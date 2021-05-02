@@ -7,7 +7,7 @@
 
 #include <memory>
 
-namespace pedasos {
+namespace pedasus {
 
 class OpNode {};
 class TableScanOp : public OpNode {};
@@ -20,6 +20,6 @@ public:
   std::unique_ptr<OpNode> top_op_;
 };
 
-}  // namespace pedasos
+}  // namespace pedasus
 
 #endif // PEDASOS_OPERATION_HPP

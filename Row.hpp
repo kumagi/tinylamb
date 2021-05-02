@@ -5,7 +5,10 @@
 #ifndef PEDASOS_ROW_HPP
 #define PEDASOS_ROW_HPP
 
-namespace pedasos {
+#include <ostream>
+#include <cstring>
+
+namespace pedasus {
 
 struct Column {
   Column() = delete;
@@ -27,10 +30,9 @@ struct Row {
     memcpy(payload, orig.payload, orig.bytes);
     return *this;
   }
+
   Row& operator=(Row&&) = delete;
-  uint64_t tid;   // Transaction ID.
-  uint16_t bytes;  // Byte size of columns field.
-  uint8_t payload[1];
+
   static size_t EmptyRowSize() {
     return sizeof(Row) - sizeof(payload);
   }
@@ -39,15 +41,19 @@ struct Row {
   }
 
   friend std::ostream& operator<<(std::ostream& o, const Row& r) {
-    o << "[" << r.tid << "]: {";
+    o << "[" << r.tid << "]: \"";
     for (size_t i = 0; i < r.bytes; ++i) {
       o << std::hex << r.payload[i] << std::dec;
     }
-    o << "}";
+    o << "\"";
     return o;
   }
+
+  uint64_t tid;   // Transaction ID.
+  uint16_t bytes;  // Byte size of columns field.
+  uint8_t payload[1];
 };
 
-}  // namespace pedasos
+}  // namespace pedasus
 
 #endif // PEDASOS_ROW_HPP

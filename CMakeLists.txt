@@ -1,12 +1,25 @@
 cmake_minimum_required(VERSION 3.14)
-project(pedasos)
+project(pedasus)
 
 find_package(Boost 1.67.0 REQUIRED)
 
 set(CMAKE_CXX_STANDARD 17)
 
-add_executable(pedasos main.cpp Page.cc Page.hpp Database.cc Database.hpp PagePool.cc PagePool.hpp Operation.cc Operation.hpp)
+add_executable(pedasus
+        main.cpp
+        )
 
+target_link_libraries(
+        pedasus
+        LINK_PUBLIC
+        libpedasus
+)
+
+add_library(libpedasus
+        STATIC
+        database.cc
+        page.cpp
+        page_pool.cpp)
 
 ########################################
 ## Testing
@@ -38,13 +51,13 @@ set(GTEST_INCLUDE ${PROJECT_BINARY_DIR}/third_party/gtest/googletest/include)
 
 function (add_simple_test test_name)
   set(target_name "${test_name}")
-  add_executable(${target_name} ${test_name}.cc)
+  add_executable(${target_name} ${test_name})
   add_test(
     NAME ${target_name}
     COMMAND ${target_name}
   )
   add_dependencies(${target_name} libgtest libgtest_main gtest)
-  target_link_libraries(${target_name} libgtest libgtest_main pthread)
+  target_link_libraries(${target_name} libgtest libgtest_main pthread libpedasus)
   target_include_directories(${target_name}
     PRIVATE
       ${PROJECT_SOURCE_DIR}/include
@@ -52,4 +65,4 @@ function (add_simple_test test_name)
   )
 endfunction()
 
-add_simple_test(PageTest)
+add_simple_test(page_pool_test)

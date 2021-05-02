@@ -1,8 +1,9 @@
-#include "Database.hpp"
 #include <iostream>
 
+#include "database.hpp"
+
 int main(int argc, char** argv) {
-  pedasos::Database db("main.pdb");
+  pedasus::Database db("main.pdb");
 
   return 0;
 }
