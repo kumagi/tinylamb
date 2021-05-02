@@ -1,8 +1,11 @@
-#include "Database.hpp"
-#include <iostream>
+#include "database/database.hpp"
 
 int main(int argc, char** argv) {
-  pedasos::Database db("main.pdb");
+  if (argc < 2) {
+    LOG(FATAL) << "Set DB file";
+    return 1;
+  }
+  tinylamb::Database db(argv[1]);
 
   return 0;
 }

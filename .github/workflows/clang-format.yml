@@ -1,0 +1,16 @@
+name: clang-format
+on: [ push, pull_request ]
+jobs:
+  validate:
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format
+      - name: Check diff
+        run: |
+          git ls-files *.{c,h,hpp,cpp,cc} | xargs clang-format -style=file -i
+          git diff --exit-code
