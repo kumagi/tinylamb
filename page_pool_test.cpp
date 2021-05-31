@@ -4,11 +4,11 @@
 #include "gtest/gtest.h"
 #include "page_pool.hpp"
 
-namespace pedasus {
+namespace tinylamb {
 
 class PagePoolTest : public ::testing::Test {
  protected:
-  static constexpr char kFileName[] = "tmp.db";
+  static constexpr char kFileName[] = "page_pool_test.db";
   static constexpr int kDefaultCapacity = 10;
   void SetUp() override {
     Reset();
@@ -36,7 +36,7 @@ TEST_F(PagePoolTest, GetPage) {
 TEST_F(PagePoolTest, GetManyPage) {
   for (int i = 0; i < 5; ++i) {
     Page* p = pp->GetPage(i);
-    ASSERT_EQ(p->header_.page_id, i);
+    ASSERT_EQ(p->header.page_id, i);
     ASSERT_EQ(pp->Size(), i + 1);
     pp->Unpin(i);
   }
@@ -45,32 +45,32 @@ TEST_F(PagePoolTest, GetManyPage) {
 TEST_F(PagePoolTest, EvictPage) {
   for (int i = 0; i < 15; ++i) {
     Page* p = pp->GetPage(i);
-    ASSERT_EQ(p->header_.page_id, i);
+    ASSERT_EQ(p->header.page_id, i);
     ASSERT_EQ(pp->Size(), std::min(i + 1, kDefaultCapacity));
     pp->Unpin(i);
   }
 }
 
 TEST_F(PagePoolTest, PersistencyWithReset) {
-  for (int i = 0; i < 15; ++i) {
+  for (int i = 0; i < 30; ++i) {
     Page* p = pp->GetPage(i);
-    uint8_t* buff = p->Payload();
+    uint8_t* buff = p->payload;
     ASSERT_NE(buff, nullptr);
-    for (size_t j = 0; j < p->PayloadSize(); ++j) {
+    for (size_t j = 0; j < Page::PayloadSize(); ++j) {
       buff[j] = i;
     }
     pp->Unpin(i);
   }
   Reset();
-  for (int i = 0; i < 15; ++i) {
+  for (int i = 0; i < 30; ++i) {
     Page* p = pp->GetPage(i);
-    uint8_t* buff = p->Payload();
+    uint8_t* buff = p->payload;
     ASSERT_NE(buff, nullptr);
-    for (size_t j = 0; j < p->PayloadSize(); ++j) {
+    for (size_t j = 0; j < Page::PayloadSize(); ++j) {
       ASSERT_EQ(buff[j], i);
     }
     pp->Unpin(i);
   }
 }
 
-}  // namespace pedasus
+}  // namespace tinylamb

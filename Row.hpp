@@ -8,7 +8,7 @@
 #include <ostream>
 #include <cstring>
 
-namespace pedasus {
+namespace tinylamb {
 
 struct Column {
   Column() = delete;
@@ -54,6 +54,6 @@ struct Row {
   uint8_t payload[1];
 };
 
-}  // namespace pedasus
+}  // namespace tinylamb
 
 #endif // PEDASOS_ROW_HPP

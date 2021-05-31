@@ -10,7 +10,7 @@
 #include "constants.hpp"
 #include "page.hpp"
 
-namespace pedasus {
+namespace tinylamb {
 
 class PagePool {
  private:
@@ -27,15 +27,15 @@ class PagePool {
   typedef std::list<Entry> LruType;
 
  public:
+  PagePool(std::string_view file_name, size_t capacity);
+
   Page* GetPage(int64_t page_id);
 
-  Entry* Unpin(size_t page_id);
+  bool Unpin(size_t page_id);
 
   uint64_t Size() const {
     return pool_lru_.size();
   }
-
-  PagePool(std::string_view file_name, size_t capacity);
 
   ~PagePool();
 
@@ -55,7 +55,6 @@ class PagePool {
     return pool_lru_.size() == capacity_;
   }
 
-
 private:
   std::string file_name_;
 
@@ -68,8 +67,9 @@ private:
   LruType pool_lru_;
 
   // A map to find PageID -> page*.
-  std::unordered_map<int64_t, LruType::iterator> pool_;
+  std::unordered_map<uint64_t, LruType::iterator> pool_;
 };
 
-}  // namespace pedasus
+}  // namespace tinylamb
+
 #endif // PEDASOS_PAGEPOOL_HPP

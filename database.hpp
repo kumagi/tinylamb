@@ -1,30 +1,31 @@
-#ifndef PEDASOS_DATABASE_HPP
-#define PEDASOS_DATABASE_HPP
+#ifndef TINYLAMB_DATABASE_HPP
+#define TINYLAMB_DATABASE_HPP
 
 #include <functional>
 
-#include "logger.hpp"
+#include "catalog.hpp"
+#include "logging.hpp"
 #include "operation.hpp"
-#include "page_pool.hpp"
+#include "page_manager.hpp"
 
-namespace pedasus {
+namespace tinylamb {
 
 class Database {
 public:
-  enum TransactionStatus {
-    RUNNING,
-    COMMIT,
-    ABORT,
-  };
-  Database(std::string_view dbname) : root_(dbname, 1024) {}
+    Database(std::string_view dbname)
+      : dbname_(dbname), pm_(dbname_, 1024), catalog_(&pm_),
+        logger_(dbname_ + ".log") {}
 
   void Transaction(const Operation& task);
 
 private:
-  PagePool root_;
-  logger logger_;
+ std::string dbname_;
+  PageManager pm_;
+  Catalog catalog_;
+  Logger logger_;
+
 };
 
-}  // namespace pedasus
+}  // namespace tinylamb
 
-#endif // PEDASOS_DATABASE_HPP
+#endif // TINYLAMB_DATABASE_HPP

@@ -1,25 +1,23 @@
 cmake_minimum_required(VERSION 3.14)
-project(pedasus)
-
-find_package(Boost 1.67.0 REQUIRED)
+project(tinylamb)
 
 set(CMAKE_CXX_STANDARD 17)
 
-add_executable(pedasus
+add_executable(tinylamb
         main.cpp
         )
 
 target_link_libraries(
-        pedasus
+        tinylamb
         LINK_PUBLIC
-        libpedasus
+        libtinylamb
 )
 
-add_library(libpedasus
+add_library(libtinylamb
         STATIC
-        database.cc
+        database.cpp
         page.cpp
-        page_pool.cpp)
+        page_pool.cpp catalog.hpp schema_params.hpp catalog_test.cpp page_manager.hpp macro.hpp page_manager_test.cpp database_test.cpp logging_test.cpp log_record.hpp lock_manager.hpp row_position.hpp transaction.hpp transaction_manager.hpp logger.hpp logger_test.cpp)
 
 ########################################
 ## Testing
@@ -57,7 +55,7 @@ function (add_simple_test test_name)
     COMMAND ${target_name}
   )
   add_dependencies(${target_name} libgtest libgtest_main gtest)
-  target_link_libraries(${target_name} libgtest libgtest_main pthread libpedasus)
+  target_link_libraries(${target_name} libgtest libgtest_main pthread libtinylamb)
   target_include_directories(${target_name}
     PRIVATE
       ${PROJECT_SOURCE_DIR}/include
@@ -66,3 +64,7 @@ function (add_simple_test test_name)
 endfunction()
 
 add_simple_test(page_pool_test)
+add_simple_test(page_manager_test)
+add_simple_test(catalog_test)
+add_simple_test(logging_test)
+add_simple_test(database_test)

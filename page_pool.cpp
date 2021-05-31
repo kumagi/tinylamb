@@ -1,6 +1,6 @@
 #include "page_pool.hpp"
 
-namespace pedasus {
+namespace tinylamb {
 
 PagePool::PagePool(std::string_view file_name, size_t capacity)
     : file_name_(file_name), src_(
@@ -9,7 +9,7 @@ PagePool::PagePool(std::string_view file_name, size_t capacity)
     std::ios_base::binary),
       capacity_(capacity) {
   if (src_.fail()) {
-    src_.open(file_name_.c_str(),
+    src_.open(file_name_,
               std::ios_base::in | std::ios_base::out | std::ios_base::ate |
               std::ios_base::binary | std::ios_base::trunc);
     if (src_.fail()) {
@@ -32,15 +32,13 @@ Page* PagePool::GetPage(int64_t page_id) {
   }
 }
 
-PagePool::Entry* PagePool::Unpin(size_t page_id) {
+bool PagePool::Unpin(uint64_t page_id) {
   auto page_entry = pool_.find(page_id);
   if (page_entry != pool_.end()) {
     page_entry->second->pinned = false;
-    return &*page_entry->second;
-  } else {
-    // A page not loaded memory cannot be unpinned.
-    assert(!"Don't unpin not loaded page.");
+    return true;
   }
+  return false;
 }
 
 bool PagePool::EvictPage(LruType::iterator target) {
@@ -77,15 +75,17 @@ Page* PagePool::AllocNewPage(size_t pid) {
 
 void PagePool::Touch(LruType::iterator it) {
   Entry tmp(std::move(*it));
+  uint64_t page_id = tmp.page_id;
   pool_lru_.erase(it);
   pool_lru_.push_back(std::move(tmp));
+  pool_[page_id] = std::prev(pool_lru_.end());
 }
-
 
 PagePool::~PagePool() {
   for (auto& it : pool_lru_) {
     if (it.pinned) {
-      std::cout << "caution: pinned page is to be deleted\n";
+      std::cout << "caution: pinned page(" << it.page_id
+                << ")is to be deleted\n";
     }
     it.page->WriteBack(src_);
   }
@@ -93,4 +93,4 @@ PagePool::~PagePool() {
   src_.close();
 }
 
-}  // namespace pedasus
+}  // namespace tinylamb

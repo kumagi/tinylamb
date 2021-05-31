@@ -4,7 +4,7 @@
 #include "gtest/gtest.h"
 #include "page.hpp"
 
-namespace pedasos {
+namespace tynylamb {
 
 class PageTest : public ::testing::Test {
 public:
@@ -55,4 +55,4 @@ TEST_F(PageTest, InsertMany) {
   std::cout << *page << "\n";
 }
 
-}  // namespace pedasos
+}  // namespace tinylamb
