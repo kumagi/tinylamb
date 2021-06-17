@@ -7,7 +7,9 @@
 
 #include <cassert>
 #include <mutex>
-#include "row_position.hpp"
+#include <unordered_set>
+
+#include "type/row_position.hpp"
 
 namespace tinylamb {
 
@@ -39,7 +41,7 @@ class LockManager {
     exclusive_locks_.emplace(row);
     return true;
   }
-  bool ReleaseSharedLock(const RowPosition& row) {
+  bool ReleaseExclusiveLock(const RowPosition& row) {
     std::scoped_lock lk(latch_);
     assert(exclusive_locks_.find(row) != exclusive_locks_.end());
     assert(shared_locks_.find(row) == shared_locks_.end());
@@ -47,7 +49,7 @@ class LockManager {
     return true;
   }
 
-  std::mutex_t latch_;
+  std::mutex latch_;
   std::unordered_map<RowPosition, int> shared_locks_;
   std::unordered_set<RowPosition> exclusive_locks_;
 };

@@ -1,9 +1,9 @@
 #ifndef TINYLAMB_PAGE_MANAGER_HPP
 #define TINYLAMB_PAGE_MANAGER_HPP
 
+#include "../macro.hpp"
 #include "page.hpp"
 #include "page_pool.hpp"
-#include "macro.hpp"
 
 namespace tinylamb {
 

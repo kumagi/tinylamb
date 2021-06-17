@@ -1,0 +1,8 @@
+//
+// Created by kumagi on 2021/06/04.
+//
+
+#ifndef TINYLAMB_CATALOG_PAGE_HPP
+#define TINYLAMB_CATALOG_PAGE_HPP
+
+#endif  // TINYLAMB_CATALOG_PAGE_HPP

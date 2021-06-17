@@ -1,5 +1,5 @@
-#ifndef PEDASOS_PAGEPOOL_HPP
-#define PEDASOS_PAGEPOOL_HPP
+#ifndef TINYLAMB_PAGEPOOL_HPP
+#define TINYLAMB_PAGEPOOL_HPP
 
 #include <cassert>
 #include <fstream>
@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <utility>
 
-#include "constants.hpp"
+#include "../constants.hpp"
 #include "page.hpp"
 
 namespace tinylamb {
@@ -72,4 +72,4 @@ private:
 
 }  // namespace tinylamb
 
-#endif // PEDASOS_PAGEPOOL_HPP
+#endif // TINYLAMB_PAGEPOOL_HPP
