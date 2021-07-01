@@ -4,8 +4,10 @@
 #include <cassert>
 #include <fstream>
 #include <list>
+#include <mutex>
 #include <unordered_map>
 #include <utility>
+#include <memory>
 
 #include "../constants.hpp"
 #include "page.hpp"
@@ -16,10 +18,7 @@ class PagePool {
  private:
   struct Entry {
     // If pinned, this page will never been evicted.
-    bool pinned = true;
-
-    // ID for the page, this is also be an offset of the file.
-    uint64_t page_id = 0;
+    uint32_t pin_count = 0;
 
     // An pointer to physical page in memory.
     std::unique_ptr<Page> page = nullptr;
@@ -29,11 +28,12 @@ class PagePool {
  public:
   PagePool(std::string_view file_name, size_t capacity);
 
-  Page* GetPage(int64_t page_id);
+  Page* GetPage(uint64_t page_id);
 
   bool Unpin(size_t page_id);
 
   uint64_t Size() const {
+    std::scoped_lock latch(pool_latch);
     return pool_lru_.size();
   }
 
@@ -49,13 +49,13 @@ class PagePool {
 
   Page* AllocNewPage(size_t pid);
 
+private:
   void Touch(LruType::iterator it);
 
-  bool IsCapacityFull() const {
-    return pool_lru_.size() == capacity_;
-  }
+  void WriteBack(const Page* target);
 
-private:
+  void ReadFrom(Page* target, uint64_t pid);
+
   std::string file_name_;
 
   std::fstream src_;
@@ -63,11 +63,13 @@ private:
   // Count of allowed max pages entry in memory.
   size_t capacity_;
 
-  // A list to detect least recentry used page.
+  // A list to detect least recently used page.
   LruType pool_lru_;
 
   // A map to find PageID -> page*.
   std::unordered_map<uint64_t, LruType::iterator> pool_;
+
+  mutable std::mutex pool_latch;
 };
 
 }  // namespace tinylamb

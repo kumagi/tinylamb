@@ -6,6 +6,7 @@
 #define TINYLAMB_ROW_POSITION_HPP
 
 #include <ostream>
+#include <cstring>
 
 namespace tinylamb {
 
@@ -31,6 +32,12 @@ struct RowPosition {
   }
   bool operator==(const RowPosition& rhs) const {
     return page_id == rhs.page_id && slot == rhs.slot;
+  }
+
+  size_t Serialize(char* dst) const {
+    memcpy(dst, &page_id, sizeof(page_id));
+    memcpy(dst + sizeof(page_id), &slot, sizeof(slot));
+    return sizeof(page_id) + sizeof(slot);
   }
 };
 

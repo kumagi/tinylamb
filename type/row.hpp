@@ -8,44 +8,50 @@
 #include <cstring>
 #include <ostream>
 
-#include "row_position.hpp"
+#include "page/row_position.hpp"
+#include "schema.hpp"
+#include "value.hpp"
 
 namespace tinylamb {
 
 struct Row {
-  Row(void* d, size_t l, RowPosition p)
-      : data(reinterpret_cast<uint8_t*>(d)), length(l), pos(p), owned(false) {}
+  Row() = default;
+  Row(void* d, size_t l, RowPosition p);
 
-  Row& operator=(const Row& orig) {
-    length = orig.length;
-    owned = orig.owned;
-    if (orig.owned) {
-      data = new uint8_t[orig.length];
-      memcpy(data, orig.data, orig.length);
-      owned = true;
-    } else {
-      data = orig.data;
-    }
-    return *this;
-  }
+  Row& operator=(const Row& orig);
 
-  ~Row() {
-    if (owned) {
-      delete[] data;
-    }
-  }
+  void SetValue(const Schema& sc, size_t idx, const Value& v);
+
+  bool Write(const Schema& sc, const Row& from);
+
+  bool Read(char* data, size_t length, const RowPosition& pos);
+
+  [[nodiscard]] const char* Data() const { return data.data(); }
+
+  [[nodiscard]] size_t Size() const { return data.size(); }
+
+  bool GetValue(Schema& sc, uint16_t idx, Value& dst);
 
   friend std::ostream& operator<<(std::ostream& o, const Row& r) {
     if (r.pos.IsValid()) {
       o << r.pos << ": ";
     }
+    if (!r.owned_data.empty()) {
+      o << "(owned)";
+    }
+    o << r.data;
     return o;
   }
 
-  uint8_t* data = nullptr;
-  size_t length = 0;
+  void MakeOwned();
+
+  [[nodiscard]] bool IsOwned() const {
+    return !owned_data.empty();
+  }
+
+  std::string_view data;
   RowPosition pos;  // Origin of the row, if exists.
-  bool owned = false;
+  std::string owned_data;
 };
 
 }  // namespace tinylamb

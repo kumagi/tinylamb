@@ -5,8 +5,8 @@
 #ifndef TINYLAMB_TRANSACTION_MANAGER_HPP
 #define TINYLAMB_TRANSACTION_MANAGER_HPP
 
-#include "../logger.hpp"
-#include "concurrency/transaction.hpp"
+#include "recovery/logger.hpp"
+#include "transaction.hpp"
 
 namespace tinylamb {
 
@@ -14,17 +14,19 @@ class TransactionManager {
  public:
   TransactionManager(LockManager* lm, PageManager* pm, Logger* l)
       : lock_manager_(lm), page_manager_(pm), logger_(l) {}
-  static Transaction BeginTransaction() {
-    return Transaction(next_txn_id_++, this, loc, page_manager_);
+
+  // Thread safe.
+  Transaction BeginTransaction() {
+    return Transaction(next_txn_id_.fetch_add(1),
+                       this, lock_manager_, page_manager_, logger_);
   }
 
  private:
   std::atomic<uint64_t> next_txn_id_ = 0;
-  LockManager* lock_manager_;
-  PageManager* page_manager_;
-  Logger* logger_;
+  LockManager* const lock_manager_;
+  PageManager* const page_manager_;
+  Logger* const logger_;
 };
-
 
 }  // namespace tinylamb
 

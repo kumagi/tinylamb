@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.14)
 project(tinylamb)
 
+find_package (Threads)
 set(CMAKE_CXX_STANDARD 17)
 
 add_executable(tinylamb
@@ -10,14 +11,28 @@ add_executable(tinylamb
 target_link_libraries(
         tinylamb
         LINK_PUBLIC
+        Threads::Threads
         libtinylamb
+)
+
+target_include_directories(
+        tinylamb
+        PUBLIC
+        ${PROJECT_SOURCE_DIR}
 )
 
 add_library(libtinylamb
         STATIC
         database.cpp
-        page.cpp
-        page_pool.cpp catalog.hpp schema_params.hpp catalog_test.cpp page_manager.hpp macro.hpp page_manager_test.cpp database_test.cpp logging_test.cpp log_record.hpp lock_manager.hpp row_position.hpp transaction.hpp transaction_manager.hpp logger.hpp logger_test.cpp)
+        page/page.cpp
+        transaction/lock_manager.cpp
+        page/page_pool.cpp type/catalog.hpp type/catalog_test.cpp page/page_manager.hpp macro.hpp page/page_manager_test.cpp database_test.cpp logging_test.cpp recovery/log_record.hpp transaction/lock_manager.hpp page/row_position.hpp transaction/transaction.hpp transaction/transaction_manager.hpp recovery/logger.hpp recovery/logger_test.cpp type/value.hpp type/schema.hpp type/value_type.hpp page/catalog_page.hpp recovery/log_record_test.cpp page/meta_page.hpp page/row_page.hpp page/row_page.cpp page/row_page_test.cpp page/page_manager.cpp recovery/logger.cpp type/catalog.cpp type/row.cpp type/schema.cpp transaction/transaction.cpp page/catalog_page.cpp recovery/log_record.cpp page/meta_page.cpp page/free_page.hpp)
+
+target_include_directories(
+        libtinylamb
+        PUBLIC
+        ${PROJECT_SOURCE_DIR}
+)
 
 ########################################
 ## Testing
@@ -33,7 +48,7 @@ ExternalProject_Add(
   BINARY_DIR ${PROJECT_BINARY_DIR}/gtest
   INSTALL_COMMAND ""
 )
-add_library(libgtest IMPORTED STATIC GLOBAL)
+add_library(libgtest IMPORTED STATIC GLOBAL cmake-build-debug/fixed_length_page.hpp type/schema_test.cpp transaction/lock_manager.cpp)
 add_dependencies(libgtest gtest)
 set_target_properties(libgtest PROPERTIES
     "IMPORTED_LOCATION" "${PROJECT_BINARY_DIR}/gtest/lib/libgtest.a"
@@ -47,12 +62,11 @@ set_target_properties(libgtest_main PROPERTIES
 )
 set(GTEST_INCLUDE ${PROJECT_BINARY_DIR}/third_party/gtest/googletest/include)
 
-function (add_simple_test test_name)
-  set(target_name "${test_name}")
-  add_executable(${target_name} ${test_name})
+function (add_simple_test file_path target_name)
+  add_executable(${target_name} ${file_path})
   add_test(
     NAME ${target_name}
-    COMMAND ${target_name}
+    COMMAND ${file_path}
   )
   add_dependencies(${target_name} libgtest libgtest_main gtest)
   target_link_libraries(${target_name} libgtest libgtest_main pthread libtinylamb)
@@ -63,8 +77,10 @@ function (add_simple_test test_name)
   )
 endfunction()
 
-add_simple_test(page_pool_test)
-add_simple_test(page_manager_test)
-add_simple_test(catalog_test)
-add_simple_test(logging_test)
-add_simple_test(database_test)
+add_simple_test(page/page_pool_test.cpp page_pool_test)
+add_simple_test(page/page_manager_test.cpp page_manager_test)
+add_simple_test(page/row_page_test.cpp row_page_test)
+add_simple_test(type/schema_test.cpp schema_test)
+add_simple_test(type/catalog_test.cpp catalog_test)
+add_simple_test(recovery/logger_test.cpp logger_test)
+add_simple_test(database_test.cpp database_test)

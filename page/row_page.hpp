@@ -1,5 +1,5 @@
-#ifndef TINYLAMB_FIXED_LENGTH_PAGE_HPP
-#define TINYLAMB_FIXED_LENGTH_PAGE_HPP
+#ifndef TINYLAMB_ROW_PAGE_HPP
+#define TINYLAMB_ROW_PAGE_HPP
 
 #include <cassert>
 
@@ -11,66 +11,57 @@
 
 namespace tinylamb {
 
-struct FixedLengthPageHeader {
-  MAPPING_ONLY(FixedLengthPageHeader);
-  void Init() {
+struct RowPageHeader {
+  MAPPING_ONLY(RowPageHeader);
+  void Initialize() {
     prev_page_id = 0;
     next_page_id = 0;
     row_count = 0;
-    free_list_head = 0;
+    row_size = 0;
   }
   uint64_t prev_page_id = 0;
   uint64_t next_page_id = 0;
   int16_t row_count = 0;
-  uint16_t free_list_head = 0;
+  uint16_t row_size = 0;
 };
 
-struct FixedLengthPage : public Page {
-  MAPPING_ONLY(FixedLengthPage);
-  void Init(uint64_t page_id) {
-    memset(Data(), 0, kPageSize);
-
+struct RowPage : public Page {
+  MAPPING_ONLY(RowPage);
+  RowPageHeader& Metadata() { return BodyAs<RowPageHeader>(); }
+  void Initialize() {
+    Metadata().Initialize();
   }
-  FixedLengthPageHeader& Metadata() {
-    return Body<FixedLengthPageHeader>();
+  [[nodiscard]] const RowPageHeader& Metadata() const {
+    return BodyAs<const RowPageHeader>();
   }
-  const FixedLengthPageHeader& Metadata() const {
-    return Body<const FixedLengthPageHeader>();
+  char* PageData() {
+    return reinterpret_cast<char*>(this) + sizeof(PageHeader) +
+           sizeof(RowPageHeader);
   }
-  static PayloadSize() {
-    return kPageSize - sizeof(PageHeader) - sizeof(FixedLengthPageHeader);
-  }
-
-  Row Read(const RowPosition& pos, const Schema& schema) {
-    assert(pos.page_id == PageId());
-    return ret(&body[schema.RowSize() * pos.slot], RowSize(), pos);
+  [[nodiscard]] const char* PageData() const {
+    return reinterpret_cast<const char*>(this) + sizeof(PageHeader) +
+           sizeof(RowPageHeader);
   }
 
-  // Make sure you have the lock of this row before invoke this function.
-  RowPosition Insert(const Row& record, const Schema& schema) {
-    const uint16_t next_pos = Metadata().row_count * schema.RowSize();
-    if (PayloadSize() < next_pos + record.length) {
-      // TODO: reuse deleted row space.
-      return RowPosition();  // No enough space.
-    }
-    memcpy(Data() + next_pos, record.data, record.length);
-    return RowPosition(PageId(), Header().row_count++);
+  char* RowPageBody() {
+    return payload + sizeof(PageHeader) + sizeof(RowPageHeader);
   }
 
-  // Make sure you have the lock of this row before invoke this function.
-  bool Update(const Row& target, const Schema& schema) {
-    assert(target.pos.page_id == PageId());
-    memccpy(Data() + schema.RowSize() * target.pos.slot, target.data, target.length);
-    return true;
-  }
+  bool Read(Transaction& txn, const RowPosition& pos, const Schema& schema,
+            Row& dst);
 
-  bool Delete(const RowPosition& target) {
-    // TODO: implement.
-  }
+  bool Insert(Transaction& txn, const Row& record, const Schema& schema,
+              RowPosition& dst);
+
+  bool Update(Transaction& txn, const RowPosition& pos, const Row& row,
+              const Schema& schema);
+
+  bool Delete(Transaction& txn, const RowPosition& pos, const Schema& schema);
+
+  [[nodiscard]] uint64_t CalcChecksum() const;
 };
+static_assert(sizeof(RowPage) == sizeof(Page));
 
-static_assert(sizeof(FixedLengthPage) == sizeof(Page));
+}  // namespace tinylamb
 
-} // namespace tinylamb
-
-#endif  // TINYLAMB_FIXED_LENGTH_PAGE_HPP
+#endif  // TINYLAMB_ROW_PAGE_HPP

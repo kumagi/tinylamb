@@ -8,6 +8,7 @@
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/schema.hpp"
+#include "page/page_manager.hpp"
 
 namespace tinylamb {
 
@@ -32,9 +33,7 @@ class CatalogTest : public ::testing::Test {
     tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get());
   }
 
-  void TearDown() override {
-    std::remove(kFileName);
-  }
+  void TearDown() override { std::remove(kFileName); }
 
   std::unique_ptr<LockManager> lm_;
   std::unique_ptr<PageManager> p_;
@@ -43,8 +42,7 @@ class CatalogTest : public ::testing::Test {
   std::unique_ptr<Catalog> c_;
 };
 
-TEST_F(CatalogTest, Construction) {
-}
+TEST_F(CatalogTest, Construction) {}
 
 TEST_F(CatalogTest, CreateTable) {
   Schema sc("test_table_for_create");
@@ -67,23 +65,29 @@ TEST_F(CatalogTest, GetTable) {
   sc.AddColumn("int_column", ValueType::kInt64, 8, 0);
   sc.AddColumn("varchar_column", ValueType::kVarChar, 16, 0);
   ASSERT_TRUE(c_->CreateTable(txn, sc));
-  ASSERT_EQ(c_->GetSchema(kTableName).Name(),
-            kTableName);
+  ASSERT_EQ(c_->GetSchema(txn, kTableName).Name(), kTableName);
   txn.PreCommit();
   txn.CommitWait();
 }
 
 TEST_F(CatalogTest, Recover) {
-  auto txn = tm_->BeginTransaction();
-  Schema sc("test_table_for_recover");
-  sc.AddColumn("int_column", ValueType::kInt64, 8, 0);
-  sc.AddColumn("varchar_column", ValueType::kVarChar, 16, 0);
-  ASSERT_TRUE(c_->CreateTable(txn, sc));
-  txn.PreCommit();
-  txn.CommitWait();
+  {
+    auto txn = tm_->BeginTransaction();
+    Schema sc("test_table_for_recover");
+    sc.AddColumn("int_column", ValueType::kInt64, 8, 0);
+    sc.AddColumn("varchar_column", ValueType::kVarChar, 16, 0);
+    ASSERT_TRUE(c_->CreateTable(txn, sc));
+    txn.PreCommit();
+    txn.CommitWait();
+  }
   Recover();
-  ASSERT_EQ(c_->GetSchema("test_table_for_recover").Name(),
-            "test_table_for_recover");
+  {
+    auto txn = tm_->BeginTransaction();
+    ASSERT_EQ(c_->GetSchema(txn, "test_table_for_recover").Name(),
+              "test_table_for_recover");
+    txn.PreCommit();
+    txn.CommitWait();
+  }
 }
 
 }  // namespace tinylamb

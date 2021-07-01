@@ -5,14 +5,20 @@
 #ifndef TINYLAMB_TRANSACTION_HPP
 #define TINYLAMB_TRANSACTION_HPP
 
-#include "transaction/lock_manager.hpp"
-#include "type/row_position.hpp"
+#include <unordered_map>
+#include <unordered_set>
+
+#include "page/row_position.hpp"
 
 namespace tinylamb {
 
 class TransactionManager;
-class Logger;
+
 class PageManager;
+class Logger;
+class LockManager;
+class Row;
+struct LogRecord;
 
 enum class TransactionStatus : uint_fast8_t {
   kUnknown,
@@ -23,14 +29,33 @@ enum class TransactionStatus : uint_fast8_t {
 
 class Transaction {
   friend class TransactionManager;
-  Transaction(uint64_t txn_id, TransactionManager* tm,
-              LockManager* lm, PageManager* pm)
-      : txn_id_(txn_id), transaction_manager_(tm),
-        lock_manager_(lm), page_manager_(pm) {}
+
  public:
-  void SetStatus(TransactionStatus status) {
-    status_ = status;
-  }
+  Transaction(uint64_t txn_id, TransactionManager* tm, LockManager* lm,
+              PageManager* pm, Logger* l);
+  Transaction SpawnSystemTransaction();
+  void SetStatus(TransactionStatus status);
+  bool IsFinished() const;
+  uint64_t PrevLSN() const { return prev_lsn_; }
+  uint64_t TxnID() const { return txn_id_; }
+
+  bool AddReadSet(const RowPosition& rs);
+  bool AddWriteSet(const RowPosition& rs);
+
+  bool PreCommit();
+
+  // Returns LSN
+  uint64_t InsertLog(const RowPosition& pos, std::string_view redo);
+  uint64_t UpdateLog(const RowPosition& pos, std::string_view redo,
+                     std::string_view undo);
+  uint64_t DeleteLog(const RowPosition& pos, std::string_view undo);
+
+  uint64_t AllocatePageLog(uint64_t page_id);
+
+  uint64_t DestroyPageLog(uint64_t page_id);
+  // Using this function is discouraged to get performance of flush pipelining.
+  void CommitWait() const;
+
  private:
   const uint64_t txn_id_;
 
@@ -39,7 +64,7 @@ class Transaction {
   std::unordered_set<RowPosition> write_set_ = {};
   TransactionStatus status_ = TransactionStatus::kUnknown;
 
-  // Not owned members.
+  // Not owned by this class.
   TransactionManager* transaction_manager_;
   LockManager* lock_manager_;
   PageManager* page_manager_;

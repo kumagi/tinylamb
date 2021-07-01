@@ -3,29 +3,27 @@
 
 #include <functional>
 
-#include "catalog.hpp"
-#include "logging.hpp"
-#include "operation.hpp"
-#include "page_manager.hpp"
+#include "page/page_manager.hpp"
+#include "recovery/logger.hpp"
+#include "type/catalog.hpp"
 
 namespace tinylamb {
 
 class Database {
-public:
-    Database(std::string_view dbname)
-      : dbname_(dbname), pm_(dbname_, 1024), catalog_(&pm_),
-        logger_(dbname_ + ".log") {}
+ public:
+  Database(std::string_view dbname)
+      : dbname_(dbname),
+        logger_(dbname_ + ".log"),
+        pm_(dbname_, 1024),
+        catalog_(&pm_) {}
 
-  void Transaction(const Operation& task);
-
-private:
- std::string dbname_;
+ private:
+  std::string dbname_;
+  Logger logger_;
   PageManager pm_;
   Catalog catalog_;
-  Logger logger_;
-
 };
 
 }  // namespace tinylamb
 
-#endif // TINYLAMB_DATABASE_HPP
+#endif  // TINYLAMB_DATABASE_HPP

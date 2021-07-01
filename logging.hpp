@@ -1,6 +1,8 @@
 #ifndef TINYLAMB_LOGGER_HPP
 #define TINYLAMB_LOGGER_HPP
 
+// this file is junk.
+
 #include <fstream>
 #include <iostream>
 #include <map>

@@ -1,31 +1,38 @@
 #include "page_pool.hpp"
 
+#include "catalog_page.hpp"
+#include "meta_page.hpp"
+#include "row_page.hpp"
+
 namespace tinylamb {
 
 PagePool::PagePool(std::string_view file_name, size_t capacity)
-    : file_name_(file_name), src_(
-    file_name_.c_str(),
-    std::ios_base::in | std::ios_base::out | std::ios_base::ate |
-    std::ios_base::binary),
+    : file_name_(file_name),
+      src_(file_name_.c_str(), std::ios_base::in | std::ios_base::out |
+                                   std::ios_base::ate | std::ios_base::binary),
       capacity_(capacity) {
   if (src_.fail()) {
-    src_.open(file_name_,
-              std::ios_base::in | std::ios_base::out | std::ios_base::ate |
-              std::ios_base::binary | std::ios_base::trunc);
+    src_.open(file_name_, std::ios_base::in | std::ios_base::out |
+                              std::ios_base::ate | std::ios_base::binary |
+                              std::ios_base::trunc);
     if (src_.fail()) {
       throw std::runtime_error("failed to open file: " + file_name_);
     }
   }
 }
 
-Page* PagePool::GetPage(int64_t page_id) {
+Page* PagePool::GetPage(uint64_t page_id) {
+  std::scoped_lock latch(pool_latch);
   auto entry = pool_.find(page_id);
   if (entry != pool_.end()) {
+    Page* result = entry->second->page.get();
+    assert(page_id == result->PageId());
+    entry->second->pin_count++;
     Touch(entry->second);
-    entry->second->pinned = true;
-    return entry->second->page.get();
+    assert(entry->second->page->PageId() == page_id);
+    return result;
   } else {
-    if (IsCapacityFull()) {
+    if (pool_lru_.size() == capacity_) {
       EvictOnePage();
     }
     return AllocNewPage(page_id);
@@ -33,40 +40,41 @@ Page* PagePool::GetPage(int64_t page_id) {
 }
 
 bool PagePool::Unpin(uint64_t page_id) {
+  std::scoped_lock latch(pool_latch);
   auto page_entry = pool_.find(page_id);
   if (page_entry != pool_.end()) {
-    page_entry->second->pinned = false;
+    page_entry->second->pin_count--;
     return true;
   }
   return false;
 }
 
 bool PagePool::EvictPage(LruType::iterator target) {
-  assert(pool_.find(target->page_id) != pool_.end());
-  uint64_t target_page_id = target->page_id;
-  if (target->pinned) {
+  assert(pool_.find(target->page->PageId()) != pool_.end());
+  if (0 < target->pin_count) {
     return false;
   }
-  target->page->WriteBack(src_);
+  WriteBack(target->page.get());
+  uint64_t page_id = target->page->PageId();
   pool_lru_.erase(target);
-  pool_.erase(target_page_id);
+  pool_.erase(page_id);
   return true;
 }
 
 bool PagePool::EvictOnePage() {
   auto target = pool_lru_.begin();
-  while (target != pool_lru_.end() &&
-         !EvictPage(target)) {
+  while (target != pool_lru_.end() && !EvictPage(target)) {
     target++;
   }
   return target != pool_lru_.end();
 }
 
 Page* PagePool::AllocNewPage(size_t pid) {
-  std::unique_ptr<Page> new_page(new Page(src_, pid));
+  std::unique_ptr<Page> new_page(new Page(pid, PageType::kMetaPage));
+  ReadFrom(new_page.get(), pid);
+  assert(new_page->PageId() == pid);
   Entry new_entry;
-  new_entry.pinned = true;
-  new_entry.page_id = pid;
+  new_entry.pin_count++;
   new_entry.page = std::move(new_page);
   pool_lru_.push_back(std::move(new_entry));
   pool_.emplace(pid, std::prev(pool_lru_.end()));
@@ -75,22 +83,79 @@ Page* PagePool::AllocNewPage(size_t pid) {
 
 void PagePool::Touch(LruType::iterator it) {
   Entry tmp(std::move(*it));
-  uint64_t page_id = tmp.page_id;
+  uint64_t page_id = tmp.page->PageId();
   pool_lru_.erase(it);
   pool_lru_.push_back(std::move(tmp));
   pool_[page_id] = std::prev(pool_lru_.end());
 }
 
 PagePool::~PagePool() {
+  std::scoped_lock latch(pool_latch);
   for (auto& it : pool_lru_) {
-    if (it.pinned) {
-      std::cout << "caution: pinned page(" << it.page_id
+    if (0 < it.pin_count) {
+      std::cout << "caution: pinned page(" << it.page->PageId()
                 << ")is to be deleted\n";
     }
-    it.page->WriteBack(src_);
+    WriteBack(it.page.get());
   }
   src_.flush();
   src_.close();
+}
+
+void PagePool::WriteBack(const Page* target) {
+  target->SetChecksum();
+  src_.seekp(target->PageId() * kPageSize, std::ios_base::beg);
+  if (src_.fail()) {
+    throw std::runtime_error("cannot seek to page: " +
+                             std::to_string(target->PageId()));
+  }
+  src_.write(target->Data(), kPageSize);
+  if (src_.fail()) {
+    throw std::runtime_error("cannot write back page: " +
+                             std::to_string(src_.bad()));
+  }
+}
+
+void PagePool::ReadFrom(Page* target, uint64_t pid) {
+  src_.seekg(pid * kPageSize, std::ios_base::beg);
+  if (src_.fail()) {
+    return;
+  }
+  src_.read(reinterpret_cast<char*>(target->payload), kPageSize);
+  if (src_.fail()) {
+    LOG_INFO("Page %lu is empty, newly allocate one", pid);
+    target->PageInit(pid, PageType::kFreePage);
+    src_.clear();
+    return;
+  }
+  bool needs_recover = false;
+  switch (target->Type()) {
+    case PageType::kUnknown:
+      LOG_ERROR("Reading page unknown type page");
+      return;
+    case PageType::kMetaPage: {
+      auto* meta_page = reinterpret_cast<MetaPage*>(target);
+      needs_recover = !meta_page->IsValid();
+      break;
+    }
+    case PageType::kCatalogPage: {
+      auto* catalog_page = reinterpret_cast<CatalogPage*>(target);
+      needs_recover = !catalog_page->IsValid();
+      break;
+    }
+    case PageType::kFixedLengthRow: {
+      auto* row_page = reinterpret_cast<RowPage*>(target);
+      needs_recover = !row_page->IsValid();
+      break;
+    }
+    case PageType::kVariableRow:
+      throw std::runtime_error("not implemented!");
+    case PageType::kFreePage:
+      break;
+  }
+  if (!needs_recover) return;
+
+  LOG_ERROR("page checksum unmatched on %lu", pid);
 }
 
 }  // namespace tinylamb

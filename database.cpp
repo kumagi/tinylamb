@@ -3,9 +3,7 @@
 //
 
 #include "database.hpp"
-namespace tinylamb {
-void Database::Transaction(const Operation& task) {
 
-}
+namespace tinylamb {
 
 }  // namespace tinylamb

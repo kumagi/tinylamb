@@ -17,7 +17,7 @@ class PagePoolTest : public ::testing::Test {
     pp = std::make_unique<PagePool>(kFileName, kDefaultCapacity);
   }
   void TearDown() override {
-    // std::remove(kFileName);
+    std::remove(kFileName);
   }
 
   std::unique_ptr<PagePool> pp = nullptr;
@@ -33,10 +33,19 @@ TEST_F(PagePoolTest, GetPage) {
   pp->Unpin(0);
 }
 
+TEST_F(PagePoolTest, GetPageSeveralpattern) {
+  std::vector<int> pattern = {0, 0, 1, 0, 2};
+  for (int & i : pattern) {
+    Page* page = pp->GetPage(i);
+    ASSERT_EQ(page->PageId(), i);
+    pp->Unpin(i);
+  }
+}
+
 TEST_F(PagePoolTest, GetManyPage) {
   for (int i = 0; i < 5; ++i) {
     Page* p = pp->GetPage(i);
-    ASSERT_EQ(p->header.page_id, i);
+    ASSERT_EQ(p->PageId(), i);
     ASSERT_EQ(pp->Size(), i + 1);
     pp->Unpin(i);
   }
@@ -45,29 +54,30 @@ TEST_F(PagePoolTest, GetManyPage) {
 TEST_F(PagePoolTest, EvictPage) {
   for (int i = 0; i < 15; ++i) {
     Page* p = pp->GetPage(i);
-    ASSERT_EQ(p->header.page_id, i);
+    ASSERT_EQ(p->PageId(), i);
     ASSERT_EQ(pp->Size(), std::min(i + 1, kDefaultCapacity));
     pp->Unpin(i);
   }
 }
 
 TEST_F(PagePoolTest, PersistencyWithReset) {
-  for (int i = 0; i < 30; ++i) {
+  constexpr size_t kPages = 11;
+  for (int i = 0; i < kPages; ++i) {
     Page* p = pp->GetPage(i);
-    uint8_t* buff = p->payload;
+    char* buff = p->Body();
     ASSERT_NE(buff, nullptr);
-    for (size_t j = 0; j < Page::PayloadSize(); ++j) {
+    for (size_t j = 0; j < Page::kBodySize; ++j) {
       buff[j] = i;
     }
     pp->Unpin(i);
   }
-  Reset();
-  for (int i = 0; i < 30; ++i) {
+  // Reset();
+  for (int i = 0; i < kPages; ++i) {
     Page* p = pp->GetPage(i);
-    uint8_t* buff = p->payload;
+    char* buff = p->Body();
     ASSERT_NE(buff, nullptr);
-    for (size_t j = 0; j < Page::PayloadSize(); ++j) {
-      ASSERT_EQ(buff[j], i);
+    for (size_t j = 0; j < Page::kBodySize; ++j) {
+      EXPECT_EQ(buff[j], i);
     }
     pp->Unpin(i);
   }
