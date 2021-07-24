@@ -11,41 +11,45 @@ namespace tinylamb {
 
 Page* MetaPage::AllocateNewPage(Transaction& txn, PageType type,
                                 PagePool& pool) {
-  MetaPageHeader& meta_data = MetaData();
   Page* ret;
   uint64_t new_page_id;
-  if (meta_data.first_free_page == 0) {
-    new_page_id = ++meta_data.max_page_count;
-    ret = pool.GetPage(meta_data.max_page_count);
+  if (first_free_page == 0) {
+    new_page_id = ++max_page_count;
+    ret = pool.GetPage(max_page_count);
   } else {
-    new_page_id = meta_data.first_free_page;
+    new_page_id = first_free_page;
     ret = pool.GetPage(new_page_id);
 
-    meta_data.first_free_page =
-        reinterpret_cast<FreePageHeader*>(ret)->next_free_page;
+    first_free_page = reinterpret_cast<FreePage*>(ret)->next_free_page;
   }
   ret->PageInit(new_page_id, type);
-  txn.AllocatePageLog(new_page_id);
+  txn.AllocatePageLog(new_page_id, type);
   txn.PreCommit();  // No need to wait for the log to be durable.
-  Header().last_lsn = txn.PrevLSN();
+  last_lsn = txn.PrevLSN();
   return ret;
 }
 
 // Precondition: latch of page is taken by txn.
 void MetaPage::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
   uint64_t free_page_id = target->PageId();
-  MetaPageHeader& meta_data = MetaData();
   target->PageInit(free_page_id, PageType::kFreePage);
   assert(target->PageId() == free_page_id);
   auto* free_page = reinterpret_cast<FreePage*>(target);
   assert(target->PageId() == free_page_id);
   // Add the free page to the free page chain.
-  free_page->MetaData().next_free_page = meta_data.first_free_page;
+  free_page->next_free_page = first_free_page;
   assert(target->PageId() == free_page_id);
-  meta_data.first_free_page = free_page_id;
+  first_free_page = free_page_id;
   txn.DestroyPageLog(free_page_id);
   txn.PreCommit();
-  Header().last_lsn = txn.PrevLSN();
+  last_lsn = txn.PrevLSN();
 }
 
 }  // namespace tinylamb
+
+uint64_t std::hash<tinylamb::MetaPage>::operator()(
+    const tinylamb::MetaPage& m) {
+  const uint64_t kChecksumSalt = 0xbe1a0a4;
+  return kChecksumSalt + std::hash<uint64_t>()(m.max_page_count) +
+         std::hash<uint64_t>()(m.first_free_page);
+}

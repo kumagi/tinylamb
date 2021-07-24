@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "page/page.hpp"
 #include "page/row_position.hpp"
 
 namespace tinylamb {
@@ -43,6 +44,7 @@ class Transaction {
   bool AddWriteSet(const RowPosition& rs);
 
   bool PreCommit();
+  void Abort();
 
   // Returns LSN
   uint64_t InsertLog(const RowPosition& pos, std::string_view redo);
@@ -50,11 +52,14 @@ class Transaction {
                      std::string_view undo);
   uint64_t DeleteLog(const RowPosition& pos, std::string_view undo);
 
-  uint64_t AllocatePageLog(uint64_t page_id);
+  uint64_t AllocatePageLog(uint64_t page_id, PageType type);
 
   uint64_t DestroyPageLog(uint64_t page_id);
   // Using this function is discouraged to get performance of flush pipelining.
   void CommitWait() const;
+
+ private:
+  friend class TransactionManager;
 
  private:
   const uint64_t txn_id_;

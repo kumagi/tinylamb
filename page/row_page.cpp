@@ -7,72 +7,79 @@ namespace tinylamb {
 
 bool RowPage::Read(Transaction& txn, const RowPosition& pos,
                    const Schema& schema, Row& dst) {
-  if (pos.page_id != PageId() || Metadata().row_count <= pos.slot) {
+  if (pos.page_id != PageId() || row_count_ <= pos.slot) {
     return false;
   }
-  char* physical_pos = PageData() + schema.FixedRowSize() * pos.slot;
+  char* physical_pos = data_ + schema.FixedRowSize() * pos.slot;
   dst.Read(physical_pos, schema.FixedRowSize(), pos);
   return true;
 }
 
 bool RowPage::Insert(Transaction& txn, const Row& record, const Schema& schema,
                      RowPosition& dst) {
-  auto& header = Metadata();
-  dst = RowPosition(PageId(), header.row_count);
+  dst = RowPosition(PageId(), row_count_);
   if (!txn.AddWriteSet(dst)) {
     return false;
   }
-  uint16_t target_slot = header.row_count;
-  const size_t row_size = schema.FixedRowSize();
-  Row inserted_row(PageData() + row_size * target_slot, schema.FixedRowSize(),
-                   dst);
-  inserted_row.Write(schema, record);
-  txn.InsertLog(dst, std::string_view(record.Data(), record.Size()));
-  header.row_count++;
-  Header().last_lsn = txn.PrevLSN();
+  std::string_view payload(record.Data(), record.Size());
+  InsertRow(payload);
+  txn.InsertLog(dst, payload);
+  last_lsn = txn.PrevLSN();
   return true;
+}
+
+void RowPage::InsertRow(std::string_view redo_log) {
+  assert(row_count_ <= MaxSlot());
+  memcpy(data_ + row_size_ * row_count_, redo_log.data(), redo_log.size());
+  row_count_++;
 }
 
 bool RowPage::Update(Transaction& txn, const RowPosition& pos,
                      const Row& new_row, const Schema& schema) {
-  auto& header = Metadata();
   if (!txn.AddWriteSet(pos)) {
     return false;
   }
-  Row target_row(PageData() + header.row_size * pos.slot, header.row_size, pos);
-  txn.UpdateLog(pos, std::string_view(new_row.Data(), new_row.Size()),
-                std::string_view(target_row.Data(), target_row.Size()));
-  target_row.Write(schema, new_row);
-  Header().last_lsn = txn.PrevLSN();
+  Row target_row(data_ + row_size_ * pos.slot, row_size_, pos);
+  std::string_view undo_log(target_row.Data(), target_row.Size());
+  std::string_view redo_log(new_row.Data(), new_row.Size());
+  txn.UpdateLog(pos, redo_log, undo_log);
+  UpdateImpl(pos, redo_log);
+  last_lsn = txn.PrevLSN();
   return true;
+}
+
+void RowPage::UpdateRow(const RowPosition& pos, std::string_view redo_log) {
+  memcpy(data_ + row_size_ * pos.slot, redo_log.data(), redo_log.size());
 }
 
 bool RowPage::Delete(Transaction& txn, const RowPosition& pos,
                      const Schema& schema) {
-  auto& header = Metadata();
-  RowPosition final_row_pos(PageId(), header.row_count - 1);
+  RowPosition final_row_pos(PageId(), row_count_ - 1);
   if (!txn.AddWriteSet(pos) || !txn.AddWriteSet(final_row_pos)) {
     return false;
   }
-  Row final_row(PageData() + header.row_size * final_row_pos.slot,
-                header.row_size, final_row_pos);
-  char* target_ptr = PageData() + header.row_size * pos.slot;
-  Row target_row(target_ptr, header.row_size, pos);
-  txn.DeleteLog(pos, std::string_view(target_ptr, header.row_size));
-  target_row.Write(schema, final_row);
-  header.row_count--;
+  txn.DeleteLog(pos, std::string_view(data_ + row_size_ * pos.slot, row_size_));
+  DeleteRow(pos);
   return true;
 }
 
-uint64_t RowPage::CalcChecksum() const {
-  const auto& header = Metadata();
+void RowPage::DeleteRow(const RowPosition& pos) {
+  memcpy(data_ + row_size_ * pos.slot, data_ + row_size_ * (row_count_ - 1),
+         row_size_);
+  row_count_--;
+}
+
+size_t RowPage::RowCount() const { return row_count_; }
+
+}  // namespace tinylamb
+
+uint64_t std::hash<tinylamb::RowPage>::operator()(
+    const tinylamb::RowPage& r) const {
   uint64_t ret = 0;
-  for (size_t i = 0; i < header.row_count; ++i) {
-    const char* physical_pos = PageData() + i * header.row_size;
+  for (size_t i = 0; i < r.row_count_; ++i) {
+    const char* physical_pos = r.data_ + i * r.row_size_;
     ret += std::hash<std::string_view>()(
-        std::string_view(physical_pos, header.row_size));
+        std::string_view(physical_pos, r.row_size_));
   }
   return ret;
 }
-
-}  // namespace tinylamb

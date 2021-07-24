@@ -102,14 +102,26 @@ PagePool::~PagePool() {
   src_.close();
 }
 
+void ZeroFillUntil(std::fstream& of, size_t expected) {
+  of.clear();
+  of.seekp(0, std::ios_base::beg);
+  const std::ofstream::pos_type start = of.tellp();
+  of.seekp(0, std::ios_base::end);
+  const std::ofstream::pos_type finish = of.tellp();
+  const size_t needs = expected - (finish - start);
+  LOG(TRACE) << "write " << needs << " bytes";
+  for (size_t i = 0; i < needs; ++i) {
+    of.write("\0", 1);
+  }
+}
+
 void PagePool::WriteBack(const Page* target) {
   target->SetChecksum();
   src_.seekp(target->PageId() * kPageSize, std::ios_base::beg);
   if (src_.fail()) {
-    throw std::runtime_error("cannot seek to page: " +
-                             std::to_string(target->PageId()));
+    ZeroFillUntil(src_, target->PageId() * kPageSize);
   }
-  src_.write(target->Data(), kPageSize);
+  src_.write(reinterpret_cast<const char*>(target), kPageSize);
   if (src_.fail()) {
     throw std::runtime_error("cannot write back page: " +
                              std::to_string(src_.bad()));
@@ -121,9 +133,9 @@ void PagePool::ReadFrom(Page* target, uint64_t pid) {
   if (src_.fail()) {
     return;
   }
-  src_.read(reinterpret_cast<char*>(target->payload), kPageSize);
+  src_.read(reinterpret_cast<char*>(target), kPageSize);
   if (src_.fail()) {
-    LOG_INFO("Page %lu is empty, newly allocate one", pid);
+    LOG(INFO) << "Page " << pid << " is empty, newly allocate one";
     target->PageInit(pid, PageType::kFreePage);
     src_.clear();
     return;
@@ -131,7 +143,7 @@ void PagePool::ReadFrom(Page* target, uint64_t pid) {
   bool needs_recover = false;
   switch (target->Type()) {
     case PageType::kUnknown:
-      LOG_ERROR("Reading page unknown type page");
+      LOG(ERROR) << "Reading page unknown type page";
       return;
     case PageType::kMetaPage: {
       auto* meta_page = reinterpret_cast<MetaPage*>(target);
@@ -153,9 +165,14 @@ void PagePool::ReadFrom(Page* target, uint64_t pid) {
     case PageType::kFreePage:
       break;
   }
+  if (needs_recover) {
+    LOG(ERROR) << "Page " << target->PageId() << " checksum matched";
+  } else {
+    LOG(INFO) << "Page " << target->PageId() << " checksum matched";
+  }
   if (!needs_recover) return;
 
-  LOG_ERROR("page checksum unmatched on %lu", pid);
+  LOG(ERROR) << "page checksum unmatched on " << pid;
 }
 
 }  // namespace tinylamb

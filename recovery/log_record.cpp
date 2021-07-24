@@ -65,12 +65,13 @@ LogRecord LogRecord::CheckpointLogRecord(uint64_t p, uint64_t txn,
 }
 
 LogRecord LogRecord::AllocatePageLogRecord(uint64_t p, uint64_t txn,
-                                           uint64_t pid) {
+                                           uint64_t pid, PageType type) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
   l.type = LogType::kSystemAllocPage;
-  l.allocate_page_id = pid;
+  l.allocated_page_id = pid;
+  l.allocated_page_type = type;
   l.length = l.Size();
   return l;
 }
@@ -114,7 +115,7 @@ size_t LogRecord::Size() const {
     case LogType::kCommit:
       break;
     case LogType::kSystemAllocPage:
-      size += sizeof(allocate_page_id);
+      size += sizeof(allocated_page_id) + sizeof(PageType);
       break;
     case LogType::kSystemDestroyPage:
       size += sizeof(destroy_page_id);
@@ -199,13 +200,16 @@ size_t LogRecord::Size() const {
       break;
     }
     case LogType::kSystemAllocPage:
-      memcpy(result.data() + offset, &allocate_page_id,
-             sizeof(allocate_page_id));
-      offset += sizeof(allocate_page_id);
+      memcpy(result.data() + offset, &allocated_page_id,
+             sizeof(allocated_page_id));
+      offset += sizeof(allocated_page_id);
+      memcpy(result.data() + offset, &allocated_page_type,
+             sizeof(allocated_page_type));
+      offset += sizeof(allocated_page_type);
       break;
     case LogType::kSystemDestroyPage:
       memcpy(result.data() + offset, &destroy_page_id, sizeof(destroy_page_id));
-      offset += sizeof(allocate_page_id);
+      offset += sizeof(allocated_page_id);
       break;
   }
   return result;

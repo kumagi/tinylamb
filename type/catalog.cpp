@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 
-#include "macro.hpp"
+#include "log_message.hpp"
 #include "page/catalog_page.hpp"
 #include "page/page.hpp"
 #include "page/page_manager.hpp"
@@ -21,7 +21,7 @@ CatalogPage* Catalog::GetCatalogPage() {
 Catalog::Catalog(PageManager* pm) : pm_(pm) {
   auto* catalog_page = GetCatalogPage();
   if (catalog_page->Type() != PageType::kCatalogPage) {
-    LOG_ERROR("No catalog found, initializing");
+    LOG(ERROR) << "No catalog found, initializing";
     catalog_page->PageInit(kCatalogPageId, PageType::kCatalogPage);
     catalog_page->Initialize();
   }
@@ -39,14 +39,13 @@ bool Catalog::CreateTable(Transaction& txn, Schema& schema) {
   Transaction new_page_txn = txn.SpawnSystemTransaction();
   Page* data_page =
       pm_->AllocateNewPage(new_page_txn, PageType::kFixedLengthRow);
-  schema.SetTableRoot(data_page->PageId());
   RowPosition result = catalog_page->AddSchema(txn, schema);
 
   // TODO: fix if schema may have variable length data.
   auto* rp = reinterpret_cast<RowPage*>(data_page);
-  rp->Metadata().row_size = schema.FixedRowSize();
+  rp->row_size_ = schema.FixedRowSize();
 
-  pm_->Unpin(data_page->Header().page_id);
+  pm_->Unpin(data_page->page_id);
   pm_->Unpin(catalog_page->PageId());
   return result.IsValid();
 }

@@ -17,12 +17,13 @@ namespace tinylamb {
 struct Row {
   Row() = default;
   Row(void* d, size_t l, RowPosition p);
+  Row(std::string_view redo, RowPosition p);
 
   Row& operator=(const Row& orig);
 
   void SetValue(const Schema& sc, size_t idx, const Value& v);
 
-  bool Write(const Schema& sc, const Row& from);
+  bool Write(std::string_view from);
 
   bool Read(char* data, size_t length, const RowPosition& pos);
 
@@ -45,9 +46,7 @@ struct Row {
 
   void MakeOwned();
 
-  [[nodiscard]] bool IsOwned() const {
-    return !owned_data.empty();
-  }
+  [[nodiscard]] bool IsOwned() const { return !owned_data.empty(); }
 
   std::string_view data;
   RowPosition pos;  // Origin of the row, if exists.
@@ -56,4 +55,4 @@ struct Row {
 
 }  // namespace tinylamb
 
-#endif // TINYLAMB_ROW_HPP
+#endif  // TINYLAMB_ROW_HPP

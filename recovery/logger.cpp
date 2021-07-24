@@ -30,11 +30,11 @@ Logger::~Logger() {
 }
 
 uint64_t Logger::AddLog(LogRecord& log) {
-  log.SetLSN(next_lsn_++);
-  std::string data = log.Serialize();
   for (;;) {
     std::scoped_lock lk(latch_);
-    const uint64_t lsn = next_lsn_;
+    const uint64_t lsn = next_lsn_++;
+    log.SetLSN(lsn);
+    std::string data = log.Serialize();
     if (buffer_.size() < written_pos_ + data.size()) {
       const size_t fraction = buffer_.size() - written_pos_;
       std::memcpy(buffer_.data() + written_pos_, data.data(), fraction);

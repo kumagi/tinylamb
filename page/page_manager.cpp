@@ -1,9 +1,9 @@
 #include "page_manager.hpp"
 
-#include <recovery/log_record.hpp>
+#include "recovery/log_record.hpp"
 #include <sstream>
 
-#include "recovery/logger.hpp"
+#include "page/meta_page.hpp"
 
 namespace tinylamb {
 
@@ -15,7 +15,7 @@ PageManager::PageManager(std::string_view name, size_t capacity)
 
 Page* PageManager::GetPage(uint64_t page_id) {
   MetaPage& m = GetMetaPage();
-  m.MetaData().max_page_count = std::max(m.MetaData().max_page_count, page_id);
+  m.max_page_count = std::max(m.max_page_count, page_id);
   UnpinMetaPage();
   return pool_.GetPage(page_id);
 }
@@ -40,7 +40,7 @@ MetaPage& PageManager::GetMetaPage() {
     throw std::runtime_error("failed to get meta page");
   }
   if (meta_page->Type() != PageType::kMetaPage) {
-    LOG_ERROR("Unrecoverable meta page crash detected, initialize all");
+    LOG(ERROR) << "Unrecoverable meta page crash detected, recovering all";
     meta_page->PageInit(kMetaPageId, PageType::kMetaPage);
   }
   return *reinterpret_cast<MetaPage*>(meta_page);

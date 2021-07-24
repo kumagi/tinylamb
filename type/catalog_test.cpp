@@ -4,11 +4,12 @@
 #include <string>
 
 #include "gtest/gtest.h"
+#include "page/page_manager.hpp"
 #include "recovery/logger.hpp"
 #include "transaction/lock_manager.hpp"
+#include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/schema.hpp"
-#include "page/page_manager.hpp"
 
 namespace tinylamb {
 
@@ -45,11 +46,13 @@ class CatalogTest : public ::testing::Test {
 TEST_F(CatalogTest, Construction) {}
 
 TEST_F(CatalogTest, CreateTable) {
-  Schema sc("test_table_for_create");
-  sc.AddColumn("int_column", ValueType::kInt64, 8, 0);
-  sc.AddColumn("varchar_column", ValueType::kVarChar, 16, 0);
+  Column c1("int_column", ValueType::kInt64, 8, Restriction::kNoRestriction, 0);
+  Column c2("varchar_column", ValueType::kVarChar, 16,
+            Restriction::kNoRestriction, 8);
+  std::vector<Column> columns = {c1, c2};
+  Schema sc("test_table_for_create", columns, 2);
   std::cerr << "inserting schema: " << sc << "\n";
-  auto txn = tm_->BeginTransaction();
+  auto txn = tm_->Begin();
   ASSERT_TRUE(c_->CreateTable(txn, sc));
   ASSERT_EQ(c_->Schemas(), 1u);
   c_->DebugDump(std::cout);
@@ -60,31 +63,41 @@ TEST_F(CatalogTest, CreateTable) {
 
 TEST_F(CatalogTest, GetTable) {
   static const char kTableName[] = "test_table_for_get";
-  auto txn = tm_->BeginTransaction();
-  Schema sc(kTableName);
-  sc.AddColumn("int_column", ValueType::kInt64, 8, 0);
-  sc.AddColumn("varchar_column", ValueType::kVarChar, 16, 0);
+  Column c1("int_column", ValueType::kInt64, 8, Restriction::kNoRestriction, 0);
+  Column c2("varchar_column", ValueType::kVarChar, 16,
+            Restriction::kNoRestriction, 8);
+  std::vector<Column> columns = {c1, c2};
+  Schema sc(kTableName, columns, 2);
+  LOG(DEBUG) << sc;
+  auto txn = tm_->Begin();
   ASSERT_TRUE(c_->CreateTable(txn, sc));
-  ASSERT_EQ(c_->GetSchema(txn, kTableName).Name(), kTableName);
+  ASSERT_EQ(c_->GetSchema(txn, kTableName), sc);
   txn.PreCommit();
   txn.CommitWait();
 }
 
-TEST_F(CatalogTest, Recover) {
+TEST_F(CatalogTest, DISABLED_Recover) {
+  static const char kTableName[] = "test_table_for_recover";
+  Column c1("int_column", ValueType::kInt64, 8, Restriction::kNoRestriction, 0);
+  Column c2("varchar_column", ValueType::kVarChar, 16,
+            Restriction::kNoRestriction, 8);
+  std::vector<Column> columns = {c1, c2};
+  Schema sc(kTableName, columns, 2);
   {
-    auto txn = tm_->BeginTransaction();
-    Schema sc("test_table_for_recover");
-    sc.AddColumn("int_column", ValueType::kInt64, 8, 0);
-    sc.AddColumn("varchar_column", ValueType::kVarChar, 16, 0);
+    auto txn = tm_->Begin();
     ASSERT_TRUE(c_->CreateTable(txn, sc));
     txn.PreCommit();
     txn.CommitWait();
   }
+  LOG(TRACE) << "try recover\n";
   Recover();
+  LOG(TRACE) << "recovered\n";
   {
-    auto txn = tm_->BeginTransaction();
+    auto txn = tm_->Begin();
     ASSERT_EQ(c_->GetSchema(txn, "test_table_for_recover").Name(),
               "test_table_for_recover");
+    Schema recovered_schema(c_->GetSchema(txn, kTableName));
+    ASSERT_EQ(sc, recovered_schema);
     txn.PreCommit();
     txn.CommitWait();
   }

@@ -2,6 +2,7 @@
 #define TINYLAMB_LOG_RECORD_HPP
 
 #include <cassert>
+#include <page/page.hpp>
 #include <unordered_set>
 #include <utility>
 
@@ -23,10 +24,9 @@ enum class LogType : uint16_t {
 };
 
 struct LogRecord {
- private:
+ public:
   LogRecord() = default;
 
- public:
   LogRecord(uint64_t p, uint64_t txn, LogType t);
 
   static LogRecord InsertingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
@@ -44,7 +44,7 @@ struct LogRecord {
                                        std::unordered_set<uint64_t> tt);
 
   static LogRecord AllocatePageLogRecord(uint64_t p, uint64_t txn,
-                                         uint64_t pid);
+                                         uint64_t pid, PageType type);
 
   static LogRecord DestroyPageLogRecord(uint64_t p, uint64_t txn, uint64_t pid);
 
@@ -61,35 +61,35 @@ struct LogRecord {
         o << "(unknown) ";
         break;
       case LogType::kBegin:
-        o << "BEGIN ";
+        o << "BEGIN\t\t";
         break;
       case LogType::kInsertRow:
-        o << "INSERT " << l.redo_data << " ";
+        o << "INSERT\t\t" << l.redo_data << " ";
         break;
       case LogType::kUpdateRow:
-        o << "UPDATE " << l.undo_data << " -> " << l.redo_data << " ";
+        o << "UPDATE\t\t" << l.undo_data << " -> " << l.redo_data << " ";
         break;
       case LogType::kDeleteRow:
-        o << "DELETE " << l.undo_data << " ";
+        o << "DELETE\t\t" << l.undo_data << " ";
         break;
       case LogType::kCommit:
-        o << "COMMIT ";
+        o << "COMMIT\t\t";
         break;
       case LogType::kBeginCheckpoint:
-        o << "BEGIN CHECKPOINT ";
+        o << "BEGIN CHECKPOINT\t";
         break;
       case LogType::kEndCheckpoint:
-        o << "END CHECKPOINT ";
+        o << "END CHECKPOINT\t";
         break;
       case LogType::kSystemAllocPage:
-        o << "ALLOCATE PAGE " << l.allocate_page_id << " ";
+        o << "ALLOCATE PAGE " << l.allocated_page_id << "\t";
         break;
       case LogType::kSystemDestroyPage:
-        o << "DESTROY PAGE " << l.destroy_page_id << " ";
+        o << "DESTROY PAGE " << l.destroy_page_id << "\t";
         break;
     }
-    o << " lsn: " << l.lsn << " prev_lsn:" << l.prev_lsn
-      << " txn_id: " << l.txn_id;
+    o << "lsn: " << l.lsn << "\tprev_lsn: " << l.prev_lsn
+      << "\ttxn_id: " << l.txn_id;
     return o;
   }
 
@@ -105,7 +105,8 @@ struct LogRecord {
   std::unordered_set<uint64_t> transaction_table;
 
   // Page alloc/destroy target.b
-  uint64_t allocate_page_id;
+  uint64_t allocated_page_id;
+  PageType allocated_page_type;
   uint64_t destroy_page_id;
 
   uint16_t length;

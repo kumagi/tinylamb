@@ -1,11 +1,13 @@
 #include "page_manager.hpp"
 
 #include <string>
-#include <transaction/lock_manager.hpp>
-#include <transaction/transaction_manager.hpp>
 
-#include "free_page.hpp"
 #include "gtest/gtest.h"
+#include "page/free_page.hpp"
+#include "recovery/logger.hpp"
+#include "transaction/lock_manager.hpp"
+#include "transaction/transaction.hpp"
+#include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
 
@@ -36,7 +38,7 @@ class PageManagerTest : public ::testing::Test {
   }
 
   Page* AllocatePage(PageType expected_type) {
-    Transaction system_txn = tm_->BeginTransaction();
+    Transaction system_txn = tm_->Begin();
     Page* new_page = p_->AllocateNewPage(system_txn, expected_type);
     EXPECT_NE(new_page, nullptr);
     EXPECT_EQ(new_page->Type(), PageType::kFreePage);
@@ -44,7 +46,7 @@ class PageManagerTest : public ::testing::Test {
   }
 
   void DestroyPage(Page* target) {
-    Transaction system_txn = tm_->BeginTransaction();
+    Transaction system_txn = tm_->Begin();
     p_->DestroyPage(system_txn, target);
   }
 
@@ -62,7 +64,7 @@ TEST_F(PageManagerTest, AllocateNewPage) {
   for (int i = 0; i <= kPages; ++i) {
     auto* page = reinterpret_cast<FreePage*>(AllocatePage(PageType::kFreePage));
     char* buff = page->FreeBody();
-    for (size_t j = 0; j < FreePage::kFreeBodySize; ++j) {
+    for (size_t j = 0; j < kFreeBodySize; ++j) {
       buff[j] = static_cast<char>((page->PageId() + j) & 0xff);
     }
     allocated_ids.insert(page->PageId());
@@ -72,7 +74,7 @@ TEST_F(PageManagerTest, AllocateNewPage) {
   for (const auto& id : allocated_ids) {
     auto* page = reinterpret_cast<FreePage*>(p_->GetPage(id));
     char* buff = page->FreeBody();
-    for (size_t j = 0; j < FreePage::kFreeBodySize; ++j) {
+    for (size_t j = 0; j < kFreeBodySize; ++j) {
       ASSERT_EQ(buff[j], static_cast<char>((id + j) & 0xff));
     }
     ASSERT_TRUE(p_->Unpin(page->PageId()));

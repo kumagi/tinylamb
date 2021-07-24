@@ -1,14 +1,16 @@
 #ifndef TINYLAMB_PAGE_MANAGER_HPP
 #define TINYLAMB_PAGE_MANAGER_HPP
 
-#include "macro.hpp"
-#include "page/meta_page.hpp"
+#include "log_message.hpp"
 #include "page/page.hpp"
 #include "page/page_pool.hpp"
 
 namespace tinylamb {
 
 class Logger;
+class Recovery;
+class MetaPage;
+class Transaction;
 
 class PageManager {
   static constexpr uint64_t kMetaPageId = 0;
@@ -31,6 +33,7 @@ class PageManager {
   void UnpinMetaPage() { pool_.Unpin(kMetaPageId); }
 
  private:
+  friend class Recovery;
   PagePool pool_;
 };
 

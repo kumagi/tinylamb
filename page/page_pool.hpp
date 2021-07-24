@@ -4,19 +4,21 @@
 #include <cassert>
 #include <fstream>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
-#include <memory>
 
-#include "../constants.hpp"
-#include "page.hpp"
+#include "constants.hpp"
+#include "page/page.hpp"
 
 namespace tinylamb {
 
 class PagePool {
  private:
   struct Entry {
+    Entry() = default;
+
     // If pinned, this page will never been evicted.
     uint32_t pin_count = 0;
 
@@ -40,7 +42,6 @@ class PagePool {
   ~PagePool();
 
  private:
-
   bool EvictPage(LruType::iterator target);
 
   // Scan first unpinned page and evict it.
@@ -49,7 +50,7 @@ class PagePool {
 
   Page* AllocNewPage(size_t pid);
 
-private:
+ private:
   void Touch(LruType::iterator it);
 
   void WriteBack(const Page* target);
@@ -74,4 +75,4 @@ private:
 
 }  // namespace tinylamb
 
-#endif // TINYLAMB_PAGEPOOL_HPP
+#endif  // TINYLAMB_PAGEPOOL_HPP

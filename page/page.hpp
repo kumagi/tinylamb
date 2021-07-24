@@ -6,9 +6,11 @@
 #include <iostream>
 
 #include "constants.hpp"
-#include "macro.hpp"
+#include "log_message.hpp"
 
 namespace tinylamb {
+
+class RowPosition;
 
 enum class PageType : uint64_t {
   kUnknown = 0,
@@ -21,55 +23,41 @@ enum class PageType : uint64_t {
 
 std::ostream& operator<<(std::ostream& o, const PageType& type);
 
-struct PageHeader {
-  uint64_t page_id = 0;
-  uint64_t last_lsn = 0;
-  enum PageType type = PageType::kUnknown;
-  [[nodiscard]] uint64_t CalcChecksum() const;
-  mutable uint64_t checksum = 0;
-  void Initialize(uint64_t pid, PageType t) {
-    page_id = pid;
-    last_lsn = 0;
-    type = t;
-  }
-};
-
-struct Page {
+class Page {
  public:
-  const static size_t kBodySize = kPageSize - sizeof(PageHeader);
   Page(size_t page_id, PageType type);
   void PageInit(uint64_t page_id, PageType type);
 
-  PageHeader& Header() { return *reinterpret_cast<PageHeader*>(payload); }
-  [[nodiscard]] const PageHeader& Header() const {
-    return *reinterpret_cast<const PageHeader*>(payload);
-  }
-  [[nodiscard]] uint64_t PageId() const { return Header().page_id; }
-  [[nodiscard]] PageType Type() const { return Header().type; }
-  template <typename T>
-  T& BodyAs() {
-    return *reinterpret_cast<T*>(payload + sizeof(PageHeader));
-  }
-  template <typename T>
-  const T& BodyAs() const {
-    return *reinterpret_cast<const T*>(payload + sizeof(PageHeader));
-  }
-  char* Body() { return reinterpret_cast<char*>(payload + sizeof(PageHeader)); }
-  [[nodiscard]] const char* Body() const {
-    return reinterpret_cast<const char*>(payload + sizeof(PageHeader));
-  }
-  char* Data() { return reinterpret_cast<char*>(payload); }
-  [[nodiscard]] const char* Data() const {
-    return reinterpret_cast<const char*>(payload);
-  }
+  [[nodiscard]] uint64_t PageId() const { return page_id; }
+  [[nodiscard]] PageType Type() const { return type; }
+
+  void InsertImpl(std::string_view redo);
+
+  void UpdateImpl(const RowPosition& pos, std::string_view redo);
+
+  void DeleteImpl(const RowPosition& pos);
+
   void SetChecksum() const;
-  [[nodiscard]] uint64_t GetChecksum() const;
+
   [[nodiscard]] bool IsValid() const;
-  char payload[kPageSize];
+  void* operator new(size_t page_id);
+  void operator delete(void* page) noexcept;
+
+  uint64_t page_id = 0;
+  uint64_t last_lsn = 0;
+  enum PageType type = PageType::kUnknown;
+  mutable uint64_t checksum = 0;
+  char page_body[0];
 };
 
-static_assert(sizeof(Page) == kPageSize);
+const static size_t kPageBodySize = kPageSize - sizeof(Page);
 
 }  // namespace tinylamb
+
+template<>
+class std::hash<tinylamb::Page> {
+ public:
+  uint64_t operator()(const tinylamb::Page& p) const;
+};
 
 #endif  // TINYLAMB_PAGE_HPP

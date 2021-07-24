@@ -64,9 +64,9 @@ TEST_F(PagePoolTest, PersistencyWithReset) {
   constexpr size_t kPages = 11;
   for (int i = 0; i < kPages; ++i) {
     Page* p = pp->GetPage(i);
-    char* buff = p->Body();
+    char* buff = p->page_body;
     ASSERT_NE(buff, nullptr);
-    for (size_t j = 0; j < Page::kBodySize; ++j) {
+    for (size_t j = 0; j < kPageBodySize; ++j) {
       buff[j] = i;
     }
     pp->Unpin(i);
@@ -74,9 +74,9 @@ TEST_F(PagePoolTest, PersistencyWithReset) {
   // Reset();
   for (int i = 0; i < kPages; ++i) {
     Page* p = pp->GetPage(i);
-    char* buff = p->Body();
+    char* buff = p->page_body;
     ASSERT_NE(buff, nullptr);
-    for (size_t j = 0; j < Page::kBodySize; ++j) {
+    for (size_t j = 0; j < kPageBodySize; ++j) {
       EXPECT_EQ(buff[j], i);
     }
     pp->Unpin(i);

@@ -7,23 +7,30 @@
 #include "page/page_manager.hpp"
 #include "recovery/logger.hpp"
 #include "transaction/lock_manager.hpp"
+#include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
+#include "type/catalog.hpp"
+#include "type/column.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
 
 class SingleSchemaRowPageTest : public ::testing::Test {
  protected:
-  static constexpr char kFileName[] = "row_page_test.db";
+  static constexpr char kDBFileName[] = "row_page_test.db";
   static constexpr char kLogName[] = "row_page_test.log";
   static constexpr char kTableName[] = "test-table_for_row_page";
 
   void SetUp() override {
     Recover();
-    Schema sc = Schema(kTableName);
-    sc.AddColumn("int_column", ValueType::kInt64, 8, 0);
-    sc.AddColumn("varchar_column", ValueType::kVarChar, 16, 0);
-    auto txn = tm_->BeginTransaction();
+    std::vector<Column> columns = {
+        Column("int_column", ValueType::kInt64, 8, Restriction::kNoRestriction,
+               0),
+        Column("varchar_column", ValueType::kVarChar, 16,
+               Restriction::kNoRestriction, 8),
+    };
+    Schema sc = Schema(kTableName, columns, 2);
+    auto txn = tm_->Begin();
     ASSERT_TRUE(c_->CreateTable(txn, sc));
     ASSERT_EQ(c_->Schemas(), 1);
     txn.PreCommit();
@@ -37,20 +44,7 @@ class SingleSchemaRowPageTest : public ::testing::Test {
     l_.reset();
     c_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(kFileName, 10);
-    c_ = std::make_unique<Catalog>(p_.get());
-    l_ = std::make_unique<Logger>(kLogName);
-    lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get());
-  }
-  void MediaFailure() {
-    tm_.reset();
-    lm_.reset();
-    l_.reset();
-    c_.reset();
-    p_.reset();
-    std::remove(kFileName);
-    p_ = std::make_unique<PageManager>(kFileName, 10);
+    p_ = std::make_unique<PageManager>(kDBFileName, 10);
     c_ = std::make_unique<Catalog>(p_.get());
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
@@ -58,7 +52,7 @@ class SingleSchemaRowPageTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    std::remove(kFileName);
+    std::remove(kDBFileName);
     std::remove(kLogName);
   }
 
@@ -72,12 +66,12 @@ class SingleSchemaRowPageTest : public ::testing::Test {
   }
 
   void InsertRow(int num, std::string_view str) {
-    auto txn = tm_->BeginTransaction();
+    auto txn = tm_->Begin();
     Schema s = c_->GetSchema(txn, kTableName);
     Row r;
     r.SetValue(s, 0, Value(num));
     r.SetValue(s, 1, Value(str.data()));
-    uint64_t data_pid = s.GetTableRoot();
+    uint64_t data_pid = s.RowPage();
     auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
     ASSERT_NE(p, nullptr);
     ASSERT_EQ(p->Type(), PageType::kFixedLengthRow);
@@ -97,12 +91,12 @@ class SingleSchemaRowPageTest : public ::testing::Test {
 };
 
 TEST_F(SingleSchemaRowPageTest, Insert) {
-  auto txn = tm_->BeginTransaction();
+  auto txn = tm_->Begin();
   Schema s = c_->GetSchema(txn, kTableName);
   Row r;
   r.SetValue(s, 0, Value(23));
   r.SetValue(s, 1, Value("hello"));
-  uint64_t data_pid = s.GetTableRoot();
+  uint64_t data_pid = s.RowPage();
   auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
   ASSERT_NE(p, nullptr);
   ASSERT_EQ(p->Type(), PageType::kFixedLengthRow);
@@ -116,12 +110,12 @@ TEST_F(SingleSchemaRowPageTest, Insert) {
 
 TEST_F(SingleSchemaRowPageTest, InsertMany) {
   constexpr int kInserts = 32;
-  auto txn = tm_->BeginTransaction();
+  auto txn = tm_->Begin();
   Schema s = c_->GetSchema(txn, kTableName);
   Row r;
   r.SetValue(s, 0, Value(23));
   r.SetValue(s, 1, Value("hello"));
-  uint64_t data_pid = s.GetTableRoot();
+  uint64_t data_pid = s.RowPage();
   auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
   ASSERT_NE(p, nullptr);
   ASSERT_EQ(p->Type(), PageType::kFixedLengthRow);
@@ -142,9 +136,9 @@ TEST_F(SingleSchemaRowPageTest, ReadMany) {
     InsertRow(i * i, kMessage);
   }
   Recover();
-  auto txn = tm_->BeginTransaction();
+  auto txn = tm_->Begin();
   Schema s = c_->GetSchema(txn, kTableName);
-  uint64_t data_pid = s.GetTableRoot();
+  uint64_t data_pid = s.RowPage();
   auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
   for (int i = 0; i < kRows; ++i) {
     RowPosition pos(p->PageId(), i);
@@ -169,9 +163,9 @@ TEST_F(SingleSchemaRowPageTest, UpdateMany) {
   Recover();
   {
     // Update even rows.
-    auto txn = tm_->BeginTransaction();
+    auto txn = tm_->Begin();
     Schema s = c_->GetSchema(txn, kTableName);
-    uint64_t data_pid = s.GetTableRoot();
+    uint64_t data_pid = s.RowPage();
     auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
     for (int i = 0; i < kRows; i += 2) {
       RowPosition pos(p->PageId(), i);
@@ -192,9 +186,9 @@ TEST_F(SingleSchemaRowPageTest, UpdateMany) {
   Recover();
   {
     // Check rows.
-    auto txn = tm_->BeginTransaction();
+    auto txn = tm_->Begin();
     Schema s = c_->GetSchema(txn, kTableName);
-    uint64_t data_pid = s.GetTableRoot();
+    uint64_t data_pid = s.RowPage();
     auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
     for (int i = 0; i < kRows; ++i) {
       RowPosition pos(p->PageId(), i);
@@ -226,9 +220,9 @@ TEST_F(SingleSchemaRowPageTest, DeleteMany) {
   }
   Recover();
   {
-    auto txn = tm_->BeginTransaction();
+    auto txn = tm_->Begin();
     Schema s = c_->GetSchema(txn, kTableName);
-    uint64_t data_pid = s.GetTableRoot();
+    uint64_t data_pid = s.RowPage();
     auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
     for (int i = 0; i < kRows / 3; i += 2) {
       RowPosition pos(p->PageId(), i);
@@ -239,7 +233,7 @@ TEST_F(SingleSchemaRowPageTest, DeleteMany) {
       auto it = inserted.find(col1.value.int_value);
       ASSERT_NE(it, inserted.end());
       inserted.erase(it);
-      ASSERT_TRUE(p->Delete(txn, pos ,s));
+      ASSERT_TRUE(p->Delete(txn, pos, s));
     }
     p_->Unpin(p->PageId());
     txn.PreCommit();
@@ -247,12 +241,12 @@ TEST_F(SingleSchemaRowPageTest, DeleteMany) {
   }
   Recover();
   {
-    auto txn = tm_->BeginTransaction();
+    auto txn = tm_->Begin();
     Schema s = c_->GetSchema(txn, kTableName);
-    uint64_t data_pid = s.GetTableRoot();
+    uint64_t data_pid = s.RowPage();
     auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
     std::unordered_set<int64_t> existing;
-    for (size_t i = 0; i < p->Metadata().row_count; ++i) {
+    for (size_t i = 0; i < p->RowCount(); ++i) {
       RowPosition pos(p->PageId(), i);
       Row ret;
       ASSERT_TRUE(p->Read(txn, pos, s, ret));
@@ -265,26 +259,6 @@ TEST_F(SingleSchemaRowPageTest, DeleteMany) {
     txn.PreCommit();
     txn.CommitWait();
   }
-}
-
-TEST_F(SingleSchemaRowPageTest, DISABLED_RecoverFromLog) {
-  constexpr char kMessage[] = "this is a pen";
-  InsertRow(12, kMessage);
-  MediaFailure();
-  auto txn = tm_->BeginTransaction();
-  Schema s = c_->GetSchema(txn, kTableName);
-  uint64_t data_pid = s.GetTableRoot();
-  auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
-  RowPosition pos(p->PageId(), 0);
-  Row ret;
-  ASSERT_TRUE(p->Read(txn, pos, s, ret));
-  ASSERT_FALSE(ret.IsOwned());
-  Value col1, col2;
-  ASSERT_TRUE(ret.GetValue(s, 0, col1));
-  ASSERT_TRUE(ret.GetValue(s, 1, col2));
-  ASSERT_EQ(col1.value.int_value, 12);
-  ASSERT_EQ(std::string(col2.value.varchar_value), std::string(kMessage));
-  p_->Unpin(p->PageId());
 }
 
 }  // namespace tinylamb

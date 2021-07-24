@@ -12,6 +12,8 @@ namespace tinylamb {
 Row::Row(void* d, size_t l, RowPosition p)
     : data(reinterpret_cast<char*>(d), l), pos(p) {}
 
+Row::Row(std::string_view redo, RowPosition p) : data(redo), pos(p) {}
+
 Row& Row::operator=(const Row& orig) {
   owned_data = orig.owned_data;
   data = orig.owned_data.empty() ? orig.data : std::string_view(owned_data);
@@ -19,11 +21,11 @@ Row& Row::operator=(const Row& orig) {
   return *this;
 }
 
-bool Row::Write(const Schema& sc, const Row& from) {
-  if (data.size() < sc.FixedRowSize()) {
+bool Row::Write(std::string_view from) {
+  if (data.size() < from.size()) {
     return false;
   }
-  memcpy(const_cast<char*>(data.data()), from.data.data(), sc.FixedRowSize());
+  memcpy(const_cast<char*>(data.data()), from.data(), from.size());
   return true;
 }
 
@@ -36,13 +38,13 @@ bool Row::Read(char* ptr, size_t length, const RowPosition& row_pos) {
 
 void Row::SetValue(const Schema& sc, size_t idx, const Value& v) {
   const Column& c = sc.GetColumn(idx);
-  if (data.size() < c.offset + c.PhysicalSize()) {
+  if (data.size() < c.Offset() + c.ValueLength()) {
     MakeOwned();
-    owned_data.resize(c.offset + c.PhysicalSize());
+    owned_data.resize(c.Offset() + c.ValueLength());
     data = std::string_view(owned_data);
   }
-  char* ptr = const_cast<char*>(data.data() + c.offset);
-  switch (c.type) {
+  char* ptr = const_cast<char*>(data.data() + c.Offset());
+  switch (c.Type()) {
     case ValueType::kUnknown:
       assert(!"Cannot set unknown type");
     case ValueType::kInt64: {
@@ -58,11 +60,11 @@ void Row::SetValue(const Schema& sc, size_t idx, const Value& v) {
 
 bool Row::GetValue(Schema& sc, uint16_t idx, Value& dst) {
   const Column& c = sc.GetColumn(idx);
-  if (data.size() < c.offset + c.value_length) {
+  if (data.size() < c.Offset() + c.ValueLength()) {
     return false;
   }
-  char* ptr = const_cast<char*>(data.data() + c.offset);
-  switch (c.type) {
+  char* ptr = const_cast<char*>(data.data() + c.Offset());
+  switch (c.Type()) {
     case ValueType::kUnknown:
       assert(!"Cannot read unknown type");
     case ValueType::kInt64:
@@ -72,7 +74,7 @@ bool Row::GetValue(Schema& sc, uint16_t idx, Value& dst) {
       dst.value.varchar_value = reinterpret_cast<char*>(ptr);
       break;
   }
-  dst.length = c.value_length;
+  dst.length = c.ValueLength();
   return true;
 }
 

@@ -34,10 +34,20 @@ struct RowPosition {
     return page_id == rhs.page_id && slot == rhs.slot;
   }
 
+  static constexpr size_t Size() {
+    return sizeof(page_id) + sizeof(slot);
+  }
+
   size_t Serialize(char* dst) const {
     memcpy(dst, &page_id, sizeof(page_id));
     memcpy(dst + sizeof(page_id), &slot, sizeof(slot));
-    return sizeof(page_id) + sizeof(slot);
+    return Size();
+  }
+
+  size_t Parse(const char* src) {
+    memcpy(&page_id, src, sizeof(page_id));
+    memcpy(&slot, src + sizeof(page_id), sizeof(slot));
+    return Size();
   }
 };
 

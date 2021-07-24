@@ -1,11 +1,7 @@
 #include "page.hpp"
 
-#include <unistd.h>
-
 #include <cstring>
-#include <fstream>
 #include <iostream>
-#include <sstream>
 
 #include "free_page.hpp"
 #include "page/catalog_page.hpp"
@@ -38,16 +34,13 @@ std::ostream& operator<<(std::ostream& o, const PageType& type) {
   return o;
 }
 
-[[nodiscard]] uint64_t PageHeader::CalcChecksum() const {
-  return std::hash<uint64_t>()(page_id) + std::hash<uint64_t>()(last_lsn) +
-         std::hash<uint64_t>()(static_cast<unsigned long>(type));
-}
-
 Page::Page(size_t page_id, PageType type) { PageInit(page_id, type); }
 
-void Page::PageInit(uint64_t page_id, PageType type) {
-  memset(payload, 0, kPageSize);
-  Header().Initialize(page_id, type);
+void Page::PageInit(uint64_t pid, PageType page_type) {
+  memset(this, 0, kPageSize);
+  page_id = pid;
+  last_lsn = 0;
+  type = page_type;
   switch (type) {
     case PageType::kUnknown:
       throw std::runtime_error("unknown type won't expect to be PageInit");
@@ -64,41 +57,111 @@ void Page::PageInit(uint64_t page_id, PageType type) {
       reinterpret_cast<RowPage*>(this)->Initialize();
       break;
     case PageType::kVariableRow:
-      throw std::runtime_error("Initialization of VariableRow is not implemented");
+      throw std::runtime_error(
+          "Initialization of VariableRow is not implemented");
   }
 }
 
-void Page::SetChecksum() const {
-  uint64_t checksum = GetChecksum();
-  Header().checksum = checksum;
-}
+void Page::SetChecksum() const { checksum = std::hash<Page>()(*this); }
 
-uint64_t Page::GetChecksum() const {
-  constexpr uint64_t kChecksumSalt = 0xcafebabe;
-  uint64_t checksum = kChecksumSalt + Header().CalcChecksum();
+void Page::InsertImpl(std::string_view redo) {
   switch (Type()) {
-    case PageType::kUnknown:
-      throw std::runtime_error("unknown type page " + std::to_string(PageId()) +
-                               " cannot calculate the checksum");
-    case PageType::kMetaPage: {
-      checksum += reinterpret_cast<const MetaPage*>(this)->CalcChecksum();
+    case PageType::kFixedLengthRow: {
+      auto* rp = reinterpret_cast<RowPage*>(this);
+      rp->InsertRow(redo);
       break;
+    }
+    case PageType::kVariableRow: {
+      throw std::runtime_error("Not implemented error");
     }
     case PageType::kCatalogPage: {
-      checksum += reinterpret_cast<const CatalogPage*>(this)->CalcChecksum();
+      auto* cp = reinterpret_cast<CatalogPage*>(this);
+      cp->InsertSchema(redo);
       break;
     }
-    case PageType::kFixedLengthRow: {
-      checksum += reinterpret_cast<const RowPage*>(this)->CalcChecksum();
+    default: {
+      LOG(ERROR) << "Cannot apply Insert log";
       break;
     }
-    case PageType::kVariableRow:
-      break;
   }
-  Header().checksum = checksum;
-  return checksum;
 }
 
-bool Page::IsValid() const { return Header().checksum == GetChecksum(); }
+void Page::UpdateImpl(const RowPosition& pos, std::string_view redo) {
+  switch (Type()) {
+    case PageType::kFixedLengthRow: {
+      auto* rp = reinterpret_cast<RowPage*>(this);
+      rp->UpdateRow(pos, redo);
+      break;
+    }
+    case PageType::kVariableRow: {
+      throw std::runtime_error("Not implemented error");
+    }
+    case PageType::kCatalogPage: {
+      auto* cp = reinterpret_cast<CatalogPage*>(this);
+      cp->UpdateSchema(pos, redo);
+      break;
+    }
+    default:
+      LOG(ERROR) << "Cannot apply Insert log";
+      break;
+  }
+}
+
+void Page::DeleteImpl(const RowPosition& pos) {
+  switch (Type()) {
+    case PageType::kFixedLengthRow: {
+      auto* rp = reinterpret_cast<RowPage*>(this);
+      rp->DeleteRow(pos);
+      break;
+    }
+    case PageType::kVariableRow: {
+      throw std::runtime_error("Not implemented error");
+    }
+    case PageType::kCatalogPage: {
+      auto* cp = reinterpret_cast<CatalogPage*>(this);
+      cp->DeleteSchema(pos);
+      break;
+    }
+    default:
+      LOG(ERROR) << "Cannot apply Insert log";
+      break;
+  }
+}
+
+bool Page::IsValid() const { return checksum == std::hash<Page>()(*this); }
+
+void* Page::operator new(size_t page_id) {
+  return new char[kPageSize];
+}
+
+void Page::operator delete(void* page) noexcept {
+  delete[] reinterpret_cast<char*>(page);
+}
 
 }  // namespace tinylamb
+
+uint64_t std::hash<tinylamb::Page>::operator()(const tinylamb::Page& p) const {
+  uint64_t header_hash =
+      std::hash<uint64_t>()(p.page_id) + std::hash<uint64_t>()(p.last_lsn) +
+      std::hash<uint64_t>()(static_cast<unsigned long>(p.type));
+  switch (p.type) {
+    case tinylamb::PageType::kUnknown:
+      throw std::runtime_error("Do not hash agains unknown page");
+    case tinylamb::PageType::kFreePage:
+      return header_hash + std::hash<tinylamb::FreePage>()(
+          reinterpret_cast<const tinylamb::FreePage&>(p));
+    case tinylamb::PageType::kMetaPage:
+      return header_hash + std::hash<tinylamb::MetaPage>()(
+                               reinterpret_cast<const tinylamb::MetaPage&>(p));
+    case tinylamb::PageType::kCatalogPage:
+      return header_hash +
+             std::hash<tinylamb::CatalogPage>()(
+                 reinterpret_cast<const tinylamb::CatalogPage&>(p));
+    case tinylamb::PageType::kFixedLengthRow:
+      return header_hash + std::hash<tinylamb::RowPage>()(
+                               reinterpret_cast<const tinylamb::RowPage&>(p));
+    case tinylamb::PageType::kVariableRow:
+      throw std::runtime_error("not implemented");
+  }
+  throw std::runtime_error("unknown page type");
+}

@@ -20,7 +20,16 @@ Transaction::Transaction(uint64_t txn_id, TransactionManager* tm,
       logger_(l) {}
 
 Transaction Transaction::SpawnSystemTransaction() {
-  return transaction_manager_->BeginTransaction();
+  return transaction_manager_->Begin();
+}
+
+bool Transaction::PreCommit() {
+  return transaction_manager_->PreCommit(*this);
+}
+
+void Transaction::Abort() {
+  transaction_manager_->Abort(*this);
+  status_ = TransactionStatus::kAborted;
 }
 
 void Transaction::SetStatus(TransactionStatus status) { status_ = status; }
@@ -46,23 +55,10 @@ bool Transaction::AddWriteSet(const RowPosition& rs) {
   return true;
 }
 
-bool Transaction::PreCommit() {
-  assert(!IsFinished());
-  LogRecord commit_log(prev_lsn_, txn_id_, LogType::kCommit);
-  SetStatus(TransactionStatus::kCommitted);
-  prev_lsn_ = logger_->AddLog(commit_log);
-  for (auto& row : read_set_) {
-    lock_manager_->ReleaseSharedLock(row);
-  }
-  for (auto& row : write_set_) {
-    lock_manager_->ReleaseExclusiveLock(row);
-  }
-  return true;
-}
-
 uint64_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pos, redo);
+  logger_->AddLog(lr);
   prev_lsn_ = logger_->AddLog(lr);
   return prev_lsn_;
 }
@@ -72,22 +68,25 @@ uint64_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
   assert(!IsFinished());
   LogRecord lr =
       LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pos, redo, undo);
-  prev_lsn_ = logger_->AddLog(lr);
+  logger_->AddLog(lr);
+  prev_lsn_ = lr.lsn;
   return prev_lsn_;
 }
 
 uint64_t Transaction::DeleteLog(const RowPosition& pos, std::string_view undo) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pos, undo);
-  prev_lsn_ = logger_->AddLog(lr);
+  logger_->AddLog(lr);
+  prev_lsn_ = lr.lsn;
   return prev_lsn_;
 }
 
-uint64_t Transaction::AllocatePageLog(uint64_t allocated_page_id) {
+uint64_t Transaction::AllocatePageLog(uint64_t allocated_page_id, PageType type) {
   assert(!IsFinished());
   LogRecord lr =
-      LogRecord::AllocatePageLogRecord(prev_lsn_, txn_id_, allocated_page_id);
-  prev_lsn_ = logger_->AddLog(lr);
+      LogRecord::AllocatePageLogRecord(prev_lsn_, txn_id_, allocated_page_id, type);
+  logger_->AddLog(lr);
+  prev_lsn_ = lr.lsn;
   return prev_lsn_;
 }
 
@@ -95,7 +94,8 @@ uint64_t Transaction::DestroyPageLog(uint64_t destroyed_page_id) {
   assert(!IsFinished());
   LogRecord lr =
       LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id);
-  prev_lsn_ = logger_->AddLog(lr);
+  logger_->AddLog(lr);
+  prev_lsn_ = lr.lsn;
   return prev_lsn_;
 }
 
