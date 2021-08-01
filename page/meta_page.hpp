@@ -16,7 +16,8 @@ struct MetaPage : public Page {
     first_free_page = 0;
   }
 
-  Page* AllocateNewPage(Transaction& txn, PageType type, PagePool& pool);
+  Page* AllocateNewPage(Transaction& txn, PageType type,
+                        PagePool& pool);
   void DestroyPage(Transaction& txn, Page* target, PagePool& pool);
 
   uint64_t max_page_count;
@@ -26,7 +27,7 @@ struct MetaPage : public Page {
 }  // namespace tinylamb
 
 namespace std {
-template<>
+template <>
 class hash<tinylamb::MetaPage> {
  public:
   uint64_t operator()(const tinylamb::MetaPage& m);

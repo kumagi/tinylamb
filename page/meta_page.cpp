@@ -23,7 +23,7 @@ Page* MetaPage::AllocateNewPage(Transaction& txn, PageType type,
     first_free_page = reinterpret_cast<FreePage*>(ret)->next_free_page;
   }
   ret->PageInit(new_page_id, type);
-  txn.AllocatePageLog(new_page_id, type);
+  txn.AllocatePageLog(new_page_id, header);
   txn.PreCommit();  // No need to wait for the log to be durable.
   last_lsn = txn.PrevLSN();
   return ret;
