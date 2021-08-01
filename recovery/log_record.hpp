@@ -44,7 +44,7 @@ struct LogRecord {
                                        std::unordered_set<uint64_t> tt);
 
   static LogRecord AllocatePageLogRecord(uint64_t p, uint64_t txn,
-                                         uint64_t pid, PageType type);
+                                         uint64_t pid, std::string_view initial_header);
 
   static LogRecord DestroyPageLogRecord(uint64_t p, uint64_t txn, uint64_t pid);
 
@@ -64,13 +64,13 @@ struct LogRecord {
         o << "BEGIN\t\t";
         break;
       case LogType::kInsertRow:
-        o << "INSERT\t\t" << l.redo_data << " ";
+        o << "INSERT\t\t" << l.redo_data.size() << "bytes ";
         break;
       case LogType::kUpdateRow:
-        o << "UPDATE\t\t" << l.undo_data << " -> " << l.redo_data << " ";
+        o << "UPDATE\t\t" << l.undo_data.size() << "bytes -> " << l.redo_data.size() << " ";
         break;
       case LogType::kDeleteRow:
-        o << "DELETE\t\t" << l.undo_data << " ";
+        o << "DELETE\t\t" << l.undo_data.size() << "bytes ";
         break;
       case LogType::kCommit:
         o << "COMMIT\t\t";
@@ -82,10 +82,10 @@ struct LogRecord {
         o << "END CHECKPOINT\t";
         break;
       case LogType::kSystemAllocPage:
-        o << "ALLOCATE PAGE " << l.allocated_page_id << "\t";
+        o << "ALLOCATE " << l.allocated_page_id << "\t";
         break;
       case LogType::kSystemDestroyPage:
-        o << "DESTROY PAGE " << l.destroy_page_id << "\t";
+        o << "DESTROY " << l.destroy_page_id << "\t";
         break;
     }
     o << "lsn: " << l.lsn << "\tprev_lsn: " << l.prev_lsn
@@ -106,7 +106,7 @@ struct LogRecord {
 
   // Page alloc/destroy target.b
   uint64_t allocated_page_id;
-  PageType allocated_page_type;
+  std::string_view initial_header_data;
   uint64_t destroy_page_id;
 
   uint16_t length;

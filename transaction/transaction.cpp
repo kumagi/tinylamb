@@ -23,9 +23,7 @@ Transaction Transaction::SpawnSystemTransaction() {
   return transaction_manager_->Begin();
 }
 
-bool Transaction::PreCommit() {
-  return transaction_manager_->PreCommit(*this);
-}
+bool Transaction::PreCommit() { return transaction_manager_->PreCommit(*this); }
 
 void Transaction::Abort() {
   transaction_manager_->Abort(*this);
@@ -57,9 +55,10 @@ bool Transaction::AddWriteSet(const RowPosition& rs) {
 
 uint64_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
   assert(!IsFinished());
+  LOG(TRACE) << "insert log invocated";
   LogRecord lr = LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pos, redo);
   logger_->AddLog(lr);
-  prev_lsn_ = logger_->AddLog(lr);
+  prev_lsn_ = lr.lsn;
   return prev_lsn_;
 }
 
@@ -81,10 +80,11 @@ uint64_t Transaction::DeleteLog(const RowPosition& pos, std::string_view undo) {
   return prev_lsn_;
 }
 
-uint64_t Transaction::AllocatePageLog(uint64_t allocated_page_id, PageType type) {
+uint64_t Transaction::AllocatePageLog(uint64_t allocated_page_id,
+                                      std::string_view initial_header) {
   assert(!IsFinished());
-  LogRecord lr =
-      LogRecord::AllocatePageLogRecord(prev_lsn_, txn_id_, allocated_page_id, type);
+  LogRecord lr = LogRecord::AllocatePageLogRecord(
+      prev_lsn_, txn_id_, allocated_page_id, initial_header);
   logger_->AddLog(lr);
   prev_lsn_ = lr.lsn;
   return prev_lsn_;

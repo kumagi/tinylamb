@@ -31,7 +31,6 @@ class Column {
          enum Restriction rst, uint16_t offset);
   [[nodiscard]] std::string_view Name() const {
     size_t name_len = *reinterpret_cast<const uint16_t*>(data.data());
-    LOG(TRACE) << "name len: " << name_len;
     return std::string_view(&data[8], name_len);
   }
   [[nodiscard]] ValueType Type() const;

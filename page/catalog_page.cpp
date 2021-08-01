@@ -28,11 +28,9 @@ RowPosition CatalogPage::AddSchema(Transaction& txn, const Schema& schema) {
     if (!txn.AddWriteSet(RowPosition(pos))) {
       return RowPosition();
     }
-    std::cout << "schema size: " << schema.Data().size() << "\n";
-    std::string_view payload(schema.Data());
     txn.AddWriteSet(RowPosition(PageId(), new_slot));
-    InsertSchema(payload);
-    txn.InsertLog(pos, payload);
+    InsertSchema(schema.Data());
+    txn.InsertLog(pos, schema.Data());
     last_lsn = txn.PrevLSN();
     return RowPosition(PageId(), new_slot);
   }
@@ -56,9 +54,8 @@ void CatalogPage::DeleteSchema(const RowPosition& pos) {
 [[nodiscard]] Schema CatalogPage::Read(Transaction& txn,
                                        const RowPosition& pos) {
   assert(pos.page_id == PageId());
-  assert(pos.slot <= slot_count);
+  assert(pos.slot < slot_count);
   txn.AddReadSet(pos);
-  LOG(TRACE) << "slot[" << pos.slot << "] -> " << slot[pos.slot];
   return Schema(reinterpret_cast<char*>(this) + slot[pos.slot]);
 }
 
@@ -75,7 +72,6 @@ uint64_t std::hash<tinylamb::CatalogPage>::operator()(
   result += std::hash<uint16_t>()(c.payload_begin);
   for (size_t i = 0; i < c.SlotCount(); ++i) {
     result += std::hash<tinylamb::Schema>()(c.Slot(i));
-    LOG(TRACE) << c.Slot(i) << " of " << c.SlotCount();
   }
   return result;
 }

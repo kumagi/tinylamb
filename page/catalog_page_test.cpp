@@ -76,9 +76,10 @@ TEST_F(CatalogPageTest, GetSchema) {
             Restriction::kNoRestriction, 8);
   Schema schema(kSchamaName, {c1, c2}, 2);
   PageInit();
-  InsertSchema(schema);
+  ASSERT_TRUE(InsertSchema(schema));
   Transaction txn = tm_->Begin();
   auto* catalog_page = reinterpret_cast<CatalogPage*>(p_->GetPage(kPageId));
+  ASSERT_EQ(catalog_page->SlotCount(), 1);
   RowPosition pos(kPageId, 0);
   Schema read_schema = catalog_page->Read(txn, pos);
   ASSERT_EQ(read_schema, schema);

@@ -16,6 +16,7 @@ class Recovery;
 class RowPage : public Page {
  public:
   void Initialize() {
+    LOG(DEBUG) << "initialize row page";
     prev_page_id_ = 0;
     next_page_id_ = 0;
     row_count_ = 0;

@@ -41,13 +41,11 @@ Schema::Schema(std::string_view schema_name, const std::vector<Column>& columns,
 
 Schema::Schema(char* ptr) {
   data = std::string_view(ptr, INT16_MAX);  // temporary set as max.
-  offsets.resize(ColumnCount());
+  offsets.reserve(ColumnCount());
   size_t offset = 0;
-  const size_t column_base =
-      sizeof(RowPage()) + sizeof(NameLength()) + NameLength() + 1;
   for (size_t i = 0; i < ColumnCount(); ++i) {
-    offsets[i] = column_base + offset;
-    offset += sizeof(Column) + GetColumn(i).Name().size();
+    offsets.push_back(offset);
+    offset += GetColumn(i).FootprintSize();
   }
   // sizeof(RowPage) + sizeof(NameLength) + name_length + sizeof(ColumnCount) +
   // offsets.

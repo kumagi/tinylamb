@@ -23,6 +23,7 @@ class RecoveryTest : public ::testing::Test {
   static constexpr char kTableName[] = "test-table_for_recovery";
 
   void SetUp() override {
+    LogCleanup();
     Recover();
     std::vector<Column> columns = {Column("int_column", ValueType::kInt64, 8,
                                           Restriction::kNoRestriction, 0),
@@ -67,6 +68,10 @@ class RecoveryTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    LogCleanup();
+  }
+
+  void LogCleanup() {
     std::remove(kDBFileName);
     std::remove(kLogName);
   }
@@ -109,7 +114,6 @@ class RecoveryTest : public ::testing::Test {
 TEST_F(RecoveryTest, SchemaRecovery) { r_->StartFrom(0); }
 TEST_F(RecoveryTest, InsertRowRecovery) {
   InsertRow(0, "hoge");
-  MediaFailure();
   r_->StartFrom(0);
 }
 

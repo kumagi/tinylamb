@@ -34,7 +34,7 @@ void Recovery::StartFrom(size_t offset) {
   while (!entire_log.empty()) {
     bool success = ParseLogRecord(entire_log, &log);
     if (!success) break;
-    std::cout << log << "\n";
+    LOG(TRACE) << log;
     entire_log.remove_prefix(log.Size());
     LogRedo(log);
   }
