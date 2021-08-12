@@ -16,11 +16,9 @@ class Recovery;
 class RowPage : public Page {
  public:
   void Initialize() {
-    LOG(DEBUG) << "initialize row page";
     prev_page_id_ = 0;
     next_page_id_ = 0;
     row_count_ = 0;
-    row_size_ = 0;
   }
 
   bool Read(Transaction& txn, const RowPosition& pos, const Schema& schema,
@@ -34,18 +32,16 @@ class RowPage : public Page {
 
   bool Delete(Transaction& txn, const RowPosition& pos, const Schema& schema);
 
-  uint16_t MaxSlot() const {
-    return (reinterpret_cast<const char*>(this) + kPageSize - data_) / row_size_;
-  }
-
   size_t RowCount() const;
 
  private:
   uint64_t prev_page_id_ = 0;
   uint64_t next_page_id_ = 0;
   int16_t row_count_ = 0;
-  uint16_t row_size_ = 0;
   char data_[0];
+  constexpr static size_t kBodySize = kPageBodySize - sizeof(prev_page_id_) -
+                                      sizeof(next_page_id_) -
+                                      sizeof(row_count_);
 
   friend class Page;
   friend class Catalog;
@@ -54,19 +50,19 @@ class RowPage : public Page {
 
   void UpdateRow(const RowPosition& pos, std::string_view redo_log);
 
-  void DeleteRow(const RowPosition& pos);
+  void DeleteRow(const RowPosition& pos, size_t row_size);
 };
 
 }  // namespace tinylamb
 
 namespace std {
 
-template<>
+template <>
 class hash<tinylamb::RowPage> {
  public:
   uint64_t operator()(const tinylamb::RowPage& r) const;
 };
 
-}
+}  // namespace std
 
 #endif  // TINYLAMB_ROW_PAGE_HPP

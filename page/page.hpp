@@ -35,7 +35,7 @@ class Page {
 
   void UpdateImpl(const RowPosition& pos, std::string_view redo);
 
-  void DeleteImpl(const RowPosition& pos);
+  void DeleteImpl(const RowPosition& pos, size_t row_size);
 
   void SetChecksum() const;
 

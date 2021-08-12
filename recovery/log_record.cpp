@@ -66,12 +66,13 @@ LogRecord LogRecord::CheckpointLogRecord(uint64_t p, uint64_t txn,
 
 LogRecord LogRecord::AllocatePageLogRecord(uint64_t p, uint64_t txn,
                                            uint64_t pid,
-                                           std::string_view initial_header) {
+                                           PageType new_page_type) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
   l.type = LogType::kSystemAllocPage;
   l.allocated_page_id = pid;
+  l.allocated_page_type = new_page_type;
   l.length = l.Size();
   return l;
 }
@@ -203,9 +204,8 @@ size_t LogRecord::Size() const {
       memcpy(result.data() + offset, &allocated_page_id,
              sizeof(allocated_page_id));
       offset += sizeof(allocated_page_id);
-      memcpy(result.data(), initial_header_data.data(),
-             initial_header_data.size());
-      offset += initial_header_data.size();
+      memcpy(result.data() + offset, &allocated_page_type, sizeof(allocated_page_type));
+      offset += sizeof(allocated_page_type);
       break;
     case LogType::kSystemDestroyPage:
       memcpy(result.data() + offset, &destroy_page_id, sizeof(destroy_page_id));

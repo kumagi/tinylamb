@@ -52,7 +52,7 @@ class Transaction {
                      std::string_view undo);
   uint64_t DeleteLog(const RowPosition& pos, std::string_view undo);
 
-  uint64_t AllocatePageLog(uint64_t page_id, std::string_view initial_header);
+  uint64_t AllocatePageLog(uint64_t page_id, PageType new_page_type);
 
   uint64_t DestroyPageLog(uint64_t page_id);
   // Using this function is discouraged to get performance of flush pipelining.

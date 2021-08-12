@@ -81,10 +81,10 @@ uint64_t Transaction::DeleteLog(const RowPosition& pos, std::string_view undo) {
 }
 
 uint64_t Transaction::AllocatePageLog(uint64_t allocated_page_id,
-                                      std::string_view initial_header) {
+                                      PageType new_page_type) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::AllocatePageLogRecord(
-      prev_lsn_, txn_id_, allocated_page_id, initial_header);
+      prev_lsn_, txn_id_, allocated_page_id, new_page_type);
   logger_->AddLog(lr);
   prev_lsn_ = lr.lsn;
   return prev_lsn_;

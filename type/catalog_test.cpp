@@ -76,7 +76,7 @@ TEST_F(CatalogTest, GetTable) {
   txn.CommitWait();
 }
 
-TEST_F(CatalogTest, DISABLED_Recover) {
+TEST_F(CatalogTest, Recover) {
   static const char kTableName[] = "test_table_for_recover";
   Column c1("int_column", ValueType::kInt64, 8, Restriction::kNoRestriction, 0);
   Column c2("varchar_column", ValueType::kVarChar, 16,
@@ -89,9 +89,7 @@ TEST_F(CatalogTest, DISABLED_Recover) {
     txn.PreCommit();
     txn.CommitWait();
   }
-  LOG(TRACE) << "try recover\n";
   Recover();
-  LOG(TRACE) << "recovered\n";
   {
     auto txn = tm_->Begin();
     ASSERT_EQ(c_->GetSchema(txn, "test_table_for_recover").Name(),

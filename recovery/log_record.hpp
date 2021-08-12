@@ -44,7 +44,7 @@ struct LogRecord {
                                        std::unordered_set<uint64_t> tt);
 
   static LogRecord AllocatePageLogRecord(uint64_t p, uint64_t txn,
-                                         uint64_t pid, std::string_view initial_header);
+                                         uint64_t pid, PageType new_page_type);
 
   static LogRecord DestroyPageLogRecord(uint64_t p, uint64_t txn, uint64_t pid);
 
@@ -106,7 +106,7 @@ struct LogRecord {
 
   // Page alloc/destroy target.b
   uint64_t allocated_page_id;
-  std::string_view initial_header_data;
+  PageType allocated_page_type;
   uint64_t destroy_page_id;
 
   uint16_t length;

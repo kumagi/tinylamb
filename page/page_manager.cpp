@@ -1,9 +1,9 @@
 #include "page_manager.hpp"
 
-#include "recovery/log_record.hpp"
 #include <sstream>
 
 #include "page/meta_page.hpp"
+#include "recovery/log_record.hpp"
 
 namespace tinylamb {
 
@@ -27,9 +27,10 @@ void PageManager::DestroyPage(Transaction& system_txn, Page* target) {
   UnpinMetaPage();
 }
 
-Page* PageManager::AllocateNewPage(Transaction& system_txn, PageType type) {
+Page* PageManager::AllocateNewPage(Transaction& system_txn,
+                                   PageType new_page_type) {
   MetaPage& m = GetMetaPage();
-  Page* new_page = m.AllocateNewPage(system_txn, type, pool_);
+  Page* new_page = m.AllocateNewPage(system_txn, pool_, new_page_type);
   UnpinMetaPage();
   return new_page;
 }

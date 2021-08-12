@@ -40,12 +40,10 @@ bool Catalog::CreateTable(Transaction& txn, Schema& schema) {
   auto* data_page = reinterpret_cast<RowPage*>(
       pm_->AllocateNewPage(new_page_txn, PageType::kFixedLengthRow));
   RowPosition result = catalog_page->AddSchema(txn, schema);
-  data_page->row_size_ = schema.FixedRowSize();
 
   // TODO: fix if schema may have variable length data.
   auto* rp = reinterpret_cast<RowPage*>(data_page);
-  rp->row_size_ = schema.FixedRowSize();
-  LOG(DEBUG) << this << "row size: " << rp->row_size_ << " of " << rp->PageId();
+  LOG(DEBUG) << this << "row size: " << schema.FixedRowSize() << " of " << rp->PageId();
 
   pm_->Unpin(data_page->page_id);
   pm_->Unpin(catalog_page->PageId());

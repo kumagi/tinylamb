@@ -16,8 +16,8 @@ struct MetaPage : public Page {
     first_free_page = 0;
   }
 
-  Page* AllocateNewPage(Transaction& txn, PageType type,
-                        PagePool& pool);
+  Page* AllocateNewPage(Transaction& txn, PagePool& pool,
+                        PageType new_page_type);
   void DestroyPage(Transaction& txn, Page* target, PagePool& pool);
 
   uint64_t max_page_count;

@@ -20,7 +20,7 @@ class PageManager {
 
   Page* GetPage(uint64_t page_id);
 
-  Page* AllocateNewPage(Transaction& txn, std::string_view header);
+  Page* AllocateNewPage(Transaction& txn, PageType new_page_type);
 
   // Logically delete the page.
   void DestroyPage(Transaction& txn, Page* target);
