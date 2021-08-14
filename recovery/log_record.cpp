@@ -9,6 +9,44 @@
 
 namespace tinylamb {
 
+std::ostream& operator<<(std::ostream& o, const LogType& type) {
+  switch (type) {
+    case LogType::kUnknown:
+      o << "(unknown) ";
+      break;
+    case LogType::kBegin:
+      o << "BEGIN";
+      break;
+    case LogType::kInsertRow:
+      o << "INSERT";
+      break;
+    case LogType::kUpdateRow:
+      o << "UPDATE";
+      break;
+    case LogType::kDeleteRow:
+      o << "DELETE";
+      break;
+    case LogType::kCommit:
+      o << "COMMIT";
+      break;
+    case LogType::kBeginCheckpoint:
+      o << "BEGIN CHECKPOINT";
+      break;
+    case LogType::kEndCheckpoint:
+      o << "END CHECKPOINT";
+      break;
+    case LogType::kSystemAllocPage:
+      o << "ALLOCATE";
+      break;
+    case LogType::kSystemDestroyPage:
+      o << "DESTROY";
+      break;
+    default:
+      o << "(undefined: " << static_cast<uint16_t>(type) << ")";
+  }
+  return o;
+}
+
 LogRecord::LogRecord(uint64_t prev, uint64_t txn, LogType t)
     : prev_lsn(prev), txn_id(txn), type(t), length(Size()) {}
 

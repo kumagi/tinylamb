@@ -31,11 +31,16 @@ void Recovery::StartFrom(size_t offset) {
   std::string_view entire_log(log_data_, filesize);
   entire_log.remove_prefix(offset);
   LogRecord log;
+  size_t log_offset = 0;
   while (!entire_log.empty()) {
     bool success = ParseLogRecord(entire_log, &log);
-    if (!success) break;
-    LOG(TRACE) << log << " rest: " << entire_log.size();
+    if (!success) {
+      LOG(ERROR) << "Failed to parse log at offset: " << log_offset;
+      break;
+    }
     entire_log.remove_prefix(log.Size());
+    log_offset += log.Size();
+    LOG(TRACE) << log << " rest: " << entire_log.size();
     LogRedo(log);
   }
 }
@@ -101,6 +106,7 @@ bool Recovery::ParseLogRecord(std::string_view src, tinylamb::LogRecord *dst) {
   src.remove_prefix(sizeof(dst->txn_id));
   switch (dst->type) {
     case LogType::kUnknown:
+      LOG(ERROR) << "unknown log type";
       return false;
     case LogType::kBegin:
     case LogType::kCommit:
@@ -170,6 +176,7 @@ bool Recovery::ParseLogRecord(std::string_view src, tinylamb::LogRecord *dst) {
       src.remove_prefix(sizeof(dst->destroy_page_id));
       return true;
   }
+  LOG(ERROR) << "unexpected execution path: " << dst->type;
   return false;
 }
 

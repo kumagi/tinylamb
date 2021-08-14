@@ -23,6 +23,8 @@ enum class LogType : uint16_t {
   kSystemDestroyPage,
 };
 
+std::ostream& operator<<(std::ostream& o, const LogType& type);
+
 struct LogRecord {
  public:
   LogRecord() = default;
@@ -43,8 +45,8 @@ struct LogRecord {
                                        std::unordered_set<uint64_t> dpt,
                                        std::unordered_set<uint64_t> tt);
 
-  static LogRecord AllocatePageLogRecord(uint64_t p, uint64_t txn,
-                                         uint64_t pid, PageType new_page_type);
+  static LogRecord AllocatePageLogRecord(uint64_t p, uint64_t txn, uint64_t pid,
+                                         PageType new_page_type);
 
   static LogRecord DestroyPageLogRecord(uint64_t p, uint64_t txn, uint64_t pid);
 
@@ -55,37 +57,31 @@ struct LogRecord {
   [[nodiscard]] std::string Serialize() const;
 
   friend std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
-    o << "type: ";
+    o << "type: " << l.type;
     switch (l.type) {
-      case LogType::kUnknown:
-        o << "(unknown) ";
-        break;
-      case LogType::kBegin:
-        o << "BEGIN\t\t";
-        break;
       case LogType::kInsertRow:
-        o << "INSERT\t\t" << l.redo_data.size() << "bytes ";
+        o << "\t\r" << l.redo_data.size() << "bytes ";
         break;
       case LogType::kUpdateRow:
-        o << "UPDATE\t\t" << l.undo_data.size() << "bytes -> " << l.redo_data.size() << " ";
+        o << "\t\t" << l.undo_data.size() << "bytes -> " << l.redo_data.size()
+          << " ";
         break;
       case LogType::kDeleteRow:
-        o << "DELETE\t\t" << l.undo_data.size() << "bytes ";
-        break;
-      case LogType::kCommit:
-        o << "COMMIT\t\t";
-        break;
-      case LogType::kBeginCheckpoint:
-        o << "BEGIN CHECKPOINT\t";
-        break;
-      case LogType::kEndCheckpoint:
-        o << "END CHECKPOINT\t";
+        o << "\t\t" << l.undo_data.size() << "bytes ";
         break;
       case LogType::kSystemAllocPage:
-        o << "ALLOCATE " << l.allocated_page_id << "\t";
+        o << "\t" << l.allocated_page_id << "\t";
         break;
       case LogType::kSystemDestroyPage:
-        o << "DESTROY " << l.destroy_page_id << "\t";
+        o << "\t" << l.destroy_page_id << "\t";
+        break;
+      case LogType::kBegin:
+      case LogType::kCommit:
+        o << "\t";
+        // Go through here to emit \t twice.
+      case LogType::kBeginCheckpoint:
+      case LogType::kEndCheckpoint:
+        o << "\t";
         break;
     }
     o << "lsn: " << l.lsn << "\tprev_lsn: " << l.prev_lsn

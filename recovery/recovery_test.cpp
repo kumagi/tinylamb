@@ -85,7 +85,7 @@ class RecoveryTest : public ::testing::Test {
     EXPECT_LT(counter, timeout_ms);
   }
 
-  void InsertRow(int num, std::string_view str) {
+  RowPosition InsertRow(int num, std::string_view str) {
     auto txn = tm_->Begin();
     Schema s = c_->GetSchema(txn, kTableName);
     Row r;
@@ -93,13 +93,30 @@ class RecoveryTest : public ::testing::Test {
     r.SetValue(s, 1, Value(str.data()));
     uint64_t data_pid = s.RowPage();
     auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
-    ASSERT_NE(p, nullptr);
-    ASSERT_EQ(p->Type(), PageType::kFixedLengthRow);
+    EXPECT_NE(p, nullptr);
+    EXPECT_EQ(p->Type(), PageType::kFixedLengthRow);
 
     RowPosition pos;
-    ASSERT_TRUE(p->Insert(txn, r, s, pos));
+    EXPECT_TRUE(p->Insert(txn, r, s, pos));
     p_->Unpin(p->PageId());
-    ASSERT_TRUE(txn.PreCommit());
+    EXPECT_TRUE(txn.PreCommit());
+    txn.CommitWait();
+    return pos;
+  }
+  void UpdateRow(RowPosition pos, int num, std::string_view str) {
+    auto txn = tm_->Begin();
+    Schema s = c_->GetSchema(txn, kTableName);
+    Row r;
+    r.SetValue(s, 0, Value(num));
+    r.SetValue(s, 1, Value(str.data()));
+    uint64_t data_pid = s.RowPage();
+    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
+    EXPECT_NE(p, nullptr);
+    EXPECT_EQ(p->Type(), PageType::kFixedLengthRow);
+
+    EXPECT_TRUE(p->Update(txn, pos, r, s));
+    p_->Unpin(p->PageId());
+    EXPECT_TRUE(txn.PreCommit());
     txn.CommitWait();
   }
 
@@ -114,6 +131,12 @@ class RecoveryTest : public ::testing::Test {
 TEST_F(RecoveryTest, SchemaRecovery) { r_->StartFrom(0); }
 TEST_F(RecoveryTest, InsertRowRecovery) {
   InsertRow(0, "hoge");
+  r_->StartFrom(0);
+
+}
+TEST_F(RecoveryTest, UpdateRowRecovery) {
+  RowPosition pos = InsertRow(0, "hoge");
+  UpdateRow(pos, 1, "bar");
   r_->StartFrom(0);
 }
 
