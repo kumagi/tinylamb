@@ -17,7 +17,10 @@ namespace tinylamb {
 
 Recovery::Recovery(std::string_view log_path, std::string_view db_path,
                    PageManager *pm, TransactionManager *tm)
-    : log_name_(log_path), db_name_(db_path), pool_(&pm->pool_), tm_(tm) {}
+    : log_name_(log_path),
+      log_data_(nullptr),
+      pool_(&pm->pool_),
+      tm_(tm) {}
 
 void Recovery::StartFrom(size_t offset) {
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
@@ -33,7 +36,7 @@ void Recovery::StartFrom(size_t offset) {
   LogRecord log;
   size_t log_offset = 0;
   while (!entire_log.empty()) {
-    bool success = ParseLogRecord(entire_log, &log);
+    bool success = LogRecord::ParseLogRecord(entire_log, &log);
     if (!success) {
       LOG(ERROR) << "Failed to parse log at offset: " << log_offset;
       break;
@@ -84,100 +87,6 @@ void Recovery::LogRedo(const LogRecord &log) {
     case LogType::kSystemDestroyPage:
       break;
   }
-}
-
-bool Recovery::ParseLogRecord(std::string_view src, tinylamb::LogRecord *dst) {
-  size_t offset = 0;
-  if (src.length() < sizeof(dst->length) + sizeof(dst->type) +
-                         sizeof(dst->lsn) + sizeof(dst->prev_lsn) +
-                         sizeof(dst->txn_id)) {
-    LOG(DEBUG) << "too small data " << src.length();
-    return false;
-  }
-  memcpy(&dst->length, src.data(), sizeof(dst->length));
-  src.remove_prefix(sizeof(dst->length));
-  memcpy(&dst->type, src.data(), sizeof(dst->type));
-  src.remove_prefix(sizeof(dst->type));
-  memcpy(&dst->lsn, src.data(), sizeof(dst->lsn));
-  src.remove_prefix(sizeof(dst->lsn));
-  memcpy(&dst->prev_lsn, src.data(), sizeof(dst->prev_lsn));
-  src.remove_prefix(sizeof(dst->prev_lsn));
-  memcpy(&dst->txn_id, src.data(), sizeof(dst->txn_id));
-  src.remove_prefix(sizeof(dst->txn_id));
-  switch (dst->type) {
-    case LogType::kUnknown:
-      LOG(ERROR) << "unknown log type";
-      return false;
-    case LogType::kBegin:
-    case LogType::kCommit:
-    case LogType::kBeginCheckpoint:
-      return true;
-    case LogType::kInsertRow: {
-      src.remove_prefix(dst->pos.Parse(src.data()));
-      uint32_t redo_size;
-      memcpy(&redo_size, src.data(), sizeof(redo_size));
-      dst->redo_data = std::string_view(src.data(), redo_size);
-      src.remove_prefix(redo_size);
-      return true;
-    }
-    case LogType::kUpdateRow: {
-      src.remove_prefix(dst->pos.Parse(src.data()));
-      uint32_t redo_size;
-      memcpy(&redo_size, src.data(), sizeof(redo_size));
-      dst->redo_data = std::string_view(src.data(), redo_size);
-      src.remove_prefix(redo_size);
-
-      uint32_t undo_size;
-      memcpy(&undo_size, src.data(), sizeof(undo_size));
-      dst->undo_data = std::string_view(src.data(), undo_size);
-      src.remove_prefix(undo_size);
-      return true;
-    }
-    case LogType::kDeleteRow: {
-      uint32_t undo_size;
-      memcpy(&undo_size, src.data(), sizeof(undo_size));
-      dst->undo_data = std::string_view(src.data(), undo_size);
-      src.remove_prefix(undo_size);
-      return true;
-    }
-
-    case LogType::kEndCheckpoint: {
-      uint64_t dpt_size;
-      memcpy(&dpt_size, src.data(), sizeof(dpt_size));
-      src.remove_prefix(sizeof(dpt_size));
-      for (size_t i = 0; i < dpt_size; ++i) {
-        uint64_t dirty_page;
-        memcpy(&dirty_page, src.data(), sizeof(dirty_page));
-        src.remove_prefix(sizeof(dirty_page));
-        dst->dirty_page_table.insert(dirty_page);
-      }
-
-      uint64_t tt_size;
-      memcpy(&tt_size, src.data(), sizeof(tt_size));
-      src.remove_prefix(sizeof(tt_size));
-      for (size_t i = 0; i < tt_size; ++i) {
-        uint64_t txn_id;
-        memcpy(&txn_id, src.data(), sizeof(txn_id));
-        src.remove_prefix(sizeof(txn_id));
-        dst->transaction_table.insert(txn_id);
-      }
-      return true;
-    }
-    case LogType::kSystemAllocPage:
-      memcpy(&dst->allocated_page_id, src.data(),
-             sizeof(dst->allocated_page_id));
-      src.remove_prefix(sizeof(dst->allocated_page_id));
-      memcpy(&dst->allocated_page_type, src.data(),
-             sizeof(dst->allocated_page_type));
-      src.remove_prefix(sizeof(dst->allocated_page_type));
-      return true;
-    case LogType::kSystemDestroyPage:
-      memcpy(&dst->destroy_page_id, src.data(), sizeof(dst->destroy_page_id));
-      src.remove_prefix(sizeof(dst->destroy_page_id));
-      return true;
-  }
-  LOG(ERROR) << "unexpected execution path: " << dst->type;
-  return false;
 }
 
 }  // namespace tinylamb

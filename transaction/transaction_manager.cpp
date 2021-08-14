@@ -37,7 +37,7 @@ bool TransactionManager::PreCommit(Transaction& txn) {
 }
 
 void TransactionManager::Abort(Transaction& txn) {
-  // Iterate prev_lsn to beginning of the transaction with undo.
+  // Iterate prev_lsn to beginning of the transaction with undoing.
 }
 
 }  // namespace tinylamb

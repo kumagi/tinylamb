@@ -19,11 +19,8 @@ class Recovery {
   void LogRedo(const LogRecord& log);
   void LogUndo(const LogRecord& log);
 
-  bool ParseLogRecord(std::string_view src, LogRecord* dst);
-
  private:
   std::string log_name_;
-  std::string db_name_;
   char* log_data_;
   PagePool* pool_;
   TransactionManager* tm_;
