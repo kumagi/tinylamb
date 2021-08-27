@@ -57,7 +57,7 @@ void Recovery::LogRedo(const LogRecord &log) {
       break;
     case LogType::kInsertRow: {
       Page *target = pool_->GetPage(log.pos.page_id);
-      target->InsertImpl(log.redo_data);
+      target->InsertImpl(log.pos, log.redo_data);
       target->last_lsn = log.lsn;
       pool_->Unpin(target->PageId());
       break;

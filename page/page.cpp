@@ -24,11 +24,8 @@ std::ostream& operator<<(std::ostream& o, const PageType& type) {
     case PageType::kCatalogPage:
       o << "CatalogType";
       break;
-    case PageType::kFixedLengthRow:
-      o << "FixedLengthRowType";
-      break;
-    case PageType::kVariableRow:
-      o << "VariableRowType";
+    case PageType::kRowPage:
+      o << "RowType";
       break;
   }
   return o;
@@ -53,26 +50,20 @@ void Page::PageInit(uint64_t pid, PageType page_type) {
     case PageType::kCatalogPage:
       reinterpret_cast<CatalogPage*>(this)->Initialize();
       break;
-    case PageType::kFixedLengthRow:
+    case PageType::kRowPage:
       reinterpret_cast<RowPage*>(this)->Initialize();
       break;
-    case PageType::kVariableRow:
-      throw std::runtime_error(
-          "Initialization of VariableRow is not implemented");
   }
 }
 
 void Page::SetChecksum() const { checksum = std::hash<Page>()(*this); }
 
-void Page::InsertImpl(std::string_view redo) {
+void Page::InsertImpl(const RowPosition& pos, std::string_view redo) {
   switch (Type()) {
-    case PageType::kFixedLengthRow: {
+    case PageType::kRowPage: {
       auto* rp = reinterpret_cast<RowPage*>(this);
       rp->InsertRow(redo);
       break;
-    }
-    case PageType::kVariableRow: {
-      throw std::runtime_error("Not implemented error");
     }
     case PageType::kCatalogPage: {
       auto* cp = reinterpret_cast<CatalogPage*>(this);
@@ -88,13 +79,10 @@ void Page::InsertImpl(std::string_view redo) {
 
 void Page::UpdateImpl(const RowPosition& pos, std::string_view redo) {
   switch (Type()) {
-    case PageType::kFixedLengthRow: {
+    case PageType::kRowPage: {
       auto* rp = reinterpret_cast<RowPage*>(this);
-      rp->UpdateRow(pos, redo);
+      rp->UpdateRow(pos.slot, redo);
       break;
-    }
-    case PageType::kVariableRow: {
-      throw std::runtime_error("Not implemented error");
     }
     case PageType::kCatalogPage: {
       auto* cp = reinterpret_cast<CatalogPage*>(this);
@@ -109,13 +97,10 @@ void Page::UpdateImpl(const RowPosition& pos, std::string_view redo) {
 
 void Page::DeleteImpl(const RowPosition& pos) {
   switch (Type()) {
-    case PageType::kFixedLengthRow: {
+    case PageType::kRowPage: {
       auto* rp = reinterpret_cast<RowPage*>(this);
-      rp->DeleteRow(pos);
+      rp->DeleteRow(pos.slot);
       break;
-    }
-    case PageType::kVariableRow: {
-      throw std::runtime_error("Not implemented error");
     }
     case PageType::kCatalogPage: {
       auto* cp = reinterpret_cast<CatalogPage*>(this);
@@ -159,11 +144,9 @@ uint64_t std::hash<tinylamb::Page>::operator()(const tinylamb::Page& p) const {
       return header_hash +
              std::hash<tinylamb::CatalogPage>()(
                  reinterpret_cast<const tinylamb::CatalogPage&>(p));
-    case tinylamb::PageType::kFixedLengthRow:
+    case tinylamb::PageType::kRowPage:
       return header_hash + std::hash<tinylamb::RowPage>()(
                                reinterpret_cast<const tinylamb::RowPage&>(p));
-    case tinylamb::PageType::kVariableRow:
-      throw std::runtime_error("not implemented");
   }
   throw std::runtime_error("unknown page type");
 }

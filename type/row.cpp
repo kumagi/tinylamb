@@ -86,3 +86,7 @@ void Row::MakeOwned() {
 }
 
 }  // namespace tinylamb
+
+uint64_t std::hash<tinylamb::Row>::operator()(const tinylamb::Row& row) {
+  return std::hash<std::string_view>()(row.data);
+}

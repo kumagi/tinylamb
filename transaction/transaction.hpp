@@ -36,9 +36,11 @@ class Transaction {
               PageManager* pm, Logger* l);
   Transaction SpawnSystemTransaction();
   void SetStatus(TransactionStatus status);
-  bool IsFinished() const;
+  bool IsFinished() const {
+    return status_ == TransactionStatus::kCommitted ||
+           status_ == TransactionStatus::kAborted;
+  }
   uint64_t PrevLSN() const { return prev_lsn_; }
-  uint64_t TxnID() const { return txn_id_; }
 
   bool AddReadSet(const RowPosition& rs);
   bool AddWriteSet(const RowPosition& rs);

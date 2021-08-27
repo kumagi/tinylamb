@@ -27,6 +27,12 @@ bool Transaction::PreCommit() { return transaction_manager_->PreCommit(*this); }
 
 void Transaction::Abort() {
   transaction_manager_->Abort(*this);
+  for (const auto& rs : read_set_) {
+    lock_manager_->ReleaseSharedLock(rs);
+  }
+  for (const auto& ws : write_set_) {
+    lock_manager_->ReleaseExclusiveLock(ws);
+  }
   status_ = TransactionStatus::kAborted;
 }
 
@@ -65,7 +71,6 @@ uint64_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
 uint64_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
                                 std::string_view redo) {
   assert(!IsFinished());
-  LOG(TRACE) << "insert log innovated";
   LogRecord lr =
       LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pos, redo, undo);
   prev_record_.emplace(pos, WriteEntry{WriteType::kUpdate, std::string(undo)});
@@ -107,10 +112,6 @@ void Transaction::CommitWait() const {
   while (logger_->CommittedLSN() < prev_lsn_) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-}
-bool Transaction::IsFinished() const {
-  return status_ == TransactionStatus::kCommitted ||
-         status_ == TransactionStatus::kAborted;
 }
 
 }  // namespace tinylamb

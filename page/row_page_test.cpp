@@ -10,10 +10,15 @@
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/catalog.hpp"
-#include "type/column.hpp"
-#include "type/schema.hpp"
 
 namespace tinylamb {
+
+TEST(RowPageTest, constrct) {
+  std::unique_ptr<RowPage> row(
+      reinterpret_cast<RowPage*>(new Page(0, PageType::kRowPage)));
+  ASSERT_EQ(row->FreePtrForTest(), kPageSize);
+  ASSERT_EQ(row->FreeSizeForTest(), kPageSize - sizeof(RowPage));
+}
 
 class SingleSchemaRowPageTest : public ::testing::Test {
  protected:
@@ -23,19 +28,10 @@ class SingleSchemaRowPageTest : public ::testing::Test {
 
   void SetUp() override {
     Recover();
-    std::vector<Column> columns = {
-        Column("int_column", ValueType::kInt64, 8, Restriction::kNoRestriction,
-               0),
-        Column("varchar_column", ValueType::kVarChar, 16,
-               Restriction::kNoRestriction, 8),
-    };
-    Schema sc = Schema(kTableName, columns, 2);
     auto txn = tm_->Begin();
-    ASSERT_TRUE(c_->CreateTable(txn, sc));
-    ASSERT_EQ(c_->Schemas(), 1);
-    txn.PreCommit();
-    txn.CommitWait();
-    ASSERT_EQ(1, c_->Schemas());
+    auto* page = reinterpret_cast<RowPage*>(
+        p_->AllocateNewPage(txn, PageType::kRowPage));
+    page_id_ = page->PageId();
   }
 
   void Recover() {
@@ -65,31 +61,72 @@ class SingleSchemaRowPageTest : public ::testing::Test {
     EXPECT_LT(counter, timeout_ms);
   }
 
-  void InsertRow(int num, std::string_view str) {
+  void InsertRow(std::string_view str) {
     auto txn = tm_->Begin();
-    Schema s = c_->GetSchema(txn, kTableName);
     Row r;
-    r.SetValue(s, 0, Value(num));
-    r.SetValue(s, 1, Value(str.data()));
-    uint64_t data_pid = s.RowPage();
-    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
+    r.data = str;
+    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
     ASSERT_NE(p, nullptr);
-    ASSERT_EQ(p->Type(), PageType::kFixedLengthRow);
+    ASSERT_EQ(p->Type(), PageType::kRowPage);
 
+    const uint16_t before_size = p->FreeSizeForTest();
     RowPosition pos;
-    ASSERT_TRUE(p->Insert(txn, r, s, pos));
+    ASSERT_TRUE(p->Insert(txn, r, pos));
+    ASSERT_EQ(p->FreeSizeForTest(),
+              before_size - r.data.size() - sizeof(RowPage::RowPointer));
     p_->Unpin(p->PageId());
     ASSERT_TRUE(txn.PreCommit());
     txn.CommitWait();
   }
 
+  void UpdateRow(int slot, std::string_view str) {
+    auto txn = tm_->Begin();
+    Row r;
+    r.data = str;
+    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+    ASSERT_NE(p, nullptr);
+    ASSERT_EQ(p->Type(), PageType::kRowPage);
+
+    RowPosition pos(page_id_, slot);
+    ASSERT_TRUE(p->Update(txn, pos, r));
+    p_->Unpin(p->PageId());
+    ASSERT_TRUE(txn.PreCommit());
+    txn.CommitWait();
+  }
+
+  void DeleteRow(int slot) {
+    auto txn = tm_->Begin();
+    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+    ASSERT_NE(p, nullptr);
+    ASSERT_EQ(p->Type(), PageType::kRowPage);
+
+    RowPosition pos(page_id_, slot);
+    ASSERT_TRUE(p->Delete(txn, pos));
+    p_->Unpin(p->PageId());
+    ASSERT_TRUE(txn.PreCommit());
+    txn.CommitWait();
+  }
+
+  std::string ReadRow(int slot) {
+    auto txn = tm_->Begin();
+    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+    EXPECT_NE(p, nullptr);
+    EXPECT_EQ(p->Type(), PageType::kRowPage);
+    Row dst;
+    RowPosition pos(page_id_, slot);
+    EXPECT_TRUE(p->Read(txn, pos, dst));
+    dst.MakeOwned();
+    p_->Unpin(p->PageId());
+    EXPECT_TRUE(txn.PreCommit());
+    txn.CommitWait();
+    return dst.owned_data;
+  }
+
   size_t GetRowCount() {
     auto txn = tm_->Begin();
-    Schema s = c_->GetSchema(txn, kTableName);
-    uint64_t data_pid = s.RowPage();
-    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
+    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
     EXPECT_NE(p, nullptr);
-    EXPECT_EQ(p->Type(), PageType::kFixedLengthRow);
+    EXPECT_EQ(p->Type(), PageType::kRowPage);
     size_t row_count = p->RowCount();
     p_->Unpin(p->PageId());
     EXPECT_TRUE(txn.PreCommit());
@@ -102,197 +139,109 @@ class SingleSchemaRowPageTest : public ::testing::Test {
   std::unique_ptr<Logger> l_;
   std::unique_ptr<TransactionManager> tm_;
   std::unique_ptr<Catalog> c_;
+  int page_id_ = 0;
 };
 
-TEST_F(SingleSchemaRowPageTest, Insert) {
-  auto txn = tm_->Begin();
-  Schema s = c_->GetSchema(txn, kTableName);
-  Row r;
-  r.SetValue(s, 0, Value(23));
-  r.SetValue(s, 1, Value("hello"));
-  uint64_t data_pid = s.RowPage();
-  auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
-  ASSERT_NE(p, nullptr);
-  ASSERT_EQ(p->Type(), PageType::kFixedLengthRow);
-
-  RowPosition pos;
-  p_->Unpin(p->PageId());
-  ASSERT_TRUE(p->Insert(txn, r, s, pos));
-  ASSERT_TRUE(txn.PreCommit());
-  txn.CommitWait();
-}
+TEST_F(SingleSchemaRowPageTest, Insert) { InsertRow("hello"); }
 
 TEST_F(SingleSchemaRowPageTest, InsertMany) {
-  constexpr int kInserts = 32;
-  auto txn = tm_->Begin();
-  Schema s = c_->GetSchema(txn, kTableName);
-  Row r;
-  r.SetValue(s, 0, Value(23));
-  r.SetValue(s, 1, Value("hello"));
-  uint64_t data_pid = s.RowPage();
-  auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
-  ASSERT_NE(p, nullptr);
-  ASSERT_EQ(p->Type(), PageType::kFixedLengthRow);
+  constexpr int kInserts = 2113;
+  size_t consumed = 0;
+  auto* page = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+  size_t before_size = page->FreeSizeForTest();
   for (int i = 0; i < kInserts; ++i) {
-    RowPosition pos;
-    r.SetValue(s, 0, i);
-    ASSERT_TRUE(p->Insert(txn, r, s, pos));
+    std::string message = std::to_string(i) + " message";
+    ASSERT_EQ(page->RowCount(), i);
+    InsertRow(message);
+    ASSERT_EQ(page->RowCount(), i + 1);
+    consumed += message.size();
   }
-  ASSERT_TRUE(txn.PreCommit());
-  p_->Unpin(p->PageId());
-  txn.CommitWait();
+  ASSERT_EQ(page->FreeSizeForTest(),
+            before_size - (kInserts * sizeof(RowPage::RowPointer) + consumed));
+  LOG(ERROR) << page->FreeSizeForTest();
 }
 
 TEST_F(SingleSchemaRowPageTest, ReadMany) {
-  constexpr char kMessage[] = "this is a pen";
-  constexpr int kRows = 100;
-  for (int i = 0; i < kRows; ++i) {
-    InsertRow(i * i, kMessage);
+  constexpr int kInserts = 180;
+  for (int i = 0; i < kInserts; ++i) {
+    InsertRow(std::to_string(i) + " message");
+    ASSERT_EQ(ReadRow(i), std::to_string(i) + " message");
   }
   Recover();
-  auto txn = tm_->Begin();
-  Schema s = c_->GetSchema(txn, kTableName);
-  uint64_t data_pid = s.RowPage();
-  auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
-  for (int i = 0; i < kRows; ++i) {
-    RowPosition pos(p->PageId(), i);
-    Row ret;
-    ASSERT_TRUE(p->Read(txn, pos, s, ret));
-    ASSERT_FALSE(ret.IsOwned());
-    Value col1, col2;
-    ASSERT_TRUE(ret.GetValue(s, 0, col1));
-    ASSERT_TRUE(ret.GetValue(s, 1, col2));
-    ASSERT_EQ(col1.value.int_value, i * i);
-    ASSERT_EQ(std::string(col2.value.varchar_value), std::string(kMessage));
+  for (int i = 0; i < kInserts; ++i) {
+    ASSERT_EQ(ReadRow(i), std::to_string(i) + " message");
   }
-  p_->Unpin(p->PageId());
 }
 
 TEST_F(SingleSchemaRowPageTest, UpdateMany) {
-  constexpr char kMessage[] = "this is a pen";
-  constexpr int kRows = 100;
-  for (int i = 0; i < kRows; ++i) {
-    InsertRow(i * i, kMessage);
+  constexpr int kInserts = 20;
+  constexpr char kLongMessage[] = " long updated messages!!!!!";
+  constexpr char kShortMessage[] = "s";
+  for (int i = 0; i < kInserts; ++i) {
+    InsertRow(std::to_string(i) + " message");
   }
-  Recover();
-  {
-    // Update even rows.
-    auto txn = tm_->Begin();
-    Schema s = c_->GetSchema(txn, kTableName);
-    uint64_t data_pid = s.RowPage();
-    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
-    for (int i = 0; i < kRows; i += 2) {
-      RowPosition pos(p->PageId(), i);
-      Row ret;
-      ASSERT_TRUE(p->Read(txn, pos, s, ret));
-      ASSERT_FALSE(ret.IsOwned());
-      Value col1, col2;
-      ASSERT_TRUE(ret.GetValue(s, 0, col1));
-      ASSERT_TRUE(ret.GetValue(s, 1, col2));
-      col1.value.int_value += 100;
-      ret.SetValue(s, 0, col1);
-      p->Update(txn, pos, ret);
-    }
-    p_->Unpin(p->PageId());
-    txn.PreCommit();
-    txn.CommitWait();
+  Recover();  // Recovery process will not do wrong thing.
+  for (int i = 0; i < kInserts; i += 2) {  // even numbers.
+    UpdateRow(i, std::to_string(i) + kLongMessage);
+    ASSERT_EQ(ReadRow(i), std::to_string(i) + kLongMessage);
   }
-  Recover();
-  {
-    // Check rows.
-    auto txn = tm_->Begin();
-    Schema s = c_->GetSchema(txn, kTableName);
-    uint64_t data_pid = s.RowPage();
-    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
-    for (int i = 0; i < kRows; ++i) {
-      RowPosition pos(p->PageId(), i);
-      Row ret;
-      ASSERT_TRUE(p->Read(txn, pos, s, ret));
-      ASSERT_FALSE(ret.IsOwned());
-      Value col1, col2;
-      ASSERT_TRUE(ret.GetValue(s, 0, col1));
-      ASSERT_TRUE(ret.GetValue(s, 1, col2));
-      if (i % 2 == 0) {
-        ASSERT_EQ(col1.value.int_value, 100 + i * i);
-      } else {
-        ASSERT_EQ(col1.value.int_value, i * i);
-      }
+  Recover();  // Recovery process will not do wrong thing.
+  for (int i = 1; i < kInserts; i += 2) {  // odd numbers.
+    UpdateRow(i, std::to_string(i) + kShortMessage);
+    ASSERT_EQ(ReadRow(i), std::to_string(i) + kShortMessage);
+  }
+  Recover();  // Recovery process will not do wrong thing.
+  for (int i = 0; i < kInserts; ++i) {
+    if (i % 2 == 0) {
+      ASSERT_EQ(ReadRow(i), std::to_string(i) + kLongMessage);
+    } else {
+      ASSERT_EQ(ReadRow(i), std::to_string(i) + kShortMessage);
     }
-    p_->Unpin(p->PageId());
-    txn.PreCommit();
-    txn.CommitWait();
   }
 }
 
 TEST_F(SingleSchemaRowPageTest, DeleteMany) {
   constexpr char kMessage[] = "this is a pen";
   constexpr int kRows = 100;
-  std::unordered_set<int64_t> inserted;
+  std::unordered_set<std::string> inserted;
   for (int i = 0; i < kRows; ++i) {
-    InsertRow(i, kMessage);
-    inserted.insert(i);
+    std::string message = std::to_string(i) + kMessage;
+    InsertRow(message);
+    inserted.insert(message);
   }
   Recover();
-  {
-    auto txn = tm_->Begin();
-    Schema s = c_->GetSchema(txn, kTableName);
-    uint64_t data_pid = s.RowPage();
-    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
-    for (int i = 0; i < kRows / 3; i += 2) {
-      RowPosition pos(p->PageId(), i);
-      Row ret;
-      ASSERT_TRUE(p->Read(txn, pos, s, ret));
-      Value col1;
-      ASSERT_TRUE(ret.GetValue(s, 0, col1));
-      auto it = inserted.find(col1.value.int_value);
-      ASSERT_NE(it, inserted.end());
-      inserted.erase(it);
-      ASSERT_TRUE(p->Delete(txn, pos, s));
-    }
-    p_->Unpin(p->PageId());
-    txn.PreCommit();
-    txn.CommitWait();
+  int deleted = 0;
+  for (int i = 0; i < kRows / 2; ++i) {
+    std::string victim = ReadRow(i);
+    inserted.erase(victim);
+    DeleteRow(i);
+    ++deleted;
   }
+  ASSERT_EQ(GetRowCount(), kRows - deleted);
   Recover();
-  {
-    auto txn = tm_->Begin();
-    Schema s = c_->GetSchema(txn, kTableName);
-    uint64_t data_pid = s.RowPage();
-    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
-    std::unordered_set<int64_t> existing;
-    for (size_t i = 0; i < p->RowCount(); ++i) {
-      RowPosition pos(p->PageId(), i);
-      Row ret;
-      ASSERT_TRUE(p->Read(txn, pos, s, ret));
-      Value col1;
-      ASSERT_TRUE(ret.GetValue(s, 0, col1));
-      existing.insert(col1.value.int_value);
-    }
-    ASSERT_EQ(inserted, existing);
-    p_->Unpin(p->PageId());
-    txn.PreCommit();
-    txn.CommitWait();
+  for (int i = 0; i < GetRowCount(); ++i) {
+    std::string got_row = ReadRow(i);
+    ASSERT_NE(inserted.find(got_row), inserted.end());
+    inserted.erase(got_row);
   }
+  ASSERT_TRUE(inserted.empty());
 }
 
 TEST_F(SingleSchemaRowPageTest, InsertAbort) {
-  ASSERT_EQ(GetRowCount(), 0);
   auto txn = tm_->Begin();
-  Schema s = c_->GetSchema(txn, kTableName);
   Row r;
-  r.SetValue(s, 0, Value(23));
-  r.SetValue(s, 1, Value("hello"));
-  uint64_t data_pid = s.RowPage();
-  auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
-  ASSERT_EQ(p->RowCount(), 1);
+  r.data = "blah~blah";
+  auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
   ASSERT_NE(p, nullptr);
-  ASSERT_EQ(p->Type(), PageType::kFixedLengthRow);
+  ASSERT_EQ(p->Type(), PageType::kRowPage);
 
+  const uint16_t before_size = p->FreeSizeForTest();
   RowPosition pos;
+  ASSERT_TRUE(p->Insert(txn, r, pos));
+  ASSERT_EQ(p->FreeSizeForTest(),
+            before_size - r.data.size() - sizeof(RowPage::RowPointer));
   p_->Unpin(p->PageId());
-  ASSERT_TRUE(p->Insert(txn, r, s, pos));
   txn.Abort();
-  txn.CommitWait();
   ASSERT_EQ(GetRowCount(), 0);
 }
 

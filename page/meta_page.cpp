@@ -19,7 +19,6 @@ Page* MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
   } else {
     new_page_id = first_free_page;
     ret = pool.GetPage(new_page_id);
-
     first_free_page = reinterpret_cast<FreePage*>(ret)->next_free_page;
   }
   ret->PageInit(new_page_id, new_page_type);

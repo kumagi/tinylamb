@@ -94,10 +94,10 @@ class RecoveryTest : public ::testing::Test {
     uint64_t data_pid = s.RowPage();
     auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
     EXPECT_NE(p, nullptr);
-    EXPECT_EQ(p->Type(), PageType::kFixedLengthRow);
+    EXPECT_EQ(p->Type(), PageType::kRowPage);
 
     RowPosition pos;
-    EXPECT_TRUE(p->Insert(txn, r, s, pos));
+    EXPECT_TRUE(p->Insert(txn, r, pos));
     p_->Unpin(p->PageId());
     EXPECT_TRUE(txn.PreCommit());
     txn.CommitWait();
@@ -112,7 +112,7 @@ class RecoveryTest : public ::testing::Test {
     uint64_t data_pid = s.RowPage();
     auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
     EXPECT_NE(p, nullptr);
-    EXPECT_EQ(p->Type(), PageType::kFixedLengthRow);
+    EXPECT_EQ(p->Type(), PageType::kRowPage);
 
     EXPECT_TRUE(p->Update(txn, pos, r));
     p_->Unpin(p->PageId());

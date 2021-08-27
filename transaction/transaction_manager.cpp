@@ -18,6 +18,7 @@ Transaction TransactionManager::Begin() {
   logger_->AddLog(begin_log);
   new_txn.prev_lsn_ = begin_log.lsn;
   active_transactions_.insert(new_txn_id);
+  assert(!new_txn.IsFinished());
   return new_txn;
 }
 
@@ -46,11 +47,14 @@ void TransactionManager::Abort(Transaction& txn) {
     auto* target = reinterpret_cast<RowPage*>(page);
     switch (pr.second.entry_type) {
       case Transaction::WriteType::kInsert:
-        target->DeleteImpl(pos);
-        break;
+        target->DeleteRow(pos.slot);
+          break;
       case Transaction::WriteType::kUpdate:
+        target->UpdateRow(pos.slot, pr.second.payload);
         break;
       case Transaction::WriteType::kDelete:
+        uint16_t slot = target->InsertRow(pr.second.payload);
+        txn.InsertLog(RowPosition(pos.page_id, slot), pr.second.payload);
         break;
     }
   }

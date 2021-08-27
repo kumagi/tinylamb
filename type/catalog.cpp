@@ -38,7 +38,7 @@ bool Catalog::CreateTable(Transaction& txn, Schema& schema) {
   auto* catalog_page = GetCatalogPage();
   Transaction new_page_txn = txn.SpawnSystemTransaction();
   auto* data_page = reinterpret_cast<RowPage*>(
-      pm_->AllocateNewPage(new_page_txn, PageType::kFixedLengthRow));
+      pm_->AllocateNewPage(new_page_txn, PageType::kRowPage));
   RowPosition result = catalog_page->AddSchema(txn, schema);
 
   // TODO: fix if schema may have variable length data.

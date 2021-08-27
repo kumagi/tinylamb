@@ -17,8 +17,7 @@ enum class PageType : uint64_t {
   kFreePage,
   kMetaPage,
   kCatalogPage,
-  kFixedLengthRow,
-  kVariableRow,
+  kRowPage,
 };
 
 std::ostream& operator<<(std::ostream& o, const PageType& type);
@@ -30,11 +29,10 @@ class Page {
 
   [[nodiscard]] uint64_t PageId() const { return page_id; }
   [[nodiscard]] PageType Type() const { return type; }
-  char* PageHead() {
-    return reinterpret_cast<char*>(this);
-  }
+  char* PageHead() { return reinterpret_cast<char*>(this); }
+  const char* PageHead() const { return reinterpret_cast<const char*>(this); }
 
-  void InsertImpl(std::string_view redo);
+  void InsertImpl(const RowPosition& pos, std::string_view redo);
 
   void UpdateImpl(const RowPosition& pos, std::string_view redo);
 
@@ -55,9 +53,12 @@ class Page {
 
 const static size_t kPageBodySize = kPageSize - sizeof(Page);
 
+static_assert(std::is_trivially_destructible<Page>::value == true,
+              "Page must be trivially destructible");
+
 }  // namespace tinylamb
 
-template<>
+template <>
 class std::hash<tinylamb::Page> {
  public:
   uint64_t operator()(const tinylamb::Page& p) const;

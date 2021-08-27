@@ -155,13 +155,11 @@ void PagePool::ReadFrom(Page* target, uint64_t pid) {
       needs_recover = !catalog_page->IsValid();
       break;
     }
-    case PageType::kFixedLengthRow: {
+    case PageType::kRowPage: {
       auto* row_page = reinterpret_cast<RowPage*>(target);
       needs_recover = !row_page->IsValid();
       break;
     }
-    case PageType::kVariableRow:
-      throw std::runtime_error("not implemented!");
     case PageType::kFreePage:
       break;
   }

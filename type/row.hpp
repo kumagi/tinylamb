@@ -17,8 +17,9 @@ namespace tinylamb {
 struct Row {
   Row() = default;
   Row(void* d, size_t l, RowPosition p);
-  Row(std::string_view redo, RowPosition p);
+  Row(std::string_view payload, RowPosition p);
 
+  // Shallow copy.
   Row& operator=(const Row& orig);
 
   void SetValue(const Schema& sc, size_t idx, const Value& v);
@@ -33,6 +34,10 @@ struct Row {
 
   bool GetValue(Schema& sc, uint16_t idx, Value& dst);
 
+  void MakeOwned();
+
+  [[nodiscard]] bool IsOwned() const { return !owned_data.empty(); }
+
   friend std::ostream& operator<<(std::ostream& o, const Row& r) {
     if (r.pos.IsValid()) {
       o << r.pos << ": ";
@@ -43,16 +48,21 @@ struct Row {
     o << r.data;
     return o;
   }
-
-  void MakeOwned();
-
-  [[nodiscard]] bool IsOwned() const { return !owned_data.empty(); }
-
   std::string_view data;
   RowPosition pos;  // Origin of the row, if exists.
   std::string owned_data;
 };
 
+
 }  // namespace tinylamb
+
+namespace std {
+template <>
+class hash<tinylamb::Row> {
+ public:
+  uint64_t operator()(const tinylamb::Row& row);
+};
+
+}  // namespace std
 
 #endif  // TINYLAMB_ROW_HPP
