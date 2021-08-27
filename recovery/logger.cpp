@@ -30,27 +30,24 @@ Logger::~Logger() {
 }
 
 uint64_t Logger::AddLog(LogRecord& log) {
-  for (;;) {
-    std::scoped_lock lk(latch_);
-    const uint64_t lsn = next_lsn_++;
-    log.SetLSN(lsn);
-    std::string data = log.Serialize();
-    if (buffer_.size() < written_pos_ + data.size()) {
-      const size_t fraction = buffer_.size() - written_pos_;
-      std::memcpy(buffer_.data() + written_pos_, data.data(), fraction);
-      std::memcpy(buffer_.data(), data.data() + fraction,
-                  data.size() - fraction);
-      written_pos_ = (written_pos_ + data.size()) % buffer_.size();
-    } else {
-      memcpy(buffer_.data() + written_pos_, data.data(), data.size());
-      written_pos_ += data.size();
-    }
-    lsn_entry_.emplace_back(lsn, written_pos_);
-    if (buffer_.size() - RestSize() < buffer_.size() / 4) {
-      worker_wait_.notify_all();
-    }
-    return lsn;
+  std::scoped_lock lk(latch_);
+  const uint64_t lsn = next_lsn_++;
+  log.SetLSN(lsn);
+  std::string data = log.Serialize();
+  if (buffer_.size() < written_pos_ + data.size()) {
+    const size_t fraction = buffer_.size() - written_pos_;
+    std::memcpy(buffer_.data() + written_pos_, data.data(), fraction);
+    std::memcpy(buffer_.data(), data.data() + fraction, data.size() - fraction);
+    written_pos_ = (written_pos_ + data.size()) % buffer_.size();
+  } else {
+    memcpy(buffer_.data() + written_pos_, data.data(), data.size());
+    written_pos_ += data.size();
   }
+  lsn_entry_.emplace_back(lsn, written_pos_);
+  if (buffer_.size() - RestSize() < buffer_.size() / 4) {
+    worker_wait_.notify_all();
+  }
+  return lsn;
 }
 
 void Logger::Finish() {

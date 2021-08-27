@@ -114,7 +114,7 @@ class RecoveryTest : public ::testing::Test {
     EXPECT_NE(p, nullptr);
     EXPECT_EQ(p->Type(), PageType::kFixedLengthRow);
 
-    EXPECT_TRUE(p->Update(txn, pos, r, s));
+    EXPECT_TRUE(p->Update(txn, pos, r));
     p_->Unpin(p->PageId());
     EXPECT_TRUE(txn.PreCommit());
     txn.CommitWait();

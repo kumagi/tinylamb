@@ -30,12 +30,15 @@ class Page {
 
   [[nodiscard]] uint64_t PageId() const { return page_id; }
   [[nodiscard]] PageType Type() const { return type; }
+  char* PageHead() {
+    return reinterpret_cast<char*>(this);
+  }
 
   void InsertImpl(std::string_view redo);
 
   void UpdateImpl(const RowPosition& pos, std::string_view redo);
 
-  void DeleteImpl(const RowPosition& pos, size_t row_size);
+  void DeleteImpl(const RowPosition& pos);
 
   void SetChecksum() const;
 

@@ -10,18 +10,22 @@ bool RowPage::Read(Transaction& txn, const RowPosition& pos,
   if (pos.page_id != PageId() || row_count_ <= pos.slot) {
     return false;
   }
-  char* physical_pos = data_ + schema.FixedRowSize() * pos.slot;
+  char* physical_pos = data_ * pos.slot;
   dst.Read(physical_pos, schema.FixedRowSize(), pos);
   return true;
 }
 
-bool RowPage::Insert(Transaction& txn, const Row& record, const Schema& schema,
-                     RowPosition& dst) {
+bool RowPage::Insert(Transaction& txn, const Row& record, RowPosition& dst) {
   dst = RowPosition(PageId(), row_count_);
   if (!txn.AddWriteSet(dst)) {
     return false;
   }
-  std::string_view payload(record.Data(), record.Size());
+  if (PageHead() + free_space_ - record.Size() <=
+      reinterpret_cast<char*>(&data_[row_count_ + 1])) {
+    // There is no enough space.
+    txn.
+    return false;
+  }
   InsertRow(payload);
   txn.InsertLog(dst, payload);
   last_lsn = txn.PrevLSN();
@@ -35,12 +39,11 @@ void RowPage::InsertRow(std::string_view redo_log) {
 }
 
 bool RowPage::Update(Transaction& txn, const RowPosition& pos,
-                     const Row& new_row, const Schema& schema) {
+                     const Row& new_row) {
   if (!txn.AddWriteSet(pos)) {
     return false;
   }
-  Row target_row(data_ + schema.FixedRowSize() * pos.slot,
-                 schema.FixedRowSize(), pos);
+  Row target_row(data_ + new_row.Size() * pos.slot, new_row.Size(), pos);
   std::string_view undo_log(target_row.Data(), target_row.Size());
   std::string_view redo_log(new_row.Data(), new_row.Size());
   txn.UpdateLog(pos, redo_log, undo_log);
@@ -53,23 +56,17 @@ void RowPage::UpdateRow(const RowPosition& pos, std::string_view redo_log) {
   memcpy(data_ + redo_log.size() * pos.slot, redo_log.data(), redo_log.size());
 }
 
-bool RowPage::Delete(Transaction& txn, const RowPosition& pos,
-                     const Schema& schema) {
+bool RowPage::Delete(Transaction& txn, const RowPosition& pos) {
   RowPosition final_row_pos(PageId(), row_count_ - 1);
   if (!txn.AddWriteSet(pos) || !txn.AddWriteSet(final_row_pos)) {
     return false;
   }
-  txn.DeleteLog(pos, std::string_view(data_ + schema.FixedRowSize() * pos.slot,
-                                      schema.FixedRowSize()));
-  DeleteRow(pos, schema.FixedRowSize());
+  txn.DeleteLog(pos, GetRow(pos.slot).data);
+  DeleteRow(pos);
   return true;
 }
 
-void RowPage::DeleteRow(const RowPosition& pos, size_t row_size) {
-  memcpy(data_ + row_size * pos.slot, data_ + row_size * (row_count_ - 1),
-         row_size);
-  row_count_--;
-}
+void RowPage::DeleteRow(const RowPosition& pos) { row_count_--; }
 
 size_t RowPage::RowCount() const { return row_count_; }
 

@@ -26,7 +26,6 @@ enum class LogType : uint16_t {
 std::ostream& operator<<(std::ostream& o, const LogType& type);
 
 struct LogRecord {
- public:
   LogRecord() = default;
 
   LogRecord(uint64_t p, uint64_t txn, LogType t);

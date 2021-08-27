@@ -107,11 +107,11 @@ void Page::UpdateImpl(const RowPosition& pos, std::string_view redo) {
   }
 }
 
-void Page::DeleteImpl(const RowPosition& pos, size_t row_size) {
+void Page::DeleteImpl(const RowPosition& pos) {
   switch (Type()) {
     case PageType::kFixedLengthRow: {
       auto* rp = reinterpret_cast<RowPage*>(this);
-      rp->DeleteRow(pos, row_size);
+      rp->DeleteRow(pos);
       break;
     }
     case PageType::kVariableRow: {

@@ -64,9 +64,20 @@ class Transaction {
  private:
   const uint64_t txn_id_;
 
+  enum class WriteType {
+    kInsert,
+    kUpdate,
+    kDelete,
+  };
+  struct WriteEntry {
+    WriteType entry_type;
+    std::string payload;
+  };
+
   uint64_t prev_lsn_ = 0;
-  std::unordered_set<RowPosition> read_set_ = {};
-  std::unordered_set<RowPosition> write_set_ = {};
+  std::unordered_set<RowPosition> read_set_{};
+  std::unordered_set<RowPosition> write_set_{};
+  std::unordered_map<RowPosition, WriteEntry> prev_record_{};
   TransactionStatus status_ = TransactionStatus::kUnknown;
 
   // Not owned by this class.

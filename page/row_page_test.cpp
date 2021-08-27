@@ -83,6 +83,20 @@ class SingleSchemaRowPageTest : public ::testing::Test {
     txn.CommitWait();
   }
 
+  size_t GetRowCount() {
+    auto txn = tm_->Begin();
+    Schema s = c_->GetSchema(txn, kTableName);
+    uint64_t data_pid = s.RowPage();
+    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
+    EXPECT_NE(p, nullptr);
+    EXPECT_EQ(p->Type(), PageType::kFixedLengthRow);
+    size_t row_count = p->RowCount();
+    p_->Unpin(p->PageId());
+    EXPECT_TRUE(txn.PreCommit());
+    txn.CommitWait();
+    return row_count;
+  }
+
   std::unique_ptr<LockManager> lm_;
   std::unique_ptr<PageManager> p_;
   std::unique_ptr<Logger> l_;
@@ -177,7 +191,7 @@ TEST_F(SingleSchemaRowPageTest, UpdateMany) {
       ASSERT_TRUE(ret.GetValue(s, 1, col2));
       col1.value.int_value += 100;
       ret.SetValue(s, 0, col1);
-      p->Update(txn, pos, ret, s);
+      p->Update(txn, pos, ret);
     }
     p_->Unpin(p->PageId());
     txn.PreCommit();
@@ -259,6 +273,27 @@ TEST_F(SingleSchemaRowPageTest, DeleteMany) {
     txn.PreCommit();
     txn.CommitWait();
   }
+}
+
+TEST_F(SingleSchemaRowPageTest, InsertAbort) {
+  ASSERT_EQ(GetRowCount(), 0);
+  auto txn = tm_->Begin();
+  Schema s = c_->GetSchema(txn, kTableName);
+  Row r;
+  r.SetValue(s, 0, Value(23));
+  r.SetValue(s, 1, Value("hello"));
+  uint64_t data_pid = s.RowPage();
+  auto* p = reinterpret_cast<RowPage*>(p_->GetPage(data_pid));
+  ASSERT_EQ(p->RowCount(), 1);
+  ASSERT_NE(p, nullptr);
+  ASSERT_EQ(p->Type(), PageType::kFixedLengthRow);
+
+  RowPosition pos;
+  p_->Unpin(p->PageId());
+  ASSERT_TRUE(p->Insert(txn, r, s, pos));
+  txn.Abort();
+  txn.CommitWait();
+  ASSERT_EQ(GetRowCount(), 0);
 }
 
 }  // namespace tinylamb

@@ -56,6 +56,7 @@ bool Transaction::AddWriteSet(const RowPosition& rs) {
 uint64_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pos, redo);
+  prev_record_.emplace(pos, WriteEntry{WriteType::kInsert, ""});
   logger_->AddLog(lr);
   prev_lsn_ = lr.lsn;
   return prev_lsn_;
@@ -64,9 +65,10 @@ uint64_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
 uint64_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
                                 std::string_view redo) {
   assert(!IsFinished());
-  LOG(TRACE) << "insert log invocated";
+  LOG(TRACE) << "insert log innovated";
   LogRecord lr =
       LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pos, redo, undo);
+  prev_record_.emplace(pos, WriteEntry{WriteType::kUpdate, std::string(undo)});
   logger_->AddLog(lr);
   prev_lsn_ = lr.lsn;
   return prev_lsn_;
@@ -75,6 +77,7 @@ uint64_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
 uint64_t Transaction::DeleteLog(const RowPosition& pos, std::string_view undo) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pos, undo);
+  prev_record_.emplace(pos, WriteEntry{WriteType::kDelete, std::string(undo)});
   logger_->AddLog(lr);
   prev_lsn_ = lr.lsn;
   return prev_lsn_;
