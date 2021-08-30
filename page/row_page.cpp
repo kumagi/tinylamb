@@ -36,10 +36,12 @@ bool RowPage::Insert(Transaction& txn, const Row& record, RowPosition& dst) {
     // There is no enough space.
     return false;
   }
-  if (PageHead() + free_ptr_ - record.Size() <=
-      reinterpret_cast<char*>(&data_[row_count_ + 1])) {
+  if (PageHead() + free_ptr_ <=
+      reinterpret_cast<char*>(&data_[row_count_ + 1]) + record.Size()) {
     DeFragment();
   }
+  assert(reinterpret_cast<char*>(&data_[row_count_ + 1]) + record.Size() <
+         PageHead() + free_ptr_);
   dst = RowPosition(PageId(), row_count_);
   if (!txn.AddWriteSet(dst)) {
     // Lock conflict.
@@ -118,8 +120,22 @@ void RowPage::DeleteRow(int slot) {
 
 size_t RowPage::RowCount() const { return row_count_; }
 
-void DeFragment() {
-  LOG(FATAL) << "de-fragment not implemented";
+void RowPage::DeFragment() {
+  // FIXME: replace it with O(1) memory consumption?
+  std::vector<std::string> tmp_buffer;
+  tmp_buffer.reserve(row_count_);
+  for (size_t i = 0; i < row_count_; ++i) {
+    Row r = GetRow(i);
+    tmp_buffer.emplace_back(r.data);
+  }
+  free_ptr_ = kPageSize;
+  for (size_t i = 0; i < row_count_; ++i) {
+    free_ptr_ -= tmp_buffer[i].size();
+    memcpy(PageHead() + free_ptr_, tmp_buffer[i].data(),
+           tmp_buffer.size());
+    std::cout << "inserted: " << tmp_buffer[i];
+    data_[i].offset = free_ptr_;
+  }
 }
 
 }  // namespace tinylamb

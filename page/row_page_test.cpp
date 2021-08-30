@@ -61,22 +61,25 @@ class SingleSchemaRowPageTest : public ::testing::Test {
     EXPECT_LT(counter, timeout_ms);
   }
 
-  void InsertRow(std::string_view str) {
+  bool InsertRow(std::string_view str) {
     auto txn = tm_->Begin();
     Row r;
     r.data = str;
     auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
-    ASSERT_NE(p, nullptr);
-    ASSERT_EQ(p->Type(), PageType::kRowPage);
+    EXPECT_NE(p, nullptr);
+    EXPECT_EQ(p->Type(), PageType::kRowPage);
 
     const uint16_t before_size = p->FreeSizeForTest();
     RowPosition pos;
-    ASSERT_TRUE(p->Insert(txn, r, pos));
-    ASSERT_EQ(p->FreeSizeForTest(),
-              before_size - r.data.size() - sizeof(RowPage::RowPointer));
+    bool success = p->Insert(txn, r, pos);
+    if (success) {
+      EXPECT_EQ(p->FreeSizeForTest(),
+                before_size - r.data.size() - sizeof(RowPage::RowPointer));
+    }
     p_->Unpin(p->PageId());
-    ASSERT_TRUE(txn.PreCommit());
+    EXPECT_TRUE(txn.PreCommit());
     txn.CommitWait();
+    return success;
   }
 
   void UpdateRow(int slot, std::string_view str) {
@@ -145,7 +148,7 @@ class SingleSchemaRowPageTest : public ::testing::Test {
 TEST_F(SingleSchemaRowPageTest, Insert) { InsertRow("hello"); }
 
 TEST_F(SingleSchemaRowPageTest, InsertMany) {
-  constexpr int kInserts = 2113;
+  constexpr int kInserts = 100;
   size_t consumed = 0;
   auto* page = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
   size_t before_size = page->FreeSizeForTest();
@@ -158,6 +161,7 @@ TEST_F(SingleSchemaRowPageTest, InsertMany) {
   }
   ASSERT_EQ(page->FreeSizeForTest(),
             before_size - (kInserts * sizeof(RowPage::RowPointer) + consumed));
+  p_->Unpin(page->PageId());
   LOG(ERROR) << page->FreeSizeForTest();
 }
 
@@ -243,6 +247,39 @@ TEST_F(SingleSchemaRowPageTest, InsertAbort) {
   p_->Unpin(p->PageId());
   txn.Abort();
   ASSERT_EQ(GetRowCount(), 0);
+}
+
+TEST_F(SingleSchemaRowPageTest, DeFragmentHappen) {
+  size_t kBigRowSize = kPageBodySize / 3 - 16;
+
+  ASSERT_TRUE(InsertRow(std::string(kBigRowSize, '0')));
+  ASSERT_TRUE(InsertRow(std::string(kBigRowSize, '1')));
+  ASSERT_TRUE(InsertRow(std::string(kBigRowSize, '2')));
+  ASSERT_FALSE(InsertRow(std::string(kBigRowSize, '3')));
+
+  DeleteRow(0);
+
+  EXPECT_EQ(GetRowCount(), 2);
+  ASSERT_EQ(std::set<std::string>(
+                {std::string(kBigRowSize, '1'), std::string(kBigRowSize, '2')}),
+            std::set<std::string>({
+                ReadRow(0),
+                ReadRow(1),
+            }));
+
+  ASSERT_TRUE(InsertRow(std::string(kBigRowSize, '3')));
+
+  EXPECT_EQ(GetRowCount(), 3);
+  ASSERT_EQ(std::set<std::string>({
+                std::string(kBigRowSize, '1'),
+                std::string(kBigRowSize, '2'),
+                std::string(kBigRowSize, '3'),
+            }),
+            std::set<std::string>({
+                ReadRow(0),
+                ReadRow(1),
+                ReadRow(2),
+            }));
 }
 
 }  // namespace tinylamb
