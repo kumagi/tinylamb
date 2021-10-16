@@ -33,6 +33,10 @@ void Recovery::StartFrom(size_t offset) {
       mmap(nullptr, filesize, PROT_READ, MAP_PRIVATE, fd, 0));
   std::string_view entire_log(log_data_, filesize);
   entire_log.remove_prefix(offset);
+
+  std::unordered_map<uint64_t, size_t> log_offsets;
+
+  // Redo phase starts here.
   LogRecord log;
   size_t log_offset = 0;
   while (!entire_log.empty()) {
@@ -41,10 +45,17 @@ void Recovery::StartFrom(size_t offset) {
       LOG(ERROR) << "Failed to parse log at offset: " << log_offset;
       break;
     }
+    log_offsets.emplace(log.lsn, log_offset);
     entire_log.remove_prefix(log.Size());
     log_offset += log.Size();
     LOG(TRACE) << log << " rest: " << entire_log.size();
     LogRedo(log);
+  }
+
+  // Undo phase starts here.
+  for (auto& txn_id : tm_->active_transactions_) {
+    uint64_t prev_lsn = txn_id
+    size_t offset =
   }
 }
 
@@ -69,8 +80,13 @@ void Recovery::LogRedo(const LogRecord &log) {
       pool_->Unpin(target->PageId());
       break;
     }
-    case LogType::kDeleteRow:
+    case LogType::kDeleteRow: {
+      Page *target = pool_->GetPage(log.pos.page_id);
+      target->DeleteImpl(log.pos);
+      target->last_lsn = log.lsn;
+      pool_->Unpin(target->PageId());
       break;
+    }
     case LogType::kCommit:
       tm_->active_transactions_.erase(log.txn_id);
       break;

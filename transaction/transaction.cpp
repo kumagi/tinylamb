@@ -25,16 +25,7 @@ Transaction Transaction::SpawnSystemTransaction() {
 
 bool Transaction::PreCommit() { return transaction_manager_->PreCommit(*this); }
 
-void Transaction::Abort() {
-  transaction_manager_->Abort(*this);
-  for (const auto& rs : read_set_) {
-    lock_manager_->ReleaseSharedLock(rs);
-  }
-  for (const auto& ws : write_set_) {
-    lock_manager_->ReleaseExclusiveLock(ws);
-  }
-  status_ = TransactionStatus::kAborted;
-}
+void Transaction::Abort() { transaction_manager_->Abort(*this); }
 
 void Transaction::SetStatus(TransactionStatus status) { status_ = status; }
 

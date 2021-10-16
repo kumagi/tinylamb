@@ -47,17 +47,23 @@ void TransactionManager::Abort(Transaction& txn) {
     auto* target = reinterpret_cast<RowPage*>(page);
     switch (pr.second.entry_type) {
       case Transaction::WriteType::kInsert:
+        txn.DeleteLog(pos, pr.second.payload);
         target->DeleteRow(pos.slot);
-          break;
-      case Transaction::WriteType::kUpdate:
+        break;
+      case Transaction::WriteType::kUpdate: {
+        // This is a Compensation Log Record. undo is Empty.
+        txn.UpdateLog(pos, "", pr.second.payload);
         target->UpdateRow(pos.slot, pr.second.payload);
         break;
+      }
       case Transaction::WriteType::kDelete:
         uint16_t slot = target->InsertRow(pr.second.payload);
+        LOG(ERROR) << "backing to: " << pr.second.payload;
         txn.InsertLog(RowPosition(pos.page_id, slot), pr.second.payload);
         break;
     }
   }
+  PreCommit(txn);  // Write empty commit.
 }
 
 }  // namespace tinylamb

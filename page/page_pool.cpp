@@ -93,8 +93,8 @@ PagePool::~PagePool() {
   std::scoped_lock latch(pool_latch);
   for (auto& it : pool_lru_) {
     if (0 < it.pin_count) {
-      std::cout << "caution: pinned page(" << it.page->PageId()
-                << ")is to be deleted\n";
+      LOG(ERROR) << "caution: pinned page(" << it.page->PageId()
+                 << ") is to be deleted\n";
     }
     WriteBack(it.page.get());
   }

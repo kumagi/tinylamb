@@ -75,9 +75,10 @@ bool RowPage::Update(Transaction& txn, const RowPosition& pos,
     return false;
   }
   if (!txn.AddWriteSet(pos)) {
+    // Write lock conflict.
     return false;
   }
-  txn.UpdateLog(pos, new_row.data, prev_row.data);
+  txn.UpdateLog(pos, prev_row.data, new_row.data);
   UpdateRow(pos.slot, new_row.data);
   last_lsn = txn.PrevLSN();
   return true;
@@ -106,8 +107,8 @@ void RowPage::UpdateRow(int slot, std::string_view new_row) {
 bool RowPage::Delete(Transaction& txn, const RowPosition& pos) {
   assert(pos.page_id == PageId());
   assert(pos.slot <= row_count_);
-  DeleteRow(pos.slot);
   txn.DeleteLog(pos, GetRow(pos.slot).data);
+  DeleteRow(pos.slot);
   return true;
 }
 
@@ -132,8 +133,7 @@ void RowPage::DeFragment() {
   for (size_t i = 0; i < row_count_; ++i) {
     free_ptr_ -= tmp_buffer[i].size();
     memcpy(PageHead() + free_ptr_, tmp_buffer[i].data(),
-           tmp_buffer.size());
-    std::cout << "inserted: " << tmp_buffer[i];
+           tmp_buffer[i].size());
     data_[i].offset = free_ptr_;
   }
 }

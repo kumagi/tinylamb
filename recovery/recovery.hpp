@@ -9,6 +9,7 @@ namespace tinylamb {
 class LogRecord;
 class PageManager;
 class PagePool;
+class Transaction;
 class TransactionManager;
 
 class Recovery {
@@ -16,8 +17,9 @@ class Recovery {
   Recovery(std::string_view log_path, std::string_view db_path,
            PageManager* pm, TransactionManager* tm);
   void StartFrom(size_t offset);
+
+ private:
   void LogRedo(const LogRecord& log);
-  void LogUndo(const LogRecord& log);
 
  private:
   std::string log_name_;

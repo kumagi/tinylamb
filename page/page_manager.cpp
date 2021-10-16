@@ -41,7 +41,6 @@ MetaPage& PageManager::GetMetaPage() {
     throw std::runtime_error("failed to get meta page");
   }
   if (meta_page->Type() != PageType::kMetaPage) {
-    LOG(ERROR) << "Unrecoverable meta page crash detected, recovering all";
     meta_page->PageInit(kMetaPageId, PageType::kMetaPage);
   }
   return *reinterpret_cast<MetaPage*>(meta_page);

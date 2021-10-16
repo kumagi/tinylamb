@@ -43,7 +43,6 @@ bool Catalog::CreateTable(Transaction& txn, Schema& schema) {
 
   // TODO: fix if schema may have variable length data.
   auto* rp = reinterpret_cast<RowPage*>(data_page);
-  LOG(DEBUG) << this << "row size: " << schema.FixedRowSize() << " of " << rp->PageId();
 
   pm_->Unpin(data_page->page_id);
   pm_->Unpin(catalog_page->PageId());
