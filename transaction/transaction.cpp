@@ -53,8 +53,8 @@ bool Transaction::AddWriteSet(const RowPosition& rs) {
 uint64_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pos, redo);
-  prev_record_.emplace(pos, WriteEntry{WriteType::kInsert, ""});
   logger_->AddLog(lr);
+  prev_record_.emplace(pos, WriteEntry{WriteType::kInsert, "", lr.lsn});
   prev_lsn_ = lr.lsn;
   return prev_lsn_;
 }
@@ -64,8 +64,9 @@ uint64_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
   assert(!IsFinished());
   LogRecord lr =
       LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pos, redo, undo);
-  prev_record_.emplace(pos, WriteEntry{WriteType::kUpdate, std::string(undo)});
   logger_->AddLog(lr);
+  prev_record_.emplace(
+      pos, WriteEntry{WriteType::kUpdate, std::string(undo), lr.lsn});
   prev_lsn_ = lr.lsn;
   return prev_lsn_;
 }
@@ -73,7 +74,40 @@ uint64_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
 uint64_t Transaction::DeleteLog(const RowPosition& pos, std::string_view undo) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pos, undo);
-  prev_record_.emplace(pos, WriteEntry{WriteType::kDelete, std::string(undo)});
+  logger_->AddLog(lr);
+  prev_record_.emplace(
+      pos, WriteEntry{WriteType::kDelete, std::string(undo), lr.lsn});
+  prev_lsn_ = lr.lsn;
+  return prev_lsn_;
+}
+
+uint64_t Transaction::CompensateInsertLog(const RowPosition& pos,
+                                          uint64_t undo_next_lsn) {
+  assert(!IsFinished());
+  LogRecord lr = LogRecord::CompensatingInsertLogRecord(
+      prev_lsn_, undo_next_lsn, txn_id_, pos);
+  logger_->AddLog(lr);
+  prev_lsn_ = lr.lsn;
+  return prev_lsn_;
+}
+
+uint64_t Transaction::CompensateUpdateLog(const RowPosition& pos,
+                                          uint64_t undo_next_lsn,
+                                          std::string_view redo) {
+  assert(!IsFinished());
+  LogRecord lr = LogRecord::CompensatingUpdateLogRecord(
+      prev_lsn_, undo_next_lsn, txn_id_, pos, redo);
+  logger_->AddLog(lr);
+  prev_lsn_ = lr.lsn;
+  return prev_lsn_;
+}
+
+uint64_t Transaction::CompensateDeleteLog(const RowPosition& pos,
+                                          uint64_t undo_next_lsn,
+                                          std::string_view redo) {
+  assert(!IsFinished());
+  LogRecord lr = LogRecord::CompensatingDeleteLogRecord(
+      prev_lsn_, undo_next_lsn, txn_id_, pos, redo);
   logger_->AddLog(lr);
   prev_lsn_ = lr.lsn;
   return prev_lsn_;

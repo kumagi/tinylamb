@@ -36,7 +36,7 @@ Page::Page(size_t page_id, PageType type) { PageInit(page_id, type); }
 void Page::PageInit(uint64_t pid, PageType page_type) {
   memset(this, 0, kPageSize);
   page_id = pid;
-  last_lsn = 0;
+  SetPageLSN(0);
   type = page_type;
   switch (type) {
     case PageType::kUnknown:
@@ -129,7 +129,7 @@ void Page::operator delete(void* page) noexcept {
 
 uint64_t std::hash<tinylamb::Page>::operator()(const tinylamb::Page& p) const {
   uint64_t header_hash =
-      std::hash<uint64_t>()(p.page_id) + std::hash<uint64_t>()(p.last_lsn) +
+      std::hash<uint64_t>()(p.page_id) + std::hash<uint64_t>()(p.PageLSN()) +
       std::hash<uint64_t>()(static_cast<unsigned long>(p.type));
   switch (p.type) {
     case tinylamb::PageType::kUnknown:

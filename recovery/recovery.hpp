@@ -20,6 +20,7 @@ class Recovery {
 
  private:
   void LogRedo(const LogRecord& log);
+  void LogUndo(const LogRecord& log);
 
  private:
   std::string log_name_;

@@ -29,6 +29,15 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kCommit:
       o << "COMMIT";
       break;
+    case LogType::kCompensateInsertRow:
+      o << "COMPENSATE INSERT";
+      break;
+    case LogType::kCompensateUpdateRow:
+      o << "COMPENSATE UPDATE";
+      break;
+    case LogType::kCompensateDeleteRow:
+      o << "COMPENSATE DELETE";
+      break;
     case LogType::kBeginCheckpoint:
       o << "BEGIN CHECKPOINT";
       break;
@@ -109,7 +118,17 @@ bool LogRecord::ParseLogRecord(std::string_view src, tinylamb::LogRecord* dst) {
       src.remove_prefix(undo_size);
       return true;
     }
+    case LogType::kCompensateInsertRow: {
+      src.remove_prefix(dst->pos.Parse(src.data()));
 
+      return true;
+    }
+    case LogType::kCompensateUpdateRow: {
+      return true;
+    }
+    case LogType::kCompensateDeleteRow: {
+      return true;
+    }
     case LogType::kEndCheckpoint: {
       uint64_t dpt_size;
       memcpy(&dpt_size, src.data(), sizeof(dpt_size));
@@ -159,6 +178,19 @@ LogRecord LogRecord::InsertingLogRecord(uint64_t p, uint64_t txn,
   return l;
 }
 
+LogRecord LogRecord::CompensatingInsertLogRecord(uint16_t p,
+                                                 uint64_t undo_next_lsn,
+                                                 uint64_t txn, RowPosition po) {
+  LogRecord l;
+  l.prev_lsn = p;
+  l.undo_next_lsn = undo_next_lsn;
+  l.txn_id = txn;
+  l.pos = po;
+  l.type = LogType::kCompensateInsertRow;
+  l.length = l.Size();
+  return l;
+}
+
 LogRecord LogRecord::UpdatingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
                                        std::string_view redo,
                                        std::string_view undo) {
@@ -172,6 +204,22 @@ LogRecord LogRecord::UpdatingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
   l.length = l.Size();
   return l;
 }
+
+LogRecord LogRecord::CompensatingUpdateLogRecord(uint16_t p,
+                                                 uint64_t undo_next_lsn,
+                                                 uint64_t txn, RowPosition po,
+                                                 std::string_view redo) {
+  LogRecord l;
+  l.prev_lsn = p;
+  l.undo_next_lsn = undo_next_lsn;
+  l.txn_id = txn;
+  l.pos = po;
+  l.type = LogType::kCompensateUpdateRow;
+  l.redo_data = redo;
+  l.length = l.Size();
+  return l;
+}
+
 LogRecord LogRecord::DeletingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
                                        std::string_view undo) {
   LogRecord l;
@@ -180,6 +228,21 @@ LogRecord LogRecord::DeletingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
   l.pos = po;
   l.type = LogType::kDeleteRow;
   l.undo_data = undo;
+  l.length = l.Size();
+  return l;
+}
+
+LogRecord LogRecord::CompensatingDeleteLogRecord(uint16_t p,
+                                                 uint64_t undo_next_lsn,
+                                                 uint64_t txn, RowPosition po,
+                                                 std::string_view redo) {
+  LogRecord l;
+  l.prev_lsn = p;
+  l.undo_next_lsn = undo_next_lsn;
+  l.txn_id = txn;
+  l.pos = po;
+  l.type = LogType::kCompensateUpdateRow;
+  l.redo_data = redo;
   l.length = l.Size();
   return l;
 }

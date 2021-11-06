@@ -16,6 +16,9 @@ enum class LogType : uint16_t {
   kInsertRow,
   kUpdateRow,
   kDeleteRow,
+  kCompensateInsertRow,
+  kCompensateUpdateRow,
+  kCompensateDeleteRow,
   kCommit,
   kBeginCheckpoint,
   kEndCheckpoint,
@@ -35,12 +38,26 @@ struct LogRecord {
   static LogRecord InsertingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
                                       std::string_view r);
 
+  static LogRecord CompensatingInsertLogRecord(uint16_t p,
+                                               uint64_t undo_next_lsn,
+                                               uint64_t txn, RowPosition po);
+
   static LogRecord UpdatingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
                                      std::string_view redo,
                                      std::string_view undo);
 
+  static LogRecord CompensatingUpdateLogRecord(uint16_t p,
+                                               uint64_t undo_next_lsn,
+                                               uint64_t txn, RowPosition po,
+                                               std::string_view redo);
+
   static LogRecord DeletingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
                                      std::string_view undo);
+
+  static LogRecord CompensatingDeleteLogRecord(uint16_t p,
+                                               uint64_t undo_next_lsn,
+                                               uint64_t txn, RowPosition po,
+                                               std::string_view redo);
 
   static LogRecord CheckpointLogRecord(uint64_t p, uint64_t txn,
                                        std::unordered_set<uint64_t> dpt,
@@ -71,6 +88,17 @@ struct LogRecord {
         break;
       case LogType::kDeleteRow:
         o << "\t\t" << l.undo_data.size() << "bytes\tpos: " << l.pos;
+        break;
+      case LogType::kCompensateInsertRow:
+        o << "\t\tUndoNextLSN: " << l.undo_next_lsn << "\tpos: " << l.pos;
+        break;
+      case LogType::kCompensateUpdateRow:
+        o << "\t\tUndoNextLSN: \" << l.undo_next_lsn << \"pos: " << l.pos
+          << l.redo_data.size() << "bytes";
+        break;
+      case LogType::kCompensateDeleteRow:
+        o << "\t\tUndoNextLSN: \" << l.undo_next_lsn << \"pos: " << l.pos
+          << l.redo_data.size() << "bytes";
         break;
       case LogType::kSystemAllocPage:
         o << "\t" << l.allocated_page_id;
@@ -110,6 +138,7 @@ struct LogRecord {
   LogType type = LogType::kUnknown;
   uint64_t lsn = 0;
   uint64_t prev_lsn = 0;
+  uint64_t undo_next_lsn = 0;  // Only used for CLR.
   uint64_t txn_id = 0;
   RowPosition pos = RowPosition();
   std::string_view undo_data{};

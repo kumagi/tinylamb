@@ -41,6 +41,7 @@ class RowPageTest : public ::testing::Test {
   void TearDown() override {
     std::remove(kDBFileName);
     std::remove(kLogName);
+    LOG(ERROR) << "removed: " << kDBFileName << " and " << kLogName;
   }
 
   void WaitForCommit(uint64_t target_lsn, size_t timeout_ms = 1000) {

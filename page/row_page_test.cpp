@@ -190,21 +190,4 @@ TEST_F(RowPageTest, DeleteAbort) {
   ASSERT_EQ(ReadRow(0), before);
 }
 
-TEST_F(RowPageTest, InsertCrash) {
-  auto txn = tm_->Begin();
-  Row r;
-  r.data = "blah~blah";
-  auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
-  ASSERT_NE(p, nullptr);
-  ASSERT_EQ(p->Type(), PageType::kRowPage);
-
-  const uint16_t before_size = p->FreeSizeForTest();
-  RowPosition pos;
-  ASSERT_TRUE(p->Insert(txn, r, pos));
-  ASSERT_EQ(p->FreeSizeForTest(),
-            before_size - r.data.size() - sizeof(RowPage::RowPointer));
-  p_->Unpin(p->PageId());
-  Recover();
-  ASSERT_EQ(GetRowCount(), 0);
-}
 }  // namespace tinylamb

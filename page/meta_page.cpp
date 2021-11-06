@@ -24,7 +24,7 @@ Page* MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
   ret->PageInit(new_page_id, new_page_type);
   txn.AllocatePageLog(new_page_id, new_page_type);
   txn.PreCommit();  // No need to wait for the log to be durable.
-  last_lsn = txn.PrevLSN();
+  SetPageLSN(txn.PrevLSN());
   return ret;
 }
 
@@ -41,7 +41,7 @@ void MetaPage::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
   first_free_page = free_page_id;
   txn.DestroyPageLog(free_page_id);
   txn.PreCommit();
-  last_lsn = txn.PrevLSN();
+  SetPageLSN(txn.PrevLSN());
 }
 
 }  // namespace tinylamb

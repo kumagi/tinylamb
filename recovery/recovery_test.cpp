@@ -11,7 +11,6 @@ class RecoveryTest : public RowPageTest {
  protected:
   static constexpr char kDBFileName[] = "recovery_test.db";
   static constexpr char kLogName[] = "recovery_test.log";
-  static constexpr char kTableName[] = "test-table_for_recovery";
 
   void SetUp() override {
     RowPageTest::SetUp();
@@ -44,14 +43,11 @@ class RecoveryTest : public RowPageTest {
     r_ = std::make_unique<Recovery>(kLogName, kDBFileName, p_.get(), tm_.get());
   }
 
-  void WaitForCommit(uint64_t target_lsn, size_t timeout_ms = 1000) {
-    size_t counter = 0;
-    while (l_->CommittedLSN() != target_lsn && counter < timeout_ms) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      ++counter;
-    }
-    EXPECT_LT(counter, timeout_ms);
+  void TearDown() override {
+    std::remove(kDBFileName);
+    std::remove(kLogName);
   }
+
   std::unique_ptr<Recovery> r_;
 };
 
@@ -78,6 +74,28 @@ TEST_F(RecoveryTest, DeleteRowRecovery) {
   DeleteRow(0);
   ASSERT_EQ(GetRowCount(), 0);
   MediaFailure();
+  r_->StartFrom(0);
+  ASSERT_EQ(GetRowCount(), 0);
+}
+
+TEST_F(RecoveryTest, InsertCrash) {
+  auto txn = tm_->Begin();
+  Row r;
+  r.data = "blah~blah";
+  auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+  LOG(ERROR) << "allocated " << p->PageId() << " for " << page_id_;
+  ASSERT_NE(p, nullptr);
+  ASSERT_EQ(p->Type(), PageType::kRowPage);
+
+  const uint16_t before_size = p->FreeSizeForTest();
+  RowPosition pos;
+  ASSERT_TRUE(p->Insert(txn, r, pos));
+  ASSERT_EQ(p->FreeSizeForTest(),
+            before_size - r.data.size() - sizeof(RowPage::RowPointer));
+  p_->Unpin(p->PageId());
+  // Note that txn is not committed.
+  Recover();
+  LOG(INFO) << "recovery start";
   r_->StartFrom(0);
   ASSERT_EQ(GetRowCount(), 0);
 }

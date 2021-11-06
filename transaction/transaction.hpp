@@ -53,6 +53,11 @@ class Transaction {
   uint64_t UpdateLog(const RowPosition& pos, std::string_view undo,
                      std::string_view redo);
   uint64_t DeleteLog(const RowPosition& pos, std::string_view undo);
+  uint64_t CompensateInsertLog(const RowPosition& pos, uint64_t undo_next_Lsn);
+  uint64_t CompensateUpdateLog(const RowPosition& pos, uint64_t undo_next_lsn,
+                               std::string_view redo);
+  uint64_t CompensateDeleteLog(const RowPosition& pos, uint64_t undo_next_lsn,
+                               std::string_view redo);
 
   uint64_t AllocatePageLog(uint64_t page_id, PageType new_page_type);
 
@@ -74,6 +79,7 @@ class Transaction {
   struct WriteEntry {
     WriteType entry_type;
     std::string payload;
+    uint64_t lsn;
   };
 
   uint64_t prev_lsn_ = 0;

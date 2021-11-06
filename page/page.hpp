@@ -29,6 +29,8 @@ class Page {
 
   [[nodiscard]] uint64_t PageId() const { return page_id; }
   [[nodiscard]] PageType Type() const { return type; }
+  [[nodiscard]] uint64_t PageLSN() const { return page_lsn; }
+  void SetPageLSN(uint64_t lsn) { page_lsn = lsn; }
   char* PageHead() { return reinterpret_cast<char*>(this); }
   const char* PageHead() const { return reinterpret_cast<const char*>(this); }
 
@@ -45,7 +47,7 @@ class Page {
   void operator delete(void* page) noexcept;
 
   uint64_t page_id = 0;
-  uint64_t last_lsn = 0;
+  uint64_t page_lsn = 0;
   enum PageType type = PageType::kUnknown;
   mutable uint64_t checksum = 0;
   char page_body[0];

@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 
 #include <filesystem>
+#include <transaction/transaction.hpp>
 
 #include "page/catalog_page.hpp"
 #include "page/page.hpp"
@@ -17,10 +18,7 @@ namespace tinylamb {
 
 Recovery::Recovery(std::string_view log_path, std::string_view db_path,
                    PageManager *pm, TransactionManager *tm)
-    : log_name_(log_path),
-      log_data_(nullptr),
-      pool_(&pm->pool_),
-      tm_(tm) {}
+    : log_name_(log_path), log_data_(nullptr), pool_(&pm->pool_), tm_(tm) {}
 
 void Recovery::StartFrom(size_t offset) {
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
@@ -35,6 +33,7 @@ void Recovery::StartFrom(size_t offset) {
   entire_log.remove_prefix(offset);
 
   std::unordered_map<uint64_t, size_t> log_offsets;
+  std::unordered_map<uint64_t, uint64_t> txn_lsns;
 
   // Redo phase starts here.
   LogRecord log;
@@ -45,7 +44,8 @@ void Recovery::StartFrom(size_t offset) {
       LOG(ERROR) << "Failed to parse log at offset: " << log_offset;
       break;
     }
-    log_offsets.emplace(log.lsn, log_offset);
+    log_offsets[log.lsn] = log_offset;
+    txn_lsns[log.txn_id] = log.lsn;
     entire_log.remove_prefix(log.Size());
     log_offset += log.Size();
     LOG(TRACE) << log << " rest: " << entire_log.size();
@@ -53,9 +53,19 @@ void Recovery::StartFrom(size_t offset) {
   }
 
   // Undo phase starts here.
-  for (auto& txn_id : tm_->active_transactions_) {
-    uint64_t prev_lsn = txn_id
-    size_t offset =
+  for (auto &txn_id : tm_->active_transactions_) {
+    uint64_t prev_lsn = txn_lsns[txn_id];
+    while (prev_lsn != 0) {
+      size_t prev_offset = log_offsets[prev_lsn];
+      std::string_view undo_log_data(log_data_ + prev_offset, filesize);
+      if (!LogRecord::ParseLogRecord(undo_log_data, &log)) {
+        LOG(ERROR) << "Failed to parse log at offset on undo: " << prev_offset;
+        break;
+      }
+      LogUndo(log);
+      prev_lsn = log.prev_lsn;
+    }
+    LOG(TRACE) << "Undo: " << log.txn_id << " finished";
   }
 }
 
@@ -68,22 +78,28 @@ void Recovery::LogRedo(const LogRecord &log) {
       break;
     case LogType::kInsertRow: {
       Page *target = pool_->GetPage(log.pos.page_id);
-      target->InsertImpl(log.pos, log.redo_data);
-      target->last_lsn = log.lsn;
+      if (target->PageLSN() < log.lsn) {
+        target->InsertImpl(log.pos, log.redo_data);
+        target->SetPageLSN(log.lsn);
+      }
       pool_->Unpin(target->PageId());
       break;
     }
     case LogType::kUpdateRow: {
       Page *target = pool_->GetPage(log.pos.page_id);
-      target->UpdateImpl(log.pos, log.redo_data);
-      target->last_lsn = log.lsn;
+      if (target->PageLSN() < log.lsn) {
+        target->UpdateImpl(log.pos, log.redo_data);
+        target->SetPageLSN(log.lsn);
+      }
       pool_->Unpin(target->PageId());
       break;
     }
     case LogType::kDeleteRow: {
       Page *target = pool_->GetPage(log.pos.page_id);
-      target->DeleteImpl(log.pos);
-      target->last_lsn = log.lsn;
+      if (target->PageLSN() < log.lsn) {
+        target->DeleteImpl(log.pos);
+        target->SetPageLSN(log.lsn);
+      }
       pool_->Unpin(target->PageId());
       break;
     }
@@ -96,11 +112,63 @@ void Recovery::LogRedo(const LogRecord &log) {
       break;
     case LogType::kSystemAllocPage: {
       Page *target = pool_->GetPage(log.allocated_page_id);
-      target->PageInit(log.allocated_page_id, log.allocated_page_type);
+      if (target->PageLSN() < log.lsn) {
+        target->PageInit(log.allocated_page_id, log.allocated_page_type);
+      }
       pool_->Unpin(target->PageId());
       break;
     }
     case LogType::kSystemDestroyPage:
+      break;
+  }
+}
+
+void Recovery::LogUndo(const LogRecord &log) {
+  Transaction txn(log.txn_id, tm_, tm_->lock_manager_, tm_->page_manager_,
+                  tm_->logger_);
+  switch (log.type) {
+    case LogType::kUnknown:
+      LOG(FATAL) << "Unknown type log";
+      throw std::runtime_error("broken log");
+    case LogType::kBegin:
+      break;
+    case LogType::kInsertRow: {
+      auto *target =
+          reinterpret_cast<RowPage *>(pool_->GetPage(log.pos.page_id));
+      txn.CompensateInsertLog(log.pos, log.lsn);
+      target->DeleteRow(log.pos.slot);
+      target->SetPageLSN(log.lsn);
+      pool_->Unpin(target->PageId());
+      break;
+    }
+    case LogType::kUpdateRow: {
+      Page *target = pool_->GetPage(log.pos.page_id);
+      txn.CompensateUpdateLog(log.pos, log.lsn, log.undo_data);
+      target->UpdateImpl(log.pos, log.undo_data);
+      target->SetPageLSN(log.lsn);
+      pool_->Unpin(target->PageId());
+      break;
+    }
+    case LogType::kDeleteRow: {
+      Page *target = pool_->GetPage(log.pos.page_id);
+      target->DeleteImpl(log.pos);
+      target->SetPageLSN(log.lsn);
+      pool_->Unpin(target->PageId());
+      break;
+    }
+    case LogType::kCommit:
+      tm_->active_transactions_.erase(log.txn_id);
+      break;
+    case LogType::kBeginCheckpoint:
+      break;
+    case LogType::kEndCheckpoint:
+      break;
+    case LogType::kSystemAllocPage:
+      break;
+    case LogType::kSystemDestroyPage:
+      Page *target = pool_->GetPage(log.destroy_page_id);
+      target->PageInit(log.destroy_page_id, log.allocated_page_type);
+      pool_->Unpin(target->PageId());
       break;
   }
 }

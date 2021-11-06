@@ -31,7 +31,7 @@ RowPosition CatalogPage::AddSchema(Transaction& txn, const Schema& schema) {
     txn.AddWriteSet(RowPosition(PageId(), new_slot));
     InsertSchema(schema.Data());
     txn.InsertLog(pos, schema.Data());
-    last_lsn = txn.PrevLSN();
+    SetPageLSN(txn.PrevLSN());
     return RowPosition(PageId(), new_slot);
   }
 }

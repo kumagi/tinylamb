@@ -164,9 +164,10 @@ void PagePool::ReadFrom(Page* target, uint64_t pid) {
       break;
   }
   if (needs_recover) {
-    LOG(ERROR) << "Page " << target->PageId() << " checksum matched";
+    LOG(ERROR) << "Page " << target->PageId() << " crashed";
   } else {
-    LOG(INFO) << "Page " << target->PageId() << " checksum matched";
+    LOG(INFO) << "Page " << target->PageId() << " checksum matched "
+              << target->PageLSN();
   }
   if (!needs_recover) return;
 
