@@ -1,5 +1,7 @@
 #include "page_pool.hpp"
 
+#include <recovery/recovery.hpp>
+
 #include "catalog_page.hpp"
 #include "meta_page.hpp"
 #include "row_page.hpp"
@@ -140,29 +142,7 @@ void PagePool::ReadFrom(Page* target, uint64_t pid) {
     src_.clear();
     return;
   }
-  bool needs_recover = false;
-  switch (target->Type()) {
-    case PageType::kUnknown:
-      LOG(ERROR) << "Reading page unknown type page";
-      return;
-    case PageType::kMetaPage: {
-      auto* meta_page = reinterpret_cast<MetaPage*>(target);
-      needs_recover = !meta_page->IsValid();
-      break;
-    }
-    case PageType::kCatalogPage: {
-      auto* catalog_page = reinterpret_cast<CatalogPage*>(target);
-      needs_recover = !catalog_page->IsValid();
-      break;
-    }
-    case PageType::kRowPage: {
-      auto* row_page = reinterpret_cast<RowPage*>(target);
-      needs_recover = !row_page->IsValid();
-      break;
-    }
-    case PageType::kFreePage:
-      break;
-  }
+  bool needs_recover = target->IsValid();
   if (needs_recover) {
     LOG(ERROR) << "Page " << target->PageId() << " crashed";
   } else {
@@ -170,8 +150,6 @@ void PagePool::ReadFrom(Page* target, uint64_t pid) {
               << target->PageLSN();
   }
   if (!needs_recover) return;
-
-  LOG(ERROR) << "page checksum unmatched on " << pid;
 }
 
 }  // namespace tinylamb

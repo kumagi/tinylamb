@@ -128,9 +128,7 @@ struct LogRecord {
     }
     o << "\tlsn: " << l.lsn << "\tprev_lsn: " << l.prev_lsn
       << "\ttxn_id: " << l.txn_id << "\tundo: " << l.undo_data.size()
-      << " \tredo: " << l.redo_data.size()
-      << "\tdpt: " << l.dirty_page_table.size()
-      << "\ttt: " << l.transaction_table.size() << "\tlength: " << l.length;
+      << " \tredo: " << l.redo_data.size();
     return o;
   }
 

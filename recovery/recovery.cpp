@@ -62,10 +62,10 @@ void Recovery::StartFrom(size_t offset) {
         LOG(ERROR) << "Failed to parse log at offset on undo: " << prev_offset;
         break;
       }
+      LOG(TRACE) << "Undo: " << log;
       LogUndo(log);
       prev_lsn = log.prev_lsn;
     }
-    LOG(TRACE) << "Undo: " << log.txn_id << " finished";
   }
 }
 
@@ -96,6 +96,7 @@ void Recovery::LogRedo(const LogRecord &log) {
     }
     case LogType::kDeleteRow: {
       Page *target = pool_->GetPage(log.pos.page_id);
+      LOG(ERROR) << target->PageLSN() << " < " << log.lsn;
       if (target->PageLSN() < log.lsn) {
         target->DeleteImpl(log.pos);
         target->SetPageLSN(log.lsn);
@@ -133,10 +134,9 @@ void Recovery::LogUndo(const LogRecord &log) {
     case LogType::kBegin:
       break;
     case LogType::kInsertRow: {
-      auto *target =
-          reinterpret_cast<RowPage *>(pool_->GetPage(log.pos.page_id));
+      auto *target = pool_->GetPage(log.pos.page_id);
       txn.CompensateInsertLog(log.pos, log.lsn);
-      target->DeleteRow(log.pos.slot);
+      target->DeleteImpl(log.pos);
       target->SetPageLSN(log.lsn);
       pool_->Unpin(target->PageId());
       break;
@@ -151,7 +151,7 @@ void Recovery::LogUndo(const LogRecord &log) {
     }
     case LogType::kDeleteRow: {
       Page *target = pool_->GetPage(log.pos.page_id);
-      target->DeleteImpl(log.pos);
+      target->InsertImpl(log.pos, log.undo_data);
       target->SetPageLSN(log.lsn);
       pool_->Unpin(target->PageId());
       break;

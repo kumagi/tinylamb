@@ -113,7 +113,24 @@ void Page::DeleteImpl(const RowPosition& pos) {
   }
 }
 
-bool Page::IsValid() const { return checksum == std::hash<Page>()(*this); }
+bool Page::IsValid() const {
+  switch (type) {
+    case tinylamb::PageType::kUnknown:
+      return false;
+    case PageType::kMetaPage: {
+      return reinterpret_cast<const MetaPage*>(this)->IsValid();
+    }
+    case PageType::kCatalogPage: {
+      return reinterpret_cast<const CatalogPage*>(this)->IsValid();
+    }
+    case PageType::kRowPage: {
+      return reinterpret_cast<const RowPage*>(this)->IsValid();
+    }
+    case PageType::kFreePage:
+      return reinterpret_cast<const FreePage*>(this)->IsValid();
+  }
+  return false;
+}
 
 void* Page::operator new(size_t page_id) {
   void* ret = new char[kPageSize];
@@ -133,10 +150,10 @@ uint64_t std::hash<tinylamb::Page>::operator()(const tinylamb::Page& p) const {
       std::hash<uint64_t>()(static_cast<unsigned long>(p.type));
   switch (p.type) {
     case tinylamb::PageType::kUnknown:
-      throw std::runtime_error("Do not hash agains unknown page");
+      throw std::runtime_error("Do not hash against unknown page");
     case tinylamb::PageType::kFreePage:
       return header_hash + std::hash<tinylamb::FreePage>()(
-          reinterpret_cast<const tinylamb::FreePage&>(p));
+                               reinterpret_cast<const tinylamb::FreePage&>(p));
     case tinylamb::PageType::kMetaPage:
       return header_hash + std::hash<tinylamb::MetaPage>()(
                                reinterpret_cast<const tinylamb::MetaPage&>(p));

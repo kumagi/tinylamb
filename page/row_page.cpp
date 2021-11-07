@@ -51,7 +51,6 @@ bool RowPage::Insert(Transaction& txn, const Row& record, RowPosition& dst) {
   dst.page_id = PageId();
   txn.InsertLog(dst, record.data);
   SetPageLSN(txn.PrevLSN());
-  LOG(TRACE) << "inserted " << page_id << " last lsn is " << PageLSN();
   return true;
 }
 
@@ -110,6 +109,7 @@ bool RowPage::Delete(Transaction& txn, const RowPosition& pos) {
   assert(pos.slot <= row_count_);
   txn.DeleteLog(pos, GetRow(pos.slot).data);
   DeleteRow(pos.slot);
+  SetPageLSN(txn.PrevLSN());
   return true;
 }
 
