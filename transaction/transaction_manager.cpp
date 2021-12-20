@@ -2,6 +2,7 @@
 
 #include "page/page_manager.hpp"
 #include "page/row_page.hpp"
+#include "page/page_ref.hpp"
 #include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
 #include "transaction/lock_manager.hpp"
@@ -43,8 +44,8 @@ void TransactionManager::Abort(Transaction& txn) {
   // Iterate prev_lsn to beginning of the transaction with undoing.
   for (const auto& pr : txn.prev_record_) {
     RowPosition pos = pr.first;
-    Page* page = txn.page_manager_->GetPage(pos.page_id);
-    auto* target = reinterpret_cast<RowPage*>(page);
+    PageRef page = txn.page_manager_->GetPage(pos.page_id);
+    RowPage* target = page.AsRowPage();
     switch (pr.second.entry_type) {
       case Transaction::WriteType::kInsert:
         txn.CompensateInsertLog(pos, pr.second.lsn);
@@ -62,7 +63,6 @@ void TransactionManager::Abort(Transaction& txn) {
         target->InsertRow(pr.second.payload);
         break;
     }
-    txn.page_manager_->Unpin(page->PageId());
   }
   PreCommit(txn);  // Writes an empty commit.
 }

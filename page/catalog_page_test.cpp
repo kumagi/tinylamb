@@ -2,6 +2,7 @@
 
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
+#include "page/page_ref.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery.hpp"
 #include "transaction/lock_manager.hpp"
@@ -36,17 +37,17 @@ class CatalogPageTest : public ::testing::Test {
   }
 
   void PageInit() {
-    auto* catalog_page = reinterpret_cast<CatalogPage*>(p_->GetPage(kPageId));
+    PageRef page = p_->GetPage(kPageId);
+    auto* catalog_page = page.AsCatalogPage();
     catalog_page->PageInit(kPageId, PageType::kCatalogPage);
-    p_->Unpin(catalog_page->page_id);
   }
 
   bool InsertSchema(const Schema& sc) {
     Transaction txn = tm_->Begin();
-    auto* catalog_page = reinterpret_cast<CatalogPage*>(p_->GetPage(kPageId));
+    PageRef page = p_->GetPage(kPageId);
+    auto* catalog_page = page.AsCatalogPage();
     bool result = catalog_page->AddSchema(txn, sc).IsValid();
     txn.PreCommit();
-    p_->Unpin(catalog_page->page_id);
     return result;
   }
 
@@ -78,7 +79,8 @@ TEST_F(CatalogPageTest, GetSchema) {
   PageInit();
   ASSERT_TRUE(InsertSchema(schema));
   Transaction txn = tm_->Begin();
-  auto* catalog_page = reinterpret_cast<CatalogPage*>(p_->GetPage(kPageId));
+  PageRef ref = p_->GetPage(kPageId);
+  auto* catalog_page = ref.AsCatalogPage();
   ASSERT_EQ(catalog_page->SlotCount(), 1);
   RowPosition pos(kPageId, 0);
   Schema read_schema = catalog_page->Read(txn, pos);

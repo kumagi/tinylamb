@@ -14,6 +14,8 @@
 
 namespace tinylamb {
 
+class PageRef;
+
 class PagePool {
  private:
   struct Entry {
@@ -29,26 +31,27 @@ class PagePool {
 
  public:
   PagePool(std::string_view file_name, size_t capacity);
+  ~PagePool();
 
-  Page* GetPage(uint64_t page_id);
-
-  bool Unpin(size_t page_id);
+  PageRef GetPage(uint64_t page_id);
 
   uint64_t Size() const {
     std::scoped_lock latch(pool_latch);
     return pool_lru_.size();
   }
 
-  ~PagePool();
-
  private:
+  friend class PageRef;
+
+  bool Unpin(size_t page_id);
+
   bool EvictPage(LruType::iterator target);
 
   // Scan first unpinned page and evict it.
   // Return false if all pages are pinned.
   bool EvictOnePage();
 
-  Page* AllocNewPage(size_t pid);
+  PageRef AllocNewPage(size_t pid);
 
  private:
   void Touch(LruType::iterator it);

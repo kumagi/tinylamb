@@ -4,6 +4,7 @@
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
 #include "page/row_page.hpp"
+#include "page/page_ref.hpp"
 #include "recovery/logger.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
@@ -19,10 +20,9 @@ class RowPageTest : public ::testing::Test {
   void SetUp() override {
     Recover();
     auto txn = tm_->Begin();
-    auto* page = reinterpret_cast<RowPage*>(
-        p_->AllocateNewPage(txn, PageType::kRowPage));
+    auto* page =
+        p_->AllocateNewPage(txn, PageType::kRowPage).AsRowPage();
     page_id_ = page->PageId();
-    p_->Unpin(page_id_);
   }
 
   virtual void Recover() {
@@ -57,7 +57,8 @@ class RowPageTest : public ::testing::Test {
     auto txn = tm_->Begin();
     Row r;
     r.data = str;
-    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+    PageRef page = p_->GetPage(page_id_);
+    auto* p = page.AsRowPage();
     EXPECT_NE(p, nullptr);
     EXPECT_EQ(p->Type(), PageType::kRowPage);
 
@@ -68,7 +69,6 @@ class RowPageTest : public ::testing::Test {
       EXPECT_EQ(p->FreeSizeForTest(),
                 before_size - r.data.size() - sizeof(RowPage::RowPointer));
     }
-    p_->Unpin(p->PageId());
     EXPECT_TRUE(txn.PreCommit());
     txn.CommitWait();
     return success;
@@ -78,40 +78,40 @@ class RowPageTest : public ::testing::Test {
     auto txn = tm_->Begin();
     Row r;
     r.data = str;
-    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+    PageRef page = p_->GetPage(page_id_);
+    auto* p = page.AsRowPage();
     ASSERT_NE(p, nullptr);
     ASSERT_EQ(p->Type(), PageType::kRowPage);
 
     RowPosition pos(page_id_, slot);
     ASSERT_TRUE(p->Update(txn, pos, r));
-    p_->Unpin(p->PageId());
     ASSERT_TRUE(txn.PreCommit());
     txn.CommitWait();
   }
 
   void DeleteRow(int slot) {
     auto txn = tm_->Begin();
-    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+    PageRef page = p_->GetPage(page_id_);
+    auto* p = page.AsRowPage();
     ASSERT_NE(p, nullptr);
     ASSERT_EQ(p->Type(), PageType::kRowPage);
 
     RowPosition pos(page_id_, slot);
     ASSERT_TRUE(p->Delete(txn, pos));
-    p_->Unpin(p->PageId());
     ASSERT_TRUE(txn.PreCommit());
     txn.CommitWait();
   }
 
   std::string ReadRow(int slot) {
     auto txn = tm_->Begin();
-    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+    PageRef page = p_->GetPage(page_id_);
+    auto* p = page.AsRowPage();
     EXPECT_NE(p, nullptr);
     EXPECT_EQ(p->Type(), PageType::kRowPage);
     Row dst;
     RowPosition pos(page_id_, slot);
     EXPECT_TRUE(p->Read(txn, pos, dst));
     dst.MakeOwned();
-    p_->Unpin(p->PageId());
     EXPECT_TRUE(txn.PreCommit());
     txn.CommitWait();
     return dst.owned_data;
@@ -119,11 +119,11 @@ class RowPageTest : public ::testing::Test {
 
   size_t GetRowCount() {
     auto txn = tm_->Begin();
-    auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+    PageRef page = p_->GetPage(page_id_);
+    auto* p = page.AsRowPage();
     EXPECT_NE(p, nullptr);
     EXPECT_EQ(p->Type(), PageType::kRowPage);
     size_t row_count = p->RowCount();
-    p_->Unpin(p->PageId());
     EXPECT_TRUE(txn.PreCommit());
     txn.CommitWait();
     return row_count;

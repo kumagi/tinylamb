@@ -23,7 +23,8 @@ TEST_F(RowPageTest, Insert) { InsertRow("hello"); }
 TEST_F(RowPageTest, InsertMany) {
   constexpr int kInserts = 100;
   size_t consumed = 0;
-  auto* page = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+  PageRef ref = p_->GetPage(page_id_);
+  auto* page = ref.AsRowPage();
   size_t before_size = page->FreeSizeForTest();
   for (int i = 0; i < kInserts; ++i) {
     std::string message = std::to_string(i) + " message";
@@ -34,7 +35,6 @@ TEST_F(RowPageTest, InsertMany) {
   }
   ASSERT_EQ(page->FreeSizeForTest(),
             before_size - (kInserts * sizeof(RowPage::RowPointer) + consumed));
-  p_->Unpin(page->PageId());
   LOG(ERROR) << page->FreeSizeForTest();
 }
 
@@ -108,7 +108,8 @@ TEST_F(RowPageTest, InsertAbort) {
   auto txn = tm_->Begin();
   Row r;
   r.data = "blah~blah";
-  auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+  PageRef ref = p_->GetPage(page_id_);
+  auto* p = ref.AsRowPage();
   ASSERT_NE(p, nullptr);
   ASSERT_EQ(p->Type(), PageType::kRowPage);
 
@@ -117,7 +118,6 @@ TEST_F(RowPageTest, InsertAbort) {
   ASSERT_TRUE(p->Insert(txn, r, pos));
   ASSERT_EQ(p->FreeSizeForTest(),
             before_size - r.data.size() - sizeof(RowPage::RowPointer));
-  p_->Unpin(p->PageId());
   txn.Abort();
   ASSERT_EQ(GetRowCount(), 0);
 }
@@ -162,7 +162,8 @@ TEST_F(RowPageTest, UpdateAbort) {
   auto txn = tm_->Begin();
   Row r;
   r.data = after;
-  auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+  PageRef ref = p_->GetPage(page_id_);
+  auto* p = ref.AsRowPage();
   ASSERT_NE(p, nullptr);
   ASSERT_EQ(p->Type(), PageType::kRowPage);
 
@@ -172,7 +173,6 @@ TEST_F(RowPageTest, UpdateAbort) {
 
   ASSERT_EQ(p->FreeSizeForTest(),
             before_size - before.length() + after.length());
-  p_->Unpin(p->PageId());
   txn.Abort();
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), before);
@@ -182,7 +182,8 @@ TEST_F(RowPageTest, DeleteAbort) {
   std::string before = "living row";
   ASSERT_TRUE(InsertRow(before));
   auto txn = tm_->Begin();
-  auto* p = reinterpret_cast<RowPage*>(p_->GetPage(page_id_));
+  PageRef ref = p_->GetPage(page_id_);
+  auto* p = ref.AsRowPage();
   RowPosition target(p->PageId(), 0);
   p->Delete(txn, target);
   txn.Abort();

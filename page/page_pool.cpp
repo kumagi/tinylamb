@@ -5,6 +5,7 @@
 #include "catalog_page.hpp"
 #include "meta_page.hpp"
 #include "row_page.hpp"
+#include "page/page_ref.hpp"
 
 namespace tinylamb {
 
@@ -23,7 +24,7 @@ PagePool::PagePool(std::string_view file_name, size_t capacity)
   }
 }
 
-Page* PagePool::GetPage(uint64_t page_id) {
+PageRef PagePool::GetPage(uint64_t page_id) {
   std::scoped_lock latch(pool_latch);
   auto entry = pool_.find(page_id);
   if (entry != pool_.end()) {
@@ -32,7 +33,7 @@ Page* PagePool::GetPage(uint64_t page_id) {
     entry->second->pin_count++;
     Touch(entry->second);
     assert(entry->second->page->PageId() == page_id);
-    return result;
+    return PageRef(this, result);
   } else {
     if (pool_lru_.size() == capacity_) {
       EvictOnePage();
@@ -71,7 +72,7 @@ bool PagePool::EvictOnePage() {
   return target != pool_lru_.end();
 }
 
-Page* PagePool::AllocNewPage(size_t pid) {
+PageRef PagePool::AllocNewPage(size_t pid) {
   std::unique_ptr<Page> new_page(new Page(pid, PageType::kMetaPage));
   ReadFrom(new_page.get(), pid);
   assert(new_page->PageId() == pid);
@@ -80,7 +81,7 @@ Page* PagePool::AllocNewPage(size_t pid) {
   new_entry.page = std::move(new_page);
   pool_lru_.push_back(std::move(new_entry));
   pool_.emplace(pid, std::prev(pool_lru_.end()));
-  return pool_lru_.back().page.get();
+  return PageRef{this, pool_lru_.back().page.get()};
 }
 
 void PagePool::Touch(LruType::iterator it) {

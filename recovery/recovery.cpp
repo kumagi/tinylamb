@@ -10,6 +10,7 @@
 #include "page/page.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_pool.hpp"
+#include "page/page_ref.hpp"
 #include "page/row_page.hpp"
 #include "recovery/log_record.hpp"
 #include "transaction/transaction_manager.hpp"
@@ -77,31 +78,28 @@ void Recovery::LogRedo(const LogRecord &log) {
       tm_->active_transactions_.insert(log.txn_id);
       break;
     case LogType::kInsertRow: {
-      Page *target = pool_->GetPage(log.pos.page_id);
+      PageRef target = pool_->GetPage(log.pos.page_id);
       if (target->PageLSN() < log.lsn) {
         target->InsertImpl(log.pos, log.redo_data);
         target->SetPageLSN(log.lsn);
       }
-      pool_->Unpin(target->PageId());
       break;
     }
     case LogType::kUpdateRow: {
-      Page *target = pool_->GetPage(log.pos.page_id);
+      PageRef target = pool_->GetPage(log.pos.page_id);
       if (target->PageLSN() < log.lsn) {
         target->UpdateImpl(log.pos, log.redo_data);
         target->SetPageLSN(log.lsn);
       }
-      pool_->Unpin(target->PageId());
       break;
     }
     case LogType::kDeleteRow: {
-      Page *target = pool_->GetPage(log.pos.page_id);
+      PageRef target = pool_->GetPage(log.pos.page_id);
       LOG(ERROR) << target->PageLSN() << " < " << log.lsn;
       if (target->PageLSN() < log.lsn) {
         target->DeleteImpl(log.pos);
         target->SetPageLSN(log.lsn);
       }
-      pool_->Unpin(target->PageId());
       break;
     }
     case LogType::kCommit:
@@ -112,11 +110,10 @@ void Recovery::LogRedo(const LogRecord &log) {
     case LogType::kEndCheckpoint:
       break;
     case LogType::kSystemAllocPage: {
-      Page *target = pool_->GetPage(log.allocated_page_id);
+      PageRef target = pool_->GetPage(log.allocated_page_id);
       if (target->PageLSN() < log.lsn) {
         target->PageInit(log.allocated_page_id, log.allocated_page_type);
       }
-      pool_->Unpin(target->PageId());
       break;
     }
     case LogType::kSystemDestroyPage:
@@ -134,26 +131,23 @@ void Recovery::LogUndo(const LogRecord &log) {
     case LogType::kBegin:
       break;
     case LogType::kInsertRow: {
-      auto *target = pool_->GetPage(log.pos.page_id);
+      PageRef target = pool_->GetPage(log.pos.page_id);
       txn.CompensateInsertLog(log.pos, log.lsn);
       target->DeleteImpl(log.pos);
       target->SetPageLSN(log.lsn);
-      pool_->Unpin(target->PageId());
       break;
     }
     case LogType::kUpdateRow: {
-      Page *target = pool_->GetPage(log.pos.page_id);
+      PageRef target = pool_->GetPage(log.pos.page_id);
       txn.CompensateUpdateLog(log.pos, log.lsn, log.undo_data);
       target->UpdateImpl(log.pos, log.undo_data);
       target->SetPageLSN(log.lsn);
-      pool_->Unpin(target->PageId());
       break;
     }
     case LogType::kDeleteRow: {
-      Page *target = pool_->GetPage(log.pos.page_id);
+      PageRef target = pool_->GetPage(log.pos.page_id);
       target->InsertImpl(log.pos, log.undo_data);
       target->SetPageLSN(log.lsn);
-      pool_->Unpin(target->PageId());
       break;
     }
     case LogType::kCommit:
@@ -166,9 +160,8 @@ void Recovery::LogUndo(const LogRecord &log) {
     case LogType::kSystemAllocPage:
       break;
     case LogType::kSystemDestroyPage:
-      Page *target = pool_->GetPage(log.destroy_page_id);
+      PageRef target = pool_->GetPage(log.destroy_page_id);
       target->PageInit(log.destroy_page_id, log.allocated_page_type);
-      pool_->Unpin(target->PageId());
       break;
   }
 }

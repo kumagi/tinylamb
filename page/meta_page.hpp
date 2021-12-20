@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "page/page.hpp"
+#include "page/page_ref.hpp"
 
 namespace tinylamb {
 
@@ -16,7 +17,7 @@ struct MetaPage : public Page {
     first_free_page = 0;
   }
 
-  Page* AllocateNewPage(Transaction& txn, PagePool& pool,
+  PageRef AllocateNewPage(Transaction& txn, PagePool& pool,
                         PageType new_page_type);
   void DestroyPage(Transaction& txn, Page* target, PagePool& pool);
 

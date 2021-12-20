@@ -24,7 +24,7 @@ target_include_directories(
 add_library(libtinylamb
   STATIC
   database.cpp page/page.cpp transaction/lock_manager.cpp page/page_pool.cpp type/catalog.hpp page/page_manager.hpp log_message.hpp recovery/log_record.hpp transaction/lock_manager.hpp page/row_position.hpp transaction/transaction.hpp transaction/transaction_manager.hpp recovery/logger.hpp type/value.hpp type/schema.hpp type/value_type.hpp page/catalog_page.hpp page/meta_page.hpp page/row_page.hpp page/row_page.cpp page/page_manager.cpp recovery/logger.cpp type/catalog.cpp type/row.cpp type/schema.cpp transaction/transaction.cpp page/catalog_page.cpp recovery/log_record.cpp page/meta_page.cpp page/free_page.hpp recovery/recovery.cpp recovery/recovery.hpp transaction/transaction_manager.cpp type/column.cpp log_message.cpp
-  )
+        page/page_ref.hpp page/page_ref.cpp)
 
 target_include_directories(
   libtinylamb

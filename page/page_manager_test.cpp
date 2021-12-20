@@ -4,6 +4,7 @@
 
 #include "gtest/gtest.h"
 #include "page/free_page.hpp"
+#include "page/page_ref.hpp"
 #include "recovery/logger.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
@@ -37,12 +38,12 @@ class PageManagerTest : public ::testing::Test {
     std::remove(kLogName);
   }
 
-  Page* AllocatePage(PageType expected_type) {
+  PageRef AllocatePage(PageType expected_type) {
     Transaction system_txn = tm_->Begin();
-    Page* new_page = p_->AllocateNewPage(system_txn, expected_type);
-    EXPECT_NE(new_page, nullptr);
+    PageRef new_page = p_->AllocateNewPage(system_txn, expected_type);
+    EXPECT_FALSE(new_page.IsNull());
     EXPECT_EQ(new_page->Type(), PageType::kFreePage);
-    return new_page;
+    return std::move(new_page);
   }
 
   void DestroyPage(Page* target) {
@@ -62,34 +63,32 @@ TEST_F(PageManagerTest, AllocateNewPage) {
   constexpr int kPages = 15;
   std::set<uint64_t> allocated_ids;
   for (int i = 0; i <= kPages; ++i) {
-    auto* page = reinterpret_cast<FreePage*>(AllocatePage(PageType::kFreePage));
+    PageRef ref = AllocatePage(PageType::kFreePage);
+    auto* page = ref.AsFreePage();
     char* buff = page->FreeBody();
     for (size_t j = 0; j < kFreeBodySize; ++j) {
       buff[j] = static_cast<char>((page->PageId() + j) & 0xff);
     }
     allocated_ids.insert(page->PageId());
-    ASSERT_TRUE(p_->Unpin(page->PageId()));
   }
   Reset();
   for (const auto& id : allocated_ids) {
-    auto* page = reinterpret_cast<FreePage*>(p_->GetPage(id));
+    PageRef ref = AllocatePage(PageType::kFreePage);
+    auto* page = ref.AsFreePage();
     char* buff = page->FreeBody();
     for (size_t j = 0; j < kFreeBodySize; ++j) {
       ASSERT_EQ(buff[j], static_cast<char>((id + j) & 0xff));
     }
-    ASSERT_TRUE(p_->Unpin(page->PageId()));
   }
 }
 
 TEST_F(PageManagerTest, DestroyPage) {
   for (int i = 0; i < 15; ++i) {
-    Page* page = AllocatePage(PageType::kFreePage);
-    DestroyPage(page);
-    p_->Unpin(page->PageId());
+    PageRef page = AllocatePage(PageType::kFreePage);
+    DestroyPage(page.get());
   }
   for (int i = 0; i < 15; ++i) {
-    Page* page = AllocatePage(PageType::kFreePage);
-    p_->Unpin(page->PageId());
+    PageRef page = AllocatePage(PageType::kFreePage);
     ASSERT_LE(page->PageId(), 15);
   }
 }

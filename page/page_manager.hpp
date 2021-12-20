@@ -18,19 +18,15 @@ class PageManager {
  public:
   PageManager(std::string_view name, size_t capacity);
 
-  Page* GetPage(uint64_t page_id);
+  PageRef GetPage(uint64_t page_id);
 
-  Page* AllocateNewPage(Transaction& txn, PageType new_page_type);
+  PageRef AllocateNewPage(Transaction& txn, PageType new_page_type);
 
   // Logically delete the page.
   void DestroyPage(Transaction& txn, Page* target);
 
-  bool Unpin(size_t page_id) { return pool_.Unpin(page_id); }
-
  private:
-  MetaPage& GetMetaPage();
-
-  void UnpinMetaPage() { pool_.Unpin(kMetaPageId); }
+  PageRef GetMetaPage();
 
  private:
   friend class Recovery;

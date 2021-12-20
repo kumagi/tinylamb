@@ -9,18 +9,20 @@
 
 namespace tinylamb {
 
-Page* MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
-                                PageType new_page_type) {
-  Page* ret;
+PageRef MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
+                                  PageType new_page_type) {
   uint64_t new_page_id;
-  if (first_free_page == 0) {
-    new_page_id = ++max_page_count;
-    ret = pool.GetPage(max_page_count);
-  } else {
-    new_page_id = first_free_page;
-    ret = pool.GetPage(new_page_id);
-    first_free_page = reinterpret_cast<FreePage*>(ret)->next_free_page;
-  }
+  PageRef ret = [&]() {
+    if (first_free_page == 0) {
+      new_page_id = ++max_page_count;
+      return pool.GetPage(max_page_count);
+    } else {
+      new_page_id = first_free_page;
+      PageRef page = pool.GetPage(new_page_id);
+      first_free_page = page.AsFreePage()->next_free_page;
+      return page;
+    }
+  }();
   ret->PageInit(new_page_id, new_page_type);
   txn.AllocatePageLog(new_page_id, new_page_type);
   txn.PreCommit();  // No need to wait for the log to be durable.
