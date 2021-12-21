@@ -67,7 +67,7 @@ TEST_F(PagePoolTest, PersistencyWithReset) {
       buff[j] = i;
     }
   }
-  // Reset();
+  Reset();
   for (int i = 0; i < kPages; ++i) {
     PageRef p = pp->GetPage(i);
     char* buff = p->page_body;

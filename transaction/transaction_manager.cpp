@@ -16,8 +16,7 @@ Transaction TransactionManager::Begin() {
 
   Transaction new_txn(new_txn_id, this, lock_manager_, page_manager_, logger_);
   LogRecord begin_log(0, new_txn_id, LogType::kBegin);
-  logger_->AddLog(begin_log);
-  new_txn.prev_lsn_ = begin_log.lsn;
+  new_txn.prev_lsn_ = logger_->AddLog(begin_log);
   active_transactions_.insert(new_txn_id);
   assert(!new_txn.IsFinished());
   return new_txn;
@@ -27,8 +26,7 @@ bool TransactionManager::PreCommit(Transaction& txn) {
   assert(!txn.IsFinished());
   LogRecord commit_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
   txn.SetStatus(TransactionStatus::kCommitted);
-  logger_->AddLog(commit_log);
-  txn.prev_lsn_ = commit_log.lsn;
+  txn.prev_lsn_ = logger_->AddLog(commit_log);
   for (auto& row : txn.read_set_) {
     lock_manager_->ReleaseSharedLock(row);
   }

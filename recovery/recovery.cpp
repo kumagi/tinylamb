@@ -45,32 +45,29 @@ void Recovery::StartFrom(size_t offset) {
       LOG(ERROR) << "Failed to parse log at offset: " << log_offset;
       break;
     }
-    log_offsets[log.lsn] = log_offset;
-    txn_lsns[log.txn_id] = log.lsn;
+    txn_lsns[log.txn_id] = log_offset;
     entire_log.remove_prefix(log.Size());
+    LogRedo(log_offset, log);
     log_offset += log.Size();
-    LOG(TRACE) << log << " rest: " << entire_log.size();
-    LogRedo(log);
   }
 
   // Undo phase starts here.
   for (auto &txn_id : tm_->active_transactions_) {
     uint64_t prev_lsn = txn_lsns[txn_id];
     while (prev_lsn != 0) {
-      size_t prev_offset = log_offsets[prev_lsn];
+      size_t prev_offset = prev_lsn;
       std::string_view undo_log_data(log_data_ + prev_offset, filesize);
       if (!LogRecord::ParseLogRecord(undo_log_data, &log)) {
         LOG(ERROR) << "Failed to parse log at offset on undo: " << prev_offset;
         break;
       }
-      LOG(TRACE) << "Undo: " << log;
-      LogUndo(log);
+      LogUndo(prev_lsn, log);
       prev_lsn = log.prev_lsn;
     }
   }
 }
 
-void Recovery::LogRedo(const LogRecord &log) {
+void Recovery::LogRedo(uint64_t lsn, const LogRecord &log) {
   switch (log.type) {
     case LogType::kUnknown:
       assert(!"unknown log type must not be parsed");
@@ -79,26 +76,25 @@ void Recovery::LogRedo(const LogRecord &log) {
       break;
     case LogType::kInsertRow: {
       PageRef target = pool_->GetPage(log.pos.page_id);
-      if (target->PageLSN() < log.lsn) {
+      if (target->PageLSN() < lsn) {
         target->InsertImpl(log.pos, log.redo_data);
-        target->SetPageLSN(log.lsn);
+        target->SetPageLSN(lsn);
       }
       break;
     }
     case LogType::kUpdateRow: {
       PageRef target = pool_->GetPage(log.pos.page_id);
-      if (target->PageLSN() < log.lsn) {
+      if (target->PageLSN() < lsn) {
         target->UpdateImpl(log.pos, log.redo_data);
-        target->SetPageLSN(log.lsn);
+        target->SetPageLSN(lsn);
       }
       break;
     }
     case LogType::kDeleteRow: {
       PageRef target = pool_->GetPage(log.pos.page_id);
-      LOG(ERROR) << target->PageLSN() << " < " << log.lsn;
-      if (target->PageLSN() < log.lsn) {
+      if (target->PageLSN() < lsn) {
         target->DeleteImpl(log.pos);
-        target->SetPageLSN(log.lsn);
+        target->SetPageLSN(lsn);
       }
       break;
     }
@@ -111,7 +107,7 @@ void Recovery::LogRedo(const LogRecord &log) {
       break;
     case LogType::kSystemAllocPage: {
       PageRef target = pool_->GetPage(log.allocated_page_id);
-      if (target->PageLSN() < log.lsn) {
+      if (target->PageLSN() < lsn) {
         target->PageInit(log.allocated_page_id, log.allocated_page_type);
       }
       break;
@@ -121,7 +117,7 @@ void Recovery::LogRedo(const LogRecord &log) {
   }
 }
 
-void Recovery::LogUndo(const LogRecord &log) {
+void Recovery::LogUndo(uint64_t lsn, const LogRecord &log) {
   Transaction txn(log.txn_id, tm_, tm_->lock_manager_, tm_->page_manager_,
                   tm_->logger_);
   switch (log.type) {
@@ -132,22 +128,22 @@ void Recovery::LogUndo(const LogRecord &log) {
       break;
     case LogType::kInsertRow: {
       PageRef target = pool_->GetPage(log.pos.page_id);
-      txn.CompensateInsertLog(log.pos, log.lsn);
+      txn.CompensateInsertLog(log.pos, lsn);
       target->DeleteImpl(log.pos);
-      target->SetPageLSN(log.lsn);
+      target->SetPageLSN(lsn);
       break;
     }
     case LogType::kUpdateRow: {
       PageRef target = pool_->GetPage(log.pos.page_id);
-      txn.CompensateUpdateLog(log.pos, log.lsn, log.undo_data);
+      txn.CompensateUpdateLog(log.pos, lsn, log.undo_data);
       target->UpdateImpl(log.pos, log.undo_data);
-      target->SetPageLSN(log.lsn);
+      target->SetPageLSN(lsn);
       break;
     }
     case LogType::kDeleteRow: {
       PageRef target = pool_->GetPage(log.pos.page_id);
       target->InsertImpl(log.pos, log.undo_data);
-      target->SetPageLSN(log.lsn);
+      target->SetPageLSN(lsn);
       break;
     }
     case LogType::kCommit:

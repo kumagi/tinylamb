@@ -68,8 +68,6 @@ struct LogRecord {
 
   static LogRecord DestroyPageLogRecord(uint64_t p, uint64_t txn, uint64_t pid);
 
-  void SetLSN(uint64_t new_lsn);
-
   size_t Size() const;
 
   [[nodiscard]] std::string Serialize() const;
@@ -126,7 +124,7 @@ struct LogRecord {
         LOG(ERROR) << "kUnknownLog";
         break;
     }
-    o << "\tlsn: " << l.lsn << "\tprev_lsn: " << l.prev_lsn
+    o << "\tprev_lsn: " << l.prev_lsn
       << "\ttxn_id: " << l.txn_id << "\tundo: " << l.undo_data.size()
       << " \tredo: " << l.redo_data.size();
     return o;
@@ -134,7 +132,6 @@ struct LogRecord {
 
   // Log size in bytes.
   LogType type = LogType::kUnknown;
-  uint64_t lsn = 0;
   uint64_t prev_lsn = 0;
   uint64_t undo_next_lsn = 0;  // Only used for CLR.
   uint64_t txn_id = 0;

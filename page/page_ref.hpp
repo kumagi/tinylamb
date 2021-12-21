@@ -5,6 +5,8 @@
 #ifndef TINYLAMB_PAGE_REF_HPP
 #define TINYLAMB_PAGE_REF_HPP
 
+#include "log_message.hpp"
+
 namespace tinylamb {
 
 class PagePool;
@@ -16,7 +18,6 @@ class FreePage;
 
 class PageRef {
  private:
-  PageRef() {}
   PageRef(PagePool* src, Page* page) : pool_(src), page_(page) {}
 
  public:
@@ -28,7 +29,7 @@ class PageRef {
   CatalogPage* AsCatalogPage() { return reinterpret_cast<CatalogPage*>(page_); }
   MetaPage* AsMetaPage() { return reinterpret_cast<MetaPage*>(page_); }
   FreePage* AsFreePage() { return reinterpret_cast<FreePage*>(page_); }
-  bool IsNull() const { return page_ == nullptr; }
+  [[nodiscard]] bool IsNull() const { return page_ == nullptr; }
   Page* get() { return page_; }
   [[nodiscard]] const Page* get() const { return page_; }
 
@@ -36,7 +37,11 @@ class PageRef {
 
   PageRef(const PageRef&) = delete;
   PageRef& operator=(const PageRef&) = delete;
-  PageRef(PageRef&&) = default;
+  PageRef(PageRef&& o) : pool_(o.pool_), page_(o.page_) {
+    o.pool_ = nullptr;
+    o.page_ = nullptr;
+  }
+
   PageRef& operator=(PageRef&&) = delete;
 
  private:

@@ -113,24 +113,7 @@ void Page::DeleteImpl(const RowPosition& pos) {
   }
 }
 
-bool Page::IsValid() const {
-  switch (type) {
-    case tinylamb::PageType::kUnknown:
-      return false;
-    case PageType::kMetaPage: {
-      return reinterpret_cast<const MetaPage*>(this)->IsValid();
-    }
-    case PageType::kCatalogPage: {
-      return reinterpret_cast<const CatalogPage*>(this)->IsValid();
-    }
-    case PageType::kRowPage: {
-      return reinterpret_cast<const RowPage*>(this)->IsValid();
-    }
-    case PageType::kFreePage:
-      return reinterpret_cast<const FreePage*>(this)->IsValid();
-  }
-  return false;
-}
+bool Page::IsValid() const { return checksum == std::hash<Page>()(*this); }
 
 void* Page::operator new(size_t page_id) {
   void* ret = new char[kPageSize];

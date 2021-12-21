@@ -62,8 +62,7 @@ LogRecord::LogRecord(uint64_t prev, uint64_t txn, LogType t)
 bool LogRecord::ParseLogRecord(std::string_view src, tinylamb::LogRecord* dst) {
   size_t offset = 0;
   if (src.length() < sizeof(dst->length) + sizeof(dst->type) +
-                         sizeof(dst->lsn) + sizeof(dst->prev_lsn) +
-                         sizeof(dst->txn_id)) {
+                         sizeof(dst->prev_lsn) + sizeof(dst->txn_id)) {
     LOG(DEBUG) << "too small data " << src.length();
     return false;
   }
@@ -71,8 +70,6 @@ bool LogRecord::ParseLogRecord(std::string_view src, tinylamb::LogRecord* dst) {
   src.remove_prefix(sizeof(dst->length));
   memcpy(&dst->type, src.data(), sizeof(dst->type));
   src.remove_prefix(sizeof(dst->type));
-  memcpy(&dst->lsn, src.data(), sizeof(dst->lsn));
-  src.remove_prefix(sizeof(dst->lsn));
   memcpy(&dst->prev_lsn, src.data(), sizeof(dst->prev_lsn));
   src.remove_prefix(sizeof(dst->prev_lsn));
   memcpy(&dst->txn_id, src.data(), sizeof(dst->txn_id));
@@ -120,7 +117,6 @@ bool LogRecord::ParseLogRecord(std::string_view src, tinylamb::LogRecord* dst) {
     }
     case LogType::kCompensateInsertRow: {
       src.remove_prefix(dst->pos.Parse(src.data()));
-
       return true;
     }
     case LogType::kCompensateUpdateRow: {
@@ -284,11 +280,9 @@ LogRecord LogRecord::DestroyPageLogRecord(uint64_t p, uint64_t txn,
   return l;
 }
 
-void LogRecord::SetLSN(uint64_t new_lsn) { lsn = new_lsn; }
-
 size_t LogRecord::Size() const {
-  size_t size = sizeof(length) + sizeof(lsn) + sizeof(prev_lsn) +
-                sizeof(txn_id) + sizeof(type);
+  size_t size =
+      sizeof(length) + sizeof(prev_lsn) + sizeof(txn_id) + sizeof(type);
   switch (type) {
     case LogType::kUnknown:
       assert(!"Don't call Size() of unknown log");
@@ -329,8 +323,6 @@ size_t LogRecord::Size() const {
   offset += sizeof(length);
   memcpy(result.data() + offset, &type, sizeof(type));
   offset += sizeof(type);
-  memcpy(result.data() + offset, &lsn, sizeof(lsn));
-  offset += sizeof(lsn);
   memcpy(result.data() + offset, &prev_lsn, sizeof(prev_lsn));
   offset += sizeof(prev_lsn);
   memcpy(result.data() + offset, &txn_id, sizeof(txn_id));
@@ -414,8 +406,8 @@ size_t LogRecord::Size() const {
 }
 
 bool LogRecord::operator==(const LogRecord& rhs) const {
-  return type == rhs.type && lsn == rhs.lsn && prev_lsn == rhs.prev_lsn &&
-         txn_id == rhs.txn_id && pos == rhs.pos && undo_data == rhs.undo_data &&
+  return type == rhs.type && prev_lsn == rhs.prev_lsn && txn_id == rhs.txn_id &&
+         pos == rhs.pos && undo_data == rhs.undo_data &&
          redo_data == rhs.redo_data &&
          dirty_page_table == rhs.dirty_page_table &&
          transaction_table == rhs.transaction_table &&

@@ -4,8 +4,8 @@
 
 #include "catalog_page.hpp"
 #include "meta_page.hpp"
-#include "row_page.hpp"
 #include "page/page_ref.hpp"
+#include "row_page.hpp"
 
 namespace tinylamb {
 
@@ -81,7 +81,7 @@ PageRef PagePool::AllocNewPage(size_t pid) {
   new_entry.page = std::move(new_page);
   pool_lru_.push_back(std::move(new_entry));
   pool_.emplace(pid, std::prev(pool_lru_.end()));
-  return PageRef{this, pool_lru_.back().page.get()};
+  return PageRef(this, pool_lru_.back().page.get());
 }
 
 void PagePool::Touch(LruType::iterator it) {
@@ -97,7 +97,7 @@ PagePool::~PagePool() {
   for (auto& it : pool_lru_) {
     if (0 < it.pin_count) {
       LOG(ERROR) << "caution: pinned page(" << it.page->PageId()
-                 << ") is to be deleted\n";
+                 << ") is to be deleted at count " << it.pin_count;
     }
     WriteBack(it.page.get());
   }
@@ -138,19 +138,17 @@ void PagePool::ReadFrom(Page* target, uint64_t pid) {
   }
   src_.read(reinterpret_cast<char*>(target), kPageSize);
   if (src_.fail()) {
-    LOG(INFO) << "Page " << pid << " is empty, newly allocate one";
     target->PageInit(pid, PageType::kFreePage);
     src_.clear();
     return;
   }
-  bool needs_recover = target->IsValid();
-  if (needs_recover) {
-    LOG(ERROR) << "Page " << target->PageId() << " crashed";
-  } else {
+  if (target->IsValid()) {
     LOG(INFO) << "Page " << target->PageId() << " checksum matched "
               << target->PageLSN();
+    return;
+  } else {
+    LOG(ERROR) << "Page " << target->PageId() << " crashed";
   }
-  if (!needs_recover) return;
 }
 
 }  // namespace tinylamb

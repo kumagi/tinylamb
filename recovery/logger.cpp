@@ -30,24 +30,22 @@ Logger::~Logger() {
 }
 
 uint64_t Logger::AddLog(LogRecord& log) {
-  std::scoped_lock lk(latch_);
-  const uint64_t lsn = next_lsn_++;
-  log.SetLSN(lsn);
   std::string data = log.Serialize();
-  if (buffer_.size() < written_pos_ + data.size()) {
-    const size_t fraction = buffer_.size() - written_pos_;
-    std::memcpy(buffer_.data() + written_pos_, data.data(), fraction);
+  std::scoped_lock lk(latch_);
+
+  size_t memory_offset = written_lsn_ % buffer_.size();
+  if (buffer_.size() < memory_offset + data.size()) {
+    const size_t fraction = buffer_.size() - memory_offset;
+    std::memcpy(buffer_.data() + memory_offset, data.data(), fraction);
     std::memcpy(buffer_.data(), data.data() + fraction, data.size() - fraction);
-    written_pos_ = (written_pos_ + data.size()) % buffer_.size();
   } else {
-    memcpy(buffer_.data() + written_pos_, data.data(), data.size());
-    written_pos_ += data.size();
+    memcpy(buffer_.data() + memory_offset, data.data(), data.size());
   }
-  lsn_entry_.emplace_back(lsn, written_pos_);
+  written_lsn_ += data.size();
   if (buffer_.size() - RestSize() < buffer_.size() / 4) {
     worker_wait_.notify_all();
   }
-  return lsn;
+  return written_lsn_ - data.size();
 }
 
 void Logger::Finish() {
@@ -64,46 +62,30 @@ void Logger::LoggerWork() {
   std::unique_lock lk(latch_);
   while (!finish_) {
     worker_wait_.wait_for(lk, std::chrono::milliseconds(every_ms_));
-    if (flushed_pos_ == written_pos_) continue;
-    if (flushed_pos_ < written_pos_) {
-      assert(written_pos_ < buffer_.size());
-      size_t flushed_bytes = write(dst_, buffer_.data() + flushed_pos_,
-                                   written_pos_ - flushed_pos_);
-      ::fsync(dst_);
-      flushed_pos_ += flushed_bytes;
-      while (!lsn_entry_.empty() &&
-             lsn_entry_.front().position <= flushed_pos_) {
-        committed_lsn_ = lsn_entry_.front().lsn;
-        lsn_entry_.pop_front();
-      }
+    if (committed_lsn_ == written_lsn_) continue;
+    const size_t written_offset = written_lsn_ % buffer_.size();
+    const size_t committed_offset = committed_lsn_ % buffer_.size();
+    size_t flushed_bytes = 0;
+    if (committed_lsn_ < written_lsn_) {
+      flushed_bytes += write(dst_, buffer_.data() + committed_offset,
+                             written_offset - committed_offset);
     } else {
-      size_t flushed_bytes = write(dst_, buffer_.data() + flushed_pos_,
-                                   buffer_.size() - flushed_pos_);
+      flushed_bytes += write(dst_, buffer_.data() + committed_offset,
+                             buffer_.size() - committed_offset);
       if (0 < flushed_bytes) {
-        flushed_bytes += write(dst_, buffer_.data(), written_pos_);
-      }
-      ::fsync(dst_);
-      flushed_pos_ = (flushed_pos_ + flushed_bytes) % buffer_.size();
-      while (!lsn_entry_.empty() &&
-             lsn_entry_.front().position <= buffer_.size()) {
-        committed_lsn_ = lsn_entry_.front().lsn;
-        lsn_entry_.pop_front();
-      }
-      while (!lsn_entry_.empty() &&
-             lsn_entry_.front().position <= flushed_pos_) {
-        committed_lsn_ = lsn_entry_.front().lsn;
-        lsn_entry_.pop_front();
+        flushed_bytes += write(dst_, buffer_.data(), written_offset);
       }
     }
+    committed_lsn_ += flushed_bytes;
     fsync(dst_);
   }
 }
 
 [[nodiscard]] size_t Logger::RestSize() const {
-  if (flushed_pos_ <= written_pos_)
-    return buffer_.size() - written_pos_ + flushed_pos_ - 1;
+  if (committed_lsn_ <= written_lsn_)
+    return buffer_.size() - written_lsn_ + committed_lsn_ - 1;
   else
-    return flushed_pos_ - written_pos_ - 1;
+    return committed_lsn_ - written_lsn_ - 1;
 }
 
 }  // namespace tinylamb

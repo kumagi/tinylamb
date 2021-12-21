@@ -53,9 +53,8 @@ bool Transaction::AddWriteSet(const RowPosition& rs) {
 uint64_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pos, redo);
-  logger_->AddLog(lr);
-  prev_record_.emplace(pos, WriteEntry{WriteType::kInsert, "", lr.lsn});
-  prev_lsn_ = lr.lsn;
+  prev_lsn_ = logger_->AddLog(lr);
+  prev_record_.emplace(pos, WriteEntry{WriteType::kInsert, "", prev_lsn_});
   return prev_lsn_;
 }
 
@@ -64,20 +63,18 @@ uint64_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
   assert(!IsFinished());
   LogRecord lr =
       LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pos, redo, undo);
-  logger_->AddLog(lr);
+  prev_lsn_ = logger_->AddLog(lr);
   prev_record_.emplace(
-      pos, WriteEntry{WriteType::kUpdate, std::string(undo), lr.lsn});
-  prev_lsn_ = lr.lsn;
+      pos, WriteEntry{WriteType::kUpdate, std::string(undo), prev_lsn_});
   return prev_lsn_;
 }
 
 uint64_t Transaction::DeleteLog(const RowPosition& pos, std::string_view undo) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pos, undo);
-  logger_->AddLog(lr);
+  prev_lsn_ = logger_->AddLog(lr);
   prev_record_.emplace(
-      pos, WriteEntry{WriteType::kDelete, std::string(undo), lr.lsn});
-  prev_lsn_ = lr.lsn;
+      pos, WriteEntry{WriteType::kDelete, std::string(undo), prev_lsn_});
   return prev_lsn_;
 }
 
@@ -86,8 +83,7 @@ uint64_t Transaction::CompensateInsertLog(const RowPosition& pos,
   assert(!IsFinished());
   LogRecord lr = LogRecord::CompensatingInsertLogRecord(
       prev_lsn_, undo_next_lsn, txn_id_, pos);
-  logger_->AddLog(lr);
-  prev_lsn_ = lr.lsn;
+  prev_lsn_ = logger_->AddLog(lr);
   return prev_lsn_;
 }
 
@@ -97,8 +93,7 @@ uint64_t Transaction::CompensateUpdateLog(const RowPosition& pos,
   assert(!IsFinished());
   LogRecord lr = LogRecord::CompensatingUpdateLogRecord(
       prev_lsn_, undo_next_lsn, txn_id_, pos, redo);
-  logger_->AddLog(lr);
-  prev_lsn_ = lr.lsn;
+  prev_lsn_ = logger_->AddLog(lr);
   return prev_lsn_;
 }
 
@@ -108,8 +103,7 @@ uint64_t Transaction::CompensateDeleteLog(const RowPosition& pos,
   assert(!IsFinished());
   LogRecord lr = LogRecord::CompensatingDeleteLogRecord(
       prev_lsn_, undo_next_lsn, txn_id_, pos, redo);
-  logger_->AddLog(lr);
-  prev_lsn_ = lr.lsn;
+  prev_lsn_ = logger_->AddLog(lr);
   return prev_lsn_;
 }
 
@@ -118,8 +112,7 @@ uint64_t Transaction::AllocatePageLog(uint64_t allocated_page_id,
   assert(!IsFinished());
   LogRecord lr = LogRecord::AllocatePageLogRecord(
       prev_lsn_, txn_id_, allocated_page_id, new_page_type);
-  logger_->AddLog(lr);
-  prev_lsn_ = lr.lsn;
+  prev_lsn_ = logger_->AddLog(lr);
   return prev_lsn_;
 }
 
@@ -127,8 +120,7 @@ uint64_t Transaction::DestroyPageLog(uint64_t destroyed_page_id) {
   assert(!IsFinished());
   LogRecord lr =
       LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id);
-  logger_->AddLog(lr);
-  prev_lsn_ = lr.lsn;
+  prev_lsn_ = logger_->AddLog(lr);
   return prev_lsn_;
 }
 

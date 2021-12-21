@@ -46,6 +46,14 @@ class PageManagerTest : public ::testing::Test {
     return std::move(new_page);
   }
 
+  PageRef GetPage(uint64_t page_id) {
+    Transaction system_txn = tm_->Begin();
+    PageRef new_page = p_->GetPage(page_id);
+    EXPECT_FALSE(new_page.IsNull());
+    EXPECT_EQ(new_page->Type(), PageType::kFreePage);
+    return std::move(new_page);
+  }
+
   void DestroyPage(Page* target) {
     Transaction system_txn = tm_->Begin();
     p_->DestroyPage(system_txn, target);
@@ -60,6 +68,16 @@ class PageManagerTest : public ::testing::Test {
 TEST_F(PageManagerTest, Construct) {}
 
 TEST_F(PageManagerTest, AllocateNewPage) {
+  PageRef ref = AllocatePage(PageType::kFreePage);
+  auto* page = ref.AsFreePage();
+  char* buff = page->FreeBody();
+  for (size_t j = 0; j < kFreeBodySize; ++j) {
+    // Make sure no SEGV happen.
+    buff[j] = static_cast<char>((page->PageId() + j) & 0xff);
+  }
+}
+
+TEST_F(PageManagerTest, AllocateMultipleNewPage) {
   constexpr int kPages = 15;
   std::set<uint64_t> allocated_ids;
   for (int i = 0; i <= kPages; ++i) {
@@ -73,7 +91,7 @@ TEST_F(PageManagerTest, AllocateNewPage) {
   }
   Reset();
   for (const auto& id : allocated_ids) {
-    PageRef ref = AllocatePage(PageType::kFreePage);
+    PageRef ref = GetPage(id);
     auto* page = ref.AsFreePage();
     char* buff = page->FreeBody();
     for (size_t j = 0; j < kFreeBodySize; ++j) {

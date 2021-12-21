@@ -21,8 +21,8 @@ class Recovery {
   void SinglePageRecover(uint64_t page_id, Page* target);
 
  private:
-  void LogRedo(const LogRecord& log);
-  void LogUndo(const LogRecord& log);
+  void LogRedo(uint64_t lsn, const LogRecord& log);
+  void LogUndo(uint64_t lsn, const LogRecord& log);
 
  private:
   std::string log_name_;
