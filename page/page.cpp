@@ -1,37 +1,23 @@
-#include "page.hpp"
+#include "page/page.hpp"
 
 #include <cstring>
 #include <iostream>
 
 #include "free_page.hpp"
-#include "page/catalog_page.hpp"
 #include "page/meta_page.hpp"
+#include "page/page_type.hpp"
 #include "page/row_page.hpp"
+#include "transaction/transaction.hpp"
+#include "type/row.hpp"
+
+#define ASSERT_PAGE_TYPE(expected_type)            \
+  if (type != expected_type) {                     \
+    throw std::runtime_error("Invalid page type"); \
+  }
 
 namespace tinylamb {
 
-std::ostream& operator<<(std::ostream& o, const PageType& type) {
-  switch (type) {
-    case PageType::kUnknown:
-      o << "UnknownPageType";
-      break;
-    case PageType::kFreePage:
-      o << "FreePageType";
-      break;
-    case PageType::kMetaPage:
-      o << "MetaPageType";
-      break;
-    case PageType::kCatalogPage:
-      o << "CatalogType";
-      break;
-    case PageType::kRowPage:
-      o << "RowType";
-      break;
-  }
-  return o;
-}
-
-Page::Page(size_t page_id, PageType type) { PageInit(page_id, type); }
+Page::Page(size_t page_id, PageType type) : body() { PageInit(page_id, type); }
 
 void Page::PageInit(uint64_t pid, PageType page_type) {
   memset(this, 0, kPageSize);
@@ -42,75 +28,80 @@ void Page::PageInit(uint64_t pid, PageType page_type) {
     case PageType::kUnknown:
       throw std::runtime_error("unknown type won't expect to be PageInit");
     case PageType::kFreePage:
-      reinterpret_cast<FreePage*>(this)->Initialize();
+      body.free_page.Initialize();
       break;
     case PageType::kMetaPage:
-      reinterpret_cast<MetaPage*>(this)->Initialize();
-      break;
-    case PageType::kCatalogPage:
-      reinterpret_cast<CatalogPage*>(this)->Initialize();
+      body.meta_page.Initialize();
       break;
     case PageType::kRowPage:
-      reinterpret_cast<RowPage*>(this)->Initialize();
+      body.row_page.Initialize();
       break;
   }
+}
+
+// Meta page functions.
+PageRef Page::AllocateNewPage(Transaction& txn, PagePool& pool,
+                              PageType new_page_type) {
+  ASSERT_PAGE_TYPE(PageType::kMetaPage);
+  PageRef ret = body.meta_page.AllocateNewPage(txn, pool, new_page_type);
+  SetPageLSN(txn.PrevLSN());
+  return std::move(ret);
+}
+
+void Page::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
+  ASSERT_PAGE_TYPE(PageType::kMetaPage);
+  body.meta_page.DestroyPage(txn, target, pool);
+  SetPageLSN(txn.PrevLSN());
+}
+
+bool Page::Read(Transaction& txn, const RowPosition& pos, Row& dst) {
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  std::string_view payload;
+  bool result = body.row_page.Read(PageId(), txn, pos, &payload);
+  if (result) {
+    dst = Row(payload, pos);
+  }
+  return result;
+}
+
+bool Page::Insert(Transaction& txn, const Row& record, RowPosition& dst) {
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  bool result = body.row_page.Insert(PageId(), txn, record, dst);
+  SetPageLSN(txn.PrevLSN());
+  return result;
+}
+
+bool Page::Update(Transaction& txn, const RowPosition& pos, const Row& row) {
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  bool result = body.row_page.Update(PageId(), txn, pos, row);
+  SetPageLSN(txn.PrevLSN());
+  return result;
+}
+
+bool Page::Delete(Transaction& txn, const RowPosition& pos) {
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  bool result = body.row_page.Delete(PageId(), txn, pos);
+  SetPageLSN(txn.PrevLSN());
+  return result;
+}
+
+size_t Page::RowCount() const {
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  return body.row_page.RowCount();
 }
 
 void Page::SetChecksum() const { checksum = std::hash<Page>()(*this); }
 
 void Page::InsertImpl(const RowPosition& pos, std::string_view redo) {
-  switch (Type()) {
-    case PageType::kRowPage: {
-      auto* rp = reinterpret_cast<RowPage*>(this);
-      rp->InsertRow(redo);
-      break;
-    }
-    case PageType::kCatalogPage: {
-      auto* cp = reinterpret_cast<CatalogPage*>(this);
-      cp->InsertSchema(redo);
-      break;
-    }
-    default: {
-      LOG(ERROR) << "Cannot apply Insert log";
-      break;
-    }
-  }
+  body.row_page.InsertRow(redo);
 }
 
 void Page::UpdateImpl(const RowPosition& pos, std::string_view redo) {
-  switch (Type()) {
-    case PageType::kRowPage: {
-      auto* rp = reinterpret_cast<RowPage*>(this);
-      rp->UpdateRow(pos.slot, redo);
-      break;
-    }
-    case PageType::kCatalogPage: {
-      auto* cp = reinterpret_cast<CatalogPage*>(this);
-      cp->UpdateSchema(pos, redo);
-      break;
-    }
-    default:
-      LOG(ERROR) << "Cannot apply Insert log";
-      break;
-  }
+  body.row_page.UpdateRow(pos.slot, redo);
 }
 
 void Page::DeleteImpl(const RowPosition& pos) {
-  switch (Type()) {
-    case PageType::kRowPage: {
-      auto* rp = reinterpret_cast<RowPage*>(this);
-      rp->DeleteRow(pos.slot);
-      break;
-    }
-    case PageType::kCatalogPage: {
-      auto* cp = reinterpret_cast<CatalogPage*>(this);
-      cp->DeleteSchema(pos);
-      break;
-    }
-    default:
-      LOG(ERROR) << "Cannot apply Insert log";
-      break;
-  }
+  body.row_page.DeleteRow(pos.slot);
 }
 
 bool Page::IsValid() const { return checksum == std::hash<Page>()(*this); }
@@ -133,20 +124,13 @@ uint64_t std::hash<tinylamb::Page>::operator()(const tinylamb::Page& p) const {
       std::hash<uint64_t>()(static_cast<unsigned long>(p.type));
   switch (p.type) {
     case tinylamb::PageType::kUnknown:
-      throw std::runtime_error("Do not hash against unknown page");
+      return 0xdeadbeefcafebabe;
     case tinylamb::PageType::kFreePage:
-      return header_hash + std::hash<tinylamb::FreePage>()(
-                               reinterpret_cast<const tinylamb::FreePage&>(p));
+      return header_hash + std::hash<tinylamb::FreePage>()(p.body.free_page);
     case tinylamb::PageType::kMetaPage:
-      return header_hash + std::hash<tinylamb::MetaPage>()(
-                               reinterpret_cast<const tinylamb::MetaPage&>(p));
-    case tinylamb::PageType::kCatalogPage:
-      return header_hash +
-             std::hash<tinylamb::CatalogPage>()(
-                 reinterpret_cast<const tinylamb::CatalogPage&>(p));
+      return header_hash + std::hash<tinylamb::MetaPage>()(p.body.meta_page);
     case tinylamb::PageType::kRowPage:
-      return header_hash + std::hash<tinylamb::RowPage>()(
-                               reinterpret_cast<const tinylamb::RowPage&>(p));
+      return header_hash + std::hash<tinylamb::RowPage>()(p.body.row_page);
   }
   throw std::runtime_error("unknown page type");
 }

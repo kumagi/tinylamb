@@ -41,8 +41,8 @@ TEST_F(LoggerTest, Construct) {
 TEST_F(LoggerTest, AppendBegin) {
   LogRecord l(0xcafebabe, 0xdeadbeef, LogType::kBegin);
   uint64_t lsn = l_->AddLog(l);
-  ASSERT_NE(0, lsn);
-  WaitForCommit(lsn);
+  ASSERT_EQ(0, lsn);  // Inserted place must be the beginning of the log.
+  WaitForCommit(lsn + l.Size());
   EXPECT_EQ(std::filesystem::file_size(kFileName), l.Size());
 }
 
@@ -60,8 +60,8 @@ TEST_F(LoggerTest, AppendInsertLog) {
   LogRecord l = LogRecord::InsertingLogRecord(
       0, 0, pos, std::string_view(r.Data(), r.Size()));
   uint64_t lsn = l_->AddLog(l);
-  ASSERT_NE(0, lsn);
-  WaitForCommit(lsn);
+  ASSERT_EQ(0, lsn);
+  WaitForCommit(lsn + l.Size());
   EXPECT_EQ(std::filesystem::file_size(kFileName), l.Size());
 }
 
@@ -69,11 +69,9 @@ TEST_F(LoggerTest, AppendManyBegin) {
   LogRecord l(0, 0, LogType::kBegin);
   uint64_t lsn = 0;
   for (int i = 0; i < 100; ++i) {
-    uint64_t prev_lsn = lsn;
     lsn = l_->AddLog(l);
-    ASSERT_LT(prev_lsn, lsn);
   }
-  WaitForCommit(lsn);
+  WaitForCommit(lsn + l.Size());
   EXPECT_EQ(std::filesystem::file_size(kFileName), l.Size() * 100);
 }
 

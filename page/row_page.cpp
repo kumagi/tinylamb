@@ -5,13 +5,14 @@
 
 namespace tinylamb {
 
-bool RowPage::Read(Transaction& txn, const RowPosition& pos, Row& dst) {
-  if (!txn.AddReadSet(pos) ||     // Failed by read conflict.
-      pos.page_id != PageId() ||  // Invalid page ID specified.
-      row_count_ <= pos.slot) {   // Specified slot is out of array.
+bool RowPage::Read(uint64_t page_id, Transaction& txn, const RowPosition& pos,
+                   std::string_view* dst) {
+  if (!txn.AddReadSet(pos) ||    // Failed by read conflict.
+      pos.page_id != page_id ||  // Invalid page ID specified.
+      row_count_ <= pos.slot) {  // Specified slot is out of array.
     return false;
   }
-  dst = GetRow(pos.slot);
+  *dst = GetRow(pos.slot);
   return true;
 }
 
@@ -31,26 +32,26 @@ bool RowPage::Read(Transaction& txn, const RowPosition& pos, Row& dst) {
  * +-------------------------------+
  *                        ^ PosX == free_ptr_
  */
-bool RowPage::Insert(Transaction& txn, const Row& record, RowPosition& dst) {
+bool RowPage::Insert(uint64_t page_id, Transaction& txn, const Row& record,
+                     RowPosition& dst) {
   if (free_size_ + sizeof(RowPointer) < record.Size()) {
     // There is no enough space.
     return false;
   }
-  if (PageHead() + free_ptr_ <=
+  if (Payload() + free_ptr_ <=
       reinterpret_cast<char*>(&data_[row_count_ + 1]) + record.Size()) {
     DeFragment();
   }
   assert(reinterpret_cast<char*>(&data_[row_count_ + 1]) + record.Size() <
-         PageHead() + free_ptr_);
-  dst = RowPosition(PageId(), row_count_);
+         Payload() + free_ptr_);
+  dst = RowPosition(page_id, row_count_);
   if (!txn.AddWriteSet(dst)) {
     // Lock conflict.
     return false;
   }
   dst.slot = InsertRow(record.data);
-  dst.page_id = PageId();
+  dst.page_id = page_id;
   txn.InsertLog(dst, record.data);
-  SetPageLSN(txn.PrevLSN());
   return true;
 }
 
@@ -60,17 +61,17 @@ uint16_t RowPage::InsertRow(std::string_view new_row) {
   free_ptr_ -= new_row.size();
   data_[row_count_].offset = free_ptr_;
   data_[row_count_].size = new_row.size();
-  memcpy(PageHead() + free_ptr_, new_row.data(), new_row.size());
+  memcpy(Payload() + free_ptr_, new_row.data(), new_row.size());
   return row_count_++;
 }
 
-bool RowPage::Update(Transaction& txn, const RowPosition& pos,
+bool RowPage::Update(uint64_t page_id, Transaction& txn, const RowPosition& pos,
                      const Row& new_row) {
-  assert(pos.page_id == PageId());
+  assert(pos.page_id == page_id);
   assert(pos.slot <= row_count_);
-  Row prev_row = GetRow(pos.slot);
-  if (prev_row.Size() < new_row.data.size() &&
-      free_size_ < new_row.data.size() - prev_row.data.size()) {
+  std::string_view prev_row = GetRow(pos.slot);
+  if (prev_row.size() < new_row.data.size() &&
+      free_size_ < new_row.data.size() - prev_row.size()) {
     // No enough space in this page.
     return false;
   }
@@ -78,38 +79,37 @@ bool RowPage::Update(Transaction& txn, const RowPosition& pos,
     // Write lock conflict.
     return false;
   }
-  txn.UpdateLog(pos, prev_row.data, new_row.data);
+  txn.UpdateLog(pos, prev_row, new_row.data);
   UpdateRow(pos.slot, new_row.data);
-  SetPageLSN(txn.PrevLSN());
   return true;
 }
 
 void RowPage::UpdateRow(int slot, std::string_view new_row) {
-  Row prev_row = GetRow(slot);
-  free_size_ -= prev_row.Size();
+  std::string_view prev_row = GetRow(slot);
+  free_size_ -= prev_row.size();
   free_size_ += new_row.size();
   assert(0 <= free_size_);
   data_[slot].size = new_row.size();
-  if (new_row.size() <= prev_row.Size()) {
+  if (new_row.size() <= prev_row.size()) {
     // There is enough space, just overwrite.
   } else {
     // Use new field.
-    if (PageHead() + free_ptr_ - new_row.size() <=
+    if (Payload() + free_ptr_ - new_row.size() <=
         reinterpret_cast<char*>(&data_[row_count_])) {
       DeFragment();
     }
     free_ptr_ -= new_row.size();
     data_[slot].offset = free_ptr_;
   }
-  memcpy(PageHead() + data_[slot].offset, new_row.data(), new_row.size());
+  memcpy(Payload() + data_[slot].offset, new_row.data(), new_row.size());
 }
 
-bool RowPage::Delete(Transaction& txn, const RowPosition& pos) {
-  assert(pos.page_id == PageId());
+bool RowPage::Delete(uint64_t page_id, Transaction& txn,
+                     const RowPosition& pos) {
+  assert(pos.page_id == page_id);
   assert(pos.slot <= row_count_);
-  txn.DeleteLog(pos, GetRow(pos.slot).data);
+  txn.DeleteLog(pos, GetRow(pos.slot));
   DeleteRow(pos.slot);
-  SetPageLSN(txn.PrevLSN());
   return true;
 }
 
@@ -127,14 +127,13 @@ void RowPage::DeFragment() {
   std::vector<std::string> tmp_buffer;
   tmp_buffer.reserve(row_count_);
   for (size_t i = 0; i < row_count_; ++i) {
-    Row r = GetRow(i);
-    tmp_buffer.emplace_back(r.data);
+    std::string_view r = GetRow(i);
+    tmp_buffer.emplace_back(r);
   }
-  free_ptr_ = kPageSize;
+  free_ptr_ = kPageBodySize;
   for (size_t i = 0; i < row_count_; ++i) {
     free_ptr_ -= tmp_buffer[i].size();
-    memcpy(PageHead() + free_ptr_, tmp_buffer[i].data(),
-           tmp_buffer[i].size());
+    memcpy(Payload() + free_ptr_, tmp_buffer[i].data(), tmp_buffer[i].size());
     data_[i].offset = free_ptr_;
   }
 }
@@ -150,7 +149,7 @@ uint64_t std::hash<tinylamb::RowPage>::operator()(
   ret += std::hash<int16_t>()(r.free_ptr_);
   ret += std::hash<int16_t>()(r.free_size_);
   for (int i = 0; i < r.row_count_; ++i) {
-    ret += std::hash<tinylamb::Row>()(r.GetRow(i));
+    ret += std::hash<std::string_view>()(r.GetRow(i));
   }
   return ret;
 }

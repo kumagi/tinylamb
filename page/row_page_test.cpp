@@ -12,10 +12,10 @@
 namespace tinylamb {
 
 TEST(ConstructTest, constrct) {
-  std::unique_ptr<RowPage> row(
-      reinterpret_cast<RowPage*>(new Page(0, PageType::kRowPage)));
-  ASSERT_EQ(row->FreePtrForTest(), kPageSize);
-  ASSERT_EQ(row->FreeSizeForTest(), kPageSize - sizeof(RowPage));
+  Page test_page(0, PageType::kRowPage);
+  RowPage* row = &test_page.body.row_page;
+  ASSERT_EQ(row->FreePtrForTest(), kPageBodySize);
+  ASSERT_EQ(row->FreeSizeForTest(), kPageBodySize - sizeof(RowPage));
 }
 
 TEST_F(RowPageTest, Insert) { InsertRow("hello"); }
@@ -24,18 +24,18 @@ TEST_F(RowPageTest, InsertMany) {
   constexpr int kInserts = 100;
   size_t consumed = 0;
   PageRef ref = p_->GetPage(page_id_);
-  auto* page = ref.AsRowPage();
-  size_t before_size = page->FreeSizeForTest();
+  RowPage& page = ref.GetRowPage();
+  size_t before_size = page.FreeSizeForTest();
   for (int i = 0; i < kInserts; ++i) {
     std::string message = std::to_string(i) + " message";
-    ASSERT_EQ(page->RowCount(), i);
+    ASSERT_EQ(page.RowCount(), i);
     InsertRow(message);
-    ASSERT_EQ(page->RowCount(), i + 1);
+    ASSERT_EQ(page.RowCount(), i + 1);
     consumed += message.size();
   }
-  ASSERT_EQ(page->FreeSizeForTest(),
+  ASSERT_EQ(page.FreeSizeForTest(),
             before_size - (kInserts * sizeof(RowPage::RowPointer) + consumed));
-  LOG(ERROR) << page->FreeSizeForTest();
+  LOG(ERROR) << page.FreeSizeForTest();
 }
 
 TEST_F(RowPageTest, ReadMany) {
@@ -108,15 +108,14 @@ TEST_F(RowPageTest, InsertAbort) {
   auto txn = tm_->Begin();
   Row r;
   r.data = "blah~blah";
-  PageRef ref = p_->GetPage(page_id_);
-  auto* p = ref.AsRowPage();
-  ASSERT_NE(p, nullptr);
-  ASSERT_EQ(p->Type(), PageType::kRowPage);
+  PageRef page = p_->GetPage(page_id_);
+  ASSERT_FALSE(page.IsNull());
+  ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-  const uint16_t before_size = p->FreeSizeForTest();
+  const uint16_t before_size = page->body.row_page.FreeSizeForTest();
   RowPosition pos;
-  ASSERT_TRUE(p->Insert(txn, r, pos));
-  ASSERT_EQ(p->FreeSizeForTest(),
+  ASSERT_TRUE(page->Insert(txn, r, pos));
+  ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
             before_size - r.data.size() - sizeof(RowPage::RowPointer));
   txn.Abort();
   ASSERT_EQ(GetRowCount(), 0);
@@ -162,16 +161,15 @@ TEST_F(RowPageTest, UpdateAbort) {
   auto txn = tm_->Begin();
   Row r;
   r.data = after;
-  PageRef ref = p_->GetPage(page_id_);
-  auto* p = ref.AsRowPage();
-  ASSERT_NE(p, nullptr);
-  ASSERT_EQ(p->Type(), PageType::kRowPage);
+  PageRef page = p_->GetPage(page_id_);
+  ASSERT_FALSE(page.IsNull());
+  ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-  const uint16_t before_size = p->FreeSizeForTest();
-  RowPosition pos(p->PageId(), 0);
-  ASSERT_TRUE(p->Update(txn, pos, r));
+  const uint16_t before_size = page->body.row_page.FreeSizeForTest();
+  RowPosition pos(page->PageId(), 0);
+  ASSERT_TRUE(page->Update(txn, pos, r));
 
-  ASSERT_EQ(p->FreeSizeForTest(),
+  ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
             before_size - before.length() + after.length());
   txn.Abort();
   ASSERT_EQ(GetRowCount(), 1);
@@ -182,10 +180,9 @@ TEST_F(RowPageTest, DeleteAbort) {
   std::string before = "living row";
   ASSERT_TRUE(InsertRow(before));
   auto txn = tm_->Begin();
-  PageRef ref = p_->GetPage(page_id_);
-  auto* p = ref.AsRowPage();
-  RowPosition target(p->PageId(), 0);
-  p->Delete(txn, target);
+  PageRef page = p_->GetPage(page_id_);
+  RowPosition target(page->PageId(), 0);
+  page->Delete(txn, target);
   txn.Abort();
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), before);

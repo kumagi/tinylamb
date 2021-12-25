@@ -61,18 +61,18 @@ TEST_F(PagePoolTest, PersistencyWithReset) {
   constexpr size_t kPages = 11;
   for (int i = 0; i < kPages; ++i) {
     PageRef p = pp->GetPage(i);
-    char* buff = p->page_body;
+    char* buff = p->body.free_page.FreeBody();
     ASSERT_NE(buff, nullptr);
-    for (size_t j = 0; j < kPageBodySize; ++j) {
+    for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
       buff[j] = i;
     }
   }
-  Reset();
+  // Reset();
   for (int i = 0; i < kPages; ++i) {
     PageRef p = pp->GetPage(i);
-    char* buff = p->page_body;
+    char* buff = p->body.free_page.FreeBody();
     ASSERT_NE(buff, nullptr);
-    for (size_t j = 0; j < kPageBodySize; ++j) {
+    for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
       EXPECT_EQ(buff[j], i);
     }
   }

@@ -1,6 +1,8 @@
 #ifndef TINYLAMB_PAGE_MANAGER_HPP
 #define TINYLAMB_PAGE_MANAGER_HPP
 
+#include <string_view>
+
 #include "log_message.hpp"
 #include "page/page.hpp"
 #include "page/page_pool.hpp"
@@ -24,6 +26,8 @@ class PageManager {
 
   // Logically delete the page.
   void DestroyPage(Transaction& txn, Page* target);
+
+  PagePool* GetPool() { return &pool_; }
 
  private:
   PageRef GetMetaPage();

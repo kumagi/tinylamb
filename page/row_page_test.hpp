@@ -3,12 +3,13 @@
 
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
-#include "page/row_page.hpp"
 #include "page/page_ref.hpp"
+#include "page/row_page.hpp"
 #include "recovery/logger.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
+#include "type/row.hpp"
 
 namespace tinylamb {
 
@@ -20,8 +21,7 @@ class RowPageTest : public ::testing::Test {
   void SetUp() override {
     Recover();
     auto txn = tm_->Begin();
-    auto* page =
-        p_->AllocateNewPage(txn, PageType::kRowPage).AsRowPage();
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
     page_id_ = page->PageId();
   }
 
@@ -29,10 +29,8 @@ class RowPageTest : public ::testing::Test {
     tm_.reset();
     lm_.reset();
     l_.reset();
-    c_.reset();
     p_.reset();
     p_ = std::make_unique<PageManager>(kDBFileName, 10);
-    c_ = std::make_unique<Catalog>(p_.get());
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
     tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get());
@@ -58,15 +56,15 @@ class RowPageTest : public ::testing::Test {
     Row r;
     r.data = str;
     PageRef page = p_->GetPage(page_id_);
-    auto* p = page.AsRowPage();
-    EXPECT_NE(p, nullptr);
-    EXPECT_EQ(p->Type(), PageType::kRowPage);
+    const RowPage& rp = page.GetRowPage();
+    EXPECT_FALSE(page.IsNull());
+    EXPECT_EQ(page->Type(), PageType::kRowPage);
 
-    const uint16_t before_size = p->FreeSizeForTest();
+    const uint16_t before_size = rp.FreeSizeForTest();
     RowPosition pos;
-    bool success = p->Insert(txn, r, pos);
+    bool success = page->Insert(txn, r, pos);
     if (success) {
-      EXPECT_EQ(p->FreeSizeForTest(),
+      EXPECT_EQ(rp.FreeSizeForTest(),
                 before_size - r.data.size() - sizeof(RowPage::RowPointer));
     }
     EXPECT_TRUE(txn.PreCommit());
@@ -79,12 +77,10 @@ class RowPageTest : public ::testing::Test {
     Row r;
     r.data = str;
     PageRef page = p_->GetPage(page_id_);
-    auto* p = page.AsRowPage();
-    ASSERT_NE(p, nullptr);
-    ASSERT_EQ(p->Type(), PageType::kRowPage);
+    ASSERT_EQ(page->Type(), PageType::kRowPage);
 
     RowPosition pos(page_id_, slot);
-    ASSERT_TRUE(p->Update(txn, pos, r));
+    ASSERT_TRUE(page->Update(txn, pos, r));
     ASSERT_TRUE(txn.PreCommit());
     txn.CommitWait();
   }
@@ -92,12 +88,10 @@ class RowPageTest : public ::testing::Test {
   void DeleteRow(int slot) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(page_id_);
-    auto* p = page.AsRowPage();
-    ASSERT_NE(p, nullptr);
-    ASSERT_EQ(p->Type(), PageType::kRowPage);
+    ASSERT_EQ(page->Type(), PageType::kRowPage);
 
     RowPosition pos(page_id_, slot);
-    ASSERT_TRUE(p->Delete(txn, pos));
+    ASSERT_TRUE(page->Delete(txn, pos));
     ASSERT_TRUE(txn.PreCommit());
     txn.CommitWait();
   }
@@ -105,12 +99,10 @@ class RowPageTest : public ::testing::Test {
   std::string ReadRow(int slot) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(page_id_);
-    auto* p = page.AsRowPage();
-    EXPECT_NE(p, nullptr);
-    EXPECT_EQ(p->Type(), PageType::kRowPage);
+    EXPECT_FALSE(page.IsNull());
     Row dst;
     RowPosition pos(page_id_, slot);
-    EXPECT_TRUE(p->Read(txn, pos, dst));
+    EXPECT_TRUE(page->Read(txn, pos, dst));
     dst.MakeOwned();
     EXPECT_TRUE(txn.PreCommit());
     txn.CommitWait();
@@ -120,10 +112,9 @@ class RowPageTest : public ::testing::Test {
   size_t GetRowCount() {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(page_id_);
-    auto* p = page.AsRowPage();
-    EXPECT_NE(p, nullptr);
-    EXPECT_EQ(p->Type(), PageType::kRowPage);
-    size_t row_count = p->RowCount();
+    EXPECT_FALSE(page.IsNull());
+    EXPECT_EQ(page->Type(), PageType::kRowPage);
+    size_t row_count = page->RowCount();
     EXPECT_TRUE(txn.PreCommit());
     txn.CommitWait();
     return row_count;
@@ -133,7 +124,6 @@ class RowPageTest : public ::testing::Test {
   std::unique_ptr<PageManager> p_;
   std::unique_ptr<Logger> l_;
   std::unique_ptr<TransactionManager> tm_;
-  std::unique_ptr<Catalog> c_;
   int page_id_ = 0;
 };
 

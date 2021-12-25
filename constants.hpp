@@ -2,11 +2,20 @@
 #define TINYLAMB_CONSTANTS_HPP
 
 #include <limits>
+#include <cstddef>
+#include <cstdint>
+#include <string_view>
 
 namespace tinylamb {
 
 static constexpr size_t kPageSize = 1024 * 32;
 static_assert(kPageSize <= std::numeric_limits<uint16_t>::max());
+static constexpr size_t kPageHeaderSize =
+    sizeof(uint64_t) +  // page_id
+    sizeof(uint64_t) +  // page_lsn
+    sizeof(uint64_t) +  // page_type
+    sizeof(uint64_t);  // checksum
+static constexpr size_t kPageBodySize = kPageSize - kPageHeaderSize;
 
 enum class Status : uint8_t {
   kUnknown,

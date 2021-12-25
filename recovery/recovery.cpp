@@ -6,20 +6,16 @@
 #include <filesystem>
 #include <transaction/transaction.hpp>
 
-#include "page/catalog_page.hpp"
-#include "page/page.hpp"
 #include "page/page_manager.hpp"
-#include "page/page_pool.hpp"
 #include "page/page_ref.hpp"
-#include "page/row_page.hpp"
 #include "recovery/log_record.hpp"
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
 
 Recovery::Recovery(std::string_view log_path, std::string_view db_path,
-                   PageManager *pm, TransactionManager *tm)
-    : log_name_(log_path), log_data_(nullptr), pool_(&pm->pool_), tm_(tm) {}
+                   PagePool *pp, TransactionManager *tm)
+    : log_name_(log_path), log_data_(nullptr), pool_(pp), tm_(tm) {}
 
 void Recovery::StartFrom(size_t offset) {
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
@@ -50,6 +46,7 @@ void Recovery::StartFrom(size_t offset) {
     LogRedo(log_offset, log);
     log_offset += log.Size();
   }
+  LOG(TRACE) << "redo finished: " << log_offset;
 
   // Undo phase starts here.
   for (auto &txn_id : tm_->active_transactions_) {
@@ -120,6 +117,7 @@ void Recovery::LogRedo(uint64_t lsn, const LogRecord &log) {
 void Recovery::LogUndo(uint64_t lsn, const LogRecord &log) {
   Transaction txn(log.txn_id, tm_, tm_->lock_manager_, tm_->page_manager_,
                   tm_->logger_);
+  LOG(TRACE) << "Undo: " << log;
   switch (log.type) {
     case LogType::kUnknown:
       LOG(FATAL) << "Unknown type log";
@@ -150,14 +148,20 @@ void Recovery::LogUndo(uint64_t lsn, const LogRecord &log) {
       tm_->active_transactions_.erase(log.txn_id);
       break;
     case LogType::kBeginCheckpoint:
-      break;
     case LogType::kEndCheckpoint:
+      LOG(ERROR) << "Cannot undo a checkpoint log record";
       break;
     case LogType::kSystemAllocPage:
       break;
-    case LogType::kSystemDestroyPage:
+    case LogType::kSystemDestroyPage: {
       PageRef target = pool_->GetPage(log.destroy_page_id);
       target->PageInit(log.destroy_page_id, log.allocated_page_type);
+      break;
+    }
+    case LogType::kCompensateInsertRow:
+    case LogType::kCompensateUpdateRow:
+    case LogType::kCompensateDeleteRow:
+      LOG(ERROR) << "Cannot undo a compensate log record";
       break;
   }
 }

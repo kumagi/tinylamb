@@ -16,7 +16,7 @@ class TransactionManager;
 class Recovery {
  public:
   Recovery(std::string_view log_path, std::string_view db_path,
-           PageManager* pm, TransactionManager* tm);
+           PagePool* pp, TransactionManager* tm);
   void StartFrom(size_t offset);
   void SinglePageRecover(uint64_t page_id, Page* target);
 

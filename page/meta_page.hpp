@@ -3,22 +3,22 @@
 
 #include <cstdint>
 
-#include "page/page.hpp"
 #include "page/page_ref.hpp"
+#include "page/page_type.hpp"
 
 namespace tinylamb {
 
 class Transaction;
 class PagePool;
 
-struct MetaPage : public Page {
+struct MetaPage  {
   void Initialize() {
     max_page_count = 0;
     first_free_page = 0;
   }
 
   PageRef AllocateNewPage(Transaction& txn, PagePool& pool,
-                        PageType new_page_type);
+                          PageType new_page_type);
   void DestroyPage(Transaction& txn, Page* target, PagePool& pool);
 
   uint64_t max_page_count;

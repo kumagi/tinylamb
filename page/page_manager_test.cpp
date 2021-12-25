@@ -41,6 +41,7 @@ class PageManagerTest : public ::testing::Test {
   PageRef AllocatePage(PageType expected_type) {
     Transaction system_txn = tm_->Begin();
     PageRef new_page = p_->AllocateNewPage(system_txn, expected_type);
+    system_txn.PreCommit();
     EXPECT_FALSE(new_page.IsNull());
     EXPECT_EQ(new_page->Type(), PageType::kFreePage);
     return std::move(new_page);
@@ -57,6 +58,7 @@ class PageManagerTest : public ::testing::Test {
   void DestroyPage(Page* target) {
     Transaction system_txn = tm_->Begin();
     p_->DestroyPage(system_txn, target);
+    system_txn.PreCommit();
   }
 
   std::unique_ptr<LockManager> lm_;
@@ -68,10 +70,9 @@ class PageManagerTest : public ::testing::Test {
 TEST_F(PageManagerTest, Construct) {}
 
 TEST_F(PageManagerTest, AllocateNewPage) {
-  PageRef ref = AllocatePage(PageType::kFreePage);
-  auto* page = ref.AsFreePage();
-  char* buff = page->FreeBody();
-  for (size_t j = 0; j < kFreeBodySize; ++j) {
+  PageRef page = AllocatePage(PageType::kFreePage);
+  char* buff = page->body.free_page.FreeBody();
+  for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
     // Make sure no SEGV happen.
     buff[j] = static_cast<char>((page->PageId() + j) & 0xff);
   }
@@ -81,10 +82,9 @@ TEST_F(PageManagerTest, AllocateMultipleNewPage) {
   constexpr int kPages = 15;
   std::set<uint64_t> allocated_ids;
   for (int i = 0; i <= kPages; ++i) {
-    PageRef ref = AllocatePage(PageType::kFreePage);
-    auto* page = ref.AsFreePage();
-    char* buff = page->FreeBody();
-    for (size_t j = 0; j < kFreeBodySize; ++j) {
+    PageRef page = AllocatePage(PageType::kFreePage);
+    char* buff = page->body.free_page.FreeBody();
+    for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
       buff[j] = static_cast<char>((page->PageId() + j) & 0xff);
     }
     allocated_ids.insert(page->PageId());
@@ -92,8 +92,8 @@ TEST_F(PageManagerTest, AllocateMultipleNewPage) {
   Reset();
   for (const auto& id : allocated_ids) {
     PageRef ref = GetPage(id);
-    auto* page = ref.AsFreePage();
-    char* buff = page->FreeBody();
+    FreePage& page = ref.GetFreePage();
+    char* buff = page.FreeBody();
     for (size_t j = 0; j < kFreeBodySize; ++j) {
       ASSERT_EQ(buff[j], static_cast<char>((id + j) & 0xff));
     }

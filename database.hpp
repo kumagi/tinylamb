@@ -14,14 +14,12 @@ class Database {
   Database(std::string_view dbname)
       : dbname_(dbname),
         logger_(dbname_ + ".log"),
-        pm_(dbname_, 1024),
-        catalog_(&pm_) {}
+        pm_(dbname_, 1024) {}
 
  private:
   std::string dbname_;
   Logger logger_;
   PageManager pm_;
-  Catalog catalog_;
 };
 
 }  // namespace tinylamb

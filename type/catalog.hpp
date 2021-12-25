@@ -7,14 +7,12 @@
 
 namespace tinylamb {
 
-class CatalogPage;
 class PageManager;
 class Transaction;
 class Schema;
 
 class Catalog {
   static constexpr uint64_t kCatalogPageId = 1;
-  CatalogPage* GetCatalogPage();
 
  public:
   explicit Catalog(PageManager* pm);

@@ -5,6 +5,7 @@
 
 #include "page/free_page.hpp"
 #include "page/page_pool.hpp"
+#include "page/page_type.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
@@ -19,14 +20,12 @@ PageRef MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
     } else {
       new_page_id = first_free_page;
       PageRef page = pool.GetPage(new_page_id);
-      first_free_page = page.AsFreePage()->next_free_page;
+      first_free_page = page.GetFreePage().next_free_page;
       return page;
     }
   }();
   ret->PageInit(new_page_id, new_page_type);
   txn.AllocatePageLog(new_page_id, new_page_type);
-  txn.PreCommit();  // No need to wait for the log to be durable.
-  SetPageLSN(txn.PrevLSN());
   return ret;
 }
 
@@ -35,15 +34,14 @@ void MetaPage::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
   uint64_t free_page_id = target->PageId();
   target->PageInit(free_page_id, PageType::kFreePage);
   assert(target->PageId() == free_page_id);
-  auto* free_page = reinterpret_cast<FreePage*>(target);
+  FreePage& free_page = target->body.free_page;
+  LOG(INFO) << "target: " << target->PageId() << " expect: " << free_page_id;
   assert(target->PageId() == free_page_id);
   // Add the free page to the free page chain.
-  free_page->next_free_page = first_free_page;
+  free_page.next_free_page = first_free_page;
   assert(target->PageId() == free_page_id);
   first_free_page = free_page_id;
   txn.DestroyPageLog(free_page_id);
-  txn.PreCommit();
-  SetPageLSN(txn.PrevLSN());
 }
 
 }  // namespace tinylamb

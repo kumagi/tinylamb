@@ -2,7 +2,6 @@
 
 #include <recovery/recovery.hpp>
 
-#include "catalog_page.hpp"
 #include "meta_page.hpp"
 #include "page/page_ref.hpp"
 #include "row_page.hpp"
@@ -33,7 +32,7 @@ PageRef PagePool::GetPage(uint64_t page_id) {
     entry->second->pin_count++;
     Touch(entry->second);
     assert(entry->second->page->PageId() == page_id);
-    return PageRef(this, result);
+    return {this, result};
   } else {
     if (pool_lru_.size() == capacity_) {
       EvictOnePage();
@@ -148,6 +147,7 @@ void PagePool::ReadFrom(Page* target, uint64_t pid) {
     return;
   } else {
     LOG(ERROR) << "Page " << target->PageId() << " crashed";
+
   }
 }
 

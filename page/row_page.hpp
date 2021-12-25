@@ -2,16 +2,16 @@
 #define TINYLAMB_ROW_PAGE_HPP
 
 #include <cassert>
+#include <string_view>
 
-#include "page/page.hpp"
-#include "page/row_position.hpp"
-#include "type/catalog.hpp"
-#include "type/row.hpp"
-#include "type/schema.hpp"
+#include "constants.hpp"
 
 namespace tinylamb {
 
 class Recovery;
+class Transaction;
+class RowPosition;
+class Row;
 
 /*  Page Layout
  * +----------------------------------------------------+
@@ -24,39 +24,63 @@ class Recovery;
  *                                     free_ptr_^
  */
 
-class RowPage : public Page {
+class RowPage {
+ private:
+  char* Payload() { return reinterpret_cast<char*>(this); }
+  [[nodiscard]] const char* Payload() const {
+    return reinterpret_cast<const char*>(this);
+  }
+
  public:
   void Initialize() {
     prev_page_id_ = 0;
     next_page_id_ = 0;
     row_count_ = 0;
-    free_ptr_ = kPageSize;
-    free_size_ = kPageSize - sizeof(RowPage);
-    memset(data_, 0, kBodySize);
+    free_ptr_ = kPageBodySize;
+    free_size_ = kPageBodySize - sizeof(RowPage);
+    // memset(data_, 0, kBodySize);
   }
 
-  bool Read(Transaction& txn, const RowPosition& pos, Row& dst);
+  bool Read(uint64_t page_id, Transaction& txn, const RowPosition& pos,
+            std::string_view* dst);
 
-  bool Insert(Transaction& txn, const Row& record, RowPosition& dst);
+  bool Insert(uint64_t page_id, Transaction& txn, const Row& record,
+              RowPosition& dst);
 
-  bool Update(Transaction& txn, const RowPosition& pos, const Row& row);
+  bool Update(uint64_t page_id, Transaction& txn, const RowPosition& pos,
+              const Row& row);
 
-  bool Delete(Transaction& txn, const RowPosition& pos);
+  bool Delete(uint64_t page_id, Transaction& txn, const RowPosition& pos);
 
-  size_t RowCount() const;
+  [[nodiscard]] size_t RowCount() const;
 
-  uint16_t FreePtrForTest() const { return free_ptr_; }
-  uint16_t FreeSizeForTest() const { return free_size_; }
+  [[nodiscard]] uint16_t FreePtrForTest() const { return free_ptr_; }
+  [[nodiscard]] uint16_t FreeSizeForTest() const { return free_size_; }
 
   void DeFragment();
 
   struct RowPointer {
     // Row start position from beginning fom this page.
-    uint16_t offset;
+    uint16_t offset = 0;
 
     // Physical row size in bytes (required to get exact size for logging).
-    int16_t size;
+    int16_t size = 0;
   };
+
+  friend class Page;
+  friend class Catalog;
+  friend class std::hash<RowPage>;
+
+  [[nodiscard]] std::string_view GetRow(uint16_t slot) const {
+    return std::string_view(Payload() + data_[slot].offset, data_[slot].size);
+  }
+
+  uint16_t InsertRow(std::string_view new_row);
+
+  void UpdateRow(int slot, std::string_view new_row);
+
+  void DeleteRow(int slot);
+
   uint64_t prev_page_id_ = 0;
   uint64_t next_page_id_ = 0;
   int16_t row_count_ = 0;
@@ -66,22 +90,6 @@ class RowPage : public Page {
   constexpr static size_t kBodySize =
       kPageBodySize - sizeof(prev_page_id_) - sizeof(next_page_id_) -
       sizeof(row_count_) - sizeof(free_ptr_) - sizeof(free_size_);
-
-  friend class Page;
-  friend class Catalog;
-  friend class std::hash<RowPage>;
-
-  Row GetRow(uint16_t slot) const {
-    return Row(
-        std::string_view(PageHead() + data_[slot].offset, data_[slot].size),
-        RowPosition(PageId(), slot));
-  }
-
-  uint16_t InsertRow(std::string_view new_row);
-
-  void UpdateRow(int slot, std::string_view new_row);
-
-  void DeleteRow(int slot);
 };
 
 static_assert(std::is_trivially_destructible<RowPage>::value == true,

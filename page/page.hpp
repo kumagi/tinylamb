@@ -7,20 +7,13 @@
 
 #include "constants.hpp"
 #include "log_message.hpp"
+#include "page/free_page.hpp"
+#include "page/meta_page.hpp"
+#include "page/row_page.hpp"
 
 namespace tinylamb {
 
 class RowPosition;
-
-enum class PageType : uint64_t {
-  kUnknown = 0,
-  kFreePage,
-  kMetaPage,
-  kCatalogPage,
-  kRowPage,
-};
-
-std::ostream& operator<<(std::ostream& o, const PageType& type);
 
 class Page {
  public:
@@ -31,8 +24,22 @@ class Page {
   [[nodiscard]] PageType Type() const { return type; }
   [[nodiscard]] uint64_t PageLSN() const { return page_lsn; }
   void SetPageLSN(uint64_t lsn) { page_lsn = lsn; }
-  char* PageHead() { return reinterpret_cast<char*>(this); }
-  const char* PageHead() const { return reinterpret_cast<const char*>(this); }
+
+  // Meta page.
+  PageRef AllocateNewPage(Transaction& txn, PagePool& pool,
+                          PageType new_page_type);
+  void DestroyPage(Transaction& txn, Page* target, PagePool& pool);
+
+  // Row page.
+  bool Read(Transaction& txn, const RowPosition& pos, Row& dst);
+
+  bool Insert(Transaction& txn, const Row& record, RowPosition& dst);
+
+  bool Update(Transaction& txn, const RowPosition& pos, const Row& row);
+
+  bool Delete(Transaction& txn, const RowPosition& pos);
+
+  [[nodiscard]] size_t RowCount() const;
 
   void InsertImpl(const RowPosition& pos, std::string_view redo);
 
@@ -50,13 +57,20 @@ class Page {
   uint64_t page_lsn = 0;
   enum PageType type = PageType::kUnknown;
   mutable uint64_t checksum = 0;
-  char page_body[0];
+  union PageBody {
+    char dummy_[kPageBodySize];
+    MetaPage meta_page;
+    FreePage free_page;
+    RowPage row_page;
+    PageBody() : dummy_() {}
+  };
+  PageBody body;
 };
-
-const static size_t kPageBodySize = kPageSize - sizeof(Page);
 
 static_assert(std::is_trivially_destructible<Page>::value == true,
               "Page must be trivially destructible");
+static_assert(sizeof(Page) == kPageSize,
+              "Page size must be equal to kPageSize");
 
 }  // namespace tinylamb
 

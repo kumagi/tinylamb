@@ -60,7 +60,7 @@ uint64_t Logger::CommittedLSN() const {
 
 void Logger::LoggerWork() {
   std::unique_lock lk(latch_);
-  while (!finish_) {
+  while (!finish_ || committed_lsn_ != written_lsn_) {
     worker_wait_.wait_for(lk, std::chrono::milliseconds(every_ms_));
     if (committed_lsn_ == written_lsn_) continue;
     const size_t written_offset = written_lsn_ % buffer_.size();

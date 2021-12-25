@@ -43,22 +43,22 @@ void TransactionManager::Abort(Transaction& txn) {
   for (const auto& pr : txn.prev_record_) {
     RowPosition pos = pr.first;
     PageRef page = txn.page_manager_->GetPage(pos.page_id);
-    RowPage* target = page.AsRowPage();
+    RowPage& target = page.GetRowPage();
     switch (pr.second.entry_type) {
       case Transaction::WriteType::kInsert:
         txn.CompensateInsertLog(pos, pr.second.lsn);
-        target->DeleteRow(pos.slot);
+        target.DeleteRow(pos.slot);
         break;
       case Transaction::WriteType::kUpdate: {
         LOG(ERROR) << "abort update";
         txn.CompensateUpdateLog(pos, pr.second.lsn, pr.second.payload);
-        target->UpdateRow(pos.slot, pr.second.payload);
+        target.UpdateRow(pos.slot, pr.second.payload);
         break;
       }
       case Transaction::WriteType::kDelete:
         LOG(ERROR) << "abort delete";
         txn.CompensateDeleteLog(pos, pr.second.lsn, pr.second.payload);
-        target->InsertRow(pr.second.payload);
+        target.InsertRow(pr.second.payload);
         break;
     }
   }
