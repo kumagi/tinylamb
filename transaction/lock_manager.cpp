@@ -1,7 +1,6 @@
 #include "transaction/lock_manager.hpp"
 
 #include <cassert>
-#include <mutex>
 
 #include "page/row_position.hpp"
 

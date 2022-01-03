@@ -105,23 +105,6 @@ TEST_F(RowPageTest, DeleteMany) {
   ASSERT_TRUE(inserted.empty());
 }
 
-TEST_F(RowPageTest, InsertAbort) {
-  auto txn = tm_->Begin();
-  Row r;
-  r.data = "blah~blah";
-  PageRef page = p_->GetPage(page_id_);
-  ASSERT_FALSE(page.IsNull());
-  ASSERT_EQ(page->Type(), PageType::kRowPage);
-
-  const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-  RowPosition pos;
-  ASSERT_TRUE(page->Insert(txn, r, pos));
-  ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
-            before_size - r.data.size() - sizeof(RowPage::RowPointer));
-  txn.Abort();
-  ASSERT_EQ(GetRowCount(), 0);
-}
-
 TEST_F(RowPageTest, DeFragmentInvoked) {
   size_t kBigRowSize = kPageBodySize / 3 - 16;
 
@@ -153,40 +136,6 @@ TEST_F(RowPageTest, DeFragmentInvoked) {
                 ReadRow(1),
                 ReadRow(2),
             }));
-}
-
-TEST_F(RowPageTest, UpdateAbort) {
-  std::string before = "before string hello world!",
-              after = "replaced by this";
-  ASSERT_TRUE(InsertRow(before));
-  auto txn = tm_->Begin();
-  Row r;
-  r.data = after;
-  PageRef page = p_->GetPage(page_id_);
-  ASSERT_FALSE(page.IsNull());
-  ASSERT_EQ(page->Type(), PageType::kRowPage);
-
-  const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-  RowPosition pos(page->PageId(), 0);
-  ASSERT_TRUE(page->Update(txn, pos, r));
-
-  ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
-            before_size - before.length() + after.length());
-  txn.Abort();
-  ASSERT_EQ(GetRowCount(), 1);
-  ASSERT_EQ(ReadRow(0), before);
-}
-
-TEST_F(RowPageTest, DeleteAbort) {
-  std::string before = "living row";
-  ASSERT_TRUE(InsertRow(before));
-  auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(page_id_);
-  RowPosition target(page->PageId(), 0);
-  page->Delete(txn, target);
-  txn.Abort();
-  ASSERT_EQ(GetRowCount(), 1);
-  ASSERT_EQ(ReadRow(0), before);
 }
 
 }  // namespace tinylamb

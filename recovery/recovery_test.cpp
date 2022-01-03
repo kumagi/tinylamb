@@ -18,14 +18,14 @@ class RecoveryTest : public RowPageTest {
     tm_.reset();
     lm_.reset();
     l_.reset();
-    p_.reset();
     r_.reset();
+    p_.reset();
     f();
     p_ = std::make_unique<PageManager>(kDBFileName, 10);
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get());
     r_ = std::make_unique<Recovery>(kLogName, kDBFileName, p_->GetPool());
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(), r_.get());
   }
 
   void Recover() override {
@@ -57,6 +57,57 @@ class RecoveryTest : public RowPageTest {
 };
 
 TEST_F(RecoveryTest, EmptyRecovery) { r_->StartFrom(0, tm_.get()); }
+
+TEST_F(RecoveryTest, InsertAbort) {
+  auto txn = tm_->Begin();
+  Row r;
+  r.data = "blah~blah";
+  PageRef page = p_->GetPage(page_id_);
+  ASSERT_FALSE(page.IsNull());
+  ASSERT_EQ(page->Type(), PageType::kRowPage);
+
+  const uint16_t before_size = page->body.row_page.FreeSizeForTest();
+  RowPosition pos;
+  ASSERT_TRUE(page->Insert(txn, r, pos));
+  ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
+            before_size - r.data.size() - sizeof(RowPage::RowPointer));
+  txn.Abort();
+  ASSERT_EQ(GetRowCount(), 0);
+}
+
+TEST_F(RecoveryTest, UpdateAbort) {
+  std::string before = "before string hello world!",
+              after = "replaced by this";
+  ASSERT_TRUE(InsertRow(before));
+  auto txn = tm_->Begin();
+  Row r;
+  r.data = after;
+  PageRef page = p_->GetPage(page_id_);
+  ASSERT_FALSE(page.IsNull());
+  ASSERT_EQ(page->Type(), PageType::kRowPage);
+
+  const uint16_t before_size = page->body.row_page.FreeSizeForTest();
+  RowPosition pos(page->PageId(), 0);
+  ASSERT_TRUE(page->Update(txn, pos, r));
+
+  ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
+            before_size - before.length() + after.length());
+  txn.Abort();
+  ASSERT_EQ(GetRowCount(), 1);
+  ASSERT_EQ(ReadRow(0), before);
+}
+
+TEST_F(RecoveryTest, DeleteAbort) {
+  std::string before = "living row";
+  ASSERT_TRUE(InsertRow(before));
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(page_id_);
+  RowPosition target(page->PageId(), 0);
+  page->Delete(txn, target);
+  txn.Abort();
+  ASSERT_EQ(GetRowCount(), 1);
+  ASSERT_EQ(ReadRow(0), before);
+}
 
 TEST_F(RecoveryTest, InsertRowRecovery) {
   InsertRow("hoge");
@@ -260,4 +311,5 @@ TEST_F(RecoveryTest, DeleteSinglePageFailure) {
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
+
 }  // namespace tinylamb

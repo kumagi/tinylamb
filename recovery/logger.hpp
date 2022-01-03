@@ -22,7 +22,7 @@ class Logger {
 
   ~Logger();
 
-  uint64_t AddLog(LogRecord& log);
+  uint64_t AddLog(const LogRecord& log);
 
   void Finish();
 

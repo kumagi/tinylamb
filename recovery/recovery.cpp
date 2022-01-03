@@ -44,9 +44,12 @@ bool is_page_manipulation(LogType type) {
 
 Recovery::Recovery(std::string_view log_path, std::string_view db_path,
                    PagePool *pp)
-    : log_name_(log_path), log_data_(nullptr), pool_(pp) {}
+    : log_name_(log_path), log_data_(nullptr), pool_(pp) {
+  RefreshMap();
+}
 
-void Recovery::StartFrom(size_t offset, TransactionManager *tm) {
+void Recovery::RefreshMap() {
+  LOG(INFO) << "reading: " << log_name_;
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
   int fd = open(log_name_.c_str(), O_RDONLY, 0666);
   if (fd == -1) {
@@ -55,8 +58,11 @@ void Recovery::StartFrom(size_t offset, TransactionManager *tm) {
   }
   log_data_ = static_cast<char *>(
       mmap(nullptr, filesize, PROT_READ, MAP_PRIVATE, fd, 0));
-  std::string_view entire_log(log_data_, filesize);
-  entire_log.remove_prefix(offset);
+}
+
+void Recovery::StartFrom(size_t offset, TransactionManager *tm) {
+  std::uintmax_t filesize = std::filesystem::file_size(log_name_);
+  RefreshMap();
 
   std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, LogRecord>>>
       page_logs;
@@ -64,8 +70,8 @@ void Recovery::StartFrom(size_t offset, TransactionManager *tm) {
   // Analysis phase starts here.
   {
     LogRecord log;
-    while (!entire_log.empty()) {
-      bool success = LogRecord::ParseLogRecord(entire_log, &log);
+    while (offset < filesize) {
+      bool success = LogRecord::ParseLogRecord(&log_data_[offset], &log);
       if (!success) {
         LOG(ERROR) << "Failed to parse log at offset: " << offset;
         break;
@@ -82,7 +88,6 @@ void Recovery::StartFrom(size_t offset, TransactionManager *tm) {
         finished_txn.insert(log.txn_id);
         LOG(INFO) << "txn: " << log.txn_id << " is finished";
       }
-      entire_log.remove_prefix(log.Size());
       offset += log.Size();
       LOG(INFO) << "analyzed " << offset << ": " << log;
     }
@@ -115,77 +120,9 @@ void Recovery::StartFrom(size_t offset, TransactionManager *tm) {
   }
 }
 
-void Recovery::SinglePageRecover(uint64_t page_id, Page *target,
-                                 TransactionManager *tm) {
-  std::uintmax_t filesize = std::filesystem::file_size(log_name_);
-  size_t offset = 0;
-  int fd = open(log_name_.c_str(), O_RDONLY, 0666);
-  if (fd == -1) {
-    std::string str_err = strerror(errno);
-    throw std::runtime_error("could not open the file: " + str_err);
-  }
-  log_data_ = static_cast<char *>(
-      mmap(nullptr, filesize, PROT_READ, MAP_PRIVATE, fd, 0));
-  std::string_view entire_log(log_data_, filesize);
-  entire_log.remove_prefix(offset);
-
-  // Collect the logs for the page.
-  std::vector<size_t> page_logs;
-  LogRecord log;
-  size_t log_offset = 0;
-  while (!entire_log.empty()) {
-    bool success = LogRecord::ParseLogRecord(entire_log, &log);
-    if (!success) {
-      LOG(ERROR) << "Failed to parse log at offset: " << log_offset;
-      break;
-    }
-    if (log.type == LogType::kBegin || log.type == LogType::kCommit) {
-      page_logs.push_back(log_offset);
-      continue;
-    }
-    if ((log.type == LogType::kInsertRow || log.type == LogType::kUpdateRow ||
-         log.type == LogType::kDeleteRow ||
-         log.type == LogType::kCompensateInsertRow ||
-         log.type == LogType::kCompensateUpdateRow ||
-         log.type == LogType::kCompensateDeleteRow) &&
-        log.pos.page_id == page_id) {
-      page_logs.push_back(log_offset);
-    }
-    entire_log.remove_prefix(log.Size());
-    log_offset += log.Size();
-  }
-
-  std::unordered_map<uint64_t, uint64_t> last_lsn;
-  // Redo all logs for the page.
-  for (const auto &lsn : page_logs) {
-    bool success = LogRecord::ParseLogRecord(&log_data_[lsn], &log);
-    assert(success);
-    if (log.type == LogType::kCommit) {
-      last_lsn.erase(log.txn_id);
-    } else {
-      last_lsn[log.txn_id] = lsn;
-      LogRedo(log_offset, log, tm);
-    }
-
-    log_offset += log.Size();
-  }
-  LOG(TRACE) << "redo finished: " << page_logs.size();
-
-  // Undo phase starts here.
-  for (auto &txn : last_lsn) {
-    uint64_t txn_id = txn.first;
-    uint64_t prev_lsn = txn.second;
-    while (prev_lsn != 0) {
-      size_t prev_offset = prev_lsn;
-      std::string_view undo_log_data(log_data_ + prev_offset, filesize);
-      if (!LogRecord::ParseLogRecord(undo_log_data, &log)) {
-        LOG(ERROR) << "Failed to parse log at offset on undo: " << prev_offset;
-        break;
-      }
-      LogUndo(prev_lsn, log, tm);
-      prev_lsn = log.prev_lsn;
-    }
-  }
+bool Recovery::ReadLog(uint64_t lsn, LogRecord *dst) {
+  RefreshMap();
+  return LogRecord::ParseLogRecord(&log_data_[lsn], dst);
 }
 
 void Recovery::LogRedo(uint64_t lsn, const LogRecord &log,

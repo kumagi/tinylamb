@@ -29,7 +29,7 @@ Logger::~Logger() {
   close(dst_);
 }
 
-uint64_t Logger::AddLog(LogRecord& log) {
+uint64_t Logger::AddLog(const LogRecord& log) {
   std::string data = log.Serialize();
   std::scoped_lock lk(latch_);
 

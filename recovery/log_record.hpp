@@ -33,7 +33,7 @@ struct LogRecord {
 
   LogRecord(uint64_t p, uint64_t txn, LogType t);
 
-  static bool ParseLogRecord(std::string_view src, LogRecord* dst);
+  static bool ParseLogRecord(const char* src, LogRecord* dst);
 
   static LogRecord InsertingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
                                       std::string_view r);

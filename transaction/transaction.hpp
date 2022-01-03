@@ -7,6 +7,7 @@
 
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "page/page.hpp"
 #include "page/row_position.hpp"
@@ -42,8 +43,8 @@ class Transaction {
   }
   uint64_t PrevLSN() const { return prev_lsn_; }
 
-  bool AddReadSet(const RowPosition& rs);
-  bool AddWriteSet(const RowPosition& rs);
+  bool AddReadSet(const RowPosition& rp);
+  bool AddWriteSet(const RowPosition& rp);
 
   bool PreCommit();
   void Abort();
@@ -85,14 +86,11 @@ class Transaction {
   uint64_t prev_lsn_ = 0;
   std::unordered_set<RowPosition> read_set_{};
   std::unordered_set<RowPosition> write_set_{};
-  std::unordered_map<RowPosition, WriteEntry> prev_record_{};
+  std::vector<uint64_t> wrote_logs_;
   TransactionStatus status_ = TransactionStatus::kUnknown;
 
   // Not owned by this class.
   TransactionManager* transaction_manager_;
-  LockManager* lock_manager_;
-  PageManager* page_manager_;
-  Logger* logger_;
 };
 
 }  // namespace tinylamb

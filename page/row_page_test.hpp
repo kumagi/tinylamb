@@ -34,7 +34,8 @@ class RowPageTest : public ::testing::Test {
     p_ = std::make_unique<PageManager>(kDBFileName, 10);
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get());
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
+                                               nullptr);
   }
 
   void TearDown() override {

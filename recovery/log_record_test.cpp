@@ -15,7 +15,7 @@ class LogRecordTest : public ::testing::Test {
   static void SerializeDeserializeCheck(const LogRecord& log) {
     std::string serialized_log = log.Serialize();
     LogRecord parsed_log;
-    LogRecord::ParseLogRecord(serialized_log, &parsed_log);
+    LogRecord::ParseLogRecord(serialized_log.data(), &parsed_log);
     EXPECT_EQ(log, parsed_log);
   }
 };

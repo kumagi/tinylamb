@@ -40,28 +40,33 @@ bool TransactionManager::PreCommit(Transaction& txn) {
 
 void TransactionManager::Abort(Transaction& txn) {
   // Iterate prev_lsn to beginning of the transaction with undoing.
-  for (const auto& pr : txn.prev_record_) {
-    RowPosition pos = pr.first;
-    PageRef page =
-        txn.page_manager_->GetPage(pos.page_id);
-    RowPage& target = page.GetRowPage();
-    switch (pr.second.entry_type) {
-      case Transaction::WriteType::kInsert:
-        txn.CompensateInsertLog(pos, pr.second.lsn);
-        target.DeleteRow(pos.slot);
-        break;
-      case Transaction::WriteType::kUpdate: {
-        txn.CompensateUpdateLog(pos, pr.second.lsn, pr.second.payload);
-        target.UpdateRow(pos.slot, pr.second.payload);
-        break;
-      }
-      case Transaction::WriteType::kDelete:
-        txn.CompensateDeleteLog(pos, pr.second.lsn, pr.second.payload);
-        target.InsertRow(pr.second.payload);
-        break;
+  {
+    const uint64_t latest_log = txn.wrote_logs_.back();
+    while (CommittedLSN() < latest_log) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
+  for (const auto& log_lsn : txn.wrote_logs_) {
+    LogRecord lr;
+    recovery_->ReadLog(log_lsn, &lr);
+    recovery_->LogUndo(log_lsn, lr, this);
+  }
   PreCommit(txn);  // Writes an empty commit.
+}
+
+bool TransactionManager::GetExclusiveLock(const RowPosition& rp) {
+  return lock_manager_->GetExclusiveLock(rp);
+}
+bool TransactionManager::GetSharedLock(const RowPosition& rp) {
+  return lock_manager_->GetSharedLock(rp);
+}
+
+uint64_t TransactionManager::AddLog(const LogRecord& lr) {
+  return logger_->AddLog(lr);
+}
+
+uint64_t TransactionManager::CommittedLSN() const {
+  return logger_->CommittedLSN();
 }
 
 }  // namespace tinylamb

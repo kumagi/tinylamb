@@ -17,11 +17,13 @@ class Recovery {
  public:
   Recovery(std::string_view log_path, std::string_view db_path, PagePool* pp);
   void StartFrom(size_t offset, TransactionManager* tm);
-  void SinglePageRecover(uint64_t page_id, Page* target, TransactionManager* tm);
+  bool ReadLog(uint64_t lsn, LogRecord* dst);
 
- private:
   void LogRedo(uint64_t lsn, const LogRecord& log, TransactionManager* tm);
   void LogUndo(uint64_t lsn, const LogRecord& log, TransactionManager* tm);
+
+ private:
+  void RefreshMap();
 
  private:
   std::string log_name_;
