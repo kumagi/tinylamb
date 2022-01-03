@@ -15,7 +15,7 @@ class MetaPage;
 class RowPage;
 class FreePage;
 
-class PageRef {
+class PageRef final {
  private:
   PageRef(PagePool* src, Page* page);
 
@@ -47,9 +47,9 @@ class PageRef {
   }
   bool operator!=(const PageRef& r) const { return !operator==(r); }
 
-
  private:
   friend class PagePool;
+  friend class PageManager;
   PagePool* pool_ = nullptr;
   Page* page_ = nullptr;
 };

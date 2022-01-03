@@ -16,10 +16,10 @@ PageRef MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
   PageRef ret = [&]() {
     if (first_free_page == 0) {
       new_page_id = ++max_page_count;
-      return pool.GetPage(max_page_count);
+      return pool.GetPage(max_page_count, nullptr);
     } else {
       new_page_id = first_free_page;
-      PageRef page = pool.GetPage(new_page_id);
+      PageRef page = pool.GetPage(new_page_id, nullptr);
       first_free_page = page.GetFreePage().next_free_page;
       return page;
     }
@@ -35,7 +35,6 @@ void MetaPage::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
   target->PageInit(free_page_id, PageType::kFreePage);
   assert(target->PageId() == free_page_id);
   FreePage& free_page = target->body.free_page;
-  LOG(INFO) << "target: " << target->PageId() << " expect: " << free_page_id;
   assert(target->PageId() == free_page_id);
   // Add the free page to the free page chain.
   free_page.next_free_page = first_free_page;

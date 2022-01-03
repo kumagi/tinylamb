@@ -18,7 +18,9 @@ TEST(ConstructTest, constrct) {
   ASSERT_EQ(row->FreeSizeForTest(), kPageBodySize - sizeof(RowPage));
 }
 
-TEST_F(RowPageTest, Insert) { InsertRow("hello"); }
+TEST_F(RowPageTest, Insert) {
+  InsertRow("hello");
+}
 
 TEST_F(RowPageTest, InsertMany) {
   constexpr int kInserts = 100;
@@ -35,7 +37,6 @@ TEST_F(RowPageTest, InsertMany) {
   }
   ASSERT_EQ(page.FreeSizeForTest(),
             before_size - (kInserts * sizeof(RowPage::RowPointer) + consumed));
-  LOG(ERROR) << page.FreeSizeForTest();
 }
 
 TEST_F(RowPageTest, ReadMany) {

@@ -14,7 +14,7 @@ class Database {
   Database(std::string_view dbname)
       : dbname_(dbname),
         logger_(dbname_ + ".log"),
-        pm_(dbname_, 1024) {}
+        pm_(dbname_ + ".db", 1024) {}
 
  private:
   std::string dbname_;

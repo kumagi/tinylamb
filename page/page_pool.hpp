@@ -19,13 +19,16 @@ class PageRef;
 class PagePool {
  private:
   struct Entry {
-    Entry() = default;
-
     // If pinned, this page will never been evicted.
     uint32_t pin_count = 0;
 
-    // An pointer to physical page in memory.
+    // A pointer to physical page in memory.
     std::unique_ptr<Page> page = nullptr;
+
+    Entry(const Entry&) = delete;
+    Entry& operator=(const Entry&) = delete;
+    Entry(Entry&&) = default;
+    Entry& operator=(Entry&&) = default;
   };
   typedef std::list<Entry> LruType;
 
@@ -33,7 +36,7 @@ class PagePool {
   PagePool(std::string_view file_name, size_t capacity);
   ~PagePool();
 
-  PageRef GetPage(uint64_t page_id);
+  PageRef GetPage(uint64_t page_id, bool* cache_hit);
 
   uint64_t Size() const {
     std::scoped_lock latch(pool_latch);

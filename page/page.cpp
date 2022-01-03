@@ -123,14 +123,14 @@ uint64_t std::hash<tinylamb::Page>::operator()(const tinylamb::Page& p) const {
       std::hash<uint64_t>()(p.page_id) + std::hash<uint64_t>()(p.PageLSN()) +
       std::hash<uint64_t>()(static_cast<unsigned long>(p.type));
   switch (p.type) {
-    case tinylamb::PageType::kUnknown:
-      return 0xdeadbeefcafebabe;
     case tinylamb::PageType::kFreePage:
       return header_hash + std::hash<tinylamb::FreePage>()(p.body.free_page);
     case tinylamb::PageType::kMetaPage:
       return header_hash + std::hash<tinylamb::MetaPage>()(p.body.meta_page);
     case tinylamb::PageType::kRowPage:
       return header_hash + std::hash<tinylamb::RowPage>()(p.body.row_page);
+    default:
+      return 0xdeadbeefcafebabe;  // Must be a broken page.
   }
-  throw std::runtime_error("unknown page type");
+
 }

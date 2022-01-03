@@ -29,21 +29,21 @@ TEST_F(PagePoolTest, Construct) {
 }
 
 TEST_F(PagePoolTest, GetPage) {
-  PageRef page = pp->GetPage(0);
+  PageRef page = pp->GetPage(0, nullptr);
   ASSERT_EQ(pp->Size(), 1);
 }
 
 TEST_F(PagePoolTest, GetPageSeveralpattern) {
   std::vector<int> pattern = {0, 0, 1, 0, 2};
   for (int & i : pattern) {
-    PageRef page = pp->GetPage(i);
+    PageRef page = pp->GetPage(i, nullptr);
     ASSERT_EQ(page->PageId(), i);
   }
 }
 
 TEST_F(PagePoolTest, GetManyPage) {
   for (int i = 0; i < 5; ++i) {
-    PageRef p = pp->GetPage(i);
+    PageRef p = pp->GetPage(i, nullptr);
     ASSERT_EQ(p->PageId(), i);
     ASSERT_EQ(pp->Size(), i + 1);
   }
@@ -51,7 +51,7 @@ TEST_F(PagePoolTest, GetManyPage) {
 
 TEST_F(PagePoolTest, EvictPage) {
   for (int i = 0; i < 15; ++i) {
-    PageRef p = pp->GetPage(i);
+    PageRef p = pp->GetPage(i, nullptr);
     ASSERT_EQ(p->PageId(), i);
     ASSERT_EQ(pp->Size(), std::min(i + 1, kDefaultCapacity));
   }
@@ -60,7 +60,7 @@ TEST_F(PagePoolTest, EvictPage) {
 TEST_F(PagePoolTest, PersistencyWithReset) {
   constexpr size_t kPages = 11;
   for (int i = 0; i < kPages; ++i) {
-    PageRef p = pp->GetPage(i);
+    PageRef p = pp->GetPage(i, nullptr);
     char* buff = p->body.free_page.FreeBody();
     ASSERT_NE(buff, nullptr);
     for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
@@ -69,7 +69,7 @@ TEST_F(PagePoolTest, PersistencyWithReset) {
   }
   // Reset();
   for (int i = 0; i < kPages; ++i) {
-    PageRef p = pp->GetPage(i);
+    PageRef p = pp->GetPage(i, nullptr);
     char* buff = p->body.free_page.FreeBody();
     ASSERT_NE(buff, nullptr);
     for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {

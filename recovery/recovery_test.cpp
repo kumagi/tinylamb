@@ -25,8 +25,7 @@ class RecoveryTest : public RowPageTest {
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
     tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get());
-    r_ = std::make_unique<Recovery>(kLogName, kDBFileName, p_->GetPool(),
-                                    tm_.get());
+    r_ = std::make_unique<Recovery>(kLogName, kDBFileName, p_->GetPool());
   }
 
   void Recover() override {
@@ -43,7 +42,7 @@ class RecoveryTest : public RowPageTest {
       db.seekp(failed_page * kPageSize, std::ios_base::beg);
       ASSERT_FALSE(db.fail());
       for (size_t i = 0; i < kPageSize; ++i) {
-        db.write("\x01", 1);
+        db.write("\xff", 1);
       }
       ASSERT_FALSE(db.fail());
     });
@@ -57,12 +56,12 @@ class RecoveryTest : public RowPageTest {
   std::unique_ptr<Recovery> r_;
 };
 
-TEST_F(RecoveryTest, EmptyRecovery) { r_->StartFrom(0); }
+TEST_F(RecoveryTest, EmptyRecovery) { r_->StartFrom(0, tm_.get()); }
 
 TEST_F(RecoveryTest, InsertRowRecovery) {
   InsertRow("hoge");
   MediaFailure();
-  r_->StartFrom(0);
+  r_->StartFrom(0, tm_.get());
   ASSERT_EQ(ReadRow(0), "hoge");
 }
 
@@ -71,7 +70,7 @@ TEST_F(RecoveryTest, UpdateRowRecovery) {
   UpdateRow(0, "bar");
   ASSERT_EQ(ReadRow(0), "bar");
   MediaFailure();
-  r_->StartFrom(0);
+  r_->StartFrom(0, tm_.get());
   ASSERT_EQ(ReadRow(0), "bar");
 }
 
@@ -80,7 +79,7 @@ TEST_F(RecoveryTest, DeleteRowRecovery) {
   DeleteRow(0);
   ASSERT_EQ(GetRowCount(), 0);
   MediaFailure();
-  r_->StartFrom(0);
+  r_->StartFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 0);
 }
 
@@ -101,7 +100,7 @@ TEST_F(RecoveryTest, InsertCrash) {
   }
   // Note that txn is not committed.
   Recover();
-  r_->StartFrom(0);
+  r_->StartFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 0);
 }
 
@@ -120,7 +119,7 @@ TEST_F(RecoveryTest, UpdateCrash) {
   }
   // Note that txn is not committed.
   Recover();
-  r_->StartFrom(0);
+  r_->StartFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
@@ -138,7 +137,7 @@ TEST_F(RecoveryTest, DeleteCrash) {
   }
   // Note that txn is not committed.
   Recover();
-  r_->StartFrom(0);
+  r_->StartFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
@@ -160,7 +159,7 @@ TEST_F(RecoveryTest, InsertMediaCrash) {
   }
   // Note that txn is not committed.
   MediaFailure();
-  r_->StartFrom(0);
+  r_->StartFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 0);
 }
 
@@ -179,7 +178,7 @@ TEST_F(RecoveryTest, UpdateMediaCrash) {
     // Note that txn is not committed.
   }
   MediaFailure();
-  r_->StartFrom(0);
+  r_->StartFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
@@ -197,7 +196,7 @@ TEST_F(RecoveryTest, DeleteMediaCrash) {
   }
   // Note that txn is not committed.
   MediaFailure();
-  r_->StartFrom(0);
+  r_->StartFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
@@ -219,8 +218,46 @@ TEST_F(RecoveryTest, InsertSinglePageFailure) {
   }
   // Note that txn is not committed.
   SinglePageFailure(page_id_);
-  r_->StartFrom(0);
+  r_->StartFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 0);
 }
 
+TEST_F(RecoveryTest, UpdateSinglePageFailure) {
+  ASSERT_TRUE(InsertRow("original message"));
+  auto txn = tm_->Begin();
+  Row r;
+  r.data = "modified message";
+  {
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_FALSE(page.IsNull());
+    ASSERT_EQ(page->Type(), PageType::kRowPage);
+
+    const uint16_t before_size = page->body.row_page.FreeSizeForTest();
+    RowPosition pos(page_id_, 0);
+    ASSERT_TRUE(page->Update(txn, pos, r));
+  }
+  // Note that txn is not committed.
+  SinglePageFailure(page_id_);
+  r_->StartFrom(0, tm_.get());
+  ASSERT_EQ(GetRowCount(), 1);
+  ASSERT_EQ(ReadRow(0), "original message");
+}
+
+TEST_F(RecoveryTest, DeleteSinglePageFailure) {
+  ASSERT_TRUE(InsertRow("original message"));
+  auto txn = tm_->Begin();
+  {
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_FALSE(page.IsNull());
+    ASSERT_EQ(page->Type(), PageType::kRowPage);
+
+    RowPosition pos(page_id_, 0);
+    ASSERT_TRUE(page->Delete(txn, pos));
+  }
+  // Note that txn is not committed.
+  SinglePageFailure(page_id_);
+  r_->StartFrom(0, tm_.get());
+  ASSERT_EQ(GetRowCount(), 1);
+  ASSERT_EQ(ReadRow(0), "original message");
+}
 }  // namespace tinylamb

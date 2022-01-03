@@ -49,10 +49,9 @@ class PageManagerTest : public ::testing::Test {
 
   PageRef GetPage(uint64_t page_id) {
     Transaction system_txn = tm_->Begin();
-    PageRef new_page = p_->GetPage(page_id);
-    EXPECT_FALSE(new_page.IsNull());
-    EXPECT_EQ(new_page->Type(), PageType::kFreePage);
-    return std::move(new_page);
+    PageRef got_page = p_->GetPage(page_id);
+    EXPECT_TRUE(!got_page.IsNull());
+    return std::move(got_page);
   }
 
   void DestroyPage(Page* target) {

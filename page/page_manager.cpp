@@ -5,19 +5,24 @@
 #include "page/meta_page.hpp"
 #include "page/page_ref.hpp"
 #include "recovery/log_record.hpp"
+#include "recovery/recovery.hpp"
 
 namespace tinylamb {
 
-PageManager::PageManager(std::string_view name, size_t capacity)
-    : pool_(name, capacity) {
+PageManager::PageManager(std::string_view db_name, size_t capacity)
+    : pool_(db_name, capacity) {
   GetMetaPage();
 }
 
 PageRef PageManager::GetPage(uint64_t page_id) {
-  PageRef page(GetMetaPage());
-  MetaPage& m = page.GetMetaPage();
-  m.max_page_count = std::max(m.max_page_count, page_id);
-  return pool_.GetPage(page_id);
+  bool cache_hit;
+  PageRef ref = pool_.GetPage(page_id, &cache_hit);
+  if (!cache_hit && !ref->IsValid()) {
+    // Found a broken page.
+    LOG(ERROR) << page_id << " is broken";
+    return PageRef(nullptr, nullptr);
+  }
+  return ref;
 }
 
 // Logically delete the page.
@@ -27,12 +32,15 @@ void PageManager::DestroyPage(Transaction& system_txn, Page* target) {
 
 PageRef PageManager::AllocateNewPage(Transaction& system_txn,
                                      PageType new_page_type) {
-  return GetMetaPage().GetMetaPage().AllocateNewPage(system_txn, pool_,
-                                                     new_page_type);
+  PageRef page(GetMetaPage());
+  MetaPage& m = page.GetMetaPage();
+  PageRef new_page = m.AllocateNewPage(system_txn, pool_, new_page_type);
+  m.max_page_count = std::max(m.max_page_count, new_page->page_id);
+  return std::move(new_page);
 }
 
 PageRef PageManager::GetMetaPage() {
-  PageRef meta_page = pool_.GetPage(kMetaPageId);
+  PageRef meta_page = pool_.GetPage(kMetaPageId, nullptr);
   if (meta_page.IsNull()) {
     throw std::runtime_error("failed to get meta page");
   }

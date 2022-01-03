@@ -23,19 +23,22 @@ PagePool::PagePool(std::string_view file_name, size_t capacity)
   }
 }
 
-PageRef PagePool::GetPage(uint64_t page_id) {
+PageRef PagePool::GetPage(uint64_t page_id, bool* cache_hit) {
   std::scoped_lock latch(pool_latch);
   auto entry = pool_.find(page_id);
   if (entry != pool_.end()) {
-    Page* result = entry->second->page.get();
-    assert(page_id == result->PageId());
     entry->second->pin_count++;
     Touch(entry->second);
-    assert(entry->second->page->PageId() == page_id);
-    return {this, result};
+    if (cache_hit != nullptr) {
+      *cache_hit = true;
+    }
+    return {this, entry->second->page.get()};
   } else {
     if (pool_lru_.size() == capacity_) {
       EvictOnePage();
+    }
+    if (cache_hit != nullptr) {
+      *cache_hit = false;
     }
     return AllocNewPage(page_id);
   }
@@ -74,8 +77,7 @@ bool PagePool::EvictOnePage() {
 PageRef PagePool::AllocNewPage(size_t pid) {
   std::unique_ptr<Page> new_page(new Page(pid, PageType::kMetaPage));
   ReadFrom(new_page.get(), pid);
-  assert(new_page->PageId() == pid);
-  Entry new_entry;
+  Entry new_entry{};
   new_entry.pin_count++;
   new_entry.page = std::move(new_page);
   pool_lru_.push_back(std::move(new_entry));
@@ -130,6 +132,7 @@ void PagePool::WriteBack(const Page* target) {
   }
 }
 
+// Precondition: target has allocated memory at kPageSize.
 void PagePool::ReadFrom(Page* target, uint64_t pid) {
   src_.seekg(pid * kPageSize, std::ios_base::beg);
   if (src_.fail()) {
@@ -139,15 +142,6 @@ void PagePool::ReadFrom(Page* target, uint64_t pid) {
   if (src_.fail()) {
     target->PageInit(pid, PageType::kFreePage);
     src_.clear();
-    return;
-  }
-  if (target->IsValid()) {
-    LOG(INFO) << "Page " << target->PageId() << " checksum matched "
-              << target->PageLSN();
-    return;
-  } else {
-    LOG(ERROR) << "Page " << target->PageId() << " crashed";
-
   }
 }
 
