@@ -73,7 +73,7 @@ TEST_F(CheckpointTest, CheckpointRecovery) {
   InsertRow("expect this operation did not rerun");
   Transaction txn = tm_->Begin();
   RowPosition inserted;
-  uint64_t restart_point;
+  lsn_t restart_point;
   {
     PageRef page = p_->GetPage(page_id_);
     page->Insert(txn, Row("inserted", RowPosition()), inserted);
@@ -90,7 +90,7 @@ TEST_F(CheckpointTest, CheckpointAbortRecovery) {
   ASSERT_TRUE(InsertRow("original message"));
   Transaction txn = tm_->Begin();
   RowPosition inserted(page_id_, 0);
-  uint64_t restart_point;
+  lsn_t restart_point;
   {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint();
@@ -109,7 +109,7 @@ TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
   ASSERT_TRUE(InsertRow("original message"));
   Transaction txn = tm_->Begin();
   RowPosition inserted(page_id_, 0);
-  uint64_t restart_point;
+  lsn_t restart_point;
   {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint([&](){

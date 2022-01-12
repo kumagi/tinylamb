@@ -34,7 +34,7 @@ class CheckpointManager {
 
   void WorkerThreadTask();
   struct ActiveTransactionEntry {
-    ActiveTransactionEntry(uint64_t id, TransactionStatus st, uint64_t lsn)
+    ActiveTransactionEntry(uint64_t id, TransactionStatus st, lsn_t lsn)
         : txn_id(id), status(st), last_lsn(lsn) {}
     friend std::ostream& operator<<(std::ostream& o,
                                     const ActiveTransactionEntry& a) {
@@ -46,9 +46,9 @@ class CheckpointManager {
       return txn_id == rhs.txn_id && status == rhs.status &&
              last_lsn == rhs.last_lsn;
     }
-    uint64_t txn_id;
+    txn_id_t txn_id;
     TransactionStatus status;
-    uint64_t last_lsn;
+    lsn_t last_lsn;
   };
 
   // This function is intentionally public for test.

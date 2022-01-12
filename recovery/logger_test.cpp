@@ -22,7 +22,7 @@ class LoggerTest : public ::testing::Test {
     std::remove(kFileName);
   }
 
-  void WaitForCommit(uint64_t target_lsn, size_t timeout_ms = 1000) {
+  void WaitForCommit(lsn_t target_lsn, size_t timeout_ms = 1000) {
     size_t counter = 0;
     while (l_->CommittedLSN() != target_lsn && counter < timeout_ms) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -40,7 +40,7 @@ TEST_F(LoggerTest, Construct) {
 
 TEST_F(LoggerTest, AppendBegin) {
   LogRecord l(0xcafebabe, 0xdeadbeef, LogType::kBegin);
-  uint64_t lsn = l_->AddLog(l);
+  lsn_t lsn = l_->AddLog(l);
   ASSERT_EQ(0, lsn);  // Inserted place must be the beginning of the log.
   WaitForCommit(lsn + l.Size());
   EXPECT_EQ(std::filesystem::file_size(kFileName), l.Size());
@@ -59,7 +59,7 @@ TEST_F(LoggerTest, AppendInsertLog) {
   r.SetValue(s, 1, Value("hogefugafoobar"));
   LogRecord l = LogRecord::InsertingLogRecord(
       0, 0, pos, std::string_view(r.Data(), r.Size()));
-  uint64_t lsn = l_->AddLog(l);
+  lsn_t lsn = l_->AddLog(l);
   ASSERT_EQ(0, lsn);
   WaitForCommit(lsn + l.Size());
   EXPECT_EQ(std::filesystem::file_size(kFileName), l.Size());
@@ -67,7 +67,7 @@ TEST_F(LoggerTest, AppendInsertLog) {
 
 TEST_F(LoggerTest, AppendManyBegin) {
   LogRecord l(0, 0, LogType::kBegin);
-  uint64_t lsn = 0;
+  lsn_t lsn = 0;
   for (int i = 0; i < 100; ++i) {
     lsn = l_->AddLog(l);
   }

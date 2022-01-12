@@ -17,12 +17,12 @@ class Transaction;
 class TransactionManager;
 
 class PageManager {
-  static constexpr uint64_t kMetaPageId = 0;
+  static constexpr page_id_t kMetaPageId = 0;
 
  public:
   PageManager(std::string_view db_name, size_t capacity);
 
-  PageRef GetPage(uint64_t page_id);
+  PageRef GetPage(page_id_t page_id);
 
   PageRef AllocateNewPage(Transaction& txn, PageType new_page_type);
 

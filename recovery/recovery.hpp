@@ -3,6 +3,7 @@
 
 #include <string>
 #include <string_view>
+#include "constants.hpp"
 
 namespace tinylamb {
 
@@ -18,12 +19,11 @@ class Recovery {
  public:
   Recovery(std::string_view log_path, PagePool* pp);
 
-  void RecoverFrom(uint64_t checkpoint_lsn, TransactionManager* tm);
+  void RecoverFrom(lsn_t checkpoint_lsn, TransactionManager* tm);
 
-  bool ReadLog(uint64_t lsn, LogRecord* dst);
+  bool ReadLog(lsn_t lsn, LogRecord* dst);
 
-  void LogUndoWithPage(uint64_t lsn, const LogRecord& log,
-                       TransactionManager* tm);
+  void LogUndoWithPage(lsn_t lsn, const LogRecord& log, TransactionManager* tm);
 
  private:
   void RefreshMap();

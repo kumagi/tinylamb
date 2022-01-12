@@ -7,17 +7,18 @@
 
 #include <ostream>
 #include <cstring>
+#include "constants.hpp"
 
 namespace tinylamb {
 
 struct RowPosition {
   // Returns invalid position.
   RowPosition() = default;
-  RowPosition(uint64_t p, uint16_t s)
+  RowPosition(page_id_t p, uint16_t s)
       : page_id(p), slot(s) {}
 
   // The page where the row exists.
-  uint64_t page_id = -1;
+  page_id_t page_id = -1;
 
   // n-th row in the page.
   uint16_t slot = -1;

@@ -41,9 +41,9 @@ class PagePool {
   PagePool(std::string_view file_name, size_t capacity);
   ~PagePool();
 
-  PageRef GetPage(uint64_t page_id, bool* cache_hit);
+  PageRef GetPage(page_id_t page_id, bool* cache_hit);
 
-  uint64_t Size() const {
+  page_id_t Size() const {
     std::scoped_lock latch(pool_latch);
     return pool_lru_.size();
   }
@@ -51,7 +51,7 @@ class PagePool {
   // Flush all page buffer without write back.
   void LostAllPageForTest();
 
-  void FlushPageForTest(uint64_t page_id);
+  void FlushPageForTest(page_id_t page_id);
 
  private:
   friend class PageRef;
@@ -60,8 +60,8 @@ class PagePool {
 
   bool Unpin(size_t page_id);
 
-  void PageLock(uint64_t page_id);
-  void PageUnlock(uint64_t page_id);
+  void PageLock(page_id_t page_id);
+  void PageUnlock(page_id_t page_id);
 
   bool EvictPage(LruType::iterator target);
 
@@ -76,7 +76,7 @@ class PagePool {
 
   void WriteBack(const Page* target);
 
-  void ReadFrom(Page* target, uint64_t pid);
+  void ReadFrom(Page* target, page_id_t pid);
 
   std::string file_name_;
 
@@ -89,7 +89,7 @@ class PagePool {
   LruType pool_lru_;
 
   // A map to find PageID -> page*.
-  std::unordered_map<uint64_t, LruType::iterator> pool_;
+  std::unordered_map<page_id_t, LruType::iterator> pool_;
 
   mutable std::mutex pool_latch;
 };

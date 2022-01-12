@@ -11,7 +11,7 @@
 namespace tinylamb {
 
 Transaction TransactionManager::Begin() {
-  uint64_t new_txn_id = next_txn_id_.fetch_add(1);
+  txn_id_t new_txn_id = next_txn_id_.fetch_add(1);
 
   Transaction new_txn(new_txn_id, this);
   LogRecord begin_log(0, new_txn_id, LogType::kBegin);
@@ -24,10 +24,10 @@ Transaction TransactionManager::Begin() {
   return new_txn;
 }
 
-Transaction TransactionManager::Begin(uint64_t txn_id,
+Transaction TransactionManager::Begin(txn_id_t txn_id,
                                       TransactionStatus txn_status,
-                                      uint64_t last_lsn) {
-  uint64_t new_txn_id = txn_id;
+                                      lsn_t last_lsn) {
+  txn_id_t new_txn_id = txn_id;
   Transaction new_txn(new_txn_id, this);
   new_txn.lsns_.push_back(last_lsn);
   new_txn.status_ = txn_status;
@@ -58,7 +58,7 @@ bool TransactionManager::PreCommit(Transaction& txn) {
   return true;
 }
 
-void TransactionManager::CommitLog(uint64_t txn_id) {
+void TransactionManager::CommitLog(txn_id_t txn_id) {
   logger_->AddLog(LogRecord(0, txn_id, LogType::kCommit));
 }
 
@@ -66,7 +66,7 @@ void TransactionManager::Abort(Transaction& txn) {
   // Iterate prev_lsn to beginning of the transaction with undoing.
   {
     const uint64_t latest_log = txn.lsns_.back();
-    while (CommittedLSN() < latest_log) {
+    while (CommittedLSN() <= latest_log) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
@@ -80,20 +80,20 @@ void TransactionManager::Abort(Transaction& txn) {
   PreCommit(txn);  // Writes an empty commit.
 }
 
-void TransactionManager::CompensateInsertLog(uint64_t txn_id,
+void TransactionManager::CompensateInsertLog(txn_id_t txn_id,
                                              const RowPosition& pos) {
   LogRecord lr = LogRecord::CompensatingInsertLogRecord(txn_id, pos);
   logger_->AddLog(lr);
 }
 
-void TransactionManager::CompensateUpdateLog(uint64_t txn_id,
+void TransactionManager::CompensateUpdateLog(txn_id_t txn_id,
                                              const RowPosition& pos,
                                              std::string_view redo) {
   LogRecord lr = LogRecord::CompensatingUpdateLogRecord(txn_id, pos, redo);
   logger_->AddLog(lr);
 }
 
-void TransactionManager::CompensateDeleteLog(uint64_t txn_id,
+void TransactionManager::CompensateDeleteLog(txn_id_t txn_id,
                                              const RowPosition& pos,
                                              std::string_view redo) {
   LogRecord lr = LogRecord::CompensatingDeleteLogRecord(txn_id, pos, redo);

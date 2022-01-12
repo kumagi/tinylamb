@@ -12,7 +12,7 @@ namespace tinylamb {
 
 PageRef MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
                                   PageType new_page_type) {
-  uint64_t new_page_id;
+  page_id_t new_page_id;
   PageRef ret = [&]() {
     if (first_free_page == 0) {
       new_page_id = ++max_page_count;
@@ -32,7 +32,7 @@ PageRef MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
 
 // Precondition: latch of page is taken by txn.
 void MetaPage::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
-  uint64_t free_page_id = target->PageId();
+  page_id_t free_page_id = target->PageId();
   target->PageInit(free_page_id, PageType::kFreePage);
   assert(target->PageId() == free_page_id);
   FreePage& free_page = target->body.free_page;

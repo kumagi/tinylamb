@@ -23,7 +23,7 @@ class TransactionTest : public ::testing::Test {
     l_.reset();
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get());
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), nullptr);
   }
 
  protected:

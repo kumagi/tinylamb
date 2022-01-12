@@ -79,7 +79,7 @@ TEST_F(PageManagerTest, AllocateNewPage) {
 
 TEST_F(PageManagerTest, AllocateMultipleNewPage) {
   constexpr int kPages = 15;
-  std::set<uint64_t> allocated_ids;
+  std::set<page_id_t> allocated_ids;
   for (int i = 0; i <= kPages; ++i) {
     PageRef page = AllocatePage(PageType::kFreePage);
     char* buff = page->body.free_page.FreeBody();

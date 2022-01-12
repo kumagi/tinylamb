@@ -5,7 +5,7 @@
 
 namespace tinylamb {
 
-bool RowPage::Read(uint64_t page_id, Transaction& txn, const RowPosition& pos,
+bool RowPage::Read(page_id_t page_id, Transaction& txn, const RowPosition& pos,
                    std::string_view* dst) {
   if (!txn.AddReadSet(pos) ||    // Failed by read conflict.
       pos.page_id != page_id ||  // Invalid page ID specified.
@@ -32,7 +32,7 @@ bool RowPage::Read(uint64_t page_id, Transaction& txn, const RowPosition& pos,
  * +-------------------------------+
  *                        ^ PosX == free_ptr_
  */
-bool RowPage::Insert(uint64_t page_id, Transaction& txn, const Row& record,
+bool RowPage::Insert(page_id_t page_id, Transaction& txn, const Row& record,
                      RowPosition& dst) {
   if (free_size_ + sizeof(RowPointer) < record.Size()) {
     // There is no enough space.
@@ -65,7 +65,7 @@ uint16_t RowPage::InsertRow(std::string_view new_row) {
   return row_count_++;
 }
 
-bool RowPage::Update(uint64_t page_id, Transaction& txn, const RowPosition& pos,
+bool RowPage::Update(page_id_t page_id, Transaction& txn, const RowPosition& pos,
                      const Row& new_row) {
   assert(pos.page_id == page_id);
   assert(pos.slot <= row_count_);
@@ -104,7 +104,7 @@ void RowPage::UpdateRow(int slot, std::string_view new_row) {
   memcpy(Payload() + data_[slot].offset, new_row.data(), new_row.size());
 }
 
-bool RowPage::Delete(uint64_t page_id, Transaction& txn,
+bool RowPage::Delete(page_id_t page_id, Transaction& txn,
                      const RowPosition& pos) {
   assert(pos.page_id == page_id);
   assert(pos.slot <= row_count_);
@@ -143,8 +143,8 @@ void RowPage::DeFragment() {
 uint64_t std::hash<tinylamb::RowPage>::operator()(
     const tinylamb::RowPage& r) const {
   uint64_t ret = 0;
-  ret += std::hash<uint64_t>()(r.prev_page_id_);
-  ret += std::hash<uint64_t>()(r.next_page_id_);
+  ret += std::hash<tinylamb::page_id_t>()(r.prev_page_id_);
+  ret += std::hash<tinylamb::page_id_t>()(r.next_page_id_);
   ret += std::hash<int16_t>()(r.row_count_);
   ret += std::hash<int16_t>()(r.free_ptr_);
   ret += std::hash<int16_t>()(r.free_size_);

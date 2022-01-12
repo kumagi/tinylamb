@@ -41,16 +41,16 @@ class RowPage {
     // memset(data_, 0, kBodySize);
   }
 
-  bool Read(uint64_t page_id, Transaction& txn, const RowPosition& pos,
+  bool Read(page_id_t page_id, Transaction& txn, const RowPosition& pos,
             std::string_view* dst);
 
-  bool Insert(uint64_t page_id, Transaction& txn, const Row& record,
+  bool Insert(page_id_t page_id, Transaction& txn, const Row& record,
               RowPosition& dst);
 
-  bool Update(uint64_t page_id, Transaction& txn, const RowPosition& pos,
+  bool Update(page_id_t page_id, Transaction& txn, const RowPosition& pos,
               const Row& row);
 
-  bool Delete(uint64_t page_id, Transaction& txn, const RowPosition& pos);
+  bool Delete(page_id_t page_id, Transaction& txn, const RowPosition& pos);
 
   [[nodiscard]] size_t RowCount() const;
 
@@ -81,8 +81,8 @@ class RowPage {
 
   void DeleteRow(int slot);
 
-  uint64_t prev_page_id_ = 0;
-  uint64_t next_page_id_ = 0;
+  page_id_t prev_page_id_ = 0;
+  page_id_t next_page_id_ = 0;
   int16_t row_count_ = 0;
   uint16_t free_ptr_ = kPageSize;
   uint16_t free_size_ = kPageSize - sizeof(RowPage);

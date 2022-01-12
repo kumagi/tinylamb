@@ -127,7 +127,7 @@ class RowPageTest : public ::testing::Test {
   std::unique_ptr<PageManager> p_;
   std::unique_ptr<Logger> l_;
   std::unique_ptr<TransactionManager> tm_;
-  uint64_t page_id_ = 0;
+  page_id_t page_id_ = 0;
 };
 
 }  // namespace tinylamb

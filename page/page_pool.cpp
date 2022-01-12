@@ -23,7 +23,7 @@ PagePool::PagePool(std::string_view file_name, size_t capacity)
   }
 }
 
-PageRef PagePool::GetPage(uint64_t page_id, bool* cache_hit) {
+PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit) {
   std::scoped_lock latch(pool_latch);
   auto entry = pool_.find(page_id);
   if (entry != pool_.end()) {
@@ -52,14 +52,14 @@ void PagePool::LostAllPageForTest() {
   pool_lru_.clear();
 }
 
-void PagePool::FlushPageForTest(uint64_t page_id) {
+void PagePool::FlushPageForTest(page_id_t page_id) {
   std::scoped_lock latch(pool_latch);
   const auto it = pool_.find(page_id);
   assert(it != pool_.end());
   WriteBack(it->second->page.get());
 }
 
-bool PagePool::Unpin(uint64_t page_id) {
+bool PagePool::Unpin(page_id_t page_id) {
   std::scoped_lock latch(pool_latch);
   auto page_entry = pool_.find(page_id);
   if (page_entry != pool_.end()) {
@@ -109,7 +109,7 @@ bool PagePool::EvictOnePage() {
 }
 
 // Precondition: pool_latch is locked.
-PageRef PagePool::AllocNewPage(size_t pid) {
+PageRef PagePool::AllocNewPage(page_id_t pid) {
   assert(!pool_latch.try_lock());
   std::unique_ptr<Page> new_page(new Page(pid, PageType::kMetaPage));
   ReadFrom(new_page.get(), pid);
@@ -121,7 +121,7 @@ PageRef PagePool::AllocNewPage(size_t pid) {
 
 void PagePool::Touch(LruType::iterator it) {
   Entry tmp(std::move(*it));
-  uint64_t page_id = tmp.page->PageId();
+  page_id_t page_id = tmp.page->PageId();
   pool_lru_.erase(it);
   pool_lru_.push_back(std::move(tmp));
   pool_[page_id] = std::prev(pool_lru_.end());
@@ -167,7 +167,7 @@ void PagePool::WriteBack(const Page* target) {
 }
 
 // Precondition: target has allocated memory at kPageSize.
-void PagePool::ReadFrom(Page* target, uint64_t pid) {
+void PagePool::ReadFrom(Page* target, page_id_t pid) {
   src_.seekg(pid * kPageSize, std::ios_base::beg);
   if (src_.fail()) {
     return;
@@ -179,7 +179,7 @@ void PagePool::ReadFrom(Page* target, uint64_t pid) {
   }
 
   // RecLSN = MAX means a clean page.
-  target->recovery_lsn = std::numeric_limits<uint64_t>::max();
+  target->recovery_lsn = std::numeric_limits<lsn_t>::max();
 }
 
 }  // namespace tinylamb

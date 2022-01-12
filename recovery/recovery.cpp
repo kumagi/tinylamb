@@ -40,7 +40,7 @@ bool IsPageManipulation(LogType type) {
   return false;
 }
 
-void LogRedo(PageRef &target, uint64_t lsn, const LogRecord &log,
+void LogRedo(PageRef &target, lsn_t lsn, const LogRecord &log,
              TransactionManager *tm) {
   switch (log.type) {
     case LogType::kUnknown:
@@ -107,7 +107,7 @@ void LogRedo(PageRef &target, uint64_t lsn, const LogRecord &log,
   }
 }
 
-void LogUndo(PageRef &target, uint64_t lsn, const LogRecord &log,
+void LogUndo(PageRef &target, lsn_t lsn, const LogRecord &log,
              TransactionManager *tm) {
   switch (log.type) {
     case LogType::kUnknown:
@@ -155,8 +155,8 @@ void LogUndo(PageRef &target, uint64_t lsn, const LogRecord &log,
 
 // Precondition: the page is locked by this thread.
 void PageReplay(
-    PageRef &&target, const std::vector<std::pair<uint64_t, LogRecord>> &logs,
-    const std::unordered_map<uint64_t, std::pair<TransactionStatus, uint64_t>>
+    PageRef &&target, const std::vector<std::pair<page_id_t, LogRecord>> &logs,
+    const std::unordered_map<txn_id_t, std::pair<TransactionStatus, lsn_t>>
         &active_transaction_table,
     TransactionManager *tm) {
   for (const auto &it : logs) {
@@ -166,7 +166,7 @@ void PageReplay(
 
   // Redo phase.
   for (const auto &lsn_log : logs) {
-    const uint64_t &lsn = lsn_log.first;
+    const lsn_t &lsn = lsn_log.first;
     const LogRecord &log = lsn_log.second;
     LOG(INFO) << "redo: " << log;
     LogRedo(target, lsn, log, tm);
@@ -174,7 +174,7 @@ void PageReplay(
 
   // Undo phase.
   for (auto iter = logs.rbegin(); iter != logs.rend(); iter++) {
-    const uint64_t &lsn = iter->first;
+    const lsn_t &lsn = iter->first;
     const LogRecord &undo_log = iter->second;
     const auto it = active_transaction_table.find(undo_log.txn_id);
     if (it != active_transaction_table.end() &&
@@ -206,15 +206,15 @@ void Recovery::RefreshMap() {
       mmap(nullptr, filesize, PROT_READ, MAP_PRIVATE, fd, 0));
 }
 
-void Recovery::RecoverFrom(uint64_t checkpoint_lsn, TransactionManager *tm) {
+void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager *tm) {
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
   RefreshMap();
 
   // Analysis phase starts here.
-  std::unordered_map<uint64_t, uint64_t> dirty_page_table;
-  std::unordered_map<uint64_t, std::pair<TransactionStatus, uint64_t>>
+  std::unordered_map<page_id_t, lsn_t> dirty_page_table;
+  std::unordered_map<txn_id_t, std::pair<TransactionStatus, lsn_t>>
       active_transaction_table;
-  uint64_t redo_start_point = filesize;
+  lsn_t redo_start_point = filesize;
   {
     size_t offset = checkpoint_lsn;
     LogRecord log;
@@ -238,8 +238,7 @@ void Recovery::RecoverFrom(uint64_t checkpoint_lsn, TransactionManager *tm) {
             if (it == dirty_page_table.end()) {
               dirty_page_table.emplace(log.pos.page_id, offset);
             } else {
-              dirty_page_table[log.pos.page_id] =
-                  std::min(offset, it->second);
+              dirty_page_table[log.pos.page_id] = std::min(offset, it->second);
             }
             break;
           }
@@ -248,8 +247,7 @@ void Recovery::RecoverFrom(uint64_t checkpoint_lsn, TransactionManager *tm) {
             if (it == dirty_page_table.end()) {
               dirty_page_table.emplace(log.pos.page_id, offset);
             } else {
-              dirty_page_table[log.pos.page_id] =
-                  std::min(offset, it->second);
+              dirty_page_table[log.pos.page_id] = std::min(offset, it->second);
             }
             break;
           }
@@ -300,11 +298,11 @@ void Recovery::RecoverFrom(uint64_t checkpoint_lsn, TransactionManager *tm) {
   }
 
   // Collect logs to redo.
-  std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, LogRecord>>>
+  std::unordered_map<page_id_t, std::vector<std::pair<lsn_t, LogRecord>>>
       page_logs;
   page_logs.reserve(dirty_page_table.size());
 
-  std::unordered_map<uint64_t, PageRef> pages;
+  std::unordered_map<page_id_t, PageRef> pages;
   {
     // Hold all dirty page's lock.
     for (const auto &it : dirty_page_table) {
@@ -316,7 +314,7 @@ void Recovery::RecoverFrom(uint64_t checkpoint_lsn, TransactionManager *tm) {
 
   // Now, other user transactions can start concurrently.
   {
-    uint64_t offset = redo_start_point;
+    lsn_t offset = redo_start_point;
     LogRecord log;
     while (offset < filesize) {
       bool success = LogRecord::ParseLogRecord(&log_data_[offset], &log);
@@ -346,12 +344,12 @@ void Recovery::RecoverFrom(uint64_t checkpoint_lsn, TransactionManager *tm) {
   }
 }
 
-bool Recovery::ReadLog(uint64_t lsn, LogRecord *dst) {
+bool Recovery::ReadLog(lsn_t lsn, LogRecord *dst) {
   RefreshMap();
   return LogRecord::ParseLogRecord(&log_data_[lsn], dst);
 }
 
-void Recovery::LogUndoWithPage(uint64_t lsn, const LogRecord &log,
+void Recovery::LogUndoWithPage(lsn_t lsn, const LogRecord &log,
                                TransactionManager *tm) {
   bool cache_hit;
   if (IsPageManipulation(log.type)) {

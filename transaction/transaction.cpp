@@ -28,7 +28,7 @@ std::ostream& operator<<(std::ostream& o, const TransactionStatus& t) {
   return o;
 }
 
-Transaction::Transaction(uint64_t txn_id, TransactionManager* tm)
+Transaction::Transaction(txn_id_t txn_id, TransactionManager* tm)
     : txn_id_(txn_id),
       status_(TransactionStatus::kRunning),
       transaction_manager_(tm) {}
@@ -71,7 +71,7 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
   return true;
 }
 
-uint64_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
+lsn_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
   assert(!IsFinished());
   LogRecord lr =
       LogRecord::InsertingLogRecord(lsns_.back(), txn_id_, pos, redo);
@@ -79,7 +79,7 @@ uint64_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
   return lsns_.back();
 }
 
-uint64_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
+lsn_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
                                 std::string_view redo) {
   assert(!IsFinished());
   LogRecord lr =
@@ -88,15 +88,15 @@ uint64_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
   return lsns_.back();
 }
 
-uint64_t Transaction::DeleteLog(const RowPosition& pos, std::string_view undo) {
+lsn_t Transaction::DeleteLog(const RowPosition& pos, std::string_view undo) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::DeletingLogRecord(lsns_.back(), txn_id_, pos, undo);
   lsns_.push_back(transaction_manager_->AddLog(lr));
   return lsns_.back();
 }
 
-uint64_t Transaction::AllocatePageLog(uint64_t allocated_page_id,
-                                      PageType new_page_type) {
+lsn_t Transaction::AllocatePageLog(page_id_t allocated_page_id,
+                                   PageType new_page_type) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::AllocatePageLogRecord(
       lsns_.back(), txn_id_, allocated_page_id, new_page_type);
@@ -104,7 +104,7 @@ uint64_t Transaction::AllocatePageLog(uint64_t allocated_page_id,
   return lsns_.back();
 }
 
-uint64_t Transaction::DestroyPageLog(uint64_t destroyed_page_id) {
+lsn_t Transaction::DestroyPageLog(page_id_t destroyed_page_id) {
   assert(!IsFinished());
   LogRecord lr =
       LogRecord::DestroyPageLogRecord(lsns_.back(), txn_id_, destroyed_page_id);

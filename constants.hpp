@@ -27,6 +27,10 @@ enum class Status : uint8_t {
   kNotImplemented,
 };
 
+typedef uint64_t lsn_t;
+typedef uint64_t txn_id_t;
+typedef uint64_t page_id_t;
+
 inline std::string_view ToString(Status s) {
   switch (s) {
     case Status::kUnknown:

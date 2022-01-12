@@ -32,14 +32,14 @@ void CheckpointManager::WorkerThreadTask() {
   }
 }
 
-uint64_t CheckpointManager::WriteCheckpoint(
+lsn_t CheckpointManager::WriteCheckpoint(
     const std::function<void()>& func_for_test) {
   LogRecord begin = LogRecord::BeginCheckpointLogRecord();
 
   // Write [Begin-Checkpoint] log.
-  uint64_t begin_lsn = tm_->logger_->AddLog(begin);
+  lsn_t begin_lsn = tm_->logger_->AddLog(begin);
 
-  std::vector<std::pair<uint64_t, uint64_t>> dirty_page_table;
+  std::vector<std::pair<page_id_t, lsn_t>> dirty_page_table;
   {
     std::scoped_lock latch(pp_->pool_latch);
     dirty_page_table.reserve(pp_->pool_.size());

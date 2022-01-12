@@ -39,7 +39,7 @@ class RecoveryTest : public RowPageTest {
     RecoverBase([]() { std::remove(kDBFileName); });
   }
 
-  void SinglePageFailure(uint64_t failed_page) {
+  void SinglePageFailure(page_id_t failed_page) {
     RecoverBase([&]() {
       std::fstream db(kDBFileName, std::ios_base::out | std::ios_base::binary);
       db.seekp(failed_page * kPageSize, std::ios_base::beg);

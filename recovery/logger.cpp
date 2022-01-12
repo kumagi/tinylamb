@@ -29,7 +29,7 @@ Logger::~Logger() {
   close(dst_);
 }
 
-uint64_t Logger::AddLog(const LogRecord& log) {
+lsn_t Logger::AddLog(const LogRecord& log) {
   std::string data = log.Serialize();
   std::scoped_lock lk(latch_);
 
@@ -53,7 +53,7 @@ void Logger::Finish() {
   worker_.join();
 }
 
-uint64_t Logger::CommittedLSN() const {
+lsn_t Logger::CommittedLSN() const {
   std::scoped_lock lk(latch_);
   return committed_lsn_;
 }

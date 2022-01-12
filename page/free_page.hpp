@@ -6,12 +6,22 @@
 
 namespace tinylamb {
 
-struct FreePage {
+class FreePage {
+  friend class Page;
+  friend class MetaPage;
+  friend std::hash<tinylamb::FreePage>;
+
   void Initialize() { next_free_page = 0; }
-  char* FreeBody() { return reinterpret_cast<char*>(&next_free_page + 1); }
+
+ public:
+  char* FreeBody() {
+    return reinterpret_cast<char*>(&next_free_page + 1);
+  }
   static constexpr size_t FreeBodySize() {
     return kPageBodySize - sizeof(FreePage);
   }
+
+ private:
   uint64_t next_free_page;
 };
 constexpr static uint32_t kFreeBodySize = kPageBodySize - sizeof(FreePage);

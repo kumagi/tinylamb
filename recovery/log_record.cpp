@@ -56,7 +56,7 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
   return o;
 }
 
-LogRecord::LogRecord(uint64_t prev, uint64_t txn, LogType t)
+LogRecord::LogRecord(lsn_t prev, txn_id_t txn, LogType t)
     : prev_lsn(prev), txn_id(txn), type(t), length(Size()) {}
 
 bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
@@ -131,9 +131,9 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
       src += sizeof(dpt_size);
       dst->dirty_page_table.reserve(dpt_size);
       for (size_t i = 0; i < dpt_size; ++i) {
-        const auto* dirty_page_id = reinterpret_cast<const uint64_t*>(src);
+        const auto* dirty_page_id = reinterpret_cast<const page_id_t*>(src);
         src += sizeof(*dirty_page_id);
-        const auto* recovery_lsn = reinterpret_cast<const uint64_t*>(src);
+        const auto* recovery_lsn = reinterpret_cast<const lsn_t *>(src);
         src += sizeof(*recovery_lsn);
         dst->dirty_page_table.emplace_back(*dirty_page_id, *recovery_lsn);
       }
@@ -143,11 +143,11 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
       src += sizeof(tt_size);
       dst->active_transaction_table.reserve(tt_size);
       for (size_t i = 0; i < tt_size; ++i) {
-        const auto* txn_id = reinterpret_cast<const uint64_t*>(src);
+        const auto* txn_id = reinterpret_cast<const txn_id_t *>(src);
         src += sizeof(*txn_id);
         const auto* status = reinterpret_cast<const TransactionStatus*>(src);
         src += sizeof(*status);
-        const auto* last_lsn = reinterpret_cast<const uint64_t*>(src);
+        const auto* last_lsn = reinterpret_cast<const lsn_t *>(src);
         src += sizeof(*last_lsn);
         dst->active_transaction_table.emplace_back(*txn_id, *status, *last_lsn);
       }
@@ -166,7 +166,7 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
   return false;
 }
 
-LogRecord LogRecord::InsertingLogRecord(uint64_t p, uint64_t txn,
+LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn,
                                         RowPosition po, std::string_view r) {
   LogRecord l;
   l.prev_lsn = p;
@@ -178,7 +178,7 @@ LogRecord LogRecord::InsertingLogRecord(uint64_t p, uint64_t txn,
   return l;
 }
 
-LogRecord LogRecord::CompensatingInsertLogRecord(uint64_t txn, RowPosition po) {
+LogRecord LogRecord::CompensatingInsertLogRecord(txn_id_t txn, RowPosition po) {
   LogRecord l;
   l.txn_id = txn;
   l.pos = po;
@@ -187,7 +187,7 @@ LogRecord LogRecord::CompensatingInsertLogRecord(uint64_t txn, RowPosition po) {
   return l;
 }
 
-LogRecord LogRecord::UpdatingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
+LogRecord LogRecord::UpdatingLogRecord(lsn_t p, txn_id_t txn, RowPosition po,
                                        std::string_view redo,
                                        std::string_view undo) {
   LogRecord l;
@@ -201,7 +201,7 @@ LogRecord LogRecord::UpdatingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
   return l;
 }
 
-LogRecord LogRecord::CompensatingUpdateLogRecord(uint64_t txn, RowPosition po,
+LogRecord LogRecord::CompensatingUpdateLogRecord(txn_id_t txn, RowPosition po,
                                                  std::string_view redo) {
   LogRecord l;
   l.txn_id = txn;
@@ -212,7 +212,7 @@ LogRecord LogRecord::CompensatingUpdateLogRecord(uint64_t txn, RowPosition po,
   return l;
 }
 
-LogRecord LogRecord::DeletingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
+LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, RowPosition po,
                                        std::string_view undo) {
   LogRecord l;
   l.prev_lsn = p;

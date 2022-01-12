@@ -32,37 +32,37 @@ std::ostream& operator<<(std::ostream& o, const LogType& type);
 struct LogRecord {
   LogRecord() = default;
 
-  LogRecord(uint64_t p, uint64_t txn, LogType t);
+  LogRecord(lsn_t p, txn_id_t txn, LogType t);
 
   static bool ParseLogRecord(const char* src, LogRecord* dst);
 
-  static LogRecord InsertingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
+  static LogRecord InsertingLogRecord(lsn_t p, txn_id_t txn, RowPosition po,
                                       std::string_view r);
 
-  static LogRecord CompensatingInsertLogRecord(uint64_t txn, RowPosition po);
+  static LogRecord CompensatingInsertLogRecord(txn_id_t txn, RowPosition po);
 
-  static LogRecord UpdatingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
+  static LogRecord UpdatingLogRecord(lsn_t p, txn_id_t txn, RowPosition po,
                                      std::string_view redo,
                                      std::string_view undo);
 
-  static LogRecord CompensatingUpdateLogRecord(uint64_t txn, RowPosition po,
+  static LogRecord CompensatingUpdateLogRecord(lsn_t txn, RowPosition po,
                                                std::string_view redo);
 
-  static LogRecord DeletingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
+  static LogRecord DeletingLogRecord(lsn_t p, txn_id_t txn, RowPosition po,
                                      std::string_view undo);
 
-  static LogRecord CompensatingDeleteLogRecord(uint64_t txn, RowPosition po,
+  static LogRecord CompensatingDeleteLogRecord(txn_id_t txn, RowPosition po,
                                                std::string_view redo);
 
-  static LogRecord AllocatePageLogRecord(uint64_t p, uint64_t txn, uint64_t pid,
+  static LogRecord AllocatePageLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                          PageType new_page_type);
 
-  static LogRecord DestroyPageLogRecord(uint64_t p, uint64_t txn, uint64_t pid);
+  static LogRecord DestroyPageLogRecord(lsn_t p, txn_id_t txn, page_id_t pid);
 
   static LogRecord BeginCheckpointLogRecord();
 
   static LogRecord EndCheckpointLogRecord(
-      const std::vector<std::pair<uint64_t, uint64_t>>& dpt,
+      const std::vector<std::pair<page_id_t , lsn_t>>& dpt,
       const std::vector<CheckpointManager::ActiveTransactionEntry>& att);
 
   void Clear();
@@ -92,8 +92,6 @@ struct LogRecord {
         o << "\t\t" << l.pos;
         break;
       case LogType::kSystemAllocPage:
-        o << "\t" << l.pos.page_id << " meta: " << l.pos;
-        break;
       case LogType::kSystemDestroyPage:
         o << "\t" << l.pos.page_id;
         break;
@@ -124,12 +122,12 @@ struct LogRecord {
 
   // Log size in bytes.
   LogType type = LogType::kUnknown;
-  uint64_t prev_lsn = 0;
-  uint64_t txn_id = 0;
+  lsn_t prev_lsn = 0;
+  txn_id_t txn_id = 0;
   RowPosition pos = RowPosition();
   std::string_view undo_data{};
   std::string_view redo_data{};
-  std::vector<std::pair<uint64_t, uint64_t>> dirty_page_table{};
+  std::vector<std::pair<page_id_t, lsn_t>> dirty_page_table{};
   std::vector<CheckpointManager::ActiveTransactionEntry>
       active_transaction_table{};
 

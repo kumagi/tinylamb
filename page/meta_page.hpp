@@ -9,9 +9,14 @@
 namespace tinylamb {
 
 class Transaction;
+class Page;
 class PagePool;
 
-struct MetaPage  {
+class MetaPage {
+  // Note that all member of this class is private.
+  friend class Page;
+  friend std::hash<tinylamb::MetaPage>;
+
   void Initialize() {
     max_page_count = 0;
     first_free_page = 0;

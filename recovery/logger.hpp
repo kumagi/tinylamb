@@ -5,11 +5,13 @@
 #include <unistd.h>
 
 #include <atomic>
-#include <condition_variable>
 #include <cassert>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
+
+#include "constants.hpp"
 
 namespace tinylamb {
 
@@ -18,15 +20,15 @@ struct LogRecord;
 class Logger {
  public:
   explicit Logger(std::string_view filename, size_t buffer_size = 1024 * 1024,
-         size_t every_ms = 20);
+                  size_t every_ms = 20);
 
   ~Logger();
 
-  uint64_t AddLog(const LogRecord& log);
+  lsn_t AddLog(const LogRecord& log);
 
   void Finish();
 
-  uint64_t CommittedLSN() const;
+  lsn_t CommittedLSN() const;
 
  private:
   void LoggerWork();
