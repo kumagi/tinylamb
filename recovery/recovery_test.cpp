@@ -15,6 +15,9 @@ class RecoveryTest : public RowPageTest {
   void SetUp() override { RowPageTest::SetUp(); }
 
   void RecoverBase(const std::function<void(void)>& f) {
+    if (p_) {
+      p_->GetPool()->LostAllPageForTest();
+    }
     tm_.reset();
     lm_.reset();
     l_.reset();
@@ -24,8 +27,8 @@ class RecoveryTest : public RowPageTest {
     p_ = std::make_unique<PageManager>(kDBFileName, 10);
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
-    r_ = std::make_unique<Recovery>(kLogName, kDBFileName, p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(), r_.get());
+    r_ = std::make_unique<Recovery>(kLogName, p_->GetPool());
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
   }
 
   void Recover() override {
@@ -56,7 +59,7 @@ class RecoveryTest : public RowPageTest {
   std::unique_ptr<Recovery> r_;
 };
 
-TEST_F(RecoveryTest, EmptyRecovery) { r_->StartFrom(0, tm_.get()); }
+TEST_F(RecoveryTest, EmptyRecovery) { r_->RecoverFrom(0, tm_.get()); }
 
 TEST_F(RecoveryTest, InsertAbort) {
   auto txn = tm_->Begin();
@@ -76,8 +79,7 @@ TEST_F(RecoveryTest, InsertAbort) {
 }
 
 TEST_F(RecoveryTest, UpdateAbort) {
-  std::string before = "before string hello world!",
-              after = "replaced by this";
+  std::string before = "before string hello world!", after = "replaced by this";
   ASSERT_TRUE(InsertRow(before));
   auto txn = tm_->Begin();
   Row r;
@@ -112,7 +114,7 @@ TEST_F(RecoveryTest, DeleteAbort) {
 TEST_F(RecoveryTest, InsertRowRecovery) {
   InsertRow("hoge");
   MediaFailure();
-  r_->StartFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(ReadRow(0), "hoge");
 }
 
@@ -121,7 +123,7 @@ TEST_F(RecoveryTest, UpdateRowRecovery) {
   UpdateRow(0, "bar");
   ASSERT_EQ(ReadRow(0), "bar");
   MediaFailure();
-  r_->StartFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(ReadRow(0), "bar");
 }
 
@@ -130,8 +132,34 @@ TEST_F(RecoveryTest, DeleteRowRecovery) {
   DeleteRow(0);
   ASSERT_EQ(GetRowCount(), 0);
   MediaFailure();
-  r_->StartFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 0);
+}
+
+TEST_F(RecoveryTest, InsertRowAbortRecovery) {
+  InsertRow("hoge", false);
+  MediaFailure();
+  r_->RecoverFrom(0, tm_.get());
+  ASSERT_EQ(GetRowCount(), 0);
+}
+
+TEST_F(RecoveryTest, UpdateRowAbortRecovery) {
+  ASSERT_TRUE(InsertRow("hoge"));
+  UpdateRow(0, "bar", false);
+  ASSERT_EQ(ReadRow(0), "hoge");
+  MediaFailure();
+  r_->RecoverFrom(0, tm_.get());
+  ASSERT_EQ(ReadRow(0), "hoge");
+}
+
+TEST_F(RecoveryTest, DeleteRowAbortRecovery) {
+  ASSERT_TRUE(InsertRow("hoge"));
+  DeleteRow(0, false);
+  ASSERT_EQ(GetRowCount(), 1);
+  MediaFailure();
+  r_->RecoverFrom(0, tm_.get());
+  ASSERT_EQ(GetRowCount(), 1);
+  ASSERT_EQ(ReadRow(0), "hoge");
 }
 
 TEST_F(RecoveryTest, InsertCrash) {
@@ -151,7 +179,7 @@ TEST_F(RecoveryTest, InsertCrash) {
   }
   // Note that txn is not committed.
   Recover();
-  r_->StartFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 0);
 }
 
@@ -170,7 +198,7 @@ TEST_F(RecoveryTest, UpdateCrash) {
   }
   // Note that txn is not committed.
   Recover();
-  r_->StartFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
@@ -188,7 +216,7 @@ TEST_F(RecoveryTest, DeleteCrash) {
   }
   // Note that txn is not committed.
   Recover();
-  r_->StartFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
@@ -210,7 +238,7 @@ TEST_F(RecoveryTest, InsertMediaCrash) {
   }
   // Note that txn is not committed.
   MediaFailure();
-  r_->StartFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 0);
 }
 
@@ -229,7 +257,7 @@ TEST_F(RecoveryTest, UpdateMediaCrash) {
     // Note that txn is not committed.
   }
   MediaFailure();
-  r_->StartFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
@@ -247,7 +275,7 @@ TEST_F(RecoveryTest, DeleteMediaCrash) {
   }
   // Note that txn is not committed.
   MediaFailure();
-  r_->StartFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
@@ -269,7 +297,7 @@ TEST_F(RecoveryTest, InsertSinglePageFailure) {
   }
   // Note that txn is not committed.
   SinglePageFailure(page_id_);
-  r_->StartFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 0);
 }
 
@@ -289,7 +317,7 @@ TEST_F(RecoveryTest, UpdateSinglePageFailure) {
   }
   // Note that txn is not committed.
   SinglePageFailure(page_id_);
-  r_->StartFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
@@ -307,7 +335,7 @@ TEST_F(RecoveryTest, DeleteSinglePageFailure) {
   }
   // Note that txn is not committed.
   SinglePageFailure(page_id_);
-  r_->StartFrom(0, tm_.get());
+  r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }

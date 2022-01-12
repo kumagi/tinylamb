@@ -60,6 +60,7 @@ LogRecord::LogRecord(uint64_t prev, uint64_t txn, LogType t)
     : prev_lsn(prev), txn_id(txn), type(t), length(Size()) {}
 
 bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
+  dst->Clear();
   size_t offset = 0;
   memcpy(&dst->length, src, sizeof(dst->length));
   src += sizeof(dst->length);
@@ -114,43 +115,51 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
       src += dst->pos.Parse(src);
       return true;
     }
-    case LogType::kCompensateUpdateRow: {
-      return true;
-    }
+    case LogType::kCompensateUpdateRow:
     case LogType::kCompensateDeleteRow: {
+      src += dst->pos.Parse(src);
+      uint32_t redo_size;
+      memcpy(&redo_size, src, sizeof(redo_size));
+      src += sizeof(redo_size);
+      dst->redo_data = std::string_view(src, redo_size);
+      src += redo_size;
       return true;
     }
     case LogType::kEndCheckpoint: {
       uint64_t dpt_size;
       memcpy(&dpt_size, src, sizeof(dpt_size));
       src += sizeof(dpt_size);
+      dst->dirty_page_table.reserve(dpt_size);
       for (size_t i = 0; i < dpt_size; ++i) {
-        const auto* dirty_page = reinterpret_cast<const uint64_t*>(src);
-        dst->dirty_page_table.insert(*dirty_page);
-        src += sizeof(*dirty_page);
+        const auto* dirty_page_id = reinterpret_cast<const uint64_t*>(src);
+        src += sizeof(*dirty_page_id);
+        const auto* recovery_lsn = reinterpret_cast<const uint64_t*>(src);
+        src += sizeof(*recovery_lsn);
+        dst->dirty_page_table.emplace_back(*dirty_page_id, *recovery_lsn);
       }
 
       uint64_t tt_size;
       memcpy(&tt_size, src, sizeof(tt_size));
       src += sizeof(tt_size);
+      dst->active_transaction_table.reserve(tt_size);
       for (size_t i = 0; i < tt_size; ++i) {
         const auto* txn_id = reinterpret_cast<const uint64_t*>(src);
-        dst->transaction_table.insert(*txn_id);
         src += sizeof(*txn_id);
+        const auto* status = reinterpret_cast<const TransactionStatus*>(src);
+        src += sizeof(*status);
+        const auto* last_lsn = reinterpret_cast<const uint64_t*>(src);
+        src += sizeof(*last_lsn);
+        dst->active_transaction_table.emplace_back(*txn_id, *status, *last_lsn);
       }
       return true;
     }
     case LogType::kSystemAllocPage:
-      memcpy(&dst->allocated_page_id, src,
-             sizeof(dst->allocated_page_id));
-      src += sizeof(dst->allocated_page_id);
-      memcpy(&dst->allocated_page_type, src,
-             sizeof(dst->allocated_page_type));
+      src += dst->pos.Parse(src);
+      memcpy(&dst->allocated_page_type, src, sizeof(dst->allocated_page_type));
       src += sizeof(dst->allocated_page_type);
       return true;
     case LogType::kSystemDestroyPage:
-      memcpy(&dst->destroy_page_id, src, sizeof(dst->destroy_page_id));
-      src += sizeof(dst->destroy_page_id);
+      src += dst->pos.Parse(src);
       return true;
   }
   LOG(ERROR) << "unexpected execution path: " << dst->type;
@@ -169,12 +178,8 @@ LogRecord LogRecord::InsertingLogRecord(uint64_t p, uint64_t txn,
   return l;
 }
 
-LogRecord LogRecord::CompensatingInsertLogRecord(uint16_t p,
-                                                 uint64_t undo_next_lsn,
-                                                 uint64_t txn, RowPosition po) {
+LogRecord LogRecord::CompensatingInsertLogRecord(uint64_t txn, RowPosition po) {
   LogRecord l;
-  l.prev_lsn = p;
-  l.undo_next_lsn = undo_next_lsn;
   l.txn_id = txn;
   l.pos = po;
   l.type = LogType::kCompensateInsertRow;
@@ -196,13 +201,9 @@ LogRecord LogRecord::UpdatingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
   return l;
 }
 
-LogRecord LogRecord::CompensatingUpdateLogRecord(uint16_t p,
-                                                 uint64_t undo_next_lsn,
-                                                 uint64_t txn, RowPosition po,
+LogRecord LogRecord::CompensatingUpdateLogRecord(uint64_t txn, RowPosition po,
                                                  std::string_view redo) {
   LogRecord l;
-  l.prev_lsn = p;
-  l.undo_next_lsn = undo_next_lsn;
   l.txn_id = txn;
   l.pos = po;
   l.type = LogType::kCompensateUpdateRow;
@@ -223,30 +224,13 @@ LogRecord LogRecord::DeletingLogRecord(uint64_t p, uint64_t txn, RowPosition po,
   return l;
 }
 
-LogRecord LogRecord::CompensatingDeleteLogRecord(uint16_t p,
-                                                 uint64_t undo_next_lsn,
-                                                 uint64_t txn, RowPosition po,
+LogRecord LogRecord::CompensatingDeleteLogRecord(uint64_t txn, RowPosition po,
                                                  std::string_view redo) {
   LogRecord l;
-  l.prev_lsn = p;
-  l.undo_next_lsn = undo_next_lsn;
   l.txn_id = txn;
   l.pos = po;
-  l.type = LogType::kCompensateUpdateRow;
+  l.type = LogType::kCompensateDeleteRow;
   l.redo_data = redo;
-  l.length = l.Size();
-  return l;
-}
-
-LogRecord LogRecord::CheckpointLogRecord(uint64_t p, uint64_t txn,
-                                         std::unordered_set<uint64_t> dpt,
-                                         std::unordered_set<uint64_t> tt) {
-  LogRecord l;
-  l.prev_lsn = p;
-  l.txn_id = txn;
-  l.type = LogType::kEndCheckpoint;
-  l.dirty_page_table = std::move(dpt);
-  l.transaction_table = std::move(tt);
   l.length = l.Size();
   return l;
 }
@@ -257,8 +241,8 @@ LogRecord LogRecord::AllocatePageLogRecord(uint64_t p, uint64_t txn,
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
+  l.pos = RowPosition(pid, -1);
   l.type = LogType::kSystemAllocPage;
-  l.allocated_page_id = pid;
   l.allocated_page_type = new_page_type;
   l.length = l.Size();
   return l;
@@ -269,10 +253,39 @@ LogRecord LogRecord::DestroyPageLogRecord(uint64_t p, uint64_t txn,
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
+  l.pos = RowPosition(pid, -1);
   l.type = LogType::kSystemDestroyPage;
-  l.destroy_page_id = pid;
   l.length = l.Size();
   return l;
+}
+
+LogRecord LogRecord::BeginCheckpointLogRecord() {
+  LogRecord l;
+  l.type = LogType::kBeginCheckpoint;
+  return l;
+}
+
+LogRecord LogRecord::EndCheckpointLogRecord(
+    const std::vector<std::pair<uint64_t, uint64_t>>& dpt,
+    const std::vector<CheckpointManager::ActiveTransactionEntry>& att) {
+  LogRecord l;
+  l.type = LogType::kEndCheckpoint;
+  l.dirty_page_table = dpt;
+  l.active_transaction_table = att;
+  return l;
+}
+
+void LogRecord::Clear() {
+  type = LogType::kUnknown;
+  pos = RowPosition();
+  prev_lsn = 0;
+  txn_id = 0;
+  undo_data = "";
+  redo_data = "";
+  dirty_page_table.clear();
+  active_transaction_table.clear();
+  allocated_page_type = PageType::kUnknown;
+  length = 0;
 }
 
 size_t LogRecord::Size() const {
@@ -281,8 +294,9 @@ size_t LogRecord::Size() const {
   switch (type) {
     case LogType::kUnknown:
       assert(!"Don't call Size() of unknown log");
-    case LogType::kBegin:
     case LogType::kBeginCheckpoint:
+      return sizeof(length) + sizeof(type);  // This is fixed size.
+    case LogType::kBegin:
       break;
     case LogType::kInsertRow:
       size += sizeof(pos) + sizeof(uint32_t) + redo_data.length();
@@ -295,17 +309,26 @@ size_t LogRecord::Size() const {
       size += sizeof(pos) + sizeof(uint32_t) + undo_data.length();
       break;
     case LogType::kEndCheckpoint:
-      size += sizeof(pos) + sizeof(uint32_t) +
-              dirty_page_table.size() * sizeof(uint64_t) +
-              transaction_table.size() * sizeof(uint64_t);
+      size += sizeof(pos) + sizeof(dirty_page_table.size()) +
+              dirty_page_table.size() * sizeof(std::pair<uint64_t, uint64_t>) +
+              sizeof(active_transaction_table.size()) +
+              active_transaction_table.size() *
+                  sizeof(CheckpointManager::ActiveTransactionEntry);
       break;
     case LogType::kCommit:
       break;
     case LogType::kSystemAllocPage:
-      size += sizeof(allocated_page_id) + sizeof(PageType);
+      size += sizeof(pos) + sizeof(PageType);
       break;
     case LogType::kSystemDestroyPage:
-      size += sizeof(destroy_page_id);
+      size += sizeof(pos);
+      break;
+    case LogType::kCompensateInsertRow:
+      size += sizeof(pos);
+      break;
+    case LogType::kCompensateUpdateRow:
+    case LogType::kCompensateDeleteRow:
+      size += sizeof(pos) + sizeof(uint32_t) + redo_data.size();
       break;
   }
   return size;
@@ -375,28 +398,42 @@ size_t LogRecord::Size() const {
         offset += sizeof(dpt);
       }
 
-      uint64_t tt_size = transaction_table.size();
+      uint64_t tt_size = active_transaction_table.size();
       memcpy(result.data() + offset, &tt_size, sizeof(tt_size));
       offset += sizeof(tt_size);
-      for (const auto& tt : transaction_table) {
-        memcpy(result.data() + offset, &tt, sizeof(tt));
-        offset += sizeof(tt);
+      for (const auto& tt : active_transaction_table) {
+        memcpy(result.data() + offset, &tt.txn_id, sizeof(tt.txn_id));
+        offset += sizeof(tt.txn_id);
+        memcpy(result.data() + offset, &tt.status, sizeof(tt.status));
+        offset += sizeof(tt.status);
+        memcpy(result.data() + offset, &tt.last_lsn, sizeof(tt.last_lsn));
+        offset += sizeof(tt.last_lsn);
       }
       break;
     }
     case LogType::kSystemAllocPage:
-      memcpy(result.data() + offset, &allocated_page_id,
-             sizeof(allocated_page_id));
-      offset += sizeof(allocated_page_id);
+      offset += pos.Serialize(result.data() + offset);
       memcpy(result.data() + offset, &allocated_page_type,
              sizeof(allocated_page_type));
       offset += sizeof(allocated_page_type);
       break;
     case LogType::kSystemDestroyPage:
-      memcpy(result.data() + offset, &destroy_page_id, sizeof(destroy_page_id));
-      offset += sizeof(allocated_page_id);
+      offset += pos.Serialize(result.data() + offset);
+      break;
+    case LogType::kCompensateInsertRow:
+      offset += pos.Serialize(result.data() + offset);
+      break;
+    case LogType::kCompensateUpdateRow:
+    case LogType::kCompensateDeleteRow:
+      offset += pos.Serialize(result.data() + offset);
+      uint32_t redo_size = redo_data.length();
+      memcpy(result.data() + offset, &redo_size, sizeof(redo_size));
+      offset += sizeof(redo_size);
+      memcpy(result.data() + offset, redo_data.data(), redo_data.size());
+      offset += redo_data.size();
       break;
   }
+  // assert(offset == Size());
   return result;
 }
 
@@ -405,9 +442,7 @@ bool LogRecord::operator==(const LogRecord& rhs) const {
          pos == rhs.pos && undo_data == rhs.undo_data &&
          redo_data == rhs.redo_data &&
          dirty_page_table == rhs.dirty_page_table &&
-         transaction_table == rhs.transaction_table &&
-         allocated_page_id == rhs.allocated_page_id &&
-         destroy_page_id == rhs.destroy_page_id && length == rhs.length;
+         active_transaction_table == rhs.active_transaction_table;
 }
 
 }  // namespace tinylamb

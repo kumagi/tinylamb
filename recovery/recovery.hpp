@@ -10,17 +10,20 @@ class LogRecord;
 class Page;
 class PageManager;
 class PagePool;
+class PageRef;
 class Transaction;
 class TransactionManager;
 
 class Recovery {
  public:
-  Recovery(std::string_view log_path, std::string_view db_path, PagePool* pp);
-  void StartFrom(size_t offset, TransactionManager* tm);
+  Recovery(std::string_view log_path, PagePool* pp);
+
+  void RecoverFrom(uint64_t checkpoint_lsn, TransactionManager* tm);
+
   bool ReadLog(uint64_t lsn, LogRecord* dst);
 
-  void LogRedo(uint64_t lsn, const LogRecord& log, TransactionManager* tm);
-  void LogUndo(uint64_t lsn, const LogRecord& log, TransactionManager* tm);
+  void LogUndoWithPage(uint64_t lsn, const LogRecord& log,
+                       TransactionManager* tm);
 
  private:
   void RefreshMap();

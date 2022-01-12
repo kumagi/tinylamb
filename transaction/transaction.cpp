@@ -10,17 +10,34 @@
 
 namespace tinylamb {
 
-Transaction::Transaction(uint64_t txn_id, TransactionManager* tm,
-                         LockManager* lm, PageManager* pm, Logger* l)
+std::ostream& operator<<(std::ostream& o, const TransactionStatus& t) {
+  switch (t) {
+    case TransactionStatus::kUnknown:
+      o << "Unknown";
+      break;
+    case TransactionStatus::kRunning:
+      o << "Running";
+      break;
+    case TransactionStatus::kCommitted:
+      o << "Committed";
+      break;
+    case TransactionStatus::kAborted:
+      o << "Aborted";
+      break;
+  }
+  return o;
+}
+
+Transaction::Transaction(uint64_t txn_id, TransactionManager* tm)
     : txn_id_(txn_id),
       status_(TransactionStatus::kRunning),
       transaction_manager_(tm) {}
 
-Transaction Transaction::SpawnSystemTransaction() {
-  return transaction_manager_->Begin();
+bool Transaction::PreCommit() {
+  bool result = transaction_manager_->PreCommit(*this);
+  status_ = TransactionStatus::kCommitted;
+  return result;
 }
-
-bool Transaction::PreCommit() { return transaction_manager_->PreCommit(*this); }
 
 void Transaction::Abort() { transaction_manager_->Abort(*this); }
 
@@ -56,79 +73,48 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
 
 uint64_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
   assert(!IsFinished());
-  LogRecord lr = LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pos, redo);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
-  wrote_logs_.push_back(prev_lsn_);
-  return prev_lsn_;
+  LogRecord lr =
+      LogRecord::InsertingLogRecord(lsns_.back(), txn_id_, pos, redo);
+  lsns_.push_back(transaction_manager_->AddLog(lr));
+  return lsns_.back();
 }
 
 uint64_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
                                 std::string_view redo) {
   assert(!IsFinished());
   LogRecord lr =
-      LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pos, redo, undo);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
-  wrote_logs_.push_back(prev_lsn_);
-  return prev_lsn_;
+      LogRecord::UpdatingLogRecord(lsns_.back(), txn_id_, pos, redo, undo);
+  lsns_.push_back(transaction_manager_->AddLog(lr));
+  return lsns_.back();
 }
 
 uint64_t Transaction::DeleteLog(const RowPosition& pos, std::string_view undo) {
   assert(!IsFinished());
-  LogRecord lr = LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pos, undo);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
-  wrote_logs_.push_back(prev_lsn_);
-  return prev_lsn_;
-}
-
-uint64_t Transaction::CompensateInsertLog(const RowPosition& pos,
-                                          uint64_t undo_next_lsn) {
-  assert(!IsFinished());
-  LogRecord lr = LogRecord::CompensatingInsertLogRecord(
-      prev_lsn_, undo_next_lsn, txn_id_, pos);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
-  return prev_lsn_;
-}
-
-uint64_t Transaction::CompensateUpdateLog(const RowPosition& pos,
-                                          uint64_t undo_next_lsn,
-                                          std::string_view redo) {
-  assert(!IsFinished());
-  LogRecord lr = LogRecord::CompensatingUpdateLogRecord(
-      prev_lsn_, undo_next_lsn, txn_id_, pos, redo);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
-  return prev_lsn_;
-}
-
-uint64_t Transaction::CompensateDeleteLog(const RowPosition& pos,
-                                          uint64_t undo_next_lsn,
-                                          std::string_view redo) {
-  assert(!IsFinished());
-  LogRecord lr = LogRecord::CompensatingDeleteLogRecord(
-      prev_lsn_, undo_next_lsn, txn_id_, pos, redo);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
-  return prev_lsn_;
+  LogRecord lr = LogRecord::DeletingLogRecord(lsns_.back(), txn_id_, pos, undo);
+  lsns_.push_back(transaction_manager_->AddLog(lr));
+  return lsns_.back();
 }
 
 uint64_t Transaction::AllocatePageLog(uint64_t allocated_page_id,
                                       PageType new_page_type) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::AllocatePageLogRecord(
-      prev_lsn_, txn_id_, allocated_page_id, new_page_type);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
-  return prev_lsn_;
+      lsns_.back(), txn_id_, allocated_page_id, new_page_type);
+  lsns_.push_back(transaction_manager_->AddLog(lr));
+  return lsns_.back();
 }
 
 uint64_t Transaction::DestroyPageLog(uint64_t destroyed_page_id) {
   assert(!IsFinished());
   LogRecord lr =
-      LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
-  return prev_lsn_;
+      LogRecord::DestroyPageLogRecord(lsns_.back(), txn_id_, destroyed_page_id);
+  lsns_.push_back(transaction_manager_->AddLog(lr));
+  return lsns_.back();
 }
 
 // Using this function is discouraged to get performance of flush pipelining.
 void Transaction::CommitWait() const {
-  while (transaction_manager_->CommittedLSN() < prev_lsn_) {
+  while (transaction_manager_->CommittedLSN() < lsns_.back()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 }

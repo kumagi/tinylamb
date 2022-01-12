@@ -27,15 +27,13 @@ PageRef PageManager::GetPage(uint64_t page_id) {
 
 // Logically delete the page.
 void PageManager::DestroyPage(Transaction& system_txn, Page* target) {
-  GetMetaPage().GetMetaPage().DestroyPage(system_txn, target, pool_);
+  GetMetaPage()->DestroyPage(system_txn, target, pool_);
 }
 
 PageRef PageManager::AllocateNewPage(Transaction& system_txn,
                                      PageType new_page_type) {
-  PageRef page(GetMetaPage());
-  MetaPage& m = page.GetMetaPage();
-  PageRef new_page = m.AllocateNewPage(system_txn, pool_, new_page_type);
-  m.max_page_count = std::max(m.max_page_count, new_page->page_id);
+  PageRef new_page =
+      GetMetaPage()->AllocateNewPage(system_txn, pool_, new_page_type);
   return std::move(new_page);
 }
 

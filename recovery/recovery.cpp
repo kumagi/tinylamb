@@ -16,7 +16,7 @@ namespace tinylamb {
 
 namespace {
 
-bool is_page_manipulation(LogType type) {
+bool IsPageManipulation(LogType type) {
   switch (type) {
     case LogType::kUnknown:
       throw std::runtime_error("Invalid format log");
@@ -40,16 +40,162 @@ bool is_page_manipulation(LogType type) {
   return false;
 }
 
+void LogRedo(PageRef &target, uint64_t lsn, const LogRecord &log,
+             TransactionManager *tm) {
+  switch (log.type) {
+    case LogType::kUnknown:
+      assert(!"unknown log type must not be parsed");
+    case LogType::kBegin:
+      tm->Begin(log.txn_id, TransactionStatus::kRunning, 0);
+      break;
+    case LogType::kInsertRow: {
+      if (target->PageLSN() < lsn) {
+        target->InsertImpl(log.pos, log.redo_data);
+        target->SetPageLSN(lsn);
+      }
+      break;
+    }
+    case LogType::kUpdateRow: {
+      if (target->PageLSN() < lsn) {
+        target->UpdateImpl(log.pos, log.redo_data);
+        target->SetPageLSN(lsn);
+      }
+      break;
+    }
+    case LogType::kDeleteRow: {
+      if (target->PageLSN() < lsn) {
+        target->DeleteImpl(log.pos);
+        target->SetPageLSN(lsn);
+      }
+      break;
+    }
+    case LogType::kCommit:
+      tm->active_transactions_.erase(log.txn_id);
+      break;
+    case LogType::kSystemAllocPage: {
+      if (target->PageLSN() < lsn || !target->IsValid()) {
+        target->PageInit(log.pos.page_id, log.allocated_page_type);
+      }
+      break;
+    }
+    case LogType::kSystemDestroyPage: {
+      throw std::runtime_error("not implemented yet");
+    }
+    case LogType::kBeginCheckpoint:
+    case LogType::kEndCheckpoint:
+    case LogType::kCompensateInsertRow: {
+      if (target->PageLSN() < lsn) {
+        target->DeleteImpl(log.pos);
+        target->SetPageLSN(lsn);
+      }
+      break;
+    }
+    case LogType::kCompensateUpdateRow: {
+      if (target->PageLSN() < lsn) {
+        target->UpdateImpl(log.pos, log.redo_data);
+        target->SetPageLSN(lsn);
+      }
+      break;
+    }
+    case LogType::kCompensateDeleteRow: {
+      if (target->PageLSN() < lsn) {
+        target->InsertImpl(log.pos, log.redo_data);
+        target->SetPageLSN(lsn);
+      }
+      break;
+    }
+  }
+}
+
+void LogUndo(PageRef &target, uint64_t lsn, const LogRecord &log,
+             TransactionManager *tm) {
+  switch (log.type) {
+    case LogType::kUnknown:
+      LOG(FATAL) << "Unknown type log";
+      throw std::runtime_error("broken log");
+    case LogType::kBegin:
+      break;
+    case LogType::kInsertRow: {
+      tm->CompensateInsertLog(log.txn_id, log.pos);
+      target->DeleteImpl(log.pos);
+      target->SetPageLSN(lsn);
+      break;
+    }
+    case LogType::kUpdateRow: {
+      tm->CompensateUpdateLog(log.txn_id, log.pos, log.undo_data);
+      target->UpdateImpl(log.pos, log.undo_data);
+      target->SetPageLSN(lsn);
+      break;
+    }
+    case LogType::kDeleteRow: {
+      tm->CompensateDeleteLog(log.txn_id, log.pos, log.undo_data);
+      target->InsertImpl(log.pos, log.undo_data);
+      target->SetPageLSN(lsn);
+      break;
+    }
+    case LogType::kCommit:
+      break;
+    case LogType::kBeginCheckpoint:
+    case LogType::kEndCheckpoint:
+      LOG(ERROR) << "Cannot undo a checkpoint log record";
+      break;
+    case LogType::kSystemAllocPage:
+      break;
+    case LogType::kSystemDestroyPage: {
+      target->PageInit(log.pos.page_id, log.allocated_page_type);
+      break;
+    }
+    case LogType::kCompensateInsertRow:
+    case LogType::kCompensateUpdateRow:
+    case LogType::kCompensateDeleteRow:
+      LOG(ERROR) << "Cannot undo a compensate log record";
+      break;
+  }
+}
+
+// Precondition: the page is locked by this thread.
+void PageReplay(
+    PageRef &&target, const std::vector<std::pair<uint64_t, LogRecord>> &logs,
+    const std::unordered_map<uint64_t, std::pair<TransactionStatus, uint64_t>>
+        &active_transaction_table,
+    TransactionManager *tm) {
+  for (const auto &it : logs) {
+    LOG(ERROR) << it.first << ": " << it.second;
+  }
+  // Redo & Undo specific page.
+
+  // Redo phase.
+  for (const auto &lsn_log : logs) {
+    const uint64_t &lsn = lsn_log.first;
+    const LogRecord &log = lsn_log.second;
+    LOG(INFO) << "redo: " << log;
+    LogRedo(target, lsn, log, tm);
+  }
+
+  // Undo phase.
+  for (auto iter = logs.rbegin(); iter != logs.rend(); iter++) {
+    const uint64_t &lsn = iter->first;
+    const LogRecord &undo_log = iter->second;
+    const auto it = active_transaction_table.find(undo_log.txn_id);
+    if (it != active_transaction_table.end() &&
+        it->second.first != TransactionStatus::kCommitted) {
+      LogUndo(target, lsn, undo_log, tm);
+      LOG(INFO) << "undo: " << undo_log;
+    }
+  }
+
+  // Release page latch.
+  target.PageUnlock();
+}
+
 }  // namespace
 
-Recovery::Recovery(std::string_view log_path, std::string_view db_path,
-                   PagePool *pp)
+Recovery::Recovery(std::string_view log_path, PagePool *pp)
     : log_name_(log_path), log_data_(nullptr), pool_(pp) {
   RefreshMap();
 }
 
 void Recovery::RefreshMap() {
-  LOG(INFO) << "reading: " << log_name_;
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
   int fd = open(log_name_.c_str(), O_RDONLY, 0666);
   if (fd == -1) {
@@ -60,15 +206,117 @@ void Recovery::RefreshMap() {
       mmap(nullptr, filesize, PROT_READ, MAP_PRIVATE, fd, 0));
 }
 
-void Recovery::StartFrom(size_t offset, TransactionManager *tm) {
+void Recovery::RecoverFrom(uint64_t checkpoint_lsn, TransactionManager *tm) {
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
   RefreshMap();
 
+  // Analysis phase starts here.
+  std::unordered_map<uint64_t, uint64_t> dirty_page_table;
+  std::unordered_map<uint64_t, std::pair<TransactionStatus, uint64_t>>
+      active_transaction_table;
+  uint64_t redo_start_point = filesize;
+  {
+    size_t offset = checkpoint_lsn;
+    LogRecord log;
+    {
+      while (offset < filesize) {
+        bool success = LogRecord::ParseLogRecord(&log_data_[offset], &log);
+        if (!success) {
+          LOG(ERROR) << "Failed to parse log at offset: " << offset;
+          break;
+        }
+        LOG(TRACE) << "analyzing: " << offset << ": " << log;
+        switch (log.type) {
+          case LogType::kUnknown:
+            throw std::runtime_error("invalid log");
+          case LogType::kBegin:
+            active_transaction_table.emplace(
+                log.txn_id, std::make_pair(TransactionStatus::kRunning, 0));
+            break;
+          case LogType::kSystemAllocPage: {
+            const auto it = dirty_page_table.find(log.txn_id);
+            if (it == dirty_page_table.end()) {
+              dirty_page_table.emplace(log.pos.page_id, offset);
+            } else {
+              dirty_page_table[log.pos.page_id] =
+                  std::min(offset, it->second);
+            }
+            break;
+          }
+          case LogType::kSystemDestroyPage: {
+            const auto it = dirty_page_table.find(log.txn_id);
+            if (it == dirty_page_table.end()) {
+              dirty_page_table.emplace(log.pos.page_id, offset);
+            } else {
+              dirty_page_table[log.pos.page_id] =
+                  std::min(offset, it->second);
+            }
+            break;
+          }
+          case LogType::kInsertRow:
+          case LogType::kUpdateRow:
+          case LogType::kDeleteRow:
+          case LogType::kCompensateInsertRow:
+          case LogType::kCompensateUpdateRow:
+          case LogType::kCompensateDeleteRow: {
+            const auto it = dirty_page_table.find(log.txn_id);
+            if (it == dirty_page_table.end()) {
+              dirty_page_table.emplace(log.pos.page_id, offset);
+            } else {
+              dirty_page_table[log.pos.page_id] = std::min(offset, it->second);
+            }
+            break;
+          }
+          case LogType::kCommit:
+            active_transaction_table[log.txn_id] =
+                std::make_pair(TransactionStatus::kCommitted, offset);
+            break;
+          case LogType::kEndCheckpoint: {
+            for (const auto &dpt : log.dirty_page_table) {
+              const auto it = dirty_page_table.find(log.txn_id);
+              if (it == dirty_page_table.end()) {
+                dirty_page_table.emplace(dpt.first, dpt.second);
+              } else {
+                dirty_page_table[it->first] = std::min(dpt.second, it->second);
+              }
+            }
+            for (const auto &at : log.active_transaction_table) {
+              active_transaction_table.emplace(
+                  at.txn_id, std::make_pair(at.status, at.last_lsn));
+            }
+            break;
+          }
+          default:
+            break;
+        }
+        offset += log.Size();
+      }
+    }
+
+    // Take minimum LSN from the dirty page table.
+    for (const auto &d : dirty_page_table) {
+      redo_start_point = std::min(redo_start_point, d.second);
+    }
+  }
+
+  // Collect logs to redo.
   std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, LogRecord>>>
       page_logs;
-  std::unordered_set<uint64_t> finished_txn;
-  // Analysis phase starts here.
+  page_logs.reserve(dirty_page_table.size());
+
+  std::unordered_map<uint64_t, PageRef> pages;
   {
+    // Hold all dirty page's lock.
+    for (const auto &it : dirty_page_table) {
+      pages.emplace(it.first, pool_->GetPage(it.first, nullptr));
+      pool_->PageLock(it.first);
+      LOG(TRACE) << "page: " << it.first << " is dirty!";
+    }
+  }
+
+  // Now, other user transactions can start concurrently.
+  {
+    uint64_t offset = redo_start_point;
     LogRecord log;
     while (offset < filesize) {
       bool success = LogRecord::ParseLogRecord(&log_data_[offset], &log);
@@ -76,46 +324,24 @@ void Recovery::StartFrom(size_t offset, TransactionManager *tm) {
         LOG(ERROR) << "Failed to parse log at offset: " << offset;
         break;
       }
-      if (is_page_manipulation(log.type)) {
-        if (log.type == LogType::kSystemAllocPage) {
-          page_logs[log.allocated_page_id].emplace_back(offset, log);
-        } else if (log.type == LogType::kSystemDestroyPage) {
-          page_logs[log.destroy_page_id].emplace_back(offset, log);
-        } else {
-          page_logs[log.pos.page_id].emplace_back(offset, log);
-        }
+      if (IsPageManipulation(log.type)) {
+        page_logs[log.pos.page_id].emplace_back(offset, log);
       } else if (log.type == LogType::kCommit) {
-        finished_txn.insert(log.txn_id);
-        LOG(INFO) << "txn: " << log.txn_id << " is finished";
+        auto it = active_transaction_table.find(log.txn_id);
+        if (it != active_transaction_table.end()) {
+          it->second.first = TransactionStatus::kCommitted;
+        }
       }
       offset += log.Size();
-      LOG(INFO) << "analyzed " << offset << ": " << log;
-    }
-  }
-
-  std::unordered_map<uint64_t, size_t> log_offsets;
-  std::unordered_map<uint64_t, uint64_t> txn_lsn;
-
-  // Redo & Undo phase starts here.
-  for (const auto &page_log : page_logs) {
-    const uint64_t &page_id = page_log.first;
-    // Page redo phase.
-    for (const auto &lsn_log : page_log.second) {
-      const uint64_t &lsn = lsn_log.first;
-      const LogRecord &log = lsn_log.second;
-      LOG(INFO) << "redo: " << log;
-      LogRedo(lsn, log, tm);
     }
 
-    // Page undo phase.
-    for (auto iter = page_log.second.rbegin(); iter != page_log.second.rend();
-         iter++) {
-      const uint64_t &lsn = iter->first;
-      const LogRecord &log = iter->second;
-      if (finished_txn.find(log.txn_id) == finished_txn.end()) {
-        LOG(INFO) << "undo: " << log;
-        LogUndo(lsn, log, tm);
+    // Redo & Undo phase starts here.
+    for (const auto &page_log : page_logs) {
+      const uint64_t &page_id = page_log.first;
+      if (pages.find(page_id) == pages.end()) {
       }
+      PageReplay(std::move(pages.find(page_id)->second), page_log.second,
+                 active_transaction_table, tm);
     }
   }
 }
@@ -125,107 +351,12 @@ bool Recovery::ReadLog(uint64_t lsn, LogRecord *dst) {
   return LogRecord::ParseLogRecord(&log_data_[lsn], dst);
 }
 
-void Recovery::LogRedo(uint64_t lsn, const LogRecord &log,
-                       TransactionManager *tm) {
-  switch (log.type) {
-    case LogType::kUnknown:
-      assert(!"unknown log type must not be parsed");
-    case LogType::kBegin:
-      tm->active_transactions_.insert(log.txn_id);
-      break;
-    case LogType::kInsertRow: {
-      PageRef target = pool_->GetPage(log.pos.page_id, nullptr);
-      if (target->PageLSN() < lsn) {
-        target->InsertImpl(log.pos, log.redo_data);
-        target->SetPageLSN(lsn);
-      }
-      break;
-    }
-    case LogType::kUpdateRow: {
-      PageRef target = pool_->GetPage(log.pos.page_id, nullptr);
-      if (target->PageLSN() < lsn) {
-        target->UpdateImpl(log.pos, log.redo_data);
-        target->SetPageLSN(lsn);
-      }
-      break;
-    }
-    case LogType::kDeleteRow: {
-      PageRef target = pool_->GetPage(log.pos.page_id, nullptr);
-      if (target->PageLSN() < lsn) {
-        target->DeleteImpl(log.pos);
-        target->SetPageLSN(lsn);
-      }
-      break;
-    }
-    case LogType::kCommit:
-      tm->active_transactions_.erase(log.txn_id);
-      break;
-    case LogType::kBeginCheckpoint:
-      break;
-    case LogType::kEndCheckpoint:
-      break;
-    case LogType::kSystemAllocPage: {
-      bool cache_hit;
-      PageRef target = pool_->GetPage(log.allocated_page_id, &cache_hit);
-      if (target->PageLSN() < lsn || (!cache_hit && !target->IsValid())) {
-        target->PageInit(log.allocated_page_id, log.allocated_page_type);
-      }
-      break;
-    }
-    case LogType::kSystemDestroyPage:
-      break;
-  }
-}
-
-void Recovery::LogUndo(uint64_t lsn, const LogRecord &log,
-                       TransactionManager *tm) {
-  Transaction txn(log.txn_id, tm, tm->lock_manager_, tm->page_manager_,
-                  tm->logger_);
-  switch (log.type) {
-    case LogType::kUnknown:
-      LOG(FATAL) << "Unknown type log";
-      throw std::runtime_error("broken log");
-    case LogType::kBegin:
-      break;
-    case LogType::kInsertRow: {
-      PageRef target = pool_->GetPage(log.pos.page_id, nullptr);
-      txn.CompensateInsertLog(log.pos, lsn);
-      target->DeleteImpl(log.pos);
-      target->SetPageLSN(lsn);
-      break;
-    }
-    case LogType::kUpdateRow: {
-      PageRef target = pool_->GetPage(log.pos.page_id, nullptr);
-      txn.CompensateUpdateLog(log.pos, lsn, log.undo_data);
-      target->UpdateImpl(log.pos, log.undo_data);
-      target->SetPageLSN(lsn);
-      break;
-    }
-    case LogType::kDeleteRow: {
-      PageRef target = pool_->GetPage(log.pos.page_id, nullptr);
-      target->InsertImpl(log.pos, log.undo_data);
-      target->SetPageLSN(lsn);
-      break;
-    }
-    case LogType::kCommit:
-      tm->active_transactions_.erase(log.txn_id);
-      break;
-    case LogType::kBeginCheckpoint:
-    case LogType::kEndCheckpoint:
-      LOG(ERROR) << "Cannot undo a checkpoint log record";
-      break;
-    case LogType::kSystemAllocPage:
-      break;
-    case LogType::kSystemDestroyPage: {
-      PageRef target = pool_->GetPage(log.destroy_page_id, nullptr);
-      target->PageInit(log.destroy_page_id, log.allocated_page_type);
-      break;
-    }
-    case LogType::kCompensateInsertRow:
-    case LogType::kCompensateUpdateRow:
-    case LogType::kCompensateDeleteRow:
-      LOG(ERROR) << "Cannot undo a compensate log record";
-      break;
+void Recovery::LogUndoWithPage(uint64_t lsn, const LogRecord &log,
+                               TransactionManager *tm) {
+  bool cache_hit;
+  if (IsPageManipulation(log.type)) {
+    PageRef target = pool_->GetPage(log.pos.page_id, &cache_hit);
+    LogUndo(target, lsn, log, tm);
   }
 }
 

@@ -26,6 +26,7 @@ PageRef MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
   }();
   ret->PageInit(new_page_id, new_page_type);
   txn.AllocatePageLog(new_page_id, new_page_type);
+
   return ret;
 }
 

@@ -32,6 +32,8 @@ PageRef PagePool::GetPage(uint64_t page_id, bool* cache_hit) {
     if (cache_hit != nullptr) {
       *cache_hit = true;
     }
+
+    std::scoped_lock page_lock(*entry->second->page_latch);
     return {this, entry->second->page.get()};
   } else {
     if (pool_lru_.size() == capacity_) {
@@ -44,6 +46,19 @@ PageRef PagePool::GetPage(uint64_t page_id, bool* cache_hit) {
   }
 }
 
+void PagePool::LostAllPageForTest() {
+  std::scoped_lock latch(pool_latch);
+  pool_.clear();
+  pool_lru_.clear();
+}
+
+void PagePool::FlushPageForTest(uint64_t page_id) {
+  std::scoped_lock latch(pool_latch);
+  const auto it = pool_.find(page_id);
+  assert(it != pool_.end());
+  WriteBack(it->second->page.get());
+}
+
 bool PagePool::Unpin(uint64_t page_id) {
   std::scoped_lock latch(pool_latch);
   auto page_entry = pool_.find(page_id);
@@ -52,6 +67,23 @@ bool PagePool::Unpin(uint64_t page_id) {
     return true;
   }
   return false;
+}
+
+void PagePool::PageLock(uint64_t page_id) {
+  std::scoped_lock latch(pool_latch);
+  auto entry = pool_.find(page_id);
+  if (entry == pool_.end()) {
+    AllocNewPage(page_id);
+    entry = pool_.find(page_id);
+  }
+  entry->second->page_latch->lock();
+}
+
+void PagePool::PageUnlock(uint64_t page_id) {
+  std::scoped_lock latch(pool_latch);
+  auto entry = pool_.find(page_id);
+  assert(entry != pool_.end());
+  entry->second->page_latch->unlock();
 }
 
 bool PagePool::EvictPage(LruType::iterator target) {
@@ -66,7 +98,9 @@ bool PagePool::EvictPage(LruType::iterator target) {
   return true;
 }
 
+// Precondition: pool_latch is locked.
 bool PagePool::EvictOnePage() {
+  assert(!pool_latch.try_lock());
   auto target = pool_lru_.begin();
   while (target != pool_lru_.end() && !EvictPage(target)) {
     target++;
@@ -74,15 +108,15 @@ bool PagePool::EvictOnePage() {
   return target != pool_lru_.end();
 }
 
+// Precondition: pool_latch is locked.
 PageRef PagePool::AllocNewPage(size_t pid) {
+  assert(!pool_latch.try_lock());
   std::unique_ptr<Page> new_page(new Page(pid, PageType::kMetaPage));
   ReadFrom(new_page.get(), pid);
-  Entry new_entry{};
-  new_entry.pin_count++;
-  new_entry.page = std::move(new_page);
+  Entry new_entry{1, std::move(new_page), std::make_unique<std::mutex>()};
   pool_lru_.push_back(std::move(new_entry));
   pool_.emplace(pid, std::prev(pool_lru_.end()));
-  return PageRef(this, pool_lru_.back().page.get());
+  return {this, pool_lru_.back().page.get()};
 }
 
 void PagePool::Touch(LruType::iterator it) {
@@ -113,7 +147,7 @@ void ZeroFillUntil(std::fstream& of, size_t expected) {
   of.seekp(0, std::ios_base::end);
   const std::ofstream::pos_type finish = of.tellp();
   const size_t needs = expected - (finish - start);
-  LOG(TRACE) << "write " << needs << " bytes";
+  assert(needs < kPageSize * 10);
   for (size_t i = 0; i < needs; ++i) {
     of.write("\0", 1);
   }
@@ -143,6 +177,9 @@ void PagePool::ReadFrom(Page* target, uint64_t pid) {
     target->PageInit(pid, PageType::kFreePage);
     src_.clear();
   }
+
+  // RecLSN = MAX means a clean page.
+  target->recovery_lsn = std::numeric_limits<uint64_t>::max();
 }
 
 }  // namespace tinylamb

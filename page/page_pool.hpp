@@ -1,5 +1,5 @@
-#ifndef TINYLAMB_PAGEPOOL_HPP
-#define TINYLAMB_PAGEPOOL_HPP
+#ifndef TINYLAMB_PAGE_POOL_HPP
+#define TINYLAMB_PAGE_POOL_HPP
 
 #include <cassert>
 #include <fstream>
@@ -14,7 +14,9 @@
 
 namespace tinylamb {
 
+class CheckpointManager;
 class PageRef;
+class Recovery;
 
 class PagePool {
  private:
@@ -24,6 +26,9 @@ class PagePool {
 
     // A pointer to physical page in memory.
     std::unique_ptr<Page> page = nullptr;
+
+    // An exclusive latch for this page.
+    std::unique_ptr<std::mutex> page_latch;
 
     Entry(const Entry&) = delete;
     Entry& operator=(const Entry&) = delete;
@@ -43,10 +48,20 @@ class PagePool {
     return pool_lru_.size();
   }
 
+  // Flush all page buffer without write back.
+  void LostAllPageForTest();
+
+  void FlushPageForTest(uint64_t page_id);
+
  private:
   friend class PageRef;
+  friend class CheckpointManager;
+  friend class Recovery;
 
   bool Unpin(size_t page_id);
+
+  void PageLock(uint64_t page_id);
+  void PageUnlock(uint64_t page_id);
 
   bool EvictPage(LruType::iterator target);
 
@@ -81,4 +96,4 @@ class PagePool {
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_PAGEPOOL_HPP
+#endif  // TINYLAMB_PAGE_POOL_HPP

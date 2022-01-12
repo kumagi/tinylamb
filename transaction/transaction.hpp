@@ -16,6 +16,7 @@ namespace tinylamb {
 
 class TransactionManager;
 
+class CheckpointManager;
 class PageManager;
 class Logger;
 class LockManager;
@@ -26,22 +27,23 @@ enum class TransactionStatus : uint_fast8_t {
   kUnknown,
   kRunning,
   kCommitted,
-  kAborted
+  kAborted,
 };
+
+std::ostream& operator<<(std::ostream& o, const TransactionStatus& t);
 
 class Transaction {
   friend class TransactionManager;
 
  public:
-  Transaction(uint64_t txn_id, TransactionManager* tm, LockManager* lm,
-              PageManager* pm, Logger* l);
-  Transaction SpawnSystemTransaction();
+  Transaction(uint64_t txn_id, TransactionManager* tm);
+
   void SetStatus(TransactionStatus status);
   bool IsFinished() const {
     return status_ == TransactionStatus::kCommitted ||
            status_ == TransactionStatus::kAborted;
   }
-  uint64_t PrevLSN() const { return prev_lsn_; }
+  uint64_t PrevLSN() const { return lsns_.back(); }
 
   bool AddReadSet(const RowPosition& rp);
   bool AddWriteSet(const RowPosition& rp);
@@ -54,39 +56,25 @@ class Transaction {
   uint64_t UpdateLog(const RowPosition& pos, std::string_view undo,
                      std::string_view redo);
   uint64_t DeleteLog(const RowPosition& pos, std::string_view undo);
-  uint64_t CompensateInsertLog(const RowPosition& pos, uint64_t undo_next_Lsn);
-  uint64_t CompensateUpdateLog(const RowPosition& pos, uint64_t undo_next_lsn,
-                               std::string_view redo);
-  uint64_t CompensateDeleteLog(const RowPosition& pos, uint64_t undo_next_lsn,
-                               std::string_view redo);
 
   uint64_t AllocatePageLog(uint64_t page_id, PageType new_page_type);
 
   uint64_t DestroyPageLog(uint64_t page_id);
+
+  // Prepared mainly for testing.
   // Using this function is discouraged to get performance of flush pipelining.
   void CommitWait() const;
 
  private:
   friend class TransactionManager;
+  friend class CheckpointManager;
 
  private:
   const uint64_t txn_id_;
 
-  enum class WriteType {
-    kInsert,
-    kUpdate,
-    kDelete,
-  };
-  struct WriteEntry {
-    WriteType entry_type;
-    std::string payload;
-    uint64_t lsn;
-  };
-
-  uint64_t prev_lsn_ = 0;
   std::unordered_set<RowPosition> read_set_{};
   std::unordered_set<RowPosition> write_set_{};
-  std::vector<uint64_t> wrote_logs_;
+  std::vector<uint64_t> lsns_;
   TransactionStatus status_ = TransactionStatus::kUnknown;
 
   // Not owned by this class.

@@ -13,6 +13,7 @@ static_assert(kPageSize <= std::numeric_limits<uint16_t>::max());
 static constexpr size_t kPageHeaderSize =
     sizeof(uint64_t) +  // page_id
     sizeof(uint64_t) +  // page_lsn
+    sizeof(uint64_t) +  // rec_lsn
     sizeof(uint64_t) +  // page_type
     sizeof(uint64_t);  // checksum
 static constexpr size_t kPageBodySize = kPageSize - kPageHeaderSize;

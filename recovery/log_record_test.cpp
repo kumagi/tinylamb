@@ -40,8 +40,10 @@ TEST_F(LogRecordTest, check) {
       LogRecord::DeletingLogRecord(13, 4, RowPosition(4, 5), "undo_log");
   SerializeDeserializeCheck(delete_log);
 
-  LogRecord checkpoint_log =
-      LogRecord::CheckpointLogRecord(14, 5, {1, 2, 3}, {4, 5, 6});
+  LogRecord checkpoint_log = LogRecord::EndCheckpointLogRecord(
+      {{1, 2}, {3, 4}, {5, 6}}, {{4LLU, TransactionStatus::kRunning, 5LLU},
+                                 {5, TransactionStatus::kCommitted, 6},
+                                 {6, TransactionStatus::kAborted, 7}});
   SerializeDeserializeCheck(checkpoint_log);
 
   LogRecord allocate_log =
@@ -50,6 +52,14 @@ TEST_F(LogRecordTest, check) {
 
   LogRecord destroy_log = LogRecord::DestroyPageLogRecord(16, 8, 21);
   SerializeDeserializeCheck(destroy_log);
+
+  // Compensation records.
+  SerializeDeserializeCheck(
+      LogRecord::CompensatingInsertLogRecord(12, {123, 345}));
+  SerializeDeserializeCheck(
+      LogRecord::CompensatingUpdateLogRecord(12, {123, 345}, "hello"));
+  SerializeDeserializeCheck(
+      LogRecord::CompensatingDeleteLogRecord(12, {123, 345}, "deleted"));
 }
 
 }  // namespace tinylamb

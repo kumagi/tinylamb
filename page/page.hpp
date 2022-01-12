@@ -23,7 +23,11 @@ class Page {
   [[nodiscard]] uint64_t PageId() const { return page_id; }
   [[nodiscard]] PageType Type() const { return type; }
   [[nodiscard]] uint64_t PageLSN() const { return page_lsn; }
+  [[nodiscard]] uint64_t RecoveryLSN() const { return recovery_lsn; }
   void SetPageLSN(uint64_t lsn) { page_lsn = lsn; }
+  void SetRecLSN(uint64_t lsn) {
+    recovery_lsn = std::min(lsn, recovery_lsn);
+  }
 
   // Meta page.
   PageRef AllocateNewPage(Transaction& txn, PagePool& pool,
@@ -54,7 +58,12 @@ class Page {
   void operator delete(void* page) noexcept;
 
   uint64_t page_id = 0;
+
+  // An LSN of the latest log which modified this page.
   uint64_t page_lsn = 0;
+
+  // An LSN of manipulation log which first make this page dirty.
+  uint64_t recovery_lsn = 0;
   enum PageType type = PageType::kUnknown;
   mutable uint64_t checksum = 0;
   union PageBody {

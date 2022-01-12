@@ -34,8 +34,7 @@ class RowPageTest : public ::testing::Test {
     p_ = std::make_unique<PageManager>(kDBFileName, 10);
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
-                                               nullptr);
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), nullptr);
   }
 
   void TearDown() override {
@@ -43,16 +42,7 @@ class RowPageTest : public ::testing::Test {
     std::remove(kLogName);
   }
 
-  void WaitForCommit(uint64_t target_lsn, size_t timeout_ms = 1000) {
-    size_t counter = 0;
-    while (l_->CommittedLSN() != target_lsn && counter < timeout_ms) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      ++counter;
-    }
-    EXPECT_LT(counter, timeout_ms);
-  }
-
-  bool InsertRow(std::string_view str) {
+  bool InsertRow(std::string_view str, bool commit = true) {
     auto txn = tm_->Begin();
     Row r;
     r.data = str;
@@ -68,12 +58,16 @@ class RowPageTest : public ::testing::Test {
       EXPECT_EQ(rp.FreeSizeForTest(),
                 before_size - r.data.size() - sizeof(RowPage::RowPointer));
     }
-    EXPECT_TRUE(txn.PreCommit());
+    if (commit) {
+      EXPECT_TRUE(txn.PreCommit());
+    } else {
+      txn.Abort();
+    }
     txn.CommitWait();
     return success;
   }
 
-  void UpdateRow(int slot, std::string_view str) {
+  void UpdateRow(int slot, std::string_view str, bool commit = true) {
     auto txn = tm_->Begin();
     Row r;
     r.data = str;
@@ -82,18 +76,26 @@ class RowPageTest : public ::testing::Test {
 
     RowPosition pos(page_id_, slot);
     ASSERT_TRUE(page->Update(txn, pos, r));
-    ASSERT_TRUE(txn.PreCommit());
+    if (commit) {
+      ASSERT_TRUE(txn.PreCommit());
+    } else {
+      txn.Abort();
+    }
     txn.CommitWait();
   }
 
-  void DeleteRow(int slot) {
+  void DeleteRow(int slot, bool commit = true) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(page_id_);
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
     RowPosition pos(page_id_, slot);
     ASSERT_TRUE(page->Delete(txn, pos));
-    ASSERT_TRUE(txn.PreCommit());
+    if (commit) {
+      ASSERT_TRUE(txn.PreCommit());
+    } else {
+      txn.Abort();
+    }
     txn.CommitWait();
   }
 
@@ -125,7 +127,7 @@ class RowPageTest : public ::testing::Test {
   std::unique_ptr<PageManager> p_;
   std::unique_ptr<Logger> l_;
   std::unique_ptr<TransactionManager> tm_;
-  int page_id_ = 0;
+  uint64_t page_id_ = 0;
 };
 
 }  // namespace tinylamb

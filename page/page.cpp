@@ -24,6 +24,7 @@ void Page::PageInit(uint64_t pid, PageType page_type) {
   page_id = pid;
   SetPageLSN(0);
   type = page_type;
+  recovery_lsn = std::numeric_limits<uint64_t>::max();
   switch (type) {
     case PageType::kUnknown:
       throw std::runtime_error("unknown type won't expect to be PageInit");
@@ -42,20 +43,22 @@ void Page::PageInit(uint64_t pid, PageType page_type) {
 // Meta page functions.
 PageRef Page::AllocateNewPage(Transaction& txn, PagePool& pool,
                               PageType new_page_type) {
-  ASSERT_PAGE_TYPE(PageType::kMetaPage);
+  ASSERT_PAGE_TYPE(PageType::kMetaPage)
   PageRef ret = body.meta_page.AllocateNewPage(txn, pool, new_page_type);
   SetPageLSN(txn.PrevLSN());
+  SetRecLSN(txn.PrevLSN());
   return std::move(ret);
 }
 
 void Page::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
-  ASSERT_PAGE_TYPE(PageType::kMetaPage);
+  ASSERT_PAGE_TYPE(PageType::kMetaPage)
   body.meta_page.DestroyPage(txn, target, pool);
   SetPageLSN(txn.PrevLSN());
+  SetRecLSN(txn.PrevLSN());
 }
 
 bool Page::Read(Transaction& txn, const RowPosition& pos, Row& dst) {
-  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  ASSERT_PAGE_TYPE(PageType::kRowPage)
   std::string_view payload;
   bool result = body.row_page.Read(PageId(), txn, pos, &payload);
   if (result) {
@@ -65,48 +68,54 @@ bool Page::Read(Transaction& txn, const RowPosition& pos, Row& dst) {
 }
 
 bool Page::Insert(Transaction& txn, const Row& record, RowPosition& dst) {
-  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  ASSERT_PAGE_TYPE(PageType::kRowPage)
   bool result = body.row_page.Insert(PageId(), txn, record, dst);
   SetPageLSN(txn.PrevLSN());
+  SetRecLSN(txn.PrevLSN());
   return result;
 }
 
 bool Page::Update(Transaction& txn, const RowPosition& pos, const Row& row) {
-  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  ASSERT_PAGE_TYPE(PageType::kRowPage)
   bool result = body.row_page.Update(PageId(), txn, pos, row);
   SetPageLSN(txn.PrevLSN());
+  SetRecLSN(txn.PrevLSN());
   return result;
 }
 
 bool Page::Delete(Transaction& txn, const RowPosition& pos) {
-  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  ASSERT_PAGE_TYPE(PageType::kRowPage)
   bool result = body.row_page.Delete(PageId(), txn, pos);
   SetPageLSN(txn.PrevLSN());
+  SetRecLSN(txn.PrevLSN());
   return result;
 }
 
 size_t Page::RowCount() const {
-  ASSERT_PAGE_TYPE(PageType::kRowPage);
+  ASSERT_PAGE_TYPE(PageType::kRowPage)
   return body.row_page.RowCount();
 }
 
 void Page::SetChecksum() const { checksum = std::hash<Page>()(*this); }
 
 void Page::InsertImpl(const RowPosition& pos, std::string_view redo) {
+  ASSERT_PAGE_TYPE(PageType::kRowPage)
   body.row_page.InsertRow(redo);
 }
 
 void Page::UpdateImpl(const RowPosition& pos, std::string_view redo) {
+  ASSERT_PAGE_TYPE(PageType::kRowPage)
   body.row_page.UpdateRow(pos.slot, redo);
 }
 
 void Page::DeleteImpl(const RowPosition& pos) {
+  ASSERT_PAGE_TYPE(PageType::kRowPage)
   body.row_page.DeleteRow(pos.slot);
 }
 
 bool Page::IsValid() const { return checksum == std::hash<Page>()(*this); }
 
-void* Page::operator new(size_t page_id) {
+void* Page::operator new(size_t) {
   void* ret = new char[kPageSize];
   memset(ret, 0, kPageSize);
   return ret;

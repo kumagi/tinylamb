@@ -17,7 +17,7 @@ struct LogRecord;
 
 class Logger {
  public:
-  Logger(std::string_view filename, size_t buffer_size = 1024 * 1024,
+  explicit Logger(std::string_view filename, size_t buffer_size = 1024 * 1024,
          size_t every_ms = 20);
 
   ~Logger();
@@ -35,7 +35,6 @@ class Logger {
 
  private:
   mutable std::mutex latch_;
-  std::atomic<uint64_t> next_lsn_ = 1;
   std::string buffer_;
   std::string filename_;
   int dst_ = -1;
