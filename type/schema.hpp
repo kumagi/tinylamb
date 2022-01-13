@@ -76,7 +76,7 @@ class Schema {
   // Physical data of the schema data, it may point owned_data.
   std::string_view data = {};
 
-  // Vector offg offset for each elements of this schema.
+  // Vector of offsets for each element of this schema.
   std::vector<uint16_t> offsets = {};
 };
 

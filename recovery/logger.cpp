@@ -4,11 +4,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <atomic>
-#include <cassert>
 #include <chrono>
 #include <cstring>
-#include <iostream>
 #include <mutex>
 
 #include "log_record.hpp"

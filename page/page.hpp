@@ -33,7 +33,7 @@ class Page {
   void DestroyPage(Transaction& txn, Page* target, PagePool& pool);
 
   // Row page.
-  bool Read(Transaction& txn, const RowPosition& pos, Row& dst);
+  bool Read(Transaction& txn, const RowPosition& pos, Row& dst) const;
 
   bool Insert(Transaction& txn, const Row& record, RowPosition& dst);
 

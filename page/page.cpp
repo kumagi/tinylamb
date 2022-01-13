@@ -57,7 +57,7 @@ void Page::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
   SetRecLSN(txn.PrevLSN());
 }
 
-bool Page::Read(Transaction& txn, const RowPosition& pos, Row& dst) {
+bool Page::Read(Transaction& txn, const RowPosition& pos, Row& dst) const {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
   std::string_view payload;
   bool result = body.row_page.Read(PageId(), txn, pos, &payload);
