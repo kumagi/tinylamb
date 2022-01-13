@@ -1,7 +1,6 @@
 #include "type/column.hpp"
 
 #include <iostream>
-#include <memory>
 
 namespace tinylamb {
 

@@ -42,7 +42,7 @@ class RowPage {
   }
 
   bool Read(page_id_t page_id, Transaction& txn, const RowPosition& pos,
-            std::string_view* dst);
+            std::string_view* dst) const;
 
   bool Insert(page_id_t page_id, Transaction& txn, const Row& record,
               RowPosition& dst);
@@ -72,7 +72,8 @@ class RowPage {
   friend class std::hash<RowPage>;
 
   [[nodiscard]] std::string_view GetRow(uint16_t slot) const {
-    return std::string_view(Payload() + data_[slot].offset, data_[slot].size);
+    return {Payload() + data_[slot].offset,
+            static_cast<size_t>(data_[slot].size)};
   }
 
   uint16_t InsertRow(std::string_view new_row);
@@ -87,9 +88,6 @@ class RowPage {
   uint16_t free_ptr_ = kPageSize;
   uint16_t free_size_ = kPageSize - sizeof(RowPage);
   RowPointer data_[0];
-  constexpr static size_t kBodySize =
-      kPageBodySize - sizeof(prev_page_id_) - sizeof(next_page_id_) -
-      sizeof(row_count_) - sizeof(free_ptr_) - sizeof(free_size_);
 };
 
 static_assert(std::is_trivially_destructible<RowPage>::value == true,

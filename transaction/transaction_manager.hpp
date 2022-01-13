@@ -50,12 +50,12 @@ class TransactionManager {
   lsn_t AddLog(const LogRecord& lr);
   lsn_t CommittedLSN() const;
 
-  std::unordered_map<txn_id_t, Transaction*> active_transactions_;
 
  private:
   friend class Recovery;
   friend class CheckpointManager;
 
+  std::unordered_map<txn_id_t, Transaction*> active_transactions_;
   std::atomic<txn_id_t> next_txn_id_ = 1;
   LockManager* const lock_manager_;
   Logger* const logger_;

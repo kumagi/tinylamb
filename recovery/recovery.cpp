@@ -40,13 +40,11 @@ bool IsPageManipulation(LogType type) {
   return false;
 }
 
-void LogRedo(PageRef &target, lsn_t lsn, const LogRecord &log,
-             TransactionManager *tm) {
+void LogRedo(PageRef &target, lsn_t lsn, const LogRecord &log) {
   switch (log.type) {
     case LogType::kUnknown:
       assert(!"unknown log type must not be parsed");
     case LogType::kBegin:
-      tm->Begin(log.txn_id, TransactionStatus::kRunning, 0);
       break;
     case LogType::kInsertRow: {
       if (target->PageLSN() < lsn) {
@@ -70,7 +68,6 @@ void LogRedo(PageRef &target, lsn_t lsn, const LogRecord &log,
       break;
     }
     case LogType::kCommit:
-      tm->active_transactions_.erase(log.txn_id);
       break;
     case LogType::kSystemAllocPage: {
       if (target->PageLSN() < lsn || !target->IsValid()) {
@@ -134,22 +131,19 @@ void LogUndo(PageRef &target, lsn_t lsn, const LogRecord &log,
       break;
     }
     case LogType::kCommit:
-      break;
     case LogType::kBeginCheckpoint:
     case LogType::kEndCheckpoint:
-      LOG(ERROR) << "Cannot undo a checkpoint log record";
+    case LogType::kCompensateInsertRow:
+    case LogType::kCompensateUpdateRow:
+    case LogType::kCompensateDeleteRow:
       break;
     case LogType::kSystemAllocPage:
+      LOG(ERROR) << "Redoing alloc is not implemented yet";
       break;
     case LogType::kSystemDestroyPage: {
       target->PageInit(log.pos.page_id, log.allocated_page_type);
       break;
     }
-    case LogType::kCompensateInsertRow:
-    case LogType::kCompensateUpdateRow:
-    case LogType::kCompensateDeleteRow:
-      LOG(ERROR) << "Cannot undo a compensate log record";
-      break;
   }
 }
 
@@ -167,7 +161,7 @@ void PageReplay(PageRef &&target,
     if (target->PageLSN() < lsn) {
       assert(log.pos.page_id == target->PageId());
       LOG(INFO) << "redo: " << log;
-      LogRedo(target, lsn, log, tm);
+      LogRedo(target, lsn, log);
     }
   }
 

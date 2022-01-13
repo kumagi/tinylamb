@@ -6,7 +6,7 @@
 namespace tinylamb {
 
 bool RowPage::Read(page_id_t page_id, Transaction& txn, const RowPosition& pos,
-                   std::string_view* dst) {
+                   std::string_view* dst) const {
   if (!txn.AddReadSet(pos) ||    // Failed by read conflict.
       pos.page_id != page_id ||  // Invalid page ID specified.
       row_count_ <= pos.slot) {  // Specified slot is out of array.

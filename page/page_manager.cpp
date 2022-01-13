@@ -20,7 +20,7 @@ PageRef PageManager::GetPage(uint64_t page_id) {
   if (!cache_hit && !ref->IsValid()) {
     // Found a broken page.
     LOG(ERROR) << page_id << " is broken";
-    return PageRef(nullptr, nullptr);
+    return {nullptr, nullptr};
   }
   return ref;
 }

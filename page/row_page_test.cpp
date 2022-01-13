@@ -3,11 +3,9 @@
 #include <string>
 
 #include "gtest/gtest.h"
+#include "page/row_page_test.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
-#include "transaction/transaction_manager.hpp"
-
-#include "page/row_page_test.hpp"
 
 namespace tinylamb {
 
@@ -18,9 +16,7 @@ TEST(ConstructTest, constrct) {
   ASSERT_EQ(row->FreeSizeForTest(), kPageBodySize - sizeof(RowPage));
 }
 
-TEST_F(RowPageTest, Insert) {
-  InsertRow("hello");
-}
+TEST_F(RowPageTest, Insert) { InsertRow("hello"); }
 
 TEST_F(RowPageTest, InsertMany) {
   constexpr int kInserts = 100;

@@ -11,7 +11,7 @@
 #include "type/row.hpp"
 
 #define ASSERT_PAGE_TYPE(expected_type)            \
-  if (type != expected_type) {                     \
+  if (type != (expected_type)) {                     \
     throw std::runtime_error("Invalid page type"); \
   }
 

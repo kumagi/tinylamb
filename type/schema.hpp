@@ -46,7 +46,7 @@ class Schema {
   [[nodiscard]] size_t FixedRowSize() const;
 
   [[nodiscard]] std::string_view Name() const {
-    return std::string_view(&data[9], NameLength());
+    return {&data[9], NameLength()};
   }
 
   [[nodiscard]] std::string_view Data() const { return data; }

@@ -25,9 +25,7 @@ class Page {
   [[nodiscard]] lsn_t PageLSN() const { return page_lsn; }
   [[nodiscard]] lsn_t RecoveryLSN() const { return recovery_lsn; }
   void SetPageLSN(lsn_t lsn) { page_lsn = lsn; }
-  void SetRecLSN(lsn_t lsn) {
-    recovery_lsn = std::min(lsn, recovery_lsn);
-  }
+  void SetRecLSN(lsn_t lsn) { recovery_lsn = std::min(lsn, recovery_lsn); }
 
   // Meta page.
   PageRef AllocateNewPage(Transaction& txn, PagePool& pool,
