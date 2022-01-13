@@ -61,6 +61,7 @@ class RowPageTest : public ::testing::Test {
     if (commit) {
       EXPECT_TRUE(txn.PreCommit());
     } else {
+      page.PageUnlock();
       txn.Abort();
     }
     txn.CommitWait();
@@ -79,6 +80,7 @@ class RowPageTest : public ::testing::Test {
     if (commit) {
       ASSERT_TRUE(txn.PreCommit());
     } else {
+      page.PageUnlock();
       txn.Abort();
     }
     txn.CommitWait();
@@ -94,6 +96,7 @@ class RowPageTest : public ::testing::Test {
     if (commit) {
       ASSERT_TRUE(txn.PreCommit());
     } else {
+      page.PageUnlock();
       txn.Abort();
     }
     txn.CommitWait();

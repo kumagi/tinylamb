@@ -4,6 +4,7 @@
 
 #ifndef TINYLAMB_CHECKPOINT_MANAGER_HPP
 #define TINYLAMB_CHECKPOINT_MANAGER_HPP
+
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -39,6 +40,7 @@ class CheckpointManager {
         << ", lastLSN: " << a.last_lsn;
       return o;
     }
+
     bool operator==(const ActiveTransactionEntry& rhs) const {
       return txn_id == rhs.txn_id && status == rhs.status &&
              last_lsn == rhs.last_lsn;

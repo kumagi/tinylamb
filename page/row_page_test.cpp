@@ -24,6 +24,7 @@ TEST_F(RowPageTest, InsertMany) {
   PageRef ref = p_->GetPage(page_id_);
   RowPage& page = ref.GetRowPage();
   size_t before_size = page.FreeSizeForTest();
+  ref.PageUnlock();
   for (int i = 0; i < kInserts; ++i) {
     std::string message = std::to_string(i) + " message";
     ASSERT_EQ(page.RowCount(), i);
@@ -54,17 +55,17 @@ TEST_F(RowPageTest, UpdateMany) {
   for (int i = 0; i < kInserts; ++i) {
     InsertRow(std::to_string(i) + " message");
   }
-  Recover();  // Recovery process will not do wrong thing.
+  Recover();  // RecoveryManager process will not do wrong thing.
   for (int i = 0; i < kInserts; i += 2) {  // even numbers.
     UpdateRow(i, std::to_string(i) + kLongMessage);
     ASSERT_EQ(ReadRow(i), std::to_string(i) + kLongMessage);
   }
-  Recover();  // Recovery process will not do wrong thing.
+  Recover();  // RecoveryManager process will not do wrong thing.
   for (int i = 1; i < kInserts; i += 2) {  // odd numbers.
     UpdateRow(i, std::to_string(i) + kShortMessage);
     ASSERT_EQ(ReadRow(i), std::to_string(i) + kShortMessage);
   }
-  Recover();  // Recovery process will not do wrong thing.
+  Recover();  // RecoveryManager process will not do wrong thing.
   for (int i = 0; i < kInserts; ++i) {
     if (i % 2 == 0) {
       ASSERT_EQ(ReadRow(i), std::to_string(i) + kLongMessage);

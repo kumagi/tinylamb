@@ -27,12 +27,12 @@ class Page {
   void SetPageLSN(lsn_t lsn) { page_lsn = lsn; }
   void SetRecLSN(lsn_t lsn) { recovery_lsn = std::min(lsn, recovery_lsn); }
 
-  // Meta page.
+  // Meta page manipulations.
   PageRef AllocateNewPage(Transaction& txn, PagePool& pool,
                           PageType new_page_type);
   void DestroyPage(Transaction& txn, Page* target, PagePool& pool);
 
-  // Row page.
+  // Row page manipulations.
   bool Read(Transaction& txn, const RowPosition& pos, Row& dst) const;
 
   bool Insert(Transaction& txn, const Row& record, RowPosition& dst);
@@ -43,6 +43,7 @@ class Page {
 
   [[nodiscard]] size_t RowCount() const;
 
+  // Internal methods exposed for recovery.
   void InsertImpl(const RowPosition& pos, std::string_view redo);
 
   void UpdateImpl(const RowPosition& pos, std::string_view redo);

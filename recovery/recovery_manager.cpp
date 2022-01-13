@@ -1,4 +1,4 @@
-#include "recovery.hpp"
+#include "recovery_manager.hpp"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -183,12 +183,12 @@ void PageReplay(PageRef&& target,
 
 }  // namespace
 
-Recovery::Recovery(std::string_view log_path, PagePool* pp)
+RecoveryManager::RecoveryManager(std::string_view log_path, PagePool* pp)
     : log_name_(log_path), log_data_(nullptr), pool_(pp) {
   RefreshMap();
 }
 
-void Recovery::RefreshMap() {
+void RecoveryManager::RefreshMap() {
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
   int fd = open(log_name_.c_str(), O_RDONLY, 0666);
   if (fd == -1) {
@@ -199,7 +199,8 @@ void Recovery::RefreshMap() {
       mmap(nullptr, filesize, PROT_READ, MAP_PRIVATE, fd, 0));
 }
 
-void Recovery::SinglePageRecovery(PageRef&& page, TransactionManager* tm) {
+void RecoveryManager::SinglePageRecovery(PageRef&& page,
+                                         TransactionManager* tm) {
   RefreshMap();
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
 
@@ -229,7 +230,8 @@ void Recovery::SinglePageRecovery(PageRef&& page, TransactionManager* tm) {
   PageReplay(std::move(page), page_logs, committed_txn, tm);
 }
 
-void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager* tm) {
+void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
+                                  TransactionManager* tm) {
   RefreshMap();
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
 
@@ -308,12 +310,11 @@ void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager* tm) {
   // Take all dirty page's lock.
   for (const auto& it : dirty_page_table) {
     PageRef&& page = pool_->GetPage(it.first, nullptr);
-    pool_->PageLock(it.first);
     if (!page->IsValid()) {
       page->page_lsn = 0;
       page->page_id = it.first;
       LOG(INFO) << "Page " << it.first
-                << " is broken, trying Single Page Recovery";
+                << " is broken, trying Single Page RecoveryManager";
       SinglePageRecovery(std::move(page), tm);
     } else {
       pages.emplace(it.first, std::move(page));
@@ -355,13 +356,13 @@ void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager* tm) {
   }
 }
 
-bool Recovery::ReadLog(lsn_t lsn, LogRecord* dst) {
+bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) {
   RefreshMap();
   return LogRecord::ParseLogRecord(&log_data_[lsn], dst);
 }
 
-void Recovery::LogUndoWithPage(lsn_t lsn, const LogRecord& log,
-                               TransactionManager* tm) {
+void RecoveryManager::LogUndoWithPage(lsn_t lsn, const LogRecord& log,
+                                      TransactionManager* tm) {
   bool cache_hit;
   if (IsPageManipulation(log.type)) {
     PageRef target = pool_->GetPage(log.pos.page_id, &cache_hit);

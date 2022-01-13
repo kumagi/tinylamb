@@ -27,7 +27,7 @@ add_library(libtinylamb
         page/page_pool.cpp page/row_page.cpp page/page_manager.cpp
         recovery/logger.cpp type/row.cpp type/schema.cpp
         transaction/transaction.cpp recovery/log_record.cpp page/meta_page.cpp
-        recovery/recovery.cpp recovery/checkpoint_manager.cpp transaction/transaction_manager.cpp
+        recovery/recovery_manager.cpp recovery/checkpoint_manager.cpp transaction/transaction_manager.cpp
         page/page_type.cpp type/column.cpp log_message.cpp page/page_ref.cpp)
 
 target_include_directories(
@@ -75,6 +75,6 @@ add_simple_test(type/schema_test.cpp)
 add_simple_test(transaction/transaction_test.cpp)
 add_simple_test(recovery/logger_test.cpp)
 add_simple_test(recovery/log_record_test.cpp)
-add_simple_test(recovery/recovery_test.cpp)
+add_simple_test(recovery/recovery_manager_test.cpp)
 add_simple_test(recovery/checkpoint_manager_test.cpp)
 add_simple_test(database_test.cpp)

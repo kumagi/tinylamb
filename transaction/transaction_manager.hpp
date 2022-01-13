@@ -18,13 +18,13 @@ class Logger;
 class LogRecord;
 class PageManager;
 class Transaction;
-class Recovery;
+class RecoveryManager;
 class RowPosition;
 enum class TransactionStatus : uint_fast8_t;
 
 class TransactionManager {
  public:
-  TransactionManager(LockManager* lm, Logger* l, Recovery* r)
+  TransactionManager(LockManager* lm, Logger* l, RecoveryManager* r)
       : lock_manager_(lm), logger_(l), recovery_(r) {}
 
   Transaction Begin();
@@ -46,14 +46,14 @@ class TransactionManager {
   lsn_t CommittedLSN() const;
 
  private:
-  friend class Recovery;
+  friend class RecoveryManager;
   friend class CheckpointManager;
 
   std::unordered_map<txn_id_t, Transaction*> active_transactions_;
   std::atomic<txn_id_t> next_txn_id_ = 1;
   LockManager* const lock_manager_;
   Logger* const logger_;
-  Recovery* const recovery_;
+  RecoveryManager* const recovery_;
   std::mutex transaction_table_lock;
 };
 

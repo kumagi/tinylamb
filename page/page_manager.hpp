@@ -6,12 +6,12 @@
 #include "log_message.hpp"
 #include "page/page.hpp"
 #include "page/page_pool.hpp"
-#include "recovery/recovery.hpp"
+#include "recovery/recovery_manager.hpp"
 
 namespace tinylamb {
 
 class Logger;
-class Recovery;
+class RecoveryManager;
 class MetaPage;
 class Transaction;
 class TransactionManager;
@@ -35,7 +35,7 @@ class PageManager {
   PageRef GetMetaPage();
 
  private:
-  friend class Recovery;
+  friend class RecoveryManager;
   PagePool pool_;
 };
 

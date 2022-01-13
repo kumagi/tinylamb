@@ -8,7 +8,7 @@
 
 namespace tinylamb {
 
-class Recovery;
+class RecoveryManager;
 class Transaction;
 class RowPosition;
 class Row;

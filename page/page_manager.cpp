@@ -5,7 +5,7 @@
 #include "page/meta_page.hpp"
 #include "page/page_ref.hpp"
 #include "recovery/log_record.hpp"
-#include "recovery/recovery.hpp"
+#include "recovery/recovery_manager.hpp"
 
 namespace tinylamb {
 

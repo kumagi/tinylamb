@@ -1,9 +1,8 @@
 #include "page_pool.hpp"
 
-#include <recovery/recovery.hpp>
-
 #include "meta_page.hpp"
 #include "page/page_ref.hpp"
+#include "recovery/recovery_manager.hpp"
 #include "row_page.hpp"
 
 namespace tinylamb {
@@ -33,7 +32,7 @@ PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit) {
       *cache_hit = true;
     }
 
-    std::scoped_lock page_lock(*entry->second->page_latch);
+    entry->second->page_latch->lock();
     return {this, entry->second->page.get()};
   } else {
     if (pool_lru_.size() == capacity_) {
@@ -69,16 +68,6 @@ bool PagePool::Unpin(page_id_t page_id) {
   return false;
 }
 
-void PagePool::PageLock(uint64_t page_id) {
-  std::scoped_lock latch(pool_latch);
-  auto entry = pool_.find(page_id);
-  if (entry == pool_.end()) {
-    AllocNewPage(page_id);
-    entry = pool_.find(page_id);
-  }
-  entry->second->page_latch->lock();
-}
-
 void PagePool::PageUnlock(uint64_t page_id) {
   std::scoped_lock latch(pool_latch);
   auto entry = pool_.find(page_id);
@@ -111,11 +100,12 @@ bool PagePool::EvictOnePage() {
 // Precondition: pool_latch is locked.
 PageRef PagePool::AllocNewPage(page_id_t pid) {
   assert(!pool_latch.try_lock());
-  std::unique_ptr<Page> new_page(new Page(pid, PageType::kMetaPage));
+  std::unique_ptr<Page> new_page(new Page(pid, PageType::kUnknown));
   ReadFrom(new_page.get(), pid);
   Entry new_entry{1, std::move(new_page), std::make_unique<std::mutex>()};
   pool_lru_.push_back(std::move(new_entry));
   pool_.emplace(pid, std::prev(pool_lru_.end()));
+  pool_lru_.back().page_latch->lock();
   return {this, pool_lru_.back().page.get()};
 }
 
@@ -150,7 +140,6 @@ void ZeroFillUntil(std::fstream& of, size_t expected) {
   of.seekp(0, std::ios_base::end);
   const std::ofstream::pos_type finish = of.tellp();
   const size_t needs = expected - (finish - start);
-  assert(needs < kPageSize * 10);
   for (size_t i = 0; i < needs; ++i) {
     of.write("\0", 1);
   }

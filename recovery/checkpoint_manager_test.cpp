@@ -42,12 +42,12 @@ class CheckpointTest : public RowPageTest {
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), nullptr);
-    r_ = std::make_unique<Recovery>(kLogName, p_->GetPool());
+    r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
     cm_ = std::make_unique<CheckpointManager>(kMasterRecordName, tm_.get(),
                                               p_->GetPool(), 1);
   }
 
-  std::unique_ptr<Recovery> r_;
+  std::unique_ptr<RecoveryManager> r_;
   std::unique_ptr<CheckpointManager> cm_;
 };
 

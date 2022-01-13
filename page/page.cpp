@@ -27,7 +27,7 @@ void Page::PageInit(uint64_t pid, PageType page_type) {
   recovery_lsn = std::numeric_limits<uint64_t>::max();
   switch (type) {
     case PageType::kUnknown:
-      throw std::runtime_error("unknown type won't expect to be PageInit");
+      break;
     case PageType::kFreePage:
       body.free_page.Initialize();
       break;

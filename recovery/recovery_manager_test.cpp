@@ -1,4 +1,4 @@
-#include "recovery/recovery.hpp"
+#include "recovery/recovery_manager.hpp"
 
 #include <memory>
 #include <string>
@@ -7,7 +7,7 @@
 
 namespace tinylamb {
 
-class RecoveryTest : public RowPageTest {
+class RecoveryManagerTest : public RowPageTest {
  protected:
   static constexpr char kDBFileName[] = "recovery_test.db";
   static constexpr char kLogName[] = "recovery_test.log";
@@ -27,7 +27,7 @@ class RecoveryTest : public RowPageTest {
     p_ = std::make_unique<PageManager>(kDBFileName, 10);
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
-    r_ = std::make_unique<Recovery>(kLogName, p_->GetPool());
+    r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
   }
 
@@ -56,12 +56,12 @@ class RecoveryTest : public RowPageTest {
     std::remove(kLogName);
   }
 
-  std::unique_ptr<Recovery> r_;
+  std::unique_ptr<RecoveryManager> r_;
 };
 
-TEST_F(RecoveryTest, EmptyRecovery) { r_->RecoverFrom(0, tm_.get()); }
+TEST_F(RecoveryManagerTest, EmptyRecovery) { r_->RecoverFrom(0, tm_.get()); }
 
-TEST_F(RecoveryTest, InsertAbort) {
+TEST_F(RecoveryManagerTest, InsertAbort) {
   auto txn = tm_->Begin();
   Row r;
   r.data = "blah~blah";
@@ -72,13 +72,15 @@ TEST_F(RecoveryTest, InsertAbort) {
   const uint16_t before_size = page->body.row_page.FreeSizeForTest();
   RowPosition pos;
   ASSERT_TRUE(page->Insert(txn, r, pos));
+  page.PageUnlock();
+
   ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
             before_size - r.data.size() - sizeof(RowPage::RowPointer));
   txn.Abort();
   ASSERT_EQ(GetRowCount(), 0);
 }
 
-TEST_F(RecoveryTest, UpdateAbort) {
+TEST_F(RecoveryManagerTest, UpdateAbort) {
   std::string before = "before string hello world!", after = "replaced by this";
   ASSERT_TRUE(InsertRow(before));
   auto txn = tm_->Begin();
@@ -91,6 +93,7 @@ TEST_F(RecoveryTest, UpdateAbort) {
   const uint16_t before_size = page->body.row_page.FreeSizeForTest();
   RowPosition pos(page->PageId(), 0);
   ASSERT_TRUE(page->Update(txn, pos, r));
+  page.PageUnlock();
 
   ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
             before_size - before.length() + after.length());
@@ -99,26 +102,28 @@ TEST_F(RecoveryTest, UpdateAbort) {
   ASSERT_EQ(ReadRow(0), before);
 }
 
-TEST_F(RecoveryTest, DeleteAbort) {
+TEST_F(RecoveryManagerTest, DeleteAbort) {
   std::string before = "living row";
   ASSERT_TRUE(InsertRow(before));
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(page_id_);
   RowPosition target(page->PageId(), 0);
   page->Delete(txn, target);
+  page.PageUnlock();
+
   txn.Abort();
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), before);
 }
 
-TEST_F(RecoveryTest, InsertRowRecovery) {
+TEST_F(RecoveryManagerTest, InsertRowRecovery) {
   InsertRow("hoge");
   MediaFailure();
   r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(ReadRow(0), "hoge");
 }
 
-TEST_F(RecoveryTest, UpdateRowRecovery) {
+TEST_F(RecoveryManagerTest, UpdateRowRecovery) {
   ASSERT_TRUE(InsertRow("hoge"));
   UpdateRow(0, "bar");
   ASSERT_EQ(ReadRow(0), "bar");
@@ -127,7 +132,7 @@ TEST_F(RecoveryTest, UpdateRowRecovery) {
   ASSERT_EQ(ReadRow(0), "bar");
 }
 
-TEST_F(RecoveryTest, DeleteRowRecovery) {
+TEST_F(RecoveryManagerTest, DeleteRowRecovery) {
   ASSERT_TRUE(InsertRow("hoge"));
   DeleteRow(0);
   ASSERT_EQ(GetRowCount(), 0);
@@ -136,14 +141,14 @@ TEST_F(RecoveryTest, DeleteRowRecovery) {
   ASSERT_EQ(GetRowCount(), 0);
 }
 
-TEST_F(RecoveryTest, InsertRowAbortRecovery) {
+TEST_F(RecoveryManagerTest, InsertRowAbortRecovery) {
   InsertRow("hoge", false);
   MediaFailure();
   r_->RecoverFrom(0, tm_.get());
   ASSERT_EQ(GetRowCount(), 0);
 }
 
-TEST_F(RecoveryTest, UpdateRowAbortRecovery) {
+TEST_F(RecoveryManagerTest, UpdateRowAbortRecovery) {
   ASSERT_TRUE(InsertRow("hoge"));
   UpdateRow(0, "bar", false);
   ASSERT_EQ(ReadRow(0), "hoge");
@@ -152,7 +157,7 @@ TEST_F(RecoveryTest, UpdateRowAbortRecovery) {
   ASSERT_EQ(ReadRow(0), "hoge");
 }
 
-TEST_F(RecoveryTest, DeleteRowAbortRecovery) {
+TEST_F(RecoveryManagerTest, DeleteRowAbortRecovery) {
   ASSERT_TRUE(InsertRow("hoge"));
   DeleteRow(0, false);
   ASSERT_EQ(GetRowCount(), 1);
@@ -162,7 +167,7 @@ TEST_F(RecoveryTest, DeleteRowAbortRecovery) {
   ASSERT_EQ(ReadRow(0), "hoge");
 }
 
-TEST_F(RecoveryTest, InsertCrash) {
+TEST_F(RecoveryManagerTest, InsertCrash) {
   auto txn = tm_->Begin();
   Row r;
   r.data = "blah~blah";
@@ -183,7 +188,7 @@ TEST_F(RecoveryTest, InsertCrash) {
   ASSERT_EQ(GetRowCount(), 0);
 }
 
-TEST_F(RecoveryTest, UpdateCrash) {
+TEST_F(RecoveryManagerTest, UpdateCrash) {
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
   Row r;
@@ -203,7 +208,7 @@ TEST_F(RecoveryTest, UpdateCrash) {
   ASSERT_EQ(ReadRow(0), "original message");
 }
 
-TEST_F(RecoveryTest, DeleteCrash) {
+TEST_F(RecoveryManagerTest, DeleteCrash) {
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
   {
@@ -221,7 +226,7 @@ TEST_F(RecoveryTest, DeleteCrash) {
   ASSERT_EQ(ReadRow(0), "original message");
 }
 
-TEST_F(RecoveryTest, InsertMediaCrash) {
+TEST_F(RecoveryManagerTest, InsertMediaCrash) {
   auto txn = tm_->Begin();
   Row r;
   r.data = "blah~blah";
@@ -242,7 +247,7 @@ TEST_F(RecoveryTest, InsertMediaCrash) {
   ASSERT_EQ(GetRowCount(), 0);
 }
 
-TEST_F(RecoveryTest, UpdateMediaCrash) {
+TEST_F(RecoveryManagerTest, UpdateMediaCrash) {
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
   Row r;
@@ -262,7 +267,7 @@ TEST_F(RecoveryTest, UpdateMediaCrash) {
   ASSERT_EQ(ReadRow(0), "original message");
 }
 
-TEST_F(RecoveryTest, DeleteMediaCrash) {
+TEST_F(RecoveryManagerTest, DeleteMediaCrash) {
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
   {
@@ -280,7 +285,7 @@ TEST_F(RecoveryTest, DeleteMediaCrash) {
   ASSERT_EQ(ReadRow(0), "original message");
 }
 
-TEST_F(RecoveryTest, InsertSinglePageFailure) {
+TEST_F(RecoveryManagerTest, InsertSinglePageFailure) {
   auto txn = tm_->Begin();
   Row r;
   r.data = "blah~blah";
@@ -301,7 +306,7 @@ TEST_F(RecoveryTest, InsertSinglePageFailure) {
   ASSERT_EQ(GetRowCount(), 0);
 }
 
-TEST_F(RecoveryTest, UpdateSinglePageFailure) {
+TEST_F(RecoveryManagerTest, UpdateSinglePageFailure) {
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
   Row r;
@@ -322,7 +327,7 @@ TEST_F(RecoveryTest, UpdateSinglePageFailure) {
   ASSERT_EQ(ReadRow(0), "original message");
 }
 
-TEST_F(RecoveryTest, DeleteSinglePageFailure) {
+TEST_F(RecoveryManagerTest, DeleteSinglePageFailure) {
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
   {

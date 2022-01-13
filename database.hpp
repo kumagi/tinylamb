@@ -28,7 +28,7 @@ class Database {
   LockManager lock_manager_;
   Logger logger_;
   PageManager pm_;
-  Recovery recovery_;
+  RecoveryManager recovery_;
   TransactionManager tm_;
   CheckpointManager cm_;
 };

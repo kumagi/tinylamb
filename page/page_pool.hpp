@@ -16,7 +16,7 @@ namespace tinylamb {
 
 class CheckpointManager;
 class PageRef;
-class Recovery;
+class RecoveryManager;
 
 class PagePool {
  private:
@@ -56,11 +56,10 @@ class PagePool {
  private:
   friend class PageRef;
   friend class CheckpointManager;
-  friend class Recovery;
+  friend class RecoveryManager;
 
   bool Unpin(size_t page_id);
-
-  void PageLock(page_id_t page_id);
+  
   void PageUnlock(page_id_t page_id);
 
   bool EvictPage(LruType::iterator target);

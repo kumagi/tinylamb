@@ -1,5 +1,5 @@
-#ifndef TINYLAMB_RECOVERY_HPP
-#define TINYLAMB_RECOVERY_HPP
+#ifndef TINYLAMB_RECOVERY_MANAGER_HPP
+#define TINYLAMB_RECOVERY_MANAGER_HPP
 
 #include <string>
 #include <string_view>
@@ -16,9 +16,9 @@ class PageRef;
 class Transaction;
 class TransactionManager;
 
-class Recovery {
+class RecoveryManager {
  public:
-  Recovery(std::string_view log_path, PagePool* pp);
+  RecoveryManager(std::string_view log_path, PagePool* pp);
 
   void SinglePageRecovery(PageRef&& page, TransactionManager* tm);
 
@@ -39,4 +39,4 @@ class Recovery {
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_RECOVERY_HPP
+#endif  // TINYLAMB_RECOVERY_MANAGER_HPP
