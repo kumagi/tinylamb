@@ -13,10 +13,6 @@ class Page;
 class PagePool;
 
 class MetaPage {
-  // Note that all member of this class is private.
-  friend class Page;
-  friend std::hash<tinylamb::MetaPage>;
-
   void Initialize() {
     max_page_count = 0;
     first_free_page = 0;
@@ -25,6 +21,11 @@ class MetaPage {
   PageRef AllocateNewPage(Transaction& txn, PagePool& pool,
                           PageType new_page_type);
   void DestroyPage(Transaction& txn, Page* target, PagePool& pool);
+
+  // Note that all member of this class is private.
+  // Only Page class can access these members.
+  friend class Page;
+  friend std::hash<tinylamb::MetaPage>;
 
   uint64_t max_page_count;
   uint64_t first_free_page;

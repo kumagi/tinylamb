@@ -7,10 +7,6 @@
 namespace tinylamb {
 
 class FreePage {
-  friend class Page;
-  friend class MetaPage;
-  friend std::hash<tinylamb::FreePage>;
-
   void Initialize() { next_free_page = 0; }
 
  public:
@@ -20,8 +16,13 @@ class FreePage {
   }
 
  private:
+  friend class Page;
+  friend class MetaPage;
+  friend std::hash<tinylamb::FreePage>;
+
   uint64_t next_free_page;
 };
+
 constexpr static uint32_t kFreeBodySize = kPageBodySize - sizeof(FreePage);
 
 }  // namespace tinylamb
