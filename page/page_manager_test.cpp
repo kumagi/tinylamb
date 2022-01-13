@@ -73,7 +73,7 @@ TEST_F(PageManagerTest, AllocateNewPage) {
   char* buff = page->body.free_page.FreeBody();
   for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
     // Make sure no SEGV happen.
-    buff[j] = static_cast<char>((page->PageId() + j) & 0xff);
+    buff[j] = static_cast<char>((page->PageID() + j) & 0xff);
   }
 }
 
@@ -84,9 +84,9 @@ TEST_F(PageManagerTest, AllocateMultipleNewPage) {
     PageRef page = AllocatePage(PageType::kFreePage);
     char* buff = page->body.free_page.FreeBody();
     for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
-      buff[j] = static_cast<char>((page->PageId() + j) & 0xff);
+      buff[j] = static_cast<char>((page->PageID() + j) & 0xff);
     }
-    allocated_ids.insert(page->PageId());
+    allocated_ids.insert(page->PageID());
   }
   Reset();
   for (const auto& id : allocated_ids) {
@@ -106,7 +106,7 @@ TEST_F(PageManagerTest, DestroyPage) {
   }
   for (int i = 0; i < 15; ++i) {
     PageRef page = AllocatePage(PageType::kFreePage);
-    ASSERT_LE(page->PageId(), 15);
+    ASSERT_LE(page->PageID(), 15);
   }
 }
 

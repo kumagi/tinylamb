@@ -32,14 +32,14 @@ PageRef MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
 
 // Precondition: latch of page is taken by txn.
 void MetaPage::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
-  page_id_t free_page_id = target->PageId();
+  page_id_t free_page_id = target->PageID();
   target->PageInit(free_page_id, PageType::kFreePage);
-  assert(target->PageId() == free_page_id);
+  assert(target->PageID() == free_page_id);
   FreePage& free_page = target->body.free_page;
-  assert(target->PageId() == free_page_id);
+  assert(target->PageID() == free_page_id);
   // Add the free page to the free page chain.
   free_page.next_free_page = first_free_page;
-  assert(target->PageId() == free_page_id);
+  assert(target->PageID() == free_page_id);
   first_free_page = free_page_id;
   txn.DestroyPageLog(free_page_id);
 }

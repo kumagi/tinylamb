@@ -11,8 +11,8 @@ namespace tinylamb {
 void PageRef::PageUnlock() {
   assert(page_);
   assert(pool_);
-  assert(hold_lock_);
-  pool_->PageUnlock(page_->page_id);
+  page_lock_.unlock();
+  page_lock_.release();
 }
 
 RowPage& PageRef::GetRowPage() {
@@ -25,22 +25,16 @@ FreePage& PageRef::GetFreePage() {
   return page_->body.free_page;
 }
 
-// Precondition: page is locked.
-PageRef::PageRef(PagePool* src, Page* page)
-    : pool_(src), page_(page), hold_lock_(true) {
-  // LOG(TRACE) << this << " pin: " << page_->PageId();
-}
-
 PageRef::~PageRef() {
   if (page_) {
-    if (hold_lock_) {
-      pool_->PageUnlock(page_->PageId());
+    pool_->Unpin(page_->PageID());
+    if (page_lock_.owns_lock()) {
+      page_lock_.unlock();
     }
-    pool_->Unpin(page_->PageId());
   }
 }
 std::ostream& operator<<(std::ostream& o, const PageRef& p) {
-  o << "{Ref: " << p.page_->PageId() << "}";
+  o << "{Ref: " << p.page_->PageID() << "}";
   return o;
 }
 

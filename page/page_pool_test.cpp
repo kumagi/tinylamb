@@ -30,14 +30,14 @@ TEST_F(PagePoolTest, GetPageSeveralpattern) {
   std::vector<int> pattern = {0, 0, 1, 0, 2};
   for (int& i : pattern) {
     PageRef page = pp->GetPage(i, nullptr);
-    ASSERT_EQ(page->PageId(), i);
+    ASSERT_EQ(page->PageID(), i);
   }
 }
 
 TEST_F(PagePoolTest, GetManyPage) {
   for (int i = 0; i < 5; ++i) {
     PageRef p = pp->GetPage(i, nullptr);
-    ASSERT_EQ(p->PageId(), i);
+    ASSERT_EQ(p->PageID(), i);
     ASSERT_EQ(pp->Size(), i + 1);
   }
 }
@@ -45,7 +45,7 @@ TEST_F(PagePoolTest, GetManyPage) {
 TEST_F(PagePoolTest, EvictPage) {
   for (int i = 0; i < 15; ++i) {
     PageRef p = pp->GetPage(i, nullptr);
-    ASSERT_EQ(p->PageId(), i);
+    ASSERT_EQ(p->PageID(), i);
     ASSERT_EQ(pp->Size(), std::min(i + 1, kDefaultCapacity));
   }
 }

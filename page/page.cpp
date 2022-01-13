@@ -60,7 +60,7 @@ void Page::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
 bool Page::Read(Transaction& txn, const RowPosition& pos, Row& dst) const {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
   std::string_view payload;
-  bool result = body.row_page.Read(PageId(), txn, pos, &payload);
+  bool result = body.row_page.Read(PageID(), txn, pos, &payload);
   if (result) {
     dst = Row(payload, pos);
   }
@@ -69,7 +69,7 @@ bool Page::Read(Transaction& txn, const RowPosition& pos, Row& dst) const {
 
 bool Page::Insert(Transaction& txn, const Row& record, RowPosition& dst) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  bool result = body.row_page.Insert(PageId(), txn, record, dst);
+  bool result = body.row_page.Insert(PageID(), txn, record, dst);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
   return result;
@@ -77,7 +77,7 @@ bool Page::Insert(Transaction& txn, const Row& record, RowPosition& dst) {
 
 bool Page::Update(Transaction& txn, const RowPosition& pos, const Row& row) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  bool result = body.row_page.Update(PageId(), txn, pos, row);
+  bool result = body.row_page.Update(PageID(), txn, pos, row);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
   return result;
@@ -85,7 +85,7 @@ bool Page::Update(Transaction& txn, const RowPosition& pos, const Row& row) {
 
 bool Page::Delete(Transaction& txn, const RowPosition& pos) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  bool result = body.row_page.Delete(PageId(), txn, pos);
+  bool result = body.row_page.Delete(PageID(), txn, pos);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
   return result;

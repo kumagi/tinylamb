@@ -1,6 +1,7 @@
 #ifndef TINYLAMB_PAGE_POOL_HPP
 #define TINYLAMB_PAGE_POOL_HPP
 
+#include <atomic>
 #include <cassert>
 #include <fstream>
 #include <list>
@@ -21,6 +22,9 @@ class RecoveryManager;
 class PagePool {
  private:
   struct Entry {
+    explicit Entry(Page* p)
+        : pin_count(1), page(p), page_latch(new std::mutex()) {}
+
     // If pinned, this page will never been evicted.
     uint32_t pin_count = 0;
 
@@ -59,8 +63,6 @@ class PagePool {
   friend class RecoveryManager;
 
   bool Unpin(size_t page_id);
-  
-  void PageUnlock(page_id_t page_id);
 
   bool EvictPage(LruType::iterator target);
 

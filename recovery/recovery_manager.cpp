@@ -158,7 +158,7 @@ void PageReplay(PageRef&& target,
   for (const auto& lsn_log : logs) {
     const lsn_t& lsn = lsn_log.first;
     const LogRecord& log = lsn_log.second;
-    assert(log.pos.page_id == target->PageId());
+    assert(log.pos.page_id == target->PageID());
     if (target->PageLSN() < lsn) {
       LOG(INFO) << "redo: " << log;
       LogRedo(target, lsn, log);
@@ -170,7 +170,7 @@ void PageReplay(PageRef&& target,
     const lsn_t& lsn = iter->first;
     const LogRecord& undo_log = iter->second;
     const auto it = committed_txn.find(undo_log.txn_id);
-    assert(undo_log.pos.page_id == target->PageId());
+    assert(undo_log.pos.page_id == target->PageID());
     if (it == committed_txn.end()) {
       LOG(INFO) << "undo: " << undo_log;
       LogUndo(target, lsn, undo_log, tm);
@@ -216,7 +216,7 @@ void RecoveryManager::SinglePageRecovery(PageRef&& page,
         LOG(ERROR) << "Failed to parse log at offset: " << offset;
         break;
       }
-      if (IsPageManipulation(log.type) && log.pos.page_id == page->PageId()) {
+      if (IsPageManipulation(log.type) && log.pos.page_id == page->PageID()) {
         page_logs.emplace_back(offset, log);
       } else if (log.type == LogType::kCommit) {
         committed_txn.insert(log.txn_id);

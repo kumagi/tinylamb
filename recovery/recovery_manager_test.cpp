@@ -91,7 +91,7 @@ TEST_F(RecoveryManagerTest, UpdateAbort) {
   ASSERT_EQ(page->Type(), PageType::kRowPage);
 
   const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-  RowPosition pos(page->PageId(), 0);
+  RowPosition pos(page->PageID(), 0);
   ASSERT_TRUE(page->Update(txn, pos, r));
   page.PageUnlock();
 
@@ -107,7 +107,7 @@ TEST_F(RecoveryManagerTest, DeleteAbort) {
   ASSERT_TRUE(InsertRow(before));
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(page_id_);
-  RowPosition target(page->PageId(), 0);
+  RowPosition target(page->PageID(), 0);
   page->Delete(txn, target);
   page.PageUnlock();
 

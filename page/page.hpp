@@ -20,7 +20,7 @@ class Page {
   Page(page_id_t page_id, PageType type);
   void PageInit(page_id_t page_id, PageType type);
 
-  [[nodiscard]] page_id_t PageId() const { return page_id; }
+  [[nodiscard]] page_id_t PageID() const { return page_id; }
   [[nodiscard]] PageType Type() const { return type; }
   [[nodiscard]] lsn_t PageLSN() const { return page_lsn; }
   [[nodiscard]] lsn_t RecoveryLSN() const { return recovery_lsn; }

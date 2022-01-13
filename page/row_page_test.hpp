@@ -22,7 +22,7 @@ class RowPageTest : public ::testing::Test {
     Recover();
     auto txn = tm_->Begin();
     PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
-    page_id_ = page->PageId();
+    page_id_ = page->PageID();
     EXPECT_TRUE(txn.PreCommit());
   }
 

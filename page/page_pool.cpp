@@ -32,8 +32,7 @@ PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit) {
       *cache_hit = true;
     }
 
-    entry->second->page_latch->lock();
-    return {this, entry->second->page.get()};
+    return {this, entry->second->page.get(), entry->second->page_latch.get()};
   } else {
     if (pool_lru_.size() == capacity_) {
       EvictOnePage();
@@ -68,20 +67,15 @@ bool PagePool::Unpin(page_id_t page_id) {
   return false;
 }
 
-void PagePool::PageUnlock(uint64_t page_id) {
-  std::scoped_lock latch(pool_latch);
-  auto entry = pool_.find(page_id);
-  assert(entry != pool_.end());
-  entry->second->page_latch->unlock();
-}
-
+// Precondition: pool_latch is locked.
 bool PagePool::EvictPage(LruType::iterator target) {
-  assert(pool_.find(target->page->PageId()) != pool_.end());
+  assert(!pool_latch.try_lock());
+  assert(pool_.find(target->page->PageID()) != pool_.end());
   if (0 < target->pin_count) {
     return false;
   }
   WriteBack(target->page.get());
-  uint64_t page_id = target->page->PageId();
+  uint64_t page_id = target->page->PageID();
   pool_lru_.erase(target);
   pool_.erase(page_id);
   return true;
@@ -102,16 +96,16 @@ PageRef PagePool::AllocNewPage(page_id_t pid) {
   assert(!pool_latch.try_lock());
   std::unique_ptr<Page> new_page(new Page(pid, PageType::kUnknown));
   ReadFrom(new_page.get(), pid);
-  Entry new_entry{1, std::move(new_page), std::make_unique<std::mutex>()};
-  pool_lru_.push_back(std::move(new_entry));
+  pool_lru_.emplace_back(new_page.release());
   pool_.emplace(pid, std::prev(pool_lru_.end()));
-  pool_lru_.back().page_latch->lock();
-  return {this, pool_lru_.back().page.get()};
+  return {this, pool_lru_.back().page.get(), pool_lru_.back().page_latch.get()};
 }
 
+// Precondition: pool_latch is locked.
 void PagePool::Touch(LruType::iterator it) {
+  assert(!pool_latch.try_lock());
   Entry tmp(std::move(*it));
-  page_id_t page_id = tmp.page->PageId();
+  page_id_t page_id = tmp.page->PageID();
   pool_lru_.erase(it);
   pool_lru_.push_back(std::move(tmp));
   pool_[page_id] = std::prev(pool_lru_.end());
@@ -121,7 +115,7 @@ PagePool::~PagePool() {
   std::scoped_lock latch(pool_latch);
   for (auto& it : pool_lru_) {
     if (0 < it.pin_count) {
-      LOG(ERROR) << "caution: pinned page(" << it.page->PageId()
+      LOG(ERROR) << "caution: pinned page(" << it.page->PageID()
                  << ") is to be deleted at count " << it.pin_count;
     }
     WriteBack(it.page.get());
@@ -147,9 +141,9 @@ void ZeroFillUntil(std::fstream& of, size_t expected) {
 
 void PagePool::WriteBack(const Page* target) {
   target->SetChecksum();
-  src_.seekp(target->PageId() * kPageSize, std::ios_base::beg);
+  src_.seekp(target->PageID() * kPageSize, std::ios_base::beg);
   if (src_.fail()) {
-    ZeroFillUntil(src_, target->PageId() * kPageSize);
+    ZeroFillUntil(src_, target->PageID() * kPageSize);
     src_.clear();
   }
   src_.write(reinterpret_cast<const char*>(target), kPageSize);
