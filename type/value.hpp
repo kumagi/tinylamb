@@ -6,6 +6,7 @@
 #define TINYLAMB_VALUE_HPP
 
 #include <cstdint>
+
 #include "value_type.hpp"
 
 namespace tinylamb {
@@ -22,10 +23,8 @@ class Value {
     length = varchar_val.length();
   }
 
-  [[nodiscard]] size_t Size() const {
-    return length;
-  }
-  
+  [[nodiscard]] size_t Size() const { return length; }
+
   template <typename T>
   T Read(ValueType as) {
     return *reinterpret_cast<const T*>(&value);

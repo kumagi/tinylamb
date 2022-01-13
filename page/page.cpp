@@ -11,7 +11,7 @@
 #include "type/row.hpp"
 
 #define ASSERT_PAGE_TYPE(expected_type)            \
-  if (type != (expected_type)) {                     \
+  if (type != (expected_type)) {                   \
     throw std::runtime_error("Invalid page type"); \
   }
 
@@ -141,5 +141,4 @@ uint64_t std::hash<tinylamb::Page>::operator()(const tinylamb::Page& p) const {
     default:
       return 0xdeadbeefcafebabe;  // Must be a broken page.
   }
-
 }

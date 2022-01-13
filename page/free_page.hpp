@@ -14,9 +14,7 @@ class FreePage {
   void Initialize() { next_free_page = 0; }
 
  public:
-  char* FreeBody() {
-    return reinterpret_cast<char*>(&next_free_page + 1);
-  }
+  char* FreeBody() { return reinterpret_cast<char*>(&next_free_page + 1); }
   static constexpr size_t FreeBodySize() {
     return kPageBodySize - sizeof(FreePage);
   }

@@ -4,11 +4,11 @@
 #include <functional>
 
 #include "page/page_manager.hpp"
+#include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/catalog.hpp"
-#include "recovery/checkpoint_manager.hpp"
 
 namespace tinylamb {
 

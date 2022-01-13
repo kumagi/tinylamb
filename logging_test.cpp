@@ -1,31 +1,23 @@
-#include "gtest/gtest.h"
 #include "logging.hpp"
+
+#include "gtest/gtest.h"
 
 namespace tinylamb {
 
 class LoggingTest : public ::testing::Test {
  protected:
   static constexpr char kFileName[] = "logger_test.log";
-  void SetUp() override {
-    Recover();
-  }
+  void SetUp() override { Recover(); }
 
-  void Recover() {
-    l_ = std::make_unique<Logging>(kFileName);
-  }
+  void Recover() { l_ = std::make_unique<Logging>(kFileName); }
 
-  void TearDown() override {
-    std::remove(kFileName);
-  }
+  void TearDown() override { std::remove(kFileName); }
   std::unique_ptr<Logging> l_;
 };
 
-TEST_F(LoggingTest, DoNothing) {
-}
+TEST_F(LoggingTest, DoNothing) {}
 
-TEST_F(LoggingTest, AppendOne) {
-  EXPECT_TRUE(l_->Append(1, "foo bar"));
-}
+TEST_F(LoggingTest, AppendOne) { EXPECT_TRUE(l_->Append(1, "foo bar")); }
 
 TEST_F(LoggingTest, EmptyRead) {
   std::string content;
@@ -93,4 +85,4 @@ TEST_F(LoggingTest, RecoverMan) {
   }
 }
 
-} // namespace tinylamb
+}  // namespace tinylamb

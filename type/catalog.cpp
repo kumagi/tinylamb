@@ -23,11 +23,8 @@ Schema Catalog::GetSchema(Transaction& txn, std::string_view table_name) {
   throw std::runtime_error("Not implemented: " + std::string(table_name));
 }
 
-[[nodiscard]] size_t Catalog::Schemas() const {
-  return 0;
-}
+[[nodiscard]] size_t Catalog::Schemas() const { return 0; }
 
-[[maybe_unused]] void Catalog::DebugDump(std::ostream& o) {
-}
+[[maybe_unused]] void Catalog::DebugDump(std::ostream& o) {}
 
 }  // namespace tinylamb

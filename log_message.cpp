@@ -1,13 +1,13 @@
 #include "log_message.hpp"
-#include <iostream>
+
 #include <chrono>
 #include <ctime>
+#include <iostream>
 
 LogStream::~LogStream() { std::cerr << message_.str() << "\e[0;39;49m\n"; }
 
-
-LogMessage::LogMessage(int log_level, const char *filename, int lineno,
-           const char* func_name) {
+LogMessage::LogMessage(int log_level, const char* filename, int lineno,
+                       const char* func_name) {
   char buff[70];
   auto now = std::chrono::system_clock::now();
   std::time_t now_time = std::chrono::system_clock::to_time_t(now);
@@ -27,10 +27,10 @@ LogMessage::LogMessage(int log_level, const char *filename, int lineno,
     case INFO:
       break;  // Do nothing.
     case DEBUG:
-      ls <<"\e[34m";
+      ls << "\e[34m";
       break;
     case TRACE:
-      ls <<"\e[4;36m";
+      ls << "\e[4;36m";
       break;
     default:
       break;

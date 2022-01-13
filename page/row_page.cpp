@@ -65,8 +65,8 @@ uint16_t RowPage::InsertRow(std::string_view new_row) {
   return row_count_++;
 }
 
-bool RowPage::Update(page_id_t page_id, Transaction& txn, const RowPosition& pos,
-                     const Row& new_row) {
+bool RowPage::Update(page_id_t page_id, Transaction& txn,
+                     const RowPosition& pos, const Row& new_row) {
   assert(pos.page_id == page_id);
   assert(pos.slot <= row_count_);
   std::string_view prev_row = GetRow(pos.slot);

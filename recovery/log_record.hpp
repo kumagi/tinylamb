@@ -62,7 +62,7 @@ struct LogRecord {
   static LogRecord BeginCheckpointLogRecord();
 
   static LogRecord EndCheckpointLogRecord(
-      const std::vector<std::pair<page_id_t , lsn_t>>& dpt,
+      const std::vector<std::pair<page_id_t, lsn_t>>& dpt,
       const std::vector<CheckpointManager::ActiveTransactionEntry>& att);
 
   void Clear();

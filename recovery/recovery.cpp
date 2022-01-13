@@ -40,7 +40,7 @@ bool IsPageManipulation(LogType type) {
   return false;
 }
 
-void LogRedo(PageRef &target, lsn_t lsn, const LogRecord &log) {
+void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
   switch (log.type) {
     case LogType::kUnknown:
       assert(!"unknown log type must not be parsed");
@@ -104,8 +104,8 @@ void LogRedo(PageRef &target, lsn_t lsn, const LogRecord &log) {
   }
 }
 
-void LogUndo(PageRef &target, lsn_t lsn, const LogRecord &log,
-             TransactionManager *tm) {
+void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
+             TransactionManager* tm) {
   switch (log.type) {
     case LogType::kUnknown:
       LOG(FATAL) << "Unknown type log";
@@ -148,18 +148,18 @@ void LogUndo(PageRef &target, lsn_t lsn, const LogRecord &log,
 }
 
 // Precondition: the page is locked by this thread.
-void PageReplay(PageRef &&target,
-                const std::vector<std::pair<lsn_t, LogRecord>> &logs,
-                const std::unordered_set<txn_id_t> &committed_txn,
-                TransactionManager *tm) {
+void PageReplay(PageRef&& target,
+                const std::vector<std::pair<lsn_t, LogRecord>>& logs,
+                const std::unordered_set<txn_id_t>& committed_txn,
+                TransactionManager* tm) {
   // Redo & Undo a specific page.
 
   // Redo phase.
-  for (const auto &lsn_log : logs) {
-    const lsn_t &lsn = lsn_log.first;
-    const LogRecord &log = lsn_log.second;
+  for (const auto& lsn_log : logs) {
+    const lsn_t& lsn = lsn_log.first;
+    const LogRecord& log = lsn_log.second;
+    assert(log.pos.page_id == target->PageId());
     if (target->PageLSN() < lsn) {
-      assert(log.pos.page_id == target->PageId());
       LOG(INFO) << "redo: " << log;
       LogRedo(target, lsn, log);
     }
@@ -167,8 +167,8 @@ void PageReplay(PageRef &&target,
 
   // Undo phase.
   for (auto iter = logs.rbegin(); iter != logs.rend(); iter++) {
-    const lsn_t &lsn = iter->first;
-    const LogRecord &undo_log = iter->second;
+    const lsn_t& lsn = iter->first;
+    const LogRecord& undo_log = iter->second;
     const auto it = committed_txn.find(undo_log.txn_id);
     assert(undo_log.pos.page_id == target->PageId());
     if (it == committed_txn.end()) {
@@ -183,7 +183,7 @@ void PageReplay(PageRef &&target,
 
 }  // namespace
 
-Recovery::Recovery(std::string_view log_path, PagePool *pp)
+Recovery::Recovery(std::string_view log_path, PagePool* pp)
     : log_name_(log_path), log_data_(nullptr), pool_(pp) {
   RefreshMap();
 }
@@ -195,11 +195,11 @@ void Recovery::RefreshMap() {
     std::string str_err = strerror(errno);
     throw std::runtime_error("could not open the file: " + str_err);
   }
-  log_data_ = static_cast<char *>(
+  log_data_ = static_cast<char*>(
       mmap(nullptr, filesize, PROT_READ, MAP_PRIVATE, fd, 0));
 }
 
-void Recovery::SinglePageRecovery(PageRef &&page, TransactionManager *tm) {
+void Recovery::SinglePageRecovery(PageRef&& page, TransactionManager* tm) {
   RefreshMap();
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
 
@@ -229,7 +229,7 @@ void Recovery::SinglePageRecovery(PageRef &&page, TransactionManager *tm) {
   PageReplay(std::move(page), page_logs, committed_txn, tm);
 }
 
-void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager *tm) {
+void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager* tm) {
   RefreshMap();
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
 
@@ -279,10 +279,10 @@ void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager *tm) {
           break;
         case LogType::kEndCheckpoint: {
           // Collect the oldest LSN to dirty_page_table.
-          for (const auto &dpt : log.dirty_page_table) {
+          for (const auto& dpt : log.dirty_page_table) {
             UpdateOldestLSN(dpt.first, dpt.second);
           }
-          for (const auto &at : log.active_transaction_table) {
+          for (const auto& at : log.active_transaction_table) {
             if (at.status == TransactionStatus::kCommitted) {
               committed_txn.insert(at.txn_id);
             }
@@ -296,7 +296,7 @@ void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager *tm) {
     }
 
     // Take minimum LSN from the dirty page table.
-    for (const auto &d : dirty_page_table) {
+    for (const auto& d : dirty_page_table) {
       redo_start_point = std::min(redo_start_point, d.second);
     }
   }
@@ -306,8 +306,8 @@ void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager *tm) {
   pages.reserve(dirty_page_table.size());
 
   // Take all dirty page's lock.
-  for (const auto &it : dirty_page_table) {
-    PageRef &&page = pool_->GetPage(it.first, nullptr);
+  for (const auto& it : dirty_page_table) {
+    PageRef&& page = pool_->GetPage(it.first, nullptr);
     pool_->PageLock(it.first);
     if (!page->IsValid()) {
       page->page_lsn = 0;
@@ -348,20 +348,20 @@ void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager *tm) {
 
   // Redo & Undo phase starts here.
   // Note that this loop could be parallelized for each page.
-  for (const auto &page_log : page_logs) {
-    const uint64_t &page_id = page_log.first;
+  for (const auto& page_log : page_logs) {
+    const uint64_t& page_id = page_log.first;
     PageReplay(std::move(pages.find(page_id)->second), page_log.second,
                committed_txn, tm);
   }
 }
 
-bool Recovery::ReadLog(lsn_t lsn, LogRecord *dst) {
+bool Recovery::ReadLog(lsn_t lsn, LogRecord* dst) {
   RefreshMap();
   return LogRecord::ParseLogRecord(&log_data_[lsn], dst);
 }
 
-void Recovery::LogUndoWithPage(lsn_t lsn, const LogRecord &log,
-                               TransactionManager *tm) {
+void Recovery::LogUndoWithPage(lsn_t lsn, const LogRecord& log,
+                               TransactionManager* tm) {
   bool cache_hit;
   if (IsPageManipulation(log.type)) {
     PageRef target = pool_->GetPage(log.pos.page_id, &cache_hit);

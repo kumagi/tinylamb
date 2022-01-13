@@ -19,6 +19,6 @@ enum class PageType : uint64_t {
 
 std::ostream& operator<<(std::ostream& o, const PageType& type);
 
-}  // namespace tinylamb;
+}  // namespace tinylamb
 
 #endif  // TINYLAMB_PAGE_TYPE_HPP

@@ -4,9 +4,8 @@
 
 namespace tinylamb {
 
-Column::Column(std::string_view name, ValueType type,
-                              uint16_t value_length, enum Restriction rst,
-                              uint16_t offset) {
+Column::Column(std::string_view name, ValueType type, uint16_t value_length,
+               enum Restriction rst, uint16_t offset) {
   size_t expected_size = 8 + name.length();
   assert(name.length() < std::numeric_limits<uint16_t>::max());
   std::string payload;

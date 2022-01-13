@@ -133,7 +133,7 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
       for (size_t i = 0; i < dpt_size; ++i) {
         const auto* dirty_page_id = reinterpret_cast<const page_id_t*>(src);
         src += sizeof(*dirty_page_id);
-        const auto* recovery_lsn = reinterpret_cast<const lsn_t *>(src);
+        const auto* recovery_lsn = reinterpret_cast<const lsn_t*>(src);
         src += sizeof(*recovery_lsn);
         dst->dirty_page_table.emplace_back(*dirty_page_id, *recovery_lsn);
       }
@@ -143,11 +143,11 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
       src += sizeof(tt_size);
       dst->active_transaction_table.reserve(tt_size);
       for (size_t i = 0; i < tt_size; ++i) {
-        const auto* txn_id = reinterpret_cast<const txn_id_t *>(src);
+        const auto* txn_id = reinterpret_cast<const txn_id_t*>(src);
         src += sizeof(*txn_id);
         const auto* status = reinterpret_cast<const TransactionStatus*>(src);
         src += sizeof(*status);
-        const auto* last_lsn = reinterpret_cast<const lsn_t *>(src);
+        const auto* last_lsn = reinterpret_cast<const lsn_t*>(src);
         src += sizeof(*last_lsn);
         dst->active_transaction_table.emplace_back(*txn_id, *status, *last_lsn);
       }
@@ -166,8 +166,8 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
   return false;
 }
 
-LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn,
-                                        RowPosition po, std::string_view r) {
+LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, RowPosition po,
+                                        std::string_view r) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;

@@ -45,7 +45,6 @@ class TransactionManager {
   lsn_t AddLog(const LogRecord& lr);
   lsn_t CommittedLSN() const;
 
-
  private:
   friend class Recovery;
   friend class CheckpointManager;

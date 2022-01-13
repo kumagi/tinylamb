@@ -13,14 +13,13 @@
 #define DEBUG 1000
 #define TRACE 0
 
-
 class LogMessage;
 class LogStream {
   friend class LogMessage;
   LogStream() = default;  // Only LogMessage can construct it.
  public:
   template <typename T>
-  LogStream &operator<<(const T &rhs) {
+  LogStream& operator<<(const T& rhs) {
     message_ << rhs;
     return *this;
   }
@@ -32,9 +31,9 @@ class LogStream {
 
 class LogMessage {
  public:
-  LogMessage(int log_level, const char *filename, int lineno,
-             const char *func_name);
-  LogStream &stream() { return ls; }
+  LogMessage(int log_level, const char* filename, int lineno,
+             const char* func_name);
+  LogStream& stream() { return ls; }
 
  private:
   LogStream ls;

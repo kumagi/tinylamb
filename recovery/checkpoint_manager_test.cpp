@@ -112,7 +112,7 @@ TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
   lsn_t restart_point;
   {
     PageRef page = p_->GetPage(page_id_);
-    restart_point = cm_->WriteCheckpoint([&](){
+    restart_point = cm_->WriteCheckpoint([&]() {
       page->Update(txn, inserted, Row("aborted", RowPosition()));
       RowPosition insert_position;
       page->Insert(txn, Row("will be deleted", RowPosition()), insert_position);

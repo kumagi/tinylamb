@@ -6,8 +6,8 @@
 #define TINYLAMB_CHECKPOINT_MANAGER_HPP
 #include <atomic>
 #include <cstdint>
-#include <thread>
 #include <functional>
+#include <thread>
 
 #include "transaction/transaction.hpp"
 
@@ -24,13 +24,10 @@ class CheckpointManager {
         tm_(tm),
         pp_(pp),
         interval_seconds_(interval),
-        checkpoint_worker_(
-            [this] { WorkerThreadTask(); }) {}
+        checkpoint_worker_([this] { WorkerThreadTask(); }) {}
   ~CheckpointManager();
 
-  void Start() {
-    start_.store(true, std::memory_order_release);
-  }
+  void Start() { start_.store(true, std::memory_order_release); }
 
   void WorkerThreadTask();
   struct ActiveTransactionEntry {

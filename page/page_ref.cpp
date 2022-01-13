@@ -26,7 +26,8 @@ FreePage& PageRef::GetFreePage() {
 }
 
 // Precondition: page is locked.
-PageRef::PageRef(PagePool* src, Page* page) : pool_(src), page_(page), hold_lock_(true) {
+PageRef::PageRef(PagePool* src, Page* page)
+    : pool_(src), page_(page), hold_lock_(true) {
   // LOG(TRACE) << this << " pin: " << page_->PageId();
 }
 

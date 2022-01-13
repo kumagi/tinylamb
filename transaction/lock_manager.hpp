@@ -25,7 +25,7 @@ class LockManager {
   std::mutex latch_;
   std::unordered_map<RowPosition, int> shared_locks_;
   std::unordered_set<RowPosition> exclusive_locks_;
- };
+};
 
 }  // namespace tinylamb
 

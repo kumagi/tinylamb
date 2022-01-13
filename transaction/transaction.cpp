@@ -80,7 +80,7 @@ lsn_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
 }
 
 lsn_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
-                                std::string_view redo) {
+                             std::string_view redo) {
   assert(!IsFinished());
   LogRecord lr =
       LogRecord::UpdatingLogRecord(lsns_.back(), txn_id_, pos, redo, undo);

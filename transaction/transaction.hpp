@@ -54,7 +54,7 @@ class Transaction {
   // Returns LSN
   lsn_t InsertLog(const RowPosition& pos, std::string_view redo);
   lsn_t UpdateLog(const RowPosition& pos, std::string_view undo,
-                     std::string_view redo);
+                  std::string_view redo);
   lsn_t DeleteLog(const RowPosition& pos, std::string_view undo);
 
   lsn_t AllocatePageLog(page_id_t page_id, PageType new_page_type);

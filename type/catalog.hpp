@@ -2,8 +2,8 @@
 #define TINYLAMB_CATALOG_HPP
 
 #include <cstdint>
-#include <string_view>
 #include <ostream>
+#include <string_view>
 
 namespace tinylamb {
 

@@ -48,10 +48,8 @@ TEST_F(LoggerTest, AppendBegin) {
 
 TEST_F(LoggerTest, AppendInsertLog) {
   std::vector<Column> columns = {
-      Column("a", ValueType::kInt64, 8,
-                             Restriction::kNoRestriction, 0),
-      Column("b", ValueType::kVarChar, 14,
-                             Restriction::kNoRestriction, 8)};
+      Column("a", ValueType::kInt64, 8, Restriction::kNoRestriction, 0),
+      Column("b", ValueType::kVarChar, 14, Restriction::kNoRestriction, 8)};
   Schema s("test_schema", columns, 2);
   RowPosition pos(123, 456);
   Row r;

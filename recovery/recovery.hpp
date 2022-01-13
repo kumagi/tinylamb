@@ -3,6 +3,7 @@
 
 #include <string>
 #include <string_view>
+
 #include "constants.hpp"
 
 namespace tinylamb {

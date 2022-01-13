@@ -1,8 +1,9 @@
+#include "page_pool.hpp"
+
 #include <memory>
 #include <string>
 
 #include "gtest/gtest.h"
-#include "page_pool.hpp"
 #include "page_ref.hpp"
 
 namespace tinylamb {
@@ -11,22 +12,14 @@ class PagePoolTest : public ::testing::Test {
  protected:
   static constexpr char kFileName[] = "page_pool_test.db";
   static constexpr int kDefaultCapacity = 10;
-  void SetUp() override {
-    Reset();
-  }
-  void Reset() {
-    pp = std::make_unique<PagePool>(kFileName, kDefaultCapacity);
-  }
-  void TearDown() override {
-    std::remove(kFileName);
-  }
+  void SetUp() override { Reset(); }
+  void Reset() { pp = std::make_unique<PagePool>(kFileName, kDefaultCapacity); }
+  void TearDown() override { std::remove(kFileName); }
 
   std::unique_ptr<PagePool> pp = nullptr;
 };
 
-TEST_F(PagePoolTest, Construct) {
-  ASSERT_EQ(pp->Size(), 0);
-}
+TEST_F(PagePoolTest, Construct) { ASSERT_EQ(pp->Size(), 0); }
 
 TEST_F(PagePoolTest, GetPage) {
   PageRef page = pp->GetPage(0, nullptr);
@@ -35,7 +28,7 @@ TEST_F(PagePoolTest, GetPage) {
 
 TEST_F(PagePoolTest, GetPageSeveralpattern) {
   std::vector<int> pattern = {0, 0, 1, 0, 2};
-  for (int & i : pattern) {
+  for (int& i : pattern) {
     PageRef page = pp->GetPage(i, nullptr);
     ASSERT_EQ(page->PageId(), i);
   }

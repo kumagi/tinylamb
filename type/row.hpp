@@ -53,7 +53,6 @@ struct Row {
   std::string owned_data;
 };
 
-
 }  // namespace tinylamb
 
 namespace std {

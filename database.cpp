@@ -4,6 +4,4 @@
 
 #include "database.hpp"
 
-namespace tinylamb {
-
-}  // namespace tinylamb
+namespace tinylamb {}  // namespace tinylamb

@@ -57,9 +57,7 @@ class Schema {
 
   [[nodiscard]] Column GetColumn(size_t idx) const;
 
-  bool operator==(const Schema& rhs) const {
-    return data == rhs.data;
-  }
+  bool operator==(const Schema& rhs) const { return data == rhs.data; }
 
   friend std::ostream& operator<<(std::ostream& o, const Schema& s) {
     o << s.Name() << ": [";
