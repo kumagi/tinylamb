@@ -29,10 +29,6 @@ class TransactionManager {
 
   Transaction Begin();
 
-  // This constructor is expected to be used in recovery process.
-  Transaction Begin(txn_id_t txn_id, TransactionStatus txn_status,
-                    lsn_t last_lsn);
-
   bool PreCommit(Transaction& txn);
 
   void Abort(Transaction& txn);
@@ -45,7 +41,6 @@ class TransactionManager {
 
   bool GetExclusiveLock(const RowPosition& rp);
   bool GetSharedLock(const RowPosition& rp);
-  void CommitLog(txn_id_t txn_id);
 
   lsn_t AddLog(const LogRecord& lr);
   lsn_t CommittedLSN() const;

@@ -170,13 +170,14 @@ void PageReplay(PageRef &&target,
     const lsn_t &lsn = iter->first;
     const LogRecord &undo_log = iter->second;
     const auto it = committed_txn.find(undo_log.txn_id);
+    assert(undo_log.pos.page_id == target->PageId());
     if (it == committed_txn.end()) {
-      LogUndo(target, lsn, undo_log, tm);
       LOG(INFO) << "undo: " << undo_log;
+      LogUndo(target, lsn, undo_log, tm);
     }
   }
 
-  // Release page latch.
+  // Release the page latch.
   target.PageUnlock();
 }
 

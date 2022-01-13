@@ -24,21 +24,6 @@ Transaction TransactionManager::Begin() {
   return new_txn;
 }
 
-Transaction TransactionManager::Begin(txn_id_t txn_id,
-                                      TransactionStatus txn_status,
-                                      lsn_t last_lsn) {
-  txn_id_t new_txn_id = txn_id;
-  Transaction new_txn(new_txn_id, this);
-  new_txn.lsns_.push_back(last_lsn);
-  new_txn.status_ = txn_status;
-  {
-    std::scoped_lock lk(transaction_table_lock);
-    active_transactions_.emplace(txn_id, &new_txn);
-  }
-  assert(!new_txn.IsFinished());
-  return new_txn;
-}
-
 bool TransactionManager::PreCommit(Transaction& txn) {
   assert(!txn.IsFinished());
   txn.SetStatus(TransactionStatus::kCommitted);
@@ -56,10 +41,6 @@ bool TransactionManager::PreCommit(Transaction& txn) {
     active_transactions_.erase(txn.txn_id_);
   }
   return true;
-}
-
-void TransactionManager::CommitLog(txn_id_t txn_id) {
-  logger_->AddLog(LogRecord(0, txn_id, LogType::kCommit));
 }
 
 void TransactionManager::Abort(Transaction& txn) {
