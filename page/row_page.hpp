@@ -68,7 +68,6 @@ class RowPage {
   };
 
   friend class Page;
-  friend class Catalog;
   friend class std::hash<RowPage>;
 
   [[nodiscard]] std::string_view GetRow(uint16_t slot) const {
