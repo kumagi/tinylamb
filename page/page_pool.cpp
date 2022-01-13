@@ -141,6 +141,9 @@ PagePool::~PagePool() {
 }
 
 void ZeroFillUntil(std::fstream& of, size_t expected) {
+  if (expected == 0) {
+    return;
+  }
   of.clear();
   of.seekp(0, std::ios_base::beg);
   const std::ofstream::pos_type start = of.tellp();
@@ -158,6 +161,7 @@ void PagePool::WriteBack(const Page* target) {
   src_.seekp(target->PageId() * kPageSize, std::ios_base::beg);
   if (src_.fail()) {
     ZeroFillUntil(src_, target->PageId() * kPageSize);
+    src_.clear();
   }
   src_.write(reinterpret_cast<const char*>(target), kPageSize);
   if (src_.fail()) {

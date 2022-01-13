@@ -19,6 +19,8 @@ class Recovery {
  public:
   Recovery(std::string_view log_path, PagePool* pp);
 
+  void SinglePageRecovery(PageRef&& page, TransactionManager* tm);
+
   void RecoverFrom(lsn_t checkpoint_lsn, TransactionManager* tm);
 
   bool ReadLog(lsn_t lsn, LogRecord* dst);

@@ -154,31 +154,29 @@ void LogUndo(PageRef &target, lsn_t lsn, const LogRecord &log,
 }
 
 // Precondition: the page is locked by this thread.
-void PageReplay(
-    PageRef &&target, const std::vector<std::pair<page_id_t, LogRecord>> &logs,
-    const std::unordered_map<txn_id_t, std::pair<TransactionStatus, lsn_t>>
-        &active_transaction_table,
-    TransactionManager *tm) {
-  for (const auto &it : logs) {
-    LOG(ERROR) << it.first << ": " << it.second;
-  }
-  // Redo & Undo specific page.
+void PageReplay(PageRef &&target,
+                const std::vector<std::pair<lsn_t, LogRecord>> &logs,
+                const std::unordered_set<txn_id_t> &committed_txn,
+                TransactionManager *tm) {
+  // Redo & Undo a specific page.
 
   // Redo phase.
   for (const auto &lsn_log : logs) {
     const lsn_t &lsn = lsn_log.first;
     const LogRecord &log = lsn_log.second;
-    LOG(INFO) << "redo: " << log;
-    LogRedo(target, lsn, log, tm);
+    if (target->PageLSN() < lsn) {
+      assert(log.pos.page_id == target->PageId());
+      LOG(INFO) << "redo: " << log;
+      LogRedo(target, lsn, log, tm);
+    }
   }
 
   // Undo phase.
   for (auto iter = logs.rbegin(); iter != logs.rend(); iter++) {
     const lsn_t &lsn = iter->first;
     const LogRecord &undo_log = iter->second;
-    const auto it = active_transaction_table.find(undo_log.txn_id);
-    if (it != active_transaction_table.end() &&
-        it->second.first != TransactionStatus::kCommitted) {
+    const auto it = committed_txn.find(undo_log.txn_id);
+    if (it == committed_txn.end()) {
       LogUndo(target, lsn, undo_log, tm);
       LOG(INFO) << "undo: " << undo_log;
     }
@@ -206,89 +204,100 @@ void Recovery::RefreshMap() {
       mmap(nullptr, filesize, PROT_READ, MAP_PRIVATE, fd, 0));
 }
 
-void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager *tm) {
-  std::uintmax_t filesize = std::filesystem::file_size(log_name_);
+void Recovery::SinglePageRecovery(PageRef &&page, TransactionManager *tm) {
   RefreshMap();
+  std::uintmax_t filesize = std::filesystem::file_size(log_name_);
+
+  // Collects all logs to redo & undo for each page.
+  std::vector<std::pair<lsn_t, LogRecord>> page_logs;
+  std::unordered_set<txn_id_t> committed_txn;
+  {
+    lsn_t offset = 0;
+    LogRecord log;
+    while (offset < filesize) {
+      bool success = LogRecord::ParseLogRecord(&log_data_[offset], &log);
+      if (!success) {
+        LOG(ERROR) << "Failed to parse log at offset: " << offset;
+        break;
+      }
+      if (IsPageManipulation(log.type) && log.pos.page_id == page->PageId()) {
+        page_logs.emplace_back(offset, log);
+      } else if (log.type == LogType::kCommit) {
+        committed_txn.insert(log.txn_id);
+      }
+      offset += log.Size();
+    }
+  }
+
+  // Redo & Undo phase starts here.
+  // Note that this loop could be parallelized for each page.
+  PageReplay(std::move(page), page_logs, committed_txn, tm);
+}
+
+void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager *tm) {
+  RefreshMap();
+  std::uintmax_t filesize = std::filesystem::file_size(log_name_);
 
   // Analysis phase starts here.
   std::unordered_map<page_id_t, lsn_t> dirty_page_table;
-  std::unordered_map<txn_id_t, std::pair<TransactionStatus, lsn_t>>
-      active_transaction_table;
+
+  auto UpdateOldestLSN = [&](page_id_t pid, lsn_t maybe_oldest) {
+    const auto it = dirty_page_table.find(pid);
+    if (it == dirty_page_table.end()) {
+      dirty_page_table.emplace(pid, maybe_oldest);
+    } else {
+      dirty_page_table[it->first] = std::min(maybe_oldest, it->second);
+    }
+  };
+
+  std::unordered_set<txn_id_t> committed_txn;
   lsn_t redo_start_point = filesize;
   {
     size_t offset = checkpoint_lsn;
     LogRecord log;
-    {
-      while (offset < filesize) {
-        bool success = LogRecord::ParseLogRecord(&log_data_[offset], &log);
-        if (!success) {
-          LOG(ERROR) << "Failed to parse log at offset: " << offset;
+    while (offset < filesize) {
+      bool success = LogRecord::ParseLogRecord(&log_data_[offset], &log);
+      if (!success) {
+        throw std::runtime_error("Invalid log: " + std::to_string(offset));
+      }
+
+      LOG(TRACE) << "analyzing: " << offset << ": " << log;
+      switch (log.type) {
+        case LogType::kUnknown:
+          throw std::runtime_error("Invalid log: " + std::to_string(offset));
+        case LogType::kBegin:
+          break;
+        case LogType::kSystemAllocPage:
+        case LogType::kSystemDestroyPage:
+        case LogType::kInsertRow:
+        case LogType::kUpdateRow:
+        case LogType::kDeleteRow:
+        case LogType::kCompensateInsertRow:
+        case LogType::kCompensateUpdateRow:
+        case LogType::kCompensateDeleteRow: {
+          // Collect the oldest LSN to dirty_page_table.
+          UpdateOldestLSN(log.pos.page_id, offset);
           break;
         }
-        LOG(TRACE) << "analyzing: " << offset << ": " << log;
-        switch (log.type) {
-          case LogType::kUnknown:
-            throw std::runtime_error("invalid log");
-          case LogType::kBegin:
-            active_transaction_table.emplace(
-                log.txn_id, std::make_pair(TransactionStatus::kRunning, 0));
-            break;
-          case LogType::kSystemAllocPage: {
-            const auto it = dirty_page_table.find(log.txn_id);
-            if (it == dirty_page_table.end()) {
-              dirty_page_table.emplace(log.pos.page_id, offset);
-            } else {
-              dirty_page_table[log.pos.page_id] = std::min(offset, it->second);
-            }
-            break;
+        case LogType::kCommit:
+          committed_txn.insert(log.txn_id);
+          break;
+        case LogType::kEndCheckpoint: {
+          // Collect the oldest LSN to dirty_page_table.
+          for (const auto &dpt : log.dirty_page_table) {
+            UpdateOldestLSN(dpt.first, dpt.second);
           }
-          case LogType::kSystemDestroyPage: {
-            const auto it = dirty_page_table.find(log.txn_id);
-            if (it == dirty_page_table.end()) {
-              dirty_page_table.emplace(log.pos.page_id, offset);
-            } else {
-              dirty_page_table[log.pos.page_id] = std::min(offset, it->second);
+          for (const auto &at : log.active_transaction_table) {
+            if (at.status == TransactionStatus::kCommitted) {
+              committed_txn.insert(at.txn_id);
             }
-            break;
           }
-          case LogType::kInsertRow:
-          case LogType::kUpdateRow:
-          case LogType::kDeleteRow:
-          case LogType::kCompensateInsertRow:
-          case LogType::kCompensateUpdateRow:
-          case LogType::kCompensateDeleteRow: {
-            const auto it = dirty_page_table.find(log.txn_id);
-            if (it == dirty_page_table.end()) {
-              dirty_page_table.emplace(log.pos.page_id, offset);
-            } else {
-              dirty_page_table[log.pos.page_id] = std::min(offset, it->second);
-            }
-            break;
-          }
-          case LogType::kCommit:
-            active_transaction_table[log.txn_id] =
-                std::make_pair(TransactionStatus::kCommitted, offset);
-            break;
-          case LogType::kEndCheckpoint: {
-            for (const auto &dpt : log.dirty_page_table) {
-              const auto it = dirty_page_table.find(log.txn_id);
-              if (it == dirty_page_table.end()) {
-                dirty_page_table.emplace(dpt.first, dpt.second);
-              } else {
-                dirty_page_table[it->first] = std::min(dpt.second, it->second);
-              }
-            }
-            for (const auto &at : log.active_transaction_table) {
-              active_transaction_table.emplace(
-                  at.txn_id, std::make_pair(at.status, at.last_lsn));
-            }
-            break;
-          }
-          default:
-            break;
+          break;
         }
-        offset += log.Size();
+        default:
+          break;
       }
+      offset += log.Size();
     }
 
     // Take minimum LSN from the dirty page table.
@@ -297,22 +306,30 @@ void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager *tm) {
     }
   }
 
-  // Collect logs to redo.
-  std::unordered_map<page_id_t, std::vector<std::pair<lsn_t, LogRecord>>>
-      page_logs;
-  page_logs.reserve(dirty_page_table.size());
-
+  // Collect all page references.
   std::unordered_map<page_id_t, PageRef> pages;
-  {
-    // Hold all dirty page's lock.
-    for (const auto &it : dirty_page_table) {
-      pages.emplace(it.first, pool_->GetPage(it.first, nullptr));
-      pool_->PageLock(it.first);
-      LOG(TRACE) << "page: " << it.first << " is dirty!";
+  pages.reserve(dirty_page_table.size());
+
+  // Take all dirty page's lock.
+  for (const auto &it : dirty_page_table) {
+    PageRef &&page = pool_->GetPage(it.first, nullptr);
+    pool_->PageLock(it.first);
+    if (!page->IsValid()) {
+      page->page_lsn = 0;
+      page->page_id = it.first;
+      LOG(INFO) << "Page " << it.first
+                << " is broken, trying Single Page Recovery";
+      SinglePageRecovery(std::move(page), tm);
+    } else {
+      pages.emplace(it.first, std::move(page));
     }
   }
+  // Now other user transactions can start concurrently.
 
-  // Now, other user transactions can start concurrently.
+  // Collects all logs to redo & undo for each page.
+  std::unordered_map<page_id_t, std::vector<std::pair<lsn_t, LogRecord>>>
+      page_logs;
+  page_logs.reserve(pages.size());
   {
     lsn_t offset = redo_start_point;
     LogRecord log;
@@ -323,24 +340,23 @@ void Recovery::RecoverFrom(lsn_t checkpoint_lsn, TransactionManager *tm) {
         break;
       }
       if (IsPageManipulation(log.type)) {
-        page_logs[log.pos.page_id].emplace_back(offset, log);
-      } else if (log.type == LogType::kCommit) {
-        auto it = active_transaction_table.find(log.txn_id);
-        if (it != active_transaction_table.end()) {
-          it->second.first = TransactionStatus::kCommitted;
+        const auto it = pages.find(log.pos.page_id);
+        if (it != pages.end()) {
+          page_logs[log.pos.page_id].emplace_back(offset, log);
         }
+      } else if (log.type == LogType::kCommit) {
+        committed_txn.insert(log.txn_id);
       }
       offset += log.Size();
     }
+  }
 
-    // Redo & Undo phase starts here.
-    for (const auto &page_log : page_logs) {
-      const uint64_t &page_id = page_log.first;
-      if (pages.find(page_id) == pages.end()) {
-      }
-      PageReplay(std::move(pages.find(page_id)->second), page_log.second,
-                 active_transaction_table, tm);
-    }
+  // Redo & Undo phase starts here.
+  // Note that this loop could be parallelized for each page.
+  for (const auto &page_log : page_logs) {
+    const uint64_t &page_id = page_log.first;
+    PageReplay(std::move(pages.find(page_id)->second), page_log.second,
+               committed_txn, tm);
   }
 }
 
