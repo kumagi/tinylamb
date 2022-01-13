@@ -12,7 +12,6 @@ void PageRef::PageUnlock() {
   assert(page_);
   assert(pool_);
   page_lock_.unlock();
-  page_lock_.release();
 }
 
 RowPage& PageRef::GetRowPage() {

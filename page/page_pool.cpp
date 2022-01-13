@@ -57,14 +57,11 @@ void PagePool::FlushPageForTest(page_id_t page_id) {
   WriteBack(it->second->page.get());
 }
 
-bool PagePool::Unpin(page_id_t page_id) {
+void PagePool::Unpin(page_id_t page_id) {
   std::scoped_lock latch(pool_latch);
   auto page_entry = pool_.find(page_id);
-  if (page_entry != pool_.end()) {
-    page_entry->second->pin_count--;
-    return true;
-  }
-  return false;
+  assert(page_entry != pool_.end());
+  page_entry->second->pin_count--;
 }
 
 // Precondition: pool_latch is locked.

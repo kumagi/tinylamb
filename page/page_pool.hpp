@@ -62,7 +62,7 @@ class PagePool {
   friend class CheckpointManager;
   friend class RecoveryManager;
 
-  bool Unpin(size_t page_id);
+  void Unpin(size_t page_id);
 
   bool EvictPage(LruType::iterator target);
 
@@ -73,10 +73,13 @@ class PagePool {
   PageRef AllocNewPage(size_t pid);
 
  private:
+  // Refresh the specified entry in LRU.
   void Touch(LruType::iterator it);
 
+  // Write `target` page into the file.
   void WriteBack(const Page* target);
 
+  // Read page at `pid` from the file to `target`.
   void ReadFrom(Page* target, page_id_t pid);
 
   std::string file_name_;
