@@ -56,13 +56,13 @@ TEST_F(CheckpointTest, Construct) {}
 TEST_F(CheckpointTest, DoCheckpoint) {
   InsertRow("expect this operation did not rerun");
   Transaction txn = tm_->Begin();
-  RowPosition inserted;
+  uint16_t slot;
   {
     PageRef page = p_->GetPage(page_id_);
-    page->Insert(txn, Row("inserted", RowPosition()), inserted);
+    page->Insert(txn, "inserted", &slot);
     p_->GetPool()->FlushPageForTest(page_id_);
     cm_->WriteCheckpoint();
-    page->Update(txn, inserted, Row("expect to be redone", RowPosition()));
+    page->Update(txn, slot, "expect to be redone");
     txn.PreCommit();
   }
   Recover();
@@ -72,57 +72,58 @@ TEST_F(CheckpointTest, DoCheckpoint) {
 TEST_F(CheckpointTest, CheckpointRecovery) {
   InsertRow("expect this operation did not rerun");
   Transaction txn = tm_->Begin();
-  RowPosition inserted;
+  uint16_t inserted;
   lsn_t restart_point;
   {
     PageRef page = p_->GetPage(page_id_);
-    page->Insert(txn, Row("inserted", RowPosition()), inserted);
+    page->Insert(txn, "inserted", &inserted);
     restart_point = cm_->WriteCheckpoint();
-    page->Update(txn, inserted, Row("expect to be redone", RowPosition()));
+    page->Update(txn, inserted, "expect to be redone");
     txn.PreCommit();
   }
   Recover();
   r_->RecoverFrom(restart_point, tm_.get());
-  EXPECT_EQ(ReadRow(inserted.slot), "expect to be redone");
+  EXPECT_EQ(ReadRow(inserted), "expect to be redone");
 }
 
 TEST_F(CheckpointTest, CheckpointAbortRecovery) {
   ASSERT_TRUE(InsertRow("original message"));
   Transaction txn = tm_->Begin();
-  RowPosition inserted(page_id_, 0);
+  uint16_t slot = 0;
   lsn_t restart_point;
   {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint();
-    page->Update(txn, inserted, Row("aborted", RowPosition()));
+    page->Update(txn, slot, "aborted");
     RowPosition insert_position;
-    page->Insert(txn, Row("will be deleted", RowPosition()), insert_position);
+    uint16_t will_be_deleted_row;
+    page->Insert(txn, "will be deleted", &will_be_deleted_row);
   }
   // Note that the txn is not committed.
   Recover();
   r_->RecoverFrom(restart_point, tm_.get());
   ASSERT_EQ(GetRowCount(), 1);
-  EXPECT_EQ(ReadRow(inserted.slot), "original message");
+  EXPECT_EQ(ReadRow(slot), "original message");
 }
 
 TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
   ASSERT_TRUE(InsertRow("original message"));
   Transaction txn = tm_->Begin();
-  RowPosition inserted(page_id_, 0);
+  uint16_t slot = 0;
   lsn_t restart_point;
   {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint([&]() {
-      page->Update(txn, inserted, Row("aborted", RowPosition()));
-      RowPosition insert_position;
-      page->Insert(txn, Row("will be deleted", RowPosition()), insert_position);
+      page->Update(txn, slot, "aborted");
+      uint16_t will_be_deleted_row;
+      page->Insert(txn, "will be deleted", &will_be_deleted_row);
     });
   }
   // Note that the txn is not committed.
   Recover();
   r_->RecoverFrom(restart_point, tm_.get());
   ASSERT_EQ(GetRowCount(), 1);
-  EXPECT_EQ(ReadRow(inserted.slot), "original message");
+  EXPECT_EQ(ReadRow(slot), "original message");
 }
 
 }  // namespace tinylamb

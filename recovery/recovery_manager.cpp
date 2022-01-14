@@ -48,21 +48,21 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
       break;
     case LogType::kInsertRow: {
       if (target->PageLSN() < lsn) {
-        target->InsertImpl(log.pos, log.redo_data);
+        target->InsertImpl(log.redo_data);
         target->SetPageLSN(lsn);
       }
       break;
     }
     case LogType::kUpdateRow: {
       if (target->PageLSN() < lsn) {
-        target->UpdateImpl(log.pos, log.redo_data);
+        target->UpdateImpl(log.pos.slot, log.redo_data);
         target->SetPageLSN(lsn);
       }
       break;
     }
     case LogType::kDeleteRow: {
       if (target->PageLSN() < lsn) {
-        target->DeleteImpl(log.pos);
+        target->DeleteImpl(log.pos.slot);
         target->SetPageLSN(lsn);
       }
       break;
@@ -82,21 +82,21 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
     case LogType::kEndCheckpoint:
     case LogType::kCompensateInsertRow: {
       if (target->PageLSN() < lsn) {
-        target->DeleteImpl(log.pos);
+        target->DeleteImpl(log.pos.slot);
         target->SetPageLSN(lsn);
       }
       break;
     }
     case LogType::kCompensateUpdateRow: {
       if (target->PageLSN() < lsn) {
-        target->UpdateImpl(log.pos, log.redo_data);
+        target->UpdateImpl(log.pos.slot, log.redo_data);
         target->SetPageLSN(lsn);
       }
       break;
     }
     case LogType::kCompensateDeleteRow: {
       if (target->PageLSN() < lsn) {
-        target->InsertImpl(log.pos, log.redo_data);
+        target->InsertImpl(log.redo_data);
         target->SetPageLSN(lsn);
       }
       break;
@@ -114,19 +114,19 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       break;
     case LogType::kInsertRow: {
       tm->CompensateInsertLog(log.txn_id, log.pos);
-      target->DeleteImpl(log.pos);
+      target->DeleteImpl(log.pos.slot);
       target->SetPageLSN(lsn);
       break;
     }
     case LogType::kUpdateRow: {
       tm->CompensateUpdateLog(log.txn_id, log.pos, log.undo_data);
-      target->UpdateImpl(log.pos, log.undo_data);
+      target->UpdateImpl(log.pos.slot, log.undo_data);
       target->SetPageLSN(lsn);
       break;
     }
     case LogType::kDeleteRow: {
       tm->CompensateDeleteLog(log.txn_id, log.pos, log.undo_data);
-      target->InsertImpl(log.pos, log.undo_data);
+      target->InsertImpl(log.undo_data);
       target->SetPageLSN(lsn);
       break;
     }

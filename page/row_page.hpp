@@ -10,8 +10,6 @@ namespace tinylamb {
 
 class RecoveryManager;
 class Transaction;
-class RowPosition;
-class Row;
 
 /*  Page Layout
  * +----------------------------------------------------+
@@ -41,16 +39,16 @@ class RowPage {
     // memset(data_, 0, kBodySize);
   }
 
-  bool Read(page_id_t page_id, Transaction& txn, const RowPosition& pos,
+  bool Read(page_id_t page_id, Transaction& txn, uint16_t slot,
             std::string_view* dst) const;
 
-  bool Insert(page_id_t page_id, Transaction& txn, const Row& record,
-              RowPosition& dst);
+  bool Insert(page_id_t page_id, Transaction& txn, std::string_view record,
+              uint16_t* dst);
 
-  bool Update(page_id_t page_id, Transaction& txn, const RowPosition& pos,
-              const Row& row);
+  bool Update(page_id_t page_id, Transaction& txn, uint16_t slot,
+              std::string_view record);
 
-  bool Delete(page_id_t page_id, Transaction& txn, const RowPosition& pos);
+  bool Delete(page_id_t page_id, Transaction& txn, uint16_t slot);
 
   [[nodiscard]] size_t RowCount() const;
 
@@ -77,9 +75,9 @@ class RowPage {
 
   uint16_t InsertRow(std::string_view new_row);
 
-  void UpdateRow(int slot, std::string_view new_row);
+  void UpdateRow(uint16_t slot, std::string_view record);
 
-  void DeleteRow(int slot);
+  void DeleteRow(uint16_t slot);
 
   page_id_t prev_page_id_ = 0;
   page_id_t next_page_id_ = 0;

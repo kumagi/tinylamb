@@ -1,6 +1,7 @@
 #ifndef TINYLAMB_PAGE_HPP
 #define TINYLAMB_PAGE_HPP
 
+#include <tiff.h>
 #include <unistd.h>
 
 #include <iostream>
@@ -12,8 +13,6 @@
 #include "page/row_page.hpp"
 
 namespace tinylamb {
-
-class RowPosition;
 
 class Page {
  public:
@@ -33,22 +32,29 @@ class Page {
   void DestroyPage(Transaction& txn, Page* target, PagePool& pool);
 
   // Row page manipulations.
-  bool Read(Transaction& txn, const RowPosition& pos, Row& dst) const;
+  bool Read(Transaction& txn, const uint16& slot,
+            std::string_view* result) const;
 
-  bool Insert(Transaction& txn, const Row& record, RowPosition& dst);
+  bool Insert(Transaction& txn, std::string_view record, uint16_t* slot);
 
-  bool Update(Transaction& txn, const RowPosition& pos, const Row& row);
+  bool Update(Transaction& txn, uint16_t slot, std::string_view row);
 
-  bool Delete(Transaction& txn, const RowPosition& pos);
+  bool Delete(Transaction& txn, const uint16_t pos);
 
   [[nodiscard]] size_t RowCount() const;
 
+  // Leaf page manipulations.
+  bool Insert(Transaction& txn, std::string_view key, std::string_view value);
+  bool Update(Transaction& txn, std::string_view key, std::string_view value);
+  bool Delete(Transaction& txn, std::string_view key);
+  bool Read(Transaction& txn, std::string_view key, std::string_view* result);
+
   // Internal methods exposed for recovery.
-  void InsertImpl(const RowPosition& pos, std::string_view redo);
+  void InsertImpl(std::string_view redo);
 
-  void UpdateImpl(const RowPosition& pos, std::string_view redo);
+  void UpdateImpl(uint16_t slot, std::string_view redo);
 
-  void DeleteImpl(const RowPosition& pos);
+  void DeleteImpl(uint16_t slot);
 
   void SetChecksum() const;
 
@@ -56,6 +62,7 @@ class Page {
   void* operator new(size_t page_id);
   void operator delete(void* page) noexcept;
 
+  // The ID for this page. This ID is also an offset of this page in file.
   page_id_t page_id = 0;
 
   // An LSN of the latest log which modified this page.

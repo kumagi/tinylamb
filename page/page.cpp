@@ -3,7 +3,7 @@
 #include <cstring>
 #include <iostream>
 
-#include "free_page.hpp"
+#include "page/free_page.hpp"
 #include "page/meta_page.hpp"
 #include "page/page_type.hpp"
 #include "page/row_page.hpp"
@@ -57,33 +57,29 @@ void Page::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
   SetRecLSN(txn.PrevLSN());
 }
 
-bool Page::Read(Transaction& txn, const RowPosition& pos, Row& dst) const {
+bool Page::Read(Transaction& txn, const uint16& slot,
+                std::string_view* result) const {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  std::string_view payload;
-  bool result = body.row_page.Read(PageID(), txn, pos, &payload);
-  if (result) {
-    dst = Row(payload, pos);
-  }
-  return result;
+  return body.row_page.Read(PageID(), txn, slot, result);
 }
 
-bool Page::Insert(Transaction& txn, const Row& record, RowPosition& dst) {
+bool Page::Insert(Transaction& txn, std::string_view record, uint16_t* slot) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  bool result = body.row_page.Insert(PageID(), txn, record, dst);
+  bool result = body.row_page.Insert(PageID(), txn, record, slot);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
   return result;
 }
 
-bool Page::Update(Transaction& txn, const RowPosition& pos, const Row& row) {
+bool Page::Update(Transaction& txn, uint16_t slot, std::string_view row) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  bool result = body.row_page.Update(PageID(), txn, pos, row);
+  bool result = body.row_page.Update(PageID(), txn, slot, row);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
   return result;
 }
 
-bool Page::Delete(Transaction& txn, const RowPosition& pos) {
+bool Page::Delete(Transaction& txn, const uint16_t pos) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
   bool result = body.row_page.Delete(PageID(), txn, pos);
   SetPageLSN(txn.PrevLSN());
@@ -96,21 +92,37 @@ size_t Page::RowCount() const {
   return body.row_page.RowCount();
 }
 
+// Leaf page manipulations.
+bool Page::Insert(Transaction& txn, std::string_view key,
+                  std::string_view value) {
+  return true;
+}
+
+bool Page::Update(Transaction& txn, std::string_view key,
+                  std::string_view value) {
+  return true;
+}
+bool Page::Delete(Transaction& txn, std::string_view key) { return true; }
+bool Page::Read(Transaction& txn, std::string_view key,
+                std::string_view* result) {
+  return true;
+}
+
 void Page::SetChecksum() const { checksum = std::hash<Page>()(*this); }
 
-void Page::InsertImpl(const RowPosition& pos, std::string_view redo) {
+void Page::InsertImpl(std::string_view redo) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
   body.row_page.InsertRow(redo);
 }
 
-void Page::UpdateImpl(const RowPosition& pos, std::string_view redo) {
+void Page::UpdateImpl(uint16_t slot, std::string_view redo) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  body.row_page.UpdateRow(pos.slot, redo);
+  body.row_page.UpdateRow(slot, redo);
 }
 
-void Page::DeleteImpl(const RowPosition& pos) {
+void Page::DeleteImpl(uint16_t slot) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  body.row_page.DeleteRow(pos.slot);
+  body.row_page.DeleteRow(slot);
 }
 
 bool Page::IsValid() const { return checksum == std::hash<Page>()(*this); }

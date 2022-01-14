@@ -140,7 +140,7 @@ void PagePool::WriteBack(const Page* target) {
   target->SetChecksum();
   src_.seekp(target->PageID() * kPageSize, std::ios_base::beg);
   if (src_.fail()) {
-    ZeroFillUntil(src_, target->PageID() * kPageSize);
+    // ZeroFillUntil(src_, target->PageID() * kPageSize);
     src_.clear();
   }
   src_.write(reinterpret_cast<const char*>(target), kPageSize);

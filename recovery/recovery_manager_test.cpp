@@ -63,19 +63,18 @@ TEST_F(RecoveryManagerTest, EmptyRecovery) { r_->RecoverFrom(0, tm_.get()); }
 
 TEST_F(RecoveryManagerTest, InsertAbort) {
   auto txn = tm_->Begin();
-  Row r;
-  r.data = "blah~blah";
+  std::string record = "blah~blah";
   PageRef page = p_->GetPage(page_id_);
   ASSERT_FALSE(page.IsNull());
   ASSERT_EQ(page->Type(), PageType::kRowPage);
 
   const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-  RowPosition pos;
-  ASSERT_TRUE(page->Insert(txn, r, pos));
+  uint16_t slot;
+  ASSERT_TRUE(page->Insert(txn, record, &slot));
   page.PageUnlock();
 
   ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
-            before_size - r.data.size() - sizeof(RowPage::RowPointer));
+            before_size - record.size() - sizeof(RowPage::RowPointer));
   txn.Abort();
   ASSERT_EQ(GetRowCount(), 0);
 }
@@ -84,15 +83,12 @@ TEST_F(RecoveryManagerTest, UpdateAbort) {
   std::string before = "before string hello world!", after = "replaced by this";
   ASSERT_TRUE(InsertRow(before));
   auto txn = tm_->Begin();
-  Row r;
-  r.data = after;
   PageRef page = p_->GetPage(page_id_);
   ASSERT_FALSE(page.IsNull());
   ASSERT_EQ(page->Type(), PageType::kRowPage);
 
   const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-  RowPosition pos(page->PageID(), 0);
-  ASSERT_TRUE(page->Update(txn, pos, r));
+  ASSERT_TRUE(page->Update(txn, 0, after));
   page.PageUnlock();
 
   ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
@@ -107,8 +103,7 @@ TEST_F(RecoveryManagerTest, DeleteAbort) {
   ASSERT_TRUE(InsertRow(before));
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(page_id_);
-  RowPosition target(page->PageID(), 0);
-  page->Delete(txn, target);
+  page->Delete(txn, 0);
   page.PageUnlock();
 
   txn.Abort();
@@ -169,18 +164,17 @@ TEST_F(RecoveryManagerTest, DeleteRowAbortRecovery) {
 
 TEST_F(RecoveryManagerTest, InsertCrash) {
   auto txn = tm_->Begin();
-  Row r;
-  r.data = "blah~blah";
+  std::string record = "blah~blah";
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
     const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-    RowPosition pos;
-    ASSERT_TRUE(page->Insert(txn, r, pos));
+    uint16_t slot;
+    ASSERT_TRUE(page->Insert(txn, record, &slot));
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
-              before_size - r.data.size() - sizeof(RowPage::RowPointer));
+              before_size - record.size() - sizeof(RowPage::RowPointer));
   }
   // Note that txn is not committed.
   Recover();
@@ -191,15 +185,13 @@ TEST_F(RecoveryManagerTest, InsertCrash) {
 TEST_F(RecoveryManagerTest, UpdateCrash) {
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
-  Row r;
-  r.data = "blah~blah";
+  std::string record = "blah~blah";
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-    RowPosition pos(page_id_, 0);
-    ASSERT_TRUE(page->Update(txn, pos, r));
+    ASSERT_TRUE(page->Update(txn, 0, record));
   }
   // Note that txn is not committed.
   Recover();
@@ -215,9 +207,7 @@ TEST_F(RecoveryManagerTest, DeleteCrash) {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-
-    RowPosition pos(page_id_, 0);
-    ASSERT_TRUE(page->Delete(txn, pos));
+    ASSERT_TRUE(page->Delete(txn, 0));
   }
   // Note that txn is not committed.
   Recover();
@@ -228,18 +218,17 @@ TEST_F(RecoveryManagerTest, DeleteCrash) {
 
 TEST_F(RecoveryManagerTest, InsertMediaCrash) {
   auto txn = tm_->Begin();
-  Row r;
-  r.data = "blah~blah";
+  std::string record = "blah~blah";
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
     const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-    RowPosition pos;
-    ASSERT_TRUE(page->Insert(txn, r, pos));
+    uint16_t slot;
+    ASSERT_TRUE(page->Insert(txn, record, &slot));
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
-              before_size - r.data.size() - sizeof(RowPage::RowPointer));
+              before_size - record.size() - sizeof(RowPage::RowPointer));
   }
   // Note that txn is not committed.
   MediaFailure();
@@ -250,15 +239,12 @@ TEST_F(RecoveryManagerTest, InsertMediaCrash) {
 TEST_F(RecoveryManagerTest, UpdateMediaCrash) {
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
-  Row r;
-  r.data = "blah~blah";
+  std::string record = "blah~blah";
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-
-    RowPosition pos(page_id_, 0);
-    ASSERT_TRUE(page->Update(txn, pos, r));
+    ASSERT_TRUE(page->Update(txn, 0, record));
     // Note that txn is not committed.
   }
   MediaFailure();
@@ -274,9 +260,7 @@ TEST_F(RecoveryManagerTest, DeleteMediaCrash) {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-
-    RowPosition pos(page_id_, 0);
-    ASSERT_TRUE(page->Delete(txn, pos));
+    ASSERT_TRUE(page->Delete(txn, 0));
   }
   // Note that txn is not committed.
   MediaFailure();
@@ -287,18 +271,17 @@ TEST_F(RecoveryManagerTest, DeleteMediaCrash) {
 
 TEST_F(RecoveryManagerTest, InsertSinglePageFailure) {
   auto txn = tm_->Begin();
-  Row r;
-  r.data = "blah~blah";
+  std::string record = "blah~blah";
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
     const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-    RowPosition pos;
-    ASSERT_TRUE(page->Insert(txn, r, pos));
+    uint16_t slot;
+    ASSERT_TRUE(page->Insert(txn, record, &slot));
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
-              before_size - r.data.size() - sizeof(RowPage::RowPointer));
+              before_size - record.size() - sizeof(RowPage::RowPointer));
   }
   // Note that txn is not committed.
   SinglePageFailure(page_id_);
@@ -309,16 +292,12 @@ TEST_F(RecoveryManagerTest, InsertSinglePageFailure) {
 TEST_F(RecoveryManagerTest, UpdateSinglePageFailure) {
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
-  Row r;
-  r.data = "modified message";
+  std::string record = "modified message";
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-
-    const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-    RowPosition pos(page_id_, 0);
-    ASSERT_TRUE(page->Update(txn, pos, r));
+    ASSERT_TRUE(page->Update(txn, 0, record));
   }
   // Note that txn is not committed.
   SinglePageFailure(page_id_);
@@ -334,9 +313,7 @@ TEST_F(RecoveryManagerTest, DeleteSinglePageFailure) {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-
-    RowPosition pos(page_id_, 0);
-    ASSERT_TRUE(page->Delete(txn, pos));
+    ASSERT_TRUE(page->Delete(txn, 0));
   }
   // Note that txn is not committed.
   SinglePageFailure(page_id_);

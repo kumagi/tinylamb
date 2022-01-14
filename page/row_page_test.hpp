@@ -44,19 +44,17 @@ class RowPageTest : public ::testing::Test {
 
   bool InsertRow(std::string_view str, bool commit = true) {
     auto txn = tm_->Begin();
-    Row r;
-    r.data = str;
     PageRef page = p_->GetPage(page_id_);
     const RowPage& rp = page.GetRowPage();
     EXPECT_FALSE(page.IsNull());
     EXPECT_EQ(page->Type(), PageType::kRowPage);
 
     const uint16_t before_size = rp.FreeSizeForTest();
-    RowPosition pos;
-    bool success = page->Insert(txn, r, pos);
+    uint16_t slot;
+    bool success = page->Insert(txn, str, &slot);
     if (success) {
       EXPECT_EQ(rp.FreeSizeForTest(),
-                before_size - r.data.size() - sizeof(RowPage::RowPointer));
+                before_size - str.size() - sizeof(RowPage::RowPointer));
     }
     if (commit) {
       EXPECT_TRUE(txn.PreCommit());
@@ -70,13 +68,10 @@ class RowPageTest : public ::testing::Test {
 
   void UpdateRow(int slot, std::string_view str, bool commit = true) {
     auto txn = tm_->Begin();
-    Row r;
-    r.data = str;
     PageRef page = p_->GetPage(page_id_);
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-    RowPosition pos(page_id_, slot);
-    ASSERT_TRUE(page->Update(txn, pos, r));
+    ASSERT_TRUE(page->Update(txn, slot, str));
     if (commit) {
       ASSERT_TRUE(txn.PreCommit());
     } else {
@@ -91,8 +86,7 @@ class RowPageTest : public ::testing::Test {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-    RowPosition pos(page_id_, slot);
-    ASSERT_TRUE(page->Delete(txn, pos));
+    ASSERT_TRUE(page->Delete(txn, slot));
     if (commit) {
       ASSERT_TRUE(txn.PreCommit());
     } else {
@@ -106,13 +100,11 @@ class RowPageTest : public ::testing::Test {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(page_id_);
     EXPECT_FALSE(page.IsNull());
-    Row dst;
-    RowPosition pos(page_id_, slot);
-    EXPECT_TRUE(page->Read(txn, pos, dst));
-    dst.MakeOwned();
+    std::string_view dst;
+    EXPECT_TRUE(page->Read(txn, slot, &dst));
     EXPECT_TRUE(txn.PreCommit());
     txn.CommitWait();
-    return dst.owned_data;
+    return std::string(dst);
   }
 
   size_t GetRowCount() {
