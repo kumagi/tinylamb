@@ -8,7 +8,6 @@
 #include "page/page_type.hpp"
 #include "page/row_page.hpp"
 #include "transaction/transaction.hpp"
-#include "type/row.hpp"
 
 #define ASSERT_PAGE_TYPE(expected_type)            \
   if (type != (expected_type)) {                   \
@@ -36,6 +35,9 @@ void Page::PageInit(uint64_t pid, PageType page_type) {
       break;
     case PageType::kRowPage:
       body.row_page.Initialize();
+      break;
+    case PageType::kLeafPage:
+      body.leaf_page.Initialize();
       break;
   }
 }
@@ -95,17 +97,34 @@ size_t Page::RowCount() const {
 // Leaf page manipulations.
 bool Page::Insert(Transaction& txn, std::string_view key,
                   std::string_view value) {
-  return true;
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  bool result = body.leaf_page.Insert(PageID(), txn, key, value);
+  SetPageLSN(txn.PrevLSN());
+  SetRecLSN(txn.PrevLSN());
+  return result;
 }
 
 bool Page::Update(Transaction& txn, std::string_view key,
                   std::string_view value) {
-  return true;
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  bool result = body.leaf_page.Update(PageID(), txn, key, value);
+  SetPageLSN(txn.PrevLSN());
+  SetRecLSN(txn.PrevLSN());
+  return result;
 }
-bool Page::Delete(Transaction& txn, std::string_view key) { return true; }
+
+bool Page::Delete(Transaction& txn, std::string_view key) {
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  bool result = body.leaf_page.Delete(PageID(), txn, key);
+  SetPageLSN(txn.PrevLSN());
+  SetRecLSN(txn.PrevLSN());
+  return result;
+}
+
 bool Page::Read(Transaction& txn, std::string_view key,
                 std::string_view* result) {
-  return true;
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  return body.leaf_page.Read(PageID(), txn, key, result);
 }
 
 void Page::SetChecksum() const { checksum = std::hash<Page>()(*this); }
@@ -123,6 +142,21 @@ void Page::UpdateImpl(uint16_t slot, std::string_view redo) {
 void Page::DeleteImpl(uint16_t slot) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
   body.row_page.DeleteRow(slot);
+}
+
+void Page::InsertImpl(std::string_view key, std::string_view value) {
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  body.leaf_page.InsertImpl(key, value);
+}
+
+void Page::UpdateImpl(std::string_view key, std::string_view value) {
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  body.leaf_page.UpdateImpl(key, value);
+}
+
+void Page::DeleteImpl(std::string_view key) {
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  body.leaf_page.DeleteImpl(key);
 }
 
 bool Page::IsValid() const { return checksum == std::hash<Page>()(*this); }

@@ -55,14 +55,14 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
     }
     case LogType::kUpdateRow: {
       if (target->PageLSN() < lsn) {
-        target->UpdateImpl(log.pos.slot, log.redo_data);
+        target->UpdateImpl(log.slot, log.redo_data);
         target->SetPageLSN(lsn);
       }
       break;
     }
     case LogType::kDeleteRow: {
       if (target->PageLSN() < lsn) {
-        target->DeleteImpl(log.pos.slot);
+        target->DeleteImpl(log.slot);
         target->SetPageLSN(lsn);
       }
       break;
@@ -71,7 +71,7 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
       break;
     case LogType::kSystemAllocPage: {
       if (target->PageLSN() < lsn || !target->IsValid()) {
-        target->PageInit(log.pos.page_id, log.allocated_page_type);
+        target->PageInit(log.pid, log.allocated_page_type);
       }
       break;
     }
@@ -82,14 +82,14 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
     case LogType::kEndCheckpoint:
     case LogType::kCompensateInsertRow: {
       if (target->PageLSN() < lsn) {
-        target->DeleteImpl(log.pos.slot);
+        target->DeleteImpl(log.slot);
         target->SetPageLSN(lsn);
       }
       break;
     }
     case LogType::kCompensateUpdateRow: {
       if (target->PageLSN() < lsn) {
-        target->UpdateImpl(log.pos.slot, log.redo_data);
+        target->UpdateImpl(log.slot, log.redo_data);
         target->SetPageLSN(lsn);
       }
       break;
@@ -113,19 +113,21 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
     case LogType::kBegin:
       break;
     case LogType::kInsertRow: {
-      tm->CompensateInsertLog(log.txn_id, log.pos);
-      target->DeleteImpl(log.pos.slot);
+      tm->CompensateInsertLog(log.txn_id, RowPosition(log.pid, log.slot));
+      target->DeleteImpl(log.slot);
       target->SetPageLSN(lsn);
       break;
     }
     case LogType::kUpdateRow: {
-      tm->CompensateUpdateLog(log.txn_id, log.pos, log.undo_data);
-      target->UpdateImpl(log.pos.slot, log.undo_data);
+      tm->CompensateUpdateLog(log.txn_id, RowPosition(log.pid, log.slot),
+                              log.undo_data);
+      target->UpdateImpl(log.slot, log.undo_data);
       target->SetPageLSN(lsn);
       break;
     }
     case LogType::kDeleteRow: {
-      tm->CompensateDeleteLog(log.txn_id, log.pos, log.undo_data);
+      tm->CompensateDeleteLog(log.txn_id, RowPosition(log.pid, log.slot),
+                              log.undo_data);
       target->InsertImpl(log.undo_data);
       target->SetPageLSN(lsn);
       break;
@@ -141,7 +143,7 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       LOG(ERROR) << "Redoing alloc is not implemented yet";
       break;
     case LogType::kSystemDestroyPage: {
-      target->PageInit(log.pos.page_id, log.allocated_page_type);
+      target->PageInit(log.pid, log.allocated_page_type);
       break;
     }
   }
@@ -158,7 +160,7 @@ void PageReplay(PageRef&& target,
   for (const auto& lsn_log : logs) {
     const lsn_t& lsn = lsn_log.first;
     const LogRecord& log = lsn_log.second;
-    assert(log.pos.page_id == target->PageID());
+    assert(log.pid == target->PageID());
     if (target->PageLSN() < lsn) {
       LOG(INFO) << "redo: " << log;
       LogRedo(target, lsn, log);
@@ -170,7 +172,7 @@ void PageReplay(PageRef&& target,
     const lsn_t& lsn = iter->first;
     const LogRecord& undo_log = iter->second;
     const auto it = committed_txn.find(undo_log.txn_id);
-    assert(undo_log.pos.page_id == target->PageID());
+    assert(undo_log.pid == target->PageID());
     if (it == committed_txn.end()) {
       LOG(INFO) << "undo: " << undo_log;
       LogUndo(target, lsn, undo_log, tm);
@@ -216,7 +218,7 @@ void RecoveryManager::SinglePageRecovery(PageRef&& page,
         LOG(ERROR) << "Failed to parse log at offset: " << offset;
         break;
       }
-      if (IsPageManipulation(log.type) && log.pos.page_id == page->PageID()) {
+      if (IsPageManipulation(log.type) && log.pid == page->PageID()) {
         page_logs.emplace_back(offset, log);
       } else if (log.type == LogType::kCommit) {
         committed_txn.insert(log.txn_id);
@@ -273,7 +275,7 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
         case LogType::kCompensateUpdateRow:
         case LogType::kCompensateDeleteRow: {
           // Collect the oldest LSN to dirty_page_table.
-          UpdateOldestLSN(log.pos.page_id, offset);
+          UpdateOldestLSN(log.pid, offset);
           break;
         }
         case LogType::kCommit:
@@ -336,9 +338,9 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
         break;
       }
       if (IsPageManipulation(log.type)) {
-        const auto it = pages.find(log.pos.page_id);
+        const auto it = pages.find(log.pid);
         if (it != pages.end()) {
-          page_logs[log.pos.page_id].emplace_back(offset, log);
+          page_logs[log.pid].emplace_back(offset, log);
         }
       } else if (log.type == LogType::kCommit) {
         committed_txn.insert(log.txn_id);
@@ -365,7 +367,7 @@ void RecoveryManager::LogUndoWithPage(lsn_t lsn, const LogRecord& log,
                                       TransactionManager* tm) {
   bool cache_hit;
   if (IsPageManipulation(log.type)) {
-    PageRef target = pool_->GetPage(log.pos.page_id, &cache_hit);
+    PageRef target = pool_->GetPage(log.pid, &cache_hit);
     LogUndo(target, lsn, log, tm);
   }
 }

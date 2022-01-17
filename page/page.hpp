@@ -9,6 +9,7 @@
 #include "constants.hpp"
 #include "log_message.hpp"
 #include "page/free_page.hpp"
+#include "page/leaf_page.hpp"
 #include "page/meta_page.hpp"
 #include "page/row_page.hpp"
 
@@ -39,7 +40,7 @@ class Page {
 
   bool Update(Transaction& txn, uint16_t slot, std::string_view row);
 
-  bool Delete(Transaction& txn, const uint16_t pos);
+  bool Delete(Transaction& txn, uint16_t pos);
 
   [[nodiscard]] size_t RowCount() const;
 
@@ -55,6 +56,10 @@ class Page {
   void UpdateImpl(uint16_t slot, std::string_view redo);
 
   void DeleteImpl(uint16_t slot);
+
+  void InsertImpl(std::string_view key, std::string_view value);
+  void UpdateImpl(std::string_view key, std::string_view value);
+  void DeleteImpl(std::string_view key);
 
   void SetChecksum() const;
 
@@ -77,6 +82,7 @@ class Page {
     MetaPage meta_page;
     FreePage free_page;
     RowPage row_page;
+    LeafPage leaf_page;
     PageBody() : dummy_() {}
   };
   PageBody body;

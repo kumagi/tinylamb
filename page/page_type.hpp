@@ -15,6 +15,8 @@ enum class PageType : uint64_t {
   kFreePage,
   kMetaPage,
   kRowPage,
+  kLeafPage,
+  kInternalPage,
 };
 
 std::ostream& operator<<(std::ostream& o, const PageType& type);

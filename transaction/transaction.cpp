@@ -95,6 +95,33 @@ lsn_t Transaction::DeleteLog(const RowPosition& pos, std::string_view undo) {
   return lsns_.back();
 }
 
+lsn_t Transaction::InsertLog(page_id_t pid, std::string_view key,
+                             std::string_view value) {
+  assert(!IsFinished());
+  LogRecord lr =
+      LogRecord::InsertingLogRecord(lsns_.back(), txn_id_, pid, key, value);
+  lsns_.push_back(transaction_manager_->AddLog(lr));
+  return lsns_.back();
+}
+
+lsn_t Transaction::UpdateLog(page_id_t pid, std::string_view key,
+                             std::string_view prev, std::string_view value) {
+  assert(!IsFinished());
+  LogRecord lr = LogRecord::UpdatingLogRecord(lsns_.back(), txn_id_, pid, key,
+                                              prev, value);
+  lsns_.push_back(transaction_manager_->AddLog(lr));
+  return lsns_.back();
+}
+
+lsn_t Transaction::DeleteLog(page_id_t pid, std::string_view key,
+                             std::string_view prev) {
+  assert(!IsFinished());
+  LogRecord lr =
+      LogRecord::DeletingLogRecord(lsns_.back(), txn_id_, pid, key, prev);
+  lsns_.push_back(transaction_manager_->AddLog(lr));
+  return lsns_.back();
+}
+
 lsn_t Transaction::AllocatePageLog(page_id_t allocated_page_id,
                                    PageType new_page_type) {
   assert(!IsFinished());

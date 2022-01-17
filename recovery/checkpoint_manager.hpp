@@ -32,6 +32,7 @@ class CheckpointManager {
 
   void WorkerThreadTask();
   struct ActiveTransactionEntry {
+    ActiveTransactionEntry() {}
     ActiveTransactionEntry(uint64_t id, TransactionStatus st, lsn_t lsn)
         : txn_id(id), status(st), last_lsn(lsn) {}
     friend std::ostream& operator<<(std::ostream& o,
@@ -41,13 +42,37 @@ class CheckpointManager {
       return o;
     }
 
+    size_t Serialize(char* dst) const {
+      memcpy(dst, &txn_id, sizeof(txn_id));
+      dst += sizeof(txn_id);
+      memcpy(dst, &status, sizeof(status));
+      dst += sizeof(status);
+      memcpy(dst, &last_lsn, sizeof(last_lsn));
+      dst += sizeof(last_lsn);
+      return Size();
+    }
+
+    static size_t Deserialize(const char* src, ActiveTransactionEntry* dst) {
+      const auto* txn_id = reinterpret_cast<const txn_id_t*>(src);
+      src += sizeof(*txn_id);
+      const auto* status = reinterpret_cast<const TransactionStatus*>(src);
+      src += sizeof(*status);
+      const auto* last_lsn = reinterpret_cast<const lsn_t*>(src);
+      *dst = {*txn_id, *status, *last_lsn};
+      return Size();
+    }
+
+    static size_t Size() {
+      return sizeof(txn_id_t) + sizeof(TransactionStatus) + sizeof(lsn_t);
+    }
+
     bool operator==(const ActiveTransactionEntry& rhs) const {
       return txn_id == rhs.txn_id && status == rhs.status &&
              last_lsn == rhs.last_lsn;
     }
-    txn_id_t txn_id;
-    TransactionStatus status;
-    lsn_t last_lsn;
+    txn_id_t txn_id = 0;
+    TransactionStatus status = TransactionStatus::kRunning;
+    lsn_t last_lsn = 0;
   };
 
   // This function is intentionally public for test.

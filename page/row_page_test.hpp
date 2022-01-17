@@ -27,6 +27,9 @@ class RowPageTest : public ::testing::Test {
   }
 
   virtual void Recover() {
+    if (p_) {
+      p_->GetPool()->LostAllPageForTest();
+    }
     tm_.reset();
     lm_.reset();
     l_.reset();
@@ -40,6 +43,10 @@ class RowPageTest : public ::testing::Test {
   void TearDown() override {
     std::remove(kDBFileName);
     std::remove(kLogName);
+  }
+
+  void Flush() {
+    p_->GetPool()->FlushPageForTest(page_id_);
   }
 
   bool InsertRow(std::string_view str, bool commit = true) {

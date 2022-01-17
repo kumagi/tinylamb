@@ -42,6 +42,7 @@ TEST_F(RowPageTest, ReadMany) {
     InsertRow(std::to_string(i) + " message");
     ASSERT_EQ(ReadRow(i), std::to_string(i) + " message");
   }
+  Flush();
   Recover();
   for (int i = 0; i < kInserts; ++i) {
     ASSERT_EQ(ReadRow(i), std::to_string(i) + " message");
@@ -55,16 +56,19 @@ TEST_F(RowPageTest, UpdateMany) {
   for (int i = 0; i < kInserts; ++i) {
     InsertRow(std::to_string(i) + " message");
   }
+  Flush();
   Recover();  // RecoveryManager process will not do wrong thing.
   for (int i = 0; i < kInserts; i += 2) {  // even numbers.
     UpdateRow(i, std::to_string(i) + kLongMessage);
     ASSERT_EQ(ReadRow(i), std::to_string(i) + kLongMessage);
   }
+  Flush();
   Recover();  // RecoveryManager process will not do wrong thing.
   for (int i = 1; i < kInserts; i += 2) {  // odd numbers.
     UpdateRow(i, std::to_string(i) + kShortMessage);
     ASSERT_EQ(ReadRow(i), std::to_string(i) + kShortMessage);
   }
+  Flush();
   Recover();  // RecoveryManager process will not do wrong thing.
   for (int i = 0; i < kInserts; ++i) {
     if (i % 2 == 0) {
@@ -84,6 +88,7 @@ TEST_F(RowPageTest, DeleteMany) {
     InsertRow(message);
     inserted.insert(message);
   }
+  Flush();
   Recover();
   int deleted = 0;
   for (int i = 0; i < kRows / 2; ++i) {
@@ -93,6 +98,7 @@ TEST_F(RowPageTest, DeleteMany) {
     ++deleted;
   }
   ASSERT_EQ(GetRowCount(), kRows - deleted);
+  Flush();
   Recover();
   for (int i = 0; i < GetRowCount(); ++i) {
     std::string got_row = ReadRow(i);

@@ -57,6 +57,11 @@ class Transaction {
                   std::string_view redo);
   lsn_t DeleteLog(const RowPosition& pos, std::string_view undo);
 
+  lsn_t InsertLog(page_id_t pid, std::string_view key, std::string_view value);
+  lsn_t UpdateLog(page_id_t pid, std::string_view key, std::string_view prev,
+                  std::string_view value);
+  lsn_t DeleteLog(page_id_t pid, std::string_view key, std::string_view prev);
+
   lsn_t AllocatePageLog(page_id_t page_id, PageType new_page_type);
 
   lsn_t DestroyPageLog(page_id_t page_id);
