@@ -15,7 +15,7 @@ Transaction TransactionManager::Begin() {
 
   Transaction new_txn(new_txn_id, this);
   LogRecord begin_log(0, new_txn_id, LogType::kBegin);
-  new_txn.lsns_.push_back(logger_->AddLog(begin_log));
+  new_txn.prev_lsn_ = logger_->AddLog(begin_log);
   {
     std::scoped_lock lk(transaction_table_lock);
     active_transactions_.emplace(new_txn_id, &new_txn);
@@ -28,8 +28,8 @@ bool TransactionManager::PreCommit(Transaction& txn) {
   assert(!txn.IsFinished());
   txn.SetStatus(TransactionStatus::kCommitted);
   // CommitLog(txn.txn_id_);
-  LogRecord commit_log(txn.lsns_.back(), txn.txn_id_, LogType::kCommit);
-  txn.lsns_.push_back(logger_->AddLog(commit_log));
+  LogRecord commit_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
+  txn.prev_lsn_ = logger_->AddLog(commit_log);
   for (auto& row : txn.read_set_) {
     lock_manager_->ReleaseSharedLock(row);
   }
@@ -46,17 +46,18 @@ bool TransactionManager::PreCommit(Transaction& txn) {
 void TransactionManager::Abort(Transaction& txn) {
   // Iterate prev_lsn to beginning of the transaction with undoing.
   {
-    const uint64_t latest_log = txn.lsns_.back();
+    const uint64_t latest_log = txn.prev_lsn_;
     while (CommittedLSN() <= latest_log) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
-  std::reverse(txn.lsns_.begin(), txn.lsns_.end());
-  for (const auto& log_lsn : txn.lsns_) {
+  lsn_t prev = txn.prev_lsn_;
+  while (prev != 0) {
     LogRecord lr;
-    recovery_->ReadLog(log_lsn, &lr);
+    recovery_->ReadLog(prev, &lr);
     LOG(TRACE) << "txn undo: " << lr;
-    recovery_->LogUndoWithPage(log_lsn, lr, txn.transaction_manager_);
+    recovery_->LogUndoWithPage(prev, lr, txn.transaction_manager_);
+    prev = lr.prev_lsn;
   }
   PreCommit(txn);  // Writes an empty commit.
 }

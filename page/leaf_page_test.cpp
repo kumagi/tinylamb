@@ -168,4 +168,36 @@ TEST_F(LeafPageTest, DeleteMany) {
     }
   }
 }
+
+TEST_F(LeafPageTest, InsertDeflag) {
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(leaf_page_id_);
+
+  // Insert value.
+  std::string value;
+  value.resize(10000);
+  for (char& i : value) i = '1';
+  ASSERT_TRUE(page->Insert(txn, "key1", value));  // About 10000 bytes used.
+  for (char& i : value) i = '2';
+  ASSERT_TRUE(page->Insert(txn, "key2", value));  // About 20000 bytes used.
+  for (char& i : value) i = '3';
+  ASSERT_TRUE(page->Insert(txn, "key3", value));   // About 30000 bytes used.
+  ASSERT_FALSE(page->Insert(txn, "key4", value));  // No space left.
+  ASSERT_TRUE(page->Delete(txn, "key2"));          // Make new space.
+  for (char& i : value) i = '4';
+  ASSERT_TRUE(page->Insert(txn, "key4", value));   // Should success.
+  ASSERT_FALSE(page->Insert(txn, "key5", value));  // No space left.
+  ASSERT_TRUE(page->Delete(txn, "key1"));          // Make new space.
+  for (char& i : value) i = '5';
+  ASSERT_TRUE(page->Insert(txn, "key5", value));  // Should success.
+
+  std::string_view row;
+  ASSERT_TRUE(page->Read(txn, "key3", &row));
+  for (const char& i : row) ASSERT_EQ(i, '3');
+  ASSERT_TRUE(page->Read(txn, "key4", &row));
+  for (const char& i : row) ASSERT_EQ(i, '4');
+  ASSERT_TRUE(page->Read(txn, "key5", &row));
+  for (const char& i : row) ASSERT_EQ(i, '5');
+}
+
 }  // namespace tinylamb

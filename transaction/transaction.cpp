@@ -73,75 +73,74 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
 
 lsn_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
   assert(!IsFinished());
-  LogRecord lr =
-      LogRecord::InsertingLogRecord(lsns_.back(), txn_id_, pos, redo);
-  lsns_.push_back(transaction_manager_->AddLog(lr));
-  return lsns_.back();
+  LogRecord lr = LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pos, redo);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
 }
 
 lsn_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
                              std::string_view redo) {
   assert(!IsFinished());
   LogRecord lr =
-      LogRecord::UpdatingLogRecord(lsns_.back(), txn_id_, pos, redo, undo);
-  lsns_.push_back(transaction_manager_->AddLog(lr));
-  return lsns_.back();
+      LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pos, redo, undo);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
 }
 
 lsn_t Transaction::DeleteLog(const RowPosition& pos, std::string_view undo) {
   assert(!IsFinished());
-  LogRecord lr = LogRecord::DeletingLogRecord(lsns_.back(), txn_id_, pos, undo);
-  lsns_.push_back(transaction_manager_->AddLog(lr));
-  return lsns_.back();
+  LogRecord lr = LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pos, undo);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
 }
 
 lsn_t Transaction::InsertLog(page_id_t pid, std::string_view key,
                              std::string_view value) {
   assert(!IsFinished());
   LogRecord lr =
-      LogRecord::InsertingLogRecord(lsns_.back(), txn_id_, pid, key, value);
-  lsns_.push_back(transaction_manager_->AddLog(lr));
-  return lsns_.back();
+      LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pid, key, value);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
 }
 
 lsn_t Transaction::UpdateLog(page_id_t pid, std::string_view key,
                              std::string_view prev, std::string_view value) {
   assert(!IsFinished());
-  LogRecord lr = LogRecord::UpdatingLogRecord(lsns_.back(), txn_id_, pid, key,
-                                              prev, value);
-  lsns_.push_back(transaction_manager_->AddLog(lr));
-  return lsns_.back();
+  LogRecord lr =
+      LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, key, prev, value);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
 }
 
 lsn_t Transaction::DeleteLog(page_id_t pid, std::string_view key,
                              std::string_view prev) {
   assert(!IsFinished());
   LogRecord lr =
-      LogRecord::DeletingLogRecord(lsns_.back(), txn_id_, pid, key, prev);
-  lsns_.push_back(transaction_manager_->AddLog(lr));
-  return lsns_.back();
+      LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, key, prev);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
 }
 
 lsn_t Transaction::AllocatePageLog(page_id_t allocated_page_id,
                                    PageType new_page_type) {
   assert(!IsFinished());
   LogRecord lr = LogRecord::AllocatePageLogRecord(
-      lsns_.back(), txn_id_, allocated_page_id, new_page_type);
-  lsns_.push_back(transaction_manager_->AddLog(lr));
-  return lsns_.back();
+      prev_lsn_, txn_id_, allocated_page_id, new_page_type);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
 }
 
 lsn_t Transaction::DestroyPageLog(page_id_t destroyed_page_id) {
   assert(!IsFinished());
   LogRecord lr =
-      LogRecord::DestroyPageLogRecord(lsns_.back(), txn_id_, destroyed_page_id);
-  lsns_.push_back(transaction_manager_->AddLog(lr));
-  return lsns_.back();
+      LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
 }
 
 // Using this function is discouraged to get performance of flush pipelining.
 void Transaction::CommitWait() const {
-  while (transaction_manager_->CommittedLSN() < lsns_.back()) {
+  while (transaction_manager_->CommittedLSN() < prev_lsn_) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 }

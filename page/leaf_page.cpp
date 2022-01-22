@@ -45,8 +45,8 @@ bool LeafPage::Insert(page_id_t page_id, Transaction& txn, std::string_view key,
                       std::string_view value) {
   const uint16_t physical_size =
       sizeof(uint16_t) + key.size() + sizeof(uint16_t) + value.size();
+
   if (free_size_ < physical_size + sizeof(RowPointer)) {
-    // There is no enough space.
     return false;
   }
 
@@ -62,7 +62,6 @@ bool LeafPage::Insert(page_id_t page_id, Transaction& txn, std::string_view key,
   if (kPageSize - sizeof(RowPointer) * (row_count_ + 1) <
       free_ptr_ + physical_size) {
     DeFragment();
-    throw std::runtime_error("not implemented");
   }
 
   InsertImpl(key, value);
@@ -143,7 +142,9 @@ void LeafPage::DeleteImpl(std::string_view key) {
   for (size_t i = 0; i < row_count_; ++i) {
     std::string_view cur_key = GetKey(rows[i]);
     if (cur_key == key) {
+      free_size_ += rows[i].size + sizeof(RowPointer);
       memmove(&rows[1], &rows[0], sizeof(RowPointer) * i);
+
       --row_count_;
       return;
     }
@@ -155,7 +156,6 @@ bool LeafPage::Read(page_id_t page_id, Transaction& txn, std::string_view key,
   *result = std::string_view();
   // TODO(kumagi): Do binary search to find the data faster.
   RowPointer* rows = Rows();
-
   for (size_t i = 0; i < row_count_; ++i) {
     std::string_view cur_key = GetKey(rows[i]);
     if (cur_key == key) {
@@ -167,7 +167,19 @@ bool LeafPage::Read(page_id_t page_id, Transaction& txn, std::string_view key,
 }
 
 void LeafPage::DeFragment() {
-  // FIXME(kumagi): implement it.
+  std::vector<std::string> payloads;
+  payloads.reserve(row_count_);
+  RowPointer* rows = Rows();
+  for (size_t i = 0; i < row_count_; ++i) {
+    payloads.emplace_back(Payload() + rows[i].offset, rows[i].size);
+  }
+  uint16_t offset = sizeof(LeafPage);
+  for (size_t i = 0; i < row_count_; ++i) {
+    rows[i].offset = offset;
+    memcpy(Payload() + offset, payloads[i].data(), payloads[i].size());
+    offset += payloads[i].size();
+  }
+  free_ptr_ = offset;
 }
 
 }  // namespace tinylamb

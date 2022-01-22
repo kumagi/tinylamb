@@ -43,7 +43,7 @@ class Transaction {
     return status_ == TransactionStatus::kCommitted ||
            status_ == TransactionStatus::kAborted;
   }
-  lsn_t PrevLSN() const { return lsns_.back(); }
+  lsn_t PrevLSN() const { return prev_lsn_; }
 
   bool AddReadSet(const RowPosition& rp);
   bool AddWriteSet(const RowPosition& rp);
@@ -79,7 +79,7 @@ class Transaction {
 
   std::unordered_set<RowPosition> read_set_{};
   std::unordered_set<RowPosition> write_set_{};
-  std::vector<lsn_t> lsns_;
+  lsn_t prev_lsn_;
   TransactionStatus status_ = TransactionStatus::kUnknown;
 
   // Not owned by this class.
