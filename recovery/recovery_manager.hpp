@@ -4,7 +4,7 @@
 #include <string>
 #include <string_view>
 
-#include "constants.hpp"
+#include "common/constants.hpp"
 
 namespace tinylamb {
 

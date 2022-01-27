@@ -8,7 +8,7 @@
 #include <cassert>
 #include <vector>
 
-#include "log_message.hpp"
+#include "common/log_message.hpp"
 #include "page/row_position.hpp"
 #include "type/column.hpp"
 #include "type/value_type.hpp"

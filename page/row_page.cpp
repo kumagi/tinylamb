@@ -51,7 +51,7 @@ bool RowPage::Insert(page_id_t page_id, Transaction& txn,
     return false;
   }
   InsertRow(record);
-  txn.InsertLog(pos, record);
+  txn.InsertLog(page_id, *dst, record);
   return true;
 }
 
@@ -79,7 +79,7 @@ bool RowPage::Update(page_id_t page_id, Transaction& txn, uint16_t slot,
     // Write lock conflict.
     return false;
   }
-  txn.UpdateLog(pos, prev_row, record);
+  txn.UpdateLog(page_id, slot, prev_row, record);
   UpdateRow(pos.slot, record);
   return true;
 }
@@ -106,8 +106,7 @@ void RowPage::UpdateRow(uint16_t slot, std::string_view record) {
 
 bool RowPage::Delete(page_id_t page_id, Transaction& txn, uint16_t slot) {
   assert(slot <= row_count_);
-  RowPosition pos(page_id, slot);
-  txn.DeleteLog(pos, GetRow(slot));
+  txn.DeleteLog(page_id, slot, GetRow(slot));
   DeleteRow(slot);
   return true;
 }
@@ -134,6 +133,16 @@ void RowPage::DeFragment() {
     free_ptr_ -= tmp_buffer[i].size();
     memcpy(Payload() + free_ptr_, tmp_buffer[i].data(), tmp_buffer[i].size());
     data_[i].offset = free_ptr_;
+  }
+}
+
+void RowPage::Dump(std::ostream& o, int indent) const {
+  o << "Rows: " << row_count_ << " Prev: " << prev_page_id_
+    << " Next: " << next_page_id_ << " FreeSize: " << free_size_
+    << " FreePtr:" << free_ptr_;
+  std::string_view out;
+  for (size_t i = 0; i < row_count_; ++i) {
+    o << "\n" << Indent(indent) << i << ": " << GetRow(i);
   }
 }
 

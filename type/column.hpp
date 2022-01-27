@@ -6,7 +6,7 @@
 #include <string_view>
 #include <vector>
 
-#include "log_message.hpp"
+#include "common/log_message.hpp"
 #include "page/row_position.hpp"
 #include "value_type.hpp"
 

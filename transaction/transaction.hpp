@@ -52,15 +52,17 @@ class Transaction {
   void Abort();
 
   // Returns LSN
-  lsn_t InsertLog(const RowPosition& pos, std::string_view redo);
-  lsn_t UpdateLog(const RowPosition& pos, std::string_view undo,
-                  std::string_view redo);
-  lsn_t DeleteLog(const RowPosition& pos, std::string_view undo);
+  template <typename KeyType, typename ValueType>
+  lsn_t InsertLog(page_id_t pid, KeyType key, ValueType redo);
 
-  lsn_t InsertLog(page_id_t pid, std::string_view key, std::string_view value);
-  lsn_t UpdateLog(page_id_t pid, std::string_view key, std::string_view prev,
-                  std::string_view value);
-  lsn_t DeleteLog(page_id_t pid, std::string_view key, std::string_view prev);
+  template <typename KeyType, typename ValueType>
+  lsn_t UpdateLog(page_id_t pid, KeyType key, ValueType prev, ValueType value);
+
+  template <typename KeyType, typename ValueType>
+  lsn_t DeleteLog(page_id_t pid, KeyType key, ValueType prev);
+
+  // Internal page deletion.
+  lsn_t DeleteLog(page_id_t pid, page_id_t prev);
 
   lsn_t AllocatePageLog(page_id_t page_id, PageType new_page_type);
 

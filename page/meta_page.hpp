@@ -29,6 +29,7 @@ class MetaPage {
 
   uint64_t max_page_count;
   uint64_t first_free_page;
+  void Dump(std::ostream& o, int) const;
 };
 
 }  // namespace tinylamb

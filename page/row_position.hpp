@@ -8,7 +8,7 @@
 #include <cstring>
 #include <ostream>
 
-#include "constants.hpp"
+#include "common/constants.hpp"
 
 namespace tinylamb {
 

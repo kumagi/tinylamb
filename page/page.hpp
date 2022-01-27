@@ -6,9 +6,10 @@
 
 #include <iostream>
 
-#include "constants.hpp"
-#include "log_message.hpp"
+#include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "page/free_page.hpp"
+#include "page/internal_page.hpp"
 #include "page/leaf_page.hpp"
 #include "page/meta_page.hpp"
 #include "page/row_page.hpp"
@@ -49,6 +50,16 @@ class Page {
   bool Update(Transaction& txn, std::string_view key, std::string_view value);
   bool Delete(Transaction& txn, std::string_view key);
   bool Read(Transaction& txn, std::string_view key, std::string_view* result);
+  bool LowestKey(Transaction& txn, std::string_view* result);
+  bool HighestKey(Transaction& txn, std::string_view* result);
+
+  // Internal page manipulations.
+  void SetTree(Transaction& txn, std::string_view key, page_id_t left,
+               page_id_t right);
+  bool Insert(Transaction& txn, std::string_view key, page_id_t pid);
+  bool Update(Transaction& txn, std::string_view key, page_id_t pid);
+  bool Delete(Transaction& txn, page_id_t pid);
+  bool GetPageForKey(Transaction& txn, std::string_view key, page_id_t* result);
 
   // Internal methods exposed for recovery.
   void InsertImpl(std::string_view redo);
@@ -67,6 +78,13 @@ class Page {
   void* operator new(size_t page_id);
   void operator delete(void* page) noexcept;
 
+  void Dump(std::ostream& o, int indent) const;
+  
+  friend std::ostream& operator<<(std::ostream& o, const Page& p) {
+    p.Dump(o, 0);
+    return o;
+  }
+
   // The ID for this page. This ID is also an offset of this page in file.
   page_id_t page_id = 0;
 
@@ -83,6 +101,7 @@ class Page {
     FreePage free_page;
     RowPage row_page;
     LeafPage leaf_page;
+    InternalPage internal_page;
     PageBody() : dummy_() {}
   };
   PageBody body;

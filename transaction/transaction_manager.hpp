@@ -9,7 +9,7 @@
 #include <shared_mutex>
 #include <unordered_map>
 
-#include "constants.hpp"
+#include "common/constants.hpp"
 
 namespace tinylamb {
 

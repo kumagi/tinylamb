@@ -44,6 +44,10 @@ void MetaPage::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
   txn.DestroyPageLog(free_page_id);
 }
 
+void MetaPage::Dump(std::ostream& o, int) const {
+  o << "[FirstFree: " << first_free_page << "]";
+}
+
 }  // namespace tinylamb
 
 uint64_t std::hash<tinylamb::MetaPage>::operator()(

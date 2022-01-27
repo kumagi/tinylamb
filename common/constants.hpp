@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <ostream>
 #include <string_view>
 
 namespace tinylamb {
@@ -48,6 +49,8 @@ inline std::string_view ToString(Status s) {
       return "INVALID STATUS";
   }
 }
+
+inline std::string Indent(int num) { return std::string(num, ' '); }
 
 }  // namespace tinylamb
 

@@ -30,19 +30,19 @@ TEST_F(LogRecordTest, check) {
 
   // Insert related logs.
   SerializeDeserializeCheck(
-      LogRecord::InsertingLogRecord(12, 2, RowPosition(1, 3), "hello"));
+      LogRecord::InsertingLogRecord(12, 2, 1, 3, "hello"));
   SerializeDeserializeCheck(
       LogRecord::InsertingLogRecord(12, 2, 3, "key", "hello"));
 
   // Update related logs.
-  SerializeDeserializeCheck(LogRecord::UpdatingLogRecord(
-      13, 3, RowPosition(3, 4), "redo_log", "long_undo_log"));
+  SerializeDeserializeCheck(
+      LogRecord::UpdatingLogRecord(13, 3, 3, 4, "redo_log", "long_undo_log"));
   SerializeDeserializeCheck(LogRecord::UpdatingLogRecord(
       13, 3, 5, "key", "redo_log", "long_undo_log"));
 
   // Delete related logs.
   SerializeDeserializeCheck(
-      LogRecord::DeletingLogRecord(13, 4, RowPosition(4, 5), "undo_log"));
+      LogRecord::DeletingLogRecord(13, 4, 4, 5, "undo_log"));
   SerializeDeserializeCheck(
       LogRecord::DeletingLogRecord(13, 4, 6, "key", "undo_log"));
 
@@ -60,15 +60,15 @@ TEST_F(LogRecordTest, check) {
 
   // Compensation records.
   SerializeDeserializeCheck(
-      LogRecord::CompensatingInsertLogRecord(12, {123, 345}));
+      LogRecord::CompensatingInsertLogRecord(12, 123, 345));
   SerializeDeserializeCheck(
       LogRecord::CompensatingInsertLogRecord(12, 34, "key1"));
   SerializeDeserializeCheck(
-      LogRecord::CompensatingUpdateLogRecord(12, {123, 345}, "hello"));
+      LogRecord::CompensatingUpdateLogRecord(12, 123, 345, "hello"));
   SerializeDeserializeCheck(
       LogRecord::CompensatingUpdateLogRecord(12, 854, "key2", "hello"));
   SerializeDeserializeCheck(
-      LogRecord::CompensatingDeleteLogRecord(12, {123, 345}, "deleted"));
+      LogRecord::CompensatingDeleteLogRecord(12, 123, 345, "deleted"));
   SerializeDeserializeCheck(
       LogRecord::CompensatingDeleteLogRecord(12, 21343, "key3", "deleted"));
 }

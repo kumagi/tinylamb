@@ -2,12 +2,11 @@
 #define TINYLAMB_LOG_RECORD_HPP
 
 #include <cassert>
-#include <page/page.hpp>
 #include <unordered_set>
 #include <utility>
 
 #include "checkpoint_manager.hpp"
-#include "type/row.hpp"
+#include "page/page.hpp"
 
 namespace tinylamb {
 
@@ -43,47 +42,57 @@ struct LogRecord {
 
   static bool ParseLogRecord(const char* src, LogRecord* dst);
 
-  static LogRecord InsertingLogRecord(lsn_t p, txn_id_t txn, RowPosition po,
-                                      std::string_view r);
-
+  static LogRecord InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                      uint16_t key, std::string_view redo);
   static LogRecord InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                       std::string_view key,
-                                      std::string_view value);
+                                      std::string_view redo);
+  static LogRecord InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                      std::string_view key, page_id_t redo);
 
-  static LogRecord CompensatingInsertLogRecord(txn_id_t txn, RowPosition po);
-
+  static LogRecord CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
+                                               uint16_t key);
   static LogRecord CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
                                                std::string_view key);
 
-  static LogRecord UpdatingLogRecord(lsn_t p, txn_id_t txn, RowPosition po,
-                                     std::string_view redo,
+  static LogRecord UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                     uint16_t key, std::string_view redo,
                                      std::string_view undo);
-
   static LogRecord UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                      std::string_view key,
                                      std::string_view redo,
                                      std::string_view undo);
+  static LogRecord UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                     std::string_view key, page_id_t redo,
+                                     page_id_t undo);
 
-  static LogRecord CompensatingUpdateLogRecord(lsn_t txn, RowPosition po,
+  static LogRecord CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
+                                               uint16_t key,
                                                std::string_view redo);
-
   static LogRecord CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
                                                std::string_view key,
                                                std::string_view redo);
+  static LogRecord CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
+                                               std::string_view key,
+                                               page_id_t redo);
 
-  static LogRecord DeletingLogRecord(lsn_t p, txn_id_t txn, RowPosition po,
-                                     std::string_view undo);
-
+  static LogRecord DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                     uint16_t key, std::string_view undo);
   static LogRecord DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                      std::string_view key,
                                      std::string_view undo);
-
-  static LogRecord CompensatingDeleteLogRecord(txn_id_t txn, RowPosition po,
-                                               std::string_view redo);
+  static LogRecord DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                     page_id_t undo);
 
   static LogRecord CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
-                                               std::string_view key,
+                                               uint16_t slot,
                                                std::string_view redo);
+  static LogRecord CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
+                                               std::string_view slot,
+                                               std::string_view redo);
+  static LogRecord CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
+                                               std::string_view slot,
+                                               page_id_t redo);
 
   static LogRecord AllocatePageLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                          PageType new_page_type);
@@ -165,6 +174,8 @@ struct LogRecord {
   std::string_view key{};
   std::string_view undo_data{};
   std::string_view redo_data{};
+  page_id_t redo_page = 0;
+  page_id_t undo_page = 0;
   std::vector<std::pair<page_id_t, lsn_t>> dirty_page_table{};
   std::vector<CheckpointManager::ActiveTransactionEntry>
       active_transaction_table{};

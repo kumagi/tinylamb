@@ -200,4 +200,21 @@ TEST_F(LeafPageTest, InsertDeflag) {
   for (const char& i : row) ASSERT_EQ(i, '5');
 }
 
+TEST_F(LeafPageTest, LowestHighestKey) {
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(leaf_page_id_);
+
+  ASSERT_TRUE(page->Insert(txn, "C", "foo"));
+  ASSERT_TRUE(page->Insert(txn, "A", "bar"));
+  ASSERT_TRUE(page->Insert(txn, "B", "baz"));
+  ASSERT_TRUE(page->Insert(txn, "D", "piy"));
+
+  std::string_view out;
+  ASSERT_TRUE(page->LowestKey(txn, &out));
+  ASSERT_EQ(out, "A");
+
+  ASSERT_TRUE(page->HighestKey(txn, &out));
+  ASSERT_EQ(out, "D");
+}
+
 }  // namespace tinylamb

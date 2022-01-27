@@ -1,8 +1,8 @@
 #ifndef TINYLAMB_FREE_PAGE_HPP
 #define TINYLAMB_FREE_PAGE_HPP
 
-#include "constants.hpp"
-#include "log_message.hpp"
+#include "common/constants.hpp"
+#include "common/log_message.hpp"
 
 namespace tinylamb {
 
@@ -21,6 +21,9 @@ class FreePage {
   friend std::hash<tinylamb::FreePage>;
 
   uint64_t next_free_page;
+  void Dump(std::ostream& o, int) const {
+    o << "[NextFreePage: " << next_free_page << "]";
+  }
 };
 
 constexpr static uint32_t kFreeBodySize = kPageBodySize - sizeof(FreePage);

@@ -8,11 +8,13 @@
 #include <cassert>
 #include <string_view>
 
-#include "constants.hpp"
+#include "common/constants.hpp"
 
 namespace tinylamb {
 
 class Transaction;
+class Page;
+class InternalPage;
 
 class LeafPage {
   char* Payload() { return reinterpret_cast<char*>(this); }
@@ -27,8 +29,7 @@ class LeafPage {
     uint16_t size = 0;
   };
   RowPointer* Rows();
-  std::string_view GetKey(const RowPointer& ptr);
-  std::string_view GetValue(const RowPointer& ptr);
+  [[nodiscard]] const RowPointer* Rows() const;
 
  public:
   void Initialize() {
@@ -44,18 +45,29 @@ class LeafPage {
   bool Update(page_id_t page_id, Transaction& txn, std::string_view key,
               std::string_view value);
   bool Delete(page_id_t page_id, Transaction& txn, std::string_view key);
+  bool Read(Transaction& txn, std::string_view key, std::string_view* result);
 
-  bool Read(page_id_t page_id, Transaction& txn, std::string_view key,
-            std::string_view* result);
+  [[nodiscard]] std::string_view GetKey(size_t idx) const;
+  [[nodiscard]] std::string_view GetValue(size_t idx) const;
+  bool LowestKey(Transaction& txn, std::string_view* result);
+  bool HighestKey(Transaction& txn, std::string_view* result);
+  [[nodiscard]] size_t RowCount() const;
+
+  // Split utils.
+  void MoveHalfTo(page_id_t pid, Transaction& txn, Page* target);
 
   void InsertImpl(std::string_view key, std::string_view value);
   void UpdateImpl(std::string_view key, std::string_view value);
   void DeleteImpl(std::string_view key);
 
+ private:
   void DeFragment();
+  void Dump(std::ostream& o, int indent) const;
+  [[nodiscard]] size_t Find(std::string_view key) const;
 
  private:
   friend class Page;
+  friend class InternalPage;
   friend class std::hash<LeafPage>;
 
   page_id_t prev_pid_ = 0;

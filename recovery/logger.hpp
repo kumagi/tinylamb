@@ -11,7 +11,7 @@
 #include <mutex>
 #include <thread>
 
-#include "constants.hpp"
+#include "common/constants.hpp"
 
 namespace tinylamb {
 

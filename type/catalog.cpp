@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 
-#include "log_message.hpp"
+#include "common/log_message.hpp"
 // #include "page/catalog_page.hpp"
 #include "page/page.hpp"
 #include "page/page_manager.hpp"

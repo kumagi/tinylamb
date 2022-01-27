@@ -71,52 +71,55 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
   return true;
 }
 
-lsn_t Transaction::InsertLog(const RowPosition& pos, std::string_view redo) {
-  assert(!IsFinished());
-  LogRecord lr = LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pos, redo);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
-  return prev_lsn_;
-}
-
-lsn_t Transaction::UpdateLog(const RowPosition& pos, std::string_view undo,
-                             std::string_view redo) {
+template <typename KeyType, typename ValueType>
+lsn_t Transaction::InsertLog(page_id_t pid, KeyType key, ValueType redo) {
   assert(!IsFinished());
   LogRecord lr =
-      LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pos, redo, undo);
+      LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pid, key, redo);
   prev_lsn_ = transaction_manager_->AddLog(lr);
   return prev_lsn_;
 }
+template lsn_t Transaction::InsertLog(page_id_t pid, uint16_t key,
+                                      std::string_view redo);
+template lsn_t Transaction::InsertLog(page_id_t pid, std::string_view key,
+                                      std::string_view redo);
+template lsn_t Transaction::InsertLog(page_id_t pid, std::string_view key,
+                                      page_id_t redo);
 
-lsn_t Transaction::DeleteLog(const RowPosition& pos, std::string_view undo) {
-  assert(!IsFinished());
-  LogRecord lr = LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pos, undo);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
-  return prev_lsn_;
-}
-
-lsn_t Transaction::InsertLog(page_id_t pid, std::string_view key,
-                             std::string_view value) {
-  assert(!IsFinished());
-  LogRecord lr =
-      LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pid, key, value);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
-  return prev_lsn_;
-}
-
-lsn_t Transaction::UpdateLog(page_id_t pid, std::string_view key,
-                             std::string_view prev, std::string_view value) {
+template <typename KeyType, typename ValueType>
+lsn_t Transaction::UpdateLog(page_id_t pid, KeyType key, ValueType undo,
+                             ValueType redo) {
   assert(!IsFinished());
   LogRecord lr =
-      LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, key, prev, value);
+      LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, key, redo, undo);
   prev_lsn_ = transaction_manager_->AddLog(lr);
   return prev_lsn_;
 }
+template lsn_t Transaction::UpdateLog(page_id_t pid, uint16_t key,
+                                      std::string_view undo,
+                                      std::string_view redo);
+template lsn_t Transaction::UpdateLog(page_id_t pid, std::string_view key,
+                                      std::string_view undo,
+                                      std::string_view redo);
+template lsn_t Transaction::UpdateLog(page_id_t pid, std::string_view key,
+                                      page_id_t undo, page_id_t redo);
 
-lsn_t Transaction::DeleteLog(page_id_t pid, std::string_view key,
-                             std::string_view prev) {
+template <typename KeyType, typename ValueType>
+lsn_t Transaction::DeleteLog(page_id_t pid, KeyType key, ValueType undo) {
   assert(!IsFinished());
   LogRecord lr =
-      LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, key, prev);
+      LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, key, undo);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
+}
+template lsn_t Transaction::DeleteLog(page_id_t pid, uint16_t key,
+                                      std::string_view undo);
+template lsn_t Transaction::DeleteLog(page_id_t pid, std::string_view key,
+                                      std::string_view undo);
+
+lsn_t Transaction::DeleteLog(page_id_t pid, page_id_t target) {
+  assert(!IsFinished());
+  LogRecord lr = LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, target);
   prev_lsn_ = transaction_manager_->AddLog(lr);
   return prev_lsn_;
 }

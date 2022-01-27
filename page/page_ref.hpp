@@ -7,7 +7,7 @@
 
 #include <mutex>
 
-#include "log_message.hpp"
+#include "common/log_message.hpp"
 
 namespace tinylamb {
 

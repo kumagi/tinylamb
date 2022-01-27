@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <utility>
 
-#include "constants.hpp"
+#include "common/constants.hpp"
 #include "page/page.hpp"
 
 namespace tinylamb {

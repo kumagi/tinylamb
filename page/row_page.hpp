@@ -4,7 +4,7 @@
 #include <cassert>
 #include <string_view>
 
-#include "constants.hpp"
+#include "common/constants.hpp"
 
 namespace tinylamb {
 
@@ -85,6 +85,7 @@ class RowPage {
   uint16_t free_ptr_ = kPageSize;
   uint16_t free_size_ = kPageSize - sizeof(RowPage);
   RowPointer data_[0];
+  void Dump(std::ostream& o, int indent) const;
 };
 
 static_assert(std::is_trivially_destructible<RowPage>::value == true,

@@ -51,12 +51,11 @@ TEST_F(LoggerTest, AppendInsertLog) {
       Column("a", ValueType::kInt64, 8, Restriction::kNoRestriction, 0),
       Column("b", ValueType::kVarChar, 14, Restriction::kNoRestriction, 8)};
   Schema s("test_schema", columns, 2);
-  RowPosition pos(123, 456);
   Row r;
   r.SetValue(s, 0, Value(123));
   r.SetValue(s, 1, Value("hogefugafoobar"));
   LogRecord l = LogRecord::InsertingLogRecord(
-      0, 0, pos, std::string_view(r.Data(), r.Size()));
+      0, 0, 123, 456, std::string_view(r.Data(), r.Size()));
   lsn_t lsn = l_->AddLog(l);
   ASSERT_EQ(0, lsn);
   WaitForCommit(lsn + l.Size());

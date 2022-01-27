@@ -3,7 +3,7 @@
 
 #include <string_view>
 
-#include "log_message.hpp"
+#include "common/log_message.hpp"
 #include "page/page.hpp"
 #include "page/page_pool.hpp"
 #include "recovery/recovery_manager.hpp"

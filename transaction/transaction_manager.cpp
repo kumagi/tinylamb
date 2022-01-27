@@ -64,21 +64,24 @@ void TransactionManager::Abort(Transaction& txn) {
 
 void TransactionManager::CompensateInsertLog(txn_id_t txn_id,
                                              const RowPosition& pos) {
-  LogRecord lr = LogRecord::CompensatingInsertLogRecord(txn_id, pos);
+  LogRecord lr =
+      LogRecord::CompensatingInsertLogRecord(txn_id, pos.page_id, pos.slot);
   logger_->AddLog(lr);
 }
 
 void TransactionManager::CompensateUpdateLog(txn_id_t txn_id,
                                              const RowPosition& pos,
                                              std::string_view redo) {
-  LogRecord lr = LogRecord::CompensatingUpdateLogRecord(txn_id, pos, redo);
+  LogRecord lr = LogRecord::CompensatingUpdateLogRecord(txn_id, pos.page_id,
+                                                        pos.slot, redo);
   logger_->AddLog(lr);
 }
 
 void TransactionManager::CompensateDeleteLog(txn_id_t txn_id,
                                              const RowPosition& pos,
                                              std::string_view redo) {
-  LogRecord lr = LogRecord::CompensatingDeleteLogRecord(txn_id, pos, redo);
+  LogRecord lr = LogRecord::CompensatingDeleteLogRecord(txn_id, pos.page_id,
+                                                        pos.slot, redo);
   logger_->AddLog(lr);
 }
 

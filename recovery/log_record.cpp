@@ -9,10 +9,15 @@
 
 namespace {
 
-enum KeyTypes {
+enum KeyTypes : uint8_t {
   kHasPageID = 0x1,
   kHasSlot = 0x2,
   kHasKey = 0x4,
+};
+
+enum ValueTypes : uint8_t {
+  kHasPageRef = 0x1,
+  kHasBinary = 0x2,
 };
 
 size_t BinSerialize(char* pos, std::string_view bin) {
@@ -216,13 +221,13 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
   return false;
 }
 
-LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, RowPosition po,
-                                        std::string_view r) {
+LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                        uint16_t slot, std::string_view r) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
-  l.pid = po.page_id;
-  l.slot = po.slot;
+  l.pid = pid;
+  l.slot = slot;
   l.type = LogType::kInsertRow;
   l.redo_data = r;
   return l;
@@ -241,11 +246,24 @@ LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::CompensatingInsertLogRecord(txn_id_t txn, RowPosition po) {
+LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                        std::string_view key, page_id_t value) {
+  LogRecord l;
+  l.prev_lsn = p;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.key = key;
+  l.type = LogType::kInsertRow;
+  l.redo_page = value;
+  return l;
+}
+
+LogRecord LogRecord::CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
+                                                 uint16_t key) {
   LogRecord l;
   l.txn_id = txn;
-  l.pid = po.page_id;
-  l.slot = po.slot;
+  l.pid = pid;
+  l.slot = key;
   l.type = LogType::kCompensateInsertRow;
   return l;
 }
@@ -260,14 +278,14 @@ LogRecord LogRecord::CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::UpdatingLogRecord(lsn_t p, txn_id_t txn, RowPosition po,
-                                       std::string_view redo,
+LogRecord LogRecord::UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                       uint16_t key, std::string_view redo,
                                        std::string_view undo) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
-  l.pid = po.page_id;
-  l.slot = po.slot;
+  l.pid = pid;
+  l.slot = key;
   l.type = LogType::kUpdateRow;
   l.redo_data = redo;
   l.undo_data = undo;
@@ -289,12 +307,27 @@ LogRecord LogRecord::UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::CompensatingUpdateLogRecord(txn_id_t txn, RowPosition po,
+LogRecord LogRecord::UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                       std::string_view key, page_id_t redo,
+                                       page_id_t undo) {
+  LogRecord l;
+  l.prev_lsn = p;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.key = key;
+  l.type = LogType::kUpdateRow;
+  l.redo_page = redo;
+  l.undo_page = undo;
+  return l;
+}
+
+LogRecord LogRecord::CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
+                                                 uint16_t slot,
                                                  std::string_view redo) {
   LogRecord l;
   l.txn_id = txn;
-  l.pid = po.page_id;
-  l.slot = po.slot;
+  l.pid = pid;
+  l.slot = slot;
   l.type = LogType::kCompensateUpdateRow;
   l.redo_data = redo;
   return l;
@@ -312,13 +345,25 @@ LogRecord LogRecord::CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, RowPosition po,
-                                       std::string_view undo) {
+LogRecord LogRecord::CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
+                                                 std::string_view key,
+                                                 page_id_t redo) {
+  LogRecord l;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.key = key;
+  l.type = LogType::kCompensateUpdateRow;
+  l.redo_page = redo;
+  return l;
+}
+
+LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                       uint16_t slot, std::string_view undo) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
-  l.pid = po.page_id;
-  l.slot = po.slot;
+  l.pid = pid;
+  l.slot = slot;
   l.type = LogType::kDeleteRow;
   l.undo_data = undo;
   return l;
@@ -337,12 +382,24 @@ LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::CompensatingDeleteLogRecord(uint64_t txn, RowPosition po,
+LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                       page_id_t undo) {
+  LogRecord l;
+  l.prev_lsn = p;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.type = LogType::kDeleteRow;
+  l.undo_page = undo;
+  return l;
+}
+
+LogRecord LogRecord::CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
+                                                 uint16_t slot,
                                                  std::string_view redo) {
   LogRecord l;
   l.txn_id = txn;
-  l.pid = po.page_id;
-  l.slot = po.slot;
+  l.pid = pid;
+  l.slot = slot;
   l.type = LogType::kCompensateDeleteRow;
   l.redo_data = redo;
   return l;
@@ -357,6 +414,18 @@ LogRecord LogRecord::CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
   l.key = key;
   l.type = LogType::kCompensateDeleteRow;
   l.redo_data = redo;
+  return l;
+}
+
+LogRecord LogRecord::CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
+                                                 std::string_view key,
+                                                 page_id_t redo) {
+  LogRecord l;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.key = key;
+  l.type = LogType::kCompensateDeleteRow;
+  l.redo_page = redo;
   return l;
 }
 
