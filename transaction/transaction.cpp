@@ -116,13 +116,8 @@ template lsn_t Transaction::DeleteLog(page_id_t pid, uint16_t key,
                                       std::string_view undo);
 template lsn_t Transaction::DeleteLog(page_id_t pid, std::string_view key,
                                       std::string_view undo);
-
-lsn_t Transaction::DeleteLog(page_id_t pid, page_id_t target) {
-  assert(!IsFinished());
-  LogRecord lr = LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, target);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
-  return prev_lsn_;
-}
+template lsn_t Transaction::DeleteLog(page_id_t pid, std::string_view key,
+                                      uint16_t undo);
 
 lsn_t Transaction::AllocatePageLog(page_id_t allocated_page_id,
                                    PageType new_page_type) {

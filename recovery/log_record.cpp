@@ -383,11 +383,12 @@ LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
 }
 
 LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                       page_id_t undo) {
+                                       std::string_view key, uint16_t undo) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
   l.pid = pid;
+  l.key = key;
   l.type = LogType::kDeleteRow;
   l.undo_page = undo;
   return l;

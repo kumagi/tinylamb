@@ -13,6 +13,7 @@
 namespace tinylamb {
 
 class Transaction;
+class Page;
 
 class InternalPage {
   char* Payload() { return reinterpret_cast<char*>(this); }
@@ -37,20 +38,20 @@ class InternalPage {
     free_size_ = kPageBodySize - sizeof(InternalPage);
   }
 
-  void SetLowestValue(page_id_t pid, page_id_t value);
-
-  void SetTree(page_id_t pid, Transaction& txn, std::string_view key,
-               page_id_t left, page_id_t right);
-
+  void SetLowestValue(page_id_t pid, Transaction& txn, page_id_t value);
+  
   bool Insert(page_id_t pid, Transaction& txn, std::string_view key,
               page_id_t value);
 
   bool Update(page_id_t pid, Transaction& txn, std::string_view key,
               page_id_t value);
 
-  bool Delete(page_id_t pid, Transaction& txn, page_id_t target);
+  bool Delete(page_id_t pid, Transaction& txn, std::string_view key);
 
   bool GetPageForKey(Transaction& txn, std::string_view key, page_id_t* result);
+
+  void SplitInto(page_id_t pid, Transaction& txn, Page* right,
+                 std::string_view* middle);
 
   // Return lowest page_id which may contain the specified |key|.
   [[nodiscard]] uint16_t SearchToInsert(std::string_view key) const;
@@ -62,7 +63,7 @@ class InternalPage {
   [[nodiscard]] page_id_t& GetValue(size_t idx);
 
   void InsertImpl(std::string_view key, page_id_t pid);
-  void DeleteImpl(page_id_t pid);
+  void DeleteImpl(std::string_view key);
 
   void Dump(std::ostream& o, int indent) const;
 

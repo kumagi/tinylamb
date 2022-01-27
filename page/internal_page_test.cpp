@@ -59,16 +59,18 @@ class InternalPageTest : public ::testing::Test {
 };
 
 TEST_F(InternalPageTest, Construct) {}
-TEST_F(InternalPageTest, SetTree) {
+TEST_F(InternalPageTest, SetMinimumTree) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(internal_page_id_);
-  page->SetTree(txn, "b", 100, 200);
+  page->SetLowestValue(txn, 100);
+  ASSERT_TRUE(page->Insert(txn, "b", 200));
 }
 
 TEST_F(InternalPageTest, GetPageForKeyMinimum) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(internal_page_id_);
-  page->SetTree(txn, "b", 100, 200);
+  page->SetLowestValue(txn, 100);
+  ASSERT_TRUE(page->Insert(txn, "b", 200));
   page_id_t pid;
   ASSERT_TRUE(page->GetPageForKey(txn, "alpha", &pid));
   ASSERT_EQ(pid, 100);
@@ -81,7 +83,8 @@ TEST_F(InternalPageTest, GetPageForKeyMinimum) {
 TEST_F(InternalPageTest, InsertKey) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(internal_page_id_);
-  page->SetTree(txn, "d", 100, 200);
+  page->SetLowestValue(txn, 100);
+  ASSERT_TRUE(page->Insert(txn, "d", 200));
   ASSERT_TRUE(page->Insert(txn, "a", 10));
   ASSERT_TRUE(page->Insert(txn, "b", 20));
   ASSERT_TRUE(page->Insert(txn, "e", 40));
@@ -93,7 +96,9 @@ TEST_F(InternalPageTest, InsertKey) {
 TEST_F(InternalPageTest, GetPageForKey) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(internal_page_id_);
-  page->SetTree(txn, "c", 2, 23);
+  page->SetLowestValue(txn, 2);
+
+  ASSERT_TRUE(page->Insert(txn, "c", 23));
   ASSERT_TRUE(page->Insert(txn, "b", 20));
   ASSERT_TRUE(page->Insert(txn, "e", 40));
 
@@ -106,6 +111,117 @@ TEST_F(InternalPageTest, GetPageForKey) {
   EXPECT_EQ(pid, 23);
   ASSERT_TRUE(page->GetPageForKey(txn, "zeta", &pid));
   EXPECT_EQ(pid, 40);
+}
+
+TEST_F(InternalPageTest, InsertAndGetKey) {
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(internal_page_id_);
+  page->SetLowestValue(txn, 100);
+
+  page_id_t pid;
+  ASSERT_TRUE(page->Insert(txn, "c", 200));
+  ASSERT_TRUE(page->Insert(txn, "a", 10));
+  ASSERT_TRUE(page->GetPageForKey(txn, "a", &pid));
+  ASSERT_TRUE(page->GetPageForKey(txn, "alpha", &pid));
+  ASSERT_EQ(pid, 10);
+
+  ASSERT_TRUE(page->Insert(txn, "g", 60));
+  ASSERT_TRUE(page->GetPageForKey(txn, "g", &pid));
+  ASSERT_EQ(pid, 60);
+  ASSERT_TRUE(page->GetPageForKey(txn, "guide", &pid));
+  ASSERT_EQ(pid, 60);
+
+  ASSERT_TRUE(page->Insert(txn, "e", 40));
+  ASSERT_TRUE(page->GetPageForKey(txn, "e", &pid));
+  ASSERT_EQ(pid, 40);
+  ASSERT_TRUE(page->GetPageForKey(txn, "error", &pid));
+  ASSERT_EQ(pid, 40);
+
+  ASSERT_TRUE(page->Insert(txn, "f", 50));
+  ASSERT_TRUE(page->GetPageForKey(txn, "f", &pid));
+  ASSERT_EQ(pid, 50);
+  ASSERT_TRUE(page->GetPageForKey(txn, "flight", &pid));
+  ASSERT_EQ(pid, 50);
+
+  ASSERT_TRUE(page->Insert(txn, "b", 20));
+  ASSERT_TRUE(page->GetPageForKey(txn, "b", &pid));
+  ASSERT_EQ(pid, 20);
+  ASSERT_TRUE(page->GetPageForKey(txn, "battle", &pid));
+  ASSERT_EQ(pid, 20);
+
+  ASSERT_TRUE(page->Insert(txn, "c", 30));
+  ASSERT_TRUE(page->GetPageForKey(txn, "c", &pid));
+  ASSERT_EQ(pid, 30);
+  ASSERT_TRUE(page->GetPageForKey(txn, "cut", &pid));
+  ASSERT_EQ(pid, 30);
+}
+
+TEST_F(InternalPageTest, DeleteKey) {
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(internal_page_id_);
+  page->SetLowestValue(txn, 2);
+  ASSERT_TRUE(page->Insert(txn, "c", 23));
+  ASSERT_TRUE(page->Insert(txn, "b", 20));
+  ASSERT_TRUE(page->Insert(txn, "e", 40));
+
+  page_id_t pid;
+  ASSERT_TRUE(page->GetPageForKey(txn, "alpha", &pid));
+  ASSERT_EQ(pid, 2);
+  ASSERT_TRUE(page->Delete(txn, "b"));
+  ASSERT_TRUE(page->GetPageForKey(txn, "b", &pid));
+  EXPECT_EQ(pid, 2);
+  ASSERT_TRUE(page->Delete(txn, "e"));
+  ASSERT_TRUE(page->GetPageForKey(txn, "e", &pid));
+  EXPECT_EQ(pid, 23);
+}
+
+TEST_F(InternalPageTest, SplitInto) {
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(internal_page_id_);
+  page->SetLowestValue(txn, 1);
+  ASSERT_TRUE(page->Insert(txn, "a", 2));
+  ASSERT_TRUE(page->Insert(txn, "b", 3));
+  ASSERT_TRUE(page->Insert(txn, "c", 4));
+  ASSERT_TRUE(page->Insert(txn, "d", 5));
+  ASSERT_TRUE(page->Insert(txn, "e", 6));
+  ASSERT_TRUE(page->Insert(txn, "f", 7));
+  ASSERT_TRUE(page->Insert(txn, "g", 8));
+  ASSERT_TRUE(page->Insert(txn, "h", 9));
+  ASSERT_TRUE(page->Insert(txn, "i", 10));
+  PageRef right = p_->AllocateNewPage(txn, PageType::kInternalPage);
+  std::string_view mid;
+
+  page->SplitInto(txn, right.get(), &mid);
+  ASSERT_EQ("e", mid);
+
+  page_id_t pid;
+  ASSERT_TRUE(page->GetPageForKey(txn, "a", &pid));
+  ASSERT_EQ(pid, 2);
+  ASSERT_TRUE(page->GetPageForKey(txn, "b", &pid));
+  EXPECT_EQ(pid, 3);
+  ASSERT_TRUE(page->GetPageForKey(txn, "c", &pid));
+  EXPECT_EQ(pid, 4);
+  ASSERT_TRUE(page->GetPageForKey(txn, "d", &pid));
+  EXPECT_EQ(pid, 5);
+  ASSERT_TRUE(page->GetPageForKey(txn, "e", &pid));
+  ASSERT_EQ(pid, 5);  // Migrated into right node.
+  ASSERT_TRUE(page->GetPageForKey(txn, "f", &pid));
+  EXPECT_EQ(pid, 5);
+  ASSERT_TRUE(page->GetPageForKey(txn, "g", &pid));
+  EXPECT_EQ(pid, 5);
+
+  ASSERT_TRUE(right->GetPageForKey(txn, "a", &pid));
+  ASSERT_EQ(pid, 6);  // Minimum value of this node.
+  ASSERT_TRUE(right->GetPageForKey(txn, "e", &pid));
+  ASSERT_EQ(pid, 6);
+  ASSERT_TRUE(right->GetPageForKey(txn, "f", &pid));
+  EXPECT_EQ(pid, 7);
+  ASSERT_TRUE(right->GetPageForKey(txn, "g", &pid));
+  EXPECT_EQ(pid, 8);
+  ASSERT_TRUE(right->GetPageForKey(txn, "h", &pid));
+  EXPECT_EQ(pid, 9);
+  ASSERT_TRUE(right->GetPageForKey(txn, "i", &pid));
+  EXPECT_EQ(pid, 10);
 }
 
 }  // namespace tinylamb

@@ -54,12 +54,11 @@ class Page {
   bool HighestKey(Transaction& txn, std::string_view* result);
 
   // Internal page manipulations.
-  void SetTree(Transaction& txn, std::string_view key, page_id_t left,
-               page_id_t right);
   bool Insert(Transaction& txn, std::string_view key, page_id_t pid);
   bool Update(Transaction& txn, std::string_view key, page_id_t pid);
-  bool Delete(Transaction& txn, page_id_t pid);
   bool GetPageForKey(Transaction& txn, std::string_view key, page_id_t* result);
+  void SetLowestValue(Transaction& txn, page_id_t i);
+  void SplitInto(Transaction& txn, Page* right, std::string_view* middle);
 
   // Internal methods exposed for recovery.
   void InsertImpl(std::string_view redo);
@@ -79,7 +78,7 @@ class Page {
   void operator delete(void* page) noexcept;
 
   void Dump(std::ostream& o, int indent) const;
-  
+
   friend std::ostream& operator<<(std::ostream& o, const Page& p) {
     p.Dump(o, 0);
     return o;

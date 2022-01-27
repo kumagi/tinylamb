@@ -82,7 +82,7 @@ struct LogRecord {
                                      std::string_view key,
                                      std::string_view undo);
   static LogRecord DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                     page_id_t undo);
+                                     std::string_view key, uint16_t undo);
 
   static LogRecord CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
                                                uint16_t slot,

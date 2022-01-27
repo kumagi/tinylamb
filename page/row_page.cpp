@@ -121,7 +121,7 @@ void RowPage::DeleteRow(uint16_t slot) {
 size_t RowPage::RowCount() const { return row_count_; }
 
 void RowPage::DeFragment() {
-  // FIXME: replace it with O(1) memory consumption?
+  // FIXME: replace it with inplace one?
   std::vector<std::string> tmp_buffer;
   tmp_buffer.reserve(row_count_);
   for (size_t i = 0; i < row_count_; ++i) {
@@ -140,7 +140,6 @@ void RowPage::Dump(std::ostream& o, int indent) const {
   o << "Rows: " << row_count_ << " Prev: " << prev_page_id_
     << " Next: " << next_page_id_ << " FreeSize: " << free_size_
     << " FreePtr:" << free_ptr_;
-  std::string_view out;
   for (size_t i = 0; i < row_count_; ++i) {
     o << "\n" << Indent(indent) << i << ": " << GetRow(i);
   }

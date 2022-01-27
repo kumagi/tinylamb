@@ -123,8 +123,17 @@ bool Page::Update(Transaction& txn, std::string_view key,
 }
 
 bool Page::Delete(Transaction& txn, std::string_view key) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage);
-  bool result = body.leaf_page.Delete(PageID(), txn, key);
+  bool result;
+  switch (type) {
+    case PageType::kLeafPage:
+      result = body.leaf_page.Delete(PageID(), txn, key);
+      break;
+    case PageType::kInternalPage:
+      result = body.internal_page.Delete(PageID(), txn, key);
+      break;
+    default:
+      throw std::runtime_error("Invalid page type");
+  }
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
   return result;
@@ -146,11 +155,6 @@ bool Page::HighestKey(Transaction& txn, std::string_view* result) {
   return body.leaf_page.HighestKey(txn, result);
 }
 
-void Page::SetTree(Transaction& txn, std::string_view key, page_id_t left,
-                   page_id_t right) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage);
-  body.internal_page.SetTree(PageID(), txn, key, left, right);
-}
 bool Page::Insert(Transaction& txn, std::string_view key, page_id_t pid) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage);
   return body.internal_page.Insert(PageID(), txn, key, pid);
@@ -161,15 +165,20 @@ bool Page::Update(Transaction& txn, std::string_view key, page_id_t pid) {
   return body.internal_page.Update(PageID(), txn, key, pid);
 }
 
-bool Page::Delete(Transaction& txn, page_id_t pid) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage);
-  return body.internal_page.Delete(PageID(), txn, pid);
-}
-
 bool Page::GetPageForKey(Transaction& txn, std::string_view key,
                          page_id_t* result) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage);
   return body.internal_page.GetPageForKey(txn, key, result);
+}
+
+void Page::SetLowestValue(Transaction& txn, page_id_t v) {
+  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  body.internal_page.SetLowestValue(PageID(), txn, v);
+}
+
+void Page::SplitInto(Transaction& txn, Page* right, std::string_view* middle) {
+  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  body.internal_page.SplitInto(PageID(), txn, right, middle);
 }
 
 void Page::SetChecksum() const { checksum = std::hash<Page>()(*this); }

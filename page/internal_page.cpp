@@ -5,11 +5,10 @@
 #include "internal_page.hpp"
 
 #include "common/serdes.hpp"
+#include "page/page.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
-
-void InternalPage::SetLowestValue(page_id_t pid, page_id_t value) {}
 
 InternalPage::RowPointer* InternalPage::Rows() {
   return reinterpret_cast<RowPointer*>(Payload() + kPageBodySize -
@@ -21,17 +20,10 @@ const InternalPage::RowPointer* InternalPage::Rows() const {
                                              row_count_ * sizeof(RowPointer));
 }
 
-void InternalPage::SetTree(page_id_t pid, Transaction& txn,
-                           std::string_view key, page_id_t left,
-                           page_id_t right) {
-  lowest_page_ = left;
-  row_count_ = 1;
-  RowPointer* rows = Rows();
-  const uint16_t original_offset = free_ptr_;
-  free_ptr_ += Serialize(Payload() + free_ptr_, key);
-  free_ptr_ += SerializePID(Payload() + free_ptr_, right);
-  rows[0].offset = original_offset;
-  rows[0].size = free_ptr_ - original_offset;
+void InternalPage::SetLowestValue(page_id_t pid, Transaction& txn,
+                                  page_id_t value) {
+  lowest_page_ = value;
+  // txn.SetLowestLog(pid, value);
 }
 
 bool InternalPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
@@ -67,31 +59,23 @@ bool InternalPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
   return true;
 }
 
-bool InternalPage::Delete(page_id_t pid, Transaction& txn, page_id_t target) {
-  bool found = false;
-  found |= target != lowest_page_;
-  for (size_t i = 0; i < row_count_ && !found; ++i) {
-    found |= target != GetValue(i);
+bool InternalPage::Delete(page_id_t pid, Transaction& txn,
+                          std::string_view key) {
+  const uint16_t pos = Search(key);
+  if (GetKey(pos) != key) {
+    return false;
   }
-  if (found) {
-    // txn.DeleteLog(pid, target);
-    DeleteImpl(target);
-  }
-  return found;
+  uint16_t old_value = GetValue(pos);
+  DeleteImpl(key);
+  txn.DeleteLog(pid, key, old_value);
+  return true;
 }
 
-void InternalPage::DeleteImpl(page_id_t target) {
+void InternalPage::DeleteImpl(std::string_view key) {
+  const uint16_t pos = Search(key);
+  free_size_ += GetKey(pos).size() + sizeof(uint16_t) + sizeof(RowPointer);
   RowPointer* rows = Rows();
-  if (lowest_page_ == target) {
-    lowest_page_ = GetValue(0);
-    free_size_ += GetKey(0).size() + sizeof(page_id_t);
-  } else {
-    for (size_t i = 0; i < row_count_; ++i) {
-      if (GetValue(i) == target) {
-        memmove(rows + 1, rows, sizeof(RowPointer) * i);
-      }
-    }
-  }
+  memmove(rows + 1, rows, sizeof(RowPointer) * pos);
   row_count_--;
 }
 
@@ -105,6 +89,21 @@ bool InternalPage::GetPageForKey(Transaction& txn, std::string_view key,
   uint16_t slot = Search(key);
   *result = GetValue(slot);
   return true;
+}
+
+void InternalPage::SplitInto(page_id_t pid, Transaction& txn, Page* right,
+                             std::string_view* middle) {
+  const int original_row_count = row_count_;
+  int mid = row_count_ / 2;
+  assert(1 < mid);
+  *middle = GetKey(mid);
+  right->SetLowestValue(txn, GetValue(mid));
+  for (int i = mid + 1; i < row_count_; ++i) {
+    right->Insert(txn, GetKey(i), GetValue(i));
+  }
+  for (int i = mid; i < original_row_count; ++i) {
+    DeleteImpl(GetKey(mid));
+  }
 }
 
 uint16_t InternalPage::SearchToInsert(std::string_view key) const {
