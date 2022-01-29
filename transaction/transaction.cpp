@@ -119,6 +119,14 @@ template lsn_t Transaction::DeleteLog(page_id_t pid, std::string_view key,
 template lsn_t Transaction::DeleteLog(page_id_t pid, std::string_view key,
                                       uint16_t undo);
 
+lsn_t Transaction::SetLowestLog(page_id_t pid, page_id_t lowest_value) {
+  assert(!IsFinished());
+  LogRecord lr =
+      LogRecord::SetLowestLogRecord(prev_lsn_, txn_id_, pid, lowest_value);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
+}
+
 lsn_t Transaction::AllocatePageLog(page_id_t allocated_page_id,
                                    PageType new_page_type) {
   assert(!IsFinished());

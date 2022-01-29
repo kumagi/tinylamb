@@ -14,16 +14,29 @@ enum class LogType : uint16_t {
   kUnknown,
   kBegin,
   kInsertRow,
+  kInsertLeaf,
+  kInsertInternal,
   kUpdateRow,
+  kUpdateLeaf,
+  kUpdateInternal,
   kDeleteRow,
+  kDeleteLeaf,
+  kDeleteInternal,
   kCompensateInsertRow,
+  kCompensateInsertLeaf,
+  kCompensateInsertInternal,
   kCompensateUpdateRow,
+  kCompensateUpdateLeaf,
+  kCompensateUpdateInternal,
   kCompensateDeleteRow,
+  kCompensateDeleteLeaf,
+  kCompensateDeleteInternal,
   kCommit,
   kBeginCheckpoint,
   kEndCheckpoint,
   kSystemAllocPage,
   kSystemDestroyPage,
+  kLowestValue,
 };
 
 std::ostream& operator<<(std::ostream& o, const LogType& type);
@@ -94,6 +107,9 @@ struct LogRecord {
                                                std::string_view slot,
                                                page_id_t redo);
 
+  static LogRecord SetLowestLogRecord(lsn_t p, txn_id_t tid, page_id_t pid,
+                                      page_id_t lowest_value);
+
   static LogRecord AllocatePageLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                          PageType new_page_type);
 
@@ -121,16 +137,17 @@ struct LogRecord {
       case LogType::kCompensateUpdateRow:
       case LogType::kCompensateDeleteRow:
       case LogType::kInsertRow:
-        o << "\t\t" << l.redo_data.size() << " bytes";
+      case LogType::kInsertLeaf:
+        o << "\t\tRedo: " << l.redo_data.size() << " bytes ";
         l.DumpPosition(o);
         break;
       case LogType::kUpdateRow:
         o << "\t\t" << l.undo_data.size() << " -> " << l.redo_data.size()
-          << "bytes";
+          << "bytes ";
         l.DumpPosition(o);
         break;
       case LogType::kDeleteRow:
-        o << "\t\t" << l.undo_data.size() << " bytes";
+        o << "\t\t" << l.undo_data.size() << " bytes ";
         l.DumpPosition(o);
         break;
       case LogType::kCompensateInsertRow:
@@ -159,6 +176,36 @@ struct LogRecord {
         return o;
       case LogType::kUnknown:
         LOG(ERROR) << "kUnknownLog";
+        break;
+      case LogType::kInsertInternal:
+        o << "\t\t"
+          << "Insert: " << l.key << " -> " << l.redo_page << " ";
+        l.DumpPosition(o);
+        break;
+        break;
+      case LogType::kUpdateLeaf:
+        break;
+      case LogType::kUpdateInternal:
+        break;
+      case LogType::kDeleteLeaf:
+        break;
+      case LogType::kDeleteInternal:
+        break;
+      case LogType::kCompensateInsertLeaf:
+        break;
+      case LogType::kCompensateInsertInternal:
+        break;
+      case LogType::kCompensateUpdateLeaf:
+        break;
+      case LogType::kCompensateUpdateInternal:
+        break;
+      case LogType::kCompensateDeleteLeaf:
+        break;
+      case LogType::kCompensateDeleteInternal:
+        break;
+      case LogType::kLowestValue:
+        o << "\t"
+          << "Lowest: " << l.redo_page;
         break;
     }
     o << "\tprev_lsn: " << l.prev_lsn << "\ttxn_id: " << l.txn_id;

@@ -32,6 +32,17 @@ class InternalPageTest : public ::testing::Test {
 
   void Flush() { p_->GetPool()->FlushPageForTest(internal_page_id_); }
 
+  void AssertPIDForKey(page_id_t pid, std::string_view key,
+                       page_id_t expected) {
+    auto txn = tm_->Begin();
+    PageRef p = p_->GetPage(pid);
+
+    page_id_t value;
+    ASSERT_TRUE(p->GetPageForKey(txn, key, &value));
+    ASSERT_EQ(value, expected);
+    EXPECT_TRUE(txn.PreCommit());
+  }
+
   virtual void Recover() {
     if (p_) {
       p_->GetPool()->LostAllPageForTest();
@@ -43,7 +54,9 @@ class InternalPageTest : public ::testing::Test {
     p_ = std::make_unique<PageManager>(kDBFileName, 10);
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
+    r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), nullptr);
+    r_->RecoverFrom(0, tm_.get());
   }
 
   void TearDown() override {
@@ -54,6 +67,7 @@ class InternalPageTest : public ::testing::Test {
   std::unique_ptr<LockManager> lm_;
   std::unique_ptr<PageManager> p_;
   std::unique_ptr<Logger> l_;
+  std::unique_ptr<RecoveryManager> r_;
   std::unique_ptr<TransactionManager> tm_;
   page_id_t internal_page_id_;
 };
@@ -67,17 +81,16 @@ TEST_F(InternalPageTest, SetMinimumTree) {
 }
 
 TEST_F(InternalPageTest, GetPageForKeyMinimum) {
-  auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(internal_page_id_);
-  page->SetLowestValue(txn, 100);
-  ASSERT_TRUE(page->Insert(txn, "b", 200));
-  page_id_t pid;
-  ASSERT_TRUE(page->GetPageForKey(txn, "alpha", &pid));
-  ASSERT_EQ(pid, 100);
-  ASSERT_TRUE(page->GetPageForKey(txn, "b", &pid));
-  ASSERT_EQ(pid, 200);
-  ASSERT_TRUE(page->GetPageForKey(txn, "delta", &pid));
-  ASSERT_EQ(pid, 200);
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(internal_page_id_);
+    page->SetLowestValue(txn, 100);
+    ASSERT_TRUE(page->Insert(txn, "b", 200));
+    txn.PreCommit();
+  }
+  AssertPIDForKey(internal_page_id_, "alpha", 100);
+  AssertPIDForKey(internal_page_id_, "b", 200);
+  AssertPIDForKey(internal_page_id_, "delta", 200);
 }
 
 TEST_F(InternalPageTest, InsertKey) {
@@ -94,23 +107,21 @@ TEST_F(InternalPageTest, InsertKey) {
 }
 
 TEST_F(InternalPageTest, GetPageForKey) {
-  auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(internal_page_id_);
-  page->SetLowestValue(txn, 2);
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(internal_page_id_);
+    page->SetLowestValue(txn, 2);
 
-  ASSERT_TRUE(page->Insert(txn, "c", 23));
-  ASSERT_TRUE(page->Insert(txn, "b", 20));
-  ASSERT_TRUE(page->Insert(txn, "e", 40));
+    ASSERT_TRUE(page->Insert(txn, "c", 23));
+    ASSERT_TRUE(page->Insert(txn, "b", 20));
+    ASSERT_TRUE(page->Insert(txn, "e", 40));
+    ASSERT_TRUE(txn.PreCommit());
+  }
 
-  page_id_t pid;
-  ASSERT_TRUE(page->GetPageForKey(txn, "alpha", &pid));
-  ASSERT_EQ(pid, 2);
-  ASSERT_TRUE(page->GetPageForKey(txn, "b", &pid));
-  EXPECT_EQ(pid, 20);
-  ASSERT_TRUE(page->GetPageForKey(txn, "c", &pid));
-  EXPECT_EQ(pid, 23);
-  ASSERT_TRUE(page->GetPageForKey(txn, "zeta", &pid));
-  EXPECT_EQ(pid, 40);
+  AssertPIDForKey(internal_page_id_, "alpha", 2);
+  AssertPIDForKey(internal_page_id_, "b", 20);
+  AssertPIDForKey(internal_page_id_, "c", 23);
+  AssertPIDForKey(internal_page_id_, "zeta", 40);
 }
 
 TEST_F(InternalPageTest, InsertAndGetKey) {
@@ -222,6 +233,26 @@ TEST_F(InternalPageTest, SplitInto) {
   EXPECT_EQ(pid, 9);
   ASSERT_TRUE(right->GetPageForKey(txn, "i", &pid));
   EXPECT_EQ(pid, 10);
+}
+
+TEST_F(InternalPageTest, Recovery) {
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(internal_page_id_);
+    page->SetLowestValue(txn, 2);
+
+    ASSERT_TRUE(page->Insert(txn, "c", 23));
+    ASSERT_TRUE(page->Insert(txn, "b", 20));
+    ASSERT_TRUE(page->Insert(txn, "e", 40));
+    txn.PreCommit();
+  }
+
+  Recover();  // Expect redo happen.
+
+  AssertPIDForKey(internal_page_id_, "alpha", 2);
+  AssertPIDForKey(internal_page_id_, "b", 20);
+  AssertPIDForKey(internal_page_id_, "c", 23);
+  AssertPIDForKey(internal_page_id_, "zeta", 40);
 }
 
 }  // namespace tinylamb

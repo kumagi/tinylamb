@@ -39,7 +39,9 @@ class InternalPage {
   }
 
   void SetLowestValue(page_id_t pid, Transaction& txn, page_id_t value);
-  
+
+  void SetLowestValueImpl(page_id_t value) { lowest_page_ = value; }
+
   bool Insert(page_id_t pid, Transaction& txn, std::string_view key,
               page_id_t value);
 
@@ -62,7 +64,8 @@ class InternalPage {
   [[nodiscard]] const page_id_t& GetValue(size_t idx) const;
   [[nodiscard]] page_id_t& GetValue(size_t idx);
 
-  void InsertImpl(std::string_view key, page_id_t pid);
+  void InsertImpl(std::string_view key, page_id_t redo);
+  void UpdateImpl(std::string_view key, page_id_t redo);
   void DeleteImpl(std::string_view key);
 
   void Dump(std::ostream& o, int indent) const;

@@ -62,14 +62,17 @@ class Page {
 
   // Internal methods exposed for recovery.
   void InsertImpl(std::string_view redo);
-
   void UpdateImpl(uint16_t slot, std::string_view redo);
-
   void DeleteImpl(uint16_t slot);
 
   void InsertImpl(std::string_view key, std::string_view value);
   void UpdateImpl(std::string_view key, std::string_view value);
   void DeleteImpl(std::string_view key);
+
+  void InsertInternalImpl(std::string_view key, page_id_t pid);
+  void UpdateInternalImpl(std::string_view key, page_id_t pid);
+  void DeleteInternalImpl(std::string_view key);
+  void SetLowestValueInternalImpl(page_id_t lowest_value);
 
   void SetChecksum() const;
 

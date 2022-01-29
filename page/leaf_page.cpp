@@ -27,7 +27,9 @@ std::string_view LeafPage::GetKey(size_t idx) const {
       reinterpret_cast<const RowPointer*>(Payload() + kPageBodySize -
                                           row_count_ * sizeof(RowPointer)) +
       idx;
-  return Deserialize(Payload() + pos->offset);
+  std::string_view ret;
+  DeserializeStringView(Payload() + pos->offset, &ret);
+  return ret;
 }
 
 std::string_view LeafPage::GetValue(size_t idx) const {
@@ -36,7 +38,10 @@ std::string_view LeafPage::GetValue(size_t idx) const {
                                           row_count_ * sizeof(RowPointer)) +
       idx;
   std::string_view key = GetKey(idx);
-  return Deserialize(Payload() + pos->offset + sizeof(uint16_t) + key.size());
+  std::string_view ret;
+  DeserializeStringView(Payload() + pos->offset + sizeof(uint16_t) + key.size(),
+                        &ret);
+  return ret;
 }
 
 bool LeafPage::Insert(page_id_t page_id, Transaction& txn, std::string_view key,
@@ -73,8 +78,8 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
   rows[pos].offset = free_ptr_;
   rows[pos].size = physical_size;
 
-  free_ptr_ += Serialize(Payload() + free_ptr_, key);
-  free_ptr_ += Serialize(Payload() + free_ptr_, value);
+  free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
+  free_ptr_ += SerializeStringView(Payload() + free_ptr_, value);
 }
 
 bool LeafPage::Update(page_id_t page_id, Transaction& txn, std::string_view key,
@@ -104,8 +109,8 @@ void LeafPage::UpdateImpl(std::string_view key, std::string_view redo) {
   RowPointer* rows = Rows();
   rows[pos].offset = free_ptr_;
   rows[pos].size = physical_size;
-  free_ptr_ += Serialize(Payload() + free_ptr_, key);
-  free_ptr_ += Serialize(Payload() + free_ptr_, redo);
+  free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
+  free_ptr_ += SerializeStringView(Payload() + free_ptr_, redo);
 }
 
 bool LeafPage::Delete(page_id_t page_id, Transaction& txn,

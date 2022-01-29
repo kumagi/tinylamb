@@ -22,8 +22,8 @@ const InternalPage::RowPointer* InternalPage::Rows() const {
 
 void InternalPage::SetLowestValue(page_id_t pid, Transaction& txn,
                                   page_id_t value) {
-  lowest_page_ = value;
-  // txn.SetLowestLog(pid, value);
+  SetLowestValueImpl(value);
+  txn.SetLowestLog(pid, value);
 }
 
 bool InternalPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
@@ -44,7 +44,7 @@ bool InternalPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
 
 void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
   const uint16_t inserted_offset = free_ptr_;
-  free_ptr_ += Serialize(Payload() + free_ptr_, key);
+  free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
   free_ptr_ += SerializePID(Payload() + free_ptr_, pid);
   uint16_t insert = SearchToInsert(key);
   RowPointer* rows = Rows();
@@ -58,6 +58,7 @@ bool InternalPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
                           page_id_t value) {
   return true;
 }
+void InternalPage::UpdateImpl(std::string_view key, page_id_t pid) { return; }
 
 bool InternalPage::Delete(page_id_t pid, Transaction& txn,
                           std::string_view key) {
@@ -137,7 +138,9 @@ std::string_view InternalPage::GetKey(size_t idx) const {
       reinterpret_cast<const RowPointer*>(Payload() + kPageBodySize -
                                           row_count_ * sizeof(RowPointer)) +
       idx;
-  return Deserialize(Payload() + pos->offset);
+  std::string_view key;
+  DeserializeStringView(Payload() + pos->offset, &key);
+  return key;
 }
 
 const page_id_t& InternalPage::GetValue(size_t idx) const {

@@ -213,6 +213,23 @@ void Page::DeleteImpl(std::string_view key) {
   body.leaf_page.DeleteImpl(key);
 }
 
+void Page::InsertInternalImpl(std::string_view key, page_id_t redo) {
+  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  body.internal_page.InsertImpl(key, redo);
+}
+void Page::UpdateInternalImpl(std::string_view key, page_id_t redo) {
+  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  body.internal_page.UpdateImpl(key, redo);
+}
+void Page::DeleteInternalImpl(std::string_view key) {
+  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  body.internal_page.DeleteImpl(key);
+}
+void Page::SetLowestValueInternalImpl(page_id_t lowest_value) {
+  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  body.internal_page.SetLowestValueImpl(lowest_value);
+}
+
 bool Page::IsValid() const { return checksum == std::hash<Page>()(*this); }
 
 void* Page::operator new(size_t) {

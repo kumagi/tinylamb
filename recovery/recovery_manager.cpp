@@ -21,56 +21,50 @@ bool IsPageManipulation(LogType type) {
     case LogType::kUnknown:
       throw std::runtime_error("Invalid format log");
 
-    case LogType::kInsertRow:
-    case LogType::kUpdateRow:
-    case LogType::kDeleteRow:
-    case LogType::kCompensateInsertRow:
-    case LogType::kCompensateUpdateRow:
-    case LogType::kCompensateDeleteRow:
-    case LogType::kSystemAllocPage:
-    case LogType::kSystemDestroyPage:
-      return true;
-
     case LogType::kBegin:
     case LogType::kCommit:
     case LogType::kBeginCheckpoint:
     case LogType::kEndCheckpoint:
       return false;
+
+    default:
+      return true;
   }
   return false;
 }
 
 void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
   switch (log.type) {
+    case LogType::kBeginCheckpoint:
+    case LogType::kEndCheckpoint:
+      return;
+    default:
+      // Do nothing.
+      break;
+  }
+  if (lsn <= target->PageLSN()) return;
+
+  switch (log.type) {
     case LogType::kUnknown:
       assert(!"unknown log type must not be parsed");
     case LogType::kBegin:
       break;
     case LogType::kInsertRow: {
-      if (target->PageLSN() < lsn) {
-        target->InsertImpl(log.redo_data);
-        target->SetPageLSN(lsn);
-      }
+      target->InsertImpl(log.redo_data);
       break;
     }
     case LogType::kUpdateRow: {
-      if (target->PageLSN() < lsn) {
-        target->UpdateImpl(log.slot, log.redo_data);
-        target->SetPageLSN(lsn);
-      }
+      target->UpdateImpl(log.slot, log.redo_data);
       break;
     }
     case LogType::kDeleteRow: {
-      if (target->PageLSN() < lsn) {
-        target->DeleteImpl(log.slot);
-        target->SetPageLSN(lsn);
-      }
+      target->DeleteImpl(log.slot);
       break;
     }
     case LogType::kCommit:
       break;
     case LogType::kSystemAllocPage: {
-      if (target->PageLSN() < lsn || !target->IsValid()) {
+      if (!target->IsValid()) {
         target->PageInit(log.pid, log.allocated_page_type);
       }
       break;
@@ -78,30 +72,51 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
     case LogType::kSystemDestroyPage: {
       throw std::runtime_error("not implemented yet");
     }
-    case LogType::kBeginCheckpoint:
-    case LogType::kEndCheckpoint:
     case LogType::kCompensateInsertRow: {
-      if (target->PageLSN() < lsn) {
-        target->DeleteImpl(log.slot);
-        target->SetPageLSN(lsn);
-      }
+      target->DeleteImpl(log.slot);
       break;
     }
     case LogType::kCompensateUpdateRow: {
-      if (target->PageLSN() < lsn) {
-        target->UpdateImpl(log.slot, log.redo_data);
-        target->SetPageLSN(lsn);
-      }
+      target->UpdateImpl(log.slot, log.redo_data);
       break;
     }
-    case LogType::kCompensateDeleteRow: {
-      if (target->PageLSN() < lsn) {
-        target->InsertImpl(log.redo_data);
-        target->SetPageLSN(lsn);
-      }
+    case LogType::kCompensateDeleteRow:
+      target->InsertImpl(log.redo_data);
       break;
-    }
+    case LogType::kInsertLeaf:
+      break;
+    case LogType::kInsertInternal:
+      target->InsertInternalImpl(log.key, log.redo_page);
+      break;
+    case LogType::kUpdateLeaf:
+      break;
+    case LogType::kUpdateInternal:
+      target->UpdateInternalImpl(log.key, log.redo_page);
+      break;
+    case LogType::kDeleteLeaf:
+      break;
+    case LogType::kDeleteInternal:
+      target->DeleteInternalImpl(log.key);
+      break;
+    case LogType::kCompensateInsertLeaf:
+      break;
+    case LogType::kCompensateInsertInternal:
+      break;
+    case LogType::kCompensateUpdateLeaf:
+      break;
+    case LogType::kCompensateUpdateInternal:
+      break;
+    case LogType::kCompensateDeleteLeaf:
+      break;
+    case LogType::kCompensateDeleteInternal:
+      break;
+    case LogType::kLowestValue:
+      target->SetLowestValueInternalImpl(log.redo_page);
+      break;
+    default:
+      assert(!"must not reach here");
   }
+  target->SetPageLSN(lsn);
 }
 
 void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
@@ -271,6 +286,12 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
         case LogType::kInsertRow:
         case LogType::kUpdateRow:
         case LogType::kDeleteRow:
+        case LogType::kInsertLeaf:
+        case LogType::kUpdateLeaf:
+        case LogType::kDeleteLeaf:
+        case LogType::kInsertInternal:
+        case LogType::kUpdateInternal:
+        case LogType::kDeleteInternal:
         case LogType::kCompensateInsertRow:
         case LogType::kCompensateUpdateRow:
         case LogType::kCompensateDeleteRow: {

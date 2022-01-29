@@ -64,6 +64,8 @@ class Transaction {
   // Internal page deletion.
   lsn_t DeleteLog(page_id_t pid, page_id_t prev);
 
+  lsn_t SetLowestLog(page_id_t pid, page_id_t lowest_value);
+
   lsn_t AllocatePageLog(page_id_t page_id, PageType new_page_type);
 
   lsn_t DestroyPageLog(page_id_t page_id);
