@@ -54,7 +54,7 @@ void TransactionManager::Abort(Transaction& txn) {
   while (prev != 0) {
     LogRecord lr;
     recovery_->ReadLog(prev, &lr);
-    LOG(TRACE) << "txn undo: " << lr;
+    LOG(TRACE) << "Rollback: " << lr;
     recovery_->LogUndoWithPage(prev, lr, txn.transaction_manager_);
     prev = lr.prev_lsn;
   }

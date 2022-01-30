@@ -48,71 +48,56 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
     case LogType::kUnknown:
       assert(!"unknown log type must not be parsed");
     case LogType::kBegin:
-      break;
-    case LogType::kInsertRow: {
-      target->InsertImpl(log.redo_data);
-      break;
-    }
-    case LogType::kUpdateRow: {
-      target->UpdateImpl(log.slot, log.redo_data);
-      break;
-    }
-    case LogType::kDeleteRow: {
-      target->DeleteImpl(log.slot);
-      break;
-    }
     case LogType::kCommit:
       break;
-    case LogType::kSystemAllocPage: {
-      if (!target->IsValid()) {
-        target->PageInit(log.pid, log.allocated_page_type);
-      }
-      break;
-    }
-    case LogType::kSystemDestroyPage: {
-      throw std::runtime_error("not implemented yet");
-    }
-    case LogType::kCompensateInsertRow: {
-      target->DeleteImpl(log.slot);
-      break;
-    }
-    case LogType::kCompensateUpdateRow: {
-      target->UpdateImpl(log.slot, log.redo_data);
-      break;
-    }
+    case LogType::kInsertRow:
     case LogType::kCompensateDeleteRow:
       target->InsertImpl(log.redo_data);
       break;
-    case LogType::kInsertLeaf:
+    case LogType::kUpdateRow:
+    case LogType::kCompensateUpdateRow:
+      target->UpdateImpl(log.slot, log.redo_data);
       break;
-    case LogType::kInsertInternal:
-      target->InsertInternalImpl(log.key, log.redo_page);
+    case LogType::kDeleteRow:
+    case LogType::kCompensateInsertRow:
+      target->DeleteImpl(log.slot);
       break;
     case LogType::kUpdateLeaf:
+      target->UpdateImpl(log.key, log.redo_data);
+      break;
+    case LogType::kDeleteLeaf:
+    case LogType::kCompensateInsertLeaf:
+      target->DeleteImpl(log.key);
+      break;
+    case LogType::kDeleteInternal:
+    case LogType::kCompensateInsertInternal:
+      target->DeleteInternalImpl(log.key);
+      break;
+    case LogType::kCompensateUpdateLeaf:
+    case LogType::kCompensateUpdateInternal:
+      target->UpdateImpl(log.key, log.redo_data);
+      break;
+    case LogType::kInsertLeaf:
+    case LogType::kCompensateDeleteLeaf:
+      target->InsertImpl(log.key, log.redo_data);
+      break;
+    case LogType::kInsertInternal:
+    case LogType::kCompensateDeleteInternal:
+      target->InsertInternalImpl(log.key, log.redo_page);
       break;
     case LogType::kUpdateInternal:
       target->UpdateInternalImpl(log.key, log.redo_page);
       break;
-    case LogType::kDeleteLeaf:
-      break;
-    case LogType::kDeleteInternal:
-      target->DeleteInternalImpl(log.key);
-      break;
-    case LogType::kCompensateInsertLeaf:
-      break;
-    case LogType::kCompensateInsertInternal:
-      break;
-    case LogType::kCompensateUpdateLeaf:
-      break;
-    case LogType::kCompensateUpdateInternal:
-      break;
-    case LogType::kCompensateDeleteLeaf:
-      break;
-    case LogType::kCompensateDeleteInternal:
-      break;
     case LogType::kLowestValue:
       target->SetLowestValueInternalImpl(log.redo_page);
       break;
+    case LogType::kSystemAllocPage:
+      if (!target->IsValid()) {
+        target->PageInit(log.pid, log.allocated_page_type);
+      }
+      break;
+    case LogType::kSystemDestroyPage:
+      throw std::runtime_error("not implemented yet");
     default:
       assert(!"must not reach here");
   }
@@ -159,8 +144,7 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       tm->CompensateUpdateInternalLog(log.txn_id, log.pid, log.key,
                                       log.undo_page);
       throw std::runtime_error(
-          "compensating update internal is not implemneted");
-      break;
+          "compensating update internal is not implemented");
     case LogType::kDeleteLeaf:
       tm->CompensateDeleteLog(log.txn_id, log.pid, log.key, log.undo_data);
       target->InsertImpl(log.key, log.undo_data);
