@@ -12,10 +12,9 @@ namespace tinylamb {
 
 Transaction TransactionManager::Begin() {
   txn_id_t new_txn_id = next_txn_id_.fetch_add(1);
-
   Transaction new_txn(new_txn_id, this);
-  LogRecord begin_log(0, new_txn_id, LogType::kBegin);
-  new_txn.prev_lsn_ = logger_->AddLog(begin_log);
+  new_txn.prev_lsn_ =
+      logger_->AddLog(LogRecord(0, new_txn_id, LogType::kBegin));
   {
     std::scoped_lock lk(transaction_table_lock);
     active_transactions_.emplace(new_txn_id, &new_txn);
@@ -27,7 +26,6 @@ Transaction TransactionManager::Begin() {
 bool TransactionManager::PreCommit(Transaction& txn) {
   assert(!txn.IsFinished());
   txn.SetStatus(TransactionStatus::kCommitted);
-  // CommitLog(txn.txn_id_);
   LogRecord commit_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
   txn.prev_lsn_ = logger_->AddLog(commit_log);
   for (auto& row : txn.read_set_) {

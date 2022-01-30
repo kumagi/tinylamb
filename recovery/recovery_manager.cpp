@@ -128,17 +128,14 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
     case LogType::kInsertRow:
       tm->CompensateInsertLog(log.txn_id, log.pid, log.slot);
       target->DeleteImpl(log.slot);
-      target->SetPageLSN(lsn);
       break;
     case LogType::kUpdateRow:
       tm->CompensateUpdateLog(log.txn_id, log.pid, log.slot, log.undo_data);
       target->UpdateImpl(log.slot, log.undo_data);
-      target->SetPageLSN(lsn);
       break;
     case LogType::kDeleteRow:
       tm->CompensateDeleteLog(log.txn_id, log.pid, log.slot, log.undo_data);
       target->InsertImpl(log.undo_data);
-      target->SetPageLSN(lsn);
       break;
     case LogType::kSystemAllocPage:
       LOG(ERROR) << "Redoing alloc is not implemented yet";
@@ -148,23 +145,30 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       break;
     case LogType::kInsertLeaf:
       tm->CompensateInsertLog(log.txn_id, log.pid, log.key);
+      target->DeleteImpl(log.key);
       break;
     case LogType::kInsertInternal:
       tm->CompensateInsertInternalLog(log.txn_id, log.pid, log.key);
+      target->DeleteInternalImpl(log.key);
       break;
     case LogType::kUpdateLeaf:
       tm->CompensateUpdateLog(log.txn_id, log.pid, log.key, log.undo_data);
+      target->UpdateImpl(log.key, log.undo_data);
       break;
     case LogType::kUpdateInternal:
       tm->CompensateUpdateInternalLog(log.txn_id, log.pid, log.key,
                                       log.undo_page);
+      throw std::runtime_error(
+          "compensating update internal is not implemneted");
       break;
     case LogType::kDeleteLeaf:
       tm->CompensateDeleteLog(log.txn_id, log.pid, log.key, log.undo_data);
+      target->InsertImpl(log.key, log.undo_data);
       break;
     case LogType::kDeleteInternal:
       tm->CompensateDeleteInternalLog(log.txn_id, log.pid, log.key,
                                       log.undo_page);
+      target->InsertInternalImpl(log.key, log.undo_page);
       break;
     case LogType::kBegin:
     case LogType::kCommit:
@@ -183,6 +187,7 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       // Compensating log cannot be undo.
       break;
   }
+  target->SetPageLSN(lsn);
 }
 
 // Precondition: the page is locked by this thread.
@@ -296,7 +301,8 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
         throw std::runtime_error("Invalid log: " + std::to_string(offset));
       }
 
-      LOG(TRACE) << "analyzing: " << offset << ": " << log;
+      LOG(TRACE) << "analyzing: " << offset << ": " << log
+                 << "  to: " << offset + log.Size();
       switch (log.type) {
         case LogType::kUnknown:
           throw std::runtime_error("Invalid log: " + std::to_string(offset));

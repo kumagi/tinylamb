@@ -28,6 +28,7 @@ Logger::~Logger() {
 
 lsn_t Logger::AddLog(const LogRecord& log) {
   std::string data = log.Serialize();
+  // LOG(TRACE) << "logging: " << log;
   std::scoped_lock lk(latch_);
 
   size_t memory_offset = written_lsn_ % buffer_.size();

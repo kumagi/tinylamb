@@ -43,6 +43,8 @@ TEST_F(LogRecordTest, check) {
         LogRecord::CompensatingInsertLogRecord(12, 123, 345));
     SerializeDeserializeCheck(
         LogRecord::CompensatingInsertLogRecord(12, 34, "key1"));
+    SerializeDeserializeCheck(
+        LogRecord::CompensatingInsertInternalLogRecord(12, 66, "key2"));
   }
 
   {

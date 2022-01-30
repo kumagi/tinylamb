@@ -162,13 +162,10 @@ struct LogRecord {
       case LogType::kCompensateInsertRow:
         l.DumpPosition(o);
         break;
-      case LogType::kSystemAllocPage:
-      case LogType::kSystemDestroyPage:
-        l.DumpPosition(o);
-        break;
       case LogType::kBegin:
       case LogType::kCommit:
-        o << "\t";
+      case LogType::kSystemAllocPage:
+      case LogType::kSystemDestroyPage:
         break;
       case LogType::kBeginCheckpoint:
         return o;
@@ -191,25 +188,15 @@ struct LogRecord {
           << "Insert: " << l.key << " -> " << l.redo_page << " ";
         l.DumpPosition(o);
         break;
-        break;
       case LogType::kUpdateLeaf:
-        break;
       case LogType::kUpdateInternal:
-        break;
       case LogType::kDeleteLeaf:
-        break;
       case LogType::kDeleteInternal:
-        break;
       case LogType::kCompensateInsertLeaf:
-        break;
       case LogType::kCompensateInsertInternal:
-        break;
       case LogType::kCompensateUpdateLeaf:
-        break;
       case LogType::kCompensateUpdateInternal:
-        break;
       case LogType::kCompensateDeleteLeaf:
-        break;
       case LogType::kCompensateDeleteInternal:
         break;
       case LogType::kLowestValue:

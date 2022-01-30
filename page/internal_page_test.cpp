@@ -255,7 +255,7 @@ TEST_F(InternalPageTest, Recovery) {
   AssertPIDForKey(internal_page_id_, "zeta", 40);
 }
 
-TEST_F(InternalPageTest, InsertAbort) {
+TEST_F(InternalPageTest, InsertCrash) {
   {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(internal_page_id_);
@@ -269,7 +269,6 @@ TEST_F(InternalPageTest, InsertAbort) {
     PageRef page = p_->GetPage(internal_page_id_);
     ASSERT_TRUE(page->Insert(txn, "b", 20));
     ASSERT_TRUE(page->Insert(txn, "e", 40));
-    txn.Abort();  // Abort!
   }
 
   Recover();  // Expect redo happen.

@@ -174,37 +174,53 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
   switch (dst->type) {
     case LogType::kUnknown:
       LOG(ERROR) << "unknown log type";
+      for (int i = 0; i < 100; ++i) {
+        if (i % 16 == 0) fprintf(stderr, "\n");
+        fprintf(stderr, " ");
+        fprintf(stderr, "%02x", (char)*src++);
+      }
       return false;
     case LogType::kBegin:
     case LogType::kCommit:
     case LogType::kBeginCheckpoint:
+    case LogType::kCompensateInsertInternal:
+    case LogType::kSystemDestroyPage:
+    case LogType::kCompensateInsertRow:
+    case LogType::kCompensateInsertLeaf:
       return true;
-    case LogType::kInsertRow: {
-      src += DeserializeStringView(src, &dst->redo_data);
-      return true;
-    }
-    case LogType::kUpdateLeaf:
-    case LogType::kUpdateRow: {
-      src += DeserializeStringView(src, &dst->redo_data);
-      src += DeserializeStringView(src, &dst->undo_data);
-      return true;
-    }
-    case LogType::kDeleteLeaf:
-    case LogType::kDeleteRow: {
-      src += DeserializeStringView(src, &dst->undo_data);
-      return true;
-    }
-    case LogType::kCompensateInsertRow: {
-      return true;
-    }
+    case LogType::kInsertRow:
     case LogType::kInsertLeaf:
-    case LogType::kCompensateUpdateLeaf:
     case LogType::kCompensateUpdateRow:
+    case LogType::kCompensateUpdateLeaf:
+    case LogType::kCompensateDeleteRow:
     case LogType::kCompensateDeleteLeaf:
-    case LogType::kCompensateDeleteRow: {
       src += DeserializeStringView(src, &dst->redo_data);
       return true;
-    }
+    case LogType::kUpdateRow:
+    case LogType::kUpdateLeaf:
+      src += DeserializeStringView(src, &dst->redo_data);
+      src += DeserializeStringView(src, &dst->undo_data);
+      return true;
+    case LogType::kDeleteRow:
+    case LogType::kDeleteLeaf:
+      src += DeserializeStringView(src, &dst->undo_data);
+      return true;
+    case LogType::kInsertInternal:
+    case LogType::kCompensateUpdateInternal:
+    case LogType::kCompensateDeleteInternal:
+    case LogType::kLowestValue:
+      src += DeserializePID(src, &dst->redo_page);
+      return true;
+    case LogType::kUpdateInternal:
+      src += DeserializePID(src, &dst->redo_page);
+      src += DeserializePID(src, &dst->undo_page);
+      return true;
+    case LogType::kDeleteInternal:
+      src += DeserializePID(src, &dst->undo_page);
+      return true;
+    case LogType::kSystemAllocPage:
+      memcpy(&dst->allocated_page_type, src, sizeof(dst->allocated_page_type));
+      return true;
     case LogType::kEndCheckpoint: {
       uint64_t dpt_size;
       memcpy(&dpt_size, src, sizeof(dpt_size));
@@ -230,28 +246,6 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
       }
       return true;
     }
-    case LogType::kSystemAllocPage:
-      memcpy(&dst->allocated_page_type, src, sizeof(dst->allocated_page_type));
-      sizeof(dst->allocated_page_type);
-      return true;
-    case LogType::kLowestValue:
-    case LogType::kInsertInternal:
-    case LogType::kCompensateUpdateInternal:
-    case LogType::kCompensateDeleteInternal:
-      src += DeserializePID(src, &dst->redo_page);
-      return true;
-    case LogType::kUpdateInternal:
-      src += DeserializePID(src, &dst->redo_page);
-      src += DeserializePID(src, &dst->undo_page);
-      return true;
-    case LogType::kDeleteInternal:
-      src += DeserializePID(src, &dst->undo_page);
-      return true;
-    case LogType::kCompensateInsertInternal:
-      break;
-    case LogType::kSystemDestroyPage:
-    case LogType::kCompensateInsertLeaf:
-      return true;
   }
   LOG(ERROR) << "unexpected execution path: " << dst->type;
   return false;
@@ -539,6 +533,7 @@ void LogRecord::Clear() {
   slot = std::numeric_limits<uint16_t>::max();
   prev_lsn = 0;
   txn_id = 0;
+  key = "";
   undo_data = "";
   redo_data = "";
   dirty_page_table.clear();
@@ -569,6 +564,16 @@ size_t LogRecord::Size() const {
     case LogType::kDeleteRow:
       size += SerializeSize(undo_data);
       break;
+    case LogType::kLowestValue:
+    case LogType::kInsertInternal:
+    case LogType::kDeleteInternal:
+    case LogType::kCompensateUpdateInternal:
+    case LogType::kCompensateDeleteInternal:
+      size += sizeof(page_id_t);
+      break;
+    case LogType::kUpdateInternal:
+      size += sizeof(page_id_t) * 2;
+      break;
     case LogType::kEndCheckpoint:
       size += sizeof(dirty_page_table.size()) +
               dirty_page_table.size() * sizeof(std::pair<page_id_t, lsn_t>);
@@ -578,16 +583,6 @@ size_t LogRecord::Size() const {
       break;
     case LogType::kSystemAllocPage:
       size += sizeof(PageType);
-      break;
-    case LogType::kUpdateInternal:
-      size += sizeof(page_id_t) * 2;
-      break;
-    case LogType::kLowestValue:
-    case LogType::kInsertInternal:
-    case LogType::kDeleteInternal:
-    case LogType::kCompensateUpdateInternal:
-    case LogType::kCompensateDeleteInternal:
-      size += sizeof(page_id_t);
       break;
     case LogType::kBegin:
     case LogType::kBeginCheckpoint:
@@ -617,43 +612,43 @@ size_t LogRecord::Size() const {
       assert(!"unknown type log must not be serialized");
     case LogType::kInsertRow:
     case LogType::kCompensateUpdateLeaf:
-    case LogType::kInsertLeaf: {
+    case LogType::kInsertLeaf:
+    case LogType::kCompensateUpdateRow:
+    case LogType::kCompensateDeleteRow:
+    case LogType::kCompensateDeleteLeaf:
       offset += SerializeStringView(result.data() + offset, redo_data);
       break;
-    }
-    case LogType::kInsertInternal:
-    case LogType::kLowestValue:
-      offset += SerializePID(result.data() + offset, redo_page);
-      break;
     case LogType::kUpdateLeaf:
-    case LogType::kUpdateRow: {
+    case LogType::kUpdateRow:
       offset += SerializeStringView(result.data() + offset, redo_data);
       offset += SerializeStringView(result.data() + offset, undo_data);
       break;
-    }
-    case LogType::kCompensateInsertRow:
-      break;
     case LogType::kDeleteLeaf:
-    case LogType::kDeleteRow: {
-      offset +=
-          ::tinylamb::SerializeStringView(result.data() + offset, undo_data);
+    case LogType::kDeleteRow:
+      offset += SerializeStringView(result.data() + offset, undo_data);
       break;
-    }
-    case LogType::kBeginCheckpoint:
-    case LogType::kBegin:
-    case LogType::kCommit:
-      // Nothing to do.
+    case LogType::kInsertInternal:
+    case LogType::kCompensateUpdateInternal:
+    case LogType::kCompensateDeleteInternal:
+    case LogType::kLowestValue:
+      offset += SerializePID(result.data() + offset, redo_page);
+      break;
+    case LogType::kUpdateInternal:
+      offset += SerializePID(result.data() + offset, redo_page);
+      offset += SerializePID(result.data() + offset, undo_page);
+      break;
+    case LogType::kDeleteInternal:
+      offset += SerializePID(result.data() + offset, undo_page);
       break;
     case LogType::kEndCheckpoint: {
       uint64_t dpt_size = dirty_page_table.size();
       memcpy(result.data() + offset, &dpt_size, sizeof(dpt_size));
       offset += sizeof(dpt_size);
       for (const auto& dpt : dirty_page_table) {
-        memcpy(result.data() + offset, &dpt, sizeof(dpt));
-        offset += sizeof(dpt);
+        offset += SerializePID(result.data() + offset, dpt.first);
+        offset += SerializePID(result.data() + offset, dpt.second);
       }
-
-      uint64_t tt_size = active_transaction_table.size();
+      const uint64_t tt_size = active_transaction_table.size();
       memcpy(result.data() + offset, &tt_size, sizeof(tt_size));
       offset += sizeof(tt_size);
       for (const auto& tt : active_transaction_table) {
@@ -666,33 +661,18 @@ size_t LogRecord::Size() const {
              sizeof(allocated_page_type));
       offset += sizeof(allocated_page_type);
       break;
-    case LogType::kSystemDestroyPage:
-      break;
-    case LogType::kCompensateUpdateRow:
-    case LogType::kCompensateDeleteRow:
-      offset += SerializeStringView(result.data() + offset, redo_data);
-      break;
-    case LogType::kUpdateInternal:
-      offset += SerializePID(result.data() + offset, redo_page);
-      offset += SerializePID(result.data() + offset, undo_page);
-      break;
-    case LogType::kDeleteInternal:
-      offset += SerializePID(result.data() + offset, undo_page);
-      break;
-    case LogType::kCompensateInsertInternal:
-      offset += SerializePID(result.data() + offset, redo_page);
-      break;
-    case LogType::kCompensateUpdateInternal:
-    case LogType::kCompensateDeleteInternal:
-      offset += SerializePID(result.data() + offset, redo_page);
-      break;
+    case LogType::kBeginCheckpoint:
+    case LogType::kCompensateInsertRow:
     case LogType::kCompensateInsertLeaf:
-      break;
-    case LogType::kCompensateDeleteLeaf:
-      offset += SerializePID(result.data() + offset, redo_page);
+    case LogType::kCompensateInsertInternal:
+    case LogType::kBegin:
+    case LogType::kCommit:
+    case LogType::kSystemDestroyPage:
+      // Nothing to do.
       break;
   }
-  // assert(offset == Size());
+  // LOG(ERROR) << offset << " : " << Size();
+  assert(offset == Size());
   return result;
 }
 
