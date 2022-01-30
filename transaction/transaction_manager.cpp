@@ -52,6 +52,7 @@ void TransactionManager::Abort(Transaction& txn) {
     }
   }
   lsn_t prev = txn.prev_lsn_;
+  recovery_->RefreshMap();
   while (prev != 0) {
     LogRecord lr;
     recovery_->ReadLog(prev, &lr);
@@ -62,27 +63,60 @@ void TransactionManager::Abort(Transaction& txn) {
   PreCommit(txn);  // Writes an empty commit.
 }
 
-void TransactionManager::CompensateInsertLog(txn_id_t txn_id,
-                                             const RowPosition& pos) {
-  LogRecord lr =
-      LogRecord::CompensatingInsertLogRecord(txn_id, pos.page_id, pos.slot);
-  logger_->AddLog(lr);
+void TransactionManager::CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
+                                             uint16_t slot) {
+  logger_->AddLog(LogRecord::CompensatingInsertLogRecord(txn_id, pid, slot));
+}
+void TransactionManager::CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
+                                             std::string_view key) {
+  logger_->AddLog(LogRecord::CompensatingInsertLogRecord(txn_id, pid, key));
+}
+void TransactionManager::CompensateInsertInternalLog(txn_id_t txn_id,
+                                                     page_id_t pid,
+                                                     std::string_view key) {
+  logger_->AddLog(
+      LogRecord::CompensatingInsertInternalLogRecord(txn_id, pid, key));
 }
 
-void TransactionManager::CompensateUpdateLog(txn_id_t txn_id,
-                                             const RowPosition& pos,
+void TransactionManager::CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
+                                             uint16_t slot,
                                              std::string_view redo) {
-  LogRecord lr = LogRecord::CompensatingUpdateLogRecord(txn_id, pos.page_id,
-                                                        pos.slot, redo);
-  logger_->AddLog(lr);
+  logger_->AddLog(
+      LogRecord::CompensatingUpdateLogRecord(txn_id, pid, slot, redo));
+}
+void TransactionManager::CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
+                                             std::string_view key,
+                                             std::string_view redo) {
+  logger_->AddLog(
+      LogRecord::CompensatingUpdateLeafLogRecord(txn_id, pid, key, redo));
+}
+void TransactionManager::CompensateUpdateInternalLog(txn_id_t txn_id,
+                                                     page_id_t pid,
+                                                     std::string_view key,
+                                                     page_id_t redo) {
+  logger_->AddLog(
+      LogRecord::CompensatingUpdateInternalLogRecord(txn_id, pid, key, redo));
 }
 
-void TransactionManager::CompensateDeleteLog(txn_id_t txn_id,
-                                             const RowPosition& pos,
+void TransactionManager::CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
+                                             uint16_t slot,
                                              std::string_view redo) {
-  LogRecord lr = LogRecord::CompensatingDeleteLogRecord(txn_id, pos.page_id,
-                                                        pos.slot, redo);
-  logger_->AddLog(lr);
+  logger_->AddLog(
+      LogRecord::CompensatingDeleteLogRecord(txn_id, pid, slot, redo));
+}
+
+void TransactionManager::CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
+                                             std::string_view key,
+                                             std::string_view redo) {
+  logger_->AddLog(
+      LogRecord::CompensatingDeleteLeafLogRecord(txn_id, pid, key, redo));
+}
+void TransactionManager::CompensateDeleteInternalLog(txn_id_t txn_id,
+                                                     page_id_t pid,
+                                                     std::string_view key,
+                                                     page_id_t redo) {
+  logger_->AddLog(
+      LogRecord::CompensatingDeleteInternalLogRecord(txn_id, pid, key, redo));
 }
 
 bool TransactionManager::GetExclusiveLock(const RowPosition& rp) {

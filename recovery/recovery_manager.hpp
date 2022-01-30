@@ -28,7 +28,6 @@ class RecoveryManager {
 
   void LogUndoWithPage(lsn_t lsn, const LogRecord& log, TransactionManager* tm);
 
- private:
   void RefreshMap();
 
  private:

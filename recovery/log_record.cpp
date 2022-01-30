@@ -269,9 +269,9 @@ LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                        std::string_view key,
-                                        std::string_view value) {
+LogRecord LogRecord::InsertingLeafLogRecord(lsn_t p, txn_id_t txn,
+                                            page_id_t pid, std::string_view key,
+                                            std::string_view value) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
@@ -282,8 +282,10 @@ LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                        std::string_view key, page_id_t value) {
+LogRecord LogRecord::InsertingInternalLogRecord(lsn_t p, txn_id_t txn,
+                                                page_id_t pid,
+                                                std::string_view key,
+                                                page_id_t value) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
@@ -314,6 +316,17 @@ LogRecord LogRecord::CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
   return l;
 }
 
+LogRecord LogRecord::CompensatingInsertInternalLogRecord(txn_id_t txn,
+                                                         page_id_t pid,
+                                                         std::string_view key) {
+  LogRecord l;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.key = key;
+  l.type = LogType::kCompensateInsertInternal;
+  return l;
+}
+
 LogRecord LogRecord::UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                        uint16_t key, std::string_view redo,
                                        std::string_view undo) {
@@ -328,10 +341,10 @@ LogRecord LogRecord::UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                       std::string_view key,
-                                       std::string_view redo,
-                                       std::string_view undo) {
+LogRecord LogRecord::UpdatingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                           std::string_view key,
+                                           std::string_view redo,
+                                           std::string_view undo) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
@@ -343,9 +356,10 @@ LogRecord LogRecord::UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                       std::string_view key, page_id_t redo,
-                                       page_id_t undo) {
+LogRecord LogRecord::UpdatingInternalLogRecord(lsn_t p, txn_id_t txn,
+                                               page_id_t pid,
+                                               std::string_view key,
+                                               page_id_t redo, page_id_t undo) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
@@ -369,9 +383,9 @@ LogRecord LogRecord::CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
-                                                 std::string_view key,
-                                                 std::string_view redo) {
+LogRecord LogRecord::CompensatingUpdateLeafLogRecord(lsn_t txn, page_id_t pid,
+                                                     std::string_view key,
+                                                     std::string_view redo) {
   LogRecord l;
   l.txn_id = txn;
   l.pid = pid;
@@ -381,9 +395,10 @@ LogRecord LogRecord::CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
-                                                 std::string_view key,
-                                                 page_id_t redo) {
+LogRecord LogRecord::CompensatingUpdateInternalLogRecord(lsn_t txn,
+                                                         page_id_t pid,
+                                                         std::string_view key,
+                                                         page_id_t redo) {
   LogRecord l;
   l.txn_id = txn;
   l.pid = pid;
@@ -405,9 +420,9 @@ LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                       std::string_view key,
-                                       std::string_view undo) {
+LogRecord LogRecord::DeletingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                           std::string_view key,
+                                           std::string_view undo) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
@@ -418,8 +433,10 @@ LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                       std::string_view key, uint16_t undo) {
+LogRecord LogRecord::DeletingInternalLogRecord(lsn_t p, txn_id_t txn,
+                                               page_id_t pid,
+                                               std::string_view key,
+                                               uint16_t undo) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
@@ -442,21 +459,23 @@ LogRecord LogRecord::CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
-                                                 std::string_view key,
-                                                 std::string_view redo) {
+LogRecord LogRecord::CompensatingDeleteLeafLogRecord(txn_id_t txn,
+                                                     page_id_t pid,
+                                                     std::string_view key,
+                                                     std::string_view redo) {
   LogRecord l;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
-  l.type = LogType::kCompensateDeleteRow;
+  l.type = LogType::kCompensateDeleteLeaf;
   l.redo_data = redo;
   return l;
 }
 
-LogRecord LogRecord::CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
-                                                 std::string_view key,
-                                                 page_id_t redo) {
+LogRecord LogRecord::CompensatingDeleteInternalLogRecord(txn_id_t txn,
+                                                         page_id_t pid,
+                                                         std::string_view key,
+                                                         page_id_t redo) {
   LogRecord l;
   l.txn_id = txn;
   l.pid = pid;

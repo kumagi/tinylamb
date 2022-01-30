@@ -38,7 +38,7 @@ bool InternalPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
   }
 
   InsertImpl(key, value);
-  txn.InsertLog(pid, key, value);
+  txn.InsertInternalLog(pid, key, value);
   return true;
 }
 
@@ -68,7 +68,7 @@ bool InternalPage::Delete(page_id_t pid, Transaction& txn,
   }
   uint16_t old_value = GetValue(pos);
   DeleteImpl(key);
-  txn.DeleteLog(pid, key, old_value);
+  txn.DeleteInternalLog(pid, key, old_value);
   return true;
 }
 

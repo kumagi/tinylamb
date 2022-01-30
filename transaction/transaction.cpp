@@ -71,53 +71,75 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
   return true;
 }
 
-template <typename KeyType, typename ValueType>
-lsn_t Transaction::InsertLog(page_id_t pid, KeyType key, ValueType redo) {
+lsn_t Transaction::InsertLog(page_id_t pid, uint16_t slot,
+                             std::string_view redo) {
   assert(!IsFinished());
-  LogRecord lr =
-      LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pid, key, redo);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
+  prev_lsn_ = transaction_manager_->AddLog(
+      LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pid, slot, redo));
   return prev_lsn_;
 }
-template lsn_t Transaction::InsertLog(page_id_t pid, uint16_t key,
-                                      std::string_view redo);
-template lsn_t Transaction::InsertLog(page_id_t pid, std::string_view key,
-                                      std::string_view redo);
-template lsn_t Transaction::InsertLog(page_id_t pid, std::string_view key,
-                                      page_id_t redo);
+lsn_t Transaction::InsertLeafLog(page_id_t pid, std::string_view key,
+                                 std::string_view redo) {
+  assert(!IsFinished());
+  prev_lsn_ = transaction_manager_->AddLog(
+      LogRecord::InsertingLeafLogRecord(prev_lsn_, txn_id_, pid, key, redo));
+  return prev_lsn_;
+}
+lsn_t Transaction::InsertInternalLog(page_id_t pid, std::string_view key,
+                                     page_id_t redo) {
+  assert(!IsFinished());
+  prev_lsn_ =
+      transaction_manager_->AddLog(LogRecord::InsertingInternalLogRecord(
+          prev_lsn_, txn_id_, pid, key, redo));
+  return prev_lsn_;
+}
 
-template <typename KeyType, typename ValueType>
-lsn_t Transaction::UpdateLog(page_id_t pid, KeyType key, ValueType undo,
-                             ValueType redo) {
+lsn_t Transaction::UpdateLog(page_id_t pid, uint16_t slot,
+                             std::string_view undo, std::string_view redo) {
   assert(!IsFinished());
-  LogRecord lr =
-      LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, key, redo, undo);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
+  prev_lsn_ = transaction_manager_->AddLog(
+      LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, slot, redo, undo));
   return prev_lsn_;
 }
-template lsn_t Transaction::UpdateLog(page_id_t pid, uint16_t key,
-                                      std::string_view undo,
-                                      std::string_view redo);
-template lsn_t Transaction::UpdateLog(page_id_t pid, std::string_view key,
-                                      std::string_view undo,
-                                      std::string_view redo);
-template lsn_t Transaction::UpdateLog(page_id_t pid, std::string_view key,
-                                      page_id_t undo, page_id_t redo);
+lsn_t Transaction::UpdateLeafLog(page_id_t pid, std::string_view key,
+                                 std::string_view undo, std::string_view redo) {
+  assert(!IsFinished());
+  prev_lsn_ = transaction_manager_->AddLog(LogRecord::UpdatingLeafLogRecord(
+      prev_lsn_, txn_id_, pid, key, redo, undo));
+  return prev_lsn_;
+}
+lsn_t Transaction::UpdateInternalLog(page_id_t pid, std::string_view key,
+                                     page_id_t undo, page_id_t redo) {
+  assert(!IsFinished());
+  prev_lsn_ = transaction_manager_->AddLog(LogRecord::UpdatingInternalLogRecord(
+      prev_lsn_, txn_id_, pid, key, redo, undo));
+  return prev_lsn_;
+}
 
-template <typename KeyType, typename ValueType>
-lsn_t Transaction::DeleteLog(page_id_t pid, KeyType key, ValueType undo) {
+lsn_t Transaction::DeleteLog(page_id_t pid, uint16_t slot,
+                             std::string_view undo) {
   assert(!IsFinished());
   LogRecord lr =
-      LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, key, undo);
+      LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, slot, undo);
   prev_lsn_ = transaction_manager_->AddLog(lr);
   return prev_lsn_;
 }
-template lsn_t Transaction::DeleteLog(page_id_t pid, uint16_t key,
-                                      std::string_view undo);
-template lsn_t Transaction::DeleteLog(page_id_t pid, std::string_view key,
-                                      std::string_view undo);
-template lsn_t Transaction::DeleteLog(page_id_t pid, std::string_view key,
-                                      uint16_t undo);
+lsn_t Transaction::DeleteLeafLog(page_id_t pid, std::string_view key,
+                                 std::string_view undo) {
+  assert(!IsFinished());
+  LogRecord lr =
+      LogRecord::DeletingLeafLogRecord(prev_lsn_, txn_id_, pid, key, undo);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
+}
+lsn_t Transaction::DeleteInternalLog(page_id_t pid, std::string_view key,
+                                     page_id_t undo) {
+  assert(!IsFinished());
+  LogRecord lr =
+      LogRecord::DeletingInternalLogRecord(prev_lsn_, txn_id_, pid, key, undo);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
+}
 
 lsn_t Transaction::SetLowestLog(page_id_t pid, page_id_t lowest_value) {
   assert(!IsFinished());

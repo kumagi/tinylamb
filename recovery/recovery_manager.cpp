@@ -125,42 +125,63 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
     case LogType::kUnknown:
       LOG(FATAL) << "Unknown type log";
       throw std::runtime_error("broken log");
-    case LogType::kBegin:
-      break;
-    case LogType::kInsertRow: {
-      tm->CompensateInsertLog(log.txn_id, RowPosition(log.pid, log.slot));
+    case LogType::kInsertRow:
+      tm->CompensateInsertLog(log.txn_id, log.pid, log.slot);
       target->DeleteImpl(log.slot);
       target->SetPageLSN(lsn);
       break;
-    }
-    case LogType::kUpdateRow: {
-      tm->CompensateUpdateLog(log.txn_id, RowPosition(log.pid, log.slot),
-                              log.undo_data);
+    case LogType::kUpdateRow:
+      tm->CompensateUpdateLog(log.txn_id, log.pid, log.slot, log.undo_data);
       target->UpdateImpl(log.slot, log.undo_data);
       target->SetPageLSN(lsn);
       break;
-    }
-    case LogType::kDeleteRow: {
-      tm->CompensateDeleteLog(log.txn_id, RowPosition(log.pid, log.slot),
-                              log.undo_data);
+    case LogType::kDeleteRow:
+      tm->CompensateDeleteLog(log.txn_id, log.pid, log.slot, log.undo_data);
       target->InsertImpl(log.undo_data);
       target->SetPageLSN(lsn);
       break;
-    }
+    case LogType::kSystemAllocPage:
+      LOG(ERROR) << "Redoing alloc is not implemented yet";
+      break;
+    case LogType::kSystemDestroyPage:
+      target->PageInit(log.pid, log.allocated_page_type);
+      break;
+    case LogType::kInsertLeaf:
+      tm->CompensateInsertLog(log.txn_id, log.pid, log.key);
+      break;
+    case LogType::kInsertInternal:
+      tm->CompensateInsertInternalLog(log.txn_id, log.pid, log.key);
+      break;
+    case LogType::kUpdateLeaf:
+      tm->CompensateUpdateLog(log.txn_id, log.pid, log.key, log.undo_data);
+      break;
+    case LogType::kUpdateInternal:
+      tm->CompensateUpdateInternalLog(log.txn_id, log.pid, log.key,
+                                      log.undo_page);
+      break;
+    case LogType::kDeleteLeaf:
+      tm->CompensateDeleteLog(log.txn_id, log.pid, log.key, log.undo_data);
+      break;
+    case LogType::kDeleteInternal:
+      tm->CompensateDeleteInternalLog(log.txn_id, log.pid, log.key,
+                                      log.undo_page);
+      break;
+    case LogType::kBegin:
     case LogType::kCommit:
     case LogType::kBeginCheckpoint:
     case LogType::kEndCheckpoint:
     case LogType::kCompensateInsertRow:
     case LogType::kCompensateUpdateRow:
     case LogType::kCompensateDeleteRow:
+    case LogType::kCompensateInsertLeaf:
+    case LogType::kCompensateInsertInternal:
+    case LogType::kCompensateUpdateLeaf:
+    case LogType::kCompensateUpdateInternal:
+    case LogType::kCompensateDeleteLeaf:
+    case LogType::kCompensateDeleteInternal:
+    case LogType::kLowestValue:  // Just ignore it!.
+      // Compensating log cannot be undo.
       break;
-    case LogType::kSystemAllocPage:
-      LOG(ERROR) << "Redoing alloc is not implemented yet";
-      break;
-    case LogType::kSystemDestroyPage: {
-      target->PageInit(log.pid, log.allocated_page_type);
-      break;
-    }
   }
 }
 
@@ -380,7 +401,6 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
 }
 
 bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) {
-  RefreshMap();
   return LogRecord::ParseLogRecord(&log_data_[lsn], dst);
 }
 

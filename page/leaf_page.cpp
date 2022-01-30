@@ -57,7 +57,7 @@ bool LeafPage::Insert(page_id_t page_id, Transaction& txn, std::string_view key,
   }
 
   InsertImpl(key, value);
-  txn.InsertLog(page_id, key, value);
+  txn.InsertLeafLog(page_id, key, value);
   return true;
 }
 
@@ -93,7 +93,7 @@ bool LeafPage::Update(page_id_t page_id, Transaction& txn, std::string_view key,
   const int size_diff = physical_size - existing_value.size();
   if (free_size_ < size_diff) return false;
 
-  txn.UpdateLog(page_id, key, existing_value, value);
+  txn.UpdateLeafLog(page_id, key, existing_value, value);
   UpdateImpl(key, value);
   return true;
 }
@@ -118,7 +118,7 @@ bool LeafPage::Delete(page_id_t page_id, Transaction& txn,
   std::string_view existing_value;
   if (!Read(txn, key, &existing_value)) return false;
 
-  txn.DeleteLog(page_id, key, existing_value);
+  txn.DeleteLeafLog(page_id, key, existing_value);
   DeleteImpl(key);
   return true;
 }

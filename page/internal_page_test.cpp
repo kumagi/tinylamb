@@ -255,4 +255,29 @@ TEST_F(InternalPageTest, Recovery) {
   AssertPIDForKey(internal_page_id_, "zeta", 40);
 }
 
+TEST_F(InternalPageTest, InsertAbort) {
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(internal_page_id_);
+    page->SetLowestValue(txn, 2);
+
+    ASSERT_TRUE(page->Insert(txn, "c", 23));
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(internal_page_id_);
+    ASSERT_TRUE(page->Insert(txn, "b", 20));
+    ASSERT_TRUE(page->Insert(txn, "e", 40));
+    txn.Abort();  // Abort!
+  }
+
+  Recover();  // Expect redo happen.
+
+  AssertPIDForKey(internal_page_id_, "alpha", 2);
+  AssertPIDForKey(internal_page_id_, "b", 2);
+  AssertPIDForKey(internal_page_id_, "c", 23);
+  AssertPIDForKey(internal_page_id_, "zeta", 23);
+}
+
 }  // namespace tinylamb

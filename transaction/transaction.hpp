@@ -52,17 +52,22 @@ class Transaction {
   void Abort();
 
   // Returns LSN
-  template <typename KeyType, typename ValueType>
-  lsn_t InsertLog(page_id_t pid, KeyType key, ValueType redo);
+  lsn_t InsertLog(page_id_t pid, uint16_t slot, std::string_view redo);
+  lsn_t InsertLeafLog(page_id_t pid, std::string_view key,
+                      std::string_view redo);
+  lsn_t InsertInternalLog(page_id_t pid, std::string_view key, page_id_t redo);
 
-  template <typename KeyType, typename ValueType>
-  lsn_t UpdateLog(page_id_t pid, KeyType key, ValueType prev, ValueType value);
+  lsn_t UpdateLog(page_id_t pid, uint16_t slot, std::string_view prev,
+                  std::string_view value);
+  lsn_t UpdateLeafLog(page_id_t pid, std::string_view key,
+                      std::string_view prev, std::string_view value);
+  lsn_t UpdateInternalLog(page_id_t pid, std::string_view key, page_id_t prev,
+                          page_id_t value);
 
-  template <typename KeyType, typename ValueType>
-  lsn_t DeleteLog(page_id_t pid, KeyType key, ValueType prev);
-
-  // Internal page deletion.
-  lsn_t DeleteLog(page_id_t pid, page_id_t prev);
+  lsn_t DeleteLog(page_id_t pid, uint16_t key, std::string_view prev);
+  lsn_t DeleteLeafLog(page_id_t pid, std::string_view key,
+                      std::string_view prev);
+  lsn_t DeleteInternalLog(page_id_t pid, std::string_view key, page_id_t prev);
 
   lsn_t SetLowestLog(page_id_t pid, page_id_t lowest_value);
 

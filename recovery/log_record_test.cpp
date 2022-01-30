@@ -34,9 +34,9 @@ TEST_F(LogRecordTest, check) {
     SerializeDeserializeCheck(
         LogRecord::InsertingLogRecord(12, 2, 1, 3, "hello"));
     SerializeDeserializeCheck(
-        LogRecord::InsertingLogRecord(12, 2, 3, "key", "hello"));
+        LogRecord::InsertingLeafLogRecord(12, 2, 3, "key", "hello"));
     SerializeDeserializeCheck(
-        LogRecord::InsertingLogRecord(12, 2, 3, "key", 343));
+        LogRecord::InsertingInternalLogRecord(12, 2, 3, "key", 343));
 
     // Compensation records.
     SerializeDeserializeCheck(
@@ -50,18 +50,18 @@ TEST_F(LogRecordTest, check) {
     SCOPED_TRACE("Updating log tests");
     SerializeDeserializeCheck(
         LogRecord::UpdatingLogRecord(13, 3, 3, 4, "redo_log", "long_undo_log"));
-    SerializeDeserializeCheck(LogRecord::UpdatingLogRecord(
+    SerializeDeserializeCheck(LogRecord::UpdatingLeafLogRecord(
         13, 3, 5, "key", "redo_log", "long_undo_log"));
     SerializeDeserializeCheck(
-        LogRecord::UpdatingLogRecord(13, 3, 5, "key", 123, 578));
+        LogRecord::UpdatingInternalLogRecord(13, 3, 5, "key", 123, 578));
 
     // Compensation records.
     SerializeDeserializeCheck(
         LogRecord::CompensatingUpdateLogRecord(12, 123, 345, "hello"));
     SerializeDeserializeCheck(
-        LogRecord::CompensatingUpdateLogRecord(12, 854, "key2", "hello"));
+        LogRecord::CompensatingUpdateLeafLogRecord(12, 854, "key2", "hello"));
     SerializeDeserializeCheck(
-        LogRecord::CompensatingUpdateLogRecord(12, 854, "key4", 123));
+        LogRecord::CompensatingUpdateInternalLogRecord(12, 854, "key4", 123));
   }
 
   {
@@ -70,15 +70,15 @@ TEST_F(LogRecordTest, check) {
     SerializeDeserializeCheck(
         LogRecord::DeletingLogRecord(13, 4, 4, 5, "undo_log"));
     SerializeDeserializeCheck(
-        LogRecord::DeletingLogRecord(13, 4, 6, "key", "undo_log"));
+        LogRecord::DeletingLeafLogRecord(13, 4, 6, "key", "undo_log"));
     SerializeDeserializeCheck(
-        LogRecord::DeletingLogRecord(13, 4, 6, "key", 543));
+        LogRecord::DeletingInternalLogRecord(13, 4, 6, "key", 543));
     SerializeDeserializeCheck(
         LogRecord::CompensatingDeleteLogRecord(12, 123, 345, "deleted"));
-    SerializeDeserializeCheck(
-        LogRecord::CompensatingDeleteLogRecord(12, 21343, "key3", "deleted"));
-    SerializeDeserializeCheck(
-        LogRecord::CompensatingDeleteLogRecord(12, 21343, "key3", 12312));
+    SerializeDeserializeCheck(LogRecord::CompensatingDeleteLeafLogRecord(
+        12, 21343, "key3", "deleted"));
+    SerializeDeserializeCheck(LogRecord::CompensatingDeleteInternalLogRecord(
+        12, 21343, "key3", 12312));
   }
 
   // Checkpoint related logs.
