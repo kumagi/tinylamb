@@ -115,7 +115,7 @@ bool Page::Insert(Transaction& txn, std::string_view key,
 
 bool Page::Update(Transaction& txn, std::string_view key,
                   std::string_view value) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  ASSERT_PAGE_TYPE(PageType::kLeafPage)
   bool result = body.leaf_page.Update(PageID(), txn, key, value);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
@@ -141,43 +141,48 @@ bool Page::Delete(Transaction& txn, std::string_view key) {
 
 bool Page::Read(Transaction& txn, std::string_view key,
                 std::string_view* result) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  ASSERT_PAGE_TYPE(PageType::kLeafPage)
   return body.leaf_page.Read(txn, key, result);
 }
 
 bool Page::LowestKey(Transaction& txn, std::string_view* result) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  ASSERT_PAGE_TYPE(PageType::kLeafPage)
   return body.leaf_page.LowestKey(txn, result);
 }
 
 bool Page::HighestKey(Transaction& txn, std::string_view* result) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  ASSERT_PAGE_TYPE(PageType::kLeafPage)
   return body.leaf_page.HighestKey(txn, result);
 }
 
+void Page::Split(Transaction& txn, Page* right) {
+  ASSERT_PAGE_TYPE(PageType::kLeafPage)
+  body.leaf_page.Split(PageID(), txn, right);
+}
+
 bool Page::Insert(Transaction& txn, std::string_view key, page_id_t pid) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  ASSERT_PAGE_TYPE(PageType::kInternalPage)
   return body.internal_page.Insert(PageID(), txn, key, pid);
 }
 
 bool Page::Update(Transaction& txn, std::string_view key, page_id_t pid) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  ASSERT_PAGE_TYPE(PageType::kInternalPage)
   return body.internal_page.Update(PageID(), txn, key, pid);
 }
 
 bool Page::GetPageForKey(Transaction& txn, std::string_view key,
                          page_id_t* result) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  ASSERT_PAGE_TYPE(PageType::kInternalPage)
   return body.internal_page.GetPageForKey(txn, key, result);
 }
 
 void Page::SetLowestValue(Transaction& txn, page_id_t v) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  ASSERT_PAGE_TYPE(PageType::kInternalPage)
   body.internal_page.SetLowestValue(PageID(), txn, v);
 }
 
 void Page::SplitInto(Transaction& txn, Page* right, std::string_view* middle) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  ASSERT_PAGE_TYPE(PageType::kInternalPage)
   body.internal_page.SplitInto(PageID(), txn, right, middle);
 }
 
@@ -199,34 +204,34 @@ void Page::DeleteImpl(uint16_t slot) {
 }
 
 void Page::InsertImpl(std::string_view key, std::string_view value) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  ASSERT_PAGE_TYPE(PageType::kLeafPage)
   body.leaf_page.InsertImpl(key, value);
 }
 
 void Page::UpdateImpl(std::string_view key, std::string_view value) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  ASSERT_PAGE_TYPE(PageType::kLeafPage)
   body.leaf_page.UpdateImpl(key, value);
 }
 
 void Page::DeleteImpl(std::string_view key) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  ASSERT_PAGE_TYPE(PageType::kLeafPage)
   body.leaf_page.DeleteImpl(key);
 }
 
 void Page::InsertInternalImpl(std::string_view key, page_id_t redo) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  ASSERT_PAGE_TYPE(PageType::kInternalPage)
   body.internal_page.InsertImpl(key, redo);
 }
 void Page::UpdateInternalImpl(std::string_view key, page_id_t redo) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  ASSERT_PAGE_TYPE(PageType::kInternalPage)
   body.internal_page.UpdateImpl(key, redo);
 }
 void Page::DeleteInternalImpl(std::string_view key) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  ASSERT_PAGE_TYPE(PageType::kInternalPage)
   body.internal_page.DeleteImpl(key);
 }
 void Page::SetLowestValueInternalImpl(page_id_t lowest_value) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage);
+  ASSERT_PAGE_TYPE(PageType::kInternalPage)
   body.internal_page.SetLowestValueImpl(lowest_value);
 }
 

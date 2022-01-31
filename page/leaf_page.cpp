@@ -158,7 +158,7 @@ bool LeafPage::HighestKey(Transaction& txn, std::string_view* result) {
 
 size_t LeafPage::RowCount() const { return row_count_; }
 
-void LeafPage::MoveHalfTo(page_id_t pid, Transaction& txn, Page* target) {
+void LeafPage::Split(page_id_t pid, Transaction& txn, Page* target) {
   // TODO(kumagi): Could be faster with bulk updates.
   for (size_t i = row_count_ / 2; i < row_count_; ++i) {
     target->Insert(txn, GetKey(i), GetValue(i));

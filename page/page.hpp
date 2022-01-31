@@ -52,6 +52,7 @@ class Page {
   bool Read(Transaction& txn, std::string_view key, std::string_view* result);
   bool LowestKey(Transaction& txn, std::string_view* result);
   bool HighestKey(Transaction& txn, std::string_view* result);
+  void Split(Transaction& txn, Page* right);
 
   // Internal page manipulations.
   bool Insert(Transaction& txn, std::string_view key, page_id_t pid);

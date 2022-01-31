@@ -121,26 +121,10 @@ PagePool::~PagePool() {
   src_.close();
 }
 
-void ZeroFillUntil(std::fstream& of, size_t expected) {
-  if (expected == 0) {
-    return;
-  }
-  of.clear();
-  of.seekp(0, std::ios_base::beg);
-  const std::ofstream::pos_type start = of.tellp();
-  of.seekp(0, std::ios_base::end);
-  const std::ofstream::pos_type finish = of.tellp();
-  const size_t needs = expected - (finish - start);
-  for (size_t i = 0; i < needs; ++i) {
-    of.write("\0", 1);
-  }
-}
-
 void PagePool::WriteBack(const Page* target) {
   target->SetChecksum();
   src_.seekp(target->PageID() * kPageSize, std::ios_base::beg);
   if (src_.fail()) {
-    // ZeroFillUntil(src_, target->PageID() * kPageSize);
     src_.clear();
   }
   src_.write(reinterpret_cast<const char*>(target), kPageSize);

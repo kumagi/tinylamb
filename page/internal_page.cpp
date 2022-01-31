@@ -125,6 +125,7 @@ void InternalPage::SplitInto(page_id_t pid, Transaction& txn, Page* right,
     right->Insert(txn, GetKey(i), GetValue(i));
   }
   for (int i = mid; i < original_row_count; ++i) {
+    txn.DeleteInternalLog(pid, GetKey(mid), GetValue(mid));
     DeleteImpl(GetKey(mid));
   }
 }
@@ -190,7 +191,6 @@ void InternalPage::Dump(std::ostream& o, int indent) const {
     << " FreePtr:" << free_ptr_;
   if (row_count_ == 0) return;
   o << "\n" << Indent(indent + 2) << lowest_page_;
-  std::string_view out;
   for (size_t i = 0; i < row_count_; ++i) {
     o << "\n"
       << Indent(indent) << GetKey(i) << "\n"

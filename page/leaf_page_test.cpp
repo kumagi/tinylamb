@@ -28,8 +28,6 @@ class LeafPageTest : public ::testing::Test {
     EXPECT_TRUE(txn.PreCommit());
   }
 
-  void Flush() { p_->GetPool()->FlushPageForTest(leaf_page_id_); }
-
   virtual void Recover() {
     if (p_) {
       p_->GetPool()->LostAllPageForTest();
@@ -218,6 +216,30 @@ TEST_F(LeafPageTest, LowestHighestKey) {
 
   ASSERT_TRUE(page->HighestKey(txn, &out));
   ASSERT_EQ(out, "D");
+}
+
+TEST_F(LeafPageTest, Split) {
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(leaf_page_id_);
+  PageRef right = p_->AllocateNewPage(txn, PageType::kLeafPage);
+  {
+    for (size_t i = 0; i < 10; ++i) {
+      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
+                               std::to_string(i) + ":value"));
+    }
+    page->Split(txn, right.get());
+  }
+  std::string_view out;
+  for (size_t i = 0; i < 5; ++i) {
+    ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+    ASSERT_EQ(std::to_string(i) + ":value", out);
+  }
+  {
+    for (size_t i = 5; i < 10; ++i) {
+      ASSERT_TRUE(right->Read(txn, std::to_string(i) + ":key", &out));
+      ASSERT_EQ(std::to_string(i) + ":value", out);
+    }
+  }
 }
 
 TEST_F(LeafPageTest, InsertCrash) {

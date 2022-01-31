@@ -30,8 +30,6 @@ class InternalPageTest : public ::testing::Test {
     EXPECT_TRUE(txn.PreCommit());
   }
 
-  void Flush() { p_->GetPool()->FlushPageForTest(internal_page_id_); }
-
   void AssertPIDForKey(page_id_t pid, std::string_view key,
                        page_id_t expected) {
     auto txn = tm_->Begin();

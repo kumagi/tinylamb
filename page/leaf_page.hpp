@@ -54,7 +54,7 @@ class LeafPage {
   [[nodiscard]] size_t RowCount() const;
 
   // Split utils.
-  void MoveHalfTo(page_id_t pid, Transaction& txn, Page* target);
+  void Split(page_id_t pid, Transaction& txn, Page* target);
 
   void InsertImpl(std::string_view key, std::string_view value);
   void UpdateImpl(std::string_view key, std::string_view value);
