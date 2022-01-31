@@ -45,9 +45,7 @@ class RowPageTest : public ::testing::Test {
     std::remove(kLogName);
   }
 
-  void Flush() {
-    p_->GetPool()->FlushPageForTest(page_id_);
-  }
+  void Flush() { p_->GetPool()->FlushPageForTest(page_id_); }
 
   bool InsertRow(std::string_view str, bool commit = true) {
     auto txn = tm_->Begin();
@@ -56,8 +54,8 @@ class RowPageTest : public ::testing::Test {
     EXPECT_FALSE(page.IsNull());
     EXPECT_EQ(page->Type(), PageType::kRowPage);
 
-    const uint16_t before_size = rp.FreeSizeForTest();
-    uint16_t slot;
+    const bin_size_t before_size = rp.FreeSizeForTest();
+    slot_t slot;
     bool success = page->Insert(txn, str, &slot);
     if (success) {
       EXPECT_EQ(rp.FreeSizeForTest(),

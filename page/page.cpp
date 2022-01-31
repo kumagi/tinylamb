@@ -68,28 +68,34 @@ bool Page::Read(Transaction& txn, const uint16& slot,
   return body.row_page.Read(PageID(), txn, slot, result);
 }
 
-bool Page::Insert(Transaction& txn, std::string_view record, uint16_t* slot) {
+bool Page::Insert(Transaction& txn, std::string_view record, slot_t* slot) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  bool result = body.row_page.Insert(PageID(), txn, record, slot);
-  SetPageLSN(txn.PrevLSN());
-  SetRecLSN(txn.PrevLSN());
-  return result;
+  if (body.row_page.Insert(PageID(), txn, record, slot)) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+    return true;
+  }
+  return false;
 }
 
-bool Page::Update(Transaction& txn, uint16_t slot, std::string_view row) {
+bool Page::Update(Transaction& txn, slot_t slot, std::string_view row) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  bool result = body.row_page.Update(PageID(), txn, slot, row);
-  SetPageLSN(txn.PrevLSN());
-  SetRecLSN(txn.PrevLSN());
-  return result;
+  if (body.row_page.Update(PageID(), txn, slot, row)) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+    return true;
+  }
+  return false;
 }
 
-bool Page::Delete(Transaction& txn, const uint16_t pos) {
+bool Page::Delete(Transaction& txn, const slot_t pos) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  bool result = body.row_page.Delete(PageID(), txn, pos);
-  SetPageLSN(txn.PrevLSN());
-  SetRecLSN(txn.PrevLSN());
-  return result;
+  if (body.row_page.Delete(PageID(), txn, pos)) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+    return true;
+  }
+  return false;
 }
 
 size_t Page::RowCount() const {
@@ -107,10 +113,12 @@ size_t Page::RowCount() const {
 bool Page::Insert(Transaction& txn, std::string_view key,
                   std::string_view value) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  bool result = body.leaf_page.Insert(PageID(), txn, key, value);
-  SetPageLSN(txn.PrevLSN());
-  SetRecLSN(txn.PrevLSN());
-  return result;
+  if (body.leaf_page.Insert(PageID(), txn, key, value)) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+    return true;
+  }
+  return false;
 }
 
 bool Page::Update(Transaction& txn, std::string_view key,
@@ -162,23 +170,40 @@ void Page::Split(Transaction& txn, Page* right) {
 
 bool Page::Insert(Transaction& txn, std::string_view key, page_id_t pid) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  return body.internal_page.Insert(PageID(), txn, key, pid);
+  bool result = body.internal_page.Insert(PageID(), txn, key, pid);
+  if (result) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+  }
+  return result;
 }
 
 bool Page::Update(Transaction& txn, std::string_view key, page_id_t pid) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  return body.internal_page.Update(PageID(), txn, key, pid);
+  if (body.internal_page.Update(PageID(), txn, key, pid)) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+    return true;
+  }
+  return false;
 }
 
 bool Page::GetPageForKey(Transaction& txn, std::string_view key,
                          page_id_t* result) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  return body.internal_page.GetPageForKey(txn, key, result);
+  if (body.internal_page.GetPageForKey(txn, key, result)) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+    return true;
+  }
+  return false;
 }
 
 void Page::SetLowestValue(Transaction& txn, page_id_t v) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
   body.internal_page.SetLowestValue(PageID(), txn, v);
+  SetPageLSN(txn.PrevLSN());
+  SetRecLSN(txn.PrevLSN());
 }
 
 void Page::SplitInto(Transaction& txn, Page* right, std::string_view* middle) {
@@ -193,12 +218,12 @@ void Page::InsertImpl(std::string_view redo) {
   body.row_page.InsertRow(redo);
 }
 
-void Page::UpdateImpl(uint16_t slot, std::string_view redo) {
+void Page::UpdateImpl(slot_t slot, std::string_view redo) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
   body.row_page.UpdateRow(slot, redo);
 }
 
-void Page::DeleteImpl(uint16_t slot) {
+void Page::DeleteImpl(slot_t slot) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
   body.row_page.DeleteRow(slot);
 }
@@ -291,6 +316,9 @@ uint64_t std::hash<tinylamb::Page>::operator()(const tinylamb::Page& p) const {
       return header_hash + std::hash<tinylamb::RowPage>()(p.body.row_page);
     case tinylamb::PageType::kLeafPage:
       return header_hash + std::hash<tinylamb::LeafPage>()(p.body.leaf_page);
+    case tinylamb::PageType::kInternalPage:
+      return header_hash +
+             std::hash<tinylamb::InternalPage>()(p.body.internal_page);
     default:
       return 0xdeadbeefcafebabe;  // Must be a broken page.
   }

@@ -47,7 +47,7 @@ struct LogRecord {
   LogRecord(lsn_t p, txn_id_t txn, LogType t);
 
   [[nodiscard]] bool HasSlot() const {
-    return slot != std::numeric_limits<uint16_t>::max();
+    return slot != std::numeric_limits<slot_t>::max();
   }
   [[nodiscard]] bool HasPageID() const {
     return pid != std::numeric_limits<page_id_t>::max();
@@ -56,7 +56,7 @@ struct LogRecord {
   static bool ParseLogRecord(const char* src, LogRecord* dst);
 
   static LogRecord InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                      uint16_t key, std::string_view redo);
+                                      slot_t key, std::string_view redo);
   static LogRecord InsertingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                           std::string_view key,
                                           std::string_view redo);
@@ -66,7 +66,7 @@ struct LogRecord {
                                               page_id_t redo);
 
   static LogRecord CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
-                                               uint16_t key);
+                                               slot_t key);
   static LogRecord CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
                                                std::string_view key);
   static LogRecord CompensatingInsertInternalLogRecord(txn_id_t txn,
@@ -74,7 +74,7 @@ struct LogRecord {
                                                        std::string_view key);
 
   static LogRecord UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                     uint16_t key, std::string_view redo,
+                                     slot_t key, std::string_view redo,
                                      std::string_view undo);
   static LogRecord UpdatingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                          std::string_view key,
@@ -86,7 +86,7 @@ struct LogRecord {
                                              page_id_t redo, page_id_t undo);
 
   static LogRecord CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
-                                               uint16_t key,
+                                               slot_t key,
                                                std::string_view redo);
   static LogRecord CompensatingUpdateLeafLogRecord(lsn_t txn, page_id_t pid,
                                                    std::string_view key,
@@ -96,17 +96,17 @@ struct LogRecord {
                                                        page_id_t redo);
 
   static LogRecord DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                     uint16_t key, std::string_view undo);
+                                     slot_t slot, std::string_view undo);
   static LogRecord DeletingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                          std::string_view key,
                                          std::string_view undo);
   static LogRecord DeletingInternalLogRecord(lsn_t p, txn_id_t txn,
                                              page_id_t pid,
                                              std::string_view key,
-                                             uint16_t undo);
+                                             page_id_t undo);
 
   static LogRecord CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
-                                               uint16_t slot,
+                                               slot_t slot,
                                                std::string_view redo);
   static LogRecord CompensatingDeleteLeafLogRecord(txn_id_t txn, page_id_t pid,
                                                    std::string_view key,
@@ -215,7 +215,7 @@ struct LogRecord {
   lsn_t prev_lsn = 0;
   txn_id_t txn_id = 0;
   page_id_t pid = std::numeric_limits<page_id_t>::max();
-  uint16_t slot = std::numeric_limits<uint16_t>::max();
+  slot_t slot = std::numeric_limits<slot_t>::max();
   std::string_view key{};
   std::string_view undo_data{};
   std::string_view redo_data{};

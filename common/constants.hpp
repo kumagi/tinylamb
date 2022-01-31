@@ -10,7 +10,6 @@
 namespace tinylamb {
 
 static constexpr size_t kPageSize = 1024 * 32;
-static_assert(kPageSize <= std::numeric_limits<uint16_t>::max());
 static constexpr size_t kPageHeaderSize = sizeof(uint64_t) +  // page_id
                                           sizeof(uint64_t) +  // page_lsn
                                           sizeof(uint64_t) +  // rec_lsn
@@ -30,6 +29,11 @@ enum class Status : uint8_t {
 typedef uint64_t lsn_t;
 typedef uint64_t txn_id_t;
 typedef uint64_t page_id_t;
+typedef uint16_t slot_t;
+typedef uint16_t bin_size_t;
+
+static_assert(kPageSize <= std::numeric_limits<slot_t>::max());
+static_assert(kPageSize <= std::numeric_limits<bin_size_t>::max());
 
 inline std::string_view ToString(Status s) {
   switch (s) {

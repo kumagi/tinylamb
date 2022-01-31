@@ -39,15 +39,15 @@ std::string_view LeafPage::GetValue(size_t idx) const {
       idx;
   std::string_view key = GetKey(idx);
   std::string_view ret;
-  DeserializeStringView(Payload() + pos->offset + sizeof(uint16_t) + key.size(),
-                        &ret);
+  DeserializeStringView(
+      Payload() + pos->offset + sizeof(bin_size_t) + key.size(), &ret);
   return ret;
 }
 
 bool LeafPage::Insert(page_id_t page_id, Transaction& txn, std::string_view key,
                       std::string_view value) {
-  const uint16_t physical_size =
-      sizeof(uint16_t) + key.size() + sizeof(uint16_t) + value.size();
+  const bin_size_t physical_size =
+      sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + value.size();
 
   size_t pos = Find(key);
   if (free_size_ < physical_size + sizeof(RowPointer) ||  // No space.
@@ -62,8 +62,8 @@ bool LeafPage::Insert(page_id_t page_id, Transaction& txn, std::string_view key,
 }
 
 void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
-  const uint16_t physical_size =
-      sizeof(uint16_t) + key.size() + sizeof(uint16_t) + value.size();
+  const bin_size_t physical_size =
+      sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + value.size();
   free_size_ -= physical_size + sizeof(RowPointer);
 
   if (kPageSize - sizeof(RowPointer) * (row_count_ + 1) <
@@ -85,7 +85,7 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
 bool LeafPage::Update(page_id_t page_id, Transaction& txn, std::string_view key,
                       std::string_view value) {
   const size_t physical_size =
-      sizeof(uint16_t) + key.size() + sizeof(uint16_t) + value.size();
+      sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + value.size();
 
   std::string_view existing_value;
   if (!Read(txn, key, &existing_value)) return false;
@@ -100,7 +100,7 @@ bool LeafPage::Update(page_id_t page_id, Transaction& txn, std::string_view key,
 
 void LeafPage::UpdateImpl(std::string_view key, std::string_view redo) {
   const size_t physical_size =
-      sizeof(uint16_t) + key.size() + sizeof(uint16_t) + redo.size();
+      sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + redo.size();
   if (kPageBodySize - sizeof(RowPointer) * row_count_ <
       free_ptr_ + physical_size) {
     DeFragment();
@@ -175,7 +175,7 @@ void LeafPage::DeFragment() {
   for (size_t i = 0; i < row_count_; ++i) {
     payloads.emplace_back(Payload() + rows[i].offset, rows[i].size);
   }
-  uint16_t offset = sizeof(LeafPage);
+  bin_size_t offset = sizeof(LeafPage);
   for (size_t i = 0; i < row_count_; ++i) {
     rows[i].offset = offset;
     memcpy(Payload() + offset, payloads[i].data(), payloads[i].size());
@@ -211,5 +211,15 @@ void LeafPage::Dump(std::ostream& o, int indent) const {
 
 uint64_t std::hash<tinylamb::LeafPage>::operator()(
     const ::tinylamb::LeafPage& r) const {
-  return 0;
+  uint64_t ret = 0;
+  ret += std::hash<tinylamb::page_id_t>()(r.prev_pid_);
+  ret += std::hash<tinylamb::page_id_t>()(r.next_pid_);
+  ret += std::hash<tinylamb::slot_t>()(r.row_count_);
+  ret += std::hash<tinylamb::bin_size_t>()(r.free_ptr_);
+  ret += std::hash<tinylamb::bin_size_t>()(r.free_size_);
+  for (int i = 0; i < r.row_count_; ++i) {
+    ret += std::hash<std::string_view>()(r.GetKey(i));
+    ret += std::hash<std::string_view>()(r.GetValue(i));
+  }
+  return ret;
 }

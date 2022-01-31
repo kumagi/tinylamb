@@ -13,12 +13,12 @@
 namespace tinylamb {
 
 size_t SerializeStringView(char* pos, std::string_view bin);
-size_t SerializeSlot(char* pos, uint16_t slot);
+size_t SerializeSlot(char* pos, slot_t slot);
 size_t SerializePID(char* pos, page_id_t pid);
 size_t SerializeSize(std::string_view bin);
 
 size_t DeserializeStringView(const char* pos, std::string_view* out);
-size_t DeserializeSlot(const char* pos, uint16_t* slot);
+size_t DeserializeSlot(const char* pos, slot_t* slot);
 size_t DeserializePID(const char* pos, page_id_t* out);
 
 }  // namespace tinylamb

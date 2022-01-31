@@ -56,7 +56,7 @@ TEST_F(CheckpointTest, Construct) {}
 TEST_F(CheckpointTest, DoCheckpoint) {
   InsertRow("expect this operation did not rerun");
   Transaction txn = tm_->Begin();
-  uint16_t slot;
+  slot_t slot;
   {
     PageRef page = p_->GetPage(page_id_);
     page->Insert(txn, "inserted", &slot);
@@ -72,7 +72,7 @@ TEST_F(CheckpointTest, DoCheckpoint) {
 TEST_F(CheckpointTest, CheckpointRecovery) {
   InsertRow("expect this operation did not rerun");
   Transaction txn = tm_->Begin();
-  uint16_t inserted;
+  slot_t inserted;
   lsn_t restart_point;
   {
     PageRef page = p_->GetPage(page_id_);
@@ -89,14 +89,14 @@ TEST_F(CheckpointTest, CheckpointRecovery) {
 TEST_F(CheckpointTest, CheckpointAbortRecovery) {
   ASSERT_TRUE(InsertRow("original message"));
   Transaction txn = tm_->Begin();
-  uint16_t slot = 0;
+  slot_t slot = 0;
   lsn_t restart_point;
   {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint();
     page->Update(txn, slot, "aborted");
     RowPosition insert_position;
-    uint16_t will_be_deleted_row;
+    slot_t will_be_deleted_row;
     page->Insert(txn, "will be deleted", &will_be_deleted_row);
   }
   // Note that the txn is not committed.
@@ -109,13 +109,13 @@ TEST_F(CheckpointTest, CheckpointAbortRecovery) {
 TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
   ASSERT_TRUE(InsertRow("original message"));
   Transaction txn = tm_->Begin();
-  uint16_t slot = 0;
+  slot_t slot = 0;
   lsn_t restart_point;
   {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint([&]() {
       page->Update(txn, slot, "aborted");
-      uint16_t will_be_deleted_row;
+      slot_t will_be_deleted_row;
       page->Insert(txn, "will be deleted", &will_be_deleted_row);
     });
   }

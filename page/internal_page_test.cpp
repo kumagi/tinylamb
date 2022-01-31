@@ -30,6 +30,8 @@ class InternalPageTest : public ::testing::Test {
     EXPECT_TRUE(txn.PreCommit());
   }
 
+  void Flush() { p_->GetPool()->FlushPageForTest(internal_page_id_); }
+
   void AssertPIDForKey(page_id_t pid, std::string_view key,
                        page_id_t expected) {
     auto txn = tm_->Begin();
@@ -285,6 +287,7 @@ TEST_F(InternalPageTest, InsertCrash) {
     PageRef page = p_->GetPage(internal_page_id_);
     page->SetLowestValue(txn, 2);
 
+    Flush();
     ASSERT_TRUE(page->Insert(txn, "c", 23));
     txn.PreCommit();
   }
@@ -320,6 +323,7 @@ TEST_F(InternalPageTest, InsertAbort) {
       ASSERT_TRUE(page->Insert(txn, "b", 20));
       ASSERT_TRUE(page->Insert(txn, "e", 40));
     }
+    Flush();
     txn.Abort();
   }
 
@@ -348,6 +352,7 @@ TEST_F(InternalPageTest, UpdateCrash) {
     ASSERT_TRUE(page->Update(txn, "b", 200));
     ASSERT_TRUE(page->Update(txn, "e", 400));
     txn.PreCommit();
+    Flush();
   }
 
   Recover();  // Expect redo happen.
@@ -364,16 +369,17 @@ TEST_F(InternalPageTest, UpdateAbort) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(internal_page_id_);
     page->SetLowestValue(txn, 2);
-
     ASSERT_TRUE(page->Insert(txn, "c", 23));
+    ASSERT_TRUE(page->Insert(txn, "b", 20));
+    ASSERT_TRUE(page->Insert(txn, "e", 40));
     txn.PreCommit();
   }
   {
     auto txn = tm_->Begin();
     {
       PageRef page = p_->GetPage(internal_page_id_);
-      ASSERT_TRUE(page->Insert(txn, "b", 20));
-      ASSERT_TRUE(page->Insert(txn, "e", 40));
+      ASSERT_TRUE(page->Update(txn, "b", 2000));
+      ASSERT_TRUE(page->Update(txn, "e", 4000));
     }
     txn.Abort();
   }
@@ -382,9 +388,9 @@ TEST_F(InternalPageTest, UpdateAbort) {
   r_->RecoverFrom(0, tm_.get());
 
   AssertPIDForKey(internal_page_id_, "alpha", 2);
-  AssertPIDForKey(internal_page_id_, "b", 2);
+  AssertPIDForKey(internal_page_id_, "b", 20);
   AssertPIDForKey(internal_page_id_, "c", 23);
-  AssertPIDForKey(internal_page_id_, "zeta", 23);
+  AssertPIDForKey(internal_page_id_, "zeta", 40);
 }
 
 TEST_F(InternalPageTest, DeleteCrash) {
@@ -395,6 +401,7 @@ TEST_F(InternalPageTest, DeleteCrash) {
     ASSERT_TRUE(page->Insert(txn, "b", 20));
     ASSERT_TRUE(page->Insert(txn, "e", 40));
     ASSERT_TRUE(page->Insert(txn, "c", 23));
+    Flush();
     txn.PreCommit();
   }
   {
@@ -431,6 +438,7 @@ TEST_F(InternalPageTest, DeleteAbort) {
       ASSERT_TRUE(page->Delete(txn, "e"));
     }
     txn.Abort();
+    Flush();
   }
 
   Recover();  // Expect redo happen.

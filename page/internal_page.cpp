@@ -28,8 +28,8 @@ void InternalPage::SetLowestValue(page_id_t pid, Transaction& txn,
 
 bool InternalPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
                           page_id_t value) {
-  const uint16_t physical_size =
-      sizeof(uint16_t) + key.size() + sizeof(uint16_t) + sizeof(page_id_t);
+  const bin_size_t physical_size =
+      sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + sizeof(page_id_t);
 
   size_t pos = SearchToInsert(key);
   if (free_size_ < physical_size + sizeof(RowPointer) ||  // No space.
@@ -43,10 +43,10 @@ bool InternalPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
 }
 
 void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
-  const uint16_t offset = free_ptr_;
+  const bin_size_t offset = free_ptr_;
   free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
   free_ptr_ += SerializePID(Payload() + free_ptr_, pid);
-  uint16_t insert = SearchToInsert(key);
+  bin_size_t insert = SearchToInsert(key);
   RowPointer* rows = Rows();
   memmove(rows - 1, rows, insert * sizeof(RowPointer));
   rows[insert - 1].offset = offset;
@@ -56,8 +56,8 @@ void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
 
 bool InternalPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
                           page_id_t value) {
-  const uint16_t physical_size =
-      sizeof(uint16_t) + key.size() + sizeof(uint16_t) + sizeof(page_id_t);
+  const bin_size_t physical_size =
+      sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + sizeof(page_id_t);
   const size_t pos = Search(key);
   if (row_count_ < pos ||  // No exist.
       GetKey(pos) != key ||
@@ -71,9 +71,8 @@ bool InternalPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
 }
 
 void InternalPage::UpdateImpl(std::string_view key, page_id_t pid) {
-  LOG(WARN) << "update: " << key << " : " << pid;
-  const uint16_t pos = Search(key);
-  const uint16_t offset = free_ptr_;
+  const bin_size_t pos = Search(key);
+  const bin_size_t offset = free_ptr_;
   free_size_ += GetKey(pos).size() - key.size();
   free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
   free_ptr_ += SerializePID(Payload() + free_ptr_, pid);
@@ -84,19 +83,19 @@ void InternalPage::UpdateImpl(std::string_view key, page_id_t pid) {
 
 bool InternalPage::Delete(page_id_t pid, Transaction& txn,
                           std::string_view key) {
-  const uint16_t pos = Search(key);
+  const bin_size_t pos = Search(key);
   if (GetKey(pos) != key) {
     return false;
   }
-  uint16_t old_value = GetValue(pos);
+  bin_size_t old_value = GetValue(pos);
   DeleteImpl(key);
   txn.DeleteInternalLog(pid, key, old_value);
   return true;
 }
 
 void InternalPage::DeleteImpl(std::string_view key) {
-  const uint16_t pos = Search(key);
-  free_size_ += GetKey(pos).size() + sizeof(uint16_t) + sizeof(RowPointer);
+  const bin_size_t pos = Search(key);
+  free_size_ += GetKey(pos).size() + sizeof(bin_size_t) + sizeof(RowPointer);
   RowPointer* rows = Rows();
   memmove(rows + 1, rows, sizeof(RowPointer) * pos);
   row_count_--;
@@ -109,7 +108,7 @@ bool InternalPage::GetPageForKey(Transaction& txn, std::string_view key,
     *result = lowest_page_;
     return true;
   }
-  uint16_t slot = Search(key);
+  bin_size_t slot = Search(key);
   *result = GetValue(slot);
   return true;
 }
@@ -130,7 +129,7 @@ void InternalPage::SplitInto(page_id_t pid, Transaction& txn, Page* right,
   }
 }
 
-uint16_t InternalPage::SearchToInsert(std::string_view key) const {
+bin_size_t InternalPage::SearchToInsert(std::string_view key) const {
   int left = -1, right = row_count_;
   while (1 < right - left) {
     const int cur = (left + right) / 2;
@@ -143,7 +142,7 @@ uint16_t InternalPage::SearchToInsert(std::string_view key) const {
   return right;
 }
 
-uint16_t InternalPage::Search(std::string_view key) const {
+bin_size_t InternalPage::Search(std::string_view key) const {
   int left = -1, right = row_count_;
   while (1 < right - left) {
     const int cur = (left + right) / 2;
@@ -173,7 +172,7 @@ const page_id_t& InternalPage::GetValue(size_t idx) const {
       idx;
   std::string_view key = GetKey(idx);
   return *reinterpret_cast<const page_id_t*>(Payload() + pos->offset +
-                                             sizeof(uint16_t) + key.size());
+                                             sizeof(bin_size_t) + key.size());
 }
 
 page_id_t& InternalPage::GetValue(size_t idx) {
@@ -183,7 +182,7 @@ page_id_t& InternalPage::GetValue(size_t idx) {
       idx;
   std::string_view key = GetKey(idx);
   return *reinterpret_cast<page_id_t*>(Payload() + pos->offset +
-                                       sizeof(uint16_t) + key.size());
+                                       sizeof(bin_size_t) + key.size());
 }
 
 void InternalPage::Dump(std::ostream& o, int indent) const {
@@ -199,3 +198,16 @@ void InternalPage::Dump(std::ostream& o, int indent) const {
 }
 
 }  // namespace tinylamb
+
+uint64_t std::hash<tinylamb::InternalPage>::operator()(
+    const ::tinylamb::InternalPage& r) const {
+  uint64_t ret = 0;
+  ret += std::hash<tinylamb::slot_t>()(r.row_count_);
+  ret += std::hash<tinylamb::bin_size_t>()(r.free_ptr_);
+  ret += std::hash<tinylamb::bin_size_t>()(r.free_size_);
+  for (int i = 0; i < r.row_count_; ++i) {
+    ret += std::hash<std::string_view>()(r.GetKey(i));
+    ret += std::hash<tinylamb::page_id_t>()(r.GetValue(i));
+  }
+  return ret;
+}

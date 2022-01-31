@@ -62,7 +62,7 @@ void TransactionManager::Abort(Transaction& txn) {
 }
 
 void TransactionManager::CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
-                                             uint16_t slot) {
+                                             slot_t slot) {
   logger_->AddLog(LogRecord::CompensatingInsertLogRecord(txn_id, pid, slot));
 }
 void TransactionManager::CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
@@ -77,7 +77,7 @@ void TransactionManager::CompensateInsertInternalLog(txn_id_t txn_id,
 }
 
 void TransactionManager::CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
-                                             uint16_t slot,
+                                             slot_t slot,
                                              std::string_view redo) {
   logger_->AddLog(
       LogRecord::CompensatingUpdateLogRecord(txn_id, pid, slot, redo));
@@ -97,7 +97,7 @@ void TransactionManager::CompensateUpdateInternalLog(txn_id_t txn_id,
 }
 
 void TransactionManager::CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
-                                             uint16_t slot,
+                                             slot_t slot,
                                              std::string_view redo) {
   logger_->AddLog(
       LogRecord::CompensatingDeleteLogRecord(txn_id, pid, slot, redo));

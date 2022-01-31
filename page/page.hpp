@@ -37,11 +37,11 @@ class Page {
   bool Read(Transaction& txn, const uint16& slot,
             std::string_view* result) const;
 
-  bool Insert(Transaction& txn, std::string_view record, uint16_t* slot);
+  bool Insert(Transaction& txn, std::string_view record, slot_t* slot);
 
-  bool Update(Transaction& txn, uint16_t slot, std::string_view row);
+  bool Update(Transaction& txn, slot_t slot, std::string_view row);
 
-  bool Delete(Transaction& txn, uint16_t pos);
+  bool Delete(Transaction& txn, slot_t pos);
 
   [[nodiscard]] size_t RowCount() const;
 
@@ -63,8 +63,8 @@ class Page {
 
   // Internal methods exposed for recovery.
   void InsertImpl(std::string_view redo);
-  void UpdateImpl(uint16_t slot, std::string_view redo);
-  void DeleteImpl(uint16_t slot);
+  void UpdateImpl(slot_t slot, std::string_view redo);
+  void DeleteImpl(slot_t slot);
 
   void InsertImpl(std::string_view key, std::string_view value);
   void UpdateImpl(std::string_view key, std::string_view value);

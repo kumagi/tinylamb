@@ -68,8 +68,8 @@ TEST_F(RecoveryManagerTest, InsertAbort) {
   ASSERT_FALSE(page.IsNull());
   ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-  const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-  uint16_t slot;
+  const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
+  slot_t slot;
   ASSERT_TRUE(page->Insert(txn, record, &slot));
   page.PageUnlock();
 
@@ -87,7 +87,7 @@ TEST_F(RecoveryManagerTest, UpdateAbort) {
   ASSERT_FALSE(page.IsNull());
   ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-  const uint16_t before_size = page->body.row_page.FreeSizeForTest();
+  const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
   ASSERT_TRUE(page->Update(txn, 0, after));
   page.PageUnlock();
 
@@ -170,8 +170,8 @@ TEST_F(RecoveryManagerTest, InsertCrash) {
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-    const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-    uint16_t slot;
+    const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
+    slot_t slot;
     ASSERT_TRUE(page->Insert(txn, record, &slot));
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
               before_size - record.size() - sizeof(RowPage::RowPointer));
@@ -224,8 +224,8 @@ TEST_F(RecoveryManagerTest, InsertMediaCrash) {
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-    const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-    uint16_t slot;
+    const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
+    slot_t slot;
     ASSERT_TRUE(page->Insert(txn, record, &slot));
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
               before_size - record.size() - sizeof(RowPage::RowPointer));
@@ -277,8 +277,8 @@ TEST_F(RecoveryManagerTest, InsertSinglePageFailure) {
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-    const uint16_t before_size = page->body.row_page.FreeSizeForTest();
-    uint16_t slot;
+    const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
+    slot_t slot;
     ASSERT_TRUE(page->Insert(txn, record, &slot));
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
               before_size - record.size() - sizeof(RowPage::RowPointer));

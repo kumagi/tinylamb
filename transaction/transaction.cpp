@@ -71,7 +71,7 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
   return true;
 }
 
-lsn_t Transaction::InsertLog(page_id_t pid, uint16_t slot,
+lsn_t Transaction::InsertLog(page_id_t pid, slot_t slot,
                              std::string_view redo) {
   assert(!IsFinished());
   prev_lsn_ = transaction_manager_->AddLog(
@@ -94,8 +94,8 @@ lsn_t Transaction::InsertInternalLog(page_id_t pid, std::string_view key,
   return prev_lsn_;
 }
 
-lsn_t Transaction::UpdateLog(page_id_t pid, uint16_t slot,
-                             std::string_view undo, std::string_view redo) {
+lsn_t Transaction::UpdateLog(page_id_t pid, slot_t slot, std::string_view undo,
+                             std::string_view redo) {
   assert(!IsFinished());
   prev_lsn_ = transaction_manager_->AddLog(
       LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, slot, redo, undo));
@@ -116,7 +116,7 @@ lsn_t Transaction::UpdateInternalLog(page_id_t pid, std::string_view key,
   return prev_lsn_;
 }
 
-lsn_t Transaction::DeleteLog(page_id_t pid, uint16_t slot,
+lsn_t Transaction::DeleteLog(page_id_t pid, slot_t slot,
                              std::string_view undo) {
   assert(!IsFinished());
   LogRecord lr =

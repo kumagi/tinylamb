@@ -23,10 +23,10 @@ class LeafPage {
   }
   struct RowPointer {
     // Row start position from beginning fom this page.
-    uint16_t offset = 0;
+    bin_size_t offset = 0;
 
     // Physical row size in bytes (required to get exact size for logging).
-    uint16_t size = 0;
+    bin_size_t size = 0;
   };
   RowPointer* Rows();
   [[nodiscard]] const RowPointer* Rows() const;
@@ -72,9 +72,9 @@ class LeafPage {
 
   page_id_t prev_pid_ = 0;
   page_id_t next_pid_ = 0;
-  int16_t row_count_ = 0;
-  uint16_t free_ptr_ = kPageSize;
-  uint16_t free_size_ = kPageSize - sizeof(LeafPage);
+  slot_t row_count_ = 0;
+  bin_size_t free_ptr_ = kPageSize;
+  bin_size_t free_size_ = kPageSize - sizeof(LeafPage);
   char data_[0];
 };
 

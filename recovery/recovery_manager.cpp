@@ -64,7 +64,6 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
       target->DeleteInternalImpl(log.key);
       break;
     case LogType::kCompensateUpdateLeaf:
-    case LogType::kCompensateUpdateInternal:
       target->UpdateImpl(log.key, log.redo_data);
       break;
     case LogType::kInsertLeaf:
@@ -76,6 +75,7 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
       target->InsertInternalImpl(log.key, log.redo_page);
       break;
     case LogType::kUpdateInternal:
+    case LogType::kCompensateUpdateInternal:
       target->UpdateInternalImpl(log.key, log.redo_page);
       break;
     case LogType::kLowestValue:
@@ -134,6 +134,7 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       tm->CompensateUpdateInternalLog(log.txn_id, log.pid, log.key,
                                       log.undo_page);
       target->UpdateInternalImpl(log.key, log.undo_page);
+      break;
     case LogType::kDeleteLeaf:
       tm->CompensateDeleteLog(log.txn_id, log.pid, log.key, log.undo_data);
       target->InsertImpl(log.key, log.undo_data);
@@ -175,6 +176,7 @@ void PageReplay(PageRef&& target,
     const lsn_t& lsn = lsn_log.first;
     const LogRecord& log = lsn_log.second;
     assert(log.pid == target->PageID());
+    LOG(WARN) << target->PageLSN() << " : " << lsn;
     if (target->PageLSN() < lsn) {
       LOG(INFO) << "redo: " << log;
       LogRedo(target, lsn, log);
@@ -336,8 +338,7 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
     if (!page->IsValid()) {
       page->page_lsn = 0;
       page->page_id = it.first;
-      LOG(INFO) << "Page " << it.first
-                << " is broken, trying Single Page RecoveryManager";
+      LOG(INFO) << "Page " << it.first << " is broken, start SPR.";
       SinglePageRecovery(std::move(page), tm);
     } else {
       pages.emplace(it.first, std::move(page));

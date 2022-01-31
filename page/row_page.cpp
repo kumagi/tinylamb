@@ -5,7 +5,7 @@
 
 namespace tinylamb {
 
-bool RowPage::Read(page_id_t page_id, Transaction& txn, uint16_t slot,
+bool RowPage::Read(page_id_t page_id, Transaction& txn, slot_t slot,
                    std::string_view* dst) const {
   if (!txn.AddReadSet(
           RowPosition(page_id, slot)) ||  // Failed by read conflict.
@@ -33,7 +33,7 @@ bool RowPage::Read(page_id_t page_id, Transaction& txn, uint16_t slot,
  *                        ^ PosX == free_ptr_
  */
 bool RowPage::Insert(page_id_t page_id, Transaction& txn,
-                     std::string_view record, uint16_t* dst) {
+                     std::string_view record, slot_t* dst) {
   if (free_size_ + sizeof(RowPointer) < record.size()) {
     // There is no enough space.
     return false;
@@ -55,8 +55,8 @@ bool RowPage::Insert(page_id_t page_id, Transaction& txn,
   return true;
 }
 
-uint16_t RowPage::InsertRow(std::string_view new_row) {
-  assert(new_row.size() <= std::numeric_limits<uint16_t>::max());
+slot_t RowPage::InsertRow(std::string_view new_row) {
+  assert(new_row.size() <= std::numeric_limits<slot_t>::max());
   free_size_ -= new_row.size() + sizeof(RowPointer);
   free_ptr_ -= new_row.size();
   data_[row_count_].offset = free_ptr_;
@@ -65,7 +65,7 @@ uint16_t RowPage::InsertRow(std::string_view new_row) {
   return row_count_++;
 }
 
-bool RowPage::Update(page_id_t page_id, Transaction& txn, uint16_t slot,
+bool RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
                      std::string_view record) {
   assert(slot <= row_count_);
   std::string_view prev_row = GetRow(slot);
@@ -84,7 +84,7 @@ bool RowPage::Update(page_id_t page_id, Transaction& txn, uint16_t slot,
   return true;
 }
 
-void RowPage::UpdateRow(uint16_t slot, std::string_view record) {
+void RowPage::UpdateRow(slot_t slot, std::string_view record) {
   std::string_view prev_row = GetRow(slot);
   free_size_ -= prev_row.size();
   free_size_ += record.size();
@@ -104,14 +104,14 @@ void RowPage::UpdateRow(uint16_t slot, std::string_view record) {
   memcpy(Payload() + data_[slot].offset, record.data(), record.size());
 }
 
-bool RowPage::Delete(page_id_t page_id, Transaction& txn, uint16_t slot) {
+bool RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
   assert(slot <= row_count_);
   txn.DeleteLog(page_id, slot, GetRow(slot));
   DeleteRow(slot);
   return true;
 }
 
-void RowPage::DeleteRow(uint16_t slot) {
+void RowPage::DeleteRow(slot_t slot) {
   row_count_--;
   free_size_ += data_[slot].size;
   std::swap(data_[slot], data_[row_count_]);
@@ -152,9 +152,9 @@ uint64_t std::hash<tinylamb::RowPage>::operator()(
   uint64_t ret = 0;
   ret += std::hash<tinylamb::page_id_t>()(r.prev_page_id_);
   ret += std::hash<tinylamb::page_id_t>()(r.next_page_id_);
-  ret += std::hash<int16_t>()(r.row_count_);
-  ret += std::hash<int16_t>()(r.free_ptr_);
-  ret += std::hash<int16_t>()(r.free_size_);
+  ret += std::hash<tinylamb::slot_t>()(r.row_count_);
+  ret += std::hash<tinylamb::bin_size_t>()(r.free_ptr_);
+  ret += std::hash<tinylamb::bin_size_t>()(r.free_size_);
   for (int i = 0; i < r.row_count_; ++i) {
     ret += std::hash<std::string_view>()(r.GetRow(i));
   }

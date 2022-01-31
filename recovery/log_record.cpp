@@ -42,10 +42,10 @@ size_t PidSlotKeySize(const tinylamb::LogRecord& lr) {
     offset += sizeof(tinylamb::page_id_t);
   }
   if (lr.HasSlot()) {
-    offset += sizeof(uint16_t);
+    offset += sizeof(tinylamb::slot_t);
   }
   if (!lr.key.empty()) {
-    offset += sizeof(uint16_t) + lr.key.length();
+    offset += sizeof(tinylamb::bin_size_t) + lr.key.length();
   }
   return offset;
 }
@@ -252,7 +252,7 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
 }
 
 LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                        uint16_t slot, std::string_view r) {
+                                        slot_t slot, std::string_view r) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
@@ -291,7 +291,7 @@ LogRecord LogRecord::InsertingInternalLogRecord(lsn_t p, txn_id_t txn,
 }
 
 LogRecord LogRecord::CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
-                                                 uint16_t key) {
+                                                 slot_t key) {
   LogRecord l;
   l.txn_id = txn;
   l.pid = pid;
@@ -322,7 +322,7 @@ LogRecord LogRecord::CompensatingInsertInternalLogRecord(txn_id_t txn,
 }
 
 LogRecord LogRecord::UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                       uint16_t key, std::string_view redo,
+                                       slot_t key, std::string_view redo,
                                        std::string_view undo) {
   LogRecord l;
   l.prev_lsn = p;
@@ -366,7 +366,7 @@ LogRecord LogRecord::UpdatingInternalLogRecord(lsn_t p, txn_id_t txn,
 }
 
 LogRecord LogRecord::CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
-                                                 uint16_t slot,
+                                                 slot_t slot,
                                                  std::string_view redo) {
   LogRecord l;
   l.txn_id = txn;
@@ -403,7 +403,7 @@ LogRecord LogRecord::CompensatingUpdateInternalLogRecord(lsn_t txn,
 }
 
 LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                       uint16_t slot, std::string_view undo) {
+                                       slot_t slot, std::string_view undo) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
@@ -430,7 +430,7 @@ LogRecord LogRecord::DeletingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
 LogRecord LogRecord::DeletingInternalLogRecord(lsn_t p, txn_id_t txn,
                                                page_id_t pid,
                                                std::string_view key,
-                                               uint16_t undo) {
+                                               page_id_t undo) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
@@ -442,7 +442,7 @@ LogRecord LogRecord::DeletingInternalLogRecord(lsn_t p, txn_id_t txn,
 }
 
 LogRecord LogRecord::CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
-                                                 uint16_t slot,
+                                                 slot_t slot,
                                                  std::string_view redo) {
   LogRecord l;
   l.txn_id = txn;
@@ -530,7 +530,7 @@ LogRecord LogRecord::EndCheckpointLogRecord(
 void LogRecord::Clear() {
   type = LogType::kUnknown;
   pid = std::numeric_limits<page_id_t>::max();
-  slot = std::numeric_limits<uint16_t>::max();
+  slot = std::numeric_limits<slot_t>::max();
   prev_lsn = 0;
   txn_id = 0;
   key = "";

@@ -22,10 +22,10 @@ class InternalPage {
   }
   struct RowPointer {
     // Row start position from beginning fom this page.
-    uint16_t offset = 0;
+    bin_size_t offset = 0;
 
     // Physical row size in bytes (required to get exact size for logging).
-    uint16_t size = 0;
+    bin_size_t size = 0;
   };
   RowPointer* Rows();
   [[nodiscard]] const RowPointer* Rows() const;
@@ -56,9 +56,9 @@ class InternalPage {
                  std::string_view* middle);
 
   // Return lowest page_id which may contain the specified |key|.
-  [[nodiscard]] uint16_t SearchToInsert(std::string_view key) const;
+  [[nodiscard]] bin_size_t SearchToInsert(std::string_view key) const;
   // Return lowest page_id which may contain the specified |key|.
-  [[nodiscard]] uint16_t Search(std::string_view key) const;
+  [[nodiscard]] bin_size_t Search(std::string_view key) const;
 
   [[nodiscard]] std::string_view GetKey(size_t idx) const;
   [[nodiscard]] const page_id_t& GetValue(size_t idx) const;
@@ -71,12 +71,24 @@ class InternalPage {
   void Dump(std::ostream& o, int indent) const;
 
  private:
-  uint16_t row_count_ = 0;
+  friend class std::hash<InternalPage>;
+
+  bin_size_t row_count_ = 0;
   page_id_t lowest_page_ = 0;
-  uint16_t free_ptr_ = sizeof(InternalPage);
-  uint16_t free_size_ = kPageBodySize - sizeof(InternalPage);
+  bin_size_t free_ptr_ = sizeof(InternalPage);
+  bin_size_t free_size_ = kPageBodySize - sizeof(InternalPage);
 };
 
 }  // namespace tinylamb
+
+namespace std {
+
+template <>
+class hash<tinylamb::InternalPage> {
+ public:
+  uint64_t operator()(const tinylamb::InternalPage& r) const;
+};
+
+}  // namespace std
 
 #endif  // TINYLAMB_INTERNAL_PAGE_HPP
