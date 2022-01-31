@@ -133,8 +133,7 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
     case LogType::kUpdateInternal:
       tm->CompensateUpdateInternalLog(log.txn_id, log.pid, log.key,
                                       log.undo_page);
-      throw std::runtime_error(
-          "compensating update internal is not implemented");
+      target->UpdateInternalImpl(log.key, log.undo_page);
     case LogType::kDeleteLeaf:
       tm->CompensateDeleteLog(log.txn_id, log.pid, log.key, log.undo_data);
       target->InsertImpl(log.key, log.undo_data);

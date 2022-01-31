@@ -43,22 +43,44 @@ bool InternalPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
 }
 
 void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
-  const uint16_t inserted_offset = free_ptr_;
+  const uint16_t offset = free_ptr_;
   free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
   free_ptr_ += SerializePID(Payload() + free_ptr_, pid);
   uint16_t insert = SearchToInsert(key);
   RowPointer* rows = Rows();
   memmove(rows - 1, rows, insert * sizeof(RowPointer));
-  rows[insert - 1].offset = inserted_offset;
-  rows[insert - 1].size = free_ptr_ - inserted_offset;
+  rows[insert - 1].offset = offset;
+  rows[insert - 1].size = free_ptr_ - offset;
   ++row_count_;
 }
 
 bool InternalPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
                           page_id_t value) {
+  const uint16_t physical_size =
+      sizeof(uint16_t) + key.size() + sizeof(uint16_t) + sizeof(page_id_t);
+  const size_t pos = Search(key);
+  if (row_count_ < pos ||  // No exist.
+      GetKey(pos) != key ||
+      free_size_ < physical_size - GetKey(pos).size()) {  // No space.
+    return false;
+  }
+
+  txn.UpdateInternalLog(pid, key, GetValue(pos), value);
+  UpdateImpl(key, value);
   return true;
 }
-void InternalPage::UpdateImpl(std::string_view key, page_id_t pid) { return; }
+
+void InternalPage::UpdateImpl(std::string_view key, page_id_t pid) {
+  LOG(WARN) << "update: " << key << " : " << pid;
+  const uint16_t pos = Search(key);
+  const uint16_t offset = free_ptr_;
+  free_size_ += GetKey(pos).size() - key.size();
+  free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
+  free_ptr_ += SerializePID(Payload() + free_ptr_, pid);
+  RowPointer* rows = Rows();
+  rows[pos].offset = offset;
+  rows[pos].size = free_ptr_ - offset;
+}
 
 bool InternalPage::Delete(page_id_t pid, Transaction& txn,
                           std::string_view key) {

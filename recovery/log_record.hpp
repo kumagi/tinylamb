@@ -143,21 +143,24 @@ struct LogRecord {
   friend std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
     o << l.type;
     switch (l.type) {
+      case LogType::kUnknown:
+        LOG(ERROR) << "kUnknownLog";
+        break;
       case LogType::kCompensateUpdateRow:
       case LogType::kCompensateDeleteRow:
       case LogType::kInsertRow:
       case LogType::kInsertLeaf:
-        o << "\t\tRedo: " << l.redo_data.size() << " bytes ";
         l.DumpPosition(o);
+        o << "\t\tRedo: " << l.redo_data.size() << " bytes ";
         break;
       case LogType::kUpdateRow:
+        l.DumpPosition(o);
         o << "\t\t" << l.undo_data.size() << " -> " << l.redo_data.size()
           << "bytes ";
-        l.DumpPosition(o);
         break;
       case LogType::kDeleteRow:
-        o << "\t\t" << l.undo_data.size() << " bytes ";
         l.DumpPosition(o);
+        o << "\t\t" << l.undo_data.size() << " bytes ";
         break;
       case LogType::kCompensateInsertRow:
         l.DumpPosition(o);
@@ -180,24 +183,23 @@ struct LogRecord {
         }
         o << "}";
         return o;
-      case LogType::kUnknown:
-        LOG(ERROR) << "kUnknownLog";
-        break;
       case LogType::kInsertInternal:
+        l.DumpPosition(o);
         o << "\t\t"
           << "Insert: " << l.key << " -> " << l.redo_page << " ";
-        l.DumpPosition(o);
         break;
       case LogType::kUpdateLeaf:
-      case LogType::kUpdateInternal:
       case LogType::kDeleteLeaf:
-      case LogType::kDeleteInternal:
       case LogType::kCompensateInsertLeaf:
-      case LogType::kCompensateInsertInternal:
       case LogType::kCompensateUpdateLeaf:
-      case LogType::kCompensateUpdateInternal:
       case LogType::kCompensateDeleteLeaf:
+      case LogType::kUpdateInternal:
+      case LogType::kDeleteInternal:
+      case LogType::kCompensateInsertInternal:
+      case LogType::kCompensateUpdateInternal:
       case LogType::kCompensateDeleteInternal:
+        o << "\t";
+        l.DumpPosition(o);
         break;
       case LogType::kLowestValue:
         o << "\t"

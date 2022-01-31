@@ -168,6 +168,30 @@ TEST_F(InternalPageTest, InsertAndGetKey) {
   ASSERT_EQ(pid, 30);
 }
 
+TEST_F(InternalPageTest, UpdateKey) {
+  auto txn = tm_->Begin();
+  {
+    PageRef page = p_->GetPage(internal_page_id_);
+    page->SetLowestValue(txn, 100);
+    ASSERT_TRUE(page->Insert(txn, "a", 1));
+    ASSERT_TRUE(page->Insert(txn, "b", 2));
+    ASSERT_TRUE(page->Insert(txn, "c", 3));
+    ASSERT_TRUE(page->Insert(txn, "d", 4));
+    ASSERT_TRUE(page->Update(txn, "a", 5));
+    ASSERT_TRUE(page->Update(txn, "b", 6));
+    ASSERT_TRUE(page->Update(txn, "c", 7));
+    ASSERT_TRUE(page->Update(txn, "d", 8));
+    ASSERT_FALSE(page->Update(txn, "e", 60));
+    ASSERT_FALSE(page->Update(txn, "f", 30));
+    txn.PreCommit();
+  }
+
+  AssertPIDForKey(internal_page_id_, "a", 5);
+  AssertPIDForKey(internal_page_id_, "b", 6);
+  AssertPIDForKey(internal_page_id_, "c", 7);
+  AssertPIDForKey(internal_page_id_, "d", 8);
+}
+
 TEST_F(InternalPageTest, DeleteKey) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(internal_page_id_);
@@ -283,6 +307,61 @@ TEST_F(InternalPageTest, InsertCrash) {
 }
 
 TEST_F(InternalPageTest, InsertAbort) {
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(internal_page_id_);
+    page->SetLowestValue(txn, 2);
+
+    ASSERT_TRUE(page->Insert(txn, "c", 23));
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    {
+      PageRef page = p_->GetPage(internal_page_id_);
+      ASSERT_TRUE(page->Insert(txn, "b", 20));
+      ASSERT_TRUE(page->Insert(txn, "e", 40));
+    }
+    txn.Abort();
+  }
+
+  Recover();  // Expect redo happen.
+  r_->RecoverFrom(0, tm_.get());
+
+  AssertPIDForKey(internal_page_id_, "alpha", 2);
+  AssertPIDForKey(internal_page_id_, "b", 2);
+  AssertPIDForKey(internal_page_id_, "c", 23);
+  AssertPIDForKey(internal_page_id_, "zeta", 23);
+}
+
+TEST_F(InternalPageTest, UpdateCrash) {
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(internal_page_id_);
+    page->SetLowestValue(txn, 2);
+    ASSERT_TRUE(page->Insert(txn, "c", 23));
+    ASSERT_TRUE(page->Insert(txn, "b", 20));
+    ASSERT_TRUE(page->Insert(txn, "e", 40));
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(internal_page_id_);
+    ASSERT_TRUE(page->Update(txn, "b", 200));
+    ASSERT_TRUE(page->Update(txn, "e", 400));
+    txn.PreCommit();
+  }
+
+  Recover();  // Expect redo happen.
+  r_->RecoverFrom(0, tm_.get());
+
+  AssertPIDForKey(internal_page_id_, "alpha", 2);
+  AssertPIDForKey(internal_page_id_, "b", 200);
+  AssertPIDForKey(internal_page_id_, "c", 23);
+  AssertPIDForKey(internal_page_id_, "zeta", 400);
+}
+
+TEST_F(InternalPageTest, UpdateAbort) {
   {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(internal_page_id_);
