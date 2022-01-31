@@ -106,7 +106,7 @@ size_t Page::RowCount() const {
 // Leaf page manipulations.
 bool Page::Insert(Transaction& txn, std::string_view key,
                   std::string_view value) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage);
+  ASSERT_PAGE_TYPE(PageType::kLeafPage)
   bool result = body.leaf_page.Insert(PageID(), txn, key, value);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());

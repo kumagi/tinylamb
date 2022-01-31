@@ -30,26 +30,16 @@ bool IsPageManipulation(LogType type) {
     default:
       return true;
   }
-  return false;
 }
 
 void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
-  switch (log.type) {
-    case LogType::kBeginCheckpoint:
-    case LogType::kEndCheckpoint:
-      return;
-    default:
-      // Do nothing.
-      break;
+  if (!IsPageManipulation(log.type) || lsn <= target->PageLSN()) {
+    return;
   }
-  if (lsn <= target->PageLSN()) return;
 
   switch (log.type) {
     case LogType::kUnknown:
       assert(!"unknown log type must not be parsed");
-    case LogType::kBegin:
-    case LogType::kCommit:
-      break;
     case LogType::kInsertRow:
     case LogType::kCompensateDeleteRow:
       target->InsertImpl(log.redo_data);

@@ -48,6 +48,7 @@ class InternalPageTest : public ::testing::Test {
       p_->GetPool()->LostAllPageForTest();
     }
     tm_.reset();
+    r_.reset();
     lm_.reset();
     l_.reset();
     p_.reset();
@@ -307,6 +308,61 @@ TEST_F(InternalPageTest, InsertAbort) {
   AssertPIDForKey(internal_page_id_, "b", 2);
   AssertPIDForKey(internal_page_id_, "c", 23);
   AssertPIDForKey(internal_page_id_, "zeta", 23);
+}
+
+TEST_F(InternalPageTest, DeleteCrash) {
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(internal_page_id_);
+    page->SetLowestValue(txn, 2);
+    ASSERT_TRUE(page->Insert(txn, "b", 20));
+    ASSERT_TRUE(page->Insert(txn, "e", 40));
+    ASSERT_TRUE(page->Insert(txn, "c", 23));
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(internal_page_id_);
+    ASSERT_TRUE(page->Delete(txn, "b"));
+    ASSERT_TRUE(page->Delete(txn, "e"));
+  }
+
+  Recover();  // Expect redo happen.
+  r_->RecoverFrom(0, tm_.get());
+
+  AssertPIDForKey(internal_page_id_, "alpha", 2);
+  AssertPIDForKey(internal_page_id_, "b", 20);
+  AssertPIDForKey(internal_page_id_, "c", 23);
+  AssertPIDForKey(internal_page_id_, "zeta", 40);
+}
+
+TEST_F(InternalPageTest, DeleteAbort) {
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(internal_page_id_);
+    page->SetLowestValue(txn, 2);
+    ASSERT_TRUE(page->Insert(txn, "b", 20));
+    ASSERT_TRUE(page->Insert(txn, "e", 40));
+    ASSERT_TRUE(page->Insert(txn, "c", 23));
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    {
+      PageRef page = p_->GetPage(internal_page_id_);
+      ASSERT_TRUE(page->Delete(txn, "b"));
+      ASSERT_TRUE(page->Delete(txn, "e"));
+    }
+    txn.Abort();
+  }
+
+  Recover();  // Expect redo happen.
+  r_->RecoverFrom(0, tm_.get());
+
+  AssertPIDForKey(internal_page_id_, "alpha", 2);
+  AssertPIDForKey(internal_page_id_, "b", 20);
+  AssertPIDForKey(internal_page_id_, "c", 23);
+  AssertPIDForKey(internal_page_id_, "zeta", 40);
 }
 
 }  // namespace tinylamb

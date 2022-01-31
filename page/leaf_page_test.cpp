@@ -35,13 +35,15 @@ class LeafPageTest : public ::testing::Test {
       p_->GetPool()->LostAllPageForTest();
     }
     tm_.reset();
+    r_.reset();
     lm_.reset();
     l_.reset();
     p_.reset();
     p_ = std::make_unique<PageManager>(kDBFileName, 10);
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), nullptr);
+    r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
   }
 
   void TearDown() override {
@@ -52,6 +54,7 @@ class LeafPageTest : public ::testing::Test {
   std::unique_ptr<LockManager> lm_;
   std::unique_ptr<PageManager> p_;
   std::unique_ptr<Logger> l_;
+  std::unique_ptr<RecoveryManager> r_;
   std::unique_ptr<TransactionManager> tm_;
   page_id_t leaf_page_id_;
 };
@@ -215,6 +218,206 @@ TEST_F(LeafPageTest, LowestHighestKey) {
 
   ASSERT_TRUE(page->HighestKey(txn, &out));
   ASSERT_EQ(out, "D");
+}
+
+TEST_F(LeafPageTest, InsertCrash) {
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 20; ++i) {
+      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
+                               std::to_string(i) + ":value"));
+    }
+    txn.PreCommit();
+  }
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+
+  {
+    std::string_view out;
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 20; ++i) {
+      ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+      ASSERT_EQ(std::to_string(i) + ":value", out);
+    }
+  }
+}
+
+TEST_F(LeafPageTest, InsertAbort) {
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 20; i += 2) {
+      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
+                               std::to_string(i) + ":value"));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    {
+      PageRef page = p_->GetPage(leaf_page_id_);
+      for (size_t i = 1; i < 20; i += 2) {
+        ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
+                                 std::to_string(i) + ":value"));
+      }
+    }
+    txn.Abort();
+  }
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+
+  {
+    std::string_view out;
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 20; ++i) {
+      if (i % 2 == 0) {
+        ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+        ASSERT_EQ(std::to_string(i) + ":value", out);
+      } else {
+        ASSERT_FALSE(page->Read(txn, std::to_string(i) + ":key", &out));
+      }
+    }
+  }
+}
+
+TEST_F(LeafPageTest, UpdateCrash) {
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 10; ++i) {
+      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
+                               std::to_string(i) + ":value"));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 10; ++i) {
+      ASSERT_TRUE(page->Update(txn, std::to_string(i) + ":key",
+                               std::to_string(i * 2) + ":value"));
+    }
+  }
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+
+  {
+    std::string_view out;
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 10; ++i) {
+      ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+      ASSERT_EQ(std::to_string(i) + ":value", out);
+    }
+  }
+}
+
+TEST_F(LeafPageTest, UpdateAbort) {
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 10; ++i) {
+      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
+                               std::to_string(i) + ":value"));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    {
+      PageRef page = p_->GetPage(leaf_page_id_);
+      for (size_t i = 0; i < 10; ++i) {
+        ASSERT_TRUE(page->Update(txn, std::to_string(i) + ":key",
+                                 std::to_string(i * 2) + ":value"));
+      }
+    }
+    txn.Abort();
+  }
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+
+  {
+    std::string_view out;
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 10; ++i) {
+      ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+      ASSERT_EQ(std::to_string(i) + ":value", out);
+    }
+  }
+}
+
+TEST_F(LeafPageTest, DeleteCrash) {
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 10; ++i) {
+      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
+                               std::to_string(i) + ":value"));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 1; i < 10; i += 2) {
+      ASSERT_TRUE(page->Delete(txn, std::to_string(i) + ":key"));
+    }
+    txn.PreCommit();
+  }
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+
+  {
+    std::string_view out;
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 10; ++i) {
+      if (i % 2 == 0) {
+        ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+        ASSERT_EQ(std::to_string(i) + ":value", out);
+      } else {
+        ASSERT_FALSE(page->Read(txn, std::to_string(i) + ":key", &out));
+      }
+    }
+  }
+}
+
+TEST_F(LeafPageTest, DeleteAbort) {
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 10; ++i) {
+      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
+                               std::to_string(i) + ":value"));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    {
+      PageRef page = p_->GetPage(leaf_page_id_);
+      for (size_t i = 0; i < 10; i += 2) {
+        ASSERT_TRUE(page->Delete(txn, std::to_string(i) + ":key"));
+      }
+    }
+    txn.Abort();
+  }
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+
+  {
+    std::string_view out;
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(leaf_page_id_);
+    for (size_t i = 0; i < 10; ++i) {
+      ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+      ASSERT_EQ(std::to_string(i) + ":value", out);
+    }
+  }
 }
 
 }  // namespace tinylamb
