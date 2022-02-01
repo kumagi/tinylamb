@@ -28,7 +28,7 @@ class InternalPageTest : public ::testing::Test {
     auto txn = tm_->Begin();
     PageRef page_ = p_->AllocateNewPage(txn, PageType::kInternalPage);
     internal_page_id_ = page_->PageID();
-    EXPECT_TRUE(txn.PreCommit());
+    EXPECT_SUCCESS(txn.PreCommit());
   }
 
   void Flush() { p_->GetPool()->FlushPageForTest(internal_page_id_); }
@@ -41,7 +41,7 @@ class InternalPageTest : public ::testing::Test {
     page_id_t value;
     ASSERT_SUCCESS(p->GetPageForKey(txn, key, &value));
     ASSERT_EQ(value, expected);
-    EXPECT_TRUE(txn.PreCommit());
+    EXPECT_SUCCESS(txn.PreCommit());
   }
 
   virtual void Recover() {
@@ -117,7 +117,7 @@ TEST_F(InternalPageTest, GetPageForKey) {
     ASSERT_SUCCESS(page->Insert(txn, "c", 23));
     ASSERT_SUCCESS(page->Insert(txn, "b", 20));
     ASSERT_SUCCESS(page->Insert(txn, "e", 40));
-    ASSERT_TRUE(txn.PreCommit());
+    ASSERT_SUCCESS(txn.PreCommit());
   }
 
   AssertPIDForKey(internal_page_id_, "alpha", 2);

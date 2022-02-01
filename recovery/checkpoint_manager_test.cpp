@@ -19,7 +19,7 @@ class CheckpointTest : public RowPageTest {
     auto txn = tm_->Begin();
     PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
     page_id_ = page->PageID();
-    EXPECT_TRUE(txn.PreCommit());
+    EXPECT_SUCCESS(txn.PreCommit());
   }
 
   void TearDown() override {

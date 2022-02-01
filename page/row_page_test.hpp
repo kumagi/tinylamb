@@ -24,7 +24,7 @@ class RowPageTest : public ::testing::Test {
     auto txn = tm_->Begin();
     PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
     page_id_ = page->PageID();
-    EXPECT_TRUE(txn.PreCommit());
+    EXPECT_SUCCESS(txn.PreCommit());
   }
 
   virtual void Recover() {
@@ -63,7 +63,7 @@ class RowPageTest : public ::testing::Test {
                 before_size - str.size() - sizeof(RowPage::RowPointer));
     }
     if (commit) {
-      EXPECT_TRUE(txn.PreCommit());
+      EXPECT_SUCCESS(txn.PreCommit());
     } else {
       page.PageUnlock();
       txn.Abort();
@@ -79,7 +79,7 @@ class RowPageTest : public ::testing::Test {
 
     ASSERT_SUCCESS(page->Update(txn, slot, str));
     if (commit) {
-      ASSERT_TRUE(txn.PreCommit());
+      ASSERT_SUCCESS(txn.PreCommit());
     } else {
       page.PageUnlock();
       txn.Abort();
@@ -94,7 +94,7 @@ class RowPageTest : public ::testing::Test {
 
     ASSERT_SUCCESS(page->Delete(txn, slot));
     if (commit) {
-      ASSERT_TRUE(txn.PreCommit());
+      ASSERT_SUCCESS(txn.PreCommit());
     } else {
       page.PageUnlock();
       txn.Abort();
@@ -108,7 +108,7 @@ class RowPageTest : public ::testing::Test {
     EXPECT_FALSE(page.IsNull());
     std::string_view dst;
     EXPECT_SUCCESS(page->Read(txn, slot, &dst));
-    EXPECT_TRUE(txn.PreCommit());
+    EXPECT_SUCCESS(txn.PreCommit());
     txn.CommitWait();
     return std::string(dst);
   }
@@ -119,7 +119,7 @@ class RowPageTest : public ::testing::Test {
     EXPECT_FALSE(page.IsNull());
     EXPECT_EQ(page->Type(), PageType::kRowPage);
     size_t row_count = page->RowCount();
-    EXPECT_TRUE(txn.PreCommit());
+    EXPECT_SUCCESS(txn.PreCommit());
     txn.CommitWait();
     return row_count;
   }

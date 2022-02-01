@@ -33,8 +33,8 @@ Transaction::Transaction(txn_id_t txn_id, TransactionManager* tm)
       status_(TransactionStatus::kRunning),
       transaction_manager_(tm) {}
 
-bool Transaction::PreCommit() {
-  bool result = transaction_manager_->PreCommit(*this);
+Status Transaction::PreCommit() {
+  Status result = transaction_manager_->PreCommit(*this);
   status_ = TransactionStatus::kCommitted;
   return result;
 }

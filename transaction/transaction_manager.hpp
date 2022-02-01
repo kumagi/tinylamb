@@ -29,7 +29,7 @@ class TransactionManager {
 
   Transaction Begin();
 
-  bool PreCommit(Transaction& txn);
+  Status PreCommit(Transaction& txn);
 
   void Abort(Transaction& txn);
 

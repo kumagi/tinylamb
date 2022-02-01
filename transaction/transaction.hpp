@@ -48,7 +48,7 @@ class Transaction {
   bool AddReadSet(const RowPosition& rp);
   bool AddWriteSet(const RowPosition& rp);
 
-  bool PreCommit();
+  Status PreCommit();
   void Abort();
 
   // Returns LSN

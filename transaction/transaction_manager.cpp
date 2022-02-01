@@ -23,7 +23,7 @@ Transaction TransactionManager::Begin() {
   return new_txn;
 }
 
-bool TransactionManager::PreCommit(Transaction& txn) {
+Status TransactionManager::PreCommit(Transaction& txn) {
   assert(!txn.IsFinished());
   txn.SetStatus(TransactionStatus::kCommitted);
   LogRecord commit_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
@@ -38,7 +38,7 @@ bool TransactionManager::PreCommit(Transaction& txn) {
     std::scoped_lock lk(transaction_table_lock);
     active_transactions_.erase(txn.txn_id_);
   }
-  return true;
+  return Status::kSuccess;
 }
 
 void TransactionManager::Abort(Transaction& txn) {
