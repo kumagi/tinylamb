@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 
+#include "common/test_util.hpp"
 #include "page/row_page_test.hpp"
 
 namespace tinylamb {
@@ -70,7 +71,7 @@ TEST_F(RecoveryManagerTest, InsertAbort) {
 
   const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
   slot_t slot;
-  ASSERT_TRUE(page->Insert(txn, record, &slot));
+  ASSERT_SUCCESS(page->Insert(txn, record, &slot));
   page.PageUnlock();
 
   ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
@@ -88,7 +89,7 @@ TEST_F(RecoveryManagerTest, UpdateAbort) {
   ASSERT_EQ(page->Type(), PageType::kRowPage);
 
   const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
-  ASSERT_TRUE(page->Update(txn, 0, after));
+  ASSERT_SUCCESS(page->Update(txn, 0, after));
   page.PageUnlock();
 
   ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
@@ -172,7 +173,7 @@ TEST_F(RecoveryManagerTest, InsertCrash) {
 
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
     slot_t slot;
-    ASSERT_TRUE(page->Insert(txn, record, &slot));
+    ASSERT_SUCCESS(page->Insert(txn, record, &slot));
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
               before_size - record.size() - sizeof(RowPage::RowPointer));
   }
@@ -191,7 +192,7 @@ TEST_F(RecoveryManagerTest, UpdateCrash) {
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-    ASSERT_TRUE(page->Update(txn, 0, record));
+    ASSERT_SUCCESS(page->Update(txn, 0, record));
   }
   // Note that txn is not committed.
   Recover();
@@ -207,7 +208,7 @@ TEST_F(RecoveryManagerTest, DeleteCrash) {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-    ASSERT_TRUE(page->Delete(txn, 0));
+    ASSERT_SUCCESS(page->Delete(txn, 0));
   }
   // Note that txn is not committed.
   Recover();
@@ -226,7 +227,7 @@ TEST_F(RecoveryManagerTest, InsertMediaCrash) {
 
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
     slot_t slot;
-    ASSERT_TRUE(page->Insert(txn, record, &slot));
+    ASSERT_SUCCESS(page->Insert(txn, record, &slot));
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
               before_size - record.size() - sizeof(RowPage::RowPointer));
   }
@@ -244,7 +245,7 @@ TEST_F(RecoveryManagerTest, UpdateMediaCrash) {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-    ASSERT_TRUE(page->Update(txn, 0, record));
+    ASSERT_SUCCESS(page->Update(txn, 0, record));
     // Note that txn is not committed.
   }
   MediaFailure();
@@ -260,7 +261,7 @@ TEST_F(RecoveryManagerTest, DeleteMediaCrash) {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-    ASSERT_TRUE(page->Delete(txn, 0));
+    ASSERT_SUCCESS(page->Delete(txn, 0));
   }
   // Note that txn is not committed.
   MediaFailure();
@@ -279,7 +280,7 @@ TEST_F(RecoveryManagerTest, InsertSinglePageFailure) {
 
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
     slot_t slot;
-    ASSERT_TRUE(page->Insert(txn, record, &slot));
+    ASSERT_SUCCESS(page->Insert(txn, record, &slot));
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
               before_size - record.size() - sizeof(RowPage::RowPointer));
   }
@@ -297,7 +298,7 @@ TEST_F(RecoveryManagerTest, UpdateSinglePageFailure) {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-    ASSERT_TRUE(page->Update(txn, 0, record));
+    ASSERT_SUCCESS(page->Update(txn, 0, record));
   }
   // Note that txn is not committed.
   SinglePageFailure(page_id_);
@@ -313,7 +314,7 @@ TEST_F(RecoveryManagerTest, DeleteSinglePageFailure) {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-    ASSERT_TRUE(page->Delete(txn, 0));
+    ASSERT_SUCCESS(page->Delete(txn, 0));
   }
   // Note that txn is not committed.
   SinglePageFailure(page_id_);

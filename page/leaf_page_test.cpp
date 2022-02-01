@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 
+#include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
 #include "recovery/logger.hpp"
@@ -64,17 +65,17 @@ TEST_F(LeafPageTest, Insert) {
   PageRef page = p_->GetPage(leaf_page_id_);
 
   // Insert value.
-  ASSERT_TRUE(page->Insert(txn, "hello", "world"));
+  ASSERT_SUCCESS(page->Insert(txn, "hello", "world"));
   // Inserting with existing key will fail.
-  ASSERT_FALSE(page->Insert(txn, "hello", "baby"));
+  ASSERT_FAIL(page->Insert(txn, "hello", "baby"));
 
   // We can read inserted value.
   std::string_view out;
-  ASSERT_TRUE(page->Read(txn, "hello", &out));
+  ASSERT_SUCCESS(page->Read(txn, "hello", &out));
   ASSERT_EQ(out, "world");
 
   // We cannot read wrong key.
-  ASSERT_FALSE(page->Read(txn, "foo", &out));
+  ASSERT_FAIL(page->Read(txn, "foo", &out));
   ASSERT_NE(out, "world");
 }
 
@@ -82,12 +83,12 @@ TEST_F(LeafPageTest, InsertMany) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(leaf_page_id_);
   for (size_t i = 0; i < 20; ++i) {
-    ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
-                             std::to_string(i) + ":value"));
+    ASSERT_SUCCESS(page->Insert(txn, std::to_string(i) + ":key",
+                                std::to_string(i) + ":value"));
   }
   std::string_view out;
   for (size_t i = 0; i < 20; ++i) {
-    ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+    ASSERT_SUCCESS(page->Read(txn, std::to_string(i) + ":key", &out));
     ASSERT_EQ(std::to_string(i) + ":value", out);
   }
 }
@@ -97,13 +98,13 @@ TEST_F(LeafPageTest, Update) {
   PageRef page = p_->GetPage(leaf_page_id_);
 
   // Insert value.
-  ASSERT_TRUE(page->Insert(txn, "hello", "world"));
+  ASSERT_SUCCESS(page->Insert(txn, "hello", "world"));
   // Inserting with existing key will fail.
-  ASSERT_TRUE(page->Update(txn, "hello", "baby"));
+  ASSERT_SUCCESS(page->Update(txn, "hello", "baby"));
 
   // We can read updated value.
   std::string_view out;
-  ASSERT_TRUE(page->Read(txn, "hello", &out));
+  ASSERT_SUCCESS(page->Read(txn, "hello", &out));
   ASSERT_EQ(out, "baby");
 }
 
@@ -112,15 +113,15 @@ TEST_F(LeafPageTest, UpdateMany) {
   PageRef page = p_->GetPage(leaf_page_id_);
 
   // Insert value.
-  ASSERT_TRUE(page->Insert(txn, "hello", "world"));
+  ASSERT_SUCCESS(page->Insert(txn, "hello", "world"));
   // Inserting with existing key will fail.
   for (size_t i = 1; i <= 1000000; i *= 10) {
-    ASSERT_TRUE(page->Update(txn, "hello", "baby" + std::to_string(i)));
+    ASSERT_SUCCESS(page->Update(txn, "hello", "baby" + std::to_string(i)));
   }
 
   // We can read updated value.
   std::string_view out;
-  ASSERT_TRUE(page->Read(txn, "hello", &out));
+  ASSERT_SUCCESS(page->Read(txn, "hello", &out));
   ASSERT_EQ(out, "baby1000000");
 }
 
@@ -129,19 +130,19 @@ TEST_F(LeafPageTest, Delete) {
   PageRef page = p_->GetPage(leaf_page_id_);
 
   // Insert value.
-  ASSERT_TRUE(page->Insert(txn, "hello", "world"));
+  ASSERT_SUCCESS(page->Insert(txn, "hello", "world"));
   // Deleting unexciting value will fail.
-  ASSERT_FALSE(page->Delete(txn, "hello1"));
+  ASSERT_FAIL(page->Delete(txn, "hello1"));
   // Delete value.
-  ASSERT_TRUE(page->Delete(txn, "hello"));
+  ASSERT_SUCCESS(page->Delete(txn, "hello"));
   // Cannot delete twice.
-  ASSERT_FALSE(page->Delete(txn, "hello"));
+  ASSERT_FAIL(page->Delete(txn, "hello"));
 
   // We cannot update deleted value.
-  ASSERT_FALSE(page->Update(txn, "hello", "hoge"));
+  ASSERT_FAIL(page->Update(txn, "hello", "hoge"));
   // We cannot read deleted value.
   std::string_view out;
-  ASSERT_FALSE(page->Read(txn, "hello", &out));
+  ASSERT_FAIL(page->Read(txn, "hello", &out));
 }
 
 TEST_F(LeafPageTest, DeleteMany) {
@@ -150,21 +151,21 @@ TEST_F(LeafPageTest, DeleteMany) {
 
   // Insert value.
   for (size_t i = 0; i < 100; ++i) {
-    ASSERT_TRUE(page->Insert(txn, "k" + std::to_string(i),
-                             "v" + std::to_string(i + 1)));
+    ASSERT_SUCCESS(page->Insert(txn, "k" + std::to_string(i),
+                                "v" + std::to_string(i + 1)));
   }
   // Deleting odd values.
   for (size_t i = 0; i < 100; i += 2) {
-    ASSERT_TRUE(page->Delete(txn, "k" + std::to_string(i)));
+    ASSERT_SUCCESS(page->Delete(txn, "k" + std::to_string(i)));
   }
   // Check all.
   for (size_t i = 0; i < 100; ++i) {
     std::string_view out;
     if (i % 2 == 0) {
-      ASSERT_FALSE(page->Read(txn, "k" + std::to_string(i), &out));
+      ASSERT_FAIL(page->Read(txn, "k" + std::to_string(i), &out));
       ASSERT_TRUE(out.empty());
     } else {
-      ASSERT_TRUE(page->Read(txn, "k" + std::to_string(i), &out));
+      ASSERT_SUCCESS(page->Read(txn, "k" + std::to_string(i), &out));
       ASSERT_EQ(out, "v" + std::to_string(i + 1));
     }
   }
@@ -178,26 +179,26 @@ TEST_F(LeafPageTest, InsertDeflag) {
   std::string value;
   value.resize(10000);
   for (char& i : value) i = '1';
-  ASSERT_TRUE(page->Insert(txn, "key1", value));  // About 10000 bytes used.
+  ASSERT_SUCCESS(page->Insert(txn, "key1", value));  // About 10000 bytes used.
   for (char& i : value) i = '2';
-  ASSERT_TRUE(page->Insert(txn, "key2", value));  // About 20000 bytes used.
+  ASSERT_SUCCESS(page->Insert(txn, "key2", value));  // About 20000 bytes used.
   for (char& i : value) i = '3';
-  ASSERT_TRUE(page->Insert(txn, "key3", value));   // About 30000 bytes used.
-  ASSERT_FALSE(page->Insert(txn, "key4", value));  // No space left.
-  ASSERT_TRUE(page->Delete(txn, "key2"));          // Make new space.
+  ASSERT_SUCCESS(page->Insert(txn, "key3", value));  // About 30000 bytes used.
+  ASSERT_FAIL(page->Insert(txn, "key4", value));     // No space left.
+  ASSERT_SUCCESS(page->Delete(txn, "key2"));         // Make new space.
   for (char& i : value) i = '4';
-  ASSERT_TRUE(page->Insert(txn, "key4", value));   // Should success.
-  ASSERT_FALSE(page->Insert(txn, "key5", value));  // No space left.
-  ASSERT_TRUE(page->Delete(txn, "key1"));          // Make new space.
+  ASSERT_SUCCESS(page->Insert(txn, "key4", value));  // Should success.
+  ASSERT_FAIL(page->Insert(txn, "key5", value));     // No space left.
+  ASSERT_SUCCESS(page->Delete(txn, "key1"));         // Make new space.
   for (char& i : value) i = '5';
-  ASSERT_TRUE(page->Insert(txn, "key5", value));  // Should success.
+  ASSERT_SUCCESS(page->Insert(txn, "key5", value));  // Should success.
 
   std::string_view row;
-  ASSERT_TRUE(page->Read(txn, "key3", &row));
+  ASSERT_SUCCESS(page->Read(txn, "key3", &row));
   for (const char& i : row) ASSERT_EQ(i, '3');
-  ASSERT_TRUE(page->Read(txn, "key4", &row));
+  ASSERT_SUCCESS(page->Read(txn, "key4", &row));
   for (const char& i : row) ASSERT_EQ(i, '4');
-  ASSERT_TRUE(page->Read(txn, "key5", &row));
+  ASSERT_SUCCESS(page->Read(txn, "key5", &row));
   for (const char& i : row) ASSERT_EQ(i, '5');
 }
 
@@ -205,16 +206,16 @@ TEST_F(LeafPageTest, LowestHighestKey) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(leaf_page_id_);
 
-  ASSERT_TRUE(page->Insert(txn, "C", "foo"));
-  ASSERT_TRUE(page->Insert(txn, "A", "bar"));
-  ASSERT_TRUE(page->Insert(txn, "B", "baz"));
-  ASSERT_TRUE(page->Insert(txn, "D", "piy"));
+  ASSERT_SUCCESS(page->Insert(txn, "C", "foo"));
+  ASSERT_SUCCESS(page->Insert(txn, "A", "bar"));
+  ASSERT_SUCCESS(page->Insert(txn, "B", "baz"));
+  ASSERT_SUCCESS(page->Insert(txn, "D", "piy"));
 
   std::string_view out;
-  ASSERT_TRUE(page->LowestKey(txn, &out));
+  ASSERT_SUCCESS(page->LowestKey(txn, &out));
   ASSERT_EQ(out, "A");
 
-  ASSERT_TRUE(page->HighestKey(txn, &out));
+  ASSERT_SUCCESS(page->HighestKey(txn, &out));
   ASSERT_EQ(out, "D");
 }
 
@@ -224,19 +225,19 @@ TEST_F(LeafPageTest, Split) {
   PageRef right = p_->AllocateNewPage(txn, PageType::kLeafPage);
   {
     for (size_t i = 0; i < 10; ++i) {
-      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
-                               std::to_string(i) + ":value"));
+      ASSERT_SUCCESS(page->Insert(txn, std::to_string(i) + ":key",
+                                  std::to_string(i) + ":value"));
     }
     page->Split(txn, right.get());
   }
   std::string_view out;
   for (size_t i = 0; i < 5; ++i) {
-    ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+    ASSERT_SUCCESS(page->Read(txn, std::to_string(i) + ":key", &out));
     ASSERT_EQ(std::to_string(i) + ":value", out);
   }
   {
     for (size_t i = 5; i < 10; ++i) {
-      ASSERT_TRUE(right->Read(txn, std::to_string(i) + ":key", &out));
+      ASSERT_SUCCESS(right->Read(txn, std::to_string(i) + ":key", &out));
       ASSERT_EQ(std::to_string(i) + ":value", out);
     }
   }
@@ -247,8 +248,8 @@ TEST_F(LeafPageTest, InsertCrash) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 20; ++i) {
-      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
-                               std::to_string(i) + ":value"));
+      ASSERT_SUCCESS(page->Insert(txn, std::to_string(i) + ":key",
+                                  std::to_string(i) + ":value"));
     }
     txn.PreCommit();
   }
@@ -260,7 +261,7 @@ TEST_F(LeafPageTest, InsertCrash) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 20; ++i) {
-      ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+      ASSERT_SUCCESS(page->Read(txn, std::to_string(i) + ":key", &out));
       ASSERT_EQ(std::to_string(i) + ":value", out);
     }
   }
@@ -271,8 +272,8 @@ TEST_F(LeafPageTest, InsertAbort) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 20; i += 2) {
-      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
-                               std::to_string(i) + ":value"));
+      ASSERT_SUCCESS(page->Insert(txn, std::to_string(i) + ":key",
+                                  std::to_string(i) + ":value"));
     }
     txn.PreCommit();
   }
@@ -281,8 +282,8 @@ TEST_F(LeafPageTest, InsertAbort) {
     {
       PageRef page = p_->GetPage(leaf_page_id_);
       for (size_t i = 1; i < 20; i += 2) {
-        ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
-                                 std::to_string(i) + ":value"));
+        ASSERT_SUCCESS(page->Insert(txn, std::to_string(i) + ":key",
+                                    std::to_string(i) + ":value"));
       }
     }
     txn.Abort();
@@ -296,10 +297,10 @@ TEST_F(LeafPageTest, InsertAbort) {
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 20; ++i) {
       if (i % 2 == 0) {
-        ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+        ASSERT_SUCCESS(page->Read(txn, std::to_string(i) + ":key", &out));
         ASSERT_EQ(std::to_string(i) + ":value", out);
       } else {
-        ASSERT_FALSE(page->Read(txn, std::to_string(i) + ":key", &out));
+        ASSERT_FAIL(page->Read(txn, std::to_string(i) + ":key", &out));
       }
     }
   }
@@ -310,8 +311,8 @@ TEST_F(LeafPageTest, UpdateCrash) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 10; ++i) {
-      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
-                               std::to_string(i) + ":value"));
+      ASSERT_SUCCESS(page->Insert(txn, std::to_string(i) + ":key",
+                                  std::to_string(i) + ":value"));
     }
     txn.PreCommit();
   }
@@ -319,8 +320,8 @@ TEST_F(LeafPageTest, UpdateCrash) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 10; ++i) {
-      ASSERT_TRUE(page->Update(txn, std::to_string(i) + ":key",
-                               std::to_string(i * 2) + ":value"));
+      ASSERT_SUCCESS(page->Update(txn, std::to_string(i) + ":key",
+                                  std::to_string(i * 2) + ":value"));
     }
   }
   Recover();
@@ -331,7 +332,7 @@ TEST_F(LeafPageTest, UpdateCrash) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 10; ++i) {
-      ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+      ASSERT_SUCCESS(page->Read(txn, std::to_string(i) + ":key", &out));
       ASSERT_EQ(std::to_string(i) + ":value", out);
     }
   }
@@ -342,8 +343,8 @@ TEST_F(LeafPageTest, UpdateAbort) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 10; ++i) {
-      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
-                               std::to_string(i) + ":value"));
+      ASSERT_SUCCESS(page->Insert(txn, std::to_string(i) + ":key",
+                                  std::to_string(i) + ":value"));
     }
     txn.PreCommit();
   }
@@ -352,8 +353,8 @@ TEST_F(LeafPageTest, UpdateAbort) {
     {
       PageRef page = p_->GetPage(leaf_page_id_);
       for (size_t i = 0; i < 10; ++i) {
-        ASSERT_TRUE(page->Update(txn, std::to_string(i) + ":key",
-                                 std::to_string(i * 2) + ":value"));
+        ASSERT_SUCCESS(page->Update(txn, std::to_string(i) + ":key",
+                                    std::to_string(i * 2) + ":value"));
       }
     }
     txn.Abort();
@@ -366,7 +367,7 @@ TEST_F(LeafPageTest, UpdateAbort) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 10; ++i) {
-      ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+      ASSERT_SUCCESS(page->Read(txn, std::to_string(i) + ":key", &out));
       ASSERT_EQ(std::to_string(i) + ":value", out);
     }
   }
@@ -377,8 +378,8 @@ TEST_F(LeafPageTest, DeleteCrash) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 10; ++i) {
-      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
-                               std::to_string(i) + ":value"));
+      ASSERT_SUCCESS(page->Insert(txn, std::to_string(i) + ":key",
+                                  std::to_string(i) + ":value"));
     }
     txn.PreCommit();
   }
@@ -386,7 +387,7 @@ TEST_F(LeafPageTest, DeleteCrash) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 1; i < 10; i += 2) {
-      ASSERT_TRUE(page->Delete(txn, std::to_string(i) + ":key"));
+      ASSERT_SUCCESS(page->Delete(txn, std::to_string(i) + ":key"));
     }
     txn.PreCommit();
   }
@@ -399,10 +400,10 @@ TEST_F(LeafPageTest, DeleteCrash) {
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 10; ++i) {
       if (i % 2 == 0) {
-        ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+        ASSERT_SUCCESS(page->Read(txn, std::to_string(i) + ":key", &out));
         ASSERT_EQ(std::to_string(i) + ":value", out);
       } else {
-        ASSERT_FALSE(page->Read(txn, std::to_string(i) + ":key", &out));
+        ASSERT_FAIL(page->Read(txn, std::to_string(i) + ":key", &out));
       }
     }
   }
@@ -413,8 +414,8 @@ TEST_F(LeafPageTest, DeleteAbort) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 10; ++i) {
-      ASSERT_TRUE(page->Insert(txn, std::to_string(i) + ":key",
-                               std::to_string(i) + ":value"));
+      ASSERT_SUCCESS(page->Insert(txn, std::to_string(i) + ":key",
+                                  std::to_string(i) + ":value"));
     }
     txn.PreCommit();
   }
@@ -423,7 +424,7 @@ TEST_F(LeafPageTest, DeleteAbort) {
     {
       PageRef page = p_->GetPage(leaf_page_id_);
       for (size_t i = 0; i < 10; i += 2) {
-        ASSERT_TRUE(page->Delete(txn, std::to_string(i) + ":key"));
+        ASSERT_SUCCESS(page->Delete(txn, std::to_string(i) + ":key"));
       }
     }
     txn.Abort();
@@ -436,7 +437,7 @@ TEST_F(LeafPageTest, DeleteAbort) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(leaf_page_id_);
     for (size_t i = 0; i < 10; ++i) {
-      ASSERT_TRUE(page->Read(txn, std::to_string(i) + ":key", &out));
+      ASSERT_SUCCESS(page->Read(txn, std::to_string(i) + ":key", &out));
       ASSERT_EQ(std::to_string(i) + ":value", out);
     }
   }

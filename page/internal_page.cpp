@@ -26,20 +26,18 @@ void InternalPage::SetLowestValue(page_id_t pid, Transaction& txn,
   txn.SetLowestLog(pid, value);
 }
 
-bool InternalPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
-                          page_id_t value) {
+Status InternalPage::Insert(page_id_t pid, Transaction& txn,
+                            std::string_view key, page_id_t value) {
   const bin_size_t physical_size =
       sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + sizeof(page_id_t);
 
   size_t pos = SearchToInsert(key);
-  if (free_size_ < physical_size + sizeof(RowPointer) ||  // No space.
-      (pos != row_count_ && GetKey(pos) == key)) {        // Already exists.
-    return false;
-  }
+  if (free_size_ < physical_size + sizeof(RowPointer)) return Status::kNoSpace;
+  if (pos != row_count_ && GetKey(pos) == key) return Status::kDuplicates;
 
   InsertImpl(key, value);
   txn.InsertInternalLog(pid, key, value);
-  return true;
+  return Status::kSuccess;
 }
 
 void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
@@ -54,20 +52,19 @@ void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
   ++row_count_;
 }
 
-bool InternalPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
-                          page_id_t value) {
+Status InternalPage::Update(page_id_t pid, Transaction& txn,
+                            std::string_view key, page_id_t value) {
   const bin_size_t physical_size =
       sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + sizeof(page_id_t);
   const size_t pos = Search(key);
-  if (row_count_ < pos ||  // No exist.
-      GetKey(pos) != key ||
-      free_size_ < physical_size - GetKey(pos).size()) {  // No space.
-    return false;
+  if (row_count_ < pos || GetKey(pos) != key) return Status::kNotExists;
+  if (free_size_ < physical_size - GetKey(pos).size()) {
+    return Status::kNoSpace;
   }
 
   txn.UpdateInternalLog(pid, key, GetValue(pos), value);
   UpdateImpl(key, value);
-  return true;
+  return Status::kSuccess;
 }
 
 void InternalPage::UpdateImpl(std::string_view key, page_id_t pid) {
@@ -81,16 +78,14 @@ void InternalPage::UpdateImpl(std::string_view key, page_id_t pid) {
   rows[pos].size = free_ptr_ - offset;
 }
 
-bool InternalPage::Delete(page_id_t pid, Transaction& txn,
-                          std::string_view key) {
+Status InternalPage::Delete(page_id_t pid, Transaction& txn,
+                            std::string_view key) {
   const bin_size_t pos = Search(key);
-  if (GetKey(pos) != key) {
-    return false;
-  }
+  if (GetKey(pos) != key) return Status::kNotExists;
   bin_size_t old_value = GetValue(pos);
   DeleteImpl(key);
   txn.DeleteInternalLog(pid, key, old_value);
-  return true;
+  return Status::kSuccess;
 }
 
 void InternalPage::DeleteImpl(std::string_view key) {
@@ -101,16 +96,16 @@ void InternalPage::DeleteImpl(std::string_view key) {
   row_count_--;
 }
 
-bool InternalPage::GetPageForKey(Transaction& txn, std::string_view key,
-                                 page_id_t* result) {
-  if (row_count_ == 0) return false;
+Status InternalPage::GetPageForKey(Transaction& txn, std::string_view key,
+                                   page_id_t* result) {
+  if (row_count_ == 0) return Status::kNotExists;
   if (key < GetKey(0)) {
     *result = lowest_page_;
-    return true;
+    return Status::kSuccess;
   }
   bin_size_t slot = Search(key);
   *result = GetValue(slot);
-  return true;
+  return Status::kSuccess;
 }
 
 void InternalPage::SplitInto(page_id_t pid, Transaction& txn, Page* right,

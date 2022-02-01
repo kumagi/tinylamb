@@ -1,6 +1,7 @@
 #ifndef TINYLAMB_ROW_PAGE_TEST_HPP
 #define TINYLAMB_ROW_PAGE_TEST_HPP
 
+#include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
@@ -56,8 +57,8 @@ class RowPageTest : public ::testing::Test {
 
     const bin_size_t before_size = rp.FreeSizeForTest();
     slot_t slot;
-    bool success = page->Insert(txn, str, &slot);
-    if (success) {
+    Status status = page->Insert(txn, str, &slot);
+    if (status == Status::kSuccess) {
       EXPECT_EQ(rp.FreeSizeForTest(),
                 before_size - str.size() - sizeof(RowPage::RowPointer));
     }
@@ -68,7 +69,7 @@ class RowPageTest : public ::testing::Test {
       txn.Abort();
     }
     txn.CommitWait();
-    return success;
+    return status == Status::kSuccess;
   }
 
   void UpdateRow(int slot, std::string_view str, bool commit = true) {
@@ -76,7 +77,7 @@ class RowPageTest : public ::testing::Test {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-    ASSERT_TRUE(page->Update(txn, slot, str));
+    ASSERT_SUCCESS(page->Update(txn, slot, str));
     if (commit) {
       ASSERT_TRUE(txn.PreCommit());
     } else {
@@ -91,7 +92,7 @@ class RowPageTest : public ::testing::Test {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
-    ASSERT_TRUE(page->Delete(txn, slot));
+    ASSERT_SUCCESS(page->Delete(txn, slot));
     if (commit) {
       ASSERT_TRUE(txn.PreCommit());
     } else {
@@ -106,7 +107,7 @@ class RowPageTest : public ::testing::Test {
     PageRef page = p_->GetPage(page_id_);
     EXPECT_FALSE(page.IsNull());
     std::string_view dst;
-    EXPECT_TRUE(page->Read(txn, slot, &dst));
+    EXPECT_SUCCESS(page->Read(txn, slot, &dst));
     EXPECT_TRUE(txn.PreCommit());
     txn.CommitWait();
     return std::string(dst);

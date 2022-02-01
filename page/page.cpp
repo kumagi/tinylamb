@@ -62,40 +62,40 @@ void Page::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
   SetRecLSN(txn.PrevLSN());
 }
 
-bool Page::Read(Transaction& txn, const uint16& slot,
-                std::string_view* result) const {
+Status Page::Read(Transaction& txn, const uint16& slot,
+                  std::string_view* result) const {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
   return body.row_page.Read(PageID(), txn, slot, result);
 }
 
-bool Page::Insert(Transaction& txn, std::string_view record, slot_t* slot) {
+Status Page::Insert(Transaction& txn, std::string_view record, slot_t* slot) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  if (body.row_page.Insert(PageID(), txn, record, slot)) {
+  Status result = body.row_page.Insert(PageID(), txn, record, slot);
+  if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
     SetRecLSN(txn.PrevLSN());
-    return true;
   }
-  return false;
+  return result;
 }
 
-bool Page::Update(Transaction& txn, slot_t slot, std::string_view row) {
+Status Page::Update(Transaction& txn, slot_t slot, std::string_view row) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  if (body.row_page.Update(PageID(), txn, slot, row)) {
+  Status result = body.row_page.Update(PageID(), txn, slot, row);
+  if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
     SetRecLSN(txn.PrevLSN());
-    return true;
   }
-  return false;
+  return result;
 }
 
-bool Page::Delete(Transaction& txn, const slot_t pos) {
+Status Page::Delete(Transaction& txn, const slot_t pos) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  if (body.row_page.Delete(PageID(), txn, pos)) {
+  Status result = body.row_page.Delete(PageID(), txn, pos);
+  if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
     SetRecLSN(txn.PrevLSN());
-    return true;
   }
-  return false;
+  return result;
 }
 
 size_t Page::RowCount() const {
@@ -110,28 +110,30 @@ size_t Page::RowCount() const {
 }
 
 // Leaf page manipulations.
-bool Page::Insert(Transaction& txn, std::string_view key,
-                  std::string_view value) {
+Status Page::Insert(Transaction& txn, std::string_view key,
+                    std::string_view value) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  if (body.leaf_page.Insert(PageID(), txn, key, value)) {
+  Status result = body.leaf_page.Insert(PageID(), txn, key, value);
+  if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
     SetRecLSN(txn.PrevLSN());
-    return true;
   }
-  return false;
-}
-
-bool Page::Update(Transaction& txn, std::string_view key,
-                  std::string_view value) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  bool result = body.leaf_page.Update(PageID(), txn, key, value);
-  SetPageLSN(txn.PrevLSN());
-  SetRecLSN(txn.PrevLSN());
   return result;
 }
 
-bool Page::Delete(Transaction& txn, std::string_view key) {
-  bool result;
+Status Page::Update(Transaction& txn, std::string_view key,
+                    std::string_view value) {
+  ASSERT_PAGE_TYPE(PageType::kLeafPage)
+  Status result = body.leaf_page.Update(PageID(), txn, key, value);
+  if (result == Status::kSuccess) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+  }
+  return result;
+}
+
+Status Page::Delete(Transaction& txn, std::string_view key) {
+  Status result;
   switch (type) {
     case PageType::kLeafPage:
       result = body.leaf_page.Delete(PageID(), txn, key);
@@ -142,23 +144,25 @@ bool Page::Delete(Transaction& txn, std::string_view key) {
     default:
       throw std::runtime_error("Invalid page type");
   }
-  SetPageLSN(txn.PrevLSN());
-  SetRecLSN(txn.PrevLSN());
+  if (result == Status::kSuccess) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+  }
   return result;
 }
 
-bool Page::Read(Transaction& txn, std::string_view key,
-                std::string_view* result) {
+Status Page::Read(Transaction& txn, std::string_view key,
+                  std::string_view* result) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
   return body.leaf_page.Read(txn, key, result);
 }
 
-bool Page::LowestKey(Transaction& txn, std::string_view* result) {
+Status Page::LowestKey(Transaction& txn, std::string_view* result) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
   return body.leaf_page.LowestKey(txn, result);
 }
 
-bool Page::HighestKey(Transaction& txn, std::string_view* result) {
+Status Page::HighestKey(Transaction& txn, std::string_view* result) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
   return body.leaf_page.HighestKey(txn, result);
 }
@@ -168,35 +172,35 @@ void Page::Split(Transaction& txn, Page* right) {
   body.leaf_page.Split(PageID(), txn, right);
 }
 
-bool Page::Insert(Transaction& txn, std::string_view key, page_id_t pid) {
+Status Page::Insert(Transaction& txn, std::string_view key, page_id_t pid) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  bool result = body.internal_page.Insert(PageID(), txn, key, pid);
-  if (result) {
+  Status result = body.internal_page.Insert(PageID(), txn, key, pid);
+  if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
     SetRecLSN(txn.PrevLSN());
   }
   return result;
 }
 
-bool Page::Update(Transaction& txn, std::string_view key, page_id_t pid) {
+Status Page::Update(Transaction& txn, std::string_view key, page_id_t pid) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  if (body.internal_page.Update(PageID(), txn, key, pid)) {
+  Status result = body.internal_page.Update(PageID(), txn, key, pid);
+  if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
     SetRecLSN(txn.PrevLSN());
-    return true;
   }
-  return false;
+  return result;
 }
 
-bool Page::GetPageForKey(Transaction& txn, std::string_view key,
-                         page_id_t* result) {
+Status Page::GetPageForKey(Transaction& txn, std::string_view key,
+                           page_id_t* page) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  if (body.internal_page.GetPageForKey(txn, key, result)) {
+  Status result = body.internal_page.GetPageForKey(txn, key, page);
+  if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
     SetRecLSN(txn.PrevLSN());
-    return true;
   }
-  return false;
+  return result;
 }
 
 void Page::SetLowestValue(Transaction& txn, page_id_t v) {

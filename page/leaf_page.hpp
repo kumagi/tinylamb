@@ -40,17 +40,17 @@ class LeafPage {
     free_size_ = kPageBodySize - sizeof(LeafPage);
   }
 
-  bool Insert(page_id_t page_id, Transaction& txn, std::string_view key,
-              std::string_view value);
-  bool Update(page_id_t page_id, Transaction& txn, std::string_view key,
-              std::string_view value);
-  bool Delete(page_id_t page_id, Transaction& txn, std::string_view key);
-  bool Read(Transaction& txn, std::string_view key, std::string_view* result);
+  Status Insert(page_id_t page_id, Transaction& txn, std::string_view key,
+                std::string_view value);
+  Status Update(page_id_t page_id, Transaction& txn, std::string_view key,
+                std::string_view value);
+  Status Delete(page_id_t page_id, Transaction& txn, std::string_view key);
+  Status Read(Transaction& txn, std::string_view key, std::string_view* result);
 
   [[nodiscard]] std::string_view GetKey(size_t idx) const;
   [[nodiscard]] std::string_view GetValue(size_t idx) const;
-  bool LowestKey(Transaction& txn, std::string_view* result);
-  bool HighestKey(Transaction& txn, std::string_view* result);
+  Status LowestKey(Transaction& txn, std::string_view* result);
+  Status HighestKey(Transaction& txn, std::string_view* result);
   [[nodiscard]] size_t RowCount() const;
 
   // Split utils.

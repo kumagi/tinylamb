@@ -34,30 +34,30 @@ class Page {
   void DestroyPage(Transaction& txn, Page* target, PagePool& pool);
 
   // Row page manipulations.
-  bool Read(Transaction& txn, const uint16& slot,
-            std::string_view* result) const;
+  Status Read(Transaction& txn, const uint16& slot,
+              std::string_view* result) const;
 
-  bool Insert(Transaction& txn, std::string_view record, slot_t* slot);
+  Status Insert(Transaction& txn, std::string_view record, slot_t* slot);
 
-  bool Update(Transaction& txn, slot_t slot, std::string_view row);
+  Status Update(Transaction& txn, slot_t slot, std::string_view row);
 
-  bool Delete(Transaction& txn, slot_t pos);
+  Status Delete(Transaction& txn, slot_t pos);
 
   [[nodiscard]] size_t RowCount() const;
 
   // Leaf page manipulations.
-  bool Insert(Transaction& txn, std::string_view key, std::string_view value);
-  bool Update(Transaction& txn, std::string_view key, std::string_view value);
-  bool Delete(Transaction& txn, std::string_view key);
-  bool Read(Transaction& txn, std::string_view key, std::string_view* result);
-  bool LowestKey(Transaction& txn, std::string_view* result);
-  bool HighestKey(Transaction& txn, std::string_view* result);
+  Status Insert(Transaction& txn, std::string_view key, std::string_view value);
+  Status Update(Transaction& txn, std::string_view key, std::string_view value);
+  Status Delete(Transaction& txn, std::string_view key);
+  Status Read(Transaction& txn, std::string_view key, std::string_view* result);
+  Status LowestKey(Transaction& txn, std::string_view* result);
+  Status HighestKey(Transaction& txn, std::string_view* result);
   void Split(Transaction& txn, Page* right);
 
   // Internal page manipulations.
-  bool Insert(Transaction& txn, std::string_view key, page_id_t pid);
-  bool Update(Transaction& txn, std::string_view key, page_id_t pid);
-  bool GetPageForKey(Transaction& txn, std::string_view key, page_id_t* result);
+  Status Insert(Transaction& txn, std::string_view key, page_id_t pid);
+  Status Update(Transaction& txn, std::string_view key, page_id_t pid);
+  Status GetPageForKey(Transaction& txn, std::string_view key, page_id_t* page);
   void SetLowestValue(Transaction& txn, page_id_t i);
   void SplitInto(Transaction& txn, Page* right, std::string_view* middle);
 

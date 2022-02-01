@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 
+#include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/leaf_page.hpp"
 #include "page/page_manager.hpp"
@@ -38,7 +39,7 @@ class InternalPageTest : public ::testing::Test {
     PageRef p = p_->GetPage(pid);
 
     page_id_t value;
-    ASSERT_TRUE(p->GetPageForKey(txn, key, &value));
+    ASSERT_SUCCESS(p->GetPageForKey(txn, key, &value));
     ASSERT_EQ(value, expected);
     EXPECT_TRUE(txn.PreCommit());
   }
@@ -78,7 +79,7 @@ TEST_F(InternalPageTest, SetMinimumTree) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(internal_page_id_);
   page->SetLowestValue(txn, 100);
-  ASSERT_TRUE(page->Insert(txn, "b", 200));
+  ASSERT_SUCCESS(page->Insert(txn, "b", 200));
 }
 
 TEST_F(InternalPageTest, GetPageForKeyMinimum) {
@@ -86,7 +87,7 @@ TEST_F(InternalPageTest, GetPageForKeyMinimum) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(internal_page_id_);
     page->SetLowestValue(txn, 100);
-    ASSERT_TRUE(page->Insert(txn, "b", 200));
+    ASSERT_SUCCESS(page->Insert(txn, "b", 200));
     txn.PreCommit();
   }
   AssertPIDForKey(internal_page_id_, "alpha", 100);
@@ -98,13 +99,13 @@ TEST_F(InternalPageTest, InsertKey) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(internal_page_id_);
   page->SetLowestValue(txn, 100);
-  ASSERT_TRUE(page->Insert(txn, "d", 200));
-  ASSERT_TRUE(page->Insert(txn, "a", 10));
-  ASSERT_TRUE(page->Insert(txn, "b", 20));
-  ASSERT_TRUE(page->Insert(txn, "e", 40));
-  ASSERT_TRUE(page->Insert(txn, "f", 50));
-  ASSERT_TRUE(page->Insert(txn, "g", 60));
-  ASSERT_TRUE(page->Insert(txn, "c", 30));
+  ASSERT_SUCCESS(page->Insert(txn, "d", 200));
+  ASSERT_SUCCESS(page->Insert(txn, "a", 10));
+  ASSERT_SUCCESS(page->Insert(txn, "b", 20));
+  ASSERT_SUCCESS(page->Insert(txn, "e", 40));
+  ASSERT_SUCCESS(page->Insert(txn, "f", 50));
+  ASSERT_SUCCESS(page->Insert(txn, "g", 60));
+  ASSERT_SUCCESS(page->Insert(txn, "c", 30));
 }
 
 TEST_F(InternalPageTest, GetPageForKey) {
@@ -113,9 +114,9 @@ TEST_F(InternalPageTest, GetPageForKey) {
     PageRef page = p_->GetPage(internal_page_id_);
     page->SetLowestValue(txn, 2);
 
-    ASSERT_TRUE(page->Insert(txn, "c", 23));
-    ASSERT_TRUE(page->Insert(txn, "b", 20));
-    ASSERT_TRUE(page->Insert(txn, "e", 40));
+    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
+    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
+    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
     ASSERT_TRUE(txn.PreCommit());
   }
 
@@ -131,40 +132,40 @@ TEST_F(InternalPageTest, InsertAndGetKey) {
   page->SetLowestValue(txn, 100);
 
   page_id_t pid;
-  ASSERT_TRUE(page->Insert(txn, "c", 200));
-  ASSERT_TRUE(page->Insert(txn, "a", 10));
-  ASSERT_TRUE(page->GetPageForKey(txn, "a", &pid));
-  ASSERT_TRUE(page->GetPageForKey(txn, "alpha", &pid));
+  ASSERT_SUCCESS(page->Insert(txn, "c", 200));
+  ASSERT_SUCCESS(page->Insert(txn, "a", 10));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "a", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "alpha", &pid));
   ASSERT_EQ(pid, 10);
 
-  ASSERT_TRUE(page->Insert(txn, "g", 60));
-  ASSERT_TRUE(page->GetPageForKey(txn, "g", &pid));
+  ASSERT_SUCCESS(page->Insert(txn, "g", 60));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "g", &pid));
   ASSERT_EQ(pid, 60);
-  ASSERT_TRUE(page->GetPageForKey(txn, "guide", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "guide", &pid));
   ASSERT_EQ(pid, 60);
 
-  ASSERT_TRUE(page->Insert(txn, "e", 40));
-  ASSERT_TRUE(page->GetPageForKey(txn, "e", &pid));
+  ASSERT_SUCCESS(page->Insert(txn, "e", 40));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "e", &pid));
   ASSERT_EQ(pid, 40);
-  ASSERT_TRUE(page->GetPageForKey(txn, "error", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "error", &pid));
   ASSERT_EQ(pid, 40);
 
-  ASSERT_TRUE(page->Insert(txn, "f", 50));
-  ASSERT_TRUE(page->GetPageForKey(txn, "f", &pid));
+  ASSERT_SUCCESS(page->Insert(txn, "f", 50));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "f", &pid));
   ASSERT_EQ(pid, 50);
-  ASSERT_TRUE(page->GetPageForKey(txn, "flight", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "flight", &pid));
   ASSERT_EQ(pid, 50);
 
-  ASSERT_TRUE(page->Insert(txn, "b", 20));
-  ASSERT_TRUE(page->GetPageForKey(txn, "b", &pid));
+  ASSERT_SUCCESS(page->Insert(txn, "b", 20));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "b", &pid));
   ASSERT_EQ(pid, 20);
-  ASSERT_TRUE(page->GetPageForKey(txn, "battle", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "battle", &pid));
   ASSERT_EQ(pid, 20);
 
-  ASSERT_TRUE(page->Insert(txn, "c", 30));
-  ASSERT_TRUE(page->GetPageForKey(txn, "c", &pid));
+  ASSERT_SUCCESS(page->Insert(txn, "c", 30));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "c", &pid));
   ASSERT_EQ(pid, 30);
-  ASSERT_TRUE(page->GetPageForKey(txn, "cut", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "cut", &pid));
   ASSERT_EQ(pid, 30);
 }
 
@@ -173,16 +174,16 @@ TEST_F(InternalPageTest, UpdateKey) {
   {
     PageRef page = p_->GetPage(internal_page_id_);
     page->SetLowestValue(txn, 100);
-    ASSERT_TRUE(page->Insert(txn, "a", 1));
-    ASSERT_TRUE(page->Insert(txn, "b", 2));
-    ASSERT_TRUE(page->Insert(txn, "c", 3));
-    ASSERT_TRUE(page->Insert(txn, "d", 4));
-    ASSERT_TRUE(page->Update(txn, "a", 5));
-    ASSERT_TRUE(page->Update(txn, "b", 6));
-    ASSERT_TRUE(page->Update(txn, "c", 7));
-    ASSERT_TRUE(page->Update(txn, "d", 8));
-    ASSERT_FALSE(page->Update(txn, "e", 60));
-    ASSERT_FALSE(page->Update(txn, "f", 30));
+    ASSERT_SUCCESS(page->Insert(txn, "a", 1));
+    ASSERT_SUCCESS(page->Insert(txn, "b", 2));
+    ASSERT_SUCCESS(page->Insert(txn, "c", 3));
+    ASSERT_SUCCESS(page->Insert(txn, "d", 4));
+    ASSERT_SUCCESS(page->Update(txn, "a", 5));
+    ASSERT_SUCCESS(page->Update(txn, "b", 6));
+    ASSERT_SUCCESS(page->Update(txn, "c", 7));
+    ASSERT_SUCCESS(page->Update(txn, "d", 8));
+    ASSERT_FAIL(page->Update(txn, "e", 60));
+    ASSERT_FAIL(page->Update(txn, "f", 30));
     txn.PreCommit();
   }
 
@@ -196,18 +197,18 @@ TEST_F(InternalPageTest, DeleteKey) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(internal_page_id_);
   page->SetLowestValue(txn, 2);
-  ASSERT_TRUE(page->Insert(txn, "c", 23));
-  ASSERT_TRUE(page->Insert(txn, "b", 20));
-  ASSERT_TRUE(page->Insert(txn, "e", 40));
+  ASSERT_SUCCESS(page->Insert(txn, "c", 23));
+  ASSERT_SUCCESS(page->Insert(txn, "b", 20));
+  ASSERT_SUCCESS(page->Insert(txn, "e", 40));
 
   page_id_t pid;
-  ASSERT_TRUE(page->GetPageForKey(txn, "alpha", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "alpha", &pid));
   ASSERT_EQ(pid, 2);
-  ASSERT_TRUE(page->Delete(txn, "b"));
-  ASSERT_TRUE(page->GetPageForKey(txn, "b", &pid));
+  ASSERT_SUCCESS(page->Delete(txn, "b"));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "b", &pid));
   EXPECT_EQ(pid, 2);
-  ASSERT_TRUE(page->Delete(txn, "e"));
-  ASSERT_TRUE(page->GetPageForKey(txn, "e", &pid));
+  ASSERT_SUCCESS(page->Delete(txn, "e"));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "e", &pid));
   EXPECT_EQ(pid, 23);
 }
 
@@ -215,15 +216,15 @@ TEST_F(InternalPageTest, SplitInto) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(internal_page_id_);
   page->SetLowestValue(txn, 1);
-  ASSERT_TRUE(page->Insert(txn, "a", 2));
-  ASSERT_TRUE(page->Insert(txn, "b", 3));
-  ASSERT_TRUE(page->Insert(txn, "c", 4));
-  ASSERT_TRUE(page->Insert(txn, "d", 5));
-  ASSERT_TRUE(page->Insert(txn, "e", 6));
-  ASSERT_TRUE(page->Insert(txn, "f", 7));
-  ASSERT_TRUE(page->Insert(txn, "g", 8));
-  ASSERT_TRUE(page->Insert(txn, "h", 9));
-  ASSERT_TRUE(page->Insert(txn, "i", 10));
+  ASSERT_SUCCESS(page->Insert(txn, "a", 2));
+  ASSERT_SUCCESS(page->Insert(txn, "b", 3));
+  ASSERT_SUCCESS(page->Insert(txn, "c", 4));
+  ASSERT_SUCCESS(page->Insert(txn, "d", 5));
+  ASSERT_SUCCESS(page->Insert(txn, "e", 6));
+  ASSERT_SUCCESS(page->Insert(txn, "f", 7));
+  ASSERT_SUCCESS(page->Insert(txn, "g", 8));
+  ASSERT_SUCCESS(page->Insert(txn, "h", 9));
+  ASSERT_SUCCESS(page->Insert(txn, "i", 10));
   PageRef right = p_->AllocateNewPage(txn, PageType::kInternalPage);
   std::string_view mid;
 
@@ -231,32 +232,32 @@ TEST_F(InternalPageTest, SplitInto) {
   ASSERT_EQ("e", mid);
 
   page_id_t pid;
-  ASSERT_TRUE(page->GetPageForKey(txn, "a", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "a", &pid));
   ASSERT_EQ(pid, 2);
-  ASSERT_TRUE(page->GetPageForKey(txn, "b", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "b", &pid));
   EXPECT_EQ(pid, 3);
-  ASSERT_TRUE(page->GetPageForKey(txn, "c", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "c", &pid));
   EXPECT_EQ(pid, 4);
-  ASSERT_TRUE(page->GetPageForKey(txn, "d", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "d", &pid));
   EXPECT_EQ(pid, 5);
-  ASSERT_TRUE(page->GetPageForKey(txn, "e", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "e", &pid));
   ASSERT_EQ(pid, 5);  // Migrated into right node.
-  ASSERT_TRUE(page->GetPageForKey(txn, "f", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "f", &pid));
   EXPECT_EQ(pid, 5);
-  ASSERT_TRUE(page->GetPageForKey(txn, "g", &pid));
+  ASSERT_SUCCESS(page->GetPageForKey(txn, "g", &pid));
   EXPECT_EQ(pid, 5);
 
-  ASSERT_TRUE(right->GetPageForKey(txn, "a", &pid));
+  ASSERT_SUCCESS(right->GetPageForKey(txn, "a", &pid));
   ASSERT_EQ(pid, 6);  // Minimum value of this node.
-  ASSERT_TRUE(right->GetPageForKey(txn, "e", &pid));
+  ASSERT_SUCCESS(right->GetPageForKey(txn, "e", &pid));
   ASSERT_EQ(pid, 6);
-  ASSERT_TRUE(right->GetPageForKey(txn, "f", &pid));
+  ASSERT_SUCCESS(right->GetPageForKey(txn, "f", &pid));
   EXPECT_EQ(pid, 7);
-  ASSERT_TRUE(right->GetPageForKey(txn, "g", &pid));
+  ASSERT_SUCCESS(right->GetPageForKey(txn, "g", &pid));
   EXPECT_EQ(pid, 8);
-  ASSERT_TRUE(right->GetPageForKey(txn, "h", &pid));
+  ASSERT_SUCCESS(right->GetPageForKey(txn, "h", &pid));
   EXPECT_EQ(pid, 9);
-  ASSERT_TRUE(right->GetPageForKey(txn, "i", &pid));
+  ASSERT_SUCCESS(right->GetPageForKey(txn, "i", &pid));
   EXPECT_EQ(pid, 10);
 }
 
@@ -266,9 +267,9 @@ TEST_F(InternalPageTest, Recovery) {
     PageRef page = p_->GetPage(internal_page_id_);
     page->SetLowestValue(txn, 2);
 
-    ASSERT_TRUE(page->Insert(txn, "c", 23));
-    ASSERT_TRUE(page->Insert(txn, "b", 20));
-    ASSERT_TRUE(page->Insert(txn, "e", 40));
+    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
+    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
+    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
     txn.PreCommit();
   }
 
@@ -288,14 +289,14 @@ TEST_F(InternalPageTest, InsertCrash) {
     page->SetLowestValue(txn, 2);
 
     Flush();
-    ASSERT_TRUE(page->Insert(txn, "c", 23));
+    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
     txn.PreCommit();
   }
   {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(internal_page_id_);
-    ASSERT_TRUE(page->Insert(txn, "b", 20));
-    ASSERT_TRUE(page->Insert(txn, "e", 40));
+    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
+    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
   }
 
   Recover();  // Expect redo happen.
@@ -313,15 +314,15 @@ TEST_F(InternalPageTest, InsertAbort) {
     PageRef page = p_->GetPage(internal_page_id_);
     page->SetLowestValue(txn, 2);
 
-    ASSERT_TRUE(page->Insert(txn, "c", 23));
+    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
     txn.PreCommit();
   }
   {
     auto txn = tm_->Begin();
     {
       PageRef page = p_->GetPage(internal_page_id_);
-      ASSERT_TRUE(page->Insert(txn, "b", 20));
-      ASSERT_TRUE(page->Insert(txn, "e", 40));
+      ASSERT_SUCCESS(page->Insert(txn, "b", 20));
+      ASSERT_SUCCESS(page->Insert(txn, "e", 40));
     }
     Flush();
     txn.Abort();
@@ -341,16 +342,16 @@ TEST_F(InternalPageTest, UpdateCrash) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(internal_page_id_);
     page->SetLowestValue(txn, 2);
-    ASSERT_TRUE(page->Insert(txn, "c", 23));
-    ASSERT_TRUE(page->Insert(txn, "b", 20));
-    ASSERT_TRUE(page->Insert(txn, "e", 40));
+    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
+    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
+    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
     txn.PreCommit();
   }
   {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(internal_page_id_);
-    ASSERT_TRUE(page->Update(txn, "b", 200));
-    ASSERT_TRUE(page->Update(txn, "e", 400));
+    ASSERT_SUCCESS(page->Update(txn, "b", 200));
+    ASSERT_SUCCESS(page->Update(txn, "e", 400));
     txn.PreCommit();
     Flush();
   }
@@ -369,17 +370,17 @@ TEST_F(InternalPageTest, UpdateAbort) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(internal_page_id_);
     page->SetLowestValue(txn, 2);
-    ASSERT_TRUE(page->Insert(txn, "c", 23));
-    ASSERT_TRUE(page->Insert(txn, "b", 20));
-    ASSERT_TRUE(page->Insert(txn, "e", 40));
+    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
+    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
+    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
     txn.PreCommit();
   }
   {
     auto txn = tm_->Begin();
     {
       PageRef page = p_->GetPage(internal_page_id_);
-      ASSERT_TRUE(page->Update(txn, "b", 2000));
-      ASSERT_TRUE(page->Update(txn, "e", 4000));
+      ASSERT_SUCCESS(page->Update(txn, "b", 2000));
+      ASSERT_SUCCESS(page->Update(txn, "e", 4000));
     }
     txn.Abort();
   }
@@ -398,17 +399,17 @@ TEST_F(InternalPageTest, DeleteCrash) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(internal_page_id_);
     page->SetLowestValue(txn, 2);
-    ASSERT_TRUE(page->Insert(txn, "b", 20));
-    ASSERT_TRUE(page->Insert(txn, "e", 40));
-    ASSERT_TRUE(page->Insert(txn, "c", 23));
+    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
+    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
+    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
     Flush();
     txn.PreCommit();
   }
   {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(internal_page_id_);
-    ASSERT_TRUE(page->Delete(txn, "b"));
-    ASSERT_TRUE(page->Delete(txn, "e"));
+    ASSERT_SUCCESS(page->Delete(txn, "b"));
+    ASSERT_SUCCESS(page->Delete(txn, "e"));
   }
 
   Recover();  // Expect redo happen.
@@ -425,17 +426,17 @@ TEST_F(InternalPageTest, DeleteAbort) {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(internal_page_id_);
     page->SetLowestValue(txn, 2);
-    ASSERT_TRUE(page->Insert(txn, "b", 20));
-    ASSERT_TRUE(page->Insert(txn, "e", 40));
-    ASSERT_TRUE(page->Insert(txn, "c", 23));
+    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
+    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
+    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
     txn.PreCommit();
   }
   {
     auto txn = tm_->Begin();
     {
       PageRef page = p_->GetPage(internal_page_id_);
-      ASSERT_TRUE(page->Delete(txn, "b"));
-      ASSERT_TRUE(page->Delete(txn, "e"));
+      ASSERT_SUCCESS(page->Delete(txn, "b"));
+      ASSERT_SUCCESS(page->Delete(txn, "e"));
     }
     txn.Abort();
     Flush();

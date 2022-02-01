@@ -30,7 +30,7 @@ add_library(libtinylamb
         recovery/recovery_manager.cpp recovery/checkpoint_manager.cpp
         transaction/transaction_manager.cpp page/page_type.cpp type/column.cpp
         common/serdes.cpp common/log_message.cpp page/page_ref.cpp page/leaf_page.cpp
-        page/internal_page.cpp)
+        page/internal_page.cpp table/b_plus_tree.cpp)
 
 target_include_directories(
         libtinylamb

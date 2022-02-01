@@ -42,15 +42,16 @@ class InternalPage {
 
   void SetLowestValueImpl(page_id_t value) { lowest_page_ = value; }
 
-  bool Insert(page_id_t pid, Transaction& txn, std::string_view key,
-              page_id_t value);
+  Status Insert(page_id_t pid, Transaction& txn, std::string_view key,
+                page_id_t value);
 
-  bool Update(page_id_t pid, Transaction& txn, std::string_view key,
-              page_id_t value);
+  Status Update(page_id_t pid, Transaction& txn, std::string_view key,
+                page_id_t value);
 
-  bool Delete(page_id_t pid, Transaction& txn, std::string_view key);
+  Status Delete(page_id_t pid, Transaction& txn, std::string_view key);
 
-  bool GetPageForKey(Transaction& txn, std::string_view key, page_id_t* result);
+  Status GetPageForKey(Transaction& txn, std::string_view key,
+                       page_id_t* result);
 
   void SplitInto(page_id_t pid, Transaction& txn, Page* right,
                  std::string_view* middle);

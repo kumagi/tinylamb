@@ -44,21 +44,22 @@ std::string_view LeafPage::GetValue(size_t idx) const {
   return ret;
 }
 
-bool LeafPage::Insert(page_id_t page_id, Transaction& txn, std::string_view key,
-                      std::string_view value) {
+Status LeafPage::Insert(page_id_t page_id, Transaction& txn,
+                        std::string_view key, std::string_view value) {
   const bin_size_t physical_size =
       sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + value.size();
 
   size_t pos = Find(key);
-  if (free_size_ < physical_size + sizeof(RowPointer) ||  // No space.
-      (pos != row_count_ && GetKey(pos) == key)) {        // Already exists.
-
-    return false;
+  if (free_size_ < physical_size + sizeof(RowPointer)) {
+    return Status::kNoSpace;
+  }
+  if (pos != row_count_ && GetKey(pos) == key) {  // Already exists.
+    return Status::kDuplicates;
   }
 
   InsertImpl(key, value);
   txn.InsertLeafLog(page_id, key, value);
-  return true;
+  return Status::kSuccess;
 }
 
 void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
@@ -82,20 +83,22 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
   free_ptr_ += SerializeStringView(Payload() + free_ptr_, value);
 }
 
-bool LeafPage::Update(page_id_t page_id, Transaction& txn, std::string_view key,
-                      std::string_view value) {
+Status LeafPage::Update(page_id_t page_id, Transaction& txn,
+                        std::string_view key, std::string_view value) {
   const size_t physical_size =
       sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + value.size();
 
   std::string_view existing_value;
-  if (!Read(txn, key, &existing_value)) return false;
+  if (Read(txn, key, &existing_value) == Status::kNotExists) {
+    return Status::kNotExists;
+  }
 
   const int size_diff = physical_size - existing_value.size();
-  if (free_size_ < size_diff) return false;
+  if (free_size_ < size_diff) return Status::kNoSpace;
 
   txn.UpdateLeafLog(page_id, key, existing_value, value);
   UpdateImpl(key, value);
-  return true;
+  return Status::kSuccess;
 }
 
 void LeafPage::UpdateImpl(std::string_view key, std::string_view redo) {
@@ -113,14 +116,15 @@ void LeafPage::UpdateImpl(std::string_view key, std::string_view redo) {
   free_ptr_ += SerializeStringView(Payload() + free_ptr_, redo);
 }
 
-bool LeafPage::Delete(page_id_t page_id, Transaction& txn,
-                      std::string_view key) {
+Status LeafPage::Delete(page_id_t page_id, Transaction& txn,
+                        std::string_view key) {
   std::string_view existing_value;
-  if (!Read(txn, key, &existing_value)) return false;
+  if (Read(txn, key, &existing_value) == Status::kNotExists)
+    return Status::kNotExists;
 
   txn.DeleteLeafLog(page_id, key, existing_value);
   DeleteImpl(key);
-  return true;
+  return Status::kSuccess;
 }
 
 void LeafPage::DeleteImpl(std::string_view key) {
@@ -131,29 +135,32 @@ void LeafPage::DeleteImpl(std::string_view key) {
   --row_count_;
 }
 
-bool LeafPage::Read(Transaction& txn, std::string_view key,
-                    std::string_view* result = nullptr) {
+Status LeafPage::Read(Transaction& txn, std::string_view key,
+                      std::string_view* result = nullptr) {
   if (result) *result = std::string_view();
   size_t pos = Find(key);
-  bool found = pos < row_count_ && GetKey(pos) == key;
-  if (result && found) *result = GetValue(pos);
-  return found;
+  if (pos < row_count_ && GetKey(pos) == key) {
+    if (result) *result = GetValue(pos);
+    return Status::kSuccess;
+  } else {
+    return Status::kNotExists;
+  }
 }
 
-bool LeafPage::LowestKey(Transaction& txn, std::string_view* result) {
+Status LeafPage::LowestKey(Transaction& txn, std::string_view* result) {
   *result = std::string_view();
-  if (row_count_ == 0) return false;
+  if (row_count_ == 0) return Status::kNotExists;
   RowPointer* rows = Rows();
   *result = GetKey(0);
-  return true;
+  return Status::kSuccess;
 }
 
-bool LeafPage::HighestKey(Transaction& txn, std::string_view* result) {
+Status LeafPage::HighestKey(Transaction& txn, std::string_view* result) {
   *result = std::string_view();
-  if (row_count_ == 0) return false;
+  if (row_count_ == 0) return Status::kNotExists;
   RowPointer* rows = Rows();
   *result = GetKey(row_count_ - 1);
-  return true;
+  return Status::kSuccess;
 }
 
 size_t LeafPage::RowCount() const { return row_count_; }

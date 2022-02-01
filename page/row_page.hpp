@@ -39,16 +39,16 @@ class RowPage {
     // memset(data_, 0, kBodySize);
   }
 
-  bool Read(page_id_t page_id, Transaction& txn, slot_t slot,
-            std::string_view* dst) const;
+  Status Read(page_id_t page_id, Transaction& txn, slot_t slot,
+              std::string_view* dst) const;
 
-  bool Insert(page_id_t page_id, Transaction& txn, std::string_view record,
-              slot_t* dst);
+  Status Insert(page_id_t page_id, Transaction& txn, std::string_view record,
+                slot_t* dst);
 
-  bool Update(page_id_t page_id, Transaction& txn, slot_t slot,
-              std::string_view record);
+  Status Update(page_id_t page_id, Transaction& txn, slot_t slot,
+                std::string_view record);
 
-  bool Delete(page_id_t page_id, Transaction& txn, slot_t slot);
+  Status Delete(page_id_t page_id, Transaction& txn, slot_t slot);
 
   [[nodiscard]] size_t RowCount() const;
 

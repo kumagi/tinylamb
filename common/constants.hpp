@@ -22,7 +22,9 @@ enum class Status : uint8_t {
   kSuccess,
   kNoSpace,
   kConflicts,
+  kDuplicates,
   kUnknownType,
+  kNotExists,
   kNotImplemented,
 };
 
@@ -43,10 +45,14 @@ inline std::string_view ToString(Status s) {
       return "Success";
     case Status::kNoSpace:
       return "NoSpace";
+    case Status::kDuplicates:
+      return "Duplicates";
     case Status::kConflicts:
       return "Conflicts";
     case Status::kUnknownType:
       return "UnknownType";
+    case Status::kNotExists:
+      return "NotExists";
     case Status::kNotImplemented:
       return "NotImplemented";
     default:

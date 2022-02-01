@@ -5,15 +5,15 @@
 
 namespace tinylamb {
 
-bool RowPage::Read(page_id_t page_id, Transaction& txn, slot_t slot,
-                   std::string_view* dst) const {
-  if (!txn.AddReadSet(
-          RowPosition(page_id, slot)) ||  // Failed by read conflict.
-      row_count_ <= slot) {               // Specified slot is out of array.
-    return false;
+Status RowPage::Read(page_id_t page_id, Transaction& txn, slot_t slot,
+                     std::string_view* dst) const {
+  if (!txn.AddReadSet(RowPosition(page_id, slot))) {
+    return Status::kConflicts;
   }
+  if (row_count_ <= slot) return Status::kNotExists;
+
   *dst = GetRow(slot);
-  return true;
+  return Status::kSuccess;
 }
 
 /*
@@ -32,12 +32,9 @@ bool RowPage::Read(page_id_t page_id, Transaction& txn, slot_t slot,
  * +-------------------------------+
  *                        ^ PosX == free_ptr_
  */
-bool RowPage::Insert(page_id_t page_id, Transaction& txn,
-                     std::string_view record, slot_t* dst) {
-  if (free_size_ + sizeof(RowPointer) < record.size()) {
-    // There is no enough space.
-    return false;
-  }
+Status RowPage::Insert(page_id_t page_id, Transaction& txn,
+                       std::string_view record, slot_t* dst) {
+  if (free_size_ + sizeof(RowPointer) < record.size()) return Status::kNoSpace;
   if (Payload() + free_ptr_ <=
       reinterpret_cast<char*>(&data_[row_count_ + 1]) + record.size()) {
     DeFragment();
@@ -46,13 +43,11 @@ bool RowPage::Insert(page_id_t page_id, Transaction& txn,
          Payload() + free_ptr_);
   *dst = row_count_;
   const RowPosition pos(page_id, *dst);
-  if (!txn.AddWriteSet(pos)) {
-    // Lock conflict.
-    return false;
-  }
+  if (!txn.AddWriteSet(pos)) return Status::kConflicts;
+
   InsertRow(record);
   txn.InsertLog(page_id, *dst, record);
-  return true;
+  return Status::kSuccess;
 }
 
 slot_t RowPage::InsertRow(std::string_view new_row) {
@@ -65,23 +60,19 @@ slot_t RowPage::InsertRow(std::string_view new_row) {
   return row_count_++;
 }
 
-bool RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
-                     std::string_view record) {
+Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
+                       std::string_view record) {
   assert(slot <= row_count_);
   std::string_view prev_row = GetRow(slot);
   if (prev_row.size() < record.size() &&
       free_size_ < record.size() - prev_row.size()) {
-    // No enough space in this page.
-    return false;
+    return Status::kNoSpace;
   }
   RowPosition pos(page_id, slot);
-  if (!txn.AddWriteSet(pos)) {
-    // Write lock conflict.
-    return false;
-  }
+  if (!txn.AddWriteSet(pos)) return Status::kConflicts;
   txn.UpdateLog(page_id, slot, prev_row, record);
   UpdateRow(pos.slot, record);
-  return true;
+  return Status::kSuccess;
 }
 
 void RowPage::UpdateRow(slot_t slot, std::string_view record) {
@@ -104,11 +95,14 @@ void RowPage::UpdateRow(slot_t slot, std::string_view record) {
   memcpy(Payload() + data_[slot].offset, record.data(), record.size());
 }
 
-bool RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
+Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
   assert(slot <= row_count_);
+  std::string_view prev_row = GetRow(slot);
+  RowPosition pos(page_id, slot);
+  if (!txn.AddWriteSet(pos)) return Status::kConflicts;
   txn.DeleteLog(page_id, slot, GetRow(slot));
   DeleteRow(slot);
-  return true;
+  return Status::kSuccess;
 }
 
 void RowPage::DeleteRow(slot_t slot) {
