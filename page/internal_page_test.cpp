@@ -1,7 +1,6 @@
 //
 // Created by kumagi on 2022/01/26.
 //
-
 #include <memory>
 #include <string>
 

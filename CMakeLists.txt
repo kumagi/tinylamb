@@ -71,6 +71,7 @@ function(add_simple_test file_path)
 endfunction()
 
 #add_simple_test(page/catalog_page_test.cpp)
+add_simple_test(table/b_plus_tree_test.cpp)
 add_simple_test(page/leaf_page_test.cpp)
 add_simple_test(page/internal_page_test.cpp)
 add_simple_test(page/page_pool_test.cpp)

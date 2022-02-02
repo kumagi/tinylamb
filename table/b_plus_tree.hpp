@@ -24,12 +24,19 @@ class BPlusTree {
   PageRef FindLeafForInsert(Transaction& txn, std::string_view key,
                             PageRef&& page, std::vector<PageRef>& parents);
 
+  PageRef FindLeaf(Transaction& txn, std::string_view key, PageRef&& root);
+
  public:
   BPlusTree(page_id_t root, PageManager* pm);
-  bool Insert(Transaction& txn, std::string_view key, std::string_view value);
-  bool Update(Transaction& txn, std::string_view key, std::string_view value);
-  bool Delete(Transaction& txn, std::string_view key);
-  bool Read(Transaction& txn, std::string_view key, std::string_view* dst);
+  Status Insert(Transaction& txn, std::string_view key, std::string_view value);
+  Status Update(Transaction& txn, std::string_view key, std::string_view value);
+  Status Delete(Transaction& txn, std::string_view key);
+  Status Read(Transaction& txn, std::string_view key, std::string_view* dst);
+  void Dump(Transaction& txn, std::ostream& o, int indent = 0) const;
+
+ private:
+  void DumpInternal(Transaction& txn, std::ostream& o, PageRef&& page,
+                    int indent = 0) const;
 
  private:
   page_id_t root_;

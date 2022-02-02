@@ -45,7 +45,12 @@ class LeafPage {
   Status Update(page_id_t page_id, Transaction& txn, std::string_view key,
                 std::string_view value);
   Status Delete(page_id_t page_id, Transaction& txn, std::string_view key);
-  Status Read(Transaction& txn, std::string_view key, std::string_view* result);
+  Status Read(page_id_t pid, Transaction& txn, slot_t slot,
+              std::string_view* result) const;
+  Status ReadKey(page_id_t pid, Transaction& txn, slot_t slot,
+                 std::string_view* result) const;
+  Status Read(page_id_t pid, Transaction& txn, std::string_view key,
+              std::string_view* result) const;
 
   [[nodiscard]] std::string_view GetKey(size_t idx) const;
   [[nodiscard]] std::string_view GetValue(size_t idx) const;

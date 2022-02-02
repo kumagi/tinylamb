@@ -89,7 +89,7 @@ Status LeafPage::Update(page_id_t page_id, Transaction& txn,
       sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + value.size();
 
   std::string_view existing_value;
-  if (Read(txn, key, &existing_value) == Status::kNotExists) {
+  if (Read(page_id, txn, key, &existing_value) == Status::kNotExists) {
     return Status::kNotExists;
   }
 
@@ -119,7 +119,7 @@ void LeafPage::UpdateImpl(std::string_view key, std::string_view redo) {
 Status LeafPage::Delete(page_id_t page_id, Transaction& txn,
                         std::string_view key) {
   std::string_view existing_value;
-  if (Read(txn, key, &existing_value) == Status::kNotExists)
+  if (Read(page_id, txn, key, &existing_value) == Status::kNotExists)
     return Status::kNotExists;
 
   txn.DeleteLeafLog(page_id, key, existing_value);
@@ -134,9 +134,22 @@ void LeafPage::DeleteImpl(std::string_view key) {
   memmove(rows + 1, rows, sizeof(RowPointer) * pos);
   --row_count_;
 }
+Status LeafPage::Read(page_id_t pid, Transaction& txn, slot_t slot,
+                      std::string_view* result) const {
+  if (row_count_ <= slot) return Status::kNotExists;
+  *result = GetValue(slot);
+  return Status::kSuccess;
+}
 
-Status LeafPage::Read(Transaction& txn, std::string_view key,
-                      std::string_view* result = nullptr) {
+Status LeafPage::ReadKey(page_id_t page_id, Transaction& txn, slot_t slot,
+                         std::string_view* result) const {
+  if (row_count_ <= slot) return Status::kNotExists;
+  *result = GetKey(slot);
+  return Status::kSuccess;
+}
+
+Status LeafPage::Read(page_id_t pid, Transaction& txn, std::string_view key,
+                      std::string_view* result = nullptr) const {
   if (result) *result = std::string_view();
   size_t pos = Find(key);
   if (pos < row_count_ && GetKey(pos) == key) {
@@ -170,7 +183,7 @@ void LeafPage::Split(page_id_t pid, Transaction& txn, Page* target) {
   for (size_t i = row_count_ / 2; i < row_count_; ++i) {
     target->Insert(txn, GetKey(i), GetValue(i));
   }
-  for (size_t i = row_count_ / 2; i < row_count_; ++i) {
+  for (size_t i = row_count_ / 2; i < row_count_;) {
     Delete(pid, txn, GetKey(i));
   }
 }

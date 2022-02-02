@@ -28,7 +28,6 @@ Logger::~Logger() {
 
 lsn_t Logger::AddLog(const LogRecord& log) {
   std::string data = log.Serialize();
-  // LOG(TRACE) << "logging: " << log;
   std::scoped_lock lk(latch_);
 
   size_t memory_offset = written_lsn_ % buffer_.size();
@@ -69,22 +68,24 @@ void Logger::LoggerWork() {
     const size_t written_offset = written_lsn_ % buffer_.size();
     const size_t committed_offset = committed_lsn_ % buffer_.size();
 
-    size_t flushed_bytes = 0;
-    if (committed_lsn_ < written_lsn_) {
+    ssize_t flushed_bytes = 0;
+    if (committed_offset < written_offset) {
       flushed_bytes += write(dst_, buffer_.data() + committed_offset,
                              written_offset - committed_offset);
+      if (flushed_bytes <= 0) continue;
     } else {
       // In case of buffer is wrap around.
       flushed_bytes += write(dst_, buffer_.data() + committed_offset,
                              buffer_.size() - committed_offset);
-      if (flushed_bytes == buffer_.size() - committed_offset &&
-          0 < flushed_bytes) {
-        flushed_bytes += write(dst_, buffer_.data(), written_offset);
+      if (flushed_bytes <= 0) continue;
+      if (flushed_bytes == buffer_.size() - committed_offset) {
+        ssize_t extra_wrote = write(dst_, buffer_.data(), written_offset);
+        if (0 < extra_wrote) flushed_bytes += extra_wrote;
       }
     }
 
-    committed_lsn_ += flushed_bytes;
     fsync(dst_);
+    committed_lsn_ += flushed_bytes;
   }
 }
 

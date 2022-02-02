@@ -148,8 +148,6 @@ void PagePool::ReadFrom(Page* target, page_id_t pid) {
 
   // RecLSN = MAX means a clean page.
   target->recovery_lsn = std::numeric_limits<lsn_t>::max();
-  LOG(WARN) << "Page: " << target->PageID()
-            << " PageLSN: " << target->PageLSN();
 }
 
 }  // namespace tinylamb

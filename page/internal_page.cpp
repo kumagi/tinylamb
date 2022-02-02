@@ -20,6 +20,8 @@ const InternalPage::RowPointer* InternalPage::Rows() const {
                                              row_count_ * sizeof(RowPointer));
 }
 
+size_t InternalPage::RowCount() const { return row_count_; }
+
 void InternalPage::SetLowestValue(page_id_t pid, Transaction& txn,
                                   page_id_t value) {
   SetLowestValueImpl(value);
@@ -97,7 +99,7 @@ void InternalPage::DeleteImpl(std::string_view key) {
 }
 
 Status InternalPage::GetPageForKey(Transaction& txn, std::string_view key,
-                                   page_id_t* result) {
+                                   page_id_t* result) const {
   if (row_count_ == 0) return Status::kNotExists;
   if (key < GetKey(0)) {
     *result = lowest_page_;
@@ -105,6 +107,11 @@ Status InternalPage::GetPageForKey(Transaction& txn, std::string_view key,
   }
   bin_size_t slot = Search(key);
   *result = GetValue(slot);
+  return Status::kSuccess;
+}
+
+Status InternalPage::LowestPage(Transaction& txn, page_id_t* result) {
+  *result = lowest_page_;
   return Status::kSuccess;
 }
 
@@ -119,6 +126,7 @@ void InternalPage::SplitInto(page_id_t pid, Transaction& txn, Page* right,
     right->Insert(txn, GetKey(i), GetValue(i));
   }
   for (int i = mid; i < original_row_count; ++i) {
+    LOG(ERROR) << "out: " << GetKey(mid);
     txn.DeleteInternalLog(pid, GetKey(mid), GetValue(mid));
     DeleteImpl(GetKey(mid));
   }

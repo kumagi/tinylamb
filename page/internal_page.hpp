@@ -37,6 +37,7 @@ class InternalPage {
     free_ptr_ = sizeof(InternalPage);
     free_size_ = kPageBodySize - sizeof(InternalPage);
   }
+  size_t RowCount() const;
 
   void SetLowestValue(page_id_t pid, Transaction& txn, page_id_t value);
 
@@ -51,7 +52,9 @@ class InternalPage {
   Status Delete(page_id_t pid, Transaction& txn, std::string_view key);
 
   Status GetPageForKey(Transaction& txn, std::string_view key,
-                       page_id_t* result);
+                       page_id_t* result) const;
+
+  Status LowestPage(Transaction& txn, page_id_t* result);
 
   void SplitInto(page_id_t pid, Transaction& txn, Page* right,
                  std::string_view* middle);

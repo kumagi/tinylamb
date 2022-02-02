@@ -33,9 +33,11 @@ class Page {
                           PageType new_page_type);
   void DestroyPage(Transaction& txn, Page* target, PagePool& pool);
 
+  size_t RowCount(Transaction& txn) const;
+
   // Row page manipulations.
-  Status Read(Transaction& txn, const uint16& slot,
-              std::string_view* result) const;
+  Status Read(Transaction& txn, uint16 slot, std::string_view* result) const;
+  Status Read(Transaction& txn, std::string_view key, page_id_t* result) const;
 
   Status Insert(Transaction& txn, std::string_view record, slot_t* slot);
 
@@ -44,6 +46,12 @@ class Page {
   Status Delete(Transaction& txn, slot_t pos);
 
   [[nodiscard]] size_t RowCount() const;
+
+  Status ReadKey(Transaction& txn, const uint16& slot,
+                 std::string_view* result) const;
+
+  std::string_view GetKey(slot_t slot) const;
+  page_id_t GetPage(slot_t slot) const;
 
   // Leaf page manipulations.
   Status Insert(Transaction& txn, std::string_view key, std::string_view value);
@@ -57,9 +65,11 @@ class Page {
   // Internal page manipulations.
   Status Insert(Transaction& txn, std::string_view key, page_id_t pid);
   Status Update(Transaction& txn, std::string_view key, page_id_t pid);
-  Status GetPageForKey(Transaction& txn, std::string_view key, page_id_t* page);
+  Status GetPageForKey(Transaction& txn, std::string_view key,
+                       page_id_t* page) const;
   void SetLowestValue(Transaction& txn, page_id_t i);
   void SplitInto(Transaction& txn, Page* right, std::string_view* middle);
+  Status LowestPage(Transaction& txn, page_id_t* page);
 
   // Internal methods exposed for recovery.
   void InsertImpl(std::string_view redo);

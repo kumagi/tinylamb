@@ -62,10 +62,48 @@ void Page::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
   SetRecLSN(txn.PrevLSN());
 }
 
-Status Page::Read(Transaction& txn, const uint16& slot,
+size_t Page::RowCount(Transaction& txn) const {
+  if (type == PageType::kRowPage) {
+    return body.row_page.RowCount();
+  }
+  if (type == PageType::kLeafPage) {
+    return body.leaf_page.RowCount();
+  } else if (type == PageType::kInternalPage) {
+    return body.internal_page.RowCount();
+  } else {
+    throw std::runtime_error("invalid page type");
+  }
+}
+
+Status Page::Read(Transaction& txn, uint16 slot,
                   std::string_view* result) const {
-  ASSERT_PAGE_TYPE(PageType::kRowPage)
-  return body.row_page.Read(PageID(), txn, slot, result);
+  if (type == PageType::kRowPage) {
+    return body.row_page.Read(PageID(), txn, slot, result);
+  }
+  if (type == PageType::kLeafPage) {
+    return body.leaf_page.Read(PageID(), txn, slot, result);
+  } else {
+    throw std::runtime_error("invalid page type");
+  }
+}
+
+Status Page::Read(Transaction& txn, std::string_view key,
+                  page_id_t* result) const {
+  ASSERT_PAGE_TYPE(PageType::kInternalPage)
+  return body.internal_page.GetPageForKey(txn, key, result);
+}
+
+std::string_view Page::GetKey(slot_t slot) const {
+  if (type == PageType::kLeafPage) {
+    return body.leaf_page.GetKey(slot);
+  } else {
+    return body.internal_page.GetKey(slot);
+  }
+}
+
+page_id_t Page::GetPage(slot_t slot) const {
+  ASSERT_PAGE_TYPE(PageType::kInternalPage)
+  return body.internal_page.GetValue(slot);
 }
 
 Status Page::Insert(Transaction& txn, std::string_view record, slot_t* slot) {
@@ -104,8 +142,26 @@ size_t Page::RowCount() const {
       return body.row_page.RowCount();
     case PageType::kLeafPage:
       return body.leaf_page.RowCount();
+    case PageType::kInternalPage:
+      return body.internal_page.RowCount();
     default:
       throw std::runtime_error("RowCount is not implemented");
+  }
+}
+
+Status Page::ReadKey(Transaction& txn, const uint16& slot,
+                     std::string_view* result) const {
+  switch (type) {
+    case PageType::kRowPage:
+      *result = "RowTableKey";
+      return Status::kSuccess;
+    case PageType::kLeafPage:
+      return body.leaf_page.ReadKey(PageID(), txn, slot, result);
+    case PageType::kInternalPage:
+      *result = body.internal_page.GetKey(slot);
+      return Status::kSuccess;
+    default:
+      throw std::runtime_error("ReadKey is not implemented");
   }
 }
 
@@ -154,7 +210,7 @@ Status Page::Delete(Transaction& txn, std::string_view key) {
 Status Page::Read(Transaction& txn, std::string_view key,
                   std::string_view* result) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  return body.leaf_page.Read(txn, key, result);
+  return body.leaf_page.Read(PageID(), txn, key, result);
 }
 
 Status Page::LowestKey(Transaction& txn, std::string_view* result) {
@@ -193,14 +249,9 @@ Status Page::Update(Transaction& txn, std::string_view key, page_id_t pid) {
 }
 
 Status Page::GetPageForKey(Transaction& txn, std::string_view key,
-                           page_id_t* page) {
+                           page_id_t* page) const {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  Status result = body.internal_page.GetPageForKey(txn, key, page);
-  if (result == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
-  }
-  return result;
+  return body.internal_page.GetPageForKey(txn, key, page);
 }
 
 void Page::SetLowestValue(Transaction& txn, page_id_t v) {
@@ -213,6 +264,11 @@ void Page::SetLowestValue(Transaction& txn, page_id_t v) {
 void Page::SplitInto(Transaction& txn, Page* right, std::string_view* middle) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
   body.internal_page.SplitInto(PageID(), txn, right, middle);
+}
+
+Status Page::LowestPage(Transaction& txn, page_id_t* page) {
+  ASSERT_PAGE_TYPE(PageType::kInternalPage)
+  return body.internal_page.LowestPage(txn, page);
 }
 
 void Page::SetChecksum() const { checksum = std::hash<Page>()(*this); }
