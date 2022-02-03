@@ -44,6 +44,14 @@ Status InternalPage::Insert(page_id_t pid, Transaction& txn,
 
 void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
   const bin_size_t offset = free_ptr_;
+  const bin_size_t physical_size =
+      sizeof(bin_size_t) + key.size() + sizeof(page_id_t);
+  free_size_ -= physical_size + sizeof(RowPointer);
+
+  if (kPageSize - sizeof(RowPointer) * (row_count_ + 1) <
+      free_ptr_ + physical_size) {
+    DeFragment();
+  }
   free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
   free_ptr_ += SerializePID(Payload() + free_ptr_, pid);
   bin_size_t insert = SearchToInsert(key);
@@ -119,14 +127,13 @@ void InternalPage::SplitInto(page_id_t pid, Transaction& txn, Page* right,
                              std::string_view* middle) {
   const int original_row_count = row_count_;
   int mid = row_count_ / 2;
-  assert(1 < mid);
+  assert(0 < mid);
   *middle = GetKey(mid);
   right->SetLowestValue(txn, GetValue(mid));
   for (int i = mid + 1; i < row_count_; ++i) {
     right->Insert(txn, GetKey(i), GetValue(i));
   }
   for (int i = mid; i < original_row_count; ++i) {
-    LOG(ERROR) << "out: " << GetKey(mid);
     txn.DeleteInternalLog(pid, GetKey(mid), GetValue(mid));
     DeleteImpl(GetKey(mid));
   }
@@ -198,6 +205,22 @@ void InternalPage::Dump(std::ostream& o, int indent) const {
       << Indent(indent) << GetKey(i) << "\n"
       << Indent(indent + 2) << GetValue(i);
   }
+}
+
+void InternalPage::DeFragment() {
+  std::vector<std::string> payloads;
+  payloads.reserve(row_count_);
+  RowPointer* rows = Rows();
+  for (size_t i = 0; i < row_count_; ++i) {
+    payloads.emplace_back(Payload() + rows[i].offset, rows[i].size);
+  }
+  bin_size_t offset = sizeof(LeafPage);
+  for (size_t i = 0; i < row_count_; ++i) {
+    rows[i].offset = offset;
+    memcpy(Payload() + offset, payloads[i].data(), payloads[i].size());
+    offset += payloads[i].size();
+  }
+  free_ptr_ = offset;
 }
 
 }  // namespace tinylamb

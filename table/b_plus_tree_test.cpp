@@ -96,4 +96,21 @@ TEST_F(BPlusTreeTest, SplitLeaf) {
   bpt_->Dump(txn, std::cout);
 }
 
+std::string KeyGen(int num, int width) {
+  std::stringstream ss;
+  ss << std::setw(width) << std::setfill('0') << num;
+  return ss.str();
+}
+
+TEST_F(BPlusTreeTest, SplitInternal) {
+  bpt_ = std::make_unique<BPlusTree>(root_page_id_, p_.get());
+  auto txn = tm_->Begin();
+  std::string key_prefix("key");
+  std::string long_value(200, 'v');
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 7000), long_value));
+  }
+  bpt_->Dump(txn, std::cout);
+}
+
 }  // namespace tinylamb

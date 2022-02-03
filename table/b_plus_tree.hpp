@@ -25,6 +25,8 @@ class BPlusTree {
                             PageRef&& page, std::vector<PageRef>& parents);
 
   PageRef FindLeaf(Transaction& txn, std::string_view key, PageRef&& root);
+  Status InsertInternal(Transaction& txn, std::string_view key, page_id_t left,
+                        page_id_t right, std::vector<PageRef>& parents);
 
  public:
   BPlusTree(page_id_t root, PageManager* pm);

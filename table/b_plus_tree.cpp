@@ -39,6 +39,37 @@ PageRef BPlusTree::FindLeaf(Transaction& txn, std::string_view key,
   return FindLeaf(txn, key, std::move(next_ref));
 }
 
+Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
+                                 page_id_t left, page_id_t right,
+                                 std::vector<PageRef>& parents) {
+  if (parents.empty()) {
+    PageRef new_parent = pm_->AllocateNewPage(txn, PageType::kInternalPage);
+    new_parent->SetLowestValue(txn, left);
+    new_parent->Insert(txn, key, right);
+    root_ = new_parent->PageID();
+    return Status::kSuccess;
+  } else {
+    PageRef internal(std::move(parents.back()));
+    parents.pop_back();
+    Status result = internal->Insert(txn, key, right);
+    if (result == Status::kSuccess) return Status::kSuccess;
+    if (result == Status::kNoSpace) {
+      PageRef new_node = pm_->AllocateNewPage(txn, PageType::kInternalPage);
+      std::string_view new_key;
+      internal->SplitInto(txn, new_node.get(), &new_key);
+      Status ret;
+      if (key < new_key) {
+        ret = internal->Insert(txn, key, right);
+      } else {
+        ret = new_node->Insert(txn, key, right);
+      }
+      return InsertInternal(txn, new_key, internal->PageID(),
+                            new_node->PageID(), parents);
+    }
+    throw std::runtime_error("unknown status:" + std::string(ToString(result)));
+  }
+}
+
 Status BPlusTree::Insert(Transaction& txn, std::string_view key,
                          std::string_view value) {
   std::vector<PageRef> parents;
@@ -53,18 +84,15 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
     target->Split(txn, new_page.get());
     std::string_view middle_key;
     new_page->LowestKey(txn, &middle_key);
-    if (parents.empty()) {
-      PageRef new_parent = pm_->AllocateNewPage(txn, PageType::kInternalPage);
-      new_parent->SetLowestValue(txn, target->page_id);
-      new_parent->Insert(txn, middle_key, new_page->page_id);
-      root_ = new_parent->PageID();
+    if (key < middle_key) {
+      target->Insert(txn, key, value);
     } else {
-      parents.back()->Insert(txn, middle_key, new_page->PageID());
+      new_page->Insert(txn, key, value);
     }
-    return Status::kSuccess;
-  } else {
-    return Status::kUnknown;
+    return InsertInternal(txn, middle_key, target->PageID(), new_page->PageID(),
+                          parents);
   }
+  throw std::runtime_error("unknown insert status");
 }
 
 Status BPlusTree::Update(Transaction& txn, std::string_view key,
@@ -81,6 +109,19 @@ Status BPlusTree::Read(Transaction& txn, std::string_view key,
 }
 
 namespace {
+
+std::string OmittedString(std::string_view original, int length) {
+  if (length < original.length()) {
+    std::string omitted_key = std::string(original).substr(0, 8);
+    omitted_key +=
+        "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
+    omitted_key += original.substr(original.length() - 8);
+    return omitted_key;
+  } else {
+    return std::string(original);
+  }
+}
+
 void DumpLeafPage(Transaction& txn, PageRef&& page, std::ostream& o,
                   int indent) {
   for (int i = 0; i < page->RowCount(); ++i) {
@@ -89,14 +130,7 @@ void DumpLeafPage(Transaction& txn, PageRef&& page, std::ostream& o,
     page->ReadKey(txn, i, &key);
     std::string_view value;
     page->Read(txn, i, &value);
-    if (20 < value.length()) {
-      std::string omitted_value = std::string(value).substr(0, 8);
-      omitted_value += "..(" + std::to_string(value.length() - 16) + "bytes)..";
-      omitted_value += value.substr(value.length() - 8);
-      o << key << ": " << omitted_value << "\n";
-    } else {
-      o << key << ": " << value << "\n";
-    }
+    o << OmittedString(key, 20) << ": " << OmittedString(value, 20) << "\n";
   }
 }
 }  // namespace
@@ -114,7 +148,7 @@ void BPlusTree::DumpInternal(Transaction& txn, std::ostream& o, PageRef&& page,
     for (int i = 0; i < page->RowCount(); ++i) {
       std::string_view key;
       page->ReadKey(txn, i, &key);
-      o << Indent(indent) << key << "\n";
+      o << Indent(indent) << OmittedString(key, 20) << "\n";
       page_id_t pid;
       if (page->Read(txn, key, &pid) == Status::kSuccess) {
         DumpInternal(txn, o, pm_->GetPage(pid), indent + 2);
