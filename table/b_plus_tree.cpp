@@ -57,11 +57,10 @@ Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
       PageRef new_node = pm_->AllocateNewPage(txn, PageType::kInternalPage);
       std::string_view new_key;
       internal->SplitInto(txn, new_node.get(), &new_key);
-      Status ret;
       if (key < new_key) {
-        ret = internal->Insert(txn, key, right);
+        internal->Insert(txn, key, right);
       } else {
-        ret = new_node->Insert(txn, key, right);
+        new_node->Insert(txn, key, right);
       }
       return InsertInternal(txn, new_key, internal->PageID(),
                             new_node->PageID(), parents);
@@ -97,15 +96,19 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
 
 Status BPlusTree::Update(Transaction& txn, std::string_view key,
                          std::string_view value) {
-  return Status::kSuccess;
+  PageRef leaf = FindLeaf(txn, key, pm_->GetPage(root_));
+  return leaf->Update(txn, key, value);
 }
 Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
-  return Status::kSuccess;
+  PageRef leaf = FindLeaf(txn, key, pm_->GetPage(root_));
+  // TODO(kumagi): We need to merge the leaf and delete the entire node.
+  return leaf->Delete(txn, key);
 }
 Status BPlusTree::Read(Transaction& txn, std::string_view key,
                        std::string_view* dst) {
   *dst = "";
-  return Status::kSuccess;
+  PageRef leaf = FindLeaf(txn, key, pm_->GetPage(root_));
+  return leaf->Read(txn, key, dst);
 }
 
 namespace {

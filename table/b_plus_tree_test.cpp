@@ -93,7 +93,6 @@ TEST_F(BPlusTreeTest, SplitLeaf) {
     ASSERT_SUCCESS(
         bpt_->Insert(txn, key_prefix + std::to_string(i), long_value));
   }
-  bpt_->Dump(txn, std::cout);
 }
 
 std::string KeyGen(int num, int width) {
@@ -106,11 +105,98 @@ TEST_F(BPlusTreeTest, SplitInternal) {
   bpt_ = std::make_unique<BPlusTree>(root_page_id_, p_.get());
   auto txn = tm_->Begin();
   std::string key_prefix("key");
-  std::string long_value(200, 'v');
-  for (int i = 0; i < 200; ++i) {
-    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 7000), long_value));
+  std::string long_value(2000, 'v');
+  for (int i = 0; i < 50; ++i) {
+    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), long_value));
   }
-  bpt_->Dump(txn, std::cout);
+}
+
+TEST_F(BPlusTreeTest, Search) {
+  bpt_ = std::make_unique<BPlusTree>(root_page_id_, p_.get());
+  {
+    auto txn = tm_->Begin();
+    std::string key_prefix("key");
+    for (int i = 0; i < 50; ++i) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), KeyGen(i * 10, 1000)));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    std::string long_value(2000, 'v');
+    std::string_view val;
+    for (int i = 0; i < 50; ++i) {
+      ASSERT_SUCCESS(bpt_->Read(txn, KeyGen(i, 10000), &val));
+      ASSERT_EQ(val, KeyGen(i * 10, 1000));
+    }
+  }
+}
+
+TEST_F(BPlusTreeTest, Update) {
+  bpt_ = std::make_unique<BPlusTree>(root_page_id_, p_.get());
+  {
+    auto txn = tm_->Begin();
+    std::string key_prefix("key");
+    for (int i = 0; i < 50; ++i) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), KeyGen(i * 10, 1000)));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    std::string long_value(2000, 'v');
+    for (int i = 0; i < 50; i += 2) {
+      ASSERT_SUCCESS(bpt_->Update(txn, KeyGen(i, 10000), KeyGen(i * 2, 100)));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    std::string long_value(2000, 'v');
+    std::string_view val;
+    for (int i = 0; i < 50; ++i) {
+      ASSERT_SUCCESS(bpt_->Read(txn, KeyGen(i, 10000), &val));
+      if (i % 2 == 0) {
+        ASSERT_EQ(val, KeyGen(i * 2, 100));
+      } else {
+        ASSERT_EQ(val, KeyGen(i * 10, 1000));
+      }
+    }
+  }
+}
+
+TEST_F(BPlusTreeTest, Delete) {
+  bpt_ = std::make_unique<BPlusTree>(root_page_id_, p_.get());
+  {
+    auto txn = tm_->Begin();
+    std::string key_prefix("key");
+    for (int i = 0; i < 50; ++i) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), KeyGen(i * 10, 1000)));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    std::string long_value(2000, 'v');
+    for (int i = 0; i < 50; i += 2) {
+      ASSERT_SUCCESS(bpt_->Delete(txn, KeyGen(i, 10000)));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    std::string long_value(2000, 'v');
+    std::string_view val;
+    for (int i = 0; i < 50; ++i) {
+      if (i % 2 == 0) {
+        ASSERT_FAIL(bpt_->Read(txn, KeyGen(i, 10000), &val));
+        ASSERT_EQ(val, "");
+      } else {
+        ASSERT_SUCCESS(bpt_->Read(txn, KeyGen(i, 10000), &val));
+        ASSERT_EQ(val, KeyGen(i * 10, 1000));
+      }
+    }
+  }
 }
 
 }  // namespace tinylamb

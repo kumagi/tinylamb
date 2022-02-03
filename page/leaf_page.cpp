@@ -186,6 +186,9 @@ void LeafPage::Split(page_id_t pid, Transaction& txn, Page* target) {
   for (size_t i = row_count_ / 2; i < row_count_;) {
     Delete(pid, txn, GetKey(i));
   }
+  target->body.leaf_page.next_pid_ = next_pid_;
+  target->body.leaf_page.prev_pid_ = pid;
+  next_pid_ = target->PageID();
 }
 
 void LeafPage::DeFragment() {
