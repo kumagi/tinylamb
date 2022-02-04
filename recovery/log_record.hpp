@@ -140,75 +140,7 @@ struct LogRecord {
 
   void DumpPosition(std::ostream& o) const;
 
-  friend std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
-    o << l.type;
-    switch (l.type) {
-      case LogType::kUnknown:
-        LOG(ERROR) << "kUnknownLog";
-        break;
-      case LogType::kCompensateUpdateRow:
-      case LogType::kCompensateDeleteRow:
-      case LogType::kInsertRow:
-      case LogType::kInsertLeaf:
-        l.DumpPosition(o);
-        o << "\t\tRedo: " << l.redo_data.size() << " bytes ";
-        break;
-      case LogType::kUpdateRow:
-        l.DumpPosition(o);
-        o << "\t\t" << l.undo_data.size() << " -> " << l.redo_data.size()
-          << "bytes ";
-        break;
-      case LogType::kDeleteRow:
-        l.DumpPosition(o);
-        o << "\t\t" << l.undo_data.size() << " bytes ";
-        break;
-      case LogType::kCompensateInsertRow:
-        l.DumpPosition(o);
-        break;
-      case LogType::kBegin:
-      case LogType::kCommit:
-      case LogType::kSystemAllocPage:
-      case LogType::kSystemDestroyPage:
-        break;
-      case LogType::kBeginCheckpoint:
-        return o;
-      case LogType::kEndCheckpoint:
-        o << "\tdpt: {";
-        for (const auto& dpt : l.dirty_page_table) {
-          o << dpt.first << ": " << dpt.second << ", ";
-        }
-        o << "}\ttt: {";
-        for (const auto& tt : l.active_transaction_table) {
-          o << tt << ", ";
-        }
-        o << "}";
-        return o;
-      case LogType::kInsertInternal:
-        l.DumpPosition(o);
-        o << "\t\t"
-          << "Insert: " << l.key << " -> " << l.redo_page << " ";
-        break;
-      case LogType::kUpdateLeaf:
-      case LogType::kDeleteLeaf:
-      case LogType::kCompensateInsertLeaf:
-      case LogType::kCompensateUpdateLeaf:
-      case LogType::kCompensateDeleteLeaf:
-      case LogType::kUpdateInternal:
-      case LogType::kDeleteInternal:
-      case LogType::kCompensateInsertInternal:
-      case LogType::kCompensateUpdateInternal:
-      case LogType::kCompensateDeleteInternal:
-        o << "\t";
-        l.DumpPosition(o);
-        break;
-      case LogType::kLowestValue:
-        o << "\t"
-          << "Lowest: " << l.redo_page;
-        break;
-    }
-    o << "\tprev_lsn: " << l.prev_lsn << "\ttxn_id: " << l.txn_id;
-    return o;
-  }
+  friend std::ostream& operator<<(std::ostream& o, const LogRecord& l);
 
   // Log size in bytes.
   LogType type = LogType::kUnknown;

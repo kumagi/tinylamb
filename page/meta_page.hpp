@@ -3,6 +3,7 @@
 
 #include <cstdint>
 
+#include "common/constants.hpp"
 #include "page/page_ref.hpp"
 #include "page/page_type.hpp"
 
@@ -13,6 +14,10 @@ class Page;
 class PagePool;
 
 class MetaPage {
+ public:
+  [[nodiscard]] page_id_t MaxPageCountForTest() const { return max_page_count; }
+
+ private:
   void Initialize() {
     max_page_count = 0;
     first_free_page = 0;
@@ -27,9 +32,9 @@ class MetaPage {
   friend class Page;
   friend std::hash<tinylamb::MetaPage>;
 
-  uint64_t max_page_count;
   uint64_t first_free_page;
   void Dump(std::ostream& o, int) const;
+  uint64_t max_page_count;
 };
 
 }  // namespace tinylamb

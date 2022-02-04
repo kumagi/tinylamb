@@ -53,7 +53,9 @@ void PagePool::LostAllPageForTest() {
 void PagePool::FlushPageForTest(page_id_t page_id) {
   std::scoped_lock latch(pool_latch);
   const auto it = pool_.find(page_id);
-  assert(it != pool_.end());
+  if (it == pool_.end()) {
+    return;  // Already evicted.
+  }
   WriteBack(it->second->page.get());
 }
 
@@ -123,6 +125,7 @@ PagePool::~PagePool() {
 
 void PagePool::WriteBack(const Page* target) {
   target->SetChecksum();
+  // LOG(WARN) << "write back: " << *target;
   src_.seekp(target->PageID() * kPageSize, std::ios_base::beg);
   if (src_.fail()) {
     src_.clear();

@@ -74,9 +74,8 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
   std::vector<PageRef> parents;
   PageRef target = FindLeafForInsert(txn, key, pm_->GetPage(root_), parents);
   Status insert_result = target->Insert(txn, key, value);
-  if (insert_result == Status::kSuccess) {
-    return Status::kSuccess;
-  } else if (insert_result == Status::kNoSpace) {
+  if (insert_result == Status::kSuccess) return Status::kSuccess;
+  if (insert_result == Status::kNoSpace) {
     // No enough space? Split!
     target.PageUnlock();
     PageRef new_page = pm_->AllocateNewPage(txn, PageType::kLeafPage);
@@ -127,6 +126,8 @@ std::string OmittedString(std::string_view original, int length) {
 
 void DumpLeafPage(Transaction& txn, PageRef&& page, std::ostream& o,
                   int indent) {
+  o << "L[" << page->PageID() << "]: ";
+  indent += 2 + std::to_string(page->PageID()).size() + 3;
   for (int i = 0; i < page->RowCount(); ++i) {
     if (0 < i) o << Indent(indent);
     std::string_view key;
@@ -146,15 +147,16 @@ void BPlusTree::DumpInternal(Transaction& txn, std::ostream& o, PageRef&& page,
   } else if (page->Type() == PageType::kInternalPage) {
     page_id_t lowest;
     if (page->LowestPage(txn, &lowest) == Status::kSuccess) {
-      DumpInternal(txn, o, pm_->GetPage(lowest), indent + 2);
+      DumpInternal(txn, o, pm_->GetPage(lowest), indent + 4);
     }
     for (int i = 0; i < page->RowCount(); ++i) {
       std::string_view key;
       page->ReadKey(txn, i, &key);
-      o << Indent(indent) << OmittedString(key, 20) << "\n";
+      o << Indent(indent) << "I[" << page->PageID()
+        << "]: " << OmittedString(key, 20) << "\n";
       page_id_t pid;
       if (page->Read(txn, key, &pid) == Status::kSuccess) {
-        DumpInternal(txn, o, pm_->GetPage(pid), indent + 2);
+        DumpInternal(txn, o, pm_->GetPage(pid), indent + 4);
       }
     }
   }

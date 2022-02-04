@@ -10,6 +10,22 @@
 
 namespace tinylamb {
 
+namespace {
+
+std::string OmittedString(std::string_view original, int length) {
+  if (length < original.length()) {
+    std::string omitted_key = std::string(original).substr(0, 8);
+    omitted_key +=
+        "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
+    omitted_key += original.substr(original.length() - 8);
+    return omitted_key;
+  } else {
+    return std::string(original);
+  }
+}
+
+}  // anonymous namespace
+
 InternalPage::RowPointer* InternalPage::Rows() {
   return reinterpret_cast<RowPointer*>(Payload() + kPageBodySize -
                                        row_count_ * sizeof(RowPointer));
@@ -30,9 +46,7 @@ void InternalPage::SetLowestValue(page_id_t pid, Transaction& txn,
 
 Status InternalPage::Insert(page_id_t pid, Transaction& txn,
                             std::string_view key, page_id_t value) {
-  const bin_size_t physical_size =
-      sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + sizeof(page_id_t);
-
+  const bin_size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
   size_t pos = SearchToInsert(key);
   if (free_size_ < physical_size + sizeof(RowPointer)) return Status::kNoSpace;
   if (pos != row_count_ && GetKey(pos) == key) return Status::kDuplicates;
@@ -99,7 +113,9 @@ Status InternalPage::Delete(page_id_t pid, Transaction& txn,
 }
 
 void InternalPage::DeleteImpl(std::string_view key) {
+  assert(0 < row_count_);
   const bin_size_t pos = Search(key);
+  assert(pos < row_count_);
   free_size_ += GetKey(pos).size() + sizeof(bin_size_t) + sizeof(RowPointer);
   RowPointer* rows = Rows();
   memmove(rows + 1, rows, sizeof(RowPointer) * pos);
@@ -118,7 +134,7 @@ Status InternalPage::GetPageForKey(Transaction& txn, std::string_view key,
   return Status::kSuccess;
 }
 
-Status InternalPage::LowestPage(Transaction& txn, page_id_t* result) {
+Status InternalPage::LowestPage(Transaction& txn, page_id_t* result) const {
   *result = lowest_page_;
   return Status::kSuccess;
 }
@@ -133,9 +149,9 @@ void InternalPage::SplitInto(page_id_t pid, Transaction& txn, Page* right,
   for (int i = mid + 1; i < row_count_; ++i) {
     right->Insert(txn, GetKey(i), GetValue(i));
   }
+  Page* this_page = GET_PAGE_PTR(this);
   for (int i = mid; i < original_row_count; ++i) {
-    txn.DeleteInternalLog(pid, GetKey(mid), GetValue(mid));
-    DeleteImpl(GetKey(mid));
+    this_page->Delete(txn, GetKey(mid));
   }
 }
 
@@ -202,7 +218,7 @@ void InternalPage::Dump(std::ostream& o, int indent) const {
   o << "\n" << Indent(indent + 2) << lowest_page_;
   for (size_t i = 0; i < row_count_; ++i) {
     o << "\n"
-      << Indent(indent) << GetKey(i) << "\n"
+      << Indent(indent) << OmittedString(GetKey(i), 20) << "\n"
       << Indent(indent + 2) << GetValue(i);
   }
 }

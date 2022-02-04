@@ -17,6 +17,9 @@ static constexpr size_t kPageHeaderSize = sizeof(uint64_t) +  // page_id
                                           sizeof(uint64_t);   // checksum
 static constexpr size_t kPageBodySize = kPageSize - kPageHeaderSize;
 
+#define GET_PAGE_PTR(x) \
+  reinterpret_cast<Page*>(reinterpret_cast<char*>(x) - kPageHeaderSize)
+
 enum class Status : uint8_t {
   kUnknown,
   kSuccess,

@@ -69,6 +69,18 @@ size_t PidSlotKeySerialize(char* pos, const tinylamb::LogRecord& lr) {
   return offset;
 }
 
+std::string OmittedString(std::string_view original, int length) {
+  if (length < original.length()) {
+    std::string omitted_key = std::string(original).substr(0, 8);
+    omitted_key +=
+        "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
+    omitted_key += original.substr(original.length() - 8);
+    return omitted_key;
+  } else {
+    return std::string(original);
+  }
+}
+
 }  // namespace
 
 namespace tinylamb {
@@ -82,80 +94,150 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
       o << "BEGIN";
       break;
     case LogType::kInsertRow:
-      o << "INSERT ROW";
+      o << "INSERT ROW\t";
       break;
     case LogType::kInsertLeaf:
-      o << "INSERT LEAF";
+      o << "INSERT LEAF\t";
       break;
     case LogType::kInsertInternal:
-      o << "INSERT INTERNAL";
+      o << "INSERT INTERNAL\t";
       break;
     case LogType::kUpdateRow:
-      o << "UPDATE ROW";
+      o << "UPDATE ROW\t";
       break;
     case LogType::kUpdateLeaf:
-      o << "UPDATE LEAF";
+      o << "UPDATE LEAF\t";
       break;
     case LogType::kUpdateInternal:
-      o << "UPDATE INTERNAL";
+      o << "UPDATE INTERNAL\t";
       break;
     case LogType::kDeleteRow:
-      o << "DELETE ROW";
+      o << "DELETE ROW\t";
       break;
     case LogType::kDeleteLeaf:
-      o << "DELETE LEAF";
+      o << "DELETE LEAF\t";
       break;
     case LogType::kDeleteInternal:
-      o << "DELETE INTERNAL";
+      o << "DELETE INTERNAL\t";
       break;
     case LogType::kCommit:
-      o << "COMMIT";
+      o << "COMMIT\t\t";
       break;
     case LogType::kCompensateInsertRow:
-      o << "COMPENSATE INSERT ROW";
+      o << "COMPENSATE INSERT ROW\t";
       break;
     case LogType::kCompensateInsertLeaf:
-      o << "COMPENSATE INSERT LEAF";
+      o << "COMPENSATE INSERT LEAF\t";
       break;
     case LogType::kCompensateInsertInternal:
-      o << "COMPENSATE INSERT INTERNAL";
+      o << "COMPENSATE INSERT INTERNAL\t";
       break;
     case LogType::kCompensateUpdateRow:
-      o << "COMPENSATE UPDATE ROW";
+      o << "COMPENSATE UPDATE ROW\t";
       break;
     case LogType::kCompensateUpdateLeaf:
-      o << "COMPENSATE UPDATE LEAF";
+      o << "COMPENSATE UPDATE LEAF\t";
       break;
     case LogType::kCompensateUpdateInternal:
-      o << "COMPENSATE UPDATE INTERNAL";
+      o << "COMPENSATE UPDATE INTERNAL\t";
       break;
     case LogType::kCompensateDeleteRow:
-      o << "COMPENSATE DELETE ROW";
+      o << "COMPENSATE DELETE ROW\t";
       break;
     case LogType::kCompensateDeleteLeaf:
-      o << "COMPENSATE DELETE LEAF";
+      o << "COMPENSATE DELETE LEAF\t";
       break;
     case LogType::kCompensateDeleteInternal:
-      o << "COMPENSATE DELETE INTERNAL";
+      o << "COMPENSATE DELETE INTERNAL\t";
       break;
     case LogType::kLowestValue:
-      o << "SET LOWEST VALUE";
+      o << "SET LOWEST VALUE\t";
       break;
     case LogType::kBeginCheckpoint:
-      o << "BEGIN CHECKPOINT";
+      o << "BEGIN CHECKPOINT\t";
       break;
     case LogType::kEndCheckpoint:
-      o << "END CHECKPOINT";
+      o << "END CHECKPOINT\t";
       break;
     case LogType::kSystemAllocPage:
-      o << "ALLOCATE";
+      o << "ALLOCATE\t";
       break;
     case LogType::kSystemDestroyPage:
-      o << "DESTROY";
+      o << "DESTROY\t";
       break;
     default:
       o << "(undefined: " << static_cast<uint16_t>(type) << ")";
   }
+  return o;
+}
+
+std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
+  o << l.type;
+  switch (l.type) {
+    case LogType::kUnknown:
+      LOG(ERROR) << "kUnknownLog";
+      break;
+    case LogType::kCompensateUpdateRow:
+    case LogType::kCompensateDeleteRow:
+    case LogType::kCompensateInsertRow:
+    case LogType::kCompensateInsertLeaf:
+    case LogType::kCompensateUpdateLeaf:
+    case LogType::kCompensateDeleteLeaf:
+    case LogType::kInsertRow:
+    case LogType::kInsertLeaf:
+      l.DumpPosition(o);
+      o << "\t\tRedo: " << l.redo_data.size() << " bytes ";
+      break;
+    case LogType::kUpdateRow:
+    case LogType::kUpdateLeaf:
+      l.DumpPosition(o);
+      o << "\t\t" << l.undo_data.size() << " -> " << l.redo_data.size()
+        << "bytes ";
+      break;
+    case LogType::kDeleteRow:
+    case LogType::kDeleteLeaf:
+      l.DumpPosition(o);
+      o << "\t\t" << l.undo_data.size() << " bytes ";
+      break;
+    case LogType::kCompensateInsertInternal:
+    case LogType::kCompensateUpdateInternal:
+    case LogType::kCompensateDeleteInternal:
+    case LogType::kInsertInternal:
+      l.DumpPosition(o);
+      o << "\tInsert: " << l.redo_page;
+      break;
+    case LogType::kUpdateInternal:
+      l.DumpPosition(o);
+      o << "\tUpdate: " << l.undo_page << " -> " << l.redo_page;
+      break;
+    case LogType::kDeleteInternal:
+      l.DumpPosition(o);
+      o << "\tDelete: " << l.undo_page;
+      break;
+    case LogType::kLowestValue:
+      l.DumpPosition(o);
+      o << "\tLowest: " << l.redo_page;
+      break;
+    case LogType::kBeginCheckpoint:
+      return o;
+    case LogType::kEndCheckpoint:
+      o << "\tdpt: {";
+      for (const auto& dpt : l.dirty_page_table) {
+        o << dpt.first << ": " << dpt.second << ", ";
+      }
+      o << "}\ttt: {";
+      for (const auto& tt : l.active_transaction_table) {
+        o << tt << ", ";
+      }
+      o << "}";
+      return o;
+    case LogType::kBegin:
+    case LogType::kCommit:
+    case LogType::kSystemAllocPage:
+    case LogType::kSystemDestroyPage:
+      break;
+  }
+  o << "\tprev_lsn: " << l.prev_lsn << "\ttxn_id: " << l.txn_id;
   return o;
 }
 
@@ -482,6 +564,7 @@ LogRecord LogRecord::CompensatingDeleteInternalLogRecord(txn_id_t txn,
 LogRecord LogRecord::SetLowestLogRecord(lsn_t p, txn_id_t tid, page_id_t pid,
                                         page_id_t lowest_value) {
   LogRecord l;
+  l.prev_lsn = p;
   l.txn_id = tid;
   l.pid = pid;
   l.type = LogType::kLowestValue;
@@ -536,6 +619,8 @@ void LogRecord::Clear() {
   key = "";
   undo_data = "";
   redo_data = "";
+  redo_page = 0;
+  undo_page = 0;
   dirty_page_table.clear();
   active_transaction_table.clear();
   allocated_page_type = PageType::kUnknown;
@@ -694,7 +779,7 @@ void LogRecord::DumpPosition(std::ostream& o) const {
     o << "| " << slot;
   }
   if (!key.empty()) {
-    o << " key: " << key;
+    o << " key: " << OmittedString(key, 20);
   }
   o << "}";
 }

@@ -35,6 +35,7 @@ class BPlusTree {
   Status Delete(Transaction& txn, std::string_view key);
   Status Read(Transaction& txn, std::string_view key, std::string_view* dst);
   void Dump(Transaction& txn, std::ostream& o, int indent = 0) const;
+  page_id_t Root() const { return root_; }
 
  private:
   void DumpInternal(Transaction& txn, std::ostream& o, PageRef&& page,

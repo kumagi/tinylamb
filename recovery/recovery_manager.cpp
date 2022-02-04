@@ -33,9 +33,7 @@ bool IsPageManipulation(LogType type) {
 }
 
 void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
-  if (!IsPageManipulation(log.type) || lsn <= target->PageLSN()) {
-    return;
-  }
+  if (!IsPageManipulation(log.type) || lsn <= target->PageLSN()) return;
 
   switch (log.type) {
     case LogType::kUnknown:
@@ -158,7 +156,7 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
     case LogType::kCompensateDeleteLeaf:
     case LogType::kCompensateDeleteInternal:
     case LogType::kLowestValue:  // Just ignore it!.
-      // Compensating log cannot be undo.
+      // Compensating log cannot undo.
       break;
   }
   target->SetPageLSN(lsn);
@@ -176,7 +174,6 @@ void PageReplay(PageRef&& target,
     const lsn_t& lsn = lsn_log.first;
     const LogRecord& log = lsn_log.second;
     assert(log.pid == target->PageID());
-    LOG(WARN) << target->PageLSN() << " : " << lsn;
     if (target->PageLSN() < lsn) {
       LOG(INFO) << "redo: " << log;
       LogRedo(target, lsn, log);
@@ -196,6 +193,7 @@ void PageReplay(PageRef&& target,
   }
 
   // Release the page latch.
+  LOG(INFO) << "SPR " << target->PageID() << " finished";
   target.PageUnlock();
 }
 

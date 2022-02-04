@@ -28,11 +28,16 @@ class BPlusTreeTest : public ::testing::Test {
     Recover();
     auto txn = tm_->Begin();
     PageRef page_ = p_->AllocateNewPage(txn, PageType::kLeafPage);
-    root_page_id_ = page_->PageID();
     EXPECT_SUCCESS(txn.PreCommit());
   }
 
+  void Flush(page_id_t pid) { p_->GetPool()->FlushPageForTest(pid); }
+
   void Recover() {
+    page_id_t root = bpt_ ? bpt_->Root() : 1;
+    if (p_) {
+      p_->GetPool()->LostAllPageForTest();
+    }
     bpt_.reset();
     tm_.reset();
     r_.reset();
@@ -44,6 +49,7 @@ class BPlusTreeTest : public ::testing::Test {
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
+    bpt_ = std::make_unique<BPlusTree>(root, p_.get());
   }
 
   void TearDown() override {
@@ -64,17 +70,11 @@ class BPlusTreeTest : public ::testing::Test {
   std::unique_ptr<RecoveryManager> r_;
   std::unique_ptr<TransactionManager> tm_;
   std::unique_ptr<BPlusTree> bpt_;
-  page_id_t root_page_id_;
 };
 
 TEST_F(BPlusTreeTest, Construct) {}
 
-TEST_F(BPlusTreeTest, ConstructBPlusTree) {
-  bpt_ = std::make_unique<BPlusTree>(root_page_id_, p_.get());
-}
-
 TEST_F(BPlusTreeTest, InsertLeaf) {
-  bpt_ = std::make_unique<BPlusTree>(root_page_id_, p_.get());
   auto txn = tm_->Begin();
   ASSERT_SUCCESS(bpt_->Insert(txn, "hello", "world"));
   ASSERT_SUCCESS(bpt_->Insert(txn, "this", "is a pen"));
@@ -85,7 +85,6 @@ TEST_F(BPlusTreeTest, InsertLeaf) {
 }
 
 TEST_F(BPlusTreeTest, SplitLeaf) {
-  bpt_ = std::make_unique<BPlusTree>(root_page_id_, p_.get());
   auto txn = tm_->Begin();
   std::string key_prefix("key");
   std::string long_value(8000, 'v');
@@ -102,22 +101,20 @@ std::string KeyGen(int num, int width) {
 }
 
 TEST_F(BPlusTreeTest, SplitInternal) {
-  bpt_ = std::make_unique<BPlusTree>(root_page_id_, p_.get());
   auto txn = tm_->Begin();
   std::string key_prefix("key");
   std::string long_value(2000, 'v');
-  for (int i = 0; i < 50; ++i) {
+  for (int i = 0; i < 6; ++i) {
     ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), long_value));
   }
 }
 
 TEST_F(BPlusTreeTest, Search) {
-  bpt_ = std::make_unique<BPlusTree>(root_page_id_, p_.get());
   {
     auto txn = tm_->Begin();
     std::string key_prefix("key");
-    for (int i = 0; i < 50; ++i) {
-      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), KeyGen(i * 10, 1000)));
+    for (int i = 0; i < 100; ++i) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), KeyGen(i * 10, 2000)));
     }
     txn.PreCommit();
   }
@@ -125,15 +122,14 @@ TEST_F(BPlusTreeTest, Search) {
     auto txn = tm_->Begin();
     std::string long_value(2000, 'v');
     std::string_view val;
-    for (int i = 0; i < 50; ++i) {
+    for (int i = 0; i < 100; ++i) {
       ASSERT_SUCCESS(bpt_->Read(txn, KeyGen(i, 10000), &val));
-      ASSERT_EQ(val, KeyGen(i * 10, 1000));
+      ASSERT_EQ(val, KeyGen(i * 10, 2000));
     }
   }
 }
 
 TEST_F(BPlusTreeTest, Update) {
-  bpt_ = std::make_unique<BPlusTree>(root_page_id_, p_.get());
   {
     auto txn = tm_->Begin();
     std::string key_prefix("key");
@@ -166,7 +162,6 @@ TEST_F(BPlusTreeTest, Update) {
 }
 
 TEST_F(BPlusTreeTest, Delete) {
-  bpt_ = std::make_unique<BPlusTree>(root_page_id_, p_.get());
   {
     auto txn = tm_->Begin();
     std::string key_prefix("key");
@@ -199,4 +194,29 @@ TEST_F(BPlusTreeTest, Delete) {
   }
 }
 
+TEST_F(BPlusTreeTest, Crash) {
+  {
+    auto txn = tm_->Begin();
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), KeyGen(i * 10, 1000)));
+    }
+    txn.PreCommit();
+  }
+
+  page_id_t max_page = p_->GetPage(0)->body.meta_page.MaxPageCountForTest();
+  for (int i = 0; i < max_page; i += 2) {
+    Flush(i);
+  }
+  page_id_t root = bpt_->Root();
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+  {
+    auto txn = tm_->Begin();
+    std::string_view val;
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_SUCCESS(bpt_->Read(txn, KeyGen(i, 10000), &val));
+      ASSERT_EQ(val, KeyGen(i * 10, 1000));
+    }
+  }
+}
 }  // namespace tinylamb

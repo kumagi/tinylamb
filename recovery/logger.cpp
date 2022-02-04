@@ -30,7 +30,7 @@ lsn_t Logger::AddLog(const LogRecord& log) {
   std::string data = log.Serialize();
   std::scoped_lock lk(latch_);
 
-  size_t memory_offset = written_lsn_ % buffer_.size();
+  size_t memory_offset = queued_lsn_ % buffer_.size();
   if (memory_offset + data.size() <= buffer_.size()) {
     memcpy(buffer_.data() + memory_offset, data.data(), data.size());
   } else {
@@ -41,11 +41,11 @@ lsn_t Logger::AddLog(const LogRecord& log) {
   }
 
   // Move buffer pointer forward
-  written_lsn_ += data.size();
+  queued_lsn_ += data.size();
   if (buffer_.size() - RestSize() < buffer_.size() / 4) {
     worker_wait_.notify_all();
   }
-  return written_lsn_ - data.size();
+  return queued_lsn_ - data.size();
 }
 
 void Logger::Finish() {
@@ -55,18 +55,18 @@ void Logger::Finish() {
 
 lsn_t Logger::CommittedLSN() const {
   std::scoped_lock lk(latch_);
-  return committed_lsn_;
+  return persistent_lsn_;
 }
 
 void Logger::LoggerWork() {
   std::unique_lock lk(latch_);
-  while (!finish_ || committed_lsn_ != written_lsn_) {
+  while (!finish_ || persistent_lsn_ != queued_lsn_) {
     worker_wait_.wait_for(lk, std::chrono::milliseconds(every_ms_));
-    if (committed_lsn_ == written_lsn_) continue;
+    if (persistent_lsn_ == queued_lsn_) continue;
 
     // Write buffered data between committed_offset to written_offset.
-    const size_t written_offset = written_lsn_ % buffer_.size();
-    const size_t committed_offset = committed_lsn_ % buffer_.size();
+    const size_t written_offset = queued_lsn_ % buffer_.size();
+    const size_t committed_offset = persistent_lsn_ % buffer_.size();
 
     ssize_t flushed_bytes = 0;
     if (committed_offset < written_offset) {
@@ -85,15 +85,15 @@ void Logger::LoggerWork() {
     }
 
     fsync(dst_);
-    committed_lsn_ += flushed_bytes;
+    persistent_lsn_ += flushed_bytes;
   }
 }
 
 [[nodiscard]] size_t Logger::RestSize() const {
-  if (committed_lsn_ <= written_lsn_)
-    return buffer_.size() - written_lsn_ + committed_lsn_ - 1;
+  if (persistent_lsn_ <= queued_lsn_)
+    return buffer_.size() - queued_lsn_ + persistent_lsn_ - 1;
   else
-    return committed_lsn_ - written_lsn_ - 1;
+    return persistent_lsn_ - queued_lsn_ - 1;
 }
 
 }  // namespace tinylamb

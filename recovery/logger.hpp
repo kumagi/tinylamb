@@ -43,8 +43,8 @@ class Logger {
   std::atomic<bool> finish_ = false;
 
   const size_t every_ms_;
-  std::atomic<size_t> written_lsn_ = 0;
-  std::atomic<size_t> committed_lsn_ = 0;
+  std::atomic<size_t> queued_lsn_ = 0;
+  std::atomic<size_t> persistent_lsn_ = 0;
 
   std::condition_variable worker_wait_;
   std::thread worker_;

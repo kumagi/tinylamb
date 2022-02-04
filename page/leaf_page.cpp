@@ -12,6 +12,22 @@
 
 namespace tinylamb {
 
+namespace {
+
+std::string OmittedString(std::string_view original, int length) {
+  if (length < original.length()) {
+    std::string omitted_key = std::string(original).substr(0, 8);
+    omitted_key +=
+        "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
+    omitted_key += original.substr(original.length() - 8);
+    return omitted_key;
+  } else {
+    return std::string(original);
+  }
+}
+
+}  // anonymous namespace
+
 LeafPage::RowPointer* LeafPage::Rows() {
   return reinterpret_cast<RowPointer*>(Payload() + kPageBodySize -
                                        row_count_ * sizeof(RowPointer));
@@ -46,16 +62,10 @@ std::string_view LeafPage::GetValue(size_t idx) const {
 
 Status LeafPage::Insert(page_id_t page_id, Transaction& txn,
                         std::string_view key, std::string_view value) {
-  const bin_size_t physical_size =
-      sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + value.size();
-
+  const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
   size_t pos = Find(key);
-  if (free_size_ < physical_size + sizeof(RowPointer)) {
-    return Status::kNoSpace;
-  }
-  if (pos != row_count_ && GetKey(pos) == key) {  // Already exists.
-    return Status::kDuplicates;
-  }
+  if (free_size_ < physical_size + sizeof(RowPointer)) return Status::kNoSpace;
+  if (pos != row_count_ && GetKey(pos) == key) return Status::kDuplicates;
 
   InsertImpl(key, value);
   txn.InsertLeafLog(page_id, key, value);
@@ -63,8 +73,8 @@ Status LeafPage::Insert(page_id_t page_id, Transaction& txn,
 }
 
 void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
-  const bin_size_t physical_size =
-      sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + value.size();
+  const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
+  assert(physical_size + sizeof(RowPointer) <= free_size_);
   free_size_ -= physical_size + sizeof(RowPointer);
 
   if (kPageSize - sizeof(RowPointer) * (row_count_ + 1) <
@@ -119,8 +129,9 @@ void LeafPage::UpdateImpl(std::string_view key, std::string_view redo) {
 Status LeafPage::Delete(page_id_t page_id, Transaction& txn,
                         std::string_view key) {
   std::string_view existing_value;
-  if (Read(page_id, txn, key, &existing_value) == Status::kNotExists)
+  if (Read(page_id, txn, key, &existing_value) == Status::kNotExists) {
     return Status::kNotExists;
+  }
 
   txn.DeleteLeafLog(page_id, key, existing_value);
   DeleteImpl(key);
@@ -128,8 +139,11 @@ Status LeafPage::Delete(page_id_t page_id, Transaction& txn,
 }
 
 void LeafPage::DeleteImpl(std::string_view key) {
+  assert(0 < row_count_);
   RowPointer* rows = Rows();
   size_t pos = Find(key);
+  assert(0 <= pos);
+  assert(pos < row_count_);
   free_size_ += rows[pos].size + sizeof(RowPointer);
   memmove(rows + 1, rows, sizeof(RowPointer) * pos);
   --row_count_;
@@ -180,11 +194,14 @@ size_t LeafPage::RowCount() const { return row_count_; }
 
 void LeafPage::Split(page_id_t pid, Transaction& txn, Page* target) {
   // TODO(kumagi): Could be faster with bulk updates.
-  for (size_t i = row_count_ / 2; i < row_count_; ++i) {
+  const int mid = row_count_ / 2;
+  const int original_row_count = row_count_;
+  for (size_t i = mid; i < row_count_; ++i) {
     target->Insert(txn, GetKey(i), GetValue(i));
   }
-  for (size_t i = row_count_ / 2; i < row_count_;) {
-    Delete(pid, txn, GetKey(i));
+  Page* this_page = GET_PAGE_PTR(this);
+  for (size_t i = mid; i < original_row_count; ++i) {
+    this_page->Delete(txn, GetKey(mid));
   }
   target->body.leaf_page.next_pid_ = next_pid_;
   target->body.leaf_page.prev_pid_ = pid;
@@ -226,7 +243,9 @@ void LeafPage::Dump(std::ostream& o, int indent) const {
     << " FreePtr:" << free_ptr_;
   std::string_view out;
   for (size_t i = 0; i < row_count_; ++i) {
-    o << "\n" << Indent(indent) << GetKey(i) << ": " << GetValue(i);
+    o << "\n"
+      << Indent(indent) << OmittedString(GetKey(i), 20) << ": "
+      << OmittedString(GetValue(i), 20);
   }
 }
 

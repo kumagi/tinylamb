@@ -230,6 +230,8 @@ TEST_F(LeafPageTest, Split) {
     }
     page->Split(txn, right.get());
   }
+  ASSERT_EQ(page->RowCount(), 5);
+  ASSERT_EQ(right->RowCount(), 5);
   std::string_view out;
   for (size_t i = 0; i < 5; ++i) {
     ASSERT_SUCCESS(page->Read(txn, std::to_string(i) + ":key", &out));

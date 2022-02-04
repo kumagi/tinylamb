@@ -54,7 +54,7 @@ class InternalPage {
   Status GetPageForKey(Transaction& txn, std::string_view key,
                        page_id_t* result) const;
 
-  Status LowestPage(Transaction& txn, page_id_t* result);
+  Status LowestPage(Transaction& txn, page_id_t* result) const;
 
   void SplitInto(page_id_t pid, Transaction& txn, Page* right,
                  std::string_view* middle);
