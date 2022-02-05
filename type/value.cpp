@@ -40,6 +40,7 @@ Value::Value(double double_value) {
     case ValueType::kDouble:
       return sizeof(double);
   }
+  throw std::runtime_error("undefined type");
 }
 
 size_t Value::Serialize(char* dst) const {
@@ -53,6 +54,7 @@ size_t Value::Serialize(char* dst) const {
     case ValueType::kDouble:
       return SerializeDouble(dst, value.double_value);
   }
+  throw std::runtime_error("undefined type");
 }
 
 size_t Value::Deserialize(const char* src, ValueType as_type) {
@@ -67,6 +69,7 @@ size_t Value::Deserialize(const char* src, ValueType as_type) {
     case ValueType::kDouble:
       return DeserializeDouble(src, &value.double_value);
   }
+  throw std::runtime_error("undefined type");
 }
 
 [[nodiscard]] std::string Value::AsString() const {
@@ -76,10 +79,11 @@ size_t Value::Deserialize(const char* src, ValueType as_type) {
     case ValueType::kInt64:
       return std::to_string(value.int_value);
     case ValueType::kVarChar:
-      return std::string(value.varchar_value);
+      return "\"" + std::string(value.varchar_value) + "\"";
     case ValueType::kDouble:
       return std::to_string(value.double_value);
   }
+  throw std::runtime_error("undefined type");
 }
 
 bool Value::operator==(const Value& rhs) const {
@@ -94,6 +98,7 @@ bool Value::operator==(const Value& rhs) const {
     case ValueType::kDouble:
       return value.double_value == rhs.value.double_value;
   }
+  throw std::runtime_error("undefined type");
 }
 
 bool Value::operator<(const Value& rhs) const {
@@ -110,6 +115,7 @@ bool Value::operator<(const Value& rhs) const {
     case ValueType::kDouble:
       return value.double_value < rhs.value.double_value;
   }
+  throw std::runtime_error("undefined type");
 }
 
 std::ostream& operator<<(std::ostream& o, const Value& v) {
@@ -131,4 +137,5 @@ uint64_t std::hash<tinylamb::Value>::operator()(
     case tinylamb::ValueType::kDouble:
       return std::hash<double>()(v.value.double_value);
   }
+  throw std::runtime_error("undefined type");
 }

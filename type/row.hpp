@@ -16,7 +16,11 @@ namespace tinylamb {
 
 struct Row {
   Row() = default;
+  Row(std::initializer_list<Value> v) : values_(v) {}
 
+  void Add(const Value& v);
+  Value& operator[](int i);
+  const Value& operator[](int i) const;
   size_t Serialize(char* dst) const;
   size_t Deserialize(const char* src, const Schema& sc);
   [[nodiscard]] size_t Size() const;
