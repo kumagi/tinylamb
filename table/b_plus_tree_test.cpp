@@ -10,6 +10,7 @@
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
+#include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "transaction/lock_manager.hpp"
@@ -22,6 +23,7 @@ class BPlusTreeTest : public ::testing::Test {
  protected:
   static constexpr char kDBFileName[] = "b_plus_tree_test.db";
   static constexpr char kLogName[] = "b_plus_tree_test.log";
+  static constexpr char kMasterRecordName[] = "b_plus_tree_master.log";
 
  public:
   void SetUp() override {
@@ -49,6 +51,8 @@ class BPlusTreeTest : public ::testing::Test {
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
+    cm_ = std::make_unique<CheckpointManager>(kMasterRecordName, tm_.get(),
+                                              p_->GetPool(), 1);
     bpt_ = std::make_unique<BPlusTree>(root, p_.get());
   }
 
@@ -69,6 +73,7 @@ class BPlusTreeTest : public ::testing::Test {
   std::unique_ptr<Logger> l_;
   std::unique_ptr<RecoveryManager> r_;
   std::unique_ptr<TransactionManager> tm_;
+  std::unique_ptr<CheckpointManager> cm_;
   std::unique_ptr<BPlusTree> bpt_;
 };
 
@@ -207,13 +212,46 @@ TEST_F(BPlusTreeTest, Crash) {
   for (int i = 0; i < max_page; i += 2) {
     Flush(i);
   }
-  page_id_t root = bpt_->Root();
   Recover();
   r_->RecoverFrom(0, tm_.get());
   {
     auto txn = tm_->Begin();
     std::string_view val;
     for (int i = 0; i < 10; ++i) {
+      ASSERT_SUCCESS(bpt_->Read(txn, KeyGen(i, 10000), &val));
+      ASSERT_EQ(val, KeyGen(i * 10, 1000));
+    }
+  }
+}
+
+TEST_F(BPlusTreeTest, CheckPoint) {
+  lsn_t restart_point;
+  {
+    auto txn = tm_->Begin();
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), KeyGen(i * 10, 1000)));
+    }
+    restart_point = cm_->WriteCheckpoint([&]() {
+      for (int i = 10; i < 20; ++i) {
+        ASSERT_SUCCESS(
+            bpt_->Insert(txn, KeyGen(i, 10000), KeyGen(i * 10, 1000)));
+      }
+    });
+    for (int i = 20; i < 30; ++i) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), KeyGen(i * 10, 1000)));
+    }
+    txn.PreCommit();
+  }
+  page_id_t max_page = p_->GetPage(0)->body.meta_page.MaxPageCountForTest();
+  for (int i = 0; i < max_page; i += 5) {
+    Flush(i);
+  }
+  Recover();
+  r_->RecoverFrom(restart_point, tm_.get());
+  {
+    auto txn = tm_->Begin();
+    std::string_view val;
+    for (int i = 0; i < 30; ++i) {
       ASSERT_SUCCESS(bpt_->Read(txn, KeyGen(i, 10000), &val));
       ASSERT_EQ(val, KeyGen(i * 10, 1000));
     }
