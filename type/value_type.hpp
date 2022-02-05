@@ -1,10 +1,34 @@
-#ifndef TINYLAMB_VALUE_TYPE_HPP
-#define TINYLAMB_VALUE_TYPE_HPP
+#ifndef TINYLAMB_TYPE_VALUE_TYPE_HPP
+#define TINYLAMB_TYPE_VALUE_TYPE_HPP
+
+#include <string_view>
 
 namespace tinylamb {
 
-enum class ValueType : uint8_t { kUnknown, kInt64, kVarChar };
-enum class AttributeType : uint16_t { kPrimaryKey = 1, kUnique = 1 << 1 };
+enum class ValueType : uint8_t { kUnknown, kInt64, kVarChar, kDouble };
+
+inline std::string_view ValueTypeToString(ValueType type) {
+  switch (type) {
+    case ValueType::kUnknown:
+      return "(Unknown)";
+    case ValueType::kInt64:
+      return "Integer";
+    case ValueType::kVarChar:
+      return "Varchar";
+    case ValueType::kDouble:
+      return "Double";
+  }
+  return "unknown value type";
+}
 
 }  // namespace tinylamb
-#endif  // TINYLAMB_VALUE_TYPE_HPP
+
+template <>
+class std::hash<tinylamb::ValueType> {
+ public:
+  uint64_t operator()(const tinylamb::ValueType& c) const {
+    return std::hash<uint8_t>()(static_cast<uint8_t>(c));
+  }
+};
+
+#endif  // TINYLAMB_TYPE_VALUE_TYPE_HPP

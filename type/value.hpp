@@ -7,48 +7,46 @@
 
 #include <cstdint>
 
-#include "value_type.hpp"
+#include "common/serdes.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
 class Value {
  public:
-  Value() {}
-  Value(int64_t int_val) {
-    value.int_value = int_val;
-    length = 8;
-  }
-  Value(std::string_view varchar_val) {
-    value.varchar_value = varchar_val.data();
-    length = varchar_val.length();
-  }
+  Value() = default;
+  explicit Value(int int_val);
+  explicit Value(int64_t int_val);
+  explicit Value(std::string_view varchar_val);
+  explicit Value(double double_value);
 
-  [[nodiscard]] size_t Size() const { return length; }
+  [[nodiscard]] size_t Size() const;
 
-  template <typename T>
-  T Read(ValueType as) {
-    return *reinterpret_cast<const T*>(&value);
-  }
+  size_t Serialize(char* dst) const;
 
-  std::string AsString(ValueType type) {
-    switch (type) {
-      case ValueType::kUnknown:
-        assert(!"unknown type cannot be string");
-      case ValueType::kInt64:
-        return std::to_string(value.int_value);
-      case ValueType::kVarChar:
-        return std::string(value.varchar_value, length);
-    }
-  }
+  size_t Deserialize(const char* src, ValueType as_type);
+
+  bool operator==(const Value& rhs) const;
+  bool operator!=(const Value& rhs) const { return !operator==(rhs); }
+  bool operator<(const Value& rhs) const;
+
+  [[nodiscard]] std::string AsString() const;
+  friend std::ostream& operator<<(std::ostream& o, const Value& v);
 
   union {
     int64_t int_value;
-    const char* varchar_value;
-  } value;
-
-  size_t length;
+    std::string_view varchar_value;
+    double double_value;
+  } value{0};
+  ValueType type{ValueType::kUnknown};
 };
 
 }  // namespace tinylamb
+
+template <>
+class std::hash<tinylamb::Value> {
+ public:
+  uint64_t operator()(const tinylamb::Value& c) const;
+};
 
 #endif  // TINYLAMB_VALUE_HPP

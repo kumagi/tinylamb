@@ -1,81 +1,67 @@
-#include "type/schema.hpp"
+#include "schema.hpp"
 
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "common/log_message.hpp"
 #include "page/row_position.hpp"
-#include "value_type.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
-Schema::Schema(std::string_view schema_name, const std::vector<Column>& columns,
-               uint64_t page_id) {
-  assert(schema_name.size() < 256);
-  size_t payload_size = 1 + schema_name.size() + 1 + sizeof(page_id);
-  for (const auto& column : columns) {
-    payload_size += column.data.size();
-  }
-  owned_data = std::string(payload_size, '\0');
-  data = std::string_view(owned_data);
+Schema::Schema(std::string_view schema_name, std::vector<Column> columns)
+    : name_(schema_name), columns_(std::move(columns)) {}
 
-  offsets.reserve(columns.size());
-  size_t offset = 0;
-  for (const auto& column : columns) {
-    offsets.push_back(offset);
-    offset += column.data.size();
+size_t Schema::Serialize(char* dst) const {
+  const char* const original_offset = dst;
+  dst += SerializeStringView(dst, name_);
+  dst += SerializeInteger(dst, static_cast<int64_t>(columns_.size()));
+  for (const auto& c : columns_) {
+    dst += c.Serialize(dst);
   }
-
-  size_t idx = 0;
-  *reinterpret_cast<uint64_t*>(&owned_data[idx]) = page_id;  // row_page
-  idx += sizeof(uint64_t);
-  owned_data[idx++] = schema_name.size() & 127;  // name_length
-  memcpy(&owned_data[idx], schema_name.data(), schema_name.size());  // name
-  idx += schema_name.size();
-  owned_data[idx++] = columns.size();
-  for (const auto& column : columns) {
-    memcpy(&owned_data[idx], column.data.data(), column.data.size());
-    idx += column.data.size();
-  }
+  return dst - original_offset;
 }
 
-Schema::Schema(char* ptr) {
-  data = std::string_view(ptr, INT16_MAX);  // temporary set as max.
-  offsets.reserve(ColumnCount());
-  size_t offset = 0;
-  for (size_t i = 0; i < ColumnCount(); ++i) {
-    offsets.push_back(offset);
-    offset += GetColumn(i).FootprintSize();
+size_t Schema::Deserialize(const char* src) {
+  const char* const original_offset = src;
+  std::string_view sv;
+  src += DeserializeStringView(src, &sv);
+  name_ = sv;
+  int64_t columns;
+  src += DeserializeInteger(src, &columns);
+  columns_.clear();
+  columns_.reserve(columns);
+  for (size_t i = 0; i < columns; ++i) {
+    Column c;
+    src += c.Deserialize(src);
+    columns_.push_back(std::move(c));
   }
-  // sizeof(RowPage) + sizeof(NameLength) + name_length + sizeof(ColumnCount) +
-  // offsets.
-  data = std::string_view(ptr, 8 + 1 + NameLength() + 1 + offset);
+  return src - original_offset;
 }
 
-Schema::Schema(const char* ptr) {
-  data = std::string_view(ptr, INT16_MAX);  // temporary set as max.
-  offsets.reserve(ColumnCount());
-  size_t offset = 0;
-  for (size_t i = 0; i < ColumnCount(); ++i) {
-    offsets.push_back(offset);
-    offset += GetColumn(i).FootprintSize();
+[[nodiscard]] size_t Schema::Size() const {
+  size_t ret = 0;
+  ret += SerializeSize(name_);
+  ret += sizeof(int64_t);
+  for (const auto& c : columns_) {
+    ret += c.Size();
   }
-  // sizeof(RowPage) + sizeof(NameLength) + name_length + sizeof(ColumnCount) +
-  // offsets.
-  data = std::string_view(ptr, 8 + 1 + NameLength() + 1 + offset);
+  return ret;
 }
 
-[[nodiscard]] size_t Schema::FixedRowSize() const {
-  size_t ans = 0;
-  for (size_t i = 0; i < ColumnCount(); ++i) {
-    ans += GetColumn(i).ValueLength();
-  }
-  return ans;
+bool Schema::operator==(const Schema& rhs) const {
+  return name_ == rhs.name_ && columns_ == rhs.columns_;
 }
 
-[[nodiscard]] Column Schema::GetColumn(size_t idx) const {
-  assert(idx < offsets.size());
-  return Column(&data[10 + NameLength() + offsets[idx]]);
+std::ostream& operator<<(std::ostream& o, const Schema& s) {
+  o << s.name_ << " [ ";
+  for (size_t i = 0; i < s.columns_.size(); ++i) {
+    if (0 < i) o << " | ";
+    o << s.columns_[i];
+  }
+  o << " ]";
+  return o;
 }
 
 }  // namespace tinylamb

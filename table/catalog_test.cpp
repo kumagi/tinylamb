@@ -1,4 +1,4 @@
-#include "type/catalog.hpp"
+#include "catalog.hpp"
 
 #include <memory>
 #include <string>

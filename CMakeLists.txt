@@ -30,7 +30,8 @@ add_library(libtinylamb
         recovery/recovery_manager.cpp recovery/checkpoint_manager.cpp
         transaction/transaction_manager.cpp page/page_type.cpp type/column.cpp
         common/serdes.cpp common/log_message.cpp page/page_ref.cpp page/leaf_page.cpp
-        page/internal_page.cpp table/b_plus_tree.cpp)
+        page/internal_page.cpp table/b_plus_tree.cpp type/value.cpp type/constraint.cpp
+        type/constraint.hpp table/table.cpp table/table.hpp)
 
 target_include_directories(
         libtinylamb
@@ -71,6 +72,9 @@ function(add_simple_test file_path)
 endfunction()
 
 #add_simple_test(page/catalog_page_test.cpp)
+add_simple_test(type/value_test.cpp)
+add_simple_test(type/constraint_test.cpp)
+add_simple_test(type/column_test.cpp)
 add_simple_test(table/b_plus_tree_test.cpp)
 add_simple_test(page/leaf_page_test.cpp)
 add_simple_test(page/internal_page_test.cpp)
