@@ -26,6 +26,9 @@ class Value {
 
   size_t Deserialize(const char* src, ValueType as_type);
 
+  [[nodiscard]] std::string EncodeMemcomparableFormat() const;
+  size_t DecodeMemcomparableFormat(const char* src);
+
   bool operator==(const Value& rhs) const;
   bool operator!=(const Value& rhs) const { return !operator==(rhs); }
   bool operator<(const Value& rhs) const;
@@ -39,6 +42,7 @@ class Value {
     double double_value;
   } value{0};
   ValueType type{ValueType::kUnknown};
+  std::string owned_data;
 };
 
 }  // namespace tinylamb

@@ -31,7 +31,7 @@ add_library(libtinylamb
         transaction/transaction_manager.cpp page/page_type.cpp type/column.cpp
         common/serdes.cpp common/log_message.cpp page/page_ref.cpp page/leaf_page.cpp
         page/internal_page.cpp table/b_plus_tree.cpp type/value.cpp type/constraint.cpp
-        type/constraint.hpp table/table.cpp table/table.hpp table/index.cpp table/index.hpp)
+        type/constraint.hpp table/table.cpp table/table.hpp table/index.cpp table/index.hpp common/debug.cpp common/debug.hpp)
 
 target_include_directories(
         libtinylamb

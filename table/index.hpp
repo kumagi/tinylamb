@@ -14,6 +14,9 @@ namespace tinylamb {
 
 class Index {
  public:
+
+
+
   std::string name_;
   std::vector<size_t> key;
   page_id_t pid;

@@ -5,6 +5,12 @@
 
 #include <assert.h>
 
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+
+#include "common/debug.hpp"
+#include "common/log_message.hpp"
 #include "common/serdes.hpp"
 
 namespace tinylamb {
@@ -99,6 +105,109 @@ bool Value::operator==(const Value& rhs) const {
       return value.double_value == rhs.value.double_value;
   }
   throw std::runtime_error("undefined type");
+}
+
+namespace {
+
+std::string EncodeMemcomparableFormatInteger(int64_t in) {
+  std::string ret(1 + 8, '\0');
+  ret[0] = static_cast<char>(ValueType::kInt64);  // Embeds prefix.
+  const uint64_t be = htobe64(in);
+  memcpy(ret.data() + 1, &be, 8);
+  ret[1] ^= char(0x80);  // plus/minus sign.
+  return ret;
+}
+
+size_t DecodeMemcomparableFormatInteger(const char* src, int64_t* dst) {
+  *dst = be64toh(*reinterpret_cast<const int64_t*>(src) ^ 0x80);
+  return sizeof(int64_t);
+}
+
+std::string EncodeMemcomparableFormatVarchar(std::string_view in) {
+  std::string ret(1 + (in.size() + 7) / 8 * 9, '\0');
+  ret[0] = static_cast<char>(ValueType::kVarChar);  // Embeds prefix.
+  char* dst = ret.data() + 1;
+  const char* src = in.data();
+  const size_t size = in.size();
+  for (size_t i = 0; i < size; i += 8) {
+    if (9 <= size - i) {
+      memcpy(dst, src, 8);
+      dst += 8;
+      src += 8;
+      *dst++ = 9;
+    } else {  // Final 1~8 bytes.
+      const size_t diff = size - i;
+      memcpy(dst, src, diff);
+      dst += 8;
+      *dst++ = char((size % 8) + (size % 8 == 0 ? 8 : 0));
+      break;
+    }
+  }
+  return ret;
+}
+
+size_t DecodeMemcomparableFormatVarchar(std::string_view src,
+                                        std::string* dst) {}
+
+std::string EncodeMemcomparableFormatDouble(double in) {
+  std::string ret(1 + 8, '\0');
+  ret[0] = static_cast<char>(ValueType::kDouble);  // Embeds prefix.
+  uint64_t be = htobe64(*reinterpret_cast<const uint64_t*>(&in));
+  if (0 <= in) {
+    be |= 0x80;
+  } else {
+    be = ~be;
+  }
+  memcpy(ret.data() + 1, &be, 8);
+  return ret;
+}
+
+size_t DecodeMemcomparableFormatDouble(const char* src, double* dst) {
+  uint64_t code = be64toh(*reinterpret_cast<const int64_t*>(src));
+  if (0 < (src[0] & 0x80)) {
+    code ^= 1LLU << 63;
+  } else {
+    code = ~code;
+  }
+  *dst = *reinterpret_cast<double*>(&code);
+  return sizeof(double);
+}
+
+}  // anonymous namespace
+
+std::string Value::EncodeMemcomparableFormat() const {
+  switch (type) {
+    case ValueType::kUnknown:
+      throw std::runtime_error("Cannot encode unknown type.");
+    case ValueType::kInt64:
+      return EncodeMemcomparableFormatInteger(value.int_value);
+    case ValueType::kVarChar:
+      return EncodeMemcomparableFormatVarchar(value.varchar_value);
+    case ValueType::kDouble:
+      return EncodeMemcomparableFormatDouble(value.double_value);
+  }
+  throw std::runtime_error("undefined type");
+}
+
+size_t Value::DecodeMemcomparableFormat(const char* src) {
+  const char* const initial_pos = src;
+  switch (static_cast<ValueType>(*src++)) {
+    case ValueType::kUnknown:
+      throw std::runtime_error("Cannot decode unknown type.");
+    case ValueType::kInt64:
+      type = ValueType::kInt64;
+      return DecodeMemcomparableFormatInteger(src, &value.int_value);
+      return src - initial_pos;
+    case ValueType::kVarChar: {
+      type = ValueType::kVarChar;
+      size_t len = DecodeMemcomparableFormatVarchar(src, &owned_data);
+      value.varchar_value = owned_data;
+      return len;
+    }
+    case ValueType::kDouble:
+      type = ValueType::kDouble;
+      return DecodeMemcomparableFormatDouble(src, &value.double_value);
+  }
 }
 
 bool Value::operator<(const Value& rhs) const {

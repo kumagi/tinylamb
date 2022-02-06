@@ -24,6 +24,7 @@ struct Row {
   size_t Serialize(char* dst) const;
   size_t Deserialize(const char* src, const Schema& sc);
   [[nodiscard]] size_t Size() const;
+  std::string EncodeMemcomparableFormat() const;
 
   bool operator==(const Row& rhs) const;
   friend std::ostream& operator<<(std::ostream& o, const Row& r);

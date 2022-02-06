@@ -31,9 +31,12 @@ class Table {
 
   Status Update(Transaction& txn, RowPosition pos, const Row& row);
 
-  Status Delete(Transaction& txn, RowPosition pos);
+  Status Delete(Transaction& txn, RowPosition pos) const;
 
-  Status Read(Transaction& txn, RowPosition pos, Row* result);
+  Status Read(Transaction& txn, RowPosition pos, Row* result) const;
+
+  Status ReadByKey(Transaction& txn, std::string_view index_name,
+                   const Row& keys, Row* result) const;
 
   PageManager* pm_;
   Schema schema_;

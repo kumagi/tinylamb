@@ -46,6 +46,14 @@ size_t Row::Deserialize(const char* src, const Schema& sc) {
   return ret;
 }
 
+std::string Row::EncodeMemcomparableFormat() const {
+  std::stringstream ss;
+  for (const auto& v : values_) {
+    ss << v.EncodeMemcomparableFormat();
+  }
+  return ss.str();
+}
+
 bool Row::operator==(const Row& rhs) const { return values_ == rhs.values_; }
 
 std::ostream& operator<<(std::ostream& o, const Row& r) {
