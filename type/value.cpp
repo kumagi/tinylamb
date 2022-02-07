@@ -35,6 +35,13 @@ Value::Value(double double_value) {
   value.double_value = double_value;
 }
 
+Value::Value(const Value& o)
+    : owned_data(o.owned_data), type(o.type), value(o.value) {
+  if (!owned_data.empty() && type == ValueType::kVarChar) {
+    value.varchar_value = owned_data;
+  }
+}
+
 [[nodiscard]] size_t Value::Size() const {
   switch (type) {
     case ValueType::kUnknown:
@@ -124,30 +131,51 @@ size_t DecodeMemcomparableFormatInteger(const char* src, int64_t* dst) {
 }
 
 std::string EncodeMemcomparableFormatVarchar(std::string_view in) {
+  if (in.empty()) {
+    return {'\x02', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0'};
+  }
   std::string ret(1 + (in.size() + 7) / 8 * 9, '\0');
   ret[0] = static_cast<char>(ValueType::kVarChar);  // Embeds prefix.
   char* dst = ret.data() + 1;
   const char* src = in.data();
   const size_t size = in.size();
-  for (size_t i = 0; i < size; i += 8) {
+  for (size_t i = 0;; i += 8) {
     if (9 <= size - i) {
       memcpy(dst, src, 8);
       dst += 8;
       src += 8;
       *dst++ = 9;
     } else {  // Final 1~8 bytes.
-      const size_t diff = size - i;
-      memcpy(dst, src, diff);
+      memcpy(dst, src, size - i);
       dst += 8;
       *dst++ = char((size % 8) + (size % 8 == 0 ? 8 : 0));
-      break;
+      return ret;
     }
   }
-  return ret;
 }
 
-size_t DecodeMemcomparableFormatVarchar(std::string_view src,
-                                        std::string* dst) {}
+size_t DecodeMemcomparableFormatVarchar(const char* src, std::string* dst) {
+  dst->clear();
+  const char* buffer;
+  const char* const initial_offset = src;
+  for (size_t size = 0;;) {
+    buffer = src;
+    const size_t offset = dst->size();
+    if (buffer[8] == 9) {
+      size += 8;
+      dst->resize(size);
+      memcpy(dst->data() + offset, buffer, 8);
+    } else {
+      size += buffer[8];
+      src += buffer[8];
+      dst->resize(size);
+      memcpy(dst->data() + offset, buffer, buffer[8]);
+      break;
+    }
+    src += buffer[8];
+  }
+  return src - initial_offset;
+}
 
 std::string EncodeMemcomparableFormatDouble(double in) {
   std::string ret(1 + 8, '\0');
@@ -190,17 +218,21 @@ std::string Value::EncodeMemcomparableFormat() const {
 }
 
 size_t Value::DecodeMemcomparableFormat(const char* src) {
-  const char* const initial_pos = src;
   switch (static_cast<ValueType>(*src++)) {
     case ValueType::kUnknown:
       throw std::runtime_error("Cannot decode unknown type.");
     case ValueType::kInt64:
       type = ValueType::kInt64;
       return DecodeMemcomparableFormatInteger(src, &value.int_value);
-      return src - initial_pos;
     case ValueType::kVarChar: {
       type = ValueType::kVarChar;
       size_t len = DecodeMemcomparableFormatVarchar(src, &owned_data);
+      if (len == 0) {
+        LOG(TRACE) << Hex(std::string_view(src, 9));
+        LOG(WARN) << owned_data.length();
+        LOG(TRACE) << len;
+        LOG(ERROR) << Hex(owned_data.data());
+      }
       value.varchar_value = owned_data;
       return len;
     }
@@ -208,6 +240,7 @@ size_t Value::DecodeMemcomparableFormat(const char* src) {
       type = ValueType::kDouble;
       return DecodeMemcomparableFormatDouble(src, &value.double_value);
   }
+  throw std::runtime_error("broken data");
 }
 
 bool Value::operator<(const Value& rhs) const {
@@ -230,6 +263,16 @@ bool Value::operator<(const Value& rhs) const {
 std::ostream& operator<<(std::ostream& o, const Value& v) {
   o << v.AsString();
   return o;
+}
+
+Value& Value::operator=(const Value& rhs) {
+  type = rhs.type;
+  value = rhs.value;
+  if (!rhs.owned_data.empty()) {
+    owned_data = rhs.owned_data;
+    value.varchar_value = owned_data;
+  }
+  return *this;
 }
 
 }  // namespace tinylamb

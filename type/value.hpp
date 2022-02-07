@@ -19,6 +19,7 @@ class Value {
   explicit Value(int64_t int_val);
   explicit Value(std::string_view varchar_val);
   explicit Value(double double_value);
+  Value(const Value& o);
 
   [[nodiscard]] size_t Size() const;
 
@@ -35,6 +36,7 @@ class Value {
 
   [[nodiscard]] std::string AsString() const;
   friend std::ostream& operator<<(std::ostream& o, const Value& v);
+  Value& operator=(const Value& rhs);
 
   union {
     int64_t int_value;

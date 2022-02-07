@@ -3,6 +3,7 @@
 //
 #include "type/value.hpp"
 
+#include "common/debug.hpp"
 #include "common/log_message.hpp"
 #include "gtest/gtest.h"
 
@@ -94,14 +95,16 @@ TEST(ValueTest, MemcomparableVarchar) {
   EXPECT_EQ(
       Value("abcdefgh").EncodeMemcomparableFormat(),
       std::string({'\2', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', '\x08'}));
-  EXPECT_EQ(
-      Value("abcdefghi").EncodeMemcomparableFormat(),
-      std::string({'\x02', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', '\x09', 'i',
-                   '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\x01'}));
+  EXPECT_EQ(Value("abcdefghi").EncodeMemcomparableFormat(),
+            std::string({'\2', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', '\x09',
+                         'i', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\1'}));
   EXPECT_EQ(
       Value("abcdefghij").EncodeMemcomparableFormat(),
       std::string({'\2', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', '\x09', 'i',
                    'j', '\0', '\0', '\0', '\0', '\0', '\0', '\x02'}));
+  EXPECT_EQ(
+      Value("\x60\x70\x10\x11\x12\x80\x90\x01").EncodeMemcomparableFormat(),
+      std::string("\x02\x60\x70\x10\x11\x12\x80\x90\x01\x08"));
 }
 
 TEST(ValueTest, MemcomparableOrderVarchar) {
@@ -137,6 +140,7 @@ void EncodeDecodeTest(const Value& v) {
   std::string encoded = v.EncodeMemcomparableFormat();
   Value another;
   const char* src = encoded.c_str();
+
   another.DecodeMemcomparableFormat(src);
   ASSERT_EQ(v, another);
 }
@@ -147,6 +151,18 @@ TEST(ValueTest, EncodeDecodeInt) {
   EncodeDecodeTest(Value(0));
   EncodeDecodeTest(Value(-1));
   EncodeDecodeTest(Value(std::numeric_limits<int64_t>::min()));
+}
+
+TEST(ValueTest, EncodeDecodeVarchar) {
+  EncodeDecodeTest(Value("a"));
+  EncodeDecodeTest(Value(""));
+  EncodeDecodeTest(Value("hello"));
+  EncodeDecodeTest(Value("A bit long string"));
+  EncodeDecodeTest(Value("12345678"));
+  EncodeDecodeTest(Value("\x50\x60\x70\x10\x11\x12\x80\x02\x01"));
+  EncodeDecodeTest(Value("\x60\x70\x10\x11\x12\x80\x90\x08"));
+  EncodeDecodeTest(Value("\x60\x70\x10\x11\x12\x90\x80\x08"));
+  EncodeDecodeTest(Value("49p2u3po32u423pori2pouropiu"));
 }
 
 TEST(ValueTest, EncodeDecodeDouble) {
@@ -169,6 +185,12 @@ void MemcomparableFormatDecodeTest(const std::vector<std::string>& input) {
   }
   for (size_t i = 0; i < decoded.size(); ++i) {
     for (size_t j = i + 1; j < decoded.size(); ++j) {
+      if (!(decoded[i] < decoded[j])) {
+        LOG(ERROR) << Hex(values[i]) << " vs " << Hex(values[j]);
+        LOG(ERROR) << Hex(decoded[i].value.varchar_value) << " vs "
+                   << Hex(decoded[j].value.varchar_value);
+        abort();
+      }
       ASSERT_LT(decoded[i], decoded[j]);
     }
   }
@@ -184,12 +206,27 @@ TEST(ValueTest, MemComparableFormatDecodeInt) {
   MemcomparableFormatDecodeTest(targets);
 }
 
-TEST(ValueTest, MemComparableFormatDecodeDouble) {
-  std::string src = "\x60\x70\x80\x90\x10\x11\x12";
-  ASSERT_EQ(src.size(), 7);
+TEST(ValueTest, MemComparableFormatDecodeVarchar) {
+  std::string src = "\x60\x70\x80\x90\x10";
+  ASSERT_EQ(src.size(), 5);
   std::vector<std::string> targets;
   do {
-    targets.emplace_back(std::string("\x03") + src + "\x01");
+    std::string v = "\x02" + src;
+    v.push_back(0);
+    v.push_back(0);
+    v.push_back(0);
+    v.push_back(char(v.size() - 1));
+    ASSERT_EQ(v.size(), 10);
+    targets.push_back(v);
+  } while (std::next_permutation(src.begin(), src.end()));
+  MemcomparableFormatDecodeTest(targets);
+}
+
+TEST(ValueTest, MemComparableFormatDecodeDouble) {
+  std::string src = "\x60\x70\x80\x90\x10\x11\x12";
+  std::vector<std::string> targets;
+  do {
+    targets.emplace_back("\x03" + src + "\x01");
   } while (std::next_permutation(src.begin(), src.end()));
   MemcomparableFormatDecodeTest(targets);
 }
