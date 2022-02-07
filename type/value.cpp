@@ -3,13 +3,8 @@
 //
 #include "type/value.hpp"
 
-#include <assert.h>
-
 #include <cstring>
-#include <iomanip>
-#include <iostream>
 
-#include "common/debug.hpp"
 #include "common/log_message.hpp"
 #include "common/serdes.hpp"
 
@@ -227,12 +222,6 @@ size_t Value::DecodeMemcomparableFormat(const char* src) {
     case ValueType::kVarChar: {
       type = ValueType::kVarChar;
       size_t len = DecodeMemcomparableFormatVarchar(src, &owned_data);
-      if (len == 0) {
-        LOG(TRACE) << Hex(std::string_view(src, 9));
-        LOG(WARN) << owned_data.length();
-        LOG(TRACE) << len;
-        LOG(ERROR) << Hex(owned_data.data());
-      }
       value.varchar_value = owned_data;
       return len;
     }

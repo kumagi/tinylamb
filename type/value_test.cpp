@@ -3,7 +3,6 @@
 //
 #include "type/value.hpp"
 
-#include "common/debug.hpp"
 #include "common/log_message.hpp"
 #include "gtest/gtest.h"
 
@@ -185,12 +184,6 @@ void MemcomparableFormatDecodeTest(const std::vector<std::string>& input) {
   }
   for (size_t i = 0; i < decoded.size(); ++i) {
     for (size_t j = i + 1; j < decoded.size(); ++j) {
-      if (!(decoded[i] < decoded[j])) {
-        LOG(ERROR) << Hex(values[i]) << " vs " << Hex(values[j]);
-        LOG(ERROR) << Hex(decoded[i].value.varchar_value) << " vs "
-                   << Hex(decoded[j].value.varchar_value);
-        abort();
-      }
       ASSERT_LT(decoded[i], decoded[j]);
     }
   }
@@ -207,13 +200,11 @@ TEST(ValueTest, MemComparableFormatDecodeInt) {
 }
 
 TEST(ValueTest, MemComparableFormatDecodeVarchar) {
-  std::string src = "\x60\x70\x80\x90\x10";
-  ASSERT_EQ(src.size(), 5);
+  std::string src = "\x60\x70\x80\x90\x10\x11\x12";
+  ASSERT_EQ(src.size(), 7);
   std::vector<std::string> targets;
   do {
     std::string v = "\x02" + src;
-    v.push_back(0);
-    v.push_back(0);
     v.push_back(0);
     v.push_back(char(v.size() - 1));
     ASSERT_EQ(v.size(), 10);
