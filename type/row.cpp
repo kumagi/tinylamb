@@ -13,7 +13,7 @@ void Row::Add(const Value& v) { values_.push_back(v); }
 
 Value& Row::operator[](int i) { return values_[i]; }
 
-const Value& Row::operator[](int i) const { return values_[i]; }
+const Value& Row::operator[](size_t i) const { return values_[i]; }
 
 size_t Row::Serialize(char* dst) const {
   const char* const original_offset = dst;

@@ -35,6 +35,8 @@ class TableTest : public ::testing::Test {
     Transaction txn = tm_->Begin();
     PageRef row_page = p_->AllocateNewPage(txn, PageType::kRowPage);
     std::vector<Index> ind;
+    PageRef bt_root = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    ind.push_back({"idx1", {0, 1}, bt_root->PageID()});
     table_ =
         std::make_unique<Table>(p_.get(), schema_, row_page->PageID(), ind);
   }
@@ -123,6 +125,24 @@ TEST_F(TableTest, Delete) {
   ASSERT_SUCCESS(table_->Delete(txn, rp));
   Row read;
   ASSERT_FAIL(table_->Read(txn, rp, &read));
+}
+
+TEST_F(TableTest, IndexRead) {
+  Transaction txn = tm_->Begin();
+  RowPosition rp;
+  ASSERT_SUCCESS(
+      table_->Insert(txn, Row({Value(1), Value("string"), Value(3.3)}), &rp));
+  ASSERT_SUCCESS(
+      table_->Insert(txn, Row({Value(2), Value("hoge"), Value(4.8)}), &rp));
+  ASSERT_SUCCESS(
+      table_->Insert(txn, Row({Value(3), Value("foo"), Value(1.5)}), &rp));
+
+  Row key({Value(2), Value("hoge")});
+  Row result;
+  ASSERT_SUCCESS(table_->ReadByKey(txn, "idx1", key, &result));
+  ASSERT_EQ(result[0], Value(2));
+  ASSERT_EQ(result[1], Value("hoge"));
+  ASSERT_EQ(result[2], Value(4.8));
 }
 
 }  // namespace tinylamb

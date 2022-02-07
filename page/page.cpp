@@ -75,7 +75,7 @@ size_t Page::RowCount(Transaction& txn) const {
   }
 }
 
-Status Page::Read(Transaction& txn, uint16 slot,
+Status Page::Read(Transaction& txn, page_id_t slot,
                   std::string_view* result) const {
   if (type == PageType::kRowPage) {
     return body.row_page.Read(PageID(), txn, slot, result);

@@ -20,11 +20,11 @@ struct Row {
 
   void Add(const Value& v);
   Value& operator[](int i);
-  const Value& operator[](int i) const;
+  const Value& operator[](size_t i) const;
   size_t Serialize(char* dst) const;
   size_t Deserialize(const char* src, const Schema& sc);
   [[nodiscard]] size_t Size() const;
-  std::string EncodeMemcomparableFormat() const;
+  [[nodiscard]] std::string EncodeMemcomparableFormat() const;
 
   bool operator==(const Row& rhs) const;
   friend std::ostream& operator<<(std::ostream& o, const Row& r);

@@ -14,12 +14,11 @@ namespace tinylamb {
 
 class Index {
  public:
-
-
-
+  Index(std::string name, std::vector<size_t> key, page_id_t pid)
+      : name_(std::move(name)), key_(std::move(key)), pid_(pid) {}
   std::string name_;
-  std::vector<size_t> key;
-  page_id_t pid;
+  std::vector<size_t> key_;
+  page_id_t pid_;
 };
 
 }  // namespace tinylamb
