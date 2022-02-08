@@ -87,6 +87,8 @@ Status Table::ReadByKey(Transaction& txn, std::string_view index_name,
       } else {
         return Status::kNotExists;
       }
+    } else if (status == Status::kNotExists) {
+      return Status::kNotExists;
     } else {
       return Status::kConflicts;  // TODO(kumagi): is it true?
     }

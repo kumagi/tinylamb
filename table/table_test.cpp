@@ -165,4 +165,20 @@ TEST_F(TableTest, IndexUpdateRead) {
   ASSERT_EQ(result[2], Value(5.8));
 }
 
+TEST_F(TableTest, IndexUpdateDelete) {
+  Transaction txn = tm_->Begin();
+  RowPosition _, target;
+  ASSERT_SUCCESS(
+      table_->Insert(txn, Row({Value(1), Value("string"), Value(3.3)}), &_));
+  ASSERT_SUCCESS(
+      table_->Insert(txn, Row({Value(2), Value("hoge"), Value(4.8)}), &target));
+  ASSERT_SUCCESS(
+      table_->Insert(txn, Row({Value(3), Value("foo"), Value(1.5)}), &_));
+  ASSERT_SUCCESS(table_->Delete(txn, target));
+
+  Row key({Value(2), Value("hoge")});
+  Row result;
+  ASSERT_EQ(table_->ReadByKey(txn, "idx1", key, &result), Status::kNotExists);
+}
+
 }  // namespace tinylamb
