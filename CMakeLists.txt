@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD 17)
 add_executable(tinylamb
         main.cpp
         )
+# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined -fsanitize=bounds -fsanitize=address")
 
 target_link_libraries(
         tinylamb

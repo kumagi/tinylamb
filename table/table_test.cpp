@@ -28,7 +28,7 @@ class TableTest : public ::testing::Test {
  public:
   void SetUp() override {
     schema_ = Schema("SampleTable", {Column("col1", ValueType::kInt64,
-                                            Constraint(Constraint::kPrimary)),
+                                            Constraint(Constraint::kIndex)),
                                      Column("col2", ValueType::kVarChar),
                                      Column("col3", ValueType::kDouble)});
     Recover();
@@ -143,6 +143,26 @@ TEST_F(TableTest, IndexRead) {
   ASSERT_EQ(result[0], Value(2));
   ASSERT_EQ(result[1], Value("hoge"));
   ASSERT_EQ(result[2], Value(4.8));
+}
+
+TEST_F(TableTest, IndexUpdateRead) {
+  Transaction txn = tm_->Begin();
+  RowPosition _, target;
+  ASSERT_SUCCESS(
+      table_->Insert(txn, Row({Value(1), Value("string"), Value(3.3)}), &_));
+  ASSERT_SUCCESS(
+      table_->Insert(txn, Row({Value(2), Value("hoge"), Value(4.8)}), &target));
+  ASSERT_SUCCESS(
+      table_->Insert(txn, Row({Value(3), Value("foo"), Value(1.5)}), &_));
+  ASSERT_SUCCESS(
+      table_->Update(txn, target, Row({Value(2), Value("baz"), Value(5.8)})));
+
+  Row key({Value(2), Value("baz")});
+  Row result;
+  ASSERT_SUCCESS(table_->ReadByKey(txn, "idx1", key, &result));
+  ASSERT_EQ(result[0], Value(2));
+  ASSERT_EQ(result[1], Value("baz"));
+  ASSERT_EQ(result[2], Value(5.8));
 }
 
 }  // namespace tinylamb

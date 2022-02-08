@@ -9,18 +9,19 @@
 namespace tinylamb {
 
 size_t SerializeStringView(char* pos, std::string_view bin) {
-  *reinterpret_cast<bin_size_t*>(pos) = bin.size();
-  memcpy(pos + sizeof(bin_size_t), bin.data(), bin.size());
-  return sizeof(bin_size_t) + bin.size();
+  bin_size_t len = bin.size();
+  memcpy(pos, &len, sizeof(len));
+  memcpy(pos + sizeof(len), bin.data(), bin.size());
+  return sizeof(len) + bin.size();
 }
 
 size_t SerializeSlot(char* pos, slot_t slot) {
-  *reinterpret_cast<slot_t*>(pos) = slot;
+  memcpy(pos, &slot, sizeof(slot));
   return sizeof(slot_t);
 }
 
 size_t SerializePID(char* pos, page_id_t pid) {
-  *reinterpret_cast<page_id_t*>(pos) = pid;
+  memcpy(pos, &pid, sizeof(pid));
   return sizeof(page_id_t);
 }
 
@@ -29,37 +30,39 @@ size_t SerializeSize(std::string_view bin) {
 }
 
 size_t SerializeInteger(char* pos, int64_t i) {
-  *reinterpret_cast<int64_t*>(pos) = i;
+  memcpy(pos, &i, sizeof(i));
   return sizeof(int64_t);
 }
 
 size_t SerializeDouble(char* pos, double d) {
-  *reinterpret_cast<double*>(pos) = d;
+  memcpy(pos, &d, sizeof(d));
   return sizeof(double);
 }
 
 size_t DeserializeStringView(const char* pos, std::string_view* out) {
-  *out = {pos + sizeof(bin_size_t), *reinterpret_cast<const bin_size_t*>(pos)};
-  return *reinterpret_cast<const bin_size_t*>(pos) + sizeof(bin_size_t);
+  bin_size_t len;
+  memcpy(&len, pos, sizeof(bin_size_t));
+  *out = {pos + sizeof(len), len};
+  return sizeof(len) + len;
 }
 
 size_t DeserializeSlot(const char* pos, slot_t* out) {
-  *out = *reinterpret_cast<const slot_t*>(pos);
+  memcpy(out, pos, sizeof(*out));
   return sizeof(slot_t);
 }
 
 size_t DeserializePID(const char* pos, page_id_t* out) {
-  *out = *reinterpret_cast<const page_id_t*>(pos);
+  memcpy(out, pos, sizeof(page_id_t));
   return sizeof(page_id_t);
 }
 
 size_t DeserializeInteger(const char* pos, int64_t* out) {
-  *out = *reinterpret_cast<const int64_t*>(pos);
+  memcpy(out, pos, sizeof(int64_t));
   return sizeof(uint64_t);
 }
 
 size_t DeserializeDouble(const char* pos, double* out) {
-  *out = *reinterpret_cast<const double*>(pos);
+  memcpy(out, pos, sizeof(double));
   return sizeof(double);
 }
 

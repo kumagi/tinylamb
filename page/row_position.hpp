@@ -9,6 +9,7 @@
 #include <ostream>
 
 #include "common/constants.hpp"
+#include "common/serdes.hpp"
 
 namespace tinylamb {
 
@@ -31,6 +32,16 @@ struct RowPosition {
   }
   bool operator==(const RowPosition& rhs) const {
     return page_id == rhs.page_id && slot == rhs.slot;
+  }
+
+  [[nodiscard]] std::string_view AsStringView() const {
+    return {reinterpret_cast<const char*>(this), sizeof(RowPosition)};
+  }
+  size_t Deserialize(const char* src) {
+    const char* const original_offset = src;
+    src += DeserializePID(src, &page_id);
+    src += DeserializeSlot(src, &slot);
+    return src - original_offset;
   }
 
   static constexpr size_t Size() { return sizeof(page_id) + sizeof(slot); }

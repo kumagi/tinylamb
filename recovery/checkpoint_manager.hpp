@@ -53,12 +53,17 @@ class CheckpointManager {
     }
 
     static size_t Deserialize(const char* src, ActiveTransactionEntry* dst) {
-      const auto* txn_id = reinterpret_cast<const txn_id_t*>(src);
-      src += sizeof(*txn_id);
-      const auto* status = reinterpret_cast<const TransactionStatus*>(src);
-      src += sizeof(*status);
-      const auto* last_lsn = reinterpret_cast<const lsn_t*>(src);
-      *dst = {*txn_id, *status, *last_lsn};
+      txn_id_t tid;
+      memcpy(&tid, src, sizeof(tid));
+      src += sizeof(tid);
+
+      TransactionStatus status;
+      memcpy(&status, src, sizeof(status));
+      src += sizeof(status);
+
+      lsn_t last_lsn;
+      memcpy(&last_lsn, src, sizeof(last_lsn));
+      *dst = {tid, status, last_lsn};
       return Size();
     }
 

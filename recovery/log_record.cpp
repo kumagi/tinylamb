@@ -309,11 +309,14 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
       src += sizeof(dpt_size);
       dst->dirty_page_table.reserve(dpt_size);
       for (size_t i = 0; i < dpt_size; ++i) {
-        const auto* dirty_page_id = reinterpret_cast<const page_id_t*>(src);
-        src += sizeof(*dirty_page_id);
-        const auto* recovery_lsn = reinterpret_cast<const lsn_t*>(src);
-        src += sizeof(*recovery_lsn);
-        dst->dirty_page_table.emplace_back(*dirty_page_id, *recovery_lsn);
+        page_id_t dirty_page_id;
+        memcpy(&dirty_page_id, src, sizeof(dirty_page_id));
+        src += sizeof(dirty_page_id);
+
+        lsn_t recovery_lsn;
+        memcpy(&recovery_lsn, src, sizeof(recovery_lsn));
+        src += sizeof(recovery_lsn);
+        dst->dirty_page_table.emplace_back(dirty_page_id, recovery_lsn);
       }
 
       uint64_t tt_size;

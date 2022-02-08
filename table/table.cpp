@@ -29,43 +29,33 @@ Status Table::Insert(Transaction& txn, const Row& row, RowPosition* rp) {
     last_pid_ = new_page->PageID();
   }
   for (auto& idx : indices_) {
-    std::stringstream s;
-    for (const auto& k : idx.key_) {
-      s << row[k].EncodeMemcomparableFormat();
-    }
-    std::string key(s.str());
     BPlusTree bpt(idx.pid_, pm_);
-    std::string_view value(reinterpret_cast<char*>(rp), sizeof(RowPosition));
-    bpt.Insert(txn, key, value);
+    bpt.Insert(txn, idx.GenerateKey(row), rp->AsStringView());
   }
   return Status::kSuccess;
 }
 
 Status Table::Update(Transaction& txn, RowPosition pos, const Row& row) {
-  PageRef ref = pm_->GetPage(pos.page_id);
-  std::string serialized_row(row.Size(), ' ');
-  row.Serialize(serialized_row.data());
-  Status result = ref->Update(txn, pos.slot, serialized_row);
-  if (result == Status::kSuccess) return result;
-  if (result == Status::kNoSpace) {
-    Status delete_result = ref->Delete(txn, pos.slot);
-    PageRef new_page = pm_->AllocateNewPage(txn, PageType::kRowPage);
-    slot_t new_pos;
-    Status new_result = new_page->Insert(txn, serialized_row, &new_pos);
-    pos.page_id = new_page->PageID();
-    pos.slot = new_pos;
-    ref->body.row_page.next_page_id_ = new_page->PageID();
-    new_page->body.row_page.prev_page_id_ = ref->PageID();
-    last_pid_ = new_page->PageID();
-    return new_result;
+  Row original_row;
+  Read(txn, pos, &original_row);
+  for (const auto& idx : indices_) {
+    BPlusTree bpt(idx.pid_, pm_);
+    bpt.Delete(txn, idx.GenerateKey(original_row));
+    bpt.Insert(txn, idx.GenerateKey(row), pos.AsStringView());
   }
-  throw std::runtime_error("update failed");
+  std::string serialized_row(row.Size(), '\0');
+  row.Serialize(serialized_row.data());
+  return pm_->GetPage(pos.page_id)->Update(txn, pos.slot, serialized_row);
 }
 
 Status Table::Delete(Transaction& txn, RowPosition pos) const {
-  PageRef ref = pm_->GetPage(pos.page_id);
-  Status delete_result = ref->Delete(txn, pos.slot);
-  return delete_result;
+  Row original_row;
+  Read(txn, pos, &original_row);
+  for (const auto& idx : indices_) {
+    BPlusTree bpt(idx.pid_, pm_);
+    bpt.Delete(txn, idx.GenerateKey(original_row));
+  }
+  return pm_->GetPage(pos.page_id)->Delete(txn, pos.slot);
 }
 
 Status Table::Read(Transaction& txn, RowPosition pos, Row* result) const {
@@ -87,10 +77,10 @@ Status Table::ReadByKey(Transaction& txn, std::string_view index_name,
     Status status = bpt.Read(txn, encoded_key, &val);
     if (status == Status::kSuccess) {
       RowPosition pos;
-      memcpy(&pos, val.data(), sizeof(RowPosition));
-      PageRef ref = pm_->GetPage(pos.page_id);
+      pos.Deserialize(val.data());
       std::string_view result_payload;
-      Status read = ref->Read(txn, pos.slot, &result_payload);
+      Status read =
+          pm_->GetPage(pos.page_id)->Read(txn, pos.slot, &result_payload);
       if (read == Status::kSuccess) {
         result->Deserialize(result_payload.data(), schema_);
         return Status::kSuccess;

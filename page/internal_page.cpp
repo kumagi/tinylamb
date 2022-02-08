@@ -191,24 +191,16 @@ std::string_view InternalPage::GetKey(size_t idx) const {
   return key;
 }
 
-const page_id_t& InternalPage::GetValue(size_t idx) const {
+page_id_t InternalPage::GetValue(size_t idx) const {
   const RowPointer* pos =
       reinterpret_cast<const RowPointer*>(Payload() + kPageBodySize -
                                           row_count_ * sizeof(RowPointer)) +
       idx;
   std::string_view key = GetKey(idx);
-  return *reinterpret_cast<const page_id_t*>(Payload() + pos->offset +
-                                             sizeof(bin_size_t) + key.size());
-}
-
-page_id_t& InternalPage::GetValue(size_t idx) {
-  const RowPointer* pos =
-      reinterpret_cast<const RowPointer*>(Payload() + kPageBodySize -
-                                          row_count_ * sizeof(RowPointer)) +
-      idx;
-  std::string_view key = GetKey(idx);
-  return *reinterpret_cast<page_id_t*>(Payload() + pos->offset +
-                                       sizeof(bin_size_t) + key.size());
+  page_id_t result;
+  memcpy(&result, Payload() + pos->offset + sizeof(bin_size_t) + key.size(),
+         sizeof(result));
+  return result;
 }
 
 void InternalPage::Dump(std::ostream& o, int indent) const {

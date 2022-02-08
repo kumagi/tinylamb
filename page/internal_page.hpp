@@ -65,8 +65,7 @@ class InternalPage {
   [[nodiscard]] bin_size_t Search(std::string_view key) const;
 
   [[nodiscard]] std::string_view GetKey(size_t idx) const;
-  [[nodiscard]] const page_id_t& GetValue(size_t idx) const;
-  [[nodiscard]] page_id_t& GetValue(size_t idx);
+  [[nodiscard]] page_id_t GetValue(size_t idx) const;
 
   void InsertImpl(std::string_view key, page_id_t redo);
   void UpdateImpl(std::string_view key, page_id_t redo);

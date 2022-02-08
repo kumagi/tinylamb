@@ -11,9 +11,10 @@
 #include "common/constants.hpp"
 
 namespace tinylamb {
-
+class Row;
 class Index {
  public:
+  std::string GenerateKey(const Row& row) const;
   Index(std::string name, std::vector<size_t> key, page_id_t pid)
       : name_(std::move(name)), key_(std::move(key)), pid_(pid) {}
   std::string name_;
