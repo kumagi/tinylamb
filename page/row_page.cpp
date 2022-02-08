@@ -34,7 +34,7 @@ Status RowPage::Read(page_id_t page_id, Transaction& txn, slot_t slot,
  */
 Status RowPage::Insert(page_id_t page_id, Transaction& txn,
                        std::string_view record, slot_t* dst) {
-  if (free_size_ + sizeof(RowPointer) < record.size()) return Status::kNoSpace;
+  if (free_size_ + sizeof(RowPointer) <= record.size()) return Status::kNoSpace;
   if (Payload() + free_ptr_ <=
       reinterpret_cast<char*>(&data_[row_count_ + 1]) + record.size()) {
     DeFragment();

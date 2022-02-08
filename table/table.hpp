@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "full_scan_iterator.hpp"
 #include "page/row_position.hpp"
 #include "table/index.hpp"
 #include "type/schema.hpp"
@@ -24,6 +25,7 @@ class Table {
   Table(PageManager* pm, Schema sc, page_id_t pid, std::vector<Index> indices)
       : pm_(pm),
         schema_(std::move(sc)),
+        first_pid_(pid),
         last_pid_(pid),
         indices_(std::move(indices)) {}
 
@@ -38,8 +40,11 @@ class Table {
   Status ReadByKey(Transaction& txn, std::string_view index_name,
                    const Row& keys, Row* result) const;
 
+  FullScanIterator Begin(Transaction& txn);
+
   PageManager* pm_;
   Schema schema_;
+  page_id_t first_pid_{};
   page_id_t last_pid_{};
   std::vector<Index> indices_;
 };

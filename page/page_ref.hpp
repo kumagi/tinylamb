@@ -51,12 +51,14 @@ class PageRef final {
   bool operator==(const PageRef& r) const {
     return pool_ == r.pool_ && page_ == r.page_;
   }
+  bool IsValid() const { return pool_ != nullptr; }
   bool operator!=(const PageRef& r) const { return !operator==(r); }
   friend std::ostream& operator<<(std::ostream& o, const PageRef& p);
 
  private:
   friend class PagePool;
   friend class PageManager;
+  friend class FullScanIterator;
   PagePool* pool_ = nullptr;
   Page* page_ = nullptr;
   std::unique_lock<std::mutex> page_lock_;

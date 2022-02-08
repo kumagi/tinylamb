@@ -32,7 +32,7 @@ add_library(libtinylamb
         transaction/transaction_manager.cpp page/page_type.cpp type/column.cpp
         common/serdes.cpp common/log_message.cpp page/page_ref.cpp page/leaf_page.cpp
         page/internal_page.cpp table/b_plus_tree.cpp type/value.cpp type/constraint.cpp
-        type/constraint.hpp table/table.cpp table/table.hpp table/index.cpp table/index.hpp common/debug.cpp common/debug.hpp)
+        type/constraint.hpp table/table.cpp table/table.hpp table/index.cpp table/index.hpp common/debug.cpp common/debug.hpp table/full_scan_iterator.cpp table/full_scan_iterator.hpp)
 
 target_include_directories(
         libtinylamb
@@ -73,21 +73,23 @@ function(add_simple_test file_path)
 endfunction()
 
 #add_simple_test(page/catalog_page_test.cpp)
-add_simple_test(table/table_test.cpp)
+
 add_simple_test(type/value_test.cpp)
 add_simple_test(type/row_test.cpp)
 add_simple_test(type/constraint_test.cpp)
 add_simple_test(type/column_test.cpp)
-add_simple_test(table/b_plus_tree_test.cpp)
+add_simple_test(type/schema_test.cpp)
 add_simple_test(page/leaf_page_test.cpp)
 add_simple_test(page/internal_page_test.cpp)
 add_simple_test(page/page_pool_test.cpp)
 add_simple_test(page/page_manager_test.cpp)
 add_simple_test(page/row_page_test.cpp)
-add_simple_test(type/schema_test.cpp)
 add_simple_test(transaction/transaction_test.cpp)
 add_simple_test(recovery/logger_test.cpp)
 add_simple_test(recovery/log_record_test.cpp)
 add_simple_test(recovery/recovery_manager_test.cpp)
 add_simple_test(recovery/checkpoint_manager_test.cpp)
+add_simple_test(table/table_test.cpp)
+add_simple_test(table/b_plus_tree_test.cpp)
+add_simple_test(table/full_scan_iterator_test.cpp)
 add_simple_test(database_test.cpp)
