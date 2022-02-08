@@ -87,7 +87,7 @@ TEST_F(FullScanIteratorTest, Construct) {}
 TEST_F(FullScanIteratorTest, Scan) {
   Transaction txn = tm_->Begin();
   RowPosition rp;
-  for (int i = 0; i < 13000; ++i) {
+  for (int i = 0; i < 130; ++i) {
     ASSERT_SUCCESS(table_->Insert(
         txn, Row({Value(i), Value("v" + std::to_string(i)), Value(0.1 + i)}),
         &rp));
