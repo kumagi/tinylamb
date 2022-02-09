@@ -223,9 +223,10 @@ Status Page::HighestKey(Transaction& txn, std::string_view* result) {
   return body.leaf_page.HighestKey(txn, result);
 }
 
-void Page::Split(Transaction& txn, Page* right) {
+void Page::Split(Transaction& txn, std::string_view key, std::string_view value,
+                 Page* right) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  body.leaf_page.Split(PageID(), txn, right);
+  body.leaf_page.Split(PageID(), txn, key, value, right);
 }
 
 Status Page::Insert(Transaction& txn, std::string_view key, page_id_t pid) {
@@ -261,9 +262,10 @@ void Page::SetLowestValue(Transaction& txn, page_id_t v) {
   SetRecLSN(txn.PrevLSN());
 }
 
-void Page::SplitInto(Transaction& txn, Page* right, std::string_view* middle) {
+void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
+                     std::string_view* middle) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  body.internal_page.SplitInto(PageID(), txn, right, middle);
+  body.internal_page.SplitInto(PageID(), txn, new_key, right, middle);
 }
 
 Status Page::LowestPage(Transaction& txn, page_id_t* page) {

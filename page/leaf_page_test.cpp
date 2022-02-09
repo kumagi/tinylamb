@@ -93,6 +93,24 @@ TEST_F(LeafPageTest, InsertMany) {
   }
 }
 
+TEST_F(LeafPageTest, InsertMany2) {
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(leaf_page_id_);
+  for (const auto& c : {'a', 'b', 'c', 'd'}) {
+    ASSERT_SUCCESS(page->Insert(txn, std::string(100, c), std::string(10, c)));
+  }
+  std::string_view out;
+  ASSERT_EQ(page->body.leaf_page.RowCount(), 4);
+  ASSERT_SUCCESS(page->Read(txn, std::string(100, 'a'), &out));
+  ASSERT_EQ(std::string(10, 'a'), out);
+  ASSERT_SUCCESS(page->Read(txn, std::string(100, 'b'), &out));
+  ASSERT_EQ(std::string(10, 'b'), out);
+  ASSERT_SUCCESS(page->Read(txn, std::string(100, 'c'), &out));
+  ASSERT_EQ(std::string(10, 'c'), out);
+  ASSERT_SUCCESS(page->Read(txn, std::string(100, 'd'), &out));
+  ASSERT_EQ(std::string(10, 'd'), out);
+}
+
 TEST_F(LeafPageTest, Update) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(leaf_page_id_);
@@ -221,27 +239,28 @@ TEST_F(LeafPageTest, LowestHighestKey) {
 
 TEST_F(LeafPageTest, Split) {
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(leaf_page_id_);
-  PageRef right = p_->AllocateNewPage(txn, PageType::kLeafPage);
-  {
-    for (size_t i = 0; i < 10; ++i) {
-      ASSERT_SUCCESS(page->Insert(txn, std::to_string(i) + ":key",
-                                  std::to_string(i) + ":value"));
+  for (int i = 0; i < 8; ++i) {
+    PageRef left = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef right = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    {
+      for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
+        ASSERT_SUCCESS(
+            left->Insert(txn, std::string(2000, c), std::string(2500, c)));
+      }
+      ASSERT_FAIL(
+          left->Insert(txn, std::string(2000, '8'), std::string(2000, '8')));
+      left->Split(txn, std::string(2000, '0' + i) + "k", std::string(2000, 'p'),
+                  right.get());
     }
-    page->Split(txn, right.get());
-  }
-  ASSERT_EQ(page->RowCount(), 5);
-  ASSERT_EQ(right->RowCount(), 5);
-  std::string_view out;
-  for (size_t i = 0; i < 5; ++i) {
-    ASSERT_SUCCESS(page->Read(txn, std::to_string(i) + ":key", &out));
-    ASSERT_EQ(std::to_string(i) + ":value", out);
-  }
-  {
-    for (size_t i = 5; i < 10; ++i) {
-      ASSERT_SUCCESS(right->Read(txn, std::to_string(i) + ":key", &out));
-      ASSERT_EQ(std::to_string(i) + ":value", out);
+    if (i < 5) {
+      ASSERT_SUCCESS(left->Insert(txn, std::string(2000, '0' + i) + "k",
+                                  std::string(2000, 'p')));
+    } else {
+      ASSERT_SUCCESS(right->Insert(txn, std::string(200, '0' + i) + "k",
+                                   std::string(2000, 'p')));
     }
+    LOG(TRACE) << *left;
+    LOG(WARN) << *right;
   }
 }
 

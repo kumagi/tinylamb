@@ -39,10 +39,11 @@ Status Table::Insert(Transaction& txn, const Row& row, RowPosition* rp) {
 
 Status Table::Update(Transaction& txn, RowPosition pos, const Row& row) {
   Row original_row;
-  Read(txn, pos, &original_row);
+  Status s = Read(txn, pos, &original_row);
+  if (s != Status::kSuccess) return s;
   for (const auto& idx : indices_) {
     BPlusTree bpt(idx.pid_, pm_);
-    Status s = bpt.Delete(txn, idx.GenerateKey(original_row));
+    s = bpt.Delete(txn, idx.GenerateKey(original_row));
     if (s != Status::kSuccess) return s;
     s = bpt.Insert(txn, idx.GenerateKey(row), pos.AsStringView());
     if (s != Status::kSuccess) return s;

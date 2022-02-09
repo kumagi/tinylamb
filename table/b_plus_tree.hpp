@@ -12,6 +12,7 @@
 
 namespace tinylamb {
 
+class BPlusTreeIterator;
 class Transaction;
 class PageManager;
 class PageRef;
@@ -27,6 +28,10 @@ class BPlusTree {
   PageRef FindLeaf(Transaction& txn, std::string_view key, PageRef&& root);
   Status InsertInternal(Transaction& txn, std::string_view key, page_id_t left,
                         page_id_t right, std::vector<PageRef>& parents);
+  PageRef FindLeftmostPage(Transaction& txn, PageRef&& root);
+  PageRef FindRightmostPage(Transaction& txn, PageRef&& root);
+  PageRef LeftmostPage(Transaction& txn);
+  PageRef RightmostPage(Transaction& txn);
 
  public:
   BPlusTree(page_id_t root, PageManager* pm);
@@ -35,9 +40,12 @@ class BPlusTree {
   Status Delete(Transaction& txn, std::string_view key);
   Status Read(Transaction& txn, std::string_view key, std::string_view* dst);
   void Dump(Transaction& txn, std::ostream& o, int indent = 0) const;
-  page_id_t Root() const { return root_; }
+  [[nodiscard]] page_id_t Root() const { return root_; }
+  BPlusTreeIterator Begin(Transaction& txn, std::string_view left = "",
+                          std::string_view right = "", bool ascending = true);
 
  private:
+  friend class BPlusTreeIterator;
   void DumpInternal(Transaction& txn, std::ostream& o, PageRef&& page,
                     int indent = 0) const;
 

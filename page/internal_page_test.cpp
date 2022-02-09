@@ -213,51 +213,18 @@ TEST_F(InternalPageTest, DeleteKey) {
 
 TEST_F(InternalPageTest, SplitInto) {
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(internal_page_id_);
-  page->SetLowestValue(txn, 1);
-  ASSERT_SUCCESS(page->Insert(txn, "a", 2));
-  ASSERT_SUCCESS(page->Insert(txn, "b", 3));
-  ASSERT_SUCCESS(page->Insert(txn, "c", 4));
-  ASSERT_SUCCESS(page->Insert(txn, "d", 5));
-  ASSERT_SUCCESS(page->Insert(txn, "e", 6));
-  ASSERT_SUCCESS(page->Insert(txn, "f", 7));
-  ASSERT_SUCCESS(page->Insert(txn, "g", 8));
-  ASSERT_SUCCESS(page->Insert(txn, "h", 9));
-  ASSERT_SUCCESS(page->Insert(txn, "i", 10));
-  PageRef right = p_->AllocateNewPage(txn, PageType::kInternalPage);
-  std::string_view mid;
+  for (int i = 0; i < 8; ++i) {
+    PageRef page = p_->AllocateNewPage(txn, PageType::kInternalPage);
+    page->SetLowestValue(txn, 0);
+    for (int j = 0; j < 8; ++j) {
+      ASSERT_SUCCESS(page->Insert(txn, std::string(4000, '0' + j), j + 1));
+    }
+    LOG(TRACE) << *page;
 
-  page->SplitInto(txn, right.get(), &mid);
-  ASSERT_EQ("e", mid);
-
-  page_id_t pid;
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "a", &pid));
-  ASSERT_EQ(pid, 2);
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "b", &pid));
-  EXPECT_EQ(pid, 3);
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "c", &pid));
-  EXPECT_EQ(pid, 4);
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "d", &pid));
-  EXPECT_EQ(pid, 5);
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "e", &pid));
-  ASSERT_EQ(pid, 5);  // Migrated into right node.
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "f", &pid));
-  EXPECT_EQ(pid, 5);
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "g", &pid));
-  EXPECT_EQ(pid, 5);
-
-  ASSERT_SUCCESS(right->GetPageForKey(txn, "a", &pid));
-  ASSERT_EQ(pid, 6);  // Minimum value of this node.
-  ASSERT_SUCCESS(right->GetPageForKey(txn, "e", &pid));
-  ASSERT_EQ(pid, 6);
-  ASSERT_SUCCESS(right->GetPageForKey(txn, "f", &pid));
-  EXPECT_EQ(pid, 7);
-  ASSERT_SUCCESS(right->GetPageForKey(txn, "g", &pid));
-  EXPECT_EQ(pid, 8);
-  ASSERT_SUCCESS(right->GetPageForKey(txn, "h", &pid));
-  EXPECT_EQ(pid, 9);
-  ASSERT_SUCCESS(right->GetPageForKey(txn, "i", &pid));
-  EXPECT_EQ(pid, 10);
+    PageRef right = p_->AllocateNewPage(txn, PageType::kInternalPage);
+    std::string_view mid;
+    page->SplitInto(txn, std::string(4000, '0' + i), right.get(), &mid);
+  }
 }
 
 TEST_F(InternalPageTest, Recovery) {

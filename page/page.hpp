@@ -60,7 +60,8 @@ class Page {
   Status Read(Transaction& txn, std::string_view key, std::string_view* result);
   Status LowestKey(Transaction& txn, std::string_view* result);
   Status HighestKey(Transaction& txn, std::string_view* result);
-  void Split(Transaction& txn, Page* right);
+  void Split(Transaction& txn, std::string_view key, std::string_view value,
+             Page* right);
 
   // Internal page manipulations.
   Status Insert(Transaction& txn, std::string_view key, page_id_t pid);
@@ -68,7 +69,8 @@ class Page {
   Status GetPageForKey(Transaction& txn, std::string_view key,
                        page_id_t* page) const;
   void SetLowestValue(Transaction& txn, page_id_t i);
-  void SplitInto(Transaction& txn, Page* right, std::string_view* middle);
+  void SplitInto(Transaction& txn, std::string_view new_key, Page* right,
+                 std::string_view* middle);
   Status LowestPage(Transaction& txn, page_id_t* page);
 
   // Internal methods exposed for recovery.

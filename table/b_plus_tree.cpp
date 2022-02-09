@@ -8,6 +8,7 @@
 
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
+#include "table/b_plus_tree_iterator.hpp"
 
 namespace tinylamb {
 
@@ -51,42 +52,72 @@ Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
   } else {
     PageRef internal(std::move(parents.back()));
     parents.pop_back();
-    Status result = internal->Insert(txn, key, right);
-    if (result == Status::kSuccess) return Status::kSuccess;
-    if (result == Status::kNoSpace) {
+    Status s = internal->Insert(txn, key, right);
+    if (s == Status::kSuccess) return Status::kSuccess;
+    if (s == Status::kNoSpace) {
       PageRef new_node = pm_->AllocateNewPage(txn, PageType::kInternalPage);
       std::string_view new_key;
-      internal->SplitInto(txn, new_node.get(), &new_key);
-      if (key < new_key) {
-        internal->Insert(txn, key, right);
-      } else {
-        new_node->Insert(txn, key, right);
-      }
+      internal->SplitInto(txn, key, new_node.get(), &new_key);
+      s = [&]() {
+        if (key < new_key) {
+          return internal->Insert(txn, key, right);
+        } else {
+          return new_node->Insert(txn, key, right);
+        }
+      }();
+      if (s != Status::kSuccess) return s;
       return InsertInternal(txn, new_key, internal->PageID(),
                             new_node->PageID(), parents);
     }
-    throw std::runtime_error("unknown status:" + std::string(ToString(result)));
+    throw std::runtime_error("unknown status:" + std::string(ToString(s)));
   }
+}
+
+PageRef BPlusTree::FindLeftmostPage(Transaction& txn, PageRef&& root) {
+  if (root->Type() == PageType::kLeafPage) return std::move(root);
+  page_id_t next;
+  root->body.internal_page.LowestPage(txn, &next);
+  return FindLeftmostPage(txn, pm_->GetPage(next));
+}
+
+PageRef BPlusTree::FindRightmostPage(Transaction& txn, PageRef&& root) {
+  if (root->Type() == PageType::kLeafPage) return std::move(root);
+  page_id_t next = root->body.internal_page.GetValue(
+      root->body.internal_page.RowCount() - 1);
+  return FindRightmostPage(txn, pm_->GetPage(next));
+}
+
+PageRef BPlusTree::LeftmostPage(Transaction& txn) {
+  return FindLeftmostPage(txn, pm_->GetPage(root_));
+}
+
+PageRef BPlusTree::RightmostPage(Transaction& txn) {
+  return FindRightmostPage(txn, pm_->GetPage(root_));
 }
 
 Status BPlusTree::Insert(Transaction& txn, std::string_view key,
                          std::string_view value) {
   std::vector<PageRef> parents;
   PageRef target = FindLeafForInsert(txn, key, pm_->GetPage(root_), parents);
-  Status insert_result = target->Insert(txn, key, value);
-  if (insert_result == Status::kSuccess) return Status::kSuccess;
-  if (insert_result == Status::kNoSpace) {
+  Status s = target->Insert(txn, key, value);
+  if (s == Status::kSuccess) return Status::kSuccess;
+  if (s == Status::kNoSpace) {
     // No enough space? Split!
-    target.PageUnlock();
+
     PageRef new_page = pm_->AllocateNewPage(txn, PageType::kLeafPage);
-    target->Split(txn, new_page.get());
+    target->Split(txn, key, value, new_page.get());
+    target.PageUnlock();
     std::string_view middle_key;
-    new_page->LowestKey(txn, &middle_key);
-    if (key < middle_key) {
-      target->Insert(txn, key, value);
-    } else {
-      new_page->Insert(txn, key, value);
+    if ([&]() {
+          if (key < middle_key) {
+            return target->Insert(txn, key, value);
+          } else {
+            return new_page->Insert(txn, key, value);
+          }
+        }() != Status::kSuccess) {
+      throw std::runtime_error("cannot insert new key/value, it's bug");
     }
+    new_page->LowestKey(txn, &middle_key);
     return InsertInternal(txn, middle_key, target->PageID(), new_page->PageID(),
                           parents);
   }
@@ -110,10 +141,15 @@ Status BPlusTree::Read(Transaction& txn, std::string_view key,
   return leaf->Read(txn, key, dst);
 }
 
+BPlusTreeIterator BPlusTree::Begin(Transaction& txn, std::string_view left,
+                                   std::string_view right, bool ascending) {
+  return {this, &txn, left, right, ascending};
+}
+
 namespace {
 
 std::string OmittedString(std::string_view original, int length) {
-  if (length < original.length()) {
+  if (20 < original.length()) {
     std::string omitted_key = std::string(original).substr(0, 8);
     omitted_key +=
         "..(" + std::to_string(original.length() - length + 4) + "bytes)..";

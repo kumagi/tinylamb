@@ -62,6 +62,12 @@ std::string_view LeafPage::GetValue(size_t idx) const {
 
 Status LeafPage::Insert(page_id_t page_id, Transaction& txn,
                         std::string_view key, std::string_view value) {
+  constexpr size_t kThreshold = kPageBodySize / 2;
+  const size_t expected_size =
+      SerializeSize(key) + SerializeSize(value) + sizeof(RowPointer);
+  if (kThreshold < expected_size) {
+    throw std::runtime_error("too huge key/value cannot be inserted");
+  }
   const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
   size_t pos = Find(key);
   if (free_size_ < physical_size + sizeof(RowPointer)) return Status::kNoSpace;
@@ -148,6 +154,7 @@ void LeafPage::DeleteImpl(std::string_view key) {
   memmove(rows + 1, rows, sizeof(RowPointer) * pos);
   --row_count_;
 }
+
 Status LeafPage::Read(page_id_t pid, Transaction& txn, slot_t slot,
                       std::string_view* result) const {
   if (row_count_ <= slot) return Status::kNotExists;
@@ -192,20 +199,37 @@ Status LeafPage::HighestKey(Transaction& txn, std::string_view* result) {
 
 size_t LeafPage::RowCount() const { return row_count_; }
 
-void LeafPage::Split(page_id_t pid, Transaction& txn, Page* target) {
-  // TODO(kumagi): Could be faster with bulk updates.
-  const int mid = row_count_ / 2;
+void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
+                     std::string_view value, Page* right) {
+  constexpr size_t kThreshold = kPageBodySize / 2;
+  const size_t expected_size =
+      SerializeSize(key) + SerializeSize(value) + sizeof(RowPointer);
+  if (kThreshold < expected_size) {
+    throw std::runtime_error("too huge key/value cannot be inserted");
+  }
+  size_t pos = Find(key);
+  size_t consumed_size = 0;
+  for (int mid = 0; mid < pos; ++mid) {
+    consumed_size += SerializeSize(GetKey(mid)) + SerializeSize(GetValue(mid)) +
+                     sizeof(RowPointer);
+  }
+  while (consumed_size + expected_size < kThreshold && pos < row_count_) {
+    consumed_size += SerializeSize(GetKey(pos)) + SerializeSize(GetValue(pos)) +
+                     sizeof(RowPointer);
+    pos++;
+  }
+
   const int original_row_count = row_count_;
-  for (size_t i = mid; i < row_count_; ++i) {
-    target->Insert(txn, GetKey(i), GetValue(i));
+  for (size_t i = pos; i < row_count_; ++i) {
+    right->Insert(txn, GetKey(i), GetValue(i));
   }
   Page* this_page = GET_PAGE_PTR(this);
-  for (size_t i = mid; i < original_row_count; ++i) {
-    this_page->Delete(txn, GetKey(mid));
+  for (size_t i = pos; i < original_row_count; ++i) {
+    this_page->Delete(txn, GetKey(pos));
   }
-  target->body.leaf_page.next_pid_ = next_pid_;
-  target->body.leaf_page.prev_pid_ = pid;
-  next_pid_ = target->PageID();
+  right->body.leaf_page.next_pid_ = next_pid_;
+  right->body.leaf_page.prev_pid_ = pid;
+  next_pid_ = right->PageID();
 }
 
 void LeafPage::DeFragment() {

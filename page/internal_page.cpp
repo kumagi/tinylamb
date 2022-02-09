@@ -139,19 +139,33 @@ Status InternalPage::LowestPage(Transaction& txn, page_id_t* result) const {
   return Status::kSuccess;
 }
 
-void InternalPage::SplitInto(page_id_t pid, Transaction& txn, Page* right,
+void InternalPage::SplitInto(page_id_t pid, Transaction& txn,
+                             std::string_view new_key, Page* right,
                              std::string_view* middle) {
+  constexpr size_t kThreshold = kPageBodySize / 2;
+  const size_t expected_size =
+      SerializeSize(new_key) + sizeof(page_id_t) + sizeof(RowPointer);
+  size_t pos = SearchToInsert(new_key);
+  size_t consumed_size = 0;
+  for (int mid = 0; mid < pos; ++mid) {
+    consumed_size +=
+        SerializeSize(GetKey(mid)) + sizeof(page_id_t) + sizeof(RowPointer);
+  }
+  while (consumed_size + expected_size < kThreshold && pos < row_count_ - 1) {
+    consumed_size +=
+        SerializeSize(GetKey(pos)) + sizeof(page_id_t) + sizeof(RowPointer);
+    pos++;
+  }
+  if (pos == row_count_) --pos;
   const int original_row_count = row_count_;
-  int mid = row_count_ / 2;
-  assert(0 < mid);
-  *middle = GetKey(mid);
-  right->SetLowestValue(txn, GetValue(mid));
-  for (int i = mid + 1; i < row_count_; ++i) {
+  *middle = GetKey(pos);
+  right->SetLowestValue(txn, GetValue(pos));
+  for (size_t i = pos + 1; i < row_count_; ++i) {
     right->Insert(txn, GetKey(i), GetValue(i));
   }
   Page* this_page = GET_PAGE_PTR(this);
-  for (int i = mid; i < original_row_count; ++i) {
-    this_page->Delete(txn, GetKey(mid));
+  for (size_t i = pos; i < original_row_count; ++i) {
+    this_page->Delete(txn, GetKey(pos));
   }
 }
 
