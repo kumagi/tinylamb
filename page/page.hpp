@@ -70,7 +70,7 @@ class Page {
                        page_id_t* page) const;
   void SetLowestValue(Transaction& txn, page_id_t i);
   void SplitInto(Transaction& txn, std::string_view new_key, Page* right,
-                 std::string_view* middle);
+                 std::string* middle);
   Status LowestPage(Transaction& txn, page_id_t* page);
 
   // Internal methods exposed for recovery.

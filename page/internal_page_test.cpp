@@ -222,7 +222,7 @@ TEST_F(InternalPageTest, SplitInto) {
     LOG(TRACE) << *page;
 
     PageRef right = p_->AllocateNewPage(txn, PageType::kInternalPage);
-    std::string_view mid;
+    std::string mid;
     page->SplitInto(txn, std::string(4000, '0' + i), right.get(), &mid);
   }
 }

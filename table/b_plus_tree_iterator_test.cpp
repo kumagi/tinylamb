@@ -147,7 +147,6 @@ TEST_F(BPlusTreeIteratorTest, FullScanMultiLeaf) {
     Init(txn, c, 1000, 10000);
   }
   BPlusTreeIterator it = bpt_->Begin(txn);
-  bpt_->Dump(txn, std::cerr);
   for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
     SCOPED_TRACE(c);
     ASSERT_TRUE(it.IsValid());
@@ -157,16 +156,16 @@ TEST_F(BPlusTreeIteratorTest, FullScanMultiLeaf) {
   EXPECT_FALSE(it.IsValid());
 }
 
-TEST_F(BPlusTreeIteratorTest, FullScanMultiInternal) {
+TEST_F(BPlusTreeIteratorTest, FullScanReverse) {
   auto txn = tm_->Begin();
   for (const auto& c :
-       {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'}) {
+       {'k', 'j', 'i', 'h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
     Init(txn, c, 10000, 2000);
   }
   BPlusTreeIterator it = bpt_->Begin(txn);
-  bpt_->Dump(txn, std::cerr);
   for (const auto& c :
        {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'}) {
+    SCOPED_TRACE(c);
     EXPECT_TRUE(it.IsValid());
     EXPECT_EQ(*it, std::string(2000, c));
     ++it;

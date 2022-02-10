@@ -263,7 +263,7 @@ void Page::SetLowestValue(Transaction& txn, page_id_t v) {
 }
 
 void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
-                     std::string_view* middle) {
+                     std::string* middle) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
   body.internal_page.SplitInto(PageID(), txn, new_key, right, middle);
 }

@@ -56,7 +56,7 @@ Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
     if (s == Status::kSuccess) return Status::kSuccess;
     if (s == Status::kNoSpace) {
       PageRef new_node = pm_->AllocateNewPage(txn, PageType::kInternalPage);
-      std::string_view new_key;
+      std::string new_key;
       internal->SplitInto(txn, key, new_node.get(), &new_key);
       s = [&]() {
         if (key < new_key) {
@@ -107,16 +107,16 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
     PageRef new_page = pm_->AllocateNewPage(txn, PageType::kLeafPage);
     target->Split(txn, key, value, new_page.get());
     target.PageUnlock();
-    std::string_view middle_key;
     if ([&]() {
-          if (key < middle_key) {
-            return target->Insert(txn, key, value);
-          } else {
+          if (new_page->RowCount() == 0 || new_page->GetKey(0) < key) {
             return new_page->Insert(txn, key, value);
+          } else {
+            return target->Insert(txn, key, value);
           }
         }() != Status::kSuccess) {
       throw std::runtime_error("cannot insert new key/value, it's bug");
     }
+    std::string_view middle_key;
     new_page->LowestKey(txn, &middle_key);
     return InsertInternal(txn, middle_key, target->PageID(), new_page->PageID(),
                           parents);

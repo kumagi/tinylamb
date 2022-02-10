@@ -114,6 +114,15 @@ TEST_F(BPlusTreeTest, SplitInternal) {
   }
 }
 
+TEST_F(BPlusTreeTest, FullScanMultiLeafReverse) {
+  auto txn = tm_->Begin();
+  for (const auto& c :
+       {'k', 'j', 'i', 'h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
+    ASSERT_SUCCESS(
+        bpt_->Insert(txn, std::string(5000, c), std::string(5000, c)));
+  }
+}
+
 TEST_F(BPlusTreeTest, FullScanMultiLeafMany) {
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f'}) {

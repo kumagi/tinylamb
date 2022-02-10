@@ -57,7 +57,6 @@ Status InternalPage::Insert(page_id_t pid, Transaction& txn,
 }
 
 void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
-  const bin_size_t offset = free_ptr_;
   const bin_size_t physical_size =
       sizeof(bin_size_t) + key.size() + sizeof(page_id_t);
   free_size_ -= physical_size + sizeof(RowPointer);
@@ -66,13 +65,14 @@ void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
       free_ptr_ + physical_size) {
     DeFragment();
   }
+  const bin_size_t offset = free_ptr_;
   free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
   free_ptr_ += SerializePID(Payload() + free_ptr_, pid);
-  bin_size_t insert = SearchToInsert(key);
+  size_t pos = SearchToInsert(key);
   RowPointer* rows = Rows();
-  memmove(rows - 1, rows, insert * sizeof(RowPointer));
-  rows[insert - 1].offset = offset;
-  rows[insert - 1].size = free_ptr_ - offset;
+  memmove(rows - 1, rows, pos * sizeof(RowPointer));
+  rows[pos - 1].offset = offset;
+  rows[pos - 1].size = free_ptr_ - offset;
   ++row_count_;
 }
 
@@ -141,7 +141,7 @@ Status InternalPage::LowestPage(Transaction& txn, page_id_t* result) const {
 
 void InternalPage::SplitInto(page_id_t pid, Transaction& txn,
                              std::string_view new_key, Page* right,
-                             std::string_view* middle) {
+                             std::string* middle) {
   constexpr size_t kThreshold = kPageBodySize / 2;
   const size_t expected_size =
       SerializeSize(new_key) + sizeof(page_id_t) + sizeof(RowPointer);

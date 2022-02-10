@@ -57,7 +57,7 @@ class InternalPage {
   Status LowestPage(Transaction& txn, page_id_t* result) const;
 
   void SplitInto(page_id_t pid, Transaction& txn, std::string_view new_key,
-                 Page* right, std::string_view* middle);
+                 Page* right, std::string* middle);
 
   // Return lowest page_id which may contain the specified |key|.
   [[nodiscard]] bin_size_t SearchToInsert(std::string_view key) const;
