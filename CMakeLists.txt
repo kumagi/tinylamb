@@ -8,6 +8,10 @@ add_executable(tinylamb
         main.cpp
         )
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined -fsanitize=bounds -fsanitize=address")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ggdb")
+
+set(CMAKE_C_COMPILER "/usr/bin/clang" CACHE string "clang compiler" FORCE)
+set(CMAKE_CXX_COMPILER "/usr/bin/clang++" CACHE string "clang++ compiler" FORCE)
 
 target_link_libraries(
         tinylamb
@@ -93,3 +97,45 @@ add_simple_test(table/b_plus_tree_iterator_test.cpp)
 add_simple_test(table/table_test.cpp)
 add_simple_test(table/full_scan_iterator_test.cpp)
 add_simple_test(transaction/transaction_test.cpp)
+
+
+########################################
+## Fuzzing
+########################################
+function(add_fuzzer_test file_path)
+    set(fuzzer_option "-fsanitize=address,fuzzer")
+    get_filename_component(filename ${file_path} NAME)
+    string(REPLACE ".cpp" "" target_name ${filename})
+    add_executable(${target_name} ${file_path})
+
+    target_compile_options(${target_name} PRIVATE -g ${fuzzer_option})
+    target_link_options(${target_name} PRIVATE ${fuzzer_option})
+
+    target_link_libraries(${target_name}
+            gtest_main
+            libtinylamb
+            )
+endfunction()
+
+add_fuzzer_test(type/value_fuzzer.cpp)
+add_fuzzer_test(page/row_page_fuzzer.cpp)
+
+########################################
+## Fuzzing Replay
+########################################
+function(add_fuzzer_test file_path)
+    set(fuzzer_option "-fsanitize=address")
+    get_filename_component(filename ${file_path} NAME)
+    string(REPLACE ".cpp" "" target_name ${filename})
+    add_executable(${target_name} ${file_path})
+
+    target_compile_options(${target_name} PRIVATE -g ${fuzzer_option})
+    target_link_options(${target_name} PRIVATE ${fuzzer_option})
+
+    target_link_libraries(${target_name}
+            gtest_main
+            libtinylamb
+            )
+endfunction()
+
+add_fuzzer_test(page/row_page_fuzzer_replay.cpp)

@@ -24,7 +24,7 @@ struct RowPosition {
   // n-th row in the page.
   slot_t slot = ~0;
 
-  [[nodiscard]] bool IsValid() const { return page_id != ~0LLU && slot != ~0; }
+  [[nodiscard]] bool IsValid() const { return page_id != ~0LLU; }
 
   friend std::ostream& operator<<(std::ostream& o, const RowPosition& p) {
     o << "{" << p.page_id << ": " << p.slot << "}";

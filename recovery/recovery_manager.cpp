@@ -200,24 +200,12 @@ void PageReplay(PageRef&& target,
 }  // namespace
 
 RecoveryManager::RecoveryManager(std::string_view log_path, PagePool* pp)
-    : log_name_(log_path), log_data_(nullptr), pool_(pp) {
-  RefreshMap();
-}
-
-void RecoveryManager::RefreshMap() {
-  std::uintmax_t filesize = std::filesystem::file_size(log_name_);
-  int fd = open(log_name_.c_str(), O_RDONLY, 0666);
-  if (fd == -1) {
-    std::string str_err = strerror(errno);
-    throw std::runtime_error("could not open the file: " + str_err);
-  }
-  log_data_ = static_cast<char*>(
-      mmap(nullptr, filesize, PROT_READ, MAP_PRIVATE, fd, 0));
-}
+    : log_name_(log_path),
+      log_file_(log_name_, std::ios::in | std::ios::binary),
+      pool_(pp) {}
 
 void RecoveryManager::SinglePageRecovery(PageRef&& page,
                                          TransactionManager* tm) {
-  RefreshMap();
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
 
   // Collects all logs to redo & undo for each page.
@@ -227,7 +215,7 @@ void RecoveryManager::SinglePageRecovery(PageRef&& page,
     lsn_t offset = 0;
     LogRecord log;
     while (offset < filesize) {
-      bool success = LogRecord::ParseLogRecord(&log_data_[offset], &log);
+      bool success = ReadLog(offset, &log);
       if (!success) {
         LOG(ERROR) << "Failed to parse log at offset: " << offset;
         break;
@@ -248,7 +236,6 @@ void RecoveryManager::SinglePageRecovery(PageRef&& page,
 
 void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
                                   TransactionManager* tm) {
-  RefreshMap();
   std::uintmax_t filesize = std::filesystem::file_size(log_name_);
 
   // Analysis phase starts here.
@@ -269,7 +256,7 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
     size_t offset = checkpoint_lsn;
     LogRecord log;
     while (offset < filesize) {
-      bool success = LogRecord::ParseLogRecord(&log_data_[offset], &log);
+      bool success = ReadLog(offset, &log);
       if (!success) {
         throw std::runtime_error("Invalid log: " + std::to_string(offset));
       }
@@ -352,7 +339,7 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
     lsn_t offset = redo_start_point;
     LogRecord log;
     while (offset < filesize) {
-      bool success = LogRecord::ParseLogRecord(&log_data_[offset], &log);
+      bool success = ReadLog(offset, &log);
       if (!success) {
         LOG(ERROR) << "Failed to parse log at offset: " << offset;
         break;
@@ -378,8 +365,11 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
   }
 }
 
-bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) {
-  return LogRecord::ParseLogRecord(&log_data_[lsn], dst);
+bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
+  dst->Clear();
+  std::istream in(log_file_.rdbuf());
+  in.seekg(lsn);
+  return LogRecord::ParseLogRecord(in, dst);
 }
 
 void RecoveryManager::LogUndoWithPage(lsn_t lsn, const LogRecord& log,

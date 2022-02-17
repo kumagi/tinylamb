@@ -50,11 +50,9 @@ void TransactionManager::Abort(Transaction& txn) {
     }
   }
   lsn_t prev = txn.prev_lsn_;
-  recovery_->RefreshMap();
   while (prev != 0) {
     LogRecord lr;
     recovery_->ReadLog(prev, &lr);
-    LOG(TRACE) << "Rollback: " << lr;
     recovery_->LogUndoWithPage(prev, lr, txn.transaction_manager_);
     prev = lr.prev_lsn;
   }

@@ -16,7 +16,13 @@ std::ostream& operator<<(std::ostream& o, const PageType& type) {
       o << "MetaPageType";
       break;
     case PageType::kRowPage:
-      o << "RowType";
+      o << "RowPageType";
+      break;
+    case PageType::kLeafPage:
+      o << "LeafPageType";
+      break;
+    case PageType::kInternalPage:
+      o << "InternalPageType";
       break;
   }
   return o;

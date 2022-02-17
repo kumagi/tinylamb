@@ -52,17 +52,13 @@ class CheckpointManager {
       return Size();
     }
 
-    static size_t Deserialize(const char* src, ActiveTransactionEntry* dst) {
+    static size_t Deserialize(std::istream& in, ActiveTransactionEntry* dst) {
       txn_id_t tid;
-      memcpy(&tid, src, sizeof(tid));
-      src += sizeof(tid);
-
+      in.read(reinterpret_cast<char*>(&tid), sizeof(tid));
       TransactionStatus status;
-      memcpy(&status, src, sizeof(status));
-      src += sizeof(status);
-
+      in.read(reinterpret_cast<char*>(&status), sizeof(status));
       lsn_t last_lsn;
-      memcpy(&last_lsn, src, sizeof(last_lsn));
+      in.read(reinterpret_cast<char*>(&last_lsn), sizeof(last_lsn));
       *dst = {tid, status, last_lsn};
       return Size();
     }

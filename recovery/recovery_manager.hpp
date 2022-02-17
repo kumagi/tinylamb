@@ -1,6 +1,7 @@
 #ifndef TINYLAMB_RECOVERY_MANAGER_HPP
 #define TINYLAMB_RECOVERY_MANAGER_HPP
 
+#include <fstream>
 #include <string>
 #include <string_view>
 
@@ -24,16 +25,14 @@ class RecoveryManager {
 
   void RecoverFrom(lsn_t checkpoint_lsn, TransactionManager* tm);
 
-  bool ReadLog(lsn_t lsn, LogRecord* dst);
+  bool ReadLog(lsn_t lsn, LogRecord* dst) const;
 
   void LogUndoWithPage(lsn_t lsn, const LogRecord& log, TransactionManager* tm);
 
-  void RefreshMap();
-
  private:
-  std::string log_name_;
-  char* log_data_;
-  PagePool* pool_;
+  std::string log_name_{""};
+  std::ifstream log_file_;
+  PagePool* pool_{nullptr};
 };
 
 }  // namespace tinylamb

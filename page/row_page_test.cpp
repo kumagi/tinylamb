@@ -108,6 +108,15 @@ TEST_F(RowPageTest, DeleteMany) {
   ASSERT_TRUE(inserted.empty());
 }
 
+TEST_F(RowPageTest, InsertZeroLenAbort) {
+  auto txn = tm_->Begin();
+  PageRef ref = p_->GetPage(page_id_);
+  slot_t s;
+  ref->Insert(txn, "", &s);
+  ref.PageUnlock();
+  txn.Abort();
+}
+
 TEST_F(RowPageTest, DeFragmentInvoked) {
   size_t kBigRowSize = kPageBodySize / 3 - 16;
 

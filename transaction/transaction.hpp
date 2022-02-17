@@ -37,6 +37,18 @@ class Transaction {
 
  public:
   Transaction(txn_id_t txn_id, TransactionManager* tm);
+  Transaction(const Transaction& o) = delete;
+  Transaction(Transaction&& o) = default;
+  Transaction& operator=(const Transaction& o) = delete;
+  Transaction& operator=(Transaction&& o) noexcept {
+    txn_id_ = o.txn_id_;
+    read_set_ = std::move(o.read_set_);
+    write_set_ = std::move(o.write_set_);
+    prev_lsn_ = o.prev_lsn_;
+    status_ = o.status_;
+    transaction_manager_ = o.transaction_manager_;
+    return *this;
+  }
 
   void SetStatus(TransactionStatus status);
   bool IsFinished() const {
@@ -84,7 +96,7 @@ class Transaction {
   friend class CheckpointManager;
 
  private:
-  const txn_id_t txn_id_;
+  txn_id_t txn_id_;
 
   std::unordered_set<RowPosition> read_set_{};
   std::unordered_set<RowPosition> write_set_{};

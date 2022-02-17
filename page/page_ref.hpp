@@ -47,7 +47,12 @@ class PageRef final {
     o.page_ = nullptr;
   }
   PageRef& operator=(const PageRef&) = delete;
-  PageRef& operator=(PageRef&&) = delete;
+  PageRef& operator=(PageRef&& o) {
+    pool_ = o.pool_;
+    page_ = o.page_;
+    page_lock_ = std::move(o.page_lock_);
+    return *this;
+  }
   bool operator==(const PageRef& r) const {
     return pool_ == r.pool_ && page_ == r.page_;
   }

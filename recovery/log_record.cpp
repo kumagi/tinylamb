@@ -21,19 +21,23 @@ enum ValueTypes : uint8_t {
   kHasBinary = 0x2,
 };
 
-size_t PidSlotKeyDeserialize(const char* pos, tinylamb::LogRecord& out) {
-  const auto types = *reinterpret_cast<const uint8_t*>(pos);
-  size_t offset = 1;
+template <typename T>
+void Read(std::istream& in, T& dst) {
+  in.read(reinterpret_cast<char*>(&dst), sizeof(T));
+}
+
+void PidSlotKeyDeserialize(std::istream& in, tinylamb::LogRecord& out) {
+  uint8_t types;
+  Read(in, types);
   if (types & KeyTypes::kHasPageID) {
-    offset += tinylamb::DeserializePID(pos + offset, &out.pid);
+    Read(in, out.pid);
   }
   if (types & KeyTypes::kHasSlot) {
-    offset += tinylamb::DeserializeSlot(pos + offset, &out.slot);
+    Read(in, out.slot);
   }
   if (types & KeyTypes::kHasKey) {
-    offset += tinylamb::DeserializeStringView(pos + offset, &out.key);
+    tinylamb::DeserializeString(in, &out.key);
   }
-  return offset;
 }
 
 size_t PidSlotKeySize(const tinylamb::LogRecord& lr) {
@@ -244,24 +248,15 @@ std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
 LogRecord::LogRecord(lsn_t prev, txn_id_t txn, LogType t)
     : prev_lsn(prev), txn_id(txn), type(t) {}
 
-bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
+bool LogRecord::ParseLogRecord(std::istream& in, tinylamb::LogRecord* dst) {
   dst->Clear();
-  memcpy(&dst->type, src, sizeof(dst->type));
-  src += sizeof(dst->type);
-  memcpy(&dst->prev_lsn, src, sizeof(dst->prev_lsn));
-  src += sizeof(dst->prev_lsn);
-  memcpy(&dst->txn_id, src, sizeof(dst->txn_id));
-  src += sizeof(dst->txn_id);
-  src += PidSlotKeyDeserialize(src, *dst);
+  Read(in, dst->type);
+  Read(in, dst->prev_lsn);
+  Read(in, dst->txn_id);
+  LOG(ERROR) << dst->type << "  prev: " << dst->prev_lsn
+             << " id: " << dst->txn_id;
+  PidSlotKeyDeserialize(in, *dst);
   switch (dst->type) {
-    case LogType::kUnknown:
-      LOG(ERROR) << "unknown log type";
-      for (int i = 0; i < 100; ++i) {
-        if (i % 16 == 0) fprintf(stderr, "\n");
-        fprintf(stderr, " ");
-        fprintf(stderr, "%02x", (char)*src++);
-      }
-      return false;
     case LogType::kBegin:
     case LogType::kCommit:
     case LogType::kBeginCheckpoint:
@@ -276,64 +271,61 @@ bool LogRecord::ParseLogRecord(const char* src, tinylamb::LogRecord* dst) {
     case LogType::kCompensateUpdateLeaf:
     case LogType::kCompensateDeleteRow:
     case LogType::kCompensateDeleteLeaf:
-      src += DeserializeStringView(src, &dst->redo_data);
+      DeserializeString(in, &dst->redo_data);
       return true;
     case LogType::kUpdateRow:
     case LogType::kUpdateLeaf:
-      src += DeserializeStringView(src, &dst->redo_data);
-      src += DeserializeStringView(src, &dst->undo_data);
+      DeserializeString(in, &dst->redo_data);
+      DeserializeString(in, &dst->undo_data);
       return true;
     case LogType::kDeleteRow:
     case LogType::kDeleteLeaf:
-      src += DeserializeStringView(src, &dst->undo_data);
+      DeserializeString(in, &dst->undo_data);
       return true;
     case LogType::kInsertInternal:
     case LogType::kCompensateUpdateInternal:
     case LogType::kCompensateDeleteInternal:
     case LogType::kLowestValue:
-      src += DeserializePID(src, &dst->redo_page);
+      Read(in, dst->redo_page);
       return true;
     case LogType::kUpdateInternal:
-      src += DeserializePID(src, &dst->redo_page);
-      src += DeserializePID(src, &dst->undo_page);
+      Read(in, dst->redo_page);
+      Read(in, dst->undo_page);
       return true;
     case LogType::kDeleteInternal:
-      src += DeserializePID(src, &dst->undo_page);
+      Read(in, dst->undo_page);
       return true;
     case LogType::kSystemAllocPage:
-      memcpy(&dst->allocated_page_type, src, sizeof(dst->allocated_page_type));
+      Read(in, dst->allocated_page_type);
       return true;
     case LogType::kEndCheckpoint: {
       uint64_t dpt_size;
-      memcpy(&dpt_size, src, sizeof(dpt_size));
-      src += sizeof(dpt_size);
+      Read(in, dpt_size);
       dst->dirty_page_table.reserve(dpt_size);
       for (size_t i = 0; i < dpt_size; ++i) {
         page_id_t dirty_page_id;
-        memcpy(&dirty_page_id, src, sizeof(dirty_page_id));
-        src += sizeof(dirty_page_id);
-
         lsn_t recovery_lsn;
-        memcpy(&recovery_lsn, src, sizeof(recovery_lsn));
-        src += sizeof(recovery_lsn);
+        Read(in, dirty_page_id);
+        Read(in, recovery_lsn);
         dst->dirty_page_table.emplace_back(dirty_page_id, recovery_lsn);
       }
 
       uint64_t tt_size;
-      memcpy(&tt_size, src, sizeof(tt_size));
-      src += sizeof(tt_size);
+      Read(in, tt_size);
       dst->active_transaction_table.reserve(tt_size);
       for (size_t i = 0; i < tt_size; ++i) {
         CheckpointManager::ActiveTransactionEntry ate;
-        src +=
-            CheckpointManager::ActiveTransactionEntry::Deserialize(src, &ate);
+        CheckpointManager::ActiveTransactionEntry::Deserialize(in, &ate);
         dst->active_transaction_table.push_back(ate);
       }
       return true;
     }
+    default:
+      LOG(ERROR) << "unknown log type: " << dst->type;
+      assert(!"unknown log");
+      return false;
   }
-  LOG(ERROR) << "unexpected execution path: " << dst->type;
-  return false;
+  assert(!"never reach here");
 }
 
 LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
@@ -619,9 +611,9 @@ void LogRecord::Clear() {
   slot = std::numeric_limits<slot_t>::max();
   prev_lsn = 0;
   txn_id = 0;
-  key = "";
-  undo_data = "";
-  redo_data = "";
+  key.clear();
+  undo_data.clear();
+  redo_data.clear();
   redo_page = 0;
   undo_page = 0;
   dirty_page_table.clear();

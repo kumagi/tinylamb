@@ -7,6 +7,7 @@
 #include "page/page_ref.hpp"
 #include "page/row_page.hpp"
 #include "recovery/logger.hpp"
+#include "recovery/recovery_manager.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
@@ -38,7 +39,8 @@ class RowPageTest : public ::testing::Test {
     p_ = std::make_unique<PageManager>(kDBFileName, 10);
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), nullptr);
+    r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
   }
 
   void TearDown() override {
@@ -127,6 +129,7 @@ class RowPageTest : public ::testing::Test {
   std::unique_ptr<LockManager> lm_;
   std::unique_ptr<PageManager> p_;
   std::unique_ptr<Logger> l_;
+  std::unique_ptr<RecoveryManager> r_;
   std::unique_ptr<TransactionManager> tm_;
   page_id_t page_id_ = 0;
 };

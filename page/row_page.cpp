@@ -35,12 +35,6 @@ Status RowPage::Read(page_id_t page_id, Transaction& txn, slot_t slot,
 Status RowPage::Insert(page_id_t page_id, Transaction& txn,
                        std::string_view record, slot_t* dst) {
   if (free_size_ + sizeof(RowPointer) <= record.size()) return Status::kNoSpace;
-  if (Payload() + free_ptr_ <=
-      reinterpret_cast<char*>(&data_[row_count_ + 1]) + record.size()) {
-    DeFragment();
-  }
-  assert(reinterpret_cast<char*>(&data_[row_count_ + 1]) + record.size() <
-         Payload() + free_ptr_);
   *dst = row_count_;
   const RowPosition pos(page_id, *dst);
   if (!txn.AddWriteSet(pos)) return Status::kConflicts;
@@ -52,6 +46,12 @@ Status RowPage::Insert(page_id_t page_id, Transaction& txn,
 
 slot_t RowPage::InsertRow(std::string_view new_row) {
   assert(new_row.size() <= std::numeric_limits<slot_t>::max());
+  if (Payload() + free_ptr_ <=
+      reinterpret_cast<char*>(&data_[row_count_ + 1]) + new_row.size()) {
+    DeFragment();
+  }
+  assert(reinterpret_cast<char*>(&data_[row_count_ + 1]) + new_row.size() <
+         Payload() + free_ptr_);
   free_size_ -= new_row.size() + sizeof(RowPointer);
   free_ptr_ -= new_row.size();
   data_[row_count_].offset = free_ptr_;
@@ -62,7 +62,7 @@ slot_t RowPage::InsertRow(std::string_view new_row) {
 
 Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
                        std::string_view record) {
-  assert(slot <= row_count_);
+  if (row_count_ <= slot) return Status::kNotExists;
   std::string_view prev_row = GetRow(slot);
   if (prev_row.size() < record.size() &&
       free_size_ < record.size() - prev_row.size()) {
@@ -96,7 +96,7 @@ void RowPage::UpdateRow(slot_t slot, std::string_view record) {
 }
 
 Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
-  assert(slot <= row_count_);
+  if (row_count_ <= slot) return Status::kNotExists;
   std::string_view prev_row = GetRow(slot);
   RowPosition pos(page_id, slot);
   if (!txn.AddWriteSet(pos)) return Status::kConflicts;

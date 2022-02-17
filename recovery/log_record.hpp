@@ -38,6 +38,10 @@ enum class LogType : uint16_t {
   kSystemDestroyPage,
   kLowestValue,
 };
+inline std::istream& operator>>(std::istream& in, const LogType& val) {
+  in >> (uint16_t&)val;
+  return in;
+}
 
 std::ostream& operator<<(std::ostream& o, const LogType& type);
 
@@ -53,7 +57,7 @@ struct LogRecord {
     return pid != std::numeric_limits<page_id_t>::max();
   }
 
-  static bool ParseLogRecord(const char* src, LogRecord* dst);
+  static bool ParseLogRecord(std::istream& in, LogRecord* dst);
 
   static LogRecord InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                       slot_t key, std::string_view redo);
@@ -148,9 +152,9 @@ struct LogRecord {
   txn_id_t txn_id = 0;
   page_id_t pid = std::numeric_limits<page_id_t>::max();
   slot_t slot = std::numeric_limits<slot_t>::max();
-  std::string_view key{};
-  std::string_view undo_data{};
-  std::string_view redo_data{};
+  std::string key{};
+  std::string undo_data{};
+  std::string redo_data{};
   page_id_t redo_page = 0;
   page_id_t undo_page = 0;
   std::vector<std::pair<page_id_t, lsn_t>> dirty_page_table{};

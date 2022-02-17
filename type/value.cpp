@@ -22,7 +22,7 @@ Value::Value(int64_t int_val) {
 
 Value::Value(std::string_view varchar_val) {
   type = ValueType::kVarChar;
-  value.varchar_value = varchar_val.data();
+  value.varchar_value = varchar_val;
 }
 
 Value::Value(double double_value) {

@@ -6,6 +6,8 @@
 
 #include <cstring>
 
+#include "common/log_message.hpp"
+
 namespace tinylamb {
 
 size_t SerializeStringView(char* pos, std::string_view bin) {
@@ -43,6 +45,26 @@ size_t DeserializeStringView(const char* pos, std::string_view* out) {
   bin_size_t len;
   memcpy(&len, pos, sizeof(bin_size_t));
   *out = {pos + sizeof(len), len};
+  return sizeof(len) + len;
+}
+
+size_t DeserializeString(const char* pos, std::string* out) {
+  out->clear();
+  bin_size_t len;
+  memcpy(&len, pos, sizeof(len));
+  LOG(ERROR) << "read len: " << len;
+
+  out->resize(len);
+  memcpy(out->data(), pos + sizeof(len), len);
+  return sizeof(len) + len;
+}
+
+size_t DeserializeString(std::istream& in, std::string* out) {
+  out->clear();
+  bin_size_t len;
+  in.read(reinterpret_cast<char*>(&len), sizeof(len));
+  out->resize(len);
+  in.read(out->data(), len);
   return sizeof(len) + len;
 }
 

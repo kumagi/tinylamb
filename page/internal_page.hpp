@@ -80,7 +80,7 @@ class InternalPage {
   page_id_t lowest_page_ = 0;
   bin_size_t free_ptr_ = sizeof(InternalPage);
   bin_size_t free_size_ = kPageBodySize - sizeof(InternalPage);
-  void DeFragment();
+  void Defragment();
 };
 
 }  // namespace tinylamb

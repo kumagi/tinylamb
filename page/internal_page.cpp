@@ -63,16 +63,15 @@ void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
 
   if (kPageSize - sizeof(RowPointer) * (row_count_ + 1) <
       free_ptr_ + physical_size) {
-    DeFragment();
+    Defragment();
   }
-  const bin_size_t offset = free_ptr_;
-  free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
-  free_ptr_ += SerializePID(Payload() + free_ptr_, pid);
-  size_t pos = SearchToInsert(key);
+  const int pos = SearchToInsert(key);
   RowPointer* rows = Rows();
   memmove(rows - 1, rows, pos * sizeof(RowPointer));
-  rows[pos - 1].offset = offset;
-  rows[pos - 1].size = free_ptr_ - offset;
+  rows[pos - 1].offset = free_ptr_;
+  rows[pos - 1].size = physical_size;
+  free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
+  free_ptr_ += SerializePID(Payload() + free_ptr_, pid);
   ++row_count_;
 }
 
@@ -229,7 +228,7 @@ void InternalPage::Dump(std::ostream& o, int indent) const {
   }
 }
 
-void InternalPage::DeFragment() {
+void InternalPage::Defragment() {
   std::vector<std::string> payloads;
   payloads.reserve(row_count_);
   RowPointer* rows = Rows();
