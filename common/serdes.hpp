@@ -20,7 +20,6 @@ size_t SerializeInteger(char* pos, int64_t i);
 size_t SerializeDouble(char* pos, double d);
 
 size_t DeserializeStringView(const char* pos, std::string_view* out);
-size_t DeserializeString(const char* pos, std::string* out);
 size_t DeserializeString(std::istream& in, std::string* out);
 size_t DeserializeSlot(const char* pos, slot_t* slot);
 size_t DeserializePID(const char* pos, page_id_t* out);

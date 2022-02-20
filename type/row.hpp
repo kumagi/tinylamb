@@ -26,6 +26,7 @@ struct Row {
   [[nodiscard]] size_t Size() const;
   [[nodiscard]] std::string EncodeMemcomparableFormat() const;
   void Clear() { values_.clear(); }
+  [[nodiscard]] bool IsValid() const { return values_.empty(); }
 
   bool operator==(const Row& rhs) const;
   friend std::ostream& operator<<(std::ostream& o, const Row& r);

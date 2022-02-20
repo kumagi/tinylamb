@@ -6,6 +6,7 @@
 #define TINYLAMB_FULL_SCAN_ITERATOR_HPP
 
 #include "type/row.hpp"
+
 namespace tinylamb {
 class Table;
 class Transaction;

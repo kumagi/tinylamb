@@ -5,6 +5,7 @@
 #include "table/table.hpp"
 
 #include "b_plus_tree.hpp"
+#include "index_scan_iterator.hpp"
 #include "page/page_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
@@ -93,8 +94,19 @@ Status Table::ReadByKey(Transaction& txn, std::string_view index_name,
   return Status::kNotExists;
 }
 
-FullScanIterator Table::Begin(Transaction& txn) {
-  return FullScanIterator(this, &txn);
+FullScanIterator Table::BeginFullScan(Transaction& txn) { return {this, &txn}; }
+
+IndexScanIterator Table::BeginIndexScan(Transaction& txn,
+                                        std::string_view index_name,
+                                        const Row& begin, const Row& end,
+                                        bool ascending) {
+  return {this, index_name, &txn, begin, end, ascending};
+}
+
+page_id_t Table::GetIndex(std::string_view name) {
+  for (const auto& idx : indices_) {
+    if (idx.name_ == name) return idx.pid_;
+  }
 }
 
 }  // namespace tinylamb

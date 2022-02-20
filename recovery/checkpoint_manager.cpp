@@ -36,7 +36,7 @@ lsn_t CheckpointManager::WriteCheckpoint(
     const std::function<void()>& func_for_test) {
   LogRecord begin = LogRecord::BeginCheckpointLogRecord();
 
-  // Write [Begin-Checkpoint] log.
+  // Write [BeginFullScan-Checkpoint] log.
   lsn_t begin_lsn = tm_->logger_->AddLog(begin);
 
   std::vector<std::pair<page_id_t, lsn_t>> dirty_page_table;

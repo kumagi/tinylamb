@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "full_scan_iterator.hpp"
+#include "index_scan_iterator.hpp"
 #include "page/row_position.hpp"
 #include "table/index.hpp"
 #include "type/schema.hpp"
@@ -40,7 +41,16 @@ class Table {
   Status ReadByKey(Transaction& txn, std::string_view index_name,
                    const Row& keys, Row* result) const;
 
-  FullScanIterator Begin(Transaction& txn);
+  FullScanIterator BeginFullScan(Transaction& txn);
+  IndexScanIterator BeginIndexScan(Transaction& txn,
+                                   std::string_view index_name,
+                                   const Row& begin, const Row& end = Row(),
+                                   bool ascending = true);
+
+ private:
+  page_id_t GetIndex(std::string_view name);
+  friend class FullScanIterator;
+  friend class IndexScanIterator;
 
   PageManager* pm_;
   Schema schema_;

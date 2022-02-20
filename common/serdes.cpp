@@ -48,17 +48,6 @@ size_t DeserializeStringView(const char* pos, std::string_view* out) {
   return sizeof(len) + len;
 }
 
-size_t DeserializeString(const char* pos, std::string* out) {
-  out->clear();
-  bin_size_t len;
-  memcpy(&len, pos, sizeof(len));
-  LOG(ERROR) << "read len: " << len;
-
-  out->resize(len);
-  memcpy(out->data(), pos + sizeof(len), len);
-  return sizeof(len) + len;
-}
-
 size_t DeserializeString(std::istream& in, std::string* out) {
   out->clear();
   bin_size_t len;

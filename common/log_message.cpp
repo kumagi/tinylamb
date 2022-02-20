@@ -1,5 +1,6 @@
 #include "log_message.hpp"
 
+#include <cassert>
 #include <chrono>
 #include <ctime>
 #include <iostream>
@@ -33,7 +34,7 @@ LogMessage::LogMessage(int log_level, const char* filename, int lineno,
       ls << "\e[4;36m";
       break;
     default:
-      break;
+      assert(!"unknwon log level");
   }
   ls << buff << filename << ":" << lineno << " " << func_name;
   switch (log_level) {

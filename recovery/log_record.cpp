@@ -253,8 +253,6 @@ bool LogRecord::ParseLogRecord(std::istream& in, tinylamb::LogRecord* dst) {
   Read(in, dst->type);
   Read(in, dst->prev_lsn);
   Read(in, dst->txn_id);
-  LOG(ERROR) << dst->type << "  prev: " << dst->prev_lsn
-             << " id: " << dst->txn_id;
   PidSlotKeyDeserialize(in, *dst);
   switch (dst->type) {
     case LogType::kBegin:

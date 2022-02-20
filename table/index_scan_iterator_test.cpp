@@ -1,7 +1,8 @@
 //
-// Created by kumagi on 2022/02/09.
+// Created by kumagi on 2022/02/21.
 //
-#include "full_scan_iterator.hpp"
+
+#include "index_scan_iterator.hpp"
 
 #include <memory>
 
@@ -11,6 +12,7 @@
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
+#include "table/index.hpp"
 #include "table/table.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction_manager.hpp"
@@ -19,11 +21,11 @@
 
 namespace tinylamb {
 
-class FullScanIteratorTest : public ::testing::Test {
+class IndexScanIteratorTest : public ::testing::Test {
  protected:
-  static constexpr char kDBFileName[] = "full_scan_iterator_test.db";
-  static constexpr char kLogName[] = "full_scan_iterator_test.log";
-  static constexpr char kMasterRecordName[] = "full_scan_iterator_master.log";
+  static constexpr char kDBFileName[] = "index_scan_iterator_test.db";
+  static constexpr char kLogName[] = "index_scan_iterator_test.log";
+  static constexpr char kMasterRecordName[] = "index_scan_iterator_master.log";
 
  public:
   void SetUp() override {
@@ -34,12 +36,14 @@ class FullScanIteratorTest : public ::testing::Test {
     Recover();
     Transaction txn = tm_->Begin();
     PageRef row_page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    PageRef leaf_page = p_->AllocateNewPage(txn, PageType::kLeafPage);
     std::vector<Index> ind;
+    ind.push_back(Index("bt", {0LLU}, leaf_page->page_id));
     table_ =
         std::make_unique<Table>(p_.get(), schema_, row_page->PageID(), ind);
   }
 
-  void Flush(page_id_t pid) { p_->GetPool()->FlushPageForTest(pid); }
+  void Flush(page_id_t pid) const { p_->GetPool()->FlushPageForTest(pid); }
 
   void Recover() {
     if (p_) {
@@ -82,21 +86,51 @@ class FullScanIteratorTest : public ::testing::Test {
   std::unique_ptr<Table> table_;
 };
 
-TEST_F(FullScanIteratorTest, Construct) {}
+TEST_F(IndexScanIteratorTest, Construct) {}
 
-TEST_F(FullScanIteratorTest, Scan) {
+TEST_F(IndexScanIteratorTest, ScanAscending) {
   Transaction txn = tm_->Begin();
   RowPosition rp;
-  for (int i = 0; i < 130; ++i) {
+  for (int i = 0; i < 230; ++i) {
     ASSERT_SUCCESS(table_->Insert(
         txn, Row({Value(i), Value("v" + std::to_string(i)), Value(0.1 + i)}),
         &rp));
   }
-  FullScanIterator it = table_->BeginFullScan(txn);
-  while (it.IsValid()) {
-    LOG(TRACE) << *it;
+  Row iter_begin({Value(43)});
+  Row iter_end({Value(180)});
+  IndexScanIterator it =
+      table_->BeginIndexScan(txn, "bt", iter_begin, iter_end);
+  ASSERT_TRUE(it.IsValid());
+  for (int i = 43; i <= 180; ++i) {
+    Row cur = *it;
+    ASSERT_EQ(cur[0], Value(i));
+    ASSERT_EQ(cur[1], Value("v" + std::to_string(i)));
+    ASSERT_EQ(cur[2], Value(0.1 + i));
     ++it;
   }
+  ASSERT_FALSE(it.IsValid());
+}
+TEST_F(IndexScanIteratorTest, ScanDecending) {
+  Transaction txn = tm_->Begin();
+  RowPosition rp;
+  for (int i = 0; i < 230; ++i) {
+    ASSERT_SUCCESS(table_->Insert(
+        txn, Row({Value(i), Value("v" + std::to_string(i)), Value(0.1 + i)}),
+        &rp));
+  }
+  Row iter_begin({Value(104)});
+  Row iter_end({Value(200)});
+  IndexScanIterator it =
+      table_->BeginIndexScan(txn, "bt", iter_begin, iter_end, false);
+  ASSERT_TRUE(it.IsValid());
+  for (int i = 200; i >= 104; --i) {
+    Row cur = *it;
+    ASSERT_EQ(cur[0], Value(i));
+    ASSERT_EQ(cur[1], Value("v" + std::to_string(i)));
+    ASSERT_EQ(cur[2], Value(0.1 + i));
+    --it;
+  }
+  ASSERT_FALSE(it.IsValid());
 }
 
 }  // namespace tinylamb

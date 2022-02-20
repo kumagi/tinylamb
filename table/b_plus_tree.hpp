@@ -44,8 +44,13 @@ class BPlusTree {
   BPlusTreeIterator Begin(Transaction& txn, std::string_view left = "",
                           std::string_view right = "", bool ascending = true);
 
+  bool operator==(const BPlusTree& rhs) const {
+    return root_ == rhs.root_ && pm_ == rhs.pm_;
+  }
+
  private:
   friend class BPlusTreeIterator;
+  friend class IndexScanIterator;
   void DumpInternal(Transaction& txn, std::ostream& o, PageRef&& page,
                     int indent = 0) const;
 

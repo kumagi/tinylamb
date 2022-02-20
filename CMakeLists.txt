@@ -34,9 +34,11 @@ add_library(libtinylamb
         transaction/transaction.cpp recovery/log_record.cpp page/meta_page.cpp
         recovery/recovery_manager.cpp recovery/checkpoint_manager.cpp
         transaction/transaction_manager.cpp page/page_type.cpp type/column.cpp
-        common/serdes.cpp common/log_message.cpp page/page_ref.cpp page/leaf_page.cpp
-        page/internal_page.cpp table/b_plus_tree.cpp type/value.cpp type/constraint.cpp
-        type/constraint.hpp table/table.cpp table/table.hpp table/index.cpp table/index.hpp common/debug.cpp common/debug.hpp table/full_scan_iterator.cpp table/full_scan_iterator.hpp table/b_plus_tree_iterator.cpp table/b_plus_tree_iterator.hpp)
+        common/serdes.cpp common/log_message.cpp page/page_ref.cpp
+        page/leaf_page.cpp page/internal_page.cpp table/b_plus_tree.cpp
+        type/value.cpp type/constraint.cpp type/constraint.hpp table/table.cpp
+        table/table.hpp table/index.cpp common/debug.cpp
+        table/full_scan_iterator.cpp table/b_plus_tree_iterator.cpp table/index_scan_iterator.cpp table/index_scan_iterator.hpp)
 
 target_include_directories(
         libtinylamb
@@ -96,6 +98,7 @@ add_simple_test(table/b_plus_tree_test.cpp)
 add_simple_test(table/b_plus_tree_iterator_test.cpp)
 add_simple_test(table/table_test.cpp)
 add_simple_test(table/full_scan_iterator_test.cpp)
+add_simple_test(table/index_scan_iterator_test.cpp)
 add_simple_test(transaction/transaction_test.cpp)
 
 
