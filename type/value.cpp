@@ -249,6 +249,93 @@ bool Value::operator<(const Value& rhs) const {
   throw std::runtime_error("undefined type");
 }
 
+bool Value::operator>(const Value& rhs) const {
+  if (type != rhs.type) {
+    throw std::runtime_error("Different type cannot be compared.");
+  }
+  switch (type) {
+    case ValueType::kUnknown:
+      throw std::runtime_error("Unknown type cannot be compared.");
+    case ValueType::kInt64:
+      return value.int_value > rhs.value.int_value;
+    case ValueType::kVarChar:
+      return value.varchar_value > rhs.value.varchar_value;
+    case ValueType::kDouble:
+      return value.double_value > rhs.value.double_value;
+  }
+  throw std::runtime_error("undefined type");
+}
+
+Value Value::operator+(const Value& rhs) const {
+  if (type != rhs.type) {
+    throw std::runtime_error("Different type cannot be added.");
+  }
+  if (type == ValueType::kInt64) {
+    return Value(value.int_value + rhs.value.int_value);
+  } else if (type == ValueType::kDouble) {
+    return Value(value.double_value + rhs.value.double_value);
+  } else if (type == ValueType::kVarChar) {
+    std::string new_string(
+        value.varchar_value.size() + rhs.value.varchar_value.size(), '\0');
+    memcpy(new_string.data(), value.varchar_value.data(),
+           value.varchar_value.size());
+    memcpy(new_string.data() + value.varchar_value.size(),
+           rhs.value.varchar_value.data(), rhs.value.varchar_value.size());
+    Value new_value;
+    new_value.owned_data = new_string;
+    new_value.type = ValueType::kVarChar;
+    new_value.value.varchar_value = new_value.owned_data;
+    return new_value;
+  }
+  throw std::runtime_error("Cannot do '+' against this type");
+}
+
+Value Value::operator-(const Value& rhs) const {
+  if (type != rhs.type) {
+    throw std::runtime_error("Different type cannot be subtracted.");
+  }
+  if (type == ValueType::kInt64) {
+    return Value(value.int_value - rhs.value.int_value);
+  } else if (type == ValueType::kDouble) {
+    return Value(value.double_value - rhs.value.double_value);
+  }
+  throw std::runtime_error("Cannot do '-' against this type");
+}
+
+Value Value::operator*(const Value& rhs) const {
+  if (type != rhs.type) {
+    throw std::runtime_error("Different type cannot be multiplied.");
+  }
+  if (type == ValueType::kInt64) {
+    return Value(value.int_value * rhs.value.int_value);
+  } else if (type == ValueType::kDouble) {
+    return Value(value.double_value * rhs.value.double_value);
+  }
+  throw std::runtime_error("Cannot do '*' against this type");
+}
+
+Value Value::operator/(const Value& rhs) const {
+  if (type != rhs.type) {
+    throw std::runtime_error("Different type cannot be divided.");
+  }
+  if (type == ValueType::kInt64) {
+    return Value(value.int_value / rhs.value.int_value);
+  } else if (type == ValueType::kDouble) {
+    return Value(value.double_value / rhs.value.double_value);
+  }
+  throw std::runtime_error("Cannot do '/' against this type");
+}
+
+Value Value::operator%(const Value& rhs) const {
+  if (type != rhs.type) {
+    throw std::runtime_error("Different type cannot do modulo.");
+  }
+  if (type == ValueType::kInt64) {
+    return Value(value.int_value % rhs.value.int_value);
+  }
+  throw std::runtime_error("Cannot do '%' against this type");
+}
+
 std::ostream& operator<<(std::ostream& o, const Value& v) {
   o << v.AsString();
   return o;

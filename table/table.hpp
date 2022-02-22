@@ -12,6 +12,7 @@
 #include "index_scan_iterator.hpp"
 #include "page/row_position.hpp"
 #include "table/index.hpp"
+#include "table/table_interface.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -21,7 +22,7 @@ class Row;
 class RowPosition;
 class PageManager;
 
-class Table {
+class Table : public TableInterface {
  public:
   Table(PageManager* pm, Schema sc, page_id_t pid, std::vector<Index> indices)
       : pm_(pm),
@@ -29,23 +30,23 @@ class Table {
         first_pid_(pid),
         last_pid_(pid),
         indices_(std::move(indices)) {}
+  ~Table() override = default;
 
-  Status Insert(Transaction& txn, const Row& row, RowPosition* rp);
+  Status Insert(Transaction& txn, const Row& row, RowPosition* rp) override;
 
-  Status Update(Transaction& txn, RowPosition pos, const Row& row);
+  Status Update(Transaction& txn, RowPosition pos, const Row& row) override;
 
-  Status Delete(Transaction& txn, RowPosition pos) const;
+  Status Delete(Transaction& txn, RowPosition pos) override;
 
-  Status Read(Transaction& txn, RowPosition pos, Row* result) const;
+  Status Read(Transaction& txn, RowPosition pos, Row* result) const override;
 
   Status ReadByKey(Transaction& txn, std::string_view index_name,
-                   const Row& keys, Row* result) const;
+                   const Row& keys, Row* result) const override;
 
-  FullScanIterator BeginFullScan(Transaction& txn);
-  IndexScanIterator BeginIndexScan(Transaction& txn,
-                                   std::string_view index_name,
-                                   const Row& begin, const Row& end = Row(),
-                                   bool ascending = true);
+  Iterator BeginFullScan(Transaction& txn) override;
+  Iterator BeginIndexScan(Transaction& txn, std::string_view index_name,
+                          const Row& begin, const Row& end = Row(),
+                          bool ascending = true) override;
 
  private:
   page_id_t GetIndex(std::string_view name);

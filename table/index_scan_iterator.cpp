@@ -50,13 +50,13 @@ void IndexScanIterator::ResolveCurrentRow() {
   current_row_.Deserialize(row.data(), table_->schema_);
 }
 
-IndexScanIterator& IndexScanIterator::operator++() {
+IteratorBase& IndexScanIterator::operator++() {
   ++iter_;
   ResolveCurrentRow();
   return *this;
 }
 
-IndexScanIterator& IndexScanIterator::operator--() {
+IteratorBase& IndexScanIterator::operator--() {
   --iter_;
   ResolveCurrentRow();
   return *this;

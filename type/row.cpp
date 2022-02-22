@@ -11,7 +11,7 @@ namespace tinylamb {
 
 void Row::Add(const Value& v) { values_.push_back(v); }
 
-Value& Row::operator[](int i) { return values_[i]; }
+Value& Row::operator[](size_t i) { return values_[i]; }
 
 const Value& Row::operator[](size_t i) const { return values_[i]; }
 
@@ -52,6 +52,25 @@ std::string Row::EncodeMemcomparableFormat() const {
     ss << v.EncodeMemcomparableFormat();
   }
   return ss.str();
+}
+
+Row Row::Extract(const std::vector<size_t>& elms) const {
+  Row tmp;
+  std::vector<Value> extracted;
+  extracted.resize(elms.size());
+  for (size_t offset : elms) {
+    extracted.push_back(values_[offset]);
+  }
+  return Row(extracted);
+}
+
+Row Row::operator+(const Row& rhs) const {
+  std::vector v(values_);
+  v.reserve(v.size() + rhs.Size());
+  for (const auto& r : rhs.values_) {
+    v.push_back(r);
+  }
+  return Row(v);
 }
 
 bool Row::operator==(const Row& rhs) const { return values_ == rhs.values_; }

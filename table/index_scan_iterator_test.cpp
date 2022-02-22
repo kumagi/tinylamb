@@ -98,8 +98,7 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
   }
   Row iter_begin({Value(43)});
   Row iter_end({Value(180)});
-  IndexScanIterator it =
-      table_->BeginIndexScan(txn, "bt", iter_begin, iter_end);
+  Iterator it = table_->BeginIndexScan(txn, "bt", iter_begin, iter_end);
   ASSERT_TRUE(it.IsValid());
   for (int i = 43; i <= 180; ++i) {
     Row cur = *it;
@@ -110,6 +109,7 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
   }
   ASSERT_FALSE(it.IsValid());
 }
+
 TEST_F(IndexScanIteratorTest, ScanDecending) {
   Transaction txn = tm_->Begin();
   RowPosition rp;
@@ -120,8 +120,7 @@ TEST_F(IndexScanIteratorTest, ScanDecending) {
   }
   Row iter_begin({Value(104)});
   Row iter_end({Value(200)});
-  IndexScanIterator it =
-      table_->BeginIndexScan(txn, "bt", iter_begin, iter_end, false);
+  Iterator it = table_->BeginIndexScan(txn, "bt", iter_begin, iter_end, false);
   ASSERT_TRUE(it.IsValid());
   for (int i = 200; i >= 104; --i) {
     Row cur = *it;

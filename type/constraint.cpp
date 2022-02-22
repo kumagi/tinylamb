@@ -104,7 +104,7 @@ uint64_t std::hash<tinylamb::Constraint>::operator()(
     case tinylamb::Constraint::kForeign:
     case tinylamb::Constraint::kCheck:
       result += std::hash<tinylamb::Value>()(c.value);
-
+      break;
     default:
       break;
   }

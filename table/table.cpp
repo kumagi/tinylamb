@@ -54,7 +54,7 @@ Status Table::Update(Transaction& txn, RowPosition pos, const Row& row) {
   return pm_->GetPage(pos.page_id)->Update(txn, pos.slot, serialized_row);
 }
 
-Status Table::Delete(Transaction& txn, RowPosition pos) const {
+Status Table::Delete(Transaction& txn, RowPosition pos) {
   Row original_row;
   Status s = Read(txn, pos, &original_row);
   if (s != Status::kSuccess) return s;
@@ -94,19 +94,22 @@ Status Table::ReadByKey(Transaction& txn, std::string_view index_name,
   return Status::kNotExists;
 }
 
-FullScanIterator Table::BeginFullScan(Transaction& txn) { return {this, &txn}; }
+Iterator Table::BeginFullScan(Transaction& txn) {
+  return Iterator(new FullScanIterator(this, &txn));
+}
 
-IndexScanIterator Table::BeginIndexScan(Transaction& txn,
-                                        std::string_view index_name,
-                                        const Row& begin, const Row& end,
-                                        bool ascending) {
-  return {this, index_name, &txn, begin, end, ascending};
+Iterator Table::BeginIndexScan(Transaction& txn, std::string_view index_name,
+                               const Row& begin, const Row& end,
+                               bool ascending) {
+  return Iterator(
+      new IndexScanIterator(this, index_name, &txn, begin, end, ascending));
 }
 
 page_id_t Table::GetIndex(std::string_view name) {
   for (const auto& idx : indices_) {
     if (idx.name_ == name) return idx.pid_;
   }
+  return -1;
 }
 
 }  // namespace tinylamb

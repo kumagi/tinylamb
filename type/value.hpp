@@ -33,6 +33,15 @@ class Value {
   bool operator==(const Value& rhs) const;
   bool operator!=(const Value& rhs) const { return !operator==(rhs); }
   bool operator<(const Value& rhs) const;
+  bool operator>(const Value& rhs) const;
+  bool operator<=(const Value& rhs) const { return !operator>(rhs); }
+  bool operator>=(const Value& rhs) const { return !operator<(rhs); }
+
+  Value operator+(const Value& rhs) const;
+  Value operator-(const Value& rhs) const;
+  Value operator*(const Value& rhs) const;
+  Value operator/(const Value& rhs) const;
+  Value operator%(const Value& rhs) const;
 
   [[nodiscard]] std::string AsString() const;
   friend std::ostream& operator<<(std::ostream& o, const Value& v);

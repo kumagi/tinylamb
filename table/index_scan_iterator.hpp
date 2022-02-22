@@ -5,16 +5,18 @@
 #ifndef TINYLAMB_INDEX_SCAN_ITERATOR_HPP
 #define TINYLAMB_INDEX_SCAN_ITERATOR_HPP
 
-#include "b_plus_tree.hpp"
-#include "b_plus_tree_iterator.hpp"
+#include "table/b_plus_tree.hpp"
+#include "table/b_plus_tree_iterator.hpp"
+#include "table/iterator_base.hpp"
 #include "type/row.hpp"
 
 namespace tinylamb {
 class Table;
 class Transaction;
 
-class IndexScanIterator {
+class IndexScanIterator : public IteratorBase {
  public:
+  ~IndexScanIterator() override = default;
   bool operator==(const IndexScanIterator& rhs) const {
     return bpt_ == rhs.bpt_ && txn_ == rhs.txn_ &&
            current_row_ == rhs.current_row_;
@@ -24,11 +26,11 @@ class IndexScanIterator {
     return !(operator==(rhs));
   }
 
-  [[nodiscard]] bool IsValid() const;
-  IndexScanIterator& operator++();
-  IndexScanIterator& operator--();
-  const Row& operator*() const;
-  Row& operator*();
+  [[nodiscard]] bool IsValid() const override;
+  IteratorBase& operator++() override;
+  IteratorBase& operator--() override;
+  const Row& operator*() const override;
+  Row& operator*() override;
 
  private:
   friend class Table;

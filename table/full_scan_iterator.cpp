@@ -20,7 +20,7 @@ FullScanIterator::FullScanIterator(Table* table, Transaction* txn)
   current_row_.Deserialize(row.data(), table_->schema_);
 }
 
-FullScanIterator& FullScanIterator::operator++() {
+IteratorBase& FullScanIterator::operator++() {
   PageRef ref = [&]() {
     PageRef ref = table_->pm_->GetPage(pos_.page_id);
     if (++pos_.slot < ref->RowCount()) return std::move(ref);
@@ -41,6 +41,11 @@ FullScanIterator& FullScanIterator::operator++() {
   std::string_view row;
   ref->Read(*txn_, pos_.slot, &row);
   current_row_.Deserialize(row.data(), table_->schema_);
+  return *this;
+}
+
+IteratorBase& FullScanIterator::operator--() {
+  assert(!"not implemented function");
   return *this;
 }
 

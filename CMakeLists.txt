@@ -8,10 +8,11 @@ add_executable(tinylamb
         main.cpp
         )
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined -fsanitize=bounds -fsanitize=address")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ggdb")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -O2")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -ggdb")
 
-set(CMAKE_C_COMPILER "/usr/bin/clang" CACHE string "clang compiler" FORCE)
-set(CMAKE_CXX_COMPILER "/usr/bin/clang++" CACHE string "clang++ compiler" FORCE)
+set(CMAKE_C_COMPILER "/usr/bin/clang" CACHE STRING "clang compiler" FORCE)
+set(CMAKE_CXX_COMPILER "/usr/bin/clang++" CACHE STRING "clang++ compiler" FORCE)
 
 target_link_libraries(
         tinylamb
@@ -38,13 +39,26 @@ add_library(libtinylamb
         page/leaf_page.cpp page/internal_page.cpp table/b_plus_tree.cpp
         type/value.cpp type/constraint.cpp type/constraint.hpp table/table.cpp
         table/table.hpp table/index.cpp common/debug.cpp
-        table/full_scan_iterator.cpp table/b_plus_tree_iterator.cpp table/index_scan_iterator.cpp table/index_scan_iterator.hpp)
+        table/full_scan_iterator.cpp table/b_plus_tree_iterator.cpp
+        table/index_scan_iterator.cpp table/index_scan_iterator.hpp
+        executor/full_scan.cpp executor/projection.cpp executor/selection.cpp
+        expression/binary_expression.cpp expression/column_value.cpp
+        executor/hash_join.cpp)
+
+add_library(libtinylamb_test_util
+        STATIC
+        table/fake_table.cpp)
 
 target_include_directories(
         libtinylamb
         PUBLIC
         ${PROJECT_SOURCE_DIR}
 )
+
+target_include_directories(
+        libtinylamb_test_util
+        PUBLIC
+        ${PROJECT_SOURCE_DIR})
 
 ########################################
 ## Testing
@@ -70,6 +84,7 @@ function(add_simple_test file_path)
     target_link_libraries(${target_name}
             gtest_main
             libtinylamb
+            libtinylamb_test_util
             )
     add_test(
             NAME ${target_name}
@@ -100,6 +115,8 @@ add_simple_test(table/table_test.cpp)
 add_simple_test(table/full_scan_iterator_test.cpp)
 add_simple_test(table/index_scan_iterator_test.cpp)
 add_simple_test(transaction/transaction_test.cpp)
+add_simple_test(expression/expression_test.cpp)
+add_simple_test(executor/executor_test.cpp)
 
 
 ########################################

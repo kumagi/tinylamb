@@ -92,7 +92,7 @@ TEST_F(FullScanIteratorTest, Scan) {
         txn, Row({Value(i), Value("v" + std::to_string(i)), Value(0.1 + i)}),
         &rp));
   }
-  FullScanIterator it = table_->BeginFullScan(txn);
+  Iterator it = table_->BeginFullScan(txn);
   while (it.IsValid()) {
     LOG(TRACE) << *it;
     ++it;
