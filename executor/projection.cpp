@@ -4,6 +4,7 @@
 
 #include "projection.hpp"
 
+#include "common/log_message.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 
@@ -14,11 +15,11 @@ bool Projection::Next(Row* dst) {
   dst->Clear();
   if (!src_->Next(&orig)) return false;
   std::vector<Value> extracted;
-  extracted.resize(offsets_.size());
+  extracted.reserve(offsets_.size());
   for (unsigned long offset : offsets_) {
     extracted.push_back(orig[offset]);
   }
-  *dst = Row(extracted);
+  *dst = Row(std::move(extracted));
   return true;
 }
 

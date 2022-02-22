@@ -57,7 +57,8 @@ class Page {
   Status Insert(Transaction& txn, std::string_view key, std::string_view value);
   Status Update(Transaction& txn, std::string_view key, std::string_view value);
   Status Delete(Transaction& txn, std::string_view key);
-  Status Read(Transaction& txn, std::string_view key, std::string_view* result);
+  Status Read(Transaction& txn, std::string_view key,
+              std::string_view* result) const;
   Status LowestKey(Transaction& txn, std::string_view* result);
   Status HighestKey(Transaction& txn, std::string_view* result);
   void Split(Transaction& txn, std::string_view key, std::string_view value,
@@ -71,7 +72,7 @@ class Page {
   void SetLowestValue(Transaction& txn, page_id_t i);
   void SplitInto(Transaction& txn, std::string_view new_key, Page* right,
                  std::string* middle);
-  Status LowestPage(Transaction& txn, page_id_t* page);
+  Status LowestPage(Transaction& txn, page_id_t* page) const;
 
   // Internal methods exposed for recovery.
   void InsertImpl(std::string_view redo);

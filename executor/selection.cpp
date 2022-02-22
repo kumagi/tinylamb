@@ -4,6 +4,7 @@
 
 #include "selection.hpp"
 
+#include "common/log_message.hpp"
 #include "expression/expression_base.hpp"
 
 namespace tinylamb {
@@ -14,7 +15,7 @@ Selection::Selection(std::unique_ptr<ExpressionBase>&& exp, Schema* schema,
 
 bool Selection::Next(Row* dst) {
   Row orig;
-  while (!src_->Next(&orig)) {
+  while (src_->Next(&orig)) {
     Value result = exp_->Evaluate(orig, schema_);
     if (result.value.int_value) {
       *dst = orig;

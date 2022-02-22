@@ -208,7 +208,7 @@ Status Page::Delete(Transaction& txn, std::string_view key) {
 }
 
 Status Page::Read(Transaction& txn, std::string_view key,
-                  std::string_view* result) {
+                  std::string_view* result) const {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
   return body.leaf_page.Read(PageID(), txn, key, result);
 }
@@ -268,7 +268,7 @@ void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
   body.internal_page.SplitInto(PageID(), txn, new_key, right, middle);
 }
 
-Status Page::LowestPage(Transaction& txn, page_id_t* page) {
+Status Page::LowestPage(Transaction& txn, page_id_t* page) const {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
   return body.internal_page.LowestPage(txn, page);
 }

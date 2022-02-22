@@ -43,7 +43,7 @@ namespace std {
 template <>
 class hash<tinylamb::Row> {
  public:
-  uint64_t operator()(const tinylamb::Row& row);
+  uint64_t operator()(const tinylamb::Row& row) const;
 };
 
 }  // namespace std

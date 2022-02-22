@@ -11,18 +11,17 @@
 #include "table/iterator.hpp"
 
 namespace tinylamb {
-class Table;
+class TableInterface;
 class Transaction;
 
 class FullScan : public ExecutorBase {
  public:
-  FullScan(Transaction& txn, Table* table);
+  FullScan(Transaction& txn, TableInterface* table);
   bool Next(Row* dst) override;
   ~FullScan() override = default;
 
  private:
-  Transaction* txn_;
-  Table* table_;
+  TableInterface* table_;
   Iterator iter_;
 };
 

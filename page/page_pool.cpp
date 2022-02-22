@@ -127,9 +127,7 @@ void PagePool::WriteBack(const Page* target) {
   target->SetChecksum();
   // LOG(WARN) << "write back: " << *target;
   src_.seekp(target->PageID() * kPageSize, std::ios_base::beg);
-  if (src_.fail()) {
-    src_.clear();
-  }
+  if (src_.fail()) src_.clear();
   src_.write(reinterpret_cast<const char*>(target), kPageSize);
   if (src_.fail()) {
     throw std::runtime_error("cannot write back page: " +

@@ -87,7 +87,7 @@ std::ostream& operator<<(std::ostream& o, const Row& r) {
 
 }  // namespace tinylamb
 
-uint64_t std::hash<tinylamb::Row>::operator()(const tinylamb::Row& row) {
+uint64_t std::hash<tinylamb::Row>::operator()(const tinylamb::Row& row) const {
   uint64_t ret = 0;
   for (const auto& v : row.values_) {
     ret += std::hash<tinylamb::Value>()(v);

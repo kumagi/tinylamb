@@ -34,8 +34,7 @@ class FakeIterator : public IteratorBase {
 // Supports full interface of table but never support transaction.
 class FakeTable : public TableInterface {
  public:
-  explicit FakeTable(std::initializer_list<Row> table)
-      : table_(std::move(table)) {}
+  explicit FakeTable(std::initializer_list<Row> table) : table_(table) {}
   ~FakeTable() override = default;
   Status Insert(Transaction& txn, const Row& row, RowPosition* rp) override;
 

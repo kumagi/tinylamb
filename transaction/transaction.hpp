@@ -36,6 +36,8 @@ class Transaction {
   friend class TransactionManager;
 
  public:
+  Transaction()
+      : txn_id_(-1), transaction_manager_(nullptr) {}  // For test purpose only.
   Transaction(txn_id_t txn_id, TransactionManager* tm);
   Transaction(const Transaction& o) = delete;
   Transaction(Transaction&& o) = default;
