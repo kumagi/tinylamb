@@ -19,22 +19,23 @@ bool HashJoin::Next(Row* dst) {
   if (!bucket_constructed_) BucketConstruct();
   if (right_buckets_iterator_ != right_buckets_.end()) {
     *dst = hold_left_ + right_buckets_iterator_->second;
-    if ((++right_buckets_iterator_)->first != left_key_) {
-      right_buckets_iterator_ = right_buckets_.end();
-      left_key_.clear();
+  } else {
+    for (;;) {
+      if (!left_->Next(&hold_left_)) return false;
+      left_key_ = hold_left_.Extract(left_cols_).EncodeMemcomparableFormat();
+      right_buckets_iterator_ = right_buckets_.find(left_key_);
+      if (right_buckets_iterator_ != right_buckets_.end()) {
+        *dst = hold_left_ + right_buckets_iterator_->second;
+        break;
+      }
     }
-    return true;
   }
 
-  for (;;) {
-    if (!left_->Next(&hold_left_)) return false;
-    left_key_ = hold_left_.Extract(left_cols_).EncodeMemcomparableFormat();
-    right_buckets_iterator_ = right_buckets_.find(left_key_);
-    if (right_buckets_iterator_ != right_buckets_.end()) {
-      *dst = hold_left_ + right_buckets_iterator_->second;
-      return true;
-    }
+  if ((++right_buckets_iterator_)->first != left_key_) {
+    right_buckets_iterator_ = right_buckets_.end();
+    left_key_.clear();
   }
+  return true;
 }
 
 void HashJoin::BucketConstruct() {

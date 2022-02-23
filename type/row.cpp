@@ -57,7 +57,7 @@ std::string Row::EncodeMemcomparableFormat() const {
 Row Row::Extract(const std::vector<size_t>& elms) const {
   Row tmp;
   std::vector<Value> extracted;
-  extracted.resize(elms.size());
+  extracted.reserve(elms.size());
   for (size_t offset : elms) {
     extracted.push_back(values_[offset]);
   }

@@ -4,12 +4,13 @@
 #include <memory>
 
 #include "executor/full_scan.hpp"
+#include "executor/hash_join.hpp"
+#include "executor/projection.hpp"
+#include "executor/selection.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "gtest/gtest.h"
-#include "projection.hpp"
-#include "selection.hpp"
 #include "table/fake_table.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
@@ -62,13 +63,18 @@ TEST_F(ExecutorTest, Projection) {
   Row got;
   ASSERT_TRUE(proj.Next(&got));
   ASSERT_NE(rows.find(got), rows.end());
+  ASSERT_TRUE(rows.erase(got));
   ASSERT_TRUE(proj.Next(&got));
   ASSERT_NE(rows.find(got), rows.end());
+  ASSERT_TRUE(rows.erase(got));
   ASSERT_TRUE(proj.Next(&got));
   ASSERT_NE(rows.find(got), rows.end());
+  ASSERT_TRUE(rows.erase(got));
   ASSERT_TRUE(proj.Next(&got));
   ASSERT_NE(rows.find(got), rows.end());
+  ASSERT_TRUE(rows.erase(got));
   ASSERT_FALSE(proj.Next(&got));
+  ASSERT_TRUE(rows.empty());
 }
 
 TEST_F(ExecutorTest, Selection) {
@@ -82,6 +88,44 @@ TEST_F(ExecutorTest, Selection) {
   ASSERT_TRUE(sel.Next(&got));
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_FALSE(sel.Next(&got));
+}
+
+TEST_F(ExecutorTest, BasicJoin) {
+  FakeTable table{{Row({Value(9), Value(1.2), Value("troop")})},
+                  {Row({Value(7), Value(3.9), Value("arise")})},
+                  {Row({Value(1), Value(4.9), Value("probe")})},
+                  {Row({Value(3), Value(12.4), Value("ought")})},
+                  {Row({Value(3), Value(99.9), Value("extra")})},
+                  {Row({Value(232), Value(40.9), Value("out")})},
+                  {Row({Value(0), Value(9.2), Value("arise")})}};
+
+  HashJoin hj(std::make_unique<FullScan>(fake_txn_, &table_), {0},
+              std::make_unique<FullScan>(fake_txn_, &table), {0});
+
+  std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2), Value(0),
+                                Value(9.2), Value("arise")}),
+                           Row({Value(3), Value("piyo"), Value(12.2), Value(3),
+                                Value(12.4), Value("ought")}),
+                           Row({Value(3), Value("piyo"), Value(12.2), Value(3),
+                                Value(99.9), Value("extra")}),
+                           Row({Value(1), Value("world"), Value(4.9), Value(1),
+                                Value(4.9), Value("probe")})});
+
+  Row got;
+  ASSERT_TRUE(hj.Next(&got));
+  ASSERT_NE(rows.find(got), rows.end());
+  ASSERT_TRUE(rows.erase(got));
+  ASSERT_TRUE(hj.Next(&got));
+  ASSERT_NE(rows.find(got), rows.end());
+  ASSERT_TRUE(rows.erase(got));
+  ASSERT_TRUE(hj.Next(&got));
+  ASSERT_NE(rows.find(got), rows.end());
+  ASSERT_TRUE(rows.erase(got));
+  ASSERT_TRUE(hj.Next(&got));
+  ASSERT_NE(rows.find(got), rows.end());
+  ASSERT_TRUE(rows.erase(got));
+  ASSERT_FALSE(hj.Next(&got));
+  ASSERT_TRUE(rows.empty());
 }
 
 }  // namespace tinylamb
