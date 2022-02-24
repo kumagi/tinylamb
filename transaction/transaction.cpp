@@ -173,4 +173,14 @@ void Transaction::CommitWait() const {
   }
 }
 
+lsn_t Transaction::SetPrevNextLog(page_id_t target, page_id_t undo_prev,
+                                  page_id_t undo_next, page_id_t redo_prev,
+                                  page_id_t redo_next) {
+  assert(!IsFinished());
+  LogRecord lr = LogRecord::SetPrevNextLogRecord(
+      prev_lsn_, txn_id_, target, undo_prev, undo_next, redo_prev, redo_next);
+  prev_lsn_ = transaction_manager_->AddLog(lr);
+  return prev_lsn_;
+}
+
 }  // namespace tinylamb

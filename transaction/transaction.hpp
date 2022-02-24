@@ -89,6 +89,9 @@ class Transaction {
 
   lsn_t DestroyPageLog(page_id_t page_id);
 
+  lsn_t SetPrevNextLog(page_id_t i, page_id_t i1, page_id_t i2, page_id_t i3,
+                       page_id_t i4);
+
   // Prepared mainly for testing.
   // Using this function is discouraged to get performance of flush pipelining.
   void CommitWait() const;

@@ -3,7 +3,6 @@
 //
 #include "b_plus_tree.hpp"
 
-#include <cstring>
 #include <vector>
 
 #include "page/page_manager.hpp"
@@ -64,9 +63,13 @@ Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
       for (int i = 0; i < root->body.leaf_page.RowCount(); ++i) {
         new_left->Insert(txn, root_page.GetKey(i), root_page.GetValue(i));
       }
+      PageRef right_page = pm_->GetPage(right);
+      right_page->SetPrevNext(txn, new_left->PageID(),
+                              right_page->body.leaf_page.next_pid_);
       root->PageTypeChange(txn, PageType::kInternalPage);
       root->SetLowestValue(txn, new_left->PageID());
       root->Insert(txn, key, right);
+      new_left->SetPrevNext(txn, 0, right);
     }
     return Status::kSuccess;
   } else {
@@ -125,7 +128,8 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
     // No enough space? Split!
 
     PageRef new_page = pm_->AllocateNewPage(txn, PageType::kLeafPage);
-    target->Split(txn, key, value, new_page.get());
+    target->body.leaf_page.Split(target->PageID(), txn, key, value,
+                                 new_page.get());
     target.PageUnlock();
     if ([&]() {
           if (new_page->RowCount() == 0 || new_page->GetKey(0) < key) {
@@ -138,6 +142,7 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
     }
     std::string_view middle_key;
     new_page->LowestKey(txn, &middle_key);
+    new_page.PageUnlock();
     return InsertInternal(txn, middle_key, target->PageID(), new_page->PageID(),
                           parents);
   }

@@ -76,13 +76,17 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
     case LogType::kCompensateUpdateInternal:
       target->UpdateInternalImpl(log.key, log.redo_page);
       break;
+    case LogType::kSetPrevNext: {
+      page_id_t prev, next;
+      log.PrevNextLogRecordRedo(prev, next);
+      target->SetPrevNextImpl(prev, next);
+      break;
+    }
     case LogType::kLowestValue:
       target->SetLowestValueInternalImpl(log.redo_page);
       break;
     case LogType::kSystemAllocPage:
-      if (!target->IsValid()) {
-        target->PageInit(log.pid, log.allocated_page_type);
-      }
+      target->PageInit(log.pid, log.allocated_page_type);
       break;
     case LogType::kSystemDestroyPage:
       throw std::runtime_error("not implemented yet");
@@ -142,6 +146,12 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
                                       log.undo_page);
       target->InsertInternalImpl(log.key, log.undo_page);
       break;
+    case LogType::kSetPrevNext: {
+      page_id_t prev, next;
+      log.PrevNextLogRecordUndo(prev, next);
+      target->SetPrevNextImpl(prev, next);
+      break;
+    }
     case LogType::kBegin:
     case LogType::kCommit:
     case LogType::kBeginCheckpoint:

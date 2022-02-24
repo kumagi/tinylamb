@@ -223,10 +223,14 @@ Status Page::HighestKey(Transaction& txn, std::string_view* result) {
   return body.leaf_page.HighestKey(txn, result);
 }
 
-void Page::Split(Transaction& txn, std::string_view key, std::string_view value,
-                 Page* right) {
+Status Page::SetPrevNext(Transaction& txn, page_id_t prev, page_id_t next) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  body.leaf_page.Split(PageID(), txn, key, value, right);
+  Status s = body.leaf_page.SetPrevNext(PageID(), txn, prev, next);
+  if (s == Status::kSuccess) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+  }
+  return s;
 }
 
 Status Page::Insert(Transaction& txn, std::string_view key, page_id_t pid) {
@@ -305,6 +309,11 @@ void Page::UpdateImpl(std::string_view key, std::string_view value) {
 void Page::DeleteImpl(std::string_view key) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
   body.leaf_page.DeleteImpl(key);
+}
+
+void Page::SetPrevNextImpl(page_id_t prev, page_id_t next) {
+  ASSERT_PAGE_TYPE(PageType::kLeafPage)
+  body.leaf_page.SetPrevNextImpl(prev, next);
 }
 
 void Page::InsertInternalImpl(std::string_view key, page_id_t redo) {

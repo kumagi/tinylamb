@@ -249,8 +249,9 @@ TEST_F(LeafPageTest, Split) {
       }
       ASSERT_FAIL(
           left->Insert(txn, std::string(2000, '8'), std::string(2000, '8')));
-      left->Split(txn, std::string(2000, '0' + i) + "k", std::string(2000, 'p'),
-                  right.get());
+      left->body.leaf_page.Split(left->PageID(), txn,
+                                 std::string(2000, '0' + i) + "k",
+                                 std::string(2000, 'p'), right.get());
     }
     if (i < 5) {
       ASSERT_SUCCESS(left->Insert(txn, std::string(2000, '0' + i) + "k",

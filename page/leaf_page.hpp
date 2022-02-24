@@ -54,9 +54,11 @@ class LeafPage {
 
   [[nodiscard]] std::string_view GetKey(size_t idx) const;
   [[nodiscard]] std::string_view GetValue(size_t idx) const;
-  Status LowestKey(Transaction& txn, std::string_view* result);
-  Status HighestKey(Transaction& txn, std::string_view* result);
+  Status LowestKey(Transaction& txn, std::string_view* result) const;
+  Status HighestKey(Transaction& txn, std::string_view* result) const;
   [[nodiscard]] size_t RowCount() const;
+  Status SetPrevNext(page_id_t pid, Transaction& txn, page_id_t prev,
+                     page_id_t next);
 
   // Split utils.
   void Split(page_id_t pid, Transaction& txn, std::string_view key,
@@ -65,6 +67,7 @@ class LeafPage {
   void InsertImpl(std::string_view key, std::string_view value);
   void UpdateImpl(std::string_view key, std::string_view value);
   void DeleteImpl(std::string_view key);
+  void SetPrevNextImpl(page_id_t prev, page_id_t next);
 
  private:
   void DeFragment();

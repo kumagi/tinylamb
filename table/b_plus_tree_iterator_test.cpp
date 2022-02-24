@@ -41,7 +41,7 @@ class BPlusTreeIteratorTest : public ::testing::Test {
         bpt_->Insert(txn, std::string(key_len, c), std::string(value_len, c)));
   }
 
-  void Flush(page_id_t pid) { p_->GetPool()->FlushPageForTest(pid); }
+  void Flush(page_id_t pid) const { p_->GetPool()->FlushPageForTest(pid); }
 
   void Recover() {
     page_id_t root = bpt_ ? bpt_->Root() : 1;
@@ -59,8 +59,6 @@ class BPlusTreeIteratorTest : public ::testing::Test {
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
-    cm_ = std::make_unique<CheckpointManager>(kMasterRecordName, tm_.get(),
-                                              p_->GetPool(), 1);
     bpt_ = std::make_unique<BPlusTree>(root, p_.get());
   }
 
@@ -81,7 +79,6 @@ class BPlusTreeIteratorTest : public ::testing::Test {
   std::unique_ptr<Logger> l_;
   std::unique_ptr<RecoveryManager> r_;
   std::unique_ptr<TransactionManager> tm_;
-  std::unique_ptr<CheckpointManager> cm_;
   std::unique_ptr<BPlusTree> bpt_;
 };
 
@@ -141,6 +138,41 @@ TEST_F(BPlusTreeIteratorTest, RangeDescending) {
   EXPECT_FALSE(it.IsValid());
 }
 
+TEST_F(BPlusTreeIteratorTest, RangeDescendingRightOpen) {
+  auto txn = tm_->Begin();
+  for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
+    Init(txn, c, 1000, 100);
+  }
+  BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);
+  EXPECT_EQ(*it, std::string(100, 'g'));
+  --it;
+  EXPECT_TRUE(it.IsValid());
+
+  EXPECT_EQ(*it, std::string(100, 'f'));
+  --it;
+  EXPECT_TRUE(it.IsValid());
+
+  EXPECT_EQ(*it, std::string(100, 'e'));
+  --it;
+  EXPECT_TRUE(it.IsValid());
+
+  EXPECT_EQ(*it, std::string(100, 'd'));
+  --it;
+  EXPECT_TRUE(it.IsValid());
+
+  EXPECT_EQ(*it, std::string(100, 'c'));
+  --it;
+  EXPECT_TRUE(it.IsValid());
+
+  EXPECT_EQ(*it, std::string(100, 'b'));
+  --it;
+  EXPECT_TRUE(it.IsValid());
+
+  EXPECT_EQ(*it, std::string(100, 'a'));
+  --it;
+  EXPECT_FALSE(it.IsValid());
+}
+
 TEST_F(BPlusTreeIteratorTest, FullScanMultiLeaf) {
   auto txn = tm_->Begin();
   for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
@@ -150,10 +182,33 @@ TEST_F(BPlusTreeIteratorTest, FullScanMultiLeaf) {
   for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
     SCOPED_TRACE(c);
     ASSERT_TRUE(it.IsValid());
-    EXPECT_EQ(*it, std::string(10000, c));
+    ASSERT_EQ(*it, std::string(10000, c));
     ++it;
   }
   EXPECT_FALSE(it.IsValid());
+}
+
+TEST_F(BPlusTreeIteratorTest, FullScanMultiLeafRecovery) {
+  {
+    auto txn = tm_->Begin();
+    for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
+      Init(txn, c, 1000, 10000);
+    }
+    txn.PreCommit();
+  }
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+  {
+    auto txn = tm_->Begin();
+    BPlusTreeIterator it = bpt_->Begin(txn);
+    for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
+      SCOPED_TRACE(c);
+      ASSERT_TRUE(it.IsValid());
+      ASSERT_EQ(*it, std::string(10000, c));
+      ++it;
+    }
+    EXPECT_FALSE(it.IsValid());
+  }
 }
 
 TEST_F(BPlusTreeIteratorTest, FullScanReverse) {
@@ -167,8 +222,25 @@ TEST_F(BPlusTreeIteratorTest, FullScanReverse) {
        {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'}) {
     SCOPED_TRACE(c);
     EXPECT_TRUE(it.IsValid());
-    EXPECT_EQ(*it, std::string(2000, c));
+    ASSERT_EQ(*it, std::string(2000, c));
     ++it;
+  }
+  EXPECT_FALSE(it.IsValid());
+}
+
+TEST_F(BPlusTreeIteratorTest, EndOpenFullScanReverse) {
+  auto txn = tm_->Begin();
+  for (const auto& c :
+       {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'}) {
+    Init(txn, c, 10000, 2000);
+  }
+  BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);
+  for (const auto& c :
+       {'k', 'j', 'i', 'h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
+    SCOPED_TRACE(c);
+    EXPECT_TRUE(it.IsValid());
+    ASSERT_EQ(*it, std::string(2000, c));
+    --it;
   }
   EXPECT_FALSE(it.IsValid());
 }

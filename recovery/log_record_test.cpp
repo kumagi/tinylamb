@@ -98,6 +98,10 @@ TEST_F(LogRecordTest, check) {
 
   // Lowest value log.
   SerializeDeserializeCheck(LogRecord::SetLowestLogRecord(14, 123, 345, 687));
+
+  // Leaf Page
+  SerializeDeserializeCheck(
+      LogRecord::SetPrevNextLogRecord(99, 212, 48, 14, 12, 5, 6237));
 }
 
 }  // namespace tinylamb

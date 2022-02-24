@@ -169,6 +169,9 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kSystemDestroyPage:
       o << "DESTROY\t";
       break;
+    case LogType::kSetPrevNext:
+      o << "SET PREV NEXT\t";
+      break;
     default:
       o << "(undefined: " << static_cast<uint16_t>(type) << ")";
   }
@@ -235,6 +238,19 @@ std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
       }
       o << "}";
       return o;
+    case LogType::kSetPrevNext: {
+      l.DumpPosition(o);
+      page_id_t undo_prev, undo_next, redo_prev, redo_next;
+      memcpy(&undo_prev, l.undo_data.data(), sizeof(undo_prev));
+      memcpy(&undo_next, l.undo_data.data() + sizeof(undo_prev),
+             sizeof(undo_prev));
+      memcpy(&redo_prev, l.redo_data.data(), sizeof(redo_prev));
+      memcpy(&redo_next, l.redo_data.data() + sizeof(redo_prev),
+             sizeof(redo_prev));
+      o << "[" << undo_prev << ", " << undo_next << "] to be "
+        << "[" << redo_prev << ", " << redo_next << "]";
+      break;
+    }
     case LogType::kBegin:
     case LogType::kCommit:
     case LogType::kSystemAllocPage:
@@ -273,6 +289,7 @@ bool LogRecord::ParseLogRecord(std::istream& in, tinylamb::LogRecord* dst) {
       return true;
     case LogType::kUpdateRow:
     case LogType::kUpdateLeaf:
+    case LogType::kSetPrevNext:
       DeserializeString(in, &dst->redo_data);
       DeserializeString(in, &dst->undo_data);
       return true;
@@ -603,6 +620,35 @@ LogRecord LogRecord::EndCheckpointLogRecord(
   return l;
 }
 
+LogRecord LogRecord::SetPrevNextLogRecord(lsn_t prev_lsn, txn_id_t tid,
+                                          page_id_t pid, page_id_t undo_prev,
+                                          page_id_t undo_next,
+                                          page_id_t redo_prev,
+                                          page_id_t redo_next) {
+  LogRecord l;
+  l.prev_lsn = prev_lsn;
+  l.txn_id = tid;
+  l.pid = pid;
+  l.type = LogType::kSetPrevNext;
+  l.undo_data = std::string(sizeof(undo_prev) + sizeof(undo_next), '\0');
+  memcpy(l.undo_data.data(), &undo_prev, sizeof(undo_prev));
+  memcpy(l.undo_data.data() + sizeof(undo_prev), &undo_next, sizeof(undo_next));
+  l.redo_data = std::string(sizeof(redo_prev) + sizeof(redo_next), '\0');
+  memcpy(l.redo_data.data(), &redo_prev, sizeof(redo_prev));
+  memcpy(l.redo_data.data() + sizeof(redo_prev), &redo_next, sizeof(redo_next));
+  return l;
+}
+
+void LogRecord::PrevNextLogRecordRedo(page_id_t& prev, page_id_t& next) const {
+  memcpy(&prev, redo_data.data(), sizeof(prev));
+  memcpy(&next, redo_data.data() + sizeof(prev), sizeof(next));
+}
+
+void LogRecord::PrevNextLogRecordUndo(page_id_t& prev, page_id_t& next) const {
+  memcpy(&prev, undo_data.data(), sizeof(prev));
+  memcpy(&next, undo_data.data() + sizeof(prev), sizeof(next));
+}
+
 void LogRecord::Clear() {
   type = LogType::kUnknown;
   pid = std::numeric_limits<page_id_t>::max();
@@ -634,6 +680,7 @@ size_t LogRecord::Size() const {
       size += SerializeSize(redo_data);
       break;
     case LogType::kUpdateLeaf:
+    case LogType::kSetPrevNext:
     case LogType::kUpdateRow:
       size += SerializeSize(redo_data);
       size += SerializeSize(undo_data);
@@ -698,6 +745,7 @@ size_t LogRecord::Size() const {
       break;
     case LogType::kUpdateLeaf:
     case LogType::kUpdateRow:
+    case LogType::kSetPrevNext:
       offset += SerializeStringView(result.data() + offset, redo_data);
       offset += SerializeStringView(result.data() + offset, undo_data);
       break;

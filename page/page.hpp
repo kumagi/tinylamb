@@ -61,8 +61,7 @@ class Page {
               std::string_view* result) const;
   Status LowestKey(Transaction& txn, std::string_view* result);
   Status HighestKey(Transaction& txn, std::string_view* result);
-  void Split(Transaction& txn, std::string_view key, std::string_view value,
-             Page* right);
+  Status SetPrevNext(Transaction& txn, page_id_t prev, page_id_t next);
 
   // Internal page manipulations.
   Status Insert(Transaction& txn, std::string_view key, page_id_t pid);
@@ -82,6 +81,7 @@ class Page {
   void InsertImpl(std::string_view key, std::string_view value);
   void UpdateImpl(std::string_view key, std::string_view value);
   void DeleteImpl(std::string_view key);
+  void SetPrevNextImpl(page_id_t prev, page_id_t next);
 
   void InsertInternalImpl(std::string_view key, page_id_t pid);
   void UpdateInternalImpl(std::string_view key, page_id_t pid);

@@ -181,23 +181,34 @@ Status LeafPage::Read(page_id_t pid, Transaction& txn, std::string_view key,
   }
 }
 
-Status LeafPage::LowestKey(Transaction& txn, std::string_view* result) {
+Status LeafPage::LowestKey(Transaction& txn, std::string_view* result) const {
   *result = std::string_view();
   if (row_count_ == 0) return Status::kNotExists;
-  RowPointer* rows = Rows();
   *result = GetKey(0);
   return Status::kSuccess;
 }
 
-Status LeafPage::HighestKey(Transaction& txn, std::string_view* result) {
+Status LeafPage::HighestKey(Transaction& txn, std::string_view* result) const {
   *result = std::string_view();
   if (row_count_ == 0) return Status::kNotExists;
-  RowPointer* rows = Rows();
   *result = GetKey(row_count_ - 1);
   return Status::kSuccess;
 }
 
 size_t LeafPage::RowCount() const { return row_count_; }
+
+Status LeafPage::SetPrevNext(page_id_t pid, Transaction& txn, page_id_t prev,
+                             page_id_t next) {
+  txn.SetPrevNextLog(pid, prev_pid_, next_pid_, prev, next);
+  prev_pid_ = prev;
+  next_pid_ = next;
+  return Status::kSuccess;
+}
+
+void LeafPage::SetPrevNextImpl(page_id_t prev, page_id_t next) {
+  prev_pid_ = prev;
+  next_pid_ = next;
+}
 
 void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
                      std::string_view value, Page* right) {
@@ -227,9 +238,8 @@ void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
   for (size_t i = pos; i < original_row_count; ++i) {
     this_page->Delete(txn, GetKey(pos));
   }
-  right->body.leaf_page.next_pid_ = next_pid_;
-  right->body.leaf_page.prev_pid_ = pid;
-  next_pid_ = right->PageID();
+  right->SetPrevNext(txn, pid, next_pid_);
+  this_page->SetPrevNext(txn, prev_pid_, right->PageID());
 }
 
 void LeafPage::DeFragment() {

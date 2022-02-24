@@ -37,6 +37,7 @@ enum class LogType : uint16_t {
   kSystemAllocPage,
   kSystemDestroyPage,
   kLowestValue,
+  kSetPrevNext,
 };
 inline std::istream& operator>>(std::istream& in, const LogType& val) {
   in >> (uint16_t&)val;
@@ -133,6 +134,14 @@ struct LogRecord {
   static LogRecord EndCheckpointLogRecord(
       const std::vector<std::pair<page_id_t, lsn_t>>& dpt,
       const std::vector<CheckpointManager::ActiveTransactionEntry>& att);
+
+  static LogRecord SetPrevNextLogRecord(lsn_t prev_lsn, txn_id_t tid,
+                                        page_id_t pid, page_id_t undo_prev,
+                                        page_id_t undo_next,
+                                        page_id_t redo_prev,
+                                        page_id_t redo_next);
+  void PrevNextLogRecordRedo(page_id_t& prev, page_id_t& next) const;
+  void PrevNextLogRecordUndo(page_id_t& prev, page_id_t& next) const;
 
   void Clear();
 
