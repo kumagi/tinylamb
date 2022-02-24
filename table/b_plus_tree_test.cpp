@@ -33,7 +33,7 @@ class BPlusTreeTest : public ::testing::Test {
     EXPECT_SUCCESS(txn.PreCommit());
   }
 
-  void Flush(page_id_t pid) { p_->GetPool()->FlushPageForTest(pid); }
+  void Flush(page_id_t pid) const { p_->GetPool()->FlushPageForTest(pid); }
 
   void Recover() {
     page_id_t root = bpt_ ? bpt_->Root() : 1;
@@ -112,6 +112,7 @@ TEST_F(BPlusTreeTest, SplitInternal) {
   for (int i = 0; i < 6; ++i) {
     ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), long_value));
   }
+  bpt_->Dump(txn, std::cerr);
 }
 
 TEST_F(BPlusTreeTest, FullScanMultiLeafReverse) {
@@ -135,7 +136,6 @@ TEST_F(BPlusTreeTest, FullScanMultiLeafMany) {
 TEST_F(BPlusTreeTest, Search) {
   {
     auto txn = tm_->Begin();
-    std::string key_prefix("key");
     for (int i = 0; i < 100; ++i) {
       ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), KeyGen(i * 10, 2000)));
     }

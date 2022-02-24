@@ -54,8 +54,6 @@ class InternalPage {
   Status GetPageForKey(Transaction& txn, std::string_view key,
                        page_id_t* result) const;
 
-  Status LowestPage(Transaction& txn, page_id_t* result) const;
-
   void SplitInto(page_id_t pid, Transaction& txn, std::string_view new_key,
                  Page* right, std::string* middle);
 
@@ -75,6 +73,7 @@ class InternalPage {
 
  private:
   friend class std::hash<InternalPage>;
+  friend class BPlusTree;
 
   bin_size_t row_count_ = 0;
   page_id_t lowest_page_ = 0;

@@ -268,9 +268,11 @@ void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
   body.internal_page.SplitInto(PageID(), txn, new_key, right, middle);
 }
 
-Status Page::LowestPage(Transaction& txn, page_id_t* page) const {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  return body.internal_page.LowestPage(txn, page);
+void Page::PageTypeChange(Transaction& txn, PageType new_type) {
+  PageTypeChangeImpl(new_type);
+  txn.AllocatePageLog(page_id, new_type);
+  SetPageLSN(txn.PrevLSN());
+  SetRecLSN(txn.PrevLSN());
 }
 
 void Page::SetChecksum() const { checksum = std::hash<Page>()(*this); }
@@ -320,6 +322,9 @@ void Page::DeleteInternalImpl(std::string_view key) {
 void Page::SetLowestValueInternalImpl(page_id_t lowest_value) {
   ASSERT_PAGE_TYPE(PageType::kInternalPage)
   body.internal_page.SetLowestValueImpl(lowest_value);
+}
+void Page::PageTypeChangeImpl(PageType new_type) {
+  PageInit(page_id, new_type);
 }
 
 bool Page::IsValid() const { return checksum == std::hash<Page>()(*this); }

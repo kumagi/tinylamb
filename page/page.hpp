@@ -72,7 +72,7 @@ class Page {
   void SetLowestValue(Transaction& txn, page_id_t i);
   void SplitInto(Transaction& txn, std::string_view new_key, Page* right,
                  std::string* middle);
-  Status LowestPage(Transaction& txn, page_id_t* page) const;
+  void PageTypeChange(Transaction& txn, PageType new_type);
 
   // Internal methods exposed for recovery.
   void InsertImpl(std::string_view redo);
@@ -87,6 +87,7 @@ class Page {
   void UpdateInternalImpl(std::string_view key, page_id_t pid);
   void DeleteInternalImpl(std::string_view key);
   void SetLowestValueInternalImpl(page_id_t lowest_value);
+  void PageTypeChangeImpl(PageType new_type);
 
   void SetChecksum() const;
 

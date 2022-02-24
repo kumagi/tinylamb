@@ -44,10 +44,30 @@ Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
                                  page_id_t left, page_id_t right,
                                  std::vector<PageRef>& parents) {
   if (parents.empty()) {
-    PageRef new_parent = pm_->AllocateNewPage(txn, PageType::kInternalPage);
-    new_parent->SetLowestValue(txn, left);
-    new_parent->Insert(txn, key, right);
-    root_ = new_parent->PageID();
+    PageRef root = pm_->GetPage(root_);
+    if (root->Type() == PageType::kInternalPage) {
+      const InternalPage& root_page = root->body.internal_page;
+      PageRef new_left = pm_->AllocateNewPage(txn, PageType::kInternalPage);
+      new_left->SetLowestValue(txn, root_page.lowest_page_);
+      for (int i = 0; i < root->RowCount(); ++i) {
+        new_left->Insert(txn, root_page.GetKey(i), root_page.GetValue(i));
+      }
+      while (0 < root_page.RowCount()) {
+        root->Delete(txn, root_page.GetKey(0));
+      }
+      root->SetLowestValue(txn, new_left->PageID());
+      root->Insert(txn, key, right);
+    } else {
+      assert(root->Type() == PageType::kLeafPage);
+      PageRef new_left = pm_->AllocateNewPage(txn, PageType::kLeafPage);
+      const LeafPage& root_page = root->body.leaf_page;
+      for (int i = 0; i < root->body.leaf_page.RowCount(); ++i) {
+        new_left->Insert(txn, root_page.GetKey(i), root_page.GetValue(i));
+      }
+      root->PageTypeChange(txn, PageType::kInternalPage);
+      root->SetLowestValue(txn, new_left->PageID());
+      root->Insert(txn, key, right);
+    }
     return Status::kSuccess;
   } else {
     PageRef internal(std::move(parents.back()));
@@ -66,6 +86,7 @@ Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
         }
       }();
       if (s != Status::kSuccess) return s;
+      internal.PageUnlock();
       return InsertInternal(txn, new_key, internal->PageID(),
                             new_node->PageID(), parents);
     }
@@ -75,9 +96,8 @@ Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
 
 PageRef BPlusTree::FindLeftmostPage(Transaction& txn, PageRef&& root) {
   if (root->Type() == PageType::kLeafPage) return std::move(root);
-  page_id_t next;
-  root->body.internal_page.LowestPage(txn, &next);
-  return FindLeftmostPage(txn, pm_->GetPage(next));
+  return FindLeftmostPage(txn,
+                          pm_->GetPage(root->body.internal_page.lowest_page_));
 }
 
 PageRef BPlusTree::FindRightmostPage(Transaction& txn, PageRef&& root) {
@@ -181,10 +201,8 @@ void BPlusTree::DumpInternal(Transaction& txn, std::ostream& o, PageRef&& page,
     o << Indent(indent);
     DumpLeafPage(txn, std::move(page), o, indent);
   } else if (page->Type() == PageType::kInternalPage) {
-    page_id_t lowest;
-    if (page->LowestPage(txn, &lowest) == Status::kSuccess) {
-      DumpInternal(txn, o, pm_->GetPage(lowest), indent + 4);
-    }
+    DumpInternal(txn, o, pm_->GetPage(page->body.internal_page.lowest_page_),
+                 indent + 4);
     for (int i = 0; i < page->RowCount(); ++i) {
       std::string_view key;
       page->ReadKey(txn, i, &key);

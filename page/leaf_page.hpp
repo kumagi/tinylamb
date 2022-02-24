@@ -72,6 +72,7 @@ class LeafPage {
   [[nodiscard]] size_t Find(std::string_view key) const;
 
  private:
+  friend class BPlusTree;
   friend class BPlusTreeIterator;
   friend class Page;
   friend class InternalPage;

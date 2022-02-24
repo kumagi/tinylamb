@@ -133,11 +133,6 @@ Status InternalPage::GetPageForKey(Transaction& txn, std::string_view key,
   return Status::kSuccess;
 }
 
-Status InternalPage::LowestPage(Transaction& txn, page_id_t* result) const {
-  *result = lowest_page_;
-  return Status::kSuccess;
-}
-
 void InternalPage::SplitInto(page_id_t pid, Transaction& txn,
                              std::string_view new_key, Page* right,
                              std::string* middle) {
