@@ -4,18 +4,22 @@
 
 #include "type/constraint.hpp"
 
+#include <cstring>
+
 #include "type/value.hpp"
 
 namespace tinylamb {
 
 size_t Constraint::Serialize(char* pos) const {
-  *reinterpret_cast<ConstraintType*>(pos++) = ctype;
+  *reinterpret_cast<ConstraintType*>(pos) = ctype;
+  pos += sizeof(ConstraintType);
   switch (ctype) {
     case kDefault:
     case kForeign:
     case kCheck:
-      *reinterpret_cast<ValueType*>(pos++) = value.type;
-      return sizeof(ConstraintType) + sizeof(ValueType) + value.Serialize(pos);
+      memcpy(pos, &value.type, sizeof(value.type));
+      pos += sizeof(value.type);
+      return sizeof(ctype) + sizeof(value.type) + value.Serialize(pos);
 
     default:
       return sizeof(ctype);
@@ -23,14 +27,16 @@ size_t Constraint::Serialize(char* pos) const {
 }
 
 size_t Constraint::Deserialize(const char* src) {
-  ctype = *reinterpret_cast<const ConstraintType*>(src++);
+  ctype = *reinterpret_cast<const ConstraintType*>(src);
+  src += sizeof(ConstraintType);
   switch (ctype) {
     case kDefault:
     case kForeign:
     case kCheck: {
-      ValueType type = *reinterpret_cast<const ValueType*>(src++);
-      return sizeof(ConstraintType) + sizeof(ValueType) +
-             value.Deserialize(src, type);
+      ValueType type;
+      memcpy(&type, src, sizeof(type));
+      src += sizeof(type);
+      return sizeof(ctype) + sizeof(type) + value.Deserialize(src, type);
     }
 
     default:
@@ -43,10 +49,10 @@ size_t Constraint::Size() const {
     case kDefault:
     case kForeign:
     case kCheck:
-      return sizeof(ConstraintType) + sizeof(ValueType) + value.Size();
+      return sizeof(ctype) + sizeof(ValueType) + value.Size();
 
     default:
-      return sizeof(ConstraintType);
+      return sizeof(ctype);
   }
 }
 
