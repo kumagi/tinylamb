@@ -70,9 +70,8 @@ class PagePool {
   // Return false if all pages are pinned.
   bool EvictOnePage();
 
-  PageRef AllocNewPage(size_t pid);
-
  private:
+  PageRef AllocNewPage(size_t pid);
   // Refresh the specified entry in LRU.
   void Touch(LruType::iterator it);
 

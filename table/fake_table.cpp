@@ -6,6 +6,8 @@
 
 #include <cassert>
 
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 
@@ -41,7 +43,7 @@ Status FakeTable::ReadByKey(Transaction& txn, std::string_view index_name,
   return Status::kNotExists;
 }
 
-Iterator FakeTable::BeginFullScan(Transaction& txn) {
+Iterator FakeTable::BeginFullScan(Transaction& txn) const {
   return Iterator(new FakeIterator(table_));
 }
 
@@ -50,7 +52,6 @@ Iterator FakeTable::BeginIndexScan(Transaction& txn,
                                    const Row& begin, const Row& end,
                                    bool ascending) {
   assert(!"not implemented");
-  return Iterator(new FakeIterator(table_));
 }
 
 }  // namespace tinylamb

@@ -4,19 +4,21 @@
 
 #include "selection.hpp"
 
+#include <utility>
+
 #include "common/log_message.hpp"
 #include "expression/expression_base.hpp"
 
 namespace tinylamb {
 
-Selection::Selection(std::unique_ptr<ExpressionBase>&& exp, Schema* schema,
-                     ExecutorBase* src)
-    : exp_(std::move(exp)), schema_(schema), src_(src) {}
+Selection::Selection(std::shared_ptr<ExpressionBase> exp, Schema schema,
+                     std::unique_ptr<ExecutorBase>&& src)
+    : exp_(std::move(exp)), schema_(std::move(schema)), src_(std::move(src)) {}
 
 bool Selection::Next(Row* dst) {
   Row orig;
   while (src_->Next(&orig)) {
-    Value result = exp_->Evaluate(orig, schema_);
+    Value result = exp_->Evaluate(orig, &schema_);
     if (result.value.int_value) {
       *dst = orig;
       return true;

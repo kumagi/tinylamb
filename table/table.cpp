@@ -4,9 +4,11 @@
 
 #include "table/table.hpp"
 
-#include "b_plus_tree.hpp"
-#include "index_scan_iterator.hpp"
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "page/page_manager.hpp"
+#include "table/b_plus_tree.hpp"
+#include "table/index_scan_iterator.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 
@@ -94,7 +96,7 @@ Status Table::ReadByKey(Transaction& txn, std::string_view index_name,
   return Status::kNotExists;
 }
 
-Iterator Table::BeginFullScan(Transaction& txn) {
+Iterator Table::BeginFullScan(Transaction& txn) const {
   return Iterator(new FullScanIterator(this, &txn));
 }
 
@@ -103,6 +105,16 @@ Iterator Table::BeginIndexScan(Transaction& txn, std::string_view index_name,
                                bool ascending) {
   return Iterator(
       new IndexScanIterator(this, index_name, &txn, begin, end, ascending));
+}
+
+Encoder& operator<<(Encoder& e, const Table& t) {
+  e << t.schema_ << t.first_pid_ << t.last_pid_ << t.indices_;
+  return e;
+}
+
+Decoder& operator>>(Decoder& d, Table& t) {
+  d >> t.schema_ >> t.first_pid_ >> t.last_pid_ >> t.indices_;
+  return d;
 }
 
 page_id_t Table::GetIndex(std::string_view name) {

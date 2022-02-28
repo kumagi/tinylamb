@@ -11,13 +11,16 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+class Encoder;
+class Decoder;
 
 class Value {
  public:
   Value() = default;
   explicit Value(int int_val);
   explicit Value(int64_t int_val);
-  explicit Value(std::string_view varchar_val);
+  // explicit Value(std::string_view varchar_val);
+  explicit Value(std::string&& str_val);
   explicit Value(double double_value);
   Value(const Value& o);
 
@@ -44,8 +47,10 @@ class Value {
   Value operator%(const Value& rhs) const;
 
   [[nodiscard]] std::string AsString() const;
-  friend std::ostream& operator<<(std::ostream& o, const Value& v);
   Value& operator=(const Value& rhs);
+  friend std::ostream& operator<<(std::ostream& o, const Value& v);
+  friend Encoder& operator<<(Encoder& o, const Value& v);
+  friend Decoder& operator>>(Decoder& o, Value& v);
 
   union {
     int64_t int_value;

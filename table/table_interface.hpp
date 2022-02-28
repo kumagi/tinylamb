@@ -15,10 +15,13 @@ namespace tinylamb {
 class Transaction;
 class Row;
 class RowPosition;
+class Encoder;
+class Decoder;
 
 class TableInterface {
  public:
   virtual ~TableInterface() = default;
+
   virtual Status Insert(Transaction& txn, const Row& row, RowPosition* rp) = 0;
 
   virtual Status Update(Transaction& txn, RowPosition pos, const Row& row) = 0;
@@ -30,7 +33,7 @@ class TableInterface {
   virtual Status ReadByKey(Transaction& txn, std::string_view index_name,
                            const Row& keys, Row* result) const = 0;
 
-  virtual Iterator BeginFullScan(Transaction& txn) = 0;
+  virtual Iterator BeginFullScan(Transaction& txn) const = 0;
   virtual Iterator BeginIndexScan(Transaction& txn, std::string_view index_name,
                                   const Row& begin, const Row& end,
                                   bool ascending) = 0;

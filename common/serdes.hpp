@@ -6,9 +6,12 @@
 #define TINYLAMB_SERDES_HPP
 
 #include <cstdint>
+#include <sstream>
 #include <string_view>
+#include <vector>
 
 #include "common/constants.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 

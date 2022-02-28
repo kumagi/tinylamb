@@ -5,6 +5,7 @@
 #ifndef TINYLAMB_PROJECTION_HPP
 #define TINYLAMB_PROJECTION_HPP
 
+#include <memory>
 #include <vector>
 
 #include "executor_base.hpp"
@@ -13,15 +14,15 @@ namespace tinylamb {
 
 class Projection : public ExecutorBase {
  public:
-  Projection(std::vector<size_t> offsets, ExecutorBase* src)
-      : offsets_(std::move(offsets)), src_(src) {}
+  Projection(std::vector<size_t> offsets, std::unique_ptr<ExecutorBase> src)
+      : offsets_(std::move(offsets)), src_(std::move(src)) {}
 
   bool Next(Row* dst) override;
   ~Projection() override = default;
 
  private:
   std::vector<size_t> offsets_;
-  ExecutorBase* src_;
+  std::unique_ptr<ExecutorBase> src_;
 };
 
 }  // namespace tinylamb

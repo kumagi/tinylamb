@@ -9,17 +9,25 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/serdes.hpp"
 
 namespace tinylamb {
 class Row;
+class Encoder;
+class Decoder;
+
 class Index {
  public:
+  Index() = default;
   [[nodiscard]] std::string GenerateKey(const Row& row) const;
   Index(std::string_view name, std::vector<size_t> key, page_id_t pid)
-      : name_(std::move(name)), key_(std::move(key)), pid_(pid) {}
+      : name_(name), key_(std::move(key)), pid_(pid) {}
+  friend Encoder& operator<<(Encoder& a, const Index& idx);
+  friend Decoder& operator>>(Decoder& e, Index& idx);
+
   std::string name_;
   std::vector<size_t> key_;
-  page_id_t pid_;
+  page_id_t pid_{};
 };
 
 }  // namespace tinylamb

@@ -17,7 +17,6 @@ class Iterator {
   explicit Iterator(IteratorBase* iter) : iter_(iter) {}
   [[nodiscard]] bool IsValid() const { return iter_->IsValid(); }
   const Row& operator*() const { return **iter_; }
-  Row& operator*() { return **iter_; }
   Iterator& operator++() {
     ++(*iter_);
     return *this;

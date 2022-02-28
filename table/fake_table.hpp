@@ -7,18 +7,21 @@
 
 #include <vector>
 
+#include "table/iterator_base.hpp"
 #include "table/table_interface.hpp"
+#include "type/row.hpp"
 
 namespace tinylamb {
+class Encoder;
+class Decoder;
 
 class FakeIterator : public IteratorBase {
  public:
-  explicit FakeIterator(std::vector<Row>& table)
+  explicit FakeIterator(const std::vector<Row>& table)
       : table_(&table), iter_(table.begin()) {}
   ~FakeIterator() override = default;
   [[nodiscard]] bool IsValid() const override { return iter_ != table_->end(); }
   const Row& operator*() const override { return *iter_; }
-  Row& operator*() override { return *iter_; }
   IteratorBase& operator++() override {
     ++iter_;
     return *this;
@@ -27,15 +30,17 @@ class FakeIterator : public IteratorBase {
     --iter_;
     return *this;
   }
-  std::vector<Row>* table_;
-  std::vector<Row>::iterator iter_;
+  const std::vector<Row>* table_;
+  std::vector<Row>::const_iterator iter_;
 };
 
 // Supports full interface of table but never support transaction.
 class FakeTable : public TableInterface {
  public:
-  explicit FakeTable(std::initializer_list<Row> table) : table_(table) {}
+  FakeTable() = default;
+  FakeTable(std::initializer_list<Row> table) : table_(table) {}
   ~FakeTable() override = default;
+
   Status Insert(Transaction& txn, const Row& row, RowPosition* rp) override;
 
   Status Update(Transaction& txn, RowPosition pos, const Row& row) override;
@@ -47,7 +52,7 @@ class FakeTable : public TableInterface {
   Status ReadByKey(Transaction& txn, std::string_view index_name,
                    const Row& keys, Row* result) const override;
 
-  Iterator BeginFullScan(Transaction& txn) override;
+  Iterator BeginFullScan(Transaction& txn) const override;
 
   Iterator BeginIndexScan(Transaction& txn, std::string_view index_name,
                           const Row& begin, const Row& end,

@@ -11,7 +11,7 @@
 
 namespace tinylamb {
 
-FullScanIterator::FullScanIterator(Table* table, Transaction* txn)
+FullScanIterator::FullScanIterator(const Table* table, Transaction* txn)
     : table_(table), txn_(txn), pos_(table_->first_pid_, 0) {
   txn_->AddReadSet(pos_);
   std::string_view row;
@@ -52,7 +52,5 @@ IteratorBase& FullScanIterator::operator--() {
 bool FullScanIterator::IsValid() const { return pos_.IsValid(); }
 
 const Row& FullScanIterator::operator*() const { return current_row_; }
-
-Row& FullScanIterator::operator*() { return current_row_; }
 
 }  // namespace tinylamb

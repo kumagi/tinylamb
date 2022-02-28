@@ -6,6 +6,8 @@
 
 #include <sstream>
 
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "type/row.hpp"
 
 namespace tinylamb {
@@ -16,6 +18,16 @@ std::string Index::GenerateKey(const Row& row) const {
     s << row[k].EncodeMemcomparableFormat();
   }
   return s.str();
+}
+
+Encoder& operator<<(Encoder& a, const Index& idx) {
+  a << idx.name_ << idx.key_ << idx.pid_;
+  return a;
+}
+
+Decoder& operator>>(Decoder& e, Index& idx) {
+  e >> idx.name_ >> idx.key_ >> idx.pid_;
+  return e;
 }
 
 }  // namespace tinylamb

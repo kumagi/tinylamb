@@ -64,6 +64,4 @@ IteratorBase& IndexScanIterator::operator--() {
 
 const Row& IndexScanIterator::operator*() const { return current_row_; }
 
-Row& IndexScanIterator::operator*() { return current_row_; }
-
 }  // namespace tinylamb

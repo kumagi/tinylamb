@@ -5,6 +5,8 @@
 
 #include <cstring>
 
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "common/log_message.hpp"
 #include "common/serdes.hpp"
 
@@ -20,9 +22,16 @@ Value::Value(int64_t int_val) {
   value.int_value = int_val;
 }
 
+/*
 Value::Value(std::string_view varchar_val) {
   type = ValueType::kVarChar;
   value.varchar_value = varchar_val;
+}
+*/
+
+Value::Value(std::string&& str_val) : owned_data(std::move(str_val)) {
+  type = ValueType::kVarChar;
+  value.varchar_value = owned_data;
 }
 
 Value::Value(double double_value) {
@@ -336,11 +345,6 @@ Value Value::operator%(const Value& rhs) const {
   throw std::runtime_error("Cannot do '%' against this type");
 }
 
-std::ostream& operator<<(std::ostream& o, const Value& v) {
-  o << v.AsString();
-  return o;
-}
-
 Value& Value::operator=(const Value& rhs) {
   type = rhs.type;
   value = rhs.value;
@@ -349,6 +353,48 @@ Value& Value::operator=(const Value& rhs) {
     value.varchar_value = owned_data;
   }
   return *this;
+}
+
+std::ostream& operator<<(std::ostream& o, const Value& v) {
+  o << v.AsString();
+  return o;
+}
+
+Encoder& operator<<(Encoder& a, const Value& v) {
+  a << v.type;
+  switch (v.type) {
+    case tinylamb::ValueType::kUnknown:
+      break;
+    case tinylamb::ValueType::kInt64:
+      a << v.value.int_value;
+      break;
+    case tinylamb::ValueType::kVarChar:
+      a << v.value.varchar_value;
+      break;
+    case tinylamb::ValueType::kDouble:
+      a << v.value.double_value;
+      break;
+  }
+  return a;
+}
+
+Decoder& operator>>(Decoder& e, Value& v) {
+  e >> v.type;
+  switch (v.type) {
+    case tinylamb::ValueType::kUnknown:
+      break;
+    case tinylamb::ValueType::kInt64:
+      e >> v.value.int_value;
+      break;
+    case tinylamb::ValueType::kVarChar:
+      e >> v.owned_data;
+      v.value.varchar_value = v.owned_data;
+      break;
+    case tinylamb::ValueType::kDouble:
+      e >> v.value.double_value;
+      break;
+  }
+  return e;
 }
 
 }  // namespace tinylamb

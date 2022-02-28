@@ -38,16 +38,20 @@ add_library(libtinylamb
         common/serdes.cpp common/log_message.cpp page/page_ref.cpp
         page/leaf_page.cpp page/internal_page.cpp table/b_plus_tree.cpp
         type/value.cpp type/constraint.cpp type/constraint.hpp table/table.cpp
-        table/table.hpp table/index.cpp common/debug.cpp
+        table/table.hpp table/index.cpp common/debug.cpp common/encoder.cpp
         table/full_scan_iterator.cpp table/b_plus_tree_iterator.cpp
         table/index_scan_iterator.cpp table/index_scan_iterator.hpp
-        executor/full_scan.cpp executor/projection.cpp executor/selection.cpp
-        expression/binary_expression.cpp expression/column_value.cpp
-        executor/hash_join.cpp)
+        database/catalog.cpp executor/full_scan.cpp executor/projection.cpp
+        executor/selection.cpp expression/binary_expression.cpp
+        expression/column_value.cpp executor/hash_join.cpp common/decoder.cpp
+        table/fake_table.cpp
+        plan/full_scan_plan.cpp plan/plan_base.cpp
+        plan/projection_plan.cpp plan/selection_plan.cpp
+        plan/selection_plan.hpp plan/product_plan.cpp plan/product_plan.hpp)
 
 add_library(libtinylamb_test_util
         STATIC
-        table/fake_table.cpp)
+        table/fake_table.cpp type/row.cpp)
 
 target_include_directories(
         libtinylamb
@@ -93,7 +97,6 @@ function(add_simple_test file_path)
     gtest_discover_tests(${target_name})
 endfunction()
 
-#add_simple_test(page/catalog_page_test.cpp)
 add_simple_test(database_test.cpp)
 add_simple_test(type/value_test.cpp)
 add_simple_test(type/row_test.cpp)
@@ -117,6 +120,8 @@ add_simple_test(table/index_scan_iterator_test.cpp)
 add_simple_test(transaction/transaction_test.cpp)
 add_simple_test(expression/expression_test.cpp)
 add_simple_test(executor/executor_test.cpp)
+add_simple_test(database/catalog_test.cpp)
+add_simple_test(plan/plan_test.cpp)
 
 
 ########################################
@@ -132,8 +137,8 @@ function(add_fuzzer_test file_path)
     target_link_options(${target_name} PRIVATE ${fuzzer_option})
 
     target_link_libraries(${target_name}
-            gtest_main
             libtinylamb
+            libtinylamb_test_util
             )
 endfunction()
 
@@ -155,6 +160,7 @@ function(add_fuzzer_test file_path)
     target_link_libraries(${target_name}
             gtest_main
             libtinylamb
+            libtinylamb_test_util
             )
 endfunction()
 

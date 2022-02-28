@@ -181,4 +181,32 @@ TEST_F(TableTest, IndexUpdateDelete) {
   ASSERT_EQ(table_->ReadByKey(txn, "idx1", key, &result), Status::kNotExists);
 }
 
+std::string KeyPayload(int num, int width) {
+  std::stringstream ss;
+  ss << std::setw(width) << std::setfill('0') << num;
+  return ss.str();
+}
+
+TEST_F(TableTest, InsertMany) {
+  Transaction txn = tm_->Begin();
+  RowPosition rp;
+  std::unordered_set<Row> rows;
+  std::unordered_set<RowPosition> rps;
+  for (int i = 0; i < 1000; ++i) {
+    std::string key = KeyPayload(i, 1000);
+    Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
+    ASSERT_SUCCESS(table_->Insert(txn, new_row, &rp));
+    rps.insert(rp);
+    Row read;
+    ASSERT_SUCCESS(table_->Read(txn, rp, &read));
+    ASSERT_EQ(read, new_row);
+    rows.insert(new_row);
+  }
+  Row read;
+  for (const auto& row : rps) {
+    ASSERT_SUCCESS(table_->Read(txn, row, &read));
+    ASSERT_NE(rows.find(read), rows.end());
+  }
+}
+
 }  // namespace tinylamb

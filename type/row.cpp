@@ -3,9 +3,10 @@
 #include <cstring>
 #include <iostream>
 
-#include "page/row_position.hpp"
-#include "schema.hpp"
-#include "value.hpp"
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
+#include "type/schema.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 
@@ -85,10 +86,20 @@ std::ostream& operator<<(std::ostream& o, const Row& r) {
   return o;
 }
 
+Encoder& operator<<(Encoder& e, const Row& r) {
+  e << r.values_;
+  return e;
+}
+
+Decoder& operator>>(Decoder& d, Row& r) {
+  d >> r.values_;
+  return d;
+}
+
 }  // namespace tinylamb
 
 uint64_t std::hash<tinylamb::Row>::operator()(const tinylamb::Row& row) const {
-  uint64_t ret = 0;
+  uint64_t ret = 0xcafe;
   for (const auto& v : row.values_) {
     ret += std::hash<tinylamb::Value>()(v);
   }

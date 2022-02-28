@@ -16,12 +16,12 @@ class Transaction;
 
 class FullScan : public ExecutorBase {
  public:
-  FullScan(Transaction& txn, TableInterface* table);
+  FullScan(Transaction& txn, const TableInterface* table);
   bool Next(Row* dst) override;
   ~FullScan() override = default;
 
  private:
-  TableInterface* table_;
+  const TableInterface* table_;
   Iterator iter_;
 };
 

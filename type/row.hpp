@@ -33,6 +33,8 @@ struct Row {
 
   bool operator==(const Row& rhs) const;
   friend std::ostream& operator<<(std::ostream& o, const Row& r);
+  friend Encoder& operator<<(Encoder& e, const Row& r);
+  friend Decoder& operator>>(Decoder& d, Row& r);
 
   std::vector<Value> values_;
 };

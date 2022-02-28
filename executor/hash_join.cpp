@@ -31,7 +31,8 @@ bool HashJoin::Next(Row* dst) {
     }
   }
 
-  if ((++right_buckets_iterator_)->first != left_key_) {
+  if ((++right_buckets_iterator_) != right_buckets_.end() &&
+      right_buckets_iterator_->first != left_key_) {
     right_buckets_iterator_ = right_buckets_.end();
     left_key_.clear();
   }

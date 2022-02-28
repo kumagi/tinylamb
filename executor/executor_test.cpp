@@ -55,8 +55,8 @@ TEST_F(ExecutorTest, FullScan) {
 }
 
 TEST_F(ExecutorTest, Projection) {
-  FullScan fs(fake_txn_, &table_);
-  Projection proj({0, 2}, &fs);
+  auto fs = std::make_unique<FullScan>(fake_txn_, &table_);
+  Projection proj({0, 2}, std::move(fs));
   std::unordered_set rows(
       {Row({Value(0), Value(1.2)}), Row({Value(3), Value(12.2)}),
        Row({Value(1), Value(4.9)}), Row({Value(2), Value(4.14)})});
@@ -78,11 +78,11 @@ TEST_F(ExecutorTest, Projection) {
 }
 
 TEST_F(ExecutorTest, Selection) {
-  FullScan fs(fake_txn_, &table_);
+
   Selection sel(std::make_unique<BinaryExpression>(
                     std::make_unique<ColumnValue>("key"),
                     std::make_unique<ConstantValue>(Value(1)), OpType::kEquals),
-                &schema_, &fs);
+                schema_, std::make_unique<FullScan>(fake_txn_, &table_));
   std::unordered_set rows({Row({Value(1), Value("world"), Value(4.9)})});
   Row got;
   ASSERT_TRUE(sel.Next(&got));

@@ -6,12 +6,14 @@
 #include <string_view>
 #include <vector>
 
+#include "common/decoder.hpp"
 #include "common/log_message.hpp"
 #include "page/row_position.hpp"
 #include "type/constraint.hpp"
 #include "value_type.hpp"
 
 namespace tinylamb {
+class Encoder;
 
 class Column {
  public:
@@ -21,12 +23,11 @@ class Column {
   [[nodiscard]] std::string_view Name() const { return name_; }
   [[nodiscard]] ValueType Type() const { return type_; }
   [[nodiscard]] Constraint GetConstraint() const { return constraint_; }
-  size_t Serialize(char* dst) const;
-  size_t Deserialize(const char* src);
-  [[nodiscard]] size_t Size() const;
 
   bool operator==(const Column& rhs) const;
   friend std::ostream& operator<<(std::ostream& o, const Column& c);
+  friend Encoder& operator<<(Encoder& a, const Column& c);
+  friend Decoder& operator>>(Decoder& e, Column& c);
 
  private:
   std::string name_;

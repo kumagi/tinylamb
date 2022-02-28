@@ -114,9 +114,6 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       tm->CompensateDeleteLog(log.txn_id, log.pid, log.slot, log.undo_data);
       target->InsertImpl(log.undo_data);
       break;
-    case LogType::kSystemAllocPage:
-      LOG(ERROR) << "Redoing alloc is not implemented yet";
-      break;
     case LogType::kSystemDestroyPage:
       target->PageInit(log.pid, log.allocated_page_type);
       break;
@@ -152,6 +149,7 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       target->SetPrevNextImpl(prev, next);
       break;
     }
+    case LogType::kSystemAllocPage:
     case LogType::kBegin:
     case LogType::kCommit:
     case LogType::kBeginCheckpoint:

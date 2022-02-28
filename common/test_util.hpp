@@ -5,7 +5,10 @@
 #ifndef TINYLAMB_TEST_UTIL_HPP
 #define TINYLAMB_TEST_UTIL_HPP
 
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "gtest/gtest.h"
+#include "serdes.hpp"
 
 #define ASSERT_SUCCESS(x) ASSERT_EQ(Status::kSuccess, x)
 #define EXPECT_SUCCESS(x) EXPECT_EQ(Status::kSuccess, x)
@@ -14,11 +17,13 @@
 
 template <typename T>
 void SerializeDeserializeTest(const T& c) {
-  std::string buff;
-  buff.resize(c.Size());
-  c.Serialize(buff.data());
+  std::stringstream ss;
+  tinylamb::Encoder arc(ss);
+  arc << c;
+
+  tinylamb::Decoder ext(ss);
   T another;
-  another.Deserialize(buff.data());
+  ext >> another;
   ASSERT_EQ(c, another);
 }
 

@@ -13,7 +13,6 @@ class IteratorBase {
   virtual ~IteratorBase() = default;
   [[nodiscard]] virtual bool IsValid() const = 0;
   virtual const Row& operator*() const = 0;
-  virtual Row& operator*() = 0;
   virtual IteratorBase& operator++() = 0;
   virtual IteratorBase& operator--() = 0;
 };

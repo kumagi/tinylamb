@@ -32,6 +32,7 @@ PageRef::~PageRef() {
     }
   }
 }
+
 std::ostream& operator<<(std::ostream& o, const PageRef& p) {
   o << "{Ref: " << p.page_->PageID() << "}";
   return o;

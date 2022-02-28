@@ -9,6 +9,7 @@
 #include <cstdint>
 
 #include "type/value.hpp"
+
 namespace tinylamb {
 
 /*
@@ -41,12 +42,12 @@ struct Constraint {
   explicit Constraint(ConstraintType ctype) : ctype(ctype) {}
   Constraint(ConstraintType ctype, const Value& v) : ctype(ctype), value(v) {}
 
-  size_t Serialize(char* pos) const;
-  size_t Deserialize(const char* src);
-  size_t Size() const;
+  [[nodiscard]] size_t Size() const;
   bool operator==(const Constraint& rhs) const;
   [[nodiscard]] bool IsNothing() const { return ctype == kNothing; }
   friend std::ostream& operator<<(std::ostream& o, const Constraint& c);
+  friend Encoder& operator<<(Encoder& a, const Constraint& c);
+  friend Decoder& operator>>(Decoder& a, Constraint& c);
 
   ConstraintType ctype{kNothing};
   Value value{};

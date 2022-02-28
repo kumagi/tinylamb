@@ -21,9 +21,12 @@ class Transaction;
 class Row;
 class RowPosition;
 class PageManager;
+class Decoder;
+class Encoder;
 
 class Table : public TableInterface {
  public:
+  explicit Table(PageManager* pm) : pm_(pm) {}
   Table(PageManager* pm, Schema sc, page_id_t pid, std::vector<Index> indices)
       : pm_(pm),
         schema_(std::move(sc)),
@@ -43,15 +46,18 @@ class Table : public TableInterface {
   Status ReadByKey(Transaction& txn, std::string_view index_name,
                    const Row& keys, Row* result) const override;
 
-  Iterator BeginFullScan(Transaction& txn) override;
+  Iterator BeginFullScan(Transaction& txn) const override;
   Iterator BeginIndexScan(Transaction& txn, std::string_view index_name,
                           const Row& begin, const Row& end = Row(),
                           bool ascending = true) override;
+  friend Encoder& operator<<(Encoder& e, const Table& t);
+  friend Decoder& operator>>(Decoder& d, Table& t);
 
  private:
-  page_id_t GetIndex(std::string_view name);
   friend class FullScanIterator;
   friend class IndexScanIterator;
+  friend class TableInterface;
+  page_id_t GetIndex(std::string_view name);
 
   PageManager* pm_;
   Schema schema_;

@@ -3,10 +3,10 @@
 
 #include <functional>
 
+#include "database/catalog.hpp"
 #include "page/page_manager.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
-#include "table/catalog.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction_manager.hpp"
 
@@ -21,7 +21,8 @@ class Database {
         pm_(dbname_ + ".db", 1024),
         recovery_(dbname_ + ".log", pm_.GetPool()),
         tm_(&lock_manager_, &logger_, &recovery_),
-        cm_(dbname_ + ".last_checkpoint", &tm_, pm_.GetPool()) {}
+        cm_(dbname_ + ".last_checkpoint", &tm_, pm_.GetPool()),
+        catalog_(1, &pm_) {}
 
  private:
   std::string dbname_;
@@ -31,6 +32,7 @@ class Database {
   RecoveryManager recovery_;
   TransactionManager tm_;
   CheckpointManager cm_;
+  Catalog catalog_;
 };
 
 }  // namespace tinylamb

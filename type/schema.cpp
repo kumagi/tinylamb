@@ -4,6 +4,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "common/log_message.hpp"
 #include "page/row_position.hpp"
 #include "type/value_type.hpp"
@@ -13,41 +15,22 @@ namespace tinylamb {
 Schema::Schema(std::string_view schema_name, std::vector<Column> columns)
     : name_(schema_name), columns_(std::move(columns)) {}
 
-size_t Schema::Serialize(char* dst) const {
-  const char* const original_offset = dst;
-  dst += SerializeStringView(dst, name_);
-  dst += SerializeInteger(dst, static_cast<int64_t>(columns_.size()));
-  for (const auto& c : columns_) {
-    dst += c.Serialize(dst);
+Schema Schema::Extract(const std::vector<size_t>& elms) const {
+  std::vector<Column> extracted;
+  extracted.reserve(elms.size());
+  for (size_t offset : elms) {
+    extracted.push_back(columns_[offset]);
   }
-  return dst - original_offset;
+  return {name_, std::move(extracted)};
 }
 
-size_t Schema::Deserialize(const char* src) {
-  const char* const original_offset = src;
-  std::string_view sv;
-  src += DeserializeStringView(src, &sv);
-  name_ = sv;
-  int64_t columns;
-  src += DeserializeInteger(src, &columns);
-  columns_.clear();
-  columns_.reserve(columns);
-  for (size_t i = 0; i < columns; ++i) {
-    Column c;
-    src += c.Deserialize(src);
-    columns_.push_back(std::move(c));
+Schema Schema::operator+(const Schema& rhs) const {
+  std::vector<Column> merged = columns_;
+  merged.reserve(columns_.size() + rhs.columns_.size());
+  for (const auto& c : rhs.columns_) {
+    merged.push_back(c);
   }
-  return src - original_offset;
-}
-
-[[nodiscard]] size_t Schema::Size() const {
-  size_t ret = 0;
-  ret += SerializeSize(name_);
-  ret += sizeof(int64_t);
-  for (const auto& c : columns_) {
-    ret += c.Size();
-  }
-  return ret;
+  return {"", merged};
 }
 
 bool Schema::operator==(const Schema& rhs) const {
@@ -64,13 +47,14 @@ std::ostream& operator<<(std::ostream& o, const Schema& s) {
   return o;
 }
 
-}  // namespace tinylamb
-
-uint64_t std::hash<tinylamb::Schema>::operator()(
-    const tinylamb::Schema& sc) const {
-  uint64_t result = std::hash<std::string_view>()(sc.Name());
-  for (size_t i = 0; i < sc.ColumnCount(); ++i) {
-    result += std::hash<tinylamb::Column>()(sc.GetColumn(i));
-  }
-  return result;
+Encoder& operator<<(Encoder& a, const Schema& sc) {
+  a << sc.name_ << sc.columns_;
+  return a;
 }
+
+Decoder& operator>>(Decoder& e, Schema& sc) {
+  e >> sc.name_ >> sc.columns_;
+  return e;
+}
+
+}  // namespace tinylamb

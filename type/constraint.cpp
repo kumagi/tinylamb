@@ -6,43 +6,11 @@
 
 #include <cstring>
 
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
-
-size_t Constraint::Serialize(char* pos) const {
-  *reinterpret_cast<ConstraintType*>(pos) = ctype;
-  pos += sizeof(ConstraintType);
-  switch (ctype) {
-    case kDefault:
-    case kForeign:
-    case kCheck:
-      memcpy(pos, &value.type, sizeof(value.type));
-      pos += sizeof(value.type);
-      return sizeof(ctype) + sizeof(value.type) + value.Serialize(pos);
-
-    default:
-      return sizeof(ctype);
-  }
-}
-
-size_t Constraint::Deserialize(const char* src) {
-  ctype = *reinterpret_cast<const ConstraintType*>(src);
-  src += sizeof(ConstraintType);
-  switch (ctype) {
-    case kDefault:
-    case kForeign:
-    case kCheck: {
-      ValueType type;
-      memcpy(&type, src, sizeof(type));
-      src += sizeof(type);
-      return sizeof(ctype) + sizeof(type) + value.Deserialize(src, type);
-    }
-
-    default:
-      return sizeof(ctype);
-  }
-}
 
 size_t Constraint::Size() const {
   switch (ctype) {
@@ -98,6 +66,16 @@ std::ostream& operator<<(std::ostream& o, const Constraint& c) {
       break;
   }
   return o;
+}
+
+Encoder& operator<<(Encoder& a, const Constraint& c) {
+  a << (uint8_t)c.ctype << c.value;
+  return a;
+}
+
+Decoder& operator>>(Decoder& e, Constraint& c) {
+  e >> (uint8_t&)c.ctype >> c.value;
+  return e;
 }
 
 }  // namespace tinylamb

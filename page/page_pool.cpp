@@ -28,18 +28,11 @@ PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit) {
   if (entry != pool_.end()) {
     entry->second->pin_count++;
     Touch(entry->second);
-    if (cache_hit != nullptr) {
-      *cache_hit = true;
-    }
-
+    if (cache_hit != nullptr) *cache_hit = true;
     return {this, entry->second->page.get(), entry->second->page_latch.get()};
   } else {
-    if (pool_lru_.size() == capacity_) {
-      EvictOnePage();
-    }
-    if (cache_hit != nullptr) {
-      *cache_hit = false;
-    }
+    if (pool_lru_.size() == capacity_) EvictOnePage();
+    if (cache_hit != nullptr) *cache_hit = false;
     return AllocNewPage(page_id);
   }
 }
