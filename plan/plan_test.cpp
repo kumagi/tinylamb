@@ -1,17 +1,17 @@
 //
 // Created by kumagi on 2022/03/01.
 //
+#include "plan/plan.hpp"
+
 #include "common/test_util.hpp"
 #include "database/catalog.hpp"
+#include "database/transaction_context.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
 #include "gtest/gtest.h"
-#include "plan/full_scan_plan.hpp"
-#include "plan/plan_base.hpp"
-#include "plan/projection_plan.hpp"
-#include "plan/selection_plan.hpp"
-#include "product_plan.hpp"
+#include "page/page_manager.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
 #include "table/table.hpp"
@@ -32,6 +32,8 @@ class PlanTest : public ::testing::Test {
     Recover();
     Transaction txn = tm_->Begin();
     catalog_->InitializeIfNeeded(txn);
+    ctx_ = std::make_unique<TransactionContext>(tm_.get(), p_.get(),
+                                                catalog_.get());
     {
       ASSERT_SUCCESS(catalog_->CreateTable(
           txn, Schema("Sc1", {Column("c1", ValueType::kInt64),
@@ -105,58 +107,44 @@ class PlanTest : public ::testing::Test {
   std::unique_ptr<TransactionManager> tm_;
   std::unique_ptr<CheckpointManager> cm_;
   std::unique_ptr<Catalog> catalog_;
+  std::unique_ptr<TransactionContext> ctx_;
 };
 
 TEST_F(PlanTest, Construct) {}
 
-TEST_F(PlanTest, ScanPlan) {
-  auto txn = tm_->Begin();
-  FullScanPlan fs(txn, "Sc1", catalog_.get(), p_.get());
-  std::unique_ptr<ExecutorBase> scan = fs.EmitExecutor(txn);
+void DumpAll(TransactionContext& ctx, Plan& plan) {
+  plan.Dump(std::cout, 0);
+  std::cout << "\n";
+  std::unique_ptr<ExecutorBase> scan = plan.EmitExecutor(ctx);
   Row result;
+  std::cout << plan.GetSchema(ctx) << "\n";
   while (scan->Next(&result)) {
-    LOG(TRACE) << result;
+    std::cout << result << "\n";
   }
+}
+
+TEST_F(PlanTest, ScanPlan) {
+  Plan fs = Plan::FullScan("Sc1");
+  DumpAll(*ctx_, fs);
 }
 
 TEST_F(PlanTest, ProjectPlan) {
-  auto txn = tm_->Begin();
-  ProjectionPlan pp(
-      std::make_unique<FullScanPlan>(txn, "Sc1", catalog_.get(), p_.get()),
-      {1});
-  std::unique_ptr<ExecutorBase> scan = pp.EmitExecutor(txn);
-  Row result;
-  while (scan->Next(&result)) {
-    LOG(TRACE) << result;
-  }
+  Plan pp = Plan::Projection(Plan::FullScan("Sc1"), {1});
+  DumpAll(*ctx_, pp);
 }
 
 TEST_F(PlanTest, SelectionPlan) {
-  auto txn = tm_->Begin();
-  std::shared_ptr<ExpressionBase> exp(new BinaryExpression(
-      std::make_unique<ColumnValue>("c1"),
-      std::make_unique<ConstantValue>(Value(100)), OpType::kGreaterThanEquals));
-  SelectionPlan sp(
-      std::make_unique<FullScanPlan>(txn, "Sc1", catalog_.get(), p_.get()),
-      exp);
-  std::unique_ptr<ExecutorBase> scan = sp.EmitExecutor(txn);
-  Row result;
-  while (scan->Next(&result)) {
-    LOG(TRACE) << result;
-  }
+  Expression exp = Expression::BinaryExpression(
+      Expression::ColumnValue("c1"), BinaryOperation::kGreaterThanEquals,
+      Expression::ConstantValue(Value(100)));
+  Plan sp = Plan::Selection(Plan::FullScan("Sc1"), std::move(exp));
+  DumpAll(*ctx_, sp);
 }
 
 TEST_F(PlanTest, ProductPlan) {
-  auto txn = tm_->Begin();
-  ProductPlan prop(
-      std::make_unique<FullScanPlan>(txn, "Sc1", catalog_.get(), p_.get()), {0},
-      std::make_unique<FullScanPlan>(txn, "Sc2", catalog_.get(), p_.get()),
-      {0});
-  std::unique_ptr<ExecutorBase> scan = prop.EmitExecutor(txn);
-  Row result;
-  while (scan->Next(&result)) {
-    LOG(TRACE) << result;
-  }
+  Plan prop =
+      Plan::Product(Plan::FullScan("Sc1"), {0}, Plan::FullScan("Sc2"), {0});
+  DumpAll(*ctx_, prop);
 }
 
 }  // namespace tinylamb

@@ -8,16 +8,18 @@
 #include <memory>
 
 #include "executor/executor_base.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
-class Transaction;
+class TransactionContext;
 
 class PlanBase {
  public:
   virtual ~PlanBase() = default;
   virtual std::unique_ptr<ExecutorBase> EmitExecutor(
-      Transaction& txn) const = 0;
-  [[nodiscard]] virtual Schema GetSchema() const = 0;
+      TransactionContext& txn) const = 0;
+  [[nodiscard]] virtual Schema GetSchema(TransactionContext& txn) const = 0;
+  virtual void Dump(std::ostream& o, int indent) const = 0;
 };
 
 }  // namespace tinylamb

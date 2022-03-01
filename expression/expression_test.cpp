@@ -2,10 +2,9 @@
 // Created by kumagi on 2022/02/22.
 //
 
+#include "expression.hpp"
+
 #include "common/log_message.hpp"
-#include "expression/binary_expression.hpp"
-#include "expression/column_value.hpp"
-#include "expression/constant_value.hpp"
 #include "gtest/gtest.h"
 #include "type/column.hpp"
 #include "type/row.hpp"
@@ -14,17 +13,17 @@
 namespace tinylamb {
 
 TEST(ExpressionTest, Constant) {
-  ConstantValue cv_int(Value(1));
-  ConstantValue cv_varchar(Value("hello"));
-  ConstantValue cv_double(Value(1.1));
+  Expression cv_int = Expression::ConstantValue(Value(1));
+  Expression cv_varchar = Expression::ConstantValue(Value("hello"));
+  Expression cv_double = Expression::ConstantValue(Value(1.1));
   LOG(INFO) << "cv_int: " << cv_int << "\ncv_varchar: " << cv_varchar
             << "\ncv_double: " << cv_double;
 }
 
 TEST(ExpressionTest, ConstantEval) {
-  ConstantValue cv_int(Value(1));
-  ConstantValue cv_varchar(Value("hello"));
-  ConstantValue cv_double(Value(1.1));
+  Expression cv_int = Expression::ConstantValue(Value(1));
+  Expression cv_varchar = Expression::ConstantValue(Value("hello"));
+  Expression cv_double = Expression::ConstantValue(Value(1.1));
   Row dummy({});
   ASSERT_EQ(cv_int.Evaluate(dummy, nullptr), Value(1));
   ASSERT_EQ(cv_varchar.Evaluate(dummy, nullptr), Value("hello"));
@@ -32,15 +31,15 @@ TEST(ExpressionTest, ConstantEval) {
 }
 
 TEST(ExpressionTest, BinaryPlus) {
-  BinaryExpression int_plus(std::make_unique<ConstantValue>(Value(1)),
-                            std::make_unique<ConstantValue>(Value(2)),
-                            OpType::kAdd);
-  BinaryExpression varchar_plus(
-      std::make_unique<ConstantValue>(Value("hello")),
-      std::make_unique<ConstantValue>(Value(" world")), OpType::kAdd);
-  BinaryExpression double_plus(std::make_unique<ConstantValue>(Value(1.1)),
-                               std::make_unique<ConstantValue>(Value(2.2)),
-                               OpType::kAdd);
+  Expression int_plus = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(1)), BinaryOperation::kAdd,
+      Expression::ConstantValue(Value(2)));
+  Expression varchar_plus = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("hello")), BinaryOperation::kAdd,
+      Expression::ConstantValue(Value(" world")));
+  Expression double_plus = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(1.1)), BinaryOperation::kAdd,
+      Expression::ConstantValue(Value(2.2)));
   Row dummy({});
   ASSERT_EQ(int_plus.Evaluate(dummy, nullptr), Value(3));
   ASSERT_EQ(varchar_plus.Evaluate(dummy, nullptr), Value("hello world"));
@@ -49,12 +48,12 @@ TEST(ExpressionTest, BinaryPlus) {
 }
 
 TEST(ExpressionTest, BinaryMinus) {
-  BinaryExpression int_minus(std::make_unique<ConstantValue>(Value(1)),
-                             std::make_unique<ConstantValue>(Value(2)),
-                             OpType::kSubtract);
-  BinaryExpression double_minus(std::make_unique<ConstantValue>(Value(1.1)),
-                                std::make_unique<ConstantValue>(Value(2.2)),
-                                OpType::kSubtract);
+  Expression int_minus = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(1)), BinaryOperation::kSubtract,
+      Expression::ConstantValue(Value(2)));
+  Expression double_minus = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(1.1)), BinaryOperation::kSubtract,
+      Expression::ConstantValue(Value(2.2)));
   Row dummy({});
   ASSERT_EQ(int_minus.Evaluate(dummy, nullptr), Value(-1));
   ASSERT_DOUBLE_EQ(double_minus.Evaluate(dummy, nullptr).value.double_value,
@@ -62,12 +61,12 @@ TEST(ExpressionTest, BinaryMinus) {
 }
 
 TEST(ExpressionTest, BinaryMultiple) {
-  BinaryExpression int_multiple(std::make_unique<ConstantValue>(Value(1)),
-                                std::make_unique<ConstantValue>(Value(2)),
-                                OpType::kMultiply);
-  BinaryExpression double_multiple(std::make_unique<ConstantValue>(Value(1.1)),
-                                   std::make_unique<ConstantValue>(Value(2.2)),
-                                   OpType::kMultiply);
+  Expression int_multiple = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(1)), BinaryOperation::kMultiply,
+      Expression::ConstantValue(Value(2)));
+  Expression double_multiple = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(1.1)), BinaryOperation::kMultiply,
+      Expression::ConstantValue(Value(2.2)));
   Row dummy({});
   ASSERT_EQ(int_multiple.Evaluate(dummy, nullptr), Value(2));
   ASSERT_DOUBLE_EQ(double_multiple.Evaluate(dummy, nullptr).value.double_value,
@@ -75,12 +74,12 @@ TEST(ExpressionTest, BinaryMultiple) {
 }
 
 TEST(ExpressionTest, BinaryDiv) {
-  BinaryExpression int_div(std::make_unique<ConstantValue>(Value(10)),
-                           std::make_unique<ConstantValue>(Value(2)),
-                           OpType::kDivide);
-  BinaryExpression double_div(std::make_unique<ConstantValue>(Value(8.8)),
-                              std::make_unique<ConstantValue>(Value(2.2)),
-                              OpType::kDivide);
+  Expression int_div = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(10)), BinaryOperation::kDivide,
+      Expression::ConstantValue(Value(2)));
+  Expression double_div = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(8.8)), BinaryOperation::kDivide,
+      Expression::ConstantValue(Value(2.2)));
   Row dummy({});
   ASSERT_EQ(int_div.Evaluate(dummy, nullptr), Value(5));
   ASSERT_DOUBLE_EQ(double_div.Evaluate(dummy, nullptr).value.double_value,
@@ -88,32 +87,32 @@ TEST(ExpressionTest, BinaryDiv) {
 }
 
 TEST(ExpressionTest, BinaryMod) {
-  BinaryExpression int_mod(std::make_unique<ConstantValue>(Value(13)),
-                           std::make_unique<ConstantValue>(Value(5)),
-                           OpType::kModulo);
+  Expression int_mod = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(13)), BinaryOperation::kModulo,
+      Expression::ConstantValue(Value(5)));
   Row dummy({});
   ASSERT_EQ(int_mod.Evaluate(dummy, nullptr), Value(3));
 }
 
 TEST(ExpressionTest, Equal) {
-  BinaryExpression int_eq(std::make_unique<ConstantValue>(Value(120)),
-                          std::make_unique<ConstantValue>(Value(120)),
-                          OpType::kEquals);
-  BinaryExpression int_ne(std::make_unique<ConstantValue>(Value(13)),
-                          std::make_unique<ConstantValue>(Value(5)),
-                          OpType::kEquals);
-  BinaryExpression double_eq(std::make_unique<ConstantValue>(Value(120.0)),
-                             std::make_unique<ConstantValue>(Value(120.0)),
-                             OpType::kEquals);
-  BinaryExpression double_ne(std::make_unique<ConstantValue>(Value(13.0)),
-                             std::make_unique<ConstantValue>(Value(5.0)),
-                             OpType::kEquals);
-  BinaryExpression varchar_eq(std::make_unique<ConstantValue>(Value("hello")),
-                              std::make_unique<ConstantValue>(Value("hello")),
-                              OpType::kEquals);
-  BinaryExpression varchar_ne(std::make_unique<ConstantValue>(Value("hello")),
-                              std::make_unique<ConstantValue>(Value("world")),
-                              OpType::kEquals);
+  Expression int_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120)), BinaryOperation::kEquals,
+      Expression::ConstantValue(Value(120)));
+  Expression int_ne = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(13)), BinaryOperation::kEquals,
+      Expression::ConstantValue(Value(5)));
+  Expression double_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120.0)), BinaryOperation::kEquals,
+      Expression::ConstantValue(Value(120.0)));
+  Expression double_ne = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(13.0)), BinaryOperation::kEquals,
+      Expression::ConstantValue(Value(5.0)));
+  Expression varchar_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("hello")), BinaryOperation::kEquals,
+      Expression::ConstantValue(Value("hello")));
+  Expression varchar_ne = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("hello")), BinaryOperation::kEquals,
+      Expression::ConstantValue(Value("world")));
   Row dummy({});
   ASSERT_EQ(int_eq.Evaluate(dummy, nullptr), Value(1));
   ASSERT_EQ(int_ne.Evaluate(dummy, nullptr), Value(0));
@@ -124,24 +123,24 @@ TEST(ExpressionTest, Equal) {
 }
 
 TEST(ExpressionTest, NotEqual) {
-  BinaryExpression int_eq(std::make_unique<ConstantValue>(Value(120)),
-                          std::make_unique<ConstantValue>(Value(120)),
-                          OpType::kNotEquals);
-  BinaryExpression int_ne(std::make_unique<ConstantValue>(Value(13)),
-                          std::make_unique<ConstantValue>(Value(5)),
-                          OpType::kNotEquals);
-  BinaryExpression double_eq(std::make_unique<ConstantValue>(Value(120.0)),
-                             std::make_unique<ConstantValue>(Value(120.0)),
-                             OpType::kNotEquals);
-  BinaryExpression double_ne(std::make_unique<ConstantValue>(Value(13.0)),
-                             std::make_unique<ConstantValue>(Value(5.0)),
-                             OpType::kNotEquals);
-  BinaryExpression varchar_eq(std::make_unique<ConstantValue>(Value("hello")),
-                              std::make_unique<ConstantValue>(Value("hello")),
-                              OpType::kNotEquals);
-  BinaryExpression varchar_ne(std::make_unique<ConstantValue>(Value("hello")),
-                              std::make_unique<ConstantValue>(Value("world")),
-                              OpType::kNotEquals);
+  Expression int_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120)), BinaryOperation::kNotEquals,
+      Expression::ConstantValue(Value(120)));
+  Expression int_ne = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(13)), BinaryOperation::kNotEquals,
+      Expression::ConstantValue(Value(5)));
+  Expression double_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120.0)), BinaryOperation::kNotEquals,
+      Expression::ConstantValue(Value(120.0)));
+  Expression double_ne = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(13.0)), BinaryOperation::kNotEquals,
+      Expression::ConstantValue(Value(5.0)));
+  Expression varchar_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("hello")), BinaryOperation::kNotEquals,
+      Expression::ConstantValue(Value("hello")));
+  Expression varchar_ne = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("hello")), BinaryOperation::kNotEquals,
+      Expression::ConstantValue(Value("world")));
   Row dummy({});
   ASSERT_EQ(int_eq.Evaluate(dummy, nullptr), Value(0));
   ASSERT_EQ(int_ne.Evaluate(dummy, nullptr), Value(1));
@@ -152,33 +151,33 @@ TEST(ExpressionTest, NotEqual) {
 }
 
 TEST(ExpressionTest, LessThan) {
-  BinaryExpression int_lt(std::make_unique<ConstantValue>(Value(100)),
-                          std::make_unique<ConstantValue>(Value(12312)),
-                          OpType::kLessThan);
-  BinaryExpression int_eq(std::make_unique<ConstantValue>(Value(120)),
-                          std::make_unique<ConstantValue>(Value(120)),
-                          OpType::kLessThan);
-  BinaryExpression int_gt(std::make_unique<ConstantValue>(Value(120)),
-                          std::make_unique<ConstantValue>(Value(-1)),
-                          OpType::kLessThan);
-  BinaryExpression double_lt(std::make_unique<ConstantValue>(Value(1.2)),
-                             std::make_unique<ConstantValue>(Value(2.2)),
-                             OpType::kLessThan);
-  BinaryExpression double_eq(std::make_unique<ConstantValue>(Value(120.0)),
-                             std::make_unique<ConstantValue>(Value(120.0)),
-                             OpType::kLessThan);
-  BinaryExpression double_gt(std::make_unique<ConstantValue>(Value(13.3)),
-                             std::make_unique<ConstantValue>(Value(5.0)),
-                             OpType::kLessThan);
-  BinaryExpression varchar_lt(std::make_unique<ConstantValue>(Value("aaa")),
-                              std::make_unique<ConstantValue>(Value("aaab")),
-                              OpType::kLessThan);
-  BinaryExpression varchar_eq(std::make_unique<ConstantValue>(Value("hello")),
-                              std::make_unique<ConstantValue>(Value("hello")),
-                              OpType::kLessThan);
-  BinaryExpression varchar_gt(std::make_unique<ConstantValue>(Value("b")),
-                              std::make_unique<ConstantValue>(Value("a")),
-                              OpType::kLessThan);
+  Expression int_lt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(100)), BinaryOperation::kLessThan,
+      Expression::ConstantValue(Value(12312)));
+  Expression int_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120)), BinaryOperation::kLessThan,
+      Expression::ConstantValue(Value(120)));
+  Expression int_gt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120)), BinaryOperation::kLessThan,
+      Expression::ConstantValue(Value(-1)));
+  Expression double_lt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(1.2)), BinaryOperation::kLessThan,
+      Expression::ConstantValue(Value(2.2)));
+  Expression double_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120.0)), BinaryOperation::kLessThan,
+      Expression::ConstantValue(Value(120.0)));
+  Expression double_gt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(13.3)), BinaryOperation::kLessThan,
+      Expression::ConstantValue(Value(5.0)));
+  Expression varchar_lt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("aaa")), BinaryOperation::kLessThan,
+      Expression::ConstantValue(Value("aaab")));
+  Expression varchar_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("hello")), BinaryOperation::kLessThan,
+      Expression::ConstantValue(Value("hello")));
+  Expression varchar_gt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("b")), BinaryOperation::kLessThan,
+      Expression::ConstantValue(Value("a")));
   Row dummy({});
   ASSERT_EQ(int_lt.Evaluate(dummy, nullptr), Value(1));
   ASSERT_EQ(int_eq.Evaluate(dummy, nullptr), Value(0));
@@ -192,33 +191,34 @@ TEST(ExpressionTest, LessThan) {
 }
 
 TEST(ExpressionTest, LessThanEquals) {
-  BinaryExpression int_lt(std::make_unique<ConstantValue>(Value(100)),
-                          std::make_unique<ConstantValue>(Value(12312)),
-                          OpType::kLessThanEquals);
-  BinaryExpression int_eq(std::make_unique<ConstantValue>(Value(120)),
-                          std::make_unique<ConstantValue>(Value(120)),
-                          OpType::kLessThanEquals);
-  BinaryExpression int_gt(std::make_unique<ConstantValue>(Value(120)),
-                          std::make_unique<ConstantValue>(Value(-1)),
-                          OpType::kLessThanEquals);
-  BinaryExpression double_lt(std::make_unique<ConstantValue>(Value(1.2)),
-                             std::make_unique<ConstantValue>(Value(2.2)),
-                             OpType::kLessThanEquals);
-  BinaryExpression double_eq(std::make_unique<ConstantValue>(Value(120.0)),
-                             std::make_unique<ConstantValue>(Value(120.0)),
-                             OpType::kLessThanEquals);
-  BinaryExpression double_gt(std::make_unique<ConstantValue>(Value(13.3)),
-                             std::make_unique<ConstantValue>(Value(5.0)),
-                             OpType::kLessThanEquals);
-  BinaryExpression varchar_lt(std::make_unique<ConstantValue>(Value("aaa")),
-                              std::make_unique<ConstantValue>(Value("aaab")),
-                              OpType::kLessThanEquals);
-  BinaryExpression varchar_eq(std::make_unique<ConstantValue>(Value("hello")),
-                              std::make_unique<ConstantValue>(Value("hello")),
-                              OpType::kLessThanEquals);
-  BinaryExpression varchar_gt(std::make_unique<ConstantValue>(Value("b")),
-                              std::make_unique<ConstantValue>(Value("a")),
-                              OpType::kLessThanEquals);
+  Expression int_lt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(100)), BinaryOperation::kLessThanEquals,
+      Expression::ConstantValue(Value(12312)));
+  Expression int_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120)), BinaryOperation::kLessThanEquals,
+      Expression::ConstantValue(Value(120)));
+  Expression int_gt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120)), BinaryOperation::kLessThanEquals,
+      Expression::ConstantValue(Value(-1)));
+  Expression double_lt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(1.2)), BinaryOperation::kLessThanEquals,
+      Expression::ConstantValue(Value(2.2)));
+  Expression double_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120.0)), BinaryOperation::kLessThanEquals,
+      Expression::ConstantValue(Value(120.0)));
+  Expression double_gt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(13.3)), BinaryOperation::kLessThanEquals,
+      Expression::ConstantValue(Value(5.0)));
+  Expression varchar_lt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("aaa")), BinaryOperation::kLessThanEquals,
+      Expression::ConstantValue(Value("aaab")));
+  Expression varchar_eq =
+      Expression::BinaryExpression(Expression::ConstantValue(Value("hello")),
+                                   BinaryOperation::kLessThanEquals,
+                                   Expression::ConstantValue(Value("hello")));
+  Expression varchar_gt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("b")), BinaryOperation::kLessThanEquals,
+      Expression::ConstantValue(Value("a")));
   Row dummy({});
   ASSERT_EQ(int_lt.Evaluate(dummy, nullptr), Value(1));
   ASSERT_EQ(int_eq.Evaluate(dummy, nullptr), Value(1));
@@ -232,33 +232,33 @@ TEST(ExpressionTest, LessThanEquals) {
 }
 
 TEST(ExpressionTest, GreaterThan) {
-  BinaryExpression int_lt(std::make_unique<ConstantValue>(Value(100)),
-                          std::make_unique<ConstantValue>(Value(12312)),
-                          OpType::kGreaterThan);
-  BinaryExpression int_eq(std::make_unique<ConstantValue>(Value(120)),
-                          std::make_unique<ConstantValue>(Value(120)),
-                          OpType::kGreaterThan);
-  BinaryExpression int_gt(std::make_unique<ConstantValue>(Value(120)),
-                          std::make_unique<ConstantValue>(Value(-1)),
-                          OpType::kGreaterThan);
-  BinaryExpression double_lt(std::make_unique<ConstantValue>(Value(1.2)),
-                             std::make_unique<ConstantValue>(Value(2.2)),
-                             OpType::kGreaterThan);
-  BinaryExpression double_eq(std::make_unique<ConstantValue>(Value(120.0)),
-                             std::make_unique<ConstantValue>(Value(120.0)),
-                             OpType::kGreaterThan);
-  BinaryExpression double_gt(std::make_unique<ConstantValue>(Value(13.3)),
-                             std::make_unique<ConstantValue>(Value(5.0)),
-                             OpType::kGreaterThan);
-  BinaryExpression varchar_lt(std::make_unique<ConstantValue>(Value("aaa")),
-                              std::make_unique<ConstantValue>(Value("aaab")),
-                              OpType::kGreaterThan);
-  BinaryExpression varchar_eq(std::make_unique<ConstantValue>(Value("hello")),
-                              std::make_unique<ConstantValue>(Value("hello")),
-                              OpType::kGreaterThan);
-  BinaryExpression varchar_gt(std::make_unique<ConstantValue>(Value("b")),
-                              std::make_unique<ConstantValue>(Value("a")),
-                              OpType::kGreaterThan);
+  Expression int_lt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(100)), BinaryOperation::kGreaterThan,
+      Expression::ConstantValue(Value(12312)));
+  Expression int_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120)), BinaryOperation::kGreaterThan,
+      Expression::ConstantValue(Value(120)));
+  Expression int_gt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120)), BinaryOperation::kGreaterThan,
+      Expression::ConstantValue(Value(-1)));
+  Expression double_lt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(1.2)), BinaryOperation::kGreaterThan,
+      Expression::ConstantValue(Value(2.2)));
+  Expression double_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(120.0)), BinaryOperation::kGreaterThan,
+      Expression::ConstantValue(Value(120.0)));
+  Expression double_gt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value(13.3)), BinaryOperation::kGreaterThan,
+      Expression::ConstantValue(Value(5.0)));
+  Expression varchar_lt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("aaa")), BinaryOperation::kGreaterThan,
+      Expression::ConstantValue(Value("aaab")));
+  Expression varchar_eq = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("hello")), BinaryOperation::kGreaterThan,
+      Expression::ConstantValue(Value("hello")));
+  Expression varchar_gt = Expression::BinaryExpression(
+      Expression::ConstantValue(Value("b")), BinaryOperation::kGreaterThan,
+      Expression::ConstantValue(Value("a")));
   Row dummy({});
   ASSERT_EQ(int_lt.Evaluate(dummy, nullptr), Value(0));
   ASSERT_EQ(int_eq.Evaluate(dummy, nullptr), Value(0));
@@ -272,33 +272,42 @@ TEST(ExpressionTest, GreaterThan) {
 }
 
 TEST(ExpressionTest, GreaterThanEquals) {
-  BinaryExpression int_lt(std::make_unique<ConstantValue>(Value(100)),
-                          std::make_unique<ConstantValue>(Value(12312)),
-                          OpType::kGreaterThanEquals);
-  BinaryExpression int_eq(std::make_unique<ConstantValue>(Value(120)),
-                          std::make_unique<ConstantValue>(Value(120)),
-                          OpType::kGreaterThanEquals);
-  BinaryExpression int_gt(std::make_unique<ConstantValue>(Value(120)),
-                          std::make_unique<ConstantValue>(Value(-1)),
-                          OpType::kGreaterThanEquals);
-  BinaryExpression double_lt(std::make_unique<ConstantValue>(Value(1.2)),
-                             std::make_unique<ConstantValue>(Value(2.2)),
-                             OpType::kGreaterThanEquals);
-  BinaryExpression double_eq(std::make_unique<ConstantValue>(Value(120.0)),
-                             std::make_unique<ConstantValue>(Value(120.0)),
-                             OpType::kGreaterThanEquals);
-  BinaryExpression double_gt(std::make_unique<ConstantValue>(Value(13.3)),
-                             std::make_unique<ConstantValue>(Value(5.0)),
-                             OpType::kGreaterThanEquals);
-  BinaryExpression varchar_lt(std::make_unique<ConstantValue>(Value("aaa")),
-                              std::make_unique<ConstantValue>(Value("aaab")),
-                              OpType::kGreaterThanEquals);
-  BinaryExpression varchar_eq(std::make_unique<ConstantValue>(Value("hello")),
-                              std::make_unique<ConstantValue>(Value("hello")),
-                              OpType::kGreaterThanEquals);
-  BinaryExpression varchar_gt(std::make_unique<ConstantValue>(Value("b")),
-                              std::make_unique<ConstantValue>(Value("a")),
-                              OpType::kGreaterThanEquals);
+  Expression int_lt =
+      Expression::BinaryExpression(Expression::ConstantValue(Value(100)),
+                                   BinaryOperation::kGreaterThanEquals,
+                                   Expression::ConstantValue(Value(12312)));
+  Expression int_eq =
+      Expression::BinaryExpression(Expression::ConstantValue(Value(120)),
+                                   BinaryOperation::kGreaterThanEquals,
+                                   Expression::ConstantValue(Value(120)));
+  Expression int_gt =
+      Expression::BinaryExpression(Expression::ConstantValue(Value(120)),
+                                   BinaryOperation::kGreaterThanEquals,
+                                   Expression::ConstantValue(Value(-1)));
+  Expression double_lt =
+      Expression::BinaryExpression(Expression::ConstantValue(Value(1.2)),
+                                   BinaryOperation::kGreaterThanEquals,
+                                   Expression::ConstantValue(Value(2.2)));
+  Expression double_eq =
+      Expression::BinaryExpression(Expression::ConstantValue(Value(120.0)),
+                                   BinaryOperation::kGreaterThanEquals,
+                                   Expression::ConstantValue(Value(120.0)));
+  Expression double_gt =
+      Expression::BinaryExpression(Expression::ConstantValue(Value(13.3)),
+                                   BinaryOperation::kGreaterThanEquals,
+                                   Expression::ConstantValue(Value(5.0)));
+  Expression varchar_lt =
+      Expression::BinaryExpression(Expression::ConstantValue(Value("aaa")),
+                                   BinaryOperation::kGreaterThanEquals,
+                                   Expression::ConstantValue(Value("aaab")));
+  Expression varchar_eq =
+      Expression::BinaryExpression(Expression::ConstantValue(Value("hello")),
+                                   BinaryOperation::kGreaterThanEquals,
+                                   Expression::ConstantValue(Value("hello")));
+  Expression varchar_gt =
+      Expression::BinaryExpression(Expression::ConstantValue(Value("b")),
+                                   BinaryOperation::kGreaterThanEquals,
+                                   Expression::ConstantValue(Value("a")));
   Row dummy({});
   ASSERT_EQ(int_lt.Evaluate(dummy, nullptr), Value(0));
   ASSERT_EQ(int_eq.Evaluate(dummy, nullptr), Value(1));
@@ -318,10 +327,10 @@ TEST(ExpressionTest, ColumnValue) {
   Schema sc("test_schema", cols);
   Row row({Value("foo"), Value(12), Value(132.3), Value(9)});
 
-  ASSERT_EQ(ColumnValue("name").Evaluate(row, &sc), Value("foo"));
-  ASSERT_EQ(ColumnValue("score").Evaluate(row, &sc), Value(12));
-  ASSERT_EQ(ColumnValue("flv").Evaluate(row, &sc), Value(132.3));
-  ASSERT_EQ(ColumnValue("date").Evaluate(row, &sc), Value(9));
+  ASSERT_EQ(Expression::ColumnValue("name").Evaluate(row, &sc), Value("foo"));
+  ASSERT_EQ(Expression::ColumnValue("score").Evaluate(row, &sc), Value(12));
+  ASSERT_EQ(Expression::ColumnValue("flv").Evaluate(row, &sc), Value(132.3));
+  ASSERT_EQ(Expression::ColumnValue("date").Evaluate(row, &sc), Value(9));
 }
 
 }  // namespace tinylamb

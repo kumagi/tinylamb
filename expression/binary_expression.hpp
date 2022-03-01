@@ -11,34 +11,21 @@
 
 namespace tinylamb {
 
-enum class OpType {
-  // Calculations.
-  kAdd,
-  kSubtract,
-  kMultiply,
-  kDivide,
-  kModulo,
-
-  // Comparisons.
-  kEquals,
-  kNotEquals,
-  kLessThan,
-  kLessThanEquals,
-  kGreaterThan,
-  kGreaterThanEquals,
-};
-
 class BinaryExpression : public ExpressionBase {
- public:
-  BinaryExpression(std::unique_ptr<ExpressionBase>&& left,
-                   std::unique_ptr<ExpressionBase>&& right, OpType op)
+  BinaryExpression(std::shared_ptr<ExpressionBase> left, BinaryOperation op,
+                   std::shared_ptr<ExpressionBase> right)
       : left_(std::move(left)), right_(std::move(right)), operation_(op) {}
+
+ public:
   Value Evaluate(const Row& row, Schema* schema) const override;
+  void Dump(std::ostream& o) const override;
 
  private:
-  std::unique_ptr<ExpressionBase> left_;
-  std::unique_ptr<ExpressionBase> right_;
-  OpType operation_;
+  friend class Expression;
+
+  std::shared_ptr<ExpressionBase> left_;
+  std::shared_ptr<ExpressionBase> right_;
+  BinaryOperation operation_;
 };
 
 }  // namespace tinylamb

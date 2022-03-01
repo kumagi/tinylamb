@@ -26,6 +26,7 @@ class Encoder;
 
 class Table : public TableInterface {
  public:
+  Table() = default;
   explicit Table(PageManager* pm) : pm_(pm) {}
   Table(PageManager* pm, Schema sc, page_id_t pid, std::vector<Index> indices)
       : pm_(pm),
@@ -57,6 +58,7 @@ class Table : public TableInterface {
   friend class FullScanIterator;
   friend class IndexScanIterator;
   friend class TableInterface;
+  friend class FullScanPlan;
   page_id_t GetIndex(std::string_view name);
 
   PageManager* pm_;

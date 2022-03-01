@@ -18,8 +18,7 @@ PageRef PageManager::GetPage(uint64_t page_id) {
   bool cache_hit;
   PageRef ref = pool_.GetPage(page_id, &cache_hit);
   if (!cache_hit && !ref->IsValid()) {
-    // Found a broken page.
-    LOG(ERROR) << page_id << " is broken";
+    // Found a broken or new page.
     return {};
   }
   return ref;
@@ -39,9 +38,7 @@ PageRef PageManager::AllocateNewPage(Transaction& system_txn,
 
 PageRef PageManager::GetMetaPage() {
   PageRef meta_page = pool_.GetPage(kMetaPageId, nullptr);
-  if (meta_page.IsNull()) {
-    throw std::runtime_error("failed to get meta page");
-  }
+  if (meta_page.IsNull()) throw std::runtime_error("failed to get meta page");
   if (meta_page->Type() != PageType::kMetaPage) {
     meta_page->PageInit(kMetaPageId, PageType::kMetaPage);
   }

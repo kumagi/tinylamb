@@ -17,6 +17,7 @@ class ExpressionBase {
  public:
   virtual ~ExpressionBase() = default;
   virtual Value Evaluate(const Row& row, Schema* schema) const = 0;
+  virtual void Dump(std::ostream& o) const = 0;
 };
 
 }  // namespace tinylamb

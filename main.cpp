@@ -1,4 +1,4 @@
-#include "database.hpp"
+#include "database/database.hpp"
 
 int main(int argc, char** argv) {
   tinylamb::Database db("main.pdb");

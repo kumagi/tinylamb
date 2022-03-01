@@ -4,16 +4,28 @@
 
 #include "plan/selection_plan.hpp"
 
+#include <memory>
+
 #include "executor/selection.hpp"
 #include "expression/expression_base.hpp"
 
 namespace tinylamb {
+
 std::unique_ptr<ExecutorBase> SelectionPlan::EmitExecutor(
-    tinylamb::Transaction& txn) const {
-  return std::make_unique<Selection>(std::move(exp_), src_->GetSchema(),
-                                     src_->EmitExecutor(txn));
+    TransactionContext& ctx) const {
+  return std::make_unique<Selection>(exp_, src_.GetSchema(ctx),
+                                     src_.EmitExecutor(ctx));
 }
 
-Schema SelectionPlan::GetSchema() const { return src_->GetSchema(); }
+Schema SelectionPlan::GetSchema(TransactionContext& ctx) const {
+  return src_.GetSchema(ctx);
+}
+
+void SelectionPlan::Dump(std::ostream& o, int indent) const {
+  o << "Select: [";
+  exp_.Dump(o);
+  o << "]\n" << Indent(indent + 2);
+  src_.Dump(o, indent + 2);
+}
 
 }  // namespace tinylamb

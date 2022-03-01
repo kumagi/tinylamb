@@ -8,21 +8,23 @@
 #include <memory>
 
 #include "executor_base.hpp"
+#include "expression/expression.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
+class Expression;
 class ExpressionBase;
 
 class Selection : public ExecutorBase {
  public:
-  Selection(std::shared_ptr<ExpressionBase> exp, Schema schema,
+  Selection(Expression& exp, Schema schema,
             std::unique_ptr<ExecutorBase>&& src);
   bool Next(Row* dst) override;
   ~Selection() override = default;
 
  private:
-  std::shared_ptr<ExpressionBase> exp_;
+  Expression exp_;
   Schema schema_;
   std::unique_ptr<ExecutorBase> src_;
 };

@@ -10,17 +10,20 @@
 namespace tinylamb {
 
 class ConstantValue : public ExpressionBase {
- public:
   explicit ConstantValue(const Value& v) : val_(v) {}
 
+ public:
   Value Evaluate(const Row& row, Schema* schema) const override { return val_; }
 
   friend std::ostream& operator<<(std::ostream& o, const ConstantValue& c) {
     o << c.val_;
     return o;
   }
+  void Dump(std::ostream& o) const override { o << val_; }
 
  private:
+  friend class Expression;
+  
   Value val_;
 };
 

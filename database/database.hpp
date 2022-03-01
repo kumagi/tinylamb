@@ -4,6 +4,7 @@
 #include <functional>
 
 #include "database/catalog.hpp"
+#include "database/transaction_context.hpp"
 #include "page/page_manager.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
@@ -23,6 +24,7 @@ class Database {
         tm_(&lock_manager_, &logger_, &recovery_),
         cm_(dbname_ + ".last_checkpoint", &tm_, pm_.GetPool()),
         catalog_(1, &pm_) {}
+  TransactionContext Begin();
 
  private:
   std::string dbname_;

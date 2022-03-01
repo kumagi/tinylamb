@@ -78,11 +78,11 @@ TEST_F(ExecutorTest, Projection) {
 }
 
 TEST_F(ExecutorTest, Selection) {
-
-  Selection sel(std::make_unique<BinaryExpression>(
-                    std::make_unique<ColumnValue>("key"),
-                    std::make_unique<ConstantValue>(Value(1)), OpType::kEquals),
-                schema_, std::make_unique<FullScan>(fake_txn_, &table_));
+  Expression key_is_1 = Expression::BinaryExpression(
+      Expression::ColumnValue("key"), BinaryOperation::kEquals,
+      Expression::ConstantValue(Value(1)));
+  Selection sel(key_is_1, schema_,
+                std::make_unique<FullScan>(fake_txn_, &table_));
   std::unordered_set rows({Row({Value(1), Value("world"), Value(4.9)})});
   Row got;
   ASSERT_TRUE(sel.Next(&got));

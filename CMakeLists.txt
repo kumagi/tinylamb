@@ -29,7 +29,7 @@ target_include_directories(
 
 add_library(libtinylamb
         STATIC
-        database.cpp page/page.cpp transaction/lock_manager.cpp
+        database/database.cpp page/page.cpp transaction/lock_manager.cpp
         page/page_pool.cpp page/row_page.cpp page/page_manager.cpp
         recovery/logger.cpp type/row.cpp type/schema.cpp
         transaction/transaction.cpp recovery/log_record.cpp page/meta_page.cpp
@@ -44,10 +44,10 @@ add_library(libtinylamb
         database/catalog.cpp executor/full_scan.cpp executor/projection.cpp
         executor/selection.cpp expression/binary_expression.cpp
         expression/column_value.cpp executor/hash_join.cpp common/decoder.cpp
-        table/fake_table.cpp
-        plan/full_scan_plan.cpp plan/plan_base.cpp
-        plan/projection_plan.cpp plan/selection_plan.cpp
-        plan/selection_plan.hpp plan/product_plan.cpp plan/product_plan.hpp)
+        table/fake_table.cpp plan/full_scan_plan.cpp plan/plan_base.cpp
+        plan/projection_plan.cpp plan/selection_plan.cpp plan/product_plan.cpp
+        plan/plan.cpp expression/expression.cpp plan/optimizer.cpp
+        executor/cross_join.cpp)
 
 add_library(libtinylamb_test_util
         STATIC
@@ -97,7 +97,7 @@ function(add_simple_test file_path)
     gtest_discover_tests(${target_name})
 endfunction()
 
-add_simple_test(database_test.cpp)
+add_simple_test(database/database_test.cpp)
 add_simple_test(type/value_test.cpp)
 add_simple_test(type/row_test.cpp)
 add_simple_test(type/constraint_test.cpp)

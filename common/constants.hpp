@@ -31,6 +31,23 @@ enum class Status : uint8_t {
   kNotImplemented,
 };
 
+enum class BinaryOperation {
+  // Calculations.
+  kAdd,
+  kSubtract,
+  kMultiply,
+  kDivide,
+  kModulo,
+
+  // Comparisons.
+  kEquals,
+  kNotEquals,
+  kLessThan,
+  kLessThanEquals,
+  kGreaterThan,
+  kGreaterThanEquals,
+};
+
 typedef uint64_t lsn_t;
 typedef uint64_t txn_id_t;
 typedef uint64_t page_id_t;

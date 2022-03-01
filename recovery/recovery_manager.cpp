@@ -179,9 +179,10 @@ void PageReplay(PageRef&& target,
 
   // Redo phase.
   for (const auto& lsn_log : logs) {
-    const lsn_t& lsn = lsn_log.first;
     const LogRecord& log = lsn_log.second;
     assert(log.pid == target->PageID());
+
+    const lsn_t& lsn = lsn_log.first;
     if (target->PageLSN() < lsn) {
       LOG(INFO) << "redo: " << log;
       LogRedo(target, lsn, log);
@@ -190,13 +191,12 @@ void PageReplay(PageRef&& target,
 
   // Undo phase.
   for (auto iter = logs.rbegin(); iter != logs.rend(); iter++) {
-    const lsn_t& lsn = iter->first;
     const LogRecord& undo_log = iter->second;
     const auto it = committed_txn.find(undo_log.txn_id);
     assert(undo_log.pid == target->PageID());
     if (it == committed_txn.end()) {
       LOG(INFO) << "undo: " << undo_log;
-      LogUndo(target, lsn, undo_log, tm);
+      LogUndo(target, iter->first, undo_log, tm);
     }
   }
 

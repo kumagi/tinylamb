@@ -10,10 +10,16 @@
 namespace tinylamb {
 
 class ColumnValue : public ExpressionBase {
- public:
   explicit ColumnValue(std::string_view col_name) : col_name_(col_name) {}
+
+ public:
   ~ColumnValue() override = default;
   Value Evaluate(const Row& row, Schema* schema) const override;
+  void Dump(std::ostream& o) const override;
+
+ private:
+  friend class Expression;
+
   std::string col_name_;
 };
 
