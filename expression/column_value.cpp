@@ -20,5 +20,6 @@ Value ColumnValue::Evaluate(const Row& row, Schema* schema) const {
   throw std::runtime_error("column " + col_name_ + " not found");
 }
 
-void ColumnValue::Dump(std::ostream& o) const { o << "(" << col_name_ << ")"; }
+void ColumnValue::Dump(std::ostream& o) const { o << col_name_; }
+
 }  // namespace tinylamb

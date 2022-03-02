@@ -46,6 +46,10 @@ class Value {
   Value operator/(const Value& rhs) const;
   Value operator%(const Value& rhs) const;
 
+  Value operator&(const Value& rhs) const;
+  Value operator|(const Value& rhs) const;
+  Value operator^(const Value& rhs) const;
+
   [[nodiscard]] std::string AsString() const;
   Value& operator=(const Value& rhs);
   friend std::ostream& operator<<(std::ostream& o, const Value& v);

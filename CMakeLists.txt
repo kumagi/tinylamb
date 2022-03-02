@@ -44,7 +44,7 @@ add_library(libtinylamb
         database/catalog.cpp executor/full_scan.cpp executor/projection.cpp
         executor/selection.cpp expression/binary_expression.cpp
         expression/column_value.cpp executor/hash_join.cpp common/decoder.cpp
-        table/fake_table.cpp plan/full_scan_plan.cpp plan/plan_base.cpp
+        table/fake_table.cpp plan/full_scan_plan.cpp
         plan/projection_plan.cpp plan/selection_plan.cpp plan/product_plan.cpp
         plan/plan.cpp expression/expression.cpp plan/optimizer.cpp
         executor/cross_join.cpp)

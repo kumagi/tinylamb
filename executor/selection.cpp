@@ -27,4 +27,6 @@ bool Selection::Next(Row* dst) {
   return false;
 }
 
+void Selection::Dump(std::ostream& o, int) const { o << "Selection: " << exp_; }
+
 }  // namespace tinylamb

@@ -345,6 +345,36 @@ Value Value::operator%(const Value& rhs) const {
   throw std::runtime_error("Cannot do '%' against this type");
 }
 
+Value Value::operator&(const Value& rhs) const {
+  if (type != rhs.type) {
+    throw std::runtime_error("Different type cannot do AND.");
+  }
+  if (type == ValueType::kInt64) {
+    return Value(value.int_value & rhs.value.int_value);
+  }
+  throw std::runtime_error("Cannot do '&' against this type");
+}
+
+Value Value::operator|(const Value& rhs) const {
+  if (type != rhs.type) {
+    throw std::runtime_error("Different type cannot do OR.");
+  }
+  if (type == ValueType::kInt64) {
+    return Value(value.int_value | rhs.value.int_value);
+  }
+  throw std::runtime_error("Cannot do '|' against this type");
+}
+
+Value Value::operator^(const Value& rhs) const {
+  if (type != rhs.type) {
+    throw std::runtime_error("Different type cannot do XOR.");
+  }
+  if (type == ValueType::kInt64) {
+    return Value(value.int_value ^ rhs.value.int_value);
+  }
+  throw std::runtime_error("Cannot do '^' against this type");
+}
+
 Value& Value::operator=(const Value& rhs) {
   type = rhs.type;
   value = rhs.value;

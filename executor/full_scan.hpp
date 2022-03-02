@@ -17,8 +17,9 @@ class Transaction;
 class FullScan : public ExecutorBase {
  public:
   FullScan(Transaction& txn, const TableInterface* table);
-  bool Next(Row* dst) override;
   ~FullScan() override = default;
+  bool Next(Row* dst) override;
+  void Dump(std::ostream& o, int indent) const override;
 
  private:
   const TableInterface* table_;

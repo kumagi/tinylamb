@@ -129,7 +129,7 @@ TEST_F(PlanTest, ScanPlan) {
 }
 
 TEST_F(PlanTest, ProjectPlan) {
-  Plan pp = Plan::Projection(Plan::FullScan("Sc1"), {1});
+  Plan pp = Plan::Projection(Plan::FullScan("Sc1"), {NamedExpression("c1")});
   DumpAll(*ctx_, pp);
 }
 
@@ -144,6 +144,11 @@ TEST_F(PlanTest, SelectionPlan) {
 TEST_F(PlanTest, ProductPlan) {
   Plan prop =
       Plan::Product(Plan::FullScan("Sc1"), {0}, Plan::FullScan("Sc2"), {0});
+  DumpAll(*ctx_, prop);
+}
+
+TEST_F(PlanTest, ProductPlanCrossJoin) {
+  Plan prop = Plan::Product(Plan::FullScan("Sc1"), Plan::FullScan("Sc2"));
   DumpAll(*ctx_, prop);
 }
 

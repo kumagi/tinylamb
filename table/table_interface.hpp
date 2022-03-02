@@ -9,6 +9,7 @@
 
 #include "common/constants.hpp"
 #include "table/iterator.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
 
@@ -37,6 +38,8 @@ class TableInterface {
   virtual Iterator BeginIndexScan(Transaction& txn, std::string_view index_name,
                                   const Row& begin, const Row& end,
                                   bool ascending) = 0;
+
+  [[nodiscard]] virtual Schema GetSchema() const = 0;
 };
 
 }  // namespace tinylamb

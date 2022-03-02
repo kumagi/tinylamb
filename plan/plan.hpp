@@ -7,6 +7,7 @@
 #include <memory>
 #include <string_view>
 
+#include "executor/named_expression.hpp"
 #include "plan/plan_base.hpp"
 
 namespace tinylamb {
@@ -22,7 +23,7 @@ class Plan {
   static Plan Product(Plan left_src, std::vector<size_t> left_cols,
                       Plan right_src, std::vector<size_t> right_cols);
   static Plan Product(Plan left_src, Plan right_src);
-  static Plan Projection(Plan src, const std::vector<size_t>& cols);
+  static Plan Projection(Plan src, std::vector<NamedExpression> cols);
   static Plan Selection(Plan src, Expression exp);
 
   std::unique_ptr<ExecutorBase> EmitExecutor(TransactionContext& ctx) const {

@@ -51,6 +51,9 @@ class Table : public TableInterface {
   Iterator BeginIndexScan(Transaction& txn, std::string_view index_name,
                           const Row& begin, const Row& end = Row(),
                           bool ascending = true) override;
+
+  [[nodiscard]] Schema GetSchema() const override { return schema_; }
+
   friend Encoder& operator<<(Encoder& e, const Table& t);
   friend Decoder& operator>>(Decoder& d, Table& t);
 
@@ -61,7 +64,7 @@ class Table : public TableInterface {
   friend class FullScanPlan;
   page_id_t GetIndex(std::string_view name);
 
-  PageManager* pm_;
+  PageManager* pm_{};
   Schema schema_;
   page_id_t first_pid_{};
   page_id_t last_pid_{};

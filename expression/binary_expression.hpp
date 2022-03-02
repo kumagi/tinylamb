@@ -17,6 +17,7 @@ class BinaryExpression : public ExpressionBase {
       : left_(std::move(left)), right_(std::move(right)), operation_(op) {}
 
  public:
+  [[nodiscard]] TypeTag Type() const override { return TypeTag::kBinaryExp; }
   Value Evaluate(const Row& row, Schema* schema) const override;
   void Dump(std::ostream& o) const override;
 

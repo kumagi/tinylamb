@@ -14,11 +14,13 @@ class ColumnValue : public ExpressionBase {
 
  public:
   ~ColumnValue() override = default;
+  [[nodiscard]] TypeTag Type() const override { return TypeTag::kColumnValue; }
   Value Evaluate(const Row& row, Schema* schema) const override;
   void Dump(std::ostream& o) const override;
 
  private:
   friend class Expression;
+  friend class ProjectionPlan;
 
   std::string col_name_;
 };

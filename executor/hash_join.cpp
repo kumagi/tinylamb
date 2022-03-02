@@ -49,4 +49,11 @@ void HashJoin::BucketConstruct() {
   bucket_constructed_ = true;
 }
 
+void HashJoin::Dump(std::ostream& o, int indent) const {
+  o << "Hash Join: ";
+  left_->Dump(o, indent + 2);
+  o << "\n" << Indent(indent) << "           ";
+  right_->Dump(o, indent + 2);
+}
+
 }  // namespace tinylamb

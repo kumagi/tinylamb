@@ -18,7 +18,8 @@ class Expression {
                                      BinaryOperation operation,
                                      Expression&& right);
   static Expression ColumnValue(std::string_view column_name);
-  
+
+  [[nodiscard]] TypeTag Type() const { return exp_->Type(); }
   Value Evaluate(const Row& row, Schema* schema) const {
     return exp_->Evaluate(row, schema);
   }
@@ -29,7 +30,6 @@ class Expression {
   }
   void Dump(std::ostream& o) const { exp_->Dump(o); }
 
- private:
   std::shared_ptr<ExpressionBase> exp_;
 };
 

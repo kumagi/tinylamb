@@ -20,8 +20,9 @@ class HashJoin : public ExecutorBase {
            std::unique_ptr<ExecutorBase>&& right,
            std::vector<size_t> right_cols);
 
-  bool Next(Row* dst) override;
   ~HashJoin() override = default;
+  bool Next(Row* dst) override;
+  void Dump(std::ostream& o, int indent) const override;
 
  private:
   void BucketConstruct();

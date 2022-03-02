@@ -14,13 +14,22 @@ bool Projection::Next(Row* dst) {
   Row orig;
   dst->Clear();
   if (!src_->Next(&orig)) return false;
-  std::vector<Value> extracted;
-  extracted.reserve(offsets_.size());
-  for (unsigned long offset : offsets_) {
-    extracted.push_back(orig[offset]);
+  std::vector<Value> result;
+  result.reserve(expressions_.size());
+  for (const auto& exp : expressions_) {
+    result.push_back(exp.expression.Evaluate(orig, &input_schema_));
   }
-  *dst = Row(std::move(extracted));
+  *dst = Row(std::move(result));
   return true;
+}
+
+void Projection::Dump(std::ostream& o, int) const {
+  o << "Projection: [";
+  for (int i = 0; i < expressions_.size(); ++i) {
+    if (0 < i) o << ", ";
+    o << expressions_[i];
+  }
+  o << "]";
 }
 
 }  // namespace tinylamb

@@ -23,10 +23,10 @@ class ExecutorTest : public ::testing::Test {
  public:
   void SetUp() override {}
 
-  FakeTable table_{{Row({Value(0), Value("hello"), Value(1.2)})},
-                   {Row({Value(3), Value("piyo"), Value(12.2)})},
-                   {Row({Value(1), Value("world"), Value(4.9)})},
-                   {Row({Value(2), Value("arise"), Value(4.14)})}};
+  FakeTable table_ = {{Row({Value(0), Value("hello"), Value(1.2)})},
+                      {Row({Value(3), Value("piyo"), Value(12.2)})},
+                      {Row({Value(1), Value("world"), Value(4.9)})},
+                      {Row({Value(2), Value("arise"), Value(4.14)})}};
   Transaction fake_txn_;
   Schema schema_{
       "test_table",
@@ -42,6 +42,8 @@ TEST_F(ExecutorTest, FullScan) {
                            Row({Value(3), Value("piyo"), Value(12.2)}),
                            Row({Value(1), Value("world"), Value(4.9)}),
                            Row({Value(2), Value("arise"), Value(4.14)})});
+  fs.Dump(std::cout, 0);
+  std::cout << "\n";
   Row got;
   ASSERT_TRUE(fs.Next(&got));
   ASSERT_NE(rows.find(got), rows.end());
@@ -56,10 +58,13 @@ TEST_F(ExecutorTest, FullScan) {
 
 TEST_F(ExecutorTest, Projection) {
   auto fs = std::make_unique<FullScan>(fake_txn_, &table_);
-  Projection proj({0, 2}, std::move(fs));
+  Projection proj({NamedExpression("key"), NamedExpression("score")}, schema_,
+                  std::move(fs));
   std::unordered_set rows(
       {Row({Value(0), Value(1.2)}), Row({Value(3), Value(12.2)}),
        Row({Value(1), Value(4.9)}), Row({Value(2), Value(4.14)})});
+  proj.Dump(std::cout, 0);
+  std::cout << "\n";
   Row got;
   ASSERT_TRUE(proj.Next(&got));
   ASSERT_NE(rows.find(got), rows.end());
@@ -84,6 +89,8 @@ TEST_F(ExecutorTest, Selection) {
   Selection sel(key_is_1, schema_,
                 std::make_unique<FullScan>(fake_txn_, &table_));
   std::unordered_set rows({Row({Value(1), Value("world"), Value(4.9)})});
+  sel.Dump(std::cout, 0);
+  std::cout << "\n";
   Row got;
   ASSERT_TRUE(sel.Next(&got));
   ASSERT_NE(rows.find(got), rows.end());
@@ -101,7 +108,8 @@ TEST_F(ExecutorTest, BasicJoin) {
 
   HashJoin hj(std::make_unique<FullScan>(fake_txn_, &table_), {0},
               std::make_unique<FullScan>(fake_txn_, &table), {0});
-
+  hj.Dump(std::cout, 0);
+  std::cout << "\n";
   std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2), Value(0),
                                 Value(9.2), Value("arise")}),
                            Row({Value(3), Value("piyo"), Value(12.2), Value(3),

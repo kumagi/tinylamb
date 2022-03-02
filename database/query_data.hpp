@@ -8,15 +8,16 @@
 #include <string>
 #include <vector>
 
+#include "executor/named_expression.hpp"
 #include "expression/expression.hpp"
 
 namespace tinylamb {
 
 struct QueryData {
  public:
-  std::vector<std::string> tables_;
-  Expression expression_;
-  std::vector<std::string> columns_;
+  std::vector<std::string> from_;
+  Expression where_;
+  std::vector<NamedExpression> select_;
 };
 
 }  // namespace tinylamb

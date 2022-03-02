@@ -24,6 +24,8 @@ class CrossJoin : public ExecutorBase {
   bool Next(Row* dst) override;
   ~CrossJoin() override = default;
 
+  void Dump(std::ostream& o, int indent) const override;
+
  private:
   void TableConstruct();
 

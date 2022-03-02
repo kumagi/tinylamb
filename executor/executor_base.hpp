@@ -14,6 +14,7 @@ class ExecutorBase {
  public:
   virtual bool Next(Row* dst) = 0;
   virtual ~ExecutorBase() = default;
+  virtual void Dump(std::ostream& o, int indent) const = 0;
 };
 
 }  // namespace tinylamb

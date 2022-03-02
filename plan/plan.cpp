@@ -6,6 +6,7 @@
 
 #include <utility>
 
+#include "executor/named_expression.hpp"
 #include "expression/expression.hpp"
 #include "plan/full_scan_plan.hpp"
 #include "plan/product_plan.hpp"
@@ -28,8 +29,8 @@ Plan Plan::Product(Plan left_src, Plan right_src) {
   return Plan(new ProductPlan(std::move(left_src), std::move(right_src)));
 }
 
-Plan Plan::Projection(Plan src, const std::vector<size_t>& cols) {
-  return Plan(new ProjectionPlan(std::move(src), cols));
+Plan Plan::Projection(Plan src, std::vector<NamedExpression> cols) {
+  return Plan(new ProjectionPlan(std::move(src), std::move(cols)));
 }
 
 Plan Plan::Selection(Plan src, Expression exp) {

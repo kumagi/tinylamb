@@ -20,4 +20,8 @@ bool tinylamb::FullScan::Next(Row* dst) {
   return true;
 }
 
+void FullScan::Dump(std::ostream& o, int indent) const {
+  o << "Table Full Scan: " << table_->GetSchema().Name();
+}
+
 }  // namespace tinylamb

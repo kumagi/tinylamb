@@ -32,6 +32,12 @@ Value Execute(BinaryOperation op, const Value& left, const Value& right) {
       return Value(left > right);
     case BinaryOperation::kGreaterThanEquals:
       return Value(left >= right);
+    case BinaryOperation::kAnd:
+      return Value(left & right);
+    case BinaryOperation::kOr:
+      return Value(left | right);
+    case BinaryOperation::kXor:
+      return Value(left ^ right);
   }
 }
 
@@ -77,6 +83,15 @@ void BinaryExpression::Dump(std::ostream& o) const {
       break;
     case BinaryOperation::kGreaterThanEquals:
       o << " >= ";
+      break;
+    case BinaryOperation::kAnd:
+      o << " AND ";
+      break;
+    case BinaryOperation::kOr:
+      o << " OR ";
+      break;
+    case BinaryOperation::kXor:
+      o << " XOR ";
       break;
   }
   right_->Dump(o);

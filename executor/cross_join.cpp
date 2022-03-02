@@ -16,8 +16,15 @@ bool CrossJoin::Next(Row* dst) {
     if (!left_->Next(&hold_left_)) return false;
     right_iter_ = right_table_.begin();
   }
-  *dst = hold_left_ + *right_iter_;
+  *dst = hold_left_ + *right_iter_++;
   return true;
+}
+
+void CrossJoin::Dump(std::ostream& o, int indent) const {
+  o << "Cross Join: ";
+  left_->Dump(o, indent + 2);
+  o << "\n" << Indent(indent) << "            ";
+  right_->Dump(o, indent + 2);
 }
 
 void CrossJoin::TableConstruct() {
@@ -25,6 +32,7 @@ void CrossJoin::TableConstruct() {
   while (right_->Next(&right_row)) {
     right_table_.push_back(right_row);
   }
+  right_iter_ = right_table_.end();
   table_constructed_ = true;
 }
 

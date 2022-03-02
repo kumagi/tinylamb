@@ -8,13 +8,15 @@
 #include <memory>
 #include <vector>
 
-#include "plan.hpp"
+#include "executor/named_expression.hpp"
+#include "expression/expression.hpp"
+#include "plan/plan.hpp"
 #include "plan/plan_base.hpp"
 
 namespace tinylamb {
 
 class ProjectionPlan : public PlanBase {
-  ProjectionPlan(Plan src, std::vector<size_t> project_columns);
+  ProjectionPlan(Plan src, std::vector<NamedExpression> project_columns);
 
  public:
   ~ProjectionPlan() override = default;
@@ -29,7 +31,7 @@ class ProjectionPlan : public PlanBase {
   friend class Plan;
 
   Plan src_;
-  std::vector<size_t> project_columns_;
+  std::vector<NamedExpression> columns_;
 };
 
 }  // namespace tinylamb

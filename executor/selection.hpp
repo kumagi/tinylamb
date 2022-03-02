@@ -20,8 +20,9 @@ class Selection : public ExecutorBase {
  public:
   Selection(Expression& exp, Schema schema,
             std::unique_ptr<ExecutorBase>&& src);
-  bool Next(Row* dst) override;
   ~Selection() override = default;
+  bool Next(Row* dst) override;
+  void Dump(std::ostream& o, int indent) const override;
 
  private:
   Expression exp_;

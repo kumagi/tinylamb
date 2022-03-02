@@ -28,7 +28,6 @@ std::unique_ptr<ExecutorBase> ProductPlan::EmitExecutor(
     return std::make_unique<CrossJoin>(left_src_.EmitExecutor(ctx),
                                        right_src_.EmitExecutor(ctx));
   }
-  // TODO(kumagi): there will be much more executors to join.
   return std::make_unique<HashJoin>(left_src_.EmitExecutor(ctx), left_cols_,
                                     right_src_.EmitExecutor(ctx), right_cols_);
 }
@@ -39,20 +38,22 @@ std::unique_ptr<ExecutorBase> ProductPlan::EmitExecutor(
 
 void ProductPlan::Dump(std::ostream& o, int indent) const {
   o << "Product: ";
-  left_src_.Dump(o, indent + 2);
-  o << "[";
+  o << "{";
   for (size_t i = 0; i < left_cols_.size(); ++i) {
     if (0 < i) o << ", ";
     o << left_cols_[i];
   }
-  o << "]\n" << Indent(indent) << "         ";
-  right_src_.Dump(o, indent + 2);
-  o << "[";
+  o << "} of ";
+  left_src_.Dump(o, indent + 2);
+  o << "\n" << Indent(indent) << "         ";
+
+  o << "{";
   for (size_t i = 0; i < right_cols_.size(); ++i) {
     if (0 < i) o << ", ";
     o << right_cols_[i];
   }
-  o << "]";
+  o << "} of ";
+  right_src_.Dump(o, indent + 2);
 }
 
 }  // namespace tinylamb

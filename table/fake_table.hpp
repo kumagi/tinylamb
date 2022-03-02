@@ -10,6 +10,7 @@
 #include "table/iterator_base.hpp"
 #include "table/table_interface.hpp"
 #include "type/row.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
 class Encoder;
@@ -57,6 +58,10 @@ class FakeTable : public TableInterface {
   Iterator BeginIndexScan(Transaction& txn, std::string_view index_name,
                           const Row& begin, const Row& end,
                           bool ascending) override;
+
+  [[nodiscard]] Schema GetSchema() const override {
+    return Schema("FakeTable", {});
+  }
 
  private:
   std::vector<Row> table_;

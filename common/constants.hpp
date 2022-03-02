@@ -46,6 +46,11 @@ enum class BinaryOperation {
   kLessThanEquals,
   kGreaterThan,
   kGreaterThanEquals,
+
+  // Boolean logics.
+  kAnd,
+  kOr,
+  kXor,
 };
 
 typedef uint64_t lsn_t;
