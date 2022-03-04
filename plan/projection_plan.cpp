@@ -43,6 +43,14 @@ Schema ProjectionPlan::GetSchema(TransactionContext& ctx) const {
   return {"", cols};
 }
 
+int ProjectionPlan::AccessRowCount(TransactionContext& ctx) const {
+  return src_.EmitRowCount(ctx);
+}
+
+int ProjectionPlan::EmitRowCount(TransactionContext& ctx) const {
+  return src_.EmitRowCount(ctx);
+}
+
 void ProjectionPlan::Dump(std::ostream& o, int indent) const {
   o << "Project: {";
   for (size_t i = 0; i < columns_.size(); ++i) {

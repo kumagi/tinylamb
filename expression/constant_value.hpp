@@ -13,7 +13,7 @@ class ConstantValue : public ExpressionBase {
   explicit ConstantValue(const Value& v) : val_(v) {}
 
  public:
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kColumnValue; }
+  [[nodiscard]] TypeTag Type() const override { return TypeTag::kConstant; }
   Value Evaluate(const Row& row, Schema* schema) const override { return val_; }
 
   friend std::ostream& operator<<(std::ostream& o, const ConstantValue& c) {

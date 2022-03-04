@@ -122,6 +122,7 @@ add_simple_test(expression/expression_test.cpp)
 add_simple_test(executor/executor_test.cpp)
 add_simple_test(database/catalog_test.cpp)
 add_simple_test(plan/plan_test.cpp)
+add_simple_test(plan/optimizer_test.cpp)
 
 
 ########################################

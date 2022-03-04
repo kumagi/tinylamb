@@ -21,6 +21,13 @@ Schema SelectionPlan::GetSchema(TransactionContext& ctx) const {
   return src_.GetSchema(ctx);
 }
 
+int SelectionPlan::AccessRowCount(TransactionContext& ctx) const {
+  return src_.EmitRowCount(ctx);
+}
+int SelectionPlan::EmitRowCount(TransactionContext& ctx) const {
+  return 1;
+}
+
 void SelectionPlan::Dump(std::ostream& o, int indent) const {
   o << "Select: [";
   exp_.Dump(o);

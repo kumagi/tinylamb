@@ -28,8 +28,7 @@ class Catalog {
 
   Status CreateTable(Transaction& txn, const Schema& schema);
 
-  Status GetTable(Transaction& txn, std::string_view schema_name,
-                  Schema* schema, Table* tbl);
+  Status GetTable(Transaction& txn, std::string_view schema_name, Table* tbl);
 
   [[maybe_unused]] void DebugDump(Transaction& txn, std::ostream& o);
 

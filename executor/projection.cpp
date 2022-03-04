@@ -23,13 +23,14 @@ bool Projection::Next(Row* dst) {
   return true;
 }
 
-void Projection::Dump(std::ostream& o, int) const {
+void Projection::Dump(std::ostream& o, int indent) const {
   o << "Projection: [";
   for (int i = 0; i < expressions_.size(); ++i) {
     if (0 < i) o << ", ";
     o << expressions_[i];
   }
-  o << "]";
+  o << "]\n" << Indent(indent + 2);
+  src_->Dump(o, indent + 2);
 }
 
 }  // namespace tinylamb

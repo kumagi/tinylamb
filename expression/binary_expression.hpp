@@ -20,6 +20,9 @@ class BinaryExpression : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kBinaryExp; }
   Value Evaluate(const Row& row, Schema* schema) const override;
   void Dump(std::ostream& o) const override;
+  [[nodiscard]] std::shared_ptr<ExpressionBase> Left() const { return left_; }
+  [[nodiscard]] BinaryOperation Op() const { return operation_; }
+  [[nodiscard]] std::shared_ptr<ExpressionBase> Right() const { return right_; }
 
  private:
   friend class Expression;

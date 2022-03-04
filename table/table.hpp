@@ -56,6 +56,7 @@ class Table : public TableInterface {
 
   friend Encoder& operator<<(Encoder& e, const Table& t);
   friend Decoder& operator>>(Decoder& d, Table& t);
+  bool operator==(const Table& rhs) const;
 
  private:
   friend class FullScanIterator;

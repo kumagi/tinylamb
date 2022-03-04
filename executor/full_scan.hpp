@@ -16,13 +16,13 @@ class Transaction;
 
 class FullScan : public ExecutorBase {
  public:
-  FullScan(Transaction& txn, const TableInterface* table);
+  FullScan(Transaction& txn, std::unique_ptr<TableInterface>&& table);
   ~FullScan() override = default;
   bool Next(Row* dst) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:
-  const TableInterface* table_;
+  std::unique_ptr<TableInterface> table_;
   Iterator iter_;
 };
 

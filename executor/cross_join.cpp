@@ -21,9 +21,9 @@ bool CrossJoin::Next(Row* dst) {
 }
 
 void CrossJoin::Dump(std::ostream& o, int indent) const {
-  o << "Cross Join: ";
+  o << "CrossJoin: \n" << Indent(indent + 2);
   left_->Dump(o, indent + 2);
-  o << "\n" << Indent(indent) << "            ";
+  o << "\n" << Indent(indent + 2);
   right_->Dump(o, indent + 2);
 }
 

@@ -15,23 +15,32 @@ namespace tinylamb {
 FullScanPlan::FullScanPlan(std::string_view table_name)
     : table_name_(table_name) {}
 
+void InitIfNeeded(std::unique_ptr<Table>& tbl, const std::string& table_name,
+                  TransactionContext& ctx) {
+  if (!tbl) {
+    tbl = std::make_unique<Table>();
+    Status s = ctx.c_->GetTable(ctx.txn_, table_name, tbl.get());
+    if (s != Status::kSuccess) {
+      LOG(FATAL) << "Table: " << table_name << " not found.";
+      abort();
+    }
+  }
+}
+
 std::unique_ptr<ExecutorBase> FullScanPlan::EmitExecutor(
     TransactionContext& ctx) const {
-  if (schema_.Empty()) {
-    ctx.c_->GetTable(ctx.txn_, table_name_, &schema_, &tbl_);
-    tbl_.pm_ = ctx.pm_;
-  }
-  ctx.c_->GetTable(ctx.txn_, table_name_, &schema_, &tbl_);
-  return std::make_unique<FullScan>(ctx.txn_, &tbl_);
+  InitIfNeeded(tbl_, table_name_, ctx);
+  tbl_->pm_ = ctx.pm_;
+  return std::make_unique<FullScan>(ctx.txn_, std::move(tbl_));
 }
 
 Schema FullScanPlan::GetSchema(TransactionContext& ctx) const {
-  if (schema_.Empty()) {
-    ctx.c_->GetTable(ctx.txn_, table_name_, &schema_, &tbl_);
-    tbl_.pm_ = ctx.pm_;
-  }
-  return schema_;
+  InitIfNeeded(tbl_, table_name_, ctx);
+  return tbl_->GetSchema();
 }
+
+int FullScanPlan::AccessRowCount(TransactionContext& ctx) const { return 1000; }
+int FullScanPlan::EmitRowCount(TransactionContext& ctx) const { return 1000; }
 
 void FullScanPlan::Dump(std::ostream& o, int indent) const {
   o << "FullScan: " << table_name_;

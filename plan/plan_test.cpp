@@ -41,7 +41,7 @@ class PlanTest : public ::testing::Test {
                               Column("c3", ValueType::kDouble)})));
       Schema sc;
       Table tbl(p_.get());
-      ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc1", &sc, &tbl));
+      ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc1", &tbl));
       RowPosition rp;
       tbl.Insert(txn, Row({Value(12), Value("hello"), Value(2.3)}), &rp);
       tbl.Insert(txn, Row({Value(10), Value("world"), Value(4.5)}), &rp);
@@ -57,7 +57,7 @@ class PlanTest : public ::testing::Test {
                             Column("d4", ValueType::kInt64)})));
     Schema sc;
     Table tbl(p_.get());
-    ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc2", &sc, &tbl));
+    ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc2", &tbl));
     RowPosition rp;
     tbl.Insert(txn, Row({Value(52), Value(53.4), Value("ou"), Value(16)}), &rp);
     tbl.Insert(txn, Row({Value(242), Value(6.1), Value("ai"), Value(32)}), &rp);

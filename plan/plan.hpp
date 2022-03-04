@@ -32,6 +32,8 @@ class Plan {
   [[nodiscard]] Schema GetSchema(TransactionContext& ctx) const {
     return plan_->GetSchema(ctx);
   }
+  [[nodiscard]] int AccessRowCount(TransactionContext& txn) const;
+  [[nodiscard]] int EmitRowCount(TransactionContext& txn) const;
   void Dump(std::ostream& o, int indent) const { plan_->Dump(o, indent); }
 
  private:

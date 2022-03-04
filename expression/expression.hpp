@@ -5,14 +5,18 @@
 #ifndef TINYLAMB_EXPRESSION_HPP
 #define TINYLAMB_EXPRESSION_HPP
 #include <memory>
+#include <utility>
 
 #include "expression_base.hpp"
+
 namespace tinylamb {
 
 class Expression {
   explicit Expression(ExpressionBase* exp) : exp_(exp) {}
 
  public:
+  explicit Expression(std::shared_ptr<ExpressionBase> exp)
+      : exp_(std::move(exp)) {}
   static Expression ConstantValue(const Value& v);
   static Expression BinaryExpression(Expression&& left,
                                      BinaryOperation operation,

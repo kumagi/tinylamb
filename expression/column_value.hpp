@@ -17,6 +17,7 @@ class ColumnValue : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kColumnValue; }
   Value Evaluate(const Row& row, Schema* schema) const override;
   void Dump(std::ostream& o) const override;
+  [[nodiscard]] std::string ColumnName() const { return col_name_; }
 
  private:
   friend class Expression;

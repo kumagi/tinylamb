@@ -50,9 +50,21 @@ void HashJoin::BucketConstruct() {
 }
 
 void HashJoin::Dump(std::ostream& o, int indent) const {
-  o << "Hash Join: ";
+  std::stringstream ss;
+  ss << "left: {";
+  for (size_t i = 0; i < left_cols_.size(); ++i) {
+    if (0 < i) ss << ", ";
+    ss << left_cols_[i];
+  }
+  ss << "} right: {";
+  for (size_t i = 0; i < right_cols_.size(); ++i) {
+    if (0 < i) ss << ", ";
+    ss << right_cols_[i];
+  }
+  ss << "}";
+  o << "HashJoin: " << ss.str() << "\n" << Indent(indent + 2);
   left_->Dump(o, indent + 2);
-  o << "\n" << Indent(indent) << "           ";
+  o << "\n" << Indent(indent + 2);
   right_->Dump(o, indent + 2);
 }
 

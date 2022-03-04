@@ -4,6 +4,7 @@
 
 #include "plan/product_plan.hpp"
 
+#include <iostream>
 #include <utility>
 
 #include "executor/cross_join.hpp"
@@ -36,23 +37,40 @@ std::unique_ptr<ExecutorBase> ProductPlan::EmitExecutor(
   return left_src_.GetSchema(ctx) + right_src_.GetSchema(ctx);
 }
 
+int ProductPlan::AccessRowCount(TransactionContext& ctx) const {
+  if (left_cols_.empty() && right_cols_.empty()) {
+    return left_src_.AccessRowCount(ctx) +
+           (1 + left_src_.EmitRowCount(ctx) * right_src_.AccessRowCount(ctx));
+  }
+  // Cost of hash join.
+  return left_src_.AccessRowCount(ctx) + right_src_.AccessRowCount(ctx);
+}
+
+int ProductPlan::EmitRowCount(TransactionContext& ctx) const {
+  if (left_cols_.empty() && right_cols_.empty()) {
+    return left_src_.EmitRowCount(ctx) * right_src_.EmitRowCount(ctx);
+  }
+  return std::min(left_src_.EmitRowCount(ctx), right_src_.EmitRowCount(ctx));
+}
+
 void ProductPlan::Dump(std::ostream& o, int indent) const {
   o << "Product: ";
-  o << "{";
-  for (size_t i = 0; i < left_cols_.size(); ++i) {
-    if (0 < i) o << ", ";
-    o << left_cols_[i];
+  if (!left_cols_.empty() || !right_cols_.empty()) {
+    o << "left {";
+    for (size_t i = 0; i < left_cols_.size(); ++i) {
+      if (0 < i) o << ", ";
+      o << left_cols_[i];
+    }
+    o << "} right {";
+    for (size_t i = 0; i < right_cols_.size(); ++i) {
+      if (0 < i) o << ", ";
+      o << right_cols_[i];
+    }
+    o << "} ";
   }
-  o << "} of ";
+  o << "\n" << Indent(indent + 2);
   left_src_.Dump(o, indent + 2);
-  o << "\n" << Indent(indent) << "         ";
-
-  o << "{";
-  for (size_t i = 0; i < right_cols_.size(); ++i) {
-    if (0 < i) o << ", ";
-    o << right_cols_[i];
-  }
-  o << "} of ";
+  o << "\n" << Indent(indent + 2);
   right_src_.Dump(o, indent + 2);
 }
 

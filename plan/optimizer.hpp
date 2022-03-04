@@ -15,12 +15,10 @@ class TransactionContext;
 
 class Optimizer {
  public:
-  Optimizer(QueryData query) : query_(std::move(query)) {}
+  explicit Optimizer() = default;
 
-  std::unique_ptr<ExecutorBase> Optimize(TransactionContext& ctx);
-
- private:
-  QueryData query_;
+  Status Optimize(const QueryData& query, TransactionContext& ctx,
+                  Schema& schema, std::unique_ptr<ExecutorBase>& exec);
 };
 
 }  // namespace tinylamb

@@ -25,6 +25,8 @@ class SelectionPlan : public PlanBase {
       TransactionContext& ctx) const override;
   [[nodiscard]] Schema GetSchema(TransactionContext& ctx) const override;
 
+  [[nodiscard]] int AccessRowCount(TransactionContext& txn) const override;
+  [[nodiscard]] int EmitRowCount(TransactionContext& txn) const override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:

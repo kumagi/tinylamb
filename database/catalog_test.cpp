@@ -83,11 +83,10 @@ TEST_F(CatalogTest, GetTable) {
   }
   {
     auto txn = tm_->Begin();
-    Schema got;
     Table tbl(nullptr);
-    ASSERT_SUCCESS(catalog_->GetTable(txn, "test_schema", &got, &tbl));
+    ASSERT_SUCCESS(catalog_->GetTable(txn, "test_schema", &tbl));
     txn.PreCommit();
-    ASSERT_EQ(new_schema, got);
+    ASSERT_EQ(new_schema, tbl.GetSchema());
   }
 }
 
@@ -105,11 +104,10 @@ TEST_F(CatalogTest, Recover) {
   r_->RecoverFrom(0, tm_.get());
   {
     auto txn = tm_->Begin();
-    Schema got;
     Table tbl(nullptr);
-    ASSERT_SUCCESS(catalog_->GetTable(txn, "test_schema", &got, &tbl));
+    ASSERT_SUCCESS(catalog_->GetTable(txn, "test_schema", &tbl));
     txn.PreCommit();
-    ASSERT_EQ(new_schema, got);
+    ASSERT_EQ(new_schema, tbl.GetSchema());
   }
 }
 

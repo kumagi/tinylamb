@@ -36,4 +36,13 @@ Plan Plan::Projection(Plan src, std::vector<NamedExpression> cols) {
 Plan Plan::Selection(Plan src, Expression exp) {
   return Plan(new SelectionPlan(std::move(src), std::move(exp)));
 }
+
+int Plan::AccessRowCount(TransactionContext& ctx) const {
+  return plan_->AccessRowCount(ctx);
+}
+
+int Plan::EmitRowCount(TransactionContext& ctx) const {
+  return plan_->EmitRowCount(ctx);
+}
+
 }  // namespace tinylamb

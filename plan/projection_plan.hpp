@@ -6,6 +6,7 @@
 #define TINYLAMB_PROJECTION_PLAN_HPP
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "executor/named_expression.hpp"
@@ -17,6 +18,13 @@ namespace tinylamb {
 
 class ProjectionPlan : public PlanBase {
   ProjectionPlan(Plan src, std::vector<NamedExpression> project_columns);
+  ProjectionPlan(Plan src, const std::vector<std::string>& project_columns)
+      : src_(std::move(std::move(src))) {
+    columns_.reserve(project_columns.size());
+    for (const auto& col : project_columns) {
+      columns_.emplace_back(col);
+    }
+  }
 
  public:
   ~ProjectionPlan() override = default;
@@ -25,6 +33,8 @@ class ProjectionPlan : public PlanBase {
       TransactionContext& ctx) const override;
   [[nodiscard]] Schema GetSchema(TransactionContext& ctx) const override;
 
+  [[nodiscard]] int AccessRowCount(TransactionContext& txn) const override;
+  [[nodiscard]] int EmitRowCount(TransactionContext& txn) const override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:

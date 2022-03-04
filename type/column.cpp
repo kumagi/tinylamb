@@ -16,9 +16,12 @@ bool Column::operator==(const Column& rhs) const {
 }
 
 std::ostream& operator<<(std::ostream& o, const Column& c) {
-  o << c.name_ << ": " << ValueTypeToString(c.type_);
+  o << c.name_;
+  if (c.type_ != ValueType::kUnknown) {
+    o << ": " << ValueTypeToString(c.type_);
+  }
   if (!c.constraint_.IsNothing()) {
-    o << " (" << c.constraint_ << ")";
+    o << "(" << c.constraint_ << ")";
   }
   return o;
 }

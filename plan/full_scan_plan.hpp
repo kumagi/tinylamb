@@ -21,13 +21,13 @@ class FullScanPlan : public PlanBase {
 
   [[nodiscard]] Schema GetSchema(TransactionContext& txn) const override;
 
+  [[nodiscard]] int AccessRowCount(TransactionContext& txn) const override;
+  [[nodiscard]] int EmitRowCount(TransactionContext& txn) const override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:
   std::string table_name_;
-
-  mutable Schema schema_;
-  mutable Table tbl_;
+  mutable std::unique_ptr<Table> tbl_;
 };
 
 }  // namespace tinylamb

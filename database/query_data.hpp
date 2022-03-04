@@ -15,6 +15,20 @@ namespace tinylamb {
 
 struct QueryData {
  public:
+  friend std::ostream& operator<<(std::ostream& o, const QueryData& q) {
+    o << "SELECT\n  ";
+    for (int i = 0; i < q.select_.size(); ++i) {
+      if (0 < i) o << ", ";
+      o << q.select_[i];
+    }
+    o << "\nFROM\n  ";
+    for (int i = 0; i < q.from_.size(); ++i) {
+      if (0 < i) o << ", ";
+      o << q.from_[i];
+    }
+    o << "\nWHERE\n  " << q.where_ << ";";
+    return o;
+  }
   std::vector<std::string> from_;
   Expression where_;
   std::vector<NamedExpression> select_;

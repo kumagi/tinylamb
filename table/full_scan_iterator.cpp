@@ -16,7 +16,11 @@ FullScanIterator::FullScanIterator(const Table* table, Transaction* txn)
   txn_->AddReadSet(pos_);
   std::string_view row;
   PageRef page = table_->pm_->GetPage(pos_.page_id);
-  page->Read(*txn, pos_.slot, &row);
+  Status s = page->Read(*txn, pos_.slot, &row);
+  if (s != Status::kSuccess) {
+    LOG(FATAL) << "Table " << table_->schema_.Name() << " not found";
+    abort();
+  }
   current_row_.Deserialize(row.data(), table_->schema_);
 }
 

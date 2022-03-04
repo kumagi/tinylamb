@@ -24,6 +24,7 @@ class Index {
       : name_(name), key_(std::move(key)), pid_(pid) {}
   friend Encoder& operator<<(Encoder& a, const Index& idx);
   friend Decoder& operator>>(Decoder& e, Index& idx);
+  bool operator==(const Index& rhs) const;
 
   std::string name_;
   std::vector<size_t> key_;

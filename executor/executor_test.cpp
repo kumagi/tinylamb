@@ -21,12 +21,15 @@ namespace tinylamb {
 
 class ExecutorTest : public ::testing::Test {
  public:
-  void SetUp() override {}
+  void SetUp() override {
+    table_ = std::unique_ptr<TableInterface>(
+        new FakeTable({{Row({Value(0), Value("hello"), Value(1.2)})},
+                       {Row({Value(3), Value("piyo"), Value(12.2)})},
+                       {Row({Value(1), Value("world"), Value(4.9)})},
+                       {Row({Value(2), Value("arise"), Value(4.14)})}}));
+  }
 
-  FakeTable table_ = {{Row({Value(0), Value("hello"), Value(1.2)})},
-                      {Row({Value(3), Value("piyo"), Value(12.2)})},
-                      {Row({Value(1), Value("world"), Value(4.9)})},
-                      {Row({Value(2), Value("arise"), Value(4.14)})}};
+  std::unique_ptr<TableInterface> table_;
   Transaction fake_txn_;
   Schema schema_{
       "test_table",
@@ -37,7 +40,7 @@ class ExecutorTest : public ::testing::Test {
 TEST_F(ExecutorTest, Construct) {}
 
 TEST_F(ExecutorTest, FullScan) {
-  FullScan fs(fake_txn_, &table_);
+  FullScan fs(fake_txn_, std::move(table_));
   std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2)}),
                            Row({Value(3), Value("piyo"), Value(12.2)}),
                            Row({Value(1), Value("world"), Value(4.9)}),
@@ -47,17 +50,22 @@ TEST_F(ExecutorTest, FullScan) {
   Row got;
   ASSERT_TRUE(fs.Next(&got));
   ASSERT_NE(rows.find(got), rows.end());
+  rows.erase(got);
   ASSERT_TRUE(fs.Next(&got));
   ASSERT_NE(rows.find(got), rows.end());
+  rows.erase(got);
   ASSERT_TRUE(fs.Next(&got));
   ASSERT_NE(rows.find(got), rows.end());
+  rows.erase(got);
   ASSERT_TRUE(fs.Next(&got));
   ASSERT_NE(rows.find(got), rows.end());
+  rows.erase(got);
+  ASSERT_TRUE(rows.empty());
   ASSERT_FALSE(fs.Next(&got));
 }
 
 TEST_F(ExecutorTest, Projection) {
-  auto fs = std::make_unique<FullScan>(fake_txn_, &table_);
+  auto fs = std::make_unique<FullScan>(fake_txn_, std::move(table_));
   Projection proj({NamedExpression("key"), NamedExpression("score")}, schema_,
                   std::move(fs));
   std::unordered_set rows(
@@ -87,7 +95,7 @@ TEST_F(ExecutorTest, Selection) {
       Expression::ColumnValue("key"), BinaryOperation::kEquals,
       Expression::ConstantValue(Value(1)));
   Selection sel(key_is_1, schema_,
-                std::make_unique<FullScan>(fake_txn_, &table_));
+                std::make_unique<FullScan>(fake_txn_, std::move(table_)));
   std::unordered_set rows({Row({Value(1), Value("world"), Value(4.9)})});
   sel.Dump(std::cout, 0);
   std::cout << "\n";
@@ -98,16 +106,17 @@ TEST_F(ExecutorTest, Selection) {
 }
 
 TEST_F(ExecutorTest, BasicJoin) {
-  FakeTable table{{Row({Value(9), Value(1.2), Value("troop")})},
-                  {Row({Value(7), Value(3.9), Value("arise")})},
-                  {Row({Value(1), Value(4.9), Value("probe")})},
-                  {Row({Value(3), Value(12.4), Value("ought")})},
-                  {Row({Value(3), Value(99.9), Value("extra")})},
-                  {Row({Value(232), Value(40.9), Value("out")})},
-                  {Row({Value(0), Value(9.2), Value("arise")})}};
+  auto table = std::unique_ptr<FakeTable>(
+      new FakeTable({{Row({Value(9), Value(1.2), Value("troop")})},
+                     {Row({Value(7), Value(3.9), Value("arise")})},
+                     {Row({Value(1), Value(4.9), Value("probe")})},
+                     {Row({Value(3), Value(12.4), Value("ought")})},
+                     {Row({Value(3), Value(99.9), Value("extra")})},
+                     {Row({Value(232), Value(40.9), Value("out")})},
+                     {Row({Value(0), Value(9.2), Value("arise")})}}));
 
-  HashJoin hj(std::make_unique<FullScan>(fake_txn_, &table_), {0},
-              std::make_unique<FullScan>(fake_txn_, &table), {0});
+  HashJoin hj(std::make_unique<FullScan>(fake_txn_, std::move(table_)), {0},
+              std::make_unique<FullScan>(fake_txn_, std::move(table)), {0});
   hj.Dump(std::cout, 0);
   std::cout << "\n";
   std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2), Value(0),

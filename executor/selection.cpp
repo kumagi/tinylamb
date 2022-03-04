@@ -27,6 +27,9 @@ bool Selection::Next(Row* dst) {
   return false;
 }
 
-void Selection::Dump(std::ostream& o, int) const { o << "Selection: " << exp_; }
+void Selection::Dump(std::ostream& o, int indent) const {
+  o << "Selection: " << exp_ << "\n" << Indent(indent + 2);
+  src_->Dump(o, indent + 2);
+}
 
 }  // namespace tinylamb

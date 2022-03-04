@@ -39,23 +39,22 @@ Status Catalog::CreateTable(Transaction& txn, const Schema& schema) {
 
   std::stringstream ss;
   Encoder arc(ss);
-  arc << schema << new_table;
+  arc << new_table;
   Status s = bpt_.Insert(txn, schema.Name(), ss.str());
   if (s == Status::kConflicts) return s;
   return Status::kSuccess;
 }
 
 Status Catalog::GetTable(Transaction& txn, std::string_view schema_name,
-                         Schema* dst, Table* tbl) {
+                         Table* tbl) {
   std::string_view val;
-  if (bpt_.Read(txn, schema_name, &val) == Status::kNotExists) {
-    return Status::kNotExists;
-  }
+  Status s = bpt_.Read(txn, schema_name, &val);
+  if (s != Status::kSuccess) return Status::kNotExists;
   Table t(pm_);
   std::string v(val);
   std::stringstream ss(v);
   Decoder ext(ss);
-  ext >> *dst >> *tbl;
+  ext >> *tbl;
   return Status::kSuccess;
 }
 

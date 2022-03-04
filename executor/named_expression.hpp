@@ -8,6 +8,7 @@
 #include <string>
 #include <utility>
 
+#include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 
 namespace tinylamb {
@@ -22,9 +23,16 @@ struct NamedExpression {
 
   friend std::ostream& operator<<(std::ostream& o, const NamedExpression& ne) {
     o << ne.expression;
-    if (!ne.name.empty()) {
+    if (ne.expression.Type() == TypeTag::kColumnValue) {
+      const auto* cv =
+          reinterpret_cast<const ColumnValue*>(ne.expression.exp_.get());
+      if (cv->ColumnName() != ne.name) {
+        o << " AS " << ne.name;
+      }
+    } else if (!ne.name.empty()) {
       o << " AS " << ne.name;
     }
+
     return o;
   }
 
