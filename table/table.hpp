@@ -9,9 +9,9 @@
 #include <vector>
 
 #include "full_scan_iterator.hpp"
-#include "index_scan_iterator.hpp"
+#include "index/index.hpp"
+#include "index/index_scan_iterator.hpp"
 #include "page/row_position.hpp"
-#include "table/index.hpp"
 #include "table/table_interface.hpp"
 #include "type/schema.hpp"
 
@@ -56,9 +56,9 @@ class Table : public TableInterface {
 
   friend Encoder& operator<<(Encoder& e, const Table& t);
   friend Decoder& operator>>(Decoder& d, Table& t);
-  bool operator==(const Table& rhs) const;
 
  private:
+  friend class Catalog;
   friend class FullScanIterator;
   friend class IndexScanIterator;
   friend class TableInterface;

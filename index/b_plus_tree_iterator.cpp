@@ -2,11 +2,11 @@
 // Created by kumagi on 2022/02/09.
 //
 
-#include "table/b_plus_tree_iterator.hpp"
+#include "b_plus_tree_iterator.hpp"
 
+#include "b_plus_tree.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
-#include "table/b_plus_tree.hpp"
 
 namespace tinylamb {
 

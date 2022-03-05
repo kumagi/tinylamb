@@ -97,7 +97,6 @@ TEST_F(CatalogTest, Recover) {
   {
     auto txn = tm_->Begin();
     catalog_->CreateTable(txn, new_schema);
-    catalog_->DebugDump(txn, std::cout);
     txn.PreCommit();
   }
   Recover();

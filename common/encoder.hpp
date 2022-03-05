@@ -6,6 +6,7 @@
 #define TINYLAMB_ENCODER_HPP
 
 #include <cstdint>
+#include <memory>
 #include <sstream>
 #include <vector>
 

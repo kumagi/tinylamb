@@ -2,10 +2,10 @@
 // Created by kumagi on 2022/02/21.
 //
 
-#include "table/index_scan_iterator.hpp"
+#include "index_scan_iterator.hpp"
 
+#include "index/b_plus_tree.hpp"
 #include "page/page_manager.hpp"
-#include "table/b_plus_tree.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
 

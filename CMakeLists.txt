@@ -36,18 +36,18 @@ add_library(libtinylamb
         recovery/recovery_manager.cpp recovery/checkpoint_manager.cpp
         transaction/transaction_manager.cpp page/page_type.cpp type/column.cpp
         common/serdes.cpp common/log_message.cpp page/page_ref.cpp
-        page/leaf_page.cpp page/internal_page.cpp table/b_plus_tree.cpp
+        page/leaf_page.cpp page/internal_page.cpp index/b_plus_tree.cpp
         type/value.cpp type/constraint.cpp type/constraint.hpp table/table.cpp
-        table/table.hpp table/index.cpp common/debug.cpp common/encoder.cpp
-        table/full_scan_iterator.cpp table/b_plus_tree_iterator.cpp
-        table/index_scan_iterator.cpp table/index_scan_iterator.hpp
+        table/table.hpp index/index.cpp common/debug.cpp common/encoder.cpp
+        table/full_scan_iterator.cpp index/b_plus_tree_iterator.cpp
+        index/index_scan_iterator.cpp index/index_scan_iterator.hpp
         database/catalog.cpp executor/full_scan.cpp executor/projection.cpp
         executor/selection.cpp expression/binary_expression.cpp
         expression/column_value.cpp executor/hash_join.cpp common/decoder.cpp
         table/fake_table.cpp plan/full_scan_plan.cpp
         plan/projection_plan.cpp plan/selection_plan.cpp plan/product_plan.cpp
         plan/plan.cpp expression/expression.cpp plan/optimizer.cpp
-        executor/cross_join.cpp)
+        executor/cross_join.cpp table/table_statistics.cpp table/table_statistics.hpp)
 
 add_library(libtinylamb_test_util
         STATIC
@@ -112,17 +112,18 @@ add_simple_test(recovery/logger_test.cpp)
 add_simple_test(recovery/log_record_test.cpp)
 add_simple_test(recovery/recovery_manager_test.cpp)
 add_simple_test(recovery/checkpoint_manager_test.cpp)
-add_simple_test(table/b_plus_tree_test.cpp)
-add_simple_test(table/b_plus_tree_iterator_test.cpp)
+add_simple_test(index/b_plus_tree_test.cpp)
+add_simple_test(index/b_plus_tree_iterator_test.cpp)
 add_simple_test(table/table_test.cpp)
 add_simple_test(table/full_scan_iterator_test.cpp)
-add_simple_test(table/index_scan_iterator_test.cpp)
+add_simple_test(index/index_scan_iterator_test.cpp)
 add_simple_test(transaction/transaction_test.cpp)
 add_simple_test(expression/expression_test.cpp)
 add_simple_test(executor/executor_test.cpp)
 add_simple_test(database/catalog_test.cpp)
 add_simple_test(plan/plan_test.cpp)
 add_simple_test(plan/optimizer_test.cpp)
+add_simple_test(table/table_statistics_test.cpp)
 
 
 ########################################

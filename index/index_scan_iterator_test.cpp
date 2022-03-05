@@ -8,11 +8,11 @@
 
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
+#include "index.hpp"
 #include "page/page_manager.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
-#include "table/index.hpp"
 #include "table/table.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction_manager.hpp"

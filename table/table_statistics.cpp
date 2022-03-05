@@ -1,0 +1,342 @@
+//
+// Created by kumagi on 2022/03/06.
+//
+
+#include "table_statistics.hpp"
+
+#include <unordered_set>
+
+#include "assert.h"
+#include "common/encoder.hpp"
+#include "table/table.hpp"
+
+namespace tinylamb {
+
+namespace {
+
+class DistinctCounterBase {
+ public:
+  virtual ~DistinctCounterBase() = default;
+  virtual void Add(int64_t v) = 0;
+  virtual void Add(std::string_view v) = 0;
+  virtual void Add(double v) = 0;
+  virtual void Output(IntegerColumnStats& o) = 0;
+  virtual void Output(VarcharColumnStats& o) = 0;
+  virtual void Output(DoubleColumnStats& o) = 0;
+};
+
+class Int64DistinctCounter : public DistinctCounterBase {
+ public:
+  ~Int64DistinctCounter() override = default;
+  Int64DistinctCounter() {
+    max = std::numeric_limits<int64_t>::min();
+    min = std::numeric_limits<int64_t>::max();
+    count = 0;
+    counter_.clear();
+  }
+  void Add(int64_t v) override {
+    max = max < v ? v : max;
+    min = v < min ? v : min;
+    counter_.insert(v);
+    ++count;
+  }
+  void Add(std::string_view v) override {
+    assert(!"called Add(varchar) to int counter");
+  }
+  void Add(double v) override {
+    assert(!"called Add(double) to integer counter");
+  }
+  void Output(IntegerColumnStats& o) override {
+    o.max = max;
+    o.min = min;
+    o.count = count;
+    o.distinct = counter_.size();
+  }
+  void Output(VarcharColumnStats& o) override {
+    assert(!"called Output(varchar) to int counter");
+  }
+  void Output(DoubleColumnStats& o) override {
+    assert(!"called Output(double) to int counter");
+  }
+  int64_t max{};
+  int64_t min{};
+  int64_t count{};
+  std::unordered_set<int64_t> counter_;
+};
+
+class VarcharDistinctCounter : public DistinctCounterBase {
+ public:
+  ~VarcharDistinctCounter() override = default;
+  VarcharDistinctCounter() {
+    max = "";
+    min = std::string(256, '\xff');
+    count = 0;
+    counter_.clear();
+  }
+  void Add(int64_t v) override {
+    assert(!"called Add(int64) to varchar counter");
+  }
+  void Add(std::string_view v) override {
+    std::string str(v);
+    max = max < str ? str : max;
+    min = str < min ? str : min;
+    count++;
+    counter_.insert(std::string(v));
+  }
+  void Add(double v) override {
+    assert(!"called Add(double) to varchar counter");
+  }
+  void Output(IntegerColumnStats& o) override {
+    assert(!"called Output(int64) to varchar counter");
+  }
+  void Output(VarcharColumnStats& o) override {
+    memcpy(o.max, max.data(), std::min(8lu, max.size()));
+    memcpy(o.min, min.data(), std::min(8lu, min.size()));
+    o.count = count;
+    o.distinct = counter_.size();
+  }
+  void Output(DoubleColumnStats& o) override {
+    assert(!"called Output(double) to varchar counter");
+  }
+
+  std::string max;
+  std::string min;
+  int64_t count{0};
+  std::unordered_set<std::string> counter_;
+};
+
+class DoubleDistinctCounter : public DistinctCounterBase {
+ public:
+  ~DoubleDistinctCounter() override = default;
+  DoubleDistinctCounter() {
+    max = std::numeric_limits<double>::min();
+    min = std::numeric_limits<double>::max();
+    count = 0;
+    counter_.clear();
+  }
+  void Add(int64_t) override { assert(!"called Add(int64) to double counter"); }
+  void Add(std::string_view v) override {
+    assert(!"called Add(varchar) to double counter");
+  }
+  void Add(double v) override {
+    max = max < v ? v : max;
+    max = v < min ? v : min;
+    count++;
+    counter_.insert(v);
+  }
+  void Output(IntegerColumnStats& o) override {
+    assert(!"called Output(int64) to double counter");
+  }
+  void Output(VarcharColumnStats& o) override {
+    assert(!"called Output(varchar) to double counter");
+  }
+  void Output(DoubleColumnStats& o) override {
+    o.max = max;
+    o.min = min;
+    o.count = count;
+    o.distinct = counter_.size();
+  }
+
+  double max{};
+  double min{};
+  int64_t count{};
+  int64_t distinct{};
+  std::unordered_set<double> counter_;
+};
+
+class DistinctCounter {
+ public:
+  explicit DistinctCounter(ValueType type) {
+    switch (type) {
+      case ValueType::kUnknown:
+        assert(!"Never reach here");
+      case ValueType::kInt64:
+        counter_ = std::make_unique<Int64DistinctCounter>();
+        break;
+      case ValueType::kVarChar:
+        counter_ = std::make_unique<VarcharDistinctCounter>();
+        break;
+      case ValueType::kDouble:
+        counter_ = std::make_unique<DoubleDistinctCounter>();
+        break;
+    }
+  }
+  void Add(const Value& v) const {
+    switch (v.type) {
+      case ValueType::kUnknown:
+        assert(!"Never reach here");
+      case ValueType::kInt64:
+        counter_->Add(v.value.int_value);
+        return;
+      case ValueType::kVarChar:
+        counter_->Add(v.value.varchar_value);
+        break;
+      case ValueType::kDouble:
+        counter_->Add(v.value.double_value);
+        break;
+    }
+  }
+  void Output(IntegerColumnStats& o) const { counter_->Output(o); }
+  void Output(VarcharColumnStats& o) const { counter_->Output(o); }
+  void Output(DoubleColumnStats& o) const { counter_->Output(o); }
+
+  std::unique_ptr<DistinctCounterBase> counter_;
+};
+
+}  // namespace
+
+TableStatistics::TableStatistics(const Schema& sc) : row_count_(0) {
+  stats_.reserve(sc.ColumnCount());
+  for (size_t i = 0; i < sc.ColumnCount(); ++i) {
+    stats_.emplace_back(sc.GetColumn(i).Type());
+  }
+}
+
+Status TableStatistics::Update(Transaction& txn, const Table& target) {
+  int rows = 0;
+  const Schema& schema = target.GetSchema();
+  Iterator it = target.BeginFullScan(txn);
+  std::vector<std::unique_ptr<DistinctCounter>> dist_counters;
+  dist_counters.reserve(schema.ColumnCount());
+  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+    const Column& col = schema.GetColumn(i);
+    dist_counters.emplace_back(new DistinctCounter(col.Type()));
+  }
+  while (it.IsValid()) {
+    const Row& row = *it;
+    for (size_t i = 0; i < dist_counters.size(); ++i) {
+      dist_counters[i]->Add(row[i]);
+    }
+    ++rows;
+    ++it;
+  }
+  row_count_ = rows;
+  for (size_t i = 0; i < stats_.size(); ++i) {
+    ColumnStats& cs = stats_[i];
+    switch (cs.type) {
+      case ValueType::kUnknown:
+        assert(!"never reach here");
+      case ValueType::kInt64:
+        dist_counters[i]->Output(cs.stat.int_stats);
+        break;
+      case ValueType::kVarChar:
+        dist_counters[i]->Output(cs.stat.varchar_stats);
+        break;
+      case ValueType::kDouble:
+        dist_counters[i]->Output(cs.stat.double_stats);
+        break;
+    }
+  }
+  return Status::kSuccess;
+}
+
+Encoder& operator<<(Encoder& e, const IntegerColumnStats& s) {
+  e << s.max << s.min << s.count << s.distinct;
+  return e;
+}
+Encoder& operator<<(Encoder& e, const VarcharColumnStats& s) {
+  e << s.count << s.distinct;
+  return e;
+}
+Encoder& operator<<(Encoder& e, const DoubleColumnStats& s) {
+  e << s.max << s.min << s.count << s.distinct;
+  return e;
+}
+Decoder& operator>>(Decoder& d, IntegerColumnStats& s) {
+  d >> s.max >> s.min >> s.count >> s.distinct;
+  return d;
+}
+Decoder& operator>>(Decoder& d, VarcharColumnStats& s) {
+  d >> s.count >> s.distinct;
+  return d;
+}
+Decoder& operator>>(Decoder& d, DoubleColumnStats& s) {
+  d >> s.max >> s.min >> s.count >> s.distinct;
+  return d;
+}
+std::ostream& operator<<(std::ostream& o, const IntegerColumnStats& t) {
+  o << "Max: " << t.max << " Min: " << t.min << " Count:" << t.count
+    << " Distinct: " << t.distinct;
+  return o;
+}
+std::ostream& operator<<(std::ostream& o, const VarcharColumnStats& t) {
+  o << "Max: " << t.max << " Min: " << t.min << " Count:" << t.count
+    << " Distinct: " << t.distinct;
+  return o;
+}
+std::ostream& operator<<(std::ostream& o, const DoubleColumnStats& t) {
+  o << "Max: " << t.max << " Min: " << t.min << " Count:" << t.count
+    << " Distinct: " << t.distinct;
+  return o;
+}
+
+Encoder& operator<<(Encoder& a, const ColumnStats& sc) {
+  a << sc.type;
+  switch (sc.type) {
+    case ValueType::kUnknown:
+      assert(!"never reach here");
+    case ValueType::kInt64:
+      a << sc.stat.int_stats;
+      break;
+    case ValueType::kVarChar:
+      a << sc.stat.varchar_stats;
+      break;
+    case ValueType::kDouble:
+      a << sc.stat.double_stats;
+      break;
+  }
+  return a;
+}
+Decoder& operator>>(Decoder& d, ColumnStats& sc) {
+  d >> sc.type;
+  switch (sc.type) {
+    case ValueType::kUnknown:
+      assert(!"never reach here");
+    case ValueType::kInt64:
+      d >> sc.stat.int_stats;
+      break;
+    case ValueType::kVarChar:
+      d >> sc.stat.varchar_stats;
+      break;
+    case ValueType::kDouble:
+      d >> sc.stat.double_stats;
+      break;
+  }
+  return d;
+}
+
+std::ostream& operator<<(std::ostream& o, const ColumnStats& t) {
+  switch (t.type) {
+    case ValueType::kUnknown:
+      assert(!"never reach here");
+    case ValueType::kInt64:
+      o << t.stat.int_stats;
+      break;
+    case ValueType::kVarChar:
+      o << t.stat.varchar_stats;
+      break;
+    case ValueType::kDouble:
+      o << t.stat.double_stats;
+      break;
+  }
+  return o;
+}
+
+Encoder& operator<<(Encoder& e, const TableStatistics& s) {
+  e << s.row_count_ << s.stats_;
+  return e;
+}
+Decoder& operator>>(Decoder& d, TableStatistics& s) {
+  d >> s.row_count_ >> s.stats_;
+  return d;
+}
+
+std::ostream& operator<<(std::ostream& o, const TableStatistics& t) {
+  o << "Rows: " << t.row_count_ << "\n";
+  for (const auto& stat : t.stats_) {
+    o << stat << "\n";
+  }
+  return o;
+}
+
+}  // namespace tinylamb

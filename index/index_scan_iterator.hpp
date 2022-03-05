@@ -5,8 +5,8 @@
 #ifndef TINYLAMB_INDEX_SCAN_ITERATOR_HPP
 #define TINYLAMB_INDEX_SCAN_ITERATOR_HPP
 
-#include "table/b_plus_tree.hpp"
-#include "table/b_plus_tree_iterator.hpp"
+#include "index/b_plus_tree.hpp"
+#include "index/b_plus_tree_iterator.hpp"
 #include "table/iterator_base.hpp"
 #include "type/row.hpp"
 

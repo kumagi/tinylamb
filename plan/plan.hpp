@@ -35,6 +35,10 @@ class Plan {
   [[nodiscard]] int AccessRowCount(TransactionContext& txn) const;
   [[nodiscard]] int EmitRowCount(TransactionContext& txn) const;
   void Dump(std::ostream& o, int indent) const { plan_->Dump(o, indent); }
+  friend std::ostream& operator<<(std::ostream& o, const Plan& p) {
+    p.Dump(o, 0);
+    return o;
+  }
 
  private:
   std::shared_ptr<PlanBase> plan_;

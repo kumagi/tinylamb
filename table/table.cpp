@@ -6,9 +6,9 @@
 
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "index/b_plus_tree.hpp"
+#include "index/index_scan_iterator.hpp"
 #include "page/page_manager.hpp"
-#include "table/b_plus_tree.hpp"
-#include "table/index_scan_iterator.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 

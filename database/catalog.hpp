@@ -8,7 +8,7 @@
 #include <string_view>
 
 #include "common/constants.hpp"
-#include "table/b_plus_tree.hpp"
+#include "index/b_plus_tree.hpp"
 
 namespace tinylamb {
 
@@ -16,6 +16,7 @@ class PageManager;
 class Table;
 class Transaction;
 class Schema;
+class TableStatistics;
 
 class Catalog {
   static constexpr uint64_t kCatalogPageId = 1;
@@ -31,6 +32,11 @@ class Catalog {
   Status GetTable(Transaction& txn, std::string_view schema_name, Table* tbl);
 
   [[maybe_unused]] void DebugDump(Transaction& txn, std::ostream& o);
+
+  Status GetStatistics(Transaction& txn, std::string_view schema_name,
+                       TableStatistics* ts);
+  Status UpdateStatistics(Transaction& txn, std::string_view schema_name,
+                          const TableStatistics& ts);
 
  private:
   page_id_t root_;

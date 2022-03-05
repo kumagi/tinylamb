@@ -5,9 +5,9 @@
 
 #include <vector>
 
+#include "b_plus_tree_iterator.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
-#include "table/b_plus_tree_iterator.hpp"
 
 namespace tinylamb {
 
