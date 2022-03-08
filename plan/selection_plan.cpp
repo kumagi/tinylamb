@@ -8,6 +8,7 @@
 
 #include "executor/selection.hpp"
 #include "expression/expression_base.hpp"
+#include "table/table_statistics.hpp"
 
 namespace tinylamb {
 
@@ -21,11 +22,13 @@ Schema SelectionPlan::GetSchema(TransactionContext& ctx) const {
   return src_.GetSchema(ctx);
 }
 
-int SelectionPlan::AccessRowCount(TransactionContext& ctx) const {
+size_t SelectionPlan::AccessRowCount(TransactionContext& ctx) const {
   return src_.EmitRowCount(ctx);
 }
-int SelectionPlan::EmitRowCount(TransactionContext& ctx) const {
-  return 1;
+
+size_t SelectionPlan::EmitRowCount(TransactionContext& ctx) const {
+  return src_.EmitRowCount(ctx) /
+         stats_.ReductionFactor(GetSchema(ctx), exp_.exp_.get());
 }
 
 void SelectionPlan::Dump(std::ostream& o, int indent) const {

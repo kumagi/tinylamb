@@ -12,8 +12,8 @@
 
 namespace tinylamb {
 
-FullScanPlan::FullScanPlan(std::string_view table_name)
-    : table_name_(table_name) {}
+FullScanPlan::FullScanPlan(std::string_view table_name, TableStatistics ts)
+    : table_name_(table_name), stats_(std::move(ts)) {}
 
 void InitIfNeeded(std::unique_ptr<Table>& tbl, const std::string& table_name,
                   TransactionContext& ctx) {
@@ -39,8 +39,13 @@ Schema FullScanPlan::GetSchema(TransactionContext& ctx) const {
   return tbl_->GetSchema();
 }
 
-int FullScanPlan::AccessRowCount(TransactionContext& ctx) const { return 1000; }
-int FullScanPlan::EmitRowCount(TransactionContext& ctx) const { return 1000; }
+size_t FullScanPlan::AccessRowCount(TransactionContext& ctx) const {
+  return stats_.row_count_;
+}
+
+size_t FullScanPlan::EmitRowCount(TransactionContext& ctx) const {
+  return stats_.row_count_;
+}
 
 void FullScanPlan::Dump(std::ostream& o, int indent) const {
   o << "FullScan: " << table_name_;

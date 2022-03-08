@@ -43,11 +43,11 @@ Schema ProjectionPlan::GetSchema(TransactionContext& ctx) const {
   return {"", cols};
 }
 
-int ProjectionPlan::AccessRowCount(TransactionContext& ctx) const {
+size_t ProjectionPlan::AccessRowCount(TransactionContext& ctx) const {
   return src_.EmitRowCount(ctx);
 }
 
-int ProjectionPlan::EmitRowCount(TransactionContext& ctx) const {
+size_t ProjectionPlan::EmitRowCount(TransactionContext& ctx) const {
   return src_.EmitRowCount(ctx);
 }
 

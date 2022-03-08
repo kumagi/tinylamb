@@ -4,10 +4,15 @@
 
 #include "table_statistics.hpp"
 
+#include <assert.h>
+
 #include <unordered_set>
 
-#include "assert.h"
 #include "common/encoder.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
 #include "table/table.hpp"
 
 namespace tinylamb {
@@ -228,6 +233,67 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
     }
   }
   return Status::kSuccess;
+}
+
+// Returns estimated inverted selection ratio if the `sc` is selected by
+// `predicate`. If the predicate selects rows to 1 / x, returns x.
+// Returning 1 means no selection (pass through).
+double TableStatistics::ReductionFactor(const Schema& sc,
+                                        ExpressionBase* predicate) const {
+  if (predicate->Type() == TypeTag::kBinaryExp) {
+    const auto* bo = reinterpret_cast<const BinaryExpression*>(predicate);
+    std::unordered_set<std::string> columns = sc.ColumnSet();
+    if (bo->Op() == BinaryOperation::kEquals) {
+      if (bo->Left()->Type() == TypeTag::kColumnValue &&
+          bo->Right()->Type() == TypeTag::kColumnValue) {
+        const auto* lcv =
+            reinterpret_cast<const ColumnValue*>(bo->Left().get());
+        const auto* rcv =
+            reinterpret_cast<const ColumnValue*>(bo->Right().get());
+        if (columns.find(lcv->ColumnName()) != columns.end() &&
+            columns.find(rcv->ColumnName()) != columns.end()) {
+          int offset_left = sc.Offset(lcv->ColumnName());
+          int offset_right = sc.Offset(rcv->ColumnName());
+          return std::min(static_cast<double>(stats_[offset_left].Distinct()),
+                          static_cast<double>(stats_[offset_right].Distinct()));
+        }
+      }
+      if (bo->Left()->Type() == TypeTag::kColumnValue) {
+        const auto* lcv =
+            reinterpret_cast<const ColumnValue*>(bo->Left().get());
+        int offset_left = sc.Offset(lcv->ColumnName());
+        return static_cast<double>(stats_[offset_left].Distinct());
+      }
+      if (bo->Right()->Type() == TypeTag::kColumnValue) {
+        const auto* rcv =
+            reinterpret_cast<const ColumnValue*>(bo->Left().get());
+        int offset_right = sc.Offset(rcv->ColumnName());
+        return static_cast<double>(stats_[offset_right].Distinct());
+      }
+      if (bo->Left()->Type() == TypeTag::kConstant &&
+          bo->Right()->Type() == TypeTag::kConstant) {
+        Value left = reinterpret_cast<const ConstantValue*>(bo->Left().get())
+                         ->GetValue();
+        Value right = reinterpret_cast<const ConstantValue*>(bo->Right().get())
+                          ->GetValue();
+        if (left == right)
+          return 1;
+        else
+          return std::numeric_limits<double>::max();
+      }
+    }
+    if (bo->Op() == BinaryOperation::kAnd) {
+      return ReductionFactor(sc, bo->Left().get()) *
+             ReductionFactor(sc, bo->Right().get());
+    }
+    if (bo->Op() == BinaryOperation::kOr) {
+      // FIXME: what should I return?
+      return ReductionFactor(sc, bo->Left().get()) +
+             ReductionFactor(sc, bo->Right().get());
+    }
+    // TODO: kGreaterThan, kGreaterEqual, kLessThan, kLessEqual, kNotEqual, kXor
+  }
+  return 1;
 }
 
 Encoder& operator<<(Encoder& e, const IntegerColumnStats& s) {

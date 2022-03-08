@@ -24,6 +24,22 @@ Schema Schema::Extract(const std::vector<size_t>& elms) const {
   return {name_, std::move(extracted)};
 }
 
+std::unordered_set<std::string> Schema::ColumnSet() const {
+  std::unordered_set<std::string> ret;
+  ret.reserve(columns_.size());
+  for (const auto& c : columns_) {
+    ret.emplace(c.Name());
+  }
+  return ret;
+}
+
+int Schema::Offset(std::string_view name) const {
+  for (size_t i = 0; i < columns_.size(); ++i) {
+    if (columns_[i].Name() == name) return i;
+  }
+  return -1;
+}
+
 Schema Schema::operator+(const Schema& rhs) const {
   std::vector<Column> merged = columns_;
   merged.reserve(columns_.size() + rhs.columns_.size());

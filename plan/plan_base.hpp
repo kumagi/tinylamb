@@ -19,8 +19,9 @@ class PlanBase {
   virtual std::unique_ptr<ExecutorBase> EmitExecutor(
       TransactionContext& txn) const = 0;
   [[nodiscard]] virtual Schema GetSchema(TransactionContext& txn) const = 0;
-  [[nodiscard]] virtual int AccessRowCount(TransactionContext& txn) const = 0;
-  [[nodiscard]] virtual int EmitRowCount(TransactionContext& txn) const = 0;
+  [[nodiscard]] virtual size_t AccessRowCount(
+      TransactionContext& txn) const = 0;
+  [[nodiscard]] virtual size_t EmitRowCount(TransactionContext& txn) const = 0;
   virtual void Dump(std::ostream& o, int indent) const = 0;
 };
 

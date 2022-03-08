@@ -23,7 +23,7 @@ class Database {
         recovery_(dbname_ + ".log", pm_.GetPool()),
         tm_(&lock_manager_, &logger_, &recovery_),
         cm_(dbname_ + ".last_checkpoint", &tm_, pm_.GetPool()),
-        catalog_(1, &pm_) {}
+        catalog_(1, 2, &pm_) {}
   TransactionContext Begin();
 
  private:

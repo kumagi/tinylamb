@@ -15,8 +15,8 @@
 
 namespace tinylamb {
 
-Plan Plan::FullScan(std::string_view table_name) {
-  return Plan(new FullScanPlan(table_name));
+Plan Plan::FullScan(std::string_view table_name, TableStatistics stat) {
+  return Plan(new FullScanPlan(table_name, std::move(stat)));
 }
 
 Plan Plan::Product(Plan left_src, std::vector<size_t> left_cols, Plan right_src,
@@ -33,16 +33,17 @@ Plan Plan::Projection(Plan src, std::vector<NamedExpression> cols) {
   return Plan(new ProjectionPlan(std::move(src), std::move(cols)));
 }
 
-Plan Plan::Selection(Plan src, Expression exp) {
-  return Plan(new SelectionPlan(std::move(src), std::move(exp)));
+Plan Plan::Selection(Plan src, Expression exp, TableStatistics stat) {
+  return Plan(
+      new SelectionPlan(std::move(src), std::move(exp), std::move(stat)));
 }
 
-int Plan::AccessRowCount(TransactionContext& ctx) const {
-  return plan_->AccessRowCount(ctx);
+size_t Plan::AccessRowCount(TransactionContext& txn) const {
+  return plan_->AccessRowCount(txn);
 }
 
-int Plan::EmitRowCount(TransactionContext& ctx) const {
-  return plan_->EmitRowCount(ctx);
+size_t Plan::EmitRowCount(TransactionContext& txn) const {
+  return plan_->EmitRowCount(txn);
 }
 
 }  // namespace tinylamb

@@ -16,6 +16,7 @@
 #include "recovery/logger.hpp"
 #include "table/table.hpp"
 #include "table/table_interface.hpp"
+#include "table/table_statistics.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
@@ -50,26 +51,43 @@ class PlanTest : public ::testing::Test {
       tbl.Insert(txn, Row({Value(431), Value("vivid"), Value(2.03)}), &rp);
       tbl.Insert(txn, Row({Value(100), Value("aster"), Value(1.2)}), &rp);
     }
-    ASSERT_SUCCESS(catalog_->CreateTable(
-        txn, Schema("Sc2", {Column("d1", ValueType::kInt64),
-                            Column("d2", ValueType::kDouble),
-                            Column("d3", ValueType::kVarChar),
-                            Column("d4", ValueType::kInt64)})));
-    Schema sc;
-    Table tbl(p_.get());
-    ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc2", &tbl));
-    RowPosition rp;
-    tbl.Insert(txn, Row({Value(52), Value(53.4), Value("ou"), Value(16)}), &rp);
-    tbl.Insert(txn, Row({Value(242), Value(6.1), Value("ai"), Value(32)}), &rp);
-    tbl.Insert(txn, Row({Value(12), Value(5.3), Value("heo"), Value(4)}), &rp);
-    tbl.Insert(txn, Row({Value(10), Value(6.5), Value("wld"), Value(8)}), &rp);
-    tbl.Insert(txn, Row({Value(33), Value(2.5), Value("vid"), Value(64)}), &rp);
-    tbl.Insert(txn, Row({Value(1), Value(7.2), Value("aer"), Value(128)}), &rp);
-    ASSERT_SUCCESS(catalog_->CreateTable(
-        txn, Schema("Sc3", {Column("e1", ValueType::kInt64),
-                            Column("e2", ValueType::kDouble)})));
-    txn.PreCommit();
+    {
+      ASSERT_SUCCESS(catalog_->CreateTable(
+          txn, Schema("Sc2", {Column("d1", ValueType::kInt64),
+                              Column("d2", ValueType::kDouble),
+                              Column("d3", ValueType::kVarChar),
+                              Column("d4", ValueType::kInt64)})));
+      Schema sc;
+      Table tbl(p_.get());
+      ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc2", &tbl));
+      RowPosition rp;
+      tbl.Insert(txn, Row({Value(52), Value(53.4), Value("ou"), Value(16)}),
+                 &rp);
+      tbl.Insert(txn, Row({Value(242), Value(6.1), Value("ai"), Value(32)}),
+                 &rp);
+      tbl.Insert(txn, Row({Value(12), Value(5.3), Value("heo"), Value(4)}),
+                 &rp);
+      tbl.Insert(txn, Row({Value(10), Value(6.5), Value("wld"), Value(8)}),
+                 &rp);
+      tbl.Insert(txn, Row({Value(33), Value(2.5), Value("vid"), Value(64)}),
+                 &rp);
+      tbl.Insert(txn, Row({Value(1), Value(7.2), Value("aer"), Value(128)}),
+                 &rp);
+    }
+    {
+      ASSERT_SUCCESS(catalog_->CreateTable(
+          txn, Schema("Sc3", {Column("e1", ValueType::kInt64),
+                              Column("e2", ValueType::kDouble)})));
+      Schema sc;
+      Table tbl(p_.get());
+      ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc2", &tbl));
+      RowPosition rp;
+      tbl.Insert(txn, Row({Value(52), Value(53.4), Value("ou"), Value(16)}),
+                 &rp);
+    }
+    ASSERT_SUCCESS(txn.PreCommit());
   }
+
   void Recover() {
     if (p_) {
       p_->GetPool()->LostAllPageForTest();
@@ -86,7 +104,7 @@ class PlanTest : public ::testing::Test {
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
     cm_ = std::make_unique<CheckpointManager>(kMasterRecordName, tm_.get(),
                                               p_->GetPool(), 1);
-    catalog_ = std::make_unique<Catalog>(1, p_.get());
+    catalog_ = std::make_unique<Catalog>(1, 2, p_.get());
   }
 
   void TearDown() override {
@@ -124,31 +142,38 @@ void DumpAll(TransactionContext& ctx, Plan& plan) {
 }
 
 TEST_F(PlanTest, ScanPlan) {
-  Plan fs = Plan::FullScan("Sc1");
+  TableStatistics ts((Schema()));
+  Plan fs = Plan::FullScan("Sc1", ts);
   DumpAll(*ctx_, fs);
 }
 
 TEST_F(PlanTest, ProjectPlan) {
-  Plan pp = Plan::Projection(Plan::FullScan("Sc1"), {NamedExpression("c1")});
+  TableStatistics ts((Schema()));
+  Plan pp =
+      Plan::Projection(Plan::FullScan("Sc1", ts), {NamedExpression("c1")});
   DumpAll(*ctx_, pp);
 }
 
 TEST_F(PlanTest, SelectionPlan) {
+  TableStatistics ts((Schema()));
   Expression exp = Expression::BinaryExpression(
       Expression::ColumnValue("c1"), BinaryOperation::kGreaterThanEquals,
       Expression::ConstantValue(Value(100)));
-  Plan sp = Plan::Selection(Plan::FullScan("Sc1"), std::move(exp));
+  Plan sp = Plan::Selection(Plan::FullScan("Sc1", ts), std::move(exp), ts);
   DumpAll(*ctx_, sp);
 }
 
 TEST_F(PlanTest, ProductPlan) {
-  Plan prop =
-      Plan::Product(Plan::FullScan("Sc1"), {0}, Plan::FullScan("Sc2"), {0});
+  TableStatistics ts((Schema()));
+  Plan prop = Plan::Product(Plan::FullScan("Sc1", ts), {0},
+                            Plan::FullScan("Sc2", ts), {0});
   DumpAll(*ctx_, prop);
 }
 
 TEST_F(PlanTest, ProductPlanCrossJoin) {
-  Plan prop = Plan::Product(Plan::FullScan("Sc1"), Plan::FullScan("Sc2"));
+  TableStatistics ts((Schema()));
+  Plan prop =
+      Plan::Product(Plan::FullScan("Sc1", ts), Plan::FullScan("Sc2", ts));
   DumpAll(*ctx_, prop);
 }
 

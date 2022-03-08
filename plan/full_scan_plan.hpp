@@ -7,13 +7,14 @@
 
 #include "plan/plan_base.hpp"
 #include "table/table.hpp"
+#include "table/table_statistics.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
 
 class FullScanPlan : public PlanBase {
  public:
-  explicit FullScanPlan(std::string_view table_name);
+  explicit FullScanPlan(std::string_view table_name, TableStatistics ts);
   ~FullScanPlan() override = default;
 
   std::unique_ptr<ExecutorBase> EmitExecutor(
@@ -21,13 +22,14 @@ class FullScanPlan : public PlanBase {
 
   [[nodiscard]] Schema GetSchema(TransactionContext& txn) const override;
 
-  [[nodiscard]] int AccessRowCount(TransactionContext& txn) const override;
-  [[nodiscard]] int EmitRowCount(TransactionContext& txn) const override;
+  [[nodiscard]] size_t AccessRowCount(TransactionContext& txn) const override;
+  [[nodiscard]] size_t EmitRowCount(TransactionContext& txn) const override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:
   std::string table_name_;
   mutable std::unique_ptr<Table> tbl_;
+  TableStatistics stats_;
 };
 
 }  // namespace tinylamb

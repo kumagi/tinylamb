@@ -22,8 +22,12 @@ class Catalog {
   static constexpr uint64_t kCatalogPageId = 1;
 
  public:
-  explicit Catalog(page_id_t pid, PageManager* pm)
-      : root_(pid), pm_(pm), bpt_(pid, pm) {}
+  explicit Catalog(page_id_t table_root, page_id_t stats_root, PageManager* pm)
+      : table_root_(table_root),
+        stats_root_(stats_root),
+        pm_(pm),
+        tables_(table_root_, pm),
+        stats_(stats_root_, pm) {}
 
   void InitializeIfNeeded(Transaction& txn);
 
@@ -37,11 +41,14 @@ class Catalog {
                        TableStatistics* ts);
   Status UpdateStatistics(Transaction& txn, std::string_view schema_name,
                           const TableStatistics& ts);
+  Status RefreshStatistics(Transaction& txn, std::string_view schema_name);
 
  private:
-  page_id_t root_;
+  page_id_t table_root_;
+  page_id_t stats_root_;
   PageManager* pm_;
-  BPlusTree bpt_;
+  BPlusTree tables_;
+  BPlusTree stats_;
 };
 
 }  // namespace tinylamb

@@ -6,6 +6,7 @@
 #define TINYLAMB_SCHEMA_HPP
 
 #include <cassert>
+#include <unordered_set>
 #include <vector>
 
 #include "common/log_message.hpp"
@@ -25,6 +26,8 @@ class Schema {
     return columns_[idx];
   }
   [[nodiscard]] Schema Extract(const std::vector<size_t>& elms) const;
+  [[nodiscard]] std::unordered_set<std::string> ColumnSet() const;
+  [[nodiscard]] int Offset(std::string_view name) const;
   [[nodiscard]] bool Empty() const { return name_.empty(); }
 
   Schema operator+(const Schema& rhs) const;

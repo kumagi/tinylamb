@@ -77,7 +77,12 @@ class OptimizerTest : public ::testing::Test {
         tbl.Insert(txn, Row({Value(i), Value(i + 53.4)}), &rp);
       }
     }
-    txn.PreCommit();
+    ASSERT_SUCCESS(txn.PreCommit());
+    auto stat_tx = tm_->Begin();
+    catalog_->RefreshStatistics(stat_tx, "Sc1");
+    catalog_->RefreshStatistics(stat_tx, "Sc2");
+    catalog_->RefreshStatistics(stat_tx, "Sc3");
+    ASSERT_SUCCESS(stat_tx.PreCommit());
   }
   void Recover() {
     if (p_) {
@@ -93,7 +98,7 @@ class OptimizerTest : public ::testing::Test {
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
-    catalog_ = std::make_unique<Catalog>(1, p_.get());
+    catalog_ = std::make_unique<Catalog>(1, 2, p_.get());
   }
 
   void TearDown() override {

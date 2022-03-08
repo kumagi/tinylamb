@@ -13,6 +13,7 @@ namespace tinylamb {
 class Table;
 class Transaction;
 class Encoder;
+class ExpressionBase;
 
 struct IntegerColumnStats {
   int64_t max;
@@ -80,6 +81,31 @@ struct ColumnStats {
     VarcharColumnStats varchar_stats;
     DoubleColumnStats double_stats;
   } stat{};
+
+  [[nodiscard]] size_t Count() const {
+    switch (type) {
+      case ValueType::kUnknown:
+        assert(!"never reach here");
+      case ValueType::kInt64:
+        return stat.int_stats.count;
+      case ValueType::kVarChar:
+        return stat.varchar_stats.count;
+      case ValueType::kDouble:
+        return stat.double_stats.count;
+    }
+  }
+  [[nodiscard]] size_t Distinct() const {
+    switch (type) {
+      case ValueType::kUnknown:
+        assert(!"never reach here");
+      case ValueType::kInt64:
+        return stat.int_stats.distinct;
+      case ValueType::kVarChar:
+        return stat.varchar_stats.distinct;
+      case ValueType::kDouble:
+        return stat.double_stats.distinct;
+    }
+  }
   friend Encoder& operator<<(Encoder& a, const ColumnStats& sc);
   friend Decoder& operator>>(Decoder& a, ColumnStats& sc);
   friend std::ostream& operator<<(std::ostream& o, const ColumnStats& t);
@@ -90,11 +116,12 @@ class TableStatistics {
  public:
   explicit TableStatistics(const Schema& sc);
   Status Update(Transaction& txn, const Table& target);
+  double ReductionFactor(const Schema& sc, ExpressionBase* predicate) const;
+
   friend Encoder& operator<<(Encoder& e, const TableStatistics& t);
   friend Decoder& operator>>(Decoder& d, TableStatistics& t);
   friend std::ostream& operator<<(std::ostream& o, const TableStatistics& t);
 
- private:
   size_t row_count_;
   std::vector<ColumnStats> stats_;
 };

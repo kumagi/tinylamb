@@ -37,7 +37,7 @@ std::unique_ptr<ExecutorBase> ProductPlan::EmitExecutor(
   return left_src_.GetSchema(ctx) + right_src_.GetSchema(ctx);
 }
 
-int ProductPlan::AccessRowCount(TransactionContext& ctx) const {
+size_t ProductPlan::AccessRowCount(TransactionContext& ctx) const {
   if (left_cols_.empty() && right_cols_.empty()) {
     return left_src_.AccessRowCount(ctx) +
            (1 + left_src_.EmitRowCount(ctx) * right_src_.AccessRowCount(ctx));
@@ -46,7 +46,7 @@ int ProductPlan::AccessRowCount(TransactionContext& ctx) const {
   return left_src_.AccessRowCount(ctx) + right_src_.AccessRowCount(ctx);
 }
 
-int ProductPlan::EmitRowCount(TransactionContext& ctx) const {
+size_t ProductPlan::EmitRowCount(TransactionContext& ctx) const {
   if (left_cols_.empty() && right_cols_.empty()) {
     return left_src_.EmitRowCount(ctx) * right_src_.EmitRowCount(ctx);
   }

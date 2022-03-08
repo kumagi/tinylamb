@@ -14,6 +14,7 @@
 #include "expression/column_value.hpp"
 #include "plan.hpp"
 #include "table/table.hpp"
+#include "table/table_statistics.hpp"
 
 namespace std {
 template <>
@@ -88,7 +89,8 @@ bool DoesTouchWithin(const ExpressionBase* ptr,
   return true;
 }
 
-Plan CalcTableSelection(const Schema& schema, const Expression& expression) {
+Plan CalcTableSelection(const Schema& schema, const Expression& expression,
+                        const TableStatistics& stat) {
   // Generate expression for selection.
   std::unordered_set<std::string> column_names = ColumnNames(schema);
   std::unordered_set<std::string> columns;
@@ -99,18 +101,19 @@ Plan CalcTableSelection(const Schema& schema, const Expression& expression) {
     auto* be = reinterpret_cast<BinaryExpression*>(expression.exp_.get());
     if (DoesTouchWithin(be->Left().get(), columns) &&
         DoesTouchWithin(be->Right().get(), columns)) {
-      return Plan::Selection(Plan::FullScan(schema.Name()), expression);
+      return Plan::Selection(Plan::FullScan(schema.Name(), stat), expression,
+                             stat);
     }
     if (be->Op() == BinaryOperation::kAnd) {
       if (DoesTouchWithin(be->Left().get(), columns)) {
-        return CalcTableSelection(schema, Expression(be->Left()));
+        return CalcTableSelection(schema, Expression(be->Left()), stat);
       }
       if (DoesTouchWithin(be->Right().get(), columns)) {
-        return CalcTableSelection(schema, Expression(be->Right()));
+        return CalcTableSelection(schema, Expression(be->Right()), stat);
       }
     }
   }
-  return Plan::FullScan(schema.Name());
+  return Plan::FullScan(schema.Name(), stat);
 }
 
 bool ContainsAny(const std::unordered_set<std::string>& left,
@@ -208,6 +211,7 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
   if (query.from_.empty()) throw std::runtime_error("No table specified");
   std::unordered_map<std::unordered_set<std::string>, std::pair<int, Plan>>
       optimal_plans;
+  std::unordered_map<std::string, TableStatistics> stats;
 
   // 1. Initialize every single tables to start.
   std::unordered_set<std::string> touched_columns;
@@ -218,15 +222,22 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
   for (const auto& from : query.from_) {
     Table tbl(ctx.pm_);
     ctx.c_->GetTable(ctx.txn_, from, &tbl);
+
+    // Get statistics.
+    TableStatistics ts(tbl.GetSchema());
+    ctx.c_->GetStatistics(ctx.txn_, from, &ts);
+    stats.emplace(from, ts);
+
     std::vector<NamedExpression> project_target;
     for (const auto& col : And(touched_columns, ColumnNames(tbl.GetSchema()))) {
       project_target.emplace_back(col);
     }
     optimal_plans.emplace(
         std::unordered_set({from}),
-        std::make_pair(100, Plan::Projection(CalcTableSelection(tbl.GetSchema(),
-                                                                query.where_),
-                                             project_target)));
+        std::make_pair(
+            100, Plan::Projection(
+                     CalcTableSelection(tbl.GetSchema(), query.where_, ts),
+                     project_target)));
   }
 
   // 2. Combine all tables to find the best combination;

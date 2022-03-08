@@ -43,7 +43,7 @@ class CatalogTest : public ::testing::Test {
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
     cm_ = std::make_unique<CheckpointManager>(kMasterRecordName, tm_.get(),
                                               p_->GetPool(), 1);
-    catalog_ = std::make_unique<Catalog>(1, p_.get());
+    catalog_ = std::make_unique<Catalog>(1, 2, p_.get());
   }
 
   void TearDown() override {
@@ -97,6 +97,7 @@ TEST_F(CatalogTest, Recover) {
   {
     auto txn = tm_->Begin();
     catalog_->CreateTable(txn, new_schema);
+    catalog_->DebugDump(txn, std::cout);
     txn.PreCommit();
   }
   Recover();
