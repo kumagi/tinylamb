@@ -1,7 +1,6 @@
 #ifndef TINYLAMB_PAGE_HPP
 #define TINYLAMB_PAGE_HPP
 
-#include <tiff.h>
 #include <unistd.h>
 
 #include <iostream>
@@ -47,7 +46,7 @@ class Page {
 
   [[nodiscard]] size_t RowCount() const;
 
-  Status ReadKey(Transaction& txn, const uint16& slot,
+  Status ReadKey(Transaction& txn, const uint16_t& slot,
                  std::string_view* result) const;
 
   std::string_view GetKey(slot_t slot) const;
