@@ -1,4 +1,4 @@
-name: Validate code format with clang-format
+name: clang-format
 on: [push, pull_request]
 jobs:
   validate:

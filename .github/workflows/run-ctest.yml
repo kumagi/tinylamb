@@ -1,4 +1,4 @@
-name: Run ctest
+name: ctest
 on: [push, pull_request]
 jobs:
   validate:
@@ -10,4 +10,4 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y cmake clang
-        mkdir build && cd build && cmake -DCMAKE_BUILD_TYPE=Debug .. && make && ctest
+        mkdir build && cd build && cmake -DCMAKE_CXX_FLAGS="-fsanitize=undefined,bounds,address" -DCMAKE_BUILD_TYPE=Debug .. && make && ctest
