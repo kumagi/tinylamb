@@ -22,6 +22,7 @@ std::unique_ptr<ExecutorBase> ProjectionPlan::EmitExecutor(
   return std::make_unique<Projection>(columns_, src_.GetSchema(ctx),
                                       src_.EmitExecutor(ctx));
 }
+
 Schema ProjectionPlan::GetSchema(TransactionContext& ctx) const {
   Schema original_schema = src_.GetSchema(ctx);
 

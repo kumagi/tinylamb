@@ -149,7 +149,7 @@ size_t Page::RowCount() const {
   }
 }
 
-Status Page::ReadKey(Transaction& txn, const uint16& slot,
+Status Page::ReadKey(Transaction& txn, const uint16_t& slot,
                      std::string_view* result) const {
   switch (type) {
     case PageType::kRowPage:
