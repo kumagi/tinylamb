@@ -10,10 +10,10 @@ CrossJoin::CrossJoin(std::unique_ptr<ExecutorBase>&& left,
                      std::unique_ptr<ExecutorBase>&& right)
     : left_(std::move(left)), right_(std::move(right)) {}
 
-bool CrossJoin::Next(Row* dst) {
+bool CrossJoin::Next(Row* dst, RowPosition* rp) {
   if (!table_constructed_) TableConstruct();
   if (right_iter_ == right_table_.end()) {
-    if (!left_->Next(&hold_left_)) return false;
+    if (!left_->Next(&hold_left_, nullptr)) return false;
     right_iter_ = right_table_.begin();
   }
   *dst = hold_left_ + *right_iter_++;
@@ -29,7 +29,7 @@ void CrossJoin::Dump(std::ostream& o, int indent) const {
 
 void CrossJoin::TableConstruct() {
   Row right_row;
-  while (right_->Next(&right_row)) {
+  while (right_->Next(&right_row, nullptr)) {
     right_table_.push_back(right_row);
   }
   right_iter_ = right_table_.end();

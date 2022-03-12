@@ -48,20 +48,20 @@ TEST_F(ExecutorTest, FullScan) {
   fs.Dump(std::cout, 0);
   std::cout << "\n";
   Row got;
-  ASSERT_TRUE(fs.Next(&got));
+  ASSERT_TRUE(fs.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   rows.erase(got);
-  ASSERT_TRUE(fs.Next(&got));
+  ASSERT_TRUE(fs.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   rows.erase(got);
-  ASSERT_TRUE(fs.Next(&got));
+  ASSERT_TRUE(fs.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   rows.erase(got);
-  ASSERT_TRUE(fs.Next(&got));
+  ASSERT_TRUE(fs.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   rows.erase(got);
   ASSERT_TRUE(rows.empty());
-  ASSERT_FALSE(fs.Next(&got));
+  ASSERT_FALSE(fs.Next(&got, nullptr));
 }
 
 TEST_F(ExecutorTest, Projection) {
@@ -74,19 +74,19 @@ TEST_F(ExecutorTest, Projection) {
   proj.Dump(std::cout, 0);
   std::cout << "\n";
   Row got;
-  ASSERT_TRUE(proj.Next(&got));
+  ASSERT_TRUE(proj.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_TRUE(rows.erase(got));
-  ASSERT_TRUE(proj.Next(&got));
+  ASSERT_TRUE(proj.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_TRUE(rows.erase(got));
-  ASSERT_TRUE(proj.Next(&got));
+  ASSERT_TRUE(proj.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_TRUE(rows.erase(got));
-  ASSERT_TRUE(proj.Next(&got));
+  ASSERT_TRUE(proj.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_TRUE(rows.erase(got));
-  ASSERT_FALSE(proj.Next(&got));
+  ASSERT_FALSE(proj.Next(&got, nullptr));
   ASSERT_TRUE(rows.empty());
 }
 
@@ -100,9 +100,9 @@ TEST_F(ExecutorTest, Selection) {
   sel.Dump(std::cout, 0);
   std::cout << "\n";
   Row got;
-  ASSERT_TRUE(sel.Next(&got));
+  ASSERT_TRUE(sel.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
-  ASSERT_FALSE(sel.Next(&got));
+  ASSERT_FALSE(sel.Next(&got, nullptr));
 }
 
 TEST_F(ExecutorTest, BasicJoin) {
@@ -129,19 +129,19 @@ TEST_F(ExecutorTest, BasicJoin) {
                                 Value(4.9), Value("probe")})});
 
   Row got;
-  ASSERT_TRUE(hj.Next(&got));
+  ASSERT_TRUE(hj.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_TRUE(rows.erase(got));
-  ASSERT_TRUE(hj.Next(&got));
+  ASSERT_TRUE(hj.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_TRUE(rows.erase(got));
-  ASSERT_TRUE(hj.Next(&got));
+  ASSERT_TRUE(hj.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_TRUE(rows.erase(got));
-  ASSERT_TRUE(hj.Next(&got));
+  ASSERT_TRUE(hj.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_TRUE(rows.erase(got));
-  ASSERT_FALSE(hj.Next(&got));
+  ASSERT_FALSE(hj.Next(&got, nullptr));
   ASSERT_TRUE(rows.empty());
 }
 

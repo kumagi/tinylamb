@@ -132,7 +132,7 @@ void DumpAll(TransactionContext& ctx, const QueryData& qd) {
   exec->Dump(std::cout, 0);
   std::cout << "\n\n" << sc << "\n";
   Row result;
-  while (exec->Next(&result)) {
+  while (exec->Next(&result, nullptr)) {
     std::cout << result << "\n";
   }
 }

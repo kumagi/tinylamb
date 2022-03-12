@@ -21,7 +21,7 @@ class HashJoin : public ExecutorBase {
            std::vector<size_t> right_cols);
 
   ~HashJoin() override = default;
-  bool Next(Row* dst) override;
+  bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:

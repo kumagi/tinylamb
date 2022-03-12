@@ -21,7 +21,7 @@ class Selection : public ExecutorBase {
   Selection(Expression& exp, Schema schema,
             std::unique_ptr<ExecutorBase>&& src);
   ~Selection() override = default;
-  bool Next(Row* dst) override;
+  bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:

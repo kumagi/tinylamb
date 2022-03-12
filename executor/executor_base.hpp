@@ -5,14 +5,16 @@
 #ifndef TINYLAMB_EXECUTOR_BASE_HPP
 #define TINYLAMB_EXECUTOR_BASE_HPP
 
+#include "page/row_position.hpp"
 #include "type/row.hpp"
 
 namespace tinylamb {
 class Row;
+class RowPosistion;
 
 class ExecutorBase {
  public:
-  virtual bool Next(Row* dst) = 0;
+  virtual bool Next(Row* dst, RowPosition* rp) = 0;
   virtual ~ExecutorBase() = default;
   virtual void Dump(std::ostream& o, int indent) const = 0;
 };

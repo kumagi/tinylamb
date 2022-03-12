@@ -136,7 +136,7 @@ void DumpAll(TransactionContext& ctx, Plan& plan) {
   std::unique_ptr<ExecutorBase> scan = plan.EmitExecutor(ctx);
   Row result;
   std::cout << plan.GetSchema(ctx) << "\n";
-  while (scan->Next(&result)) {
+  while (scan->Next(&result, nullptr)) {
     std::cout << result << "\n";
   }
 }

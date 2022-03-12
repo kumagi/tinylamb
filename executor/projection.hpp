@@ -23,7 +23,7 @@ class Projection : public ExecutorBase {
         src_(std::move(src)) {}
   ~Projection() override = default;
 
-  bool Next(Row* dst) override;
+  bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:

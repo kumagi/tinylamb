@@ -10,10 +10,10 @@
 
 namespace tinylamb {
 
-bool Projection::Next(Row* dst) {
+bool Projection::Next(Row* dst, RowPosition* rp) {
   Row orig;
   dst->Clear();
-  if (!src_->Next(&orig)) return false;
+  if (!src_->Next(&orig, nullptr)) return false;
   std::vector<Value> result;
   result.reserve(expressions_.size());
   for (const auto& exp : expressions_) {

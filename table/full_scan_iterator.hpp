@@ -33,6 +33,7 @@ class FullScanIterator : public IteratorBase {
 
  private:
   friend class Table;
+  friend class FullScan;
   FullScanIterator(const Table* table, Transaction* txn);
 
   const Table* table_;

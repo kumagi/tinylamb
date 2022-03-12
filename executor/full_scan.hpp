@@ -8,6 +8,7 @@
 #include <memory>
 
 #include "executor/executor_base.hpp"
+#include "page/row_position.hpp"
 #include "table/iterator.hpp"
 
 namespace tinylamb {
@@ -18,7 +19,7 @@ class FullScan : public ExecutorBase {
  public:
   FullScan(Transaction& txn, std::unique_ptr<TableInterface>&& table);
   ~FullScan() override = default;
-  bool Next(Row* dst) override;
+  bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:

@@ -15,9 +15,9 @@ Selection::Selection(Expression& exp, Schema schema,
                      std::unique_ptr<ExecutorBase>&& src)
     : exp_(exp), schema_(std::move(schema)), src_(std::move(src)) {}
 
-bool Selection::Next(Row* dst) {
+bool Selection::Next(Row* dst, RowPosition* rp) {
   Row orig;
-  while (src_->Next(&orig)) {
+  while (src_->Next(&orig, nullptr)) {
     Value result = exp_.Evaluate(orig, &schema_);
     if (result.value.int_value) {
       *dst = orig;

@@ -21,7 +21,7 @@ class CrossJoin : public ExecutorBase {
   CrossJoin(std::unique_ptr<ExecutorBase>&& left,
             std::unique_ptr<ExecutorBase>&& right);
 
-  bool Next(Row* dst) override;
+  bool Next(Row* dst, RowPosition* rp) override;
   ~CrossJoin() override = default;
 
   void Dump(std::ostream& o, int indent) const override;

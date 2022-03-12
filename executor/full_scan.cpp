@@ -13,7 +13,7 @@ namespace tinylamb {
 FullScan::FullScan(Transaction& txn, std::unique_ptr<TableInterface>&& table)
     : table_(std::move(table)), iter_(table_->BeginFullScan(txn)) {}
 
-bool tinylamb::FullScan::Next(Row* dst) {
+bool tinylamb::FullScan::Next(Row* dst, RowPosition* rp) {
   if (!iter_.IsValid()) return false;
   *dst = *iter_;
   ++iter_;
