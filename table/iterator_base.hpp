@@ -6,7 +6,7 @@
 #define TINYLAMB_ITERATOR_BASE_HPP
 
 namespace tinylamb {
-class Row;
+struct Row;
 
 class IteratorBase {
  public:

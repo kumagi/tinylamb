@@ -15,13 +15,13 @@ HashJoin::HashJoin(std::unique_ptr<ExecutorBase>&& left,
       right_(std::move(right)),
       right_cols_(std::move(right_cols)) {}
 
-bool HashJoin::Next(Row* dst) {
+bool HashJoin::Next(Row* dst, RowPosition* rp) {
   if (!bucket_constructed_) BucketConstruct();
   if (right_buckets_iterator_ != right_buckets_.end()) {
     *dst = hold_left_ + right_buckets_iterator_->second;
   } else {
     for (;;) {
-      if (!left_->Next(&hold_left_)) return false;
+      if (!left_->Next(&hold_left_, rp)) return false;
       left_key_ = hold_left_.Extract(left_cols_).EncodeMemcomparableFormat();
       right_buckets_iterator_ = right_buckets_.find(left_key_);
       if (right_buckets_iterator_ != right_buckets_.end()) {
@@ -41,7 +41,7 @@ bool HashJoin::Next(Row* dst) {
 
 void HashJoin::BucketConstruct() {
   Row row;
-  while (right_->Next(&row)) {
+  while (right_->Next(&row, nullptr)) {
     right_buckets_.emplace(row.Extract(right_cols_).EncodeMemcomparableFormat(),
                            row);
   }

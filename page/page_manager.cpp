@@ -33,7 +33,7 @@ PageRef PageManager::AllocateNewPage(Transaction& system_txn,
                                      PageType new_page_type) {
   PageRef new_page =
       GetMetaPage()->AllocateNewPage(system_txn, pool_, new_page_type);
-  return std::move(new_page);
+  return new_page;
 }
 
 PageRef PageManager::GetMetaPage() {
@@ -42,7 +42,7 @@ PageRef PageManager::GetMetaPage() {
   if (meta_page->Type() != PageType::kMetaPage) {
     meta_page->PageInit(kMetaPageId, PageType::kMetaPage);
   }
-  return std::move(meta_page);
+  return meta_page;
 }
 
 }  // namespace tinylamb

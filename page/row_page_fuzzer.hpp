@@ -76,7 +76,7 @@ class Operation {
         page_(env_->p_->GetPage(env_->page_id_)),
         txn_(env_->tm_->Begin()) {}
 
-  void StartTransaction() { txn_ = std::move(env_->tm_->Begin()); }
+  void StartTransaction() { txn_ = env_->tm_->Begin(); }
 
   size_t Execute(std::string_view input, bool verbose = false) {
     uint8_t operation = input[0];

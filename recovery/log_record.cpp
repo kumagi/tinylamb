@@ -262,7 +262,7 @@ std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
 }
 
 LogRecord::LogRecord(lsn_t prev, txn_id_t txn, LogType t)
-    : prev_lsn(prev), txn_id(txn), type(t) {}
+    : type(t), prev_lsn(prev), txn_id(txn) {}
 
 bool LogRecord::ParseLogRecord(std::istream& in, tinylamb::LogRecord* dst) {
   dst->Clear();
@@ -338,7 +338,6 @@ bool LogRecord::ParseLogRecord(std::istream& in, tinylamb::LogRecord* dst) {
     default:
       LOG(ERROR) << "unknown log type: " << dst->type;
       assert(!"unknown log");
-      return false;
   }
   assert(!"never reach here");
 }

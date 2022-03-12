@@ -95,7 +95,6 @@ TEST_F(CheckpointTest, CheckpointAbortRecovery) {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint();
     page->Update(txn, slot, "aborted");
-    RowPosition insert_position;
     slot_t will_be_deleted_row;
     page->Insert(txn, "will be deleted", &will_be_deleted_row);
   }

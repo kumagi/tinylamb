@@ -47,7 +47,7 @@ class PageRef final {
     o.page_ = nullptr;
   }
   PageRef& operator=(const PageRef&) = delete;
-  PageRef& operator=(PageRef&& o) {
+  PageRef& operator=(PageRef&& o) noexcept {
     pool_ = o.pool_;
     page_ = o.page_;
     page_lock_ = std::move(o.page_lock_);

@@ -40,7 +40,7 @@ Value::Value(double double_value) {
 }
 
 Value::Value(const Value& o)
-    : owned_data(o.owned_data), type(o.type), value(o.value) {
+    : value(o.value), type(o.type), owned_data(o.owned_data) {
   if (!owned_data.empty() && type == ValueType::kVarChar) {
     value.varchar_value = owned_data;
   }

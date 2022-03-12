@@ -18,7 +18,7 @@ static constexpr size_t kPageHeaderSize = sizeof(uint64_t) +  // page_id
 static constexpr size_t kPageBodySize = kPageSize - kPageHeaderSize;
 
 #define GET_PAGE_PTR(x) \
-  reinterpret_cast<Page*>(reinterpret_cast<char*>(x) - kPageHeaderSize)
+  (reinterpret_cast<Page*>(reinterpret_cast<char*>(x) - kPageHeaderSize))
 
 enum class Status : uint8_t {
   kUnknown,
@@ -85,7 +85,7 @@ inline std::string_view ToString(Status s) {
   }
 }
 
-inline std::string Indent(int num) { return std::string(num, ' '); }
+inline std::string Indent(int num) { return {static_cast<char>(num), ' '}; }
 
 }  // namespace tinylamb
 

@@ -37,7 +37,7 @@ class InternalPage {
     free_ptr_ = sizeof(InternalPage);
     free_size_ = kPageBodySize - sizeof(InternalPage);
   }
-  size_t RowCount() const;
+  bin_size_t RowCount() const;
 
   void SetLowestValue(page_id_t pid, Transaction& txn, page_id_t value);
 

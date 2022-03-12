@@ -52,7 +52,7 @@ PageRef Page::AllocateNewPage(Transaction& txn, PagePool& pool,
   PageRef ret = body.meta_page.AllocateNewPage(txn, pool, new_page_type);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
-  return std::move(ret);
+  return ret;
 }
 
 void Page::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {

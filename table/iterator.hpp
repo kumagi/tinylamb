@@ -10,7 +10,7 @@
 #include "table/iterator_base.hpp"
 
 namespace tinylamb {
-class Row;
+struct Row;
 
 class Iterator {
  public:

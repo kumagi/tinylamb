@@ -13,11 +13,11 @@
 
 namespace tinylamb {
 
-class Transaction;
-class Row;
-class RowPosition;
-class Encoder;
 class Decoder;
+class Encoder;
+class Transaction;
+struct Row;
+struct RowPosition;
 
 class TableInterface {
  public:

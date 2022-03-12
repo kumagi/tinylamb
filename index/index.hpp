@@ -12,7 +12,7 @@
 #include "common/serdes.hpp"
 
 namespace tinylamb {
-class Row;
+struct Row;
 class Encoder;
 class Decoder;
 

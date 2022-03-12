@@ -9,13 +9,13 @@
 
 namespace tinylamb {
 
-class LogRecord;
 class Page;
 class PageManager;
 class PagePool;
 class PageRef;
 class Transaction;
 class TransactionManager;
+struct LogRecord;
 
 class RecoveryManager {
  public:
@@ -30,7 +30,7 @@ class RecoveryManager {
   void LogUndoWithPage(lsn_t lsn, const LogRecord& log, TransactionManager* tm);
 
  private:
-  std::string log_name_{""};
+  std::string log_name_;
   std::ifstream log_file_;
   PagePool* pool_{nullptr};
 };

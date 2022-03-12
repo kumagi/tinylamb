@@ -9,7 +9,7 @@ add_executable(tinylamb
         )
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined -fsanitize=bounds -fsanitize=address")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -O2")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -ggdb")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -ggdb -Wall -Wextra")
 
 set(CMAKE_C_COMPILER "/usr/bin/clang" CACHE STRING "clang compiler" FORCE)
 set(CMAKE_CXX_COMPILER "/usr/bin/clang++" CACHE STRING "clang++ compiler" FORCE)
@@ -47,7 +47,7 @@ add_library(libtinylamb
         table/fake_table.cpp plan/full_scan_plan.cpp
         plan/projection_plan.cpp plan/selection_plan.cpp plan/product_plan.cpp
         plan/plan.cpp expression/expression.cpp plan/optimizer.cpp
-        executor/cross_join.cpp table/table_statistics.cpp table/table_statistics.hpp)
+        executor/cross_join.cpp table/table_statistics.cpp)
 
 add_library(libtinylamb_test_util
         STATIC

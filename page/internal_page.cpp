@@ -36,7 +36,7 @@ const InternalPage::RowPointer* InternalPage::Rows() const {
                                              row_count_ * sizeof(RowPointer));
 }
 
-size_t InternalPage::RowCount() const { return row_count_; }
+bin_size_t InternalPage::RowCount() const { return row_count_; }
 
 void InternalPage::SetLowestValue(page_id_t pid, Transaction& txn,
                                   page_id_t value) {

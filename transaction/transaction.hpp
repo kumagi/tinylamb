@@ -20,8 +20,8 @@ class CheckpointManager;
 class PageManager;
 class Logger;
 class LockManager;
-class Row;
 struct LogRecord;
+struct Row;
 
 enum class TransactionStatus : uint_fast8_t {
   kUnknown,

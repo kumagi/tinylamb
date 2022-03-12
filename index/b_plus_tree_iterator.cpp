@@ -20,23 +20,23 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
   }
   if (ascending) {
     if (begin.empty()) {
-      PageRef leaf = tree->LeftmostPage(*txn);
+      PageRef leaf = tree->LeftmostPage(*txn_);
       pid_ = leaf->PageID();
       idx_ = 0;
     } else {
       PageRef leaf =
-          tree_->FindLeaf(*txn, begin, tree_->pm_->GetPage(tree_->root_));
+          tree_->FindLeaf(*txn_, begin, tree_->pm_->GetPage(tree_->root_));
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.Find(begin);
     }
   } else {
     if (end.empty()) {
-      PageRef leaf = tree->RightmostPage(*txn);
+      PageRef leaf = tree->RightmostPage(*txn_);
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.row_count_ - 1;
     } else {
       PageRef leaf =
-          tree_->FindLeaf(*txn, end, tree_->pm_->GetPage(tree_->root_));
+          tree_->FindLeaf(*txn_, end, tree_->pm_->GetPage(tree_->root_));
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.Find(end);
     }

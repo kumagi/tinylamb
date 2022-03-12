@@ -275,7 +275,6 @@ void LeafPage::Dump(std::ostream& o, int indent) const {
   o << "Rows: " << row_count_ << " Prev: " << prev_pid_
     << " Next: " << next_pid_ << " FreeSize: " << free_size_
     << " FreePtr:" << free_ptr_;
-  std::string_view out;
   for (size_t i = 0; i < row_count_; ++i) {
     o << "\n"
       << Indent(indent) << OmittedString(GetKey(i), 20) << ": "

@@ -97,7 +97,6 @@ void RowPage::UpdateRow(slot_t slot, std::string_view record) {
 
 Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
   if (row_count_ <= slot) return Status::kNotExists;
-  std::string_view prev_row = GetRow(slot);
   RowPosition pos(page_id, slot);
   if (!txn.AddWriteSet(pos)) return Status::kConflicts;
   txn.DeleteLog(page_id, slot, GetRow(slot));

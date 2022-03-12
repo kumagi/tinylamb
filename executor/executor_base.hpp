@@ -9,8 +9,8 @@
 #include "type/row.hpp"
 
 namespace tinylamb {
-class Row;
-class RowPosistion;
+struct Row;
+struct RowPosistion;
 
 class ExecutorBase {
  public:

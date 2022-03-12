@@ -18,11 +18,11 @@
 namespace tinylamb {
 
 class Transaction;
-class Row;
-class RowPosition;
 class PageManager;
 class Decoder;
 class Encoder;
+struct Row;
+struct RowPosition;
 
 class Table : public TableInterface {
  public:

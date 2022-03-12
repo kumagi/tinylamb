@@ -13,8 +13,8 @@
 #include "type/schema.hpp"
 
 namespace tinylamb {
-class Row;
 class ExecutorBase;
+struct Row;
 
 class CrossJoin : public ExecutorBase {
  public:

@@ -15,12 +15,12 @@ namespace tinylamb {
 
 class LockManager;
 class Logger;
-class LogRecord;
 class PageManager;
 class Transaction;
 class RecoveryManager;
-class RowPosition;
 enum class TransactionStatus : uint_fast8_t;
+struct LogRecord;
+struct RowPosition;
 
 class TransactionManager {
  public:

@@ -10,8 +10,8 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
-class Row;
 class Schema;
+struct Row;
 
 enum class TypeTag : int {
   kBinaryExp,

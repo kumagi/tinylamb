@@ -27,7 +27,7 @@ FullScanIterator::FullScanIterator(const Table* table, Transaction* txn)
 IteratorBase& FullScanIterator::operator++() {
   PageRef ref = [&]() {
     PageRef ref = table_->pm_->GetPage(pos_.page_id);
-    if (++pos_.slot < ref->RowCount()) return std::move(ref);
+    if (++pos_.slot < ref->RowCount()) return ref;
     pos_.page_id = ref->body.row_page.next_page_id_;
     ref.PageUnlock();
     if (pos_.page_id == 0) {
