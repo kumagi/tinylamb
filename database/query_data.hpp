@@ -26,7 +26,7 @@ struct QueryData {
       if (0 < i) o << ", ";
       o << q.from_[i];
     }
-    o << "\nWHERE\n  " << q.where_ << ";";
+    o << "\nWHERE\n  " << *q.where_ << ";";
     return o;
   }
   std::vector<std::string> from_;

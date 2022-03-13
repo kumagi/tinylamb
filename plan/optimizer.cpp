@@ -5,6 +5,7 @@
 #include "optimizer.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -67,6 +68,13 @@ std::unordered_set<std::string> And(const std::unordered_set<std::string>& a,
   return ret;
 }
 
+std::unordered_set<std::string> Or(const std::unordered_set<std::string>& a,
+                                   const std::unordered_set<std::string>& b) {
+  std::unordered_set<std::string> ret = a;
+  std::copy(b.begin(), b.end(), std::inserter(ret, ret.end()));
+  return ret;
+}
+
 bool ReferenceWithin(const ExpressionBase* ptr,
                      const std::unordered_set<std::string>& columns) {
   if (ptr->Type() == TypeTag::kBinaryExp) {
@@ -95,15 +103,15 @@ bool DoesTouchWithin(const ExpressionBase* ptr,
   return true;
 }
 
-Plan CalcTableSelection(const Schema& schema, const Expression& expression,
+Plan CalcTableSelection(const Schema& schema, const Expression& where,
                         const TableStatistics& stat) {
   // Generate expression for selection.
   std::unordered_set<std::string> columns = ColumnNames(schema);
-  if (expression->Type() == TypeTag::kBinaryExp) {
-    auto* be = reinterpret_cast<BinaryExpression*>(expression.get());
+  if (where->Type() == TypeTag::kBinaryExp) {
+    auto* be = reinterpret_cast<BinaryExpression*>(where.get());
     if (DoesTouchWithin(be->Left().get(), columns) &&
         DoesTouchWithin(be->Right().get(), columns)) {
-      return NewSelectionPlan(NewFullScanPlan(schema.Name(), stat), expression,
+      return NewSelectionPlan(NewFullScanPlan(schema.Name(), stat), where,
                               stat);
     }
     if (be->Op() == BinaryOperation::kAnd) {
@@ -123,14 +131,6 @@ bool ContainsAny(const std::unordered_set<std::string>& left,
   return std::any_of(left.begin(), left.end(), [&](const std::string& s) {
     return right.find(s) != right.end();
   });
-}
-
-std::unordered_set<std::string> JoinName(
-    const std::unordered_set<std::string>& left,
-    const std::unordered_set<std::string>& right) {
-  std::unordered_set<std::string> ret = left;
-  std::copy(right.begin(), right.end(), std::inserter(ret, ret.end()));
-  return ret;
 }
 
 void ExtractColumns(const Schema& sc, ExpressionBase* exp,
@@ -211,7 +211,6 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
   if (query.from_.empty()) throw std::runtime_error("No table specified");
   std::unordered_map<std::unordered_set<std::string>, CostAndPlan>
       optimal_plans;
-  std::unordered_map<std::string, TableStatistics> stats;
 
   // 1. Initialize every single tables to start.
   std::unordered_set<std::string> touched_columns;
@@ -226,19 +225,18 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
     // Get statistics.
     TableStatistics ts(tbl.GetSchema());
     ctx.c_->GetStatistics(ctx.txn_, from, &ts);
-    stats.emplace(from, ts);
 
     // Push down all selection & projection.
     std::vector<NamedExpression> project_target;
     for (const auto& col : And(touched_columns, ColumnNames(tbl.GetSchema()))) {
       project_target.emplace_back(col);
     }
-    optimal_plans.emplace(
-        std::unordered_set({from}),
-        CostAndPlan{100, NewProjectionPlan(CalcTableSelection(tbl.GetSchema(),
-                                                              query.where_, ts),
-                                           project_target)});
+    Plan np = NewProjectionPlan(
+        CalcTableSelection(tbl.GetSchema(), query.where_, ts), project_target);
+    optimal_plans.emplace(std::unordered_set({from}),
+                          CostAndPlan{np->AccessRowCount(ctx), np});
   }
+  assert(optimal_plans.size() == query.from_.size());
 
   // 2. Combine all tables to find the best combination;
   for (size_t i = 0; i < query.from_.size(); ++i) {
@@ -247,7 +245,8 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
         if (ContainsAny(base_table.first, join_table.first)) continue;
         Plan bj = BestJoin(ctx, query.where_, base_table, join_table);
         std::unordered_set<std::string> joined_tables =
-            JoinName(base_table.first, join_table.first);
+            Or(base_table.first, join_table.first);
+        assert(1 < joined_tables.size());
         size_t cost = bj->AccessRowCount(ctx);
         auto iter = optimal_plans.find(joined_tables);
         if (iter == optimal_plans.end()) {
@@ -258,6 +257,7 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
       }
     }
   }
+  assert(optimal_plans.find(Set(query.from_)) != optimal_plans.end());
 
   // 3. Attach final projection and emit the result.
   auto solution = optimal_plans.find(Set(query.from_))->second.plan;

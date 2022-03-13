@@ -5,6 +5,7 @@
 #ifndef TINYLAMB_EXPRESSION_HPP
 #define TINYLAMB_EXPRESSION_HPP
 
+#include <iosfwd>
 #include <memory>
 
 #include "type/value.hpp"
@@ -25,6 +26,10 @@ class ExpressionBase {
   [[nodiscard]] virtual TypeTag Type() const = 0;
   virtual Value Evaluate(const Row& row, Schema* schema) const = 0;
   virtual void Dump(std::ostream& o) const = 0;
+  friend std::ostream& operator<<(std::ostream& o, const ExpressionBase& e) {
+    e.Dump(o);
+    return o;
+  }
 };
 
 typedef std::shared_ptr<ExpressionBase> Expression;

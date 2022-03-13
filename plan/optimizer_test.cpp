@@ -8,7 +8,6 @@
 #include "database/query_data.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor.hpp"
-#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
