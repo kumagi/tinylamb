@@ -11,7 +11,7 @@
 
 #include "executor/named_expression.hpp"
 #include "expression/expression.hpp"
-#include "plan/plan_base.hpp"
+#include "plan/plan.hpp"
 
 namespace tinylamb {
 

@@ -91,9 +91,9 @@ TEST_F(ExecutorTest, Projection) {
 }
 
 TEST_F(ExecutorTest, Selection) {
-  Expression key_is_1 = Expression::BinaryExpression(
-      Expression::ColumnValue("key"), BinaryOperation::kEquals,
-      Expression::ConstantValue(Value(1)));
+  Expression key_is_1 =
+      BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(1)));
   Selection sel(key_is_1, schema_,
                 std::make_unique<FullScan>(fake_txn_, std::move(table_)));
   std::unordered_set rows({Row({Value(1), Value("world"), Value(4.9)})});

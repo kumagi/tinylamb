@@ -6,29 +6,26 @@
 #define TINYLAMB_BINARY_EXPRESSION_HPP
 
 #include <memory>
+#include <utility>
 
-#include "expression/expression_base.hpp"
+#include "expression/expression.hpp"
 
 namespace tinylamb {
 
 class BinaryExpression : public ExpressionBase {
-  BinaryExpression(std::shared_ptr<ExpressionBase> left, BinaryOperation op,
-                   std::shared_ptr<ExpressionBase> right)
-      : left_(std::move(left)), right_(std::move(right)), operation_(op) {}
-
  public:
+  BinaryExpression(Expression left, BinaryOperation op, Expression right)
+      : left_(std::move(left)), right_(std::move(right)), operation_(op) {}
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kBinaryExp; }
   Value Evaluate(const Row& row, Schema* schema) const override;
   void Dump(std::ostream& o) const override;
-  [[nodiscard]] std::shared_ptr<ExpressionBase> Left() const { return left_; }
+  [[nodiscard]] Expression Left() const { return left_; }
   [[nodiscard]] BinaryOperation Op() const { return operation_; }
-  [[nodiscard]] std::shared_ptr<ExpressionBase> Right() const { return right_; }
+  [[nodiscard]] Expression Right() const { return right_; }
 
  private:
-  friend class Expression;
-
-  std::shared_ptr<ExpressionBase> left_;
-  std::shared_ptr<ExpressionBase> right_;
+  Expression left_;
+  Expression right_;
   BinaryOperation operation_;
 };
 

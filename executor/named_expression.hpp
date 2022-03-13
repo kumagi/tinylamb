@@ -15,17 +15,17 @@ namespace tinylamb {
 
 struct NamedExpression {
   explicit NamedExpression(std::string_view name_)
-      : name(name_), expression(Expression::ColumnValue(name_)) {}
+      : name(name_), expression(ColumnValueExp(name_)) {}
   NamedExpression(std::string_view name_, std::string_view column_name)
-      : name(name_), expression(Expression::ColumnValue(column_name)) {}
+      : name(name_), expression(ColumnValueExp(column_name)) {}
   NamedExpression(std::string_view name_, Expression exp)
       : name(name_), expression(std::move(exp)) {}
 
   friend std::ostream& operator<<(std::ostream& o, const NamedExpression& ne) {
     o << ne.expression;
-    if (ne.expression.Type() == TypeTag::kColumnValue) {
+    if (ne.expression->Type() == TypeTag::kColumnValue) {
       const auto* cv =
-          reinterpret_cast<const ColumnValue*>(ne.expression.exp_.get());
+          reinterpret_cast<const ColumnValue*>(ne.expression.get());
       if (cv->ColumnName() != ne.name) {
         o << " AS " << ne.name;
       }

@@ -1,6 +1,8 @@
 //
 // Created by kumagi on 2022/03/01.
 //
+#include "plan/plan.hpp"
+
 #include "common/test_util.hpp"
 #include "database/catalog.hpp"
 #include "database/transaction_context.hpp"
@@ -8,7 +10,6 @@
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
-#include "plan/plan_base.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
 #include "table/table.hpp"
@@ -149,9 +150,9 @@ TEST_F(PlanTest, ProjectPlan) {
 
 TEST_F(PlanTest, SelectionPlan) {
   TableStatistics ts((Schema()));
-  Expression exp = Expression::BinaryExpression(
-      Expression::ColumnValue("c1"), BinaryOperation::kGreaterThanEquals,
-      Expression::ConstantValue(Value(100)));
+  Expression exp = BinaryExpressionExp(ColumnValueExp("c1"),
+                                       BinaryOperation::kGreaterThanEquals,
+                                       ConstantValueExp(Value(100)));
   Plan sp = NewSelectionPlan(NewFullScanPlan("Sc1", ts), exp, ts);
   DumpAll(*ctx_, sp);
 }

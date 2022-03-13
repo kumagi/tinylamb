@@ -7,7 +7,7 @@
 #include "database/catalog.hpp"
 #include "database/query_data.hpp"
 #include "database/transaction_context.hpp"
-#include "executor/executor_base.hpp"
+#include "executor/executor.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
@@ -138,9 +138,8 @@ void DumpAll(TransactionContext& ctx, const QueryData& qd) {
 TEST_F(OptimizerTest, Simple) {
   QueryData qd{
       {"Sc1"},
-      Expression(Expression::BinaryExpression(
-          Expression::ColumnValue("c1"), BinaryOperation::kEquals,
-          Expression::ConstantValue(Value(2)))),
+      BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(2))),
       {NamedExpression("c1"), NamedExpression("Column2Varchar", "c2")}};
   DumpAll(*ctx_, qd);
 }
@@ -148,9 +147,8 @@ TEST_F(OptimizerTest, Simple) {
 TEST_F(OptimizerTest, Join) {
   QueryData qd{
       {"Sc1", "Sc2"},
-      Expression(Expression::BinaryExpression(Expression::ColumnValue("c1"),
-                                              BinaryOperation::kEquals,
-                                              Expression::ColumnValue("d1"))),
+      BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                          ColumnValueExp("d1")),
       {NamedExpression("c2"), NamedExpression("d1"), NamedExpression("d3")}};
   DumpAll(*ctx_, qd);
 }
@@ -158,35 +156,31 @@ TEST_F(OptimizerTest, Join) {
 TEST_F(OptimizerTest, ThreeJoin) {
   QueryData qd{
       {"Sc1", "Sc2", "Sc3"},
-      Expression(Expression::BinaryExpression(
-          Expression::BinaryExpression(Expression::ColumnValue("c1"),
-                                       BinaryOperation::kEquals,
-                                       Expression::ColumnValue("d1")),
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                              ColumnValueExp("d1")),
           BinaryOperation::kAnd,
-          Expression::BinaryExpression(Expression::ColumnValue("d1"),
-                                       BinaryOperation::kEquals,
-                                       Expression::ColumnValue("e1")))),
+          BinaryExpressionExp(ColumnValueExp("d1"), BinaryOperation::kEquals,
+                              ColumnValueExp("e1"))),
 
       {NamedExpression("Sc1-c2", "c2"), NamedExpression("Sc2-e1", "e1"),
        NamedExpression("Sc3-d3", "d3"),
-       NamedExpression("e1+100", Expression::BinaryExpression(
-                                     Expression::ConstantValue(Value(100)),
-                                     BinaryOperation::kAdd,
-                                     Expression::ColumnValue("e1")))}};
+       NamedExpression(
+           "e1+100",
+           BinaryExpressionExp(ConstantValueExp(Value(100)),
+                               BinaryOperation::kAdd, ColumnValueExp("e1")))}};
   DumpAll(*ctx_, qd);
 }
 
 TEST_F(OptimizerTest, JoinWhere) {
   QueryData qd{
       {"Sc1", "Sc2"},
-      Expression(Expression::BinaryExpression(
-          Expression::BinaryExpression(Expression::ColumnValue("c1"),
-                                       BinaryOperation::kEquals,
-                                       Expression::ColumnValue("d1")),
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                              ColumnValueExp("d1")),
           BinaryOperation::kAnd,
-          Expression::BinaryExpression(Expression::ColumnValue("c1"),
-                                       BinaryOperation::kEquals,
-                                       Expression::ConstantValue(Value(2))))),
+          BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                              ConstantValueExp(Value(2)))),
       {NamedExpression("c1"), NamedExpression("c2"), NamedExpression("d1"),
        NamedExpression("d2"), NamedExpression("d3")}};
   DumpAll(*ctx_, qd);

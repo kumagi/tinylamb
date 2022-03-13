@@ -7,13 +7,12 @@
 
 #include <memory>
 
-#include "executor_base.hpp"
+#include "executor.hpp"
 #include "expression/expression.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
-class Expression;
 class ExpressionBase;
 
 class Selection : public ExecutorBase {

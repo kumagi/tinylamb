@@ -7,7 +7,7 @@
 #include <utility>
 
 #include "common/log_message.hpp"
-#include "expression/expression_base.hpp"
+#include "expression/expression.hpp"
 
 namespace tinylamb {
 
@@ -17,7 +17,7 @@ Selection::Selection(Expression exp, Schema schema, Executor src)
 bool Selection::Next(Row* dst, RowPosition* rp) {
   Row orig;
   while (src_->Next(&orig, nullptr)) {
-    Value result = exp_.Evaluate(orig, &schema_);
+    Value result = exp_->Evaluate(orig, &schema_);
     if (result.value.int_value) {
       *dst = orig;
       return true;

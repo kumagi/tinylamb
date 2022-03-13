@@ -32,8 +32,8 @@ Schema ProjectionPlan::GetSchema(TransactionContext& ctx) const {
       cols.emplace_back(columns_[i].name);
       continue;
     }
-    if (columns_[i].expression.Type() == TypeTag::kColumnValue) {
-      auto* cv = dynamic_cast<ColumnValue*>(columns_[i].expression.exp_.get());
+    if (columns_[i].expression->Type() == TypeTag::kColumnValue) {
+      auto* cv = dynamic_cast<ColumnValue*>(columns_[i].expression.get());
       cols.emplace_back(cv->col_name_);
       continue;
     }

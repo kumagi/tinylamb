@@ -36,8 +36,7 @@ class Transaction {
   friend class TransactionManager;
 
  public:
-  Transaction()
-      : txn_id_(-1), transaction_manager_(nullptr) {}  // For test purpose only.
+  Transaction() = default;  // For test purpose only.
   Transaction(txn_id_t txn_id, TransactionManager* tm);
   Transaction(const Transaction& o) = delete;
   Transaction(Transaction&& o) = default;
@@ -101,15 +100,15 @@ class Transaction {
   friend class CheckpointManager;
 
  private:
-  txn_id_t txn_id_;
+  txn_id_t txn_id_{static_cast<txn_id_t>(-1)};
 
   std::unordered_set<RowPosition> read_set_{};
   std::unordered_set<RowPosition> write_set_{};
-  lsn_t prev_lsn_;
+  lsn_t prev_lsn_{};
   TransactionStatus status_ = TransactionStatus::kUnknown;
 
   // Not owned by this class.
-  TransactionManager* transaction_manager_;
+  TransactionManager* transaction_manager_{nullptr};
 };
 
 }  // namespace tinylamb

@@ -5,14 +5,13 @@
 #ifndef TINYLAMB_COLUMN_VALUE_HPP
 #define TINYLAMB_COLUMN_VALUE_HPP
 
-#include "expression/expression_base.hpp"
+#include "expression/expression.hpp"
 
 namespace tinylamb {
 
 class ColumnValue : public ExpressionBase {
-  explicit ColumnValue(std::string_view col_name) : col_name_(col_name) {}
-
  public:
+  explicit ColumnValue(std::string_view col_name) : col_name_(col_name) {}
   ~ColumnValue() override = default;
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kColumnValue; }
   Value Evaluate(const Row& row, Schema* schema) const override;
@@ -20,7 +19,6 @@ class ColumnValue : public ExpressionBase {
   [[nodiscard]] std::string ColumnName() const { return col_name_; }
 
  private:
-  friend class Expression;
   friend class ProjectionPlan;
 
   std::string col_name_;

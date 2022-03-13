@@ -5,14 +5,13 @@
 #ifndef TINYLAMB_CONSTANT_VALUE_HPP
 #define TINYLAMB_CONSTANT_VALUE_HPP
 
-#include "expression/expression_base.hpp"
+#include "expression/expression.hpp"
 
 namespace tinylamb {
 
 class ConstantValue : public ExpressionBase {
-  explicit ConstantValue(const Value& v) : val_(v) {}
-
  public:
+  explicit ConstantValue(const Value& v) : val_(v) {}
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kConstant; }
   Value Evaluate(const Row&, Schema*) const override { return val_; }
   [[nodiscard]] Value GetValue() const { return val_; }
@@ -24,8 +23,6 @@ class ConstantValue : public ExpressionBase {
   void Dump(std::ostream& o) const override { o << val_; }
 
  private:
-  friend class Expression;
-
   Value val_;
 };
 

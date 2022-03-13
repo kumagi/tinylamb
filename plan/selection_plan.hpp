@@ -8,12 +8,11 @@
 #include <utility>
 
 #include "expression/expression.hpp"
-#include "plan/plan_base.hpp"
+#include "plan/plan.hpp"
 #include "table/table_statistics.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
-class Expression;
 
 class SelectionPlan : public PlanBase {
  public:

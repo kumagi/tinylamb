@@ -7,6 +7,7 @@
 
 #include <vector>
 
+#include "expression/expression.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -116,7 +117,7 @@ class TableStatistics {
  public:
   explicit TableStatistics(const Schema& sc);
   Status Update(Transaction& txn, const Table& target);
-  double ReductionFactor(const Schema& sc, ExpressionBase* predicate) const;
+  double ReductionFactor(const Schema& sc, const Expression& predicate) const;
 
   friend Encoder& operator<<(Encoder& e, const TableStatistics& t);
   friend Decoder& operator>>(Decoder& d, TableStatistics& t);

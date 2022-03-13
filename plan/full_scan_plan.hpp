@@ -5,7 +5,7 @@
 #ifndef TINYLAMB_FULL_SCAN_PLAN_HPP
 #define TINYLAMB_FULL_SCAN_PLAN_HPP
 
-#include "plan/plan_base.hpp"
+#include "plan/plan.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "type/schema.hpp"

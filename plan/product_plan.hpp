@@ -5,8 +5,8 @@
 #ifndef TINYLAMB_PRODUCT_PLAN_HPP
 #define TINYLAMB_PRODUCT_PLAN_HPP
 
-#include "expression/expression_base.hpp"
-#include "plan/plan_base.hpp"
+#include "expression/expression.hpp"
+#include "plan/plan.hpp"
 
 namespace tinylamb {
 class ExecutorBase;

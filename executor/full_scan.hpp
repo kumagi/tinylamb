@@ -7,7 +7,7 @@
 
 #include <memory>
 
-#include "executor/executor_base.hpp"
+#include "executor/executor.hpp"
 #include "page/row_position.hpp"
 #include "table/iterator.hpp"
 

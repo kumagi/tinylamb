@@ -8,8 +8,8 @@
 #include <memory>
 #include <unordered_map>
 
-#include "executor/executor_base.hpp"
-#include "expression/expression_base.hpp"
+#include "executor/executor.hpp"
+#include "expression/expression.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 

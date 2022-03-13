@@ -1,28 +1,29 @@
 //
-// Created by kumagi on 2022/03/02.
+// Created by kumagi on 2022/03/14.
 //
+
 #include "expression/expression.hpp"
+
+#include <memory>
 
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
-#include "type/value.hpp"
 
 namespace tinylamb {
 
-Expression Expression::ConstantValue(const Value& v) {
-  return Expression(new class ConstantValue(v));
+Expression ColumnValueExp(std::string_view col_name) {
+  return std::make_shared<ColumnValue>(col_name);
 }
 
-Expression Expression::BinaryExpression(Expression&& left,
-                                        BinaryOperation operation,
-                                        Expression&& right) {
-  return Expression(new class BinaryExpression(std::move(left.exp_), operation,
-                                               std::move(right.exp_)));
+Expression ConstantValueExp(const Value& v) {
+  return std::make_shared<ConstantValue>(v);
 }
 
-Expression Expression::ColumnValue(std::string_view column_name) {
-  return Expression(new class ColumnValue(column_name));
+Expression BinaryExpressionExp(Expression left, BinaryOperation op,
+                               Expression right) {
+  return std::make_shared<BinaryExpression>(std::move(left), op,
+                                            std::move(right));
 }
 
 }  // namespace tinylamb

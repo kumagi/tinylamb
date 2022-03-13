@@ -2,8 +2,8 @@
 // Created by kumagi on 2022/02/21.
 //
 
-#ifndef TINYLAMB_EXECUTOR_BASE_HPP
-#define TINYLAMB_EXECUTOR_BASE_HPP
+#ifndef TINYLAMB_EXECUTOR_HPP
+#define TINYLAMB_EXECUTOR_HPP
 
 #include <iosfwd>
 #include <memory>
@@ -23,4 +23,4 @@ typedef std::shared_ptr<ExecutorBase> Executor;
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_EXECUTOR_BASE_HPP
+#endif  // TINYLAMB_EXECUTOR_HPP

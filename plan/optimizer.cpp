@@ -13,7 +13,7 @@
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "full_scan_plan.hpp"
-#include "plan/plan_base.hpp"
+#include "plan/plan.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 
@@ -37,15 +37,15 @@ struct CostAndPlan {
   Plan plan;
 };
 
-void ExtractTouchedColumns(const ExpressionBase* ptr,
+void ExtractTouchedColumns(const Expression& exp,
                            std::unordered_set<std::string>& cols) {
-  if (ptr->Type() == TypeTag::kColumnValue) {
-    auto* cv = reinterpret_cast<const ColumnValue*>(ptr);
+  if (exp->Type() == TypeTag::kColumnValue) {
+    auto* cv = reinterpret_cast<const ColumnValue*>(exp.get());
     cols.emplace(cv->ColumnName());
-  } else if (ptr->Type() == TypeTag::kBinaryExp) {
-    auto* be = reinterpret_cast<const BinaryExpression*>(ptr);
-    ExtractTouchedColumns(be->Left().get(), cols);
-    ExtractTouchedColumns(be->Right().get(), cols);
+  } else if (exp->Type() == TypeTag::kBinaryExp) {
+    auto* be = reinterpret_cast<const BinaryExpression*>(exp.get());
+    ExtractTouchedColumns(be->Left(), cols);
+    ExtractTouchedColumns(be->Right(), cols);
   }
 }
 
@@ -99,8 +99,8 @@ Plan CalcTableSelection(const Schema& schema, const Expression& expression,
                         const TableStatistics& stat) {
   // Generate expression for selection.
   std::unordered_set<std::string> columns = ColumnNames(schema);
-  if (expression.Type() == TypeTag::kBinaryExp) {
-    auto* be = reinterpret_cast<BinaryExpression*>(expression.exp_.get());
+  if (expression->Type() == TypeTag::kBinaryExp) {
+    auto* be = reinterpret_cast<BinaryExpression*>(expression.get());
     if (DoesTouchWithin(be->Left().get(), columns) &&
         DoesTouchWithin(be->Right().get(), columns)) {
       return NewSelectionPlan(NewFullScanPlan(schema.Name(), stat), expression,
@@ -165,11 +165,11 @@ Plan BetterPlan(TransactionContext& ctx, Plan a, Plan b) {
 }
 
 Plan BestJoin(
-    TransactionContext& ctx, ExpressionBase* where,
+    TransactionContext& ctx, const Expression& where,
     const std::pair<std::unordered_set<std::string>, CostAndPlan>& left,
     const std::pair<std::unordered_set<std::string>, CostAndPlan>& right) {
   if (where->Type() == TypeTag::kBinaryExp) {
-    auto* be = reinterpret_cast<BinaryExpression*>(where);
+    auto* be = reinterpret_cast<BinaryExpression*>(where.get());
     if (be->Op() == BinaryOperation::kEquals) {
       Schema left_schema = left.second.plan->GetSchema(ctx);
       std::unordered_set<std::string> left_column_names =
@@ -191,8 +191,8 @@ Plan BestJoin(
                                          left.second.plan, left_cols));
       }
     } else if (be->Op() == BinaryOperation::kAnd) {
-      return BetterPlan(ctx, BestJoin(ctx, be->Left().get(), left, right),
-                        BestJoin(ctx, be->Right().get(), left, right));
+      return BetterPlan(ctx, BestJoin(ctx, be->Left(), left, right),
+                        BestJoin(ctx, be->Right(), left, right));
     }
   }
   return NewProductPlan(left.second.plan, right.second.plan);
@@ -215,9 +215,9 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
 
   // 1. Initialize every single tables to start.
   std::unordered_set<std::string> touched_columns;
-  ExtractTouchedColumns(query.where_.exp_.get(), touched_columns);
+  ExtractTouchedColumns(query.where_, touched_columns);
   for (const auto& sel : query.select_) {
-    ExtractTouchedColumns(sel.expression.exp_.get(), touched_columns);
+    ExtractTouchedColumns(sel.expression, touched_columns);
   }
   for (const auto& from : query.from_) {
     Table tbl(ctx.pm_);
@@ -245,8 +245,7 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
     for (const auto& base_table : optimal_plans) {
       for (const auto& join_table : optimal_plans) {
         if (ContainsAny(base_table.first, join_table.first)) continue;
-        Plan bj =
-            BestJoin(ctx, query.where_.exp_.get(), base_table, join_table);
+        Plan bj = BestJoin(ctx, query.where_, base_table, join_table);
         std::unordered_set<std::string> joined_tables =
             JoinName(base_table.first, join_table.first);
         size_t cost = bj->AccessRowCount(ctx);

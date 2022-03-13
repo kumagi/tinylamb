@@ -239,9 +239,9 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
 // `predicate`. If the predicate selects rows to 1 / x, returns x.
 // Returning 1 means no selection (pass through).
 double TableStatistics::ReductionFactor(const Schema& sc,
-                                        ExpressionBase* predicate) const {
+                                        const Expression& predicate) const {
   if (predicate->Type() == TypeTag::kBinaryExp) {
-    const auto* bo = reinterpret_cast<const BinaryExpression*>(predicate);
+    const auto* bo = reinterpret_cast<const BinaryExpression*>(predicate.get());
     std::unordered_set<std::string> columns = sc.ColumnSet();
     if (bo->Op() == BinaryOperation::kEquals) {
       if (bo->Left()->Type() == TypeTag::kColumnValue &&
@@ -283,13 +283,11 @@ double TableStatistics::ReductionFactor(const Schema& sc,
       }
     }
     if (bo->Op() == BinaryOperation::kAnd) {
-      return ReductionFactor(sc, bo->Left().get()) *
-             ReductionFactor(sc, bo->Right().get());
+      return ReductionFactor(sc, bo->Left()) * ReductionFactor(sc, bo->Right());
     }
     if (bo->Op() == BinaryOperation::kOr) {
       // FIXME: what should I return?
-      return ReductionFactor(sc, bo->Left().get()) +
-             ReductionFactor(sc, bo->Right().get());
+      return ReductionFactor(sc, bo->Left()) + ReductionFactor(sc, bo->Right());
     }
     // TODO: kGreaterThan, kGreaterEqual, kLessThan, kLessEqual, kNotEqual, kXor
   }
