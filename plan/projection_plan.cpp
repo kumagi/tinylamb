@@ -17,14 +17,13 @@ ProjectionPlan::ProjectionPlan(Plan src,
                                std::vector<NamedExpression> project_columns)
     : src_(std::move(src)), columns_(std::move(project_columns)) {}
 
-std::unique_ptr<ExecutorBase> ProjectionPlan::EmitExecutor(
-    TransactionContext& ctx) const {
-  return std::make_unique<Projection>(columns_, src_.GetSchema(ctx),
-                                      src_.EmitExecutor(ctx));
+Executor ProjectionPlan::EmitExecutor(TransactionContext& ctx) const {
+  return std::make_shared<Projection>(columns_, src_->GetSchema(ctx),
+                                      src_->EmitExecutor(ctx));
 }
 
 Schema ProjectionPlan::GetSchema(TransactionContext& ctx) const {
-  Schema original_schema = src_.GetSchema(ctx);
+  Schema original_schema = src_->GetSchema(ctx);
 
   std::vector<Column> cols;
   cols.reserve(columns_.size());
@@ -45,11 +44,11 @@ Schema ProjectionPlan::GetSchema(TransactionContext& ctx) const {
 }
 
 size_t ProjectionPlan::AccessRowCount(TransactionContext& ctx) const {
-  return src_.EmitRowCount(ctx);
+  return src_->EmitRowCount(ctx);
 }
 
 size_t ProjectionPlan::EmitRowCount(TransactionContext& ctx) const {
-  return src_.EmitRowCount(ctx);
+  return src_->EmitRowCount(ctx);
 }
 
 void ProjectionPlan::Dump(std::ostream& o, int indent) const {
@@ -59,6 +58,6 @@ void ProjectionPlan::Dump(std::ostream& o, int indent) const {
     o << columns_[i];
   }
   o << "}\n" << Indent(indent + 2);
-  src_.Dump(o, indent + 2);
+  src_->Dump(o, indent + 2);
 }
 }  // namespace tinylamb

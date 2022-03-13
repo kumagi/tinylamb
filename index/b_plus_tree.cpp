@@ -48,7 +48,7 @@ Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
       const InternalPage& root_page = root->body.internal_page;
       PageRef new_left = pm_->AllocateNewPage(txn, PageType::kInternalPage);
       new_left->SetLowestValue(txn, root_page.lowest_page_);
-      for (int i = 0; i < root->RowCount(); ++i) {
+      for (slot_t i = 0; i < root->RowCount(); ++i) {
         new_left->Insert(txn, root_page.GetKey(i), root_page.GetValue(i));
       }
       while (0 < root_page.RowCount()) {
@@ -60,7 +60,7 @@ Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
       assert(root->Type() == PageType::kLeafPage);
       PageRef new_left = pm_->AllocateNewPage(txn, PageType::kLeafPage);
       const LeafPage& root_page = root->body.leaf_page;
-      for (int i = 0; i < root->body.leaf_page.RowCount(); ++i) {
+      for (slot_t i = 0; i < root->body.leaf_page.RowCount(); ++i) {
         new_left->Insert(txn, root_page.GetKey(i), root_page.GetValue(i));
       }
       PageRef right_page = pm_->GetPage(right);
@@ -177,7 +177,7 @@ std::string OmittedString(std::string_view original, int length) {
   if (20 < original.length()) {
     std::string omitted_key = std::string(original).substr(0, 8);
     omitted_key +=
-        "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
+        "..(" + std::to_string(original.length() - 20 + 4) + "bytes)..";
     omitted_key += original.substr(original.length() - 8);
     return omitted_key;
   } else {
@@ -189,7 +189,7 @@ void DumpLeafPage(Transaction& txn, PageRef&& page, std::ostream& o,
                   int indent) {
   o << "L[" << page->PageID() << "]: ";
   indent += 2 + std::to_string(page->PageID()).size() + 3;
-  for (int i = 0; i < page->RowCount(); ++i) {
+  for (slot_t i = 0; i < page->RowCount(); ++i) {
     if (0 < i) o << Indent(indent);
     std::string_view key;
     page->ReadKey(txn, i, &key);
@@ -208,7 +208,7 @@ void BPlusTree::DumpInternal(Transaction& txn, std::ostream& o, PageRef&& page,
   } else if (page->Type() == PageType::kInternalPage) {
     DumpInternal(txn, o, pm_->GetPage(page->body.internal_page.lowest_page_),
                  indent + 4);
-    for (int i = 0; i < page->RowCount(); ++i) {
+    for (slot_t i = 0; i < page->RowCount(); ++i) {
       std::string_view key;
       page->ReadKey(txn, i, &key);
       o << Indent(indent) << "I[" << page->PageID()

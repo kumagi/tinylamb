@@ -1,21 +1,13 @@
 #include "catalog.hpp"
 
-#include <cstdint>
-#include <sstream>
-#include <string>
-
 #include "common/encoder.hpp"
-#include "common/log_message.hpp"
-// #include "page/catalog_page.hpp"
 #include "index/b_plus_tree_iterator.hpp"
 #include "page/page.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
-#include "page/row_page.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "transaction/transaction.hpp"
-#include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value_type.hpp"
 

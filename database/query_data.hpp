@@ -17,12 +17,12 @@ struct QueryData {
  public:
   friend std::ostream& operator<<(std::ostream& o, const QueryData& q) {
     o << "SELECT\n  ";
-    for (int i = 0; i < q.select_.size(); ++i) {
+    for (size_t i = 0; i < q.select_.size(); ++i) {
       if (0 < i) o << ", ";
       o << q.select_[i];
     }
     o << "\nFROM\n  ";
-    for (int i = 0; i < q.from_.size(); ++i) {
+    for (size_t i = 0; i < q.from_.size(); ++i) {
       if (0 < i) o << ", ";
       o << q.from_[i];
     }

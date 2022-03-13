@@ -1,21 +1,17 @@
 //
 // Created by kumagi on 2022/03/01.
 //
-#include "plan/plan.hpp"
-
 #include "common/test_util.hpp"
 #include "database/catalog.hpp"
 #include "database/transaction_context.hpp"
-#include "expression/binary_expression.hpp"
-#include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
+#include "plan/plan_base.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
 #include "table/table.hpp"
-#include "table/table_interface.hpp"
 #include "table/table_statistics.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
@@ -102,8 +98,6 @@ class PlanTest : public ::testing::Test {
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
-    cm_ = std::make_unique<CheckpointManager>(kMasterRecordName, tm_.get(),
-                                              p_->GetPool(), 1);
     catalog_ = std::make_unique<Catalog>(1, 2, p_.get());
   }
 
@@ -123,19 +117,18 @@ class PlanTest : public ::testing::Test {
   std::unique_ptr<Logger> l_;
   std::unique_ptr<RecoveryManager> r_;
   std::unique_ptr<TransactionManager> tm_;
-  std::unique_ptr<CheckpointManager> cm_;
   std::unique_ptr<Catalog> catalog_;
   std::unique_ptr<TransactionContext> ctx_;
 };
 
 TEST_F(PlanTest, Construct) {}
 
-void DumpAll(TransactionContext& ctx, Plan& plan) {
-  plan.Dump(std::cout, 0);
+void DumpAll(TransactionContext& ctx, const Plan& plan) {
+  plan->Dump(std::cout, 0);
   std::cout << "\n";
-  std::unique_ptr<ExecutorBase> scan = plan.EmitExecutor(ctx);
+  Executor scan = plan->EmitExecutor(ctx);
   Row result;
-  std::cout << plan.GetSchema(ctx) << "\n";
+  std::cout << plan->GetSchema(ctx) << "\n";
   while (scan->Next(&result, nullptr)) {
     std::cout << result << "\n";
   }
@@ -143,14 +136,14 @@ void DumpAll(TransactionContext& ctx, Plan& plan) {
 
 TEST_F(PlanTest, ScanPlan) {
   TableStatistics ts((Schema()));
-  Plan fs = Plan::FullScan("Sc1", ts);
+  Plan fs = NewFullScanPlan("Sc1", ts);
   DumpAll(*ctx_, fs);
 }
 
 TEST_F(PlanTest, ProjectPlan) {
   TableStatistics ts((Schema()));
   Plan pp =
-      Plan::Projection(Plan::FullScan("Sc1", ts), {NamedExpression("c1")});
+      NewProjectionPlan(NewFullScanPlan("Sc1", ts), {NamedExpression("c1")});
   DumpAll(*ctx_, pp);
 }
 
@@ -159,21 +152,21 @@ TEST_F(PlanTest, SelectionPlan) {
   Expression exp = Expression::BinaryExpression(
       Expression::ColumnValue("c1"), BinaryOperation::kGreaterThanEquals,
       Expression::ConstantValue(Value(100)));
-  Plan sp = Plan::Selection(Plan::FullScan("Sc1", ts), std::move(exp), ts);
+  Plan sp = NewSelectionPlan(NewFullScanPlan("Sc1", ts), exp, ts);
   DumpAll(*ctx_, sp);
 }
 
 TEST_F(PlanTest, ProductPlan) {
   TableStatistics ts((Schema()));
-  Plan prop = Plan::Product(Plan::FullScan("Sc1", ts), {0},
-                            Plan::FullScan("Sc2", ts), {0});
+  Plan prop = NewProductPlan(NewFullScanPlan("Sc1", ts), {0},
+                             NewFullScanPlan("Sc2", ts), {0});
   DumpAll(*ctx_, prop);
 }
 
 TEST_F(PlanTest, ProductPlanCrossJoin) {
   TableStatistics ts((Schema()));
   Plan prop =
-      Plan::Product(Plan::FullScan("Sc1", ts), Plan::FullScan("Sc2", ts));
+      NewProductPlan(NewFullScanPlan("Sc1", ts), NewFullScanPlan("Sc2", ts));
   DumpAll(*ctx_, prop);
 }
 

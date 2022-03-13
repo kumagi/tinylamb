@@ -46,8 +46,8 @@ add_library(libtinylamb
         expression/column_value.cpp executor/hash_join.cpp common/decoder.cpp
         table/fake_table.cpp plan/full_scan_plan.cpp
         plan/projection_plan.cpp plan/selection_plan.cpp plan/product_plan.cpp
-        plan/plan.cpp expression/expression.cpp plan/optimizer.cpp
-        executor/cross_join.cpp table/table_statistics.cpp)
+        expression/expression.cpp plan/optimizer.cpp
+        executor/cross_join.cpp table/table_statistics.cpp plan/plan_base.cpp)
 
 add_library(libtinylamb_test_util
         STATIC

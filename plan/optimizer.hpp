@@ -8,6 +8,7 @@
 #include <memory>
 
 #include "database/query_data.hpp"
+#include "executor/executor_base.hpp"
 
 namespace tinylamb {
 class ExecutorBase;
@@ -18,7 +19,7 @@ class Optimizer {
   explicit Optimizer() = default;
 
   Status Optimize(const QueryData& query, TransactionContext& ctx,
-                  Schema& schema, std::unique_ptr<ExecutorBase>& exec);
+                  Schema& schema, Executor& exec);
 };
 
 }  // namespace tinylamb

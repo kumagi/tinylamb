@@ -52,7 +52,7 @@ TEST_F(PagePoolTest, EvictPage) {
 
 TEST_F(PagePoolTest, PersistencyWithReset) {
   constexpr size_t kPages = 11;
-  for (char i = 0; i < kPages; ++i) {
+  for (size_t i = 0; i < kPages; ++i) {
     PageRef p = pp->GetPage(i, nullptr);
     char* buff = p->body.free_page.FreeBody();
     ASSERT_NE(buff, nullptr);
@@ -61,7 +61,7 @@ TEST_F(PagePoolTest, PersistencyWithReset) {
     }
   }
   // Reset();
-  for (int i = 0; i < kPages; ++i) {
+  for (size_t i = 0; i < kPages; ++i) {
     PageRef p = pp->GetPage(i, nullptr);
     char* buff = p->body.free_page.FreeBody();
     ASSERT_NE(buff, nullptr);

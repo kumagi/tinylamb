@@ -6,7 +6,7 @@
 #define TINYLAMB_DEBUG_HPP
 
 #include <iomanip>
-#include <iostream>
+#include <iosfwd>
 #include <sstream>
 
 namespace tinylamb {

@@ -100,7 +100,7 @@ TEST_F(RowPageTest, DeleteMany) {
   ASSERT_EQ(GetRowCount(), kRows - deleted);
   Flush();
   Recover();
-  for (int i = 0; i < GetRowCount(); ++i) {
+  for (size_t i = 0; i < GetRowCount(); ++i) {
     std::string got_row = ReadRow(i);
     ASSERT_NE(inserted.find(got_row), inserted.end());
     inserted.erase(got_row);

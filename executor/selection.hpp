@@ -18,8 +18,7 @@ class ExpressionBase;
 
 class Selection : public ExecutorBase {
  public:
-  Selection(Expression& exp, Schema schema,
-            std::unique_ptr<ExecutorBase>&& src);
+  Selection(Expression exp, Schema schema, Executor src);
   ~Selection() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
@@ -27,7 +26,7 @@ class Selection : public ExecutorBase {
  private:
   Expression exp_;
   Schema schema_;
-  std::unique_ptr<ExecutorBase> src_;
+  Executor src_;
 };
 }  // namespace tinylamb
 

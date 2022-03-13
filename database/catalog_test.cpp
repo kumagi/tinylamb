@@ -8,7 +8,6 @@
 #include "page/page_manager.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
-#include "table/fake_table.hpp"
 #include "table/table.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"

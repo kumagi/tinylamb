@@ -17,10 +17,10 @@ namespace tinylamb {
 class Projection : public ExecutorBase {
  public:
   Projection(std::vector<NamedExpression> expressions, Schema input_schema,
-             std::unique_ptr<ExecutorBase> src)
+             const Executor& src)
       : expressions_(std::move(expressions)),
         input_schema_(std::move(input_schema)),
-        src_(std::move(src)) {}
+        src_(src) {}
   ~Projection() override = default;
 
   bool Next(Row* dst, RowPosition* rp) override;
@@ -29,7 +29,7 @@ class Projection : public ExecutorBase {
  private:
   std::vector<NamedExpression> expressions_;
   Schema input_schema_;
-  std::unique_ptr<ExecutorBase> src_;
+  Executor src_;
 };
 
 }  // namespace tinylamb

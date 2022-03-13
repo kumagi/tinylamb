@@ -8,8 +8,6 @@
 #include "database/query_data.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
-#include "expression/binary_expression.hpp"
-#include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
@@ -127,7 +125,7 @@ void DumpAll(TransactionContext& ctx, const QueryData& qd) {
   std::cout << qd << "\n\n";
   Optimizer opt;
   Schema sc;
-  std::unique_ptr<ExecutorBase> exec;
+  Executor exec;
   opt.Optimize(qd, ctx, sc, exec);
   exec->Dump(std::cout, 0);
   std::cout << "\n\n" << sc << "\n";

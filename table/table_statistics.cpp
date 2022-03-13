@@ -45,10 +45,10 @@ class Int64DistinctCounter : public DistinctCounterBase {
     counter_.insert(v);
     ++count;
   }
-  void Add(std::string_view v) override {
+  void Add(std::string_view) override {
     assert(!"called Add(varchar) to int counter");
   }
-  void Add(double v) override {
+  void Add(double) override {
     assert(!"called Add(double) to integer counter");
   }
   void Output(IntegerColumnStats& o) override {
@@ -57,10 +57,10 @@ class Int64DistinctCounter : public DistinctCounterBase {
     o.count = count;
     o.distinct = counter_.size();
   }
-  void Output(VarcharColumnStats& o) override {
+  void Output(VarcharColumnStats&) override {
     assert(!"called Output(varchar) to int counter");
   }
-  void Output(DoubleColumnStats& o) override {
+  void Output(DoubleColumnStats&) override {
     assert(!"called Output(double) to int counter");
   }
   int64_t max{};
@@ -78,7 +78,7 @@ class VarcharDistinctCounter : public DistinctCounterBase {
     count = 0;
     counter_.clear();
   }
-  void Add(int64_t v) override {
+  void Add(int64_t) override {
     assert(!"called Add(int64) to varchar counter");
   }
   void Add(std::string_view v) override {
@@ -88,10 +88,10 @@ class VarcharDistinctCounter : public DistinctCounterBase {
     count++;
     counter_.insert(std::string(v));
   }
-  void Add(double v) override {
+  void Add(double) override {
     assert(!"called Add(double) to varchar counter");
   }
-  void Output(IntegerColumnStats& o) override {
+  void Output(IntegerColumnStats&) override {
     assert(!"called Output(int64) to varchar counter");
   }
   void Output(VarcharColumnStats& o) override {
@@ -100,7 +100,7 @@ class VarcharDistinctCounter : public DistinctCounterBase {
     o.count = count;
     o.distinct = counter_.size();
   }
-  void Output(DoubleColumnStats& o) override {
+  void Output(DoubleColumnStats&) override {
     assert(!"called Output(double) to varchar counter");
   }
 
@@ -120,7 +120,7 @@ class DoubleDistinctCounter : public DistinctCounterBase {
     counter_.clear();
   }
   void Add(int64_t) override { assert(!"called Add(int64) to double counter"); }
-  void Add(std::string_view v) override {
+  void Add(std::string_view) override {
     assert(!"called Add(varchar) to double counter");
   }
   void Add(double v) override {
@@ -129,10 +129,10 @@ class DoubleDistinctCounter : public DistinctCounterBase {
     count++;
     counter_.insert(v);
   }
-  void Output(IntegerColumnStats& o) override {
+  void Output(IntegerColumnStats&) override {
     assert(!"called Output(int64) to double counter");
   }
-  void Output(VarcharColumnStats& o) override {
+  void Output(VarcharColumnStats&) override {
     assert(!"called Output(varchar) to double counter");
   }
   void Output(DoubleColumnStats& o) override {

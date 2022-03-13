@@ -11,12 +11,12 @@
 
 #include "executor/named_expression.hpp"
 #include "expression/expression.hpp"
-#include "plan/plan.hpp"
 #include "plan/plan_base.hpp"
 
 namespace tinylamb {
 
 class ProjectionPlan : public PlanBase {
+ public:
   ProjectionPlan(Plan src, std::vector<NamedExpression> project_columns);
   ProjectionPlan(Plan src, const std::vector<std::string>& project_columns)
       : src_(std::move(std::move(src))) {
@@ -26,11 +26,9 @@ class ProjectionPlan : public PlanBase {
     }
   }
 
- public:
   ~ProjectionPlan() override = default;
 
-  std::unique_ptr<ExecutorBase> EmitExecutor(
-      TransactionContext& ctx) const override;
+  Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] Schema GetSchema(TransactionContext& ctx) const override;
 
   [[nodiscard]] size_t AccessRowCount(TransactionContext& txn) const override;
@@ -38,8 +36,6 @@ class ProjectionPlan : public PlanBase {
   void Dump(std::ostream& o, int indent) const override;
 
  private:
-  friend class Plan;
-
   Plan src_;
   std::vector<NamedExpression> columns_;
 };

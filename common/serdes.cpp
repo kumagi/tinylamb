@@ -4,11 +4,8 @@
 
 #include "common/serdes.hpp"
 
-#include <cassert>
 #include <cstring>
 #include <sstream>
-
-#include "common/log_message.hpp"
 
 namespace tinylamb {
 

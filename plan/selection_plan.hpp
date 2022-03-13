@@ -8,22 +8,20 @@
 #include <utility>
 
 #include "expression/expression.hpp"
-#include "plan.hpp"
 #include "plan/plan_base.hpp"
 #include "table/table_statistics.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
-class Plan;
 class Expression;
 
 class SelectionPlan : public PlanBase {
  public:
-  ~SelectionPlan() override = default;
   SelectionPlan(Plan src, Expression exp, TableStatistics stat)
       : src_(std::move(src)), exp_(std::move(exp)), stats_(std::move(stat)) {}
-  std::unique_ptr<ExecutorBase> EmitExecutor(
-      TransactionContext& ctx) const override;
+
+  ~SelectionPlan() override = default;
+  Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] Schema GetSchema(TransactionContext& ctx) const override;
 
   [[nodiscard]] size_t AccessRowCount(TransactionContext& txn) const override;
@@ -31,8 +29,8 @@ class SelectionPlan : public PlanBase {
   void Dump(std::ostream& o, int indent) const override;
 
  private:
-  mutable Plan src_;
-  mutable Expression exp_;
+  Plan src_;
+  Expression exp_;
   TableStatistics stats_;
 };
 

@@ -81,7 +81,7 @@ class RowPage {
 
   page_id_t prev_page_id_ = 0;
   page_id_t next_page_id_ = 0;
-  int16_t row_count_ = 0;
+  slot_t row_count_ = 0;
   bin_size_t free_ptr_ = kPageSize;
   bin_size_t free_size_ = kPageSize - sizeof(RowPage);
   RowPointer data_[0];

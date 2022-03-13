@@ -6,13 +6,11 @@
 
 namespace tinylamb {
 
-HashJoin::HashJoin(std::unique_ptr<ExecutorBase>&& left,
-                   std::vector<size_t> left_cols,
-                   std::unique_ptr<ExecutorBase>&& right,
-                   std::vector<size_t> right_cols)
-    : left_(std::move(left)),
+HashJoin::HashJoin(const Executor& left, std::vector<size_t> left_cols,
+                   const Executor& right, std::vector<size_t> right_cols)
+    : left_(left),
       left_cols_(std::move(left_cols)),
-      right_(std::move(right)),
+      right_(right),
       right_cols_(std::move(right_cols)) {}
 
 bool HashJoin::Next(Row* dst, RowPosition* rp) {

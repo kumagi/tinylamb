@@ -11,9 +11,8 @@
 
 namespace tinylamb {
 
-Selection::Selection(Expression& exp, Schema schema,
-                     std::unique_ptr<ExecutorBase>&& src)
-    : exp_(exp), schema_(std::move(schema)), src_(std::move(src)) {}
+Selection::Selection(Expression exp, Schema schema, Executor src)
+    : exp_(std::move(exp)), schema_(std::move(schema)), src_(std::move(src)) {}
 
 bool Selection::Next(Row* dst, RowPosition* rp) {
   Row orig;

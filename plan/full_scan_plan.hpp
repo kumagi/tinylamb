@@ -17,8 +17,7 @@ class FullScanPlan : public PlanBase {
   explicit FullScanPlan(std::string_view table_name, TableStatistics ts);
   ~FullScanPlan() override = default;
 
-  std::unique_ptr<ExecutorBase> EmitExecutor(
-      TransactionContext& txn) const override;
+  Executor EmitExecutor(TransactionContext& txn) const override;
 
   [[nodiscard]] Schema GetSchema(TransactionContext& txn) const override;
 
@@ -28,7 +27,6 @@ class FullScanPlan : public PlanBase {
 
  private:
   std::string table_name_;
-  mutable std::unique_ptr<Table> tbl_;
   TableStatistics stats_;
 };
 

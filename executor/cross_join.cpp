@@ -6,11 +6,10 @@
 
 namespace tinylamb {
 
-CrossJoin::CrossJoin(std::unique_ptr<ExecutorBase>&& left,
-                     std::unique_ptr<ExecutorBase>&& right)
+CrossJoin::CrossJoin(Executor left, Executor right)
     : left_(std::move(left)), right_(std::move(right)) {}
 
-bool CrossJoin::Next(Row* dst, RowPosition* rp) {
+bool CrossJoin::Next(Row* dst, RowPosition*) {
   if (!table_constructed_) TableConstruct();
   if (right_iter_ == right_table_.end()) {
     if (!left_->Next(&hold_left_, nullptr)) return false;

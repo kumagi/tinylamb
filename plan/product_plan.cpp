@@ -23,34 +23,33 @@ ProductPlan::ProductPlan(Plan left_src, std::vector<size_t> left_cols,
 ProductPlan::ProductPlan(Plan left_src, Plan right_src)
     : left_src_(std::move(left_src)), right_src_(std::move(right_src)) {}
 
-std::unique_ptr<ExecutorBase> ProductPlan::EmitExecutor(
-    TransactionContext& ctx) const {
+Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
   if (left_cols_.empty() && right_cols_.empty()) {
-    return std::make_unique<CrossJoin>(left_src_.EmitExecutor(ctx),
-                                       right_src_.EmitExecutor(ctx));
+    return std::make_shared<CrossJoin>(left_src_->EmitExecutor(ctx),
+                                       right_src_->EmitExecutor(ctx));
   }
-  return std::make_unique<HashJoin>(left_src_.EmitExecutor(ctx), left_cols_,
-                                    right_src_.EmitExecutor(ctx), right_cols_);
+  return std::make_shared<HashJoin>(left_src_->EmitExecutor(ctx), left_cols_,
+                                    right_src_->EmitExecutor(ctx), right_cols_);
 }
 
 [[nodiscard]] Schema ProductPlan::GetSchema(TransactionContext& ctx) const {
-  return left_src_.GetSchema(ctx) + right_src_.GetSchema(ctx);
+  return left_src_->GetSchema(ctx) + right_src_->GetSchema(ctx);
 }
 
 size_t ProductPlan::AccessRowCount(TransactionContext& ctx) const {
   if (left_cols_.empty() && right_cols_.empty()) {
-    return left_src_.AccessRowCount(ctx) +
-           (1 + left_src_.EmitRowCount(ctx) * right_src_.AccessRowCount(ctx));
+    return left_src_->AccessRowCount(ctx) +
+           (1 + left_src_->EmitRowCount(ctx) * right_src_->AccessRowCount(ctx));
   }
   // Cost of hash join.
-  return left_src_.AccessRowCount(ctx) + right_src_.AccessRowCount(ctx);
+  return left_src_->AccessRowCount(ctx) + right_src_->AccessRowCount(ctx);
 }
 
 size_t ProductPlan::EmitRowCount(TransactionContext& ctx) const {
   if (left_cols_.empty() && right_cols_.empty()) {
-    return left_src_.EmitRowCount(ctx) * right_src_.EmitRowCount(ctx);
+    return left_src_->EmitRowCount(ctx) * right_src_->EmitRowCount(ctx);
   }
-  return std::min(left_src_.EmitRowCount(ctx), right_src_.EmitRowCount(ctx));
+  return std::min(left_src_->EmitRowCount(ctx), right_src_->EmitRowCount(ctx));
 }
 
 void ProductPlan::Dump(std::ostream& o, int indent) const {
@@ -69,9 +68,9 @@ void ProductPlan::Dump(std::ostream& o, int indent) const {
     o << "} ";
   }
   o << "\n" << Indent(indent + 2);
-  left_src_.Dump(o, indent + 2);
+  left_src_->Dump(o, indent + 2);
   o << "\n" << Indent(indent + 2);
-  right_src_.Dump(o, indent + 2);
+  right_src_->Dump(o, indent + 2);
 }
 
 }  // namespace tinylamb

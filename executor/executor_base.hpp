@@ -5,12 +5,12 @@
 #ifndef TINYLAMB_EXECUTOR_BASE_HPP
 #define TINYLAMB_EXECUTOR_BASE_HPP
 
-#include "page/row_position.hpp"
-#include "type/row.hpp"
+#include <iosfwd>
+#include <memory>
 
 namespace tinylamb {
 struct Row;
-struct RowPosistion;
+struct RowPosition;
 
 class ExecutorBase {
  public:
@@ -18,6 +18,8 @@ class ExecutorBase {
   virtual ~ExecutorBase() = default;
   virtual void Dump(std::ostream& o, int indent) const = 0;
 };
+
+typedef std::shared_ptr<ExecutorBase> Executor;
 
 }  // namespace tinylamb
 

@@ -12,7 +12,8 @@
 #include "database/transaction_context.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
-#include "plan.hpp"
+#include "full_scan_plan.hpp"
+#include "plan/plan_base.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 
@@ -32,7 +33,7 @@ namespace tinylamb {
 namespace {
 
 struct CostAndPlan {
-  int cost;
+  size_t cost;
   Plan plan;
 };
 
@@ -102,8 +103,8 @@ Plan CalcTableSelection(const Schema& schema, const Expression& expression,
     auto* be = reinterpret_cast<BinaryExpression*>(expression.exp_.get());
     if (DoesTouchWithin(be->Left().get(), columns) &&
         DoesTouchWithin(be->Right().get(), columns)) {
-      return Plan::Selection(Plan::FullScan(schema.Name(), stat), expression,
-                             stat);
+      return NewSelectionPlan(NewFullScanPlan(schema.Name(), stat), expression,
+                              stat);
     }
     if (be->Op() == BinaryOperation::kAnd) {
       if (DoesTouchWithin(be->Left().get(), columns)) {
@@ -114,7 +115,7 @@ Plan CalcTableSelection(const Schema& schema, const Expression& expression,
       }
     }
   }
-  return Plan::FullScan(schema.Name(), stat);
+  return NewFullScanPlan(schema.Name(), stat);
 }
 
 bool ContainsAny(const std::unordered_set<std::string>& left,
@@ -156,27 +157,26 @@ std::vector<size_t> TargetColumns(const Schema& sc, ExpressionBase* exp) {
 }
 
 Plan BetterPlan(TransactionContext& ctx, Plan a, Plan b) {
-  if (a.AccessRowCount(ctx) < b.AccessRowCount(ctx)) {
+  if (a->AccessRowCount(ctx) < b->AccessRowCount(ctx)) {
     return a;
   } else {
     return b;
   }
 }
 
-Plan BestJoin(TransactionContext& ctx, ExpressionBase* where,
-              const std::pair<std::unordered_set<std::string>,
-                              CostAndPlan>& left,
-              const std::pair<std::unordered_set<std::string>,
-                              CostAndPlan>& right) {
+Plan BestJoin(
+    TransactionContext& ctx, ExpressionBase* where,
+    const std::pair<std::unordered_set<std::string>, CostAndPlan>& left,
+    const std::pair<std::unordered_set<std::string>, CostAndPlan>& right) {
   if (where->Type() == TypeTag::kBinaryExp) {
     auto* be = reinterpret_cast<BinaryExpression*>(where);
     if (be->Op() == BinaryOperation::kEquals) {
-      Schema left_schema = left.second.plan.GetSchema(ctx);
+      Schema left_schema = left.second.plan->GetSchema(ctx);
       std::unordered_set<std::string> left_column_names =
           ColumnNames(left_schema);
-      Schema right_schema = right.second.plan.GetSchema(ctx);
+      Schema right_schema = right.second.plan->GetSchema(ctx);
       std::unordered_set<std::string> right_column_names =
-          ColumnNames(right.second.plan.GetSchema(ctx));
+          ColumnNames(right.second.plan->GetSchema(ctx));
       if (ReferenceWithin(be->Left().get(), left_column_names) &&
           ReferenceWithin(be->Right().get(), right_column_names)) {
         // We can use HashJoin!
@@ -185,17 +185,17 @@ Plan BestJoin(TransactionContext& ctx, ExpressionBase* where,
         std::vector<size_t> right_cols =
             TargetColumns(right_schema, be->Right().get());
         return BetterPlan(ctx,
-                          Plan::Product(left.second.plan, left_cols,
-                                        right.second.plan, right_cols),
-                          Plan::Product(right.second.plan, right_cols,
-                                        left.second.plan, left_cols));
+                          NewProductPlan(left.second.plan, left_cols,
+                                         right.second.plan, right_cols),
+                          NewProductPlan(right.second.plan, right_cols,
+                                         left.second.plan, left_cols));
       }
     } else if (be->Op() == BinaryOperation::kAnd) {
       return BetterPlan(ctx, BestJoin(ctx, be->Left().get(), left, right),
                         BestJoin(ctx, be->Right().get(), left, right));
     }
   }
-  return Plan::Product(left.second.plan, right.second.plan);
+  return NewProductPlan(left.second.plan, right.second.plan);
 }
 
 std::unordered_set<std::string> Set(const std::vector<std::string>& from) {
@@ -207,8 +207,7 @@ std::unordered_set<std::string> Set(const std::vector<std::string>& from) {
 }  // anonymous namespace
 
 Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
-                           Schema& schema,
-                           std::unique_ptr<ExecutorBase>& exec) {
+                           Schema& schema, Executor& exec) {
   if (query.from_.empty()) throw std::runtime_error("No table specified");
   std::unordered_map<std::unordered_set<std::string>, CostAndPlan>
       optimal_plans;
@@ -236,9 +235,9 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
     }
     optimal_plans.emplace(
         std::unordered_set({from}),
-        CostAndPlan{100, Plan::Projection(
-            CalcTableSelection(tbl.GetSchema(), query.where_, ts),
-                     project_target)});
+        CostAndPlan{100, NewProjectionPlan(CalcTableSelection(tbl.GetSchema(),
+                                                              query.where_, ts),
+                                           project_target)});
   }
 
   // 2. Combine all tables to find the best combination;
@@ -250,7 +249,7 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
             BestJoin(ctx, query.where_.exp_.get(), base_table, join_table);
         std::unordered_set<std::string> joined_tables =
             JoinName(base_table.first, join_table.first);
-        int cost = bj.AccessRowCount(ctx);
+        size_t cost = bj->AccessRowCount(ctx);
         auto iter = optimal_plans.find(joined_tables);
         if (iter == optimal_plans.end()) {
           optimal_plans.emplace(joined_tables, CostAndPlan{cost, bj});
@@ -263,9 +262,9 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
 
   // 3. Attach final projection and emit the result.
   auto solution = optimal_plans.find(Set(query.from_))->second.plan;
-  solution = Plan::Projection(solution, query.select_);
-  schema = solution.GetSchema(ctx);
-  exec = solution.EmitExecutor(ctx);
+  solution = NewProjectionPlan(solution, query.select_);
+  schema = solution->GetSchema(ctx);
+  exec = solution->EmitExecutor(ctx);
   return Status::kSuccess;
 }
 

@@ -13,44 +13,42 @@
 
 namespace tinylamb {
 
-Status FakeTable::Insert(Transaction& txn, const Row& row, RowPosition* rp) {
+Status FakeTable::Insert(Transaction&, const Row& row, RowPosition* rp) {
   table_.push_back(row);
   rp->page_id = 1;
   rp->slot = table_.size() - 1;
   return Status::kSuccess;
 }
 
-Status FakeTable::Update(Transaction& txn, RowPosition pos, const Row& row) {
+Status FakeTable::Update(Transaction&, RowPosition pos, const Row& row) {
   if (table_.size() <= pos.slot) return Status::kNotExists;
   table_[pos.slot] = row;
   return Status::kSuccess;
 }
 
-Status FakeTable::Delete(Transaction& txn, RowPosition pos) {
+Status FakeTable::Delete(Transaction&, RowPosition pos) {
   if (table_.size() <= pos.slot) return Status::kNotExists;
   table_.erase(table_.begin() + pos.slot);
   return Status::kSuccess;
 }
 
-Status FakeTable::Read(Transaction& txn, RowPosition pos, Row* result) const {
+Status FakeTable::Read(Transaction&, RowPosition pos, Row* result) const {
   if (table_.size() <= pos.slot) return Status::kNotExists;
   *result = table_[pos.slot];
   return Status::kSuccess;
 }
 
-Status FakeTable::ReadByKey(Transaction& txn, std::string_view index_name,
-                            const Row& keys, Row* result) const {
+Status FakeTable::ReadByKey(Transaction&, std::string_view, const Row&,
+                            Row*) const {
   return Status::kNotExists;
 }
 
-Iterator FakeTable::BeginFullScan(Transaction& txn) const {
+Iterator FakeTable::BeginFullScan(Transaction&) const {
   return Iterator(new FakeIterator(table_));
 }
 
-Iterator FakeTable::BeginIndexScan(Transaction& txn,
-                                   std::string_view index_name,
-                                   const Row& begin, const Row& end,
-                                   bool ascending) {
+Iterator FakeTable::BeginIndexScan(Transaction&, std::string_view, const Row&,
+                                   const Row&, bool) {
   assert(!"not implemented");
 }
 

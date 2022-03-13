@@ -4,7 +4,8 @@
 
 #include "page/row_page_fuzzer.hpp"
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
+                                                       size_t size) {
   if (size < 2) return 0;
   static tinylamb::RowPageEnvironment env;
   env.Initialize();

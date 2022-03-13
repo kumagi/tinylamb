@@ -10,15 +10,15 @@
 
 #include "executor/executor_base.hpp"
 #include "expression/expression_base.hpp"
+#include "type/row.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
 
 class HashJoin : public ExecutorBase {
  public:
-  HashJoin(std::unique_ptr<ExecutorBase>&& left, std::vector<size_t> left_cols,
-           std::unique_ptr<ExecutorBase>&& right,
-           std::vector<size_t> right_cols);
+  HashJoin(const Executor& left, std::vector<size_t> left_cols,
+           const Executor& right, std::vector<size_t> right_cols);
 
   ~HashJoin() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
@@ -28,9 +28,9 @@ class HashJoin : public ExecutorBase {
   void BucketConstruct();
 
  private:
-  std::unique_ptr<ExecutorBase> left_;
+  Executor left_;
   std::vector<size_t> left_cols_;
-  std::unique_ptr<ExecutorBase> right_;
+  Executor right_;
   std::vector<size_t> right_cols_;
 
   Row hold_left_;

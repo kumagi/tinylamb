@@ -10,9 +10,10 @@
 
 using tinylamb::Value;
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
+                                                       size_t size) {
   if (size < 2) return 0;
-  for (int i = 1; i < size - 1; ++i) {
+  for (size_t i = 1; i < size - 1; ++i) {
     std::string left(reinterpret_cast<const char*>(data), i);
     std::string right(reinterpret_cast<const char*>(data + i), size - i);
     Value l(std::move(left)), r(std::move(right));

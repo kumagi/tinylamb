@@ -85,7 +85,7 @@ TEST_F(BPlusTreeTest, InsertLeaf) {
   ASSERT_SUCCESS(bpt_->Insert(txn, "this", "is a pen"));
   ASSERT_SUCCESS(bpt_->Insert(txn, "lorem", "ipsum"));
   ASSERT_SUCCESS(bpt_->Insert(txn, "foo", "bar"));
-  ASSERT_SUCCESS(bpt_->Insert(txn, "key", "blar"));
+  ASSERT_SUCCESS(bpt_->Insert(txn, "key", "blah"));
   ASSERT_SUCCESS(txn.PreCommit());
 }
 
@@ -228,7 +228,7 @@ TEST_F(BPlusTreeTest, Crash) {
   }
 
   page_id_t max_page = p_->GetPage(0)->body.meta_page.MaxPageCountForTest();
-  for (int i = 0; i < max_page; i += 2) {
+  for (size_t i = 0; i < max_page; i += 2) {
     Flush(i);
   }
   Recover();
@@ -262,7 +262,7 @@ TEST_F(BPlusTreeTest, CheckPoint) {
     txn.PreCommit();
   }
   page_id_t max_page = p_->GetPage(0)->body.meta_page.MaxPageCountForTest();
-  for (int i = 0; i < max_page; i += 5) {
+  for (size_t i = 0; i < max_page; i += 5) {
     Flush(i);
   }
   Recover();

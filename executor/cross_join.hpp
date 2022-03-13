@@ -10,16 +10,15 @@
 
 #include "executor/executor_base.hpp"
 #include "expression/expression_base.hpp"
+#include "type/row.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
-class ExecutorBase;
 struct Row;
 
 class CrossJoin : public ExecutorBase {
  public:
-  CrossJoin(std::unique_ptr<ExecutorBase>&& left,
-            std::unique_ptr<ExecutorBase>&& right);
+  CrossJoin(Executor left, Executor right);
 
   bool Next(Row* dst, RowPosition* rp) override;
   ~CrossJoin() override = default;
@@ -30,14 +29,15 @@ class CrossJoin : public ExecutorBase {
   void TableConstruct();
 
  private:
-  std::unique_ptr<ExecutorBase> left_;
-  std::unique_ptr<ExecutorBase> right_;
+  Executor left_;
+  Executor right_;
 
   Row hold_left_;
   bool table_constructed_{false};
   std::vector<Row> right_table_;
   std::vector<Row>::iterator right_iter_;
 };
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_CROSS_JOIN_HPP
