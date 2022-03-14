@@ -26,8 +26,8 @@ class Value {
 
   [[nodiscard]] size_t Size() const;
 
+  // Read/Write without type info.
   size_t Serialize(char* dst) const;
-
   size_t Deserialize(const char* src, ValueType as_type);
 
   [[nodiscard]] std::string EncodeMemcomparableFormat() const;
@@ -53,6 +53,8 @@ class Value {
   [[nodiscard]] std::string AsString() const;
   Value& operator=(const Value& rhs);
   friend std::ostream& operator<<(std::ostream& o, const Value& v);
+
+  // Read/Write with type info.
   friend Encoder& operator<<(Encoder& o, const Value& v);
   friend Decoder& operator>>(Decoder& o, Value& v);
 

@@ -16,7 +16,8 @@ class LogRecordTest : public ::testing::Test {
     std::string serialized_log = log.Serialize();
     std::istringstream ss(serialized_log, std::istringstream::binary);
     LogRecord parsed_log;
-    LogRecord::ParseLogRecord(ss, &parsed_log);
+    Decoder dec(ss);
+    dec >> parsed_log;
     EXPECT_EQ(log, parsed_log);
   }
 };

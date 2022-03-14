@@ -47,15 +47,6 @@ size_t DeserializeStringView(const char* pos, std::string_view* out) {
   return sizeof(len) + len;
 }
 
-size_t DeserializeString(std::istream& in, std::string* out) {
-  out->clear();
-  bin_size_t len;
-  in.read(reinterpret_cast<char*>(&len), sizeof(len));
-  out->resize(len);
-  in.read(out->data(), len);
-  return sizeof(len) + len;
-}
-
 size_t DeserializeSlot(const char* pos, slot_t* out) {
   memcpy(out, pos, sizeof(*out));
   return sizeof(slot_t);

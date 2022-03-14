@@ -10,6 +10,8 @@
 #include <functional>
 #include <thread>
 
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
@@ -32,7 +34,7 @@ class CheckpointManager {
 
   void WorkerThreadTask();
   struct ActiveTransactionEntry {
-    ActiveTransactionEntry() {}
+    ActiveTransactionEntry() = default;
     ActiveTransactionEntry(uint64_t id, TransactionStatus st, lsn_t lsn)
         : txn_id(id), status(st), last_lsn(lsn) {}
     friend std::ostream& operator<<(std::ostream& o,
@@ -42,27 +44,14 @@ class CheckpointManager {
       return o;
     }
 
-    size_t Serialize(char* dst) const {
-      memcpy(dst, &txn_id, sizeof(txn_id));
-      dst += sizeof(txn_id);
-      memcpy(dst, &status, sizeof(status));
-      dst += sizeof(status);
-      memcpy(dst, &last_lsn, sizeof(last_lsn));
-      dst += sizeof(last_lsn);
-      return Size();
+    friend Encoder& operator<<(Encoder& e, const ActiveTransactionEntry& t) {
+      e << t.txn_id << (uint_fast8_t)t.status << t.last_lsn;
+      return e;
     }
-
-    static size_t Deserialize(std::istream& in, ActiveTransactionEntry* dst) {
-      txn_id_t tid;
-      in.read(reinterpret_cast<char*>(&tid), sizeof(tid));
-      TransactionStatus status;
-      in.read(reinterpret_cast<char*>(&status), sizeof(status));
-      lsn_t last_lsn;
-      in.read(reinterpret_cast<char*>(&last_lsn), sizeof(last_lsn));
-      *dst = {tid, status, last_lsn};
-      return Size();
+    friend Decoder& operator>>(Decoder& d, ActiveTransactionEntry& t) {
+      d >> t.txn_id >> (uint_fast8_t&)t.status >> t.last_lsn;
+      return d;
     }
-
     static size_t Size() {
       return sizeof(txn_id_t) + sizeof(TransactionStatus) + sizeof(lsn_t);
     }

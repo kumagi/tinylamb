@@ -16,64 +16,12 @@ enum KeyTypes : uint8_t {
   kHasKey = 0x4,
 };
 
-enum ValueTypes : uint8_t {
-  kHasPageRef = 0x1,
-  kHasBinary = 0x2,
-};
-
 template <typename T>
 void Read(std::istream& in, T& dst) {
   in.read(reinterpret_cast<char*>(&dst), sizeof(T));
 }
 
-void PidSlotKeyDeserialize(std::istream& in, tinylamb::LogRecord& out) {
-  uint8_t types;
-  Read(in, types);
-  if (types & KeyTypes::kHasPageID) {
-    Read(in, out.pid);
-  }
-  if (types & KeyTypes::kHasSlot) {
-    Read(in, out.slot);
-  }
-  if (types & KeyTypes::kHasKey) {
-    tinylamb::DeserializeString(in, &out.key);
-  }
-}
-
-size_t PidSlotKeySize(const tinylamb::LogRecord& lr) {
-  size_t offset = 1;
-  if (lr.HasPageID()) {
-    offset += sizeof(tinylamb::page_id_t);
-  }
-  if (lr.HasSlot()) {
-    offset += sizeof(tinylamb::slot_t);
-  }
-  if (!lr.key.empty()) {
-    offset += sizeof(tinylamb::bin_size_t) + lr.key.length();
-  }
-  return offset;
-}
-
-size_t PidSlotKeySerialize(char* pos, const tinylamb::LogRecord& lr) {
-  uint8_t types = 0;
-  size_t offset = 1;
-  if (lr.HasPageID()) {
-    types |= KeyTypes::kHasPageID;
-    offset += tinylamb::SerializePID(pos + offset, lr.pid);
-  }
-  if (lr.HasSlot()) {
-    types |= KeyTypes::kHasSlot;
-    offset += tinylamb::SerializeSlot(pos + offset, lr.slot);
-  }
-  if (!lr.key.empty()) {
-    types |= KeyTypes::kHasKey;
-    offset += tinylamb::SerializeStringView(pos + offset, lr.key);
-  }
-  *reinterpret_cast<uint8_t*>(pos) = types;
-  return offset;
-}
-
-std::string OmittedString(std::string_view original, int length) {
+std::string OmittedString(std::string_view original, size_t length) {
   if (length < original.length()) {
     std::string omitted_key = std::string(original).substr(0, 8);
     omitted_key +=
@@ -263,84 +211,6 @@ std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
 
 LogRecord::LogRecord(lsn_t prev, txn_id_t txn, LogType t)
     : type(t), prev_lsn(prev), txn_id(txn) {}
-
-bool LogRecord::ParseLogRecord(std::istream& in, tinylamb::LogRecord* dst) {
-  dst->Clear();
-  Read(in, dst->type);
-  Read(in, dst->prev_lsn);
-  Read(in, dst->txn_id);
-  PidSlotKeyDeserialize(in, *dst);
-  switch (dst->type) {
-    case LogType::kBegin:
-    case LogType::kCommit:
-    case LogType::kBeginCheckpoint:
-    case LogType::kCompensateInsertInternal:
-    case LogType::kSystemDestroyPage:
-    case LogType::kCompensateInsertRow:
-    case LogType::kCompensateInsertLeaf:
-      return true;
-    case LogType::kInsertRow:
-    case LogType::kInsertLeaf:
-    case LogType::kCompensateUpdateRow:
-    case LogType::kCompensateUpdateLeaf:
-    case LogType::kCompensateDeleteRow:
-    case LogType::kCompensateDeleteLeaf:
-      DeserializeString(in, &dst->redo_data);
-      return true;
-    case LogType::kUpdateRow:
-    case LogType::kUpdateLeaf:
-    case LogType::kSetPrevNext:
-      DeserializeString(in, &dst->redo_data);
-      DeserializeString(in, &dst->undo_data);
-      return true;
-    case LogType::kDeleteRow:
-    case LogType::kDeleteLeaf:
-      DeserializeString(in, &dst->undo_data);
-      return true;
-    case LogType::kInsertInternal:
-    case LogType::kCompensateUpdateInternal:
-    case LogType::kCompensateDeleteInternal:
-    case LogType::kLowestValue:
-      Read(in, dst->redo_page);
-      return true;
-    case LogType::kUpdateInternal:
-      Read(in, dst->redo_page);
-      Read(in, dst->undo_page);
-      return true;
-    case LogType::kDeleteInternal:
-      Read(in, dst->undo_page);
-      return true;
-    case LogType::kSystemAllocPage:
-      Read(in, dst->allocated_page_type);
-      return true;
-    case LogType::kEndCheckpoint: {
-      uint64_t dpt_size;
-      Read(in, dpt_size);
-      dst->dirty_page_table.reserve(dpt_size);
-      for (size_t i = 0; i < dpt_size; ++i) {
-        page_id_t dirty_page_id;
-        lsn_t recovery_lsn;
-        Read(in, dirty_page_id);
-        Read(in, recovery_lsn);
-        dst->dirty_page_table.emplace_back(dirty_page_id, recovery_lsn);
-      }
-
-      uint64_t tt_size;
-      Read(in, tt_size);
-      dst->active_transaction_table.reserve(tt_size);
-      for (size_t i = 0; i < tt_size; ++i) {
-        CheckpointManager::ActiveTransactionEntry ate;
-        CheckpointManager::ActiveTransactionEntry::Deserialize(in, &ate);
-        dst->active_transaction_table.push_back(ate);
-      }
-      return true;
-    }
-    default:
-      LOG(ERROR) << "unknown log type: " << dst->type;
-      assert(!"unknown log");
-  }
-  assert(!"never reach here");
-}
 
 LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                         slot_t slot, std::string_view r) {
@@ -666,7 +536,17 @@ void LogRecord::Clear() {
 
 size_t LogRecord::Size() const {
   size_t size = sizeof(type) + sizeof(prev_lsn) + sizeof(txn_id);
-  size += PidSlotKeySize(*this);
+  size_t offset = 1;
+  if ((*this).HasPageID()) {
+    offset += sizeof(page_id_t);
+  }
+  if ((*this).HasSlot()) {
+    offset += sizeof(slot_t);
+  }
+  if (!(*this).key.empty()) {
+    offset += sizeof(bin_size_t) + (*this).key.length();
+  }
+  size += offset;
   switch (type) {
     case LogType::kUnknown:
       assert(!"Don't call Size() of unknown log");
@@ -720,18 +600,22 @@ size_t LogRecord::Size() const {
   return size;
 }
 
-[[nodiscard]] std::string LogRecord::Serialize() const {
-  const size_t length = Size();
-  std::string result(length, 0);
-  size_t offset = 0;
-  memcpy(result.data() + offset, &type, sizeof(type));
-  offset += sizeof(type);
-  memcpy(result.data() + offset, &prev_lsn, sizeof(prev_lsn));
-  offset += sizeof(prev_lsn);
-  memcpy(result.data() + offset, &txn_id, sizeof(txn_id));
-  offset += sizeof(txn_id);
-  offset += PidSlotKeySerialize(result.data() + offset, *this);
-  switch (type) {
+Encoder& operator<<(Encoder& e, const LogRecord& l) {
+  e << (uint16_t&)l.type << l.prev_lsn << l.txn_id;
+  const uint8_t types = (l.HasPageID() ? kHasPageID : 0) |
+                        (l.HasSlot() ? kHasSlot : 0) |
+                        (!l.key.empty() ? kHasKey : 0);
+  e << types;
+  if (l.HasPageID()) {
+    e << l.pid;
+  }
+  if (l.HasSlot()) {
+    e << l.slot;
+  }
+  if (!l.key.empty()) {
+    e << l.key;
+  }
+  switch (l.type) {
     case LogType::kUnknown:
       assert(!"unknown type log must not be serialized");
     case LogType::kInsertRow:
@@ -740,51 +624,35 @@ size_t LogRecord::Size() const {
     case LogType::kCompensateUpdateRow:
     case LogType::kCompensateDeleteRow:
     case LogType::kCompensateDeleteLeaf:
-      offset += SerializeStringView(result.data() + offset, redo_data);
+      e << l.redo_data;
       break;
     case LogType::kUpdateLeaf:
     case LogType::kUpdateRow:
     case LogType::kSetPrevNext:
-      offset += SerializeStringView(result.data() + offset, redo_data);
-      offset += SerializeStringView(result.data() + offset, undo_data);
+      e << l.redo_data << l.undo_data;
       break;
     case LogType::kDeleteLeaf:
     case LogType::kDeleteRow:
-      offset += SerializeStringView(result.data() + offset, undo_data);
+      e << l.undo_data;
       break;
     case LogType::kInsertInternal:
     case LogType::kCompensateUpdateInternal:
     case LogType::kCompensateDeleteInternal:
     case LogType::kLowestValue:
-      offset += SerializePID(result.data() + offset, redo_page);
+      e << l.redo_page;
       break;
     case LogType::kUpdateInternal:
-      offset += SerializePID(result.data() + offset, redo_page);
-      offset += SerializePID(result.data() + offset, undo_page);
+      e << l.redo_page << l.undo_page;
       break;
     case LogType::kDeleteInternal:
-      offset += SerializePID(result.data() + offset, undo_page);
+      e << l.undo_page;
       break;
     case LogType::kEndCheckpoint: {
-      uint64_t dpt_size = dirty_page_table.size();
-      memcpy(result.data() + offset, &dpt_size, sizeof(dpt_size));
-      offset += sizeof(dpt_size);
-      for (const auto& dpt : dirty_page_table) {
-        offset += SerializePID(result.data() + offset, dpt.first);
-        offset += SerializePID(result.data() + offset, dpt.second);
-      }
-      const uint64_t tt_size = active_transaction_table.size();
-      memcpy(result.data() + offset, &tt_size, sizeof(tt_size));
-      offset += sizeof(tt_size);
-      for (const auto& tt : active_transaction_table) {
-        offset += tt.Serialize(result.data() + offset);
-      }
+      e << l.dirty_page_table << l.active_transaction_table;
       break;
     }
     case LogType::kSystemAllocPage:
-      memcpy(result.data() + offset, &allocated_page_type,
-             sizeof(allocated_page_type));
-      offset += sizeof(allocated_page_type);
+      e << (uint64_t&)l.allocated_page_type;
       break;
     case LogType::kBeginCheckpoint:
     case LogType::kCompensateInsertRow:
@@ -796,18 +664,88 @@ size_t LogRecord::Size() const {
       // Nothing to do.
       break;
   }
-  // LOG(ERROR) << offset << " : " << Size();
-  assert(offset == Size());
-  return result;
+  return e;
 }
 
-bool LogRecord::operator==(const LogRecord& rhs) const {
-  return type == rhs.type && prev_lsn == rhs.prev_lsn && txn_id == rhs.txn_id &&
-         pid == rhs.pid && slot == rhs.slot && undo_data == rhs.undo_data &&
-         redo_data == rhs.redo_data &&
-         dirty_page_table == rhs.dirty_page_table &&
-         redo_page == rhs.redo_page && undo_page == rhs.undo_page &&
-         active_transaction_table == rhs.active_transaction_table;
+Decoder& operator>>(Decoder& d, LogRecord& l) {
+  l.Clear();
+  d >> (uint16_t&)l.type >> l.prev_lsn >> l.txn_id;
+  uint8_t types;
+  d >> types;
+  if (types & kHasPageID) {
+    d >> l.pid;
+  }
+  if (types & kHasSlot) {
+    d >> l.slot;
+  }
+  if (types & kHasKey) {
+    d >> l.key;
+  }
+  switch (l.type) {
+    case LogType::kBegin:
+    case LogType::kCommit:
+    case LogType::kBeginCheckpoint:
+    case LogType::kCompensateInsertInternal:
+    case LogType::kSystemDestroyPage:
+    case LogType::kCompensateInsertRow:
+    case LogType::kCompensateInsertLeaf:
+      break;
+    case LogType::kInsertRow:
+    case LogType::kInsertLeaf:
+    case LogType::kCompensateUpdateRow:
+    case LogType::kCompensateUpdateLeaf:
+    case LogType::kCompensateDeleteRow:
+    case LogType::kCompensateDeleteLeaf:
+      d >> l.redo_data;
+      break;
+    case LogType::kUpdateRow:
+    case LogType::kUpdateLeaf:
+    case LogType::kSetPrevNext:
+      d >> l.redo_data >> l.undo_data;
+      break;
+    case LogType::kDeleteRow:
+    case LogType::kDeleteLeaf:
+      d >> l.undo_data;
+      break;
+    case LogType::kInsertInternal:
+    case LogType::kCompensateUpdateInternal:
+    case LogType::kCompensateDeleteInternal:
+    case LogType::kLowestValue:
+      d >> l.redo_page;
+      break;
+    case LogType::kUpdateInternal:
+      d >> l.redo_page >> l.undo_page;
+      break;
+    case LogType::kDeleteInternal:
+      d >> l.undo_page;
+      break;
+    case LogType::kSystemAllocPage:
+      d >> (uint64_t&)l.allocated_page_type;
+      break;
+    case LogType::kEndCheckpoint: {
+      d >> l.dirty_page_table >> l.active_transaction_table;
+      break;
+    }
+    default:
+      LOG(ERROR) << "unknown log type: " << l.type;
+      assert(!"unknown log");
+  }
+  return d;
+}
+
+std::string LogRecord::Serialize() const {
+  std::stringstream ss;
+  Encoder enc(ss);
+  enc << *this;
+  return ss.str();
+}
+
+bool LogRecord::operator==(const LogRecord& r) const {
+  return std::tie(type, prev_lsn, txn_id, pid, slot, undo_data, redo_data,
+                  dirty_page_table, redo_page, active_transaction_table) ==
+         std::tie(r.type, r.prev_lsn, r.txn_id, r.pid, r.slot, r.undo_data,
+                  r.redo_data, r.dirty_page_table, r.redo_page,
+                  r.active_transaction_table);
 }
 
 void LogRecord::DumpPosition(std::ostream& o) const {

@@ -377,7 +377,10 @@ bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
   dst->Clear();
   std::istream in(log_file_.rdbuf());
   in.seekg(lsn);
-  return LogRecord::ParseLogRecord(in, dst);
+  if (!in.good()) return false;
+  Decoder dec(in);
+  dec >> *dst;
+  return true;
 }
 
 void RecoveryManager::LogUndoWithPage(lsn_t lsn, const LogRecord& log,

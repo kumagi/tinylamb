@@ -101,6 +101,7 @@ lsn_t Transaction::UpdateLog(page_id_t pid, slot_t slot, std::string_view undo,
       LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, slot, redo, undo));
   return prev_lsn_;
 }
+
 lsn_t Transaction::UpdateLeafLog(page_id_t pid, std::string_view key,
                                  std::string_view undo, std::string_view redo) {
   assert(!IsFinished());
@@ -108,6 +109,7 @@ lsn_t Transaction::UpdateLeafLog(page_id_t pid, std::string_view key,
       prev_lsn_, txn_id_, pid, key, redo, undo));
   return prev_lsn_;
 }
+
 lsn_t Transaction::UpdateInternalLog(page_id_t pid, std::string_view key,
                                      page_id_t undo, page_id_t redo) {
   assert(!IsFinished());
@@ -124,6 +126,7 @@ lsn_t Transaction::DeleteLog(page_id_t pid, slot_t slot,
   prev_lsn_ = transaction_manager_->AddLog(lr);
   return prev_lsn_;
 }
+
 lsn_t Transaction::DeleteLeafLog(page_id_t pid, std::string_view key,
                                  std::string_view undo) {
   assert(!IsFinished());
@@ -132,6 +135,7 @@ lsn_t Transaction::DeleteLeafLog(page_id_t pid, std::string_view key,
   prev_lsn_ = transaction_manager_->AddLog(lr);
   return prev_lsn_;
 }
+
 lsn_t Transaction::DeleteInternalLog(page_id_t pid, std::string_view key,
                                      page_id_t undo) {
   assert(!IsFinished());

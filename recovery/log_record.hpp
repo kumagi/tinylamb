@@ -6,6 +6,8 @@
 #include <utility>
 
 #include "checkpoint_manager.hpp"
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "page/page.hpp"
 
 namespace tinylamb {
@@ -57,8 +59,6 @@ struct LogRecord {
   [[nodiscard]] bool HasPageID() const {
     return pid != std::numeric_limits<page_id_t>::max();
   }
-
-  static bool ParseLogRecord(std::istream& in, LogRecord* dst);
 
   static LogRecord InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                       slot_t key, std::string_view redo);
@@ -147,9 +147,11 @@ struct LogRecord {
 
   [[nodiscard]] size_t Size() const;
 
+  friend Encoder& operator<<(Encoder& e, const LogRecord& l);
+  friend Decoder& operator>>(Decoder& d, LogRecord& l);
   [[nodiscard]] std::string Serialize() const;
 
-  bool operator==(const LogRecord& rhs) const;
+  bool operator==(const LogRecord& r) const;
 
   void DumpPosition(std::ostream& o) const;
 

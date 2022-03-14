@@ -36,6 +36,13 @@ class Encoder {
     return *this;
   }
 
+  template <typename T, typename U>
+  Encoder& operator<<(const std::pair<T, U>& p) {
+    *this << p.first << p.second;
+    return *this;
+  }
+
+
  private:
   std::ostream* os_;
 };
