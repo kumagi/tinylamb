@@ -6,6 +6,7 @@
 
 #include <filesystem>
 
+#include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "recovery/log_record.hpp"
 #include "type/row.hpp"
@@ -14,12 +15,15 @@ namespace tinylamb {
 
 class LoggerTest : public ::testing::Test {
  protected:
-  static constexpr char kFileName[] = "logger_test.log";
-  void SetUp() override { l_ = std::make_unique<Logger>(kFileName, 4096, 10); }
+  void SetUp() override {
+    std::string prefix = "logger_test-" + RandomString();
+    log_name_ = prefix + ".log";
+    l_ = std::make_unique<Logger>(log_name_, 4096, 10);
+  }
 
   void TearDown() override {
     std::this_thread::sleep_for(std::chrono::microseconds(5));
-    std::remove(kFileName);
+    std::remove(log_name_.c_str());
   }
 
   void WaitForCommit(lsn_t target_lsn, size_t timeout_ms = 1000) {
@@ -31,6 +35,7 @@ class LoggerTest : public ::testing::Test {
     EXPECT_LT(counter, timeout_ms);
   }
 
+  std::string log_name_;
   std::unique_ptr<Logger> l_;
 };
 
@@ -43,7 +48,7 @@ TEST_F(LoggerTest, AppendBegin) {
   lsn_t lsn = l_->AddLog(l);
   ASSERT_EQ(0, lsn);  // Inserted place must be the beginning of the log.
   WaitForCommit(lsn + l.Size());
-  EXPECT_EQ(std::filesystem::file_size(kFileName), l.Size());
+  EXPECT_EQ(std::filesystem::file_size(log_name_), l.Size());
 }
 
 TEST_F(LoggerTest, AppendManyBegin) {
@@ -53,7 +58,7 @@ TEST_F(LoggerTest, AppendManyBegin) {
     lsn = l_->AddLog(l);
   }
   WaitForCommit(lsn + l.Size());
-  EXPECT_EQ(std::filesystem::file_size(kFileName), l.Size() * 100);
+  EXPECT_EQ(std::filesystem::file_size(log_name_), l.Size() * 100);
 }
 
 }  // namespace tinylamb

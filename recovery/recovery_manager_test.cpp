@@ -10,10 +10,10 @@ namespace tinylamb {
 
 class RecoveryManagerTest : public RowPageTest {
  protected:
-  static constexpr char kDBFileName[] = "recovery_test.db";
-  static constexpr char kLogName[] = "recovery_test.log";
-
-  void SetUp() override { RowPageTest::SetUp(); }
+  void SetUp() override {
+    file_name_ = "recovery_manager_test-" + RandomString();
+    RowPageTest::SetUp();
+  }
 
   void RecoverBase(const std::function<void(void)>& f) {
     if (p_) {
@@ -25,10 +25,10 @@ class RecoveryManagerTest : public RowPageTest {
     r_.reset();
     p_.reset();
     f();
-    p_ = std::make_unique<PageManager>(kDBFileName, 10);
-    l_ = std::make_unique<Logger>(kLogName);
+    p_ = std::make_unique<PageManager>(file_name_ + ".db", 10);
+    l_ = std::make_unique<Logger>(file_name_ + ".log");
     lm_ = std::make_unique<LockManager>();
-    r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
+    r_ = std::make_unique<RecoveryManager>(file_name_ + ".log", p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
   }
 
@@ -37,12 +37,13 @@ class RecoveryManagerTest : public RowPageTest {
   }
 
   void MediaFailure() {
-    RecoverBase([]() { std::remove(kDBFileName); });
+    RecoverBase([&]() { std::remove((file_name_ + ".db").c_str()); });
   }
 
   void SinglePageFailure(page_id_t failed_page) {
     RecoverBase([&]() {
-      std::fstream db(kDBFileName, std::ios_base::out | std::ios_base::binary);
+      std::fstream db(file_name_ + ".db",
+                      std::ios_base::out | std::ios_base::binary);
       db.seekp(failed_page * kPageSize, std::ios_base::beg);
       ASSERT_FALSE(db.fail());
       for (size_t i = 0; i < kPageSize; ++i) {
@@ -53,8 +54,8 @@ class RecoveryManagerTest : public RowPageTest {
   }
 
   void TearDown() override {
-    std::remove(kDBFileName);
-    std::remove(kLogName);
+    std::remove((file_name_ + ".db").c_str());
+    std::remove((file_name_ + ".log").c_str());
   }
 
   std::unique_ptr<RecoveryManager> r_;

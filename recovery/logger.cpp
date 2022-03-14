@@ -78,7 +78,8 @@ void Logger::LoggerWork() {
       flushed_bytes += write(dst_, buffer_.data() + committed_offset,
                              buffer_.size() - committed_offset);
       if (flushed_bytes <= 0) continue;
-      if (flushed_bytes == buffer_.size() - committed_offset) {
+      if (static_cast<size_t>(flushed_bytes) ==
+          buffer_.size() - committed_offset) {
         ssize_t extra_wrote = write(dst_, buffer_.data(), written_offset);
         if (0 < extra_wrote) flushed_bytes += extra_wrote;
       }

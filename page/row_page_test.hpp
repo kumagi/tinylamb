@@ -17,10 +17,8 @@ namespace tinylamb {
 
 class RowPageTest : public ::testing::Test {
  protected:
-  static constexpr char kDBFileName[] = "row_page_test.db";
-  static constexpr char kLogName[] = "row_page_test.log";
-
   void SetUp() override {
+    file_name_ = "row_page_test-" + RandomString();
     Recover();
     auto txn = tm_->Begin();
     PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
@@ -36,16 +34,16 @@ class RowPageTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(kDBFileName, 10);
-    l_ = std::make_unique<Logger>(kLogName);
+    p_ = std::make_unique<PageManager>(file_name_ + ".db", 10);
+    l_ = std::make_unique<Logger>(file_name_ + ".log");
     lm_ = std::make_unique<LockManager>();
-    r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
+    r_ = std::make_unique<RecoveryManager>(file_name_ + ".log", p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
   }
 
   void TearDown() override {
-    std::remove(kDBFileName);
-    std::remove(kLogName);
+    std::remove((file_name_ + ".db").c_str());
+    std::remove((file_name_ + ".log").c_str());
   }
 
   void Flush() { p_->GetPool()->FlushPageForTest(page_id_); }
@@ -126,6 +124,7 @@ class RowPageTest : public ::testing::Test {
     return row_count;
   }
 
+  std::string file_name_;
   std::unique_ptr<LockManager> lm_;
   std::unique_ptr<PageManager> p_;
   std::unique_ptr<Logger> l_;

@@ -21,13 +21,11 @@
 namespace tinylamb {
 
 class BPlusTreeIteratorTest : public ::testing::Test {
- protected:
-  static constexpr char kDBFileName[] = "b_plus_tree_test.db";
-  static constexpr char kLogName[] = "b_plus_tree_test.log";
-  static constexpr char kMasterRecordName[] = "b_plus_tree_master.log";
-
  public:
   void SetUp() override {
+    std::string prefix = "b_plus_tree_iterator_test-" + RandomString();
+    db_name_ = prefix + ".db";
+    log_name_ = prefix + ".log";
     Recover();
     auto txn = tm_->Begin();
     PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
@@ -54,10 +52,10 @@ class BPlusTreeIteratorTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(kDBFileName, 10);
-    l_ = std::make_unique<Logger>(kLogName);
+    p_ = std::make_unique<PageManager>(db_name_, 10);
+    l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
-    r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
+    r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
     bpt_ = std::make_unique<BPlusTree>(root, p_.get());
   }
@@ -69,11 +67,12 @@ class BPlusTreeIteratorTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    std::remove(kDBFileName);
-    std::remove(kLogName);
+    std::remove(db_name_.c_str());
+    std::remove(log_name_.c_str());
   }
 
- public:
+  std::string db_name_;
+  std::string log_name_;
   std::unique_ptr<LockManager> lm_;
   std::unique_ptr<PageManager> p_;
   std::unique_ptr<Logger> l_;

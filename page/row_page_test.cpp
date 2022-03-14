@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/row_page_test.hpp"
 #include "transaction/lock_manager.hpp"
@@ -101,7 +102,7 @@ TEST_F(RowPageTest, DeleteMany) {
   Flush();
   Recover();
   for (size_t i = 0; i < GetRowCount(); ++i) {
-    std::string got_row = ReadRow(i);
+    std::string got_row = ReadRow(static_cast<slot_t>(i));
     ASSERT_NE(inserted.find(got_row), inserted.end());
     inserted.erase(got_row);
   }
@@ -148,6 +149,30 @@ TEST_F(RowPageTest, DeFragmentInvoked) {
                 ReadRow(1),
                 ReadRow(2),
             }));
+}
+
+TEST_F(RowPageTest, InsertTwoThreads) {
+  auto txn1 = tm_->Begin(), txn2 = tm_->Begin();
+  {  // txn1
+    PageRef ref = p_->GetPage(page_id_);
+    std::string message = "message1";
+    slot_t slot;
+    ASSERT_SUCCESS(ref->Insert(txn1, message, &slot));
+  }
+  {
+    PageRef ref = p_->GetPage(page_id_);
+    std::string message = "message2";
+    slot_t slot;
+    ASSERT_SUCCESS(ref->Insert(txn2, message, &slot));
+  }
+  {
+    PageRef ref = p_->GetPage(page_id_);
+    std::string message = "message1-again";
+    slot_t slot;
+    ASSERT_SUCCESS(ref->Insert(txn1, message, &slot));
+  }
+  ASSERT_SUCCESS(txn1.PreCommit());
+  ASSERT_SUCCESS(txn2.PreCommit());
 }
 
 }  // namespace tinylamb

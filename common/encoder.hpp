@@ -42,7 +42,6 @@ class Encoder {
     return *this;
   }
 
-
  private:
   std::ostream* os_;
 };

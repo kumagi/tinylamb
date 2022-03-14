@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/free_page.hpp"
 #include "page/page_ref.hpp"
@@ -14,11 +15,10 @@ namespace tinylamb {
 
 class PageManagerTest : public ::testing::Test {
  protected:
-  static constexpr char kFileName[] = "page_manager_test.db";
-  static constexpr char kLogName[] = "page_manager_test.log";
   void SetUp() override {
-    std::remove(kFileName);
-    std::remove(kLogName);
+    std::string prefix = "page_manager_test-" + RandomString();
+    db_name_ = prefix + ".db";
+    log_name_ = prefix + ".log";
     Reset();
   }
 
@@ -27,15 +27,15 @@ class PageManagerTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(kFileName, 10);
-    l_ = std::make_unique<Logger>(kLogName);
+    p_ = std::make_unique<PageManager>(db_name_, 10);
+    l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), nullptr);
   }
 
   void TearDown() override {
-    std::remove(kFileName);
-    std::remove(kLogName);
+    std::remove(db_name_.c_str());
+    std::remove(log_name_.c_str());
   }
 
   PageRef AllocatePage(PageType expected_type) {
@@ -60,6 +60,8 @@ class PageManagerTest : public ::testing::Test {
     system_txn.PreCommit();
   }
 
+  std::string db_name_;
+  std::string log_name_;
   std::unique_ptr<LockManager> lm_;
   std::unique_ptr<PageManager> p_;
   std::unique_ptr<Logger> l_;
