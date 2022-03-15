@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "common/test_util.hpp"
+#include "common/random_string.hpp"
 #include "gtest/gtest.h"
 #include "page/free_page.hpp"
 #include "page/page_ref.hpp"

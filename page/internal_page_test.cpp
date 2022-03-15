@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 
+#include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/leaf_page.hpp"

@@ -6,7 +6,7 @@
 
 #include <filesystem>
 
-#include "common/test_util.hpp"
+#include "common/random_string.hpp"
 #include "gtest/gtest.h"
 #include "recovery/log_record.hpp"
 #include "type/row.hpp"

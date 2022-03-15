@@ -1,6 +1,7 @@
 #ifndef TINYLAMB_ROW_PAGE_TEST_HPP
 #define TINYLAMB_ROW_PAGE_TEST_HPP
 
+#include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"

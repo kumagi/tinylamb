@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 
+#include "common/random_string.hpp"
 #include "gtest/gtest.h"
 #include "page_ref.hpp"
 
@@ -10,12 +11,15 @@ namespace tinylamb {
 
 class PagePoolTest : public ::testing::Test {
  protected:
-  static constexpr char kFileName[] = "page_pool_test.db";
   static constexpr int kDefaultCapacity = 10;
-  void SetUp() override { Reset(); }
-  void Reset() { pp = std::make_unique<PagePool>(kFileName, kDefaultCapacity); }
-  void TearDown() override { std::remove(kFileName); }
+  void SetUp() override {
+    filename_ = "internal_page_test-" + RandomString();
+    Reset();
+  }
+  void Reset() { pp = std::make_unique<PagePool>(filename_, kDefaultCapacity); }
+  void TearDown() override { std::remove(filename_.c_str()); }
 
+  std::string filename_;
   std::unique_ptr<PagePool> pp = nullptr;
 };
 

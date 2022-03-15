@@ -37,7 +37,7 @@ class Decoder {
     }
     return *this;
   }
-  
+
   template <typename T, typename U>
   Decoder& operator>>(std::pair<T, U>& p) {
     *this >> p.first >> p.second;

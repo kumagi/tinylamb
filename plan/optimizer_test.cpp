@@ -3,6 +3,7 @@
 //
 #include "plan/optimizer.hpp"
 
+#include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "database/catalog.hpp"
 #include "database/query_data.hpp"
@@ -24,9 +25,10 @@ namespace tinylamb {
 
 class OptimizerTest : public ::testing::Test {
  public:
-  static constexpr char kDBFileName[] = "optimizer_test.db";
-  static constexpr char kLogName[] = "optimizer_test.log";
   void SetUp() override {
+    std::string prefix = "optimizer_test-" + RandomString();
+    db_name_ = prefix + ".db";
+    log_name_ = prefix + ".log";
     Recover();
     Transaction txn = tm_->Begin();
     catalog_->InitializeIfNeeded(txn);
@@ -90,10 +92,10 @@ class OptimizerTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(kDBFileName, 10);
-    l_ = std::make_unique<Logger>(kLogName);
+    p_ = std::make_unique<PageManager>(db_name_, 10);
+    l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
-    r_ = std::make_unique<RecoveryManager>(kLogName, p_->GetPool());
+    r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
     tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
     catalog_ = std::make_unique<Catalog>(1, 2, p_.get());
   }
@@ -105,10 +107,12 @@ class OptimizerTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    std::remove(kDBFileName);
-    std::remove(kLogName);
+    std::remove(db_name_.c_str());
+    std::remove(log_name_.c_str());
   }
 
+  std::string db_name_;
+  std::string log_name_;
   std::unique_ptr<LockManager> lm_;
   std::unique_ptr<PageManager> p_;
   std::unique_ptr<Logger> l_;
