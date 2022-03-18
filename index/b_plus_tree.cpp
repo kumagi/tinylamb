@@ -126,7 +126,6 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
   if (s == Status::kSuccess) return Status::kSuccess;
   if (s == Status::kNoSpace) {
     // No enough space? Split!
-
     PageRef new_page = pm_->AllocateNewPage(txn, PageType::kLeafPage);
     target->body.leaf_page.Split(target->PageID(), txn, key, value,
                                  new_page.get());

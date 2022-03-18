@@ -70,7 +70,7 @@ class TableTest : public ::testing::Test {
     l_.reset();
     p_.reset();
     std::remove(db_name_.c_str());
-    std::remove(log_name_.c_str());
+    // std::remove(log_name_.c_str());
     std::remove(master_record_name_.c_str());
   }
 
@@ -92,7 +92,7 @@ TEST_F(TableTest, Construct) {}
 
 TEST_F(TableTest, Insert) {
   Transaction txn = tm_->Begin();
-  Row r({Value(1), Value("23"), Value(3.3)});
+  Row r({Value(1), Value("fuga"), Value(3.3)});
   RowPosition rp;
   ASSERT_SUCCESS(table_->Insert(txn, r, &rp));
 }
@@ -119,6 +119,21 @@ TEST_F(TableTest, Update) {
   ASSERT_SUCCESS(table_->Read(txn, rp, &read));
   ASSERT_EQ(read, new_row);
   LOG(INFO) << read;
+}
+
+TEST_F(TableTest, UpdateMany) {
+  Transaction txn = tm_->Begin();
+  RowPosition rp;
+  std::vector<RowPosition> rps;
+  for (int i = 0; i < 30; ++i) {
+    Row new_row({Value(i), Value(RandomString(20)), Value(i * 99e8)});
+    ASSERT_SUCCESS(table_->Insert(txn, new_row, &rp));
+    rps.push_back(rp);
+  }
+  for (int i = 0; i < 260; ++i) {
+    Row new_row({Value(i), Value(RandomString(40)), Value(i * 99e8)});
+    ASSERT_SUCCESS(table_->Update(txn, rps[i % rps.size()], new_row));
+  }
 }
 
 TEST_F(TableTest, Delete) {
@@ -210,6 +225,28 @@ TEST_F(TableTest, InsertMany) {
   for (const auto& row : rps) {
     ASSERT_SUCCESS(table_->Read(txn, row, &read));
     ASSERT_NE(rows.find(read), rows.end());
+  }
+}
+
+TEST_F(TableTest, UpdateHeavy) {
+  Transaction txn = tm_->Begin();
+  RowPosition rp;
+  std::unordered_set<Row> rows;
+  std::vector<RowPosition> rps;
+  rps.reserve(4000);
+  for (int i = 0; i < 4000; ++i) {
+    std::string key = RandomString((31 * i) % 800 + 1);
+    Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
+    ASSERT_SUCCESS(table_->Insert(txn, new_row, &rp));
+    rps.push_back(rp);
+  }
+  Row read;
+  for (int i = 0; i < 8000; ++i) {
+    RowPosition pos = rps[(i * 63) % rps.size()];
+    std::string key = RandomString((63 * i) % 120 + 1);
+    LOG(TRACE) << "Update: " << key;
+    Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
+    ASSERT_SUCCESS(table_->Update(txn, pos, new_row));
   }
 }
 

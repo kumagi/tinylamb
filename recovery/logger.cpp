@@ -28,7 +28,13 @@ Logger::~Logger() {
 
 lsn_t Logger::AddLog(const LogRecord& log) {
   std::string data = log.Serialize();
-  std::scoped_lock lk(latch_);
+  std::unique_lock lk(latch_);
+
+  while (buffer_.size() - data.size() <= queued_lsn_ - persistent_lsn_) {
+    // Has no enough space in buffer, wait for worker.
+    worker_wait_.notify_all();
+    worker_wait_.wait_for(lk, std::chrono::milliseconds(1));
+  }
 
   size_t memory_offset = queued_lsn_ % buffer_.size();
   if (memory_offset + data.size() <= buffer_.size()) {
@@ -74,7 +80,7 @@ void Logger::LoggerWork() {
                              written_offset - committed_offset);
       if (flushed_bytes <= 0) continue;
     } else {
-      // In case of buffer is wrap around.
+      // In case of buffer does wrap around.
       flushed_bytes += write(dst_, buffer_.data() + committed_offset,
                              buffer_.size() - committed_offset);
       if (flushed_bytes <= 0) continue;
@@ -85,7 +91,7 @@ void Logger::LoggerWork() {
       }
     }
 
-    fsync(dst_);
+    fdatasync(dst_);
     persistent_lsn_ += flushed_bytes;
   }
 }

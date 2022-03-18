@@ -34,7 +34,7 @@ Status RowPage::Read(page_id_t page_id, Transaction& txn, slot_t slot,
  */
 Status RowPage::Insert(page_id_t page_id, Transaction& txn,
                        std::string_view record, slot_t* dst) {
-  if (free_size_ + sizeof(RowPointer) <= record.size()) return Status::kNoSpace;
+  if (free_size_ <= record.size() + sizeof(RowPointer)) return Status::kNoSpace;
   *dst = row_count_;
   const RowPosition pos(page_id, *dst);
   if (!txn.AddWriteSet(pos)) return Status::kConflicts;
@@ -49,6 +49,9 @@ slot_t RowPage::InsertRow(std::string_view new_row) {
   if (Payload() + free_ptr_ <=
       reinterpret_cast<char*>(&data_[row_count_ + 1]) + new_row.size()) {
     DeFragment();
+    LOG(INFO) << "free: " << free_size_
+              << " vs required: " << new_row.size() + sizeof(RowPointer);
+    LOG(TRACE) << "deflag happen";
   }
   assert(reinterpret_cast<char*>(&data_[row_count_ + 1]) + new_row.size() <
          Payload() + free_ptr_);
@@ -69,7 +72,10 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
     return Status::kNoSpace;
   }
   RowPosition pos(page_id, slot);
-  if (!txn.AddWriteSet(pos)) return Status::kConflicts;
+  if (!txn.AddWriteSet(pos)) {
+    LOG(ERROR) << "cannot add write-set";
+    return Status::kConflicts;
+  }
   txn.UpdateLog(page_id, slot, prev_row, record);
   UpdateRow(pos.slot, record);
   return Status::kSuccess;

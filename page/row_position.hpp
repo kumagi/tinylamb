@@ -34,8 +34,11 @@ struct RowPosition {
     return page_id == rhs.page_id && slot == rhs.slot;
   }
 
-  [[nodiscard]] std::string_view AsStringView() const {
-    return {reinterpret_cast<const char*>(this), sizeof(RowPosition)};
+  [[nodiscard]] std::string Serialize() const {
+    std::string s(Size(), '\0');
+    memcpy(s.data(), &page_id, sizeof(page_id));
+    memcpy(s.data() + sizeof(page_id), &slot, sizeof(slot));
+    return s;
   }
   size_t Deserialize(const char* src) {
     const char* const original_offset = src;

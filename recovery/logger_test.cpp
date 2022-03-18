@@ -51,14 +51,17 @@ TEST_F(LoggerTest, AppendBegin) {
   EXPECT_EQ(std::filesystem::file_size(log_name_), l.Size());
 }
 
-TEST_F(LoggerTest, AppendManyBegin) {
-  LogRecord l(0, 0, LogType::kBegin);
+TEST_F(LoggerTest, AppendMany) {
   lsn_t lsn = 0;
-  for (int i = 0; i < 100; ++i) {
-    lsn = l_->AddLog(l);
+  size_t size = 0;
+  for (int i = 0; i < 2048; ++i) {
+    LogRecord l = LogRecord::InsertingLogRecord(
+        0, 0, i, i * 2, RandomString((i * 31) % 800 + 1));
+    lsn = l_->AddLog(l) + l.Size();
+    size += l.Size();
   }
-  WaitForCommit(lsn + l.Size());
-  EXPECT_EQ(std::filesystem::file_size(log_name_), l.Size() * 100);
+  WaitForCommit(lsn);
+  EXPECT_EQ(std::filesystem::file_size(log_name_), size);
 }
 
 }  // namespace tinylamb

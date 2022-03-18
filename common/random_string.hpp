@@ -12,15 +12,14 @@ namespace tinylamb {
 thread_local std::random_device seed_gen;
 thread_local std::mt19937 engine(seed_gen());
 
-std::string RandomString() {
+std::string RandomString(size_t len = 16) {
   static const char alphanum[] =
       "0123456789"
       "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
       "abcdefghijklmnopqrstuvwxyz";
-  const static size_t len = 16;
   std::string ret;
   ret.reserve(len);
-  for (int i = 0; i < 12; ++i) {
+  for (size_t i = 0; i < len; ++i) {
     ret.push_back(alphanum[engine() % (sizeof(alphanum) - 1)]);
   }
   return ret;

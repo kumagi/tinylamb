@@ -2,7 +2,6 @@
 #define TINYLAMB_LOG_MESSAGE_HPP
 
 #include <sstream>
-#include <string>
 
 #define LOG(level) LogMessage(level, __FILE__, __LINE__, __func__).stream()
 

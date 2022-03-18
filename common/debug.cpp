@@ -4,6 +4,8 @@
 
 #include "debug.hpp"
 
+#include <iostream>
+
 namespace tinylamb {
 
 std::string Hex(std::string_view in) {

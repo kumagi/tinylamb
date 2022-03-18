@@ -125,6 +125,9 @@ add_simple_test(plan/plan_test.cpp)
 add_simple_test(plan/optimizer_test.cpp)
 add_simple_test(table/table_statistics_test.cpp)
 
+# Concurrency tests.
+add_simple_test(page/row_page_concurrent_test.cpp)
+
 
 ########################################
 ## Fuzzing
