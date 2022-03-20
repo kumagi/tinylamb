@@ -5,6 +5,7 @@
 #include <string_view>
 
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 
 namespace tinylamb {
 
@@ -69,8 +70,8 @@ class RowPage {
   friend class std::hash<RowPage>;
 
   [[nodiscard]] std::string_view GetRow(slot_t slot) const {
-    return {Payload() + data_[slot].offset,
-            static_cast<size_t>(data_[slot].size)};
+    return {Payload() + rows_[slot].offset,
+            static_cast<size_t>(rows_[slot].size)};
   }
 
   bin_size_t InsertRow(std::string_view new_row);
@@ -81,10 +82,11 @@ class RowPage {
 
   page_id_t prev_page_id_ = 0;
   page_id_t next_page_id_ = 0;
+  slot_t row_max_ = 0;
   slot_t row_count_ = 0;
   bin_size_t free_ptr_ = kPageSize;
   bin_size_t free_size_ = kPageSize - sizeof(RowPage);
-  RowPointer data_[0];
+  RowPointer rows_[0];
   void Dump(std::ostream& o, int indent) const;
 };
 

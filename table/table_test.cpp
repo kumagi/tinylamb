@@ -114,7 +114,7 @@ TEST_F(TableTest, Update) {
   Row new_row({Value(1), Value("hogefuga"), Value(99e8)});
   ASSERT_SUCCESS(
       table_->Insert(txn, Row({Value(1), Value("string"), Value(3.3)}), &rp));
-  ASSERT_SUCCESS(table_->Update(txn, rp, new_row));
+  ASSERT_SUCCESS(table_->Update(txn, new_row, &rp));
   Row read;
   ASSERT_SUCCESS(table_->Read(txn, rp, &read));
   ASSERT_EQ(read, new_row);
@@ -132,7 +132,7 @@ TEST_F(TableTest, UpdateMany) {
   }
   for (int i = 0; i < 260; ++i) {
     Row new_row({Value(i), Value(RandomString(40)), Value(i * 99e8)});
-    ASSERT_SUCCESS(table_->Update(txn, rps[i % rps.size()], new_row));
+    ASSERT_SUCCESS(table_->Update(txn, new_row, &rps[i % rps.size()]));
   }
 }
 
@@ -174,7 +174,7 @@ TEST_F(TableTest, IndexUpdateRead) {
   ASSERT_SUCCESS(
       table_->Insert(txn, Row({Value(3), Value("foo"), Value(1.5)}), &_));
   ASSERT_SUCCESS(
-      table_->Update(txn, target, Row({Value(2), Value("baz"), Value(5.8)})));
+      table_->Update(txn, Row({Value(2), Value("baz"), Value(5.8)}), &target));
 
   Row key({Value(2), Value("baz")});
   Row result;
@@ -229,24 +229,24 @@ TEST_F(TableTest, InsertMany) {
 }
 
 TEST_F(TableTest, UpdateHeavy) {
+  constexpr int kCount = 50;
   Transaction txn = tm_->Begin();
   RowPosition rp;
   std::unordered_set<Row> rows;
   std::vector<RowPosition> rps;
-  rps.reserve(4000);
-  for (int i = 0; i < 4000; ++i) {
-    std::string key = RandomString((31 * i) % 800 + 1);
+  rps.reserve(kCount);
+  for (int i = 0; i < kCount; ++i) {
+    std::string key = RandomString((19937 * i) % 120 + 10);
     Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
     ASSERT_SUCCESS(table_->Insert(txn, new_row, &rp));
     rps.push_back(rp);
   }
   Row read;
-  for (int i = 0; i < 8000; ++i) {
-    RowPosition pos = rps[(i * 63) % rps.size()];
-    std::string key = RandomString((63 * i) % 120 + 1);
-    LOG(TRACE) << "Update: " << key;
+  for (int i = 0; i < kCount * 2; ++i) {
+    RowPosition& pos = rps[(i * 63) % rps.size()];
+    std::string key = RandomString((19937 * i) % 3200 + 5000);
     Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
-    ASSERT_SUCCESS(table_->Update(txn, pos, new_row));
+    ASSERT_SUCCESS(table_->Update(txn, new_row, &pos));
   }
 }
 

@@ -92,7 +92,7 @@ TEST_F(RowPageTest, DeleteMany) {
   Flush();
   Recover();
   int deleted = 0;
-  for (int i = 0; i < kRows / 2; ++i) {
+  for (int i = 0; i < kRows; i += 2) {
     std::string victim = ReadRow(i);
     inserted.erase(victim);
     DeleteRow(i);
@@ -101,10 +101,17 @@ TEST_F(RowPageTest, DeleteMany) {
   ASSERT_EQ(GetRowCount(), kRows - deleted);
   Flush();
   Recover();
-  for (size_t i = 0; i < GetRowCount(); ++i) {
-    std::string got_row = ReadRow(static_cast<slot_t>(i));
-    ASSERT_NE(inserted.find(got_row), inserted.end());
-    inserted.erase(got_row);
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(page_id_);
+  for (size_t i = 0; i < kRows; ++i) {
+    std::string_view got_row;
+    if (i % 2 == 0) {
+      ASSERT_EQ(Status::kNotExists, page->Read(txn, i, &got_row));
+    } else {
+      ASSERT_EQ(Status::kSuccess, page->Read(txn, i, &got_row));
+      ASSERT_NE(inserted.find(std::string(got_row)), inserted.end());
+      inserted.erase(std::string(got_row));
+    }
   }
   ASSERT_TRUE(inserted.empty());
 }
@@ -132,8 +139,8 @@ TEST_F(RowPageTest, DeFragmentInvoked) {
   ASSERT_EQ(std::set<std::string>(
                 {std::string(kBigRowSize, '1'), std::string(kBigRowSize, '2')}),
             std::set<std::string>({
-                ReadRow(0),
                 ReadRow(1),
+                ReadRow(2),
             }));
 
   ASSERT_TRUE(InsertRow(std::string(kBigRowSize, '3')));
@@ -173,6 +180,68 @@ TEST_F(RowPageTest, InsertTwoThreads) {
   }
   ASSERT_SUCCESS(txn1.PreCommit());
   ASSERT_SUCCESS(txn2.PreCommit());
+}
+
+TEST_F(RowPageTest, UpdateHeavy) {
+  constexpr int kCount = 50;
+  Transaction txn = tm_->Begin();
+  std::vector<std::string> rows(kCount);
+  std::vector<slot_t> slots;
+  slots.reserve(kCount);
+  PageRef ref = p_->GetPage(page_id_);
+  for (int i = 0; i < kCount; ++i) {
+    std::string key = RandomString((19937 * i) % 120 + 100);
+    slot_t slot;
+    ASSERT_SUCCESS(ref->Insert(txn, key, &slot));
+    slots.push_back(slot);
+    rows[i] = key;
+  }
+  Row read;
+  for (int i = 0; i < kCount * 20; ++i) {
+    slot_t slot = slots[(i * 63) % slots.size()];
+    std::string key = RandomString((19937 * i) % 120 + 10);
+    ASSERT_SUCCESS(ref->Update(txn, slot, key));
+    rows[slot] = key;
+  }
+  for (int i = 0; i < kCount; ++i) {
+    std::string_view row;
+    ASSERT_SUCCESS(ref->Read(txn, i, &row));
+    ASSERT_EQ(rows[i], row);
+  }
+}
+
+TEST_F(RowPageTest, UpdateAndDeleteHeavy) {
+  constexpr int kCount = 60;
+  Transaction txn = tm_->Begin();
+  std::vector<std::string> rows(kCount);
+  std::vector<slot_t> slots;
+  slots.reserve(kCount);
+  PageRef ref = p_->GetPage(page_id_);
+  for (int i = 0; i < kCount; ++i) {
+    std::string key = RandomString((19937 * i) % 120 + 100);
+    slot_t slot;
+    ASSERT_SUCCESS(ref->Insert(txn, key, &slot));
+    slots.push_back(slot);
+    rows[i] = key;
+  }
+  Row read;
+  for (int i = 0; i < kCount * 40; ++i) {
+    slot_t slot = slots[(i * 63) % slots.size()];
+    std::string key = RandomString((19937 * i) % 120 + 10);
+    if (i % 2 == 0) {
+      ASSERT_SUCCESS(ref->Update(txn, slot, key));
+    } else {
+      ASSERT_SUCCESS(ref->Delete(txn, slot));
+      slot_t s;
+      ASSERT_SUCCESS(ref->Insert(txn, key, &s));
+    }
+    rows[slot] = key;
+  }
+  for (int i = 0; i < kCount; ++i) {
+    std::string_view row;
+    ASSERT_SUCCESS(ref->Read(txn, i, &row));
+    ASSERT_EQ(rows[i], row);
+  }
 }
 
 }  // namespace tinylamb

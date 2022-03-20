@@ -28,15 +28,13 @@ class LeafPage {
     // Physical row size in bytes (required to get exact size for logging).
     bin_size_t size = 0;
   };
-  RowPointer* Rows();
-  [[nodiscard]] const RowPointer* Rows() const;
 
  public:
   void Initialize() {
     prev_pid_ = 0;
     next_pid_ = 0;
     row_count_ = 0;
-    free_ptr_ = sizeof(LeafPage);
+    free_ptr_ = kPageBodySize;
     free_size_ = kPageBodySize - sizeof(LeafPage);
   }
 
@@ -86,7 +84,7 @@ class LeafPage {
   slot_t row_count_ = 0;
   bin_size_t free_ptr_ = kPageSize;
   bin_size_t free_size_ = kPageSize - sizeof(LeafPage);
-  char data_[0];
+  RowPointer rows_[0];
 };
 
 static_assert(std::is_trivially_destructible<LeafPage>::value == true,

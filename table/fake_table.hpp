@@ -44,7 +44,7 @@ class FakeTable : public TableInterface {
 
   Status Insert(Transaction& txn, const Row& row, RowPosition* rp) override;
 
-  Status Update(Transaction& txn, RowPosition pos, const Row& row) override;
+  Status Update(Transaction& txn, const Row& row, RowPosition* pos) override;
 
   Status Delete(Transaction& txn, RowPosition pos) override;
 

@@ -20,9 +20,9 @@ Status FakeTable::Insert(Transaction&, const Row& row, RowPosition* rp) {
   return Status::kSuccess;
 }
 
-Status FakeTable::Update(Transaction&, RowPosition pos, const Row& row) {
-  if (table_.size() <= pos.slot) return Status::kNotExists;
-  table_[pos.slot] = row;
+Status FakeTable::Update(Transaction&, const Row& row, RowPosition* pos) {
+  if (table_.size() <= pos->slot) return Status::kNotExists;
+  table_[pos->slot] = row;
   return Status::kSuccess;
 }
 

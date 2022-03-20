@@ -16,6 +16,7 @@ FullScan::FullScan(Transaction& txn, std::unique_ptr<TableInterface>&& table)
 bool tinylamb::FullScan::Next(Row* dst, RowPosition* rp) {
   if (!iter_.IsValid()) return false;
   *dst = *iter_;
+  // *rp = *iter_;
   ++iter_;
   return true;
 }

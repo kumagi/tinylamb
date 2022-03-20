@@ -279,4 +279,31 @@ TEST_F(BPlusTreeTest, CheckPoint) {
     }
   }
 }
+
+TEST_F(BPlusTreeTest, UpdateHeavy) {
+  constexpr int kCount = 50;
+  Transaction txn = tm_->Begin();
+  std::vector<std::string> keys;
+  std::unordered_map<std::string, std::string> kvp;
+  keys.reserve(kCount);
+  for (int i = 0; i < kCount; ++i) {
+    std::string key = RandomString((19937 * i) % 12 + 10);
+    std::string value = RandomString((19937 * i) % 120 + 10);
+    ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
+    keys.push_back(key);
+    kvp.emplace(key, value);
+  }
+  for (int i = 0; i < kCount; ++i) {
+    const std::string& key = keys[(i * 63) % keys.size()];
+    std::string value = RandomString((19937 * i) % 320 + 500);
+    ASSERT_SUCCESS(bpt_->Update(txn, key, value));
+    kvp[key] = value;
+  }
+  for (const auto& kv : kvp) {
+    std::string_view val;
+    bpt_->Read(txn, kv.first, &val);
+    ASSERT_EQ(kvp[kv.first], val);
+  }
+}
+
 }  // namespace tinylamb

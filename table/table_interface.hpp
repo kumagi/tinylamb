@@ -25,7 +25,7 @@ class TableInterface {
 
   virtual Status Insert(Transaction& txn, const Row& row, RowPosition* rp) = 0;
 
-  virtual Status Update(Transaction& txn, RowPosition pos, const Row& row) = 0;
+  virtual Status Update(Transaction& txn, const Row& row, RowPosition* pos) = 0;
 
   virtual Status Delete(Transaction& txn, RowPosition pos) = 0;
 

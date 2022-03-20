@@ -29,6 +29,7 @@ enum class Status : uint8_t {
   kUnknownType,
   kNotExists,
   kNotImplemented,
+  kTooBigData,
 };
 
 enum class BinaryOperation {
@@ -83,6 +84,11 @@ inline std::string_view ToString(Status s) {
     default:
       return "INVALID STATUS";
   }
+}
+
+inline std::ostream& operator<<(std::ostream& o, const Status s) {
+  o << ToString(s);
+  return o;
 }
 
 inline std::string Indent(int num) { return {static_cast<char>(num), ' '}; }

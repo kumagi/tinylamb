@@ -41,20 +41,38 @@ Status Table::Insert(Transaction& txn, const Row& row, RowPosition* rp) {
   return s;
 }
 
-Status Table::Update(Transaction& txn, RowPosition pos, const Row& row) {
+Status Table::Update(Transaction& txn, const Row& row, RowPosition* pos) {
   Row original_row;
-  Status s = Read(txn, pos, &original_row);
+  Status s = Read(txn, *pos, &original_row);
+  STATUS(s, *pos);
   if (s != Status::kSuccess) return s;
   for (const auto& idx : indices_) {
     BPlusTree bpt(idx.pid_, pm_);
     s = bpt.Delete(txn, idx.GenerateKey(original_row));
     if (s != Status::kSuccess) return s;
-    s = bpt.Insert(txn, idx.GenerateKey(row), pos.Serialize());
+    s = bpt.Insert(txn, idx.GenerateKey(row), pos->Serialize());
     if (s != Status::kSuccess) return s;
   }
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
-  return pm_->GetPage(pos.page_id)->Update(txn, pos.slot, serialized_row);
+  PageRef page = pm_->GetPage(pos->page_id);
+  s = page->Update(txn, pos->slot, serialized_row);
+  if (s == Status::kNoSpace) {
+    page->Delete(txn, pos->slot);
+    page.PageUnlock();
+    PageRef new_page = pm_->AllocateNewPage(txn, PageType::kRowPage);
+    RowPosition new_row_pos(new_page->PageID(), -1);
+    s = new_page->Insert(txn, serialized_row, &new_row_pos.slot);
+    if (s != Status::kSuccess) return s;
+    {
+      PageRef last_page = pm_->GetPage(last_pid_);
+      last_page->body.row_page.next_page_id_ = new_page->PageID();
+      new_page->body.row_page.prev_page_id_ = last_page->PageID();
+    }
+    *pos = new_row_pos;
+    last_pid_ = new_page->PageID();
+  }
+  return s;
 }
 
 Status Table::Delete(Transaction& txn, RowPosition pos) {

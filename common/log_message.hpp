@@ -4,6 +4,10 @@
 #include <sstream>
 
 #define LOG(level) LogMessage(level, __FILE__, __LINE__, __func__).stream()
+#define STATUS(s, message)                                            \
+  {                                                                   \
+    if ((s) != Status::kSuccess) LOG(WARN) << (message) << ": " << s; \
+  }
 
 #define FATAL 9000
 #define ERROR 5000

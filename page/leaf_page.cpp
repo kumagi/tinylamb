@@ -14,7 +14,7 @@ namespace tinylamb {
 
 namespace {
 
-std::string OmittedString(std::string_view original, int length) {
+std::string OmittedString(std::string_view original, size_t length) {
   if (length < original.length()) {
     std::string omitted_key = std::string(original).substr(0, 8);
     omitted_key +=
@@ -28,31 +28,15 @@ std::string OmittedString(std::string_view original, int length) {
 
 }  // anonymous namespace
 
-LeafPage::RowPointer* LeafPage::Rows() {
-  return reinterpret_cast<RowPointer*>(Payload() + kPageBodySize -
-                                       row_count_ * sizeof(RowPointer));
-}
-
-const LeafPage::RowPointer* LeafPage::Rows() const {
-  return reinterpret_cast<const RowPointer*>(Payload() + kPageBodySize -
-                                             row_count_ * sizeof(RowPointer));
-}
-
 std::string_view LeafPage::GetKey(size_t idx) const {
-  const RowPointer* pos =
-      reinterpret_cast<const RowPointer*>(Payload() + kPageBodySize -
-                                          row_count_ * sizeof(RowPointer)) +
-      idx;
+  const RowPointer* pos = &rows_[idx];
   std::string_view ret;
   DeserializeStringView(Payload() + pos->offset, &ret);
   return ret;
 }
 
 std::string_view LeafPage::GetValue(size_t idx) const {
-  const RowPointer* pos =
-      reinterpret_cast<const RowPointer*>(Payload() + kPageBodySize -
-                                          row_count_ * sizeof(RowPointer)) +
-      idx;
+  const RowPointer* pos = &rows_[idx];
   std::string_view key = GetKey(idx);
   std::string_view ret;
   DeserializeStringView(
@@ -63,14 +47,12 @@ std::string_view LeafPage::GetValue(size_t idx) const {
 Status LeafPage::Insert(page_id_t page_id, Transaction& txn,
                         std::string_view key, std::string_view value) {
   constexpr size_t kThreshold = kPageBodySize / 2;
-  const size_t expected_size =
-      SerializeSize(key) + SerializeSize(value) + sizeof(RowPointer);
-  if (kThreshold < expected_size) {
-    throw std::runtime_error("too huge key/value cannot be inserted");
-  }
   const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
-  size_t pos = Find(key);
+  const size_t expected_size = physical_size + sizeof(RowPointer);
+  if (kThreshold < expected_size) return Status::kTooBigData;
   if (free_size_ < physical_size + sizeof(RowPointer)) return Status::kNoSpace;
+
+  size_t pos = Find(key);
   if (pos != row_count_ && GetKey(pos) == key) return Status::kDuplicates;
 
   InsertImpl(key, value);
@@ -82,21 +64,20 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
   const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
   assert(physical_size + sizeof(RowPointer) <= free_size_);
   free_size_ -= physical_size + sizeof(RowPointer);
-
-  if (kPageSize - sizeof(RowPointer) * (row_count_ + 1) <
-      free_ptr_ + physical_size) {
+  if (free_ptr_ < sizeof(RowPointer) * (row_count_ + 1) + physical_size) {
     DeFragment();
   }
-
+  assert(physical_size < free_ptr_);
   size_t pos = Find(key);
   row_count_++;
-  RowPointer* rows = Rows();
-  memmove(&rows[0], &rows[1], sizeof(RowPointer) * pos);
-  rows[pos].offset = free_ptr_;
-  rows[pos].size = physical_size;
-
-  free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
-  free_ptr_ += SerializeStringView(Payload() + free_ptr_, value);
+  free_ptr_ -= physical_size;
+  bin_size_t write_offset = free_ptr_;
+  write_offset += SerializeStringView(Payload() + write_offset, key);
+  SerializeStringView(Payload() + write_offset, value);
+  memmove(rows_ + pos + 1, rows_ + pos,
+          sizeof(RowPointer) * (row_count_ - pos));
+  rows_[pos].offset = free_ptr_;
+  rows_[pos].size = physical_size;
 }
 
 Status LeafPage::Update(page_id_t page_id, Transaction& txn,
@@ -118,18 +99,23 @@ Status LeafPage::Update(page_id_t page_id, Transaction& txn,
 }
 
 void LeafPage::UpdateImpl(std::string_view key, std::string_view redo) {
-  const size_t physical_size =
-      sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + redo.size();
-  if (kPageBodySize - sizeof(RowPointer) * row_count_ <
-      free_ptr_ + physical_size) {
-    DeFragment();
+  const size_t physical_size = SerializeSize(key) + SerializeSize(redo);
+  assert(physical_size <= free_size_);
+  const size_t pos = Find(key);
+  if (rows_[pos].size < physical_size) {
+    if (free_ptr_ < sizeof(RowPointer) * row_count_ + physical_size) {
+      rows_[pos].size = 0;
+      DeFragment();
+    }
+    free_ptr_ -= physical_size;
+    rows_[pos].offset = free_ptr_;
   }
-  size_t pos = Find(key);
-  RowPointer* rows = Rows();
-  rows[pos].offset = free_ptr_;
-  rows[pos].size = physical_size;
-  free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
-  free_ptr_ += SerializeStringView(Payload() + free_ptr_, redo);
+  free_size_ += rows_[pos].size;
+  free_size_ -= physical_size;
+  rows_[pos].size = physical_size;
+  bin_size_t write_offset = rows_[pos].offset;
+  write_offset += SerializeStringView(Payload() + write_offset, key);
+  SerializeStringView(Payload() + write_offset, redo);
 }
 
 Status LeafPage::Delete(page_id_t page_id, Transaction& txn,
@@ -145,31 +131,29 @@ Status LeafPage::Delete(page_id_t page_id, Transaction& txn,
 }
 
 void LeafPage::DeleteImpl(std::string_view key) {
-  assert(0 < row_count_);
-  RowPointer* rows = Rows();
   size_t pos = Find(key);
-  assert(0 <= pos);
   assert(pos < row_count_);
-  free_size_ += rows[pos].size + sizeof(RowPointer);
-  memmove(rows + 1, rows, sizeof(RowPointer) * pos);
+  free_size_ += rows_[pos].size + sizeof(RowPointer);
+  memmove(rows_ + pos, rows_ + pos + 1,
+          sizeof(RowPointer) * (row_count_ - pos));
   --row_count_;
 }
 
-Status LeafPage::Read(page_id_t pid, Transaction& txn, slot_t slot,
+Status LeafPage::Read(page_id_t, Transaction&, slot_t slot,
                       std::string_view* result) const {
   if (row_count_ <= slot) return Status::kNotExists;
   *result = GetValue(slot);
   return Status::kSuccess;
 }
 
-Status LeafPage::ReadKey(page_id_t page_id, Transaction& txn, slot_t slot,
+Status LeafPage::ReadKey(page_id_t, Transaction&, slot_t slot,
                          std::string_view* result) const {
   if (row_count_ <= slot) return Status::kNotExists;
   *result = GetKey(slot);
   return Status::kSuccess;
 }
 
-Status LeafPage::Read(page_id_t pid, Transaction& txn, std::string_view key,
+Status LeafPage::Read(page_id_t, Transaction&, std::string_view key,
                       std::string_view* result = nullptr) const {
   if (result) *result = std::string_view();
   size_t pos = Find(key);
@@ -181,14 +165,14 @@ Status LeafPage::Read(page_id_t pid, Transaction& txn, std::string_view key,
   }
 }
 
-Status LeafPage::LowestKey(Transaction& txn, std::string_view* result) const {
+Status LeafPage::LowestKey(Transaction&, std::string_view* result) const {
   *result = std::string_view();
   if (row_count_ == 0) return Status::kNotExists;
   *result = GetKey(0);
   return Status::kSuccess;
 }
 
-Status LeafPage::HighestKey(Transaction& txn, std::string_view* result) const {
+Status LeafPage::HighestKey(Transaction&, std::string_view* result) const {
   *result = std::string_view();
   if (row_count_ == 0) return Status::kNotExists;
   *result = GetKey(row_count_ - 1);
@@ -220,7 +204,7 @@ void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
   }
   size_t pos = Find(key);
   size_t consumed_size = 0;
-  for (int mid = 0; mid < pos; ++mid) {
+  for (size_t mid = 0; mid < pos; ++mid) {
     consumed_size += SerializeSize(GetKey(mid)) + SerializeSize(GetValue(mid)) +
                      sizeof(RowPointer);
   }
@@ -230,7 +214,7 @@ void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
     pos++;
   }
 
-  const int original_row_count = row_count_;
+  const size_t original_row_count = row_count_;
   for (size_t i = pos; i < row_count_; ++i) {
     right->Insert(txn, GetKey(i), GetValue(i));
   }
@@ -245,15 +229,14 @@ void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
 void LeafPage::DeFragment() {
   std::vector<std::string> payloads;
   payloads.reserve(row_count_);
-  RowPointer* rows = Rows();
   for (size_t i = 0; i < row_count_; ++i) {
-    payloads.emplace_back(Payload() + rows[i].offset, rows[i].size);
+    payloads.emplace_back(Payload() + rows_[i].offset, rows_[i].size);
   }
-  bin_size_t offset = sizeof(LeafPage);
+  bin_size_t offset = kPageBodySize;
   for (size_t i = 0; i < row_count_; ++i) {
-    rows[i].offset = offset;
+    offset -= payloads[i].size();
+    rows_[i].offset = offset;
     memcpy(Payload() + offset, payloads[i].data(), payloads[i].size());
-    offset += payloads[i].size();
   }
   free_ptr_ = offset;
 }
@@ -277,7 +260,7 @@ void LeafPage::Dump(std::ostream& o, int indent) const {
     << " FreePtr:" << free_ptr_;
   for (size_t i = 0; i < row_count_; ++i) {
     o << "\n"
-      << Indent(indent) << OmittedString(GetKey(i), 20) << ": "
+      << Indent(indent) << OmittedString(GetKey(i), 20) << " :"
       << OmittedString(GetValue(i), 20);
   }
 }

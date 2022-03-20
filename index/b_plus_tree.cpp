@@ -145,13 +145,40 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
     return InsertInternal(txn, middle_key, target->PageID(), new_page->PageID(),
                           parents);
   }
-  throw std::runtime_error("unknown insert status");
+  return s;
 }
 
 Status BPlusTree::Update(Transaction& txn, std::string_view key,
                          std::string_view value) {
   PageRef leaf = FindLeaf(txn, key, pm_->GetPage(root_));
-  return leaf->Update(txn, key, value);
+  Status s = leaf->Update(txn, key, value);
+  if (s == Status::kSuccess) return Status::kSuccess;
+  if (s == Status::kNoSpace) {
+    // No enough space? Split!
+    leaf->Delete(txn, key);
+    leaf.PageUnlock();
+    std::vector<PageRef> parents;
+    PageRef target = FindLeafForInsert(txn, key, pm_->GetPage(root_), parents);
+    PageRef new_page = pm_->AllocateNewPage(txn, PageType::kLeafPage);
+    target->body.leaf_page.Split(target->PageID(), txn, key, value,
+                                 new_page.get());
+    target.PageUnlock();
+    if ([&]() {
+          if (new_page->RowCount() == 0 || new_page->GetKey(0) < key) {
+            return new_page->Insert(txn, key, value);
+          } else {
+            return target->Insert(txn, key, value);
+          }
+        }() != Status::kSuccess) {
+      throw std::runtime_error("cannot update new key/value, it's bug");
+    }
+    std::string_view middle_key;
+    new_page->LowestKey(txn, &middle_key);
+    new_page.PageUnlock();
+    return InsertInternal(txn, middle_key, target->PageID(), new_page->PageID(),
+                          parents);
+  }
+  return s;
 }
 Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
   PageRef leaf = FindLeaf(txn, key, pm_->GetPage(root_));

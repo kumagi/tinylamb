@@ -92,7 +92,6 @@ class RowPageTest : public ::testing::Test {
     auto txn = tm_->Begin();
     PageRef page = p_->GetPage(page_id_);
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-
     ASSERT_SUCCESS(page->Delete(txn, slot));
     if (commit) {
       ASSERT_SUCCESS(txn.PreCommit());

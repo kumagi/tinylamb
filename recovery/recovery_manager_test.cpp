@@ -88,13 +88,13 @@ TEST_F(RecoveryManagerTest, UpdateAbort) {
   PageRef page = p_->GetPage(page_id_);
   ASSERT_FALSE(page.IsNull());
   ASSERT_EQ(page->Type(), PageType::kRowPage);
-
+  
   const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
   ASSERT_SUCCESS(page->Update(txn, 0, after));
   page.PageUnlock();
 
   ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
-            before_size - before.length() + after.length());
+            before_size + before.length() - after.length());
   txn.Abort();
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), before);
