@@ -121,7 +121,7 @@ void RowPage::DeleteRow(slot_t slot) {
   }
 }
 
-size_t RowPage::RowCount() const { return row_count_; }
+slot_t RowPage::RowCount() const { return row_count_; }
 
 void RowPage::DeFragment() {
   // FIXME: replace it with inplace one?

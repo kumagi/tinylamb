@@ -236,15 +236,15 @@ TEST_F(TableTest, UpdateHeavy) {
   std::vector<RowPosition> rps;
   rps.reserve(kCount);
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString((19937 * i) % 120 + 10);
+    std::string key = RandomString((19937 * i) % 120 + 10, false);
     Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
     ASSERT_SUCCESS(table_->Insert(txn, new_row, &rp));
     rps.push_back(rp);
   }
   Row read;
-  for (int i = 0; i < kCount * 2; ++i) {
+  for (int i = 0; i < kCount * 4; ++i) {
     RowPosition& pos = rps[(i * 63) % rps.size()];
-    std::string key = RandomString((19937 * i) % 3200 + 5000);
+    std::string key = RandomString((19937 * i) % 3200 + 5000, false);
     Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
     ASSERT_SUCCESS(table_->Update(txn, new_row, &pos));
   }

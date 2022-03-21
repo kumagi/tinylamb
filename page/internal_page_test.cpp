@@ -33,11 +33,11 @@ class InternalPageTest : public ::testing::Test {
 
   void Flush() { p_->GetPool()->FlushPageForTest(internal_page_id_); }
 
-  void AssertPIDForKey(page_id_t pid, std::string_view key,
-                       page_id_t expected) {
-    auto txn = tm_->Begin();
-    PageRef p = p_->GetPage(pid);
+  PageRef Page() { return p_->GetPage(internal_page_id_); }
 
+  void AssertPIDForKey(std::string_view key, page_id_t expected) {
+    auto txn = tm_->Begin();
+    PageRef p = Page();
     page_id_t value;
     ASSERT_SUCCESS(p->GetPageForKey(txn, key, &value));
     ASSERT_EQ(value, expected);
@@ -73,13 +73,13 @@ class InternalPageTest : public ::testing::Test {
   std::unique_ptr<Logger> l_;
   std::unique_ptr<RecoveryManager> r_;
   std::unique_ptr<TransactionManager> tm_;
-  page_id_t internal_page_id_;
+  page_id_t internal_page_id_{0};
 };
 
 TEST_F(InternalPageTest, Construct) {}
 TEST_F(InternalPageTest, SetMinimumTree) {
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(internal_page_id_);
+  PageRef page = Page();
   page->SetLowestValue(txn, 100);
   ASSERT_SUCCESS(page->Insert(txn, "b", 200));
 }
@@ -92,14 +92,14 @@ TEST_F(InternalPageTest, GetPageForKeyMinimum) {
     ASSERT_SUCCESS(page->Insert(txn, "b", 200));
     txn.PreCommit();
   }
-  AssertPIDForKey(internal_page_id_, "alpha", 100);
-  AssertPIDForKey(internal_page_id_, "b", 200);
-  AssertPIDForKey(internal_page_id_, "delta", 200);
+  AssertPIDForKey("alpha", 100);
+  AssertPIDForKey("b", 200);
+  AssertPIDForKey("delta", 200);
 }
 
 TEST_F(InternalPageTest, InsertKey) {
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(internal_page_id_);
+  PageRef page = Page();
   page->SetLowestValue(txn, 100);
   ASSERT_SUCCESS(page->Insert(txn, "d", 200));
   ASSERT_SUCCESS(page->Insert(txn, "a", 10));
@@ -113,7 +113,7 @@ TEST_F(InternalPageTest, InsertKey) {
 TEST_F(InternalPageTest, GetPageForKey) {
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = Page();
     page->SetLowestValue(txn, 2);
 
     ASSERT_SUCCESS(page->Insert(txn, "c", 23));
@@ -122,15 +122,15 @@ TEST_F(InternalPageTest, GetPageForKey) {
     ASSERT_SUCCESS(txn.PreCommit());
   }
 
-  AssertPIDForKey(internal_page_id_, "alpha", 2);
-  AssertPIDForKey(internal_page_id_, "b", 20);
-  AssertPIDForKey(internal_page_id_, "c", 23);
-  AssertPIDForKey(internal_page_id_, "zeta", 40);
+  AssertPIDForKey("alpha", 2);
+  AssertPIDForKey("b", 20);
+  AssertPIDForKey("c", 23);
+  AssertPIDForKey("zeta", 40);
 }
 
 TEST_F(InternalPageTest, InsertAndGetKey) {
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(internal_page_id_);
+  PageRef page = Page();
   page->SetLowestValue(txn, 100);
 
   page_id_t pid;
@@ -174,7 +174,7 @@ TEST_F(InternalPageTest, InsertAndGetKey) {
 TEST_F(InternalPageTest, UpdateKey) {
   auto txn = tm_->Begin();
   {
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = Page();
     page->SetLowestValue(txn, 100);
     ASSERT_SUCCESS(page->Insert(txn, "a", 1));
     ASSERT_SUCCESS(page->Insert(txn, "b", 2));
@@ -189,15 +189,15 @@ TEST_F(InternalPageTest, UpdateKey) {
     txn.PreCommit();
   }
 
-  AssertPIDForKey(internal_page_id_, "a", 5);
-  AssertPIDForKey(internal_page_id_, "b", 6);
-  AssertPIDForKey(internal_page_id_, "c", 7);
-  AssertPIDForKey(internal_page_id_, "d", 8);
+  AssertPIDForKey("a", 5);
+  AssertPIDForKey("b", 6);
+  AssertPIDForKey("c", 7);
+  AssertPIDForKey("d", 8);
 }
 
 TEST_F(InternalPageTest, DeleteKey) {
   auto txn = tm_->Begin();
-  PageRef page = p_->GetPage(internal_page_id_);
+  PageRef page = Page();
   page->SetLowestValue(txn, 2);
   ASSERT_SUCCESS(page->Insert(txn, "c", 23));
   ASSERT_SUCCESS(page->Insert(txn, "b", 20));
@@ -222,7 +222,6 @@ TEST_F(InternalPageTest, SplitInto) {
     for (int j = 0; j < 8; ++j) {
       ASSERT_SUCCESS(page->Insert(txn, std::string(4000, '0' + j), j + 1));
     }
-    LOG(TRACE) << *page;
 
     PageRef right = p_->AllocateNewPage(txn, PageType::kInternalPage);
     std::string mid;
@@ -233,7 +232,7 @@ TEST_F(InternalPageTest, SplitInto) {
 TEST_F(InternalPageTest, Recovery) {
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = Page();
     page->SetLowestValue(txn, 2);
 
     ASSERT_SUCCESS(page->Insert(txn, "c", 23));
@@ -245,16 +244,16 @@ TEST_F(InternalPageTest, Recovery) {
   Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
-  AssertPIDForKey(internal_page_id_, "alpha", 2);
-  AssertPIDForKey(internal_page_id_, "b", 20);
-  AssertPIDForKey(internal_page_id_, "c", 23);
-  AssertPIDForKey(internal_page_id_, "zeta", 40);
+  AssertPIDForKey("alpha", 2);
+  AssertPIDForKey("b", 20);
+  AssertPIDForKey("c", 23);
+  AssertPIDForKey("zeta", 40);
 }
 
 TEST_F(InternalPageTest, InsertCrash) {
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = Page();
     page->SetLowestValue(txn, 2);
 
     Flush();
@@ -263,7 +262,7 @@ TEST_F(InternalPageTest, InsertCrash) {
   }
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = Page();
     ASSERT_SUCCESS(page->Insert(txn, "b", 20));
     ASSERT_SUCCESS(page->Insert(txn, "e", 40));
   }
@@ -271,16 +270,16 @@ TEST_F(InternalPageTest, InsertCrash) {
   Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
-  AssertPIDForKey(internal_page_id_, "alpha", 2);
-  AssertPIDForKey(internal_page_id_, "b", 2);
-  AssertPIDForKey(internal_page_id_, "c", 23);
-  AssertPIDForKey(internal_page_id_, "zeta", 23);
+  AssertPIDForKey("alpha", 2);
+  AssertPIDForKey("b", 2);
+  AssertPIDForKey("c", 23);
+  AssertPIDForKey("zeta", 23);
 }
 
 TEST_F(InternalPageTest, InsertAbort) {
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = Page();
     page->SetLowestValue(txn, 2);
 
     ASSERT_SUCCESS(page->Insert(txn, "c", 23));
@@ -289,7 +288,7 @@ TEST_F(InternalPageTest, InsertAbort) {
   {
     auto txn = tm_->Begin();
     {
-      PageRef page = p_->GetPage(internal_page_id_);
+      PageRef page = Page();
       ASSERT_SUCCESS(page->Insert(txn, "b", 20));
       ASSERT_SUCCESS(page->Insert(txn, "e", 40));
     }
@@ -300,16 +299,16 @@ TEST_F(InternalPageTest, InsertAbort) {
   Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
-  AssertPIDForKey(internal_page_id_, "alpha", 2);
-  AssertPIDForKey(internal_page_id_, "b", 2);
-  AssertPIDForKey(internal_page_id_, "c", 23);
-  AssertPIDForKey(internal_page_id_, "zeta", 23);
+  AssertPIDForKey("alpha", 2);
+  AssertPIDForKey("b", 2);
+  AssertPIDForKey("c", 23);
+  AssertPIDForKey("zeta", 23);
 }
 
 TEST_F(InternalPageTest, UpdateCrash) {
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = Page();
     page->SetLowestValue(txn, 2);
     ASSERT_SUCCESS(page->Insert(txn, "c", 23));
     ASSERT_SUCCESS(page->Insert(txn, "b", 20));
@@ -318,7 +317,7 @@ TEST_F(InternalPageTest, UpdateCrash) {
   }
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = Page();
     ASSERT_SUCCESS(page->Update(txn, "b", 200));
     ASSERT_SUCCESS(page->Update(txn, "e", 400));
     txn.PreCommit();
@@ -328,16 +327,16 @@ TEST_F(InternalPageTest, UpdateCrash) {
   Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
-  AssertPIDForKey(internal_page_id_, "alpha", 2);
-  AssertPIDForKey(internal_page_id_, "b", 200);
-  AssertPIDForKey(internal_page_id_, "c", 23);
-  AssertPIDForKey(internal_page_id_, "zeta", 400);
+  AssertPIDForKey("alpha", 2);
+  AssertPIDForKey("b", 200);
+  AssertPIDForKey("c", 23);
+  AssertPIDForKey("zeta", 400);
 }
 
 TEST_F(InternalPageTest, UpdateAbort) {
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = Page();
     page->SetLowestValue(txn, 2);
     ASSERT_SUCCESS(page->Insert(txn, "c", 23));
     ASSERT_SUCCESS(page->Insert(txn, "b", 20));
@@ -347,7 +346,7 @@ TEST_F(InternalPageTest, UpdateAbort) {
   {
     auto txn = tm_->Begin();
     {
-      PageRef page = p_->GetPage(internal_page_id_);
+      PageRef page = Page();
       ASSERT_SUCCESS(page->Update(txn, "b", 2000));
       ASSERT_SUCCESS(page->Update(txn, "e", 4000));
     }
@@ -357,16 +356,16 @@ TEST_F(InternalPageTest, UpdateAbort) {
   Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
-  AssertPIDForKey(internal_page_id_, "alpha", 2);
-  AssertPIDForKey(internal_page_id_, "b", 20);
-  AssertPIDForKey(internal_page_id_, "c", 23);
-  AssertPIDForKey(internal_page_id_, "zeta", 40);
+  AssertPIDForKey("alpha", 2);
+  AssertPIDForKey("b", 20);
+  AssertPIDForKey("c", 23);
+  AssertPIDForKey("zeta", 40);
 }
 
 TEST_F(InternalPageTest, DeleteCrash) {
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = Page();
     page->SetLowestValue(txn, 2);
     ASSERT_SUCCESS(page->Insert(txn, "b", 20));
     ASSERT_SUCCESS(page->Insert(txn, "e", 40));
@@ -376,7 +375,7 @@ TEST_F(InternalPageTest, DeleteCrash) {
   }
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = Page();
     ASSERT_SUCCESS(page->Delete(txn, "b"));
     ASSERT_SUCCESS(page->Delete(txn, "e"));
   }
@@ -384,16 +383,16 @@ TEST_F(InternalPageTest, DeleteCrash) {
   Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
-  AssertPIDForKey(internal_page_id_, "alpha", 2);
-  AssertPIDForKey(internal_page_id_, "b", 20);
-  AssertPIDForKey(internal_page_id_, "c", 23);
-  AssertPIDForKey(internal_page_id_, "zeta", 40);
+  AssertPIDForKey("alpha", 2);
+  AssertPIDForKey("b", 20);
+  AssertPIDForKey("c", 23);
+  AssertPIDForKey("zeta", 40);
 }
 
 TEST_F(InternalPageTest, DeleteAbort) {
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = Page();
     page->SetLowestValue(txn, 2);
     ASSERT_SUCCESS(page->Insert(txn, "b", 20));
     ASSERT_SUCCESS(page->Insert(txn, "e", 40));
@@ -403,7 +402,7 @@ TEST_F(InternalPageTest, DeleteAbort) {
   {
     auto txn = tm_->Begin();
     {
-      PageRef page = p_->GetPage(internal_page_id_);
+      PageRef page = Page();
       ASSERT_SUCCESS(page->Delete(txn, "b"));
       ASSERT_SUCCESS(page->Delete(txn, "e"));
     }
@@ -414,10 +413,44 @@ TEST_F(InternalPageTest, DeleteAbort) {
   Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
-  AssertPIDForKey(internal_page_id_, "alpha", 2);
-  AssertPIDForKey(internal_page_id_, "b", 20);
-  AssertPIDForKey(internal_page_id_, "c", 23);
-  AssertPIDForKey(internal_page_id_, "zeta", 40);
+  AssertPIDForKey("alpha", 2);
+  AssertPIDForKey("b", 20);
+  AssertPIDForKey("c", 23);
+  AssertPIDForKey("zeta", 40);
 }
 
+TEST_F(InternalPageTest, UpdateHeavy) {
+  std::mt19937 random(0);
+  constexpr int kCount = 40;
+  Transaction txn = tm_->Begin();
+  std::vector<std::string> keys;
+  std::unordered_map<std::string, page_id_t> kvp;
+  keys.reserve(kCount);
+  PageRef page = Page();
+  page->SetLowestValue(txn, 999);
+  for (int i = 0; i < kCount; ++i) {
+    std::string key = RandomString((19937 * i) % 12 + 10);
+    page_id_t value = random() % 10000;
+    ASSERT_SUCCESS(page->Insert(txn, key, value));
+    keys.push_back(key);
+    kvp.emplace(key, value);
+  }
+  for (int i = 0; i < kCount * 4; ++i) {
+    {
+      auto iter = kvp.begin();
+      std::advance(iter, random() % kvp.size());
+      ASSERT_SUCCESS(page->Delete(txn, iter->first));
+      kvp.erase(iter);
+    }
+    std::string key = RandomString((19937 * i) % 32 + 100);
+    page_id_t value = random() % 10000;
+    ASSERT_SUCCESS(page->Insert(txn, key, value));
+    kvp[key] = value;
+  }
+  for (const auto& kv : kvp) {
+    page_id_t val;
+    page->GetPageForKey(txn, kv.first, &val);
+    ASSERT_EQ(kvp[kv.first], val);
+  }
+}
 }  // namespace tinylamb

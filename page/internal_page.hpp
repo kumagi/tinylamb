@@ -27,17 +27,15 @@ class InternalPage {
     // Physical row size in bytes (required to get exact size for logging).
     bin_size_t size = 0;
   };
-  RowPointer* Rows();
-  [[nodiscard]] const RowPointer* Rows() const;
 
  public:
   void Initialize() {
     lowest_page_ = 0;
     row_count_ = 0;
-    free_ptr_ = sizeof(InternalPage);
+    free_ptr_ = kPageBodySize;
     free_size_ = kPageBodySize - sizeof(InternalPage);
   }
-  bin_size_t RowCount() const;
+  [[nodiscard]] slot_t RowCount() const;
 
   void SetLowestValue(page_id_t pid, Transaction& txn, page_id_t value);
 
@@ -74,12 +72,13 @@ class InternalPage {
  private:
   friend class std::hash<InternalPage>;
   friend class BPlusTree;
+  void DeFragment();
 
-  bin_size_t row_count_ = 0;
+  slot_t row_count_ = 0;
   page_id_t lowest_page_ = 0;
   bin_size_t free_ptr_ = sizeof(InternalPage);
   bin_size_t free_size_ = kPageBodySize - sizeof(InternalPage);
-  void Defragment();
+  RowPointer rows_[0];
 };
 
 }  // namespace tinylamb

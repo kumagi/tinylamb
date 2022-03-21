@@ -36,7 +36,6 @@ class Page {
 
   // Row page manipulations.
   Status Read(Transaction& txn, slot_t slot, std::string_view* result) const;
-  Status Read(Transaction& txn, std::string_view key, page_id_t* result) const;
 
   Status Insert(Transaction& txn, std::string_view record, slot_t* slot);
 
@@ -44,7 +43,7 @@ class Page {
 
   Status Delete(Transaction& txn, slot_t pos);
 
-  [[nodiscard]] size_t RowCount() const;
+  [[nodiscard]] slot_t RowCount() const;
 
   Status ReadKey(Transaction& txn, const uint16_t& slot,
                  std::string_view* result) const;

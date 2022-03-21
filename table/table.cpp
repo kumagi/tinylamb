@@ -4,7 +4,6 @@
 
 #include "table/table.hpp"
 
-#include "common/debug.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "index/b_plus_tree.hpp"
@@ -36,6 +35,7 @@ Status Table::Insert(Transaction& txn, const Row& row, RowPosition* rp) {
   for (auto& idx : indices_) {
     BPlusTree bpt(idx.pid_, pm_);
     s = bpt.Insert(txn, idx.GenerateKey(row), rp->Serialize());
+    LOG(TRACE) << "insert: " << idx.GenerateKey(row);
     if (s != Status::kSuccess) return s;
   }
   return s;
@@ -49,8 +49,8 @@ Status Table::Update(Transaction& txn, const Row& row, RowPosition* pos) {
   for (const auto& idx : indices_) {
     BPlusTree bpt(idx.pid_, pm_);
     s = bpt.Delete(txn, idx.GenerateKey(original_row));
-    if (s != Status::kSuccess) return s;
-    s = bpt.Insert(txn, idx.GenerateKey(row), pos->Serialize());
+    LOG(DEBUG) << "delete: " << idx.GenerateKey(original_row);
+    STATUS(s, "delete index");
     if (s != Status::kSuccess) return s;
   }
   std::string serialized_row(row.Size(), '\0');
@@ -71,6 +71,11 @@ Status Table::Update(Transaction& txn, const Row& row, RowPosition* pos) {
     }
     *pos = new_row_pos;
     last_pid_ = new_page->PageID();
+  }
+  for (const auto& idx : indices_) {
+    BPlusTree bpt(idx.pid_, pm_);
+    s = bpt.Insert(txn, idx.GenerateKey(row), pos->Serialize());
+    if (s != Status::kSuccess) return s;
   }
   return s;
 }

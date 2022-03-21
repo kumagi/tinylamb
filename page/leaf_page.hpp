@@ -54,7 +54,7 @@ class LeafPage {
   [[nodiscard]] std::string_view GetValue(size_t idx) const;
   Status LowestKey(Transaction& txn, std::string_view* result) const;
   Status HighestKey(Transaction& txn, std::string_view* result) const;
-  [[nodiscard]] size_t RowCount() const;
+  [[nodiscard]] slot_t RowCount() const;
   Status SetPrevNext(page_id_t pid, Transaction& txn, page_id_t prev,
                      page_id_t next);
 
@@ -82,8 +82,8 @@ class LeafPage {
   page_id_t prev_pid_ = 0;
   page_id_t next_pid_ = 0;
   slot_t row_count_ = 0;
-  bin_size_t free_ptr_ = kPageSize;
-  bin_size_t free_size_ = kPageSize - sizeof(LeafPage);
+  bin_size_t free_ptr_ = kPageBodySize;
+  bin_size_t free_size_ = kPageBodySize - sizeof(LeafPage);
   RowPointer rows_[0];
 };
 

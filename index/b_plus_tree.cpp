@@ -40,9 +40,10 @@ PageRef BPlusTree::FindLeaf(Transaction& txn, std::string_view key,
 }
 
 Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
-                                 page_id_t left, page_id_t right,
+                                 page_id_t right,
                                  std::vector<PageRef>& parents) {
   if (parents.empty()) {
+    // Swap parent node to internal node.
     PageRef root = pm_->GetPage(root_);
     if (root->Type() == PageType::kInternalPage) {
       const InternalPage& root_page = root->body.internal_page;
@@ -90,8 +91,7 @@ Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
       }();
       if (s != Status::kSuccess) return s;
       internal.PageUnlock();
-      return InsertInternal(txn, new_key, internal->PageID(),
-                            new_node->PageID(), parents);
+      return InsertInternal(txn, new_key, new_node->PageID(), parents);
     }
     throw std::runtime_error("unknown status:" + std::string(ToString(s)));
   }
@@ -130,20 +130,17 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
     target->body.leaf_page.Split(target->PageID(), txn, key, value,
                                  new_page.get());
     target.PageUnlock();
-    if ([&]() {
-          if (new_page->RowCount() == 0 || new_page->GetKey(0) < key) {
-            return new_page->Insert(txn, key, value);
-          } else {
-            return target->Insert(txn, key, value);
-          }
-        }() != Status::kSuccess) {
-      throw std::runtime_error("cannot insert new key/value, it's bug");
+    if (new_page->RowCount() == 0 || new_page->GetKey(0) < key) {
+      s = new_page->Insert(txn, key, value);
+      STATUS(s, "new_page");
+    } else {
+      s = target->Insert(txn, key, value);
+      STATUS(s, "BPT, target");
     }
     std::string_view middle_key;
     new_page->LowestKey(txn, &middle_key);
     new_page.PageUnlock();
-    return InsertInternal(txn, middle_key, target->PageID(), new_page->PageID(),
-                          parents);
+    return InsertInternal(txn, middle_key, new_page->PageID(), parents);
   }
   return s;
 }
@@ -163,20 +160,18 @@ Status BPlusTree::Update(Transaction& txn, std::string_view key,
     target->body.leaf_page.Split(target->PageID(), txn, key, value,
                                  new_page.get());
     target.PageUnlock();
-    if ([&]() {
-          if (new_page->RowCount() == 0 || new_page->GetKey(0) < key) {
-            return new_page->Insert(txn, key, value);
-          } else {
-            return target->Insert(txn, key, value);
-          }
-        }() != Status::kSuccess) {
-      throw std::runtime_error("cannot update new key/value, it's bug");
+    if (new_page->RowCount() == 0 || new_page->GetKey(0) < key) {
+      s = new_page->Insert(txn, key, value);
+      STATUS(s, "new_page");
+    } else {
+      s = target->Insert(txn, key, value);
+      STATUS(s, "BPT, target");
     }
+    LOG(DEBUG) << s;
     std::string_view middle_key;
     new_page->LowestKey(txn, &middle_key);
     new_page.PageUnlock();
-    return InsertInternal(txn, middle_key, target->PageID(), new_page->PageID(),
-                          parents);
+    return InsertInternal(txn, middle_key, new_page->PageID(), parents);
   }
   return s;
 }
@@ -240,7 +235,7 @@ void BPlusTree::DumpInternal(Transaction& txn, std::ostream& o, PageRef&& page,
       o << Indent(indent) << "I[" << page->PageID()
         << "]: " << OmittedString(key, 20) << "\n";
       page_id_t pid;
-      if (page->Read(txn, key, &pid) == Status::kSuccess) {
+      if (page->GetPageForKey(txn, key, &pid) == Status::kSuccess) {
         DumpInternal(txn, o, pm_->GetPage(pid), indent + 4);
       }
     }

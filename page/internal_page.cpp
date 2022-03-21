@@ -12,7 +12,7 @@ namespace tinylamb {
 
 namespace {
 
-std::string OmittedString(std::string_view original, int length) {
+std::string OmittedString(std::string_view original, size_t length) {
   if (length < original.length()) {
     std::string omitted_key = std::string(original).substr(0, 8);
     omitted_key +=
@@ -26,17 +26,7 @@ std::string OmittedString(std::string_view original, int length) {
 
 }  // anonymous namespace
 
-InternalPage::RowPointer* InternalPage::Rows() {
-  return reinterpret_cast<RowPointer*>(Payload() + kPageBodySize -
-                                       row_count_ * sizeof(RowPointer));
-}
-
-const InternalPage::RowPointer* InternalPage::Rows() const {
-  return reinterpret_cast<const RowPointer*>(Payload() + kPageBodySize -
-                                             row_count_ * sizeof(RowPointer));
-}
-
-bin_size_t InternalPage::RowCount() const { return row_count_; }
+slot_t InternalPage::RowCount() const { return row_count_; }
 
 void InternalPage::SetLowestValue(page_id_t pid, Transaction& txn,
                                   page_id_t value) {
@@ -46,59 +36,44 @@ void InternalPage::SetLowestValue(page_id_t pid, Transaction& txn,
 
 Status InternalPage::Insert(page_id_t pid, Transaction& txn,
                             std::string_view key, page_id_t value) {
-  const bin_size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
-  size_t pos = SearchToInsert(key);
+  const bin_size_t physical_size = SerializeSize(key) + sizeof(value);
   if (free_size_ < physical_size + sizeof(RowPointer)) return Status::kNoSpace;
+  size_t pos = SearchToInsert(key);
   if (pos != row_count_ && GetKey(pos) == key) return Status::kDuplicates;
-
   InsertImpl(key, value);
   txn.InsertInternalLog(pid, key, value);
   return Status::kSuccess;
 }
 
 void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
-  const bin_size_t physical_size =
-      sizeof(bin_size_t) + key.size() + sizeof(page_id_t);
+  const bin_size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
   free_size_ -= physical_size + sizeof(RowPointer);
-
-  if (kPageSize - sizeof(RowPointer) * (row_count_ + 1) <
-      free_ptr_ + physical_size) {
-    Defragment();
+  if (free_ptr_ < sizeof(RowPointer) * (row_count_ + 1) + physical_size) {
+    DeFragment();
   }
   const int pos = SearchToInsert(key);
-  RowPointer* rows = Rows();
-  memmove(rows - 1, rows, pos * sizeof(RowPointer));
-  rows[pos - 1].offset = free_ptr_;
-  rows[pos - 1].size = physical_size;
-  free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
-  free_ptr_ += SerializePID(Payload() + free_ptr_, pid);
   ++row_count_;
+  assert(physical_size <= free_ptr_);
+  free_ptr_ -= physical_size;
+  SerializePID(Payload() + free_ptr_, pid);
+  SerializeStringView(Payload() + free_ptr_ + sizeof(page_id_t), key);
+  memmove(rows_ + pos + 1, rows_ + pos,
+          (row_count_ - pos) * sizeof(RowPointer));
+  rows_[pos].offset = free_ptr_;
+  rows_[pos].size = physical_size;
 }
 
 Status InternalPage::Update(page_id_t pid, Transaction& txn,
                             std::string_view key, page_id_t value) {
-  const bin_size_t physical_size =
-      sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + sizeof(page_id_t);
   const size_t pos = Search(key);
   if (row_count_ < pos || GetKey(pos) != key) return Status::kNotExists;
-  if (free_size_ < physical_size - GetKey(pos).size()) {
-    return Status::kNoSpace;
-  }
-
   txn.UpdateInternalLog(pid, key, GetValue(pos), value);
   UpdateImpl(key, value);
   return Status::kSuccess;
 }
 
 void InternalPage::UpdateImpl(std::string_view key, page_id_t pid) {
-  const bin_size_t pos = Search(key);
-  const bin_size_t offset = free_ptr_;
-  free_size_ += GetKey(pos).size() - key.size();
-  free_ptr_ += SerializeStringView(Payload() + free_ptr_, key);
-  free_ptr_ += SerializePID(Payload() + free_ptr_, pid);
-  RowPointer* rows = Rows();
-  rows[pos].offset = offset;
-  rows[pos].size = free_ptr_ - offset;
+  memcpy(Payload() + rows_[Search(key)].offset, &pid, sizeof(pid));
 }
 
 Status InternalPage::Delete(page_id_t pid, Transaction& txn,
@@ -113,23 +88,23 @@ Status InternalPage::Delete(page_id_t pid, Transaction& txn,
 
 void InternalPage::DeleteImpl(std::string_view key) {
   assert(0 < row_count_);
-  const bin_size_t pos = Search(key);
+  size_t pos = Search(key);
   assert(pos < row_count_);
-  free_size_ += GetKey(pos).size() + sizeof(bin_size_t) + sizeof(RowPointer);
-  RowPointer* rows = Rows();
-  memmove(rows + 1, rows, sizeof(RowPointer) * pos);
-  row_count_--;
+  free_size_ += GetKey(pos).length() + sizeof(page_id_t);
+  memmove(rows_ + pos, rows_ + pos + 1,
+          sizeof(RowPointer) * (row_count_ - pos));
+  --row_count_;
 }
 
 Status InternalPage::GetPageForKey(Transaction& txn, std::string_view key,
                                    page_id_t* result) const {
+  assert(0 < row_count_);
   if (row_count_ == 0) return Status::kNotExists;
   if (key < GetKey(0)) {
     *result = lowest_page_;
-    return Status::kSuccess;
+  } else {
+    *result = GetValue(Search(key));
   }
-  bin_size_t slot = Search(key);
-  *result = GetValue(slot);
   return Status::kSuccess;
 }
 
@@ -141,7 +116,7 @@ void InternalPage::SplitInto(page_id_t pid, Transaction& txn,
       SerializeSize(new_key) + sizeof(page_id_t) + sizeof(RowPointer);
   size_t pos = SearchToInsert(new_key);
   size_t consumed_size = 0;
-  for (int mid = 0; mid < pos; ++mid) {
+  for (size_t mid = 0; mid < pos; ++mid) {
     consumed_size +=
         SerializeSize(GetKey(mid)) + sizeof(page_id_t) + sizeof(RowPointer);
   }
@@ -151,7 +126,7 @@ void InternalPage::SplitInto(page_id_t pid, Transaction& txn,
     pos++;
   }
   if (pos == row_count_) --pos;
-  const int original_row_count = row_count_;
+  const size_t original_row_count = row_count_;
   *middle = GetKey(pos);
   right->SetLowestValue(txn, GetValue(pos));
   for (size_t i = pos + 1; i < row_count_; ++i) {
@@ -190,24 +165,15 @@ bin_size_t InternalPage::Search(std::string_view key) const {
 }
 
 std::string_view InternalPage::GetKey(size_t idx) const {
-  const RowPointer* pos =
-      reinterpret_cast<const RowPointer*>(Payload() + kPageBodySize -
-                                          row_count_ * sizeof(RowPointer)) +
-      idx;
   std::string_view key;
-  DeserializeStringView(Payload() + pos->offset, &key);
+  DeserializeStringView(Payload() + rows_[idx].offset + sizeof(page_id_t),
+                        &key);
   return key;
 }
 
 page_id_t InternalPage::GetValue(size_t idx) const {
-  const RowPointer* pos =
-      reinterpret_cast<const RowPointer*>(Payload() + kPageBodySize -
-                                          row_count_ * sizeof(RowPointer)) +
-      idx;
-  std::string_view key = GetKey(idx);
   page_id_t result;
-  memcpy(&result, Payload() + pos->offset + sizeof(bin_size_t) + key.size(),
-         sizeof(result));
+  memcpy(&result, Payload() + rows_[idx].offset, sizeof(result));
   return result;
 }
 
@@ -223,18 +189,17 @@ void InternalPage::Dump(std::ostream& o, int indent) const {
   }
 }
 
-void InternalPage::Defragment() {
+void InternalPage::DeFragment() {
   std::vector<std::string> payloads;
   payloads.reserve(row_count_);
-  RowPointer* rows = Rows();
   for (size_t i = 0; i < row_count_; ++i) {
-    payloads.emplace_back(Payload() + rows[i].offset, rows[i].size);
+    payloads.emplace_back(Payload() + rows_[i].offset, rows_[i].size);
   }
-  bin_size_t offset = sizeof(LeafPage);
+  bin_size_t offset = kPageBodySize;
   for (size_t i = 0; i < row_count_; ++i) {
-    rows[i].offset = offset;
+    offset -= payloads[i].size();
+    rows_[i].offset = offset;
     memcpy(Payload() + offset, payloads[i].data(), payloads[i].size());
-    offset += payloads[i].size();
   }
   free_ptr_ = offset;
 }

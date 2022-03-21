@@ -51,7 +51,7 @@ class RowPage {
 
   Status Delete(page_id_t page_id, Transaction& txn, slot_t slot);
 
-  [[nodiscard]] size_t RowCount() const;
+  [[nodiscard]] slot_t RowCount() const;
 
   [[nodiscard]] bin_size_t FreePtrForTest() const { return free_ptr_; }
   [[nodiscard]] bin_size_t FreeSizeForTest() const { return free_size_; }

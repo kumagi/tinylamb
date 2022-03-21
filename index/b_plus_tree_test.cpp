@@ -287,16 +287,45 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
   std::unordered_map<std::string, std::string> kvp;
   keys.reserve(kCount);
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString((19937 * i) % 12 + 10);
-    std::string value = RandomString((19937 * i) % 120 + 10);
+    std::string key = RandomString((19937 * i) % 12 + 10, false);
+    std::string value = RandomString((19937 * i) % 120 + 10, false);
     ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
     keys.push_back(key);
     kvp.emplace(key, value);
   }
   for (int i = 0; i < kCount; ++i) {
     const std::string& key = keys[(i * 63) % keys.size()];
-    std::string value = RandomString((19937 * i) % 320 + 500);
+    std::string value = RandomString((19937 * i) % 320 + 500, false);
     ASSERT_SUCCESS(bpt_->Update(txn, key, value));
+    kvp[key] = value;
+  }
+  for (const auto& kv : kvp) {
+    std::string_view val;
+    bpt_->Read(txn, kv.first, &val);
+    ASSERT_EQ(kvp[kv.first], val);
+  }
+}
+
+TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
+  constexpr int kCount = 50;
+  Transaction txn = tm_->Begin();
+  std::unordered_map<std::string, std::string> kvp;
+  kvp.reserve(kCount);
+  for (int i = 0; i < kCount; ++i) {
+    std::string key = RandomString((19937 * i) % 12 + 10, false);
+    std::string value = RandomString((19937 * i) % 120 + 10, false);
+    ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
+    kvp.emplace(key, value);
+  }
+  for (int i = 0; i < kCount * 16; ++i) {
+    auto iter = kvp.begin();
+    std::advance(iter, (i * 19937) % kvp.size());
+    ASSERT_SUCCESS(bpt_->Delete(txn, iter->first));
+    kvp.erase(iter);
+
+    std::string key = RandomString((19937 * i) % 130 + 50, false);
+    std::string value = RandomString((19937 * i) % 320 + 500, false);
+    ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
     kvp[key] = value;
   }
   for (const auto& kv : kvp) {

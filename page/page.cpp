@@ -87,12 +87,6 @@ Status Page::Read(Transaction& txn, slot_t slot,
   }
 }
 
-Status Page::Read(Transaction& txn, std::string_view key,
-                  page_id_t* result) const {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  return body.internal_page.GetPageForKey(txn, key, result);
-}
-
 std::string_view Page::GetKey(slot_t slot) const {
   if (type == PageType::kLeafPage) {
     return body.leaf_page.GetKey(slot);
@@ -136,7 +130,7 @@ Status Page::Delete(Transaction& txn, const slot_t pos) {
   return result;
 }
 
-size_t Page::RowCount() const {
+slot_t Page::RowCount() const {
   switch (type) {
     case PageType::kRowPage:
       return body.row_page.RowCount();
