@@ -51,8 +51,8 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kInsertLeaf:
       o << "INSERT LEAF\t";
       break;
-    case LogType::kInsertInternal:
-      o << "INSERT INTERNAL\t";
+    case LogType::kInsertBranch:
+      o << "INSERT BRANCH\t";
       break;
     case LogType::kUpdateRow:
       o << "UPDATE ROW\t";
@@ -60,8 +60,8 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kUpdateLeaf:
       o << "UPDATE LEAF\t";
       break;
-    case LogType::kUpdateInternal:
-      o << "UPDATE INTERNAL\t";
+    case LogType::kUpdateBranch:
+      o << "UPDATE BRANCH\t";
       break;
     case LogType::kDeleteRow:
       o << "DELETE ROW\t";
@@ -69,8 +69,8 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kDeleteLeaf:
       o << "DELETE LEAF\t";
       break;
-    case LogType::kDeleteInternal:
-      o << "DELETE INTERNAL\t";
+    case LogType::kDeleteBranch:
+      o << "DELETE BRANCH\t";
       break;
     case LogType::kCommit:
       o << "COMMIT\t\t";
@@ -81,8 +81,8 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kCompensateInsertLeaf:
       o << "COMPENSATE INSERT LEAF\t";
       break;
-    case LogType::kCompensateInsertInternal:
-      o << "COMPENSATE INSERT INTERNAL\t";
+    case LogType::kCompensateInsertBranch:
+      o << "COMPENSATE INSERT BRANCH\t";
       break;
     case LogType::kCompensateUpdateRow:
       o << "COMPENSATE UPDATE ROW\t";
@@ -90,8 +90,8 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kCompensateUpdateLeaf:
       o << "COMPENSATE UPDATE LEAF\t";
       break;
-    case LogType::kCompensateUpdateInternal:
-      o << "COMPENSATE UPDATE INTERNAL\t";
+    case LogType::kCompensateUpdateBranch:
+      o << "COMPENSATE UPDATE BRANCH\t";
       break;
     case LogType::kCompensateDeleteRow:
       o << "COMPENSATE DELETE ROW\t";
@@ -99,8 +99,8 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kCompensateDeleteLeaf:
       o << "COMPENSATE DELETE LEAF\t";
       break;
-    case LogType::kCompensateDeleteInternal:
-      o << "COMPENSATE DELETE INTERNAL\t";
+    case LogType::kCompensateDeleteBranch:
+      o << "COMPENSATE DELETE BRANCH\t";
       break;
     case LogType::kLowestValue:
       o << "SET LOWEST VALUE\t";
@@ -154,18 +154,18 @@ std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
       l.DumpPosition(o);
       o << "\t\t" << l.undo_data.size() << " bytes ";
       break;
-    case LogType::kCompensateInsertInternal:
-    case LogType::kCompensateUpdateInternal:
-    case LogType::kCompensateDeleteInternal:
-    case LogType::kInsertInternal:
+    case LogType::kCompensateInsertBranch:
+    case LogType::kCompensateUpdateBranch:
+    case LogType::kCompensateDeleteBranch:
+    case LogType::kInsertBranch:
       l.DumpPosition(o);
       o << "\tInsert: " << l.redo_page;
       break;
-    case LogType::kUpdateInternal:
+    case LogType::kUpdateBranch:
       l.DumpPosition(o);
       o << "\tUpdate: " << l.undo_page << " -> " << l.redo_page;
       break;
-    case LogType::kDeleteInternal:
+    case LogType::kDeleteBranch:
       l.DumpPosition(o);
       o << "\tDelete: " << l.undo_page;
       break;
@@ -237,17 +237,17 @@ LogRecord LogRecord::InsertingLeafLogRecord(lsn_t p, txn_id_t txn,
   return l;
 }
 
-LogRecord LogRecord::InsertingInternalLogRecord(lsn_t p, txn_id_t txn,
-                                                page_id_t pid,
-                                                std::string_view key,
-                                                page_id_t value) {
+LogRecord LogRecord::InsertingBranchLogRecord(lsn_t p, txn_id_t txn,
+                                              page_id_t pid,
+                                              std::string_view key,
+                                              page_id_t redo) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
-  l.type = LogType::kInsertInternal;
-  l.redo_page = value;
+  l.type = LogType::kInsertBranch;
+  l.redo_page = redo;
   return l;
 }
 
@@ -271,14 +271,14 @@ LogRecord LogRecord::CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::CompensatingInsertInternalLogRecord(txn_id_t txn,
-                                                         page_id_t pid,
-                                                         std::string_view key) {
+LogRecord LogRecord::CompensatingInsertBranchLogRecord(txn_id_t txn,
+                                                       page_id_t pid,
+                                                       std::string_view key) {
   LogRecord l;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
-  l.type = LogType::kCompensateInsertInternal;
+  l.type = LogType::kCompensateInsertBranch;
   return l;
 }
 
@@ -311,16 +311,16 @@ LogRecord LogRecord::UpdatingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::UpdatingInternalLogRecord(lsn_t p, txn_id_t txn,
-                                               page_id_t pid,
-                                               std::string_view key,
-                                               page_id_t redo, page_id_t undo) {
+LogRecord LogRecord::UpdatingBranchLogRecord(lsn_t p, txn_id_t txn,
+                                             page_id_t pid,
+                                             std::string_view key,
+                                             page_id_t redo, page_id_t undo) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
-  l.type = LogType::kUpdateInternal;
+  l.type = LogType::kUpdateBranch;
   l.redo_page = redo;
   l.undo_page = undo;
   return l;
@@ -350,15 +350,14 @@ LogRecord LogRecord::CompensatingUpdateLeafLogRecord(lsn_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::CompensatingUpdateInternalLogRecord(lsn_t txn,
-                                                         page_id_t pid,
-                                                         std::string_view key,
-                                                         page_id_t redo) {
+LogRecord LogRecord::CompensatingUpdateBranchLogRecord(lsn_t txn, page_id_t pid,
+                                                       std::string_view key,
+                                                       page_id_t redo) {
   LogRecord l;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
-  l.type = LogType::kCompensateUpdateInternal;
+  l.type = LogType::kCompensateUpdateBranch;
   l.redo_page = redo;
   return l;
 }
@@ -388,16 +387,16 @@ LogRecord LogRecord::DeletingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::DeletingInternalLogRecord(lsn_t p, txn_id_t txn,
-                                               page_id_t pid,
-                                               std::string_view key,
-                                               page_id_t undo) {
+LogRecord LogRecord::DeletingBranchLogRecord(lsn_t p, txn_id_t txn,
+                                             page_id_t pid,
+                                             std::string_view key,
+                                             page_id_t undo) {
   LogRecord l;
   l.prev_lsn = p;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
-  l.type = LogType::kDeleteInternal;
+  l.type = LogType::kDeleteBranch;
   l.undo_page = undo;
   return l;
 }
@@ -427,15 +426,15 @@ LogRecord LogRecord::CompensatingDeleteLeafLogRecord(txn_id_t txn,
   return l;
 }
 
-LogRecord LogRecord::CompensatingDeleteInternalLogRecord(txn_id_t txn,
-                                                         page_id_t pid,
-                                                         std::string_view key,
-                                                         page_id_t redo) {
+LogRecord LogRecord::ComnensatingDeleteBranchLogRecord(txn_id_t txn,
+                                                       page_id_t pid,
+                                                       std::string_view slot,
+                                                       page_id_t redo) {
   LogRecord l;
   l.txn_id = txn;
   l.pid = pid;
-  l.key = key;
-  l.type = LogType::kCompensateDeleteInternal;
+  l.key = slot;
+  l.type = LogType::kCompensateDeleteBranch;
   l.redo_page = redo;
   return l;
 }
@@ -569,13 +568,13 @@ size_t LogRecord::Size() const {
       size += SerializeSize(undo_data);
       break;
     case LogType::kLowestValue:
-    case LogType::kInsertInternal:
-    case LogType::kDeleteInternal:
-    case LogType::kCompensateUpdateInternal:
-    case LogType::kCompensateDeleteInternal:
+    case LogType::kInsertBranch:
+    case LogType::kDeleteBranch:
+    case LogType::kCompensateUpdateBranch:
+    case LogType::kCompensateDeleteBranch:
       size += sizeof(page_id_t);
       break;
-    case LogType::kUpdateInternal:
+    case LogType::kUpdateBranch:
       size += sizeof(page_id_t) * 2;
       break;
     case LogType::kEndCheckpoint:
@@ -590,7 +589,7 @@ size_t LogRecord::Size() const {
       break;
     case LogType::kBegin:
     case LogType::kBeginCheckpoint:
-    case LogType::kCompensateInsertInternal:
+    case LogType::kCompensateInsertBranch:
     case LogType::kSystemDestroyPage:
     case LogType::kCompensateInsertRow:
     case LogType::kCommit:
@@ -635,16 +634,16 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
     case LogType::kDeleteRow:
       e << l.undo_data;
       break;
-    case LogType::kInsertInternal:
-    case LogType::kCompensateUpdateInternal:
-    case LogType::kCompensateDeleteInternal:
+    case LogType::kInsertBranch:
+    case LogType::kCompensateUpdateBranch:
+    case LogType::kCompensateDeleteBranch:
     case LogType::kLowestValue:
       e << l.redo_page;
       break;
-    case LogType::kUpdateInternal:
+    case LogType::kUpdateBranch:
       e << l.redo_page << l.undo_page;
       break;
-    case LogType::kDeleteInternal:
+    case LogType::kDeleteBranch:
       e << l.undo_page;
       break;
     case LogType::kEndCheckpoint: {
@@ -657,7 +656,7 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
     case LogType::kBeginCheckpoint:
     case LogType::kCompensateInsertRow:
     case LogType::kCompensateInsertLeaf:
-    case LogType::kCompensateInsertInternal:
+    case LogType::kCompensateInsertBranch:
     case LogType::kBegin:
     case LogType::kCommit:
     case LogType::kSystemDestroyPage:
@@ -685,7 +684,7 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
     case LogType::kBegin:
     case LogType::kCommit:
     case LogType::kBeginCheckpoint:
-    case LogType::kCompensateInsertInternal:
+    case LogType::kCompensateInsertBranch:
     case LogType::kSystemDestroyPage:
     case LogType::kCompensateInsertRow:
     case LogType::kCompensateInsertLeaf:
@@ -707,16 +706,16 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
     case LogType::kDeleteLeaf:
       d >> l.undo_data;
       break;
-    case LogType::kInsertInternal:
-    case LogType::kCompensateUpdateInternal:
-    case LogType::kCompensateDeleteInternal:
+    case LogType::kInsertBranch:
+    case LogType::kCompensateUpdateBranch:
+    case LogType::kCompensateDeleteBranch:
     case LogType::kLowestValue:
       d >> l.redo_page;
       break;
-    case LogType::kUpdateInternal:
+    case LogType::kUpdateBranch:
       d >> l.redo_page >> l.undo_page;
       break;
-    case LogType::kDeleteInternal:
+    case LogType::kDeleteBranch:
       d >> l.undo_page;
       break;
     case LogType::kSystemAllocPage:

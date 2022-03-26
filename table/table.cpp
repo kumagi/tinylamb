@@ -49,7 +49,9 @@ Status Table::Update(Transaction& txn, const Row& row, RowPosition* pos) {
   for (const auto& idx : indices_) {
     BPlusTree bpt(idx.pid_, pm_);
     s = bpt.Delete(txn, idx.GenerateKey(original_row));
-    LOG(DEBUG) << "delete: " << idx.GenerateKey(original_row);
+    LOG(DEBUG) << "delete: " << idx.GenerateKey(original_row) << " then \n";
+    bpt.Dump(txn, std::cout, 0);
+    std::cout << "\n";
     STATUS(s, "delete index");
     if (s != Status::kSuccess) return s;
   }

@@ -13,7 +13,7 @@ class PagePoolTest : public ::testing::Test {
  protected:
   static constexpr int kDefaultCapacity = 10;
   void SetUp() override {
-    filename_ = "internal_page_test-" + RandomString();
+    filename_ = "page_pool_test-" + RandomString();
     Reset();
   }
   void Reset() { pp = std::make_unique<PagePool>(filename_, kDefaultCapacity); }

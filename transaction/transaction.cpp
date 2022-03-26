@@ -85,12 +85,11 @@ lsn_t Transaction::InsertLeafLog(page_id_t pid, std::string_view key,
       LogRecord::InsertingLeafLogRecord(prev_lsn_, txn_id_, pid, key, redo));
   return prev_lsn_;
 }
-lsn_t Transaction::InsertInternalLog(page_id_t pid, std::string_view key,
-                                     page_id_t redo) {
+lsn_t Transaction::InsertBranchLog(page_id_t pid, std::string_view key,
+                                   page_id_t redo) {
   assert(!IsFinished());
-  prev_lsn_ =
-      transaction_manager_->AddLog(LogRecord::InsertingInternalLogRecord(
-          prev_lsn_, txn_id_, pid, key, redo));
+  prev_lsn_ = transaction_manager_->AddLog(
+      LogRecord::InsertingBranchLogRecord(prev_lsn_, txn_id_, pid, key, redo));
   return prev_lsn_;
 }
 
@@ -110,10 +109,10 @@ lsn_t Transaction::UpdateLeafLog(page_id_t pid, std::string_view key,
   return prev_lsn_;
 }
 
-lsn_t Transaction::UpdateInternalLog(page_id_t pid, std::string_view key,
-                                     page_id_t undo, page_id_t redo) {
+lsn_t Transaction::UpdateBranchLog(page_id_t pid, std::string_view key,
+                                   page_id_t undo, page_id_t redo) {
   assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(LogRecord::UpdatingInternalLogRecord(
+  prev_lsn_ = transaction_manager_->AddLog(LogRecord::UpdatingBranchLogRecord(
       prev_lsn_, txn_id_, pid, key, redo, undo));
   return prev_lsn_;
 }
@@ -136,11 +135,11 @@ lsn_t Transaction::DeleteLeafLog(page_id_t pid, std::string_view key,
   return prev_lsn_;
 }
 
-lsn_t Transaction::DeleteInternalLog(page_id_t pid, std::string_view key,
-                                     page_id_t undo) {
+lsn_t Transaction::DeleteBranchLog(page_id_t pid, std::string_view key,
+                                   page_id_t undo) {
   assert(!IsFinished());
   LogRecord lr =
-      LogRecord::DeletingInternalLogRecord(prev_lsn_, txn_id_, pid, key, undo);
+      LogRecord::DeletingBranchLogRecord(prev_lsn_, txn_id_, pid, key, undo);
   prev_lsn_ = transaction_manager_->AddLog(lr);
   return prev_lsn_;
 }

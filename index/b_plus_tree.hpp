@@ -26,8 +26,8 @@ class BPlusTree {
                             PageRef&& page, std::vector<PageRef>& parents);
 
   PageRef FindLeaf(Transaction& txn, std::string_view key, PageRef&& root);
-  Status InsertInternal(Transaction& txn, std::string_view key, page_id_t right,
-                        std::vector<PageRef>& parents);
+  Status InsertBranch(Transaction& txn, std::string_view key, page_id_t right,
+                      std::vector<PageRef>& parents);
   PageRef FindLeftmostPage(Transaction& txn, PageRef&& root);
   PageRef FindRightmostPage(Transaction& txn, PageRef&& root);
   PageRef LeftmostPage(Transaction& txn);
@@ -48,11 +48,13 @@ class BPlusTree {
     return root_ == rhs.root_ && pm_ == rhs.pm_;
   }
 
+  bool SanityCheckForTest(PageManager* pm) const;
+
  private:
   friend class BPlusTreeIterator;
   friend class IndexScanIterator;
-  void DumpInternal(Transaction& txn, std::ostream& o, PageRef&& page,
-                    int indent = 0) const;
+  void DumpBranch(Transaction& txn, std::ostream& o, PageRef&& page,
+                  int indent = 0) const;
 
  private:
   page_id_t root_;

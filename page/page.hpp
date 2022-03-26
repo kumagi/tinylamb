@@ -7,8 +7,8 @@
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
+#include "page/branch_page.hpp"
 #include "page/free_page.hpp"
-#include "page/internal_page.hpp"
 #include "page/leaf_page.hpp"
 #include "page/meta_page.hpp"
 #include "page/row_page.hpp"
@@ -52,7 +52,8 @@ class Page {
   page_id_t GetPage(slot_t slot) const;
 
   // Leaf page manipulations.
-  Status Insert(Transaction& txn, std::string_view key, std::string_view value);
+  Status InsertLeaf(Transaction& txn, std::string_view key,
+                    std::string_view value);
   Status Update(Transaction& txn, std::string_view key, std::string_view value);
   Status Delete(Transaction& txn, std::string_view key);
   Status Read(Transaction& txn, std::string_view key,
@@ -61,11 +62,13 @@ class Page {
   Status HighestKey(Transaction& txn, std::string_view* result);
   Status SetPrevNext(Transaction& txn, page_id_t prev, page_id_t next);
 
-  // Internal page manipulations.
-  Status Insert(Transaction& txn, std::string_view key, page_id_t pid);
-  Status Update(Transaction& txn, std::string_view key, page_id_t pid);
+  // Branch page manipulations.
+  Status InsertBranch(Transaction& txn, std::string_view key, page_id_t pid);
+  Status UpdateBranch(Transaction& txn, std::string_view key, page_id_t pid);
   Status GetPageForKey(Transaction& txn, std::string_view key,
                        page_id_t* page) const;
+  Status FindForKey(Transaction& txn, std::string_view key,
+                    page_id_t* page) const;
   void SetLowestValue(Transaction& txn, page_id_t i);
   void SplitInto(Transaction& txn, std::string_view new_key, Page* right,
                  std::string* middle);
@@ -81,10 +84,10 @@ class Page {
   void DeleteImpl(std::string_view key);
   void SetPrevNextImpl(page_id_t prev, page_id_t next);
 
-  void InsertInternalImpl(std::string_view key, page_id_t pid);
-  void UpdateInternalImpl(std::string_view key, page_id_t pid);
-  void DeleteInternalImpl(std::string_view key);
-  void SetLowestValueInternalImpl(page_id_t lowest_value);
+  void InsertBranchImpl(std::string_view key, page_id_t pid);
+  void UpdateBranchImpl(std::string_view key, page_id_t pid);
+  void DeleteBranchImpl(std::string_view key);
+  void SetLowestValueBranchImpl(page_id_t lowest_value);
   void PageTypeChangeImpl(PageType new_type);
 
   void SetChecksum() const;
@@ -116,7 +119,7 @@ class Page {
     FreePage free_page;
     RowPage row_page;
     LeafPage leaf_page;
-    InternalPage internal_page;
+    BranchPage branch_page;
     PageBody() : dummy_() {}
   };
   PageBody body;

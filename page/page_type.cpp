@@ -21,8 +21,8 @@ std::ostream& operator<<(std::ostream& o, const PageType& type) {
     case PageType::kLeafPage:
       o << "LeafPageType";
       break;
-    case PageType::kInternalPage:
-      o << "InternalPageType";
+    case PageType::kBranchPage:
+      o << "BranchPageType";
       break;
   }
   return o;

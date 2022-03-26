@@ -46,7 +46,7 @@ class BPlusTreeTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique<PageManager>(db_name_, 10);
+    p_ = std::make_unique<PageManager>(db_name_, 110);
     l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
@@ -108,7 +108,7 @@ std::string KeyGen(int num, int width) {
   return ss.str();
 }
 
-TEST_F(BPlusTreeTest, SplitInternal) {
+TEST_F(BPlusTreeTest, SplitBranch) {
   auto txn = tm_->Begin();
   std::string key_prefix("key");
   std::string long_value(2000, 'v');
@@ -189,19 +189,39 @@ TEST_F(BPlusTreeTest, Update) {
 }
 
 TEST_F(BPlusTreeTest, Delete) {
+  constexpr int kCount = 50;
+  std::unordered_map<std::string, std::string> kvp;
+  kvp.reserve(kCount);
   {
     auto txn = tm_->Begin();
     std::string key_prefix("key");
-    for (int i = 0; i < 50; ++i) {
-      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), KeyGen(i * 10, 1000)));
+    for (int i = 0; i < kCount; ++i) {
+      std::string key = KeyGen(i, 10000);
+      std::string value = KeyGen(i * 10, 1000);
+      ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
+      ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+      kvp.emplace(key, value);
     }
+    bpt_->Dump(txn, std::cerr, 0);
+    std::cerr << "\n";
     txn.PreCommit();
   }
   {
     auto txn = tm_->Begin();
     std::string long_value(2000, 'v');
     for (int i = 0; i < 50; i += 2) {
-      ASSERT_SUCCESS(bpt_->Delete(txn, KeyGen(i, 10000)));
+      LOG(TRACE) << "delete: " << i;
+      std::string key = KeyGen(i, 10000);
+      ASSERT_SUCCESS(bpt_->Delete(txn, key));
+      bpt_->Dump(txn, std::cerr, 0);
+      std::cerr << "\n";
+      kvp.erase(key);
+      for (const auto& kv : kvp) {
+        std::string_view val;
+        ASSERT_SUCCESS(bpt_->Read(txn, kv.first, &val));
+        ASSERT_EQ(kv.second, val);
+      }
+      ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     }
     txn.PreCommit();
   }
@@ -211,6 +231,7 @@ TEST_F(BPlusTreeTest, Delete) {
     std::string_view val;
     for (int i = 0; i < 50; ++i) {
       if (i % 2 == 0) {
+        LOG(ERROR) << "read: " << i;
         ASSERT_FAIL(bpt_->Read(txn, KeyGen(i, 10000), &val));
         ASSERT_EQ(val, "");
       } else {
@@ -290,10 +311,11 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
     std::string key = RandomString((19937 * i) % 12 + 10, false);
     std::string value = RandomString((19937 * i) % 120 + 10, false);
     ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
+    bpt_->SanityCheckForTest(p_.get());
     keys.push_back(key);
     kvp.emplace(key, value);
   }
-  for (int i = 0; i < kCount; ++i) {
+  for (int i = 0; i < kCount * 4; ++i) {
     const std::string& key = keys[(i * 63) % keys.size()];
     std::string value = RandomString((19937 * i) % 320 + 500, false);
     ASSERT_SUCCESS(bpt_->Update(txn, key, value));
@@ -312,20 +334,28 @@ TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
   std::unordered_map<std::string, std::string> kvp;
   kvp.reserve(kCount);
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString((19937 * i) % 12 + 10, false);
+    std::string key = RandomString((19937 * i) % 120 + 10, false);
     std::string value = RandomString((19937 * i) % 120 + 10, false);
     ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
-    kvp.emplace(key, value);
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    kvp[key] = value;
   }
-  for (int i = 0; i < kCount * 16; ++i) {
+  for (const auto& kv : kvp) {
+    std::string_view val;
+    bpt_->Read(txn, kv.first, &val);
+    ASSERT_EQ(kvp[kv.first], val);
+  }
+  for (int i = 0; i < kCount * 4; ++i) {
     auto iter = kvp.begin();
     std::advance(iter, (i * 19937) % kvp.size());
     ASSERT_SUCCESS(bpt_->Delete(txn, iter->first));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     kvp.erase(iter);
 
-    std::string key = RandomString((19937 * i) % 130 + 50, false);
-    std::string value = RandomString((19937 * i) % 320 + 500, false);
+    std::string key = RandomString((19937 * i) % 130 + 1000, false);
+    std::string value = RandomString((19937 * i) % 320 + 5000, false);
     ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     kvp[key] = value;
   }
   for (const auto& kv : kvp) {

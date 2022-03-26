@@ -39,8 +39,8 @@ void Page::PageInit(uint64_t pid, PageType page_type) {
     case PageType::kLeafPage:
       body.leaf_page.Initialize();
       break;
-    case PageType::kInternalPage:
-      body.internal_page.Initialize();
+    case PageType::kBranchPage:
+      body.branch_page.Initialize();
       break;
   }
 }
@@ -68,8 +68,8 @@ size_t Page::RowCount(Transaction& txn) const {
   }
   if (type == PageType::kLeafPage) {
     return body.leaf_page.RowCount();
-  } else if (type == PageType::kInternalPage) {
-    return body.internal_page.RowCount();
+  } else if (type == PageType::kBranchPage) {
+    return body.branch_page.RowCount();
   } else {
     throw std::runtime_error("invalid page type");
   }
@@ -91,13 +91,13 @@ std::string_view Page::GetKey(slot_t slot) const {
   if (type == PageType::kLeafPage) {
     return body.leaf_page.GetKey(slot);
   } else {
-    return body.internal_page.GetKey(slot);
+    return body.branch_page.GetKey(slot);
   }
 }
 
 page_id_t Page::GetPage(slot_t slot) const {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  return body.internal_page.GetValue(slot);
+  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  return body.branch_page.GetValue(slot);
 }
 
 Status Page::Insert(Transaction& txn, std::string_view record, slot_t* slot) {
@@ -136,8 +136,8 @@ slot_t Page::RowCount() const {
       return body.row_page.RowCount();
     case PageType::kLeafPage:
       return body.leaf_page.RowCount();
-    case PageType::kInternalPage:
-      return body.internal_page.RowCount();
+    case PageType::kBranchPage:
+      return body.branch_page.RowCount();
     default:
       throw std::runtime_error("RowCount is not implemented");
   }
@@ -151,8 +151,8 @@ Status Page::ReadKey(Transaction& txn, const uint16_t& slot,
       return Status::kSuccess;
     case PageType::kLeafPage:
       return body.leaf_page.ReadKey(PageID(), txn, slot, result);
-    case PageType::kInternalPage:
-      *result = body.internal_page.GetKey(slot);
+    case PageType::kBranchPage:
+      *result = body.branch_page.GetKey(slot);
       return Status::kSuccess;
     default:
       throw std::runtime_error("ReadKey is not implemented");
@@ -160,8 +160,8 @@ Status Page::ReadKey(Transaction& txn, const uint16_t& slot,
 }
 
 // Leaf page manipulations.
-Status Page::Insert(Transaction& txn, std::string_view key,
-                    std::string_view value) {
+Status Page::InsertLeaf(Transaction& txn, std::string_view key,
+                        std::string_view value) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
   Status result = body.leaf_page.Insert(PageID(), txn, key, value);
   if (result == Status::kSuccess) {
@@ -188,8 +188,8 @@ Status Page::Delete(Transaction& txn, std::string_view key) {
     case PageType::kLeafPage:
       result = body.leaf_page.Delete(PageID(), txn, key);
       break;
-    case PageType::kInternalPage:
-      result = body.internal_page.Delete(PageID(), txn, key);
+    case PageType::kBranchPage:
+      result = body.branch_page.Delete(PageID(), txn, key);
       break;
     default:
       throw std::runtime_error("Invalid page type");
@@ -227,9 +227,10 @@ Status Page::SetPrevNext(Transaction& txn, page_id_t prev, page_id_t next) {
   return s;
 }
 
-Status Page::Insert(Transaction& txn, std::string_view key, page_id_t pid) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  Status result = body.internal_page.Insert(PageID(), txn, key, pid);
+Status Page::InsertBranch(Transaction& txn, std::string_view key,
+                          page_id_t pid) {
+  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  Status result = body.branch_page.Insert(PageID(), txn, key, pid);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
     SetRecLSN(txn.PrevLSN());
@@ -237,9 +238,10 @@ Status Page::Insert(Transaction& txn, std::string_view key, page_id_t pid) {
   return result;
 }
 
-Status Page::Update(Transaction& txn, std::string_view key, page_id_t pid) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  Status result = body.internal_page.Update(PageID(), txn, key, pid);
+Status Page::UpdateBranch(Transaction& txn, std::string_view key,
+                          page_id_t pid) {
+  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  Status result = body.branch_page.Update(PageID(), txn, key, pid);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
     SetRecLSN(txn.PrevLSN());
@@ -249,21 +251,27 @@ Status Page::Update(Transaction& txn, std::string_view key, page_id_t pid) {
 
 Status Page::GetPageForKey(Transaction& txn, std::string_view key,
                            page_id_t* page) const {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  return body.internal_page.GetPageForKey(txn, key, page);
+  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  return body.branch_page.GetPageForKey(txn, key, page);
+}
+
+Status Page::FindForKey(Transaction& txn, std::string_view key,
+                        page_id_t* page) const {
+  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  return body.branch_page.FindForKey(txn, key, page);
 }
 
 void Page::SetLowestValue(Transaction& txn, page_id_t v) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  body.internal_page.SetLowestValue(PageID(), txn, v);
+  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  body.branch_page.SetLowestValue(PageID(), txn, v);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
 }
 
 void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
                      std::string* middle) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  body.internal_page.SplitInto(PageID(), txn, new_key, right, middle);
+  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  body.branch_page.SplitInto(PageID(), txn, new_key, right, middle);
 }
 
 void Page::PageTypeChange(Transaction& txn, PageType new_type) {
@@ -310,21 +318,21 @@ void Page::SetPrevNextImpl(page_id_t prev, page_id_t next) {
   body.leaf_page.SetPrevNextImpl(prev, next);
 }
 
-void Page::InsertInternalImpl(std::string_view key, page_id_t redo) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  body.internal_page.InsertImpl(key, redo);
+void Page::InsertBranchImpl(std::string_view key, page_id_t pid) {
+  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  body.branch_page.InsertImpl(key, pid);
 }
-void Page::UpdateInternalImpl(std::string_view key, page_id_t redo) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  body.internal_page.UpdateImpl(key, redo);
+void Page::UpdateBranchImpl(std::string_view key, page_id_t pid) {
+  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  body.branch_page.UpdateImpl(key, pid);
 }
-void Page::DeleteInternalImpl(std::string_view key) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  body.internal_page.DeleteImpl(key);
+void Page::DeleteBranchImpl(std::string_view key) {
+  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  body.branch_page.DeleteImpl(key);
 }
-void Page::SetLowestValueInternalImpl(page_id_t lowest_value) {
-  ASSERT_PAGE_TYPE(PageType::kInternalPage)
-  body.internal_page.SetLowestValueImpl(lowest_value);
+void Page::SetLowestValueBranchImpl(page_id_t lowest_value) {
+  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  body.branch_page.SetLowestValueImpl(lowest_value);
 }
 void Page::PageTypeChangeImpl(PageType new_type) {
   PageInit(page_id, new_type);
@@ -362,9 +370,9 @@ void Page::Dump(std::ostream& o, int indent) const {
       o << " LeafPage ";
       body.leaf_page.Dump(o, indent);
       break;
-    case PageType::kInternalPage:
-      o << " InternalPage ";
-      body.internal_page.Dump(o, indent);
+    case PageType::kBranchPage:
+      o << " BranchPage ";
+      body.branch_page.Dump(o, indent);
       break;
     default:
       break;
@@ -386,9 +394,9 @@ uint64_t std::hash<tinylamb::Page>::operator()(const tinylamb::Page& p) const {
       return header_hash + std::hash<tinylamb::RowPage>()(p.body.row_page);
     case tinylamb::PageType::kLeafPage:
       return header_hash + std::hash<tinylamb::LeafPage>()(p.body.leaf_page);
-    case tinylamb::PageType::kInternalPage:
+    case tinylamb::PageType::kBranchPage:
       return header_hash +
-             std::hash<tinylamb::InternalPage>()(p.body.internal_page);
+             std::hash<tinylamb::BranchPage>()(p.body.branch_page);
     default:
       return 0xdeadbeefcafebabe;  // Must be a broken page.
   }

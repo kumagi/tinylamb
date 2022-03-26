@@ -36,7 +36,7 @@ add_library(libtinylamb
         recovery/recovery_manager.cpp recovery/checkpoint_manager.cpp
         transaction/transaction_manager.cpp page/page_type.cpp type/column.cpp
         common/serdes.cpp common/log_message.cpp page/page_ref.cpp
-        page/leaf_page.cpp page/internal_page.cpp index/b_plus_tree.cpp
+        page/leaf_page.cpp page/branch_page.cpp index/b_plus_tree.cpp
         type/value.cpp type/constraint.cpp type/constraint.hpp table/table.cpp
         table/table.hpp index/index.cpp common/debug.cpp common/encoder.cpp
         table/full_scan_iterator.cpp index/b_plus_tree_iterator.cpp
@@ -104,7 +104,7 @@ add_simple_test(type/constraint_test.cpp)
 add_simple_test(type/column_test.cpp)
 add_simple_test(type/schema_test.cpp)
 add_simple_test(page/leaf_page_test.cpp)
-add_simple_test(page/internal_page_test.cpp)
+add_simple_test(page/branch_page_test.cpp)
 add_simple_test(page/page_pool_test.cpp)
 add_simple_test(page/page_manager_test.cpp)
 add_simple_test(page/row_page_test.cpp)

@@ -8,6 +8,7 @@
 #include "b_plus_tree_iterator.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
+#include "transaction/transaction.hpp"
 
 namespace tinylamb {
 
@@ -39,59 +40,58 @@ PageRef BPlusTree::FindLeaf(Transaction& txn, std::string_view key,
   return FindLeaf(txn, key, std::move(next_ref));
 }
 
-Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
-                                 page_id_t right,
-                                 std::vector<PageRef>& parents) {
+Status BPlusTree::InsertBranch(Transaction& txn, std::string_view key,
+                               page_id_t right, std::vector<PageRef>& parents) {
   if (parents.empty()) {
-    // Swap parent node to internal node.
+    // Swap parent node to the branch node.
     PageRef root = pm_->GetPage(root_);
-    if (root->Type() == PageType::kInternalPage) {
-      const InternalPage& root_page = root->body.internal_page;
-      PageRef new_left = pm_->AllocateNewPage(txn, PageType::kInternalPage);
+    if (root->Type() == PageType::kBranchPage) {
+      const BranchPage& root_page = root->body.branch_page;
+      PageRef new_left = pm_->AllocateNewPage(txn, PageType::kBranchPage);
       new_left->SetLowestValue(txn, root_page.lowest_page_);
       for (slot_t i = 0; i < root->RowCount(); ++i) {
-        new_left->Insert(txn, root_page.GetKey(i), root_page.GetValue(i));
+        new_left->InsertBranch(txn, root_page.GetKey(i), root_page.GetValue(i));
       }
       while (0 < root_page.RowCount()) {
         root->Delete(txn, root_page.GetKey(0));
       }
       root->SetLowestValue(txn, new_left->PageID());
-      root->Insert(txn, key, right);
+      root->InsertBranch(txn, key, right);
     } else {
       assert(root->Type() == PageType::kLeafPage);
       PageRef new_left = pm_->AllocateNewPage(txn, PageType::kLeafPage);
       const LeafPage& root_page = root->body.leaf_page;
       for (slot_t i = 0; i < root->body.leaf_page.RowCount(); ++i) {
-        new_left->Insert(txn, root_page.GetKey(i), root_page.GetValue(i));
+        new_left->InsertLeaf(txn, root_page.GetKey(i), root_page.GetValue(i));
       }
       PageRef right_page = pm_->GetPage(right);
       right_page->SetPrevNext(txn, new_left->PageID(),
                               right_page->body.leaf_page.next_pid_);
-      root->PageTypeChange(txn, PageType::kInternalPage);
+      root->PageTypeChange(txn, PageType::kBranchPage);
       root->SetLowestValue(txn, new_left->PageID());
-      root->Insert(txn, key, right);
+      root->InsertBranch(txn, key, right);
       new_left->SetPrevNext(txn, 0, right);
     }
     return Status::kSuccess;
   } else {
-    PageRef internal(std::move(parents.back()));
+    PageRef branch(std::move(parents.back()));
     parents.pop_back();
-    Status s = internal->Insert(txn, key, right);
+    Status s = branch->InsertBranch(txn, key, right);
     if (s == Status::kSuccess) return Status::kSuccess;
     if (s == Status::kNoSpace) {
-      PageRef new_node = pm_->AllocateNewPage(txn, PageType::kInternalPage);
+      PageRef new_node = pm_->AllocateNewPage(txn, PageType::kBranchPage);
       std::string new_key;
-      internal->SplitInto(txn, key, new_node.get(), &new_key);
+      branch->SplitInto(txn, key, new_node.get(), &new_key);
       s = [&]() {
         if (key < new_key) {
-          return internal->Insert(txn, key, right);
+          return branch->InsertBranch(txn, key, right);
         } else {
-          return new_node->Insert(txn, key, right);
+          return new_node->InsertBranch(txn, key, right);
         }
       }();
       if (s != Status::kSuccess) return s;
-      internal.PageUnlock();
-      return InsertInternal(txn, new_key, new_node->PageID(), parents);
+      branch.PageUnlock();
+      return InsertBranch(txn, new_key, new_node->PageID(), parents);
     }
     throw std::runtime_error("unknown status:" + std::string(ToString(s)));
   }
@@ -100,13 +100,13 @@ Status BPlusTree::InsertInternal(Transaction& txn, std::string_view key,
 PageRef BPlusTree::FindLeftmostPage(Transaction& txn, PageRef&& root) {
   if (root->Type() == PageType::kLeafPage) return std::move(root);
   return FindLeftmostPage(txn,
-                          pm_->GetPage(root->body.internal_page.lowest_page_));
+                          pm_->GetPage(root->body.branch_page.lowest_page_));
 }
 
 PageRef BPlusTree::FindRightmostPage(Transaction& txn, PageRef&& root) {
   if (root->Type() == PageType::kLeafPage) return std::move(root);
-  page_id_t next = root->body.internal_page.GetValue(
-      root->body.internal_page.RowCount() - 1);
+  page_id_t next =
+      root->body.branch_page.GetValue(root->body.branch_page.RowCount() - 1);
   return FindRightmostPage(txn, pm_->GetPage(next));
 }
 
@@ -122,7 +122,7 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
                          std::string_view value) {
   std::vector<PageRef> parents;
   PageRef target = FindLeafForInsert(txn, key, pm_->GetPage(root_), parents);
-  Status s = target->Insert(txn, key, value);
+  Status s = target->InsertLeaf(txn, key, value);
   if (s == Status::kSuccess) return Status::kSuccess;
   if (s == Status::kNoSpace) {
     // No enough space? Split!
@@ -131,16 +131,16 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
                                  new_page.get());
     target.PageUnlock();
     if (new_page->RowCount() == 0 || new_page->GetKey(0) < key) {
-      s = new_page->Insert(txn, key, value);
+      s = new_page->InsertLeaf(txn, key, value);
       STATUS(s, "new_page");
     } else {
-      s = target->Insert(txn, key, value);
+      s = target->InsertLeaf(txn, key, value);
       STATUS(s, "BPT, target");
     }
     std::string_view middle_key;
     new_page->LowestKey(txn, &middle_key);
     new_page.PageUnlock();
-    return InsertInternal(txn, middle_key, new_page->PageID(), parents);
+    return InsertBranch(txn, middle_key, new_page->PageID(), parents);
   }
   return s;
 }
@@ -161,25 +161,66 @@ Status BPlusTree::Update(Transaction& txn, std::string_view key,
                                  new_page.get());
     target.PageUnlock();
     if (new_page->RowCount() == 0 || new_page->GetKey(0) < key) {
-      s = new_page->Insert(txn, key, value);
+      s = new_page->InsertLeaf(txn, key, value);
       STATUS(s, "new_page");
     } else {
-      s = target->Insert(txn, key, value);
+      s = target->InsertLeaf(txn, key, value);
       STATUS(s, "BPT, target");
     }
     LOG(DEBUG) << s;
     std::string_view middle_key;
     new_page->LowestKey(txn, &middle_key);
     new_page.PageUnlock();
-    return InsertInternal(txn, middle_key, new_page->PageID(), parents);
+    return InsertBranch(txn, middle_key, new_page->PageID(), parents);
   }
   return s;
 }
-Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
-  PageRef leaf = FindLeaf(txn, key, pm_->GetPage(root_));
-  // TODO(kumagi): We need to merge the leaf and delete the entire node.
-  return leaf->Delete(txn, key);
+
+void ChangeLeftMostKey(Transaction& txn, std::string_view old_next,
+                       std::string_view new_next,
+                       std::vector<PageRef>& parents) {
+  for (int idx = (int)parents.size() - 1; 0 <= idx; --idx) {
+    PageRef& page = parents[idx];
+    page_id_t value;
+    Status s = page->FindForKey(txn, old_next, &value);
+    if (s == Status::kSuccess) {
+      s = page->Delete(txn, old_next);
+      assert(s == Status::kSuccess);
+      s = page->InsertBranch(txn, new_next, value);
+      assert(s == Status::kSuccess);
+    } else {
+      break;
+    }
+  }
 }
+
+Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
+  PageRef root = pm_->GetPage(root_);
+  std::vector<PageRef> parents;
+  PageRef leaf = FindLeafForInsert(txn, key, std::move(root), parents);
+  // TODO(kumagi): We need to merge the leaf and delete the entire node.
+  std::string next_leftmost = leaf->GetKey(0) == key && 1 < leaf->RowCount()
+                                  ? std::string(leaf->GetKey(1))
+                                  : "";
+  Status s = leaf->Delete(txn, key);
+  if (s != Status::kSuccess) return s;
+  if (!next_leftmost.empty()) {
+    ChangeLeftMostKey(txn, key, next_leftmost, parents);
+  }
+
+  PageRef ref = std::move(leaf);
+  while (ref->RowCount() == 0 && !parents.empty()) {
+    LOG(ERROR) << "page destroy: " << ref->PageID();
+    ref.PageUnlock();
+    pm_->DestroyPage(txn, ref.get());
+    PageRef parent = std::move(parents.back());
+    parent->Delete(txn, key);
+    parents.pop_back();
+    ref = std::move(parent);
+  }
+  return s;
+}
+
 Status BPlusTree::Read(Transaction& txn, std::string_view key,
                        std::string_view* dst) {
   *dst = "";
@@ -192,13 +233,23 @@ BPlusTreeIterator BPlusTree::Begin(Transaction& txn, std::string_view left,
   return {this, &txn, left, right, ascending};
 }
 
+bool BPlusTree::SanityCheckForTest(PageManager* pm) const {
+  PageRef page = pm_->GetPage(root_);
+  if (page->Type() == PageType::kLeafPage) {
+    return page->body.leaf_page.SanityCheckForTest();
+  } else if (page->Type() == PageType::kBranchPage) {
+    return page->body.branch_page.SanityCheckForTest(pm);
+  }
+  return false;
+}
+
 namespace {
 
 std::string OmittedString(std::string_view original, int length) {
-  if (20 < original.length()) {
+  if (length < original.length()) {
     std::string omitted_key = std::string(original).substr(0, 8);
     omitted_key +=
-        "..(" + std::to_string(original.length() - 20 + 4) + "bytes)..";
+        "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
     omitted_key += original.substr(original.length() - 8);
     return omitted_key;
   } else {
@@ -216,34 +267,34 @@ void DumpLeafPage(Transaction& txn, PageRef&& page, std::ostream& o,
     page->ReadKey(txn, i, &key);
     std::string_view value;
     page->Read(txn, i, &value);
-    o << OmittedString(key, 20) << ": " << OmittedString(value, 20) << "\n";
+    o << OmittedString(key, 80) << ": " << OmittedString(value, 30) << "\n";
   }
 }
 }  // namespace
 
-void BPlusTree::DumpInternal(Transaction& txn, std::ostream& o, PageRef&& page,
-                             int indent) const {
+void BPlusTree::DumpBranch(Transaction& txn, std::ostream& o, PageRef&& page,
+                           int indent) const {
   if (page->Type() == PageType::kLeafPage) {
     o << Indent(indent);
     DumpLeafPage(txn, std::move(page), o, indent);
-  } else if (page->Type() == PageType::kInternalPage) {
-    DumpInternal(txn, o, pm_->GetPage(page->body.internal_page.lowest_page_),
-                 indent + 4);
+  } else if (page->Type() == PageType::kBranchPage) {
+    DumpBranch(txn, o, pm_->GetPage(page->body.branch_page.lowest_page_),
+               indent + 4);
     for (slot_t i = 0; i < page->RowCount(); ++i) {
       std::string_view key;
       page->ReadKey(txn, i, &key);
-      o << Indent(indent) << "I[" << page->PageID()
+      o << Indent(indent) << "B[" << page->PageID()
         << "]: " << OmittedString(key, 20) << "\n";
       page_id_t pid;
       if (page->GetPageForKey(txn, key, &pid) == Status::kSuccess) {
-        DumpInternal(txn, o, pm_->GetPage(pid), indent + 4);
+        DumpBranch(txn, o, pm_->GetPage(pid), indent + 4);
       }
     }
   }
 }
 
 void BPlusTree::Dump(Transaction& txn, std::ostream& o, int indent) const {
-  DumpInternal(txn, o, pm_->GetPage(root_), indent);
+  DumpBranch(txn, o, pm_->GetPage(root_), indent);
   o << "\n";
 }
 

@@ -18,22 +18,22 @@
 
 namespace tinylamb {
 
-class InternalPageTest : public ::testing::Test {
+class BranchPageTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    std::string prefix = "internal_page_test-" + RandomString();
+    std::string prefix = "branch_page_test-" + RandomString();
     db_name_ = prefix + ".db";
     log_name_ = prefix + ".log";
     Recover();
     auto txn = tm_->Begin();
-    PageRef page_ = p_->AllocateNewPage(txn, PageType::kInternalPage);
-    internal_page_id_ = page_->PageID();
+    PageRef page_ = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    branch_page_id_ = page_->PageID();
     EXPECT_SUCCESS(txn.PreCommit());
   }
 
-  void Flush() { p_->GetPool()->FlushPageForTest(internal_page_id_); }
+  void Flush() { p_->GetPool()->FlushPageForTest(branch_page_id_); }
 
-  PageRef Page() { return p_->GetPage(internal_page_id_); }
+  PageRef Page() { return p_->GetPage(branch_page_id_); }
 
   void AssertPIDForKey(std::string_view key, page_id_t expected) {
     auto txn = tm_->Begin();
@@ -73,23 +73,23 @@ class InternalPageTest : public ::testing::Test {
   std::unique_ptr<Logger> l_;
   std::unique_ptr<RecoveryManager> r_;
   std::unique_ptr<TransactionManager> tm_;
-  page_id_t internal_page_id_{0};
+  page_id_t branch_page_id_{0};
 };
 
-TEST_F(InternalPageTest, Construct) {}
-TEST_F(InternalPageTest, SetMinimumTree) {
+TEST_F(BranchPageTest, Construct) {}
+TEST_F(BranchPageTest, SetMinimumTree) {
   auto txn = tm_->Begin();
   PageRef page = Page();
   page->SetLowestValue(txn, 100);
-  ASSERT_SUCCESS(page->Insert(txn, "b", 200));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "b", 200));
 }
 
-TEST_F(InternalPageTest, GetPageForKeyMinimum) {
+TEST_F(BranchPageTest, GetPageForKeyMinimum) {
   {
     auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(internal_page_id_);
+    PageRef page = p_->GetPage(branch_page_id_);
     page->SetLowestValue(txn, 100);
-    ASSERT_SUCCESS(page->Insert(txn, "b", 200));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "b", 200));
     txn.PreCommit();
   }
   AssertPIDForKey("alpha", 100);
@@ -97,28 +97,28 @@ TEST_F(InternalPageTest, GetPageForKeyMinimum) {
   AssertPIDForKey("delta", 200);
 }
 
-TEST_F(InternalPageTest, InsertKey) {
+TEST_F(BranchPageTest, InsertKey) {
   auto txn = tm_->Begin();
   PageRef page = Page();
   page->SetLowestValue(txn, 100);
-  ASSERT_SUCCESS(page->Insert(txn, "d", 200));
-  ASSERT_SUCCESS(page->Insert(txn, "a", 10));
-  ASSERT_SUCCESS(page->Insert(txn, "b", 20));
-  ASSERT_SUCCESS(page->Insert(txn, "e", 40));
-  ASSERT_SUCCESS(page->Insert(txn, "f", 50));
-  ASSERT_SUCCESS(page->Insert(txn, "g", 60));
-  ASSERT_SUCCESS(page->Insert(txn, "c", 30));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "d", 200));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "a", 10));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "f", 50));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "g", 60));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "c", 30));
 }
 
-TEST_F(InternalPageTest, GetPageForKey) {
+TEST_F(BranchPageTest, GetPageForKey) {
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
 
-    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
-    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
-    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
     ASSERT_SUCCESS(txn.PreCommit());
   }
 
@@ -128,64 +128,64 @@ TEST_F(InternalPageTest, GetPageForKey) {
   AssertPIDForKey("zeta", 40);
 }
 
-TEST_F(InternalPageTest, InsertAndGetKey) {
+TEST_F(BranchPageTest, InsertAndGetKey) {
   auto txn = tm_->Begin();
   PageRef page = Page();
   page->SetLowestValue(txn, 100);
 
   page_id_t pid;
-  ASSERT_SUCCESS(page->Insert(txn, "c", 200));
-  ASSERT_SUCCESS(page->Insert(txn, "a", 10));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "c", 200));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "a", 10));
   ASSERT_SUCCESS(page->GetPageForKey(txn, "a", &pid));
   ASSERT_SUCCESS(page->GetPageForKey(txn, "alpha", &pid));
   ASSERT_EQ(pid, 10);
 
-  ASSERT_SUCCESS(page->Insert(txn, "g", 60));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "g", 60));
   ASSERT_SUCCESS(page->GetPageForKey(txn, "g", &pid));
   ASSERT_EQ(pid, 60);
   ASSERT_SUCCESS(page->GetPageForKey(txn, "guide", &pid));
   ASSERT_EQ(pid, 60);
 
-  ASSERT_SUCCESS(page->Insert(txn, "e", 40));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
   ASSERT_SUCCESS(page->GetPageForKey(txn, "e", &pid));
   ASSERT_EQ(pid, 40);
   ASSERT_SUCCESS(page->GetPageForKey(txn, "error", &pid));
   ASSERT_EQ(pid, 40);
 
-  ASSERT_SUCCESS(page->Insert(txn, "f", 50));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "f", 50));
   ASSERT_SUCCESS(page->GetPageForKey(txn, "f", &pid));
   ASSERT_EQ(pid, 50);
   ASSERT_SUCCESS(page->GetPageForKey(txn, "flight", &pid));
   ASSERT_EQ(pid, 50);
 
-  ASSERT_SUCCESS(page->Insert(txn, "b", 20));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
   ASSERT_SUCCESS(page->GetPageForKey(txn, "b", &pid));
   ASSERT_EQ(pid, 20);
   ASSERT_SUCCESS(page->GetPageForKey(txn, "battle", &pid));
   ASSERT_EQ(pid, 20);
 
-  ASSERT_SUCCESS(page->Insert(txn, "c", 30));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "c", 30));
   ASSERT_SUCCESS(page->GetPageForKey(txn, "c", &pid));
   ASSERT_EQ(pid, 30);
   ASSERT_SUCCESS(page->GetPageForKey(txn, "cut", &pid));
   ASSERT_EQ(pid, 30);
 }
 
-TEST_F(InternalPageTest, UpdateKey) {
+TEST_F(BranchPageTest, UpdateKey) {
   auto txn = tm_->Begin();
   {
     PageRef page = Page();
     page->SetLowestValue(txn, 100);
-    ASSERT_SUCCESS(page->Insert(txn, "a", 1));
-    ASSERT_SUCCESS(page->Insert(txn, "b", 2));
-    ASSERT_SUCCESS(page->Insert(txn, "c", 3));
-    ASSERT_SUCCESS(page->Insert(txn, "d", 4));
-    ASSERT_SUCCESS(page->Update(txn, "a", 5));
-    ASSERT_SUCCESS(page->Update(txn, "b", 6));
-    ASSERT_SUCCESS(page->Update(txn, "c", 7));
-    ASSERT_SUCCESS(page->Update(txn, "d", 8));
-    ASSERT_FAIL(page->Update(txn, "e", 60));
-    ASSERT_FAIL(page->Update(txn, "f", 30));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "a", 1));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "b", 2));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "c", 3));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "d", 4));
+    ASSERT_SUCCESS(page->UpdateBranch(txn, "a", 5));
+    ASSERT_SUCCESS(page->UpdateBranch(txn, "b", 6));
+    ASSERT_SUCCESS(page->UpdateBranch(txn, "c", 7));
+    ASSERT_SUCCESS(page->UpdateBranch(txn, "d", 8));
+    ASSERT_FAIL(page->UpdateBranch(txn, "e", 60));
+    ASSERT_FAIL(page->UpdateBranch(txn, "f", 30));
     txn.PreCommit();
   }
 
@@ -195,13 +195,13 @@ TEST_F(InternalPageTest, UpdateKey) {
   AssertPIDForKey("d", 8);
 }
 
-TEST_F(InternalPageTest, DeleteKey) {
+TEST_F(BranchPageTest, DeleteKey) {
   auto txn = tm_->Begin();
   PageRef page = Page();
   page->SetLowestValue(txn, 2);
-  ASSERT_SUCCESS(page->Insert(txn, "c", 23));
-  ASSERT_SUCCESS(page->Insert(txn, "b", 20));
-  ASSERT_SUCCESS(page->Insert(txn, "e", 40));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
 
   page_id_t pid;
   ASSERT_SUCCESS(page->GetPageForKey(txn, "alpha", &pid));
@@ -214,30 +214,31 @@ TEST_F(InternalPageTest, DeleteKey) {
   EXPECT_EQ(pid, 23);
 }
 
-TEST_F(InternalPageTest, SplitInto) {
+TEST_F(BranchPageTest, SplitInto) {
   auto txn = tm_->Begin();
   for (int i = 0; i < 8; ++i) {
-    PageRef page = p_->AllocateNewPage(txn, PageType::kInternalPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kBranchPage);
     page->SetLowestValue(txn, 0);
     for (int j = 0; j < 8; ++j) {
-      ASSERT_SUCCESS(page->Insert(txn, std::string(4000, '0' + j), j + 1));
+      ASSERT_SUCCESS(
+          page->InsertBranch(txn, std::string(4000, '0' + j), j + 1));
     }
 
-    PageRef right = p_->AllocateNewPage(txn, PageType::kInternalPage);
+    PageRef right = p_->AllocateNewPage(txn, PageType::kBranchPage);
     std::string mid;
     page->SplitInto(txn, std::string(4000, '0' + i), right.get(), &mid);
   }
 }
 
-TEST_F(InternalPageTest, Recovery) {
+TEST_F(BranchPageTest, Recovery) {
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
 
-    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
-    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
-    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
     txn.PreCommit();
   }
 
@@ -250,21 +251,21 @@ TEST_F(InternalPageTest, Recovery) {
   AssertPIDForKey("zeta", 40);
 }
 
-TEST_F(InternalPageTest, InsertCrash) {
+TEST_F(BranchPageTest, InsertCrash) {
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
 
     Flush();
-    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
     txn.PreCommit();
   }
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
-    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
-    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
   }
 
   Recover();  // Expect redo happen.
@@ -276,21 +277,21 @@ TEST_F(InternalPageTest, InsertCrash) {
   AssertPIDForKey("zeta", 23);
 }
 
-TEST_F(InternalPageTest, InsertAbort) {
+TEST_F(BranchPageTest, InsertAbort) {
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
 
-    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
     txn.PreCommit();
   }
   {
     auto txn = tm_->Begin();
     {
       PageRef page = Page();
-      ASSERT_SUCCESS(page->Insert(txn, "b", 20));
-      ASSERT_SUCCESS(page->Insert(txn, "e", 40));
+      ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
+      ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
     }
     Flush();
     txn.Abort();
@@ -305,21 +306,21 @@ TEST_F(InternalPageTest, InsertAbort) {
   AssertPIDForKey("zeta", 23);
 }
 
-TEST_F(InternalPageTest, UpdateCrash) {
+TEST_F(BranchPageTest, UpdateCrash) {
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
-    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
-    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
-    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
     txn.PreCommit();
   }
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
-    ASSERT_SUCCESS(page->Update(txn, "b", 200));
-    ASSERT_SUCCESS(page->Update(txn, "e", 400));
+    ASSERT_SUCCESS(page->UpdateBranch(txn, "b", 200));
+    ASSERT_SUCCESS(page->UpdateBranch(txn, "e", 400));
     txn.PreCommit();
     Flush();
   }
@@ -333,22 +334,22 @@ TEST_F(InternalPageTest, UpdateCrash) {
   AssertPIDForKey("zeta", 400);
 }
 
-TEST_F(InternalPageTest, UpdateAbort) {
+TEST_F(BranchPageTest, UpdateAbort) {
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
-    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
-    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
-    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
     txn.PreCommit();
   }
   {
     auto txn = tm_->Begin();
     {
       PageRef page = Page();
-      ASSERT_SUCCESS(page->Update(txn, "b", 2000));
-      ASSERT_SUCCESS(page->Update(txn, "e", 4000));
+      ASSERT_SUCCESS(page->UpdateBranch(txn, "b", 2000));
+      ASSERT_SUCCESS(page->UpdateBranch(txn, "e", 4000));
     }
     txn.Abort();
   }
@@ -362,14 +363,14 @@ TEST_F(InternalPageTest, UpdateAbort) {
   AssertPIDForKey("zeta", 40);
 }
 
-TEST_F(InternalPageTest, DeleteCrash) {
+TEST_F(BranchPageTest, DeleteCrash) {
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
-    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
-    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
-    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
     Flush();
     txn.PreCommit();
   }
@@ -389,14 +390,14 @@ TEST_F(InternalPageTest, DeleteCrash) {
   AssertPIDForKey("zeta", 40);
 }
 
-TEST_F(InternalPageTest, DeleteAbort) {
+TEST_F(BranchPageTest, DeleteAbort) {
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
-    ASSERT_SUCCESS(page->Insert(txn, "b", 20));
-    ASSERT_SUCCESS(page->Insert(txn, "e", 40));
-    ASSERT_SUCCESS(page->Insert(txn, "c", 23));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
+    ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
     txn.PreCommit();
   }
   {
@@ -419,7 +420,7 @@ TEST_F(InternalPageTest, DeleteAbort) {
   AssertPIDForKey("zeta", 40);
 }
 
-TEST_F(InternalPageTest, UpdateHeavy) {
+TEST_F(BranchPageTest, UpdateHeavy) {
   std::mt19937 random(0);
   constexpr int kCount = 40;
   Transaction txn = tm_->Begin();
@@ -431,7 +432,7 @@ TEST_F(InternalPageTest, UpdateHeavy) {
   for (int i = 0; i < kCount; ++i) {
     std::string key = RandomString((19937 * i) % 12 + 10);
     page_id_t value = random() % 10000;
-    ASSERT_SUCCESS(page->Insert(txn, key, value));
+    ASSERT_SUCCESS(page->InsertBranch(txn, key, value));
     keys.push_back(key);
     kvp.emplace(key, value);
   }
@@ -444,7 +445,7 @@ TEST_F(InternalPageTest, UpdateHeavy) {
     }
     std::string key = RandomString((19937 * i) % 32 + 100);
     page_id_t value = random() % 10000;
-    ASSERT_SUCCESS(page->Insert(txn, key, value));
+    ASSERT_SUCCESS(page->InsertBranch(txn, key, value));
     kvp[key] = value;
   }
   for (const auto& kv : kvp) {

@@ -67,11 +67,11 @@ void TransactionManager::CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
                                              std::string_view key) {
   logger_->AddLog(LogRecord::CompensatingInsertLogRecord(txn_id, pid, key));
 }
-void TransactionManager::CompensateInsertInternalLog(txn_id_t txn_id,
-                                                     page_id_t pid,
-                                                     std::string_view key) {
+void TransactionManager::CompensateInsertBranchLog(txn_id_t txn_id,
+                                                   page_id_t pid,
+                                                   std::string_view key) {
   logger_->AddLog(
-      LogRecord::CompensatingInsertInternalLogRecord(txn_id, pid, key));
+      LogRecord::CompensatingInsertBranchLogRecord(txn_id, pid, key));
 }
 
 void TransactionManager::CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
@@ -86,12 +86,12 @@ void TransactionManager::CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
   logger_->AddLog(
       LogRecord::CompensatingUpdateLeafLogRecord(txn_id, pid, key, redo));
 }
-void TransactionManager::CompensateUpdateInternalLog(txn_id_t txn_id,
-                                                     page_id_t pid,
-                                                     std::string_view key,
-                                                     page_id_t redo) {
+void TransactionManager::CompensateUpdateBranchLog(txn_id_t txn_id,
+                                                   page_id_t pid,
+                                                   std::string_view key,
+                                                   page_id_t redo) {
   logger_->AddLog(
-      LogRecord::CompensatingUpdateInternalLogRecord(txn_id, pid, key, redo));
+      LogRecord::CompensatingUpdateBranchLogRecord(txn_id, pid, key, redo));
 }
 
 void TransactionManager::CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
@@ -107,12 +107,12 @@ void TransactionManager::CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
   logger_->AddLog(
       LogRecord::CompensatingDeleteLeafLogRecord(txn_id, pid, key, redo));
 }
-void TransactionManager::CompensateDeleteInternalLog(txn_id_t txn_id,
-                                                     page_id_t pid,
-                                                     std::string_view key,
-                                                     page_id_t redo) {
+void TransactionManager::CompensateDeleteBranchLog(txn_id_t txn_id,
+                                                   page_id_t pid,
+                                                   std::string_view key,
+                                                   page_id_t redo) {
   logger_->AddLog(
-      LogRecord::CompensatingDeleteInternalLogRecord(txn_id, pid, key, redo));
+      LogRecord::ComnensatingDeleteBranchLogRecord(txn_id, pid, key, redo));
 }
 
 bool TransactionManager::GetExclusiveLock(const RowPosition& rp) {

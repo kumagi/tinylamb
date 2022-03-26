@@ -57,9 +57,9 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
     case LogType::kCompensateInsertLeaf:
       target->DeleteImpl(log.key);
       break;
-    case LogType::kDeleteInternal:
-    case LogType::kCompensateInsertInternal:
-      target->DeleteInternalImpl(log.key);
+    case LogType::kDeleteBranch:
+    case LogType::kCompensateInsertBranch:
+      target->DeleteBranchImpl(log.key);
       break;
     case LogType::kCompensateUpdateLeaf:
       target->UpdateImpl(log.key, log.redo_data);
@@ -68,13 +68,13 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
     case LogType::kCompensateDeleteLeaf:
       target->InsertImpl(log.key, log.redo_data);
       break;
-    case LogType::kInsertInternal:
-    case LogType::kCompensateDeleteInternal:
-      target->InsertInternalImpl(log.key, log.redo_page);
+    case LogType::kInsertBranch:
+    case LogType::kCompensateDeleteBranch:
+      target->InsertBranchImpl(log.key, log.redo_page);
       break;
-    case LogType::kUpdateInternal:
-    case LogType::kCompensateUpdateInternal:
-      target->UpdateInternalImpl(log.key, log.redo_page);
+    case LogType::kUpdateBranch:
+    case LogType::kCompensateUpdateBranch:
+      target->UpdateBranchImpl(log.key, log.redo_page);
       break;
     case LogType::kSetPrevNext: {
       page_id_t prev, next;
@@ -83,7 +83,7 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
       break;
     }
     case LogType::kLowestValue:
-      target->SetLowestValueInternalImpl(log.redo_page);
+      target->SetLowestValueBranchImpl(log.redo_page);
       break;
     case LogType::kSystemAllocPage:
       target->PageInit(log.pid, log.allocated_page_type);
@@ -121,27 +121,27 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       tm->CompensateInsertLog(log.txn_id, log.pid, log.key);
       target->DeleteImpl(log.key);
       break;
-    case LogType::kInsertInternal:
-      tm->CompensateInsertInternalLog(log.txn_id, log.pid, log.key);
-      target->DeleteInternalImpl(log.key);
+    case LogType::kInsertBranch:
+      tm->CompensateInsertBranchLog(log.txn_id, log.pid, log.key);
+      target->DeleteBranchImpl(log.key);
       break;
     case LogType::kUpdateLeaf:
       tm->CompensateUpdateLog(log.txn_id, log.pid, log.key, log.undo_data);
       target->UpdateImpl(log.key, log.undo_data);
       break;
-    case LogType::kUpdateInternal:
-      tm->CompensateUpdateInternalLog(log.txn_id, log.pid, log.key,
-                                      log.undo_page);
-      target->UpdateInternalImpl(log.key, log.undo_page);
+    case LogType::kUpdateBranch:
+      tm->CompensateUpdateBranchLog(log.txn_id, log.pid, log.key,
+                                    log.undo_page);
+      target->UpdateBranchImpl(log.key, log.undo_page);
       break;
     case LogType::kDeleteLeaf:
       tm->CompensateDeleteLog(log.txn_id, log.pid, log.key, log.undo_data);
       target->InsertImpl(log.key, log.undo_data);
       break;
-    case LogType::kDeleteInternal:
-      tm->CompensateDeleteInternalLog(log.txn_id, log.pid, log.key,
-                                      log.undo_page);
-      target->InsertInternalImpl(log.key, log.undo_page);
+    case LogType::kDeleteBranch:
+      tm->CompensateDeleteBranchLog(log.txn_id, log.pid, log.key,
+                                    log.undo_page);
+      target->InsertBranchImpl(log.key, log.undo_page);
       break;
     case LogType::kSetPrevNext: {
       page_id_t prev, next;
@@ -158,11 +158,11 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
     case LogType::kCompensateUpdateRow:
     case LogType::kCompensateDeleteRow:
     case LogType::kCompensateInsertLeaf:
-    case LogType::kCompensateInsertInternal:
+    case LogType::kCompensateInsertBranch:
     case LogType::kCompensateUpdateLeaf:
-    case LogType::kCompensateUpdateInternal:
+    case LogType::kCompensateUpdateBranch:
     case LogType::kCompensateDeleteLeaf:
-    case LogType::kCompensateDeleteInternal:
+    case LogType::kCompensateDeleteBranch:
     case LogType::kLowestValue:  // Just ignore it!.
       // Compensating log cannot undo.
       break;
@@ -284,9 +284,9 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
         case LogType::kInsertLeaf:
         case LogType::kUpdateLeaf:
         case LogType::kDeleteLeaf:
-        case LogType::kInsertInternal:
-        case LogType::kUpdateInternal:
-        case LogType::kDeleteInternal:
+        case LogType::kInsertBranch:
+        case LogType::kUpdateBranch:
+        case LogType::kDeleteBranch:
         case LogType::kCompensateInsertRow:
         case LogType::kCompensateUpdateRow:
         case LogType::kCompensateDeleteRow: {

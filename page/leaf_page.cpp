@@ -215,20 +215,20 @@ void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
     consumed_size += SerializeSize(GetKey(mid)) + SerializeSize(GetValue(mid)) +
                      sizeof(RowPointer);
   }
-  while (consumed_size + expected_size <= kThreshold && pos < row_count_) {
-    consumed_size += SerializeSize(GetKey(pos)) + SerializeSize(GetValue(pos)) +
-                     sizeof(RowPointer);
+  while (consumed_size + expected_size <= kThreshold && pivot < row_count_) {
+    consumed_size += SerializeSize(GetKey(pivot)) +
+                     SerializeSize(GetValue(pivot)) + sizeof(RowPointer);
     pivot++;
   }
-  while (kPageBodySize < consumed_size + expected_size && 0 < pos) {
-    consumed_size -= SerializeSize(GetKey(pos - 1)) +
-                     SerializeSize(GetValue(pos - 1)) + sizeof(RowPointer);
+  while (kPageBodySize < consumed_size + expected_size && 0 < pivot) {
+    consumed_size -= SerializeSize(GetKey(pivot - 1)) +
+                     SerializeSize(GetValue(pivot - 1)) + sizeof(RowPointer);
     pivot--;
   }
 
   const size_t original_row_count = row_count_;
   for (size_t i = pivot; i < row_count_; ++i) {
-    right->Insert(txn, GetKey(i), GetValue(i));
+    right->InsertLeaf(txn, GetKey(i), GetValue(i));
   }
 
   Page* this_page = GET_PAGE_PTR(this);
@@ -281,9 +281,16 @@ void LeafPage::Dump(std::ostream& o, int indent) const {
     << " FreePtr:" << free_ptr_;
   for (size_t i = 0; i < row_count_; ++i) {
     o << "\n"
-      << Indent(indent) << OmittedString(GetKey(i), 20) << " :"
+      << Indent(indent) << OmittedString(GetKey(i), 40) << " :"
       << OmittedString(GetValue(i), 20);
   }
+}
+
+bool LeafPage::SanityCheckForTest() const {
+  for (slot_t i = 0; i < row_count_ - 1; ++i) {
+    if (GetKey(i + 1) < GetKey(i)) return false;
+  }
+  return true;
 }
 
 }  // namespace tinylamb

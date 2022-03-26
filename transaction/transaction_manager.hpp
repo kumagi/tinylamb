@@ -36,20 +36,20 @@ class TransactionManager {
   void CompensateInsertLog(txn_id_t txn_id, page_id_t pid, slot_t slot);
   void CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
                            std::string_view key);
-  void CompensateInsertInternalLog(txn_id_t txn_id, page_id_t pid,
-                                   std::string_view key);
+  void CompensateInsertBranchLog(txn_id_t txn_id, page_id_t pid,
+                                 std::string_view key);
   void CompensateUpdateLog(txn_id_t txn_id, page_id_t pid, slot_t slot,
                            std::string_view redo);
   void CompensateUpdateLog(txn_id_t txn_id, page_id_t pid, std::string_view key,
                            std::string_view redo);
-  void CompensateUpdateInternalLog(txn_id_t txn_id, page_id_t pid,
-                                   std::string_view key, page_id_t redo);
+  void CompensateUpdateBranchLog(txn_id_t txn_id, page_id_t pid,
+                                 std::string_view key, page_id_t redo);
   void CompensateDeleteLog(txn_id_t txn_id, page_id_t pid, slot_t slot,
                            std::string_view redo);
   void CompensateDeleteLog(txn_id_t txn_id, page_id_t pid, std::string_view key,
                            std::string_view redo);
-  void CompensateDeleteInternalLog(txn_id_t txn_id, page_id_t pid,
-                                   std::string_view key, page_id_t redo);
+  void CompensateDeleteBranchLog(txn_id_t txn_id, page_id_t pid,
+                                 std::string_view key, page_id_t redo);
 
   bool GetExclusiveLock(const RowPosition& rp);
   bool GetSharedLock(const RowPosition& rp);

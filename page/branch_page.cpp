@@ -2,10 +2,11 @@
 // Created by kumagi on 2022/01/23.
 //
 
-#include "internal_page.hpp"
+#include "branch_page.hpp"
 
 #include "common/serdes.hpp"
 #include "page/page.hpp"
+#include "page/page_manager.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
@@ -26,26 +27,26 @@ std::string OmittedString(std::string_view original, size_t length) {
 
 }  // anonymous namespace
 
-slot_t InternalPage::RowCount() const { return row_count_; }
+slot_t BranchPage::RowCount() const { return row_count_; }
 
-void InternalPage::SetLowestValue(page_id_t pid, Transaction& txn,
-                                  page_id_t value) {
+void BranchPage::SetLowestValue(page_id_t pid, Transaction& txn,
+                                page_id_t value) {
   SetLowestValueImpl(value);
   txn.SetLowestLog(pid, value);
 }
 
-Status InternalPage::Insert(page_id_t pid, Transaction& txn,
-                            std::string_view key, page_id_t value) {
+Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
+                          page_id_t value) {
   const bin_size_t physical_size = SerializeSize(key) + sizeof(value);
   if (free_size_ < physical_size + sizeof(RowPointer)) return Status::kNoSpace;
   size_t pos = SearchToInsert(key);
   if (pos != row_count_ && GetKey(pos) == key) return Status::kDuplicates;
   InsertImpl(key, value);
-  txn.InsertInternalLog(pid, key, value);
+  txn.InsertBranchLog(pid, key, value);
   return Status::kSuccess;
 }
 
-void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
+void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
   const bin_size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
   free_size_ -= physical_size + sizeof(RowPointer);
   if (free_ptr_ < sizeof(RowPointer) * (row_count_ + 1) + physical_size) {
@@ -63,43 +64,46 @@ void InternalPage::InsertImpl(std::string_view key, page_id_t pid) {
   rows_[pos].size = physical_size;
 }
 
-Status InternalPage::Update(page_id_t pid, Transaction& txn,
-                            std::string_view key, page_id_t value) {
+Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
+                          page_id_t value) {
   const size_t pos = Search(key);
   if (row_count_ < pos || GetKey(pos) != key) return Status::kNotExists;
-  txn.UpdateInternalLog(pid, key, GetValue(pos), value);
+  txn.UpdateBranchLog(pid, key, GetValue(pos), value);
   UpdateImpl(key, value);
   return Status::kSuccess;
 }
 
-void InternalPage::UpdateImpl(std::string_view key, page_id_t pid) {
+void BranchPage::UpdateImpl(std::string_view key, page_id_t pid) {
   memcpy(Payload() + rows_[Search(key)].offset, &pid, sizeof(pid));
 }
 
-Status InternalPage::Delete(page_id_t pid, Transaction& txn,
-                            std::string_view key) {
-  const bin_size_t pos = Search(key);
-  if (GetKey(pos) != key) return Status::kNotExists;
+Status BranchPage::Delete(page_id_t pid, Transaction& txn,
+                          std::string_view key) {
+  const int pos = Search(key);
   bin_size_t old_value = GetValue(pos);
   DeleteImpl(key);
-  txn.DeleteInternalLog(pid, key, old_value);
+  txn.DeleteBranchLog(pid, key, old_value);
   return Status::kSuccess;
 }
 
-void InternalPage::DeleteImpl(std::string_view key) {
+void BranchPage::DeleteImpl(std::string_view key) {
   assert(0 < row_count_);
-  size_t pos = Search(key);
+  int pos = Search(key);
   assert(pos < row_count_);
-  free_size_ += GetKey(pos).length() + sizeof(page_id_t);
+  if (pos < 0) {
+    lowest_page_ = GetValue(0);
+    ++pos;
+  } else {
+    free_size_ += GetKey(pos).length() + sizeof(page_id_t);
+  }
   memmove(rows_ + pos, rows_ + pos + 1,
           sizeof(RowPointer) * (row_count_ - pos));
   --row_count_;
 }
 
-Status InternalPage::GetPageForKey(Transaction& txn, std::string_view key,
-                                   page_id_t* result) const {
+Status BranchPage::GetPageForKey(Transaction& txn, std::string_view key,
+                                 page_id_t* result) const {
   assert(0 < row_count_);
-  if (row_count_ == 0) return Status::kNotExists;
   if (key < GetKey(0)) {
     *result = lowest_page_;
   } else {
@@ -108,9 +112,21 @@ Status InternalPage::GetPageForKey(Transaction& txn, std::string_view key,
   return Status::kSuccess;
 }
 
-void InternalPage::SplitInto(page_id_t pid, Transaction& txn,
-                             std::string_view new_key, Page* right,
-                             std::string* middle) {
+Status BranchPage::FindForKey(Transaction& txn, std::string_view key,
+                              page_id_t* result) const {
+  assert(0 < row_count_);
+  size_t pos = Search(key);
+  if (RowCount() < pos) return Status::kNotExists;
+  if (key == GetKey(pos)) {
+    *result = GetValue(pos);
+    return Status::kSuccess;
+  }
+  return Status::kNotExists;
+}
+
+void BranchPage::SplitInto(page_id_t pid, Transaction& txn,
+                           std::string_view new_key, Page* right,
+                           std::string* middle) {
   constexpr size_t kThreshold = kPageBodySize / 2;
   const size_t expected_size =
       SerializeSize(new_key) + sizeof(page_id_t) + sizeof(RowPointer);
@@ -130,7 +146,7 @@ void InternalPage::SplitInto(page_id_t pid, Transaction& txn,
   *middle = GetKey(pos);
   right->SetLowestValue(txn, GetValue(pos));
   for (size_t i = pos + 1; i < row_count_; ++i) {
-    right->Insert(txn, GetKey(i), GetValue(i));
+    right->InsertBranch(txn, GetKey(i), GetValue(i));
   }
   Page* this_page = GET_PAGE_PTR(this);
   for (size_t i = pos; i < original_row_count; ++i) {
@@ -138,7 +154,7 @@ void InternalPage::SplitInto(page_id_t pid, Transaction& txn,
   }
 }
 
-bin_size_t InternalPage::SearchToInsert(std::string_view key) const {
+bin_size_t BranchPage::SearchToInsert(std::string_view key) const {
   int left = -1, right = row_count_;
   while (1 < right - left) {
     const int cur = (left + right) / 2;
@@ -151,7 +167,7 @@ bin_size_t InternalPage::SearchToInsert(std::string_view key) const {
   return right;
 }
 
-bin_size_t InternalPage::Search(std::string_view key) const {
+int BranchPage::Search(std::string_view key) const {
   int left = -1, right = row_count_;
   while (1 < right - left) {
     const int cur = (left + right) / 2;
@@ -164,20 +180,20 @@ bin_size_t InternalPage::Search(std::string_view key) const {
   return left;
 }
 
-std::string_view InternalPage::GetKey(size_t idx) const {
+std::string_view BranchPage::GetKey(size_t idx) const {
   std::string_view key;
   DeserializeStringView(Payload() + rows_[idx].offset + sizeof(page_id_t),
                         &key);
   return key;
 }
 
-page_id_t InternalPage::GetValue(size_t idx) const {
+page_id_t BranchPage::GetValue(size_t idx) const {
   page_id_t result;
   memcpy(&result, Payload() + rows_[idx].offset, sizeof(result));
   return result;
 }
 
-void InternalPage::Dump(std::ostream& o, int indent) const {
+void BranchPage::Dump(std::ostream& o, int indent) const {
   o << "Rows: " << row_count_ << " FreeSize: " << free_size_
     << " FreePtr:" << free_ptr_;
   if (row_count_ == 0) return;
@@ -189,7 +205,59 @@ void InternalPage::Dump(std::ostream& o, int indent) const {
   }
 }
 
-void InternalPage::DeFragment() {
+std::string SmallestKey(PageRef&& page) {
+  if (page->Type() == PageType::kLeafPage)
+    return std::string(page->body.leaf_page.GetKey(0));
+  else if (page->Type() == PageType::kBranchPage)
+    return std::string(page->body.branch_page.GetKey(0));
+  assert(!"invalid page type");
+}
+
+std::string BiggestKey(PageRef&& page) {
+  if (page->Type() == PageType::kLeafPage) {
+    slot_t count = page->body.leaf_page.RowCount();
+    return std::string(page->body.leaf_page.GetKey(count - 1));
+  } else if (page->Type() == PageType::kBranchPage) {
+    slot_t count = page->body.branch_page.RowCount();
+    return std::string(page->body.branch_page.GetKey(count - 1));
+  }
+  assert(!"invalid page type");
+}
+
+bool SanityCheck(PageRef&& page, PageManager* pm) {
+  if (page->Type() == PageType::kLeafPage)
+    return page->body.leaf_page.SanityCheckForTest();
+  else if (page->Type() == PageType::kBranchPage)
+    return page->body.branch_page.SanityCheckForTest(pm);
+  assert(!"invalid page type");
+}
+
+bool BranchPage::SanityCheckForTest(PageManager* pm) const {
+  bool sanity = SanityCheck(pm->GetPage(lowest_page_), pm);
+  if (!sanity) return false;
+  const Page* this_page = GET_CONST_PAGE_PTR(this);
+  for (size_t i = 0; i < row_count_ - 1; ++i) {
+    if (GetKey(i + 1) < GetKey(i)) return false;
+    std::string smallest = SmallestKey(pm->GetPage(GetValue(i)));
+    if (smallest < GetKey(i)) {
+      LOG(FATAL) << "Child smallest key is smaller than parent slot: "
+                 << smallest << " vs " << GetKey(i);
+      return false;
+    }
+    std::string biggest = BiggestKey(pm->GetPage(GetValue(i)));
+    if (GetKey(i + 1) < biggest) {
+      LOG(WARN) << *this_page;
+      LOG(FATAL) << "Child biggest key is bigger than parent next slot: "
+                 << GetKey(i + 1) << " vs " << biggest;
+      return false;
+    }
+    sanity = SanityCheck(pm->GetPage(GetValue(i)), pm);
+    if (!sanity) return false;
+  }
+  return SanityCheck(pm->GetPage(GetValue(row_count_ - 1)), pm);
+}
+
+void BranchPage::DeFragment() {
   std::vector<std::string> payloads;
   payloads.reserve(row_count_);
   for (size_t i = 0; i < row_count_; ++i) {
@@ -206,8 +274,8 @@ void InternalPage::DeFragment() {
 
 }  // namespace tinylamb
 
-uint64_t std::hash<tinylamb::InternalPage>::operator()(
-    const ::tinylamb::InternalPage& r) const {
+uint64_t std::hash<tinylamb::BranchPage>::operator()(
+    const ::tinylamb::BranchPage& r) const {
   uint64_t ret = 0;
   ret += std::hash<tinylamb::slot_t>()(r.row_count_);
   ret += std::hash<tinylamb::bin_size_t>()(r.free_ptr_);

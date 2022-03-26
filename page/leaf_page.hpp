@@ -14,7 +14,7 @@ namespace tinylamb {
 
 class Transaction;
 class Page;
-class InternalPage;
+class BranchPage;
 
 class LeafPage {
   char* Payload() { return reinterpret_cast<char*>(this); }
@@ -66,6 +66,7 @@ class LeafPage {
   void UpdateImpl(std::string_view key, std::string_view value);
   void DeleteImpl(std::string_view key);
   void SetPrevNextImpl(page_id_t prev, page_id_t next);
+  [[nodiscard]] bool SanityCheckForTest() const;
 
  private:
   void DeFragment();
@@ -76,7 +77,7 @@ class LeafPage {
   friend class BPlusTree;
   friend class BPlusTreeIterator;
   friend class Page;
-  friend class InternalPage;
+  friend class BranchPage;
   friend class std::hash<LeafPage>;
 
   page_id_t prev_pid_ = 0;

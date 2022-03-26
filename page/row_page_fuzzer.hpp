@@ -94,7 +94,7 @@ class Operation {
         page_->Read(txn_, slot, &dst);
         return 1 + sizeof(slot);
       }
-      case 1: {  // Insert
+      case 1: {  // InsertBranch
         bin_size_t size;
         if (input.size() < sizeof(size)) return 1 + input.size();
         memcpy(&size, input.data(), sizeof(size));
@@ -102,11 +102,11 @@ class Operation {
         size = std::min(size, (bin_size_t)input.size());
         std::string_view str(input.data(), size);
         slot_t slot;
-        if (verbose) LOG(TRACE) << "Insert: " << str;
+        if (verbose) LOG(TRACE) << "InsertBranch: " << str;
         page_->Insert(txn_, str, &slot);
         return 1 + sizeof(size) + size;
       }
-      case 2: {  // Update
+      case 2: {  // UpdateBranch
         slot_t slot;
         if (input.size() < sizeof(slot)) return 1 + input.size();
         memcpy(&slot, input.data(), sizeof(slot_t));
@@ -119,7 +119,7 @@ class Operation {
 
         size = std::min(size, (bin_size_t)input.size());
         std::string_view str(input.data(), size);
-        if (verbose) LOG(TRACE) << "Update: " << str << " at " << slot;
+        if (verbose) LOG(TRACE) << "UpdateBranch: " << str << " at " << slot;
         Status s = page_->Update(txn_, slot, str);
         if (verbose) LOG(TRACE) << ToString(s);
         return 1 + sizeof(slot) + sizeof(size) + size;

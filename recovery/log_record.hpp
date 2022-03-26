@@ -17,22 +17,22 @@ enum class LogType : uint16_t {
   kBegin,
   kInsertRow,
   kInsertLeaf,
-  kInsertInternal,
+  kInsertBranch,
   kUpdateRow,
   kUpdateLeaf,
-  kUpdateInternal,
+  kUpdateBranch,
   kDeleteRow,
   kDeleteLeaf,
-  kDeleteInternal,
+  kDeleteBranch,
   kCompensateInsertRow,
   kCompensateInsertLeaf,
-  kCompensateInsertInternal,
+  kCompensateInsertBranch,
   kCompensateUpdateRow,
   kCompensateUpdateLeaf,
-  kCompensateUpdateInternal,
+  kCompensateUpdateBranch,
   kCompensateDeleteRow,
   kCompensateDeleteLeaf,
-  kCompensateDeleteInternal,
+  kCompensateDeleteBranch,
   kCommit,
   kBeginCheckpoint,
   kEndCheckpoint,
@@ -65,18 +65,17 @@ struct LogRecord {
   static LogRecord InsertingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                           std::string_view key,
                                           std::string_view redo);
-  static LogRecord InsertingInternalLogRecord(lsn_t p, txn_id_t txn,
-                                              page_id_t pid,
-                                              std::string_view key,
-                                              page_id_t redo);
+  static LogRecord InsertingBranchLogRecord(lsn_t p, txn_id_t txn,
+                                            page_id_t pid, std::string_view key,
+                                            page_id_t redo);
 
   static LogRecord CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
                                                slot_t key);
   static LogRecord CompensatingInsertLogRecord(txn_id_t txn, page_id_t pid,
                                                std::string_view key);
-  static LogRecord CompensatingInsertInternalLogRecord(txn_id_t txn,
-                                                       page_id_t pid,
-                                                       std::string_view key);
+  static LogRecord CompensatingInsertBranchLogRecord(txn_id_t txn,
+                                                     page_id_t pid,
+                                                     std::string_view key);
 
   static LogRecord UpdatingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                      slot_t key, std::string_view redo,
@@ -85,10 +84,9 @@ struct LogRecord {
                                          std::string_view key,
                                          std::string_view redo,
                                          std::string_view undo);
-  static LogRecord UpdatingInternalLogRecord(lsn_t p, txn_id_t txn,
-                                             page_id_t pid,
-                                             std::string_view key,
-                                             page_id_t redo, page_id_t undo);
+  static LogRecord UpdatingBranchLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                           std::string_view key, page_id_t redo,
+                                           page_id_t undo);
 
   static LogRecord CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
                                                slot_t key,
@@ -96,19 +94,18 @@ struct LogRecord {
   static LogRecord CompensatingUpdateLeafLogRecord(lsn_t txn, page_id_t pid,
                                                    std::string_view key,
                                                    std::string_view redo);
-  static LogRecord CompensatingUpdateInternalLogRecord(lsn_t txn, page_id_t pid,
-                                                       std::string_view key,
-                                                       page_id_t redo);
+  static LogRecord CompensatingUpdateBranchLogRecord(lsn_t txn, page_id_t pid,
+                                                     std::string_view key,
+                                                     page_id_t redo);
 
   static LogRecord DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                      slot_t slot, std::string_view undo);
   static LogRecord DeletingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
                                          std::string_view key,
                                          std::string_view undo);
-  static LogRecord DeletingInternalLogRecord(lsn_t p, txn_id_t txn,
-                                             page_id_t pid,
-                                             std::string_view key,
-                                             page_id_t undo);
+  static LogRecord DeletingBranchLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
+                                           std::string_view key,
+                                           page_id_t undo);
 
   static LogRecord CompensatingDeleteLogRecord(txn_id_t txn, page_id_t pid,
                                                slot_t slot,
@@ -116,10 +113,10 @@ struct LogRecord {
   static LogRecord CompensatingDeleteLeafLogRecord(txn_id_t txn, page_id_t pid,
                                                    std::string_view key,
                                                    std::string_view redo);
-  static LogRecord CompensatingDeleteInternalLogRecord(txn_id_t txn,
-                                                       page_id_t pid,
-                                                       std::string_view slot,
-                                                       page_id_t redo);
+  static LogRecord ComnensatingDeleteBranchLogRecord(txn_id_t txn,
+                                                     page_id_t pid,
+                                                     std::string_view slot,
+                                                     page_id_t redo);
 
   static LogRecord SetLowestLogRecord(lsn_t p, txn_id_t tid, page_id_t pid,
                                       page_id_t lowest_value);
