@@ -17,6 +17,8 @@
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
+#include "type/row.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 
@@ -115,6 +117,28 @@ TEST_F(BPlusTreeTest, SplitBranch) {
   for (int i = 0; i < 6; ++i) {
     ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), long_value));
   }
+}
+
+TEST_F(BPlusTreeTest, MergeBranch) {
+  auto txn = tm_->Begin();
+  std::string long_value(2000, 'v');
+  for (int i = 0; i < 6; ++i) {
+    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), long_value));
+  }
+  bpt_->Dump(txn, std::cerr);
+  std::cerr << "\n";
+  for (int i = 0; i < 6; ++i) {
+    std::string key = KeyGen(i, 10000);
+    SCOPED_TRACE(key);
+    ASSERT_SUCCESS(bpt_->Delete(txn, key));
+    bpt_->Dump(txn, std::cerr);
+    std::cerr << "\n";
+    for (int j = i + 1; j < 6; ++j) {
+      std::string_view val;
+      ASSERT_SUCCESS(bpt_->Read(txn, KeyGen(j, 10000), &val));
+      ASSERT_EQ(val, long_value);
+    }
+  }
   bpt_->Dump(txn, std::cerr);
 }
 
@@ -197,28 +221,36 @@ TEST_F(BPlusTreeTest, Delete) {
     std::string key_prefix("key");
     for (int i = 0; i < kCount; ++i) {
       std::string key = KeyGen(i, 10000);
-      std::string value = KeyGen(i * 10, 1000);
+      std::string value = KeyGen(i, 1000);
       ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
       ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
       kvp.emplace(key, value);
     }
-    bpt_->Dump(txn, std::cerr, 0);
-    std::cerr << "\n";
     txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    for (const auto& kv : kvp) {
+      std::string_view val;
+      Status s = bpt_->Read(txn, kv.first, &val);
+      ASSERT_SUCCESS(s);
+      ASSERT_EQ(kv.second, val);
+    }
   }
   {
     auto txn = tm_->Begin();
     std::string long_value(2000, 'v');
     for (int i = 0; i < 50; i += 2) {
-      LOG(TRACE) << "delete: " << i;
       std::string key = KeyGen(i, 10000);
       ASSERT_SUCCESS(bpt_->Delete(txn, key));
-      bpt_->Dump(txn, std::cerr, 0);
-      std::cerr << "\n";
       kvp.erase(key);
       for (const auto& kv : kvp) {
         std::string_view val;
-        ASSERT_SUCCESS(bpt_->Read(txn, kv.first, &val));
+        Status s = bpt_->Read(txn, kv.first, &val);
+        if (s != Status::kSuccess) {
+          LOG(TRACE) << "failed to search: " << kv.first;
+        }
+        ASSERT_SUCCESS(s);
         ASSERT_EQ(kv.second, val);
       }
       ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
@@ -231,14 +263,107 @@ TEST_F(BPlusTreeTest, Delete) {
     std::string_view val;
     for (int i = 0; i < 50; ++i) {
       if (i % 2 == 0) {
-        LOG(ERROR) << "read: " << i;
         ASSERT_FAIL(bpt_->Read(txn, KeyGen(i, 10000), &val));
         ASSERT_EQ(val, "");
       } else {
         ASSERT_SUCCESS(bpt_->Read(txn, KeyGen(i, 10000), &val));
-        ASSERT_EQ(val, KeyGen(i * 10, 1000));
+        ASSERT_EQ(val, KeyGen(i * 1, 1000));
       }
     }
+  }
+}
+
+TEST_F(BPlusTreeTest, DeleteAll) {
+  constexpr int kCount = 100;
+  std::unordered_map<std::string, std::string> kvp;
+  kvp.reserve(kCount);
+  {
+    auto txn = tm_->Begin();
+    std::string key_prefix("key");
+    for (int i = 0; i < kCount; ++i) {
+      std::string key = KeyGen(i, 10000);
+      std::string value = KeyGen(i, 1000);
+      ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
+      ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+      kvp.emplace(key, value);
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    for (const auto& kv : kvp) {
+      std::string_view val;
+      Status s = bpt_->Read(txn, kv.first, &val);
+      ASSERT_SUCCESS(s);
+      ASSERT_EQ(kv.second, val);
+    }
+  }
+  {
+    auto txn = tm_->Begin();
+    std::string long_value(2000, 'v');
+    for (int i = 0; i < kCount; i++) {
+      std::string key = KeyGen(i, 10000);
+      ASSERT_SUCCESS(bpt_->Delete(txn, key));
+      kvp.erase(key);
+      for (const auto& kv : kvp) {
+        std::string_view val;
+        Status s = bpt_->Read(txn, kv.first, &val);
+        if (s != Status::kSuccess) {
+          LOG(TRACE) << "failed to search: " << kv.first;
+        }
+        ASSERT_SUCCESS(s);
+        ASSERT_EQ(kv.second, val);
+      }
+      ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    }
+    txn.PreCommit();
+  }
+}
+
+TEST_F(BPlusTreeTest, DeleteAllReverse) {
+  constexpr int kCount = 100;
+  std::unordered_map<std::string, std::string> kvp;
+  kvp.reserve(kCount);
+  {
+    auto txn = tm_->Begin();
+    std::string key_prefix("key");
+    for (int i = 0; i < kCount; ++i) {
+      std::string key = KeyGen(i, 10000);
+      std::string value = KeyGen(i, 1000);
+      ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
+      ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+      kvp.emplace(key, value);
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    for (const auto& kv : kvp) {
+      std::string_view val;
+      Status s = bpt_->Read(txn, kv.first, &val);
+      ASSERT_SUCCESS(s);
+      ASSERT_EQ(kv.second, val);
+    }
+  }
+  {
+    auto txn = tm_->Begin();
+    std::string long_value(2000, 'v');
+    for (int i = kCount - 1; 0 < i; i--) {
+      std::string key = KeyGen(i, 10000);
+      ASSERT_SUCCESS(bpt_->Delete(txn, key));
+      kvp.erase(key);
+      for (const auto& kv : kvp) {
+        std::string_view val;
+        Status s = bpt_->Read(txn, kv.first, &val);
+        if (s != Status::kSuccess) {
+          LOG(TRACE) << "failed to search: " << kv.first;
+        }
+        ASSERT_SUCCESS(s);
+        ASSERT_EQ(kv.second, val);
+      }
+      ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    }
+    txn.PreCommit();
   }
 }
 
@@ -328,8 +453,32 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
   }
 }
 
-TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
+TEST_F(BPlusTreeTest, InsertDelete) {
   constexpr int kCount = 50;
+  Transaction txn = tm_->Begin();
+  std::unordered_set<std::string> keys;
+  keys.reserve(kCount);
+  for (int i = 0; i < kCount; ++i) {
+    Row r({Value(i), Value(RandomString((19937 * i) % 120 + 10, false))});
+    std::string key = r.EncodeMemcomparableFormat();
+    ASSERT_SUCCESS(bpt_->Insert(txn, key, "foo"));
+    keys.insert(key);
+  }
+  Row read;
+  for (int i = 0; i < kCount * 4; ++i) {
+    auto it = keys.begin();
+    std::advance(it, (i * 63) % keys.size());
+    ASSERT_SUCCESS(bpt_->Delete(txn, *it));
+    keys.erase(it);
+    Row r({Value(i), Value(RandomString((19937 * i) % 3200 + 5000, false))});
+    std::string inserting_key = r.EncodeMemcomparableFormat();
+    bpt_->Insert(txn, inserting_key, "bar");
+    keys.insert(inserting_key);
+  }
+}
+
+TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
+  constexpr int kCount = 100;
   Transaction txn = tm_->Begin();
   std::unordered_map<std::string, std::string> kvp;
   kvp.reserve(kCount);

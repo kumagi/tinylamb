@@ -72,6 +72,7 @@ class Page {
   void SetLowestValue(Transaction& txn, page_id_t i);
   void SplitInto(Transaction& txn, std::string_view new_key, Page* right,
                  std::string* middle);
+  void Merge(Transaction& txn, Page* page);
   void PageTypeChange(Transaction& txn, PageType new_type);
 
   // Internal methods exposed for recovery.

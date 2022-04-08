@@ -42,6 +42,9 @@ class BranchPage {
 
   void SetLowestValueImpl(page_id_t value) { lowest_page_ = value; }
 
+  Status AttachLeft(page_id_t pid, Transaction& txn, std::string_view key,
+                    page_id_t value);
+
   Status Insert(page_id_t pid, Transaction& txn, std::string_view key,
                 page_id_t value);
 
@@ -58,6 +61,8 @@ class BranchPage {
 
   void SplitInto(page_id_t pid, Transaction& txn, std::string_view new_key,
                  Page* right, std::string* middle);
+
+  void Merge(page_id_t pid, Transaction& txn, Page* child);
 
   // Return lowest page_id which may contain the specified |key|.
   [[nodiscard]] bin_size_t SearchToInsert(std::string_view key) const;

@@ -21,6 +21,11 @@ PageRef BPlusTree::FindLeafForInsert(Transaction& txn, std::string_view key,
     return std::move(page);
   }
   page_id_t next;
+  if (page->RowCount() == 0) {
+    for (auto& p : parents) p.PageUnlock();
+    page.PageUnlock();
+    abort();
+  }
   if (page->GetPageForKey(txn, key, &next) != Status::kSuccess) {
     LOG(ERROR) << "No next page found";
   }
@@ -176,47 +181,108 @@ Status BPlusTree::Update(Transaction& txn, std::string_view key,
   return s;
 }
 
-void ChangeLeftMostKey(Transaction& txn, std::string_view old_next,
-                       std::string_view new_next,
-                       std::vector<PageRef>& parents) {
-  for (int idx = (int)parents.size() - 1; 0 <= idx; --idx) {
-    PageRef& page = parents[idx];
-    page_id_t value;
-    Status s = page->FindForKey(txn, old_next, &value);
-    if (s == Status::kSuccess) {
-      s = page->Delete(txn, old_next);
-      assert(s == Status::kSuccess);
-      s = page->InsertBranch(txn, new_next, value);
-      assert(s == Status::kSuccess);
-    } else {
-      break;
-    }
-  }
-}
-
 Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
   PageRef root = pm_->GetPage(root_);
   std::vector<PageRef> parents;
   PageRef leaf = FindLeafForInsert(txn, key, std::move(root), parents);
-  // TODO(kumagi): We need to merge the leaf and delete the entire node.
   std::string next_leftmost = leaf->GetKey(0) == key && 1 < leaf->RowCount()
                                   ? std::string(leaf->GetKey(1))
                                   : "";
   Status s = leaf->Delete(txn, key);
   if (s != Status::kSuccess) return s;
-  if (!next_leftmost.empty()) {
-    ChangeLeftMostKey(txn, key, next_leftmost, parents);
-  }
-
   PageRef ref = std::move(leaf);
   while (ref->RowCount() == 0 && !parents.empty()) {
-    LOG(ERROR) << "page destroy: " << ref->PageID();
-    ref.PageUnlock();
-    pm_->DestroyPage(txn, ref.get());
     PageRef parent = std::move(parents.back());
-    parent->Delete(txn, key);
+    if (ref->Type() == PageType::kLeafPage) {
+      parent->Delete(txn, key);
+    } else if (ref->Type() == PageType::kBranchPage) {
+      page_id_t orphan = ref->body.branch_page.lowest_page_;
+      const BranchPage& bp = parent->body.branch_page;
+      if (bp.lowest_page_ == ref->PageID()) {
+        // If this node is the leftmost child of the parent,
+        // Merge this node into the right sibling.
+        std::string_view parent_key(parent->GetKey(0));
+        PageRef right = pm_->GetPage(bp.GetValue(0));
+        s = right->body.branch_page.AttachLeft(right->PageID(), txn, parent_key,
+                                               orphan);
+        assert(s == Status::kSuccess);
+        parent->Delete(txn, key);
+      } else if (0 < bp.RowCount()) {
+        // In other case, steal right most entry from left sibling.
+        int idx = bp.Search(key);
+        assert(0 <= idx);
+        std::string parent_key(bp.GetKey(idx));  // needs deep copy.
+        const page_id_t left_sibling = [&]() {
+          if (idx == 0) {
+            return bp.lowest_page_;
+          } else {
+            return bp.GetValue(idx - 1);
+          }
+        }();
+        PageRef left = pm_->GetPage(left_sibling);
+        const int rightmost_idx = left->RowCount() - 1;
+        std::string_view left_rightmost_key = left->GetKey(rightmost_idx);
+        size_t left_rightmost_value = left->GetPage(rightmost_idx);
+        parent->Delete(txn, key);
+        if (1 < left->RowCount()) {
+          // Steal key from left sibling and insert it into parent.
+          parent->InsertBranch(txn, left_rightmost_key, ref->PageID());
+          s = left->Delete(txn, left_rightmost_key);
+          ref->SetLowestValue(txn, left_rightmost_value);
+          assert(ref->RowCount() == 0);
+          ref->InsertBranch(txn, parent_key, orphan);
+        } else {
+          // Just steal the key from the parent and merge into left sibling.
+          left->InsertBranch(txn, parent_key, orphan);
+        }
+        assert(s == Status::kSuccess);
+      } else {
+        for (slot_t i = 0; i < bp.row_count_; ++i) {
+          if (bp.GetValue(i) == ref->PageID()) {
+            // Merge into next left page.
+            std::string_view parent_key = parent->GetKey(i);
+            ref.PageUnlock();
+            PageRef left = pm_->GetPage(bp.GetValue(i));
+            left->InsertBranch(txn, parent_key, orphan);
+            parent->Delete(txn, key);
+          }
+        }
+      }
+    }
     parents.pop_back();
+    if (ref->RowCount() == 0 && ref->PageID() != root_) {
+      pm_->DestroyPage(txn, ref.get());
+    }
+    ref.PageUnlock();
     ref = std::move(parent);
+  }
+  if (parents.empty() && ref->RowCount() == 0) {
+    if (ref->Type() == PageType::kBranchPage) {
+      ref.PageUnlock();
+      // Root is empty, move entire dada into root.
+      assert(ref->PageID() == root_);
+      PageRef next_root = pm_->GetPage(ref->body.branch_page.lowest_page_);
+      if (next_root->Type() == PageType::kBranchPage) {
+        const BranchPage& bp = next_root->body.branch_page;
+        ref->SetLowestValue(txn, bp.lowest_page_);
+        while (0 < bp.row_count_) {
+          std::string moving_key(bp.GetKey(0));
+          s = ref->InsertBranch(txn, moving_key, bp.GetValue(0));
+          assert(s == Status::kSuccess);
+          next_root->Delete(txn, moving_key);
+        }
+      } else if (next_root->Type() == PageType::kLeafPage) {
+        ref->PageTypeChange(txn, PageType::kLeafPage);
+        const LeafPage& lp = next_root->body.leaf_page;
+        while (0 < lp.row_count_) {
+          std::string moving_key(lp.GetKey(0));
+          ref->InsertLeaf(txn, moving_key, lp.GetValue(0));
+          next_root->Delete(txn, moving_key);
+        }
+      }
+      next_root.PageUnlock();
+      pm_->DestroyPage(txn, next_root.get());
+    }
   }
   return s;
 }
@@ -246,7 +312,7 @@ bool BPlusTree::SanityCheckForTest(PageManager* pm) const {
 namespace {
 
 std::string OmittedString(std::string_view original, int length) {
-  if (length < original.length()) {
+  if ((size_t)length < original.length()) {
     std::string omitted_key = std::string(original).substr(0, 8);
     omitted_key +=
         "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
@@ -280,6 +346,10 @@ void BPlusTree::DumpBranch(Transaction& txn, std::ostream& o, PageRef&& page,
   } else if (page->Type() == PageType::kBranchPage) {
     DumpBranch(txn, o, pm_->GetPage(page->body.branch_page.lowest_page_),
                indent + 4);
+    if (page->RowCount() == 0) {
+      o << Indent(indent) << "(Empty branch): " << *page;
+      return;
+    }
     for (slot_t i = 0; i < page->RowCount(); ++i) {
       std::string_view key;
       page->ReadKey(txn, i, &key);
@@ -290,11 +360,19 @@ void BPlusTree::DumpBranch(Transaction& txn, std::ostream& o, PageRef&& page,
         DumpBranch(txn, o, pm_->GetPage(pid), indent + 4);
       }
     }
+  } else {
+    LOG(ERROR) << "Invalid page type";
+    abort();
   }
 }
 
 void BPlusTree::Dump(Transaction& txn, std::ostream& o, int indent) const {
-  DumpBranch(txn, o, pm_->GetPage(root_), indent);
+  PageRef root_page = pm_->GetPage(root_);
+  if (root_page->Type() == PageType::kLeafPage) {
+    DumpLeafPage(txn, std::move(root_page), o, indent);
+  } else {
+    DumpBranch(txn, o, std::move(root_page), indent);
+  }
   o << "\n";
 }
 

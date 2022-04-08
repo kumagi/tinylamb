@@ -11,7 +11,10 @@ namespace tinylamb {
 void PageRef::PageUnlock() {
   assert(page_);
   assert(pool_);
-  page_lock_.unlock();
+  if (page_lock_.owns_lock()) {
+    page_lock_.unlock();
+    pool_->Unpin(page_->PageID());
+  }
 }
 
 RowPage& PageRef::GetRowPage() {
@@ -28,8 +31,8 @@ PageRef::~PageRef() {
   if (page_) {
     if (page_lock_.owns_lock()) {
       page_lock_.unlock();
+      pool_->Unpin(page_->PageID());
     }
-    pool_->Unpin(page_->PageID());
   }
 }
 

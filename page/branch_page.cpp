@@ -35,6 +35,20 @@ void BranchPage::SetLowestValue(page_id_t pid, Transaction& txn,
   txn.SetLowestLog(pid, value);
 }
 
+Status BranchPage::AttachLeft(page_id_t pid, Transaction& txn,
+                              std::string_view key, page_id_t value) {
+  assert(0 < row_count_);
+  const bin_size_t physical_size = SerializeSize(key) + sizeof(value);
+  if (free_size_ < physical_size + sizeof(RowPointer)) return Status::kNoSpace;
+  if (0 != row_count_ && GetKey(0) == key) return Status::kDuplicates;
+  assert(key < GetKey(0));
+  InsertImpl(key, lowest_page_);
+  txn.InsertBranchLog(pid, key, lowest_page_);
+  SetLowestValue(pid, txn, value);
+  txn.SetLowestLog(pid, value);
+  return Status::kSuccess;
+}
+
 Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
                           page_id_t value) {
   const bin_size_t physical_size = SerializeSize(key) + sizeof(value);
@@ -93,9 +107,8 @@ void BranchPage::DeleteImpl(std::string_view key) {
   if (pos < 0) {
     lowest_page_ = GetValue(0);
     ++pos;
-  } else {
-    free_size_ += GetKey(pos).length() + sizeof(page_id_t);
   }
+  free_size_ += GetKey(pos).length() + sizeof(page_id_t);
   memmove(rows_ + pos, rows_ + pos + 1,
           sizeof(RowPointer) * (row_count_ - pos));
   --row_count_;
@@ -154,6 +167,14 @@ void BranchPage::SplitInto(page_id_t pid, Transaction& txn,
   }
 }
 
+void BranchPage::Merge(page_id_t pid, Transaction& txn, Page* child) {
+  assert(child->Type() == PageType::kBranchPage);
+  assert(child->body.branch_page.row_count_ == 0);
+  assert(0 < row_count_);
+  const page_id_t new_child = child->body.branch_page.lowest_page_;
+  LOG(ERROR) << pid << " and " << new_child << " merge";
+}
+
 bin_size_t BranchPage::SearchToInsert(std::string_view key) const {
   int left = -1, right = row_count_;
   while (1 < right - left) {
@@ -195,7 +216,7 @@ page_id_t BranchPage::GetValue(size_t idx) const {
 
 void BranchPage::Dump(std::ostream& o, int indent) const {
   o << "Rows: " << row_count_ << " FreeSize: " << free_size_
-    << " FreePtr:" << free_ptr_;
+    << " FreePtr:" << free_ptr_ << " Lowest: " << lowest_page_;
   if (row_count_ == 0) return;
   o << "\n" << Indent(indent + 2) << lowest_page_;
   for (size_t i = 0; i < row_count_; ++i) {

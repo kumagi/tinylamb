@@ -274,6 +274,11 @@ void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
   body.branch_page.SplitInto(PageID(), txn, new_key, right, middle);
 }
 
+void Page::Merge(Transaction& txn, Page* page) {
+  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  body.branch_page.Merge(PageID(), txn, page);
+}
+
 void Page::PageTypeChange(Transaction& txn, PageType new_type) {
   PageTypeChangeImpl(new_type);
   txn.AllocatePageLog(page_id, new_type);
