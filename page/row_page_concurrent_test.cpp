@@ -24,7 +24,7 @@ TEST_F(RowPageTest, InsertInsert) {
   }
 }
 
-TEST_F(RowPageTest, InsertUpdate) {
+TEST_F(RowPageTest, DISABLED_InsertUpdate) {
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
   for (int j = 0; j < 100; ++j) {
