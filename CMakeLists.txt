@@ -133,7 +133,7 @@ add_simple_test(page/row_page_concurrent_test.cpp)
 ## Fuzzing
 ########################################
 function(add_fuzzer_test file_path)
-    set(fuzzer_option "-fsanitize=address,fuzzer")
+    set(fuzzer_option "-fsanitize=address,fuzzer,undefined,bounds")
     get_filename_component(filename ${file_path} NAME)
     string(REPLACE ".cpp" "" target_name ${filename})
     add_executable(${target_name} ${file_path})
@@ -149,6 +149,7 @@ endfunction()
 
 add_fuzzer_test(type/value_fuzzer.cpp)
 add_fuzzer_test(page/row_page_fuzzer.cpp)
+add_fuzzer_test(index/b_plus_tree_fuzzer.cpp)
 
 ########################################
 ## Fuzzing Replay
@@ -170,3 +171,4 @@ function(add_fuzzer_test file_path)
 endfunction()
 
 add_fuzzer_test(page/row_page_fuzzer_replay.cpp)
+add_fuzzer_test(index/b_plus_tree_fuzzer_replay.cpp)
