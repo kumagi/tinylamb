@@ -303,13 +303,18 @@ TEST_F(BPlusTreeTest, DeleteAll) {
     std::string long_value(2000, 'v');
     for (int i = 0; i < kCount; i++) {
       std::string key = KeyGen(i, 10000);
+      LOG(TRACE) << "Delete: " << i;
       ASSERT_SUCCESS(bpt_->Delete(txn, key));
       kvp.erase(key);
+      bpt_->Dump(txn, std::cerr, 0);
+      std::cerr << "\n";
       for (const auto& kv : kvp) {
         std::string_view val;
         Status s = bpt_->Read(txn, kv.first, &val);
         if (s != Status::kSuccess) {
           LOG(TRACE) << "failed to search: " << kv.first;
+          bpt_->Dump(txn, std::cerr, 0);
+          std::cerr << "\n";
         }
         ASSERT_SUCCESS(s);
         ASSERT_EQ(kv.second, val);

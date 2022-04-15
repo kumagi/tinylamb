@@ -11,7 +11,7 @@ namespace tinylamb {
 
 thread_local std::random_device seed_gen;
 thread_local std::mt19937 device_random(seed_gen());
-thread_local std::mt19937 seeded_random(4);
+thread_local std::mt19937 seeded_random(4);  // see https://xkcd.com/221/
 
 std::string RandomString(size_t len = 16, bool random_seed = true) {
   static const char alphanum[] =

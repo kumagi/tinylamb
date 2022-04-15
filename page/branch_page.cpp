@@ -63,7 +63,8 @@ Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
 void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
   const bin_size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
   free_size_ -= physical_size + sizeof(RowPointer);
-  if (free_ptr_ < sizeof(RowPointer) * (row_count_ + 1) + physical_size) {
+  if ((Payload() + free_ptr_ - physical_size) <=
+      reinterpret_cast<char*>(&rows_[row_count_ + 2])) {
     DeFragment();
   }
   const int pos = SearchToInsert(key);
@@ -145,16 +146,16 @@ void BranchPage::SplitInto(page_id_t pid, Transaction& txn,
       SerializeSize(new_key) + sizeof(page_id_t) + sizeof(RowPointer);
   size_t pos = SearchToInsert(new_key);
   size_t consumed_size = 0;
-  for (size_t mid = 0; mid < pos; ++mid) {
+  for (size_t i = 0; i < pos; ++i) {
     consumed_size +=
-        SerializeSize(GetKey(mid)) + sizeof(page_id_t) + sizeof(RowPointer);
+        SerializeSize(GetKey(i)) + sizeof(page_id_t) + sizeof(RowPointer);
   }
   while (consumed_size + expected_size < kThreshold && pos < row_count_ - 1) {
     consumed_size +=
         SerializeSize(GetKey(pos)) + sizeof(page_id_t) + sizeof(RowPointer);
     pos++;
   }
-  if (pos == row_count_) --pos;
+  if (pos >= row_count_ - 1) --pos;
   const size_t original_row_count = row_count_;
   *middle = GetKey(pos);
   right->SetLowestValue(txn, GetValue(pos));
@@ -231,6 +232,7 @@ std::string SmallestKey(PageRef&& page) {
     return std::string(page->body.leaf_page.GetKey(0));
   else if (page->Type() == PageType::kBranchPage)
     return std::string(page->body.branch_page.GetKey(0));
+  LOG(ERROR) << " for " << page->PageID() << " -> " << page->Type();
   assert(!"invalid page type");
 }
 
@@ -256,9 +258,17 @@ bool SanityCheck(PageRef&& page, PageManager* pm) {
 bool BranchPage::SanityCheckForTest(PageManager* pm) const {
   bool sanity = SanityCheck(pm->GetPage(lowest_page_), pm);
   if (!sanity) return false;
+  if (row_count_ == 0) {
+    LOG(FATAL) << "Branch page is empty";
+    return false;
+  }
   const Page* this_page = GET_CONST_PAGE_PTR(this);
   for (size_t i = 0; i < row_count_ - 1; ++i) {
     if (GetKey(i + 1) < GetKey(i)) return false;
+    if (GetValue(i) == 0) {
+      LOG(FATAL) << "zero page at " << i;
+      Dump(std::cerr, 0);
+    }
     std::string smallest = SmallestKey(pm->GetPage(GetValue(i)));
     if (smallest < GetKey(i)) {
       LOG(FATAL) << "Child smallest key is smaller than parent slot: "

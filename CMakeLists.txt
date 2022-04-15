@@ -155,7 +155,7 @@ add_fuzzer_test(index/b_plus_tree_fuzzer.cpp)
 ## Fuzzing Replay
 ########################################
 function(add_fuzzer_test file_path)
-    set(fuzzer_option "-fsanitize=address")
+    set(fuzzer_option "-fsanitize=address,undefined,bounds")
     get_filename_component(filename ${file_path} NAME)
     string(REPLACE ".cpp" "" target_name ${filename})
     add_executable(${target_name} ${file_path})

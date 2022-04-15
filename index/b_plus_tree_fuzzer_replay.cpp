@@ -13,8 +13,10 @@ int main(int argc, char** argv) {
   std::filesystem::path file(argv[1]);
   std::ifstream case_data(file, std::ios::in | std::ios::binary);
   std::string file_content;
-  case_data >> file_content;
-  LOG(ERROR) << "test: " << file;
+  file_content.resize(8);
+  case_data.read(file_content.data(), 8);
+  LOG(INFO) << "test file: " << file;
   tinylamb::Try(*(uint64_t*)file_content.data(), true);
+  LOG(INFO) << "successfully finished.";
   return 0;
 }
