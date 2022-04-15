@@ -140,6 +140,7 @@ function(add_fuzzer_test file_path)
 
     target_compile_options(${target_name} PRIVATE -g ${fuzzer_option})
     target_link_options(${target_name} PRIVATE ${fuzzer_option})
+    set_property(TARGET ${target_name} APPEND_STRING PROPERTY LINK_FLAGS " -fuse-ld=${mold}")
 
     target_link_libraries(${target_name}
             libtinylamb
