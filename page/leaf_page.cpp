@@ -65,12 +65,13 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
   }
   assert(sizeof(RowPointer) * (row_count_ + 1) + physical_size <= free_ptr_);
   free_size_ -= physical_size + sizeof(RowPointer);
-  size_t pos = Find(key);
   free_ptr_ -= physical_size;
 
   bin_size_t write_offset = free_ptr_;
   write_offset += SerializeStringView(Payload() + write_offset, key);
   SerializeStringView(Payload() + write_offset, value);
+
+  size_t pos = Find(key);
   memmove(rows_ + pos + 1, rows_ + pos,
           sizeof(RowPointer) * (row_count_ - pos));
   row_count_++;
@@ -80,19 +81,18 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
 
 Status LeafPage::Update(page_id_t page_id, Transaction& txn,
                         std::string_view key, std::string_view value) {
-  const size_t physical_size =
-      sizeof(bin_size_t) + key.size() + sizeof(bin_size_t) + value.size();
+  const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
 
-  std::string_view existing_value;
-  if (Read(page_id, txn, key, &existing_value) == Status::kNotExists) {
+  std::string_view old_value;
+  if (Read(page_id, txn, key, &old_value) == Status::kNotExists) {
     return Status::kNotExists;
   }
+  const bin_size_t old_size = SerializeSize(key) + SerializeSize(old_value);
+  if (old_size < physical_size && free_size_ < physical_size - old_size) {
+    return Status::kNoSpace;
+  }
 
-  const int64_t size_diff =
-      static_cast<int64_t>(physical_size) - existing_value.size();
-  if (free_size_ < size_diff) return Status::kNoSpace;
-
-  txn.UpdateLeafLog(page_id, key, existing_value, value);
+  txn.UpdateLeafLog(page_id, key, old_value, value);
   UpdateImpl(key, value);
   return Status::kSuccess;
 }
@@ -100,7 +100,9 @@ Status LeafPage::Update(page_id_t page_id, Transaction& txn,
 void LeafPage::UpdateImpl(std::string_view key, std::string_view redo) {
   const size_t physical_size = SerializeSize(key) + SerializeSize(redo);
   const size_t pos = Find(key);
-  assert((int)physical_size - rows_[pos].size <= free_size_);
+  if (rows_[pos].size < physical_size) {
+    assert(physical_size - rows_[pos].size <= free_size_);
+  }
   if (rows_[pos].size < physical_size) {
     if (free_ptr_ <= sizeof(RowPointer) * (row_count_ + 1) + physical_size) {
       free_size_ += rows_[pos].size;
@@ -232,7 +234,7 @@ void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
   }
   right->SetPrevNext(txn, pid, next_pid_);
   this_page->SetPrevNext(txn, prev_pid_, right->PageID());
-  
+
   if (right->RowCount() == 0 || right->GetKey(0) <= key) {
     assert(expected_size <= right->body.leaf_page.free_size_);
   } else {

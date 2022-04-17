@@ -146,7 +146,6 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
     std::string_view middle_key;
     new_page->LowestKey(txn, &middle_key);
     new_page.PageUnlock();
-    LOG(WARN) << "Insert and split: " << middle_key;
     return InsertBranch(txn, middle_key, new_page->PageID(), parents);
   }
   return s;
