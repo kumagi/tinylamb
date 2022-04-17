@@ -109,7 +109,7 @@ void BranchPage::DeleteImpl(std::string_view key) {
     lowest_page_ = GetValue(0);
     ++pos;
   }
-  free_size_ += GetKey(pos).length() + sizeof(page_id_t);
+  free_size_ += SerializeSize(GetKey(pos)) + sizeof(page_id_t);
   memmove(rows_ + pos, rows_ + pos + 1,
           sizeof(RowPointer) * (row_count_ - pos));
   --row_count_;
@@ -139,32 +139,44 @@ Status BranchPage::FindForKey(Transaction& txn, std::string_view key,
 }
 
 void BranchPage::SplitInto(page_id_t pid, Transaction& txn,
-                           std::string_view new_key, Page* right,
+                           std::string_view key, Page* right,
                            std::string* middle) {
-  constexpr size_t kThreshold = kPageBodySize / 2;
+  const size_t kPayload = kPageBodySize - OFFSET_OF(BranchPage, rows_);
+  const size_t kThreshold = kPayload / 2;
   const size_t expected_size =
-      SerializeSize(new_key) + sizeof(page_id_t) + sizeof(RowPointer);
-  size_t pos = SearchToInsert(new_key);
+      SerializeSize(key) + sizeof(page_id_t) + sizeof(RowPointer);
+  assert(right->type == PageType::kBranchPage);
   size_t consumed_size = 0;
-  for (size_t i = 0; i < pos; ++i) {
+  size_t pivot = 0;
+  while (consumed_size < kThreshold && pivot < row_count_ - 2) {
     consumed_size +=
-        SerializeSize(GetKey(i)) + sizeof(page_id_t) + sizeof(RowPointer);
+        SerializeSize(GetKey(pivot++)) + sizeof(page_id_t) + sizeof(RowPointer);
   }
-  while (consumed_size + expected_size < kThreshold && pos < row_count_ - 1) {
+  while (GetKey(pivot) < key && consumed_size < expected_size) {
+    pivot++;
     consumed_size +=
-        SerializeSize(GetKey(pos)) + sizeof(page_id_t) + sizeof(RowPointer);
-    pos++;
+        SerializeSize(GetKey(pivot)) + sizeof(page_id_t) + sizeof(RowPointer);
   }
-  if (pos >= row_count_ - 1) --pos;
+  while (key < GetKey(pivot) && kPayload < consumed_size + expected_size) {
+    consumed_size -=
+        SerializeSize(GetKey(pivot)) + sizeof(page_id_t) + sizeof(RowPointer);
+    pivot--;
+  }
+
   const size_t original_row_count = row_count_;
-  *middle = GetKey(pos);
-  right->SetLowestValue(txn, GetValue(pos));
-  for (size_t i = pos + 1; i < row_count_; ++i) {
+  *middle = GetKey(pivot);
+  right->SetLowestValue(txn, GetValue(pivot));
+  for (size_t i = pivot + 1; i < row_count_; ++i) {
     right->InsertBranch(txn, GetKey(i), GetValue(i));
   }
   Page* this_page = GET_PAGE_PTR(this);
-  for (size_t i = pos; i < original_row_count; ++i) {
-    this_page->Delete(txn, GetKey(pos));
+  for (size_t i = pivot; i < original_row_count; ++i) {
+    this_page->Delete(txn, GetKey(pivot));
+  }
+  if (right->RowCount() == 0 || right->GetKey(0) <= key) {
+    assert(expected_size <= right->body.branch_page.free_size_);
+  } else {
+    assert(expected_size <= free_size_);
   }
 }
 

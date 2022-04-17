@@ -88,7 +88,14 @@ void Try(uint64_t seed, bool verbose) {
 
     for (const auto& kv : kvp) {
       std::string_view val;
-      bpt.Read(txn, kv.first, &val);
+      Status s = bpt.Read(txn, kv.first, &val);
+      if (s != Status::kSuccess) {
+        LOG(ERROR) << s;
+      }
+      if (kvp[kv.first] != val) {
+        LOG(ERROR) << kvp[kv.first] << " vs " << val;
+      }
+      assert(s == Status::kSuccess);
       assert(kvp[kv.first] == val);
     }
 
@@ -106,7 +113,15 @@ void Try(uint64_t seed, bool verbose) {
     kvp[key] = value;
     for (const auto& kv : kvp) {
       std::string_view val;
-      bpt.Read(txn, kv.first, &val);
+      Status s = bpt.Read(txn, kv.first, &val);
+      if (s != Status::kSuccess) {
+        LOG(ERROR) << s;
+      }
+      if (kvp[kv.first] != val) {
+        LOG(ERROR) << "Key: " << kv.first;
+        LOG(ERROR) << kvp[kv.first] << " vs " << val;
+      }
+      assert(s == Status::kSuccess);
       assert(kvp[kv.first] == val);
     }
   }

@@ -60,14 +60,11 @@ Status LeafPage::Insert(page_id_t page_id, Transaction& txn,
 void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
   const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
   assert(physical_size + sizeof(RowPointer) <= free_size_);
-  if ((Payload() + free_ptr_ - physical_size) <=
-      reinterpret_cast<char*>(&rows_[row_count_ + 2])) {
+  if (free_ptr_ <= sizeof(RowPointer) * (row_count_ + 1) + physical_size) {
     DeFragment();
   }
-  assert(reinterpret_cast<char*>(&rows_[row_count_ + 2]) <
-         Payload() + free_ptr_ - physical_size);
+  assert(sizeof(RowPointer) * (row_count_ + 1) + physical_size <= free_ptr_);
   free_size_ -= physical_size + sizeof(RowPointer);
-
   size_t pos = Find(key);
   free_ptr_ -= physical_size;
 
@@ -105,14 +102,12 @@ void LeafPage::UpdateImpl(std::string_view key, std::string_view redo) {
   const size_t pos = Find(key);
   assert((int)physical_size - rows_[pos].size <= free_size_);
   if (rows_[pos].size < physical_size) {
-    if ((Payload() + free_ptr_ - physical_size) <=
-        reinterpret_cast<char*>(&rows_[row_count_ + 1])) {
+    if (free_ptr_ <= sizeof(RowPointer) * (row_count_ + 1) + physical_size) {
       free_size_ += rows_[pos].size;
       rows_[pos].size = 0;
       DeFragment();
     }
-    assert(reinterpret_cast<char*>(&rows_[row_count_ + 1]) <
-           Payload() + free_ptr_ - physical_size);
+    assert(sizeof(RowPointer) * (row_count_ + 1) + physical_size <= free_ptr_);
     free_ptr_ -= physical_size;
     rows_[pos].offset = free_ptr_;
   }
@@ -203,47 +198,28 @@ void LeafPage::SetPrevNextImpl(page_id_t prev, page_id_t next) {
 
 void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
                      std::string_view value, Page* right) {
-  assert(right->type == PageType::kLeafPage);
-  constexpr size_t kThreshold = kPageBodySize / 2;
+  const size_t kPayload = kPageBodySize - OFFSET_OF(LeafPage, rows_);
+  const size_t kThreshold = kPayload / 2;
   const size_t expected_size =
       SerializeSize(key) + SerializeSize(value) + sizeof(RowPointer);
   assert(expected_size < kThreshold);
-  size_t pivot = Find(key);
-  size_t left_consumed_size = 0;
-  size_t right_consumed_size = 0;
-  for (size_t i = 0; i < row_count_; ++i) {
-    const size_t size = SerializeSize(GetKey(i)) + SerializeSize(GetValue(i)) +
-                        sizeof(RowPointer);
-    if (i < pivot) {
-      left_consumed_size += size;
-    } else {
-      right_consumed_size += size;
-    }
-  }
-  while (pivot < row_count_ - 1 && key < GetKey(pivot) &&
-         left_consumed_size + expected_size < kThreshold) {
+  assert(right->type == PageType::kLeafPage);
+  size_t consumed_size = 0;
+  size_t pivot = 0;
+  while (consumed_size < kThreshold && pivot < row_count_ - 1) {
+    consumed_size += SerializeSize(GetKey(pivot)) +
+                     SerializeSize(GetValue(pivot)) + sizeof(RowPointer);
     pivot++;
-    const size_t pivot_size = SerializeSize(GetKey(pivot)) +
-                              SerializeSize(GetValue(pivot)) +
-                              sizeof(RowPointer);
-    left_consumed_size += pivot_size;
-    right_consumed_size -= pivot_size;
   }
-  while (0 < pivot && key < GetKey(pivot) &&
-         kThreshold < left_consumed_size + expected_size) {
-    const size_t pivot_size = SerializeSize(GetKey(pivot)) +
-                              SerializeSize(GetValue(pivot)) +
-                              sizeof(RowPointer);
-    left_consumed_size -= pivot_size;
-    right_consumed_size += pivot_size;
+  while (GetKey(pivot) < key && consumed_size < expected_size) {
+    pivot++;
+    consumed_size +=
+        SerializeSize(GetKey(pivot)) + sizeof(RowPointer) + sizeof(RowPointer);
+  }
+  while (key < GetKey(pivot) && kPayload < consumed_size + expected_size) {
+    consumed_size -=
+        SerializeSize(GetKey(pivot)) + sizeof(RowPointer) + sizeof(RowPointer);
     pivot--;
-    /*
-    LOG(WARN) << (GetKey(pivot) < key) << " pivot: " << pivot << " of "
-              << row_count_ << " left: " << left_consumed_size
-              << " right: " << right_consumed_size
-              << " sum: " << (left_consumed_size + right_consumed_size)
-              << " consumed: " << expected_size;
-              */
   }
 
   const size_t original_row_count = row_count_;
@@ -256,7 +232,7 @@ void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
   }
   right->SetPrevNext(txn, pid, next_pid_);
   this_page->SetPrevNext(txn, prev_pid_, right->PageID());
-
+  
   if (right->RowCount() == 0 || right->GetKey(0) <= key) {
     assert(expected_size <= right->body.leaf_page.free_size_);
   } else {
@@ -270,15 +246,16 @@ void LeafPage::DeFragment() {
   for (size_t i = 0; i < row_count_; ++i) {
     payloads.emplace_back(Payload() + rows_[i].offset, rows_[i].size);
   }
-  free_ptr_ = kPageBodySize;
+  free_ptr_ = kPageBodySize - OFFSET_OF(LeafPage, rows_);
   for (size_t i = 0; i < row_count_; ++i) {
     assert(payloads[i].size() <= free_ptr_);
+    assert(payloads[i].size() == rows_[i].size);
     free_ptr_ -= payloads[i].size();
     rows_[i].offset = free_ptr_;
+
     memcpy(Payload() + free_ptr_, payloads[i].data(), payloads[i].size());
   }
-  assert(free_ptr_ - row_count_ * sizeof(RowPointer) - sizeof(LeafPage) ==
-         free_size_);
+  assert(free_ptr_ - row_count_ * sizeof(RowPointer) == free_size_);
 }
 
 size_t LeafPage::Find(std::string_view key) const {

@@ -453,12 +453,32 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
     bpt_->SanityCheckForTest(p_.get());
     keys.push_back(key);
     kvp.emplace(key, value);
+    for (const auto& kv : kvp) {
+      std::string_view val;
+      bpt_->Read(txn, kv.first, &val);
+      assert(kvp[kv.first] == val);
+    }
   }
   for (int i = 0; i < kCount * 4; ++i) {
     const std::string& key = keys[(i * 63) % keys.size()];
     std::string value = RandomString((19937 * i) % 320 + 500, false);
+    LOG(TRACE) << "Update: " << key;
     ASSERT_SUCCESS(bpt_->Update(txn, key, value));
     kvp[key] = value;
+    bpt_->Dump(txn, std::cerr, 0);
+    std::cerr << "\n";
+    for (const auto& kv : kvp) {
+      std::string_view val;
+      Status s = bpt_->Read(txn, kv.first, &val);
+      if (s != Status::kSuccess) {
+        LOG(ERROR) << kv.first << " not found";
+      }
+      if (kvp[kv.first] != val) {
+        LOG(ERROR) << kv.first;
+        LOG(ERROR) << kvp[kv.first] << " vs " << val;
+      }
+      assert(kvp[kv.first] == val);
+    }
   }
   for (const auto& kv : kvp) {
     std::string_view val;

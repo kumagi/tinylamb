@@ -59,7 +59,7 @@ class BranchPage {
   Status FindForKey(Transaction& txn, std::string_view key,
                     page_id_t* result) const;
 
-  void SplitInto(page_id_t pid, Transaction& txn, std::string_view new_key,
+  void SplitInto(page_id_t pid, Transaction& txn, std::string_view key,
                  Page* right, std::string* middle);
 
   void Merge(page_id_t pid, Transaction& txn, Page* child);

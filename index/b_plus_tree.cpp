@@ -85,20 +85,20 @@ Status BPlusTree::InsertBranch(Transaction& txn, std::string_view key,
     if (s == Status::kSuccess) return Status::kSuccess;
     if (s == Status::kNoSpace) {
       PageRef new_node = pm_->AllocateNewPage(txn, PageType::kBranchPage);
-      std::string new_key;
-      branch->SplitInto(txn, key, new_node.get(), &new_key);
+      std::string middle_key;
+      branch->SplitInto(txn, key, new_node.get(), &middle_key);
       s = [&]() {
-        if (key < new_key) {
+        if (key < middle_key) {
           return branch->InsertBranch(txn, key, right);
         } else {
           return new_node->InsertBranch(txn, key, right);
         }
       }();
       assert(0 < new_node->RowCount());
-      if (s != Status::kSuccess) return s;
+      assert(s == Status::kSuccess);
       branch.PageUnlock();
       new_node.PageUnlock();
-      return InsertBranch(txn, new_key, new_node->PageID(), parents);
+      return InsertBranch(txn, middle_key, new_node->PageID(), parents);
     }
     throw std::runtime_error("unknown status:" + std::string(ToString(s)));
   }
@@ -142,9 +142,11 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
     } else {
       s = target->InsertLeaf(txn, key, value);
     }
+    assert(s == Status::kSuccess);
     std::string_view middle_key;
     new_page->LowestKey(txn, &middle_key);
     new_page.PageUnlock();
+    LOG(WARN) << "Insert and split: " << middle_key;
     return InsertBranch(txn, middle_key, new_page->PageID(), parents);
   }
   return s;
@@ -152,30 +154,26 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
 
 Status BPlusTree::Update(Transaction& txn, std::string_view key,
                          std::string_view value) {
-  PageRef leaf = FindLeaf(txn, key, pm_->GetPage(root_));
+  std::vector<PageRef> parents;
+  PageRef leaf = FindLeafForInsert(txn, key, pm_->GetPage(root_), parents);
   Status s = leaf->Update(txn, key, value);
   if (s == Status::kSuccess) return Status::kSuccess;
   if (s == Status::kNoSpace) {
     // No enough space? Split!
     leaf->Delete(txn, key);
-    leaf.PageUnlock();
-    std::vector<PageRef> parents;
-    PageRef target = FindLeafForInsert(txn, key, pm_->GetPage(root_), parents);
     PageRef new_page = pm_->AllocateNewPage(txn, PageType::kLeafPage);
-    target->body.leaf_page.Split(target->PageID(), txn, key, value,
-                                 new_page.get());
-    target.PageUnlock();
-    if (new_page->RowCount() == 0 || new_page->GetKey(0) < key) {
+    leaf->body.leaf_page.Split(leaf->PageID(), txn, key, value, new_page.get());
+    if (new_page->GetKey(0) <= key) {
       s = new_page->InsertLeaf(txn, key, value);
       STATUS(s, "new_page");
     } else {
-      s = target->InsertLeaf(txn, key, value);
+      s = leaf->InsertLeaf(txn, key, value);
       STATUS(s, "BPT, target");
     }
-    LOG(DEBUG) << s;
     std::string_view middle_key;
     new_page->LowestKey(txn, &middle_key);
     new_page.PageUnlock();
+    leaf.PageUnlock();
     return InsertBranch(txn, middle_key, new_page->PageID(), parents);
   }
   return s;
@@ -238,14 +236,13 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
         size_t left_rightmost_value = left->GetPage(rightmost_idx);
         s = left->Delete(txn, left_rightmost_key);
         ref->InsertBranch(txn, parent_key, orphan);
+        parent->Delete(txn, key);
         if (0 < left->RowCount()) {
           // Steal
           ref->SetLowestValue(txn, left_rightmost_value);
-          parent->Delete(txn, key);
           parent->InsertBranch(txn, left_rightmost_key, ref->PageID());
         } else {
           // Merge
-          parent->Delete(txn, key);
           if (idx == 0) {
             parent->SetLowestValue(txn, ref->PageID());
           } else {

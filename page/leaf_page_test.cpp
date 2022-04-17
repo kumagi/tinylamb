@@ -212,13 +212,13 @@ TEST_F(LeafPageTest, InsertDefrag) {
       page->InsertLeaf(txn, "key2", value));  // About 20000 bytes used.
   for (char& i : value) i = '3';
   ASSERT_SUCCESS(
-      page->InsertLeaf(txn, "key3", value));  // About 30000 bytes used.
-  ASSERT_FAIL(page->InsertLeaf(txn, "key4", value));     // No space left.
-  ASSERT_SUCCESS(page->Delete(txn, "key2"));         // Make new space.
+      page->InsertLeaf(txn, "key3", value));          // About 30000 bytes used.
+  ASSERT_FAIL(page->InsertLeaf(txn, "key4", value));  // No space left.
+  ASSERT_SUCCESS(page->Delete(txn, "key2"));          // Make new space.
   for (char& i : value) i = '4';
   ASSERT_SUCCESS(page->InsertLeaf(txn, "key4", value));  // Should success.
   ASSERT_FAIL(page->InsertLeaf(txn, "key5", value));     // No space left.
-  ASSERT_SUCCESS(page->Delete(txn, "key1"));         // Make new space.
+  ASSERT_SUCCESS(page->Delete(txn, "key1"));             // Make new space.
   for (char& i : value) i = '5';
   ASSERT_SUCCESS(page->InsertLeaf(txn, "key5", value));  // Should success.
 
@@ -253,6 +253,7 @@ TEST_F(LeafPageTest, Split) {
   for (int i = 0; i < 8; ++i) {
     PageRef left = p_->AllocateNewPage(txn, PageType::kLeafPage);
     PageRef right = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    std::string key = std::string(2000, '0' + i) + "k";
     {
       for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
         ASSERT_SUCCESS(
@@ -260,11 +261,12 @@ TEST_F(LeafPageTest, Split) {
       }
       ASSERT_FAIL(left->InsertLeaf(txn, std::string(2000, '8'),
                                    std::string(2000, '8')));
-      left->body.leaf_page.Split(left->PageID(), txn,
-                                 std::string(2000, '0' + i) + "k",
+      left->body.leaf_page.Split(left->PageID(), txn, key,
                                  std::string(2000, 'p'), right.get());
     }
-    if (i < 5) {
+    std::string_view lowest_key;
+    Status s = right->LowestKey(txn, &lowest_key);
+    if (s == Status::kSuccess && key < lowest_key) {
       ASSERT_SUCCESS(left->InsertLeaf(txn, std::string(2000, '0' + i) + "k",
                                       std::string(2000, 'p')));
     } else {

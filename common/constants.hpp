@@ -22,6 +22,8 @@ static constexpr size_t kPageBodySize = kPageSize - kPageHeaderSize;
 #define GET_CONST_PAGE_PTR(x)                                       \
   (reinterpret_cast<const Page*>(reinterpret_cast<const char*>(x) - \
                                  kPageHeaderSize))
+#define OFFSET_OF(klass, member) \
+  (reinterpret_cast<size_t>(&reinterpret_cast<const klass*>(0)->member))
 
 enum class Status : uint8_t {
   kUnknown,

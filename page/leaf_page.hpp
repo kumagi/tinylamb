@@ -17,9 +17,9 @@ class Page;
 class BranchPage;
 
 class LeafPage {
-  char* Payload() { return reinterpret_cast<char*>(this); }
+  char* Payload() { return reinterpret_cast<char*>(rows_); }
   [[nodiscard]] const char* Payload() const {
-    return reinterpret_cast<const char*>(this);
+    return reinterpret_cast<const char*>(rows_);
   }
   struct RowPointer {
     // Row start position from beginning fom this page.
@@ -34,8 +34,8 @@ class LeafPage {
     prev_pid_ = 0;
     next_pid_ = 0;
     row_count_ = 0;
-    free_ptr_ = kPageBodySize;
-    free_size_ = kPageBodySize - sizeof(LeafPage);
+    free_ptr_ = kPageBodySize - OFFSET_OF(LeafPage, rows_);
+    free_size_ = kPageBodySize - OFFSET_OF(LeafPage, rows_);
   }
 
   Status Insert(page_id_t page_id, Transaction& txn, std::string_view key,
@@ -83,8 +83,8 @@ class LeafPage {
   page_id_t prev_pid_ = 0;
   page_id_t next_pid_ = 0;
   slot_t row_count_ = 0;
-  bin_size_t free_ptr_ = kPageBodySize;
-  bin_size_t free_size_ = kPageBodySize - sizeof(LeafPage);
+  bin_size_t free_ptr_ = kPageBodySize - OFFSET_OF(LeafPage, rows_);
+  bin_size_t free_size_ = kPageBodySize - OFFSET_OF(LeafPage, rows_);
   RowPointer rows_[0];
 };
 
