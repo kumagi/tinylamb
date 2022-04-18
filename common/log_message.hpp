@@ -11,8 +11,11 @@
 
 #define FATAL 9000
 #define ERROR 5000
+#define ALERT 4000
 #define WARN 3000
+#define NOTICE 2500
 #define INFO 2000
+#define USER 1500
 #define DEBUG 1000
 #define TRACE 0
 

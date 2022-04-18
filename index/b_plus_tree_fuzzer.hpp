@@ -35,7 +35,7 @@ void Try(uint64_t seed, bool verbose) {
     }
     return ret;
   };
-  const uint32_t count = rand() % 200;
+  const uint32_t count = rand() % 2000 + 200;
   std::string db_name = RandomString();
   std::string log_name = db_name + ".log";
   PageManager page_manager(db_name + ".db", 20);

@@ -97,6 +97,7 @@ function(add_simple_test file_path)
     gtest_discover_tests(${target_name})
 endfunction()
 
+add_simple_test(common/log_message_test.cpp)
 add_simple_test(database/database_test.cpp)
 add_simple_test(type/value_test.cpp)
 add_simple_test(type/row_test.cpp)
@@ -150,6 +151,7 @@ endfunction()
 add_fuzzer_test(type/value_fuzzer.cpp)
 add_fuzzer_test(page/row_page_fuzzer.cpp)
 add_fuzzer_test(index/b_plus_tree_fuzzer.cpp)
+add_fuzzer_test(table/table_fuzzer.cpp)
 
 ########################################
 ## Fuzzing Replay
@@ -172,3 +174,4 @@ endfunction()
 
 add_fuzzer_test(page/row_page_fuzzer_replay.cpp)
 add_fuzzer_test(index/b_plus_tree_fuzzer_replay.cpp)
+add_fuzzer_test(table/table_fuzzer_replay.cpp)

@@ -20,15 +20,24 @@ LogMessage::LogMessage(int log_level, const char* filename, int lineno,
       ls << "\e[1;31m";
       break;
     case ERROR:
-      ls << "\e[31m";
+      ls << "\e[4;31m";
+      break;
+    case ALERT:
+      ls << "\e[1;5;95m";
       break;
     case WARN:
       ls << "\e[33m";
       break;
+    case NOTICE:
+      ls << "\e[1;36m";
+      break;
     case INFO:
       break;  // Do nothing.
+    case USER:
+      ls << "\e[7;32m";
+      break;
     case DEBUG:
-      ls << "\e[34m";
+      ls << "\e[1;34m";
       break;
     case TRACE:
       ls << "\e[4;36m";
@@ -39,22 +48,31 @@ LogMessage::LogMessage(int log_level, const char* filename, int lineno,
   ls << buff << filename << ":" << lineno << " " << func_name;
   switch (log_level) {
     case FATAL:
-      ls << " FATAL ";
+      ls << " FATAL  ";
       break;
     case ERROR:
-      ls << " ERROR ";
+      ls << " ERROR  ";
+      break;
+    case ALERT:
+      ls << " ALERT  ";
       break;
     case WARN:
-      ls << " WARN ";
+      ls << " WARN   ";
+      break;
+    case NOTICE:
+      ls << " NOTICE ";
       break;
     case INFO:
-      ls << " INFO ";
+      ls << " INFO   ";
+      break;
+    case USER:
+      ls << " USER   ";
       break;
     case DEBUG:
-      ls << " DEBUG ";
+      ls << " DEBUG  ";
       break;
     case TRACE:
-      ls << " TRACE ";
+      ls << " TRACE  ";
       break;
     default:
       ls << "UNKNOWN LOG LEVEL ";
