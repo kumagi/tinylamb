@@ -42,7 +42,7 @@ void Try(uint64_t seed, bool verbose) {
   Logger logger(log_name);
   LockManager lm;
   RecoveryManager rm(log_name, page_manager.GetPool());
-  TransactionManager tm(&lm, &logger, &rm);
+  TransactionManager tm(&lm, &page_manager, &logger, &rm);
   page_id_t root;
   {
     auto txn = tm.Begin();
@@ -50,7 +50,7 @@ void Try(uint64_t seed, bool verbose) {
     root = page->PageID();
     assert(txn.PreCommit() == Status::kSuccess);
   }
-  BPlusTree bpt(root, &page_manager);
+  BPlusTree bpt(root);
   Transaction txn = tm.Begin();
   std::unordered_map<std::string, std::string> kvp;
   kvp.reserve(count);

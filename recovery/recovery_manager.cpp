@@ -33,7 +33,9 @@ bool IsPageManipulation(LogType type) {
 }
 
 void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
-  if (!IsPageManipulation(log.type) || lsn <= target->PageLSN()) return;
+  if (!IsPageManipulation(log.type) || lsn <= target->PageLSN()) {
+    return;
+  }
 
   switch (log.type) {
     case LogType::kUnknown:
@@ -377,7 +379,9 @@ bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
   dst->Clear();
   std::istream in(log_file_.rdbuf());
   in.seekg(lsn);
-  if (!in.good()) return false;
+  if (!in.good()) {
+    return false;
+  }
   Decoder dec(in);
   dec >> *dst;
   return true;
@@ -385,9 +389,8 @@ bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
 
 void RecoveryManager::LogUndoWithPage(lsn_t lsn, const LogRecord& log,
                                       TransactionManager* tm) {
-  bool cache_hit;
   if (IsPageManipulation(log.type)) {
-    PageRef target = pool_->GetPage(log.pid, &cache_hit);
+    PageRef target = pool_->GetPage(log.pid);
     LogUndo(target, lsn, log, tm);
   }
 }

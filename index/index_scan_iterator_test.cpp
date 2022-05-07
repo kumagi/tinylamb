@@ -8,6 +8,7 @@
 
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
+#include "database/database.hpp"
 #include "gtest/gtest.h"
 #include "index.hpp"
 #include "page/page_manager.hpp"
@@ -25,84 +26,51 @@ namespace tinylamb {
 class IndexScanIteratorTest : public ::testing::Test {
  public:
   void SetUp() override {
-    std::string prefix = "index_scan_iterator_test-" + RandomString();
-    db_name_ = prefix + ".db";
-    log_name_ = prefix + ".log";
-    master_record_name_ = prefix + ".master.log";
-    schema_ = Schema("SampleTable", {Column("col1", ValueType::kInt64,
-                                            Constraint(Constraint::kIndex)),
-                                     Column("col2", ValueType::kVarChar),
-                                     Column("col3", ValueType::kDouble)});
+    prefix_ = "index_scan_iterator_test-" + RandomString();
     Recover();
-    Transaction txn = tm_->Begin();
-    PageRef row_page = p_->AllocateNewPage(txn, PageType::kRowPage);
-    PageRef leaf_page = p_->AllocateNewPage(txn, PageType::kLeafPage);
-    std::vector<Index> ind;
-    ind.push_back(Index("bt", {0LLU}, leaf_page->page_id));
-    table_ =
-        std::make_unique<Table>(p_.get(), schema_, row_page->PageID(), ind);
+    Schema sc("SampleTable", {Column("col1", ValueType::kInt64,
+                                     Constraint(Constraint::kIndex)),
+                              Column("col2", ValueType::kVarChar),
+                              Column("col3", ValueType::kDouble)});
+    Transaction txn = db_->Begin();
+    IndexSchema is("idx", {0});
+    ASSERT_SUCCESS(db_->CreateTable(txn, sc));
+    ASSERT_SUCCESS(db_->CreateIndex(txn, "SampleTable", is));
+    ASSERT_SUCCESS(txn.PreCommit());
   }
 
-  void Flush(page_id_t pid) const { p_->GetPool()->FlushPageForTest(pid); }
-
   void Recover() {
-    if (p_) {
-      p_->GetPool()->LostAllPageForTest();
+    if (db_) {
+      db_->Storage().LostAllPageForTest();
     }
-    table_.reset();
-    tm_.reset();
-    r_.reset();
-    lm_.reset();
-    l_.reset();
-    p_.reset();
-    p_ = std::make_unique<PageManager>(db_name_, 10);
-    l_ = std::make_unique<Logger>(log_name_);
-    lm_ = std::make_unique<LockManager>();
-    r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
-    cm_ = std::make_unique<CheckpointManager>(master_record_name_, tm_.get(),
-                                              p_->GetPool(), 1);
+    db_ = std::make_unique<Database>(prefix_);
   }
 
   void TearDown() override {
-    table_.reset();
-    tm_.reset();
-    r_.reset();
-    lm_.reset();
-    l_.reset();
-    p_.reset();
-    std::remove(db_name_.c_str());
-    std::remove(log_name_.c_str());
-    std::remove(master_record_name_.c_str());
+    std::remove(db_->Storage().DBName().c_str());
+    std::remove(db_->Storage().LogName().c_str());
+    std::remove(db_->Storage().MasterRecordName().c_str());
   }
 
- public:
-  std::string db_name_;
-  std::string log_name_;
-  std::string master_record_name_;
-  Schema schema_;
-  std::unique_ptr<LockManager> lm_;
-  std::unique_ptr<PageManager> p_;
-  std::unique_ptr<Logger> l_;
-  std::unique_ptr<RecoveryManager> r_;
-  std::unique_ptr<TransactionManager> tm_;
-  std::unique_ptr<CheckpointManager> cm_;
-  std::unique_ptr<Table> table_;
+  std::string prefix_;
+  std::unique_ptr<Database> db_;
 };
 
 TEST_F(IndexScanIteratorTest, Construct) {}
 
 TEST_F(IndexScanIteratorTest, ScanAscending) {
-  Transaction txn = tm_->Begin();
+  Transaction txn = db_->Begin();
+  Table table;
+  ASSERT_SUCCESS(db_->GetTable(txn, "SampleTable", &table));
   RowPosition rp;
   for (int i = 0; i < 230; ++i) {
-    ASSERT_SUCCESS(table_->Insert(
+    ASSERT_SUCCESS(table.Insert(
         txn, Row({Value(i), Value("v" + std::to_string(i)), Value(0.1 + i)}),
         &rp));
   }
   Row iter_begin({Value(43)});
   Row iter_end({Value(180)});
-  Iterator it = table_->BeginIndexScan(txn, "bt", iter_begin, iter_end);
+  Iterator it = table.BeginIndexScan(txn, "bt", iter_begin, iter_end);
   ASSERT_TRUE(it.IsValid());
   for (int i = 43; i <= 180; ++i) {
     Row cur = *it;
@@ -115,16 +83,18 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
 }
 
 TEST_F(IndexScanIteratorTest, ScanDecending) {
-  Transaction txn = tm_->Begin();
+  Transaction txn = db_->Begin();
+  Table table;
+  ASSERT_SUCCESS(db_->GetTable(txn, "SampleTable", &table));
   RowPosition rp;
   for (int i = 0; i < 230; ++i) {
-    ASSERT_SUCCESS(table_->Insert(
+    ASSERT_SUCCESS(table.Insert(
         txn, Row({Value(i), Value("v" + std::to_string(i)), Value(0.1 + i)}),
         &rp));
   }
   Row iter_begin({Value(104)});
   Row iter_end({Value(200)});
-  Iterator it = table_->BeginIndexScan(txn, "bt", iter_begin, iter_end, false);
+  Iterator it = table.BeginIndexScan(txn, "bt", iter_begin, iter_end, false);
   ASSERT_TRUE(it.IsValid());
   for (int i = 200; i >= 104; --i) {
     Row cur = *it;

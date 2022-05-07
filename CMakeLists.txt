@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD 17)
 add_executable(tinylamb
         main.cpp
         )
-# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined -fsanitize=bounds -fsanitize=address")
+# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined,bounds,address")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -O2")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -ggdb -Wall -Wextra")
 
@@ -41,17 +41,17 @@ add_library(libtinylamb
         table/table.hpp index/index.cpp common/debug.cpp common/encoder.cpp
         table/full_scan_iterator.cpp index/b_plus_tree_iterator.cpp
         index/index_scan_iterator.cpp index/index_scan_iterator.hpp
-        database/catalog.cpp executor/full_scan.cpp executor/projection.cpp
+        database/relation_storage.cpp executor/full_scan.cpp executor/projection.cpp
         executor/selection.cpp expression/binary_expression.cpp
         expression/column_value.cpp executor/hash_join.cpp common/decoder.cpp
-        table/fake_table.cpp plan/full_scan_plan.cpp
+        plan/full_scan_plan.cpp
         plan/projection_plan.cpp plan/selection_plan.cpp plan/product_plan.cpp
         plan/optimizer.cpp
-        executor/cross_join.cpp table/table_statistics.cpp plan/plan.cpp expression/expression.cpp)
+        executor/cross_join.cpp table/table_statistics.cpp plan/plan.cpp expression/expression.cpp database/page_storage.cpp database/page_storage.hpp index/index_schema.cpp index/index_schema.hpp common/status_or.cpp common/status_or.hpp)
 
 add_library(libtinylamb_test_util
         STATIC
-        table/fake_table.cpp type/row.cpp)
+        type/row.cpp)
 
 target_include_directories(
         libtinylamb
@@ -128,13 +128,15 @@ add_simple_test(table/table_statistics_test.cpp)
 
 # Concurrency tests.
 add_simple_test(page/row_page_concurrent_test.cpp)
+add_simple_test(index/b_plus_tree_concurrent_test.cpp)
+add_simple_test(table/table_concurrent_test.cpp)
 
 
 ########################################
 ## Fuzzing
 ########################################
 function(add_fuzzer_test file_path)
-    set(fuzzer_option "-fsanitize=address,fuzzer,undefined,bounds")
+    set(fuzzer_option "-fsanitize=fuzzer,undefined,bounds")
     get_filename_component(filename ${file_path} NAME)
     string(REPLACE ".cpp" "" target_name ${filename})
     add_executable(${target_name} ${file_path})

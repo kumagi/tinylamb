@@ -24,18 +24,9 @@ class RowPageEnvironment {
     std::string prefix = "checkpoint_test-" + RandomString();
     db_name_ = prefix + ".db";
     log_name_ = prefix + ".log";
-    tm_.reset();
-    r_.reset();
-    lm_.reset();
-    l_.reset();
-    p_.reset();
     std::remove(db_name_.c_str());
     std::remove(log_name_.c_str());
-    p_ = std::make_unique<PageManager>(db_name_, 10);
-    l_ = std::make_unique<Logger>(log_name_);
-    r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
-    lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
+    Recover();
     auto txn = tm_->Begin();
     PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
     page_id_ = page->PageID();
@@ -54,7 +45,8 @@ class RowPageEnvironment {
     l_ = std::make_unique<Logger>(log_name_);
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
     lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
+                                               r_.get());
   }
 
   ~RowPageEnvironment() {

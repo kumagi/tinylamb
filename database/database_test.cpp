@@ -15,6 +15,8 @@ class DatabaseTest : public ::testing::Test {
 
 TEST_F(DatabaseTest, DoNothing) {}
 
-TEST_F(DatabaseTest, SimpleTxn) { TransactionContext txn = db_->Begin(); }
+TEST_F(DatabaseTest, SimpleTxn) {
+  TransactionContext txn = db_->BeginContext();
+}
 
 }  // namespace tinylamb

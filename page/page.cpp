@@ -16,9 +16,9 @@
 
 namespace tinylamb {
 
-Page::Page(size_t page_id, PageType type) : body() { PageInit(page_id, type); }
+Page::Page(page_id_t pid, PageType type) : body() { PageInit(pid, type); }
 
-void Page::PageInit(uint64_t pid, PageType page_type) {
+void Page::PageInit(page_id_t pid, PageType page_type) {
   memset(this, 0, kPageSize);
   page_id = pid;
   SetPageLSN(0);
@@ -82,17 +82,15 @@ Status Page::Read(Transaction& txn, slot_t slot,
   }
   if (type == PageType::kLeafPage) {
     return body.leaf_page.Read(PageID(), txn, slot, result);
-  } else {
-    throw std::runtime_error("invalid page type");
   }
+  throw std::runtime_error("invalid page type");
 }
 
 std::string_view Page::GetKey(slot_t slot) const {
   if (type == PageType::kLeafPage) {
     return body.leaf_page.GetKey(slot);
-  } else {
-    return body.branch_page.GetKey(slot);
   }
+  return body.branch_page.GetKey(slot);
 }
 
 page_id_t Page::GetPage(slot_t slot) const {

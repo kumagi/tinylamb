@@ -1,14 +1,19 @@
-#ifndef TINYLAMB_CATALOG_HPP
-#define TINYLAMB_CATALOG_HPP
+#ifndef TINYLAMB_RELATION_STORAGE_HPP
+#define TINYLAMB_RELATION_STORAGE_HPP
 
 #include <bits/unique_ptr.h>
 
 #include <cstdint>
 #include <ostream>
 #include <string_view>
+#include <unordered_map>
 
 #include "common/constants.hpp"
+#include "database/page_storage.hpp"
 #include "index/b_plus_tree.hpp"
+#include "table/table.hpp"
+#include "table/table_statistics.hpp"
+#include "transaction/transaction.hpp"
 
 namespace tinylamb {
 
@@ -16,22 +21,20 @@ class PageManager;
 class Table;
 class Transaction;
 class Schema;
+class IndexSchema;
 class TableStatistics;
+class PageStorage;
 
-class Catalog {
-  static constexpr uint64_t kCatalogPageId = 1;
-
+class RelationStorage {
  public:
-  explicit Catalog(page_id_t table_root, page_id_t stats_root, PageManager* pm)
-      : table_root_(table_root),
-        stats_root_(stats_root),
-        pm_(pm),
-        tables_(table_root_, pm),
-        stats_(stats_root_, pm) {}
+  explicit RelationStorage(std::string_view dbname);
 
-  void InitializeIfNeeded(Transaction& txn);
+  Transaction Begin() { return storage_.Begin(); }
 
   Status CreateTable(Transaction& txn, const Schema& schema);
+
+  Status CreateIndex(Transaction& txn, std::string_view schema_name,
+                     const IndexSchema& idx);
 
   Status GetTable(Transaction& txn, std::string_view schema_name, Table* tbl);
 
@@ -43,14 +46,18 @@ class Catalog {
                           const TableStatistics& ts);
   Status RefreshStatistics(Transaction& txn, std::string_view schema_name);
 
+  PageStorage* GetPageStorage() { return &storage_; }
+
  private:
-  page_id_t table_root_;
-  page_id_t stats_root_;
-  PageManager* pm_;
-  BPlusTree tables_;
-  BPlusTree stats_;
+  // Persistent { Name => Table } storage.
+  BPlusTree catalog_;
+
+  // Persistent { Name => TableStatistics } storage.
+  BPlusTree statistics_;
+
+  PageStorage storage_;
 };
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_CATALOG_HPP
+#endif  // TINYLAMB_RELATION_STORAGE_HPP

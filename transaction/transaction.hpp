@@ -11,6 +11,7 @@
 
 #include "page/page.hpp"
 #include "page/row_position.hpp"
+#include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
 
@@ -33,8 +34,6 @@ enum class TransactionStatus : uint_fast8_t {
 std::ostream& operator<<(std::ostream& o, const TransactionStatus& t);
 
 class Transaction {
-  friend class TransactionManager;
-
  public:
   Transaction() = default;  // For test purpose only.
   Transaction(txn_id_t txn_id, TransactionManager* tm);
@@ -64,7 +63,7 @@ class Transaction {
   Status PreCommit();
   void Abort();
 
-  // Returns LSN
+  // Log the action. Returns LSN.
   lsn_t InsertLog(page_id_t pid, slot_t slot, std::string_view redo);
   lsn_t InsertLeafLog(page_id_t pid, std::string_view key,
                       std::string_view redo);
@@ -88,18 +87,20 @@ class Transaction {
 
   lsn_t DestroyPageLog(page_id_t page_id);
 
-  lsn_t SetPrevNextLog(page_id_t i, page_id_t i1, page_id_t i2, page_id_t i3,
-                       page_id_t i4);
+  lsn_t SetPrevNextLog(page_id_t target, page_id_t undo_prev,
+                       page_id_t undo_next, page_id_t redo_prev,
+                       page_id_t redo_next);
 
   // Prepared mainly for testing.
   // Using this function is discouraged to get performance of flush pipelining.
   void CommitWait() const;
 
+  PageManager* PageManager() { return transaction_manager_->GetPageManager(); }
+
  private:
   friend class TransactionManager;
   friend class CheckpointManager;
 
- private:
   txn_id_t txn_id_{static_cast<txn_id_t>(-1)};
 
   std::unordered_set<RowPosition> read_set_{};

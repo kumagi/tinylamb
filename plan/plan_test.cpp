@@ -5,7 +5,8 @@
 
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
-#include "database/catalog.hpp"
+#include "database/page_storage.hpp"
+#include "database/relation_storage.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
@@ -24,21 +25,18 @@ namespace tinylamb {
 class PlanTest : public ::testing::Test {
  public:
   void SetUp() override {
-    std::string prefix = "plan_test-" + RandomString();
-    db_name_ = prefix + ".db";
-    log_name_ = prefix + ".log";
+    prefix_ = "plan_test-" + RandomString();
+    ts_ = std::make_unique<PageStorage>(prefix_);
     Recover();
-    Transaction txn = tm_->Begin();
-    catalog_->InitializeIfNeeded(txn);
-    ctx_ = std::make_unique<TransactionContext>(tm_.get(), p_.get(),
-                                                catalog_.get());
+    Transaction txn = ts_->Begin();
+    ctx_ = std::make_unique<TransactionContext>(ts_->Begin(), catalog_.get());
     {
       ASSERT_SUCCESS(catalog_->CreateTable(
           txn, Schema("Sc1", {Column("c1", ValueType::kInt64),
                               Column("c2", ValueType::kVarChar),
                               Column("c3", ValueType::kDouble)})));
       Schema sc;
-      Table tbl(p_.get());
+      Table tbl;
       ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc1", &tbl));
       RowPosition rp;
       tbl.Insert(txn, Row({Value(12), Value("hello"), Value(2.3)}), &rp);
@@ -55,7 +53,7 @@ class PlanTest : public ::testing::Test {
                               Column("d3", ValueType::kVarChar),
                               Column("d4", ValueType::kInt64)})));
       Schema sc;
-      Table tbl(p_.get());
+      Table tbl;
       ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc2", &tbl));
       RowPosition rp;
       tbl.Insert(txn, Row({Value(52), Value(53.4), Value("ou"), Value(16)}),
@@ -76,7 +74,7 @@ class PlanTest : public ::testing::Test {
           txn, Schema("Sc3", {Column("e1", ValueType::kInt64),
                               Column("e2", ValueType::kDouble)})));
       Schema sc;
-      Table tbl(p_.get());
+      Table tbl;
       ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc2", &tbl));
       RowPosition rp;
       tbl.Insert(txn, Row({Value(52), Value(53.4), Value("ou"), Value(16)}),
@@ -86,68 +84,49 @@ class PlanTest : public ::testing::Test {
   }
 
   void Recover() {
-    if (p_) {
-      p_->GetPool()->LostAllPageForTest();
-    }
-    tm_.reset();
-    r_.reset();
-    lm_.reset();
-    l_.reset();
-    p_.reset();
-    p_ = std::make_unique<PageManager>(db_name_, 10);
-    l_ = std::make_unique<Logger>(log_name_);
-    lm_ = std::make_unique<LockManager>();
-    r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
-    catalog_ = std::make_unique<Catalog>(1, 2, p_.get());
+    ts_->LostAllPageForTest();
+    ts_ = std::make_unique<PageStorage>(prefix_);
+    catalog_ = std::make_unique<RelationStorage>(1, 2, ts_.get());
   }
 
   void TearDown() override {
     catalog_.reset();
-    tm_.reset();
-    r_.reset();
-    lm_.reset();
-    l_.reset();
-    p_.reset();
-    std::remove(db_name_.c_str());
-    std::remove(log_name_.c_str());
+    std::remove(ts_->DBName().c_str());
+    std::remove(ts_->LogName().c_str());
+    ts_.reset();
   }
 
-  std::string db_name_;
-  std::string log_name_;
-  std::unique_ptr<LockManager> lm_;
-  std::unique_ptr<PageManager> p_;
-  std::unique_ptr<Logger> l_;
-  std::unique_ptr<RecoveryManager> r_;
-  std::unique_ptr<TransactionManager> tm_;
-  std::unique_ptr<Catalog> catalog_;
+  void DumpAll(const Plan& plan) {
+    plan->Dump(std::cout, 0);
+    std::cout << "\n";
+    TransactionContext ctx{ts_->Begin(), catalog_.get()};
+    Executor scan = plan->EmitExecutor(ctx);
+    Row result;
+    std::cout << plan->GetSchema(ctx) << "\n";
+    while (scan->Next(&result, nullptr)) {
+      std::cout << result << "\n";
+    }
+  }
+
+  std::string prefix_;
+  std::unique_ptr<PageStorage> ts_;
+  std::unique_ptr<RelationStorage> catalog_;
   std::unique_ptr<TransactionContext> ctx_;
 };
 
 TEST_F(PlanTest, Construct) {}
 
-void DumpAll(TransactionContext& ctx, const Plan& plan) {
-  plan->Dump(std::cout, 0);
-  std::cout << "\n";
-  Executor scan = plan->EmitExecutor(ctx);
-  Row result;
-  std::cout << plan->GetSchema(ctx) << "\n";
-  while (scan->Next(&result, nullptr)) {
-    std::cout << result << "\n";
-  }
-}
-
 TEST_F(PlanTest, ScanPlan) {
   TableStatistics ts((Schema()));
   Plan fs = NewFullScanPlan("Sc1", ts);
-  DumpAll(*ctx_, fs);
+  DumpAll(fs);
 }
 
 TEST_F(PlanTest, ProjectPlan) {
   TableStatistics ts((Schema()));
   Plan pp =
       NewProjectionPlan(NewFullScanPlan("Sc1", ts), {NamedExpression("c1")});
-  DumpAll(*ctx_, pp);
+  DumpAll(pp);
 }
 
 TEST_F(PlanTest, SelectionPlan) {
@@ -156,21 +135,21 @@ TEST_F(PlanTest, SelectionPlan) {
                                        BinaryOperation::kGreaterThanEquals,
                                        ConstantValueExp(Value(100)));
   Plan sp = NewSelectionPlan(NewFullScanPlan("Sc1", ts), exp, ts);
-  DumpAll(*ctx_, sp);
+  DumpAll(sp);
 }
 
 TEST_F(PlanTest, ProductPlan) {
   TableStatistics ts((Schema()));
   Plan prop = NewProductPlan(NewFullScanPlan("Sc1", ts), {0},
                              NewFullScanPlan("Sc2", ts), {0});
-  DumpAll(*ctx_, prop);
+  DumpAll(prop);
 }
 
 TEST_F(PlanTest, ProductPlanCrossJoin) {
   TableStatistics ts((Schema()));
   Plan prop =
       NewProductPlan(NewFullScanPlan("Sc1", ts), NewFullScanPlan("Sc2", ts));
-  DumpAll(*ctx_, prop);
+  DumpAll(prop);
 }
 
 }  // namespace tinylamb

@@ -20,10 +20,11 @@ class LockManager {
   bool ReleaseSharedLock(const RowPosition& row);
   bool GetExclusiveLock(const RowPosition& row);
   bool ReleaseExclusiveLock(const RowPosition& row);
+  bool TryUpgradeLock(const RowPosition& row);
 
  private:
   std::mutex latch_;
-  std::unordered_map<RowPosition, int> shared_locks_;
+  std::unordered_map<RowPosition, txn_id_t> shared_locks_;
   std::unordered_set<RowPosition> exclusive_locks_;
 };
 

@@ -10,6 +10,7 @@
 #include "executor/executor.hpp"
 #include "page/row_position.hpp"
 #include "table/iterator.hpp"
+#include "table/table.hpp"
 
 namespace tinylamb {
 class TableInterface;
@@ -17,13 +18,13 @@ class Transaction;
 
 class FullScan : public ExecutorBase {
  public:
-  FullScan(Transaction& txn, std::unique_ptr<TableInterface>&& table);
+  FullScan(Transaction& txn, Table* table);
   ~FullScan() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:
-  std::unique_ptr<TableInterface> table_;
+  Table* table_;
   Iterator iter_;
 };
 

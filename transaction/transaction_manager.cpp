@@ -118,8 +118,13 @@ void TransactionManager::CompensateDeleteBranchLog(txn_id_t txn_id,
 bool TransactionManager::GetExclusiveLock(const RowPosition& rp) {
   return lock_manager_->GetExclusiveLock(rp);
 }
+
 bool TransactionManager::GetSharedLock(const RowPosition& rp) {
   return lock_manager_->GetSharedLock(rp);
+}
+
+bool TransactionManager::TryUpgradeLock(const RowPosition& rp) {
+  return lock_manager_->TryUpgradeLock(rp);
 }
 
 uint64_t TransactionManager::AddLog(const LogRecord& lr) {

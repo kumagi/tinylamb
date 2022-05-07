@@ -45,7 +45,7 @@ class PagePool {
   PagePool(std::string_view file_name, size_t capacity);
   ~PagePool();
 
-  PageRef GetPage(page_id_t page_id, bool* cache_hit);
+  PageRef GetPage(page_id_t page_id, bool* cache_hit = nullptr);
 
   page_id_t Size() const {
     std::scoped_lock latch(pool_latch);
@@ -71,7 +71,7 @@ class PagePool {
   bool EvictOnePage();
 
  private:
-  PageRef AllocNewPage(size_t pid);
+  PageRef AllocNewPage(page_id_t pid, std::unique_lock<std::mutex> lock);
   // Refresh the specified entry in LRU.
   void Touch(LruType::iterator it);
 

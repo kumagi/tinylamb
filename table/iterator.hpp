@@ -16,6 +16,9 @@ class Iterator {
  public:
   explicit Iterator(IteratorBase* iter) : iter_(iter) {}
   [[nodiscard]] bool IsValid() const { return iter_->IsValid(); }
+  [[nodiscard]] RowPosition Position() const { return iter_->Position(); }
+  IteratorBase* operator->() { return iter_.get(); }
+  const IteratorBase* operator->() const { return iter_.get(); }
   const Row& operator*() const { return **iter_; }
   Iterator& operator++() {
     ++(*iter_);

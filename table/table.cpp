@@ -14,108 +14,105 @@
 
 namespace tinylamb {
 
-Status Table::Insert(Transaction& txn, const Row& row, RowPosition* rp) {
-  PageRef ref = pm_->GetPage(last_pid_);
+Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
+  PageRef root_page =
+      txn.PageManager()->AllocateNewPage(txn, PageType::kLeafPage);
+  BPlusTree new_bpt(root_page->PageID());
+  indices_.emplace_back(idx.name_, idx.key_, root_page->PageID());
+
+  Iterator it = BeginFullScan(txn);
+  while (it.IsValid()) {
+    Row current = *it;
+    new_bpt.Insert(txn, current.Extract(idx.key_).EncodeMemcomparableFormat(),
+                   it.Position().Serialize());
+  }
+  LOG(FATAL) << "leaf is " << root_page->PageID();
+  return Status::kSuccess;
+}
+
+StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
+  PageRef ref = txn.PageManager()->GetPage(last_pid_);
   std::string serialized_row(row.Size(), ' ');
   row.Serialize(serialized_row.data());
   slot_t pos;
   Status s = ref->Insert(txn, serialized_row, &pos);
-  rp->page_id = ref->page_id;
-  rp->slot = pos;
+  RowPosition rp;
+  rp.page_id = ref->page_id;
+  rp.slot = pos;
   if (s == Status::kNoSpace) {
-    PageRef new_page = pm_->AllocateNewPage(txn, PageType::kRowPage);
-    s = new_page->Insert(txn, serialized_row, &pos);
-    if (s != Status::kSuccess) return s;
-    rp->page_id = new_page->PageID();
-    rp->slot = pos;
+    PageRef new_page =
+        txn.PageManager()->AllocateNewPage(txn, PageType::kRowPage);
+    RETURN_IF_FAIL(new_page->Insert(txn, serialized_row, &pos));
+    rp.page_id = new_page->PageID();
+    rp.slot = pos;
     ref->body.row_page.next_page_id_ = new_page->PageID();
     new_page->body.row_page.prev_page_id_ = ref->PageID();
     last_pid_ = new_page->PageID();
   }
+  ref.PageUnlock();
   for (auto& idx : indices_) {
-    BPlusTree bpt(idx.pid_, pm_);
-    s = bpt.Insert(txn, idx.GenerateKey(row), rp->Serialize());
-    if (s != Status::kSuccess) return s;
+    BPlusTree bpt(idx.pid_);
+    RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(row), rp.Serialize()));
   }
-  return s;
+  return rp;
 }
 
-Status Table::Update(Transaction& txn, const Row& row, RowPosition* pos) {
-  Row original_row;
-  Status s = Read(txn, *pos, &original_row);
-  STATUS(s, *pos);
-  if (s != Status::kSuccess) return s;
+StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
+                                    const Row& row) {
+  if (!txn.AddWriteSet(pos)) {
+    return Status::kConflicts;
+  }
+  ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
+  RowPosition new_pos = pos;
   for (const auto& idx : indices_) {
-    BPlusTree bpt(idx.pid_, pm_);
-    s = bpt.Delete(txn, idx.GenerateKey(original_row));
-    STATUS(s, "delete index");
-    if (s != Status::kSuccess) return s;
+    BPlusTree bpt(idx.pid_);
+    RETURN_IF_FAIL(bpt.Delete(txn, idx.GenerateKey(original_row)));
   }
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
-  PageRef page = pm_->GetPage(pos->page_id);
-  s = page->Update(txn, pos->slot, serialized_row);
+  PageRef page = txn.PageManager()->GetPage(new_pos.page_id);
+  Status s = page->Update(txn, new_pos.slot, serialized_row);
   if (s == Status::kNoSpace) {
-    page->Delete(txn, pos->slot);
+    page->Delete(txn, new_pos.slot);
     page.PageUnlock();
-    PageRef new_page = pm_->AllocateNewPage(txn, PageType::kRowPage);
+    PageRef new_page =
+        txn.PageManager()->AllocateNewPage(txn, PageType::kRowPage);
     RowPosition new_row_pos(new_page->PageID(), -1);
-    s = new_page->Insert(txn, serialized_row, &new_row_pos.slot);
-    if (s != Status::kSuccess) return s;
+    RETURN_IF_FAIL(new_page->Insert(txn, serialized_row, &new_row_pos.slot));
     {
-      PageRef last_page = pm_->GetPage(last_pid_);
+      PageRef last_page = txn.PageManager()->GetPage(last_pid_);
       last_page->body.row_page.next_page_id_ = new_page->PageID();
       new_page->body.row_page.prev_page_id_ = last_page->PageID();
     }
-    *pos = new_row_pos;
+    new_pos = new_row_pos;
     last_pid_ = new_page->PageID();
   }
   for (const auto& idx : indices_) {
-    BPlusTree bpt(idx.pid_, pm_);
-    s = bpt.Insert(txn, idx.GenerateKey(row), pos->Serialize());
-    if (s != Status::kSuccess) return s;
+    BPlusTree bpt(idx.pid_);
+    RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(row), pos.Serialize()));
   }
-  return s;
+  return new_pos;
 }
 
 Status Table::Delete(Transaction& txn, RowPosition pos) {
-  Row original_row;
-  Status s = Read(txn, pos, &original_row);
-  if (s != Status::kSuccess) return s;
+  if (!txn.AddWriteSet(pos)) {
+    return Status::kConflicts;
+  }
+  ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
   for (const auto& idx : indices_) {
-    BPlusTree bpt(idx.pid_, pm_);
-    s = bpt.Delete(txn, idx.GenerateKey(original_row));
-    if (s != Status::kSuccess) return s;
+    BPlusTree bpt(idx.pid_);
+    RETURN_IF_FAIL(bpt.Delete(txn, idx.GenerateKey(original_row)));
   }
-  return pm_->GetPage(pos.page_id)->Delete(txn, pos.slot);
+  return txn.PageManager()->GetPage(pos.page_id)->Delete(txn, pos.slot);
 }
 
-Status Table::Read(Transaction& txn, RowPosition pos, Row* result) const {
+StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
   std::string_view read_row;
-  Status s = pm_->GetPage(pos.page_id)->Read(txn, pos.slot, &read_row);
-  if (s != Status::kSuccess) return s;
-  result->Deserialize(read_row.data(), schema_);
-  return s;
-}
-
-Status Table::ReadByKey(Transaction& txn, std::string_view index_name,
-                        const Row& keys, Row* result) const {
-  for (const auto& index : indices_) {
-    if (index.name_ != index_name) continue;
-    std::string encoded_key = keys.EncodeMemcomparableFormat();
-    BPlusTree bpt(index.pid_, pm_);
-    std::string_view val;
-    Status s = bpt.Read(txn, encoded_key, &val);
-    if (s != Status::kSuccess) return s;
-    RowPosition pos;
-    pos.Deserialize(val.data());
-    std::string_view result_payload;
-    s = pm_->GetPage(pos.page_id)->Read(txn, pos.slot, &result_payload);
-    if (s != Status::kSuccess) return s;
-    result->Deserialize(result_payload.data(), schema_);
-    return Status::kSuccess;
-  }
-  return Status::kNotExists;
+  RETURN_IF_FAIL(
+      txn.PageManager()->GetPage(pos.page_id)->Read(txn, pos.slot, &read_row));
+  Row result;
+  result.Deserialize(read_row.data(), schema_);
+  return result;
 }
 
 Iterator Table::BeginFullScan(Transaction& txn) const {
@@ -141,7 +138,9 @@ Decoder& operator>>(Decoder& d, Table& t) {
 
 page_id_t Table::GetIndex(std::string_view name) {
   for (const auto& idx : indices_) {
-    if (idx.name_ == name) return idx.pid_;
+    if (idx.sc_.name_ == name) {
+      return idx.pid_;
+    }
   }
   return -1;
 }

@@ -4,7 +4,7 @@
 
 #include "full_scan_plan.hpp"
 
-#include "database/catalog.hpp"
+#include "database/relation_storage.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/full_scan.hpp"
 #include "table/table.hpp"
@@ -26,8 +26,7 @@ std::unique_ptr<Table> GetTable(const std::string& table_name,
 }
 
 Executor FullScanPlan::EmitExecutor(TransactionContext& ctx) const {
-  std::unique_ptr<Table> tbl = GetTable(table_name_, ctx);
-  tbl->pm_ = ctx.pm_;
+  Table* tbl = GetTable(table_name_, ctx);
   return std::make_shared<FullScan>(ctx.txn_, std::move(tbl));
 }
 

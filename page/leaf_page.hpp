@@ -72,8 +72,7 @@ class LeafPage {
   void DeFragment();
   void Dump(std::ostream& o, int indent) const;
   [[nodiscard]] size_t Find(std::string_view key) const;
-
- private:
+  
   friend class BPlusTree;
   friend class BPlusTreeIterator;
   friend class Page;

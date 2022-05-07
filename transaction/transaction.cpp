@@ -47,7 +47,6 @@ bool Transaction::AddReadSet(const RowPosition& rp) {
   assert(!IsFinished());
   if (write_set_.find(rp) != write_set_.end() ||
       read_set_.find(rp) != read_set_.end()) {
-    // Already having the lock.
     return true;
   }
   if (!transaction_manager_->GetSharedLock(rp)) {
@@ -60,13 +59,14 @@ bool Transaction::AddReadSet(const RowPosition& rp) {
 bool Transaction::AddWriteSet(const RowPosition& rp) {
   assert(!IsFinished());
   if (write_set_.find(rp) != write_set_.end()) {
-    // Already having the lock.
     return true;
   }
-  if (!transaction_manager_->GetExclusiveLock(rp)) {
+  write_set_.insert(rp);
+  if ((read_set_.find(rp) != read_set_.end() &&
+       !transaction_manager_->TryUpgradeLock(rp)) ||
+      !transaction_manager_->GetExclusiveLock(rp)) {
     return false;
   }
-  write_set_.insert(rp);
   read_set_.erase(rp);
   return true;
 }
@@ -120,52 +120,46 @@ lsn_t Transaction::UpdateBranchLog(page_id_t pid, std::string_view key,
 lsn_t Transaction::DeleteLog(page_id_t pid, slot_t slot,
                              std::string_view undo) {
   assert(!IsFinished());
-  LogRecord lr =
-      LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, slot, undo);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
+  prev_lsn_ = transaction_manager_->AddLog(
+      LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, slot, undo));
   return prev_lsn_;
 }
 
 lsn_t Transaction::DeleteLeafLog(page_id_t pid, std::string_view key,
                                  std::string_view undo) {
   assert(!IsFinished());
-  LogRecord lr =
-      LogRecord::DeletingLeafLogRecord(prev_lsn_, txn_id_, pid, key, undo);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
+  prev_lsn_ = transaction_manager_->AddLog(
+      LogRecord::DeletingLeafLogRecord(prev_lsn_, txn_id_, pid, key, undo));
   return prev_lsn_;
 }
 
 lsn_t Transaction::DeleteBranchLog(page_id_t pid, std::string_view key,
                                    page_id_t undo) {
   assert(!IsFinished());
-  LogRecord lr =
-      LogRecord::DeletingBranchLogRecord(prev_lsn_, txn_id_, pid, key, undo);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
+  prev_lsn_ = transaction_manager_->AddLog(
+      LogRecord::DeletingBranchLogRecord(prev_lsn_, txn_id_, pid, key, undo));
   return prev_lsn_;
 }
 
 lsn_t Transaction::SetLowestLog(page_id_t pid, page_id_t lowest_value) {
   assert(!IsFinished());
-  LogRecord lr =
-      LogRecord::SetLowestLogRecord(prev_lsn_, txn_id_, pid, lowest_value);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
+  prev_lsn_ = transaction_manager_->AddLog(
+      LogRecord::SetLowestLogRecord(prev_lsn_, txn_id_, pid, lowest_value));
   return prev_lsn_;
 }
 
 lsn_t Transaction::AllocatePageLog(page_id_t allocated_page_id,
                                    PageType new_page_type) {
   assert(!IsFinished());
-  LogRecord lr = LogRecord::AllocatePageLogRecord(
-      prev_lsn_, txn_id_, allocated_page_id, new_page_type);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
+  prev_lsn_ = transaction_manager_->AddLog(LogRecord::AllocatePageLogRecord(
+      prev_lsn_, txn_id_, allocated_page_id, new_page_type));
   return prev_lsn_;
 }
 
 lsn_t Transaction::DestroyPageLog(page_id_t destroyed_page_id) {
   assert(!IsFinished());
-  LogRecord lr =
-      LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
+  prev_lsn_ = transaction_manager_->AddLog(
+      LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id));
   return prev_lsn_;
 }
 
@@ -180,9 +174,8 @@ lsn_t Transaction::SetPrevNextLog(page_id_t target, page_id_t undo_prev,
                                   page_id_t undo_next, page_id_t redo_prev,
                                   page_id_t redo_next) {
   assert(!IsFinished());
-  LogRecord lr = LogRecord::SetPrevNextLogRecord(
-      prev_lsn_, txn_id_, target, undo_prev, undo_next, redo_prev, redo_next);
-  prev_lsn_ = transaction_manager_->AddLog(lr);
+  prev_lsn_ = transaction_manager_->AddLog(LogRecord::SetPrevNextLogRecord(
+      prev_lsn_, txn_id_, target, undo_prev, undo_next, redo_prev, redo_next));
   return prev_lsn_;
 }
 

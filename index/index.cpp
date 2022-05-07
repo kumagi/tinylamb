@@ -13,24 +13,21 @@
 namespace tinylamb {
 
 std::string Index::GenerateKey(const Row& row) const {
-  std::stringstream s;
-  for (const auto& k : key_) {
-    s << row[k].EncodeMemcomparableFormat();
-  }
-  return s.str();
+  return sc_.GenerateKey(row);
 }
 
 Encoder& operator<<(Encoder& a, const Index& idx) {
-  a << idx.name_ << idx.key_ << idx.pid_;
+  a << idx.sc_ << idx.pid_;
   return a;
 }
 
 Decoder& operator>>(Decoder& e, Index& idx) {
-  e >> idx.name_ >> idx.key_ >> idx.pid_;
+  e >> idx.sc_ >> idx.pid_;
   return e;
 }
+
 bool Index::operator==(const Index& rhs) const {
-  return name_ == rhs.name_ && key_ == rhs.key_ && pid_ == rhs.pid_;
+  return sc_ == rhs.sc_ && pid_ == rhs.pid_;
 }
 
 }  // namespace tinylamb

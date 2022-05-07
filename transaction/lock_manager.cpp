@@ -2,6 +2,7 @@
 
 #include <cassert>
 
+#include "common/log_message.hpp"
 #include "page/row_position.hpp"
 
 namespace tinylamb {
@@ -19,6 +20,7 @@ bool LockManager::GetSharedLock(const RowPosition& row) {
   }
   return true;
 }
+
 bool LockManager::ReleaseSharedLock(const RowPosition& row) {
   std::scoped_lock lk(latch_);
   assert(exclusive_locks_.find(row) == exclusive_locks_.end());
@@ -29,6 +31,7 @@ bool LockManager::ReleaseSharedLock(const RowPosition& row) {
   }
   return true;
 }
+
 bool LockManager::GetExclusiveLock(const RowPosition& row) {
   std::scoped_lock lk(latch_);
   if (shared_locks_.find(row) != shared_locks_.end() ||
@@ -38,12 +41,23 @@ bool LockManager::GetExclusiveLock(const RowPosition& row) {
   exclusive_locks_.emplace(row);
   return true;
 }
+
 bool LockManager::ReleaseExclusiveLock(const RowPosition& row) {
   std::scoped_lock lk(latch_);
   assert(exclusive_locks_.find(row) != exclusive_locks_.end());
   assert(shared_locks_.find(row) == shared_locks_.end());
   exclusive_locks_.erase(row);
   return true;
+}
+
+bool LockManager::TryUpgradeLock(const RowPosition& row) {
+  std::scoped_lock lk(latch_);
+  if (shared_locks_.size() <= 1) {
+    shared_locks_.clear();
+    exclusive_locks_.emplace(row);
+    return true;
+  }
+  return false;
 }
 
 }  // namespace tinylamb

@@ -15,7 +15,11 @@ FullScanIterator::FullScanIterator(const Table* table, Transaction* txn)
     : table_(table), txn_(txn), pos_(table_->first_pid_, 0) {
   txn_->AddReadSet(pos_);
   std::string_view row;
-  PageRef page = table_->pm_->GetPage(pos_.page_id);
+  PageRef page = txn->PageManager()->GetPage(pos_.page_id);
+  if (page->RowCount() == 0) {
+    pos_.page_id = ~0LLU;
+    return;
+  }
   Status s = page->Read(*txn, pos_.slot, &row);
   if (s != Status::kSuccess) {
     LOG(FATAL) << "Table " << table_->schema_.Name() << " not found";
@@ -26,8 +30,10 @@ FullScanIterator::FullScanIterator(const Table* table, Transaction* txn)
 
 IteratorBase& FullScanIterator::operator++() {
   PageRef ref = [&]() {
-    PageRef ref = table_->pm_->GetPage(pos_.page_id);
-    if (++pos_.slot < ref->RowCount()) return ref;
+    PageRef ref = txn_->PageManager()->GetPage(pos_.page_id);
+    if (++pos_.slot < ref->RowCount()) {
+      return ref;
+    }
     pos_.page_id = ref->body.row_page.next_page_id_;
     ref.PageUnlock();
     if (pos_.page_id == 0) {
@@ -35,7 +41,7 @@ IteratorBase& FullScanIterator::operator++() {
       return PageRef();
     }
     pos_.slot = 0;
-    return table_->pm_->GetPage(pos_.page_id);
+    return txn_->PageManager()->GetPage(pos_.page_id);
   }();
   if (!ref.IsValid()) {
     current_row_.Clear();
@@ -56,5 +62,6 @@ IteratorBase& FullScanIterator::operator--() {
 bool FullScanIterator::IsValid() const { return pos_.IsValid(); }
 
 const Row& FullScanIterator::operator*() const { return current_row_; }
+Row& FullScanIterator::operator*() { return current_row_; }
 
 }  // namespace tinylamb

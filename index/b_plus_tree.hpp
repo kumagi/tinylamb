@@ -21,6 +21,19 @@ class PageRef;
  * A versatile persistent data structure, which supports { string => string }.
  */
 class BPlusTree {
+ public:
+  explicit BPlusTree(page_id_t root);
+  Status Insert(Transaction& txn, std::string_view key, std::string_view value);
+  Status Update(Transaction& txn, std::string_view key, std::string_view value);
+  Status Delete(Transaction& txn, std::string_view key);
+  Status Read(Transaction& txn, std::string_view key, std::string_view* dst);
+  void Dump(Transaction& txn, std::ostream& o, int indent = 0) const;
+  [[nodiscard]] page_id_t Root() const { return root_; }
+  BPlusTreeIterator Begin(Transaction& txn, std::string_view left = "",
+                          std::string_view right = "", bool ascending = true);
+  bool operator==(const BPlusTree& rhs) const { return root_ == rhs.root_; }
+  bool SanityCheckForTest(PageManager* pm) const;
+
  private:
   PageRef FindLeafForInsert(Transaction& txn, std::string_view key,
                             PageRef&& page, std::vector<PageRef>& parents);
@@ -33,32 +46,13 @@ class BPlusTree {
   PageRef LeftmostPage(Transaction& txn);
   PageRef RightmostPage(Transaction& txn);
 
- public:
-  BPlusTree(page_id_t root, PageManager* pm);
-  Status Insert(Transaction& txn, std::string_view key, std::string_view value);
-  Status Update(Transaction& txn, std::string_view key, std::string_view value);
-  Status Delete(Transaction& txn, std::string_view key);
-  Status Read(Transaction& txn, std::string_view key, std::string_view* dst);
-  void Dump(Transaction& txn, std::ostream& o, int indent = 0) const;
-  [[nodiscard]] page_id_t Root() const { return root_; }
-  BPlusTreeIterator Begin(Transaction& txn, std::string_view left = "",
-                          std::string_view right = "", bool ascending = true);
-
-  bool operator==(const BPlusTree& rhs) const {
-    return root_ == rhs.root_ && pm_ == rhs.pm_;
-  }
-
-  bool SanityCheckForTest(PageManager* pm) const;
-
- private:
   friend class BPlusTreeIterator;
   friend class IndexScanIterator;
   void DumpBranch(Transaction& txn, std::ostream& o, PageRef&& page,
                   int indent = 0) const;
 
- private:
   page_id_t root_;
-  PageManager* pm_;
+  std::mutex latch_;
 };
 
 }  // namespace tinylamb

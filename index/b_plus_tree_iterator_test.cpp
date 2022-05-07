@@ -57,8 +57,9 @@ class BPlusTreeIteratorTest : public ::testing::Test {
     l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
-    bpt_ = std::make_unique<BPlusTree>(root, p_.get());
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
+                                               r_.get());
+    bpt_ = std::make_unique<BPlusTree>(root);
   }
 
   void TearDown() override {
@@ -91,7 +92,7 @@ TEST_F(BPlusTreeIteratorTest, FullScan) {
   BPlusTreeIterator it = bpt_->Begin(txn);
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
     EXPECT_TRUE(it.IsValid());
-    EXPECT_EQ(*it, std::string(100, c));
+    EXPECT_EQ(it.Value(), std::string(100, c));
     ++it;
   }
 
@@ -106,11 +107,11 @@ TEST_F(BPlusTreeIteratorTest, RangeAcending) {
   BPlusTreeIterator it = bpt_->Begin(txn, "b", "d");
   EXPECT_TRUE(it.IsValid());
 
-  EXPECT_EQ(*it, std::string(100, 'b'));
+  EXPECT_EQ(it.Value(), std::string(100, 'b'));
   ++it;
   EXPECT_TRUE(it.IsValid());
 
-  EXPECT_EQ(*it, std::string(100, 'c'));
+  EXPECT_EQ(it.Value(), std::string(100, 'c'));
   ++it;
   EXPECT_FALSE(it.IsValid());
 }
@@ -121,19 +122,19 @@ TEST_F(BPlusTreeIteratorTest, RangeDescending) {
     Init(txn, c, 1000, 100);
   }
   BPlusTreeIterator it = bpt_->Begin(txn, "", "d", false);
-  EXPECT_EQ(*it, std::string(100, 'd'));
+  EXPECT_EQ(it.Value(), std::string(100, 'd'));
   --it;
   EXPECT_TRUE(it.IsValid());
 
-  EXPECT_EQ(*it, std::string(100, 'c'));
+  EXPECT_EQ(it.Value(), std::string(100, 'c'));
   --it;
   EXPECT_TRUE(it.IsValid());
 
-  EXPECT_EQ(*it, std::string(100, 'b'));
+  EXPECT_EQ(it.Value(), std::string(100, 'b'));
   --it;
   EXPECT_TRUE(it.IsValid());
 
-  EXPECT_EQ(*it, std::string(100, 'a'));
+  EXPECT_EQ(it.Value(), std::string(100, 'a'));
   --it;
   EXPECT_FALSE(it.IsValid());
 }
@@ -144,31 +145,31 @@ TEST_F(BPlusTreeIteratorTest, RangeDescendingRightOpen) {
     Init(txn, c, 1000, 100);
   }
   BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);
-  EXPECT_EQ(*it, std::string(100, 'g'));
+  EXPECT_EQ(it.Value(), std::string(100, 'g'));
   --it;
   EXPECT_TRUE(it.IsValid());
 
-  EXPECT_EQ(*it, std::string(100, 'f'));
+  EXPECT_EQ(it.Value(), std::string(100, 'f'));
   --it;
   EXPECT_TRUE(it.IsValid());
 
-  EXPECT_EQ(*it, std::string(100, 'e'));
+  EXPECT_EQ(it.Value(), std::string(100, 'e'));
   --it;
   EXPECT_TRUE(it.IsValid());
 
-  EXPECT_EQ(*it, std::string(100, 'd'));
+  EXPECT_EQ(it.Value(), std::string(100, 'd'));
   --it;
   EXPECT_TRUE(it.IsValid());
 
-  EXPECT_EQ(*it, std::string(100, 'c'));
+  EXPECT_EQ(it.Value(), std::string(100, 'c'));
   --it;
   EXPECT_TRUE(it.IsValid());
 
-  EXPECT_EQ(*it, std::string(100, 'b'));
+  EXPECT_EQ(it.Value(), std::string(100, 'b'));
   --it;
   EXPECT_TRUE(it.IsValid());
 
-  EXPECT_EQ(*it, std::string(100, 'a'));
+  EXPECT_EQ(it.Value(), std::string(100, 'a'));
   --it;
   EXPECT_FALSE(it.IsValid());
 }
@@ -182,7 +183,7 @@ TEST_F(BPlusTreeIteratorTest, FullScanMultiLeaf) {
   for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
     SCOPED_TRACE(c);
     ASSERT_TRUE(it.IsValid());
-    ASSERT_EQ(*it, std::string(10000, c));
+    ASSERT_EQ(it.Value(), std::string(10000, c));
     ++it;
   }
   EXPECT_FALSE(it.IsValid());
@@ -204,7 +205,7 @@ TEST_F(BPlusTreeIteratorTest, FullScanMultiLeafRecovery) {
     for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
       SCOPED_TRACE(c);
       ASSERT_TRUE(it.IsValid());
-      ASSERT_EQ(*it, std::string(10000, c));
+      ASSERT_EQ(it.Value(), std::string(10000, c));
       ++it;
     }
     EXPECT_FALSE(it.IsValid());
@@ -222,7 +223,7 @@ TEST_F(BPlusTreeIteratorTest, FullScanReverse) {
        {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'}) {
     SCOPED_TRACE(c);
     EXPECT_TRUE(it.IsValid());
-    ASSERT_EQ(*it, std::string(2000, c));
+    ASSERT_EQ(it.Value(), std::string(2000, c));
     ++it;
   }
   EXPECT_FALSE(it.IsValid());
@@ -239,7 +240,7 @@ TEST_F(BPlusTreeIteratorTest, EndOpenFullScanReverse) {
        {'k', 'j', 'i', 'h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
     SCOPED_TRACE(c);
     EXPECT_TRUE(it.IsValid());
-    ASSERT_EQ(*it, std::string(2000, c));
+    ASSERT_EQ(it.Value(), std::string(2000, c));
     --it;
   }
   EXPECT_FALSE(it.IsValid());

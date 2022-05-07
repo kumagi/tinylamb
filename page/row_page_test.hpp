@@ -39,7 +39,8 @@ class RowPageTest : public ::testing::Test {
     l_ = std::make_unique<Logger>(file_name_ + ".log");
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(file_name_ + ".log", p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
+                                               r_.get());
   }
 
   void TearDown() override {

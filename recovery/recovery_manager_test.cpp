@@ -29,7 +29,8 @@ class RecoveryManagerTest : public RowPageTest {
     l_ = std::make_unique<Logger>(file_name_ + ".log");
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(file_name_ + ".log", p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), r_.get());
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
+                                               r_.get());
   }
 
   void Recover() override {
@@ -88,7 +89,7 @@ TEST_F(RecoveryManagerTest, UpdateAbort) {
   PageRef page = p_->GetPage(page_id_);
   ASSERT_FALSE(page.IsNull());
   ASSERT_EQ(page->Type(), PageType::kRowPage);
-  
+
   const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
   ASSERT_SUCCESS(page->Update(txn, 0, after));
   page.PageUnlock();

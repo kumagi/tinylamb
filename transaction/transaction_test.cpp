@@ -4,6 +4,7 @@
 #include <string>
 
 #include "gtest/gtest.h"
+#include "page/page_manager.hpp"
 #include "recovery/logger.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
@@ -20,14 +21,17 @@ class TransactionTest : public ::testing::Test {
   virtual void Reset() {
     tm_.reset();
     lm_.reset();
+    pm_.reset();
     l_.reset();
     l_ = std::make_unique<Logger>(kLogName);
     lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), nullptr);
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), pm_.get(), l_.get(),
+                                               nullptr);
   }
 
  protected:
   std::unique_ptr<LockManager> lm_;
+  std::unique_ptr<PageManager> pm_;
   std::unique_ptr<Logger> l_;
   std::unique_ptr<TransactionManager> tm_;
 };

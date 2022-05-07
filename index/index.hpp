@@ -6,10 +6,12 @@
 #define TINYLAMB_INDEX_HPP
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "common/serdes.hpp"
+#include "index_schema.hpp"
 
 namespace tinylamb {
 struct Row;
@@ -21,13 +23,12 @@ class Index {
   Index() = default;
   [[nodiscard]] std::string GenerateKey(const Row& row) const;
   Index(std::string_view name, std::vector<size_t> key, page_id_t pid)
-      : name_(name), key_(std::move(key)), pid_(pid) {}
+      : sc_(name, std::move(key)), pid_(pid) {}
   friend Encoder& operator<<(Encoder& a, const Index& idx);
   friend Decoder& operator>>(Decoder& e, Index& idx);
   bool operator==(const Index& rhs) const;
 
-  std::string name_;
-  std::vector<size_t> key_;
+  IndexSchema sc_;
   page_id_t pid_{};
 };
 

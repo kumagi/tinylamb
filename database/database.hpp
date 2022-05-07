@@ -3,38 +3,39 @@
 
 #include <functional>
 
-#include "database/catalog.hpp"
-#include "database/transaction_context.hpp"
-#include "page/page_manager.hpp"
-#include "recovery/checkpoint_manager.hpp"
-#include "recovery/logger.hpp"
-#include "transaction/lock_manager.hpp"
-#include "transaction/transaction_manager.hpp"
+#include "database/page_storage.hpp"
+#include "relation_storage.hpp"
+#include "table/table.hpp"
+#include "table/table_statistics.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
+class IndexSchema;
 
 class Database {
  public:
-  explicit Database(std::string_view dbname)
-      : dbname_(dbname),
-        lock_manager_(),
-        logger_(dbname_ + ".log"),
-        pm_(dbname_ + ".db", 1024),
-        recovery_(dbname_ + ".log", pm_.GetPool()),
-        tm_(&lock_manager_, &logger_, &recovery_),
-        cm_(dbname_ + ".last_checkpoint", &tm_, pm_.GetPool()),
-        catalog_(1, 2, &pm_) {}
-  TransactionContext Begin();
+  explicit Database(std::string_view dbname) : relations_(dbname) {}
+  Transaction Begin();
+  TransactionContext BeginContext();
+
+  Status CreateTable(Transaction& txn, const Schema& schema);
+  Status CreateIndex(Transaction& txn, std::string_view schema_name,
+                     const IndexSchema& idx);
+
+  Status GetTable(Transaction& txn, std::string_view schema_name, Table* tbl);
+
+  [[maybe_unused]] void DebugDump(Transaction& txn, std::ostream& o);
+
+  Status GetStatistics(Transaction& txn, std::string_view schema_name,
+                       TableStatistics* ts);
+  Status UpdateStatistics(Transaction& txn, std::string_view schema_name,
+                          const TableStatistics& ts);
+  Status RefreshStatistics(Transaction& txn, std::string_view schema_name);
+
+  PageStorage& Storage() { return *relations_.GetPageStorage(); }
 
  private:
-  std::string dbname_;
-  LockManager lock_manager_;
-  Logger logger_;
-  PageManager pm_;
-  RecoveryManager recovery_;
-  TransactionManager tm_;
-  CheckpointManager cm_;
-  Catalog catalog_;
+  RelationStorage relations_;
 };
 
 }  // namespace tinylamb

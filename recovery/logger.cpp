@@ -28,7 +28,7 @@ Logger::~Logger() {
 
 lsn_t Logger::AddLog(const LogRecord& log) {
   std::string data = log.Serialize();
-  std::unique_lock lk(latch_);
+  std::unique_lock lk{latch_};
 
   while (buffer_.size() - data.size() <= queued_lsn_ - persistent_lsn_) {
     // Has no enough space in buffer, wait for worker.
@@ -51,7 +51,7 @@ lsn_t Logger::AddLog(const LogRecord& log) {
   if (buffer_.size() - RestSize() < buffer_.size() / 4) {
     worker_wait_.notify_all();
   }
-  return queued_lsn_ - data.size();
+  return queued_lsn_.load() - data.size();
 }
 
 void Logger::Finish() {
@@ -61,14 +61,16 @@ void Logger::Finish() {
 
 lsn_t Logger::CommittedLSN() const {
   std::scoped_lock lk(latch_);
-  return persistent_lsn_;
+  return persistent_lsn_.load(std::memory_order_release);
 }
 
 void Logger::LoggerWork() {
   std::unique_lock lk(latch_);
   while (!finish_ || persistent_lsn_ != queued_lsn_) {
     worker_wait_.wait_for(lk, std::chrono::milliseconds(every_ms_));
-    if (persistent_lsn_ == queued_lsn_) continue;
+    if (persistent_lsn_ == queued_lsn_) {
+      continue;
+    }
 
     // Write buffered data between committed_offset to written_offset.
     const size_t written_offset = queued_lsn_ % buffer_.size();
@@ -78,16 +80,22 @@ void Logger::LoggerWork() {
     if (committed_offset < written_offset) {
       flushed_bytes += write(dst_, buffer_.data() + committed_offset,
                              written_offset - committed_offset);
-      if (flushed_bytes <= 0) continue;
+      if (flushed_bytes <= 0) {
+        continue;
+      }
     } else {
       // In case of buffer does wrap around.
       flushed_bytes += write(dst_, buffer_.data() + committed_offset,
                              buffer_.size() - committed_offset);
-      if (flushed_bytes <= 0) continue;
+      if (flushed_bytes <= 0) {
+        continue;
+      }
       if (static_cast<size_t>(flushed_bytes) ==
           buffer_.size() - committed_offset) {
         ssize_t extra_wrote = write(dst_, buffer_.data(), written_offset);
-        if (0 < extra_wrote) flushed_bytes += extra_wrote;
+        if (0 < extra_wrote) {
+          flushed_bytes += extra_wrote;
+        }
       }
     }
 
@@ -97,10 +105,10 @@ void Logger::LoggerWork() {
 }
 
 [[nodiscard]] size_t Logger::RestSize() const {
-  if (persistent_lsn_ <= queued_lsn_)
+  if (persistent_lsn_ <= queued_lsn_) {
     return buffer_.size() - queued_lsn_ + persistent_lsn_ - 1;
-  else
-    return persistent_lsn_ - queued_lsn_ - 1;
+  }
+  return persistent_lsn_ - queued_lsn_ - 1;
 }
 
 }  // namespace tinylamb

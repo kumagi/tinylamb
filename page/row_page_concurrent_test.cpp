@@ -8,8 +8,10 @@
 
 namespace tinylamb {
 
+class RowPageConcurrentTest : public RowPageTest {};
+
 constexpr int kThreads = 8;
-TEST_F(RowPageTest, InsertInsert) {
+TEST_F(RowPageConcurrentTest, InsertInsert) {
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
   for (int i = 0; i < kThreads; ++i) {
@@ -24,24 +26,25 @@ TEST_F(RowPageTest, InsertInsert) {
   }
 }
 
-TEST_F(RowPageTest, InsertUpdate) {
+TEST_F(RowPageConcurrentTest, InsertUpdate) {
+  constexpr int kRows = 100;
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
-  for (int j = 0; j < 100; ++j) {
+  for (int j = 0; j < kRows; ++j) {
     EXPECT_TRUE(InsertRow(RandomString()));
   }
   for (int i = 0; i < kThreads / 2; ++i) {
     threads.emplace_back([this]() {
-      for (int j = 0; j < 100; ++j) {
+      for (int j = 0; j < kRows; ++j) {
         EXPECT_TRUE(InsertRow(RandomString()));
       }
     });
   }
   for (int i = 0; i < kThreads / 2; ++i) {
-    threads.emplace_back([&]() {
-      unsigned int seed = i;
-      for (int j = 0; j < 100; ++j) {
-        UpdateRow(rand_r(&seed) % 100, RandomString());
+    threads.emplace_back([&, i]() {
+      std::mt19937 rand(i);
+      for (int j = 0; j < kRows; ++j) {
+        UpdateRow(rand() % kRows, RandomString());
       }
     });
   }
@@ -50,14 +53,14 @@ TEST_F(RowPageTest, InsertUpdate) {
   }
 }
 
-TEST_F(RowPageTest, UpdateUpdate) {
+TEST_F(RowPageConcurrentTest, UpdateUpdate) {
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
 
   thread_local std::random_device seed_gen;
   thread_local std::mt19937 engine(seed_gen());
-  while (InsertRow(RandomString(engine() % 64)))
-    ;
+  while (InsertRow(RandomString(engine() % 64))) {
+  }
   size_t rows = GetRowCount();
   for (int i = 0; i < kThreads; ++i) {
     threads.emplace_back([&]() {

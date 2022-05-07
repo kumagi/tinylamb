@@ -23,18 +23,25 @@ PagePool::PagePool(std::string_view file_name, size_t capacity)
 }
 
 PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit) {
-  std::scoped_lock latch(pool_latch);
+  std::unique_lock latch(pool_latch);
   auto entry = pool_.find(page_id);
   if (entry != pool_.end()) {
     entry->second->pin_count++;
     Touch(entry->second);
-    if (cache_hit != nullptr) *cache_hit = true;
+    if (cache_hit != nullptr) {
+      *cache_hit = true;
+    }
+    latch.unlock();
     return {this, entry->second->page.get(), entry->second->page_latch.get()};
-  } else {
-    if (pool_lru_.size() == capacity_) EvictOnePage();
-    if (cache_hit != nullptr) *cache_hit = false;
-    return AllocNewPage(page_id);
   }
+
+  if (pool_lru_.size() == capacity_) {
+    EvictOnePage();
+  }
+  if (cache_hit != nullptr) {
+    *cache_hit = false;
+  }
+  return AllocNewPage(page_id, std::move(latch));
 }
 
 void PagePool::LostAllPageForTest() {
@@ -75,7 +82,7 @@ bool PagePool::EvictPage(LruType::iterator target) {
 
 // Precondition: pool_latch is locked.
 bool PagePool::EvictOnePage() {
-  assert(!pool_latch.try_lock());
+  // assert(!pool_latch.try_lock());
   auto target = pool_lru_.begin();
   while (target != pool_lru_.end() && !EvictPage(target)) {
     target++;
@@ -84,12 +91,13 @@ bool PagePool::EvictOnePage() {
 }
 
 // Precondition: pool_latch is locked.
-PageRef PagePool::AllocNewPage(page_id_t pid) {
-  assert(!pool_latch.try_lock());
+PageRef PagePool::AllocNewPage(page_id_t pid,
+                               std::unique_lock<std::mutex> lock) {
   std::unique_ptr<Page> new_page(new Page(pid, PageType::kUnknown));
   ReadFrom(new_page.get(), pid);
   pool_lru_.emplace_back(new_page.release());
   pool_.emplace(pid, std::prev(pool_lru_.end()));
+  lock.unlock();
   return {this, pool_lru_.back().page.get(), pool_lru_.back().page_latch.get()};
 }
 

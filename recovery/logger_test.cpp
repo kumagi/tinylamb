@@ -47,7 +47,7 @@ TEST_F(LoggerTest, AppendBegin) {
   LogRecord l(0xcafebabe, 0xdeadbeef, LogType::kBegin);
   lsn_t lsn = l_->AddLog(l);
   ASSERT_EQ(0, lsn);  // Inserted place must be the beginning of the log.
-  WaitForCommit(lsn + l.Size());
+  WaitForCommit(0 + l.Size());
   EXPECT_EQ(std::filesystem::file_size(log_name_), l.Size());
 }
 

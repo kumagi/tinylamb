@@ -24,8 +24,9 @@ struct RowPosition;
 
 class TransactionManager {
  public:
-  TransactionManager(LockManager* lm, Logger* l, RecoveryManager* r)
-      : lock_manager_(lm), logger_(l), recovery_(r) {}
+  TransactionManager(LockManager* lm, PageManager* pm, Logger* l,
+                     RecoveryManager* r)
+      : lock_manager_(lm), page_manager_(pm), logger_(l), recovery_(r) {}
 
   Transaction Begin();
 
@@ -54,8 +55,12 @@ class TransactionManager {
   bool GetExclusiveLock(const RowPosition& rp);
   bool GetSharedLock(const RowPosition& rp);
 
+  bool TryUpgradeLock(const RowPosition& rp);
+
   lsn_t AddLog(const LogRecord& lr);
   lsn_t CommittedLSN() const;
+
+  PageManager* GetPageManager() { return page_manager_; }
 
  private:
   friend class RecoveryManager;
@@ -64,6 +69,7 @@ class TransactionManager {
   std::unordered_map<txn_id_t, Transaction*> active_transactions_;
   std::atomic<txn_id_t> next_txn_id_ = 1;
   LockManager* const lock_manager_;
+  PageManager* const page_manager_;
   Logger* const logger_;
   RecoveryManager* const recovery_;
   std::mutex transaction_table_lock;

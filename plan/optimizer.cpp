@@ -9,7 +9,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "database/catalog.hpp"
+#include "database/relation_storage.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
@@ -41,10 +41,10 @@ struct CostAndPlan {
 void ExtractTouchedColumns(const Expression& exp,
                            std::unordered_set<std::string>& cols) {
   if (exp->Type() == TypeTag::kColumnValue) {
-    auto* cv = reinterpret_cast<const ColumnValue*>(exp.get());
+    const auto* cv = reinterpret_cast<const ColumnValue*>(exp.get());
     cols.emplace(cv->ColumnName());
   } else if (exp->Type() == TypeTag::kBinaryExp) {
-    auto* be = reinterpret_cast<const BinaryExpression*>(exp.get());
+    const auto* be = reinterpret_cast<const BinaryExpression*>(exp.get());
     ExtractTouchedColumns(be->Left(), cols);
     ExtractTouchedColumns(be->Right(), cols);
   }
@@ -208,7 +208,9 @@ std::unordered_set<std::string> Set(const std::vector<std::string>& from) {
 
 Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
                            Schema& schema, Executor& exec) {
-  if (query.from_.empty()) throw std::runtime_error("No table specified");
+  if (query.from_.empty()) {
+    throw std::runtime_error("No table specified");
+  }
   std::unordered_map<std::unordered_set<std::string>, CostAndPlan>
       optimal_plans;
 
@@ -219,22 +221,23 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
     ExtractTouchedColumns(sel.expression, touched_columns);
   }
   for (const auto& from : query.from_) {
-    Table tbl(ctx.pm_);
+    Table tbl;
     ctx.c_->GetTable(ctx.txn_, from, &tbl);
 
     // Get statistics.
-    TableStatistics ts(tbl.GetSchema());
-    ctx.c_->GetStatistics(ctx.txn_, from, &ts);
+    TableStatistics stats(tbl.GetSchema());
+    ctx.c_->GetStatistics(ctx.txn_, from, &stats);
 
     // Push down all selection & projection.
     std::vector<NamedExpression> project_target;
     for (const auto& col : And(touched_columns, ColumnNames(tbl.GetSchema()))) {
       project_target.emplace_back(col);
     }
-    Plan np = NewProjectionPlan(
-        CalcTableSelection(tbl.GetSchema(), query.where_, ts), project_target);
+    Plan npp = NewProjectionPlan(
+        CalcTableSelection(tbl.GetSchema(), query.where_, stats),
+        project_target);
     optimal_plans.emplace(std::unordered_set({from}),
-                          CostAndPlan{np->AccessRowCount(ctx), np});
+                          CostAndPlan{npp->AccessRowCount(ctx), npp});
   }
   assert(optimal_plans.size() == query.from_.size());
 
@@ -242,17 +245,19 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
   for (size_t i = 0; i < query.from_.size(); ++i) {
     for (const auto& base_table : optimal_plans) {
       for (const auto& join_table : optimal_plans) {
-        if (ContainsAny(base_table.first, join_table.first)) continue;
-        Plan bj = BestJoin(ctx, query.where_, base_table, join_table);
+        if (ContainsAny(base_table.first, join_table.first)) {
+          continue;
+        }
+        Plan best_join = BestJoin(ctx, query.where_, base_table, join_table);
         std::unordered_set<std::string> joined_tables =
             Or(base_table.first, join_table.first);
         assert(1 < joined_tables.size());
-        size_t cost = bj->AccessRowCount(ctx);
+        size_t cost = best_join->AccessRowCount(ctx);
         auto iter = optimal_plans.find(joined_tables);
         if (iter == optimal_plans.end()) {
-          optimal_plans.emplace(joined_tables, CostAndPlan{cost, bj});
+          optimal_plans.emplace(joined_tables, CostAndPlan{cost, best_join});
         } else if (cost < iter->second.cost) {
-          iter->second = CostAndPlan{cost, bj};
+          iter->second = CostAndPlan{cost, best_join};
         }
       }
     }

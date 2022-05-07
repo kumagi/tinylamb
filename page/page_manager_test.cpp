@@ -30,7 +30,8 @@ class PageManagerTest : public ::testing::Test {
     p_ = std::make_unique<PageManager>(db_name_, 10);
     l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), l_.get(), nullptr);
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
+                                               nullptr);
   }
 
   void TearDown() override {

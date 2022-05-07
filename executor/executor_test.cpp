@@ -21,12 +21,16 @@ namespace tinylamb {
 
 class ExecutorTest : public ::testing::Test {
  public:
+  void BulkInsert(Table& tbl, std::initializer_list<Row> rows) {
+    ASSERT_TRUE(tbl.Insert())
+  }
+
   void SetUp() override {
-    table_ = std::unique_ptr<TableInterface>(
-        new FakeTable({{Row({Value(0), Value("hello"), Value(1.2)})},
-                       {Row({Value(3), Value("piyo"), Value(12.2)})},
-                       {Row({Value(1), Value("world"), Value(4.9)})},
-                       {Row({Value(2), Value("arise"), Value(4.14)})}}));
+    table_ = std::unique_ptr<Table>(
+        new Table({{Row({Value(0), Value("hello"), Value(1.2)})},
+                   {Row({Value(3), Value("piyo"), Value(12.2)})},
+                   {Row({Value(1), Value("world"), Value(4.9)})},
+                   {Row({Value(2), Value("arise"), Value(4.14)})}}));
   }
 
   std::unique_ptr<TableInterface> table_;
@@ -106,14 +110,14 @@ TEST_F(ExecutorTest, Selection) {
 }
 
 TEST_F(ExecutorTest, BasicJoin) {
-  auto table = std::unique_ptr<FakeTable>(
-      new FakeTable({{Row({Value(9), Value(1.2), Value("troop")})},
-                     {Row({Value(7), Value(3.9), Value("arise")})},
-                     {Row({Value(1), Value(4.9), Value("probe")})},
-                     {Row({Value(3), Value(12.4), Value("ought")})},
-                     {Row({Value(3), Value(99.9), Value("extra")})},
-                     {Row({Value(232), Value(40.9), Value("out")})},
-                     {Row({Value(0), Value(9.2), Value("arise")})}}));
+  auto table = std::unique_ptr<Table>(
+      new Table({{Row({Value(9), Value(1.2), Value("troop")})},
+                 {Row({Value(7), Value(3.9), Value("arise")})},
+                 {Row({Value(1), Value(4.9), Value("probe")})},
+                 {Row({Value(3), Value(12.4), Value("ought")})},
+                 {Row({Value(3), Value(99.9), Value("extra")})},
+                 {Row({Value(232), Value(40.9), Value("out")})},
+                 {Row({Value(0), Value(9.2), Value("arise")})}}));
 
   HashJoin hj(std::make_unique<FullScan>(fake_txn_, std::move(table_)), {0},
               std::make_unique<FullScan>(fake_txn_, std::move(table)), {0});

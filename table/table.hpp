@@ -8,68 +8,62 @@
 #include <utility>
 #include <vector>
 
+#include "common/status_or.hpp"
 #include "full_scan_iterator.hpp"
 #include "index/index.hpp"
 #include "index/index_scan_iterator.hpp"
+#include "iterator.hpp"
 #include "page/row_position.hpp"
-#include "table/table_interface.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
 
 class Transaction;
-class PageManager;
 class Decoder;
 class Encoder;
 struct Row;
 struct RowPosition;
 
-class Table : public TableInterface {
+class Table {
  public:
   Table() = default;
-  explicit Table(PageManager* pm) : pm_(pm) {}
-  Table(PageManager* pm, Schema sc, page_id_t pid, std::vector<Index> indices)
-      : pm_(pm),
-        schema_(std::move(sc)),
-        first_pid_(pid),
-        last_pid_(pid),
-        indices_(std::move(indices)) {}
-  ~Table() override = default;
+  Table(Schema sc, page_id_t pid)
+      : schema_(std::move(sc)), first_pid_(pid), last_pid_(pid) {}
+  ~Table() = default;
 
-  Status Insert(Transaction& txn, const Row& row, RowPosition* rp) override;
+  Status CreateIndex(Transaction& txn, const IndexSchema& idx);
 
-  Status Update(Transaction& txn, const Row& row, RowPosition* pos) override;
+  StatusOr<RowPosition> Insert(Transaction& txn, const Row& row);
 
-  Status Delete(Transaction& txn, RowPosition pos) override;
+  StatusOr<RowPosition> Update(Transaction& txn, const RowPosition& pos,
+                               const Row& row);
 
-  Status Read(Transaction& txn, RowPosition pos, Row* result) const override;
+  Status Delete(Transaction& txn, RowPosition pos);
 
-  Status ReadByKey(Transaction& txn, std::string_view index_name,
-                   const Row& keys, Row* result) const override;
+  StatusOr<Row> Read(Transaction& txn, RowPosition pos) const;
 
-  Iterator BeginFullScan(Transaction& txn) const override;
+  Iterator BeginFullScan(Transaction& txn) const;
   Iterator BeginIndexScan(Transaction& txn, std::string_view index_name,
                           const Row& begin, const Row& end = Row(),
-                          bool ascending = true) override;
+                          bool ascending = true);
 
-  [[nodiscard]] Schema GetSchema() const override { return schema_; }
+  [[nodiscard]] Schema GetSchema() const { return schema_; }
 
   friend Encoder& operator<<(Encoder& e, const Table& t);
   friend Decoder& operator>>(Decoder& d, Table& t);
 
  private:
-  friend class Catalog;
+  friend class RelationStorage;
   friend class FullScanIterator;
   friend class IndexScanIterator;
   friend class TableInterface;
   friend class FullScanPlan;
   page_id_t GetIndex(std::string_view name);
 
-  PageManager* pm_{};
   Schema schema_;
   page_id_t first_pid_{};
   page_id_t last_pid_{};
-  std::vector<Index> indices_;
+  std::vector<Index> indices_{};
 };
 
 }  // namespace tinylamb

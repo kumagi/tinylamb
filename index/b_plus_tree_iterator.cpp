@@ -7,6 +7,7 @@
 #include "b_plus_tree.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
+#include "transaction/transaction.hpp"
 
 namespace tinylamb {
 
@@ -24,8 +25,8 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
       pid_ = leaf->PageID();
       idx_ = 0;
     } else {
-      PageRef leaf =
-          tree_->FindLeaf(*txn_, begin, tree_->pm_->GetPage(tree_->root_));
+      PageRef leaf = tree_->FindLeaf(*txn_, begin,
+                                     txn->PageManager()->GetPage(tree_->root_));
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.Find(begin);
     }
@@ -35,8 +36,8 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.row_count_ - 1;
     } else {
-      PageRef leaf =
-          tree_->FindLeaf(*txn_, end, tree_->pm_->GetPage(tree_->root_));
+      PageRef leaf = tree_->FindLeaf(*txn_, end,
+                                     txn->PageManager()->GetPage(tree_->root_));
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.Find(end);
     }
@@ -44,12 +45,16 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
   valid_ = true;
 }
 
-std::string_view BPlusTreeIterator::operator*() {
-  return tree_->pm_->GetPage(pid_)->body.leaf_page.GetValue(idx_);
+std::string_view BPlusTreeIterator::Value() {
+  return txn_->PageManager()->GetPage(pid_)->body.leaf_page.GetValue(idx_);
+}
+
+std::string_view BPlusTreeIterator::Value() const {
+  return txn_->PageManager()->GetPage(pid_)->body.leaf_page.GetValue(idx_);
 }
 
 BPlusTreeIterator& BPlusTreeIterator::operator++() {
-  PageRef ref = tree_->pm_->GetPage(pid_);
+  PageRef ref = txn_->PageManager()->GetPage(pid_);
   LeafPage* const lp = &ref->body.leaf_page;
   idx_++;
   if (lp->row_count_ <= idx_) {
@@ -58,7 +63,7 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
       valid_ = false;
       return *this;
     }
-    PageRef next_ref = tree_->pm_->GetPage(pid_);
+    PageRef next_ref = txn_->PageManager()->GetPage(pid_);
     ref.PageUnlock();
     idx_ = 0;
     if (next_ref->body.leaf_page.row_count_ == 0 ||
@@ -74,12 +79,14 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
 }
 
 BPlusTreeIterator& BPlusTreeIterator::operator--() {
-  PageRef ref = tree_->pm_->GetPage(pid_);
+  PageRef ref = txn_->PageManager()->GetPage(pid_);
   LeafPage* const lp = &ref->body.leaf_page;
   if (0 == idx_) {
     pid_ = lp->prev_pid_;
-    if (pid_ == 0) valid_ = false;
-    PageRef prev_ref = tree_->pm_->GetPage(pid_);
+    if (pid_ == 0) {
+      valid_ = false;
+    }
+    PageRef prev_ref = txn_->PageManager()->GetPage(pid_);
     ref.PageUnlock();
     idx_ = prev_ref->body.leaf_page.row_count_ - 1;
     if (prev_ref->body.leaf_page.row_count_ == 0 ||
@@ -87,9 +94,8 @@ BPlusTreeIterator& BPlusTreeIterator::operator--() {
       valid_ = false;
     }
     return *this;
-  } else {
-    --idx_;
   }
+  --idx_;
   if (!begin_.empty() && lp->GetKey(idx_) < begin_) valid_ = false;
   return *this;
 }

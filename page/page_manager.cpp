@@ -31,14 +31,14 @@ void PageManager::DestroyPage(Transaction& system_txn, Page* target) {
 
 PageRef PageManager::AllocateNewPage(Transaction& system_txn,
                                      PageType new_page_type) {
-  PageRef new_page =
-      GetMetaPage()->AllocateNewPage(system_txn, pool_, new_page_type);
-  return new_page;
+  return GetMetaPage()->AllocateNewPage(system_txn, pool_, new_page_type);
 }
 
 PageRef PageManager::GetMetaPage() {
   PageRef meta_page = pool_.GetPage(kMetaPageId, nullptr);
-  if (meta_page.IsNull()) throw std::runtime_error("failed to get meta page");
+  if (meta_page.IsNull()) {
+    throw std::runtime_error("failed to get meta page");
+  }
   if (meta_page->Type() != PageType::kMetaPage) {
     meta_page->PageInit(kMetaPageId, PageType::kMetaPage);
   }

@@ -11,19 +11,17 @@
 namespace tinylamb {
 
 class PageManager;
-class Catalog;
+class RelationStorage;
 
 class TransactionContext {
  public:
-  TransactionContext(TransactionManager* tm, PageManager* page_manager,
-                     Catalog* catalog)
-      : txn_(tm->Begin()), pm_(page_manager), c_(catalog) {}
+  TransactionContext(Transaction&& txn, RelationStorage* catalog)
+      : txn_(std::move(txn)), c_(catalog) {}
   TransactionContext(const TransactionContext&) = delete;
   TransactionContext& operator=(const TransactionContext&) = delete;
   TransactionContext(TransactionContext&&) = default;
   TransactionContext& operator=(TransactionContext&& o) noexcept {
     txn_ = std::move(o.txn_);
-    pm_ = o.pm_;
     c_ = o.c_;
     return *this;
   }
@@ -31,8 +29,7 @@ class TransactionContext {
   void Abort() { txn_.Abort(); }
 
   Transaction txn_;
-  PageManager* pm_;
-  Catalog* c_;
+  RelationStorage* c_;
 };
 
 }  // namespace tinylamb

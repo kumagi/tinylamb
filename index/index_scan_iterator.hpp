@@ -27,9 +27,11 @@ class IndexScanIterator : public IteratorBase {
   }
 
   [[nodiscard]] bool IsValid() const override;
+  [[nodiscard]] RowPosition Position() const override;
   IteratorBase& operator++() override;
   IteratorBase& operator--() override;
   const Row& operator*() const override;
+  Row& operator*() override;
 
  private:
   friend class Table;
