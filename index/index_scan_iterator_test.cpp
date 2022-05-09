@@ -60,13 +60,13 @@ TEST_F(IndexScanIteratorTest, Construct) {}
 
 TEST_F(IndexScanIteratorTest, ScanAscending) {
   Transaction txn = db_->Begin();
-  Table table;
-  ASSERT_SUCCESS(db_->GetTable(txn, "SampleTable", &table));
-  RowPosition rp;
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(txn, "SampleTable"));
   for (int i = 0; i < 230; ++i) {
-    ASSERT_SUCCESS(table.Insert(
-        txn, Row({Value(i), Value("v" + std::to_string(i)), Value(0.1 + i)}),
-        &rp));
+    ASSERT_SUCCESS(
+        table
+            .Insert(txn, Row({Value(i), Value("v" + std::to_string(i)),
+                              Value(0.1 + i)}))
+            .GetStatus());
   }
   Row iter_begin({Value(43)});
   Row iter_end({Value(180)});
@@ -84,13 +84,14 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
 
 TEST_F(IndexScanIteratorTest, ScanDecending) {
   Transaction txn = db_->Begin();
-  Table table;
-  ASSERT_SUCCESS(db_->GetTable(txn, "SampleTable", &table));
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(txn, "SampleTable"));
   RowPosition rp;
   for (int i = 0; i < 230; ++i) {
-    ASSERT_SUCCESS(table.Insert(
-        txn, Row({Value(i), Value("v" + std::to_string(i)), Value(0.1 + i)}),
-        &rp));
+    ASSERT_SUCCESS(
+        table
+            .Insert(txn, Row({Value(i), Value("v" + std::to_string(i)),
+                              Value(0.1 + i)}))
+            .GetStatus());
   }
   Row iter_begin({Value(104)});
   Row iter_end({Value(200)});

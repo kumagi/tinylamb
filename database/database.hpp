@@ -22,12 +22,12 @@ class Database {
   Status CreateIndex(Transaction& txn, std::string_view schema_name,
                      const IndexSchema& idx);
 
-  Status GetTable(Transaction& txn, std::string_view schema_name, Table* tbl);
+  StatusOr<Table> GetTable(Transaction& txn, std::string_view schema_name);
 
   [[maybe_unused]] void DebugDump(Transaction& txn, std::ostream& o);
 
-  Status GetStatistics(Transaction& txn, std::string_view schema_name,
-                       TableStatistics* ts);
+  StatusOr<TableStatistics> GetStatistics(Transaction& txn,
+                                          std::string_view schema_name);
   Status UpdateStatistics(Transaction& txn, std::string_view schema_name,
                           const TableStatistics& ts);
   Status RefreshStatistics(Transaction& txn, std::string_view schema_name);

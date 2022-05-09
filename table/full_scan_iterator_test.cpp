@@ -56,13 +56,13 @@ TEST_F(FullScanIteratorTest, Construct) {}
 
 TEST_F(FullScanIteratorTest, Scan) {
   Transaction txn = db_->Begin();
-  RowPosition rp;
-  Table table;
-  ASSERT_SUCCESS(db_->GetTable(txn, "SampleTable", &table));
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(txn, "SampleTable"));
   for (int i = 0; i < 130; ++i) {
-    ASSERT_SUCCESS(table.Insert(
-        txn, Row({Value(i), Value("v" + std::to_string(i)), Value(0.1 + i)}),
-        &rp));
+    ASSERT_SUCCESS(
+        table
+            .Insert(txn, Row({Value(i), Value("v" + std::to_string(i)),
+                              Value(0.1 + i)}))
+            .GetStatus());
   }
   Iterator it = table.BeginFullScan(txn);
   while (it.IsValid()) {

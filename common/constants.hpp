@@ -30,6 +30,13 @@ static constexpr size_t kPageBodySize = kPageSize - kPageHeaderSize;
     Status tmp_status = expr;                              \
     if (tmp_status != Status::kSuccess) return tmp_status; \
   }
+
+#define CRASH_IF_FAIL(expr)                                \
+  {                                                        \
+    Status tmp_status = expr;                              \
+    if (tmp_status != Status::kSuccess) assert(!## #expr); \
+  }
+
 #define ASSIGN_OR_RETURN(type, value, expr)          \
   StatusOr<type> value##_tmp = expr;                 \
   if (value##_tmp.GetStatus() != Status::kSuccess) { \
@@ -40,6 +47,11 @@ static constexpr size_t kPageBodySize = kPageSize - kPageHeaderSize;
 #define ASSIGN_OR_ASSERT_FAIL(type, value, expr)        \
   StatusOr<type> value##_tmp = expr;                    \
   ASSERT_EQ(value##_tmp.GetStatus(), Status::kSuccess); \
+  type value = value##_tmp.Value()
+
+#define ASSIGN_OR_CRASH(type, value, expr)             \
+  StatusOr<type> value##_tmp = expr;                   \
+  assert(value##_tmp.GetStatus() == Status::kSuccess); \
   type value = value##_tmp.Value()
 
 enum class Status : uint8_t {

@@ -56,8 +56,7 @@ constexpr int kThreads = 2;
 TEST_F(TableConcurrentTest, InsertInsert) {
   constexpr int kSize = 2000;
   auto ro_txn = db_->Begin();
-  Table table;
-  ASSERT_SUCCESS(db_->GetTable(ro_txn, "SampleTable", &table));
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ro_txn, "SampleTable"));
   ASSERT_SUCCESS(ro_txn.PreCommit());
   std::vector<std::unordered_map<RowPosition, Row>> rows;
   rows.resize(kThreads);
@@ -69,8 +68,8 @@ TEST_F(TableConcurrentTest, InsertInsert) {
       for (int j = 0; j < kSize; ++j) {
         Row new_row({Value(j * kSize + i), Value(RandomString(32)),
                      Value((double)2 * j * kSize + i)});
-        RowPosition inserted_pos;
-        ASSERT_SUCCESS(table.Insert(txn, new_row, &inserted_pos));
+        ASSIGN_OR_ASSERT_FAIL(RowPosition, inserted_pos,
+                              table.Insert(txn, new_row));
         rows[i].emplace(inserted_pos, new_row);
       }
       ASSERT_SUCCESS(txn.PreCommit());
@@ -83,8 +82,7 @@ TEST_F(TableConcurrentTest, InsertInsert) {
     auto txn = db_->Begin();
     for (const auto& rows_per_thread : rows) {
       for (const auto& row : rows_per_thread) {
-        Row read_row;
-        ASSERT_SUCCESS(table.Read(txn, row.first, &read_row));
+        ASSIGN_OR_ASSERT_FAIL(Row, read_row, table.Read(txn, row.first));
         ASSERT_EQ(read_row, row.second);
       }
     }

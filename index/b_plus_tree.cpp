@@ -136,7 +136,6 @@ PageRef BPlusTree::RightmostPage(Transaction& txn) {
 
 Status BPlusTree::Insert(Transaction& txn, std::string_view key,
                          std::string_view value) {
-  std::scoped_lock lk(latch_);
   std::vector<PageRef> parents;
   PageRef target =
       FindLeafForInsert(txn, key, txn.PageManager()->GetPage(root_), parents);
@@ -167,7 +166,6 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
 
 Status BPlusTree::Update(Transaction& txn, std::string_view key,
                          std::string_view value) {
-  std::scoped_lock lk(latch_);
   std::vector<PageRef> parents;
   PageRef leaf =
       FindLeafForInsert(txn, key, txn.PageManager()->GetPage(root_), parents);
@@ -198,7 +196,6 @@ Status BPlusTree::Update(Transaction& txn, std::string_view key,
 }
 
 Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
-  std::scoped_lock lk(latch_);
   PageRef root = txn.PageManager()->GetPage(root_);
   std::vector<PageRef> parents;
   PageRef leaf = FindLeafForInsert(txn, key, std::move(root), parents);
@@ -313,11 +310,13 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
   return s;
 }
 
-Status BPlusTree::Read(Transaction& txn, std::string_view key,
-                       std::string_view* dst) {
-  *dst = "";
+StatusOr<std::string_view> BPlusTree::Read(Transaction& txn,
+                                           std::string_view key) {
+  std::string_view result;
   PageRef leaf = FindLeaf(txn, key, txn.PageManager()->GetPage(root_));
-  return leaf->Read(txn, key, dst);
+  RETURN_IF_FAIL(leaf->Read(txn, key, &result));
+  LOG(ERROR) << leaf->PageID();
+  return result;
 }
 
 BPlusTreeIterator BPlusTree::Begin(Transaction& txn, std::string_view left,

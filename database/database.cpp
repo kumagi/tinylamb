@@ -23,18 +23,18 @@ Status Database::CreateIndex(Transaction& txn, std::string_view schema_name,
   return relations_.CreateIndex(txn, schema_name, idx);
 }
 
-Status Database::GetTable(Transaction& txn, std::string_view schema_name,
-                          Table* tbl) {
-  return relations_.GetTable(txn, schema_name, tbl);
+StatusOr<Table> Database::GetTable(Transaction& txn,
+                                   std::string_view schema_name) {
+  return relations_.GetTable(txn, schema_name);
 }
 
 void Database::DebugDump(Transaction& txn, std::ostream& o) {
   relations_.DebugDump(txn, o);
 }
 
-Status Database::GetStatistics(Transaction& txn, std::string_view schema_name,
-                               TableStatistics* ts) {
-  return relations_.GetStatistics(txn, schema_name, ts);
+StatusOr<TableStatistics> Database::GetStatistics(
+    Transaction& txn, std::string_view schema_name) {
+  return relations_.GetStatistics(txn, schema_name);
 }
 
 Status Database::UpdateStatistics(Transaction& txn,

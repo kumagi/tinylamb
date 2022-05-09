@@ -26,80 +26,89 @@ class PlanTest : public ::testing::Test {
  public:
   void SetUp() override {
     prefix_ = "plan_test-" + RandomString();
-    ts_ = std::make_unique<PageStorage>(prefix_);
     Recover();
-    Transaction txn = ts_->Begin();
-    ctx_ = std::make_unique<TransactionContext>(ts_->Begin(), catalog_.get());
+    Transaction txn = rs_->Begin();
+    ctx_ = std::make_unique<TransactionContext>(rs_->Begin(), rs_.get());
     {
-      ASSERT_SUCCESS(catalog_->CreateTable(
+      ASSERT_SUCCESS(rs_->CreateTable(
           txn, Schema("Sc1", {Column("c1", ValueType::kInt64),
                               Column("c2", ValueType::kVarChar),
                               Column("c3", ValueType::kDouble)})));
       Schema sc;
-      Table tbl;
-      ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc1", &tbl));
-      RowPosition rp;
-      tbl.Insert(txn, Row({Value(12), Value("hello"), Value(2.3)}), &rp);
-      tbl.Insert(txn, Row({Value(10), Value("world"), Value(4.5)}), &rp);
-      tbl.Insert(txn, Row({Value(52), Value("ought"), Value(5.3)}), &rp);
-      tbl.Insert(txn, Row({Value(242), Value("arise"), Value(6.0)}), &rp);
-      tbl.Insert(txn, Row({Value(431), Value("vivid"), Value(2.03)}), &rp);
-      tbl.Insert(txn, Row({Value(100), Value("aster"), Value(1.2)}), &rp);
+      ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, "Sc1"));
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(12), Value("hello"), Value(2.3)}))
+              .GetStatus());
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(10), Value("world"), Value(4.5)}))
+              .GetStatus());
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(52), Value("ought"), Value(5.3)}))
+              .GetStatus());
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(242), Value("arise"), Value(6.0)}))
+              .GetStatus());
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(431), Value("vivid"), Value(2.03)}))
+              .GetStatus());
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(100), Value("aster"), Value(1.2)}))
+              .GetStatus());
     }
     {
-      ASSERT_SUCCESS(catalog_->CreateTable(
+      ASSERT_SUCCESS(rs_->CreateTable(
           txn, Schema("Sc2", {Column("d1", ValueType::kInt64),
                               Column("d2", ValueType::kDouble),
                               Column("d3", ValueType::kVarChar),
                               Column("d4", ValueType::kInt64)})));
       Schema sc;
-      Table tbl;
-      ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc2", &tbl));
-      RowPosition rp;
-      tbl.Insert(txn, Row({Value(52), Value(53.4), Value("ou"), Value(16)}),
-                 &rp);
-      tbl.Insert(txn, Row({Value(242), Value(6.1), Value("ai"), Value(32)}),
-                 &rp);
-      tbl.Insert(txn, Row({Value(12), Value(5.3), Value("heo"), Value(4)}),
-                 &rp);
-      tbl.Insert(txn, Row({Value(10), Value(6.5), Value("wld"), Value(8)}),
-                 &rp);
-      tbl.Insert(txn, Row({Value(33), Value(2.5), Value("vid"), Value(64)}),
-                 &rp);
-      tbl.Insert(txn, Row({Value(1), Value(7.2), Value("aer"), Value(128)}),
-                 &rp);
+      ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, "Sc2"));
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(52), Value(53.4), Value("ou"), Value(16)}))
+              .GetStatus());
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(242), Value(6.1), Value("ai"), Value(32)}))
+              .GetStatus());
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(12), Value(5.3), Value("heo"), Value(4)}))
+              .GetStatus());
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(10), Value(6.5), Value("wld"), Value(8)}))
+              .GetStatus());
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(33), Value(2.5), Value("vid"), Value(64)}))
+              .GetStatus());
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(1), Value(7.2), Value("aer"), Value(128)}))
+              .GetStatus());
     }
     {
-      ASSERT_SUCCESS(catalog_->CreateTable(
+      ASSERT_SUCCESS(rs_->CreateTable(
           txn, Schema("Sc3", {Column("e1", ValueType::kInt64),
                               Column("e2", ValueType::kDouble)})));
       Schema sc;
-      Table tbl;
-      ASSERT_SUCCESS(catalog_->GetTable(txn, "Sc2", &tbl));
-      RowPosition rp;
-      tbl.Insert(txn, Row({Value(52), Value(53.4), Value("ou"), Value(16)}),
-                 &rp);
+      ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, "Sc2"));
+      ASSERT_SUCCESS(
+          tbl.Insert(txn, Row({Value(52), Value(53.4), Value("ou"), Value(16)}))
+              .GetStatus());
     }
     ASSERT_SUCCESS(txn.PreCommit());
   }
 
   void Recover() {
-    ts_->LostAllPageForTest();
-    ts_ = std::make_unique<PageStorage>(prefix_);
-    catalog_ = std::make_unique<RelationStorage>(1, 2, ts_.get());
+    if (rs_) rs_->GetPageStorage()->LostAllPageForTest();
+    rs_ = std::make_unique<RelationStorage>(prefix_);
   }
 
   void TearDown() override {
-    catalog_.reset();
-    std::remove(ts_->DBName().c_str());
-    std::remove(ts_->LogName().c_str());
-    ts_.reset();
+    std::remove(rs_->GetPageStorage()->DBName().c_str());
+    std::remove(rs_->GetPageStorage()->LogName().c_str());
   }
 
   void DumpAll(const Plan& plan) {
     plan->Dump(std::cout, 0);
     std::cout << "\n";
-    TransactionContext ctx{ts_->Begin(), catalog_.get()};
+    TransactionContext ctx{rs_->Begin(), rs_.get()};
     Executor scan = plan->EmitExecutor(ctx);
     Row result;
     std::cout << plan->GetSchema(ctx) << "\n";
@@ -109,8 +118,7 @@ class PlanTest : public ::testing::Test {
   }
 
   std::string prefix_;
-  std::unique_ptr<PageStorage> ts_;
-  std::unique_ptr<RelationStorage> catalog_;
+  std::unique_ptr<RelationStorage> rs_;
   std::unique_ptr<TransactionContext> ctx_;
 };
 

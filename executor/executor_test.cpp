@@ -11,7 +11,6 @@
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "gtest/gtest.h"
-#include "table/fake_table.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"

@@ -16,7 +16,6 @@
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
 #include "table/table.hpp"
-#include "table/table_interface.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"

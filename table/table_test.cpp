@@ -26,14 +26,14 @@ class TableTest : public ::testing::Test {
  public:
   void SetUp() override {
     prefix_ = "table_test-" + RandomString();
-    Schema schema(kTableName, {Column("col1", ValueType::kInt64,
-                                      Constraint(Constraint::kIndex)),
-                               Column("col2", ValueType::kVarChar),
-                               Column("col3", ValueType::kDouble)});
     Recover();
     Transaction txn = rs_->Begin();
     IndexSchema idx("idx1", {0, 1});
 
+    Schema schema(kTableName, {Column("col1", ValueType::kInt64,
+                                      Constraint(Constraint::kIndex)),
+                               Column("col2", ValueType::kVarChar),
+                               Column("col3", ValueType::kDouble)});
     rs_->CreateTable(txn, schema);
     rs_->CreateIndex(txn, schema.Name(), idx);
   }
@@ -59,8 +59,7 @@ TEST_F(TableTest, Construct) {}
 
 TEST_F(TableTest, Insert) {
   Transaction txn = rs_->Begin();
-  Table tbl;
-  ASSERT_SUCCESS(rs_->GetTable(txn, kTableName, &tbl));
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
   RowPosition rp;
   Row r({Value(1), Value("fuga"), Value(3.3)});
   ASSERT_SUCCESS(tbl.Insert(txn, r).GetStatus());
@@ -69,8 +68,7 @@ TEST_F(TableTest, Insert) {
 TEST_F(TableTest, Read) {
   Transaction txn = rs_->Begin();
   Row r({Value(1), Value("string"), Value(3.3)});
-  Table tbl;
-  ASSERT_SUCCESS(rs_->GetTable(txn, kTableName, &tbl));
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
   ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl.Insert(txn, r));
   ASSIGN_OR_ASSERT_FAIL(Row, read, tbl.Read(txn, rp));
   ASSERT_EQ(read, r);
@@ -79,8 +77,7 @@ TEST_F(TableTest, Read) {
 
 TEST_F(TableTest, Update) {
   Transaction txn = rs_->Begin();
-  Table tbl;
-  ASSERT_SUCCESS(rs_->GetTable(txn, kTableName, &tbl));
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
   Row new_row({Value(1), Value("hogefuga"), Value(99e8)});
   ASSIGN_OR_ASSERT_FAIL(
       RowPosition, rp,
@@ -93,8 +90,7 @@ TEST_F(TableTest, Update) {
 
 TEST_F(TableTest, UpdateMany) {
   Transaction txn = rs_->Begin();
-  Table tbl;
-  ASSERT_SUCCESS(rs_->GetTable(txn, kTableName, &tbl));
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
   std::vector<RowPosition> rps;
   for (int i = 0; i < 30; ++i) {
     Row new_row({Value(i), Value(RandomString(20)), Value(i * 99e8)});
@@ -111,8 +107,7 @@ TEST_F(TableTest, UpdateMany) {
 
 TEST_F(TableTest, Delete) {
   Transaction txn = rs_->Begin();
-  Table tbl;
-  ASSERT_SUCCESS(rs_->GetTable(txn, kTableName, &tbl));
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
   ASSIGN_OR_ASSERT_FAIL(
       RowPosition, rp,
       tbl.Insert(txn, Row({Value(1), Value("string"), Value(3.3)})));
@@ -122,25 +117,20 @@ TEST_F(TableTest, Delete) {
 
 TEST_F(TableTest, IndexRead) {
   Transaction txn = rs_->Begin();
-  Table tbl;
-  ASSERT_SUCCESS(rs_->GetTable(txn, kTableName, &tbl));
-  ASSIGN_OR_ASSERT_FAIL(
-      RowPosition, rp1,
-      tbl.Insert(txn, Row({Value(1), Value("string"), Value(3.3)})));
-  ASSIGN_OR_ASSERT_FAIL(
-      RowPosition, rp2,
-      tbl.Insert(txn, Row({Value(2), Value("hoge"), Value(4.8)})));
-  ASSIGN_OR_ASSERT_FAIL(
-      RowPosition, rp3,
-      tbl.Insert(txn, Row({Value(3), Value("foo"), Value(1.5)})));
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
+  ASSERT_SUCCESS(tbl.Insert(txn, Row({Value(1), Value("string"), Value(3.3)}))
+                     .GetStatus());
+  ASSERT_SUCCESS(
+      tbl.Insert(txn, Row({Value(2), Value("hoge"), Value(4.8)})).GetStatus());
+  ASSERT_SUCCESS(
+      tbl.Insert(txn, Row({Value(3), Value("foo"), Value(1.5)})).GetStatus());
 
   // TODO(kumagi): do index scan.
 }
 
 TEST_F(TableTest, IndexUpdateRead) {
   Transaction txn = rs_->Begin();
-  Table tbl;
-  ASSERT_SUCCESS(rs_->GetTable(txn, kTableName, &tbl));
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
   ASSIGN_OR_ASSERT_FAIL(
       RowPosition, rp0,
       tbl.Insert(txn, Row({Value(1), Value("string"), Value(3.3)})));
@@ -159,8 +149,7 @@ TEST_F(TableTest, IndexUpdateRead) {
 
 TEST_F(TableTest, IndexUpdateDelete) {
   Transaction txn = rs_->Begin();
-  Table tbl;
-  ASSERT_SUCCESS(rs_->GetTable(txn, kTableName, &tbl));
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
   ASSIGN_OR_ASSERT_FAIL(
       RowPosition, rp1,
       tbl.Insert(txn, Row({Value(1), Value("string"), Value(3.3)})));
@@ -182,8 +171,7 @@ std::string KeyPayload(int num, int width) {
 
 TEST_F(TableTest, InsertMany) {
   Transaction txn = rs_->Begin();
-  Table tbl;
-  ASSERT_SUCCESS(rs_->GetTable(txn, kTableName, &tbl));
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
   std::unordered_set<Row> rows;
   std::unordered_set<RowPosition> rps;
   for (int i = 0; i < 1000; ++i) {
@@ -204,8 +192,7 @@ TEST_F(TableTest, InsertMany) {
 TEST_F(TableTest, UpdateHeavy) {
   constexpr int kCount = 50;
   Transaction txn = rs_->Begin();
-  Table tbl;
-  ASSERT_SUCCESS(rs_->GetTable(txn, kTableName, &tbl));
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
   std::unordered_set<Row> rows;
   std::vector<RowPosition> rps;
   rps.reserve(kCount);

@@ -61,15 +61,13 @@ void Try(uint64_t seed, bool verbose) {
       LOG(TRACE) << "Insert: " << key << " : " << value;
     }
     assert(bpt.Insert(txn, key, value) == Status::kSuccess);
-    std::string_view val;
-    assert(bpt.Read(txn, key, &val) == Status::kSuccess);
+    ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, key));
     assert(val == value);
     assert(bpt.SanityCheckForTest(&page_manager));
     kvp[key] = value;
   }
   for (const auto& kv : kvp) {
-    std::string_view val;
-    bpt.Read(txn, kv.first, &val);
+    ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, kv.first));
     assert(kvp[kv.first] == val);
   }
   for (uint32_t i = 0; i < count * 4; ++i) {
@@ -87,15 +85,10 @@ void Try(uint64_t seed, bool verbose) {
     kvp.erase(iter);
 
     for (const auto& kv : kvp) {
-      std::string_view val;
-      Status s = bpt.Read(txn, kv.first, &val);
-      if (s != Status::kSuccess) {
-        LOG(ERROR) << s;
-      }
+      ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, kv.first));
       if (kvp[kv.first] != val) {
         LOG(ERROR) << kvp[kv.first] << " vs " << val;
       }
-      assert(s == Status::kSuccess);
       assert(kvp[kv.first] == val);
     }
 
@@ -112,22 +105,16 @@ void Try(uint64_t seed, bool verbose) {
     }
     kvp[key] = value;
     for (const auto& kv : kvp) {
-      std::string_view val;
-      Status s = bpt.Read(txn, kv.first, &val);
-      if (s != Status::kSuccess) {
-        LOG(ERROR) << s;
-      }
+      ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, kv.first));
       if (kvp[kv.first] != val) {
         LOG(ERROR) << "Key: " << kv.first;
         LOG(ERROR) << kvp[kv.first] << " vs " << val;
       }
-      assert(s == Status::kSuccess);
       assert(kvp[kv.first] == val);
     }
   }
   for (const auto& kv : kvp) {
-    std::string_view val;
-    assert(bpt.Read(txn, kv.first, &val) == Status::kSuccess);
+    ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, kv.first));
     assert(kvp[kv.first] == val);
     assert(bpt.Delete(txn, kv.first) == Status::kSuccess);
   }

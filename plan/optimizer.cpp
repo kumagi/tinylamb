@@ -221,12 +221,9 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
     ExtractTouchedColumns(sel.expression, touched_columns);
   }
   for (const auto& from : query.from_) {
-    Table tbl;
-    ctx.c_->GetTable(ctx.txn_, from, &tbl);
-
-    // Get statistics.
-    TableStatistics stats(tbl.GetSchema());
-    ctx.c_->GetStatistics(ctx.txn_, from, &stats);
+    ASSIGN_OR_RETURN(Table, tbl, ctx.c_->GetTable(ctx.txn_, from));
+    ASSIGN_OR_RETURN(TableStatistics, stats,
+                     ctx.c_->GetStatistics(ctx.txn_, from));
 
     // Push down all selection & projection.
     std::vector<NamedExpression> project_target;

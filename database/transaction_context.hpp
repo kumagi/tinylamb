@@ -5,6 +5,7 @@
 #ifndef TINYLAMB_TRANSACTION_CONTEXT_HPP
 #define TINYLAMB_TRANSACTION_CONTEXT_HPP
 
+#include "table/table.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
 
@@ -25,11 +26,14 @@ class TransactionContext {
     c_ = o.c_;
     return *this;
   }
+  Table* GetTable(std::string_view table_name);
+
   Status PreCommit() { return txn_.PreCommit(); }
   void Abort() { txn_.Abort(); }
 
   Transaction txn_;
   RelationStorage* c_;
+  std::unordered_map<std::string, Table> tables_;
 };
 
 }  // namespace tinylamb

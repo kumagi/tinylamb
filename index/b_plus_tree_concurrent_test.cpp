@@ -115,8 +115,8 @@ TEST_F(BPlusTreeConcurrentTest, InsertInsert) {
     auto txn = tm_->Begin();
     for (const auto& rows_per_thread : rows) {
       for (const auto& row : rows_per_thread) {
-        std::string_view value;
-        ASSERT_SUCCESS(bpt_->Read(txn, row.first, &value));
+        ASSIGN_OR_ASSERT_FAIL(std::string_view, value,
+                              bpt_->Read(txn, row.first));
         ASSERT_EQ(value, row.second);
       }
     }

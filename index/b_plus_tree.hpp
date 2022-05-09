@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "page/page_ref.hpp"
 
 namespace tinylamb {
@@ -26,7 +27,7 @@ class BPlusTree {
   Status Insert(Transaction& txn, std::string_view key, std::string_view value);
   Status Update(Transaction& txn, std::string_view key, std::string_view value);
   Status Delete(Transaction& txn, std::string_view key);
-  Status Read(Transaction& txn, std::string_view key, std::string_view* dst);
+  StatusOr<std::string_view> Read(Transaction& txn, std::string_view key);
   void Dump(Transaction& txn, std::ostream& o, int indent = 0) const;
   [[nodiscard]] page_id_t Root() const { return root_; }
   BPlusTreeIterator Begin(Transaction& txn, std::string_view left = "",
@@ -52,7 +53,6 @@ class BPlusTree {
                   int indent = 0) const;
 
   page_id_t root_;
-  std::mutex latch_;
 };
 
 }  // namespace tinylamb

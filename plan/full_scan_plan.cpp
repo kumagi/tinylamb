@@ -14,24 +14,13 @@ namespace tinylamb {
 FullScanPlan::FullScanPlan(std::string_view table_name, TableStatistics ts)
     : table_name_(table_name), stats_(std::move(ts)) {}
 
-std::unique_ptr<Table> GetTable(const std::string& table_name,
-                                TransactionContext& ctx) {
-  std::unique_ptr<Table> tbl = std::make_unique<Table>();
-  Status s = ctx.c_->GetTable(ctx.txn_, table_name, tbl.get());
-  if (s != Status::kSuccess) {
-    LOG(FATAL) << "Table: " << table_name << " not found.";
-    abort();
-  }
-  return tbl;
-}
-
 Executor FullScanPlan::EmitExecutor(TransactionContext& ctx) const {
-  Table* tbl = GetTable(table_name_, ctx);
-  return std::make_shared<FullScan>(ctx.txn_, std::move(tbl));
+  return std::make_shared<FullScan>(ctx.txn_, ctx.GetTable(table_name_));
 }
 
 Schema FullScanPlan::GetSchema(TransactionContext& ctx) const {
-  return GetTable(table_name_, ctx)->GetSchema();
+  StatusOr<Table> tbl = ctx.c_->GetTable(ctx.txn_, table_name_);
+  return tbl.Value().schema_;
 }
 
 size_t FullScanPlan::AccessRowCount(TransactionContext&) const {

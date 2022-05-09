@@ -50,12 +50,10 @@ void Try(uint64_t seed, bool verbose) {
   {
     for (size_t i = 0; i < kRows; ++i) {
       auto txn = db.Begin();
-      Table table;
-      db.GetTable(txn, "FuzzerTable", &table);
+      ASSIGN_OR_CRASH(Table, table, db.GetTable(txn, "FuzzerTable"));
       Row new_row({Value((int)i), Value(RandomString(rand() % 300 + 10)),
                    Value((double)(rand() % 1000))});
-      RowPosition rp;
-      table.Insert(txn, new_row, &rp);
+      ASSIGN_OR_CRASH(RowPosition, rp, table.Insert(txn, new_row));
       if (verbose) {
         LOG(DEBUG) << "Insert: " << new_row;
       }
@@ -68,8 +66,7 @@ void Try(uint64_t seed, bool verbose) {
   }
   for (size_t i = 0; i < kRows * 30; ++i) {
     auto txn = db.Begin();
-    Table table;
-    db.GetTable(txn, "FuzzerTable", &table);
+    ASSIGN_OR_CRASH(Table, table, db.GetTable(txn, "FuzzerTable"));
     auto iter = rows.begin();
     size_t offset = rand() % rows.size();
     std::advance(iter, offset);
@@ -85,11 +82,7 @@ void Try(uint64_t seed, bool verbose) {
     rows.erase(iter);
 
     for (const auto& row : rows) {
-      Row read_row;
-      Status s = table.Read(txn, row.first, &read_row);
-      if (s != Status::kSuccess) {
-        LOG(ERROR) << s;
-      }
+      ASSIGN_OR_CRASH(Row, read_row, table.Read(txn, row.first));
       if (row.second != read_row) {
         LOG(ERROR) << row.second << " vs " << read_row;
       }
@@ -102,15 +95,10 @@ void Try(uint64_t seed, bool verbose) {
     if (verbose) {
       LOG(TRACE) << "Insert: " << new_row;
     }
-    RowPosition rp;
-    assert(table.Insert(txn, new_row, &rp));
+    ASSIGN_OR_CRASH(RowPosition, rp, table.Insert(txn, new_row));
     rows[rp] = new_row;
     for (const auto& row : rows) {
-      Row read_row;
-      s = table.Read(txn, row.first, &read_row);
-      if (s != Status::kSuccess) {
-        LOG(ERROR) << s;
-      }
+      ASSIGN_OR_CRASH(Row, read_row, table.Read(txn, row.first));
       if (row.second != read_row) {
         LOG(ERROR) << "Row: " << i;
         LOG(ERROR) << row.second << " vs " << read_row;
@@ -123,10 +111,8 @@ void Try(uint64_t seed, bool verbose) {
 
   for (const auto& row : rows) {
     auto txn = db.Begin();
-    Table table;
-    db.GetTable(txn, "FuzzerTable", &table);
-    Row read_row;
-    assert(table.Read(txn, row.first, &read_row) == Status::kSuccess);
+    ASSIGN_OR_CRASH(Table, table, db.GetTable(txn, "FuzzerTable"));
+    ASSIGN_OR_CRASH(Row, read_row, table.Read(txn, row.first));
     assert(row.second == read_row);
     Status s = table.Delete(txn, row.first);
     if (s != Status::kSuccess) {
