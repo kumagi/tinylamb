@@ -52,7 +52,7 @@ class Table {
   friend Encoder& operator<<(Encoder& e, const Table& t);
   friend Decoder& operator>>(Decoder& d, Table& t);
 
- private:
+ public:
   friend class RelationStorage;
   friend class FullScanIterator;
   friend class IndexScanIterator;

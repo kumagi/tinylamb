@@ -57,9 +57,11 @@ class RowPageTest : public ::testing::Test {
     EXPECT_FALSE(page.IsNull());
     EXPECT_EQ(page->Type(), PageType::kRowPage);
     const bin_size_t before_size = rp.FreeSizeForTest();
-    ASSIGN_OR_CRASH(slot_t, slot, page->Insert(txn, str));
-    EXPECT_EQ(rp.FreeSizeForTest(),
-              before_size - str.size() - sizeof(RowPage::RowPointer));
+    Status insert_result = page->Insert(txn, str).GetStatus();
+    if (insert_result == Status::kSuccess) {
+      EXPECT_EQ(rp.FreeSizeForTest(),
+                before_size - str.size() - sizeof(RowPage::RowPointer));
+    }
     if (commit) {
       EXPECT_SUCCESS(txn.PreCommit());
     } else {
@@ -67,7 +69,7 @@ class RowPageTest : public ::testing::Test {
       txn.Abort();
     }
     txn.CommitWait();
-    return true;
+    return insert_result == Status::kSuccess;
   }
 
   void UpdateRow(int slot, std::string_view str, bool commit = true) {

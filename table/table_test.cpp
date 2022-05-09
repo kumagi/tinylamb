@@ -28,14 +28,14 @@ class TableTest : public ::testing::Test {
     prefix_ = "table_test-" + RandomString();
     Recover();
     Transaction txn = rs_->Begin();
-    IndexSchema idx("idx1", {0, 1});
-
     Schema schema(kTableName, {Column("col1", ValueType::kInt64,
                                       Constraint(Constraint::kIndex)),
                                Column("col2", ValueType::kVarChar),
                                Column("col3", ValueType::kDouble)});
     rs_->CreateTable(txn, schema);
+    IndexSchema idx("idx1", {0, 1});
     rs_->CreateIndex(txn, schema.Name(), idx);
+    ASSERT_SUCCESS(txn.PreCommit());
   }
 
   void Recover() {
@@ -72,7 +72,6 @@ TEST_F(TableTest, Read) {
   ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl.Insert(txn, r));
   ASSIGN_OR_ASSERT_FAIL(Row, read, tbl.Read(txn, rp));
   ASSERT_EQ(read, r);
-  LOG(INFO) << read;
 }
 
 TEST_F(TableTest, Update) {
@@ -85,7 +84,6 @@ TEST_F(TableTest, Update) {
   ASSIGN_OR_ASSERT_FAIL(RowPosition, new_rp, tbl.Update(txn, rp, new_row));
   ASSIGN_OR_ASSERT_FAIL(Row, read, tbl.Read(txn, rp));
   ASSERT_EQ(read, new_row);
-  LOG(INFO) << read;
 }
 
 TEST_F(TableTest, UpdateMany) {

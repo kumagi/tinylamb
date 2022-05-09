@@ -256,9 +256,7 @@ TEST_F(BPlusTreeTest, Delete) {
     std::string long_value(2000, 'v');
     for (int i = 0; i < 50; ++i) {
       if (i % 2 == 0) {
-        ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
-                              bpt_->Read(txn, KeyGen(i, 10000)));
-        ASSERT_EQ(val, "");
+        ASSERT_FAIL(bpt_->Read(txn, KeyGen(i, 10000)).GetStatus());
       } else {
         ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
                               bpt_->Read(txn, KeyGen(i, 10000)));

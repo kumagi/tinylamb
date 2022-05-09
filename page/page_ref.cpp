@@ -28,7 +28,7 @@ FreePage& PageRef::GetFreePage() {
 }
 
 PageRef::~PageRef() {
-  if (page_) {
+  if (page_ != nullptr) {
     if (page_lock_.owns_lock()) {
       page_lock_.unlock();
       pool_->Unpin(page_->PageID());

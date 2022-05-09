@@ -14,25 +14,16 @@
 
 namespace tinylamb {
 
-constexpr int kTableRoot = 1;
-constexpr int kStatsRoot = 2;
+constexpr int kDefaultTableRoot = 1;
+constexpr int kDefaultStatisticsRoot = 2;
 
 RelationStorage::RelationStorage(std::string_view dbname)
-    : catalog_(kTableRoot), statistics_(kStatsRoot), storage_(dbname) {
+    : catalog_(kDefaultTableRoot),
+      statistics_(kDefaultStatisticsRoot),
+      storage_(dbname) {
   auto txn = Begin();
-  {
-    PageRef tables_root = storage_.pm_.GetPool()->GetPage(kTableRoot);
-    if (!tables_root.IsValid() || tables_root->Type() != PageType::kLeafPage) {
-      LOG(FATAL) << "invalid table root: " << tables_root->Type();
-      tables_root->PageInit(kTableRoot, PageType::kLeafPage);
-    }
-  }
-  {
-    PageRef stats_root = storage_.pm_.GetPool()->GetPage(kStatsRoot);
-    if (!stats_root.IsValid() || stats_root->Type() != PageType::kLeafPage) {
-      stats_root->PageInit(kTableRoot, PageType::kLeafPage);
-    }
-  }
+  catalog_ = BPlusTree(txn, kDefaultTableRoot);
+  statistics_ = BPlusTree(txn, kDefaultStatisticsRoot);
   if (txn.PreCommit() != Status::kSuccess) {
     LOG(FATAL) << "Failed to initialize relations";
     exit(1);
@@ -72,7 +63,8 @@ Status RelationStorage::CreateIndex(Transaction& txn,
                                     std::string_view schema_name,
                                     const IndexSchema& idx) {
   ASSIGN_OR_RETURN(Table, tbl, GetTable(txn, schema_name));
-  return tbl.CreateIndex(txn, idx);
+  RETURN_IF_FAIL(tbl.CreateIndex(txn, idx));
+  return catalog_.Update(txn, schema_name, Serialize(tbl));
 }
 
 StatusOr<Table> RelationStorage::GetTable(Transaction& txn,

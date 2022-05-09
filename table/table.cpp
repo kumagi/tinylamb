@@ -26,7 +26,6 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
     new_bpt.Insert(txn, current.Extract(idx.key_).EncodeMemcomparableFormat(),
                    it.Position().Serialize());
   }
-  LOG(FATAL) << "leaf is " << root_page->PageID();
   return Status::kSuccess;
 }
 
@@ -51,7 +50,7 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
     last_pid_ = new_page->PageID();
   }
   ref.PageUnlock();
-  for (auto& idx : indices_) {
+  for (const auto& idx : indices_) {
     BPlusTree bpt(idx.pid_);
     RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(row), rp.Serialize()));
   }

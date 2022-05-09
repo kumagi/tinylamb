@@ -80,8 +80,7 @@ TEST_F(LeafPageTest, InsertLeaf) {
   ASSERT_EQ(out1, "world");
 
   // We cannot read wrong key.
-  ASSIGN_OR_ASSERT_FAIL(std::string_view, out2, page->Read(txn, "foo"));
-  ASSERT_NE(out2, "world");
+  ASSERT_FAIL(page->Read(txn, "foo").GetStatus());
 }
 
 TEST_F(LeafPageTest, InsertMany) {

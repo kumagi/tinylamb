@@ -23,7 +23,8 @@ class PageRef;
  */
 class BPlusTree {
  public:
-  explicit BPlusTree(page_id_t root);
+  BPlusTree(Transaction& txn, page_id_t default_root);
+  explicit BPlusTree(page_id_t given_root);
   Status Insert(Transaction& txn, std::string_view key, std::string_view value);
   Status Update(Transaction& txn, std::string_view key, std::string_view value);
   Status Delete(Transaction& txn, std::string_view key);

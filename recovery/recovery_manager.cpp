@@ -270,7 +270,6 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
       if (!success) {
         throw std::runtime_error("Invalid log: " + std::to_string(offset));
       }
-
       LOG(TRACE) << "analyzing: " << offset << ": " << log
                  << "  to: " << offset + log.Size();
       switch (log.type) {

@@ -12,7 +12,17 @@
 
 namespace tinylamb {
 
-BPlusTree::BPlusTree(page_id_t root) : root_(root) {}
+BPlusTree::BPlusTree(Transaction& txn, page_id_t default_root)
+    : root_(default_root) {
+  PageRef root = txn.PageManager()->GetPage(default_root);
+  if (!root.IsValid()) {
+    PageRef new_root =
+        txn.PageManager()->AllocateNewPage(txn, PageType::kLeafPage);
+    root_ = new_root->PageID();
+  }
+}
+
+BPlusTree::BPlusTree(page_id_t given_root) : root_(given_root) {}
 
 PageRef BPlusTree::FindLeafForInsert(Transaction& txn, std::string_view key,
                                      PageRef&& page,
