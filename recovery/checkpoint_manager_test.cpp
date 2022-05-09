@@ -59,10 +59,9 @@ TEST_F(CheckpointTest, Construct) {}
 TEST_F(CheckpointTest, DoCheckpoint) {
   InsertRow("expect this operation did not rerun");
   Transaction txn = tm_->Begin();
-  slot_t slot;
   {
     PageRef page = p_->GetPage(page_id_);
-    page->Insert(txn, "inserted", &slot);
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(txn, "inserted"));
     p_->GetPool()->FlushPageForTest(page_id_);
     cm_->WriteCheckpoint();
     page->Update(txn, slot, "expect to be redone");
@@ -75,18 +74,19 @@ TEST_F(CheckpointTest, DoCheckpoint) {
 TEST_F(CheckpointTest, CheckpointRecovery) {
   InsertRow("expect this operation did not rerun");
   Transaction txn = tm_->Begin();
-  slot_t inserted;
   lsn_t restart_point;
+  slot_t result;
   {
     PageRef page = p_->GetPage(page_id_);
-    page->Insert(txn, "inserted", &inserted);
+    ASSIGN_OR_ASSERT_FAIL(slot_t, inserted, page->Insert(txn, "inserted"));
     restart_point = cm_->WriteCheckpoint();
     page->Update(txn, inserted, "expect to be redone");
     txn.PreCommit();
+    result = inserted;
   }
   Recover();
   r_->RecoverFrom(restart_point, tm_.get());
-  EXPECT_EQ(ReadRow(inserted), "expect to be redone");
+  EXPECT_EQ(ReadRow(result), "expect to be redone");
 }
 
 TEST_F(CheckpointTest, CheckpointAbortRecovery) {
@@ -98,8 +98,7 @@ TEST_F(CheckpointTest, CheckpointAbortRecovery) {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint();
     page->Update(txn, slot, "aborted");
-    slot_t will_be_deleted_row;
-    page->Insert(txn, "will be deleted", &will_be_deleted_row);
+    ASSIGN_OR_ASSERT_FAIL(slot_t, will_be_deleted_row, page->Insert(txn, "will be deleted"));
   }
   // Note that the txn is not committed.
   Recover();
@@ -117,8 +116,7 @@ TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint([&]() {
       page->Update(txn, slot, "aborted");
-      slot_t will_be_deleted_row;
-      page->Insert(txn, "will be deleted", &will_be_deleted_row);
+      ASSIGN_OR_ASSERT_FAIL(slot_t, will_be_deleted_row, page->Insert(txn, "will be deleted"));
     });
   }
   // Note that the txn is not committed.

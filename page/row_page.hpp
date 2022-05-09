@@ -6,6 +6,7 @@
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
+#include "common/status_or.hpp"
 
 namespace tinylamb {
 
@@ -40,11 +41,9 @@ class RowPage {
     // memset(data_, 0, kBodySize);
   }
 
-  Status Read(page_id_t page_id, Transaction& txn, slot_t slot,
-              std::string_view* dst) const;
+  StatusOr<std::string_view> Read(page_id_t page_id, Transaction& txn, slot_t slot) const;
 
-  Status Insert(page_id_t page_id, Transaction& txn, std::string_view record,
-                slot_t* dst);
+  StatusOr<slot_t> Insert(page_id_t page_id, Transaction& txn, std::string_view record);
 
   Status Update(page_id_t page_id, Transaction& txn, slot_t slot,
                 std::string_view record);

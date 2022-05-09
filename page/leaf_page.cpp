@@ -82,11 +82,7 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
 Status LeafPage::Update(page_id_t page_id, Transaction& txn,
                         std::string_view key, std::string_view value) {
   const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
-
-  std::string_view old_value;
-  if (Read(page_id, txn, key, &old_value) == Status::kNotExists) {
-    return Status::kNotExists;
-  }
+  ASSIGN_OR_RETURN(std::string_view, old_value, Read(page_id, txn, key));
   const bin_size_t old_size = SerializeSize(key) + SerializeSize(old_value);
   if (old_size < physical_size && free_size_ < physical_size - old_size) {
     return Status::kNoSpace;
@@ -123,10 +119,7 @@ void LeafPage::UpdateImpl(std::string_view key, std::string_view redo) {
 
 Status LeafPage::Delete(page_id_t page_id, Transaction& txn,
                         std::string_view key) {
-  std::string_view existing_value;
-  if (Read(page_id, txn, key, &existing_value) == Status::kNotExists) {
-    return Status::kNotExists;
-  }
+  ASSIGN_OR_RETURN(std::string_view, existing_value, Read(page_id, txn, key));
 
   txn.DeleteLeafLog(page_id, key, existing_value);
   DeleteImpl(key);
@@ -143,44 +136,33 @@ void LeafPage::DeleteImpl(std::string_view key) {
   --row_count_;
 }
 
-Status LeafPage::Read(page_id_t, Transaction&, slot_t slot,
-                      std::string_view* result) const {
+StatusOr<std::string_view> LeafPage::Read(page_id_t, Transaction&, slot_t slot) const {
   if (row_count_ <= slot) return Status::kNotExists;
-  *result = GetValue(slot);
-  return Status::kSuccess;
+  return GetValue(slot);
 }
 
-Status LeafPage::ReadKey(page_id_t, Transaction&, slot_t slot,
-                         std::string_view* result) const {
+StatusOr<std::string_view> LeafPage::ReadKey(page_id_t, Transaction&, slot_t slot) const {
   if (row_count_ <= slot) return Status::kNotExists;
-  *result = GetKey(slot);
-  return Status::kSuccess;
+  return GetKey(slot);
 }
 
-Status LeafPage::Read(page_id_t, Transaction&, std::string_view key,
-                      std::string_view* result = nullptr) const {
-  if (result) *result = std::string_view();
+StatusOr<std::string_view> LeafPage::Read(page_id_t, Transaction&, std::string_view key) const {
   size_t pos = Find(key);
   if (pos < row_count_ && GetKey(pos) == key) {
-    if (result) *result = GetValue(pos);
-    return Status::kSuccess;
+    return GetValue(pos);
   } else {
     return Status::kNotExists;
   }
 }
 
-Status LeafPage::LowestKey(Transaction&, std::string_view* result) const {
-  *result = std::string_view();
+StatusOr<std::string_view> LeafPage::LowestKey(Transaction&) const {
   if (row_count_ == 0) return Status::kNotExists;
-  *result = GetKey(0);
-  return Status::kSuccess;
+  return GetKey(0);
 }
 
-Status LeafPage::HighestKey(Transaction&, std::string_view* result) const {
-  *result = std::string_view();
+StatusOr<std::string_view> LeafPage::HighestKey(Transaction&) const {
   if (row_count_ == 0) return Status::kNotExists;
-  *result = GetKey(row_count_ - 1);
-  return Status::kSuccess;
+  return GetKey(row_count_ - 1);
 }
 
 slot_t LeafPage::RowCount() const { return row_count_; }

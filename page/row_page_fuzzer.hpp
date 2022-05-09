@@ -81,9 +81,8 @@ class Operation {
         slot_t slot;
         if (input.size() < sizeof(slot)) return 1 + input.size();
         memcpy(&slot, input.data(), sizeof(slot_t));
-        std::string_view dst;
         if (verbose) LOG(TRACE) << "Read: " << slot;
-        page_->Read(txn_, slot, &dst);
+        page_->Read(txn_, slot);
         return 1 + sizeof(slot);
       }
       case 1: {  // InsertBranch
@@ -93,9 +92,8 @@ class Operation {
         input.remove_prefix(sizeof(size));
         size = std::min(size, (bin_size_t)input.size());
         std::string_view str(input.data(), size);
-        slot_t slot;
         if (verbose) LOG(TRACE) << "InsertBranch: " << str;
-        page_->Insert(txn_, str, &slot);
+        page_->Insert(txn_, str);
         return 1 + sizeof(size) + size;
       }
       case 2: {  // UpdateBranch

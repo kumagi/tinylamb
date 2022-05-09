@@ -156,8 +156,7 @@ Status BPlusTree::Insert(Transaction& txn, std::string_view key,
       s = target->InsertLeaf(txn, key, value);
     }
     assert(s == Status::kSuccess);
-    std::string_view middle_key;
-    new_page->LowestKey(txn, &middle_key);
+    ASSIGN_OR_RETURN(std::string_view, middle_key, new_page->LowestKey(txn));
     new_page.PageUnlock();
     return InsertBranch(txn, middle_key, new_page->PageID(), parents);
   }
@@ -186,8 +185,7 @@ Status BPlusTree::Update(Transaction& txn, std::string_view key,
       s = leaf->InsertLeaf(txn, key, value);
       STATUS(s, "BPT, target");
     }
-    std::string_view middle_key;
-    new_page->LowestKey(txn, &middle_key);
+    ASSIGN_OR_RETURN(std::string_view, middle_key, new_page->LowestKey(txn));
     new_page.PageUnlock();
     leaf.PageUnlock();
     return InsertBranch(txn, middle_key, new_page->PageID(), parents);
@@ -312,11 +310,8 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
 
 StatusOr<std::string_view> BPlusTree::Read(Transaction& txn,
                                            std::string_view key) {
-  std::string_view result;
   PageRef leaf = FindLeaf(txn, key, txn.PageManager()->GetPage(root_));
-  RETURN_IF_FAIL(leaf->Read(txn, key, &result));
-  LOG(ERROR) << leaf->PageID();
-  return result;
+  return leaf->Read(txn, key);
 }
 
 BPlusTreeIterator BPlusTree::Begin(Transaction& txn, std::string_view left,
@@ -356,10 +351,8 @@ void DumpLeafPage(Transaction& txn, PageRef&& page, std::ostream& o,
     if (0 < i) {
       o << Indent(indent);
     }
-    std::string_view key;
-    page->ReadKey(txn, i, &key);
-    std::string_view value;
-    page->Read(txn, i, &value);
+    ASSIGN_OR_CRASH(std::string_view, key, page->ReadKey(txn, i));
+    ASSIGN_OR_CRASH(std::string_view, value, page->Read(txn, i));
     o << OmittedString(key, 80) << ": " << OmittedString(value, 30) << "\n";
   }
 }
@@ -379,8 +372,7 @@ void BPlusTree::DumpBranch(Transaction& txn, std::ostream& o, PageRef&& page,
       return;
     }
     for (slot_t i = 0; i < page->RowCount(); ++i) {
-      std::string_view key;
-      page->ReadKey(txn, i, &key);
+      ASSIGN_OR_CRASH(std::string_view, key, page->ReadKey(txn, i));
       o << Indent(indent) << "B[" << page->PageID()
         << "]: " << OmittedString(key, 20) << "\n";
       page_id_t pid;

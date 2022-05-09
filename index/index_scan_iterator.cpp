@@ -24,8 +24,7 @@ IndexScanIterator::IndexScanIterator(Table* table, std::string_view index_name,
   rp.Deserialize(pos.data());
   txn_->AddReadSet(rp);
   PageRef page = txn->PageManager()->GetPage(rp.page_id);
-  std::string_view row;
-  page->Read(*txn, rp.slot, &row);
+  ASSIGN_OR_CRASH(std::string_view, row, page->Read(*txn, rp.slot));
   current_row_.Deserialize(row.data(), table_->schema_);
 }
 
@@ -55,8 +54,7 @@ void IndexScanIterator::ResolveCurrentRow() {
     return;
   }
   txn_->AddReadSet(rp);
-  std::string_view row;
-  ref->Read(*txn_, rp.slot, &row);
+  ASSIGN_OR_CRASH(std::string_view, row, ref->Read(*txn_, rp.slot));
   current_row_.Deserialize(row.data(), table_->schema_);
 }
 

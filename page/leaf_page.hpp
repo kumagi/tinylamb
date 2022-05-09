@@ -9,6 +9,7 @@
 #include <string_view>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 
 namespace tinylamb {
 
@@ -43,17 +44,14 @@ class LeafPage {
   Status Update(page_id_t page_id, Transaction& txn, std::string_view key,
                 std::string_view value);
   Status Delete(page_id_t page_id, Transaction& txn, std::string_view key);
-  Status Read(page_id_t pid, Transaction& txn, slot_t slot,
-              std::string_view* result) const;
-  Status ReadKey(page_id_t pid, Transaction& txn, slot_t slot,
-                 std::string_view* result) const;
-  Status Read(page_id_t pid, Transaction& txn, std::string_view key,
-              std::string_view* result) const;
+  StatusOr<std::string_view> Read(page_id_t pid, Transaction& txn, slot_t slot) const;
+  StatusOr<std::string_view> ReadKey(page_id_t pid, Transaction& txn, slot_t slot) const;
+  StatusOr<std::string_view> Read(page_id_t pid, Transaction& txn, std::string_view key) const;
 
   [[nodiscard]] std::string_view GetKey(size_t idx) const;
   [[nodiscard]] std::string_view GetValue(size_t idx) const;
-  Status LowestKey(Transaction& txn, std::string_view* result) const;
-  Status HighestKey(Transaction& txn, std::string_view* result) const;
+  StatusOr<std::string_view> LowestKey(Transaction& txn) const;
+  StatusOr<std::string_view> HighestKey(Transaction& txn) const;
   [[nodiscard]] slot_t RowCount() const;
   Status SetPrevNext(page_id_t pid, Transaction& txn, page_id_t prev,
                      page_id_t next);

@@ -34,17 +34,18 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
   PageRef ref = txn.PageManager()->GetPage(last_pid_);
   std::string serialized_row(row.Size(), ' ');
   row.Serialize(serialized_row.data());
-  slot_t pos;
-  Status s = ref->Insert(txn, serialized_row, &pos);
+  StatusOr<slot_t> pos = ref->Insert(txn, serialized_row);
   RowPosition rp;
-  rp.page_id = ref->page_id;
-  rp.slot = pos;
-  if (s == Status::kNoSpace) {
+  if (pos.HasValue()) {
+    rp.page_id = ref->page_id;
+    rp.slot = pos.Value();
+  }
+  if (pos.GetStatus() == Status::kNoSpace) {
     PageRef new_page =
         txn.PageManager()->AllocateNewPage(txn, PageType::kRowPage);
-    RETURN_IF_FAIL(new_page->Insert(txn, serialized_row, &pos));
+    ASSIGN_OR_RETURN(slot_t, new_pos, new_page->Insert(txn, serialized_row));
     rp.page_id = new_page->PageID();
-    rp.slot = pos;
+    rp.slot = new_pos;
     ref->body.row_page.next_page_id_ = new_page->PageID();
     new_page->body.row_page.prev_page_id_ = ref->PageID();
     last_pid_ = new_page->PageID();
@@ -77,8 +78,8 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     page.PageUnlock();
     PageRef new_page =
         txn.PageManager()->AllocateNewPage(txn, PageType::kRowPage);
-    RowPosition new_row_pos(new_page->PageID(), -1);
-    RETURN_IF_FAIL(new_page->Insert(txn, serialized_row, &new_row_pos.slot));
+    ASSIGN_OR_RETURN(slot_t, new_slot, new_page->Insert(txn, serialized_row));
+    RowPosition new_row_pos(new_page->PageID(), new_slot);
     {
       PageRef last_page = txn.PageManager()->GetPage(last_pid_);
       last_page->body.row_page.next_page_id_ = new_page->PageID();
@@ -107,9 +108,9 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
 }
 
 StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
-  std::string_view read_row;
-  RETURN_IF_FAIL(
-      txn.PageManager()->GetPage(pos.page_id)->Read(txn, pos.slot, &read_row));
+  ASSIGN_OR_RETURN(
+      std::string_view, read_row,
+      txn.PageManager()->GetPage(pos.page_id)->Read(txn, pos.slot));
   Row result;
   result.Deserialize(read_row.data(), schema_);
   return result;

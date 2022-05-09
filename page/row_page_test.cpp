@@ -104,11 +104,11 @@ TEST_F(RowPageTest, DeleteMany) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(page_id_);
   for (size_t i = 0; i < kRows; ++i) {
-    std::string_view got_row;
+
     if (i % 2 == 0) {
-      ASSERT_EQ(Status::kNotExists, page->Read(txn, i, &got_row));
+      ASSERT_EQ(Status::kNotExists, page->Read(txn, i).GetStatus());
     } else {
-      ASSERT_EQ(Status::kSuccess, page->Read(txn, i, &got_row));
+      ASSIGN_OR_ASSERT_FAIL(std::string_view, got_row, page->Read(txn, i));
       ASSERT_NE(inserted.find(std::string(got_row)), inserted.end());
       inserted.erase(std::string(got_row));
     }
@@ -119,8 +119,7 @@ TEST_F(RowPageTest, DeleteMany) {
 TEST_F(RowPageTest, InsertZeroLenAbort) {
   auto txn = tm_->Begin();
   PageRef ref = p_->GetPage(page_id_);
-  slot_t s;
-  ref->Insert(txn, "", &s);
+  ASSIGN_OR_ASSERT_FAIL(slot_t, s, ref->Insert(txn, ""));
   ref.PageUnlock();
   txn.Abort();
 }
@@ -163,20 +162,17 @@ TEST_F(RowPageTest, InsertTwoThreads) {
   {  // txn1
     PageRef ref = p_->GetPage(page_id_);
     std::string message = "message1";
-    slot_t slot;
-    ASSERT_SUCCESS(ref->Insert(txn1, message, &slot));
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot,ref->Insert(txn1, message));
   }
   {
     PageRef ref = p_->GetPage(page_id_);
     std::string message = "message2";
-    slot_t slot;
-    ASSERT_SUCCESS(ref->Insert(txn2, message, &slot));
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn2, message));
   }
   {
     PageRef ref = p_->GetPage(page_id_);
     std::string message = "message1-again";
-    slot_t slot;
-    ASSERT_SUCCESS(ref->Insert(txn1, message, &slot));
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn1, message));
   }
   ASSERT_SUCCESS(txn1.PreCommit());
   ASSERT_SUCCESS(txn2.PreCommit());
@@ -191,8 +187,7 @@ TEST_F(RowPageTest, UpdateHeavy) {
   PageRef ref = p_->GetPage(page_id_);
   for (int i = 0; i < kCount; ++i) {
     std::string key = RandomString((19937 * i) % 120 + 100);
-    slot_t slot;
-    ASSERT_SUCCESS(ref->Insert(txn, key, &slot));
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn, key));
     slots.push_back(slot);
     rows[i] = key;
   }
@@ -204,8 +199,7 @@ TEST_F(RowPageTest, UpdateHeavy) {
     rows[slot] = key;
   }
   for (int i = 0; i < kCount; ++i) {
-    std::string_view row;
-    ASSERT_SUCCESS(ref->Read(txn, i, &row));
+    ASSIGN_OR_ASSERT_FAIL(std::string_view, row, ref->Read(txn, i));
     ASSERT_EQ(rows[i], row);
   }
 }
@@ -219,8 +213,7 @@ TEST_F(RowPageTest, UpdateAndDeleteHeavy) {
   PageRef ref = p_->GetPage(page_id_);
   for (int i = 0; i < kCount; ++i) {
     std::string key = RandomString((19937 * i) % 120 + 100);
-    slot_t slot;
-    ASSERT_SUCCESS(ref->Insert(txn, key, &slot));
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn, key));
     slots.push_back(slot);
     rows[i] = key;
   }
@@ -232,14 +225,12 @@ TEST_F(RowPageTest, UpdateAndDeleteHeavy) {
       ASSERT_SUCCESS(ref->Update(txn, slot, key));
     } else {
       ASSERT_SUCCESS(ref->Delete(txn, slot));
-      slot_t s;
-      ASSERT_SUCCESS(ref->Insert(txn, key, &s));
+      ASSIGN_OR_ASSERT_FAIL(slot_t, s, ref->Insert(txn, key));
     }
     rows[slot] = key;
   }
   for (int i = 0; i < kCount; ++i) {
-    std::string_view row;
-    ASSERT_SUCCESS(ref->Read(txn, i, &row));
+    ASSIGN_OR_ASSERT_FAIL(std::string_view, row, ref->Read(txn, i));
     ASSERT_EQ(rows[i], row);
   }
 }

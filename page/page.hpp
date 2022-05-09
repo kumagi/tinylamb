@@ -7,6 +7,7 @@
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
+#include "common/status_or.hpp"
 #include "page/branch_page.hpp"
 #include "page/free_page.hpp"
 #include "page/leaf_page.hpp"
@@ -35,9 +36,9 @@ class Page {
   size_t RowCount(Transaction& txn) const;
 
   // Row page manipulations.
-  Status Read(Transaction& txn, slot_t slot, std::string_view* result) const;
+  StatusOr<std::string_view> Read(Transaction& txn, slot_t slot) const;
 
-  Status Insert(Transaction& txn, std::string_view record, slot_t* slot);
+  StatusOr<slot_t> Insert(Transaction& txn, std::string_view record);
 
   Status Update(Transaction& txn, slot_t slot, std::string_view row);
 
@@ -45,8 +46,7 @@ class Page {
 
   [[nodiscard]] slot_t RowCount() const;
 
-  Status ReadKey(Transaction& txn, const uint16_t& slot,
-                 std::string_view* result) const;
+  StatusOr<std::string_view> ReadKey(Transaction& txn, slot_t slot) const;
 
   std::string_view GetKey(slot_t slot) const;
   page_id_t GetPage(slot_t slot) const;
@@ -56,10 +56,9 @@ class Page {
                     std::string_view value);
   Status Update(Transaction& txn, std::string_view key, std::string_view value);
   Status Delete(Transaction& txn, std::string_view key);
-  Status Read(Transaction& txn, std::string_view key,
-              std::string_view* result) const;
-  Status LowestKey(Transaction& txn, std::string_view* result);
-  Status HighestKey(Transaction& txn, std::string_view* result);
+  StatusOr<std::string_view> Read(Transaction& txn, std::string_view key) const;
+  StatusOr<std::string_view> LowestKey(Transaction& txn);
+  StatusOr<std::string_view> HighestKey(Transaction& txn);
   Status SetPrevNext(Transaction& txn, page_id_t prev, page_id_t next);
 
   // Branch page manipulations.

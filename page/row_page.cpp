@@ -5,15 +5,14 @@
 
 namespace tinylamb {
 
-Status RowPage::Read(page_id_t page_id, Transaction& txn, slot_t slot,
-                     std::string_view* dst) const {
+StatusOr<std::string_view> RowPage::Read(page_id_t page_id, Transaction& txn, slot_t slot) const {
   if (!txn.AddReadSet(RowPosition(page_id, slot))) {
     return Status::kConflicts;
   }
-  if (row_max_ <= slot || rows_[slot].offset == 0) return Status::kNotExists;
-
-  *dst = GetRow(slot);
-  return Status::kSuccess;
+  if (row_max_ <= slot || rows_[slot].offset == 0) {
+    return Status::kNotExists;
+  }
+  return GetRow(slot);
 }
 
 /*
@@ -32,14 +31,16 @@ Status RowPage::Read(page_id_t page_id, Transaction& txn, slot_t slot,
  * +-------------------------------+
  *                        ^ PosX == free_ptr_
  */
-Status RowPage::Insert(page_id_t page_id, Transaction& txn,
-                       std::string_view record, slot_t* dst) {
+StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
+                                 std::string_view record) {
   if (free_size_ <= record.size() + sizeof(RowPointer)) return Status::kNoSpace;
   // Scan the first vacant slot.
-  *dst = InsertRow(record);
-  if (!txn.AddWriteSet(RowPosition(page_id, *dst))) return Status::kConflicts;
-  txn.InsertLog(page_id, *dst, record);
-  return Status::kSuccess;
+  slot_t result = InsertRow(record);
+  if (!txn.AddWriteSet(RowPosition(page_id, result))) {
+    return Status::kConflicts;
+  }
+  txn.InsertLog(page_id, result, record);
+  return result;
 }
 
 slot_t RowPage::InsertRow(std::string_view new_row) {

@@ -75,13 +75,12 @@ size_t Page::RowCount(Transaction& txn) const {
   }
 }
 
-Status Page::Read(Transaction& txn, slot_t slot,
-                  std::string_view* result) const {
+StatusOr<std::string_view> Page::Read(Transaction& txn, slot_t slot) const {
   if (type == PageType::kRowPage) {
-    return body.row_page.Read(PageID(), txn, slot, result);
+    return body.row_page.Read(PageID(), txn, slot);
   }
   if (type == PageType::kLeafPage) {
-    return body.leaf_page.Read(PageID(), txn, slot, result);
+    return body.leaf_page.Read(PageID(), txn, slot);
   }
   throw std::runtime_error("invalid page type");
 }
@@ -98,10 +97,10 @@ page_id_t Page::GetPage(slot_t slot) const {
   return body.branch_page.GetValue(slot);
 }
 
-Status Page::Insert(Transaction& txn, std::string_view record, slot_t* slot) {
+StatusOr<slot_t> Page::Insert(Transaction& txn, std::string_view record) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  Status result = body.row_page.Insert(PageID(), txn, record, slot);
-  if (result == Status::kSuccess) {
+  StatusOr<slot_t> result = body.row_page.Insert(PageID(), txn, record);
+  if (result.GetStatus() == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
     SetRecLSN(txn.PrevLSN());
   }
@@ -141,17 +140,14 @@ slot_t Page::RowCount() const {
   }
 }
 
-Status Page::ReadKey(Transaction& txn, const uint16_t& slot,
-                     std::string_view* result) const {
+StatusOr<std::string_view> Page::ReadKey(Transaction& txn, slot_t slot) const {
   switch (type) {
     case PageType::kRowPage:
-      *result = "RowTableKey";
-      return Status::kSuccess;
+      return Status::kUnknown;
     case PageType::kLeafPage:
-      return body.leaf_page.ReadKey(PageID(), txn, slot, result);
+      return body.leaf_page.ReadKey(PageID(), txn, slot);
     case PageType::kBranchPage:
-      *result = body.branch_page.GetKey(slot);
-      return Status::kSuccess;
+      return body.branch_page.GetKey(slot);
     default:
       throw std::runtime_error("ReadKey is not implemented");
   }
@@ -199,20 +195,19 @@ Status Page::Delete(Transaction& txn, std::string_view key) {
   return result;
 }
 
-Status Page::Read(Transaction& txn, std::string_view key,
-                  std::string_view* result) const {
+StatusOr<std::string_view> Page::Read(Transaction& txn, std::string_view key) const {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  return body.leaf_page.Read(PageID(), txn, key, result);
+  return body.leaf_page.Read(PageID(), txn, key);
 }
 
-Status Page::LowestKey(Transaction& txn, std::string_view* result) {
+StatusOr<std::string_view> Page::LowestKey(Transaction& txn) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  return body.leaf_page.LowestKey(txn, result);
+  return body.leaf_page.LowestKey(txn);
 }
 
-Status Page::HighestKey(Transaction& txn, std::string_view* result) {
+StatusOr<std::string_view> Page::HighestKey(Transaction& txn) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  return body.leaf_page.HighestKey(txn, result);
+  return body.leaf_page.HighestKey(txn);
 }
 
 Status Page::SetPrevNext(Transaction& txn, page_id_t prev, page_id_t next) {
