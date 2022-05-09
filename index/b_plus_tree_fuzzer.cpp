@@ -4,7 +4,6 @@
 
 #include "index/b_plus_tree_fuzzer.hpp"
 
-
 extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
                                                        size_t size) {
   if (size < 8) return 0;

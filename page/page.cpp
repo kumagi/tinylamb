@@ -195,7 +195,8 @@ Status Page::Delete(Transaction& txn, std::string_view key) {
   return result;
 }
 
-StatusOr<std::string_view> Page::Read(Transaction& txn, std::string_view key) const {
+StatusOr<std::string_view> Page::Read(Transaction& txn,
+                                      std::string_view key) const {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
   return body.leaf_page.Read(PageID(), txn, key);
 }

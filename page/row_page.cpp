@@ -5,7 +5,8 @@
 
 namespace tinylamb {
 
-StatusOr<std::string_view> RowPage::Read(page_id_t page_id, Transaction& txn, slot_t slot) const {
+StatusOr<std::string_view> RowPage::Read(page_id_t page_id, Transaction& txn,
+                                         slot_t slot) const {
   if (!txn.AddReadSet(RowPosition(page_id, slot))) {
     return Status::kConflicts;
   }

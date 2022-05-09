@@ -104,7 +104,6 @@ TEST_F(RowPageTest, DeleteMany) {
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(page_id_);
   for (size_t i = 0; i < kRows; ++i) {
-
     if (i % 2 == 0) {
       ASSERT_EQ(Status::kNotExists, page->Read(txn, i).GetStatus());
     } else {
@@ -162,7 +161,7 @@ TEST_F(RowPageTest, InsertTwoThreads) {
   {  // txn1
     PageRef ref = p_->GetPage(page_id_);
     std::string message = "message1";
-    ASSIGN_OR_ASSERT_FAIL(slot_t, slot,ref->Insert(txn1, message));
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn1, message));
   }
   {
     PageRef ref = p_->GetPage(page_id_);

@@ -136,17 +136,20 @@ void LeafPage::DeleteImpl(std::string_view key) {
   --row_count_;
 }
 
-StatusOr<std::string_view> LeafPage::Read(page_id_t, Transaction&, slot_t slot) const {
+StatusOr<std::string_view> LeafPage::Read(page_id_t, Transaction&,
+                                          slot_t slot) const {
   if (row_count_ <= slot) return Status::kNotExists;
   return GetValue(slot);
 }
 
-StatusOr<std::string_view> LeafPage::ReadKey(page_id_t, Transaction&, slot_t slot) const {
+StatusOr<std::string_view> LeafPage::ReadKey(page_id_t, Transaction&,
+                                             slot_t slot) const {
   if (row_count_ <= slot) return Status::kNotExists;
   return GetKey(slot);
 }
 
-StatusOr<std::string_view> LeafPage::Read(page_id_t, Transaction&, std::string_view key) const {
+StatusOr<std::string_view> LeafPage::Read(page_id_t, Transaction&,
+                                          std::string_view key) const {
   size_t pos = Find(key);
   if (pos < row_count_ && GetKey(pos) == key) {
     return GetValue(pos);

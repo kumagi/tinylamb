@@ -41,9 +41,11 @@ class RowPage {
     // memset(data_, 0, kBodySize);
   }
 
-  StatusOr<std::string_view> Read(page_id_t page_id, Transaction& txn, slot_t slot) const;
+  StatusOr<std::string_view> Read(page_id_t page_id, Transaction& txn,
+                                  slot_t slot) const;
 
-  StatusOr<slot_t> Insert(page_id_t page_id, Transaction& txn, std::string_view record);
+  StatusOr<slot_t> Insert(page_id_t page_id, Transaction& txn,
+                          std::string_view record);
 
   Status Update(page_id_t page_id, Transaction& txn, slot_t slot,
                 std::string_view record);
