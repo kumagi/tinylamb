@@ -8,10 +8,9 @@
 #include "database/relation_storage.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/hash_join.hpp"
+#include "executor/insert.hpp"
 #include "executor/projection.hpp"
 #include "executor/selection.hpp"
-#include "expression/binary_expression.hpp"
-#include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "gtest/gtest.h"
 #include "transaction/transaction.hpp"
@@ -73,26 +72,27 @@ TEST_F(ExecutorTest, FullScan) {
   fs.Dump(std::cout, 0);
   std::cout << "\n";
   Row got;
-  ASSERT_TRUE(fs.Next(&got, nullptr));
+  RowPosition pos;
+  ASSERT_TRUE(fs.Next(&got, &pos));
   ASSERT_NE(rows.find(got), rows.end());
   rows.erase(got);
-  ASSERT_TRUE(fs.Next(&got, nullptr));
+  ASSERT_TRUE(fs.Next(&got, &pos));
   ASSERT_NE(rows.find(got), rows.end());
   rows.erase(got);
-  ASSERT_TRUE(fs.Next(&got, nullptr));
+  ASSERT_TRUE(fs.Next(&got, &pos));
   ASSERT_NE(rows.find(got), rows.end());
   rows.erase(got);
-  ASSERT_TRUE(fs.Next(&got, nullptr));
+  ASSERT_TRUE(fs.Next(&got, &pos));
   ASSERT_NE(rows.find(got), rows.end());
   rows.erase(got);
   ASSERT_TRUE(rows.empty());
-  ASSERT_FALSE(fs.Next(&got, nullptr));
+  ASSERT_FALSE(fs.Next(&got, &pos));
 }
 
 TEST_F(ExecutorTest, Projection) {
   Transaction txn = rs_->Begin();
   ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
-  auto fs = std::make_unique<FullScan>(txn, &tbl);
+  auto fs = std::make_shared<FullScan>(txn, &tbl);
   Projection proj({NamedExpression("key"), NamedExpression("score")},
                   tbl.GetSchema(), std::move(fs));
   std::unordered_set rows(
@@ -124,7 +124,7 @@ TEST_F(ExecutorTest, Selection) {
       BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(1)));
   Selection sel(key_is_1, tbl.GetSchema(),
-                std::make_unique<FullScan>(txn, &tbl));
+                std::make_shared<FullScan>(txn, &tbl));
   std::unordered_set rows({Row({Value(1), Value("world"), Value(4.9)})});
   sel.Dump(std::cout, 0);
   std::cout << "\n";
@@ -153,8 +153,8 @@ TEST_F(ExecutorTest, BasicJoin) {
               {Row({Value(232), Value(40.9), Value("out")})},
               {Row({Value(0), Value(9.2), Value("arise")})}});
 
-  HashJoin hj(std::make_unique<FullScan>(txn, &tbl), {0},
-              std::make_unique<FullScan>(txn, &right_tbl), {0});
+  HashJoin hj(std::make_shared<FullScan>(txn, &tbl), {0},
+              std::make_shared<FullScan>(txn, &right_tbl), {0});
   hj.Dump(std::cout, 0);
   std::cout << "\n";
   std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2), Value(0),
@@ -180,6 +180,53 @@ TEST_F(ExecutorTest, BasicJoin) {
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_TRUE(rows.erase(got));
   ASSERT_FALSE(hj.Next(&got, nullptr));
+  ASSERT_TRUE(rows.empty());
+}
+
+TEST_F(ExecutorTest, Insert) {
+  Transaction txn = rs_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
+  Schema src_schema{
+      "SrcTable",
+      {Column("key2", ValueType::kInt64), Column("name2", ValueType::kVarChar),
+       Column("score2", ValueType::kDouble)}};
+  rs_->CreateTable(txn, src_schema);
+  ASSIGN_OR_ASSERT_FAIL(Table, right_tbl, rs_->GetTable(txn, "SrcTable"));
+  BulkInsert(txn, right_tbl,
+             {{Row({Value(9), Value("troop"), Value(1.2)})},
+              {Row({Value(7), Value("arise"), Value(3.9)})},
+              {Row({Value(1), Value("probe"), Value(4.9)})},
+              {Row({Value(3), Value("ought"), Value(12.4)})},
+              {Row({Value(3), Value("extra"), Value(99.9)})},
+              {Row({Value(232), Value("out"), Value(40.9)})},
+              {Row({Value(0), Value("arise"), Value(9.2)})}});
+  auto insert = std::make_shared<Insert>(
+      txn, &tbl, std::make_shared<FullScan>(txn, &right_tbl));
+  std::cout << *insert << "\n";
+  Row result;
+  ASSERT_TRUE(insert->Next(&result, nullptr));
+  ASSERT_EQ(result[1], Value(7));
+  ASSERT_FALSE(insert->Next(&result, nullptr));
+
+  std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2)}),
+                           Row({Value(3), Value("piyo"), Value(12.2)}),
+                           Row({Value(1), Value("world"), Value(4.9)}),
+                           Row({Value(2), Value("arise"), Value(4.14)}),
+                           Row({Value(9), Value("troop"), Value(1.2)}),
+                           Row({Value(7), Value("arise"), Value(3.9)}),
+                           Row({Value(1), Value("probe"), Value(4.9)}),
+                           Row({Value(3), Value("ought"), Value(12.4)}),
+                           Row({Value(3), Value("extra"), Value(99.9)}),
+                           Row({Value(232), Value("out"), Value(40.9)}),
+                           Row({Value(0), Value("arise"), Value(9.2)})});
+  FullScan fs(txn, &tbl);
+  while (!rows.empty()) {
+    Row got;
+    RowPosition pos;
+    ASSERT_TRUE(fs.Next(&got, &pos));
+    ASSERT_NE(rows.find(got), rows.end());
+    rows.erase(got);
+  }
   ASSERT_TRUE(rows.empty());
 }
 

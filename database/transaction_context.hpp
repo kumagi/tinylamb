@@ -16,14 +16,14 @@ class RelationStorage;
 
 class TransactionContext {
  public:
-  TransactionContext(Transaction&& txn, RelationStorage* catalog)
-      : txn_(std::move(txn)), c_(catalog) {}
+  TransactionContext(Transaction&& txn, RelationStorage* rs)
+      : txn_(std::move(txn)), rs_(rs) {}
   TransactionContext(const TransactionContext&) = delete;
   TransactionContext& operator=(const TransactionContext&) = delete;
   TransactionContext(TransactionContext&&) = default;
   TransactionContext& operator=(TransactionContext&& o) noexcept {
     txn_ = std::move(o.txn_);
-    c_ = o.c_;
+    rs_ = o.rs_;
     return *this;
   }
   Table* GetTable(std::string_view table_name);
@@ -32,7 +32,7 @@ class TransactionContext {
   void Abort() { txn_.Abort(); }
 
   Transaction txn_;
-  RelationStorage* c_;
+  RelationStorage* rs_;
   std::unordered_map<std::string, Table> tables_;
 };
 

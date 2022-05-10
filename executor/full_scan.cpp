@@ -11,19 +11,21 @@
 namespace tinylamb {
 
 FullScan::FullScan(Transaction& txn, Table* table)
-    : table_(std::move(table)), iter_(table_->BeginFullScan(txn)) {}
+    : table_(table), iter_(table_->BeginFullScan(txn)) {}
 
 bool tinylamb::FullScan::Next(Row* dst, RowPosition* rp) {
   if (!iter_.IsValid()) {
     return false;
   }
   *dst = *iter_;
-  // *rp = *iter_;
+  if (rp != nullptr) {
+    *rp = iter_->Position();
+  }
   ++iter_;
   return true;
 }
 
-void FullScan::Dump(std::ostream& o, int indent) const {
+void FullScan::Dump(std::ostream& o, int) const {
   o << "FullScan: " << table_->GetSchema().Name();
 }
 

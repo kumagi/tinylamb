@@ -2,8 +2,8 @@
 // Created by kumagi on 2022/02/21.
 //
 
-#ifndef TINYLAMB_EXECUTOR_HPP
-#define TINYLAMB_EXECUTOR_HPP
+#ifndef TINYLAMB_EXECUTOR_BASE_HPP
+#define TINYLAMB_EXECUTOR_BASE_HPP
 
 #include <iosfwd>
 #include <memory>
@@ -14,8 +14,8 @@ struct RowPosition;
 
 class ExecutorBase {
  public:
-  virtual bool Next(Row* dst, RowPosition* rp) = 0;
   virtual ~ExecutorBase() = default;
+  virtual bool Next(Row* dst, RowPosition* rp) = 0;
   virtual void Dump(std::ostream& o, int indent) const = 0;
   friend std::ostream& operator<<(std::ostream& o, const ExecutorBase& e) {
     e.Dump(o, 0);
@@ -27,4 +27,4 @@ typedef std::shared_ptr<ExecutorBase> Executor;
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_EXECUTOR_HPP
+#endif  // TINYLAMB_EXECUTOR_BASE_HPP

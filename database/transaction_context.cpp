@@ -13,11 +13,8 @@ Table* TransactionContext::GetTable(std::string_view table_name) {
   if (it != tables_.end()) {
     return &it->second;
   }
-  StatusOr<Table> tbl = c_->GetTable(txn_, table_name);
-  if (!tbl.HasValue()) {
-    abort();
-  }
-  auto result = tables_.emplace(table_name, tbl.Value());
+  ASSIGN_OR_CRASH(Table, tbl, rs_->GetTable(txn_, table_name));
+  auto result = tables_.emplace(table_name, tbl);
   return &result.first->second;
 }
 

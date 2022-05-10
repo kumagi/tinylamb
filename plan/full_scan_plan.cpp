@@ -19,7 +19,7 @@ Executor FullScanPlan::EmitExecutor(TransactionContext& ctx) const {
 }
 
 Schema FullScanPlan::GetSchema(TransactionContext& ctx) const {
-  StatusOr<Table> tbl = ctx.c_->GetTable(ctx.txn_, table_name_);
+  StatusOr<Table> tbl = ctx.rs_->GetTable(ctx.txn_, table_name_);
   return tbl.Value().schema_;
 }
 

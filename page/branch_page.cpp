@@ -4,6 +4,8 @@
 
 #include "branch_page.hpp"
 
+#include <cstddef>
+
 #include "common/serdes.hpp"
 #include "page/page.hpp"
 #include "page/page_manager.hpp"
@@ -82,7 +84,9 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
 Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
                           page_id_t value) {
   const size_t pos = Search(key);
-  if (row_count_ < pos || GetKey(pos) != key) return Status::kNotExists;
+  if (row_count_ < pos || GetKey(pos) != key) {
+    return Status::kNotExists;
+  }
   txn.UpdateBranchLog(pid, key, GetValue(pos), value);
   UpdateImpl(key, value);
   return Status::kSuccess;
@@ -130,7 +134,9 @@ Status BranchPage::FindForKey(Transaction& txn, std::string_view key,
                               page_id_t* result) const {
   assert(0 < row_count_);
   size_t pos = Search(key);
-  if (RowCount() < pos) return Status::kNotExists;
+  if (RowCount() < pos) {
+    return Status::kNotExists;
+  }
   if (key == GetKey(pos)) {
     *result = GetValue(pos);
     return Status::kSuccess;
@@ -141,7 +147,7 @@ Status BranchPage::FindForKey(Transaction& txn, std::string_view key,
 void BranchPage::SplitInto(page_id_t pid, Transaction& txn,
                            std::string_view key, Page* right,
                            std::string* middle) {
-  const size_t kPayload = kPageBodySize - OFFSET_OF(BranchPage, rows_);
+  const size_t kPayload = kPageBodySize - offsetof(BranchPage, rows_);
   const size_t kThreshold = kPayload / 2;
   const size_t expected_size =
       SerializeSize(key) + sizeof(page_id_t) + sizeof(RowPointer);
@@ -180,7 +186,7 @@ void BranchPage::SplitInto(page_id_t pid, Transaction& txn,
   }
 }
 
-void BranchPage::Merge(page_id_t pid, Transaction& txn, Page* child) {
+void BranchPage::Merge(page_id_t pid, Transaction& txn, Page* child) const {
   assert(child->Type() == PageType::kBranchPage);
   assert(child->body.branch_page.row_count_ == 0);
   assert(0 < row_count_);
@@ -189,27 +195,31 @@ void BranchPage::Merge(page_id_t pid, Transaction& txn, Page* child) {
 }
 
 bin_size_t BranchPage::SearchToInsert(std::string_view key) const {
-  int left = -1, right = row_count_;
+  int left = -1;
+  int right = row_count_;
   while (1 < right - left) {
     const int cur = (left + right) / 2;
     std::string_view cur_key = GetKey(cur);
-    if (key < cur_key)
+    if (key < cur_key) {
       right = cur;
-    else
+    } else {
       left = cur;
+    }
   }
   return right;
 }
 
 int BranchPage::Search(std::string_view key) const {
-  int left = -1, right = row_count_;
+  int left = -1;
+  int right = row_count_;
   while (1 < right - left) {
     const int cur = (left + right) / 2;
     std::string_view cur_key = GetKey(cur);
-    if (key < cur_key)
+    if (key < cur_key) {
       right = cur;
-    else
+    } else {
       left = cur;
+    }
   }
   return left;
 }
@@ -240,10 +250,11 @@ void BranchPage::Dump(std::ostream& o, int indent) const {
 }
 
 std::string SmallestKey(PageRef&& page) {
-  if (page->Type() == PageType::kLeafPage)
+  if (page->Type() == PageType::kLeafPage) {
     return std::string(page->body.leaf_page.GetKey(0));
-  else if (page->Type() == PageType::kBranchPage)
+  } else if (page->Type() == PageType::kBranchPage) {
     return std::string(page->body.branch_page.GetKey(0));
+  }
   LOG(ERROR) << " for " << page->PageID() << " -> " << page->Type();
   assert(!"invalid page type");
 }
@@ -252,7 +263,8 @@ std::string BiggestKey(PageRef&& page) {
   if (page->Type() == PageType::kLeafPage) {
     slot_t count = page->body.leaf_page.RowCount();
     return std::string(page->body.leaf_page.GetKey(count - 1));
-  } else if (page->Type() == PageType::kBranchPage) {
+  }
+  if (page->Type() == PageType::kBranchPage) {
     slot_t count = page->body.branch_page.RowCount();
     return std::string(page->body.branch_page.GetKey(count - 1));
   }
@@ -260,23 +272,29 @@ std::string BiggestKey(PageRef&& page) {
 }
 
 bool SanityCheck(PageRef&& page, PageManager* pm) {
-  if (page->Type() == PageType::kLeafPage)
+  if (page->Type() == PageType::kLeafPage) {
     return page->body.leaf_page.SanityCheckForTest();
-  else if (page->Type() == PageType::kBranchPage)
+  }
+  if (page->Type() == PageType::kBranchPage) {
     return page->body.branch_page.SanityCheckForTest(pm);
+  }
   assert(!"invalid page type");
 }
 
 bool BranchPage::SanityCheckForTest(PageManager* pm) const {
   bool sanity = SanityCheck(pm->GetPage(lowest_page_), pm);
-  if (!sanity) return false;
+  if (!sanity) {
+    return false;
+  }
   if (row_count_ == 0) {
     LOG(FATAL) << "Branch page is empty";
     return false;
   }
   const Page* this_page = GET_CONST_PAGE_PTR(this);
   for (size_t i = 0; i < row_count_ - 1; ++i) {
-    if (GetKey(i + 1) < GetKey(i)) return false;
+    if (GetKey(i + 1) < GetKey(i)) {
+      return false;
+    }
     if (GetValue(i) == 0) {
       LOG(FATAL) << "zero page at " << i;
       Dump(std::cerr, 0);
@@ -295,7 +313,9 @@ bool BranchPage::SanityCheckForTest(PageManager* pm) const {
       return false;
     }
     sanity = SanityCheck(pm->GetPage(GetValue(i)), pm);
-    if (!sanity) return false;
+    if (!sanity) {
+      return false;
+    }
   }
   return SanityCheck(pm->GetPage(GetValue(row_count_ - 1)), pm);
 }

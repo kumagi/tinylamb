@@ -9,7 +9,7 @@
 #include "database/query_data.hpp"
 #include "database/relation_storage.hpp"
 #include "database/transaction_context.hpp"
-#include "executor/executor.hpp"
+#include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
 #include "table/table.hpp"

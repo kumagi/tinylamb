@@ -7,7 +7,7 @@
 
 #include <memory>
 
-#include "executor.hpp"
+#include "executor_base.hpp"
 #include "expression/expression.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"

@@ -62,7 +62,7 @@ class BranchPage {
   void SplitInto(page_id_t pid, Transaction& txn, std::string_view key,
                  Page* right, std::string* middle);
 
-  void Merge(page_id_t pid, Transaction& txn, Page* child);
+  void Merge(page_id_t pid, Transaction& txn, Page* child) const;
 
   // Return lowest page_id which may contain the specified |key|.
   [[nodiscard]] bin_size_t SearchToInsert(std::string_view key) const;

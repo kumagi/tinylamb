@@ -21,9 +21,8 @@ std::string OmittedString(std::string_view original, size_t length) {
         "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
     omitted_key += original.substr(original.length() - 8);
     return omitted_key;
-  } else {
-    return std::string(original);
   }
+  return std::string(original);
 }
 
 }  // anonymous namespace
@@ -46,11 +45,16 @@ Status LeafPage::Insert(page_id_t page_id, Transaction& txn,
   constexpr size_t kThreshold = kPageBodySize / 2;
   const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
   const bin_size_t expected_size = physical_size + sizeof(RowPointer);
-  if (kThreshold < expected_size) return Status::kTooBigData;
-  if (free_size_ < expected_size) return Status::kNoSpace;
-
+  if (kThreshold < expected_size) {
+    return Status::kTooBigData;
+  }
+  if (free_size_ < expected_size) {
+    return Status::kNoSpace;
+  }
   size_t pos = Find(key);
-  if (pos != row_count_ && GetKey(pos) == key) return Status::kDuplicates;
+  if (pos != row_count_ && GetKey(pos) == key) {
+    return Status::kDuplicates;
+  }
 
   InsertImpl(key, value);
   txn.InsertLeafLog(page_id, key, value);
@@ -138,13 +142,17 @@ void LeafPage::DeleteImpl(std::string_view key) {
 
 StatusOr<std::string_view> LeafPage::Read(page_id_t, Transaction&,
                                           slot_t slot) const {
-  if (row_count_ <= slot) return Status::kNotExists;
+  if (row_count_ <= slot) {
+    return Status::kNotExists;
+  }
   return GetValue(slot);
 }
 
 StatusOr<std::string_view> LeafPage::ReadKey(page_id_t, Transaction&,
                                              slot_t slot) const {
-  if (row_count_ <= slot) return Status::kNotExists;
+  if (row_count_ <= slot) {
+    return Status::kNotExists;
+  }
   return GetKey(slot);
 }
 
@@ -153,18 +161,21 @@ StatusOr<std::string_view> LeafPage::Read(page_id_t, Transaction&,
   size_t pos = Find(key);
   if (pos < row_count_ && GetKey(pos) == key) {
     return GetValue(pos);
-  } else {
-    return Status::kNotExists;
   }
+  return Status::kNotExists;
 }
 
 StatusOr<std::string_view> LeafPage::LowestKey(Transaction&) const {
-  if (row_count_ == 0) return Status::kNotExists;
+  if (row_count_ == 0) {
+    return Status::kNotExists;
+  }
   return GetKey(0);
 }
 
 StatusOr<std::string_view> LeafPage::HighestKey(Transaction&) const {
-  if (row_count_ == 0) return Status::kNotExists;
+  if (row_count_ == 0) {
+    return Status::kNotExists;
+  }
   return GetKey(row_count_ - 1);
 }
 
@@ -185,7 +196,7 @@ void LeafPage::SetPrevNextImpl(page_id_t prev, page_id_t next) {
 
 void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
                      std::string_view value, Page* right) {
-  const size_t kPayload = kPageBodySize - OFFSET_OF(LeafPage, rows_);
+  const size_t kPayload = kPageBodySize - offsetof(LeafPage, rows_);
   const size_t kThreshold = kPayload / 2;
   const size_t expected_size =
       SerializeSize(key) + SerializeSize(value) + sizeof(RowPointer);
@@ -233,7 +244,7 @@ void LeafPage::DeFragment() {
   for (size_t i = 0; i < row_count_; ++i) {
     payloads.emplace_back(Payload() + rows_[i].offset, rows_[i].size);
   }
-  free_ptr_ = kPageBodySize - OFFSET_OF(LeafPage, rows_);
+  free_ptr_ = kPageBodySize - offsetof(LeafPage, rows_);
   for (size_t i = 0; i < row_count_; ++i) {
     assert(payloads[i].size() <= free_ptr_);
     assert(payloads[i].size() == rows_[i].size);
@@ -246,14 +257,16 @@ void LeafPage::DeFragment() {
 }
 
 size_t LeafPage::Find(std::string_view key) const {
-  int left = -1, right = row_count_;
+  int left = -1;
+  int right = row_count_;
   while (1 < right - left) {
     const int cur = (left + right) / 2;
     std::string_view cur_key = GetKey(cur);
-    if (cur_key < key)
+    if (cur_key < key) {
       left = cur;
-    else
+    } else {
       right = cur;
+    }
   }
   return right;
 }

@@ -16,7 +16,7 @@ namespace tinylamb {
 struct RowPosition {
   // Returns invalid position.
   RowPosition() = default;
-  RowPosition(page_id_t p, slot_t s) : page_id(p), slot(s) {}
+  RowPosition(page_id_t pid, slot_t sl) : page_id(pid), slot(sl) {}
 
   // The page where the row exists.
   page_id_t page_id = ~0LLU;

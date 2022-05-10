@@ -6,6 +6,7 @@
 #define TINYLAMB_LEAF_PAGE_HPP
 
 #include <cassert>
+#include <cstddef>
 #include <string_view>
 
 #include "common/constants.hpp"
@@ -35,8 +36,8 @@ class LeafPage {
     prev_pid_ = 0;
     next_pid_ = 0;
     row_count_ = 0;
-    free_ptr_ = kPageBodySize - OFFSET_OF(LeafPage, rows_);
-    free_size_ = kPageBodySize - OFFSET_OF(LeafPage, rows_);
+    free_ptr_ = kPageBodySize - offsetof(LeafPage, rows_);
+    free_size_ = kPageBodySize - offsetof(LeafPage, rows_);
   }
 
   Status Insert(page_id_t page_id, Transaction& txn, std::string_view key,
@@ -83,8 +84,8 @@ class LeafPage {
   page_id_t prev_pid_ = 0;
   page_id_t next_pid_ = 0;
   slot_t row_count_ = 0;
-  bin_size_t free_ptr_ = kPageBodySize - OFFSET_OF(LeafPage, rows_);
-  bin_size_t free_size_ = kPageBodySize - OFFSET_OF(LeafPage, rows_);
+  bin_size_t free_ptr_ = kPageBodySize - offsetof(LeafPage, rows_);
+  bin_size_t free_size_ = kPageBodySize - offsetof(LeafPage, rows_);
   RowPointer rows_[0];
 };
 

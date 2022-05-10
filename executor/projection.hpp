@@ -6,9 +6,10 @@
 #define TINYLAMB_PROJECTION_HPP
 
 #include <memory>
+#include <utility>
 #include <vector>
 
-#include "executor.hpp"
+#include "executor_base.hpp"
 #include "named_expression.hpp"
 #include "type/schema.hpp"
 
@@ -17,10 +18,10 @@ namespace tinylamb {
 class Projection : public ExecutorBase {
  public:
   Projection(std::vector<NamedExpression> expressions, Schema input_schema,
-             const Executor& src)
+             Executor src)
       : expressions_(std::move(expressions)),
         input_schema_(std::move(input_schema)),
-        src_(src) {}
+        src_(std::move(src)) {}
   ~Projection() override = default;
 
   bool Next(Row* dst, RowPosition* rp) override;

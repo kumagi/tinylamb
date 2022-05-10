@@ -8,7 +8,7 @@
 #include <memory>
 #include <vector>
 
-#include "executor/executor.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/named_expression.hpp"
 #include "expression/expression.hpp"
 #include "type/schema.hpp"

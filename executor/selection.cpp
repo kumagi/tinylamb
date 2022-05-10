@@ -17,8 +17,7 @@ Selection::Selection(Expression exp, Schema schema, Executor src)
 bool Selection::Next(Row* dst, RowPosition* rp) {
   Row orig;
   while (src_->Next(&orig, nullptr)) {
-    Value result = exp_->Evaluate(orig, &schema_);
-    if (result.value.int_value) {
+    if (exp_->Evaluate(orig, &schema_).value.int_value != 0) {
       *dst = orig;
       return true;
     }

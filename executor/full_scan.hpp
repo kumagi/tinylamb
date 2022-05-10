@@ -7,14 +7,14 @@
 
 #include <memory>
 
-#include "executor/executor.hpp"
-#include "page/row_position.hpp"
+#include "executor/executor_base.hpp"
 #include "table/iterator.hpp"
-#include "table/table.hpp"
 
 namespace tinylamb {
-class TableInterface;
+class Table;
 class Transaction;
+struct Row;
+struct RowPosition;
 
 class FullScan : public ExecutorBase {
  public:

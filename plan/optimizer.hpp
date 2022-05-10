@@ -8,7 +8,7 @@
 #include <memory>
 
 #include "database/query_data.hpp"
-#include "executor/executor.hpp"
+#include "executor/executor_base.hpp"
 
 namespace tinylamb {
 class ExecutorBase;
