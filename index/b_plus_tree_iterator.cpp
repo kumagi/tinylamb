@@ -4,7 +4,7 @@
 
 #include "b_plus_tree_iterator.hpp"
 
-#include "b_plus_tree.hpp"
+#include "index/b_plus_tree.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
 #include "transaction/transaction.hpp"

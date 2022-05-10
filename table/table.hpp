@@ -48,11 +48,12 @@ class Table {
                           bool ascending = true);
 
   [[nodiscard]] Schema GetSchema() const { return schema_; }
+  [[nodiscard]] size_t IndexCount() const { return indexes_.size(); }
 
   friend Encoder& operator<<(Encoder& e, const Table& t);
   friend Decoder& operator>>(Decoder& d, Table& t);
 
- public:
+ private:
   friend class RelationStorage;
   friend class FullScanIterator;
   friend class IndexScanIterator;
@@ -63,7 +64,7 @@ class Table {
   Schema schema_;
   page_id_t first_pid_{};
   page_id_t last_pid_{};
-  std::vector<Index> indices_{};
+  std::vector<Index> indexes_{};
 };
 
 }  // namespace tinylamb

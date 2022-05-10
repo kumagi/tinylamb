@@ -10,6 +10,7 @@
 
 #include "common/constants.hpp"
 #include "database/page_storage.hpp"
+#include "database/transaction_context.hpp"
 #include "index/b_plus_tree.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
@@ -30,6 +31,7 @@ class RelationStorage {
   explicit RelationStorage(std::string_view dbname);
 
   Transaction Begin() { return storage_.Begin(); }
+  TransactionContext BeginContext() { return {storage_.Begin(), this}; }
 
   Status CreateTable(Transaction& txn, const Schema& schema);
 

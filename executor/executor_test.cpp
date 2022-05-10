@@ -3,6 +3,9 @@
 //
 #include <memory>
 
+#include "common/random_string.hpp"
+#include "common/test_util.hpp"
+#include "database/relation_storage.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/hash_join.hpp"
 #include "executor/projection.hpp"
@@ -18,32 +21,51 @@
 
 namespace tinylamb {
 
+static const char* kTableName = "SampleTable";
 class ExecutorTest : public ::testing::Test {
  public:
-  void BulkInsert(Table& tbl, std::initializer_list<Row> rows) {
-    ASSERT_TRUE(tbl.Insert())
+  static void BulkInsert(Transaction& txn, Table& tbl,
+                         std::initializer_list<Row> rows) {
+    for (const auto& row : rows) {
+      ASSERT_SUCCESS(tbl.Insert(txn, row).GetStatus());
+    }
   }
 
   void SetUp() override {
-    table_ = std::unique_ptr<Table>(
-        new Table({{Row({Value(0), Value("hello"), Value(1.2)})},
-                   {Row({Value(3), Value("piyo"), Value(12.2)})},
-                   {Row({Value(1), Value("world"), Value(4.9)})},
-                   {Row({Value(2), Value("arise"), Value(4.14)})}}));
+    prefix_ = "table_test-" + RandomString();
+    Recover();
+    Schema schema{
+        kTableName,
+        {Column("key", ValueType::kInt64), Column("name", ValueType::kVarChar),
+         Column("score", ValueType::kDouble)}};
+    Transaction txn = rs_->Begin();
+    rs_->CreateTable(txn, schema);
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
+    BulkInsert(txn, tbl,
+               {{Row({Value(0), Value("hello"), Value(1.2)})},
+                {Row({Value(3), Value("piyo"), Value(12.2)})},
+                {Row({Value(1), Value("world"), Value(4.9)})},
+                {Row({Value(2), Value("arise"), Value(4.14)})}});
+    ASSERT_SUCCESS(txn.PreCommit());
   }
 
-  std::unique_ptr<TableInterface> table_;
-  Transaction fake_txn_;
-  Schema schema_{
-      "test_table",
-      {Column("key", ValueType::kInt64), Column("name", ValueType::kVarChar),
-       Column("score", ValueType::kDouble)}};
+  void Recover() {
+    if (rs_) {
+      rs_->GetPageStorage()->LostAllPageForTest();
+    }
+    rs_ = std::make_unique<RelationStorage>(prefix_);
+  }
+
+  std::string prefix_;
+  std::unique_ptr<RelationStorage> rs_;
 };
 
 TEST_F(ExecutorTest, Construct) {}
 
 TEST_F(ExecutorTest, FullScan) {
-  FullScan fs(fake_txn_, std::move(table_));
+  Transaction txn = rs_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
+  FullScan fs(txn, &tbl);
   std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2)}),
                            Row({Value(3), Value("piyo"), Value(12.2)}),
                            Row({Value(1), Value("world"), Value(4.9)}),
@@ -68,9 +90,11 @@ TEST_F(ExecutorTest, FullScan) {
 }
 
 TEST_F(ExecutorTest, Projection) {
-  auto fs = std::make_unique<FullScan>(fake_txn_, std::move(table_));
-  Projection proj({NamedExpression("key"), NamedExpression("score")}, schema_,
-                  std::move(fs));
+  Transaction txn = rs_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
+  auto fs = std::make_unique<FullScan>(txn, &tbl);
+  Projection proj({NamedExpression("key"), NamedExpression("score")},
+                  tbl.GetSchema(), std::move(fs));
   std::unordered_set rows(
       {Row({Value(0), Value(1.2)}), Row({Value(3), Value(12.2)}),
        Row({Value(1), Value(4.9)}), Row({Value(2), Value(4.14)})});
@@ -94,11 +118,13 @@ TEST_F(ExecutorTest, Projection) {
 }
 
 TEST_F(ExecutorTest, Selection) {
+  Transaction txn = rs_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
   Expression key_is_1 =
       BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(1)));
-  Selection sel(key_is_1, schema_,
-                std::make_unique<FullScan>(fake_txn_, std::move(table_)));
+  Selection sel(key_is_1, tbl.GetSchema(),
+                std::make_unique<FullScan>(txn, &tbl));
   std::unordered_set rows({Row({Value(1), Value("world"), Value(4.9)})});
   sel.Dump(std::cout, 0);
   std::cout << "\n";
@@ -109,17 +135,26 @@ TEST_F(ExecutorTest, Selection) {
 }
 
 TEST_F(ExecutorTest, BasicJoin) {
-  auto table = std::unique_ptr<Table>(
-      new Table({{Row({Value(9), Value(1.2), Value("troop")})},
-                 {Row({Value(7), Value(3.9), Value("arise")})},
-                 {Row({Value(1), Value(4.9), Value("probe")})},
-                 {Row({Value(3), Value(12.4), Value("ought")})},
-                 {Row({Value(3), Value(99.9), Value("extra")})},
-                 {Row({Value(232), Value(40.9), Value("out")})},
-                 {Row({Value(0), Value(9.2), Value("arise")})}}));
+  Transaction txn = rs_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
 
-  HashJoin hj(std::make_unique<FullScan>(fake_txn_, std::move(table_)), {0},
-              std::make_unique<FullScan>(fake_txn_, std::move(table)), {0});
+  Schema right_schema{
+      "RightTable",
+      {Column("key2", ValueType::kInt64), Column("score2", ValueType::kDouble),
+       Column("name2", ValueType::kVarChar)}};
+  rs_->CreateTable(txn, right_schema);
+  ASSIGN_OR_ASSERT_FAIL(Table, right_tbl, rs_->GetTable(txn, "RightTable"));
+  BulkInsert(txn, right_tbl,
+             {{Row({Value(9), Value(1.2), Value("troop")})},
+              {Row({Value(7), Value(3.9), Value("arise")})},
+              {Row({Value(1), Value(4.9), Value("probe")})},
+              {Row({Value(3), Value(12.4), Value("ought")})},
+              {Row({Value(3), Value(99.9), Value("extra")})},
+              {Row({Value(232), Value(40.9), Value("out")})},
+              {Row({Value(0), Value(9.2), Value("arise")})}});
+
+  HashJoin hj(std::make_unique<FullScan>(txn, &tbl), {0},
+              std::make_unique<FullScan>(txn, &right_tbl), {0});
   hj.Dump(std::cout, 0);
   std::cout << "\n";
   std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2), Value(0),

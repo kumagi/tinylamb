@@ -75,7 +75,7 @@ TEST_F(CatalogTest, Recover) {
     auto txn = rs_->Begin();
     rs_->CreateTable(txn, new_schema);
     rs_->DebugDump(txn, std::cout);
-    txn.PreCommit();
+    ASSERT_SUCCESS(txn.PreCommit());
   }
   Recover();
   {

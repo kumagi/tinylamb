@@ -18,7 +18,7 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
   PageRef root_page =
       txn.PageManager()->AllocateNewPage(txn, PageType::kLeafPage);
   BPlusTree new_bpt(root_page->PageID());
-  indices_.emplace_back(idx.name_, idx.key_, root_page->PageID());
+  indexes_.emplace_back(idx.name_, idx.key_, root_page->PageID());
 
   Iterator it = BeginFullScan(txn);
   while (it.IsValid()) {
@@ -50,7 +50,7 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
     last_pid_ = new_page->PageID();
   }
   ref.PageUnlock();
-  for (const auto& idx : indices_) {
+  for (const auto& idx : indexes_) {
     BPlusTree bpt(idx.pid_);
     RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(row), rp.Serialize()));
   }
@@ -64,7 +64,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   }
   ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
   RowPosition new_pos = pos;
-  for (const auto& idx : indices_) {
+  for (const auto& idx : indexes_) {
     BPlusTree bpt(idx.pid_);
     RETURN_IF_FAIL(bpt.Delete(txn, idx.GenerateKey(original_row)));
   }
@@ -87,7 +87,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     new_pos = new_row_pos;
     last_pid_ = new_page->PageID();
   }
-  for (const auto& idx : indices_) {
+  for (const auto& idx : indexes_) {
     BPlusTree bpt(idx.pid_);
     RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(row), pos.Serialize()));
   }
@@ -99,7 +99,7 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
     return Status::kConflicts;
   }
   ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
-  for (const auto& idx : indices_) {
+  for (const auto& idx : indexes_) {
     BPlusTree bpt(idx.pid_);
     RETURN_IF_FAIL(bpt.Delete(txn, idx.GenerateKey(original_row)));
   }
@@ -127,17 +127,17 @@ Iterator Table::BeginIndexScan(Transaction& txn, std::string_view index_name,
 }
 
 Encoder& operator<<(Encoder& e, const Table& t) {
-  e << t.schema_ << t.first_pid_ << t.last_pid_ << t.indices_;
+  e << t.schema_ << t.first_pid_ << t.last_pid_ << t.indexes_;
   return e;
 }
 
 Decoder& operator>>(Decoder& d, Table& t) {
-  d >> t.schema_ >> t.first_pid_ >> t.last_pid_ >> t.indices_;
+  d >> t.schema_ >> t.first_pid_ >> t.last_pid_ >> t.indexes_;
   return d;
 }
 
 page_id_t Table::GetIndex(std::string_view name) {
-  for (const auto& idx : indices_) {
+  for (const auto& idx : indexes_) {
     if (idx.sc_.name_ == name) {
       return idx.pid_;
     }

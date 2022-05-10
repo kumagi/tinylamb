@@ -12,13 +12,9 @@
 #include "executor/executor.hpp"
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
-#include "page/page_manager.hpp"
-#include "recovery/checkpoint_manager.hpp"
-#include "recovery/logger.hpp"
 #include "table/table.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
-#include "transaction/transaction_manager.hpp"
 #include "type/row.hpp"
 
 namespace tinylamb {
@@ -27,66 +23,63 @@ class OptimizerTest : public ::testing::Test {
  public:
   void SetUp() override {
     std::string prefix = "optimizer_test-" + RandomString();
-    db_ = std::make_unique<Database>(prefix);
+    rs_ = std::make_unique<RelationStorage>(prefix);
     Recover();
-    Transaction txn = db_->Begin();
+    Transaction txn = rs_->Begin();
     {
-      ASSERT_SUCCESS(db_->CreateTable(
+      ASSERT_SUCCESS(rs_->CreateTable(
           txn, Schema("Sc1", {Column("c1", ValueType::kInt64),
                               Column("c2", ValueType::kVarChar),
                               Column("c3", ValueType::kDouble)})));
-      Table tbl;
-      ASSERT_SUCCESS(db_->GetTable(txn, "Sc1", &tbl));
-      RowPosition rp;
+      ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, "Sc1"));
       for (int i = 0; i < 100; ++i) {
-        tbl.Insert(
-            txn,
-            Row({Value(i), Value("c2-" + std::to_string(i)), Value(i + 9.9)}),
-            &rp);
+        ASSERT_SUCCESS(
+            tbl.Insert(txn, Row({Value(i), Value("c2-" + std::to_string(i)),
+                                 Value(i + 9.9)}))
+                .GetStatus());
       }
     }
     {
-      ASSERT_SUCCESS(db_->CreateTable(
+      ASSERT_SUCCESS(rs_->CreateTable(
           txn, Schema("Sc2", {Column("d1", ValueType::kInt64),
                               Column("d2", ValueType::kDouble),
                               Column("d3", ValueType::kVarChar),
                               Column("d4", ValueType::kInt64)})));
-      Table tbl;
-      ASSERT_SUCCESS(db_->GetTable(txn, "Sc2", &tbl));
-      RowPosition rp;
+      ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, "Sc2"));
       for (int i = 0; i < 20; ++i) {
-        tbl.Insert(txn,
-                   Row({Value(i), Value(i + 0.2),
-                        Value("d3-" + std::to_string(i)), Value(16)}),
-                   &rp);
+        ASSERT_SUCCESS(
+            tbl.Insert(txn, Row({Value(i), Value(i + 0.2),
+                                 Value("d3-" + std::to_string(i)), Value(16)}))
+                .GetStatus());
       }
     }
     {
-      ASSERT_SUCCESS(db_->CreateTable(
+      ASSERT_SUCCESS(rs_->CreateTable(
           txn, Schema("Sc3", {Column("e1", ValueType::kInt64),
                               Column("e2", ValueType::kDouble)})));
-      Table tbl;
-      ASSERT_SUCCESS(db_->GetTable(txn, "Sc3", &tbl));
+      ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, "Sc3"));
       RowPosition rp;
       for (int i = 10; 0 < i; --i) {
-        tbl.Insert(txn, Row({Value(i), Value(i + 53.4)}), &rp);
+        ASSERT_SUCCESS(
+            tbl.Insert(txn, Row({Value(i), Value(i + 53.4)})).GetStatus());
       }
     }
     ASSERT_SUCCESS(txn.PreCommit());
-    auto stat_tx = db_->Begin();
-    db_->RefreshStatistics(stat_tx, "Sc1");
-    db_->RefreshStatistics(stat_tx, "Sc2");
-    db_->RefreshStatistics(stat_tx, "Sc3");
+    auto stat_tx = rs_->Begin();
+    rs_->RefreshStatistics(stat_tx, "Sc1");
+    rs_->RefreshStatistics(stat_tx, "Sc2");
+    rs_->RefreshStatistics(stat_tx, "Sc3");
     ASSERT_SUCCESS(stat_tx.PreCommit());
   }
   void Recover() {
-    db_->Storage().LostAllPageForTest();
-    db_ = std::make_unique<Database>(prefix_);
+    rs_->GetPageStorage()->LostAllPageForTest();
+    rs_ = std::make_unique<RelationStorage>(prefix_);
   }
 
   void TearDown() override {
-    std::remove(db_->Storage().DBName().c_str());
-    std::remove(db_->Storage().LogName().c_str());
+    std::remove(rs_->GetPageStorage()->DBName().c_str());
+    std::remove(rs_->GetPageStorage()->LogName().c_str());
+    std::remove(rs_->GetPageStorage()->MasterRecordName().c_str());
   }
 
   void DumpAll(const QueryData& qd) {
@@ -94,7 +87,7 @@ class OptimizerTest : public ::testing::Test {
     Optimizer opt;
     Schema sc;
     Executor exec;
-    TransactionContext ctx = db_->BeginContext();
+    TransactionContext ctx = rs_->BeginContext();
     opt.Optimize(qd, ctx, sc, exec);
     exec->Dump(std::cout, 0);
     std::cout << "\n\n" << sc << "\n";
@@ -105,7 +98,7 @@ class OptimizerTest : public ::testing::Test {
   }
 
   std::string prefix_;
-  std::unique_ptr<Database> db_;
+  std::unique_ptr<RelationStorage> rs_;
 };
 
 TEST_F(OptimizerTest, Construct) {}

@@ -60,7 +60,6 @@ TEST_F(TableTest, Construct) {}
 TEST_F(TableTest, Insert) {
   Transaction txn = rs_->Begin();
   ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
-  RowPosition rp;
   Row r({Value(1), Value("fuga"), Value(3.3)});
   ASSERT_SUCCESS(tbl.Insert(txn, r).GetStatus());
 }

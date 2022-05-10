@@ -11,13 +11,10 @@
 #include "database/database.hpp"
 #include "gtest/gtest.h"
 #include "index.hpp"
-#include "page/page_manager.hpp"
 #include "recovery/checkpoint_manager.hpp"
-#include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "table/table.hpp"
 #include "transaction/lock_manager.hpp"
-#include "transaction/transaction_manager.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 
@@ -38,7 +35,7 @@ class IndexScanIteratorTest : public ::testing::Test {
     IndexSchema is("idx", {0});
     ASSERT_SUCCESS(rs_->CreateIndex(txn, kTableName, is));
     ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->GetTable(txn, kTableName));
-    ASSERT_EQ(table.indices_.size(), 1);
+    ASSERT_EQ(table.IndexCount(), 1);
     ASSERT_SUCCESS(txn.PreCommit());
   }
 
