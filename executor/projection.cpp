@@ -13,7 +13,9 @@ namespace tinylamb {
 bool Projection::Next(Row* dst, RowPosition* rp) {
   Row orig;
   dst->Clear();
-  if (!src_->Next(&orig, nullptr)) return false;
+  if (!src_->Next(&orig, rp)) {
+    return false;
+  }
   std::vector<Value> result;
   result.reserve(expressions_.size());
   for (const auto& exp : expressions_) {
@@ -26,7 +28,9 @@ bool Projection::Next(Row* dst, RowPosition* rp) {
 void Projection::Dump(std::ostream& o, int indent) const {
   o << "Projection: [";
   for (size_t i = 0; i < expressions_.size(); ++i) {
-    if (0 < i) o << ", ";
+    if (0 < i) {
+      o << ", ";
+    }
     o << expressions_[i];
   }
   o << "]\n" << Indent(indent + 2);

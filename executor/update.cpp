@@ -20,7 +20,11 @@ bool Update::Next(Row* dst, RowPosition* rp) {
   RowPosition position;
   while (src_->Next(&new_row, &position)) {
     assert(position.IsValid());
-    target_->Update(*txn_, position, new_row);
+    StatusOr<RowPosition> p = target_->Update(*txn_, position, new_row);
+    if (p.GetStatus() != Status::kSuccess) {
+      finished_ = true;
+      return true;
+    }
     update_count++;
   }
   *dst = Row({Value("Update Rows"), Value(update_count)});

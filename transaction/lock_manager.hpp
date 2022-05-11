@@ -24,7 +24,7 @@ class LockManager {
 
  private:
   std::mutex latch_;
-  std::unordered_map<RowPosition, txn_id_t> shared_locks_;
+  std::unordered_map<RowPosition, size_t> shared_locks_;
   std::unordered_set<RowPosition> exclusive_locks_;
 };
 

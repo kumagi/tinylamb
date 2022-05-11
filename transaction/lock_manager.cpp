@@ -52,7 +52,9 @@ bool LockManager::ReleaseExclusiveLock(const RowPosition& row) {
 
 bool LockManager::TryUpgradeLock(const RowPosition& row) {
   std::scoped_lock lk(latch_);
-  if (shared_locks_.size() <= 1) {
+  if (exclusive_locks_.find(row) == exclusive_locks_.end() &&
+      (shared_locks_.find(row) == shared_locks_.end() ||
+       shared_locks_[row] <= 1)) {
     shared_locks_.clear();
     exclusive_locks_.emplace(row);
     return true;

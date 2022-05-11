@@ -28,10 +28,10 @@ Status TransactionManager::PreCommit(Transaction& txn) {
   txn.SetStatus(TransactionStatus::kCommitted);
   LogRecord commit_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
   txn.prev_lsn_ = logger_->AddLog(commit_log);
-  for (auto& row : txn.read_set_) {
+  for (const auto& row : txn.read_set_) {
     lock_manager_->ReleaseSharedLock(row);
   }
-  for (auto& row : txn.write_set_) {
+  for (const auto& row : txn.write_set_) {
     lock_manager_->ReleaseExclusiveLock(row);
   }
   {

@@ -22,7 +22,7 @@ struct NamedExpression {
       : name(name_), expression(std::move(exp)) {}
 
   friend std::ostream& operator<<(std::ostream& o, const NamedExpression& ne) {
-    o << ne.expression;
+    o << *ne.expression;
     if (ne.expression->Type() == TypeTag::kColumnValue) {
       const auto* cv =
           reinterpret_cast<const ColumnValue*>(ne.expression.get());

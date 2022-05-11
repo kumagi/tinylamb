@@ -62,9 +62,9 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
     return true;
   }
   write_set_.insert(rp);
-  if ((read_set_.find(rp) != read_set_.end() &&
-       !transaction_manager_->TryUpgradeLock(rp)) ||
-      !transaction_manager_->GetExclusiveLock(rp)) {
+  if (!transaction_manager_->GetExclusiveLock(rp) &&
+      (read_set_.find(rp) != read_set_.end() &&
+       !transaction_manager_->TryUpgradeLock(rp))) {
     return false;
   }
   read_set_.erase(rp);

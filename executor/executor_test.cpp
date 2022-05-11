@@ -17,6 +17,7 @@
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
+#include "update.hpp"
 
 namespace tinylamb {
 
@@ -219,6 +220,48 @@ TEST_F(ExecutorTest, Insert) {
                            Row({Value(3), Value("extra"), Value(99.9)}),
                            Row({Value(232), Value("out"), Value(40.9)}),
                            Row({Value(0), Value("arise"), Value(9.2)})});
+  FullScan fs(txn, &tbl);
+  while (!rows.empty()) {
+    Row got;
+    RowPosition pos;
+    ASSERT_TRUE(fs.Next(&got, &pos));
+    ASSERT_NE(rows.find(got), rows.end());
+    rows.erase(got);
+  }
+  ASSERT_TRUE(rows.empty());
+}
+
+TEST_F(ExecutorTest, Update) {
+  Transaction txn = rs_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
+  Schema src_schema{
+      "SrcTable",
+      {Column("key2", ValueType::kInt64), Column("name2", ValueType::kVarChar),
+       Column("score2", ValueType::kDouble)}};
+  rs_->CreateTable(txn, src_schema);
+  ASSIGN_OR_ASSERT_FAIL(Table, right_tbl, rs_->GetTable(txn, "SrcTable"));
+
+  std::vector<NamedExpression> update_rule = {
+      NamedExpression("key", ColumnValueExp("key")),
+      NamedExpression("name", ConstantValueExp(Value("****"))),
+      NamedExpression("score",
+                      BinaryExpressionExp(ColumnValueExp("score"),
+                                          BinaryOperation::kMultiply,
+                                          ConstantValueExp(Value(2.0))))};
+  auto update = std::make_shared<Update>(
+      txn, &tbl,
+      std::make_shared<Projection>(update_rule, tbl.GetSchema(),
+                                   std::make_shared<FullScan>(txn, &tbl)));
+  std::cout << *update << "\n";
+  Row result;
+  ASSERT_TRUE(update->Next(&result, nullptr));
+  ASSERT_EQ(result[1], Value(4));
+  ASSERT_FALSE(update->Next(&result, nullptr));
+
+  std::unordered_set<Row> rows({{Row({Value(0), Value("****"), Value(2.4)})},
+                                {Row({Value(3), Value("****"), Value(24.4)})},
+                                {Row({Value(1), Value("****"), Value(9.8)})},
+                                {Row({Value(2), Value("****"), Value(8.28)})}});
   FullScan fs(txn, &tbl);
   while (!rows.empty()) {
     Row got;
