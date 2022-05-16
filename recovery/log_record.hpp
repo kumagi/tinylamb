@@ -148,7 +148,7 @@ struct LogRecord {
   friend Decoder& operator>>(Decoder& d, LogRecord& l);
   [[nodiscard]] std::string Serialize() const;
 
-  bool operator==(const LogRecord& r) const;
+  bool operator==(const LogRecord& r) const = default;
 
   void DumpPosition(std::ostream& o) const;
 

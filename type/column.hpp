@@ -25,7 +25,7 @@ class Column {
   [[nodiscard]] ValueType Type() const { return type_; }
   [[nodiscard]] Constraint GetConstraint() const { return constraint_; }
 
-  bool operator==(const Column& rhs) const;
+  bool operator==(const Column& rhs) const = default;
   friend std::ostream& operator<<(std::ostream& o, const Column& c);
   friend Encoder& operator<<(Encoder& a, const Column& c);
   friend Decoder& operator>>(Decoder& e, Column& c);

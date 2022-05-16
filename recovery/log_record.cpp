@@ -739,14 +739,6 @@ std::string LogRecord::Serialize() const {
   return ss.str();
 }
 
-bool LogRecord::operator==(const LogRecord& r) const {
-  return std::tie(type, prev_lsn, txn_id, pid, slot, undo_data, redo_data,
-                  dirty_page_table, redo_page, active_transaction_table) ==
-         std::tie(r.type, r.prev_lsn, r.txn_id, r.pid, r.slot, r.undo_data,
-                  r.redo_data, r.dirty_page_table, r.redo_page,
-                  r.active_transaction_table);
-}
-
 void LogRecord::DumpPosition(std::ostream& o) const {
   o << "{";
   if (HasPageID()) {

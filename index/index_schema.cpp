@@ -29,8 +29,5 @@ Decoder& operator>>(Decoder& e, IndexSchema& idx) {
   e >> idx.name_ >> idx.key_;
   return e;
 }
-bool IndexSchema::operator==(const IndexSchema& rhs) const {
-  return name_ == rhs.name_ && key_ == rhs.key_;
-}
 
 }  // namespace tinylamb

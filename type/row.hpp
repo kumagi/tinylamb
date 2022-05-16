@@ -31,7 +31,7 @@ struct Row {
   [[nodiscard]] Row Extract(const std::vector<size_t>& elms) const;
   Row operator+(const Row& rhs) const;
 
-  bool operator==(const Row& rhs) const;
+  bool operator==(const Row& rhs) const = default;
   bool operator!=(const Row& rhs) const { return !operator==(rhs); }
   friend std::ostream& operator<<(std::ostream& o, const Row& r);
   friend Encoder& operator<<(Encoder& e, const Row& r);

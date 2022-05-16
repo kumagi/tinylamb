@@ -74,8 +74,6 @@ Row Row::operator+(const Row& rhs) const {
   return Row(v);
 }
 
-bool Row::operator==(const Row& rhs) const { return values_ == rhs.values_; }
-
 std::ostream& operator<<(std::ostream& o, const Row& r) {
   o << "[";
   for (size_t i = 0; i < r.values_.size(); ++i) {

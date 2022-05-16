@@ -24,7 +24,7 @@ class IndexSchema {
       : name_(name), key_(std::move(key)) {}
   friend Encoder& operator<<(Encoder& a, const IndexSchema& idx);
   friend Decoder& operator>>(Decoder& e, IndexSchema& idx);
-  bool operator==(const IndexSchema& rhs) const;
+  bool operator==(const IndexSchema& rhs) const = default;
 
   std::string name_;
   std::vector<size_t> key_;

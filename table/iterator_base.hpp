@@ -15,6 +15,8 @@ class IteratorBase {
   virtual ~IteratorBase() = default;
   [[nodiscard]] virtual bool IsValid() const = 0;
   [[nodiscard]] virtual RowPosition Position() const = 0;
+  bool operator==(const IteratorBase&) const = default;
+  bool operator<=>(const IteratorBase&) const = default;
   virtual const Row& operator*() const = 0;
   virtual Row& operator*() = 0;
   const Row* operator->() const { return &operator*(); }

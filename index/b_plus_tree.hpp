@@ -33,7 +33,7 @@ class BPlusTree {
   [[nodiscard]] page_id_t Root() const { return root_; }
   BPlusTreeIterator Begin(Transaction& txn, std::string_view left = "",
                           std::string_view right = "", bool ascending = true);
-  bool operator==(const BPlusTree& rhs) const { return root_ == rhs.root_; }
+  bool operator==(const BPlusTree& rhs) const = default;
   bool SanityCheckForTest(PageManager* pm) const;
 
  private:

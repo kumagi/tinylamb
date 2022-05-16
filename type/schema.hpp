@@ -31,7 +31,7 @@ class Schema {
   [[nodiscard]] bool Empty() const { return name_.empty(); }
 
   Schema operator+(const Schema& rhs) const;
-  bool operator==(const Schema& rhs) const;
+  bool operator==(const Schema& rhs) const = default;
   friend std::ostream& operator<<(std::ostream& o, const Schema& s);
   friend Encoder& operator<<(Encoder& a, const Schema& sc);
   friend Decoder& operator>>(Decoder& a, Schema& sc);

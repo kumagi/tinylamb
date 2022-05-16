@@ -26,7 +26,7 @@ class Index {
       : sc_(name, std::move(key)), pid_(pid) {}
   friend Encoder& operator<<(Encoder& a, const Index& idx);
   friend Decoder& operator>>(Decoder& e, Index& idx);
-  bool operator==(const Index& rhs) const;
+  bool operator==(const Index& rhs) const = default;
 
   IndexSchema sc_;
   page_id_t pid_{};

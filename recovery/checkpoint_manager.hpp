@@ -55,11 +55,7 @@ class CheckpointManager {
     static size_t Size() {
       return sizeof(txn_id_t) + sizeof(TransactionStatus) + sizeof(lsn_t);
     }
-
-    bool operator==(const ActiveTransactionEntry& rhs) const {
-      return txn_id == rhs.txn_id && status == rhs.status &&
-             last_lsn == rhs.last_lsn;
-    }
+    bool operator==(const ActiveTransactionEntry& rhs) const = default;
     txn_id_t txn_id = 0;
     TransactionStatus status = TransactionStatus::kRunning;
     lsn_t last_lsn = 0;

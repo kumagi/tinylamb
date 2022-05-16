@@ -24,19 +24,6 @@ size_t Constraint::Size() const {
   }
 }
 
-bool Constraint::operator==(const Constraint& rhs) const {
-  if (ctype != rhs.ctype) return false;
-  switch (ctype) {
-    case kDefault:
-    case kForeign:
-    case kCheck:
-      return value == rhs.value;
-
-    default:
-      return true;
-  }
-}
-
 std::ostream& operator<<(std::ostream& o, const Constraint& c) {
   switch (c.ctype) {
     case tinylamb::Constraint::kNothing:

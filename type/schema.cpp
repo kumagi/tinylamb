@@ -49,10 +49,6 @@ Schema Schema::operator+(const Schema& rhs) const {
   return {"", merged};
 }
 
-bool Schema::operator==(const Schema& rhs) const {
-  return name_ == rhs.name_ && columns_ == rhs.columns_;
-}
-
 std::ostream& operator<<(std::ostream& o, const Schema& s) {
   o << s.name_ << " [ ";
   for (size_t i = 0; i < s.columns_.size(); ++i) {

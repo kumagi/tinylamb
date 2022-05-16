@@ -10,11 +10,6 @@ namespace tinylamb {
 Column::Column(std::string_view name, ValueType type, Constraint cst)
     : name_(name), type_(type), constraint_(std::move(cst)) {}
 
-bool Column::operator==(const Column& rhs) const {
-  return name_ == rhs.name_ && type_ == rhs.type_ &&
-         constraint_ == rhs.constraint_;
-}
-
 std::ostream& operator<<(std::ostream& o, const Column& c) {
   o << c.name_;
   if (c.type_ != ValueType::kUnknown) {

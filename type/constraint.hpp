@@ -43,7 +43,7 @@ struct Constraint {
   Constraint(ConstraintType ctype, const Value& v) : ctype(ctype), value(v) {}
 
   [[nodiscard]] size_t Size() const;
-  bool operator==(const Constraint& rhs) const;
+  bool operator==(const Constraint& rhs) const = default;
   [[nodiscard]] bool IsNothing() const { return ctype == kNothing; }
   friend std::ostream& operator<<(std::ostream& o, const Constraint& c);
   friend Encoder& operator<<(Encoder& a, const Constraint& c);

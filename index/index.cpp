@@ -26,8 +26,4 @@ Decoder& operator>>(Decoder& e, Index& idx) {
   return e;
 }
 
-bool Index::operator==(const Index& rhs) const {
-  return sc_ == rhs.sc_ && pid_ == rhs.pid_;
-}
-
 }  // namespace tinylamb
