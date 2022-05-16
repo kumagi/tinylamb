@@ -30,9 +30,8 @@ struct RowPosition {
     o << "{" << p.page_id << ": " << p.slot << "}";
     return o;
   }
-  bool operator==(const RowPosition& rhs) const {
-    return page_id == rhs.page_id && slot == rhs.slot;
-  }
+  bool operator==(const RowPosition& rhs) const = default;
+  bool operator!=(const RowPosition& rhs) const = default;
 
   [[nodiscard]] std::string Serialize() const {
     std::string s(Size(), '\0');

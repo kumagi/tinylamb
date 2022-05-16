@@ -73,7 +73,7 @@ TEST_F(RecoveryManagerTest, InsertAbort) {
 
   const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
 
-  ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(txn, record));
+  ASSERT_SUCCESS(page->Insert(txn, record).GetStatus());
   page.PageUnlock();
 
   ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
@@ -174,7 +174,7 @@ TEST_F(RecoveryManagerTest, InsertCrash) {
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
-    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(txn, record));
+    ASSERT_SUCCESS(page->Insert(txn, record).GetStatus());
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
               before_size - record.size() - sizeof(RowPage::RowPointer));
   }
@@ -227,7 +227,7 @@ TEST_F(RecoveryManagerTest, InsertMediaCrash) {
     ASSERT_EQ(page->Type(), PageType::kRowPage);
 
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
-    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(txn, record));
+    ASSERT_SUCCESS(page->Insert(txn, record).GetStatus());
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
               before_size - record.size() - sizeof(RowPage::RowPointer));
   }
@@ -280,7 +280,7 @@ TEST_F(RecoveryManagerTest, InsertSinglePageFailure) {
 
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
 
-    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(txn, record));
+    ASSERT_SUCCESS(page->Insert(txn, record).GetStatus());
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
               before_size - record.size() - sizeof(RowPage::RowPointer));
   }

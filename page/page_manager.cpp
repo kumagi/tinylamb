@@ -26,7 +26,7 @@ PageRef PageManager::GetPage(uint64_t page_id) {
 
 // Logically delete the page.
 void PageManager::DestroyPage(Transaction& system_txn, Page* target) {
-  GetMetaPage()->DestroyPage(system_txn, target, pool_);
+  GetMetaPage()->DestroyPage(system_txn, target);
 }
 
 PageRef PageManager::AllocateNewPage(Transaction& system_txn,

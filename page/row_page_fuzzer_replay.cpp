@@ -17,6 +17,10 @@ void TestCase(std::string_view input) {
 }
 
 int main(int argc, char** argv) {
+  if (argc < 2) {
+    LOG(FATAL) << "set test file.";
+    return 1;
+  }
   std::filesystem::path target_dir(argv[1]);
 
   std::filesystem::directory_iterator dir(target_dir);

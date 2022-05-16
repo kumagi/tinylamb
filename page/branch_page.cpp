@@ -22,9 +22,8 @@ std::string OmittedString(std::string_view original, size_t length) {
         "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
     omitted_key += original.substr(original.length() - 8);
     return omitted_key;
-  } else {
-    return std::string(original);
   }
+  return std::string(original);
 }
 
 }  // anonymous namespace
@@ -37,26 +36,16 @@ void BranchPage::SetLowestValue(page_id_t pid, Transaction& txn,
   txn.SetLowestLog(pid, value);
 }
 
-Status BranchPage::AttachLeft(page_id_t pid, Transaction& txn,
-                              std::string_view key, page_id_t value) {
-  assert(0 < row_count_);
-  const bin_size_t physical_size = SerializeSize(key) + sizeof(value);
-  if (free_size_ < physical_size + sizeof(RowPointer)) return Status::kNoSpace;
-  if (0 != row_count_ && GetKey(0) == key) return Status::kDuplicates;
-  assert(key < GetKey(0));
-  InsertImpl(key, lowest_page_);
-  txn.InsertBranchLog(pid, key, lowest_page_);
-  SetLowestValue(pid, txn, value);
-  txn.SetLowestLog(pid, value);
-  return Status::kSuccess;
-}
-
 Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
                           page_id_t value) {
   const bin_size_t physical_size = SerializeSize(key) + sizeof(value);
-  if (free_size_ < physical_size + sizeof(RowPointer)) return Status::kNoSpace;
+  if (free_size_ < physical_size + sizeof(RowPointer)) {
+    return Status::kNoSpace;
+  }
   size_t pos = SearchToInsert(key);
-  if (pos != row_count_ && GetKey(pos) == key) return Status::kDuplicates;
+  if (pos != row_count_ && GetKey(pos) == key) {
+    return Status::kDuplicates;
+  }
   InsertImpl(key, value);
   txn.InsertBranchLog(pid, key, value);
   return Status::kSuccess;
@@ -119,7 +108,7 @@ void BranchPage::DeleteImpl(std::string_view key) {
   --row_count_;
 }
 
-Status BranchPage::GetPageForKey(Transaction& txn, std::string_view key,
+Status BranchPage::GetPageForKey(Transaction& /*txn*/, std::string_view key,
                                  page_id_t* result) const {
   assert(0 < row_count_);
   if (key < GetKey(0)) {
@@ -130,21 +119,7 @@ Status BranchPage::GetPageForKey(Transaction& txn, std::string_view key,
   return Status::kSuccess;
 }
 
-Status BranchPage::FindForKey(Transaction& txn, std::string_view key,
-                              page_id_t* result) const {
-  assert(0 < row_count_);
-  size_t pos = Search(key);
-  if (RowCount() < pos) {
-    return Status::kNotExists;
-  }
-  if (key == GetKey(pos)) {
-    *result = GetValue(pos);
-    return Status::kSuccess;
-  }
-  return Status::kNotExists;
-}
-
-void BranchPage::SplitInto(page_id_t pid, Transaction& txn,
+void BranchPage::SplitInto(page_id_t /*pid*/, Transaction& txn,
                            std::string_view key, Page* right,
                            std::string* middle) {
   const size_t kPayload = kPageBodySize - offsetof(BranchPage, rows_);
@@ -184,14 +159,6 @@ void BranchPage::SplitInto(page_id_t pid, Transaction& txn,
   } else {
     assert(expected_size <= free_size_);
   }
-}
-
-void BranchPage::Merge(page_id_t pid, Transaction& txn, Page* child) const {
-  assert(child->Type() == PageType::kBranchPage);
-  assert(child->body.branch_page.row_count_ == 0);
-  assert(0 < row_count_);
-  const page_id_t new_child = child->body.branch_page.lowest_page_;
-  LOG(ERROR) << pid << " and " << new_child << " merge";
 }
 
 bin_size_t BranchPage::SearchToInsert(std::string_view key) const {

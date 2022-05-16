@@ -4,8 +4,6 @@
 
 #include "executor/full_scan.hpp"
 
-#include <cassert>
-
 #include "table/table.hpp"
 
 namespace tinylamb {
@@ -25,7 +23,7 @@ bool tinylamb::FullScan::Next(Row* dst, RowPosition* rp) {
   return true;
 }
 
-void FullScan::Dump(std::ostream& o, int) const {
+void FullScan::Dump(std::ostream& o, int /*indent*/) const {
   o << "FullScan: " << table_->GetSchema().Name();
 }
 

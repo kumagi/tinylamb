@@ -55,14 +55,14 @@ PageRef Page::AllocateNewPage(Transaction& txn, PagePool& pool,
   return ret;
 }
 
-void Page::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
+void Page::DestroyPage(Transaction& txn, Page* target) {
   ASSERT_PAGE_TYPE(PageType::kMetaPage)
-  body.meta_page.DestroyPage(txn, target, pool);
+  body.meta_page.DestroyPage(txn, target);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
 }
 
-size_t Page::RowCount(Transaction& txn) const {
+size_t Page::RowCount(Transaction& /*txn*/) const {
   if (type == PageType::kRowPage) {
     return body.row_page.RowCount();
   }
@@ -249,12 +249,6 @@ Status Page::GetPageForKey(Transaction& txn, std::string_view key,
   return body.branch_page.GetPageForKey(txn, key, page);
 }
 
-Status Page::FindForKey(Transaction& txn, std::string_view key,
-                        page_id_t* page) const {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage)
-  return body.branch_page.FindForKey(txn, key, page);
-}
-
 void Page::SetLowestValue(Transaction& txn, page_id_t v) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage)
   body.branch_page.SetLowestValue(PageID(), txn, v);
@@ -266,11 +260,6 @@ void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
                      std::string* middle) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage)
   body.branch_page.SplitInto(PageID(), txn, new_key, right, middle);
-}
-
-void Page::Merge(Transaction& txn, Page* page) {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage)
-  body.branch_page.Merge(PageID(), txn, page);
 }
 
 void Page::PageTypeChange(Transaction& txn, PageType new_type) {

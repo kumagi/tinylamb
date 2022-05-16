@@ -85,7 +85,6 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
 TEST_F(IndexScanIteratorTest, ScanDecending) {
   Transaction txn = rs_->Begin();
   ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->GetTable(txn, kTableName));
-  RowPosition rp;
   for (int i = 0; i < 230; ++i) {
     ASSERT_SUCCESS(
         table

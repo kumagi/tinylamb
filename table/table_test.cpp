@@ -80,7 +80,7 @@ TEST_F(TableTest, Update) {
   ASSIGN_OR_ASSERT_FAIL(
       RowPosition, rp,
       tbl.Insert(txn, Row({Value(1), Value("string"), Value(3.3)})));
-  ASSIGN_OR_ASSERT_FAIL(RowPosition, new_rp, tbl.Update(txn, rp, new_row));
+  ASSERT_SUCCESS(tbl.Update(txn, rp, new_row).GetStatus());
   ASSIGN_OR_ASSERT_FAIL(Row, read, tbl.Read(txn, rp));
   ASSERT_EQ(read, new_row);
 }
@@ -137,9 +137,11 @@ TEST_F(TableTest, IndexUpdateRead) {
   ASSIGN_OR_ASSERT_FAIL(
       RowPosition, rp2,
       tbl.Insert(txn, Row({Value(3), Value("foo"), Value(1.5)})));
+  ASSERT_NE(rp0, rp2);
   ASSIGN_OR_ASSERT_FAIL(
       RowPosition, rp3,
       tbl.Update(txn, rp1, Row({Value(2), Value("baz"), Value(5.8)})));
+  ASSERT_EQ(rp1, rp3);
 
   // TODO(kumagi): do index scan.
 }
@@ -158,6 +160,7 @@ TEST_F(TableTest, IndexUpdateDelete) {
       tbl.Insert(txn, Row({Value(3), Value("foo"), Value(1.5)})));
   ASSERT_SUCCESS(tbl.Delete(txn, rp1));
   // TODO(kumagi): do index scan.
+  ASSERT_NE(rp2, rp3);
 }
 
 std::string KeyPayload(int num, int width) {

@@ -31,7 +31,7 @@ class Page {
   // Meta page manipulations.
   PageRef AllocateNewPage(Transaction& txn, PagePool& pool,
                           PageType new_page_type);
-  void DestroyPage(Transaction& txn, Page* target, PagePool& pool);
+  void DestroyPage(Transaction& txn, Page* target);
 
   size_t RowCount(Transaction& txn) const;
 
@@ -66,12 +66,9 @@ class Page {
   Status UpdateBranch(Transaction& txn, std::string_view key, page_id_t pid);
   Status GetPageForKey(Transaction& txn, std::string_view key,
                        page_id_t* page) const;
-  Status FindForKey(Transaction& txn, std::string_view key,
-                    page_id_t* page) const;
   void SetLowestValue(Transaction& txn, page_id_t i);
   void SplitInto(Transaction& txn, std::string_view new_key, Page* right,
                  std::string* middle);
-  void Merge(Transaction& txn, Page* page);
   void PageTypeChange(Transaction& txn, PageType new_type);
 
   // Internal methods exposed for recovery.

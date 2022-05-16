@@ -31,7 +31,7 @@ PageRef MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
 }
 
 // Precondition: latch of page is taken by txn.
-void MetaPage::DestroyPage(Transaction& txn, Page* target, PagePool& pool) {
+void MetaPage::DestroyPage(Transaction& txn, Page* target) {
   page_id_t free_page_id = target->PageID();
   target->PageInit(free_page_id, PageType::kFreePage);
   assert(target->PageID() == free_page_id);

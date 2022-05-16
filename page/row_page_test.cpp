@@ -119,6 +119,7 @@ TEST_F(RowPageTest, InsertZeroLenAbort) {
   auto txn = tm_->Begin();
   PageRef ref = p_->GetPage(page_id_);
   ASSIGN_OR_ASSERT_FAIL(slot_t, s, ref->Insert(txn, ""));
+  ASSERT_EQ(s, 0);
   ref.PageUnlock();
   txn.Abort();
 }
@@ -157,21 +158,25 @@ TEST_F(RowPageTest, DeFragmentInvoked) {
 }
 
 TEST_F(RowPageTest, InsertTwoThreads) {
-  auto txn1 = tm_->Begin(), txn2 = tm_->Begin();
+  auto txn1 = tm_->Begin();
+  auto txn2 = tm_->Begin();
   {  // txn1
     PageRef ref = p_->GetPage(page_id_);
     std::string message = "message1";
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn1, message));
+    ASSERT_EQ(slot, 0);
   }
   {
     PageRef ref = p_->GetPage(page_id_);
     std::string message = "message2";
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn2, message));
+    ASSERT_EQ(slot, 1);
   }
   {
     PageRef ref = p_->GetPage(page_id_);
     std::string message = "message1-again";
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn1, message));
+    ASSERT_EQ(slot, 2);
   }
   ASSERT_SUCCESS(txn1.PreCommit());
   ASSERT_SUCCESS(txn2.PreCommit());
@@ -224,7 +229,7 @@ TEST_F(RowPageTest, UpdateAndDeleteHeavy) {
       ASSERT_SUCCESS(ref->Update(txn, slot, key));
     } else {
       ASSERT_SUCCESS(ref->Delete(txn, slot));
-      ASSIGN_OR_ASSERT_FAIL(slot_t, s, ref->Insert(txn, key));
+      ASSERT_SUCCESS(ref->Insert(txn, key).GetStatus());
     }
     rows[slot] = key;
   }

@@ -98,8 +98,7 @@ TEST_F(CheckpointTest, CheckpointAbortRecovery) {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint();
     page->Update(txn, slot, "aborted");
-    ASSIGN_OR_ASSERT_FAIL(slot_t, will_be_deleted_row,
-                          page->Insert(txn, "will be deleted"));
+    ASSERT_SUCCESS(page->Insert(txn, "will be deleted").GetStatus());
   }
   // Note that the txn is not committed.
   Recover();
@@ -117,8 +116,7 @@ TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint([&]() {
       page->Update(txn, slot, "aborted");
-      ASSIGN_OR_ASSERT_FAIL(slot_t, will_be_deleted_row,
-                            page->Insert(txn, "will be deleted"));
+      ASSERT_SUCCESS(page->Insert(txn, "will be deleted").GetStatus());
     });
   }
   // Note that the txn is not committed.

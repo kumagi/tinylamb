@@ -13,7 +13,6 @@
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
 #include "table/table.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 
@@ -58,7 +57,6 @@ class OptimizerTest : public ::testing::Test {
           txn, Schema("Sc3", {Column("e1", ValueType::kInt64),
                               Column("e2", ValueType::kDouble)})));
       ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, "Sc3"));
-      RowPosition rp;
       for (int i = 10; 0 < i; --i) {
         ASSERT_SUCCESS(
             tbl.Insert(txn, Row({Value(i), Value(i + 53.4)})).GetStatus());
@@ -82,7 +80,7 @@ class OptimizerTest : public ::testing::Test {
     std::remove(rs_->GetPageStorage()->MasterRecordName().c_str());
   }
 
-  void DumpAll(const QueryData& qd) {
+  void DumpAll(const QueryData& qd) const {
     std::cout << qd << "\n\n";
     Optimizer opt;
     Schema sc;
