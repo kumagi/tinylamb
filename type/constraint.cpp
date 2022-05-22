@@ -24,6 +24,16 @@ size_t Constraint::Size() const {
   }
 }
 
+bool Constraint::operator==(const Constraint& rhs) const {
+  switch (ctype) {
+    case kDefault:
+      return rhs.ctype == kDefault && value == rhs.value;
+
+    default:
+      return ctype == rhs.ctype;
+  }
+}
+
 std::ostream& operator<<(std::ostream& o, const Constraint& c) {
   switch (c.ctype) {
     case tinylamb::Constraint::kNothing:
@@ -35,7 +45,7 @@ std::ostream& operator<<(std::ostream& o, const Constraint& c) {
     case tinylamb::Constraint::kUnique:
       o << "UNIQUE";
       break;
-    case tinylamb::Constraint::kPrimary:
+    case tinylamb::Constraint::kPrimaryKey:
       o << "PRIMARY KEY";
       break;
     case tinylamb::Constraint::kIndex:

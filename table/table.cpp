@@ -22,8 +22,7 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
 
   Iterator it = BeginFullScan(txn);
   while (it.IsValid()) {
-    Row current = *it;
-    new_bpt.Insert(txn, current.Extract(idx.key_).EncodeMemcomparableFormat(),
+    new_bpt.Insert(txn, it->Extract(idx.key_).EncodeMemcomparableFormat(),
                    it.Position().Serialize());
   }
   return Status::kSuccess;
@@ -52,7 +51,8 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
   ref.PageUnlock();
   for (const auto& idx : indexes_) {
     BPlusTree bpt(idx.pid_);
-    RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(row), rp.Serialize()));
+    if (idx.IsUnique())
+      RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(row), rp.Serialize()));
   }
   return rp;
 }

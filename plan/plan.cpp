@@ -12,8 +12,8 @@ Plan NewFullScanPlan(std::string_view table_name, const TableStatistics& ts) {
   return std::make_shared<FullScanPlan>(table_name, ts);
 }
 
-Plan NewProductPlan(const Plan& left_src, std::vector<size_t> left_cols,
-                    const Plan& right_src, std::vector<size_t> right_cols) {
+Plan NewProductPlan(const Plan& left_src, std::vector<slot_t> left_cols,
+                    const Plan& right_src, std::vector<slot_t> right_cols) {
   return std::make_shared<ProductPlan>(left_src, std::move(left_cols),
                                        right_src, std::move(right_cols));
 }

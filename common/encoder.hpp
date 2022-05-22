@@ -25,6 +25,7 @@ class Encoder {
   Encoder& operator<<(int64_t i64);
   Encoder& operator<<(double d);
   Encoder& operator<<(ValueType v);
+  Encoder& operator<<(bool v);
 
   template <typename T>
   Encoder& operator<<(const std::vector<T>& vec) {

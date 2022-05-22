@@ -28,7 +28,7 @@ struct Row {
   [[nodiscard]] std::string EncodeMemcomparableFormat() const;
   void Clear() { values_.clear(); }
   [[nodiscard]] bool IsValid() const { return values_.empty(); }
-  [[nodiscard]] Row Extract(const std::vector<size_t>& elms) const;
+  [[nodiscard]] Row Extract(const std::vector<slot_t>& elms) const;
   Row operator+(const Row& rhs) const;
 
   bool operator==(const Row& rhs) const = default;

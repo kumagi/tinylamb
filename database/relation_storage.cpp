@@ -54,6 +54,17 @@ Status RelationStorage::CreateTable(Transaction& txn, const Schema& schema) {
   Table new_table(schema, table_page->PageID());
   TableStatistics new_stat(schema);
 
+  // Prepare index for primary-key and unique-key.
+  for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
+    const Column& col = schema.GetColumn(i);
+    if (col.GetConstraint().IsUnique()) {
+      std::stringstream idx_name_stream;
+      idx_name_stream << schema.Name() << "|" << col.Name();
+      IndexSchema new_idx(idx_name_stream.str(), {i}, {});
+      new_table.CreateIndex(txn, new_idx);
+    }
+  }
+
   RETURN_IF_FAIL(catalog_.Insert(txn, schema.Name(), Serialize(new_table)));
   return statistics_.Insert(txn, std::string(schema.Name()),
                             Serialize(new_stat));

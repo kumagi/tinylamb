@@ -21,12 +21,12 @@ std::string IndexSchema::GenerateKey(const Row& row) const {
 }
 
 Encoder& operator<<(Encoder& a, const IndexSchema& idx) {
-  a << idx.name_ << idx.key_;
+  a << idx.name_ << idx.key_ << idx.include_ << (bool)idx.mode_;
   return a;
 }
 
 Decoder& operator>>(Decoder& e, IndexSchema& idx) {
-  e >> idx.name_ >> idx.key_;
+  e >> idx.name_ >> idx.key_ >> idx.include_ >> (bool&)idx.mode_;
   return e;
 }
 

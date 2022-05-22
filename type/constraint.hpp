@@ -32,7 +32,7 @@ struct Constraint {
     kNotNull,
     kDefault,
     kUnique,
-    kPrimary,
+    kPrimaryKey,
     kForeign,  // Won't implemented.
     kCheck,    // Won't implemented.
     kIndex,
@@ -43,8 +43,11 @@ struct Constraint {
   Constraint(ConstraintType ctype, const Value& v) : ctype(ctype), value(v) {}
 
   [[nodiscard]] size_t Size() const;
-  bool operator==(const Constraint& rhs) const = default;
+  bool operator==(const Constraint& rhs) const;
   [[nodiscard]] bool IsNothing() const { return ctype == kNothing; }
+  [[nodiscard]] bool IsUnique() const {
+    return ctype == kUnique || ctype == kPrimaryKey;
+  }
   friend std::ostream& operator<<(std::ostream& o, const Constraint& c);
   friend Encoder& operator<<(Encoder& a, const Constraint& c);
   friend Decoder& operator>>(Decoder& a, Constraint& c);

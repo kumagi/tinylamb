@@ -6,8 +6,8 @@
 
 namespace tinylamb {
 
-HashJoin::HashJoin(const Executor& left, std::vector<size_t> left_cols,
-                   const Executor& right, std::vector<size_t> right_cols)
+HashJoin::HashJoin(const Executor& left, std::vector<slot_t> left_cols,
+                   const Executor& right, std::vector<slot_t> right_cols)
     : left_(left),
       left_cols_(std::move(left_cols)),
       right_(right),

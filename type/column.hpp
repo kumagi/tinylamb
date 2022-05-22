@@ -18,8 +18,8 @@ class Encoder;
 class Column {
  public:
   Column() = default;
-  Column(std::string_view name, ValueType type = ValueType::kUnknown,
-         Constraint cst = Constraint());
+  explicit Column(std::string_view name, ValueType type = ValueType::kUnknown,
+                  Constraint cst = Constraint());
 
   [[nodiscard]] std::string_view Name() const { return name_; }
   [[nodiscard]] ValueType Type() const { return type_; }

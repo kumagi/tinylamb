@@ -34,8 +34,8 @@ class PlanBase {
 
 typedef std::shared_ptr<PlanBase> Plan;
 Plan NewFullScanPlan(std::string_view table_name, const TableStatistics& ts);
-Plan NewProductPlan(const Plan& left_src, std::vector<size_t> left_cols,
-                    const Plan& right_src, std::vector<size_t> right_cols);
+Plan NewProductPlan(const Plan& left_src, std::vector<slot_t> left_cols,
+                    const Plan& right_src, std::vector<slot_t> right_cols);
 Plan NewProductPlan(const Plan& left_src, const Plan& right_src);
 Plan NewSelectionPlan(const Plan& src, const Expression& exp,
                       const TableStatistics& stat);

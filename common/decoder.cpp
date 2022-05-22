@@ -44,4 +44,9 @@ Decoder& Decoder::operator>>(ValueType& v) {
   return *this;
 }
 
+Decoder& Decoder::operator>>(bool& v) {
+  is_->read(reinterpret_cast<char*>(&v), sizeof(v));
+  return *this;
+}
+
 }  // namespace tinylamb

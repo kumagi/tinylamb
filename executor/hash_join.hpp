@@ -17,8 +17,8 @@ namespace tinylamb {
 
 class HashJoin : public ExecutorBase {
  public:
-  HashJoin(const Executor& left, std::vector<size_t> left_cols,
-           const Executor& right, std::vector<size_t> right_cols);
+  HashJoin(const Executor& left, std::vector<slot_t> left_cols,
+           const Executor& right, std::vector<slot_t> right_cols);
 
   ~HashJoin() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
@@ -29,9 +29,9 @@ class HashJoin : public ExecutorBase {
 
  private:
   Executor left_;
-  std::vector<size_t> left_cols_;
+  std::vector<slot_t> left_cols_;
   Executor right_;
-  std::vector<size_t> right_cols_;
+  std::vector<slot_t> right_cols_;
 
   Row hold_left_;
   std::string left_key_;

@@ -25,6 +25,7 @@ class Decoder {
   Decoder& operator>>(int64_t& i64);
   Decoder& operator>>(double& d);
   Decoder& operator>>(ValueType& v);
+  Decoder& operator>>(bool& v);
 
   template <typename T>
   Decoder& operator>>(std::vector<T>& vec) {

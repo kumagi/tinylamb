@@ -11,7 +11,7 @@
 
 #include "common/constants.hpp"
 #include "common/serdes.hpp"
-#include "index_schema.hpp"
+#include "index/index_schema.hpp"
 
 namespace tinylamb {
 struct Row;
@@ -22,8 +22,10 @@ class Index {
  public:
   Index() = default;
   [[nodiscard]] std::string GenerateKey(const Row& row) const;
-  Index(std::string_view name, std::vector<size_t> key, page_id_t pid)
-      : sc_(name, std::move(key)), pid_(pid) {}
+  Index(std::string_view name, std::vector<slot_t> key, page_id_t pid,
+        std::vector<slot_t> include = {}, IndexMode mode = IndexMode::kUnique)
+      : sc_(name, std::move(key), std::move(include), mode), pid_(pid) {}
+  [[nodiscard]] bool IsUnique() const { return sc_.IsUnique(); }
   friend Encoder& operator<<(Encoder& a, const Index& idx);
   friend Decoder& operator>>(Decoder& e, Index& idx);
   bool operator==(const Index& rhs) const = default;

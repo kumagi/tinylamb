@@ -13,8 +13,8 @@ class ExecutorBase;
 
 class ProductPlan : public PlanBase {
  public:
-  ProductPlan(Plan left_src, std::vector<size_t> left_cols, Plan right_src,
-              std::vector<size_t> right_cols);
+  ProductPlan(Plan left_src, std::vector<slot_t> left_cols, Plan right_src,
+              std::vector<slot_t> right_cols);
   ProductPlan(Plan left_src, Plan right_src);
 
   ~ProductPlan() override = default;
@@ -28,8 +28,8 @@ class ProductPlan : public PlanBase {
  public:
   Plan left_src_;
   Plan right_src_;
-  std::vector<size_t> left_cols_;
-  std::vector<size_t> right_cols_;
+  std::vector<slot_t> left_cols_;
+  std::vector<slot_t> right_cols_;
 };
 
 }  // namespace tinylamb

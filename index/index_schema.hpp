@@ -16,18 +16,28 @@ struct Row;
 class Encoder;
 class Decoder;
 
+enum class IndexMode : bool { kUnique = true, kNonUnique = false };
+
 class IndexSchema {
  public:
   IndexSchema() = default;
+  IndexSchema(std::string_view name, std::vector<slot_t> key,
+              std::vector<slot_t> include = {},
+              IndexMode mode = IndexMode::kUnique)
+      : name_(name),
+        key_(std::move(key)),
+        include_(std::move(include)),
+        mode_(mode) {}
   [[nodiscard]] std::string GenerateKey(const Row& row) const;
-  IndexSchema(std::string_view name, std::vector<size_t> key)
-      : name_(name), key_(std::move(key)) {}
+  [[nodiscard]] bool IsUnique() const { return mode_ == IndexMode::kUnique; }
   friend Encoder& operator<<(Encoder& a, const IndexSchema& idx);
   friend Decoder& operator>>(Decoder& e, IndexSchema& idx);
   bool operator==(const IndexSchema& rhs) const = default;
 
   std::string name_;
-  std::vector<size_t> key_;
+  std::vector<slot_t> key_;
+  std::vector<slot_t> include_;
+  IndexMode mode_;
 };
 
 }  // namespace tinylamb

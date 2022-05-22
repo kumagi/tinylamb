@@ -18,6 +18,7 @@ TEST(Constraint, SerializeDeserialize) {
   SerializeDeserializeTest(Constraint(Constraint::kNothing));
   SerializeDeserializeTest(Constraint(Constraint::kDefault, Value(2)));
   SerializeDeserializeTest(Constraint(Constraint::kUnique));
+  SerializeDeserializeTest(Constraint(Constraint::kPrimaryKey));
   SerializeDeserializeTest(Constraint(Constraint::kNotNull));
 }
 

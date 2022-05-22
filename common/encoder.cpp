@@ -46,4 +46,9 @@ Encoder& Encoder::operator<<(ValueType v) {
   return *this;
 }
 
+Encoder& Encoder::operator<<(bool v) {
+  os_->write(reinterpret_cast<const char*>(&v), sizeof(v));
+  return *this;
+}
+
 }  // namespace tinylamb

@@ -17,7 +17,7 @@ bool tinylamb::FullScan::Next(Row* dst, RowPosition* rp) {
   }
   *dst = *iter_;
   if (rp != nullptr) {
-    *rp = iter_->Position();
+    *rp = iter_.Position();
   }
   ++iter_;
   return true;

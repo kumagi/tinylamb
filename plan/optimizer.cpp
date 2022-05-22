@@ -134,7 +134,7 @@ bool ContainsAny(const std::unordered_set<std::string>& left,
 }
 
 void ExtractColumns(const Schema& sc, ExpressionBase* exp,
-                    std::vector<size_t>& dst) {
+                    std::vector<slot_t>& dst) {
   if (exp->Type() == TypeTag::kColumnValue) {
     auto* cv = reinterpret_cast<ColumnValue*>(exp);
     const std::string& name = cv->ColumnName();
@@ -150,8 +150,8 @@ void ExtractColumns(const Schema& sc, ExpressionBase* exp,
   }
 }
 
-std::vector<size_t> TargetColumns(const Schema& sc, ExpressionBase* exp) {
-  std::vector<size_t> out;
+std::vector<slot_t> TargetColumns(const Schema& sc, ExpressionBase* exp) {
+  std::vector<slot_t> out;
   ExtractColumns(sc, exp, out);
   return out;
 }
@@ -180,9 +180,9 @@ Plan BestJoin(
       if (ReferenceWithin(be->Left().get(), left_column_names) &&
           ReferenceWithin(be->Right().get(), right_column_names)) {
         // We can use HashJoin!
-        std::vector<size_t> left_cols =
+        std::vector<slot_t> left_cols =
             TargetColumns(left_schema, be->Left().get());
-        std::vector<size_t> right_cols =
+        std::vector<slot_t> right_cols =
             TargetColumns(right_schema, be->Right().get());
         return BetterPlan(ctx,
                           NewProductPlan(left.second.plan, left_cols,

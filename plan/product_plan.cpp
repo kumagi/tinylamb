@@ -13,8 +13,8 @@
 
 namespace tinylamb {
 
-ProductPlan::ProductPlan(Plan left_src, std::vector<size_t> left_cols,
-                         Plan right_src, std::vector<size_t> right_cols)
+ProductPlan::ProductPlan(Plan left_src, std::vector<slot_t> left_cols,
+                         Plan right_src, std::vector<slot_t> right_cols)
     : left_src_(std::move(left_src)),
       right_src_(std::move(right_src)),
       left_cols_(std::move(left_cols)),

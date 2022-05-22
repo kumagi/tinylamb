@@ -20,7 +20,7 @@ class Schema {
  public:
   Schema() = default;
   Schema(std::string_view schema_name, std::vector<Column> columns);
-  [[nodiscard]] size_t ColumnCount() const { return columns_.size(); }
+  [[nodiscard]] slot_t ColumnCount() const { return columns_.size(); }
   [[nodiscard]] std::string_view Name() const { return name_; }
   [[nodiscard]] const Column& GetColumn(size_t idx) const {
     return columns_[idx];

@@ -104,7 +104,9 @@ size_t Value::Deserialize(const char* src, ValueType as_type) {
 }
 
 bool Value::operator==(const Value& rhs) const {
-  if (type != rhs.type) return false;
+  if (type != rhs.type) {
+    return false;
+  }
   switch (type) {
     case ValueType::kUnknown:
       throw std::runtime_error("Unknown type cannot be compared.");
@@ -281,9 +283,11 @@ Value Value::operator+(const Value& rhs) const {
   }
   if (type == ValueType::kInt64) {
     return Value(value.int_value + rhs.value.int_value);
-  } else if (type == ValueType::kDouble) {
+  }
+  if (type == ValueType::kDouble) {
     return Value(value.double_value + rhs.value.double_value);
-  } else if (type == ValueType::kVarChar) {
+  }
+  if (type == ValueType::kVarChar) {
     std::string new_string(
         value.varchar_value.size() + rhs.value.varchar_value.size(), '\0');
     memcpy(new_string.data(), value.varchar_value.data(),
@@ -305,7 +309,8 @@ Value Value::operator-(const Value& rhs) const {
   }
   if (type == ValueType::kInt64) {
     return Value(value.int_value - rhs.value.int_value);
-  } else if (type == ValueType::kDouble) {
+  }
+  if (type == ValueType::kDouble) {
     return Value(value.double_value - rhs.value.double_value);
   }
   throw std::runtime_error("Cannot do '-' against this type");
@@ -317,7 +322,8 @@ Value Value::operator*(const Value& rhs) const {
   }
   if (type == ValueType::kInt64) {
     return Value(value.int_value * rhs.value.int_value);
-  } else if (type == ValueType::kDouble) {
+  }
+  if (type == ValueType::kDouble) {
     return Value(value.double_value * rhs.value.double_value);
   }
   throw std::runtime_error("Cannot do '*' against this type");
@@ -329,7 +335,8 @@ Value Value::operator/(const Value& rhs) const {
   }
   if (type == ValueType::kInt64) {
     return Value(value.int_value / rhs.value.int_value);
-  } else if (type == ValueType::kDouble) {
+  }
+  if (type == ValueType::kDouble) {
     return Value(value.double_value / rhs.value.double_value);
   }
   throw std::runtime_error("Cannot do '/' against this type");

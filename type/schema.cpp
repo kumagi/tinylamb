@@ -35,7 +35,9 @@ std::unordered_set<std::string> Schema::ColumnSet() const {
 
 int Schema::Offset(std::string_view name) const {
   for (size_t i = 0; i < columns_.size(); ++i) {
-    if (columns_[i].Name() == name) return i;
+    if (columns_[i].Name() == name) {
+      return i;
+    }
   }
   return -1;
 }
@@ -52,7 +54,9 @@ Schema Schema::operator+(const Schema& rhs) const {
 std::ostream& operator<<(std::ostream& o, const Schema& s) {
   o << s.name_ << " [ ";
   for (size_t i = 0; i < s.columns_.size(); ++i) {
-    if (0 < i) o << " | ";
+    if (0 < i) {
+      o << " | ";
+    }
     o << s.columns_[i];
   }
   o << " ]";
