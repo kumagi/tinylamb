@@ -21,7 +21,6 @@ class IndexScanIterator : public IteratorBase {
     return bpt_ == rhs.bpt_ && txn_ == rhs.txn_ &&
            current_row_ == rhs.current_row_;
   }
-  
   [[nodiscard]] bool IsValid() const override;
   [[nodiscard]] RowPosition Position() const override;
   IteratorBase& operator++() override;
