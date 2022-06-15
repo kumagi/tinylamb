@@ -51,6 +51,8 @@ class TransactionManager {
                            std::string_view redo);
   void CompensateDeleteBranchLog(txn_id_t txn_id, page_id_t pid,
                                  std::string_view key, page_id_t redo);
+  void CompensateSetLowestValueLog(txn_id_t txn_id, page_id_t pid,
+                                   page_id_t redo);
 
   bool GetExclusiveLock(const RowPosition& rp);
   bool GetSharedLock(const RowPosition& rp);

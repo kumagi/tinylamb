@@ -9,6 +9,7 @@
 #include "index/b_plus_tree.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "page/page_manager.hpp"
+#include "page/row_position.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 
@@ -18,12 +19,15 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
   PageRef root_page =
       txn.PageManager()->AllocateNewPage(txn, PageType::kLeafPage);
   BPlusTree new_bpt(root_page->PageID());
-  indexes_.emplace_back(idx.name_, idx.key_, root_page->PageID());
+  indexes_.emplace_back(idx.name_, idx.key_, root_page->PageID(), idx.include_,
+                        idx.mode_);
 
   Iterator it = BeginFullScan(txn);
   while (it.IsValid()) {
-    new_bpt.Insert(txn, it->Extract(idx.key_).EncodeMemcomparableFormat(),
-                   it.Position().Serialize());
+    RETURN_IF_FAIL(
+        new_bpt.Insert(txn, it->Extract(idx.key_).EncodeMemcomparableFormat(),
+                       it.Position().Serialize()));
+    ++it;
   }
   return Status::kSuccess;
 }
@@ -49,11 +53,7 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
     last_pid_ = new_page->PageID();
   }
   ref.PageUnlock();
-  for (const auto& idx : indexes_) {
-    BPlusTree bpt(idx.pid_);
-    if (idx.IsUnique())
-      RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(row), rp.Serialize()));
-  }
+  RETURN_IF_FAIL(IndexInsert(txn, row, rp));
   return rp;
 }
 
@@ -64,10 +64,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   }
   ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
   RowPosition new_pos = pos;
-  for (const auto& idx : indexes_) {
-    BPlusTree bpt(idx.pid_);
-    RETURN_IF_FAIL(bpt.Delete(txn, idx.GenerateKey(original_row)));
-  }
+  RETURN_IF_FAIL(IndexDelete(txn, pos));
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
   PageRef page = txn.PageManager()->GetPage(new_pos.page_id);
@@ -87,10 +84,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     new_pos = new_row_pos;
     last_pid_ = new_page->PageID();
   }
-  for (const auto& idx : indexes_) {
-    BPlusTree bpt(idx.pid_);
-    RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(row), pos.Serialize()));
-  }
+  RETURN_IF_FAIL(IndexInsert(txn, row, new_pos));
   return new_pos;
 }
 
@@ -98,11 +92,7 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
   if (!txn.AddWriteSet(pos)) {
     return Status::kConflicts;
   }
-  ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
-  for (const auto& idx : indexes_) {
-    BPlusTree bpt(idx.pid_);
-    RETURN_IF_FAIL(bpt.Delete(txn, idx.GenerateKey(original_row)));
-  }
+  RETURN_IF_FAIL(IndexDelete(txn, pos));
   return txn.PageManager()->GetPage(pos.page_id)->Delete(txn, pos.slot);
 }
 
@@ -113,6 +103,54 @@ StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
   Row result;
   result.Deserialize(read_row.data(), schema_);
   return result;
+}
+
+Status Table::IndexInsert(Transaction& txn, const Row& new_row,
+                          const RowPosition& pos) {
+  for (const auto& idx : indexes_) {
+    BPlusTree bpt(idx.pid_);
+    if (idx.IsUnique()) {
+      LOG(TRACE) << "insert: " << idx.sc_.name_ << " is unique";
+      RETURN_IF_FAIL(
+          bpt.Insert(txn, idx.GenerateKey(new_row), pos.Serialize()));
+    } else {
+      StatusOr<std::string_view> existing_value =
+          bpt.Read(txn, idx.GenerateKey(new_row));
+      if (existing_value.HasValue()) {
+        std::string_view existing_data = existing_value.Value();
+        auto rps = Decode<std::vector<RowPosition>>(existing_data);
+        rps.push_back(pos);
+        RETURN_IF_FAIL(bpt.Update(txn, idx.GenerateKey(new_row), Encode(rps)));
+      } else {
+        std::vector<RowPosition> rps{pos};
+        RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(new_row), Encode(rps)));
+      }
+    }
+  }
+  return Status::kSuccess;
+}
+
+Status Table::IndexDelete(Transaction& txn, const RowPosition& pos) {
+  ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
+  for (const auto& idx : indexes_) {
+    BPlusTree bpt(idx.pid_);
+    std::string key = idx.GenerateKey(original_row);
+    if (idx.IsUnique()) {
+      RETURN_IF_FAIL(bpt.Delete(txn, key));
+    } else {
+      StatusOr<std::string_view> existing_value =
+          bpt.Read(txn, idx.GenerateKey(original_row));
+      std::string_view existing_data = existing_value.Value();
+      auto rps = Decode<std::vector<RowPosition>>(existing_data);
+      std::erase(rps, pos);
+      if (rps.empty()) {
+        RETURN_IF_FAIL(bpt.Delete(txn, key));
+      } else {
+        RETURN_IF_FAIL(bpt.Update(txn, key, Encode(rps)));
+      }
+    }
+  }
+  return Status::kSuccess;
 }
 
 Iterator Table::BeginFullScan(Transaction& txn) const {

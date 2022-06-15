@@ -47,6 +47,14 @@ class Encoder {
   std::ostream* os_;
 };
 
+template <typename T>
+std::string Encode(T src) {
+  std::stringstream ss;
+  Encoder enc(ss);
+  enc << src;
+  return ss.str();
+}
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_ENCODER_HPP

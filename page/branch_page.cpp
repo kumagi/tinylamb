@@ -32,8 +32,9 @@ slot_t BranchPage::RowCount() const { return row_count_; }
 
 void BranchPage::SetLowestValue(page_id_t pid, Transaction& txn,
                                 page_id_t value) {
+  page_id_t old_lowest_value = lowest_page_;
   SetLowestValueImpl(value);
-  txn.SetLowestLog(pid, value);
+  txn.SetLowestLog(pid, value, old_lowest_value);
 }
 
 Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
@@ -76,7 +77,7 @@ Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
   if (row_count_ < pos || GetKey(pos) != key) {
     return Status::kNotExists;
   }
-  txn.UpdateBranchLog(pid, key, GetValue(pos), value);
+  txn.UpdateBranchLog(pid, key, value, GetValue(pos));
   UpdateImpl(key, value);
   return Status::kSuccess;
 }
@@ -88,9 +89,15 @@ void BranchPage::UpdateImpl(std::string_view key, page_id_t pid) {
 Status BranchPage::Delete(page_id_t pid, Transaction& txn,
                           std::string_view key) {
   const int pos = Search(key);
-  bin_size_t old_value = GetValue(pos);
+  if (pos < 0) {
+    page_id_t next_lowest = GetValue(0);
+    page_id_t prev_lowest = lowest_page_;
+    txn.DeleteBranchLog(pid, GetKey(0), next_lowest);
+    txn.SetLowestLog(pid, next_lowest, prev_lowest);
+  } else {
+    txn.DeleteBranchLog(pid, GetKey(pos), GetValue(pos));
+  }
   DeleteImpl(key);
-  txn.DeleteBranchLog(pid, key, old_value);
   return Status::kSuccess;
 }
 
@@ -193,6 +200,7 @@ int BranchPage::Search(std::string_view key) const {
 
 std::string_view BranchPage::GetKey(size_t idx) const {
   std::string_view key;
+  assert(idx < row_count_);
   DeserializeStringView(Payload() + rows_[idx].offset + sizeof(page_id_t),
                         &key);
   return key;
@@ -200,6 +208,11 @@ std::string_view BranchPage::GetKey(size_t idx) const {
 
 page_id_t BranchPage::GetValue(size_t idx) const {
   page_id_t result;
+  if (!(idx < row_count_)) {
+    LOG(INFO) << idx << " < " << row_count_;
+  }
+
+  assert(idx < row_count_);
   memcpy(&result, Payload() + rows_[idx].offset, sizeof(result));
   return result;
 }
@@ -207,7 +220,9 @@ page_id_t BranchPage::GetValue(size_t idx) const {
 void BranchPage::Dump(std::ostream& o, int indent) const {
   o << "Rows: " << row_count_ << " FreeSize: " << free_size_
     << " FreePtr:" << free_ptr_ << " Lowest: " << lowest_page_;
-  if (row_count_ == 0) return;
+  if (row_count_ == 0) {
+    return;
+  }
   o << "\n" << Indent(indent + 2) << lowest_page_;
   for (size_t i = 0; i < row_count_; ++i) {
     o << "\n"
@@ -219,10 +234,10 @@ void BranchPage::Dump(std::ostream& o, int indent) const {
 std::string SmallestKey(PageRef&& page) {
   if (page->Type() == PageType::kLeafPage) {
     return std::string(page->body.leaf_page.GetKey(0));
-  } else if (page->Type() == PageType::kBranchPage) {
+  }
+  if (page->Type() == PageType::kBranchPage) {
     return std::string(page->body.branch_page.GetKey(0));
   }
-  LOG(ERROR) << " for " << page->PageID() << " -> " << page->Type();
   assert(!"invalid page type");
 }
 

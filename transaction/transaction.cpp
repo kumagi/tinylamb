@@ -93,8 +93,8 @@ lsn_t Transaction::InsertBranchLog(page_id_t pid, std::string_view key,
   return prev_lsn_;
 }
 
-lsn_t Transaction::UpdateLog(page_id_t pid, slot_t slot, std::string_view undo,
-                             std::string_view redo) {
+lsn_t Transaction::UpdateLog(page_id_t pid, slot_t slot, std::string_view redo,
+                             std::string_view undo) {
   assert(!IsFinished());
   prev_lsn_ = transaction_manager_->AddLog(
       LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, slot, redo, undo));
@@ -102,7 +102,7 @@ lsn_t Transaction::UpdateLog(page_id_t pid, slot_t slot, std::string_view undo,
 }
 
 lsn_t Transaction::UpdateLeafLog(page_id_t pid, std::string_view key,
-                                 std::string_view undo, std::string_view redo) {
+                                 std::string_view redo, std::string_view undo) {
   assert(!IsFinished());
   prev_lsn_ = transaction_manager_->AddLog(LogRecord::UpdatingLeafLogRecord(
       prev_lsn_, txn_id_, pid, key, redo, undo));
@@ -110,7 +110,7 @@ lsn_t Transaction::UpdateLeafLog(page_id_t pid, std::string_view key,
 }
 
 lsn_t Transaction::UpdateBranchLog(page_id_t pid, std::string_view key,
-                                   page_id_t undo, page_id_t redo) {
+                                   page_id_t redo, page_id_t undo) {
   assert(!IsFinished());
   prev_lsn_ = transaction_manager_->AddLog(LogRecord::UpdatingBranchLogRecord(
       prev_lsn_, txn_id_, pid, key, redo, undo));
@@ -141,10 +141,10 @@ lsn_t Transaction::DeleteBranchLog(page_id_t pid, std::string_view key,
   return prev_lsn_;
 }
 
-lsn_t Transaction::SetLowestLog(page_id_t pid, page_id_t lowest_value) {
+lsn_t Transaction::SetLowestLog(page_id_t pid, page_id_t redo, page_id_t undo) {
   assert(!IsFinished());
   prev_lsn_ = transaction_manager_->AddLog(
-      LogRecord::SetLowestLogRecord(prev_lsn_, txn_id_, pid, lowest_value));
+      LogRecord::SetLowestLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
   return prev_lsn_;
 }
 
@@ -170,12 +170,12 @@ void Transaction::CommitWait() const {
   }
 }
 
-lsn_t Transaction::SetPrevNextLog(page_id_t target, page_id_t undo_prev,
-                                  page_id_t undo_next, page_id_t redo_prev,
-                                  page_id_t redo_next) {
+lsn_t Transaction::SetPrevNextLog(page_id_t target, page_id_t redo_next,
+                                  page_id_t redo_prev, page_id_t undo_next,
+                                  page_id_t undo_prev) {
   assert(!IsFinished());
   prev_lsn_ = transaction_manager_->AddLog(LogRecord::SetPrevNextLogRecord(
-      prev_lsn_, txn_id_, target, undo_prev, undo_next, redo_prev, redo_next));
+      prev_lsn_, txn_id_, target, redo_next, redo_prev, undo_next, undo_prev));
   return prev_lsn_;
 }
 

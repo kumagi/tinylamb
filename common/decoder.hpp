@@ -49,6 +49,16 @@ class Decoder {
   std::istream* is_;
 };
 
+template <typename T>
+T Decode(std::string_view src) {
+  std::string buffer(src);
+  std::stringstream ss(buffer);
+  Decoder dec(ss);
+  T ret;
+  dec >> ret;
+  return ret;
+}
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_DECODER_HPP

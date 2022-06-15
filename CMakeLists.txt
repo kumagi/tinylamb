@@ -8,6 +8,8 @@ add_executable(tinylamb
         main.cpp
         )
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined,bounds,address")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize-address-use-after-scope")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -O2")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -ggdb -Wall -Wextra")
 
@@ -116,6 +118,7 @@ add_simple_test(recovery/checkpoint_manager_test.cpp)
 add_simple_test(index/b_plus_tree_test.cpp)
 add_simple_test(index/b_plus_tree_iterator_test.cpp)
 add_simple_test(table/table_test.cpp)
+add_simple_test(table/index_test.cpp)
 add_simple_test(table/full_scan_iterator_test.cpp)
 add_simple_test(index/index_scan_iterator_test.cpp)
 add_simple_test(transaction/transaction_test.cpp)

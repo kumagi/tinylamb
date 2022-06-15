@@ -54,6 +54,10 @@ class Table {
   friend Decoder& operator>>(Decoder& d, Table& t);
 
  private:
+  Status IndexInsert(Transaction& txn, const Row& new_row,
+                     const RowPosition& pos);
+  Status IndexDelete(Transaction& txn, const RowPosition& pos);
+
   friend class RelationStorage;
   friend class FullScanIterator;
   friend class IndexScanIterator;

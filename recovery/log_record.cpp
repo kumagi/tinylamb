@@ -171,7 +171,7 @@ std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
       break;
     case LogType::kLowestValue:
       l.DumpPosition(o);
-      o << "\tLowest: " << l.redo_page;
+      o << "\tLowest: " << l.undo_page << " -> " << l.redo_page;
       break;
     case LogType::kBeginCheckpoint:
       return o;
@@ -311,12 +311,12 @@ LogRecord LogRecord::UpdatingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::UpdatingBranchLogRecord(lsn_t p, txn_id_t txn,
+LogRecord LogRecord::UpdatingBranchLogRecord(lsn_t prev_lsn, txn_id_t txn,
                                              page_id_t pid,
                                              std::string_view key,
                                              page_id_t redo, page_id_t undo) {
   LogRecord l;
-  l.prev_lsn = p;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
@@ -326,7 +326,7 @@ LogRecord LogRecord::UpdatingBranchLogRecord(lsn_t p, txn_id_t txn,
   return l;
 }
 
-LogRecord LogRecord::CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
+LogRecord LogRecord::CompensatingUpdateLogRecord(txn_id_t txn, page_id_t pid,
                                                  slot_t slot,
                                                  std::string_view redo) {
   LogRecord l;
@@ -362,10 +362,11 @@ LogRecord LogRecord::CompensatingUpdateBranchLogRecord(lsn_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                       slot_t slot, std::string_view undo) {
+LogRecord LogRecord::DeletingLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                       page_id_t pid, slot_t slot,
+                                       std::string_view undo) {
   LogRecord l;
-  l.prev_lsn = p;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.slot = slot;
@@ -374,11 +375,11 @@ LogRecord LogRecord::DeletingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::DeletingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                           std::string_view key,
+LogRecord LogRecord::DeletingLeafLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                           page_id_t pid, std::string_view key,
                                            std::string_view undo) {
   LogRecord l;
-  l.prev_lsn = p;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
@@ -387,12 +388,12 @@ LogRecord LogRecord::DeletingLeafLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
   return l;
 }
 
-LogRecord LogRecord::DeletingBranchLogRecord(lsn_t p, txn_id_t txn,
+LogRecord LogRecord::DeletingBranchLogRecord(lsn_t prev_lsn, txn_id_t txn,
                                              page_id_t pid,
                                              std::string_view key,
                                              page_id_t undo) {
   LogRecord l;
-  l.prev_lsn = p;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
@@ -439,22 +440,34 @@ LogRecord LogRecord::ComnensatingDeleteBranchLogRecord(txn_id_t txn,
   return l;
 }
 
-LogRecord LogRecord::SetLowestLogRecord(lsn_t p, txn_id_t tid, page_id_t pid,
-                                        page_id_t lowest_value) {
+LogRecord LogRecord::SetLowestLogRecord(lsn_t prev_lsn, txn_id_t tid,
+                                        page_id_t pid, page_id_t redo,
+                                        page_id_t undo) {
   LogRecord l;
-  l.prev_lsn = p;
+  l.prev_lsn = prev_lsn;
   l.txn_id = tid;
   l.pid = pid;
   l.type = LogType::kLowestValue;
-  l.redo_page = lowest_value;
+  l.redo_page = redo;
+  l.undo_page = undo;
   return l;
 }
 
-LogRecord LogRecord::AllocatePageLogRecord(uint64_t p, uint64_t txn,
-                                           uint64_t pid,
+LogRecord LogRecord::CompensateSetLowestValueLogRecord(txn_id_t tid,
+                                                       page_id_t pid,
+                                                       page_id_t redo) {
+  LogRecord l;
+  l.txn_id = tid;
+  l.pid = pid;
+  l.type = LogType::kLowestValue;
+  l.redo_page = redo;
+  return l;
+}
+LogRecord LogRecord::AllocatePageLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                           page_id_t pid,
                                            PageType new_page_type) {
   LogRecord l;
-  l.prev_lsn = p;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.type = LogType::kSystemAllocPage;
@@ -462,10 +475,10 @@ LogRecord LogRecord::AllocatePageLogRecord(uint64_t p, uint64_t txn,
   return l;
 }
 
-LogRecord LogRecord::DestroyPageLogRecord(uint64_t p, uint64_t txn,
-                                          uint64_t pid) {
+LogRecord LogRecord::DestroyPageLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                          page_id_t pid) {
   LogRecord l;
-  l.prev_lsn = p;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.type = LogType::kSystemDestroyPage;
@@ -489,10 +502,10 @@ LogRecord LogRecord::EndCheckpointLogRecord(
 }
 
 LogRecord LogRecord::SetPrevNextLogRecord(lsn_t prev_lsn, txn_id_t tid,
-                                          page_id_t pid, page_id_t undo_prev,
-                                          page_id_t undo_next,
+                                          page_id_t pid, page_id_t redo_next,
                                           page_id_t redo_prev,
-                                          page_id_t redo_next) {
+                                          page_id_t undo_next,
+                                          page_id_t undo_prev) {
   LogRecord l;
   l.prev_lsn = prev_lsn;
   l.txn_id = tid;
@@ -507,7 +520,7 @@ LogRecord LogRecord::SetPrevNextLogRecord(lsn_t prev_lsn, txn_id_t tid,
   return l;
 }
 
-void LogRecord::PrevNextLogRecordRedo(page_id_t& prev, page_id_t& next) const {
+void LogRecord::PrevNextLogRecordRedo(page_id_t& next, page_id_t& prev) const {
   memcpy(&prev, redo_data.data(), sizeof(prev));
   memcpy(&next, redo_data.data() + sizeof(prev), sizeof(next));
 }
@@ -567,7 +580,6 @@ size_t LogRecord::Size() const {
     case LogType::kDeleteRow:
       size += SerializeSize(undo_data);
       break;
-    case LogType::kLowestValue:
     case LogType::kInsertBranch:
     case LogType::kDeleteBranch:
     case LogType::kCompensateUpdateBranch:
@@ -575,6 +587,7 @@ size_t LogRecord::Size() const {
       size += sizeof(page_id_t);
       break;
     case LogType::kUpdateBranch:
+    case LogType::kLowestValue:
       size += sizeof(page_id_t) * 2;
       break;
     case LogType::kEndCheckpoint:
@@ -637,10 +650,10 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
     case LogType::kInsertBranch:
     case LogType::kCompensateUpdateBranch:
     case LogType::kCompensateDeleteBranch:
-    case LogType::kLowestValue:
       e << l.redo_page;
       break;
     case LogType::kUpdateBranch:
+    case LogType::kLowestValue:
       e << l.redo_page << l.undo_page;
       break;
     case LogType::kDeleteBranch:
@@ -709,10 +722,10 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
     case LogType::kInsertBranch:
     case LogType::kCompensateUpdateBranch:
     case LogType::kCompensateDeleteBranch:
-    case LogType::kLowestValue:
       d >> l.redo_page;
       break;
     case LogType::kUpdateBranch:
+    case LogType::kLowestValue:
       d >> l.redo_page >> l.undo_page;
       break;
     case LogType::kDeleteBranch:

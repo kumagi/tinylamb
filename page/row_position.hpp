@@ -9,6 +9,8 @@
 #include <ostream>
 
 #include "common/constants.hpp"
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "common/serdes.hpp"
 
 namespace tinylamb {
@@ -32,6 +34,14 @@ struct RowPosition {
   }
   bool operator==(const RowPosition& rhs) const = default;
   bool operator!=(const RowPosition& rhs) const = default;
+  friend Encoder& operator<<(Encoder& a, const RowPosition& rp) {
+    a << rp.page_id << rp.slot;
+    return a;
+  }
+  friend Decoder& operator>>(Decoder& a, RowPosition& rp) {
+    a >> rp.page_id >> rp.slot;
+    return a;
+  }
 
   [[nodiscard]] std::string Serialize() const {
     std::string s(Size(), '\0');

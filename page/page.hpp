@@ -59,7 +59,7 @@ class Page {
   StatusOr<std::string_view> Read(Transaction& txn, std::string_view key) const;
   StatusOr<std::string_view> LowestKey(Transaction& txn);
   StatusOr<std::string_view> HighestKey(Transaction& txn);
-  Status SetPrevNext(Transaction& txn, page_id_t prev, page_id_t next);
+  Status SetPrevNext(Transaction& txn, page_id_t next, page_id_t prev);
 
   // Branch page manipulations.
   Status InsertBranch(Transaction& txn, std::string_view key, page_id_t pid);

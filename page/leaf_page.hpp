@@ -67,7 +67,7 @@ class LeafPage {
   void InsertImpl(std::string_view key, std::string_view value);
   void UpdateImpl(std::string_view key, std::string_view value);
   void DeleteImpl(std::string_view key);
-  void SetPrevNextImpl(page_id_t prev, page_id_t next);
+  void SetPrevNextImpl(page_id_t next, page_id_t prev);
   [[nodiscard]] bool SanityCheckForTest() const;
 
  private:

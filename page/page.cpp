@@ -94,6 +94,7 @@ std::string_view Page::GetKey(slot_t slot) const {
 
 page_id_t Page::GetPage(slot_t slot) const {
   ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  LOG(ERROR) << slot;
   return body.branch_page.GetValue(slot);
 }
 
@@ -211,9 +212,9 @@ StatusOr<std::string_view> Page::HighestKey(Transaction& txn) {
   return body.leaf_page.HighestKey(txn);
 }
 
-Status Page::SetPrevNext(Transaction& txn, page_id_t prev, page_id_t next) {
+Status Page::SetPrevNext(Transaction& txn, page_id_t next, page_id_t prev) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  Status s = body.leaf_page.SetPrevNext(PageID(), txn, prev, next);
+  Status s = body.leaf_page.SetPrevNext(PageID(), txn, next, prev);
   if (s == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
     SetRecLSN(txn.PrevLSN());
@@ -301,27 +302,31 @@ void Page::DeleteImpl(std::string_view key) {
   body.leaf_page.DeleteImpl(key);
 }
 
-void Page::SetPrevNextImpl(page_id_t prev, page_id_t next) {
+void Page::SetPrevNextImpl(page_id_t next, page_id_t prev) {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  body.leaf_page.SetPrevNextImpl(prev, next);
+  body.leaf_page.SetPrevNextImpl(next, prev);
 }
 
 void Page::InsertBranchImpl(std::string_view key, page_id_t pid) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage)
   body.branch_page.InsertImpl(key, pid);
 }
+
 void Page::UpdateBranchImpl(std::string_view key, page_id_t pid) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage)
   body.branch_page.UpdateImpl(key, pid);
 }
+
 void Page::DeleteBranchImpl(std::string_view key) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage)
   body.branch_page.DeleteImpl(key);
 }
+
 void Page::SetLowestValueBranchImpl(page_id_t lowest_value) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage)
   body.branch_page.SetLowestValueImpl(lowest_value);
 }
+
 void Page::PageTypeChangeImpl(PageType new_type) {
   PageInit(page_id, new_type);
 }

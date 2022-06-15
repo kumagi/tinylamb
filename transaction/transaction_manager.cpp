@@ -107,12 +107,20 @@ void TransactionManager::CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
   logger_->AddLog(
       LogRecord::CompensatingDeleteLeafLogRecord(txn_id, pid, key, redo));
 }
+
 void TransactionManager::CompensateDeleteBranchLog(txn_id_t txn_id,
                                                    page_id_t pid,
                                                    std::string_view key,
                                                    page_id_t redo) {
   logger_->AddLog(
       LogRecord::ComnensatingDeleteBranchLogRecord(txn_id, pid, key, redo));
+}
+
+void TransactionManager::CompensateSetLowestValueLog(txn_id_t txn_id,
+                                                     page_id_t pid,
+                                                     page_id_t redo) {
+  logger_->AddLog(
+      LogRecord::CompensateSetLowestValueLogRecord(txn_id, pid, redo));
 }
 
 bool TransactionManager::GetExclusiveLock(const RowPosition& rp) {

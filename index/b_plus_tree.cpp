@@ -30,12 +30,14 @@ PageRef BPlusTree::FindLeafForInsert(Transaction& txn, std::string_view key,
   if (page->Type() == PageType::kLeafPage) {
     return std::move(page);
   }
-  page_id_t next;
   if (page->RowCount() == 0) {
-    for (auto& p : parents) p.PageUnlock();
+    for (auto& p : parents) {
+      p.PageUnlock();
+    }
     page.PageUnlock();
     abort();
   }
+  page_id_t next;
   if (page->GetPageForKey(txn, key, &next) != Status::kSuccess) {
     LOG(ERROR) << "No next page found";
   }
@@ -84,12 +86,12 @@ Status BPlusTree::InsertBranch(Transaction& txn, std::string_view key,
         new_left->InsertLeaf(txn, root_page.GetKey(i), root_page.GetValue(i));
       }
       PageRef right_page = txn.PageManager()->GetPage(right);
-      right_page->SetPrevNext(txn, new_left->PageID(),
-                              right_page->body.leaf_page.next_pid_);
+      right_page->SetPrevNext(txn, right_page->body.leaf_page.next_pid_,
+                              new_left->PageID());
       root->PageTypeChange(txn, PageType::kBranchPage);
       root->SetLowestValue(txn, new_left->PageID());
       root->InsertBranch(txn, key, right);
-      new_left->SetPrevNext(txn, 0, right);
+      new_left->SetPrevNext(txn, right, 0);
     }
     return Status::kSuccess;
   }

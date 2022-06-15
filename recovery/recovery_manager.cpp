@@ -80,8 +80,8 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
       break;
     case LogType::kSetPrevNext: {
       page_id_t prev, next;
-      log.PrevNextLogRecordRedo(prev, next);
-      target->SetPrevNextImpl(prev, next);
+      log.PrevNextLogRecordRedo(next, prev);
+      target->SetPrevNextImpl(next, prev);
       break;
     }
     case LogType::kLowestValue:
@@ -130,6 +130,7 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
     case LogType::kUpdateLeaf:
       tm->CompensateUpdateLog(log.txn_id, log.pid, log.key, log.undo_data);
       target->UpdateImpl(log.key, log.undo_data);
+      LOG(ERROR) << "undo: " << log.undo_data;
       break;
     case LogType::kUpdateBranch:
       tm->CompensateUpdateBranchLog(log.txn_id, log.pid, log.key,
@@ -145,10 +146,15 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
                                     log.undo_page);
       target->InsertBranchImpl(log.key, log.undo_page);
       break;
+    case LogType::kLowestValue: {
+      tm->CompensateSetLowestValueLog(log.txn_id, log.pid, log.undo_page);
+      target->SetLowestValueBranchImpl(log.undo_page);
+      break;
+    }
     case LogType::kSetPrevNext: {
       page_id_t prev, next;
-      log.PrevNextLogRecordUndo(prev, next);
-      target->SetPrevNextImpl(prev, next);
+      log.PrevNextLogRecordUndo(next, prev);
+      target->SetPrevNextImpl(next, prev);
       break;
     }
     case LogType::kSystemAllocPage:
@@ -165,7 +171,6 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
     case LogType::kCompensateUpdateBranch:
     case LogType::kCompensateDeleteLeaf:
     case LogType::kCompensateDeleteBranch:
-    case LogType::kLowestValue:  // Just ignore it!.
       // Compensating log cannot undo.
       break;
   }

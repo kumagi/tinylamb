@@ -98,7 +98,8 @@ TEST_F(LogRecordTest, check) {
   SerializeDeserializeCheck(LogRecord::DestroyPageLogRecord(16, 8, 21));
 
   // Lowest value log.
-  SerializeDeserializeCheck(LogRecord::SetLowestLogRecord(14, 123, 345, 687));
+  SerializeDeserializeCheck(
+      LogRecord::SetLowestLogRecord(14, 123, 345, 687, 89));
 
   // Leaf Page
   SerializeDeserializeCheck(

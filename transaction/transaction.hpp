@@ -69,27 +69,27 @@ class Transaction {
                       std::string_view redo);
   lsn_t InsertBranchLog(page_id_t pid, std::string_view key, page_id_t redo);
 
-  lsn_t UpdateLog(page_id_t pid, slot_t slot, std::string_view prev,
-                  std::string_view value);
+  lsn_t UpdateLog(page_id_t pid, slot_t slot, std::string_view redo,
+                  std::string_view undo);
   lsn_t UpdateLeafLog(page_id_t pid, std::string_view key,
-                      std::string_view prev, std::string_view value);
-  lsn_t UpdateBranchLog(page_id_t pid, std::string_view key, page_id_t undo,
-                        page_id_t redo);
+                      std::string_view redo, std::string_view undo);
+  lsn_t UpdateBranchLog(page_id_t pid, std::string_view key, page_id_t redo,
+                        page_id_t undo);
 
   lsn_t DeleteLog(page_id_t pid, slot_t key, std::string_view prev);
   lsn_t DeleteLeafLog(page_id_t pid, std::string_view key,
                       std::string_view prev);
   lsn_t DeleteBranchLog(page_id_t pid, std::string_view key, page_id_t undo);
 
-  lsn_t SetLowestLog(page_id_t pid, page_id_t lowest_value);
+  lsn_t SetLowestLog(page_id_t pid, page_id_t redo, page_id_t undo);
 
   lsn_t AllocatePageLog(page_id_t page_id, PageType new_page_type);
 
   lsn_t DestroyPageLog(page_id_t page_id);
 
-  lsn_t SetPrevNextLog(page_id_t target, page_id_t undo_prev,
-                       page_id_t undo_next, page_id_t redo_prev,
-                       page_id_t redo_next);
+  lsn_t SetPrevNextLog(page_id_t target, page_id_t redo_next,
+                       page_id_t redo_prev, page_id_t undo_next,
+                       page_id_t undo_prev);
 
   // Prepared mainly for testing.
   // Using this function is discouraged to get performance of flush pipelining.

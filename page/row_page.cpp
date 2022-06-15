@@ -80,7 +80,7 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
     LOG(ERROR) << "cannot add write-set";
     return Status::kConflicts;
   }
-  txn.UpdateLog(page_id, slot, prev_row, record);
+  txn.UpdateLog(page_id, slot, record, prev_row);
   UpdateRow(pos.slot, record);
   return Status::kSuccess;
 }

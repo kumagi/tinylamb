@@ -92,7 +92,7 @@ Status LeafPage::Update(page_id_t page_id, Transaction& txn,
     return Status::kNoSpace;
   }
 
-  txn.UpdateLeafLog(page_id, key, old_value, value);
+  txn.UpdateLeafLog(page_id, key, value, old_value);
   UpdateImpl(key, value);
   return Status::kSuccess;
 }
@@ -181,17 +181,17 @@ StatusOr<std::string_view> LeafPage::HighestKey(Transaction&) const {
 
 slot_t LeafPage::RowCount() const { return row_count_; }
 
-Status LeafPage::SetPrevNext(page_id_t pid, Transaction& txn, page_id_t prev,
-                             page_id_t next) {
-  txn.SetPrevNextLog(pid, prev_pid_, next_pid_, prev, next);
+Status LeafPage::SetPrevNext(page_id_t pid, Transaction& txn, page_id_t next,
+                             page_id_t prev) {
+  txn.SetPrevNextLog(pid, next, prev, next_pid_, prev_pid_);
   prev_pid_ = prev;
   next_pid_ = next;
   return Status::kSuccess;
 }
 
-void LeafPage::SetPrevNextImpl(page_id_t prev, page_id_t next) {
-  prev_pid_ = prev;
+void LeafPage::SetPrevNextImpl(page_id_t next, page_id_t prev) {
   next_pid_ = next;
+  prev_pid_ = prev;
 }
 
 void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
@@ -228,8 +228,8 @@ void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
   for (size_t i = pivot; i < original_row_count; ++i) {
     this_page->Delete(txn, GetKey(pivot));
   }
-  right->SetPrevNext(txn, pid, next_pid_);
-  this_page->SetPrevNext(txn, prev_pid_, right->PageID());
+  right->SetPrevNext(txn, next_pid_, pid);
+  this_page->SetPrevNext(txn, right->PageID(), prev_pid_);
 
   if (right->RowCount() == 0 || right->GetKey(0) <= key) {
     assert(expected_size <= right->body.leaf_page.free_size_);
