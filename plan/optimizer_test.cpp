@@ -21,56 +21,62 @@ namespace tinylamb {
 class OptimizerTest : public ::testing::Test {
  public:
   void SetUp() override {
-    std::string prefix = "optimizer_test-" + RandomString();
-    rs_ = std::make_unique<RelationStorage>(prefix);
+    prefix_ = "optimizer_test-" + RandomString();
     Recover();
-    Transaction txn = rs_->Begin();
+    TransactionContext ctx = rs_->BeginContext();
     {
-      ASSERT_SUCCESS(rs_->CreateTable(
-          txn, Schema("Sc1", {Column("c1", ValueType::kInt64),
-                              Column("c2", ValueType::kVarChar),
-                              Column("c3", ValueType::kDouble)})));
-      ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, "Sc1"));
+      ASSIGN_OR_ASSERT_FAIL(
+          Table, tbl,
+          rs_->CreateTable(ctx,
+                           Schema("Sc1", {Column("c1", ValueType::kInt64),
+                                          Column("c2", ValueType::kVarChar),
+                                          Column("c3", ValueType::kDouble)})));
       for (int i = 0; i < 100; ++i) {
         ASSERT_SUCCESS(
-            tbl.Insert(txn, Row({Value(i), Value("c2-" + std::to_string(i)),
-                                 Value(i + 9.9)}))
+            tbl.Insert(ctx.txn_,
+                       Row({Value(i), Value("c2-" + std::to_string(i)),
+                            Value(i + 9.9)}))
                 .GetStatus());
       }
     }
     {
-      ASSERT_SUCCESS(rs_->CreateTable(
-          txn, Schema("Sc2", {Column("d1", ValueType::kInt64),
-                              Column("d2", ValueType::kDouble),
-                              Column("d3", ValueType::kVarChar),
-                              Column("d4", ValueType::kInt64)})));
-      ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, "Sc2"));
+      ASSIGN_OR_ASSERT_FAIL(
+          Table, tbl,
+          rs_->CreateTable(ctx,
+                           Schema("Sc2", {Column("d1", ValueType::kInt64),
+                                          Column("d2", ValueType::kDouble),
+                                          Column("d3", ValueType::kVarChar),
+                                          Column("d4", ValueType::kInt64)})));
       for (int i = 0; i < 20; ++i) {
         ASSERT_SUCCESS(
-            tbl.Insert(txn, Row({Value(i), Value(i + 0.2),
-                                 Value("d3-" + std::to_string(i)), Value(16)}))
+            tbl.Insert(ctx.txn_,
+                       Row({Value(i), Value(i + 0.2),
+                            Value("d3-" + std::to_string(i)), Value(16)}))
                 .GetStatus());
       }
     }
     {
-      ASSERT_SUCCESS(rs_->CreateTable(
-          txn, Schema("Sc3", {Column("e1", ValueType::kInt64),
-                              Column("e2", ValueType::kDouble)})));
-      ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, "Sc3"));
+      ASSIGN_OR_ASSERT_FAIL(
+          Table, tbl,
+          rs_->CreateTable(ctx,
+                           Schema("Sc3", {Column("e1", ValueType::kInt64),
+                                          Column("e2", ValueType::kDouble)})));
       for (int i = 10; 0 < i; --i) {
         ASSERT_SUCCESS(
-            tbl.Insert(txn, Row({Value(i), Value(i + 53.4)})).GetStatus());
+            tbl.Insert(ctx.txn_, Row({Value(i), Value(i + 53.4)})).GetStatus());
       }
     }
-    ASSERT_SUCCESS(txn.PreCommit());
-    auto stat_tx = rs_->Begin();
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+    auto stat_tx = rs_->BeginContext();
     rs_->RefreshStatistics(stat_tx, "Sc1");
     rs_->RefreshStatistics(stat_tx, "Sc2");
     rs_->RefreshStatistics(stat_tx, "Sc3");
     ASSERT_SUCCESS(stat_tx.PreCommit());
   }
   void Recover() {
-    rs_->GetPageStorage()->LostAllPageForTest();
+    if (rs_) {
+      rs_->GetPageStorage()->LostAllPageForTest();
+    }
     rs_ = std::make_unique<RelationStorage>(prefix_);
   }
 

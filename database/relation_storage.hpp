@@ -30,28 +30,31 @@ class RelationStorage {
  public:
   explicit RelationStorage(std::string_view dbname);
 
-  Transaction Begin() { return storage_.Begin(); }
+  // Transaction Begin() { return storage_.Begin(); }
   TransactionContext BeginContext() { return {storage_.Begin(), this}; }
 
-  Status CreateTable(Transaction& txn, const Schema& schema);
+  StatusOr<Table> CreateTable(TransactionContext& ctx, const Schema& schema);
 
-  Status CreateIndex(Transaction& txn, std::string_view schema_name,
+  Status CreateIndex(TransactionContext& ctx, std::string_view schema_name,
                      const IndexSchema& idx);
-
-  StatusOr<Table> GetTable(Transaction& txn, std::string_view schema_name);
 
   [[maybe_unused]] void DebugDump(Transaction& txn, std::ostream& o);
 
-  StatusOr<TableStatistics> GetStatistics(Transaction& txn,
+  StatusOr<TableStatistics> GetStatistics(TransactionContext& txn,
                                           std::string_view schema_name);
 
-  Status UpdateStatistics(Transaction& txn, std::string_view schema_name,
+  Status UpdateStatistics(TransactionContext& txn, std::string_view schema_name,
                           const TableStatistics& ts);
-  Status RefreshStatistics(Transaction& txn, std::string_view schema_name);
+  Status RefreshStatistics(TransactionContext& txn,
+                           std::string_view schema_name);
 
   PageStorage* GetPageStorage() { return &storage_; }
 
  private:
+  friend class TransactionContext;
+  StatusOr<Table> GetTable(TransactionContext& ctx,
+                           std::string_view schema_name);
+
   // Persistent { Name => Table } storage.
   BPlusTree catalog_;
 

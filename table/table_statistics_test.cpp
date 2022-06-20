@@ -27,47 +27,52 @@ class TableStatisticsTest : public ::testing::Test {
   void SetUp() override {
     prefix_ = "table_statistics_test-" + RandomString();
     Recover();
-    Transaction txn = db_->Begin();
+    TransactionContext ctx = db_->BeginContext();
     {
-      ASSERT_SUCCESS(db_->CreateTable(
-          txn, Schema("Sc1", {Column("c1", ValueType::kInt64),
-                              Column("c2", ValueType::kVarChar),
-                              Column("c3", ValueType::kDouble)})));
-      ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(txn, "Sc1"));
+      ASSIGN_OR_ASSERT_FAIL(
+          Table, tbl,
+          db_->CreateTable(ctx,
+                           Schema("Sc1", {Column("c1", ValueType::kInt64),
+                                          Column("c2", ValueType::kVarChar),
+                                          Column("c3", ValueType::kDouble)})));
       for (int i = 0; i < 100; ++i) {
         ASSERT_SUCCESS(
-            tbl.Insert(txn, Row({Value(i), Value("c2-" + std::to_string(i)),
-                                 Value(i + 9.9)}))
+            tbl.Insert(ctx.txn_,
+                       Row({Value(i), Value("c2-" + std::to_string(i)),
+                            Value(i + 9.9)}))
                 .GetStatus());
       }
     }
     {
-      ASSERT_SUCCESS(db_->CreateTable(
-          txn, Schema("Sc2", {Column("d1", ValueType::kInt64),
-                              Column("d2", ValueType::kDouble),
-                              Column("d3", ValueType::kVarChar),
-                              Column("d4", ValueType::kInt64)})));
-      ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(txn, "Sc2"));
+      ASSIGN_OR_ASSERT_FAIL(
+          Table, tbl,
+          db_->CreateTable(ctx,
+                           Schema("Sc2", {Column("d1", ValueType::kInt64),
+                                          Column("d2", ValueType::kDouble),
+                                          Column("d3", ValueType::kVarChar),
+                                          Column("d4", ValueType::kInt64)})));
       for (int i = 0; i < 20; ++i) {
         ASSERT_SUCCESS(
-            tbl.Insert(txn, Row({Value(i), Value(i + 0.2),
-                                 Value("d3-" + std::to_string(i)), Value(16)}))
+            tbl.Insert(ctx.txn_,
+                       Row({Value(i), Value(i + 0.2),
+                            Value("d3-" + std::to_string(i)), Value(16)}))
                 .GetStatus());
       }
     }
     {
-      ASSERT_SUCCESS(db_->CreateTable(
-          txn, Schema("Sc3", {Column("e1", ValueType::kInt64),
-                              Column("e2", ValueType::kDouble)})));
-      ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(txn, "Sc3"));
+      ASSIGN_OR_ASSERT_FAIL(
+          Table, tbl,
+          db_->CreateTable(ctx,
+                           Schema("Sc3", {Column("e1", ValueType::kInt64),
+                                          Column("e2", ValueType::kDouble)})));
       for (int i = 10; 0 < i; --i) {
         ASSERT_SUCCESS(
-            tbl.Insert(txn, Row({Value(i), Value(i + 53.4)})).GetStatus());
+            tbl.Insert(ctx.txn_, Row({Value(i), Value(i + 53.4)})).GetStatus());
       }
     }
-    txn.PreCommit();
+    ctx.txn_.PreCommit();
     {
-      auto stat_tx = db_->Begin();
+      TransactionContext stat_tx = db_->BeginContext();
       db_->RefreshStatistics(stat_tx, "Sc1");
       db_->RefreshStatistics(stat_tx, "Sc2");
       db_->RefreshStatistics(stat_tx, "Sc3");
@@ -93,20 +98,20 @@ class TableStatisticsTest : public ::testing::Test {
 TEST_F(TableStatisticsTest, Construct) {}
 
 TEST_F(TableStatisticsTest, Update) {
-  auto txn = db_->Begin();
-  ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(txn, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, ts, db_->GetStatistics(txn, "Sc1"));
-  ts.Update(txn, tbl);
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(ctx, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, ts, db_->GetStatistics(ctx, "Sc1"));
+  ts.Update(ctx.txn_, tbl);
   LOG(TRACE) << ts;
 }
 
 TEST_F(TableStatisticsTest, Store) {
-  auto txn = db_->Begin();
-  ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(txn, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, ts, db_->GetStatistics(txn, "Sc1"));
-  ts.Update(txn, tbl);
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(ctx, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, ts, db_->GetStatistics(ctx, "Sc1"));
+  ts.Update(ctx.txn_, tbl);
   LOG(TRACE) << ts;
-  db_->UpdateStatistics(txn, "Sc2", ts);
+  db_->UpdateStatistics(ctx, "Sc2", ts);
 }
 
 }  // namespace tinylamb

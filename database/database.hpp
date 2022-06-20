@@ -15,22 +15,23 @@ class IndexSchema;
 class Database {
  public:
   explicit Database(std::string_view dbname) : relations_(dbname) {}
-  Transaction Begin();
   TransactionContext BeginContext();
 
-  Status CreateTable(Transaction& txn, const Schema& schema);
-  Status CreateIndex(Transaction& txn, std::string_view schema_name,
+  StatusOr<Table> CreateTable(TransactionContext& ctx, const Schema& schema);
+  Status CreateIndex(TransactionContext& ctx, std::string_view schema_name,
                      const IndexSchema& idx);
 
-  StatusOr<Table> GetTable(Transaction& txn, std::string_view schema_name);
+  StatusOr<Table> GetTable(TransactionContext& ctx,
+                           std::string_view schema_name);
 
-  [[maybe_unused]] void DebugDump(Transaction& txn, std::ostream& o);
+  [[maybe_unused]] void DebugDump(TransactionContext& ctx, std::ostream& o);
 
-  StatusOr<TableStatistics> GetStatistics(Transaction& txn,
+  StatusOr<TableStatistics> GetStatistics(TransactionContext& ctx,
                                           std::string_view schema_name);
-  Status UpdateStatistics(Transaction& txn, std::string_view schema_name,
+  Status UpdateStatistics(TransactionContext& txn, std::string_view schema_name,
                           const TableStatistics& ts);
-  Status RefreshStatistics(Transaction& txn, std::string_view schema_name);
+  Status RefreshStatistics(TransactionContext& txn,
+                           std::string_view schema_name);
 
   PageStorage& Storage() { return *relations_.GetPageStorage(); }
 

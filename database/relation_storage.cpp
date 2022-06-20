@@ -21,10 +21,10 @@ RelationStorage::RelationStorage(std::string_view dbname)
     : catalog_(kDefaultTableRoot),
       statistics_(kDefaultStatisticsRoot),
       storage_(dbname) {
-  auto txn = Begin();
-  catalog_ = BPlusTree(txn, kDefaultTableRoot);
-  statistics_ = BPlusTree(txn, kDefaultStatisticsRoot);
-  if (txn.PreCommit() != Status::kSuccess) {
+  auto ctx = BeginContext();
+  catalog_ = BPlusTree(ctx.txn_, kDefaultTableRoot);
+  statistics_ = BPlusTree(ctx.txn_, kDefaultStatisticsRoot);
+  if (ctx.txn_.PreCommit() != Status::kSuccess) {
     LOG(FATAL) << "Failed to initialize relations";
     exit(1);
   }
@@ -46,11 +46,14 @@ void Deserialize(std::string_view from, Deserializable& dst) {
   ext >> dst;
 }
 
-Status RelationStorage::CreateTable(Transaction& txn, const Schema& schema) {
-  if (catalog_.Read(txn, schema.Name()).GetStatus() != Status::kNotExists) {
+StatusOr<Table> RelationStorage::CreateTable(TransactionContext& ctx,
+                                             const Schema& schema) {
+  if (catalog_.Read(ctx.txn_, schema.Name()).GetStatus() !=
+      Status::kNotExists) {
     return Status::kConflicts;
   }
-  PageRef table_page = storage_.pm_.AllocateNewPage(txn, PageType::kRowPage);
+  PageRef table_page =
+      storage_.pm_.AllocateNewPage(ctx.txn_, PageType::kRowPage);
   Table new_table(schema, table_page->PageID());
   TableStatistics new_stat(schema);
 
@@ -61,26 +64,28 @@ Status RelationStorage::CreateTable(Transaction& txn, const Schema& schema) {
       std::stringstream idx_name_stream;
       idx_name_stream << schema.Name() << "|" << col.Name();
       IndexSchema new_idx(idx_name_stream.str(), {i}, {});
-      new_table.CreateIndex(txn, new_idx);
+      new_table.CreateIndex(ctx.txn_, new_idx);
     }
   }
 
-  RETURN_IF_FAIL(catalog_.Insert(txn, schema.Name(), Serialize(new_table)));
-  return statistics_.Insert(txn, std::string(schema.Name()),
-                            Serialize(new_stat));
+  RETURN_IF_FAIL(
+      catalog_.Insert(ctx.txn_, schema.Name(), Serialize(new_table)));
+  RETURN_IF_FAIL(statistics_.Insert(ctx.txn_, std::string(schema.Name()),
+                                    Serialize(new_stat)));
+  return new_table;
 }
 
-Status RelationStorage::CreateIndex(Transaction& txn,
+Status RelationStorage::CreateIndex(TransactionContext& ctx,
                                     std::string_view schema_name,
                                     const IndexSchema& idx) {
-  ASSIGN_OR_RETURN(Table, tbl, GetTable(txn, schema_name));
-  RETURN_IF_FAIL(tbl.CreateIndex(txn, idx));
-  return catalog_.Update(txn, schema_name, Serialize(tbl));
+  ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
+  RETURN_IF_FAIL(tbl.CreateIndex(ctx.txn_, idx));
+  return catalog_.Update(ctx.txn_, schema_name, Serialize(tbl));
 }
 
-StatusOr<Table> RelationStorage::GetTable(Transaction& txn,
+StatusOr<Table> RelationStorage::GetTable(TransactionContext& ctx,
                                           std::string_view schema_name) {
-  ASSIGN_OR_RETURN(std::string_view, val, catalog_.Read(txn, schema_name));
+  ASSIGN_OR_RETURN(std::string_view, val, catalog_.Read(ctx.txn_, schema_name));
   Table tbl;
   Deserialize(val, tbl);
   return tbl;
@@ -99,26 +104,27 @@ StatusOr<Table> RelationStorage::GetTable(Transaction& txn,
 }
 
 StatusOr<TableStatistics> RelationStorage::GetStatistics(
-    Transaction& txn, std::string_view schema_name) {
-  ASSIGN_OR_RETURN(std::string_view, val, statistics_.Read(txn, schema_name));
-  ASSIGN_OR_RETURN(Table, tbl, GetTable(txn, schema_name));
+    TransactionContext& ctx, std::string_view schema_name) {
+  ASSIGN_OR_RETURN(std::string_view, val,
+                   statistics_.Read(ctx.txn_, schema_name));
+  ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
   TableStatistics ts(tbl.schema_);
   Deserialize(val, ts);
   return ts;
 }
 
-Status RelationStorage::UpdateStatistics(Transaction& txn,
+Status RelationStorage::UpdateStatistics(TransactionContext& ctx,
                                          std::string_view schema_name,
                                          const TableStatistics& ts) {
-  return statistics_.Update(txn, std::string(schema_name), Serialize(ts));
+  return statistics_.Update(ctx.txn_, std::string(schema_name), Serialize(ts));
 }
 
-Status RelationStorage::RefreshStatistics(Transaction& txn,
+Status RelationStorage::RefreshStatistics(TransactionContext& ctx,
                                           std::string_view schema_name) {
-  ASSIGN_OR_RETURN(Table, tbl, GetTable(txn, schema_name));
-  ASSIGN_OR_RETURN(TableStatistics, stats, GetStatistics(txn, schema_name));
-  RETURN_IF_FAIL(stats.Update(txn, tbl));
-  return UpdateStatistics(txn, schema_name, stats);
+  ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
+  ASSIGN_OR_RETURN(TableStatistics, stats, GetStatistics(ctx, schema_name));
+  RETURN_IF_FAIL(stats.Update(ctx.txn_, tbl));
+  return UpdateStatistics(ctx, schema_name, stats);
 }
 
 }  // namespace tinylamb

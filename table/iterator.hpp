@@ -28,6 +28,10 @@ class Iterator {
     --(*iter_);
     return *this;
   }
+  friend std::ostream& operator<<(std::ostream& o, const Iterator& it) {
+    it.iter_->Dump(o, 0);
+    return o;
+  }
 
  private:
   std::unique_ptr<IteratorBase> iter_;

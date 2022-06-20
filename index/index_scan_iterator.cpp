@@ -5,20 +5,25 @@
 #include "index_scan_iterator.hpp"
 
 #include "index/b_plus_tree.hpp"
+#include "index/index.hpp"
 #include "page/page_manager.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
 
-IndexScanIterator::IndexScanIterator(Table* table, std::string_view index_name,
-                                     Transaction* txn, const Row& begin,
-                                     const Row& end, bool ascending)
+IndexScanIterator::IndexScanIterator(Table* table, Index* index,
+                                     Transaction* txn, Row begin, Row end,
+                                     bool ascending)
     : table_(table),
-      bpt_(BPlusTree(table_->GetIndex(index_name))),
+      index_(index),
       txn_(txn),
-      iter_(&bpt_, txn, begin.EncodeMemcomparableFormat(),
-            end.EncodeMemcomparableFormat(), ascending) {
+      begin_(std::move(begin)),
+      end_(std::move(end)),
+      ascending_(ascending),
+      bpt_(index->Root()),
+      iter_(&bpt_, txn, begin_.EncodeMemcomparableFormat(),
+            end_.EncodeMemcomparableFormat(), ascending) {
   std::string_view pos = iter_.Value();
   RowPosition rp;
   rp.Deserialize(pos.data());
@@ -71,6 +76,24 @@ IteratorBase& IndexScanIterator::operator--() {
 }
 
 const Row& IndexScanIterator::operator*() const { return current_row_; }
+
 Row& IndexScanIterator::operator*() { return current_row_; }
+
+void IndexScanIterator::Dump(std::ostream& o, int /*indent*/) const {
+  o << table_->GetSchema().Name() << ": {";
+  for (size_t i = 0; i < index_->sc_.key_.size(); ++i) {
+    if (0 < i) {
+      o << ", ";
+    }
+    o << index_->sc_.key_[i];
+  }
+  o << "} [";
+  if (ascending_) {
+    o << begin_ << " -> " << end_;
+  } else {
+    o << end_ << " -> " << begin_;
+  }
+  o << "]";
+}
 
 }  // namespace tinylamb

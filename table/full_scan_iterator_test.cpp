@@ -31,8 +31,9 @@ class FullScanIteratorTest : public ::testing::Test {
                                      Constraint(Constraint::kIndex)),
                               Column("col2", ValueType::kVarChar),
                               Column("col3", ValueType::kDouble)});
-    Transaction txn = db_->Begin();
-    ASSERT_SUCCESS(db_->CreateTable(txn, sc));
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_SUCCESS(db_->CreateTable(ctx, sc).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
   void Recover() {
@@ -55,16 +56,16 @@ class FullScanIteratorTest : public ::testing::Test {
 TEST_F(FullScanIteratorTest, Construct) {}
 
 TEST_F(FullScanIteratorTest, Scan) {
-  Transaction txn = db_->Begin();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(txn, "SampleTable"));
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
   for (int i = 0; i < 130; ++i) {
     ASSERT_SUCCESS(
         table
-            .Insert(txn, Row({Value(i), Value("v" + std::to_string(i)),
-                              Value(0.1 + i)}))
+            .Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                   Value(0.1 + i)}))
             .GetStatus());
   }
-  Iterator it = table.BeginFullScan(txn);
+  Iterator it = table.BeginFullScan(ctx.txn_);
   while (it.IsValid()) {
     LOG(TRACE) << *it;
     ++it;

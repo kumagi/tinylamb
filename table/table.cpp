@@ -110,7 +110,6 @@ Status Table::IndexInsert(Transaction& txn, const Row& new_row,
   for (const auto& idx : indexes_) {
     BPlusTree bpt(idx.pid_);
     if (idx.IsUnique()) {
-      LOG(TRACE) << "insert: " << idx.sc_.name_ << " is unique";
       RETURN_IF_FAIL(
           bpt.Insert(txn, idx.GenerateKey(new_row), pos.Serialize()));
     } else {
@@ -157,11 +156,10 @@ Iterator Table::BeginFullScan(Transaction& txn) const {
   return Iterator(new FullScanIterator(this, &txn));
 }
 
-Iterator Table::BeginIndexScan(Transaction& txn, std::string_view index_name,
-                               const Row& begin, const Row& end,
-                               bool ascending) {
+Iterator Table::BeginIndexScan(Transaction& txn, Index* index, const Row& begin,
+                               const Row& end, bool ascending) {
   return Iterator(
-      new IndexScanIterator(this, index_name, &txn, begin, end, ascending));
+      new IndexScanIterator(this, index, &txn, begin, end, ascending));
 }
 
 Encoder& operator<<(Encoder& e, const Table& t) {
@@ -174,13 +172,13 @@ Decoder& operator>>(Decoder& d, Table& t) {
   return d;
 }
 
-page_id_t Table::GetIndex(std::string_view name) {
-  for (const auto& idx : indexes_) {
+Index& Table::GetIndex(std::string_view name) {
+  for (auto& idx : indexes_) {
     if (idx.sc_.name_ == name) {
-      return idx.pid_;
+      return idx;
     }
   }
-  return -1;
+  assert(!"never reach here");
 }
 
 }  // namespace tinylamb

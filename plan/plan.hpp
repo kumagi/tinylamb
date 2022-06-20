@@ -14,6 +14,7 @@
 #include "type/schema.hpp"
 
 namespace tinylamb {
+class Table;
 class TransactionContext;
 class TableStatistics;
 
@@ -33,7 +34,7 @@ class PlanBase {
 };
 
 typedef std::shared_ptr<PlanBase> Plan;
-Plan NewFullScanPlan(std::string_view table_name, const TableStatistics& ts);
+Plan NewFullScanPlan(const Table& table, const TableStatistics& ts);
 Plan NewProductPlan(const Plan& left_src, std::vector<slot_t> left_cols,
                     const Plan& right_src, std::vector<slot_t> right_cols);
 Plan NewProductPlan(const Plan& left_src, const Plan& right_src);

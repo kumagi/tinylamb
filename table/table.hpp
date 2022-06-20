@@ -43,15 +43,15 @@ class Table {
   StatusOr<Row> Read(Transaction& txn, RowPosition pos) const;
 
   Iterator BeginFullScan(Transaction& txn) const;
-  Iterator BeginIndexScan(Transaction& txn, std::string_view index_name,
-                          const Row& begin, const Row& end = Row(),
-                          bool ascending = true);
+  Iterator BeginIndexScan(Transaction& txn, Index* index, const Row& begin,
+                          const Row& end = Row(), bool ascending = true);
 
   [[nodiscard]] Schema GetSchema() const { return schema_; }
   [[nodiscard]] size_t IndexCount() const { return indexes_.size(); }
 
   friend Encoder& operator<<(Encoder& e, const Table& t);
   friend Decoder& operator>>(Decoder& d, Table& t);
+  Index& GetIndex(std::string_view name);
 
  private:
   Status IndexInsert(Transaction& txn, const Row& new_row,
@@ -62,8 +62,6 @@ class Table {
   friend class FullScanIterator;
   friend class IndexScanIterator;
   friend class TableInterface;
-  friend class FullScanPlan;
-  page_id_t GetIndex(std::string_view name);
 
   Schema schema_;
   page_id_t first_pid_{};

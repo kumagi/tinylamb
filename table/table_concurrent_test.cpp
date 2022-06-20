@@ -30,7 +30,7 @@ class TableConcurrentTest : public ::testing::Test {
                                      Constraint(Constraint::kIndex)),
                               Column("col2", ValueType::kVarChar),
                               Column("col3", ValueType::kDouble)});
-    auto txn = db_->Begin();
+    TransactionContext txn = db_->BeginContext();
     db_->CreateTable(txn, sc);
     ASSERT_SUCCESS(txn.PreCommit());
   }
@@ -55,34 +55,34 @@ constexpr int kThreads = 2;
 
 TEST_F(TableConcurrentTest, InsertInsert) {
   constexpr int kSize = 2000;
-  auto ro_txn = db_->Begin();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ro_txn, "SampleTable"));
-  ASSERT_SUCCESS(ro_txn.PreCommit());
+  TransactionContext ro_ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ro_ctx, "SampleTable"));
+  ASSERT_SUCCESS(ro_ctx.PreCommit());
   std::vector<std::unordered_map<RowPosition, Row>> rows;
   rows.resize(kThreads);
   std::vector<std::thread> workers;
   workers.reserve(kThreads);
   for (int i = 0; i < kThreads; ++i) {
     workers.emplace_back([&, i]() {
-      auto txn = db_->Begin();
+      TransactionContext ctx = db_->BeginContext();
       for (int j = 0; j < kSize; ++j) {
         Row new_row({Value(j * kSize + i), Value(RandomString(32)),
                      Value((double)2 * j * kSize + i)});
         ASSIGN_OR_ASSERT_FAIL(RowPosition, inserted_pos,
-                              table.Insert(txn, new_row));
+                              table.Insert(ctx.txn_, new_row));
         rows[i].emplace(inserted_pos, new_row);
       }
-      ASSERT_SUCCESS(txn.PreCommit());
+      ASSERT_SUCCESS(ctx.txn_.PreCommit());
     });
   }
   for (auto& w : workers) {
     w.join();
   }
   {
-    auto txn = db_->Begin();
+    TransactionContext ctx = db_->BeginContext();
     for (const auto& rows_per_thread : rows) {
       for (const auto& row : rows_per_thread) {
-        ASSIGN_OR_ASSERT_FAIL(Row, read_row, table.Read(txn, row.first));
+        ASSIGN_OR_ASSERT_FAIL(Row, read_row, table.Read(ctx.txn_, row.first));
         ASSERT_EQ(read_row, row.second);
       }
     }

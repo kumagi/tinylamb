@@ -4,8 +4,7 @@
 
 #include "table_statistics.hpp"
 
-#include <assert.h>
-
+#include <cassert>
 #include <unordered_set>
 
 #include "common/encoder.hpp"
@@ -45,10 +44,10 @@ class Int64DistinctCounter : public DistinctCounterBase {
     counter_.insert(v);
     ++count;
   }
-  void Add(std::string_view) override {
+  void Add(std::string_view /*v*/) override {
     assert(!"called Add(varchar) to int counter");
   }
-  void Add(double) override {
+  void Add(double /*v*/) override {
     assert(!"called Add(double) to integer counter");
   }
   void Output(IntegerColumnStats& o) override {
@@ -57,10 +56,10 @@ class Int64DistinctCounter : public DistinctCounterBase {
     o.count = count;
     o.distinct = counter_.size();
   }
-  void Output(VarcharColumnStats&) override {
+  void Output(VarcharColumnStats& /*o*/) override {
     assert(!"called Output(varchar) to int counter");
   }
-  void Output(DoubleColumnStats&) override {
+  void Output(DoubleColumnStats& /*o*/) override {
     assert(!"called Output(double) to int counter");
   }
   int64_t max{};
@@ -78,7 +77,7 @@ class VarcharDistinctCounter : public DistinctCounterBase {
     count = 0;
     counter_.clear();
   }
-  void Add(int64_t) override {
+  void Add(int64_t /*v*/) override {
     assert(!"called Add(int64) to varchar counter");
   }
   void Add(std::string_view v) override {
@@ -88,19 +87,19 @@ class VarcharDistinctCounter : public DistinctCounterBase {
     count++;
     counter_.insert(std::string(v));
   }
-  void Add(double) override {
+  void Add(double /*v*/) override {
     assert(!"called Add(double) to varchar counter");
   }
-  void Output(IntegerColumnStats&) override {
+  void Output(IntegerColumnStats& /*o*/) override {
     assert(!"called Output(int64) to varchar counter");
   }
   void Output(VarcharColumnStats& o) override {
-    memcpy(o.max, max.data(), std::min(8lu, max.size()));
-    memcpy(o.min, min.data(), std::min(8lu, min.size()));
+    memcpy(o.max, max.data(), std::min(8LU, max.size()));
+    memcpy(o.min, min.data(), std::min(8LU, min.size()));
     o.count = count;
     o.distinct = counter_.size();
   }
-  void Output(DoubleColumnStats&) override {
+  void Output(DoubleColumnStats& /*o*/) override {
     assert(!"called Output(double) to varchar counter");
   }
 
@@ -119,8 +118,10 @@ class DoubleDistinctCounter : public DistinctCounterBase {
     count = 0;
     counter_.clear();
   }
-  void Add(int64_t) override { assert(!"called Add(int64) to double counter"); }
-  void Add(std::string_view) override {
+  void Add(int64_t /*v*/) override {
+    assert(!"called Add(int64) to double counter");
+  }
+  void Add(std::string_view /*v*/) override {
     assert(!"called Add(varchar) to double counter");
   }
   void Add(double v) override {
@@ -129,10 +130,10 @@ class DoubleDistinctCounter : public DistinctCounterBase {
     count++;
     counter_.insert(v);
   }
-  void Output(IntegerColumnStats&) override {
+  void Output(IntegerColumnStats& /*o*/) override {
     assert(!"called Output(int64) to double counter");
   }
-  void Output(VarcharColumnStats&) override {
+  void Output(VarcharColumnStats& /*o*/) override {
     assert(!"called Output(varchar) to double counter");
   }
   void Output(DoubleColumnStats& o) override {
@@ -276,10 +277,10 @@ double TableStatistics::ReductionFactor(const Schema& sc,
                          ->GetValue();
         Value right = reinterpret_cast<const ConstantValue*>(bo->Right().get())
                           ->GetValue();
-        if (left == right)
+        if (left == right) {
           return 1;
-        else
-          return std::numeric_limits<double>::max();
+        }
+        return std::numeric_limits<double>::max();
       }
     }
     if (bo->Op() == BinaryOperation::kAnd) {

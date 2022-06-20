@@ -38,15 +38,16 @@ class ExecutorTest : public ::testing::Test {
         kTableName,
         {Column("key", ValueType::kInt64), Column("name", ValueType::kVarChar),
          Column("score", ValueType::kDouble)}};
-    Transaction txn = rs_->Begin();
-    rs_->CreateTable(txn, schema);
-    ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
-    BulkInsert(txn, tbl,
+    TransactionContext ctx = rs_->BeginContext();
+    rs_->CreateTable(ctx, schema);
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+                          ctx.GetTable(kTableName));
+    BulkInsert(ctx.txn_, *tbl,
                {{Row({Value(0), Value("hello"), Value(1.2)})},
                 {Row({Value(3), Value("piyo"), Value(12.2)})},
                 {Row({Value(1), Value("world"), Value(4.9)})},
                 {Row({Value(2), Value("arise"), Value(4.14)})}});
-    ASSERT_SUCCESS(txn.PreCommit());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
   void Recover() {
@@ -63,9 +64,9 @@ class ExecutorTest : public ::testing::Test {
 TEST_F(ExecutorTest, Construct) {}
 
 TEST_F(ExecutorTest, FullScan) {
-  Transaction txn = rs_->Begin();
-  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
-  FullScan fs(txn, &tbl);
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  FullScan fs(ctx.txn_, *tbl);
   std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2)}),
                            Row({Value(3), Value("piyo"), Value(12.2)}),
                            Row({Value(1), Value("world"), Value(4.9)}),
@@ -91,11 +92,11 @@ TEST_F(ExecutorTest, FullScan) {
 }
 
 TEST_F(ExecutorTest, Projection) {
-  Transaction txn = rs_->Begin();
-  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
-  auto fs = std::make_shared<FullScan>(txn, &tbl);
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  auto fs = std::make_shared<FullScan>(ctx.txn_, *tbl);
   Projection proj({NamedExpression("key"), NamedExpression("score")},
-                  tbl.GetSchema(), std::move(fs));
+                  tbl->GetSchema(), std::move(fs));
   std::unordered_set rows(
       {Row({Value(0), Value(1.2)}), Row({Value(3), Value(12.2)}),
        Row({Value(1), Value(4.9)}), Row({Value(2), Value(4.14)})});
@@ -119,13 +120,13 @@ TEST_F(ExecutorTest, Projection) {
 }
 
 TEST_F(ExecutorTest, Selection) {
-  Transaction txn = rs_->Begin();
-  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   Expression key_is_1 =
       BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(1)));
-  Selection sel(key_is_1, tbl.GetSchema(),
-                std::make_shared<FullScan>(txn, &tbl));
+  Selection sel(key_is_1, tbl->GetSchema(),
+                std::make_shared<FullScan>(ctx.txn_, *tbl));
   std::unordered_set rows({Row({Value(1), Value("world"), Value(4.9)})});
   sel.Dump(std::cout, 0);
   std::cout << "\n";
@@ -136,16 +137,15 @@ TEST_F(ExecutorTest, Selection) {
 }
 
 TEST_F(ExecutorTest, BasicJoin) {
-  Transaction txn = rs_->Begin();
-  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
-
-  Schema right_schema{
-      "RightTable",
-      {Column("key2", ValueType::kInt64), Column("score2", ValueType::kDouble),
-       Column("name2", ValueType::kVarChar)}};
-  rs_->CreateTable(txn, right_schema);
-  ASSIGN_OR_ASSERT_FAIL(Table, right_tbl, rs_->GetTable(txn, "RightTable"));
-  BulkInsert(txn, right_tbl,
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(ctx, Schema{"RightTable",
+                                   {Column("key2", ValueType::kInt64),
+                                    Column("score2", ValueType::kDouble),
+                                    Column("name2", ValueType::kVarChar)}}));
+  BulkInsert(ctx.txn_, right_tbl,
              {{Row({Value(9), Value(1.2), Value("troop")})},
               {Row({Value(7), Value(3.9), Value("arise")})},
               {Row({Value(1), Value(4.9), Value("probe")})},
@@ -154,8 +154,8 @@ TEST_F(ExecutorTest, BasicJoin) {
               {Row({Value(232), Value(40.9), Value("out")})},
               {Row({Value(0), Value(9.2), Value("arise")})}});
 
-  HashJoin hj(std::make_shared<FullScan>(txn, &tbl), {0},
-              std::make_shared<FullScan>(txn, &right_tbl), {0});
+  HashJoin hj(std::make_shared<FullScan>(ctx.txn_, *tbl), {0},
+              std::make_shared<FullScan>(ctx.txn_, right_tbl), {0});
   hj.Dump(std::cout, 0);
   std::cout << "\n";
   std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2), Value(0),
@@ -185,15 +185,16 @@ TEST_F(ExecutorTest, BasicJoin) {
 }
 
 TEST_F(ExecutorTest, Insert) {
-  Transaction txn = rs_->Begin();
-  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   Schema src_schema{
       "SrcTable",
       {Column("key2", ValueType::kInt64), Column("name2", ValueType::kVarChar),
        Column("score2", ValueType::kDouble)}};
-  rs_->CreateTable(txn, src_schema);
-  ASSIGN_OR_ASSERT_FAIL(Table, right_tbl, rs_->GetTable(txn, "SrcTable"));
-  BulkInsert(txn, right_tbl,
+  rs_->CreateTable(ctx, src_schema);
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, right_tbl,
+                        ctx.GetTable("SrcTable"));
+  BulkInsert(ctx.txn_, *right_tbl,
              {{Row({Value(9), Value("troop"), Value(1.2)})},
               {Row({Value(7), Value("arise"), Value(3.9)})},
               {Row({Value(1), Value("probe"), Value(4.9)})},
@@ -202,7 +203,7 @@ TEST_F(ExecutorTest, Insert) {
               {Row({Value(232), Value("out"), Value(40.9)})},
               {Row({Value(0), Value("arise"), Value(9.2)})}});
   auto insert = std::make_shared<Insert>(
-      txn, &tbl, std::make_shared<FullScan>(txn, &right_tbl));
+      ctx.txn_, &*tbl, std::make_shared<FullScan>(ctx.txn_, *right_tbl));
   std::cout << *insert << "\n";
   Row result;
   ASSERT_TRUE(insert->Next(&result, nullptr));
@@ -220,7 +221,7 @@ TEST_F(ExecutorTest, Insert) {
                            Row({Value(3), Value("extra"), Value(99.9)}),
                            Row({Value(232), Value("out"), Value(40.9)}),
                            Row({Value(0), Value("arise"), Value(9.2)})});
-  FullScan fs(txn, &tbl);
+  FullScan fs(ctx.txn_, *tbl);
   while (!rows.empty()) {
     Row got;
     RowPosition pos;
@@ -232,14 +233,15 @@ TEST_F(ExecutorTest, Insert) {
 }
 
 TEST_F(ExecutorTest, Update) {
-  Transaction txn = rs_->Begin();
-  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, kTableName));
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   Schema src_schema{
       "SrcTable",
       {Column("key2", ValueType::kInt64), Column("name2", ValueType::kVarChar),
        Column("score2", ValueType::kDouble)}};
-  rs_->CreateTable(txn, src_schema);
-  ASSIGN_OR_ASSERT_FAIL(Table, right_tbl, rs_->GetTable(txn, "SrcTable"));
+  rs_->CreateTable(ctx, src_schema);
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, right_tbl,
+                        ctx.GetTable("SrcTable"));
 
   std::vector<NamedExpression> update_rule = {
       NamedExpression("key", ColumnValueExp("key")),
@@ -249,9 +251,9 @@ TEST_F(ExecutorTest, Update) {
                                           BinaryOperation::kMultiply,
                                           ConstantValueExp(Value(2.0))))};
   auto update = std::make_shared<Update>(
-      txn, &tbl,
-      std::make_shared<Projection>(update_rule, tbl.GetSchema(),
-                                   std::make_shared<FullScan>(txn, &tbl)));
+      ctx.txn_, &*tbl,
+      std::make_shared<Projection>(update_rule, tbl->GetSchema(),
+                                   std::make_shared<FullScan>(ctx.txn_, *tbl)));
   std::cout << *update << "\n";
   Row result;
   ASSERT_TRUE(update->Next(&result, nullptr));
@@ -262,7 +264,7 @@ TEST_F(ExecutorTest, Update) {
                                 {Row({Value(3), Value("****"), Value(24.4)})},
                                 {Row({Value(1), Value("****"), Value(9.8)})},
                                 {Row({Value(2), Value("****"), Value(8.28)})}});
-  FullScan fs(txn, &tbl);
+  FullScan fs(ctx.txn_, *tbl);
   while (!rows.empty()) {
     Row got;
     RowPosition pos;

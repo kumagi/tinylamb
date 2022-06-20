@@ -8,8 +8,8 @@
 
 namespace tinylamb {
 
-Plan NewFullScanPlan(std::string_view table_name, const TableStatistics& ts) {
-  return std::make_shared<FullScanPlan>(table_name, ts);
+Plan NewFullScanPlan(const Table& table, const TableStatistics& ts) {
+  return std::make_shared<FullScanPlan>(table, ts);
 }
 
 Plan NewProductPlan(const Plan& left_src, std::vector<slot_t> left_cols,

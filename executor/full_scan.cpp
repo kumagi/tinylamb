@@ -8,8 +8,8 @@
 
 namespace tinylamb {
 
-FullScan::FullScan(Transaction& txn, Table* table)
-    : table_(table), iter_(table_->BeginFullScan(txn)) {}
+FullScan::FullScan(Transaction& txn, const Table& table)
+    : table_(&table), iter_(table_->BeginFullScan(txn)) {}
 
 bool tinylamb::FullScan::Next(Row* dst, RowPosition* rp) {
   if (!iter_.IsValid()) {

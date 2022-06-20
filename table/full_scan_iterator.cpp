@@ -58,4 +58,8 @@ bool FullScanIterator::IsValid() const { return pos_.IsValid(); }
 const Row& FullScanIterator::operator*() const { return current_row_; }
 Row& FullScanIterator::operator*() { return current_row_; }
 
+void FullScanIterator::Dump(std::ostream& o, int /*indent*/) const {
+  o << "FullScan: " << table_->schema_.Name();
+}
+
 }  // namespace tinylamb

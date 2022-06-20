@@ -1,21 +1,23 @@
 //
-// Created by kumagi on 2022/03/01.
+// Created by kumagi on 22/06/19.
 //
 
-#ifndef TINYLAMB_FULL_SCAN_PLAN_HPP
-#define TINYLAMB_FULL_SCAN_PLAN_HPP
+#ifndef TINYLAMB_INDEX_SCAN_PLAN_HPP
+#define TINYLAMB_INDEX_SCAN_PLAN_HPP
 
 #include "plan/plan.hpp"
-#include "table/table.hpp"
 #include "table/table_statistics.hpp"
-#include "type/schema.hpp"
+#include "type/row.hpp"
 
 namespace tinylamb {
+class Index;
+class Table;
 
-class FullScanPlan : public PlanBase {
+class IndexScanPlan : public PlanBase {
  public:
-  explicit FullScanPlan(const Table& table, TableStatistics ts);
-  ~FullScanPlan() override = default;
+  explicit IndexScanPlan(Table* table, Index* index, TableStatistics ts,
+                         Row begin, const Row& end, bool ascending);
+  ~IndexScanPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& txn) const override;
 
@@ -26,10 +28,14 @@ class FullScanPlan : public PlanBase {
   void Dump(std::ostream& o, int indent) const override;
 
  private:
-  const Table* table_;
+  Table* table_;
+  Index* index_;
   TableStatistics stats_;
+  Row begin_;
+  Row end_;
+  bool ascending_;
 };
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_FULL_SCAN_PLAN_HPP
+#endif  // TINYLAMB_INDEX_SCAN_PLAN_HPP

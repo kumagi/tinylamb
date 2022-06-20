@@ -11,28 +11,29 @@
 
 namespace tinylamb {
 
-FullScanPlan::FullScanPlan(std::string_view table_name, TableStatistics ts)
-    : table_name_(table_name), stats_(std::move(ts)) {}
+FullScanPlan::FullScanPlan(const Table& table, TableStatistics ts)
+    : table_(&table), stats_(std::move(ts)) {}
 
 Executor FullScanPlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<FullScan>(ctx.txn_, ctx.GetTable(table_name_));
+  return std::make_shared<FullScan>(ctx.txn_, *table_);
 }
 
 Schema FullScanPlan::GetSchema(TransactionContext& ctx) const {
-  StatusOr<Table> tbl = ctx.rs_->GetTable(ctx.txn_, table_name_);
-  return tbl.Value().schema_;
+  ASSIGN_OR_CRASH(std::shared_ptr<Table>, tbl,
+                  ctx.GetTable(table_->GetSchema().Name()));
+  return tbl->GetSchema();
 }
 
-size_t FullScanPlan::AccessRowCount(TransactionContext&) const {
+size_t FullScanPlan::AccessRowCount(TransactionContext& /*txn*/) const {
   return stats_.row_count_;
 }
 
-size_t FullScanPlan::EmitRowCount(TransactionContext&) const {
+size_t FullScanPlan::EmitRowCount(TransactionContext& /*txn*/) const {
   return stats_.row_count_;
 }
 
-void FullScanPlan::Dump(std::ostream& o, int) const {
-  o << "FullScan: " << table_name_;
+void FullScanPlan::Dump(std::ostream& o, int /*indent*/) const {
+  o << "FullScan: " << table_->GetSchema().Name();
 }
 
 }  // namespace tinylamb

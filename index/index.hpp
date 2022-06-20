@@ -26,6 +26,7 @@ class Index {
         std::vector<slot_t> include = {}, IndexMode mode = IndexMode::kUnique)
       : sc_(name, std::move(key), std::move(include), mode), pid_(pid) {}
   [[nodiscard]] bool IsUnique() const { return sc_.IsUnique(); }
+  [[nodiscard]] page_id_t Root() const { return pid_; }
   friend Encoder& operator<<(Encoder& a, const Index& idx);
   friend Decoder& operator>>(Decoder& e, Index& idx);
   bool operator==(const Index& rhs) const = default;

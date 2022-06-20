@@ -18,13 +18,13 @@ struct RowPosition;
 
 class FullScan : public ExecutorBase {
  public:
-  FullScan(Transaction& txn, Table* table);
+  FullScan(Transaction& txn, const Table& table);
   ~FullScan() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:
-  Table* table_;
+  const Table* table_;
   Iterator iter_;
 };
 

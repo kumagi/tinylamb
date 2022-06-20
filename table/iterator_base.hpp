@@ -23,6 +23,11 @@ class IteratorBase {
   Row* operator->() { return &operator*(); }
   virtual IteratorBase& operator++() = 0;
   virtual IteratorBase& operator--() = 0;
+  virtual void Dump(std::ostream& o, int indent) const = 0;
+  friend std::ostream& operator<<(std::ostream& o, const IteratorBase& it) {
+    it.Dump(o, 0);
+    return o;
+  }
 };
 
 }  // namespace tinylamb

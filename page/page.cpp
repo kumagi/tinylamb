@@ -333,7 +333,7 @@ void Page::PageTypeChangeImpl(PageType new_type) {
 
 bool Page::IsValid() const { return checksum == std::hash<Page>()(*this); }
 
-void* Page::operator new(size_t) {
+void* Page::operator new(size_t /*unused*/) {
   void* ret = new char[kPageSize];
   memset(ret, 0, kPageSize);
   return ret;

@@ -103,27 +103,26 @@ bool DoesTouchWithin(const ExpressionBase* ptr,
   return true;
 }
 
-Plan CalcTableSelection(const Schema& schema, const Expression& where,
+Plan CalcTableSelection(const Table& table, const Expression& where,
                         const TableStatistics& stat) {
   // Generate expression for selection.
-  std::unordered_set<std::string> columns = ColumnNames(schema);
+  std::unordered_set<std::string> columns = ColumnNames(table.GetSchema());
   if (where->Type() == TypeTag::kBinaryExp) {
     auto* be = reinterpret_cast<BinaryExpression*>(where.get());
     if (DoesTouchWithin(be->Left().get(), columns) &&
         DoesTouchWithin(be->Right().get(), columns)) {
-      return NewSelectionPlan(NewFullScanPlan(schema.Name(), stat), where,
-                              stat);
+      return NewSelectionPlan(NewFullScanPlan(table, stat), where, stat);
     }
     if (be->Op() == BinaryOperation::kAnd) {
       if (DoesTouchWithin(be->Left().get(), columns)) {
-        return CalcTableSelection(schema, Expression(be->Left()), stat);
+        return CalcTableSelection(table, Expression(be->Left()), stat);
       }
       if (DoesTouchWithin(be->Right().get(), columns)) {
-        return CalcTableSelection(schema, Expression(be->Right()), stat);
+        return CalcTableSelection(table, Expression(be->Right()), stat);
       }
     }
   }
-  return NewFullScanPlan(schema.Name(), stat);
+  return NewFullScanPlan(table, stat);
 }
 
 bool ContainsAny(const std::unordered_set<std::string>& left,
@@ -139,7 +138,9 @@ void ExtractColumns(const Schema& sc, ExpressionBase* exp,
     auto* cv = reinterpret_cast<ColumnValue*>(exp);
     const std::string& name = cv->ColumnName();
     for (size_t i = 0; i < sc.ColumnCount(); ++i) {
-      if (sc.GetColumn(i).Name() == name) dst.push_back(i);
+      if (sc.GetColumn(i).Name() == name) {
+        dst.push_back(i);
+      }
     }
   } else if (exp->Type() == TypeTag::kBinaryExp) {
     auto* be = reinterpret_cast<BinaryExpression*>(exp);
@@ -150,18 +151,17 @@ void ExtractColumns(const Schema& sc, ExpressionBase* exp,
   }
 }
 
-std::vector<slot_t> TargetColumns(const Schema& sc, ExpressionBase* exp) {
+std::vector<slot_t> TargetColumns(const Schema& schema, ExpressionBase* exp) {
   std::vector<slot_t> out;
-  ExtractColumns(sc, exp, out);
+  ExtractColumns(schema, exp, out);
   return out;
 }
 
 Plan BetterPlan(TransactionContext& ctx, Plan a, Plan b) {
   if (a->AccessRowCount(ctx) < b->AccessRowCount(ctx)) {
     return a;
-  } else {
-    return b;
   }
+  return b;
 }
 
 Plan BestJoin(
@@ -200,7 +200,9 @@ Plan BestJoin(
 
 std::unordered_set<std::string> Set(const std::vector<std::string>& from) {
   std::unordered_set<std::string> joined;
-  for (const auto& f : from) joined.insert(f);
+  for (const auto& f : from) {
+    joined.insert(f);
+  }
   return joined;
 }
 
@@ -221,18 +223,17 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
     ExtractTouchedColumns(sel.expression, touched_columns);
   }
   for (const auto& from : query.from_) {
-    ASSIGN_OR_RETURN(Table, tbl, ctx.rs_->GetTable(ctx.txn_, from));
-    ASSIGN_OR_RETURN(TableStatistics, stats,
-                     ctx.rs_->GetStatistics(ctx.txn_, from));
+    ASSIGN_OR_RETURN(std::shared_ptr<Table>, tbl, ctx.GetTable(from));
+    ASSIGN_OR_RETURN(TableStatistics, stats, ctx.rs_->GetStatistics(ctx, from));
 
     // Push down all selection & projection.
     std::vector<NamedExpression> project_target;
-    for (const auto& col : And(touched_columns, ColumnNames(tbl.GetSchema()))) {
+    for (const auto& col :
+         And(touched_columns, ColumnNames(tbl->GetSchema()))) {
       project_target.emplace_back(col);
     }
-    Plan npp = NewProjectionPlan(
-        CalcTableSelection(tbl.GetSchema(), query.where_, stats),
-        project_target);
+    Plan npp = NewProjectionPlan(CalcTableSelection(*tbl, query.where_, stats),
+                                 project_target);
     optimal_plans.emplace(std::unordered_set({from}),
                           CostAndPlan{npp->AccessRowCount(ctx), npp});
   }

@@ -26,14 +26,14 @@ class TransactionContext {
     rs_ = o.rs_;
     return *this;
   }
-  Table* GetTable(std::string_view table_name);
+  StatusOr<std::shared_ptr<Table>> GetTable(std::string_view table_name);
 
   Status PreCommit() { return txn_.PreCommit(); }
   void Abort() { txn_.Abort(); }
 
   Transaction txn_;
   RelationStorage* rs_;
-  std::unordered_map<std::string, Table> tables_;
+  std::unordered_map<std::string, std::shared_ptr<Table>> tables_;
 };
 
 }  // namespace tinylamb

@@ -11,11 +11,14 @@
 #include "type/row.hpp"
 
 namespace tinylamb {
+class Index;
 class Table;
 class Transaction;
 
 class IndexScanIterator : public IteratorBase {
  public:
+  IndexScanIterator(Table* table, Index* index, Transaction* txn, Row begin,
+                    Row end, bool ascending);
   ~IndexScanIterator() override = default;
   bool operator==(const IndexScanIterator& rhs) const {
     return bpt_ == rhs.bpt_ && txn_ == rhs.txn_ &&
@@ -28,16 +31,20 @@ class IndexScanIterator : public IteratorBase {
   const Row& operator*() const override;
   Row& operator*() override;
 
+  void Dump(std::ostream& o, int indent) const override;
+
  private:
   friend class Table;
-  IndexScanIterator(Table* table, std::string_view index_name, Transaction* txn,
-                    const Row& begin, const Row& end = Row(),
-                    bool ascending = true);
+  friend class IndexScan;
   void ResolveCurrentRow();
 
   Table* table_;
-  BPlusTree bpt_;
+  Index* index_;
   Transaction* txn_;
+  const Row begin_;
+  const Row end_;
+  bool ascending_;
+  BPlusTree bpt_;
   BPlusTreeIterator iter_;
   Row current_row_;
 };

@@ -32,6 +32,7 @@ struct IntegerColumnStats {
     min = std::min(min, sample.value.int_value);
     ++count;
   }
+  double EstimateCount(int64_t from, int64_t to) const;
   friend Encoder& operator<<(Encoder& a, const IntegerColumnStats& sc);
   friend Decoder& operator>>(Decoder& a, IntegerColumnStats& sc);
   friend std::ostream& operator<<(std::ostream& o, const IntegerColumnStats& t);
@@ -54,6 +55,7 @@ struct VarcharColumnStats {
     }
     ++count;
   }
+  double EstimateCount(std::string_view from, std::string_view to) const;
   friend Encoder& operator<<(Encoder& a, const VarcharColumnStats& sc);
   friend Decoder& operator>>(Decoder& a, VarcharColumnStats& sc);
   friend std::ostream& operator<<(std::ostream& o, const VarcharColumnStats& t);
@@ -69,6 +71,7 @@ struct DoubleColumnStats {
     min = std::min(min, sample.value.double_value);
     ++count;
   }
+  double EstimateCount(double from, double to) const;
   friend Encoder& operator<<(Encoder& a, const DoubleColumnStats& sc);
   friend Decoder& operator>>(Decoder& a, DoubleColumnStats& sc);
   friend std::ostream& operator<<(std::ostream& o, const DoubleColumnStats& t);
@@ -107,6 +110,44 @@ struct ColumnStats {
         return stat.double_stats.distinct;
     }
   }
+  [[nodiscard]] double EstimateCount(int64_t from, int64_t to) const {
+    switch (type) {
+      case ValueType::kUnknown:
+        assert(!"never reach here");
+      case ValueType::kInt64:
+        return stat.int_stats.EstimateCount(from, to);
+      case ValueType::kVarChar:
+        assert(!"never reach here");
+      case ValueType::kDouble:
+        assert(!"never reach here");
+    }
+  }
+  [[nodiscard]] double EstimateCount(double from, double to) const {
+    switch (type) {
+      case ValueType::kUnknown:
+        assert(!"never reach here");
+      case ValueType::kInt64:
+        assert(!"never reach here");
+      case ValueType::kVarChar:
+        assert(!"never reach here");
+      case ValueType::kDouble:
+        return stat.double_stats.EstimateCount(from, to);
+    }
+  }
+  [[nodiscard]] double EstimateCount(std::string_view from,
+                                     std::string_view to) const {
+    switch (type) {
+      case ValueType::kUnknown:
+        assert(!"never reach here");
+      case ValueType::kInt64:
+        assert(!"never reach here");
+      case ValueType::kVarChar:
+        return stat.varchar_stats.EstimateCount(from, to);
+      case ValueType::kDouble:
+        assert(!"never reach here");
+    }
+  }
+
   friend Encoder& operator<<(Encoder& a, const ColumnStats& sc);
   friend Decoder& operator>>(Decoder& a, ColumnStats& sc);
   friend std::ostream& operator<<(std::ostream& o, const ColumnStats& t);
@@ -117,11 +158,35 @@ class TableStatistics {
  public:
   explicit TableStatistics(const Schema& sc);
   Status Update(Transaction& txn, const Table& target);
-  double ReductionFactor(const Schema& sc, const Expression& predicate) const;
+  [[nodiscard]] double ReductionFactor(const Schema& sc,
+                                       const Expression& predicate) const;
 
   friend Encoder& operator<<(Encoder& e, const TableStatistics& t);
   friend Decoder& operator>>(Decoder& d, TableStatistics& t);
   friend std::ostream& operator<<(std::ostream& o, const TableStatistics& t);
+
+  template <typename T>
+  [[nodiscard]] double EstimateCount(int col_idx, const T& from,
+                                     const T& to) const {
+    return stats_[col_idx].EstimateCount(from, to);
+  }
+  [[nodiscard]] double EstimateCount(int col_idx, const Value& from,
+                                     const Value& to) const {
+    assert(from.type == to.type);
+    if (from.type == ValueType::kInt64) {
+      return stats_[col_idx].EstimateCount(from.value.int_value,
+                                           to.value.int_value);
+    }
+    if (from.type == ValueType::kVarChar) {
+      return stats_[col_idx].EstimateCount(from.value.varchar_value,
+                                           to.value.varchar_value);
+    }
+    if (from.type == ValueType::kDouble) {
+      return stats_[col_idx].EstimateCount(from.value.double_value,
+                                           to.value.double_value);
+    }
+    abort();
+  }
 
   size_t row_count_;
   std::vector<ColumnStats> stats_;

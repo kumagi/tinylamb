@@ -11,10 +11,8 @@
 #include "database/database.hpp"
 #include "gtest/gtest.h"
 #include "index.hpp"
-#include "recovery/checkpoint_manager.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "table/table.hpp"
-#include "transaction/lock_manager.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 
@@ -30,13 +28,14 @@ class IndexScanIteratorTest : public ::testing::Test {
                                   Constraint(Constraint::kIndex)),
                            Column("col2", ValueType::kVarChar),
                            Column("col3", ValueType::kDouble)});
-    Transaction txn = rs_->Begin();
-    ASSERT_SUCCESS(rs_->CreateTable(txn, sc));
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, sc).GetStatus());
     IndexSchema is("idx", {0});
-    ASSERT_SUCCESS(rs_->CreateIndex(txn, kTableName, is));
-    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->GetTable(txn, kTableName));
-    ASSERT_EQ(table.IndexCount(), 1);
-    ASSERT_SUCCESS(txn.PreCommit());
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, kTableName, is));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          ctx.GetTable(kTableName));
+    ASSERT_EQ(table->IndexCount(), 1);
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
   void Recover() {
@@ -59,18 +58,20 @@ class IndexScanIteratorTest : public ::testing::Test {
 TEST_F(IndexScanIteratorTest, Construct) {}
 
 TEST_F(IndexScanIteratorTest, ScanAscending) {
-  Transaction txn = rs_->Begin();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->GetTable(txn, kTableName));
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
   for (int i = 0; i < 230; ++i) {
     ASSERT_SUCCESS(
         table
-            .Insert(txn, Row({Value(i), Value("v" + std::to_string(i)),
-                              Value(0.1 + i)}))
+            ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                    Value(0.1 + i)}))
             .GetStatus());
   }
   Row iter_begin({Value(43)});
   Row iter_end({Value(180)});
-  Iterator it = table.BeginIndexScan(txn, "idx", iter_begin, iter_end);
+  Iterator it = table->BeginIndexScan(ctx.txn_, &table->GetIndex("idx"),
+                                      iter_begin, iter_end);
   ASSERT_TRUE(it.IsValid());
   for (int i = 43; i <= 180; ++i) {
     Row cur = *it;
@@ -83,18 +84,20 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
 }
 
 TEST_F(IndexScanIteratorTest, ScanDecending) {
-  Transaction txn = rs_->Begin();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->GetTable(txn, kTableName));
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
   for (int i = 0; i < 230; ++i) {
     ASSERT_SUCCESS(
         table
-            .Insert(txn, Row({Value(i), Value("v" + std::to_string(i)),
-                              Value(0.1 + i)}))
+            ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                    Value(0.1 + i)}))
             .GetStatus());
   }
   Row iter_begin({Value(104)});
   Row iter_end({Value(200)});
-  Iterator it = table.BeginIndexScan(txn, "idx", iter_begin, iter_end, false);
+  Iterator it = table->BeginIndexScan(ctx.txn_, &table->GetIndex("idx"),
+                                      iter_begin, iter_end, false);
   ASSERT_TRUE(it.IsValid());
   for (int i = 200; i >= 104; --i) {
     Row cur = *it;

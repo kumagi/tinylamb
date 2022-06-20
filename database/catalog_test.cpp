@@ -6,12 +6,8 @@
 #include "database/page_storage.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
-#include "recovery/checkpoint_manager.hpp"
-#include "recovery/logger.hpp"
 #include "relation_storage.hpp"
 #include "table/table.hpp"
-#include "transaction/lock_manager.hpp"
-#include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/schema.hpp"
 
@@ -22,10 +18,11 @@ class CatalogTest : public ::testing::Test {
   void SetUp() override {
     prefix_ = "catalog_test-" + RandomString();
     Recover();
-    auto txn = rs_->Begin();
   }
   void Recover() {
-    if (rs_) rs_->GetPageStorage()->LostAllPageForTest();
+    if (rs_) {
+      rs_->GetPageStorage()->LostAllPageForTest();
+    }
     rs_ = std::make_unique<RelationStorage>(prefix_);
   }
 
@@ -42,12 +39,12 @@ class CatalogTest : public ::testing::Test {
 TEST_F(CatalogTest, Construction) {}
 
 TEST_F(CatalogTest, CreateTable) {
-  auto txn = rs_->Begin();
+  TransactionContext ctx = rs_->BeginContext();
   Schema new_schema("test_schema", {Column("col1", ValueType::kInt64),
                                     Column("key", ValueType::kInt64),
                                     Column("col3", ValueType::kVarChar)});
-  rs_->CreateTable(txn, new_schema);
-  txn.PreCommit();
+  rs_->CreateTable(ctx, new_schema);
+  ctx.txn_.PreCommit();
 }
 
 TEST_F(CatalogTest, GetTable) {
@@ -55,15 +52,16 @@ TEST_F(CatalogTest, GetTable) {
                                     Column("key", ValueType::kInt64),
                                     Column("col3", ValueType::kVarChar)});
   {
-    auto txn = rs_->Begin();
-    rs_->CreateTable(txn, new_schema);
-    txn.PreCommit();
+    TransactionContext ctx = rs_->BeginContext();
+    rs_->CreateTable(ctx, new_schema);
+    ctx.txn_.PreCommit();
   }
   {
-    auto txn = rs_->Begin();
-    ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, "test_schema"));
-    txn.PreCommit();
-    ASSERT_EQ(new_schema, tbl.GetSchema());
+    TransactionContext ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+                          ctx.GetTable("test_schema"));
+    ctx.txn_.PreCommit();
+    ASSERT_EQ(new_schema, tbl->GetSchema());
   }
 }
 
@@ -72,17 +70,18 @@ TEST_F(CatalogTest, Recover) {
                                     Column("key", ValueType::kInt64),
                                     Column("col3", ValueType::kVarChar)});
   {
-    auto txn = rs_->Begin();
-    rs_->CreateTable(txn, new_schema);
-    rs_->DebugDump(txn, std::cout);
-    ASSERT_SUCCESS(txn.PreCommit());
+    TransactionContext ctx = rs_->BeginContext();
+    rs_->CreateTable(ctx, new_schema);
+    rs_->DebugDump(ctx.txn_, std::cout);
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
   Recover();
   {
-    auto txn = rs_->Begin();
-    ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->GetTable(txn, "test_schema"));
-    txn.PreCommit();
-    ASSERT_EQ(new_schema, tbl.GetSchema());
+    TransactionContext ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+                          ctx.GetTable("test_schema"));
+    ctx.txn_.PreCommit();
+    ASSERT_EQ(new_schema, tbl->GetSchema());
   }
 }
 
