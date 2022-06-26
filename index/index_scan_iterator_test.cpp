@@ -68,10 +68,8 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
                                     Value(0.1 + i)}))
             .GetStatus());
   }
-  Row iter_begin({Value(43)});
-  Row iter_end({Value(180)});
-  Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex("idx"),
-                                      iter_begin, iter_end);
+  Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(0), Value(43),
+                                      Value(180));
   ASSERT_TRUE(it.IsValid());
   for (int i = 43; i <= 180; ++i) {
     Row cur = *it;
@@ -94,10 +92,8 @@ TEST_F(IndexScanIteratorTest, ScanDecending) {
                                     Value(0.1 + i)}))
             .GetStatus());
   }
-  Row iter_begin({Value(104)});
-  Row iter_end({Value(200)});
-  Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex("idx"),
-                                      iter_begin, iter_end, false);
+  Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(0), Value(104),
+                                      Value(200), false);
   ASSERT_TRUE(it.IsValid());
   for (int i = 200; i >= 104; --i) {
     Row cur = *it;

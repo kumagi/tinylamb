@@ -24,6 +24,8 @@ class Value {
   explicit Value(double double_value);
   Value(const Value& o);
 
+  bool Truthy() const;
+
   [[nodiscard]] size_t Size() const;
 
   // Read/Write without type info.

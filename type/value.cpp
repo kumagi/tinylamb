@@ -46,6 +46,13 @@ Value::Value(const Value& o)
   }
 }
 
+bool Value::Truthy() const {
+  if (type == ValueType::kInt64) {
+    return value.int_value != 0;
+  }
+  return true;
+}
+
 [[nodiscard]] size_t Value::Size() const {
   switch (type) {
     case ValueType::kUnknown:

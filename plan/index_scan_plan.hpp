@@ -16,8 +16,8 @@ class Table;
 class IndexScanPlan : public PlanBase {
  public:
   explicit IndexScanPlan(const Table& table, const Index& index,
-                         TableStatistics ts, Row begin, Row end,
-                         bool ascending);
+                         const TableStatistics& ts, Value begin, Value end,
+                         bool ascending, Expression where);
   ~IndexScanPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& txn) const override;
@@ -31,10 +31,11 @@ class IndexScanPlan : public PlanBase {
  private:
   const Table& table_;
   const Index& index_;
-  TableStatistics stats_;
-  Row begin_;
-  Row end_;
+  const TableStatistics& stats_;
+  Value begin_;
+  Value end_;
   bool ascending_;
+  Expression where_;
 };
 
 }  // namespace tinylamb

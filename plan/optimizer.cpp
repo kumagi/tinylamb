@@ -13,6 +13,7 @@
 #include "database/transaction_context.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
 #include "full_scan_plan.hpp"
 #include "plan/plan.hpp"
 #include "table/table.hpp"
@@ -24,7 +25,9 @@ class hash<std::unordered_set<std::string>> {
  public:
   uint64_t operator()(const std::unordered_set<std::string>& s) const {
     uint64_t out = 0;
-    for (const auto& e : s) out += std::hash<std::string>()(e);
+    for (const auto& e : s) {
+      out += std::hash<std::string>()(e);
+    }
     return out;
   }
 };
@@ -100,16 +103,16 @@ std::unordered_set<std::string> Union(
   return ret;
 }
 
-bool ReferenceWithin(const ExpressionBase* ptr,
+bool ReferenceWithin(const Expression& where,
                      const std::unordered_set<std::string>& columns) {
-  if (ptr->Type() == TypeTag::kBinaryExp) {
-    const auto* be = reinterpret_cast<const BinaryExpression*>(ptr);
-    return ReferenceWithin(be->Left().get(), columns) ||
-           ReferenceWithin(be->Right().get(), columns);
+  if (where->Type() == TypeTag::kBinaryExp) {
+    const BinaryExpression& be = where->AsBinaryExpression();
+    return ReferenceWithin(be.Left(), columns) ||
+           ReferenceWithin(be.Right(), columns);
   }
-  if (ptr->Type() == TypeTag::kColumnValue) {
-    const auto* be = reinterpret_cast<const ColumnValue*>(ptr);
-    return columns.find(be->ColumnName()) != columns.end();
+  if (where->Type() == TypeTag::kColumnValue) {
+    const ColumnValue& cv = where->AsColumnValue();
+    return columns.find(cv.ColumnName()) != columns.end();
   }
   return false;
 }
@@ -140,23 +143,27 @@ Plan CalcTableSelection(const Table& table, const Expression& where,
     }
     if (be.Op() == BinaryOperation::kAnd) {
       if (DoesTouchWithin(be.Left(), columns)) {
-        return CalcTableSelection(table, Expression(be.Left()), stat);
+        return CalcTableSelection(table, be.Left(), stat);
       }
       if (DoesTouchWithin(be.Right(), columns)) {
-        return CalcTableSelection(table, Expression(be.Right()), stat);
+        return CalcTableSelection(table, be.Right(), stat);
       }
     }
     std::unordered_set<slot_t> cols = TouchedOffsets(table, where);
     if (IsComparison(be.Op())) {
-      std::unordered_set<slot_t> candidates = table.AvailableKeyIndex();
+      std::unordered_map<slot_t, size_t> candidates = table.AvailableKeyIndex();
       if (be.Op() == BinaryOperation::kEquals) {
         if ((be.Left()->Type() == TypeTag::kColumnValue &&
              be.Right()->Type() == TypeTag::kConstantValue)) {
-          const auto* cv =
-              reinterpret_cast<const ColumnValue*>(be.Left().get());
-          int col_idx = table.GetSchema().Offset(cv->ColumnName());
-          if (0 <= col_idx && candidates.contains(col_idx)) {
-            // I can use Index Scan!
+          const ColumnValue cv = be.Left()->AsColumnValue();
+          const ConstantValue constant = be.Right()->AsConstantValue();
+          int col_idx = table.GetSchema().Offset(cv.ColumnName());
+          auto it = candidates.find(col_idx);
+          if (0 <= col_idx && it != candidates.end()) {
+            const Index& available_idx = table.GetIndex(it->second);
+            return NewIndexScanPlan(table, available_idx, stat,
+                                    constant.GetValue(), constant.GetValue(),
+                                    true, where);
           }
         }
       } else {
@@ -173,26 +180,26 @@ bool ContainsAny(const std::unordered_set<std::string>& left,
   });
 }
 
-void ExtractColumns(const Schema& sc, ExpressionBase* exp,
+void ExtractColumns(const Schema& sc, const Expression& exp,
                     std::vector<slot_t>& dst) {
   if (exp->Type() == TypeTag::kColumnValue) {
-    auto* cv = reinterpret_cast<ColumnValue*>(exp);
-    const std::string& name = cv->ColumnName();
+    const ColumnValue& cv = exp->AsColumnValue();
+    const std::string& name = cv.ColumnName();
     for (size_t i = 0; i < sc.ColumnCount(); ++i) {
       if (sc.GetColumn(i).Name() == name) {
         dst.push_back(i);
       }
     }
   } else if (exp->Type() == TypeTag::kBinaryExp) {
-    auto* be = reinterpret_cast<BinaryExpression*>(exp);
-    if (be->Op() == BinaryOperation::kAnd) {
-      ExtractColumns(sc, be->Left().get(), dst);
-      ExtractColumns(sc, be->Right().get(), dst);
+    const BinaryExpression& be = exp->AsBinaryExpression();
+    if (be.Op() == BinaryOperation::kAnd) {
+      ExtractColumns(sc, be.Left(), dst);
+      ExtractColumns(sc, be.Right(), dst);
     }
   }
 }
 
-std::vector<slot_t> TargetColumns(const Schema& schema, ExpressionBase* exp) {
+std::vector<slot_t> TargetColumns(const Schema& schema, const Expression& exp) {
   std::vector<slot_t> out;
   ExtractColumns(schema, exp, out);
   return out;
@@ -210,30 +217,29 @@ Plan BestJoin(
     const std::pair<std::unordered_set<std::string>, CostAndPlan>& left,
     const std::pair<std::unordered_set<std::string>, CostAndPlan>& right) {
   if (where->Type() == TypeTag::kBinaryExp) {
-    auto* be = reinterpret_cast<BinaryExpression*>(where.get());
-    if (be->Op() == BinaryOperation::kEquals) {
+    const BinaryExpression& be = where->AsBinaryExpression();
+    if (be.Op() == BinaryOperation::kEquals) {
       Schema left_schema = left.second.plan->GetSchema(ctx);
       std::unordered_set<std::string> left_column_names =
           ColumnNames(left_schema);
       Schema right_schema = right.second.plan->GetSchema(ctx);
       std::unordered_set<std::string> right_column_names =
           ColumnNames(right.second.plan->GetSchema(ctx));
-      if (ReferenceWithin(be->Left().get(), left_column_names) &&
-          ReferenceWithin(be->Right().get(), right_column_names)) {
+      if (ReferenceWithin(be.Left(), left_column_names) &&
+          ReferenceWithin(be.Right(), right_column_names)) {
         // We can use HashJoin!
-        std::vector<slot_t> left_cols =
-            TargetColumns(left_schema, be->Left().get());
+        std::vector<slot_t> left_cols = TargetColumns(left_schema, be.Left());
         std::vector<slot_t> right_cols =
-            TargetColumns(right_schema, be->Right().get());
+            TargetColumns(right_schema, be.Right());
         return BetterPlan(ctx,
                           NewProductPlan(left.second.plan, left_cols,
                                          right.second.plan, right_cols),
                           NewProductPlan(right.second.plan, right_cols,
                                          left.second.plan, left_cols));
       }
-    } else if (be->Op() == BinaryOperation::kAnd) {
-      return BetterPlan(ctx, BestJoin(ctx, be->Left(), left, right),
-                        BestJoin(ctx, be->Right(), left, right));
+    } else if (be.Op() == BinaryOperation::kAnd) {
+      return BetterPlan(ctx, BestJoin(ctx, be.Left(), left, right),
+                        BestJoin(ctx, be.Right(), left, right));
     }
   }
   return NewProductPlan(left.second.plan, right.second.plan);

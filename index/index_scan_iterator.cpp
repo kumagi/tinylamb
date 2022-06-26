@@ -13,13 +13,13 @@
 namespace tinylamb {
 
 IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
-                                     Transaction& txn, Row begin, Row end,
-                                     bool ascending)
+                                     Transaction& txn, const Value& begin,
+                                     const Value& end, bool ascending)
     : table_(table),
       index_(index),
       txn_(txn),
-      begin_(std::move(begin)),
-      end_(std::move(end)),
+      begin_(begin),
+      end_(end),
       ascending_(ascending),
       bpt_(index.Root()),
       iter_(&bpt_, &txn, begin_.EncodeMemcomparableFormat(),

@@ -6,7 +6,9 @@
 #define TINYLAMB_INDEX_SCAN_HPP
 
 #include "executor/executor_base.hpp"
+#include "expression/expression.hpp"
 #include "table/iterator.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
 class Index;
@@ -16,13 +18,16 @@ class Transaction;
 class IndexScan : public ExecutorBase {
  public:
   IndexScan(Transaction& txn, const Table& table, const Index& index,
-            const Row& begin, const Row& end, bool ascending);
+            const Value& begin, const Value& end, bool ascending,
+            Expression where, const Schema& sc);
   ~IndexScan() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:
   Iterator iter_;
+  Expression cond_;
+  Schema schema_;
 };
 
 }  // namespace tinylamb

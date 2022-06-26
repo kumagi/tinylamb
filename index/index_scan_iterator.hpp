@@ -18,7 +18,7 @@ class Transaction;
 class IndexScanIterator : public IteratorBase {
  public:
   IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
-                    Row begin, Row end, bool ascending);
+                    const Value& begin, const Value& end, bool ascending);
   ~IndexScanIterator() override = default;
   bool operator==(const IndexScanIterator& rhs) const {
     return bpt_ == rhs.bpt_ && &txn_ == &rhs.txn_ &&
@@ -41,8 +41,8 @@ class IndexScanIterator : public IteratorBase {
   const Table& table_;
   const Index& index_;
   Transaction& txn_;
-  const Row begin_;
-  const Row end_;
+  Value begin_;
+  Value end_;
   bool ascending_;
   BPlusTree bpt_;
   BPlusTreeIterator iter_;

@@ -13,6 +13,7 @@
 #include "executor/selection.hpp"
 #include "expression/constant_value.hpp"
 #include "gtest/gtest.h"
+#include "index_scan.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -22,6 +23,7 @@
 namespace tinylamb {
 
 static const char* kTableName = "SampleTable";
+static const char* kIndexName = "SampleIndex";
 class ExecutorTest : public ::testing::Test {
  public:
   static void BulkInsert(Transaction& txn, Table& tbl,
@@ -39,14 +41,14 @@ class ExecutorTest : public ::testing::Test {
         {Column("key", ValueType::kInt64), Column("name", ValueType::kVarChar),
          Column("score", ValueType::kDouble)}};
     TransactionContext ctx = rs_->BeginContext();
-    rs_->CreateTable(ctx, schema);
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
-                          ctx.GetTable(kTableName));
-    BulkInsert(ctx.txn_, *tbl,
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->CreateTable(ctx, schema));
+    IndexSchema idx_sc(kIndexName, {1, 2, 0}, {});
+    BulkInsert(ctx.txn_, tbl,
                {{Row({Value(0), Value("hello"), Value(1.2)})},
                 {Row({Value(3), Value("piyo"), Value(12.2)})},
                 {Row({Value(1), Value("world"), Value(4.9)})},
                 {Row({Value(2), Value("arise"), Value(4.14)})}});
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, kTableName, idx_sc));
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
@@ -88,6 +90,26 @@ TEST_F(ExecutorTest, FullScan) {
   ASSERT_NE(rows.find(got), rows.end());
   rows.erase(got);
   ASSERT_TRUE(rows.empty());
+  ASSERT_FALSE(fs.Next(&got, &pos));
+}
+
+TEST_F(ExecutorTest, IndexScan) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSERT_EQ(tbl->IndexCount(), 1);
+  IndexScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value("he"), Value("q"), true,
+               BinaryExpressionExp(ColumnValueExp("score"),
+                                   BinaryOperation::kGreaterThan,
+                                   ConstantValueExp(Value(10.0))),
+               tbl->GetSchema());
+  Row target({Value(3), Value("piyo"), Value(12.2)});
+
+  fs.Dump(std::cout, 0);
+  std::cout << "\n";
+  Row got;
+  RowPosition pos;
+  ASSERT_TRUE(fs.Next(&got, &pos));
+  ASSERT_EQ(got, target);
   ASSERT_FALSE(fs.Next(&got, &pos));
 }
 

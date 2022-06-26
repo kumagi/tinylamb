@@ -14,9 +14,11 @@ Plan NewFullScanPlan(const Table& table, const TableStatistics& ts) {
 }
 
 Plan NewIndexScanPlan(const Table& table, const Index& index,
-                      TableStatistics ts, Row begin, Row end, bool ascending) {
+                      const TableStatistics& ts, const Value& begin,
+                      const Value& end, bool ascending,
+                      const Expression& where) {
   return std::make_shared<IndexScanPlan>(table, index, ts, begin, end,
-                                         ascending);
+                                         ascending, where);
 }
 
 Plan NewProductPlan(const Plan& left_src, std::vector<slot_t> left_cols,

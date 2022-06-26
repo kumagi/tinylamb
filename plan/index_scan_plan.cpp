@@ -16,18 +16,19 @@
 namespace tinylamb {
 
 IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
-                             TableStatistics ts, Row begin, Row end,
-                             bool ascending)
+                             const TableStatistics& ts, Value begin, Value end,
+                             bool ascending, Expression where)
     : table_(table),
       index_(index),
-      stats_(std::move(ts)),
+      stats_(ts),
       begin_(std::move(begin)),
       end_(std::move(end)),
-      ascending_(ascending) {}
+      ascending_(ascending),
+      where_(where) {}
 
 Executor IndexScanPlan::EmitExecutor(TransactionContext& ctx) const {
   return std::make_shared<IndexScan>(ctx.txn_, table_, index_, begin_, end_,
-                                     ascending_);
+                                     ascending_, where_, GetSchema(ctx));
 }
 
 Schema IndexScanPlan::GetSchema(TransactionContext& ctx) const {
@@ -46,9 +47,7 @@ size_t IndexScanPlan::EmitRowCount(TransactionContext& /*txn*/) const {
   }
   double ret = 0;
   for (const slot_t& col : index_.sc_.key_) {
-    ret = std::min(ret,
-                   stats_.EstimateCount(col, begin_.Extract({col}).values_[0],
-                                        end_.Extract({col}).values_[0]));
+    ret = std::min(ret, stats_.EstimateCount(col, begin_, end_));
   }
   return std::ceil(ret);
 }

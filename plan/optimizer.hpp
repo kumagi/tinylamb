@@ -18,8 +18,8 @@ class Optimizer {
  public:
   explicit Optimizer() = default;
 
-  Status Optimize(const QueryData& query, TransactionContext& ctx,
-                  Schema& schema, Executor& exec);
+  static Status Optimize(const QueryData& query, TransactionContext& ctx,
+                         Schema& schema, Executor& exec);
 };
 
 }  // namespace tinylamb

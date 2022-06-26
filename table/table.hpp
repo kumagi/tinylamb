@@ -5,6 +5,7 @@
 #ifndef TINYLAMB_TABLE_HPP
 #define TINYLAMB_TABLE_HPP
 
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -44,17 +45,20 @@ class Table {
 
   Iterator BeginFullScan(Transaction& txn) const;
   Iterator BeginIndexScan(Transaction& txn, const Index& index,
-                          const Row& begin, const Row& end = Row(),
+                          const Value& begin, const Value& end = Value(),
                           bool ascending = true) const;
 
-  [[nodiscard]] std::unordered_set<slot_t> AvailableKeyIndex() const;
+  [[nodiscard]] std::unordered_map<slot_t, size_t> AvailableKeyIndex() const;
 
   [[nodiscard]] Schema GetSchema() const { return schema_; }
   [[nodiscard]] size_t IndexCount() const { return indexes_.size(); }
 
   friend Encoder& operator<<(Encoder& e, const Table& t);
   friend Decoder& operator>>(Decoder& d, Table& t);
-  Index& GetIndex(std::string_view name);
+  [[nodiscard]] const Index& GetIndex(size_t offset) const {
+    return indexes_[offset];
+  }
+  void AddIndex(const Index& idx) { indexes_.emplace_back(idx); }
 
  private:
   Status IndexInsert(Transaction& txn, const Row& new_row,

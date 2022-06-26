@@ -16,13 +16,17 @@
 namespace tinylamb {
 
 Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
-  PageRef root_page =
-      txn.PageManager()->AllocateNewPage(txn, PageType::kLeafPage);
-  BPlusTree new_bpt(root_page->PageID());
-  indexes_.emplace_back(idx.name_, idx.key_, root_page->PageID(), idx.include_,
-                        idx.mode_);
+  page_id_t new_root;
+  {
+    PageRef root_page =
+        txn.PageManager()->AllocateNewPage(txn, PageType::kLeafPage);
+    new_root = root_page->PageID();
+    indexes_.emplace_back(idx.name_, idx.key_, root_page->PageID(),
+                          idx.include_, idx.mode_);
+  }
 
   Iterator it = BeginFullScan(txn);
+  BPlusTree new_bpt(new_root);
   while (it.IsValid()) {
     RETURN_IF_FAIL(
         new_bpt.Insert(txn, it->Extract(idx.key_).EncodeMemcomparableFormat(),
@@ -157,16 +161,16 @@ Iterator Table::BeginFullScan(Transaction& txn) const {
 }
 
 Iterator Table::BeginIndexScan(Transaction& txn, const Index& index,
-                               const Row& begin, const Row& end,
+                               const Value& begin, const Value& end,
                                bool ascending) const {
   return Iterator(
       new IndexScanIterator(*this, index, txn, begin, end, ascending));
 }
 
-std::unordered_set<slot_t> Table::AvailableKeyIndex() const {
-  std::unordered_set<slot_t> ret;
-  for (const auto& idx : indexes_) {
-    ret.emplace(idx.sc_.key_[0]);
+std::unordered_map<slot_t, size_t> Table::AvailableKeyIndex() const {
+  std::unordered_map<slot_t, size_t> ret;
+  for (size_t i = 0; i < indexes_.size(); ++i) {
+    ret.emplace(indexes_[i].sc_.key_[0], i);
   }
   return ret;
 }
@@ -179,15 +183,6 @@ Encoder& operator<<(Encoder& e, const Table& t) {
 Decoder& operator>>(Decoder& d, Table& t) {
   d >> t.schema_ >> t.first_pid_ >> t.last_pid_ >> t.indexes_;
   return d;
-}
-
-Index& Table::GetIndex(std::string_view name) {
-  for (auto& idx : indexes_) {
-    if (idx.sc_.name_ == name) {
-      return idx;
-    }
-  }
-  assert(!"never reach here");
 }
 
 }  // namespace tinylamb
