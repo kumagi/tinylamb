@@ -15,8 +15,8 @@ class Transaction;
 
 class IndexScan : public ExecutorBase {
  public:
-  IndexScan(Transaction& txn, Table* table, Index* index, const Row& begin,
-            const Row& end, bool ascending);
+  IndexScan(Transaction& txn, const Table& table, const Index& index,
+            const Row& begin, const Row& end, bool ascending);
   ~IndexScan() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;

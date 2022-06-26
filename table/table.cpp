@@ -156,10 +156,19 @@ Iterator Table::BeginFullScan(Transaction& txn) const {
   return Iterator(new FullScanIterator(this, &txn));
 }
 
-Iterator Table::BeginIndexScan(Transaction& txn, Index* index, const Row& begin,
-                               const Row& end, bool ascending) {
+Iterator Table::BeginIndexScan(Transaction& txn, const Index& index,
+                               const Row& begin, const Row& end,
+                               bool ascending) const {
   return Iterator(
-      new IndexScanIterator(this, index, &txn, begin, end, ascending));
+      new IndexScanIterator(*this, index, txn, begin, end, ascending));
+}
+
+std::unordered_set<slot_t> Table::AvailableKeyIndex() const {
+  std::unordered_set<slot_t> ret;
+  for (const auto& idx : indexes_) {
+    ret.emplace(idx.sc_.key_[0]);
+  }
+  return ret;
 }
 
 Encoder& operator<<(Encoder& e, const Table& t) {

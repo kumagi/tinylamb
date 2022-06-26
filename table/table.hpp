@@ -43,8 +43,11 @@ class Table {
   StatusOr<Row> Read(Transaction& txn, RowPosition pos) const;
 
   Iterator BeginFullScan(Transaction& txn) const;
-  Iterator BeginIndexScan(Transaction& txn, Index* index, const Row& begin,
-                          const Row& end = Row(), bool ascending = true);
+  Iterator BeginIndexScan(Transaction& txn, const Index& index,
+                          const Row& begin, const Row& end = Row(),
+                          bool ascending = true) const;
+
+  [[nodiscard]] std::unordered_set<slot_t> AvailableKeyIndex() const;
 
   [[nodiscard]] Schema GetSchema() const { return schema_; }
   [[nodiscard]] size_t IndexCount() const { return indexes_.size(); }

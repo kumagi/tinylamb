@@ -13,17 +13,23 @@
 namespace tinylamb {
 class Schema;
 struct Row;
+class ColumnValue;
+class BinaryExpression;
+class ConstantValue;
 
 enum class TypeTag : int {
   kBinaryExp,
   kColumnValue,
-  kConstant,
+  kConstantValue,
 };
 
 class ExpressionBase {
  public:
   virtual ~ExpressionBase() = default;
   [[nodiscard]] virtual TypeTag Type() const = 0;
+  [[nodiscard]] const ColumnValue& AsColumnValue() const;
+  [[nodiscard]] const BinaryExpression& AsBinaryExpression() const;
+  [[nodiscard]] const ConstantValue& AsConstantValue() const;
   virtual Value Evaluate(const Row& row, Schema* schema) const = 0;
   virtual void Dump(std::ostream& o) const = 0;
   friend std::ostream& operator<<(std::ostream& o, const ExpressionBase& e) {

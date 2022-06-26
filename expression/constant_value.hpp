@@ -12,7 +12,9 @@ namespace tinylamb {
 class ConstantValue : public ExpressionBase {
  public:
   explicit ConstantValue(const Value& v) : val_(v) {}
-  [[nodiscard]] TypeTag Type() const override { return TypeTag::kConstant; }
+  [[nodiscard]] TypeTag Type() const override {
+    return TypeTag::kConstantValue;
+  }
   Value Evaluate(const Row&, Schema*) const override { return val_; }
   [[nodiscard]] Value GetValue() const { return val_; }
 

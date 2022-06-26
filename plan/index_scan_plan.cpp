@@ -15,13 +15,14 @@
 
 namespace tinylamb {
 
-IndexScanPlan::IndexScanPlan(Table* table, Index* index, TableStatistics ts,
-                             Row begin, const Row& end, bool ascending)
+IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
+                             TableStatistics ts, Row begin, Row end,
+                             bool ascending)
     : table_(table),
       index_(index),
       stats_(std::move(ts)),
       begin_(std::move(begin)),
-      end_(end),
+      end_(std::move(end)),
       ascending_(ascending) {}
 
 Executor IndexScanPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -31,7 +32,7 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& ctx) const {
 
 Schema IndexScanPlan::GetSchema(TransactionContext& ctx) const {
   ASSIGN_OR_CRASH(std::shared_ptr<Table>, tbl,
-                  ctx.GetTable(table_->GetSchema().Name()));
+                  ctx.GetTable(table_.GetSchema().Name()));
   return tbl->GetSchema();
 }
 
@@ -40,11 +41,11 @@ size_t IndexScanPlan::AccessRowCount(TransactionContext& txn) const {
 }
 
 size_t IndexScanPlan::EmitRowCount(TransactionContext& /*txn*/) const {
-  if (index_->IsUnique()) {
+  if (index_.IsUnique()) {
     return 2;
   }
   double ret = 0;
-  for (const slot_t& col : index_->sc_.key_) {
+  for (const slot_t& col : index_.sc_.key_) {
     ret = std::min(ret,
                    stats_.EstimateCount(col, begin_.Extract({col}).values_[0],
                                         end_.Extract({col}).values_[0]));
@@ -53,7 +54,7 @@ size_t IndexScanPlan::EmitRowCount(TransactionContext& /*txn*/) const {
 }
 
 void IndexScanPlan::Dump(std::ostream& o, int /*indent*/) const {
-  o << "IndexScan: " << table_->GetSchema().Name();
+  o << "IndexScan: " << table_.GetSchema().Name();
 }
 
 }  // namespace tinylamb

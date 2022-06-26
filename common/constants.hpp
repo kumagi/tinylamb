@@ -69,6 +69,21 @@ enum class BinaryOperation {
   kXor,
 };
 
+inline bool IsComparison(enum BinaryOperation op) {
+  switch (op) {
+    case BinaryOperation::kEquals:
+    case BinaryOperation::kNotEquals:
+    case BinaryOperation::kLessThan:
+    case BinaryOperation::kLessThanEquals:
+    case BinaryOperation::kGreaterThan:
+    case BinaryOperation::kGreaterThanEquals:
+      return true;
+
+    default:
+      return false;
+  }
+}
+
 typedef uint64_t lsn_t;
 typedef uint64_t txn_id_t;
 typedef uint64_t page_id_t;

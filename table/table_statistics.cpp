@@ -271,8 +271,8 @@ double TableStatistics::ReductionFactor(const Schema& sc,
         int offset_right = sc.Offset(rcv->ColumnName());
         return static_cast<double>(stats_[offset_right].Distinct());
       }
-      if (bo->Left()->Type() == TypeTag::kConstant &&
-          bo->Right()->Type() == TypeTag::kConstant) {
+      if (bo->Left()->Type() == TypeTag::kConstantValue &&
+          bo->Right()->Type() == TypeTag::kConstantValue) {
         Value left = reinterpret_cast<const ConstantValue*>(bo->Left().get())
                          ->GetValue();
         Value right = reinterpret_cast<const ConstantValue*>(bo->Right().get())
@@ -295,14 +295,47 @@ double TableStatistics::ReductionFactor(const Schema& sc,
   return 1;
 }
 
+double IntegerColumnStats::EstimateCount(int64_t from, int64_t to) const {
+  if (to <= from) {
+    std::swap(from, to);
+  }
+  assert(from <= to);
+  from = std::max(min, from);
+  to = std::min(max, to);
+  return (from - to) * static_cast<double>(count) / distinct;
+}
+
 Encoder& operator<<(Encoder& e, const IntegerColumnStats& s) {
   e << s.max << s.min << s.count << s.distinct;
   return e;
 }
+
+double VarcharColumnStats::EstimateCount(std::string_view from,
+                                         std::string_view to) const {
+  if (to <= from) {
+    std::swap(from, to);
+  }
+  if (to <= min || max <= from) {
+    return 1;
+  }
+  return 2;  // FIXME: there must be a better estimation!
+}
+
 Encoder& operator<<(Encoder& e, const VarcharColumnStats& s) {
   e << s.count << s.distinct;
   return e;
 }
+
+double DoubleColumnStats::EstimateCount(double from, double to) const {
+  if (to <= from) {
+    std::swap(from, to);
+  }
+  assert(from <= to);
+  from = std::max(min, from);
+  to = std::min(max, to);
+  return (from - to) * count / distinct;
+}
+
 Encoder& operator<<(Encoder& e, const DoubleColumnStats& s) {
   e << s.max << s.min << s.count << s.distinct;
   return e;

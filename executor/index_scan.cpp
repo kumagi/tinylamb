@@ -9,9 +9,9 @@
 
 namespace tinylamb {
 
-IndexScan::IndexScan(Transaction& txn, Table* table, Index* index,
+IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
                      const Row& begin, const Row& end, bool ascending)
-    : iter_(new IndexScanIterator(table, index, &txn, begin, end, ascending)) {}
+    : iter_(new IndexScanIterator(table, index, txn, begin, end, ascending)) {}
 
 bool IndexScan::Next(Row* dst, RowPosition* rp) {
   if (!iter_.IsValid()) {

@@ -32,7 +32,7 @@ struct IntegerColumnStats {
     min = std::min(min, sample.value.int_value);
     ++count;
   }
-  double EstimateCount(int64_t from, int64_t to) const;
+  [[nodiscard]] double EstimateCount(int64_t from, int64_t to) const;
   friend Encoder& operator<<(Encoder& a, const IntegerColumnStats& sc);
   friend Decoder& operator>>(Decoder& a, IntegerColumnStats& sc);
   friend std::ostream& operator<<(std::ostream& o, const IntegerColumnStats& t);
@@ -55,7 +55,8 @@ struct VarcharColumnStats {
     }
     ++count;
   }
-  double EstimateCount(std::string_view from, std::string_view to) const;
+  [[nodiscard]] double EstimateCount(std::string_view from,
+                                     std::string_view to) const;
   friend Encoder& operator<<(Encoder& a, const VarcharColumnStats& sc);
   friend Decoder& operator>>(Decoder& a, VarcharColumnStats& sc);
   friend std::ostream& operator<<(std::ostream& o, const VarcharColumnStats& t);
@@ -71,7 +72,7 @@ struct DoubleColumnStats {
     min = std::min(min, sample.value.double_value);
     ++count;
   }
-  double EstimateCount(double from, double to) const;
+  [[nodiscard]] double EstimateCount(double from, double to) const;
   friend Encoder& operator<<(Encoder& a, const DoubleColumnStats& sc);
   friend Decoder& operator>>(Decoder& a, DoubleColumnStats& sc);
   friend std::ostream& operator<<(std::ostream& o, const DoubleColumnStats& t);

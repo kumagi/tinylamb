@@ -15,8 +15,9 @@ class Table;
 
 class IndexScanPlan : public PlanBase {
  public:
-  explicit IndexScanPlan(Table* table, Index* index, TableStatistics ts,
-                         Row begin, const Row& end, bool ascending);
+  explicit IndexScanPlan(const Table& table, const Index& index,
+                         TableStatistics ts, Row begin, Row end,
+                         bool ascending);
   ~IndexScanPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& txn) const override;
@@ -28,8 +29,8 @@ class IndexScanPlan : public PlanBase {
   void Dump(std::ostream& o, int indent) const override;
 
  private:
-  Table* table_;
-  Index* index_;
+  const Table& table_;
+  const Index& index_;
   TableStatistics stats_;
   Row begin_;
   Row end_;

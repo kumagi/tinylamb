@@ -2,6 +2,7 @@
 // Created by kumagi on 2022/03/14.
 //
 #include "plan/full_scan_plan.hpp"
+#include "plan/index_scan_plan.hpp"
 #include "plan/product_plan.hpp"
 #include "plan/projection_plan.hpp"
 #include "plan/selection_plan.hpp"
@@ -10,6 +11,12 @@ namespace tinylamb {
 
 Plan NewFullScanPlan(const Table& table, const TableStatistics& ts) {
   return std::make_shared<FullScanPlan>(table, ts);
+}
+
+Plan NewIndexScanPlan(const Table& table, const Index& index,
+                      TableStatistics ts, Row begin, Row end, bool ascending) {
+  return std::make_shared<IndexScanPlan>(table, index, ts, begin, end,
+                                         ascending);
 }
 
 Plan NewProductPlan(const Plan& left_src, std::vector<slot_t> left_cols,

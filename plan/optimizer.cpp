@@ -50,6 +50,27 @@ void ExtractTouchedColumns(const Expression& exp,
   }
 }
 
+std::unordered_set<std::string> TouchedColumns(const Expression& where) {
+  std::unordered_set<std::string> ret;
+  ExtractTouchedColumns(where, ret);
+  return ret;
+}
+
+std::unordered_set<slot_t> TouchedOffsets(const Table& table,
+                                          const Expression& where) {
+  std::unordered_set<std::string> touched_columns = TouchedColumns(where);
+  std::unordered_set<slot_t> touched_offset;
+  touched_offset.reserve(touched_columns.size());
+  const Schema& sc = table.GetSchema();
+  for (slot_t i = 0; i < sc.ColumnCount(); ++i) {
+    if (touched_columns.find(std::string(sc.GetColumn(i).Name())) !=
+        touched_columns.end()) {
+      touched_offset.emplace(i);
+    }
+  }
+  return touched_offset;
+}
+
 std::unordered_set<std::string> ColumnNames(const Schema& sc) {
   std::unordered_set<std::string> ret;
   ret.reserve(sc.ColumnCount());
@@ -59,17 +80,21 @@ std::unordered_set<std::string> ColumnNames(const Schema& sc) {
   return ret;
 }
 
-std::unordered_set<std::string> And(const std::unordered_set<std::string>& a,
-                                    const std::unordered_set<std::string>& b) {
+std::unordered_set<std::string> Intersect(
+    const std::unordered_set<std::string>& a,
+    const std::unordered_set<std::string>& b) {
   std::unordered_set<std::string> ret;
   for (const auto& l : a) {
-    if (b.find(l) != b.end()) ret.emplace(l);
+    if (b.find(l) != b.end()) {
+      ret.emplace(l);
+    }
   }
   return ret;
 }
 
-std::unordered_set<std::string> Or(const std::unordered_set<std::string>& a,
-                                   const std::unordered_set<std::string>& b) {
+std::unordered_set<std::string> Union(
+    const std::unordered_set<std::string>& a,
+    const std::unordered_set<std::string>& b) {
   std::unordered_set<std::string> ret = a;
   std::copy(b.begin(), b.end(), std::inserter(ret, ret.end()));
   return ret;
@@ -89,15 +114,15 @@ bool ReferenceWithin(const ExpressionBase* ptr,
   return false;
 }
 
-bool DoesTouchWithin(const ExpressionBase* ptr,
+bool DoesTouchWithin(const Expression& where,
                      const std::unordered_set<std::string>& columns) {
-  if (ptr->Type() == TypeTag::kBinaryExp) {
-    const auto* be = reinterpret_cast<const BinaryExpression*>(ptr);
-    return DoesTouchWithin(be->Left().get(), columns) &&
-           DoesTouchWithin(be->Right().get(), columns);
+  if (where->Type() == TypeTag::kBinaryExp) {
+    const BinaryExpression& be = where->AsBinaryExpression();
+    return DoesTouchWithin(be.Left(), columns) &&
+           DoesTouchWithin(be.Right(), columns);
   }
-  if (ptr->Type() == TypeTag::kColumnValue) {
-    const auto* be = reinterpret_cast<const ColumnValue*>(ptr);
+  if (where->Type() == TypeTag::kColumnValue) {
+    const auto* be = reinterpret_cast<const ColumnValue*>(where.get());
     return columns.find(be->ColumnName()) != columns.end();
   }
   return true;
@@ -108,17 +133,33 @@ Plan CalcTableSelection(const Table& table, const Expression& where,
   // Generate expression for selection.
   std::unordered_set<std::string> columns = ColumnNames(table.GetSchema());
   if (where->Type() == TypeTag::kBinaryExp) {
-    auto* be = reinterpret_cast<BinaryExpression*>(where.get());
-    if (DoesTouchWithin(be->Left().get(), columns) &&
-        DoesTouchWithin(be->Right().get(), columns)) {
+    const BinaryExpression& be = where->AsBinaryExpression();
+    if (DoesTouchWithin(be.Left(), columns) &&
+        DoesTouchWithin(be.Right(), columns)) {
       return NewSelectionPlan(NewFullScanPlan(table, stat), where, stat);
     }
-    if (be->Op() == BinaryOperation::kAnd) {
-      if (DoesTouchWithin(be->Left().get(), columns)) {
-        return CalcTableSelection(table, Expression(be->Left()), stat);
+    if (be.Op() == BinaryOperation::kAnd) {
+      if (DoesTouchWithin(be.Left(), columns)) {
+        return CalcTableSelection(table, Expression(be.Left()), stat);
       }
-      if (DoesTouchWithin(be->Right().get(), columns)) {
-        return CalcTableSelection(table, Expression(be->Right()), stat);
+      if (DoesTouchWithin(be.Right(), columns)) {
+        return CalcTableSelection(table, Expression(be.Right()), stat);
+      }
+    }
+    std::unordered_set<slot_t> cols = TouchedOffsets(table, where);
+    if (IsComparison(be.Op())) {
+      std::unordered_set<slot_t> candidates = table.AvailableKeyIndex();
+      if (be.Op() == BinaryOperation::kEquals) {
+        if ((be.Left()->Type() == TypeTag::kColumnValue &&
+             be.Right()->Type() == TypeTag::kConstantValue)) {
+          const auto* cv =
+              reinterpret_cast<const ColumnValue*>(be.Left().get());
+          int col_idx = table.GetSchema().Offset(cv->ColumnName());
+          if (0 <= col_idx && candidates.contains(col_idx)) {
+            // I can use Index Scan!
+          }
+        }
+      } else {
       }
     }
   }
@@ -229,7 +270,7 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
     // Push down all selection & projection.
     std::vector<NamedExpression> project_target;
     for (const auto& col :
-         And(touched_columns, ColumnNames(tbl->GetSchema()))) {
+         Intersect(touched_columns, ColumnNames(tbl->GetSchema()))) {
       project_target.emplace_back(col);
     }
     Plan npp = NewProjectionPlan(CalcTableSelection(*tbl, query.where_, stats),
@@ -248,7 +289,7 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
         }
         Plan best_join = BestJoin(ctx, query.where_, base_table, join_table);
         std::unordered_set<std::string> joined_tables =
-            Or(base_table.first, join_table.first);
+            Union(base_table.first, join_table.first);
         assert(1 < joined_tables.size());
         size_t cost = best_join->AccessRowCount(ctx);
         auto iter = optimal_plans.find(joined_tables);

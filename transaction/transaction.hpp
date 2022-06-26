@@ -97,6 +97,9 @@ class Transaction {
 
   PageManager* PageManager() { return transaction_manager_->GetPageManager(); }
 
+  // Transaction is not a value object. Never try to compare by its attributes.
+  bool operator==(const Transaction& rhs) const = delete;
+
  private:
   friend class TransactionManager;
   friend class CheckpointManager;

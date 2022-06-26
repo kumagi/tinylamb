@@ -17,11 +17,11 @@ class Transaction;
 
 class IndexScanIterator : public IteratorBase {
  public:
-  IndexScanIterator(Table* table, Index* index, Transaction* txn, Row begin,
-                    Row end, bool ascending);
+  IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
+                    Row begin, Row end, bool ascending);
   ~IndexScanIterator() override = default;
   bool operator==(const IndexScanIterator& rhs) const {
-    return bpt_ == rhs.bpt_ && txn_ == rhs.txn_ &&
+    return bpt_ == rhs.bpt_ && &txn_ == &rhs.txn_ &&
            current_row_ == rhs.current_row_;
   }
   [[nodiscard]] bool IsValid() const override;
@@ -38,9 +38,9 @@ class IndexScanIterator : public IteratorBase {
   friend class IndexScan;
   void ResolveCurrentRow();
 
-  Table* table_;
-  Index* index_;
-  Transaction* txn_;
+  const Table& table_;
+  const Index& index_;
+  Transaction& txn_;
   const Row begin_;
   const Row end_;
   bool ascending_;
