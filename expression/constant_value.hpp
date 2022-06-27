@@ -15,7 +15,7 @@ class ConstantValue : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override {
     return TypeTag::kConstantValue;
   }
-  Value Evaluate(const Row&, Schema*) const override { return val_; }
+  Value Evaluate(const Row&, const Schema&) const override { return val_; }
   [[nodiscard]] Value GetValue() const { return val_; }
 
   friend std::ostream& operator<<(std::ostream& o, const ConstantValue& c) {

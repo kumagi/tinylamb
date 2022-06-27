@@ -5,14 +5,15 @@
 #ifndef TINYLAMB_TRANSACTION_CONTEXT_HPP
 #define TINYLAMB_TRANSACTION_CONTEXT_HPP
 
-#include "table/table.hpp"
 #include "transaction/transaction.hpp"
-#include "transaction/transaction_manager.hpp"
+// #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
 
 class PageManager;
 class RelationStorage;
+class Table;
+class TableStatistics;
 
 class TransactionContext {
  public:
@@ -27,6 +28,8 @@ class TransactionContext {
     return *this;
   }
   StatusOr<std::shared_ptr<Table>> GetTable(std::string_view table_name);
+  StatusOr<std::shared_ptr<TableStatistics>> GetStats(
+      std::string_view table_name);
 
   Status PreCommit() { return txn_.PreCommit(); }
   void Abort() { txn_.Abort(); }
@@ -34,6 +37,7 @@ class TransactionContext {
   Transaction txn_;
   RelationStorage* rs_;
   std::unordered_map<std::string, std::shared_ptr<Table>> tables_;
+  std::unordered_map<std::string, std::shared_ptr<TableStatistics>> stats_;
 };
 
 }  // namespace tinylamb

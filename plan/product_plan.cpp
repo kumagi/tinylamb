@@ -18,7 +18,8 @@ ProductPlan::ProductPlan(Plan left_src, std::vector<slot_t> left_cols,
     : left_src_(std::move(left_src)),
       right_src_(std::move(right_src)),
       left_cols_(std::move(left_cols)),
-      right_cols_(std::move(right_cols)) {}
+      right_cols_(std::move(right_cols)),
+      output_schema_(left_src_->GetSchema() + right_src_->GetSchema()) {}
 
 ProductPlan::ProductPlan(Plan left_src, Plan right_src)
     : left_src_(std::move(left_src)), right_src_(std::move(right_src)) {}
@@ -32,8 +33,8 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
                                     right_src_->EmitExecutor(ctx), right_cols_);
 }
 
-[[nodiscard]] Schema ProductPlan::GetSchema(TransactionContext& ctx) const {
-  return left_src_->GetSchema(ctx) + right_src_->GetSchema(ctx);
+[[nodiscard]] const Schema& ProductPlan::GetSchema() const {
+  return output_schema_;
 }
 
 size_t ProductPlan::AccessRowCount(TransactionContext& ctx) const {

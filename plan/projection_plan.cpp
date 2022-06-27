@@ -15,15 +15,12 @@ namespace tinylamb {
 
 ProjectionPlan::ProjectionPlan(Plan src,
                                std::vector<NamedExpression> project_columns)
-    : src_(std::move(src)), columns_(std::move(project_columns)) {}
+    : src_(std::move(src)),
+      columns_(std::move(project_columns)),
+      output_schema_(CalcSchema()) {}
 
-Executor ProjectionPlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<Projection>(columns_, src_->GetSchema(ctx),
-                                      src_->EmitExecutor(ctx));
-}
-
-Schema ProjectionPlan::GetSchema(TransactionContext& ctx) const {
-  Schema original_schema = src_->GetSchema(ctx);
+Schema ProjectionPlan::CalcSchema() const {
+  Schema original_schema = src_->GetSchema();
 
   std::vector<Column> cols;
   cols.reserve(columns_.size());
@@ -39,9 +36,15 @@ Schema ProjectionPlan::GetSchema(TransactionContext& ctx) const {
     }
     cols.emplace_back("$col" + std::to_string(i));
   }
-
   return {"", cols};
 }
+
+Executor ProjectionPlan::EmitExecutor(TransactionContext& ctx) const {
+  return std::make_shared<Projection>(columns_, src_->GetSchema(),
+                                      src_->EmitExecutor(ctx));
+}
+
+const Schema& ProjectionPlan::GetSchema() const { return output_schema_; }
 
 size_t ProjectionPlan::AccessRowCount(TransactionContext& ctx) const {
   return src_->EmitRowCount(ctx);

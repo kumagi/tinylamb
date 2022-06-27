@@ -25,9 +25,10 @@ TEST(ExpressionTest, ConstantEval) {
   Expression cv_varchar = ConstantValueExp(Value("hello"));
   Expression cv_double = ConstantValueExp(Value(1.1));
   Row dummy({});
-  ASSERT_EQ(cv_int->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(cv_varchar->Evaluate(dummy, nullptr), Value("hello"));
-  ASSERT_EQ(cv_double->Evaluate(dummy, nullptr), Value(1.1));
+  Schema dummy_schema;
+  ASSERT_EQ(cv_int->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(cv_varchar->Evaluate(dummy, dummy_schema), Value("hello"));
+  ASSERT_EQ(cv_double->Evaluate(dummy, dummy_schema), Value(1.1));
 }
 
 TEST(ExpressionTest, BinaryPlus) {
@@ -41,10 +42,12 @@ TEST(ExpressionTest, BinaryPlus) {
       BinaryExpressionExp(ConstantValueExp(Value(1.1)), BinaryOperation::kAdd,
                           ConstantValueExp(Value(2.2)));
   Row dummy({});
-  ASSERT_EQ(int_plus->Evaluate(dummy, nullptr), Value(3));
-  ASSERT_EQ(varchar_plus->Evaluate(dummy, nullptr), Value("hello world"));
-  ASSERT_DOUBLE_EQ(double_plus->Evaluate(dummy, nullptr).value.double_value,
-                   Value(3.3).value.double_value);
+  Schema dummy_schema;
+  ASSERT_EQ(int_plus->Evaluate(dummy, dummy_schema), Value(3));
+  ASSERT_EQ(varchar_plus->Evaluate(dummy, dummy_schema), Value("hello world"));
+  ASSERT_DOUBLE_EQ(
+      double_plus->Evaluate(dummy, dummy_schema).value.double_value,
+      Value(3.3).value.double_value);
 }
 
 TEST(ExpressionTest, BinaryMinus) {
@@ -55,9 +58,11 @@ TEST(ExpressionTest, BinaryMinus) {
                                                 BinaryOperation::kSubtract,
                                                 ConstantValueExp(Value(2.2)));
   Row dummy({});
-  ASSERT_EQ(int_minus->Evaluate(dummy, nullptr), Value(-1));
-  ASSERT_DOUBLE_EQ(double_minus->Evaluate(dummy, nullptr).value.double_value,
-                   Value(-1.1).value.double_value);
+  Schema dummy_schema;
+  ASSERT_EQ(int_minus->Evaluate(dummy, dummy_schema), Value(-1));
+  ASSERT_DOUBLE_EQ(
+      double_minus->Evaluate(dummy, dummy_schema).value.double_value,
+      Value(-1.1).value.double_value);
 }
 
 TEST(ExpressionTest, BinaryMultiple) {
@@ -68,9 +73,11 @@ TEST(ExpressionTest, BinaryMultiple) {
       ConstantValueExp(Value(1.1)), BinaryOperation::kMultiply,
       ConstantValueExp(Value(2.2)));
   Row dummy({});
-  ASSERT_EQ(int_multiple->Evaluate(dummy, nullptr), Value(2));
-  ASSERT_DOUBLE_EQ(double_multiple->Evaluate(dummy, nullptr).value.double_value,
-                   Value(2.42).value.double_value);
+  Schema dummy_schema;
+  ASSERT_EQ(int_multiple->Evaluate(dummy, dummy_schema), Value(2));
+  ASSERT_DOUBLE_EQ(
+      double_multiple->Evaluate(dummy, dummy_schema).value.double_value,
+      Value(2.42).value.double_value);
 }
 
 TEST(ExpressionTest, BinaryDiv) {
@@ -81,8 +88,9 @@ TEST(ExpressionTest, BinaryDiv) {
                                               BinaryOperation::kDivide,
                                               ConstantValueExp(Value(2.2)));
   Row dummy({});
-  ASSERT_EQ(int_div->Evaluate(dummy, nullptr), Value(5));
-  ASSERT_DOUBLE_EQ(double_div->Evaluate(dummy, nullptr).value.double_value,
+  Schema dummy_schema;
+  ASSERT_EQ(int_div->Evaluate(dummy, dummy_schema), Value(5));
+  ASSERT_DOUBLE_EQ(double_div->Evaluate(dummy, dummy_schema).value.double_value,
                    Value(4.0).value.double_value);
 }
 
@@ -91,7 +99,8 @@ TEST(ExpressionTest, BinaryMod) {
       BinaryExpressionExp(ConstantValueExp(Value(13)), BinaryOperation::kModulo,
                           ConstantValueExp(Value(5)));
   Row dummy({});
-  ASSERT_EQ(int_mod->Evaluate(dummy, nullptr), Value(3));
+  Schema dummy_schema;
+  ASSERT_EQ(int_mod->Evaluate(dummy, dummy_schema), Value(3));
 }
 
 TEST(ExpressionTest, Equal) {
@@ -114,12 +123,13 @@ TEST(ExpressionTest, Equal) {
                                               BinaryOperation::kEquals,
                                               ConstantValueExp(Value("world")));
   Row dummy({});
-  ASSERT_EQ(int_eq->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(int_ne->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(double_eq->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(double_ne->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(varchar_eq->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(varchar_ne->Evaluate(dummy, nullptr), Value(0));
+  Schema dummy_schema;
+  ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(int_ne->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(double_eq->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(double_ne->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(varchar_eq->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(varchar_ne->Evaluate(dummy, dummy_schema), Value(0));
 }
 
 TEST(ExpressionTest, NotEqual) {
@@ -142,12 +152,13 @@ TEST(ExpressionTest, NotEqual) {
                                               BinaryOperation::kNotEquals,
                                               ConstantValueExp(Value("world")));
   Row dummy({});
-  ASSERT_EQ(int_eq->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(int_ne->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(double_eq->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(double_ne->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(varchar_eq->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(varchar_ne->Evaluate(dummy, nullptr), Value(1));
+  Schema dummy_schema;
+  ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(int_ne->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(double_eq->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(double_ne->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(varchar_eq->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(varchar_ne->Evaluate(dummy, dummy_schema), Value(1));
 }
 
 TEST(ExpressionTest, LessThan) {
@@ -179,15 +190,16 @@ TEST(ExpressionTest, LessThan) {
                                               BinaryOperation::kLessThan,
                                               ConstantValueExp(Value("a")));
   Row dummy({});
-  ASSERT_EQ(int_lt->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(int_eq->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(int_gt->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(double_lt->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(double_eq->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(double_gt->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(varchar_lt->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(varchar_eq->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(varchar_gt->Evaluate(dummy, nullptr), Value(0));
+  Schema dummy_schema;
+  ASSERT_EQ(int_lt->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(int_gt->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(double_lt->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(double_eq->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(double_gt->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(varchar_lt->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(varchar_eq->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(varchar_gt->Evaluate(dummy, dummy_schema), Value(0));
 }
 
 TEST(ExpressionTest, LessThanEquals) {
@@ -219,15 +231,16 @@ TEST(ExpressionTest, LessThanEquals) {
                                               BinaryOperation::kLessThanEquals,
                                               ConstantValueExp(Value("a")));
   Row dummy({});
-  ASSERT_EQ(int_lt->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(int_eq->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(int_gt->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(double_lt->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(double_eq->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(double_gt->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(varchar_lt->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(varchar_eq->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(varchar_gt->Evaluate(dummy, nullptr), Value(0));
+  Schema dummy_schema;
+  ASSERT_EQ(int_lt->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(int_gt->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(double_lt->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(double_eq->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(double_gt->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(varchar_lt->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(varchar_eq->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(varchar_gt->Evaluate(dummy, dummy_schema), Value(0));
 }
 
 TEST(ExpressionTest, GreaterThan) {
@@ -259,15 +272,16 @@ TEST(ExpressionTest, GreaterThan) {
                                               BinaryOperation::kGreaterThan,
                                               ConstantValueExp(Value("a")));
   Row dummy({});
-  ASSERT_EQ(int_lt->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(int_eq->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(int_gt->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(double_lt->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(double_eq->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(double_gt->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(varchar_lt->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(varchar_eq->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(varchar_gt->Evaluate(dummy, nullptr), Value(1));
+  Schema dummy_schema;
+  ASSERT_EQ(int_lt->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(int_gt->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(double_lt->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(double_eq->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(double_gt->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(varchar_lt->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(varchar_eq->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(varchar_gt->Evaluate(dummy, dummy_schema), Value(1));
 }
 
 TEST(ExpressionTest, GreaterThanEquals) {
@@ -299,15 +313,16 @@ TEST(ExpressionTest, GreaterThanEquals) {
       ConstantValueExp(Value("b")), BinaryOperation::kGreaterThanEquals,
       ConstantValueExp(Value("a")));
   Row dummy({});
-  ASSERT_EQ(int_lt->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(int_eq->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(int_gt->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(double_lt->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(double_eq->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(double_gt->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(varchar_lt->Evaluate(dummy, nullptr), Value(0));
-  ASSERT_EQ(varchar_eq->Evaluate(dummy, nullptr), Value(1));
-  ASSERT_EQ(varchar_gt->Evaluate(dummy, nullptr), Value(1));
+  Schema dummy_schema;
+  ASSERT_EQ(int_lt->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(int_gt->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(double_lt->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(double_eq->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(double_gt->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(varchar_lt->Evaluate(dummy, dummy_schema), Value(0));
+  ASSERT_EQ(varchar_eq->Evaluate(dummy, dummy_schema), Value(1));
+  ASSERT_EQ(varchar_gt->Evaluate(dummy, dummy_schema), Value(1));
 }
 
 TEST(ExpressionTest, ColumnValue) {
@@ -317,10 +332,10 @@ TEST(ExpressionTest, ColumnValue) {
   Schema sc("test_schema", cols);
   Row row({Value("foo"), Value(12), Value(132.3), Value(9)});
 
-  ASSERT_EQ(ColumnValueExp("name")->Evaluate(row, &sc), Value("foo"));
-  ASSERT_EQ(ColumnValueExp("score")->Evaluate(row, &sc), Value(12));
-  ASSERT_EQ(ColumnValueExp("flv")->Evaluate(row, &sc), Value(132.3));
-  ASSERT_EQ(ColumnValueExp("date")->Evaluate(row, &sc), Value(9));
+  ASSERT_EQ(ColumnValueExp("name")->Evaluate(row, sc), Value("foo"));
+  ASSERT_EQ(ColumnValueExp("score")->Evaluate(row, sc), Value(12));
+  ASSERT_EQ(ColumnValueExp("flv")->Evaluate(row, sc), Value(132.3));
+  ASSERT_EQ(ColumnValueExp("date")->Evaluate(row, sc), Value(9));
 }
 
 }  // namespace tinylamb

@@ -12,17 +12,13 @@
 namespace tinylamb {
 
 FullScanPlan::FullScanPlan(const Table& table, TableStatistics ts)
-    : table_(&table), stats_(std::move(ts)) {}
+    : table_(table), stats_(std::move(ts)) {}
 
 Executor FullScanPlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<FullScan>(ctx.txn_, *table_);
+  return std::make_shared<FullScan>(ctx.txn_, table_);
 }
 
-Schema FullScanPlan::GetSchema(TransactionContext& ctx) const {
-  ASSIGN_OR_CRASH(std::shared_ptr<Table>, tbl,
-                  ctx.GetTable(table_->GetSchema().Name()));
-  return tbl->GetSchema();
-}
+const Schema& FullScanPlan::GetSchema() const { return table_.GetSchema(); }
 
 size_t FullScanPlan::AccessRowCount(TransactionContext& /*txn*/) const {
   return stats_.row_count_;
@@ -33,7 +29,7 @@ size_t FullScanPlan::EmitRowCount(TransactionContext& /*txn*/) const {
 }
 
 void FullScanPlan::Dump(std::ostream& o, int /*indent*/) const {
-  o << "FullScan: " << table_->GetSchema().Name();
+  o << "FullScan: " << table_.GetSchema().Name();
 }
 
 }  // namespace tinylamb

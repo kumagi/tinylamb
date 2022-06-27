@@ -23,10 +23,13 @@ bool IndexScan::Next(Row* dst, RowPosition* rp) {
     if (!iter_.IsValid()) {
       return false;
     }
-    *rp = iter_.Position();
+    RowPosition pointed_row = iter_.Position();
+    if (rp != nullptr) {
+      *rp = pointed_row;
+    }
     *dst = *iter_;
     ++iter_;
-  } while (!cond_->Evaluate(*dst, &schema_).Truthy());
+  } while (!cond_->Evaluate(*dst, schema_).Truthy());
   return true;
 }
 

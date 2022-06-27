@@ -14,7 +14,8 @@ class ColumnValue : public ExpressionBase {
   explicit ColumnValue(std::string_view col_name) : col_name_(col_name) {}
   ~ColumnValue() override = default;
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kColumnValue; }
-  Value Evaluate(const Row& row, Schema* schema) const override;
+  [[nodiscard]] Value Evaluate(const Row& row,
+                               const Schema& schema) const override;
   void Dump(std::ostream& o) const override;
   [[nodiscard]] std::string ColumnName() const { return col_name_; }
 

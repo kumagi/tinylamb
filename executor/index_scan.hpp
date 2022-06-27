@@ -27,7 +27,7 @@ class IndexScan : public ExecutorBase {
  private:
   Iterator iter_;
   Expression cond_;
-  Schema schema_;
+  const Schema& schema_;
 };
 
 }  // namespace tinylamb

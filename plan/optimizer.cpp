@@ -131,46 +131,174 @@ bool DoesTouchWithin(const Expression& where,
   return true;
 }
 
-Plan CalcTableSelection(const Table& table, const Expression& where,
-                        const TableStatistics& stat) {
-  // Generate expression for selection.
-  std::unordered_set<std::string> columns = ColumnNames(table.GetSchema());
-  if (where->Type() == TypeTag::kBinaryExp) {
-    const BinaryExpression& be = where->AsBinaryExpression();
-    if (DoesTouchWithin(be.Left(), columns) &&
-        DoesTouchWithin(be.Right(), columns)) {
-      return NewSelectionPlan(NewFullScanPlan(table, stat), where, stat);
-    }
-    if (be.Op() == BinaryOperation::kAnd) {
-      if (DoesTouchWithin(be.Left(), columns)) {
-        return CalcTableSelection(table, be.Left(), stat);
-      }
-      if (DoesTouchWithin(be.Right(), columns)) {
-        return CalcTableSelection(table, be.Right(), stat);
-      }
-    }
-    std::unordered_set<slot_t> cols = TouchedOffsets(table, where);
-    if (IsComparison(be.Op())) {
-      std::unordered_map<slot_t, size_t> candidates = table.AvailableKeyIndex();
-      if (be.Op() == BinaryOperation::kEquals) {
-        if ((be.Left()->Type() == TypeTag::kColumnValue &&
-             be.Right()->Type() == TypeTag::kConstantValue)) {
-          const ColumnValue cv = be.Left()->AsColumnValue();
-          const ConstantValue constant = be.Right()->AsConstantValue();
-          int col_idx = table.GetSchema().Offset(cv.ColumnName());
-          auto it = candidates.find(col_idx);
-          if (0 <= col_idx && it != candidates.end()) {
-            const Index& available_idx = table.GetIndex(it->second);
-            return NewIndexScanPlan(table, available_idx, stat,
-                                    constant.GetValue(), constant.GetValue(),
-                                    true, where);
+struct Range {
+  enum class Dir : bool { kRight, kLeft };
+  std::optional<Value> min;
+  std::optional<Value> max;
+  bool min_inclusive = false;
+  bool max_inclusive = false;
+  bool Empty() const { return !min.has_value() && !max.has_value(); }
+  void Update(BinaryOperation op, const Value& rhs, Dir dir) {
+    // Given x `op` `rhs`.
+    switch (op) {
+      case BinaryOperation::kEquals:
+        // e.g. x == 10
+        max = min = rhs;
+        min_inclusive = max_inclusive = true;
+        break;
+      case BinaryOperation::kNotEquals:
+        // e.g. x != 10
+        max = min = rhs;
+        min_inclusive = max_inclusive = false;
+        break;
+      case BinaryOperation::kLessThan:
+      case BinaryOperation::kGreaterThan:
+        if ((dir == Dir::kRight && op == BinaryOperation::kLessThan) ||
+            (dir == Dir::kLeft && op == BinaryOperation::kGreaterThan)) {
+          // e.g. x < 10
+          // e.g. 10 > x
+          if (!max.has_value() || (max.has_value() && rhs < *max)) {
+            max = rhs;
+            max_inclusive = false;
+          }
+        } else {
+          // e.g. 10 < x
+          // e.g. x > 10
+          if (!min.has_value() || (min.has_value() && *min < rhs)) {
+            min = rhs;
+            min_inclusive = false;
           }
         }
-      } else {
+        break;
+      case BinaryOperation::kLessThanEquals:
+      case BinaryOperation::kGreaterThanEquals:
+        if ((dir == Dir::kRight && op == BinaryOperation::kLessThanEquals) ||
+            (dir == Dir::kLeft && op == BinaryOperation::kGreaterThanEquals)) {
+          // e.g. x <= 10
+          // e.g. 10 >= x
+          if (!max.has_value() || (max.has_value() && rhs < *max)) {
+            max = rhs;
+            max_inclusive = true;
+          }
+        } else {
+          // e.g. 10 <= x
+          // e.g. x >= 10
+          min = rhs;
+          min_inclusive = true;
+        }
+
+      default:
+        assert(!"invalid operator to update");
+    }
+  }
+};
+
+Plan BestScan(TransactionContext& ctx,
+              const std::vector<NamedExpression>& select, const Table& from,
+              const Expression& where, const TableStatistics& stat) {
+  const Schema& sc = from.GetSchema();
+  size_t minimum_cost = std::numeric_limits<size_t>::max();
+  Plan best_scan;
+  // Get { first-column offset => index offset } map.
+  std::unordered_map<slot_t, size_t> candidates = from.AvailableKeyIndex();
+  // Prepare all range of candidates.
+  std::unordered_map<slot_t, Range> ranges;
+  ranges.reserve(candidates.size());
+  for (const auto& it : candidates) {
+    ranges.emplace(it.first, Range());
+  }
+  std::vector<Expression> stack;
+  stack.push_back(where);
+  std::vector<Expression> related_ops;
+  while (!stack.empty()) {
+    Expression exp = stack.back();
+    stack.pop_back();
+    if (exp->Type() == TypeTag::kBinaryExp) {
+      const BinaryExpression& be = exp->AsBinaryExpression();
+      if (be.Op() == BinaryOperation::kAnd) {
+        stack.push_back(be.Left());
+        stack.push_back(be.Right());
+        continue;
+      }
+      if (IsComparison(be.Op())) {
+        if (be.Left()->Type() == TypeTag::kColumnValue &&
+            be.Right()->Type() == TypeTag::kConstantValue) {
+          const ColumnValue& cv = be.Left()->AsColumnValue();
+          const int offset = sc.Offset(cv.ColumnName());
+          if (0 <= offset) {
+            related_ops.push_back(exp);
+            auto iter = ranges.find(offset);
+            if (iter != ranges.end()) {
+              iter->second.Update(be.Op(),
+                                  be.Right()->AsConstantValue().GetValue(),
+                                  Range::Dir::kRight);
+            }
+          }
+        } else if (be.Left()->Type() == TypeTag::kColumnValue &&
+                   be.Right()->Type() == TypeTag::kConstantValue) {
+          const ColumnValue& cv = be.Right()->AsColumnValue();
+          const int offset = sc.Offset(cv.ColumnName());
+          if (0 <= offset) {
+            related_ops.push_back(exp);
+            auto iter = ranges.find(offset);
+            if (iter != ranges.end()) {
+              iter->second.Update(be.Op(),
+                                  be.Left()->AsConstantValue().GetValue(),
+                                  Range::Dir::kLeft);
+            }
+          }
+        }
+      }
+      if (be.Op() == BinaryOperation::kOr) {
+        assert(!"Not supported!");
       }
     }
   }
-  return NewFullScanPlan(table, stat);
+  Expression scan_exp;
+  if (!related_ops.empty()) {
+    scan_exp = related_ops[0];
+    for (size_t i = 1; i < related_ops.size(); ++i) {
+      scan_exp =
+          BinaryExpressionExp(scan_exp, BinaryOperation::kAnd, related_ops[i]);
+    }
+  }
+
+  // Build all IndexScan.
+  for (const auto& range : ranges) {
+    slot_t key = range.first;
+    const Range& span = range.second;
+    if (span.Empty()) {
+      continue;
+    }
+    const Index& target_idx = from.GetIndex(candidates[key]);
+    Plan new_plan = NewProjectionPlan(
+        NewSelectionPlan(NewIndexScanPlan(from, target_idx, stat, *span.min,
+                                          *span.max, true, where),
+                         scan_exp, stat),
+        select);
+    if (new_plan->AccessRowCount(ctx) < minimum_cost) {
+      best_scan = new_plan;
+      minimum_cost = new_plan->AccessRowCount(ctx);
+    }
+  }
+
+  if (scan_exp) {
+    // Full scan + selection.
+    Plan full_scan_plan = NewProjectionPlan(
+        NewSelectionPlan(NewFullScanPlan(from, stat), scan_exp, stat), select);
+    if (full_scan_plan->AccessRowCount(ctx) < minimum_cost) {
+      best_scan = full_scan_plan;
+      minimum_cost = full_scan_plan->AccessRowCount(ctx);
+    }
+  } else {
+    Plan full_scan_plan =
+        NewProjectionPlan(NewFullScanPlan(from, stat), select);
+    if (full_scan_plan->AccessRowCount(ctx) < minimum_cost) {
+      best_scan = full_scan_plan;
+      minimum_cost = full_scan_plan->AccessRowCount(ctx);
+    }
+  }
+  return best_scan;
 }
 
 bool ContainsAny(const std::unordered_set<std::string>& left,
@@ -219,12 +347,12 @@ Plan BestJoin(
   if (where->Type() == TypeTag::kBinaryExp) {
     const BinaryExpression& be = where->AsBinaryExpression();
     if (be.Op() == BinaryOperation::kEquals) {
-      Schema left_schema = left.second.plan->GetSchema(ctx);
+      Schema left_schema = left.second.plan->GetSchema();
       std::unordered_set<std::string> left_column_names =
           ColumnNames(left_schema);
-      Schema right_schema = right.second.plan->GetSchema(ctx);
+      Schema right_schema = right.second.plan->GetSchema();
       std::unordered_set<std::string> right_column_names =
-          ColumnNames(right.second.plan->GetSchema(ctx));
+          ColumnNames(right.second.plan->GetSchema());
       if (ReferenceWithin(be.Left(), left_column_names) &&
           ReferenceWithin(be.Right(), right_column_names)) {
         // We can use HashJoin!
@@ -271,7 +399,8 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
   }
   for (const auto& from : query.from_) {
     ASSIGN_OR_RETURN(std::shared_ptr<Table>, tbl, ctx.GetTable(from));
-    ASSIGN_OR_RETURN(TableStatistics, stats, ctx.rs_->GetStatistics(ctx, from));
+    ASSIGN_OR_RETURN(std::shared_ptr<TableStatistics>, stats,
+                     ctx.GetStats(from));
 
     // Push down all selection & projection.
     std::vector<NamedExpression> project_target;
@@ -279,10 +408,9 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
          Intersect(touched_columns, ColumnNames(tbl->GetSchema()))) {
       project_target.emplace_back(col);
     }
-    Plan npp = NewProjectionPlan(CalcTableSelection(*tbl, query.where_, stats),
-                                 project_target);
+    Plan scan = BestScan(ctx, project_target, *tbl, query.where_, *stats);
     optimal_plans.emplace(std::unordered_set({from}),
-                          CostAndPlan{npp->AccessRowCount(ctx), npp});
+                          CostAndPlan{scan->AccessRowCount(ctx), scan});
   }
   assert(optimal_plans.size() == query.from_.size());
 
@@ -312,7 +440,7 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
   // 3. Attach final projection and emit the result.
   auto solution = optimal_plans.find(Set(query.from_))->second.plan;
   solution = NewProjectionPlan(solution, query.select_);
-  schema = solution->GetSchema(ctx);
+  schema = solution->GetSchema();
   exec = solution->EmitExecutor(ctx);
   return Status::kSuccess;
 }

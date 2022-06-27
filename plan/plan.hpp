@@ -23,7 +23,7 @@ class PlanBase {
  public:
   virtual ~PlanBase() = default;
   virtual Executor EmitExecutor(TransactionContext& txn) const = 0;
-  [[nodiscard]] virtual Schema GetSchema(TransactionContext& txn) const = 0;
+  [[nodiscard]] virtual const Schema& GetSchema() const = 0;
   [[nodiscard]] virtual size_t AccessRowCount(
       TransactionContext& txn) const = 0;
   [[nodiscard]] virtual size_t EmitRowCount(TransactionContext& txn) const = 0;

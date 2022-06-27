@@ -17,7 +17,7 @@ Selection::Selection(Expression exp, Schema schema, Executor src)
 bool Selection::Next(Row* dst, RowPosition* rp) {
   Row orig;
   while (src_->Next(&orig, rp)) {
-    if (exp_->Evaluate(orig, &schema_).value.int_value != 0) {
+    if (exp_->Evaluate(orig, schema_).value.int_value != 0) {
       *dst = orig;
       return true;
     }
@@ -26,7 +26,7 @@ bool Selection::Next(Row* dst, RowPosition* rp) {
 }
 
 void Selection::Dump(std::ostream& o, int indent) const {
-  o << "Selection: " << exp_ << "\n" << Indent(indent + 2);
+  o << "Selection: " << *exp_ << "\n" << Indent(indent + 2);
   src_->Dump(o, indent + 2);
 }
 

@@ -29,15 +29,18 @@ class ProjectionPlan : public PlanBase {
   ~ProjectionPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
-  [[nodiscard]] Schema GetSchema(TransactionContext& ctx) const override;
+  [[nodiscard]] const Schema& GetSchema() const override;
 
   [[nodiscard]] size_t AccessRowCount(TransactionContext& txn) const override;
   [[nodiscard]] size_t EmitRowCount(TransactionContext& txn) const override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:
+  [[nodiscard]] Schema CalcSchema() const;
+
   Plan src_;
   std::vector<NamedExpression> columns_;
+  Schema output_schema_;
 };
 
 }  // namespace tinylamb

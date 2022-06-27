@@ -13,13 +13,11 @@
 namespace tinylamb {
 
 Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<Selection>(exp_, src_->GetSchema(ctx),
+  return std::make_shared<Selection>(exp_, src_->GetSchema(),
                                      src_->EmitExecutor(ctx));
 }
 
-Schema SelectionPlan::GetSchema(TransactionContext& ctx) const {
-  return src_->GetSchema(ctx);
-}
+const Schema& SelectionPlan::GetSchema() const { return src_->GetSchema(); }
 
 size_t SelectionPlan::AccessRowCount(TransactionContext& ctx) const {
   return src_->EmitRowCount(ctx);
@@ -27,7 +25,7 @@ size_t SelectionPlan::AccessRowCount(TransactionContext& ctx) const {
 
 size_t SelectionPlan::EmitRowCount(TransactionContext& ctx) const {
   return static_cast<size_t>(static_cast<double>(src_->EmitRowCount(ctx)) /
-                             stats_.ReductionFactor(GetSchema(ctx), exp_));
+                             stats_.ReductionFactor(GetSchema(), exp_));
 }
 
 void SelectionPlan::Dump(std::ostream& o, int indent) const {

@@ -30,7 +30,7 @@ class ExpressionBase {
   [[nodiscard]] const ColumnValue& AsColumnValue() const;
   [[nodiscard]] const BinaryExpression& AsBinaryExpression() const;
   [[nodiscard]] const ConstantValue& AsConstantValue() const;
-  virtual Value Evaluate(const Row& row, Schema* schema) const = 0;
+  virtual Value Evaluate(const Row& row, const Schema& schema) const = 0;
   virtual void Dump(std::ostream& o) const = 0;
   friend std::ostream& operator<<(std::ostream& o, const ExpressionBase& e) {
     e.Dump(o);

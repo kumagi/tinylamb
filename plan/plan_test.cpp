@@ -112,7 +112,7 @@ class PlanTest : public ::testing::Test {
     TransactionContext ctx = rs_->BeginContext();
     Executor scan = plan->EmitExecutor(ctx);
     Row result;
-    std::cout << plan->GetSchema(ctx) << "\n";
+    std::cout << plan->GetSchema() << "\n";
     while (scan->Next(&result, nullptr)) {
       std::cout << result << "\n";
     }

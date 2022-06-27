@@ -18,6 +18,7 @@
 
 namespace tinylamb {
 
+static const char* const kIndexName = "SampleIndex";
 class OptimizerTest : public ::testing::Test {
  public:
   void SetUp() override {
@@ -66,6 +67,8 @@ class OptimizerTest : public ::testing::Test {
             tbl.Insert(ctx.txn_, Row({Value(i), Value(i + 53.4)})).GetStatus());
       }
     }
+    IndexSchema idx_sc(kIndexName, {1, 2});
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "Sc1", idx_sc));
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
     auto stat_tx = rs_->BeginContext();
     rs_->RefreshStatistics(stat_tx, "Sc1");
@@ -113,6 +116,15 @@ TEST_F(OptimizerTest, Simple) {
       BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(2))),
       {NamedExpression("c1"), NamedExpression("Column2Varchar", "c2")}};
+  DumpAll(qd);
+}
+
+TEST_F(OptimizerTest, IndexScan) {
+  QueryData qd{
+      {"Sc1"},
+      BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value("c2-32"))),
+      {NamedExpression("c1"), NamedExpression("score", "c3")}};
   DumpAll(qd);
 }
 

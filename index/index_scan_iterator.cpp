@@ -88,7 +88,9 @@ void IndexScanIterator::Dump(std::ostream& o, int /*indent*/) const {
     o << index_.sc_.key_[i];
   }
   o << "} [";
-  if (ascending_) {
+  if (begin_ == end_) {
+    o << begin_;
+  } else if (ascending_) {
     o << begin_ << " -> " << end_;
   } else {
     o << end_ << " -> " << begin_;

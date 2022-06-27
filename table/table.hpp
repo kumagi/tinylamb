@@ -50,7 +50,7 @@ class Table {
 
   [[nodiscard]] std::unordered_map<slot_t, size_t> AvailableKeyIndex() const;
 
-  [[nodiscard]] Schema GetSchema() const { return schema_; }
+  [[nodiscard]] const Schema& GetSchema() const { return schema_; }
   [[nodiscard]] size_t IndexCount() const { return indexes_.size(); }
 
   friend Encoder& operator<<(Encoder& e, const Table& t);

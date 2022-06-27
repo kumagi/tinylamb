@@ -43,7 +43,7 @@ Value Execute(BinaryOperation op, const Value& left, const Value& right) {
 
 }  // anonymous namespace
 
-Value BinaryExpression::Evaluate(const Row& row, Schema* schema) const {
+Value BinaryExpression::Evaluate(const Row& row, const Schema& schema) const {
   return Execute(operation_, left_->Evaluate(row, schema),
                  right_->Evaluate(row, schema));
 }

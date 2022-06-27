@@ -10,9 +10,9 @@
 
 namespace tinylamb {
 
-Value ColumnValue::Evaluate(const Row& row, Schema* schema) const {
-  for (size_t i = 0; i < schema->ColumnCount(); ++i) {
-    const Column& c = schema->GetColumn(i);
+Value ColumnValue::Evaluate(const Row& row, const Schema& schema) const {
+  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+    const Column& c = schema.GetColumn(i);
     if (c.Name() == col_name_) {
       return row[i];
     }

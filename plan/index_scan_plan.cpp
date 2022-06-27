@@ -21,21 +21,17 @@ IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
     : table_(table),
       index_(index),
       stats_(ts),
-      begin_(std::move(begin)),
-      end_(std::move(end)),
+      begin_(begin),
+      end_(end),
       ascending_(ascending),
-      where_(where) {}
+      where_(std::move(where)) {}
 
 Executor IndexScanPlan::EmitExecutor(TransactionContext& ctx) const {
   return std::make_shared<IndexScan>(ctx.txn_, table_, index_, begin_, end_,
-                                     ascending_, where_, GetSchema(ctx));
+                                     ascending_, where_, GetSchema());
 }
 
-Schema IndexScanPlan::GetSchema(TransactionContext& ctx) const {
-  ASSIGN_OR_CRASH(std::shared_ptr<Table>, tbl,
-                  ctx.GetTable(table_.GetSchema().Name()));
-  return tbl->GetSchema();
-}
+const Schema& IndexScanPlan::GetSchema() const { return table_.GetSchema(); }
 
 size_t IndexScanPlan::AccessRowCount(TransactionContext& txn) const {
   return EmitRowCount(txn) * 2;
@@ -45,11 +41,7 @@ size_t IndexScanPlan::EmitRowCount(TransactionContext& /*txn*/) const {
   if (index_.IsUnique()) {
     return 2;
   }
-  double ret = 0;
-  for (const slot_t& col : index_.sc_.key_) {
-    ret = std::min(ret, stats_.EstimateCount(col, begin_, end_));
-  }
-  return std::ceil(ret);
+  return std::ceil(stats_.EstimateCount(index_.sc_.key_[0], begin_, end_));
 }
 
 void IndexScanPlan::Dump(std::ostream& o, int /*indent*/) const {

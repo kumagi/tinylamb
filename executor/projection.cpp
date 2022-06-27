@@ -19,7 +19,7 @@ bool Projection::Next(Row* dst, RowPosition* rp) {
   std::vector<Value> result;
   result.reserve(expressions_.size());
   for (const auto& exp : expressions_) {
-    result.push_back(exp.expression->Evaluate(orig, &input_schema_));
+    result.push_back(exp.expression->Evaluate(orig, input_schema_));
   }
   *dst = Row(std::move(result));
   return true;

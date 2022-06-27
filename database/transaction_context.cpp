@@ -20,4 +20,16 @@ StatusOr<std::shared_ptr<Table>> TransactionContext::GetTable(
   return result.first->second;
 }
 
+StatusOr<std::shared_ptr<TableStatistics>> TransactionContext::GetStats(
+    std::string_view table_name) {
+  auto it = stats_.find(std::string(table_name));
+  if (it != stats_.end()) {
+    return it->second;
+  }
+  ASSIGN_OR_RETURN(TableStatistics, tbl, rs_->GetStatistics(*this, table_name));
+  auto result = stats_.emplace(
+      table_name, std::make_shared<TableStatistics>(std::move(tbl)));
+  return result.first->second;
+}
+
 }  // namespace tinylamb

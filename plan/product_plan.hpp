@@ -19,7 +19,7 @@ class ProductPlan : public PlanBase {
 
   ~ProductPlan() override = default;
   Executor EmitExecutor(TransactionContext& ctx) const override;
-  [[nodiscard]] Schema GetSchema(TransactionContext& ctx) const override;
+  [[nodiscard]] const Schema& GetSchema() const override;
 
   [[nodiscard]] size_t AccessRowCount(TransactionContext& ctx) const override;
   [[nodiscard]] size_t EmitRowCount(TransactionContext& ctx) const override;
@@ -30,6 +30,7 @@ class ProductPlan : public PlanBase {
   Plan right_src_;
   std::vector<slot_t> left_cols_;
   std::vector<slot_t> right_cols_;
+  Schema output_schema_;
 };
 
 }  // namespace tinylamb

@@ -22,7 +22,7 @@ class IndexScanPlan : public PlanBase {
 
   Executor EmitExecutor(TransactionContext& txn) const override;
 
-  [[nodiscard]] Schema GetSchema(TransactionContext& txn) const override;
+  [[nodiscard]] const Schema& GetSchema() const override;
 
   [[nodiscard]] size_t AccessRowCount(TransactionContext& txn) const override;
   [[nodiscard]] size_t EmitRowCount(TransactionContext& txn) const override;
