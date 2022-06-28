@@ -28,7 +28,6 @@ class CrossJoin : public ExecutorBase {
  private:
   void TableConstruct();
 
- private:
   Executor left_;
   Executor right_;
 

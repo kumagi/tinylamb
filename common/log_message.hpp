@@ -1,7 +1,11 @@
 #ifndef TINYLAMB_LOG_MESSAGE_HPP
 #define TINYLAMB_LOG_MESSAGE_HPP
 
+#include <array>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #define LOG(level) LogMessage(level, __FILE__, __LINE__, __func__).stream()
 #define STATUS(s, message)                                            \
@@ -23,12 +27,65 @@ class LogMessage;
 class LogStream {
   friend class LogMessage;
   LogStream() = default;  // Only LogMessage can construct it.
+
  public:
+  template <int N>
+  LogStream& operator<<(const std::array<char, N>& rhs) {
+    message_ << rhs.data();
+    return *this;
+  }
+
+  template <typename T>
+  LogStream& operator<<(const std::unordered_set<T>& rhs) {
+    message_ << "{";
+    bool first = true;
+    for (const auto& r : rhs) {
+      if (!first) {
+        message_ << ", ";
+      }
+      message_ << r;
+      first = true;
+    }
+    message_ << "}";
+    return *this;
+  }
+
+  template <typename K, typename V>
+  LogStream& operator<<(const std::unordered_map<K, V>& rhs) {
+    message_ << "{";
+    bool first = true;
+    for (const auto& r : rhs) {
+      if (!first) {
+        message_ << ", ";
+      }
+      message_ << r.first << " => " << r.second;
+      first = false;
+    }
+    message_ << "}";
+    return *this;
+  }
+
+  template <typename T>
+  LogStream& operator<<(const std::vector<T>& rhs) {
+    message_ << "[";
+    bool first = true;
+    for (const auto& r : rhs) {
+      if (!first) {
+        message_ << ", ";
+      }
+      message_ << r;
+      first = false;
+    }
+    message_ << "]";
+    return *this;
+  }
+
   template <typename T>
   LogStream& operator<<(const T& rhs) {
     message_ << rhs;
     return *this;
   }
+
   ~LogStream();
 
  private:

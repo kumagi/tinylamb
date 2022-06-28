@@ -4,6 +4,8 @@
 
 #include "hash_join.hpp"
 
+#include "common/debug.hpp"
+
 namespace tinylamb {
 
 HashJoin::HashJoin(const Executor& left, std::vector<slot_t> left_cols,

@@ -1,5 +1,6 @@
 #include "log_message.hpp"
 
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <ctime>
@@ -9,11 +10,11 @@ LogStream::~LogStream() { std::cerr << message_.str() << "\e[0;39;49m\n"; }
 
 LogMessage::LogMessage(int log_level, const char* filename, int lineno,
                        const char* func_name) {
-  char buff[70];
+  std::array<char, 70> buff{};
   auto now = std::chrono::system_clock::now();
   std::time_t now_time = std::chrono::system_clock::to_time_t(now);
   std::tm now_tm = *std::localtime(&now_time);
-  strftime(buff, sizeof(buff), "%Y-%m-%d %H:%M:%S ", &now_tm);
+  strftime(buff.data(), buff.size(), "%Y-%m-%d %H:%M:%S ", &now_tm);
 
   switch (log_level) {
     case FATAL:
@@ -45,7 +46,7 @@ LogMessage::LogMessage(int log_level, const char* filename, int lineno,
     default:
       assert(!"unknwon log level");
   }
-  ls << buff << filename << ":" << lineno << " " << func_name;
+  ls << buff.data() << filename << ":" << lineno << " " << func_name;
   switch (log_level) {
     case FATAL:
       ls << " FATAL  ";

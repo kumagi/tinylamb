@@ -53,27 +53,6 @@ void ExtractTouchedColumns(const Expression& exp,
   }
 }
 
-std::unordered_set<std::string> TouchedColumns(const Expression& where) {
-  std::unordered_set<std::string> ret;
-  ExtractTouchedColumns(where, ret);
-  return ret;
-}
-
-std::unordered_set<slot_t> TouchedOffsets(const Table& table,
-                                          const Expression& where) {
-  std::unordered_set<std::string> touched_columns = TouchedColumns(where);
-  std::unordered_set<slot_t> touched_offset;
-  touched_offset.reserve(touched_columns.size());
-  const Schema& sc = table.GetSchema();
-  for (slot_t i = 0; i < sc.ColumnCount(); ++i) {
-    if (touched_columns.find(std::string(sc.GetColumn(i).Name())) !=
-        touched_columns.end()) {
-      touched_offset.emplace(i);
-    }
-  }
-  return touched_offset;
-}
-
 std::unordered_set<std::string> ColumnNames(const Schema& sc) {
   std::unordered_set<std::string> ret;
   ret.reserve(sc.ColumnCount());
@@ -103,43 +82,16 @@ std::unordered_set<std::string> Union(
   return ret;
 }
 
-bool ReferenceWithin(const Expression& where,
-                     const std::unordered_set<std::string>& columns) {
-  if (where->Type() == TypeTag::kBinaryExp) {
-    const BinaryExpression& be = where->AsBinaryExpression();
-    return ReferenceWithin(be.Left(), columns) ||
-           ReferenceWithin(be.Right(), columns);
-  }
-  if (where->Type() == TypeTag::kColumnValue) {
-    const ColumnValue& cv = where->AsColumnValue();
-    return columns.find(cv.ColumnName()) != columns.end();
-  }
-  return false;
-}
-
-bool DoesTouchWithin(const Expression& where,
-                     const std::unordered_set<std::string>& columns) {
-  if (where->Type() == TypeTag::kBinaryExp) {
-    const BinaryExpression& be = where->AsBinaryExpression();
-    return DoesTouchWithin(be.Left(), columns) &&
-           DoesTouchWithin(be.Right(), columns);
-  }
-  if (where->Type() == TypeTag::kColumnValue) {
-    const auto* be = reinterpret_cast<const ColumnValue*>(where.get());
-    return columns.find(be->ColumnName()) != columns.end();
-  }
-  return true;
-}
-
 struct Range {
-  enum class Dir : bool { kRight, kLeft };
   std::optional<Value> min;
   std::optional<Value> max;
   bool min_inclusive = false;
   bool max_inclusive = false;
-  bool Empty() const { return !min.has_value() && !max.has_value(); }
+  [[nodiscard]] bool Empty() const {
+    return !min.has_value() && !max.has_value();
+  }
+  enum class Dir : bool { kRight, kLeft };
   void Update(BinaryOperation op, const Value& rhs, Dir dir) {
-    // Given x `op` `rhs`.
     switch (op) {
       case BinaryOperation::kEquals:
         // e.g. x == 10
@@ -148,8 +100,7 @@ struct Range {
         break;
       case BinaryOperation::kNotEquals:
         // e.g. x != 10
-        max = min = rhs;
-        min_inclusive = max_inclusive = false;
+        // We have nothing to do here.
         break;
       case BinaryOperation::kLessThan:
       case BinaryOperation::kGreaterThan:
@@ -176,7 +127,7 @@ struct Range {
             (dir == Dir::kLeft && op == BinaryOperation::kGreaterThanEquals)) {
           // e.g. x <= 10
           // e.g. 10 >= x
-          if (!max.has_value() || (max.has_value() && rhs < *max)) {
+          if (!max.has_value() || (max.has_value() && rhs <= *max)) {
             max = rhs;
             max_inclusive = true;
           }
@@ -193,8 +144,20 @@ struct Range {
   }
 };
 
-Plan BestScan(TransactionContext& ctx,
-              const std::vector<NamedExpression>& select, const Table& from,
+bool TouchOnly(Expression where, std::string_view col_name) {
+  if (where->Type() == TypeTag::kColumnValue) {
+    const ColumnValue& cv = where->AsColumnValue();
+    return cv.ColumnName() == col_name;
+  }
+  if (where->Type() == TypeTag::kBinaryExp) {
+    const BinaryExpression& be = where->AsBinaryExpression();
+    return TouchOnly(be.Left(), col_name) && TouchOnly(be.Right(), col_name);
+  }
+  assert(where->Type() == TypeTag::kConstantValue);
+  return true;
+}
+
+Plan BestScan(const std::vector<NamedExpression>& select, const Table& from,
               const Expression& where, const TableStatistics& stat) {
   const Schema& sc = from.GetSchema();
   size_t minimum_cost = std::numeric_limits<size_t>::max();
@@ -271,32 +234,30 @@ Plan BestScan(TransactionContext& ctx,
       continue;
     }
     const Index& target_idx = from.GetIndex(candidates[key]);
-    Plan new_plan = NewProjectionPlan(
-        NewSelectionPlan(NewIndexScanPlan(from, target_idx, stat, *span.min,
-                                          *span.max, true, where),
-                         scan_exp, stat),
-        select);
-    if (new_plan->AccessRowCount(ctx) < minimum_cost) {
+    Plan new_plan = NewIndexScanPlan(from, target_idx, stat, *span.min,
+                                     *span.max, true, scan_exp);
+    if (!TouchOnly(scan_exp, from.GetSchema().GetColumn(key).Name())) {
+      new_plan = NewSelectionPlan(new_plan, scan_exp, stat);
+    }
+    if (select.size() != new_plan->GetSchema().ColumnCount()) {
+      new_plan = NewProjectionPlan(new_plan, select);
+    }
+    if (new_plan->AccessRowCount() < minimum_cost) {
       best_scan = new_plan;
-      minimum_cost = new_plan->AccessRowCount(ctx);
+      minimum_cost = new_plan->AccessRowCount();
     }
   }
 
+  Plan full_scan_plan = NewFullScanPlan(from, stat);
   if (scan_exp) {
-    // Full scan + selection.
-    Plan full_scan_plan = NewProjectionPlan(
-        NewSelectionPlan(NewFullScanPlan(from, stat), scan_exp, stat), select);
-    if (full_scan_plan->AccessRowCount(ctx) < minimum_cost) {
-      best_scan = full_scan_plan;
-      minimum_cost = full_scan_plan->AccessRowCount(ctx);
-    }
-  } else {
-    Plan full_scan_plan =
-        NewProjectionPlan(NewFullScanPlan(from, stat), select);
-    if (full_scan_plan->AccessRowCount(ctx) < minimum_cost) {
-      best_scan = full_scan_plan;
-      minimum_cost = full_scan_plan->AccessRowCount(ctx);
-    }
+    full_scan_plan = NewSelectionPlan(full_scan_plan, scan_exp, stat);
+  }
+  if (select.size() != full_scan_plan->GetSchema().ColumnCount()) {
+    full_scan_plan = NewProjectionPlan(full_scan_plan, select);
+  }
+  if (full_scan_plan->AccessRowCount() < minimum_cost) {
+    best_scan = full_scan_plan;
+    minimum_cost = full_scan_plan->AccessRowCount();
   }
   return best_scan;
 }
@@ -333,15 +294,29 @@ std::vector<slot_t> TargetColumns(const Schema& schema, const Expression& exp) {
   return out;
 }
 
-Plan BetterPlan(TransactionContext& ctx, Plan a, Plan b) {
-  if (a->AccessRowCount(ctx) < b->AccessRowCount(ctx)) {
+Plan BetterPlan(Plan a, Plan b) {
+  if (a->AccessRowCount() < b->AccessRowCount()) {
     return a;
   }
   return b;
 }
 
+bool ReferenceWithin(const Expression& where,
+                     const std::unordered_set<std::string>& columns) {
+  if (where->Type() == TypeTag::kBinaryExp) {
+    const BinaryExpression& be = where->AsBinaryExpression();
+    return ReferenceWithin(be.Left(), columns) ||
+           ReferenceWithin(be.Right(), columns);
+  }
+  if (where->Type() == TypeTag::kColumnValue) {
+    const ColumnValue& cv = where->AsColumnValue();
+    return columns.find(cv.ColumnName()) != columns.end();
+  }
+  return false;
+}
+
 Plan BestJoin(
-    TransactionContext& ctx, const Expression& where,
+    const Expression& where,
     const std::pair<std::unordered_set<std::string>, CostAndPlan>& left,
     const std::pair<std::unordered_set<std::string>, CostAndPlan>& right) {
   if (where->Type() == TypeTag::kBinaryExp) {
@@ -359,15 +334,14 @@ Plan BestJoin(
         std::vector<slot_t> left_cols = TargetColumns(left_schema, be.Left());
         std::vector<slot_t> right_cols =
             TargetColumns(right_schema, be.Right());
-        return BetterPlan(ctx,
-                          NewProductPlan(left.second.plan, left_cols,
+        return BetterPlan(NewProductPlan(left.second.plan, left_cols,
                                          right.second.plan, right_cols),
                           NewProductPlan(right.second.plan, right_cols,
                                          left.second.plan, left_cols));
       }
     } else if (be.Op() == BinaryOperation::kAnd) {
-      return BetterPlan(ctx, BestJoin(ctx, be.Left(), left, right),
-                        BestJoin(ctx, be.Right(), left, right));
+      return BetterPlan(BestJoin(be.Left(), left, right),
+                        BestJoin(be.Right(), left, right));
     }
   }
   return NewProductPlan(left.second.plan, right.second.plan);
@@ -408,9 +382,9 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
          Intersect(touched_columns, ColumnNames(tbl->GetSchema()))) {
       project_target.emplace_back(col);
     }
-    Plan scan = BestScan(ctx, project_target, *tbl, query.where_, *stats);
+    Plan scan = BestScan(project_target, *tbl, query.where_, *stats);
     optimal_plans.emplace(std::unordered_set({from}),
-                          CostAndPlan{scan->AccessRowCount(ctx), scan});
+                          CostAndPlan{scan->AccessRowCount(), scan});
   }
   assert(optimal_plans.size() == query.from_.size());
 
@@ -421,11 +395,11 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
         if (ContainsAny(base_table.first, join_table.first)) {
           continue;
         }
-        Plan best_join = BestJoin(ctx, query.where_, base_table, join_table);
+        Plan best_join = BestJoin(query.where_, base_table, join_table);
         std::unordered_set<std::string> joined_tables =
             Union(base_table.first, join_table.first);
         assert(1 < joined_tables.size());
-        size_t cost = best_join->AccessRowCount(ctx);
+        size_t cost = best_join->AccessRowCount();
         auto iter = optimal_plans.find(joined_tables);
         if (iter == optimal_plans.end()) {
           optimal_plans.emplace(joined_tables, CostAndPlan{cost, best_join});

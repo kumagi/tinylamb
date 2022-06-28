@@ -91,11 +91,10 @@ class OptimizerTest : public ::testing::Test {
 
   void DumpAll(const QueryData& qd) const {
     std::cout << qd << "\n\n";
-    Optimizer opt;
     Schema sc;
     Executor exec;
     TransactionContext ctx = rs_->BeginContext();
-    opt.Optimize(qd, ctx, sc, exec);
+    Optimizer::Optimize(qd, ctx, sc, exec);
     exec->Dump(std::cout, 0);
     std::cout << "\n\n" << sc << "\n";
     Row result;
@@ -133,6 +132,19 @@ TEST_F(OptimizerTest, Join) {
       {"Sc1", "Sc2"},
       BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
                           ColumnValueExp("d1")),
+      {NamedExpression("c2"), NamedExpression("d1"), NamedExpression("d3")}};
+  DumpAll(qd);
+}
+
+TEST_F(OptimizerTest, IndexScanJoin) {
+  QueryData qd{
+      {"Sc1", "Sc2"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                              ColumnValueExp("d1")),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
+                              ConstantValueExp(Value("c2-4")))),
       {NamedExpression("c2"), NamedExpression("d1"), NamedExpression("d3")}};
   DumpAll(qd);
 }

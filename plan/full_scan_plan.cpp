@@ -20,16 +20,13 @@ Executor FullScanPlan::EmitExecutor(TransactionContext& ctx) const {
 
 const Schema& FullScanPlan::GetSchema() const { return table_.GetSchema(); }
 
-size_t FullScanPlan::AccessRowCount(TransactionContext& /*txn*/) const {
-  return stats_.row_count_;
-}
+size_t FullScanPlan::AccessRowCount() const { return stats_.row_count_; }
 
-size_t FullScanPlan::EmitRowCount(TransactionContext& /*txn*/) const {
-  return stats_.row_count_;
-}
+size_t FullScanPlan::EmitRowCount() const { return stats_.row_count_; }
 
 void FullScanPlan::Dump(std::ostream& o, int /*indent*/) const {
-  o << "FullScan: " << table_.GetSchema().Name();
+  o << "FullScan: " << table_.GetSchema().Name()
+    << "(estimated cost: " << AccessRowCount() << ")";
 }
 
 }  // namespace tinylamb

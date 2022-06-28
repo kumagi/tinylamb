@@ -31,8 +31,8 @@ class ProjectionPlan : public PlanBase {
   Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] const Schema& GetSchema() const override;
 
-  [[nodiscard]] size_t AccessRowCount(TransactionContext& txn) const override;
-  [[nodiscard]] size_t EmitRowCount(TransactionContext& txn) const override;
+  [[nodiscard]] size_t AccessRowCount() const override;
+  [[nodiscard]] size_t EmitRowCount() const override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:

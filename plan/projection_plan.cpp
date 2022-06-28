@@ -46,21 +46,19 @@ Executor ProjectionPlan::EmitExecutor(TransactionContext& ctx) const {
 
 const Schema& ProjectionPlan::GetSchema() const { return output_schema_; }
 
-size_t ProjectionPlan::AccessRowCount(TransactionContext& ctx) const {
-  return src_->EmitRowCount(ctx);
-}
+size_t ProjectionPlan::AccessRowCount() const { return src_->EmitRowCount(); }
 
-size_t ProjectionPlan::EmitRowCount(TransactionContext& ctx) const {
-  return src_->EmitRowCount(ctx);
-}
+size_t ProjectionPlan::EmitRowCount() const { return src_->EmitRowCount(); }
 
 void ProjectionPlan::Dump(std::ostream& o, int indent) const {
   o << "Project: {";
   for (size_t i = 0; i < columns_.size(); ++i) {
-    if (0 < i) o << ", ";
+    if (0 < i) {
+      o << ", ";
+    }
     o << columns_[i];
   }
-  o << "}\n" << Indent(indent + 2);
+  o << "} (estimated cost: " << AccessRowCount() << ")\n" << Indent(indent + 2);
   src_->Dump(o, indent + 2);
 }
 }  // namespace tinylamb

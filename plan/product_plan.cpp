@@ -37,33 +37,37 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
   return output_schema_;
 }
 
-size_t ProductPlan::AccessRowCount(TransactionContext& ctx) const {
+size_t ProductPlan::AccessRowCount() const {
   if (left_cols_.empty() && right_cols_.empty()) {
-    return left_src_->AccessRowCount(ctx) +
-           (1 + left_src_->EmitRowCount(ctx) * right_src_->AccessRowCount(ctx));
+    return left_src_->AccessRowCount() +
+           (1 + left_src_->EmitRowCount() * right_src_->AccessRowCount());
   }
   // Cost of hash join.
-  return left_src_->AccessRowCount(ctx) + right_src_->AccessRowCount(ctx);
+  return left_src_->AccessRowCount() + right_src_->AccessRowCount();
 }
 
-size_t ProductPlan::EmitRowCount(TransactionContext& ctx) const {
+size_t ProductPlan::EmitRowCount() const {
   if (left_cols_.empty() && right_cols_.empty()) {
-    return left_src_->EmitRowCount(ctx) * right_src_->EmitRowCount(ctx);
+    return left_src_->EmitRowCount() * right_src_->EmitRowCount();
   }
-  return std::min(left_src_->EmitRowCount(ctx), right_src_->EmitRowCount(ctx));
+  return std::min(left_src_->EmitRowCount(), right_src_->EmitRowCount());
 }
 
 void ProductPlan::Dump(std::ostream& o, int indent) const {
-  o << "Product: ";
+  o << "Product: (estimated cost: " << EmitRowCount() << ")";
   if (!left_cols_.empty() || !right_cols_.empty()) {
     o << "left {";
     for (size_t i = 0; i < left_cols_.size(); ++i) {
-      if (0 < i) o << ", ";
+      if (0 < i) {
+        o << ", ";
+      }
       o << left_cols_[i];
     }
     o << "} right {";
     for (size_t i = 0; i < right_cols_.size(); ++i) {
-      if (0 < i) o << ", ";
+      if (0 < i) {
+        o << ", ";
+      }
       o << right_cols_[i];
     }
     o << "} ";

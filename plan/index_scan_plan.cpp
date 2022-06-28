@@ -33,19 +33,18 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& ctx) const {
 
 const Schema& IndexScanPlan::GetSchema() const { return table_.GetSchema(); }
 
-size_t IndexScanPlan::AccessRowCount(TransactionContext& txn) const {
-  return EmitRowCount(txn) * 2;
-}
+size_t IndexScanPlan::AccessRowCount() const { return EmitRowCount() * 2; }
 
-size_t IndexScanPlan::EmitRowCount(TransactionContext& /*txn*/) const {
-  if (index_.IsUnique()) {
-    return 2;
+size_t IndexScanPlan::EmitRowCount() const {
+  if (index_.IsUnique() && begin_ == end_) {
+    return 1;
   }
   return std::ceil(stats_.EstimateCount(index_.sc_.key_[0], begin_, end_));
 }
 
 void IndexScanPlan::Dump(std::ostream& o, int /*indent*/) const {
-  o << "IndexScan: " << table_.GetSchema().Name();
+  o << "IndexScan: " << table_.GetSchema().Name()
+    << " (estimated cost: " << AccessRowCount() << ")";
 }
 
 }  // namespace tinylamb

@@ -21,11 +21,11 @@ class ProductPlan : public PlanBase {
   Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] const Schema& GetSchema() const override;
 
-  [[nodiscard]] size_t AccessRowCount(TransactionContext& ctx) const override;
-  [[nodiscard]] size_t EmitRowCount(TransactionContext& ctx) const override;
+  [[nodiscard]] size_t AccessRowCount() const override;
+  [[nodiscard]] size_t EmitRowCount() const override;
   void Dump(std::ostream& o, int indent) const override;
 
- public:
+ private:
   Plan left_src_;
   Plan right_src_;
   std::vector<slot_t> left_cols_;

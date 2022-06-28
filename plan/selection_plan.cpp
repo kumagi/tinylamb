@@ -4,6 +4,7 @@
 
 #include "plan/selection_plan.hpp"
 
+#include <cmath>
 #include <memory>
 
 #include "executor/selection.hpp"
@@ -19,19 +20,17 @@ Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
 
 const Schema& SelectionPlan::GetSchema() const { return src_->GetSchema(); }
 
-size_t SelectionPlan::AccessRowCount(TransactionContext& ctx) const {
-  return src_->EmitRowCount(ctx);
-}
+size_t SelectionPlan::AccessRowCount() const { return src_->EmitRowCount(); }
 
-size_t SelectionPlan::EmitRowCount(TransactionContext& ctx) const {
-  return static_cast<size_t>(static_cast<double>(src_->EmitRowCount(ctx)) /
-                             stats_.ReductionFactor(GetSchema(), exp_));
+size_t SelectionPlan::EmitRowCount() const {
+  return std::ceil(static_cast<double>(src_->EmitRowCount()) /
+                   stats_.ReductionFactor(GetSchema(), exp_));
 }
 
 void SelectionPlan::Dump(std::ostream& o, int indent) const {
   o << "Select: [";
   exp_->Dump(o);
-  o << "]\n" << Indent(indent + 2);
+  o << "] (estimated cost: " << AccessRowCount() << ")\n" << Indent(indent + 2);
   src_->Dump(o, indent + 2);
 }
 
