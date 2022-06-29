@@ -18,9 +18,9 @@ class BPlusTreeIterator {
  public:
   BPlusTreeIterator(BPlusTree* tree, Transaction* txn, std::string_view begin,
                     std::string_view end, bool ascending = true);
-  std::string_view Key() const;
-  std::string_view Value();
-  [[nodiscard]] std::string_view Value() const;
+  [[nodiscard]] std::string Key() const;
+  std::string Value();
+  [[nodiscard]] std::string Value() const;
   BPlusTreeIterator& operator++();
   BPlusTreeIterator& operator--();
   [[nodiscard]] bool IsValid() const { return valid_; }

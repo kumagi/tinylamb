@@ -19,12 +19,18 @@ class IndexScanIterator : public IteratorBase {
  public:
   IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
                     const Value& begin, const Value& end, bool ascending);
+  IndexScanIterator(const IndexScanIterator&) = delete;
+  IndexScanIterator(IndexScanIterator&&) = delete;
+  IndexScanIterator& operator=(const IndexScanIterator&) = delete;
+  IndexScanIterator& operator=(IndexScanIterator&&) = delete;
   ~IndexScanIterator() override = default;
   bool operator==(const IndexScanIterator& rhs) const {
     return bpt_ == rhs.bpt_ && &txn_ == &rhs.txn_ &&
            current_row_ == rhs.current_row_;
   }
   [[nodiscard]] bool IsValid() const override;
+  [[nodiscard]] std::string GetKey() const;
+  [[nodiscard]] std::string GetValue() const;
   [[nodiscard]] RowPosition Position() const override;
   IteratorBase& operator++() override;
   IteratorBase& operator--() override;

@@ -18,7 +18,7 @@ namespace tinylamb {
  *                      specified.
  * UNIQUE Constraint − Ensures that all values in a column are different.
  * PRIMARY Key − Uniquely identifies each row/record in a database table.
- * FOREIGN Key − Uniquely identifies a row/record in any of the given
+ * FOREIGN GetKey − Uniquely identifies a row/record in any of the given
  *               database table.
  * CHECK Constraint − The CHECK constraint ensures that all the values in a
  *                    column satisfies certain conditions.

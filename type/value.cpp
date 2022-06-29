@@ -5,6 +5,7 @@
 
 #include <cstring>
 
+#include "common/debug.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "common/log_message.hpp"
@@ -134,12 +135,14 @@ std::string EncodeMemcomparableFormatInteger(int64_t in) {
   ret[0] = static_cast<char>(ValueType::kInt64);  // Embeds prefix.
   const uint64_t be = htobe64(in);
   memcpy(ret.data() + 1, &be, 8);
-  ret[1] ^= char(0x80);  // plus/minus sign.
+  ret[1] ^= static_cast<char>(0x80);  // plus/minus sign.
   return ret;
 }
 
 size_t DecodeMemcomparableFormatInteger(const char* src, int64_t* dst) {
-  *dst = be64toh(*reinterpret_cast<const int64_t*>(src) ^ 0x80);
+  int64_t loaded;
+  memcpy(&loaded, src, 8);
+  *dst = be64toh(loaded ^ 0x80);
   return sizeof(int64_t);
 }
 
@@ -161,7 +164,7 @@ std::string EncodeMemcomparableFormatVarchar(std::string_view in) {
     } else {  // Final 1~8 bytes.
       memcpy(dst, src, size - i);
       dst += 8;
-      *dst++ = char((size % 8) + (size % 8 == 0 ? 8 : 0));
+      *dst++ = static_cast<char>((size % 8) + (size % 8 == 0 ? 8 : 0));
       return ret;
     }
   }
@@ -180,7 +183,7 @@ size_t DecodeMemcomparableFormatVarchar(const char* src, std::string* dst) {
       memcpy(dst->data() + offset, buffer, 8);
     } else {
       size += buffer[8];
-      src += buffer[8];
+      src += 9;
       dst->resize(size);
       memcpy(dst->data() + offset, buffer, buffer[8]);
       break;
@@ -204,7 +207,9 @@ std::string EncodeMemcomparableFormatDouble(double in) {
 }
 
 size_t DecodeMemcomparableFormatDouble(const char* src, double* dst) {
-  uint64_t code = be64toh(*reinterpret_cast<const int64_t*>(src));
+  int64_t loaded;
+  memcpy(&loaded, src, sizeof(int64_t));
+  uint64_t code = be64toh(loaded);
   if (0 < (src[0] & 0x80)) {
     code ^= 1LLU << 63;
   } else {
@@ -236,16 +241,16 @@ size_t Value::DecodeMemcomparableFormat(const char* src) {
       throw std::runtime_error("Cannot decode unknown type.");
     case ValueType::kInt64:
       type = ValueType::kInt64;
-      return DecodeMemcomparableFormatInteger(src, &value.int_value);
+      return DecodeMemcomparableFormatInteger(src, &value.int_value) + 1;
     case ValueType::kVarChar: {
       type = ValueType::kVarChar;
       size_t len = DecodeMemcomparableFormatVarchar(src, &owned_data);
       value.varchar_value = owned_data;
-      return len;
+      return len + 1;
     }
     case ValueType::kDouble:
       type = ValueType::kDouble;
-      return DecodeMemcomparableFormatDouble(src, &value.double_value);
+      return DecodeMemcomparableFormatDouble(src, &value.double_value) + 1;
   }
   throw std::runtime_error("broken data");
 }

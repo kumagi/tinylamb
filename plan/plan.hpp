@@ -21,7 +21,12 @@ class Index;
 
 class PlanBase {
  public:
+  PlanBase() = default;
   virtual ~PlanBase() = default;
+  PlanBase(const PlanBase&) = delete;
+  PlanBase& operator=(const PlanBase&) = delete;
+  PlanBase(PlanBase&&) = delete;
+  PlanBase& operator=(PlanBase&&) = delete;
   virtual Executor EmitExecutor(TransactionContext& txn) const = 0;
   [[nodiscard]] virtual const Schema& GetSchema() const = 0;
   [[nodiscard]] virtual size_t AccessRowCount() const = 0;
@@ -46,8 +51,6 @@ Plan NewSelectionPlan(const Plan& src, const Expression& exp,
                       const TableStatistics& stat);
 Plan NewProjectionPlan(const Plan& src,
                        std::vector<NamedExpression> project_columns);
-Plan NewProjectionPlan(Plan src,
-                       const std::vector<std::string>& project_columns);
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_PLAN_HPP

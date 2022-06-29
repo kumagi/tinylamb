@@ -12,9 +12,8 @@
 namespace tinylamb {
 
 BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
-                                     std::basic_string_view<char> begin,
-                                     std::basic_string_view<char> end,
-                                     bool ascending)
+                                     std::string_view begin,
+                                     std::string_view end, bool ascending)
     : tree_(tree), txn_(txn), begin_(begin), end_(end) {
   if (!end.empty() && !begin.empty() && end < begin) {
     std::runtime_error("invalid begin & end");
@@ -45,12 +44,19 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
   valid_ = true;
 }
 
-std::string_view BPlusTreeIterator::Value() {
-  return txn_->PageManager()->GetPage(pid_)->body.leaf_page.GetValue(idx_);
+std::string BPlusTreeIterator::Key() const {
+  return std::string(
+      txn_->PageManager()->GetPage(pid_)->body.leaf_page.GetKey(idx_));
 }
 
-std::string_view BPlusTreeIterator::Value() const {
-  return txn_->PageManager()->GetPage(pid_)->body.leaf_page.GetValue(idx_);
+std::string BPlusTreeIterator::Value() {
+  return std::string(
+      txn_->PageManager()->GetPage(pid_)->body.leaf_page.GetValue(idx_));
+}
+
+std::string BPlusTreeIterator::Value() const {
+  return std::string(
+      txn_->PageManager()->GetPage(pid_)->body.leaf_page.GetValue(idx_));
 }
 
 BPlusTreeIterator& BPlusTreeIterator::operator++() {
@@ -96,7 +102,9 @@ BPlusTreeIterator& BPlusTreeIterator::operator--() {
     return *this;
   }
   --idx_;
-  if (!begin_.empty() && lp->GetKey(idx_) < begin_) valid_ = false;
+  if (!begin_.empty() && lp->GetKey(idx_) < begin_) {
+    valid_ = false;
+  }
   return *this;
 }
 

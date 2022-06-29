@@ -30,6 +30,10 @@ class Table {
   Table() = default;
   Table(Schema sc, page_id_t pid)
       : schema_(std::move(sc)), first_pid_(pid), last_pid_(pid) {}
+  Table(const Table&) = default;
+  Table(Table&&) = default;
+  Table& operator=(const Table&) = default;
+  Table& operator=(Table&&) = default;
   ~Table() = default;
 
   Status CreateIndex(Transaction& txn, const IndexSchema& idx);
@@ -55,10 +59,10 @@ class Table {
 
   friend Encoder& operator<<(Encoder& e, const Table& t);
   friend Decoder& operator>>(Decoder& d, Table& t);
+  bool operator==(const Table& rhs) const = default;
   [[nodiscard]] const Index& GetIndex(size_t offset) const {
     return indexes_[offset];
   }
-  void AddIndex(const Index& idx) { indexes_.emplace_back(idx); }
 
  private:
   Status IndexInsert(Transaction& txn, const Row& new_row,

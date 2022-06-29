@@ -24,9 +24,7 @@ IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
       bpt_(index.Root()),
       iter_(&bpt_, &txn, begin_.EncodeMemcomparableFormat(),
             end_.EncodeMemcomparableFormat(), ascending) {
-  std::string_view pos = iter_.Value();
-  RowPosition rp;
-  rp.Deserialize(pos.data());
+  auto rp = Decode<RowPosition>(iter_.Value());
   txn_.AddReadSet(rp);
   PageRef page = txn.PageManager()->GetPage(rp.page_id);
   ASSIGN_OR_CRASH(std::string_view, row, page->Read(txn, rp.slot));
@@ -35,14 +33,15 @@ IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
 
 bool IndexScanIterator::IsValid() const { return iter_.IsValid(); }
 
+std::string IndexScanIterator::GetKey() const { return iter_.Key(); }
+
+std::string IndexScanIterator::GetValue() const { return iter_.Value(); }
+
 RowPosition IndexScanIterator::Position() const {
   if (!iter_.IsValid()) {
     return {};
   }
-  std::string_view pos = iter_.Value();
-  RowPosition rp;
-  rp.Deserialize(pos.data());
-  return rp;
+  return Decode<RowPosition>(GetValue());
 }
 
 void IndexScanIterator::ResolveCurrentRow() {
@@ -50,9 +49,7 @@ void IndexScanIterator::ResolveCurrentRow() {
     current_row_.Clear();
     return;
   }
-  std::string_view pos = iter_.Value();
-  RowPosition rp;
-  rp.Deserialize(pos.data());
+  auto rp = Decode<RowPosition>(GetValue());
   PageRef ref = txn_.PageManager()->GetPage(rp.page_id);
   if (!ref.IsValid()) {
     current_row_.Clear();

@@ -49,7 +49,7 @@ add_library(libtinylamb
         plan/full_scan_plan.cpp
         plan/projection_plan.cpp plan/selection_plan.cpp plan/product_plan.cpp
         plan/optimizer.cpp
-        executor/cross_join.cpp table/table_statistics.cpp plan/plan.cpp expression/expression.cpp database/page_storage.cpp database/page_storage.hpp index/index_schema.cpp index/index_schema.hpp common/status_or.hpp database/transaction_context.cpp executor/insert.cpp executor/insert.hpp executor/update.cpp executor/update.hpp plan/index_scan_plan.cpp plan/index_scan_plan.hpp executor/index_scan.cpp executor/index_scan.hpp)
+        executor/cross_join.cpp table/table_statistics.cpp plan/plan.cpp expression/expression.cpp database/page_storage.cpp database/page_storage.hpp index/index_schema.cpp index/index_schema.hpp common/status_or.hpp database/transaction_context.cpp executor/insert.cpp executor/insert.hpp executor/update.cpp executor/update.hpp plan/index_scan_plan.cpp plan/index_scan_plan.hpp executor/index_scan.cpp executor/index_scan.hpp executor/index_only_scan.cpp executor/index_only_scan.hpp)
 
 add_library(libtinylamb_test_util
         STATIC

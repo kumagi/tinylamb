@@ -7,6 +7,7 @@
 
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
+#include "index/index_scan_iterator.hpp"
 #include "table/iterator.hpp"
 #include "type/schema.hpp"
 
@@ -20,6 +21,10 @@ class IndexScan : public ExecutorBase {
   IndexScan(Transaction& txn, const Table& table, const Index& index,
             const Value& begin, const Value& end, bool ascending,
             Expression where, const Schema& sc);
+  IndexScan(const IndexScan&) = delete;
+  IndexScan(IndexScan&&) = delete;
+  IndexScan& operator=(const IndexScan&) = delete;
+  IndexScan& operator=(IndexScan&&) = delete;
   ~IndexScan() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;

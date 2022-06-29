@@ -4,6 +4,7 @@
 
 #include "table/table.hpp"
 
+#include "common/debug.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "index/b_plus_tree.hpp"

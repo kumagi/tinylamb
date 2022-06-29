@@ -3,6 +3,7 @@
 #include <cstring>
 #include <iostream>
 
+#include "common/debug.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "type/schema.hpp"
@@ -53,6 +54,17 @@ std::string Row::EncodeMemcomparableFormat() const {
     ss << v.EncodeMemcomparableFormat();
   }
   return ss.str();
+}
+
+void Row::DecodeMemcomparableFormat(std::string_view src, const Schema& sc) {
+  values_.clear();
+  values_.reserve(sc.ColumnCount());
+  while (!src.empty()) {
+    Value v;
+    size_t advanced = v.DecodeMemcomparableFormat(src.data());
+    src.remove_prefix(advanced);
+    values_.push_back(v);
+  }
 }
 
 Row Row::Extract(const std::vector<slot_t>& elms) const {

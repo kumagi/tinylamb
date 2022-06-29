@@ -12,7 +12,12 @@ struct Row;
 
 class IteratorBase {
  public:
+  IteratorBase() = default;
   virtual ~IteratorBase() = default;
+  IteratorBase(const IteratorBase&) = delete;
+  IteratorBase(IteratorBase&&) = delete;
+  IteratorBase& operator=(const IteratorBase&) = delete;
+  IteratorBase& operator=(IteratorBase&&) = delete;
   [[nodiscard]] virtual bool IsValid() const = 0;
   [[nodiscard]] virtual RowPosition Position() const = 0;
   bool operator==(const IteratorBase&) const = default;

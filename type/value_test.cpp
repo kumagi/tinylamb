@@ -206,7 +206,7 @@ TEST(ValueTest, MemComparableFormatDecodeVarchar) {
   do {
     std::string v = "\x02" + src;
     v.push_back(0);
-    v.push_back(char(v.size() - 1));
+    v.push_back(static_cast<char>(v.size() - 1));
     ASSERT_EQ(v.size(), 10);
     targets.push_back(v);
   } while (std::next_permutation(src.begin(), src.end()));

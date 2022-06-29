@@ -107,7 +107,7 @@ void Try(uint64_t seed, bool verbose) {
     for (const auto& kv : kvp) {
       ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, kv.first));
       if (kvp[kv.first] != val) {
-        LOG(ERROR) << "Key: " << kv.first;
+        LOG(ERROR) << "GetKey: " << kv.first;
         LOG(ERROR) << kvp[kv.first] << " vs " << val;
       }
       assert(kvp[kv.first] == val);

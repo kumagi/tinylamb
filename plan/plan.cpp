@@ -41,9 +41,4 @@ Plan NewProjectionPlan(const Plan& src,
   return std::make_shared<ProjectionPlan>(src, std::move(project_columns));
 }
 
-Plan NewProjectionPlan(const Plan& src,
-                       const std::vector<std::string>& project_columns) {
-  return std::make_shared<ProjectionPlan>(src, project_columns);
-}
-
 }  // namespace tinylamb

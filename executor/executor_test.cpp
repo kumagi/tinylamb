@@ -13,6 +13,7 @@
 #include "executor/selection.hpp"
 #include "expression/constant_value.hpp"
 #include "gtest/gtest.h"
+#include "index_only_scan.hpp"
 #include "index_scan.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
@@ -47,7 +48,7 @@ class ExecutorTest : public ::testing::Test {
                 {Row({Value(3), Value("piyo"), Value(12.2)})},
                 {Row({Value(1), Value("world"), Value(4.9)})},
                 {Row({Value(2), Value("arise"), Value(4.14)})}});
-    IndexSchema idx_sc(kIndexName, {1, 2, 0});
+    IndexSchema idx_sc(kIndexName, {1, 2});
     ASSERT_SUCCESS(rs_->CreateIndex(ctx, kTableName, idx_sc));
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
@@ -110,7 +111,31 @@ TEST_F(ExecutorTest, IndexScan) {
   Row got;
   RowPosition pos;
   ASSERT_TRUE(fs.Next(&got, &pos));
+  std::cout << got << "\n";
   ASSERT_EQ(got, target);
+  ASSERT_FALSE(fs.Next(&got, &pos));
+}
+
+TEST_F(ExecutorTest, IndexOnlyScan) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSERT_EQ(tbl->IndexCount(), 1);
+  const Schema sc = tbl->GetSchema();
+  IndexOnlyScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value("he"), Value("q"),
+                   true,
+                   BinaryExpressionExp(ColumnValueExp("score"),
+                                       BinaryOperation::kGreaterThan,
+                                       ConstantValueExp(Value(10.0))),
+                   sc);
+  Row expected({Value("piyo"), Value(12.2)});
+
+  fs.Dump(std::cout, 0);
+  std::cout << "\n";
+  Row got;
+  RowPosition pos;
+  ASSERT_TRUE(fs.Next(&got, &pos));
+  std::cout << got << "\n";
+  ASSERT_EQ(got, expected);
   ASSERT_FALSE(fs.Next(&got, &pos));
 }
 
