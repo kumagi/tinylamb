@@ -4,7 +4,6 @@
 
 #include "table/table.hpp"
 
-#include "common/debug.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "index/b_plus_tree.hpp"
@@ -15,6 +14,16 @@
 #include "type/row.hpp"
 
 namespace tinylamb {
+
+Encoder& operator<<(Encoder& e, const Table::IndexValueType& v) {
+  e << v.pos << v.include;
+  return e;
+}
+
+Decoder& operator>>(Decoder& d, Table::IndexValueType& t) {
+  d >> t.pos >> t.include;
+  return d;
+}
 
 Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
   page_id_t new_root;
@@ -114,19 +123,29 @@ Status Table::IndexInsert(Transaction& txn, const Row& new_row,
                           const RowPosition& pos) {
   for (const auto& idx : indexes_) {
     BPlusTree bpt(idx.pid_);
+    std::vector<Value> include_values;
+    include_values.reserve(idx.sc_.include_.size());
+    for (const auto& in : idx.sc_.include_) {
+      include_values.push_back(new_row[in]);
+    }
+    Row include(include_values);
     if (idx.IsUnique()) {
-      RETURN_IF_FAIL(
-          bpt.Insert(txn, idx.GenerateKey(new_row), pos.Serialize()));
+      // BTree value is encoded pair<RowPosition, vector<Value>>.
+      IndexValueType val;
+      val.pos = pos;
+      val.include = include;
+      RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(new_row), Encode(val)));
     } else {
+      // BTree value is encoded vector<pair<RowPosition, vector<Value>>>.
       StatusOr<std::string_view> existing_value =
           bpt.Read(txn, idx.GenerateKey(new_row));
       if (existing_value.HasValue()) {
         std::string_view existing_data = existing_value.Value();
-        auto rps = Decode<std::vector<RowPosition>>(existing_data);
-        rps.push_back(pos);
+        auto rps = Decode<std::vector<IndexValueType>>(existing_data);
+        rps.push_back({pos, include});
         RETURN_IF_FAIL(bpt.Update(txn, idx.GenerateKey(new_row), Encode(rps)));
       } else {
-        std::vector<RowPosition> rps{pos};
+        std::vector<IndexValueType> rps{{pos, include}};
         RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(new_row), Encode(rps)));
       }
     }
@@ -142,15 +161,17 @@ Status Table::IndexDelete(Transaction& txn, const RowPosition& pos) {
     if (idx.IsUnique()) {
       RETURN_IF_FAIL(bpt.Delete(txn, key));
     } else {
-      StatusOr<std::string_view> existing_value =
-          bpt.Read(txn, idx.GenerateKey(original_row));
-      std::string_view existing_data = existing_value.Value();
-      auto rps = Decode<std::vector<RowPosition>>(existing_data);
-      std::erase(rps, pos);
-      if (rps.empty()) {
+      ASSIGN_OR_RETURN(std::string_view, existing_data,
+                       bpt.Read(txn, idx.GenerateKey(original_row)));
+      auto values = Decode<std::vector<IndexValueType>>(existing_data);
+      auto new_end =
+          std::remove_if(values.begin(), values.end(),
+                         [&](const IndexValueType& v) { return v.pos == pos; });
+      values.erase(new_end, values.end());
+      if (values.empty()) {
         RETURN_IF_FAIL(bpt.Delete(txn, key));
       } else {
-        RETURN_IF_FAIL(bpt.Update(txn, key, Encode(rps)));
+        RETURN_IF_FAIL(bpt.Update(txn, key, Encode(values)));
       }
     }
   }

@@ -12,7 +12,7 @@ Column::Column(std::string_view name, ValueType type, Constraint cst)
 
 std::ostream& operator<<(std::ostream& o, const Column& c) {
   o << c.name_;
-  if (c.type_ != ValueType::kUnknown) {
+  if (c.type_ != ValueType::kNull) {
     o << ": " << ValueTypeToString(c.type_);
   }
   if (!c.constraint_.IsNothing()) {

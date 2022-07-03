@@ -154,7 +154,7 @@ class DistinctCounter {
  public:
   explicit DistinctCounter(ValueType type) {
     switch (type) {
-      case ValueType::kUnknown:
+      case ValueType::kNull:
         assert(!"Never reach here");
       case ValueType::kInt64:
         counter_ = std::make_unique<Int64DistinctCounter>();
@@ -169,7 +169,7 @@ class DistinctCounter {
   }
   void Add(const Value& v) const {
     switch (v.type) {
-      case ValueType::kUnknown:
+      case ValueType::kNull:
         assert(!"Never reach here");
       case ValueType::kInt64:
         counter_->Add(v.value.int_value);
@@ -220,7 +220,7 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
   for (size_t i = 0; i < stats_.size(); ++i) {
     ColumnStats& cs = stats_[i];
     switch (cs.type) {
-      case ValueType::kUnknown:
+      case ValueType::kNull:
         assert(!"never reach here");
       case ValueType::kInt64:
         dist_counters[i]->Output(cs.stat.int_stats);
@@ -371,7 +371,7 @@ std::ostream& operator<<(std::ostream& o, const DoubleColumnStats& t) {
 Encoder& operator<<(Encoder& a, const ColumnStats& sc) {
   a << sc.type;
   switch (sc.type) {
-    case ValueType::kUnknown:
+    case ValueType::kNull:
       assert(!"never reach here");
     case ValueType::kInt64:
       a << sc.stat.int_stats;
@@ -388,7 +388,7 @@ Encoder& operator<<(Encoder& a, const ColumnStats& sc) {
 Decoder& operator>>(Decoder& d, ColumnStats& sc) {
   d >> sc.type;
   switch (sc.type) {
-    case ValueType::kUnknown:
+    case ValueType::kNull:
       assert(!"never reach here");
     case ValueType::kInt64:
       d >> sc.stat.int_stats;
@@ -405,7 +405,7 @@ Decoder& operator>>(Decoder& d, ColumnStats& sc) {
 
 std::ostream& operator<<(std::ostream& o, const ColumnStats& t) {
   switch (t.type) {
-    case ValueType::kUnknown:
+    case ValueType::kNull:
       assert(!"never reach here");
     case ValueType::kInt64:
       o << t.stat.int_stats;

@@ -19,6 +19,9 @@ FullScanIterator::FullScanIterator(const Table* table, Transaction* txn)
     pos_.page_id = ~0LLU;
     return;
   }
+  while (page->Read(*txn, pos_.slot).GetStatus() == Status::kNotExists) {
+    pos_.slot++;
+  }
   ASSIGN_OR_CRASH(std::string_view, row, page->Read(*txn, pos_.slot));
   current_row_.Deserialize(row.data(), table_->schema_);
 }
@@ -43,6 +46,9 @@ IteratorBase& FullScanIterator::operator++() {
     return *this;
   }
   txn_->AddReadSet(pos_);
+  while (ref->Read(*txn_, pos_.slot).GetStatus() == Status::kNotExists) {
+    pos_.slot++;
+  }
   ASSIGN_OR_CRASH(std::string_view, row, ref->Read(*txn_, pos_.slot));
   current_row_.Deserialize(row.data(), table_->schema_);
   return *this;

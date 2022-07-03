@@ -56,9 +56,8 @@ std::string Row::EncodeMemcomparableFormat() const {
   return ss.str();
 }
 
-void Row::DecodeMemcomparableFormat(std::string_view src, const Schema& sc) {
+void Row::DecodeMemcomparableFormat(std::string_view src) {
   values_.clear();
-  values_.reserve(sc.ColumnCount());
   while (!src.empty()) {
     Value v;
     size_t advanced = v.DecodeMemcomparableFormat(src.data());

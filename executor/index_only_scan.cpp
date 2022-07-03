@@ -61,12 +61,7 @@ bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
     if (!iter_.IsValid()) {
       return false;
     }
-    Row decoded_key;
-    decoded_key.DecodeMemcomparableFormat(iter_.GetKey(), key_schema_);
-    Row decoded_value;
-    // decoded_value.Deserialize(iter_.Value().data(), value_schema_);
-
-    *dst = decoded_key + decoded_value;
+    *dst = iter_.GetKey() + iter_.Include();
     ++iter_;
   } while (!cond_->Evaluate(*dst, output_schema_).Truthy());
   return true;

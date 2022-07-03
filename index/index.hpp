@@ -30,6 +30,7 @@ class Index {
   friend Encoder& operator<<(Encoder& a, const Index& idx);
   friend Decoder& operator>>(Decoder& e, Index& idx);
   bool operator==(const Index& rhs) const = default;
+  friend std::ostream& operator<<(std::ostream& o, const Index& rhs);
 
   IndexSchema sc_;
   page_id_t pid_{};

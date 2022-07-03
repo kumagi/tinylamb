@@ -56,7 +56,7 @@ bool Value::Truthy() const {
 
 [[nodiscard]] size_t Value::Size() const {
   switch (type) {
-    case ValueType::kUnknown:
+    case ValueType::kNull:
       throw std::runtime_error("Unknown type does not have size");
     case ValueType::kInt64:
       return sizeof(int64_t);
@@ -70,7 +70,7 @@ bool Value::Truthy() const {
 
 size_t Value::Serialize(char* dst) const {
   switch (type) {
-    case ValueType::kUnknown:
+    case ValueType::kNull:
       throw std::runtime_error("Unknown type cannot be serialized");
     case ValueType::kInt64:
       return SerializeInteger(dst, value.int_value);
@@ -85,7 +85,7 @@ size_t Value::Serialize(char* dst) const {
 size_t Value::Deserialize(const char* src, ValueType as_type) {
   type = as_type;
   switch (as_type) {
-    case ValueType::kUnknown:
+    case ValueType::kNull:
       throw std::runtime_error("Cannot parse without type.");
     case ValueType::kInt64:
       return DeserializeInteger(src, &value.int_value);
@@ -99,7 +99,7 @@ size_t Value::Deserialize(const char* src, ValueType as_type) {
 
 [[nodiscard]] std::string Value::AsString() const {
   switch (type) {
-    case ValueType::kUnknown:
+    case ValueType::kNull:
       return "(unknown type)";
     case ValueType::kInt64:
       return std::to_string(value.int_value);
@@ -116,8 +116,8 @@ bool Value::operator==(const Value& rhs) const {
     return false;
   }
   switch (type) {
-    case ValueType::kUnknown:
-      throw std::runtime_error("Unknown type cannot be compared.");
+    case ValueType::kNull:
+      return true;
     case ValueType::kInt64:
       return value.int_value == rhs.value.int_value;
     case ValueType::kVarChar:
@@ -223,7 +223,7 @@ size_t DecodeMemcomparableFormatDouble(const char* src, double* dst) {
 
 std::string Value::EncodeMemcomparableFormat() const {
   switch (type) {
-    case ValueType::kUnknown:
+    case ValueType::kNull:
       throw std::runtime_error("Cannot encode unknown type.");
     case ValueType::kInt64:
       return EncodeMemcomparableFormatInteger(value.int_value);
@@ -237,7 +237,7 @@ std::string Value::EncodeMemcomparableFormat() const {
 
 size_t Value::DecodeMemcomparableFormat(const char* src) {
   switch (static_cast<ValueType>(*src++)) {
-    case ValueType::kUnknown:
+    case ValueType::kNull:
       throw std::runtime_error("Cannot decode unknown type.");
     case ValueType::kInt64:
       type = ValueType::kInt64;
@@ -260,7 +260,7 @@ bool Value::operator<(const Value& rhs) const {
     throw std::runtime_error("Different type cannot be compared.");
   }
   switch (type) {
-    case ValueType::kUnknown:
+    case ValueType::kNull:
       throw std::runtime_error("Unknown type cannot be compared.");
     case ValueType::kInt64:
       return value.int_value < rhs.value.int_value;
@@ -277,7 +277,7 @@ bool Value::operator>(const Value& rhs) const {
     throw std::runtime_error("Different type cannot be compared.");
   }
   switch (type) {
-    case ValueType::kUnknown:
+    case ValueType::kNull:
       throw std::runtime_error("Unknown type cannot be compared.");
     case ValueType::kInt64:
       return value.int_value > rhs.value.int_value;
@@ -412,7 +412,7 @@ std::ostream& operator<<(std::ostream& o, const Value& v) {
 Encoder& operator<<(Encoder& a, const Value& v) {
   a << v.type;
   switch (v.type) {
-    case tinylamb::ValueType::kUnknown:
+    case tinylamb::ValueType::kNull:
       break;
     case tinylamb::ValueType::kInt64:
       a << v.value.int_value;
@@ -430,7 +430,7 @@ Encoder& operator<<(Encoder& a, const Value& v) {
 Decoder& operator>>(Decoder& e, Value& v) {
   e >> v.type;
   switch (v.type) {
-    case tinylamb::ValueType::kUnknown:
+    case tinylamb::ValueType::kNull:
       break;
     case tinylamb::ValueType::kInt64:
       e >> v.value.int_value;
@@ -451,7 +451,7 @@ Decoder& operator>>(Decoder& e, Value& v) {
 uint64_t std::hash<tinylamb::Value>::operator()(
     const tinylamb::Value& v) const {
   switch (v.type) {
-    case tinylamb::ValueType::kUnknown:
+    case tinylamb::ValueType::kNull:
       break;
     case tinylamb::ValueType::kInt64:
       return std::hash<int64_t>()(v.value.int_value);

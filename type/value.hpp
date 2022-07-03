@@ -16,7 +16,7 @@ class Decoder;
 
 class Value {
  public:
-  Value() = default;
+  Value() : type(ValueType::kNull) {}
   explicit Value(int int_val);
   explicit Value(int64_t int_val);
   // explicit Value(std::string_view varchar_val);
@@ -60,12 +60,14 @@ class Value {
   friend Encoder& operator<<(Encoder& o, const Value& v);
   friend Decoder& operator>>(Decoder& o, Value& v);
 
+  [[nodiscard]] bool IsNull() const { return type == ValueType::kNull; }
+
   union {
     int64_t int_value;
     std::string_view varchar_value;
     double double_value;
   } value{0};
-  ValueType type{ValueType::kUnknown};
+  ValueType type{ValueType::kNull};
   std::string owned_data;
 };
 

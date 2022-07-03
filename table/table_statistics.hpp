@@ -79,7 +79,7 @@ struct DoubleColumnStats {
 };
 
 struct ColumnStats {
-  ColumnStats() : type(ValueType::kUnknown) {}
+  ColumnStats() : type(ValueType::kNull) {}
   explicit ColumnStats(ValueType t) : type(t) {}
   union {
     IntegerColumnStats int_stats;
@@ -89,7 +89,7 @@ struct ColumnStats {
 
   [[nodiscard]] size_t Count() const {
     switch (type) {
-      case ValueType::kUnknown:
+      case ValueType::kNull:
         assert(!"never reach here");
       case ValueType::kInt64:
         return stat.int_stats.count;
@@ -101,7 +101,7 @@ struct ColumnStats {
   }
   [[nodiscard]] size_t Distinct() const {
     switch (type) {
-      case ValueType::kUnknown:
+      case ValueType::kNull:
         assert(!"never reach here");
       case ValueType::kInt64:
         return stat.int_stats.distinct;
@@ -113,7 +113,7 @@ struct ColumnStats {
   }
   [[nodiscard]] double EstimateCount(int64_t from, int64_t to) const {
     switch (type) {
-      case ValueType::kUnknown:
+      case ValueType::kNull:
         assert(!"never reach here");
       case ValueType::kInt64:
         return stat.int_stats.EstimateCount(from, to);
@@ -125,7 +125,7 @@ struct ColumnStats {
   }
   [[nodiscard]] double EstimateCount(double from, double to) const {
     switch (type) {
-      case ValueType::kUnknown:
+      case ValueType::kNull:
         assert(!"never reach here");
       case ValueType::kInt64:
         assert(!"never reach here");
@@ -138,7 +138,7 @@ struct ColumnStats {
   [[nodiscard]] double EstimateCount(std::string_view from,
                                      std::string_view to) const {
     switch (type) {
-      case ValueType::kUnknown:
+      case ValueType::kNull:
         assert(!"never reach here");
       case ValueType::kInt64:
         assert(!"never reach here");

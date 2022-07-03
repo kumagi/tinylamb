@@ -39,17 +39,20 @@ add_library(libtinylamb
         transaction/transaction_manager.cpp page/page_type.cpp type/column.cpp
         common/serdes.cpp common/log_message.cpp page/page_ref.cpp
         page/leaf_page.cpp page/branch_page.cpp index/b_plus_tree.cpp
-        type/value.cpp type/constraint.cpp type/constraint.hpp table/table.cpp
-        table/table.hpp index/index.cpp common/debug.cpp common/encoder.cpp
+        type/value.cpp type/constraint.cpp table/table.cpp
+        index/index.cpp common/debug.cpp common/encoder.cpp
         table/full_scan_iterator.cpp index/b_plus_tree_iterator.cpp
-        index/index_scan_iterator.cpp index/index_scan_iterator.hpp
+        index/index_scan_iterator.cpp
         database/relation_storage.cpp executor/full_scan.cpp executor/projection.cpp
         executor/selection.cpp expression/binary_expression.cpp
         expression/column_value.cpp executor/hash_join.cpp common/decoder.cpp
-        plan/full_scan_plan.cpp
-        plan/projection_plan.cpp plan/selection_plan.cpp plan/product_plan.cpp
-        plan/optimizer.cpp
-        executor/cross_join.cpp table/table_statistics.cpp plan/plan.cpp expression/expression.cpp database/page_storage.cpp database/page_storage.hpp index/index_schema.cpp index/index_schema.hpp common/status_or.hpp database/transaction_context.cpp executor/insert.cpp executor/insert.hpp executor/update.cpp executor/update.hpp plan/index_scan_plan.cpp plan/index_scan_plan.hpp executor/index_scan.cpp executor/index_scan.hpp executor/index_only_scan.cpp executor/index_only_scan.hpp)
+        plan/full_scan_plan.cpp plan/projection_plan.cpp plan/selection_plan.cpp
+        plan/product_plan.cpp plan/optimizer.cpp executor/cross_join.cpp
+        table/table_statistics.cpp plan/plan.cpp expression/expression.cpp
+        database/page_storage.cpp index/index_schema.cpp
+        database/transaction_context.cpp executor/insert.cpp
+        executor/update.cpp plan/index_scan_plan.cpp executor/index_scan.cpp
+        executor/index_only_scan.cpp)
 
 add_library(libtinylamb_test_util
         STATIC

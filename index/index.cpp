@@ -25,5 +25,9 @@ Decoder& operator>>(Decoder& e, Index& idx) {
   e >> idx.sc_ >> idx.pid_;
   return e;
 }
+std::ostream& operator<<(std::ostream& o, const Index& rhs) {
+  o << "Index: " << rhs.sc_ << " Root: " << rhs.pid_;
+  return o;
+}
 
 }  // namespace tinylamb

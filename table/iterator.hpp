@@ -18,7 +18,6 @@ class Iterator {
   [[nodiscard]] bool IsValid() const { return iter_->IsValid(); }
   [[nodiscard]] RowPosition Position() const { return iter_->Position(); }
   Row* operator->() { return &**iter_; }
-  const Row* operator->() const { return &**iter_; }
   const Row& operator*() const { return **iter_; }
   Iterator& operator++() {
     ++(*iter_);

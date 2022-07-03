@@ -30,11 +30,15 @@ class IndexScanIteratorTest : public ::testing::Test {
                            Column("col3", ValueType::kDouble)});
     TransactionContext ctx = rs_->BeginContext();
     ASSERT_SUCCESS(rs_->CreateTable(ctx, sc).GetStatus());
-    IndexSchema is("idx", {0});
-    ASSERT_SUCCESS(rs_->CreateIndex(ctx, kTableName, is));
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, kTableName, IndexSchema("PK", {0})));
+    ASSERT_SUCCESS(rs_->CreateIndex(
+        ctx, kTableName,
+        IndexSchema("NameIdx", {1}, {2}, IndexMode::kNonUnique)));
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, kTableName,
+                                    IndexSchema("KeyScore", {0, 2}, {1})));
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
                           ctx.GetTable(kTableName));
-    ASSERT_EQ(table->IndexCount(), 1);
+    ASSERT_EQ(table->IndexCount(), 3);
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
@@ -81,6 +85,77 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
   ASSERT_FALSE(it.IsValid());
 }
 
+TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  for (int i = 0; i < 120; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(ctx.txn_,
+                     Row({Value(i), Value("v" + std::to_string(i % 10)),
+                          Value(static_cast<double>(i * 2))}))
+            .GetStatus());
+  }
+  {
+    // Partial scan.
+    Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(1),
+                                        Value("v2"), Value("v7"));
+    ASSERT_TRUE(it.IsValid());
+    int counter = 0;
+    while (it.IsValid()) {
+      Row row = *it;
+      ASSERT_DOUBLE_EQ(row[0].value.int_value * 2, row[2].value.double_value);
+      ++it;
+      ++counter;
+    }
+    ASSERT_EQ(counter, 12 * (7 - 2 + 1));
+    ASSERT_FALSE(it.IsValid());
+  }
+  {
+    // Full scan.
+    Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(1));
+    ASSERT_TRUE(it.IsValid());
+    int counter = 0;
+    while (it.IsValid()) {
+      Row row = *it;
+      ASSERT_DOUBLE_EQ(row[0].value.int_value * 2, row[2].value.double_value);
+      ++it;
+      ++counter;
+    }
+    ASSERT_EQ(counter, 120);
+    ASSERT_FALSE(it.IsValid());
+  }
+
+  // Delete where PK % 5 == 0
+  {
+    Iterator it = table->BeginFullScan(ctx.txn_);
+    ASSERT_TRUE(it.IsValid());
+    while (it.IsValid()) {
+      Row row = *it;
+      if (row[0].value.int_value % 5 == 0) {
+        table->Delete(ctx.txn_, it.Position());
+      }
+      ++it;
+    }
+    ASSERT_FALSE(it.IsValid());
+  }
+  {
+    // Full scan again.
+    Iterator it = table->BeginFullScan(ctx.txn_);
+    ASSERT_TRUE(it.IsValid());
+    int counter = 0;
+    while (it.IsValid()) {
+      Row row = *it;
+      ASSERT_DOUBLE_EQ(row[0].value.int_value * 2, row[2].value.double_value);
+      ++it;
+      ++counter;
+    }
+    ASSERT_EQ(counter, 80);
+    ASSERT_FALSE(it.IsValid());
+  }
+}
+
 TEST_F(IndexScanIteratorTest, ScanDecending) {
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
@@ -103,6 +178,49 @@ TEST_F(IndexScanIteratorTest, ScanDecending) {
     --it;
   }
   ASSERT_FALSE(it.IsValid());
+}
+
+TEST_F(IndexScanIteratorTest, NonUniqueDescending) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  for (int i = 0; i < 120; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(ctx.txn_,
+                     Row({Value(i), Value("v" + std::to_string(i % 10)),
+                          Value(static_cast<double>(i * 2))}))
+            .GetStatus());
+  }
+  {
+    Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(1),
+                                        Value("v2"), Value("v7"), false);
+    ASSERT_TRUE(it.IsValid());
+    int counter = 0;
+    while (it.IsValid()) {
+      Row row = *it;
+      ASSERT_DOUBLE_EQ(row[0].value.int_value * 2, row[2].value.double_value);
+      --it;
+      ++counter;
+    }
+    ASSERT_EQ(counter, 12 * (7 - 2 + 1));
+    ASSERT_FALSE(it.IsValid());
+  }
+  {
+    // Full scan.
+    Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(1), Value(),
+                                        Value(), false);
+    ASSERT_TRUE(it.IsValid());
+    int counter = 0;
+    while (it.IsValid()) {
+      Row row = *it;
+      ASSERT_DOUBLE_EQ(row[0].value.int_value * 2, row[2].value.double_value);
+      --it;
+      ++counter;
+    }
+    ASSERT_EQ(counter, 120);
+    ASSERT_FALSE(it.IsValid());
+  }
 }
 
 }  // namespace tinylamb

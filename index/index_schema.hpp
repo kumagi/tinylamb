@@ -17,6 +17,7 @@ class Encoder;
 class Decoder;
 
 enum class IndexMode : bool { kUnique = true, kNonUnique = false };
+std::ostream& operator<<(std::ostream& o, const IndexMode& mode);
 
 class IndexSchema {
  public:
@@ -33,6 +34,7 @@ class IndexSchema {
   friend Encoder& operator<<(Encoder& a, const IndexSchema& idx);
   friend Decoder& operator>>(Decoder& e, IndexSchema& idx);
   bool operator==(const IndexSchema& rhs) const = default;
+  friend std::ostream& operator<<(std::ostream& o, const IndexSchema& rhs);
 
   std::string name_;
   std::vector<slot_t> key_;

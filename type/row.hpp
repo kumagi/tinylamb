@@ -26,7 +26,7 @@ struct Row {
   size_t Deserialize(const char* src, const Schema& sc);
   [[nodiscard]] size_t Size() const;
   [[nodiscard]] std::string EncodeMemcomparableFormat() const;
-  void DecodeMemcomparableFormat(std::string_view src, const Schema& sc);
+  void DecodeMemcomparableFormat(std::string_view src);
   void Clear() { values_.clear(); }
   [[nodiscard]] bool IsValid() const { return values_.empty(); }
   [[nodiscard]] Row Extract(const std::vector<slot_t>& elms) const;

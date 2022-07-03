@@ -24,7 +24,6 @@
 namespace tinylamb {
 
 static const char* const kTableName = "SampleTable";
-static const char* const kIndexName = "SampleIndex";
 class ExecutorTest : public ::testing::Test {
  public:
   static void BulkInsert(Transaction& txn, Table& tbl,
@@ -48,8 +47,11 @@ class ExecutorTest : public ::testing::Test {
                 {Row({Value(3), Value("piyo"), Value(12.2)})},
                 {Row({Value(1), Value("world"), Value(4.9)})},
                 {Row({Value(2), Value("arise"), Value(4.14)})}});
-    IndexSchema idx_sc(kIndexName, {1, 2});
-    ASSERT_SUCCESS(rs_->CreateIndex(ctx, kTableName, idx_sc));
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(ctx, kTableName, IndexSchema("Idx1", {1, 2})));
+    ASSERT_SUCCESS(rs_->CreateIndex(
+        ctx, kTableName,
+        IndexSchema("Idx2", {1}, {1, 2}, IndexMode::kNonUnique)));
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
@@ -97,7 +99,7 @@ TEST_F(ExecutorTest, FullScan) {
 TEST_F(ExecutorTest, IndexScan) {
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
-  ASSERT_EQ(tbl->IndexCount(), 1);
+  ASSERT_EQ(tbl->IndexCount(), 2);
   const Schema sc = tbl->GetSchema();
   IndexScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value("he"), Value("q"), true,
                BinaryExpressionExp(ColumnValueExp("score"),
@@ -119,7 +121,7 @@ TEST_F(ExecutorTest, IndexScan) {
 TEST_F(ExecutorTest, IndexOnlyScan) {
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
-  ASSERT_EQ(tbl->IndexCount(), 1);
+  ASSERT_EQ(tbl->IndexCount(), 2);
   const Schema sc = tbl->GetSchema();
   IndexOnlyScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value("he"), Value("q"),
                    true,
@@ -136,6 +138,32 @@ TEST_F(ExecutorTest, IndexOnlyScan) {
   ASSERT_TRUE(fs.Next(&got, &pos));
   std::cout << got << "\n";
   ASSERT_EQ(got, expected);
+  ASSERT_FALSE(fs.Next(&got, &pos));
+}
+
+TEST_F(ExecutorTest, IndexOnlyFullScan) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSERT_EQ(tbl->IndexCount(), 2);
+  const Schema sc = tbl->GetSchema();
+  IndexOnlyScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value(), Value(), true,
+                   BinaryExpressionExp(ColumnValueExp("score"),
+                                       BinaryOperation::kGreaterThan,
+                                       ConstantValueExp(Value(1.0))),
+                   sc);
+
+  fs.Dump(std::cout, 0);
+  std::cout << "\n";
+  Row got;
+  RowPosition pos;
+  ASSERT_TRUE(fs.Next(&got, &pos));
+  ASSERT_EQ(got, Row({Value("arise"), Value(4.14)}));
+  ASSERT_TRUE(fs.Next(&got, &pos));
+  ASSERT_EQ(got, Row({Value("hello"), Value(1.20)}));
+  ASSERT_TRUE(fs.Next(&got, &pos));
+  ASSERT_EQ(got, Row({Value("piyo"), Value(12.2)}));
+  ASSERT_TRUE(fs.Next(&got, &pos));
+  ASSERT_EQ(got, Row({Value("world"), Value(4.9)}));
   ASSERT_FALSE(fs.Next(&got, &pos));
 }
 

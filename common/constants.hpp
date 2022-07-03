@@ -121,7 +121,9 @@ inline std::ostream& operator<<(std::ostream& o, const Status s) {
   return o;
 }
 
-inline std::string Indent(size_t num) { return std::string(num, ' '); }
+inline std::string Indent(size_t num) {
+  return std::string(num, ' ');  // NOLINT
+}
 
 }  // namespace tinylamb
 

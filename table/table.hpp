@@ -12,7 +12,6 @@
 #include "common/status_or.hpp"
 #include "full_scan_iterator.hpp"
 #include "index/index.hpp"
-#include "index/index_scan_iterator.hpp"
 #include "iterator.hpp"
 #include "page/row_position.hpp"
 #include "type/schema.hpp"
@@ -27,6 +26,13 @@ struct RowPosition;
 
 class Table {
  public:
+  struct IndexValueType {
+    RowPosition pos;
+    Row include;
+    friend Encoder& operator<<(Encoder& e, const IndexValueType& v);
+    friend Decoder& operator>>(Decoder& d, IndexValueType& t);
+  };
+
   Table() = default;
   Table(Schema sc, page_id_t pid)
       : schema_(std::move(sc)), first_pid_(pid), last_pid_(pid) {}
@@ -49,7 +55,8 @@ class Table {
 
   Iterator BeginFullScan(Transaction& txn) const;
   Iterator BeginIndexScan(Transaction& txn, const Index& index,
-                          const Value& begin, const Value& end = Value(),
+                          const Value& begin = Value(),
+                          const Value& end = Value(),
                           bool ascending = true) const;
 
   [[nodiscard]] std::unordered_map<slot_t, size_t> AvailableKeyIndex() const;

@@ -6,6 +6,7 @@
 #define TINYLAMB_ITERATOR_BASE_HPP
 
 #include "page/row_position.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 struct Row;
