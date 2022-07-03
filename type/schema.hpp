@@ -10,7 +10,6 @@
 #include <vector>
 
 #include "common/log_message.hpp"
-#include "page/row_position.hpp"
 #include "type/column.hpp"
 #include "type/value_type.hpp"
 
@@ -25,10 +24,8 @@ class Schema {
   [[nodiscard]] const Column& GetColumn(size_t idx) const {
     return columns_[idx];
   }
-  [[nodiscard]] Schema Extract(const std::vector<size_t>& elms) const;
   [[nodiscard]] std::unordered_set<std::string> ColumnSet() const;
   [[nodiscard]] int Offset(std::string_view name) const;
-  [[nodiscard]] bool Empty() const { return name_.empty(); }
 
   Schema operator+(const Schema& rhs) const;
   bool operator==(const Schema& rhs) const = default;

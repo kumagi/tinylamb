@@ -7,22 +7,12 @@
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "common/log_message.hpp"
-#include "page/row_position.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
 
 Schema::Schema(std::string_view schema_name, std::vector<Column> columns)
     : name_(schema_name), columns_(std::move(columns)) {}
-
-Schema Schema::Extract(const std::vector<size_t>& elms) const {
-  std::vector<Column> extracted;
-  extracted.reserve(elms.size());
-  for (size_t offset : elms) {
-    extracted.push_back(columns_[offset]);
-  }
-  return {name_, std::move(extracted)};
-}
 
 std::unordered_set<std::string> Schema::ColumnSet() const {
   std::unordered_set<std::string> ret;
@@ -34,7 +24,7 @@ std::unordered_set<std::string> Schema::ColumnSet() const {
 }
 
 int Schema::Offset(std::string_view name) const {
-  for (size_t i = 0; i < columns_.size(); ++i) {
+  for (int i = 0; i < static_cast<int>(columns_.size()); ++i) {
     if (columns_[i].Name() == name) {
       return i;
     }

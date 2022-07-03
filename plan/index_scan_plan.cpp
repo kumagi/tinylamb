@@ -10,14 +10,15 @@
 #include "database/relation_storage.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/index_scan.hpp"
+#include "expression/binary_expression.hpp"
 #include "index/index.hpp"
 #include "table/table.hpp"
 
 namespace tinylamb {
 
 IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
-                             const TableStatistics& ts, Value begin, Value end,
-                             bool ascending, Expression where)
+                             const TableStatistics& ts, const Value& begin,
+                             const Value& end, bool ascending, Expression where)
     : table_(table),
       index_(index),
       stats_(ts),

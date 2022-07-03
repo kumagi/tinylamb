@@ -7,6 +7,8 @@
 
 #include <iosfwd>
 #include <memory>
+#include <string>
+#include <unordered_set>
 
 #include "type/value.hpp"
 
@@ -25,12 +27,19 @@ enum class TypeTag : int {
 
 class ExpressionBase {
  public:
+  ExpressionBase() = default;
   virtual ~ExpressionBase() = default;
+  ExpressionBase(const ExpressionBase&) = delete;
+  ExpressionBase(ExpressionBase&&) = delete;
+  ExpressionBase& operator=(const ExpressionBase&) = delete;
+  ExpressionBase& operator=(ExpressionBase&&) = delete;
   [[nodiscard]] virtual TypeTag Type() const = 0;
   [[nodiscard]] const ColumnValue& AsColumnValue() const;
   [[nodiscard]] const BinaryExpression& AsBinaryExpression() const;
   [[nodiscard]] const ConstantValue& AsConstantValue() const;
-  virtual Value Evaluate(const Row& row, const Schema& schema) const = 0;
+  [[nodiscard]] std::unordered_set<std::string> TouchedColumns() const;
+  [[nodiscard]] virtual Value Evaluate(const Row& row,
+                                       const Schema& schema) const = 0;
   virtual void Dump(std::ostream& o) const = 0;
   friend std::ostream& operator<<(std::ostream& o, const ExpressionBase& e) {
     e.Dump(o);

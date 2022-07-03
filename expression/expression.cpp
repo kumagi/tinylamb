@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <memory>
+#include <unordered_set>
 
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
@@ -26,6 +27,26 @@ const BinaryExpression& ExpressionBase::AsBinaryExpression() const {
 const ConstantValue& ExpressionBase::AsConstantValue() const {
   assert(Type() == TypeTag::kConstantValue);
   return reinterpret_cast<const ConstantValue&>(*this);
+}
+
+std::unordered_set<std::string> ExpressionBase::TouchedColumns() const {
+  std::unordered_set<std::string> ret;
+  switch (Type()) {
+    case TypeTag::kBinaryExp: {
+      const BinaryExpression& be = AsBinaryExpression();
+      ret.merge(be.Left()->TouchedColumns());
+      ret.merge(be.Right()->TouchedColumns());
+      break;
+    }
+    case TypeTag::kColumnValue: {
+      const ColumnValue& cv = AsColumnValue();
+      ret.emplace(cv.ColumnName());
+      break;
+    }
+    case TypeTag::kConstantValue:
+      break;
+  }
+  return ret;
 }
 
 Expression ColumnValueExp(std::string_view col_name) {

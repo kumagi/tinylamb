@@ -47,8 +47,8 @@ add_library(libtinylamb
         executor/selection.cpp expression/binary_expression.cpp
         expression/column_value.cpp executor/hash_join.cpp common/decoder.cpp
         plan/full_scan_plan.cpp plan/projection_plan.cpp plan/selection_plan.cpp
-        plan/product_plan.cpp plan/optimizer.cpp executor/cross_join.cpp
-        table/table_statistics.cpp plan/plan.cpp expression/expression.cpp
+        plan/product_plan.cpp plan/optimizer.cpp plan/index_only_scan_plan.cpp
+        executor/cross_join.cpp table/table_statistics.cpp expression/expression.cpp
         database/page_storage.cpp index/index_schema.cpp
         database/transaction_context.cpp executor/insert.cpp
         executor/update.cpp plan/index_scan_plan.cpp executor/index_scan.cpp

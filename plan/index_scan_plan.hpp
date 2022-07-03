@@ -15,9 +15,13 @@ class Table;
 
 class IndexScanPlan : public PlanBase {
  public:
-  explicit IndexScanPlan(const Table& table, const Index& index,
-                         const TableStatistics& ts, Value begin, Value end,
-                         bool ascending, Expression where);
+  IndexScanPlan(const Table& table, const Index& index,
+                const TableStatistics& ts, const Value& begin, const Value& end,
+                bool ascending, Expression where);
+  IndexScanPlan(const IndexScanPlan&) = delete;
+  IndexScanPlan(IndexScanPlan&&) = delete;
+  IndexScanPlan& operator=(const IndexScanPlan&) = delete;
+  IndexScanPlan& operator=(IndexScanPlan&&) = delete;
   ~IndexScanPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& txn) const override;

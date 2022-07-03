@@ -6,6 +6,7 @@
 #define TINYLAMB_INDEX_HPP
 
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -27,6 +28,7 @@ class Index {
       : sc_(name, std::move(key), std::move(include), mode), pid_(pid) {}
   [[nodiscard]] bool IsUnique() const { return sc_.IsUnique(); }
   [[nodiscard]] page_id_t Root() const { return pid_; }
+  std::unordered_set<slot_t> CoeveredColumns() const;
   friend Encoder& operator<<(Encoder& a, const Index& idx);
   friend Decoder& operator>>(Decoder& e, Index& idx);
   bool operator==(const Index& rhs) const = default;

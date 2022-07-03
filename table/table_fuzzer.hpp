@@ -51,8 +51,9 @@ void Try(uint64_t seed, bool verbose) {
     for (size_t i = 0; i < kRows; ++i) {
       TransactionContext ctx = db.BeginContext();
       ASSIGN_OR_CRASH(Table, table, db.GetTable(ctx, "FuzzerTable"));
-      Row new_row({Value((int)i), Value(RandomString(rand() % 300 + 10)),
-                   Value((double)(rand() % 1000))});
+      Row new_row({Value(static_cast<int>(i)),
+                   Value(RandomString(rand() % 300 + 10)),
+                   Value(static_cast<double>(rand() % 1000))});
       ASSIGN_OR_CRASH(RowPosition, rp, table.Insert(ctx.txn_, new_row));
       if (verbose) {
         LOG(DEBUG) << "Insert: " << new_row;

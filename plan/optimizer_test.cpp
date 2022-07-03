@@ -48,11 +48,11 @@ class OptimizerTest : public ::testing::Test {
                                           Column("d2", ValueType::kDouble),
                                           Column("d3", ValueType::kVarChar),
                                           Column("d4", ValueType::kInt64)})));
-      for (int i = 0; i < 20; ++i) {
+      for (int i = 0; i < 200; ++i) {
         ASSERT_SUCCESS(
             tbl.Insert(ctx.txn_,
                        Row({Value(i), Value(i + 0.2),
-                            Value("d3-" + std::to_string(i)), Value(16)}))
+                            Value("d3-" + std::to_string(i % 10)), Value(16)}))
                 .GetStatus());
       }
     }
@@ -62,13 +62,16 @@ class OptimizerTest : public ::testing::Test {
           rs_->CreateTable(ctx,
                            Schema("Sc3", {Column("e1", ValueType::kInt64),
                                           Column("e2", ValueType::kDouble)})));
-      for (int i = 10; 0 < i; --i) {
+      for (int i = 20; 0 < i; --i) {
         ASSERT_SUCCESS(
             tbl.Insert(ctx.txn_, Row({Value(i), Value(i + 53.4)})).GetStatus());
       }
     }
     IndexSchema idx_sc(kIndexName, {1, 2});
-    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "Sc1", idx_sc));
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "Sc1", IndexSchema("KeyIdx", {1, 2})));
+    ASSERT_SUCCESS(rs_->CreateIndex(
+        ctx, "Sc2",
+        IndexSchema("NameIdx", {2, 3}, {0, 1}, IndexMode::kNonUnique)));
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
     auto stat_tx = rs_->BeginContext();
     rs_->RefreshStatistics(stat_tx, "Sc1");
@@ -124,6 +127,30 @@ TEST_F(OptimizerTest, IndexScan) {
       BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
                           ConstantValueExp(Value("c2-32"))),
       {NamedExpression("c1"), NamedExpression("score", "c3")}};
+  DumpAll(qd);
+}
+
+TEST_F(OptimizerTest, IndexOnlyScan) {
+  QueryData qd{
+      {"Sc1"},
+      BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value("c2-32"))),
+      {NamedExpression("name", "c2"), NamedExpression("score", "c3")}};
+  DumpAll(qd);
+}
+
+TEST_F(OptimizerTest, IndexOnlyScanInclude) {
+  QueryData qd{{"Sc2"},
+               BinaryExpressionExp(
+                   BinaryExpressionExp(ColumnValueExp("d3"),
+                                       BinaryOperation::kGreaterThanEquals,
+                                       ConstantValueExp(Value("d3-3"))),
+                   BinaryOperation::kAnd,
+                   BinaryExpressionExp(ColumnValueExp("d3"),
+                                       BinaryOperation::kLessThanEquals,
+                                       ConstantValueExp(Value("d3-5")))),
+               {NamedExpression("key", "d1"), NamedExpression("score", "d2"),
+                NamedExpression("name", "d3"), NamedExpression("const", "d4")}};
   DumpAll(qd);
 }
 

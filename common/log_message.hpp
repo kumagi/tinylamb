@@ -44,7 +44,7 @@ class LogStream {
         message_ << ", ";
       }
       message_ << r;
-      first = true;
+      first = false;
     }
     message_ << "}";
     return *this;

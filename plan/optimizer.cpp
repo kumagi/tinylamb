@@ -15,7 +15,12 @@
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "full_scan_plan.hpp"
+#include "index_only_scan_plan.hpp"
+#include "index_scan_plan.hpp"
 #include "plan/plan.hpp"
+#include "product_plan.hpp"
+#include "projection_plan.hpp"
+#include "selection_plan.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 
@@ -67,7 +72,7 @@ std::unordered_set<std::string> Intersect(
     const std::unordered_set<std::string>& b) {
   std::unordered_set<std::string> ret;
   for (const auto& l : a) {
-    if (b.find(l) != b.end()) {
+    if (b.contains(l)) {
       ret.emplace(l);
     }
   }
@@ -137,14 +142,14 @@ struct Range {
           min = rhs;
           min_inclusive = true;
         }
-
+        break;
       default:
         assert(!"invalid operator to update");
     }
   }
 };
 
-bool TouchOnly(Expression where, std::string_view col_name) {
+bool TouchOnly(const Expression& where, std::string_view col_name) {
   if (where->Type() == TypeTag::kColumnValue) {
     const ColumnValue& cv = where->AsColumnValue();
     return cv.ColumnName() == col_name;
@@ -155,6 +160,34 @@ bool TouchOnly(Expression where, std::string_view col_name) {
   }
   assert(where->Type() == TypeTag::kConstantValue);
   return true;
+}
+
+template <typename T>
+bool Covered(const std::unordered_set<T> big,
+             const std::unordered_set<T> small) {
+  return std::ranges::all_of(small.begin(), small.end(),
+                             [&](const T& t) { return big.contains(t); });
+}
+
+Plan IndexScanSelect(const Table& from, const Index& target_idx,
+                     const TableStatistics& stat, const Value& begin,
+                     const Value& end, const Expression& where,
+                     const std::vector<NamedExpression>& select) {
+  std::unordered_set<std::string> touched = where->TouchedColumns();
+  for (const auto& s : select) {
+    touched.emplace(s.name);
+  }
+  std::unordered_set<slot_t> touched_cols;
+  touched_cols.reserve(touched.size());
+  for (const auto& t : touched) {
+    touched_cols.insert(from.GetSchema().Offset(t));
+  }
+  if (Covered(target_idx.CoeveredColumns(), touched_cols)) {
+    return std::make_shared<IndexOnlyScanPlan>(from, target_idx, stat, begin,
+                                               end, true, where, select);
+  }
+  return std::make_shared<IndexScanPlan>(from, target_idx, stat, begin, end,
+                                         true, where);
 }
 
 Plan BestScan(const std::vector<NamedExpression>& select, const Table& from,
@@ -234,13 +267,13 @@ Plan BestScan(const std::vector<NamedExpression>& select, const Table& from,
       continue;
     }
     const Index& target_idx = from.GetIndex(candidates[key]);
-    Plan new_plan = NewIndexScanPlan(from, target_idx, stat, *span.min,
-                                     *span.max, true, scan_exp);
+    Plan new_plan = IndexScanSelect(from, target_idx, stat, *span.min,
+                                    *span.max, scan_exp, select);
     if (!TouchOnly(scan_exp, from.GetSchema().GetColumn(key).Name())) {
-      new_plan = NewSelectionPlan(new_plan, scan_exp, stat);
+      new_plan = std::make_shared<SelectionPlan>(new_plan, scan_exp, stat);
     }
     if (select.size() != new_plan->GetSchema().ColumnCount()) {
-      new_plan = NewProjectionPlan(new_plan, select);
+      new_plan = std::make_shared<ProjectionPlan>(new_plan, select);
     }
     if (new_plan->AccessRowCount() < minimum_cost) {
       best_scan = new_plan;
@@ -248,12 +281,13 @@ Plan BestScan(const std::vector<NamedExpression>& select, const Table& from,
     }
   }
 
-  Plan full_scan_plan = NewFullScanPlan(from, stat);
+  Plan full_scan_plan(new FullScanPlan(from, stat));
   if (scan_exp) {
-    full_scan_plan = NewSelectionPlan(full_scan_plan, scan_exp, stat);
+    full_scan_plan =
+        std::make_shared<SelectionPlan>(full_scan_plan, scan_exp, stat);
   }
   if (select.size() != full_scan_plan->GetSchema().ColumnCount()) {
-    full_scan_plan = NewProjectionPlan(full_scan_plan, select);
+    full_scan_plan = std::make_shared<ProjectionPlan>(full_scan_plan, select);
   }
   if (full_scan_plan->AccessRowCount() < minimum_cost) {
     best_scan = full_scan_plan;
@@ -334,17 +368,18 @@ Plan BestJoin(
         std::vector<slot_t> left_cols = TargetColumns(left_schema, be.Left());
         std::vector<slot_t> right_cols =
             TargetColumns(right_schema, be.Right());
-        return BetterPlan(NewProductPlan(left.second.plan, left_cols,
-                                         right.second.plan, right_cols),
-                          NewProductPlan(right.second.plan, right_cols,
-                                         left.second.plan, left_cols));
+        return BetterPlan(
+            std::make_shared<ProductPlan>(left.second.plan, left_cols,
+                                          right.second.plan, right_cols),
+            std::make_shared<ProductPlan>(right.second.plan, right_cols,
+                                          left.second.plan, left_cols));
       }
     } else if (be.Op() == BinaryOperation::kAnd) {
       return BetterPlan(BestJoin(be.Left(), left, right),
                         BestJoin(be.Right(), left, right));
     }
   }
-  return NewProductPlan(left.second.plan, right.second.plan);
+  return std::make_shared<ProductPlan>(left.second.plan, right.second.plan);
 }
 
 std::unordered_set<std::string> Set(const std::vector<std::string>& from) {
@@ -413,7 +448,7 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
 
   // 3. Attach final projection and emit the result.
   auto solution = optimal_plans.find(Set(query.from_))->second.plan;
-  solution = NewProjectionPlan(solution, query.select_);
+  solution = std::make_shared<ProjectionPlan>(solution, query.select_);
   schema = solution->GetSchema();
   exec = solution->EmitExecutor(ctx);
   return Status::kSuccess;

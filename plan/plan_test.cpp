@@ -9,10 +9,14 @@
 #include "database/relation_storage.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/expression.hpp"
+#include "full_scan_plan.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
+#include "product_plan.hpp"
+#include "projection_plan.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
+#include "selection_plan.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "transaction/lock_manager.hpp"
@@ -128,7 +132,7 @@ TEST_F(PlanTest, ScanPlan) {
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
-  Plan fs = NewFullScanPlan(*tbl, ts);
+  Plan fs(new FullScanPlan(*tbl, ts));
   DumpAll(fs);
 }
 
@@ -136,8 +140,8 @@ TEST_F(PlanTest, ProjectPlan) {
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
-  Plan pp =
-      NewProjectionPlan(NewFullScanPlan(*tbl, ts), {NamedExpression("c1")});
+  Plan pp(new ProjectionPlan(std::make_shared<FullScanPlan>(*tbl, ts),
+                             {NamedExpression("c1")}));
   DumpAll(pp);
 }
 
@@ -148,7 +152,7 @@ TEST_F(PlanTest, SelectionPlan) {
   Expression exp = BinaryExpressionExp(ColumnValueExp("c1"),
                                        BinaryOperation::kGreaterThanEquals,
                                        ConstantValueExp(Value(100)));
-  Plan sp = NewSelectionPlan(NewFullScanPlan(*tbl, ts), exp, ts);
+  Plan sp(new SelectionPlan(std::make_shared<FullScanPlan>(*tbl, ts), exp, ts));
   DumpAll(sp);
 }
 
@@ -157,8 +161,8 @@ TEST_F(PlanTest, ProductPlan) {
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
-  Plan prop = NewProductPlan(NewFullScanPlan(*tbl1, ts), {0},
-                             NewFullScanPlan(*tbl2, ts), {0});
+  Plan prop(new ProductPlan(std::make_shared<FullScanPlan>(*tbl1, ts), {0},
+                            std::make_shared<FullScanPlan>(*tbl2, ts), {0}));
   DumpAll(prop);
 }
 
@@ -167,8 +171,8 @@ TEST_F(PlanTest, ProductPlanCrossJoin) {
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
-  Plan prop =
-      NewProductPlan(NewFullScanPlan(*tbl1, ts), NewFullScanPlan(*tbl2, ts));
+  Plan prop(new ProductPlan(std::make_shared<FullScanPlan>(*tbl1, ts),
+                            std::make_shared<FullScanPlan>(*tbl2, ts)));
   DumpAll(prop);
 }
 

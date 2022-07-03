@@ -38,9 +38,7 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
   Iterator it = BeginFullScan(txn);
   BPlusTree new_bpt(new_root);
   while (it.IsValid()) {
-    RETURN_IF_FAIL(
-        new_bpt.Insert(txn, it->Extract(idx.key_).EncodeMemcomparableFormat(),
-                       it.Position().Serialize()));
+    RETURN_IF_FAIL(IndexInsert(txn, *it, it.Position()));
     ++it;
   }
   return Status::kSuccess;
