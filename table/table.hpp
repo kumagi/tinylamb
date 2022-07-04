@@ -72,9 +72,10 @@ class Table {
   }
 
  private:
-  Status IndexInsert(Transaction& txn, const Row& new_row,
+  Status IndexInsert(Transaction& txn, const Index& idx, const Row& new_row,
                      const RowPosition& pos);
-  Status IndexDelete(Transaction& txn, const RowPosition& pos);
+  Status IndexDelete(Transaction& txn, const Index& idx,
+                     const RowPosition& pos);
 
   friend class RelationStorage;
   friend class FullScanIterator;

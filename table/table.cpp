@@ -38,7 +38,7 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
   Iterator it = BeginFullScan(txn);
   BPlusTree new_bpt(new_root);
   while (it.IsValid()) {
-    RETURN_IF_FAIL(IndexInsert(txn, *it, it.Position()));
+    RETURN_IF_FAIL(IndexInsert(txn, indexes_.back(), *it, it.Position()));
     ++it;
   }
   return Status::kSuccess;
@@ -65,7 +65,9 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
     last_pid_ = new_page->PageID();
   }
   ref.PageUnlock();
-  RETURN_IF_FAIL(IndexInsert(txn, row, rp));
+  for (const auto& idx : indexes_) {
+    RETURN_IF_FAIL(IndexInsert(txn, idx, row, rp));
+  }
   return rp;
 }
 
@@ -76,7 +78,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   }
   ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
   RowPosition new_pos = pos;
-  RETURN_IF_FAIL(IndexDelete(txn, pos));
+  for (const auto& idx : indexes_) {
+    RETURN_IF_FAIL(IndexDelete(txn, idx, pos));
+  }
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
   PageRef page = txn.PageManager()->GetPage(new_pos.page_id);
@@ -96,7 +100,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     new_pos = new_row_pos;
     last_pid_ = new_page->PageID();
   }
-  RETURN_IF_FAIL(IndexInsert(txn, row, new_pos));
+  for (const auto& idx : indexes_) {
+    RETURN_IF_FAIL(IndexInsert(txn, idx, row, new_pos));
+  }
   return new_pos;
 }
 
@@ -104,7 +110,9 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
   if (!txn.AddWriteSet(pos)) {
     return Status::kConflicts;
   }
-  RETURN_IF_FAIL(IndexDelete(txn, pos));
+  for (const auto& idx : indexes_) {
+    RETURN_IF_FAIL(IndexDelete(txn, idx, pos));
+  }
   return txn.PageManager()->GetPage(pos.page_id)->Delete(txn, pos.slot);
 }
 
@@ -117,60 +125,57 @@ StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
   return result;
 }
 
-Status Table::IndexInsert(Transaction& txn, const Row& new_row,
-                          const RowPosition& pos) {
-  for (const auto& idx : indexes_) {
-    BPlusTree bpt(idx.pid_);
-    std::vector<Value> include_values;
-    include_values.reserve(idx.sc_.include_.size());
-    for (const auto& in : idx.sc_.include_) {
-      include_values.push_back(new_row[in]);
-    }
-    Row include(include_values);
-    if (idx.IsUnique()) {
-      // BTree value is encoded pair<RowPosition, vector<Value>>.
-      IndexValueType val;
-      val.pos = pos;
-      val.include = include;
-      RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(new_row), Encode(val)));
+Status Table::IndexInsert(Transaction& txn, const Index& idx,
+                          const Row& new_row, const RowPosition& pos) {
+  BPlusTree bpt(idx.pid_);
+  std::vector<Value> include_values;
+  include_values.reserve(idx.sc_.include_.size());
+  for (const auto& in : idx.sc_.include_) {
+    include_values.push_back(new_row[in]);
+  }
+  Row include(include_values);
+  if (idx.IsUnique()) {
+    // BTree value is encoded pair<RowPosition, vector<Value>>.
+    IndexValueType val;
+    val.pos = pos;
+    val.include = include;
+    RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(new_row), Encode(val)));
+  } else {
+    // BTree value is encoded vector<pair<RowPosition, vector<Value>>>.
+    StatusOr<std::string_view> existing_value =
+        bpt.Read(txn, idx.GenerateKey(new_row));
+    if (existing_value.HasValue()) {
+      std::string_view existing_data = existing_value.Value();
+      auto rps = Decode<std::vector<IndexValueType>>(existing_data);
+      rps.push_back({pos, include});
+      RETURN_IF_FAIL(bpt.Update(txn, idx.GenerateKey(new_row), Encode(rps)));
     } else {
-      // BTree value is encoded vector<pair<RowPosition, vector<Value>>>.
-      StatusOr<std::string_view> existing_value =
-          bpt.Read(txn, idx.GenerateKey(new_row));
-      if (existing_value.HasValue()) {
-        std::string_view existing_data = existing_value.Value();
-        auto rps = Decode<std::vector<IndexValueType>>(existing_data);
-        rps.push_back({pos, include});
-        RETURN_IF_FAIL(bpt.Update(txn, idx.GenerateKey(new_row), Encode(rps)));
-      } else {
-        std::vector<IndexValueType> rps{{pos, include}};
-        RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(new_row), Encode(rps)));
-      }
+      std::vector<IndexValueType> rps{{pos, include}};
+      RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(new_row), Encode(rps)));
     }
   }
   return Status::kSuccess;
 }
 
-Status Table::IndexDelete(Transaction& txn, const RowPosition& pos) {
+Status Table::IndexDelete(Transaction& txn, const Index& idx,
+                          const RowPosition& pos) {
   ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
-  for (const auto& idx : indexes_) {
-    BPlusTree bpt(idx.pid_);
-    std::string key = idx.GenerateKey(original_row);
-    if (idx.IsUnique()) {
+  BPlusTree bpt(idx.pid_);
+  std::string key = idx.GenerateKey(original_row);
+  if (idx.IsUnique()) {
+    RETURN_IF_FAIL(bpt.Delete(txn, key));
+  } else {
+    ASSIGN_OR_RETURN(std::string_view, existing_data,
+                     bpt.Read(txn, idx.GenerateKey(original_row)));
+    auto values = Decode<std::vector<IndexValueType>>(existing_data);
+    auto new_end =
+        std::remove_if(values.begin(), values.end(),
+                       [&](const IndexValueType& v) { return v.pos == pos; });
+    values.erase(new_end, values.end());
+    if (values.empty()) {
       RETURN_IF_FAIL(bpt.Delete(txn, key));
     } else {
-      ASSIGN_OR_RETURN(std::string_view, existing_data,
-                       bpt.Read(txn, idx.GenerateKey(original_row)));
-      auto values = Decode<std::vector<IndexValueType>>(existing_data);
-      auto new_end =
-          std::remove_if(values.begin(), values.end(),
-                         [&](const IndexValueType& v) { return v.pos == pos; });
-      values.erase(new_end, values.end());
-      if (values.empty()) {
-        RETURN_IF_FAIL(bpt.Delete(txn, key));
-      } else {
-        RETURN_IF_FAIL(bpt.Update(txn, key, Encode(values)));
-      }
+      RETURN_IF_FAIL(bpt.Update(txn, key, Encode(values)));
     }
   }
   return Status::kSuccess;
