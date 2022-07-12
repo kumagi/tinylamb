@@ -15,12 +15,19 @@ class ConstantValue : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override {
     return TypeTag::kConstantValue;
   }
-  Value Evaluate(const Row&, const Schema&) const override { return val_; }
+  [[nodiscard]] Value Evaluate(const Row& /*row*/,
+                               const Schema& /*schema*/) const override {
+    return val_;
+  }
   [[nodiscard]] Value GetValue() const { return val_; }
 
   friend std::ostream& operator<<(std::ostream& o, const ConstantValue& c) {
     o << c.val_;
     return o;
+  }
+
+  [[nodiscard]] std::string ToString() const override {
+    return val_.AsString();
   }
   void Dump(std::ostream& o) const override { o << val_; }
 

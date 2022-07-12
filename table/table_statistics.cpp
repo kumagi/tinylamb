@@ -191,7 +191,7 @@ class DistinctCounter {
 
 }  // namespace
 
-TableStatistics::TableStatistics(const Schema& sc) : row_count_(0) {
+TableStatistics::TableStatistics(const Schema& sc) {
   stats_.reserve(sc.ColumnCount());
   for (size_t i = 0; i < sc.ColumnCount(); ++i) {
     stats_.emplace_back(sc.GetColumn(i).Type());
@@ -216,7 +216,6 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
     ++rows;
     ++it;
   }
-  row_count_ = rows;
   for (size_t i = 0; i < stats_.size(); ++i) {
     ColumnStats& cs = stats_[i];
     switch (cs.type) {
@@ -241,9 +240,10 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
 // Returning 1 means no selection (pass through).
 double TableStatistics::ReductionFactor(const Schema& sc,
                                         const Expression& predicate) const {
+  assert(0 < sc.ColumnCount());
   if (predicate->Type() == TypeTag::kBinaryExp) {
     const auto* bo = reinterpret_cast<const BinaryExpression*>(predicate.get());
-    std::unordered_set<std::string> columns = sc.ColumnSet();
+    std::unordered_set<ColumnName> columns = sc.ColumnSet();
     if (bo->Op() == BinaryOperation::kEquals) {
       if (bo->Left()->Type() == TypeTag::kColumnValue &&
           bo->Right()->Type() == TypeTag::kColumnValue) {
@@ -251,10 +251,10 @@ double TableStatistics::ReductionFactor(const Schema& sc,
             reinterpret_cast<const ColumnValue*>(bo->Left().get());
         const auto* rcv =
             reinterpret_cast<const ColumnValue*>(bo->Right().get());
-        if (columns.find(lcv->ColumnName()) != columns.end() &&
-            columns.find(rcv->ColumnName()) != columns.end()) {
-          int offset_left = sc.Offset(lcv->ColumnName());
-          int offset_right = sc.Offset(rcv->ColumnName());
+        if (columns.find(lcv->GetColumnName()) != columns.end() &&
+            columns.find(rcv->GetColumnName()) != columns.end()) {
+          int offset_left = sc.Offset(lcv->GetColumnName());
+          int offset_right = sc.Offset(rcv->GetColumnName());
           return std::min(static_cast<double>(stats_[offset_left].Distinct()),
                           static_cast<double>(stats_[offset_right].Distinct()));
         }
@@ -262,13 +262,13 @@ double TableStatistics::ReductionFactor(const Schema& sc,
       if (bo->Left()->Type() == TypeTag::kColumnValue) {
         const auto* lcv =
             reinterpret_cast<const ColumnValue*>(bo->Left().get());
-        int offset_left = sc.Offset(lcv->ColumnName());
+        int offset_left = sc.Offset(lcv->GetColumnName());
         return static_cast<double>(stats_[offset_left].Distinct());
       }
       if (bo->Right()->Type() == TypeTag::kColumnValue) {
         const auto* rcv =
             reinterpret_cast<const ColumnValue*>(bo->Left().get());
-        int offset_right = sc.Offset(rcv->ColumnName());
+        int offset_right = sc.Offset(rcv->GetColumnName());
         return static_cast<double>(stats_[offset_right].Distinct());
       }
       if (bo->Left()->Type() == TypeTag::kConstantValue &&
@@ -421,16 +421,16 @@ std::ostream& operator<<(std::ostream& o, const ColumnStats& t) {
 }
 
 Encoder& operator<<(Encoder& e, const TableStatistics& s) {
-  e << s.row_count_ << s.stats_;
+  e << s.stats_;
   return e;
 }
 Decoder& operator>>(Decoder& d, TableStatistics& s) {
-  d >> s.row_count_ >> s.stats_;
+  d >> s.stats_;
   return d;
 }
 
 std::ostream& operator<<(std::ostream& o, const TableStatistics& t) {
-  o << "Rows: " << t.row_count_ << "\n";
+  o << "Rows: " << t.Count() << "\n";
   for (const auto& stat : t.stats_) {
     o << stat << "\n";
   }

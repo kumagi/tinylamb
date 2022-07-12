@@ -6,22 +6,27 @@
 #include <string_view>
 #include <vector>
 
-#include "common/decoder.hpp"
 #include "common/log_message.hpp"
 #include "page/row_position.hpp"
+#include "type/column_name.hpp"
 #include "type/constraint.hpp"
 #include "value_type.hpp"
 
 namespace tinylamb {
 class Encoder;
+class Decoder;
 
 class Column {
  public:
   Column() = default;
+  explicit Column(ColumnName name, ValueType type = ValueType::kNull,
+                  Constraint cst = Constraint());
+
   explicit Column(std::string_view name, ValueType type = ValueType::kNull,
                   Constraint cst = Constraint());
 
-  [[nodiscard]] std::string_view Name() const { return name_; }
+  [[nodiscard]] const ColumnName& Name() const { return col_name_; }
+  ColumnName& Name() { return col_name_; }
   [[nodiscard]] ValueType Type() const { return type_; }
   [[nodiscard]] Constraint GetConstraint() const { return constraint_; }
 
@@ -31,7 +36,7 @@ class Column {
   friend Decoder& operator>>(Decoder& e, Column& c);
 
  private:
-  std::string name_;
+  ColumnName col_name_;
   ValueType type_{};
   Constraint constraint_{Constraint::kNothing};
 };

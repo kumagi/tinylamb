@@ -6,9 +6,9 @@
 
 #include <utility>
 
-#include "executor/named_expression.hpp"
 #include "executor/projection.hpp"
 #include "expression/column_value.hpp"
+#include "expression/named_expression.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -17,7 +17,19 @@ ProjectionPlan::ProjectionPlan(Plan src,
                                std::vector<NamedExpression> project_columns)
     : src_(std::move(src)),
       columns_(std::move(project_columns)),
-      output_schema_(CalcSchema()) {}
+      output_schema_(CalcSchema()),
+      stats_(src_->GetStats()) {}
+
+ProjectionPlan::ProjectionPlan(Plan src,
+                               const std::vector<ColumnName>& project_columns)
+    : src_(std::move(std::move(src))),
+      output_schema_(CalcSchema()),
+      stats_(src->GetStats()) {
+  columns_.reserve(project_columns.size());
+  for (const auto& col : project_columns) {
+    columns_.emplace_back(col);
+  }
+}
 
 Schema ProjectionPlan::CalcSchema() const {
   Schema original_schema = src_->GetSchema();
@@ -31,10 +43,10 @@ Schema ProjectionPlan::CalcSchema() const {
     }
     if (columns_[i].expression->Type() == TypeTag::kColumnValue) {
       auto* cv = dynamic_cast<ColumnValue*>(columns_[i].expression.get());
-      cols.emplace_back(cv->col_name_);
+      cols.emplace_back(ColumnName(cv->col_name_));
       continue;
     }
-    cols.emplace_back("$col" + std::to_string(i));
+    cols.emplace_back(ColumnName("$col" + std::to_string(i)));
   }
   return {"", cols};
 }
@@ -46,7 +58,7 @@ Executor ProjectionPlan::EmitExecutor(TransactionContext& ctx) const {
 
 const Schema& ProjectionPlan::GetSchema() const { return output_schema_; }
 
-size_t ProjectionPlan::AccessRowCount() const { return src_->EmitRowCount(); }
+size_t ProjectionPlan::AccessRowCount() const { return src_->AccessRowCount(); }
 
 size_t ProjectionPlan::EmitRowCount() const { return src_->EmitRowCount(); }
 

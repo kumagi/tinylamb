@@ -329,10 +329,10 @@ TEST(ExpressionTest, ColumnValue) {
   std::vector<Column> cols{
       Column("name", ValueType::kVarChar), Column("score", ValueType::kInt64),
       Column("flv", ValueType::kDouble), Column("date", ValueType::kInt64)};
-  Schema sc("test_schema", cols);
+  Schema sc("sc", cols);
   Row row({Value("foo"), Value(12), Value(132.3), Value(9)});
 
-  ASSERT_EQ(ColumnValueExp("name")->Evaluate(row, sc), Value("foo"));
+  ASSERT_EQ(ColumnValueExp("sc.name")->Evaluate(row, sc), Value("foo"));
   ASSERT_EQ(ColumnValueExp("score")->Evaluate(row, sc), Value(12));
   ASSERT_EQ(ColumnValueExp("flv")->Evaluate(row, sc), Value(132.3));
   ASSERT_EQ(ColumnValueExp("date")->Evaluate(row, sc), Value(9));

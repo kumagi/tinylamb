@@ -156,13 +156,14 @@ TEST_F(PlanTest, SelectionPlan) {
   DumpAll(sp);
 }
 
-TEST_F(PlanTest, ProductPlan) {
+TEST_F(PlanTest, HashJoinPlan) {
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
-  Plan prop(new ProductPlan(std::make_shared<FullScanPlan>(*tbl1, ts), {0},
-                            std::make_shared<FullScanPlan>(*tbl2, ts), {0}));
+  Plan prop(new ProductPlan(
+      std::make_shared<FullScanPlan>(*tbl1, ts), {ColumnName("Sc1.c1")},
+      std::make_shared<FullScanPlan>(*tbl2, ts), {ColumnName("Sc2.d1")}));
   DumpAll(prop);
 }
 

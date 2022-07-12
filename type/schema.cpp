@@ -7,25 +7,40 @@
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "common/log_message.hpp"
+#include "type/column_name.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
 
 Schema::Schema(std::string_view schema_name, std::vector<Column> columns)
-    : name_(schema_name), columns_(std::move(columns)) {}
+    : name_(schema_name), columns_(std::move(columns)) {
+  for (auto& c : columns_) {
+    if (c.Name().schema.empty()) {
+      c.Name().schema = Name();
+    }
+  }
+}
 
-std::unordered_set<std::string> Schema::ColumnSet() const {
-  std::unordered_set<std::string> ret;
+std::unordered_set<ColumnName> Schema::ColumnSet() const {
+  std::unordered_set<ColumnName> ret;
   ret.reserve(columns_.size());
   for (const auto& c : columns_) {
-    ret.emplace(c.Name());
+    if (c.Name().name.empty()) {
+      ret.emplace(Name(), c.Name().name);
+    } else {
+      ret.emplace(c.Name());
+    }
   }
   return ret;
 }
 
-int Schema::Offset(std::string_view name) const {
+int Schema::Offset(const ColumnName& col_name) const {
+  if (!col_name.schema.empty() && !Name().empty() &&
+      Name() != col_name.schema) {
+    return -1;
+  }
   for (int i = 0; i < static_cast<int>(columns_.size()); ++i) {
-    if (columns_[i].Name() == name) {
+    if (columns_[i].Name() == col_name) {
       return i;
     }
   }

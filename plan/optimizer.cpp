@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <stack>
 #include <unordered_map>
 #include <unordered_set>
 
+#include "common/converter.hpp"
 #include "database/relation_storage.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/binary_expression.hpp"
@@ -44,45 +46,17 @@ namespace {
 struct CostAndPlan {
   size_t cost;
   Plan plan;
+  [[maybe_unused]] friend std::ostream& operator<<(std::ostream& o,
+                                                   const CostAndPlan& c) {
+    o << c.cost << ": " << *c.plan;
+    return o;
+  }
 };
 
-void ExtractTouchedColumns(const Expression& exp,
-                           std::unordered_set<std::string>& cols) {
-  if (exp->Type() == TypeTag::kColumnValue) {
-    const auto* cv = reinterpret_cast<const ColumnValue*>(exp.get());
-    cols.emplace(cv->ColumnName());
-  } else if (exp->Type() == TypeTag::kBinaryExp) {
-    const auto* be = reinterpret_cast<const BinaryExpression*>(exp.get());
-    ExtractTouchedColumns(be->Left(), cols);
-    ExtractTouchedColumns(be->Right(), cols);
-  }
-}
-
-std::unordered_set<std::string> ColumnNames(const Schema& sc) {
-  std::unordered_set<std::string> ret;
-  ret.reserve(sc.ColumnCount());
-  for (size_t i = 0; i < sc.ColumnCount(); ++i) {
-    ret.emplace(sc.GetColumn(i).Name());
-  }
-  return ret;
-}
-
-std::unordered_set<std::string> Intersect(
-    const std::unordered_set<std::string>& a,
-    const std::unordered_set<std::string>& b) {
-  std::unordered_set<std::string> ret;
-  for (const auto& l : a) {
-    if (b.contains(l)) {
-      ret.emplace(l);
-    }
-  }
-  return ret;
-}
-
-std::unordered_set<std::string> Union(
-    const std::unordered_set<std::string>& a,
-    const std::unordered_set<std::string>& b) {
-  std::unordered_set<std::string> ret = a;
+template <typename T>
+std::unordered_set<T> Union(const std::unordered_set<T>& a,
+                            const std::unordered_set<T>& b) {
+  std::unordered_set<T> ret = a;
   std::copy(b.begin(), b.end(), std::inserter(ret, ret.end()));
   return ret;
 }
@@ -149,10 +123,10 @@ struct Range {
   }
 };
 
-bool TouchOnly(const Expression& where, std::string_view col_name) {
+bool TouchOnly(const Expression& where, const ColumnName& col_name) {
   if (where->Type() == TypeTag::kColumnValue) {
     const ColumnValue& cv = where->AsColumnValue();
-    return cv.ColumnName() == col_name;
+    return cv.GetColumnName() == col_name;
   }
   if (where->Type() == TypeTag::kBinaryExp) {
     const BinaryExpression& be = where->AsBinaryExpression();
@@ -173,18 +147,18 @@ Plan IndexScanSelect(const Table& from, const Index& target_idx,
                      const TableStatistics& stat, const Value& begin,
                      const Value& end, const Expression& where,
                      const std::vector<NamedExpression>& select) {
-  std::unordered_set<std::string> touched = where->TouchedColumns();
+  std::unordered_set<ColumnName> touched = where->TouchedColumns();
   for (const auto& s : select) {
-    touched.emplace(s.name);
+    touched.merge(s.expression->TouchedColumns());
   }
   std::unordered_set<slot_t> touched_cols;
   touched_cols.reserve(touched.size());
   for (const auto& t : touched) {
     touched_cols.insert(from.GetSchema().Offset(t));
   }
-  if (Covered(target_idx.CoeveredColumns(), touched_cols)) {
+  if (Covered(target_idx.CoveredColumns(), touched_cols)) {
     return std::make_shared<IndexOnlyScanPlan>(from, target_idx, stat, begin,
-                                               end, true, where, select);
+                                               end, true, where);
   }
   return std::make_shared<IndexScanPlan>(from, target_idx, stat, begin, end,
                                          true, where);
@@ -220,7 +194,7 @@ Plan BestScan(const std::vector<NamedExpression>& select, const Table& from,
         if (be.Left()->Type() == TypeTag::kColumnValue &&
             be.Right()->Type() == TypeTag::kConstantValue) {
           const ColumnValue& cv = be.Left()->AsColumnValue();
-          const int offset = sc.Offset(cv.ColumnName());
+          const int offset = sc.Offset(cv.GetColumnName());
           if (0 <= offset) {
             related_ops.push_back(exp);
             auto iter = ranges.find(offset);
@@ -233,7 +207,7 @@ Plan BestScan(const std::vector<NamedExpression>& select, const Table& from,
         } else if (be.Left()->Type() == TypeTag::kColumnValue &&
                    be.Right()->Type() == TypeTag::kConstantValue) {
           const ColumnValue& cv = be.Right()->AsColumnValue();
-          const int offset = sc.Offset(cv.ColumnName());
+          const int offset = sc.Offset(cv.GetColumnName());
           if (0 <= offset) {
             related_ops.push_back(exp);
             auto iter = ranges.find(offset);
@@ -303,31 +277,6 @@ bool ContainsAny(const std::unordered_set<std::string>& left,
   });
 }
 
-void ExtractColumns(const Schema& sc, const Expression& exp,
-                    std::vector<slot_t>& dst) {
-  if (exp->Type() == TypeTag::kColumnValue) {
-    const ColumnValue& cv = exp->AsColumnValue();
-    const std::string& name = cv.ColumnName();
-    for (size_t i = 0; i < sc.ColumnCount(); ++i) {
-      if (sc.GetColumn(i).Name() == name) {
-        dst.push_back(i);
-      }
-    }
-  } else if (exp->Type() == TypeTag::kBinaryExp) {
-    const BinaryExpression& be = exp->AsBinaryExpression();
-    if (be.Op() == BinaryOperation::kAnd) {
-      ExtractColumns(sc, be.Left(), dst);
-      ExtractColumns(sc, be.Right(), dst);
-    }
-  }
-}
-
-std::vector<slot_t> TargetColumns(const Schema& schema, const Expression& exp) {
-  std::vector<slot_t> out;
-  ExtractColumns(schema, exp, out);
-  return out;
-}
-
 Plan BetterPlan(Plan a, Plan b) {
   if (a->AccessRowCount() < b->AccessRowCount()) {
     return a;
@@ -335,65 +284,63 @@ Plan BetterPlan(Plan a, Plan b) {
   return b;
 }
 
-bool ReferenceWithin(const Expression& where,
-                     const std::unordered_set<std::string>& columns) {
-  if (where->Type() == TypeTag::kBinaryExp) {
-    const BinaryExpression& be = where->AsBinaryExpression();
-    return ReferenceWithin(be.Left(), columns) ||
-           ReferenceWithin(be.Right(), columns);
-  }
-  if (where->Type() == TypeTag::kColumnValue) {
-    const ColumnValue& cv = where->AsColumnValue();
-    return columns.find(cv.ColumnName()) != columns.end();
-  }
-  return false;
-}
-
-Plan BestJoin(
-    const Expression& where,
-    const std::pair<std::unordered_set<std::string>, CostAndPlan>& left,
-    const std::pair<std::unordered_set<std::string>, CostAndPlan>& right) {
-  if (where->Type() == TypeTag::kBinaryExp) {
-    const BinaryExpression& be = where->AsBinaryExpression();
-    if (be.Op() == BinaryOperation::kEquals) {
-      Schema left_schema = left.second.plan->GetSchema();
-      std::unordered_set<std::string> left_column_names =
-          ColumnNames(left_schema);
-      Schema right_schema = right.second.plan->GetSchema();
-      std::unordered_set<std::string> right_column_names =
-          ColumnNames(right.second.plan->GetSchema());
-      if (ReferenceWithin(be.Left(), left_column_names) &&
-          ReferenceWithin(be.Right(), right_column_names)) {
-        // We can use HashJoin!
-        std::vector<slot_t> left_cols = TargetColumns(left_schema, be.Left());
-        std::vector<slot_t> right_cols =
-            TargetColumns(right_schema, be.Right());
-        return BetterPlan(
-            std::make_shared<ProductPlan>(left.second.plan, left_cols,
-                                          right.second.plan, right_cols),
-            std::make_shared<ProductPlan>(right.second.plan, right_cols,
-                                          left.second.plan, left_cols));
+Plan BestJoin(const Expression& where, const Plan& left, const Plan& right) {
+  std::vector<std::pair<ColumnName, ColumnName>> equals;
+  std::stack<Expression> exp;
+  exp.push(where);
+  while (!exp.empty()) {
+    const Expression here = exp.top();
+    exp.pop();
+    switch (here->Type()) {
+      case TypeTag::kBinaryExp: {
+        const auto& be = here->AsBinaryExpression();
+        if (be.Op() == BinaryOperation::kEquals &&
+            be.Right()->Type() == TypeTag::kColumnValue &&
+            be.Left()->Type() == TypeTag::kColumnValue) {
+          const auto& cv_l = be.Left()->AsColumnValue();
+          const auto& cv_r = be.Right()->AsColumnValue();
+          if (0 <= left->GetSchema().Offset(cv_l.GetColumnName()) &&
+              0 <= right->GetSchema().Offset(cv_r.GetColumnName())) {
+            equals.emplace_back(cv_l.GetColumnName(), cv_r.GetColumnName());
+          } else if (0 <= right->GetSchema().Offset(cv_l.GetColumnName()) &&
+                     0 <= left->GetSchema().Offset(cv_r.GetColumnName())) {
+            equals.emplace_back(cv_r.GetColumnName(), cv_l.GetColumnName());
+          }
+        }
+        if (be.Op() == BinaryOperation::kAnd) {
+          exp.push(be.Left());
+          exp.push(be.Right());
+        }
+        break;
       }
-    } else if (be.Op() == BinaryOperation::kAnd) {
-      return BetterPlan(BestJoin(be.Left(), left, right),
-                        BestJoin(be.Right(), left, right));
+      case TypeTag::kColumnValue:
+      case TypeTag::kConstantValue:
+        // Ignore.
+        break;
     }
   }
-  return std::make_shared<ProductPlan>(left.second.plan, right.second.plan);
-}
-
-std::unordered_set<std::string> Set(const std::vector<std::string>& from) {
-  std::unordered_set<std::string> joined;
-  for (const auto& f : from) {
-    joined.insert(f);
+  if (!equals.empty()) {
+    std::vector<ColumnName> left_cols;
+    std::vector<ColumnName> right_cols;
+    left_cols.reserve(equals.size());
+    right_cols.reserve(equals.size());
+    for (auto&& cn : equals) {
+      left_cols.emplace_back(std::move(cn.first));
+      right_cols.emplace_back(std::move(cn.second));
+    }
+    return BetterPlan(
+        std::make_shared<ProductPlan>(left, left_cols, right, right_cols),
+        std::make_shared<ProductPlan>(right, right_cols, left, left_cols));
   }
-  return joined;
+  Plan ans = std::make_shared<ProductPlan>(left, right);
+  return std::make_shared<SelectionPlan>(ans, where,
+                                         TableStatistics(ans->GetSchema()));
 }
 
 }  // anonymous namespace
 
-Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
-                           Schema& schema, Executor& exec) {
+StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
+                                   TransactionContext& ctx) {
   if (query.from_.empty()) {
     throw std::runtime_error("No table specified");
   }
@@ -401,10 +348,10 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
       optimal_plans;
 
   // 1. Initialize every single tables to start.
-  std::unordered_set<std::string> touched_columns;
-  ExtractTouchedColumns(query.where_, touched_columns);
+  std::unordered_set<ColumnName> touched_columns =
+      query.where_->TouchedColumns();
   for (const auto& sel : query.select_) {
-    ExtractTouchedColumns(sel.expression, touched_columns);
+    touched_columns.merge(sel.expression->TouchedColumns());
   }
   for (const auto& from : query.from_) {
     ASSIGN_OR_RETURN(std::shared_ptr<Table>, tbl, ctx.GetTable(from));
@@ -413,9 +360,15 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
 
     // Push down all selection & projection.
     std::vector<NamedExpression> project_target;
-    for (const auto& col :
-         Intersect(touched_columns, ColumnNames(tbl->GetSchema()))) {
-      project_target.emplace_back(col);
+    for (size_t i = 0; i < tbl->GetSchema().ColumnCount(); ++i) {
+      for (const auto& touched_col : touched_columns) {
+        const Column& table_col = tbl->GetSchema().GetColumn(i);
+        if (table_col.Name().name == touched_col.name &&
+            (touched_col.schema.empty() ||
+             touched_col.schema == tbl->GetSchema().Name())) {
+          project_target.emplace_back(table_col.Name());
+        }
+      }
     }
     Plan scan = BestScan(project_target, *tbl, query.where_, *stats);
     optimal_plans.emplace(std::unordered_set({from}),
@@ -430,7 +383,8 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
         if (ContainsAny(base_table.first, join_table.first)) {
           continue;
         }
-        Plan best_join = BestJoin(query.where_, base_table, join_table);
+        Plan best_join = BestJoin(query.where_, base_table.second.plan,
+                                  join_table.second.plan);
         std::unordered_set<std::string> joined_tables =
             Union(base_table.first, join_table.first);
         assert(1 < joined_tables.size());
@@ -444,14 +398,12 @@ Status Optimizer::Optimize(const QueryData& query, TransactionContext& ctx,
       }
     }
   }
-  assert(optimal_plans.find(Set(query.from_)) != optimal_plans.end());
+  assert(optimal_plans.find(MakeSet(query.from_)) != optimal_plans.end());
 
   // 3. Attach final projection and emit the result.
-  auto solution = optimal_plans.find(Set(query.from_))->second.plan;
+  auto solution = optimal_plans.find(MakeSet(query.from_))->second.plan;
   solution = std::make_shared<ProjectionPlan>(solution, query.select_);
-  schema = solution->GetSchema();
-  exec = solution->EmitExecutor(ctx);
-  return Status::kSuccess;
+  return solution;
 }
 
 }  // namespace tinylamb

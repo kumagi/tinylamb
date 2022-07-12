@@ -39,7 +39,7 @@ class IndexSchema {
   std::string name_;
   std::vector<slot_t> key_;
   std::vector<slot_t> include_;
-  IndexMode mode_;
+  IndexMode mode_{IndexMode::kUnique};
 };
 
 }  // namespace tinylamb

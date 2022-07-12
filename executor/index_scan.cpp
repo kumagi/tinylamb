@@ -34,7 +34,7 @@ bool IndexScan::Next(Row* dst, RowPosition* rp) {
 }
 
 void IndexScan::Dump(std::ostream& o, int /*indent*/) const {
-  o << "IndexScan: " << iter_ << " where " << *cond_;
+  o << "IndexScan: " << iter_ << " WHERE " << *cond_;
 }
 
 }  // namespace tinylamb

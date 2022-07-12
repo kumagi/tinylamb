@@ -10,7 +10,7 @@
 #include <vector>
 
 #include "executor_base.hpp"
-#include "named_expression.hpp"
+#include "expression/named_expression.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -22,6 +22,10 @@ class Projection : public ExecutorBase {
       : expressions_(std::move(expressions)),
         input_schema_(std::move(input_schema)),
         src_(std::move(src)) {}
+  Projection(const Projection&) = delete;
+  Projection(Projection&&) = delete;
+  Projection& operator=(const Projection&) = delete;
+  Projection& operator=(Projection&&) = delete;
   ~Projection() override = default;
 
   bool Next(Row* dst, RowPosition* rp) override;

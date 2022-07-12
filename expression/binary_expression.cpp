@@ -48,53 +48,57 @@ Value BinaryExpression::Evaluate(const Row& row, const Schema& schema) const {
                  right_->Evaluate(row, schema));
 }
 
-void BinaryExpression::Dump(std::ostream& o) const {
-  left_->Dump(o);
+std::string BinaryExpression::ToString() const {
+  std::stringstream ss;
+  ss << left_->ToString();
   switch (operation_) {
     case BinaryOperation::kAdd:
-      o << " + ";
+      ss << " + ";
       break;
     case BinaryOperation::kSubtract:
-      o << " - ";
+      ss << " - ";
       break;
     case BinaryOperation::kMultiply:
-      o << " * ";
+      ss << " * ";
       break;
     case BinaryOperation::kDivide:
-      o << " / ";
+      ss << " / ";
       break;
     case BinaryOperation::kModulo:
-      o << " % ";
+      ss << " % ";
       break;
     case BinaryOperation::kEquals:
-      o << " = ";
+      ss << " = ";
       break;
     case BinaryOperation::kNotEquals:
-      o << " != ";
+      ss << " != ";
       break;
     case BinaryOperation::kLessThan:
-      o << " < ";
+      ss << " < ";
       break;
     case BinaryOperation::kLessThanEquals:
-      o << " <= ";
+      ss << " <= ";
       break;
     case BinaryOperation::kGreaterThan:
-      o << " > ";
+      ss << " > ";
       break;
     case BinaryOperation::kGreaterThanEquals:
-      o << " >= ";
+      ss << " >= ";
       break;
     case BinaryOperation::kAnd:
-      o << " AND ";
+      ss << " AND ";
       break;
     case BinaryOperation::kOr:
-      o << " OR ";
+      ss << " OR ";
       break;
     case BinaryOperation::kXor:
-      o << " XOR ";
+      ss << " XOR ";
       break;
   }
-  right_->Dump(o);
+  ss << right_->ToString();
+  return ss.str();
 }
+
+void BinaryExpression::Dump(std::ostream& o) const { o << ToString(); }
 
 }  // namespace tinylamb

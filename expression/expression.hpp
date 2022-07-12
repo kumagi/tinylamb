@@ -10,6 +10,7 @@
 #include <string>
 #include <unordered_set>
 
+#include "type/column_name.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -35,11 +36,13 @@ class ExpressionBase {
   ExpressionBase& operator=(ExpressionBase&&) = delete;
   [[nodiscard]] virtual TypeTag Type() const = 0;
   [[nodiscard]] const ColumnValue& AsColumnValue() const;
+  [[nodiscard]] ColumnValue& AsColumnValue();
   [[nodiscard]] const BinaryExpression& AsBinaryExpression() const;
   [[nodiscard]] const ConstantValue& AsConstantValue() const;
-  [[nodiscard]] std::unordered_set<std::string> TouchedColumns() const;
+  [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const;
   [[nodiscard]] virtual Value Evaluate(const Row& row,
                                        const Schema& schema) const = 0;
+  [[nodiscard]] virtual std::string ToString() const = 0;
   virtual void Dump(std::ostream& o) const = 0;
   friend std::ostream& operator<<(std::ostream& o, const ExpressionBase& e) {
     e.Dump(o);
@@ -48,7 +51,8 @@ class ExpressionBase {
 };
 
 typedef std::shared_ptr<ExpressionBase> Expression;
-Expression ColumnValueExp(std::string_view col_name);
+Expression ColumnValueExp(const ColumnName& col_name);
+Expression ColumnValueExp(const std::string_view& col_name);
 Expression ConstantValueExp(const Value& v);
 Expression BinaryExpressionExp(Expression left, BinaryOperation op,
                                Expression right);

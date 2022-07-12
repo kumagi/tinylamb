@@ -138,14 +138,25 @@ Row& IndexScanIterator::operator*() {
 }
 
 void IndexScanIterator::Dump(std::ostream& o, int /*indent*/) const {
-  o << table_.GetSchema().Name() << ": {";
+  o << index_.sc_.name_ << " on " << table_.GetSchema().Name() << ": {";
   for (size_t i = 0; i < index_.sc_.key_.size(); ++i) {
     if (0 < i) {
       o << ", ";
     }
     o << index_.sc_.key_[i];
   }
-  o << "} [";
+  o << "},";
+  if (!index_.sc_.include_.empty()) {
+    o << " Include: {";
+    for (size_t i = 0; i < index_.sc_.include_.size(); ++i) {
+      if (0 < i) {
+        o << ", ";
+      }
+      o << index_.sc_.include_[i];
+    }
+    o << "},";
+  }
+  o << " [";
   if (begin_ == end_) {
     o << begin_;
   } else if (ascending_) {

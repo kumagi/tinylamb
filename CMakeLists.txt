@@ -52,7 +52,7 @@ add_library(libtinylamb
         database/page_storage.cpp index/index_schema.cpp
         database/transaction_context.cpp executor/insert.cpp
         executor/update.cpp plan/index_scan_plan.cpp executor/index_scan.cpp
-        executor/index_only_scan.cpp)
+        executor/index_only_scan.cpp type/column_name.cpp query/query_data.cpp expression/named_expression.cpp common/converter.hpp)
 
 add_library(libtinylamb_test_util
         STATIC
@@ -129,6 +129,7 @@ add_simple_test(expression/expression_test.cpp)
 add_simple_test(executor/executor_test.cpp)
 add_simple_test(database/catalog_test.cpp)
 add_simple_test(plan/plan_test.cpp)
+add_simple_test(type/column_name_test.cpp)
 add_simple_test(plan/optimizer_test.cpp)
 add_simple_test(table/table_statistics_test.cpp)
 

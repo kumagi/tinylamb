@@ -16,12 +16,19 @@ namespace tinylamb {
 
 class SelectionPlan : public PlanBase {
  public:
-  SelectionPlan(Plan src, Expression exp, const TableStatistics& stat)
-      : src_(std::move(src)), exp_(exp), stats_(stat) {}
-
+  SelectionPlan(Plan src, Expression exp, TableStatistics stat)
+      : src_(std::move(src)), exp_(std::move(exp)), stats_(std::move(stat)) {}
+  SelectionPlan(const SelectionPlan&) = delete;
+  SelectionPlan(SelectionPlan&&) = delete;
+  SelectionPlan& operator=(const SelectionPlan&) = delete;
+  SelectionPlan& operator=(SelectionPlan&&) = delete;
   ~SelectionPlan() override = default;
+
   Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] const Schema& GetSchema() const override;
+  [[nodiscard]] const TableStatistics& GetStats() const override {
+    return stats_;
+  }
 
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
@@ -30,7 +37,7 @@ class SelectionPlan : public PlanBase {
  private:
   Plan src_;
   Expression exp_;
-  const TableStatistics& stats_;
+  TableStatistics stats_;
 };
 
 }  // namespace tinylamb

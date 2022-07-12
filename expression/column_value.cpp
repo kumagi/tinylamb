@@ -13,11 +13,11 @@ namespace tinylamb {
 Value ColumnValue::Evaluate(const Row& row, const Schema& schema) const {
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     const Column& c = schema.GetColumn(i);
-    if (c.Name() == col_name_) {
+    if (c.Name().name == col_name_.name) {
       return row[i];
     }
   }
-  throw std::runtime_error("column " + col_name_ + " not found");
+  throw std::runtime_error("column " + col_name_.ToString() + " not found");
 }
 
 void ColumnValue::Dump(std::ostream& o) const { o << col_name_; }

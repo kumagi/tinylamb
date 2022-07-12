@@ -11,12 +11,18 @@
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
+#include "type/column_name.hpp"
 
 namespace tinylamb {
 
 const ColumnValue& ExpressionBase::AsColumnValue() const {
   assert(Type() == TypeTag::kColumnValue);
   return reinterpret_cast<const ColumnValue&>(*this);
+}
+
+ColumnValue& ExpressionBase::AsColumnValue() {
+  assert(Type() == TypeTag::kColumnValue);
+  return reinterpret_cast<ColumnValue&>(*this);
 }
 
 const BinaryExpression& ExpressionBase::AsBinaryExpression() const {
@@ -29,8 +35,8 @@ const ConstantValue& ExpressionBase::AsConstantValue() const {
   return reinterpret_cast<const ConstantValue&>(*this);
 }
 
-std::unordered_set<std::string> ExpressionBase::TouchedColumns() const {
-  std::unordered_set<std::string> ret;
+std::unordered_set<ColumnName> ExpressionBase::TouchedColumns() const {
+  std::unordered_set<ColumnName> ret;
   switch (Type()) {
     case TypeTag::kBinaryExp: {
       const BinaryExpression& be = AsBinaryExpression();
@@ -40,7 +46,7 @@ std::unordered_set<std::string> ExpressionBase::TouchedColumns() const {
     }
     case TypeTag::kColumnValue: {
       const ColumnValue& cv = AsColumnValue();
-      ret.emplace(cv.ColumnName());
+      ret.emplace(cv.GetColumnName());
       break;
     }
     case TypeTag::kConstantValue:
@@ -49,8 +55,11 @@ std::unordered_set<std::string> ExpressionBase::TouchedColumns() const {
   return ret;
 }
 
-Expression ColumnValueExp(std::string_view col_name) {
+Expression ColumnValueExp(const ColumnName& col_name) {
   return std::make_shared<ColumnValue>(col_name);
+}
+Expression ColumnValueExp(const std::string_view& col_name) {
+  return std::make_shared<ColumnValue>(ColumnName(col_name));
 }
 
 Expression ConstantValueExp(const Value& v) {

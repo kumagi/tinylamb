@@ -36,7 +36,7 @@ Decoder& operator>>(Decoder& e, IndexSchema& idx) {
 }
 
 std::ostream& operator<<(std::ostream& o, const IndexSchema& rhs) {
-  o << rhs.name_ << " => [ Column{";
+  o << rhs.name_ << " => [ Column: {";
   for (size_t i = 0; i < rhs.key_.size(); ++i) {
     if (0 < i) {
       o << ", ";
@@ -44,8 +44,8 @@ std::ostream& operator<<(std::ostream& o, const IndexSchema& rhs) {
     o << rhs.key_[i];
   }
   o << "}";
-  if (rhs.include_.empty()) {
-    o << "Include{";
+  if (!rhs.include_.empty()) {
+    o << " Include: {";
     for (size_t i = 0; i < rhs.include_.size(); ++i) {
       if (0 < i) {
         o << ", ";

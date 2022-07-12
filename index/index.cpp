@@ -16,7 +16,7 @@ std::string Index::GenerateKey(const Row& row) const {
   return sc_.GenerateKey(row);
 }
 
-std::unordered_set<slot_t> Index::CoeveredColumns() const {
+std::unordered_set<slot_t> Index::CoveredColumns() const {
   std::unordered_set<slot_t> ret;
   for (const auto& k : sc_.key_) {
     ret.emplace(k);

@@ -17,8 +17,7 @@ class IndexOnlyScanPlan : public PlanBase {
  public:
   IndexOnlyScanPlan(const Table& table, const Index& index,
                     const TableStatistics& ts, const Value& begin,
-                    const Value& end, bool ascending, Expression where,
-                    std::vector<NamedExpression> select);
+                    const Value& end, bool ascending, Expression where);
   IndexOnlyScanPlan(const IndexOnlyScanPlan&) = delete;
   IndexOnlyScanPlan(IndexOnlyScanPlan&&) = delete;
   IndexOnlyScanPlan& operator=(const IndexOnlyScanPlan&) = delete;
@@ -30,6 +29,9 @@ class IndexOnlyScanPlan : public PlanBase {
   [[nodiscard]] const Schema& GetSchema() const override {
     return output_schema_;
   }
+  [[nodiscard]] const TableStatistics& GetStats() const override {
+    return stats_;
+  }
 
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
@@ -39,7 +41,7 @@ class IndexOnlyScanPlan : public PlanBase {
   [[nodiscard]] Schema OutputSchema() const;
   const Table& table_;
   const Index& index_;
-  const TableStatistics& stats_;
+  TableStatistics stats_;
   Value begin_;
   Value end_;
   bool ascending_;

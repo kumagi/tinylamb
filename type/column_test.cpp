@@ -9,19 +9,21 @@
 namespace tinylamb {
 
 TEST(ColumnTest, Construct) {
-  Column c("test_column", ValueType::kInt64);
-  Column d("next_column", ValueType::kVarChar, Constraint(Constraint::kUnique));
+  Column c(ColumnName("test_column"), ValueType::kInt64);
+  Column d(ColumnName("next_column"), ValueType::kVarChar,
+           Constraint(Constraint::kUnique));
 }
 
 TEST(ColumnTest, SerializeDeserialize) {
-  SerializeDeserializeTest(Column("test_column", ValueType::kInt64));
-  SerializeDeserializeTest(Column("next_column", ValueType::kDouble,
+  SerializeDeserializeTest(
+      Column(ColumnName("test_column"), ValueType::kInt64));
+  SerializeDeserializeTest(Column(ColumnName("next_column"), ValueType::kDouble,
                                   Constraint(Constraint::kUnique)));
 }
 
 TEST(ColumnTest, Dump) {
-  LOG(INFO) << Column("test_column", ValueType::kInt64);
-  LOG(ERROR) << Column("next_column", ValueType::kDouble,
+  LOG(INFO) << Column(ColumnName("test_column"), ValueType::kInt64);
+  LOG(ERROR) << Column(ColumnName("next_column"), ValueType::kDouble,
                        Constraint(Constraint::kUnique));
 }
 

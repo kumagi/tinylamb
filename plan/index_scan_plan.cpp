@@ -21,7 +21,7 @@ IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
                              const Value& end, bool ascending, Expression where)
     : table_(table),
       index_(index),
-      stats_(ts),
+      stats_(ts.TransformBy(index.sc_.key_[0], begin, end)),
       begin_(begin),
       end_(end),
       ascending_(ascending),

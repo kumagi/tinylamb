@@ -26,6 +26,7 @@ class IndexScan : public ExecutorBase {
   IndexScan& operator=(const IndexScan&) = delete;
   IndexScan& operator=(IndexScan&&) = delete;
   ~IndexScan() override = default;
+
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
 

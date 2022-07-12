@@ -27,6 +27,9 @@ class IndexScanPlan : public PlanBase {
   Executor EmitExecutor(TransactionContext& txn) const override;
 
   [[nodiscard]] const Schema& GetSchema() const override;
+  [[nodiscard]] const TableStatistics& GetStats() const override {
+    return stats_;
+  }
 
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
@@ -35,7 +38,7 @@ class IndexScanPlan : public PlanBase {
  private:
   const Table& table_;
   const Index& index_;
-  const TableStatistics& stats_;
+  TableStatistics stats_;
   Value begin_;
   Value end_;
   bool ascending_;

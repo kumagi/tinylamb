@@ -29,6 +29,11 @@ class LogStream {
   LogStream() = default;  // Only LogMessage can construct it.
 
  public:
+  LogStream(const LogStream&) = delete;
+  LogStream(LogStream&&) = delete;
+  LogStream& operator=(const LogStream&) = delete;
+  LogStream& operator=(LogStream&&) = delete;
+
   template <int N>
   LogStream& operator<<(const std::array<char, N>& rhs) {
     message_ << rhs.data();

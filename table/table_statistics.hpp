@@ -5,6 +5,7 @@
 #ifndef TINYLAMB_TABLE_STATISTICS_HPP
 #define TINYLAMB_TABLE_STATISTICS_HPP
 
+#include <cmath>
 #include <vector>
 
 #include "expression/expression.hpp"
@@ -32,6 +33,12 @@ struct IntegerColumnStats {
     min = std::min(min, sample.value.int_value);
     ++count;
   }
+  IntegerColumnStats& operator*=(double multiplier) {
+    count = std::floor(count * multiplier);
+    distinct = std::floor(distinct * multiplier);
+    return *this;
+  }
+  bool operator==(const IntegerColumnStats&) const = default;
   [[nodiscard]] double EstimateCount(int64_t from, int64_t to) const;
   friend Encoder& operator<<(Encoder& a, const IntegerColumnStats& sc);
   friend Decoder& operator>>(Decoder& a, IntegerColumnStats& sc);
@@ -55,6 +62,12 @@ struct VarcharColumnStats {
     }
     ++count;
   }
+  VarcharColumnStats& operator*=(double multiplier) {
+    count = std::floor(count * multiplier);
+    distinct = std::floor(distinct * multiplier);
+    return *this;
+  }
+  bool operator==(const VarcharColumnStats&) const = default;
   [[nodiscard]] double EstimateCount(std::string_view from,
                                      std::string_view to) const;
   friend Encoder& operator<<(Encoder& a, const VarcharColumnStats& sc);
@@ -72,6 +85,12 @@ struct DoubleColumnStats {
     min = std::min(min, sample.value.double_value);
     ++count;
   }
+  DoubleColumnStats& operator*=(double multiplier) {
+    count = std::floor(count * multiplier);
+    distinct = std::floor(distinct * multiplier);
+    return *this;
+  }
+  bool operator==(const DoubleColumnStats&) const = default;
   [[nodiscard]] double EstimateCount(double from, double to) const;
   friend Encoder& operator<<(Encoder& a, const DoubleColumnStats& sc);
   friend Decoder& operator>>(Decoder& a, DoubleColumnStats& sc);
@@ -80,6 +99,27 @@ struct DoubleColumnStats {
 
 struct ColumnStats {
   ColumnStats() : type(ValueType::kNull) {}
+  ColumnStats(const ColumnStats&) = default;
+  ColumnStats(ColumnStats&&) = default;
+  ColumnStats& operator=(const ColumnStats&) = default;
+  ColumnStats& operator=(ColumnStats&&) = default;
+  ~ColumnStats() = default;
+  bool operator==(const ColumnStats& o) const {
+    if (type != o.type) {
+      return false;
+    }
+    switch (type) {
+      case ValueType::kNull:
+        return true;
+      case ValueType::kInt64:
+        return stat.int_stats == o.stat.int_stats;
+      case ValueType::kVarChar:
+        return stat.varchar_stats == o.stat.varchar_stats;
+      case ValueType::kDouble:
+        return stat.double_stats == o.stat.double_stats;
+    }
+  }
+
   explicit ColumnStats(ValueType t) : type(t) {}
   union {
     IntegerColumnStats int_stats;
@@ -149,6 +189,23 @@ struct ColumnStats {
     }
   }
 
+  ColumnStats& operator*=(double multiplier) {
+    switch (type) {
+      case ValueType::kNull:
+        break;
+      case ValueType::kInt64:
+        stat.int_stats *= multiplier;
+        break;
+      case ValueType::kVarChar:
+        stat.varchar_stats *= multiplier;
+        break;
+      case ValueType::kDouble:
+        stat.double_stats *= multiplier;
+        break;
+    }
+    return *this;
+  }
+
   friend Encoder& operator<<(Encoder& a, const ColumnStats& sc);
   friend Decoder& operator>>(Decoder& a, ColumnStats& sc);
   friend std::ostream& operator<<(std::ostream& o, const ColumnStats& t);
@@ -158,6 +215,13 @@ struct ColumnStats {
 class TableStatistics {
  public:
   explicit TableStatistics(const Schema& sc);
+  TableStatistics(const TableStatistics&) = default;
+  TableStatistics(TableStatistics&&) = default;
+  TableStatistics& operator=(const TableStatistics&) = default;
+  TableStatistics& operator=(TableStatistics&&) = default;
+  bool operator==(const TableStatistics&) const = default;
+  ~TableStatistics() = default;
+
   Status Update(Transaction& txn, const Table& target);
   [[nodiscard]] double ReductionFactor(const Schema& sc,
                                        const Expression& predicate) const;
@@ -166,30 +230,59 @@ class TableStatistics {
   friend Decoder& operator>>(Decoder& d, TableStatistics& t);
   friend std::ostream& operator<<(std::ostream& o, const TableStatistics& t);
 
-  template <typename T>
-  [[nodiscard]] double EstimateCount(int col_idx, const T& from,
-                                     const T& to) const {
-    return stats_[col_idx].EstimateCount(from, to);
+  [[nodiscard]] size_t Count() const {
+    size_t ans = 0;
+    for (const auto& st : stats_) {
+      ans = std::max(ans, st.Count());
+    }
+    return ans;
   }
   [[nodiscard]] double EstimateCount(int col_idx, const Value& from,
                                      const Value& to) const {
     assert(from.type == to.type);
-    if (from.type == ValueType::kInt64) {
-      return stats_[col_idx].EstimateCount(from.value.int_value,
-                                           to.value.int_value);
-    }
-    if (from.type == ValueType::kVarChar) {
-      return stats_[col_idx].EstimateCount(from.value.varchar_value,
-                                           to.value.varchar_value);
-    }
-    if (from.type == ValueType::kDouble) {
-      return stats_[col_idx].EstimateCount(from.value.double_value,
-                                           to.value.double_value);
+    switch (from.type) {
+      case ValueType::kNull:
+        LOG(FATAL) << "null value estimation is not implemented yet";
+        break;
+      case ValueType::kInt64:
+        return stats_[col_idx].EstimateCount(from.value.int_value,
+                                             to.value.int_value);
+      case ValueType::kVarChar:
+        return stats_[col_idx].EstimateCount(from.value.varchar_value,
+                                             to.value.varchar_value);
+      case ValueType::kDouble:
+        return stats_[col_idx].EstimateCount(from.value.double_value,
+                                             to.value.double_value);
     }
     abort();
   }
 
-  size_t row_count_;
+  [[nodiscard]] TableStatistics TransformBy(int col_idx, const Value& from,
+                                            const Value& to) const {
+    TableStatistics ret(*this);
+    double multiplier = EstimateCount(col_idx, from, to);
+    for (auto& st : ret.stats_) {
+      st *= multiplier / st.Count();
+    }
+    return ret;
+  }
+
+  void Concat(const TableStatistics& rhs) {
+    stats_.reserve(stats_.size() + rhs.stats_.size());
+    for (const auto& s : rhs.stats_) {
+      stats_.emplace_back(s);
+    }
+  }
+
+  TableStatistics operator*(size_t multiplier) const {
+    TableStatistics ans(*this);
+    for (auto& st : ans.stats_) {
+      st *= multiplier;
+    }
+    return ans;
+  }
+
+ private:
   std::vector<ColumnStats> stats_;
 };
 

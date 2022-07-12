@@ -45,6 +45,7 @@ enum class Status : uint8_t {
   kNotExists,
   kNotImplemented,
   kTooBigData,
+  kAmbiguousQuery,
 };
 
 enum class BinaryOperation {

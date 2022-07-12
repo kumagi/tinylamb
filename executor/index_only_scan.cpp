@@ -68,7 +68,7 @@ bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
 }
 
 void IndexOnlyScan::Dump(std::ostream& o, int /*indent*/) const {
-  o << "IndexOnlyScan: " << iter_ << " where " << *cond_;
+  o << "IndexOnlyScan: " << iter_ << " WHERE " << *cond_;
 }
 
 }  // namespace tinylamb

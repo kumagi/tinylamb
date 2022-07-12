@@ -7,19 +7,22 @@
 
 #include <memory>
 
+#include "common/status_or.hpp"
 #include "executor/executor_base.hpp"
 #include "query/query_data.hpp"
 
 namespace tinylamb {
 class ExecutorBase;
 class TransactionContext;
+class PlanBase;
+typedef std::shared_ptr<PlanBase> Plan;
 
 class Optimizer {
  public:
   explicit Optimizer() = default;
 
-  static Status Optimize(const QueryData& query, TransactionContext& ctx,
-                         Schema& schema, Executor& exec);
+  static StatusOr<Plan> Optimize(const QueryData& query,
+                                 TransactionContext& ctx);
 };
 
 }  // namespace tinylamb

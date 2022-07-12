@@ -19,16 +19,14 @@ namespace tinylamb {
 IndexOnlyScanPlan::IndexOnlyScanPlan(const Table& table, const Index& index,
                                      const TableStatistics& ts,
                                      const Value& begin, const Value& end,
-                                     bool ascending, Expression where,
-                                     std::vector<NamedExpression> select)
+                                     bool ascending, Expression where)
     : table_(table),
       index_(index),
-      stats_(ts),
+      stats_(ts.TransformBy(index.sc_.key_[0], begin, end)),
       begin_(begin),
       end_(end),
       ascending_(ascending),
       where_(std::move(where)),
-      select_(std::move(select)),
       output_schema_(OutputSchema()) {}
 
 Schema IndexOnlyScanPlan::OutputSchema() const {
@@ -58,7 +56,7 @@ size_t IndexOnlyScanPlan::EmitRowCount() const {
 }
 
 void IndexOnlyScanPlan::Dump(std::ostream& o, int /*indent*/) const {
-  o << "IndexOnlyScan: " << table_.GetSchema().Name()
+  o << "IndexOnlyScan: " << table_.GetSchema().Name() << " with " << index_
     << " (estimated cost: " << AccessRowCount() << ")";
 }
 
