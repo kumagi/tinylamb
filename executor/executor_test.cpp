@@ -8,18 +8,19 @@
 #include "database/relation_storage.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/hash_join.hpp"
+#include "executor/index_join.hpp"
+#include "executor/index_scan.hpp"
 #include "executor/insert.hpp"
 #include "executor/projection.hpp"
 #include "executor/selection.hpp"
+#include "executor/update.hpp"
 #include "expression/constant_value.hpp"
 #include "gtest/gtest.h"
 #include "index_only_scan.hpp"
-#include "index_scan.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
-#include "update.hpp"
 
 namespace tinylamb {
 
@@ -34,7 +35,7 @@ class ExecutorTest : public ::testing::Test {
   }
 
   void SetUp() override {
-    prefix_ = "table_test-" + RandomString();
+    prefix_ = "executor_test-" + RandomString();
     Recover();
     Schema schema{
         kTableName,
@@ -60,6 +61,12 @@ class ExecutorTest : public ::testing::Test {
       rs_->GetPageStorage()->LostAllPageForTest();
     }
     rs_ = std::make_unique<RelationStorage>(prefix_);
+  }
+
+  void TearDown() override {
+    std::remove(rs_->GetPageStorage()->DBName().c_str());
+    std::remove(rs_->GetPageStorage()->LogName().c_str());
+    std::remove(rs_->GetPageStorage()->MasterRecordName().c_str());
   }
 
   std::string prefix_;
@@ -234,30 +241,147 @@ TEST_F(ExecutorTest, BasicJoin) {
               std::make_shared<FullScan>(ctx.txn_, right_tbl), {0});
   hj.Dump(std::cout, 0);
   std::cout << "\n";
-  std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2), Value(0),
-                                Value(9.2), Value("arise")}),
-                           Row({Value(3), Value("piyo"), Value(12.2), Value(3),
-                                Value(12.4), Value("ought")}),
-                           Row({Value(3), Value("piyo"), Value(12.2), Value(3),
-                                Value(99.9), Value("extra")}),
-                           Row({Value(1), Value("world"), Value(4.9), Value(1),
-                                Value(4.9), Value("probe")})});
+  std::unordered_set expected({Row({Value(0), Value("hello"), Value(1.2),
+                                    Value(0), Value(9.2), Value("arise")}),
+                               Row({Value(3), Value("piyo"), Value(12.2),
+                                    Value(3), Value(12.4), Value("ought")}),
+                               Row({Value(3), Value("piyo"), Value(12.2),
+                                    Value(3), Value(99.9), Value("extra")}),
+                               Row({Value(1), Value("world"), Value(4.9),
+                                    Value(1), Value(4.9), Value("probe")})});
 
   Row got;
   ASSERT_TRUE(hj.Next(&got, nullptr));
-  ASSERT_NE(rows.find(got), rows.end());
-  ASSERT_TRUE(rows.erase(got));
+  ASSERT_NE(expected.find(got), expected.end());
+  ASSERT_TRUE(expected.erase(got));
   ASSERT_TRUE(hj.Next(&got, nullptr));
-  ASSERT_NE(rows.find(got), rows.end());
-  ASSERT_TRUE(rows.erase(got));
+  ASSERT_NE(expected.find(got), expected.end());
+  ASSERT_TRUE(expected.erase(got));
   ASSERT_TRUE(hj.Next(&got, nullptr));
-  ASSERT_NE(rows.find(got), rows.end());
-  ASSERT_TRUE(rows.erase(got));
+  ASSERT_NE(expected.find(got), expected.end());
+  ASSERT_TRUE(expected.erase(got));
   ASSERT_TRUE(hj.Next(&got, nullptr));
-  ASSERT_NE(rows.find(got), rows.end());
-  ASSERT_TRUE(rows.erase(got));
+  ASSERT_NE(expected.find(got), expected.end());
+  ASSERT_TRUE(expected.erase(got));
   ASSERT_FALSE(hj.Next(&got, nullptr));
-  ASSERT_TRUE(rows.empty());
+  ASSERT_TRUE(expected.empty());
+}
+
+TEST_F(ExecutorTest, IndexJoin) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(ctx, Schema{"RightTable",
+                                   {Column("key", ValueType::kInt64),
+                                    Column("score", ValueType::kDouble),
+                                    Column("name", ValueType::kVarChar)}}));
+  BulkInsert(ctx.txn_, right_tbl,
+             {{Row({Value(1), Value(4.9), Value("right one")})},
+              {Row({Value(3), Value(12.4), Value("right three")})},
+              {Row({Value(3), Value(99.9), Value("right duplicated three")})},
+              {Row({Value(2), Value(99.9), Value("right two")})},
+              {Row({Value(232), Value(40.9), Value("right ignored")})},
+              {Row({Value(0), Value(9.2), Value("right zero")})}});
+
+  ASSERT_SUCCESS(rs_->CreateIndex(
+      ctx, "RightTable",
+      IndexSchema("RightIdx", {0}, {}, IndexMode::kNonUnique)));
+
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, reload_right,
+                        ctx.GetTable("RightTable"));
+  ASSERT_EQ(reload_right->IndexCount(), 1);
+
+  IndexJoin ij(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0},
+               *reload_right, reload_right->GetIndex(0), {0});
+  std::cout << ij << "\n";
+
+  std::unordered_set expected(
+      {Row({Value(0), Value("hello"), Value(1.2), Value(0), Value(9.2),
+            Value("right zero")}),
+       Row({Value(3), Value("piyo"), Value(12.2), Value(3), Value(12.4),
+            Value("right three")}),
+       Row({Value(3), Value("piyo"), Value(12.2), Value(3), Value(99.9),
+            Value("right duplicated three")}),
+       Row({Value(1), Value("world"), Value(4.9), Value(1), Value(4.9),
+            Value("right one")}),
+       Row({Value(2), Value("arise"), Value(4.14), Value(2), Value(99.9),
+            Value("right two")})});
+  Row got;
+
+  ASSERT_TRUE(ij.Next(&got, nullptr));
+  ASSERT_TRUE(expected.contains(got));
+  ASSERT_TRUE(expected.erase(got));
+  ASSERT_TRUE(ij.Next(&got, nullptr));
+  ASSERT_TRUE(expected.contains(got));
+  ASSERT_TRUE(expected.erase(got));
+  ASSERT_TRUE(ij.Next(&got, nullptr));
+  ASSERT_TRUE(expected.contains(got));
+  ASSERT_TRUE(expected.erase(got));
+  ASSERT_TRUE(ij.Next(&got, nullptr));
+  ASSERT_TRUE(expected.contains(got));
+  ASSERT_TRUE(expected.erase(got));
+  ASSERT_TRUE(ij.Next(&got, nullptr));
+  ASSERT_TRUE(expected.contains(got));
+  ASSERT_TRUE(expected.erase(got));
+  ASSERT_FALSE(ij.Next(&got, nullptr));
+  ASSERT_TRUE(expected.empty());
+}
+
+TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(ctx, Schema{"RightTable",
+                                   {Column("key", ValueType::kInt64),
+                                    Column("score", ValueType::kDouble),
+                                    Column("name", ValueType::kVarChar)}}));
+  /*
+               {{Row({Value(0), Value("hello"), Value(1.2)})},
+                {Row({Value(3), Value("piyo"), Value(12.2)})},
+                {Row({Value(1), Value("world"), Value(4.9)})},
+                {Row({Value(2), Value("arise"), Value(4.14)})}});
+                */
+  BulkInsert(ctx.txn_, right_tbl,
+             {{Row({Value(1), Value(4.9), Value("right one")})},
+              {Row({Value(3), Value(12.4), Value("right three")})},
+              {Row({Value(3), Value(99.9), Value("piyo")})},
+              {Row({Value(2), Value(12.3), Value("arise")})},
+              {Row({Value(232), Value(40.9), Value("right ignored")})},
+              {Row({Value(0), Value(9.2), Value("hello")})},
+              {Row({Value(0), Value(0.1), Value("build")})}});
+
+  ASSERT_SUCCESS(rs_->CreateIndex(
+      ctx, "RightTable",
+      IndexSchema("RightIdx", {0}, {}, IndexMode::kNonUnique)));
+
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, reload_right,
+                        ctx.GetTable("RightTable"));
+  ASSERT_EQ(reload_right->IndexCount(), 1);
+
+  IndexJoin ij(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0, 1},
+               *reload_right, reload_right->GetIndex(0), {0, 2});
+  std::cout << ij << "\n";
+
+  std::unordered_set expected({Row({Value(0), Value("hello"), Value(1.2),
+                                    Value(0), Value(9.2), Value("hello")}),
+                               Row({Value(3), Value("piyo"), Value(12.2),
+                                    Value(3), Value(99.9), Value("piyo")}),
+                               Row({Value(2), Value("arise"), Value(4.14),
+                                    Value(2), Value(12.3), Value("arise")})});
+  Row got;
+  ASSERT_TRUE(ij.Next(&got, nullptr));
+  ASSERT_TRUE(expected.contains(got));
+  ASSERT_TRUE(expected.erase(got));
+  ASSERT_TRUE(ij.Next(&got, nullptr));
+  ASSERT_TRUE(expected.contains(got));
+  ASSERT_TRUE(expected.erase(got));
+  ASSERT_TRUE(ij.Next(&got, nullptr));
+  ASSERT_TRUE(expected.contains(got));
+  ASSERT_TRUE(expected.erase(got));
+  ASSERT_FALSE(ij.Next(&got, nullptr));
+  ASSERT_TRUE(expected.empty());
 }
 
 TEST_F(ExecutorTest, Insert) {

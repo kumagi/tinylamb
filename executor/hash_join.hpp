@@ -17,17 +17,20 @@ namespace tinylamb {
 
 class HashJoin : public ExecutorBase {
  public:
-  HashJoin(const Executor& left, std::vector<slot_t> left_cols,
-           const Executor& right, std::vector<slot_t> right_cols);
-
+  HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
+           std::vector<slot_t> right_cols);
+  HashJoin(const HashJoin&) = delete;
+  HashJoin(HashJoin&&) = delete;
+  HashJoin& operator=(const HashJoin&) = delete;
+  HashJoin& operator=(HashJoin&&) = delete;
   ~HashJoin() override = default;
+
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:
   void BucketConstruct();
 
- private:
   Executor left_;
   std::vector<slot_t> left_cols_;
   Executor right_;

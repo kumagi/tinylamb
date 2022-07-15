@@ -29,11 +29,16 @@ class IndexSchema {
         key_(std::move(key)),
         include_(std::move(include)),
         mode_(mode) {}
+  IndexSchema(const IndexSchema&) = default;
+  IndexSchema(IndexSchema&&) = default;
+  IndexSchema& operator=(const IndexSchema&) = default;
+  IndexSchema& operator=(IndexSchema&&) = default;
+  bool operator==(const IndexSchema& rhs) const = default;
+
   [[nodiscard]] std::string GenerateKey(const Row& row) const;
   [[nodiscard]] bool IsUnique() const { return mode_ == IndexMode::kUnique; }
   friend Encoder& operator<<(Encoder& a, const IndexSchema& idx);
   friend Decoder& operator>>(Decoder& e, IndexSchema& idx);
-  bool operator==(const IndexSchema& rhs) const = default;
   friend std::ostream& operator<<(std::ostream& o, const IndexSchema& rhs);
 
   std::string name_;

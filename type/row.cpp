@@ -40,7 +40,7 @@ size_t Row::Deserialize(const char* src, const Schema& sc) {
   return src - original_offset;
 }
 
-[[nodiscard]] size_t Row::Size() const {
+size_t Row::Size() const {
   size_t ret = sizeof(uint16_t);
   for (const auto& v : values_) {
     ret += v.Size();
@@ -71,6 +71,9 @@ Row Row::Extract(const std::vector<slot_t>& elms) const {
   std::vector<Value> extracted;
   extracted.reserve(elms.size());
   for (size_t offset : elms) {
+    if (values_.size() <= offset) {
+      return {};
+    }
     extracted.push_back(values_[offset]);
   }
   return Row(extracted);
@@ -88,7 +91,9 @@ Row Row::operator+(const Row& rhs) const {
 std::ostream& operator<<(std::ostream& o, const Row& r) {
   o << "[";
   for (size_t i = 0; i < r.values_.size(); ++i) {
-    if (0 < i) o << ", ";
+    if (0 < i) {
+      o << ", ";
+    }
     o << r.values_[i];
   }
   o << "]";

@@ -110,11 +110,11 @@ class OptimizerTest : public ::testing::Test {
     std::remove(rs_->GetPageStorage()->MasterRecordName().c_str());
   }
 
-  Status DumpAll(const QueryData& qd) const {
+  [[nodiscard]] Status DumpAll(const QueryData& qd) const {
     TransactionContext ctx = rs_->BeginContext();
     QueryData qd_resolved = qd;
     qd_resolved.Rewrite(ctx);
-    std::cout << qd_resolved << "\n\n";
+    std::cout << qd << "\n\n";
     ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(qd_resolved, ctx));
     Executor exec = plan->EmitExecutor(ctx);
     std::cout << " --- Logical Plan ---\n" << *plan << "\n";
@@ -140,7 +140,7 @@ TEST_F(OptimizerTest, Simple) {
                           ConstantValueExp(Value(2))),
       {NamedExpression("c1"),
        NamedExpression("Column2Varchar", ColumnName("c2"))}};
-  DumpAll(qd);
+  ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, IndexScan) {
@@ -149,7 +149,7 @@ TEST_F(OptimizerTest, IndexScan) {
       BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
                           ConstantValueExp(Value("c2-32"))),
       {NamedExpression("c1"), NamedExpression("score", ColumnName("c3"))}};
-  DumpAll(qd);
+  ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, IndexOnlyScan) {
@@ -159,7 +159,7 @@ TEST_F(OptimizerTest, IndexOnlyScan) {
                           ConstantValueExp(Value("c2-32"))),
       {NamedExpression("name", ColumnName("c2")),
        NamedExpression("score", ColumnName("c3"))}};
-  DumpAll(qd);
+  ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, IndexOnlyScanInclude) {
@@ -176,7 +176,7 @@ TEST_F(OptimizerTest, IndexOnlyScanInclude) {
                 NamedExpression("score", ColumnName("d2")),
                 NamedExpression("name", ColumnName("d3")),
                 NamedExpression("const", ColumnName("d4"))}};
-  DumpAll(qd);
+  ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, Join) {
@@ -185,7 +185,7 @@ TEST_F(OptimizerTest, Join) {
       BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
                           ColumnValueExp("d1")),
       {NamedExpression("c2"), NamedExpression("d1"), NamedExpression("d3")}};
-  DumpAll(qd);
+  ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, IndexScanJoin) {
@@ -198,7 +198,7 @@ TEST_F(OptimizerTest, IndexScanJoin) {
           BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
                               ConstantValueExp(Value("c2-4")))),
       {NamedExpression("c2"), NamedExpression("d1"), NamedExpression("d3")}};
-  DumpAll(qd);
+  ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, ThreeJoin) {
@@ -218,7 +218,7 @@ TEST_F(OptimizerTest, ThreeJoin) {
            "e1+100",
            BinaryExpressionExp(ConstantValueExp(Value(100)),
                                BinaryOperation::kAdd, ColumnValueExp("e1")))}};
-  DumpAll(qd);
+  ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, JoinWhere) {
@@ -232,7 +232,7 @@ TEST_F(OptimizerTest, JoinWhere) {
                               ConstantValueExp(Value(2)))),
       {NamedExpression("c1"), NamedExpression("c2"), NamedExpression("d1"),
        NamedExpression("d2"), NamedExpression("d3")}};
-  DumpAll(qd);
+  ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, SameNameColumn) {
@@ -248,7 +248,20 @@ TEST_F(OptimizerTest, SameNameColumn) {
       {NamedExpression("Sc1.c1"), NamedExpression("Sc1.c2"),
        NamedExpression("c3"), NamedExpression("SC4.c1"),
        NamedExpression("Sc4.c2")}};
-  DumpAll(qd);
+  ASSERT_SUCCESS(DumpAll(qd));
 }
 
+TEST_F(OptimizerTest, Asterisk) {
+  QueryData qd{
+      {"Sc1", "Sc4"},
+      BinaryExpressionExp(BinaryExpressionExp(ColumnValueExp("Sc1.c1"),
+                                              BinaryOperation::kEquals,
+                                              ColumnValueExp("Sc4.c1")),
+                          BinaryOperation::kAnd,
+                          BinaryExpressionExp(ColumnValueExp("Sc4.c1"),
+                                              BinaryOperation::kEquals,
+                                              ConstantValueExp(Value(2)))),
+      {NamedExpression("*")}};
+  ASSERT_SUCCESS(DumpAll(qd));
+}
 }  // namespace tinylamb

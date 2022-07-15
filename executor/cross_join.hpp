@@ -19,9 +19,13 @@ struct Row;
 class CrossJoin : public ExecutorBase {
  public:
   CrossJoin(Executor left, Executor right);
+  CrossJoin(const CrossJoin&) = delete;
+  CrossJoin(CrossJoin&&) = delete;
+  CrossJoin& operator=(const CrossJoin&) = delete;
+  CrossJoin& operator=(CrossJoin&&) = delete;
+  ~CrossJoin() override = default;
 
   bool Next(Row* dst, RowPosition* rp) override;
-  ~CrossJoin() override = default;
 
   void Dump(std::ostream& o, int indent) const override;
 

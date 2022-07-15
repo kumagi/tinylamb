@@ -18,6 +18,11 @@ struct Row {
   Row() = default;
   Row(std::initializer_list<Value> v) : values_(v) {}
   explicit Row(std::vector<Value> v) : values_(std::move(v)) {}
+  Row(const Row&) = default;
+  Row(Row&&) = default;
+  Row& operator=(const Row&) = default;
+  Row& operator=(Row&&) = default;
+  ~Row() = default;
 
   void Add(const Value& v);
   Value& operator[](size_t i);
@@ -28,7 +33,7 @@ struct Row {
   [[nodiscard]] std::string EncodeMemcomparableFormat() const;
   void DecodeMemcomparableFormat(std::string_view src);
   void Clear() { values_.clear(); }
-  [[nodiscard]] bool IsValid() const { return values_.empty(); }
+  [[nodiscard]] bool IsValid() const { return !values_.empty(); }
   [[nodiscard]] Row Extract(const std::vector<slot_t>& elms) const;
   Row operator+(const Row& rhs) const;
 
