@@ -95,6 +95,7 @@ class PlanTest : public ::testing::Test {
                                                Value("ou"), Value(16)}))
                          .GetStatus());
     }
+    rs_->CreateIndex(ctx, "Sc2", IndexSchema("Sc2PK", {0}));
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
@@ -164,6 +165,17 @@ TEST_F(PlanTest, HashJoinPlan) {
   Plan prop(new ProductPlan(
       std::make_shared<FullScanPlan>(*tbl1, ts), {ColumnName("Sc1.c1")},
       std::make_shared<FullScanPlan>(*tbl2, ts), {ColumnName("Sc2.d1")}));
+  DumpAll(prop);
+}
+
+TEST_F(PlanTest, IndexJoinPlan) {
+  TableStatistics ts((Schema()));
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  Plan prop(new ProductPlan(std::make_shared<FullScanPlan>(*tbl1, ts),
+                            {ColumnName("Sc1.c1")}, *tbl2, tbl2->GetIndex(0),
+                            {ColumnName("Sc2.d1")}, ts));
   DumpAll(prop);
 }
 

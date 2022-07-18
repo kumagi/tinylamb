@@ -24,7 +24,7 @@ class IndexJoin : public ExecutorBase {
   IndexJoin(IndexJoin&&) = delete;
   IndexJoin& operator=(const IndexJoin&) = delete;
   IndexJoin& operator=(IndexJoin&&) = delete;
-  ~IndexJoin() = default;
+  ~IndexJoin() override = default;
 
   bool Next(Row* dst, RowPosition* /* rp */) override;
   void Dump(std::ostream& o, int indent) const override;

@@ -27,6 +27,9 @@ IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
       iter_(&bpt_, &txn,
             begin_.IsNull() ? "" : begin_.EncodeMemcomparableFormat(),
             end_.IsNull() ? "" : end_.EncodeMemcomparableFormat(), ascending) {
+  if (!iter_.IsValid()) {
+    return;
+  }
   keys_.DecodeMemcomparableFormat(iter_.Key());
   if (is_unique_) {
     auto val = Decode<Table::IndexValueType>(iter_.Value());

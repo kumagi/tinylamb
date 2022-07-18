@@ -4,6 +4,7 @@
 
 #include "b_plus_tree_iterator.hpp"
 
+#include "common/debug.hpp"
 #include "index/b_plus_tree.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
@@ -23,35 +24,33 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
       PageRef leaf = tree->LeftmostPage(*txn_);
       pid_ = leaf->PageID();
       idx_ = 0;
+      valid_ = true;
     } else {
       PageRef leaf = tree_->FindLeaf(*txn_, begin,
                                      txn->PageManager()->GetPage(tree_->root_));
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.Find(begin);
+      valid_ = 0 <= idx_ && idx_ < leaf->body.leaf_page.row_count_;
     }
   } else {
     if (end.empty()) {
       PageRef leaf = tree->RightmostPage(*txn_);
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.row_count_ - 1;
+      valid_ = true;
     } else {
       PageRef leaf = tree_->FindLeaf(*txn_, end,
                                      txn->PageManager()->GetPage(tree_->root_));
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.Find(end);
+      valid_ = 0 <= idx_ && idx_ < leaf->body.leaf_page.row_count_;
     }
   }
-  valid_ = true;
 }
 
 std::string BPlusTreeIterator::Key() const {
   return std::string(
       txn_->PageManager()->GetPage(pid_)->body.leaf_page.GetKey(idx_));
-}
-
-std::string BPlusTreeIterator::Value() {
-  return std::string(
-      txn_->PageManager()->GetPage(pid_)->body.leaf_page.GetValue(idx_));
 }
 
 std::string BPlusTreeIterator::Value() const {

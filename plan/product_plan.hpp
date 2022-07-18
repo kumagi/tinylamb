@@ -16,6 +16,10 @@ class ProductPlan : public PlanBase {
  public:
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
               std::vector<ColumnName> right_cols);
+  ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
+              const Table& right_tbl, const Index& idx,
+              std::vector<ColumnName> right_cols,
+              const TableStatistics& right_ts);
   ProductPlan(Plan left_src, Plan right_src);
   ProductPlan(const ProductPlan&) = delete;
   ProductPlan(ProductPlan&&) = delete;
@@ -38,6 +42,9 @@ class ProductPlan : public PlanBase {
   Plan right_src_;
   std::vector<ColumnName> left_cols_;
   std::vector<ColumnName> right_cols_;
+  const Table* right_tbl_;
+  const Index* right_idx_;
+  const TableStatistics* right_ts_;
   Schema output_schema_;
   TableStatistics stats_;
 };

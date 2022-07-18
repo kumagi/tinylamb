@@ -34,8 +34,8 @@ class BPlusTreeIteratorTest : public ::testing::Test {
     EXPECT_SUCCESS(txn.PreCommit());
   }
 
-  void Init(Transaction& txn, const char c, size_t key_len,
-            size_t value_len) const {
+  void Insert(Transaction& txn, const char c, size_t key_len,
+              size_t value_len) const {
     ASSERT_SUCCESS(
         bpt_->Insert(txn, std::string(key_len, c), std::string(value_len, c)));
   }
@@ -87,7 +87,7 @@ TEST_F(BPlusTreeIteratorTest, Construct) {}
 TEST_F(BPlusTreeIteratorTest, FullScan) {
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
-    Init(txn, c, 1000, 100);
+    Insert(txn, c, 1000, 100);
   }
   BPlusTreeIterator it = bpt_->Begin(txn);
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
@@ -102,7 +102,7 @@ TEST_F(BPlusTreeIteratorTest, FullScan) {
 TEST_F(BPlusTreeIteratorTest, RangeAcending) {
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
-    Init(txn, c, 1000, 100);
+    Insert(txn, c, 1000, 100);
   }
   BPlusTreeIterator it = bpt_->Begin(txn, "b", "d");
   EXPECT_TRUE(it.IsValid());
@@ -119,7 +119,7 @@ TEST_F(BPlusTreeIteratorTest, RangeAcending) {
 TEST_F(BPlusTreeIteratorTest, RangeDescending) {
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
-    Init(txn, c, 1000, 100);
+    Insert(txn, c, 1000, 100);
   }
   BPlusTreeIterator it = bpt_->Begin(txn, "", "d", false);
   EXPECT_EQ(it.Value(), std::string(100, 'd'));
@@ -142,7 +142,7 @@ TEST_F(BPlusTreeIteratorTest, RangeDescending) {
 TEST_F(BPlusTreeIteratorTest, RangeDescendingRightOpen) {
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
-    Init(txn, c, 1000, 100);
+    Insert(txn, c, 1000, 100);
   }
   BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);
   EXPECT_EQ(it.Value(), std::string(100, 'g'));
@@ -177,7 +177,7 @@ TEST_F(BPlusTreeIteratorTest, RangeDescendingRightOpen) {
 TEST_F(BPlusTreeIteratorTest, FullScanMultiLeaf) {
   auto txn = tm_->Begin();
   for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
-    Init(txn, c, 1000, 10000);
+    Insert(txn, c, 1000, 10000);
   }
   BPlusTreeIterator it = bpt_->Begin(txn);
   for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
@@ -193,7 +193,7 @@ TEST_F(BPlusTreeIteratorTest, FullScanMultiLeafRecovery) {
   {
     auto txn = tm_->Begin();
     for (const auto& c : {'1', '2', '3', '4', '5', '6', '7'}) {
-      Init(txn, c, 1000, 10000);
+      Insert(txn, c, 1000, 10000);
     }
     txn.PreCommit();
   }
@@ -216,7 +216,7 @@ TEST_F(BPlusTreeIteratorTest, FullScanReverse) {
   auto txn = tm_->Begin();
   for (const auto& c :
        {'k', 'j', 'i', 'h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
-    Init(txn, c, 10000, 2000);
+    Insert(txn, c, 10000, 2000);
   }
   BPlusTreeIterator it = bpt_->Begin(txn);
   for (const auto& c :
@@ -233,7 +233,7 @@ TEST_F(BPlusTreeIteratorTest, EndOpenFullScanReverse) {
   auto txn = tm_->Begin();
   for (const auto& c :
        {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'}) {
-    Init(txn, c, 10000, 2000);
+    Insert(txn, c, 10000, 2000);
   }
   BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);
   for (const auto& c :

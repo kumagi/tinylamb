@@ -7,8 +7,11 @@
 #include <iostream>
 #include <utility>
 
+#include "database/transaction_context.hpp"
 #include "executor/cross_join.hpp"
 #include "executor/hash_join.hpp"
+#include "executor/index_join.hpp"
+#include "table/table.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -33,24 +36,47 @@ TableStatistics HashJoinStats(const TableStatistics& left,
 
 }  // namespace
 
+// For Hash Join.
 ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
                          Plan right_src, std::vector<ColumnName> right_cols)
     : left_src_(std::move(left_src)),
       right_src_(std::move(right_src)),
       left_cols_(std::move(left_cols)),
       right_cols_(std::move(right_cols)),
+      right_tbl_(nullptr),
+      right_idx_(nullptr),
+      right_ts_(nullptr),
       output_schema_(left_src_->GetSchema() + right_src_->GetSchema()),
       stats_(HashJoinStats(left_src_->GetStats(), left_cols_,
                            right_src_->GetStats(), right_cols_)) {}
 
+// For Index Join.
+ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
+                         const Table& right_tbl, const Index& idx,
+                         std::vector<ColumnName> right_cols,
+                         const TableStatistics& right_ts)
+    : left_src_(std::move(left_src)),
+      left_cols_(std::move(left_cols)),
+      right_cols_(std::move(right_cols)),
+      right_tbl_(&right_tbl),
+      right_idx_(&idx),
+      right_ts_(&right_ts),
+      output_schema_(left_src_->GetSchema() + right_tbl_->GetSchema()),
+      stats_(HashJoinStats(left_src_->GetStats(), left_cols_, *right_ts_,
+                           right_cols_)) {}
+
+// For Cross Join.
 ProductPlan::ProductPlan(Plan left_src, Plan right_src)
     : left_src_(std::move(left_src)),
       right_src_(std::move(right_src)),
+      right_tbl_(nullptr),
+      right_idx_(nullptr),
+      right_ts_(nullptr),
       output_schema_(left_src_->GetSchema() + right_src_->GetSchema()),
       stats_(CrossJoinStats(left_src_->GetStats(), right_src_->GetStats())) {}
 
 Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
-  if (left_cols_.empty() && right_cols_.empty()) {
+  if (left_cols_.empty() && right_cols_.empty()) {  // Cross Join
     return std::make_shared<CrossJoin>(left_src_->EmitExecutor(ctx),
                                        right_src_->EmitExecutor(ctx));
   }
@@ -71,7 +97,9 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
 
     // Build right offsets.
     left.reserve(right_cols_.size());
-    const Schema& right_schema = right_src_->GetSchema();
+    const Schema& right_schema = right_tbl_ != nullptr
+                                     ? right_tbl_->GetSchema()
+                                     : right_src_->GetSchema();
     for (const auto& col : right_cols_) {
       for (size_t i = 0; i < right_schema.ColumnCount(); ++i) {
         const Column c = right_schema.GetColumn(i);
@@ -80,6 +108,11 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
         }
       }
     }
+  }
+  if (right_tbl_ != nullptr) {
+    // IndexJoin.
+    return std::make_shared<IndexJoin>(ctx.txn_, left_src_->EmitExecutor(ctx),
+                                       left, *right_tbl_, *right_idx_, right);
   }
   return std::make_shared<HashJoin>(left_src_->EmitExecutor(ctx), left,
                                     right_src_->EmitExecutor(ctx), right);
@@ -99,8 +132,11 @@ size_t ProductPlan::AccessRowCount() const {
 }
 
 size_t ProductPlan::EmitRowCount() const {
-  if (left_cols_.empty() && right_cols_.empty()) {
+  if (left_cols_.empty() && right_cols_.empty()) {  // CrossJoin.
     return left_src_->EmitRowCount() * right_src_->EmitRowCount();
+  }
+  if (right_tbl_ != nullptr) {  // IndexJoin
+    return std::min(left_src_->EmitRowCount(), right_ts_->Count());
   }
   return std::min(left_src_->EmitRowCount(), right_src_->EmitRowCount());
 }
@@ -130,7 +166,13 @@ void ProductPlan::Dump(std::ostream& o, int indent) const {
   o << "\n" << Indent(indent + 2);
   left_src_->Dump(o, indent + 2);
   o << "\n" << Indent(indent + 2);
-  right_src_->Dump(o, indent + 2);
+  if (right_tbl_ == nullptr) {
+    // CrossJoin or HashJoin.
+    right_src_->Dump(o, indent + 2);
+  } else {
+    // IndexJoin.
+    right_idx_->Dump(o);
+  }
 }
 
 }  // namespace tinylamb

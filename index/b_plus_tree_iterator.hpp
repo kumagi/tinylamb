@@ -20,7 +20,6 @@ class BPlusTreeIterator {
                     std::string_view begin = "", std::string_view end = "",
                     bool ascending = true);
   [[nodiscard]] std::string Key() const;
-  std::string Value();
   [[nodiscard]] std::string Value() const;
   BPlusTreeIterator& operator++();
   BPlusTreeIterator& operator--();

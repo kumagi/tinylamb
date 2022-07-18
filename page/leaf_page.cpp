@@ -6,6 +6,7 @@
 
 #include <cstring>
 
+#include "common/debug.hpp"
 #include "common/serdes.hpp"
 #include "page/page.hpp"
 #include "transaction/transaction.hpp"
@@ -140,7 +141,8 @@ void LeafPage::DeleteImpl(std::string_view key) {
   --row_count_;
 }
 
-StatusOr<std::string_view> LeafPage::Read(page_id_t, Transaction&,
+StatusOr<std::string_view> LeafPage::Read(page_id_t /*unused*/,
+                                          Transaction& /*unused*/,
                                           slot_t slot) const {
   if (row_count_ <= slot) {
     return Status::kNotExists;
@@ -148,7 +150,8 @@ StatusOr<std::string_view> LeafPage::Read(page_id_t, Transaction&,
   return GetValue(slot);
 }
 
-StatusOr<std::string_view> LeafPage::ReadKey(page_id_t, Transaction&,
+StatusOr<std::string_view> LeafPage::ReadKey(page_id_t /*unused*/,
+                                             Transaction& /*unused*/,
                                              slot_t slot) const {
   if (row_count_ <= slot) {
     return Status::kNotExists;
@@ -156,7 +159,8 @@ StatusOr<std::string_view> LeafPage::ReadKey(page_id_t, Transaction&,
   return GetKey(slot);
 }
 
-StatusOr<std::string_view> LeafPage::Read(page_id_t, Transaction&,
+StatusOr<std::string_view> LeafPage::Read(page_id_t /*unused*/,
+                                          Transaction& /*unused*/,
                                           std::string_view key) const {
   size_t pos = Find(key);
   if (pos < row_count_ && GetKey(pos) == key) {
@@ -165,14 +169,14 @@ StatusOr<std::string_view> LeafPage::Read(page_id_t, Transaction&,
   return Status::kNotExists;
 }
 
-StatusOr<std::string_view> LeafPage::LowestKey(Transaction&) const {
+StatusOr<std::string_view> LeafPage::LowestKey(Transaction& /*unused*/) const {
   if (row_count_ == 0) {
     return Status::kNotExists;
   }
   return GetKey(0);
 }
 
-StatusOr<std::string_view> LeafPage::HighestKey(Transaction&) const {
+StatusOr<std::string_view> LeafPage::HighestKey(Transaction& /*unused*/) const {
   if (row_count_ == 0) {
     return Status::kNotExists;
   }
@@ -284,7 +288,9 @@ void LeafPage::Dump(std::ostream& o, int indent) const {
 
 bool LeafPage::SanityCheckForTest() const {
   for (slot_t i = 0; i < row_count_ - 1; ++i) {
-    if (GetKey(i + 1) < GetKey(i)) return false;
+    if (GetKey(i + 1) < GetKey(i)) {
+      return false;
+    }
   }
   return true;
 }
