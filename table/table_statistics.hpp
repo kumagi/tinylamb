@@ -230,13 +230,15 @@ class TableStatistics {
   friend Decoder& operator>>(Decoder& d, TableStatistics& t);
   friend std::ostream& operator<<(std::ostream& o, const TableStatistics& t);
 
-  [[nodiscard]] size_t Count() const {
+  [[nodiscard]] size_t Rows() const {
     size_t ans = 0;
     for (const auto& st : stats_) {
       ans = std::max(ans, st.Count());
     }
     return ans;
   }
+
+  [[nodiscard]] size_t Columns() const { return stats_.size(); }
   [[nodiscard]] double EstimateCount(int col_idx, const Value& from,
                                      const Value& to) const {
     assert(from.type == to.type);

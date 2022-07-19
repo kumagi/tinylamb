@@ -277,17 +277,12 @@ bool ContainsAny(const std::unordered_set<std::string>& left,
   });
 }
 
-Plan BetterPlan(Plan a, Plan b) {
-  if (a->AccessRowCount() < b->AccessRowCount()) {
-    return a;
-  }
-  return b;
-}
-
-Plan BestJoin(const Expression& where, const Plan& left, const Plan& right) {
+Plan BestJoin(TransactionContext& ctx, const Expression& where,
+              const Plan& left, const Plan& right) {
   std::vector<std::pair<ColumnName, ColumnName>> equals;
   std::stack<Expression> exp;
   exp.push(where);
+  std::vector<Expression> related_exp;
   while (!exp.empty()) {
     const Expression here = exp.top();
     exp.pop();
@@ -302,9 +297,11 @@ Plan BestJoin(const Expression& where, const Plan& left, const Plan& right) {
           if (0 <= left->GetSchema().Offset(cv_l.GetColumnName()) &&
               0 <= right->GetSchema().Offset(cv_r.GetColumnName())) {
             equals.emplace_back(cv_l.GetColumnName(), cv_r.GetColumnName());
+            related_exp.push_back(here);
           } else if (0 <= right->GetSchema().Offset(cv_l.GetColumnName()) &&
                      0 <= left->GetSchema().Offset(cv_r.GetColumnName())) {
             equals.emplace_back(cv_r.GetColumnName(), cv_l.GetColumnName());
+            related_exp.push_back(here);
           }
         }
         if (be.Op() == BinaryOperation::kAnd) {
@@ -319,6 +316,8 @@ Plan BestJoin(const Expression& where, const Plan& left, const Plan& right) {
         break;
     }
   }
+
+  std::vector<Plan> candidates;
   if (!equals.empty()) {
     std::vector<ColumnName> left_cols;
     std::vector<ColumnName> right_cols;
@@ -328,13 +327,48 @@ Plan BestJoin(const Expression& where, const Plan& left, const Plan& right) {
       left_cols.emplace_back(std::move(cn.first));
       right_cols.emplace_back(std::move(cn.second));
     }
-    return BetterPlan(
-        std::make_shared<ProductPlan>(left, left_cols, right, right_cols),
+    // HashJoin.
+    candidates.push_back(
+        std::make_shared<ProductPlan>(left, left_cols, right, right_cols));
+    candidates.push_back(
         std::make_shared<ProductPlan>(right, right_cols, left, left_cols));
+
+    // IndexJoin.
+    if (const Table* right_tbl = right->ScanSource()) {
+      for (size_t i = 0; i < right_tbl->IndexCount(); ++i) {
+        const Index& right_idx = right_tbl->GetIndex(i);
+        const Schema& right_schema = right_tbl->GetSchema();
+        ASSIGN_OR_CRASH(std::shared_ptr<TableStatistics>, stat,
+                        ctx.GetStats(right_tbl->GetSchema().Name()));
+        for (const auto& rcol : right_cols) {
+          if (rcol == right_schema.GetColumn(right_idx.sc_.key_[0]).Name()) {
+            candidates.push_back(std::make_shared<ProductPlan>(
+                left, left_cols, *right_tbl, right_idx, right_cols, *stat));
+          }
+        }
+      }
+    }
   }
-  Plan ans = std::make_shared<ProductPlan>(left, right);
-  return std::make_shared<SelectionPlan>(ans, where,
-                                         TableStatistics(ans->GetSchema()));
+  if (candidates.empty()) {
+    if (0 < related_exp.size()) {
+      Expression final_selection = related_exp.back();
+      related_exp.pop_back();
+      for (const auto& e : related_exp) {
+        final_selection =
+            BinaryExpressionExp(e, BinaryOperation::kAnd, final_selection);
+      }
+      Plan ans = std::make_shared<ProductPlan>(left, right);
+      candidates.push_back(std::make_shared<SelectionPlan>(ans, final_selection,
+                                                           ans->GetStats()));
+    } else {
+      candidates.push_back(std::make_shared<ProductPlan>(left, right));
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const Plan& a, const Plan& b) {
+              return a->AccessRowCount() < b->AccessRowCount();
+            });
+  return candidates[0];
 }
 
 }  // anonymous namespace
@@ -383,7 +417,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
         if (ContainsAny(base_table.first, join_table.first)) {
           continue;
         }
-        Plan best_join = BestJoin(query.where_, base_table.second.plan,
+        Plan best_join = BestJoin(ctx, query.where_, base_table.second.plan,
                                   join_table.second.plan);
         std::unordered_set<std::string> joined_tables =
             Union(base_table.first, join_table.first);

@@ -20,9 +20,9 @@ Executor FullScanPlan::EmitExecutor(TransactionContext& ctx) const {
 
 const Schema& FullScanPlan::GetSchema() const { return table_.GetSchema(); }
 
-size_t FullScanPlan::AccessRowCount() const { return stats_.Count(); }
+size_t FullScanPlan::AccessRowCount() const { return stats_.Rows(); }
 
-size_t FullScanPlan::EmitRowCount() const { return stats_.Count(); }
+size_t FullScanPlan::EmitRowCount() const { return stats_.Rows(); }
 
 void FullScanPlan::Dump(std::ostream& o, int /*indent*/) const {
   o << "FullScan: " << table_.GetSchema().Name()

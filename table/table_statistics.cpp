@@ -254,7 +254,9 @@ double TableStatistics::ReductionFactor(const Schema& sc,
         if (columns.find(lcv->GetColumnName()) != columns.end() &&
             columns.find(rcv->GetColumnName()) != columns.end()) {
           int offset_left = sc.Offset(lcv->GetColumnName());
+          assert(0 <= offset_left && offset_left < (int)stats_.size());
           int offset_right = sc.Offset(rcv->GetColumnName());
+          assert(0 <= offset_right && offset_right < (int)stats_.size());
           return std::min(static_cast<double>(stats_[offset_left].Distinct()),
                           static_cast<double>(stats_[offset_right].Distinct()));
         }
@@ -262,7 +264,9 @@ double TableStatistics::ReductionFactor(const Schema& sc,
       if (bo->Left()->Type() == TypeTag::kColumnValue) {
         const auto* lcv =
             reinterpret_cast<const ColumnValue*>(bo->Left().get());
+        LOG(WARN) << lcv->GetColumnName() << " in " << sc;
         int offset_left = sc.Offset(lcv->GetColumnName());
+        assert(0 <= offset_left && offset_left < (int)stats_.size());
         return static_cast<double>(stats_[offset_left].Distinct());
       }
       if (bo->Right()->Type() == TypeTag::kColumnValue) {
@@ -353,17 +357,17 @@ Decoder& operator>>(Decoder& d, DoubleColumnStats& s) {
   return d;
 }
 std::ostream& operator<<(std::ostream& o, const IntegerColumnStats& t) {
-  o << "Max: " << t.max << " Min: " << t.min << " Count:" << t.count
+  o << "Max: " << t.max << " Min: " << t.min << " Rows:" << t.count
     << " Distinct: " << t.distinct;
   return o;
 }
 std::ostream& operator<<(std::ostream& o, const VarcharColumnStats& t) {
-  o << "Max: " << t.max << " Min: " << t.min << " Count:" << t.count
+  o << "Max: " << t.max << " Min: " << t.min << " Rows:" << t.count
     << " Distinct: " << t.distinct;
   return o;
 }
 std::ostream& operator<<(std::ostream& o, const DoubleColumnStats& t) {
-  o << "Max: " << t.max << " Min: " << t.min << " Count:" << t.count
+  o << "Max: " << t.max << " Min: " << t.min << " Rows:" << t.count
     << " Distinct: " << t.distinct;
   return o;
 }
@@ -430,7 +434,7 @@ Decoder& operator>>(Decoder& d, TableStatistics& s) {
 }
 
 std::ostream& operator<<(std::ostream& o, const TableStatistics& t) {
-  o << "Rows: " << t.Count() << "\n";
+  o << "Rows: " << t.Rows() << "\n";
   for (const auto& stat : t.stats_) {
     o << stat << "\n";
   }

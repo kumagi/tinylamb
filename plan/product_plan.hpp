@@ -28,6 +28,8 @@ class ProductPlan : public PlanBase {
   ~ProductPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
+
+  [[nodiscard]] const Table* ScanSource() const override { return nullptr; };
   [[nodiscard]] const Schema& GetSchema() const override;
   [[nodiscard]] const TableStatistics& GetStats() const override {
     return stats_;

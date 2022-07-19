@@ -85,7 +85,7 @@ class PagePool {
 
   std::fstream src_;
 
-  // Count of allowed max pages entry in memory.
+  // Rows of allowed max pages entry in memory.
   size_t capacity_;
 
   // A list to detect least recently used page.

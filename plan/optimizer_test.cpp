@@ -83,6 +83,7 @@ class OptimizerTest : public ::testing::Test {
     IndexSchema idx_sc(kIndexName, {1, 2});
     ASSERT_SUCCESS(rs_->CreateIndex(ctx, "Sc1", IndexSchema("KeyIdx", {1, 2})));
     ASSERT_SUCCESS(rs_->CreateIndex(ctx, "Sc1", IndexSchema("Sc1PK", {0})));
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "Sc2", IndexSchema("Sc2PK", {0})));
     ASSERT_SUCCESS(rs_->CreateIndex(
         ctx, "Sc2",
         IndexSchema("NameIdx", {2, 3}, {0, 1}, IndexMode::kNonUnique)));
@@ -212,8 +213,8 @@ TEST_F(OptimizerTest, ThreeJoin) {
                               ColumnValueExp("e1"))),
 
       {NamedExpression("Sc1-c2", ColumnName("c2")),
-       NamedExpression("Sc2-e1", ColumnName("e1")),
-       NamedExpression("Sc3-d3", ColumnName("d3")),
+       NamedExpression("Sc2-d1", ColumnName("d1")),
+       NamedExpression("Sc3-e2", ColumnName("e2")),
        NamedExpression(
            "e1+100",
            BinaryExpressionExp(ConstantValueExp(Value(100)),

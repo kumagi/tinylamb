@@ -19,8 +19,8 @@ namespace {
 
 TableStatistics CrossJoinStats(const TableStatistics& left,
                                const TableStatistics& right) {
-  TableStatistics ans(left * right.Count());
-  ans.Concat(right * left.Count());
+  TableStatistics ans(left * right.Rows());
+  ans.Concat(right * left.Rows());
   return ans;
 }
 
@@ -30,7 +30,7 @@ TableStatistics HashJoinStats(const TableStatistics& left,
                               const std::vector<ColumnName>& right_cols) {
   TableStatistics ans(left);
   ans.Concat(right);
-  // TODO: get minimum of distinct of all join key columns.
+  size_t min_distinct = std::numeric_limits<size_t>::max();
   return ans;
 }
 
@@ -127,6 +127,10 @@ size_t ProductPlan::AccessRowCount() const {
     return left_src_->AccessRowCount() +
            (1 + left_src_->EmitRowCount() * right_src_->AccessRowCount());
   }
+  if (right_tbl_ != nullptr) {
+    // IndexJoin.
+    return left_src_->AccessRowCount() * 3;
+  }
   // Cost of hash join.
   return left_src_->AccessRowCount() + right_src_->AccessRowCount();
 }
@@ -136,7 +140,7 @@ size_t ProductPlan::EmitRowCount() const {
     return left_src_->EmitRowCount() * right_src_->EmitRowCount();
   }
   if (right_tbl_ != nullptr) {  // IndexJoin
-    return std::min(left_src_->EmitRowCount(), right_ts_->Count());
+    return std::min(left_src_->EmitRowCount(), right_ts_->Rows());
   }
   return std::min(left_src_->EmitRowCount(), right_src_->EmitRowCount());
 }
@@ -144,7 +148,7 @@ size_t ProductPlan::EmitRowCount() const {
 void ProductPlan::Dump(std::ostream& o, int indent) const {
   o << "Product: ";
   if (left_cols_.empty() && right_cols_.empty()) {
-    o << " Cross Join ";
+    o << "Cross Join ";
   } else {
     o << "left:{";
     for (size_t i = 0; i < left_cols_.size(); ++i) {

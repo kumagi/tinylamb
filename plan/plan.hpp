@@ -30,7 +30,8 @@ class PlanBase {
 
   virtual Executor EmitExecutor(TransactionContext& txn) const = 0;
 
-  virtual const TableStatistics& GetStats() const = 0;
+  [[nodiscard]] virtual const Table* ScanSource() const = 0;
+  [[nodiscard]] virtual const TableStatistics& GetStats() const = 0;
   [[nodiscard]] virtual const Schema& GetSchema() const = 0;
   [[nodiscard]] virtual size_t AccessRowCount() const = 0;
   [[nodiscard]] virtual size_t EmitRowCount() const = 0;
