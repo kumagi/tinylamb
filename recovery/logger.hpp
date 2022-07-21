@@ -24,7 +24,7 @@ class Logger {
 
   ~Logger();
 
-  lsn_t AddLog(const LogRecord& log);
+  lsn_t AddLog(std::string_view log);
 
   void Finish();
 

@@ -45,7 +45,7 @@ TEST_F(LoggerTest, Construct) {
 
 TEST_F(LoggerTest, AppendBegin) {
   LogRecord l(0xcafebabe, 0xdeadbeef, LogType::kBegin);
-  lsn_t lsn = l_->AddLog(l);
+  lsn_t lsn = l_->AddLog(l.Serialize());
   ASSERT_EQ(0, lsn);  // Inserted place must be the beginning of the log.
   WaitForCommit(0 + l.Size());
   EXPECT_EQ(std::filesystem::file_size(log_name_), l.Size());
@@ -57,7 +57,7 @@ TEST_F(LoggerTest, AppendMany) {
   for (int i = 0; i < 2048; ++i) {
     LogRecord l = LogRecord::InsertingLogRecord(
         0, 0, i, i * 2, RandomString((i * 31) % 800 + 1));
-    lsn = l_->AddLog(l) + l.Size();
+    lsn = l_->AddLog(l.Serialize()) + l.Size();
     size += l.Size();
   }
   WaitForCommit(lsn);

@@ -7,9 +7,8 @@ set(CMAKE_CXX_STANDARD 20)
 add_executable(tinylamb
         main.cpp
         )
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined,bounds,address")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined,bounds,address -fsanitize-address-use-after-scope")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize-address-use-after-scope")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -O2")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -ggdb -Wall -Wextra")
 
@@ -158,6 +157,7 @@ function(add_fuzzer_test file_path)
             )
 endfunction()
 
+add_fuzzer_test(recovery/logger_fuzzer.cpp)
 add_fuzzer_test(type/value_fuzzer.cpp)
 add_fuzzer_test(page/row_page_fuzzer.cpp)
 add_fuzzer_test(index/b_plus_tree_fuzzer.cpp)
@@ -182,6 +182,7 @@ function(add_fuzzer_test file_path)
             )
 endfunction()
 
+add_fuzzer_test(recovery/logger_fuzzer_replay.cpp)
 add_fuzzer_test(page/row_page_fuzzer_replay.cpp)
 add_fuzzer_test(index/b_plus_tree_fuzzer_replay.cpp)
 add_fuzzer_test(table/table_fuzzer_replay.cpp)

@@ -26,8 +26,7 @@ Logger::~Logger() {
   close(dst_);
 }
 
-lsn_t Logger::AddLog(const LogRecord& log) {
-  std::string data = log.Serialize();
+lsn_t Logger::AddLog(std::string_view data) {
   std::unique_lock lk{latch_};
 
   while (buffer_.size() - data.size() <= queued_lsn_ - persistent_lsn_) {
