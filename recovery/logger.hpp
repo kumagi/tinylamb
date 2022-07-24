@@ -15,39 +15,35 @@
 
 namespace tinylamb {
 
-struct LogRecord;
-
-class Logger {
+class Logger final {
  public:
   explicit Logger(std::string_view filename, size_t buffer_size = 1024 * 1024,
-                  size_t every_ms = 20);
-
+                  size_t every_ms = 1);
+  Logger(const Logger&) = delete;
+  Logger(Logger&&) = delete;
+  Logger& operator=(const Logger&) = delete;
+  Logger& operator=(Logger&&) = delete;
   ~Logger();
-
-  lsn_t AddLog(std::string_view log);
 
   void Finish();
 
-  lsn_t CommittedLSN() const;
+  [[nodiscard]] lsn_t CommittedLSN() const;
+
+  lsn_t AddLog(std::string_view payload);
 
  private:
   void LoggerWork();
 
-  [[nodiscard]] size_t RestSize() const;
-
- private:
-  mutable std::mutex latch_;
+  // This order of member is suggested by Clang-Tidy to minimize the padding.
+  std::atomic<bool> finish_ = false;
+  alignas(64) std::atomic<lsn_t> flushed_lsn_{0};
+  const size_t every_us_;
+  std::thread worker_;
   std::string buffer_;
   std::string filename_;
+  std::mutex enqueue_latch_;
+  alignas(64) std::atomic<lsn_t> buffered_lsn_{0};
   int dst_ = -1;
-  std::atomic<bool> finish_ = false;
-
-  const size_t every_ms_;
-  std::atomic<lsn_t> queued_lsn_{0};
-  std::atomic<lsn_t> persistent_lsn_{0};
-
-  std::condition_variable worker_wait_;
-  std::thread worker_;
 };
 
 }  // namespace tinylamb

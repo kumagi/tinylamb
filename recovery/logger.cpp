@@ -13,11 +13,11 @@
 namespace tinylamb {
 
 Logger::Logger(std::string_view filename, size_t buffer_size, size_t every_ms)
-    : buffer_(buffer_size, 0),
+    : every_us_(every_ms),
+      worker_(&Logger::LoggerWork, this),
+      buffer_(buffer_size, 0),
       filename_(filename),
-      dst_(open(filename_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0666)),
-      every_ms_(every_ms),
-      worker_(&Logger::LoggerWork, this) {
+      dst_(open(filename_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0666)) {
   memset(buffer_.data(), 0, buffer_size);
 }
 
@@ -26,88 +26,68 @@ Logger::~Logger() {
   close(dst_);
 }
 
-lsn_t Logger::AddLog(std::string_view data) {
-  std::unique_lock lk{latch_};
-
-  while (buffer_.size() - data.size() <= queued_lsn_ - persistent_lsn_) {
-    // Has no enough space in buffer, wait for worker.
-    worker_wait_.notify_all();
-    worker_wait_.wait_for(lk, std::chrono::milliseconds(1));
-  }
-
-  size_t memory_offset = queued_lsn_ % buffer_.size();
-  if (memory_offset + data.size() <= buffer_.size()) {
-    memcpy(buffer_.data() + memory_offset, data.data(), data.size());
-  } else {
-    // In case of buffer wrap-around.
-    const size_t fraction = buffer_.size() - memory_offset;
-    std::memcpy(buffer_.data() + memory_offset, data.data(), fraction);
-    std::memcpy(buffer_.data(), data.data() + fraction, data.size() - fraction);
-  }
-
-  // Move buffer pointer forward
-  queued_lsn_ += data.size();
-  if (buffer_.size() - RestSize() < buffer_.size() / 4) {
-    worker_wait_.notify_all();
-  }
-  return queued_lsn_.load() - data.size();
-}
-
 void Logger::Finish() {
   finish_ = true;
   worker_.join();
 }
 
 lsn_t Logger::CommittedLSN() const {
-  std::scoped_lock lk(latch_);
-  return persistent_lsn_.load(std::memory_order_release);
+  return flushed_lsn_.load(std::memory_order_release);
+}
+
+lsn_t Logger::AddLog(std::string_view payload) {
+  std::unique_lock enq_lk{enqueue_latch_};
+  const lsn_t lsn = buffered_lsn_.load(std::memory_order_relaxed);
+  while (!payload.empty()) {
+    const size_t buffered_lsn = buffered_lsn_.load(std::memory_order_seq_cst);
+    const size_t flushed_lsn = flushed_lsn_.load(std::memory_order_seq_cst);
+
+    if (buffered_lsn - flushed_lsn == buffer_.size()) {
+      // Has no space in the buffer, wait for worker.
+      std::this_thread::sleep_for(std::chrono::microseconds(1));
+      continue;
+    }
+    const size_t buffered = buffered_lsn % buffer_.size();
+    const size_t flushed = flushed_lsn % buffer_.size();
+    const size_t write_size =
+        flushed <= buffered
+            ? std::min(payload.size(), buffer_.size() - buffered)
+            : std::min(payload.size(), flushed - buffered);
+    memcpy(buffer_.data() + buffered, payload.data(), write_size);
+
+    // Forward buffer pointer.
+    buffered_lsn_.store(buffered_lsn + write_size, std::memory_order_release);
+
+    payload.remove_prefix(write_size);
+  }
+  return lsn;
 }
 
 void Logger::LoggerWork() {
-  std::unique_lock lk(latch_);
-  while (!finish_ || persistent_lsn_ != queued_lsn_) {
-    worker_wait_.wait_for(lk, std::chrono::milliseconds(every_ms_));
-    if (persistent_lsn_ == queued_lsn_) {
+  while (!finish_ || flushed_lsn_ < buffered_lsn_) {
+    const size_t flushed_lsn = flushed_lsn_.load(std::memory_order_relaxed);
+    const size_t buffered_lsn = buffered_lsn_.load(std::memory_order_acquire);
+
+    if (flushed_lsn == buffered_lsn) {
+      // No data to flush.
+      std::this_thread::sleep_for(std::chrono::microseconds(every_us_));
       continue;
     }
 
-    // Write buffered data between committed_offset to written_offset.
-    const size_t written_offset = queued_lsn_ % buffer_.size();
-    const size_t committed_offset = persistent_lsn_ % buffer_.size();
+    const size_t buffered = buffered_lsn % buffer_.size();
+    const size_t flushed = flushed_lsn % buffer_.size();
 
-    ssize_t flushed_bytes = 0;
-    if (committed_offset < written_offset) {
-      flushed_bytes += write(dst_, buffer_.data() + committed_offset,
-                             written_offset - committed_offset);
-      if (flushed_bytes <= 0) {
-        continue;
-      }
-    } else {
-      // In case of buffer does wrap around.
-      flushed_bytes += write(dst_, buffer_.data() + committed_offset,
-                             buffer_.size() - committed_offset);
-      if (flushed_bytes <= 0) {
-        continue;
-      }
-      if (static_cast<size_t>(flushed_bytes) ==
-          buffer_.size() - committed_offset) {
-        ssize_t extra_wrote = write(dst_, buffer_.data(), written_offset);
-        if (0 < extra_wrote) {
-          flushed_bytes += extra_wrote;
-        }
-      }
+    const ssize_t flushed_size =
+        write(dst_, buffer_.data() + flushed,
+              (flushed < buffered ? buffered : buffer_.size()) - flushed);
+    if (flushed_size <= 0) {
+      LOG(FATAL) << "Failed to flush.";
+      continue;
     }
 
-    fdatasync(dst_);
-    persistent_lsn_ += flushed_bytes;
+    fdatasync(dst_);  // Flush!
+    flushed_lsn_.store(flushed_lsn + flushed_size, std::memory_order_release);
   }
-}
-
-[[nodiscard]] size_t Logger::RestSize() const {
-  if (persistent_lsn_ <= queued_lsn_) {
-    return buffer_.size() - queued_lsn_ + persistent_lsn_ - 1;
-  }
-  return persistent_lsn_ - queued_lsn_ - 1;
 }
 
 }  // namespace tinylamb

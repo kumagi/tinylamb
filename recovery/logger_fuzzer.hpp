@@ -4,6 +4,7 @@
 
 #ifndef TINYLAMB_LOGGER_FUZZER_HPP
 #define TINYLAMB_LOGGER_FUZZER_HPP
+#include <filesystem>
 #include <fstream>
 #include <random>
 
@@ -16,56 +17,56 @@ static const char alphanum[] =
     "0123456789"
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "abcdefghijklmnopqrstuvwxyz";
+constexpr int kBufferSize = 32;
+constexpr size_t kLoop = 10;
 
-void Try(const uint64_t seed, bool verbose) {
-  std::string filename;
-  {  // Write.
-    std::mt19937 rand(seed);
-    auto RandomString = [&rand](size_t len = 16) {
-      std::string ret;
-      ret.reserve(len);
-      for (size_t i = 0; i < len; ++i) {
-        ret.push_back(alphanum[rand() % (sizeof(alphanum) - 1)]);
-      }
-      return ret;
-    };
+inline void Try(const uint64_t seed, bool verbose) {
+  std::mt19937 rand(seed);
+  auto RandomString = [&rand](size_t len = 16) {
+    std::string ret;
+    ret.reserve(len);
+    for (size_t i = 0; i < len; ++i) {
+      ret.push_back(alphanum[rand() % (sizeof(alphanum) - 1)]);
+    }
+    return ret;
+  };
 
-    filename = RandomString(16) + "-fuzzer.log";
-    Logger logger(filename, 280, 1);
-    for (size_t i = 0; i < rand() % 1000 + 1000; ++i) {
+  std::string filename = RandomString(16) + "-fuzzer.log";
+  std::remove(filename.c_str());
+  std::vector<std::string> written;
+  {
+    Logger logger(filename, kBufferSize, 1);
+    lsn_t total = 0;
+    for (size_t i = 0; i < kLoop; ++i) {
       std::string log_data = RandomString(rand() % 100 + 1);
       logger.AddLog(log_data);
       if (verbose) {
         LOG(TRACE) << log_data;
       }
+      total += log_data.size();
+      written.push_back(std::move(log_data));
+    }
+    while (logger.CommittedLSN() < total) {
     }
   }
 
-  {  // Verify.
-    std::mt19937 verify_rand(seed);
-    auto RandomString = [&verify_rand](size_t len = 16) {
-      std::string ret;
-      ret.reserve(len);
-      for (size_t i = 0; i < len; ++i) {
-        ret.push_back(alphanum[verify_rand() % (sizeof(alphanum) - 1)]);
-      }
-      return ret;
-    };
-    std::ifstream file;
-    file.open(RandomString(16) + "-fuzzer.log");
-    for (size_t i = 0; i < verify_rand() % 1000 + 1000; ++i) {
-      std::string expected_log_data = RandomString(verify_rand() % 100 + 1);
-      std::string log_data(expected_log_data.size(), ' ');
-      file.read(log_data.data(), log_data.size());
-      if (verbose) {
-        LOG(TRACE) << log_data << " == " << expected_log_data;
-      }
-      assert(log_data == expected_log_data);
+  std::ifstream file;
+  file.open(filename);
+  assert(filename == filename);
+  size_t lsn = 0;
+  for (const auto& exp : written) {
+    std::string actual;
+    actual.resize(exp.size());
+    file.read(actual.data(), actual.size());
+    if (exp != actual) {
+      LOG(FATAL) << lsn << ": expected: " << exp << " actual: " << actual;
     }
-    std::string a(1, ' ');
-    file.read(a.data(), 1);
-    assert(file.eof());
+    assert(actual == exp);
+    lsn += exp.size();
   }
+  std::string a(1, ' ');
+  file.read(a.data(), 1);
+  assert(file.eof());
   std::remove(filename.c_str());
 }
 
