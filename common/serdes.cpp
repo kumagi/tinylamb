@@ -32,6 +32,11 @@ size_t SerializeSize(std::string_view bin) {
   return sizeof(bin_size_t) + bin.size();
 }
 
+size_t SerializeNull(char* pos) {
+  *pos = '\0';
+  return 1;
+}
+
 size_t SerializeInteger(char* pos, int64_t i) {
   memcpy(pos, &i, sizeof(i));
   return sizeof(int64_t);

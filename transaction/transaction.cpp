@@ -148,6 +148,30 @@ lsn_t Transaction::SetLowestLog(page_id_t pid, page_id_t redo, page_id_t undo) {
   return prev_lsn_;
 }
 
+lsn_t Transaction::SetLowFence(page_id_t pid, const IndexKey& redo,
+                               const IndexKey& undo) {
+  assert(!IsFinished());
+  prev_lsn_ = transaction_manager_->AddLog(
+      LogRecord::SetLowFenceLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
+  return prev_lsn_;
+}
+
+lsn_t Transaction::SetHighFence(page_id_t pid, const IndexKey& redo,
+                                const IndexKey& undo) {
+  assert(!IsFinished());
+  prev_lsn_ = transaction_manager_->AddLog(
+      LogRecord::SetHighFenceLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
+  return prev_lsn_;
+}
+
+lsn_t Transaction::SetFoster(page_id_t pid, const FosterPair& redo,
+                             const FosterPair& undo) {
+  assert(!IsFinished());
+  prev_lsn_ = transaction_manager_->AddLog(
+      LogRecord::SetFosterLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
+  return prev_lsn_;
+}
+
 lsn_t Transaction::AllocatePageLog(page_id_t allocated_page_id,
                                    PageType new_page_type) {
   assert(!IsFinished());
@@ -168,15 +192,6 @@ void Transaction::CommitWait() const {
   while (transaction_manager_->CommittedLSN() < prev_lsn_) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-}
-
-lsn_t Transaction::SetPrevNextLog(page_id_t target, page_id_t redo_next,
-                                  page_id_t redo_prev, page_id_t undo_next,
-                                  page_id_t undo_prev) {
-  assert(!IsFinished());
-  prev_lsn_ = transaction_manager_->AddLog(LogRecord::SetPrevNextLogRecord(
-      prev_lsn_, txn_id_, target, redo_next, redo_prev, undo_next, undo_prev));
-  return prev_lsn_;
 }
 
 }  // namespace tinylamb

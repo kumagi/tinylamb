@@ -24,6 +24,9 @@ enum class LogType : uint16_t {
   kDeleteRow,
   kDeleteLeaf,
   kDeleteBranch,
+  kSetLowFence,
+  kSetHighFence,
+  kSetFoster,
   kCompensateInsertRow,
   kCompensateInsertLeaf,
   kCompensateInsertBranch,
@@ -33,13 +36,15 @@ enum class LogType : uint16_t {
   kCompensateDeleteRow,
   kCompensateDeleteLeaf,
   kCompensateDeleteBranch,
+  kCompensateSetLowFence,
+  kCompensateSetHighFence,
+  kCompensateSetFoster,
   kCommit,
   kBeginCheckpoint,
   kEndCheckpoint,
   kSystemAllocPage,
   kSystemDestroyPage,
   kLowestValue,
-  kSetPrevNext,
 };
 inline std::istream& operator>>(std::istream& in, const LogType& val) {
   in >> (uint16_t&)val;
@@ -116,10 +121,29 @@ struct LogRecord {
   static LogRecord CompensatingDeleteLeafLogRecord(txn_id_t txn, page_id_t pid,
                                                    std::string_view key,
                                                    std::string_view redo);
-  static LogRecord ComnensatingDeleteBranchLogRecord(txn_id_t txn,
+  static LogRecord CompensatingDeleteBranchLogRecord(txn_id_t txn,
                                                      page_id_t pid,
                                                      std::string_view slot,
                                                      page_id_t redo);
+
+  static LogRecord SetLowFenceLogRecord(lsn_t prev_lsn, txn_id_t tx,
+                                        page_id_t pid, const IndexKey& redo,
+                                        const IndexKey& undo);
+  static LogRecord SetHighFenceLogRecord(lsn_t prev_lsn, txn_id_t tx,
+                                         page_id_t pid, const IndexKey& redo,
+                                         const IndexKey& undo);
+  static LogRecord CompensateSetLowFenceLogRecord(lsn_t prev_lsn, txn_id_t tx,
+                                                  page_id_t pid,
+                                                  const IndexKey& redo);
+  static LogRecord CompensateSetHighFenceLogRecord(lsn_t prev_lsn, txn_id_t tx,
+                                                   page_id_t pid,
+                                                   const IndexKey& redo);
+  static LogRecord SetFosterLogRecord(lsn_t prev_lsn, txn_id_t tx,
+                                      page_id_t pid, const FosterPair& redo,
+                                      const FosterPair& undo);
+  static LogRecord CompensateSetFosterLogRecord(lsn_t prev_lsn, txn_id_t tx,
+                                                page_id_t pid,
+                                                const FosterPair& redo);
 
   static LogRecord SetLowestLogRecord(lsn_t prev_lsn, txn_id_t tid,
                                       page_id_t pid, page_id_t redo,
@@ -139,14 +163,6 @@ struct LogRecord {
   static LogRecord EndCheckpointLogRecord(
       const std::vector<std::pair<page_id_t, lsn_t>>& dpt,
       const std::vector<CheckpointManager::ActiveTransactionEntry>& att);
-
-  static LogRecord SetPrevNextLogRecord(lsn_t prev_lsn, txn_id_t tid,
-                                        page_id_t pid, page_id_t redo_next,
-                                        page_id_t redo_prev,
-                                        page_id_t undo_next,
-                                        page_id_t undo_prev);
-  void PrevNextLogRecordRedo(page_id_t& prev, page_id_t& next) const;
-  void PrevNextLogRecordUndo(page_id_t& prev, page_id_t& next) const;
 
   void Clear();
 

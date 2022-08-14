@@ -26,13 +26,13 @@ Encoder& Encoder::operator<<(slot_t slot) {
   return *this;
 }
 
-Encoder& Encoder::operator<<(page_id_t pid) {
-  os_->write(reinterpret_cast<const char*>(&pid), sizeof(pid));
+Encoder& Encoder::operator<<(int64_t i64) {
+  os_->write(reinterpret_cast<const char*>(&i64), sizeof(i64));
   return *this;
 }
 
-Encoder& Encoder::operator<<(int64_t i64) {
-  os_->write(reinterpret_cast<const char*>(&i64), sizeof(i64));
+Encoder& Encoder::operator<<(uint64_t u64) {
+  os_->write(reinterpret_cast<const char*>(&u64), sizeof(u64));
   return *this;
 }
 

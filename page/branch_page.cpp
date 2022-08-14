@@ -7,6 +7,8 @@
 #include <cstddef>
 
 #include "common/serdes.hpp"
+#include "page/foster_pair.hpp"
+#include "page/index_key.hpp"
 #include "page/page.hpp"
 #include "page/page_manager.hpp"
 #include "transaction/transaction.hpp"
@@ -56,7 +58,7 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
   const bin_size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
   free_size_ -= physical_size + sizeof(RowPointer);
   if ((Payload() + free_ptr_ - physical_size) <=
-      reinterpret_cast<char*>(&rows_[row_count_ + 2])) {
+      reinterpret_cast<char*>(&rows_[row_count_ + kExtraIdx + 2])) {
     DeFragment();
   }
   const int pos = SearchToInsert(key);
@@ -65,10 +67,10 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
   free_ptr_ -= physical_size;
   SerializePID(Payload() + free_ptr_, pid);
   SerializeStringView(Payload() + free_ptr_ + sizeof(page_id_t), key);
-  memmove(rows_ + pos + 1, rows_ + pos,
+  memmove(rows_ + kExtraIdx + pos + 1, rows_ + kExtraIdx + pos,
           (row_count_ - pos) * sizeof(RowPointer));
-  rows_[pos].offset = free_ptr_;
-  rows_[pos].size = physical_size;
+  rows_[kExtraIdx + pos].offset = free_ptr_;
+  rows_[kExtraIdx + pos].size = physical_size;
 }
 
 Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
@@ -83,7 +85,7 @@ Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
 }
 
 void BranchPage::UpdateImpl(std::string_view key, page_id_t pid) {
-  memcpy(Payload() + rows_[Search(key)].offset, &pid, sizeof(pid));
+  memcpy(Payload() + rows_[Search(key) + kExtraIdx].offset, &pid, sizeof(pid));
 }
 
 Status BranchPage::Delete(page_id_t pid, Transaction& txn,
@@ -110,25 +112,144 @@ void BranchPage::DeleteImpl(std::string_view key) {
     ++pos;
   }
   free_size_ += SerializeSize(GetKey(pos)) + sizeof(page_id_t);
-  memmove(rows_ + pos, rows_ + pos + 1,
+  memmove(rows_ + pos + kExtraIdx, rows_ + pos + kExtraIdx + 1,
           sizeof(RowPointer) * (row_count_ - pos));
   --row_count_;
 }
 
-Status BranchPage::GetPageForKey(Transaction& /*txn*/, std::string_view key,
-                                 page_id_t* result) const {
+StatusOr<page_id_t> BranchPage::GetPageForKey(Transaction& /*txn*/,
+                                              std::string_view key) const {
   assert(0 < row_count_);
   if (key < GetKey(0)) {
-    *result = lowest_page_;
-  } else {
-    *result = GetValue(Search(key));
+    return lowest_page_;
   }
+  return GetValue(Search(key));
+}
+
+void BranchPage::SetFence(RowPointer& fence_pos, const IndexKey& new_fence) {
+  const size_t physical_size = SerializeSize(new_fence);
+  if (free_ptr_ < physical_size) {
+    fence_pos = RowPointer();
+    DeFragment();
+  }
+  free_ptr_ -= physical_size;
+  free_size_ += fence_pos.size;
+  if (new_fence.IsMinusInfinity()) {
+    fence_pos = kMinusInfinity;
+  } else if (new_fence.IsPlusInfinity()) {
+    fence_pos = kPlusInfinity;
+  } else {
+    ASSIGN_OR_CRASH(std::string_view, key, new_fence.GetKey());
+    free_size_ -= physical_size;
+    fence_pos.size = physical_size;
+    fence_pos.offset = free_ptr_;
+    SerializeStringView(Payload() + fence_pos.offset, key);
+  }
+}
+
+Status BranchPage::SetLowFence(page_id_t pid, Transaction& txn,
+                               const IndexKey& lf) {
+  if (lf.IsNotInfinity()) {
+    const std::string_view new_fence = lf.GetKey().Value();
+    const size_t physical_size = SerializeSize(lf);
+    if (physical_size > new_fence.size() &&
+        free_size_ < physical_size - new_fence.size()) {
+      return Status::kNoSpace;
+    }
+  }
+  txn.SetLowFence(pid, lf, GetLowFence());
+  SetFence(rows_[kLowFenceIdx], lf);
   return Status::kSuccess;
 }
 
-void BranchPage::SplitInto(page_id_t /*pid*/, Transaction& txn,
-                           std::string_view key, Page* right,
-                           std::string* middle) {
+Status BranchPage::SetHighFence(page_id_t pid, Transaction& txn,
+                                const IndexKey& hf) {
+  if (hf.IsNotInfinity()) {
+    const std::string_view new_fence = hf.GetKey().Value();
+    const size_t physical_size = SerializeSize(hf);
+    if (physical_size > new_fence.size() &&
+        free_size_ < physical_size - new_fence.size()) {
+      return Status::kNoSpace;
+    }
+  }
+  txn.SetHighFence(pid, hf, GetHighFence());
+  SetFence(rows_[kHighFenceIdx], hf);
+  return Status::kSuccess;
+}
+
+IndexKey BranchPage::GetLowFence() const {
+  if (rows_[kLowFenceIdx] == kMinusInfinity) {
+    return IndexKey::MinusInfinity();
+  }
+  return IndexKey::Deserialize(Payload() + rows_[kLowFenceIdx].offset);
+}
+
+IndexKey BranchPage::GetHighFence() const {
+  if (rows_[kHighFenceIdx] == kPlusInfinity) {
+    return IndexKey::PlusInfinity();
+  }
+  return IndexKey::Deserialize(Payload() + rows_[kHighFenceIdx].offset);
+}
+
+void BranchPage::SetLowFenceImpl(const IndexKey& lf) {
+  SetFence(rows_[kLowFenceIdx], lf);
+}
+
+void BranchPage::SetHighFenceImpl(const IndexKey& hf) {
+  SetFence(rows_[kHighFenceIdx], hf);
+}
+
+Status BranchPage::SetFoster(page_id_t pid, Transaction& txn,
+                             const FosterPair& new_foster) {
+  size_t physical_size = SerializeSize(new_foster.key) + sizeof(page_id_t);
+  if (rows_[kFosterIdx].size < physical_size &&
+      free_size_ < physical_size - rows_[kFosterIdx].size) {
+    return Status::kNoSpace;
+  }
+  StatusOr<FosterPair> prev_foster = GetFoster();
+  if (prev_foster.HasValue()) {
+    txn.SetFoster(pid, new_foster, prev_foster.Value());
+  } else {
+    txn.SetFoster(pid, new_foster, FosterPair("", 0));
+  }
+  SetFosterImpl(new_foster);
+  return Status::kSuccess;
+}
+
+void BranchPage::SetFosterImpl(const FosterPair& foster) {
+  free_size_ += rows_[kFosterIdx].size;
+  if (foster.key.empty()) {
+    rows_[kFosterIdx] = {0, 0};
+    return;
+  }
+  bin_size_t physical_size =
+      SerializeSize(foster.key) + sizeof(foster.child_pid);
+  if (free_ptr_ <= physical_size) {
+    rows_[kFosterIdx] = RowPointer();
+    DeFragment();
+  }
+  free_ptr_ -= physical_size;
+  free_size_ -= physical_size;
+  rows_[kFosterIdx] = {free_ptr_, physical_size};
+  size_t offset =
+      SerializeStringView(Payload() + rows_[kFosterIdx].offset, foster.key);
+  SerializePID(Payload() + rows_[kFosterIdx].offset + offset, foster.child_pid);
+}
+
+StatusOr<FosterPair> BranchPage::GetFoster() const {
+  if (rows_[kFosterIdx].size == 0) {
+    return Status::kNotExists;
+  }
+  std::string_view serialized_key;
+  page_id_t child = 0;
+  size_t offset = DeserializeStringView(Payload() + rows_[kFosterIdx].offset,
+                                        &serialized_key);
+  DeserializePID(Payload() + rows_[kFosterIdx].offset + offset, &child);
+  return FosterPair(serialized_key, child);
+}
+
+void BranchPage::Split(page_id_t /*pid*/, Transaction& txn,
+                       std::string_view key, Page* right, std::string* middle) {
   const size_t kPayload = kPageBodySize - offsetof(BranchPage, rows_);
   const size_t kThreshold = kPayload / 2;
   const size_t expected_size =
@@ -136,7 +257,8 @@ void BranchPage::SplitInto(page_id_t /*pid*/, Transaction& txn,
   assert(right->type == PageType::kBranchPage);
   size_t consumed_size = 0;
   size_t pivot = 0;
-  while (consumed_size < kThreshold && pivot < row_count_ - 2) {
+  while (consumed_size < kThreshold && pivot < row_count_ - 2 &&
+         pivot < row_count_) {
     consumed_size +=
         SerializeSize(GetKey(pivot++)) + sizeof(page_id_t) + sizeof(RowPointer);
   }
@@ -169,38 +291,43 @@ void BranchPage::SplitInto(page_id_t /*pid*/, Transaction& txn,
 }
 
 bin_size_t BranchPage::SearchToInsert(std::string_view key) const {
-  int left = -1;
-  int right = row_count_;
+  int left = kExtraIdx - 1;
+  int right = row_count_ + static_cast<int>(kExtraIdx);
   while (1 < right - left) {
     const int cur = (left + right) / 2;
-    std::string_view cur_key = GetKey(cur);
+    std::string_view cur_key = GetRow(cur);
     if (key < cur_key) {
       right = cur;
     } else {
       left = cur;
     }
   }
-  return right;
+  return right - static_cast<int>(kExtraIdx);
 }
 
 int BranchPage::Search(std::string_view key) const {
-  int left = -1;
-  int right = row_count_;
+  int left = kExtraIdx - 1;
+  int right = row_count_ + static_cast<int>(kExtraIdx);
   while (1 < right - left) {
     const int cur = (left + right) / 2;
-    std::string_view cur_key = GetKey(cur);
+    std::string_view cur_key = GetRow(cur);
     if (key < cur_key) {
       right = cur;
     } else {
       left = cur;
     }
   }
-  return left;
+  return left - static_cast<int>(kExtraIdx);
 }
 
 std::string_view BranchPage::GetKey(size_t idx) const {
-  std::string_view key;
   assert(idx < row_count_);
+  return GetRow(idx + kExtraIdx);
+}
+
+std::string_view BranchPage::GetRow(size_t idx) const {
+  std::string_view key;
+  assert(idx < row_count_ + kExtraIdx);
   DeserializeStringView(Payload() + rows_[idx].offset + sizeof(page_id_t),
                         &key);
   return key;
@@ -208,17 +335,14 @@ std::string_view BranchPage::GetKey(size_t idx) const {
 
 page_id_t BranchPage::GetValue(size_t idx) const {
   page_id_t result;
-  if (!(idx < row_count_)) {
-    LOG(INFO) << idx << " < " << row_count_;
-  }
-
   assert(idx < row_count_);
-  memcpy(&result, Payload() + rows_[idx].offset, sizeof(result));
+  memcpy(&result, Payload() + rows_[idx + kExtraIdx].offset, sizeof(result));
   return result;
 }
 
 void BranchPage::Dump(std::ostream& o, int indent) const {
-  o << "Rows: " << row_count_ << " FreeSize: " << free_size_
+  o << "Rows: " << row_count_ << " LowFence: " << GetLowFence()
+    << " HighFence: " << GetHighFence() << " FreeSize: " << free_size_
     << " FreePtr:" << free_ptr_ << " Lowest: " << lowest_page_;
   if (row_count_ == 0) {
     return;
@@ -305,13 +429,15 @@ bool BranchPage::SanityCheckForTest(PageManager* pm) const {
 void BranchPage::DeFragment() {
   std::vector<std::string> payloads;
   payloads.reserve(row_count_);
-  for (size_t i = 0; i < row_count_; ++i) {
+  for (size_t i = 0; i < row_count_ + kExtraIdx; ++i) {
     payloads.emplace_back(Payload() + rows_[i].offset, rows_[i].size);
   }
   bin_size_t offset = kPageBodySize;
-  for (size_t i = 0; i < row_count_; ++i) {
+  for (size_t i = 0; i < row_count_ + kExtraIdx; ++i) {
     offset -= payloads[i].size();
-    rows_[i].offset = offset;
+    if (0 < rows_[i].size) {
+      rows_[i].offset = offset;
+    }
     memcpy(Payload() + offset, payloads[i].data(), payloads[i].size());
   }
   free_ptr_ = offset;
@@ -325,7 +451,12 @@ uint64_t std::hash<tinylamb::BranchPage>::operator()(
   ret += std::hash<tinylamb::slot_t>()(r.row_count_);
   ret += std::hash<tinylamb::bin_size_t>()(r.free_ptr_);
   ret += std::hash<tinylamb::bin_size_t>()(r.free_size_);
-  for (int i = 0; i < r.row_count_; ++i) {
+  ret += std::hash<tinylamb::IndexKey>()(r.GetLowFence());
+  ret += std::hash<tinylamb::IndexKey>()(r.GetHighFence());
+  if (auto foster = r.GetFoster()) {
+    ret += std::hash<tinylamb::FosterPair>()(foster.Value());
+  }
+  for (size_t i = 0; i < r.row_count_; ++i) {
     ret += std::hash<std::string_view>()(r.GetKey(i));
     ret += std::hash<tinylamb::page_id_t>()(r.GetValue(i));
   }

@@ -50,6 +50,11 @@ TEST_F(LoggerTest, AppendOne) {
   ASSERT_EQ(0, lsn);  // Inserted place must be the beginning of the log.
   WaitForCommit(0 + l.Size());
   EXPECT_EQ(std::filesystem::file_size(log_name_), l.Size());
+  std::ifstream file;
+  file.open(log_name_);
+  std::string file_data;
+  file >> file_data;
+  ASSERT_EQ(file_data, l.Serialize());
 }
 
 TEST_F(LoggerTest, AppendTwo) {

@@ -52,7 +52,7 @@ add_library(libtinylamb
         database/transaction_context.cpp executor/insert.cpp
         executor/update.cpp plan/index_scan_plan.cpp executor/index_scan.cpp
         executor/index_only_scan.cpp type/column_name.cpp query/query_data.cpp
-        expression/named_expression.cpp executor/index_join.cpp)
+        expression/named_expression.cpp executor/index_join.cpp page/index_key.hpp page/row_pointer.hpp)
 
 add_library(libtinylamb_test_util
         STATIC
@@ -166,7 +166,7 @@ add_fuzzer_test(table/table_fuzzer.cpp)
 ########################################
 ## Fuzzing Replay
 ########################################
-function(add_fuzzer_test file_path)
+function(add_replay_test file_path)
     set(fuzzer_option "-fsanitize=address,undefined,bounds")
     get_filename_component(filename ${file_path} NAME)
     string(REPLACE ".cpp" "" target_name ${filename})
@@ -182,7 +182,7 @@ function(add_fuzzer_test file_path)
             )
 endfunction()
 
-add_fuzzer_test(recovery/logger_fuzzer_replay.cpp)
-add_fuzzer_test(page/row_page_fuzzer_replay.cpp)
-add_fuzzer_test(index/b_plus_tree_fuzzer_replay.cpp)
-add_fuzzer_test(table/table_fuzzer_replay.cpp)
+add_replay_test(recovery/logger_fuzzer_replay.cpp)
+add_replay_test(page/row_page_fuzzer_replay.cpp)
+add_replay_test(index/b_plus_tree_fuzzer_replay.cpp)
+add_replay_test(table/table_fuzzer_replay.cpp)

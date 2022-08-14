@@ -16,11 +16,11 @@
 namespace tinylamb {
 
 class TransactionManager;
-
 class CheckpointManager;
 class PageManager;
 class Logger;
 class LockManager;
+struct FosterPair;
 struct LogRecord;
 struct Row;
 
@@ -33,7 +33,7 @@ enum class TransactionStatus : uint_fast8_t {
 
 std::ostream& operator<<(std::ostream& o, const TransactionStatus& t);
 
-class Transaction {
+class Transaction final {
  public:
   Transaction() = default;  // For test purpose only.
   Transaction(txn_id_t txn_id, TransactionManager* tm);
@@ -49,6 +49,7 @@ class Transaction {
     transaction_manager_ = o.transaction_manager_;
     return *this;
   }
+  ~Transaction() = default;
 
   void SetStatus(TransactionStatus status);
   bool IsFinished() const {
@@ -83,13 +84,14 @@ class Transaction {
 
   lsn_t SetLowestLog(page_id_t pid, page_id_t redo, page_id_t undo);
 
+  lsn_t SetLowFence(page_id_t pid, const IndexKey& redo, const IndexKey& undo);
+  lsn_t SetHighFence(page_id_t pid, const IndexKey& redo, const IndexKey& undo);
+  lsn_t SetFoster(page_id_t pid, const FosterPair& redo,
+                  const FosterPair& undo);
+
   lsn_t AllocatePageLog(page_id_t page_id, PageType new_page_type);
 
   lsn_t DestroyPageLog(page_id_t page_id);
-
-  lsn_t SetPrevNextLog(page_id_t target, page_id_t redo_next,
-                       page_id_t redo_prev, page_id_t undo_next,
-                       page_id_t undo_prev);
 
   // Prepared mainly for testing.
   // Using this function is discouraged to get performance of flush pipelining.

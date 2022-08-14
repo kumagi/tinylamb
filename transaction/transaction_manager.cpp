@@ -120,7 +120,7 @@ void TransactionManager::CompensateDeleteBranchLog(txn_id_t txn_id,
                                                    std::string_view key,
                                                    page_id_t redo) {
   logger_->AddLog(
-      LogRecord::ComnensatingDeleteBranchLogRecord(txn_id, pid, key, redo)
+      LogRecord::CompensatingDeleteBranchLogRecord(txn_id, pid, key, redo)
           .Serialize());
 }
 
@@ -129,6 +129,29 @@ void TransactionManager::CompensateSetLowestValueLog(txn_id_t txn_id,
                                                      page_id_t redo) {
   logger_->AddLog(
       LogRecord::CompensateSetLowestValueLogRecord(txn_id, pid, redo)
+          .Serialize());
+}
+
+void TransactionManager::CompensateSetLowFenceLog(txn_id_t txn_id,
+                                                  page_id_t pid,
+                                                  const IndexKey& redo) {
+  logger_->AddLog(
+      LogRecord::CompensateSetLowFenceLogRecord(0, txn_id, pid, redo)
+          .Serialize());
+}
+
+void TransactionManager::CompensateSetHighFenceLog(txn_id_t txn_id,
+                                                   page_id_t pid,
+                                                   const IndexKey& redo) {
+  logger_->AddLog(
+      LogRecord::CompensateSetHighFenceLogRecord(0, txn_id, pid, redo)
+          .Serialize());
+}
+
+void TransactionManager::CompensateSetFosterLog(txn_id_t txn_id, page_id_t pid,
+                                                const FosterPair& foster) {
+  logger_->AddLog(
+      LogRecord::CompensateSetFosterLogRecord(0, txn_id, pid, foster)
           .Serialize());
 }
 

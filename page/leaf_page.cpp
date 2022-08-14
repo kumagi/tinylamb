@@ -8,6 +8,7 @@
 
 #include "common/debug.hpp"
 #include "common/serdes.hpp"
+#include "page/index_key.hpp"
 #include "page/page.hpp"
 #include "transaction/transaction.hpp"
 
@@ -185,19 +186,6 @@ StatusOr<std::string_view> LeafPage::HighestKey(Transaction& /*unused*/) const {
 
 slot_t LeafPage::RowCount() const { return row_count_; }
 
-Status LeafPage::SetPrevNext(page_id_t pid, Transaction& txn, page_id_t next,
-                             page_id_t prev) {
-  txn.SetPrevNextLog(pid, next, prev, next_pid_, prev_pid_);
-  prev_pid_ = prev;
-  next_pid_ = next;
-  return Status::kSuccess;
-}
-
-void LeafPage::SetPrevNextImpl(page_id_t next, page_id_t prev) {
-  next_pid_ = next;
-  prev_pid_ = prev;
-}
-
 void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
                      std::string_view value, Page* right) {
   const size_t kPayload = kPageBodySize - offsetof(LeafPage, rows_);
@@ -232,8 +220,6 @@ void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
   for (size_t i = pivot; i < original_row_count; ++i) {
     this_page->Delete(txn, GetKey(pivot));
   }
-  right->SetPrevNext(txn, next_pid_, pid);
-  this_page->SetPrevNext(txn, right->PageID(), prev_pid_);
 
   if (right->RowCount() == 0 || right->GetKey(0) <= key) {
     assert(expected_size <= right->body.leaf_page.free_size_);
@@ -248,16 +234,48 @@ void LeafPage::DeFragment() {
   for (size_t i = 0; i < row_count_; ++i) {
     payloads.emplace_back(Payload() + rows_[i].offset, rows_[i].size);
   }
+  if (low_fence_ != kMinusInfinity) {
+    payloads.emplace_back(Payload() + low_fence_.offset, low_fence_.size);
+  }
+  if (high_fence_ != kPlusInfinity) {
+    payloads.emplace_back(Payload() + high_fence_.offset, high_fence_.size);
+  }
+  if (foster_.offset != 0) {
+    payloads.emplace_back(Payload() + foster_.offset, foster_.size);
+  }
   free_ptr_ = kPageBodySize - offsetof(LeafPage, rows_);
   for (size_t i = 0; i < row_count_; ++i) {
     assert(payloads[i].size() <= free_ptr_);
     assert(payloads[i].size() == rows_[i].size);
     free_ptr_ -= payloads[i].size();
     rows_[i].offset = free_ptr_;
-
     memcpy(Payload() + free_ptr_, payloads[i].data(), payloads[i].size());
   }
-  assert(free_ptr_ - row_count_ * sizeof(RowPointer) == free_size_);
+  size_t extra_offset = 0;
+  if (low_fence_ != kMinusInfinity) {
+    assert(low_fence_.size <= free_ptr_);
+    free_ptr_ -= low_fence_.size;
+    low_fence_.offset = free_ptr_;
+    memcpy(Payload() + free_ptr_, payloads[row_count_].data(),
+           payloads[row_count_].size());
+    extra_offset++;
+  }
+  if (high_fence_ != kPlusInfinity) {
+    assert(high_fence_.size <= free_ptr_);
+    free_ptr_ -= high_fence_.size;
+    high_fence_.offset = free_ptr_;
+    memcpy(Payload() + free_ptr_, payloads[row_count_ + extra_offset].data(),
+           payloads[row_count_ + extra_offset].size());
+    extra_offset++;
+  }
+  if (foster_.offset != 0) {
+    assert(foster_.size <= free_ptr_);
+    free_ptr_ -= foster_.size;
+    foster_.offset = free_ptr_;
+    memcpy(Payload() + free_ptr_, payloads[row_count_ + extra_offset].data(),
+           payloads[row_count_ + extra_offset].size());
+    extra_offset++;
+  }
 }
 
 size_t LeafPage::Find(std::string_view key) const {
@@ -275,9 +293,134 @@ size_t LeafPage::Find(std::string_view key) const {
   return right;
 }
 
+void LeafPage::SetFence(RowPointer& fence_pos, const IndexKey& new_fence) {
+  const size_t physical_size = SerializeSize(new_fence);
+  if (free_ptr_ < physical_size) {
+    fence_pos = RowPointer();
+    DeFragment();
+  }
+  free_ptr_ -= physical_size;
+  free_size_ += fence_pos.size;
+  if (new_fence.IsMinusInfinity()) {
+    fence_pos = kMinusInfinity;
+  } else if (new_fence.IsPlusInfinity()) {
+    fence_pos = kPlusInfinity;
+  } else {
+    ASSIGN_OR_CRASH(std::string_view, key, new_fence.GetKey());
+    free_size_ -= physical_size;
+    fence_pos.size = physical_size;
+    fence_pos.offset = free_ptr_;
+    SerializeStringView(Payload() + fence_pos.offset, key);
+  }
+}
+
+Status LeafPage::SetLowFence(page_id_t pid, Transaction& txn,
+                             const IndexKey& lf) {
+  if (lf.IsNotInfinity()) {
+    const std::string_view new_fence = lf.GetKey().Value();
+    const size_t physical_size = SerializeSize(lf);
+    if (physical_size > new_fence.size() &&
+        free_size_ < physical_size - new_fence.size()) {
+      return Status::kNoSpace;
+    }
+  }
+  txn.SetLowFence(pid, lf, GetLowFence());
+  SetFence(low_fence_, lf);
+  return Status::kSuccess;
+}
+
+Status LeafPage::SetHighFence(page_id_t pid, Transaction& txn,
+                              const IndexKey& hf) {
+  if (hf.IsNotInfinity()) {
+    const std::string_view new_fence = hf.GetKey().Value();
+    const size_t physical_size = SerializeSize(hf);
+    if (physical_size > new_fence.size() &&
+        free_size_ < physical_size - new_fence.size()) {
+      return Status::kNoSpace;
+    }
+  }
+  txn.SetHighFence(pid, hf, GetHighFence());
+  SetFence(high_fence_, hf);
+  return Status::kSuccess;
+}
+
+void LeafPage::SetLowFenceImpl(const IndexKey& lf) { SetFence(low_fence_, lf); }
+
+void LeafPage::SetHighFenceImpl(const IndexKey& hf) {
+  SetFence(high_fence_, hf);
+}
+
+IndexKey LeafPage::GetLowFence() const {
+  if (low_fence_ == kMinusInfinity) {
+    return IndexKey::MinusInfinity();
+  }
+  assert(low_fence_ != kPlusInfinity);
+  std::string_view ret;
+  DeserializeStringView(Payload() + low_fence_.offset, &ret);
+  return IndexKey(ret);
+}
+
+IndexKey LeafPage::GetHighFence() const {
+  if (high_fence_ == kPlusInfinity) {
+    return IndexKey::PlusInfinity();
+  }
+  assert(high_fence_ != kMinusInfinity);
+  std::string_view ret;
+  DeserializeStringView(Payload() + high_fence_.offset, &ret);
+  return IndexKey(ret);
+}
+
+Status LeafPage::SetFoster(page_id_t pid, Transaction& txn,
+                           const FosterPair& new_foster) {
+  free_size_ += foster_.size;
+  size_t physical_size = SerializeSize(new_foster.key) + sizeof(page_id_t);
+  if (foster_.size < physical_size &&
+      free_size_ < physical_size - foster_.size) {
+    return Status::kNoSpace;
+  }
+  StatusOr<FosterPair> prev_foster = GetFoster();
+  if (prev_foster.HasValue()) {
+    txn.SetFoster(pid, new_foster, prev_foster.Value());
+  } else {
+    txn.SetFoster(pid, new_foster, FosterPair("", 0));
+  }
+  SetFosterImpl(new_foster);
+  return Status::kSuccess;
+}
+
+void LeafPage::SetFosterImpl(const FosterPair& foster) {
+  if (foster.key.empty()) {
+    foster_ = {0, 0};
+    return;
+  }
+  bin_size_t physical_size =
+      SerializeSize(foster.key) + sizeof(foster.child_pid);
+  free_size_ += foster_.size;
+  if (free_ptr_ <= physical_size) {
+    DeFragment();
+  }
+  free_ptr_ -= physical_size;
+  free_size_ -= physical_size;
+  foster_ = {free_ptr_, physical_size};
+  size_t offset = SerializeStringView(Payload() + foster_.offset, foster.key);
+  SerializePID(Payload() + foster_.offset + offset, foster.child_pid);
+}
+
+StatusOr<FosterPair> LeafPage::GetFoster() const {
+  if (foster_.size == 0) {
+    return Status::kNotExists;
+  }
+  std::string_view serialized_key;
+  page_id_t child;
+  size_t offset =
+      DeserializeStringView(Payload() + foster_.offset, &serialized_key);
+  DeserializePID(Payload() + foster_.offset + offset, &child);
+  return FosterPair(serialized_key, child);
+}
+
 void LeafPage::Dump(std::ostream& o, int indent) const {
-  o << "Rows: " << row_count_ << " Prev: " << prev_pid_
-    << " Next: " << next_pid_ << " FreeSize: " << free_size_
+  o << "Rows: " << row_count_ << " LowFence: " << GetLowFence()
+    << " HighFence: " << GetHighFence() << " FreeSize: " << free_size_
     << " FreePtr:" << free_ptr_;
   for (size_t i = 0; i < row_count_; ++i) {
     o << "\n"
@@ -299,12 +442,17 @@ bool LeafPage::SanityCheckForTest() const {
 
 uint64_t std::hash<tinylamb::LeafPage>::operator()(
     const ::tinylamb::LeafPage& r) const {
-  uint64_t ret = 0;
-  ret += std::hash<tinylamb::page_id_t>()(r.prev_pid_);
-  ret += std::hash<tinylamb::page_id_t>()(r.next_pid_);
+  uint64_t ret = 0x1eaf1eaf;
   ret += std::hash<tinylamb::slot_t>()(r.row_count_);
   ret += std::hash<tinylamb::bin_size_t>()(r.free_ptr_);
   ret += std::hash<tinylamb::bin_size_t>()(r.free_size_);
+  ret += std::hash<tinylamb::IndexKey>()(r.GetLowFence());
+  ret += std::hash<tinylamb::IndexKey>()(r.GetHighFence());
+  tinylamb::StatusOr<tinylamb::FosterPair> foster = r.GetFoster();
+  if (foster.HasValue()) {
+    ret += std::hash<std::string_view>()(foster.Value().key);
+    ret += std::hash<tinylamb::page_id_t>()(foster.Value().child_pid);
+  }
   for (int i = 0; i < r.row_count_; ++i) {
     ret += std::hash<std::string_view>()(r.GetKey(i));
     ret += std::hash<std::string_view>()(r.GetValue(i));

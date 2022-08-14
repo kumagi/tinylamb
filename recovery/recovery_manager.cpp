@@ -78,20 +78,32 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
     case LogType::kCompensateUpdateBranch:
       target->UpdateBranchImpl(log.key, log.redo_page);
       break;
-    case LogType::kSetPrevNext: {
-      page_id_t prev, next;
-      log.PrevNextLogRecordRedo(next, prev);
-      target->SetPrevNextImpl(next, prev);
-      break;
-    }
     case LogType::kLowestValue:
       target->SetLowestValueBranchImpl(log.redo_page);
       break;
+    case LogType::kSetFoster:
+    case LogType::kCompensateSetFoster: {
+      auto new_foster = Decode<FosterPair>(log.redo_data);
+      target->SetFosterImpl(new_foster);
+      break;
+    }
     case LogType::kSystemAllocPage:
       target->PageInit(log.pid, log.allocated_page_type);
       break;
     case LogType::kSystemDestroyPage:
       throw std::runtime_error("not implemented yet");
+    case LogType::kSetLowFence:
+    case LogType::kCompensateSetLowFence: {
+      auto ik = Decode<IndexKey>(log.redo_data);
+      target->SetLowFenceImpl(ik);
+      break;
+    }
+    case LogType::kSetHighFence:
+    case LogType::kCompensateSetHighFence: {
+      auto ik = Decode<IndexKey>(log.redo_data);
+      target->SetHighFenceImpl(ik);
+      break;
+    }
     default:
       assert(!"must not reach here");
   }
@@ -151,10 +163,22 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       target->SetLowestValueBranchImpl(log.undo_page);
       break;
     }
-    case LogType::kSetPrevNext: {
-      page_id_t prev, next;
-      log.PrevNextLogRecordUndo(next, prev);
-      target->SetPrevNextImpl(next, prev);
+    case LogType::kSetLowFence: {
+      auto undo_key = Decode<IndexKey>(log.undo_data);
+      tm->CompensateSetLowFenceLog(log.txn_id, log.pid, undo_key);
+      target->SetLowFenceImpl(undo_key);
+      break;
+    }
+    case LogType::kSetHighFence: {
+      auto undo_key = Decode<IndexKey>(log.undo_data);
+      tm->CompensateSetHighFenceLog(log.txn_id, log.pid, undo_key);
+      target->SetHighFenceImpl(undo_key);
+      break;
+    }
+    case LogType::kSetFoster: {
+      auto foster = Decode<FosterPair>(log.undo_data);
+      tm->CompensateSetFosterLog(log.txn_id, log.pid, foster);
+      target->SetFosterImpl(foster);
       break;
     }
     case LogType::kSystemAllocPage:
@@ -171,6 +195,9 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
     case LogType::kCompensateUpdateBranch:
     case LogType::kCompensateDeleteLeaf:
     case LogType::kCompensateDeleteBranch:
+    case LogType::kCompensateSetLowFence:
+    case LogType::kCompensateSetHighFence:
+    case LogType::kCompensateSetFoster:
       // Compensating log cannot undo.
       break;
   }

@@ -212,16 +212,6 @@ StatusOr<std::string_view> Page::HighestKey(Transaction& txn) {
   return body.leaf_page.HighestKey(txn);
 }
 
-Status Page::SetPrevNext(Transaction& txn, page_id_t next, page_id_t prev) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  Status s = body.leaf_page.SetPrevNext(PageID(), txn, next, prev);
-  if (s == Status::kSuccess) {
-    SetPageLSN(txn.PrevLSN());
-    SetRecLSN(txn.PrevLSN());
-  }
-  return s;
-}
-
 Status Page::InsertBranch(Transaction& txn, std::string_view key,
                           page_id_t pid) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage)
@@ -244,10 +234,10 @@ Status Page::UpdateBranch(Transaction& txn, std::string_view key,
   return result;
 }
 
-Status Page::GetPageForKey(Transaction& txn, std::string_view key,
-                           page_id_t* page) const {
+StatusOr<page_id_t> Page::GetPageForKey(Transaction& txn,
+                                        std::string_view key) const {
   ASSERT_PAGE_TYPE(PageType::kBranchPage)
-  return body.branch_page.GetPageForKey(txn, key, page);
+  return body.branch_page.GetPageForKey(txn, key);
 }
 
 void Page::SetLowestValue(Transaction& txn, page_id_t v) {
@@ -260,7 +250,7 @@ void Page::SetLowestValue(Transaction& txn, page_id_t v) {
 void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
                      std::string* middle) {
   ASSERT_PAGE_TYPE(PageType::kBranchPage)
-  body.branch_page.SplitInto(PageID(), txn, new_key, right, middle);
+  body.branch_page.Split(PageID(), txn, new_key, right, middle);
 }
 
 void Page::PageTypeChange(Transaction& txn, PageType new_type) {
@@ -302,9 +292,139 @@ void Page::DeleteImpl(std::string_view key) {
   body.leaf_page.DeleteImpl(key);
 }
 
-void Page::SetPrevNextImpl(page_id_t next, page_id_t prev) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage)
-  body.leaf_page.SetPrevNextImpl(next, prev);
+Status Page::SetLowFence(Transaction& txn, const IndexKey& key) {
+  Status result;
+  switch (type) {
+    case PageType::kLeafPage:
+      result = body.leaf_page.SetLowFence(PageID(), txn, key);
+      break;
+    case PageType::kBranchPage:
+      result = body.branch_page.SetLowFence(PageID(), txn, key);
+      break;
+    default:
+      throw std::runtime_error("Invalid page type");
+  }
+  if (result == Status::kSuccess) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+  }
+  return result;
+}
+
+Status Page::SetHighFence(Transaction& txn, const IndexKey& key) {
+  Status result;
+  switch (type) {
+    case PageType::kLeafPage:
+      result = body.leaf_page.SetHighFence(PageID(), txn, key);
+      break;
+    case PageType::kBranchPage:
+      result = body.branch_page.SetHighFence(PageID(), txn, key);
+      break;
+    default:
+      throw std::runtime_error("Invalid page type");
+  }
+  if (result == Status::kSuccess) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+  }
+  return result;
+}
+
+IndexKey Page::GetLowFence(Transaction& /*txn*/) const {
+  switch (type) {
+    case PageType::kLeafPage:
+      return body.leaf_page.GetLowFence();
+      break;
+    case PageType::kBranchPage:
+      return body.branch_page.GetLowFence();
+      break;
+    default:
+      throw std::runtime_error("Invalid page type");
+  }
+}
+
+IndexKey Page::GetHighFence(Transaction& /*txn*/) const {
+  switch (type) {
+    case PageType::kLeafPage:
+      return body.leaf_page.GetHighFence();
+      break;
+    case PageType::kBranchPage:
+      return body.branch_page.GetHighFence();
+      break;
+    default:
+      throw std::runtime_error("Invalid page type");
+  }
+}
+
+Status Page::SetFoster(Transaction& txn, const FosterPair& foster) {
+  Status result;
+  switch (type) {
+    case PageType::kLeafPage:
+      result = body.leaf_page.SetFoster(PageID(), txn, foster);
+      break;
+    case PageType::kBranchPage:
+      result = body.branch_page.SetFoster(PageID(), txn, foster);
+      break;
+    default:
+      throw std::runtime_error("Invalid page type");
+  }
+  if (result == Status::kSuccess) {
+    SetPageLSN(txn.PrevLSN());
+    SetRecLSN(txn.PrevLSN());
+  }
+  return result;
+}
+
+StatusOr<FosterPair> Page::GetFoster(Transaction& /*txn*/) {
+  switch (type) {
+    case PageType::kLeafPage:
+      return body.leaf_page.GetFoster();
+      break;
+    case PageType::kBranchPage:
+      return body.branch_page.GetFoster();
+      break;
+    default:
+      throw std::runtime_error("Invalid page type");
+  }
+}
+
+void Page::SetLowFenceImpl(const IndexKey& key) {
+  switch (type) {
+    case PageType::kLeafPage:
+      body.leaf_page.SetLowFenceImpl(key);
+      return;
+    case PageType::kBranchPage:
+      body.branch_page.SetLowFenceImpl(key);
+      return;
+    default:
+      throw std::runtime_error("Invalid page type");
+  }
+}
+
+void Page::SetHighFenceImpl(const IndexKey& key) {
+  switch (type) {
+    case PageType::kLeafPage:
+      body.leaf_page.SetHighFenceImpl(key);
+      return;
+    case PageType::kBranchPage:
+      body.branch_page.SetHighFenceImpl(key);
+      return;
+    default:
+      throw std::runtime_error("Invalid page type");
+  }
+}
+
+void Page::SetFosterImpl(const FosterPair& foster) {
+  switch (type) {
+    case PageType::kLeafPage:
+      body.leaf_page.SetFosterImpl(foster);
+      return;
+    case PageType::kBranchPage:
+      body.branch_page.SetFosterImpl(foster);
+      return;
+    default:
+      throw std::runtime_error("Invalid page type");
+  }
 }
 
 void Page::InsertBranchImpl(std::string_view key, page_id_t pid) {

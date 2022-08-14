@@ -63,7 +63,6 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
   LeafPage* const lp = &ref->body.leaf_page;
   idx_++;
   if (lp->row_count_ <= idx_) {
-    pid_ = lp->next_pid_;
     if (pid_ == 0) {
       valid_ = false;
       return *this;
@@ -87,7 +86,6 @@ BPlusTreeIterator& BPlusTreeIterator::operator--() {
   PageRef ref = txn_->PageManager()->GetPage(pid_);
   LeafPage* const lp = &ref->body.leaf_page;
   if (0 == idx_) {
-    pid_ = lp->prev_pid_;
     if (pid_ == 0) {
       valid_ = false;
     }

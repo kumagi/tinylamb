@@ -9,6 +9,8 @@
 #include <iosfwd>
 
 namespace tinylamb {
+class Encoder;
+class Decoder;
 
 enum class PageType : uint64_t {
   kUnknown = 0,
@@ -20,6 +22,8 @@ enum class PageType : uint64_t {
 };
 
 std::ostream& operator<<(std::ostream& o, const PageType& type);
+Encoder& operator<<(Encoder& e, const PageType& type);
+Decoder& operator>>(Decoder& e, PageType& type);
 
 }  // namespace tinylamb
 

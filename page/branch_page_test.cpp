@@ -38,9 +38,7 @@ class BranchPageTest : public ::testing::Test {
   void AssertPIDForKey(std::string_view key, page_id_t expected) {
     auto txn = tm_->Begin();
     PageRef p = Page();
-    page_id_t value;
-    ASSERT_SUCCESS(p->GetPageForKey(txn, key, &value));
-    ASSERT_EQ(value, expected);
+    ASSERT_SUCCESS_AND_EQ(p->GetPageForKey(txn, key), expected);
     EXPECT_SUCCESS(txn.PreCommit());
   }
 
@@ -86,16 +84,14 @@ TEST_F(BranchPageTest, SetMinimumTree) {
 }
 
 TEST_F(BranchPageTest, GetPageForKeyMinimum) {
-  {
-    auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(branch_page_id_);
-    page->SetLowestValue(txn, 100);
-    ASSERT_SUCCESS(page->InsertBranch(txn, "b", 200));
-    txn.PreCommit();
-  }
-  AssertPIDForKey("alpha", 100);
-  AssertPIDForKey("b", 200);
-  AssertPIDForKey("delta", 200);
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(branch_page_id_);
+  page->SetLowestValue(txn, 100);
+  ASSERT_SUCCESS(page->InsertBranch(txn, "b", 200));
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "alpha"), 100);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "b"), 200);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "delta"), 200);
+  ASSERT_SUCCESS(txn.PreCommit());
 }
 
 TEST_F(BranchPageTest, InsertKey) {
@@ -109,6 +105,7 @@ TEST_F(BranchPageTest, InsertKey) {
   ASSERT_SUCCESS(page->InsertBranch(txn, "f", 50));
   ASSERT_SUCCESS(page->InsertBranch(txn, "g", 60));
   ASSERT_SUCCESS(page->InsertBranch(txn, "c", 30));
+  ASSERT_SUCCESS(txn.PreCommit());
 }
 
 TEST_F(BranchPageTest, GetPageForKey) {
@@ -134,42 +131,44 @@ TEST_F(BranchPageTest, InsertAndGetKey) {
   PageRef page = Page();
   page->SetLowestValue(txn, 100);
 
-  page_id_t pid;
   ASSERT_SUCCESS(page->InsertBranch(txn, "c", 200));
   ASSERT_SUCCESS(page->InsertBranch(txn, "a", 10));
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "a", &pid));
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "alpha", &pid));
-  ASSERT_EQ(pid, 10);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "a"), 10);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "alpha"), 10);
 
   ASSERT_SUCCESS(page->InsertBranch(txn, "g", 60));
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "g", &pid));
-  ASSERT_EQ(pid, 60);
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "guide", &pid));
-  ASSERT_EQ(pid, 60);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "g"), 60);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "guide"), 60);
 
   ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "e", &pid));
-  ASSERT_EQ(pid, 40);
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "error", &pid));
-  ASSERT_EQ(pid, 40);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "e"), 40);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "error"), 40);
 
   ASSERT_SUCCESS(page->InsertBranch(txn, "f", 50));
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "f", &pid));
-  ASSERT_EQ(pid, 50);
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "flight", &pid));
-  ASSERT_EQ(pid, 50);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "f"), 50);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "flight"), 50);
 
   ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "b", &pid));
-  ASSERT_EQ(pid, 20);
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "battle", &pid));
-  ASSERT_EQ(pid, 20);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "b"), 20);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "battle"), 20);
 
   ASSERT_SUCCESS(page->InsertBranch(txn, "c", 30));
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "c", &pid));
-  ASSERT_EQ(pid, 30);
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "cut", &pid));
-  ASSERT_EQ(pid, 30);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "c"), 30);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "cut"), 30);
+
+  // Double-check.
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "a"), 10);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "alpha"), 10);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "b"), 20);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "battle"), 20);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "c"), 30);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "cut"), 30);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "g"), 60);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "guide"), 60);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "e"), 40);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "error"), 40);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "f"), 50);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "flight"), 50);
 }
 
 TEST_F(BranchPageTest, UpdateKey) {
@@ -204,15 +203,11 @@ TEST_F(BranchPageTest, DeleteKey) {
   ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
   ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
 
-  page_id_t pid;
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "alpha", &pid));
-  ASSERT_EQ(pid, 2);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "alpha"), 2);
   ASSERT_SUCCESS(page->Delete(txn, "b"));
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "b", &pid));
-  EXPECT_EQ(pid, 2);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "b"), 2);
   ASSERT_SUCCESS(page->Delete(txn, "e"));
-  ASSERT_SUCCESS(page->GetPageForKey(txn, "e", &pid));
-  EXPECT_EQ(pid, 23);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "e"), 23);
 }
 
 TEST_F(BranchPageTest, SplitInto) {
@@ -450,9 +445,86 @@ TEST_F(BranchPageTest, UpdateHeavy) {
     kvp[key] = value;
   }
   for (const auto& kv : kvp) {
-    page_id_t val;
-    page->GetPageForKey(txn, kv.first, &val);
-    ASSERT_EQ(kvp[kv.first], val);
+    ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, kv.first), kvp[kv.first]);
   }
 }
+
+TEST_F(BranchPageTest, Fences) {
+  Transaction txn = tm_->Begin();
+  PageRef page = Page();
+  for (int i = 0; i < 100; ++i) {
+    std::string low = RandomString((19937 * i) % 12 + 10000, false);
+    std::string high = RandomString((19937 * i) % 12 + 10000, false);
+    ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey(low)));
+    ASSERT_EQ(page->GetLowFence(txn), IndexKey(low));
+    ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey(high)));
+    ASSERT_EQ(page->GetLowFence(txn), IndexKey(low));
+    ASSERT_EQ(page->GetHighFence(txn), IndexKey(high));
+  }
+  ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey::MinusInfinity()));
+  ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey::PlusInfinity()));
+  ASSERT_TRUE(page->GetLowFence(txn).IsMinusInfinity());
+  ASSERT_TRUE(page->GetHighFence(txn).IsPlusInfinity());
+}
+
+TEST_F(BranchPageTest, FencesCrash) {
+  std::string low = RandomString(1234, false);
+  std::string high = RandomString(4567, false);
+  {
+    Transaction txn = tm_->Begin();
+    PageRef page = Page();
+    ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey(low)));
+    ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey(high)));
+    ASSERT_EQ(page->GetLowFence(txn), IndexKey(low));
+    ASSERT_EQ(page->GetHighFence(txn), IndexKey(high));
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+  {
+    auto restarted_txn = tm_->Begin();
+    PageRef recovered_page = Page();
+    ASSERT_EQ(recovered_page->GetLowFence(restarted_txn), IndexKey(low));
+    ASSERT_EQ(recovered_page->GetHighFence(restarted_txn), IndexKey(high));
+    ASSERT_SUCCESS(restarted_txn.PreCommit());
+  }
+}
+
+TEST_F(BranchPageTest, FosterChild) {
+  Transaction txn = tm_->Begin();
+  PageRef page = Page();
+  for (int i = 0; i < 100; ++i) {
+    std::string key = RandomString((19937 * i) % 12 + 10000, false);
+    ASSERT_SUCCESS(page->SetFoster(txn, {key, page_id_t(i)}));
+    ASSIGN_OR_ASSERT_FAIL(FosterPair, result, page->GetFoster(txn));
+    ASSERT_EQ(result.key, key);
+    ASSERT_EQ(result.child_pid, i);
+  }
+  LOG(ERROR) << "inserted: " << 100;
+}
+
+TEST_F(BranchPageTest, FosterChildCrash) {
+  for (int i = 0; i < 5; ++i) {
+    std::string key = RandomString((19937 * i) % 12 + 10000, false);
+    {
+      Transaction txn = tm_->Begin();
+      PageRef page = Page();
+      ASSERT_SUCCESS(page->SetFoster(txn, {key, page_id_t(i)}));
+      ASSIGN_OR_ASSERT_FAIL(FosterPair, result, page->GetFoster(txn));
+      ASSERT_EQ(result.key, key);
+      ASSERT_EQ(result.child_pid, i);
+      ASSERT_SUCCESS(txn.PreCommit());
+    }
+    Recover();
+    r_->RecoverFrom(0, tm_.get());
+    {
+      Transaction txn = tm_->Begin();
+      PageRef page = Page();
+      ASSIGN_OR_ASSERT_FAIL(FosterPair, result, page->GetFoster(txn));
+      ASSERT_EQ(result.key, key);
+      ASSERT_EQ(result.child_pid, i);
+    }
+  }
+}
+
 }  // namespace tinylamb

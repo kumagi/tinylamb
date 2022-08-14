@@ -47,6 +47,35 @@ Value::Value(const Value& o)
   }
 }
 
+Value::Value(Value&& o) noexcept
+    : value(o.value), type(o.type), owned_data(std::move(o.owned_data)) {
+  if (!owned_data.empty() && type == ValueType::kVarChar) {
+    value.varchar_value = owned_data;
+  }
+  o.owned_data.clear();
+}
+
+Value& Value::operator=(const Value& rhs) {
+  type = rhs.type;
+  value = rhs.value;
+  if (!rhs.owned_data.empty()) {
+    owned_data = rhs.owned_data;
+    value.varchar_value = owned_data;
+  }
+  return *this;
+}
+
+Value& Value::operator=(Value&& o) noexcept {
+  type = o.type;
+  value = o.value;
+  owned_data = std::move(o.owned_data);
+  if (!owned_data.empty()) {
+    value.varchar_value = owned_data;
+  }
+  o.owned_data.clear();
+  return *this;
+}
+
 bool Value::Truthy() const {
   if (type == ValueType::kInt64) {
     return value.int_value != 0;
@@ -57,7 +86,7 @@ bool Value::Truthy() const {
 [[nodiscard]] size_t Value::Size() const {
   switch (type) {
     case ValueType::kNull:
-      throw std::runtime_error("Unknown type does not have size");
+      return 1;
     case ValueType::kInt64:
       return sizeof(int64_t);
     case ValueType::kVarChar:
@@ -71,7 +100,7 @@ bool Value::Truthy() const {
 size_t Value::Serialize(char* dst) const {
   switch (type) {
     case ValueType::kNull:
-      throw std::runtime_error("Unknown type cannot be serialized");
+      return SerializeNull(dst);
     case ValueType::kInt64:
       return SerializeInteger(dst, value.int_value);
     case ValueType::kVarChar:
@@ -392,16 +421,6 @@ Value Value::operator^(const Value& rhs) const {
     return Value(value.int_value ^ rhs.value.int_value);
   }
   throw std::runtime_error("Cannot do '^' against this type");
-}
-
-Value& Value::operator=(const Value& rhs) {
-  type = rhs.type;
-  value = rhs.value;
-  if (!rhs.owned_data.empty()) {
-    owned_data = rhs.owned_data;
-    value.varchar_value = owned_data;
-  }
-  return *this;
 }
 
 std::ostream& operator<<(std::ostream& o, const Value& v) {

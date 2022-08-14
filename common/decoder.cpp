@@ -24,13 +24,13 @@ Decoder& Decoder::operator>>(slot_t& slot) {
   return *this;
 }
 
-Decoder& Decoder::operator>>(page_id_t& pid) {
-  is_->read(reinterpret_cast<char*>(&pid), sizeof(pid));
+Decoder& Decoder::operator>>(int64_t& i64) {
+  is_->read(reinterpret_cast<char*>(&i64), sizeof(i64));
   return *this;
 }
 
-Decoder& Decoder::operator>>(int64_t& i64) {
-  is_->read(reinterpret_cast<char*>(&i64), sizeof(i64));
+Decoder& Decoder::operator>>(uint64_t& u64) {
+  is_->read(reinterpret_cast<char*>(&u64), sizeof(u64));
   return *this;
 }
 

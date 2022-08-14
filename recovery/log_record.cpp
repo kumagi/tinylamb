@@ -72,6 +72,15 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kDeleteBranch:
       o << "DELETE BRANCH\t";
       break;
+    case LogType::kSetLowFence:
+      o << "SET LOW FENCE\t";
+      break;
+    case LogType::kSetHighFence:
+      o << "SET HIGH FENCE\t";
+      break;
+    case LogType::kSetFoster:
+      o << "SET FOSTER\t";
+      break;
     case LogType::kCommit:
       o << "COMMIT\t\t";
       break;
@@ -102,6 +111,12 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
     case LogType::kCompensateDeleteBranch:
       o << "COMPENSATE DELETE BRANCH\t";
       break;
+    case LogType::kCompensateSetLowFence:
+      o << "COMPENSATE SET LOW FENCE\t";
+      break;
+    case LogType::kCompensateSetHighFence:
+      o << "COMPENSATE SET HIGH FENCE\t";
+      break;
     case LogType::kLowestValue:
       o << "SET LOWEST VALUE\t";
       break;
@@ -116,9 +131,6 @@ std::ostream& operator<<(std::ostream& o, const LogType& type) {
       break;
     case LogType::kSystemDestroyPage:
       o << "DESTROY\t";
-      break;
-    case LogType::kSetPrevNext:
-      o << "SET PREV NEXT\t";
       break;
     default:
       o << "(undefined: " << static_cast<uint16_t>(type) << ")";
@@ -159,46 +171,44 @@ std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
     case LogType::kCompensateDeleteBranch:
     case LogType::kInsertBranch:
       l.DumpPosition(o);
-      o << "\tInsert: " << l.redo_page;
+      o << "\t Insert: " << l.redo_page;
       break;
     case LogType::kUpdateBranch:
       l.DumpPosition(o);
-      o << "\tUpdate: " << l.undo_page << " -> " << l.redo_page;
+      o << "\t Update: " << l.undo_page << " -> " << l.redo_page;
       break;
     case LogType::kDeleteBranch:
       l.DumpPosition(o);
-      o << "\tDelete: " << l.undo_page;
+      o << "\t Delete: " << l.undo_page;
       break;
     case LogType::kLowestValue:
       l.DumpPosition(o);
-      o << "\tLowest: " << l.undo_page << " -> " << l.redo_page;
+      o << "\t Lowest: " << l.undo_page << " -> " << l.redo_page;
       break;
     case LogType::kBeginCheckpoint:
       return o;
     case LogType::kEndCheckpoint:
-      o << "\tdpt: {";
+      o << "\t DPT: {";
       for (const auto& dpt : l.dirty_page_table) {
         o << dpt.first << ": " << dpt.second << ", ";
       }
-      o << "}\ttt: {";
+      o << "}\t TT: {";
       for (const auto& tt : l.active_transaction_table) {
         o << tt << ", ";
       }
       o << "}";
       return o;
-    case LogType::kSetPrevNext: {
-      l.DumpPosition(o);
-      page_id_t undo_prev, undo_next, redo_prev, redo_next;
-      memcpy(&undo_prev, l.undo_data.data(), sizeof(undo_prev));
-      memcpy(&undo_next, l.undo_data.data() + sizeof(undo_prev),
-             sizeof(undo_prev));
-      memcpy(&redo_prev, l.redo_data.data(), sizeof(redo_prev));
-      memcpy(&redo_next, l.redo_data.data() + sizeof(redo_prev),
-             sizeof(redo_prev));
-      o << "[" << undo_prev << ", " << undo_next << "] to be "
-        << "[" << redo_prev << ", " << redo_next << "]";
       break;
-    }
+    case LogType::kSetLowFence:
+    case LogType::kSetHighFence:
+    case LogType::kSetFoster:
+      o << "\t Update: " << l.undo_data.size() << " -> " << l.redo_data.size();
+      break;
+    case LogType::kCompensateSetLowFence:
+    case LogType::kCompensateSetHighFence:
+    case LogType::kCompensateSetFoster:
+      o << "\t Update: " << l.redo_data.size();
+      break;
     case LogType::kBegin:
     case LogType::kCommit:
     case LogType::kSystemAllocPage:
@@ -427,7 +437,7 @@ LogRecord LogRecord::CompensatingDeleteLeafLogRecord(txn_id_t txn,
   return l;
 }
 
-LogRecord LogRecord::ComnensatingDeleteBranchLogRecord(txn_id_t txn,
+LogRecord LogRecord::CompensatingDeleteBranchLogRecord(txn_id_t txn,
                                                        page_id_t pid,
                                                        std::string_view slot,
                                                        page_id_t redo) {
@@ -437,6 +447,81 @@ LogRecord LogRecord::ComnensatingDeleteBranchLogRecord(txn_id_t txn,
   l.key = slot;
   l.type = LogType::kCompensateDeleteBranch;
   l.redo_page = redo;
+  return l;
+}
+
+LogRecord LogRecord::SetLowFenceLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                          page_id_t pid, const IndexKey& redo,
+                                          const IndexKey& undo) {
+  LogRecord l;
+  l.prev_lsn = prev_lsn;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.type = LogType::kSetLowFence;
+  l.redo_data = Encode(redo);
+  l.undo_data = Encode(undo);
+  return l;
+}
+
+LogRecord LogRecord::SetHighFenceLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                           page_id_t pid, const IndexKey& redo,
+                                           const IndexKey& undo) {
+  LogRecord l;
+  l.prev_lsn = prev_lsn;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.type = LogType::kSetHighFence;
+  l.redo_data = Encode(redo);
+  l.undo_data = Encode(undo);
+  return l;
+}
+
+LogRecord LogRecord::CompensateSetLowFenceLogRecord(lsn_t prev_lsn,
+                                                    txn_id_t txn, page_id_t pid,
+                                                    const IndexKey& redo) {
+  LogRecord l;
+  l.prev_lsn = prev_lsn;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.type = LogType::kCompensateSetLowFence;
+  l.redo_data = Encode(redo);
+  return l;
+}
+
+LogRecord LogRecord::CompensateSetHighFenceLogRecord(lsn_t prev_lsn,
+                                                     txn_id_t txn,
+                                                     page_id_t pid,
+                                                     const IndexKey& redo) {
+  LogRecord l;
+  l.prev_lsn = prev_lsn;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.type = LogType::kCompensateSetHighFence;
+  l.redo_data = Encode(redo);
+  return l;
+}
+
+LogRecord LogRecord::SetFosterLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                        page_id_t pid, const FosterPair& redo,
+                                        const FosterPair& undo) {
+  LogRecord l;
+  l.prev_lsn = prev_lsn;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.type = LogType::kSetFoster;
+  l.redo_data = Encode(redo);
+  l.undo_data = Encode(undo);
+  return l;
+}
+LogRecord LogRecord::CompensateSetFosterLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                                  page_id_t pid,
+                                                  const FosterPair& redo) {
+  LogRecord l;
+  l.prev_lsn = prev_lsn;
+  l.txn_id = txn;
+  l.pid = pid;
+  l.type = LogType::kCompensateSetFoster;
+  l.redo_data = Encode(redo);
   return l;
 }
 
@@ -501,35 +586,6 @@ LogRecord LogRecord::EndCheckpointLogRecord(
   return l;
 }
 
-LogRecord LogRecord::SetPrevNextLogRecord(lsn_t prev_lsn, txn_id_t tid,
-                                          page_id_t pid, page_id_t redo_next,
-                                          page_id_t redo_prev,
-                                          page_id_t undo_next,
-                                          page_id_t undo_prev) {
-  LogRecord l;
-  l.prev_lsn = prev_lsn;
-  l.txn_id = tid;
-  l.pid = pid;
-  l.type = LogType::kSetPrevNext;
-  l.undo_data = std::string(sizeof(undo_prev) + sizeof(undo_next), '\0');
-  memcpy(l.undo_data.data(), &undo_prev, sizeof(undo_prev));
-  memcpy(l.undo_data.data() + sizeof(undo_prev), &undo_next, sizeof(undo_next));
-  l.redo_data = std::string(sizeof(redo_prev) + sizeof(redo_next), '\0');
-  memcpy(l.redo_data.data(), &redo_prev, sizeof(redo_prev));
-  memcpy(l.redo_data.data() + sizeof(redo_prev), &redo_next, sizeof(redo_next));
-  return l;
-}
-
-void LogRecord::PrevNextLogRecordRedo(page_id_t& next, page_id_t& prev) const {
-  memcpy(&prev, redo_data.data(), sizeof(prev));
-  memcpy(&next, redo_data.data() + sizeof(prev), sizeof(next));
-}
-
-void LogRecord::PrevNextLogRecordUndo(page_id_t& prev, page_id_t& next) const {
-  memcpy(&prev, undo_data.data(), sizeof(prev));
-  memcpy(&next, undo_data.data() + sizeof(prev), sizeof(next));
-}
-
 void LogRecord::Clear() {
   type = LogType::kUnknown;
   pid = std::numeric_limits<page_id_t>::max();
@@ -568,11 +624,16 @@ size_t LogRecord::Size() const {
     case LogType::kCompensateUpdateLeaf:
     case LogType::kCompensateDeleteRow:
     case LogType::kCompensateDeleteLeaf:
+    case LogType::kCompensateSetLowFence:
+    case LogType::kCompensateSetHighFence:
+    case LogType::kCompensateSetFoster:
       size += SerializeSize(redo_data);
       break;
     case LogType::kUpdateLeaf:
-    case LogType::kSetPrevNext:
     case LogType::kUpdateRow:
+    case LogType::kSetLowFence:
+    case LogType::kSetHighFence:
+    case LogType::kSetFoster:
       size += SerializeSize(redo_data);
       size += SerializeSize(undo_data);
       break;
@@ -636,11 +697,16 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
     case LogType::kCompensateUpdateRow:
     case LogType::kCompensateDeleteRow:
     case LogType::kCompensateDeleteLeaf:
+    case LogType::kCompensateSetLowFence:
+    case LogType::kCompensateSetHighFence:
+    case LogType::kCompensateSetFoster:
       e << l.redo_data;
       break;
+    case LogType::kSetLowFence:
+    case LogType::kSetHighFence:
+    case LogType::kSetFoster:
     case LogType::kUpdateLeaf:
     case LogType::kUpdateRow:
-    case LogType::kSetPrevNext:
       e << l.redo_data << l.undo_data;
       break;
     case LogType::kDeleteLeaf:
@@ -682,15 +748,15 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
 Decoder& operator>>(Decoder& d, LogRecord& l) {
   l.Clear();
   d >> (uint16_t&)l.type >> l.prev_lsn >> l.txn_id;
-  uint8_t types;
+  uint8_t types = 0;
   d >> types;
-  if (types & kHasPageID) {
+  if ((types & kHasPageID) != 0) {
     d >> l.pid;
   }
-  if (types & kHasSlot) {
+  if ((types & kHasSlot) != 0) {
     d >> l.slot;
   }
-  if (types & kHasKey) {
+  if ((types & kHasKey) != 0) {
     d >> l.key;
   }
   switch (l.type) {
@@ -708,11 +774,14 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
     case LogType::kCompensateUpdateLeaf:
     case LogType::kCompensateDeleteRow:
     case LogType::kCompensateDeleteLeaf:
+    case LogType::kCompensateSetFoster:
       d >> l.redo_data;
       break;
     case LogType::kUpdateRow:
     case LogType::kUpdateLeaf:
-    case LogType::kSetPrevNext:
+    case LogType::kSetLowFence:
+    case LogType::kSetHighFence:
+    case LogType::kSetFoster:
       d >> l.redo_data >> l.undo_data;
       break;
     case LogType::kDeleteRow:
@@ -732,7 +801,7 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
       d >> l.undo_page;
       break;
     case LogType::kSystemAllocPage:
-      d >> (uint64_t&)l.allocated_page_type;
+      d >> l.allocated_page_type;
       break;
     case LogType::kEndCheckpoint: {
       d >> l.dirty_page_table >> l.active_transaction_table;

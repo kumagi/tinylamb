@@ -22,6 +22,13 @@
   ASSERT_EQ(value##_tmp.GetStatus(), Status::kSuccess); \
   type value = value##_tmp.Value()
 
+#define ASSERT_SUCCESS_AND_EQ(expr, expected)     \
+  {                                               \
+    auto tmp = expr;                              \
+    ASSERT_EQ(tmp.GetStatus(), Status::kSuccess); \
+    ASSERT_EQ(tmp.Value(), expected);             \
+  }
+
 #define ASSIGN_OR_CRASH(type, value, expr)             \
   StatusOr<type> value##_tmp = expr;                   \
   assert(value##_tmp.GetStatus() == Status::kSuccess); \
@@ -47,6 +54,9 @@ class StatusOr {
     return *value_;
   }
   [[nodiscard]] Status GetStatus() const { return status_; }
+  [[nodiscard]] explicit operator bool() const {
+    return status_ == Status::kSuccess;
+  }
 
  private:
   Status status_;

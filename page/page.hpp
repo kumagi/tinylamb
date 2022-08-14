@@ -3,6 +3,7 @@
 
 #include <unistd.h>
 
+#include <array>
 #include <iostream>
 
 #include "common/constants.hpp"
@@ -51,6 +52,18 @@ class Page {
   std::string_view GetKey(slot_t slot) const;
   page_id_t GetPage(slot_t slot) const;
 
+  // Leaf & Branch common manipulation.
+  Status SetLowFence(Transaction& txn, const IndexKey& key);
+  Status SetHighFence(Transaction& txn, const IndexKey& key);
+  [[nodiscard]] IndexKey GetLowFence(Transaction& txn) const;
+  [[nodiscard]] IndexKey GetHighFence(Transaction& txn) const;
+  [[nodiscard]] Status SetFoster(Transaction& txn, const FosterPair& foster);
+  [[nodiscard]] StatusOr<FosterPair> GetFoster(Transaction& txn);
+
+  void SetLowFenceImpl(const IndexKey& key);
+  void SetHighFenceImpl(const IndexKey& key);
+  void SetFosterImpl(const FosterPair& foster);
+
   // Leaf page manipulations.
   Status InsertLeaf(Transaction& txn, std::string_view key,
                     std::string_view value);
@@ -59,13 +72,13 @@ class Page {
   StatusOr<std::string_view> Read(Transaction& txn, std::string_view key) const;
   StatusOr<std::string_view> LowestKey(Transaction& txn);
   StatusOr<std::string_view> HighestKey(Transaction& txn);
-  Status SetPrevNext(Transaction& txn, page_id_t next, page_id_t prev);
 
   // Branch page manipulations.
   Status InsertBranch(Transaction& txn, std::string_view key, page_id_t pid);
   Status UpdateBranch(Transaction& txn, std::string_view key, page_id_t pid);
-  Status GetPageForKey(Transaction& txn, std::string_view key,
-                       page_id_t* page) const;
+  StatusOr<page_id_t> GetPageForKey(Transaction& txn,
+                                    std::string_view key) const;
+
   void SetLowestValue(Transaction& txn, page_id_t i);
   void SplitInto(Transaction& txn, std::string_view new_key, Page* right,
                  std::string* middle);
@@ -79,7 +92,6 @@ class Page {
   void InsertImpl(std::string_view key, std::string_view value);
   void UpdateImpl(std::string_view key, std::string_view value);
   void DeleteImpl(std::string_view key);
-  void SetPrevNextImpl(page_id_t prev, page_id_t next);
 
   void InsertBranchImpl(std::string_view key, page_id_t pid);
   void UpdateBranchImpl(std::string_view key, page_id_t pid);
@@ -111,7 +123,7 @@ class Page {
   enum PageType type = PageType::kUnknown;
   mutable uint64_t checksum = 0;
   union PageBody {
-    char dummy_[kPageBodySize];
+    std::array<char, kPageBodySize> dummy_;
     MetaPage meta_page;
     FreePage free_page;
     RowPage row_page;

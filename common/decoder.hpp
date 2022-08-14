@@ -21,8 +21,8 @@ class Decoder {
   Decoder& operator>>(std::string& str);
   Decoder& operator>>(uint8_t& u8);
   Decoder& operator>>(slot_t& slot);
-  Decoder& operator>>(page_id_t& pid);
   Decoder& operator>>(int64_t& i64);
+  Decoder& operator>>(uint64_t& u64);
   Decoder& operator>>(double& d);
   Decoder& operator>>(ValueType& v);
   Decoder& operator>>(bool& v);

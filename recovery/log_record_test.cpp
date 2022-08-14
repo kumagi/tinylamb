@@ -82,7 +82,34 @@ TEST_F(LogRecordTest, check) {
     SerializeDeserializeCheck(LogRecord::CompensatingDeleteLeafLogRecord(
         12, 21343, "key3", "deleted"));
     SerializeDeserializeCheck(
-        LogRecord::ComnensatingDeleteBranchLogRecord(12, 21343, "key3", 12312));
+        LogRecord::CompensatingDeleteBranchLogRecord(12, 21343, "key3", 12312));
+  }
+
+  {
+    // IndexKey related logs.
+    SCOPED_TRACE("Fence log tests");
+    SerializeDeserializeCheck(LogRecord::SetLowFenceLogRecord(
+        20, 21, 12, IndexKey::MinusInfinity(), IndexKey("low")));
+    SerializeDeserializeCheck(LogRecord::SetLowFenceLogRecord(
+        2, 231, 112, IndexKey("previous"), IndexKey::MinusInfinity()));
+    SerializeDeserializeCheck(LogRecord::SetLowFenceLogRecord(
+        120, 1, 2, IndexKey("foobar"), IndexKey("low")));
+
+    SerializeDeserializeCheck(LogRecord::SetHighFenceLogRecord(
+        29, 51, 32, IndexKey::PlusInfinity(), IndexKey("high")));
+    SerializeDeserializeCheck(LogRecord::SetHighFenceLogRecord(
+        2, 5, 42, IndexKey("previous"), IndexKey::PlusInfinity()));
+    SerializeDeserializeCheck(LogRecord::SetHighFenceLogRecord(
+        21, 91, 12, IndexKey("foobar"), IndexKey("high")));
+  }
+
+  {
+    // Foster Child related logs.
+    SCOPED_TRACE("Foster log tests");
+    SerializeDeserializeCheck(LogRecord::SetFosterLogRecord(
+        20, 21, 12, FosterPair("new", 0), FosterPair("old", 43)));
+    SerializeDeserializeCheck(LogRecord::SetFosterLogRecord(
+        2, 1, 11, FosterPair("ne", 44), FosterPair("old", 1)));
   }
 
   // Checkpoint related logs.
@@ -100,10 +127,6 @@ TEST_F(LogRecordTest, check) {
   // Lowest value log.
   SerializeDeserializeCheck(
       LogRecord::SetLowestLogRecord(14, 123, 345, 687, 89));
-
-  // Leaf Page
-  SerializeDeserializeCheck(
-      LogRecord::SetPrevNextLogRecord(99, 212, 48, 14, 12, 5, 6237));
 }
 
 }  // namespace tinylamb

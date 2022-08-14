@@ -21,8 +21,8 @@ class Encoder {
   Encoder& operator<<(std::string_view sv);
   Encoder& operator<<(uint8_t u8);
   Encoder& operator<<(slot_t slot);
-  Encoder& operator<<(page_id_t pid);
   Encoder& operator<<(int64_t i64);
+  Encoder& operator<<(uint64_t u64);
   Encoder& operator<<(double d);
   Encoder& operator<<(ValueType v);
   Encoder& operator<<(bool v);

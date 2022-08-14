@@ -37,12 +37,11 @@ class BPlusTree {
   bool SanityCheckForTest(PageManager* pm) const;
 
  private:
+  void GrowTreeHeightIfNeeded(Transaction& txn);
   PageRef FindLeafForInsert(Transaction& txn, std::string_view key,
-                            PageRef&& page, std::vector<PageRef>& parents);
+                            PageRef&& page);
 
   PageRef FindLeaf(Transaction& txn, std::string_view key, PageRef&& root);
-  Status InsertBranch(Transaction& txn, std::string_view key, page_id_t right,
-                      std::vector<PageRef>& parents);
   PageRef FindLeftmostPage(Transaction& txn, PageRef&& root);
   PageRef FindRightmostPage(Transaction& txn, PageRef&& root);
   PageRef LeftmostPage(Transaction& txn);

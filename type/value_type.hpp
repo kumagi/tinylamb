@@ -5,7 +5,12 @@
 
 namespace tinylamb {
 
-enum class ValueType : uint8_t { kNull, kInt64, kVarChar, kDouble };
+enum class ValueType : uint8_t {
+  kNull,
+  kInt64,
+  kVarChar,
+  kDouble,
+};
 
 inline std::string_view ValueTypeToString(ValueType type) {
   switch (type) {

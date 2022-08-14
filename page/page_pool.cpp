@@ -116,7 +116,7 @@ PagePool::~PagePool() {
   for (auto& it : pool_lru_) {
     if (0 < it.pin_count) {
       LOG(ERROR) << "caution: pinned page(" << it.page->PageID()
-                 << ") is to be deleted at count " << it.pin_count;
+                 << ") is to be deleted at pin count " << it.pin_count;
     }
     WriteBack(it.page.get());
   }

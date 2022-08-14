@@ -13,12 +13,14 @@
 
 namespace tinylamb {
 
+class IndexKey;
 class LockManager;
 class Logger;
 class PageManager;
 class Transaction;
 class RecoveryManager;
 enum class TransactionStatus : uint_fast8_t;
+struct FosterPair;
 struct LogRecord;
 struct RowPosition;
 
@@ -53,7 +55,12 @@ class TransactionManager {
                                  std::string_view key, page_id_t redo);
   void CompensateSetLowestValueLog(txn_id_t txn_id, page_id_t pid,
                                    page_id_t redo);
-
+  void CompensateSetLowFenceLog(txn_id_t txn_id, page_id_t pid,
+                                const IndexKey& redo);
+  void CompensateSetHighFenceLog(txn_id_t txn_id, page_id_t pid,
+                                 const IndexKey& redo);
+  void CompensateSetFosterLog(txn_id_t txn_id, page_id_t pid,
+                              const FosterPair& foster);
   bool GetExclusiveLock(const RowPosition& rp);
   bool GetSharedLock(const RowPosition& rp);
 

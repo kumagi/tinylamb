@@ -283,7 +283,7 @@ TEST_F(LeafPageTest, InsertCrash) {
       ASSERT_SUCCESS(page->InsertLeaf(txn, std::to_string(i) + ":key",
                                       std::to_string(i) + ":value"));
     }
-    txn.PreCommit();
+    ASSERT_SUCCESS(txn.PreCommit());
   }
   Recover();
   r_->RecoverFrom(0, tm_.get());
@@ -307,7 +307,7 @@ TEST_F(LeafPageTest, InsertAbort) {
       ASSERT_SUCCESS(page->InsertLeaf(txn, std::to_string(i) + ":key",
                                       std::to_string(i) + ":value"));
     }
-    txn.PreCommit();
+    ASSERT_SUCCESS(txn.PreCommit());
   }
   {
     auto txn = tm_->Begin();
@@ -346,7 +346,7 @@ TEST_F(LeafPageTest, UpdateCrash) {
       ASSERT_SUCCESS(page->InsertLeaf(txn, std::to_string(i) + ":key",
                                       std::to_string(i) + ":value"));
     }
-    txn.PreCommit();
+    ASSERT_SUCCESS(txn.PreCommit());
   }
   {
     auto txn = tm_->Begin();
@@ -378,7 +378,7 @@ TEST_F(LeafPageTest, UpdateAbort) {
       ASSERT_SUCCESS(page->InsertLeaf(txn, std::to_string(i) + ":key",
                                       std::to_string(i) + ":value"));
     }
-    txn.PreCommit();
+    ASSERT_SUCCESS(txn.PreCommit());
   }
   {
     auto txn = tm_->Begin();
@@ -413,7 +413,7 @@ TEST_F(LeafPageTest, DeleteCrash) {
       ASSERT_SUCCESS(page->InsertLeaf(txn, std::to_string(i) + ":key",
                                       std::to_string(i) + ":value"));
     }
-    txn.PreCommit();
+    ASSERT_SUCCESS(txn.PreCommit());
   }
   {
     auto txn = tm_->Begin();
@@ -421,7 +421,7 @@ TEST_F(LeafPageTest, DeleteCrash) {
     for (size_t i = 1; i < 10; i += 2) {
       ASSERT_SUCCESS(page->Delete(txn, std::to_string(i) + ":key"));
     }
-    txn.PreCommit();
+    ASSERT_SUCCESS(txn.PreCommit());
   }
   Recover();
   r_->RecoverFrom(0, tm_.get());
@@ -449,7 +449,7 @@ TEST_F(LeafPageTest, DeleteAbort) {
       ASSERT_SUCCESS(page->InsertLeaf(txn, std::to_string(i) + ":key",
                                       std::to_string(i) + ":value"));
     }
-    txn.PreCommit();
+    ASSERT_SUCCESS(txn.PreCommit());
   }
   {
     auto txn = tm_->Begin();
@@ -525,6 +525,71 @@ TEST_F(LeafPageTest, InsertDeleteHeavy) {
   for (const auto& kv : kvp) {
     ASSIGN_OR_ASSERT_FAIL(std::string_view, val, page->Read(txn, kv.first));
     ASSERT_EQ(kvp[kv.first], val);
+  }
+}
+
+TEST_F(LeafPageTest, Fences) {
+  Transaction txn = tm_->Begin();
+  PageRef page = Page();
+  for (int i = 0; i < 100; ++i) {
+    std::string low = RandomString((19937 * i) % 12 + 10000, false);
+    std::string high = RandomString((19937 * i) % 12 + 10000, false);
+    ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey(low)));
+    ASSERT_EQ(page->GetLowFence(txn), IndexKey(low));
+    ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey(high)));
+    ASSERT_EQ(page->GetLowFence(txn), IndexKey(low));
+    ASSERT_EQ(page->GetHighFence(txn), IndexKey(high));
+  }
+  ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey::MinusInfinity()));
+  ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey::PlusInfinity()));
+  ASSERT_TRUE(page->GetLowFence(txn).IsMinusInfinity());
+  ASSERT_TRUE(page->GetHighFence(txn).IsPlusInfinity());
+}
+
+TEST_F(LeafPageTest, FencesCrash) {
+  std::string low = RandomString(1234, false);
+  std::string high = RandomString(4567, false);
+  {
+    Transaction txn = tm_->Begin();
+    PageRef page = Page();
+    ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey(low)));
+    ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey(high)));
+    ASSERT_EQ(page->GetLowFence(txn), IndexKey(low));
+    ASSERT_EQ(page->GetHighFence(txn), IndexKey(high));
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+  {
+    auto restarted_txn = tm_->Begin();
+    PageRef recovered_page = Page();
+    ASSERT_EQ(recovered_page->GetLowFence(restarted_txn), IndexKey(low));
+    ASSERT_EQ(recovered_page->GetHighFence(restarted_txn), IndexKey(high));
+    ASSERT_SUCCESS(restarted_txn.PreCommit());
+  }
+}
+
+TEST_F(LeafPageTest, FosterChildCrash) {
+  for (int i = 0; i < 5; ++i) {
+    std::string key = RandomString((19937 * i) % 12 + 10000, false);
+    {
+      Transaction txn = tm_->Begin();
+      PageRef page = Page();
+      ASSERT_SUCCESS(page->SetFoster(txn, {key, page_id_t(i)}));
+      ASSIGN_OR_ASSERT_FAIL(FosterPair, result, page->GetFoster(txn));
+      ASSERT_EQ(result.key, key);
+      ASSERT_EQ(result.child_pid, i);
+      ASSERT_SUCCESS(txn.PreCommit());
+    }
+    Recover();
+    r_->RecoverFrom(0, tm_.get());
+    {
+      Transaction txn = tm_->Begin();
+      PageRef page = Page();
+      ASSIGN_OR_ASSERT_FAIL(FosterPair, result, page->GetFoster(txn));
+      ASSERT_EQ(result.key, key);
+      ASSERT_EQ(result.child_pid, i);
+    }
   }
 }
 

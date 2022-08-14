@@ -11,33 +11,30 @@
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
+#include "foster_pair.hpp"
+#include "page/index_key.hpp"
+#include "page/row_pointer.hpp"
 
 namespace tinylamb {
 
 class Transaction;
 class Page;
 class BranchPage;
+class IndexKey;
 
-class LeafPage {
+class LeafPage final {
   char* Payload() { return reinterpret_cast<char*>(rows_); }
   [[nodiscard]] const char* Payload() const {
     return reinterpret_cast<const char*>(rows_);
   }
-  struct RowPointer {
-    // Row start position from beginning fom this page.
-    bin_size_t offset = 0;
-
-    // Physical row size in bytes (required to get exact size for logging).
-    bin_size_t size = 0;
-  };
 
  public:
   void Initialize() {
-    prev_pid_ = 0;
-    next_pid_ = 0;
     row_count_ = 0;
     free_ptr_ = kPageBodySize - offsetof(LeafPage, rows_);
     free_size_ = kPageBodySize - offsetof(LeafPage, rows_);
+    low_fence_ = kMinusInfinity;
+    high_fence_ = kPlusInfinity;
   }
 
   Status Insert(page_id_t page_id, Transaction& txn, std::string_view key,
@@ -57,8 +54,7 @@ class LeafPage {
   StatusOr<std::string_view> LowestKey(Transaction& txn) const;
   StatusOr<std::string_view> HighestKey(Transaction& txn) const;
   [[nodiscard]] slot_t RowCount() const;
-  Status SetPrevNext(page_id_t pid, Transaction& txn, page_id_t prev,
-                     page_id_t next);
+  [[nodiscard]] StatusOr<FosterPair> GetFoster() const;
 
   // Split utils.
   void Split(page_id_t pid, Transaction& txn, std::string_view key,
@@ -67,7 +63,18 @@ class LeafPage {
   void InsertImpl(std::string_view key, std::string_view value);
   void UpdateImpl(std::string_view key, std::string_view value);
   void DeleteImpl(std::string_view key);
-  void SetPrevNextImpl(page_id_t next, page_id_t prev);
+  void SetFence(RowPointer& fence_pos, const IndexKey& new_fence);
+  Status SetLowFence(page_id_t pid, Transaction& txn, const IndexKey& lf);
+  Status SetHighFence(page_id_t pid, Transaction& txn, const IndexKey& hf);
+  void SetLowFenceImpl(const IndexKey& lf);
+  void SetHighFenceImpl(const IndexKey& hf);
+  [[nodiscard]] IndexKey GetLowFence() const;
+  [[nodiscard]] IndexKey GetHighFence() const;
+
+  Status SetFoster(page_id_t pid, Transaction& txn,
+                   const FosterPair& new_foster);
+  void SetFosterImpl(const FosterPair& foster);
+
   [[nodiscard]] bool SanityCheckForTest() const;
 
  private:
@@ -81,15 +88,16 @@ class LeafPage {
   friend class BranchPage;
   friend class std::hash<LeafPage>;
 
-  page_id_t prev_pid_ = 0;
-  page_id_t next_pid_ = 0;
   slot_t row_count_ = 0;
   bin_size_t free_ptr_ = kPageBodySize - offsetof(LeafPage, rows_);
   bin_size_t free_size_ = kPageBodySize - offsetof(LeafPage, rows_);
-  RowPointer rows_[0];
+  RowPointer low_fence_;
+  RowPointer high_fence_;
+  RowPointer foster_;
+  RowPointer rows_[];
 };
 
-static_assert(std::is_trivially_destructible<LeafPage>::value == true,
+static_assert(std::is_trivially_destructible<LeafPage>::value,
               "RowPage must be trivially destructible");
 
 }  // namespace tinylamb

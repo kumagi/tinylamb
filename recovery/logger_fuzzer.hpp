@@ -17,8 +17,8 @@ static const char alphanum[] =
     "0123456789"
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "abcdefghijklmnopqrstuvwxyz";
-constexpr int kBufferSize = 32;
-constexpr size_t kLoop = 10;
+constexpr int kBufferSize = 64;
+constexpr size_t kLoop = 1024;
 
 inline void Try(const uint64_t seed, bool verbose) {
   std::mt19937 rand(seed);
@@ -38,7 +38,7 @@ inline void Try(const uint64_t seed, bool verbose) {
     Logger logger(filename, kBufferSize, 1);
     lsn_t total = 0;
     for (size_t i = 0; i < kLoop; ++i) {
-      std::string log_data = RandomString(rand() % 100 + 1);
+      std::string log_data = RandomString(rand() % 1000 + 1);
       logger.AddLog(log_data);
       if (verbose) {
         LOG(TRACE) << log_data;
@@ -52,7 +52,6 @@ inline void Try(const uint64_t seed, bool verbose) {
 
   std::ifstream file;
   file.open(filename);
-  assert(filename == filename);
   size_t lsn = 0;
   for (const auto& exp : written) {
     std::string actual;

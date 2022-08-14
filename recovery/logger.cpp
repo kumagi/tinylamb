@@ -44,7 +44,7 @@ lsn_t Logger::AddLog(std::string_view payload) {
 
     if (buffered_lsn - flushed_lsn == buffer_.size()) {
       // Has no space in the buffer, wait for worker.
-      std::this_thread::sleep_for(std::chrono::microseconds(1));
+      std::this_thread::sleep_for(std::chrono::microseconds(every_us_ / 2));
       continue;
     }
     const size_t buffered = buffered_lsn % buffer_.size();
@@ -76,18 +76,17 @@ void Logger::LoggerWork() {
 
     const size_t buffered = buffered_lsn % buffer_.size();
     const size_t flushed = flushed_lsn % buffer_.size();
-
     const ssize_t flushed_size =
         write(dst_, buffer_.data() + flushed,
               (flushed < buffered ? buffered : buffer_.size()) - flushed);
     if (flushed_size <= 0) {
-      LOG(FATAL) << "Failed to flush.";
       continue;
     }
 
     fdatasync(dst_);  // Flush!
     flushed_lsn_.store(flushed_lsn + flushed_size, std::memory_order_release);
   }
+  fsync(dst_);
 }
 
 }  // namespace tinylamb

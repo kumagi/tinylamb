@@ -92,17 +92,29 @@ TEST_F(BPlusTreeTest, InsertLeaf) {
   ASSERT_SUCCESS(bpt_->Insert(txn, "lorem", "ipsum"));
   ASSERT_SUCCESS(bpt_->Insert(txn, "foo", "bar"));
   ASSERT_SUCCESS(bpt_->Insert(txn, "key", "blah"));
+
+  ASSERT_EQ(bpt_->Read(txn, "hello").Value(), "world");
+  ASSERT_EQ(bpt_->Read(txn, "this").Value(), "is a pen");
+  ASSERT_EQ(bpt_->Read(txn, "lorem").Value(), "ipsum");
+  ASSERT_EQ(bpt_->Read(txn, "foo").Value(), "bar");
+  ASSERT_EQ(bpt_->Read(txn, "key").Value(), "blah");
   ASSERT_SUCCESS(txn.PreCommit());
 }
 
 TEST_F(BPlusTreeTest, SplitLeaf) {
+  constexpr static int kKeys = 100;
   auto txn = tm_->Begin();
   std::string key_prefix("key");
   std::string long_value(8000, 'v');
-  for (int i = 0; i < 100; ++i) {
+  for (int i = 0; i < kKeys; ++i) {
     ASSERT_SUCCESS(
         bpt_->Insert(txn, key_prefix + std::to_string(i), long_value));
   }
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, key_prefix + std::to_string(i)),
+                          long_value);
+  }
+  ASSERT_SUCCESS(txn.PreCommit());
 }
 
 std::string KeyGen(int num, int width) {
@@ -112,12 +124,19 @@ std::string KeyGen(int num, int width) {
 }
 
 TEST_F(BPlusTreeTest, SplitBranch) {
+  constexpr static int kKeys = 1000;
   auto txn = tm_->Begin();
   std::string key_prefix("key");
   std::string long_value(2000, 'v');
-  for (int i = 0; i < 6; ++i) {
+  for (int i = 0; i < kKeys; ++i) {
     ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 10000), long_value));
   }
+  bpt_->Dump(txn, std::cerr);
+  std::cerr << "\n\n";
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(i, 10000)), long_value);
+  }
+  ASSERT_SUCCESS(txn.PreCommit());
 }
 
 TEST_F(BPlusTreeTest, MergeBranch) {
@@ -130,7 +149,7 @@ TEST_F(BPlusTreeTest, MergeBranch) {
   std::cerr << "\n";
   for (int i = 0; i < 6; ++i) {
     std::string key = KeyGen(i, 10000);
-    SCOPED_TRACE(key);
+    // SCOPED_TRACE(key);
     ASSERT_SUCCESS(bpt_->Delete(txn, key));
     bpt_->Dump(txn, std::cerr);
     std::cerr << "\n";

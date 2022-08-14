@@ -23,6 +23,10 @@ class Value {
   explicit Value(std::string&& str_val);
   explicit Value(double double_value);
   Value(const Value& o);
+  Value(Value&& o) noexcept;
+  Value& operator=(const Value& o);
+  Value& operator=(Value&& o) noexcept;
+  ~Value() = default;
 
   [[nodiscard]] bool Truthy() const;
 
@@ -53,7 +57,6 @@ class Value {
   Value operator^(const Value& rhs) const;
 
   [[nodiscard]] std::string AsString() const;
-  Value& operator=(const Value& rhs);
   friend std::ostream& operator<<(std::ostream& o, const Value& v);
 
   // Read/Write with type info.
