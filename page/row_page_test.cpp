@@ -34,7 +34,7 @@ TEST_F(RowPageTest, InsertMany) {
     consumed += message.size();
   }
   ASSERT_EQ(page.FreeSizeForTest(),
-            before_size - (kInserts * sizeof(RowPage::RowPointer) + consumed));
+            before_size - (kInserts * sizeof(RowPointer) + consumed));
 }
 
 TEST_F(RowPageTest, ReadMany) {

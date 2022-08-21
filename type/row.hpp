@@ -24,7 +24,6 @@ struct Row {
   Row& operator=(Row&&) = default;
   ~Row() = default;
 
-  void Add(const Value& v);
   Value& operator[](size_t i);
   const Value& operator[](size_t i) const;
   size_t Serialize(char* dst) const;

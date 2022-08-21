@@ -13,6 +13,7 @@
 #include "foster_pair.hpp"
 #include "page/index_key.hpp"
 #include "page/row_pointer.hpp"
+#include "page_ref.hpp"
 
 namespace tinylamb {
 

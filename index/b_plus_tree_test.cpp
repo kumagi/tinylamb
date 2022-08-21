@@ -124,7 +124,7 @@ std::string KeyGen(int num, int width) {
 }
 
 TEST_F(BPlusTreeTest, SplitBranch) {
-  constexpr static int kKeys = 1000;
+  constexpr static int kKeys = 4;
   auto txn = tm_->Begin();
   std::string key_prefix("key");
   std::string long_value(2000, 'v');

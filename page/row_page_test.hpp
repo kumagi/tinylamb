@@ -60,7 +60,7 @@ class RowPageTest : public ::testing::Test {
     Status insert_result = page->Insert(txn, str).GetStatus();
     if (insert_result == Status::kSuccess) {
       EXPECT_EQ(rp.FreeSizeForTest(),
-                before_size - str.size() - sizeof(RowPage::RowPointer));
+                before_size - str.size() - sizeof(RowPointer));
     }
     if (commit) {
       EXPECT_SUCCESS(txn.PreCommit());

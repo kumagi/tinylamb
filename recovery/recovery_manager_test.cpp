@@ -77,7 +77,7 @@ TEST_F(RecoveryManagerTest, InsertAbort) {
   page.PageUnlock();
 
   ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
-            before_size - record.size() - sizeof(RowPage::RowPointer));
+            before_size - record.size() - sizeof(RowPointer));
   txn.Abort();
   ASSERT_EQ(GetRowCount(), 0);
 }
@@ -176,7 +176,7 @@ TEST_F(RecoveryManagerTest, InsertCrash) {
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
     ASSERT_SUCCESS(page->Insert(txn, record).GetStatus());
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
-              before_size - record.size() - sizeof(RowPage::RowPointer));
+              before_size - record.size() - sizeof(RowPointer));
   }
   // Note that txn is not committed.
   Recover();
@@ -229,7 +229,7 @@ TEST_F(RecoveryManagerTest, InsertMediaCrash) {
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
     ASSERT_SUCCESS(page->Insert(txn, record).GetStatus());
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
-              before_size - record.size() - sizeof(RowPage::RowPointer));
+              before_size - record.size() - sizeof(RowPointer));
   }
   // Note that txn is not committed.
   MediaFailure();
@@ -282,7 +282,7 @@ TEST_F(RecoveryManagerTest, InsertSinglePageFailure) {
 
     ASSERT_SUCCESS(page->Insert(txn, record).GetStatus());
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
-              before_size - record.size() - sizeof(RowPage::RowPointer));
+              before_size - record.size() - sizeof(RowPointer));
   }
   // Note that txn is not committed.
   SinglePageFailure(page_id_);

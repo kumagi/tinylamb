@@ -8,7 +8,13 @@
 
 namespace tinylamb {
 
-TEST(ValueTest, Construct) { Value v; }
+TEST(ValueTest, DefaultConstruct) { Value v; }
+
+TEST(ValueTest, Calculate) {
+  ASSERT_EQ(Value(1), Value(1));
+  ASSERT_EQ(Value(2) + Value(3), Value(5));
+  ASSERT_EQ(Value(3) - Value(4), Value(-1));
+}
 
 void SerializeDeserializeTest(const Value& v) {
   std::string buff;
@@ -23,7 +29,7 @@ void SerializeDeserializeTest(const Value& v) {
 
 TEST(ValueTest, SerializeDesrialize) {
   SerializeDeserializeTest(Value(1));
-  SerializeDeserializeTest(Value(int64_t(-301)));
+  SerializeDeserializeTest(Value(301L));
   SerializeDeserializeTest(Value("hello"));
   SerializeDeserializeTest(Value(439.3));
 }
@@ -40,7 +46,7 @@ TEST(ValueTest, Dump) {
   LOG(INFO) << Value("foo-bar");
   LOG(WARN) << Value(1.23e3);
   LOG(ERROR) << Value();
-  LOG(FATAL) << Value("foo") << " " << Value();
+  LOG(FATAL) << Value("foo");
 }
 
 void MemcomparableFormatEncodeTest(const std::vector<Value>& input) {

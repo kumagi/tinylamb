@@ -14,6 +14,11 @@ struct RowPosition;
 
 class ExecutorBase {
  public:
+  ExecutorBase() = default;
+  ExecutorBase(const ExecutorBase&) = delete;
+  ExecutorBase(ExecutorBase&&) = delete;
+  ExecutorBase& operator=(const ExecutorBase&) = delete;
+  ExecutorBase& operator=(ExecutorBase&&) = delete;
   virtual ~ExecutorBase() = default;
   virtual bool Next(Row* dst, RowPosition* rp) = 0;
   virtual void Dump(std::ostream& o, int indent) const = 0;

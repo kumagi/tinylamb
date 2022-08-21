@@ -27,6 +27,7 @@ PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit) {
   auto entry = pool_.find(page_id);
   if (entry != pool_.end()) {
     entry->second->pin_count++;
+    LOG(WARN) << "pin: " << page_id << " -> " << entry->second->pin_count;
     Touch(entry->second);
     if (cache_hit != nullptr) {
       *cache_hit = true;
@@ -64,6 +65,7 @@ void PagePool::Unpin(page_id_t page_id) {
   auto page_entry = pool_.find(page_id);
   assert(page_entry != pool_.end());
   page_entry->second->pin_count--;
+  LOG(ERROR) << "unpin: " << page_id << " -> " << page_entry->second->pin_count;
 }
 
 // Precondition: pool_latch is locked.

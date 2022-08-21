@@ -11,8 +11,6 @@
 
 namespace tinylamb {
 
-void Row::Add(const Value& v) { values_.push_back(v); }
-
 Value& Row::operator[](size_t i) { return values_[i]; }
 
 const Value& Row::operator[](size_t i) const { return values_[i]; }

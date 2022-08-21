@@ -7,6 +7,7 @@
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "common/status_or.hpp"
+#include "page/row_pointer.hpp"
 
 namespace tinylamb {
 
@@ -58,14 +59,6 @@ class RowPage {
   [[nodiscard]] bin_size_t FreeSizeForTest() const { return free_size_; }
 
   void DeFragment();
-
-  struct RowPointer {
-    // Row start position from beginning fom this page.
-    bin_size_t offset = 0;
-
-    // Physical row size in bytes (required to get exact size for logging).
-    bin_size_t size = 0;
-  };
 
   friend class Page;
   friend class std::hash<RowPage>;

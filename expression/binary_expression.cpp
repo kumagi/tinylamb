@@ -8,7 +8,9 @@ namespace tinylamb {
 namespace {
 
 Value Execute(BinaryOperation op, const Value& left, const Value& right) {
-  if (left.type != right.type) throw std::runtime_error("type mismatch");
+  if (left.type != right.type) {
+    throw std::runtime_error("type mismatch");
+  }
   switch (op) {
     case BinaryOperation::kAdd:
       return left + right;
@@ -33,11 +35,11 @@ Value Execute(BinaryOperation op, const Value& left, const Value& right) {
     case BinaryOperation::kGreaterThanEquals:
       return Value(left >= right);
     case BinaryOperation::kAnd:
-      return Value(left & right);
+      return (left & right);
     case BinaryOperation::kOr:
-      return Value(left | right);
+      return (left | right);
     case BinaryOperation::kXor:
-      return Value(left ^ right);
+      return (left ^ right);
   }
 }
 

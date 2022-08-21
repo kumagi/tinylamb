@@ -18,8 +18,14 @@ class ExpressionBase;
 class Selection : public ExecutorBase {
  public:
   Selection(Expression exp, Schema schema, Executor src);
+  Selection(const Selection&) = delete;
+  Selection(Selection&&) = delete;
+  Selection& operator=(const Selection&) = delete;
+  Selection& operator=(Selection&&) = delete;
   ~Selection() override = default;
+
   bool Next(Row* dst, RowPosition* rp) override;
+
   void Dump(std::ostream& o, int indent) const override;
 
  private:

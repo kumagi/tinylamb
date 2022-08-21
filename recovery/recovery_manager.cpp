@@ -142,7 +142,6 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
     case LogType::kUpdateLeaf:
       tm->CompensateUpdateLog(log.txn_id, log.pid, log.key, log.undo_data);
       target->UpdateImpl(log.key, log.undo_data);
-      LOG(ERROR) << "undo: " << log.undo_data;
       break;
     case LogType::kUpdateBranch:
       tm->CompensateUpdateBranchLog(log.txn_id, log.pid, log.key,
