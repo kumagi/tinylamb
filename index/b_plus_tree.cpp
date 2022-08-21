@@ -185,16 +185,11 @@ Status BPlusTree::Update(Transaction& txn, std::string_view key,
 }
 
 Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
-  PageRef root = txn.PageManager()->GetPage(root_);
-  PageRef leaf = FindLeafForInsert(txn, key, std::move(root));
-  std::string next_leftmost = leaf->GetKey(0) == key && 1 < leaf->RowCount()
-                                  ? std::string(leaf->GetKey(1))
-                                  : "";
-  Status s = leaf->Delete(txn, key);
+  PageRef curr = FindLeaf(txn, key);
+  Status s = curr->Delete(txn, key);
   if (s != Status::kSuccess) {
     return s;
   }
-  PageRef ref = std::move(leaf);
   /*
   while (ref->RowCount() == 0 && !parents.empty()) {
     PageRef parent = std::move(parents.back());
@@ -266,7 +261,6 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
     ref.PageUnlock();
     ref = std::move(parent);
   }
-  */
   if (ref->RowCount() == 0) {
     if (ref->Type() == PageType::kBranchPage) {
       ref.PageUnlock();
@@ -296,6 +290,7 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
       txn.PageManager()->DestroyPage(txn, next_root.get());
     }
   }
+   */
   return s;
 }
 

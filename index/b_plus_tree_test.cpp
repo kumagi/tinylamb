@@ -136,6 +136,9 @@ TEST_F(BPlusTreeTest, SplitBranch) {
   for (int i = 0; i < kKeys; ++i) {
     ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(i, 10000)), long_value);
   }
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(i, 10000)), long_value);
+  }
   ASSERT_SUCCESS(txn.PreCommit());
 }
 

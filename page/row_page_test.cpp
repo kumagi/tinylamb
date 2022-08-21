@@ -51,9 +51,9 @@ TEST_F(RowPageTest, ReadMany) {
 }
 
 TEST_F(RowPageTest, UpdateMany) {
-  constexpr int kInserts = 20;
-  constexpr char kLongMessage[] = " long updated messages!!!!!";
-  constexpr char kShortMessage[] = "s";
+  constexpr static int kInserts = 20;
+  constexpr static char kLongMessage[] = " long updated messages!!!!!";
+  constexpr static char kShortMessage[] = "s";
   for (int i = 0; i < kInserts; ++i) {
     InsertRow(std::to_string(i) + " message");
   }
@@ -81,7 +81,7 @@ TEST_F(RowPageTest, UpdateMany) {
 }
 
 TEST_F(RowPageTest, DeleteMany) {
-  constexpr char kMessage[] = "this is a pen";
+  constexpr static char kMessage[] = "this is a pen";
   constexpr int kRows = 100;
   std::unordered_set<std::string> inserted;
   for (int i = 0; i < kRows; ++i) {
