@@ -85,6 +85,9 @@ class BranchPage final {
   void Dump(std::ostream& o, int indent) const;
   bool SanityCheckForTest(PageManager* pm) const;
 
+  Status MoveRightToFoster(Transaction& txn, Page& right);
+  Status MoveLeftFromFoster(Transaction& txn, Page& right);
+
  private:
   [[nodiscard]] std::string_view GetRow(size_t idx) const;
   constexpr static size_t kLowFenceIdx = 0;

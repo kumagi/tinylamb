@@ -44,10 +44,11 @@ std::string_view LeafPage::GetValue(size_t idx) const {
 
 Status LeafPage::Insert(page_id_t page_id, Transaction& txn,
                         std::string_view key, std::string_view value) {
-  constexpr size_t kThreshold = kPageBodySize / 2;
+  constexpr size_t kThreshold = kPageBodySize / 6;
   const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
   const bin_size_t expected_size = physical_size + sizeof(RowPointer);
   if (kThreshold < expected_size) {
+    LOG(INFO) << "too big: " << kThreshold << " << " << expected_size;
     return Status::kTooBigData;
   }
   if (free_size_ < expected_size) {
@@ -87,7 +88,11 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
 
 Status LeafPage::Update(page_id_t page_id, Transaction& txn,
                         std::string_view key, std::string_view value) {
+  constexpr size_t kThreshold = kPageBodySize / 6;
   const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
+  if (kThreshold < physical_size) {
+    return Status::kTooBigData;
+  }
   ASSIGN_OR_RETURN(std::string_view, old_value, Read(page_id, txn, key));
   const bin_size_t old_size = SerializeSize(key) + SerializeSize(old_value);
   if (old_size < physical_size && free_size_ < physical_size - old_size) {
@@ -372,7 +377,6 @@ IndexKey LeafPage::GetHighFence() const {
 
 Status LeafPage::SetFoster(page_id_t pid, Transaction& txn,
                            const FosterPair& new_foster) {
-  free_size_ += foster_.size;
   size_t physical_size = SerializeSize(new_foster.key) + sizeof(page_id_t);
   if (foster_.size < physical_size &&
       free_size_ < physical_size - foster_.size) {
@@ -389,13 +393,13 @@ Status LeafPage::SetFoster(page_id_t pid, Transaction& txn,
 }
 
 void LeafPage::SetFosterImpl(const FosterPair& foster) {
+  free_size_ += foster_.size;
   if (foster.key.empty()) {
     foster_ = {0, 0};
     return;
   }
   bin_size_t physical_size =
       SerializeSize(foster.key) + sizeof(foster.child_pid);
-  free_size_ += foster_.size;
   if (free_ptr_ <= physical_size) {
     DeFragment();
   }
@@ -427,6 +431,42 @@ void LeafPage::Dump(std::ostream& o, int indent) const {
       << Indent(indent) << OmittedString(GetKey(i), 40) << " :"
       << OmittedString(GetValue(i), 20);
   }
+  if (0 < foster_.size) {
+    std::string_view serialized_key;
+    page_id_t child = 0;
+    size_t offset =
+        DeserializeStringView(Payload() + foster_.offset, &serialized_key);
+    DeserializePID(Payload() + foster_.offset + offset, &child);
+    o << "\n"
+      << Indent(indent) << "  FosterKey: " << serialized_key << " -> " << child;
+  }
+}
+
+Status LeafPage::MoveRightToFoster(Transaction& txn, Page& right) {
+  assert(right.Type() == PageType::kLeafPage);
+  assert(1 < row_count_);
+  std::string_view move_key = GetKey(row_count_ - 1);
+  std::string_view move_value = GetValue(row_count_ - 1);
+  RETURN_IF_FAIL(right.InsertLeaf(txn, move_key, move_value));
+  Page* this_page = GET_PAGE_PTR(this);
+  RETURN_IF_FAIL(
+      this_page->SetFoster(txn, FosterPair(move_key, right.page_id)));
+  RETURN_IF_FAIL(this_page->Delete(txn, move_key));
+  return Status::kSuccess;
+}
+
+Status LeafPage::MoveLeftFromFoster(Transaction& txn, Page& right) {
+  assert(right.Type() == PageType::kLeafPage);
+  assert(1 < right.RowCount());
+  std::string_view move_key = right.GetKey(0);
+  std::string_view next_foster_key = right.GetKey(1);
+  std::string_view move_value = right.body.leaf_page.GetValue(0);
+  Page* this_page = GET_PAGE_PTR(this);
+  RETURN_IF_FAIL(this_page->InsertLeaf(txn, move_key, move_value));
+  RETURN_IF_FAIL(
+      this_page->SetFoster(txn, FosterPair(next_foster_key, right.PageID())));
+  RETURN_IF_FAIL(right.Delete(txn, move_key));
+  return Status::kSuccess;
 }
 
 bool LeafPage::SanityCheckForTest() const {

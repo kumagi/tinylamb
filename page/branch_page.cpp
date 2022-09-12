@@ -42,6 +42,9 @@ void BranchPage::SetLowestValue(page_id_t pid, Transaction& txn,
 Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
                           page_id_t value) {
   const bin_size_t physical_size = SerializeSize(key) + sizeof(value);
+  if (kPageBodySize / 6 < physical_size) {
+    return Status::kTooBigData;
+  }
   if (free_size_ < physical_size + sizeof(RowPointer)) {
     return Status::kNoSpace;
   }
@@ -75,6 +78,10 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
 
 Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
                           page_id_t value) {
+  const bin_size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
+  if (kPageBodySize / 6 < physical_size) {
+    return Status::kTooBigData;
+  }
   const size_t pos = Search(key);
   if (row_count_ < pos || GetKey(pos) != key) {
     return Status::kNotExists;
@@ -353,6 +360,15 @@ void BranchPage::Dump(std::ostream& o, int indent) const {
       << Indent(indent) << OmittedString(GetKey(i), 20) << "\n"
       << Indent(indent + 2) << GetValue(i);
   }
+  if (0 < rows_[kFosterIdx].size) {
+    std::string_view serialized_key;
+    page_id_t child = 0;
+    size_t offset = DeserializeStringView(Payload() + rows_[kFosterIdx].offset,
+                                          &serialized_key);
+    DeserializePID(Payload() + rows_[kFosterIdx].offset + offset, &child);
+    o << "\n"
+      << Indent(indent) << "  FosterKey: " << serialized_key << " -> " << child;
+  }
 }
 
 std::string SmallestKey(PageRef&& page) {
@@ -441,6 +457,40 @@ void BranchPage::DeFragment() {
     memcpy(Payload() + offset, payloads[i].data(), payloads[i].size());
   }
   free_ptr_ = offset;
+}
+
+Status BranchPage::MoveRightToFoster(Transaction& txn, Page& right) {
+  assert(right.Type() == PageType::kBranchPage);
+  assert(0 < row_count_);
+  ASSIGN_OR_CRASH(FosterPair, old_foster, GetFoster());
+  assert(old_foster.child_pid == right.PageID());
+  std::string_view move_key = GetKey(row_count_ - 1);
+  page_id_t move_value = GetValue(row_count_ - 1);
+  RETURN_IF_FAIL(right.InsertBranch(txn, old_foster.key,
+                                    right.body.branch_page.lowest_page_));
+  right.SetLowestValue(txn, move_value);
+  Page* this_page = GET_PAGE_PTR(this);
+  RETURN_IF_FAIL(
+      this_page->SetFoster(txn, FosterPair(move_key, right.page_id)));
+  RETURN_IF_FAIL(this_page->Delete(txn, move_key));
+  return Status::kSuccess;
+}
+
+Status BranchPage::MoveLeftFromFoster(Transaction& txn, Page& right) {
+  assert(right.Type() == PageType::kBranchPage);
+  assert(0 < right.RowCount());
+  ASSIGN_OR_CRASH(FosterPair, old_foster, GetFoster());
+  assert(old_foster.child_pid == right.PageID());
+  std::string_view move_key = right.GetKey(0);
+  page_id_t move_value = right.body.branch_page.GetValue(0);
+  Page* this_page = GET_PAGE_PTR(this);
+  RETURN_IF_FAIL(this_page->InsertBranch(txn, old_foster.key,
+                                         right.body.branch_page.lowest_page_));
+  RETURN_IF_FAIL(
+      this_page->SetFoster(txn, FosterPair(move_key, right.PageID())));
+  right.SetLowestValue(txn, move_value);
+  RETURN_IF_FAIL(right.Delete(txn, move_key));
+  return Status::kSuccess;
 }
 
 }  // namespace tinylamb

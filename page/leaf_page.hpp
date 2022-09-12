@@ -75,6 +75,9 @@ class LeafPage final {
                    const FosterPair& new_foster);
   void SetFosterImpl(const FosterPair& foster);
 
+  Status MoveRightToFoster(Transaction& txn, Page& right);
+  Status MoveLeftFromFoster(Transaction& txn, Page& right);
+
   [[nodiscard]] bool SanityCheckForTest() const;
 
  private:

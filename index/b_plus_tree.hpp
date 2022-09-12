@@ -37,14 +37,11 @@ class BPlusTree {
   bool SanityCheckForTest(PageManager* pm) const;
 
  private:
-  void GrowTreeHeightIfNeeded(Transaction& txn) const;
-  PageRef FindLeafForInsert(Transaction& txn, std::string_view key,
-                            PageRef&& page);
-  PageRef FindLeaf(Transaction& txn, std::string_view key);
   static Status SplitAndInsert(Transaction& txn, PageRef&& leaf,
                                std::string_view key, std::string_view value);
+  void GrowTreeHeightIfNeeded(Transaction& txn) const;
+  PageRef FindLeaf(Transaction& txn, std::string_view key);
 
-  PageRef FindLeaf(Transaction& txn, std::string_view key, PageRef&& root);
   PageRef FindLeftmostPage(Transaction& txn, PageRef&& root);
   PageRef FindRightmostPage(Transaction& txn, PageRef&& root);
   PageRef LeftmostPage(Transaction& txn);

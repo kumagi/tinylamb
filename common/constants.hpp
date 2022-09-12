@@ -113,6 +113,10 @@ inline std::string_view ToString(Status s) {
       return "NotExists";
     case Status::kNotImplemented:
       return "NotImplemented";
+    case Status::kTooBigData:
+      return "TooBigData";
+    case Status::kAmbiguousQuery:
+      return "AmbiguousQuery";
     default:
       return "INVALID STATUS";
   }

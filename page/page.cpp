@@ -94,7 +94,6 @@ std::string_view Page::GetKey(slot_t slot) const {
 
 page_id_t Page::GetPage(slot_t slot) const {
   ASSERT_PAGE_TYPE(PageType::kBranchPage)
-  LOG(ERROR) << slot;
   return body.branch_page.GetValue(slot);
 }
 

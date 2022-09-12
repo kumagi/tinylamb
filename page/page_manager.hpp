@@ -34,7 +34,6 @@ class PageManager {
  private:
   PageRef GetMetaPage();
 
- private:
   friend class RecoveryManager;
   PagePool pool_;
 };
