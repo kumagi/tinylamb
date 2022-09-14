@@ -13,6 +13,8 @@ namespace tinylamb {
 
 std::string Hex(std::string_view in);
 
+std::string OmittedString(std::string_view original, int length);
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_DEBUG_HPP

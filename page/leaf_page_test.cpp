@@ -202,31 +202,41 @@ TEST_F(LeafPageTest, InsertDefrag) {
 
   // InsertBranch value.
   std::string value;
-  value.resize(10000);
+  value.resize(5000);
   for (char& i : value) i = '1';
   ASSERT_SUCCESS(
-      page->InsertLeaf(txn, "key1", value));  // About 10000 bytes used.
+      page->InsertLeaf(txn, "key1", value));  // About 5000 bytes used.
+  ASSERT_SUCCESS(
+      page->InsertLeaf(txn, "key2", value));  // About 10000 bytes used.
   for (char& i : value) i = '2';
   ASSERT_SUCCESS(
-      page->InsertLeaf(txn, "key2", value));  // About 20000 bytes used.
+      page->InsertLeaf(txn, "key3", value));  // About 15000 bytes used.
+  ASSERT_SUCCESS(
+      page->InsertLeaf(txn, "key4", value));  // About 20000 bytes used.
   for (char& i : value) i = '3';
   ASSERT_SUCCESS(
-      page->InsertLeaf(txn, "key3", value));          // About 30000 bytes used.
-  ASSERT_FAIL(page->InsertLeaf(txn, "key4", value));  // No space left.
+      page->InsertLeaf(txn, "key5", value));  // About 25000 bytes used.
+  ASSERT_SUCCESS(
+      page->InsertLeaf(txn, "key6", value));          // About 30000 bytes used.
+  ASSERT_FAIL(page->InsertLeaf(txn, "key7", value));  // No space left.
   ASSERT_SUCCESS(page->Delete(txn, "key2"));          // Make new space.
   for (char& i : value) i = '4';
-  ASSERT_SUCCESS(page->InsertLeaf(txn, "key4", value));  // Should success.
-  ASSERT_FAIL(page->InsertLeaf(txn, "key5", value));     // No space left.
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "key7", value));  // Should success.
+  ASSERT_FAIL(page->InsertLeaf(txn, "key8", value));     // No space left.
   ASSERT_SUCCESS(page->Delete(txn, "key1"));             // Make new space.
   for (char& i : value) i = '5';
-  ASSERT_SUCCESS(page->InsertLeaf(txn, "key5", value));  // Should success.
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "key8", value));  // Should success.
 
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row1, page->Read(txn, "key3"));
-  for (const char& i : row1) ASSERT_EQ(i, '3');
+  for (const char& i : row1) ASSERT_EQ(i, '2');
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row2, page->Read(txn, "key4"));
-  for (const char& i : row2) ASSERT_EQ(i, '4');
+  for (const char& i : row2) ASSERT_EQ(i, '2');
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row3, page->Read(txn, "key5"));
-  for (const char& i : row3) ASSERT_EQ(i, '5');
+  for (const char& i : row3) ASSERT_EQ(i, '3');
+  ASSIGN_OR_ASSERT_FAIL(std::string_view, row4, page->Read(txn, "key7"));
+  for (const char& i : row4) ASSERT_EQ(i, '4');
+  ASSIGN_OR_ASSERT_FAIL(std::string_view, row5, page->Read(txn, "key8"));
+  for (const char& i : row5) ASSERT_EQ(i, '5');
 }
 
 TEST_F(LeafPageTest, LowestHighestKey) {

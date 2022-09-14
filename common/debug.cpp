@@ -17,4 +17,15 @@ std::string Hex(std::string_view in) {
   return s.str();
 }
 
+std::string OmittedString(std::string_view original, int length) {
+  if ((size_t)length < original.length()) {
+    std::string omitted_key = std::string(original).substr(0, 8);
+    omitted_key +=
+        "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
+    omitted_key += original.substr(original.length() - 8);
+    return omitted_key;
+  }
+  return std::string(original);
+}
+
 }  // namespace tinylamb
