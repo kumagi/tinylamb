@@ -1,9 +1,10 @@
 //
-// Created by kumagi on 2022/04/10.
+// Created by kumagi on 22/09/22.
 //
+
 #include <filesystem>
 
-#include "index/b_plus_tree_fuzzer.hpp"
+#include "page/leaf_page_fuzzer.hpp"
 
 int main(int argc, char** argv) {
   if (argc < 2) {
@@ -16,7 +17,7 @@ int main(int argc, char** argv) {
   file_content.resize(8);
   case_data.read(file_content.data(), 8);
   LOG(INFO) << "test file: " << file;
-  tinylamb::Try(*reinterpret_cast<uint64_t*>(file_content.data()), true);
+  tinylamb::Try(*(uint64_t*)file_content.data(), true);
   LOG(INFO) << "successfully finished.";
   return 0;
 }

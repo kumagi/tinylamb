@@ -493,9 +493,9 @@ TEST_F(BPlusTreeTest, InsertDelete) {
   std::unordered_set<std::string> keys;
   keys.reserve(kCount);
   for (int i = 0; i < kCount; ++i) {
-    Row r({Value(i), Value(RandomString((19937 * i) % 120 + 10, false))});
-    std::string key = r.EncodeMemcomparableFormat();
+    std::string key = RandomString((19937 * i) % 120 + 10, false);
     ASSERT_SUCCESS(bpt_->Insert(txn, key, "foo"));
+    LOG(WARN) << "insert: " << OmittedString(key, 20);
     keys.insert(key);
   }
   Row read;
@@ -507,10 +507,10 @@ TEST_F(BPlusTreeTest, InsertDelete) {
     LOG(INFO) << "delete: " << OmittedString(*it, 20);
     ASSERT_SUCCESS(bpt_->Delete(txn, *it));
     keys.erase(it);
-    Row r({Value(i), Value(RandomString((19937 * i) % 2200 + 3000, false))});
-    std::string inserting_key = r.EncodeMemcomparableFormat();
-    bpt_->Insert(txn, inserting_key, "bar");
+    std::string inserting_key = RandomString((19937 * i) % 2000 + 2000, false);
+    ASSERT_SUCCESS(bpt_->Insert(txn, inserting_key, "bar"));
     keys.insert(inserting_key);
+    ASSERT_TRUE(bpt_->SanityCheckForTest(txn.PageManager()));
   }
 }
 
@@ -530,15 +530,19 @@ TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
     ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
     ASSERT_EQ(kvp[kv.first], val);
   }
-  for (int i = 0; i < kCount * 4; ++i) {
+  for (int i = 0; i < kCount * 40; ++i) {
     auto iter = kvp.begin();
     std::advance(iter, (i * 19937) % kvp.size());
+    bpt_->Dump(txn, std::cerr, 0);
+    std::cerr << "\n";
+    LOG(INFO) << "delete: " << OmittedString(iter->first, 20);
     ASSERT_SUCCESS(bpt_->Delete(txn, iter->first));
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     kvp.erase(iter);
 
     std::string key = RandomString((19937 * i) % 130 + 1000, false);
-    std::string value = RandomString((19937 * i) % 320 + 5000, false);
+    std::string value = RandomString((19937 * i) % 320 + 3000, false);
+    LOG(INFO) << "insert: " << OmittedString(key, 20);
     ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     kvp[key] = value;

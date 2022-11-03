@@ -231,7 +231,7 @@ void BranchPage::SetFosterImpl(const FosterPair& foster) {
   }
   bin_size_t physical_size =
       SerializeSize(foster.key) + sizeof(foster.child_pid);
-  if (free_ptr_ <= physical_size) {
+  if (free_ptr_ <= sizeof(RowPointer) * row_count_ + physical_size) {
     rows_[kFosterIdx] = RowPointer();
     DeFragment();
   }

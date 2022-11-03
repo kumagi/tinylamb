@@ -55,8 +55,8 @@ void Try(uint64_t seed, bool verbose) {
   std::unordered_map<std::string, std::string> kvp;
   kvp.reserve(count);
   for (uint32_t i = 0; i < count; ++i) {
-    std::string key = RandomString((19937 * i) % 120 + 10);
-    std::string value = RandomString((19937 * i) % 120 + 10);
+    std::string key = RandomString(rand() % 120 + 10);
+    std::string value = RandomString(rand() % 120 + 10);
     if (verbose) {
       LOG(TRACE) << "Insert: " << key << " : " << value;
     }
@@ -70,17 +70,23 @@ void Try(uint64_t seed, bool verbose) {
     ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, kv.first));
     assert(kvp[kv.first] == val);
   }
+  if (verbose) {
+    bpt.Dump(txn, std::cerr, 0);
+    std::cerr << " finished to dump\n";
+  }
   for (uint32_t i = 0; i < count * 4; ++i) {
     auto iter = kvp.begin();
-    std::advance(iter, (i * 19937) % kvp.size());
+    std::advance(iter, rand() % kvp.size());
     if (verbose) {
-      LOG(TRACE) << "Delete: " << iter->first << " : " << iter->second;
+      LOG(WARN) << "Delete: " << iter->first << " : " << iter->second;
     }
     assert(bpt.Delete(txn, iter->first) == Status::kSuccess);
     assert(bpt.SanityCheckForTest(&page_manager));
     if (verbose) {
+      /*
       bpt.Dump(txn, std::cerr, 0);
       std::cerr << "\n";
+       */
     }
     kvp.erase(iter);
 
@@ -93,15 +99,15 @@ void Try(uint64_t seed, bool verbose) {
     }
 
     std::string key = RandomString((19937 * i) % 130 + 1000);
-    std::string value = RandomString((19937 * i) % 320 + 5000);
+    std::string value = RandomString((19937 * i) % 320 + 2000);
     if (verbose) {
       LOG(TRACE) << "Insert: " << key << " : " << value;
     }
     assert(bpt.Insert(txn, key, value));
     assert(bpt.SanityCheckForTest(&page_manager));
     if (verbose) {
-      bpt.Dump(txn, std::cerr, 0);
-      std::cerr << "\n";
+      // bpt.Dump(txn, std::cerr, 0);
+      // std::cerr << "\n";
     }
     kvp[key] = value;
     for (const auto& kv : kvp) {
@@ -113,11 +119,21 @@ void Try(uint64_t seed, bool verbose) {
       assert(kvp[kv.first] == val);
     }
   }
+  if (verbose) {
+    bpt.Dump(txn, std::cerr, 0);
+    std::cerr << "\n";
+  }
   for (const auto& kv : kvp) {
+    if (verbose) {
+      LOG(TRACE) << "Find and delete: " << kv.first;
+      bpt.Dump(txn, std::cerr, 0);
+      std::cerr << "\n";
+    }
     ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, kv.first));
     assert(kvp[kv.first] == val);
     assert(bpt.Delete(txn, kv.first) == Status::kSuccess);
   }
+  LOG(ERROR) << "finish";
   std::remove((db_name + ".db").c_str());
   std::remove(log_name.c_str());
 }

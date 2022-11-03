@@ -150,6 +150,8 @@ struct ColumnStats {
       case ValueType::kDouble:
         return stat.double_stats.distinct;
     }
+    abort();
+    return 0;
   }
   [[nodiscard]] double EstimateCount(int64_t from, int64_t to) const {
     switch (type) {
@@ -162,6 +164,8 @@ struct ColumnStats {
       case ValueType::kDouble:
         assert(!"never reach here");
     }
+    abort();
+    return 0.0;
   }
   [[nodiscard]] double EstimateCount(double from, double to) const {
     switch (type) {
@@ -174,6 +178,8 @@ struct ColumnStats {
       case ValueType::kDouble:
         return stat.double_stats.EstimateCount(from, to);
     }
+    abort();
+    return 0.0;
   }
   [[nodiscard]] double EstimateCount(std::string_view from,
                                      std::string_view to) const {
@@ -187,6 +193,8 @@ struct ColumnStats {
       case ValueType::kDouble:
         assert(!"never reach here");
     }
+    abort();
+    return 0.0;
   }
 
   ColumnStats& operator*=(double multiplier) {

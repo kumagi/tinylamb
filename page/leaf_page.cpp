@@ -82,8 +82,7 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
   memmove(rows_ + pos + 1, rows_ + pos,
           sizeof(RowPointer) * (row_count_ - pos));
   row_count_++;
-  rows_[pos].offset = free_ptr_;
-  rows_[pos].size = physical_size;
+  rows_[pos] = {free_ptr_, physical_size};
 }
 
 Status LeafPage::Update(page_id_t page_id, Transaction& txn,
@@ -131,9 +130,11 @@ void LeafPage::UpdateImpl(std::string_view key, std::string_view redo) {
 Status LeafPage::Delete(page_id_t page_id, Transaction& txn,
                         std::string_view key) {
   ASSIGN_OR_RETURN(std::string_view, existing_value, Read(page_id, txn, key));
+  size_t pos = Find(key);
 
   txn.DeleteLeafLog(page_id, key, existing_value);
   DeleteImpl(key);
+  assert(SanityCheckForTest());
   return Status::kSuccess;
 }
 
@@ -400,7 +401,7 @@ void LeafPage::SetFosterImpl(const FosterPair& foster) {
   }
   bin_size_t physical_size =
       SerializeSize(foster.key) + sizeof(foster.child_pid);
-  if (free_ptr_ <= physical_size) {
+  if (free_ptr_ <= sizeof(RowPointer) * (row_count_) + physical_size) {
     DeFragment();
   }
   free_ptr_ -= physical_size;
