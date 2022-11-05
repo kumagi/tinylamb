@@ -32,7 +32,7 @@ class BPlusTreeTest : public ::testing::Test {
     master_record_name_ = prefix + ".master.log";
     Recover();
     auto txn = tm_->Begin();
-    PageRef page_ = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
     EXPECT_SUCCESS(txn.PreCommit());
   }
 
@@ -213,7 +213,7 @@ TEST_F(BPlusTreeTest, Update) {
   {
     auto txn = tm_->Begin();
     std::string key_prefix("key");
-    for (int i = 0; i < kCount; ++i) {
+    for (size_t i = 0; i < kCount; ++i) {
       ASSERT_SUCCESS(
           bpt_->Insert(txn, KeyGen(i, kPayloadSize), KeyGen(i * 10, 100)));
     }
@@ -222,7 +222,7 @@ TEST_F(BPlusTreeTest, Update) {
   {
     auto txn = tm_->Begin();
     std::string long_value(2000, 'v');
-    for (int i = 0; i < kCount; i += 2) {
+    for (size_t i = 0; i < kCount; i += 2) {
       ASSERT_SUCCESS(
           bpt_->Update(txn, KeyGen(i, kPayloadSize), KeyGen(i * 2, 200)));
     }
@@ -230,7 +230,7 @@ TEST_F(BPlusTreeTest, Update) {
   }
   {
     auto txn = tm_->Begin();
-    for (int i = 0; i < kCount; ++i) {
+    for (size_t i = 0; i < kCount; ++i) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
                             bpt_->Read(txn, KeyGen(i, kPayloadSize)));
       if (i % 2 == 0) {
@@ -293,6 +293,36 @@ TEST_F(BPlusTreeTest, Delete) {
       }
     }
   }
+}
+
+TEST_F(BPlusTreeTest, DeleteFoster) {
+  {
+    auto txn = tm_->Begin();
+    PageRef root = p_->GetPage(bpt_->Root());
+    root->PageTypeChange(txn, PageType::kBranchPage);
+    PageRef left = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    left->InsertLeaf(txn, "hello", "world");
+    root->SetLowestValue(txn, left->PageID());
+    PageRef right = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    right->InsertLeaf(txn, "jack", "chen");
+    root->InsertBranch(txn, "jack", right->PageID());
+    PageRef foster = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef foster_left = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    foster_left->InsertLeaf(txn, "jj", "pp");
+    PageRef foster_right = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    foster_right->InsertLeaf(txn, "zz", "adf");
+    foster->SetLowestValue(txn, foster_left->PageID());
+    foster->InsertBranch(txn, "zz", foster_right->PageID());
+    ASSERT_SUCCESS(root->SetFoster(txn, FosterPair("j", foster->PageID())));
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    bpt_->Dump(txn, std::cout, 0);
+    EXPECT_SUCCESS(bpt_->Delete(txn, "zz"));
+    bpt_->Dump(txn, std::cout, 0);
+  }
+
 }
 
 TEST_F(BPlusTreeTest, DeleteAll) {

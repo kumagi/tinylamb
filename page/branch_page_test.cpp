@@ -527,4 +527,27 @@ TEST_F(BranchPageTest, FosterChildCrash) {
   }
 }
 
+TEST_F(BranchPageTest, moveLeftFromFoster1) {
+  Transaction txn = tm_->Begin();
+  PageRef page = Page();
+  page->SetLowestValue(txn, 12);
+  page->InsertBranch(txn, "a", 13);
+  PageRef foster =
+      txn.PageManager()->AllocateNewPage(txn, PageType::kBranchPage);
+  foster->SetLowestValue(txn, 14);
+  foster->InsertBranch(txn, "c", 15);
+  foster->InsertBranch(txn, "d", 16);
+  ASSERT_SUCCESS(page->SetFoster(txn, FosterPair("b", foster->PageID())));
+
+  ASSERT_SUCCESS(page->body.branch_page.MoveLeftFromFoster(txn, *foster));
+  ASSERT_EQ(page->RowCount(), 2u);
+  ASSERT_EQ(page->GetKey(0), "a");
+  ASSERT_EQ(page->GetKey(1), "b");
+  ASSERT_TRUE(page->GetFoster(txn));
+  EXPECT_EQ(foster->body.branch_page.GetLowestValue(txn), 15);
+
+  ASSERT_SUCCESS(page->body.branch_page.MoveLeftFromFoster(txn, *foster));
+  ASSERT_EQ(page->RowCount(), 4)
+}
+
 }  // namespace tinylamb

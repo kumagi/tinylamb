@@ -143,8 +143,6 @@ PageRef BPlusTree::FindLeaf(Transaction& txn, std::string_view key) {
 Status BPlusTree::SplitAndInsert(Transaction& txn, PageRef&& leaf,
                                  std::string_view key, std::string_view value) {
   PageRef right = txn.PageManager()->AllocateNewPage(txn, PageType::kLeafPage);
-  LOG(INFO) << "splitingy by: "
-            << std::string(key.data(), std::min(10lu, key.size()));
   leaf->body.leaf_page.Split(leaf->PageID(), txn, key, value, right.get());
   // right->SetLowFence(txn, IndexKey(right->GetKey(0)));
   RETURN_IF_FAIL(
@@ -181,6 +179,20 @@ Status BPlusTree::Update(Transaction& txn, std::string_view key,
 
 Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
   PageRef curr = txn.PageManager()->GetPage(root_);
+  if (auto curr_foster = curr->GetFoster(txn)) {
+    const FosterPair& foster = curr_foster.Value();
+    if (foster.key <= key) {
+      PageRef right_page =
+          txn.PageManager()->GetPage(curr->GetPage(foster.child_pid));
+      if (right_page->RowCount() == 1) {
+        if (curr->RowCount() == 1) {
+          // Merge tre
+          curr->body.branch_page.MoveLeftFromFoster(txn, *right_page);
+        }
+
+      }
+    }
+  }
   if (curr->RowCount() == 1 && curr->PageID() == root_ &&
       curr->Type() == PageType::kBranchPage) {
     PageRef prev_page =

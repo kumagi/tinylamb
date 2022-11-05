@@ -479,18 +479,24 @@ Status BranchPage::MoveRightToFoster(Transaction& txn, Page& right) {
 Status BranchPage::MoveLeftFromFoster(Transaction& txn, Page& right) {
   assert(right.Type() == PageType::kBranchPage);
   assert(0 < right.RowCount());
-  ASSIGN_OR_CRASH(FosterPair, old_foster, GetFoster());
-  assert(old_foster.child_pid == right.PageID());
-  std::string_view move_key = right.GetKey(0);
-  page_id_t move_value = right.body.branch_page.GetValue(0);
-  Page* this_page = GET_PAGE_PTR(this);
-  RETURN_IF_FAIL(this_page->InsertBranch(txn, old_foster.key,
-                                         right.body.branch_page.lowest_page_));
-  RETURN_IF_FAIL(
-      this_page->SetFoster(txn, FosterPair(move_key, right.PageID())));
-  right.SetLowestValue(txn, move_value);
-  RETURN_IF_FAIL(right.Delete(txn, move_key));
-  return Status::kSuccess;
+  if (right.RowCount() == 1) {
+    // Merge foster.
+
+  } else {
+    // Move leftmost entry from foster.
+    ASSIGN_OR_CRASH(FosterPair, old_foster, GetFoster());
+    assert(old_foster.child_pid == right.PageID());
+    std::string_view move_key = right.GetKey(0);
+    page_id_t move_value = right.body.branch_page.GetValue(0);
+    Page* this_page = GET_PAGE_PTR(this);
+    RETURN_IF_FAIL(this_page->InsertBranch(
+        txn, old_foster.key, right.body.branch_page.lowest_page_));
+    RETURN_IF_FAIL(
+        this_page->SetFoster(txn, FosterPair(move_key, right.PageID())));
+    right.SetLowestValue(txn, move_value);
+    RETURN_IF_FAIL(right.Delete(txn, move_key));
+    return Status::kSuccess;
+  }
 }
 
 }  // namespace tinylamb
