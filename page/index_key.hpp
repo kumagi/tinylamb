@@ -8,8 +8,10 @@
 #include <cstring>
 #include <string>
 
+#include "common/debug.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/serdes.hpp"
 #include "common/status_or.hpp"
 
 namespace tinylamb {
@@ -88,7 +90,7 @@ class IndexKey final {
     } else if (key.is_plus_infinity_) {
       o << "+(inf)";
     } else {
-      o << key.key_;
+      o << OmittedString(key.key_, 5);
     }
     return o;
   }
@@ -105,6 +107,13 @@ inline size_t SerializeSize(const IndexKey& ik) {
   }
   ASSIGN_OR_CRASH(std::string_view, key, ik.GetKey());
   return sizeof(bin_size_t) + key.size();
+}
+
+inline std::string SerializeIndexKey(const IndexKey& ik) {
+  assert(ik.IsNotInfinity());
+  std::string ret(SerializeSize(ik), 0);
+  SerializeStringView(ret.data(), ik.GetKey().Value());
+  return ret;
 }
 
 }  // namespace tinylamb

@@ -37,8 +37,11 @@ class BPlusTree {
   bool SanityCheckForTest(PageManager* pm) const;
 
  private:
-  static Status SplitAndInsert(Transaction& txn, PageRef&& leaf,
-                               std::string_view key, std::string_view value);
+  static Status LeafInsert(Transaction& txn, PageRef& leaf,
+                           std::string_view key, std::string_view value);
+  static Status SetFosterRecursively(Transaction& txn, PageRef& parent,
+                                     PageRef& new_child,
+                                     std::string_view foster_key);
   void GrowTreeHeightIfNeeded(Transaction& txn) const;
   PageRef FindLeaf(Transaction& txn, std::string_view key);
 

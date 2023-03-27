@@ -59,6 +59,8 @@ class Page {
   [[nodiscard]] IndexKey GetHighFence(Transaction& txn) const;
   [[nodiscard]] Status SetFoster(Transaction& txn, const FosterPair& foster);
   [[nodiscard]] StatusOr<FosterPair> GetFoster(Transaction& txn);
+  Status MoveRightToFoster(Transaction& txn, Page& foster);
+  Status MoveLeftFromFoster(Transaction& txn, Page& foster);
 
   void SetLowFenceImpl(const IndexKey& key);
   void SetHighFenceImpl(const IndexKey& key);

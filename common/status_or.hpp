@@ -10,17 +10,28 @@
 
 #include "common/constants.hpp"
 
+#define UNLIKELY(x) __builtin_expect((x), 0)
+
 #define ASSIGN_OR_RETURN(type, value, expr)          \
   StatusOr<type> value##_tmp = expr;                 \
   if (value##_tmp.GetStatus() != Status::kSuccess) { \
     return value##_tmp.GetStatus();                  \
   }                                                  \
-  type value = value##_tmp.Value()
+  type value(value##_tmp.MoveValue())
 
 #define ASSIGN_OR_ASSERT_FAIL(type, value, expr)        \
   StatusOr<type> value##_tmp = expr;                    \
   ASSERT_EQ(value##_tmp.GetStatus(), Status::kSuccess); \
-  type value = value##_tmp.Value()
+  type value(value##_tmp.Value())
+
+#define COERCE(x)                                              \
+  {                                                            \
+    Status tmp_status = (x);                                   \
+    if (UNLIKELY(tmp_status != Status::kSuccess)) {            \
+      LOG(FATAL) << "Crashed: " << #x << " is " << tmp_status; \
+      abort();                                                 \
+    }                                                          \
+  }
 
 #define ASSERT_SUCCESS_AND_EQ(expr, expected)     \
   {                                               \
@@ -48,6 +59,10 @@ class StatusOr {
   T& Value() {
     assert(status_ == Status::kSuccess);
     return *value_;
+  }
+  T&& MoveValue() {
+    assert(status_ == Status::kSuccess);
+    return std::move(*value_);
   }
   const T& Value() const {
     assert(status_ == Status::kSuccess);

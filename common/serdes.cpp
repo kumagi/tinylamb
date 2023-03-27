@@ -7,8 +7,6 @@
 #include <cstring>
 #include <sstream>
 
-#include "log_message.hpp"
-
 namespace tinylamb {
 
 size_t SerializeStringView(char* pos, std::string_view bin) {

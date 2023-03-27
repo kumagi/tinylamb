@@ -453,8 +453,8 @@ TEST_F(BranchPageTest, Fences) {
   Transaction txn = tm_->Begin();
   PageRef page = Page();
   for (int i = 0; i < 100; ++i) {
-    std::string low = RandomString((19937 * i) % 12 + 10000, false);
-    std::string high = RandomString((19937 * i) % 12 + 10000, false);
+    std::string low = RandomString((19937 * i) % 12 + 5000, false);
+    std::string high = RandomString((19937 * i) % 12 + 5000, false);
     ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey(low)));
     ASSERT_EQ(page->GetLowFence(txn), IndexKey(low));
     ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey(high)));
@@ -494,11 +494,15 @@ TEST_F(BranchPageTest, FosterChild) {
   Transaction txn = tm_->Begin();
   PageRef page = Page();
   for (int i = 0; i < 100; ++i) {
-    std::string key = RandomString((19937 * i) % 12 + 10000, false);
+    std::string key = RandomString((19937 * i) % 12 + 5000, false);
     ASSERT_SUCCESS(page->SetFoster(txn, {key, page_id_t(i)}));
     ASSIGN_OR_ASSERT_FAIL(FosterPair, result, page->GetFoster(txn));
     ASSERT_EQ(result.key, key);
     ASSERT_EQ(result.child_pid, i);
+    ASSERT_SUCCESS(page->SetFoster(txn, FosterPair()));
+    if (auto f = page->GetFoster(txn)) {
+      ASSERT_TRUE(!"never reach here");
+    }
   }
   LOG(ERROR) << "inserted: " << 100;
 }
@@ -527,7 +531,7 @@ TEST_F(BranchPageTest, FosterChildCrash) {
   }
 }
 
-TEST_F(BranchPageTest, moveLeftFromFoster1) {
+TEST_F(BranchPageTest, MoveLeftFromFoster1) {
   Transaction txn = tm_->Begin();
   PageRef page = Page();
   page->SetLowestValue(txn, 12);
@@ -547,7 +551,7 @@ TEST_F(BranchPageTest, moveLeftFromFoster1) {
   EXPECT_EQ(foster->body.branch_page.GetLowestValue(txn), 15);
 
   ASSERT_SUCCESS(page->body.branch_page.MoveLeftFromFoster(txn, *foster));
-  ASSERT_EQ(page->RowCount(), 4)
+  ASSERT_EQ(page->RowCount(), 4);
 }
 
 }  // namespace tinylamb

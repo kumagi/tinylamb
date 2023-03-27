@@ -40,9 +40,7 @@ class BranchPage final {
   [[nodiscard]] slot_t RowCount() const;
 
   void SetLowestValue(page_id_t pid, Transaction& txn, page_id_t page);
-  page_id_t GetLowestValue(Transaction& ) {
-    return lowest_page_;
-  }
+  page_id_t GetLowestValue(Transaction&) { return lowest_page_; }
 
   void SetLowestValueImpl(page_id_t value) { lowest_page_ = value; }
 
@@ -92,6 +90,7 @@ class BranchPage final {
   Status MoveLeftFromFoster(Transaction& txn, Page& right);
 
  private:
+  void UpdateSlotImpl(RowPointer& pos, std::string_view payload);
   [[nodiscard]] std::string_view GetRow(size_t idx) const;
   constexpr static size_t kLowFenceIdx = 0;
   constexpr static size_t kHighFenceIdx = 1;

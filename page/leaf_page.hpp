@@ -81,6 +81,7 @@ class LeafPage final {
   [[nodiscard]] bool SanityCheckForTest() const;
 
  private:
+  void UpdateSlotImpl(RowPointer& pos, std::string_view payload);
   void DeFragment();
   void Dump(std::ostream& o, int indent) const;
   [[nodiscard]] size_t Find(std::string_view key) const;

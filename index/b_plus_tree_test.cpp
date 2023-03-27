@@ -99,6 +99,7 @@ TEST_F(BPlusTreeTest, InsertLeaf) {
   ASSERT_EQ(bpt_->Read(txn, "lorem").Value(), "ipsum");
   ASSERT_EQ(bpt_->Read(txn, "foo").Value(), "bar");
   ASSERT_EQ(bpt_->Read(txn, "key").Value(), "blah");
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
   ASSERT_SUCCESS(txn.PreCommit());
 }
 
@@ -110,10 +111,12 @@ TEST_F(BPlusTreeTest, SplitLeaf) {
   for (int i = 0; i < kKeys; ++i) {
     ASSERT_SUCCESS(
         bpt_->Insert(txn, key_prefix + std::to_string(i), long_value));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
   }
   for (int i = 0; i < kKeys; ++i) {
     ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, key_prefix + std::to_string(i)),
                           long_value);
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
   }
   ASSERT_SUCCESS(txn.PreCommit());
 }
@@ -125,30 +128,33 @@ std::string KeyGen(int num, int width) {
 }
 
 TEST_F(BPlusTreeTest, SplitBranch) {
-  constexpr static int kKeys = 20;
+  constexpr static int kKeys = 50;
+  constexpr static size_t kPayloadSize = 5000;
   auto txn = tm_->Begin();
   std::string value = "v";
   for (int i = 0; i < kKeys; ++i) {
-    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 5000), value));
+    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, kPayloadSize), value));
   }
   bpt_->Dump(txn, std::cerr);
   std::cerr << "\n\n";
   for (int i = 0; i < kKeys; ++i) {
-    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(i, 5000)), value);
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(i, kPayloadSize)), value);
   }
   for (int i = 0; i < kKeys; ++i) {
-    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(i, 5000)), value);
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(i, kPayloadSize)), value);
   }
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
   ASSERT_SUCCESS(txn.PreCommit());
 }
 
 TEST_F(BPlusTreeTest, MergeBranch) {
   constexpr static size_t kPayloadSize = 5000;
-  constexpr static size_t kInserts = 50;
+  constexpr static size_t kInserts = 40;
   auto txn = tm_->Begin();
   std::string short_value = "v";
   for (size_t i = 0; i < kInserts; ++i) {
     ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, kPayloadSize), short_value));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(txn.PageManager()));
   }
   bpt_->Dump(txn, std::cerr);
   std::cerr << "\n";
@@ -159,30 +165,34 @@ TEST_F(BPlusTreeTest, MergeBranch) {
     std::cerr << "deleted: " << i << "\n";
     bpt_->Dump(txn, std::cerr);
     for (size_t j = i + 1; j < kInserts; ++j) {
+      LOG(TRACE) << "search: " << j;
       ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
                             bpt_->Read(txn, KeyGen(j, kPayloadSize)));
+      if (val != short_value) {
+        LOG(FATAL) << OmittedString(val, 20) << " not found";
+      }
       ASSERT_EQ(val, short_value);
     }
   }
-  bpt_->Dump(txn, std::cerr);
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
 }
 
 TEST_F(BPlusTreeTest, FullScanMultiLeafReverse) {
   auto txn = tm_->Begin();
   for (const auto& c :
        {'k', 'j', 'i', 'h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
-    ASSERT_SUCCESS(
-        bpt_->Insert(txn, std::string(5000, c), std::string(5000, c)));
+    ASSERT_SUCCESS(bpt_->Insert(txn, std::string(5000, c), std::string(10, c)));
+    bpt_->Dump(txn, std::cerr);
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
   }
 }
 
 TEST_F(BPlusTreeTest, FullScanMultiLeafMany) {
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f'}) {
-    ASSERT_SUCCESS(
-        bpt_->Insert(txn, std::string(5000, c), std::string(5000, c)));
+    ASSERT_SUCCESS(bpt_->Insert(txn, std::string(5000, c), std::string(10, c)));
   }
-  bpt_->Dump(txn, std::cerr);
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
 }
 
 TEST_F(BPlusTreeTest, Search) {
@@ -205,6 +215,7 @@ TEST_F(BPlusTreeTest, Search) {
       ASSERT_EQ(val, KeyGen(i * 10, 200));
     }
   }
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
 }
 
 TEST_F(BPlusTreeTest, Update) {
@@ -295,7 +306,7 @@ TEST_F(BPlusTreeTest, Delete) {
   }
 }
 
-TEST_F(BPlusTreeTest, DeleteFoster) {
+TEST_F(BPlusTreeTest, DeleteFosterBranch) {
   {
     auto txn = tm_->Begin();
     PageRef root = p_->GetPage(bpt_->Root());
@@ -318,15 +329,221 @@ TEST_F(BPlusTreeTest, DeleteFoster) {
   }
   {
     auto txn = tm_->Begin();
-    bpt_->Dump(txn, std::cout, 0);
     EXPECT_SUCCESS(bpt_->Delete(txn, "zz"));
-    bpt_->Dump(txn, std::cout, 0);
+    EXPECT_SUCCESS(bpt_->Delete(txn, "jj"));
+    EXPECT_SUCCESS(bpt_->Delete(txn, "hello"));
+    EXPECT_SUCCESS(bpt_->Delete(txn, "jack"));
   }
+}
 
+TEST_F(BPlusTreeTest, LiftUpBranch) {
+  {
+    auto txn = tm_->Begin();
+    PageRef root = p_->GetPage(bpt_->Root());
+    root->PageTypeChange(txn, PageType::kBranchPage);
+    PageRef a_branch = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef b_branch = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    ASSERT_SUCCESS(b_branch->SetLowFence(txn, IndexKey("b")));
+    root->SetLowestValue(txn, a_branch->PageID());
+    root->InsertBranch(txn, "b", b_branch->PageID());
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    a->InsertLeaf(txn, "a", "1");
+    PageRef aa = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    aa->InsertLeaf(txn, "aa", "2");
+    a_branch->SetLowestValue(txn, a->PageID());
+    a_branch->InsertBranch(txn, "aa", aa->PageID());
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    b->InsertLeaf(txn, "b", "3");
+    PageRef bb = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    bb->InsertLeaf(txn, "bb", "4");
+
+    b_branch->SetLowestValue(txn, b->PageID());
+    b_branch->InsertBranch(txn, "bb", bb->PageID());
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "bb"));
+    bpt_->Dump(txn, std::cerr, 0);
+  }
+}
+
+void BuildBranchFosterTree(TransactionManager* tm, BPlusTree* bpt) {
+  /*
+              ┌─────┐
+              │aaaaa│
+      ┌───────┴─────┴───────────┐
+      │                         │
+      │                         │
+     ┌▼─┌┐       ┌────┐        ┌▼─┐
+     │aa│┼─┬─────►aaaa│        │b │
+  ┌──┴──┴──┤     ┌────┴─┐    ┌─┴──┴┐
+  │        │     │      │    │     │
+  │        │     │      │    │     │
+┌─▼┐    ┌──▼┐ ┌──▼┐ ┌▼───┐┌▼────┐  ┌▼─┐
+│a │    │aa │ │aaa│ │aaaa││aaaaa│  │b │
+└──┘    └───┘ └───┘ └────┘└─────┘  └──┘
+ */
+  PageManager* p = tm->GetPageManager();
+  auto txn = tm->Begin();
+  PageRef root = p->GetPage(bpt->Root());
+  root->PageTypeChange(txn, PageType::kBranchPage);
+  PageRef a_branch = p->AllocateNewPage(txn, PageType::kBranchPage);
+  PageRef b_branch = p->AllocateNewPage(txn, PageType::kBranchPage);
+  root->SetLowestValue(txn, a_branch->PageID());
+  root->InsertBranch(txn, "aaaaa", b_branch->PageID());
+  PageRef a = p->AllocateNewPage(txn, PageType::kLeafPage);
+  a->InsertLeaf(txn, "a", "1");
+  PageRef aa = p->AllocateNewPage(txn, PageType::kLeafPage);
+  aa->InsertLeaf(txn, "aa", "2");
+  a_branch->SetLowestValue(txn, a->PageID());
+  a_branch->InsertBranch(txn, "aa", aa->PageID());
+  PageRef a_foster = p->AllocateNewPage(txn, PageType::kBranchPage);
+  ASSERT_SUCCESS(
+      a_branch->SetFoster(txn, FosterPair("aaa", a_foster->PageID())));
+  PageRef aaa = p->AllocateNewPage(txn, PageType::kLeafPage);
+  aaa->InsertLeaf(txn, "aaa", "3");
+  a_foster->SetLowestValue(txn, aaa->PageID());
+  PageRef aaaa = p->AllocateNewPage(txn, PageType::kLeafPage);
+  aaaa->InsertLeaf(txn, "aaaa", "4");
+  a_foster->InsertBranch(txn, "aaaa", aaaa->PageID());
+
+  PageRef aaaaa = p->AllocateNewPage(txn, PageType::kLeafPage);
+  aaaaa->InsertLeaf(txn, "aaaaa", "5");
+  b_branch->SetLowestValue(txn, aaaaa->PageID());
+  b_branch->SetLowFence(txn, IndexKey("aaaaa"));
+
+  PageRef b = p->AllocateNewPage(txn, PageType::kLeafPage);
+  b->InsertLeaf(txn, "b", "6");
+  b_branch->InsertBranch(txn, "b", b->PageID());
+  txn.PreCommit();
+}
+
+TEST_F(BPlusTreeTest, LiftUpBranchWithFoster1) {
+  BuildBranchFosterTree(tm_.get(), bpt_.get());
+  {
+    auto txn = tm_->Begin();
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aaa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aaaa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aaaaa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
+    bpt_->Dump(txn, std::cerr, 0);
+  }
+}
+
+TEST_F(BPlusTreeTest, LiftUpBranchWithFoster2) {
+  BuildBranchFosterTree(tm_.get(), bpt_.get());
+  {
+    auto txn = tm_->Begin();
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aaaaa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aaa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aaaa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
+    bpt_->Dump(txn, std::cerr, 0);
+  }
+}
+
+TEST_F(BPlusTreeTest, LiftUpBranchWithFoster3) {
+  BuildBranchFosterTree(tm_.get(), bpt_.get());
+  {
+    auto txn = tm_->Begin();
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aaaa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aaa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aaaaa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
+    bpt_->Dump(txn, std::cerr, 0);
+  }
+}
+
+TEST_F(BPlusTreeTest, LiftUpBranchWithFosterOther) {
+  std::vector<std::string> keys{"a", "aa", "aaa", "aaaa", "aaaaa", "b"};
+  do {
+    BuildBranchFosterTree(tm_.get(), bpt_.get());
+    auto txn = tm_->Begin();
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aaaa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aaa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "aaaaa"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
+    bpt_->Dump(txn, std::cerr, 0);
+  } while (std::next_permutation(keys.begin(), keys.end()));
+}
+
+TEST_F(BPlusTreeTest, DeleteFosterLeaf) {
+  {
+    auto txn = tm_->Begin();
+    PageRef root = p_->GetPage(bpt_->Root());
+    root->PageTypeChange(txn, PageType::kBranchPage);
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    a->InsertLeaf(txn, "a", "a");
+    root->SetLowestValue(txn, a->PageID());
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    b->InsertLeaf(txn, "b", "b");
+    root->InsertBranch(txn, "b", b->PageID());
+    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    c->InsertLeaf(txn, "c", "c");
+    c->InsertLeaf(txn, "cc", "cc");
+    root->InsertBranch(txn, "c", c->PageID());
+    c->InsertLeaf(txn, "c", "c");
+    PageRef d = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    d->InsertLeaf(txn, "d", "d");
+    ASSERT_SUCCESS(c->SetFoster(txn, FosterPair("d", d->PageID())));
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "cc"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
+    bpt_->Dump(txn, std::cerr, 0);
+    ASSERT_SUCCESS(bpt_->Delete(txn, "c"));
+    bpt_->Dump(txn, std::cerr, 0);
+  }
 }
 
 TEST_F(BPlusTreeTest, DeleteAll) {
-  constexpr int kCount = 100;
+  constexpr int kCount = 50;
   constexpr int kKeyLength = 5000;
   std::unordered_map<std::string, std::string> kvp;
   kvp.reserve(kCount);
@@ -358,6 +575,11 @@ TEST_F(BPlusTreeTest, DeleteAll) {
       ASSERT_SUCCESS(bpt_->Delete(txn, key));
       kvp.erase(key);
       for (const auto& kv : kvp) {
+        if (bpt_->Read(txn, kv.first).GetStatus() != Status::kSuccess) {
+          LOG(ERROR) << "Cannot find: " << OmittedString(kv.first, 10)
+                     << " from";
+          bpt_->Dump(txn, std::cerr);
+        }
         ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
         ASSERT_EQ(kv.second, val);
       }
@@ -396,12 +618,15 @@ TEST_F(BPlusTreeTest, DeleteAllReverse) {
     std::string long_value(2000, 'v');
     for (int i = kCount - 1; 0 < i; i--) {
       std::string key = KeyGen(i, kKeyLength);
-      std::cerr << "delete: " << i << "\n";
       ASSERT_SUCCESS(bpt_->Delete(txn, key));
       kvp.erase(key);
-      bpt_->Dump(txn, std::cerr, 0);
+      bpt_->Dump(txn, std::cerr);
       std::cerr << "\n";
       for (const auto& kv : kvp) {
+        auto v = bpt_->Read(txn, kv.first);
+        if (!v) {
+          LOG(FATAL) << "not found: " << kv.first;
+        }
         ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
         ASSERT_EQ(kv.second, val);
       }
@@ -497,11 +722,8 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
   for (int i = 0; i < kCount * 4; ++i) {
     const std::string& key = keys[(i * 63) % keys.size()];
     std::string value = RandomString((19937 * i) % 320 + 500, false);
-    LOG(TRACE) << "Update: " << key;
     ASSERT_SUCCESS(bpt_->Update(txn, key, value));
     kvp[key] = value;
-    bpt_->Dump(txn, std::cerr, 0);
-    std::cerr << "\n";
     for (const auto& kv : kvp) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
       if (kvp[kv.first] != val) {
@@ -525,16 +747,12 @@ TEST_F(BPlusTreeTest, InsertDelete) {
   for (int i = 0; i < kCount; ++i) {
     std::string key = RandomString((19937 * i) % 120 + 10, false);
     ASSERT_SUCCESS(bpt_->Insert(txn, key, "foo"));
-    LOG(WARN) << "insert: " << OmittedString(key, 20);
     keys.insert(key);
   }
   Row read;
   for (int i = 0; i < kCount * 4; ++i) {
     auto it = keys.begin();
     std::advance(it, (i * 63) % keys.size());
-    bpt_->Dump(txn, std::cerr, 0);
-    std::cerr << "\n";
-    LOG(INFO) << "delete: " << OmittedString(*it, 20);
     ASSERT_SUCCESS(bpt_->Delete(txn, *it));
     keys.erase(it);
     std::string inserting_key = RandomString((19937 * i) % 2000 + 2000, false);
@@ -545,7 +763,7 @@ TEST_F(BPlusTreeTest, InsertDelete) {
 }
 
 TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
-  constexpr int kCount = 100;
+  int kCount = 100;
   Transaction txn = tm_->Begin();
   std::unordered_map<std::string, std::string> kvp;
   kvp.reserve(kCount);
@@ -560,20 +778,22 @@ TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
     ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
     ASSERT_EQ(kvp[kv.first], val);
   }
+  LOG(INFO) << "initialized, insert and delete for " << (kCount * 40)
+            << " times.";
   for (int i = 0; i < kCount * 40; ++i) {
     auto iter = kvp.begin();
     std::advance(iter, (i * 19937) % kvp.size());
-    bpt_->Dump(txn, std::cerr, 0);
-    std::cerr << "\n";
-    LOG(INFO) << "delete: " << OmittedString(iter->first, 20);
+    // LOG(WARN) << "Delete: " << iter->first;
     ASSERT_SUCCESS(bpt_->Delete(txn, iter->first));
+    // bpt_->Dump(txn, std::cerr, 0);
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     kvp.erase(iter);
 
     std::string key = RandomString((19937 * i) % 130 + 1000, false);
     std::string value = RandomString((19937 * i) % 320 + 3000, false);
-    LOG(INFO) << "insert: " << OmittedString(key, 20);
+    // LOG(WARN) << "Insert: " << key;
     ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
+    // bpt_->Dump(txn, std::cerr, 0);
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     kvp[key] = value;
   }

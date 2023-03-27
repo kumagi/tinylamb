@@ -19,6 +19,9 @@ static constexpr size_t kPageBodySize = kPageSize - kPageHeaderSize;
 
 #define GET_PAGE_PTR(x) \
   (reinterpret_cast<Page*>(reinterpret_cast<char*>(x) - kPageHeaderSize))
+#define GET_PAGE_CONST_PTR(x)                                       \
+  (reinterpret_cast<const Page*>(reinterpret_cast<const char*>(x) - \
+                                 kPageHeaderSize))
 #define GET_CONST_PAGE_PTR(x)                                       \
   (reinterpret_cast<const Page*>(reinterpret_cast<const char*>(x) - \
                                  kPageHeaderSize))

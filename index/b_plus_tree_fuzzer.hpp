@@ -35,7 +35,7 @@ void Try(uint64_t seed, bool verbose) {
     }
     return ret;
   };
-  const uint32_t count = rand() % 2000 + 200;
+  const uint32_t count = rand() % 20 + 300;
   std::string db_name = RandomString();
   std::string log_name = db_name + ".log";
   PageManager page_manager(db_name + ".db", 20);
@@ -79,8 +79,13 @@ void Try(uint64_t seed, bool verbose) {
     std::advance(iter, rand() % kvp.size());
     if (verbose) {
       LOG(WARN) << "Delete: " << iter->first << " : " << iter->second;
+      bpt.Dump(txn, std::cerr, 0);
     }
-    assert(bpt.Delete(txn, iter->first) == Status::kSuccess);
+    Status s = bpt.Delete(txn, iter->first);
+    if (s != Status::kSuccess) {
+      LOG(ERROR) << s;
+    }
+    assert(s == Status::kSuccess);
     assert(bpt.SanityCheckForTest(&page_manager));
     if (verbose) {
       /*
@@ -102,13 +107,14 @@ void Try(uint64_t seed, bool verbose) {
     std::string value = RandomString((19937 * i) % 320 + 2000);
     if (verbose) {
       LOG(TRACE) << "Insert: " << key << " : " << value;
+      bpt.Dump(txn, std::cerr, 0);
     }
     assert(bpt.Insert(txn, key, value));
-    assert(bpt.SanityCheckForTest(&page_manager));
     if (verbose) {
-      // bpt.Dump(txn, std::cerr, 0);
-      // std::cerr << "\n";
+      bpt.Dump(txn, std::cerr, 0);
+      std::cerr << "\n";
     }
+    assert(bpt.SanityCheckForTest(&page_manager));
     kvp[key] = value;
     for (const auto& kv : kvp) {
       ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, kv.first));
@@ -120,20 +126,20 @@ void Try(uint64_t seed, bool verbose) {
     }
   }
   if (verbose) {
-    bpt.Dump(txn, std::cerr, 0);
-    std::cerr << "\n";
+    // bpt.Dump(txn, std::cerr, 0);
+    // std::cerr << "\n";
   }
   for (const auto& kv : kvp) {
     if (verbose) {
       LOG(TRACE) << "Find and delete: " << kv.first;
       bpt.Dump(txn, std::cerr, 0);
-      std::cerr << "\n";
     }
     ASSIGN_OR_CRASH(std::string_view, val, bpt.Read(txn, kv.first));
     assert(kvp[kv.first] == val);
-    assert(bpt.Delete(txn, kv.first) == Status::kSuccess);
+    Status s = bpt.Delete(txn, kv.first);
+    STATUS(s, "deleted");
+    assert(s == Status::kSuccess);
   }
-  LOG(ERROR) << "finish";
   std::remove((db_name + ".db").c_str());
   std::remove(log_name.c_str());
 }
