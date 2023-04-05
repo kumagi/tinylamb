@@ -6,3 +6,7 @@ tinylamb
 
 A simple implementation of RDBMS.
 
+## Note by ryo_grid
+- building needs gcc-10 or later  
+
+
