@@ -7,6 +7,9 @@ tinylamb
 A simple implementation of RDBMS.
 
 ## Note by ryo_grid
-- building needs gcc-10 or later  
+- needs gcc-10 or later
+- needs g++-10 or later
+- build is succeeded on WSL1 Ubuntu 20.04 env
 
-
+- referece 
+  - https://students-tech.blog/post/change-gcc.html
