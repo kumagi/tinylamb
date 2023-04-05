@@ -538,6 +538,25 @@ TEST_F(LeafPageTest, InsertDeleteHeavy) {
   }
 }
 
+TEST_F(LeafPageTest, FosterChild) {
+  for (int i = 0; i < 5; ++i) {
+    std::string key = RandomString((19937 * i) % 12 + 10000, false);
+    {
+      Transaction txn = tm_->Begin();
+      PageRef page = Page();
+      ASSERT_SUCCESS(page->SetFoster(txn, {key, page_id_t(i)}));
+      ASSIGN_OR_ASSERT_FAIL(FosterPair, result, page->GetFoster(txn));
+      ASSERT_EQ(result.key, key);
+      ASSERT_SUCCESS(page->SetFoster(txn, {}));
+      ASSERT_SUCCESS(page->SetFoster(txn, FosterPair()));
+      if (auto f = page->GetFoster(txn)) {
+        ASSERT_TRUE(!"never reach here");
+      }
+      ASSERT_EQ(result.child_pid, i);
+    }
+  }
+}
+
 TEST_F(LeafPageTest, Fences) {
   Transaction txn = tm_->Begin();
   PageRef page = Page();

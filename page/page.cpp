@@ -186,7 +186,8 @@ Status Page::Delete(Transaction& txn, std::string_view key) {
       result = body.branch_page.Delete(PageID(), txn, key);
       break;
     default:
-      throw std::runtime_error("Invalid page type");
+      throw std::runtime_error("Invalid page type for delete: " +
+                               PageTypeString(type));
   }
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
@@ -383,8 +384,35 @@ StatusOr<FosterPair> Page::GetFoster(Transaction& /*txn*/) {
       return body.branch_page.GetFoster();
       break;
     default:
+      throw std::runtime_error("Invalid page type for GetFoster: " +
+                               PageTypeString(type));
+  }
+}
+
+Status Page::MoveRightToFoster(Transaction& txn, Page& foster) {
+  switch (type) {
+    case PageType::kLeafPage:
+      return body.leaf_page.MoveRightToFoster(txn, foster);
+    case PageType::kBranchPage:
+      return body.branch_page.MoveRightToFoster(txn, foster);
+    default:
       throw std::runtime_error("Invalid page type");
   }
+  return Status::kSuccess;
+}
+
+Status Page::MoveLeftFromFoster(Transaction& txn, Page& foster) {
+  switch (type) {
+    case PageType::kLeafPage:
+      return body.leaf_page.MoveLeftFromFoster(txn, foster);
+      break;
+    case PageType::kBranchPage:
+      return body.branch_page.MoveLeftFromFoster(txn, foster);
+      break;
+    default:
+      throw std::runtime_error("Invalid page type");
+  }
+  return Status::kSuccess;
 }
 
 void Page::SetLowFenceImpl(const IndexKey& key) {

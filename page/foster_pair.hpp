@@ -16,6 +16,15 @@ namespace tinylamb {
 struct FosterPair {
   FosterPair() = default;
   FosterPair(std::string_view k, page_id_t pid) : key(k), child_pid(pid) {}
+  bool IsEmpty() const { return key.empty(); }
+  friend std::ostream& operator<<(std::ostream& o, const FosterPair& f) {
+    if (f.key.empty()) {
+      o << "(empty pair)";
+    } else {
+      o << f.key << " -> " << f.key;
+    }
+    return o;
+  }
   friend Encoder& operator<<(Encoder& e, const FosterPair& fp) {
     e << fp.key << fp.child_pid;
     return e;

@@ -8,9 +8,12 @@
 #include <vector>
 
 #define LOG(level) LogMessage(level, __FILE__, __LINE__, __func__).stream()
-#define STATUS(s, message)                                            \
-  {                                                                   \
-    if ((s) != Status::kSuccess) LOG(WARN) << (message) << ": " << s; \
+#define STATUS(s, message)                  \
+  {                                         \
+    if ((s) != Status::kSuccess) {          \
+      LOG(FATAL) << (message) << ": " << s; \
+      abort();                              \
+    }                                       \
   }
 
 #define FATAL 9000

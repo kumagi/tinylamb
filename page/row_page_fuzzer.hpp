@@ -79,20 +79,28 @@ class Operation {
     switch (operation % 6) {
       case 0: {  // Read
         slot_t slot;
-        if (input.size() < sizeof(slot)) return 1 + input.size();
+        if (input.size() < sizeof(slot)) {
+          return 1 + input.size();
+        }
         memcpy(&slot, input.data(), sizeof(slot_t));
-        if (verbose) LOG(TRACE) << "Read: " << slot;
+        if (verbose) {
+          LOG(TRACE) << "Read: " << slot;
+        }
         page_->Read(txn_, slot);
         return 1 + sizeof(slot);
       }
       case 1: {  // InsertBranch
         bin_size_t size;
-        if (input.size() < sizeof(size)) return 1 + input.size();
+        if (input.size() < sizeof(size)) {
+          return 1 + input.size();
+        }
         memcpy(&size, input.data(), sizeof(size));
         input.remove_prefix(sizeof(size));
         size = std::min(size, (bin_size_t)input.size());
         std::string_view str(input.data(), size);
-        if (verbose) LOG(TRACE) << "InsertBranch: " << str;
+        if (verbose) {
+          LOG(TRACE) << "InsertBranch: " << str;
+        }
         page_->Insert(txn_, str);
         return 1 + sizeof(size) + size;
       }

@@ -65,7 +65,12 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
       valid_ = false;
       return *this;
     }
-    PageRef next_ref = txn_->PageManager()->GetPage(pid_);
+    IndexKey high_fence = ref->GetHighFence(*txn_);
+    if (high_fence.IsPlusInfinity()) {
+      valid_ = false;
+      return *this;
+    }
+    PageRef next_ref = tree_->FindLeaf(*txn_, high_fence.GetKey().Value());
     ref.PageUnlock();
     idx_ = 0;
     if (next_ref->body.leaf_page.row_count_ == 0 ||
@@ -87,7 +92,8 @@ BPlusTreeIterator& BPlusTreeIterator::operator--() {
     if (pid_ == 0) {
       valid_ = false;
     }
-    PageRef prev_ref = txn_->PageManager()->GetPage(pid_);
+    IndexKey low_fence = ref->GetLowFence(*txn_);
+    PageRef prev_ref = tree_->FindLeaf(*txn_, low_fence.GetKey().Value());
     ref.PageUnlock();
     idx_ = prev_ref->body.leaf_page.row_count_ - 1;
     if (prev_ref->body.leaf_page.row_count_ == 0 ||

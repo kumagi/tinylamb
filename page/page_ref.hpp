@@ -4,6 +4,7 @@
 
 #ifndef TINYLAMB_PAGE_REF_HPP
 #define TINYLAMB_PAGE_REF_HPP
+#include <assert.h>
 
 #include <mutex>
 
@@ -37,6 +38,10 @@ class PageRef final {
   [[nodiscard]] bool IsNull() const { return page_ == nullptr; }
   Page* get() { return page_; }
   [[nodiscard]] const Page* get() const { return page_; }
+  void Swap(PageRef& other) {
+    std::swap(pool_, other.pool_);
+    std::swap(page_, other.page_);
+  }
 
   ~PageRef();
 

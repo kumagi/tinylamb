@@ -14,10 +14,10 @@ namespace tinylamb {
 
 Logger::Logger(std::string_view filename, size_t buffer_size, size_t every_ms)
     : every_us_(every_ms),
-      worker_(&Logger::LoggerWork, this),
       buffer_(buffer_size, 0),
       filename_(filename),
-      dst_(open(filename_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0666)) {
+      dst_(open(filename_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0666)),
+      worker_(&Logger::LoggerWork, this) {
   memset(buffer_.data(), 0, buffer_size);
 }
 
@@ -64,6 +64,7 @@ lsn_t Logger::AddLog(std::string_view payload) {
 }
 
 void Logger::LoggerWork() {
+  assert(0 < buffer_.size());
   while (!finish_ || flushed_lsn_ < buffered_lsn_) {
     const size_t flushed_lsn = flushed_lsn_.load(std::memory_order_relaxed);
     const size_t buffered_lsn = buffered_lsn_.load(std::memory_order_acquire);

@@ -38,12 +38,12 @@ class Logger final {
   std::atomic<bool> finish_ = false;
   alignas(64) std::atomic<lsn_t> flushed_lsn_{0};
   const size_t every_us_;
-  std::thread worker_;
   std::string buffer_;
   std::string filename_;
   std::mutex enqueue_latch_;
   alignas(64) std::atomic<lsn_t> buffered_lsn_{0};
   int dst_ = -1;
+  std::thread worker_;
 };
 
 }  // namespace tinylamb
