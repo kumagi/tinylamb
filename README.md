@@ -11,5 +11,5 @@ A simple implementation of RDBMS.
 - needs g++-10 or later
 - build is succeeded on WSL1 Ubuntu 20.04 env
 
-- referece 
+- referenced site
   - https://students-tech.blog/post/change-gcc.html
