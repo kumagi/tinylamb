@@ -1,0 +1,33 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "(gdb) Bash on Windows Launch",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${command:extension.vscode-wsl-workspaceFolder}/build/optimizer_test",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${command:extension.vscode-wsl-workspaceFolder}/build/",
+            "environment": [],
+            "externalConsole": true,
+            "pipeTransport": {
+                "debuggerPath": "/usr/bin/gdb",
+                "pipeProgram": "${env:windir}\\system32\\bash.exe",
+                "pipeArgs": ["-c"],
+                "pipeCwd": "/"
+            },
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "sourceFileMap": {
+                "${command:extension.vscode-wsl-workspaceFolder}": "${workspaceFolder}"
+            },
+
+        }
+    ]
+}
