@@ -243,6 +243,7 @@ Plan BestScan(const std::vector<NamedExpression>& select, const Table& from,
     const Index& target_idx = from.GetIndex(candidates[key]);
     Plan new_plan = IndexScanSelect(from, target_idx, stat, *span.min,
                                     *span.max, scan_exp, select);
+    // (ryo_grid) ?????
     if (!TouchOnly(scan_exp, from.GetSchema().GetColumn(key).Name())) {
       new_plan = std::make_shared<SelectionPlan>(new_plan, scan_exp, stat);
     }
@@ -353,6 +354,9 @@ Plan BestJoin(TransactionContext& ctx, const Expression& where,
     if (0 < related_exp.size()) {
       Expression final_selection = related_exp.back();
       related_exp.pop_back();
+      // T1.C1 = T2.C2 のようなカラム値が同値かチェックする item が大本のwhere句にあったが
+      // 上のwhileループ内でcandidatesに加えられるような組み合わせが存在しなかった場合candidatesが
+      // 空なのでここにきて、使われなかった条件を満たすため、か活かすための（？）selectionを構築する
       for (const auto& e : related_exp) {
         final_selection =
             BinaryExpressionExp(e, BinaryOperation::kAnd, final_selection);
@@ -361,6 +365,9 @@ Plan BestJoin(TransactionContext& ctx, const Expression& where,
       candidates.push_back(std::make_shared<SelectionPlan>(ans, final_selection,
                                                            ans->GetStats()));
     } else {
+      // T1.C1 = T2.C2 のようなカラム値が同値かチェックする item が大本のwhere句に無かった場合
+      // 上のwhileループがスルーされ、candidatesが空なのでここにくる。
+      // 満たすべき、か活かすことのできる（？）同値の条件が存在しないためselectionの付加は行わない
       candidates.push_back(std::make_shared<ProductPlan>(left, right));
     }
   }
