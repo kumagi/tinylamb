@@ -335,6 +335,10 @@ Plan BestJoin(TransactionContext& ctx, const Expression& where,
         std::make_shared<ProductPlan>(right, right_cols, left, left_cols));
 
     // IndexJoin.
+    // 通常のSelingerと異なりベースとするテーブルは既にjoinされている前提で処理している
+    // また、最適コストを算出済みの部分組み合わせは一方向にjoinしていく前提ではない？？？
+    // (右側にしか新たに加えるテーブルを置かないルールで、左から右にjoinしていくことになる？？？
+    //  HashJoinの '新 ++ ベース' のケースがあるのでそうはならない？？？)
     if (const Table* right_tbl = right->ScanSource()) {
       for (size_t i = 0; i < right_tbl->IndexCount(); ++i) {
         const Index& right_idx = right_tbl->GetIndex(i);
@@ -356,7 +360,7 @@ Plan BestJoin(TransactionContext& ctx, const Expression& where,
       related_exp.pop_back();
       // T1.C1 = T2.C2 のようなカラム値が同値かチェックする item が大本のwhere句にあったが
       // 上のwhileループ内でcandidatesに加えられるような組み合わせが存在しなかった場合candidatesが
-      // 空なのでここにきて、使われなかった条件を満たすため、か活かすための（？）selectionを構築する
+      // 空なのでここにきて、ここでは使われなかった条件を活かして出力カラム数を減らす用selectionを構築する？
       for (const auto& e : related_exp) {
         final_selection =
             BinaryExpressionExp(e, BinaryOperation::kAnd, final_selection);
@@ -367,7 +371,7 @@ Plan BestJoin(TransactionContext& ctx, const Expression& where,
     } else {
       // T1.C1 = T2.C2 のようなカラム値が同値かチェックする item が大本のwhere句に無かった場合
       // 上のwhileループがスルーされ、candidatesが空なのでここにくる。
-      // 満たすべき、か活かすことのできる（？）同値の条件が存在しないためselectionの付加は行わない
+      // 活かすことのできる同値の条件が存在しないためselectionの付加は行わない？
       candidates.push_back(std::make_shared<ProductPlan>(left, right));
     }
   }
