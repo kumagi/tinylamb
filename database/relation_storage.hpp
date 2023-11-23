@@ -17,8 +17,6 @@
 #ifndef TINYLAMB_RELATION_STORAGE_HPP
 #define TINYLAMB_RELATION_STORAGE_HPP
 
-#include <bits/unique_ptr.h>
-
 #include <cstdint>
 #include <ostream>
 #include <string_view>

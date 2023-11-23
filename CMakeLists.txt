@@ -95,10 +95,6 @@ function(add_simple_test file_path)
             libtinylamb
             libtinylamb_test_util
     )
-    add_test(
-            NAME ${target_name}
-            COMMAND ${target_name}
-    )
     gtest_discover_tests(${target_name})
 endfunction()
 

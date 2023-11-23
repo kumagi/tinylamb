@@ -151,8 +151,8 @@ bool TouchOnly(const Expression& where, const ColumnName& col_name) {
 template <typename T>
 bool Covered(const std::unordered_set<T> big,
              const std::unordered_set<T> small) {
-  return std::ranges::all_of(small.begin(), small.end(),
-                             [&](const T& t) { return big.contains(t); });
+  return std::all_of(small.begin(), small.end(),
+                     [&](const T& t) { return big.contains(t); });
 }
 
 Plan IndexScanSelect(const Table& from, const Index& target_idx,
