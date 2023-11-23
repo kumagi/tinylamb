@@ -27,21 +27,6 @@
 
 namespace tinylamb {
 
-namespace {
-
-std::string OmittedString(std::string_view original, size_t length) {
-  if (length < original.length()) {
-    std::string omitted_key = std::string(original).substr(0, 8);
-    omitted_key +=
-        "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
-    omitted_key += original.substr(original.length() - 8);
-    return omitted_key;
-  }
-  return std::string(original);
-}
-
-}  // anonymous namespace
-
 slot_t BranchPage::RowCount() const { return row_count_; }
 
 void BranchPage::SetLowestValue(page_id_t pid, Transaction& txn,

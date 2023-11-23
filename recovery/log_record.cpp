@@ -37,16 +37,16 @@ void Read(std::istream& in, T& dst) {
   in.read(reinterpret_cast<char*>(&dst), sizeof(T));
 }
 
-std::string OmittedString(std::string_view original, size_t length) {
+[[maybe_unused]] std::string OmittedString(std::string_view original,
+                                           size_t length) {
   if (length < original.length()) {
     std::string omitted_key = std::string(original).substr(0, 8);
     omitted_key +=
         "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
     omitted_key += original.substr(original.length() - 8);
     return omitted_key;
-  } else {
-    return std::string(original);
   }
+  return std::string(original);
 }
 
 }  // namespace

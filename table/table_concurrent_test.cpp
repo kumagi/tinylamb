@@ -36,7 +36,9 @@ namespace tinylamb {
 class TableConcurrentTest : public ::testing::Test {
  public:
   void SetUp() override {
-    prefix_ = "table_concurrent_test-" + RandomString();
+    std::string current_test =
+        ::testing::UnitTest::GetInstance()->current_test_info()->name();
+    prefix_ = "table_concurrent_test-" + current_test + RandomString();
     Recover();
     Schema sc("SampleTable", {Column("col1", ValueType::kInt64,
                                      Constraint(Constraint::kIndex)),

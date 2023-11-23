@@ -21,7 +21,18 @@
 
 namespace tinylamb {
 
-class RowPageConcurrentTest : public RowPageTest {};
+class RowPageConcurrentTest : public RowPageTest {
+  void SetUp() override {
+    std::string current_test =
+        ::testing::UnitTest::GetInstance()->current_test_info()->name();
+    file_name_ = "row_page_concurrent_test-" + current_test + RandomString();
+    Recover();
+    auto txn = tm_->Begin();
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    page_id_ = page->PageID();
+    EXPECT_SUCCESS(txn.PreCommit());
+  }
+};
 
 constexpr int kThreads = 8;
 TEST_F(RowPageConcurrentTest, InsertInsert) {
@@ -70,7 +81,6 @@ TEST_F(RowPageConcurrentTest, UpdateUpdate) {
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
 
-  thread_local std::random_device seed_gen;
   thread_local std::mt19937 engine(seed_gen());
   while (InsertRow(RandomString(engine() % 64))) {
   }

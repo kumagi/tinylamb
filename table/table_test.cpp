@@ -222,7 +222,6 @@ TEST_F(TableTest, UpdateHeavy) {
   for (int i = 0; i < kCount * 4; ++i) {
     const size_t target = (i * 63) % rps.size();
     RowPosition& pos = rps[target];
-    RowPosition old_pos = pos;
     std::string key = RandomString((19937 * i) % 1000 + 800, false);
     Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
     ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl->Update(ctx.txn_, pos, new_row));

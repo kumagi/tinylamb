@@ -37,12 +37,11 @@ TableStatistics CrossJoinStats(const TableStatistics& left,
 }
 
 TableStatistics HashJoinStats(const TableStatistics& left,
-                              const std::vector<ColumnName>& left_cols,
+                              const std::vector<ColumnName>& /*left_cols*/,
                               const TableStatistics& right,
-                              const std::vector<ColumnName>& right_cols) {
+                              const std::vector<ColumnName>& /*right_cols*/) {
   TableStatistics ans(left);
   ans.Concat(right);
-  size_t min_distinct = std::numeric_limits<size_t>::max();
   return ans;
 }
 

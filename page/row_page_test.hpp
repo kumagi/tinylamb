@@ -60,8 +60,8 @@ class RowPageTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    std::remove((file_name_ + ".db").c_str());
-    std::remove((file_name_ + ".log").c_str());
+    std::ignore = std::remove((file_name_ + ".db").c_str());
+    std::ignore = std::remove((file_name_ + ".log").c_str());
   }
 
   void Flush() { p_->GetPool()->FlushPageForTest(page_id_); }

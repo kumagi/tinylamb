@@ -26,21 +26,6 @@
 
 namespace tinylamb {
 
-namespace {
-
-std::string OmittedString(std::string_view original, size_t length) {
-  if (length < original.length()) {
-    std::string omitted_key = std::string(original).substr(0, 8);
-    omitted_key +=
-        "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
-    omitted_key += original.substr(original.length() - 8);
-    return omitted_key;
-  }
-  return std::string(original);
-}
-
-}  // anonymous namespace
-
 std::string_view LeafPage::GetKey(size_t idx) const {
   std::string_view ret;
   DeserializeStringView(Payload() + rows_[idx].offset, &ret);
@@ -205,7 +190,7 @@ StatusOr<std::string_view> LeafPage::HighestKey(Transaction& /*unused*/) const {
 
 slot_t LeafPage::RowCount() const { return row_count_; }
 
-void LeafPage::Split(page_id_t pid, Transaction& txn, std::string_view key,
+void LeafPage::Split(page_id_t /*pid*/, Transaction& txn, std::string_view key,
                      std::string_view value, Page* right) {
   const size_t kPayload = kPageBodySize - offsetof(LeafPage, rows_);
   const size_t kThreshold = kPayload / 2;
