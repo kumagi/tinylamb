@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "plan/product_plan.hpp"
 
 #include <iostream>

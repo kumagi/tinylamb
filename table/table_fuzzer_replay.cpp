@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include <filesystem>
 
 #include "table/table_fuzzer.hpp"

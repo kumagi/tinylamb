@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_FULL_SCAN_ITERATOR_HPP
 #define TINYLAMB_FULL_SCAN_ITERATOR_HPP
 #include <memory>

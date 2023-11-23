@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_UNIQUE_INDEX_SCAN_ITERATOR_HPP
 #define TINYLAMB_UNIQUE_INDEX_SCAN_ITERATOR_HPP
 

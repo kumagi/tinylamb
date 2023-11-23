@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_TRANSACTION_MANAGER_HPP
 #define TINYLAMB_TRANSACTION_MANAGER_HPP
 

@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "plan/selection_plan.hpp"
 
 #include <cmath>

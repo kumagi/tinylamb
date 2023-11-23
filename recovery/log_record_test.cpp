@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "log_record.hpp"
 
 #include <filesystem>

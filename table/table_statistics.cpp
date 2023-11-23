@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "table_statistics.hpp"
 
 #include <cassert>

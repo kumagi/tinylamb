@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_CONSTANT_VALUE_HPP
 #define TINYLAMB_CONSTANT_VALUE_HPP
 

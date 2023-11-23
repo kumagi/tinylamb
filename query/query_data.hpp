@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_QUERY_DATA_HPP
 #define TINYLAMB_QUERY_DATA_HPP
 

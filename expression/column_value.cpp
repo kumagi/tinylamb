@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "expression/column_value.hpp"
 
 #include "type/column.hpp"

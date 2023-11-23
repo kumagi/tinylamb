@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_COLUMN_VALUE_HPP
 #define TINYLAMB_COLUMN_VALUE_HPP
 

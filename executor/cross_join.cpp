@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "cross_join.hpp"
 
 namespace tinylamb {

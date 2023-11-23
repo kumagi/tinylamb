@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "expression/expression.hpp"
 
 #include <cassert>

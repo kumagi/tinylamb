@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_BRANCH_PAGE_HPP
 #define TINYLAMB_BRANCH_PAGE_HPP
 

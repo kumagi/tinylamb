@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "table/full_scan_iterator.hpp"
 
 #include "page/page_manager.hpp"

@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_B_PLUS_TREE_HPP
 #define TINYLAMB_B_PLUS_TREE_HPP
 #include <string_view>

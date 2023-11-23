@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_CHECKPOINT_MANAGER_HPP
 #define TINYLAMB_CHECKPOINT_MANAGER_HPP
 

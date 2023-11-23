@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "database.hpp"
 
 #include "index/index_schema.hpp"

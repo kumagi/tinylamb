@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "b_plus_tree_iterator.hpp"
 
 #include <filesystem>

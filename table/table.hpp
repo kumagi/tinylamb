@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_TABLE_HPP
 #define TINYLAMB_TABLE_HPP
 

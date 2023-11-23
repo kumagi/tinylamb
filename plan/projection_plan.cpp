@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "plan/projection_plan.hpp"
 
 #include <utility>

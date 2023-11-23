@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "index.hpp"
 
 #include <sstream>

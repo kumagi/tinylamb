@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_TEST_UTIL_HPP
 #define TINYLAMB_TEST_UTIL_HPP
 

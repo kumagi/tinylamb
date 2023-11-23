@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_ITERATOR_HPP
 #define TINYLAMB_ITERATOR_HPP
 

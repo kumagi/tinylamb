@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_RANDOM_STRING_HPP
 #define TINYLAMB_RANDOM_STRING_HPP
 

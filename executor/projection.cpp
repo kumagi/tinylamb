@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "projection.hpp"
 
 #include "common/log_message.hpp"

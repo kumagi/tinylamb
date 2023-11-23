@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "recovery/checkpoint_manager.hpp"
 
 #include "page/page_pool.hpp"

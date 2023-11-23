@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "selection.hpp"
 
 #include <utility>

@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_PAGE_TYPE_HPP
 #define TINYLAMB_PAGE_TYPE_HPP
 

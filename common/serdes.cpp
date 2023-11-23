@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "common/serdes.hpp"
 
 #include <cstring>

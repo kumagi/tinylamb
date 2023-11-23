@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_INDEX_HPP
 #define TINYLAMB_INDEX_HPP
 

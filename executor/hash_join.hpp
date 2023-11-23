@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_HASH_JOIN_HPP
 #define TINYLAMB_HASH_JOIN_HPP
 

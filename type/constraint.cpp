@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "type/constraint.hpp"
 
 #include <cstring>

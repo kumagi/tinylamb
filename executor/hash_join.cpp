@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "hash_join.hpp"
 
 #include <utility>

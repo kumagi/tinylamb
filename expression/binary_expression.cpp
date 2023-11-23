@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "binary_expression.hpp"
 
 namespace tinylamb {

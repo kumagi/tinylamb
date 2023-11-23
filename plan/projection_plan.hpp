@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_PROJECTION_PLAN_HPP
 #define TINYLAMB_PROJECTION_PLAN_HPP
 

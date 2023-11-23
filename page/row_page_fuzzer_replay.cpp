@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include <filesystem>
 
 #include "page/row_page_fuzzer.hpp"

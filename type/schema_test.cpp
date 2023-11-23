@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "schema.hpp"
 
 #include "common/test_util.hpp"

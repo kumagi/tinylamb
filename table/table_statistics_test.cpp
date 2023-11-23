@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "table/table_statistics.hpp"
 
 #include "common/random_string.hpp"

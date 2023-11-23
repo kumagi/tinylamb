@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "page/leaf_page.hpp"
 
 #include <cstring>

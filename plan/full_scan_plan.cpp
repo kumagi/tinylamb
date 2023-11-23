@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "full_scan_plan.hpp"
 
 #include "database/relation_storage.hpp"

@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "table/table_fuzzer.hpp"
 
 extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,

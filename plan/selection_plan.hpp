@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_SELECTION_PLAN_HPP
 #define TINYLAMB_SELECTION_PLAN_HPP
 

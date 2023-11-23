@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_OPTIMIZER_HPP
 #define TINYLAMB_OPTIMIZER_HPP
 

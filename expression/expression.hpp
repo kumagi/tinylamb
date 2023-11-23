@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_EXPRESSION_HPP
 #define TINYLAMB_EXPRESSION_HPP
 

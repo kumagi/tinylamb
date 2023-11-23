@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "decoder.hpp"
 
 namespace tinylamb {

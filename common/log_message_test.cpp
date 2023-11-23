@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "common/log_message.hpp"
 
 #include <gtest/gtest.h>

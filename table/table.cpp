@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "table/table.hpp"
 
 #include <algorithm>

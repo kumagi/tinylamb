@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "recovery/logger.hpp"
 
 #include <fcntl.h>

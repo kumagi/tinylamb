@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "index_scan_iterator.hpp"
 
 #include "index/b_plus_tree.hpp"

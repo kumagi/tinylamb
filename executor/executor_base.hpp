@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef TINYLAMB_EXECUTOR_BASE_HPP
 #define TINYLAMB_EXECUTOR_BASE_HPP
 
