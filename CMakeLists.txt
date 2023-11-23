@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 
 add_executable(tinylamb
         main.cpp
-        )
+)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined,bounds,address -fsanitize-address-use-after-scope")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -O2")
@@ -94,7 +94,7 @@ function(add_simple_test file_path)
             gtest_main
             libtinylamb
             libtinylamb_test_util
-            )
+    )
     add_test(
             NAME ${target_name}
             COMMAND ${target_name}
@@ -134,9 +134,9 @@ add_simple_test(plan/optimizer_test.cpp)
 add_simple_test(table/table_statistics_test.cpp)
 
 # Concurrency tests.
-#add_simple_test(page/row_page_concurrent_test.cpp)
-#add_simple_test(index/b_plus_tree_concurrent_test.cpp)
-#add_simple_test(table/table_concurrent_test.cpp)
+add_simple_test(page/row_page_concurrent_test.cpp)
+add_simple_test(index/b_plus_tree_concurrent_test.cpp)
+add_simple_test(table/table_concurrent_test.cpp)
 
 
 ########################################
@@ -154,7 +154,7 @@ function(add_fuzzer_test file_path)
     target_link_libraries(${target_name}
             libtinylamb
             libtinylamb_test_util
-            )
+    )
 endfunction()
 
 add_fuzzer_test(recovery/logger_fuzzer.cpp)
@@ -180,7 +180,7 @@ function(add_replay_test file_path)
             gtest_main
             libtinylamb
             libtinylamb_test_util
-            )
+    )
 endfunction()
 
 add_replay_test(recovery/logger_fuzzer_replay.cpp)

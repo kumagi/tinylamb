@@ -1,6 +1,19 @@
-//
-// Created by kumagi on 2022/04/21.
-//
+/**
+ * Copyright 2023 KUMAZAKI Hiroki
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 
 #include <memory>
 #include <thread>
@@ -43,18 +56,18 @@ class TableConcurrentTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    std::remove(db_->Storage().DBName().c_str());
-    std::remove(db_->Storage().LogName().c_str());
-    std::remove(db_->Storage().MasterRecordName().c_str());
+    std::ignore = std::remove(db_->Storage().DBName().c_str());
+    std::ignore = std::remove(db_->Storage().LogName().c_str());
+    std::ignore = std::remove(db_->Storage().MasterRecordName().c_str());
   }
 
   std::string prefix_;
   std::unique_ptr<Database> db_;
 };
-constexpr int kThreads = 2;
+constexpr int kThreads = 5;
 
 TEST_F(TableConcurrentTest, InsertInsert) {
-  constexpr int kSize = 2000;
+  constexpr int kSize = 5000;
   TransactionContext ro_ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ro_ctx, "SampleTable"));
   ASSERT_SUCCESS(ro_ctx.PreCommit());

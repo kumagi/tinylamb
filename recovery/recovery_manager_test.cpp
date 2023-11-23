@@ -1,3 +1,19 @@
+/**
+ * Copyright 2023 KUMAZAKI Hiroki
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "recovery/recovery_manager.hpp"
 
 #include <memory>
@@ -38,7 +54,8 @@ class RecoveryManagerTest : public RowPageTest {
   }
 
   void MediaFailure() {
-    RecoverBase([&]() { std::remove((file_name_ + ".db").c_str()); });
+    RecoverBase(
+        [&]() { std::ignore = std::remove((file_name_ + ".db").c_str()); });
   }
 
   void SinglePageFailure(page_id_t failed_page) {
@@ -55,8 +72,8 @@ class RecoveryManagerTest : public RowPageTest {
   }
 
   void TearDown() override {
-    std::remove((file_name_ + ".db").c_str());
-    std::remove((file_name_ + ".log").c_str());
+    std::ignore = std::remove((file_name_ + ".db").c_str());
+    std::ignore = std::remove((file_name_ + ".log").c_str());
   }
 
   std::unique_ptr<RecoveryManager> r_;

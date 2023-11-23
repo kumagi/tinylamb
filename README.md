@@ -6,3 +6,8 @@ tinylamb
 
 A simple implementation of RDBMS.
 
+License
+==========
+See ./LICENSE.txt
+
+Copyright (c) 2023 KUMAZAKI Hiroki <rintyo@gmail.com>

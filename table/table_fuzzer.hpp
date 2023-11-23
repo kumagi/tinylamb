@@ -1,6 +1,19 @@
-//
-// Created by kumagi on 2022/04/19.
-//
+/**
+ * Copyright 2023 KUMAZAKI Hiroki
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 
 #ifndef TINYLAMB_TABLE_FUZZER_HPP
 #define TINYLAMB_TABLE_FUZZER_HPP
@@ -75,7 +88,9 @@ void Try(uint64_t seed, bool verbose) {
       LOG(TRACE) << "Delete: " << iter->first << " : " << iter->second;
     }
     Status s = table.Delete(ctx.txn_, iter->first);
-    if (s != Status::kSuccess) LOG(FATAL) << s;
+    if (s != Status::kSuccess) {
+      LOG(FATAL) << s;
+    }
     assert(s == Status::kSuccess);
     if (verbose) {
       // std::cerr << table << "\n";
@@ -91,7 +106,7 @@ void Try(uint64_t seed, bool verbose) {
       assert(row.second == read_row);
     }
 
-    Row new_row({Value((int)offset), Value(RandomString(rand() % 4900 + 5000)),
+    Row new_row({Value((int)offset), Value(RandomString(rand() % 1000 + 1000)),
                  Value((double)(rand() % 800))});
     if (verbose) {
       LOG(TRACE) << "Insert: " << new_row;
@@ -121,9 +136,9 @@ void Try(uint64_t seed, bool verbose) {
     }
     ctx.txn_.PreCommit();
   }
-  std::remove(db.Storage().DBName().c_str());
-  std::remove(db.Storage().LogName().c_str());
-  std::remove(db.Storage().MasterRecordName().c_str());
+  std::ignore = std::remove(db.Storage().DBName().c_str());
+  std::ignore = std::remove(db.Storage().LogName().c_str());
+  std::ignore = std::remove(db.Storage().MasterRecordName().c_str());
 }
 
 }  // namespace tinylamb
