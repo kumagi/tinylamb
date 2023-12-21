@@ -69,7 +69,7 @@ class PagePool {
   }
 
   // Flush all page buffer without write back.
-  void LostAllPageForTest();
+  void DropAllPages();
 
   void FlushPageForTest(page_id_t page_id);
 

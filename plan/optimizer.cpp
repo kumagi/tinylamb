@@ -23,7 +23,7 @@
 #include <unordered_set>
 
 #include "common/converter.hpp"
-#include "database/relation_storage.hpp"
+#include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"

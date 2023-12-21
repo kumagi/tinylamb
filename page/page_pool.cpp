@@ -60,7 +60,7 @@ PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit) {
   return AllocNewPage(page_id, std::move(latch));
 }
 
-void PagePool::LostAllPageForTest() {
+void PagePool::DropAllPages() {
   std::scoped_lock latch(pool_latch);
   pool_.clear();
   pool_lru_.clear();

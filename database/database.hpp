@@ -17,42 +17,68 @@
 #ifndef TINYLAMB_DATABASE_HPP
 #define TINYLAMB_DATABASE_HPP
 
-#include <functional>
+#include <cstdint>
+#include <ostream>
+#include <string_view>
+#include <unordered_map>
 
+#include "common/constants.hpp"
 #include "database/page_storage.hpp"
-#include "relation_storage.hpp"
+#include "database/transaction_context.hpp"
+#include "index/b_plus_tree.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
-#include "type/schema.hpp"
+#include "transaction/transaction.hpp"
 
 namespace tinylamb {
+
+class Table;
+class Transaction;
+class Schema;
 class IndexSchema;
+class TableStatistics;
+class PageStorage;
 
 class Database {
  public:
-  explicit Database(std::string_view dbname) : relations_(dbname) {}
-  TransactionContext BeginContext();
+  explicit Database(std::string_view dbname);
+
+  // Transaction Begin() { return storage_.Begin(); }
+  TransactionContext BeginContext() { return {storage_.Begin(), this}; }
 
   StatusOr<Table> CreateTable(TransactionContext& ctx, const Schema& schema);
+
   Status CreateIndex(TransactionContext& ctx, std::string_view schema_name,
                      const IndexSchema& idx);
+
+  [[maybe_unused]] void DebugDump(Transaction& txn, std::ostream& o);
+
+  StatusOr<TableStatistics> GetStatistics(TransactionContext& txn,
+                                          std::string_view schema_name);
+
+  Status UpdateStatistics(TransactionContext& txn, std::string_view schema_name,
+                          const TableStatistics& ts);
+
+  Status RefreshStatistics(TransactionContext& txn,
+                           std::string_view schema_name);
+
+  void EmulateCrash();
 
   StatusOr<Table> GetTable(TransactionContext& ctx,
                            std::string_view schema_name);
 
-  [[maybe_unused]] void DebugDump(TransactionContext& ctx, std::ostream& o);
-
-  StatusOr<TableStatistics> GetStatistics(TransactionContext& ctx,
-                                          std::string_view schema_name);
-  Status UpdateStatistics(TransactionContext& txn, std::string_view schema_name,
-                          const TableStatistics& ts);
-  Status RefreshStatistics(TransactionContext& txn,
-                           std::string_view schema_name);
-
-  PageStorage& Storage() { return *relations_.GetPageStorage(); }
+  void DeleteAll();
 
  private:
-  RelationStorage relations_;
+  friend class TransactionContext;
+
+  // Persistent { Name => Table } storage.
+  BPlusTree catalog_;
+
+  // Persistent { Name => TableStatistics } storage.
+  BPlusTree statistics_;
+
+  PageStorage storage_;
 };
 
 }  // namespace tinylamb

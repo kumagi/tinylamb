@@ -30,7 +30,7 @@ target_include_directories(
 
 add_library(libtinylamb
         STATIC
-        database/database.cpp page/page.cpp transaction/lock_manager.cpp
+        page/page.cpp transaction/lock_manager.cpp
         page/page_pool.cpp page/row_page.cpp page/page_manager.cpp
         recovery/logger.cpp type/row.cpp type/schema.cpp
         transaction/transaction.cpp recovery/log_record.cpp page/meta_page.cpp
@@ -42,7 +42,7 @@ add_library(libtinylamb
         index/index.cpp common/debug.cpp common/encoder.cpp
         table/full_scan_iterator.cpp index/b_plus_tree_iterator.cpp
         index/index_scan_iterator.cpp
-        database/relation_storage.cpp executor/full_scan.cpp executor/projection.cpp
+        database/database.cpp executor/full_scan.cpp executor/projection.cpp
         executor/selection.cpp expression/binary_expression.cpp
         expression/column_value.cpp executor/hash_join.cpp common/decoder.cpp
         plan/full_scan_plan.cpp plan/projection_plan.cpp plan/selection_plan.cpp
@@ -99,7 +99,6 @@ function(add_simple_test file_path)
 endfunction()
 
 add_simple_test(common/log_message_test.cpp)
-add_simple_test(database/database_test.cpp)
 add_simple_test(type/value_test.cpp)
 add_simple_test(type/row_test.cpp)
 add_simple_test(type/constraint_test.cpp)

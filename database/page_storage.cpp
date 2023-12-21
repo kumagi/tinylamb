@@ -32,7 +32,7 @@ PageStorage::PageStorage(std::string_view dbname)
   rm_.RecoverFrom(0, &tm_);
 }
 
-void PageStorage::LostAllPageForTest() { pm_.GetPool()->LostAllPageForTest(); }
+void PageStorage::DiscardAllUpdates() { pm_.GetPool()->DropAllPages(); }
 
 Transaction PageStorage::Begin() { return tm_.Begin(); }
 

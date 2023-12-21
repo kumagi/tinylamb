@@ -40,13 +40,13 @@ class IndexScanIteratorTest : public ::testing::Test {
                                   Constraint(Constraint::kIndex)),
                            Column("col2", ValueType::kVarChar),
                            Column("col3", ValueType::kDouble)});
-    TransactionContext ctx = rs_->BeginContext();
-    ASSERT_SUCCESS(rs_->CreateTable(ctx, sc).GetStatus());
-    ASSERT_SUCCESS(rs_->CreateIndex(ctx, kTableName, IndexSchema("PK", {0})));
-    ASSERT_SUCCESS(rs_->CreateIndex(
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_SUCCESS(db_->CreateTable(ctx, sc).GetStatus());
+    ASSERT_SUCCESS(db_->CreateIndex(ctx, kTableName, IndexSchema("PK", {0})));
+    ASSERT_SUCCESS(db_->CreateIndex(
         ctx, kTableName,
         IndexSchema("NameIdx", {1}, {2}, IndexMode::kNonUnique)));
-    ASSERT_SUCCESS(rs_->CreateIndex(ctx, kTableName,
+    ASSERT_SUCCESS(db_->CreateIndex(ctx, kTableName,
                                     IndexSchema("KeyScore", {0, 2}, {1})));
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
                           ctx.GetTable(kTableName));
@@ -55,26 +55,22 @@ class IndexScanIteratorTest : public ::testing::Test {
   }
 
   void Recover() {
-    if (rs_) {
-      rs_->GetPageStorage()->LostAllPageForTest();
+    if (db_) {
+      db_->EmulateCrash();
     }
-    rs_ = std::make_unique<RelationStorage>(prefix_);
+    db_ = std::make_unique<Database>(prefix_);
   }
 
-  void TearDown() override {
-    std::remove(rs_->GetPageStorage()->DBName().c_str());
-    std::remove(rs_->GetPageStorage()->LogName().c_str());
-    std::remove(rs_->GetPageStorage()->MasterRecordName().c_str());
-  }
+  void TearDown() override { db_->DeleteAll(); }
 
   std::string prefix_;
-  std::unique_ptr<RelationStorage> rs_;
+  std::unique_ptr<Database> db_;
 };
 
 TEST_F(IndexScanIteratorTest, Construct) {}
 
 TEST_F(IndexScanIteratorTest, ScanAscending) {
-  TransactionContext ctx = rs_->BeginContext();
+  TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 230; ++i) {
@@ -98,7 +94,7 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
 }
 
 TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
-  TransactionContext ctx = rs_->BeginContext();
+  TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 120; ++i) {
@@ -169,7 +165,7 @@ TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
 }
 
 TEST_F(IndexScanIteratorTest, ScanDecending) {
-  TransactionContext ctx = rs_->BeginContext();
+  TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 230; ++i) {
@@ -193,7 +189,7 @@ TEST_F(IndexScanIteratorTest, ScanDecending) {
 }
 
 TEST_F(IndexScanIteratorTest, NonUniqueDescending) {
-  TransactionContext ctx = rs_->BeginContext();
+  TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 120; ++i) {

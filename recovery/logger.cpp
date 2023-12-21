@@ -79,7 +79,7 @@ lsn_t Logger::AddLog(std::string_view payload) {
 }
 
 void Logger::LoggerWork() {
-  assert(0 < buffer_.size());
+  assert(!buffer_.empty());
   while (!finish_ || flushed_lsn_ < buffered_lsn_) {
     const size_t flushed_lsn = flushed_lsn_.load(std::memory_order_relaxed);
     const size_t buffered_lsn = buffered_lsn_.load(std::memory_order_acquire);

@@ -19,7 +19,6 @@
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
-#include "database/relation_storage.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
@@ -113,16 +112,12 @@ class OptimizerTest : public ::testing::Test {
   }
   void Recover() {
     if (rs_) {
-      rs_->GetPageStorage()->LostAllPageForTest();
+      rs_->EmulateCrash();
     }
-    rs_ = std::make_unique<RelationStorage>(prefix_);
+    rs_ = std::make_unique<Database>(prefix_);
   }
 
-  void TearDown() override {
-    std::remove(rs_->GetPageStorage()->DBName().c_str());
-    std::remove(rs_->GetPageStorage()->LogName().c_str());
-    std::remove(rs_->GetPageStorage()->MasterRecordName().c_str());
-  }
+  void TearDown() override { rs_->DeleteAll(); }
 
   [[nodiscard]] Status DumpAll(const QueryData& qd) const {
     TransactionContext ctx = rs_->BeginContext();
@@ -142,7 +137,7 @@ class OptimizerTest : public ::testing::Test {
   }
 
   std::string prefix_;
-  std::unique_ptr<RelationStorage> rs_;
+  std::unique_ptr<Database> rs_;
 };
 
 TEST_F(OptimizerTest, Construct) {}

@@ -23,7 +23,7 @@
 #include <cmath>
 #include <utility>
 
-#include "database/relation_storage.hpp"
+#include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/index_scan.hpp"
 #include "expression/binary_expression.hpp"

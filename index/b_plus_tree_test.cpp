@@ -53,7 +53,7 @@ class BPlusTreeTest : public ::testing::Test {
   void Recover() {
     page_id_t root = bpt_ ? bpt_->Root() : 1;
     if (p_) {
-      p_->GetPool()->LostAllPageForTest();
+      p_->GetPool()->DropAllPages();
     }
     bpt_.reset();
     tm_.reset();

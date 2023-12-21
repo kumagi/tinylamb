@@ -27,6 +27,7 @@
 #include "recovery/recovery_manager.hpp"
 #include "table.hpp"
 #include "transaction/lock_manager.hpp"
+#include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -51,16 +52,12 @@ class TableConcurrentTest : public ::testing::Test {
 
   void Recover() {
     if (db_) {
-      db_->Storage().LostAllPageForTest();
+      db_->EmulateCrash();
     }
     db_ = std::make_unique<Database>(prefix_);
   }
 
-  void TearDown() override {
-    std::ignore = std::remove(db_->Storage().DBName().c_str());
-    std::ignore = std::remove(db_->Storage().LogName().c_str());
-    std::ignore = std::remove(db_->Storage().MasterRecordName().c_str());
-  }
+  void TearDown() override { db_->DeleteAll(); }
 
   std::string prefix_;
   std::unique_ptr<Database> db_;
@@ -78,15 +75,16 @@ TEST_F(TableConcurrentTest, InsertInsert) {
   workers.reserve(kThreads);
   for (int i = 0; i < kThreads; ++i) {
     workers.emplace_back([&, i]() {
-      TransactionContext ctx = db_->BeginContext();
       for (int j = 0; j < kSize; ++j) {
+        TransactionContext ctx = db_->BeginContext();
         Row new_row({Value(j * kSize + i), Value(RandomString(32)),
                      Value((double)2 * j * kSize + i)});
         ASSIGN_OR_ASSERT_FAIL(RowPosition, inserted_pos,
                               table.Insert(ctx.txn_, new_row));
         rows[i].emplace(inserted_pos, new_row);
+        ASSERT_SUCCESS(ctx.txn_.PreCommit());
+        ctx.txn_.CommitWait();
       }
-      ASSERT_SUCCESS(ctx.txn_.PreCommit());
     });
   }
   for (auto& w : workers) {

@@ -43,7 +43,7 @@ class CheckpointTest : public RowPageTest {
 
   void Recover() override {
     if (p_) {
-      p_->GetPool()->LostAllPageForTest();
+      p_->GetPool()->DropAllPages();
     }
     cm_.reset();
     tm_.reset();

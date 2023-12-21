@@ -19,10 +19,10 @@
 
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
+#include "database.hpp"
 #include "database/page_storage.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
-#include "relation_storage.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/schema.hpp"
@@ -37,20 +37,15 @@ class CatalogTest : public ::testing::Test {
   }
   void Recover() {
     if (rs_) {
-      rs_->GetPageStorage()->LostAllPageForTest();
+      rs_->EmulateCrash();
     }
-    rs_ = std::make_unique<RelationStorage>(prefix_);
+    rs_ = std::make_unique<Database>(prefix_);
   }
 
-  void TearDown() override {
-    std::ignore = std::remove(rs_->GetPageStorage()->DBName().c_str());
-    std::ignore = std::remove(rs_->GetPageStorage()->LogName().c_str());
-    std::ignore =
-        std::remove(rs_->GetPageStorage()->MasterRecordName().c_str());
-  }
+  void TearDown() override { rs_->DeleteAll(); }
 
   std::string prefix_;
-  std::unique_ptr<RelationStorage> rs_;
+  std::unique_ptr<Database> rs_;
 };
 
 TEST_F(CatalogTest, Construction) {}

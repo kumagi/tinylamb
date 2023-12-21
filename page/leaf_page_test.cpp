@@ -45,7 +45,7 @@ class LeafPageTest : public ::testing::Test {
 
   virtual void Recover() {
     if (p_) {
-      p_->GetPool()->LostAllPageForTest();
+      p_->GetPool()->DropAllPages();
     }
     tm_.reset();
     r_.reset();

@@ -89,7 +89,7 @@ class Table {
   Status IndexDelete(Transaction& txn, const Index& idx,
                      const RowPosition& pos);
 
-  friend class RelationStorage;
+  friend class Database;
   friend class FullScanIterator;
   friend class IndexScanIterator;
   friend class TableInterface;

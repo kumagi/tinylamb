@@ -18,8 +18,8 @@
 
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
+#include "database/database.hpp"
 #include "database/page_storage.hpp"
-#include "database/relation_storage.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/expression.hpp"
 #include "full_scan_plan.hpp"
@@ -114,15 +114,12 @@ class PlanTest : public ::testing::Test {
 
   void Recover() {
     if (rs_) {
-      rs_->GetPageStorage()->LostAllPageForTest();
+      rs_->EmulateCrash();
     }
-    rs_ = std::make_unique<RelationStorage>(prefix_);
+    rs_ = std::make_unique<Database>(prefix_);
   }
 
-  void TearDown() override {
-    std::remove(rs_->GetPageStorage()->DBName().c_str());
-    std::remove(rs_->GetPageStorage()->LogName().c_str());
-  }
+  void TearDown() override { rs_->DeleteAll(); }
 
   void DumpAll(const Plan& plan) const {
     plan->Dump(std::cout, 0);
@@ -137,7 +134,7 @@ class PlanTest : public ::testing::Test {
   }
 
   std::string prefix_;
-  std::unique_ptr<RelationStorage> rs_;
+  std::unique_ptr<Database> rs_;
 };
 
 TEST_F(PlanTest, Construct) {}

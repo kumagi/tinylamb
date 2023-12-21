@@ -23,13 +23,13 @@
 namespace tinylamb {
 
 class PageManager;
-class RelationStorage;
+class Database;
 class Table;
 class TableStatistics;
 
 class TransactionContext {
  public:
-  TransactionContext(Transaction&& txn, RelationStorage* rs)
+  TransactionContext(Transaction&& txn, Database* rs)
       : txn_(std::move(txn)), rs_(rs) {}
   TransactionContext(const TransactionContext&) = delete;
   TransactionContext& operator=(const TransactionContext&) = delete;
@@ -47,7 +47,7 @@ class TransactionContext {
   void Abort() { txn_.Abort(); }
 
   Transaction txn_;
-  RelationStorage* rs_;
+  Database* rs_;
   std::unordered_map<std::string, std::shared_ptr<Table>> tables_;
   std::unordered_map<std::string, std::shared_ptr<TableStatistics>> stats_;
 };

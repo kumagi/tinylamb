@@ -20,7 +20,7 @@
 
 #include "database/transaction_context.hpp"
 
-#include "database/relation_storage.hpp"
+#include "database/database.hpp"
 
 namespace tinylamb {
 

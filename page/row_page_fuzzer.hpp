@@ -47,7 +47,7 @@ class RowPageEnvironment {
 
   void Recover() {
     if (p_) {
-      p_->GetPool()->LostAllPageForTest();
+      p_->GetPool()->DropAllPages();
     }
     tm_.reset();
     lm_.reset();

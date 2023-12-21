@@ -135,9 +135,7 @@ void Try(uint64_t seed, bool verbose) {
     }
     ctx.txn_.PreCommit();
   }
-  std::ignore = std::remove(db.Storage().DBName().c_str());
-  std::ignore = std::remove(db.Storage().LogName().c_str());
-  std::ignore = std::remove(db.Storage().MasterRecordName().c_str());
+  db.DeleteAll();
 }
 
 }  // namespace tinylamb

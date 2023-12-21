@@ -19,7 +19,6 @@
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
-#include "database/relation_storage.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/constant_value.hpp"
 #include "gtest/gtest.h"
@@ -93,15 +92,12 @@ class TableStatisticsTest : public ::testing::Test {
   }
   void Recover() {
     if (db_) {
-      db_->Storage().LostAllPageForTest();
+      db_->EmulateCrash();
     }
     db_ = std::make_unique<Database>(prefix_);
   }
 
-  void TearDown() override {
-    std::remove(db_->Storage().DBName().c_str());
-    std::remove(db_->Storage().LogName().c_str());
-  }
+  void TearDown() override { db_->DeleteAll(); }
 
   std::string prefix_;
   std::unique_ptr<Database> db_;

@@ -39,10 +39,10 @@ class PageStorage {
   std::string LogName() const;
   std::string MasterRecordName() const;
 
-  void LostAllPageForTest();
+  void DiscardAllUpdates();
 
  private:
-  friend class RelationStorage;
+  friend class Database;
   friend class Database;
 
   std::string dbname_;

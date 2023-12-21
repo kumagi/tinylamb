@@ -40,17 +40,16 @@ Decoder& operator>>(Decoder& d, Table::IndexValueType& t) {
 }
 
 Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
-  page_id_t new_root;
   {
     PageRef root_page =
         txn.PageManager()->AllocateNewPage(txn, PageType::kLeafPage);
-    new_root = root_page->PageID();
+    page_id_t new_root = root_page->PageID();
     indexes_.emplace_back(idx.name_, idx.key_, root_page->PageID(),
                           idx.include_, idx.mode_);
+    BPlusTree new_bpt(new_root);
   }
 
   Iterator it = BeginFullScan(txn);
-  BPlusTree new_bpt(new_root);
   while (it.IsValid()) {
     RETURN_IF_FAIL(IndexInsert(txn, indexes_.back(), *it, it.Position()));
     ++it;
@@ -73,9 +72,9 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
       PageRef next =
           txn.PageManager()->GetPage(ref->body.row_page.next_page_id_);
       ref = std::move(next);
-      StatusOr<slot_t> next_pos = next->Insert(txn, serialized_row);
-      if (next_pos.HasValue()) {
-        rp.page_id = next->PageID();
+      StatusOr<slot_t> next_pos = ref->Insert(txn, serialized_row);
+      if (next_pos.GetStatus() == Status::kSuccess) {
+        rp.page_id = ref->PageID();
         rp.slot = next_pos.Value();
         finished = true;
         break;

@@ -33,7 +33,7 @@ class RecoveryManagerTest : public RowPageTest {
 
   void RecoverBase(const std::function<void(void)>& f) {
     if (p_) {
-      p_->GetPool()->LostAllPageForTest();
+      p_->GetPool()->DropAllPages();
     }
     tm_.reset();
     lm_.reset();

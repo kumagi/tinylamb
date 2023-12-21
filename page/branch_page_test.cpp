@@ -57,7 +57,7 @@ class BranchPageTest : public ::testing::Test {
 
   virtual void Recover() {
     if (p_) {
-      p_->GetPool()->LostAllPageForTest();
+      p_->GetPool()->DropAllPages();
     }
     tm_.reset();
     r_.reset();
@@ -74,8 +74,8 @@ class BranchPageTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    std::remove(db_name_.c_str());
-    std::remove(log_name_.c_str());
+    std::ignore = std::remove(db_name_.c_str());
+    std::ignore = std::remove(log_name_.c_str());
   }
 
   std::string db_name_;

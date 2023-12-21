@@ -16,7 +16,7 @@
 
 #include "full_scan_plan.hpp"
 
-#include "database/relation_storage.hpp"
+#include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/full_scan.hpp"
 #include "table/table.hpp"
