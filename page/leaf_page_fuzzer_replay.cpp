@@ -19,6 +19,7 @@
 //
 
 #include <filesystem>
+#include <iostream>
 
 #include "page/leaf_page_fuzzer.hpp"
 

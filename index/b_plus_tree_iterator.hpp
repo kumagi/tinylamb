@@ -17,7 +17,9 @@
 #ifndef TINYLAMB_B_PLUS_TREE_ITERATOR_HPP
 #define TINYLAMB_B_PLUS_TREE_ITERATOR_HPP
 
+#include <cstddef>
 #include <string>
+#include <string_view>
 
 #include "common/constants.hpp"
 

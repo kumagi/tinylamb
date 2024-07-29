@@ -62,10 +62,10 @@ class Database {
   Status RefreshStatistics(TransactionContext& txn,
                            std::string_view schema_name);
 
-  void EmulateCrash();
-
   StatusOr<Table> GetTable(TransactionContext& ctx,
                            std::string_view schema_name);
+
+  void EmulateCrash();
 
   void DeleteAll();
 

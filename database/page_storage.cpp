@@ -20,6 +20,10 @@
 
 #include "page_storage.hpp"
 
+#include <string_view>
+
+#include "transaction/transaction.hpp"
+
 namespace tinylamb {
 
 PageStorage::PageStorage(std::string_view dbname)

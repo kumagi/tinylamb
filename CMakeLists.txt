@@ -52,7 +52,15 @@ add_library(libtinylamb
         database/transaction_context.cpp executor/insert.cpp
         executor/update.cpp plan/index_scan_plan.cpp executor/index_scan.cpp
         executor/index_only_scan.cpp type/column_name.cpp query/query_data.cpp
-        expression/named_expression.cpp executor/index_join.cpp page/index_key.hpp page/row_pointer.hpp)
+        expression/named_expression.cpp executor/index_join.cpp
+        index/lsm_tree.cpp
+        index/lsm_detail/offset_index.cpp
+        index/lsm_detail/lsm_view.cpp
+        index/lsm_detail/blob_file.cpp
+        index/lsm_detail/cache.cpp index/lsm_detail/sorted_run.cpp
+        common/ring_buffer.hpp
+)
+
 
 add_library(libtinylamb_test_util
         STATIC
@@ -68,6 +76,25 @@ target_include_directories(
         libtinylamb_test_util
         PUBLIC
         ${PROJECT_SOURCE_DIR})
+
+########################################
+## Bench
+########################################
+
+function(add_benchmark file_path)
+    get_filename_component(filename ${file_path} NAME)
+    string(REPLACE ".cpp" "" target_name ${filename})
+    add_executable(${target_name} ${file_path})
+    target_compile_options(${target_name} PRIVATE "-O2")
+    set_property(TARGET ${target_name} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    target_link_libraries(${target_name}
+            libtinylamb
+            leveldb
+            rocksdb
+    )
+endfunction()
+
+add_benchmark("index/lsm_detail/lsm_tree_bench.cpp")
 
 ########################################
 ## Testing
@@ -115,6 +142,7 @@ add_simple_test(recovery/recovery_manager_test.cpp)
 add_simple_test(recovery/checkpoint_manager_test.cpp)
 add_simple_test(index/b_plus_tree_test.cpp)
 add_simple_test(index/b_plus_tree_iterator_test.cpp)
+add_simple_test(index/lsm_tree_test.cpp)
 add_simple_test(table/table_test.cpp)
 add_simple_test(table/index_test.cpp)
 add_simple_test(table/full_scan_iterator_test.cpp)
@@ -127,11 +155,16 @@ add_simple_test(plan/plan_test.cpp)
 add_simple_test(type/column_name_test.cpp)
 add_simple_test(plan/optimizer_test.cpp)
 add_simple_test(table/table_statistics_test.cpp)
+add_simple_test(index/lsm_detail/blob_file_test.cpp)
+add_simple_test(index/lsm_detail/lsm_view_test.cpp)
+add_simple_test(index/lsm_detail/cache_test.cpp)
+add_simple_test(index/lsm_detail/sorted_run_test.cpp)
 
 # Concurrency tests.
 add_simple_test(page/row_page_concurrent_test.cpp)
 add_simple_test(index/b_plus_tree_concurrent_test.cpp)
 add_simple_test(table/table_concurrent_test.cpp)
+add_simple_test(index/lsm_detail/cache_concurrent_test.cpp)
 
 
 ########################################

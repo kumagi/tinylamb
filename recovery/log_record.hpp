@@ -18,6 +18,9 @@
 #define TINYLAMB_LOG_RECORD_HPP
 
 #include <cassert>
+#include <istream>
+#include <limits>
+#include <ostream>
 #include <unordered_set>
 #include <utility>
 
@@ -62,8 +65,8 @@ enum class LogType : uint16_t {
   kSystemDestroyPage,
   kLowestValue,
 };
-inline std::istream& operator>>(std::istream& in, const LogType& val) {
-  in >> (uint16_t&)val;
+inline std::istream& operator>>(std::istream& in, LogType& val) {
+  in >> *reinterpret_cast<uint16_t*>(&val);
   return in;
 }
 

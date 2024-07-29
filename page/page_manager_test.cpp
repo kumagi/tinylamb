@@ -16,7 +16,9 @@
 
 #include "page_manager.hpp"
 
+#include <cstdio>
 #include <string>
+#include <tuple>
 
 #include "common/random_string.hpp"
 #include "gtest/gtest.h"
@@ -51,8 +53,8 @@ class PageManagerTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    std::remove(db_name_.c_str());
-    std::remove(log_name_.c_str());
+    std::ignore = std::remove(db_name_.c_str());
+    std::ignore = std::remove(log_name_.c_str());
   }
 
   PageRef AllocatePage(PageType expected_type) {

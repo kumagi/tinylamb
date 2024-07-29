@@ -19,20 +19,43 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
+#include <string_view>
+#include <thread>
 
-#include "log_record.hpp"
+#include "common/constants.hpp"
+#include "common/log_message.hpp"
 
 namespace tinylamb {
 
-Logger::Logger(std::string_view filename, size_t buffer_size, size_t every_ms)
+namespace {
+int CreateFile(const std::filesystem::path& path) {
+  if (path.has_parent_path()) {
+    std::filesystem::create_directories(path.parent_path());
+  }
+  return ::open(path.c_str(), O_RDWR | O_CREAT | O_APPEND, 0666);
+}
+
+}  // namespace
+
+Logger::Logger(const std::filesystem::path& logfile, size_t buffer_size,
+               size_t every_ms)
     : every_us_(every_ms),
       buffer_(buffer_size, 0),
-      filename_(filename),
-      dst_(open(filename_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0666)),
+      dst_(CreateFile(logfile)),
       worker_(&Logger::LoggerWork, this) {
+  if (dst_ == -1) {
+    LOG(FATAL) << "Failed to open log file: " << std::strerror(errno) << " for "
+               << logfile;
+  }
+  flushed_lsn_ = buffered_lsn_ = std::filesystem::file_size(logfile);
   memset(buffer_.data(), 0, buffer_size);
 }
 
@@ -96,6 +119,7 @@ void Logger::LoggerWork() {
         write(dst_, buffer_.data() + flushed,
               (flushed < buffered ? buffered : buffer_.size()) - flushed);
     if (flushed_size <= 0) {
+      // LOG(FATAL) << dst_ << " : " << std::strerror(errno);
       continue;
     }
 

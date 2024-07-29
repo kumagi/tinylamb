@@ -16,8 +16,11 @@
 
 #include "page_pool.hpp"
 
+#include <memory>
+
 #include "meta_page.hpp"
 #include "page/page_ref.hpp"
+#include "page_type.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "row_page.hpp"
 

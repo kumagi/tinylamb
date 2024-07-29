@@ -17,9 +17,13 @@
 #ifndef TINYLAMB_ENCODER_HPP
 #define TINYLAMB_ENCODER_HPP
 
+#include <cstddef>
 #include <cstdint>
-#include <memory>
+#include <ostream>
 #include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"

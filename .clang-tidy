@@ -25,7 +25,7 @@ Checks: '-*,
   -modernize-use-using,
   -modernize-use-default-member-init,
   -modernize-macro-to-enum,
-  -modernize-use-trailing-return-type
+  -modernize-use-trailing-return-type,
   performance-*,
   -performance-no-int-to-ptr,
   readability-*,

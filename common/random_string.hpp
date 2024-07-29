@@ -17,7 +17,9 @@
 #ifndef TINYLAMB_RANDOM_STRING_HPP
 #define TINYLAMB_RANDOM_STRING_HPP
 
+#include <cstddef>
 #include <random>
+#include <string>
 
 namespace tinylamb {
 

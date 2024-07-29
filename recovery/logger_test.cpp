@@ -18,6 +18,10 @@
 
 #include <filesystem>
 #include <fstream>
+#include <ios>
+#include <memory>
+#include <string>
+#include <thread>
 
 #include "common/random_string.hpp"
 #include "gtest/gtest.h"
@@ -94,6 +98,20 @@ TEST_F(LoggerTest, AppendMany) {
     EXPECT_EQ(lsn, size);
   }
   WaitForCommit(lsn);
+  EXPECT_EQ(std::filesystem::file_size(log_name_), size);
+}
+
+TEST_F(LoggerTest, AppendExponential) {
+  l_ = std::make_unique<Logger>(log_name_);
+  lsn_t lsn = 0;
+  size_t size = 0;
+  for (int i = 0; i < 1000; ++i) {
+    std::string data(i * i + 1, 'x');
+    lsn = l_->AddLog(data);
+    EXPECT_EQ(lsn, size);
+    size += i * i + 1;
+  }
+  WaitForCommit(size);
   EXPECT_EQ(std::filesystem::file_size(log_name_), size);
 }
 

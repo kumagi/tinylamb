@@ -16,6 +16,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #include "b_plus_tree.hpp"
 #include "common/random_string.hpp"
@@ -77,9 +78,9 @@ class BPlusTreeConcurrentTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    std::remove(db_name_.c_str());
-    std::remove(log_name_.c_str());
-    std::remove(master_record_name_.c_str());
+    std::ignore = std::remove(db_name_.c_str());
+    std::ignore = std::remove(log_name_.c_str());
+    std::ignore = std::remove(master_record_name_.c_str());
   }
 
  protected:
