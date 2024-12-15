@@ -13,27 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TINYLAMB_CACHE_HPP
-#define TINYLAMB_CACHE_HPP
+#ifndef TINYLAMB_VM_CACHE_IMPL_HPP
+#define TINYLAMB_VM_CACHE_IMPL_HPP
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <memory>
+#include <iosfwd>
 #include <mutex>
-#include <ostream>
 #include <string>
-#include <string_view>
 #include <vector>
-
-#include "common/ring_buffer.hpp"
 
 namespace tinylamb {
 
-class Cache final {
-  static constexpr size_t kBlockSize = 4UL * 1024;
-
+class VMCacheImpl {
   enum class PageState : std::uint8_t {
     kUnknown = 0,
 
@@ -56,64 +50,19 @@ class Cache final {
     kUnlockedAccessed = 6,
   };
 
-  friend std::ostream& operator<<(std::ostream& o, const PageState& s) {
-    switch (s) {
-      case PageState::kUnknown:
-        o << "<Unknown>";
-        break;
-      case PageState::kEvicted:
-        o << "<Evicted>";
-        break;
-      case PageState::kLocked:
-        o << "<Locked>";
-        break;
-      case PageState::kUnlocked:
-        o << "<Unlocked>";
-        break;
-      case PageState::kMarked:
-        o << "<Marked>";
-        break;
-      case PageState::kLockedAccessed:
-        o << "<LockedAccessed>";
-        break;
-      case PageState::kUnlockedAccessed:
-        o << "<UnlockedAccessed>";
-        break;
-    }
-    return o;
-  }
+  friend std::ostream& operator<<(std::ostream& o, const PageState& s);
 
  public:
-  class Lock {
-   public:
-    ~Lock() noexcept {
-      locked_page_->store(PageState::kUnlocked, std::memory_order_release);
-    }
-    Lock(const Lock&) = delete;
-    Lock& operator=(const Lock&) = delete;
-    Lock(Lock&&) = default;
-    Lock& operator=(Lock&&) = default;
-
-   private:
-    friend class Cache;
-    std::atomic<PageState>* locked_page_;
-    Lock(std::atomic<PageState>& target) : locked_page_(&target) {}
-  };
-  typedef std::vector<Lock> Locks;
-
-  Cache(int fd, size_t memory_capacity, size_t max_size = 0);
-  ~Cache();
-  Cache(const Cache&) = delete;
-  Cache(Cache&&) = delete;
-  Cache& operator=(const Cache&) = delete;
-  Cache& operator=(Cache&&) = delete;
-
-  std::string ReadAt(size_t offset, size_t length) const;
-  Locks ReadAt(size_t offset, size_t length, std::string_view& out) const;
-  void Copy(void* dst, size_t offset, size_t length) const;
+  VMCacheImpl(int fd, size_t block_size, size_t memory_capacity,
+              size_t offset = 0, size_t file_size = 0);
+  ~VMCacheImpl();
+  VMCacheImpl(const VMCacheImpl&) = delete;
+  VMCacheImpl(VMCacheImpl&&) = delete;
+  VMCacheImpl& operator=(const VMCacheImpl&) = delete;
+  VMCacheImpl& operator=(VMCacheImpl&&) = delete;
+  void Read(void* dst, size_t offset, size_t length) const;
   void Invalidate(size_t offset, size_t length);
-
-  std::string Dump() const;
+  [[nodiscard]] std::string Dump() const;
 
  private:
   void ReadInPage(void* dst, size_t length, void* src) const;
@@ -131,9 +80,11 @@ class Cache final {
   bool SanityCheck() const;
 
   int fd_;
+  const size_t block_size_;
   mutable char* buffer_;
   const size_t max_memory_pages_;
   const size_t max_size_;
+  const size_t offset_;
   mutable std::vector<std::atomic<PageState>> meta_;
 
   mutable std::mutex queue_lock_;
@@ -147,4 +98,4 @@ class Cache final {
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_CACHE_HPP
+#endif  // TINYLAMB_VM_CACHE_IMPL_HPP

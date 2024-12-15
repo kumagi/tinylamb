@@ -21,8 +21,10 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -46,14 +48,19 @@ class BlobFile final {
 
   [[nodiscard]] std::string ReadAt(size_t offset, size_t length) const;
   [[nodiscard]] Cache::Locks ReadAt(size_t, std::string_view& out) const;
-  lsn_t Append(std::string_view payload) {
-    return file_writer_.AddLog(payload);
-  }
+  lsn_t Append(std::string_view payload);
   [[nodiscard]] lsn_t Written() const { return file_writer_.CommittedLSN(); }
+  void Flush() const {
+    const lsn_t lsn = file_writer_.BufferedLSN();
+    while (file_writer_.CommittedLSN() < lsn) {
+      std::this_thread::yield();
+    }
+  }
 
  private:
   Logger file_writer_;
   Cache cache_;
+  std::mutex writer_lock_;
 };
 
 }  // namespace tinylamb

@@ -79,6 +79,7 @@ enum class Status : uint8_t {
   kTooBigData,
   kAmbiguousQuery,
   kIsInfinity,
+  kDeleted,
 };
 
 enum class BinaryOperation {

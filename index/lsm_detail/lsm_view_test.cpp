@@ -39,7 +39,7 @@ class LSMViewTest : public ::testing::Test {
   void SetUp() override {
     path_ = "tmp_view_merger_test-" + RandomString();
     std::filesystem::create_directory(path_);
-    std::string blob_path = path_ + "/blob.db";
+    std::string blob_path = path_ / "blob.db";
     std::vector<std::filesystem::path> index_files;
     blob_ = std::make_unique<BlobFile>(blob_path);
     {
@@ -47,11 +47,10 @@ class LSMViewTest : public ::testing::Test {
         std::map<std::string, LSMValue> mem_value;
         for (int j = 0; j < 100; ++j) {
           mem_value.emplace(std::to_string(j + i * 100),
-                            LSMValue{false, std::to_string(i)});
+                            LSMValue(std::to_string(i)));
         }
-        SortedRun run(mem_value, *blob_, i);
-        std::string filepath = path_ + "/" + std::to_string(i);
-        run.Flush(filepath);
+        std::string filepath = path_ / std::to_string(i);
+        SortedRun::Construct(filepath, mem_value, *blob_, i);
         index_files.emplace_back(std::move(filepath));
       }
     }
@@ -67,7 +66,7 @@ class LSMViewTest : public ::testing::Test {
   std::unique_ptr<LSMView> view_;
   std::unique_ptr<BlobFile> blob_;
 
-  std::string path_;
+  std::filesystem::path path_;
 };
 
 TEST_F(LSMViewTest, Find) {
@@ -100,10 +99,10 @@ TEST_F(LSMViewTest, Iter) {
 }
 
 TEST_F(LSMViewTest, Merged) {
-  std::filesystem::path merged_file = path_ + "/merged.idx";
-  SortedRun merged = view_->CreateSingleRun();
+  std::filesystem::path merged_file = path_ / "merged.idx";
+  view_->CreateSingleRun(merged_file);
+  SortedRun merged(merged_file);
   ASSERT_EQ(merged.Size(), 100 * 10);
-  merged.Flush(merged_file);
 
   std::map<std::string, std::string> expected;
   for (int i = 0; i < 1000; ++i) {
@@ -124,10 +123,10 @@ TEST_F(LSMViewTest, Merged) {
 
 TEST_F(LSMViewTest, Recover) {
   view_.reset();
-  blob_ = std::make_unique<BlobFile>(path_ + "/blob.db");
+  blob_ = std::make_unique<BlobFile>(path_ / "blob.db");
   std::vector<std::filesystem::path> idx;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
-    if (entry.path() != path_ + "/blob.db") {
+    if (entry.path() != path_ / "blob.db") {
       idx.push_back(entry.path());
     }
   }
@@ -143,14 +142,10 @@ TEST_F(LSMViewTest, Recover) {
 TEST_F(LSMViewTest, Overwrite) {
   std::map<std::string, LSMValue> mem_value;
   for (int i = 0; i < 1000; ++i) {
-    mem_value.emplace(std::to_string(i),
-                      LSMValue{false, std::to_string(i * 2)});
+    mem_value.emplace(std::to_string(i), LSMValue(std::to_string(i * 2)));
   }
-  std::string filepath = path_ + "/overwrites.idx";
-  {
-    SortedRun run(mem_value, *blob_, 12);
-    run.Flush(filepath);
-  }
+  std::string filepath = path_ / "overwrites.idx";
+  SortedRun::Construct(filepath, mem_value, *blob_, 12);
 
   std::vector<SortedRun> index_files{SortedRun(filepath)};
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
@@ -169,15 +164,10 @@ TEST_F(LSMViewTest, Overwrite) {
 TEST_F(LSMViewTest, OverwriteAndScan) {
   std::map<std::string, LSMValue> mem_value;
   for (int i = 0; i < 1000; i += 2) {
-    mem_value.emplace(std::to_string(i),
-                      LSMValue{false, std::to_string(i * 2)});
+    mem_value.emplace(std::to_string(i), LSMValue(std::to_string(i * 2)));
   }
-  std::string filepath = path_ + "/overwrites.idx";
-  {
-    Logger index_writer(filepath);
-    SortedRun run(mem_value, *blob_, 11);
-    run.Flush(filepath);
-  }
+  std::string filepath = path_ / "overwrites.idx";
+  SortedRun::Construct(filepath, mem_value, *blob_, 11);
 
   std::vector<std::filesystem::path> index_files;
   for (const auto& entry : std::filesystem::directory_iterator(path_)) {
@@ -195,6 +185,88 @@ TEST_F(LSMViewTest, OverwriteAndScan) {
       ASSERT_EQ(value, std::to_string(key_int * 2));
     } else {
       ASSERT_EQ(value, std::to_string(key_int / 100));
+    }
+    ++iter;
+  }
+}
+
+TEST_F(LSMViewTest, DeleteAndScan) {
+  std::map<std::string, LSMValue> mem_value;
+  mem_value.emplace(std::to_string(42), LSMValue::Delete());
+  std::string filepath = path_ / "deletes.idx";
+  SortedRun::Construct(filepath, mem_value, *blob_, 11);
+
+  std::vector<std::filesystem::path> index_files;
+  for (const auto& entry : std::filesystem::directory_iterator(path_)) {
+    if (!entry.path().string().ends_with(".db")) {
+      index_files.push_back(entry.path());
+    }
+  }
+  view_ = std::make_unique<LSMView>(*blob_, index_files);
+  StatusOr<std::string> result = view_->Find(std::to_string(42));
+  ASSERT_EQ(result.GetStatus(), Status::kNotExists);
+}
+
+TEST_F(LSMViewTest, DeleteMultiAndScan) {
+  std::map<std::string, LSMValue> mem_value;
+  for (int i = 0; i < 1000; i += 2) {
+    mem_value.emplace(std::to_string(i), LSMValue::Delete());
+  }
+  std::filesystem::path filepath = path_ / "deletes.idx";
+  SortedRun::Construct(filepath, mem_value, *blob_, 11);
+
+  std::vector<std::filesystem::path> index_files;
+  for (const auto& entry : std::filesystem::directory_iterator(path_)) {
+    if (!entry.path().string().ends_with(".db")) {
+      index_files.push_back(entry.path());
+    }
+  }
+  view_ = std::make_unique<LSMView>(*blob_, index_files);
+  auto iter = view_->Begin();
+  int valid_key = 1;
+  while (iter.IsValid()) {
+    std::string key = iter.Key();
+    int key_int = std::stol(key);
+    ASSERT_EQ(key_int % 2, 1);
+    ++iter;
+  }
+}
+
+TEST_F(LSMViewTest, DeleteOverWriteScan) {
+  {
+    std::map<std::string, LSMValue> mem_value;
+    for (int i = 0; i < 1000; i += 2) {
+      mem_value.emplace(std::to_string(i), LSMValue::Delete());
+    }
+    std::filesystem::path filepath = path_ / "deletes.idx";
+    SortedRun::Construct(filepath, mem_value, *blob_, 11);
+  }
+  {
+    std::map<std::string, LSMValue> mem_value;
+    for (int i = 0; i < 1000; i += 4) {
+      mem_value.emplace(std::to_string(i), LSMValue("Hello"));
+    }
+    std::filesystem::path filepath = path_ / "overwrite.idx";
+    SortedRun::Construct(filepath, mem_value, *blob_, 12);
+  }
+
+  std::vector<std::filesystem::path> index_files;
+  for (const auto& entry : std::filesystem::directory_iterator(path_)) {
+    if (!entry.path().string().ends_with(".db")) {
+      index_files.push_back(entry.path());
+    }
+  }
+  view_ = std::make_unique<LSMView>(*blob_, index_files);
+  auto iter = view_->Begin();
+  int valid_key = 1;
+  while (iter.IsValid()) {
+    std::string key = iter.Key();
+    int key_int = std::stol(key);
+    if (key_int % 4 == 0) {
+      ASSERT_EQ(iter.Value(), "Hello");
+      LOG(INFO) << key_int;
+    } else {
+      ASSERT_EQ(key_int % 2, 1);
     }
     ++iter;
   }

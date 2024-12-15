@@ -45,7 +45,8 @@ class Logger final {
 
   void Finish();
 
-  [[nodiscard]] lsn_t CommittedLSN() const;
+  [[nodiscard]] lsn_t CommittedLSN() const { return flushed_lsn_; }
+  [[nodiscard]] lsn_t BufferedLSN() const { return buffered_lsn_; }
 
   lsn_t AddLog(std::string_view payload);
 

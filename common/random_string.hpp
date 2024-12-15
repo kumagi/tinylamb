@@ -23,18 +23,20 @@
 
 namespace tinylamb {
 
-inline thread_local std::random_device seed_gen;
-inline thread_local std::mt19937 device_random(seed_gen());
-inline thread_local std::mt19937 seeded_random(4);  // see https://xkcd.com/221/
+inline std::random_device seed_gen;
+inline std::mt19937 device_random(seed_gen());
+inline std::mt19937 seeded_random(4);  // see https://xkcd.com/221/
 
-inline std::string RandomString(size_t len = 16, bool random_seed = true) {
+inline void RandomStringInitialize() { seeded_random = std::mt19937(4); }
+
+inline std::string RandomString(size_t len = 16, bool use_seed = true) {
   static const char alphanum[] =
       "0123456789"
       "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
       "abcdefghijklmnopqrstuvwxyz";
   std::string ret;
   ret.reserve(len);
-  if (random_seed) {
+  if (use_seed) {
     for (size_t i = 0; i < len; ++i) {
       ret.push_back(alphanum[device_random() % (sizeof(alphanum) - 1)]);
     }

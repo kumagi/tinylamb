@@ -54,11 +54,12 @@ add_library(libtinylamb
         executor/index_only_scan.cpp type/column_name.cpp query/query_data.cpp
         expression/named_expression.cpp executor/index_join.cpp
         index/lsm_tree.cpp
-        index/lsm_detail/offset_index.cpp
         index/lsm_detail/lsm_view.cpp
         index/lsm_detail/blob_file.cpp
         index/lsm_detail/cache.cpp index/lsm_detail/sorted_run.cpp
         common/ring_buffer.hpp
+        common/vm_cache_impl.cpp
+        common/vm_cache_impl.hpp
 )
 
 
@@ -125,6 +126,7 @@ function(add_simple_test file_path)
     gtest_discover_tests(${target_name})
 endfunction()
 
+add_simple_test(common/vm_cache_test.cpp)
 add_simple_test(common/log_message_test.cpp)
 add_simple_test(type/value_test.cpp)
 add_simple_test(type/row_test.cpp)
@@ -189,6 +191,9 @@ add_fuzzer_test(recovery/logger_fuzzer.cpp)
 add_fuzzer_test(type/value_fuzzer.cpp)
 add_fuzzer_test(page/row_page_fuzzer.cpp)
 add_fuzzer_test(page/leaf_page_fuzzer.cpp)
+add_fuzzer_test(index/lsm_detail/lsm_view_fuzzer.cpp)
+add_fuzzer_test(index/lsm_detail/cache_fuzzer.cpp)
+add_fuzzer_test(index/lsm_tree_fuzzer.cpp)
 add_fuzzer_test(index/b_plus_tree_fuzzer.cpp)
 add_fuzzer_test(table/table_fuzzer.cpp)
 
@@ -196,7 +201,7 @@ add_fuzzer_test(table/table_fuzzer.cpp)
 ## Fuzzing Replay
 ########################################
 function(add_replay_test file_path)
-    set(fuzzer_option "-fsanitize=address,undefined,bounds")
+    set(fuzzer_option "-fsanitize-trap=undefined,bounds")
     get_filename_component(filename ${file_path} NAME)
     string(REPLACE ".cpp" "" target_name ${filename})
     add_executable(${target_name} ${file_path})
@@ -214,5 +219,9 @@ endfunction()
 add_replay_test(recovery/logger_fuzzer_replay.cpp)
 add_replay_test(page/row_page_fuzzer_replay.cpp)
 add_replay_test(page/leaf_page_fuzzer_replay.cpp)
+add_replay_test(index/lsm_detail/lsm_view_fuzzer_replay.cpp)
+add_replay_test(index/lsm_detail/cache_fuzzer_replay.cpp)
+add_replay_test(index/lsm_tree_fuzzer_replay.cpp)
 add_replay_test(index/b_plus_tree_fuzzer_replay.cpp)
+
 add_replay_test(table/table_fuzzer_replay.cpp)

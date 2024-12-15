@@ -66,11 +66,10 @@ Logger::~Logger() {
 
 void Logger::Finish() {
   finish_ = true;
+  while (flushed_lsn_ != buffered_lsn_) {
+    // Wait to flush.
+  }
   worker_.join();
-}
-
-lsn_t Logger::CommittedLSN() const {
-  return flushed_lsn_.load(std::memory_order_release);
 }
 
 lsn_t Logger::AddLog(std::string_view payload) {
@@ -119,8 +118,8 @@ void Logger::LoggerWork() {
         write(dst_, buffer_.data() + flushed,
               (flushed < buffered ? buffered : buffer_.size()) - flushed);
     if (flushed_size <= 0) {
-      // LOG(FATAL) << dst_ << " : " << std::strerror(errno);
-      continue;
+      LOG(FATAL) << dst_ << " : " << std::strerror(errno);
+      break;
     }
 
     fdatasync(dst_);  // Flush!

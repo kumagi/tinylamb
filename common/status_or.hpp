@@ -51,7 +51,7 @@
 
 #define ASSERT_SUCCESS_AND_EQ(expr, expected)     \
   {                                               \
-    auto tmp = expr;                              \
+    const auto& tmp = expr;                       \
     ASSERT_EQ(tmp.GetStatus(), Status::kSuccess); \
     ASSERT_EQ(tmp.Value(), expected);             \
   }

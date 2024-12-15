@@ -17,9 +17,8 @@
 #ifndef TINYLAMB_DEBUG_HPP
 #define TINYLAMB_DEBUG_HPP
 
-#include <iomanip>
-#include <iosfwd>
-#include <sstream>
+#include <string>
+#include <string_view>
 
 namespace tinylamb {
 

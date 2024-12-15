@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -60,6 +61,14 @@ Cache::Locks BlobFile::ReadAt(size_t offset, std::string_view& out) const {
   cache_.Copy(&key_size, offset, sizeof(key_size));
   key_size = be32toh(key_size);
   return cache_.ReadAt(offset + sizeof(int32_t), key_size, out);
+}
+
+lsn_t BlobFile::Append(std::string_view payload) {
+  std::scoped_lock<std::mutex> lk(writer_lock_);
+  size_t before = file_writer_.BufferedLSN();
+  lsn_t lsn = file_writer_.AddLog(payload);
+  cache_.Invalidate(before, payload.length());
+  return lsn;
 }
 
 }  // namespace tinylamb

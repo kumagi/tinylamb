@@ -17,10 +17,23 @@
 #ifndef TINYLAMB_ROW_PAGE_FUZZER_HPP
 #define TINYLAMB_ROW_PAGE_FUZZER_HPP
 
+#include <stdlib.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <string_view>
+
+#include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
 #include "page/row_page.hpp"
+#include "page_type.hpp"
 #include "recovery/logger.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
@@ -30,9 +43,7 @@ namespace tinylamb {
 
 class RowPageEnvironment {
  public:
-  RowPageEnvironment() { Initialize(); }
-
-  void Initialize() {
+  RowPageEnvironment() {
     std::string prefix = "checkpoint_test-" + RandomString();
     db_name_ = prefix + ".db";
     log_name_ = prefix + ".log";
@@ -102,7 +113,7 @@ class Operation {
         return 1 + sizeof(slot);
       }
       case 1: {  // InsertBranch
-        bin_size_t size;
+        bin_size_t size = 0;
         if (input.size() < sizeof(size)) {
           return 1 + input.size();
         }
@@ -118,39 +129,55 @@ class Operation {
       }
       case 2: {  // UpdateBranch
         slot_t slot;
-        if (input.size() < sizeof(slot)) return 1 + input.size();
+        if (input.size() < sizeof(slot)) {
+          return 1 + input.size();
+        }
         memcpy(&slot, input.data(), sizeof(slot_t));
         input.remove_prefix(sizeof(slot));
 
         bin_size_t size;
-        if (input.size() < sizeof(size)) return 1 + sizeof(size) + input.size();
+        if (input.size() < sizeof(size)) {
+          return 1 + sizeof(size) + input.size();
+        }
         memcpy(&size, input.data(), sizeof(size));
         input.remove_prefix(sizeof(size));
 
         size = std::min(size, (bin_size_t)input.size());
         std::string_view str(input.data(), size);
-        if (verbose) LOG(TRACE) << "UpdateBranch: " << str << " at " << slot;
+        if (verbose) {
+          LOG(TRACE) << "UpdateBranch: " << str << " at " << slot;
+        }
         Status s = page_->Update(txn_, slot, str);
-        if (verbose) LOG(TRACE) << ToString(s);
+        if (verbose) {
+          LOG(TRACE) << ToString(s);
+        }
         return 1 + sizeof(slot) + sizeof(size) + size;
       }
       case 3: {  // Delete
         slot_t slot;
-        if (input.size() < sizeof(slot)) return 1 + input.size();
+        if (input.size() < sizeof(slot)) {
+          return 1 + input.size();
+        }
         memcpy(&slot, input.data(), sizeof(slot_t));
         input.remove_prefix(sizeof(slot));
-        if (verbose) LOG(TRACE) << "Delete: " << slot;
+        if (verbose) {
+          LOG(TRACE) << "Delete: " << slot;
+        }
         page_->Delete(txn_, slot);
         return 1 + sizeof(slot);
       }
       case 4: {  // Commit
-        if (verbose) LOG(TRACE) << "Commit";
+        if (verbose) {
+          LOG(TRACE) << "Commit";
+        }
         txn_.PreCommit();
         StartTransaction();
         return 1;
       }
       case 5: {  // Abort
-        if (verbose) LOG(TRACE) << "Commit";
+        if (verbose) {
+          LOG(TRACE) << "Commit";
+        }
         page_.PageUnlock();
         txn_.Abort();
         StartTransaction();
@@ -158,7 +185,9 @@ class Operation {
         return 1;
       }
       case 6: {  // Crash
-        if (verbose) LOG(TRACE) << "Crash";
+        if (verbose) {
+          LOG(TRACE) << "Crash";
+        }
         page_.PageUnlock();
         env_->Recover();
         StartTransaction();

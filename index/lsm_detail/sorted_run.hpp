@@ -17,13 +17,13 @@
 #ifndef TINYLAMB_SORTED_RUN_HPP
 #define TINYLAMB_SORTED_RUN_HPP
 
-#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -32,16 +32,42 @@
 
 #include "common/log_message.hpp"
 #include "common/status_or.hpp"
+#include "common/vm_cache.hpp"
 #include "index/lsm_detail/blob_file.hpp"
-#include "recovery/logger.hpp"
+
 namespace tinylamb {
 
 struct LSMValue {
   bool is_delete{false};
   std::string payload;
+  static LSMValue& Delete() {
+    static LSMValue instance = LSMValue();
+    return instance;
+  }
+  LSMValue() : is_delete(true) {}
+  explicit LSMValue(std::string p) : is_delete(false), payload(std::move(p)) {}
+  LSMValue(const LSMValue& rhs) = default;
+  LSMValue(LSMValue&& rhs) = default;
+  LSMValue& operator=(const LSMValue& rhs) = default;
+  LSMValue& operator=(LSMValue&& rhs) = default;
+  ~LSMValue() = default;
+  friend std::ostream& operator<<(std::ostream& o, const LSMValue& v) {
+    if (v.is_delete) {
+      o << "(deleted)";
+    } else {
+      o << v.payload;
+    }
+    return o;
+  }
 };
 
 class SortedRun {
+  static std::string HeadString(uint32_t in) {
+    std::string out(4, 0);
+    *(reinterpret_cast<uint32_t*>(out.data())) = be32toh(in);
+    return out;
+  }
+
  public:
   struct Entry {
     constexpr static size_t kIndirectThreshold = 12;
@@ -59,7 +85,27 @@ class SortedRun {
     [[nodiscard]] std::string BuildValue(const BlobFile& blob) const;
 
     [[nodiscard]] bool IsDeleted() const {
-      return value_offset_ == kDeletedValue;
+      return value_.offset_ == kDeletedValue;
+    }
+    friend std::ostream& operator<<(std::ostream& o, const Entry& e) {
+      o << "length: " << e.length_ << " head: " << e.key_head_;
+      if (kIndirectThreshold < e.length_) {
+        o << " stored at offset: " << e.key_.reference_;
+      } else {
+        o << " key: " << SortedRun::HeadString(e.key_.inline_);
+      }
+      if (e.IsDeleted()) {
+        o << "(deleted)";
+      } else {
+        o << " value_len: " << e.value_length_;
+        if (e.value_length_ <= sizeof(uint64_t)) {
+          o << " value: "
+            << std::string_view(e.value_.inline_.data(), e.value_length_);
+        } else {
+          o << " offset: " << e.value_.offset_;
+        }
+      }
+      return o;
     }
     // If this is bigger than kIndirectThreshold, the key payload is stored
     // over offset.
@@ -82,8 +128,16 @@ class SortedRun {
     } key_{0};
 
     constexpr static uint64_t kDeletedValue = 0xffffffffffffffff;
-    uint64_t value_offset_{0};
     uint64_t value_length_{0};
+    union Value {
+      // Pointer to full length value.
+      // Used only when the value length is longer than 8 bytes.
+      uint64_t offset_;
+
+      // Actual value inlined entry. The value_length_ must be shorter or equal
+      // to 8 bytes when this field used.
+      std::array<char, 8> inline_;
+    } value_{0};
   };
 
   class Iterator {
@@ -98,21 +152,23 @@ class SortedRun {
 
     [[nodiscard]] std::string Key() const {
       assert(IsValid());
-      return parent_->index_[offset_].BuildKey(*blob_);
+      return Entry().BuildKey(*blob_);
     }
     [[nodiscard]] std::string Value() const {
       assert(IsValid());
-      return parent_->index_[offset_].BuildValue(*blob_);
+      return Entry().BuildValue(*blob_);
     }
     [[nodiscard]] int Compare(const Iterator& rhs) const {
       assert(IsValid());
       assert(blob_ == rhs.blob_);
-      return parent_->index_[offset_].Compare(rhs.parent_->index_[rhs.offset_],
-                                              *blob_);
+      assert(offset_ < parent_->Size());
+      if (rhs.offset_ >= rhs.parent_->Size()) {
+        LOG(ERROR) << rhs.offset_ << " vs " << rhs.parent_->Size();
+      }
+      assert(rhs.offset_ < rhs.parent_->Size());
+      return Entry().Compare(rhs.Entry(), *blob_);
     }
-    [[nodiscard]] const Entry& Entry() const {
-      return parent_->index_[offset_];
-    }
+    [[nodiscard]] Entry Entry() const { return parent_->GetEntry(offset_); }
     [[nodiscard]] bool IsValid() const { return offset_ < parent_->Size(); }
     Iterator& operator++() {
       ++offset_;
@@ -123,7 +179,7 @@ class SortedRun {
     friend std::ostream& operator<<(std::ostream& o, const Iterator& it);
     [[nodiscard]] size_t Generation() const { return parent_->generation_; }
     [[nodiscard]] bool IsDeleted() const {
-      return parent_->index_[offset_].IsDeleted();
+      return parent_->GetEntry(offset_).IsDeleted();
     }
 
    private:
@@ -132,33 +188,46 @@ class SortedRun {
     size_t offset_;
   };
 
+  SortedRun() = default;
   explicit SortedRun(const std::filesystem::path& file);
-  SortedRun(const std::map<std::string, LSMValue>& tree, BlobFile& blob_,
-            size_t generation);
-  SortedRun(std::string_view min_key, std::string_view max_key,
-            std::vector<Entry> index, size_t generation)
-      : min_key_(min_key),
-        max_key_(max_key),
-        index_(std::move(index)),
-        generation_(generation) {}
-  StatusOr<size_t> Flush(const std::filesystem::path& path);
+  static void Construct(const std::filesystem::path& file,
+                        const std::map<std::string, LSMValue>& tree,
+                        BlobFile& blob_, size_t generation);
+
+  SortedRun(const SortedRun&) = default;
+  SortedRun(SortedRun&&) = default;
+  SortedRun& operator=(const SortedRun&) = default;
+  SortedRun& operator=(SortedRun&&) = default;
+  ~SortedRun() = default;
+
+  // StatusOr<size_t> Flush(const std::filesystem::path& path);
 
   [[nodiscard]] StatusOr<std::string> Find(std::string_view key,
                                            const BlobFile& blob) const;
 
-  [[nodiscard]] size_t Size() const { return index_.size(); }
+  [[nodiscard]] size_t Size() const { return length_; }
   [[nodiscard]] size_t Generation() const { return generation_; }
 
   [[nodiscard]] Iterator Begin(const BlobFile& blob) const {
     return {this, blob, 0};
   }
   friend std::ostream& operator<<(std::ostream& o, const SortedRun& s);
+  static void FlushInternal(const std::filesystem::path& path,
+                            std::string_view min, std::string_view max,
+                            const std::vector<Entry>& index, size_t generation);
 
  private:
+  static size_t FileOffset() {
+    return reinterpret_cast<intptr_t>(
+        &reinterpret_cast<SortedRun*>(NULL)->index_);
+  }
+  [[nodiscard]] Entry GetEntry(size_t offset) const;
+
   std::string min_key_;
   std::string max_key_;
-  std::vector<Entry> index_;
+  size_t length_{0};
   size_t generation_{0};
+  std::shared_ptr<VMCache<Entry>> index_;
 };
 
 }  // namespace tinylamb

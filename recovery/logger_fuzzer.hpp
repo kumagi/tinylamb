@@ -20,10 +20,15 @@
 
 #ifndef TINYLAMB_LOGGER_FUZZER_HPP
 #define TINYLAMB_LOGGER_FUZZER_HPP
+#include <cstddef>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <string>
+#include <vector>
 
+#include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "recovery/logger.hpp"
 
@@ -60,7 +65,7 @@ inline void Try(const uint64_t seed, bool verbose) {
         LOG(TRACE) << log_data;
       }
       total += log_data.size();
-      written.push_back(std::move(log_data));
+      written.emplace_back(log_data);
     }
     while (logger.CommittedLSN() < total) {
     }

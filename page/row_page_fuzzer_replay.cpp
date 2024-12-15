@@ -15,12 +15,15 @@
  */
 
 #include <filesystem>
+#include <fstream>
+#include <ios>
+#include <string_view>
 
+#include "common/log_message.hpp"
 #include "page/row_page_fuzzer.hpp"
 
 void TestCase(std::string_view input) {
   tinylamb::RowPageEnvironment env;
-  env.Initialize();
   tinylamb::Operation op(&env);
   while (!input.empty()) {
     size_t read_bytes = op.Execute(input, true);

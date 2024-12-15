@@ -16,6 +16,7 @@
 #include <endian.h>
 #include <fcntl.h>
 #include <leveldb/db.h>
+#include <leveldb/iterator.h>
 #include <leveldb/status.h>
 // #include <rocksdb/db.h>
 // #include <rocksdb/metadata.h>
@@ -27,30 +28,20 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <iomanip>
 #include <iostream>
-#include <map>
-#include <memory>
 #include <random>
 #include <set>
 #include <string>
 #include <string_view>
-#include <utility>
-#include <vector>
 
-#include "blob_file.hpp"
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "index/lsm_tree.hpp"
 #include "lsm_view.hpp"
-#include "recovery/logger.hpp"
-#include "sorted_run.hpp"
 
 using namespace tinylamb;
 
@@ -61,8 +52,8 @@ void Bench(size_t count, const std::function<void()>& fun,
   auto finish = std::chrono::system_clock::now();
   int us = std::chrono::duration_cast<std::chrono::milliseconds>(finish - begin)
                .count();
-  std::cout << std::setw(25) << name << ": " << count * 10.0 / us << " " << unit
-            << "\n";
+  std::cout << std::setw(25) << name << ": " << (double)count / us << " "
+            << unit << "\n";
 }
 
 int main(int argc, char** argv) {
@@ -94,16 +85,12 @@ int main(int argc, char** argv) {
     Bench(
         kCount,
         [&]() {
-          for (int i = 0; i < 10; ++i) {
-            std::map<std::string, std::string> mem_value;
-            leveldb::WriteOptions wo;
-            for (size_t j = 0; j < kCount / 10; ++j) {
-              ldb->Put(wo, std::to_string(j + i * (kCount / 10)),
-                       std::to_string(i));
-            }
+          leveldb::WriteOptions wo;
+          for (size_t i = 0; i < kCount; ++i) {
+            ldb->Put(wo, std::to_string(i), std::to_string(i));
           }
         },
-        "LDB Write", "tpms");
+        "LDB Write", "writes/ms");
     if (opts.contains('s')) {
       Bench(
           kCount,
@@ -115,7 +102,7 @@ int main(int argc, char** argv) {
               auto v = ldb->Get(ro, key, &val);
             }
           },
-          "LDB Success Find", "qpms");
+          "LDB Success Find", "reads/ms");
     }
     if (opts.contains('f')) {
       Bench(
@@ -125,11 +112,27 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < kCount; ++i) {
               std::string val;
               std::string key = std::to_string(random() % kCount) + "k";
-              auto v = ldb->Get(ro, key, &val);
+              volatile auto v = ldb->Get(ro, key, &val);
             }
           },
-          "LDB Failed Find", "qpms");
+          "LDB Failed Find", "reads/ms");
     }
+    if (opts.contains('i')) {
+      Bench(
+          kCount,
+          [&]() {
+            leveldb::ReadOptions ro;
+            leveldb::Iterator* it = ldb->NewIterator(ro);
+            for (it->SeekToFirst(); it->Valid(); it->Next()) {
+              volatile std::string key = it->key().ToString();
+              volatile std::string value = it->value().ToString();
+            }
+            assert(it->status().ok());
+            delete it;
+          },
+          "LDB Full Scan", "reads/ms");
+    }
+    std::filesystem::remove_all(ldb_path);
   }
 
   if (opts.contains('k')) {
@@ -140,15 +143,12 @@ int main(int argc, char** argv) {
     Bench(
         kCount,
         [&]() {
-          for (int i = 0; i < 10; ++i) {
-            for (size_t j = 0; j < kCount / 10; ++j) {
-              tree.Write(std::to_string(j + i * (kCount / 10)),
-                         std::to_string(i));
-            }
+          for (size_t i = 0; i < kCount; ++i) {
+            tree.Write(std::to_string(i * i), std::to_string(i));
           }
           tree.Sync();
         },
-        "KDB Write", "tpms");
+        "KDB Write", "writes/ms");
     LSMView vm = tree.GetView();
 
     if (opts.contains('s')) {
@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
               auto v = vm.Find(key);
             }
           },
-          "KDB Success Find", "qpms");
+          "KDB Success Find", "reads/ms");
     }
     if (opts.contains('f')) {
       Bench(
@@ -171,7 +171,18 @@ int main(int argc, char** argv) {
               auto v = vm.Find(key);
             }
           },
-          "KDB Failed Find", "qpms");
+          "KDB Failed Find", "reads/ms");
+    }
+    if (opts.contains('i')) {
+      Bench(
+          kCount,
+          [&]() {
+            for (LSMView::Iterator it = vm.Begin(); it.IsValid(); ++it) {
+              volatile std::string key = it.Key();
+              volatile std::string value = it.Value();
+            }
+          },
+          "KDB Full Scan before merge", "reads/ms");
     }
     if (opts.contains('m')) {
       tree.MergeAll();
@@ -184,7 +195,7 @@ int main(int argc, char** argv) {
               auto v = vm2.Find(key);
             }
           },
-          "KDB Merged Success Find", "qpms");
+          "KDB Merged Success Find", "reads/ms");
 
       if (opts.contains('f')) {
         Bench(
@@ -195,7 +206,18 @@ int main(int argc, char** argv) {
                 auto v = vm2.Find(key);
               }
             },
-            "KDB Merged Failed Find", "qpms");
+            "KDB Merged Failed Find", "reads/ms");
+      }
+      if (opts.contains('i')) {
+        Bench(
+            kCount,
+            [&]() {
+              for (LSMView::Iterator it = vm2.Begin(); it.IsValid(); ++it) {
+                volatile std::string key = it.Key();
+                volatile std::string value = it.Value();
+              }
+            },
+            "KDB Full Scan after merge", "reads/ms");
       }
     }
     std::filesystem::remove_all(path);

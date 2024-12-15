@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "index/lsm_detail/cache.hpp"
+#include "vm_cache_impl.hpp"
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -27,15 +27,13 @@
 #include <cstddef>
 #include <cstring>
 #include <mutex>
+#include <ostream>
 #include <set>
 #include <sstream>
 #include <string>
-#include <string_view>
 #include <thread>
-#include <vector>
 
 #include "common/log_message.hpp"
-#include "common/vm_cache.hpp"
 
 namespace tinylamb {
 namespace {
@@ -49,11 +47,41 @@ int FileSize(int fd) {
 }
 }  // namespace
 
-Cache::Cache(int fd, size_t memory_capacity, size_t max_size)
+std::ostream& operator<<(std::ostream& o, const VMCacheImpl::PageState& s) {
+  switch (s) {
+    case VMCacheImpl::PageState::kUnknown:
+      o << "<Unknown>";
+      break;
+    case VMCacheImpl::PageState::kEvicted:
+      o << "<Evicted>";
+      break;
+    case VMCacheImpl::PageState::kLocked:
+      o << "<Locked>";
+      break;
+    case VMCacheImpl::PageState::kUnlocked:
+      o << "<Unlocked>";
+      break;
+    case VMCacheImpl::PageState::kMarked:
+      o << "<Marked>";
+      break;
+    case VMCacheImpl::PageState::kLockedAccessed:
+      o << "<LockedAccessed>";
+      break;
+    case VMCacheImpl::PageState::kUnlockedAccessed:
+      o << "<UnlockedAccessed>";
+      break;
+  }
+  return o;
+}
+
+VMCacheImpl::VMCacheImpl(int fd, size_t block_size, size_t memory_capacity,
+                         size_t offset, size_t file_size)
     : fd_(fd),
-      max_memory_pages_((memory_capacity + kBlockSize - 1) / kBlockSize),
-      max_size_(max_size != 0 ? max_size : FileSize(fd)),
-      meta_(max_size_ / kBlockSize + 1),
+      block_size_(block_size),
+      max_memory_pages_((memory_capacity + block_size - 1) / block_size),
+      max_size_(file_size != 0 ? file_size - offset : FileSize(fd) - file_size),
+      offset_(offset),
+      meta_(max_size_ / block_size + 1),
       small_queue_size_((max_memory_pages_ + 9) / 10),
       main_queue_size_(max_memory_pages_ - small_queue_size_),
       ghost_queue_size_(max_memory_pages_ - small_queue_size_) {
@@ -70,7 +98,7 @@ Cache::Cache(int fd, size_t memory_capacity, size_t max_size)
     m.store(PageState::kEvicted, std::memory_order_relaxed);
   }
   /*
-  LOG(TRACE) << "Cache: " << max_memory_pages_ << " pages in memory"
+  LOG(TRACE) << "VMCacheImpl: " << max_memory_pages_ << " pages in memory"
              << " total: " << meta_.size()
              << " pages Small: " << small_queue_size_
              << " Main: " << main_queue_size_
@@ -78,64 +106,41 @@ Cache::Cache(int fd, size_t memory_capacity, size_t max_size)
              */
 }
 
-std::string Cache::ReadAt(size_t offset, size_t length) const {
-  std::string result(length, '\0');
-  Copy(result.data(), offset, length);
-  return result;
-}
-
-Cache::Locks Cache::ReadAt(size_t offset, size_t length,
-                           std::string_view& out) const {
-  const size_t first_page = offset / kBlockSize;
-  const size_t last_page = (offset + length) / kBlockSize;
-  const size_t blocks = last_page - first_page + 1;
-
-  Cache::Locks locks;
-  locks.reserve(blocks);
-  for (size_t page = first_page; page <= last_page; ++page) {
-    FixPage(page);
-    locks.push_back(meta_[page]);
-  }
-  out = std::string_view(&buffer_[offset], length);
-  return locks;
-}
-
-void Cache::Copy(void* dst, size_t offset, size_t length) const {
+void VMCacheImpl::Read(void* dst, size_t offset, size_t length) const {
   char* dst_ptr = reinterpret_cast<char*>(dst);
-  size_t copied = 0;
   size_t to_next_boundary =
-      ((offset + kBlockSize - 1) / kBlockSize) * kBlockSize - offset;
+      (((offset + block_size_ - 1) / block_size_) * block_size_) - offset;
   size_t read_size = std::min(to_next_boundary, length);
   while (0 < length) {
-    size_t original = length;
-    ReadInPage(dst_ptr + copied, read_size, buffer_ + offset + copied);
-    copied += read_size;
+    ReadInPage(dst_ptr, read_size, buffer_ + offset);
+    offset += read_size;
     length -= read_size;
-    read_size = std::min(kBlockSize, length);
+    dst_ptr += read_size;
+    read_size = std::min(block_size_, length);
   }
 }
 
-void Cache::Invalidate(size_t offset, size_t length) {
-  for (size_t target = offset / kBlockSize;
-       target <= (offset + length) / kBlockSize && target < max_size_;
+void VMCacheImpl::Invalidate(size_t offset, size_t length) {
+  for (size_t target = offset / block_size_;
+       target <= (offset + length) / block_size_ && target < max_size_;
        ++target) {
     InvalidatePage(target);
   }
 }
 
 // The `dst` to `length` range must not go over any page boundaries.
-void Cache::ReadInPage(void* dst, size_t length, void* src) const {
-  size_t page = (reinterpret_cast<char*>(src) - buffer_) / kBlockSize;
+void VMCacheImpl::ReadInPage(void* dst, size_t length, void* src) const {
+  size_t page = (reinterpret_cast<char*>(src) - buffer_) / block_size_;
   FixPage(page);
   ::memcpy(dst, src, length);
   UnfixPage(page);
 }
 
-size_t Cache::FindMetaPage(std::atomic<PageState>* page_ptr) const {
+size_t VMCacheImpl::FindMetaPage(std::atomic<PageState>* page_ptr) const {
   return page_ptr - meta_.data();
 }
 
-void Cache::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
+void VMCacheImpl::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
   while (small_queue_.size() == small_queue_size_) {
     std::atomic<PageState>* dequeued = small_queue_.front();
     small_queue_.pop_front();
@@ -173,6 +178,7 @@ void Cache::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
                                                std::memory_order_relaxed)) {
             continue;
           }
+          LOG(WARN) << small_queue_.size();
           EnqueueToMainFifo(dequeued);
           break;
         case PageState::kMarked:
@@ -194,9 +200,10 @@ void Cache::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
   assert(small_queue_.size() <= small_queue_size_);
 }
 
-void Cache::EnqueueToMainFifo(std::atomic<PageState>* page_ptr) const {
+void VMCacheImpl::EnqueueToMainFifo(std::atomic<PageState>* page_ptr) const {
   while (main_queue_.size() >= main_queue_size_) {
     std::atomic<PageState>* dequeued = main_queue_.front();
+    LOG(TRACE) << "loading page: " << dequeued;
     main_queue_.pop_front();
     assert(dequeued != nullptr);
     for (;;) {
@@ -252,7 +259,7 @@ void Cache::EnqueueToMainFifo(std::atomic<PageState>* page_ptr) const {
   assert(main_queue_.size() <= main_queue_size_);
 }
 
-void Cache::EnqueueToGhostFifo(std::atomic<PageState>* page_ptr) const {
+void VMCacheImpl::EnqueueToGhostFifo(std::atomic<PageState>* page_ptr) const {
   if (ghost_queue_.size() >= ghost_queue_size_) {
     std::atomic<PageState>* dequeued = ghost_queue_.front();
     ghost_queue_.pop_front();
@@ -288,7 +295,7 @@ void Cache::EnqueueToGhostFifo(std::atomic<PageState>* page_ptr) const {
   assert(ghost_queue_.size() <= ghost_queue_size_);
 }
 
-void Cache::FixPage(size_t page) const {
+void VMCacheImpl::FixPage(size_t page) const {
   std::atomic<PageState>& target = meta_[page];
   for (;;) {
     PageState state = target.load(std::memory_order_acquire);
@@ -314,7 +321,7 @@ void Cache::FixPage(size_t page) const {
   }
 }
 
-void Cache::UnfixPage(size_t page) const {
+void VMCacheImpl::UnfixPage(size_t page) const {
   const PageState state = meta_[page].load(std::memory_order_relaxed);
   if (state == PageState::kLocked) {
     meta_[page].store(PageState::kUnlocked, std::memory_order_release);
@@ -325,7 +332,7 @@ void Cache::UnfixPage(size_t page) const {
   }
 }
 
-void Cache::InvalidatePage(size_t page) const {
+void VMCacheImpl::InvalidatePage(size_t page) const {
   std::atomic<PageState>& target = meta_[page];
   for (;;) {
     PageState state = target.load(std::memory_order_acquire);
@@ -342,18 +349,12 @@ void Cache::InvalidatePage(size_t page) const {
   }
 }
 
-static int activated_pages = 0;
-
-void Cache::Activate(size_t page) const {
-  /*
-  LOG(TRACE) << "activate: " << page << " length: " << kBlockSize
-             << " current: " << ++activated_pages << " " << Dump();
-  //*/
-
-  size_t offset = page * kBlockSize;
-  size_t rest_size = kBlockSize;
+void VMCacheImpl::Activate(size_t page) const {
+  size_t offset = (page * block_size_);
+  size_t rest_size = block_size_;
   while (0 < rest_size) {
-    ssize_t read_bytes = ::pread(fd_, &buffer_[offset], rest_size, offset);
+    ssize_t read_bytes =
+        ::pread(fd_, &buffer_[offset], rest_size, offset + offset_);
     if (read_bytes < 0) {
       LOG(ERROR) << strerror(errno);
     }
@@ -365,15 +366,15 @@ void Cache::Activate(size_t page) const {
   }
 }
 
-void Cache::Release(size_t page) const {
+void VMCacheImpl::Release(size_t page) const {
   /*
   LOG(DEBUG) << " release: " << page << " current: " << --activated_pages
              << " | " << Dump();
   //*/
-  ::madvise(&buffer_[page * kBlockSize], kBlockSize, MADV_DONTNEED);
+  ::madvise(&buffer_[page * block_size_], block_size_, MADV_DONTNEED);
 }
 
-bool Cache::SanityCheck() const {
+bool VMCacheImpl::SanityCheck() const {
   std::set<std::atomic<PageState>*> pages;
   for (const auto& c : small_queue_) {
     if (pages.contains(c)) {
@@ -399,7 +400,7 @@ bool Cache::SanityCheck() const {
   return true;
 }
 
-std::string Cache::Dump() const {
+std::string VMCacheImpl::Dump() const {
   std::stringstream ss;
   ss << "[";
   for (size_t i = 0; i < small_queue_.size(); ++i) {
@@ -427,10 +428,11 @@ std::string Cache::Dump() const {
   return ss.str();
 }
 
-Cache::~Cache() {
+VMCacheImpl::~VMCacheImpl() {
   if (::munmap(buffer_, max_size_) != 0) {
     LOG(FATAL) << "Destructing cache: " << strerror(errno);
   }
   ::close(fd_);
 }
+
 }  // namespace tinylamb

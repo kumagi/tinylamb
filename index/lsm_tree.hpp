@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_LSM_TREE_HPP
 #define TINYLAMB_LSM_TREE_HPP
 
+#include <atomic>
 #include <climits>
 #include <cstddef>
 #include <deque>
@@ -32,7 +33,6 @@
 #include "common/status_or.hpp"
 #include "index/lsm_detail/blob_file.hpp"
 #include "index/lsm_detail/lsm_view.hpp"
-#include "index/lsm_detail/offset_index.hpp"
 #include "lsm_detail/sorted_run.hpp"
 
 namespace tinylamb {
@@ -42,7 +42,7 @@ void Merger(const std::stop_token& st, LSMTree* tree);
 
 class LSMTree final {
  public:
-  LSMTree(std::string_view directory_path);
+  LSMTree(std::filesystem::path directory_path);
   ~LSMTree();
 
   // Neither movable nor copyable.
@@ -59,13 +59,14 @@ class LSMTree final {
 
   LSMView GetView() const {
     std::scoped_lock lk(file_tree_lock_);
-    return {blob_, index_};
+    return GetViewImpl();
   }
 
   void MergeAll();
 
  private:
   friend void Flusher(const std::stop_token& st, LSMTree* tree);
+  LSMView GetViewImpl() const { return {blob_, index_}; }
 
   struct FileAndIndex {
     std::filesystem::path filepath;
@@ -76,16 +77,18 @@ class LSMTree final {
   std::filesystem::path root_dir_;
   std::map<std::string, LSMValue> mem_tree_;
   std::map<std::string, LSMValue> frozen_mem_tree_;
+  std::atomic<size_t> generation_{0};
 
   BlobFile blob_;
-  std::deque<std::filesystem::path> files_;
-  std::deque<SortedRun> index_;
 
   std::jthread flusher_;
   std::jthread merger_;
 
   mutable std::timed_mutex mem_tree_lock_;
   mutable std::timed_mutex file_tree_lock_;
+
+  std::deque<std::filesystem::path> files_;
+  std::deque<SortedRun> index_;
 };
 
 }  // namespace tinylamb

@@ -43,6 +43,7 @@ class LSMView {
                 return a.Generation() > b.Generation();
               });
   }
+  LSMView(LSMView&&) = default;
 
   class Iterator {
    public:
@@ -58,7 +59,7 @@ class LSMView {
     [[nodiscard]] std::string Key() const { return iters_[0].Key(); }
     [[nodiscard]] std::string Value() const;
     Iterator& operator++();
-    const SortedRun::Entry& operator*() const;
+    SortedRun::Entry Entry() const;
     bool operator==(const Iterator& rhs) const;
     [[nodiscard]] bool IsValid() const;
     friend std::ostream& operator<<(std::ostream& o,
@@ -74,7 +75,7 @@ class LSMView {
   [[nodiscard]] Iterator Begin() const;
   [[nodiscard]] StatusOr<std::string> Find(std::string_view key) const;
   [[nodiscard]] size_t Size() const;
-  [[nodiscard]] SortedRun CreateSingleRun() const;
+  void CreateSingleRun(const std::filesystem::path& path) const;
   friend std::ostream& operator<<(std::ostream& o, const LSMView& v);
 
  private:

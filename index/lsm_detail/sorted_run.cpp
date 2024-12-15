@@ -19,6 +19,7 @@
 #include <bits/types/struct_iovec.h>
 #include <endian.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -32,15 +33,18 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <ostream>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/debug.hpp"
 #include "common/log_message.hpp"
 #include "common/status_or.hpp"
+#include "common/vm_cache.hpp"
 #include "index/lsm_detail/blob_file.hpp"
 #include "recovery/logger.hpp"
 
@@ -179,12 +183,16 @@ SortedRun::Entry::Entry(std::string_view key, const LSMValue& value,
     key_.inline_ = be64toh(key_.inline_);
   }
   if (value.is_delete) {
-    value_offset_ = kDeletedValue;
+    value_.offset_ = kDeletedValue;
     value_length_ = 0;
+  } else {
+    value_length_ = value.payload.length();
+    if (value_length_ <= sizeof(uint64_t)) {
+      ::memcpy(value_.inline_.data(), value.payload.data(), value_length_);
+    } else {
+      value_.offset_ = blob_.Append(value.payload);
+    }
   }
-
-  value_length_ = value.payload.length();
-  value_offset_ = blob_.Append(value.payload);
 }
 
 std::string SortedRun::Entry::BuildKey(const BlobFile& blob) const {
@@ -203,83 +211,92 @@ std::string SortedRun::Entry::BuildKey(const BlobFile& blob) const {
 
 std::string SortedRun::Entry::BuildValue(const BlobFile& blob) const {
   assert(!IsDeleted());
-  return blob.ReadAt(value_offset_, value_length_);
+  if (value_length_ <= sizeof(uint64_t)) {
+    return {value_.inline_.data(), value_length_};
+  }
+  return blob.ReadAt(value_.offset_, value_length_);
 }
 
 SortedRun::SortedRun(const std::filesystem::path& file) {
-  int fd = open(file.c_str(), O_RDONLY);
+  int fd = ::open(file.c_str(), O_RDONLY);
   if (fd <= 0) {
     LOG(FATAL) << "Failed to open file: " << file;
     return;
   }
+  size_t offset = 0;
   size_t len{};
 
-  read(fd, &len, sizeof(size_t));
+  offset += ::read(fd, &len, sizeof(size_t));
   min_key_.resize(len);
-  read(fd, min_key_.data(), len);
+  offset += ::read(fd, min_key_.data(), len);
 
-  read(fd, &len, sizeof(size_t));
+  offset += ::read(fd, &len, sizeof(size_t));
   max_key_.resize(len);
-  read(fd, max_key_.data(), len);
+  offset += ::read(fd, max_key_.data(), len);
 
-  read(fd, &len, sizeof(size_t));
-  index_.resize(len);
-  read(fd, index_.data(), len * sizeof(Entry));
+  offset += ::read(fd, &length_, sizeof(size_t));
+  offset += ::read(fd, &generation_, sizeof(size_t));
 
-  read(fd, &generation_, sizeof(size_t));
+  index_ = std::make_unique<VMCache<Entry>>(fd, 4096 * 4096, offset);
 }
 
-SortedRun::SortedRun(const std::map<std::string, LSMValue>& tree,
-                     BlobFile& blob, size_t generation)
-    : generation_(generation) {
-  index_.reserve(tree.size());
+void SortedRun::Construct(const std::filesystem::path& file,
+                          const std::map<std::string, LSMValue>& tree,
+                          BlobFile& blob, size_t generation) {
+  assert(!tree.empty());
   std::string_view min_key(tree.begin()->first);
   std::string_view max_key(tree.rbegin()->first);
-  min_key_ = min_key;
-  max_key_ = max_key;
 
-  for (const auto& m : tree) {
-    index_.emplace_back(m.first, m.second, blob);
+  std::vector<Entry> entries;
+  entries.reserve(tree.size());
+  for (const auto& t : tree) {
+    entries.emplace_back(t.first, LSMValue(t.second), blob);
   }
+  FlushInternal(file, min_key, max_key, entries, generation);
 }
 
-StatusOr<size_t> SortedRun::Flush(const std::filesystem::path& path) {
+void SortedRun::FlushInternal(const std::filesystem::path& path,
+                              std::string_view min, std::string_view max,
+                              const std::vector<Entry>& index,
+                              size_t generation) {
+  size_t length = index.size();
   int fd = OpenFile(path);
   if (fd <= 0) {
     LOG(FATAL) << "Failed to flushing: " << std::strerror(errno);
-    return Status::kUnknown;
+    exit(1);
   }
-  std::array<iovec, 8> vec{};
+  std::array<iovec, 7> vec{};
 
-  size_t min_key_length = min_key_.length();
-  vec[0].iov_len = sizeof(min_key_.size());
+  size_t min_key_length = min.length();
+  vec[0].iov_len = sizeof(min.size());
   vec[0].iov_base = &min_key_length;
+
   vec[1].iov_len = min_key_length;
-  vec[1].iov_base = min_key_.data();
+  vec[1].iov_base = const_cast<char*>(min.data());
 
-  size_t max_key_length = max_key_.length();
-  vec[2].iov_len = sizeof(max_key_.size());
+  size_t max_key_length = max.length();
+  vec[2].iov_len = sizeof(max.size());
   vec[2].iov_base = &max_key_length;
+
   vec[3].iov_len = max_key_length;
-  vec[3].iov_base = max_key_.data();
+  vec[3].iov_base = const_cast<char*>(max.data());
 
-  size_t index_length = index_.size();
-  vec[4].iov_len = sizeof(index_.size());
-  vec[4].iov_base = &index_length;
-  vec[5].iov_len = index_length * sizeof(Entry);
-  vec[5].iov_base = index_.data();
+  vec[4].iov_len = sizeof(length_);
+  vec[4].iov_base = &length;
 
-  vec[6].iov_len = sizeof(size_t);
-  vec[6].iov_base = &generation_;
+  vec[5].iov_len = sizeof(generation);
+  vec[5].iov_base = &generation;
+
+  vec[6].iov_len = length * sizeof(Entry);
+  vec[6].iov_base = const_cast<Entry*>(index.data());
 
   ssize_t written = ::writev(fd, vec.data(), vec.size());
   if (written < 0) {
     LOG(FATAL) << "failed to writev: " << ::strerror(errno);
-    return Status::kUnknown;
+    exit(1);
   }
   ::fsync(fd);
   ::close(fd);
-  return written;
 }
 
 auto SortedRun::Find(std::string_view key,
@@ -288,19 +305,23 @@ auto SortedRun::Find(std::string_view key,
     return Status::kNotExists;
   }
 
-  int left = 0, right = index_.size();
+  int left = 0, right = length_;
   while (1 < std::abs(right - left)) {
-    int mid = left + (right - left) / 2;
-    const Entry& mid_entry = index_[mid];
+    int mid = left + ((right - left) / 2);
+    const Entry mid_entry = GetEntry(mid);
     if (0 <= mid_entry.Compare(key, blob)) {
       left = mid;
     } else {
       right = mid;
     }
   }
-  int result = index_[left].Compare(key, blob);
+  Entry left_entry = GetEntry(left);
+  int result = left_entry.Compare(key, blob);
   if (result == 0) {
-    return blob.ReadAt(index_[left].value_offset_, index_[left].value_length_);
+    if (left_entry.IsDeleted()) {
+      return Status::kDeleted;
+    }
+    return left_entry.BuildValue(blob);
   }
   return Status::kNotExists;
 }
@@ -313,18 +334,47 @@ bool SortedRun::Iterator::operator!=(const SortedRun::Iterator& rhs) const {
   return !operator==(rhs);
 }
 
+SortedRun::Entry SortedRun::GetEntry(size_t offset) const {
+  SortedRun::Entry entry;
+  index_->Read(&entry, offset, 1);
+  return entry;
+}
+
 std::ostream& operator<<(std::ostream& o, const SortedRun::Iterator& it) {
-  o << it.Key() << "=>" << it.Value();
+  if (it.IsDeleted()) {
+    o << it.Key() << "=>(deleted)";
+  } else {
+    o << it.Key() << "=>" << it.Value();
+  }
   return o;
 }
+
+std::string HeadString(uint32_t in) {
+  std::string out(4, 0);
+  *(reinterpret_cast<uint32_t*>(out.data())) = be32toh(in);
+  return out;
+}
+
 std::ostream& operator<<(std::ostream& o, const SortedRun& s) {
   std::string min_key = OmittedString(s.min_key_, 20);
   std::string max_key = OmittedString(s.max_key_, 20);
   o << "{\n"
     << "  key range: [" << min_key << " ~ " << max_key << "]\n"
-    << "  Entries: " << s.index_.size() << "\n"
-    << "  Generation: " << s.generation_ << "\n"
+    << "  Entries: " << s.length_ << "\n  [";
+  for (size_t i = 0; i < s.length_; ++i) {
+    if (0 < i) {
+      o << ", ";
+    }
+    SortedRun::Entry entry = s.GetEntry(i);
+    if (entry.IsDeleted()) {
+      o << "(" << HeadString(entry.key_head_) << ")";
+    } else {
+      o << HeadString(entry.key_head_);
+    }
+  }
+  o << "]\n  Generation: " << s.generation_ << "\n"
     << "}\n";
   return o;
 }
+
 }  // namespace tinylamb

@@ -20,6 +20,7 @@
 
 #include "b_plus_tree_iterator.hpp"
 #include "common/debug.hpp"
+#include "common/status_or.hpp"
 #include "page/index_key.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"

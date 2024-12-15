@@ -16,6 +16,7 @@
 
 #include "logger.hpp"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <ios>

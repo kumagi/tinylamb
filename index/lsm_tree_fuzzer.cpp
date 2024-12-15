@@ -1,5 +1,5 @@
 /**
- * Copyright 2023 KUMAZAKI Hiroki
+ * Copyright 2024 KUMAZAKI Hiroki
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,16 @@
  * limitations under the License.
  */
 
-#include "page/row_page_fuzzer.hpp"
+#include "index/lsm_tree_fuzzer.hpp"
+
+#include <cstddef>
+#include <cstdint>
 
 extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
                                                        size_t size) {
-  if (size < 2) return 0;
-  static tinylamb::RowPageEnvironment env;
-  tinylamb::Operation op(&env);
-  std::string_view input(reinterpret_cast<const char*>(data), size);
-  while (!input.empty()) {
-    size_t read_bytes = op.Execute(input);
-    input.remove_prefix(read_bytes);
+  if (size < 8) {
+    return 0;
   }
+  tinylamb::Try(*reinterpret_cast<const uint64_t*>(data), false);
   return 0;
 }

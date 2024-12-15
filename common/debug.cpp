@@ -16,7 +16,11 @@
 
 #include "debug.hpp"
 
+#include <iomanip>
 #include <iostream>
+#include <sstream>
+#include <string>
+#include <string_view>
 
 namespace tinylamb {
 

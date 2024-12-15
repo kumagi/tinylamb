@@ -153,4 +153,43 @@ TEST_F(LSMTreeTest, LongKeyRangeScan) {
   ASSERT_EQ(expected_iter, expected.end());
 }
 
+TEST_F(LSMTreeTest, DeleteSingle) {
+  for (int i = 0; i < 1000; ++i) {
+    t_->Write(std::to_string(i), std::to_string(i * 2));
+  }
+  t_->Sync();
+  for (int i = 1; i < 1000; i += 2) {
+    t_->Delete(std::to_string(i));
+  }
+  t_->Sync();
+  for (int i = 0; i < 1000; ++i) {
+    StatusOr<std::string> ret = t_->Read(std::to_string(i));
+    if (i % 2 == 0) {
+      ASSERT_SUCCESS_AND_EQ(ret, std::to_string(i * 2));
+    } else {
+      ASSERT_EQ(ret.GetStatus(), Status::kNotExists);
+    }
+  }
+}
+
+TEST_F(LSMTreeTest, DeleteRangeScan) {
+  for (int i = 0; i < 1000; ++i) {
+    t_->Write(std::to_string(i), std::to_string(i * 2));
+  }
+  t_->Sync();
+  for (int i = 1; i < 1000; i += 2) {
+    t_->Delete(std::to_string(i));
+  }
+  t_->Sync();
+  LSMView v = t_->GetView();
+  LSMView::Iterator iter = v.Begin();
+  while (iter.IsValid()) {
+    int key = std::stoi(iter.Key());
+    LOG(INFO) << v;
+    ASSERT_EQ(key % 2, 0);
+    ASSERT_EQ(iter.Value(), std::to_string(key * 2));
+    ++iter;
+  }
+}
+
 }  // namespace tinylamb
