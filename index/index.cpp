@@ -16,8 +16,11 @@
 
 #include "index.hpp"
 
-#include <sstream>
+#include <ostream>
+#include <string>
+#include <unordered_set>
 
+#include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "type/row.hpp"

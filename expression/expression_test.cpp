@@ -16,11 +16,16 @@
 
 #include "expression/expression.hpp"
 
+#include <vector>
+
+#include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "gtest/gtest.h"
 #include "type/column.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 

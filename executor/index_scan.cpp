@@ -20,10 +20,15 @@
 
 #include "index_scan.hpp"
 
+#include <ostream>
 #include <utility>
 
+#include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "index/index_scan_iterator.hpp"
+#include "page/row_position.hpp"
+#include "type/schema.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 

@@ -24,8 +24,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -33,7 +33,6 @@
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "log_message.hpp"
 #include "random_string.hpp"
 
 namespace tinylamb {

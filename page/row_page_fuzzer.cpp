@@ -16,9 +16,15 @@
 
 #include "page/row_page_fuzzer.hpp"
 
+#include <cstddef>
+#include <cstdint>
+#include <string_view>
+
 extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
                                                        size_t size) {
-  if (size < 2) return 0;
+  if (size < 2) {
+    return 0;
+  }
   static tinylamb::RowPageEnvironment env;
   tinylamb::Operation op(&env);
   std::string_view input(reinterpret_cast<const char*>(data), size);

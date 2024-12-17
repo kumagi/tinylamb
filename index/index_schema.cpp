@@ -20,7 +20,10 @@
 
 #include "index_schema.hpp"
 
+#include <cstddef>
+#include <ostream>
 #include <sstream>
+#include <string>
 
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"

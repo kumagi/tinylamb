@@ -24,9 +24,9 @@
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "type/column_name.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
-
 const ColumnValue& ExpressionBase::AsColumnValue() const {
   assert(Type() == TypeTag::kColumnValue);
   return reinterpret_cast<const ColumnValue&>(*this);
@@ -70,6 +70,7 @@ std::unordered_set<ColumnName> ExpressionBase::TouchedColumns() const {
 Expression ColumnValueExp(const ColumnName& col_name) {
   return std::make_shared<ColumnValue>(col_name);
 }
+
 Expression ColumnValueExp(const std::string_view& col_name) {
   return std::make_shared<ColumnValue>(ColumnName(col_name));
 }
@@ -83,5 +84,4 @@ Expression BinaryExpressionExp(Expression left, BinaryOperation op,
   return std::make_shared<BinaryExpression>(std::move(left), op,
                                             std::move(right));
 }
-
 }  // namespace tinylamb

@@ -15,24 +15,26 @@
  */
 
 #include <memory>
+#include <utility>
 
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "gtest/gtest.h"
+#include "index/index_schema.hpp"
 #include "page/page_manager.hpp"
-#include "recovery/checkpoint_manager.hpp"
-#include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "table/table.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction_manager.hpp"
+#include "type/constraint.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
-
 static const char* kTableName = "SampleTable";
+
 class IndexTest : public ::testing::Test {
  public:
   void SetUp() override {
@@ -224,5 +226,4 @@ TEST_F(IndexTest, UpdateHeavy) {
     rps[(i * 63) % rps.size()] = rp;
   }
 }
-
 }  // namespace tinylamb

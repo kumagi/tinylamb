@@ -21,14 +21,19 @@
 #include "index_scan_plan.hpp"
 
 #include <cmath>
+#include <cstddef>
+#include <memory>
+#include <ostream>
 #include <utility>
 
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/index_scan.hpp"
-#include "expression/binary_expression.hpp"
+#include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "table/table.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 

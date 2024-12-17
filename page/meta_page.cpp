@@ -16,29 +16,30 @@
 
 #include "page/meta_page.hpp"
 
-#include <memory>
-#include <sstream>
+#include <cassert>
+#include <cstdint>
+#include <functional>
+#include <ostream>
 
+#include "common/constants.hpp"
 #include "page/free_page.hpp"
 #include "page/page_pool.hpp"
 #include "page/page_type.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
-
 PageRef MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
                                   PageType new_page_type) {
-  page_id_t new_page_id;
+  page_id_t new_page_id = 0;
   PageRef ret = [&]() {
     if (first_free_page == 0) {
       new_page_id = ++max_page_count;
       return pool.GetPage(max_page_count, nullptr);
-    } else {
-      new_page_id = first_free_page;
-      PageRef page = pool.GetPage(new_page_id, nullptr);
-      first_free_page = page.GetFreePage().next_free_page;
-      return page;
     }
+    new_page_id = first_free_page;
+    PageRef page = pool.GetPage(new_page_id, nullptr);
+    first_free_page = page.GetFreePage().next_free_page;
+    return page;
   }();
   ret->PageInit(new_page_id, new_page_type);
   txn.AllocatePageLog(new_page_id, new_page_type);
@@ -63,7 +64,6 @@ void MetaPage::DestroyPage(Transaction& txn, Page* target) {
 void MetaPage::Dump(std::ostream& o, int) const {
   o << "[FirstFree: " << first_free_page << "]";
 }
-
 }  // namespace tinylamb
 
 uint64_t std::hash<tinylamb::MetaPage>::operator()(

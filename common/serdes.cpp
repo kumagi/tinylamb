@@ -16,11 +16,13 @@
 
 #include "common/serdes.hpp"
 
+#include <cstdint>
 #include <cstring>
-#include <sstream>
+#include <string_view>
+
+#include "constants.hpp"
 
 namespace tinylamb {
-
 size_t SerializeStringView(char* pos, std::string_view bin) {
   bin_size_t len = bin.size();
   memcpy(pos, &len, sizeof(len));
@@ -58,7 +60,7 @@ size_t SerializeDouble(char* pos, double d) {
 }
 
 size_t DeserializeStringView(const char* pos, std::string_view* out) {
-  bin_size_t len;
+  bin_size_t len = 0;
   memcpy(&len, pos, sizeof(bin_size_t));
   *out = {pos + sizeof(len), len};
   return sizeof(len) + len;
@@ -83,5 +85,4 @@ size_t DeserializeDouble(const char* pos, double* out) {
   memcpy(out, pos, sizeof(double));
   return sizeof(double);
 }
-
 }  // namespace tinylamb

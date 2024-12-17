@@ -16,17 +16,29 @@
 
 #include "database.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+#include <ostream>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <tuple>
+
+#include "common/constants.hpp"
 #include "common/encoder.hpp"
+#include "common/log_message.hpp"
+#include "common/status_or.hpp"
 #include "database/page_storage.hpp"
 #include "index/b_plus_tree_iterator.hpp"
 #include "page/page.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
+#include "page/page_type.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "transaction/transaction.hpp"
+#include "type/column.hpp"
 #include "type/schema.hpp"
-#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -47,7 +59,7 @@ Database::Database(std::string_view dbname)
 }
 
 template <typename Serializable>
-std::string Serialize(const Serializable& from) {
+static std::string Serialize(const Serializable& from) {
   std::stringstream ss;
   Encoder arc(ss);
   arc << from;
@@ -55,7 +67,7 @@ std::string Serialize(const Serializable& from) {
 }
 
 template <typename Deserializable>
-void Deserialize(std::string_view from, Deserializable& dst) {
+static void Deserialize(std::string_view from, Deserializable& dst) {
   std::string v(from);
   std::stringstream ss(v);
   Decoder ext(ss);

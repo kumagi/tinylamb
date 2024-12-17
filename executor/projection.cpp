@@ -16,7 +16,13 @@
 
 #include "projection.hpp"
 
-#include "common/log_message.hpp"
+#include <cstddef>
+#include <ostream>
+#include <utility>
+#include <vector>
+
+#include "common/constants.hpp"
+#include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 

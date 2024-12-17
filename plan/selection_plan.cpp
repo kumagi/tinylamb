@@ -17,10 +17,15 @@
 #include "plan/selection_plan.hpp"
 
 #include <cmath>
+#include <cstddef>
 #include <memory>
+#include <ostream>
 
+#include "common/constants.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/selection.hpp"
 #include "expression/expression.hpp"
+#include "plan.hpp"
 #include "table/table_statistics.hpp"
 
 namespace tinylamb {

@@ -16,11 +16,25 @@
 
 #include "recovery/recovery_manager.hpp"
 
+#include <gtest/gtest.h>
+
+#include <cstddef>
+#include <cstdio>
+#include <fstream>
+#include <functional>
+#include <ios>
 #include <memory>
 #include <string>
+#include <tuple>
 
+#include "common/constants.hpp"
+#include "common/random_string.hpp"
 #include "common/test_util.hpp"
+#include "logger.hpp"
+#include "page/page_type.hpp"
 #include "page/row_page_test.hpp"
+#include "page/row_pointer.hpp"
+#include "transaction/lock_manager.hpp"
 
 namespace tinylamb {
 

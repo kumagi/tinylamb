@@ -17,15 +17,28 @@
 #include "table/table.hpp"
 
 #include <algorithm>
+#include <cstddef>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/status_or.hpp"
+#include "full_scan_iterator.hpp"
 #include "index/b_plus_tree.hpp"
 #include "index/index_scan_iterator.hpp"
+#include "index/index_schema.hpp"
+#include "iterator.hpp"
 #include "page/page_manager.hpp"
+#include "page/page_type.hpp"
 #include "page/row_position.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 

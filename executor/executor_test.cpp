@@ -14,11 +14,19 @@
  * limitations under the License.
  */
 
+#include <initializer_list>
+#include <iostream>
 #include <memory>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
+#include "database/transaction_context.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/hash_join.hpp"
 #include "executor/index_join.hpp"
@@ -27,17 +35,20 @@
 #include "executor/projection.hpp"
 #include "executor/selection.hpp"
 #include "executor/update.hpp"
-#include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "gtest/gtest.h"
+#include "index/index_schema.hpp"
 #include "index_only_scan.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
-
 static const char* const kTableName = "SampleTable";
+
 class ExecutorTest : public ::testing::Test {
  public:
   static void BulkInsert(Transaction& txn, Table& tbl,
@@ -483,5 +494,4 @@ TEST_F(ExecutorTest, Update) {
   }
   ASSERT_TRUE(rows.empty());
 }
-
 }  // namespace tinylamb

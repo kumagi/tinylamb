@@ -16,8 +16,14 @@
 
 #include "cross_join.hpp"
 
-namespace tinylamb {
+#include <ostream>
+#include <utility>
 
+#include "common/constants.hpp"
+#include "executor_base.hpp"
+#include "page/row_position.hpp"
+
+namespace tinylamb {
 CrossJoin::CrossJoin(Executor left, Executor right)
     : left_(std::move(left)), right_(std::move(right)) {}
 
@@ -50,5 +56,4 @@ void CrossJoin::Dump(std::ostream& o, int indent) const {
   o << "\n" << Indent(indent + 2);
   right_->Dump(o, indent + 2);
 }
-
 }  // namespace tinylamb

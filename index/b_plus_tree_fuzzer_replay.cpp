@@ -14,8 +14,14 @@
  * limitations under the License.
  */
 
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <ios>
+#include <iostream>
+#include <string>
 
+#include "common/log_message.hpp"
 #include "index/b_plus_tree_fuzzer.hpp"
 
 int main(int argc, char** argv) {

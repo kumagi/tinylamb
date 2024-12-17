@@ -15,25 +15,29 @@
  */
 
 #include <memory>
+#include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
+#include "database/transaction_context.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
-#include "recovery/checkpoint_manager.hpp"
-#include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "table.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
+#include "type/constraint.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
-
 class TableConcurrentTest : public ::testing::Test {
  public:
   void SetUp() override {
@@ -62,6 +66,7 @@ class TableConcurrentTest : public ::testing::Test {
   std::string prefix_;
   std::unique_ptr<Database> db_;
 };
+
 constexpr int kThreads = 5;
 
 TEST_F(TableConcurrentTest, InsertInsert) {
@@ -69,7 +74,7 @@ TEST_F(TableConcurrentTest, InsertInsert) {
   TransactionContext ro_ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ro_ctx, "SampleTable"));
   ASSERT_SUCCESS(ro_ctx.PreCommit());
-  std::vector<std::unordered_map<RowPosition, Row>> rows;
+  std::vector<std::unordered_map<RowPosition, Row> > rows;
   rows.resize(kThreads);
   std::vector<std::thread> workers;
   workers.reserve(kThreads);
@@ -77,8 +82,8 @@ TEST_F(TableConcurrentTest, InsertInsert) {
     workers.emplace_back([&, i]() {
       for (int j = 0; j < kSize; ++j) {
         TransactionContext ctx = db_->BeginContext();
-        Row new_row({Value(j * kSize + i), Value(RandomString(32)),
-                     Value((double)2 * j * kSize + i)});
+        Row new_row({Value((j * kSize) + i), Value(RandomString(32)),
+                     Value(((double)2 * j * kSize) + i)});
         ASSIGN_OR_ASSERT_FAIL(RowPosition, inserted_pos,
                               table.Insert(ctx.txn_, new_row));
         rows[i].emplace(inserted_pos, new_row);
@@ -100,5 +105,4 @@ TEST_F(TableConcurrentTest, InsertInsert) {
     }
   }
 }
-
 }  // namespace tinylamb

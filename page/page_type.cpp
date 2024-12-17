@@ -16,6 +16,7 @@
 
 #include "page_type.hpp"
 
+#include <cstdint>
 #include <ostream>
 
 #include "common/decoder.hpp"

@@ -16,16 +16,23 @@
 
 #include "b_plus_tree_iterator.hpp"
 
-#include <filesystem>
+#include <cstddef>
+#include <cstdio>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <tuple>
 
 #include "b_plus_tree.hpp"
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/page.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
+#include "page/page_type.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
@@ -34,7 +41,6 @@
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
-
 class BPlusTreeIteratorTest : public ::testing::Test {
  public:
   void SetUp() override {
@@ -83,8 +89,8 @@ class BPlusTreeIteratorTest : public ::testing::Test {
     lm_.reset();
     l_.reset();
     p_.reset();
-    std::remove(db_name_.c_str());
-    std::remove(log_name_.c_str());
+    std::ignore = std::remove(db_name_.c_str());
+    std::ignore = std::remove(log_name_.c_str());
   }
 
   std::string db_name_;
@@ -98,6 +104,7 @@ class BPlusTreeIteratorTest : public ::testing::Test {
 };
 
 TEST_F(BPlusTreeIteratorTest, Construct) {}
+
 TEST_F(BPlusTreeIteratorTest, FullScan) {
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
@@ -273,5 +280,4 @@ TEST_F(BPlusTreeIteratorTest, EndOpenFullScanReverse) {
   }
   EXPECT_FALSE(it.IsValid());
 }
-
 }  // namespace tinylamb

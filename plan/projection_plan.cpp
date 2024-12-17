@@ -16,15 +16,25 @@
 
 #include "plan/projection_plan.hpp"
 
+#include <cstddef>
+#include <memory>
+#include <ostream>
+#include <string>
 #include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/projection.hpp"
 #include "expression/column_value.hpp"
+#include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
+#include "plan.hpp"
+#include "type/column.hpp"
+#include "type/column_name.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
-
 ProjectionPlan::ProjectionPlan(Plan src,
                                std::vector<NamedExpression> project_columns)
     : src_(std::move(src)),

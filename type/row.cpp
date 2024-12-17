@@ -16,17 +16,23 @@
 
 #include "type/row.hpp"
 
+#include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <vector>
 
-#include "common/debug.hpp"
+#include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/serdes.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
-
 Value& Row::operator[](size_t i) { return values_[i]; }
 
 const Value& Row::operator[](size_t i) const { return values_[i]; }
@@ -123,7 +129,6 @@ Decoder& operator>>(Decoder& d, Row& r) {
   d >> r.values_;
   return d;
 }
-
 }  // namespace tinylamb
 
 uint64_t std::hash<tinylamb::Row>::operator()(const tinylamb::Row& row) const {

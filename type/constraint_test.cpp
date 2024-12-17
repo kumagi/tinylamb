@@ -16,9 +16,11 @@
 
 #include "type/constraint.hpp"
 
+#include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
+#include "value.hpp"
 
 namespace tinylamb {
 

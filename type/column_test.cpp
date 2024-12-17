@@ -16,11 +16,14 @@
 
 #include "type/column.hpp"
 
+#include "column_name.hpp"
+#include "common/log_message.hpp"
 #include "common/test_util.hpp"
+#include "constraint.hpp"
 #include "gtest/gtest.h"
+#include "value_type.hpp"
 
 namespace tinylamb {
-
 TEST(ColumnTest, Construct) {
   Column c(ColumnName("test_column"), ValueType::kInt64);
   Column d(ColumnName("next_column"), ValueType::kVarChar,
@@ -39,5 +42,4 @@ TEST(ColumnTest, Dump) {
   LOG(ERROR) << Column(ColumnName("next_column"), ValueType::kDouble,
                        Constraint(Constraint::kUnique));
 }
-
 }  // namespace tinylamb

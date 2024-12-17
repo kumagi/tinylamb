@@ -20,11 +20,11 @@
 
 #include "database/transaction_context.hpp"
 
+#include "common/status_or.hpp"
 #include "database/database.hpp"
 
 namespace tinylamb {
-
-StatusOr<std::shared_ptr<Table>> TransactionContext::GetTable(
+StatusOr<std::shared_ptr<Table> > TransactionContext::GetTable(
     std::string_view table_name) {
   auto it = tables_.find(std::string(table_name));
   if (it != tables_.end()) {
@@ -36,7 +36,7 @@ StatusOr<std::shared_ptr<Table>> TransactionContext::GetTable(
   return result.first->second;
 }
 
-StatusOr<std::shared_ptr<TableStatistics>> TransactionContext::GetStats(
+StatusOr<std::shared_ptr<TableStatistics> > TransactionContext::GetStats(
     std::string_view table_name) {
   auto it = stats_.find(std::string(table_name));
   if (it != stats_.end()) {
@@ -47,5 +47,4 @@ StatusOr<std::shared_ptr<TableStatistics>> TransactionContext::GetStats(
       table_name, std::make_shared<TableStatistics>(std::move(tbl)));
   return result.first->second;
 }
-
 }  // namespace tinylamb

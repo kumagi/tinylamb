@@ -18,14 +18,12 @@
 
 #include <cstring>
 
-#include "common/debug.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
-#include "common/log_message.hpp"
 #include "common/serdes.hpp"
+#include "value_type.hpp"
 
 namespace tinylamb {
-
 Value::Value(int int_val) {
   type = ValueType::kInt64;
   value.int_value = int_val;
@@ -171,19 +169,18 @@ bool Value::operator==(const Value& rhs) const {
 }
 
 namespace {
-
 std::string EncodeMemcomparableFormatInteger(int64_t in) {
   std::string ret(1 + 8, '\0');
   ret[0] = static_cast<char>(ValueType::kInt64);  // Embeds prefix.
   const uint64_t be = htobe64(in);
-  memcpy(ret.data() + 1, &be, 8);
+  ::memcpy(ret.data() + 1, &be, 8);
   ret[1] ^= static_cast<char>(0x80);  // plus/minus sign.
   return ret;
 }
 
 size_t DecodeMemcomparableFormatInteger(const char* src, int64_t* dst) {
   int64_t loaded;
-  memcpy(&loaded, src, 8);
+  ::memcpy(&loaded, src, 8);
   *dst = be64toh(loaded ^ 0x80);
   return sizeof(int64_t);
 }
@@ -199,12 +196,13 @@ std::string EncodeMemcomparableFormatVarchar(std::string_view in) {
   const size_t size = in.size();
   for (size_t i = 0;; i += 8) {
     if (9 <= size - i) {
-      memcpy(dst, src, 8);
+      ::memcpy(dst, src, 8);
       dst += 8;
       src += 8;
       *dst++ = 9;
-    } else {  // Final 1~8 bytes.
-      memcpy(dst, src, size - i);
+    } else {
+      // Final 1~8 bytes.
+      ::memcpy(dst, src, size - i);
       dst += 8;
       *dst++ = static_cast<char>((size % 8) + (size % 8 == 0 ? 8 : 0));
       return ret;
@@ -222,12 +220,12 @@ size_t DecodeMemcomparableFormatVarchar(const char* src, std::string* dst) {
     if (buffer[8] == 9) {
       size += 8;
       dst->resize(size);
-      memcpy(dst->data() + offset, buffer, 8);
+      ::memcpy(dst->data() + offset, buffer, 8);
     } else {
       size += buffer[8];
       src += 9;
       dst->resize(size);
-      memcpy(dst->data() + offset, buffer, buffer[8]);
+      ::memcpy(dst->data() + offset, buffer, buffer[8]);
       break;
     }
     src += buffer[8];
@@ -260,7 +258,6 @@ size_t DecodeMemcomparableFormatDouble(const char* src, double* dst) {
   *dst = *reinterpret_cast<double*>(&code);
   return sizeof(double);
 }
-
 }  // anonymous namespace
 
 std::string Value::EncodeMemcomparableFormat() const {
@@ -344,10 +341,10 @@ Value Value::operator+(const Value& rhs) const {
   if (type == ValueType::kVarChar) {
     std::string new_string(
         value.varchar_value.size() + rhs.value.varchar_value.size(), '\0');
-    memcpy(new_string.data(), value.varchar_value.data(),
-           value.varchar_value.size());
-    memcpy(new_string.data() + value.varchar_value.size(),
-           rhs.value.varchar_value.data(), rhs.value.varchar_value.size());
+    ::memcpy(new_string.data(), value.varchar_value.data(),
+             value.varchar_value.size());
+    ::memcpy(new_string.data() + value.varchar_value.size(),
+             rhs.value.varchar_value.data(), rhs.value.varchar_value.size());
     Value new_value;
     new_value.owned_data = new_string;
     new_value.type = ValueType::kVarChar;
@@ -477,7 +474,6 @@ Decoder& operator>>(Decoder& e, Value& v) {
   }
   return e;
 }
-
 }  // namespace tinylamb
 
 uint64_t std::hash<tinylamb::Value>::operator()(

@@ -24,7 +24,6 @@
 #include <thread>
 
 #include "common/constants.hpp"
-#include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "gtest/gtest.h"
@@ -37,6 +36,7 @@ class LSMTreeTest : public ::testing::Test {
     dir_path_ = "lsm_tree_test-" + RandomString();
     t_ = std::make_unique<LSMTree>(dir_path_);
   }
+
   void TearDown() override {
     t_.reset();
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -185,11 +185,9 @@ TEST_F(LSMTreeTest, DeleteRangeScan) {
   LSMView::Iterator iter = v.Begin();
   while (iter.IsValid()) {
     int key = std::stoi(iter.Key());
-    LOG(INFO) << v;
     ASSERT_EQ(key % 2, 0);
     ASSERT_EQ(iter.Value(), std::to_string(key * 2));
     ++iter;
   }
 }
-
 }  // namespace tinylamb

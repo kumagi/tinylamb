@@ -16,16 +16,28 @@
 
 #include "page/leaf_page.hpp"
 
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <functional>
+#include <ostream>
+#include <string>
+#include <string_view>
+#include <vector>
 
+#include "common/constants.hpp"
 #include "common/debug.hpp"
+#include "common/log_message.hpp"
 #include "common/serdes.hpp"
+#include "common/status_or.hpp"
 #include "page/index_key.hpp"
 #include "page/page.hpp"
+#include "page_type.hpp"
+#include "row_pointer.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
-
 std::string_view LeafPage::GetKey(size_t idx) const {
   std::string_view ret;
   DeserializeStringView(Payload() + rows_[idx].offset, &ret);
@@ -404,7 +416,7 @@ StatusOr<FosterPair> LeafPage::GetFoster() const {
     return Status::kNotExists;
   }
   std::string_view serialized_key;
-  page_id_t child;
+  page_id_t child = 0;
   size_t offset =
       DeserializeStringView(Payload() + foster_.offset, &serialized_key);
   DeserializePID(Payload() + foster_.offset + offset, &child);
@@ -498,7 +510,6 @@ bool LeafPage::SanityCheckForTest() const {
   }
   return true;
 }
-
 }  // namespace tinylamb
 
 uint64_t std::hash<tinylamb::LeafPage>::operator()(

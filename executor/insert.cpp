@@ -20,9 +20,12 @@
 
 #include "executor/insert.hpp"
 
+#include <cstdint>
 #include <ostream>
 
+#include "common/constants.hpp"
 #include "table/table.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 

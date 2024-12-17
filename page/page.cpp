@@ -16,13 +16,23 @@
 
 #include "page/page.hpp"
 
+#include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 
+#include "common/constants.hpp"
+#include "common/status_or.hpp"
+#include "index_key.hpp"
 #include "page/free_page.hpp"
 #include "page/meta_page.hpp"
 #include "page/page_type.hpp"
 #include "page/row_page.hpp"
+#include "page_ref.hpp"
 #include "transaction/transaction.hpp"
 
 #define ASSERT_PAGE_TYPE(expected_type)            \
@@ -31,15 +41,14 @@
   }
 
 namespace tinylamb {
-
-Page::Page(page_id_t pid, PageType type) : body() { PageInit(pid, type); }
+Page::Page(page_id_t pid, PageType type) { PageInit(pid, type); }
 
 void Page::PageInit(page_id_t pid, PageType page_type) {
   memset(this, 0, kPageSize);
   page_id = pid;
   SetPageLSN(0);
   type = page_type;
-  recovery_lsn = std::numeric_limits<uint64_t>::max();
+  recovery_lsn = std::numeric_limits <uint64_t>::max();
   switch (type) {
     case PageType::kUnknown:
       break;
@@ -84,14 +93,14 @@ size_t Page::RowCount(Transaction& /*txn*/) const {
   }
   if (type == PageType::kLeafPage) {
     return body.leaf_page.RowCount();
-  } else if (type == PageType::kBranchPage) {
-    return body.branch_page.RowCount();
-  } else {
-    throw std::runtime_error("invalid page type");
   }
+  if (type == PageType::kBranchPage) {
+    return body.branch_page.RowCount();
+  }
+  throw std::runtime_error("invalid page type");
 }
 
-StatusOr<std::string_view> Page::Read(Transaction& txn, slot_t slot) const {
+StatusOr <std::string_view> Page::Read(Transaction& txn, slot_t slot) const {
   if (type == PageType::kRowPage) {
     return body.row_page.Read(PageID(), txn, slot);
   }
@@ -113,9 +122,9 @@ page_id_t Page::GetPage(slot_t slot) const {
   return body.branch_page.GetValue(slot);
 }
 
-StatusOr<slot_t> Page::Insert(Transaction& txn, std::string_view record) {
+StatusOr <slot_t> Page::Insert(Transaction& txn, std::string_view record) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
-  StatusOr<slot_t> result = body.row_page.Insert(PageID(), txn, record);
+  StatusOr <slot_t> result = body.row_page.Insert(PageID(), txn, record);
   if (result.GetStatus() == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
     SetRecLSN(txn.PrevLSN());
@@ -156,7 +165,7 @@ slot_t Page::RowCount() const {
   }
 }
 
-StatusOr<std::string_view> Page::ReadKey(Transaction& txn, slot_t slot) const {
+StatusOr <std::string_view> Page::ReadKey(Transaction& txn, slot_t slot) const {
   switch (type) {
     case PageType::kRowPage:
       return Status::kUnknown;
@@ -212,18 +221,18 @@ Status Page::Delete(Transaction& txn, std::string_view key) {
   return result;
 }
 
-StatusOr<std::string_view> Page::Read(Transaction& txn,
-                                      std::string_view key) const {
+StatusOr <std::string_view> Page::Read(Transaction& txn,
+                                       std::string_view key) const {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
   return body.leaf_page.Read(PageID(), txn, key);
 }
 
-StatusOr<std::string_view> Page::LowestKey(Transaction& txn) {
+StatusOr <std::string_view> Page::LowestKey(Transaction& txn) const {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
   return body.leaf_page.LowestKey(txn);
 }
 
-StatusOr<std::string_view> Page::HighestKey(Transaction& txn) {
+StatusOr <std::string_view> Page::HighestKey(Transaction& txn) const {
   ASSERT_PAGE_TYPE(PageType::kLeafPage)
   return body.leaf_page.HighestKey(txn);
 }
@@ -250,8 +259,8 @@ Status Page::UpdateBranch(Transaction& txn, std::string_view key,
   return result;
 }
 
-StatusOr<page_id_t> Page::GetPageForKey(Transaction& txn, std::string_view key,
-                                        bool less_than) const {
+StatusOr <page_id_t> Page::GetPageForKey(Transaction& txn, std::string_view key,
+                                         bool less_than) const {
   ASSERT_PAGE_TYPE(PageType::kBranchPage)
   return body.branch_page.GetPageForKey(txn, key, less_than);
 }
@@ -276,7 +285,7 @@ void Page::PageTypeChange(Transaction& txn, PageType new_type) {
   SetRecLSN(txn.PrevLSN());
 }
 
-void Page::SetChecksum() const { checksum = std::hash<Page>()(*this); }
+void Page::SetChecksum() const { checksum = std::hash <Page>()(*this); }
 
 void Page::InsertImpl(std::string_view redo) {
   ASSERT_PAGE_TYPE(PageType::kRowPage)
@@ -309,7 +318,7 @@ void Page::DeleteImpl(std::string_view key) {
 }
 
 Status Page::SetLowFence(Transaction& txn, const IndexKey& key) {
-  Status result;
+  Status result = Status::kUnknown;
   switch (type) {
     case PageType::kLeafPage:
       result = body.leaf_page.SetLowFence(PageID(), txn, key);
@@ -328,7 +337,7 @@ Status Page::SetLowFence(Transaction& txn, const IndexKey& key) {
 }
 
 Status Page::SetHighFence(Transaction& txn, const IndexKey& key) {
-  Status result;
+  Status result = Status::kUnknown;
   switch (type) {
     case PageType::kLeafPage:
       result = body.leaf_page.SetHighFence(PageID(), txn, key);
@@ -373,7 +382,7 @@ IndexKey Page::GetHighFence(Transaction& /*txn*/) const {
 }
 
 Status Page::SetFoster(Transaction& txn, const FosterPair& foster) {
-  Status result;
+  Status result = Status::kUnknown;
   switch (type) {
     case PageType::kLeafPage:
       result = body.leaf_page.SetFoster(PageID(), txn, foster);
@@ -391,7 +400,7 @@ Status Page::SetFoster(Transaction& txn, const FosterPair& foster) {
   return result;
 }
 
-StatusOr<FosterPair> Page::GetFoster(Transaction& /*txn*/) {
+StatusOr <FosterPair> Page::GetFoster(Transaction& /*txn*/) const {
   switch (type) {
     case PageType::kLeafPage:
       return body.leaf_page.GetFoster();
@@ -494,7 +503,7 @@ void Page::PageTypeChangeImpl(PageType new_type) {
   PageInit(page_id, new_type);
 }
 
-bool Page::IsValid() const { return checksum == std::hash<Page>()(*this); }
+bool Page::IsValid() const { return checksum == std::hash <Page>()(*this); }
 
 void* Page::operator new(size_t /*unused*/) {
   void* ret = new char[kPageSize];
@@ -503,12 +512,12 @@ void* Page::operator new(size_t /*unused*/) {
 }
 
 void Page::operator delete(void* page) noexcept {
-  delete[] reinterpret_cast<char*>(page);
+  delete[] reinterpret_cast <char*>(page);
 }
 
 void Page::Dump(std::ostream& o, int indent) const {
   o << "PID: " << page_id << " PageLSN: " << page_lsn
-    << " RecLSN: " << recovery_lsn << " Type:";
+      << " RecLSN: " << recovery_lsn << " Type:";
   switch (type) {
     case PageType::kFreePage:
       o << " FreePage ";
@@ -534,26 +543,25 @@ void Page::Dump(std::ostream& o, int indent) const {
       break;
   }
 }
+} // namespace tinylamb
 
-}  // namespace tinylamb
-
-uint64_t std::hash<tinylamb::Page>::operator()(const tinylamb::Page& p) const {
-  uint64_t header_hash = std::hash<uint64_t>()(p.page_id) +
-                         std::hash<uint64_t>()(p.PageLSN()) +
-                         std::hash<uint64_t>()(static_cast<uint64_t>(p.type));
+uint64_t std::hash <tinylamb::Page>::operator()(const tinylamb::Page& p) const {
+  uint64_t header_hash = std::hash <uint64_t>()(p.page_id) +
+                         std::hash <uint64_t>()(p.PageLSN()) +
+                         std::hash <uint64_t>()(static_cast <uint64_t>(p.type));
   switch (p.type) {
     case tinylamb::PageType::kFreePage:
-      return header_hash + std::hash<tinylamb::FreePage>()(p.body.free_page);
+      return header_hash + std::hash <tinylamb::FreePage>()(p.body.free_page);
     case tinylamb::PageType::kMetaPage:
-      return header_hash + std::hash<tinylamb::MetaPage>()(p.body.meta_page);
+      return header_hash + std::hash <tinylamb::MetaPage>()(p.body.meta_page);
     case tinylamb::PageType::kRowPage:
-      return header_hash + std::hash<tinylamb::RowPage>()(p.body.row_page);
+      return header_hash + std::hash <tinylamb::RowPage>()(p.body.row_page);
     case tinylamb::PageType::kLeafPage:
-      return header_hash + std::hash<tinylamb::LeafPage>()(p.body.leaf_page);
+      return header_hash + std::hash <tinylamb::LeafPage>()(p.body.leaf_page);
     case tinylamb::PageType::kBranchPage:
       return header_hash +
-             std::hash<tinylamb::BranchPage>()(p.body.branch_page);
+             std::hash <tinylamb::BranchPage>()(p.body.branch_page);
     default:
-      return 0xdeadbeefcafebabe;  // Must be a broken page.
+      return 0xdeadbeefcafebabe; // Must be a broken page.
   }
 }

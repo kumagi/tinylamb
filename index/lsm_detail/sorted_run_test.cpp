@@ -16,30 +16,22 @@
 
 #include "index/lsm_detail/sorted_run.hpp"
 
-#include <fcntl.h>
-
 #include <cstddef>
 #include <filesystem>
-#include <ios>
 #include <map>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <vector>
 
 #include "blob_file.hpp"
-#include "cache.hpp"
 #include "common/constants.hpp"
-#include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "gtest/gtest.h"
-#include "recovery/logger.hpp"
 
 namespace tinylamb {
-
 class SortedRunEntryTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -152,6 +144,7 @@ class SortedRunTest : public ::testing::Test {
     SortedRun::Construct(index_file_, input, *blob_, 1);
     sr_ = std::make_unique<SortedRun>(index_file_);
   }
+
   void TearDown() override {
     std::ignore = std::filesystem::remove(data_file_);
     std::ignore = std::filesystem::remove(index_file_);

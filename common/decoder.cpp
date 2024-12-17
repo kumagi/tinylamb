@@ -17,7 +17,6 @@
 #include "decoder.hpp"
 
 namespace tinylamb {
-
 Decoder& Decoder::operator>>(std::string& str) {
   bin_size_t size;
   is_->read(reinterpret_cast<char*>(&size), sizeof(size));
@@ -60,5 +59,4 @@ Decoder& Decoder::operator>>(bool& v) {
   is_->read(reinterpret_cast<char*>(&v), sizeof(v));
   return *this;
 }
-
 }  // namespace tinylamb

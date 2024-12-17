@@ -23,16 +23,14 @@
 #include "expression/constant_value.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
-#include "recovery/checkpoint_manager.hpp"
-#include "recovery/logger.hpp"
 #include "table/table.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/row.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
-
 class TableStatisticsTest : public ::testing::Test {
  public:
   void SetUp() override {
@@ -90,6 +88,7 @@ class TableStatisticsTest : public ::testing::Test {
       ASSERT_SUCCESS(stat_tx.PreCommit());
     }
   }
+
   void Recover() {
     if (db_) {
       db_->EmulateCrash();
@@ -121,5 +120,4 @@ TEST_F(TableStatisticsTest, Store) {
   LOG(TRACE) << ts;
   db_->UpdateStatistics(ctx, "Sc2", ts);
 }
-
 }  // namespace tinylamb

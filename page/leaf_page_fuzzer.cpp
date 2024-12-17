@@ -20,6 +20,9 @@
 
 #include "page/leaf_page_fuzzer.hpp"
 
+#include <cstddef>
+#include <cstdint>
+
 extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
                                                        size_t size) {
   if (size < 8) return 0;

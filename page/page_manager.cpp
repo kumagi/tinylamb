@@ -16,11 +16,14 @@
 
 #include "page_manager.hpp"
 
-#include <sstream>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <string_view>
 
 #include "page/meta_page.hpp"
 #include "page/page_ref.hpp"
-#include "recovery/log_record.hpp"
+#include "page_type.hpp"
 #include "recovery/recovery_manager.hpp"
 
 namespace tinylamb {
@@ -31,7 +34,7 @@ PageManager::PageManager(std::string_view db_name, size_t capacity)
 }
 
 PageRef PageManager::GetPage(uint64_t page_id) {
-  bool cache_hit;
+  bool cache_hit = false;
   PageRef ref = pool_.GetPage(page_id, &cache_hit);
   if (!cache_hit && !ref->IsValid()) {
     // Found a broken or new page.

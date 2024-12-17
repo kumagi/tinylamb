@@ -29,11 +29,9 @@
 #include "common/status_or.hpp"
 #include "gtest/gtest.h"
 #include "index/lsm_detail/blob_file.hpp"
-#include "recovery/logger.hpp"
 #include "sorted_run.hpp"
 
 namespace tinylamb {
-
 class LSMViewTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -46,7 +44,7 @@ class LSMViewTest : public ::testing::Test {
       for (int i = 0; i < 10; ++i) {
         std::map<std::string, LSMValue> mem_value;
         for (int j = 0; j < 100; ++j) {
-          mem_value.emplace(std::to_string(j + i * 100),
+          mem_value.emplace(std::to_string(j + (i * 100)),
                             LSMValue(std::to_string(i)));
         }
         std::string filepath = path_ / std::to_string(i);
@@ -271,5 +269,4 @@ TEST_F(LSMViewTest, DeleteOverWriteScan) {
     ++iter;
   }
 }
-
 }  // namespace tinylamb

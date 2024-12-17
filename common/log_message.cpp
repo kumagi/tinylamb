@@ -21,6 +21,7 @@
 #include <chrono>
 #include <ctime>
 #include <iostream>
+#include <tuple>
 
 LogStream::~LogStream() { std::cerr << message_.str() << "\e[0;39;49m\n"; }
 
@@ -30,7 +31,8 @@ LogMessage::LogMessage(int log_level, const char* filename, int lineno,
   auto now = std::chrono::system_clock::now();
   std::time_t now_time = std::chrono::system_clock::to_time_t(now);
   std::tm now_tm = *std::localtime(&now_time);
-  strftime(buff.data(), buff.size(), "%Y-%m-%d %H:%M:%S ", &now_tm);
+  std::ignore =
+      strftime(buff.data(), buff.size(), "%Y-%m-%d %H:%M:%S ", &now_tm);
 
   switch (log_level) {
     case FATAL:
@@ -60,7 +62,7 @@ LogMessage::LogMessage(int log_level, const char* filename, int lineno,
       ls << "\e[4;36m";
       break;
     default:
-      assert(!"unknwon log level");
+      assert(!"unknown log level");
   }
   ls << buff.data() << filename << ":" << lineno << " " << func_name;
   switch (log_level) {

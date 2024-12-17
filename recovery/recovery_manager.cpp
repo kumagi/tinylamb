@@ -16,12 +16,24 @@
 
 #include "recovery_manager.hpp"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <ios>
+#include <istream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
+#include "common/decoder.hpp"
+#include "common/log_message.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
 #include "recovery/log_record.hpp"

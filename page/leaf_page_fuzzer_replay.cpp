@@ -18,9 +18,13 @@
 // Created by kumagi on 22/09/22.
 //
 
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <string>
 
+#include "common/log_message.hpp"
 #include "page/leaf_page_fuzzer.hpp"
 
 int main(int argc, char** argv) {

@@ -17,8 +17,8 @@
 #include "transaction/lock_manager.hpp"
 
 #include <cassert>
+#include <mutex>
 
-#include "common/log_message.hpp"
 #include "page/row_position.hpp"
 
 namespace tinylamb {

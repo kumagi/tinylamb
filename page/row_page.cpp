@@ -16,7 +16,22 @@
 
 #include "row_page.hpp"
 
-#include "recovery/log_record.hpp"
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <limits>
+#include <ostream>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "common/constants.hpp"
+#include "common/debug.hpp"
+#include "common/log_message.hpp"
+#include "common/status_or.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {

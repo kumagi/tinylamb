@@ -20,7 +20,6 @@
 #include "page/row_page_test.hpp"
 
 namespace tinylamb {
-
 class CheckpointTest : public RowPageTest {
  protected:
   void SetUp() override {
@@ -60,6 +59,7 @@ class CheckpointTest : public RowPageTest {
     cm_ = std::make_unique<CheckpointManager>(master_record_name_, tm_.get(),
                                               p_->GetPool(), 1);
   }
+
   std::string db_name_;
   std::string log_name_;
   std::string master_record_name_;
@@ -87,8 +87,8 @@ TEST_F(CheckpointTest, DoCheckpoint) {
 TEST_F(CheckpointTest, CheckpointRecovery) {
   InsertRow("expect this operation did not rerun");
   Transaction txn = tm_->Begin();
-  lsn_t restart_point;
-  slot_t result;
+  lsn_t restart_point = 0;
+  slot_t result = 0;
   {
     PageRef page = p_->GetPage(page_id_);
     ASSIGN_OR_ASSERT_FAIL(slot_t, inserted, page->Insert(txn, "inserted"));
@@ -106,7 +106,7 @@ TEST_F(CheckpointTest, CheckpointAbortRecovery) {
   ASSERT_TRUE(InsertRow("original message"));
   Transaction txn = tm_->Begin();
   slot_t slot = 0;
-  lsn_t restart_point;
+  lsn_t restart_point = 0;
   {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint();
@@ -124,7 +124,7 @@ TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
   ASSERT_TRUE(InsertRow("original message"));
   Transaction txn = tm_->Begin();
   slot_t slot = 0;
-  lsn_t restart_point;
+  lsn_t restart_point = 0;
   {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint([&]() {
@@ -138,5 +138,4 @@ TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
   ASSERT_EQ(GetRowCount(), 1);
   EXPECT_EQ(ReadRow(slot), "original message");
 }
-
 }  // namespace tinylamb

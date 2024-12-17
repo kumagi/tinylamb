@@ -81,7 +81,7 @@ VMCacheImpl::VMCacheImpl(int fd, size_t block_size, size_t memory_capacity,
       max_memory_pages_((memory_capacity + block_size - 1) / block_size),
       max_size_(file_size != 0 ? file_size - offset : FileSize(fd) - file_size),
       offset_(offset),
-      meta_(max_size_ / block_size + 1),
+      meta_(((max_size_ / block_size)) + 1),
       small_queue_size_((max_memory_pages_ + 9) / 10),
       main_queue_size_(max_memory_pages_ - small_queue_size_),
       ghost_queue_size_(max_memory_pages_ - small_queue_size_) {
@@ -178,7 +178,6 @@ void VMCacheImpl::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
                                                std::memory_order_relaxed)) {
             continue;
           }
-          LOG(WARN) << small_queue_.size();
           EnqueueToMainFifo(dequeued);
           break;
         case PageState::kMarked:
@@ -434,5 +433,4 @@ VMCacheImpl::~VMCacheImpl() {
   }
   ::close(fd_);
 }
-
 }  // namespace tinylamb

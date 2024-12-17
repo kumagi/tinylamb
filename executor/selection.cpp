@@ -16,10 +16,13 @@
 
 #include "selection.hpp"
 
+#include <ostream>
 #include <utility>
 
-#include "common/log_message.hpp"
+#include "common/constants.hpp"
+#include "executor_base.hpp"
 #include "expression/expression.hpp"
+#include "page/row_position.hpp"
 
 namespace tinylamb {
 

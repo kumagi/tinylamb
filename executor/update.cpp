@@ -20,10 +20,14 @@
 
 #include "update.hpp"
 
+#include <cassert>
+#include <cstdint>
 #include <ostream>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "table/table.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 

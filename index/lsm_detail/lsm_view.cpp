@@ -16,30 +16,25 @@
 
 #include "lsm_view.hpp"
 
-#include <endian.h>
-
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <filesystem>
-#include <initializer_list>
 #include <ostream>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "blob_file.hpp"
 #include "common/constants.hpp"
-#include "common/log_message.hpp"
 #include "common/status_or.hpp"
 #include "index/lsm_detail/sorted_run.hpp"
 
 namespace tinylamb {
-
 LSMView::Iterator LSMView::Begin() const { return {this, true}; }
 
 StatusOr<std::string> LSMView::Find(std::string_view key) const {
+  int i = 0;
   for (const auto& idx : indexes_) {
     auto result = idx.Find(key, blob_);
     if (result.GetStatus() == Status::kDeleted) {
@@ -48,6 +43,7 @@ StatusOr<std::string> LSMView::Find(std::string_view key) const {
     if (result.HasValue()) {
       return result;
     }
+    ++i;
   }
   return Status::kNotExists;
 }
@@ -182,7 +178,7 @@ void LSMView::Iterator::Forward() {
   std::swap(iters_[0], iters_[curr]);
   while (curr * 2 < iters_.size()) {
     if (curr * 2 + 1 == iters_.size() ||
-        IsRightIteratorBigger(curr * 2, curr * 2 + 1, iters_)) {
+        IsRightIteratorBigger(curr * 2, (curr * 2) + 1, iters_)) {
       if (!iters_[curr].IsValid() ||
           (iters_[curr * 2].IsValid() &&
            (0 < iters_[curr * 2].Compare(iters_[curr]) ||
@@ -194,8 +190,8 @@ void LSMView::Iterator::Forward() {
         break;
       }
     } else {
-      if (IsRightIteratorBigger(curr * 2 + 1, curr, iters_)) {
-        std::swap(iters_[curr], iters_[curr * 2 + 1]);
+      if (IsRightIteratorBigger((curr * 2) + 1, curr, iters_)) {
+        std::swap(iters_[curr], iters_[(curr * 2) + 1]);
         curr = curr * 2 + 1;
       } else {
         break;
@@ -251,5 +247,4 @@ std::ostream& operator<<(std::ostream& o, const LSMView& v) {
   }
   return o;
 }
-
 }  // namespace tinylamb

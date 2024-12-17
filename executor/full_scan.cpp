@@ -20,10 +20,11 @@
 
 #include "executor/full_scan.hpp"
 
+#include <ostream>
+
 #include "table/table.hpp"
 
 namespace tinylamb {
-
 FullScan::FullScan(Transaction& txn, const Table& table)
     : table_(&table), iter_(table_->BeginFullScan(txn)) {}
 
@@ -42,5 +43,4 @@ bool tinylamb::FullScan::Next(Row* dst, RowPosition* rp) {
 void FullScan::Dump(std::ostream& o, int /*indent*/) const {
   o << "FullScan: " << table_->GetSchema().Name();
 }
-
 }  // namespace tinylamb

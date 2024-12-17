@@ -20,6 +20,7 @@
 
 #include "page_storage.hpp"
 
+#include <cstddef>
 #include <string_view>
 
 #include "transaction/transaction.hpp"
@@ -28,7 +29,7 @@ namespace tinylamb {
 
 PageStorage::PageStorage(std::string_view dbname)
     : dbname_(dbname),
-      logger_(LogName(), 8 * 1024 * 1024, 1),
+      logger_(LogName(), static_cast<size_t>(8 * 1024 * 1024), 1),
       pm_(DBName(), 1024),
       rm_(LogName(), pm_.GetPool()),
       tm_(&lm_, &pm_, &logger_, &rm_),

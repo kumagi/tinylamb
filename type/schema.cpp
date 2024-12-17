@@ -17,14 +17,16 @@
 #include "schema.hpp"
 
 #include <cstring>
+#include <ostream>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "column.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
-#include "common/log_message.hpp"
 #include "type/column_name.hpp"
-#include "type/value_type.hpp"
 
 namespace tinylamb {
 

@@ -16,22 +16,33 @@
 
 #include "plan/optimizer.hpp"
 
+#include <iostream>
+#include <memory>
+#include <string>
+
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "gtest/gtest.h"
+#include "index/index_schema.hpp"
 #include "plan/plan.hpp"
 #include "query/query_data.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
+#include "type/column_name.hpp"
 #include "type/row.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
-
 static const char* const kIndexName = "SampleIndex";
+
 class OptimizerTest : public ::testing::Test {
  public:
   void SetUp() override {
@@ -110,6 +121,7 @@ class OptimizerTest : public ::testing::Test {
     rs_->RefreshStatistics(stat_tx, "Sc4");
     ASSERT_SUCCESS(stat_tx.PreCommit());
   }
+
   void Recover() {
     if (rs_) {
       rs_->EmulateCrash();

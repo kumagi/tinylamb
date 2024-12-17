@@ -16,14 +16,25 @@
 
 #include "b_plus_tree.hpp"
 
-#include <vector>
+#include <cstdlib>
+
+#include <cassert>
+#include <cstddef>
+#include <cstdlib>
+#include <ostream>
+#include <string>
+#include <utility>
 
 #include "b_plus_tree_iterator.hpp"
+#include "common/constants.hpp"
 #include "common/debug.hpp"
+#include "common/log_message.hpp"
 #include "common/status_or.hpp"
 #include "page/index_key.hpp"
+#include "page/leaf_page.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
+#include "page/page_type.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
@@ -431,7 +442,7 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
 }
 
 StatusOr<std::string_view> BPlusTree::Read(Transaction& txn,
-                                           std::string_view key) {
+                                           std::string_view key) const {
   PageRef curr = txn.PageManager()->GetPage(root_);
   while (curr->Type() == PageType::kBranchPage) {
     if (auto maybe_foster = curr->GetFoster(txn)) {
@@ -474,7 +485,6 @@ bool BPlusTree::SanityCheckForTest(PageManager* pm) const {
 }
 
 namespace {
-
 void DumpLeafPage(Transaction& txn, PageRef& page, std::ostream& o,
                   int indent) {
   o << ": L[" << page->PageID() << "] {" << page->GetLowFence(txn) << "~"
@@ -545,5 +555,4 @@ void BPlusTree::Dump(Transaction& txn, std::ostream& o, int indent) const {
   }
   o << "\n";
 }
-
 }  // namespace tinylamb

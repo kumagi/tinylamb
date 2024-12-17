@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "database/database.hpp"
 
 int main(int argc, char** argv) {

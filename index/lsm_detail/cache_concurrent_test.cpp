@@ -25,7 +25,6 @@
 #include <string>
 #include <thread>
 #include <tuple>
-#include <unordered_map>
 #include <vector>
 
 #include "common/constants.hpp"

@@ -20,11 +20,23 @@
 
 #include "query_data.hpp"
 
+#include <cstddef>
+#include <memory>
 #include <stack>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
+#include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "table/table.hpp"
+#include "type/column_name.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
 

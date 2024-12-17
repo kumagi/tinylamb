@@ -19,21 +19,22 @@
 #include <memory>
 
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
-#include "recovery/checkpoint_manager.hpp"
-#include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction_manager.hpp"
+#include "type/constraint.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
-
 static const char* kTableName = "SampleTable";
+
 class TableTest : public ::testing::Test {
  public:
   void SetUp() override {
@@ -224,5 +225,4 @@ TEST_F(TableTest, UpdateHeavy) {
     rps[target] = rp;
   }
 }
-
 }  // namespace tinylamb

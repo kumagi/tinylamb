@@ -17,6 +17,12 @@
 #include "encoder.hpp"
 
 #include <cassert>
+#include <cstdint>
+#include <limits>
+#include <string_view>
+
+#include "constants.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 

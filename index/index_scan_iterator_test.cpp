@@ -17,37 +17,47 @@
 #include "index_scan_iterator.hpp"
 
 #include <memory>
+#include <string>
 
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
+#include "database/transaction_context.hpp"
 #include "gtest/gtest.h"
 #include "index.hpp"
+#include "index_schema.hpp"
 #include "recovery/recovery_manager.hpp"
+#include "table/iterator.hpp"
 #include "table/table.hpp"
+#include "type/constraint.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
-
 class IndexScanIteratorTest : public ::testing::Test {
- public:
+public:
   static constexpr char kTableName[] = "SampleTable";
+
   void SetUp() override {
     prefix_ = "index_scan_iterator_test-" + RandomString();
     Recover();
-    Schema sc(kTableName, {Column("col1", ValueType::kInt64,
-                                  Constraint(Constraint::kIndex)),
-                           Column("col2", ValueType::kVarChar),
-                           Column("col3", ValueType::kDouble)});
+    Schema sc(kTableName, {
+                Column("col1", ValueType::kInt64,
+                       Constraint(Constraint::kIndex)),
+                Column("col2", ValueType::kVarChar),
+                Column("col3", ValueType::kDouble)
+              });
     TransactionContext ctx = db_->BeginContext();
     ASSERT_SUCCESS(db_->CreateTable(ctx, sc).GetStatus());
     ASSERT_SUCCESS(db_->CreateIndex(ctx, kTableName, IndexSchema("PK", {0})));
     ASSERT_SUCCESS(db_->CreateIndex(
-        ctx, kTableName,
-        IndexSchema("NameIdx", {1}, {2}, IndexMode::kNonUnique)));
+      ctx, kTableName,
+      IndexSchema("NameIdx", {1}, {2}, IndexMode::kNonUnique)));
     ASSERT_SUCCESS(db_->CreateIndex(ctx, kTableName,
-                                    IndexSchema("KeyScore", {0, 2}, {1})));
+      IndexSchema("KeyScore", {0, 2}, {1})));
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
                           ctx.GetTable(kTableName));
     ASSERT_EQ(table->IndexCount(), 3);
@@ -58,16 +68,17 @@ class IndexScanIteratorTest : public ::testing::Test {
     if (db_) {
       db_->EmulateCrash();
     }
-    db_ = std::make_unique<Database>(prefix_);
+    db_ = std::make_unique <Database>(prefix_);
   }
 
   void TearDown() override { db_->DeleteAll(); }
 
   std::string prefix_;
-  std::unique_ptr<Database> db_;
+  std::unique_ptr <Database> db_;
 };
 
-TEST_F(IndexScanIteratorTest, Construct) {}
+TEST_F(IndexScanIteratorTest, Construct) {
+}
 
 TEST_F(IndexScanIteratorTest, ScanAscending) {
   TransactionContext ctx = db_->BeginContext();
@@ -75,10 +86,10 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 230; ++i) {
     ASSERT_SUCCESS(
-        table
-            ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
-                                    Value(0.1 + i)}))
-            .GetStatus());
+      table
+      ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+        Value(0.1 + i)}))
+      .GetStatus());
   }
   Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(0), Value(43),
                                       Value(180));
@@ -99,13 +110,12 @@ TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 120; ++i) {
     ASSERT_SUCCESS(
-        table
-            ->Insert(ctx.txn_,
-                     Row({Value(i), Value("v" + std::to_string(i % 10)),
-                          Value(static_cast<double>(i * 2))}))
-            .GetStatus());
-  }
-  {
+      table
+      ->Insert(ctx.txn_,
+        Row({Value(i), Value("v" + std::to_string(i % 10)),
+          Value(static_cast<double>(i * 2))}))
+      .GetStatus());
+  } {
     // Partial scan.
     Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(1),
                                         Value("v2"), Value("v7"));
@@ -119,8 +129,7 @@ TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
     }
     ASSERT_EQ(counter, 12 * (7 - 2 + 1));
     ASSERT_FALSE(it.IsValid());
-  }
-  {
+  } {
     // Full scan.
     Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(1));
     ASSERT_TRUE(it.IsValid());
@@ -147,8 +156,7 @@ TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
       ++it;
     }
     ASSERT_FALSE(it.IsValid());
-  }
-  {
+  } {
     // Full scan again.
     Iterator it = table->BeginFullScan(ctx.txn_);
     ASSERT_TRUE(it.IsValid());
@@ -170,10 +178,10 @@ TEST_F(IndexScanIteratorTest, ScanDecending) {
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 230; ++i) {
     ASSERT_SUCCESS(
-        table
-            ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
-                                    Value(0.1 + i)}))
-            .GetStatus());
+      table
+      ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+        Value(0.1 + i)}))
+      .GetStatus());
   }
   Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(0), Value(104),
                                       Value(200), false);
@@ -194,13 +202,12 @@ TEST_F(IndexScanIteratorTest, NonUniqueDescending) {
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 120; ++i) {
     ASSERT_SUCCESS(
-        table
-            ->Insert(ctx.txn_,
-                     Row({Value(i), Value("v" + std::to_string(i % 10)),
-                          Value(static_cast<double>(i * 2))}))
-            .GetStatus());
-  }
-  {
+      table
+      ->Insert(ctx.txn_,
+        Row({Value(i), Value("v" + std::to_string(i % 10)),
+          Value(static_cast<double>(i * 2))}))
+      .GetStatus());
+  } {
     Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(1),
                                         Value("v2"), Value("v7"), false);
     ASSERT_TRUE(it.IsValid());
@@ -213,8 +220,7 @@ TEST_F(IndexScanIteratorTest, NonUniqueDescending) {
     }
     ASSERT_EQ(counter, 12 * (7 - 2 + 1));
     ASSERT_FALSE(it.IsValid());
-  }
-  {
+  } {
     // Full scan.
     Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(1), Value(),
                                         Value(), false);
@@ -230,5 +236,4 @@ TEST_F(IndexScanIteratorTest, NonUniqueDescending) {
     ASSERT_FALSE(it.IsValid());
   }
 }
-
-}  // namespace tinylamb
+} // namespace tinylamb

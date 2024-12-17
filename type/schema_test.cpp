@@ -16,8 +16,12 @@
 
 #include "schema.hpp"
 
+#include "column_name.hpp"
+#include "common/log_message.hpp"
 #include "common/test_util.hpp"
+#include "constraint.hpp"
 #include "gtest/gtest.h"
+#include "value_type.hpp"
 
 namespace tinylamb {
 

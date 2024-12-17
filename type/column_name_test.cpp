@@ -19,7 +19,6 @@
 //
 #include "type/column_name.hpp"
 
-#include "common/test_util.hpp"
 #include "gtest/gtest.h"
 
 namespace tinylamb {

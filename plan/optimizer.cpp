@@ -18,25 +18,43 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <ostream>
 #include <stack>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
 #include "common/converter.hpp"
+#include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "full_scan_plan.hpp"
 #include "index_only_scan_plan.hpp"
 #include "index_scan_plan.hpp"
 #include "plan/plan.hpp"
 #include "product_plan.hpp"
 #include "projection_plan.hpp"
+#include "query/query_data.hpp"
 #include "selection_plan.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
+#include "type/column_name.hpp"
+#include "type/value.hpp"
 
 namespace std {
 template <>

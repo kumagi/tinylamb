@@ -17,20 +17,20 @@
 #include "logger.hpp"
 
 #include <chrono>
+#include <cstddef>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <ios>
 #include <memory>
 #include <string>
 #include <thread>
 
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
 #include "gtest/gtest.h"
 #include "recovery/log_record.hpp"
-#include "type/row.hpp"
 
 namespace tinylamb {
-
 class LoggerTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -126,5 +126,4 @@ TEST_F(LoggerTest, Verify) {
   file >> file_data;
   ASSERT_EQ(file_data, written_log);
 }
-
 }  // namespace tinylamb

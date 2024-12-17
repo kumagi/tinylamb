@@ -16,6 +16,7 @@
 
 #include "debug.hpp"
 
+#include <cstddef>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -23,7 +24,6 @@
 #include <string_view>
 
 namespace tinylamb {
-
 std::string Hex(std::string_view in) {
   std::stringstream s;
   for (size_t i = 0; i < in.size(); ++i) {
@@ -55,5 +55,4 @@ std::string HeadString(std::string_view original, int length) {
   }
   return std::string(original);
 }
-
 }  // namespace tinylamb

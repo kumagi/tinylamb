@@ -35,7 +35,6 @@
 #include <vector>
 
 #include "common/log_message.hpp"
-#include "common/vm_cache.hpp"
 
 namespace tinylamb {
 namespace {
@@ -53,7 +52,7 @@ Cache::Cache(int fd, size_t memory_capacity, size_t max_size)
     : fd_(fd),
       max_memory_pages_((memory_capacity + kBlockSize - 1) / kBlockSize),
       max_size_(max_size != 0 ? max_size : FileSize(fd)),
-      meta_(max_size_ / kBlockSize + 1),
+      meta_((max_size_ / kBlockSize) + 1),
       small_queue_size_((max_memory_pages_ + 9) / 10),
       main_queue_size_(max_memory_pages_ - small_queue_size_),
       ghost_queue_size_(max_memory_pages_ - small_queue_size_) {
@@ -104,7 +103,7 @@ void Cache::Copy(void* dst, size_t offset, size_t length) const {
   char* dst_ptr = reinterpret_cast<char*>(dst);
   size_t copied = 0;
   size_t to_next_boundary =
-      ((offset + kBlockSize - 1) / kBlockSize) * kBlockSize - offset;
+      (((offset + kBlockSize - 1) / kBlockSize) * kBlockSize) - offset;
   size_t read_size = std::min(to_next_boundary, length);
   while (0 < length) {
     size_t original = length;

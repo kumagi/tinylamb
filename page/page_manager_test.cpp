@@ -16,14 +16,19 @@
 
 #include "page_manager.hpp"
 
+#include <cstdint>
 #include <cstdio>
+#include <memory>
+#include <set>
 #include <string>
 #include <tuple>
 
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
 #include "gtest/gtest.h"
 #include "page/free_page.hpp"
 #include "page/page_ref.hpp"
+#include "page_type.hpp"
 #include "recovery/logger.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"

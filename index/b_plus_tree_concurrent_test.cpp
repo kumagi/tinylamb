@@ -14,23 +14,30 @@
  * limitations under the License.
  */
 
+#include <cstdio>
 #include <memory>
+#include <random>
 #include <string>
+#include <string_view>
+#include <thread>
+#include <tuple>
 #include <unordered_map>
+#include <vector>
 
 #include "b_plus_tree.hpp"
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
+#include "page/page_type.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
-#include "type/row.hpp"
-#include "type/value.hpp"
 
 namespace tinylamb {
 
@@ -109,8 +116,8 @@ TEST_F(BPlusTreeConcurrentTest, InsertInsert) {
       std::mt19937 rand(i);
       auto txn = tm_->Begin();
       for (int j = 0; j < kSize; ++j) {
-        std::string key(RandomString(rand() % 1000 + 100));
-        std::string value(RandomString(rand() % 1000 + 100));
+        std::string key(RandomString((rand() % 1000) + 100));
+        std::string value(RandomString((rand() % 1000) + 100));
         Status s = bpt_->Insert(txn, key, value);
         if (s == Status::kDuplicates) {
           --j;

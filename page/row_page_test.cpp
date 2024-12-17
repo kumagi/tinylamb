@@ -16,16 +16,24 @@
 
 #include "page/row_page.hpp"
 
+#include <cstddef>
+#include <set>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
+#include "common/constants.hpp"
+#include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/row_page_test.hpp"
-#include "transaction/lock_manager.hpp"
+#include "page_ref.hpp"
+#include "page_type.hpp"
+#include "row_pointer.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
-
 TEST(ConstructTest, constrct) {
   Page test_page(0, PageType::kRowPage);
   RowPage* row = &test_page.body.row_page;
@@ -75,13 +83,15 @@ TEST_F(RowPageTest, UpdateMany) {
   }
   Flush();
   Recover();  // RecoveryManager process will not do wrong thing.
-  for (int i = 0; i < kInserts; i += 2) {  // even numbers.
+  for (int i = 0; i < kInserts; i += 2) {
+    // even numbers.
     UpdateRow(i, std::to_string(i) + kLongMessage);
     ASSERT_EQ(ReadRow(i), std::to_string(i) + kLongMessage);
   }
   Flush();
   Recover();  // RecoveryManager process will not do wrong thing.
-  for (int i = 1; i < kInserts; i += 2) {  // odd numbers.
+  for (int i = 1; i < kInserts; i += 2) {
+    // odd numbers.
     UpdateRow(i, std::to_string(i) + kShortMessage);
     ASSERT_EQ(ReadRow(i), std::to_string(i) + kShortMessage);
   }
@@ -176,7 +186,8 @@ TEST_F(RowPageTest, DeFragmentInvoked) {
 TEST_F(RowPageTest, InsertTwoThreads) {
   auto txn1 = tm_->Begin();
   auto txn2 = tm_->Begin();
-  {  // txn1
+  {
+    // txn1
     PageRef ref = p_->GetPage(page_id_);
     std::string message = "message1";
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn1, message));
@@ -254,5 +265,4 @@ TEST_F(RowPageTest, UpdateAndDeleteHeavy) {
     ASSERT_EQ(rows[i], row);
   }
 }
-
 }  // namespace tinylamb

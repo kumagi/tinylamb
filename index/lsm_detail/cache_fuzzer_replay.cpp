@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include <endian.h>
-
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -23,7 +21,6 @@
 #include <ios>
 #include <iostream>
 #include <string>
-#include <string_view>
 
 #include "common/log_message.hpp"
 #include "index/lsm_detail/cache_fuzzer.hpp"

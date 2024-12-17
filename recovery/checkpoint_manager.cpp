@@ -16,13 +16,23 @@
 
 #include "recovery/checkpoint_manager.hpp"
 
+#include <chrono>
+#include <cstddef>
+#include <fstream>
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "page/page_pool.hpp"
 #include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
-
 CheckpointManager::~CheckpointManager() {
   stop_ = true;
   checkpoint_worker_.join();
@@ -51,7 +61,7 @@ lsn_t CheckpointManager::WriteCheckpoint(
   // Write [BeginFullScan-Checkpoint] log.
   lsn_t begin_lsn = tm_->logger_->AddLog(begin.Serialize());
 
-  std::vector<std::pair<page_id_t, lsn_t>> dirty_page_table;
+  std::vector<std::pair<page_id_t, lsn_t> > dirty_page_table;
   {
     std::scoped_lock latch(pp_->pool_latch);
     dirty_page_table.reserve(pp_->pool_.size());
@@ -82,5 +92,4 @@ lsn_t CheckpointManager::WriteCheckpoint(
   master_log_file.write(reinterpret_cast<char*>(&begin_lsn), sizeof(begin_lsn));
   return begin_lsn;
 }
-
 }  // namespace tinylamb

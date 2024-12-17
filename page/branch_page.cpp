@@ -16,17 +16,32 @@
 
 #include "branch_page.hpp"
 
+#include <cassert>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <ostream>
+#include <string>
+#include <string_view>
+#include <vector>
 
+#include "common/constants.hpp"
+#include "common/debug.hpp"
+#include "common/log_message.hpp"
 #include "common/serdes.hpp"
+#include "common/status_or.hpp"
 #include "page/foster_pair.hpp"
 #include "page/index_key.hpp"
 #include "page/page.hpp"
 #include "page/page_manager.hpp"
+#include "page_ref.hpp"
+#include "page_type.hpp"
+#include "row_pointer.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
-
 slot_t BranchPage::RowCount() const { return row_count_; }
 
 void BranchPage::SetLowestValue(page_id_t pid, Transaction& txn,
@@ -507,7 +522,6 @@ Status BranchPage::MoveLeftFromFoster(Transaction& txn, Page& right) {
   right.SetLowestValue(txn, 0);
   return Status::kSuccess;
 }
-
 }  // namespace tinylamb
 
 uint64_t std::hash<tinylamb::BranchPage>::operator()(

@@ -19,7 +19,6 @@
 #include <bits/types/struct_iovec.h>
 #include <endian.h>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -35,7 +34,6 @@
 #include <map>
 #include <memory>
 #include <ostream>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -46,12 +44,9 @@
 #include "common/status_or.hpp"
 #include "common/vm_cache.hpp"
 #include "index/lsm_detail/blob_file.hpp"
-#include "recovery/logger.hpp"
 
 namespace tinylamb {
-
 namespace {
-
 int OpenFile(const std::filesystem::path& path) {
   int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0666);
   if (fd < 0) {
@@ -72,7 +67,6 @@ int MemoryCompare(std::string_view lhs, std::string_view rhs) {
   }
   return -1;
 }
-
 }  // namespace
 
 /* A comparison between SortedRun::Entry vs general length binary.
@@ -237,7 +231,7 @@ SortedRun::SortedRun(const std::filesystem::path& file) {
   offset += ::read(fd, &length_, sizeof(size_t));
   offset += ::read(fd, &generation_, sizeof(size_t));
 
-  index_ = std::make_unique<VMCache<Entry>>(fd, 4096 * 4096, offset);
+  index_ = std::make_unique<VMCache<Entry> >(fd, 4096 * 4096, offset);
 }
 
 void SortedRun::Construct(const std::filesystem::path& file,
@@ -299,8 +293,8 @@ void SortedRun::FlushInternal(const std::filesystem::path& path,
   ::close(fd);
 }
 
-auto SortedRun::Find(std::string_view key,
-                     const BlobFile& blob) const -> StatusOr<std::string> {
+auto SortedRun::Find(std::string_view key, const BlobFile& blob) const
+    -> StatusOr<std::string> {
   if (key < min_key_ || max_key_ < key) {
     return Status::kNotExists;
   }
@@ -349,7 +343,7 @@ std::ostream& operator<<(std::ostream& o, const SortedRun::Iterator& it) {
   return o;
 }
 
-std::string HeadString(uint32_t in) {
+static std::string HeadString(uint32_t in) {
   std::string out(4, 0);
   *(reinterpret_cast<uint32_t*>(out.data())) = be32toh(in);
   return out;
@@ -376,5 +370,4 @@ std::ostream& operator<<(std::ostream& o, const SortedRun& s) {
     << "}\n";
   return o;
 }
-
 }  // namespace tinylamb

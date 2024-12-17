@@ -14,18 +14,21 @@
  * limitations under the License.
  */
 
+#include <iostream>
 #include <memory>
 #include <string>
 
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database.hpp"
-#include "database/page_storage.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction_manager.hpp"
+#include "transaction_context.hpp"
 #include "type/schema.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 

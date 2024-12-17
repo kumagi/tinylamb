@@ -16,6 +16,13 @@
 
 #include "table/full_scan_iterator.hpp"
 
+#include <cassert>
+#include <ostream>
+#include <string_view>
+
+#include "common/constants.hpp"
+#include "common/status_or.hpp"
+#include "iterator_base.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
 #include "table/table.hpp"

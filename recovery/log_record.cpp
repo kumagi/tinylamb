@@ -17,12 +17,26 @@
 #include "log_record.hpp"
 
 #include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
-#include <unordered_set>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
+#include "checkpoint_manager.hpp"
+#include "common/constants.hpp"
+#include "common/debug.hpp"
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
+#include "common/log_message.hpp"
 #include "common/serdes.hpp"
-#include "type/row.hpp"
+#include "page/foster_pair.hpp"
+#include "page/index_key.hpp"
+#include "page/page_type.hpp"
 
 namespace {
 

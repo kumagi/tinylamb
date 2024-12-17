@@ -14,15 +14,17 @@
  * limitations under the License.
  */
 
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <string>
 #include <string_view>
 
 #include "common/log_message.hpp"
 #include "page/row_page_fuzzer.hpp"
 
-void TestCase(std::string_view input) {
+static void TestCase(std::string_view input) {
   tinylamb::RowPageEnvironment env;
   tinylamb::Operation op(&env);
   while (!input.empty()) {

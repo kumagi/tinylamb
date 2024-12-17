@@ -16,22 +16,34 @@
 
 #include "index_scan_iterator.hpp"
 
+#include <cstddef>
+#include <ostream>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "common/constants.hpp"
+#include "common/decoder.hpp"
+#include "common/log_message.hpp"
+#include "common/status_or.hpp"
 #include "index/b_plus_tree.hpp"
 #include "index/index.hpp"
+#include "index_schema.hpp"
 #include "page/page_manager.hpp"
+#include "table/iterator_base.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
-
 IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
-                                     Transaction& txn, const Value& begin,
-                                     const Value& end, bool ascending)
+                                     Transaction& txn, Value begin, Value end,
+                                     bool ascending)
     : table_(table),
       index_(index),
       txn_(txn),
-      begin_(begin),
-      end_(end),
+      begin_(std::move(begin)),
+      end_(std::move(end)),
       ascending_(ascending),
       is_unique_(index.sc_.mode_ == IndexMode::kUnique),
       value_offset_(ascending_ ? 0 : -1),
@@ -48,7 +60,7 @@ IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
     pos_ = val.pos;
     include_ = val.include;
   } else {
-    auto val = Decode<std::vector<Table::IndexValueType>>(iter_.Value());
+    auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
     value_offset_ = ascending ? 0 : val.size() - 1;
     pos_ = val[value_offset_].pos;
     include_ = val[value_offset_].include;
@@ -84,7 +96,7 @@ void IndexScanIterator::UpdateIteratorState() {
     pos_ = rp.pos;
     include_ = rp.include;
   } else {
-    auto val = Decode<std::vector<Table::IndexValueType>>(iter_.Value());
+    auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
     const Table::IndexValueType& row_value = val[value_offset_];
     pos_ = row_value.pos;
     include_ = row_value.include;
@@ -107,7 +119,7 @@ IteratorBase& IndexScanIterator::operator++() {
   if (is_unique_) {
     ++iter_;
   } else {
-    auto val = Decode<std::vector<Table::IndexValueType>>(iter_.Value());
+    auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
     ++value_offset_;
     if (val.size() <= value_offset_) {
       ++iter_;
@@ -128,7 +140,7 @@ IteratorBase& IndexScanIterator::operator--() {
     } else {
       --iter_;
       if (iter_.IsValid()) {
-        auto val = Decode<std::vector<Table::IndexValueType>>(iter_.Value());
+        auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
         value_offset_ = val.size() - 1;
       }
     }
@@ -181,5 +193,4 @@ void IndexScanIterator::Dump(std::ostream& o, int /*indent*/) const {
   }
   o << "]";
 }
-
 }  // namespace tinylamb

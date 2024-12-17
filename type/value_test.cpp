@@ -16,11 +16,18 @@
 
 #include "type/value.hpp"
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "gtest/gtest.h"
 
 namespace tinylamb {
-
 TEST(ValueTest, DefaultConstruct) { Value v; }
 
 TEST(ValueTest, Calculate) {
@@ -240,5 +247,4 @@ TEST(ValueTest, MemComparableFormatDecodeDouble) {
   } while (std::next_permutation(src.begin(), src.end()));
   MemcomparableFormatDecodeTest(targets);
 }
-
 }  // namespace tinylamb

@@ -16,8 +16,12 @@
 
 #include "page_pool.hpp"
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdio>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "common/random_string.hpp"
 #include "gtest/gtest.h"

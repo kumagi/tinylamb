@@ -18,9 +18,14 @@
 // Created by kumagi on 22/07/22.
 //
 
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <string>
 
+#include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "recovery/logger_fuzzer.hpp"
 
 int main(int argc, char** argv) {

@@ -16,14 +16,16 @@
 
 #include "type/constraint.hpp"
 
-#include <cstring>
+#include <cstdint>
+#include <functional>
+#include <ostream>
 
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
-
 size_t Constraint::Size() const {
   switch (ctype) {
     case kDefault:
@@ -78,15 +80,14 @@ std::ostream& operator<<(std::ostream& o, const Constraint& c) {
 }
 
 Encoder& operator<<(Encoder& a, const Constraint& c) {
-  a << (uint8_t)c.ctype << c.value;
+  a << static_cast<uint8_t>(c.ctype) << c.value;
   return a;
 }
 
 Decoder& operator>>(Decoder& e, Constraint& c) {
-  e >> (uint8_t&)c.ctype >> c.value;
+  e >> reinterpret_cast<uint8_t&>(c.ctype) >> c.value;
   return e;
 }
-
 }  // namespace tinylamb
 
 uint64_t std::hash<tinylamb::Constraint>::operator()(

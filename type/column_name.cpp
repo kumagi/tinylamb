@@ -19,13 +19,17 @@
 //
 #include "type/column_name.hpp"
 
+#include <cstdint>
+#include <functional>
 #include <ostream>
+#include <string>
+#include <string_view>
 #include <tuple>
 
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
-namespace tinylamb {
 
+namespace tinylamb {
 std::ostream& operator<<(std::ostream& o, const ColumnName& c) {
   o << c.ToString();
   return o;
@@ -48,7 +52,6 @@ Decoder& operator>>(Decoder& e, ColumnName& c) {
   e >> c.schema >> c.name;
   return e;
 }
-
 }  // namespace tinylamb
 uint64_t std::hash<tinylamb::ColumnName>::operator()(
     const tinylamb::ColumnName& c) const {

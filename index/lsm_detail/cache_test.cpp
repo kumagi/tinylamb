@@ -28,7 +28,6 @@
 #include <tuple>
 #include <vector>
 
-#include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "gtest/gtest.h"
 

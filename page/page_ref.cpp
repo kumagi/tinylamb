@@ -16,8 +16,12 @@
 
 #include "page/page_ref.hpp"
 
+#include <cassert>
+#include <ostream>
+
 #include "page/page.hpp"
 #include "page/page_pool.hpp"
+#include "page_type.hpp"
 
 namespace tinylamb {
 

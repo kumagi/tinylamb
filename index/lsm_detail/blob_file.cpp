@@ -15,33 +15,20 @@
  */
 #include "index/lsm_detail/blob_file.hpp"
 
-#include <bits/types/struct_iovec.h>
-#include <bits/xopen_lim.h>
 #include <endian.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <sys/uio.h>
-#include <unistd.h>
 
-#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <map>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "cache.hpp"
 #include "common/constants.hpp"
-#include "common/log_message.hpp"
-#include "common/status_or.hpp"
 
 namespace tinylamb {
-
 BlobFile::BlobFile(const std::filesystem::path& path, size_t memory_capacity,
                    size_t max_filesize)
     : file_writer_(path),
@@ -70,5 +57,4 @@ lsn_t BlobFile::Append(std::string_view payload) {
   cache_.Invalidate(before, payload.length());
   return lsn;
 }
-
 }  // namespace tinylamb

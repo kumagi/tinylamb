@@ -16,26 +16,32 @@
 
 #include "plan/plan.hpp"
 
+#include <iostream>
+#include <memory>
+
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
-#include "database/page_storage.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "full_scan_plan.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
 #include "product_plan.hpp"
 #include "projection_plan.hpp"
-#include "recovery/checkpoint_manager.hpp"
-#include "recovery/logger.hpp"
 #include "selection_plan.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
+#include "type/column_name.hpp"
 #include "type/row.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 

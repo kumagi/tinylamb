@@ -16,8 +16,11 @@
 
 #include "b_plus_tree_iterator.hpp"
 
-#include "common/debug.hpp"
+#include <stdexcept>
+#include <string_view>
+
 #include "index/b_plus_tree.hpp"
+#include "page/index_key.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
 #include "transaction/transaction.hpp"

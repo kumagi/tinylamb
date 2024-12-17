@@ -16,9 +16,14 @@
 
 #include "log_record.hpp"
 
-#include <filesystem>
+#include <sstream>
+#include <string>
 
+#include "common/decoder.hpp"
 #include "gtest/gtest.h"
+#include "page/index_key.hpp"
+#include "page/page_type.hpp"
+#include "transaction/transaction.hpp"
 
 namespace tinylamb {
 

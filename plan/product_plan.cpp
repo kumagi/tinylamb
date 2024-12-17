@@ -16,6 +16,8 @@
 
 #include "plan/product_plan.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <iostream>
 #include <utility>
 
@@ -28,7 +30,6 @@
 
 namespace tinylamb {
 namespace {
-
 TableStatistics CrossJoinStats(const TableStatistics& left,
                                const TableStatistics& right) {
   TableStatistics ans(left * right.Rows());
@@ -44,7 +45,6 @@ TableStatistics HashJoinStats(const TableStatistics& left,
   ans.Concat(right);
   return ans;
 }
-
 }  // namespace
 
 // For Hash Join.
@@ -87,7 +87,8 @@ ProductPlan::ProductPlan(Plan left_src, Plan right_src)
       stats_(CrossJoinStats(left_src_->GetStats(), right_src_->GetStats())) {}
 
 Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
-  if (left_cols_.empty() && right_cols_.empty()) {  // Cross Join
+  if (left_cols_.empty() && right_cols_.empty()) {
+    // Cross Join
     return std::make_shared<CrossJoin>(left_src_->EmitExecutor(ctx),
                                        right_src_->EmitExecutor(ctx));
   }
@@ -147,10 +148,12 @@ size_t ProductPlan::AccessRowCount() const {
 }
 
 size_t ProductPlan::EmitRowCount() const {
-  if (left_cols_.empty() && right_cols_.empty()) {  // CrossJoin.
+  if (left_cols_.empty() && right_cols_.empty()) {
+    // CrossJoin.
     return left_src_->EmitRowCount() * right_src_->EmitRowCount();
   }
-  if (right_tbl_ != nullptr) {  // IndexJoin
+  if (right_tbl_ != nullptr) {
+    // IndexJoin
     return std::min(left_src_->EmitRowCount(), right_ts_->Rows());
   }
   return std::min(left_src_->EmitRowCount(), right_src_->EmitRowCount());
@@ -189,5 +192,4 @@ void ProductPlan::Dump(std::ostream& o, int indent) const {
     right_idx_->Dump(o);
   }
 }
-
 }  // namespace tinylamb

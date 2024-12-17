@@ -16,9 +16,14 @@
 
 #include "expression/column_value.hpp"
 
+#include <cstddef>
+#include <ostream>
+#include <stdexcept>
+
 #include "type/column.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 

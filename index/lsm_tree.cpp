@@ -17,8 +17,6 @@
 #include "index/lsm_tree.hpp"
 
 #include <chrono>
-#include <cstddef>
-#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
@@ -35,7 +33,6 @@
 #include "lsm_detail/sorted_run.hpp"
 
 namespace tinylamb {
-
 void Flusher(const std::stop_token& st, LSMTree* tree);
 
 std::filesystem::path BlobPath(const std::filesystem::path& dir) {
@@ -154,7 +151,8 @@ void LSMTree::Sync() {
   }
   std::swap(mem_tree_, frozen_mem_tree_);
   std::filesystem::path new_index_file =
-      root_dir_ / std::to_string(blob_.Written());
+      root_dir_ /
+      (std::to_string(generation_) + "-" + std::to_string(blob_.Written()));
   SortedRun::Construct(new_index_file, frozen_mem_tree_, blob_,
                        generation_.fetch_add(1));
   frozen_mem_tree_.clear();
@@ -177,5 +175,4 @@ void LSMTree::MergeAll() {
   index_.emplace_front(path);
   files_.push_front(std::move(path));
 }
-
 }  // namespace tinylamb

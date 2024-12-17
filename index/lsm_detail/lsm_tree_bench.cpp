@@ -13,17 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <endian.h>
-#include <fcntl.h>
 #include <leveldb/db.h>
 #include <leveldb/iterator.h>
 #include <leveldb/status.h>
 // #include <rocksdb/db.h>
 // #include <rocksdb/metadata.h>
 // #include <rocksdb/options.h>
-#include <rocksdb/slice.h>
-#include <rocksdb/status.h>
-#include <unistd.h>
 
 #include <cassert>
 #include <chrono>
@@ -32,6 +27,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <set>
 #include <string>
@@ -45,8 +41,8 @@
 
 using namespace tinylamb;
 
-void Bench(size_t count, const std::function<void()>& fun,
-           std::string_view name, std::string_view unit) {
+static void Bench(size_t count, const std::function<void()>& fun,
+                  std::string_view name, std::string_view unit) {
   auto begin = std::chrono::system_clock::now();
   fun();
   auto finish = std::chrono::system_clock::now();
