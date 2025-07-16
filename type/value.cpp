@@ -24,6 +24,35 @@
 #include "value_type.hpp"
 
 namespace tinylamb {
+
+std::string ToString(UnaryOperation type) {
+  switch (type) {
+    case UnaryOperation::kIsNull:
+      return "IS NULL";
+    case UnaryOperation::kIsNotNull:
+      return "IS NOT NULL";
+    case UnaryOperation::kNot:
+      return "NOT";
+    case UnaryOperation::kMinus:
+      return "-";
+  }
+}
+
+std::string ToString(AggregationType type) {
+  switch (type) {
+    case AggregationType::kCount:
+      return "COUNT";
+    case AggregationType::kSum:
+      return "SUM";
+    case AggregationType::kAvg:
+      return "AVG";
+    case AggregationType::kMin:
+      return "MIN";
+    case AggregationType::kMax:
+      return "MAX";
+  }
+}
+
 Value::Value(int int_val) {
   type = ValueType::kInt64;
   value.int_value = int_val;

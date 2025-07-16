@@ -34,6 +34,7 @@
 #include "product_plan.hpp"
 #include "projection_plan.hpp"
 #include "selection_plan.hpp"
+#include "aggregation_plan.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "transaction/transaction.hpp"
@@ -203,6 +204,41 @@ TEST_F(PlanTest, ProductPlanCrossJoin) {
   Plan prop(new ProductPlan(std::make_shared<FullScanPlan>(*tbl1, ts),
                             std::make_shared<FullScanPlan>(*tbl2, ts)));
   DumpAll(prop);
+}
+
+TEST_F(PlanTest, UnaryPlan) {
+  TableStatistics ts((Schema()));
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  Expression exp = UnaryExpressionExp(ColumnValueExp("c1"),
+                                      UnaryOperation::kIsNull);
+  Plan sp(new SelectionPlan(std::make_shared<FullScanPlan>(*tbl, ts), exp, ts));
+  DumpAll(sp);
+}
+
+TEST_F(PlanTest, AggregationPlan) {
+  TableStatistics ts((Schema()));
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression(
+          "count",
+          AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("c1"))),
+      NamedExpression(
+          "sum",
+          AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("c3"))),
+      NamedExpression(
+          "avg",
+          AggregateExpressionExp(AggregationType::kAvg, ColumnValueExp("c3"))),
+      NamedExpression(
+          "min",
+          AggregateExpressionExp(AggregationType::kMin, ColumnValueExp("c3"))),
+      NamedExpression(
+          "max",
+          AggregateExpressionExp(AggregationType::kMax, ColumnValueExp("c3")))};
+  Plan ap(new AggregationPlan(std::make_shared<FullScanPlan>(*tbl, ts),
+                              std::move(aggregates)));
+  DumpAll(ap);
 }
 
 }  // namespace tinylamb

@@ -14,43 +14,38 @@
  * limitations under the License.
  */
 
-#ifndef TINYLAMB_FULL_SCAN_PLAN_HPP
-#define TINYLAMB_FULL_SCAN_PLAN_HPP
+#ifndef TINYLAMB_AGGREGATION_PLAN_HPP
+#define TINYLAMB_AGGREGATION_PLAN_HPP
 
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "expression/named_expression.hpp"
 #include "plan/plan.hpp"
-#include "table/table.hpp"
-#include "table/table_statistics.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
 
-class FullScanPlan : public PlanBase {
+class AggregationPlan : public PlanBase {
  public:
-  explicit FullScanPlan(const Table& table, const TableStatistics& ts);
-  FullScanPlan(const FullScanPlan&) = delete;
-  FullScanPlan(FullScanPlan&&) = delete;
-  FullScanPlan& operator=(const FullScanPlan&) = delete;
-  FullScanPlan& operator=(FullScanPlan&&) = delete;
-  ~FullScanPlan() override = default;
-
-  Executor EmitExecutor(TransactionContext& txn) const override;
-
-  [[nodiscard]] const Table* ScanSource() const override { return &table_; };
+  AggregationPlan(Plan child, std::vector<NamedExpression> aggregates);
   [[nodiscard]] const Schema& GetSchema() const override;
-  [[nodiscard]] const TableStatistics& GetStats() const override {
-    return stats_;
-  }
-
+  [[nodiscard]] Executor EmitExecutor(TransactionContext& ctx) const override;
+  [[nodiscard]] const Table* ScanSource() const override;
+  [[nodiscard]] const TableStatistics& GetStats() const override;
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
-  void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
+  void Dump(std::ostream& o, int indent) const override;
 
  private:
-  const Table& table_;
-  const TableStatistics& stats_;
+  [[nodiscard]] Schema GenerateSchema() const;
+  Plan child_;
+  std::vector<NamedExpression> aggregates_;
+  mutable Schema schema_;
 };
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_FULL_SCAN_PLAN_HPP
+#endif  // TINYLAMB_AGGREGATION_PLAN_HPP

@@ -35,6 +35,7 @@
 #include "executor/projection.hpp"
 #include "executor/selection.hpp"
 #include "executor/update.hpp"
+#include "executor/aggregation.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "gtest/gtest.h"
@@ -493,5 +494,36 @@ TEST_F(ExecutorTest, Update) {
     rows.erase(got);
   }
   ASSERT_TRUE(rows.empty());
+}
+
+TEST_F(ExecutorTest, Aggregation) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  auto fs = std::make_shared<FullScan>(ctx.txn_, *tbl);
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression(
+          "count",
+          AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("key"))),
+      NamedExpression(
+          "sum",
+          AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("score"))),
+      NamedExpression(
+          "avg",
+          AggregateExpressionExp(AggregationType::kAvg, ColumnValueExp("score"))),
+      NamedExpression(
+          "min",
+          AggregateExpressionExp(AggregationType::kMin, ColumnValueExp("score"))),
+      NamedExpression(
+          "max",
+          AggregateExpressionExp(AggregationType::kMax, ColumnValueExp("score")))};
+  AggregationExecutor agg(std::move(fs), std::move(aggregates));
+  Row result;
+  ASSERT_TRUE(agg.Next(&result, nullptr));
+  ASSERT_EQ(result[0], Value(4));
+  ASSERT_EQ(result[1], Value(22.44));
+  ASSERT_EQ(result[2], Value(5.61));
+  ASSERT_EQ(result[3], Value(1.2));
+  ASSERT_EQ(result[4], Value(12.2));
+  ASSERT_FALSE(agg.Next(&result, nullptr));
 }
 }  // namespace tinylamb

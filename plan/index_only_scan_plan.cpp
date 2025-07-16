@@ -82,4 +82,10 @@ void IndexOnlyScanPlan::Dump(std::ostream& o, int /*indent*/) const {
     << " (estimated cost: " << AccessRowCount() << ")";
 }
 
+std::string IndexOnlyScanPlan::ToString() const {
+  return "IndexOnlyScan: " + std::string(table_.GetSchema().Name()) + " with " +
+         index_.sc_.name_ +
+         " (estimated cost: " + std::to_string(AccessRowCount()) + ")";
+}
+
 }  // namespace tinylamb

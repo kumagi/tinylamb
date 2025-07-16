@@ -31,11 +31,19 @@ struct Row;
 class ColumnValue;
 class BinaryExpression;
 class ConstantValue;
+class UnaryExpression;
+class AggregateExpression;
+class CaseExpression;
+class InExpression;
 
 enum class TypeTag : int {
   kBinaryExp,
   kColumnValue,
   kConstantValue,
+  kUnaryExp,
+  kAggregateExp,
+  kCaseExp,
+  kInExp,
 };
 
 class ExpressionBase {
@@ -51,6 +59,10 @@ class ExpressionBase {
   [[nodiscard]] ColumnValue& AsColumnValue();
   [[nodiscard]] const BinaryExpression& AsBinaryExpression() const;
   [[nodiscard]] const ConstantValue& AsConstantValue() const;
+  [[nodiscard]] const UnaryExpression& AsUnaryExpression() const;
+  [[nodiscard]] const AggregateExpression& AsAggregateExpression() const;
+  [[nodiscard]] const CaseExpression& AsCaseExpression() const;
+  [[nodiscard]] const InExpression& AsInExpression() const;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const;
   [[nodiscard]] virtual Value Evaluate(const Row& row,
                                        const Schema& schema) const = 0;
@@ -68,6 +80,12 @@ Expression ColumnValueExp(const std::string_view& col_name);
 Expression ConstantValueExp(const Value& v);
 Expression BinaryExpressionExp(Expression left, BinaryOperation op,
                                Expression right);
+Expression UnaryExpressionExp(Expression child, UnaryOperation op);
+Expression AggregateExpressionExp(AggregationType type, Expression child);
+Expression CaseExpressionExp(
+    std::vector<std::pair<Expression, Expression>> when_clauses,
+    Expression else_clause);
+Expression InExpressionExp(Expression child, std::vector<Expression> list);
 
 }  // namespace tinylamb
 

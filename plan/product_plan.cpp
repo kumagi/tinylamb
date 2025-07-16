@@ -192,4 +192,29 @@ void ProductPlan::Dump(std::ostream& o, int indent) const {
     right_idx_->Dump(o);
   }
 }
+
+std::string ProductPlan::ToString() const {
+  std::string s = "Product: ";
+  if (left_cols_.empty() && right_cols_.empty()) {
+    s += "Cross Join ";
+  } else {
+    s += "left:{";
+    for (size_t i = 0; i < left_cols_.size(); ++i) {
+      if (0 < i) {
+        s += ", ";
+      }
+      s += left_cols_[i].ToString();
+    }
+    s += "} right:{";
+    for (size_t i = 0; i < right_cols_.size(); ++i) {
+      if (0 < i) {
+        s += ", ";
+      }
+      s += right_cols_[i].ToString();
+    }
+    s += "} ";
+  }
+  s += " (estimated cost: " + std::to_string(EmitRowCount()) + ")";
+  return s;
+}
 }  // namespace tinylamb

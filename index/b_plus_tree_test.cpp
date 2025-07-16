@@ -205,7 +205,7 @@ TEST_F(BPlusTreeTest, MergeBranch) {
   std::string short_value = "v";
   for (size_t i = 0; i < kInserts; ++i) {
     ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, kPayloadSize), short_value));
-    ASSERT_TRUE(bpt_->SanityCheckForTest(txn.PageManager()));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(txn.GetPageManager()));
   }
   for (size_t i = 0; i < kInserts; ++i) {
     std::string key = KeyGen(i, kPayloadSize);
@@ -723,7 +723,7 @@ TEST_F(BPlusTreeTest, InsertDelete) {
     std::string inserting_key = RandomString((19937 * i) % 2000 + 2000, false);
     ASSERT_SUCCESS(bpt_->Insert(txn, inserting_key, "bar"));
     keys.insert(inserting_key);
-    ASSERT_TRUE(bpt_->SanityCheckForTest(txn.PageManager()));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(txn.GetPageManager()));
   }
 }
 

@@ -49,6 +49,7 @@ class PlanBase {
   [[nodiscard]] virtual size_t EmitRowCount() const = 0;
 
   virtual void Dump(std::ostream& o, int indent) const = 0;
+  [[nodiscard]] virtual std::string ToString() const = 0;
   friend std::ostream& operator<<(std::ostream& o, const PlanBase& p) {
     p.Dump(o, 0);
     return o;

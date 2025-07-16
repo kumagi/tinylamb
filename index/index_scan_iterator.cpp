@@ -104,7 +104,7 @@ void IndexScanIterator::UpdateIteratorState() {
 }
 
 void IndexScanIterator::ResolveRow() const {
-  PageRef ref = txn_.PageManager()->GetPage(pos_.page_id);
+  PageRef ref = txn_.GetPageManager()->GetPage(pos_.page_id);
   if (!ref.IsValid()) {
     return;
   }

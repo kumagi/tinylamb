@@ -59,7 +59,7 @@ class LSMView {
     [[nodiscard]] std::string Key() const { return iters_[0].Key(); }
     [[nodiscard]] std::string Value() const;
     Iterator& operator++();
-    SortedRun::Entry Entry() const;
+    SortedRun::Entry GetEntry() const;
     bool operator==(const Iterator& rhs) const;
     [[nodiscard]] bool IsValid() const;
     friend std::ostream& operator<<(std::ostream& o,

@@ -26,6 +26,33 @@ namespace tinylamb {
 class Encoder;
 class Decoder;
 
+enum class UnaryOperation : int {
+  kIsNull,
+  kIsNotNull,
+  kNot,
+  kMinus,
+};
+
+enum class AggregationType : int {
+  kCount,
+  kSum,
+  kAvg,
+  kMin,
+  kMax,
+};
+
+std::string ToString(AggregationType type);
+inline std::ostream& operator<<(std::ostream& o, const AggregationType& at) {
+  o << ToString(at);
+  return o;
+}
+
+std::string ToString(UnaryOperation type);
+inline std::ostream& operator<<(std::ostream& o, const UnaryOperation& uo) {
+  o << ToString(uo);
+  return o;
+}
+
 class Value {
  public:
   Value() : type(ValueType::kNull) {}

@@ -44,10 +44,10 @@ void DumpLeafPage(Transaction& txn, PageRef& page, std::ostream& o, int indent);
 
 BPlusTree::BPlusTree(Transaction& txn, page_id_t default_root)
     : root_(default_root) {
-  PageRef root = txn.PageManager()->GetPage(default_root);
+  PageRef root = txn.GetPageManager()->GetPage(default_root);
   if (!root.IsValid()) {
     PageRef new_root =
-        txn.PageManager()->AllocateNewPage(txn, PageType::kLeafPage);
+        txn.GetPageManager()->AllocateNewPage(txn, PageType::kLeafPage);
     root_ = new_root->PageID();
   }
 }
@@ -57,7 +57,7 @@ BPlusTree::BPlusTree(page_id_t given_root) : root_(given_root) {}
 PageRef BPlusTree::FindLeftmostPage(Transaction& txn, PageRef&& page) {
   while (page->Type() != PageType::kLeafPage) {
     assert(page->Type() == PageType::kBranchPage);
-    page = txn.PageManager()->GetPage(page->body.branch_page.lowest_page_);
+    page = txn.GetPageManager()->GetPage(page->body.branch_page.lowest_page_);
   }
   return std::move(page);
 }
@@ -65,22 +65,22 @@ PageRef BPlusTree::FindLeftmostPage(Transaction& txn, PageRef&& page) {
 PageRef BPlusTree::FindRightmostPage(Transaction& txn, PageRef&& page) {
   while (page->Type() != PageType::kLeafPage) {
     assert(page->Type() == PageType::kBranchPage);
-    page = txn.PageManager()->GetPage(
+    page = txn.GetPageManager()->GetPage(
         page->body.branch_page.GetValue(page->body.branch_page.RowCount() - 1));
   }
   return std::move(page);
 }
 
 PageRef BPlusTree::LeftmostPage(Transaction& txn) {
-  return FindLeftmostPage(txn, txn.PageManager()->GetPage(root_));
+  return FindLeftmostPage(txn, txn.GetPageManager()->GetPage(root_));
 }
 
 PageRef BPlusTree::RightmostPage(Transaction& txn) {
-  return FindRightmostPage(txn, txn.PageManager()->GetPage(root_));
+  return FindRightmostPage(txn, txn.GetPageManager()->GetPage(root_));
 }
 
 void BPlusTree::GrowTreeHeightIfNeeded(Transaction& txn) const {
-  PageRef root = txn.PageManager()->GetPage(root_);
+  PageRef root = txn.GetPageManager()->GetPage(root_);
   StatusOr<FosterPair> root_foster = root->GetFoster(txn);
   if (!root_foster.HasValue()) {
     return;
@@ -89,7 +89,7 @@ void BPlusTree::GrowTreeHeightIfNeeded(Transaction& txn) const {
   if (root->Type() == PageType::kBranchPage) {
     const BranchPage& root_page = root->body.branch_page;
     PageRef new_left =
-        txn.PageManager()->AllocateNewPage(txn, PageType::kBranchPage);
+        txn.GetPageManager()->AllocateNewPage(txn, PageType::kBranchPage);
     new_left->SetLowestValue(txn, root_page.lowest_page_);
     for (slot_t i = 0; i < root->RowCount(); ++i) {
       new_left->InsertBranch(txn, root_page.GetKey(i), root_page.GetValue(i));
@@ -106,13 +106,13 @@ void BPlusTree::GrowTreeHeightIfNeeded(Transaction& txn) const {
   assert(root->Type() == PageType::kLeafPage);
   // Swap parent node to the branch node.
   PageRef new_left =
-      txn.PageManager()->AllocateNewPage(txn, PageType::kLeafPage);
+      txn.GetPageManager()->AllocateNewPage(txn, PageType::kLeafPage);
   const LeafPage& root_page = root->body.leaf_page;
   for (slot_t i = 0; i < root->body.leaf_page.RowCount(); ++i) {
     new_left->InsertLeaf(txn, root_page.GetKey(i), root_page.GetValue(i));
   }
   COERCE(new_left->SetHighFence(txn, IndexKey(new_right.key)));
-  PageRef right_page = txn.PageManager()->GetPage(new_right.child_pid);
+  PageRef right_page = txn.GetPageManager()->GetPage(new_right.child_pid);
   root->PageTypeChange(txn, PageType::kBranchPage);
   root->SetLowestValue(txn, new_left->PageID());
   root->InsertBranch(txn, new_right.key, new_right.child_pid);
@@ -125,19 +125,19 @@ void BPlusTree::GrowTreeHeightIfNeeded(Transaction& txn) const {
 PageRef BPlusTree::FindLeaf(Transaction& txn, std::string_view key,
                             bool less_than) {
   GrowTreeHeightIfNeeded(txn);
-  PageRef curr = txn.PageManager()->GetPage(root_);
+  PageRef curr = txn.GetPageManager()->GetPage(root_);
   assert(curr->GetFoster(txn).GetStatus() == Status::kNotExists);
   while (curr->Type() != PageType::kLeafPage) {
     assert(curr->Type() == PageType::kBranchPage);
     ASSIGN_OR_CRASH(page_id_t, next, curr->GetPageForKey(txn, key, less_than));
-    PageRef next_page = txn.PageManager()->GetPage(next);
+    PageRef next_page = txn.GetPageManager()->GetPage(next);
     assert(next_page->PageID() == next);
     while (auto next_foster = next_page->GetFoster(txn)) {
       const FosterPair& new_child = next_foster.Value();
       Status s = curr->InsertBranch(txn, new_child.key, new_child.child_pid);
       if (s != Status::kSuccess) {
         PageRef right =
-            txn.PageManager()->AllocateNewPage(txn, PageType::kBranchPage);
+            txn.GetPageManager()->AllocateNewPage(txn, PageType::kBranchPage);
         std::string middle;
         curr->body.branch_page.Split(curr->PageID(), txn, key, &*right,
                                      &middle);
@@ -161,7 +161,7 @@ PageRef BPlusTree::FindLeaf(Transaction& txn, std::string_view key,
       COERCE(s);
       if (new_child.key <= key) {
         next_page.PageUnlock();
-        next_page = txn.PageManager()->GetPage(
+        next_page = txn.GetPageManager()->GetPage(
             curr->GetPageForKey(txn, key, false).Value());
       }
     }
@@ -177,7 +177,7 @@ Status BPlusTree::LeafInsert(Transaction& txn, PageRef& leaf,
     const FosterPair& right = foster.Value();
     if (right.key <= key) {
       leaf.PageUnlock();
-      PageRef foster_child = txn.PageManager()->GetPage(right.child_pid);
+      PageRef foster_child = txn.GetPageManager()->GetPage(right.child_pid);
       return LeafInsert(txn, foster_child, key, value);
     }
   }
@@ -191,7 +191,7 @@ Status BPlusTree::LeafInsert(Transaction& txn, PageRef& leaf,
       return Status::kSuccess;
     }
     PageRef right =
-        txn.PageManager()->AllocateNewPage(txn, PageType::kLeafPage);
+        txn.GetPageManager()->AllocateNewPage(txn, PageType::kLeafPage);
     leaf->body.leaf_page.Split(leaf->PageID(), txn, key, value, right.get());
     COERCE(right->SetLowFence(txn, IndexKey(right->GetKey(0))));
     COERCE(right->SetHighFence(txn, leaf->GetHighFence(txn)));
@@ -212,7 +212,7 @@ Status BPlusTree::SetFosterRecursively(Transaction& txn, PageRef& parent,
   COERCE(parent->SetHighFence(txn, new_child->GetHighFence(txn)));
   while (auto foster = parent->GetFoster(txn)) {
     const FosterPair& foster_pair = foster.Value();
-    parent = txn.PageManager()->GetPage(foster_pair.child_pid);
+    parent = txn.GetPageManager()->GetPage(foster_pair.child_pid);
     COERCE(parent->SetHighFence(txn, new_child->GetHighFence(txn)));
   }
   assert(!parent->GetFoster(txn).HasValue());
@@ -223,7 +223,7 @@ Status BPlusTree::SetFosterRecursively(Transaction& txn, PageRef& parent,
   }
   assert(s == Status::kNoSpace);
   PageRef new_foster_child =
-      txn.PageManager()->AllocateNewPage(txn, parent->Type());
+      txn.GetPageManager()->AllocateNewPage(txn, parent->Type());
   std::string middle;
   if (parent->Type() == PageType::kBranchPage) {
     parent->body.branch_page.Split(parent->PageID(), txn, foster_key,
@@ -270,7 +270,7 @@ Status BPlusTree::Update(Transaction& txn, std::string_view key,
 Status HandleFoster(Transaction& txn, PageRef& curr, std::string_view key) {
   if (auto curr_foster = curr->GetFoster(txn)) {
     const FosterPair& foster = curr_foster.Value();
-    PageRef right_page = txn.PageManager()->GetPage(foster.child_pid);
+    PageRef right_page = txn.GetPageManager()->GetPage(foster.child_pid);
     if (foster.key <= key) {
       if (right_page->RowCount() == 1) {
         if (curr->RowCount() == 1) {
@@ -300,13 +300,13 @@ Status HandleFoster(Transaction& txn, PageRef& curr, std::string_view key) {
 }
 
 Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
-  PageRef curr = txn.PageManager()->GetPage(root_);
+  PageRef curr = txn.GetPageManager()->GetPage(root_);
   STATUS(HandleFoster(txn, curr, key), "Foster operation must success");
   if (curr->RowCount() == 1 && curr->PageID() == root_ &&
       curr->Type() == PageType::kBranchPage) {
     PageRef prev_page =
-        txn.PageManager()->GetPage(curr->body.branch_page.lowest_page_);
-    PageRef next_page = txn.PageManager()->GetPage(curr->GetPage(0));
+        txn.GetPageManager()->GetPage(curr->body.branch_page.lowest_page_);
+    PageRef next_page = txn.GetPageManager()->GetPage(curr->GetPage(0));
     if ((key < curr->GetKey(0) && prev_page->RowCount() == 1 &&
          !prev_page->GetFoster(txn)) ||
         (curr->GetKey(0) <= key && next_page->RowCount() == 1 &&
@@ -323,11 +323,11 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
         if (auto foster = prev_page->GetFoster(txn)) {
           const FosterPair& foster_pair = foster.Value();
           PageRef child_page =
-              txn.PageManager()->GetPage(foster_pair.child_pid);
+              txn.GetPageManager()->GetPage(foster_pair.child_pid);
           for (;;) {
             if (auto child_foster = child_page->GetFoster(txn)) {
               const FosterPair& grand_foster = child_foster.Value();
-              child_page = txn.PageManager()->GetPage(grand_foster.child_pid);
+              child_page = txn.GetPageManager()->GetPage(grand_foster.child_pid);
               continue;
             }
             break;
@@ -362,7 +362,7 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
               foster_root_pid = fp.child_pid;
               foster_key = fp.key;
             }
-            foster_parent = txn.PageManager()->GetPage(fp.child_pid);
+            foster_parent = txn.GetPageManager()->GetPage(fp.child_pid);
           }
           COERCE(foster_parent->SetFoster(
               txn, FosterPair(old_key, next_page->PageID())));
@@ -385,7 +385,7 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
     if (auto foster_pair = curr->GetFoster(txn)) {
       const FosterPair& foster = foster_pair.Value();
       if (foster.key <= key) {
-        PageRef next = txn.PageManager()->GetPage(foster.child_pid);
+        PageRef next = txn.GetPageManager()->GetPage(foster.child_pid);
         if (next->RowCount() == 1) {
           COERCE(curr->MoveRightToFoster(txn, *next));
         }
@@ -397,21 +397,21 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
     int next_idx = curr->body.branch_page.Search(key, false);
     PageRef next_page =
         next_idx < 0
-            ? txn.PageManager()->GetPage(curr->body.branch_page.lowest_page_)
-            : txn.PageManager()->GetPage(
+            ? txn.GetPageManager()->GetPage(curr->body.branch_page.lowest_page_)
+            : txn.GetPageManager()->GetPage(
                   curr->body.branch_page.GetValue(next_idx));
     if (next_page->RowCount() == 1 && !next_page->GetFoster(txn)) {
       if (next_idx < curr->RowCount() - 1) {
         // To avoid empty node, make the node have sibling.
         // Make right sibling a foster child and rebalance.
         std::string_view next_key = curr->body.branch_page.GetKey(next_idx + 1);
-        PageRef new_foster = txn.PageManager()->GetPage(
+        PageRef new_foster = txn.GetPageManager()->GetPage(
             curr->body.branch_page.GetValue(next_idx + 1));
         COERCE(SetFosterRecursively(txn, next_page, new_foster, next_key));
         COERCE(curr->Delete(txn, next_key));
       } else {
         // Make this foster child of left sibling.
-        PageRef new_foster_parent = txn.PageManager()->GetPage(
+        PageRef new_foster_parent = txn.GetPageManager()->GetPage(
             curr->body.branch_page.GetValue(next_idx - 1));
         std::string_view next_key = curr->GetKey(curr->RowCount() - 1);
         COERCE(
@@ -428,7 +428,7 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
     if (auto foster_pair = curr->GetFoster(txn)) {
       const FosterPair& foster = foster_pair.Value();
       if (foster.key <= key) {
-        PageRef next = txn.PageManager()->GetPage(foster.child_pid);
+        PageRef next = txn.GetPageManager()->GetPage(foster.child_pid);
         if (1 < next->RowCount()) {
           curr = std::move(next);
         }
@@ -443,24 +443,24 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
 
 StatusOr<std::string_view> BPlusTree::Read(Transaction& txn,
                                            std::string_view key) const {
-  PageRef curr = txn.PageManager()->GetPage(root_);
+  PageRef curr = txn.GetPageManager()->GetPage(root_);
   while (curr->Type() == PageType::kBranchPage) {
     if (auto maybe_foster = curr->GetFoster(txn)) {
       const FosterPair& foster_child = maybe_foster.Value();
       if (foster_child.key <= key) {
-        curr = txn.PageManager()->GetPage(foster_child.child_pid);
+        curr = txn.GetPageManager()->GetPage(foster_child.child_pid);
         continue;
       }
     }
     ASSIGN_OR_CRASH(page_id_t, maybe_next,
                     curr->GetPageForKey(txn, key, false));
-    curr = txn.PageManager()->GetPage(maybe_next);
+    curr = txn.GetPageManager()->GetPage(maybe_next);
   }
   assert(curr->Type() == PageType::kLeafPage);
   while (auto maybe_foster = curr->GetFoster(txn)) {
     const FosterPair& foster_child = maybe_foster.Value();
     if (foster_child.key <= key) {
-      curr = txn.PageManager()->GetPage(foster_child.child_pid);
+      curr = txn.GetPageManager()->GetPage(foster_child.child_pid);
       continue;
     }
     break;
@@ -503,7 +503,7 @@ void DumpLeafPage(Transaction& txn, PageRef& page, std::ostream& o,
     o << Indent(indent) << " | F[" << foster.child_pid
       << "]: " << HeadString(foster.key, 80) << " from [" << page->PageID()
       << "]\n";
-    PageRef child = txn.PageManager()->GetPage(foster.child_pid);
+    PageRef child = txn.GetPageManager()->GetPage(foster.child_pid);
     o << Indent(indent + 1);
     DumpLeafPage(txn, child, o, indent + 1);
   }
@@ -517,7 +517,7 @@ void BPlusTree::DumpBranch(Transaction& txn, std::ostream& o, PageRef& page,
     DumpLeafPage(txn, page, o, indent);
   } else if (page->Type() == PageType::kBranchPage) {
     PageRef branch_page =
-        txn.PageManager()->GetPage(page->body.branch_page.lowest_page_);
+        txn.GetPageManager()->GetPage(page->body.branch_page.lowest_page_);
     DumpBranch(txn, o, branch_page, indent + 4);
     if (page->RowCount() == 0) {
       o << Indent(indent) << "(No Slot for " << page->PageID() << ")\n";
@@ -529,14 +529,14 @@ void BPlusTree::DumpBranch(Transaction& txn, std::ostream& o, PageRef& page,
         << "]: " << page->GetLowFence(txn) << "~" << page->GetHighFence(txn)
         << ": " << OmittedString(key, 20) << "\n";
       ASSIGN_OR_CRASH(page_id_t, pid, page->GetPageForKey(txn, key, false));
-      PageRef current_page = txn.PageManager()->GetPage(pid);
+      PageRef current_page = txn.GetPageManager()->GetPage(pid);
       DumpBranch(txn, o, current_page, indent + 4);
     }
     if (auto maybe_foster = page->GetFoster(txn)) {
       const FosterPair& foster = maybe_foster.Value();
       o << Indent(indent) << " | branch foster["
         << OmittedString(foster.key, 10) << "]\n";
-      PageRef child = txn.PageManager()->GetPage(foster.child_pid);
+      PageRef child = txn.GetPageManager()->GetPage(foster.child_pid);
       o << Indent(indent + 1);
       DumpBranch(txn, o, child, indent + 1);
     }
@@ -547,7 +547,7 @@ void BPlusTree::DumpBranch(Transaction& txn, std::ostream& o, PageRef& page,
 }
 
 void BPlusTree::Dump(Transaction& txn, std::ostream& o, int indent) const {
-  PageRef root_page = txn.PageManager()->GetPage(root_);
+  PageRef root_page = txn.GetPageManager()->GetPage(root_);
   if (root_page->Type() == PageType::kLeafPage) {
     DumpLeafPage(txn, root_page, o, indent);
   } else {

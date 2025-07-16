@@ -51,4 +51,9 @@ void SelectionPlan::Dump(std::ostream& o, int indent) const {
   src_->Dump(o, indent + 2);
 }
 
+std::string SelectionPlan::ToString() const {
+  return "Select: [" + exp_->ToString() +
+         "] (estimated cost: " + std::to_string(AccessRowCount()) + ")";
+}
+
 }  // namespace tinylamb

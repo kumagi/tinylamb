@@ -51,6 +51,7 @@ class IndexScanPlan : public PlanBase {
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
   void Dump(std::ostream& o, int indent) const override;
+  [[nodiscard]] std::string ToString() const override;
 
  private:
   const Table& table_;

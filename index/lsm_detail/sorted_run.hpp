@@ -152,11 +152,11 @@ class SortedRun {
 
     [[nodiscard]] std::string Key() const {
       assert(IsValid());
-      return Entry().BuildKey(*blob_);
+      return GetEntry().BuildKey(*blob_);
     }
     [[nodiscard]] std::string Value() const {
       assert(IsValid());
-      return Entry().BuildValue(*blob_);
+      return GetEntry().BuildValue(*blob_);
     }
     [[nodiscard]] int Compare(const Iterator& rhs) const {
       assert(IsValid());
@@ -166,9 +166,9 @@ class SortedRun {
         LOG(ERROR) << rhs.offset_ << " vs " << rhs.parent_->Size();
       }
       assert(rhs.offset_ < rhs.parent_->Size());
-      return Entry().Compare(rhs.Entry(), *blob_);
+      return GetEntry().Compare(rhs.GetEntry(), *blob_);
     }
-    [[nodiscard]] Entry Entry() const { return parent_->GetEntry(offset_); }
+    [[nodiscard]] Entry GetEntry() const { return parent_->GetEntry(offset_); }
     [[nodiscard]] bool IsValid() const { return offset_ < parent_->Size(); }
     Iterator& operator++() {
       ++offset_;
@@ -215,13 +215,13 @@ class SortedRun {
   static void FlushInternal(const std::filesystem::path& path,
                             std::string_view min, std::string_view max,
                             const std::vector<Entry>& index, size_t generation);
+  [[nodiscard]] Entry GetEntry(size_t offset) const;
 
  private:
   static size_t FileOffset() {
     return reinterpret_cast<intptr_t>(
         &reinterpret_cast<SortedRun*>(NULL)->index_);
   }
-  [[nodiscard]] Entry GetEntry(size_t offset) const;
 
   std::string min_key_;
   std::string max_key_;

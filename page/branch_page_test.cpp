@@ -541,7 +541,7 @@ TEST_F(BranchPageTest, MoveLeftFromFoster1) {
   page->SetLowestValue(txn, 12);
   page->InsertBranch(txn, "a", 13);
   PageRef foster =
-      txn.PageManager()->AllocateNewPage(txn, PageType::kBranchPage);
+      txn.GetPageManager()->AllocateNewPage(txn, PageType::kBranchPage);
   foster->SetLowestValue(txn, 14);
   foster->InsertBranch(txn, "c", 15);
   foster->InsertBranch(txn, "d", 16);

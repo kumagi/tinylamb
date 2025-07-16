@@ -33,7 +33,7 @@ namespace tinylamb {
 FullScanIterator::FullScanIterator(const Table* table, Transaction* txn)
     : table_(table), txn_(txn), pos_(table_->first_pid_, 0) {
   txn_->AddReadSet(pos_);
-  PageRef page = txn->PageManager()->GetPage(pos_.page_id);
+  PageRef page = txn->GetPageManager()->GetPage(pos_.page_id);
   if (page->RowCount() == 0) {
     pos_.page_id = ~0LLU;
     return;
@@ -47,7 +47,7 @@ FullScanIterator::FullScanIterator(const Table* table, Transaction* txn)
 
 IteratorBase& FullScanIterator::operator++() {
   PageRef ref = [&]() {
-    PageRef ref = txn_->PageManager()->GetPage(pos_.page_id);
+    PageRef ref = txn_->GetPageManager()->GetPage(pos_.page_id);
     if (++pos_.slot < ref->RowCount()) {
       return ref;
     }
@@ -58,7 +58,7 @@ IteratorBase& FullScanIterator::operator++() {
       return PageRef();
     }
     pos_.slot = 0;
-    return txn_->PageManager()->GetPage(pos_.page_id);
+    return txn_->GetPageManager()->GetPage(pos_.page_id);
   }();
   if (!ref.IsValid()) {
     current_row_.Clear();

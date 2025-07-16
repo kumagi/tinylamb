@@ -95,4 +95,17 @@ void ProjectionPlan::Dump(std::ostream& o, int indent) const {
   o << "} (estimated cost: " << AccessRowCount() << ")\n" << Indent(indent + 2);
   src_->Dump(o, indent + 2);
 }
+
+std::string ProjectionPlan::ToString() const {
+  std::string s = "Project: {";
+  for (size_t i = 0; i < columns_.size(); ++i) {
+    if (0 < i) {
+      s += ", ";
+    }
+    s += columns_[i].name;
+  }
+  s += "} (estimated cost: " + std::to_string(AccessRowCount()) + ")";
+  return s;
+}
 }  // namespace tinylamb
+

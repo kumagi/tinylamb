@@ -55,7 +55,7 @@ Decoder& operator>>(Decoder& d, Table::IndexValueType& t) {
 Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
   {
     PageRef root_page =
-        txn.PageManager()->AllocateNewPage(txn, PageType::kLeafPage);
+        txn.GetPageManager()->AllocateNewPage(txn, PageType::kLeafPage);
     page_id_t new_root = root_page->PageID();
     indexes_.emplace_back(idx.name_, idx.key_, root_page->PageID(),
                           idx.include_, idx.mode_);
@@ -71,7 +71,7 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
 }
 
 StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
-  PageRef ref = txn.PageManager()->GetPage(last_pid_);
+  PageRef ref = txn.GetPageManager()->GetPage(last_pid_);
   std::string serialized_row(row.Size(), ' ');
   row.Serialize(serialized_row.data());
   StatusOr<slot_t> pos = ref->Insert(txn, serialized_row);
@@ -83,7 +83,7 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
     bool finished = false;
     while (ref->body.row_page.next_page_id_ != 0) {
       PageRef next =
-          txn.PageManager()->GetPage(ref->body.row_page.next_page_id_);
+          txn.GetPageManager()->GetPage(ref->body.row_page.next_page_id_);
       ref = std::move(next);
       StatusOr<slot_t> next_pos = ref->Insert(txn, serialized_row);
       if (next_pos.GetStatus() == Status::kSuccess) {
@@ -95,7 +95,7 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
     }
     if (!finished) {
       PageRef new_page =
-          txn.PageManager()->AllocateNewPage(txn, PageType::kRowPage);
+          txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage);
       ASSIGN_OR_RETURN(slot_t, new_pos, new_page->Insert(txn, serialized_row));
       rp.page_id = new_page->PageID();
       rp.slot = new_pos;
@@ -123,14 +123,14 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   }
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
-  PageRef page = txn.PageManager()->GetPage(new_pos.page_id);
+  PageRef page = txn.GetPageManager()->GetPage(new_pos.page_id);
   Status s = page->Update(txn, new_pos.slot, serialized_row);
   if (s == Status::kNoSpace) {
     page->Delete(txn, new_pos.slot);
     bool finished = false;
     while (page->body.row_page.next_page_id_ != 0) {
       page_id_t next_page = page->body.row_page.next_page_id_;
-      page = txn.PageManager()->GetPage(next_page);
+      page = txn.GetPageManager()->GetPage(next_page);
       StatusOr<slot_t> next_pos = page->Insert(txn, serialized_row);
       if (next_pos.HasValue()) {
         new_pos.page_id = page->PageID();
@@ -141,12 +141,12 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     }
     if (!finished) {
       PageRef new_page =
-          txn.PageManager()->AllocateNewPage(txn, PageType::kRowPage);
+          txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage);
       ASSIGN_OR_RETURN(slot_t, new_slot, new_page->Insert(txn, serialized_row));
       RowPosition new_row_pos(new_page->PageID(), new_slot);
       page.PageUnlock();
       {
-        PageRef last_page = txn.PageManager()->GetPage(last_pid_);
+        PageRef last_page = txn.GetPageManager()->GetPage(last_pid_);
         last_page->body.row_page.next_page_id_ = new_page->PageID();
         new_page->body.row_page.prev_page_id_ = last_page->PageID();
       }
@@ -167,13 +167,13 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
   for (const auto& idx : indexes_) {
     RETURN_IF_FAIL(IndexDelete(txn, idx, pos));
   }
-  return txn.PageManager()->GetPage(pos.page_id)->Delete(txn, pos.slot);
+  return txn.GetPageManager()->GetPage(pos.page_id)->Delete(txn, pos.slot);
 }
 
 StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
   ASSIGN_OR_RETURN(
       std::string_view, read_row,
-      txn.PageManager()->GetPage(pos.page_id)->Read(txn, pos.slot));
+      txn.GetPageManager()->GetPage(pos.page_id)->Read(txn, pos.slot));
   Row result;
   result.Deserialize(read_row.data(), schema_);
   return result;

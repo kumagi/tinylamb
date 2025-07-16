@@ -46,4 +46,9 @@ void FullScanPlan::Dump(std::ostream& o, int /*indent*/) const {
     << "(estimated cost: " << AccessRowCount() << ")";
 }
 
+std::string FullScanPlan::ToString() const {
+  return "FullScan: " + std::string(table_.GetSchema().Name()) +
+         "(estimated cost: " + std::to_string(AccessRowCount()) + ")";
+}
+
 }  // namespace tinylamb

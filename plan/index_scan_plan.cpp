@@ -69,4 +69,9 @@ void IndexScanPlan::Dump(std::ostream& o, int /*indent*/) const {
     << " (estimated cost: " << AccessRowCount() << ")";
 }
 
+std::string IndexScanPlan::ToString() const {
+  return "IndexScan: " + std::string(table_.GetSchema().Name()) +
+         " (estimated cost: " + std::to_string(AccessRowCount()) + ")";
+}
+
 }  // namespace tinylamb

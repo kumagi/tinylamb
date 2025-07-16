@@ -69,7 +69,7 @@ void LSMView::CreateSingleRun(const std::filesystem::path& path) const {
 
   size_t pos = 0;
   while (it.IsValid()) {
-    merged.push_back(it.TopIterator().Entry());
+    merged.push_back(it.TopIterator().GetEntry());
     if (++pos == merged.size()) {
       max_key = it.Key();
     }
@@ -127,7 +127,7 @@ LSMView::Iterator::Iterator(const LSMView* vm, bool head) : vm_(vm) {
 
 std::string LSMView::Iterator::Value() const { return iters_[0].Value(); }
 
-SortedRun::Entry LSMView::Iterator::Entry() const { return iters_[0].Entry(); }
+SortedRun::Entry LSMView::Iterator::GetEntry() const { return iters_[0].GetEntry(); }
 
 // Treats invalid iterator as infinity big.
 bool IsRightIteratorBigger(int left, int right,

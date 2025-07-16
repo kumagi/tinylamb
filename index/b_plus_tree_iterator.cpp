@@ -63,16 +63,16 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
 
 std::string BPlusTreeIterator::Key() const {
   return std::string(
-      txn_->PageManager()->GetPage(pid_)->body.leaf_page.GetKey(idx_));
+      txn_->GetPageManager()->GetPage(pid_)->body.leaf_page.GetKey(idx_));
 }
 
 std::string BPlusTreeIterator::Value() const {
   return std::string(
-      txn_->PageManager()->GetPage(pid_)->body.leaf_page.GetValue(idx_));
+      txn_->GetPageManager()->GetPage(pid_)->body.leaf_page.GetValue(idx_));
 }
 
 BPlusTreeIterator& BPlusTreeIterator::operator++() {
-  PageRef ref = txn_->PageManager()->GetPage(pid_);
+  PageRef ref = txn_->GetPageManager()->GetPage(pid_);
   LeafPage* const lp = &ref->body.leaf_page;
   idx_++;
   if (lp->row_count_ <= idx_) {
@@ -83,7 +83,7 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
     if (auto foster = ref->GetFoster(*txn_)) {
       const FosterPair& foster_pair = foster.Value();
       pid_ = foster_pair.child_pid;
-      PageRef next_ref = txn_->PageManager()->GetPage(pid_);
+      PageRef next_ref = txn_->GetPageManager()->GetPage(pid_);
       ref.PageUnlock();
       idx_ = 0;
       if (next_ref->body.leaf_page.row_count_ == 0 ||
@@ -116,7 +116,7 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
 }
 
 BPlusTreeIterator& BPlusTreeIterator::operator--() {
-  PageRef ref = txn_->PageManager()->GetPage(pid_);
+  PageRef ref = txn_->GetPageManager()->GetPage(pid_);
   LeafPage* const lp = &ref->body.leaf_page;
   if (0 == idx_) {
     if (pid_ == 0) {

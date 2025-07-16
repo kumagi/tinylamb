@@ -23,6 +23,10 @@
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/unary_expression.hpp"
+#include "expression/aggregate_expression.hpp"
+#include "expression/case_expression.hpp"
+#include "expression/in_expression.hpp"
 #include "type/column_name.hpp"
 #include "type/value.hpp"
 
@@ -47,6 +51,26 @@ const ConstantValue& ExpressionBase::AsConstantValue() const {
   return reinterpret_cast<const ConstantValue&>(*this);
 }
 
+const UnaryExpression& ExpressionBase::AsUnaryExpression() const {
+  assert(Type() == TypeTag::kUnaryExp);
+  return reinterpret_cast<const UnaryExpression&>(*this);
+}
+
+const AggregateExpression& ExpressionBase::AsAggregateExpression() const {
+  assert(Type() == TypeTag::kAggregateExp);
+  return reinterpret_cast<const AggregateExpression&>(*this);
+}
+
+const CaseExpression& ExpressionBase::AsCaseExpression() const {
+  assert(Type() == TypeTag::kCaseExp);
+  return reinterpret_cast<const CaseExpression&>(*this);
+}
+
+const InExpression& ExpressionBase::AsInExpression() const {
+  assert(Type() == TypeTag::kInExp);
+  return reinterpret_cast<const InExpression&>(*this);
+}
+
 std::unordered_set<ColumnName> ExpressionBase::TouchedColumns() const {
   std::unordered_set<ColumnName> ret;
   switch (Type()) {
@@ -63,6 +87,35 @@ std::unordered_set<ColumnName> ExpressionBase::TouchedColumns() const {
     }
     case TypeTag::kConstantValue:
       break;
+    case TypeTag::kUnaryExp: {
+      const UnaryExpression& ue = AsUnaryExpression();
+      ret.merge(ue.Child()->TouchedColumns());
+      break;
+    }
+    case TypeTag::kAggregateExp: {
+      const AggregateExpression& ae = AsAggregateExpression();
+      ret.merge(ae.Child()->TouchedColumns());
+      break;
+    }
+    case TypeTag::kCaseExp: {
+      const CaseExpression& ce = AsCaseExpression();
+      for (const auto& when : ce.when_clauses_) {
+        ret.merge(when.first->TouchedColumns());
+        ret.merge(when.second->TouchedColumns());
+      }
+      if (ce.else_clause_) {
+        ret.merge(ce.else_clause_->TouchedColumns());
+      }
+      break;
+    }
+    case TypeTag::kInExp: {
+      const InExpression& ie = AsInExpression();
+      ret.merge(ie.child_->TouchedColumns());
+      for (const auto& item : ie.list_) {
+        ret.merge(item->TouchedColumns());
+      }
+      break;
+    }
   }
   return ret;
 }
@@ -83,5 +136,24 @@ Expression BinaryExpressionExp(Expression left, BinaryOperation op,
                                Expression right) {
   return std::make_shared<BinaryExpression>(std::move(left), op,
                                             std::move(right));
+}
+
+Expression UnaryExpressionExp(Expression child, UnaryOperation op) {
+  return std::make_shared<UnaryExpression>(std::move(child), op);
+}
+
+Expression AggregateExpressionExp(AggregationType type, Expression child) {
+  return std::make_shared<AggregateExpression>(type, std::move(child));
+}
+
+Expression CaseExpressionExp(
+    std::vector<std::pair<Expression, Expression>> when_clauses,
+    Expression else_clause) {
+  return std::make_shared<CaseExpression>(std::move(when_clauses),
+                                           std::move(else_clause));
+}
+
+Expression InExpressionExp(Expression child, std::vector<Expression> list) {
+  return std::make_shared<InExpression>(std::move(child), std::move(list));
 }
 }  // namespace tinylamb
