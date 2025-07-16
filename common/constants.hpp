@@ -104,6 +104,40 @@ enum class BinaryOperation {
   kXor,
 };
 
+inline std::string_view ToString(BinaryOperation op) {
+  switch (op) {
+    case BinaryOperation::kAdd:
+      return "+";
+    case BinaryOperation::kSubtract:
+      return "-";
+    case BinaryOperation::kMultiply:
+      return "*";
+    case BinaryOperation::kDivide:
+      return "/";
+    case BinaryOperation::kModulo:
+      return "%";
+    case BinaryOperation::kEquals:
+      return "=";
+    case BinaryOperation::kNotEquals:
+      return "!=";
+    case BinaryOperation::kLessThan:
+      return "<";
+    case BinaryOperation::kLessThanEquals:
+      return "<=";
+    case BinaryOperation::kGreaterThan:
+      return ">";
+    case BinaryOperation::kGreaterThanEquals:
+      return ">=";
+    case BinaryOperation::kAnd:
+      return "AND";
+    case BinaryOperation::kOr:
+      return "OR";
+    case BinaryOperation::kXor:
+      return "XOR";
+  }
+  return "INVALID";
+}
+
 inline bool IsComparison(enum BinaryOperation op) {
   switch (op) {
     case BinaryOperation::kEquals:

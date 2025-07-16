@@ -33,6 +33,7 @@ add_library(libtinylamb_parser
         STATIC
         parser/tokenizer.cpp
         parser/parser.cpp
+        parser/pratt_parser.cpp
 )
 
 add_library(libtinylamb
@@ -65,7 +66,8 @@ add_library(libtinylamb
         database/transaction_context.cpp executor/insert.cpp
         executor/update.cpp plan/index_scan_plan.cpp executor/index_scan.cpp
         executor/index_only_scan.cpp type/column_name.cpp query/query_data.cpp
-        expression/named_expression.cpp executor/index_join.cpp
+                expression/named_expression.cpp executor/index_join.cpp
+        executor/constant_executor.cpp
         index/lsm_tree.cpp
         index/lsm_detail/lsm_view.cpp
         index/lsm_detail/blob_file.cpp
@@ -182,6 +184,9 @@ add_simple_test(index/lsm_detail/lsm_view_test.cpp)
 add_simple_test(index/lsm_detail/cache_test.cpp)
 add_simple_test(index/lsm_detail/sorted_run_test.cpp)
 add_simple_test(parser/parser_test.cpp)
+add_simple_test(parser/tokenizer_test.cpp)
+add_simple_test(parser/pratt_parser_test.cpp)
+add_simple_test(query/query_test.cpp)
 
 # Concurrency tests.
 add_simple_test(page/row_page_concurrent_test.cpp)

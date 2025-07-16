@@ -18,6 +18,7 @@
 #define TINYLAMB_TOKEN_HPP
 
 #include <string>
+#include <string_view>
 
 namespace tinylamb {
 
@@ -38,6 +39,34 @@ enum class TokenType {
 struct Token {
   TokenType type;
   std::string value;
+
+  [[nodiscard]] std::string ToString() const {
+    switch (type) {
+      case TokenType::kIdentifier:
+        return "Identifier<" + value + ">";
+      case TokenType::kNumeric:
+        return "Numeric<" + value + ">";
+      case TokenType::kString:
+        return "String<" + value + ">";
+      case TokenType::kComma:
+        return "Comma";
+      case TokenType::kLParen:
+        return "LParen";
+      case TokenType::kRParen:
+        return "RParen";
+      case TokenType::kSemicolon:
+        return "Semicolon";
+      case TokenType::kOperator:
+        return "Operator<" + value + ">";
+      case TokenType::kKeyword:
+        return "Keyword<" + value + ">";
+      case TokenType::kEof:
+        return "Eof";
+      case TokenType::kUnknown:
+        return "Unknown<" + value + ">";
+    }
+    return "INVALID_TOKEN_TYPE";
+  }
 };
 
 }  // namespace tinylamb

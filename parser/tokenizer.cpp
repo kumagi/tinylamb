@@ -30,6 +30,10 @@ Tokenizer::Tokenizer(const std::string& sql) : sql_(sql) {}
 std::vector<Token> Tokenizer::Tokenize() {
   std::vector<Token> tokens;
   while (pos_ < sql_.size()) {
+    SkipWhitespace();
+    if (pos_ >= sql_.size()) {
+      break;
+    }
     tokens.push_back(NextToken());
   }
   tokens.push_back({TokenType::kEof, ""});
@@ -37,10 +41,6 @@ std::vector<Token> Tokenizer::Tokenize() {
 }
 
 Token Tokenizer::NextToken() {
-  SkipWhitespace();
-  if (pos_ >= sql_.size()) {
-    return {TokenType::kEof, ""};
-  }
   char c = Peek();
   if (std::isalpha(c)) {
     return Keyword();

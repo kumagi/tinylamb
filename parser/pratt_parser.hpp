@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef TINYLAMB_PARSER_HPP
-#define TINYLAMB_PARSER_HPP
+#ifndef TINYLAMB_PRATT_PARSER_HPP
+#define TINYLAMB_PRATT_PARSER_HPP
 
 #include <memory>
 #include <vector>
@@ -25,20 +25,12 @@
 
 namespace tinylamb {
 
-class Parser {
+class PrattParser {
  public:
-  explicit Parser(const std::vector<Token>& tokens);
-  std::unique_ptr<Statement> Parse();
+  explicit PrattParser(const std::vector<Token>& tokens);
   Expression ParseExpression(int precedence = 0);
 
  private:
-  std::unique_ptr<Statement> ParseCreateTable();
-  std::unique_ptr<Statement> ParseDropTable();
-  std::unique_ptr<Statement> ParseSelect();
-  std::unique_ptr<Statement> ParseInsert();
-  std::unique_ptr<Statement> ParseUpdate();
-  std::unique_ptr<Statement> ParseDelete();
-
   Expression ParsePrimary();
   Expression ParseUnary();
   int GetPrecedence();
@@ -53,4 +45,4 @@ class Parser {
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_PARSER_HPP
+#endif  // TINYLAMB_PRATT_PARSER_HPP

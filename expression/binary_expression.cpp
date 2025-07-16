@@ -58,59 +58,14 @@ Value Execute(BinaryOperation op, const Value& left, const Value& right) {
 }  // anonymous namespace
 
 Value BinaryExpression::Evaluate(const Row& row, const Schema& schema) const {
-  return Execute(operation_, left_->Evaluate(row, schema),
+  return Execute(op_, left_->Evaluate(row, schema),
                  right_->Evaluate(row, schema));
 }
 
 std::string BinaryExpression::ToString() const {
-  std::stringstream ss;
-  ss << left_->ToString();
-  switch (operation_) {
-    case BinaryOperation::kAdd:
-      ss << " + ";
-      break;
-    case BinaryOperation::kSubtract:
-      ss << " - ";
-      break;
-    case BinaryOperation::kMultiply:
-      ss << " * ";
-      break;
-    case BinaryOperation::kDivide:
-      ss << " / ";
-      break;
-    case BinaryOperation::kModulo:
-      ss << " % ";
-      break;
-    case BinaryOperation::kEquals:
-      ss << " = ";
-      break;
-    case BinaryOperation::kNotEquals:
-      ss << " != ";
-      break;
-    case BinaryOperation::kLessThan:
-      ss << " < ";
-      break;
-    case BinaryOperation::kLessThanEquals:
-      ss << " <= ";
-      break;
-    case BinaryOperation::kGreaterThan:
-      ss << " > ";
-      break;
-    case BinaryOperation::kGreaterThanEquals:
-      ss << " >= ";
-      break;
-    case BinaryOperation::kAnd:
-      ss << " AND ";
-      break;
-    case BinaryOperation::kOr:
-      ss << " OR ";
-      break;
-    case BinaryOperation::kXor:
-      ss << " XOR ";
-      break;
-  }
-  ss << right_->ToString();
-  return ss.str();
+  std::stringstream o;
+  o << *left_ << " " << tinylamb::ToString(op_) << " " << *right_;
+  return o.str();
 }
 
 void BinaryExpression::Dump(std::ostream& o) const { o << ToString(); }

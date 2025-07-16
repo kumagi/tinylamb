@@ -27,20 +27,20 @@ namespace tinylamb {
 class BinaryExpression : public ExpressionBase {
  public:
   BinaryExpression(Expression left, BinaryOperation op, Expression right)
-      : left_(std::move(left)), right_(std::move(right)), operation_(op) {}
+      : left_(std::move(left)), right_(std::move(right)), op_(op) {}
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kBinaryExp; }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
-  [[nodiscard]] Expression Left() const { return left_; }
-  [[nodiscard]] BinaryOperation Op() const { return operation_; }
-  [[nodiscard]] Expression Right() const { return right_; }
-  [[nodiscard]] std::string ToString() const override;
+  [[nodiscard]] BinaryOperation Op() const { return op_; }
+  [[nodiscard]] const Expression& Left() const { return left_; }
+  [[nodiscard]] const Expression& Right() const { return right_; }
+  std::string ToString() const override;
   void Dump(std::ostream& o) const override;
 
  private:
   Expression left_;
   Expression right_;
-  BinaryOperation operation_;
+  BinaryOperation op_;
 };
 
 }  // namespace tinylamb

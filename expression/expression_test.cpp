@@ -430,7 +430,7 @@ TEST(ExpressionTest, CaseExpression) {
   Row dummy({});
   Schema dummy_schema;
 
-  Expression case_exp = CaseExpressionExp(
+  Expression case_exp_true = CaseExpressionExp(
       {{BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kEquals,
                             ConstantValueExp(Value(1))),
         ConstantValueExp(Value("one"))},
@@ -438,23 +438,84 @@ TEST(ExpressionTest, CaseExpression) {
                             ConstantValueExp(Value(1))),
         ConstantValueExp(Value("two"))}},
       ConstantValueExp(Value("other")));
-  ASSERT_EQ(case_exp->Evaluate(dummy, dummy_schema), Value("one"));
+  ASSERT_EQ(case_exp_true->Evaluate(dummy, dummy_schema), Value("one"));
+
+  Expression case_exp_false = CaseExpressionExp(
+      {{BinaryExpressionExp(ConstantValueExp(Value(2)), BinaryOperation::kEquals,
+                            ConstantValueExp(Value(1))),
+        ConstantValueExp(Value("one"))},
+       {BinaryExpressionExp(ConstantValueExp(Value(2)), BinaryOperation::kEquals,
+                            ConstantValueExp(Value(1))),
+        ConstantValueExp(Value("two"))}},
+      ConstantValueExp(Value("other")));
+  ASSERT_EQ(case_exp_false->Evaluate(dummy, dummy_schema), Value("other"));
 }
 
 TEST(ExpressionTest, InExpression) {
   Row dummy({});
   Schema dummy_schema;
 
-  Expression in_exp = InExpressionExp(
+  Expression in_exp_true = InExpressionExp(
       ConstantValueExp(Value(1)),
       {ConstantValueExp(Value(1)), ConstantValueExp(Value(2)),
        ConstantValueExp(Value(3))});
-  Expression not_in_exp = InExpressionExp(
+  Expression in_exp_false = InExpressionExp(
       ConstantValueExp(Value(4)),
       {ConstantValueExp(Value(1)), ConstantValueExp(Value(2)),
        ConstantValueExp(Value(3))});
-  ASSERT_EQ(in_exp->Evaluate(dummy, dummy_schema), Value(true));
-  ASSERT_EQ(not_in_exp->Evaluate(dummy, dummy_schema), Value(false));
+  ASSERT_EQ(in_exp_true->Evaluate(dummy, dummy_schema), Value(true));
+  ASSERT_EQ(in_exp_false->Evaluate(dummy, dummy_schema), Value(false));
+}
+
+
+TEST(ExpressionTest, PathologicalCases) {
+  Row dummy({});
+  Schema dummy_schema;
+
+  // (1 + 2) * 3 = 9
+  Expression exp1 = BinaryExpressionExp(
+      BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kAdd,
+                          ConstantValueExp(Value(2))),
+      BinaryOperation::kMultiply, ConstantValueExp(Value(3)));
+  ASSERT_EQ(exp1->Evaluate(dummy, dummy_schema), Value(9));
+
+  // 1 + (2 * 3) = 7
+  Expression exp2 = BinaryExpressionExp(
+      ConstantValueExp(Value(1)), BinaryOperation::kAdd,
+      BinaryExpressionExp(ConstantValueExp(Value(2)),
+                          BinaryOperation::kMultiply,
+                          ConstantValueExp(Value(3))));
+  ASSERT_EQ(exp2->Evaluate(dummy, dummy_schema), Value(7));
+
+  // (true AND false) OR true = true
+  Expression exp3 = BinaryExpressionExp(
+      BinaryExpressionExp(ConstantValueExp(Value(true)), BinaryOperation::kAnd,
+                          ConstantValueExp(Value(false))),
+      BinaryOperation::kOr, ConstantValueExp(Value(true)));
+  ASSERT_EQ(exp3->Evaluate(dummy, dummy_schema), Value(true));
+
+  // true AND (false OR true) = true
+  Expression exp4 = BinaryExpressionExp(
+      ConstantValueExp(Value(true)), BinaryOperation::kAnd,
+      BinaryExpressionExp(ConstantValueExp(Value(false)), BinaryOperation::kOr,
+                          ConstantValueExp(Value(true))));
+  ASSERT_EQ(exp4->Evaluate(dummy, dummy_schema), Value(true));
+
+  // ((1 + 2) * 3 - (4 / 2)) > 5 AND (true OR false) = (9 - 2) > 5 AND true = 7 >
+  // 5 AND true = true
+  Expression exp5 = BinaryExpressionExp(
+      BinaryExpressionExp(
+          BinaryExpressionExp(
+              BinaryExpressionExp(ConstantValueExp(Value(1)),
+                                  BinaryOperation::kAdd,
+                                  ConstantValueExp(Value(2))),
+              BinaryOperation::kMultiply, ConstantValueExp(Value(3))),
+          BinaryOperation::kSubtract,
+          BinaryExpressionExp(ConstantValueExp(Value(4)),
+                              BinaryOperation::kDivide,
+                              ConstantValueExp(Value(2)))),
+      BinaryOperation::kGreaterThan, ConstantValueExp(Value(5)));
+  ASSERT_EQ(exp5->Evaluate(dummy, dummy_schema), Value(true));
 }
 
 }  // namespace tinylamb

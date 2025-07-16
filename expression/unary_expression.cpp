@@ -34,10 +34,13 @@ Value UnaryExpression::Evaluate(const Row& row, const Schema& schema) const {
       return Value(!child.IsNull());
     case UnaryOperation::kNot:
       if (child.IsNull()) {
-        return Value(true);
+        return Value();
       }
       return Value(!child.Truthy());
     case UnaryOperation::kMinus:
+      if (child.type == ValueType::kDouble) {
+        return Value(-child.value.double_value);
+      }
       return Value(-child.value.int_value);
   }
 }
