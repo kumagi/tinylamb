@@ -16,8 +16,6 @@
 
 #include "b_plus_tree.hpp"
 
-#include <cstdlib>
-
 #include <cassert>
 #include <cstddef>
 #include <cstdlib>
@@ -327,7 +325,8 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
           for (;;) {
             if (auto child_foster = child_page->GetFoster(txn)) {
               const FosterPair& grand_foster = child_foster.Value();
-              child_page = txn.GetPageManager()->GetPage(grand_foster.child_pid);
+              child_page =
+                  txn.GetPageManager()->GetPage(grand_foster.child_pid);
               continue;
             }
             break;

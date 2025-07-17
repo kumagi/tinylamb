@@ -50,13 +50,18 @@ class PlanBase {
 
   virtual void Dump(std::ostream& o, int indent) const = 0;
   [[nodiscard]] virtual std::string ToString() const = 0;
-  friend std::ostream& operator<<(std::ostream& o, const PlanBase& p) {
-    p.Dump(o, 0);
-    return o;
-  }
+  friend std::ostream& operator<<(std::ostream& o, const PlanBase& p);
 };
 
 typedef std::shared_ptr<PlanBase> Plan;
-}  // namespace tinylamb
 
+inline std::ostream& operator<<(std::ostream& o, const Plan& p) {
+  if (p) {
+    p->Dump(o, 0);
+  } else {
+    o << "(null plan)";
+  }
+  return o;
+}
+}  // namespace tinylamb
 #endif  // TINYLAMB_PLAN_HPP

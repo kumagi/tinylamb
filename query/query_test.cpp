@@ -54,10 +54,9 @@ class QueryTest : public ::testing::Test {
     switch (stmt->Type()) {
       case StatementType::kCreateTable: {
         auto& create_table = dynamic_cast<CreateTableStatement&>(*stmt);
-        ASSIGN_OR_RETURN(
-            Table, table,
-            db_->CreateTable(ctx, Schema(create_table.TableName(),
-                                         create_table.Columns())));
+        ASSIGN_OR_RETURN(Table, table,
+                         db_->CreateTable(ctx, Schema(create_table.TableName(),
+                                                      create_table.Columns())));
         return {std::make_shared<ConstantExecutor>(
             Row({Value(0), Value("CREATE TABLE")}))};
       }
@@ -104,16 +103,15 @@ class QueryTest : public ::testing::Test {
 TEST_F(QueryTest, DISABLED_SimpleSelect) {
   TransactionContext ctx = db_->BeginContext();
   {
-    auto st = ExecuteQuery(ctx,
-                           "CREATE TABLE t1 (c1 INT, c2 INT, c3 VARCHAR(10));");
+    auto st =
+        ExecuteQuery(ctx, "CREATE TABLE t1 (c1 INT, c2 INT, c3 VARCHAR(10));");
     ASSERT_EQ(st.GetStatus(), Status::kSuccess);
     auto exec = std::move(st.Value());
     Row result;
     ASSERT_TRUE(exec->Next(&result, nullptr));
   }
   {
-    auto st =
-        ExecuteQuery(ctx, "INSERT INTO t1 VALUES (1, 10, 'hello');");
+    auto st = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (1, 10, 'hello');");
     ASSERT_EQ(st.GetStatus(), Status::kSuccess);
     auto exec = std::move(st.Value());
     Row result;
@@ -122,8 +120,7 @@ TEST_F(QueryTest, DISABLED_SimpleSelect) {
     ASSERT_FALSE(exec->Next(&result, nullptr));
   }
   {
-    auto st =
-        ExecuteQuery(ctx, "INSERT INTO t1 VALUES (2, 20, 'world');");
+    auto st = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (2, 20, 'world');");
     ASSERT_EQ(st.GetStatus(), Status::kSuccess);
     auto exec = std::move(st.Value());
     Row result;
@@ -148,18 +145,16 @@ TEST_F(QueryTest, DISABLED_SimpleSelect) {
 TEST_F(QueryTest, DISABLED_SelectWithProjection) {
   TransactionContext ctx = db_->BeginContext();
   {
-    auto st = ExecuteQuery(ctx,
-                           "CREATE TABLE t1 (c1 INT, c2 INT, c3 VARCHAR(10));");
+    auto st =
+        ExecuteQuery(ctx, "CREATE TABLE t1 (c1 INT, c2 INT, c3 VARCHAR(10));");
     ASSERT_EQ(st.GetStatus(), Status::kSuccess);
   }
   {
-    auto st =
-        ExecuteQuery(ctx, "INSERT INTO t1 VALUES (1, 10, 'hello');");
+    auto st = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (1, 10, 'hello');");
     ASSERT_EQ(st.GetStatus(), Status::kSuccess);
   }
   {
-    auto st =
-        ExecuteQuery(ctx, "INSERT INTO t1 VALUES (2, 20, 'world');");
+    auto st = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (2, 20, 'world');");
     ASSERT_EQ(st.GetStatus(), Status::kSuccess);
   }
   {

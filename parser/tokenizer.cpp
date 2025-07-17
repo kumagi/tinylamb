@@ -95,7 +95,8 @@ void Tokenizer::SkipWhitespace() {
 
 Token Tokenizer::Identifier() {
   size_t start = pos_;
-  while (pos_ < sql_.size() && (std::isalnum(sql_[pos_]) || sql_[pos_] == '_')) {
+  while (pos_ < sql_.size() &&
+         (std::isalnum(sql_[pos_]) || sql_[pos_] == '_')) {
     pos_++;
   }
   return {TokenType::kIdentifier, sql_.substr(start, pos_ - start)};
@@ -103,7 +104,8 @@ Token Tokenizer::Identifier() {
 
 Token Tokenizer::Numeric() {
   size_t start = pos_;
-  while (pos_ < sql_.size() && (std::isdigit(sql_[pos_]) || sql_[pos_] == '.')) {
+  while (pos_ < sql_.size() &&
+         (std::isdigit(sql_[pos_]) || sql_[pos_] == '.')) {
     pos_++;
   }
   return {TokenType::kNumeric, sql_.substr(start, pos_ - start)};
@@ -131,7 +133,8 @@ Token Tokenizer::Operator() {
 
 Token Tokenizer::Keyword() {
   size_t start = pos_;
-  while (pos_ < sql_.size() && (std::isalnum(sql_[pos_]) || sql_[pos_] == '_')) {
+  while (pos_ < sql_.size() &&
+         (std::isalnum(sql_[pos_]) || sql_[pos_] == '_')) {
     pos_++;
   }
   std::string value = sql_.substr(start, pos_ - start);

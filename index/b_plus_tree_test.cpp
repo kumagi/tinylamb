@@ -49,7 +49,7 @@
 
 namespace tinylamb {
 class BPlusTreeTest : public ::testing::Test {
-public:
+ public:
   void SetUp() override {
     std::string prefix = "b_plus_tree_test-" + RandomString();
     db_name_ = prefix + ".db";
@@ -74,15 +74,15 @@ public:
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique <PageManager>(db_name_, 110);
-    l_ = std::make_unique <Logger>(log_name_);
-    lm_ = std::make_unique <LockManager>();
-    r_ = std::make_unique <RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique <TransactionManager>(lm_.get(), p_.get(), l_.get(),
-                                                r_.get());
-    cm_ = std::make_unique <CheckpointManager>(master_record_name_, tm_.get(),
-                                               p_->GetPool(), 1);
-    bpt_ = std::make_unique <BPlusTree>(root);
+    p_ = std::make_unique<PageManager>(db_name_, 110);
+    l_ = std::make_unique<Logger>(log_name_);
+    lm_ = std::make_unique<LockManager>();
+    r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
+                                               r_.get());
+    cm_ = std::make_unique<CheckpointManager>(master_record_name_, tm_.get(),
+                                              p_->GetPool(), 1);
+    bpt_ = std::make_unique<BPlusTree>(root);
   }
 
   void TearDown() override {
@@ -100,17 +100,16 @@ public:
   std::string db_name_;
   std::string log_name_;
   std::string master_record_name_;
-  std::unique_ptr <LockManager> lm_;
-  std::unique_ptr <PageManager> p_;
-  std::unique_ptr <Logger> l_;
-  std::unique_ptr <RecoveryManager> r_;
-  std::unique_ptr <TransactionManager> tm_;
-  std::unique_ptr <CheckpointManager> cm_;
-  std::unique_ptr <BPlusTree> bpt_;
+  std::unique_ptr<LockManager> lm_;
+  std::unique_ptr<PageManager> p_;
+  std::unique_ptr<Logger> l_;
+  std::unique_ptr<RecoveryManager> r_;
+  std::unique_ptr<TransactionManager> tm_;
+  std::unique_ptr<CheckpointManager> cm_;
+  std::unique_ptr<BPlusTree> bpt_;
 };
 
-TEST_F(BPlusTreeTest, Construct) {
-}
+TEST_F(BPlusTreeTest, Construct) {}
 
 TEST_F(BPlusTreeTest, InsertLeaf) {
   auto txn = tm_->Begin();
@@ -136,7 +135,7 @@ TEST_F(BPlusTreeTest, SplitLeaf) {
   const std::string long_value(5000, 'v');
   for (int i = 0; i < kKeys; ++i) {
     ASSERT_SUCCESS(
-      bpt_->Insert(txn, key_prefix + std::to_string(i), long_value));
+        bpt_->Insert(txn, key_prefix + std::to_string(i), long_value));
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
   }
   for (int i = 0; i < kKeys; ++i) {
@@ -150,9 +149,9 @@ TEST_F(BPlusTreeTest, SplitLeaf) {
 TEST_F(BPlusTreeTest, SplitLeaf2) {
   constexpr int kSize = 2723;
   auto txn = tm_->Begin();
-  for (const auto& c: {'1', '2', '3', '4', '5', '6', '7', '8', '9'}) {
+  for (const auto& c : {'1', '2', '3', '4', '5', '6', '7', '8', '9'}) {
     ASSERT_SUCCESS(
-      bpt_->Insert(txn, std::string(kSize, c), std::string(kSize, c)));
+        bpt_->Insert(txn, std::string(kSize, c), std::string(kSize, c)));
   }
 }
 
@@ -160,7 +159,7 @@ TEST_F(BPlusTreeTest, SplitLeafBig) {
   constexpr static int kSize = 2000;
   auto txn = tm_->Begin();
   for (char i = 0; i < 10; ++i) {
-    std::string key(kSize, static_cast <char>('0' + i));
+    std::string key(kSize, static_cast<char>('0' + i));
     std::string value(kSize, '0' + i);
     ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
@@ -225,7 +224,7 @@ TEST_F(BPlusTreeTest, MergeBranch) {
 
 TEST_F(BPlusTreeTest, FullScanMultiLeafReverse) {
   auto txn = tm_->Begin();
-  for (const auto& c:
+  for (const auto& c :
        {'k', 'j', 'i', 'h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
     ASSERT_SUCCESS(bpt_->Insert(txn, std::string(5000, c), std::string(10, c)));
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
@@ -234,21 +233,23 @@ TEST_F(BPlusTreeTest, FullScanMultiLeafReverse) {
 
 TEST_F(BPlusTreeTest, FullScanMultiLeafMany) {
   auto txn = tm_->Begin();
-  for (const auto& c: {'a', 'b', 'c', 'd', 'e', 'f'}) {
+  for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f'}) {
     ASSERT_SUCCESS(bpt_->Insert(txn, std::string(5000, c), std::string(10, c)));
   }
   ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
 }
 
 TEST_F(BPlusTreeTest, Search) {
-  constexpr static size_t kPayloadSize = 5000; {
+  constexpr static size_t kPayloadSize = 5000;
+  {
     auto txn = tm_->Begin();
     for (int i = 0; i < 100; ++i) {
       ASSERT_SUCCESS(
-        bpt_->Insert(txn, KeyGen(i, kPayloadSize), KeyGen(i * 10, 200)));
+          bpt_->Insert(txn, KeyGen(i, kPayloadSize), KeyGen(i * 10, 200)));
     }
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     for (int i = 0; i < 100; ++i) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
@@ -261,21 +262,24 @@ TEST_F(BPlusTreeTest, Search) {
 
 TEST_F(BPlusTreeTest, Update) {
   constexpr static size_t kPayloadSize = 5000;
-  constexpr static size_t kCount = 200; {
+  constexpr static size_t kCount = 200;
+  {
     auto txn = tm_->Begin();
     for (size_t i = 0; i < kCount; ++i) {
       ASSERT_SUCCESS(
-        bpt_->Insert(txn, KeyGen(i, kPayloadSize), KeyGen(i * 10, 100)));
+          bpt_->Insert(txn, KeyGen(i, kPayloadSize), KeyGen(i * 10, 100)));
     }
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     for (size_t i = 0; i < kCount; i += 2) {
       ASSERT_SUCCESS(
-        bpt_->Update(txn, KeyGen(i, kPayloadSize), KeyGen(i * 2, 200)));
+          bpt_->Update(txn, KeyGen(i, kPayloadSize), KeyGen(i * 2, 200)));
     }
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     for (size_t i = 0; i < kCount; ++i) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
@@ -292,8 +296,9 @@ TEST_F(BPlusTreeTest, Update) {
 TEST_F(BPlusTreeTest, Delete) {
   constexpr int kCount = 50;
   constexpr int kKeyLength = 5000;
-  std::unordered_map <std::string, std::string> kvp;
-  kvp.reserve(kCount); {
+  std::unordered_map<std::string, std::string> kvp;
+  kvp.reserve(kCount);
+  {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; ++i) {
       std::string key = KeyGen(i, kKeyLength);
@@ -303,27 +308,30 @@ TEST_F(BPlusTreeTest, Delete) {
       kvp.emplace(key, value);
     }
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
-    for (const auto& kv: kvp) {
+    for (const auto& kv : kvp) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
       ASSERT_EQ(kv.second, val);
     }
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; i += 2) {
       std::string key = KeyGen(i, kKeyLength);
       ASSERT_SUCCESS(bpt_->Delete(txn, key));
       kvp.erase(key);
-      for (const auto& kv: kvp) {
+      for (const auto& kv : kvp) {
         ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
         ASSERT_EQ(kv.second, val);
       }
       ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     }
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; ++i) {
       if (i % 2 == 0) {
@@ -337,7 +345,8 @@ TEST_F(BPlusTreeTest, Delete) {
   }
 }
 
-TEST_F(BPlusTreeTest, DeleteFosterBranch) { {
+TEST_F(BPlusTreeTest, DeleteFosterBranch) {
+  {
     auto txn = tm_->Begin();
     PageRef root = p_->GetPage(bpt_->Root());
     root->PageTypeChange(txn, PageType::kBranchPage);
@@ -356,7 +365,8 @@ TEST_F(BPlusTreeTest, DeleteFosterBranch) { {
     foster->InsertBranch(txn, "zz", foster_right->PageID());
     ASSERT_SUCCESS(root->SetFoster(txn, FosterPair("j", foster->PageID())));
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     EXPECT_SUCCESS(bpt_->Delete(txn, "zz"));
     EXPECT_SUCCESS(bpt_->Delete(txn, "jj"));
@@ -365,7 +375,8 @@ TEST_F(BPlusTreeTest, DeleteFosterBranch) { {
   }
 }
 
-TEST_F(BPlusTreeTest, LiftUpBranch) { {
+TEST_F(BPlusTreeTest, LiftUpBranch) {
+  {
     auto txn = tm_->Begin();
     PageRef root = p_->GetPage(bpt_->Root());
     root->PageTypeChange(txn, PageType::kBranchPage);
@@ -388,7 +399,8 @@ TEST_F(BPlusTreeTest, LiftUpBranch) { {
     b_branch->SetLowestValue(txn, b->PageID());
     b_branch->InsertBranch(txn, "bb", bb->PageID());
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
     ASSERT_SUCCESS(bpt_->Delete(txn, "aa"));
@@ -429,7 +441,7 @@ void BuildBranchFosterTree(TransactionManager* tm, BPlusTree* bpt) {
   a_branch->InsertBranch(txn, "aa", aa->PageID());
   PageRef a_foster = p->AllocateNewPage(txn, PageType::kBranchPage);
   ASSERT_SUCCESS(
-    a_branch->SetFoster(txn, FosterPair("aaa", a_foster->PageID())));
+      a_branch->SetFoster(txn, FosterPair("aaa", a_foster->PageID())));
   PageRef aaa = p->AllocateNewPage(txn, PageType::kLeafPage);
   aaa->InsertLeaf(txn, "aaa", "3");
   a_foster->SetLowestValue(txn, aaa->PageID());
@@ -449,7 +461,8 @@ void BuildBranchFosterTree(TransactionManager* tm, BPlusTree* bpt) {
 }
 
 TEST_F(BPlusTreeTest, LiftUpBranchWithFoster1) {
-  BuildBranchFosterTree(tm_.get(), bpt_.get()); {
+  BuildBranchFosterTree(tm_.get(), bpt_.get());
+  {
     auto txn = tm_->Begin();
     ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
     ASSERT_SUCCESS(bpt_->Delete(txn, "aa"));
@@ -461,7 +474,8 @@ TEST_F(BPlusTreeTest, LiftUpBranchWithFoster1) {
 }
 
 TEST_F(BPlusTreeTest, LiftUpBranchWithFoster2) {
-  BuildBranchFosterTree(tm_.get(), bpt_.get()); {
+  BuildBranchFosterTree(tm_.get(), bpt_.get());
+  {
     auto txn = tm_->Begin();
     ASSERT_SUCCESS(bpt_->Delete(txn, "aaaaa"));
     ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
@@ -473,7 +487,8 @@ TEST_F(BPlusTreeTest, LiftUpBranchWithFoster2) {
 }
 
 TEST_F(BPlusTreeTest, LiftUpBranchWithFoster3) {
-  BuildBranchFosterTree(tm_.get(), bpt_.get()); {
+  BuildBranchFosterTree(tm_.get(), bpt_.get());
+  {
     auto txn = tm_->Begin();
     ASSERT_SUCCESS(bpt_->Delete(txn, "aaaa"));
     ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
@@ -485,7 +500,7 @@ TEST_F(BPlusTreeTest, LiftUpBranchWithFoster3) {
 }
 
 TEST_F(BPlusTreeTest, LiftUpBranchWithFosterOther) {
-  std::vector <std::string> keys{"a", "aa", "aaa", "aaaa", "aaaaa", "b"};
+  std::vector<std::string> keys{"a", "aa", "aaa", "aaaa", "aaaaa", "b"};
   do {
     BuildBranchFosterTree(tm_.get(), bpt_.get());
     auto txn = tm_->Begin();
@@ -498,7 +513,8 @@ TEST_F(BPlusTreeTest, LiftUpBranchWithFosterOther) {
   } while (std::next_permutation(keys.begin(), keys.end()));
 }
 
-TEST_F(BPlusTreeTest, DeleteFosterLeaf) { {
+TEST_F(BPlusTreeTest, DeleteFosterLeaf) {
+  {
     auto txn = tm_->Begin();
     PageRef root = p_->GetPage(bpt_->Root());
     root->PageTypeChange(txn, PageType::kBranchPage);
@@ -517,7 +533,8 @@ TEST_F(BPlusTreeTest, DeleteFosterLeaf) { {
     d->InsertLeaf(txn, "d", "d");
     ASSERT_SUCCESS(c->SetFoster(txn, FosterPair("d", d->PageID())));
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
     ASSERT_SUCCESS(bpt_->Delete(txn, "cc"));
@@ -529,8 +546,9 @@ TEST_F(BPlusTreeTest, DeleteFosterLeaf) { {
 TEST_F(BPlusTreeTest, DeleteAll) {
   constexpr int kCount = 50;
   constexpr int kKeyLength = 5000;
-  std::unordered_map <std::string, std::string> kvp;
-  kvp.reserve(kCount); {
+  std::unordered_map<std::string, std::string> kvp;
+  kvp.reserve(kCount);
+  {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; ++i) {
       std::string key = KeyGen(i, kKeyLength);
@@ -540,23 +558,25 @@ TEST_F(BPlusTreeTest, DeleteAll) {
       kvp.emplace(key, value);
     }
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
-    for (const auto& kv: kvp) {
+    for (const auto& kv : kvp) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
       ASSERT_EQ(kv.second, val);
     }
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; i++) {
       std::string key = KeyGen(i, kKeyLength);
       ASSERT_SUCCESS(bpt_->Delete(txn, key));
       kvp.erase(key);
-      for (const auto& kv: kvp) {
+      for (const auto& kv : kvp) {
         if (bpt_->Read(txn, kv.first).GetStatus() != Status::kSuccess) {
           LOG(ERROR) << "Cannot find: " << OmittedString(kv.first, 10)
-              << " from";
+                     << " from";
           bpt_->Dump(txn, std::cerr);
         }
         ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
@@ -571,8 +591,9 @@ TEST_F(BPlusTreeTest, DeleteAll) {
 TEST_F(BPlusTreeTest, DeleteAllReverse) {
   constexpr int kCount = 100;
   constexpr int kKeyLength = 5000;
-  std::unordered_map <std::string, std::string> kvp;
-  kvp.reserve(kCount); {
+  std::unordered_map<std::string, std::string> kvp;
+  kvp.reserve(kCount);
+  {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; ++i) {
       std::string key = KeyGen(i, kKeyLength);
@@ -582,20 +603,22 @@ TEST_F(BPlusTreeTest, DeleteAllReverse) {
       kvp.emplace(key, value);
     }
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
-    for (const auto& kv: kvp) {
+    for (const auto& kv : kvp) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
       ASSERT_EQ(kv.second, val);
     }
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     std::string long_value(2000, 'v');
     for (int i = kCount - 1; 0 < i; i--) {
       std::string key = KeyGen(i, kKeyLength);
       ASSERT_SUCCESS(bpt_->Delete(txn, key));
       kvp.erase(key);
-      for (const auto& kv: kvp) {
+      for (const auto& kv : kvp) {
         auto v = bpt_->Read(txn, kv.first);
         if (!v) {
           LOG(FATAL) << "not found: " << kv.first;
@@ -611,11 +634,12 @@ TEST_F(BPlusTreeTest, DeleteAllReverse) {
 
 TEST_F(BPlusTreeTest, Crash) {
   constexpr int kCount = 100;
-  constexpr int kKeyLength = 4000; {
+  constexpr int kKeyLength = 4000;
+  {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; ++i) {
       ASSERT_SUCCESS(
-        bpt_->Insert(txn, KeyGen(i, kKeyLength), KeyGen(i * 10, 1000)));
+          bpt_->Insert(txn, KeyGen(i, kKeyLength), KeyGen(i * 10, 1000)));
     }
     txn.PreCommit();
   }
@@ -625,7 +649,8 @@ TEST_F(BPlusTreeTest, Crash) {
     Flush(i);
   }
   Recover();
-  r_->RecoverFrom(0, tm_.get()); {
+  r_->RecoverFrom(0, tm_.get());
+  {
     auto txn = tm_->Begin();
     for (int i = 0; i < kCount; ++i) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
@@ -637,21 +662,22 @@ TEST_F(BPlusTreeTest, Crash) {
 
 TEST_F(BPlusTreeTest, CheckPoint) {
   constexpr int kKeyLength = 4000;
-  lsn_t restart_point; {
+  lsn_t restart_point;
+  {
     auto txn = tm_->Begin();
     for (int i = 0; i < 10; ++i) {
       ASSERT_SUCCESS(
-        bpt_->Insert(txn, KeyGen(i, kKeyLength), KeyGen(i * 10, 1000)));
+          bpt_->Insert(txn, KeyGen(i, kKeyLength), KeyGen(i * 10, 1000)));
     }
     restart_point = cm_->WriteCheckpoint([&]() {
       for (int i = 10; i < 20; ++i) {
         ASSERT_SUCCESS(
-          bpt_->Insert(txn, KeyGen(i, kKeyLength), KeyGen(i * 10, 1000)));
+            bpt_->Insert(txn, KeyGen(i, kKeyLength), KeyGen(i * 10, 1000)));
       }
     });
     for (int i = 20; i < 30; ++i) {
       ASSERT_SUCCESS(
-        bpt_->Insert(txn, KeyGen(i, kKeyLength), KeyGen(i * 10, 1000)));
+          bpt_->Insert(txn, KeyGen(i, kKeyLength), KeyGen(i * 10, 1000)));
     }
     txn.PreCommit();
   }
@@ -660,7 +686,8 @@ TEST_F(BPlusTreeTest, CheckPoint) {
     Flush(i);
   }
   Recover();
-  r_->RecoverFrom(restart_point, tm_.get()); {
+  r_->RecoverFrom(restart_point, tm_.get());
+  {
     auto txn = tm_->Begin();
     for (int i = 0; i < 30; ++i) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
@@ -673,8 +700,8 @@ TEST_F(BPlusTreeTest, CheckPoint) {
 TEST_F(BPlusTreeTest, UpdateHeavy) {
   constexpr int kCount = 100;
   Transaction txn = tm_->Begin();
-  std::vector <std::string> keys;
-  std::unordered_map <std::string, std::string> kvp;
+  std::vector<std::string> keys;
+  std::unordered_map<std::string, std::string> kvp;
   keys.reserve(kCount);
   for (int i = 0; i < kCount; ++i) {
     std::string key = RandomString(((19937 * i) % 12) + 10, false);
@@ -683,7 +710,7 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
     bpt_->SanityCheckForTest(p_.get());
     keys.push_back(key);
     kvp.emplace(key, value);
-    for (const auto& kv: kvp) {
+    for (const auto& kv : kvp) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
       ASSERT_EQ(kvp[kv.first], val);
     }
@@ -693,12 +720,12 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
     std::string value = RandomString((19937 * i) % 320 + 500, false);
     ASSERT_SUCCESS(bpt_->Update(txn, key, value));
     kvp[key] = value;
-    for (const auto& kv: kvp) {
+    for (const auto& kv : kvp) {
       ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
       ASSERT_EQ(kvp[kv.first], val);
     }
   }
-  for (const auto& kv: kvp) {
+  for (const auto& kv : kvp) {
     ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
     ASSERT_EQ(kvp[kv.first], val);
   }
@@ -707,7 +734,7 @@ TEST_F(BPlusTreeTest, UpdateHeavy) {
 TEST_F(BPlusTreeTest, InsertDelete) {
   constexpr int kCount = 50;
   Transaction txn = tm_->Begin();
-  std::unordered_set <std::string> keys;
+  std::unordered_set<std::string> keys;
   keys.reserve(kCount);
   for (int i = 0; i < kCount; ++i) {
     std::string key = RandomString((19937 * i) % 120 + 10, false);
@@ -730,7 +757,7 @@ TEST_F(BPlusTreeTest, InsertDelete) {
 TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
   int kCount = 100;
   Transaction txn = tm_->Begin();
-  std::unordered_map <std::string, std::string> kvp;
+  std::unordered_map<std::string, std::string> kvp;
   kvp.reserve(kCount);
   for (int i = 0; i < kCount; ++i) {
     std::string key = RandomString((19937 * i) % 120 + 10, false);
@@ -739,12 +766,12 @@ TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     kvp[key] = value;
   }
-  for (const auto& kv: kvp) {
+  for (const auto& kv : kvp) {
     ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
     ASSERT_EQ(kvp[kv.first], val);
   }
   LOG(INFO) << "initialized, insert and delete for " << (kCount * 40)
-      << " times.";
+            << " times.";
   for (int i = 0; i < kCount; ++i) {
     auto iter = kvp.begin();
     std::advance(iter, (i * 19937) % kvp.size());
@@ -758,9 +785,9 @@ TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
     ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
     kvp[key] = value;
   }
-  for (const auto& kv: kvp) {
+  for (const auto& kv : kvp) {
     ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, kv.first));
     ASSERT_EQ(kvp[kv.first], val);
   }
 }
-} // namespace tinylamb
+}  // namespace tinylamb

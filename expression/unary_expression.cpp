@@ -46,11 +46,19 @@ Value UnaryExpression::Evaluate(const Row& row, const Schema& schema) const {
 }
 
 std::string UnaryExpression::ToString() const {
-  return ::tinylamb::ToString(operation_) + " " + child_->ToString();
+  if (operation_ == UnaryOperation::kMinus) {
+    return "(" + ::tinylamb::ToString(operation_) + child_->ToString() + ")";
+  }
+  return "(" + ::tinylamb::ToString(operation_) + " " + child_->ToString() +
+         ")";
 }
 
 void UnaryExpression::Dump(std::ostream& o) const {
-  o << "(" << ::tinylamb::ToString(operation_) << " " << *child_ << ")";
+  if (operation_ == UnaryOperation::kMinus) {
+    o << "(" << ::tinylamb::ToString(operation_) << *child_ << ")";
+  } else {
+    o << "(" << ::tinylamb::ToString(operation_) << " " << *child_ << ")";
+  }
 }
 
 }  // namespace tinylamb

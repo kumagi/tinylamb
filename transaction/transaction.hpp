@@ -109,7 +109,9 @@ class Transaction final {
   // Using this function is discouraged to get performance of flush pipelining.
   void CommitWait() const;
 
-  PageManager* GetPageManager() { return transaction_manager_->GetPageManager(); }
+  PageManager* GetPageManager() {
+    return transaction_manager_->GetPageManager();
+  }
 
   // Transaction is not a value object. Never try to compare by its attributes.
   bool operator==(const Transaction& rhs) const = delete;

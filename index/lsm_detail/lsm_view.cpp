@@ -127,7 +127,9 @@ LSMView::Iterator::Iterator(const LSMView* vm, bool head) : vm_(vm) {
 
 std::string LSMView::Iterator::Value() const { return iters_[0].Value(); }
 
-SortedRun::Entry LSMView::Iterator::GetEntry() const { return iters_[0].GetEntry(); }
+SortedRun::Entry LSMView::Iterator::GetEntry() const {
+  return iters_[0].GetEntry();
+}
 
 // Treats invalid iterator as infinity big.
 bool IsRightIteratorBigger(int left, int right,

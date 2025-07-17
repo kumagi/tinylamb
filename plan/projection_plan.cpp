@@ -108,4 +108,3 @@ std::string ProjectionPlan::ToString() const {
   return s;
 }
 }  // namespace tinylamb
-

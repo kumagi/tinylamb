@@ -27,6 +27,7 @@
 #include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/aggregation.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/hash_join.hpp"
 #include "executor/index_join.hpp"
@@ -35,7 +36,6 @@
 #include "executor/projection.hpp"
 #include "executor/selection.hpp"
 #include "executor/update.hpp"
-#include "executor/aggregation.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "gtest/gtest.h"
@@ -501,21 +501,16 @@ TEST_F(ExecutorTest, Aggregation) {
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   auto fs = std::make_shared<FullScan>(ctx.txn_, *tbl);
   std::vector<NamedExpression> aggregates = {
-      NamedExpression(
-          "count",
-          AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("key"))),
-      NamedExpression(
-          "sum",
-          AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("score"))),
-      NamedExpression(
-          "avg",
-          AggregateExpressionExp(AggregationType::kAvg, ColumnValueExp("score"))),
-      NamedExpression(
-          "min",
-          AggregateExpressionExp(AggregationType::kMin, ColumnValueExp("score"))),
-      NamedExpression(
-          "max",
-          AggregateExpressionExp(AggregationType::kMax, ColumnValueExp("score")))};
+      NamedExpression("count", AggregateExpressionExp(AggregationType::kCount,
+                                                      ColumnValueExp("key"))),
+      NamedExpression("sum", AggregateExpressionExp(AggregationType::kSum,
+                                                    ColumnValueExp("score"))),
+      NamedExpression("avg", AggregateExpressionExp(AggregationType::kAvg,
+                                                    ColumnValueExp("score"))),
+      NamedExpression("min", AggregateExpressionExp(AggregationType::kMin,
+                                                    ColumnValueExp("score"))),
+      NamedExpression("max", AggregateExpressionExp(AggregationType::kMax,
+                                                    ColumnValueExp("score")))};
   AggregationExecutor agg(std::move(fs), std::move(aggregates));
   Row result;
   ASSERT_TRUE(agg.Next(&result, nullptr));

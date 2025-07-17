@@ -67,7 +67,7 @@ std::string AggregationPlan::ToString() const {
 }
 
 void AggregationPlan::Dump(std::ostream& o, int indent) const {
-o << Indent(indent) << ToString() << "\n";
+  o << Indent(indent) << ToString() << "\n";
   child_->Dump(o, indent + 2);
 }
 

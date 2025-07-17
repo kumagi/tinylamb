@@ -25,7 +25,8 @@
 
 namespace tinylamb {
 
-Value AggregateExpression::Evaluate(const Row& row, const Schema& schema) const {
+Value AggregateExpression::Evaluate(const Row& row,
+                                    const Schema& schema) const {
   // This method should not be called directly.
   // The value of an aggregate expression is calculated by the aggregator.
   return {};

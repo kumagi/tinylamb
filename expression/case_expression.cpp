@@ -40,8 +40,8 @@ Value CaseExpression::Evaluate(const Row& row, const Schema& schema) const {
 std::string CaseExpression::ToString() const {
   std::string result = "CASE";
   for (const auto& when : when_clauses_) {
-    result += " WHEN " + when.first->ToString() + " THEN " +
-              when.second->ToString();
+    result +=
+        " WHEN " + when.first->ToString() + " THEN " + when.second->ToString();
   }
   if (else_clause_) {
     result += " ELSE " + else_clause_->ToString();

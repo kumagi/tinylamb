@@ -34,7 +34,7 @@ TEST(TokenizerTest, Empty) {
 TEST(TokenizerTest, Select) {
   Tokenizer tokenizer("SELECT * FROM users WHERE id = 1;");
   std::vector<Token> tokens = tokenizer.Tokenize();
-  ASSERT_EQ(tokens.size(), 9);
+  ASSERT_EQ(tokens.size(), 10);
   ASSERT_EQ(tokens[0].type, TokenType::kKeyword);
   ASSERT_EQ(tokens[0].value, "SELECT");
   ASSERT_EQ(tokens[1].type, TokenType::kOperator);
@@ -52,13 +52,14 @@ TEST(TokenizerTest, Select) {
   ASSERT_EQ(tokens[7].type, TokenType::kNumeric);
   ASSERT_EQ(tokens[7].value, "1");
   ASSERT_EQ(tokens[8].type, TokenType::kSemicolon);
+  ASSERT_EQ(tokens[9].type, TokenType::kEof);
 }
 
 TEST(TokenizerTest, Create) {
   Tokenizer tokenizer(
       "CREATE TABLE users (id INT, name VARCHAR(20), score DOUBLE);");
   std::vector<Token> tokens = tokenizer.Tokenize();
-  ASSERT_EQ(tokens.size(), 16);
+  ASSERT_EQ(tokens.size(), 18);
   ASSERT_EQ(tokens[0].type, TokenType::kKeyword);
   ASSERT_EQ(tokens[0].value, "CREATE");
   ASSERT_EQ(tokens[1].type, TokenType::kKeyword);
@@ -85,12 +86,15 @@ TEST(TokenizerTest, Create) {
   ASSERT_EQ(tokens[14].type, TokenType::kIdentifier);
   ASSERT_EQ(tokens[14].value, "DOUBLE");
   ASSERT_EQ(tokens[15].type, TokenType::kRParen);
+  ASSERT_EQ(tokens[16].type, TokenType::kSemicolon);
+  ASSERT_EQ(tokens[16].value, ";");
+  ASSERT_EQ(tokens[17].type, TokenType::kEof);
 }
 
 TEST(TokenizerTest, Insert) {
   Tokenizer tokenizer("INSERT INTO users VALUES (1, 'foo', 1.2);");
   std::vector<Token> tokens = tokenizer.Tokenize();
-  ASSERT_EQ(tokens.size(), 10);
+  ASSERT_EQ(tokens.size(), 13);
   ASSERT_EQ(tokens[0].type, TokenType::kKeyword);
   ASSERT_EQ(tokens[0].value, "INSERT");
   ASSERT_EQ(tokens[1].type, TokenType::kKeyword);
@@ -108,7 +112,10 @@ TEST(TokenizerTest, Insert) {
   ASSERT_EQ(tokens[8].type, TokenType::kComma);
   ASSERT_EQ(tokens[9].type, TokenType::kNumeric);
   ASSERT_EQ(tokens[9].value, "1.2");
+  ASSERT_EQ(tokens[10].type, TokenType::kRParen);
+  ASSERT_EQ(tokens[11].type, TokenType::kSemicolon);
+  ASSERT_EQ(tokens[11].value, ";");
+  ASSERT_EQ(tokens[12].type, TokenType::kEof);
 }
-
 
 }  // namespace tinylamb

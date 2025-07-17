@@ -57,10 +57,11 @@ add_library(libtinylamb
         expression/aggregate_expression.cpp
         expression/case_expression.cpp
         expression/in_expression.cpp
+        expression/function_call_expression.cpp
         expression/column_value.cpp executor/hash_join.cpp common/decoder.cpp
         plan/full_scan_plan.cpp plan/projection_plan.cpp plan/selection_plan.cpp
         plan/product_plan.cpp plan/optimizer.cpp plan/index_only_scan_plan.cpp
-        plan/aggregation_plan.cpp
+        plan/aggregation_plan.cpp plan/plan.cpp
         executor/cross_join.cpp table/table_statistics.cpp expression/expression.cpp
         database/page_storage.cpp index/index_schema.cpp
         database/transaction_context.cpp executor/insert.cpp
@@ -75,6 +76,9 @@ add_library(libtinylamb
         common/ring_buffer.hpp
         common/vm_cache_impl.cpp
         common/vm_cache_impl.hpp
+        type/function.cpp
+        type/type.cpp
+        expression/expression.cpp
 )
 
 

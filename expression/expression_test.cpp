@@ -360,38 +360,37 @@ TEST(ExpressionTest, UnaryExpression) {
   Schema dummy_schema;
 
   // IS NULL
-  Expression is_null_true = UnaryExpressionExp(
-      ConstantValueExp(Value()), UnaryOperation::kIsNull);
-  Expression is_null_false = UnaryExpressionExp(
-      ConstantValueExp(Value(1)), UnaryOperation::kIsNull);
+  Expression is_null_true =
+      UnaryExpressionExp(ConstantValueExp(Value()), UnaryOperation::kIsNull);
+  Expression is_null_false =
+      UnaryExpressionExp(ConstantValueExp(Value(1)), UnaryOperation::kIsNull);
   ASSERT_EQ(is_null_true->Evaluate(dummy, dummy_schema), Value(true));
   ASSERT_EQ(is_null_false->Evaluate(dummy, dummy_schema), Value(false));
 
   // IS NOT NULL
-  Expression is_not_null_true = UnaryExpressionExp(
-      ConstantValueExp(Value(1)), UnaryOperation::kIsNotNull);
-  Expression is_not_null_false = UnaryExpressionExp(
-      ConstantValueExp(Value()),
-      UnaryOperation::kIsNotNull);
+  Expression is_not_null_true = UnaryExpressionExp(ConstantValueExp(Value(1)),
+                                                   UnaryOperation::kIsNotNull);
+  Expression is_not_null_false =
+      UnaryExpressionExp(ConstantValueExp(Value()), UnaryOperation::kIsNotNull);
   ASSERT_EQ(is_not_null_true->Evaluate(dummy, dummy_schema), Value(true));
   ASSERT_EQ(is_not_null_false->Evaluate(dummy, dummy_schema), Value(false));
 
   // NOT
-  Expression not_true = UnaryExpressionExp(ConstantValueExp(Value(true)),
-                                           UnaryOperation::kNot);
-  Expression not_false = UnaryExpressionExp(ConstantValueExp(Value(false)),
-                                            UnaryOperation::kNot);
-  Expression not_null = UnaryExpressionExp(
-      ConstantValueExp(Value()), UnaryOperation::kNot);
+  Expression not_true =
+      UnaryExpressionExp(ConstantValueExp(Value(true)), UnaryOperation::kNot);
+  Expression not_false =
+      UnaryExpressionExp(ConstantValueExp(Value(false)), UnaryOperation::kNot);
+  Expression not_null =
+      UnaryExpressionExp(ConstantValueExp(Value()), UnaryOperation::kNot);
   ASSERT_EQ(not_true->Evaluate(dummy, dummy_schema), Value(false));
   ASSERT_EQ(not_false->Evaluate(dummy, dummy_schema), Value(true));
   ASSERT_TRUE(not_null->Evaluate(dummy, dummy_schema).IsNull());
 
   // Unary Minus
-  Expression int_minus = UnaryExpressionExp(ConstantValueExp(Value(1)),
-                                            UnaryOperation::kMinus);
-  Expression double_minus = UnaryExpressionExp(ConstantValueExp(Value(1.1)),
-                                               UnaryOperation::kMinus);
+  Expression int_minus =
+      UnaryExpressionExp(ConstantValueExp(Value(1)), UnaryOperation::kMinus);
+  Expression double_minus =
+      UnaryExpressionExp(ConstantValueExp(Value(1.1)), UnaryOperation::kMinus);
   ASSERT_EQ(int_minus->Evaluate(dummy, dummy_schema), Value(-1));
   ASSERT_DOUBLE_EQ(
       double_minus->Evaluate(dummy, dummy_schema).value.double_value,
@@ -402,18 +401,18 @@ TEST(ExpressionTest, AggregateExpression) {
   Row dummy({});
   Schema dummy_schema;
 
-  Expression count_all = AggregateExpressionExp(
-      AggregationType::kCount, ColumnValueExp("*"));
-  Expression count_col = AggregateExpressionExp(
-      AggregationType::kCount, ColumnValueExp("col"));
-  Expression sum_col = AggregateExpressionExp(
-      AggregationType::kSum, ColumnValueExp("col"));
-  Expression avg_col = AggregateExpressionExp(
-      AggregationType::kAvg, ColumnValueExp("col"));
-  Expression min_col = AggregateExpressionExp(
-      AggregationType::kMin, ColumnValueExp("col"));
-  Expression max_col = AggregateExpressionExp(
-      AggregationType::kMax, ColumnValueExp("col"));
+  Expression count_all =
+      AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("*"));
+  Expression count_col =
+      AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("col"));
+  Expression sum_col =
+      AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("col"));
+  Expression avg_col =
+      AggregateExpressionExp(AggregationType::kAvg, ColumnValueExp("col"));
+  Expression min_col =
+      AggregateExpressionExp(AggregationType::kMin, ColumnValueExp("col"));
+  Expression max_col =
+      AggregateExpressionExp(AggregationType::kMax, ColumnValueExp("col"));
 
   // Note: Aggregate expressions are not evaluated directly.
   // The executor is responsible for computing the result.
@@ -430,24 +429,28 @@ TEST(ExpressionTest, CaseExpression) {
   Row dummy({});
   Schema dummy_schema;
 
-  Expression case_exp_true = CaseExpressionExp(
-      {{BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kEquals,
-                            ConstantValueExp(Value(1))),
-        ConstantValueExp(Value("one"))},
-       {BinaryExpressionExp(ConstantValueExp(Value(2)), BinaryOperation::kEquals,
-                            ConstantValueExp(Value(1))),
-        ConstantValueExp(Value("two"))}},
-      ConstantValueExp(Value("other")));
+  Expression case_exp_true =
+      CaseExpressionExp({{BinaryExpressionExp(ConstantValueExp(Value(1)),
+                                              BinaryOperation::kEquals,
+                                              ConstantValueExp(Value(1))),
+                          ConstantValueExp(Value("one"))},
+                         {BinaryExpressionExp(ConstantValueExp(Value(2)),
+                                              BinaryOperation::kEquals,
+                                              ConstantValueExp(Value(1))),
+                          ConstantValueExp(Value("two"))}},
+                        ConstantValueExp(Value("other")));
   ASSERT_EQ(case_exp_true->Evaluate(dummy, dummy_schema), Value("one"));
 
-  Expression case_exp_false = CaseExpressionExp(
-      {{BinaryExpressionExp(ConstantValueExp(Value(2)), BinaryOperation::kEquals,
-                            ConstantValueExp(Value(1))),
-        ConstantValueExp(Value("one"))},
-       {BinaryExpressionExp(ConstantValueExp(Value(2)), BinaryOperation::kEquals,
-                            ConstantValueExp(Value(1))),
-        ConstantValueExp(Value("two"))}},
-      ConstantValueExp(Value("other")));
+  Expression case_exp_false =
+      CaseExpressionExp({{BinaryExpressionExp(ConstantValueExp(Value(2)),
+                                              BinaryOperation::kEquals,
+                                              ConstantValueExp(Value(1))),
+                          ConstantValueExp(Value("one"))},
+                         {BinaryExpressionExp(ConstantValueExp(Value(2)),
+                                              BinaryOperation::kEquals,
+                                              ConstantValueExp(Value(1))),
+                          ConstantValueExp(Value("two"))}},
+                        ConstantValueExp(Value("other")));
   ASSERT_EQ(case_exp_false->Evaluate(dummy, dummy_schema), Value("other"));
 }
 
@@ -455,18 +458,17 @@ TEST(ExpressionTest, InExpression) {
   Row dummy({});
   Schema dummy_schema;
 
-  Expression in_exp_true = InExpressionExp(
-      ConstantValueExp(Value(1)),
-      {ConstantValueExp(Value(1)), ConstantValueExp(Value(2)),
-       ConstantValueExp(Value(3))});
-  Expression in_exp_false = InExpressionExp(
-      ConstantValueExp(Value(4)),
-      {ConstantValueExp(Value(1)), ConstantValueExp(Value(2)),
-       ConstantValueExp(Value(3))});
+  Expression in_exp_true =
+      InExpressionExp(ConstantValueExp(Value(1)),
+                      {ConstantValueExp(Value(1)), ConstantValueExp(Value(2)),
+                       ConstantValueExp(Value(3))});
+  Expression in_exp_false =
+      InExpressionExp(ConstantValueExp(Value(4)),
+                      {ConstantValueExp(Value(1)), ConstantValueExp(Value(2)),
+                       ConstantValueExp(Value(3))});
   ASSERT_EQ(in_exp_true->Evaluate(dummy, dummy_schema), Value(true));
   ASSERT_EQ(in_exp_false->Evaluate(dummy, dummy_schema), Value(false));
 }
-
 
 TEST(ExpressionTest, PathologicalCases) {
   Row dummy({});
@@ -480,11 +482,11 @@ TEST(ExpressionTest, PathologicalCases) {
   ASSERT_EQ(exp1->Evaluate(dummy, dummy_schema), Value(9));
 
   // 1 + (2 * 3) = 7
-  Expression exp2 = BinaryExpressionExp(
-      ConstantValueExp(Value(1)), BinaryOperation::kAdd,
-      BinaryExpressionExp(ConstantValueExp(Value(2)),
-                          BinaryOperation::kMultiply,
-                          ConstantValueExp(Value(3))));
+  Expression exp2 =
+      BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kAdd,
+                          BinaryExpressionExp(ConstantValueExp(Value(2)),
+                                              BinaryOperation::kMultiply,
+                                              ConstantValueExp(Value(3))));
   ASSERT_EQ(exp2->Evaluate(dummy, dummy_schema), Value(7));
 
   // (true AND false) OR true = true
@@ -501,15 +503,15 @@ TEST(ExpressionTest, PathologicalCases) {
                           ConstantValueExp(Value(true))));
   ASSERT_EQ(exp4->Evaluate(dummy, dummy_schema), Value(true));
 
-  // ((1 + 2) * 3 - (4 / 2)) > 5 AND (true OR false) = (9 - 2) > 5 AND true = 7 >
-  // 5 AND true = true
+  // ((1 + 2) * 3 - (4 / 2)) > 5 AND (true OR false) = (9 - 2) > 5 AND true = 7
+  // > 5 AND true = true
   Expression exp5 = BinaryExpressionExp(
       BinaryExpressionExp(
-          BinaryExpressionExp(
-              BinaryExpressionExp(ConstantValueExp(Value(1)),
-                                  BinaryOperation::kAdd,
-                                  ConstantValueExp(Value(2))),
-              BinaryOperation::kMultiply, ConstantValueExp(Value(3))),
+          BinaryExpressionExp(BinaryExpressionExp(ConstantValueExp(Value(1)),
+                                                  BinaryOperation::kAdd,
+                                                  ConstantValueExp(Value(2))),
+                              BinaryOperation::kMultiply,
+                              ConstantValueExp(Value(3))),
           BinaryOperation::kSubtract,
           BinaryExpressionExp(ConstantValueExp(Value(4)),
                               BinaryOperation::kDivide,

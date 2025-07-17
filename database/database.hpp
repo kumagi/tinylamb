@@ -38,6 +38,7 @@ class Schema;
 class IndexSchema;
 class TableStatistics;
 class PageStorage;
+class Function;
 
 class Database {
  public:
@@ -50,6 +51,10 @@ class Database {
 
   Status CreateIndex(TransactionContext& ctx, std::string_view schema_name,
                      const IndexSchema& idx);
+
+  StatusOr<Function> GetOrAddFunction(TransactionContext& ctx,
+                                      std::string_view function_name,
+                                      int argument_count);
 
   [[maybe_unused]] void DebugDump(Transaction& txn, std::ostream& o);
 
@@ -77,6 +82,9 @@ class Database {
 
   // Persistent { Name => TableStatistics } storage.
   BPlusTree statistics_;
+
+  // Persistent { Name => Function } storage.
+  BPlusTree functions_;
 
   PageStorage storage_;
 };

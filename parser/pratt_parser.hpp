@@ -27,8 +27,13 @@ namespace tinylamb {
 
 class PrattParser {
  public:
-  explicit PrattParser(const std::vector<Token>& tokens);
+  explicit PrattParser(std::vector<Token>::const_iterator begin,
+                       std::vector<Token>::const_iterator end);
   Expression ParseExpression(int precedence = 0);
+  [[nodiscard]] size_t GetPos() const {
+    return std::distance(begin_pos_, current_pos_);
+  }
+  void SetPos(size_t p) { current_pos_ = begin_pos_ + p; }
 
  private:
   Expression ParsePrimary();
@@ -39,8 +44,9 @@ class PrattParser {
   Token Advance();
   void Expect(TokenType type);
 
-  std::vector<Token> tokens_;
-  size_t pos_{0};
+  std::vector<Token>::const_iterator begin_pos_;
+  std::vector<Token>::const_iterator current_pos_;
+  std::vector<Token>::const_iterator end_pos_;
 };
 
 }  // namespace tinylamb

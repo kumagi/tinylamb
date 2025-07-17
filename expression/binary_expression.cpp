@@ -64,7 +64,7 @@ Value BinaryExpression::Evaluate(const Row& row, const Schema& schema) const {
 
 std::string BinaryExpression::ToString() const {
   std::stringstream o;
-  o << *left_ << " " << tinylamb::ToString(op_) << " " << *right_;
+  o << "(" << *left_ << " " << tinylamb::ToString(op_) << " " << *right_ << ")";
   return o.str();
 }
 

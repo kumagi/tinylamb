@@ -38,20 +38,24 @@
 #include "table/table_statistics.hpp"
 #include "transaction/transaction.hpp"
 #include "type/column.hpp"
+#include "type/function.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
 
 constexpr int kDefaultTableRoot = 1;
 constexpr int kDefaultStatisticsRoot = 2;
+constexpr int kDefaultFunctionRoot = 3;
 
 Database::Database(std::string_view dbname)
     : catalog_(kDefaultTableRoot),
       statistics_(kDefaultStatisticsRoot),
+      functions_(kDefaultFunctionRoot),
       storage_(dbname) {
   auto ctx = BeginContext();
   catalog_ = BPlusTree(ctx.txn_, kDefaultTableRoot);
   statistics_ = BPlusTree(ctx.txn_, kDefaultStatisticsRoot);
+  functions_ = BPlusTree(ctx.txn_, kDefaultFunctionRoot);
   if (ctx.txn_.PreCommit() != Status::kSuccess) {
     LOG(FATAL) << "Failed to initialize relations";
     exit(1);
@@ -109,6 +113,25 @@ Status Database::CreateIndex(TransactionContext& ctx,
   ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
   RETURN_IF_FAIL(tbl.CreateIndex(ctx.txn_, idx));
   return catalog_.Update(ctx.txn_, schema_name, Serialize(tbl));
+}
+
+StatusOr<Function> Database::GetOrAddFunction(TransactionContext& ctx,
+                                              std::string_view function_name,
+                                              int argument_count) {
+  StatusOr<std::string_view> val = functions_.Read(ctx.txn_, function_name);
+  if (val.GetStatus() != Status::kSuccess &&
+      val.GetStatus() != Status::kNotExists) {
+    return val.GetStatus();
+  }
+  if (val.GetStatus() == Status::kNotExists) {
+    Function new_func{std::string(function_name), argument_count};
+    RETURN_IF_FAIL(
+        functions_.Insert(ctx.txn_, function_name, Serialize(new_func)));
+    return new_func;
+  }
+  Function func;
+  Deserialize(val.Value(), func);
+  return func;
 }
 
 StatusOr<Table> Database::GetTable(TransactionContext& ctx,

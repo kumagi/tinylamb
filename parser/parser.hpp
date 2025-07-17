@@ -29,7 +29,6 @@ class Parser {
  public:
   explicit Parser(const std::vector<Token>& tokens);
   std::unique_ptr<Statement> Parse();
-  Expression ParseExpression(int precedence = 0);
 
  private:
   std::unique_ptr<Statement> ParseCreateTable();
@@ -39,9 +38,7 @@ class Parser {
   std::unique_ptr<Statement> ParseUpdate();
   std::unique_ptr<Statement> ParseDelete();
 
-  Expression ParsePrimary();
-  Expression ParseUnary();
-  int GetPrecedence();
+  Expression ParseExpression();
 
   Token Peek();
   Token Advance();

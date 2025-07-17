@@ -19,6 +19,7 @@
 #include <iostream>
 #include <memory>
 
+#include "aggregation_plan.hpp"
 #include "common/constants.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -34,7 +35,6 @@
 #include "product_plan.hpp"
 #include "projection_plan.hpp"
 #include "selection_plan.hpp"
-#include "aggregation_plan.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "transaction/transaction.hpp"
@@ -210,8 +210,8 @@ TEST_F(PlanTest, UnaryPlan) {
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
-  Expression exp = UnaryExpressionExp(ColumnValueExp("c1"),
-                                      UnaryOperation::kIsNull);
+  Expression exp =
+      UnaryExpressionExp(ColumnValueExp("c1"), UnaryOperation::kIsNull);
   Plan sp(new SelectionPlan(std::make_shared<FullScanPlan>(*tbl, ts), exp, ts));
   DumpAll(sp);
 }
@@ -221,21 +221,16 @@ TEST_F(PlanTest, AggregationPlan) {
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
   std::vector<NamedExpression> aggregates = {
-      NamedExpression(
-          "count",
-          AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("c1"))),
-      NamedExpression(
-          "sum",
-          AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("c3"))),
-      NamedExpression(
-          "avg",
-          AggregateExpressionExp(AggregationType::kAvg, ColumnValueExp("c3"))),
-      NamedExpression(
-          "min",
-          AggregateExpressionExp(AggregationType::kMin, ColumnValueExp("c3"))),
-      NamedExpression(
-          "max",
-          AggregateExpressionExp(AggregationType::kMax, ColumnValueExp("c3")))};
+      NamedExpression("count", AggregateExpressionExp(AggregationType::kCount,
+                                                      ColumnValueExp("c1"))),
+      NamedExpression("sum", AggregateExpressionExp(AggregationType::kSum,
+                                                    ColumnValueExp("c3"))),
+      NamedExpression("avg", AggregateExpressionExp(AggregationType::kAvg,
+                                                    ColumnValueExp("c3"))),
+      NamedExpression("min", AggregateExpressionExp(AggregationType::kMin,
+                                                    ColumnValueExp("c3"))),
+      NamedExpression("max", AggregateExpressionExp(AggregationType::kMax,
+                                                    ColumnValueExp("c3")))};
   Plan ap(new AggregationPlan(std::make_shared<FullScanPlan>(*tbl, ts),
                               std::move(aggregates)));
   DumpAll(ap);

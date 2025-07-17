@@ -20,8 +20,8 @@
 #include <vector>
 
 #include "expression/aggregate_expression.hpp"
-#include "type/schema.hpp"
 #include "type/row.hpp"
+#include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {

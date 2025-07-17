@@ -21,13 +21,12 @@
 #include <stdexcept>
 #include <vector>
 
+#include "common/log_message.hpp"
+#include "expression/constant_value.hpp"
 #include "parser/ast.hpp"
+#include "parser/pratt_parser.hpp"
 #include "parser/token.hpp"
 #include "type/value_type.hpp"
-
-#include "expression/constant_value.hpp"
-
-#include "common/log_message.hpp"
 
 namespace tinylamb {
 
@@ -59,7 +58,7 @@ std::unique_ptr<Statement> Parser::ParseInsert() {
   while (Peek().type != TokenType::kSemicolon) {
     std::vector<Expression> row;
     while (Peek().type != TokenType::kRParen) {
-      row.push_back(ParseExpression(0));
+      row.push_back(ParseExpression());
       if (Peek().type == TokenType::kComma) {
         Advance();
       }
@@ -78,34 +77,36 @@ std::unique_ptr<Statement> Parser::ParseInsert() {
 std::unique_ptr<Statement> Parser::ParseSelect() {
   Advance();  // SELECT
   std::vector<NamedExpression> select_list;
+  PrattParser pratt_parser(tokens_.begin(), tokens_.end());  // Create once
   if (Peek().type == TokenType::kOperator && Peek().value == "*") {
     Advance();
     select_list.emplace_back("", ColumnValueExp("*"));
   } else {
     while (Peek().type != TokenType::kKeyword || Peek().value != "FROM") {
-      select_list.emplace_back("", ParseExpression(0));
+      select_list.emplace_back("", ParseExpression());
       if (Peek().type == TokenType::kComma) {
         Advance();
       }
     }
   }
-  Expect(TokenType::kKeyword);
-  Advance();  // FROM
+  Expect(TokenType::kKeyword);  // FROM
   std::vector<std::string> from_clause;
-  while (Peek().type != TokenType::kKeyword || Peek().value != "WHERE") {
-    from_clause.push_back(Advance().value);
-    if (Peek().type == TokenType::kComma) {
-      Advance();
-    }
+  from_clause.push_back(Advance().value);  // Consume the first table name
+
+  while (Peek().type == TokenType::kComma) {
+    Advance();                               // Consume the comma
+    from_clause.push_back(Advance().value);  // Consume the next table name
   }
-  Expect(TokenType::kKeyword);
-  Advance();  // WHERE
-  Expression where_clause = ParseExpression(0);
+
+  Expression where_clause = nullptr;
+  if (Peek().type == TokenType::kKeyword && Peek().value == "WHERE") {
+    Expect(TokenType::kKeyword);  // WHERE
+    where_clause = ParseExpression();
+  }
   Expect(TokenType::kSemicolon);
   return std::make_unique<SelectStatement>(select_list, from_clause,
                                            where_clause);
 }
-
 
 std::unique_ptr<Statement> Parser::ParseDropTable() {
   Advance();  // DROP
@@ -150,92 +151,12 @@ std::unique_ptr<Statement> Parser::ParseCreateTable() {
   return std::make_unique<CreateTableStatement>(table_name, columns);
 }
 
-int Parser::GetPrecedence() {
-  const Token& token = Peek();
-  if (token.type == TokenType::kOperator) {
-    if (token.value == "=" || token.value == "!=" || token.value == "<" ||
-        token.value == "<=" || token.value == ">" || token.value == ">=") {
-      return 1;
-    }
-    if (token.value == "+" || token.value == "-") {
-      return 2;
-    }
-    if (token.value == "*" || token.value == "/") {
-      return 3;
-    }
-  }
-  return 0;
-}
-
-Expression Parser::ParseExpression(int precedence) {
-  Expression left = ParseUnary();
-  while (precedence < GetPrecedence()) {
-    Token op = Advance();
-    Expression right = ParseExpression(GetPrecedence());
-    if (op.value == "=") {
-      left = BinaryExpressionExp(left, BinaryOperation::kEquals, right);
-    } else if (op.value == "!=") {
-      left = BinaryExpressionExp(left, BinaryOperation::kNotEquals, right);
-    } else if (op.value == "<") {
-      left = BinaryExpressionExp(left, BinaryOperation::kLessThan, right);
-    } else if (op.value == "<=") {
-      left = BinaryExpressionExp(left, BinaryOperation::kLessThanEquals, right);
-    } else if (op.value == ">") {
-      left = BinaryExpressionExp(left, BinaryOperation::kGreaterThan, right);
-    } else if (op.value == ">=") {
-      left =
-          BinaryExpressionExp(left, BinaryOperation::kGreaterThanEquals, right);
-    } else if (op.value == "+") {
-      left = BinaryExpressionExp(left, BinaryOperation::kAdd, right);
-    } else if (op.value == "-") {
-      left = BinaryExpressionExp(left, BinaryOperation::kSubtract, right);
-    } else if (op.value == "*") {
-      left = BinaryExpressionExp(left, BinaryOperation::kMultiply, right);
-    } else if (op.value == "/") {
-      left = BinaryExpressionExp(left, BinaryOperation::kDivide, right);
-    } else {
-      throw std::runtime_error("Unsupported expression: " + op.ToString());
-    }
-  }
-  return left;
-}
-
-Expression Parser::ParseUnary() {
-  if (Peek().type == TokenType::kOperator && Peek().value == "-") {
-    Advance();
-    return UnaryExpressionExp(ParseExpression(4), UnaryOperation::kMinus);
-  }
-  return ParsePrimary();
-}
-
-Expression Parser::ParsePrimary() {
-  if (Peek().type == TokenType::kLParen) {
-    Advance();
-    Expression expr = ParseExpression(0);
-    Expect(TokenType::kRParen);
-    return expr;
-  }
-  Token token = Advance();
-  if (token.type == TokenType::kIdentifier) {
-    return ColumnValueExp(token.value);
-  }
-  if (token.type == TokenType::kNumeric) {
-    return ConstantValueExp(
-        Value(static_cast<int64_t>(std::stoll(token.value))));
-  }
-  if (token.type == TokenType::kString) {
-    return ConstantValueExp(Value(std::move(token.value)));
-  }
-  throw std::runtime_error("Unsupported expression");
-}
-
 Token Parser::Peek() {
   if (pos_ >= tokens_.size()) {
     return {TokenType::kEof, ""};
   }
   return tokens_[pos_];
 }
-
 
 Token Parser::Advance() {
   if (pos_ >= tokens_.size()) {
@@ -249,6 +170,13 @@ void Parser::Expect(TokenType type) {
   if (token.type != type) {
     throw std::runtime_error("Unexpected token");
   }
+}
+
+Expression Parser::ParseExpression() {
+  PrattParser pratt_parser(tokens_.begin() + pos_, tokens_.end());
+  Expression expr = pratt_parser.ParseExpression(0);
+  pos_ += pratt_parser.GetPos();  // Advance Parser's position
+  return expr;
 }
 
 }  // namespace tinylamb

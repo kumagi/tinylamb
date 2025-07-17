@@ -113,8 +113,9 @@ TEST(ParserTest, SelectStar) {
   ASSERT_EQ(select.FromClause().size(), 1);
   ASSERT_EQ(select.FromClause()[0], "users");
   ASSERT_EQ(select.SelectList().size(), 1);
-  ASSERT_EQ(select.SelectList()[0].expression->AsColumnValue().GetColumnName().name,
-            "*");
+  ASSERT_EQ(
+      select.SelectList()[0].expression->AsColumnValue().GetColumnName().name,
+      "*");
 }
 
 TEST(ParserTest, SelectWithExpression) {

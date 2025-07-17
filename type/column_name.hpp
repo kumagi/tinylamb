@@ -21,9 +21,9 @@
 #ifndef TINYLAMB_COLUMN_NAME_HPP
 #define TINYLAMB_COLUMN_NAME_HPP
 
+#include <cstdint>
 #include <iosfwd>
 #include <string>
-#include <cstdint>
 
 namespace tinylamb {
 

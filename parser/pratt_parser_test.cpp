@@ -22,16 +22,22 @@
 #include <vector>
 
 #include "expression/binary_expression.hpp"
+#include "expression/function_call_expression.hpp"
 #include "parser/token.hpp"
 #include "parser/tokenizer.hpp"
 
 namespace tinylamb {
 
 TEST(ExpressionParserTest, Simple) {
+  // Arrange
   Tokenizer tokenizer("1 + 2");
   std::vector<Token> tokens = tokenizer.Tokenize();
-  PrattParser parser(tokens);
+
+  // Act
+  PrattParser parser(tokens.begin(), tokens.end());
   Expression expr = parser.ParseExpression();
+
+  // Assert
   ASSERT_EQ(expr->Type(), TypeTag::kBinaryExp);
   auto& be = expr->AsBinaryExpression();
   ASSERT_EQ(be.Op(), BinaryOperation::kAdd);
@@ -40,10 +46,15 @@ TEST(ExpressionParserTest, Simple) {
 }
 
 TEST(ExpressionParserTest, Precedence) {
+  // Arrange
   Tokenizer tokenizer("1 + 2 * 3");
   std::vector<Token> tokens = tokenizer.Tokenize();
-  PrattParser parser(tokens);
+
+  // Act
+  PrattParser parser(tokens.begin(), tokens.end());
   Expression expr = parser.ParseExpression();
+
+  // Assert
   ASSERT_EQ(expr->Type(), TypeTag::kBinaryExp);
   auto& be = expr->AsBinaryExpression();
   ASSERT_EQ(be.Op(), BinaryOperation::kAdd);
@@ -54,10 +65,15 @@ TEST(ExpressionParserTest, Precedence) {
 }
 
 TEST(ExpressionParserTest, Parentheses) {
+  // Arrange
   Tokenizer tokenizer("(1 + 2) * 3");
   std::vector<Token> tokens = tokenizer.Tokenize();
-  PrattParser parser(tokens);
+
+  // Act
+  PrattParser parser(tokens.begin(), tokens.end());
   Expression expr = parser.ParseExpression();
+
+  // Assert
   ASSERT_EQ(expr->Type(), TypeTag::kBinaryExp);
   auto& be = expr->AsBinaryExpression();
   ASSERT_EQ(be.Op(), BinaryOperation::kMultiply);
@@ -67,34 +83,87 @@ TEST(ExpressionParserTest, Parentheses) {
   ASSERT_EQ(be2.Op(), BinaryOperation::kAdd);
 }
 
-TEST(ExpressionParserTest, DifficultCases) {
-  // -1 * (2 + 3)
-  Tokenizer tokenizer1("-1 * (2 + 3)");
-  std::vector<Token> tokens1 = tokenizer1.Tokenize();
-  PrattParser parser1(tokens1);
-  Expression expr1 = parser1.ParseExpression();
-  ASSERT_EQ(expr1->ToString(), "(-1 * (2 + 3))");
+TEST(ExpressionParserTest, DifficultCaseUnaryMultiply) {
+  // Arrange
+  Tokenizer tokenizer("-1 * (2 + 3)");
+  std::vector<Token> tokens = tokenizer.Tokenize();
 
-  // a * b + c * d
-  Tokenizer tokenizer2("a * b + c * d");
-  std::vector<Token> tokens2 = tokenizer2.Tokenize();
-  PrattParser parser2(tokens2);
-  Expression expr2 = parser2.ParseExpression();
-  ASSERT_EQ(expr2->ToString(), "((a * b) + (c * d))");
+  // Act
+  PrattParser parser(tokens.begin(), tokens.end());
+  Expression expr = parser.ParseExpression();
 
-  // a + b * c + d
-  Tokenizer tokenizer3("a + b * c + d");
-  std::vector<Token> tokens3 = tokenizer3.Tokenize();
-  PrattParser parser3(tokens3);
-  Expression expr3 = parser3.ParseExpression();
-  ASSERT_EQ(expr3->ToString(), "((a + (b * c)) + d)");
+  // Assert
+  ASSERT_EQ(expr->ToString(), "((-1) * (2 + 3))");
+}
 
-  // (a + b) * (c + d)
-  Tokenizer tokenizer4("(a + b) * (c + d)");
-  std::vector<Token> tokens4 = tokenizer4.Tokenize();
-  PrattParser parser4(tokens4);
-  Expression expr4 = parser4.ParseExpression();
-  ASSERT_EQ(expr4->ToString(), "((a + b) * (c + d))");
+TEST(ExpressionParserTest, DifficultCaseMultiplyAddMultiply) {
+  // Arrange
+  Tokenizer tokenizer("a * b + c * d");
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Act
+  PrattParser parser(tokens.begin(), tokens.end());
+  Expression expr = parser.ParseExpression();
+
+  // Assert
+  ASSERT_EQ(expr->ToString(), "((a * b) + (c * d))");
+}
+
+TEST(ExpressionParserTest, DifficultCaseAddMultiplyAdd) {
+  // Arrange
+  Tokenizer tokenizer("a + b * c + d");
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Act
+  PrattParser parser(tokens.begin(), tokens.end());
+  Expression expr = parser.ParseExpression();
+
+  // Assert
+  ASSERT_EQ(expr->ToString(), "((a + (b * c)) + d)");
+}
+
+TEST(ExpressionParserTest, DifficultCaseParenthesesMultiplyParentheses) {
+  // Arrange
+  Tokenizer tokenizer("(a + b) * (c + d)");
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Act
+  PrattParser parser(tokens.begin(), tokens.end());
+  Expression expr = parser.ParseExpression();
+
+  // Assert
+  ASSERT_EQ(expr->ToString(), "((a + b) * (c + d))");
+}
+
+TEST(ExpressionParserTest, DifficultCaseNegativeParenthesesMultiply) {
+  // Arrange
+  Tokenizer tokenizer("-(a + b) * c");
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Act
+  PrattParser parser(tokens.begin(), tokens.end());
+  Expression expr = parser.ParseExpression();
+
+  // Assert
+  ASSERT_EQ(expr->ToString(), "((-(a + b)) * c)");
+}
+
+TEST(ExpressionParserTest, FunctionCall) {
+  // Arrange
+  Tokenizer tokenizer("f(1, a + 2)");
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Act
+  PrattParser parser(tokens.begin(), tokens.end());
+  Expression expr = parser.ParseExpression();
+
+  // Assert
+  ASSERT_EQ(expr->Type(), TypeTag::kFunctionCallExp);
+  auto& fce = expr->AsFunctionCallExpression();
+  ASSERT_EQ(fce.FuncName(), "f");
+  ASSERT_EQ(fce.Args().size(), 2);
+  ASSERT_EQ(fce.Args()[0]->ToString(), "1");
+  ASSERT_EQ(fce.Args()[1]->ToString(), "(a + 2)");
 }
 
 }  // namespace tinylamb

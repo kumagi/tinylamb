@@ -30,7 +30,7 @@ class Transaction;
 class IndexScanIterator : public IteratorBase {
  public:
   IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
-                    Value  begin = Value(), Value  end = Value(),
+                    Value begin = Value(), Value end = Value(),
                     bool ascending = true);
   IndexScanIterator(const IndexScanIterator&) = delete;
   IndexScanIterator(IndexScanIterator&&) = delete;

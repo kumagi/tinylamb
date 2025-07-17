@@ -26,23 +26,22 @@
 #include <utility>
 #include <vector>
 
-#include "type/value.hpp"
 #include "common/constants.hpp"
 #include "executor/executor_base.hpp"
 #include "table/table.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 IndexJoin::IndexJoin(Transaction& txn, Executor left,
-                     std::vector <slot_t> left_cols, const Table& tbl,
-                     const Index& idx, std::vector <slot_t> right_cols)
-  : txn_(txn),
-    left_(std::move(left)),
-    left_cols_(std::move(left_cols)),
-    right_(tbl),
-    right_idx_(idx),
-    right_it_(nullptr),
-    right_cols_(std::move(right_cols)) {
-}
+                     std::vector<slot_t> left_cols, const Table& tbl,
+                     const Index& idx, std::vector<slot_t> right_cols)
+    : txn_(txn),
+      left_(std::move(left)),
+      left_cols_(std::move(left_cols)),
+      right_(tbl),
+      right_idx_(idx),
+      right_it_(nullptr),
+      right_cols_(std::move(right_cols)) {}
 
 bool IndexJoin::Load() {
   for (;;) {
@@ -50,8 +49,8 @@ bool IndexJoin::Load() {
       return false;
     }
     Value left_key = hold_left_.Extract(left_cols_)[0];
-    right_it_ = std::make_unique <IndexScanIterator>(right_, right_idx_, txn_,
-                                                     left_key, left_key);
+    right_it_ = std::make_unique<IndexScanIterator>(right_, right_idx_, txn_,
+                                                    left_key, left_key);
     if (right_it_->IsValid()) {
       return true;
     }
@@ -98,4 +97,4 @@ void IndexJoin::Dump(std::ostream& o, int indent) const {
   left_->Dump(o, indent + 2);
   o << "\n" << Indent(indent + 2) << right_.GetSchema();
 }
-} // namespace tinylamb
+}  // namespace tinylamb

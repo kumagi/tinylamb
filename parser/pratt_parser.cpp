@@ -23,6 +23,7 @@
 
 #include "expression/binary_expression.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/function_call_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "parser/ast.hpp"
 #include "parser/token.hpp"
@@ -30,7 +31,9 @@
 
 namespace tinylamb {
 
-PrattParser::PrattParser(const std::vector<Token>& tokens) : tokens_(tokens) {}
+PrattParser::PrattParser(std::vector<Token>::const_iterator begin,
+                         std::vector<Token>::const_iterator end)
+    : begin_pos_(begin), current_pos_(begin), end_pos_(end) {}
 
 int PrattParser::GetPrecedence() {
   const Token& token = Peek();
@@ -49,43 +52,29 @@ int PrattParser::GetPrecedence() {
   return 0;
 }
 
+namespace {
+BinaryOperation GetBinaryOperation(const std::string& op_str) {
+  if (op_str == "=") return BinaryOperation::kEquals;
+  if (op_str == "!=") return BinaryOperation::kNotEquals;
+  if (op_str == "<") return BinaryOperation::kLessThan;
+  if (op_str == "<=") return BinaryOperation::kLessThanEquals;
+  if (op_str == ">") return BinaryOperation::kGreaterThan;
+  if (op_str == ">=") return BinaryOperation::kGreaterThanEquals;
+  if (op_str == "+") return BinaryOperation::kAdd;
+  if (op_str == "-") return BinaryOperation::kSubtract;
+  if (op_str == "*") return BinaryOperation::kMultiply;
+  if (op_str == "/") return BinaryOperation::kDivide;
+  throw std::runtime_error("Unsupported binary operation: " + op_str);
+}
+}  // namespace
+
 Expression PrattParser::ParseExpression(int precedence) {
   Expression left = ParseUnary();
   while (precedence < GetPrecedence()) {
+    int current_op_precedence = GetPrecedence();
     Token op = Advance();
-    if (op.value == "=") {
-      left = BinaryExpressionExp(left, BinaryOperation::kEquals,
-                                 ParseExpression(GetPrecedence()));
-    } else if (op.value == "!=") {
-      left = BinaryExpressionExp(left, BinaryOperation::kNotEquals,
-                                 ParseExpression(GetPrecedence()));
-    } else if (op.value == "<") {
-      left = BinaryExpressionExp(left, BinaryOperation::kLessThan,
-                                 ParseExpression(GetPrecedence()));
-    } else if (op.value == "<=") {
-      left = BinaryExpressionExp(left, BinaryOperation::kLessThanEquals,
-                                 ParseExpression(GetPrecedence()));
-    } else if (op.value == ">") {
-      left = BinaryExpressionExp(left, BinaryOperation::kGreaterThan,
-                                 ParseExpression(GetPrecedence()));
-    } else if (op.value == ">=") {
-      left = BinaryExpressionExp(left, BinaryOperation::kGreaterThanEquals,
-                                 ParseExpression(GetPrecedence()));
-    } else if (op.value == "+") {
-      left = BinaryExpressionExp(left, BinaryOperation::kAdd,
-                                 ParseExpression(GetPrecedence()));
-    } else if (op.value == "-") {
-      left = BinaryExpressionExp(left, BinaryOperation::kSubtract,
-                                 ParseExpression(GetPrecedence()));
-    } else if (op.value == "*") {
-      left = BinaryExpressionExp(left, BinaryOperation::kMultiply,
-                                 ParseExpression(GetPrecedence()));
-    } else if (op.value == "/") {
-      left = BinaryExpressionExp(left, BinaryOperation::kDivide,
-                                 ParseExpression(GetPrecedence()));
-    } else {
-      throw std::runtime_error("Unsupported expression: " + op.ToString());
-    }
+    left = BinaryExpressionExp(left, GetBinaryOperation(op.value),
+                               ParseExpression(current_op_precedence));
   }
   return left;
 }
@@ -107,6 +96,20 @@ Expression PrattParser::ParsePrimary() {
   }
   Token token = Advance();
   if (token.type == TokenType::kIdentifier) {
+    std::string func_name = token.value;
+    if (Peek().type == TokenType::kLParen) {
+      Advance();  // Consume '('
+      std::vector<Expression> args;
+      if (Peek().type != TokenType::kRParen) {
+        args.push_back(ParseExpression(0));
+        while (Peek().type == TokenType::kComma) {
+          Advance();  // Consume ','
+          args.push_back(ParseExpression(0));
+        }
+      }
+      Expect(TokenType::kRParen);  // Consume ')'
+      return FunctionCallExp(func_name, std::move(args));
+    }
     return ColumnValueExp(token.value);
   }
   if (token.type == TokenType::kNumeric) {
@@ -120,17 +123,17 @@ Expression PrattParser::ParsePrimary() {
 }
 
 Token PrattParser::Peek() {
-  if (pos_ >= tokens_.size()) {
+  if (current_pos_ >= end_pos_) {
     return {TokenType::kEof, ""};
   }
-  return tokens_[pos_];
+  return *current_pos_;
 }
 
 Token PrattParser::Advance() {
-  if (pos_ >= tokens_.size()) {
+  if (current_pos_ >= end_pos_) {
     return {TokenType::kEof, ""};
   }
-  return tokens_[pos_++];
+  return *current_pos_++;
 }
 
 void PrattParser::Expect(TokenType type) {

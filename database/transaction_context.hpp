@@ -39,6 +39,7 @@ class TransactionContext {
     rs_ = o.rs_;
     return *this;
   }
+  Database* GetDB() { return rs_; }
   StatusOr<std::shared_ptr<Table>> GetTable(std::string_view table_name);
   StatusOr<std::shared_ptr<TableStatistics>> GetStats(
       std::string_view table_name);

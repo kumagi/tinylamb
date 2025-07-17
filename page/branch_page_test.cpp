@@ -26,12 +26,12 @@
 #include <unordered_map>
 #include <vector>
 
-#include "common/status_or.hpp"
+#include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "page/leaf_page.hpp"
-#include "common/constants.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
 #include "page/page_type.hpp"
@@ -42,7 +42,7 @@
 
 namespace tinylamb {
 class BranchPageTest : public ::testing::Test {
-protected:
+ protected:
   void SetUp() override {
     std::string prefix = "branch_page_test-" + RandomString();
     db_name_ = prefix + ".db";
@@ -74,12 +74,12 @@ protected:
     lm_.reset();
     l_.reset();
     p_.reset();
-    p_ = std::make_unique <PageManager>(db_name_, 10);
-    l_ = std::make_unique <Logger>(log_name_);
-    lm_ = std::make_unique <LockManager>();
-    r_ = std::make_unique <RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique <TransactionManager>(lm_.get(), p_.get(), l_.get(),
-                                                r_.get());
+    p_ = std::make_unique<PageManager>(db_name_, 10);
+    l_ = std::make_unique<Logger>(log_name_);
+    lm_ = std::make_unique<LockManager>();
+    r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
+    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
+                                               r_.get());
     // r_->RecoverFrom(0, tm_.get());
   }
 
@@ -90,16 +90,15 @@ protected:
 
   std::string db_name_;
   std::string log_name_;
-  std::unique_ptr <LockManager> lm_;
-  std::unique_ptr <PageManager> p_;
-  std::unique_ptr <Logger> l_;
-  std::unique_ptr <RecoveryManager> r_;
-  std::unique_ptr <TransactionManager> tm_;
+  std::unique_ptr<LockManager> lm_;
+  std::unique_ptr<PageManager> p_;
+  std::unique_ptr<Logger> l_;
+  std::unique_ptr<RecoveryManager> r_;
+  std::unique_ptr<TransactionManager> tm_;
   page_id_t branch_page_id_{0};
 };
 
-TEST_F(BranchPageTest, Construct) {
-}
+TEST_F(BranchPageTest, Construct) {}
 
 TEST_F(BranchPageTest, SetMinimumTree) {
   auto txn = tm_->Begin();
@@ -133,7 +132,8 @@ TEST_F(BranchPageTest, InsertKey) {
   ASSERT_SUCCESS(txn.PreCommit());
 }
 
-TEST_F(BranchPageTest, GetPageForKey) { {
+TEST_F(BranchPageTest, GetPageForKey) {
+  {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
@@ -196,7 +196,8 @@ TEST_F(BranchPageTest, InsertAndGetKey) {
 }
 
 TEST_F(BranchPageTest, UpdateKey) {
-  auto txn = tm_->Begin(); {
+  auto txn = tm_->Begin();
+  {
     PageRef page = Page();
     page->SetLowestValue(txn, 100);
     ASSERT_SUCCESS(page->InsertBranch(txn, "a", 1));
@@ -240,7 +241,7 @@ TEST_F(BranchPageTest, SplitInto) {
     page->SetLowestValue(txn, 0);
     for (int j = 0; j < 8; ++j) {
       ASSERT_SUCCESS(
-        page->InsertBranch(txn, std::string(4000, '0' + j), j + 1));
+          page->InsertBranch(txn, std::string(4000, '0' + j), j + 1));
     }
 
     PageRef right = p_->AllocateNewPage(txn, PageType::kBranchPage);
@@ -249,7 +250,8 @@ TEST_F(BranchPageTest, SplitInto) {
   }
 }
 
-TEST_F(BranchPageTest, Recovery) { {
+TEST_F(BranchPageTest, Recovery) {
+  {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
@@ -260,7 +262,7 @@ TEST_F(BranchPageTest, Recovery) { {
     txn.PreCommit();
   }
 
-  Recover(); // Expect redo happen.
+  Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
   AssertPIDForKey("alpha", 2);
@@ -269,7 +271,8 @@ TEST_F(BranchPageTest, Recovery) { {
   AssertPIDForKey("zeta", 40);
 }
 
-TEST_F(BranchPageTest, InsertCrash) { {
+TEST_F(BranchPageTest, InsertCrash) {
+  {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
@@ -277,14 +280,15 @@ TEST_F(BranchPageTest, InsertCrash) { {
     Flush();
     ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     PageRef page = Page();
     ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
     ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
   }
 
-  Recover(); // Expect redo happen.
+  Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
   AssertPIDForKey("alpha", 2);
@@ -293,15 +297,18 @@ TEST_F(BranchPageTest, InsertCrash) { {
   AssertPIDForKey("zeta", 23);
 }
 
-TEST_F(BranchPageTest, InsertAbort) { {
+TEST_F(BranchPageTest, InsertAbort) {
+  {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
 
     ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
     txn.PreCommit();
-  } {
-    auto txn = tm_->Begin(); {
+  }
+  {
+    auto txn = tm_->Begin();
+    {
       PageRef page = Page();
       ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
       ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
@@ -310,7 +317,7 @@ TEST_F(BranchPageTest, InsertAbort) { {
     txn.Abort();
   }
 
-  Recover(); // Expect redo happen.
+  Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
   AssertPIDForKey("alpha", 2);
@@ -319,7 +326,8 @@ TEST_F(BranchPageTest, InsertAbort) { {
   AssertPIDForKey("zeta", 23);
 }
 
-TEST_F(BranchPageTest, UpdateCrash) { {
+TEST_F(BranchPageTest, UpdateCrash) {
+  {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
@@ -327,7 +335,8 @@ TEST_F(BranchPageTest, UpdateCrash) { {
     ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
     ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     PageRef page = Page();
     ASSERT_SUCCESS(page->UpdateBranch(txn, "b", 200));
@@ -336,7 +345,7 @@ TEST_F(BranchPageTest, UpdateCrash) { {
     Flush();
   }
 
-  Recover(); // Expect redo happen.
+  Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
   AssertPIDForKey("alpha", 2);
@@ -345,7 +354,8 @@ TEST_F(BranchPageTest, UpdateCrash) { {
   AssertPIDForKey("zeta", 400);
 }
 
-TEST_F(BranchPageTest, UpdateAbort) { {
+TEST_F(BranchPageTest, UpdateAbort) {
+  {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
@@ -353,8 +363,10 @@ TEST_F(BranchPageTest, UpdateAbort) { {
     ASSERT_SUCCESS(page->InsertBranch(txn, "b", 20));
     ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
     txn.PreCommit();
-  } {
-    auto txn = tm_->Begin(); {
+  }
+  {
+    auto txn = tm_->Begin();
+    {
       PageRef page = Page();
       ASSERT_SUCCESS(page->UpdateBranch(txn, "b", 2000));
       ASSERT_SUCCESS(page->UpdateBranch(txn, "e", 4000));
@@ -362,7 +374,7 @@ TEST_F(BranchPageTest, UpdateAbort) { {
     txn.Abort();
   }
 
-  Recover(); // Expect redo happen.
+  Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
   AssertPIDForKey("alpha", 2);
@@ -371,7 +383,8 @@ TEST_F(BranchPageTest, UpdateAbort) { {
   AssertPIDForKey("zeta", 40);
 }
 
-TEST_F(BranchPageTest, DeleteCrash) { {
+TEST_F(BranchPageTest, DeleteCrash) {
+  {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
@@ -380,14 +393,15 @@ TEST_F(BranchPageTest, DeleteCrash) { {
     ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
     Flush();
     txn.PreCommit();
-  } {
+  }
+  {
     auto txn = tm_->Begin();
     PageRef page = Page();
     ASSERT_SUCCESS(page->Delete(txn, "b"));
     ASSERT_SUCCESS(page->Delete(txn, "e"));
   }
 
-  Recover(); // Expect redo happen.
+  Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
   AssertPIDForKey("alpha", 2);
@@ -396,7 +410,8 @@ TEST_F(BranchPageTest, DeleteCrash) { {
   AssertPIDForKey("zeta", 40);
 }
 
-TEST_F(BranchPageTest, DeleteAbort) { {
+TEST_F(BranchPageTest, DeleteAbort) {
+  {
     auto txn = tm_->Begin();
     PageRef page = Page();
     page->SetLowestValue(txn, 2);
@@ -404,8 +419,10 @@ TEST_F(BranchPageTest, DeleteAbort) { {
     ASSERT_SUCCESS(page->InsertBranch(txn, "e", 40));
     ASSERT_SUCCESS(page->InsertBranch(txn, "c", 23));
     txn.PreCommit();
-  } {
-    auto txn = tm_->Begin(); {
+  }
+  {
+    auto txn = tm_->Begin();
+    {
       PageRef page = Page();
       ASSERT_SUCCESS(page->Delete(txn, "b"));
       ASSERT_SUCCESS(page->Delete(txn, "e"));
@@ -414,7 +431,7 @@ TEST_F(BranchPageTest, DeleteAbort) { {
     Flush();
   }
 
-  Recover(); // Expect redo happen.
+  Recover();  // Expect redo happen.
   r_->RecoverFrom(0, tm_.get());
 
   AssertPIDForKey("alpha", 2);
@@ -427,8 +444,8 @@ TEST_F(BranchPageTest, UpdateHeavy) {
   std::mt19937 random(0);
   constexpr int kCount = 40;
   Transaction txn = tm_->Begin();
-  std::vector <std::string> keys;
-  std::unordered_map <std::string, page_id_t> kvp;
+  std::vector<std::string> keys;
+  std::unordered_map<std::string, page_id_t> kvp;
   keys.reserve(kCount);
   PageRef page = Page();
   page->SetLowestValue(txn, 999);
@@ -451,7 +468,7 @@ TEST_F(BranchPageTest, UpdateHeavy) {
     ASSERT_SUCCESS(page->InsertBranch(txn, key, value));
     kvp[key] = value;
   }
-  for (const auto& kv: kvp) {
+  for (const auto& kv : kvp) {
     ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, kv.first, false),
                           kvp[kv.first]);
   }
@@ -477,7 +494,8 @@ TEST_F(BranchPageTest, Fences) {
 
 TEST_F(BranchPageTest, FencesCrash) {
   std::string low = RandomString(1234, false);
-  std::string high = RandomString(4567, false); {
+  std::string high = RandomString(4567, false);
+  {
     Transaction txn = tm_->Begin();
     PageRef page = Page();
     ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey(low)));
@@ -487,7 +505,8 @@ TEST_F(BranchPageTest, FencesCrash) {
     ASSERT_SUCCESS(txn.PreCommit());
   }
   Recover();
-  r_->RecoverFrom(0, tm_.get()); {
+  r_->RecoverFrom(0, tm_.get());
+  {
     auto restarted_txn = tm_->Begin();
     PageRef recovered_page = Page();
     ASSERT_EQ(recovered_page->GetLowFence(restarted_txn), IndexKey(low));
@@ -515,7 +534,8 @@ TEST_F(BranchPageTest, FosterChild) {
 
 TEST_F(BranchPageTest, FosterChildCrash) {
   for (int i = 0; i < 5; ++i) {
-    std::string key = RandomString(((19937 * i) % 12) + 10000, false); {
+    std::string key = RandomString(((19937 * i) % 12) + 10000, false);
+    {
       Transaction txn = tm_->Begin();
       PageRef page = Page();
       ASSERT_SUCCESS(page->SetFoster(txn, {key, page_id_t(i)}));
@@ -525,7 +545,8 @@ TEST_F(BranchPageTest, FosterChildCrash) {
       ASSERT_SUCCESS(txn.PreCommit());
     }
     Recover();
-    r_->RecoverFrom(0, tm_.get()); {
+    r_->RecoverFrom(0, tm_.get());
+    {
       Transaction txn = tm_->Begin();
       PageRef page = Page();
       ASSIGN_OR_ASSERT_FAIL(FosterPair, result, page->GetFoster(txn));
@@ -557,4 +578,4 @@ TEST_F(BranchPageTest, MoveLeftFromFoster1) {
   ASSERT_SUCCESS(page->body.branch_page.MoveLeftFromFoster(txn, *foster));
   ASSERT_EQ(page->RowCount(), 4);
 }
-} // namespace tinylamb
+}  // namespace tinylamb

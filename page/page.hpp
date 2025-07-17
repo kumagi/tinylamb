@@ -34,7 +34,7 @@
 
 namespace tinylamb {
 class Page {
-public:
+ public:
   Page(page_id_t pid, PageType type);
 
   void PageInit(page_id_t pid, PageType type);
@@ -55,9 +55,9 @@ public:
   size_t RowCount(Transaction& txn) const;
 
   // Row page manipulations.
-  StatusOr <std::string_view> Read(Transaction& txn, slot_t slot) const;
+  StatusOr<std::string_view> Read(Transaction& txn, slot_t slot) const;
 
-  StatusOr <slot_t> Insert(Transaction& txn, std::string_view record);
+  StatusOr<slot_t> Insert(Transaction& txn, std::string_view record);
 
   Status Update(Transaction& txn, slot_t slot, std::string_view row);
 
@@ -65,7 +65,7 @@ public:
 
   [[nodiscard]] slot_t RowCount() const;
 
-  StatusOr <std::string_view> ReadKey(Transaction& txn, slot_t slot) const;
+  StatusOr<std::string_view> ReadKey(Transaction& txn, slot_t slot) const;
 
   std::string_view GetKey(slot_t slot) const;
 
@@ -82,7 +82,7 @@ public:
 
   [[nodiscard]] Status SetFoster(Transaction& txn, const FosterPair& foster);
 
-  [[nodiscard]] StatusOr <FosterPair> GetFoster(Transaction& txn) const;
+  [[nodiscard]] StatusOr<FosterPair> GetFoster(Transaction& txn) const;
 
   Status MoveRightToFoster(Transaction& txn, Page& foster);
 
@@ -102,19 +102,19 @@ public:
 
   Status Delete(Transaction& txn, std::string_view key);
 
-  StatusOr <std::string_view> Read(Transaction& txn, std::string_view key) const;
+  StatusOr<std::string_view> Read(Transaction& txn, std::string_view key) const;
 
-  StatusOr <std::string_view> LowestKey(Transaction& txn) const;
+  StatusOr<std::string_view> LowestKey(Transaction& txn) const;
 
-  StatusOr <std::string_view> HighestKey(Transaction& txn) const;
+  StatusOr<std::string_view> HighestKey(Transaction& txn) const;
 
   // Branch page manipulations.
   Status InsertBranch(Transaction& txn, std::string_view key, page_id_t pid);
 
   Status UpdateBranch(Transaction& txn, std::string_view key, page_id_t pid);
 
-  StatusOr <page_id_t> GetPageForKey(Transaction& txn, std::string_view key,
-                                     bool less_than) const;
+  StatusOr<page_id_t> GetPageForKey(Transaction& txn, std::string_view key,
+                                    bool less_than) const;
 
   void SetLowestValue(Transaction& txn, page_id_t v);
 
@@ -173,29 +173,28 @@ public:
   mutable uint64_t checksum = 0;
 
   union PageBody {
-    std::array <char, kPageBodySize> dummy_;
+    std::array<char, kPageBodySize> dummy_;
     MetaPage meta_page;
     FreePage free_page;
     RowPage row_page;
     LeafPage leaf_page;
     BranchPage branch_page;
 
-    PageBody() : dummy_() {
-    }
+    PageBody() : dummy_() {}
   };
 
   PageBody body;
 };
 
-static_assert(std::is_trivially_destructible <Page>::value == true,
+static_assert(std::is_trivially_destructible<Page>::value == true,
               "Page must be trivially destructible");
 static_assert(sizeof(Page) == kPageSize,
               "Page size must be equal to kPageSize");
-} // namespace tinylamb
+}  // namespace tinylamb
 
-template<>
-class std::hash <tinylamb::Page> {
-public:
+template <>
+class std::hash<tinylamb::Page> {
+ public:
   uint64_t operator()(const tinylamb::Page& p) const;
 };
 

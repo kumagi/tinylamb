@@ -22,7 +22,10 @@
 #include <string>
 #include <unordered_set>
 
+#include "common/status_or.hpp"
+#include "database/transaction_context.hpp"
 #include "type/column_name.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -35,16 +38,7 @@ class UnaryExpression;
 class AggregateExpression;
 class CaseExpression;
 class InExpression;
-
-enum class TypeTag : int {
-  kBinaryExp,
-  kColumnValue,
-  kConstantValue,
-  kUnaryExp,
-  kAggregateExp,
-  kCaseExp,
-  kInExp,
-};
+class FunctionCallExpression;
 
 class ExpressionBase {
  public:
@@ -63,9 +57,26 @@ class ExpressionBase {
   [[nodiscard]] const AggregateExpression& AsAggregateExpression() const;
   [[nodiscard]] const CaseExpression& AsCaseExpression() const;
   [[nodiscard]] const InExpression& AsInExpression() const;
+  [[nodiscard]] const FunctionCallExpression& AsFunctionCallExpression() const;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const;
   [[nodiscard]] virtual Value Evaluate(const Row& row,
                                        const Schema& schema) const = 0;
+  [[nodiscard]] virtual Value Evaluate(const Row* left,
+                                       const Schema& left_schema,
+                                       const Row* right,
+                                       const Schema& right_schema) const {
+    throw std::runtime_error("not implemented");
+  };
+  [[nodiscard]] virtual tinylamb::Type ResultType(const Schema& schema) const {
+    throw std::runtime_error("not implemented");
+  }
+  [[nodiscard]] virtual tinylamb::Type ResultType(const Schema& left,
+                                                  const Schema& right) const {
+    throw std::runtime_error("not implemented");
+  }
+  virtual Status Validate(TransactionContext& ctx, const Schema& schema) const {
+    return Status::kSuccess;
+  }
   [[nodiscard]] virtual std::string ToString() const = 0;
   virtual void Dump(std::ostream& o) const = 0;
   friend std::ostream& operator<<(std::ostream& o, const ExpressionBase& e) {
@@ -86,6 +97,8 @@ Expression CaseExpressionExp(
     std::vector<std::pair<Expression, Expression>> when_clauses,
     Expression else_clause);
 Expression InExpressionExp(Expression child, std::vector<Expression> list);
+Expression FunctionCallExp(const std::string& func_name,
+                           std::vector<Expression> args);
 
 }  // namespace tinylamb
 
