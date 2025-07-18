@@ -43,6 +43,14 @@ int CreateFile(const std::filesystem::path& path) {
   return ::open(path.c_str(), O_RDWR | O_CREAT | O_APPEND, 0666);
 }
 
+int FdataSync(int fd) {
+#if defined(__APPLE__)
+  return ::fcntl(fd, F_FULLFSYNC);
+#else
+  return fdatasync(fd);
+#endif
+}
+
 }  // namespace
 
 Logger::Logger(const std::filesystem::path& logfile, size_t buffer_size,
@@ -122,7 +130,7 @@ void Logger::LoggerWork() {
       break;
     }
 
-    fdatasync(dst_);  // Flush!
+    FdataSync(dst_);  // Flush!
     flushed_lsn_.store(flushed_lsn + flushed_size, std::memory_order_release);
   }
   fsync(dst_);

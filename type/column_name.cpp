@@ -14,9 +14,6 @@
  * limitations under the License.
  */
 
-//
-// Created by kumagi on 22/07/07.
-//
 #include "type/column_name.hpp"
 
 #include <cstdint>
@@ -56,6 +53,6 @@ Decoder& operator>>(Decoder& e, ColumnName& c) {
 uint64_t std::hash<tinylamb::ColumnName>::operator()(
     const tinylamb::ColumnName& c) const {
   uint64_t result = std::hash<std::string_view>()(c.schema);
-  result = std::hash<std::string_view>()(c.name);
+  result += std::hash<std::string_view>()(c.name);
   return result;
 }

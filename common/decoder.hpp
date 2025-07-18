@@ -35,6 +35,7 @@ class Decoder {
   Decoder& operator>>(slot_t& slot);
   Decoder& operator>>(int64_t& i64);
   Decoder& operator>>(uint64_t& u64);
+  Decoder& operator>>(size_t& size);
   Decoder& operator>>(double& d);
   Decoder& operator>>(ValueType& v);
   Decoder& operator>>(bool& v);

@@ -20,7 +20,6 @@
 #include <memory>
 #include <ostream>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"

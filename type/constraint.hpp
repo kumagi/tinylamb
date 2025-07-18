@@ -71,9 +71,9 @@ struct Constraint {
 }  // namespace tinylamb
 
 template <>
-class std::hash<tinylamb::Constraint> {
+struct std::hash<tinylamb::Constraint> {
  public:
-  uint64_t operator()(const tinylamb::Constraint& c) const;
+  uint64_t operator()(const tinylamb::Constraint& c) const noexcept;
 };
 
 #endif  // TINYLAMB_CONSTRAINT_HPP

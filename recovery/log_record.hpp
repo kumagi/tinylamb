@@ -17,12 +17,9 @@
 #ifndef TINYLAMB_LOG_RECORD_HPP
 #define TINYLAMB_LOG_RECORD_HPP
 
-#include <cassert>
 #include <istream>
 #include <limits>
 #include <ostream>
-#include <unordered_set>
-#include <utility>
 
 #include "checkpoint_manager.hpp"
 #include "common/decoder.hpp"

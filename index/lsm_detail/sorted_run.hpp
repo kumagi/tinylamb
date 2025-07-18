@@ -30,10 +30,12 @@
 #include <utility>
 #include <vector>
 
+#include "common/env_endian.hpp"
 #include "common/log_message.hpp"
 #include "common/status_or.hpp"
 #include "common/vm_cache.hpp"
 #include "index/lsm_detail/blob_file.hpp"
+
 
 namespace tinylamb {
 

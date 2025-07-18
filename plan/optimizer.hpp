@@ -20,7 +20,6 @@
 #include <memory>
 
 #include "common/status_or.hpp"
-#include "executor/executor_base.hpp"
 #include "query/query_data.hpp"
 
 namespace tinylamb {

@@ -63,6 +63,7 @@ class Value {
   explicit Value(double double_value);
   Value(const Value& o);
   Value(Value&& o) noexcept;
+  explicit Value(long i);
   Value& operator=(const Value& o);
   Value& operator=(Value&& o) noexcept;
   ~Value() = default;

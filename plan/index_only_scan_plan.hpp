@@ -14,16 +14,16 @@
  * limitations under the License.
  */
 
-//
-// Created by kumagi on 22/06/19.
-//
-
 #ifndef TINYLAMB_INDEX_ONLY_SCAN_PLAN_HPP
 #define TINYLAMB_INDEX_ONLY_SCAN_PLAN_HPP
 
+#include <ostream>
+#include <cstddef>
+#include <vector>
 #include "plan/plan.hpp"
 #include "table/table_statistics.hpp"
 #include "type/row.hpp"
+#include "expression/named_expression.hpp"
 
 namespace tinylamb {
 class Index;

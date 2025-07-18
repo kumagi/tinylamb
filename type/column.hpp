@@ -17,12 +17,10 @@
 #ifndef TINYLAMB_COLUMN_HPP
 #define TINYLAMB_COLUMN_HPP
 
-#include <cassert>
 #include <memory>
 #include <string_view>
 #include <vector>
 
-#include "common/log_message.hpp"
 #include "page/row_position.hpp"
 #include "type/column_name.hpp"
 #include "type/constraint.hpp"
@@ -59,14 +57,10 @@ class Column {
 
 }  // namespace tinylamb
 
-namespace std {
-
 template <>
-class hash<tinylamb::Column> {
+struct std::hash<tinylamb::Column> {
  public:
-  uint64_t operator()(const tinylamb::Column& c) const;
-};
-
-}  // namespace std
+  uint64_t operator()(const tinylamb::Column& c) const noexcept;
+};  // namespace std
 
 #endif  // TINYLAMB_COLUMN_HPP

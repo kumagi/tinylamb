@@ -37,8 +37,8 @@
 
 namespace tinylamb {
 class LSMTree;
-void Flusher(const std::stop_token& st, LSMTree* tree);
-void Merger(const std::stop_token& st, LSMTree* tree);
+void Flusher(const bool& stop, LSMTree* tree);
+void Merger(const bool& stop, LSMTree* tree);
 
 class LSMTree final {
  public:
@@ -65,7 +65,8 @@ class LSMTree final {
   void MergeAll();
 
  private:
-  friend void Flusher(const std::stop_token& st, LSMTree* tree);
+  friend void Flusher(LSMTree* tree);
+  friend void Merger(LSMTree* tree);
   LSMView GetViewImpl() const { return {blob_, index_}; }
 
   struct FileAndIndex {
@@ -81,8 +82,9 @@ class LSMTree final {
 
   BlobFile blob_;
 
-  std::jthread flusher_;
-  std::jthread merger_;
+  std::atomic<bool> stop_{false};
+  std::thread flusher_;
+  std::thread merger_;
 
   mutable std::timed_mutex mem_tree_lock_;
   mutable std::timed_mutex file_tree_lock_;

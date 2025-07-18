@@ -14,17 +14,11 @@
  * limitations under the License.
  */
 
-//
-// Created by kumagi on 22/06/19.
-//
-
 #include "index_scan_plan.hpp"
 
 #include <cmath>
 #include <cstddef>
 #include <memory>
-#include <ostream>
-#include <utility>
 
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"

@@ -33,7 +33,6 @@
 #include "lsm_detail/sorted_run.hpp"
 
 namespace tinylamb {
-void Flusher(const std::stop_token& st, LSMTree* tree);
 
 std::filesystem::path BlobPath(const std::filesystem::path& dir) {
   return dir / "blob.db";
@@ -44,29 +43,30 @@ LSMTree::LSMTree(std::filesystem::path directory_path)
       root_dir_(std::move(directory_path)),
       blob_(BlobPath(root_dir_)) {
   std::filesystem::create_directory(root_dir_);
-  flusher_ = std::jthread(Flusher, this);
-  merger_ = std::jthread(Merger, this);
+  flusher_ = std::thread([&](){Flusher(this);});
+  merger_ = std::thread([&](){Merger(this);});
 }
 
 LSMTree::~LSMTree() {
+  stop_ = true;
   flusher_.join();
   merger_.join();
 }
 
-void Flusher(const std::stop_token& st, LSMTree* tree) {
+void Flusher(LSMTree* tree) {
   for (;;) {
     std::this_thread::sleep_for(std::chrono::microseconds(tree->every_us_));
-    if (st.stop_possible()) {
+    if (tree->stop_.load()) {
       break;
     }
     tree->Sync();
   }
 }
 
-void Merger(const std::stop_token& st, LSMTree* tree) {
+void Merger(LSMTree* tree) {
   for (;;) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    if (st.stop_possible()) {
+    if (tree->stop_.load()) {
       break;
     }
     tree->MergeAll();

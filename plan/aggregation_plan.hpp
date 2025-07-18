@@ -18,7 +18,6 @@
 #define TINYLAMB_AGGREGATION_PLAN_HPP
 
 #include <memory>
-#include <utility>
 #include <vector>
 
 #include "expression/named_expression.hpp"

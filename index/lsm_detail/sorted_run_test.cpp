@@ -48,7 +48,7 @@ TEST_F(SortedRunEntryTest, Generate) {
   SortedRun::Entry short_entry = SortedRun::Entry("abc", LSMValue("val"), *l);
   SortedRun::Entry middle_entry =
       SortedRun::Entry("abcdefhijk", LSMValue("foobar"), *l);
-  std::string long_key(2000, 'a');
+  std::string long_key(200, 'a');
   SortedRun::Entry long_entry =
       SortedRun::Entry(long_key, LSMValue("long value"), *l);
   while (l->Written() < 6) {

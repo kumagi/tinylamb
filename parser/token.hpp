@@ -18,7 +18,6 @@
 #define TINYLAMB_TOKEN_HPP
 
 #include <string>
-#include <string_view>
 
 namespace tinylamb {
 

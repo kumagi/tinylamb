@@ -19,7 +19,7 @@
 #include <cmath>
 #include <cstddef>
 #include <memory>
-#include <ostream>
+#include <string>
 
 #include "common/constants.hpp"
 #include "executor/executor_base.hpp"

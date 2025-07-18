@@ -27,6 +27,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <cassert>
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"

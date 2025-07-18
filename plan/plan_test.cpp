@@ -38,7 +38,6 @@
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "transaction/transaction.hpp"
-#include "transaction/transaction_manager.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"

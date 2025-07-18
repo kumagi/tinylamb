@@ -24,7 +24,7 @@
 namespace tinylamb {
 class ExecutorBase;
 
-class ProductPlan : public PlanBase {
+class ProductPlan final : public PlanBase {
  public:
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
               std::vector<ColumnName> right_cols);

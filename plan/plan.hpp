@@ -22,8 +22,6 @@
 
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
-#include "expression/named_expression.hpp"
-#include "type/schema.hpp"
 
 namespace tinylamb {
 class Table;

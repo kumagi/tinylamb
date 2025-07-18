@@ -17,9 +17,11 @@
 #ifndef TINYLAMB_QUERY_DATA_HPP
 #define TINYLAMB_QUERY_DATA_HPP
 
+#include <ostream>
 #include <string>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 

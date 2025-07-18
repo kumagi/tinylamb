@@ -14,10 +14,6 @@
  * limitations under the License.
  */
 
-//
-// Created by kumagi on 22/06/19.
-//
-
 #include "index_only_scan_plan.hpp"
 
 #include <cmath>

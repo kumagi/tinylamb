@@ -35,7 +35,7 @@ TEST(ExpressionParserTest, Simple) {
 
   // Act
   PrattParser parser(tokens.begin(), tokens.end());
-  Expression expr = parser.ParseExpression();
+  const Expression expr = parser.ParseExpression();
 
   // Assert
   ASSERT_EQ(expr->Type(), TypeTag::kBinaryExp);

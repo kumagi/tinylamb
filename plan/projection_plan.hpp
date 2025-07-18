@@ -18,7 +18,6 @@
 #define TINYLAMB_PROJECTION_PLAN_HPP
 
 #include <memory>
-#include <utility>
 #include <vector>
 
 #include "expression/expression.hpp"

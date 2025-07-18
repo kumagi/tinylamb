@@ -20,7 +20,6 @@
 #include "plan/plan.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
-#include "type/schema.hpp"
 
 namespace tinylamb {
 

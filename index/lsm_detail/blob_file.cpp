@@ -15,8 +15,6 @@
  */
 #include "index/lsm_detail/blob_file.hpp"
 
-#include <endian.h>
-
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -27,6 +25,7 @@
 
 #include "cache.hpp"
 #include "common/constants.hpp"
+#include "common/env_endian.hpp"
 
 namespace tinylamb {
 BlobFile::BlobFile(const std::filesystem::path& path, size_t memory_capacity,

@@ -78,7 +78,7 @@ class PagePool {
   friend class CheckpointManager;
   friend class RecoveryManager;
 
-  void Unpin(size_t page_id);
+  void Unpin(page_id_t page_id);
 
   bool EvictPage(LruType::iterator target);
 

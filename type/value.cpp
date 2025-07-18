@@ -20,8 +20,9 @@
 
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/env_endian.hpp"
 #include "common/serdes.hpp"
-#include "value_type.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -36,6 +37,7 @@ std::string ToString(UnaryOperation type) {
     case UnaryOperation::kMinus:
       return "-";
   }
+  return "UNKNOWN";
 }
 
 std::string ToString(AggregationType type) {
@@ -50,6 +52,8 @@ std::string ToString(AggregationType type) {
       return "MIN";
     case AggregationType::kMax:
       return "MAX";
+    default:
+      return "UNKNOWN";
   }
 }
 
@@ -59,6 +63,11 @@ Value::Value(int int_val) {
 }
 
 Value::Value(int64_t int_val) {
+  type = ValueType::kInt64;
+  value.int_value = int_val;
+}
+
+Value::Value(long int_val) {
   type = ValueType::kInt64;
   value.int_value = int_val;
 }

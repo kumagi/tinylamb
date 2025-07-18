@@ -14,9 +14,6 @@
  * limitations under the License.
  */
 
-//
-// Created by kumagi on 22/07/07.
-//
 #include "type/column_name.hpp"
 
 #include "gtest/gtest.h"

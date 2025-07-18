@@ -16,10 +16,7 @@
 
 #include "plan/product_plan.hpp"
 
-#include <algorithm>
 #include <cstddef>
-#include <iostream>
-#include <utility>
 
 #include "database/transaction_context.hpp"
 #include "executor/cross_join.hpp"

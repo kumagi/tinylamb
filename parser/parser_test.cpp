@@ -33,7 +33,7 @@ TEST(ParserTest, CreateTable) {
   Parser parser(tokens);
   std::unique_ptr<Statement> stmt = parser.Parse();
   ASSERT_EQ(stmt->Type(), StatementType::kCreateTable);
-  auto& create_table = dynamic_cast<CreateTableStatement&>(*stmt);
+  const auto& create_table = dynamic_cast<CreateTableStatement&>(*stmt);
   ASSERT_EQ(create_table.TableName(), "users");
   ASSERT_EQ(create_table.Columns().size(), 3);
   ASSERT_EQ(create_table.Columns()[0].Name().name, "id");
@@ -52,7 +52,7 @@ TEST(ParserTest, CreateTableWithExtraWhitespace) {
   Parser parser(tokens);
   std::unique_ptr<Statement> stmt = parser.Parse();
   ASSERT_EQ(stmt->Type(), StatementType::kCreateTable);
-  auto& create_table = dynamic_cast<CreateTableStatement&>(*stmt);
+  const auto& create_table = dynamic_cast<CreateTableStatement&>(*stmt);
   ASSERT_EQ(create_table.TableName(), "users");
   ASSERT_EQ(create_table.Columns().size(), 3);
 }

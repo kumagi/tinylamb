@@ -16,8 +16,10 @@
 
 #include "sorted_run.hpp"
 
+#if TARGET_OS_LINUX
 #include <bits/types/struct_iovec.h>
-#include <endian.h>
+#elif __APPLE__
+#endif
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -40,6 +42,7 @@
 
 #include "common/constants.hpp"
 #include "common/debug.hpp"
+#include "common/env_endian.hpp"
 #include "common/log_message.hpp"
 #include "common/status_or.hpp"
 #include "common/vm_cache.hpp"

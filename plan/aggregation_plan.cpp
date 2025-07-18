@@ -17,14 +17,12 @@
 #include "plan/aggregation_plan.hpp"
 
 #include <memory>
-#include <utility>
 #include <vector>
 
 #include "executor/aggregation.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "plan/plan.hpp"
-#include "table/table_statistics.hpp"
 #include "type/column.hpp"
 #include "type/value_type.hpp"
 

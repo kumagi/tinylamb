@@ -39,6 +39,7 @@ class Encoder {
   Encoder& operator<<(slot_t slot);
   Encoder& operator<<(int64_t i64);
   Encoder& operator<<(uint64_t u64);
+  Encoder& operator<<(size_t size);
   Encoder& operator<<(double d);
   Encoder& operator<<(ValueType v);
   Encoder& operator<<(bool v);

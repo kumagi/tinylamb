@@ -26,7 +26,7 @@
 
 namespace tinylamb {
 
-class SelectionPlan : public PlanBase {
+class SelectionPlan final : public PlanBase {
  public:
   SelectionPlan(Plan src, Expression exp, TableStatistics stat)
       : src_(std::move(src)), exp_(std::move(exp)), stats_(std::move(stat)) {}

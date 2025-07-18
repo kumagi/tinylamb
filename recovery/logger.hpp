@@ -17,14 +17,9 @@
 #ifndef TINYLAMB_LOGGER_HPP
 #define TINYLAMB_LOGGER_HPP
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <atomic>
-#include <cassert>
 #include <cstddef>
 #include <filesystem>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>

@@ -302,7 +302,8 @@ Plan BestScan(const std::vector<NamedExpression>& select, const Table& from,
 
 bool ContainsAny(const std::unordered_set<std::string>& left,
                  const std::unordered_set<std::string>& right) {
-  return std::any_of(left.begin(), left.end(), [&](const std::string& s) {
+  return std::ranges::any_of(
+      left, [&](const std::string& s) {
     return right.find(s) != right.end();
   });
 }
@@ -344,6 +345,8 @@ Plan BestJoin(TransactionContext& ctx, const Expression& where,
       case TypeTag::kConstantValue:
         // Ignore.
         break;
+      default:
+        // Do nothing.
     }
   }
 

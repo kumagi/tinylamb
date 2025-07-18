@@ -306,7 +306,6 @@ double TableStatistics::ReductionFactor(const Schema& sc,
       if (bo->Left()->Type() == TypeTag::kColumnValue) {
         const auto* lcv =
             reinterpret_cast<const ColumnValue*>(bo->Left().get());
-        LOG(WARN) << lcv->GetColumnName() << " in " << sc;
         int offset_left = sc.Offset(lcv->GetColumnName());
         assert(0 <= offset_left && offset_left < (int)stats_.size());
         return static_cast<double>(stats_[offset_left].Distinct());

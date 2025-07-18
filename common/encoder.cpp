@@ -54,6 +54,11 @@ Encoder& Encoder::operator<<(uint64_t u64) {
   return *this;
 }
 
+Encoder& Encoder::operator<<(size_t size) {
+  os_ ->write(reinterpret_cast<const char*>(&size), sizeof(size));
+  return *this;
+}
+
 Encoder& Encoder::operator<<(double d) {
   os_->write(reinterpret_cast<const char*>(&d), sizeof(d));
   return *this;

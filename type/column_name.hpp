@@ -14,16 +14,15 @@
  * limitations under the License.
  */
 
-//
-// Created by kumagi on 22/07/07.
-//
-
 #ifndef TINYLAMB_COLUMN_NAME_HPP
 #define TINYLAMB_COLUMN_NAME_HPP
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <string>
+#include <string_view>
 
 namespace tinylamb {
 
@@ -63,14 +62,10 @@ struct ColumnName {
 
 }  // namespace tinylamb
 
-namespace std {
-
 template <>
-class hash<tinylamb::ColumnName> {
+struct std::hash<tinylamb::ColumnName> {
  public:
-  uint64_t operator()(const tinylamb::ColumnName& c) const;
-};
-
-}  // namespace std
+  uint64_t operator()(const tinylamb::ColumnName& c) const noexcept;
+};  // namespace std
 
 #endif  // TINYLAMB_COLUMN_NAME_HPP

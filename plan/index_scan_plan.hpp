@@ -14,10 +14,6 @@
  * limitations under the License.
  */
 
-//
-// Created by kumagi on 22/06/19.
-//
-
 #ifndef TINYLAMB_INDEX_SCAN_PLAN_HPP
 #define TINYLAMB_INDEX_SCAN_PLAN_HPP
 
@@ -29,7 +25,7 @@ namespace tinylamb {
 class Index;
 class Table;
 
-class IndexScanPlan : public PlanBase {
+class IndexScanPlan final : public PlanBase {
  public:
   IndexScanPlan(const Table& table, const Index& index,
                 const TableStatistics& ts, const Value& begin, const Value& end,

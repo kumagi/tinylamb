@@ -18,7 +18,6 @@
 
 #include <cstddef>
 #include <memory>
-#include <ostream>
 
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
