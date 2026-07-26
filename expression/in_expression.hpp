@@ -34,6 +34,7 @@ class InExpression : public ExpressionBase {
                                const Schema& schema) const override;
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
+  [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
 
   Expression child_;
   std::vector<Expression> list_;

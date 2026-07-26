@@ -17,6 +17,7 @@
 #include "expression/case_expression.hpp"
 
 #include <string>
+#include <unordered_set>
 
 #include "expression/expression.hpp"
 #include "type/row.hpp"
@@ -24,6 +25,18 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+
+std::unordered_set<ColumnName> CaseExpression::TouchedColumns() const {
+  std::unordered_set<ColumnName> result;
+  for (const auto& when : when_clauses_) {
+    result.merge(when.first->TouchedColumns());
+    result.merge(when.second->TouchedColumns());
+  }
+  if (else_clause_) {
+    result.merge(else_clause_->TouchedColumns());
+  }
+  return result;
+}
 
 Value CaseExpression::Evaluate(const Row& row, const Schema& schema) const {
   for (const auto& when : when_clauses_) {

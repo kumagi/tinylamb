@@ -42,6 +42,7 @@ class ColumnValue : public ExpressionBase {
   [[nodiscard]] std::string ToString() const override {
     return col_name_.ToString();
   }
+  [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
 
  private:
   friend class ProjectionPlan;

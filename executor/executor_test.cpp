@@ -511,7 +511,8 @@ TEST_F(ExecutorTest, Aggregation) {
                                                     ColumnValueExp("score"))),
       NamedExpression("max", AggregateExpressionExp(AggregationType::kMax,
                                                     ColumnValueExp("score")))};
-  AggregationExecutor agg(std::move(fs), std::move(aggregates));
+  AggregationExecutor agg(std::move(fs), tbl->GetSchema(),
+                          std::move(aggregates));
   Row result;
   ASSERT_TRUE(agg.Next(&result, nullptr));
   ASSERT_EQ(result[0], Value(4));

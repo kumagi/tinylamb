@@ -22,6 +22,7 @@
 #include "database/database.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/insert.hpp"
 #include "gtest/gtest.h"
 #include "parser/parser.hpp"
 #include "parser/tokenizer.hpp"
@@ -62,15 +63,17 @@ class QueryTest : public ::testing::Test {
       }
       case StatementType::kInsert: {
         auto& insert = dynamic_cast<InsertStatement&>(*stmt);
-        QueryData query;
-        query.from_.push_back(insert.TableName());
-        for (const auto& row : insert.Values()) {
-          for (const auto& val : row) {
-            query.select_.emplace_back("", val);
+        ASSIGN_OR_RETURN(std::shared_ptr<Table>, table, ctx.GetTable(insert.TableName()));
+        if (insert.Values().size() == 1) {
+          std::vector<Value> vals;
+          for (const auto& expr : insert.Values()[0]) {
+            vals.emplace_back(expr->Evaluate(Row(), Schema()));
           }
+          Row row(std::move(vals));
+          return {std::make_shared<Insert>(ctx.txn_, table.get(),
+                                           std::make_shared<ConstantExecutor>(row))};
         }
-        ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
-        return plan->EmitExecutor(ctx);
+        return Status::kNotImplemented;
       }
       case StatementType::kSelect: {
         auto& select = dynamic_cast<SelectStatement&>(*stmt);
@@ -100,7 +103,7 @@ class QueryTest : public ::testing::Test {
   std::unique_ptr<Database> db_;
 };
 
-TEST_F(QueryTest, DISABLED_SimpleSelect) {
+TEST_F(QueryTest, SimpleSelect) {
   TransactionContext ctx = db_->BeginContext();
   {
     auto st =
@@ -142,7 +145,7 @@ TEST_F(QueryTest, DISABLED_SimpleSelect) {
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
-TEST_F(QueryTest, DISABLED_SelectWithProjection) {
+TEST_F(QueryTest, SelectWithProjection) {
   TransactionContext ctx = db_->BeginContext();
   {
     auto st =
@@ -152,10 +155,18 @@ TEST_F(QueryTest, DISABLED_SelectWithProjection) {
   {
     auto st = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (1, 10, 'hello');");
     ASSERT_EQ(st.GetStatus(), Status::kSuccess);
+    auto exec = std::move(st.Value());
+    Row result;
+    ASSERT_TRUE(exec->Next(&result, nullptr));
+    ASSERT_FALSE(exec->Next(&result, nullptr));
   }
   {
     auto st = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (2, 20, 'world');");
     ASSERT_EQ(st.GetStatus(), Status::kSuccess);
+    auto exec = std::move(st.Value());
+    Row result;
+    ASSERT_TRUE(exec->Next(&result, nullptr));
+    ASSERT_FALSE(exec->Next(&result, nullptr));
   }
   {
     auto st = ExecuteQuery(ctx, "SELECT c1, c3 FROM t1 WHERE c1 = 2;");

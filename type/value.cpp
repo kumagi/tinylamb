@@ -16,6 +16,7 @@
 
 #include "type/value.hpp"
 
+#include <cmath>
 #include <cstring>
 
 #include "common/decoder.hpp"
@@ -67,10 +68,6 @@ Value::Value(int64_t int_val) {
   value.int_value = int_val;
 }
 
-Value::Value(long int_val) {
-  type = ValueType::kInt64;
-  value.int_value = int_val;
-}
 
 /*
 Value::Value(std::string_view varchar_val) {
@@ -201,7 +198,7 @@ bool Value::operator==(const Value& rhs) const {
     case ValueType::kVarChar:
       return value.varchar_value == rhs.value.varchar_value;
     case ValueType::kDouble:
-      return value.double_value == rhs.value.double_value;
+      return std::fabs(value.double_value - rhs.value.double_value) < 1e-9;
   }
   throw std::runtime_error("undefined type");
 }

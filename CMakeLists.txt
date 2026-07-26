@@ -10,7 +10,7 @@ add_executable(tinylamb
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined,bounds,address -fsanitize-address-use-after-scope")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -O2")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -ggdb -Wall -Wextra")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -ggdb -Wall -Wextra --coverage -fprofile-arcs -ftest-coverage")
 
 #set(CMAKE_C_COMPILER "/usr/bin/clang" CACHE STRING "clang compiler" FORCE)
 #set(CMAKE_CXX_COMPILER "/usr/bin/clang++" CACHE STRING "clang++ compiler" FORCE)
@@ -35,6 +35,8 @@ add_library(libtinylamb_parser
         parser/parser.cpp
         parser/pratt_parser.cpp
 )
+target_compile_options(libtinylamb_parser PRIVATE --coverage -fprofile-arcs -ftest-coverage)
+target_link_options(libtinylamb_parser PRIVATE --coverage)
 
 add_library(libtinylamb
         STATIC
@@ -85,6 +87,8 @@ add_library(libtinylamb
 add_library(libtinylamb_test_util
         STATIC
         type/row.cpp)
+target_compile_options(libtinylamb_test_util PRIVATE --coverage -fprofile-arcs -ftest-coverage)
+target_link_options(libtinylamb_test_util PRIVATE --coverage)
 
 target_include_directories(
         libtinylamb
@@ -143,11 +147,13 @@ function(add_simple_test file_path)
     get_filename_component(filename ${file_path} NAME)
     string(REPLACE ".cpp" "" target_name ${filename})
     add_executable(${target_name} ${file_path})
+    target_compile_options(${target_name} PRIVATE --coverage -fprofile-arcs -ftest-coverage)
     target_link_libraries(${target_name}
             gtest_main
             libtinylamb_parser
             libtinylamb
             libtinylamb_test_util
+            --coverage
     )
     gtest_discover_tests(${target_name})
 endfunction()

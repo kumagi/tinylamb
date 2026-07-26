@@ -38,7 +38,8 @@ const Schema& AggregationPlan::GetSchema() const { return schema_; }
 
 Executor AggregationPlan::EmitExecutor(TransactionContext& ctx) const {
   return std::make_shared<AggregationExecutor>(child_->EmitExecutor(ctx),
-                                               aggregates_);
+                                                child_->GetSchema(),
+                                                aggregates_);
 }
 
 const Table* AggregationPlan::ScanSource() const {

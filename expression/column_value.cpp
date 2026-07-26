@@ -20,12 +20,18 @@
 #include <ostream>
 #include <stdexcept>
 
+#include <unordered_set>
+
 #include "type/column.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
+
+std::unordered_set<ColumnName> ColumnValue::TouchedColumns() const {
+  return {col_name_};
+}
 
 Value ColumnValue::Evaluate(const Row& row, const Schema& schema) const {
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {

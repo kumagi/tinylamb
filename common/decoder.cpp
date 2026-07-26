@@ -45,10 +45,6 @@ Decoder& Decoder::operator>>(uint64_t& u64) {
   return *this;
 }
 
-Decoder& Decoder::operator>>(size_t& size) {
-  is_->read(reinterpret_cast<char*>(&size), sizeof(size));
-  return *this;
-}
 
 
 Decoder& Decoder::operator>>(double& d) {

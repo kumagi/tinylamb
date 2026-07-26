@@ -35,6 +35,7 @@ class AggregateExpression : public ExpressionBase {
   [[nodiscard]] Expression Child() const { return child_; }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
+  [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
 
  private:
   AggregationType type_;

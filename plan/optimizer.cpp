@@ -347,6 +347,7 @@ Plan BestJoin(TransactionContext& ctx, const Expression& where,
         break;
       default:
         // Do nothing.
+        break;
     }
   }
 
@@ -411,13 +412,42 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   if (query.from_.empty()) {
     throw std::runtime_error("No table specified");
   }
+
+  // Expand SELECT * to all columns of the first FROM table (single-table case).
+  std::vector<NamedExpression> expanded_select;
+  bool has_star = false;
+  for (const auto& sel : query.select_) {
+    if (sel.expression->Type() == TypeTag::kColumnValue) {
+      const auto& cv = sel.expression->AsColumnValue();
+      if (cv.GetColumnName().name == "*") {
+        has_star = true;
+        break;
+      }
+    }
+  }
+  if (has_star) {
+    if (query.from_.size() != 1) {
+      throw std::runtime_error("SELECT * with multiple tables not supported");
+    }
+    ASSIGN_OR_RETURN(std::shared_ptr<Table>, star_tbl,
+                     ctx.GetTable(query.from_[0]));
+    const Schema& sc = star_tbl->GetSchema();
+    expanded_select.reserve(sc.ColumnCount());
+    for (slot_t i = 0; i < sc.ColumnCount(); ++i) {
+      const Column& c = sc.GetColumn(i);
+      expanded_select.emplace_back(c.Name());
+    }
+  } else {
+    expanded_select = query.select_;
+  }
+
   std::unordered_map<std::unordered_set<std::string>, CostAndPlan>
       optimal_plans;
 
   // 1. Initialize every single tables to start.
   std::unordered_set<ColumnName> touched_columns =
-      query.where_->TouchedColumns();
-  for (const auto& sel : query.select_) {
+      query.where_ ? query.where_->TouchedColumns() : std::unordered_set<ColumnName>{};
+  for (const auto& sel : expanded_select) {
     touched_columns.merge(sel.expression->TouchedColumns());
   }
   for (const auto& from : query.from_) {
@@ -434,6 +464,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
             (touched_col.schema.empty() ||
              touched_col.schema == tbl->GetSchema().Name())) {
           project_target.emplace_back(table_col.Name());
+          break;
         }
       }
     }
@@ -469,7 +500,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
 
   // 3. Attach final projection and emit the result.
   auto solution = optimal_plans.find(MakeSet(query.from_))->second.plan;
-  solution = std::make_shared<ProjectionPlan>(solution, query.select_);
+  solution = std::make_shared<ProjectionPlan>(solution, expanded_select);
   return solution;
 }
 

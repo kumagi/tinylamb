@@ -17,6 +17,7 @@
 #include "expression/in_expression.hpp"
 
 #include <string>
+#include <unordered_set>
 
 #include "expression/expression.hpp"
 #include "type/row.hpp"
@@ -24,6 +25,14 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+
+std::unordered_set<ColumnName> InExpression::TouchedColumns() const {
+  std::unordered_set<ColumnName> result = child_->TouchedColumns();
+  for (const auto& item : list_) {
+    result.merge(item->TouchedColumns());
+  }
+  return result;
+}
 
 Value InExpression::Evaluate(const Row& row, const Schema& schema) const {
   Value child = child_->Evaluate(row, schema);

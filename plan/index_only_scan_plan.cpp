@@ -29,6 +29,7 @@
 #include "executor/index_only_scan.hpp"
 #include "expression/expression.hpp"
 #include "index/index.hpp"
+#include "index/index_schema.hpp"
 #include "table/table.hpp"
 #include "type/column.hpp"
 
@@ -48,14 +49,14 @@ IndexOnlyScanPlan::IndexOnlyScanPlan(const Table& table, const Index& index,
       output_schema_(OutputSchema()) {}
 
 Schema IndexOnlyScanPlan::OutputSchema() const {
-  std::vector<Column> out;
-  for (const auto& col_id : index_.sc_.key_) {
-    out.push_back(table_.GetSchema().GetColumn(col_id));
+  std::vector<Column> cols;
+  for (const auto& key : index_.sc_.key_) {
+    cols.push_back(table_.GetSchema().GetColumn(key));
   }
-  for (const auto& col_id : index_.sc_.include_) {
-    out.push_back(table_.GetSchema().GetColumn(col_id));
+  for (const auto& included : index_.sc_.include_) {
+    cols.push_back(table_.GetSchema().GetColumn(included));
   }
-  return {"", out};
+  return {"", cols};
 }
 
 Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& ctx) const {

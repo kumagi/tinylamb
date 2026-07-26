@@ -19,6 +19,7 @@
 
 #include <sstream>
 #include <string>
+#include <unordered_set>
 
 #include "type/function.hpp"
 #include "type/row.hpp"
@@ -26,6 +27,14 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+
+std::unordered_set<ColumnName> FunctionCallExpression::TouchedColumns() const {
+  std::unordered_set<ColumnName> result;
+  for (const auto& arg : args_) {
+    result.merge(arg->TouchedColumns());
+  }
+  return result;
+}
 
 Value FunctionCallExpression::Evaluate(const Row& row,
                                        const Schema& schema) const {

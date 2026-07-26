@@ -35,18 +35,17 @@ class Decoder {
   Decoder& operator>>(slot_t& slot);
   Decoder& operator>>(int64_t& i64);
   Decoder& operator>>(uint64_t& u64);
-  Decoder& operator>>(size_t& size);
   Decoder& operator>>(double& d);
   Decoder& operator>>(ValueType& v);
   Decoder& operator>>(bool& v);
 
   template <typename T>
   Decoder& operator>>(std::vector<T>& vec) {
-    size_t size = vec.size();
+    uint64_t size = vec.size();
     is_->read(reinterpret_cast<char*>(&size), sizeof(size));
     vec.clear();
     vec.resize(size);
-    for (size_t i = 0; i < size; ++i) {
+    for (uint64_t i = 0; i < size; ++i) {
       *this >> vec[i];
     }
     return *this;

@@ -27,9 +27,11 @@
 namespace tinylamb {
 
 AggregationExecutor::AggregationExecutor(
-    std::shared_ptr<ExecutorBase> child,
+    std::shared_ptr<ExecutorBase> child, Schema input_schema,
     std::vector<NamedExpression> aggregates)
-    : child_(std::move(child)), aggregates_(std::move(aggregates)) {}
+    : child_(std::move(child)),
+      input_schema_(std::move(input_schema)),
+      aggregates_(std::move(aggregates)) {}
 
 bool AggregationExecutor::Next(Row* dst, RowPosition* rp) {
   if (executed_) {
@@ -63,7 +65,7 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* rp) {
     count++;
     for (size_t i = 0; i < aggregates_.size(); ++i) {
       const auto& agg = aggregates_[i].expression->AsAggregateExpression();
-      Value val = agg.Child()->Evaluate(row, Schema());
+      Value val = agg.Child()->Evaluate(row, input_schema_);
       switch (agg.GetType()) {
         case AggregationType::kSum:
           results[i].value.double_value += val.value.double_value;

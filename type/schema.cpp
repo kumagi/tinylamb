@@ -58,7 +58,12 @@ int Schema::Offset(const ColumnName& col_name) const {
     return -1;
   }
   for (int i = 0; i < static_cast<int>(columns_.size()); ++i) {
-    if (columns_[i].Name() == col_name) {
+    const ColumnName& cn = columns_[i].Name();
+    if (col_name.schema.empty()) {
+      if (cn.name == col_name.name) {
+        return i;
+      }
+    } else if (cn == col_name) {
       return i;
     }
   }

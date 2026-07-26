@@ -55,15 +55,18 @@ inline std::ostream& operator<<(std::ostream& o, const UnaryOperation& uo) {
 
 class Value {
  public:
-  Value() : type(ValueType::kNull) {}
-  explicit Value(int int_val);
-  explicit Value(int64_t int_val);
-  // explicit Value(std::string_view varchar_val);
-  explicit Value(std::string&& str_val);
-  explicit Value(double double_value);
-  Value(const Value& o);
-  Value(Value&& o) noexcept;
-  explicit Value(long i);
+   Value() : type(ValueType::kNull) {}
+   explicit Value(int int_val);
+   explicit Value(int64_t int64_val);
+   explicit Value(std::string&& str_val);
+   explicit Value(double double_value);
+   Value(const Value& o);
+   Value(Value&& o) noexcept;
+
+   template <typename I, typename std::enable_if<std::is_integral<I>::value, int>::type = 0>
+   explicit Value(I val) : type(ValueType::kInt64) {
+     value.int_value = static_cast<int64_t>(val);
+   }
   Value& operator=(const Value& o);
   Value& operator=(Value&& o) noexcept;
   ~Value() = default;

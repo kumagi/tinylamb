@@ -16,7 +16,9 @@
 
 #include "parser/tokenizer.hpp"
 
+#include <algorithm>
 #include <cctype>
+#include <iterator>
 #include <string>
 #include <vector>
 

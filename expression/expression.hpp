@@ -58,7 +58,7 @@ class ExpressionBase {
   [[nodiscard]] const CaseExpression& AsCaseExpression() const;
   [[nodiscard]] const InExpression& AsInExpression() const;
   [[nodiscard]] const FunctionCallExpression& AsFunctionCallExpression() const;
-  [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const;
+  [[nodiscard]] virtual std::unordered_set<ColumnName> TouchedColumns() const;
   [[nodiscard]] virtual Value Evaluate(const Row& row,
                                        const Schema& schema) const = 0;
   [[nodiscard]] virtual Value Evaluate(const Row* left,

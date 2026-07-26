@@ -47,6 +47,7 @@ class FunctionCallExpression : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override {
     return TypeTag::kFunctionCallExp;
   }
+  [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
 
  private:
   std::string func_name_;

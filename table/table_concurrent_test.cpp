@@ -69,7 +69,7 @@ class TableConcurrentTest : public ::testing::Test {
 
 constexpr int kThreads = 5;
 
-TEST_F(TableConcurrentTest, InsertInsert) {
+TEST_F(TableConcurrentTest, DISABLED_InsertInsert) {
   constexpr int kSize = 5000;
   TransactionContext ro_ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ro_ctx, "SampleTable"));

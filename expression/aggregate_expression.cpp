@@ -17,6 +17,7 @@
 #include "expression/aggregate_expression.hpp"
 
 #include <string>
+#include <unordered_set>
 
 #include "expression/expression.hpp"
 #include "type/row.hpp"
@@ -24,6 +25,10 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+
+std::unordered_set<ColumnName> AggregateExpression::TouchedColumns() const {
+  return child_->TouchedColumns();
+}
 
 Value AggregateExpression::Evaluate(const Row& row,
                                     const Schema& schema) const {

@@ -36,6 +36,7 @@ class BinaryExpression : public ExpressionBase {
   [[nodiscard]] const Expression& Right() const { return right_; }
   std::string ToString() const override;
   void Dump(std::ostream& o) const override;
+  [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
 
  private:
   Expression left_;

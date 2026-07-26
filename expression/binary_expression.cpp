@@ -16,7 +16,15 @@
 
 #include "binary_expression.hpp"
 
+#include <unordered_set>
+
 namespace tinylamb {
+
+std::unordered_set<ColumnName> BinaryExpression::TouchedColumns() const {
+  std::unordered_set<ColumnName> result = left_->TouchedColumns();
+  result.merge(right_->TouchedColumns());
+  return result;
+}
 namespace {
 
 Value Execute(BinaryOperation op, const Value& left, const Value& right) {

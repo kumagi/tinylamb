@@ -17,6 +17,7 @@
 #include "expression/unary_expression.hpp"
 
 #include <string>
+#include <unordered_set>
 
 #include "expression/expression.hpp"
 #include "type/row.hpp"
@@ -24,6 +25,10 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+
+std::unordered_set<ColumnName> UnaryExpression::TouchedColumns() const {
+  return child_->TouchedColumns();
+}
 
 Value UnaryExpression::Evaluate(const Row& row, const Schema& schema) const {
   Value child = child_->Evaluate(row, schema);

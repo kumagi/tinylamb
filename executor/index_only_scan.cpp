@@ -48,11 +48,11 @@ Schema IndexOnlyScan::KeySchema(const Index& idx, const Schema& input_schema) {
 }
 
 Schema IndexOnlyScan::ValueSchema(const Index& idx,
-                                  const Schema& input_schema) {
+                                   const Schema& input_schema) {
   const IndexSchema& is = idx.sc_;
   std::vector<Column> cols;
   cols.reserve(is.include_.size());
-  for (const auto& key : is.key_) {
+  for (const auto& key : is.include_) {
     cols.push_back(input_schema.GetColumn(key));
   }
   return {"", cols};
@@ -62,12 +62,11 @@ Schema IndexOnlyScan::OutputSchema(const Index& idx,
                                    const Schema& input_schema) {
   const IndexSchema& is = idx.sc_;
   std::vector<Column> cols;
-  cols.reserve(is.key_.size() + is.include_.size());
   for (const auto& key : is.key_) {
     cols.push_back(input_schema.GetColumn(key));
   }
-  for (const auto& key : is.key_) {
-    cols.push_back(input_schema.GetColumn(key));
+  for (const auto& included : is.include_) {
+    cols.push_back(input_schema.GetColumn(included));
   }
   return {"", cols};
 }

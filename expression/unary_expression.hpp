@@ -35,6 +35,7 @@ class UnaryExpression : public ExpressionBase {
   [[nodiscard]] UnaryOperation Op() const { return operation_; }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
+  [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
 
  private:
   Expression child_;

@@ -22,18 +22,20 @@
 
 #include "executor/executor_base.hpp"
 #include "expression/named_expression.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
 
 class AggregationExecutor : public ExecutorBase {
  public:
-  AggregationExecutor(std::shared_ptr<ExecutorBase> child,
+  AggregationExecutor(std::shared_ptr<ExecutorBase> child, Schema input_schema,
                       std::vector<NamedExpression> aggregates);
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:
   std::shared_ptr<ExecutorBase> child_;
+  Schema input_schema_;
   std::vector<NamedExpression> aggregates_;
   bool executed_ = false;
 };

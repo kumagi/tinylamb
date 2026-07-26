@@ -36,6 +36,7 @@ class CaseExpression : public ExpressionBase {
                                const Schema& schema) const override;
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
+  [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
 
   std::vector<std::pair<Expression, Expression>> when_clauses_;
   Expression else_clause_;
