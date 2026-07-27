@@ -19,8 +19,14 @@
 
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/log_message.hpp"
 #include "gtest/gtest.h"
 #include "serdes.hpp"
+#include <sstream>
+
+namespace tinylamb {
+class Transaction;  // forward declaration for DumpLogTxn helper
+}  // namespace tinylamb
 
 #define ASSERT_SUCCESS(x) ASSERT_EQ(Status::kSuccess, x)
 #define EXPECT_SUCCESS(x) EXPECT_EQ(Status::kSuccess, x)
@@ -37,6 +43,22 @@ void SerializeDeserializeTest(const T& c) {
   T another;
   ext >> another;
   ASSERT_EQ(c, another);
+}
+
+template <typename T>
+void DumpLog(const T& obj, int indent = 0) {
+  std::ostringstream oss;
+  obj.Dump(oss, indent);
+  LOG(INFO) << oss.str();
+}
+
+// Variant for objects whose Dump signature takes a Transaction& (e.g. BPlusTree,
+// Database). Routes the dump through LOG(INFO) instead of raw std::ostream.
+template <typename T>
+void DumpLogTxn(const T& obj, tinylamb::Transaction& txn, int indent = 0) {
+  std::ostringstream oss;
+  obj.Dump(txn, oss, indent);
+  LOG(INFO) << oss.str();
 }
 
 #endif  // TINYLAMB_TEST_UTIL_HPP

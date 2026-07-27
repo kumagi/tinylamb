@@ -74,26 +74,38 @@ class CacheTest : public ::testing::Test {
 };
 
 TEST_F(CacheTest, one_page) {
+  // Arrange -- nothing more than default CacheTest SetUp(); 4 MiB file + 32 KiB cache
+  // Act -- read 1024 sequential 4-byte ints at stride 4
   for (int i = 0; i < 1024; ++i) {
     std::string data = cache_->ReadAt(i * sizeof(int), sizeof(int));
     int data_as_int = *(reinterpret_cast<int*>(data.data()));
+
+    // Assert -- each read yields the deterministic Expected(i) value
     ASSERT_EQ(data_as_int, Expected(i));
   }
 }
 
 TEST_F(CacheTest, mega_page) {
+  // Arrange -- nothing more than default CacheTest SetUp(); 4 MiB file + 32 KiB cache
+  // Act -- read 1024 sequential 4-byte ints at stride 4096 (1 MiB page boundaries)
   for (int i = 0; i < 1024; ++i) {
     std::string data = cache_->ReadAt(i * 1024 * sizeof(int), sizeof(int));
     int data_as_int = *(reinterpret_cast<int*>(data.data()));
+
+    // Assert -- each read yields the deterministic Expected(i*1024) value
     ASSERT_EQ(data_as_int, Expected(i * 1024));
   }
 }
 
 TEST_F(CacheTest, mega_pages) {
+  // Arrange -- nothing more than default CacheTest SetUp(); 4 MiB file + 32 KiB cache
+  // Act -- read 4 sequential 4-byte ints at stride 1 MiB (full page boundaries)
   for (int i = 0; i < 4; ++i) {
     std::string data =
         cache_->ReadAt(i * 1024 * 1024 * sizeof(int), sizeof(int));
     int data_as_int = *(reinterpret_cast<int*>(data.data()));
+
+    // Assert -- each read yields the deterministic Expected(i*1024*1024) value
     ASSERT_EQ(data_as_int, Expected(i * 1024 * 1024));
   }
 }

@@ -52,6 +52,10 @@ class TransactionTest : public ::testing::Test {
   std::unique_ptr<TransactionManager> tm_;
 };
 
-TEST_F(TransactionTest, construct) {}
+TEST_F(TransactionTest, construct) {
+  // Arrange -- nothing to set up; default TransactionManager created by SetUp()
+  // Act -- nothing to execute; default constructed via SetUp()
+  // Assert -- nothing to verify; gtest green on pass, death on crash
+}
 
 }  // namespace tinylamb

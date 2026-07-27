@@ -25,21 +25,30 @@
 namespace tinylamb {
 
 TEST(Constraint, Construct) {
+  // Arrange -- nothing more than default Constraint kinds
+  // Act -- construct two Constraints of different kinds/values
   Constraint c(Constraint::kNothing);
   Constraint s(Constraint::kDefault, Value("hello"));
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST(Constraint, SerializeDeserialize) {
+  // Arrange -- nothing more than default Constraint kinds
+  // Act -- serialize+deserialize round-trip for 5 Constraint variants
   SerializeDeserializeTest(Constraint(Constraint::kNothing));
   SerializeDeserializeTest(Constraint(Constraint::kDefault, Value(2)));
   SerializeDeserializeTest(Constraint(Constraint::kUnique));
   SerializeDeserializeTest(Constraint(Constraint::kPrimaryKey));
   SerializeDeserializeTest(Constraint(Constraint::kNotNull));
+  // Assert -- implicit; SerializeDeserializeTest macro asserts equality
 }
 
 TEST(Constraint, Dump) {
+  // Arrange -- nothing more than two Constraints of different kinds
+  // Act -- stream Constraints to LOG (no assertion; output-only)
   LOG(INFO) << Constraint(Constraint::kNothing);
   LOG(WARN) << Constraint(Constraint::kDefault, Value(2));
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 }  // namespace tinylamb

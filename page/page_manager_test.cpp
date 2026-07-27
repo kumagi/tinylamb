@@ -92,18 +92,28 @@ class PageManagerTest : public ::testing::Test {
   std::unique_ptr<TransactionManager> tm_;
 };
 
-TEST_F(PageManagerTest, Construct) {}
+TEST_F(PageManagerTest, Construct) {
+  // Arrange -- nothing to set up; default PageManager created by SetUp()
+  // Act -- nothing to execute; default constructed via SetUp()
+  // Assert -- nothing to verify; gtest green on pass, death on crash
+}
 
 TEST_F(PageManagerTest, AllocateNewPage) {
+  // Arrange -- allocate a new free page via system transaction
   PageRef page = AllocatePage(PageType::kFreePage);
+
+  // Act -- write a deterministic byte pattern into the free page body
   char* buff = page->body.free_page.FreeBody();
   for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
     // Make sure no SEGV happen.
     buff[j] = static_cast<char>((page->PageID() + j) & 0xff);
   }
+
+  // Assert -- implicit; no SEGV means the page body is writable and sized correctly
 }
 
 TEST_F(PageManagerTest, AllocateMultipleNewPage) {
+  // Arrange -- allocate 15+1 free pages, each written with a deterministic byte pattern
   constexpr int kPages = 15;
   std::set<page_id_t> allocated_ids;
   for (int i = 0; i <= kPages; ++i) {
@@ -114,11 +124,15 @@ TEST_F(PageManagerTest, AllocateMultipleNewPage) {
     }
     allocated_ids.insert(page->PageID());
   }
+
+  // Act -- reset PageManager (drop pages) and re-read each allocated page
   Reset();
   for (const auto& id : allocated_ids) {
     PageRef ref = GetPage(id);
     FreePage& page = ref.GetFreePage();
     char* buff = page.FreeBody();
+
+    // Assert -- each page's body still has the deterministic pattern written before reset
     for (size_t j = 0; j < kFreeBodySize; ++j) {
       ASSERT_EQ(buff[j], static_cast<char>((id + j) & 0xff));
     }
@@ -126,12 +140,17 @@ TEST_F(PageManagerTest, AllocateMultipleNewPage) {
 }
 
 TEST_F(PageManagerTest, DestroyPage) {
+  // Arrange -- allocate and destroy 15 free pages
   for (int i = 0; i < 15; ++i) {
     PageRef page = AllocatePage(PageType::kFreePage);
     DestroyPage(page.get());
   }
+
+  // Act -- re-allocate 15 free pages; PageManager should recycle destroyed page IDs
   for (int i = 0; i < 15; ++i) {
     PageRef page = AllocatePage(PageType::kFreePage);
+
+    // Assert -- recycled page IDs must be <= 15 (the max ID ever allocated)
     ASSERT_LE(page->PageID(), 15);
   }
 }

@@ -46,15 +46,20 @@ class BlobFileTest : public ::testing::Test {
 };
 
 TEST_F(BlobFileTest, ReadAt) {
+  // Arrange -- build a tree of 2 key/value pairs and a Logger to write them
   std::map<std::string, std::string> tree;
   tree.emplace("foo", "barr");
   tree.emplace("value", "notice");
   auto lg = std::make_unique<Logger>(path_);
+
+  // Act -- write each key and value through the Logger, then destroy the logger
   for (const auto& it : tree) {
     lg->AddLog(it.first);
     lg->AddLog(it.second);
   }
   lg.reset();
+
+  // Assert -- read back each entry at the expected offset via BlobFile::ReadAt
   ASSERT_EQ(blob_->ReadAt(0, 3), "foo");
   ASSERT_EQ(blob_->ReadAt(3, 4), "barr");
   ASSERT_EQ(blob_->ReadAt(7, 5), "value");

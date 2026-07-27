@@ -43,21 +43,28 @@ class RowPageConcurrentTest : public RowPageTest {
 
 constexpr int kThreads = 8;
 TEST_F(RowPageConcurrentTest, InsertInsert) {
+  // Arrange -- spawn 8 threads, each inserting 100 random-string rows
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
   for (int i = 0; i < kThreads; ++i) {
     threads.emplace_back([this]() {
       for (int j = 0; j < 100; ++j) {
+        // Act -- insert a row with a random string key
         EXPECT_TRUE(InsertRow(RandomString()));
       }
     });
   }
+
+  // Act -- join all threads (waits for all insertions to complete)
   for (auto& thread : threads) {
     thread.join();
   }
+
+  // Assert -- implicit; all threads completed without deadlock; gtest green on pass
 }
 
 TEST_F(RowPageConcurrentTest, InsertUpdate) {
+  // Arrange -- pre-insert 100 rows, then spawn 4 inserters + 4 updaters
   constexpr int kRows = 100;
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
@@ -67,6 +74,7 @@ TEST_F(RowPageConcurrentTest, InsertUpdate) {
   for (int i = 0; i < kThreads / 2; ++i) {
     threads.emplace_back([this]() {
       for (int j = 0; j < kRows; ++j) {
+        // Act (inserter) -- insert a row with a random string key
         EXPECT_TRUE(InsertRow(RandomString()));
       }
     });
@@ -75,16 +83,22 @@ TEST_F(RowPageConcurrentTest, InsertUpdate) {
     threads.emplace_back([&, i]() {
       std::mt19937 rand(i);
       for (int j = 0; j < kRows; ++j) {
+        // Act (updater) -- update a random existing row with a new random string
         UpdateRow(rand() % kRows, RandomString());
       }
     });
   }
+
+  // Act -- join all threads (waits for all insertions and updates to complete)
   for (auto& thread : threads) {
     thread.join();
   }
+
+  // Assert -- implicit; all threads completed without deadlock; gtest green on pass
 }
 
 TEST_F(RowPageConcurrentTest, UpdateUpdate) {
+  // Arrange -- fill the page with random-string rows until full, then spawn 8 updaters
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
 
@@ -92,15 +106,21 @@ TEST_F(RowPageConcurrentTest, UpdateUpdate) {
   while (InsertRow(RandomString(engine() % 64))) {
   }
   size_t rows = GetRowCount();
+
   for (int i = 0; i < kThreads; ++i) {
     threads.emplace_back([&]() {
+      // Act -- each thread updates 100 random rows with new random strings
       for (int j = 0; j < 100; ++j) {
         UpdateRow(engine() % rows, RandomString(engine() % 64));
       }
     });
   }
+
+  // Act -- join all threads (waits for all updates to complete)
   for (auto& thread : threads) {
     thread.join();
   }
+
+  // Assert -- implicit; all threads completed without deadlock; gtest green on pass
 }
 }  // namespace tinylamb

@@ -107,10 +107,13 @@ constexpr int kThreads = 2;
 constexpr int kSize = 2;
 
 TEST_F(BPlusTreeConcurrentTest, InsertInsert) {
+  // Arrange -- spawn kThreads=2 threads, each with its own row map
   std::vector<std::unordered_map<std::string, std::string>> rows;
   rows.resize(kThreads);
   std::vector<std::thread> workers;
   workers.reserve(kThreads);
+
+  // Act 1 -- each thread inserts kSize=2 random key-value pairs via bpt_->Insert
   for (int i = 0; i < kThreads; ++i) {
     workers.emplace_back([&, i]() {
       std::mt19937 rand(i);
@@ -131,12 +134,15 @@ TEST_F(BPlusTreeConcurrentTest, InsertInsert) {
   for (auto& worker : workers) {
     worker.join();
   }
+
+  // Act 2 -- single-threaded read-back validates all inserted pairs
   {
     auto txn = tm_->Begin();
     for (const auto& rows_per_thread : rows) {
       for (const auto& row : rows_per_thread) {
         ASSIGN_OR_ASSERT_FAIL(std::string_view, value,
                               bpt_->Read(txn, row.first));
+        // Assert -- read-back value matches what thread inserted
         ASSERT_EQ(value, row.second);
       }
     }

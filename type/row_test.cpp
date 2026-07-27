@@ -20,6 +20,11 @@
 
 namespace tinylamb {
 
-TEST(RowTest, construct) { Row r; }
+TEST(RowTest, construct) {
+  // Arrange -- nothing more than default Row ctor
+  // Act -- default-construct a Row
+  Row r;
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
+}
 
 }  // namespace tinylamb

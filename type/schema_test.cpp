@@ -26,35 +26,44 @@
 namespace tinylamb {
 
 TEST(SchemaTest, Construct) {
+  // Arrange -- nothing more than default ColumnName/ValueType/Constraint
+  // Act -- construct two Schemas with different column counts
   Schema s("sample", {Column(ColumnName("c1"), ValueType::kInt64,
-                             Constraint(Constraint::kPrimaryKey)),
-                      Column(ColumnName("c2"), ValueType::kDouble)});
+                              Constraint(Constraint::kPrimaryKey)),
+                       Column(ColumnName("c2"), ValueType::kDouble)});
   Schema t("next_schema", {Column(ColumnName("c1"), ValueType::kInt64,
-                                  Constraint(Constraint::kPrimaryKey)),
-                           Column(ColumnName("c2"), ValueType::kDouble),
-                           Column(ColumnName("c3"), ValueType::kVarChar)});
+                                   Constraint(Constraint::kPrimaryKey)),
+                            Column(ColumnName("c2"), ValueType::kDouble),
+                            Column(ColumnName("c3"), ValueType::kVarChar)});
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST(SchemaTest, SerializeDeserialize) {
+  // Arrange -- nothing more than default ColumnName/ValueType/Constraint
+  // Act -- serialize+deserialize round-trip for 2 Schema variants
   SerializeDeserializeTest(
       Schema("sample", {Column(ColumnName("c1"), ValueType::kInt64,
-                               Constraint(Constraint::kPrimaryKey)),
-                        Column(ColumnName("c2"), ValueType::kDouble)}));
+                                Constraint(Constraint::kPrimaryKey)),
+                         Column(ColumnName("c2"), ValueType::kDouble)}));
   SerializeDeserializeTest(
       Schema("next_schema", {Column(ColumnName("c1"), ValueType::kInt64,
-                                    Constraint(Constraint::kPrimaryKey)),
-                             Column(ColumnName("c2"), ValueType::kDouble),
-                             Column(ColumnName("c3"), ValueType::kVarChar)}));
+                                     Constraint(Constraint::kPrimaryKey)),
+                              Column(ColumnName("c2"), ValueType::kDouble),
+                              Column(ColumnName("c3"), ValueType::kVarChar)}));
+  // Assert -- implicit; SerializeDeserializeTest macro asserts equality
 }
 
 TEST(SchemaTest, Dump) {
+  // Arrange -- nothing more than two Schemas with different column counts
+  // Act -- stream Schemas to LOG (no assertion; output-only)
   LOG(INFO) << Schema("sample", {Column(ColumnName("c1"), ValueType::kInt64,
-                                        Constraint(Constraint::kPrimaryKey)),
-                                 Column(ColumnName("c2"), ValueType::kDouble)});
+                                         Constraint(Constraint::kPrimaryKey)),
+                                  Column(ColumnName("c2"), ValueType::kDouble)});
   LOG(WARN) << Schema("next_schema",
-                      {Column(ColumnName("c1"), ValueType::kInt64,
-                              Constraint(Constraint::kPrimaryKey)),
-                       Column(ColumnName("c2"), ValueType::kDouble),
-                       Column(ColumnName("c3"), ValueType::kVarChar)});
+                       {Column(ColumnName("c1"), ValueType::kInt64,
+                               Constraint(Constraint::kPrimaryKey)),
+                        Column(ColumnName("c2"), ValueType::kDouble),
+                        Column(ColumnName("c3"), ValueType::kVarChar)});
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 }  // namespace tinylamb

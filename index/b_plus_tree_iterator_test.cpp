@@ -103,13 +103,20 @@ class BPlusTreeIteratorTest : public ::testing::Test {
   std::unique_ptr<BPlusTree> bpt_;
 };
 
-TEST_F(BPlusTreeIteratorTest, Construct) {}
+TEST_F(BPlusTreeIteratorTest, Construct) {
+  // Arrange -- nothing to set up; default BPlusTreeIterator constructed by SetUp()
+  // Act -- nothing to execute; default constructed via SetUp()
+  // Assert -- nothing to verify; gtest green on pass, death on crash
+}
 
 TEST_F(BPlusTreeIteratorTest, FullScan) {
+  // Arrange -- begin transaction, insert 7 keys a..g with 1000-byte key and 100-byte value
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
     Insert(txn, c, 1000, 100);
   }
+
+  // Act -- begin a full scan iterator and walk through all 7 keys
   BPlusTreeIterator it = bpt_->Begin(txn);
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
     EXPECT_TRUE(it.IsValid());
@@ -117,104 +124,114 @@ TEST_F(BPlusTreeIteratorTest, FullScan) {
     ++it;
   }
 
+  // Assert -- iterator is exhausted after the 7th key
   EXPECT_FALSE(it.IsValid());
 }
 
 TEST_F(BPlusTreeIteratorTest, RangeAcending) {
+  // Arrange -- begin transaction, insert 7 keys a..g with 1000-byte key and 100-byte value
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
     Insert(txn, c, 1000, 100);
   }
+
+  // Act -- begin a range scan iterator [b, d] and walk forward
   BPlusTreeIterator it = bpt_->Begin(txn, "b", "d");
   EXPECT_TRUE(it.IsValid());
-
   EXPECT_EQ(it.Value(), std::string(100, 'b'));
   ++it;
   EXPECT_TRUE(it.IsValid());
-
   EXPECT_EQ(it.Value(), std::string(100, 'c'));
   ++it;
+
+  // Assert -- iterator reaches the upper bound "d" and then exhausts
   EXPECT_FALSE(it.IsValid());
 }
 
 TEST_F(BPlusTreeIteratorTest, RangeDescending) {
+  // Arrange -- begin transaction, insert 7 keys a..g with 1000-byte key and 100-byte value
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
     Insert(txn, c, 1000, 100);
   }
+
+  // Act -- begin a descending range scan iterator ["", "d"] and walk backward
   BPlusTreeIterator it = bpt_->Begin(txn, "", "d", false);
   EXPECT_EQ(it.Value(), std::string(100, 'd'));
   --it;
   EXPECT_TRUE(it.IsValid());
-
   EXPECT_EQ(it.Value(), std::string(100, 'c'));
   --it;
   EXPECT_TRUE(it.IsValid());
-
   EXPECT_EQ(it.Value(), std::string(100, 'b'));
   --it;
   EXPECT_TRUE(it.IsValid());
-
   EXPECT_EQ(it.Value(), std::string(100, 'a'));
   --it;
+
+  // Assert -- iterator reaches the lower bound "a" and then exhausts
   EXPECT_FALSE(it.IsValid());
 }
 
 TEST_F(BPlusTreeIteratorTest, RangeDescendingRightOpen) {
+  // Arrange -- begin transaction, insert 7 keys a..g with 1000-byte key and 100-byte value
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
     Insert(txn, c, 1000, 100);
   }
+
+  // Act -- begin a descending full scan iterator ["", ""] (right-open) and walk backward
   BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);
   EXPECT_EQ(it.Value(), std::string(100, 'g'));
   --it;
   EXPECT_TRUE(it.IsValid());
-
   EXPECT_EQ(it.Value(), std::string(100, 'f'));
   --it;
   EXPECT_TRUE(it.IsValid());
-
   EXPECT_EQ(it.Value(), std::string(100, 'e'));
   --it;
   EXPECT_TRUE(it.IsValid());
-
   EXPECT_EQ(it.Value(), std::string(100, 'd'));
   --it;
   EXPECT_TRUE(it.IsValid());
-
   EXPECT_EQ(it.Value(), std::string(100, 'c'));
   --it;
   EXPECT_TRUE(it.IsValid());
-
   EXPECT_EQ(it.Value(), std::string(100, 'b'));
   --it;
   EXPECT_TRUE(it.IsValid());
-
   EXPECT_EQ(it.Value(), std::string(100, 'a'));
   --it;
+
+  // Assert -- iterator exhausts after visiting all 7 keys in reverse
   EXPECT_FALSE(it.IsValid());
 }
 
 TEST_F(BPlusTreeIteratorTest, FullScanMultiLeaf) {
+  // Arrange -- begin transaction, insert 9 keys '1'..'9' with 2723-byte key and 2723-byte value
   constexpr int kSize = 2723;
   auto txn = tm_->Begin();
   for (const auto& c : {'1', '2', '3', '4', '5', '6', '7', '8', '9'}) {
     Insert(txn, c, kSize, kSize);
   }
-  bpt_->Dump(txn, std::cerr);
+  DumpLogTxn(*bpt_, txn);
+
+  // Act -- begin a full scan iterator and walk through all 9 keys
   BPlusTreeIterator it = bpt_->Begin(txn);
   for (const auto& c : {'1', '2', '3', '4', '5', '6', '7', '8', '9'}) {
     SCOPED_TRACE(c);
-    bpt_->Dump(txn, std::cerr);
+    DumpLogTxn(*bpt_, txn);
     ASSERT_TRUE(it.IsValid());
     ASSERT_EQ(it.Value(), std::string(kSize, c));
     ++it;
   }
 
+  // Assert -- iterator is exhausted after the 9th key
   EXPECT_FALSE(it.IsValid());
 }
 
 TEST_F(BPlusTreeIteratorTest, FullScanMultiLeafRecovery) {
+  // Arrange -- begin transaction, insert 9 keys '1'..'9' with 2000-byte key and 2000-byte value, precommit
   constexpr int kSize = 2000;
   {
     auto txn = tm_->Begin();
@@ -226,8 +243,10 @@ TEST_F(BPlusTreeIteratorTest, FullScanMultiLeafRecovery) {
   LOG(ERROR) << "before recovery";
   {
     auto txn = tm_->Begin();
-    bpt_->Dump(txn, std::cerr);
+    DumpLogTxn(*bpt_, txn);
   }
+
+  // Act -- emulate crash + recovery, then begin a full scan iterator
   Recover();
   r_->RecoverFrom(0, tm_.get());
   LOG(ERROR) << "after recovery";
@@ -240,17 +259,22 @@ TEST_F(BPlusTreeIteratorTest, FullScanMultiLeafRecovery) {
       ASSERT_EQ(it.Value(), std::string(kSize, c));
       ++it;
     }
+
+    // Assert -- iterator is exhausted after the 9th key
     EXPECT_FALSE(it.IsValid());
   }
 }
 
 TEST_F(BPlusTreeIteratorTest, FullScanReverse) {
+  // Arrange -- begin transaction, insert 11 keys 'k'..'a' (reverse order) with 2000-byte key and 2000-byte value
   constexpr int kSize = 2000;
   auto txn = tm_->Begin();
   for (const auto& c :
        {'k', 'j', 'i', 'h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
     Insert(txn, c, kSize, kSize);
   }
+
+  // Act -- begin a full scan iterator (forward) and walk through all 11 keys in alphabetical order
   BPlusTreeIterator it = bpt_->Begin(txn);
   for (const auto& c :
        {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'}) {
@@ -259,18 +283,23 @@ TEST_F(BPlusTreeIteratorTest, FullScanReverse) {
     ASSERT_EQ(it.Value(), std::string(kSize, c));
     ++it;
   }
+
+  // Assert -- iterator is exhausted after the 11th key
   EXPECT_FALSE(it.IsValid());
 }
 
 TEST_F(BPlusTreeIteratorTest, EndOpenFullScanReverse) {
+  // Arrange -- begin transaction, insert 11 keys 'a'..'k' (forward order) with 2000-byte key and 2000-byte value
   constexpr int kSize = 2000;
   auto txn = tm_->Begin();
   for (const auto& c :
        {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'}) {
     Insert(txn, c, kSize, kSize);
   }
+
+  // Act -- begin a descending full scan iterator ["", ""] (both bounds open) and walk backward
   BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);
-  bpt_->Dump(txn, std::cerr);
+  DumpLogTxn(*bpt_, txn);
   for (const auto& c :
        {'k', 'j', 'i', 'h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
     SCOPED_TRACE(c);
@@ -278,6 +307,8 @@ TEST_F(BPlusTreeIteratorTest, EndOpenFullScanReverse) {
     ASSERT_EQ(it.Value(), std::string(kSize, c));
     --it;
   }
+
+  // Assert -- iterator is exhausted after visiting all 11 keys in reverse
   EXPECT_FALSE(it.IsValid());
 }
 }  // namespace tinylamb

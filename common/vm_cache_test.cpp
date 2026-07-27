@@ -86,25 +86,34 @@ class VMCacheTest : public ::testing::Test {
 };
 
 TEST_F(VMCacheTest, one_page) {
+  // Arrange -- create a VMCache of 1024 int32_t values
   constexpr size_t kCount = 1024;
   auto cache = MakeCache<int32_t>(kCount);
+
+  // Act -- read each element back via cache->Read
   for (int i = 0; i < 1024; ++i) {
     int32_t data;
     cache->Read(&data, i, 1);
+
+    // Assert -- each read yields the expected value written by MakeCache
     ASSERT_EQ(data, Expected<int32_t>(i));
   }
 }
 
 TEST_F(VMCacheTest, offset) {
+  // Arrange -- for each offset 1..4095 (step 127), create a VMCache of 1024 int32_t values at that offset
   constexpr size_t kCount = 1024;
   for (int i = 1; i < 4096; i += 127) {
     auto cache = MakeCache<int32_t>(kCount, i);
+
+    // Act -- read each element back via cache->Read
     for (int j = 0; j < 1024; ++j) {
       int32_t data;
       cache->Read(&data, j, 1);
       if (data != Expected<int32_t>(j)) {
         exit(1);
       }
+      // Assert -- each read yields the expected value, or exit(1) on mismatch
       ASSERT_EQ(data, Expected<int32_t>(j));
     }
   }
@@ -127,12 +136,17 @@ struct Data {
 };
 
 TEST_F(VMCacheTest, offset_struct) {
+  // Arrange -- for each offset 1..4095 (step 127), create a VMCache of 1024 Data structs at that offset
   constexpr size_t kCount = 1024;
   for (int i = 1; i < 4096; i += 127) {
     auto cache = MakeCache<Data>(kCount, i);
+
+    // Act -- read each struct back via cache->Read
     for (int j = 0; j < 1024; ++j) {
       Data data;
       cache->Read(&data, j, 1);
+
+      // Assert -- each read yields the expected struct
       ASSERT_EQ(data, Expected<Data>(j));
     }
   }

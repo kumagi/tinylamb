@@ -102,20 +102,30 @@ class TableStatisticsTest : public ::testing::Test {
   std::unique_ptr<Database> db_;
 };
 
-TEST_F(TableStatisticsTest, Construct) {}
+TEST_F(TableStatisticsTest, Construct) {
+  // Arrange -- nothing to set up; default TableStatistics created by SetUp()
+  // Act -- nothing to execute; default constructed via SetUp()
+  // Assert -- nothing to verify; gtest green on pass, death on crash
+}
 
 TEST_F(TableStatisticsTest, Update) {
+  // Arrange -- begin context, get table "Sc1" and its statistics
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(ctx, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL(TableStatistics, ts, db_->GetStatistics(ctx, "Sc1"));
+
+  // Act -- update the statistics from the table
   ts.Update(ctx.txn_, tbl);
   LOG(TRACE) << ts;
 }
 
 TEST_F(TableStatisticsTest, Store) {
+  // Arrange -- begin context, get table "Sc1" and its statistics
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(ctx, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL(TableStatistics, ts, db_->GetStatistics(ctx, "Sc1"));
+
+  // Act -- update the statistics, then store them for "Sc2"
   ts.Update(ctx.txn_, tbl);
   LOG(TRACE) << ts;
   db_->UpdateStatistics(ctx, "Sc2", ts);

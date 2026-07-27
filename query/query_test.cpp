@@ -104,80 +104,81 @@ class QueryTest : public ::testing::Test {
 };
 
 TEST_F(QueryTest, SimpleSelect) {
+  // Arrange
   TransactionContext ctx = db_->BeginContext();
-  {
-    auto st =
-        ExecuteQuery(ctx, "CREATE TABLE t1 (c1 INT, c2 INT, c3 VARCHAR(10));");
-    ASSERT_EQ(st.GetStatus(), Status::kSuccess);
-    auto exec = std::move(st.Value());
-    Row result;
-    ASSERT_TRUE(exec->Next(&result, nullptr));
-  }
-  {
-    auto st = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (1, 10, 'hello');");
-    ASSERT_EQ(st.GetStatus(), Status::kSuccess);
-    auto exec = std::move(st.Value());
-    Row result;
-    ASSERT_TRUE(exec->Next(&result, nullptr));
-    ASSERT_EQ(result[1], Value(1));
-    ASSERT_FALSE(exec->Next(&result, nullptr));
-  }
-  {
-    auto st = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (2, 20, 'world');");
-    ASSERT_EQ(st.GetStatus(), Status::kSuccess);
-    auto exec = std::move(st.Value());
-    Row result;
-    ASSERT_TRUE(exec->Next(&result, nullptr));
-    ASSERT_EQ(result[1], Value(1));
-    ASSERT_FALSE(exec->Next(&result, nullptr));
-  }
-  {
-    auto st = ExecuteQuery(ctx, "SELECT * FROM t1 WHERE c1 = 1;");
-    ASSERT_EQ(st.GetStatus(), Status::kSuccess);
-    auto exec = std::move(st.Value());
-    Row result;
-    ASSERT_TRUE(exec->Next(&result, nullptr));
-    ASSERT_EQ(result[0], Value(1));
-    ASSERT_EQ(result[1], Value(10));
-    ASSERT_EQ(result[2], Value("hello"));
-    ASSERT_FALSE(exec->Next(&result, nullptr));
-  }
+  Row result;
+
+  // Act + Assert: CREATE TABLE t1
+  auto st_create =
+      ExecuteQuery(ctx, "CREATE TABLE t1 (c1 INT, c2 INT, c3 VARCHAR(10));");
+  ASSERT_EQ(st_create.GetStatus(), Status::kSuccess);
+  auto exec_create = std::move(st_create.Value());
+  ASSERT_TRUE(exec_create->Next(&result, nullptr));
+
+  // Act + Assert: INSERT (1, 10, 'hello')
+  auto st_insert1 = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (1, 10, 'hello');");
+  ASSERT_EQ(st_insert1.GetStatus(), Status::kSuccess);
+  auto exec_insert1 = std::move(st_insert1.Value());
+  ASSERT_TRUE(exec_insert1->Next(&result, nullptr));
+  ASSERT_EQ(result[1], Value(1));
+  ASSERT_FALSE(exec_insert1->Next(&result, nullptr));
+
+  // Act + Assert: INSERT (2, 20, 'world')
+  auto st_insert2 = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (2, 20, 'world');");
+  ASSERT_EQ(st_insert2.GetStatus(), Status::kSuccess);
+  auto exec_insert2 = std::move(st_insert2.Value());
+  ASSERT_TRUE(exec_insert2->Next(&result, nullptr));
+  ASSERT_EQ(result[1], Value(1));
+  ASSERT_FALSE(exec_insert2->Next(&result, nullptr));
+
+  // Act + Assert: SELECT * FROM t1 WHERE c1 = 1
+  auto st_select = ExecuteQuery(ctx, "SELECT * FROM t1 WHERE c1 = 1;");
+  ASSERT_EQ(st_select.GetStatus(), Status::kSuccess);
+  auto exec_select = std::move(st_select.Value());
+  ASSERT_TRUE(exec_select->Next(&result, nullptr));
+  ASSERT_EQ(result[0], Value(1));
+  ASSERT_EQ(result[1], Value(10));
+  ASSERT_EQ(result[2], Value("hello"));
+  ASSERT_FALSE(exec_select->Next(&result, nullptr));
+
+  // Act + Assert: PreCommit
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
 TEST_F(QueryTest, SelectWithProjection) {
+  // Arrange
   TransactionContext ctx = db_->BeginContext();
-  {
-    auto st =
-        ExecuteQuery(ctx, "CREATE TABLE t1 (c1 INT, c2 INT, c3 VARCHAR(10));");
-    ASSERT_EQ(st.GetStatus(), Status::kSuccess);
-  }
-  {
-    auto st = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (1, 10, 'hello');");
-    ASSERT_EQ(st.GetStatus(), Status::kSuccess);
-    auto exec = std::move(st.Value());
-    Row result;
-    ASSERT_TRUE(exec->Next(&result, nullptr));
-    ASSERT_FALSE(exec->Next(&result, nullptr));
-  }
-  {
-    auto st = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (2, 20, 'world');");
-    ASSERT_EQ(st.GetStatus(), Status::kSuccess);
-    auto exec = std::move(st.Value());
-    Row result;
-    ASSERT_TRUE(exec->Next(&result, nullptr));
-    ASSERT_FALSE(exec->Next(&result, nullptr));
-  }
-  {
-    auto st = ExecuteQuery(ctx, "SELECT c1, c3 FROM t1 WHERE c1 = 2;");
-    ASSERT_EQ(st.GetStatus(), Status::kSuccess);
-    auto exec = std::move(st.Value());
-    Row result;
-    ASSERT_TRUE(exec->Next(&result, nullptr));
-    ASSERT_EQ(result[0], Value(2));
-    ASSERT_EQ(result[1], Value("world"));
-    ASSERT_FALSE(exec->Next(&result, nullptr));
-  }
+  Row result;
+
+  // Act + Assert: CREATE TABLE t1
+  auto st_create =
+      ExecuteQuery(ctx, "CREATE TABLE t1 (c1 INT, c2 INT, c3 VARCHAR(10));");
+  ASSERT_EQ(st_create.GetStatus(), Status::kSuccess);
+
+  // Act + Assert: INSERT (1, 10, 'hello')
+  auto st_insert1 = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (1, 10, 'hello');");
+  ASSERT_EQ(st_insert1.GetStatus(), Status::kSuccess);
+  auto exec_insert1 = std::move(st_insert1.Value());
+  ASSERT_TRUE(exec_insert1->Next(&result, nullptr));
+  ASSERT_FALSE(exec_insert1->Next(&result, nullptr));
+
+  // Act + Assert: INSERT (2, 20, 'world')
+  auto st_insert2 = ExecuteQuery(ctx, "INSERT INTO t1 VALUES (2, 20, 'world');");
+  ASSERT_EQ(st_insert2.GetStatus(), Status::kSuccess);
+  auto exec_insert2 = std::move(st_insert2.Value());
+  ASSERT_TRUE(exec_insert2->Next(&result, nullptr));
+  ASSERT_FALSE(exec_insert2->Next(&result, nullptr));
+
+  // Act + Assert: SELECT c1, c3 FROM t1 WHERE c1 = 2
+  auto st_select = ExecuteQuery(ctx, "SELECT c1, c3 FROM t1 WHERE c1 = 2;");
+  ASSERT_EQ(st_select.GetStatus(), Status::kSuccess);
+  auto exec_select = std::move(st_select.Value());
+  ASSERT_TRUE(exec_select->Next(&result, nullptr));
+  ASSERT_EQ(result[0], Value(2));
+  ASSERT_EQ(result[1], Value("world"));
+  ASSERT_FALSE(exec_select->Next(&result, nullptr));
+
+  // Act + Assert: PreCommit
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 

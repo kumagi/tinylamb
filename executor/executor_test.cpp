@@ -94,20 +94,26 @@ class ExecutorTest : public ::testing::Test {
   std::unique_ptr<Database> rs_;
 };
 
-TEST_F(ExecutorTest, Construct) {}
+TEST_F(ExecutorTest, Construct) {
+  // Arrange -- nothing to set up; default database created by SetUp()
+  // Act -- nothing to execute; default constructed via SetUp()
+  // Assert -- nothing to verify; gtest death on crash, gtest green on pass
+}
 
 TEST_F(ExecutorTest, FullScan) {
+  // Arrange
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   FullScan fs(ctx.txn_, *tbl);
   std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2)}),
-                           Row({Value(3), Value("piyo"), Value(12.2)}),
-                           Row({Value(1), Value("world"), Value(4.9)}),
-                           Row({Value(2), Value("arise"), Value(4.14)})});
-  fs.Dump(std::cout, 0);
-  std::cout << "\n";
+                            Row({Value(3), Value("piyo"), Value(12.2)}),
+                            Row({Value(1), Value("world"), Value(4.9)}),
+                            Row({Value(2), Value("arise"), Value(4.14)})});
+  DumpLog(fs);
   Row got;
   RowPosition pos;
+
+  // Act -- iterate FullScan cursor through all rows
   ASSERT_TRUE(fs.Next(&got, &pos));
   ASSERT_NE(rows.find(got), rows.end());
   rows.erase(got);
@@ -120,70 +126,79 @@ TEST_F(ExecutorTest, FullScan) {
   ASSERT_TRUE(fs.Next(&got, &pos));
   ASSERT_NE(rows.find(got), rows.end());
   rows.erase(got);
+
+  // Assert -- cursor exhausted and all rows consumed
   ASSERT_TRUE(rows.empty());
   ASSERT_FALSE(fs.Next(&got, &pos));
 }
 
 TEST_F(ExecutorTest, IndexScan) {
+  // Arrange
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   ASSERT_EQ(tbl->IndexCount(), 2);
   const Schema sc = tbl->GetSchema();
   IndexScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value("he"), Value("q"), true,
-               BinaryExpressionExp(ColumnValueExp("score"),
-                                   BinaryOperation::kGreaterThan,
-                                   ConstantValueExp(Value(10.0))),
-               sc);
+                BinaryExpressionExp(ColumnValueExp("score"),
+                                    BinaryOperation::kGreaterThan,
+                                    ConstantValueExp(Value(10.0))),
+                sc);
   Row target({Value(3), Value("piyo"), Value(12.2)});
-
-  fs.Dump(std::cout, 0);
-  std::cout << "\n";
+  DumpLog(fs);
   Row got;
   RowPosition pos;
+
+  // Act -- advance IndexScan cursor to first match
   ASSERT_TRUE(fs.Next(&got, &pos));
-  std::cout << got << "\n";
+  LOG(INFO) << got;
+
+  // Assert -- matched row equals target and cursor exhausts after first match
   ASSERT_EQ(got, target);
   ASSERT_FALSE(fs.Next(&got, &pos));
 }
 
 TEST_F(ExecutorTest, IndexOnlyScan) {
+  // Arrange
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   ASSERT_EQ(tbl->IndexCount(), 2);
   const Schema sc = tbl->GetSchema();
   IndexOnlyScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value("he"), Value("q"),
-                   true,
-                   BinaryExpressionExp(ColumnValueExp("score"),
-                                       BinaryOperation::kGreaterThan,
-                                       ConstantValueExp(Value(10.0))),
-                   sc);
+                    true,
+                    BinaryExpressionExp(ColumnValueExp("score"),
+                                        BinaryOperation::kGreaterThan,
+                                        ConstantValueExp(Value(10.0))),
+                    sc);
   Row expected({Value("piyo"), Value(12.2)});
-
-  fs.Dump(std::cout, 0);
-  std::cout << "\n";
+  DumpLog(fs);
   Row got;
   RowPosition pos;
+
+  // Act -- advance IndexOnlyScan cursor to first match
   ASSERT_TRUE(fs.Next(&got, &pos));
-  std::cout << got << "\n";
+  LOG(INFO) << got;
+
+  // Assert -- matched projected row equals expected and cursor exhausts
   ASSERT_EQ(got, expected);
   ASSERT_FALSE(fs.Next(&got, &pos));
 }
 
 TEST_F(ExecutorTest, IndexOnlyFullScan) {
+  // Arrange
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   ASSERT_EQ(tbl->IndexCount(), 2);
   const Schema sc = tbl->GetSchema();
   IndexOnlyScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value(), Value(), true,
-                   BinaryExpressionExp(ColumnValueExp("score"),
-                                       BinaryOperation::kGreaterThan,
-                                       ConstantValueExp(Value(1.0))),
-                   sc);
-
-  fs.Dump(std::cout, 0);
-  std::cout << "\n";
+                    BinaryExpressionExp(ColumnValueExp("score"),
+                                        BinaryOperation::kGreaterThan,
+                                        ConstantValueExp(Value(1.0))),
+                    sc);
+  DumpLog(fs);
   Row got;
   RowPosition pos;
+
+  // Act -- iterate IndexOnlyScan cursor through all projected rows
   ASSERT_TRUE(fs.Next(&got, &pos));
   ASSERT_EQ(got, Row({Value("arise"), Value(4.14)}));
   ASSERT_TRUE(fs.Next(&got, &pos));
@@ -192,21 +207,25 @@ TEST_F(ExecutorTest, IndexOnlyFullScan) {
   ASSERT_EQ(got, Row({Value("piyo"), Value(12.2)}));
   ASSERT_TRUE(fs.Next(&got, &pos));
   ASSERT_EQ(got, Row({Value("world"), Value(4.9)}));
+
+  // Assert -- cursor exhausted after all projected rows consumed
   ASSERT_FALSE(fs.Next(&got, &pos));
 }
 
 TEST_F(ExecutorTest, Projection) {
+  // Arrange
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   auto fs = std::make_shared<FullScan>(ctx.txn_, *tbl);
   Projection proj({NamedExpression("key"), NamedExpression("score")},
-                  tbl->GetSchema(), std::move(fs));
+                   tbl->GetSchema(), std::move(fs));
   std::unordered_set rows(
       {Row({Value(0), Value(1.2)}), Row({Value(3), Value(12.2)}),
-       Row({Value(1), Value(4.9)}), Row({Value(2), Value(4.14)})});
-  proj.Dump(std::cout, 0);
-  std::cout << "\n";
+        Row({Value(1), Value(4.9)}), Row({Value(2), Value(4.14)})});
+  DumpLog(proj);
   Row got;
+
+  // Act -- iterate Projection cursor through all projected rows
   ASSERT_TRUE(proj.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_TRUE(rows.erase(got));
@@ -219,28 +238,35 @@ TEST_F(ExecutorTest, Projection) {
   ASSERT_TRUE(proj.Next(&got, nullptr));
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_TRUE(rows.erase(got));
+
+  // Assert -- cursor exhausted and all projected rows consumed
   ASSERT_FALSE(proj.Next(&got, nullptr));
   ASSERT_TRUE(rows.empty());
 }
 
 TEST_F(ExecutorTest, Selection) {
+  // Arrange
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   Expression key_is_1 =
       BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kEquals,
-                          ConstantValueExp(Value(1)));
+                           ConstantValueExp(Value(1)));
   Selection sel(key_is_1, tbl->GetSchema(),
                 std::make_shared<FullScan>(ctx.txn_, *tbl));
   std::unordered_set rows({Row({Value(1), Value("world"), Value(4.9)})});
-  sel.Dump(std::cout, 0);
-  std::cout << "\n";
+  DumpLog(sel);
   Row got;
+
+  // Act -- advance Selection cursor to first matching row
   ASSERT_TRUE(sel.Next(&got, nullptr));
+
+  // Assert -- matched row is in expected set and cursor exhausts after one match
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_FALSE(sel.Next(&got, nullptr));
 }
 
 TEST_F(ExecutorTest, BasicJoin) {
+  // Arrange
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   ASSIGN_OR_ASSERT_FAIL(
@@ -257,11 +283,9 @@ TEST_F(ExecutorTest, BasicJoin) {
               {Row({Value(3), Value(99.9), Value("extra")})},
               {Row({Value(232), Value(40.9), Value("out")})},
               {Row({Value(0), Value(9.2), Value("arise")})}});
-
   HashJoin hj(std::make_shared<FullScan>(ctx.txn_, *tbl), {0},
               std::make_shared<FullScan>(ctx.txn_, right_tbl), {0});
-  hj.Dump(std::cout, 0);
-  std::cout << "\n";
+  DumpLog(hj);
   std::unordered_set expected({Row({Value(0), Value("hello"), Value(1.2),
                                     Value(0), Value(9.2), Value("arise")}),
                                Row({Value(3), Value("piyo"), Value(12.2),
@@ -270,8 +294,9 @@ TEST_F(ExecutorTest, BasicJoin) {
                                     Value(3), Value(99.9), Value("extra")}),
                                Row({Value(1), Value("world"), Value(4.9),
                                     Value(1), Value(4.9), Value("probe")})});
-
   Row got;
+
+  // Act -- iterate HashJoin cursor through all matched pairs
   ASSERT_TRUE(hj.Next(&got, nullptr));
   ASSERT_NE(expected.find(got), expected.end());
   ASSERT_TRUE(expected.erase(got));
@@ -284,11 +309,14 @@ TEST_F(ExecutorTest, BasicJoin) {
   ASSERT_TRUE(hj.Next(&got, nullptr));
   ASSERT_NE(expected.find(got), expected.end());
   ASSERT_TRUE(expected.erase(got));
+
+  // Assert -- cursor exhausted and all matched pairs consumed
   ASSERT_FALSE(hj.Next(&got, nullptr));
   ASSERT_TRUE(expected.empty());
 }
 
 TEST_F(ExecutorTest, IndexJoin) {
+  // Arrange
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   ASSIGN_OR_ASSERT_FAIL(
@@ -304,19 +332,15 @@ TEST_F(ExecutorTest, IndexJoin) {
               {Row({Value(2), Value(99.9), Value("right two")})},
               {Row({Value(232), Value(40.9), Value("right ignored")})},
               {Row({Value(0), Value(9.2), Value("right zero")})}});
-
   ASSERT_SUCCESS(rs_->CreateIndex(
       ctx, "RightTable",
       IndexSchema("RightIdx", {0}, {}, IndexMode::kNonUnique)));
-
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, reload_right,
                         ctx.GetTable("RightTable"));
   ASSERT_EQ(reload_right->IndexCount(), 1);
-
   IndexJoin ij(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0},
-               *reload_right, reload_right->GetIndex(0), {0});
-  std::cout << ij << "\n";
-
+                *reload_right, reload_right->GetIndex(0), {0});
+  LOG(INFO) << ij;
   std::unordered_set expected(
       {Row({Value(0), Value("hello"), Value(1.2), Value(0), Value(9.2),
             Value("right zero")}),
@@ -330,6 +354,7 @@ TEST_F(ExecutorTest, IndexJoin) {
             Value("right two")})});
   Row got;
 
+  // Act -- iterate IndexJoin cursor through all matched pairs
   ASSERT_TRUE(ij.Next(&got, nullptr));
   ASSERT_TRUE(expected.contains(got));
   ASSERT_TRUE(expected.erase(got));
@@ -345,11 +370,14 @@ TEST_F(ExecutorTest, IndexJoin) {
   ASSERT_TRUE(ij.Next(&got, nullptr));
   ASSERT_TRUE(expected.contains(got));
   ASSERT_TRUE(expected.erase(got));
+
+  // Assert -- cursor exhausted and all matched pairs consumed
   ASSERT_FALSE(ij.Next(&got, nullptr));
   ASSERT_TRUE(expected.empty());
 }
 
 TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
+  // Arrange
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   ASSIGN_OR_ASSERT_FAIL(
@@ -358,12 +386,6 @@ TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
                                    {Column("key", ValueType::kInt64),
                                     Column("score", ValueType::kDouble),
                                     Column("name", ValueType::kVarChar)}}));
-  /*
-               {{Row({Value(0), Value("hello"), Value(1.2)})},
-                {Row({Value(3), Value("piyo"), Value(12.2)})},
-                {Row({Value(1), Value("world"), Value(4.9)})},
-                {Row({Value(2), Value("arise"), Value(4.14)})}});
-                */
   BulkInsert(ctx.txn_, right_tbl,
              {{Row({Value(1), Value(4.9), Value("right one")})},
               {Row({Value(3), Value(12.4), Value("right three")})},
@@ -372,19 +394,15 @@ TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
               {Row({Value(232), Value(40.9), Value("right ignored")})},
               {Row({Value(0), Value(9.2), Value("hello")})},
               {Row({Value(0), Value(0.1), Value("build")})}});
-
   ASSERT_SUCCESS(rs_->CreateIndex(
       ctx, "RightTable",
       IndexSchema("RightIdx", {0}, {}, IndexMode::kNonUnique)));
-
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, reload_right,
                         ctx.GetTable("RightTable"));
   ASSERT_EQ(reload_right->IndexCount(), 1);
-
   IndexJoin ij(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0, 1},
                *reload_right, reload_right->GetIndex(0), {0, 2});
-  std::cout << ij << "\n";
-
+  LOG(INFO) << ij;
   std::unordered_set expected({Row({Value(0), Value("hello"), Value(1.2),
                                     Value(0), Value(9.2), Value("hello")}),
                                Row({Value(3), Value("piyo"), Value(12.2),
@@ -392,6 +410,8 @@ TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
                                Row({Value(2), Value("arise"), Value(4.14),
                                     Value(2), Value(12.3), Value("arise")})});
   Row got;
+
+  // Act -- iterate IndexJoin cursor through all composite-key matched pairs
   ASSERT_TRUE(ij.Next(&got, nullptr));
   ASSERT_TRUE(expected.contains(got));
   ASSERT_TRUE(expected.erase(got));
@@ -401,11 +421,14 @@ TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
   ASSERT_TRUE(ij.Next(&got, nullptr));
   ASSERT_TRUE(expected.contains(got));
   ASSERT_TRUE(expected.erase(got));
+
+  // Assert -- cursor exhausted and all matched pairs consumed
   ASSERT_FALSE(ij.Next(&got, nullptr));
   ASSERT_TRUE(expected.empty());
 }
 
 TEST_F(ExecutorTest, Insert) {
+  // Arrange
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   Schema src_schema{
@@ -425,12 +448,18 @@ TEST_F(ExecutorTest, Insert) {
               {Row({Value(0), Value("arise"), Value(9.2)})}});
   auto insert = std::make_shared<Insert>(
       ctx.txn_, &*tbl, std::make_shared<FullScan>(ctx.txn_, *right_tbl));
-  std::cout << *insert << "\n";
+  LOG(INFO) << *insert;
   Row result;
+
+  // Act 1 -- iterate Insert executor to produce rows from SrcTable into SampleTable
   ASSERT_TRUE(insert->Next(&result, nullptr));
   ASSERT_EQ(result[1], Value(7));
   ASSERT_FALSE(insert->Next(&result, nullptr));
 
+  // Assert 1 -- Insert executor produced the expected row and then exhausted
+  // (implicit above)
+
+  // Arrange 2 -- prepare verification FullScan over the populated SampleTable
   std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2)}),
                            Row({Value(3), Value("piyo"), Value(12.2)}),
                            Row({Value(1), Value("world"), Value(4.9)}),
@@ -442,6 +471,8 @@ TEST_F(ExecutorTest, Insert) {
                            Row({Value(3), Value("extra"), Value(99.9)}),
                            Row({Value(232), Value("out"), Value(40.9)}),
                            Row({Value(0), Value("arise"), Value(9.2)})});
+
+  // Act 2 -- iterate FullScan to verify all 12 rows are present in SampleTable
   FullScan fs(ctx.txn_, *tbl);
   while (!rows.empty()) {
     Row got;
@@ -450,10 +481,13 @@ TEST_F(ExecutorTest, Insert) {
     ASSERT_NE(rows.find(got), rows.end());
     rows.erase(got);
   }
+
+  // Assert 2 -- FullScan consumed all expected rows and cursor exhausted
   ASSERT_TRUE(rows.empty());
 }
 
 TEST_F(ExecutorTest, Update) {
+  // Arrange
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   Schema src_schema{
@@ -475,16 +509,24 @@ TEST_F(ExecutorTest, Update) {
       ctx.txn_, &*tbl,
       std::make_shared<Projection>(update_rule, tbl->GetSchema(),
                                    std::make_shared<FullScan>(ctx.txn_, *tbl)));
-  std::cout << *update << "\n";
+  LOG(INFO) << *update;
   Row result;
+
+  // Act 1 -- iterate Update executor to apply updates to SampleTable rows
   ASSERT_TRUE(update->Next(&result, nullptr));
   ASSERT_EQ(result[1], Value(4));
   ASSERT_FALSE(update->Next(&result, nullptr));
 
+  // Assert 1 -- Update executor produced the expected updated row and exhausted
+  // (implicit above)
+
+  // Arrange 2 -- prepare verification FullScan over the updated SampleTable
   std::unordered_set<Row> rows({{Row({Value(0), Value("****"), Value(2.4)})},
                                 {Row({Value(3), Value("****"), Value(24.4)})},
                                 {Row({Value(1), Value("****"), Value(9.8)})},
                                 {Row({Value(2), Value("****"), Value(8.28)})}});
+
+  // Act 2 -- iterate FullScan to verify all 4 updated rows are present
   FullScan fs(ctx.txn_, *tbl);
   while (!rows.empty()) {
     Row got;
@@ -493,10 +535,13 @@ TEST_F(ExecutorTest, Update) {
     ASSERT_NE(rows.find(got), rows.end());
     rows.erase(got);
   }
+
+  // Assert 2 -- FullScan consumed all expected updated rows and cursor exhausted
   ASSERT_TRUE(rows.empty());
 }
 
 TEST_F(ExecutorTest, Aggregation) {
+  // Arrange
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
   auto fs = std::make_shared<FullScan>(ctx.txn_, *tbl);
@@ -514,7 +559,11 @@ TEST_F(ExecutorTest, Aggregation) {
   AggregationExecutor agg(std::move(fs), tbl->GetSchema(),
                           std::move(aggregates));
   Row result;
+
+  // Act -- advance Aggregation cursor to compute aggregates over all rows
   ASSERT_TRUE(agg.Next(&result, nullptr));
+
+  // Assert -- aggregated values match expected statistics
   ASSERT_EQ(result[0], Value(4));
   ASSERT_EQ(result[1], Value(22.44));
   ASSERT_EQ(result[2], Value(5.61));

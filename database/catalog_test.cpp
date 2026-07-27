@@ -51,18 +51,28 @@ class CatalogTest : public ::testing::Test {
   std::unique_ptr<Database> rs_;
 };
 
-TEST_F(CatalogTest, Construction) {}
+TEST_F(CatalogTest, Construction) {
+  // Arrange -- nothing to set up; default database created by SetUp()
+  // Act -- nothing to execute; default constructed via SetUp()
+  // Assert -- nothing to verify; gtest green on pass, death on crash
+}
 
 TEST_F(CatalogTest, CreateTable) {
+  // Arrange -- begin context, define schema with 3 columns
   TransactionContext ctx = rs_->BeginContext();
   Schema new_schema("test_schema", {Column("col1", ValueType::kInt64),
                                     Column("key", ValueType::kInt64),
                                     Column("col3", ValueType::kVarChar)});
+
+  // Act -- create table and pre-commit
   rs_->CreateTable(ctx, new_schema);
   ctx.txn_.PreCommit();
+
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST_F(CatalogTest, GetTable) {
+  // Arrange -- define schema; create table in first context, pre-commit
   Schema new_schema("test_schema", {Column("col1", ValueType::kInt64),
                                     Column("key", ValueType::kInt64),
                                     Column("col3", ValueType::kVarChar)});
@@ -71,31 +81,44 @@ TEST_F(CatalogTest, GetTable) {
     rs_->CreateTable(ctx, new_schema);
     ctx.txn_.PreCommit();
   }
+
+  // Act -- open second context, get table, pre-commit
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
                           ctx.GetTable("test_schema"));
     ctx.txn_.PreCommit();
+
+    // Assert -- retrieved table's schema matches the created schema
     ASSERT_EQ(new_schema, tbl->GetSchema());
   }
 }
 
 TEST_F(CatalogTest, Recover) {
+  // Arrange -- define schema; create table, debug-dump, pre-commit
   Schema new_schema("test_schema", {Column("col1", ValueType::kInt64),
                                     Column("key", ValueType::kInt64),
                                     Column("col3", ValueType::kVarChar)});
   {
     TransactionContext ctx = rs_->BeginContext();
     rs_->CreateTable(ctx, new_schema);
-    rs_->DebugDump(ctx.txn_, std::cout);
+    {
+      std::ostringstream oss;
+      rs_->DebugDump(ctx.txn_, oss);
+      LOG(INFO) << oss.str();
+    }
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
+
+  // Act -- emulate crash, recover database, open new context, get table, pre-commit
   Recover();
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
                           ctx.GetTable("test_schema"));
     ctx.txn_.PreCommit();
+
+    // Assert -- recovered table's schema matches the originally created schema
     ASSERT_EQ(new_schema, tbl->GetSchema());
   }
 }

@@ -132,18 +132,21 @@ class OptimizerTest : public ::testing::Test {
   void TearDown() override { rs_->DeleteAll(); }
 
   [[nodiscard]] Status DumpAll(const QueryData& qd) const {
+    // Arrange: open context + rewrite query for debugging
     TransactionContext ctx = rs_->BeginContext();
     QueryData qd_resolved = qd;
     qd_resolved.Rewrite(ctx);
-    std::cout << qd << "\n\n";
+    LOG(INFO) << qd << "\n";
+
+    // Act: optimize plan + emit executor + execute query
     ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(qd_resolved, ctx));
     Executor exec = plan->EmitExecutor(ctx);
-    std::cout << " --- Logical Plan ---\n" << *plan << "\n";
-    std::cout << "\n --- Physical Plan ---\n" << *exec << "\n";
-    std::cout << "\n --- Output ---\n" << plan->GetSchema() << "\n";
+    LOG(INFO) << " --- Logical Plan ---\n" << *plan;
+    LOG(INFO) << "\n --- Physical Plan ---\n" << *exec;
+    LOG(INFO) << "\n --- Output ---\n" << plan->GetSchema();
     Row result;
     while (exec->Next(&result, nullptr)) {
-      std::cout << result << "\n";
+      LOG(INFO) << result;
     }
     return Status::kSuccess;
   }
@@ -152,64 +155,86 @@ class OptimizerTest : public ::testing::Test {
   std::unique_ptr<Database> rs_;
 };
 
-TEST_F(OptimizerTest, Construct) {}
+TEST_F(OptimizerTest, Construct) {
+  // Arrange (SetUp created 4 tables + indexes + statistics)
+
+  // Act + Assert: database fixture is usable
+  TransactionContext ctx = rs_->BeginContext();
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
 
 TEST_F(OptimizerTest, Simple) {
+  // Arrange
   QueryData qd{
       {"Sc1"},
       BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(2))),
       {NamedExpression("c1"),
        NamedExpression("Column2Varchar", ColumnName("c2"))}};
+
+  // Act + Assert: optimize + execute + dump
   ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, IndexScan) {
+  // Arrange
   QueryData qd{
       {"Sc1"},
       BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
                           ConstantValueExp(Value("c2-32"))),
       {NamedExpression("c1"), NamedExpression("score", ColumnName("c3"))}};
+
+  // Act + Assert: optimize + execute + dump
   ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, IndexOnlyScan) {
+  // Arrange
   QueryData qd{
       {"Sc1"},
       BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
                           ConstantValueExp(Value("c2-32"))),
       {NamedExpression("name", ColumnName("c2")),
        NamedExpression("score", ColumnName("c3"))}};
+
+  // Act + Assert: optimize + execute + dump
   ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, IndexOnlyScanInclude) {
+  // Arrange
   QueryData qd{{"Sc2"},
-               BinaryExpressionExp(
-                   BinaryExpressionExp(ColumnValueExp("d3"),
-                                       BinaryOperation::kGreaterThanEquals,
-                                       ConstantValueExp(Value("d3-3"))),
-                   BinaryOperation::kAnd,
-                   BinaryExpressionExp(ColumnValueExp("d3"),
-                                       BinaryOperation::kLessThanEquals,
-                                       ConstantValueExp(Value("d3-5")))),
-               {NamedExpression("key", ColumnName("d1")),
-                NamedExpression("score", ColumnName("d2")),
-                NamedExpression("name", ColumnName("d3")),
-                NamedExpression("const", ColumnName("d4"))}};
+                BinaryExpressionExp(
+                    BinaryExpressionExp(ColumnValueExp("d3"),
+                                        BinaryOperation::kGreaterThanEquals,
+                                        ConstantValueExp(Value("d3-3"))),
+                    BinaryOperation::kAnd,
+                    BinaryExpressionExp(ColumnValueExp("d3"),
+                                        BinaryOperation::kLessThanEquals,
+                                        ConstantValueExp(Value("d3-5")))),
+                {NamedExpression("key", ColumnName("d1")),
+                 NamedExpression("score", ColumnName("d2")),
+                 NamedExpression("name", ColumnName("d3")),
+                 NamedExpression("const", ColumnName("d4"))}};
+
+  // Act + Assert: optimize + execute + dump
   ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, Join) {
+  // Arrange
   QueryData qd{
       {"Sc1", "Sc2"},
       BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
                           ColumnValueExp("d1")),
       {NamedExpression("c2"), NamedExpression("d1"), NamedExpression("d3")}};
+
+  // Act + Assert: optimize + execute + dump
   ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, IndexScanJoin) {
+  // Arrange
   QueryData qd{
       {"Sc1", "Sc2"},
       BinaryExpressionExp(
@@ -219,10 +244,13 @@ TEST_F(OptimizerTest, IndexScanJoin) {
           BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
                               ConstantValueExp(Value("c2-4")))),
       {NamedExpression("c2"), NamedExpression("d1"), NamedExpression("d3")}};
+
+  // Act + Assert: optimize + execute + dump
   ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, ThreeJoin) {
+  // Arrange
   QueryData qd{
       {"Sc1", "Sc2", "Sc3"},
       BinaryExpressionExp(
@@ -239,10 +267,13 @@ TEST_F(OptimizerTest, ThreeJoin) {
            "e1+100",
            BinaryExpressionExp(ConstantValueExp(Value(100)),
                                BinaryOperation::kAdd, ColumnValueExp("e1")))}};
+
+  // Act + Assert: optimize + execute + dump
   ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, JoinWhere) {
+  // Arrange
   QueryData qd{
       {"Sc1", "Sc2"},
       BinaryExpressionExp(
@@ -253,10 +284,13 @@ TEST_F(OptimizerTest, JoinWhere) {
                               ConstantValueExp(Value(2)))),
       {NamedExpression("c1"), NamedExpression("c2"), NamedExpression("d1"),
        NamedExpression("d2"), NamedExpression("d3")}};
+
+  // Act + Assert: optimize + execute + dump
   ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, SameNameColumn) {
+  // Arrange
   QueryData qd{
       {"Sc1", "Sc4"},
       BinaryExpressionExp(BinaryExpressionExp(ColumnValueExp("Sc1.c1"),
@@ -269,10 +303,13 @@ TEST_F(OptimizerTest, SameNameColumn) {
       {NamedExpression("Sc1.c1"), NamedExpression("Sc1.c2"),
        NamedExpression("c3"), NamedExpression("SC4.c1"),
        NamedExpression("Sc4.c2")}};
+
+  // Act + Assert: optimize + execute + dump
   ASSERT_SUCCESS(DumpAll(qd));
 }
 
 TEST_F(OptimizerTest, Asterisk) {
+  // Arrange
   QueryData qd{
       {"Sc1", "Sc4"},
       BinaryExpressionExp(BinaryExpressionExp(ColumnValueExp("Sc1.c1"),
@@ -283,6 +320,8 @@ TEST_F(OptimizerTest, Asterisk) {
                                               BinaryOperation::kEquals,
                                               ConstantValueExp(Value(2)))),
       {NamedExpression("*")}};
+
+  // Act + Assert: optimize + execute + dump
   ASSERT_SUCCESS(DumpAll(qd));
 }
 }  // namespace tinylamb

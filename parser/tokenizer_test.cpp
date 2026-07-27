@@ -25,15 +25,25 @@
 namespace tinylamb {
 
 TEST(TokenizerTest, Empty) {
+  // Arrange -- tokenize empty string
   Tokenizer tokenizer("");
+
+  // Act -- tokenize
   std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Assert -- empty input yields single EOF token
   ASSERT_EQ(tokens.size(), 1);
   ASSERT_EQ(tokens[0].type, TokenType::kEof);
 }
 
 TEST(TokenizerTest, Select) {
+  // Arrange -- tokenize SELECT * FROM with WHERE clause
   Tokenizer tokenizer("SELECT * FROM users WHERE id = 1;");
+
+  // Act -- tokenize
   std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Assert -- 10 tokens: SELECT, *, FROM, users, WHERE, id, =, 1, ;, EOF
   ASSERT_EQ(tokens.size(), 10);
   ASSERT_EQ(tokens[0].type, TokenType::kKeyword);
   ASSERT_EQ(tokens[0].value, "SELECT");
@@ -56,9 +66,14 @@ TEST(TokenizerTest, Select) {
 }
 
 TEST(TokenizerTest, Create) {
+  // Arrange -- tokenize CREATE TABLE statement with 3 columns
   Tokenizer tokenizer(
       "CREATE TABLE users (id INT, name VARCHAR(20), score DOUBLE);");
+
+  // Act -- tokenize
   std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Assert -- 18 tokens: CREATE, TABLE, users, (, id, INT, ,, name, VARCHAR, (, 20, ), ,, score, DOUBLE, ), ;, EOF
   ASSERT_EQ(tokens.size(), 18);
   ASSERT_EQ(tokens[0].type, TokenType::kKeyword);
   ASSERT_EQ(tokens[0].value, "CREATE");
@@ -92,8 +107,13 @@ TEST(TokenizerTest, Create) {
 }
 
 TEST(TokenizerTest, Insert) {
+  // Arrange -- tokenize INSERT INTO statement with 3 values
   Tokenizer tokenizer("INSERT INTO users VALUES (1, 'foo', 1.2);");
+
+  // Act -- tokenize
   std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Assert -- 13 tokens: INSERT, INTO, users, VALUES, (, 1, ,, foo, ,, 1.2, ), ;, EOF
   ASSERT_EQ(tokens.size(), 13);
   ASSERT_EQ(tokens[0].type, TokenType::kKeyword);
   ASSERT_EQ(tokens[0].value, "INSERT");

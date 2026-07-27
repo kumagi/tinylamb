@@ -82,34 +82,40 @@ class LeafPageTest : public ::testing::Test {
   page_id_t leaf_page_id_{0};
 };
 
-TEST_F(LeafPageTest, Construct) {}
+TEST_F(LeafPageTest, Construct) {
+  // Arrange -- nothing to set up; default database created by SetUp()
+  // Act -- nothing to execute; default constructed via SetUp()
+  // Assert -- nothing to verify; gtest death on crash, gtest green on pass
+}
 
 TEST_F(LeafPageTest, InsertLeaf) {
+  // Arrange
   auto txn = tm_->Begin();
   PageRef page = Page();
 
-  // InsertBranch a value.
+  // Act -- insert a key-value pair, then attempt duplicate insert (should fail)
   ASSERT_SUCCESS(page->InsertLeaf(txn, "hello", "world"));
-  // Inserting with existing key will fail.
   ASSERT_FAIL(page->InsertLeaf(txn, "hello", "baby"));
 
-  // We can read inserted value.
+  // Assert -- reading the inserted key returns the value; reading wrong key fails
   ASSIGN_OR_ASSERT_FAIL(std::string_view, out1, page->Read(txn, "hello"));
   ASSERT_EQ(out1, "world");
-
-  // We cannot read wrong key.
   ASSERT_FAIL(page->Read(txn, "foo").GetStatus());
 }
 
 TEST_F(LeafPageTest, InsertMany) {
+  // Arrange
   constexpr int kRows = 20;
   auto txn = tm_->Begin();
   PageRef page = Page();
+
+  // Act -- insert kRows key-value pairs
   for (size_t i = 0; i < kRows; ++i) {
     ASSERT_SUCCESS(page->InsertLeaf(txn, std::to_string(i) + ":key",
                                     std::to_string(i) + ":value"));
   }
 
+  // Assert -- reading each inserted key returns the corresponding value
   for (size_t i = 0; i < kRows; ++i) {
     ASSIGN_OR_ASSERT_FAIL(std::string_view, out,
                           page->Read(txn, std::to_string(i) + ":key"));
@@ -118,12 +124,17 @@ TEST_F(LeafPageTest, InsertMany) {
 }
 
 TEST_F(LeafPageTest, InsertMany2) {
+  // Arrange
   auto txn = tm_->Begin();
   PageRef page = Page();
+
+  // Act -- insert four 100-char keys with 10-char values
   for (const auto& c : {'a', 'b', 'c', 'd'}) {
     ASSERT_SUCCESS(
         page->InsertLeaf(txn, std::string(100, c), std::string(10, c)));
   }
+
+  // Assert -- row count is 4 and each key reads back its expected value
   ASSERT_EQ(page->body.leaf_page.RowCount(), 4);
   ASSIGN_OR_ASSERT_FAIL(std::string_view, out1,
                         page->Read(txn, std::string(100, 'a')));
@@ -140,69 +151,68 @@ TEST_F(LeafPageTest, InsertMany2) {
 }
 
 TEST_F(LeafPageTest, Update) {
+  // Arrange
   auto txn = tm_->Begin();
   PageRef page = Page();
 
-  // InsertBranch value.
+  // Act -- insert "hello" then update it to "baby"
   ASSERT_SUCCESS(page->InsertLeaf(txn, "hello", "world"));
-  // Inserting with existing key will fail.
   ASSERT_SUCCESS(page->Update(txn, "hello", "baby"));
 
-  // We can read updated value.
+  // Assert -- reading the updated key returns the new value
   ASSIGN_OR_ASSERT_FAIL(std::string_view, out, page->Read(txn, "hello"));
   ASSERT_EQ(out, "baby");
 }
 
 TEST_F(LeafPageTest, UpdateMany) {
+  // Arrange
   auto txn = tm_->Begin();
   PageRef page = Page();
 
-  // InsertBranch value.
+  // Act -- insert "hello" then update it 6 times with progressively longer values
   ASSERT_SUCCESS(page->InsertLeaf(txn, "hello", "world"));
-  // Overwrite value.
   for (size_t i = 1; i <= 1000000; i *= 10) {
     ASSERT_SUCCESS(page->Update(txn, "hello", "baby" + std::to_string(i)));
   }
 
-  // We can read updated value.
+  // Assert -- final read returns the last updated value
   ASSIGN_OR_ASSERT_FAIL(std::string_view, out, page->Read(txn, "hello"));
   ASSERT_EQ(out, "baby1000000");
 }
 
 TEST_F(LeafPageTest, Delete) {
+  // Arrange
   auto txn = tm_->Begin();
   PageRef page = Page();
 
-  // InsertBranch value.
+  // Act -- insert "hello", then attempt deletes of non-existent and existing keys
   ASSERT_SUCCESS(page->InsertLeaf(txn, "hello", "world"));
-  // Deleting unexciting value will fail.
   ASSERT_FAIL(page->Delete(txn, "hello1"));
-  // Delete value.
   ASSERT_SUCCESS(page->Delete(txn, "hello"));
-  // Cannot delete twice.
   ASSERT_FAIL(page->Delete(txn, "hello"));
 
-  // We cannot update deleted value.
+  // Assert -- deleted key cannot be updated or read
   ASSERT_FAIL(page->Update(txn, "hello", "hoge"));
-  // We cannot read deleted value.
   ASSERT_FAIL(page->Read(txn, "hello").GetStatus());
 }
 
 TEST_F(LeafPageTest, DeleteMany) {
+  // Arrange
   constexpr int kRows = 10;
   auto txn = tm_->Begin();
   PageRef page = Page();
 
-  // InsertBranch value.
+  // Act 1 -- insert kRows key-value pairs
   for (size_t i = 0; i < kRows; ++i) {
     ASSERT_SUCCESS(page->InsertLeaf(txn, "k" + std::to_string(i),
                                     "v" + std::to_string(i + 1)));
   }
-  // Deleting odd values.
+  // Act 2 -- delete even-indexed keys
   for (size_t i = 0; i < kRows; i += 2) {
     ASSERT_SUCCESS(page->Delete(txn, "k" + std::to_string(i)));
   }
-  // Check all.
+
+  // Assert -- even-indexed keys are gone, odd-indexed keys still readable
   for (size_t i = 0; i < kRows; ++i) {
     if (i % 2 == 0) {
       ASSERT_FAIL(page->Read(txn, "k" + std::to_string(i)).GetStatus());
@@ -215,86 +225,73 @@ TEST_F(LeafPageTest, DeleteMany) {
 }
 
 TEST_F(LeafPageTest, InsertDefrag) {
+  // Arrange
   auto txn = tm_->Begin();
   PageRef page = Page();
-
-  // InsertBranch value.
   std::string value;
   value.resize(5000);
-  for (char& i : value) {
-    i = '1';
-  }
-  ASSERT_SUCCESS(
-      page->InsertLeaf(txn, "key1", value));  // About 5000 bytes used.
-  ASSERT_SUCCESS(
-      page->InsertLeaf(txn, "key2", value));  // About 10000 bytes used.
-  for (char& i : value) {
-    i = '2';
-  }
-  ASSERT_SUCCESS(
-      page->InsertLeaf(txn, "key3", value));  // About 15000 bytes used.
-  ASSERT_SUCCESS(
-      page->InsertLeaf(txn, "key4", value));  // About 20000 bytes used.
-  for (char& i : value) {
-    i = '3';
-  }
-  ASSERT_SUCCESS(
-      page->InsertLeaf(txn, "key5", value));  // About 25000 bytes used.
-  ASSERT_SUCCESS(
-      page->InsertLeaf(txn, "key6", value));          // About 30000 bytes used.
-  ASSERT_FAIL(page->InsertLeaf(txn, "key7", value));  // No space left.
-  ASSERT_SUCCESS(page->Delete(txn, "key2"));          // Make new space.
-  for (char& i : value) {
-    i = '4';
-  }
-  ASSERT_SUCCESS(page->InsertLeaf(txn, "key7", value));  // Should success.
-  ASSERT_FAIL(page->InsertLeaf(txn, "key8", value));     // No space left.
-  ASSERT_SUCCESS(page->Delete(txn, "key1"));             // Make new space.
-  for (char& i : value) {
-    i = '5';
-  }
-  ASSERT_SUCCESS(page->InsertLeaf(txn, "key8", value));  // Should success.
+  for (char& i : value) { i = '1'; }
 
+  // Act 1 -- insert 6 large keys (~5000 bytes each) until page is full at key7
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "key1", value));
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "key2", value));
+  for (char& i : value) { i = '2'; }
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "key3", value));
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "key4", value));
+  for (char& i : value) { i = '3'; }
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "key5", value));
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "key6", value));
+  ASSERT_FAIL(page->InsertLeaf(txn, "key7", value));
+
+  // Act 2 -- delete key2 to free space, then insert key7 (should succeed)
+  ASSERT_SUCCESS(page->Delete(txn, "key2"));
+  for (char& i : value) { i = '4'; }
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "key7", value));
+  ASSERT_FAIL(page->InsertLeaf(txn, "key8", value));
+
+  // Act 3 -- delete key1 to free more space, then insert key8 (should succeed)
+  ASSERT_SUCCESS(page->Delete(txn, "key1"));
+  for (char& i : value) { i = '5'; }
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "key8", value));
+
+  // Assert -- surviving keys have the expected values; key2/key1 are gone
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row1, page->Read(txn, "key3"));
-  for (const char& i : row1) {
-    ASSERT_EQ(i, '2');
-  }
+  for (const char& i : row1) { ASSERT_EQ(i, '2'); }
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row2, page->Read(txn, "key4"));
-  for (const char& i : row2) {
-    ASSERT_EQ(i, '2');
-  }
+  for (const char& i : row2) { ASSERT_EQ(i, '2'); }
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row3, page->Read(txn, "key5"));
-  for (const char& i : row3) {
-    ASSERT_EQ(i, '3');
-  }
+  for (const char& i : row3) { ASSERT_EQ(i, '3'); }
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row4, page->Read(txn, "key7"));
-  for (const char& i : row4) {
-    ASSERT_EQ(i, '4');
-  }
+  for (const char& i : row4) { ASSERT_EQ(i, '4'); }
   ASSIGN_OR_ASSERT_FAIL(std::string_view, row5, page->Read(txn, "key8"));
-  for (const char& i : row5) {
-    ASSERT_EQ(i, '5');
-  }
+  for (const char& i : row5) { ASSERT_EQ(i, '5'); }
 }
 
 TEST_F(LeafPageTest, LowestHighestKey) {
+  // Arrange
   auto txn = tm_->Begin();
   PageRef page = Page();
 
+  // Act -- insert four keys out of order to test internal sorting
   ASSERT_SUCCESS(page->InsertLeaf(txn, "C", "foo"));
   ASSERT_SUCCESS(page->InsertLeaf(txn, "A", "bar"));
   ASSERT_SUCCESS(page->InsertLeaf(txn, "B", "baz"));
   ASSERT_SUCCESS(page->InsertLeaf(txn, "D", "piy"));
 
+  // Assert -- LowestKey returns "A", HighestKey returns "D"
   ASSIGN_OR_ASSERT_FAIL(std::string_view, lowest, page->LowestKey(txn));
   ASSERT_EQ(lowest, "A");
-
   ASSIGN_OR_ASSERT_FAIL(std::string_view, highest, page->HighestKey(txn));
   ASSERT_EQ(highest, "D");
 }
 
 TEST_F(LeafPageTest, Split) {
+  // Arrange -- nothing more than fixture setup; Split test works on allocated pages
   auto txn = tm_->Begin();
+
+  // Act -- for 8 iterations, fill a left leaf page, split it into a right page,
+  //        then insert a separator key into either left or right depending on
+  //        the lowest key of the right page after the split
   for (int i = 0; i < 8; ++i) {
     PageRef left = p_->AllocateNewPage(txn, PageType::kLeafPage);
     PageRef right = p_->AllocateNewPage(txn, PageType::kLeafPage);
@@ -319,9 +316,14 @@ TEST_F(LeafPageTest, Split) {
                                        std::string(2000, 'p')));
     }
   }
+
+  // Assert -- implicit; split logic verified by successful inserts and no crashes
 }
 
 TEST_F(LeafPageTest, InsertCrash) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act 1 -- insert 20 key-value pairs and commit
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
@@ -331,6 +333,8 @@ TEST_F(LeafPageTest, InsertCrash) {
     }
     ASSERT_SUCCESS(txn.PreCommit());
   }
+
+  // Act 2 -- emulate crash, then recover and verify all 20 pairs survived
   Recover();
   r_->RecoverFrom(0, tm_.get());
   {
@@ -342,9 +346,15 @@ TEST_F(LeafPageTest, InsertCrash) {
       ASSERT_EQ(std::to_string(i) + ":value", out);
     }
   }
+
+  // Assert -- all 20 key-value pairs survived the crash/recovery round-trip
+  // (implicit in Act 2 assertions)
 }
 
 TEST_F(LeafPageTest, InsertAbort) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act 1 -- insert 10 even-indexed key-value pairs and commit
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
@@ -354,6 +364,8 @@ TEST_F(LeafPageTest, InsertAbort) {
     }
     ASSERT_SUCCESS(txn.PreCommit());
   }
+
+  // Act 2 -- insert 10 odd-indexed key-value pairs then abort the transaction
   {
     auto txn = tm_->Begin();
     {
@@ -365,6 +377,8 @@ TEST_F(LeafPageTest, InsertAbort) {
     }
     txn.Abort();
   }
+
+  // Act 3 -- recover and verify only even-indexed pairs survived
   Recover();
   r_->RecoverFrom(0, tm_.get());
   {
@@ -380,9 +394,15 @@ TEST_F(LeafPageTest, InsertAbort) {
       }
     }
   }
+
+  // Assert -- even-indexed pairs durable, odd-indexed pairs aborted
+  // (implicit in Act 3 assertions)
 }
 
 TEST_F(LeafPageTest, UpdateCrash) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act 1 -- insert 10 key-value pairs and commit
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
@@ -392,6 +412,8 @@ TEST_F(LeafPageTest, UpdateCrash) {
     }
     ASSERT_SUCCESS(txn.PreCommit());
   }
+
+  // Act 2 -- update all 10 values to i*2 then crash before commit
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
@@ -400,6 +422,8 @@ TEST_F(LeafPageTest, UpdateCrash) {
                                   std::to_string(i * 2) + ":value"));
     }
   }
+
+  // Act 3 -- recover; updates were not committed so original values must remain
   Recover();
   r_->RecoverFrom(0, tm_.get());
   {
@@ -411,9 +435,15 @@ TEST_F(LeafPageTest, UpdateCrash) {
       ASSERT_EQ(std::to_string(i) + ":value", out);
     }
   }
+
+  // Assert -- uncommitted updates were discarded; original values preserved
+  // (implicit in Act 3 assertions)
 }
 
 TEST_F(LeafPageTest, UpdateAbort) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act 1 -- insert 10 key-value pairs and commit
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
@@ -423,6 +453,8 @@ TEST_F(LeafPageTest, UpdateAbort) {
     }
     ASSERT_SUCCESS(txn.PreCommit());
   }
+
+  // Act 2 -- update all 10 values to i*2 then abort the transaction
   {
     auto txn = tm_->Begin();
     {
@@ -434,6 +466,8 @@ TEST_F(LeafPageTest, UpdateAbort) {
     }
     txn.Abort();
   }
+
+  // Act 3 -- recover; aborted updates leave original values intact
   Recover();
   r_->RecoverFrom(0, tm_.get());
   {
@@ -445,9 +479,15 @@ TEST_F(LeafPageTest, UpdateAbort) {
       ASSERT_EQ(std::to_string(i) + ":value", out);
     }
   }
+
+  // Assert -- aborted updates were discarded; original values preserved
+  // (implicit in Act 3 assertions)
 }
 
 TEST_F(LeafPageTest, DeleteCrash) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act 1 -- insert 10 key-value pairs and commit
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
@@ -457,6 +497,8 @@ TEST_F(LeafPageTest, DeleteCrash) {
     }
     ASSERT_SUCCESS(txn.PreCommit());
   }
+
+  // Act 2 -- delete odd-indexed keys and commit
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
@@ -465,6 +507,8 @@ TEST_F(LeafPageTest, DeleteCrash) {
     }
     ASSERT_SUCCESS(txn.PreCommit());
   }
+
+  // Act 3 -- recover; committed deletes must persist, even-indexed keys remain
   Recover();
   r_->RecoverFrom(0, tm_.get());
   {
@@ -480,9 +524,15 @@ TEST_F(LeafPageTest, DeleteCrash) {
       }
     }
   }
+
+  // Assert -- committed deletes durable; even-indexed pairs survived
+  // (implicit in Act 3 assertions)
 }
 
 TEST_F(LeafPageTest, DeleteAbort) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act 1 -- insert 10 key-value pairs and commit
   {
     auto txn = tm_->Begin();
     PageRef page = Page();
@@ -492,6 +542,8 @@ TEST_F(LeafPageTest, DeleteAbort) {
     }
     ASSERT_SUCCESS(txn.PreCommit());
   }
+
+  // Act 2 -- delete even-indexed keys then abort the transaction
   {
     auto txn = tm_->Begin();
     {
@@ -502,6 +554,8 @@ TEST_F(LeafPageTest, DeleteAbort) {
     }
     txn.Abort();
   }
+
+  // Act 3 -- recover; aborted deletes leave all 10 pairs intact
   Recover();
   r_->RecoverFrom(0, tm_.get());
   {
@@ -513,15 +567,21 @@ TEST_F(LeafPageTest, DeleteAbort) {
       ASSERT_EQ(std::to_string(i) + ":value", out);
     }
   }
+
+  // Assert -- aborted deletes discarded; all 10 pairs preserved
+  // (implicit in Act 3 assertions)
 }
 
 TEST_F(LeafPageTest, UpdateHeavy) {
+  // Arrange
   constexpr int kCount = 40;
   Transaction txn = tm_->Begin();
   std::vector<std::string> keys;
   std::unordered_map<std::string, std::string> kvp;
   keys.reserve(kCount);
   PageRef page = Page();
+
+  // Act 1 -- insert kCount random key-value pairs
   for (int i = 0; i < kCount; ++i) {
     std::string key = RandomString((19937 * i) % 12 + 10, false);
     std::string value = RandomString((19937 * i) % 120 + 10, false);
@@ -529,12 +589,16 @@ TEST_F(LeafPageTest, UpdateHeavy) {
     keys.push_back(key);
     kvp.emplace(key, value);
   }
+
+  // Act 2 -- update each key kCount*8 times with new random values
   for (int i = 0; i < kCount * 8; ++i) {
     const std::string& key = keys[(i * 63) % keys.size()];
     std::string value = RandomString((19937 * i) % 320 + 100, false);
     ASSERT_SUCCESS(page->Update(txn, key, value));
     kvp[key] = value;
   }
+
+  // Assert -- every key reads back the last value written via Update
   for (const auto& kv : kvp) {
     ASSIGN_OR_ASSERT_FAIL(std::string_view, val, page->Read(txn, kv.first));
     ASSERT_EQ(kvp[kv.first], val);
@@ -542,12 +606,15 @@ TEST_F(LeafPageTest, UpdateHeavy) {
 }
 
 TEST_F(LeafPageTest, InsertDeleteHeavy) {
+  // Arrange
   constexpr int kCount = 40;
   Transaction txn = tm_->Begin();
   std::vector<std::string> keys;
   std::unordered_map<std::string, std::string> kvp;
   keys.reserve(kCount);
   PageRef page = Page();
+
+  // Act 1 -- insert kCount random key-value pairs
   for (int i = 0; i < kCount; ++i) {
     std::string key = RandomString((19937 * i) % 12 + 10, false);
     std::string value = RandomString((19937 * i) % 120 + 10, false);
@@ -555,6 +622,8 @@ TEST_F(LeafPageTest, InsertDeleteHeavy) {
     keys.push_back(key);
     kvp.emplace(key, value);
   }
+
+  // Act 2 -- for kCount*8 iterations, delete then re-insert each key with new value
   for (int i = 0; i < kCount * 8; ++i) {
     const std::string& key = keys[(i * 63) % keys.size()];
     std::string value = RandomString((19937 * i) % 320 + 100, false);
@@ -562,6 +631,8 @@ TEST_F(LeafPageTest, InsertDeleteHeavy) {
     ASSERT_SUCCESS(page->InsertLeaf(txn, key, value));
     kvp[key] = value;
   }
+
+  // Assert -- every key reads back the last re-inserted value
   for (const auto& kv : kvp) {
     ASSIGN_OR_ASSERT_FAIL(std::string_view, val, page->Read(txn, kv.first));
     ASSERT_EQ(kvp[kv.first], val);
@@ -569,6 +640,9 @@ TEST_F(LeafPageTest, InsertDeleteHeavy) {
 }
 
 TEST_F(LeafPageTest, FosterChild) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act -- for 5 iterations, set foster pairs with random keys and child page IDs
   for (int i = 0; i < 5; ++i) {
     std::string key = RandomString((19937 * i) % 12 + 10000, false);
     {
@@ -585,11 +659,17 @@ TEST_F(LeafPageTest, FosterChild) {
       ASSERT_EQ(result.child_pid, i);
     }
   }
+
+  // Assert -- foster pair get/set round-trip preserves key and child_pid
+  // (implicit in Act assertions)
 }
 
 TEST_F(LeafPageTest, Fences) {
+  // Arrange
   Transaction txn = tm_->Begin();
   PageRef page = Page();
+
+  // Act -- for 100 iterations, set low/high fences with random strings and verify
   for (int i = 0; i < 100; ++i) {
     std::string low = RandomString((19937 * i) % 12 + 10000, false);
     std::string high = RandomString((19937 * i) % 12 + 10000, false);
@@ -599,15 +679,22 @@ TEST_F(LeafPageTest, Fences) {
     ASSERT_EQ(page->GetLowFence(txn), IndexKey(low));
     ASSERT_EQ(page->GetHighFence(txn), IndexKey(high));
   }
+
+  // Act -- set fences to minus/plus infinity and verify
   ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey::MinusInfinity()));
   ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey::PlusInfinity()));
+
+  // Assert -- fences at infinity are correctly reported
   ASSERT_TRUE(page->GetLowFence(txn).IsMinusInfinity());
   ASSERT_TRUE(page->GetHighFence(txn).IsPlusInfinity());
 }
 
 TEST_F(LeafPageTest, FencesCrash) {
+  // Arrange
   std::string low = RandomString(1234, false);
   std::string high = RandomString(4567, false);
+
+  // Act 1 -- set low/high fences and commit
   {
     Transaction txn = tm_->Begin();
     PageRef page = Page();
@@ -617,6 +704,8 @@ TEST_F(LeafPageTest, FencesCrash) {
     ASSERT_EQ(page->GetHighFence(txn), IndexKey(high));
     ASSERT_SUCCESS(txn.PreCommit());
   }
+
+  // Act 2 -- emulate crash, then recover and verify fences survived
   Recover();
   r_->RecoverFrom(0, tm_.get());
   {
@@ -626,9 +715,15 @@ TEST_F(LeafPageTest, FencesCrash) {
     ASSERT_EQ(recovered_page->GetHighFence(restarted_txn), IndexKey(high));
     ASSERT_SUCCESS(restarted_txn.PreCommit());
   }
+
+  // Assert -- fences survived the crash/recovery round-trip
+  // (implicit in Act 2 assertions)
 }
 
 TEST_F(LeafPageTest, FosterChildCrash) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act -- for 5 iterations, set foster pair, commit, crash, recover, verify
   for (int i = 0; i < 5; ++i) {
     std::string key = RandomString((19937 * i) % 12 + 10000, false);
     {
@@ -650,5 +745,8 @@ TEST_F(LeafPageTest, FosterChildCrash) {
       ASSERT_EQ(result.child_pid, i);
     }
   }
+
+  // Assert -- foster pair survived each crash/recovery round-trip
+  // (implicit in Act assertions)
 }
 }  // namespace tinylamb

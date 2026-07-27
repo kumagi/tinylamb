@@ -50,42 +50,68 @@ class LSMTreeTest : public ::testing::Test {
 // TEST_F(LSMTreeTest, Construct) {}
 
 TEST_F(LSMTreeTest, WriteOne) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act -- write single key-value pair, then sleep to let background flush
   t_->Write("foo", "bar");
   std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST_F(LSMTreeTest, WriteMany) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act -- write 1000 key-value pairs, then sleep to let background flush
   for (int i = 0; i < 1000; ++i) {
     t_->Write(std::to_string(i), std::to_string(i * 2));
   }
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST_F(LSMTreeTest, ReadOne) {
+  // Arrange -- write one key-value pair, wait for flush
   t_->Write("foo", "bar");
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+  // Act -- read back the key
   auto result = t_->Read("foo");
+
+  // Assert -- read returns the value written
   ASSERT_SUCCESS_AND_EQ(result, "bar");
 }
 
 TEST_F(LSMTreeTest, ReadManyMemory) {
+  // Arrange -- write 100 key-value pairs, wait for flush
   for (int i = 0; i < 100; ++i) {
     t_->Write(std::to_string(i), std::to_string(i * 2));
   }
+
+  // Act -- read each key back
   for (int i = 0; i < 100; ++i) {
     ASSERT_SUCCESS_AND_EQ(t_->Read(std::to_string(i)), std::to_string(i * 2));
   }
+
+  // Assert -- implicit; all 100 reads returned expected values; gtest green
 }
 
 TEST_F(LSMTreeTest, RangeScan) {
+  // Arrange -- write 1000 key-value pairs, wait for sync, build expected map
   std::map<std::string, std::string> expected;
   for (int i = 0; i < 1000; ++i) {
     t_->Write(std::to_string(i), std::to_string(i * 2));
     expected.emplace(std::to_string(i), std::to_string(i * 2));
   }
+
+  // Act -- sync LSMTree, then scan via iterator
   t_->Sync();
   LSMView v = t_->GetView();
   LSMView::Iterator it = v.Begin();
   auto expected_iter = expected.begin();
+
+  // Assert -- iterator yields every key-value pair in sorted order, matching expected
   while (it.IsValid()) {
     ASSERT_EQ(expected_iter->first, it.Key());
     ASSERT_EQ(expected_iter->second, it.Value());
@@ -96,32 +122,44 @@ TEST_F(LSMTreeTest, RangeScan) {
 }
 
 TEST_F(LSMTreeTest, PointQuery) {
+  // Arrange -- write 1000 key-value pairs, wait for sync
   for (int i = 0; i < 1000; ++i) {
     t_->Write(std::to_string(i), std::to_string(i * 2));
   }
+
+  // Act -- sync LSMTree, then point-query each key via view
   t_->Sync();
   LSMView v = t_->GetView();
   for (int i = 0; i < 1000; ++i) {
     auto ret = v.Find(std::to_string(i));
+
+    // Assert -- each point-query returns the expected value
     ASSERT_SUCCESS_AND_EQ(ret, std::to_string(i * 2));
   }
 }
 
 TEST_F(LSMTreeTest, OverwrittenRangeScan) {
+  // Arrange -- write 1000 key-value pairs, sync, take view v1
   for (int i = 0; i < 1000; ++i) {
     t_->Write(std::to_string(i), std::to_string(i * 2));
   }
   t_->Sync();
   LSMView v1 = t_->GetView();
+
+  // Act 1 -- overwrite even-indexed keys with i*i, sync, take view v2
   for (int i = 0; i < 1000; i += 2) {
     t_->Write(std::to_string(i), std::to_string(i * i));
   }
   t_->Sync();
   LSMView v2 = t_->GetView();
+
+  // Assert 1 -- v1 sees original values for all 1000 keys (snapshot semantics)
   for (int i = 0; i < 1000; ++i) {
     auto ret = v1.Find(std::to_string(i));
     ASSERT_SUCCESS_AND_EQ(ret, std::to_string(i * 2));
   }
+
+  // Assert 2 -- v2 sees i*i for even keys, i*2 for odd keys (overwrite visible only in v2)
   for (int i = 0; i < 1000; ++i) {
     if (i % 2 == 0) {
       auto ret = v2.Find(std::to_string(i));
@@ -134,16 +172,21 @@ TEST_F(LSMTreeTest, OverwrittenRangeScan) {
 }
 
 TEST_F(LSMTreeTest, LongKeyRangeScan) {
+  // Arrange -- write 300 key-value pairs with long keys (i*i+1 bytes of 'x'), wait for sync
   std::map<std::string, std::string> expected;
   for (int i = 0; i < 300; ++i) {
     std::string key(i * i + 1, 'x');
     t_->Write(key, std::to_string(i * 2));
     expected.emplace(key, std::to_string(i * 2));
   }
+
+  // Act -- sync LSMTree, then scan via iterator
   t_->Sync();
   LSMView v = t_->GetView();
   LSMView::Iterator it = v.Begin();
   auto expected_iter = expected.begin();
+
+  // Assert -- iterator yields every key-value pair in sorted order, matching expected
   while (it.IsValid()) {
     ASSERT_EQ(expected_iter->first, it.Key());
     ASSERT_EQ(expected_iter->second, it.Value());
@@ -154,6 +197,7 @@ TEST_F(LSMTreeTest, LongKeyRangeScan) {
 }
 
 TEST_F(LSMTreeTest, DeleteSingle) {
+  // Arrange -- write 1000 key-value pairs, sync, delete odd-indexed keys
   for (int i = 0; i < 1000; ++i) {
     t_->Write(std::to_string(i), std::to_string(i * 2));
   }
@@ -162,8 +206,12 @@ TEST_F(LSMTreeTest, DeleteSingle) {
     t_->Delete(std::to_string(i));
   }
   t_->Sync();
+
+  // Act -- read each key back; odd keys should be absent, even keys present
   for (int i = 0; i < 1000; ++i) {
     StatusOr<std::string> ret = t_->Read(std::to_string(i));
+
+    // Assert -- even keys retain original value, odd keys return kNotExists
     if (i % 2 == 0) {
       ASSERT_SUCCESS_AND_EQ(ret, std::to_string(i * 2));
     } else {
@@ -173,6 +221,7 @@ TEST_F(LSMTreeTest, DeleteSingle) {
 }
 
 TEST_F(LSMTreeTest, DeleteRangeScan) {
+  // Arrange -- write 1000 key-value pairs, sync, delete odd-indexed keys
   for (int i = 0; i < 1000; ++i) {
     t_->Write(std::to_string(i), std::to_string(i * 2));
   }
@@ -181,8 +230,12 @@ TEST_F(LSMTreeTest, DeleteRangeScan) {
     t_->Delete(std::to_string(i));
   }
   t_->Sync();
+
+  // Act -- scan via iterator after deletion
   LSMView v = t_->GetView();
   LSMView::Iterator iter = v.Begin();
+
+  // Assert -- iterator yields only even-indexed keys with their original values
   while (iter.IsValid()) {
     int key = std::stoi(iter.Key());
     ASSERT_EQ(key % 2, 0);

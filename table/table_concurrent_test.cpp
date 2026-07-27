@@ -70,17 +70,19 @@ class TableConcurrentTest : public ::testing::Test {
 constexpr int kThreads = 5;
 
 TEST_F(TableConcurrentTest, DISABLED_InsertInsert) {
+  // Arrange -- spawn 5 threads, each inserting 5000 rows; prepopulate read-only context
   constexpr int kSize = 5000;
   TransactionContext ro_ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ro_ctx, "SampleTable"));
   ASSERT_SUCCESS(ro_ctx.PreCommit());
-  std::vector<std::unordered_map<RowPosition, Row> > rows;
+  std::vector<std::unordered_map<RowPosition, Row>> rows;
   rows.resize(kThreads);
   std::vector<std::thread> workers;
   workers.reserve(kThreads);
   for (int i = 0; i < kThreads; ++i) {
     workers.emplace_back([&, i]() {
       for (int j = 0; j < kSize; ++j) {
+        // Act -- insert a row with a deterministic key/value per thread
         TransactionContext ctx = db_->BeginContext();
         Row new_row({Value((j * kSize) + i), Value(RandomString(32)),
                      Value(((double)2 * j * kSize) + i)});
@@ -92,9 +94,13 @@ TEST_F(TableConcurrentTest, DISABLED_InsertInsert) {
       }
     });
   }
+
+  // Act -- join all threads (waits for all insertions to complete)
   for (auto& w : workers) {
     w.join();
   }
+
+  // Assert -- read back every inserted row and verify it matches the expected value
   {
     TransactionContext ctx = db_->BeginContext();
     for (const auto& rows_per_thread : rows) {

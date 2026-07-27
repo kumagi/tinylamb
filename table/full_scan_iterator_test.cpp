@@ -67,16 +67,23 @@ class FullScanIteratorTest : public ::testing::Test {
   std::unique_ptr<Database> db_;
 };
 
-TEST_F(FullScanIteratorTest, Construct) {}
+TEST_F(FullScanIteratorTest, Construct) {
+  // Arrange -- nothing to set up; default FullScanIteratorTest environment via SetUp()
+  // Act -- nothing to execute; default constructed via SetUp()
+  // Assert -- nothing to verify; gtest green on pass, death on crash
+}
 
 TEST_F(FullScanIteratorTest, Scan) {
+  // Arrange -- begin context, get table "SampleTable"
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
+
+  // Act -- insert 130 rows, then run a full scan iterator through all rows
   for (int i = 0; i < 130; ++i) {
     ASSERT_SUCCESS(
-        table
-            .Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
-                                   Value(0.1 + i)}))
+        table.Insert(ctx.txn_,
+                     Row({Value(i), Value("v" + std::to_string(i)),
+                          Value(0.1 + i)}))
             .GetStatus());
   }
   Iterator it = table.BeginFullScan(ctx.txn_);
@@ -84,6 +91,8 @@ TEST_F(FullScanIteratorTest, Scan) {
     LOG(TRACE) << *it;
     ++it;
   }
+
+  // Assert -- implicit; full scan completes without crash; gtest green on pass
 }
 
 }  // namespace tinylamb

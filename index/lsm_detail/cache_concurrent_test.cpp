@@ -75,6 +75,7 @@ class CacheConcurrentTest : public ::testing::Test {
 };
 
 TEST_F(CacheConcurrentTest, ReadTwo) {
+  // Arrange -- spawn 15 threads, each reading 1000 random positions from the cache
   constexpr size_t kThreads = 15;
   std::vector<std::thread> workers;
   workers.reserve(kThreads);
@@ -82,19 +83,25 @@ TEST_F(CacheConcurrentTest, ReadTwo) {
     workers.emplace_back([&, i]() {
       std::mt19937 rand(i);
       for (int j = 0; j < 1000; ++j) {
+        // Act -- read a 4-byte int at a random position
         size_t pos = rand() % kSize;
         std::string data = cache_->ReadAt(pos * sizeof(int), sizeof(int));
         int data_as_int = *(reinterpret_cast<int*>(data.data()));
+
+        // Assert -- the read value matches the deterministic Expected() function
         ASSERT_EQ(data_as_int, Expected(pos));
       }
     });
   }
+
+  // Act -- join all threads (waits for all reads to complete)
   for (auto& worker : workers) {
     worker.join();
   }
 }
 
 TEST_F(CacheConcurrentTest, ReadFifteen) {
+  // Arrange -- spawn 50 threads, each reading 100 random positions from the cache
   constexpr size_t kThreads = 50;
   std::vector<std::thread> workers;
   workers.reserve(kThreads);
@@ -102,9 +109,12 @@ TEST_F(CacheConcurrentTest, ReadFifteen) {
     workers.emplace_back([&, i]() {
       std::mt19937 rand(i);
       for (int j = 0; j < 100; ++j) {
+        // Act -- read a 4-byte int at a random position
         size_t pos = rand() % kSize;
         std::string data = cache_->ReadAt(pos * sizeof(int), sizeof(int));
         int data_as_int = *(reinterpret_cast<int*>(data.data()));
+
+        // Assert -- the read value matches the deterministic Expected() function
         if (data_as_int != Expected(pos)) {
           LOG(ERROR) << pos;
         }
@@ -112,6 +122,8 @@ TEST_F(CacheConcurrentTest, ReadFifteen) {
       }
     });
   }
+
+  // Act -- join all threads (waits for all reads to complete)
   for (auto& worker : workers) {
     worker.join();
   }

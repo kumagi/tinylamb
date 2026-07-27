@@ -93,263 +93,374 @@ class RecoveryManagerTest : public RowPageTest {
   std::unique_ptr<RecoveryManager> r_;
 };
 
-TEST_F(RecoveryManagerTest, EmptyRecovery) { r_->RecoverFrom(0, tm_.get()); }
+TEST_F(RecoveryManagerTest, EmptyRecovery) {
+  // Arrange -- nothing more than fixture setup; empty log file
+  // Act -- recover from LSN 0 with nothing to redo
+  r_->RecoverFrom(0, tm_.get());
+  // Assert -- implicit; no crash, no rows recovered; gtest green on pass
+}
 
 TEST_F(RecoveryManagerTest, InsertAbort) {
+  // Arrange
   auto txn = tm_->Begin();
   std::string record = "blah~blah";
   PageRef page = p_->GetPage(page_id_);
   ASSERT_FALSE(page.IsNull());
   ASSERT_EQ(page->Type(), PageType::kRowPage);
-
   const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
 
+  // Act 1 -- insert record and verify free space decremented
   ASSERT_SUCCESS(page->Insert(txn, record).GetStatus());
   page.PageUnlock();
-
   ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
             before_size - record.size() - sizeof(RowPointer));
+
+  // Act 2 -- abort the transaction
   txn.Abort();
+
+  // Assert -- aborted insert leaves row count at 0
   ASSERT_EQ(GetRowCount(), 0);
 }
 
 TEST_F(RecoveryManagerTest, UpdateAbort) {
+  // Arrange
   std::string before = "before string hello world!", after = "replaced by this";
   ASSERT_TRUE(InsertRow(before));
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(page_id_);
   ASSERT_FALSE(page.IsNull());
   ASSERT_EQ(page->Type(), PageType::kRowPage);
-
   const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
+
+  // Act 1 -- update row 0 and verify free space adjusted
   ASSERT_SUCCESS(page->Update(txn, 0, after));
   page.PageUnlock();
-
   ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
             before_size + before.length() - after.length());
+
+  // Act 2 -- abort the transaction
   txn.Abort();
+
+  // Assert -- aborted update leaves original row intact, row count = 1
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), before);
 }
 
 TEST_F(RecoveryManagerTest, DeleteAbort) {
+  // Arrange
   std::string before = "living row";
   ASSERT_TRUE(InsertRow(before));
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(page_id_);
+
+  // Act 1 -- delete row 0
   page->Delete(txn, 0);
   page.PageUnlock();
 
+  // Act 2 -- abort the transaction
   txn.Abort();
+
+  // Assert -- aborted delete leaves original row intact, row count = 1
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), before);
 }
 
 TEST_F(RecoveryManagerTest, InsertRowRecovery) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act 1 -- insert a row and commit (implicit via InsertRow helper)
   InsertRow("hoge");
+
+  // Act 2 -- emulate media failure (db file removed) then recover from log
   MediaFailure();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- recovered row 0 reads back "hoge"
   ASSERT_EQ(ReadRow(0), "hoge");
 }
 
 TEST_F(RecoveryManagerTest, UpdateRowRecovery) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act 1 -- insert a row, then update row 0 and commit
   ASSERT_TRUE(InsertRow("hoge"));
   UpdateRow(0, "bar");
   ASSERT_EQ(ReadRow(0), "bar");
+
+  // Act 2 -- emulate media failure (db file removed) then recover from log
   MediaFailure();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- recovered row 0 reads back "bar" (update survived via redo log)
   ASSERT_EQ(ReadRow(0), "bar");
 }
 
 TEST_F(RecoveryManagerTest, DeleteRowRecovery) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act 1 -- insert a row, then delete row 0 and commit
   ASSERT_TRUE(InsertRow("hoge"));
   DeleteRow(0);
   ASSERT_EQ(GetRowCount(), 0);
+
+  // Act 2 -- emulate media failure (db file removed) then recover from log
   MediaFailure();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- recovered table has row count 0 (delete survived via redo log)
   ASSERT_EQ(GetRowCount(), 0);
 }
 
 TEST_F(RecoveryManagerTest, InsertRowAbortRecovery) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act 1 -- insert a row but do not commit (aborted by default)
   InsertRow("hoge", false);
+
+  // Act 2 -- emulate media failure (db file removed) then recover from log
   MediaFailure();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- aborted insert leaves no durable row; row count = 0
   ASSERT_EQ(GetRowCount(), 0);
 }
 
 TEST_F(RecoveryManagerTest, UpdateRowAbortRecovery) {
+  // Arrange -- nothing more than fixture setup; row 0 = "hoge" committed
+
+  // Act 1 -- update row 0 but do not commit (aborted by default)
   ASSERT_TRUE(InsertRow("hoge"));
   UpdateRow(0, "bar", false);
   ASSERT_EQ(ReadRow(0), "hoge");
+
+  // Act 2 -- emulate media failure (db file removed) then recover from log
   MediaFailure();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- aborted update discarded; row 0 retains original "hoge"
   ASSERT_EQ(ReadRow(0), "hoge");
 }
 
 TEST_F(RecoveryManagerTest, DeleteRowAbortRecovery) {
+  // Arrange -- nothing more than fixture setup; row 0 = "hoge" committed
+
+  // Act 1 -- delete row 0 but do not commit (aborted by default)
   ASSERT_TRUE(InsertRow("hoge"));
   DeleteRow(0, false);
   ASSERT_EQ(GetRowCount(), 1);
+
+  // Act 2 -- emulate media failure (db file removed) then recover from log
   MediaFailure();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- aborted delete discarded; row 0 retains original "hoge"
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "hoge");
 }
 
 TEST_F(RecoveryManagerTest, InsertCrash) {
+  // Arrange
   auto txn = tm_->Begin();
   std::string record = "blah~blah";
+
+  // Act 1 -- insert record into row page (txn not committed)
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
     ASSERT_SUCCESS(page->Insert(txn, record).GetStatus());
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
               before_size - record.size() - sizeof(RowPointer));
   }
-  // Note that txn is not committed.
+
+  // Act 2 -- emulate crash (no commit), then recover from log
   Recover();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- uncommitted insert discarded; row count = 0
   ASSERT_EQ(GetRowCount(), 0);
 }
 
 TEST_F(RecoveryManagerTest, UpdateCrash) {
+  // Arrange -- row 0 = "original message" committed
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
   std::string record = "blah~blah";
+
+  // Act 1 -- update row 0 (txn not committed)
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-
     ASSERT_SUCCESS(page->Update(txn, 0, record));
   }
-  // Note that txn is not committed.
+
+  // Act 2 -- emulate crash (no commit), then recover from log
   Recover();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- uncommitted update discarded; row 0 retains original
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
 
 TEST_F(RecoveryManagerTest, DeleteCrash) {
+  // Arrange -- row 0 = "original message" committed
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
+
+  // Act 1 -- delete row 0 (txn not committed)
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_SUCCESS(page->Delete(txn, 0));
   }
-  // Note that txn is not committed.
+
+  // Act 2 -- emulate crash (no commit), then recover from log
   Recover();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- uncommitted delete discarded; row 0 retains original
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
 
 TEST_F(RecoveryManagerTest, InsertMediaCrash) {
+  // Arrange
   auto txn = tm_->Begin();
   std::string record = "blah~blah";
+
+  // Act 1 -- insert record into row page (txn not committed)
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
     ASSERT_SUCCESS(page->Insert(txn, record).GetStatus());
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
               before_size - record.size() - sizeof(RowPointer));
   }
-  // Note that txn is not committed.
+
+  // Act 2 -- emulate media failure (db file removed), then recover from log
   MediaFailure();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- uncommitted insert discarded; row count = 0
   ASSERT_EQ(GetRowCount(), 0);
 }
 
 TEST_F(RecoveryManagerTest, UpdateMediaCrash) {
+  // Arrange -- row 0 = "original message" committed
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
   std::string record = "blah~blah";
+
+  // Act 1 -- update row 0 (txn not committed)
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_SUCCESS(page->Update(txn, 0, record));
-    // Note that txn is not committed.
   }
+
+  // Act 2 -- emulate media failure (db file removed), then recover from log
   MediaFailure();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- uncommitted update discarded; row 0 retains original
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
 
 TEST_F(RecoveryManagerTest, DeleteMediaCrash) {
+  // Arrange -- row 0 = "original message" committed
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
+
+  // Act 1 -- delete row 0 (txn not committed)
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_SUCCESS(page->Delete(txn, 0));
   }
-  // Note that txn is not committed.
+
+  // Act 2 -- emulate media failure (db file removed), then recover from log
   MediaFailure();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- uncommitted delete discarded; row 0 retains original
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
 
 TEST_F(RecoveryManagerTest, InsertSinglePageFailure) {
+  // Arrange
   auto txn = tm_->Begin();
   std::string record = "blah~blah";
+
+  // Act 1 -- insert record into row page (txn not committed)
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
-
     const bin_size_t before_size = page->body.row_page.FreeSizeForTest();
-
     ASSERT_SUCCESS(page->Insert(txn, record).GetStatus());
     ASSERT_EQ(page->body.row_page.FreeSizeForTest(),
               before_size - record.size() - sizeof(RowPointer));
   }
-  // Note that txn is not committed.
+
+  // Act 2 -- emulate single-page corruption, then recover from log
   SinglePageFailure(page_id_);
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- uncommitted insert discarded; row count = 0
   ASSERT_EQ(GetRowCount(), 0);
 }
 
 TEST_F(RecoveryManagerTest, UpdateSinglePageFailure) {
+  // Arrange -- row 0 = "original message" committed
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
   std::string record = "modified message";
+
+  // Act 1 -- update row 0 (txn not committed)
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_SUCCESS(page->Update(txn, 0, record));
   }
-  // Note that txn is not committed.
+
+  // Act 2 -- emulate single-page corruption, then recover from log
   SinglePageFailure(page_id_);
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- uncommitted update discarded; row 0 retains original
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }
 
 TEST_F(RecoveryManagerTest, DeleteSinglePageFailure) {
+  // Arrange -- row 0 = "original message" committed
   ASSERT_TRUE(InsertRow("original message"));
   auto txn = tm_->Begin();
+
+  // Act 1 -- delete row 0 (txn not committed)
   {
     PageRef page = p_->GetPage(page_id_);
     ASSERT_FALSE(page.IsNull());
     ASSERT_EQ(page->Type(), PageType::kRowPage);
     ASSERT_SUCCESS(page->Delete(txn, 0));
   }
-  // Note that txn is not committed.
+
+  // Act 2 -- emulate single-page corruption, then recover from log
   SinglePageFailure(page_id_);
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- uncommitted delete discarded; row 0 retains original
   ASSERT_EQ(GetRowCount(), 1);
   ASSERT_EQ(ReadRow(0), "original message");
 }

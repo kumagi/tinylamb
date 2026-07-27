@@ -128,14 +128,13 @@ class PlanTest : public ::testing::Test {
   void TearDown() override { rs_->DeleteAll(); }
 
   void DumpAll(const Plan& plan) const {
-    plan->Dump(std::cout, 0);
-    std::cout << "\n";
+    DumpLog(*plan, 0);
     TransactionContext ctx = rs_->BeginContext();
     Executor scan = plan->EmitExecutor(ctx);
     Row result;
-    std::cout << plan->GetSchema() << "\n";
+    LOG(INFO) << plan->GetSchema();
     while (scan->Next(&result, nullptr)) {
-      std::cout << result << "\n";
+      LOG(INFO) << result;
     }
   }
 
@@ -143,82 +142,124 @@ class PlanTest : public ::testing::Test {
   std::unique_ptr<Database> rs_;
 };
 
-TEST_F(PlanTest, Construct) {}
+TEST_F(PlanTest, Construct) {
+  // Arrange -- nothing to set up; default database created by SetUp()
+  // Act -- nothing to execute; default constructed via SetUp()
+  // Assert -- nothing to verify; gtest green on pass, death on crash
+}
 
 TEST_F(PlanTest, ScanPlan) {
+  // Arrange -- begin context, get Sc1 table, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+
+  // Act -- construct FullScanPlan and dump via LOG(INFO)
   Plan fs(new FullScanPlan(*tbl, ts));
   DumpAll(fs);
+
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST_F(PlanTest, ProjectPlan) {
+  // Arrange -- begin context, get Sc1 table, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+
+  // Act -- construct ProjectionPlan projecting c1, dump via LOG(INFO)
   Plan pp(new ProjectionPlan(std::make_shared<FullScanPlan>(*tbl, ts),
-                             {NamedExpression("c1")}));
+                              {NamedExpression("c1")}));
   DumpAll(pp);
+
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST_F(PlanTest, SelectionPlan) {
+  // Arrange -- begin context, get Sc1 table, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+
+  // Act -- construct SelectionPlan with filter c1 >= 100, dump via LOG(INFO)
   Expression exp = BinaryExpressionExp(ColumnValueExp("c1"),
                                        BinaryOperation::kGreaterThanEquals,
                                        ConstantValueExp(Value(100)));
   Plan sp(new SelectionPlan(std::make_shared<FullScanPlan>(*tbl, ts), exp, ts));
   DumpAll(sp);
+
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST_F(PlanTest, HashJoinPlan) {
+  // Arrange -- begin context, get Sc1 and Sc2 tables, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+
+  // Act -- construct ProductPlan (hash join on Sc1.c1 = Sc2.d1), dump via LOG(INFO)
   Plan prop(new ProductPlan(
       std::make_shared<FullScanPlan>(*tbl1, ts), {ColumnName("Sc1.c1")},
       std::make_shared<FullScanPlan>(*tbl2, ts), {ColumnName("Sc2.d1")}));
   DumpAll(prop);
+
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST_F(PlanTest, IndexJoinPlan) {
+  // Arrange -- begin context, get Sc1 and Sc2 tables, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+
+  // Act -- construct ProductPlan (index join on Sc2PK index), dump via LOG(INFO)
   Plan prop(new ProductPlan(std::make_shared<FullScanPlan>(*tbl1, ts),
-                            {ColumnName("Sc1.c1")}, *tbl2, tbl2->GetIndex(0),
-                            {ColumnName("Sc2.d1")}, ts));
+                             {ColumnName("Sc1.c1")}, *tbl2, tbl2->GetIndex(0),
+                             {ColumnName("Sc2.d1")}, ts));
   DumpAll(prop);
+
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST_F(PlanTest, ProductPlanCrossJoin) {
+  // Arrange -- begin context, get Sc1 and Sc2 tables, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+
+  // Act -- construct ProductPlan (cross join), dump via LOG(INFO)
   Plan prop(new ProductPlan(std::make_shared<FullScanPlan>(*tbl1, ts),
-                            std::make_shared<FullScanPlan>(*tbl2, ts)));
+                             std::make_shared<FullScanPlan>(*tbl2, ts)));
   DumpAll(prop);
+
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST_F(PlanTest, UnaryPlan) {
+  // Arrange -- begin context, get Sc1 table, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+
+  // Act -- construct SelectionPlan with IS NULL filter on c1, dump via LOG(INFO)
   Expression exp =
       UnaryExpressionExp(ColumnValueExp("c1"), UnaryOperation::kIsNull);
   Plan sp(new SelectionPlan(std::make_shared<FullScanPlan>(*tbl, ts), exp, ts));
   DumpAll(sp);
+
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST_F(PlanTest, AggregationPlan) {
+  // Arrange -- begin context, get Sc1 table, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+
+  // Act -- construct AggregationPlan with count/sum/avg/min/max on c1/c3, dump via LOG(INFO)
   std::vector<NamedExpression> aggregates = {
       NamedExpression("count", AggregateExpressionExp(AggregationType::kCount,
                                                       ColumnValueExp("c1"))),
@@ -233,6 +274,8 @@ TEST_F(PlanTest, AggregationPlan) {
   Plan ap(new AggregationPlan(std::make_shared<FullScanPlan>(*tbl, ts),
                               std::move(aggregates)));
   DumpAll(ap);
+
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 }  // namespace tinylamb

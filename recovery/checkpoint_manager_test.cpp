@@ -67,9 +67,16 @@ class CheckpointTest : public RowPageTest {
   std::unique_ptr<CheckpointManager> cm_;
 };
 
-TEST_F(CheckpointTest, Construct) {}
+TEST_F(CheckpointTest, Construct) {
+  // Arrange -- nothing to set up; default database created by SetUp()
+  // Act -- nothing to execute; default constructed via SetUp()
+  // Assert -- nothing to verify; gtest death on crash, gtest green on pass
+}
 
 TEST_F(CheckpointTest, DoCheckpoint) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act 1 -- insert a row, then checkpoint, then update+commit within {} scope
   InsertRow("expect this operation did not rerun");
   Transaction txn = tm_->Begin();
   {
@@ -80,11 +87,18 @@ TEST_F(CheckpointTest, DoCheckpoint) {
     page->Update(txn, slot, "expect to be redone");
     txn.PreCommit();
   }
+
+  // Act 2 -- recover from log; redo should replay the post-checkpoint update
   Recover();
   r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST_F(CheckpointTest, CheckpointRecovery) {
+  // Arrange -- nothing more than fixture setup
+
+  // Act 1 -- insert a row, then checkpoint at restart_point, then update+commit
   InsertRow("expect this operation did not rerun");
   Transaction txn = tm_->Begin();
   lsn_t restart_point = 0;
@@ -97,34 +111,47 @@ TEST_F(CheckpointTest, CheckpointRecovery) {
     txn.PreCommit();
     result = inserted;
   }
+
+  // Act 2 -- recover from restart_point; redo should replay the update
   Recover();
   r_->RecoverFrom(restart_point, tm_.get());
+
+  // Assert -- recovered row reads back "expect to be redone"
   EXPECT_EQ(ReadRow(result), "expect to be redone");
 }
 
 TEST_F(CheckpointTest, CheckpointAbortRecovery) {
+  // Arrange -- row 0 = "original message" committed
   ASSERT_TRUE(InsertRow("original message"));
   Transaction txn = tm_->Begin();
   slot_t slot = 0;
   lsn_t restart_point = 0;
+
+  // Act 1 -- checkpoint, then update+insert without committing
   {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint();
     page->Update(txn, slot, "aborted");
     ASSERT_SUCCESS(page->Insert(txn, "will be deleted").GetStatus());
   }
-  // Note that the txn is not committed.
+
+  // Act 2 -- recover from restart_point; uncommitted changes discarded
   Recover();
   r_->RecoverFrom(restart_point, tm_.get());
+
+  // Assert -- aborted txn leaves row 0 with original message, row count = 1
   ASSERT_EQ(GetRowCount(), 1);
   EXPECT_EQ(ReadRow(slot), "original message");
 }
 
 TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
+  // Arrange -- row 0 = "original message" committed
   ASSERT_TRUE(InsertRow("original message"));
   Transaction txn = tm_->Begin();
   slot_t slot = 0;
   lsn_t restart_point = 0;
+
+  // Act 1 -- checkpoint with lambda that updates+inserts but does not commit
   {
     PageRef page = p_->GetPage(page_id_);
     restart_point = cm_->WriteCheckpoint([&]() {
@@ -132,9 +159,12 @@ TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
       ASSERT_SUCCESS(page->Insert(txn, "will be deleted").GetStatus());
     });
   }
-  // Note that the txn is not committed.
+
+  // Act 2 -- recover from restart_point; uncommitted changes discarded
   Recover();
   r_->RecoverFrom(restart_point, tm_.get());
+
+  // Assert -- aborted txn leaves row 0 with original message, row count = 1
   ASSERT_EQ(GetRowCount(), 1);
   EXPECT_EQ(ReadRow(slot), "original message");
 }

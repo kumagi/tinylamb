@@ -21,21 +21,32 @@
 namespace tinylamb {
 
 TEST(ColumnNameTest, Construct) {
+  // Arrange -- nothing more than two ColumnName strings
+  // Act -- construct two ColumnName objects (one qualified, one bare)
   ColumnName a("test.ColumnName");
   ColumnName b("ColumnName");
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST(ColumnNameTest, Check) {
+  // Arrange -- two ColumnName strings (one qualified, one bare)
   ColumnName a("test.ColumnName");
+
+  // Act -- inspect schema and name components
+  // Assert -- qualified name splits into schema="test", name="ColumnName"
   ASSERT_EQ("test", a.schema);
   ASSERT_EQ("ColumnName", a.name);
+  // Act/Assert -- bare name has empty schema, name="foobar"
   ColumnName b("foobar");
   ASSERT_TRUE(b.schema.empty());
   ASSERT_TRUE("foobar");
 }
 
 TEST(ColumnNameTest, ToString) {
+  // Arrange -- qualified ColumnName "Foo.Bar"
   ColumnName a("Foo.Bar");
+
+  // Act + Assert -- ToString round-trips the original qualified name
   ASSERT_EQ(a.ToString(), "Foo.Bar");
 }
 

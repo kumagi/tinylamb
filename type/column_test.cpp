@@ -25,21 +25,30 @@
 
 namespace tinylamb {
 TEST(ColumnTest, Construct) {
+  // Arrange -- nothing more than default ColumnName/ValueType/Constraint
+  // Act -- construct two Columns with different names/types/constraints
   Column c(ColumnName("test_column"), ValueType::kInt64);
   Column d(ColumnName("next_column"), ValueType::kVarChar,
-           Constraint(Constraint::kUnique));
+            Constraint(Constraint::kUnique));
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST(ColumnTest, SerializeDeserialize) {
+  // Arrange -- nothing more than default ColumnName/ValueType/Constraint
+  // Act -- serialize+deserialize round-trip for 2 Column variants
   SerializeDeserializeTest(
       Column(ColumnName("test_column"), ValueType::kInt64));
   SerializeDeserializeTest(Column(ColumnName("next_column"), ValueType::kDouble,
-                                  Constraint(Constraint::kUnique)));
+                                   Constraint(Constraint::kUnique)));
+  // Assert -- implicit; SerializeDeserializeTest macro asserts equality
 }
 
 TEST(ColumnTest, Dump) {
+  // Arrange -- nothing more than two Columns with different names/types
+  // Act -- stream Columns to LOG (no assertion; output-only)
   LOG(INFO) << Column(ColumnName("test_column"), ValueType::kInt64);
   LOG(ERROR) << Column(ColumnName("next_column"), ValueType::kDouble,
-                       Constraint(Constraint::kUnique));
+                        Constraint(Constraint::kUnique));
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 }  // namespace tinylamb

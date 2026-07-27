@@ -44,6 +44,7 @@ class SortedRunEntryTest : public ::testing::Test {
 };
 
 TEST_F(SortedRunEntryTest, Generate) {
+  // Arrange -- create a BlobFile and three entries (short, middle, long key)
   auto l = std::make_unique<BlobFile>(filepath_);
   SortedRun::Entry short_entry = SortedRun::Entry("abc", LSMValue("val"), *l);
   SortedRun::Entry middle_entry =
@@ -51,10 +52,13 @@ TEST_F(SortedRunEntryTest, Generate) {
   std::string long_key(200, 'a');
   SortedRun::Entry long_entry =
       SortedRun::Entry(long_key, LSMValue("long value"), *l);
+
+  // Act -- wait for 6 writes to land, then destroy the writer
   while (l->Written() < 6) {
   }
   l.reset();
 
+  // Assert -- read back the three entries via a fresh BlobFile and verify key/value
   BlobFile blob(filepath_);
   ASSERT_EQ(short_entry.BuildKey(blob), "abc");
   ASSERT_EQ(short_entry.BuildValue(blob), "val");
@@ -65,15 +69,19 @@ TEST_F(SortedRunEntryTest, Generate) {
 }
 
 TEST_F(SortedRunEntryTest, Compare) {
+  // Arrange -- create a BlobFile and three entries (short, middle, long key)
   auto l = std::make_unique<BlobFile>(filepath_);
   SortedRun::Entry short_entry("abc", LSMValue("val"), *l);
   SortedRun::Entry middle_entry("abcdefhijk", LSMValue("foobar"), *l);
   std::string long_key("abcdefghijklmnopqrstuvwxyz");
   SortedRun::Entry long_entry(long_key, LSMValue("long value"), *l);
+
+  // Act -- wait for 6 writes to land, then destroy the writer
   while (l->Written() < 6) {
   }
   l.reset();
 
+  // Assert -- comparisons against external keys yield expected ordering
   BlobFile blob(filepath_);
   ASSERT_LT(short_entry.Compare("abb", blob), 0);
   ASSERT_EQ(short_entry.Compare("abc", blob), 0);
@@ -93,6 +101,7 @@ TEST_F(SortedRunEntryTest, Compare) {
 }
 
 TEST_F(SortedRunEntryTest, MoreCompare) {
+  // Arrange -- build a vector of 12 keys with varied lengths and prefixes; build entries for each + extension
   std::vector<std::string> keys = {
       std::string(1, 0), std::string(2, 0),  std::string(3, 0),
       std::string(1, 0), std::string(2, 0),  std::string(3, 0),
@@ -103,6 +112,8 @@ TEST_F(SortedRunEntryTest, MoreCompare) {
   std::vector<std::string> candidates;
   std::vector<SortedRun::Entry> entries;
   BlobFile blob(filepath_);
+
+  // Act -- for each key, create an entry; also create entries for key+ext pairs
   {
     for (const auto& key : keys) {
       candidates.push_back(key);
@@ -114,6 +125,7 @@ TEST_F(SortedRunEntryTest, MoreCompare) {
     }
   }
 
+  // Assert -- pairwise comparison of all candidates/entries yields consistent ordering
   for (size_t i = 0; i < candidates.size(); ++i) {
     for (size_t j = 0; j < candidates.size(); ++j) {
       if (candidates[i] < candidates[j]) {
@@ -157,20 +169,32 @@ class SortedRunTest : public ::testing::Test {
 };
 
 TEST_F(SortedRunTest, First) {
+  // Arrange -- SortedRun is pre-constructed by SetUp() with 1000 key/value pairs
+  // Act -- find the first key "common_prefix:0"
   auto result = sr_->Find("common_prefix:0", *blob_);
+
+  // Assert -- the result is "0" (i^2 = 0^2 = 0)
   ASSERT_SUCCESS_AND_EQ(result, "0");
 }
 
 TEST_F(SortedRunTest, Build) {
+  // Arrange -- SortedRun is pre-constructed by SetUp() with 1000 key/value pairs
+  // Act -- find the key "common_prefix:121"
   auto result = sr_->Find("common_prefix:121", *blob_);
+
+  // Assert -- the result is "14641" (121^2 = 14641)
   ASSERT_SUCCESS_AND_EQ(result, "14641");
 }
 
 TEST_F(SortedRunTest, Find) {
+  // Arrange -- SortedRun is pre-constructed by SetUp() with 1000 key/value pairs
+  // Act -- find all 1000 keys in the run
   for (int i = 0; i < 1000; ++i) {
     auto result = sr_->Find("common_prefix:" + std::to_string(i), *blob_);
     ASSERT_SUCCESS_AND_EQ(result, std::to_string(i * i));
   }
+
+  // Assert -- out-of-range keys return kNotExists
   auto minus = sr_->Find("common_prefix:" + std::to_string(-1), *blob_);
   ASSERT_EQ(minus.GetStatus(), Status::kNotExists);
   auto over = sr_->Find("common_prefix:" + std::to_string(10000), *blob_);
@@ -178,6 +202,7 @@ TEST_F(SortedRunTest, Find) {
 }
 
 TEST_F(SortedRunTest, Delete) {
+  // Arrange -- build a SortedRun with 1000 keys where i%3==0 are deletes, i%3==1 are values, i%3==2 absent
   std::filesystem::path data_file;
   std::filesystem::path index_file;
   {
@@ -197,13 +222,17 @@ TEST_F(SortedRunTest, Delete) {
     sr_ = std::make_unique<SortedRun>(index_file);
   }
 
+  // Act -- find all 1000 keys in the run
   for (int i = 0; i < 1000; ++i) {
     auto result = sr_->Find(std::to_string(i), *blob_);
     if (i % 3 == 0) {
+      // Assert -- deleted keys return kDeleted
       ASSERT_EQ(result.GetStatus(), Status::kDeleted);
     } else if (i % 3 == 1) {
+      // Assert -- value keys return the doubled value
       ASSERT_SUCCESS_AND_EQ(result, std::to_string(i * 2));
     } else {
+      // Assert -- absent keys return kNotExists
       ASSERT_EQ(result.GetStatus(), Status::kNotExists);
     }
   }
@@ -212,13 +241,18 @@ TEST_F(SortedRunTest, Delete) {
 }
 
 TEST_F(SortedRunTest, Iterator) {
+  // Arrange -- SortedRun is pre-constructed by SetUp() with 1000 key/value pairs
+  // Act -- walk the iterator from begin to end
   auto iter = sr_->Begin(*blob_);
   while (iter.IsValid()) {
     ++iter;
   }
+
+  // Assert -- implicit; iterator exhausts after 1000 entries; gtest green on pass
 }
 
 TEST_F(SortedRunTest, DeleteScan) {
+  // Arrange -- build a SortedRun with 1000 keys where i%3==0 are deletes, i%3==1 are values, i%3==2 absent
   std::filesystem::path data_file;
   std::filesystem::path index_file;
   {
@@ -238,6 +272,7 @@ TEST_F(SortedRunTest, DeleteScan) {
     sr_ = std::make_unique<SortedRun>(index_file);
   }
 
+  // Act -- walk the iterator; for non-deleted entries, verify key%3==1
   SortedRun::Iterator it = sr_->Begin(*blob_);
   while (it.IsValid()) {
     if (!it.IsDeleted()) {

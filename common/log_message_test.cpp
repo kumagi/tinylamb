@@ -19,6 +19,8 @@
 #include <gtest/gtest.h>
 
 TEST(LogMessage, Log) {
+  // Arrange -- nothing more than the LOG macro itself
+  // Act -- stream one message at each severity level (no assertion; output-only)
   LOG(FATAL) << "FATAL";
   LOG(ERROR) << "ERROR";
   LOG(ALERT) << "ALERT";
@@ -28,4 +30,5 @@ TEST(LogMessage, Log) {
   LOG(USER) << "USER";
   LOG(DEBUG) << "DEBUG";
   LOG(TRACE) << "TRACE";
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }

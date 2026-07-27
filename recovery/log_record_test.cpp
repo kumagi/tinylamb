@@ -40,16 +40,21 @@ class LogRecordTest : public ::testing::Test {
 };
 
 TEST_F(LogRecordTest, construct) {
+  // Arrange -- nothing more than a LogRecord with deterministic txn/offset/type
+  // Act -- default-construct a LogRecord via its 3-arg ctor
   LogRecord l(0xaabbccddeeff0011, 0x1122334455667788, LogType::kBegin);
+  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 TEST_F(LogRecordTest, check) {
+  // Arrange -- a generic LogRecord for round-trip serdes, plus per-category sub-arranges under SCOPED_TRACE
   SerializeDeserializeCheck(
       LogRecord(0xaabbccddeeff0011, 0x1122334455667788, LogType::kBegin));
 
   {
-    // InsertBranch related logs.
+    // Arrange -- InsertBranch-related logs (Inserting/InsertingLeaf/InsertingBranch + compensations)
     SCOPED_TRACE("Insertion log tests");
+    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for each log variant
     SerializeDeserializeCheck(
         LogRecord::InsertingLogRecord(12, 2, 1, 3, "hello"));
     SerializeDeserializeCheck(
@@ -57,7 +62,6 @@ TEST_F(LogRecordTest, check) {
     SerializeDeserializeCheck(
         LogRecord::InsertingBranchLogRecord(12, 2, 3, "key", 343));
 
-    // Compensation records.
     SerializeDeserializeCheck(
         LogRecord::CompensatingInsertLogRecord(12, 123, 345));
     SerializeDeserializeCheck(
@@ -67,8 +71,9 @@ TEST_F(LogRecordTest, check) {
   }
 
   {
-    // UpdateBranch related logs.
+    // Arrange -- UpdateBranch-related logs (Updating/UpdatingLeaf/UpdatingBranch + compensations)
     SCOPED_TRACE("Updating log tests");
+    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for each log variant
     SerializeDeserializeCheck(
         LogRecord::UpdatingLogRecord(13, 3, 3, 4, "redo_log", "long_undo_log"));
     SerializeDeserializeCheck(LogRecord::UpdatingLeafLogRecord(
@@ -76,7 +81,6 @@ TEST_F(LogRecordTest, check) {
     SerializeDeserializeCheck(
         LogRecord::UpdatingBranchLogRecord(13, 3, 5, "key", 123, 578));
 
-    // Compensation records.
     SerializeDeserializeCheck(
         LogRecord::CompensatingUpdateLogRecord(12, 123, 345, "hello"));
     SerializeDeserializeCheck(
@@ -86,8 +90,9 @@ TEST_F(LogRecordTest, check) {
   }
 
   {
-    // Delete related logs.
+    // Arrange -- Delete-related logs (Deleting/DeletingLeaf/DeletingBranch + compensations)
     SCOPED_TRACE("Deletion log tests");
+    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for each log variant
     SerializeDeserializeCheck(
         LogRecord::DeletingLogRecord(13, 4, 4, 5, "undo_log"));
     SerializeDeserializeCheck(
@@ -103,8 +108,9 @@ TEST_F(LogRecordTest, check) {
   }
 
   {
-    // IndexKey related logs.
+    // Arrange -- IndexKey-related logs (SetLowFence / SetHighFence with various key boundaries)
     SCOPED_TRACE("Fence log tests");
+    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for each fence log
     SerializeDeserializeCheck(LogRecord::SetLowFenceLogRecord(
         20, 21, 12, IndexKey::MinusInfinity(), IndexKey("low")));
     SerializeDeserializeCheck(LogRecord::SetLowFenceLogRecord(
@@ -121,27 +127,31 @@ TEST_F(LogRecordTest, check) {
   }
 
   {
-    // Foster Child related logs.
+    // Arrange -- Foster Child-related logs (SetFoster with FosterPair entries)
     SCOPED_TRACE("Foster log tests");
+    // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality for each foster log
     SerializeDeserializeCheck(LogRecord::SetFosterLogRecord(
         20, 21, 12, FosterPair("new", 0), FosterPair("old", 43)));
     SerializeDeserializeCheck(LogRecord::SetFosterLogRecord(
         2, 1, 11, FosterPair("ne", 44), FosterPair("old", 1)));
   }
 
-  // Checkpoint related logs.
+  // Arrange -- Checkpoint-related logs (BeginCheckpoint / EndCheckpoint with txn table)
+  // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality
   SerializeDeserializeCheck(LogRecord::BeginCheckpointLogRecord());
   SerializeDeserializeCheck(LogRecord::EndCheckpointLogRecord(
       {{1, 2}, {3, 4}, {5, 6}}, {{4LLU, TransactionStatus::kRunning, 5LLU},
                                  {5, TransactionStatus::kCommitted, 6},
                                  {6, TransactionStatus::kAborted, 7}}));
 
-  // Page manipulation related logs.
+  // Arrange -- Page manipulation logs (AllocatePage / DestroyPage)
+  // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality
   SerializeDeserializeCheck(
       LogRecord::AllocatePageLogRecord(15, 7, 10, PageType::kMetaPage));
   SerializeDeserializeCheck(LogRecord::DestroyPageLogRecord(16, 8, 21));
 
-  // Lowest value log.
+  // Arrange -- Lowest value log (SetLowest with 5 fields)
+  // Act + Assert -- SerializeDeserializeCheck asserts round-trip equality
   SerializeDeserializeCheck(
       LogRecord::SetLowestLogRecord(14, 123, 345, 687, 89));
 }
