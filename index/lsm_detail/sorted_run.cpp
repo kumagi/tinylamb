@@ -16,9 +16,9 @@
 
 #include "sorted_run.hpp"
 
-#if TARGET_OS_LINUX
+#if defined(TARGET_OS_LINUX)
 #include <bits/types/struct_iovec.h>
-#elif __APPLE__
+#elif defined(__APPLE__)
 #endif
 #include <fcntl.h>
 #include <sys/types.h>

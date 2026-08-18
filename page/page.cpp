@@ -41,7 +41,7 @@
   }
 
 namespace tinylamb {
-Page::Page(page_id_t pid, PageType type) { PageInit(pid, type); }
+Page::Page(page_id_t pid, PageType page_type) { PageInit(pid, page_type); }
 
 void Page::PageInit(page_id_t pid, PageType page_type) {
   body.dummy_.fill(0);

@@ -8,6 +8,10 @@ endif()
 include(CTest)
 
 option(TINYLAMB_ENABLE_WARNINGS "Enable compiler warnings" ON)
+option(TINYLAMB_ENABLE_PEDANTIC_WARNINGS
+       "Enable additional strict compiler warnings" ON)
+option(TINYLAMB_ENABLE_CONVERSION_WARNINGS
+       "Enable noisy implicit numeric conversion warnings" OFF)
 option(TINYLAMB_ENABLE_SANITIZERS "Build with AddressSanitizer and UBSan" OFF)
 option(TINYLAMB_ENABLE_COVERAGE "Build with coverage instrumentation" OFF)
 
@@ -45,6 +49,20 @@ function(tinylamb_apply_options target)
     if(TINYLAMB_ENABLE_WARNINGS)
         if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
             target_compile_options(${target} PRIVATE -Wall -Wextra)
+            if(TINYLAMB_ENABLE_PEDANTIC_WARNINGS)
+                target_compile_options(${target} PRIVATE
+                        -Wpedantic
+                        -Wshadow
+                        -Wformat=2
+                        -Wundef
+                        -Wextra-semi
+                        -Wimplicit-fallthrough)
+                if(TINYLAMB_ENABLE_CONVERSION_WARNINGS)
+                    target_compile_options(${target} PRIVATE
+                            -Wconversion
+                            -Wsign-conversion)
+                endif()
+            endif()
         elseif(MSVC)
             target_compile_options(${target} PRIVATE /W4)
         endif()

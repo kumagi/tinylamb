@@ -172,6 +172,12 @@ class Page {
   enum PageType type = PageType::kUnknown;
   mutable uint64_t checksum = 0;
 
+  // RowPage contains an intentional zero-sized tail array. Keep this union's
+  // layout identical to the 32 KiB page format.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
   union PageBody {
     std::array<char, kPageBodySize> dummy_;
     MetaPage meta_page;
@@ -182,8 +188,10 @@ class Page {
 
     PageBody() : dummy_() {}
   };
-
   PageBody body;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 };
 
 static_assert(std::is_trivially_destructible<Page>::value == true,

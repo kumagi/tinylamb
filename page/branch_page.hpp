@@ -120,7 +120,16 @@ class BranchPage final {
   slot_t row_count_ = 0;
   bin_size_t free_ptr_ = sizeof(BranchPage);
   bin_size_t free_size_ = kPageBodySize - sizeof(BranchPage);
+  // The flexible tail is part of the fixed-size page format.  Its offset is
+  // used for both slot storage and payload placement.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
   RowPointer rows_[];
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 };
 
 }  // namespace tinylamb

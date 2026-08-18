@@ -23,7 +23,9 @@
 #include <iostream>
 #include <tuple>
 
-LogStream::~LogStream() { std::cerr << message_.str() << "\e[0;39;49m\n"; }
+LogStream::~LogStream() {
+  std::cerr << message_.str() << "\033[0;39;49m\n";
+}
 
 LogMessage::LogMessage(int log_level, const char* filename, int lineno,
                        const char* func_name) {
@@ -36,30 +38,30 @@ LogMessage::LogMessage(int log_level, const char* filename, int lineno,
 
   switch (log_level) {
     case FATAL:
-      ls << "\e[1;31m";
+      ls << "\033[1;31m";
       break;
     case ERROR:
-      ls << "\e[4;31m";
+      ls << "\033[4;31m";
       break;
     case ALERT:
-      ls << "\e[1;5;95m";
+      ls << "\033[1;5;95m";
       break;
     case WARN:
-      ls << "\e[33m";
+      ls << "\033[33m";
       break;
     case NOTICE:
-      ls << "\e[1;36m";
+      ls << "\033[1;36m";
       break;
     case INFO:
       break;  // Do nothing.
     case USER:
-      ls << "\e[7;32m";
+      ls << "\033[7;32m";
       break;
     case DEBUG:
-      ls << "\e[1;34m";
+      ls << "\033[1;34m";
       break;
     case TRACE:
-      ls << "\e[4;36m";
+      ls << "\033[4;36m";
       break;
     default:
       assert(!"unknown log level");

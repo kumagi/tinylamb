@@ -47,12 +47,12 @@ FullScanIterator::FullScanIterator(const Table* table, Transaction* txn)
 
 IteratorBase& FullScanIterator::operator++() {
   PageRef ref = [&]() {
-    PageRef ref = txn_->GetPageManager()->GetPage(pos_.page_id);
-    if (++pos_.slot < ref->RowCount()) {
-      return ref;
+    PageRef page_ref = txn_->GetPageManager()->GetPage(pos_.page_id);
+    if (++pos_.slot < page_ref->RowCount()) {
+      return page_ref;
     }
-    pos_.page_id = ref->body.row_page.next_page_id_;
-    ref.PageUnlock();
+    pos_.page_id = page_ref->body.row_page.next_page_id_;
+    page_ref.PageUnlock();
     if (pos_.page_id == 0) {
       pos_.page_id = ~0LLU;
       return PageRef();

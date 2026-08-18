@@ -114,7 +114,16 @@ class LeafPage final {
   RowPointer low_fence_;
   RowPointer high_fence_;
   RowPointer foster_;
+  // The flexible tail is part of the fixed-size page format.  Its offset is
+  // used for both slot storage and payload placement.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
   RowPointer rows_[];
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 };
 
 static_assert(std::is_trivially_destructible<LeafPage>::value,

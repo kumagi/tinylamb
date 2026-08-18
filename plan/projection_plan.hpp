@@ -41,7 +41,7 @@ class ProjectionPlan : public PlanBase {
 
   [[nodiscard]] const Table* ScanSource() const override {
     return src_->ScanSource();
-  };
+  }
   [[nodiscard]] const Schema& GetSchema() const override;
   [[nodiscard]] const TableStatistics& GetStats() const override {
     return stats_;

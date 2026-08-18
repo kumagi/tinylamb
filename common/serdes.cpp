@@ -16,15 +16,18 @@
 
 #include "common/serdes.hpp"
 
+#include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string_view>
 
 #include "constants.hpp"
 
 namespace tinylamb {
 size_t SerializeStringView(char* pos, std::string_view bin) {
-  bin_size_t len = bin.size();
+  assert(bin.size() <= std::numeric_limits<bin_size_t>::max());
+  const bin_size_t len = static_cast<bin_size_t>(bin.size());
   memcpy(pos, &len, sizeof(len));
   memcpy(pos + sizeof(len), bin.data(), bin.size());
   return sizeof(len) + bin.size();

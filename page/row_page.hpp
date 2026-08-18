@@ -96,7 +96,17 @@ class RowPage {
   slot_t row_count_ = 0;
   bin_size_t free_ptr_ = kPageSize;
   bin_size_t free_size_ = kPageSize - sizeof(RowPage);
+  // This zero-sized tail keeps the on-disk page header at the exact offset
+  // where the variable-sized slot array begins.  Changing it to [1] would
+  // alter sizeof(RowPage) and corrupt the fixed-size page layout.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
   RowPointer rows_[0];
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
   void Dump(std::ostream& o, int indent) const;
   friend std::ostream& operator<<(std::ostream& o, const RowPage& r) {
     r.Dump(o, 0);

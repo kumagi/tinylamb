@@ -21,15 +21,11 @@
 namespace tinylamb {
 
 namespace {
-inline int NearestPowerOf2(int n) {
+inline size_t NearestPowerOf2(size_t n) {
   if (n == 0) {
     return 1;
   }
-  int a = std::log(n);
-  if (std::pow(2, a) == n) {
-    return n;
-  }
-  return pow(2, a + 1);
+  return std::bit_ceil(n);
 }
 }  // namespace
 

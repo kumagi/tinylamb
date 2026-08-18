@@ -51,8 +51,8 @@ struct Constraint {
   };
 
   Constraint() = default;
-  explicit Constraint(ConstraintType ctype) : ctype(ctype) {}
-  Constraint(ConstraintType ctype, const Value& v) : ctype(ctype), value(v) {}
+  explicit Constraint(ConstraintType type) : ctype(type) {}
+  Constraint(ConstraintType type, const Value& v) : ctype(type), value(v) {}
 
   [[nodiscard]] size_t Size() const;
   bool operator==(const Constraint& rhs) const;

@@ -48,6 +48,6 @@ inline std::string RandomString(size_t len = 16, bool use_seed = true) {
   return ret;
 }
 
-};  // namespace tinylamb
+}  // namespace tinylamb
 
 #endif  // TINYLAMB_RANDOM_STRING_HPP

@@ -18,6 +18,10 @@
 #define TINYLAMB_TABLE_STATISTICS_HPP
 
 #include <cmath>
+#include <array>
+#include <algorithm>
+#include <cstring>
+#include <limits>
 #include <vector>
 
 #include "expression/expression.hpp"
@@ -35,8 +39,8 @@ struct IntegerColumnStats {
   size_t count;
   size_t distinct;
   void Init() {
-    max = std::numeric_limits<typeof(max)>::min();
-    min = std::numeric_limits<typeof(max)>::max();
+    max = std::numeric_limits<int64_t>::lowest();
+    min = std::numeric_limits<int64_t>::max();
     count = 0;
     distinct = 0;
   }
@@ -46,8 +50,8 @@ struct IntegerColumnStats {
     ++count;
   }
   IntegerColumnStats& operator*=(double multiplier) {
-    count = std::floor(count * multiplier);
-    distinct = std::floor(distinct * multiplier);
+    count = static_cast<size_t>(std::floor(count * multiplier));
+    distinct = static_cast<size_t>(std::floor(distinct * multiplier));
     return *this;
   }
   bool operator==(const IntegerColumnStats&) const = default;
@@ -63,20 +67,20 @@ struct VarcharColumnStats {
   size_t count;
   size_t distinct;
   void Check(const Value& sample) {
-    char cmp[0] = {};
-    size_t len = std::min(8ul, sample.value.varchar_value.length());
-    memcpy(cmp, sample.value.varchar_value.data(), len);
-    if (memcmp(max, cmp, len) < 0) {
-      memcpy(max, cmp, len);
+    std::array<char, 8> cmp{};
+    size_t len = std::min(cmp.size(), sample.value.varchar_value.length());
+    memcpy(cmp.data(), sample.value.varchar_value.data(), len);
+    if (memcmp(max, cmp.data(), len) < 0) {
+      memcpy(max, cmp.data(), len);
     }
-    if (memcmp(min, cmp, len) > 0) {
-      memcpy(min, cmp, len);
+    if (memcmp(min, cmp.data(), len) > 0) {
+      memcpy(min, cmp.data(), len);
     }
     ++count;
   }
   VarcharColumnStats& operator*=(double multiplier) {
-    count = std::floor(count * multiplier);
-    distinct = std::floor(distinct * multiplier);
+    count = static_cast<size_t>(std::floor(count * multiplier));
+    distinct = static_cast<size_t>(std::floor(distinct * multiplier));
     return *this;
   }
   bool operator==(const VarcharColumnStats&) const = default;
@@ -98,8 +102,8 @@ struct DoubleColumnStats {
     ++count;
   }
   DoubleColumnStats& operator*=(double multiplier) {
-    count = std::floor(count * multiplier);
-    distinct = std::floor(distinct * multiplier);
+    count = static_cast<size_t>(std::floor(count * multiplier));
+    distinct = static_cast<size_t>(std::floor(distinct * multiplier));
     return *this;
   }
   bool operator==(const DoubleColumnStats&) const = default;
