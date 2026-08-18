@@ -97,6 +97,10 @@ class BranchPage final {
 
   void Dump(std::ostream& o, int indent) const;
   bool SanityCheckForTest(PageManager* pm) const;
+  friend std::ostream& operator<<(std::ostream& o, const BranchPage& b) {
+    b.Dump(o, 0);
+    return o;
+  }
 
   Status MoveRightToFoster(Transaction& txn, Page& right);
   Status MoveLeftFromFoster(Transaction& txn, Page& right);

@@ -44,11 +44,12 @@ namespace tinylamb {
 Page::Page(page_id_t pid, PageType type) { PageInit(pid, type); }
 
 void Page::PageInit(page_id_t pid, PageType page_type) {
-  memset(this, 0, kPageSize);
+  body.dummy_.fill(0);
   page_id = pid;
-  SetPageLSN(0);
+  page_lsn = 0;
   type = page_type;
   recovery_lsn = std::numeric_limits<uint64_t>::max();
+  checksum = 0;
   switch (type) {
     case PageType::kUnknown:
       break;

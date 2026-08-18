@@ -51,6 +51,10 @@ class MetaPage {
   uint64_t first_free_page;
   void Dump(std::ostream& o, int) const;
   uint64_t max_page_count;
+  friend std::ostream& operator<<(std::ostream& o, const MetaPage& m) {
+    m.Dump(o, 0);
+    return o;
+  }
 };
 
 }  // namespace tinylamb

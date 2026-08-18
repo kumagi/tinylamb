@@ -241,7 +241,6 @@ TableStatistics::TableStatistics(const Schema& sc) {
 }
 
 Status TableStatistics::Update(Transaction& txn, const Table& target) {
-  int rows = 0;
   const Schema& schema = target.GetSchema();
   Iterator it = target.BeginFullScan(txn);
   std::vector<std::unique_ptr<DistinctCounter> > dist_counters;
@@ -255,7 +254,6 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
     for (size_t i = 0; i < dist_counters.size(); ++i) {
       dist_counters[i]->Add(row[i]);
     }
-    ++rows;
     ++it;
   }
   for (size_t i = 0; i < stats_.size(); ++i) {

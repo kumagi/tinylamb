@@ -40,6 +40,10 @@ class FreePage {
   void Dump(std::ostream& o, int) const {
     o << "[NextFreePage: " << next_free_page << "]";
   }
+  friend std::ostream& operator<<(std::ostream& o, const FreePage& f) {
+    f.Dump(o, 0);
+    return o;
+  }
 };
 
 constexpr static uint32_t kFreeBodySize = kPageBodySize - sizeof(FreePage);

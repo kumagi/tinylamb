@@ -41,6 +41,8 @@ class PageStorage {
 
   void DiscardAllUpdates();
 
+  friend std::ostream& operator<<(std::ostream& o, const PageStorage& ps);
+
  private:
   friend class Database;
   friend class Database;

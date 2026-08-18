@@ -18,6 +18,7 @@
 #define TINYLAMB_LOCK_MANAGER_HPP
 
 #include <mutex>
+#include <ostream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -34,8 +35,15 @@ class LockManager {
   bool ReleaseExclusiveLock(const RowPosition& row);
   bool TryUpgradeLock(const RowPosition& row);
 
+  friend std::ostream& operator<<(std::ostream& o, const LockManager& lm) {
+    std::scoped_lock lk(lm.latch_);
+    o << "LockManager(shared=" << lm.shared_locks_.size()
+      << ", exclusive=" << lm.exclusive_locks_.size() << ")";
+    return o;
+  }
+
  private:
-  std::mutex latch_;
+  mutable std::mutex latch_;
   std::unordered_map<RowPosition, size_t> shared_locks_;
   std::unordered_set<RowPosition> exclusive_locks_;
 };

@@ -47,6 +47,11 @@ class PageManager {
 
   PagePool* GetPool() { return &pool_; }
 
+  friend std::ostream& operator<<(std::ostream& o, const PageManager& pm) {
+    o << "PageManager(pool=" << pm.pool_ << ")";
+    return o;
+  }
+
  private:
   PageRef GetMetaPage();
 

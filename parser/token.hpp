@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_TOKEN_HPP
 #define TINYLAMB_TOKEN_HPP
 
+#include <ostream>
 #include <string>
 
 namespace tinylamb {
@@ -65,6 +66,11 @@ struct Token {
         return "Unknown<" + value + ">";
     }
     return "INVALID_TOKEN_TYPE";
+  }
+
+  friend std::ostream& operator<<(std::ostream& o, const Token& t) {
+    o << t.ToString();
+    return o;
   }
 };
 

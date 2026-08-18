@@ -23,6 +23,7 @@
 
 #include <cassert>
 #include <optional>
+#include <ostream>
 
 #include "common/constants.hpp"
 
@@ -90,6 +91,15 @@ class StatusOr {
   [[nodiscard]] Status GetStatus() const { return status_; }
   [[nodiscard]] explicit operator bool() const {
     return status_ == Status::kSuccess;
+  }
+
+  friend std::ostream& operator<<(std::ostream& o, const StatusOr<T>& so) {
+    if (so.HasValue()) {
+      o << so.Value();
+    } else {
+      o << "<error: " << so.GetStatus() << ">";
+    }
+    return o;
   }
 
  private:

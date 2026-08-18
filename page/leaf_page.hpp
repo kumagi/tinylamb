@@ -97,6 +97,10 @@ class LeafPage final {
   void DeFragment();
   void Dump(std::ostream& o, int indent) const;
   [[nodiscard]] size_t Find(std::string_view key) const;
+  friend std::ostream& operator<<(std::ostream& o, const LeafPage& l) {
+    l.Dump(o, 0);
+    return o;
+  }
 
   friend class BPlusTree;
   friend class BPlusTreeIterator;

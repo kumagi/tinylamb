@@ -282,8 +282,8 @@ void BranchPage::Split(page_id_t /*pid*/, Transaction& txn,
   assert(right->type == PageType::kBranchPage);
   size_t consumed_size = 0;
   size_t pivot = 0;
-  while (consumed_size < kThreshold && pivot < row_count_ - 2 &&
-         pivot < row_count_) {
+  while (consumed_size < kThreshold &&
+         pivot + 2 < static_cast<size_t>(row_count_)) {
     consumed_size +=
         SerializeSize(GetKey(pivot++)) + sizeof(page_id_t) + sizeof(RowPointer);
   }
@@ -432,7 +432,7 @@ bool BranchPage::SanityCheckForTest(PageManager* pm) const {
     return false;
   }
   const Page* this_page = GET_CONST_PAGE_PTR(this);
-  for (size_t i = 0; i < row_count_ - 1; ++i) {
+  for (size_t i = 0; i + 1 < static_cast<size_t>(row_count_); ++i) {
     if (GetKey(i + 1) < GetKey(i)) {
       LOG(FATAL) << "key not ordered";
       return false;

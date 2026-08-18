@@ -56,7 +56,7 @@ Decoder& operator>>(Decoder& e, Column& c) {
 }  // namespace tinylamb
 
 uint64_t std::hash<tinylamb::Column>::operator()(
-    const tinylamb::Column& c) const {
+    const tinylamb::Column& c) const noexcept {
   uint64_t result = std::hash<tinylamb::ColumnName>()(c.Name());
   result += std::hash<tinylamb::ValueType>()(c.Type());
   result += std::hash<tinylamb::Constraint>()(c.GetConstraint());

@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <ostream>
 #include <thread>
 
 #include "common/decoder.hpp"
@@ -76,6 +77,14 @@ class CheckpointManager {
   // This function is intentionally public for test.
   uint64_t WriteCheckpoint(const std::function<void()>& func_for_test = []() {
   });
+
+  friend std::ostream& operator<<(std::ostream& o,
+                                  const CheckpointManager& cm) {
+    o << "CheckpointManager(start=" << cm.start_.load()
+      << ", interval=" << cm.interval_seconds_
+      << ", path=" << cm.master_record_path << ")";
+    return o;
+  }
 
  private:
   std::atomic<bool> start_ = false;

@@ -47,4 +47,17 @@ StatusOr<std::shared_ptr<TableStatistics> > TransactionContext::GetStats(
       table_name, std::make_shared<TableStatistics>(std::move(tbl)));
   return result.first->second;
 }
+
+std::ostream& operator<<(std::ostream& o, const TransactionContext& ctx) {
+  o << "TransactionContext(txn=" << ctx.txn_ << ", tables=[";
+  for (const auto& [name, t] : ctx.tables_) {
+    o << name << ": " << t << ", ";
+  }
+  o << "], stats=[";
+  for (const auto& [name, s] : ctx.stats_) {
+    o << name << ": " << s << ", ";
+  }
+  o << "])";
+  return o;
+}
 }  // namespace tinylamb

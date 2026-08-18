@@ -30,8 +30,7 @@ std::unordered_set<ColumnName> AggregateExpression::TouchedColumns() const {
   return child_->TouchedColumns();
 }
 
-Value AggregateExpression::Evaluate(const Row& row,
-                                    const Schema& schema) const {
+Value AggregateExpression::Evaluate(const Row&, const Schema&) const {
   // This method should not be called directly.
   // The value of an aggregate expression is calculated by the aggregator.
   return {};

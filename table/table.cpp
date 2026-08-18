@@ -259,6 +259,19 @@ Encoder& operator<<(Encoder& e, const Table& t) {
   return e;
 }
 
+std::ostream& operator<<(std::ostream& o, const Table& t) {
+  o << "Table(schema=" << t.schema_ << ", first_pid=" << t.first_pid_
+    << ", last_pid=" << t.last_pid_ << ", indexes=[";
+  for (size_t i = 0; i < t.indexes_.size(); i++) {
+    if (i) {
+      o << ", ";
+    }
+    o << t.indexes_[i];
+  }
+  o << "])";
+  return o;
+}
+
 Decoder& operator>>(Decoder& d, Table& t) {
   d >> t.schema_ >> t.first_pid_ >> t.last_pid_ >> t.indexes_;
   return d;

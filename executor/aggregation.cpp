@@ -33,7 +33,7 @@ AggregationExecutor::AggregationExecutor(
       input_schema_(std::move(input_schema)),
       aggregates_(std::move(aggregates)) {}
 
-bool AggregationExecutor::Next(Row* dst, RowPosition* rp) {
+bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
   if (executed_) {
     return false;
   }

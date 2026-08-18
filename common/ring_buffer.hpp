@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <ostream>
 #include <thread>
 #include <valarray>
 #include <vector>
@@ -65,6 +66,13 @@ class SimpleRingBuffer {
     return write_idx_ - read_idx_ == buffer_.size();
   }
   [[nodiscard]] size_t Capacity() const { return buffer_.size(); }
+
+  friend std::ostream& operator<<(std::ostream& o,
+                                  const SimpleRingBuffer<T>& b) {
+    o << "SimpleRingBuffer(capacity=" << b.Capacity()
+      << ", size=" << (b.write_idx_ - b.read_idx_) << ")";
+    return o;
+  }
 
  private:
   std::vector<T> buffer_;
@@ -124,6 +132,15 @@ class RingBuffer {
     return write_idx_ - read_idx_ == buffer_.size();
   }
   [[nodiscard]] size_t Capacity() const { return buffer_.size(); }
+
+  friend std::ostream& operator<<(std::ostream& o, const RingBuffer<T>& b) {
+    o << "RingBuffer(capacity=" << b.Capacity()
+      << ", size="
+      << (b.write_idx_.load(std::memory_order_relaxed) -
+          b.read_idx_.load(std::memory_order_relaxed))
+      << ")";
+    return o;
+  }
 
  private:
   std::vector<T> buffer_;

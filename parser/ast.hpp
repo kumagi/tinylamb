@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_AST_HPP
 #define TINYLAMB_AST_HPP
 
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -35,11 +36,35 @@ enum class StatementType {
   kDelete,
 };
 
+inline std::string StatementTypeName(StatementType t) {
+  switch (t) {
+    case StatementType::kCreateTable:
+      return "CreateTable";
+    case StatementType::kDropTable:
+      return "DropTable";
+    case StatementType::kSelect:
+      return "Select";
+    case StatementType::kInsert:
+      return "Insert";
+    case StatementType::kUpdate:
+      return "Update";
+    case StatementType::kDelete:
+      return "Delete";
+  }
+  return "Unknown";
+}
+
 class Statement {
  public:
   explicit Statement(StatementType type) : type_(type) {}
   virtual ~Statement() = default;
   StatementType Type() const { return type_; }
+  virtual void Dump(std::ostream& o) const = 0;
+  friend std::ostream& operator<<(std::ostream& o, const Statement& s) {
+    o << StatementTypeName(s.Type()) << " ";
+    s.Dump(o);
+    return o;
+  }
 
  private:
   StatementType type_;
@@ -54,6 +79,16 @@ class CreateTableStatement : public Statement {
 
   const std::string& TableName() const { return table_name_; }
   const std::vector<Column>& Columns() const { return columns_; }
+  void Dump(std::ostream& o) const override {
+    o << "table=" << table_name_ << " columns=[";
+    for (size_t i = 0; i < columns_.size(); i++) {
+      if (i) {
+        o << ", ";
+      }
+      o << columns_[i];
+    }
+    o << "]";
+  }
 
  private:
   std::string table_name_;
@@ -67,6 +102,7 @@ class DropTableStatement : public Statement {
         table_name_(std::move(table_name)) {}
 
   const std::string& TableName() const { return table_name_; }
+  void Dump(std::ostream& o) const override { o << "table=" << table_name_; }
 
  private:
   std::string table_name_;
@@ -86,6 +122,28 @@ class SelectStatement : public Statement {
   }
   const std::vector<std::string>& FromClause() const { return from_clause_; }
   const Expression& WhereClause() const { return where_clause_; }
+  void Dump(std::ostream& o) const override {
+    o << "select=[";
+    for (size_t i = 0; i < select_list_.size(); i++) {
+      if (i) {
+        o << ", ";
+      }
+      o << select_list_[i];
+    }
+    o << "] from=[";
+    for (size_t i = 0; i < from_clause_.size(); i++) {
+      if (i) {
+        o << ", ";
+      }
+      o << from_clause_[i];
+    }
+    o << "] where=";
+    if (where_clause_) {
+      o << *where_clause_;
+    } else {
+      o << "(null)";
+    }
+  }
 
  private:
   std::vector<NamedExpression> select_list_;
@@ -103,6 +161,23 @@ class InsertStatement : public Statement {
 
   const std::string& TableName() const { return table_name_; }
   const std::vector<std::vector<Expression>>& Values() const { return values_; }
+  void Dump(std::ostream& o) const override {
+    o << "table=" << table_name_ << " values=[";
+    for (size_t i = 0; i < values_.size(); i++) {
+      if (i) {
+        o << "; ";
+      }
+      o << "(";
+      for (size_t j = 0; j < values_[i].size(); j++) {
+        if (j) {
+          o << ", ";
+        }
+        o << *values_[i][j];
+      }
+      o << ")";
+    }
+    o << "]";
+  }
 
  private:
   std::string table_name_;
@@ -124,6 +199,21 @@ class UpdateStatement : public Statement {
     return set_clause_;
   }
   const Expression& WhereClause() const { return where_clause_; }
+  void Dump(std::ostream& o) const override {
+    o << "table=" << table_name_ << " set=[";
+    for (size_t i = 0; i < set_clause_.size(); i++) {
+      if (i) {
+        o << ", ";
+      }
+      o << set_clause_[i].first << " = " << *set_clause_[i].second;
+    }
+    o << "] where=";
+    if (where_clause_) {
+      o << *where_clause_;
+    } else {
+      o << "(null)";
+    }
+  }
 
  private:
   std::string table_name_;
@@ -140,6 +230,14 @@ class DeleteStatement : public Statement {
 
   const std::string& TableName() const { return table_name_; }
   const Expression& WhereClause() const { return where_clause_; }
+  void Dump(std::ostream& o) const override {
+    o << "table=" << table_name_ << " where=";
+    if (where_clause_) {
+      o << *where_clause_;
+    } else {
+      o << "(null)";
+    }
+  }
 
  private:
   std::string table_name_;

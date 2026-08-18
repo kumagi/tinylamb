@@ -47,6 +47,13 @@ class Logger final {
 
   [[nodiscard]] int Fd() const { return dst_; }
 
+  friend std::ostream& operator<<(std::ostream& o, const Logger& l) {
+    o << "Logger(committed_lsn=" << l.flushed_lsn_.load()
+      << ", buffered_lsn=" << l.buffered_lsn_.load()
+      << ", finish=" << l.finish_.load() << ")";
+    return o;
+  }
+
  private:
   void LoggerWork();
 

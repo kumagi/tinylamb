@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <numeric>
+#include <ostream>
 #include <string>
 
 #include "common/vm_cache_impl.hpp"
@@ -50,6 +51,11 @@ class VMCache {
     cache_.Invalidate(offset, length * sizeof(T));
   }
   [[nodiscard]] std::string Dump() const { return cache_.Dump(); }
+
+  friend std::ostream& operator<<(std::ostream& o, const VMCache<T>& c) {
+    o << c.Dump();
+    return o;
+  }
 
  private:
   VMCacheImpl cache_;

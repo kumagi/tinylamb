@@ -112,6 +112,13 @@ class Transaction final {
   PageManager* GetPageManager() {
     return transaction_manager_->GetPageManager();
   }
+  friend std::ostream& operator<<(std::ostream& o, const Transaction& t) {
+    o << "Transaction(id=" << t.txn_id_ << ", status=" << t.status_
+      << ", prev_lsn=" << t.prev_lsn_
+      << ", read_set=" << t.read_set_.size()
+      << ", write_set=" << t.write_set_.size() << ")";
+    return o;
+  }
 
   // Transaction is not a value object. Never try to compare by its attributes.
   bool operator==(const Transaction& rhs) const = delete;

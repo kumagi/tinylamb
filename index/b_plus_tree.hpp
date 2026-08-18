@@ -45,6 +45,10 @@ class BPlusTree {
   [[nodiscard]] page_id_t Root() const { return root_; }
   BPlusTreeIterator Begin(Transaction& txn, std::string_view left = "",
                           std::string_view right = "", bool ascending = true);
+  friend std::ostream& operator<<(std::ostream& o, const BPlusTree& t) {
+    o << "BPlusTree(root=" << t.root_ << ")";
+    return o;
+  }
   bool operator==(const BPlusTree& rhs) const = default;
   bool SanityCheckForTest(PageManager* pm) const;
 

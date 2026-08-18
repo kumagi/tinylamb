@@ -46,6 +46,8 @@ class TransactionContext {
 
   Status PreCommit() { return txn_.PreCommit(); }
   void Abort() { txn_.Abort(); }
+  friend std::ostream& operator<<(std::ostream& o,
+                                  const TransactionContext& ctx);
 
   Transaction txn_;
   Database* rs_;

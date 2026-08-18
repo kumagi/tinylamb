@@ -44,7 +44,7 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
       PageRef leaf = tree_->FindLeaf(*txn_, begin, false);
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.Find(begin);
-      valid_ = 0 <= idx_ && idx_ < leaf->body.leaf_page.row_count_;
+      valid_ = idx_ < static_cast<size_t>(leaf->body.leaf_page.row_count_);
     }
   } else {
     if (end.empty()) {
@@ -56,7 +56,7 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
       PageRef leaf = tree_->FindLeaf(*txn_, end, false);
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.Find(end);
-      valid_ = 0 <= idx_ && idx_ < leaf->body.leaf_page.row_count_;
+      valid_ = idx_ < static_cast<size_t>(leaf->body.leaf_page.row_count_);
     }
   }
 }

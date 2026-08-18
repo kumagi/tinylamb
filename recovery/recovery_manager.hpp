@@ -45,6 +45,12 @@ class RecoveryManager {
 
   void LogUndoWithPage(lsn_t lsn, const LogRecord& log, TransactionManager* tm);
 
+  friend std::ostream& operator<<(std::ostream& o,
+                                  const RecoveryManager& rm) {
+    o << "RecoveryManager(log=" << rm.log_name_ << ")";
+    return o;
+  }
+
  private:
   std::string log_name_;
   std::ifstream log_file_;

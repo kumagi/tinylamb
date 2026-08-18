@@ -68,6 +68,13 @@ class PagePool {
     return pool_lru_.size();
   }
 
+  friend std::ostream& operator<<(std::ostream& o, const PagePool& pp) {
+    std::scoped_lock latch(pp.pool_latch);
+    o << "PagePool(file=" << pp.file_name_ << ", capacity=" << pp.capacity_
+      << ", pages=" << pp.pool_lru_.size() << ")";
+    return o;
+  }
+
   // Flush all page buffer without write back.
   void DropAllPages();
 

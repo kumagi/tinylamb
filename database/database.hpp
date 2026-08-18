@@ -58,6 +58,8 @@ class Database {
 
   [[maybe_unused]] void DebugDump(Transaction& txn, std::ostream& o);
 
+  friend std::ostream& operator<<(std::ostream& o, const Database& db);
+
   StatusOr<TableStatistics> GetStatistics(TransactionContext& txn,
                                           std::string_view schema_name);
 

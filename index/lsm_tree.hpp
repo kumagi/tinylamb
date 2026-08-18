@@ -64,6 +64,22 @@ class LSMTree final {
 
   void MergeAll();
 
+  friend std::ostream& operator<<(std::ostream& o, const LSMTree& t) {
+    o << "LSMTree(dir=" << t.root_dir_ << ", generation="
+      << t.generation_.load(std::memory_order_relaxed) << ", blob=" << t.blob_;
+    {
+      std::scoped_lock lk(t.mem_tree_lock_);
+      o << ", mem_tree=" << t.mem_tree_.size()
+        << ", frozen=" << t.frozen_mem_tree_.size();
+    }
+    {
+      std::scoped_lock lk(t.file_tree_lock_);
+      o << ", files=" << t.files_.size() << ", runs=" << t.index_.size();
+    }
+    o << ")";
+    return o;
+  }
+
  private:
   friend void Flusher(LSMTree* tree);
   friend void Merger(LSMTree* tree);
@@ -72,6 +88,12 @@ class LSMTree final {
   struct FileAndIndex {
     std::filesystem::path filepath;
     SortedRun index;
+
+    friend std::ostream& operator<<(std::ostream& o,
+                                    const FileAndIndex& fi) {
+      o << "FileAndIndex(" << fi.filepath << ": " << fi.index << ")";
+      return o;
+    }
   };
 
   int every_us_;

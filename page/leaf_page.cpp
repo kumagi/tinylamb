@@ -212,7 +212,8 @@ void LeafPage::Split(page_id_t /*pid*/, Transaction& txn, std::string_view key,
   assert(right->type == PageType::kLeafPage);
   size_t consumed_size = 0;
   size_t pivot = 0;
-  while (consumed_size < kThreshold && pivot < row_count_ - 1) {
+  while (consumed_size < kThreshold &&
+         pivot + 1 < static_cast<size_t>(row_count_)) {
     consumed_size += SerializeSize(GetKey(pivot)) +
                      SerializeSize(GetValue(pivot)) + sizeof(RowPointer);
     pivot++;

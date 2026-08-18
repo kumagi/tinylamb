@@ -18,6 +18,8 @@
 #define TINYLAMB_TRANSACTION_MANAGER_HPP
 
 #include <atomic>
+#include <mutex>
+#include <ostream>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -83,6 +85,14 @@ class TransactionManager {
 
   PageManager* GetPageManager() { return page_manager_; }
 
+  friend std::ostream& operator<<(std::ostream& o,
+                                  const TransactionManager& tm) {
+    std::scoped_lock lk(tm.transaction_table_lock);
+    o << "TransactionManager(next_txn_id=" << tm.next_txn_id_.load()
+      << ", active=" << tm.active_transactions_.size() << ")";
+    return o;
+  }
+
  private:
   friend class RecoveryManager;
   friend class CheckpointManager;
@@ -93,7 +103,7 @@ class TransactionManager {
   PageManager* const page_manager_;
   Logger* const logger_;
   RecoveryManager* const recovery_;
-  std::mutex transaction_table_lock;
+  mutable std::mutex transaction_table_lock;
 };
 
 }  // namespace tinylamb

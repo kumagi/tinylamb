@@ -43,6 +43,11 @@ class Table {
     Row include;
     friend Encoder& operator<<(Encoder& e, const IndexValueType& v);
     friend Decoder& operator>>(Decoder& d, IndexValueType& t);
+    friend std::ostream& operator<<(std::ostream& o,
+                                    const IndexValueType& v) {
+      o << "IndexValueType(pos=" << v.pos << ", include=" << v.include << ")";
+      return o;
+    }
   };
 
   Table() = default;
@@ -78,6 +83,7 @@ class Table {
 
   friend Encoder& operator<<(Encoder& e, const Table& t);
   friend Decoder& operator>>(Decoder& d, Table& t);
+  friend std::ostream& operator<<(std::ostream& o, const Table& t);
   bool operator==(const Table& rhs) const = default;
   [[nodiscard]] const Index& GetIndex(size_t offset) const {
     return indexes_[offset];

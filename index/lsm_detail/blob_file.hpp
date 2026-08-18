@@ -57,6 +57,11 @@ class BlobFile final {
     }
   }
 
+  friend std::ostream& operator<<(std::ostream& o, const BlobFile& b) {
+    o << "BlobFile(written=" << b.Written() << ", cache=" << b.cache_ << ")";
+    return o;
+  }
+
  private:
   Logger file_writer_;
   Cache cache_;

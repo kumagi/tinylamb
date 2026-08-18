@@ -90,7 +90,7 @@ Decoder& operator>>(Decoder& e, Constraint& c) {
 }  // namespace tinylamb
 
 uint64_t std::hash<tinylamb::Constraint>::operator()(
-    const tinylamb::Constraint& c) const {
+    const tinylamb::Constraint& c) const noexcept {
   uint64_t result = std::hash<uint8_t>()(c.ctype);
   switch (c.ctype) {
     case tinylamb::Constraint::kDefault:

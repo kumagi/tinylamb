@@ -47,4 +47,13 @@ std::string PageStorage::MasterRecordName() const {
   return dbname_ + ".last_checkpoint";
 }
 
+std::ostream& operator<<(std::ostream& o, const PageStorage& ps) {
+  o << "PageStorage(dbname=" << ps.dbname_
+    << ", lock_manager=" << ps.lm_ << ", logger=" << ps.logger_
+    << ", page_manager=" << ps.pm_ << ", recovery_manager=" << ps.rm_
+    << ", transaction_manager=" << ps.tm_
+    << ", checkpoint_manager=" << ps.cm_ << ")";
+  return o;
+}
+
 }  // namespace tinylamb

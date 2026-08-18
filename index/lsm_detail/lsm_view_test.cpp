@@ -257,7 +257,6 @@ TEST_F(LSMViewTest, DeleteMultiAndScan) {
 
   // Assert -- scan the view; every remaining key must be odd (even keys are tombstoned)
   auto iter = view_->Begin();
-  int valid_key = 1;
   while (iter.IsValid()) {
     std::string key = iter.Key();
     int key_int = std::stol(key);
@@ -296,7 +295,6 @@ TEST_F(LSMViewTest, DeleteOverWriteScan) {
 
   // Assert -- scan the view; for i%4==0 the value is "Hello", for other odd keys the value is i/100
   auto iter = view_->Begin();
-  int valid_key = 1;
   while (iter.IsValid()) {
     std::string key = iter.Key();
     int key_int = std::stol(key);

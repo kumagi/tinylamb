@@ -150,6 +150,8 @@ struct ColumnStats {
       case ValueType::kDouble:
         return stat.double_stats.count;
     }
+    abort();
+    return 0;
   }
   [[nodiscard]] size_t Distinct() const {
     switch (type) {

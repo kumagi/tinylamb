@@ -106,7 +106,6 @@ void Cache::Copy(void* dst, size_t offset, size_t length) const {
       (((offset + kBlockSize - 1) / kBlockSize) * kBlockSize) - offset;
   size_t read_size = std::min(to_next_boundary, length);
   while (0 < length) {
-    size_t original = length;
     ReadInPage(dst_ptr + copied, read_size, buffer_ + offset + copied);
     copied += read_size;
     length -= read_size;
@@ -341,14 +340,7 @@ void Cache::InvalidatePage(size_t page) const {
   }
 }
 
-static int activated_pages = 0;
-
 void Cache::Activate(size_t page) const {
-  /*
-  LOG(TRACE) << "activate: " << page << " length: " << kBlockSize
-             << " current: " << ++activated_pages << " " << Dump();
-  //*/
-
   size_t offset = page * kBlockSize;
   size_t rest_size = kBlockSize;
   while (0 < rest_size) {
@@ -365,10 +357,6 @@ void Cache::Activate(size_t page) const {
 }
 
 void Cache::Release(size_t page) const {
-  /*
-  LOG(DEBUG) << " release: " << page << " current: " << --activated_pages
-             << " | " << Dump();
-  //*/
   ::madvise(&buffer_[page * kBlockSize], kBlockSize, MADV_DONTNEED);
 }
 

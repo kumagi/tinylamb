@@ -115,6 +115,11 @@ class Cache final {
 
   std::string Dump() const;
 
+  friend std::ostream& operator<<(std::ostream& o, const Cache& c) {
+    o << c.Dump();
+    return o;
+  }
+
  private:
   void ReadInPage(void* dst, size_t length, void* src) const;
   void FixPage(size_t page) const;

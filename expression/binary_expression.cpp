@@ -16,6 +16,7 @@
 
 #include "binary_expression.hpp"
 
+#include <stdexcept>
 #include <unordered_set>
 
 namespace tinylamb {
@@ -61,6 +62,7 @@ Value Execute(BinaryOperation op, const Value& left, const Value& right) {
     case BinaryOperation::kXor:
       return (left ^ right);
   }
+  throw std::logic_error("invalid binary operation");
 }
 
 }  // anonymous namespace

@@ -17,6 +17,7 @@
 #include "expression/unary_expression.hpp"
 
 #include <string>
+#include <stdexcept>
 #include <unordered_set>
 
 #include "expression/expression.hpp"
@@ -48,6 +49,7 @@ Value UnaryExpression::Evaluate(const Row& row, const Schema& schema) const {
       }
       return Value(-child.value.int_value);
   }
+  throw std::logic_error("invalid unary operation");
 }
 
 std::string UnaryExpression::ToString() const {

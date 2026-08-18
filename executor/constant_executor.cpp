@@ -22,7 +22,7 @@
 
 namespace tinylamb {
 
-bool ConstantExecutor::Next(Row* row, RowPosition* rp) {
+bool ConstantExecutor::Next(Row* row, RowPosition* /*rp*/) {
   if (done_) {
     return false;
   }
@@ -31,7 +31,7 @@ bool ConstantExecutor::Next(Row* row, RowPosition* rp) {
   return true;
 }
 
-void ConstantExecutor::Dump(std::ostream& o, int indent) const {
+void ConstantExecutor::Dump(std::ostream& o, int /*indent*/) const {
   o << "ConstantExecutor";
 }
 

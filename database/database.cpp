@@ -62,6 +62,12 @@ Database::Database(std::string_view dbname)
   }
 }
 
+std::ostream& operator<<(std::ostream& o, const Database& db) {
+  o << "Database(storage=" << db.storage_
+    << ", catalogs=<BPlusTree; use DebugDump(txn, o) for details>)";
+  return o;
+}
+
 template <typename Serializable>
 static std::string Serialize(const Serializable& from) {
   std::stringstream ss;

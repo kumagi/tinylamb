@@ -98,6 +98,10 @@ class RowPage {
   bin_size_t free_size_ = kPageSize - sizeof(RowPage);
   RowPointer rows_[0];
   void Dump(std::ostream& o, int indent) const;
+  friend std::ostream& operator<<(std::ostream& o, const RowPage& r) {
+    r.Dump(o, 0);
+    return o;
+  }
 };
 
 static_assert(std::is_trivially_destructible<RowPage>::value,

@@ -39,6 +39,17 @@ class BPlusTreeIterator {
   BPlusTreeIterator& operator--();
   [[nodiscard]] bool IsValid() const { return valid_; }
 
+  friend std::ostream& operator<<(std::ostream& o,
+                                  const BPlusTreeIterator& it) {
+    if (it.IsValid()) {
+      o << "BPlusTreeIterator(key=" << it.Key() << ", value=" << it.Value()
+        << ")";
+    } else {
+      o << "BPlusTreeIterator(invalid)";
+    }
+    return o;
+  }
+
  private:
   BPlusTree* tree_;
   Transaction* txn_;

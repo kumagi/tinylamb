@@ -34,7 +34,6 @@ namespace tinylamb {
 LSMView::Iterator LSMView::Begin() const { return {this, true}; }
 
 StatusOr<std::string> LSMView::Find(std::string_view key) const {
-  int i = 0;
   for (const auto& idx : indexes_) {
     auto result = idx.Find(key, blob_);
     if (result.GetStatus() == Status::kDeleted) {
@@ -43,7 +42,6 @@ StatusOr<std::string> LSMView::Find(std::string_view key) const {
     if (result.HasValue()) {
       return result;
     }
-    ++i;
   }
   return Status::kNotExists;
 }

@@ -19,6 +19,7 @@
 
 #include <iosfwd>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
@@ -61,20 +62,18 @@ class ExpressionBase {
   [[nodiscard]] virtual std::unordered_set<ColumnName> TouchedColumns() const;
   [[nodiscard]] virtual Value Evaluate(const Row& row,
                                        const Schema& schema) const = 0;
-  [[nodiscard]] virtual Value Evaluate(const Row* left,
-                                       const Schema& left_schema,
-                                       const Row* right,
-                                       const Schema& right_schema) const {
-    throw std::runtime_error("not implemented");
-  };
-  [[nodiscard]] virtual tinylamb::Type ResultType(const Schema& schema) const {
+  [[nodiscard]] virtual Value Evaluate(const Row*, const Schema&, const Row*,
+                                       const Schema&) const {
     throw std::runtime_error("not implemented");
   }
-  [[nodiscard]] virtual tinylamb::Type ResultType(const Schema& left,
-                                                  const Schema& right) const {
+  [[nodiscard]] virtual tinylamb::Type ResultType(const Schema&) const {
     throw std::runtime_error("not implemented");
   }
-  virtual Status Validate(TransactionContext& ctx, const Schema& schema) const {
+  [[nodiscard]] virtual tinylamb::Type ResultType(const Schema&, const Schema&)
+      const {
+    throw std::runtime_error("not implemented");
+  }
+  virtual Status Validate(TransactionContext&, const Schema&) const {
     return Status::kSuccess;
   }
   [[nodiscard]] virtual std::string ToString() const = 0;

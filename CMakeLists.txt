@@ -1,44 +1,75 @@
 cmake_minimum_required(VERSION 3.14)
-project(tinylamb)
+project(tinylamb LANGUAGES CXX)
 
-find_package(Threads)
-set(CMAKE_CXX_STANDARD 20)
+if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+endif()
 
-add_executable(tinylamb
-        main.cpp
-)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined,bounds,address -fsanitize-address-use-after-scope")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -O2")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -ggdb -Wall -Wextra --coverage -fprofile-arcs -ftest-coverage")
+include(CTest)
 
-#set(CMAKE_C_COMPILER "/usr/bin/clang" CACHE STRING "clang compiler" FORCE)
-#set(CMAKE_CXX_COMPILER "/usr/bin/clang++" CACHE STRING "clang++ compiler" FORCE)
+option(TINYLAMB_ENABLE_WARNINGS "Enable compiler warnings" ON)
+option(TINYLAMB_ENABLE_SANITIZERS "Build with AddressSanitizer and UBSan" OFF)
+option(TINYLAMB_ENABLE_COVERAGE "Build with coverage instrumentation" OFF)
 
-target_link_libraries(
-        tinylamb
-        LINK_PUBLIC
-        Threads::Threads
-        libtinylamb
-        libtinylamb_parser
-)
+find_package(Threads REQUIRED)
 
-target_include_directories(
-        tinylamb
-        PRIVATE
-        ${PROJECT_SOURCE_DIR}
-)
+if(TINYLAMB_ENABLE_SANITIZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        message(FATAL_ERROR
+                "TINYLAMB_ENABLE_SANITIZERS requires GCC or Clang")
+    endif()
 
-add_library(libtinylamb_parser
+    add_library(tinylamb_sanitizers INTERFACE)
+    target_compile_options(tinylamb_sanitizers INTERFACE
+            -fsanitize=address,undefined,bounds
+            -fsanitize-address-use-after-scope
+            -fno-omit-frame-pointer)
+    target_link_options(tinylamb_sanitizers INTERFACE
+            -fsanitize=address,undefined,bounds)
+endif()
+
+if(TINYLAMB_ENABLE_COVERAGE)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        message(FATAL_ERROR
+                "TINYLAMB_ENABLE_COVERAGE requires GCC or Clang")
+    endif()
+
+    add_library(tinylamb_coverage INTERFACE)
+    target_compile_options(tinylamb_coverage INTERFACE --coverage)
+    target_link_options(tinylamb_coverage INTERFACE --coverage)
+endif()
+
+function(tinylamb_apply_options target)
+    target_compile_features(${target} PRIVATE cxx_std_20)
+
+    if(TINYLAMB_ENABLE_WARNINGS)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(${target} PRIVATE -Wall -Wextra)
+        elseif(MSVC)
+            target_compile_options(${target} PRIVATE /W4)
+        endif()
+    endif()
+
+    if(TINYLAMB_ENABLE_SANITIZERS)
+        target_link_libraries(${target} PRIVATE tinylamb_sanitizers)
+    endif()
+
+    if(TINYLAMB_ENABLE_COVERAGE)
+        target_link_libraries(${target} PRIVATE tinylamb_coverage)
+    endif()
+endfunction()
+
+add_library(tinylamb_parser
         STATIC
         parser/tokenizer.cpp
         parser/parser.cpp
         parser/pratt_parser.cpp
 )
-target_compile_options(libtinylamb_parser PRIVATE --coverage -fprofile-arcs -ftest-coverage)
-target_link_options(libtinylamb_parser PRIVATE --coverage)
+add_library(tinylamb::parser ALIAS tinylamb_parser)
+target_compile_features(tinylamb_parser PUBLIC cxx_std_20)
+tinylamb_apply_options(tinylamb_parser)
 
-add_library(libtinylamb
+add_library(tinylamb_core
         STATIC
         page/page.cpp transaction/lock_manager.cpp
         page/page_pool.cpp page/row_page.cpp page/page_manager.cpp
@@ -80,32 +111,52 @@ add_library(libtinylamb
         common/vm_cache_impl.hpp
         type/function.cpp
         type/type.cpp
-        expression/expression.cpp
 )
+add_library(tinylamb::core ALIAS tinylamb_core)
+target_compile_features(tinylamb_core PUBLIC cxx_std_20)
+tinylamb_apply_options(tinylamb_core)
+target_link_libraries(tinylamb_core PUBLIC Threads::Threads)
 
 
-add_library(libtinylamb_test_util
+add_library(tinylamb_test_util
         STATIC
         type/row.cpp)
-target_compile_options(libtinylamb_test_util PRIVATE --coverage -fprofile-arcs -ftest-coverage)
-target_link_options(libtinylamb_test_util PRIVATE --coverage)
+add_library(tinylamb::test_util ALIAS tinylamb_test_util)
+target_compile_features(tinylamb_test_util PUBLIC cxx_std_20)
+tinylamb_apply_options(tinylamb_test_util)
 
 target_include_directories(
-        libtinylamb
+        tinylamb_parser
         PUBLIC
-        ${PROJECT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 target_include_directories(
-        libtinylamb_parser
+        tinylamb_core
         PUBLIC
-        ${PROJECT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 target_include_directories(
-        libtinylamb_test_util
+        tinylamb_test_util
         PUBLIC
-        ${PROJECT_SOURCE_DIR})
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_executable(tinylamb
+        main.cpp
+)
+tinylamb_apply_options(tinylamb)
+target_link_libraries(
+        tinylamb
+        PRIVATE
+        tinylamb::core
+        tinylamb::parser
+)
+target_include_directories(
+        tinylamb
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
 
 ########################################
 ## Bench
@@ -113,12 +164,13 @@ target_include_directories(
 
 function(add_benchmark file_path)
     get_filename_component(filename ${file_path} NAME)
-    string(REPLACE ".cpp" "" target_name ${filename})
+    get_filename_component(target_name ${filename} NAME_WE)
     add_executable(${target_name} ${file_path})
-    target_compile_options(${target_name} PRIVATE "-O2")
+    tinylamb_apply_options(${target_name})
     set_property(TARGET ${target_name} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
     target_link_libraries(${target_name}
-            libtinylamb
+            PRIVATE
+            tinylamb::core
             leveldb
             rocksdb
     )
@@ -129,34 +181,40 @@ endfunction()
 ########################################
 ## Testing
 ########################################
-enable_testing()
-
-include(FetchContent)
-FetchContent_Declare(
-        googletest
-        # Specify the commit you depend on and update it regularly.
-        URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
-)
-
-# For Windows: Prevent overriding the parent project's compiler/linker settings
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
-include(GoogleTest)
-
-function(add_simple_test file_path)
-    get_filename_component(filename ${file_path} NAME)
-    string(REPLACE ".cpp" "" target_name ${filename})
-    add_executable(${target_name} ${file_path})
-    target_compile_options(${target_name} PRIVATE --coverage -fprofile-arcs -ftest-coverage)
-    target_link_libraries(${target_name}
-            gtest_main
-            libtinylamb_parser
-            libtinylamb
-            libtinylamb_test_util
-            --coverage
+if(BUILD_TESTING)
+    include(FetchContent)
+    FetchContent_Declare(
+            googletest
+            URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+            URL_HASH SHA256=1f357c27ca988c3f7c6b4bf68a9395005ac6761f034046e9dde0896e3aba00e4
     )
-    gtest_discover_tests(${target_name})
-endfunction()
+
+    # Keep the dependency focused on the test library used here.
+    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    set(INSTALL_GMOCK OFF CACHE BOOL "" FORCE)
+    set(gtest_build_tests OFF CACHE BOOL "" FORCE)
+    if(WIN32)
+        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    endif()
+
+    FetchContent_MakeAvailable(googletest)
+    include(GoogleTest)
+
+    function(add_simple_test file_path)
+        get_filename_component(filename ${file_path} NAME)
+        get_filename_component(target_name ${filename} NAME_WE)
+        add_executable(${target_name} ${file_path})
+        tinylamb_apply_options(${target_name})
+        target_link_libraries(${target_name}
+                PRIVATE
+                GTest::gtest_main
+                tinylamb::parser
+                tinylamb::core
+                tinylamb::test_util
+        )
+        gtest_discover_tests(${target_name})
+    endfunction()
 
 add_simple_test(common/vm_cache_test.cpp)
 add_simple_test(common/log_message_test.cpp)
@@ -204,6 +262,7 @@ add_simple_test(index/b_plus_tree_concurrent_test.cpp)
 add_simple_test(table/table_concurrent_test.cpp)
 add_simple_test(index/lsm_detail/cache_concurrent_test.cpp)
 
+endif()
 
 ########################################
 ## Fuzzing
