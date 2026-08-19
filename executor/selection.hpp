@@ -18,9 +18,12 @@
 #define TINYLAMB_SELECTION_HPP
 
 #include <memory>
+#include <optional>
 
 #include "executor_base.hpp"
 #include "expression/expression.hpp"
+#include "expression/bytecode.hpp"
+#include "expression/jit.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 
@@ -29,7 +32,8 @@ class ExpressionBase;
 
 class Selection : public ExecutorBase {
  public:
-  Selection(Expression exp, Schema schema, Executor src);
+  Selection(Expression exp, Schema schema, Executor src,
+            size_t jit_threshold_rows = 20'000'000);
   Selection(const Selection&) = delete;
   Selection(Selection&&) = delete;
   Selection& operator=(const Selection&) = delete;
@@ -37,13 +41,30 @@ class Selection : public ExecutorBase {
   ~Selection() override = default;
 
   bool Next(Row* dst, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
 
   void Dump(std::ostream& o, int indent) const override;
+  [[nodiscard]] size_t SkippedBatches() const { return skipped_batches_; }
+  [[nodiscard]] size_t JitBatches() const { return jit_batches_; }
 
  private:
   Expression exp_;
   Schema schema_;
   Executor src_;
+  DataChunk input_batch_;
+  DataChunk output_batch_;
+  size_t output_offset_{0};
+  size_t skipped_batches_{0};
+  std::optional<BytecodeProgram> bytecode_;
+  std::optional<JitInt64Kernels> jit_filter_;
+  bool jit_attempted_{false};
+  uint16_t jit_column_{0};
+  int64_t jit_constant_{0};
+  BinaryOperation jit_operation_{BinaryOperation::kEquals};
+  size_t jit_batches_{0};
+  size_t jit_threshold_rows_;
+  size_t rows_seen_{0};
 };
 }  // namespace tinylamb
 

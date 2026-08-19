@@ -71,9 +71,22 @@ TEST(ValueTest, Compare) {
   ASSERT_TRUE(Value("abc") < Value("d"));
 }
 
+TEST(ValueTest, VarcharCopiesOwnTheReferencedBytes) {
+  std::string backing = "statistics-boundary";
+  Value borrowed;
+  borrowed.type = ValueType::kVarChar;
+  borrowed.value.varchar_value = backing;
+
+  Value copied = borrowed;
+  backing.assign("overwritten");
+
+  EXPECT_EQ(copied.value.varchar_value, "statistics-boundary");
+}
+
 TEST(ValueTest, Dump) {
   // Arrange -- six Values of different types/levels for LOG streaming
-  // Act -- stream each Value to LOG at various levels (no assertion; output-only)
+  // Act -- stream each Value to LOG at various levels (no assertion;
+  // output-only)
   LOG(TRACE) << Value(12);
   LOG(DEBUG) << Value(120214143342323);
   LOG(INFO) << Value("foo-bar");
@@ -100,7 +113,8 @@ void MemcomparableFormatEncodeTest(const std::vector<Value>& input) {
 
 TEST(ValueTest, MemcomparableOrderInt) {
   // Arrange -- three int Value sets: ascending, descending, and extreme values
-  // Act + Assert -- MemcomparableFormatEncodeTest macro asserts sorted encoding order
+  // Act + Assert -- MemcomparableFormatEncodeTest macro asserts sorted encoding
+  // order
   MemcomparableFormatEncodeTest({Value(1), Value(2), Value(3)});
   MemcomparableFormatEncodeTest({Value(-1), Value(-2), Value(-3)});
   MemcomparableFormatEncodeTest({Value(std::numeric_limits<int64_t>::max()),
@@ -110,7 +124,8 @@ TEST(ValueTest, MemcomparableOrderInt) {
 
 TEST(ValueTest, MemcomparableVarchar) {
   // Arrange -- 13 varchar Values of increasing length and one binary value
-  // Act + Assert -- EncodeMemcomparableFormat yields expected prefix-tagged bytes
+  // Act + Assert -- EncodeMemcomparableFormat yields expected prefix-tagged
+  // bytes
   EXPECT_EQ(Value("a").EncodeMemcomparableFormat(),
             std::string(
                 {'\2', 'a', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\x01'}));
@@ -253,12 +268,14 @@ TEST(ValueTest, MemComparableFormatDecodeInt) {
     targets.emplace_back("\x01" + src + "\x01");
   } while (std::next_permutation(src.begin(), src.end()));
 
-  // Act + Assert -- MemcomparableFormatDecodeTest asserts decoded Values are strictly ascending
+  // Act + Assert -- MemcomparableFormatDecodeTest asserts decoded Values are
+  // strictly ascending
   MemcomparableFormatDecodeTest(targets);
 }
 
 TEST(ValueTest, MemComparableFormatDecodeVarchar) {
-  // Arrange -- 7-byte source string and its 5040 permutations as varchar-prefixed targets
+  // Arrange -- 7-byte source string and its 5040 permutations as
+  // varchar-prefixed targets
   std::string src = "\x60\x70\x80\x90\x10\x11\x12";
   ASSERT_EQ(src.size(), 7);
   std::vector<std::string> targets;
@@ -270,19 +287,22 @@ TEST(ValueTest, MemComparableFormatDecodeVarchar) {
     targets.push_back(v);
   } while (std::next_permutation(src.begin(), src.end()));
 
-  // Act + Assert -- MemcomparableFormatDecodeTest asserts decoded Values are strictly ascending
+  // Act + Assert -- MemcomparableFormatDecodeTest asserts decoded Values are
+  // strictly ascending
   MemcomparableFormatDecodeTest(targets);
 }
 
 TEST(ValueTest, MemComparableFormatDecodeDouble) {
-  // Arrange -- 7-byte source string and its 5040 permutations as double-prefixed targets
+  // Arrange -- 7-byte source string and its 5040 permutations as
+  // double-prefixed targets
   std::string src = "\x60\x70\x80\x90\x10\x11\x12";
   std::vector<std::string> targets;
   do {
     targets.emplace_back("\x03" + src + "\x01");
   } while (std::next_permutation(src.begin(), src.end()));
 
-  // Act + Assert -- MemcomparableFormatDecodeTest asserts decoded Values are strictly ascending
+  // Act + Assert -- MemcomparableFormatDecodeTest asserts decoded Values are
+  // strictly ascending
   MemcomparableFormatDecodeTest(targets);
 }
 }  // namespace tinylamb

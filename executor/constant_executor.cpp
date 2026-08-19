@@ -23,12 +23,19 @@
 namespace tinylamb {
 
 bool ConstantExecutor::Next(Row* row, RowPosition* /*rp*/) {
-  if (done_) {
+  if (offset_ >= rows_.size()) {
     return false;
   }
-  *row = row_;
-  done_ = true;
+  *row = rows_[offset_++];
   return true;
+}
+
+size_t ConstantExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset();
+  while (offset_ < rows_.size() && destination->Size() < max_rows) {
+    destination->Append(rows_[offset_++]);
+  }
+  return destination->Size();
 }
 
 void ConstantExecutor::Dump(std::ostream& o, int /*indent*/) const {

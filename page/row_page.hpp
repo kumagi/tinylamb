@@ -47,6 +47,7 @@ class RowPage {
   [[nodiscard]] const char* Payload() const {
     return reinterpret_cast<const char*>(this);
   }
+  void DeFragmentExcept(slot_t excluded_slot);
 
  public:
   void Initialize() {
@@ -70,6 +71,7 @@ class RowPage {
   Status Delete(page_id_t page_id, Transaction& txn, slot_t slot);
 
   [[nodiscard]] slot_t RowCount() const;
+  [[nodiscard]] slot_t RowMax() const { return row_max_; }
 
   [[nodiscard]] bin_size_t FreePtrForTest() const { return free_ptr_; }
   [[nodiscard]] bin_size_t FreeSizeForTest() const { return free_size_; }

@@ -17,6 +17,8 @@
 #ifndef TINYLAMB_CONSTANT_EXECUTOR_HPP
 #define TINYLAMB_CONSTANT_EXECUTOR_HPP
 
+#include <vector>
+
 #include "executor/executor_base.hpp"
 #include "type/row.hpp"
 
@@ -24,13 +26,16 @@ namespace tinylamb {
 
 class ConstantExecutor : public ExecutorBase {
  public:
-  explicit ConstantExecutor(Row row) : row_(std::move(row)) {}
+  explicit ConstantExecutor(Row row) : rows_({std::move(row)}) {}
+  explicit ConstantExecutor(std::vector<Row> rows) : rows_(std::move(rows)) {}
   bool Next(Row* row, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:
-  Row row_;
-  bool done_{false};
+  std::vector<Row> rows_;
+  size_t offset_{0};
 };
 
 }  // namespace tinylamb

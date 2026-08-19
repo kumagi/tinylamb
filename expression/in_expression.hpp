@@ -32,6 +32,16 @@ class InExpression : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kInExp; }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
+  [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,
+                               const Row* right,
+                               const Schema& right_schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema&) const override {
+    return tinylamb::Type(TypeTag::kBigInt);
+  }
+  [[nodiscard]] tinylamb::Type ResultType(const Schema&,
+                                          const Schema&) const override {
+    return tinylamb::Type(TypeTag::kBigInt);
+  }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;

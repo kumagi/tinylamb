@@ -68,7 +68,12 @@ bool IndexJoin::Next(Row* dst, RowPosition* /* rp */) {
     ++*right_it_;
     *dst = hold_left_ + right_row;
     if (!right_it_->IsValid() && !Load()) {
-      return left_key == right_key;
+      const bool matched = left_key == right_key;
+      // The last matching row still has to be returned, but the next call must
+      // not reuse the exhausted right iterator.  Clearing the held outer row
+      // makes the next call enter Load(), which will report end-of-input.
+      hold_left_.Clear();
+      return matched;
     }
     if (left_key == right_key) {
       return true;

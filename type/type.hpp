@@ -30,6 +30,7 @@ enum class TypeTag {
   kBigInt,
   kDouble,
   kVarChar,
+  kDate,
   kBinaryExp,
   kColumnValue,
   kConstantValue,
@@ -38,6 +39,8 @@ enum class TypeTag {
   kCaseExp,
   kInExp,
   kFunctionCallExp,
+  kQueryExp,
+  kIntervalExp,
 };
 
 class Type {

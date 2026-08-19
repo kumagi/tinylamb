@@ -17,7 +17,10 @@
 #ifndef TINYLAMB_FULL_SCAN_ITERATOR_HPP
 #define TINYLAMB_FULL_SCAN_ITERATOR_HPP
 #include <memory>
+#include <optional>
+#include <vector>
 
+#include "page/page_ref.hpp"
 #include "page/row_position.hpp"
 #include "table/iterator_base.hpp"
 #include "type/row.hpp"
@@ -49,12 +52,25 @@ class FullScanIterator : public IteratorBase {
  private:
   friend class Table;
   friend class FullScan;
-  FullScanIterator(const Table* table, Transaction* txn);
+  FullScanIterator(const Table* table, Transaction* txn,
+                   std::optional<std::vector<slot_t>> projection =
+                       std::nullopt);
+  FullScanIterator(const Table* table, Transaction* txn,
+                   std::vector<page_id_t> pages,
+                   std::optional<std::vector<slot_t>> projection);
+
+  void DeserializeCurrent(std::string_view row);
+  void SeekVisibleRow();
+  bool AdvancePage();
 
   const Table* table_;
   Transaction* txn_;
   RowPosition pos_;
   Row current_row_;
+  std::unique_ptr<PageRef> page_;
+  std::optional<std::vector<slot_t>> projection_;
+  std::optional<std::vector<page_id_t>> pages_;
+  size_t page_index_{0};
 };
 
 }  // namespace tinylamb

@@ -43,7 +43,7 @@ std::vector<Token> Tokenizer::Tokenize() {
 
 Token Tokenizer::NextToken() {
   char c = Peek();
-  if (std::isalpha(c)) {
+  if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
     return Keyword();
   }
   if (std::isdigit(c)) {
@@ -52,9 +52,16 @@ Token Tokenizer::NextToken() {
   if (c == '\'') {
     return String();
   }
+  if (c == '`') {
+    return QuotedIdentifier();
+  }
   if (c == ',') {
     Advance();
     return {TokenType::kComma, ","};
+  }
+  if (c == '.') {
+    Advance();
+    return {TokenType::kDot, "."};
   }
   if (c == '(') {
     Advance();
@@ -71,6 +78,7 @@ Token Tokenizer::NextToken() {
   if (std::string("+-*/%<>=!").find(c) != std::string::npos) {
     return Operator();
   }
+  Advance();
   return {TokenType::kUnknown, std::string(1, c)};
 }
 
@@ -103,6 +111,25 @@ Token Tokenizer::Identifier() {
   return {TokenType::kIdentifier, sql_.substr(start, pos_ - start)};
 }
 
+Token Tokenizer::QuotedIdentifier() {
+  Advance();  // Skip the opening backtick.
+  std::string value;
+  while (pos_ < sql_.size()) {
+    if (sql_[pos_] != '`') {
+      value.push_back(sql_[pos_++]);
+      continue;
+    }
+    if (pos_ + 1 < sql_.size() && sql_[pos_ + 1] == '`') {
+      value.push_back('`');
+      pos_ += 2;
+      continue;
+    }
+    Advance();
+    break;
+  }
+  return {TokenType::kIdentifier, value};
+}
+
 Token Tokenizer::Numeric() {
   size_t start = pos_;
   while (pos_ < sql_.size() &&
@@ -114,11 +141,19 @@ Token Tokenizer::Numeric() {
 
 Token Tokenizer::String() {
   Advance();  // Skip the opening quote
-  size_t start = pos_;
-  while (pos_ < sql_.size() && sql_[pos_] != '\'') {
-    pos_++;
+  std::string value;
+  while (pos_ < sql_.size()) {
+    if (sql_[pos_] != '\'') {
+      value.push_back(sql_[pos_++]);
+      continue;
+    }
+    if (pos_ + 1 < sql_.size() && sql_[pos_ + 1] == '\'') {
+      value.push_back('\'');
+      pos_ += 2;
+      continue;
+    }
+    break;
   }
-  std::string value = sql_.substr(start, pos_ - start);
   Advance();  // Skip the closing quote
   return {TokenType::kString, value};
 }
@@ -142,12 +177,17 @@ Token Tokenizer::Keyword() {
   std::string upper_value;
   std::transform(value.begin(), value.end(), std::back_inserter(upper_value),
                  ::toupper);
-  if (upper_value == "SELECT" || upper_value == "FROM" ||
-      upper_value == "WHERE" || upper_value == "CREATE" ||
-      upper_value == "DROP" || upper_value == "TABLE" ||
-      upper_value == "INSERT" || upper_value == "INTO" ||
-      upper_value == "VALUES" || upper_value == "UPDATE" ||
-      upper_value == "SET" || upper_value == "DELETE") {
+  static const std::vector<std::string> keywords = {
+      "SELECT",   "FROM",   "WHERE",   "CREATE", "DROP",   "TABLE",
+      "INSERT",   "INTO",   "VALUES",  "UPDATE", "SET",    "DELETE",
+      "AND",      "OR",     "NOT",     "IS",     "NULL",   "AS",
+      "DISTINCT", "ORDER",  "BY",      "ASC",    "DESC",   "LIMIT",
+      "OFFSET",   "JOIN",   "INNER",   "LEFT",   "RIGHT",  "ON",
+      "CASE",     "WHEN",   "THEN",    "ELSE",   "END",    "IN",
+      "GROUP",    "HAVING", "PRIMARY", "KEY",    "UNIQUE", "REFERENCES",
+      "DEFAULT",  "TRUE",   "FALSE"};
+  if (std::find(keywords.begin(), keywords.end(), upper_value) !=
+      keywords.end()) {
     return {TokenType::kKeyword, upper_value};
   }
   return {TokenType::kIdentifier, value};

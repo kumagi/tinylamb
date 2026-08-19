@@ -26,7 +26,10 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/full_scan.hpp"
 #include "executor/index_only_scan.hpp"
+#include "executor/projection.hpp"
+#include "executor/selection.hpp"
 #include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "index/index_schema.hpp"
@@ -60,6 +63,21 @@ Schema IndexOnlyScanPlan::OutputSchema() const {
 }
 
 Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& ctx) const {
+  if (ctx.txn_.RequiresHistoricalRead()) {
+    Executor executor = std::make_shared<FullScan>(ctx.txn_, table_);
+    executor = std::make_shared<Selection>(where_, table_.GetSchema(),
+                                           std::move(executor));
+    std::vector<NamedExpression> columns;
+    columns.reserve(index_.sc_.key_.size() + index_.sc_.include_.size());
+    for (slot_t offset : index_.sc_.key_) {
+      columns.emplace_back(table_.GetSchema().GetColumn(offset).Name());
+    }
+    for (slot_t offset : index_.sc_.include_) {
+      columns.emplace_back(table_.GetSchema().GetColumn(offset).Name());
+    }
+    return std::make_shared<Projection>(std::move(columns), table_.GetSchema(),
+                                        std::move(executor));
+  }
   return std::make_shared<IndexOnlyScan>(ctx.txn_, table_, index_, begin_, end_,
                                          ascending_, where_,
                                          table_.GetSchema());
@@ -71,7 +89,7 @@ size_t IndexOnlyScanPlan::EmitRowCount() const {
   if (index_.IsUnique() && begin_ == end_) {
     return 1;
   }
-  return std::ceil(stats_.EstimateCount(index_.sc_.key_[0], begin_, end_));
+  return stats_.Rows();
 }
 
 void IndexOnlyScanPlan::Dump(std::ostream& o, int /*indent*/) const {

@@ -39,6 +39,7 @@ class Parser {
   std::unique_ptr<Statement> ParseDelete();
 
   Expression ParseExpression();
+  Expression ParseWhereClause(std::vector<std::string>* from_clause);
 
   Token Peek();
   Token Advance();

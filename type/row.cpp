@@ -16,6 +16,7 @@
 
 #include "type/row.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -39,31 +40,88 @@ const Value& Row::operator[](size_t i) const { return values_[i]; }
 
 size_t Row::Serialize(char* dst) const {
   const char* const original_offset = dst;
-  dst += SerializeSlot(dst, values_.size());
-  for (const auto& v : values_) {
-    dst += v.Serialize(dst);
+  const bool has_null =
+      std::any_of(values_.begin(), values_.end(),
+                  [](const Value& value) { return value.IsNull(); });
+  constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
+  const slot_t count = static_cast<slot_t>(values_.size());
+  dst += SerializeSlot(dst, has_null ? count | kNullBitmapFlag : count);
+  if (has_null) {
+    const size_t bitmap_size = (values_.size() + 7) / 8;
+    memset(dst, 0, bitmap_size);
+    for (size_t i = 0; i < values_.size(); ++i) {
+      if (values_[i].IsNull()) dst[i / 8] |= static_cast<char>(1U << (i % 8));
+    }
+    dst += bitmap_size;
+  }
+  for (const Value& value : values_) {
+    if (!value.IsNull()) dst += value.Serialize(dst);
   }
   return dst - original_offset;
 }
 
 size_t Row::Deserialize(const char* src, const Schema& sc) {
   const char* const original_offset = src;
-  uint16_t count;
-  src += DeserializeSlot(src, &count);
+  constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
+  slot_t encoded_count;
+  src += DeserializeSlot(src, &encoded_count);
+  const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
+  const slot_t count = encoded_count & ~kNullBitmapFlag;
+  const char* bitmap = nullptr;
+  if (has_null) {
+    bitmap = src;
+    src += (count + 7) / 8;
+  }
   values_.clear();
   values_.reserve(count);
-  for (uint16_t i = 0; i < count; ++i) {
+  for (slot_t i = 0; i < count; ++i) {
+    const bool is_null =
+        has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
     Value v;
-    src += v.Deserialize(src, sc.GetColumn(i).Type());
+    if (!is_null) src += v.Deserialize(src, sc.GetColumn(i).Type());
     values_.push_back(v);
   }
   return src - original_offset;
 }
 
+size_t Row::DeserializeProjected(const char* src, const Schema& sc,
+                                 const std::vector<slot_t>& columns) {
+  const char* const original_offset = src;
+  constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
+  slot_t encoded_count;
+  src += DeserializeSlot(src, &encoded_count);
+  const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
+  const slot_t count = encoded_count & ~kNullBitmapFlag;
+  const char* bitmap = nullptr;
+  if (has_null) {
+    bitmap = src;
+    src += (count + 7) / 8;
+  }
+
+  values_.clear();
+  values_.reserve(columns.size());
+  size_t projection = 0;
+  for (slot_t i = 0; i < count; ++i) {
+    const bool is_null =
+        has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
+    Value value;
+    if (!is_null) src += value.Deserialize(src, sc.GetColumn(i).Type());
+    if (projection < columns.size() && columns[projection] == i) {
+      values_.push_back(std::move(value));
+      ++projection;
+    }
+  }
+  return src - original_offset;
+}
+
 size_t Row::Size() const {
+  const bool has_null =
+      std::any_of(values_.begin(), values_.end(),
+                  [](const Value& value) { return value.IsNull(); });
   size_t ret = sizeof(uint16_t);
+  if (has_null) ret += (values_.size() + 7) / 8;
   for (const auto& v : values_) {
-    ret += v.Size();
+    if (!v.IsNull()) ret += v.Size();
   }
   return ret;
 }

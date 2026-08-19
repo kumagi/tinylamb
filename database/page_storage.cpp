@@ -41,6 +41,8 @@ void PageStorage::DiscardAllUpdates() { pm_.GetPool()->DropAllPages(); }
 
 Transaction PageStorage::Begin() { return tm_.Begin(); }
 
+Transaction PageStorage::BeginReadOnly() { return tm_.Begin(true); }
+
 std::string PageStorage::DBName() const { return dbname_ + ".db"; }
 std::string PageStorage::LogName() const { return dbname_ + ".log"; }
 std::string PageStorage::MasterRecordName() const {
@@ -48,10 +50,9 @@ std::string PageStorage::MasterRecordName() const {
 }
 
 std::ostream& operator<<(std::ostream& o, const PageStorage& ps) {
-  o << "PageStorage(dbname=" << ps.dbname_
-    << ", lock_manager=" << ps.lm_ << ", logger=" << ps.logger_
-    << ", page_manager=" << ps.pm_ << ", recovery_manager=" << ps.rm_
-    << ", transaction_manager=" << ps.tm_
+  o << "PageStorage(dbname=" << ps.dbname_ << ", lock_manager=" << ps.lm_
+    << ", logger=" << ps.logger_ << ", page_manager=" << ps.pm_
+    << ", recovery_manager=" << ps.rm_ << ", transaction_manager=" << ps.tm_
     << ", checkpoint_manager=" << ps.cm_ << ")";
   return o;
 }

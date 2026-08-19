@@ -17,8 +17,10 @@
 #ifndef TINYLAMB_AST_HPP
 #define TINYLAMB_AST_HPP
 
+#include <memory>
 #include <ostream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "expression/expression.hpp"
@@ -26,6 +28,18 @@
 #include "type/column.hpp"
 
 namespace tinylamb {
+
+class SelectStatement;
+
+enum class JoinType { kCross, kInner, kLeft };
+
+struct SelectSource {
+  std::string table;
+  std::string alias;
+  std::shared_ptr<SelectStatement> query;
+  JoinType join_type{JoinType::kCross};
+  Expression join_condition;
+};
 
 enum class StatementType {
   kCreateTable,
@@ -110,18 +124,68 @@ class DropTableStatement : public Statement {
 
 class SelectStatement : public Statement {
  public:
+  struct OrderByTerm {
+    Expression expression;
+    bool ascending{true};
+  };
+
   SelectStatement(std::vector<NamedExpression> select_list,
-                  std::vector<std::string> from_clause, Expression where_clause)
+                  std::vector<std::string> from_clause, Expression where_clause,
+                  std::vector<OrderByTerm> order_by = {}, size_t limit = 0,
+                  size_t offset = 0, bool distinct = false)
       : Statement(StatementType::kSelect),
         select_list_(std::move(select_list)),
         from_clause_(std::move(from_clause)),
-        where_clause_(std::move(where_clause)) {}
+        where_clause_(std::move(where_clause)),
+        order_by_(std::move(order_by)),
+        limit_(limit),
+        offset_(offset),
+        distinct_(distinct) {
+    for (const std::string& table : from_clause_) {
+      sources_.push_back(
+          SelectSource{table, table, nullptr, JoinType::kCross, nullptr});
+    }
+  }
 
   const std::vector<NamedExpression>& SelectList() const {
     return select_list_;
   }
   const std::vector<std::string>& FromClause() const { return from_clause_; }
   const Expression& WhereClause() const { return where_clause_; }
+  const std::vector<OrderByTerm>& OrderBy() const { return order_by_; }
+  size_t Limit() const { return limit_; }
+  size_t Offset() const { return offset_; }
+  bool Distinct() const { return distinct_; }
+  const std::vector<SelectSource>& Sources() const { return sources_; }
+  const std::vector<Expression>& GroupBy() const { return group_by_; }
+  const Expression& Having() const { return having_; }
+  const std::unordered_map<std::string, std::shared_ptr<SelectStatement>>&
+  WithQueries() const {
+    return with_queries_;
+  }
+  bool RequiresRelationalEvaluation() const { return complex_; }
+  const std::unordered_map<std::string, std::string>& Aliases() const {
+    return aliases_;
+  }
+  void AddAlias(std::string alias, std::string table) {
+    aliases_.emplace(std::move(alias), std::move(table));
+  }
+  void SetSources(std::vector<SelectSource> sources) {
+    sources_ = std::move(sources);
+  }
+  void SetGroupBy(std::vector<Expression> group_by) {
+    group_by_ = std::move(group_by);
+    complex_ = true;
+  }
+  void SetHaving(Expression having) {
+    having_ = std::move(having);
+    complex_ = true;
+  }
+  void AddWithQuery(std::string name, std::shared_ptr<SelectStatement> query) {
+    with_queries_.emplace(std::move(name), std::move(query));
+    complex_ = true;
+  }
+  void MarkComplex() { complex_ = true; }
   void Dump(std::ostream& o) const override {
     o << "select=[";
     for (size_t i = 0; i < select_list_.size(); i++) {
@@ -149,18 +213,32 @@ class SelectStatement : public Statement {
   std::vector<NamedExpression> select_list_;
   std::vector<std::string> from_clause_;
   Expression where_clause_;
+  std::vector<OrderByTerm> order_by_;
+  size_t limit_{0};
+  size_t offset_{0};
+  bool distinct_{false};
+  std::unordered_map<std::string, std::string> aliases_;
+  std::vector<SelectSource> sources_;
+  std::vector<Expression> group_by_;
+  Expression having_;
+  std::unordered_map<std::string, std::shared_ptr<SelectStatement>>
+      with_queries_;
+  bool complex_{false};
 };
 
 class InsertStatement : public Statement {
  public:
   InsertStatement(std::string table_name,
-                  std::vector<std::vector<Expression>> values)
+                  std::vector<std::vector<Expression>> values,
+                  std::vector<std::string> columns = {})
       : Statement(StatementType::kInsert),
         table_name_(std::move(table_name)),
-        values_(std::move(values)) {}
+        values_(std::move(values)),
+        columns_(std::move(columns)) {}
 
   const std::string& TableName() const { return table_name_; }
   const std::vector<std::vector<Expression>>& Values() const { return values_; }
+  const std::vector<std::string>& Columns() const { return columns_; }
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " values=[";
     for (size_t i = 0; i < values_.size(); i++) {
@@ -182,6 +260,7 @@ class InsertStatement : public Statement {
  private:
   std::string table_name_;
   std::vector<std::vector<Expression>> values_;
+  std::vector<std::string> columns_;
 };
 
 class UpdateStatement : public Statement {

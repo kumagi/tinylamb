@@ -40,6 +40,15 @@ bool tinylamb::FullScan::Next(Row* dst, RowPosition* rp) {
   return true;
 }
 
+size_t FullScan::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset(table_->GetSchema(), max_rows);
+  while (iter_.IsValid() && destination->Size() < max_rows) {
+    destination->Append(*iter_, iter_.Position());
+    ++iter_;
+  }
+  return destination->Size();
+}
+
 void FullScan::Dump(std::ostream& o, int /*indent*/) const {
   o << "FullScan: " << table_->GetSchema().Name();
 }

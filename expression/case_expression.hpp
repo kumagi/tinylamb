@@ -34,6 +34,12 @@ class CaseExpression : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kCaseExp; }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
+  [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,
+                               const Row* right,
+                               const Schema& right_schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
+                                          const Schema& right) const override;
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;

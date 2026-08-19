@@ -36,12 +36,35 @@ Value AggregateExpression::Evaluate(const Row&, const Schema&) const {
   return {};
 }
 
+Type AggregateExpression::ResultType(const Schema& schema) const {
+  if (type_ == AggregationType::kCount) {
+    return tinylamb::Type(TypeTag::kBigInt);
+  }
+  if (type_ == AggregationType::kAvg) {
+    return tinylamb::Type(TypeTag::kDouble);
+  }
+  return child_->ResultType(schema);
+}
+
+Type AggregateExpression::ResultType(const Schema& left,
+                                     const Schema& right) const {
+  if (type_ == AggregationType::kCount) {
+    return tinylamb::Type(TypeTag::kBigInt);
+  }
+  if (type_ == AggregationType::kAvg) {
+    return tinylamb::Type(TypeTag::kDouble);
+  }
+  return child_->ResultType(left, right);
+}
+
 std::string AggregateExpression::ToString() const {
-  return ::tinylamb::ToString(type_) + "(" + child_->ToString() + ")";
+  return ::tinylamb::ToString(type_) + "(" + (distinct_ ? "DISTINCT " : "") +
+         child_->ToString() + ")";
 }
 
 void AggregateExpression::Dump(std::ostream& o) const {
-  o << ::tinylamb::ToString(type_) << "(" << *child_ << ")";
+  o << ::tinylamb::ToString(type_) << "(" << (distinct_ ? "DISTINCT " : "")
+    << *child_ << ")";
 }
 
 }  // namespace tinylamb

@@ -35,6 +35,12 @@ class ColumnValue : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kColumnValue; }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
+  [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,
+                               const Row* right,
+                               const Schema& right_schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
+                                          const Schema& right) const override;
   void Dump(std::ostream& o) const override;
   [[nodiscard]] const ColumnName& GetColumnName() const { return col_name_; }
   void SetSchemaName(std::string_view s) { col_name_.schema = s; }

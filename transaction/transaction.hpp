@@ -17,6 +17,11 @@
 #ifndef TINYLAMB_TRANSACTION_HPP
 #define TINYLAMB_TRANSACTION_HPP
 
+#include <optional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -48,17 +53,20 @@ std::ostream& operator<<(std::ostream& o, const TransactionStatus& t);
 class Transaction final {
  public:
   Transaction() = default;  // For test purpose only.
-  Transaction(txn_id_t txn_id, TransactionManager* tm);
+  Transaction(txn_id_t txn_id, TransactionManager* tm, bool read_only = false);
   Transaction(const Transaction& o) = delete;
   Transaction(Transaction&& o) = default;
   Transaction& operator=(const Transaction& o) = delete;
   Transaction& operator=(Transaction&& o) noexcept {
     txn_id_ = o.txn_id_;
+    snapshot_ts_ = o.snapshot_ts_;
     read_set_ = std::move(o.read_set_);
     write_set_ = std::move(o.write_set_);
+    version_read_cache_ = std::move(o.version_read_cache_);
     prev_lsn_ = o.prev_lsn_;
     status_ = o.status_;
     transaction_manager_ = o.transaction_manager_;
+    read_only_ = o.read_only_;
     return *this;
   }
   ~Transaction() = default;
@@ -72,6 +80,16 @@ class Transaction final {
 
   bool AddReadSet(const RowPosition& rp);
   bool AddWriteSet(const RowPosition& rp);
+  StatusOr<std::string_view> ReadVersion(
+      const RowPosition& rp, std::optional<std::string_view> physical);
+  void RegisterVersionWrite(const RowPosition& rp,
+                            std::optional<std::string_view> before,
+                            std::optional<std::string_view> after);
+
+  [[nodiscard]] txn_id_t ID() const { return txn_id_; }
+  [[nodiscard]] uint64_t SnapshotTimestamp() const { return snapshot_ts_; }
+  [[nodiscard]] bool RequiresHistoricalRead() const;
+  [[nodiscard]] bool IsReadOnly() const { return read_only_; }
 
   Status PreCommit();
   void Abort();
@@ -114,8 +132,7 @@ class Transaction final {
   }
   friend std::ostream& operator<<(std::ostream& o, const Transaction& t) {
     o << "Transaction(id=" << t.txn_id_ << ", status=" << t.status_
-      << ", prev_lsn=" << t.prev_lsn_
-      << ", read_set=" << t.read_set_.size()
+      << ", prev_lsn=" << t.prev_lsn_ << ", read_set=" << t.read_set_.size()
       << ", write_set=" << t.write_set_.size() << ")";
     return o;
   }
@@ -128,11 +145,19 @@ class Transaction final {
   friend class CheckpointManager;
 
   txn_id_t txn_id_{static_cast<txn_id_t>(-1)};
+  uint64_t snapshot_ts_{0};
 
   std::unordered_set<RowPosition> read_set_{};
   std::unordered_set<RowPosition> write_set_{};
+  std::unordered_map<RowPosition, std::string> version_read_cache_{};
+  // A read-only query may hand page morsels to multiple scan workers.  The
+  // version cache and read set are transaction-local, so guard them while
+  // preserving a single MVCC snapshot across those workers.
+  std::unique_ptr<std::mutex> read_state_mutex_{
+      std::make_unique<std::mutex>()};
   lsn_t prev_lsn_{};
   TransactionStatus status_ = TransactionStatus::kUnknown;
+  bool read_only_{false};
 
   // Not owned by this class.
   TransactionManager* transaction_manager_{nullptr};

@@ -15,6 +15,7 @@
  */
 
 #include <cstddef>
+#include <future>
 #include <random>
 #include <string>
 #include <thread>
@@ -60,7 +61,8 @@ TEST_F(RowPageConcurrentTest, InsertInsert) {
     thread.join();
   }
 
-  // Assert -- implicit; all threads completed without deadlock; gtest green on pass
+  // Assert -- implicit; all threads completed without deadlock; gtest green on
+  // pass
 }
 
 TEST_F(RowPageConcurrentTest, InsertUpdate) {
@@ -83,7 +85,8 @@ TEST_F(RowPageConcurrentTest, InsertUpdate) {
     threads.emplace_back([&, i]() {
       std::mt19937 rand(i);
       for (int j = 0; j < kRows; ++j) {
-        // Act (updater) -- update a random existing row with a new random string
+        // Act (updater) -- update a random existing row with a new random
+        // string
         UpdateRow(rand() % kRows, RandomString());
       }
     });
@@ -94,11 +97,13 @@ TEST_F(RowPageConcurrentTest, InsertUpdate) {
     thread.join();
   }
 
-  // Assert -- implicit; all threads completed without deadlock; gtest green on pass
+  // Assert -- implicit; all threads completed without deadlock; gtest green on
+  // pass
 }
 
 TEST_F(RowPageConcurrentTest, UpdateUpdate) {
-  // Arrange -- fill the page with random-string rows until full, then spawn 8 updaters
+  // Arrange -- fill the page with random-string rows until full, then spawn 8
+  // updaters
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
 
@@ -121,6 +126,114 @@ TEST_F(RowPageConcurrentTest, UpdateUpdate) {
     thread.join();
   }
 
-  // Assert -- implicit; all threads completed without deadlock; gtest green on pass
+  // Assert -- implicit; all threads completed without deadlock; gtest green on
+  // pass
+}
+
+TEST_F(RowPageConcurrentTest, ReaderUsesSnapshotWhileWriterIsUncommitted) {
+  ASSERT_TRUE(InsertRow("committed"));
+
+  Transaction writer = tm_->Begin();
+  PageRef writer_page = p_->GetPage(page_id_);
+  ASSERT_SUCCESS(writer_page->Update(writer, 0, "uncommitted"));
+  writer_page.PageUnlock();
+
+  auto reader = std::async(std::launch::async, [this]() {
+    Transaction txn = tm_->Begin();
+    PageRef page = p_->GetPage(page_id_);
+    StatusOr<std::string_view> value = page->Read(txn, 0);
+    std::string result = value.HasValue() ? std::string(value.Value()) : "";
+    page.PageUnlock();
+    EXPECT_SUCCESS(txn.PreCommit());
+    return std::pair(value.GetStatus(), result);
+  });
+
+  ASSERT_EQ(reader.wait_for(std::chrono::milliseconds(500)),
+            std::future_status::ready);
+  const auto [status, value] = reader.get();
+  EXPECT_EQ(status, Status::kSuccess);
+  EXPECT_EQ(value, "committed");
+
+  EXPECT_SUCCESS(writer.PreCommit());
+  EXPECT_EQ(ReadRow(0), "uncommitted");
+}
+
+TEST_F(RowPageConcurrentTest, SnapshotRemainsStableAfterWriterCommits) {
+  ASSERT_TRUE(InsertRow("version-1"));
+  Transaction reader = tm_->Begin();
+
+  Transaction writer = tm_->Begin();
+  PageRef page = p_->GetPage(page_id_);
+  ASSERT_SUCCESS(page->Update(writer, 0, "version-2"));
+  page.PageUnlock();
+  ASSERT_SUCCESS(writer.PreCommit());
+
+  PageRef reader_page = p_->GetPage(page_id_);
+  ASSERT_SUCCESS_AND_EQ(reader_page->Read(reader, 0), "version-1");
+  reader_page.PageUnlock();
+  ASSERT_SUCCESS(reader.PreCommit());
+  EXPECT_EQ(ReadRow(0), "version-2");
+}
+
+TEST_F(RowPageConcurrentTest, DeleteAndInsertRespectSnapshotVisibility) {
+  ASSERT_TRUE(InsertRow("existing"));
+  Transaction old_reader = tm_->Begin();
+
+  Transaction deleter = tm_->Begin();
+  PageRef page = p_->GetPage(page_id_);
+  ASSERT_SUCCESS(page->Delete(deleter, 0));
+  page.PageUnlock();
+  ASSERT_SUCCESS(deleter.PreCommit());
+
+  PageRef old_page = p_->GetPage(page_id_);
+  ASSERT_SUCCESS_AND_EQ(old_page->Read(old_reader, 0), "existing");
+  old_page.PageUnlock();
+
+  Transaction inserter = tm_->Begin();
+  PageRef insert_page = p_->GetPage(page_id_);
+  ASSIGN_OR_ASSERT_FAIL(slot_t, reused,
+                        insert_page->Insert(inserter, "replacement"));
+  ASSERT_EQ(reused, 0);
+  insert_page.PageUnlock();
+
+  PageRef still_old_page = p_->GetPage(page_id_);
+  ASSERT_SUCCESS_AND_EQ(still_old_page->Read(old_reader, 0), "existing");
+  still_old_page.PageUnlock();
+  ASSERT_SUCCESS(inserter.PreCommit());
+  ASSERT_SUCCESS(old_reader.PreCommit());
+  EXPECT_EQ(ReadRow(0), "replacement");
+}
+
+TEST_F(RowPageConcurrentTest, AbortedVersionNeverBecomesVisible) {
+  ASSERT_TRUE(InsertRow("durable"));
+  Transaction writer = tm_->Begin();
+  PageRef page = p_->GetPage(page_id_);
+  ASSERT_SUCCESS(page->Update(writer, 0, "discarded"));
+  page.PageUnlock();
+
+  Transaction reader = tm_->Begin();
+  PageRef reader_page = p_->GetPage(page_id_);
+  ASSERT_SUCCESS_AND_EQ(reader_page->Read(reader, 0), "durable");
+  reader_page.PageUnlock();
+  ASSERT_SUCCESS(reader.PreCommit());
+
+  writer.Abort();
+  EXPECT_EQ(ReadRow(0), "durable");
+}
+
+TEST_F(RowPageConcurrentTest, WritersStillConflictUnderMV2PL) {
+  ASSERT_TRUE(InsertRow("base"));
+  Transaction first = tm_->Begin();
+  PageRef page = p_->GetPage(page_id_);
+  ASSERT_SUCCESS(page->Update(first, 0, "first"));
+  page.PageUnlock();
+
+  Transaction second = tm_->Begin();
+  PageRef second_page = p_->GetPage(page_id_);
+  EXPECT_EQ(second_page->Update(second, 0, "second"), Status::kConflicts);
+  second_page.PageUnlock();
+  ASSERT_SUCCESS(second.PreCommit());
+  ASSERT_SUCCESS(first.PreCommit());
+  EXPECT_EQ(ReadRow(0), "first");
 }
 }  // namespace tinylamb

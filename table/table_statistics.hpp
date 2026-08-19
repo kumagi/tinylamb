@@ -17,230 +17,103 @@
 #ifndef TINYLAMB_TABLE_STATISTICS_HPP
 #define TINYLAMB_TABLE_STATISTICS_HPP
 
-#include <cmath>
-#include <array>
-#include <algorithm>
-#include <cstring>
-#include <limits>
+#include <cstddef>
+#include <iosfwd>
+#include <optional>
 #include <vector>
 
 #include "expression/expression.hpp"
 #include "type/schema.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 class Table;
 class Transaction;
 class Encoder;
-class ExpressionBase;
+class Decoder;
+class TableStatistics;
 
-struct IntegerColumnStats {
-  int64_t max;
-  int64_t min;
-  size_t count;
-  size_t distinct;
-  void Init() {
-    max = std::numeric_limits<int64_t>::lowest();
-    min = std::numeric_limits<int64_t>::max();
-    count = 0;
-    distinct = 0;
-  }
-  void Check(const Value& sample) {
-    max = std::max(max, sample.value.int_value);
-    min = std::min(min, sample.value.int_value);
-    ++count;
-  }
-  IntegerColumnStats& operator*=(double multiplier) {
-    count = static_cast<size_t>(std::floor(count * multiplier));
-    distinct = static_cast<size_t>(std::floor(distinct * multiplier));
-    return *this;
-  }
-  bool operator==(const IntegerColumnStats&) const = default;
-  [[nodiscard]] double EstimateCount(int64_t from, int64_t to) const;
-  friend Encoder& operator<<(Encoder& a, const IntegerColumnStats& sc);
-  friend Decoder& operator>>(Decoder& a, IntegerColumnStats& sc);
-  friend std::ostream& operator<<(std::ostream& o, const IntegerColumnStats& t);
+inline constexpr size_t kHistogramBucketCount = 16;
+inline constexpr size_t kBoundaryValueCount = 5;
+inline constexpr size_t kMostCommonValueCount = 5;
+
+struct ValueFrequency {
+  Value value;
+  size_t count{0};
+
+  bool operator==(const ValueFrequency&) const = default;
+  friend Encoder& operator<<(Encoder& encoder, const ValueFrequency& value);
+  friend Decoder& operator>>(Decoder& decoder, ValueFrequency& value);
 };
 
-struct VarcharColumnStats {
-  char max[8];
-  char min[8];
-  size_t count;
-  size_t distinct;
-  void Check(const Value& sample) {
-    std::array<char, 8> cmp{};
-    size_t len = std::min(cmp.size(), sample.value.varchar_value.length());
-    memcpy(cmp.data(), sample.value.varchar_value.data(), len);
-    if (memcmp(max, cmp.data(), len) < 0) {
-      memcpy(max, cmp.data(), len);
-    }
-    if (memcmp(min, cmp.data(), len) > 0) {
-      memcpy(min, cmp.data(), len);
-    }
-    ++count;
-  }
-  VarcharColumnStats& operator*=(double multiplier) {
-    count = static_cast<size_t>(std::floor(count * multiplier));
-    distinct = static_cast<size_t>(std::floor(distinct * multiplier));
-    return *this;
-  }
-  bool operator==(const VarcharColumnStats&) const = default;
-  [[nodiscard]] double EstimateCount(std::string_view from,
-                                     std::string_view to) const;
-  friend Encoder& operator<<(Encoder& a, const VarcharColumnStats& sc);
-  friend Decoder& operator>>(Decoder& a, VarcharColumnStats& sc);
-  friend std::ostream& operator<<(std::ostream& o, const VarcharColumnStats& t);
+// Equi-depth histogram bucket. Values are inclusive at both boundaries.
+struct HistogramBucket {
+  Value lower;
+  Value upper;
+  size_t count{0};
+  size_t distinct{0};
+
+  bool operator==(const HistogramBucket&) const = default;
+  friend Encoder& operator<<(Encoder& encoder, const HistogramBucket& bucket);
+  friend Decoder& operator>>(Decoder& decoder, HistogramBucket& bucket);
 };
 
-struct DoubleColumnStats {
-  double max;
-  double min;
-  size_t count;
-  size_t distinct;
-  void Check(const Value& sample) {
-    max = std::max(max, sample.value.double_value);
-    min = std::min(min, sample.value.double_value);
-    ++count;
-  }
-  DoubleColumnStats& operator*=(double multiplier) {
-    count = static_cast<size_t>(std::floor(count * multiplier));
-    distinct = static_cast<size_t>(std::floor(distinct * multiplier));
-    return *this;
-  }
-  bool operator==(const DoubleColumnStats&) const = default;
-  [[nodiscard]] double EstimateCount(double from, double to) const;
-  friend Encoder& operator<<(Encoder& a, const DoubleColumnStats& sc);
-  friend Decoder& operator>>(Decoder& a, DoubleColumnStats& sc);
-  friend std::ostream& operator<<(std::ostream& o, const DoubleColumnStats& t);
-};
+class ColumnStats {
+ public:
+  ColumnStats() = default;
+  explicit ColumnStats(ValueType type) : type_(type) {}
 
-struct ColumnStats {
-  ColumnStats() : type(ValueType::kNull) {}
-  ColumnStats(const ColumnStats&) = default;
-  ColumnStats(ColumnStats&&) = default;
-  ColumnStats& operator=(const ColumnStats&) = default;
-  ColumnStats& operator=(ColumnStats&&) = default;
-  ~ColumnStats() = default;
-  bool operator==(const ColumnStats& o) const {
-    if (type != o.type) {
-      return false;
-    }
-    switch (type) {
-      case ValueType::kNull:
-        return true;
-      case ValueType::kInt64:
-        return stat.int_stats == o.stat.int_stats;
-      case ValueType::kVarChar:
-        return stat.varchar_stats == o.stat.varchar_stats;
-      case ValueType::kDouble:
-        return stat.double_stats == o.stat.double_stats;
-    }
+  [[nodiscard]] ValueType Type() const { return type_; }
+  [[nodiscard]] size_t Count() const { return non_null_count_; }
+  [[nodiscard]] size_t NonNullCount() const { return non_null_count_; }
+  [[nodiscard]] size_t NullCount() const { return null_count_; }
+  [[nodiscard]] size_t Distinct() const { return distinct_count_; }
+  [[nodiscard]] const std::vector<HistogramBucket>& Histogram() const {
+    return histogram_;
+  }
+  [[nodiscard]] const std::vector<ValueFrequency>& LowestValues() const {
+    return lowest_values_;
+  }
+  [[nodiscard]] const std::vector<ValueFrequency>& HighestValues() const {
+    return highest_values_;
+  }
+  [[nodiscard]] const std::vector<ValueFrequency>& MostCommonValues() const {
+    return most_common_values_;
   }
 
-  explicit ColumnStats(ValueType t) : type(t) {}
-  union {
-    IntegerColumnStats int_stats;
-    VarcharColumnStats varchar_stats;
-    DoubleColumnStats double_stats;
-  } stat{};
+  [[nodiscard]] double EstimateEqual(const Value& value) const;
+  [[nodiscard]] double EstimateRange(const std::optional<Value>& lower,
+                                     bool lower_inclusive,
+                                     const std::optional<Value>& upper,
+                                     bool upper_inclusive) const;
 
-  [[nodiscard]] size_t Count() const {
-    switch (type) {
-      case ValueType::kNull:
-        assert(!"never reach here");
-      case ValueType::kInt64:
-        return stat.int_stats.count;
-      case ValueType::kVarChar:
-        return stat.varchar_stats.count;
-      case ValueType::kDouble:
-        return stat.double_stats.count;
-    }
-    abort();
-    return 0;
-  }
-  [[nodiscard]] size_t Distinct() const {
-    switch (type) {
-      case ValueType::kNull:
-        assert(!"never reach here");
-      case ValueType::kInt64:
-        return stat.int_stats.distinct;
-      case ValueType::kVarChar:
-        return stat.varchar_stats.distinct;
-      case ValueType::kDouble:
-        return stat.double_stats.distinct;
-    }
-    abort();
-    return 0;
-  }
-  [[nodiscard]] double EstimateCount(int64_t from, int64_t to) const {
-    switch (type) {
-      case ValueType::kNull:
-        assert(!"never reach here");
-      case ValueType::kInt64:
-        return stat.int_stats.EstimateCount(from, to);
-      case ValueType::kVarChar:
-        assert(!"never reach here");
-      case ValueType::kDouble:
-        assert(!"never reach here");
-    }
-    abort();
-    return 0.0;
-  }
-  [[nodiscard]] double EstimateCount(double from, double to) const {
-    switch (type) {
-      case ValueType::kNull:
-        assert(!"never reach here");
-      case ValueType::kInt64:
-        assert(!"never reach here");
-      case ValueType::kVarChar:
-        assert(!"never reach here");
-      case ValueType::kDouble:
-        return stat.double_stats.EstimateCount(from, to);
-    }
-    abort();
-    return 0.0;
-  }
-  [[nodiscard]] double EstimateCount(std::string_view from,
-                                     std::string_view to) const {
-    switch (type) {
-      case ValueType::kNull:
-        assert(!"never reach here");
-      case ValueType::kInt64:
-        assert(!"never reach here");
-      case ValueType::kVarChar:
-        return stat.varchar_stats.EstimateCount(from, to);
-      case ValueType::kDouble:
-        assert(!"never reach here");
-    }
-    abort();
-    return 0.0;
-  }
+  ColumnStats& operator*=(double multiplier);
+  bool operator==(const ColumnStats&) const = default;
 
-  ColumnStats& operator*=(double multiplier) {
-    switch (type) {
-      case ValueType::kNull:
-        break;
-      case ValueType::kInt64:
-        stat.int_stats *= multiplier;
-        break;
-      case ValueType::kVarChar:
-        stat.varchar_stats *= multiplier;
-        break;
-      case ValueType::kDouble:
-        stat.double_stats *= multiplier;
-        break;
-    }
-    return *this;
-  }
+  friend Encoder& operator<<(Encoder& encoder, const ColumnStats& stats);
+  friend Decoder& operator>>(Decoder& decoder, ColumnStats& stats);
+  friend Decoder& operator>>(Decoder& decoder, TableStatistics& stats);
+  friend std::ostream& operator<<(std::ostream& out, const ColumnStats& stats);
 
-  friend Encoder& operator<<(Encoder& a, const ColumnStats& sc);
-  friend Decoder& operator>>(Decoder& a, ColumnStats& sc);
-  friend std::ostream& operator<<(std::ostream& o, const ColumnStats& t);
-  ValueType type;
+ private:
+  friend class TableStatistics;
+
+  [[nodiscard]] double EstimateLessThan(const Value& value) const;
+  void Duplicate(size_t multiplier);
+
+  ValueType type_{ValueType::kNull};
+  size_t non_null_count_{0};
+  size_t null_count_{0};
+  size_t distinct_count_{0};
+  std::vector<HistogramBucket> histogram_;
+  std::vector<ValueFrequency> lowest_values_;
+  std::vector<ValueFrequency> highest_values_;
+  std::vector<ValueFrequency> most_common_values_;
 };
 
 class TableStatistics {
  public:
-  explicit TableStatistics(const Schema& sc);
+  explicit TableStatistics(const Schema& schema);
   TableStatistics(const TableStatistics&) = default;
   TableStatistics(TableStatistics&&) = default;
   TableStatistics& operator=(const TableStatistics&) = default;
@@ -249,68 +122,38 @@ class TableStatistics {
   ~TableStatistics() = default;
 
   Status Update(Transaction& txn, const Table& target);
-  [[nodiscard]] double ReductionFactor(const Schema& sc,
+
+  // Inverse selectivity kept for the existing Plan API. A return value of 10
+  // means that approximately one tenth of the input rows survive.
+  [[nodiscard]] double ReductionFactor(const Schema& schema,
                                        const Expression& predicate) const;
+  [[nodiscard]] double EstimateSelectivity(const Schema& schema,
+                                           const Expression& predicate) const;
 
-  friend Encoder& operator<<(Encoder& e, const TableStatistics& t);
-  friend Decoder& operator>>(Decoder& d, TableStatistics& t);
-  friend std::ostream& operator<<(std::ostream& o, const TableStatistics& t);
-
-  [[nodiscard]] size_t Rows() const {
-    size_t ans = 0;
-    for (const auto& st : stats_) {
-      ans = std::max(ans, st.Count());
-    }
-    return ans;
-  }
-
+  [[nodiscard]] size_t Rows() const { return row_count_; }
   [[nodiscard]] size_t Columns() const { return stats_.size(); }
-  [[nodiscard]] double EstimateCount(int col_idx, const Value& from,
-                                     const Value& to) const {
-    assert(from.type == to.type);
-    switch (from.type) {
-      case ValueType::kNull:
-        LOG(FATAL) << "null value estimation is not implemented yet";
-        break;
-      case ValueType::kInt64:
-        return stats_[col_idx].EstimateCount(from.value.int_value,
-                                             to.value.int_value);
-      case ValueType::kVarChar:
-        return stats_[col_idx].EstimateCount(from.value.varchar_value,
-                                             to.value.varchar_value);
-      case ValueType::kDouble:
-        return stats_[col_idx].EstimateCount(from.value.double_value,
-                                             to.value.double_value);
-    }
-    abort();
+  [[nodiscard]] const ColumnStats& Column(size_t index) const {
+    return stats_.at(index);
   }
 
-  [[nodiscard]] TableStatistics TransformBy(int col_idx, const Value& from,
-                                            const Value& to) const {
-    TableStatistics ret(*this);
-    double multiplier = EstimateCount(col_idx, from, to);
-    for (auto& st : ret.stats_) {
-      st *= multiplier / st.Count();
-    }
-    return ret;
-  }
+  [[nodiscard]] double EstimateCount(int column_index, const Value& from,
+                                     const Value& to) const;
+  [[nodiscard]] TableStatistics TransformBy(int column_index, const Value& from,
+                                            const Value& to) const;
+  [[nodiscard]] TableStatistics Filter(const Schema& schema,
+                                       const Expression& predicate) const;
+  [[nodiscard]] TableStatistics ScaleToRows(size_t rows) const;
 
-  void Concat(const TableStatistics& rhs) {
-    stats_.reserve(stats_.size() + rhs.stats_.size());
-    for (const auto& s : rhs.stats_) {
-      stats_.emplace_back(s);
-    }
-  }
+  void Concat(const TableStatistics& rhs);
+  TableStatistics operator*(size_t multiplier) const;
 
-  TableStatistics operator*(size_t multiplier) const {
-    TableStatistics ans(*this);
-    for (auto& st : ans.stats_) {
-      st *= multiplier;
-    }
-    return ans;
-  }
+  friend Encoder& operator<<(Encoder& encoder, const TableStatistics& stats);
+  friend Decoder& operator>>(Decoder& decoder, TableStatistics& stats);
+  friend std::ostream& operator<<(std::ostream& out,
+                                  const TableStatistics& stats);
 
  private:
+  size_t row_count_{0};
   std::vector<ColumnStats> stats_;
 };
 

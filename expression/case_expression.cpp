@@ -50,6 +50,37 @@ Value CaseExpression::Evaluate(const Row& row, const Schema& schema) const {
   return {};
 }
 
+Value CaseExpression::Evaluate(const Row* left, const Schema& left_schema,
+                               const Row* right,
+                               const Schema& right_schema) const {
+  for (const auto& when : when_clauses_) {
+    Value condition =
+        when.first->Evaluate(left, left_schema, right, right_schema);
+    if (!condition.IsNull() && condition.Truthy()) {
+      return when.second->Evaluate(left, left_schema, right, right_schema);
+    }
+  }
+  return else_clause_
+             ? else_clause_->Evaluate(left, left_schema, right, right_schema)
+             : Value();
+}
+
+Type CaseExpression::ResultType(const Schema& schema) const {
+  if (!when_clauses_.empty()) {
+    return when_clauses_.front().second->ResultType(schema);
+  }
+  return else_clause_ ? else_clause_->ResultType(schema)
+                      : tinylamb::Type(TypeTag::kInvalid);
+}
+
+Type CaseExpression::ResultType(const Schema& left, const Schema& right) const {
+  if (!when_clauses_.empty()) {
+    return when_clauses_.front().second->ResultType(left, right);
+  }
+  return else_clause_ ? else_clause_->ResultType(left, right)
+                      : tinylamb::Type(TypeTag::kInvalid);
+}
+
 std::string CaseExpression::ToString() const {
   std::string result = "CASE";
   for (const auto& when : when_clauses_) {

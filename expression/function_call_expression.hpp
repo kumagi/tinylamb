@@ -17,6 +17,8 @@
 #ifndef TINYLAMB_FUNCTION_CALL_EXPRESSION_HPP
 #define TINYLAMB_FUNCTION_CALL_EXPRESSION_HPP
 
+#include <algorithm>
+#include <cctype>
 #include <memory>
 #include <string>
 #include <utility>
@@ -29,7 +31,11 @@ namespace tinylamb {
 class FunctionCallExpression : public ExpressionBase {
  public:
   FunctionCallExpression(std::string func_name, std::vector<Expression> args)
-      : func_name_(std::move(func_name)), args_(std::move(args)) {}
+      : func_name_(std::move(func_name)), args_(std::move(args)) {
+    std::transform(
+        func_name_.begin(), func_name_.end(), func_name_.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  }
 
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;

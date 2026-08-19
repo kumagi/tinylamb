@@ -24,6 +24,8 @@
 
 namespace tinylamb {
 
+[[nodiscard]] Value EvaluateUnary(UnaryOperation operation, Value child);
+
 class UnaryExpression : public ExpressionBase {
  public:
   UnaryExpression(Expression child, UnaryOperation op)
@@ -31,6 +33,12 @@ class UnaryExpression : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kUnaryExp; }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
+  [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,
+                               const Row* right,
+                               const Schema& right_schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
+                                          const Schema& right) const override;
   [[nodiscard]] Expression Child() const { return child_; }
   [[nodiscard]] UnaryOperation Op() const { return operation_; }
   [[nodiscard]] std::string ToString() const override;

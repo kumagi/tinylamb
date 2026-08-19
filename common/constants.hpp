@@ -97,6 +97,8 @@ enum class BinaryOperation {
   kLessThanEquals,
   kGreaterThan,
   kGreaterThanEquals,
+  kLike,
+  kNotLike,
 
   // Boolean logics.
   kAnd,
@@ -128,6 +130,10 @@ inline std::string_view ToString(BinaryOperation op) {
       return ">";
     case BinaryOperation::kGreaterThanEquals:
       return ">=";
+    case BinaryOperation::kLike:
+      return "LIKE";
+    case BinaryOperation::kNotLike:
+      return "NOT LIKE";
     case BinaryOperation::kAnd:
       return "AND";
     case BinaryOperation::kOr:

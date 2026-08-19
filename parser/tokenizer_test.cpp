@@ -73,7 +73,8 @@ TEST(TokenizerTest, Create) {
   // Act -- tokenize
   std::vector<Token> tokens = tokenizer.Tokenize();
 
-  // Assert -- 18 tokens: CREATE, TABLE, users, (, id, INT, ,, name, VARCHAR, (, 20, ), ,, score, DOUBLE, ), ;, EOF
+  // Assert -- 18 tokens: CREATE, TABLE, users, (, id, INT, ,, name, VARCHAR, (,
+  // 20, ), ,, score, DOUBLE, ), ;, EOF
   ASSERT_EQ(tokens.size(), 18);
   ASSERT_EQ(tokens[0].type, TokenType::kKeyword);
   ASSERT_EQ(tokens[0].value, "CREATE");
@@ -113,7 +114,8 @@ TEST(TokenizerTest, Insert) {
   // Act -- tokenize
   std::vector<Token> tokens = tokenizer.Tokenize();
 
-  // Assert -- 13 tokens: INSERT, INTO, users, VALUES, (, 1, ,, foo, ,, 1.2, ), ;, EOF
+  // Assert -- 13 tokens: INSERT, INTO, users, VALUES, (, 1, ,, foo, ,, 1.2, ),
+  // ;, EOF
   ASSERT_EQ(tokens.size(), 13);
   ASSERT_EQ(tokens[0].type, TokenType::kKeyword);
   ASSERT_EQ(tokens[0].value, "INSERT");
@@ -136,6 +138,29 @@ TEST(TokenizerTest, Insert) {
   ASSERT_EQ(tokens[11].type, TokenType::kSemicolon);
   ASSERT_EQ(tokens[11].value, ";");
   ASSERT_EQ(tokens[12].type, TokenType::kEof);
+}
+
+TEST(TokenizerTest, GoogleSqlQuotedIdentifier) {
+  Tokenizer tokenizer("SELECT `CURRENT_TIMESTAMP`(), `customer`.`c_id`;");
+
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  ASSERT_EQ(tokens[1].type, TokenType::kIdentifier);
+  EXPECT_EQ(tokens[1].value, "CURRENT_TIMESTAMP");
+  ASSERT_EQ(tokens[5].type, TokenType::kIdentifier);
+  EXPECT_EQ(tokens[5].value, "customer");
+  ASSERT_EQ(tokens[7].type, TokenType::kIdentifier);
+  EXPECT_EQ(tokens[7].value, "c_id");
+}
+
+TEST(TokenizerTest, UnknownCharacterStillAdvances) {
+  Tokenizer tokenizer("?");
+
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  ASSERT_EQ(tokens.size(), 2);
+  EXPECT_EQ(tokens[0].type, TokenType::kUnknown);
+  EXPECT_EQ(tokens[1].type, TokenType::kEof);
 }
 
 }  // namespace tinylamb

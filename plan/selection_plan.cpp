@@ -39,10 +39,7 @@ const Schema& SelectionPlan::GetSchema() const { return src_->GetSchema(); }
 
 size_t SelectionPlan::AccessRowCount() const { return src_->EmitRowCount(); }
 
-size_t SelectionPlan::EmitRowCount() const {
-  return std::ceil(static_cast<double>(src_->EmitRowCount()) /
-                   stats_.ReductionFactor(GetSchema(), exp_));
-}
+size_t SelectionPlan::EmitRowCount() const { return stats_.Rows(); }
 
 void SelectionPlan::Dump(std::ostream& o, int indent) const {
   o << "Select: [";

@@ -26,13 +26,18 @@ namespace tinylamb {
 
 class AggregateExpression : public ExpressionBase {
  public:
-  AggregateExpression(AggregationType type, Expression child)
-      : type_(type), child_(std::move(child)) {}
+  AggregateExpression(AggregationType type, Expression child,
+                      bool distinct = false)
+      : type_(type), child_(std::move(child)), distinct_(distinct) {}
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kAggregateExp; }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
+                                          const Schema& right) const override;
   [[nodiscard]] AggregationType GetType() const { return type_; }
   [[nodiscard]] Expression Child() const { return child_; }
+  [[nodiscard]] bool Distinct() const { return distinct_; }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
@@ -40,6 +45,7 @@ class AggregateExpression : public ExpressionBase {
  private:
   AggregationType type_;
   Expression child_;
+  bool distinct_{false};
 };
 
 }  // namespace tinylamb

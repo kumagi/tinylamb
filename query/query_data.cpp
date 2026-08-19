@@ -31,9 +31,14 @@
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
+#include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/case_expression.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
+#include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/unary_expression.hpp"
 #include "table/table.hpp"
 #include "type/column_name.hpp"
 #include "type/schema.hpp"
@@ -45,11 +50,15 @@ namespace {
 Status ResolveExpression(
     Expression& exp,
     const std::unordered_map<std::string, std::string>& col_table_map,
-    const std::unordered_set<std::string>& ambiguous_colum_name) {
+    const std::unordered_set<std::string>& ambiguous_colum_name,
+    const std::unordered_map<std::string, std::string>& aliases) {
+  if (!exp) return Status::kSuccess;
   if (exp->Type() == TypeTag::kColumnValue) {
     auto& cv = exp->AsColumnValue();
     const ColumnName& col_name = cv.GetColumnName();
     if (!col_name.schema.empty()) {
+      const auto alias = aliases.find(col_name.schema);
+      if (alias != aliases.end()) cv.SetSchemaName(alias->second);
       return Status::kSuccess;
     }
     if (ambiguous_colum_name.contains(col_name.name)) {
@@ -60,6 +69,54 @@ Status ResolveExpression(
       return Status::kNotExists;
     }
     cv.SetSchemaName(it->second);
+    return Status::kSuccess;
+  }
+  if (exp->Type() == TypeTag::kBinaryExp) {
+    Expression left = exp->AsBinaryExpression().Left();
+    Expression right = exp->AsBinaryExpression().Right();
+    RETURN_IF_FAIL(
+        ResolveExpression(left, col_table_map, ambiguous_colum_name, aliases));
+    RETURN_IF_FAIL(
+        ResolveExpression(right, col_table_map, ambiguous_colum_name, aliases));
+  } else if (exp->Type() == TypeTag::kUnaryExp) {
+    Expression child = exp->AsUnaryExpression().Child();
+    RETURN_IF_FAIL(
+        ResolveExpression(child, col_table_map, ambiguous_colum_name, aliases));
+  } else if (exp->Type() == TypeTag::kAggregateExp) {
+    Expression child = exp->AsAggregateExpression().Child();
+    if (child->Type() == TypeTag::kColumnValue &&
+        child->AsColumnValue().GetColumnName().name == "*") {
+      return Status::kSuccess;
+    }
+    RETURN_IF_FAIL(
+        ResolveExpression(child, col_table_map, ambiguous_colum_name, aliases));
+  } else if (exp->Type() == TypeTag::kCaseExp) {
+    const auto& case_expression = exp->AsCaseExpression();
+    for (const auto& clause : case_expression.when_clauses_) {
+      Expression condition = clause.first;
+      Expression value = clause.second;
+      RETURN_IF_FAIL(ResolveExpression(condition, col_table_map,
+                                       ambiguous_colum_name, aliases));
+      RETURN_IF_FAIL(ResolveExpression(value, col_table_map,
+                                       ambiguous_colum_name, aliases));
+    }
+    Expression otherwise = case_expression.else_clause_;
+    RETURN_IF_FAIL(ResolveExpression(otherwise, col_table_map,
+                                     ambiguous_colum_name, aliases));
+  } else if (exp->Type() == TypeTag::kInExp) {
+    const auto& in = exp->AsInExpression();
+    Expression child = in.child_;
+    RETURN_IF_FAIL(
+        ResolveExpression(child, col_table_map, ambiguous_colum_name, aliases));
+    for (Expression item : in.list_) {
+      RETURN_IF_FAIL(ResolveExpression(item, col_table_map,
+                                       ambiguous_colum_name, aliases));
+    }
+  } else if (exp->Type() == TypeTag::kFunctionCallExp) {
+    for (Expression argument : exp->AsFunctionCallExpression().Args()) {
+      RETURN_IF_FAIL(ResolveExpression(argument, col_table_map,
+                                       ambiguous_colum_name, aliases));
+    }
   }
   return Status::kSuccess;
 }
@@ -68,7 +125,8 @@ Status ResolveSelect(
     std::vector<NamedExpression>& select,
     const std::unordered_map<std::string, std::string>& col_table_map,
     const std::unordered_set<std::string>& ambiguous_colum_name,
-    const std::vector<ColumnName>& all_cols) {
+    const std::vector<ColumnName>& all_cols,
+    const std::unordered_map<std::string, std::string>& aliases) {
   for (auto it = select.begin(); it != select.end();) {
     if (it->expression->Type() == TypeTag::kColumnValue) {
       auto& cv = it->expression->AsColumnValue();
@@ -86,6 +144,9 @@ Status ResolveSelect(
         continue;
       }
       if (!col_name.schema.empty()) {
+        Expression expression = it->expression;
+        RETURN_IF_FAIL(ResolveExpression(expression, col_table_map,
+                                         ambiguous_colum_name, aliases));
         ++it;
         continue;
       }
@@ -96,6 +157,9 @@ Status ResolveSelect(
       cv.SetSchemaName(col_it->second);
       ++it;
     } else {
+      Expression expression = it->expression;
+      RETURN_IF_FAIL(ResolveExpression(expression, col_table_map,
+                                       ambiguous_colum_name, aliases));
       ++it;
     }
   }
@@ -124,24 +188,12 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   }
 
   // Rewrite SELECT clause.
-  ResolveSelect(select_, col_table_map, ambiguous_colum_name, all_cols);
+  RETURN_IF_FAIL(ResolveSelect(select_, col_table_map, ambiguous_colum_name,
+                               all_cols, aliases_));
 
   // Rewrite WHERE clause.
-  std::stack<Expression> stack;
-  stack.push(where_);
-  while (!stack.empty()) {
-    Expression exp = stack.top();
-    stack.pop();
-    if (exp->Type() == TypeTag::kBinaryExp) {
-      const auto& be = exp->AsBinaryExpression();
-      stack.push(be.Left());
-      stack.push(be.Right());
-    } else if (exp->Type() == TypeTag::kColumnValue) {
-      RETURN_IF_FAIL(
-          ResolveExpression(exp, col_table_map, ambiguous_colum_name));
-    }
-  }
-  return Status::kSuccess;
+  return ResolveExpression(where_, col_table_map, ambiguous_colum_name,
+                           aliases_);
 }
 
 }  // namespace tinylamb

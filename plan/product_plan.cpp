@@ -38,8 +38,9 @@ TableStatistics HashJoinStats(const TableStatistics& left,
                               const std::vector<ColumnName>& /*left_cols*/,
                               const TableStatistics& right,
                               const std::vector<ColumnName>& /*right_cols*/) {
-  TableStatistics ans(left);
-  ans.Concat(right);
+  const size_t output_rows = std::min(left.Rows(), right.Rows());
+  TableStatistics ans = left.ScaleToRows(output_rows);
+  ans.Concat(right.ScaleToRows(output_rows));
   return ans;
 }
 }  // namespace

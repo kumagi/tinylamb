@@ -18,8 +18,13 @@
 #define TINYLAMB_OPTIMIZER_HPP
 
 #include <memory>
+#include <string>
+#include <unordered_set>
+#include <vector>
 
 #include "common/status_or.hpp"
+#include "expression/rewrite.hpp"
+#include "plan/cascades.hpp"
 #include "query/query_data.hpp"
 
 namespace tinylamb {
@@ -28,12 +33,29 @@ class TransactionContext;
 class PlanBase;
 typedef std::shared_ptr<PlanBase> Plan;
 
+struct OptimizerOptions {
+  cascades::RuleSet relational_rules;
+  ExpressionRuleSet expression_rules;
+  std::vector<cascades::ImplementationRule> extra_implementation_rules;
+  std::unordered_set<std::string> disabled_implementation_rules;
+
+  [[nodiscard]] static OptimizerOptions Default() {
+    OptimizerOptions options;
+    options.relational_rules = cascades::RuleSet::Default();
+    options.expression_rules = ExpressionRuleSet::Default();
+    return options;
+  }
+};
+
 class Optimizer {
  public:
   explicit Optimizer() = default;
 
   static StatusOr<Plan> Optimize(const QueryData& query,
                                  TransactionContext& ctx);
+  static StatusOr<Plan> Optimize(const QueryData& query,
+                                 TransactionContext& ctx,
+                                 const OptimizerOptions& options);
 };
 
 }  // namespace tinylamb

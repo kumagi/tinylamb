@@ -18,6 +18,8 @@
 #define TINYLAMB_TABLE_HPP
 
 #include <unordered_map>
+#include <cstddef>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -38,6 +40,7 @@ struct RowPosition;
 
 class Table {
  public:
+  using ScanMorsel = std::vector<page_id_t>;
   struct IndexValueType {
     RowPosition pos;
     Row include;
@@ -71,6 +74,13 @@ class Table {
   StatusOr<Row> Read(Transaction& txn, RowPosition pos) const;
 
   Iterator BeginFullScan(Transaction& txn) const;
+  Iterator BeginFullScan(Transaction& txn,
+                         const std::vector<slot_t>& projection) const;
+  Iterator BeginMorselScan(
+      Transaction& txn, const ScanMorsel& pages,
+      std::optional<std::vector<slot_t>> projection = std::nullopt) const;
+  [[nodiscard]] std::vector<ScanMorsel> BuildScanMorsels(
+      Transaction& txn, size_t pages_per_morsel = 8) const;
   Iterator BeginIndexScan(Transaction& txn, const Index& index,
                           const Value& begin = Value(),
                           const Value& end = Value(),

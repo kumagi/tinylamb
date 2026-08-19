@@ -75,7 +75,8 @@ class RowPageTest : public ::testing::Test {
     const bin_size_t before_size = rp.FreeSizeForTest();
     Status insert_result = page->Insert(txn, str).GetStatus();
     if (insert_result == Status::kSuccess) {
-      EXPECT_EQ(rp.FreeSizeForTest(),
+      // Defragmentation may reclaim space that earlier deletes left behind.
+      EXPECT_GE(rp.FreeSizeForTest(),
                 before_size - str.size() - sizeof(RowPointer));
     }
     if (commit) {

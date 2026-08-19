@@ -239,6 +239,35 @@ Iterator Table::BeginFullScan(Transaction& txn) const {
   return Iterator(new FullScanIterator(this, &txn));
 }
 
+Iterator Table::BeginFullScan(Transaction& txn,
+                              const std::vector<slot_t>& projection) const {
+  return Iterator(new FullScanIterator(this, &txn, projection));
+}
+
+Iterator Table::BeginMorselScan(
+    Transaction& txn, const ScanMorsel& pages,
+    std::optional<std::vector<slot_t>> projection) const {
+  return Iterator(
+      new FullScanIterator(this, &txn, pages, std::move(projection)));
+}
+
+std::vector<Table::ScanMorsel> Table::BuildScanMorsels(
+    Transaction& txn, size_t pages_per_morsel) const {
+  pages_per_morsel = std::max<size_t>(1, pages_per_morsel);
+  std::vector<ScanMorsel> morsels;
+  page_id_t page_id = first_pid_;
+  while (page_id != 0) {
+    if (morsels.empty() || morsels.back().size() == pages_per_morsel) {
+      morsels.emplace_back();
+      morsels.back().reserve(pages_per_morsel);
+    }
+    morsels.back().push_back(page_id);
+    PageRef page = txn.GetPageManager()->GetPage(page_id, true);
+    page_id = page->body.row_page.next_page_id_;
+  }
+  return morsels;
+}
+
 Iterator Table::BeginIndexScan(Transaction& txn, const Index& index,
                                const Value& begin, const Value& end,
                                bool ascending) const {

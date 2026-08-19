@@ -18,7 +18,7 @@
 #define TINYLAMB_HASH_JOIN_HPP
 
 #include <memory>
-#include <unordered_map>
+#include <thread>
 
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
@@ -30,7 +30,8 @@ namespace tinylamb {
 class HashJoin : public ExecutorBase {
  public:
   HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
-           std::vector<slot_t> right_cols);
+           std::vector<slot_t> right_cols,
+           size_t worker_count = std::thread::hardware_concurrency());
   HashJoin(const HashJoin&) = delete;
   HashJoin(HashJoin&&) = delete;
   HashJoin& operator=(const HashJoin&) = delete;
@@ -38,22 +39,24 @@ class HashJoin : public ExecutorBase {
   ~HashJoin() override = default;
 
   bool Next(Row* dst, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
 
+  [[nodiscard]] size_t WorkerCount() const { return worker_count_; }
+
  private:
-  void BucketConstruct();
+  void Materialize();
 
   Executor left_;
   std::vector<slot_t> left_cols_;
   Executor right_;
   std::vector<slot_t> right_cols_;
 
-  Row hold_left_;
-  std::string left_key_;
-  bool bucket_constructed_{false};
-  std::unordered_multimap<std::string, Row> right_buckets_;
-  std::unordered_multimap<std::string, Row>::const_iterator
-      right_buckets_iterator_;
+  size_t worker_count_;
+  bool materialized_{false};
+  std::vector<std::pair<Row, RowPosition>> output_;
+  size_t output_offset_{0};
 };
 
 }  // namespace tinylamb

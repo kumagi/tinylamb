@@ -40,6 +40,9 @@ class AggregateExpression;
 class CaseExpression;
 class InExpression;
 class FunctionCallExpression;
+class QueryExpression;
+class IntervalExpression;
+class SelectStatement;
 
 class ExpressionBase {
  public:
@@ -59,6 +62,8 @@ class ExpressionBase {
   [[nodiscard]] const CaseExpression& AsCaseExpression() const;
   [[nodiscard]] const InExpression& AsInExpression() const;
   [[nodiscard]] const FunctionCallExpression& AsFunctionCallExpression() const;
+  [[nodiscard]] const QueryExpression& AsQueryExpression() const;
+  [[nodiscard]] const IntervalExpression& AsIntervalExpression() const;
   [[nodiscard]] virtual std::unordered_set<ColumnName> TouchedColumns() const;
   [[nodiscard]] virtual Value Evaluate(const Row& row,
                                        const Schema& schema) const = 0;
@@ -69,8 +74,8 @@ class ExpressionBase {
   [[nodiscard]] virtual tinylamb::Type ResultType(const Schema&) const {
     throw std::runtime_error("not implemented");
   }
-  [[nodiscard]] virtual tinylamb::Type ResultType(const Schema&, const Schema&)
-      const {
+  [[nodiscard]] virtual tinylamb::Type ResultType(const Schema&,
+                                                  const Schema&) const {
     throw std::runtime_error("not implemented");
   }
   virtual Status Validate(TransactionContext&, const Schema&) const {
@@ -91,13 +96,18 @@ Expression ConstantValueExp(const Value& v);
 Expression BinaryExpressionExp(Expression left, BinaryOperation op,
                                Expression right);
 Expression UnaryExpressionExp(Expression child, UnaryOperation op);
-Expression AggregateExpressionExp(AggregationType type, Expression child);
+Expression AggregateExpressionExp(AggregationType type, Expression child,
+                                  bool distinct = false);
 Expression CaseExpressionExp(
     std::vector<std::pair<Expression, Expression>> when_clauses,
     Expression else_clause);
 Expression InExpressionExp(Expression child, std::vector<Expression> list);
 Expression FunctionCallExp(const std::string& func_name,
                            std::vector<Expression> args);
+Expression QueryExpressionExp(std::shared_ptr<SelectStatement> query,
+                              Expression test = nullptr, bool exists = false,
+                              bool negated = false);
+Expression IntervalExpressionExp(int64_t amount, std::string unit);
 
 }  // namespace tinylamb
 

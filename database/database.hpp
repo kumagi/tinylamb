@@ -46,6 +46,9 @@ class Database {
 
   // Transaction Begin() { return storage_.Begin(); }
   TransactionContext BeginContext() { return {storage_.Begin(), this}; }
+  TransactionContext BeginReadOnlyContext() {
+    return {storage_.BeginReadOnly(), this};
+  }
 
   StatusOr<Table> CreateTable(TransactionContext& ctx, const Schema& schema);
 

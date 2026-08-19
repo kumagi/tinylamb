@@ -33,6 +33,8 @@ class FullScan : public ExecutorBase {
   FullScan(Transaction& txn, const Table& table);
   ~FullScan() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:

@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <ios>
 #include <istream>
@@ -43,6 +44,11 @@
 namespace tinylamb {
 
 namespace {
+
+bool RecoveryTraceEnabled() {
+  static const bool enabled = std::getenv("TINYLAMB_RECOVERY_TRACE") != nullptr;
+  return enabled;
+}
 
 bool IsPageManipulation(LogType type) {
   switch (type) {
@@ -245,7 +251,7 @@ void PageReplay(PageRef&& target,
 
     const lsn_t& lsn = lsn_log.first;
     if (target->PageLSN() < lsn) {
-      LOG(INFO) << "redo: " << log;
+      if (RecoveryTraceEnabled()) LOG(INFO) << "redo: " << log;
       LogRedo(target, lsn, log);
     }
   }
@@ -256,13 +262,15 @@ void PageReplay(PageRef&& target,
     const auto it = committed_txn.find(undo_log.txn_id);
     assert(undo_log.pid == target->PageID());
     if (it == committed_txn.end()) {
-      LOG(INFO) << "undo: " << undo_log;
+      if (RecoveryTraceEnabled()) LOG(INFO) << "undo: " << undo_log;
       LogUndo(target, iter->first, undo_log, tm);
     }
   }
 
   // Release the page latch.
-  LOG(INFO) << "SPR " << target->PageID() << " finished";
+  if (RecoveryTraceEnabled()) {
+    LOG(INFO) << "SPR " << target->PageID() << " finished";
+  }
   target.PageUnlock();
 }
 
@@ -329,8 +337,10 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
       if (!success) {
         throw std::runtime_error("Invalid log: " + std::to_string(offset));
       }
-      LOG(TRACE) << "analyzing: " << offset << ": " << log
-                 << "  to: " << offset + log.Size();
+      if (RecoveryTraceEnabled()) {
+        LOG(TRACE) << "analyzing: " << offset << ": " << log
+                   << "  to: " << offset + log.Size();
+      }
       switch (log.type) {
         case LogType::kUnknown:
           throw std::runtime_error("Invalid log: " + std::to_string(offset));

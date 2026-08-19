@@ -68,14 +68,14 @@ bool LockManager::ReleaseExclusiveLock(const RowPosition& row) {
 
 bool LockManager::TryUpgradeLock(const RowPosition& row) {
   std::scoped_lock lk(latch_);
-  if (exclusive_locks_.find(row) == exclusive_locks_.end() &&
-      (shared_locks_.find(row) == shared_locks_.end() ||
-       shared_locks_[row] <= 1)) {
-    shared_locks_.clear();
-    exclusive_locks_.emplace(row);
-    return true;
-  }
-  return false;
+  if (exclusive_locks_.find(row) != exclusive_locks_.end()) return false;
+  const auto shared = shared_locks_.find(row);
+  if (shared == shared_locks_.end() || shared->second != 1) return false;
+  // Upgrade only this row. Clearing the whole shared-lock table loses locks
+  // held for unrelated rows and makes the owning transactions crash at commit.
+  shared_locks_.erase(shared);
+  exclusive_locks_.emplace(row);
+  return true;
 }
 
 }  // namespace tinylamb

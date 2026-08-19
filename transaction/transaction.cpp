@@ -48,9 +48,12 @@ std::ostream& operator<<(std::ostream& o, const TransactionStatus& t) {
   return o;
 }
 
-Transaction::Transaction(txn_id_t txn_id, TransactionManager* tm)
+Transaction::Transaction(txn_id_t txn_id, TransactionManager* tm,
+                         bool read_only)
     : txn_id_(txn_id),
+      snapshot_ts_(tm->CurrentCommitTimestamp()),
       status_(TransactionStatus::kRunning),
+      read_only_(read_only),
       transaction_manager_(tm) {}
 
 Status Transaction::PreCommit() {
@@ -65,30 +68,55 @@ void Transaction::SetStatus(TransactionStatus status) { status_ = status; }
 
 bool Transaction::AddReadSet(const RowPosition& rp) {
   assert(!IsFinished());
-  if (write_set_.find(rp) != write_set_.end() ||
-      read_set_.find(rp) != read_set_.end()) {
-    return true;
-  }
-  if (!transaction_manager_->GetSharedLock(rp)) {
-    return false;
-  }
+  // MV2PL readers use snapshot-visible row versions and therefore never take
+  // a lock that conflicts with a writer's exclusive lock.
   read_set_.insert(rp);
   return true;
 }
 
 bool Transaction::AddWriteSet(const RowPosition& rp) {
   assert(!IsFinished());
+  if (read_only_) return false;
   if (write_set_.find(rp) != write_set_.end()) {
     return true;
   }
-  write_set_.insert(rp);
-  if (!transaction_manager_->GetExclusiveLock(rp) &&
-      (read_set_.find(rp) != read_set_.end() &&
-       !transaction_manager_->TryUpgradeLock(rp))) {
+  if (!transaction_manager_->GetExclusiveLock(rp)) {
     return false;
   }
-  read_set_.erase(rp);
+  // Do not remember a write lock until it has actually been acquired.
+  write_set_.insert(rp);
   return true;
+}
+
+StatusOr<std::string_view> Transaction::ReadVersion(
+    const RowPosition& rp, std::optional<std::string_view> physical) {
+  assert(!IsFinished());
+  std::scoped_lock state_guard(*read_state_mutex_);
+  AddReadSet(rp);
+  if (!transaction_manager_) {
+    if (!physical) return Status::kNotExists;
+    return *physical;
+  }
+  StatusOr<std::string> visible =
+      transaction_manager_->ReadVersion(*this, rp, physical);
+  if (!visible.HasValue()) return visible.GetStatus();
+  auto [iter, inserted] =
+      version_read_cache_.insert_or_assign(rp, std::move(visible.Value()));
+  return std::string_view(iter->second);
+}
+
+void Transaction::RegisterVersionWrite(const RowPosition& rp,
+                                       std::optional<std::string_view> before,
+                                       std::optional<std::string_view> after) {
+  std::scoped_lock state_guard(*read_state_mutex_);
+  if (!transaction_manager_) return;
+  transaction_manager_->RegisterVersionWrite(*this, rp, before, after);
+  version_read_cache_.erase(rp);
+}
+
+bool Transaction::RequiresHistoricalRead() const {
+  return transaction_manager_ &&
+         transaction_manager_->RequiresHistoricalRead(*this);
 }
 
 lsn_t Transaction::InsertLog(page_id_t pid, slot_t slot,

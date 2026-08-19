@@ -55,7 +55,8 @@ BPlusTree::BPlusTree(page_id_t given_root) : root_(given_root) {}
 PageRef BPlusTree::FindLeftmostPage(Transaction& txn, PageRef&& page) {
   while (page->Type() != PageType::kLeafPage) {
     assert(page->Type() == PageType::kBranchPage);
-    page = txn.GetPageManager()->GetPage(page->body.branch_page.lowest_page_);
+    page = txn.GetPageManager()->GetPage(page->body.branch_page.lowest_page_,
+                                         txn.IsReadOnly());
   }
   return std::move(page);
 }
@@ -64,17 +65,20 @@ PageRef BPlusTree::FindRightmostPage(Transaction& txn, PageRef&& page) {
   while (page->Type() != PageType::kLeafPage) {
     assert(page->Type() == PageType::kBranchPage);
     page = txn.GetPageManager()->GetPage(
-        page->body.branch_page.GetValue(page->body.branch_page.RowCount() - 1));
+        page->body.branch_page.GetValue(page->body.branch_page.RowCount() - 1),
+        txn.IsReadOnly());
   }
   return std::move(page);
 }
 
 PageRef BPlusTree::LeftmostPage(Transaction& txn) {
-  return FindLeftmostPage(txn, txn.GetPageManager()->GetPage(root_));
+  return FindLeftmostPage(
+      txn, txn.GetPageManager()->GetPage(root_, txn.IsReadOnly()));
 }
 
 PageRef BPlusTree::RightmostPage(Transaction& txn) {
-  return FindRightmostPage(txn, txn.GetPageManager()->GetPage(root_));
+  return FindRightmostPage(
+      txn, txn.GetPageManager()->GetPage(root_, txn.IsReadOnly()));
 }
 
 void BPlusTree::GrowTreeHeightIfNeeded(Transaction& txn) const {
@@ -442,24 +446,26 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) {
 
 StatusOr<std::string_view> BPlusTree::Read(Transaction& txn,
                                            std::string_view key) const {
-  PageRef curr = txn.GetPageManager()->GetPage(root_);
+  PageRef curr = txn.GetPageManager()->GetPage(root_, txn.IsReadOnly());
   while (curr->Type() == PageType::kBranchPage) {
     if (auto maybe_foster = curr->GetFoster(txn)) {
       const FosterPair& foster_child = maybe_foster.Value();
       if (foster_child.key <= key) {
-        curr = txn.GetPageManager()->GetPage(foster_child.child_pid);
+        curr = txn.GetPageManager()->GetPage(foster_child.child_pid,
+                                             txn.IsReadOnly());
         continue;
       }
     }
     ASSIGN_OR_CRASH(page_id_t, maybe_next,
                     curr->GetPageForKey(txn, key, false));
-    curr = txn.GetPageManager()->GetPage(maybe_next);
+    curr = txn.GetPageManager()->GetPage(maybe_next, txn.IsReadOnly());
   }
   assert(curr->Type() == PageType::kLeafPage);
   while (auto maybe_foster = curr->GetFoster(txn)) {
     const FosterPair& foster_child = maybe_foster.Value();
     if (foster_child.key <= key) {
-      curr = txn.GetPageManager()->GetPage(foster_child.child_pid);
+      curr = txn.GetPageManager()->GetPage(foster_child.child_pid,
+                                           txn.IsReadOnly());
       continue;
     }
     break;

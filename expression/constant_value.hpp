@@ -31,7 +31,20 @@ class ConstantValue : public ExpressionBase {
                                const Schema& /*schema*/) const override {
     return val_;
   }
+  [[nodiscard]] Value Evaluate(const Row* /*left*/,
+                               const Schema& /*left_schema*/,
+                               const Row* /*right*/,
+                               const Schema& /*right_schema*/) const override {
+    return val_;
+  }
   [[nodiscard]] Value GetValue() const { return val_; }
+  [[nodiscard]] tinylamb::Type ResultType(const Schema&) const override {
+    return TypeForValue();
+  }
+  [[nodiscard]] tinylamb::Type ResultType(const Schema&,
+                                          const Schema&) const override {
+    return TypeForValue();
+  }
 
   friend std::ostream& operator<<(std::ostream& o, const ConstantValue& c) {
     o << c.val_;
@@ -44,6 +57,21 @@ class ConstantValue : public ExpressionBase {
   void Dump(std::ostream& o) const override { o << val_; }
 
  private:
+  [[nodiscard]] tinylamb::Type TypeForValue() const {
+    switch (val_.type) {
+      case ValueType::kInt64:
+        return tinylamb::Type(TypeTag::kBigInt);
+      case ValueType::kDouble:
+        return tinylamb::Type(TypeTag::kDouble);
+      case ValueType::kVarChar:
+        return tinylamb::Type(TypeTag::kVarChar);
+      case ValueType::kDate:
+        return tinylamb::Type(TypeTag::kDate);
+      case ValueType::kNull:
+        return tinylamb::Type(TypeTag::kInvalid);
+    }
+    return tinylamb::Type(TypeTag::kInvalid);
+  }
   Value val_;
 };
 

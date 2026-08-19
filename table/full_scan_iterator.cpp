@@ -30,47 +30,83 @@
 
 namespace tinylamb {
 
-FullScanIterator::FullScanIterator(const Table* table, Transaction* txn)
-    : table_(table), txn_(txn), pos_(table_->first_pid_, 0) {
-  txn_->AddReadSet(pos_);
-  PageRef page = txn->GetPageManager()->GetPage(pos_.page_id);
-  if (page->RowCount() == 0) {
-    pos_.page_id = ~0LLU;
-    return;
-  }
-  while (page->Read(*txn, pos_.slot).GetStatus() == Status::kNotExists) {
-    pos_.slot++;
-  }
-  ASSIGN_OR_CRASH(std::string_view, row, page->Read(*txn, pos_.slot));
-  current_row_.Deserialize(row.data(), table_->schema_);
+FullScanIterator::FullScanIterator(
+    const Table* table, Transaction* txn,
+    std::optional<std::vector<slot_t>> projection)
+    : table_(table),
+      txn_(txn),
+      pos_(table_->first_pid_, 0),
+      projection_(std::move(projection)) {
+  page_ = std::make_unique<PageRef>(txn->GetPageManager()->GetPage(
+      pos_.page_id, txn->IsReadOnly()));
+  SeekVisibleRow();
+}
+
+FullScanIterator::FullScanIterator(
+    const Table* table, Transaction* txn, std::vector<page_id_t> pages,
+    std::optional<std::vector<slot_t>> projection)
+    : table_(table),
+      txn_(txn),
+      pos_(pages.empty() ? ~0ULL : pages.front(), 0),
+      projection_(std::move(projection)),
+      pages_(std::move(pages)) {
+  if (!pos_.IsValid()) return;
+  page_ = std::make_unique<PageRef>(txn->GetPageManager()->GetPage(
+      pos_.page_id, txn->IsReadOnly()));
+  SeekVisibleRow();
 }
 
 IteratorBase& FullScanIterator::operator++() {
-  PageRef ref = [&]() {
-    PageRef page_ref = txn_->GetPageManager()->GetPage(pos_.page_id);
-    if (++pos_.slot < page_ref->RowCount()) {
-      return page_ref;
-    }
-    pos_.page_id = page_ref->body.row_page.next_page_id_;
-    page_ref.PageUnlock();
-    if (pos_.page_id == 0) {
-      pos_.page_id = ~0LLU;
-      return PageRef();
-    }
-    pos_.slot = 0;
-    return txn_->GetPageManager()->GetPage(pos_.page_id);
-  }();
-  if (!ref.IsValid()) {
-    current_row_.Clear();
-    return *this;
+  if (!pos_.IsValid()) return *this;
+  ++pos_.slot;
+  if (page_ == nullptr) {
+    page_ = std::make_unique<PageRef>(
+        txn_->GetPageManager()->GetPage(pos_.page_id, txn_->IsReadOnly()));
   }
-  txn_->AddReadSet(pos_);
-  while (ref->Read(*txn_, pos_.slot).GetStatus() == Status::kNotExists) {
-    pos_.slot++;
-  }
-  ASSIGN_OR_CRASH(std::string_view, row, ref->Read(*txn_, pos_.slot));
-  current_row_.Deserialize(row.data(), table_->schema_);
+  SeekVisibleRow();
   return *this;
+}
+
+void FullScanIterator::SeekVisibleRow() {
+  while (pos_.IsValid()) {
+    while (pos_.slot < (*page_)->body.row_page.RowMax()) {
+      StatusOr<std::string_view> row = (*page_)->Read(*txn_, pos_.slot);
+      if (row.HasValue()) {
+        DeserializeCurrent(row.Value());
+        if (!txn_->IsReadOnly()) page_.reset();
+        return;
+      }
+      ++pos_.slot;
+    }
+    if (!AdvancePage()) break;
+  }
+  pos_.page_id = ~0ULL;
+  current_row_.Clear();
+}
+
+bool FullScanIterator::AdvancePage() {
+  page_id_t next_page = 0;
+  if (pages_) {
+    ++page_index_;
+    if (page_index_ < pages_->size()) next_page = (*pages_)[page_index_];
+  } else {
+    next_page = (*page_)->body.row_page.next_page_id_;
+  }
+  page_.reset();
+  if (next_page == 0) return false;
+  pos_ = RowPosition(next_page, 0);
+  page_ = std::make_unique<PageRef>(txn_->GetPageManager()->GetPage(
+      next_page, txn_->IsReadOnly()));
+  return true;
+}
+
+void FullScanIterator::DeserializeCurrent(std::string_view row) {
+  if (projection_) {
+    current_row_.DeserializeProjected(row.data(), table_->schema_,
+                                      *projection_);
+  } else {
+    current_row_.Deserialize(row.data(), table_->schema_);
+  }
 }
 
 IteratorBase& FullScanIterator::operator--() {

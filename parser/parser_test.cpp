@@ -142,7 +142,8 @@ TEST(ParserTest, SelectStar) {
   Parser parser(tokens);
   std::unique_ptr<Statement> stmt = parser.Parse();
 
-  // Assert -- statement type, from-clause table, select-list has 1 entry with "*"
+  // Assert -- statement type, from-clause table, select-list has 1 entry with
+  // "*"
   ASSERT_EQ(stmt->Type(), StatementType::kSelect);
   auto& select = dynamic_cast<SelectStatement&>(*stmt);
   ASSERT_EQ(select.FromClause().size(), 1);
@@ -162,12 +163,47 @@ TEST(ParserTest, SelectWithExpression) {
   Parser parser(tokens);
   std::unique_ptr<Statement> stmt = parser.Parse();
 
-  // Assert -- statement type, from-clause table, select-list has 1 entry (expression)
+  // Assert -- statement type, from-clause table, select-list has 1 entry
+  // (expression)
   ASSERT_EQ(stmt->Type(), StatementType::kSelect);
   auto& select = dynamic_cast<SelectStatement&>(*stmt);
   ASSERT_EQ(select.FromClause().size(), 1);
   ASSERT_EQ(select.FromClause()[0], "users");
   ASSERT_EQ(select.SelectList().size(), 1);
+}
+
+TEST(ParserTest, TpccDdlTypesAndConstraints) {
+  Tokenizer tokenizer(
+      "CREATE TABLE warehouse (w_id INT64 NOT NULL, "
+      "w_tax NUMERIC(4, 4), w_name STRING(10), PRIMARY KEY(w_id));");
+  Parser parser(tokenizer.Tokenize());
+
+  std::unique_ptr<Statement> stmt = parser.Parse();
+
+  const auto& create = dynamic_cast<const CreateTableStatement&>(*stmt);
+  ASSERT_EQ(create.Columns().size(), 3);
+  EXPECT_EQ(create.Columns()[0].Type(), ValueType::kInt64);
+  EXPECT_EQ(create.Columns()[1].Type(), ValueType::kDouble);
+  EXPECT_EQ(create.Columns()[2].Type(), ValueType::kVarChar);
+}
+
+TEST(ParserTest, TpccJoinOrderingAndLimit) {
+  Tokenizer tokenizer(
+      "SELECT c.c_id, o.o_id FROM customer AS c JOIN orders AS o "
+      "ON c.c_id = o.o_c_id WHERE c.c_w_id = 1 ORDER BY o.o_id DESC "
+      "LIMIT 1 OFFSET 2;");
+  Parser parser(tokenizer.Tokenize());
+
+  std::unique_ptr<Statement> stmt = parser.Parse();
+
+  const auto& select = dynamic_cast<const SelectStatement&>(*stmt);
+  ASSERT_EQ(select.FromClause().size(), 2);
+  ASSERT_EQ(select.OrderBy().size(), 1);
+  EXPECT_FALSE(select.OrderBy()[0].ascending);
+  EXPECT_EQ(select.Limit(), 1);
+  EXPECT_EQ(select.Offset(), 2);
+  EXPECT_EQ(select.Aliases().at("c"), "customer");
+  EXPECT_EQ(select.Aliases().at("o"), "orders");
 }
 
 }  // namespace tinylamb

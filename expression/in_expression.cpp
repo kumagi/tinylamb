@@ -36,12 +36,30 @@ std::unordered_set<ColumnName> InExpression::TouchedColumns() const {
 
 Value InExpression::Evaluate(const Row& row, const Schema& schema) const {
   Value child = child_->Evaluate(row, schema);
+  bool saw_null = child.IsNull();
   for (const auto& item : list_) {
-    if (child == item->Evaluate(row, schema)) {
+    Value candidate = item->Evaluate(row, schema);
+    saw_null |= candidate.IsNull();
+    if (!child.IsNull() && !candidate.IsNull() && child == candidate) {
       return Value(true);
     }
   }
-  return Value(false);
+  return saw_null ? Value() : Value(false);
+}
+
+Value InExpression::Evaluate(const Row* left, const Schema& left_schema,
+                             const Row* right,
+                             const Schema& right_schema) const {
+  Value child = child_->Evaluate(left, left_schema, right, right_schema);
+  bool saw_null = child.IsNull();
+  for (const auto& item : list_) {
+    Value candidate = item->Evaluate(left, left_schema, right, right_schema);
+    saw_null |= candidate.IsNull();
+    if (!child.IsNull() && !candidate.IsNull() && child == candidate) {
+      return Value(true);
+    }
+  }
+  return saw_null ? Value() : Value(false);
 }
 
 std::string InExpression::ToString() const {

@@ -30,6 +30,8 @@
 #include "expression/constant_value.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
+#include "expression/interval_expression.hpp"
+#include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "type/column_name.hpp"
 #include "type/type.hpp"
@@ -73,6 +75,14 @@ const FunctionCallExpression& ExpressionBase::AsFunctionCallExpression() const {
   return dynamic_cast<const FunctionCallExpression&>(*this);
 }
 
+const QueryExpression& ExpressionBase::AsQueryExpression() const {
+  return dynamic_cast<const QueryExpression&>(*this);
+}
+
+const IntervalExpression& ExpressionBase::AsIntervalExpression() const {
+  return dynamic_cast<const IntervalExpression&>(*this);
+}
+
 std::unordered_set<ColumnName> ExpressionBase::TouchedColumns() const {
   std::unordered_set<ColumnName> result;
   return result;
@@ -99,8 +109,9 @@ Expression UnaryExpressionExp(Expression child, UnaryOperation op) {
   return std::make_shared<UnaryExpression>(child, op);
 }
 
-Expression AggregateExpressionExp(AggregationType type, Expression child) {
-  return std::make_shared<AggregateExpression>(type, child);
+Expression AggregateExpressionExp(AggregationType type, Expression child,
+                                  bool distinct) {
+  return std::make_shared<AggregateExpression>(type, child, distinct);
 }
 
 Expression CaseExpressionExp(
@@ -116,6 +127,16 @@ Expression InExpressionExp(Expression child, std::vector<Expression> list) {
 Expression FunctionCallExp(const std::string& func_name,
                            std::vector<Expression> args) {
   return std::make_shared<FunctionCallExpression>(func_name, args);
+}
+
+Expression QueryExpressionExp(std::shared_ptr<SelectStatement> query,
+                              Expression test, bool exists, bool negated) {
+  return std::make_shared<QueryExpression>(std::move(query), std::move(test),
+                                           exists, negated);
+}
+
+Expression IntervalExpressionExp(int64_t amount, std::string unit) {
+  return std::make_shared<IntervalExpression>(amount, std::move(unit));
 }
 
 }  // namespace tinylamb

@@ -23,7 +23,9 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/full_scan.hpp"
 #include "executor/index_scan.hpp"
+#include "executor/selection.hpp"
 #include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "table/table.hpp"
@@ -43,6 +45,11 @@ IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
       where_(std::move(where)) {}
 
 Executor IndexScanPlan::EmitExecutor(TransactionContext& ctx) const {
+  if (ctx.txn_.RequiresHistoricalRead()) {
+    Executor scan = std::make_shared<FullScan>(ctx.txn_, table_);
+    return std::make_shared<Selection>(where_, table_.GetSchema(),
+                                       std::move(scan));
+  }
   return std::make_shared<IndexScan>(ctx.txn_, table_, index_, begin_, end_,
                                      ascending_, where_, GetSchema());
 }
@@ -55,7 +62,7 @@ size_t IndexScanPlan::EmitRowCount() const {
   if (index_.IsUnique() && begin_ == end_) {
     return 1;
   }
-  return std::ceil(stats_.EstimateCount(index_.sc_.key_[0], begin_, end_));
+  return stats_.Rows();
 }
 
 void IndexScanPlan::Dump(std::ostream& o, int /*indent*/) const {

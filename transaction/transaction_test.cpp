@@ -58,4 +58,27 @@ TEST_F(TransactionTest, construct) {
   // Assert -- nothing to verify; gtest green on pass, death on crash
 }
 
+TEST_F(TransactionTest, UpgradePreservesUnrelatedSharedLocks) {
+  const RowPosition upgraded(10, 1);
+  const RowPosition preserved(10, 2);
+  ASSERT_TRUE(lm_->GetSharedLock(upgraded));
+  ASSERT_TRUE(lm_->GetSharedLock(preserved));
+
+  ASSERT_TRUE(lm_->TryUpgradeLock(upgraded));
+
+  EXPECT_TRUE(lm_->ReleaseExclusiveLock(upgraded));
+  EXPECT_TRUE(lm_->ReleaseSharedLock(preserved));
+}
+
+TEST_F(TransactionTest, UpgradeRequiresSoleSharedOwner) {
+  const RowPosition row(10, 1);
+  ASSERT_TRUE(lm_->GetSharedLock(row));
+  ASSERT_TRUE(lm_->GetSharedLock(row));
+
+  EXPECT_FALSE(lm_->TryUpgradeLock(row));
+
+  EXPECT_TRUE(lm_->ReleaseSharedLock(row));
+  EXPECT_TRUE(lm_->ReleaseSharedLock(row));
+}
+
 }  // namespace tinylamb

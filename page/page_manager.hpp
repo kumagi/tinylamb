@@ -38,7 +38,7 @@ class PageManager {
  public:
   PageManager(std::string_view db_name, size_t capacity);
 
-  PageRef GetPage(page_id_t page_id);
+  PageRef GetPage(page_id_t page_id, bool shared = false);
 
   PageRef AllocateNewPage(Transaction& txn, PageType new_page_type);
 

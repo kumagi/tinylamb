@@ -19,6 +19,7 @@
 #include <assert.h>
 
 #include <mutex>
+#include <shared_mutex>
 
 #include "common/log_message.hpp"
 
@@ -33,8 +34,14 @@ class FreePage;
 class PageRef final {
  private:
   // Precondition: page is locked.
-  PageRef(PagePool* src, Page* page, std::mutex* page_lock)
-      : pool_(src), page_(page), page_lock_(*page_lock) {}
+  PageRef(PagePool* src, Page* page, std::shared_mutex* page_lock, bool shared)
+      : pool_(src), page_(page) {
+    if (shared) {
+      shared_page_lock_ = std::shared_lock<std::shared_mutex>(*page_lock);
+    } else {
+      exclusive_page_lock_ = std::unique_lock<std::shared_mutex>(*page_lock);
+    }
+  }
 
   PageRef() : pool_(nullptr), page_(nullptr) {}
 
@@ -53,22 +60,30 @@ class PageRef final {
   void Swap(PageRef& other) {
     std::swap(pool_, other.pool_);
     std::swap(page_, other.page_);
+    std::swap(exclusive_page_lock_, other.exclusive_page_lock_);
+    std::swap(shared_page_lock_, other.shared_page_lock_);
   }
 
   ~PageRef();
 
   PageRef(const PageRef&) = delete;
   PageRef(PageRef&& o) noexcept
-      : pool_(o.pool_), page_(o.page_), page_lock_(std::move(o.page_lock_)) {
+      : pool_(o.pool_),
+        page_(o.page_),
+        exclusive_page_lock_(std::move(o.exclusive_page_lock_)),
+        shared_page_lock_(std::move(o.shared_page_lock_)) {
     o.pool_ = nullptr;
     o.page_ = nullptr;
   }
   PageRef& operator=(const PageRef&) = delete;
   PageRef& operator=(PageRef&& o) noexcept {
-    PageUnlock();
+    if (page_ != nullptr) PageUnlock();
     pool_ = o.pool_;
     page_ = o.page_;
-    page_lock_ = std::move(o.page_lock_);
+    exclusive_page_lock_ = std::move(o.exclusive_page_lock_);
+    shared_page_lock_ = std::move(o.shared_page_lock_);
+    o.pool_ = nullptr;
+    o.page_ = nullptr;
     return *this;
   }
   bool operator==(const PageRef& r) const {
@@ -84,7 +99,8 @@ class PageRef final {
   friend class FullScanIterator;
   PagePool* pool_ = nullptr;
   Page* page_ = nullptr;
-  std::unique_lock<std::mutex> page_lock_;
+  std::unique_lock<std::shared_mutex> exclusive_page_lock_;
+  std::shared_lock<std::shared_mutex> shared_page_lock_;
 };
 
 }  // namespace tinylamb

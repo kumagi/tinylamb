@@ -35,6 +35,7 @@ class PageStorage {
   explicit PageStorage(std::string_view dbname);
 
   Transaction Begin();
+  Transaction BeginReadOnly();
   std::string DBName() const;
   std::string LogName() const;
   std::string MasterRecordName() const;

@@ -21,27 +21,137 @@
 
 #include "common/constants.hpp"
 #include "executor_base.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/constant_value.hpp"
+#include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
 
 namespace tinylamb {
+namespace {
 
-Selection::Selection(Expression exp, Schema schema, Executor src)
-    : exp_(std::move(exp)), schema_(std::move(schema)), src_(std::move(src)) {}
+BinaryOperation Flip(BinaryOperation operation) {
+  switch (operation) {
+    case BinaryOperation::kLessThan:
+      return BinaryOperation::kGreaterThan;
+    case BinaryOperation::kLessThanEquals:
+      return BinaryOperation::kGreaterThanEquals;
+    case BinaryOperation::kGreaterThan:
+      return BinaryOperation::kLessThan;
+    case BinaryOperation::kGreaterThanEquals:
+      return BinaryOperation::kLessThanEquals;
+    default:
+      return operation;
+  }
+}
+
+bool BatchMayMatch(const Expression& expression, const Schema& schema,
+                   const DataChunk& chunk) {
+  if (!expression || expression->Type() != TypeTag::kBinaryExp) return true;
+  const BinaryExpression& binary = expression->AsBinaryExpression();
+  if (binary.Op() == BinaryOperation::kAnd) {
+    return BatchMayMatch(binary.Left(), schema, chunk) &&
+           BatchMayMatch(binary.Right(), schema, chunk);
+  }
+  if (binary.Op() == BinaryOperation::kOr) {
+    return BatchMayMatch(binary.Left(), schema, chunk) ||
+           BatchMayMatch(binary.Right(), schema, chunk);
+  }
+  if (!IsComparison(binary.Op())) return true;
+  const Expression* column = &binary.Left();
+  const Expression* constant = &binary.Right();
+  BinaryOperation operation = binary.Op();
+  if ((*column)->Type() == TypeTag::kConstantValue &&
+      (*constant)->Type() == TypeTag::kColumnValue) {
+    std::swap(column, constant);
+    operation = Flip(operation);
+  }
+  if ((*column)->Type() != TypeTag::kColumnValue ||
+      (*constant)->Type() != TypeTag::kConstantValue) {
+    return true;
+  }
+  const int offset =
+      schema.Offset((*column)->AsColumnValue().GetColumnName());
+  if (offset < 0) return true;
+  return chunk.ZoneMapAt(static_cast<size_t>(offset))
+      .MayMatch(operation, (*constant)->AsConstantValue().GetValue());
+}
+
+}  // namespace
+
+Selection::Selection(Expression exp, Schema schema, Executor src,
+                     size_t jit_threshold_rows)
+    : exp_(std::move(exp)),
+      schema_(std::move(schema)),
+      src_(std::move(src)),
+      jit_threshold_rows_(jit_threshold_rows) {
+  bytecode_ = BytecodeCompiler::Compile(exp_, schema_);
+}
 
 bool Selection::Next(Row* dst, RowPosition* rp) {
-  Row orig;
-  while (src_->Next(&orig, rp)) {
-    if (exp_->Evaluate(orig, schema_).value.int_value != 0) {
-      *dst = orig;
-      return true;
+  if (output_offset_ >= output_batch_.Size()) {
+    if (NextBatch(&output_batch_) == 0) return false;
+    output_offset_ = 0;
+  }
+  *dst = output_batch_.RowAt(output_offset_);
+  if (rp) *rp = output_batch_.PositionAt(output_offset_);
+  ++output_offset_;
+  return true;
+}
+
+size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset(schema_, max_rows);
+  while (destination->Size() < max_rows) {
+    const size_t requested = max_rows - destination->Size();
+    if (src_->NextBatch(&input_batch_, requested) == 0) break;
+    if (!BatchMayMatch(exp_, schema_, input_batch_)) {
+      ++skipped_batches_;
+      continue;
+    }
+    std::optional<ColumnVector> predicates;
+    rows_seen_ += input_batch_.Size();
+    if (bytecode_ && !jit_attempted_ && rows_seen_ >= jit_threshold_rows_) {
+      jit_attempted_ = true;
+      const auto& instructions = bytecode_->Instructions();
+      if (instructions.size() == 3 &&
+          instructions[0].opcode == BytecodeOp::kLoadColumn &&
+          instructions[1].opcode == BytecodeOp::kLoadConstant &&
+          instructions[2].opcode == BytecodeOp::kBinaryInt64 &&
+          bytecode_->Constants()[instructions[1].operand].type ==
+              ValueType::kInt64) {
+        jit_column_ = instructions[0].operand;
+        jit_constant_ =
+            bytecode_->Constants()[instructions[1].operand].value.int_value;
+        jit_operation_ = instructions[2].binary;
+        jit_filter_ = JitInt64Kernels::CompileFilter(jit_operation_);
+      }
+    }
+    if (jit_filter_ && input_batch_.ZoneMapAt(jit_column_).NullCount() == 0) {
+      std::vector<uint8_t> result(input_batch_.Size());
+      jit_filter_->Filter(input_batch_.ColumnAt(jit_column_).IntegerData().data(),
+                          result.data(), result.size(), jit_constant_);
+      predicates.emplace(ValueType::kInt64, input_batch_.Size());
+      for (uint8_t value : result) predicates->Append(Value(value != 0));
+      ++jit_batches_;
+    } else if (bytecode_) {
+      predicates.emplace(bytecode_->EvaluateBatch(input_batch_));
+    }
+    for (size_t i = 0; i < input_batch_.Size(); ++i) {
+      const Value predicate = predicates
+                                  ? predicates->ValueAt(i)
+                                  : exp_->Evaluate(input_batch_.RowAt(i),
+                                                   schema_);
+      if (!predicate.IsNull() && predicate.Truthy()) {
+        destination->Append(input_batch_, i);
+      }
     }
   }
-  return false;
+  return destination->Size();
 }
 
 void Selection::Dump(std::ostream& o, int indent) const {
-  o << "Selection: " << *exp_ << "\n" << Indent(indent + 2);
+  o << "Selection: " << *exp_ << " (zone-map skipped=" << skipped_batches_
+    << ", jit batches=" << jit_batches_ << ")\n" << Indent(indent + 2);
   src_->Dump(o, indent + 2);
 }
 

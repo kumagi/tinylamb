@@ -24,6 +24,9 @@
 
 namespace tinylamb {
 
+[[nodiscard]] Value EvaluateBinary(BinaryOperation operation,
+                                   const Value& left, const Value& right);
+
 class BinaryExpression : public ExpressionBase {
  public:
   BinaryExpression(Expression left, BinaryOperation op, Expression right)
@@ -31,6 +34,12 @@ class BinaryExpression : public ExpressionBase {
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kBinaryExp; }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
+  [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,
+                               const Row* right,
+                               const Schema& right_schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
+  [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
+                                          const Schema& right) const override;
   [[nodiscard]] BinaryOperation Op() const { return op_; }
   [[nodiscard]] const Expression& Left() const { return left_; }
   [[nodiscard]] const Expression& Right() const { return right_; }

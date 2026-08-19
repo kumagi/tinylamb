@@ -6,6 +6,135 @@ tinylamb
 
 A simple implementation of RDBMS.
 
+SQL frontend
+============
+
+The `tinylamb` executable reads one SQL statement from standard input. The
+pinned GoogleSQL parser produces its parser AST, a visitor converts that tree
+directly to tinylamb expressions and relational query nodes, and the resulting
+plan is executed by tinylamb. SQL text is not parsed again by tinylamb's legacy
+Tokenizer, Parser, or PrattParser.
+
+```console
+cmake -S . -B build
+cmake --build build -j
+echo "SELECT * FROM warehouse WHERE w_id = 1;" | ./build/tinylamb tpcc
+```
+
+CMake downloads the pinned GoogleSQL `execute_query` release and verifies its
+SHA-256 checksum. Bazel is not required. GoogleSQL AST mode is required by the
+SQL executable; configuring with `-DTINYLAMB_ENABLE_GOOGLESQL=OFF` leaves only
+the lower-level tinylamb libraries available.
+
+The SQL execution path supports the TPC-C transaction query shapes (excluding
+stored procedures) and all 22 TPC-H queries. This includes inner and left
+joins, derived tables, CTEs, correlated scalar/`IN`/`EXISTS` subqueries,
+`GROUP BY`/`HAVING`, nested and distinct aggregates, `CASE`, `LIKE`, `BETWEEN`,
+date intervals and extraction, `ORDER BY`, `LIMIT`/`OFFSET`, `INSERT`, `UPDATE`,
+and `DELETE`. End-to-end coverage lives in `query/sql_engine_tpcc_test.cpp` and
+`query/sql_engine_tpch_test.cpp`.
+
+`EXPLAIN` returns the selected physical execution strategy without running the
+query. `EXPLAIN ANALYZE` executes it and adds actual row count, planning and
+execution time, scan/filter/join/project/sort timings, join comparison counts,
+peak intermediate rows, and subquery/index cache counters. Both forms work
+through standard input and PostgreSQL simple-query clients such as `psql`.
+
+```sql
+EXPLAIN SELECT * FROM lineitem WHERE l_orderkey = 1;
+EXPLAIN ANALYZE SELECT l_returnflag, COUNT(*) FROM lineitem
+  GROUP BY l_returnflag;
+```
+
+The TPC-H benchmark takes a scale factor, builds the pinned TPC-H DBGEN tool,
+generates all eight official-distribution `.tbl` files, validates their
+cardinalities, loads them with their SQL types, and executes all 22 queries. It
+prints each runtime profile followed by a slowest-first summary. DBGEN is only
+downloaded when this explicit benchmark target is built.
+
+```console
+cmake --build build -j --target tinylamb_tpch_benchmark
+./build/tinylamb_tpch_benchmark /var/tmp/tinylamb-tpch-sf1/database \
+  --scale-factor 1 --data-dir /var/tmp/tinylamb-tpch-sf1/data
+```
+
+`--reuse-database` skips schema creation and loading for a previously loaded
+database, and `--query N` runs one query while investigating a plan. `--force`
+only replaces the three tinylamb database files at the exact path supplied.
+Scale factors outside the official TPC-H set are accepted for quick engineering
+smoke tests but are reported as non-official.
+
+PostgreSQL-compatible TCP server
+================================
+
+`tinylamb_server` exposes the same SQL engine through PostgreSQL's version 3
+wire protocol. It uses a non-blocking `epoll` event loop and accepts multiple
+TCP clients. The standard-input `tinylamb` executable remains available for
+scripts and debugging.
+
+```console
+cmake --build build -j --target tinylamb_server
+./build/tinylamb_server warehouse.db --host 127.0.0.1 --port 54321 \
+  --read-workers 8
+
+# In another terminal:
+psql -X "host=127.0.0.1 port=54321 user=tinylamb dbname=warehouse sslmode=prefer"
+```
+
+The server supports PostgreSQL startup negotiation, trust authentication,
+simple queries, text result rows and NULLs, command tags, error responses,
+and `BEGIN`/`COMMIT`/`ROLLBACK`. Autocommit `SELECT`/`WITH` queries run on a
+worker pool, so independent clients execute read-only transactions in parallel
+without blocking the epoll I/O loop. The default worker count is the detected
+hardware concurrency and can be set with `--read-workers`. TLS/GSS encryption
+requests are declined and
+clients continue over plain TCP. The default bind address is therefore
+`127.0.0.1`; binding to a non-loopback address should only be done on a trusted
+network. PostgreSQL extended-query messages, `COPY`, catalog compatibility for
+psql backslash commands such as `\\dt`, and PostgreSQL user/password management
+are not implemented yet.
+
+Read scaling can be measured with the bundled PostgreSQL-protocol benchmark
+client after creating a table named `read_scale` with an integer `id` column:
+
+```console
+cmake --build build -j --target tinylamb_pg_read_benchmark
+./build/tinylamb_pg_read_benchmark --host 127.0.0.1 --port 54321 \
+  --clients 8 --warmup 3 --seconds 15 --database warehouse
+```
+
+Cascades optimizer
+==================
+
+Logical joins are explored in a Cascades-style memo rather than by the old
+subset dynamic-programming loop. Scalar normalization, logical
+transformations, and physical implementations are independent named rule
+sets, each with a small C++ pattern DSL and add/remove APIs. See
+[`docs/cascades_optimizer.md`](docs/cascades_optimizer.md) for the architecture
+and extension examples.
+
+TPC-C workload benchmark
+========================
+
+The benchmark client initializes a new scaled TPC-C database, verifies all
+five transaction types once, and then runs the standard 45/43/4/4/4 mix:
+
+```console
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target tinylamb_tpcc_benchmark
+./build/tinylamb_tpcc_benchmark /tmp/tinylamb-tpcc.db \
+  --clients 1 --warmup 3 --seconds 15 \
+  --warehouses 1 --districts 1 --customers 100 --items 100 \
+  --initial-orders 100 --order-lines 5 --seed 20260823
+```
+
+Each SQL statement goes through the GoogleSQL frontend, tinylamb optimizer,
+executor, and transaction commit path. The client reports committed
+transactions per second (`tps`) and executed SQL statements per second
+(`sql_qps`). It is currently single-client only. The reduced scale, omitted
+terminal think/keying time, and lack of an audited implementation mean the
+result is not an official TPC-C `tpmC` score.
+
 License
 ==========
 See ./LICENSE.txt

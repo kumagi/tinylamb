@@ -18,12 +18,17 @@
 #define TINYLAMB_TRANSACTION_MANAGER_HPP
 
 #include <atomic>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <shared_mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
+#include "page/row_position.hpp"
 
 namespace tinylamb {
 
@@ -44,7 +49,7 @@ class TransactionManager {
                      RecoveryManager* r)
       : lock_manager_(lm), page_manager_(pm), logger_(l), recovery_(r) {}
 
-  Transaction Begin();
+  Transaction Begin(bool read_only = false);
 
   Status PreCommit(Transaction& txn);
 
@@ -80,6 +85,17 @@ class TransactionManager {
 
   bool TryUpgradeLock(const RowPosition& rp);
 
+  [[nodiscard]] uint64_t CurrentCommitTimestamp() const {
+    return commit_timestamp_.load();
+  }
+  StatusOr<std::string> ReadVersion(
+      const Transaction& txn, const RowPosition& rp,
+      std::optional<std::string_view> physical) const;
+  void RegisterVersionWrite(Transaction& txn, const RowPosition& rp,
+                            std::optional<std::string_view> before,
+                            std::optional<std::string_view> after);
+  [[nodiscard]] bool RequiresHistoricalRead(const Transaction& txn) const;
+
   lsn_t AddLog(const LogRecord& lr);
   lsn_t CommittedLSN() const;
 
@@ -99,6 +115,28 @@ class TransactionManager {
 
   std::unordered_map<txn_id_t, Transaction*> active_transactions_;
   std::atomic<txn_id_t> next_txn_id_ = 1;
+  struct CommittedVersion {
+    uint64_t begin_ts{0};
+    uint64_t end_ts{std::numeric_limits<uint64_t>::max()};
+    std::optional<std::string> value;
+  };
+  struct PendingVersion {
+    txn_id_t owner{0};
+    std::optional<std::string> value;
+  };
+  struct VersionChain {
+    std::vector<CommittedVersion> committed;
+    std::optional<PendingVersion> pending;
+  };
+  void CommitVersions(Transaction& txn);
+  void AbortVersions(Transaction& txn);
+  void ReleaseLocksAndForget(Transaction& txn);
+  void GarbageCollectVersions();
+
+  std::atomic<uint64_t> commit_timestamp_{0};
+  mutable std::mutex version_lock_;
+  std::unordered_map<RowPosition, VersionChain> versions_;
+  std::unordered_map<txn_id_t, uint64_t> active_snapshots_;
   LockManager* const lock_manager_;
   PageManager* const page_manager_;
   Logger* const logger_;

@@ -24,6 +24,7 @@
 #include "common/env_endian.hpp"
 #include "common/serdes.hpp"
 #include "type/value_type.hpp"
+#include "type/date.hpp"
 
 namespace tinylamb {
 
@@ -68,7 +69,6 @@ Value::Value(int64_t int_val) {
   value.int_value = int_val;
 }
 
-
 /*
 Value::Value(std::string_view varchar_val) {
   type = ValueType::kVarChar;
@@ -86,39 +86,57 @@ Value::Value(double double_value) {
   value.double_value = double_value;
 }
 
-Value::Value(const Value& o)
-    : value(o.value), type(o.type), owned_data(o.owned_data) {
-  if (!owned_data.empty() && type == ValueType::kVarChar) {
+Value Value::Date(std::string_view date) {
+  return DateFromDays(ParseDateDays(date));
+}
+
+Value Value::DateFromDays(int64_t days) {
+  Value result;
+  result.type = ValueType::kDate;
+  result.value.int_value = days;
+  return result;
+}
+
+int64_t Value::DateDays() const {
+  if (type != ValueType::kDate) throw std::runtime_error("DATE value required");
+  return value.int_value;
+}
+
+Value::Value(const Value& o) : value(o.value), type(o.type) {
+  if (type == ValueType::kVarChar) {
+    owned_data.assign(o.value.varchar_value);
     value.varchar_value = owned_data;
   }
 }
 
-Value::Value(Value&& o) noexcept
-    : value(o.value), type(o.type), owned_data(std::move(o.owned_data)) {
-  if (!owned_data.empty() && type == ValueType::kVarChar) {
+Value::Value(Value&& o) : value(o.value), type(o.type) {
+  if (type == ValueType::kVarChar) {
+    owned_data.assign(o.value.varchar_value);
     value.varchar_value = owned_data;
   }
-  o.owned_data.clear();
 }
 
 Value& Value::operator=(const Value& rhs) {
+  if (this == &rhs) return *this;
   type = rhs.type;
   value = rhs.value;
-  if (!rhs.owned_data.empty()) {
-    owned_data = rhs.owned_data;
+  owned_data.clear();
+  if (type == ValueType::kVarChar) {
+    owned_data.assign(rhs.value.varchar_value);
     value.varchar_value = owned_data;
   }
   return *this;
 }
 
-Value& Value::operator=(Value&& o) noexcept {
+Value& Value::operator=(Value&& o) {
+  if (this == &o) return *this;
   type = o.type;
   value = o.value;
-  owned_data = std::move(o.owned_data);
-  if (!owned_data.empty()) {
+  owned_data.clear();
+  if (type == ValueType::kVarChar) {
+    owned_data.assign(o.value.varchar_value);
     value.varchar_value = owned_data;
   }
-  o.owned_data.clear();
   return *this;
 }
 
@@ -134,6 +152,7 @@ bool Value::Truthy() const {
     case ValueType::kNull:
       return 1;
     case ValueType::kInt64:
+    case ValueType::kDate:
       return sizeof(int64_t);
     case ValueType::kVarChar:
       return SerializeSize(value.varchar_value);
@@ -148,6 +167,7 @@ size_t Value::Serialize(char* dst) const {
     case ValueType::kNull:
       return SerializeNull(dst);
     case ValueType::kInt64:
+    case ValueType::kDate:
       return SerializeInteger(dst, value.int_value);
     case ValueType::kVarChar:
       return SerializeStringView(dst, value.varchar_value);
@@ -163,6 +183,7 @@ size_t Value::Deserialize(const char* src, ValueType as_type) {
     case ValueType::kNull:
       throw std::runtime_error("Cannot parse without type.");
     case ValueType::kInt64:
+    case ValueType::kDate:
       return DeserializeInteger(src, &value.int_value);
     case ValueType::kVarChar:
       return DeserializeStringView(src, &value.varchar_value);
@@ -178,6 +199,8 @@ size_t Value::Deserialize(const char* src, ValueType as_type) {
       return "(unknown type)";
     case ValueType::kInt64:
       return std::to_string(value.int_value);
+    case ValueType::kDate:
+      return FormatDateDays(value.int_value);
     case ValueType::kVarChar:
       return "\"" + std::string(value.varchar_value) + "\"";
     case ValueType::kDouble:
@@ -194,6 +217,7 @@ bool Value::operator==(const Value& rhs) const {
     case ValueType::kNull:
       return true;
     case ValueType::kInt64:
+    case ValueType::kDate:
       return value.int_value == rhs.value.int_value;
     case ValueType::kVarChar:
       return value.varchar_value == rhs.value.varchar_value;
@@ -301,6 +325,11 @@ std::string Value::EncodeMemcomparableFormat() const {
       throw std::runtime_error("Cannot encode unknown type.");
     case ValueType::kInt64:
       return EncodeMemcomparableFormatInteger(value.int_value);
+    case ValueType::kDate: {
+      std::string encoded = EncodeMemcomparableFormatInteger(value.int_value);
+      encoded[0] = static_cast<char>(ValueType::kDate);
+      return encoded;
+    }
     case ValueType::kVarChar:
       return EncodeMemcomparableFormatVarchar(value.varchar_value);
     case ValueType::kDouble:
@@ -315,6 +344,9 @@ size_t Value::DecodeMemcomparableFormat(const char* src) {
       throw std::runtime_error("Cannot decode unknown type.");
     case ValueType::kInt64:
       type = ValueType::kInt64;
+      return DecodeMemcomparableFormatInteger(src, &value.int_value) + 1;
+    case ValueType::kDate:
+      type = ValueType::kDate;
       return DecodeMemcomparableFormatInteger(src, &value.int_value) + 1;
     case ValueType::kVarChar: {
       type = ValueType::kVarChar;
@@ -337,6 +369,7 @@ bool Value::operator<(const Value& rhs) const {
     case ValueType::kNull:
       throw std::runtime_error("Unknown type cannot be compared.");
     case ValueType::kInt64:
+    case ValueType::kDate:
       return value.int_value < rhs.value.int_value;
     case ValueType::kVarChar:
       return value.varchar_value < rhs.value.varchar_value;
@@ -354,6 +387,7 @@ bool Value::operator>(const Value& rhs) const {
     case ValueType::kNull:
       throw std::runtime_error("Unknown type cannot be compared.");
     case ValueType::kInt64:
+    case ValueType::kDate:
       return value.int_value > rhs.value.int_value;
     case ValueType::kVarChar:
       return value.varchar_value > rhs.value.varchar_value;
@@ -479,6 +513,7 @@ Encoder& operator<<(Encoder& a, const Value& v) {
     case tinylamb::ValueType::kNull:
       break;
     case tinylamb::ValueType::kInt64:
+    case tinylamb::ValueType::kDate:
       a << v.value.int_value;
       break;
     case tinylamb::ValueType::kVarChar:
@@ -497,6 +532,7 @@ Decoder& operator>>(Decoder& e, Value& v) {
     case tinylamb::ValueType::kNull:
       break;
     case tinylamb::ValueType::kInt64:
+    case tinylamb::ValueType::kDate:
       e >> v.value.int_value;
       break;
     case tinylamb::ValueType::kVarChar:
@@ -517,6 +553,7 @@ uint64_t std::hash<tinylamb::Value>::operator()(
     case tinylamb::ValueType::kNull:
       break;
     case tinylamb::ValueType::kInt64:
+    case tinylamb::ValueType::kDate:
       return std::hash<int64_t>()(v.value.int_value);
     case tinylamb::ValueType::kVarChar:
       return std::hash<std::string_view>()(v.value.varchar_value);

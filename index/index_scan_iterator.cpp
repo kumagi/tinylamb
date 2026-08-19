@@ -36,6 +36,26 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+namespace {
+
+std::string EncodeBegin(const Value& value) {
+  return value.IsNull() ? std::string() : value.EncodeMemcomparableFormat();
+}
+
+std::string EncodeEnd(const Index& index, const Value& value) {
+  if (value.IsNull()) return {};
+  std::string encoded = value.EncodeMemcomparableFormat();
+  if (index.sc_.key_.size() > 1) {
+    // Optimizer ranges currently constrain the first index column. A composite
+    // key has encoded suffix columns, so the inclusive upper bound must cover
+    // every key sharing that prefix instead of stopping at the bare prefix.
+    encoded.push_back(static_cast<char>(0xff));
+  }
+  return encoded;
+}
+
+}  // namespace
+
 IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
                                      Transaction& txn, Value begin, Value end,
                                      bool ascending)
@@ -48,9 +68,8 @@ IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
       is_unique_(index.sc_.mode_ == IndexMode::kUnique),
       value_offset_(ascending_ ? 0 : -1),
       bpt_(index.Root()),
-      iter_(&bpt_, &txn,
-            begin_.IsNull() ? "" : begin_.EncodeMemcomparableFormat(),
-            end_.IsNull() ? "" : end_.EncodeMemcomparableFormat(), ascending) {
+      iter_(&bpt_, &txn, EncodeBegin(begin_), EncodeEnd(index_, end_),
+            ascending) {
   if (!iter_.IsValid()) {
     return;
   }
@@ -104,7 +123,7 @@ void IndexScanIterator::UpdateIteratorState() {
 }
 
 void IndexScanIterator::ResolveRow() const {
-  PageRef ref = txn_.GetPageManager()->GetPage(pos_.page_id);
+  PageRef ref = txn_.GetPageManager()->GetPage(pos_.page_id, txn_.IsReadOnly());
   if (!ref.IsValid()) {
     return;
   }

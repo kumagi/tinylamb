@@ -28,8 +28,11 @@ namespace tinylamb {
 void PageRef::PageUnlock() {
   assert(page_);
   assert(pool_);
-  if (page_lock_.owns_lock()) {
-    page_lock_.unlock();
+  if (exclusive_page_lock_.owns_lock()) {
+    exclusive_page_lock_.unlock();
+    pool_->Unpin(page_->PageID());
+  } else if (shared_page_lock_.owns_lock()) {
+    shared_page_lock_.unlock();
     pool_->Unpin(page_->PageID());
   }
 }

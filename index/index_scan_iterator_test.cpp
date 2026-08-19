@@ -85,12 +85,12 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
   // Arrange -- begin context, get table, insert 230 rows with ascending PK
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                         ctx.GetTable(kTableName));
+                        ctx.GetTable(kTableName));
   for (int i = 0; i < 230; ++i) {
     ASSERT_SUCCESS(
         table
             ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
-                                     Value(0.1 + i)}))
+                                    Value(0.1 + i)}))
             .GetStatus());
   }
 
@@ -99,7 +99,8 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
                                       Value(180));
   ASSERT_TRUE(it.IsValid());
 
-  // Assert -- iterator yields rows 43..180 in ascending order with expected values
+  // Assert -- iterator yields rows 43..180 in ascending order with expected
+  // values
   for (int i = 43; i <= 180; ++i) {
     Row cur = *it;
     ASSERT_EQ(cur[0], Value(i));
@@ -111,16 +112,17 @@ TEST_F(IndexScanIteratorTest, ScanAscending) {
 }
 
 TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
-  // Arrange -- begin context, get table, insert 120 rows with duplicate NameIdx values
+  // Arrange -- begin context, get table, insert 120 rows with duplicate NameIdx
+  // values
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                         ctx.GetTable(kTableName));
+                        ctx.GetTable(kTableName));
   for (int i = 0; i < 120; ++i) {
     ASSERT_SUCCESS(
         table
             ->Insert(ctx.txn_,
-                      Row({Value(i), Value("v" + std::to_string(i % 10)),
-                           Value(static_cast<double>(i * 2))}))
+                     Row({Value(i), Value("v" + std::to_string(i % 10)),
+                          Value(static_cast<double>(i * 2))}))
             .GetStatus());
   }
 
@@ -184,7 +186,7 @@ TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
       ++counter;
     }
     // Assert -- after deleting 24 rows (PK%5==0 out of 120), 96 remain
-    ASSERT_EQ(counter, 80);
+    ASSERT_EQ(counter, 96);
     ASSERT_FALSE(it.IsValid());
   }
 }
@@ -193,16 +195,17 @@ TEST_F(IndexScanIteratorTest, ScanDecending) {
   // Arrange -- begin context, get table, insert 230 rows with ascending PK
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                         ctx.GetTable(kTableName));
+                        ctx.GetTable(kTableName));
   for (int i = 0; i < 230; ++i) {
     ASSERT_SUCCESS(
         table
             ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
-                                     Value(0.1 + i)}))
+                                    Value(0.1 + i)}))
             .GetStatus());
   }
 
-  // Act -- begin descending index scan on PK between 104 and 200, iterate backward
+  // Act -- begin descending index scan on PK between 104 and 200, iterate
+  // backward
   Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(0), Value(104),
                                       Value(200), false);
   ASSERT_TRUE(it.IsValid());
@@ -219,16 +222,17 @@ TEST_F(IndexScanIteratorTest, ScanDecending) {
 }
 
 TEST_F(IndexScanIteratorTest, NonUniqueDescending) {
-  // Arrange -- begin context, get table, insert 120 rows with duplicate NameIdx values
+  // Arrange -- begin context, get table, insert 120 rows with duplicate NameIdx
+  // values
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                         ctx.GetTable(kTableName));
+                        ctx.GetTable(kTableName));
   for (int i = 0; i < 120; ++i) {
     ASSERT_SUCCESS(
         table
             ->Insert(ctx.txn_,
-                      Row({Value(i), Value("v" + std::to_string(i % 10)),
-                           Value(static_cast<double>(i * 2))}))
+                     Row({Value(i), Value("v" + std::to_string(i % 10)),
+                          Value(static_cast<double>(i * 2))}))
             .GetStatus());
   }
 

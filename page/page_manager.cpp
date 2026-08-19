@@ -33,9 +33,9 @@ PageManager::PageManager(std::string_view db_name, size_t capacity)
   GetMetaPage();
 }
 
-PageRef PageManager::GetPage(uint64_t page_id) {
+PageRef PageManager::GetPage(uint64_t page_id, bool shared) {
   bool cache_hit = false;
-  PageRef ref = pool_.GetPage(page_id, &cache_hit);
+  PageRef ref = pool_.GetPage(page_id, &cache_hit, shared);
   if (!cache_hit && !ref->IsValid()) {
     // Found a broken or new page.
     return {};

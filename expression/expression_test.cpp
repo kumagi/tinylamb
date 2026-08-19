@@ -50,7 +50,8 @@ TEST(ExpressionTest, ConstantEval) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each expression against empty row/schema and verify
+  // Act + Assert -- evaluate each expression against empty row/schema and
+  // verify
   ASSERT_EQ(cv_int->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(cv_varchar->Evaluate(dummy, dummy_schema), Value("hello"));
   ASSERT_EQ(cv_double->Evaluate(dummy, dummy_schema), Value(1.1));
@@ -198,7 +199,8 @@ TEST(ExpressionTest, NotEqual) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify not-equals semantics (0=false, 1=true)
+  // Act + Assert -- evaluate each and verify not-equals semantics (0=false,
+  // 1=true)
   ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(0));
   ASSERT_EQ(int_ne->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(double_eq->Evaluate(dummy, dummy_schema), Value(0));
@@ -239,7 +241,8 @@ TEST(ExpressionTest, LessThan) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify less-than semantics (1=true, 0=false)
+  // Act + Assert -- evaluate each and verify less-than semantics (1=true,
+  // 0=false)
   ASSERT_EQ(int_lt->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(0));
   ASSERT_EQ(int_gt->Evaluate(dummy, dummy_schema), Value(0));
@@ -252,7 +255,8 @@ TEST(ExpressionTest, LessThan) {
 }
 
 TEST(ExpressionTest, LessThanEquals) {
-  // Arrange -- construct nine binary less-than-or-equals expressions across types/signs
+  // Arrange -- construct nine binary less-than-or-equals expressions across
+  // types/signs
   Expression int_lt = BinaryExpressionExp(ConstantValueExp(Value(100)),
                                           BinaryOperation::kLessThanEquals,
                                           ConstantValueExp(Value(12312)));
@@ -283,7 +287,8 @@ TEST(ExpressionTest, LessThanEquals) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify <= semantics (1=true for less-or-equal, 0=false for greater)
+  // Act + Assert -- evaluate each and verify <= semantics (1=true for
+  // less-or-equal, 0=false for greater)
   ASSERT_EQ(int_lt->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(int_gt->Evaluate(dummy, dummy_schema), Value(0));
@@ -296,7 +301,8 @@ TEST(ExpressionTest, LessThanEquals) {
 }
 
 TEST(ExpressionTest, GreaterThan) {
-  // Arrange -- construct nine binary greater-than expressions across types/signs
+  // Arrange -- construct nine binary greater-than expressions across
+  // types/signs
   Expression int_lt = BinaryExpressionExp(ConstantValueExp(Value(100)),
                                           BinaryOperation::kGreaterThan,
                                           ConstantValueExp(Value(12312)));
@@ -327,7 +333,8 @@ TEST(ExpressionTest, GreaterThan) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify > semantics (1=true for greater, 0=false for less-or-equal)
+  // Act + Assert -- evaluate each and verify > semantics (1=true for greater,
+  // 0=false for less-or-equal)
   ASSERT_EQ(int_lt->Evaluate(dummy, dummy_schema), Value(0));
   ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(0));
   ASSERT_EQ(int_gt->Evaluate(dummy, dummy_schema), Value(1));
@@ -340,7 +347,8 @@ TEST(ExpressionTest, GreaterThan) {
 }
 
 TEST(ExpressionTest, GreaterThanEquals) {
-  // Arrange -- construct nine binary greater-than-or-equals expressions across types/signs
+  // Arrange -- construct nine binary greater-than-or-equals expressions across
+  // types/signs
   Expression int_lt = BinaryExpressionExp(ConstantValueExp(Value(100)),
                                           BinaryOperation::kGreaterThanEquals,
                                           ConstantValueExp(Value(12312)));
@@ -371,7 +379,8 @@ TEST(ExpressionTest, GreaterThanEquals) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify >= semantics (1=true for greater-or-equal, 0=false for less)
+  // Act + Assert -- evaluate each and verify >= semantics (1=true for
+  // greater-or-equal, 0=false for less)
   ASSERT_EQ(int_lt->Evaluate(dummy, dummy_schema), Value(0));
   ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(int_gt->Evaluate(dummy, dummy_schema), Value(1));
@@ -391,7 +400,8 @@ TEST(ExpressionTest, ColumnValue) {
   Schema sc("sc", cols);
   Row row({Value("foo"), Value(12), Value(132.3), Value(9)});
 
-  // Act + Assert -- evaluate ColumnValueExp for each column and verify it reads the row's field
+  // Act + Assert -- evaluate ColumnValueExp for each column and verify it reads
+  // the row's field
   ASSERT_EQ(ColumnValueExp("sc.name")->Evaluate(row, sc), Value("foo"));
   ASSERT_EQ(ColumnValueExp("score")->Evaluate(row, sc), Value(12));
   ASSERT_EQ(ColumnValueExp("flv")->Evaluate(row, sc), Value(132.3));
@@ -458,8 +468,9 @@ TEST(ExpressionTest, AggregateExpression) {
   Expression max_col =
       AggregateExpressionExp(AggregationType::kMax, ColumnValueExp("col"));
 
-  // Act + Assert -- aggregate expressions are not evaluated directly; executor computes them.
-  // Here we only verify ToString() renders the expected aggregate syntax.
+  // Act + Assert -- aggregate expressions are not evaluated directly; executor
+  // computes them. Here we only verify ToString() renders the expected
+  // aggregate syntax.
   ASSERT_EQ(count_all->ToString(), "COUNT(*)");
   ASSERT_EQ(count_col->ToString(), "COUNT(col)");
   ASSERT_EQ(sum_col->ToString(), "SUM(col)");
@@ -474,27 +485,28 @@ TEST(ExpressionTest, CaseExpression) {
   Schema dummy_schema;
   Expression case_exp_true =
       CaseExpressionExp({{BinaryExpressionExp(ConstantValueExp(Value(1)),
-                                               BinaryOperation::kEquals,
-                                               ConstantValueExp(Value(1))),
-                           ConstantValueExp(Value("one"))},
-                          {BinaryExpressionExp(ConstantValueExp(Value(2)),
-                                               BinaryOperation::kEquals,
-                                               ConstantValueExp(Value(1))),
-                           ConstantValueExp(Value("two"))}},
-                         ConstantValueExp(Value("other")));
+                                              BinaryOperation::kEquals,
+                                              ConstantValueExp(Value(1))),
+                          ConstantValueExp(Value("one"))},
+                         {BinaryExpressionExp(ConstantValueExp(Value(2)),
+                                              BinaryOperation::kEquals,
+                                              ConstantValueExp(Value(1))),
+                          ConstantValueExp(Value("two"))}},
+                        ConstantValueExp(Value("other")));
 
   Expression case_exp_false =
       CaseExpressionExp({{BinaryExpressionExp(ConstantValueExp(Value(2)),
-                                               BinaryOperation::kEquals,
-                                               ConstantValueExp(Value(1))),
-                           ConstantValueExp(Value("one"))},
-                          {BinaryExpressionExp(ConstantValueExp(Value(2)),
-                                               BinaryOperation::kEquals,
-                                               ConstantValueExp(Value(1))),
-                           ConstantValueExp(Value("two"))}},
-                         ConstantValueExp(Value("other")));
+                                              BinaryOperation::kEquals,
+                                              ConstantValueExp(Value(1))),
+                          ConstantValueExp(Value("one"))},
+                         {BinaryExpressionExp(ConstantValueExp(Value(2)),
+                                              BinaryOperation::kEquals,
+                                              ConstantValueExp(Value(1))),
+                          ConstantValueExp(Value("two"))}},
+                        ConstantValueExp(Value("other")));
 
-  // Act + Assert -- CASE returns "one" when first WHEN matches, "other" otherwise
+  // Act + Assert -- CASE returns "one" when first WHEN matches, "other"
+  // otherwise
   ASSERT_EQ(case_exp_true->Evaluate(dummy, dummy_schema), Value("one"));
   ASSERT_EQ(case_exp_false->Evaluate(dummy, dummy_schema), Value("other"));
 }
@@ -512,13 +524,15 @@ TEST(ExpressionTest, InExpression) {
                       {ConstantValueExp(Value(1)), ConstantValueExp(Value(2)),
                        ConstantValueExp(Value(3))});
 
-  // Act + Assert -- IN returns true when left value is in the list, false otherwise
+  // Act + Assert -- IN returns true when left value is in the list, false
+  // otherwise
   ASSERT_EQ(in_exp_true->Evaluate(dummy, dummy_schema), Value(true));
   ASSERT_EQ(in_exp_false->Evaluate(dummy, dummy_schema), Value(false));
 }
 
 TEST(ExpressionTest, PathologicalCases) {
-  // Arrange -- empty row/schema for all sub-cases; sub-cases build their own expressions
+  // Arrange -- empty row/schema for all sub-cases; sub-cases build their own
+  // expressions
   Row dummy({});
   Schema dummy_schema;
 
@@ -559,8 +573,9 @@ TEST(ExpressionTest, PathologicalCases) {
   // Act 4 + Assert 4 -- evaluate and verify result equals true
   ASSERT_EQ(exp4->Evaluate(dummy, dummy_schema), Value(true));
 
-  // Subcase 5 -- ((1 + 2) * 3 - (4 / 2)) > 5 AND (true OR false) = (9 - 2) > 5 AND true = 7 > 5 AND true = true
-  // Arrange 5 -- deeply nested arithmetic+logical: ((1+2)*3 - 4/2) > 5 AND (true OR false)
+  // Subcase 5 -- ((1 + 2) * 3 - (4 / 2)) > 5 AND (true OR false) = (9 - 2) > 5
+  // AND true = 7 > 5 AND true = true Arrange 5 -- deeply nested
+  // arithmetic+logical: ((1+2)*3 - 4/2) > 5 AND (true OR false)
   Expression exp5 = BinaryExpressionExp(
       BinaryExpressionExp(
           BinaryExpressionExp(BinaryExpressionExp(ConstantValueExp(Value(1)),
@@ -575,6 +590,69 @@ TEST(ExpressionTest, PathologicalCases) {
       BinaryOperation::kGreaterThan, ConstantValueExp(Value(5)));
   // Act 5 + Assert 5 -- evaluate and verify result equals true
   ASSERT_EQ(exp5->Evaluate(dummy, dummy_schema), Value(true));
+}
+
+TEST(ExpressionTest, SqlNullThreeValuedLogic) {
+  const Row row;
+  const Schema schema;
+  const Expression null_value = ConstantValueExp(Value());
+  const Expression true_value = ConstantValueExp(Value(true));
+  const Expression false_value = ConstantValueExp(Value(false));
+
+  EXPECT_EQ(BinaryExpressionExp(null_value, BinaryOperation::kAnd, false_value)
+                ->Evaluate(row, schema),
+            Value(false));
+  EXPECT_TRUE(BinaryExpressionExp(null_value, BinaryOperation::kAnd, true_value)
+                  ->Evaluate(row, schema)
+                  .IsNull());
+  EXPECT_EQ(BinaryExpressionExp(null_value, BinaryOperation::kOr, true_value)
+                ->Evaluate(row, schema),
+            Value(true));
+  EXPECT_TRUE(BinaryExpressionExp(null_value, BinaryOperation::kOr, false_value)
+                  ->Evaluate(row, schema)
+                  .IsNull());
+  EXPECT_TRUE(BinaryExpressionExp(null_value, BinaryOperation::kEquals,
+                                  ConstantValueExp(Value(1)))
+                  ->Evaluate(row, schema)
+                  .IsNull());
+}
+
+TEST(ExpressionTest, MixedNumericEvaluationAndTypeInference) {
+  const Schema schema("numbers", {Column("integer", ValueType::kInt64),
+                                  Column("floating", ValueType::kDouble)});
+  const Row row({Value(2), Value(0.5)});
+  const Expression expression =
+      BinaryExpressionExp(ColumnValueExp("integer"), BinaryOperation::kAdd,
+                          ColumnValueExp("floating"));
+
+  const Value result = expression->Evaluate(row, schema);
+
+  ASSERT_EQ(result.type, ValueType::kDouble);
+  EXPECT_DOUBLE_EQ(result.value.double_value, 2.5);
+  EXPECT_EQ(expression->ResultType(schema).GetType(), TypeTag::kDouble);
+}
+
+TEST(ExpressionTest, TpchScalarFunctionsUseTheCommonExpressionEvaluator) {
+  const Row row;
+  const Schema schema;
+  const Expression date_add =
+      FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01")),
+                                   IntervalExpressionExp(1, "year")});
+  const Expression date_sub =
+      FunctionCallExp("date_sub", {ConstantValueExp(Value("1998-12-01")),
+                                   IntervalExpressionExp(74, "day")});
+  const Expression substring = FunctionCallExp(
+      "substr", {ConstantValueExp(Value("19-555-0100")),
+                 ConstantValueExp(Value(1)), ConstantValueExp(Value(2))});
+  const Expression year =
+      FunctionCallExp("extract_year", {ConstantValueExp(Value("1996-07-15"))});
+
+  EXPECT_EQ(date_add->Evaluate(row, schema), Value("1995-01-01"));
+  EXPECT_EQ(date_sub->Evaluate(row, schema), Value("1998-09-18"));
+  EXPECT_EQ(substring->Evaluate(row, schema), Value("19"));
+  EXPECT_EQ(year->Evaluate(row, schema), Value(1996));
+  EXPECT_EQ(date_add->ResultType(schema).GetType(), TypeTag::kVarChar);
+  EXPECT_EQ(year->ResultType(schema).GetType(), TypeTag::kBigInt);
 }
 
 }  // namespace tinylamb

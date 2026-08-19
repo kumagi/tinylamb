@@ -40,6 +40,8 @@ struct Row {
   const Value& operator[](size_t i) const;
   size_t Serialize(char* dst) const;
   size_t Deserialize(const char* src, const Schema& sc);
+  size_t DeserializeProjected(const char* src, const Schema& sc,
+                              const std::vector<slot_t>& columns);
   [[nodiscard]] size_t Size() const;
   [[nodiscard]] std::string EncodeMemcomparableFormat() const;
   void DecodeMemcomparableFormat(std::string_view src);

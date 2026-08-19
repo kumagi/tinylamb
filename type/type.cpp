@@ -30,6 +30,8 @@ size_t Type::Size() const {
       return sizeof(double);
     case TypeTag::kVarChar:
       return 0;
+    case TypeTag::kDate:
+      return sizeof(int64_t);
     default:
       throw std::runtime_error("Invalid type");
   }
@@ -45,6 +47,8 @@ std::string Type::ToString() const {
       return "DOUBLE";
     case TypeTag::kVarChar:
       return "VARCHAR";
+    case TypeTag::kDate:
+      return "DATE";
     default:
       return "INVALID";
   }

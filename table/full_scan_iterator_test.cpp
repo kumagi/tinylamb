@@ -16,6 +16,8 @@
 
 #include "full_scan_iterator.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -68,9 +70,9 @@ class FullScanIteratorTest : public ::testing::Test {
 };
 
 TEST_F(FullScanIteratorTest, Construct) {
-  // Arrange -- nothing to set up; default FullScanIteratorTest environment via SetUp()
-  // Act -- nothing to execute; default constructed via SetUp()
-  // Assert -- nothing to verify; gtest green on pass, death on crash
+  // Arrange -- nothing to set up; default FullScanIteratorTest environment via
+  // SetUp() Act -- nothing to execute; default constructed via SetUp() Assert
+  // -- nothing to verify; gtest green on pass, death on crash
 }
 
 TEST_F(FullScanIteratorTest, Scan) {
@@ -81,9 +83,9 @@ TEST_F(FullScanIteratorTest, Scan) {
   // Act -- insert 130 rows, then run a full scan iterator through all rows
   for (int i = 0; i < 130; ++i) {
     ASSERT_SUCCESS(
-        table.Insert(ctx.txn_,
-                     Row({Value(i), Value("v" + std::to_string(i)),
-                          Value(0.1 + i)}))
+        table
+            .Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                   Value(0.1 + i)}))
             .GetStatus());
   }
   Iterator it = table.BeginFullScan(ctx.txn_);
@@ -93,6 +95,85 @@ TEST_F(FullScanIteratorTest, Scan) {
   }
 
   // Assert -- implicit; full scan completes without crash; gtest green on pass
+}
+
+TEST_F(FullScanIteratorTest, ProjectedScanReturnsRequestedColumnsInOrder) {
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
+  ASSERT_SUCCESS(
+      table.Insert(ctx.txn_, Row({Value(42), Value("not copied"), Value(3.5)}))
+          .GetStatus());
+
+  Iterator projected = table.BeginFullScan(ctx.txn_, {0, 2});
+  ASSERT_TRUE(projected.IsValid());
+  ASSERT_EQ((*projected).values_.size(), 2);
+  EXPECT_EQ((*projected)[0], Value(42));
+  EXPECT_EQ((*projected)[1], Value(3.5));
+
+  Iterator no_columns = table.BeginFullScan(ctx.txn_, {});
+  ASSERT_TRUE(no_columns.IsValid());
+  EXPECT_TRUE((*no_columns).values_.empty());
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest, ScanAfterDeletingFirstSlot) {
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
+  RowPosition first;
+  for (int i = 0; i < 6; ++i) {
+    ASSIGN_OR_ASSERT_FAIL(
+        RowPosition, position,
+        table.Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                    Value(0.1 + i)})));
+    if (i == 0) first = position;
+  }
+  ASSERT_SUCCESS(table.Delete(ctx.txn_, first));
+
+  int count = 0;
+  int64_t maximum = 0;
+  for (Iterator it = table.BeginFullScan(ctx.txn_); it.IsValid(); ++it) {
+    ++count;
+    maximum = std::max(maximum, (*it)[0].value.int_value);
+  }
+
+  EXPECT_EQ(count, 5);
+  EXPECT_EQ(maximum, 5);
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest, OldSnapshotScansPhysicallyDeletedTailRow) {
+  TransactionContext seed = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(seed, "SampleTable"));
+  RowPosition tail;
+  for (int i = 0; i < 2; ++i) {
+    ASSIGN_OR_ASSERT_FAIL(
+        RowPosition, inserted,
+        table.Insert(seed.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                     Value(0.1 + i)})));
+    tail = inserted;
+  }
+  ASSERT_SUCCESS(seed.PreCommit());
+
+  TransactionContext old_reader = db_->BeginContext();
+  TransactionContext writer = db_->BeginContext();
+  ASSERT_SUCCESS(table.Delete(writer.txn_, tail));
+  ASSERT_SUCCESS(writer.PreCommit());
+
+  size_t old_count = 0;
+  for (Iterator it = table.BeginFullScan(old_reader.txn_); it.IsValid(); ++it) {
+    ++old_count;
+  }
+  EXPECT_EQ(old_count, 2);
+  ASSERT_SUCCESS(old_reader.PreCommit());
+
+  TransactionContext fresh_reader = db_->BeginContext();
+  size_t fresh_count = 0;
+  for (Iterator it = table.BeginFullScan(fresh_reader.txn_); it.IsValid();
+       ++it) {
+    ++fresh_count;
+  }
+  EXPECT_EQ(fresh_count, 1);
+  ASSERT_SUCCESS(fresh_reader.PreCommit());
 }
 
 }  // namespace tinylamb

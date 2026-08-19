@@ -28,6 +28,7 @@ enum class TokenType {
   kNumeric,
   kString,
   kComma,
+  kDot,
   kLParen,
   kRParen,
   kSemicolon,
@@ -50,6 +51,8 @@ struct Token {
         return "String<" + value + ">";
       case TokenType::kComma:
         return "Comma";
+      case TokenType::kDot:
+        return "Dot";
       case TokenType::kLParen:
         return "LParen";
       case TokenType::kRParen:

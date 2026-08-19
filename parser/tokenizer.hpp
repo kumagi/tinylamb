@@ -35,6 +35,7 @@ class Tokenizer {
   char Advance();
   void SkipWhitespace();
   Token Identifier();
+  Token QuotedIdentifier();
   Token Numeric();
   Token String();
   Token Operator();

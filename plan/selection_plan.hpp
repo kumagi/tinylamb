@@ -29,7 +29,9 @@ namespace tinylamb {
 class SelectionPlan final : public PlanBase {
  public:
   SelectionPlan(Plan src, Expression exp, TableStatistics stat)
-      : src_(std::move(src)), exp_(std::move(exp)), stats_(std::move(stat)) {}
+      : src_(std::move(src)),
+        exp_(std::move(exp)),
+        stats_(stat.Filter(src_->GetSchema(), exp_)) {}
   SelectionPlan(const SelectionPlan&) = delete;
   SelectionPlan(SelectionPlan&&) = delete;
   SelectionPlan& operator=(const SelectionPlan&) = delete;

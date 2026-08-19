@@ -28,13 +28,17 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
+#include "executor/constant_executor.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/hash_join.hpp"
 #include "executor/index_join.hpp"
 #include "executor/index_scan.hpp"
 #include "executor/insert.hpp"
+#include "executor/parallel_scan.hpp"
+#include "executor/parallel_aggregation.hpp"
 #include "executor/projection.hpp"
 #include "executor/selection.hpp"
+#include "executor/sort.hpp"
 #include "executor/update.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
@@ -49,6 +53,40 @@
 
 namespace tinylamb {
 static const char* const kTableName = "SampleTable";
+
+class SyntheticBatchExecutor final : public ExecutorBase {
+ public:
+  explicit SyntheticBatchExecutor(size_t row_count) : row_count_(row_count) {}
+
+  bool Next(Row* destination, RowPosition* position) override {
+    if (next_row_ == row_count_) return false;
+    *destination = Row({Value(static_cast<int64_t>(next_row_ % 100))});
+    if (position) *position = RowPosition(1, next_row_);
+    ++next_row_;
+    return true;
+  }
+
+  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+    const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+    destination->Reset(schema, max_rows);
+    const size_t batch_rows = std::min<size_t>(max_rows, 64);
+    while (next_row_ < row_count_ && destination->Size() < batch_rows) {
+      destination->Append(
+          Row({Value(static_cast<int64_t>(next_row_ % 100))}),
+          RowPosition(1, next_row_));
+      ++next_row_;
+    }
+    return destination->Size();
+  }
+
+  void Dump(std::ostream& out, int /*indent*/) const override {
+    out << "SyntheticBatchExecutor";
+  }
+
+ private:
+  size_t row_count_;
+  size_t next_row_{0};
+};
 
 class ExecutorTest : public ::testing::Test {
  public:
@@ -263,6 +301,90 @@ TEST_F(ExecutorTest, Selection) {
   // Assert -- matched row is in expected set and cursor exhausts after one match
   ASSERT_NE(rows.find(got), rows.end());
   ASSERT_FALSE(sel.Next(&got, nullptr));
+}
+
+TEST_F(ExecutorTest, SelectionSkipsImpossibleZoneMapBatch) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  Selection selection(
+      BinaryExpressionExp(ColumnValueExp("key"),
+                          BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(1000))),
+      table->GetSchema(), std::make_shared<FullScan>(ctx.txn_, *table));
+  DataChunk output;
+  EXPECT_EQ(selection.NextBatch(&output), 0U);
+  EXPECT_EQ(selection.SkippedBatches(), 1U);
+}
+
+TEST_F(ExecutorTest, SelectionUsesJitForLargeIntegerBatches) {
+  std::vector<Row> rows;
+  rows.reserve(2048);
+  for (int64_t value = 0; value < 2048; ++value) {
+    rows.emplace_back(std::vector<Value>{Value(value)});
+  }
+  const Schema schema("jit", {Column("value", ValueType::kInt64)});
+  Selection selection(
+      BinaryExpressionExp(ColumnValueExp("value"),
+                          BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(1000))),
+      schema, std::make_shared<ConstantExecutor>(std::move(rows)), 1024);
+  DataChunk output;
+  size_t selected = 0;
+  while (selection.NextBatch(&output) != 0) selected += output.Size();
+  EXPECT_EQ(selected, 1047U);
+  EXPECT_GE(selection.JitBatches(), 1U);
+}
+
+TEST_F(ExecutorTest, ProjectionUsesJitForLargeAffineIntegerBatches) {
+  std::vector<Row> rows;
+  rows.reserve(2048);
+  for (int64_t value = 0; value < 2048; ++value) {
+    rows.emplace_back(std::vector<Value>{Value(value)});
+  }
+  const Schema schema("jit", {Column("value", ValueType::kInt64)});
+  std::vector<NamedExpression> expressions = {NamedExpression(
+      "affine",
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("value"),
+                              BinaryOperation::kMultiply,
+                              ConstantValueExp(Value(3))),
+          BinaryOperation::kAdd, ConstantValueExp(Value(7))))};
+  Projection projection(std::move(expressions), schema,
+                        std::make_shared<ConstantExecutor>(std::move(rows)),
+                        1024);
+  DataChunk output;
+  size_t offset = 0;
+  while (projection.NextBatch(&output) != 0) {
+    for (size_t row = 0; row < output.Size(); ++row) {
+      EXPECT_EQ(output.ColumnAt(0).ValueAt(row),
+                Value(static_cast<int64_t>((offset + row) * 3 + 7)));
+    }
+    offset += output.Size();
+  }
+  EXPECT_EQ(offset, 2048U);
+  EXPECT_GE(projection.JitBatches(), 1U);
+}
+
+TEST_F(ExecutorTest, AggregationUsesJitForLargeIntegerSumBatches) {
+  std::vector<Row> rows;
+  rows.reserve(2048);
+  int64_t expected = 0;
+  for (int64_t value = 0; value < 2048; ++value) {
+    rows.emplace_back(std::vector<Value>{Value(value)});
+    expected += value;
+  }
+  const Schema schema("jit", {Column("value", ValueType::kInt64)});
+  std::vector<NamedExpression> aggregates = {NamedExpression(
+      "sum", AggregateExpressionExp(AggregationType::kSum,
+                                     ColumnValueExp("value")))};
+  AggregationExecutor aggregate(
+      std::make_shared<ConstantExecutor>(std::move(rows)), schema,
+      std::move(aggregates), 1024);
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+  EXPECT_EQ(result[0], Value(expected));
+  EXPECT_GE(aggregate.JitBatches(), 1U);
 }
 
 TEST_F(ExecutorTest, BasicJoin) {
@@ -570,5 +692,145 @@ TEST_F(ExecutorTest, Aggregation) {
   ASSERT_EQ(result[3], Value(1.2));
   ASSERT_EQ(result[4], Value(12.2));
   ASSERT_FALSE(agg.Next(&result, nullptr));
+}
+
+TEST_F(ExecutorTest, VectorizedScanFilterProjectAggregatePipeline) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  const Schema input_schema = table->GetSchema();
+  auto scan = std::make_shared<FullScan>(ctx.txn_, *table);
+  auto filter = std::make_shared<Selection>(
+      BinaryExpressionExp(ColumnValueExp("score"),
+                          BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(4.0))),
+      input_schema, scan);
+  std::vector<NamedExpression> projections = {
+      NamedExpression(
+          "doubled",
+          BinaryExpressionExp(ColumnValueExp("score"),
+                              BinaryOperation::kMultiply,
+                              ConstantValueExp(Value(2.0))))};
+  auto project = std::make_shared<Projection>(projections, input_schema,
+                                              std::move(filter));
+  const Schema projected_schema(
+      "projected", {Column("doubled", ValueType::kDouble)});
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("count",
+                      AggregateExpressionExp(AggregationType::kCount,
+                                             ColumnValueExp("doubled"))),
+      NamedExpression("sum",
+                      AggregateExpressionExp(AggregationType::kSum,
+                                             ColumnValueExp("doubled")))};
+  AggregationExecutor aggregate(std::move(project), projected_schema,
+                                std::move(aggregates));
+
+  DataChunk output;
+  ASSERT_EQ(aggregate.NextBatch(&output, 8), 1);
+  ASSERT_EQ(output.Size(), 1);
+  const Row result = output.RowAt(0);
+  EXPECT_EQ(result[0], Value(3));
+  EXPECT_EQ(result[1], Value(42.48));
+  EXPECT_EQ(aggregate.NextBatch(&output, 8), 0);
+}
+
+TEST_F(ExecutorTest, MorselDrivenParallelScanReadsEveryPageOnce) {
+  constexpr char kParallelTable[] = "ParallelScanTable";
+  constexpr int64_t kRows = 2000;
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema schema{kParallelTable,
+                  {Column("key", ValueType::kInt64),
+                   Column("payload", ValueType::kVarChar)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    for (int64_t key = 0; key < kRows; ++key) {
+      std::string payload = "row-" + std::to_string(key);
+      payload.resize(100, 'x');
+      ASSERT_SUCCESS(table.Insert(
+          writer.txn_, Row({Value(key), Value(std::move(payload))})).GetStatus());
+    }
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+
+  TransactionContext reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable(kParallelTable));
+  ParallelScan scan(reader.txn_, *table, 4, 1);
+  ASSERT_GT(scan.MorselCount(), 4U);
+  EXPECT_EQ(scan.WorkerCount(), 4U);
+
+  std::unordered_set<int64_t> keys;
+  DataChunk chunk;
+  while (scan.NextBatch(&chunk, 37) != 0) {
+    ASSERT_LE(chunk.Size(), 37U);
+    for (size_t row = 0; row < chunk.Size(); ++row) {
+      EXPECT_TRUE(keys.insert(chunk.ColumnAt(0).ValueAt(row).value.int_value)
+                      .second);
+    }
+  }
+  EXPECT_EQ(keys.size(), static_cast<size_t>(kRows));
+  EXPECT_TRUE(keys.contains(0));
+  EXPECT_TRUE(keys.contains(kRows - 1));
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+TEST_F(ExecutorTest, ThreadLocalAggregationMergesPartialAndDistinctStates) {
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  auto input = std::make_shared<SyntheticBatchExecutor>(10000);
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("count",
+                      AggregateExpressionExp(AggregationType::kCount,
+                                             ColumnValueExp("value"))),
+      NamedExpression("sum",
+                      AggregateExpressionExp(AggregationType::kSum,
+                                             ColumnValueExp("value"))),
+      NamedExpression("avg",
+                      AggregateExpressionExp(AggregationType::kAvg,
+                                             ColumnValueExp("value"))),
+      NamedExpression("min",
+                      AggregateExpressionExp(AggregationType::kMin,
+                                             ColumnValueExp("value"))),
+      NamedExpression("max",
+                      AggregateExpressionExp(AggregationType::kMax,
+                                             ColumnValueExp("value"))),
+      NamedExpression("distinct_count",
+                      AggregateExpressionExp(AggregationType::kCount,
+                                             ColumnValueExp("value"), true))};
+  ParallelAggregationExecutor aggregate(input, schema, std::move(aggregates),
+                                        4);
+
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+  EXPECT_EQ(result[0], Value(10000));
+  EXPECT_EQ(result[1], Value(495000));
+  EXPECT_EQ(result[2], Value(49.5));
+  EXPECT_EQ(result[3], Value(0));
+  EXPECT_EQ(result[4], Value(99));
+  EXPECT_EQ(result[5], Value(100));
+  EXPECT_FALSE(aggregate.Next(&result, nullptr));
+}
+
+TEST_F(ExecutorTest, ParallelSortPreservesOrderAndStableTies) {
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  auto input = std::make_shared<SyntheticBatchExecutor>(10000);
+  SortExecutor sort(input, schema, {{ColumnValueExp("value"), true}}, 4);
+
+  int64_t previous_value = -1;
+  slot_t previous_position = 0;
+  size_t count = 0;
+  Row row;
+  RowPosition position;
+  while (sort.Next(&row, &position)) {
+    const int64_t value = row[0].value.int_value;
+    EXPECT_GE(value, previous_value);
+    if (value == previous_value) {
+      EXPECT_GT(position.slot, previous_position);
+    }
+    previous_value = value;
+    previous_position = position.slot;
+    ++count;
+  }
+  EXPECT_EQ(count, 10000U);
+  EXPECT_EQ(previous_value, 99);
 }
 }  // namespace tinylamb

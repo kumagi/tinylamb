@@ -37,9 +37,8 @@ AggregationPlan::AggregationPlan(Plan child,
 const Schema& AggregationPlan::GetSchema() const { return schema_; }
 
 Executor AggregationPlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<AggregationExecutor>(child_->EmitExecutor(ctx),
-                                                child_->GetSchema(),
-                                                aggregates_);
+  return std::make_shared<AggregationExecutor>(
+      child_->EmitExecutor(ctx), child_->GetSchema(), aggregates_);
 }
 
 const Table* AggregationPlan::ScanSource() const {
@@ -73,7 +72,20 @@ void AggregationPlan::Dump(std::ostream& o, int indent) const {
 Schema AggregationPlan::GenerateSchema() const {
   std::vector<Column> columns;
   for (const auto& agg : aggregates_) {
-    columns.emplace_back(agg.name, ValueType::kInt64);
+    const auto& expression = agg.expression->AsAggregateExpression();
+    ValueType type = ValueType::kInt64;
+    if (expression.GetType() == AggregationType::kAvg) {
+      type = ValueType::kDouble;
+    } else if (expression.GetType() != AggregationType::kCount &&
+               expression.Child()->Type() == TypeTag::kColumnValue) {
+      const int offset = child_->GetSchema().Offset(
+          expression.Child()->AsColumnValue().GetColumnName());
+      if (offset >= 0) {
+        type =
+            child_->GetSchema().GetColumn(static_cast<size_t>(offset)).Type();
+      }
+    }
+    columns.emplace_back(agg.name, type);
   }
   return {"", columns};
 }

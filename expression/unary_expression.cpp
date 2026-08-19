@@ -16,8 +16,8 @@
 
 #include "expression/unary_expression.hpp"
 
-#include <string>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 
 #include "expression/expression.hpp"
@@ -26,30 +26,60 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+namespace {
+
+}  // namespace
+
+Value EvaluateUnary(UnaryOperation operation, Value child) {
+  switch (operation) {
+    case UnaryOperation::kIsNull:
+      return Value(child.IsNull());
+    case UnaryOperation::kIsNotNull:
+      return Value(!child.IsNull());
+    case UnaryOperation::kNot:
+      return child.IsNull() ? Value() : Value(!child.Truthy());
+    case UnaryOperation::kMinus:
+      if (child.IsNull()) return Value();
+      if (child.type == ValueType::kDouble) {
+        return Value(-child.value.double_value);
+      }
+      if (child.type == ValueType::kInt64) return Value(-child.value.int_value);
+      throw std::runtime_error("unary minus requires a number");
+  }
+  throw std::logic_error("invalid unary operation");
+}
+
+Type UnaryResultType(UnaryOperation operation, const Type& child) {
+  if (operation == UnaryOperation::kIsNull ||
+      operation == UnaryOperation::kIsNotNull ||
+      operation == UnaryOperation::kNot) {
+    return Type(TypeTag::kBigInt);
+  }
+  return child;
+}
 
 std::unordered_set<ColumnName> UnaryExpression::TouchedColumns() const {
   return child_->TouchedColumns();
 }
 
 Value UnaryExpression::Evaluate(const Row& row, const Schema& schema) const {
-  Value child = child_->Evaluate(row, schema);
-  switch (operation_) {
-    case UnaryOperation::kIsNull:
-      return Value(child.IsNull());
-    case UnaryOperation::kIsNotNull:
-      return Value(!child.IsNull());
-    case UnaryOperation::kNot:
-      if (child.IsNull()) {
-        return Value();
-      }
-      return Value(!child.Truthy());
-    case UnaryOperation::kMinus:
-      if (child.type == ValueType::kDouble) {
-        return Value(-child.value.double_value);
-      }
-      return Value(-child.value.int_value);
-  }
-  throw std::logic_error("invalid unary operation");
+  return EvaluateUnary(operation_, child_->Evaluate(row, schema));
+}
+
+Value UnaryExpression::Evaluate(const Row* left, const Schema& left_schema,
+                                const Row* right,
+                                const Schema& right_schema) const {
+  return EvaluateUnary(
+      operation_, child_->Evaluate(left, left_schema, right, right_schema));
+}
+
+Type UnaryExpression::ResultType(const Schema& schema) const {
+  return UnaryResultType(operation_, child_->ResultType(schema));
+}
+
+Type UnaryExpression::ResultType(const Schema& left,
+                                 const Schema& right) const {
+  return UnaryResultType(operation_, child_->ResultType(left, right));
 }
 
 std::string UnaryExpression::ToString() const {

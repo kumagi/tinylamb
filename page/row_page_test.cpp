@@ -69,7 +69,8 @@ TEST_F(RowPageTest, InsertMany) {
     consumed += message.size();
   }
 
-  // Assert -- free size decreased by exactly kInserts*sizeof(RowPointer) + consumed bytes
+  // Assert -- free size decreased by exactly kInserts*sizeof(RowPointer) +
+  // consumed bytes
   ASSERT_EQ(page.FreeSizeForTest(),
             before_size - (kInserts * sizeof(RowPointer) + consumed));
 }
@@ -126,7 +127,8 @@ TEST_F(RowPageTest, UpdateMany) {
   Flush();
   Recover();  // RecoveryManager process will not do wrong thing.
 
-  // Assert -- every row has the expected final message after all updates + recoveries
+  // Assert -- every row has the expected final message after all updates +
+  // recoveries
   for (int i = 0; i < kInserts; ++i) {
     if (i % 2 == 0) {
       ASSERT_EQ(ReadRow(i), std::to_string(i) + kLongMessage);
@@ -163,7 +165,8 @@ TEST_F(RowPageTest, DeleteMany) {
   Flush();
   Recover();
 
-  // Act 3 -- verify remaining odd-indexed rows still readable, even-indexed gone
+  // Act 3 -- verify remaining odd-indexed rows still readable, even-indexed
+  // gone
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(page_id_);
   for (size_t i = 0; i < kRows; ++i) {
@@ -191,7 +194,8 @@ TEST_F(RowPageTest, InsertZeroLenAbort) {
   ref.PageUnlock();
   txn.Abort();
 
-  // Assert -- implicit; aborted txn leaves no durable trace; gtest green on pass
+  // Assert -- implicit; aborted txn leaves no durable trace; gtest green on
+  // pass
 }
 
 TEST_F(RowPageTest, DeFragmentInvoked) {
@@ -215,7 +219,8 @@ TEST_F(RowPageTest, DeFragmentInvoked) {
             }));
   ASSERT_TRUE(InsertRow(std::string(kBigRowSize, '3')));
 
-  // Assert -- after defrag, row 3 occupies the freed slot and all 3 big rows coexist
+  // Assert -- after defrag, row 3 occupies the freed slot and all 3 big rows
+  // coexist
   EXPECT_EQ(GetRowCount(), 3);
   ASSERT_EQ(std::set<std::string>({
                 std::string(kBigRowSize, '1'),
@@ -227,6 +232,50 @@ TEST_F(RowPageTest, DeFragmentInvoked) {
                 ReadRow(1),
                 ReadRow(2),
             }));
+}
+
+TEST_F(RowPageTest, RepeatedGrowingUpdatesPreserveAllRows) {
+  constexpr int kRows = 400;
+  constexpr int kGrowingRows = 100;
+  for (int i = 0; i < kRows; ++i) {
+    ASSERT_TRUE(InsertRow(std::to_string(i) + std::string(60, 'a')));
+  }
+  for (int i = 0; i < kGrowingRows; ++i) {
+    UpdateRow(i, std::to_string(i) + std::string(80, 'b'));
+  }
+  for (int i = 0; i < kRows; ++i) {
+    const std::string expected =
+        std::to_string(i) +
+        std::string(i < kGrowingRows ? 80 : 60, i < kGrowingRows ? 'b' : 'a');
+    EXPECT_EQ(ReadRow(i), expected) << "slot " << i;
+  }
+}
+
+TEST_F(RowPageTest, ReusingManyHolesDoesNotOverwriteSlotArray) {
+  constexpr int kRows = 300;
+  constexpr int kDeletedRows = 250;
+  for (int i = 0; i < kRows; ++i) {
+    ASSERT_TRUE(InsertRow("original-" + std::to_string(i)));
+  }
+  for (int i = 0; i < kDeletedRows; ++i) {
+    DeleteRow(i);
+  }
+
+  int replacements = 0;
+  const std::string replacement(100, 'r');
+  while (InsertRow(replacement + std::to_string(replacements))) {
+    ++replacements;
+  }
+  ASSERT_GT(replacements, 0);
+
+  for (int i = kDeletedRows; i < kRows; ++i) {
+    EXPECT_EQ(ReadRow(i), "original-" + std::to_string(i)) << "slot " << i;
+  }
+  for (int i = 0; i < replacements; ++i) {
+    const int slot = i < kDeletedRows ? i : kRows + i - kDeletedRows;
+    EXPECT_EQ(ReadRow(slot), replacement + std::to_string(i))
+        << "slot " << slot;
+  }
 }
 
 TEST_F(RowPageTest, InsertTwoThreads) {
@@ -279,7 +328,8 @@ TEST_F(RowPageTest, UpdateHeavy) {
     rows[i] = key;
   }
 
-  // Act 2 -- update each slot kCount*20 times via round-robin with new random keys
+  // Act 2 -- update each slot kCount*20 times via round-robin with new random
+  // keys
   Row read;
   for (int i = 0; i < kCount * 20; ++i) {
     slot_t slot = slots[(i * 63) % slots.size()];

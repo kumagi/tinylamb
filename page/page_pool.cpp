@@ -53,17 +53,24 @@ PagePool::PagePool(std::string_view file_name, size_t capacity)
   }
 }
 
-PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit) {
+PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit, bool shared) {
   std::unique_lock latch(pool_latch);
   auto entry = pool_.find(page_id);
   if (entry != pool_.end()) {
     entry->second->pin_count++;
     Touch(entry->second);
+    // Touch moves the entry to the tail of pool_lru_ and invalidates the old
+    // list iterator. Resolve the new iterator before taking addresses from it;
+    // using entry->second here was a use-after-erase that could hand PageRef a
+    // stale page latch under concurrent reads.
+    const LruType::iterator refreshed = pool_.at(page_id);
+    Page* const page = refreshed->page.get();
+    std::shared_mutex* const page_latch = refreshed->page_latch.get();
     if (cache_hit != nullptr) {
       *cache_hit = true;
     }
     latch.unlock();
-    return {this, entry->second->page.get(), entry->second->page_latch.get()};
+    return {this, page, page_latch, shared};
   }
 
   if (pool_lru_.size() == capacity_) {
@@ -72,7 +79,11 @@ PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit) {
   if (cache_hit != nullptr) {
     *cache_hit = false;
   }
-  return AllocNewPage(page_id, std::move(latch));
+  PageRef result = AllocNewPage(page_id, std::move(latch));
+  // A newly loaded page is returned with an exclusive latch. Downgrading it
+  // here would require releasing and reacquiring, and cache misses are rare on
+  // the read scaling path. Subsequent hits use the requested shared mode.
+  return result;
 }
 
 void PagePool::DropAllPages() {
@@ -129,7 +140,8 @@ PageRef PagePool::AllocNewPage(page_id_t pid,
   pool_lru_.emplace_back(new_page.release());
   pool_.emplace(pid, std::prev(pool_lru_.end()));
   lock.unlock();
-  return {this, pool_lru_.back().page.get(), pool_lru_.back().page_latch.get()};
+  return {this, pool_lru_.back().page.get(), pool_lru_.back().page_latch.get(),
+          false};
 }
 
 // Precondition: pool_latch is locked.

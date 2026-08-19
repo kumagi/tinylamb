@@ -38,13 +38,11 @@ namespace tinylamb {
 
 StatusOr<std::string_view> RowPage::Read(page_id_t page_id, Transaction& txn,
                                          slot_t slot) const {
-  if (!txn.AddReadSet(RowPosition(page_id, slot))) {
-    return Status::kConflicts;
-  }
+  const RowPosition position(page_id, slot);
   if (row_max_ <= slot || rows_[slot].offset == 0) {
-    return Status::kNotExists;
+    return txn.ReadVersion(position, std::nullopt);
   }
-  return GetRow(slot);
+  return txn.ReadVersion(position, GetRow(slot));
 }
 
 /*
@@ -73,32 +71,38 @@ StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
   if (!txn.AddWriteSet(RowPosition(page_id, result))) {
     return Status::kConflicts;
   }
+  txn.RegisterVersionWrite(RowPosition(page_id, result), std::nullopt, record);
   txn.InsertLog(page_id, result, record);
   return result;
 }
 
 slot_t RowPage::InsertRow(std::string_view new_row) {
   assert(new_row.size() <= std::numeric_limits<slot_t>::max());
-  if (Payload() + free_ptr_ <=
-      reinterpret_cast<char*>(&rows_[row_count_ + 1]) + new_row.size()) {
-    DeFragment();
-  }
   slot_t slot = 0;
-  for (; slot <= row_max_; ++slot) {
+  for (; slot < row_max_; ++slot) {
     if (rows_[slot].offset == 0) {
       break;
     }
   }
 
-  assert(reinterpret_cast<char*>(&rows_[slot + 1]) + new_row.size() <
-         Payload() + free_ptr_);
+  // row_count_ cannot describe the end of the slot array when deletions have
+  // left holes.  Reserve metadata through the highest live/prospective slot;
+  // otherwise tuple bytes can overwrite RowPointers that are still in use.
+  const slot_t prospective_row_max = std::max<slot_t>(row_max_, slot + 1);
+  char* const slot_array_end =
+      reinterpret_cast<char*>(&rows_[prospective_row_max]);
+  if (Payload() + free_ptr_ <= slot_array_end + new_row.size()) {
+    DeFragment();
+  }
+
+  assert(slot_array_end + new_row.size() < Payload() + free_ptr_);
   free_size_ -= new_row.size() + sizeof(RowPointer);
   free_ptr_ -= new_row.size();
   rows_[slot].offset = free_ptr_;
   rows_[slot].size = new_row.size();
   memcpy(Payload() + free_ptr_, new_row.data(), new_row.size());
   row_count_++;
-  row_max_ = std::max(row_max_, row_count_);
+  row_max_ = prospective_row_max;
   return slot;
 }
 
@@ -117,27 +121,34 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
     LOG(ERROR) << "cannot add write-set";
     return Status::kConflicts;
   }
+  txn.RegisterVersionWrite(pos, prev_row, record);
   txn.UpdateLog(page_id, slot, record, prev_row);
   UpdateRow(pos.slot, record);
   return Status::kSuccess;
 }
 
 void RowPage::UpdateRow(slot_t slot, std::string_view record) {
-  std::string_view prev_row = GetRow(slot);
-  if (record.size() <= prev_row.size()) {
+  const size_t previous_size = rows_[slot].size;
+  if (record.size() <= previous_size) {
     // There is already enough space, just overwrite.
+    free_size_ += previous_size - record.size();
   } else {
-    // Use new field.
-    if (Payload() + free_ptr_ - record.size() <=
-        reinterpret_cast<char*>(&rows_[row_max_])) {
-      rows_[slot].size = 0;
-      DeFragment();
+    // Allocate a new field and leave the old field as fragmented free space.
+    // If the contiguous tail cannot hold it, compact while excluding the old
+    // value. This avoids the previous size=0 workaround, which could make the
+    // last tuple overlap the slot array after repeated growing updates.
+    const size_t slot_bytes = static_cast<size_t>(
+        reinterpret_cast<char*>(&rows_[row_max_]) - Payload());
+    bool compacted = false;
+    if (free_ptr_ < slot_bytes + record.size()) {
+      DeFragmentExcept(slot);
+      compacted = true;
     }
     free_ptr_ -= record.size();
     rows_[slot].offset = free_ptr_;
+    if (!compacted) free_size_ += previous_size;
+    free_size_ -= record.size();
   }
-  free_size_ += prev_row.size();
-  free_size_ -= record.size();
   rows_[slot].size = record.size();
   memcpy(Payload() + rows_[slot].offset, record.data(), record.size());
 }
@@ -150,7 +161,9 @@ Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
   if (!txn.AddWriteSet(pos)) {
     return Status::kConflicts;
   }
-  txn.DeleteLog(page_id, slot, GetRow(slot));
+  const std::string_view previous = GetRow(slot);
+  txn.RegisterVersionWrite(pos, previous, std::nullopt);
+  txn.DeleteLog(page_id, slot, previous);
   DeleteRow(slot);
   return Status::kSuccess;
 }
@@ -159,19 +172,19 @@ void RowPage::DeleteRow(slot_t slot) {
   row_count_--;
   free_size_ += rows_[slot].size;
   rows_[slot].size = rows_[slot].offset = 0;
-  while (slot == row_max_ - 1 && rows_[slot].offset == 0) {
-    row_max_--;
-  }
+  // Keep the high-water mark: an older MV2PL snapshot may still need to ask
+  // the version store for a physically deleted tail slot. Vacant slots remain
+  // reusable by InsertRow.
 }
 
 slot_t RowPage::RowCount() const { return row_count_; }
 
-void RowPage::DeFragment() {
+void RowPage::DeFragmentExcept(slot_t excluded_slot) {
   // FIXME: replace it with inplace one?
   std::vector<std::string> tmp_buffer;
   tmp_buffer.reserve(row_max_);
   for (size_t i = 0; i < row_max_; ++i) {
-    if (rows_[i].offset == 0) {
+    if (rows_[i].offset == 0 || i == excluded_slot) {
       tmp_buffer.emplace_back("");
     } else {
       tmp_buffer.emplace_back(GetRow(i));
@@ -179,19 +192,23 @@ void RowPage::DeFragment() {
   }
   free_ptr_ = kPageBodySize;
   for (size_t i = 0; i < row_max_; ++i) {
-    if (rows_[i].offset == 0) {
+    if (rows_[i].offset == 0 || i == excluded_slot) {
+      if (i == excluded_slot) rows_[i].size = rows_[i].offset = 0;
       continue;
     }
 
     free_ptr_ -= tmp_buffer[i].size();
     rows_[i].offset = free_ptr_;
-    if (i == 41) {
-      LOG(TRACE) << "defragging: " << i << "  loading: " << rows_[i].offset
-                 << " size: " << rows_[i].size << " the tail position is "
-                 << (void*)(Payload() + rows_[i].offset + rows_[i].size);
-    }
     memcpy(Payload() + free_ptr_, tmp_buffer[i].data(), tmp_buffer[i].size());
   }
+  const size_t slot_bytes = static_cast<size_t>(
+      reinterpret_cast<char*>(&rows_[row_max_]) - Payload());
+  assert(slot_bytes <= free_ptr_);
+  free_size_ = free_ptr_ - slot_bytes;
+}
+
+void RowPage::DeFragment() {
+  DeFragmentExcept(std::numeric_limits<slot_t>::max());
 }
 
 void RowPage::Dump(std::ostream& o, int indent) const {

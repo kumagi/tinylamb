@@ -39,10 +39,14 @@ BlobFile::BlobFile(const std::filesystem::path& path, size_t memory_capacity,
 }
 
 std::string BlobFile::ReadAt(size_t offset, size_t length) const {
+  // Appends are asynchronous. A reader on the same BlobFile must nevertheless
+  // observe every offset already returned by Append().
+  Flush();
   return cache_.ReadAt(offset, length);
 }
 
 Cache::Locks BlobFile::ReadAt(size_t offset, std::string_view& out) const {
+  Flush();
   int32_t key_size = 0;
   cache_.Copy(&key_size, offset, sizeof(key_size));
   key_size = be32toh(key_size);

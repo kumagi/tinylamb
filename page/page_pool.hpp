@@ -23,6 +23,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <utility>
 
@@ -39,7 +40,7 @@ class PagePool {
  private:
   struct Entry {
     explicit Entry(Page* p)
-        : pin_count(1), page(p), page_latch(new std::mutex()) {}
+        : pin_count(1), page(p), page_latch(new std::shared_mutex()) {}
 
     // If pinned, this page will never been evicted.
     uint32_t pin_count = 0;
@@ -47,8 +48,8 @@ class PagePool {
     // A pointer to physical page in memory.
     std::unique_ptr<Page> page = nullptr;
 
-    // An exclusive latch for this page.
-    std::unique_ptr<std::mutex> page_latch;
+    // A physical page latch. Readers share it while writers remain exclusive.
+    std::unique_ptr<std::shared_mutex> page_latch;
 
     Entry(const Entry&) = delete;
     Entry& operator=(const Entry&) = delete;
@@ -61,7 +62,8 @@ class PagePool {
   PagePool(std::string_view file_name, size_t capacity);
   ~PagePool();
 
-  PageRef GetPage(page_id_t page_id, bool* cache_hit = nullptr);
+  PageRef GetPage(page_id_t page_id, bool* cache_hit = nullptr,
+                  bool shared = false);
 
   page_id_t Size() const {
     std::scoped_lock latch(pool_latch);

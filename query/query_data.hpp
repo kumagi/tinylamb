@@ -19,6 +19,8 @@
 
 #include <ostream>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -30,6 +32,13 @@ class TransactionContext;
 
 struct QueryData {
  public:
+  QueryData() = default;
+  QueryData(std::vector<std::string> from, Expression where,
+            std::vector<NamedExpression> select)
+      : from_(std::move(from)),
+        where_(std::move(where)),
+        select_(std::move(select)) {}
+
   friend std::ostream& operator<<(std::ostream& o, const QueryData& q) {
     o << "SELECT\n  ";
     for (size_t i = 0; i < q.select_.size(); ++i) {
@@ -52,6 +61,10 @@ struct QueryData {
   std::vector<std::string> from_;
   Expression where_;
   std::vector<NamedExpression> select_;
+  std::unordered_map<std::string, std::string> aliases_;
+  // UPDATE/DELETE executors need the physical row position. An index-only
+  // scan deliberately has no table row position and must not be selected.
+  bool require_row_position_{false};
 };
 
 }  // namespace tinylamb

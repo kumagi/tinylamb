@@ -18,6 +18,7 @@
 
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 
 #include "common/constants.hpp"
@@ -188,6 +189,73 @@ TEST_F(OptimizerTest, IndexScan) {
   ASSERT_SUCCESS(DumpAll(qd));
 }
 
+TEST_F(OptimizerTest, HistoricalSnapshotFallsBackFromMutableIndex) {
+  TransactionContext old_reader = rs_->BeginContext();
+  TransactionContext writer = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, writer.GetTable("Sc1"));
+
+  RowPosition target;
+  Row replacement;
+  for (Iterator iter = table->BeginFullScan(writer.txn_); iter.IsValid();
+       ++iter) {
+    if ((*iter)[0] == Value(2)) {
+      target = iter.Position();
+      replacement = Row({Value(1002), (*iter)[1], (*iter)[2]});
+      break;
+    }
+  }
+  ASSERT_TRUE(target.IsValid());
+  ASSERT_SUCCESS(table->Update(writer.txn_, target, replacement).GetStatus());
+  ASSERT_SUCCESS(writer.PreCommit());
+  ASSERT_TRUE(old_reader.txn_.RequiresHistoricalRead());
+
+  QueryData query{
+      {"Sc1"},
+      BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(2))),
+      {NamedExpression("c1"), NamedExpression("c2")}};
+  ASSERT_SUCCESS(query.Rewrite(old_reader));
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, old_reader));
+  Executor executor = plan->EmitExecutor(old_reader);
+  std::ostringstream physical;
+  executor->Dump(physical, 0);
+  EXPECT_NE(physical.str().find("FullScan"), std::string::npos)
+      << physical.str();
+
+  Row result;
+  ASSERT_TRUE(executor->Next(&result, nullptr));
+  EXPECT_EQ(result[0], Value(2));
+  EXPECT_FALSE(executor->Next(&result, nullptr));
+  ASSERT_SUCCESS(old_reader.PreCommit());
+}
+
+TEST_F(OptimizerTest, PhysicalRulesCanBeRemovedIndependently) {
+  QueryData query{
+      {"Sc1"},
+      BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(2))),
+      {NamedExpression("c1"), NamedExpression("c2")}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  OptimizerOptions full_scan_only = OptimizerOptions::Default();
+  full_scan_only.disabled_implementation_rules.insert("index_scan");
+  ASSIGN_OR_ASSERT_FAIL(Plan, full_plan,
+                        Optimizer::Optimize(query, context, full_scan_only));
+  std::ostringstream full_dump;
+  full_dump << full_plan;
+  EXPECT_NE(full_dump.str().find("FullScan"), std::string::npos);
+
+  OptimizerOptions index_scan_only = OptimizerOptions::Default();
+  index_scan_only.disabled_implementation_rules.insert("full_scan");
+  ASSIGN_OR_ASSERT_FAIL(Plan, index_plan,
+                        Optimizer::Optimize(query, context, index_scan_only));
+  std::ostringstream index_dump;
+  index_dump << index_plan;
+  EXPECT_NE(index_dump.str().find("IndexScan"), std::string::npos);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, IndexOnlyScan) {
   // Arrange
   QueryData qd{
@@ -204,18 +272,18 @@ TEST_F(OptimizerTest, IndexOnlyScan) {
 TEST_F(OptimizerTest, IndexOnlyScanInclude) {
   // Arrange
   QueryData qd{{"Sc2"},
-                BinaryExpressionExp(
-                    BinaryExpressionExp(ColumnValueExp("d3"),
-                                        BinaryOperation::kGreaterThanEquals,
-                                        ConstantValueExp(Value("d3-3"))),
-                    BinaryOperation::kAnd,
-                    BinaryExpressionExp(ColumnValueExp("d3"),
-                                        BinaryOperation::kLessThanEquals,
-                                        ConstantValueExp(Value("d3-5")))),
-                {NamedExpression("key", ColumnName("d1")),
-                 NamedExpression("score", ColumnName("d2")),
-                 NamedExpression("name", ColumnName("d3")),
-                 NamedExpression("const", ColumnName("d4"))}};
+               BinaryExpressionExp(
+                   BinaryExpressionExp(ColumnValueExp("d3"),
+                                       BinaryOperation::kGreaterThanEquals,
+                                       ConstantValueExp(Value("d3-3"))),
+                   BinaryOperation::kAnd,
+                   BinaryExpressionExp(ColumnValueExp("d3"),
+                                       BinaryOperation::kLessThanEquals,
+                                       ConstantValueExp(Value("d3-5")))),
+               {NamedExpression("key", ColumnName("d1")),
+                NamedExpression("score", ColumnName("d2")),
+                NamedExpression("name", ColumnName("d3")),
+                NamedExpression("const", ColumnName("d4"))}};
 
   // Act + Assert: optimize + execute + dump
   ASSERT_SUCCESS(DumpAll(qd));
