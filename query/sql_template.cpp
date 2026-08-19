@@ -67,7 +67,16 @@ Expression BindExpression(const Expression& expression,
       if (*index >= parameters.size()) {
         throw std::runtime_error("SQL template parameter underflow");
       }
-      return ConstantValueExp(parameters[(*index)++]);
+      Value parameter = parameters[(*index)++];
+      // The extractor reads `date '...'` from the SQL text as a bare string and
+      // would otherwise degrade the typed DATE constant into a VARCHAR.  Keep
+      // the cached tree type-correct so later binds (and the interpreter) see a
+      // DATE, not a string.
+      if (current.type == ValueType::kDate &&
+          parameter.type == ValueType::kVarChar) {
+        parameter = Value::Date(parameter.value.varchar_value);
+      }
+      return ConstantValueExp(parameter);
     }
     case TypeTag::kColumnValue:
       return ColumnValueExp(expression->AsColumnValue().GetColumnName());
@@ -259,14 +268,9 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
     const bool number_start =
         std::isdigit(c) ||
         (sql[i] == '.' && i + 1 < sql.size() &&
-         std::isdigit(static_cast<unsigned char>(sql[i + 1]))) ||
-        (sql[i] == '-' && i + 1 < sql.size() &&
-         (std::isdigit(static_cast<unsigned char>(sql[i + 1])) ||
-          sql[i + 1] == '.') &&
-         (i == 0 || !IsIdentChar(sql[i - 1])));
+         std::isdigit(static_cast<unsigned char>(sql[i + 1])));
     if (number_start && (i == 0 || !IsIdentChar(sql[i - 1]))) {
       const size_t begin = i;
-      if (sql[i] == '-') ++i;
       bool is_float = false;
       while (i < sql.size() &&
              std::isdigit(static_cast<unsigned char>(sql[i]))) {

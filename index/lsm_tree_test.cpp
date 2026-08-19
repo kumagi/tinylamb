@@ -243,4 +243,39 @@ TEST_F(LSMTreeTest, DeleteRangeScan) {
     ++iter;
   }
 }
+
+// Regression test for a crash found by the lsm_tree fuzzer (seed
+// "\x00\x01a\x01b").  The background merger thread wakes every 20ms and calls
+// MergeAll(); whenever the tree has no sorted run yet -- a fresh tree that was
+// never flushed, or the race where Sync() has built a run file but has not yet
+// registered it under file_tree_lock_ -- the LSMView built by GetViewImpl()
+// contains ZERO runs.  LSMView::Iterator's constructor then reads iters_[0]
+// from the empty vector (index/lsm_detail/lsm_view.cpp:115), which is a null
+// reference binding (UBSan) and a SEGV under ASan.  The crashing merger thread
+// died while holding file_tree_lock_, deadlocking every later Sync/Read/Write.
+// Correct behavior: merging an empty index is a no-op, and Begin() on an empty
+// view is an already-invalid iterator.
+TEST_F(LSMTreeTest, MergeAllOnEmptyIndex) {
+  // Arrange -- an empty tree: nothing was ever written, so the flusher's Sync()
+  // always returns early and index_ holds no sorted run.
+
+  // Act -- merge the (empty) index, exactly what the background Merger does.
+  t_->MergeAll();
+
+  // Assert -- should be a no-op on an empty tree.  Currently crashes in
+  // LSMView::CreateSingleRun() -> Begin() -> iters_[0] on an empty vector.
+  ASSERT_TRUE(true);
+}
+
+// Same root cause, reachable through the public view API on an empty tree.
+TEST_F(LSMTreeTest, EmptyViewBegin) {
+  // Arrange -- an empty tree, so GetView() builds an LSMView with no runs.
+  LSMView v = t_->GetView();
+
+  // Act -- begin iteration over the empty view.
+  LSMView::Iterator it = v.Begin();
+
+  // Assert -- an iterator over an empty view is invalid, not a null deref.
+  ASSERT_FALSE(it.IsValid());
+}
 }  // namespace tinylamb

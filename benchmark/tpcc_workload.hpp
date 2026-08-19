@@ -33,18 +33,42 @@ constexpr size_t kTpccTransactionTypeCount =
 
 std::string_view ToString(TpccTransactionType type);
 
+// TPC-C Clause 1.3 / 4.3 population sized by scale factor W (warehouse count).
 struct TpccScale {
   int warehouses{1};
-  int districts_per_warehouse{1};
-  int customers_per_district{100};
-  int items{100};
-  int initial_orders_per_district{100};
-  int order_lines_per_order{5};
+  int districts_per_warehouse{10};
+  int customers_per_district{3000};
+  int items{100000};
+  int initial_orders_per_district{3000};
+  int new_orders_per_district{900};
+  int min_order_lines{5};
+  int max_order_lines{15};
+
+  static TpccScale Official(int scale_factor);
+  static TpccScale ForTest();
+
+  [[nodiscard]] int ScaleFactor() const { return warehouses; }
+  [[nodiscard]] int Terminals() const {
+    return warehouses * districts_per_warehouse;
+  }
+};
+
+// Clause 2.1.6: one C per field for every terminal. C-Load vs C-Run for
+// C_LAST must satisfy |delta| in [65, 119] excluding 96 and 112.
+struct TpccNurand {
+  int c_last_load{0};
+  int c_last_run{0};
+  int c_id{0};
+  int c_ol_i_id{0};
+  bool valid{false};
+
+  static TpccNurand FromSeed(uint64_t seed);
 };
 
 struct TpccTransactionResult {
   TpccTransactionType type{TpccTransactionType::kNewOrder};
   bool committed{false};
+  bool user_rollback{false};
   size_t sql_statements{0};
   int warehouse_id{0};
   int district_id{0};
@@ -56,16 +80,19 @@ struct TpccTransactionResult {
   std::string error;
 };
 
-// A scaled, no-think-time TPC-C workload. Every transaction is executed through
-// SqlEngine, so parsing, AST conversion, optimization, execution, logging, and
-// commit are included in the measured path. It is intentionally not advertised
-// as an audited TPC-C/tpmC implementation.
+std::string TpccLastName(int n);
+
+// TPC-C transaction mix and data access (Clause 2 and 5.2). Not an audited
+// tpmC run: think/keying time is omitted unless the benchmark driver adds it.
 class TpccWorkload {
  public:
-  TpccWorkload(Database& database, TpccScale scale, uint64_t seed);
+  // terminal_id < 0 picks a random home warehouse/district (tests).
+  // Otherwise the terminal is bound like TPC-C: warehouse-major, 10 districts.
+  TpccWorkload(Database& database, TpccScale scale, uint64_t seed,
+               int terminal_id = -1, TpccNurand nurand = {});
 
   static Status Initialize(Database& database, const TpccScale& scale,
-                           std::string* error);
+                           std::string* error, uint64_t seed = 1);
 
   TpccTransactionType NextTransactionType();
   TpccTransactionResult Execute(TpccTransactionType type);
@@ -86,14 +113,18 @@ class TpccWorkload {
   TpccTransactionResult StockLevel();
 
   int Random(int lower, int upper);
-  int PickWarehouse();
-  int PickDistrict();
-  int PickCustomer();
-  std::string CustomerLastName(int customer_id) const;
+  int NURand(int a, int x, int y, int c);
+  int PickCustomerId();
+  int PickItemId();
+  int PickLastNameNumber();
+  std::string PickCustomerLastName();
 
   Database* database_;
   TpccScale scale_;
   std::mt19937_64 random_;
+  int home_warehouse_{1};
+  int home_district_{1};
+  TpccNurand nurand_{};
 };
 
 }  // namespace tinylamb

@@ -4,12 +4,17 @@
 
 #include <algorithm>
 #include <array>
+#include <exception>
 #include <iomanip>
+#include <iostream>
 #include <memory>
-#include <set>
+#include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
@@ -71,7 +76,91 @@ Status CreateIndex(Database& database, TransactionContext& context,
                               IndexSchema(name, std::move(keys), {}, mode));
 }
 
+constexpr std::array<std::string_view, 10> kLastNameSyllables = {
+    "BAR", "OUGHT", "ABLE", "PRI", "PRES", "ESE", "ANTI", "CALLY", "ATION",
+    "EING"};
+
+int ComputeNURand(int a, int x, int y, int c, int rand_a, int rand_xy) {
+  (void)a;
+  return (((rand_a | rand_xy) + c) % (y - x + 1)) + x;
+}
+
+std::string SqlLiteral(std::string_view text) {
+  std::string out;
+  out.reserve(text.size() + 2);
+  out.push_back('\'');
+  for (char ch : text) {
+    if (ch == '\'') out.push_back('\'');
+    out.push_back(ch);
+  }
+  out.push_back('\'');
+  return out;
+}
+
 }  // namespace
+
+TpccNurand TpccNurand::FromSeed(uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  auto pick = [&](int lower, int upper) {
+    return std::uniform_int_distribution<int>(lower, upper)(rng);
+  };
+  TpccNurand nurand;
+  nurand.c_id = pick(0, 1023);
+  nurand.c_ol_i_id = pick(0, 8191);
+  nurand.c_last_load = pick(0, 255);
+  std::vector<int> deltas;
+  deltas.reserve(53);
+  for (int delta = 65; delta <= 119; ++delta) {
+    if (delta == 96 || delta == 112) continue;
+    deltas.push_back(delta);
+  }
+  for (;;) {
+    const int delta = deltas[static_cast<size_t>(
+        pick(0, static_cast<int>(deltas.size()) - 1))];
+    const int sign = pick(0, 1) == 0 ? -1 : 1;
+    const int run = nurand.c_last_load + sign * delta;
+    if (run >= 0 && run <= 255) {
+      nurand.c_last_run = run;
+      nurand.valid = true;
+      return nurand;
+    }
+  }
+}
+
+TpccScale TpccScale::Official(int scale_factor) {
+  TpccScale scale;
+  scale.warehouses = std::max(1, scale_factor);
+  scale.districts_per_warehouse = 10;
+  scale.customers_per_district = 3000;
+  scale.items = 100000;
+  scale.initial_orders_per_district = 3000;
+  scale.new_orders_per_district = 900;
+  scale.min_order_lines = 5;
+  scale.max_order_lines = 15;
+  return scale;
+}
+
+TpccScale TpccScale::ForTest() {
+  TpccScale scale;
+  scale.warehouses = 1;
+  scale.districts_per_warehouse = 1;
+  scale.customers_per_district = 10;
+  scale.items = 20;
+  scale.initial_orders_per_district = 10;
+  scale.new_orders_per_district = 3;
+  scale.min_order_lines = 3;
+  scale.max_order_lines = 3;
+  return scale;
+}
+
+std::string TpccLastName(int n) {
+  n = std::clamp(n, 0, 999);
+  std::string name;
+  name += kLastNameSyllables[static_cast<size_t>(n / 100)];
+  name += kLastNameSyllables[static_cast<size_t>((n / 10) % 10)];
+  name += kLastNameSyllables[static_cast<size_t>(n % 10)];
+  return name;
+}
 
 std::string_view ToString(TpccTransactionType type) {
   switch (type) {
@@ -91,21 +180,42 @@ std::string_view ToString(TpccTransactionType type) {
   return "unknown";
 }
 
-TpccWorkload::TpccWorkload(Database& database, TpccScale scale, uint64_t seed)
-    : database_(&database), scale_(scale), random_(seed) {}
+TpccWorkload::TpccWorkload(Database& database, TpccScale scale, uint64_t seed,
+                           int terminal_id, TpccNurand nurand)
+    : database_(&database),
+      scale_(scale),
+      random_(seed),
+      nurand_(nurand.valid ? nurand : TpccNurand::FromSeed(seed)) {
+  if (terminal_id >= 0) {
+    const int terminals = std::max(1, scale_.Terminals());
+    const int id = terminal_id % terminals;
+    home_warehouse_ = id / scale_.districts_per_warehouse + 1;
+    home_district_ = id % scale_.districts_per_warehouse + 1;
+  } else {
+    home_warehouse_ = Random(1, scale_.warehouses);
+    home_district_ = Random(1, scale_.districts_per_warehouse);
+  }
+}
 
 Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
-                                std::string* error) {
+                                std::string* error, uint64_t seed) {
   if (scale.warehouses < 1 || scale.districts_per_warehouse < 1 ||
       scale.customers_per_district < 1 || scale.items < 1 ||
       scale.initial_orders_per_district < 1 ||
-      scale.order_lines_per_order < 1) {
-    if (error != nullptr) *error = "all TPC-C scale values must be positive";
+      scale.new_orders_per_district < 1 || scale.min_order_lines < 1 ||
+      scale.max_order_lines < scale.min_order_lines) {
+    if (error != nullptr) *error = "invalid TPC-C scale values";
     return Status::kUnknown;
   }
   if (scale.initial_orders_per_district < scale.customers_per_district) {
     if (error != nullptr) {
       *error = "initial orders must cover every customer for Order-Status";
+    }
+    return Status::kUnknown;
+  }
+  if (scale.new_orders_per_district > scale.initial_orders_per_district) {
+    if (error != nullptr) {
+      *error = "new-order rows cannot exceed initial orders per district";
     }
     return Status::kUnknown;
   }
@@ -188,65 +298,102 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
   auto insert = [&](size_t table, Row row) {
     return tables[table]->Insert(load_context.txn_, row).GetStatus();
   };
+  std::mt19937_64 rng(seed);
+  auto load_random = [&](int lower, int upper) {
+    return std::uniform_int_distribution<int>(lower, upper)(rng);
+  };
+  const TpccNurand nurand = TpccNurand::FromSeed(seed);
 
   for (int item_id = 1; item_id <= scale.items; ++item_id) {
+    const bool original = load_random(1, 10) == 1;
     status =
         insert(4, Row({Value(item_id), Value("Item#" + std::to_string(item_id)),
-                       Value(1.0 + static_cast<double>(item_id % 100)),
-                       Value(item_id % 10 == 0 ? "ORIGINAL" : "DATA")}));
+                       Value(static_cast<double>(load_random(100, 10000)) /
+                             100.0),
+                       Value(original ? "ORIGINAL" : "DATA")}));
     if (status != Status::kSuccess) break;
   }
   for (int warehouse_id = 1;
        status == Status::kSuccess && warehouse_id <= scale.warehouses;
        ++warehouse_id) {
     status =
-        insert(0, Row({Value(warehouse_id), Value(300000.0), Value(0.1),
+        insert(0, Row({Value(warehouse_id), Value(300000.0),
+                       Value(static_cast<double>(load_random(0, 2000)) / 10000.0),
                        Value("Warehouse#" + std::to_string(warehouse_id))}));
     for (int item_id = 1; status == Status::kSuccess && item_id <= scale.items;
          ++item_id) {
-      status = insert(5, Row({Value(warehouse_id), Value(item_id), Value(100),
-                              Value(0.0), Value(0), Value(0),
-                              Value(item_id % 10 == 0 ? "ORIGINAL" : "DATA")}));
+      const bool original = load_random(1, 10) == 1;
+      status = insert(
+          5, Row({Value(warehouse_id), Value(item_id),
+                  Value(load_random(10, 100)), Value(0.0), Value(0), Value(0),
+                  Value(original ? "ORIGINAL" : "DATA")}));
     }
     for (int district_id = 1; status == Status::kSuccess &&
                               district_id <= scale.districts_per_warehouse;
          ++district_id) {
       status = insert(
           1, Row({Value(warehouse_id), Value(district_id), Value(30000.0),
-                  Value(0.1), Value(scale.initial_orders_per_district + 1),
+                  Value(static_cast<double>(load_random(0, 2000)) / 10000.0),
+                  Value(scale.initial_orders_per_district + 1),
                   Value("District#" + std::to_string(district_id))}));
       for (int customer_id = 1; status == Status::kSuccess &&
                                 customer_id <= scale.customers_per_district;
            ++customer_id) {
+        const int last_name_n =
+            customer_id <= 1000
+                ? customer_id - 1
+                : ComputeNURand(255, 0, 999, nurand.c_last_load,
+                                load_random(0, 255), load_random(0, 999));
         status = insert(
             2, Row({Value(warehouse_id), Value(district_id), Value(customer_id),
                     Value("First#" + std::to_string(customer_id)), Value("OE"),
-                    Value("Last#" + std::to_string(customer_id % 10)),
-                    Value(customer_id % 10 == 0 ? "BC" : "GC"), Value(0.05),
+                    Value(TpccLastName(last_name_n)),
+                    Value(load_random(1, 10) == 1 ? "BC" : "GC"),
+                    Value(static_cast<double>(load_random(0, 5000)) / 10000.0),
                     Value(-10.0), Value(10.0), Value(1), Value(0),
                     Value("customer data")}));
+        if (status == Status::kSuccess) {
+          status = insert(
+              3, Row({Value(warehouse_id), Value(district_id),
+                      Value(customer_id), Value(warehouse_id),
+                      Value(district_id), Value("2026-01-01 00:00:00"),
+                      Value(10.0), Value("history")}));
+        }
       }
+      std::vector<int> customer_permutation(
+          static_cast<size_t>(scale.customers_per_district));
+      std::iota(customer_permutation.begin(), customer_permutation.end(), 1);
+      std::shuffle(customer_permutation.begin(), customer_permutation.end(),
+                   rng);
+      const int delivered_orders =
+          scale.initial_orders_per_district - scale.new_orders_per_district;
       for (int order_id = 1; status == Status::kSuccess &&
                              order_id <= scale.initial_orders_per_district;
            ++order_id) {
         const int customer_id =
-            ((order_id - 1) % scale.customers_per_district) + 1;
+            customer_permutation[static_cast<size_t>(
+                (order_id - 1) % scale.customers_per_district)];
+        const int line_count =
+            load_random(scale.min_order_lines, scale.max_order_lines);
+        const bool queued = order_id > delivered_orders;
         status = insert(
             6, Row({Value(warehouse_id), Value(district_id), Value(order_id),
-                    Value(customer_id), Value("2026-01-01 00:00:00"), Value(),
-                    Value(scale.order_lines_per_order), Value(1)}));
-        if (status == Status::kSuccess) {
+                    Value(customer_id), Value("2026-01-01 00:00:00"),
+                    queued ? Value() : Value(load_random(1, 10)),
+                    Value(line_count), Value(1)}));
+        if (status == Status::kSuccess && queued) {
           status = insert(7, Row({Value(warehouse_id), Value(district_id),
                                   Value(order_id)}));
         }
-        for (int line = 1;
-             status == Status::kSuccess && line <= scale.order_lines_per_order;
+        for (int line = 1; status == Status::kSuccess && line <= line_count;
              ++line) {
-          const int item_id = ((order_id + line - 2) % scale.items) + 1;
-          status = insert(
-              8, Row({Value(warehouse_id), Value(district_id), Value(order_id),
-                      Value(line), Value(item_id), Value(warehouse_id), Value(),
-                      Value(5), Value(5.0 * (1.0 + item_id % 100))}));
+          const int item_id = load_random(1, scale.items);
+          status = insert(8, Row({Value(warehouse_id), Value(district_id),
+                                  Value(order_id), Value(line), Value(item_id),
+                                  Value(warehouse_id),
+                                  queued ? Value()
+                                         : Value("2026-01-01 00:00:00"),
+                                  Value(5), Value(5.0)}));
         }
       }
     }
@@ -262,11 +409,22 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
     return status;
   }
 
+  const bool skip_stats =
+      scale.customers_per_district >= 1000 || scale.items >= 10000;
+  if (skip_stats) {
+    std::cerr << "warning: skipping TPC-C statistics refresh at SF="
+              << scale.ScaleFactor()
+              << " (serialized histograms exceed a 32KiB leaf)\n";
+    return Status::kSuccess;
+  }
+
   TransactionContext stats_context = database.BeginContext();
   for (std::string_view table : kTpccTables) {
     status = database.RefreshStatistics(stats_context, table);
     if (status != Status::kSuccess) {
-      if (error != nullptr) *error = "failed to refresh TPC-C statistics";
+      if (error != nullptr) {
+        *error = "failed to refresh TPC-C statistics for " + std::string(table);
+      }
       stats_context.Abort();
       return status;
     }
@@ -278,18 +436,25 @@ int TpccWorkload::Random(int lower, int upper) {
   return std::uniform_int_distribution<int>(lower, upper)(random_);
 }
 
-int TpccWorkload::PickWarehouse() { return Random(1, scale_.warehouses); }
-
-int TpccWorkload::PickDistrict() {
-  return Random(1, scale_.districts_per_warehouse);
+int TpccWorkload::NURand(int a, int x, int y, int c) {
+  return ComputeNURand(a, x, y, c, Random(0, a), Random(x, y));
 }
 
-int TpccWorkload::PickCustomer() {
-  return Random(1, scale_.customers_per_district);
+int TpccWorkload::PickCustomerId() {
+  return NURand(1023, 1, scale_.customers_per_district, nurand_.c_id);
 }
 
-std::string TpccWorkload::CustomerLastName(int customer_id) const {
-  return "Last#" + std::to_string(customer_id % 10);
+int TpccWorkload::PickItemId() {
+  return NURand(8191, 1, scale_.items, nurand_.c_ol_i_id);
+}
+
+int TpccWorkload::PickLastNameNumber() {
+  const int max_name = std::min(999, scale_.customers_per_district - 1);
+  return NURand(255, 0, max_name, nurand_.c_last_run);
+}
+
+std::string TpccWorkload::PickCustomerLastName() {
+  return TpccLastName(PickLastNameNumber());
 }
 
 TpccTransactionType TpccWorkload::NextTransactionType() {
@@ -364,9 +529,29 @@ TpccTransactionResult TpccWorkload::Execute(TpccTransactionType type) {
 TpccTransactionResult TpccWorkload::NewOrder() {
   TpccTransactionResult result;
   result.type = TpccTransactionType::kNewOrder;
-  result.warehouse_id = PickWarehouse();
-  result.district_id = PickDistrict();
-  result.customer_id = PickCustomer();
+  result.warehouse_id = home_warehouse_;
+  result.district_id = home_district_;
+  result.customer_id = PickCustomerId();
+  const int line_count =
+      Random(scale_.min_order_lines, scale_.max_order_lines);
+  const bool rollback = Random(1, 100) == 1;
+  std::vector<int> item_ids(static_cast<size_t>(line_count));
+  std::vector<int> supply_warehouses(static_cast<size_t>(line_count),
+                                     result.warehouse_id);
+  std::vector<int> quantities(static_cast<size_t>(line_count));
+  int all_local = 1;
+  for (int line = 0; line < line_count; ++line) {
+    item_ids[static_cast<size_t>(line)] = PickItemId();
+    quantities[static_cast<size_t>(line)] = Random(1, 10);
+    if (scale_.warehouses > 1 && Random(1, 100) == 1) {
+      int remote = result.warehouse_id;
+      while (remote == result.warehouse_id) remote = Random(1, scale_.warehouses);
+      supply_warehouses[static_cast<size_t>(line)] = remote;
+      all_local = 0;
+    }
+  }
+  if (rollback) item_ids.back() = scale_.items + 1;
+
   TransactionContext context = database_->BeginContext();
   auto fail = [&]() {
     context.Abort();
@@ -407,18 +592,12 @@ TpccTransactionResult TpccWorkload::NewOrder() {
     return fail();
   }
 
-  std::set<int> item_ids;
-  while (item_ids.size() < static_cast<size_t>(std::min(
-                               scale_.order_lines_per_order, scale_.items))) {
-    item_ids.insert(Random(1, scale_.items));
-  }
-  const int line_count = static_cast<int>(item_ids.size());
   rows.clear();
   sql.str("");
   sql << "INSERT INTO orders VALUES (" << result.warehouse_id << ','
       << result.district_id << ',' << result.order_id << ','
       << result.customer_id << ",'2026-08-19 00:00:00',NULL," << line_count
-      << ",1);";
+      << ',' << all_local << ");";
   if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
       !RequireAffected(rows, 1, "new-order order insert", &result)) {
     return fail();
@@ -432,22 +611,20 @@ TpccTransactionResult TpccWorkload::NewOrder() {
     return fail();
   }
 
-  int line_number = 0;
-  for (int item_id : item_ids) {
-    ++line_number;
-    const int quantity = Random(1, 10);
-    int supply_warehouse = result.warehouse_id;
-    if (scale_.warehouses > 1 && Random(1, 100) == 1) {
-      do {
-        supply_warehouse = PickWarehouse();
-      } while (supply_warehouse == result.warehouse_id);
-    }
+  for (int line = 0; line < line_count; ++line) {
+    const int item_id = item_ids[static_cast<size_t>(line)];
+    const int quantity = quantities[static_cast<size_t>(line)];
+    const int supply_warehouse = supply_warehouses[static_cast<size_t>(line)];
     rows.clear();
     sql.str("");
     sql << "SELECT i_price, i_name, i_data FROM item WHERE i_id = " << item_id
         << ';';
     if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
         !RequireRows(rows, "new-order item read", &result)) {
+      if (rollback && line == line_count - 1) {
+        result.user_rollback = true;
+        result.error = "new-order unused item rollback";
+      }
       return fail();
     }
     const double price = DoubleValue(rows.front()[0]);
@@ -479,7 +656,7 @@ TpccTransactionResult TpccWorkload::NewOrder() {
     rows.clear();
     sql.str("");
     sql << "INSERT INTO order_line VALUES (" << result.warehouse_id << ','
-        << result.district_id << ',' << result.order_id << ',' << line_number
+        << result.district_id << ',' << result.order_id << ',' << (line + 1)
         << ',' << item_id << ',' << supply_warehouse << ",NULL," << quantity
         << ',' << Number(line_amount) << ");";
     if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
@@ -496,9 +673,17 @@ TpccTransactionResult TpccWorkload::NewOrder() {
 TpccTransactionResult TpccWorkload::Payment() {
   TpccTransactionResult result;
   result.type = TpccTransactionType::kPayment;
-  result.warehouse_id = PickWarehouse();
-  result.district_id = PickDistrict();
-  result.customer_id = PickCustomer();
+  result.warehouse_id = home_warehouse_;
+  result.district_id = home_district_;
+  int customer_warehouse = home_warehouse_;
+  int customer_district = home_district_;
+  if (scale_.warehouses > 1 && Random(1, 100) <= 15) {
+    do {
+      customer_warehouse = Random(1, scale_.warehouses);
+    } while (customer_warehouse == home_warehouse_);
+    customer_district = Random(1, scale_.districts_per_warehouse);
+  }
+  result.customer_id = PickCustomerId();
   result.amount = static_cast<double>(Random(100, 500000)) / 100.0;
   TransactionContext context = database_->BeginContext();
   auto fail = [&]() {
@@ -541,42 +726,75 @@ TpccTransactionResult TpccWorkload::Payment() {
   rows.clear();
   sql.str("");
   if (Random(1, 100) <= 60) {
-    const std::string last_name = CustomerLastName(result.customer_id);
-    sql << "SELECT c_id, c_first, c_credit, c_balance FROM customer "
-        << "WHERE c_w_id = " << result.warehouse_id
-        << " AND c_d_id = " << result.district_id << " AND c_last = '"
+    const std::string last_name = PickCustomerLastName();
+    sql << "SELECT c_id, c_first, c_credit, c_balance, c_data FROM customer "
+        << "WHERE c_w_id = " << customer_warehouse
+        << " AND c_d_id = " << customer_district << " AND c_last = '"
         << last_name << "' ORDER BY c_first;";
     if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
         !RequireRows(rows, "payment customer-name read", &result)) {
       return fail();
     }
-    result.customer_id =
-        static_cast<int>(IntValue(rows[(rows.size() - 1) / 2][0]));
+    const Row& chosen = rows[(rows.size() - 1) / 2];
+    result.customer_id = static_cast<int>(IntValue(chosen[0]));
+    const std::string credit = chosen[2].AsString();
+    std::string customer_data = chosen[4].AsString();
+    rows.clear();
+    sql.str("");
+    sql << "UPDATE customer SET c_balance = c_balance - "
+        << Number(result.amount) << ", c_ytd_payment = c_ytd_payment + "
+        << Number(result.amount) << ", c_payment_cnt = c_payment_cnt + 1";
+    if (credit == "BC") {
+      std::ostringstream data;
+      data << result.customer_id << ',' << customer_district << ','
+           << customer_warehouse << ',' << result.district_id << ','
+           << result.warehouse_id << ',' << Number(result.amount) << ','
+           << customer_data;
+      std::string next = data.str();
+      if (next.size() > 500) next.resize(500);
+      sql << ", c_data = " << SqlLiteral(next);
+    }
+    sql << " WHERE c_w_id = " << customer_warehouse
+        << " AND c_d_id = " << customer_district
+        << " AND c_id = " << result.customer_id << ';';
   } else {
-    sql << "SELECT c_id, c_first, c_credit, c_balance FROM customer "
-        << "WHERE c_w_id = " << result.warehouse_id
-        << " AND c_d_id = " << result.district_id
+    sql << "SELECT c_id, c_first, c_credit, c_balance, c_data FROM customer "
+        << "WHERE c_w_id = " << customer_warehouse
+        << " AND c_d_id = " << customer_district
         << " AND c_id = " << result.customer_id << ';';
     if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
         !RequireRows(rows, "payment customer read", &result)) {
       return fail();
     }
+    const std::string credit = rows.front()[2].AsString();
+    std::string customer_data = rows.front()[4].AsString();
+    rows.clear();
+    sql.str("");
+    sql << "UPDATE customer SET c_balance = c_balance - "
+        << Number(result.amount) << ", c_ytd_payment = c_ytd_payment + "
+        << Number(result.amount) << ", c_payment_cnt = c_payment_cnt + 1";
+    if (credit == "BC") {
+      std::ostringstream data;
+      data << result.customer_id << ',' << customer_district << ','
+           << customer_warehouse << ',' << result.district_id << ','
+           << result.warehouse_id << ',' << Number(result.amount) << ','
+           << customer_data;
+      std::string next = data.str();
+      if (next.size() > 500) next.resize(500);
+      sql << ", c_data = " << SqlLiteral(next);
+    }
+    sql << " WHERE c_w_id = " << customer_warehouse
+        << " AND c_d_id = " << customer_district
+        << " AND c_id = " << result.customer_id << ';';
   }
-  rows.clear();
-  sql.str("");
-  sql << "UPDATE customer SET c_balance = c_balance - " << Number(result.amount)
-      << ", c_ytd_payment = c_ytd_payment + " << Number(result.amount)
-      << ", c_payment_cnt = c_payment_cnt + 1 WHERE c_w_id = "
-      << result.warehouse_id << " AND c_d_id = " << result.district_id
-      << " AND c_id = " << result.customer_id << ';';
   if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
       !RequireAffected(rows, 1, "payment customer update", &result)) {
     return fail();
   }
   rows.clear();
   sql.str("");
-  sql << "INSERT INTO history VALUES (" << result.warehouse_id << ','
-      << result.district_id << ',' << result.customer_id << ','
+  sql << "INSERT INTO history VALUES (" << customer_warehouse << ','
+      << customer_district << ',' << result.customer_id << ','
       << result.warehouse_id << ',' << result.district_id
       << ",'2026-08-19 00:00:00'," << Number(result.amount) << ",'payment');";
   if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
@@ -592,9 +810,9 @@ TpccTransactionResult TpccWorkload::Payment() {
 TpccTransactionResult TpccWorkload::OrderStatus() {
   TpccTransactionResult result;
   result.type = TpccTransactionType::kOrderStatus;
-  result.warehouse_id = PickWarehouse();
-  result.district_id = PickDistrict();
-  result.customer_id = PickCustomer();
+  result.warehouse_id = home_warehouse_;
+  result.district_id = home_district_;
+  result.customer_id = PickCustomerId();
   TransactionContext context = database_->BeginContext();
   auto fail = [&]() {
     context.Abort();
@@ -605,7 +823,7 @@ TpccTransactionResult TpccWorkload::OrderStatus() {
   if (Random(1, 100) <= 60) {
     sql << "SELECT c_id, c_first, c_balance FROM customer WHERE c_w_id = "
         << result.warehouse_id << " AND c_d_id = " << result.district_id
-        << " AND c_last = '" << CustomerLastName(result.customer_id)
+        << " AND c_last = '" << PickCustomerLastName()
         << "' ORDER BY c_first;";
     if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
         !RequireRows(rows, "order-status customer-name read", &result)) {
@@ -652,7 +870,7 @@ TpccTransactionResult TpccWorkload::OrderStatus() {
 TpccTransactionResult TpccWorkload::Delivery() {
   TpccTransactionResult result;
   result.type = TpccTransactionType::kDelivery;
-  result.warehouse_id = PickWarehouse();
+  result.warehouse_id = home_warehouse_;
   const int carrier_id = Random(1, 10);
   TransactionContext context = database_->BeginContext();
   auto fail = [&]() {
@@ -747,8 +965,8 @@ TpccTransactionResult TpccWorkload::Delivery() {
 TpccTransactionResult TpccWorkload::StockLevel() {
   TpccTransactionResult result;
   result.type = TpccTransactionType::kStockLevel;
-  result.warehouse_id = PickWarehouse();
-  result.district_id = PickDistrict();
+  result.warehouse_id = home_warehouse_;
+  result.district_id = home_district_;
   const int threshold = Random(10, 20);
   TransactionContext context = database_->BeginContext();
   auto fail = [&]() {

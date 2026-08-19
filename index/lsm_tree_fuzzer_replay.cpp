@@ -17,10 +17,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
-#include <ios>
 #include <iostream>
+#include <iterator>
 #include <string>
+#include <vector>
 
 #include "common/log_message.hpp"
 #include "index/lsm_tree_fuzzer.hpp"
@@ -32,22 +32,11 @@ int main(int argc, char** argv) {
   }
   std::filesystem::path file(argv[1]);
   std::ifstream case_data(file, std::ios::in | std::ios::binary);
-  std::string file_content(8, 0);
-  case_data.read(file_content.data(), 8);
-  LOG(INFO) << "test file: " << file << " : " << std::hex << std::setw(2)
-            << std::setfill('0') << "0x" << ((int)file_content[0] & 0xff)
-            << ", 0x" << std::hex << std::setw(2)
-            << ((int)file_content[1] & 0xff) << ", 0x" << std::hex
-            << std::setw(2) << ((int)file_content[2] & 0xff) << ", 0x"
-            << std::hex << std::setw(2) << ((int)file_content[3] & 0xff)
-            << ", 0x" << std::hex << std::setw(2)
-            << ((int)file_content[4] & 0xff) << ", 0x" << std::hex
-            << std::setw(2) << ((int)file_content[5] & 0xff) << ", 0x"
-            << std::hex << std::setw(2) << ((int)file_content[6] & 0xff)
-            << ", 0x" << std::hex << std::setw(2)
-            << ((int)file_content[7] & 0xff);
-  uint64_t seed = *reinterpret_cast<const uint64_t*>(file_content.data());
-  tinylamb::Try(seed, true);
+  std::vector<char> content((std::istreambuf_iterator<char>(case_data)),
+                            std::istreambuf_iterator<char>());
+  LOG(INFO) << "test file: " << file << " (" << content.size() << " bytes)";
+  tinylamb::Try(reinterpret_cast<const uint8_t*>(content.data()),
+                content.size(), true);
   LOG(INFO) << "successfully finished.";
   return 0;
 }

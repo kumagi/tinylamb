@@ -20,47 +20,39 @@
 
 #ifndef TINYLAMB_LOGGER_FUZZER_HPP
 #define TINYLAMB_LOGGER_FUZZER_HPP
+#include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <random>
 #include <string>
 #include <vector>
-#include <cassert>
 
+#include "common/byte_stream.hpp"
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
+#include "common/random_string.hpp"
 #include "recovery/logger.hpp"
 
 namespace tinylamb {
 
-static const char alphanum[] =
-    "0123456789"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "abcdefghijklmnopqrstuvwxyz";
 constexpr int kBufferSize = 64;
-constexpr size_t kLoop = 1024;
+constexpr size_t kMaxLogs = 1024;
 
-inline void Try(const uint64_t seed, bool verbose) {
-  std::mt19937 rand(seed);
-  auto RandomString = [&rand](size_t len = 16) {
-    std::string ret;
-    ret.reserve(len);
-    for (size_t i = 0; i < len; ++i) {
-      ret.push_back(alphanum[rand() % (sizeof(alphanum) - 1)]);
-    }
-    return ret;
-  };
-
+// Byte-driven WAL fuzzer.  Each input byte controls a record length and payload
+// directly, so libFuzzer can evolve record boundaries and sizes toward the
+// group-commit buffer edge cases instead of sampling a PRNG.
+inline void Try(const uint8_t* data, size_t size, bool verbose) {
+  ByteStream stream(data, size);
   std::string filename = RandomString(16) + "-fuzzer.log";
   std::remove(filename.c_str());
   std::vector<std::string> written;
   {
     Logger logger(filename, kBufferSize, 1);
     lsn_t total = 0;
-    for (size_t i = 0; i < kLoop; ++i) {
-      std::string log_data = RandomString(rand() % 1000 + 1);
+    for (size_t i = 0; i < kMaxLogs && stream.Remaining(); ++i) {
+      std::string log_data(stream.Bytes(stream.Pick(256)));
       logger.AddLog(log_data);
       if (verbose) {
         LOG(TRACE) << log_data;

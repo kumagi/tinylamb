@@ -22,7 +22,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
+#include <vector>
 
 #include "common/log_message.hpp"
 #include "page/leaf_page_fuzzer.hpp"
@@ -34,11 +36,11 @@ int main(int argc, char** argv) {
   }
   std::filesystem::path file(argv[1]);
   std::ifstream case_data(file, std::ios::in | std::ios::binary);
-  std::string file_content;
-  file_content.resize(8);
-  case_data.read(file_content.data(), 8);
-  LOG(INFO) << "test file: " << file;
-  tinylamb::Try(*(uint64_t*)file_content.data(), true);
+  std::vector<char> content((std::istreambuf_iterator<char>(case_data)),
+                            std::istreambuf_iterator<char>());
+  LOG(INFO) << "test file: " << file << " (" << content.size() << " bytes)";
+  tinylamb::Try(reinterpret_cast<const uint8_t*>(content.data()),
+                content.size(), true);
   LOG(INFO) << "successfully finished.";
   return 0;
 }

@@ -21,10 +21,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <map>
-#include <random>
 #include <string>
 #include <vector>
 
+#include "common/byte_stream.hpp"
 #include "common/constants.hpp"
 #include "common/debug.hpp"
 #include "common/log_message.hpp"
@@ -35,34 +35,34 @@
 
 namespace tinylamb {
 
-inline void Try(const uint64_t seed, bool verbose) {
-  if (verbose) {
-    LOG(INFO) << "seed: " << seed;
-  }
+// Byte-driven LSM view fuzzer.  The input directly encodes the number of
+// sorted runs, the entries per run, and each key / value / tombstone, so
+// libFuzzer can steer overlapping and duplicate keys across run boundaries
+// toward merge and delete-resolution bugs instead of sampling a PRNG.
+inline void Try(const uint8_t* data, size_t size, bool verbose) {
+  ByteStream stream(data, size);
   std::filesystem::path base = "lsm_view_fuzzer-" + RandomString(20, false);
   std::filesystem::create_directory(base);
-  std::mt19937 rand(seed);
   std::string blob_path = base / "blob.db";
   BlobFile blob(blob_path, 1024 * 1024LLU, 1024LLU * 1024 * 1024 * 8);
   std::vector<std::filesystem::path> index_files;
 
-  int files = rand() % 10 + 2;
+  const int files = static_cast<int>(stream.Pick(10)) + 2;
   std::map<std::string, std::string> expected;
 
-  for (int file = 0; file < files; ++file) {
+  for (int file = 0; file < files && stream.Remaining(); ++file) {
     std::map<std::string, LSMValue> mem_value;
-    int size = rand() % 1000 + 10;
-    for (int i = 0; i < size; ++i) {
-      std::string key = RandomString(rand() % 1000 + 1, false);
-
-      if (rand() % 2 == 0) {
+    const int size = static_cast<int>(stream.Pick(100)) + 1;
+    for (int i = 0; i < size && stream.Remaining(); ++i) {
+      std::string key(stream.Bytes(stream.Pick(256)));
+      if (stream.Pick(2) == 0) {
         mem_value[key] = LSMValue::Delete();
         expected.erase(key);
         if (verbose) {
           LOG(INFO) << "delete " << OmittedString(key, 20);
         }
       } else {
-        std::string value = RandomString(rand() % 1000 + 1, false);
+        std::string value(stream.Bytes(stream.Pick(256)));
         mem_value[key] = LSMValue(value);
         expected[key] = value;
         if (verbose) {

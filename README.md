@@ -116,24 +116,28 @@ and extension examples.
 TPC-C workload benchmark
 ========================
 
-The benchmark client initializes a new scaled TPC-C database, verifies all
-five transaction types once, and then runs the standard 45/43/4/4/4 mix:
+The benchmark client takes a TPC-C scale factor `W` (warehouse count, default
+1) and loads the Clause 4.3 population: 10 districts per warehouse, 3,000
+customers per district, 100,000 items, and 3,000 initial orders per district
+(the newest 900 stay in `NEW-ORDER`). It then runs 10 terminals per warehouse
+with the standard 45/43/4/4/4 mix, NURand customer/item/last-name selection,
+1% New-Order unused-item rollback, and 15% remote Payment.
 
 ```console
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j --target tinylamb_tpcc_benchmark
-./build/tinylamb_tpcc_benchmark /tmp/tinylamb-tpcc.db \
-  --clients 1 --warmup 3 --seconds 15 \
-  --warehouses 1 --districts 1 --customers 100 --items 100 \
-  --initial-orders 100 --order-lines 5 --seed 20260823
+./build/tinylamb_tpcc_benchmark /tmp/tinylamb-tpcc.db --scale-factor 1
+./build/tinylamb_tpcc_benchmark /tmp/tinylamb-tpcc.db --sf 1 \
+  --clients 10 --warmup 2 --seconds 10 --seed 20260819
 ```
 
 Each SQL statement goes through the GoogleSQL frontend, tinylamb optimizer,
 executor, and transaction commit path. The client reports committed
-transactions per second (`tps`) and executed SQL statements per second
-(`sql_qps`). It is currently single-client only. The reduced scale, omitted
-terminal think/keying time, and lack of an audited implementation mean the
-result is not an official TPC-C `tpmC` score.
+transactions per second (`tps`), SQL statements per second (`sql_qps`), and
+committed New-Order transactions per minute (`new_order_tpm`). Think/keying
+time is omitted, so the number is not an audited TPC-C `tpmC` score. Scale
+factor 1 is a large load (on the order of 100k items and ~300k order lines).
+Unit tests use a reduced `TpccScale::ForTest()` population, not SF=1.
 
 License
 ==========

@@ -22,9 +22,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <map>
-#include <random>
 #include <string>
 
+#include "common/byte_stream.hpp"
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "common/random_string.hpp"
@@ -34,17 +34,19 @@ namespace tinylamb {
 
 inline uint64_t Generate(size_t offset) { return offset * 19937 + 2147483647; }
 
-inline void Try(const uint64_t seed, bool verbose) {
+// Byte-driven LSM stress test.  The input directly encodes a Write / Delete /
+// Verify operation stream with key and value bytes taken from the same buffer,
+// so libFuzzer can steer exact keys, tombstones, and flush points toward
+// memtable freeze and merge boundaries instead of sampling a PRNG.
+inline void Try(const uint8_t* data, size_t size, bool verbose) {
+  ByteStream stream(data, size);
   RandomStringInitialize();
   std::filesystem::path base_path = "lsm_tree_fuzzer-" + RandomString(20, true);
   if (std::filesystem::exists(base_path)) {
     std::filesystem::remove_all(base_path);
   }
-  std::mt19937 rand(seed);
   std::map<std::string, std::string> expected;
   LSMTree tree(base_path);
-
-  const size_t kTestSize = rand() % 1000 + 10;
 
   auto Scan = [&]() {
     for (const auto& it : expected) {
@@ -55,16 +57,32 @@ inline void Try(const uint64_t seed, bool verbose) {
     }
   };
 
-  for (size_t i = 0; i < kTestSize; ++i) {
-    std::string key = RandomString(rand() % 4 + 2, false);
-    std::string value = RandomString(rand() % 16 + 8, false);
-    if (verbose) {
-      LOG(TRACE) << "Insert: (" << (i + 1) << "/" << kTestSize << "): " << key
-                 << " => " << value;
+  constexpr size_t kMaxOps = 200;
+  for (size_t i = 0; i < kMaxOps && stream.Remaining(); ++i) {
+    std::string key(stream.Bytes(stream.Pick(64)));
+    switch (stream.Pick(3)) {
+      case 0: {  // Write
+        std::string value(stream.Bytes(stream.Pick(64)));
+        if (verbose) {
+          LOG(TRACE) << "Insert: " << key << " => " << value;
+        }
+        tree.Write(key, value, stream.Pick(1) == 0);
+        expected[key] = value;
+        break;
+      }
+      case 1: {  // Delete (tombstone)
+        if (verbose) {
+          LOG(TRACE) << "Delete: " << key;
+        }
+        tree.Delete(key, stream.Pick(1) == 0);
+        expected.erase(key);
+        break;
+      }
+      default: {  // Verify the model against the tree.
+        Scan();
+        break;
+      }
     }
-    tree.Write(key, value, false);
-    expected[key] = value;
-    Scan();
   }
   tree.Sync();
   Scan();

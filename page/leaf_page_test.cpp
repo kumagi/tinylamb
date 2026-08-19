@@ -689,6 +689,50 @@ TEST_F(LeafPageTest, Fences) {
   ASSERT_TRUE(page->GetHighFence(txn).IsPlusInfinity());
 }
 
+TEST_F(LeafPageTest, SetLowFenceOobOnFullPage) {
+  // Reproduces a real bug in LeafPage::SetLowFence (page/leaf_page.cpp:327):
+  // the free-space precheck only rejects the call when free_size_ < 2 and
+  // never accounts for either the OLD fence size (freed inside UpdateSlotImpl)
+  // or the actual NEW fence size. On a nearly-full page a growing fence update
+  // triggers DeFragment inside UpdateSlotImpl, then subtracts the new fence
+  // size from the freshly packed free_ptr_ -- underflowing the uint16 counter
+  // -- and finally memcpy()s the fence payload to a wild offset far beyond the
+  // page (heap-buffer-overflow). Setting a fence that does not fit must be
+  // rejected with kNoSpace instead of scribbling out of bounds.
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  // Fill the page with 292-byte keys and 292-byte values until full.
+  for (int i = 0; i < 60; ++i) {
+    std::string key = std::string(284, static_cast<char>('a' + i / 10)) +
+                      std::string(8, static_cast<char>('0' + i % 10));
+    if (page->InsertLeaf(txn, key, std::string(292, 'v')) != Status::kSuccess) {
+      break;
+    }
+  }
+  // A 5000-byte low fence cannot possibly fit; the API must refuse it.
+  std::string big_fence(5000, 'f');
+  ASSERT_FAIL(page->SetLowFence(txn, IndexKey(big_fence)));
+}
+
+TEST_F(LeafPageTest, SetHighFenceOobOnFullPage) {
+  // Same root cause as SetLowFenceOobOnFullPage, but through the high-fence
+  // path: LeafPage::SetHighFence (page/leaf_page.cpp:342) reuses the same
+  // broken free-space precheck, so a fence that does not fit underflows
+  // free_ptr_ in UpdateSlotImpl and memcpy()s the fence payload past the end
+  // of the page. The API must reject the oversized fence with kNoSpace.
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  for (int i = 0; i < 60; ++i) {
+    std::string key = std::string(284, static_cast<char>('a' + i / 10)) +
+                      std::string(8, static_cast<char>('0' + i % 10));
+    if (page->InsertLeaf(txn, key, std::string(292, 'v')) != Status::kSuccess) {
+      break;
+    }
+  }
+  std::string big_fence(5000, 'f');
+  ASSERT_FAIL(page->SetHighFence(txn, IndexKey(big_fence)));
+}
+
 TEST_F(LeafPageTest, FencesCrash) {
   // Arrange
   std::string low = RandomString(1234, false);

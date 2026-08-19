@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -47,12 +48,46 @@ class TpccWorkloadTest : public ::testing::Test {
   std::unique_ptr<Database> database_;
 };
 
+TEST(TpccScaleTest, OfficialMatchesClause43) {
+  const TpccScale scale = TpccScale::Official(1);
+  EXPECT_EQ(scale.ScaleFactor(), 1);
+  EXPECT_EQ(scale.warehouses, 1);
+  EXPECT_EQ(scale.districts_per_warehouse, 10);
+  EXPECT_EQ(scale.customers_per_district, 3000);
+  EXPECT_EQ(scale.items, 100000);
+  EXPECT_EQ(scale.initial_orders_per_district, 3000);
+  EXPECT_EQ(scale.new_orders_per_district, 900);
+  EXPECT_EQ(scale.min_order_lines, 5);
+  EXPECT_EQ(scale.max_order_lines, 15);
+  EXPECT_EQ(scale.Terminals(), 10);
+  EXPECT_EQ(TpccScale::Official(4).warehouses, 4);
+  EXPECT_EQ(TpccScale::Official(4).Terminals(), 40);
+}
+
+TEST(TpccScaleTest, LastNameSyllables) {
+  EXPECT_EQ(TpccLastName(0), "BARBARBAR");
+  EXPECT_EQ(TpccLastName(3), "BARBARPRI");
+  EXPECT_EQ(TpccLastName(999), "EINGEINGEING");
+}
+
+TEST(TpccScaleTest, NurandCLastDelta) {
+  for (uint64_t seed = 1; seed < 200; ++seed) {
+    const TpccNurand nurand = TpccNurand::FromSeed(seed);
+    ASSERT_TRUE(nurand.valid);
+    const int delta = std::abs(nurand.c_last_load - nurand.c_last_run);
+    EXPECT_GE(delta, 65) << seed;
+    EXPECT_LE(delta, 119) << seed;
+    EXPECT_NE(delta, 96) << seed;
+    EXPECT_NE(delta, 112) << seed;
+    EXPECT_GE(nurand.c_last_load, 0);
+    EXPECT_LE(nurand.c_last_load, 255);
+    EXPECT_GE(nurand.c_last_run, 0);
+    EXPECT_LE(nurand.c_last_run, 255);
+  }
+}
+
 TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
-  TpccScale scale;
-  scale.customers_per_district = 5;
-  scale.items = 20;
-  scale.initial_orders_per_district = 5;
-  scale.order_lines_per_order = 3;
+  const TpccScale scale = TpccScale::ForTest();
   std::string error;
   ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
             Status::kSuccess)
@@ -60,7 +95,7 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
   const std::vector<Row> initial_customer_count =
       Run("SELECT COUNT(*) FROM customer;");
   ASSERT_EQ(initial_customer_count.size(), 1);
-  EXPECT_EQ(initial_customer_count[0][0], Value(5));
+  EXPECT_EQ(initial_customer_count[0][0], Value(10));
   const std::vector<Row> initial_customers =
       Run("SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 "
           "AND c_id = 4;");
@@ -68,10 +103,14 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
   const std::vector<Row> initial_queues =
       Run("SELECT COUNT(*) FROM new_order;");
   ASSERT_EQ(initial_queues.size(), 1);
-  EXPECT_EQ(initial_queues[0][0], Value(5));
-  const std::vector<Row> stock_probe =
-      Run("SELECT s_quantity FROM stock WHERE s_w_id = 1 AND s_i_id = 1;");
-  ASSERT_EQ(stock_probe.size(), 1);
+  EXPECT_EQ(initial_queues[0][0], Value(3));
+  const std::vector<Row> initial_history =
+      Run("SELECT COUNT(*) FROM history;");
+  ASSERT_EQ(initial_history.size(), 1);
+  EXPECT_EQ(initial_history[0][0], Value(10));
+  ASSERT_EQ(Run("SELECT s_quantity FROM stock WHERE s_w_id = 1 AND s_i_id = 1;")
+                .size(),
+            1);
   ASSERT_EQ(Run("SELECT s_quantity, s_data FROM stock WHERE s_w_id = 1 AND "
                 "s_i_id = 2;")
                 .size(),
@@ -96,7 +135,7 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
       << customer_plan;
   const std::string name_plan = ExplainText(
       "SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND "
-      "c_last = 'Last#4' ORDER BY c_first;");
+      "c_last = 'BARBARPRI' ORDER BY c_first;");
   EXPECT_NE(name_plan.find("Index"), std::string::npos) << name_plan;
   EXPECT_EQ(name_plan.find("ParallelSort"), std::string::npos) << name_plan;
   const std::string queue_plan = ExplainText(
@@ -104,17 +143,21 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
       "ORDER BY no_o_id LIMIT 1;");
   EXPECT_NE(queue_plan.find("Index"), std::string::npos) << queue_plan;
   EXPECT_EQ(queue_plan.find("ParallelSort"), std::string::npos) << queue_plan;
-  TpccWorkload workload(*database_, scale, 42);
+  TpccWorkload workload(*database_, scale, 42, 0);
 
   const TpccTransactionResult new_order =
       workload.Execute(TpccTransactionType::kNewOrder);
-  ASSERT_TRUE(new_order.committed) << new_order.error;
-  EXPECT_EQ(new_order.order_id, 6);
-  EXPECT_EQ(new_order.sql_statements, 18);
+  ASSERT_TRUE(new_order.committed || new_order.user_rollback) << new_order.error;
+  if (new_order.committed) {
+    EXPECT_EQ(new_order.order_id, 11);
+    EXPECT_GE(new_order.sql_statements,
+              6 + 4 * static_cast<size_t>(scale.min_order_lines));
+  }
   const std::vector<Row> queues_after_new_order =
       Run("SELECT COUNT(*) FROM new_order;");
   ASSERT_EQ(queues_after_new_order.size(), 1);
-  EXPECT_EQ(queues_after_new_order[0][0], Value(6));
+  EXPECT_EQ(queues_after_new_order[0][0],
+            Value(new_order.committed ? 4 : 3));
 
   const TpccTransactionResult payment =
       workload.Execute(TpccTransactionType::kPayment);
@@ -130,11 +173,11 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
       workload.Execute(TpccTransactionType::kDelivery);
   ASSERT_TRUE(delivery.committed) << delivery.error;
   EXPECT_EQ(delivery.delivered_orders, 1);
-  EXPECT_EQ(delivery.sql_statements, 7);
   const std::vector<Row> queues_after_delivery =
       Run("SELECT COUNT(*) FROM new_order;");
   ASSERT_EQ(queues_after_delivery.size(), 1);
-  EXPECT_EQ(queues_after_delivery[0][0], Value(5));
+  EXPECT_EQ(queues_after_delivery[0][0],
+            Value(new_order.committed ? 3 : 2));
 
   const TpccTransactionResult stock_level =
       workload.Execute(TpccTransactionType::kStockLevel);
@@ -145,24 +188,11 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
   const std::vector<Row> district =
       Run("SELECT d_next_o_id FROM district WHERE d_w_id = 1 AND d_id = 1;");
   ASSERT_EQ(district.size(), 1);
-  EXPECT_EQ(district[0][0], Value(7));
-
-  const std::vector<Row> queues = Run("SELECT COUNT(*) FROM new_order;");
-  ASSERT_EQ(queues.size(), 1);
-  EXPECT_EQ(queues[0][0], Value(5));
+  EXPECT_EQ(district[0][0], Value(new_order.committed ? 12 : 11));
 
   const std::vector<Row> history = Run("SELECT COUNT(*) FROM history;");
   ASSERT_EQ(history.size(), 1);
-  EXPECT_EQ(history[0][0], Value(1));
-
-  const std::vector<Row> stock = Run("SELECT SUM(s_order_cnt) FROM stock;");
-  ASSERT_EQ(stock.size(), 1);
-  EXPECT_EQ(stock[0][0], Value(3));
-
-  const std::vector<Row> delivered =
-      Run("SELECT COUNT(*) FROM orders WHERE o_carrier_id IS NOT NULL;");
-  ASSERT_EQ(delivered.size(), 1);
-  EXPECT_EQ(delivered[0][0], Value(1));
+  EXPECT_EQ(history[0][0], Value(11));
 
   const std::vector<Row> delivery_count =
       Run("SELECT SUM(c_delivery_cnt) FROM customer;");

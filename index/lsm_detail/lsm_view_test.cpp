@@ -104,6 +104,34 @@ TEST_F(LSMViewTest, Iter) {
   ASSERT_EQ(it, expected.end());
 }
 
+TEST_F(LSMViewTest, BeginOnViewWithoutRunsIsSafe) {
+  // A view backed by no sorted runs must yield an exhausted iterator, not
+  // crash.  LSMView::Iterator currently dereferences iters_[0] even when no
+  // run produced a valid entry, so Begin() faults on the empty vector.  This
+  // test documents that bug and should turn green once the empty case is
+  // guarded.
+  LSMView empty_view(*blob_, std::vector<std::filesystem::path>{});
+  LSMView::Iterator iter = empty_view.Begin();
+  EXPECT_FALSE(iter.IsValid());
+}
+
+TEST_F(LSMViewTest, ConstructEmptyRunIsSafe) {
+  // Building a SortedRun from an empty map must either be rejected cleanly or
+  // produce a valid empty run.  SortedRun::Construct() instead calls
+  // tree.begin()->first / tree.rbegin()->first, which on an empty map are the
+  // map's end() sentinel: it reads the in-object header node as if it were a
+  // std::string, running off the end of the map object.  Under ASan this is a
+  // stack-buffer-overflow; with the assert compiled out (NDEBUG) it is silent
+  // UB whose garbage min/max keys then blow up FlushInternal()'s writev().
+  // The fuzzer reaches this with inputs whose byte stream runs dry before the
+  // first run's first entry is encoded (e.g. "\x5d\x00").
+  std::map<std::string, LSMValue> empty;
+  std::string filepath = path_ / "empty_run.idx";
+  SortedRun::Construct(filepath, empty, *blob_, 0);
+  SortedRun run(filepath);
+  EXPECT_EQ(run.Size(), 0);
+}
+
 TEST_F(LSMViewTest, Merged) {
   // Arrange -- LSMView is pre-constructed by SetUp() with 10 SortedRuns of 100 keys each
   //            Build the expected map of 1000 keys (0..999) -> value (i/100)

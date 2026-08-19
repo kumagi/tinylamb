@@ -136,6 +136,19 @@ TEST_F(BPlusTreeTest, InsertLeaf) {
   ASSERT_SUCCESS(txn.PreCommit());
 }
 
+TEST_F(BPlusTreeTest, InsertDuplicateKeyReturnsErrorWithoutRecursing) {
+  // Inserting a key that already exists must surface as a clean status, not
+  // drive the tree into an unbounded split.  BPlusTree::LeafInsert currently
+  // treats LeafPage::InsertLeaf's kDuplicates as "page full" and recurses
+  // through foster pages forever, exhausting the stack.  This test documents
+  // that bug and should turn green once the status is propagated instead.
+  auto txn = tm_->Begin();
+  ASSERT_SUCCESS(bpt_->Insert(txn, "key", "first"));
+  ASSERT_EQ(bpt_->Insert(txn, "key", "second"), Status::kDuplicates);
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
 TEST_F(BPlusTreeTest, SplitLeaf) {
   // Arrange -- begin transaction, define 100 keys and a 5000-byte long value
   constexpr static int kKeys = 100;

@@ -5,6 +5,8 @@
 #include <gtest/gtest.h>
 
 #include "parser/ast.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/constant_value.hpp"
 #include "query/googlesql_ast.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
@@ -78,6 +80,47 @@ TEST(SqlTemplateTest, BindsCompositeStockLookup) {
   const auto& select = dynamic_cast<const SelectStatement&>(*bound);
   EXPECT_EQ(select.WhereClause()->ToString(),
             "((s_w_id = 1) AND (s_i_id = 7))");
+}
+
+TEST(SqlTemplateTest, BindsDateLiteralsPreservingTheDateType) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  auto original =
+      ParseSql("SELECT d FROM t WHERE d <= date '1998-09-18';");
+  ASSERT_TRUE(original);
+  const SqlTemplate templated =
+      ExtractSqlTemplate("SELECT d FROM t WHERE d <= date '1994-01-01';");
+  ASSERT_TRUE(templated.templatable);
+  auto bound = BindStatementLiterals(*original, templated.parameters);
+  const auto& select = dynamic_cast<const SelectStatement&>(*bound);
+  ASSERT_TRUE(select.WhereClause());
+  const auto& binary = select.WhereClause()->AsBinaryExpression();
+  const Value date = binary.Right()->AsConstantValue().GetValue();
+  EXPECT_EQ(date.type, ValueType::kDate);
+  EXPECT_EQ(date.AsString(), "1994-01-01");
+}
+
+TEST(SqlTemplateTest, ExtractsNegativeLiteralsWithoutTheSign) {
+  const SqlTemplate negative = ExtractSqlTemplate("SELECT -5, -5.5;");
+  ASSERT_EQ(negative.parameters.size(), 2);
+  EXPECT_EQ(negative.parameters[0], Value(5));
+  EXPECT_EQ(negative.parameters[1], Value(5.5));
+  const SqlTemplate same_shape = ExtractSqlTemplate("SELECT -7, -1.25;");
+  EXPECT_EQ(negative.fingerprint, same_shape.fingerprint);
+}
+
+TEST(SqlTemplateTest, BindsNegativeLiteralWithoutDoubleNegation) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  auto original = ParseSql("SELECT -5;");
+  ASSERT_TRUE(original);
+  const SqlTemplate templated = ExtractSqlTemplate("SELECT -7;");
+  auto bound = BindStatementLiterals(*original, templated.parameters);
+  const auto& select = dynamic_cast<const SelectStatement&>(*bound);
+  ASSERT_EQ(select.SelectList().size(), 1);
+  EXPECT_EQ(select.SelectList()[0].expression->ToString(), "(-7)");
 }
 
 }  // namespace
