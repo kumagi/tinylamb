@@ -21,6 +21,9 @@
 #include "index/b_plus_tree_iterator.hpp"
 #include "table/iterator_base.hpp"
 #include "type/row.hpp"
+#include "type/value.hpp"
+
+#include <vector>
 
 namespace tinylamb {
 class Index;
@@ -31,6 +34,9 @@ class IndexScanIterator : public IteratorBase {
  public:
   IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
                     Value begin = Value(), Value end = Value(),
+                    bool ascending = true);
+  IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
+                    std::vector<Value> begin_key, std::vector<Value> end_key,
                     bool ascending = true);
   IndexScanIterator(const IndexScanIterator&) = delete;
   IndexScanIterator(IndexScanIterator&&) = delete;

@@ -271,4 +271,27 @@ TEST_F(IndexScanIteratorTest, NonUniqueDescending) {
     ASSERT_FALSE(it.IsValid());
   }
 }
+
+TEST_F(IndexScanIteratorTest, CompositeEqualityPointLookup) {
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  for (int i = 0; i < 40; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                    Value(0.1 + i)}))
+            .GetStatus());
+  }
+  const Index& key_score = table->GetIndex(2);
+  Iterator it = table->BeginIndexScan(ctx.txn_, key_score,
+                                      {Value(32), Value(0.1 + 32)},
+                                      {Value(32), Value(0.1 + 32)});
+  ASSERT_TRUE(it.IsValid());
+  Row row = *it;
+  EXPECT_EQ(row[0], Value(32));
+  EXPECT_EQ(row[1], Value("v32"));
+  ++it;
+  EXPECT_FALSE(it.IsValid());
+}
 }  // namespace tinylamb

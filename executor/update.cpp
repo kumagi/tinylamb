@@ -1,28 +1,15 @@
 /**
  * Copyright 2023 KUMAZAKI Hiroki
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Licensed under the Apache License, Version 2.0.
  */
-
-//
-// Created by kumagi on 22/05/11.
-//
 
 #include "update.hpp"
 
 #include <cassert>
 #include <cstdint>
 #include <ostream>
+#include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
@@ -35,21 +22,24 @@ bool Update::Next(Row* dst, RowPosition* rp) {
   if (finished_) {
     return false;
   }
-  int64_t update_count = 0;
+  std::vector<std::pair<Row, RowPosition>> pending;
   Row new_row;
   RowPosition position;
   while (src_->Next(&new_row, &position)) {
     assert(position.IsValid());
-    StatusOr<RowPosition> p = target_->Update(*txn_, position, new_row);
+    pending.emplace_back(std::move(new_row), position);
+  }
+  int64_t update_count = 0;
+  for (auto& [row, row_position] : pending) {
+    StatusOr<RowPosition> p = target_->Update(*txn_, row_position, row);
     if (p.GetStatus() != Status::kSuccess) {
-      finished_ = true;
-      return true;
+      break;
     }
     update_count++;
   }
   *dst = Row({Value("Update Rows"), Value(update_count)});
   if (rp != nullptr) {
-    *rp = RowPosition();  // Fill with an invalid data.
+    *rp = RowPosition();
   }
   finished_ = true;
   return true;

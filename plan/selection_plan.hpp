@@ -50,6 +50,10 @@ class SelectionPlan final : public PlanBase {
 
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
+  [[nodiscard]] bool IsOrderedBy(const std::vector<Expression>& expressions,
+                                 const std::vector<bool>& ascending) const override {
+    return src_->IsOrderedBy(expressions, ascending);
+  }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

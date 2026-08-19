@@ -208,6 +208,7 @@ add_library(tinylamb_sql
         query/googlesql_frontend.cpp
         query/googlesql_ast.cpp
         query/googlesql_ast_visitor.cpp
+        query/sql_template.cpp
         query/sql_engine.cpp
 )
 add_library(tinylamb::sql ALIAS tinylamb_sql)
@@ -440,6 +441,7 @@ add_simple_test(parser/pratt_parser_test.cpp)
 add_simple_test(query/query_test.cpp)
 add_simple_test(query/googlesql_frontend_test.cpp)
 add_simple_test(query/googlesql_ast_test.cpp)
+add_simple_test(query/sql_template_test.cpp)
 add_simple_test(query/sql_engine_tpcc_test.cpp)
 add_simple_test(query/sql_engine_tpch_test.cpp)
 add_simple_test(server/postgres_protocol_test.cpp)

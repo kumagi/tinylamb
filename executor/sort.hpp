@@ -21,7 +21,7 @@ class SortExecutor : public ExecutorBase {
     bool ascending{true};
   };
   SortExecutor(Executor source, Schema schema, std::vector<Key> keys,
-               size_t worker_count = std::thread::hardware_concurrency())
+               size_t worker_count = 1)
       : source_(std::move(source)),
         schema_(std::move(schema)),
         keys_(std::move(keys)),

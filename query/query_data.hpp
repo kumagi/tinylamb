@@ -65,6 +65,8 @@ struct QueryData {
   // UPDATE/DELETE executors need the physical row position. An index-only
   // scan deliberately has no table row position and must not be selected.
   bool require_row_position_{false};
+  std::vector<Expression> order_expressions_;
+  std::vector<bool> order_ascending_;
 };
 
 }  // namespace tinylamb

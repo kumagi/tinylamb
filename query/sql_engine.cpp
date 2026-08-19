@@ -10,8 +10,10 @@
 #include <chrono>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -23,7 +25,6 @@
 #include "executor/insert.hpp"
 #include "executor/limit.hpp"
 #include "executor/projection.hpp"
-#include "executor/query_scheduler.hpp"
 #include "executor/relational.hpp"
 #include "executor/sort.hpp"
 #include "executor/update.hpp"
@@ -35,6 +36,7 @@
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
 #include "query/query_data.hpp"
+#include "query/sql_template.hpp"
 #include "table/table.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -97,6 +99,27 @@ std::vector<Row> ExplainRows(std::string_view plan) {
   return rows;
 }
 
+std::mutex template_cache_mutex;
+std::unordered_map<std::string, std::shared_ptr<Statement>> template_cache;
+constexpr size_t kMaxCachedTemplates = 1024;
+
+void RememberTemplate(const std::string& fingerprint,
+                      std::unique_ptr<Statement> statement) {
+  std::scoped_lock lock(template_cache_mutex);
+  if (template_cache.size() >= kMaxCachedTemplates) {
+    template_cache.erase(template_cache.begin());
+  }
+  template_cache.insert_or_assign(fingerprint,
+                                  std::shared_ptr<Statement>(std::move(statement)));
+}
+
+std::shared_ptr<Statement> FindTemplate(const std::string& fingerprint) {
+  std::scoped_lock lock(template_cache_mutex);
+  const auto cached = template_cache.find(fingerprint);
+  if (cached == template_cache.end()) return nullptr;
+  return cached->second;
+}
+
 }  // namespace
 
 StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
@@ -148,6 +171,18 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     return Executor(
         std::make_shared<ConstantExecutor>(ExplainRows(output.str())));
   }
+  const SqlTemplate templated = ExtractSqlTemplate(sql);
+  if (templated.templatable) {
+    if (const std::shared_ptr<Statement> cached =
+            FindTemplate(templated.fingerprint)) {
+      try {
+        return PrepareStatement(
+            ctx, BindStatementLiterals(*cached, templated.parameters));
+      } catch (const std::exception&) {
+        // Literal shape drifted from the cached tree; parse the original SQL.
+      }
+    }
+  }
   GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(sql);
   if (!parsed.ok) {
     last_error_ = std::move(parsed.error);
@@ -156,7 +191,16 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   try {
     ASSIGN_OR_RETURN(std::unique_ptr<GoogleSqlAstNode>, ast,
                      GoogleSqlAstParser::Parse(parsed.ast));
-    return PrepareStatement(ctx, GoogleSqlAstVisitor::Visit(*ast));
+    std::unique_ptr<Statement> statement = GoogleSqlAstVisitor::Visit(*ast);
+    if (templated.templatable) {
+      try {
+        RememberTemplate(
+            templated.fingerprint,
+            BindStatementLiterals(*statement, templated.parameters));
+      } catch (const std::exception&) {
+      }
+    }
+    return PrepareStatement(ctx, std::move(statement));
   } catch (const std::exception& error) {
     last_error_ = error.what();
     return Status::kUnknown;
@@ -246,11 +290,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             item.name.empty() ? item.expression->ToString() : item.name);
       }
       if (select->RequiresRelationalEvaluation()) {
-        Executor executor = std::make_shared<RelationalExecutor>(ctx, select);
-        QueryScheduler& scheduler = QueryScheduler::Global();
-        return Executor(std::make_shared<ScheduledExecutor>(
-            std::move(executor), scheduler,
-            std::min<size_t>(4, scheduler.CpuCapacity()), size_t{64} << 20));
+        return Executor(std::make_shared<RelationalExecutor>(ctx, select));
       }
       QueryData query;
       query.from_ = select->FromClause();
@@ -260,9 +300,12 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       query.select_ = select->SelectList();
       const size_t visible_columns = query.select_.size();
       std::vector<Expression> sort_expressions;
+      std::vector<bool> sort_ascending;
       sort_expressions.reserve(select->OrderBy().size());
       for (size_t i = 0; i < select->OrderBy().size(); ++i) {
         const auto& order = select->OrderBy()[i];
+        query.order_expressions_.push_back(order.expression);
+        query.order_ascending_.push_back(order.ascending);
         auto selected = std::find_if(query.select_.begin(), query.select_.end(),
                                      [&](const auto& item) {
                                        return item.expression->ToString() ==
@@ -275,6 +318,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           query.select_.emplace_back(hidden_name, order.expression);
           sort_expressions.push_back(ColumnValueExp(hidden_name));
         }
+        sort_ascending.push_back(order.ascending);
       }
       RETURN_IF_FAIL(query.Rewrite(ctx));
       ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
@@ -282,11 +326,12 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       if (select->Distinct()) {
         executor = std::make_shared<DistinctExecutor>(std::move(executor));
       }
-      if (!select->OrderBy().empty()) {
+      if (!select->OrderBy().empty() &&
+          !plan->IsOrderedBy(query.order_expressions_, query.order_ascending_)) {
         std::vector<SortExecutor::Key> keys;
         keys.reserve(select->OrderBy().size());
         for (size_t i = 0; i < select->OrderBy().size(); ++i) {
-          keys.push_back({sort_expressions[i], select->OrderBy()[i].ascending});
+          keys.push_back({sort_expressions[i], sort_ascending[i]});
         }
         executor = std::make_shared<SortExecutor>(
             std::move(executor), plan->GetSchema(), std::move(keys));
@@ -304,10 +349,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         executor = std::make_shared<Projection>(
             std::move(visible), plan->GetSchema(), std::move(executor));
       }
-      QueryScheduler& scheduler = QueryScheduler::Global();
-      return Executor(std::make_shared<ScheduledExecutor>(
-          std::move(executor), scheduler,
-          std::min<size_t>(4, scheduler.CpuCapacity()), size_t{64} << 20));
+      return executor;
     }
     case StatementType::kUpdate: {
       const auto& update = dynamic_cast<const UpdateStatement&>(*statement);
@@ -335,11 +377,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       query.require_row_position_ = true;
       RETURN_IF_FAIL(query.Rewrite(ctx));
       ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
-      Executor stable_source = std::make_shared<SortExecutor>(
-          plan->EmitExecutor(ctx), plan->GetSchema(),
-          std::vector<SortExecutor::Key>{});
       return Executor(std::make_shared<Update>(ctx.txn_, table.get(),
-                                               std::move(stable_source)));
+                                               plan->EmitExecutor(ctx)));
     }
     case StatementType::kDelete: {
       const auto& remove = dynamic_cast<const DeleteStatement&>(*statement);
@@ -359,11 +398,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       query.require_row_position_ = true;
       RETURN_IF_FAIL(query.Rewrite(ctx));
       ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
-      Executor stable_source = std::make_shared<SortExecutor>(
-          plan->EmitExecutor(ctx), plan->GetSchema(),
-          std::vector<SortExecutor::Key>{});
       return Executor(std::make_shared<DeleteExecutor>(
-          ctx.txn_, *table, std::move(stable_source)));
+          ctx.txn_, *table, plan->EmitExecutor(ctx)));
     }
     case StatementType::kDropTable:
       return Status::kNotImplemented;

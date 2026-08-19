@@ -19,7 +19,10 @@
 
 #include "plan/plan.hpp"
 #include "table/table_statistics.hpp"
+#include "type/column_name.hpp"
 #include "type/row.hpp"
+
+#include <vector>
 
 namespace tinylamb {
 class Index;
@@ -28,8 +31,9 @@ class Table;
 class IndexScanPlan final : public PlanBase {
  public:
   IndexScanPlan(const Table& table, const Index& index,
-                const TableStatistics& ts, const Value& begin, const Value& end,
-                bool ascending, Expression where);
+                const TableStatistics& ts, std::vector<Value> begin_key,
+                std::vector<Value> end_key, bool ascending, Expression where,
+                std::vector<ColumnName> provided_order = {});
   IndexScanPlan(const IndexScanPlan&) = delete;
   IndexScanPlan(IndexScanPlan&&) = delete;
   IndexScanPlan& operator=(const IndexScanPlan&) = delete;
@@ -46,6 +50,8 @@ class IndexScanPlan final : public PlanBase {
 
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
+  [[nodiscard]] bool IsOrderedBy(const std::vector<Expression>& expressions,
+                                 const std::vector<bool>& ascending) const override;
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
@@ -53,10 +59,11 @@ class IndexScanPlan final : public PlanBase {
   const Table& table_;
   const Index& index_;
   TableStatistics stats_;
-  Value begin_;
-  Value end_;
+  std::vector<Value> begin_key_;
+  std::vector<Value> end_key_;
   bool ascending_;
   Expression where_;
+  std::vector<ColumnName> provided_order_;
 };
 
 }  // namespace tinylamb

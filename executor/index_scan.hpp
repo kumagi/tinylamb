@@ -26,6 +26,9 @@
 #include "index/index_scan_iterator.hpp"
 #include "table/iterator.hpp"
 #include "type/schema.hpp"
+#include "type/value.hpp"
+
+#include <vector>
 
 namespace tinylamb {
 class Index;
@@ -37,6 +40,9 @@ class IndexScan : public ExecutorBase {
   IndexScan(Transaction& txn, const Table& table, const Index& index,
             const Value& begin, const Value& end, bool ascending,
             Expression where, const Schema& sc);
+  IndexScan(Transaction& txn, const Table& table, const Index& index,
+            std::vector<Value> begin_key, std::vector<Value> end_key,
+            bool ascending, Expression where, const Schema& sc);
   IndexScan(const IndexScan&) = delete;
   IndexScan(IndexScan&&) = delete;
   IndexScan& operator=(const IndexScan&) = delete;

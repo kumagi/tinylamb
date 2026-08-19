@@ -29,6 +29,7 @@
 #include "iterator.hpp"
 #include "page/row_position.hpp"
 #include "type/schema.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 
@@ -85,6 +86,10 @@ class Table {
                           const Value& begin = Value(),
                           const Value& end = Value(),
                           bool ascending = true) const;
+  Iterator BeginIndexScan(Transaction& txn, const Index& index,
+                          std::vector<Value> begin_key,
+                          std::vector<Value> end_key,
+                          bool ascending = true) const;
 
   [[nodiscard]] std::unordered_map<slot_t, size_t> AvailableKeyIndex() const;
 
@@ -104,6 +109,8 @@ class Table {
                      const RowPosition& pos);
   Status IndexDelete(Transaction& txn, const Index& idx,
                      const RowPosition& pos);
+  Status IndexDelete(Transaction& txn, const Index& idx, const RowPosition& pos,
+                     const Row& original_row);
 
   friend class Database;
   friend class FullScanIterator;

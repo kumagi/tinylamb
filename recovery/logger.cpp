@@ -115,23 +115,27 @@ void Logger::LoggerWork() {
     const size_t buffered_lsn = buffered_lsn_.load(std::memory_order_acquire);
 
     if (flushed_lsn == buffered_lsn) {
-      // No data to flush.
       std::this_thread::sleep_for(std::chrono::microseconds(every_us_));
       continue;
     }
 
-    const size_t buffered = buffered_lsn % buffer_.size();
-    const size_t flushed = flushed_lsn % buffer_.size();
-    const ssize_t flushed_size =
-        write(dst_, buffer_.data() + flushed,
-              (flushed < buffered ? buffered : buffer_.size()) - flushed);
-    if (flushed_size <= 0) {
-      LOG(FATAL) << dst_ << " : " << std::strerror(errno);
-      break;
+    while (flushed_lsn_.load(std::memory_order_relaxed) <
+           buffered_lsn_.load(std::memory_order_acquire)) {
+      const size_t flushed = flushed_lsn_.load(std::memory_order_relaxed);
+      const size_t buffered = buffered_lsn_.load(std::memory_order_acquire);
+      const size_t flushed_off = flushed % buffer_.size();
+      const size_t buffered_off = buffered % buffer_.size();
+      const ssize_t flushed_size =
+          write(dst_, buffer_.data() + flushed_off,
+                (flushed_off < buffered_off ? buffered_off : buffer_.size()) -
+                    flushed_off);
+      if (flushed_size <= 0) {
+        LOG(FATAL) << dst_ << " : " << std::strerror(errno);
+        return;
+      }
+      flushed_lsn_.store(flushed + flushed_size, std::memory_order_release);
     }
-
-    FdataSync(dst_);  // Flush!
-    flushed_lsn_.store(flushed_lsn + flushed_size, std::memory_order_release);
+    FdataSync(dst_);
   }
   fsync(dst_);
 }

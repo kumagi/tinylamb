@@ -111,6 +111,15 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
   return rp;
 }
 
+bool IndexCoversUnchanged(const Index& idx, const Row& original,
+                          const Row& updated) {
+  if (idx.GenerateKey(original) != idx.GenerateKey(updated)) return false;
+  for (slot_t slot : idx.sc_.include_) {
+    if (original[slot] != updated[slot]) return false;
+  }
+  return true;
+}
+
 StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
                                     const Row& row) {
   if (!txn.AddWriteSet(pos)) {
@@ -118,41 +127,59 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   }
   ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
   RowPosition new_pos = pos;
+  bool indexes_unchanged = true;
   for (const auto& idx : indexes_) {
-    RETURN_IF_FAIL(IndexDelete(txn, idx, pos));
+    if (!IndexCoversUnchanged(idx, original_row, row)) {
+      indexes_unchanged = false;
+      break;
+    }
   }
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
   PageRef page = txn.GetPageManager()->GetPage(new_pos.page_id);
   Status s = page->Update(txn, new_pos.slot, serialized_row);
-  if (s == Status::kNoSpace) {
-    page->Delete(txn, new_pos.slot);
-    bool finished = false;
-    while (page->body.row_page.next_page_id_ != 0) {
-      page_id_t next_page = page->body.row_page.next_page_id_;
-      page = txn.GetPageManager()->GetPage(next_page);
-      StatusOr<slot_t> next_pos = page->Insert(txn, serialized_row);
-      if (next_pos.HasValue()) {
-        new_pos.page_id = page->PageID();
-        new_pos.slot = next_pos.Value();
-        finished = true;
-        break;
-      }
+  if (s == Status::kSuccess && indexes_unchanged) {
+    return new_pos;
+  }
+  if (s == Status::kSuccess) {
+    for (const auto& idx : indexes_) {
+      RETURN_IF_FAIL(IndexDelete(txn, idx, pos, original_row));
     }
-    if (!finished) {
-      PageRef new_page =
-          txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage);
-      ASSIGN_OR_RETURN(slot_t, new_slot, new_page->Insert(txn, serialized_row));
-      RowPosition new_row_pos(new_page->PageID(), new_slot);
-      page.PageUnlock();
-      {
-        PageRef last_page = txn.GetPageManager()->GetPage(last_pid_);
-        last_page->body.row_page.next_page_id_ = new_page->PageID();
-        new_page->body.row_page.prev_page_id_ = last_page->PageID();
-      }
-      new_pos = new_row_pos;
-      last_pid_ = new_page->PageID();
+    for (const auto& idx : indexes_) {
+      RETURN_IF_FAIL(IndexInsert(txn, idx, row, new_pos));
     }
+    return new_pos;
+  }
+  if (s != Status::kNoSpace) return s;
+  for (const auto& idx : indexes_) {
+    RETURN_IF_FAIL(IndexDelete(txn, idx, pos, original_row));
+  }
+  page->Delete(txn, new_pos.slot);
+  bool finished = false;
+  while (page->body.row_page.next_page_id_ != 0) {
+    page_id_t next_page = page->body.row_page.next_page_id_;
+    page = txn.GetPageManager()->GetPage(next_page);
+    StatusOr<slot_t> next_pos = page->Insert(txn, serialized_row);
+    if (next_pos.HasValue()) {
+      new_pos.page_id = page->PageID();
+      new_pos.slot = next_pos.Value();
+      finished = true;
+      break;
+    }
+  }
+  if (!finished) {
+    PageRef new_page =
+        txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage);
+    ASSIGN_OR_RETURN(slot_t, new_slot, new_page->Insert(txn, serialized_row));
+    RowPosition new_row_pos(new_page->PageID(), new_slot);
+    page.PageUnlock();
+    {
+      PageRef last_page = txn.GetPageManager()->GetPage(last_pid_);
+      last_page->body.row_page.next_page_id_ = new_page->PageID();
+      new_page->body.row_page.prev_page_id_ = last_page->PageID();
+    }
+    new_pos = new_row_pos;
+    last_pid_ = new_page->PageID();
   }
   for (const auto& idx : indexes_) {
     RETURN_IF_FAIL(IndexInsert(txn, idx, row, new_pos));
@@ -214,6 +241,11 @@ Status Table::IndexInsert(Transaction& txn, const Index& idx,
 Status Table::IndexDelete(Transaction& txn, const Index& idx,
                           const RowPosition& pos) {
   ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
+  return IndexDelete(txn, idx, pos, original_row);
+}
+
+Status Table::IndexDelete(Transaction& txn, const Index& idx,
+                          const RowPosition& pos, const Row& original_row) {
   BPlusTree bpt(idx.pid_);
   std::string key = idx.GenerateKey(original_row);
   if (idx.IsUnique()) {
@@ -271,8 +303,20 @@ std::vector<Table::ScanMorsel> Table::BuildScanMorsels(
 Iterator Table::BeginIndexScan(Transaction& txn, const Index& index,
                                const Value& begin, const Value& end,
                                bool ascending) const {
-  return Iterator(
-      new IndexScanIterator(*this, index, txn, begin, end, ascending));
+  return BeginIndexScan(txn, index,
+                        begin.IsNull() ? std::vector<Value>{}
+                                       : std::vector<Value>{begin},
+                        end.IsNull() ? std::vector<Value>{}
+                                     : std::vector<Value>{end},
+                        ascending);
+}
+
+Iterator Table::BeginIndexScan(Transaction& txn, const Index& index,
+                               std::vector<Value> begin_key,
+                               std::vector<Value> end_key,
+                               bool ascending) const {
+  return Iterator(new IndexScanIterator(*this, index, txn, std::move(begin_key),
+                                        std::move(end_key), ascending));
 }
 
 std::unordered_map<slot_t, size_t> Table::AvailableKeyIndex() const {

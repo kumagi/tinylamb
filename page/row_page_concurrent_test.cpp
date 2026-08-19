@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <future>
 #include <random>
@@ -221,19 +223,28 @@ TEST_F(RowPageConcurrentTest, AbortedVersionNeverBecomesVisible) {
   EXPECT_EQ(ReadRow(0), "durable");
 }
 
-TEST_F(RowPageConcurrentTest, WritersStillConflictUnderMV2PL) {
+TEST_F(RowPageConcurrentTest, WritersWaitForExclusiveLock) {
   ASSERT_TRUE(InsertRow("base"));
   Transaction first = tm_->Begin();
   PageRef page = p_->GetPage(page_id_);
   ASSERT_SUCCESS(page->Update(first, 0, "first"));
   page.PageUnlock();
 
-  Transaction second = tm_->Begin();
-  PageRef second_page = p_->GetPage(page_id_);
-  EXPECT_EQ(second_page->Update(second, 0, "second"), Status::kConflicts);
-  second_page.PageUnlock();
-  ASSERT_SUCCESS(second.PreCommit());
+  std::atomic<bool> started{false};
+  std::thread waiter([&] {
+    Transaction second = tm_->Begin();
+    started.store(true, std::memory_order_release);
+    PageRef second_page = p_->GetPage(page_id_);
+    ASSERT_SUCCESS(second_page->Update(second, 0, "second"));
+    second_page.PageUnlock();
+    ASSERT_SUCCESS(second.PreCommit());
+  });
+  while (!started.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
   ASSERT_SUCCESS(first.PreCommit());
-  EXPECT_EQ(ReadRow(0), "first");
+  waiter.join();
+  EXPECT_EQ(ReadRow(0), "second");
 }
 }  // namespace tinylamb

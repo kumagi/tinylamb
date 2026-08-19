@@ -45,6 +45,10 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.Find(begin);
       valid_ = idx_ < static_cast<size_t>(leaf->body.leaf_page.row_count_);
+      if (valid_ && !end.empty() &&
+          end < leaf->body.leaf_page.GetKey(idx_)) {
+        valid_ = false;
+      }
     }
   } else {
     if (end.empty()) {

@@ -69,6 +69,41 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
       Run("SELECT COUNT(*) FROM new_order;");
   ASSERT_EQ(initial_queues.size(), 1);
   EXPECT_EQ(initial_queues[0][0], Value(5));
+  const std::vector<Row> stock_probe =
+      Run("SELECT s_quantity FROM stock WHERE s_w_id = 1 AND s_i_id = 1;");
+  ASSERT_EQ(stock_probe.size(), 1);
+  ASSERT_EQ(Run("SELECT s_quantity, s_data FROM stock WHERE s_w_id = 1 AND "
+                "s_i_id = 2;")
+                .size(),
+            1);
+  ASSERT_EQ(Run("SELECT s_quantity, s_data FROM stock WHERE s_w_id = 1 AND "
+                "s_i_id = 7;")
+                .size(),
+            1);
+
+  auto ExplainText = [this](std::string_view sql) {
+    std::string text;
+    for (const Row& row : Run(std::string("EXPLAIN ") + std::string(sql))) {
+      text += row[0].AsString();
+      text += '\n';
+    }
+    return text;
+  };
+  const std::string customer_plan = ExplainText(
+      "SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 4;");
+  EXPECT_NE(customer_plan.find("Index"), std::string::npos) << customer_plan;
+  EXPECT_EQ(customer_plan.find("ParallelSort"), std::string::npos)
+      << customer_plan;
+  const std::string name_plan = ExplainText(
+      "SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND "
+      "c_last = 'Last#4' ORDER BY c_first;");
+  EXPECT_NE(name_plan.find("Index"), std::string::npos) << name_plan;
+  EXPECT_EQ(name_plan.find("ParallelSort"), std::string::npos) << name_plan;
+  const std::string queue_plan = ExplainText(
+      "SELECT no_o_id FROM new_order WHERE no_w_id = 1 AND no_d_id = 1 "
+      "ORDER BY no_o_id LIMIT 1;");
+  EXPECT_NE(queue_plan.find("Index"), std::string::npos) << queue_plan;
+  EXPECT_EQ(queue_plan.find("ParallelSort"), std::string::npos) << queue_plan;
   TpccWorkload workload(*database_, scale, 42);
 
   const TpccTransactionResult new_order =

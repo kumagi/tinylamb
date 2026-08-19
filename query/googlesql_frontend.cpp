@@ -126,7 +126,9 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
   if (output.starts_with("ERROR:")) {
     return {false, {}, std::move(output)};
   }
-  if (parse_cache.size() >= kMaxCachedStatements) parse_cache.clear();
+  if (parse_cache.size() >= kMaxCachedStatements) {
+    parse_cache.erase(parse_cache.begin());
+  }
   parse_cache.emplace(cache_key, output);
   return {true, std::move(output), {}};
 #else

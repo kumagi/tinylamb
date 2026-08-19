@@ -1,55 +1,74 @@
 /**
  * Copyright 2023 KUMAZAKI Hiroki
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Licensed under the Apache License, Version 2.0.
  */
 
 #include "index_only_scan_plan.hpp"
 
-#include <cmath>
 #include <cstddef>
 #include <memory>
 #include <ostream>
 #include <utility>
 #include <vector>
 
-#include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/index_only_scan.hpp"
 #include "executor/projection.hpp"
 #include "executor/selection.hpp"
+#include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "index/index_schema.hpp"
 #include "table/table.hpp"
 #include "type/column.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
+namespace {
+
+bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
+                  const std::vector<Expression>& expressions,
+                  const std::vector<bool>& ascending) {
+  if (provided.empty() || expressions.empty() ||
+      expressions.size() != ascending.size() ||
+      expressions.size() > provided.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < expressions.size(); ++i) {
+    if (expressions[i]->Type() != TypeTag::kColumnValue) return false;
+    if (expressions[i]->AsColumnValue().GetColumnName().name !=
+        provided[i].name) {
+      return false;
+    }
+    if (ascending[i] != scan_ascending) return false;
+  }
+  return true;
+}
+
+Value FirstOrNull(const std::vector<Value>& keys) {
+  return keys.empty() ? Value() : keys.front();
+}
+
+}  // namespace
 
 IndexOnlyScanPlan::IndexOnlyScanPlan(const Table& table, const Index& index,
                                      const TableStatistics& ts,
-                                     const Value& begin, const Value& end,
-                                     bool ascending, Expression where)
+                                     std::vector<Value> begin_key,
+                                     std::vector<Value> end_key,
+                                     bool ascending, Expression where,
+                                     std::vector<ColumnName> provided_order)
     : table_(table),
       index_(index),
-      stats_(ts.TransformBy(index.sc_.key_[0], begin, end)),
-      begin_(begin),
-      end_(end),
+      stats_(ts.TransformBy(index.sc_.key_[0], FirstOrNull(begin_key),
+                            FirstOrNull(end_key))),
+      begin_key_(std::move(begin_key)),
+      end_key_(std::move(end_key)),
       ascending_(ascending),
       where_(std::move(where)),
-      output_schema_(OutputSchema()) {}
+      output_schema_(OutputSchema()),
+      provided_order_(std::move(provided_order)) {}
 
 Schema IndexOnlyScanPlan::OutputSchema() const {
   std::vector<Column> cols;
@@ -78,18 +97,25 @@ Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& ctx) const {
     return std::make_shared<Projection>(std::move(columns), table_.GetSchema(),
                                         std::move(executor));
   }
-  return std::make_shared<IndexOnlyScan>(ctx.txn_, table_, index_, begin_, end_,
-                                         ascending_, where_,
+  return std::make_shared<IndexOnlyScan>(ctx.txn_, table_, index_, begin_key_,
+                                         end_key_, ascending_, where_,
                                          table_.GetSchema());
 }
 
 size_t IndexOnlyScanPlan::AccessRowCount() const { return EmitRowCount(); }
 
 size_t IndexOnlyScanPlan::EmitRowCount() const {
-  if (index_.IsUnique() && begin_ == end_) {
+  if (index_.IsUnique() && begin_key_ == end_key_ &&
+      begin_key_.size() == index_.sc_.key_.size()) {
     return 1;
   }
   return stats_.Rows();
+}
+
+bool IndexOnlyScanPlan::IsOrderedBy(
+    const std::vector<Expression>& expressions,
+    const std::vector<bool>& ascending) const {
+  return OrderMatches(provided_order_, ascending_, expressions, ascending);
 }
 
 void IndexOnlyScanPlan::Dump(std::ostream& o, int /*indent*/) const {

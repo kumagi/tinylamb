@@ -112,24 +112,13 @@ bool Covered(const std::unordered_set<T>& available,
       required, [&](const T& value) { return available.contains(value); });
 }
 
-bool TouchOnly(const Expression& expression, const ColumnName& column) {
-  if (!expression) return true;
-  if (expression->Type() == TypeTag::kColumnValue) {
-    return expression->AsColumnValue().GetColumnName() == column;
-  }
-  if (expression->Type() == TypeTag::kBinaryExp) {
-    const auto& binary = expression->AsBinaryExpression();
-    return TouchOnly(binary.Left(), column) &&
-           TouchOnly(binary.Right(), column);
-  }
-  return expression->TouchedColumns().empty();
-}
-
 Plan BuildIndexScan(const Table& table, const Index& index,
-                    const TableStatistics& statistics, const Value& begin,
-                    const Value& end, const Expression& predicate,
+                    const TableStatistics& statistics,
+                    std::vector<Value> begin_key, std::vector<Value> end_key,
+                    bool ascending, const Expression& predicate,
                     const std::vector<NamedExpression>& select,
-                    bool require_row_position) {
+                    bool require_row_position,
+                    std::vector<ColumnName> provided_order) {
   std::unordered_set<ColumnName> touched = predicate->TouchedColumns();
   for (const NamedExpression& item : select) {
     touched.merge(item.expression->TouchedColumns());
@@ -141,11 +130,13 @@ Plan BuildIndexScan(const Table& table, const Index& index,
   }
   if (!require_row_position &&
       Covered(index.CoveredColumns(), touched_offsets)) {
-    return std::make_shared<IndexOnlyScanPlan>(table, index, statistics, begin,
-                                               end, true, predicate);
+    return std::make_shared<IndexOnlyScanPlan>(
+        table, index, statistics, std::move(begin_key), std::move(end_key),
+        ascending, predicate, std::move(provided_order));
   }
-  return std::make_shared<IndexScanPlan>(table, index, statistics, begin, end,
-                                         true, predicate);
+  return std::make_shared<IndexScanPlan>(
+      table, index, statistics, std::move(begin_key), std::move(end_key),
+      ascending, predicate, std::move(provided_order));
 }
 
 std::vector<Plan> ScanCandidates(const std::vector<NamedExpression>& select,
@@ -153,15 +144,13 @@ std::vector<Plan> ScanCandidates(const std::vector<NamedExpression>& select,
                                  const Expression& predicate,
                                  const TableStatistics& statistics,
                                  bool require_row_position,
-                                 bool include_indexes, bool include_full_scan) {
+                                 bool include_indexes, bool include_full_scan,
+                                 [[maybe_unused]] const std::vector<Expression>&
+                                     order_expressions,
+                                 [[maybe_unused]] const std::vector<bool>&
+                                     order_ascending) {
   const Schema& schema = table.GetSchema();
-  const std::unordered_map<slot_t, size_t> indexes = table.AvailableKeyIndex();
   std::unordered_map<slot_t, Range> ranges;
-  for (const auto& [column, unused] : indexes) {
-    static_cast<void>(unused);
-    ranges.emplace(column, Range{});
-  }
-
   std::vector<Expression> range_predicates;
   for (const Expression& conjunct : SplitConjuncts(predicate)) {
     if (conjunct->Type() != TypeTag::kBinaryExp) continue;
@@ -184,31 +173,76 @@ std::vector<Plan> ScanCandidates(const std::vector<NamedExpression>& select,
     if (!column || !constant) continue;
     const int offset = schema.Offset(column->GetColumnName());
     if (offset < 0) continue;
-    const auto range = ranges.find(static_cast<slot_t>(offset));
-    if (range == ranges.end()) continue;
-    range->second.Update(binary.Op(), constant->GetValue(), direction);
+    ranges[static_cast<slot_t>(offset)].Update(binary.Op(),
+                                               constant->GetValue(), direction);
     range_predicates.push_back(conjunct);
   }
 
   const Expression pushed_predicate = CombineConjuncts(range_predicates);
   std::vector<Plan> candidates;
-  for (const auto& [column, range] : ranges) {
-    if (!include_indexes) break;
-    // The current B+Tree iterator accepts a closed begin/end key. One-sided
-    // bounds stay as a full scan until the key type gains infinity sentinels.
-    if (!range.min || !range.max) continue;
-    const Index& index = table.GetIndex(indexes.at(column));
-    Plan candidate =
-        BuildIndexScan(table, index, statistics, *range.min, *range.max,
-                       pushed_predicate, select, require_row_position);
-    if (!TouchOnly(pushed_predicate, schema.GetColumn(column).Name())) {
-      candidate = std::make_shared<SelectionPlan>(candidate, pushed_predicate,
-                                                  statistics);
+  if (include_indexes) {
+    for (size_t index_offset = 0; index_offset < table.IndexCount();
+         ++index_offset) {
+      const Index& index = table.GetIndex(index_offset);
+      std::vector<Value> begin_key;
+      std::vector<Value> end_key;
+      std::unordered_set<slot_t> consumed;
+      size_t equality_prefix = 0;
+      for (slot_t slot : index.sc_.key_) {
+        const auto range = ranges.find(slot);
+        if (range == ranges.end()) break;
+        const bool equality = range->second.min && range->second.max &&
+                              *range->second.min == *range->second.max;
+        if (equality) {
+          begin_key.push_back(*range->second.min);
+          end_key.push_back(*range->second.max);
+          consumed.insert(slot);
+          ++equality_prefix;
+          continue;
+        }
+        if (range->second.min) {
+          begin_key.push_back(*range->second.min);
+        } else if (begin_key.empty()) {
+          break;
+        }
+        if (range->second.max) {
+          end_key.push_back(*range->second.max);
+        } else if (!begin_key.empty()) {
+          end_key = begin_key;
+          if (!range->second.min) end_key.clear();
+          else end_key.pop_back();
+        }
+        consumed.insert(slot);
+        break;
+      }
+      if (begin_key.empty()) continue;
+
+      std::vector<ColumnName> provided_order;
+      for (size_t key = equality_prefix; key < index.sc_.key_.size(); ++key) {
+        provided_order.push_back(
+            schema.GetColumn(index.sc_.key_[key]).Name());
+      }
+      // Prefix encoding is correct for forward scans. DESC still needs a
+      // sort until the B+tree iterator can land on the last key of a prefix.
+
+      Plan candidate = BuildIndexScan(
+          table, index, statistics, begin_key, end_key, true,
+          pushed_predicate, select, require_row_position,
+          std::move(provided_order));
+      const bool covered = std::ranges::all_of(
+          pushed_predicate->TouchedColumns(), [&](const ColumnName& column) {
+            const int offset = schema.Offset(column);
+            return offset >= 0 && consumed.contains(static_cast<slot_t>(offset));
+          });
+      if (!covered) {
+        candidate = std::make_shared<SelectionPlan>(candidate, pushed_predicate,
+                                                    statistics);
+      }
+      if (select.size() != candidate->GetSchema().ColumnCount()) {
+        candidate = std::make_shared<ProjectionPlan>(candidate, select);
+      }
+      candidates.push_back(std::move(candidate));
     }
-    if (select.size() != candidate->GetSchema().ColumnCount()) {
-      candidate = std::make_shared<ProjectionPlan>(candidate, select);
-    }
-    candidates.push_back(std::move(candidate));
   }
 
   if (include_full_scan) {
@@ -351,12 +385,18 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   const cascades::PhysicalProperties properties{
       .require_row_position = query.require_row_position_, .ordering = {}};
 
-  const auto to_alternatives = [](std::vector<Plan> plans) {
+  const auto to_alternatives = [&](std::vector<Plan> plans) {
     std::vector<cascades::PlanAlternative> result;
     result.reserve(plans.size());
     for (Plan& plan : plans) {
-      result.push_back(cascades::PlanAlternative{
-          plan, static_cast<double>(plan->AccessRowCount())});
+      double cost = static_cast<double>(plan->AccessRowCount());
+      if (!query.order_expressions_.empty() &&
+          plan->IsOrderedBy(query.order_expressions_,
+                            query.order_ascending_)) {
+        cost = std::min(cost, 1.0);
+      }
+      result.push_back(
+          cascades::PlanAlternative{std::move(plan), cost});
     }
     return result;
   };
@@ -378,7 +418,8 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
         }
         return to_alternatives(ScanCandidates(
             projection, table, predicate, *statistics.at(logical.table),
-            required.require_row_position, indexes, full_scan));
+            required.require_row_position, indexes, full_scan,
+            query.order_expressions_, query.order_ascending_));
       };
   const auto join_alternatives =
       [&](const std::vector<cascades::BestPlan>& children, bool hash,
@@ -394,18 +435,18 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   using namespace cascades::dsl;
   cascades::ImplementationRuleSet implementation_rules;
   implementation_rules.Add(cascades::ImplementationRule(
-      "full_scan", Scan(),
-      [&](const cascades::Bindings&, const cascades::LogicalExpression& logical,
-          const std::vector<cascades::BestPlan>&,
-          const cascades::PhysicalProperties& required) {
-        return scan_alternatives(logical, required, false, true);
-      }));
-  implementation_rules.Add(cascades::ImplementationRule(
       "index_scan", Scan(),
       [&](const cascades::Bindings&, const cascades::LogicalExpression& logical,
           const std::vector<cascades::BestPlan>&,
           const cascades::PhysicalProperties& required) {
         return scan_alternatives(logical, required, true, false);
+      }));
+  implementation_rules.Add(cascades::ImplementationRule(
+      "full_scan", Scan(),
+      [&](const cascades::Bindings&, const cascades::LogicalExpression& logical,
+          const std::vector<cascades::BestPlan>&,
+          const cascades::PhysicalProperties& required) {
+        return scan_alternatives(logical, required, false, true);
       }));
   implementation_rules.Add(cascades::ImplementationRule(
       "hash_join", Join(),

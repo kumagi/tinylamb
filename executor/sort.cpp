@@ -26,7 +26,9 @@ void SortExecutor::Materialize() {
         return false;
       };
   const size_t workers =
-      std::min(worker_count_, std::max<size_t>(1, rows_.size()));
+      rows_.size() < 4096
+          ? 1
+          : std::min(worker_count_, std::max<size_t>(1, rows_.size()));
   const size_t run_size = (rows_.size() + workers - 1) / workers;
   std::exception_ptr error;
   std::mutex error_mutex;

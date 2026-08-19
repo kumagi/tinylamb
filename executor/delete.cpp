@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <ostream>
+#include <utility>
+#include <vector>
 
 #include "table/table.hpp"
 #include "type/row.hpp"
@@ -11,11 +13,13 @@
 namespace tinylamb {
 bool DeleteExecutor::Next(Row* dst, RowPosition* rp) {
   if (finished_) return false;
-  int64_t count = 0;
+  std::vector<RowPosition> pending;
   Row row;
   RowPosition position;
-  while (source_->Next(&row, &position)) {
-    if (target_->Delete(*txn_, position) != Status::kSuccess) break;
+  while (source_->Next(&row, &position)) pending.push_back(position);
+  int64_t count = 0;
+  for (const RowPosition& row_position : pending) {
+    if (target_->Delete(*txn_, row_position) != Status::kSuccess) break;
     ++count;
   }
   *dst = Row({Value("Delete Rows"), Value(count)});

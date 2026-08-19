@@ -31,7 +31,19 @@ IndexOnlyScan::IndexOnlyScan(Transaction& txn, const Table& table,
                              const Index& index, const Value& begin,
                              const Value& end, bool ascending, Expression where,
                              const Schema& sc)
-    : iter_(table, index, txn, begin, end, ascending),
+    : IndexOnlyScan(txn, table, index,
+                    begin.IsNull() ? std::vector<Value>{}
+                                   : std::vector<Value>{begin},
+                    end.IsNull() ? std::vector<Value>{}
+                                 : std::vector<Value>{end},
+                    ascending, std::move(where), sc) {}
+
+IndexOnlyScan::IndexOnlyScan(Transaction& txn, const Table& table,
+                             const Index& index, std::vector<Value> begin_key,
+                             std::vector<Value> end_key, bool ascending,
+                             Expression where, const Schema& sc)
+    : iter_(table, index, txn, std::move(begin_key), std::move(end_key),
+            ascending),
       cond_(std::move(where)),
       key_schema_(KeySchema(index, sc)),
       value_schema_(ValueSchema(index, sc)),
@@ -72,14 +84,13 @@ Schema IndexOnlyScan::OutputSchema(const Index& idx,
 }
 
 bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
-  do {
-    if (!iter_.IsValid()) {
-      return false;
-    }
+  while (iter_.IsValid()) {
     *dst = iter_.GetKey() + iter_.Include();
     ++iter_;
-  } while (!cond_->Evaluate(*dst, output_schema_).Truthy());
-  return true;
+    if (!dst->IsValid()) continue;
+    if (cond_->Evaluate(*dst, output_schema_).Truthy()) return true;
+  }
+  return false;
 }
 
 void IndexOnlyScan::Dump(std::ostream& o, int /*indent*/) const {

@@ -22,6 +22,7 @@
 #include <vector>
 #include "plan/plan.hpp"
 #include "table/table_statistics.hpp"
+#include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "expression/named_expression.hpp"
 
@@ -32,8 +33,9 @@ class Table;
 class IndexOnlyScanPlan : public PlanBase {
  public:
   IndexOnlyScanPlan(const Table& table, const Index& index,
-                    const TableStatistics& ts, const Value& begin,
-                    const Value& end, bool ascending, Expression where);
+                    const TableStatistics& ts, std::vector<Value> begin_key,
+                    std::vector<Value> end_key, bool ascending, Expression where,
+                    std::vector<ColumnName> provided_order = {});
   IndexOnlyScanPlan(const IndexOnlyScanPlan&) = delete;
   IndexOnlyScanPlan(IndexOnlyScanPlan&&) = delete;
   IndexOnlyScanPlan& operator=(const IndexOnlyScanPlan&) = delete;
@@ -52,6 +54,8 @@ class IndexOnlyScanPlan : public PlanBase {
 
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
+  [[nodiscard]] bool IsOrderedBy(const std::vector<Expression>& expressions,
+                                 const std::vector<bool>& ascending) const override;
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
@@ -60,12 +64,13 @@ class IndexOnlyScanPlan : public PlanBase {
   const Table& table_;
   const Index& index_;
   TableStatistics stats_;
-  Value begin_;
-  Value end_;
+  std::vector<Value> begin_key_;
+  std::vector<Value> end_key_;
   bool ascending_;
   Expression where_;
   std::vector<NamedExpression> select_;
   Schema output_schema_;
+  std::vector<ColumnName> provided_order_;
 };
 
 }  // namespace tinylamb

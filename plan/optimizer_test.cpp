@@ -177,6 +177,30 @@ TEST_F(OptimizerTest, Simple) {
   ASSERT_SUCCESS(DumpAll(qd));
 }
 
+TEST_F(OptimizerTest, CompositeIndexUsesEqualityPrefix) {
+  QueryData query{
+      {"Sc1"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
+                              ConstantValueExp(Value("c2-32"))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp("c3"), BinaryOperation::kEquals,
+                              ConstantValueExp(Value(32 + 9.9)))),
+      {NamedExpression("c1"), NamedExpression("c2")}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  dump << plan;
+  EXPECT_NE(dump.str().find("Index"), std::string::npos) << dump.str();
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(32));
+  EXPECT_FALSE(executor->Next(&row, nullptr));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, IndexScan) {
   // Arrange
   QueryData qd{

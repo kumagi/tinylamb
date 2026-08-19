@@ -38,20 +38,25 @@
 namespace tinylamb {
 namespace {
 
-std::string EncodeBegin(const Value& value) {
-  return value.IsNull() ? std::string() : value.EncodeMemcomparableFormat();
+std::string EncodeParts(const std::vector<Value>& parts) {
+  std::string encoded;
+  for (const Value& value : parts) {
+    if (value.IsNull()) break;
+    encoded += value.EncodeMemcomparableFormat();
+  }
+  return encoded;
 }
 
-std::string EncodeEnd(const Index& index, const Value& value) {
-  if (value.IsNull()) return {};
-  std::string encoded = value.EncodeMemcomparableFormat();
-  if (index.sc_.key_.size() > 1) {
-    // Optimizer ranges currently constrain the first index column. A composite
-    // key has encoded suffix columns, so the inclusive upper bound must cover
-    // every key sharing that prefix instead of stopping at the bare prefix.
+std::string EncodeEndParts(const Index& index, const std::vector<Value>& parts) {
+  std::string encoded = EncodeParts(parts);
+  if (!encoded.empty() && parts.size() < index.sc_.key_.size()) {
     encoded.push_back(static_cast<char>(0xff));
   }
   return encoded;
+}
+
+Value FirstOrNull(const std::vector<Value>& parts) {
+  return parts.empty() ? Value() : parts.front();
 }
 
 }  // namespace
@@ -59,16 +64,28 @@ std::string EncodeEnd(const Index& index, const Value& value) {
 IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
                                      Transaction& txn, Value begin, Value end,
                                      bool ascending)
+    : IndexScanIterator(table, index, txn,
+                        begin.IsNull() ? std::vector<Value>{}
+                                       : std::vector<Value>{std::move(begin)},
+                        end.IsNull() ? std::vector<Value>{}
+                                     : std::vector<Value>{std::move(end)},
+                        ascending) {}
+
+IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
+                                     Transaction& txn,
+                                     std::vector<Value> begin_key,
+                                     std::vector<Value> end_key,
+                                     bool ascending)
     : table_(table),
       index_(index),
       txn_(txn),
-      begin_(std::move(begin)),
-      end_(std::move(end)),
+      begin_(FirstOrNull(begin_key)),
+      end_(FirstOrNull(end_key)),
       ascending_(ascending),
       is_unique_(index.sc_.mode_ == IndexMode::kUnique),
       value_offset_(ascending_ ? 0 : -1),
       bpt_(index.Root()),
-      iter_(&bpt_, &txn, EncodeBegin(begin_), EncodeEnd(index_, end_),
+      iter_(&bpt_, &txn, EncodeParts(begin_key), EncodeEndParts(index, end_key),
             ascending) {
   if (!iter_.IsValid()) {
     return;
@@ -128,8 +145,13 @@ void IndexScanIterator::ResolveRow() const {
     return;
   }
   txn_.AddReadSet(pos_);
-  ASSIGN_OR_CRASH(std::string_view, row, ref->Read(txn_, pos_.slot));
-  current_row_.Deserialize(row.data(), table_.schema_);
+  StatusOr<std::string_view> row = ref->Read(txn_, pos_.slot);
+  if (!row.HasValue()) {
+    current_row_.Clear();
+    current_row_resolved_ = true;
+    return;
+  }
+  current_row_.Deserialize(row.Value().data(), table_.schema_);
   current_row_resolved_ = true;
 }
 
@@ -172,7 +194,6 @@ const Row& IndexScanIterator::operator*() const {
   if (!current_row_resolved_) {
     ResolveRow();
   }
-  LOG(INFO) << current_row_;
   return current_row_;
 }
 

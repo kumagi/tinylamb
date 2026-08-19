@@ -43,7 +43,7 @@ struct WorkerStats {
 
 void Usage(std::ostream& out, std::string_view program) {
   out << "usage: " << program << " <new-database-path> [options]\n"
-      << "  --clients N       clients (currently must be 1)\n"
+      << "  --clients N       concurrent clients (default: 1)\n"
       << "  --warmup N        warmup seconds (default: 2)\n"
       << "  --seconds N       measurement seconds (default: 10)\n"
       << "  --warehouses N   (default: 1)\n"
@@ -135,9 +135,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   if (options.clients != 1) {
-    std::cerr << "concurrent TPC-C clients are not supported yet: tinylamb "
-                 "currently terminates an index scan on row-lock conflict\n";
-    return 2;
+    std::cerr << "note: multi-client TPC-C is experimental and not tpmC\n";
   }
 
   std::cout << "benchmark=tinylamb_scaled_tpcc\n"

@@ -22,6 +22,7 @@
 
 #include <ostream>
 #include <utility>
+#include <vector>
 
 #include "expression/expression.hpp"
 #include "index/index.hpp"
@@ -35,23 +36,30 @@ namespace tinylamb {
 IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
                      const Value& begin, const Value& end, bool ascending,
                      Expression where, const Schema& sc)
-    : iter_(new IndexScanIterator(table, index, txn, begin, end, ascending)),
+    : IndexScan(txn, table, index,
+                begin.IsNull() ? std::vector<Value>{}
+                               : std::vector<Value>{begin},
+                end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end},
+                ascending, std::move(where), sc) {}
+
+IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
+                     std::vector<Value> begin_key, std::vector<Value> end_key,
+                     bool ascending, Expression where, const Schema& sc)
+    : iter_(new IndexScanIterator(table, index, txn, std::move(begin_key),
+                                  std::move(end_key), ascending)),
       cond_(std::move(where)),
       schema_(sc) {}
 
 bool IndexScan::Next(Row* dst, RowPosition* rp) {
-  do {
-    if (!iter_.IsValid()) {
-      return false;
-    }
-    RowPosition pointed_row = iter_.Position();
-    if (rp != nullptr) {
-      *rp = pointed_row;
-    }
+  while (iter_.IsValid()) {
+    const RowPosition pointed_row = iter_.Position();
     *dst = *iter_;
     ++iter_;
-  } while (!cond_->Evaluate(*dst, schema_).Truthy());
-  return true;
+    if (!dst->IsValid()) continue;
+    if (rp != nullptr) *rp = pointed_row;
+    if (cond_->Evaluate(*dst, schema_).Truthy()) return true;
+  }
+  return false;
 }
 
 void IndexScan::Dump(std::ostream& o, int /*indent*/) const {

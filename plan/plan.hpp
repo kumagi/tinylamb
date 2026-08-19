@@ -45,6 +45,11 @@ class PlanBase {
   [[nodiscard]] virtual const Schema& GetSchema() const = 0;
   [[nodiscard]] virtual size_t AccessRowCount() const = 0;
   [[nodiscard]] virtual size_t EmitRowCount() const = 0;
+  [[nodiscard]] virtual bool IsOrderedBy(
+      const std::vector<Expression>& /*expressions*/,
+      const std::vector<bool>& /*ascending*/) const {
+    return false;
+  }
 
   virtual void Dump(std::ostream& o, int indent) const = 0;
   [[nodiscard]] virtual std::string ToString() const = 0;
