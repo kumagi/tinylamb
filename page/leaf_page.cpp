@@ -53,11 +53,16 @@ std::string_view LeafPage::GetValue(size_t idx) const {
 
 Status LeafPage::Insert(page_id_t page_id, Transaction& txn,
                         std::string_view key, std::string_view value) {
-  constexpr size_t kThreshold = kPageBodySize / 6;
+  constexpr size_t kFanoutThreshold = kPageBodySize / 6;
   const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
   const bin_size_t expected_size = physical_size + sizeof(RowPointer);
-  if (kThreshold < expected_size) {
-    return Status::kTooBigData;
+  if (kFanoutThreshold < expected_size) {
+    if (expected_size > kPageBodySize / 2) {
+      return Status::kTooBigData;
+    }
+    if (row_count_ > 0) {
+      return Status::kNoSpace;
+    }
   }
   if (free_size_ < expected_size) {
     return Status::kNoSpace;
@@ -95,10 +100,13 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
 
 Status LeafPage::Update(page_id_t page_id, Transaction& txn,
                         std::string_view key, std::string_view value) {
-  constexpr size_t kThreshold = kPageBodySize / 6;
+  constexpr size_t kFanoutThreshold = kPageBodySize / 6;
   const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
-  if (kThreshold < physical_size) {
-    return Status::kTooBigData;
+  if (kFanoutThreshold < physical_size) {
+    if (physical_size + sizeof(RowPointer) > kPageBodySize / 2) {
+      return Status::kTooBigData;
+    }
+    return Status::kNoSpace;
   }
   ASSIGN_OR_RETURN(std::string_view, old_value, Read(page_id, txn, key));
   const bin_size_t old_size = SerializeSize(key) + SerializeSize(old_value);
@@ -324,15 +332,30 @@ void LeafPage::SetFence(RowPointer& fence_pos, const IndexKey& new_fence) {
   }
 }
 
+namespace {
+
+Status FenceNeedsSpace(bin_size_t free_size, const RowPointer& fence_pos,
+                       const IndexKey& fence) {
+  if (!fence.IsNotInfinity()) return Status::kSuccess;
+  const size_t physical_size = SerializeSize(fence);
+  const bin_size_t old_size =
+      (fence_pos == kMinusInfinity || fence_pos == kPlusInfinity)
+          ? 0
+          : fence_pos.size;
+  if (physical_size > old_size &&
+      free_size < physical_size - old_size) {
+    return Status::kNoSpace;
+  }
+  return Status::kSuccess;
+}
+
+}  // namespace
+
 Status LeafPage::SetLowFence(page_id_t pid, Transaction& txn,
                              const IndexKey& lf) {
-  if (lf.IsNotInfinity()) {
-    const std::string_view new_fence = lf.GetKey().Value();
-    const size_t physical_size = SerializeSize(lf);
-    if (physical_size > new_fence.size() &&
-        free_size_ < physical_size - new_fence.size()) {
-      return Status::kNoSpace;
-    }
+  if (Status space = FenceNeedsSpace(free_size_, low_fence_, lf);
+      space != Status::kSuccess) {
+    return space;
   }
   txn.SetLowFence(pid, lf, GetLowFence());
   SetFence(low_fence_, lf);
@@ -341,13 +364,9 @@ Status LeafPage::SetLowFence(page_id_t pid, Transaction& txn,
 
 Status LeafPage::SetHighFence(page_id_t pid, Transaction& txn,
                               const IndexKey& hf) {
-  if (hf.IsNotInfinity()) {
-    const std::string_view new_fence = hf.GetKey().Value();
-    const size_t physical_size = SerializeSize(hf);
-    if (physical_size > new_fence.size() &&
-        free_size_ < physical_size - new_fence.size()) {
-      return Status::kNoSpace;
-    }
+  if (Status space = FenceNeedsSpace(free_size_, high_fence_, hf);
+      space != Status::kSuccess) {
+    return space;
   }
   txn.SetHighFence(pid, hf, GetHighFence());
   SetFence(high_fence_, hf);

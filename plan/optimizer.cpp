@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -345,6 +346,66 @@ bool IsAggregate(const NamedExpression& expression) {
   return expression.expression->Type() == TypeTag::kAggregateExp;
 }
 
+struct OptimizerImplementContext {
+  std::function<std::vector<cascades::PlanAlternative>(
+      const cascades::LogicalExpression&, const cascades::PhysicalProperties&,
+      bool, bool)>
+      scan_alternatives;
+  std::function<std::vector<cascades::PlanAlternative>(
+      const std::vector<cascades::BestPlan>&, bool, bool, bool)>
+      join_alternatives;
+};
+
+thread_local OptimizerImplementContext* tls_implement = nullptr;
+
+const cascades::ImplementationRuleSet& DefaultImplementationRules() {
+  static const cascades::ImplementationRuleSet rules = [] {
+    using namespace cascades::dsl;
+    cascades::ImplementationRuleSet built;
+    built.Add(cascades::ImplementationRule(
+        "index_scan", Scan(),
+        [](const cascades::Bindings&,
+           const cascades::LogicalExpression& logical,
+           const std::vector<cascades::BestPlan>&,
+           const cascades::PhysicalProperties& required) {
+          return tls_implement->scan_alternatives(logical, required, true,
+                                                  false);
+        }));
+    built.Add(cascades::ImplementationRule(
+        "full_scan", Scan(),
+        [](const cascades::Bindings&,
+           const cascades::LogicalExpression& logical,
+           const std::vector<cascades::BestPlan>&,
+           const cascades::PhysicalProperties& required) {
+          return tls_implement->scan_alternatives(logical, required, false,
+                                                  true);
+        }));
+    built.Add(cascades::ImplementationRule(
+        "hash_join", Join(),
+        [](const cascades::Bindings&, const cascades::LogicalExpression&,
+           const std::vector<cascades::BestPlan>& children,
+           const cascades::PhysicalProperties&) {
+          return tls_implement->join_alternatives(children, true, false, false);
+        }));
+    built.Add(cascades::ImplementationRule(
+        "index_join", Join(),
+        [](const cascades::Bindings&, const cascades::LogicalExpression&,
+           const std::vector<cascades::BestPlan>& children,
+           const cascades::PhysicalProperties&) {
+          return tls_implement->join_alternatives(children, false, true, false);
+        }));
+    built.Add(cascades::ImplementationRule(
+        "nested_loop_join", Join(),
+        [](const cascades::Bindings&, const cascades::LogicalExpression&,
+           const std::vector<cascades::BestPlan>& children,
+           const cascades::PhysicalProperties&) {
+          return tls_implement->join_alternatives(children, false, false, true);
+        }));
+    return built;
+  }();
+  return rules;
+}
+
 }  // namespace
 
 StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
@@ -432,53 +493,32 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                            children[1].plan, hash, index, cross));
       };
 
-  using namespace cascades::dsl;
-  cascades::ImplementationRuleSet implementation_rules;
-  implementation_rules.Add(cascades::ImplementationRule(
-      "index_scan", Scan(),
-      [&](const cascades::Bindings&, const cascades::LogicalExpression& logical,
-          const std::vector<cascades::BestPlan>&,
-          const cascades::PhysicalProperties& required) {
-        return scan_alternatives(logical, required, true, false);
-      }));
-  implementation_rules.Add(cascades::ImplementationRule(
-      "full_scan", Scan(),
-      [&](const cascades::Bindings&, const cascades::LogicalExpression& logical,
-          const std::vector<cascades::BestPlan>&,
-          const cascades::PhysicalProperties& required) {
-        return scan_alternatives(logical, required, false, true);
-      }));
-  implementation_rules.Add(cascades::ImplementationRule(
-      "hash_join", Join(),
-      [&](const cascades::Bindings&, const cascades::LogicalExpression&,
-          const std::vector<cascades::BestPlan>& children,
-          const cascades::PhysicalProperties&) {
-        return join_alternatives(children, true, false, false);
-      }));
-  implementation_rules.Add(cascades::ImplementationRule(
-      "index_join", Join(),
-      [&](const cascades::Bindings&, const cascades::LogicalExpression&,
-          const std::vector<cascades::BestPlan>& children,
-          const cascades::PhysicalProperties&) {
-        return join_alternatives(children, false, true, false);
-      }));
-  implementation_rules.Add(cascades::ImplementationRule(
-      "nested_loop_join", Join(),
-      [&](const cascades::Bindings&, const cascades::LogicalExpression&,
-          const std::vector<cascades::BestPlan>& children,
-          const cascades::PhysicalProperties&) {
-        return join_alternatives(children, false, false, true);
-      }));
-  for (const std::string& disabled : options.disabled_implementation_rules) {
-    implementation_rules.Remove(disabled);
-  }
-  for (const cascades::ImplementationRule& extra :
-       options.extra_implementation_rules) {
-    implementation_rules.Add(extra);
+  OptimizerImplementContext implement_context;
+  implement_context.scan_alternatives = scan_alternatives;
+  implement_context.join_alternatives = join_alternatives;
+  tls_implement = &implement_context;
+  struct TlsClear {
+    ~TlsClear() { tls_implement = nullptr; }
+  } tls_clear;
+
+  const cascades::ImplementationRuleSet* implementation_rules =
+      &DefaultImplementationRules();
+  cascades::ImplementationRuleSet customized;
+  if (!options.disabled_implementation_rules.empty() ||
+      !options.extra_implementation_rules.empty()) {
+    customized = DefaultImplementationRules();
+    for (const std::string& disabled : options.disabled_implementation_rules) {
+      customized.Remove(disabled);
+    }
+    for (const cascades::ImplementationRule& extra :
+         options.extra_implementation_rules) {
+      customized.Add(extra);
+    }
+    implementation_rules = &customized;
   }
 
   std::optional<cascades::BestPlan> best =
-      search.Optimize(root, properties, implementation_rules);
+      search.Optimize(root, properties, *implementation_rules);
   if (!best) return Status::kNotImplemented;
 
   // Range and join implementation rules may consume part of the predicate.

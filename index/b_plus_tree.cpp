@@ -186,7 +186,8 @@ Status BPlusTree::LeafInsert(Transaction& txn, PageRef& leaf,
 
   for (;;) {
     Status leaf_result = leaf->InsertLeaf(txn, key, value);
-    if (leaf_result == Status::kTooBigData) {
+    if (leaf_result == Status::kTooBigData ||
+        leaf_result == Status::kDuplicates) {
       return leaf_result;
     }
     if (leaf_result == Status::kSuccess) {
@@ -262,7 +263,7 @@ Status BPlusTree::Update(Transaction& txn, std::string_view key,
                          std::string_view value) {
   PageRef curr = FindLeaf(txn, key, false);
   Status s = curr->Update(txn, key, value);
-  if (s == Status::kNoSpace) {
+  if (s == Status::kNoSpace || s == Status::kTooBigData) {
     COERCE(curr->Delete(txn, key));
     return LeafInsert(txn, curr, key, value);
   }

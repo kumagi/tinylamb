@@ -563,6 +563,7 @@ std::unique_ptr<Statement> VisitInsert(const GoogleSqlAstNode& root) {
   for (const GoogleSqlAstNode* row : row_list->Children("InsertValuesRow")) {
     std::vector<Expression> values;
     for (const auto& value : row->children) {
+      if (value->kind == "Location" || value->kind == "Hint") continue;
       values.push_back(VisitExpression(*value));
     }
     rows.push_back(std::move(values));

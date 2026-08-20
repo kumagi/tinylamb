@@ -14,9 +14,12 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
+#include <sstream>
+#include <stdexcept>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -29,17 +32,22 @@
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/constant_executor.hpp"
+#include "executor/cross_join.hpp"
+#include "executor/delete.hpp"
+#include "executor/distinct.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/hash_join.hpp"
 #include "executor/index_join.hpp"
 #include "executor/index_scan.hpp"
 #include "executor/insert.hpp"
+#include "executor/limit.hpp"
 #include "executor/parallel_scan.hpp"
 #include "executor/parallel_aggregation.hpp"
 #include "executor/projection.hpp"
 #include "executor/selection.hpp"
 #include "executor/sort.hpp"
 #include "executor/update.hpp"
+#include "executor/zone_map.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "gtest/gtest.h"
@@ -832,5 +840,684 @@ TEST_F(ExecutorTest, ParallelSortPreservesOrderAndStableTies) {
   }
   EXPECT_EQ(count, 10000U);
   EXPECT_EQ(previous_value, 99);
+}
+
+// ===== DistinctExecutor =====
+TEST_F(ExecutorTest, DistinctEmptyInput) {
+  DistinctExecutor distinct(
+      std::make_shared<ConstantExecutor>(std::vector<Row>{}));
+  Row row;
+  RowPosition pos;
+  ASSERT_FALSE(distinct.Next(&row, &pos));
+  ASSERT_FALSE(distinct.Next(&row, nullptr));
+}
+
+TEST_F(ExecutorTest, DistinctAllDuplicates) {
+  std::vector<Row> rows;
+  for (int i = 0; i < 6; ++i) {
+    rows.emplace_back(std::vector<Value>{Value(7)});
+  }
+  DistinctExecutor distinct(std::make_shared<ConstantExecutor>(std::move(rows)));
+  Row row;
+  RowPosition pos;
+  ASSERT_TRUE(distinct.Next(&row, &pos));
+  EXPECT_EQ(row, Row({Value(7)}));
+  ASSERT_FALSE(distinct.Next(&row, nullptr));
+}
+
+TEST_F(ExecutorTest, DistinctAlreadySortedInput) {
+  std::vector<Row> rows{Row({Value(1)}), Row({Value(2)}), Row({Value(2)}),
+                        Row({Value(3)}), Row({Value(4)}), Row({Value(4)})};
+  DistinctExecutor distinct(std::make_shared<ConstantExecutor>(std::move(rows)));
+  Row row;
+  RowPosition pos;
+  int64_t expected = 1;
+  while (distinct.Next(&row, &pos)) {
+    EXPECT_EQ(row, Row({Value(expected)}));
+    ++expected;
+  }
+  EXPECT_EQ(expected, 5);
+}
+
+TEST_F(ExecutorTest, DistinctUnsortedInterleavedDuplicates) {
+  std::vector<Row> rows{Row({Value(3)}), Row({Value(1)}), Row({Value(3)}),
+                        Row({Value(2)}), Row({Value(1)}), Row({Value(4)})};
+  DistinctExecutor distinct(std::make_shared<ConstantExecutor>(std::move(rows)));
+  Row row;
+  RowPosition pos;
+  std::unordered_set<Value> seen;
+  size_t count = 0;
+  while (distinct.Next(&row, &pos)) {
+    ASSERT_TRUE(seen.insert(row[0]).second);
+    ++count;
+  }
+  EXPECT_EQ(count, 4U);
+  EXPECT_EQ(seen,
+            std::unordered_set<Value>({Value(1), Value(2), Value(3), Value(4)}));
+}
+
+TEST_F(ExecutorTest, DistinctMultipleColumns) {
+  std::vector<Row> rows{
+      Row({Value(1), Value("a")}), Row({Value(1), Value("a")}),
+      Row({Value(1), Value("b")}), Row({Value(2), Value("a")}),
+      Row({Value(2), Value("a")}), Row({Value(2), Value("c")})};
+  DistinctExecutor distinct(std::make_shared<ConstantExecutor>(std::move(rows)));
+  Row row;
+  RowPosition pos;
+  std::unordered_set<Row> seen;
+  size_t count = 0;
+  while (distinct.Next(&row, &pos)) {
+    ASSERT_TRUE(seen.insert(row).second);
+    ++count;
+  }
+  EXPECT_EQ(count, 4U);
+  EXPECT_TRUE(seen.contains(Row({Value(1), Value("b")})));
+  EXPECT_TRUE(seen.contains(Row({Value(2), Value("c")})));
+}
+
+TEST_F(ExecutorTest, DistinctNullValueThrowsFromHash) {
+  // std::hash<Value> throws for kNull, so DistinctExecutor (which deduplicates
+  // via std::unordered_set<Row>) cannot handle NULL-containing rows.
+  std::vector<Row> rows{Row({Value()}), Row({Value(5)})};
+  DistinctExecutor distinct(std::make_shared<ConstantExecutor>(std::move(rows)));
+  Row row;
+  RowPosition pos;
+  EXPECT_THROW(distinct.Next(&row, &pos), std::runtime_error);
+}
+
+TEST_F(ExecutorTest, DistinctOverFullScanPreservesRowsAndPositions) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  DistinctExecutor distinct(std::make_shared<FullScan>(ctx.txn_, *tbl));
+  LOG(INFO) << distinct;
+  std::unordered_set<Row> expected({
+      Row({Value(0), Value("hello"), Value(1.2)}),
+      Row({Value(3), Value("piyo"), Value(12.2)}),
+      Row({Value(1), Value("world"), Value(4.9)}),
+      Row({Value(2), Value("arise"), Value(4.14)})});
+  Row row;
+  RowPosition pos;
+  size_t count = 0;
+  while (distinct.Next(&row, &pos)) {
+    ASSERT_NE(expected.find(row), expected.end());
+    ASSERT_TRUE(pos.IsValid());
+    ++count;
+  }
+  EXPECT_EQ(count, 4U);
+  std::stringstream ss;
+  distinct.Dump(ss, 0);
+  EXPECT_NE(ss.str().find("Distinct"), std::string::npos);
+}
+
+// ===== CrossJoin =====
+TEST_F(ExecutorTest, CrossJoinProducesCartesianProduct) {
+  auto left = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1)}), Row({Value(2)})});
+  auto right = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value("a")}), Row({Value("b")})});
+  CrossJoin join(left, right);
+  std::unordered_set<Row> expected({
+      Row({Value(1), Value("a")}), Row({Value(1), Value("b")}),
+      Row({Value(2), Value("a")}), Row({Value(2), Value("b")})});
+  Row got;
+  RowPosition pos;
+  size_t count = 0;
+  while (join.Next(&got, &pos)) {
+    ASSERT_NE(expected.find(got), expected.end());
+    ++count;
+  }
+  EXPECT_EQ(count, 4U);
+  std::stringstream ss;
+  join.Dump(ss, 0);
+  EXPECT_NE(ss.str().find("CrossJoin"), std::string::npos);
+}
+
+// ===== DeleteExecutor =====
+TEST_F(ExecutorTest, DeleteRemovesAllRows) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  auto deleter = std::make_shared<DeleteExecutor>(
+      ctx.txn_, *tbl, std::make_shared<FullScan>(ctx.txn_, *tbl));
+  LOG(INFO) << *deleter;
+  Row result;
+  RowPosition rp;
+  ASSERT_TRUE(deleter->Next(&result, &rp));
+  EXPECT_EQ(result, Row({Value("Delete Rows"), Value(4)}));
+  ASSERT_FALSE(deleter->Next(&result, &rp));
+  Row got;
+  FullScan fs(ctx.txn_, *tbl);
+  ASSERT_FALSE(fs.Next(&got, nullptr));
+  std::stringstream ss;
+  deleter->Dump(ss, 0);
+  EXPECT_NE(ss.str().find("Delete"), std::string::npos);
+}
+
+TEST_F(ExecutorTest, DeleteEmptySourceCountsZero) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  auto deleter = std::make_shared<DeleteExecutor>(
+      ctx.txn_, *tbl, std::make_shared<ConstantExecutor>(std::vector<Row>{}));
+  Row result;
+  ASSERT_TRUE(deleter->Next(&result, nullptr));
+  EXPECT_EQ(result, Row({Value("Delete Rows"), Value(0)}));
+  ASSERT_FALSE(deleter->Next(&result, nullptr));
+}
+
+// ===== ConstantExecutor =====
+TEST_F(ExecutorTest, ConstantExecutorNextBatchSplitsRows) {
+  std::vector<Row> rows{Row({Value(1)}), Row({Value(2)}), Row({Value(3)})};
+  ConstantExecutor ce(std::move(rows));
+  DataChunk chunk;
+  EXPECT_EQ(ce.NextBatch(&chunk, 2), 2U);
+  EXPECT_EQ(chunk.RowAt(0), Row({Value(1)}));
+  EXPECT_EQ(ce.NextBatch(&chunk, 2), 1U);
+  EXPECT_EQ(ce.NextBatch(&chunk, 2), 0U);
+  ConstantExecutor single(Row({Value(9)}));
+  Row got;
+  ASSERT_TRUE(single.Next(&got, nullptr));
+  EXPECT_EQ(got, Row({Value(9)}));
+  ASSERT_FALSE(single.Next(&got, nullptr));
+  std::stringstream ss;
+  ce.Dump(ss, 0);
+  EXPECT_NE(ss.str().find("ConstantExecutor"), std::string::npos);
+}
+
+// ===== ZoneMap =====
+TEST_F(ExecutorTest, ZoneMapTracksStats) {
+  ZoneMap map;
+  EXPECT_EQ(map.NullCount(), 0U);
+  EXPECT_EQ(map.ValueCount(), 0U);
+  EXPECT_FALSE(map.Minimum().has_value());
+  EXPECT_FALSE(map.Maximum().has_value());
+  map.Add(Value(10));
+  map.Add(Value(3));
+  map.Add(Value(7));
+  map.Add(Value());
+  EXPECT_EQ(map.NullCount(), 1U);
+  EXPECT_EQ(map.ValueCount(), 3U);
+  ASSERT_TRUE(map.Minimum().has_value());
+  ASSERT_TRUE(map.Maximum().has_value());
+  EXPECT_EQ(*map.Minimum(), Value(3));
+  EXPECT_EQ(*map.Maximum(), Value(10));
+  map.Reset();
+  EXPECT_EQ(map.NullCount(), 0U);
+  EXPECT_EQ(map.ValueCount(), 0U);
+  EXPECT_FALSE(map.Minimum().has_value());
+  EXPECT_FALSE(map.Maximum().has_value());
+}
+
+TEST_F(ExecutorTest, ZoneMapMayMatchComparisons) {
+  ZoneMap map;
+  map.Add(Value(5));
+  map.Add(Value(10));
+  EXPECT_TRUE(map.MayMatch(BinaryOperation::kEquals, Value(5)));
+  EXPECT_TRUE(map.MayMatch(BinaryOperation::kEquals, Value(7)));
+  EXPECT_FALSE(map.MayMatch(BinaryOperation::kEquals, Value(4)));
+  EXPECT_FALSE(map.MayMatch(BinaryOperation::kEquals, Value(11)));
+  EXPECT_TRUE(map.MayMatch(BinaryOperation::kNotEquals, Value(5)));
+  EXPECT_TRUE(map.MayMatch(BinaryOperation::kNotEquals, Value(4)));
+  EXPECT_TRUE(map.MayMatch(BinaryOperation::kLessThan, Value(11)));
+  EXPECT_FALSE(map.MayMatch(BinaryOperation::kLessThan, Value(5)));
+  EXPECT_TRUE(map.MayMatch(BinaryOperation::kLessThanEquals, Value(5)));
+  EXPECT_FALSE(map.MayMatch(BinaryOperation::kLessThanEquals, Value(4)));
+  EXPECT_TRUE(map.MayMatch(BinaryOperation::kGreaterThan, Value(4)));
+  EXPECT_FALSE(map.MayMatch(BinaryOperation::kGreaterThan, Value(10)));
+  EXPECT_TRUE(map.MayMatch(BinaryOperation::kGreaterThanEquals, Value(10)));
+  EXPECT_FALSE(map.MayMatch(BinaryOperation::kGreaterThanEquals, Value(11)));
+}
+
+TEST_F(ExecutorTest, ZoneMapMayMatchDegenerateCases) {
+  ZoneMap single;
+  single.Add(Value(7));
+  EXPECT_FALSE(single.MayMatch(BinaryOperation::kNotEquals, Value(7)));
+  EXPECT_TRUE(single.MayMatch(BinaryOperation::kNotEquals, Value(6)));
+  EXPECT_TRUE(single.MayMatch(BinaryOperation::kAdd, Value(1)));
+  EXPECT_FALSE(single.MayMatch(BinaryOperation::kEquals, Value()));
+  ZoneMap empty;
+  EXPECT_FALSE(empty.MayMatch(BinaryOperation::kEquals, Value(1)));
+  ZoneMap doubles;
+  doubles.Add(Value(1.0));
+  EXPECT_FALSE(doubles.MayMatch(BinaryOperation::kEquals, Value(1)));
+  EXPECT_FALSE(doubles.MayMatch(BinaryOperation::kLessThan, Value(2)));
+}
+
+// ===== Selection edge cases =====
+TEST_F(ExecutorTest, SelectionConstantOnLeftIsFlipped) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  auto collect_keys = [&](const Expression& exp) {
+    Selection sel(exp, tbl->GetSchema(),
+                  std::make_shared<FullScan>(ctx.txn_, *tbl));
+    std::vector<int64_t> keys;
+    Row got;
+    while (sel.Next(&got, nullptr)) {
+      keys.push_back(got[0].value.int_value);
+    }
+    std::sort(keys.begin(), keys.end());
+    return keys;
+  };
+  EXPECT_EQ(collect_keys(BinaryExpressionExp(
+                ConstantValueExp(Value(2)), BinaryOperation::kLessThan,
+                ColumnValueExp("key"))),
+            std::vector<int64_t>({3}));
+  EXPECT_EQ(collect_keys(BinaryExpressionExp(
+                ConstantValueExp(Value(2)), BinaryOperation::kLessThanEquals,
+                ColumnValueExp("key"))),
+            std::vector<int64_t>({2, 3}));
+  EXPECT_EQ(collect_keys(BinaryExpressionExp(
+                ConstantValueExp(Value(3)), BinaryOperation::kGreaterThan,
+                ColumnValueExp("key"))),
+            std::vector<int64_t>({0, 1, 2}));
+  EXPECT_EQ(collect_keys(BinaryExpressionExp(
+                ConstantValueExp(Value(3)), BinaryOperation::kGreaterThanEquals,
+                ColumnValueExp("key"))),
+            std::vector<int64_t>({0, 1, 2, 3}));
+  EXPECT_EQ(collect_keys(BinaryExpressionExp(
+                ConstantValueExp(Value(3)), BinaryOperation::kEquals,
+                ColumnValueExp("key"))),
+            std::vector<int64_t>({3}));
+  EXPECT_EQ(collect_keys(BinaryExpressionExp(
+                ConstantValueExp(Value(3)), BinaryOperation::kNotEquals,
+                ColumnValueExp("key"))),
+            std::vector<int64_t>({0, 1, 2}));
+}
+
+TEST_F(ExecutorTest, SelectionSupportsOrPredicate) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  Expression key_is_0 =
+      BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(0)));
+  Expression key_is_3 =
+      BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(3)));
+  Selection sel(BinaryExpressionExp(key_is_0, BinaryOperation::kOr, key_is_3),
+                tbl->GetSchema(), std::make_shared<FullScan>(ctx.txn_, *tbl));
+  Row got;
+  std::unordered_set<Value> keys;
+  while (sel.Next(&got, nullptr)) {
+    keys.insert(got[0]);
+  }
+  EXPECT_EQ(keys, std::unordered_set<Value>({Value(0), Value(3)}));
+}
+
+// ===== ParallelScan =====
+TEST_F(ExecutorTest, ParallelScanEmptyTableReturnsNoRows) {
+  constexpr char kTable[] = "EmptyScanTable";
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema schema{kTable, {Column("key", ValueType::kInt64)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  TransactionContext reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable(kTable));
+  ParallelScan scan(reader.txn_, *table, 2, 1);
+  DataChunk chunk;
+  EXPECT_EQ(scan.NextBatch(&chunk), 0U);
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+TEST_F(ExecutorTest, ParallelScanNextScalarPath) {
+  constexpr char kTable[] = "ParallelScalarTable";
+  constexpr int64_t kRows = 500;
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema schema{kTable, {Column("key", ValueType::kInt64)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    for (int64_t key = 0; key < kRows; ++key) {
+      ASSERT_SUCCESS(table.Insert(writer.txn_, Row({Value(key)})).GetStatus());
+    }
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  TransactionContext reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable(kTable));
+  ParallelScan scan(reader.txn_, *table, 2, 1);
+  LOG(INFO) << scan;
+  std::unordered_set<int64_t> keys;
+  Row row;
+  RowPosition pos;
+  size_t count = 0;
+  while (scan.Next(&row, &pos)) {
+    ASSERT_TRUE(keys.insert(row[0].value.int_value).second);
+    ASSERT_TRUE(pos.IsValid());
+    ++count;
+  }
+  EXPECT_EQ(count, static_cast<size_t>(kRows));
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+TEST_F(ExecutorTest, ParallelScanProjectedColumns) {
+  constexpr char kTable[] = "ParallelProjectionTable";
+  constexpr int64_t kRows = 800;
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema schema{kTable, {Column("key", ValueType::kInt64),
+                           Column("name", ValueType::kVarChar)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    for (int64_t key = 0; key < kRows; ++key) {
+      ASSERT_SUCCESS(table.Insert(
+          writer.txn_, Row({Value(key), Value("n" + std::to_string(key))}))
+          .GetStatus());
+    }
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  TransactionContext reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable(kTable));
+  ParallelScan scan(reader.txn_, *table, 2, 1, std::vector<slot_t>{0, 1});
+  DataChunk chunk;
+  size_t total = 0;
+  std::unordered_set<std::string> names;
+  while (scan.NextBatch(&chunk, 64) != 0) {
+    ASSERT_EQ(chunk.ColumnCount(), 2U);
+    for (size_t row = 0; row < chunk.Size(); ++row) {
+      names.insert(chunk.ColumnAt(0).ValueAt(row).AsString());
+    }
+    total += chunk.Size();
+  }
+  EXPECT_EQ(total, static_cast<size_t>(kRows));
+  EXPECT_EQ(names.size(), static_cast<size_t>(kRows));
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+TEST_F(ExecutorTest, ParallelScanReorderedProjectionThrows) {
+  // Row::DeserializeProjected assumes an ascending projection column list, so
+  // a reordered projection like {1, 0} yields a projected row narrower than the
+  // chunk layout ParallelScan initializes, and the worker throws.
+  constexpr char kTable[] = "ParallelProjectionTable";
+  constexpr int64_t kRows = 800;
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema schema{kTable, {Column("key", ValueType::kInt64),
+                           Column("name", ValueType::kVarChar)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    for (int64_t key = 0; key < kRows; ++key) {
+      ASSERT_SUCCESS(table.Insert(
+          writer.txn_, Row({Value(key), Value("n" + std::to_string(key))}))
+          .GetStatus());
+    }
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  TransactionContext reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable(kTable));
+  ParallelScan scan(reader.txn_, *table, 2, 1, std::vector<slot_t>{1, 0});
+  DataChunk chunk;
+  EXPECT_THROW(scan.NextBatch(&chunk, 64), std::invalid_argument);
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+TEST_F(ExecutorTest, ParallelScanSplitsLargeChunksWhenAskedSmallBatches) {
+  constexpr char kTable[] = "ParallelSplitTable";
+  constexpr int64_t kRows = 2000;
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema schema{kTable, {Column("key", ValueType::kInt64)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    for (int64_t key = 0; key < kRows; ++key) {
+      ASSERT_SUCCESS(table.Insert(writer.txn_, Row({Value(key)})).GetStatus());
+    }
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  TransactionContext reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable(kTable));
+  ParallelScan scan(reader.txn_, *table, 4, 1);
+  DataChunk chunk;
+  ASSERT_GT(scan.NextBatch(&chunk, 1000), 0U);
+  size_t total = chunk.Size();
+  size_t batches = 0;
+  while (true) {
+    const size_t got = scan.NextBatch(&chunk, 1);
+    if (got == 0) break;
+    EXPECT_EQ(got, 1U);
+    total += got;
+    ++batches;
+  }
+  EXPECT_EQ(total, static_cast<size_t>(kRows));
+  EXPECT_GT(batches, 10U);
+  ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+// ===== ParallelAggregationExecutor =====
+TEST_F(ExecutorTest, ParallelAggregationCountStarAndExpressionChild) {
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  auto input = std::make_shared<SyntheticBatchExecutor>(100);
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression(
+          "count_star",
+          AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("*"))),
+      NamedExpression(
+          "sum_plus_one",
+          AggregateExpressionExp(
+              AggregationType::kSum,
+              BinaryExpressionExp(ColumnValueExp("value"),
+                                  BinaryOperation::kAdd,
+                                  ConstantValueExp(Value(1)))))};
+  ParallelAggregationExecutor aggregate(input, schema, std::move(aggregates),
+                                        2);
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+  EXPECT_EQ(result[0], Value(100));
+  EXPECT_EQ(result[1], Value(5050));
+  EXPECT_FALSE(aggregate.Next(&result, nullptr));
+}
+
+TEST_F(ExecutorTest, ParallelAggregationAverageOverEmptyInput) {
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  auto input = std::make_shared<ConstantExecutor>(std::vector<Row>{});
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("avg", AggregateExpressionExp(AggregationType::kAvg,
+                                                    ColumnValueExp("value")))};
+  ParallelAggregationExecutor aggregate(input, schema, std::move(aggregates),
+                                        2);
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+  EXPECT_TRUE(result[0].IsNull());
+}
+
+TEST_F(ExecutorTest, ParallelAggregationNextBatchAndDump) {
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  auto input = std::make_shared<SyntheticBatchExecutor>(50);
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("count",
+                      AggregateExpressionExp(AggregationType::kCount,
+                                             ColumnValueExp("value")))};
+  ParallelAggregationExecutor aggregate(input, schema, std::move(aggregates),
+                                        3);
+  LOG(INFO) << aggregate;
+  DataChunk chunk;
+  EXPECT_EQ(aggregate.NextBatch(&chunk, 8), 1U);
+  EXPECT_EQ(chunk.RowAt(0)[0], Value(50));
+  EXPECT_EQ(aggregate.NextBatch(&chunk, 8), 0U);
+}
+
+TEST_F(ExecutorTest, ParallelAggregationMissingColumnThrows) {
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  auto input = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(2)})});
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("sum_missing",
+                      AggregateExpressionExp(AggregationType::kSum,
+                                             ColumnValueExp("missing")))};
+  ParallelAggregationExecutor aggregate(input, schema, std::move(aggregates),
+                                        2);
+  Row result;
+  EXPECT_THROW(aggregate.Next(&result, nullptr), std::runtime_error);
+}
+
+// ===== Insert / Update =====
+TEST_F(ExecutorTest, InsertWithRowPosition) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  auto insert = std::make_shared<Insert>(
+      ctx.txn_, &*tbl,
+      std::make_shared<ConstantExecutor>(
+          std::vector<Row>{Row({Value(100), Value("new"), Value(1.0)})}));
+  Row result;
+  RowPosition rp;
+  ASSERT_TRUE(insert->Next(&result, &rp));
+  EXPECT_EQ(result, Row({Value("Insert Rows"), Value(1)}));
+  ASSERT_FALSE(insert->Next(&result, &rp));
+}
+
+TEST_F(ExecutorTest, UpdateWithRowPosition) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  std::vector<NamedExpression> update_rule = {
+      NamedExpression("key", ColumnValueExp("key")),
+      NamedExpression("name", ConstantValueExp(Value("changed"))),
+      NamedExpression("score", ColumnValueExp("score"))};
+  auto update = std::make_shared<Update>(
+      ctx.txn_, &*tbl,
+      std::make_shared<Projection>(update_rule, tbl->GetSchema(),
+                                   std::make_shared<FullScan>(ctx.txn_, *tbl)));
+  Row result;
+  RowPosition rp;
+  ASSERT_TRUE(update->Next(&result, &rp));
+  EXPECT_EQ(result, Row({Value("Update Rows"), Value(4)}));
+  ASSERT_FALSE(update->Next(&result, &rp));
+}
+
+// ===== Sort / HashJoin =====
+TEST_F(ExecutorTest, SortDumpAndSmallInput) {
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  auto input = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(2)}), Row({Value(1)}), Row({Value(2)})});
+  SortExecutor sort(input, schema, {{ColumnValueExp("value"), true}});
+  Row row;
+  RowPosition pos;
+  ASSERT_TRUE(sort.Next(&row, &pos));
+  EXPECT_EQ(row, Row({Value(1)}));
+  ASSERT_TRUE(sort.Next(&row, &pos));
+  EXPECT_EQ(row, Row({Value(2)}));
+  ASSERT_TRUE(sort.Next(&row, &pos));
+  EXPECT_EQ(row, Row({Value(2)}));
+  ASSERT_FALSE(sort.Next(&row, nullptr));
+  std::stringstream ss;
+  sort.Dump(ss, 0);
+  EXPECT_NE(ss.str().find("ParallelSort"), std::string::npos);
+}
+
+TEST_F(ExecutorTest, HashJoinNextBatchAndDump) {
+  auto left = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1), Value("l")}),
+                       Row({Value(2), Value("l2")})});
+  auto right = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1), Value("r1")}),
+                       Row({Value(1), Value("r2")})});
+  HashJoin join(left, {0}, right, {0});
+  LOG(INFO) << join;
+  DataChunk chunk;
+  EXPECT_EQ(join.NextBatch(&chunk, 8), 2U);
+  EXPECT_EQ(chunk.Size(), 2U);
+  EXPECT_EQ(join.NextBatch(&chunk, 8), 0U);
+  std::stringstream ss;
+  join.Dump(ss, 0);
+  EXPECT_NE(ss.str().find("PartitionedHashJoin"), std::string::npos);
+}
+
+TEST_F(ExecutorTest, HashJoinWithMultipleJoinColumnsDumpsAllKeys) {
+  auto left = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1), Value(10), Value("l")})});
+  auto right = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1), Value(10), Value("r")})});
+  HashJoin join(left, {0, 1}, right, {0, 1});
+  Row got;
+  ASSERT_TRUE(join.Next(&got, nullptr));
+  EXPECT_EQ(got, Row({Value(1), Value(10), Value("l"), Value(1), Value(10),
+                      Value("r")}));
+  ASSERT_FALSE(join.Next(&got, nullptr));
+  std::stringstream ss;
+  join.Dump(ss, 0);
+  EXPECT_NE(ss.str().find("left: {0, 1}"), std::string::npos);
+  EXPECT_NE(ss.str().find("right: {0, 1}"), std::string::npos);
+}
+
+// ===== LimitExecutor =====
+TEST_F(ExecutorTest, LimitLessThanInputRows) {
+  auto input = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1)}), Row({Value(2)}), Row({Value(3)})});
+  LimitExecutor limit(input, 2, 0);
+  Row row;
+  RowPosition rp;
+  ASSERT_TRUE(limit.Next(&row, &rp));
+  EXPECT_EQ(row, Row({Value(1)}));
+  ASSERT_TRUE(limit.Next(&row, &rp));
+  EXPECT_EQ(row, Row({Value(2)}));
+  ASSERT_FALSE(limit.Next(&row, nullptr));
+}
+
+TEST_F(ExecutorTest, LimitEqualToInputRows) {
+  auto input = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1)}), Row({Value(2)})});
+  LimitExecutor limit(input, 2, 0);
+  Row row;
+  ASSERT_TRUE(limit.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(1)}));
+  ASSERT_TRUE(limit.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(2)}));
+  ASSERT_FALSE(limit.Next(&row, nullptr));
+}
+
+TEST_F(ExecutorTest, LimitGreaterThanInputRows) {
+  auto input = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1)})});
+  LimitExecutor limit(input, 5, 0);
+  Row row;
+  ASSERT_TRUE(limit.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(1)}));
+  ASSERT_FALSE(limit.Next(&row, nullptr));
+}
+
+TEST_F(ExecutorTest, LimitZeroMeansNoLimit) {
+  auto input = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1)}), Row({Value(2)})});
+  LimitExecutor limit(input, 0, 0);
+  Row row;
+  ASSERT_TRUE(limit.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(1)}));
+  ASSERT_TRUE(limit.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(2)}));
+  ASSERT_FALSE(limit.Next(&row, nullptr));
+}
+
+TEST_F(ExecutorTest, LimitOffsetSkipsLeadingRows) {
+  auto input = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1)}), Row({Value(2)}), Row({Value(3)})});
+  LimitExecutor limit(input, 1, 2);
+  Row row;
+  ASSERT_TRUE(limit.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(3)}));
+  ASSERT_FALSE(limit.Next(&row, nullptr));
+}
+
+TEST_F(ExecutorTest, LimitOffsetBeyondInputEmitsNothing) {
+  auto input = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1)}), Row({Value(2)})});
+  LimitExecutor limit(input, 5, 10);
+  Row row;
+  ASSERT_FALSE(limit.Next(&row, nullptr));
+}
+
+TEST_F(ExecutorTest, LimitOffsetWithEmptyInputEmitsNothing) {
+  auto input = std::make_shared<ConstantExecutor>(std::vector<Row>{});
+  LimitExecutor limit(input, 3, 1);
+  Row row;
+  ASSERT_FALSE(limit.Next(&row, nullptr));
+}
+
+TEST_F(ExecutorTest, LimitDump) {
+  auto input = std::make_shared<SyntheticBatchExecutor>(5);
+  LimitExecutor limit(input, 3, 1);
+  Row row;
+  ASSERT_TRUE(limit.Next(&row, nullptr));
+  std::stringstream ss;
+  limit.Dump(ss, 0);
+  EXPECT_NE(ss.str().find("Limit: 3 offset 1"), std::string::npos);
+  EXPECT_NE(ss.str().find("SyntheticBatchExecutor"), std::string::npos);
 }
 }  // namespace tinylamb

@@ -140,10 +140,11 @@ bool ExpressionRuleSet::Contains(std::string_view name) const {
       rules_, [&](const ExpressionRule& rule) { return rule.Name() == name; });
 }
 
-ExpressionRuleSet ExpressionRuleSet::Default() {
-  using namespace expression_dsl;
-  ExpressionRuleSet rules;
-  rules.Add(ExpressionRule(
+const ExpressionRuleSet& ExpressionRuleSet::Default() {
+  static const ExpressionRuleSet rules = [] {
+    using namespace expression_dsl;
+    ExpressionRuleSet built;
+    built.Add(ExpressionRule(
       "fold_binary",
       AnyBinary(Is(TypeTag::kConstantValue, "left"),
                 Is(TypeTag::kConstantValue, "right")),
@@ -154,7 +155,7 @@ ExpressionRuleSet ExpressionRuleSet::Default() {
           return Expression{};
         }
       }));
-  rules.Add(ExpressionRule(
+    built.Add(ExpressionRule(
       "fold_unary", AnyUnary(Is(TypeTag::kConstantValue, "child")),
       [](const Expression& expression, const ExpressionBindings&) {
         try {
@@ -163,7 +164,7 @@ ExpressionRuleSet ExpressionRuleSet::Default() {
           return Expression{};
         }
       }));
-  rules.Add(ExpressionRule(
+    built.Add(ExpressionRule(
       "fold_in", Is(TypeTag::kInExp),
       [](const Expression& expression, const ExpressionBindings&) {
         const std::vector<Expression> children = ExpressionChildren(expression);
@@ -174,7 +175,7 @@ ExpressionRuleSet ExpressionRuleSet::Default() {
           return Expression{};
         }
       }));
-  rules.Add(ExpressionRule(
+    built.Add(ExpressionRule(
       "singleton_in", Is(TypeTag::kInExp),
       [](const Expression& expression, const ExpressionBindings&) {
         const auto& in = expression->AsInExpression();
@@ -182,7 +183,7 @@ ExpressionRuleSet ExpressionRuleSet::Default() {
         return BinaryExpressionExp(in.child_, BinaryOperation::kEquals,
                                    in.list_.front());
       }));
-  rules.Add(ExpressionRule(
+    built.Add(ExpressionRule(
       "canonicalize_comparison", AnyBinary(Any("left"), Any("right")),
       [](const Expression& expression, const ExpressionBindings& bindings) {
         const auto& binary = expression->AsBinaryExpression();
@@ -194,7 +195,7 @@ ExpressionRuleSet ExpressionRuleSet::Default() {
                                    FlipComparison(binary.Op()),
                                    bindings.at("left"));
       }));
-  rules.Add(ExpressionRule(
+    built.Add(ExpressionRule(
       "boolean_identity", AnyBinary(Any("left"), Any("right")),
       [](const Expression& expression, const ExpressionBindings& bindings) {
         const auto operation = expression->AsBinaryExpression().Op();
@@ -218,13 +219,13 @@ ExpressionRuleSet ExpressionRuleSet::Default() {
         }
         return Expression{};
       }));
-  rules.Add(ExpressionRule(
+    built.Add(ExpressionRule(
       "double_negation",
       Unary(UnaryOperation::kNot, Unary(UnaryOperation::kNot, Any("child"))),
       [](const Expression&, const ExpressionBindings& bindings) {
         return bindings.at("child");
       }));
-  rules.Add(ExpressionRule(
+    built.Add(ExpressionRule(
       "de_morgan",
       Unary(UnaryOperation::kNot,
             AnyBinary(Any("left"), Any("right"), "binary")),
@@ -240,7 +241,7 @@ ExpressionRuleSet ExpressionRuleSet::Default() {
                                                : BinaryOperation::kAnd,
             UnaryExpressionExp(bindings.at("right"), UnaryOperation::kNot));
       }));
-  rules.Add(ExpressionRule(
+    built.Add(ExpressionRule(
       "simplify_case", Is(TypeTag::kCaseExp),
       [](const Expression& expression, const ExpressionBindings&) {
         const auto& source = expression->AsCaseExpression();
@@ -264,6 +265,8 @@ ExpressionRuleSet ExpressionRuleSet::Default() {
         }
         return CaseExpressionExp(std::move(clauses), std::move(otherwise));
       }));
+    return built;
+  }();
   return rules;
 }
 
@@ -289,7 +292,7 @@ Expression ExpressionRewriter::RewriteOnce(const Expression& expression) const {
   Expression current =
       children_changed ? WithExpressionChildren(expression, std::move(children))
                        : expression;
-  for (const ExpressionRule& rule : rules_.Rules()) {
+  for (const ExpressionRule& rule : rules_->Rules()) {
     if (Expression replacement = rule.Apply(current)) return replacement;
   }
   return current;

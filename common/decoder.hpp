@@ -18,6 +18,7 @@
 #define TINYLAMB_DECODER_HPP
 
 #include <cstdint>
+#include <ios>
 #include <memory>
 #include <sstream>
 #include <vector>
@@ -41,10 +42,15 @@ class Decoder {
 
   template <typename T>
   Decoder& operator>>(std::vector<T>& vec) {
-    uint64_t size = vec.size();
+    uint64_t size = 0;
     is_->read(reinterpret_cast<char*>(&size), sizeof(size));
     vec.clear();
-    vec.resize(size);
+    constexpr uint64_t kMaxDecodedElements = 1 << 20;
+    if (size > kMaxDecodedElements) {
+      is_->setstate(std::ios::failbit);
+      return *this;
+    }
+    vec.resize(static_cast<size_t>(size));
     for (uint64_t i = 0; i < size; ++i) {
       *this >> vec[i];
     }

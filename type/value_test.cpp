@@ -19,13 +19,16 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "gtest/gtest.h"
+#include "type/date.hpp"
 
 namespace tinylamb {
 TEST(ValueTest, DefaultConstruct) {
@@ -305,4 +308,211 @@ TEST(ValueTest, MemComparableFormatDecodeDouble) {
   // strictly ascending
   MemcomparableFormatDecodeTest(targets);
 }
+
+TEST(ValueTest, UnaryAndAggregationToString) {
+  // Arrange + Act -- stream every UnaryOperation and AggregationType value
+  std::ostringstream unary;
+  unary << UnaryOperation::kIsNull << "|" << UnaryOperation::kIsNotNull << "|"
+        << UnaryOperation::kNot << "|" << UnaryOperation::kMinus << "|"
+        << static_cast<UnaryOperation>(99);
+  // Assert -- every enum member has a textual name, unknown falls back
+  ASSERT_EQ(unary.str(), "IS NULL|IS NOT NULL|NOT|-|UNKNOWN");
+
+  std::ostringstream agg;
+  agg << AggregationType::kCount << "|" << AggregationType::kSum << "|"
+      << AggregationType::kAvg << "|" << AggregationType::kMin << "|"
+      << AggregationType::kMax << "|" << static_cast<AggregationType>(99);
+  ASSERT_EQ(agg.str(), "COUNT|SUM|AVG|MIN|MAX|UNKNOWN");
+}
+
+TEST(ValueTest, NullSizeAndSerialize) {
+  // Arrange -- a default (null) Value
+  Value v;
+  char buffer[4] = {0};
+  // Act + Assert -- null has a 1-byte serialized footprint
+  ASSERT_EQ(v.Size(), 1);
+  ASSERT_EQ(v.Serialize(buffer), 1);
+  // Act -- deserializing as kNull requires an explicit type and is rejected
+  Value restored;
+  ASSERT_THROW(restored.Deserialize(buffer, ValueType::kNull),
+               std::runtime_error);
+}
+
+TEST(ValueTest, AsStringVariants) {
+  // Arrange -- one value per type
+  // Act + Assert -- AsString returns the documented formatting
+  ASSERT_EQ(Value().AsString(), "(unknown type)");
+  ASSERT_EQ(Value(42).AsString(), "42");
+  ASSERT_EQ(Value("x").AsString(), "\"x\"");
+  ASSERT_EQ(Value(1.5).AsString(), "1.500000");
+  std::ostringstream oss;
+  oss << Value(7);
+  ASSERT_EQ(oss.str(), "7");
+}
+
+TEST(ValueTest, VarcharConcatenation) {
+  // Arrange + Act -- concatenate two varchar values
+  ASSERT_EQ(Value("foo") + Value("bar"), Value("foobar"));
+  // Assert -- concatenating incompatible types throws
+  ASSERT_THROW(Value(1) + Value("x"), std::runtime_error);
+  ASSERT_THROW(Value(Value::DateFromDays(1)) + Value(Value::DateFromDays(2)),
+               std::runtime_error);
+}
+
+TEST(ValueTest, DoubleArithmetic) {
+  // Arrange + Act -- arithmetic on double values
+  // Assert -- results match IEEE double expectations
+  ASSERT_EQ(Value(3.0) + Value(1.5), Value(4.5));
+  ASSERT_EQ(Value(3.0) - Value(1.0), Value(2.0));
+  ASSERT_EQ(Value(2.0) * Value(3.0), Value(6.0));
+  ASSERT_EQ(Value(6.0) / Value(2.0), Value(3.0));
+  ASSERT_EQ(Value(7) / Value(2), Value(3));
+}
+
+TEST(ValueTest, ModuloAndBitwise) {
+  // Arrange + Act -- % and bitwise ops on integers
+  // Assert -- results match integer semantics
+  ASSERT_EQ(Value(7) % Value(3), Value(1));
+  ASSERT_EQ(Value(6) & Value(3), Value(2));
+  ASSERT_EQ(Value(4) | Value(1), Value(5));
+  ASSERT_EQ(Value(6) ^ Value(3), Value(5));
+  // Assert -- applying them to doubles throws
+  ASSERT_THROW(Value(1.0) % Value(2.0), std::runtime_error);
+  ASSERT_THROW(Value(1.0) & Value(2.0), std::runtime_error);
+  ASSERT_THROW(Value(1.0) | Value(2.0), std::runtime_error);
+  ASSERT_THROW(Value(1.0) ^ Value(2.0), std::runtime_error);
+}
+
+TEST(ValueTest, DateRoundTrip) {
+  // Arrange -- a date value parsed from an ISO string
+  Value date = Value::Date("2020-01-02");
+  ASSERT_EQ(date.type, ValueType::kDate);
+  // Act -- encode, decode, and re-extract the day count
+  std::string encoded = date.EncodeMemcomparableFormat();
+  Value decoded;
+  decoded.DecodeMemcomparableFormat(encoded.c_str());
+  // Assert -- round trip preserves the date and its days
+  ASSERT_EQ(decoded, date);
+  ASSERT_EQ(decoded.DateDays(), date.DateDays());
+  ASSERT_EQ(Value::DateFromDays(date.DateDays()), date);
+}
+
+TEST(ValueTest, HashValues) {
+  // Arrange -- values of every concrete type
+  std::hash<Value> hasher;
+  // Act -- hash each value
+  // Assert -- hashing succeeds and distinct values hash differently
+  ASSERT_NE(hasher(Value(1)), hasher(Value(2)));
+  ASSERT_NE(hasher(Value("a")), hasher(Value("b")));
+  ASSERT_NE(hasher(Value(1.0)), hasher(Value(2.0)));
+  ASSERT_EQ(hasher(Value("a")), hasher(Value("a")));
+  ASSERT_EQ(hasher(Value(1)), hasher(Value(1)));
+  ASSERT_EQ(hasher(Value(1.5)), hasher(Value(1.5)));
+}
+
+TEST(ValueTest, Truthy) {
+  // Arrange + Act + Assert -- Truthy() distinguishes zero from non-zero ints
+  ASSERT_FALSE(Value(0).Truthy());
+  ASSERT_TRUE(Value(1).Truthy());
+  ASSERT_TRUE(Value(-1).Truthy());
+  // Assert -- non-int values are always truthy
+  ASSERT_TRUE(Value("").Truthy());
+  ASSERT_TRUE(Value(0.0).Truthy());
+}
+
+TEST(ValueTest, OrderedComparisonOperators) {
+  // Arrange + Act + Assert -- <=, >=, != follow the same ordering as < and >
+  ASSERT_TRUE(Value(1) <= Value(1));
+  ASSERT_TRUE(Value(1) >= Value(1));
+  ASSERT_TRUE(Value(1) != Value(2));
+  ASSERT_FALSE(Value(1) > Value(1));
+  ASSERT_FALSE(Value(1) < Value(1));
+  ASSERT_TRUE(Value(2) > Value(1));
+  ASSERT_TRUE(Value(1) <= Value(2));
+}
+
+TEST(DateTest, ParseRejectsMalformedDates) {
+  // Act + Assert -- non-ISO formats and impossible calendar days are rejected.
+  ASSERT_THROW(ParseDateDays("not-a-date"), std::runtime_error);
+  ASSERT_THROW(ParseDateDays("2024-13-01"), std::runtime_error);
+  ASSERT_THROW(ParseDateDays("2024-02-30"), std::runtime_error);
+  ASSERT_THROW(ParseDateDays("2023-02-29"), std::runtime_error);
+  // sscanf tolerates single-digit fields; it must still normalize to days.
+  EXPECT_EQ(ParseDateDays("2024-1-1"), ParseDateDays("2024-01-01"));
+}
+
+TEST(DateTest, ParseFormatRoundTrip) {
+  // Arrange -- representative dates, including a leap day.
+  const std::vector<std::string> dates = {"2020-02-29", "2024-12-31",
+                                          "2000-01-01", "1999-07-04"};
+  for (const std::string& date : dates) {
+    // Act -- parse to days and back.
+    const int64_t days = ParseDateDays(date);
+    // Assert -- formatting round-trips exactly.
+    EXPECT_EQ(FormatDateDays(days), date);
+  }
+  // Assert -- day counts increase chronologically.
+  EXPECT_LT(ParseDateDays("1999-01-01"), ParseDateDays("2000-01-01"));
+  EXPECT_LT(ParseDateDays("2020-01-01"), ParseDateDays("2020-01-02"));
+}
+
+TEST(DateTest, AddDayMonthYearIntervals) {
+  // Act + Assert -- day arithmetic is exact across month boundaries.
+  EXPECT_EQ(FormatDateDays(AddDateIntervalDays(
+                ParseDateDays("2024-01-31"), 1, "day")),
+            "2024-02-01");
+  EXPECT_EQ(FormatDateDays(AddDateIntervalDays(
+                ParseDateDays("2024-03-01"), -1, "day")),
+            "2024-02-29");
+
+  // Act + Assert -- month arithmetic clamps overflowing month-ends.
+  EXPECT_EQ(FormatDateDays(AddDateIntervalDays(
+                ParseDateDays("2024-01-31"), 1, "month")),
+            "2024-02-29");
+  EXPECT_EQ(FormatDateDays(AddDateIntervalDays(
+                ParseDateDays("2023-01-31"), 1, "month")),
+            "2023-02-28");
+  EXPECT_EQ(FormatDateDays(AddDateIntervalDays(
+                ParseDateDays("2024-08-31"), 1, "month")),
+            "2024-09-30");
+
+  // Act + Assert -- year arithmetic clamps leap-day overflow.
+  EXPECT_EQ(FormatDateDays(AddDateIntervalDays(
+                ParseDateDays("2024-02-29"), 1, "year")),
+            "2025-02-28");
+  EXPECT_EQ(FormatDateDays(AddDateIntervalDays(
+                ParseDateDays("2020-02-29"), 4, "year")),
+            "2024-02-29");
+
+  // Act + Assert -- the plural forms are accepted.
+  EXPECT_EQ(FormatDateDays(AddDateIntervalDays(
+                ParseDateDays("2024-01-15"), 2, "months")),
+            "2024-03-15");
+  EXPECT_EQ(FormatDateDays(AddDateIntervalDays(
+                ParseDateDays("2024-01-15"), 2, "years")),
+            "2026-01-15");
+}
+
+TEST(DateTest, AddIntervalRejectsUnknownUnits) {
+  // Act + Assert -- unsupported interval units throw.
+  ASSERT_THROW(AddDateIntervalDays(ParseDateDays("2024-01-01"), 1, "week"),
+               std::runtime_error);
+  ASSERT_THROW(AddDateIntervalDays(ParseDateDays("2024-01-01"), 1, "hour"),
+               std::runtime_error);
+}
+
+TEST(DateTest, ValueDateFromDaysRoundTrip) {
+  // Arrange -- a handful of day counts via the Value API.
+  const std::vector<int64_t> day_counts = {
+      ParseDateDays("1970-01-01"), ParseDateDays("2020-02-29"),
+      ParseDateDays("2038-01-19")};
+  for (int64_t days : day_counts) {
+    // Act -- build a Value and extract its day count.
+    const Value value = Value::DateFromDays(days);
+    // Assert -- the day count survives the Value round-trip.
+    EXPECT_EQ(value.DateDays(), days);
+    EXPECT_EQ(value.type, ValueType::kDate);
+  }
+}
+
 }  // namespace tinylamb

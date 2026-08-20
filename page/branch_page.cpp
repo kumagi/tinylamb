@@ -62,7 +62,8 @@ Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
     return Status::kNoSpace;
   }
   size_t pos = SearchToInsert(key);
-  if (pos != row_count_ && GetKey(pos) == key) {
+  if ((pos < row_count_ && GetKey(pos) == key) ||
+      (pos > 0 && GetKey(pos - 1) == key)) {
     return Status::kDuplicates;
   }
   InsertImpl(key, value);
@@ -181,10 +182,14 @@ void BranchPage::SetFence(RowPointer& fence_pos, const IndexKey& new_fence) {
 Status BranchPage::SetLowFence(page_id_t pid, Transaction& txn,
                                const IndexKey& lf) {
   if (lf.IsNotInfinity()) {
-    const std::string_view new_fence = lf.GetKey().Value();
     const size_t physical_size = SerializeSize(lf);
-    if (physical_size > new_fence.size() &&
-        free_size_ < physical_size - new_fence.size()) {
+    const bin_size_t old_size =
+        (rows_[kLowFenceIdx] == kMinusInfinity ||
+         rows_[kLowFenceIdx] == kPlusInfinity)
+            ? 0
+            : rows_[kLowFenceIdx].size;
+    if (physical_size > old_size &&
+        free_size_ < physical_size - old_size) {
       return Status::kNoSpace;
     }
   }
@@ -196,10 +201,14 @@ Status BranchPage::SetLowFence(page_id_t pid, Transaction& txn,
 Status BranchPage::SetHighFence(page_id_t pid, Transaction& txn,
                                 const IndexKey& hf) {
   if (hf.IsNotInfinity()) {
-    const std::string_view new_fence = hf.GetKey().Value();
     const size_t physical_size = SerializeSize(hf);
-    if (physical_size > new_fence.size() &&
-        free_size_ < physical_size - new_fence.size()) {
+    const bin_size_t old_size =
+        (rows_[kHighFenceIdx] == kMinusInfinity ||
+         rows_[kHighFenceIdx] == kPlusInfinity)
+            ? 0
+            : rows_[kHighFenceIdx].size;
+    if (physical_size > old_size &&
+        free_size_ < physical_size - old_size) {
       return Status::kNoSpace;
     }
   }

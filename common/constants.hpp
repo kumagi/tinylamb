@@ -45,6 +45,9 @@ static constexpr size_t kPageHeaderSize = sizeof(uint64_t) +  // page_id
                                           sizeof(uint64_t) +  // page_type
                                           sizeof(uint64_t);   // checksum
 static constexpr size_t kPageBodySize = kPageSize - kPageHeaderSize;
+// ~2 GiB of 32 KiB pages: enough for SF=2 working set without pinning the
+// whole database. Tests construct PageManager with a small explicit capacity.
+static constexpr size_t kDefaultPagePoolCapacity = (size_t{2} << 30) / kPageSize;
 
 #define GET_PAGE_PTR(x) \
   (reinterpret_cast<Page*>(reinterpret_cast<char*>(x) - kPageHeaderSize))

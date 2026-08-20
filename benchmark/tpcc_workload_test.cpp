@@ -182,7 +182,7 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
   const TpccTransactionResult stock_level =
       workload.Execute(TpccTransactionType::kStockLevel);
   ASSERT_TRUE(stock_level.committed) << stock_level.error;
-  EXPECT_EQ(stock_level.sql_statements, 2);
+  EXPECT_GE(stock_level.sql_statements, 3);
   EXPECT_GE(stock_level.low_stock, 0);
 
   const std::vector<Row> district =
@@ -198,6 +198,159 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
       Run("SELECT SUM(c_delivery_cnt) FROM customer;");
   ASSERT_EQ(delivery_count.size(), 1);
   EXPECT_EQ(delivery_count[0][0], Value(1));
+}
+
+TEST_F(TpccWorkloadTest, InitializeRejectsInvalidScales) {
+  std::string error;
+
+  TpccScale no_warehouse = TpccScale::ForTest();
+  no_warehouse.warehouses = 0;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, no_warehouse, &error),
+            Status::kUnknown);
+  EXPECT_FALSE(error.empty());
+
+  TpccScale no_customers = TpccScale::ForTest();
+  no_customers.customers_per_district = 0;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, no_customers, &error),
+            Status::kUnknown);
+  EXPECT_FALSE(error.empty());
+
+  TpccScale no_lines = TpccScale::ForTest();
+  no_lines.min_order_lines = 0;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, no_lines, &error),
+            Status::kUnknown);
+  EXPECT_FALSE(error.empty());
+
+  TpccScale orders_below_customers = TpccScale::ForTest();
+  orders_below_customers.initial_orders_per_district = 1;
+  ASSERT_EQ(
+      TpccWorkload::Initialize(*database_, orders_below_customers, &error),
+      Status::kUnknown);
+  EXPECT_FALSE(error.empty());
+
+  TpccScale too_many_new_orders = TpccScale::ForTest();
+  too_many_new_orders.new_orders_per_district =
+      too_many_new_orders.initial_orders_per_district + 1;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, too_many_new_orders, &error),
+            Status::kUnknown);
+  EXPECT_FALSE(error.empty());
+}
+
+TEST_F(TpccWorkloadTest, InitializeBeyondThousandCustomersUsesNurandLastName) {
+  // Arrange -- more than 1000 customers per district forces the C-Load
+  // NURand last-name path during population.
+  TpccScale scale = TpccScale::ForTest();
+  scale.customers_per_district = 1005;
+  scale.initial_orders_per_district = 1005;
+  scale.new_orders_per_district = 1;
+
+  // Act -- initialize the fixture with the enlarged customer population.
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kSuccess)
+      << error;
+
+  // Assert -- every customer row landed with a well-formed last name.
+  const std::vector<Row> count = Run("SELECT COUNT(*) FROM customer;");
+  ASSERT_EQ(count.size(), 1);
+  EXPECT_EQ(count[0][0], Value(1005));
+  const std::vector<Row> first =
+      Run("SELECT c_last FROM customer WHERE c_id = 1;");
+  ASSERT_EQ(first.size(), 1);
+  EXPECT_EQ(first[0][0], Value(TpccLastName(0)));
+  const std::vector<Row> nurand =
+      Run("SELECT c_last FROM customer WHERE c_id = 1005;");
+  ASSERT_EQ(nurand.size(), 1);
+  EXPECT_FALSE(nurand[0][0].IsNull());
+  EXPECT_EQ(nurand[0][0].type, ValueType::kVarChar);
+}
+
+TEST_F(TpccWorkloadTest, NextTransactionTypeSamplesClause52Mix) {
+  // Arrange -- a workload bound to a random (negative) terminal id so the
+  // home warehouse/district selection uses the random path.
+  TpccWorkload workload(*database_, TpccScale::ForTest(), 7, -1);
+
+  // Act -- sample the transaction type mix many times.
+  std::array<int, 5> counts = {0, 0, 0, 0, 0};
+  for (int i = 0; i < 500; ++i) {
+    const TpccTransactionType type = workload.NextTransactionType();
+    ++counts[static_cast<size_t>(type)];
+  }
+
+  // Assert -- the Clause 5.2 mix is roughly 45/43/4/4/4 percent.
+  EXPECT_GE(counts[0], 150);  // kNewOrder
+  EXPECT_GE(counts[1], 150);  // kPayment
+  EXPECT_GT(counts[2], 0);    // kOrderStatus
+  EXPECT_GT(counts[3], 0);    // kDelivery
+  EXPECT_GT(counts[4], 0);    // kStockLevel
+  const int new_order_plus_payment = counts[0] + counts[1];
+  EXPECT_GE(new_order_plus_payment, 400);
+  EXPECT_LE(new_order_plus_payment, 480);
+}
+
+TEST(TpccScaleTest, ToStringCoversEveryTransactionType) {
+  EXPECT_EQ(ToString(TpccTransactionType::kNewOrder), "new_order");
+  EXPECT_EQ(ToString(TpccTransactionType::kPayment), "payment");
+  EXPECT_EQ(ToString(TpccTransactionType::kOrderStatus), "order_status");
+  EXPECT_EQ(ToString(TpccTransactionType::kDelivery), "delivery");
+  EXPECT_EQ(ToString(TpccTransactionType::kStockLevel), "stock_level");
+  EXPECT_EQ(ToString(TpccTransactionType::kCount), "unknown");
+  EXPECT_EQ(ToString(static_cast<TpccTransactionType>(99)), "unknown");
+}
+
+TEST_F(TpccWorkloadTest, ExecuteOnUninitializedDatabaseReportsError) {
+  // Arrange -- the database has no TPC-C tables at all.
+  TpccWorkload workload(*database_, TpccScale::ForTest(), 42, 0);
+
+  // Act -- run NewOrder against the empty schema.
+  const TpccTransactionResult new_order =
+      workload.Execute(TpccTransactionType::kNewOrder);
+
+  // Assert -- the failure is surfaced through the result, not a crash.
+  EXPECT_FALSE(new_order.committed);
+  EXPECT_FALSE(new_order.user_rollback);
+  EXPECT_NE(new_order.error.find("new_order"), std::string::npos)
+      << new_order.error;
+
+  // Act -- execute an invalid transaction type.
+  const TpccTransactionResult invalid =
+      workload.Execute(static_cast<TpccTransactionType>(99));
+
+  // Assert -- the invalid type is reported precisely.
+  EXPECT_FALSE(invalid.committed);
+  EXPECT_EQ(invalid.error, "invalid TPC-C transaction type");
+}
+
+TEST_F(TpccWorkloadTest, PaymentNameLookupAndBcCreditUpdate) {
+  // Arrange -- a full test-scale fixture.
+  const TpccScale scale = TpccScale::ForTest();
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kSuccess)
+      << error;
+
+  // Act -- run payments with a variety of seeds. The 60% name-based lookup
+  // path and the BC-credit c_data rewrite are chosen by the workload RNG, so
+  // several seeds are tried until a BC-credit update is observed.
+  const std::vector<Row> bc_customers =
+      Run("SELECT COUNT(*) FROM customer WHERE c_credit = 'BC';");
+  ASSERT_EQ(bc_customers.size(), 1);
+  for (uint64_t seed = 1; seed <= 60; ++seed) {
+    TpccWorkload workload(*database_, scale, seed, 0);
+    const TpccTransactionResult payment =
+        workload.Execute(TpccTransactionType::kPayment);
+    ASSERT_TRUE(payment.committed) << payment.error;
+    EXPECT_GT(payment.amount, 0.0);
+  }
+  if (bc_customers[0][0] != Value(int64_t{0})) {
+    const std::vector<Row> rewritten =
+        Run("SELECT COUNT(*) FROM customer WHERE c_data <> 'customer data';");
+    ASSERT_EQ(rewritten.size(), 1);
+    EXPECT_NE(rewritten[0][0], Value(int64_t{0}));
+  }
+  const std::vector<Row> history = Run("SELECT COUNT(*) FROM history;");
+  ASSERT_EQ(history.size(), 1);
+  EXPECT_EQ(history[0][0], Value(70));
 }
 
 }  // namespace

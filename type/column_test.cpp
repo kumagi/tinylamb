@@ -16,6 +16,9 @@
 
 #include "type/column.hpp"
 
+#include <functional>
+#include <sstream>
+
 #include "column_name.hpp"
 #include "common/log_message.hpp"
 #include "common/test_util.hpp"
@@ -50,5 +53,43 @@ TEST(ColumnTest, Dump) {
   LOG(ERROR) << Column(ColumnName("next_column"), ValueType::kDouble,
                         Constraint(Constraint::kUnique));
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
+}
+
+TEST(ColumnTest, Stream) {
+  // Arrange -- columns with and without constraints, and a null-typed column
+  // Act -- stream each to a stringstream
+  std::ostringstream oss;
+  oss << Column(ColumnName("int_col"), ValueType::kInt64) << "|"
+      << Column(ColumnName("uniq_col"), ValueType::kDouble,
+                Constraint(Constraint::kUnique))
+      << "|" << Column(ColumnName("bare_col"), ValueType::kNull);
+  // Assert -- type is rendered unless kNull; constraint is appended
+  ASSERT_EQ(oss.str(),
+            "int_col: Integer|uniq_col: Double(UNIQUE)|bare_col");
+}
+
+TEST(ColumnTest, Accessors) {
+  // Arrange -- a column built through the string_view constructor
+  Column c("named_col", ValueType::kVarChar, Constraint(Constraint::kDefault));
+  // Act + Assert -- accessors expose the stored name, type and constraint
+  ASSERT_EQ(c.Name().name, "named_col");
+  ASSERT_EQ(c.Type(), ValueType::kVarChar);
+  ASSERT_EQ(c.GetConstraint().ctype, Constraint::kDefault);
+}
+
+TEST(ColumnTest, Hash) {
+  // Arrange -- several columns
+  // Act -- hash each of them
+  std::hash<Column> hasher;
+  // Assert -- different names/types/constraints hash differently
+  ASSERT_NE(hasher(Column("a", ValueType::kInt64)),
+            hasher(Column("b", ValueType::kInt64)));
+  ASSERT_NE(hasher(Column("a", ValueType::kInt64)),
+            hasher(Column("a", ValueType::kDouble)));
+  ASSERT_NE(hasher(Column("a", ValueType::kInt64,
+                          Constraint(Constraint::kUnique))),
+            hasher(Column("a", ValueType::kInt64)));
+  ASSERT_EQ(hasher(Column("a", ValueType::kInt64)),
+            hasher(Column("a", ValueType::kInt64)));
 }
 }  // namespace tinylamb

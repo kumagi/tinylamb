@@ -31,6 +31,22 @@
 #include "index/lsm_detail/sorted_run.hpp"
 
 namespace tinylamb {
+// Treats invalid iterator as infinity big.
+bool IsRightIteratorBigger(int left, int right,
+                           const std::vector<SortedRun::Iterator>& iters) {
+  if (!iters[left].IsValid()) {
+    return false;
+  }
+  if (!iters[right].IsValid()) {
+    return true;
+  }
+  int result = iters[left].Compare(iters[right]);
+  if (result != 0) {
+    return 0 < result;
+  }
+  return iters[right].Generation() < iters[left].Generation();
+}
+
 LSMView::Iterator LSMView::Begin() const { return {this, true}; }
 
 StatusOr<std::string> LSMView::Find(std::string_view key) const {
@@ -58,12 +74,16 @@ void LSMView::CreateSingleRun(const std::filesystem::path& path) const {
   std::vector<SortedRun::Entry> merged;
   merged.reserve(Size());
   Iterator it = Begin();
-  std::string min_key = it.Key();
-  std::string max_key;
   size_t max_generation = 0;
   for (const auto& run : indexes_) {
     max_generation = std::max(max_generation, run.Generation());
   }
+  if (!it.IsValid()) {
+    SortedRun::FlushInternal(path, "", "", {}, max_generation + 1);
+    return;
+  }
+  std::string min_key = it.Key();
+  std::string max_key;
 
   size_t pos = 0;
   while (it.IsValid()) {
@@ -76,7 +96,8 @@ void LSMView::CreateSingleRun(const std::filesystem::path& path) const {
   SortedRun::FlushInternal(path, min_key, max_key, merged, max_generation + 1);
 }
 
-LSMView::Iterator::Iterator(const LSMView* vm, bool head) : vm_(vm) {
+LSMView::Iterator::Iterator(const LSMView* vm, bool head)
+    : vm_(vm), remaining_iters_(0) {
   if (head) {
     iters_.reserve(vm_->indexes_.size());
     for (const SortedRun& run : vm_->indexes_) {
@@ -90,15 +111,23 @@ LSMView::Iterator::Iterator(const LSMView* vm, bool head) : vm_(vm) {
         continue;
       }
       while (0 < curr) {
+        if (!iters_[curr].IsValid() || !iters_[curr / 2].IsValid()) {
+          break;
+        }
         int result = iters_[curr].Compare(iters_[curr / 2]);
         if (result == 0) {
           if (iters_[curr].Generation() < iters_[curr / 2].Generation()) {
-            // Bigger generation has priority.
-            result--;
             ++iters_[curr];
+            if (!iters_[curr].IsValid()) {
+              break;
+            }
+            result--;
           } else {
-            result++;
             ++iters_[curr / 2];
+            if (!iters_[curr / 2].IsValid()) {
+              break;
+            }
+            result++;
           }
         }
         if (0 < result) {
@@ -110,14 +139,39 @@ LSMView::Iterator::Iterator(const LSMView* vm, bool head) : vm_(vm) {
         }
       }
     }
-    remaining_iters_ = iters_.size();
+    {
+      std::vector<SortedRun::Iterator> valid;
+      valid.reserve(iters_.size());
+      for (const SortedRun::Iterator& it : iters_) {
+        if (it.IsValid()) valid.push_back(it);
+      }
+      iters_ = std::move(valid);
+      remaining_iters_ = iters_.size();
+      for (size_t i = 1; i < iters_.size(); ++i) {
+        size_t curr = i;
+        while (0 < curr) {
+          int result = iters_[curr].Compare(iters_[curr / 2]);
+          if (result == 0) {
+            result = iters_[curr].Generation() < iters_[curr / 2].Generation()
+                         ? -1
+                         : 1;
+          }
+          if (0 < result) {
+            std::swap(iters_[curr], iters_[curr / 2]);
+            curr /= 2;
+          } else {
+            break;
+          }
+        }
+      }
+    }
 
-    if (iters_[0].IsDeleted()) {
+    if (!iters_.empty() && iters_[0].IsValid() && iters_[0].IsDeleted()) {
       std::string deleted_key;
       do {
         deleted_key = iters_[0].Key();
         ++*this;
-      } while (IsValid() &&
+      } while (IsValid() && !iters_.empty() && iters_[0].IsValid() &&
                (deleted_key == iters_[0].Key() || iters_[0].IsDeleted()));
     }
   }
@@ -127,22 +181,6 @@ std::string LSMView::Iterator::Value() const { return iters_[0].Value(); }
 
 SortedRun::Entry LSMView::Iterator::GetEntry() const {
   return iters_[0].GetEntry();
-}
-
-// Treats invalid iterator as infinity big.
-bool IsRightIteratorBigger(int left, int right,
-                           const std::vector<SortedRun::Iterator>& iters) {
-  if (!iters[left].IsValid()) {
-    return false;
-  }
-  if (!iters[right].IsValid()) {
-    return true;
-  }
-  int result = iters[left].Compare(iters[right]);
-  if (result != 0) {
-    return 0 < result;
-  }
-  return iters[right].Generation() < iters[left].Generation();
 }
 
 void LSMView::Iterator::Forward() {
@@ -201,11 +239,16 @@ void LSMView::Iterator::Forward() {
 }
 
 LSMView::Iterator& LSMView::Iterator::operator++() {
+  if (!IsValid() || iters_.empty() || !iters_[0].IsValid()) {
+    remaining_iters_ = 0;
+    return *this;
+  }
   std::string previous_key;
   do {
     previous_key = Key();
     Forward();
-  } while (IsValid() && (Key() == previous_key || iters_[0].IsDeleted()));
+  } while (IsValid() && !iters_.empty() && iters_[0].IsValid() &&
+           (Key() == previous_key || iters_[0].IsDeleted()));
   return *this;
 }
 

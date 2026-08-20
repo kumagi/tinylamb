@@ -73,8 +73,9 @@ PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit, bool shared) {
     return {this, page, page_latch, shared};
   }
 
-  if (pool_lru_.size() == capacity_) {
-    EvictOnePage();
+  if (pool_lru_.size() >= capacity_) {
+    while (pool_lru_.size() >= capacity_ && EvictOnePage()) {
+    }
   }
   if (cache_hit != nullptr) {
     *cache_hit = false;
@@ -105,6 +106,10 @@ void PagePool::Unpin(page_id_t page_id) {
   std::scoped_lock latch(pool_latch);
   auto page_entry = pool_.find(page_id);
   assert(page_entry != pool_.end());
+  if (page_entry->second->pin_count == 0) {
+    LOG(ERROR) << "unpin underflow on page " << page_id;
+    return;
+  }
   page_entry->second->pin_count--;
 }
 

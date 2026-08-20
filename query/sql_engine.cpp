@@ -6,9 +6,11 @@
 #include "query/sql_engine.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -99,24 +101,39 @@ std::vector<Row> ExplainRows(std::string_view plan) {
   return rows;
 }
 
-std::mutex template_cache_mutex;
-std::unordered_map<std::string, std::shared_ptr<Statement>> template_cache;
 constexpr size_t kMaxCachedTemplates = 1024;
+constexpr size_t kTemplateCacheShards = 16;
+constexpr size_t kMaxCachedTemplatesPerShard =
+    kMaxCachedTemplates / kTemplateCacheShards;
+
+struct TemplateShard {
+  std::mutex mutex;
+  std::unordered_map<std::string, std::shared_ptr<Statement>> cache;
+};
+
+std::array<TemplateShard, kTemplateCacheShards> template_shards;
+
+TemplateShard& ShardFor(const std::string& fingerprint) {
+  return template_shards[std::hash<std::string>{}(fingerprint) %
+                         kTemplateCacheShards];
+}
 
 void RememberTemplate(const std::string& fingerprint,
                       std::unique_ptr<Statement> statement) {
-  std::scoped_lock lock(template_cache_mutex);
-  if (template_cache.size() >= kMaxCachedTemplates) {
-    template_cache.erase(template_cache.begin());
+  TemplateShard& shard = ShardFor(fingerprint);
+  std::scoped_lock lock(shard.mutex);
+  if (shard.cache.size() >= kMaxCachedTemplatesPerShard) {
+    shard.cache.erase(shard.cache.begin());
   }
-  template_cache.insert_or_assign(fingerprint,
-                                  std::shared_ptr<Statement>(std::move(statement)));
+  shard.cache.insert_or_assign(fingerprint,
+                               std::shared_ptr<Statement>(std::move(statement)));
 }
 
 std::shared_ptr<Statement> FindTemplate(const std::string& fingerprint) {
-  std::scoped_lock lock(template_cache_mutex);
-  const auto cached = template_cache.find(fingerprint);
-  if (cached == template_cache.end()) return nullptr;
+  TemplateShard& shard = ShardFor(fingerprint);
+  std::scoped_lock lock(shard.mutex);
+  const auto cached = shard.cache.find(fingerprint);
+  if (cached == shard.cache.end()) return nullptr;
   return cached->second;
 }
 
@@ -253,7 +270,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           row = std::move(reordered);
         }
         if (row.size() != table->GetSchema().ColumnCount()) {
-          last_error_ = "INSERT value count does not match table schema";
+          last_error_ = "INSERT value count does not match table schema (got " +
+                        std::to_string(row.size()) + ", expected " +
+                        std::to_string(table->GetSchema().ColumnCount()) + ")";
           return Status::kUnknown;
         }
         for (size_t i = 0; i < row.size(); ++i) {

@@ -39,10 +39,13 @@ struct OptimizerOptions {
   std::vector<cascades::ImplementationRule> extra_implementation_rules;
   std::unordered_set<std::string> disabled_implementation_rules;
 
-  [[nodiscard]] static OptimizerOptions Default() {
-    OptimizerOptions options;
-    options.relational_rules = cascades::RuleSet::Default();
-    options.expression_rules = ExpressionRuleSet::Default();
+  [[nodiscard]] static const OptimizerOptions& Default() {
+    static const OptimizerOptions options = [] {
+      OptimizerOptions built;
+      built.relational_rules = cascades::RuleSet::Default();
+      built.expression_rules = ExpressionRuleSet::Default();
+      return built;
+    }();
     return options;
   }
 };

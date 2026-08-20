@@ -16,6 +16,7 @@
 
 #include "transaction/transaction_manager.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -132,22 +133,24 @@ void TransactionManager::RegisterVersionWrite(
   }
   if (!chain.pending) {
     chain.pending = PendingVersion{txn.ID(), std::nullopt};
+    if (txn.write_set_.size() == 1) {
+      pending_txn_count_.fetch_add(1, std::memory_order_relaxed);
+    }
   }
   assert(chain.pending->owner == txn.ID());
   chain.pending->value =
       after ? std::optional<std::string>(std::string(*after)) : std::nullopt;
 }
 
+bool TransactionManager::IndexKeysMayBeStale(const Transaction& txn) const {
+  // O(1) IndexScan plan gate: only committed index mutations can hide keys.
+  // Concurrent pending writers are resolved per row via ReadVersion.
+  return txn.SnapshotTimestamp() <
+         max_committed_begin_ts_.load(std::memory_order_acquire);
+}
+
 bool TransactionManager::RequiresHistoricalRead(const Transaction& txn) const {
-  std::scoped_lock lock(version_lock_);
-  for (const auto& [position, chain] : versions_) {
-    if (chain.pending && chain.pending->owner != txn.ID()) return true;
-    if (!chain.committed.empty() &&
-        txn.SnapshotTimestamp() < chain.committed.back().begin_ts) {
-      return true;
-    }
-  }
-  return false;
+  return IndexKeysMayBeStale(txn);
 }
 
 void TransactionManager::CommitVersions(Transaction& txn) {
@@ -156,6 +159,10 @@ void TransactionManager::CommitVersions(Transaction& txn) {
   std::scoped_lock transaction_guard(transaction_table_lock);
   std::scoped_lock version_guard(version_lock_);
   const uint64_t commit_ts = commit_timestamp_.fetch_add(1) + 1;
+  max_committed_begin_ts_.store(
+      std::max(max_committed_begin_ts_.load(std::memory_order_relaxed),
+               commit_ts),
+      std::memory_order_release);
   for (const RowPosition& rp : txn.write_set_) {
     const auto found = versions_.find(rp);
     if (found == versions_.end() || !found->second.pending ||
@@ -168,6 +175,9 @@ void TransactionManager::CommitVersions(Transaction& txn) {
                                std::move(chain.pending->value)});
     chain.pending.reset();
   }
+  if (!txn.write_set_.empty()) {
+    pending_txn_count_.fetch_sub(1, std::memory_order_relaxed);
+  }
 }
 
 void TransactionManager::AbortVersions(Transaction& txn) {
@@ -178,6 +188,9 @@ void TransactionManager::AbortVersions(Transaction& txn) {
         found->second.pending->owner == txn.ID()) {
       found->second.pending.reset();
     }
+  }
+  if (!txn.write_set_.empty()) {
+    pending_txn_count_.fetch_sub(1, std::memory_order_relaxed);
   }
 }
 
@@ -207,7 +220,13 @@ void TransactionManager::GarbageCollectVersions() {
   for (auto chain_iter = versions_.begin(); chain_iter != versions_.end();) {
     VersionChain& chain = chain_iter->second;
     if (!oldest_snapshot && !chain.pending) {
-      chain_iter = versions_.erase(chain_iter);
+      // Keep the latest committed version so later snapshots can still
+      // reconstruct the row without a physical page copy.
+      if (chain.committed.size() > 1) {
+        chain.committed.erase(chain.committed.begin(),
+                              std::prev(chain.committed.end()));
+      }
+      ++chain_iter;
       continue;
     }
     if (oldest_snapshot) {

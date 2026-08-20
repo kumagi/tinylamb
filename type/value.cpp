@@ -141,6 +141,9 @@ Value& Value::operator=(Value&& o) {
 }
 
 bool Value::Truthy() const {
+  if (IsNull()) {
+    return false;
+  }
   if (type == ValueType::kInt64) {
     return value.int_value != 0;
   }

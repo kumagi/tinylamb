@@ -85,6 +85,12 @@ Schema IndexOnlyScan::OutputSchema(const Index& idx,
 
 bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
   while (iter_.IsValid()) {
+    // Heap visibility: uncommitted or snapshot-invisible index entries must
+    // not leak through INCLUDE columns that are not versioned.
+    if (!(*iter_).IsValid()) {
+      ++iter_;
+      continue;
+    }
     *dst = iter_.GetKey() + iter_.Include();
     ++iter_;
     if (!dst->IsValid()) continue;

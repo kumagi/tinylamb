@@ -89,6 +89,7 @@ class Transaction final {
   [[nodiscard]] txn_id_t ID() const { return txn_id_; }
   [[nodiscard]] uint64_t SnapshotTimestamp() const { return snapshot_ts_; }
   [[nodiscard]] bool RequiresHistoricalRead() const;
+  [[nodiscard]] bool IndexKeysMayBeStale() const;
   [[nodiscard]] bool IsReadOnly() const { return read_only_; }
 
   Status PreCommit();

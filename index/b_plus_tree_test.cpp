@@ -957,4 +957,147 @@ TEST_F(BPlusTreeTest, InsertDeleteHeavy) {
     ASSERT_EQ(kvp[kv.first], val);
   }
 }
+
+TEST_F(BPlusTreeTest, DumpLeafTree) {
+  // Arrange -- insert a few keys into the leaf
+  auto txn = tm_->Begin();
+  ASSERT_SUCCESS(bpt_->Insert(txn, "hello", "world"));
+  ASSERT_SUCCESS(bpt_->Insert(txn, "this", "is a pen"));
+  txn.PreCommit();
+
+  // Act -- dump the tree to a stream
+  auto dump_txn = tm_->Begin();
+  std::stringstream ss;
+  bpt_->Dump(dump_txn, ss);
+
+  // Assert -- the leaf dump names the leaf page
+  EXPECT_NE(ss.str().find("L["), std::string::npos);
+}
+
+TEST_F(BPlusTreeTest, DumpBranchTreeWithFoster) {
+  // Arrange -- build a branch tree with a foster branch
+  BuildBranchFosterTree(tm_.get(), bpt_.get());
+
+  // Act -- dump the multi-level tree
+  auto txn = tm_->Begin();
+  std::stringstream ss;
+  bpt_->Dump(txn, ss);
+  std::string dumped = ss.str();
+
+  // Assert -- the dump walks branch pages and foster children
+  EXPECT_NE(dumped.find("B["), std::string::npos);
+  EXPECT_NE(dumped.find("branch foster"), std::string::npos);
+}
+
+TEST_F(BPlusTreeTest, DumpEmptyBranchSlot) {
+  // Arrange -- make the root a branch with zero keys but one leaf child
+  {
+    auto txn = tm_->Begin();
+    PageRef root = p_->GetPage(bpt_->Root());
+    root->PageTypeChange(txn, PageType::kBranchPage);
+    PageRef leaf = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    leaf->InsertLeaf(txn, "a", "1");
+    root->SetLowestValue(txn, leaf->PageID());
+    txn.PreCommit();
+  }
+
+  // Act -- dump the zero-key branch
+  auto txn = tm_->Begin();
+  std::stringstream ss;
+  bpt_->Dump(txn, ss);
+
+  // Assert -- the empty branch reports the no-slot sentinel line
+  EXPECT_NE(ss.str().find("No Slot"), std::string::npos);
+}
+
+TEST_F(BPlusTreeTest, SanityCheckRejectsInvalidRootType) {
+  // Arrange -- corrupt the root page into an unrecognized page type
+  {
+    auto txn = tm_->Begin();
+    PageRef root = p_->GetPage(bpt_->Root());
+    root->PageTypeChange(txn, PageType::kRowPage);
+    txn.PreCommit();
+  }
+
+  // Act -- run the sanity check on the corrupted root
+  // Assert -- a non-leaf, non-branch root fails the check
+  EXPECT_FALSE(bpt_->SanityCheckForTest(p_.get()));
+}
+
+TEST_F(BPlusTreeTest, DeleteMissingKey) {
+  // Arrange -- a single committed key
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Insert(txn, "present", "value"));
+    txn.PreCommit();
+  }
+
+  // Act -- delete a key that was never inserted
+  {
+    auto txn = tm_->Begin();
+    ASSERT_EQ(bpt_->Delete(txn, "absent"), Status::kNotExists);
+    // Assert -- the existing key is untouched by the failed delete
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "present"), "value");
+  }
+}
+
+TEST_F(BPlusTreeTest, UpdateForcesReinsert) {
+  // Arrange -- pack a leaf with three large keys and small values
+  constexpr static int kSize = 5000;
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(0, kSize), "small"));
+    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(1, kSize), "small"));
+    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(2, kSize), "small"));
+    txn.PreCommit();
+  }
+
+  // Act -- grow the first value far beyond its original size
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Update(txn, KeyGen(0, kSize), std::string(9000, 'v')));
+    // Assert -- the enlarged value reads back correctly
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(0, kSize)),
+                          std::string(9000, 'v'));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    txn.PreCommit();
+  }
+}
+
+TEST_F(BPlusTreeTest, InterleavedTransactions) {
+  // Arrange -- commit 20 keys up front
+  {
+    auto txn = tm_->Begin();
+    for (int i = 0; i < 20; ++i) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 5000), "v"));
+    }
+    txn.PreCommit();
+  }
+
+  // Act -- a reader and a writer run in lockstep over the committed data
+  {
+    auto reader = tm_->Begin();
+    auto writer = tm_->Begin();
+    for (int i = 0; i < 20; ++i) {
+      ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
+                            bpt_->Read(reader, KeyGen(i, 5000)));
+      ASSERT_EQ(val, "v");
+    }
+    for (int i = 0; i < 20; i += 2) {
+      ASSERT_SUCCESS(bpt_->Update(writer, KeyGen(i, 5000), "u"));
+    }
+    reader.PreCommit();
+    writer.PreCommit();
+  }
+
+  // Assert -- even keys carry the new value, odd keys the original
+  {
+    auto txn = tm_->Begin();
+    for (int i = 0; i < 20; ++i) {
+      ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
+                            bpt_->Read(txn, KeyGen(i, 5000)));
+      ASSERT_EQ(val, i % 2 == 0 ? "u" : "v");
+    }
+  }
+}
 }  // namespace tinylamb

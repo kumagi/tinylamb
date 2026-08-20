@@ -205,16 +205,16 @@ inline constexpr std::array<std::string_view, 22> kTpchBenchmarkQueries = {
             AND l_shipdate < date_add(date '1996-01-01', INTERVAL 1 year)))
       AND s_nationkey = n_nationkey AND n_name = 'PERU' ORDER BY s_name;)sql",
     R"sql(SELECT s_name, COUNT(*) AS numwait
-      FROM supplier, lineitem l1, orders, nation
+      FROM supplier, lineitem l1, orders, nation,
+           (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey
+            HAVING COUNT(DISTINCT l_suppkey) > 1) multi,
+           (SELECT l_orderkey FROM lineitem
+            WHERE l_receiptdate > l_commitdate GROUP BY l_orderkey
+            HAVING COUNT(DISTINCT l_suppkey) = 1) only_late
       WHERE s_suppkey = l1.l_suppkey AND o_orderkey = l1.l_orderkey
+      AND l1.l_orderkey = multi.l_orderkey
+      AND l1.l_orderkey = only_late.l_orderkey
       AND o_orderstatus = 'F' AND l1.l_receiptdate > l1.l_commitdate
-      AND EXISTS(SELECT * FROM lineitem l2
-                 WHERE l2.l_orderkey = l1.l_orderkey
-                 AND l2.l_suppkey <> l1.l_suppkey)
-      AND NOT EXISTS(SELECT * FROM lineitem l3
-                     WHERE l3.l_orderkey = l1.l_orderkey
-                     AND l3.l_suppkey <> l1.l_suppkey
-                     AND l3.l_receiptdate > l3.l_commitdate)
       AND s_nationkey = n_nationkey AND n_name = 'PERU'
       GROUP BY s_name ORDER BY numwait DESC, s_name LIMIT 100;)sql",
     R"sql(SELECT cntrycode, COUNT(*) AS numcust, sum(c_acctbal) AS totacctbal
@@ -225,8 +225,7 @@ inline constexpr std::array<std::string_view, 22> kTpchBenchmarkQueries = {
               (SELECT avg(c_acctbal) FROM customer WHERE c_acctbal > 0.00
                AND substr(c_phone, 1, 2)
                  IN ('10', '19', '14', '22', '23', '31', '13'))
-            AND NOT EXISTS(SELECT * FROM orders
-                           WHERE o_custkey = c_custkey)) custsale
+            AND c_custkey NOT IN (SELECT o_custkey FROM orders)) custsale
       GROUP BY cntrycode ORDER BY cntrycode;)sql"};
 
 }  // namespace tinylamb

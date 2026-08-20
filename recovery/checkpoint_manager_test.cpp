@@ -168,4 +168,17 @@ TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
   ASSERT_EQ(GetRowCount(), 1);
   EXPECT_EQ(ReadRow(slot), "original message");
 }
+
+TEST_F(CheckpointTest, PeriodicCheckpointRuns) {
+  // Arrange -- fixture creates a CheckpointManager with a 1-second interval
+  // Act -- start the background worker and wait for its first checkpoint
+  cm_->Start();
+  for (int i = 0;
+       i < 400 && !std::filesystem::exists(master_record_name_); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  // Assert -- the periodic worker called WriteCheckpoint, writing the master
+  // record file
+  EXPECT_TRUE(std::filesystem::exists(master_record_name_));
+}
 }  // namespace tinylamb

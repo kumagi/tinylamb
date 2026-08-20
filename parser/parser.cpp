@@ -285,7 +285,8 @@ std::unique_ptr<Statement> Parser::ParseCreateTable() {
         (Peek().value == "PRIMARY" || Peek().value == "UNIQUE")) {
       int constraint_depth = 0;
       while (!(constraint_depth == 0 && (Peek().type == TokenType::kComma ||
-                                         Peek().type == TokenType::kRParen))) {
+                                         Peek().type == TokenType::kRParen ||
+                                         Peek().type == TokenType::kEof))) {
         Token token = Advance();
         if (token.type == TokenType::kLParen) ++constraint_depth;
         if (token.type == TokenType::kRParen) --constraint_depth;
@@ -319,7 +320,10 @@ std::unique_ptr<Statement> Parser::ParseCreateTable() {
                upper_type_name == "DECIMAL") {
       type = ValueType::kDouble;
       if (Peek().type == TokenType::kLParen) {
-        while (Peek().type != TokenType::kRParen) Advance();
+        while (Peek().type != TokenType::kRParen &&
+               Peek().type != TokenType::kEof) {
+          Advance();
+        }
         Advance();
       }
     } else {
@@ -328,7 +332,8 @@ std::unique_ptr<Statement> Parser::ParseCreateTable() {
     columns.emplace_back(column_name, type);
     int constraint_depth = 0;
     while (!(constraint_depth == 0 && (Peek().type == TokenType::kComma ||
-                                       Peek().type == TokenType::kRParen))) {
+                                       Peek().type == TokenType::kRParen ||
+                                       Peek().type == TokenType::kEof))) {
       Token token = Advance();
       if (token.type == TokenType::kLParen) ++constraint_depth;
       if (token.type == TokenType::kRParen) --constraint_depth;
@@ -351,7 +356,7 @@ Token Parser::Peek() {
 
 Token Parser::Advance() {
   if (pos_ >= tokens_.size()) {
-    return {TokenType::kEof, ""};
+    throw std::runtime_error("Unexpected end of input");
   }
   return tokens_[pos_++];
 }

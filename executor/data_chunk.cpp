@@ -168,18 +168,15 @@ void DataChunk::Reset() {
 }
 
 void DataChunk::Reset(const Schema& schema, size_t capacity) {
-  if (!HasLayout(schema)) {
-    Initialize(schema, capacity);
-    return;
-  }
-  Reset();
-  Reserve(capacity);
+  Initialize(schema, capacity);
 }
 
 bool DataChunk::HasLayout(const Schema& schema) const {
   if (ColumnCount() != schema.ColumnCount()) return false;
   for (size_t i = 0; i < ColumnCount(); ++i) {
-    if (columns_[i].Type() != schema.GetColumn(i).Type()) return false;
+    const ValueType have = columns_[i].Type();
+    if (have == ValueType::kNull) continue;
+    if (have != schema.GetColumn(i).Type()) return false;
   }
   return true;
 }
@@ -190,11 +187,14 @@ void DataChunk::Reserve(size_t capacity) {
 }
 
 void DataChunk::EnsureLayout(const Row& row) {
-  if (columns_.empty() && size_ == 0 && !row.values_.empty()) {
+  if (columns_.empty() && size_ == 0) {
     std::vector<ValueType> types;
     types.reserve(row.values_.size());
-    for (const Value& value : row.values_) types.push_back(value.type);
+    for (const Value& value : row.values_) {
+      types.push_back(value.IsNull() ? ValueType::kNull : value.type);
+    }
     Initialize(std::move(types));
+    return;
   }
   if (row.values_.size() != columns_.size()) {
     throw std::invalid_argument("data chunk row width mismatch");

@@ -95,6 +95,7 @@ class TransactionManager {
                             std::optional<std::string_view> before,
                             std::optional<std::string_view> after);
   [[nodiscard]] bool RequiresHistoricalRead(const Transaction& txn) const;
+  [[nodiscard]] bool IndexKeysMayBeStale(const Transaction& txn) const;
 
   lsn_t AddLog(const LogRecord& lr);
   lsn_t CommittedLSN() const;
@@ -134,6 +135,8 @@ class TransactionManager {
   void GarbageCollectVersions();
 
   std::atomic<uint64_t> commit_timestamp_{0};
+  std::atomic<uint64_t> max_committed_begin_ts_{0};
+  std::atomic<int> pending_txn_count_{0};
   mutable std::mutex version_lock_;
   std::unordered_map<RowPosition, VersionChain> versions_;
   std::unordered_map<txn_id_t, uint64_t> active_snapshots_;

@@ -50,4 +50,71 @@ TEST(ColumnNameTest, ToString) {
   ASSERT_EQ(a.ToString(), "Foo.Bar");
 }
 
+TEST(ColumnNameTest, ConstructorsAndEmpty) {
+  // Arrange -- no input; default-constructed ColumnName
+  // Act -- construct via every public constructor
+  ColumnName def;
+  ColumnName two("s", "c");
+  ColumnName bare("name");
+  ColumnName empty_schema("t.");
+  ColumnName dot(".");
+
+  // Assert -- default ctor is empty
+  EXPECT_TRUE(def.Empty());
+  EXPECT_TRUE(def.schema.empty());
+  EXPECT_TRUE(def.name.empty());
+  // Assert -- the two-argument ctor splits schema and name
+  EXPECT_EQ(two.schema, "s");
+  EXPECT_EQ(two.name, "c");
+  EXPECT_FALSE(two.Empty());
+  EXPECT_EQ(two.ToString(), "s.c");
+  // Assert -- a bare name has an empty schema
+  EXPECT_TRUE(bare.schema.empty());
+  EXPECT_EQ(bare.name, "name");
+  EXPECT_EQ(bare.ToString(), "name");
+  // Assert -- "t." keeps the schema and leaves the name empty
+  EXPECT_EQ(empty_schema.schema, "t");
+  EXPECT_TRUE(empty_schema.name.empty());
+  EXPECT_FALSE(empty_schema.Empty());
+  // Assert -- "." parses to an empty schema and name
+  EXPECT_TRUE(dot.schema.empty());
+  EXPECT_TRUE(dot.name.empty());
+  EXPECT_TRUE(dot.Empty());
+}
+
+TEST(ColumnNameTest, EqualityOrderingAndHash) {
+  // Act -- build equivalent and differing ColumnNames
+  ColumnName a("t.c");
+  ColumnName b("t", "c");
+  ColumnName c("t.d");
+  ColumnName d("u.c");
+
+  // Assert -- equality is by schema and name, not by spelling
+  EXPECT_EQ(a, b);
+  EXPECT_NE(a, c);
+  EXPECT_NE(c, d);
+  EXPECT_NE(a, ColumnName());
+  // Assert -- ordering follows (schema, name) lexicographically
+  EXPECT_TRUE(a < c);  // t.c < t.d
+  EXPECT_TRUE(a < d);  // t.c < u.c
+  EXPECT_FALSE(c < a);
+  EXPECT_FALSE(a < b);  // equal names are not less-than
+  EXPECT_TRUE(ColumnName("") < a);
+  // Assert -- equivalent names hash identically, distinct names do not
+  EXPECT_EQ(std::hash<ColumnName>{}(a), std::hash<ColumnName>{}(b));
+  EXPECT_NE(std::hash<ColumnName>{}(a), std::hash<ColumnName>{}(c));
+}
+
+TEST(ColumnNameTest, StreamsToDumpString) {
+  // Act -- stream qualified and bare names into ostringstreams
+  std::ostringstream oss_qualified;
+  oss_qualified << ColumnName("schema.column");
+  std::ostringstream oss_bare;
+  oss_bare << ColumnName("column");
+
+  // Assert -- the stream operator renders ToString()
+  EXPECT_EQ(oss_qualified.str(), "schema.column");
+  EXPECT_EQ(oss_bare.str(), "column");
+}
+
 }  // namespace tinylamb

@@ -85,17 +85,23 @@ std::string Cache::ReadAt(size_t offset, size_t length) const {
 
 Cache::Locks Cache::ReadAt(size_t offset, size_t length,
                            std::string_view& out) const {
-  const size_t first_page = offset / kBlockSize;
-  const size_t last_page = (offset + length) / kBlockSize;
-  const size_t blocks = last_page - first_page + 1;
-
   Cache::Locks locks;
-  locks.reserve(blocks);
-  for (size_t page = first_page; page <= last_page; ++page) {
+  if (offset >= max_size_ || length == 0) {
+    out = {};
+    return locks;
+  }
+  const size_t take = std::min(length, max_size_ - offset);
+  const size_t first_page = offset / kBlockSize;
+  const size_t last_page = (offset + take - 1) / kBlockSize;
+  const size_t last_valid = meta_.empty() ? 0 : meta_.size() - 1;
+  const size_t clamped_last = std::min(last_page, last_valid);
+
+  locks.reserve(clamped_last >= first_page ? clamped_last - first_page + 1 : 0);
+  for (size_t page = first_page; page <= clamped_last; ++page) {
     FixPage(page);
     locks.push_back(meta_[page]);
   }
-  out = std::string_view(&buffer_[offset], length);
+  out = std::string_view(&buffer_[offset], take);
   return locks;
 }
 

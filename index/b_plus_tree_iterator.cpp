@@ -54,8 +54,10 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
     if (end.empty()) {
       PageRef leaf = tree->RightmostPage(*txn_);
       pid_ = leaf->PageID();
-      idx_ = leaf->body.leaf_page.row_count_ - 1;
-      valid_ = true;
+      idx_ = leaf->body.leaf_page.row_count_ == 0
+                 ? 0
+                 : leaf->body.leaf_page.row_count_ - 1;
+      valid_ = leaf->body.leaf_page.row_count_ > 0;
     } else {
       PageRef leaf = tree_->FindLeaf(*txn_, end, false);
       pid_ = leaf->PageID();

@@ -283,4 +283,84 @@ TEST_F(SortedRunTest, DeleteScan) {
   std::ignore = std::filesystem::remove(data_file);
   std::ignore = std::filesystem::remove(index_file);
 }
+
+TEST_F(SortedRunTest, IteratorEquality) {
+  // Arrange -- the fixture SortedRun and a fresh iterator
+  SortedRun::Iterator first = sr_->Begin(*blob_);
+  ASSERT_TRUE(first.IsValid());
+  SortedRun::Iterator copy = first;
+
+  // Act -- compare equal iterators, then advance one of them
+  // Assert -- identical offsets compare equal, differing offsets compare unequal
+  ASSERT_TRUE(copy == first);
+  ASSERT_FALSE(copy != first);
+  ++first;
+  ASSERT_TRUE(copy != first);
+  ASSERT_FALSE(copy == first);
+  // Drain the writer before teardown (see EntryStreamOperatorVariants).
+  blob_->Flush();
+}
+TEST_F(SortedRunTest, IteratorStreamOperator) {
+  // Arrange -- an iterator pointing at a live (non-deleted) entry
+  SortedRun::Iterator it = sr_->Begin(*blob_);
+  ASSERT_TRUE(it.IsValid());
+  ASSERT_FALSE(it.IsDeleted());
+
+  // Act -- stream the iterator
+  std::stringstream ss;
+  ss << it;
+
+  // Assert -- the dump contains the key and the value
+  std::string dumped = ss.str();
+  EXPECT_NE(dumped.find("=>"), std::string::npos);
+  EXPECT_NE(dumped.find(it.Key()), std::string::npos);
+  // Drain the writer before teardown (see EntryStreamOperatorVariants).
+  blob_->Flush();
+}
+TEST_F(SortedRunTest, SortedRunStreamOperator) {
+  // Arrange -- the fixture SortedRun holds 1000 entries
+  // Act -- stream the whole run
+  std::stringstream ss;
+  ss << *sr_;
+  std::string dumped = ss.str();
+
+  // Assert -- the dump carries key range, entry count, and generation
+  EXPECT_NE(dumped.find("key range:"), std::string::npos);
+  EXPECT_NE(dumped.find("Entries: 1000"), std::string::npos);
+  EXPECT_NE(dumped.find("Generation:"), std::string::npos);
+  // Drain the writer before teardown (see EntryStreamOperatorVariants).
+  blob_->Flush();
+}
+TEST_F(SortedRunTest, EntryStreamOperatorVariants) {
+  // Arrange -- entries with short/inline, long/indirect, deleted, and large
+  // value payloads
+  SortedRun::Entry short_key("abc", LSMValue("val"), *blob_);
+  SortedRun::Entry long_key(std::string(20, 'a'), LSMValue("long value"),
+                            *blob_);
+  SortedRun::Entry deleted("del", LSMValue::Delete(), *blob_);
+  SortedRun::Entry inline_value("k2", LSMValue(std::string(3, 'x')), *blob_);
+  SortedRun::Entry long_value("k3", LSMValue(std::string(100, 'y')), *blob_);
+
+  // Act -- stream every entry
+  std::stringstream ss;
+  ss << short_key << "\n"
+     << long_key << "\n"
+     << deleted << "\n"
+     << inline_value << "\n"
+     << long_value;
+  std::string dumped = ss.str();
+
+  // Assert -- each serialization arm is exercised
+  EXPECT_NE(dumped.find("length:"), std::string::npos);
+  EXPECT_NE(dumped.find("key: "), std::string::npos);
+  EXPECT_NE(dumped.find("stored at offset:"), std::string::npos);
+  EXPECT_NE(dumped.find("(deleted)"), std::string::npos);
+  EXPECT_NE(dumped.find("value_len:"), std::string::npos);
+  EXPECT_NE(dumped.find(" offset: "), std::string::npos);
+
+  // Drain the writer: BlobFile destroys its cache (which closes the shared
+  // fd) before the Logger's worker thread, so any still-pending append makes
+  // the worker fail with EBADF and Logger::Finish() deadlocks.
+  blob_->Flush();
+}
 }  // namespace tinylamb

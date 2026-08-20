@@ -36,6 +36,7 @@
 #include "plan/projection_plan.hpp"
 #include "plan/selection_plan.hpp"
 #include "query/query_data.hpp"
+#include "query/sql_engine.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -180,6 +181,186 @@ TEST_F(QueryTest, SelectWithProjection) {
 
   // Act + Assert: PreCommit
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+namespace {
+std::vector<Row> RunSql(TransactionContext& ctx, Database& db,
+                        std::string_view sql) {
+  SqlEngine engine(db);
+  StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+  EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
+                                                    << engine.LastError();
+  std::vector<Row> rows;
+  if (!prepared.HasValue()) return rows;
+  Row row;
+  while (prepared.Value()->Next(&row, nullptr)) rows.push_back(row);
+  return rows;
+}
+}  // namespace
+
+TEST_F(QueryTest, SqlEngineExplainRequiresQuery) {
+  // Arrange
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+
+  // Act + Assert -- bare EXPLAIN is rejected with a precise message.
+  StatusOr<Executor> prepared = engine.Prepare(ctx, "EXPLAIN");
+  EXPECT_FALSE(prepared.HasValue());
+  EXPECT_EQ(prepared.GetStatus(), Status::kUnknown);
+  EXPECT_EQ(engine.LastError(), "EXPLAIN requires a query");
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineExplainRejectsNonSelect) {
+  // Arrange
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+
+  // Act + Assert -- EXPLAIN of DDL is rejected as not-implemented.
+  StatusOr<Executor> prepared =
+      engine.Prepare(ctx, "EXPLAIN CREATE TABLE t (a INT64);");
+  EXPECT_FALSE(prepared.HasValue());
+  EXPECT_EQ(prepared.GetStatus(), Status::kNotImplemented);
+  EXPECT_EQ(engine.LastError(), "EXPLAIN currently supports SELECT and WITH queries");
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineExplainAnalyzeSelect) {
+  // Arrange -- a table with a few rows.
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  ASSERT_TRUE(engine.Prepare(ctx, "CREATE TABLE t (a INT64);").HasValue());
+  ASSERT_TRUE(engine.Prepare(ctx, "INSERT INTO t VALUES (1), (2), (3);")
+                  .HasValue());
+
+  // Act -- EXPLAIN ANALYZE a simple SELECT.
+  StatusOr<Executor> prepared =
+      engine.Prepare(ctx, "EXPLAIN ANALYZE SELECT a FROM t;");
+  ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
+  ASSERT_TRUE(engine.LastStatementType().has_value());
+  EXPECT_EQ(engine.LastStatementType().value(), StatementType::kSelect);
+  Row row;
+  std::string text;
+  while (prepared.Value()->Next(&row, nullptr)) {
+    text += row[0].AsString();
+  }
+
+  // Assert -- the plan embeds the runtime statistics.
+  EXPECT_NE(text.find("Planning Time"), std::string::npos) << text;
+  EXPECT_NE(text.find("Actual Rows"), std::string::npos) << text;
+  EXPECT_NE(text.find("Execution Time"), std::string::npos) << text;
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineExplainBoundaryRejectsMalformedKeyword) {
+  // Arrange
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+
+  // Act + Assert -- "EXPLAINX" is not EXPLAIN; it must fail as bad SQL.
+  StatusOr<Executor> prepared = engine.Prepare(ctx, "EXPLAINX SELECT 1;");
+  EXPECT_FALSE(prepared.HasValue());
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineInsertValidationErrors) {
+  // Arrange -- a two-column table.
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  ASSERT_TRUE(engine.Prepare(ctx, "CREATE TABLE t (a INT64, b INT64);")
+                  .HasValue());
+
+  // Act + Assert -- column/value count mismatch.
+  StatusOr<Executor> mismatch =
+      engine.Prepare(ctx, "INSERT INTO t (a, b) VALUES (1);");
+  EXPECT_FALSE(mismatch.HasValue());
+  EXPECT_EQ(mismatch.GetStatus(), Status::kUnknown);
+  EXPECT_NE(engine.LastError().find("mismatch"), std::string::npos)
+      << engine.LastError();
+
+  // Act + Assert -- unknown column name.
+  StatusOr<Executor> unknown =
+      engine.Prepare(ctx, "INSERT INTO t (nope) VALUES (1);");
+  EXPECT_FALSE(unknown.HasValue());
+  EXPECT_EQ(unknown.GetStatus(), Status::kNotExists);
+  EXPECT_NE(engine.LastError().find("unknown INSERT column"),
+            std::string::npos)
+      << engine.LastError();
+
+  // Act + Assert -- value count does not match the schema.
+  StatusOr<Executor> too_few = engine.Prepare(ctx, "INSERT INTO t VALUES (1);");
+  EXPECT_FALSE(too_few.HasValue());
+  EXPECT_NE(engine.LastError().find("does not match"), std::string::npos)
+      << engine.LastError();
+
+  // Act + Assert -- type mismatch on a typed column.
+  StatusOr<Executor> type_mismatch =
+      engine.Prepare(ctx, "INSERT INTO t VALUES ('x', 2);");
+  EXPECT_FALSE(type_mismatch.HasValue());
+  EXPECT_NE(engine.LastError().find("type mismatch"), std::string::npos)
+      << engine.LastError();
+
+  // Act + Assert -- a well-formed insert still works afterwards.
+  EXPECT_TRUE(engine.Prepare(ctx, "INSERT INTO t VALUES (1, 2);").HasValue());
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineDistinctAndDropTable) {
+  // Arrange -- a table with duplicate values.
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_, "CREATE TABLE t (a INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1), (1), (2), (3);");
+
+  // Act + Assert -- SELECT DISTINCT removes duplicates.
+  std::vector<Row> distinct = RunSql(ctx, *db_, "SELECT DISTINCT a FROM t;");
+  ASSERT_EQ(distinct.size(), 3);
+  EXPECT_EQ(distinct[0][0], Value(1));
+  EXPECT_EQ(distinct[1][0], Value(2));
+  EXPECT_EQ(distinct[2][0], Value(3));
+
+  // Act + Assert -- DROP TABLE is not implemented (rejected by the frontend).
+  StatusOr<Executor> drop = engine.Prepare(ctx, "DROP TABLE t;");
+  EXPECT_FALSE(drop.HasValue());
+  EXPECT_NE(drop.GetStatus(), Status::kSuccess);
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineQueryDataRewriteErrors) {
+  // Arrange -- a table with a known schema.
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_, "CREATE TABLE t (a INT64, b INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+  // Act + Assert -- a SELECT of a missing column fails during rewrite.
+  StatusOr<Executor> bad_select = engine.Prepare(ctx, "SELECT nope FROM t;");
+  EXPECT_FALSE(bad_select.HasValue());
+
+  // Act + Assert -- a WHERE on a missing column fails during rewrite.
+  StatusOr<Executor> bad_where =
+      engine.Prepare(ctx, "SELECT a FROM t WHERE nope = 1;");
+  EXPECT_FALSE(bad_where.HasValue());
+
+  // Act + Assert -- unary NOT and IN resolve correctly in WHERE.
+  std::vector<Row> not_rows =
+      RunSql(ctx, *db_, "SELECT a FROM t WHERE NOT a = 2;");
+  ASSERT_EQ(not_rows.size(), 1);
+  EXPECT_EQ(not_rows[0][0], Value(1));
+
+  std::vector<Row> in_rows =
+      RunSql(ctx, *db_, "SELECT a FROM t WHERE a IN (1, 3);");
+  ASSERT_EQ(in_rows.size(), 1);
+  EXPECT_EQ(in_rows[0][0], Value(1));
+
+  // Act + Assert -- a binary expression in WHERE is planned and executed.
+  StatusOr<Executor> fn =
+      engine.Prepare(ctx, "SELECT a FROM t WHERE a + 1 = 3;");
+  ASSERT_TRUE(fn.HasValue()) << engine.LastError();
+  Row row;
+  ASSERT_TRUE(fn.Value()->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(2));
+  ctx.txn_.Abort();
 }
 
 }  // namespace tinylamb

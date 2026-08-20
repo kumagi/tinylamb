@@ -92,6 +92,9 @@ class RowPage {
 
   void DeleteRow(slot_t slot);
 
+  bool ReclaimUntilContiguous(size_t bytes, slot_t protected_slot,
+                              slot_t prospective_row_max);
+
   page_id_t prev_page_id_ = 0;
   page_id_t next_page_id_ = 0;
   slot_t row_max_ = 0;

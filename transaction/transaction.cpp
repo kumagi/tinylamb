@@ -102,6 +102,12 @@ StatusOr<std::string_view> Transaction::ReadVersion(
   if (!visible.HasValue()) return visible.GetStatus();
   auto [iter, inserted] =
       version_read_cache_.insert_or_assign(rp, std::move(visible.Value()));
+  constexpr size_t kMaxVersionReadCache = 4096;
+  if (version_read_cache_.size() > kMaxVersionReadCache) {
+    std::string keep = std::move(iter->second);
+    version_read_cache_.clear();
+    iter = version_read_cache_.insert_or_assign(rp, std::move(keep)).first;
+  }
   return std::string_view(iter->second);
 }
 
@@ -117,6 +123,11 @@ void Transaction::RegisterVersionWrite(const RowPosition& rp,
 bool Transaction::RequiresHistoricalRead() const {
   return transaction_manager_ &&
          transaction_manager_->RequiresHistoricalRead(*this);
+}
+
+bool Transaction::IndexKeysMayBeStale() const {
+  return transaction_manager_ &&
+         transaction_manager_->IndexKeysMayBeStale(*this);
 }
 
 lsn_t Transaction::InsertLog(page_id_t pid, slot_t slot,

@@ -21,16 +21,31 @@
 #include "page_storage.hpp"
 
 #include <cstddef>
+#include <cstdlib>
 #include <string_view>
 
+#include "common/constants.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
+namespace {
+size_t PagePoolCapacityFromEnv() {
+  const char* env = std::getenv("TINYLAMB_PAGE_POOL_BYTES");
+  if (env == nullptr || env[0] == '\0') {
+    return kDefaultPagePoolCapacity;
+  }
+  const unsigned long long bytes = std::strtoull(env, nullptr, 10);
+  if (bytes < kPageSize) {
+    return kDefaultPagePoolCapacity;
+  }
+  return static_cast<size_t>(bytes / kPageSize);
+}
+}  // namespace
 
 PageStorage::PageStorage(std::string_view dbname)
     : dbname_(dbname),
       logger_(LogName(), static_cast<size_t>(8 * 1024 * 1024), 1000),
-      pm_(DBName(), 1024),
+      pm_(DBName(), PagePoolCapacityFromEnv()),
       rm_(LogName(), pm_.GetPool()),
       tm_(&lm_, &pm_, &logger_, &rm_),
       cm_(MasterRecordName(), &tm_, pm_.GetPool()) {

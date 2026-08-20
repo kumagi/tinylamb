@@ -89,12 +89,14 @@ int SortedRun::Entry::Compare(std::string_view rhs,
   uint32_t head = 0;
   memcpy(&head, rhs.data(), std::min(4UL, rhs.size()));
   head = be32toh(head);
-  int head_diff = head - key_head_;
-  if (rhs.size() <= 4 && length_ == rhs.size() && head_diff == 0) {
-    return 0;
+  if (head < key_head_) {
+    return -1;
   }
-  if (head_diff != 0) {
-    return head_diff;
+  if (head > key_head_) {
+    return 1;
+  }
+  if (rhs.size() <= 4 && length_ == rhs.size()) {
+    return 0;
   }
   if (length_ != rhs.length() && (length_ <= 4 || rhs.length() <= 4)) {
     return rhs.length() - length_;
@@ -129,9 +131,11 @@ int SortedRun::Entry::Compare(std::string_view rhs,
 // *this > rhs => negative value
 int SortedRun::Entry::Compare(const SortedRun::Entry& rhs,
                               const BlobFile& blob) const {
-  int diff = rhs.key_head_ - key_head_;
-  if (diff != 0) {
-    return diff;
+  if (rhs.key_head_ < key_head_) {
+    return -1;
+  }
+  if (rhs.key_head_ > key_head_) {
+    return 1;
   }
   if (length_ <= 4 || rhs.length_ <= 4) {
     return rhs.length_ - length_;
@@ -240,7 +244,10 @@ SortedRun::SortedRun(const std::filesystem::path& file) {
 void SortedRun::Construct(const std::filesystem::path& file,
                           const std::map<std::string, LSMValue>& tree,
                           BlobFile& blob, size_t generation) {
-  assert(!tree.empty());
+  if (tree.empty()) {
+    FlushInternal(file, "", "", {}, generation);
+    return;
+  }
   std::string_view min_key(tree.begin()->first);
   std::string_view max_key(tree.rbegin()->first);
 

@@ -209,43 +209,46 @@ bool RuleSet::Contains(std::string_view name) const {
       rules_, [&](const Rule& rule) { return rule.Name() == name; });
 }
 
-RuleSet RuleSet::Default() {
-  using namespace dsl;
-  RuleSet rules;
-  rules.Add(Rule("join_commutativity", Join(Any("left"), Any("right")),
-                 [](const Bindings&, Memo& memo, GroupId group,
-                    const LogicalExpression& expression) {
-                   memo.AddExpression(
-                       group, LogicalExpression{LogicalOperator::kJoin,
-                                                {expression.children[1],
-                                                 expression.children[0]},
-                                                {}});
-                 }));
-  rules.Add(Rule(
-      "join_enumeration", Join(),
-      [](const Bindings&, Memo& memo, GroupId group, const LogicalExpression&) {
-        const std::vector<std::string> relations = memo.Get(group).relations;
-        if (relations.size() < 3) return;
-        if (relations.size() >= std::numeric_limits<uint64_t>::digits) {
-          throw std::runtime_error("join graph is too large for enumeration");
-        }
-        const uint64_t limit = uint64_t{1} << relations.size();
-        for (uint64_t mask = 1; mask + 1 < limit; ++mask) {
-          // Commutativity supplies the mirrored orientation.
-          if ((mask & 1U) == 0) continue;
-          std::vector<std::string> left;
-          std::vector<std::string> right;
-          for (size_t i = 0; i < relations.size(); ++i) {
-            ((mask >> i) & 1U ? left : right).push_back(relations[i]);
+const RuleSet& RuleSet::Default() {
+  static const RuleSet rules = [] {
+    using namespace dsl;
+    RuleSet built;
+    built.Add(Rule("join_commutativity", Join(Any("left"), Any("right")),
+                   [](const Bindings&, Memo& memo, GroupId group,
+                      const LogicalExpression& expression) {
+                     memo.AddExpression(
+                         group, LogicalExpression{LogicalOperator::kJoin,
+                                                  {expression.children[1],
+                                                   expression.children[0]},
+                                                  {}});
+                   }));
+    built.Add(Rule(
+        "join_enumeration", Join(),
+        [](const Bindings&, Memo& memo, GroupId group,
+           const LogicalExpression&) {
+          const std::vector<std::string> relations = memo.Get(group).relations;
+          if (relations.size() < 3) return;
+          if (relations.size() >= std::numeric_limits<uint64_t>::digits) {
+            throw std::runtime_error("join graph is too large for enumeration");
           }
-          if (left.empty() || right.empty()) continue;
-          const GroupId left_group = memo.EnsureGroup(std::move(left));
-          const GroupId right_group = memo.EnsureGroup(std::move(right));
-          memo.AddExpression(group, LogicalExpression{LogicalOperator::kJoin,
-                                                      {left_group, right_group},
-                                                      {}});
-        }
-      }));
+          const uint64_t limit = uint64_t{1} << relations.size();
+          for (uint64_t mask = 1; mask + 1 < limit; ++mask) {
+            if ((mask & 1U) == 0) continue;
+            std::vector<std::string> left;
+            std::vector<std::string> right;
+            for (size_t i = 0; i < relations.size(); ++i) {
+              ((mask >> i) & 1U ? left : right).push_back(relations[i]);
+            }
+            if (left.empty() || right.empty()) continue;
+            const GroupId left_group = memo.EnsureGroup(std::move(left));
+            const GroupId right_group = memo.EnsureGroup(std::move(right));
+            memo.AddExpression(
+                group, LogicalExpression{LogicalOperator::kJoin,
+                                         {left_group, right_group}, {}});
+          }
+        }));
+    return built;
+  }();
   return rules;
 }
 
@@ -300,7 +303,7 @@ void SearchEngine::ExploreGroup(GroupId group) {
     const std::vector<LogicalExpression> snapshot =
         memo_.Get(group).expressions;
     for (const LogicalExpression& expression : snapshot) {
-      for (const Rule& rule : rules_.Rules()) {
+      for (const Rule& rule : rules_->Rules()) {
         changed |= rule.Apply(memo_, group, expression);
       }
     }

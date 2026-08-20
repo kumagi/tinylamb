@@ -63,7 +63,7 @@ IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
       provided_order_(std::move(provided_order)) {}
 
 Executor IndexScanPlan::EmitExecutor(TransactionContext& ctx) const {
-  if (ctx.txn_.RequiresHistoricalRead()) {
+  if (ctx.txn_.IndexKeysMayBeStale()) {
     Executor scan = std::make_shared<FullScan>(ctx.txn_, table_);
     return std::make_shared<Selection>(where_, table_.GetSchema(),
                                        std::move(scan));

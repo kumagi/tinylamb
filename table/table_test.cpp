@@ -215,6 +215,63 @@ TEST_F(TableTest, IndexUpdateDelete) {
   ASSERT_NE(rp2, rp3);
 }
 
+// Reproduces a table_fuzzer crash.  Inserting a second row whose key
+// duplicates an existing UNIQUE index entry must be rejected with
+// Status::kDuplicates instead of blowing up.  The fuzzer hit this through
+// BPlusTree::Insert: Table::IndexInsert (table/table.cpp:218-223) forwards a
+// unique-key duplicate straight into the tree, and BPlusTree::LeafInsert
+// (index/b_plus_tree.cpp:187-208) treated LeafPage::Insert's kDuplicates
+// (page/leaf_page.cpp:66-68) like "page full": it split the leaf and recursed
+// into the right half, where the same duplicate still sat, so it never
+// terminated and exhausted the stack (ASan: stack-overflow).  The B+ tree now
+// propagates kDuplicates; this test pins that contract at the table level.
+TEST_F(TableTest, InsertDuplicateUniqueKey) {
+  // Arrange
+  TransactionContext ctx = rs_->BeginContext();
+  ASSERT_SUCCESS(
+      rs_->CreateIndex(ctx, kTableName, IndexSchema("col1_unique", {0})));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSERT_SUCCESS(tbl->Insert(ctx.txn_,
+                             Row({Value(1), Value("first"), Value(3.3)}))
+                     .GetStatus());
+
+  // Act -- second row reuses the uniquely indexed col1 value
+  StatusOr<RowPosition> dup = tbl->Insert(
+      ctx.txn_, Row({Value(1), Value("second"), Value(4.4)}));
+
+  // Assert -- the unique-key violation is reported as an error status.
+  ASSERT_EQ(dup.GetStatus(), Status::kDuplicates);
+}
+
+// Follow-up on the same unique-key path: Table::Insert writes the row into the
+// row page BEFORE it maintains the indexes, and when an index insert fails
+// (kDuplicates above) it returns the error without rolling the row-page write
+// back.  The rejected row therefore stays in the table and shows up in a full
+// scan, so a statement the caller was told failed still modified the table.
+TEST_F(TableTest, InsertDuplicateUniqueKeyLeavesNoOrphan) {
+  // Arrange
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSERT_SUCCESS(tbl->Insert(ctx.txn_,
+                             Row({Value(1), Value("dup"), Value(3.3)}))
+                     .GetStatus());
+
+  // Act -- identical indexed key must be rejected...
+  StatusOr<RowPosition> dup = tbl->Insert(
+      ctx.txn_, Row({Value(1), Value("dup"), Value(5.5)}));
+  ASSERT_EQ(dup.GetStatus(), Status::kDuplicates);
+
+  // Assert -- the rejected insert must not have left a row behind; the table
+  // may only contain the first row.
+  size_t count = 0;
+  Iterator it = tbl->BeginFullScan(ctx.txn_);
+  while (it.IsValid()) {
+    ++count;
+    ++it;
+  }
+  ASSERT_EQ(count, 1u);
+}
+
 std::string KeyPayload(int num, int width) {
   std::stringstream ss;
   ss << std::setw(width) << std::setfill('0') << num;
@@ -273,5 +330,180 @@ TEST_F(TableTest, UpdateHeavy) {
   }
 
   // Assert -- implicit; gtest death on crash, gtest green on pass
+}
+
+TEST_F(TableTest, ReadOnlyUpdateConflicts) {
+  // Arrange -- insert a committed row
+  RowPosition rp;
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+    ASSIGN_OR_ASSERT_FAIL(RowPosition, inserted,
+                          tbl->Insert(ctx.txn_,
+                                      Row({Value(1), Value("string"),
+                                           Value(3.3)})));
+    rp = inserted;
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Act -- update and delete through a read-only transaction
+  TransactionContext ctx = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSERT_EQ(tbl->Update(ctx.txn_, rp,
+                        Row({Value(1), Value("new"), Value(4.4)}))
+                .GetStatus(),
+            Status::kConflicts);
+  ASSERT_EQ(tbl->Delete(ctx.txn_, rp), Status::kConflicts);
+}
+
+TEST_F(TableTest, InsertAllocatesNewPageWhenFull) {
+  // Arrange
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  std::vector<RowPosition> rps;
+  std::string payload(300, 'x');
+
+  // Act -- insert 600 rows; the first row page fills and later rows spill
+  for (int i = 0; i < 600; ++i) {
+    Row r({Value(i), Value(std::string(payload)), Value(i * 1.5)});
+    ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl->Insert(ctx.txn_, r));
+    rps.push_back(rp);
+  }
+
+  // Assert -- rows landed on more than one row page
+  ASSERT_NE(rps.front().page_id, rps.back().page_id);
+  // Assert -- every inserted row reads back intact across page boundaries
+  for (int i = 0; i < 600; ++i) {
+    ASSIGN_OR_ASSERT_FAIL(Row, read, tbl->Read(ctx.txn_, rps[i]));
+    ASSERT_EQ(read, Row({Value(i), Value(std::string(payload)), Value(i * 1.5)}));
+  }
+}
+
+TEST_F(TableTest, UpdateNonIndexedColumnFastPath) {
+  // Arrange
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL(
+      RowPosition, rp,
+      tbl->Insert(ctx.txn_, Row({Value(1), Value("string"), Value(3.3)})));
+
+  // Act -- update only the (non-indexed) double column
+  Row updated({Value(1), Value("string"), Value(9.9)});
+  ASSIGN_OR_ASSERT_FAIL(RowPosition, new_pos,
+                        tbl->Update(ctx.txn_, rp, updated));
+
+  // Assert -- the indexed columns are unchanged so the row stays in place
+  ASSERT_EQ(new_pos, rp);
+  ASSIGN_OR_ASSERT_FAIL(Row, read, tbl->Read(ctx.txn_, new_pos));
+  ASSERT_EQ(read, updated);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(TableTest, IndexWithIncludeColumnUpdate) {
+  // Arrange -- add an index whose include column is col3 (the double)
+  TransactionContext ctx = rs_->BeginContext();
+  ASSERT_SUCCESS(
+      rs_->CreateIndex(ctx, kTableName, IndexSchema("idx_inc", {0}, {2})));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL(
+      RowPosition, rp,
+      tbl->Insert(ctx.txn_, Row({Value(1), Value("string"), Value(3.3)})));
+
+  // Act -- update the include column; the key column is unchanged
+  Row updated({Value(1), Value("string"), Value(7.7)});
+  ASSIGN_OR_ASSERT_FAIL(RowPosition, new_pos,
+                        tbl->Update(ctx.txn_, rp, updated));
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+
+  // Assert -- the updated row reads back through a fresh transaction
+  TransactionContext read_ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2,
+                        read_ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL(Row, read, tbl2->Read(read_ctx.txn_, new_pos));
+  ASSERT_EQ(read, updated);
+  ASSERT_SUCCESS(read_ctx.txn_.PreCommit());
+}
+
+TEST_F(TableTest, BuildScanMorselsAndMorselScan) {
+  // Arrange
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  std::string payload(200, 'x');
+  for (int i = 0; i < 400; ++i) {
+    Row r({Value(i), Value(std::string(payload)), Value(i * 1.5)});
+    ASSERT_SUCCESS(tbl->Insert(ctx.txn_, r).GetStatus());
+  }
+
+  // Act -- split the table into morsels of two pages each
+  std::vector<Table::ScanMorsel> morsels = tbl->BuildScanMorsels(ctx.txn_, 2);
+  ASSERT_FALSE(morsels.empty());
+
+  // Assert -- scanning every morsel returns every inserted row exactly once
+  size_t count = 0;
+  for (const auto& morsel : morsels) {
+    Iterator it = tbl->BeginMorselScan(ctx.txn_, morsel);
+    while (it.IsValid()) {
+      ++count;
+      ++it;
+    }
+  }
+  ASSERT_EQ(count, 400u);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(TableTest, IndexScanFullRange) {
+  // Arrange -- insert 20 rows into the indexed table
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  for (int i = 0; i < 20; ++i) {
+    Row r({Value(i), Value("str" + std::to_string(i)), Value(1.0 * i)});
+    ASSERT_SUCCESS(tbl->Insert(ctx.txn_, r).GetStatus());
+  }
+  const Index& index = tbl->GetIndex(0);
+
+  // Act -- scan the whole index ascending, descending, and via vector keys
+  Iterator asc = tbl->BeginIndexScan(ctx.txn_, index, Value(), Value(), true);
+  int asc_count = 0;
+  while (asc.IsValid()) {
+    ++asc_count;
+    ++asc;
+  }
+  Iterator desc =
+      tbl->BeginIndexScan(ctx.txn_, index, Value(), Value(), false);
+  int desc_count = 0;
+  while (desc.IsValid()) {
+    ++desc_count;
+    ++desc;
+  }
+  Iterator vec = tbl->BeginIndexScan(ctx.txn_, index, std::vector<Value>{},
+                                     std::vector<Value>{}, true);
+  int vec_count = 0;
+  while (vec.IsValid()) {
+    ++vec_count;
+    ++vec;
+  }
+
+  // Assert -- every scan sees the full 20-row table
+  ASSERT_EQ(asc_count, 20);
+  ASSERT_EQ(desc_count, 20);
+  ASSERT_EQ(vec_count, 20);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(TableTest, AvailableKeyIndexAndStreamOperator) {
+  // Arrange
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+
+  // Act -- query which schema slots back the table's indexes
+  auto available = tbl->AvailableKeyIndex();
+  ASSERT_EQ(available.size(), 1u);
+  ASSERT_EQ(available.count(0), 1u);
+
+  // Act -- stream the table
+  std::stringstream ss;
+  ss << *tbl;
+  EXPECT_NE(ss.str().find("Table(schema="), std::string::npos);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 }  // namespace tinylamb

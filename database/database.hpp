@@ -85,7 +85,9 @@ class Database {
   // Persistent { Name => Table } storage.
   BPlusTree catalog_;
 
-  // Persistent { Name => TableStatistics } storage.
+  // Persistent statistics: table name → row-count meta, and
+  // table name + NUL + column index → ColumnStats.  Splitting by column
+  // keeps each B+tree value under the leaf entry size limit.
   BPlusTree statistics_;
 
   // Persistent { Name => Function } storage.

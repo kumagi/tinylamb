@@ -201,7 +201,7 @@ TEST_F(BranchPageTest, InsertAndGetKey) {
   ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "b", false), 20);
   ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "battle", false), 20);
 
-  ASSERT_SUCCESS(page->InsertBranch(txn, "c", 30));
+  ASSERT_SUCCESS(page->UpdateBranch(txn, "c", 30));
   ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "c", false), 30);
   ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "cut", false), 30);
 
@@ -689,5 +689,150 @@ TEST_F(BranchPageTest, MoveLeftFromFoster1) {
 
   // Assert 2 -- parent now has 4 keys "a","b","c","d"; foster child emptied
   ASSERT_EQ(page->RowCount(), 4);
+}
+
+TEST_F(BranchPageTest, InsertTooBigData) {
+  // Arrange -- nothing more than fixture setup
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+
+  // Act -- a key larger than the per-entry limit must be rejected
+  Status result =
+      page->InsertBranch(txn, std::string(6000, 'a'), 1);
+
+  // Assert -- kTooBigData, not a silent truncation or crash
+  ASSERT_EQ(result, Status::kTooBigData);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(BranchPageTest, InsertDuplicateKey) {
+  // Arrange
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+
+  // Act -- insert the same branch key twice
+  ASSERT_SUCCESS(page->InsertBranch(txn, "a", 1));
+  Status result = page->InsertBranch(txn, "a", 2);
+
+  // Assert -- duplicate insertion is rejected
+  ASSERT_EQ(result, Status::kDuplicates);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(BranchPageTest, UpdateTooBigKey) {
+  // Arrange
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  ASSERT_SUCCESS(page->InsertBranch(txn, "a", 1));
+
+  // Act -- updating with an oversized key must be rejected up-front
+  Status result =
+      page->UpdateBranch(txn, std::string(6000, 'a'), 2);
+
+  // Assert -- kTooBigData
+  ASSERT_EQ(result, Status::kTooBigData);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(BranchPageTest, DeleteLowestKeyPromotesLowestValue) {
+  // Arrange
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  page->SetLowestValue(txn, 100);
+  ASSERT_SUCCESS(page->InsertBranch(txn, "b", 200));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "c", 300));
+
+  // Act -- delete a key smaller than the lowest key (the "left edge" path)
+  ASSERT_SUCCESS(page->Delete(txn, "a"));
+
+  // Assert -- the old lowest row "b" was consumed to promote the lowest value
+  ASSERT_EQ(page->RowCount(), 1U);
+  ASSERT_EQ(page->GetKey(0), "c");
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "alpha", false), 200);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "b", false), 200);
+  ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "c", false), 300);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(BranchPageTest, SetFenceNoSpace) {
+  // Arrange -- fill the branch page nearly to capacity
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  page->SetLowestValue(txn, 0);
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_SUCCESS(page->InsertBranch(txn, std::string(4000, '0' + i), i + 1));
+  }
+
+  // Act -- an oversized low fence cannot fit in the remaining space
+  Status low = page->SetLowFence(txn, IndexKey(std::string(5000, 'l')));
+
+  // Assert -- kNoSpace
+  ASSERT_EQ(low, Status::kNoSpace);
+
+  // Act -- an oversized high fence cannot fit either
+  Status high = page->SetHighFence(txn, IndexKey(std::string(5000, 'h')));
+
+  // Assert -- kNoSpace
+  ASSERT_EQ(high, Status::kNoSpace);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(BranchPageTest, SetFosterNoSpace) {
+  // Arrange -- fill the branch page nearly to capacity
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  page->SetLowestValue(txn, 0);
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_SUCCESS(page->InsertBranch(txn, std::string(4000, '0' + i), i + 1));
+  }
+
+  // Act -- an oversized foster key cannot fit in the remaining space
+  Status result =
+      page->SetFoster(txn, FosterPair(std::string(5000, 'f'), 99));
+
+  // Assert -- kNoSpace
+  ASSERT_EQ(result, Status::kNoSpace);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(BranchPageTest, DumpBranchPage) {
+  // Arrange -- a populated page with lowest value, rows and a foster pair
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  page->SetLowestValue(txn, 100);
+  ASSERT_SUCCESS(page->InsertBranch(txn, "b", 200));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "c", 300));
+  ASSERT_SUCCESS(page->SetFoster(txn, FosterPair("d", 400)));
+
+  // Act -- stream the page through the Dump path
+  std::ostringstream oss;
+  oss << *page;
+
+  // Assert -- header, rows and foster key are all rendered
+  const std::string dumped = oss.str();
+  EXPECT_NE(dumped.find("BranchPage"), std::string::npos);
+  EXPECT_NE(dumped.find("FosterKey"), std::string::npos);
+  EXPECT_NE(dumped.find("d -> 400"), std::string::npos);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(BranchPageTest, SplitPivotAdjustment) {
+  // Arrange -- a small page whose split must advance the pivot past the new key
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  page->SetLowestValue(txn, 1);
+  ASSERT_SUCCESS(page->InsertBranch(txn, "a", 2));
+  ASSERT_SUCCESS(page->InsertBranch(txn, "b", 3));
+  PageRef right = p_->AllocateNewPage(txn, PageType::kBranchPage);
+
+  // Act -- split with a separator between the two existing keys
+  std::string middle;
+  page->SplitInto(txn, "ab", right.get(), &middle);
+
+  // Assert -- the middle key separates the left page from the right side
+  ASSERT_EQ(middle, "b");
+  ASSERT_EQ(page->RowCount(), 1U);
+  ASSERT_EQ(right->RowCount(), 0U);
+  ASSERT_SUCCESS(txn.PreCommit());
 }
 }  // namespace tinylamb

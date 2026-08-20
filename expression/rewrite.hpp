@@ -101,7 +101,7 @@ class ExpressionRuleSet {
     return rules_;
   }
 
-  static ExpressionRuleSet Default();
+  static const ExpressionRuleSet& Default();
 
  private:
   std::vector<ExpressionRule> rules_;
@@ -109,14 +109,14 @@ class ExpressionRuleSet {
 
 class ExpressionRewriter {
  public:
-  explicit ExpressionRewriter(ExpressionRuleSet rules)
-      : rules_(std::move(rules)) {}
+  explicit ExpressionRewriter(const ExpressionRuleSet& rules)
+      : rules_(&rules) {}
 
   [[nodiscard]] Expression Rewrite(const Expression& expression) const;
 
  private:
   [[nodiscard]] Expression RewriteOnce(const Expression& expression) const;
-  ExpressionRuleSet rules_;
+  const ExpressionRuleSet* rules_;
 };
 
 [[nodiscard]] std::vector<Expression> ExpressionChildren(

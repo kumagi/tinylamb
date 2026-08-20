@@ -81,4 +81,146 @@ TEST_F(TransactionTest, UpgradeRequiresSoleSharedOwner) {
   EXPECT_TRUE(lm_->ReleaseSharedLock(row));
 }
 
+TEST_F(TransactionTest, TransactionIdsIncrement) {
+  // Arrange -- nothing more than fixture setup
+  // Act -- begin three sequential transactions
+  auto first = tm_->Begin();
+  auto second = tm_->Begin();
+  auto third = tm_->Begin();
+
+  // Assert -- transaction ids are assigned in strictly increasing order
+  ASSERT_EQ(first.ID(), 1u);
+  ASSERT_EQ(second.ID(), 2u);
+  ASSERT_EQ(third.ID(), 3u);
+}
+
+TEST_F(TransactionTest, ReadOnlyTransactionCommit) {
+  // Arrange -- nothing more than fixture setup
+  // Act -- commit a read-only transaction
+  Transaction txn = tm_->Begin(true);
+  ASSERT_TRUE(txn.IsReadOnly());
+  ASSERT_EQ(txn.PreCommit(), Status::kSuccess);
+
+  // Assert -- the read-only transaction finishes without writing a commit log
+  ASSERT_TRUE(txn.IsFinished());
+}
+
+TEST_F(TransactionTest, ReadOnlyTransactionAbort) {
+  // Arrange -- nothing more than fixture setup
+  // Act -- abort a read-only transaction
+  Transaction txn = tm_->Begin(true);
+  txn.Abort();
+
+  // Assert -- the read-only abort path skips log undo entirely
+  ASSERT_TRUE(txn.IsFinished());
+}
+
+TEST_F(TransactionTest, MVCCVisibilityChain) {
+  // Arrange -- a row position shared by all versions in this test
+  const RowPosition rp(1, 1);
+
+  // Act 1 -- writer 1 publishes version "v1"
+  Transaction writer = tm_->Begin();
+  ASSERT_TRUE(writer.AddWriteSet(rp));
+  writer.RegisterVersionWrite(rp, std::nullopt, "v1");
+  ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
+  writer.CommitWait();
+
+  // Assert 1 -- a snapshot reader started after the commit sees "v1"
+  {
+    Transaction reader = tm_->Begin(true);
+    ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(reader, rp, std::nullopt), "v1");
+
+    // Act 2 -- writer 2 overwrites with "v2" while the reader's snapshot is open
+    Transaction writer2 = tm_->Begin();
+    ASSERT_TRUE(writer2.AddWriteSet(rp));
+    writer2.RegisterVersionWrite(rp, "v1", "v2");
+
+    // Assert 2 -- committed v1 stays visible; pending writes are not a plan gate
+    ASSERT_FALSE(reader.RequiresHistoricalRead());
+    ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(reader, rp, std::nullopt), "v1");
+    // Assert 3 -- the writer itself sees its own uncommitted pending version
+    ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(writer2, rp, std::nullopt), "v2");
+    ASSERT_EQ(writer2.PreCommit(), Status::kSuccess);
+  }
+
+  // Assert 4 -- a fresh reader after both commits sees the newest version
+  {
+    Transaction reader = tm_->Begin(true);
+    ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(reader, rp, std::nullopt), "v2");
+    reader.PreCommit();
+  }
+}
+
+TEST_F(TransactionTest, ReadVersionDeleteVisibleAsNotExists) {
+  // Arrange -- a row position whose committed version is a deletion
+  const RowPosition rp(9, 1);
+  Transaction writer = tm_->Begin();
+  ASSERT_TRUE(writer.AddWriteSet(rp));
+  writer.RegisterVersionWrite(rp, "v", std::nullopt);
+  ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
+  writer.CommitWait();
+
+  // Act -- read the deleted row from a snapshot after the commit
+  Transaction reader = tm_->Begin(true);
+  auto result = tm_->ReadVersion(reader, rp, std::nullopt);
+
+  // Assert -- a deleted version is visible as kNotExists, not as garbage
+  ASSERT_EQ(result.GetStatus(), Status::kNotExists);
+  reader.PreCommit();
+}
+
+TEST_F(TransactionTest, ReadVersionPhysicalFallback) {
+  // Arrange -- a row position with no MVCC version history
+  const RowPosition rp(77, 1);
+  Transaction txn = tm_->Begin(true);
+
+  // Act -- read it with and without a physical (page) value
+  auto with_physical = tm_->ReadVersion(txn, rp, std::string_view("physical"));
+  auto without_physical = tm_->ReadVersion(txn, rp, std::nullopt);
+
+  // Assert -- the physical value falls back when no version chain exists
+  ASSERT_SUCCESS_AND_EQ(with_physical, "physical");
+  ASSERT_EQ(without_physical.GetStatus(), Status::kNotExists);
+  txn.PreCommit();
+}
+
+TEST_F(TransactionTest, LockManagementThroughManager) {
+  // Arrange -- a row position with no locks held yet
+  const RowPosition rp(5, 1);
+
+  // Act -- take an exclusive lock through the TransactionManager
+  ASSERT_TRUE(tm_->GetExclusiveLock(rp));
+  ASSERT_FALSE(tm_->GetExclusiveLock(rp));
+  ASSERT_FALSE(tm_->GetSharedLock(rp));
+  ASSERT_TRUE(lm_->ReleaseExclusiveLock(rp));
+
+  // Act -- take a shared lock and upgrade it to exclusive
+  ASSERT_TRUE(tm_->GetSharedLock(rp));
+  ASSERT_TRUE(tm_->TryUpgradeLock(rp));
+
+  // Assert -- the upgraded exclusive lock releases cleanly
+  ASSERT_TRUE(lm_->ReleaseExclusiveLock(rp));
+}
+
+TEST_F(TransactionTest, CompensateLogsThroughManager) {
+  // Arrange -- nothing more than fixture setup
+  // Act -- append every flavor of compensating log record via the manager
+  tm_->CompensateInsertLog(1, 3, 4);
+  tm_->CompensateInsertLog(1, 3, "leaf-key");
+  tm_->CompensateInsertBranchLog(1, 3, "branch-key");
+  tm_->CompensateUpdateLog(1, 3, 4, "redo");
+  tm_->CompensateUpdateLog(1, 3, "leaf-key", "redo");
+  tm_->CompensateUpdateBranchLog(1, 3, "branch-key", 5);
+  tm_->CompensateDeleteLog(1, 3, 4, "redo");
+  tm_->CompensateDeleteLog(1, 3, "leaf-key", "redo");
+  tm_->CompensateDeleteBranchLog(1, 3, "branch-key", 5);
+  tm_->CompensateSetLowestValueLog(1, 3, 6);
+  tm_->CompensateSetLowFenceLog(1, 3, IndexKey("low"));
+  tm_->CompensateSetHighFenceLog(1, 3, IndexKey("high"));
+  tm_->CompensateSetFosterLog(1, 3, FosterPair("fk", 7));
+
+  // Assert -- implicit; every compensating record was appended without crash
+}
+
 }  // namespace tinylamb

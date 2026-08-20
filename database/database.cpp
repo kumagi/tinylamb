@@ -16,6 +16,7 @@
 
 #include "database.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ostream>
@@ -23,8 +24,10 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <vector>
 
 #include "common/constants.hpp"
+#include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "common/log_message.hpp"
 #include "common/status_or.hpp"
@@ -84,6 +87,63 @@ static void Deserialize(std::string_view from, Deserializable& dst) {
   ext >> dst;
 }
 
+namespace {
+
+constexpr uint64_t kStatisticsMetaMagic = 0x544C53544D455441ULL;  // TLSTMETA
+
+std::string StatisticsColumnKey(std::string_view table, slot_t column) {
+  std::string key;
+  key.reserve(table.size() + 3);
+  key.append(table);
+  key.push_back('\0');
+  key.push_back(static_cast<char>((column >> 8) & 0xff));
+  key.push_back(static_cast<char>(column & 0xff));
+  return key;
+}
+
+std::string EncodeStatisticsMeta(size_t rows) {
+  std::stringstream stream;
+  Encoder encoder(stream);
+  encoder << kStatisticsMetaMagic << static_cast<uint64_t>(rows);
+  return stream.str();
+}
+
+uint64_t PeekUint64(std::string_view payload) {
+  if (payload.size() < sizeof(uint64_t)) {
+    return 0;
+  }
+  std::string copy(payload);
+  std::stringstream stream(copy);
+  Decoder decoder(stream);
+  uint64_t value = 0;
+  decoder >> value;
+  return value;
+}
+
+Status UpsertStatistics(BPlusTree& tree, Transaction& txn, std::string_view key,
+                        std::string_view value) {
+  const Status updated = tree.Update(txn, key, value);
+  if (updated == Status::kNotExists) {
+    return tree.Insert(txn, key, value);
+  }
+  return updated;
+}
+
+Status WriteSplitStatistics(BPlusTree& tree, Transaction& txn,
+                            std::string_view table_name,
+                            const TableStatistics& stats) {
+  RETURN_IF_FAIL(UpsertStatistics(tree, txn, table_name,
+                                  EncodeStatisticsMeta(stats.Rows())));
+  for (slot_t column = 0; column < stats.Columns(); ++column) {
+    RETURN_IF_FAIL(UpsertStatistics(tree, txn,
+                                    StatisticsColumnKey(table_name, column),
+                                    Serialize(stats.Column(column))));
+  }
+  return Status::kSuccess;
+}
+
+}  // namespace
+
 StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
                                       const Schema& schema) {
   if (catalog_.Read(ctx.txn_, schema.Name()).GetStatus() !=
@@ -94,6 +154,8 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
       storage_.pm_.AllocateNewPage(ctx.txn_, PageType::kRowPage);
   Table new_table(schema, table_page->PageID());
   TableStatistics new_stat(schema);
+  // CreateIndex full-scans the table and reacquires this page latch.
+  table_page.PageUnlock();
 
   // Prepare index for primary-key and unique-key.
   for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
@@ -108,8 +170,8 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
 
   RETURN_IF_FAIL(
       catalog_.Insert(ctx.txn_, schema.Name(), Serialize(new_table)));
-  RETURN_IF_FAIL(statistics_.Insert(ctx.txn_, std::string(schema.Name()),
-                                    Serialize(new_stat)));
+  RETURN_IF_FAIL(
+      WriteSplitStatistics(statistics_, ctx.txn_, schema.Name(), new_stat));
   return new_table;
 }
 
@@ -161,18 +223,44 @@ StatusOr<Table> Database::GetTable(TransactionContext& ctx,
 
 StatusOr<TableStatistics> Database::GetStatistics(
     TransactionContext& ctx, std::string_view schema_name) {
-  ASSIGN_OR_RETURN(std::string_view, val,
-                   statistics_.Read(ctx.txn_, schema_name));
   ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
-  TableStatistics ts(tbl.schema_);
-  Deserialize(val, ts);
+  ASSIGN_OR_RETURN(std::string_view, meta,
+                   statistics_.Read(ctx.txn_, schema_name));
+  TableStatistics ts(tbl.GetSchema());
+  if (PeekUint64(meta) != kStatisticsMetaMagic) {
+    Deserialize(meta, ts);
+    return ts;
+  }
+  uint64_t magic = 0;
+  uint64_t rows = 0;
+  {
+    std::string copy(meta);
+    std::stringstream stream(copy);
+    Decoder decoder(stream);
+    decoder >> magic >> rows;
+  }
+  const Schema& schema = tbl.GetSchema();
+  std::vector<ColumnStats> columns;
+  columns.reserve(schema.ColumnCount());
+  for (slot_t column = 0; column < schema.ColumnCount(); ++column) {
+    StatusOr<std::string_view> payload =
+        statistics_.Read(ctx.txn_, StatisticsColumnKey(schema_name, column));
+    if (!payload.HasValue()) {
+      columns.emplace_back(schema.GetColumn(column).Type());
+      continue;
+    }
+    ColumnStats stats;
+    Deserialize(payload.Value(), stats);
+    columns.push_back(std::move(stats));
+  }
+  ts.Assign(rows, std::move(columns));
   return ts;
 }
 
 Status Database::UpdateStatistics(TransactionContext& ctx,
                                   std::string_view schema_name,
                                   const TableStatistics& ts) {
-  return statistics_.Update(ctx.txn_, std::string(schema_name), Serialize(ts));
+  return WriteSplitStatistics(statistics_, ctx.txn_, schema_name, ts);
 }
 
 Status Database::RefreshStatistics(TransactionContext& ctx,

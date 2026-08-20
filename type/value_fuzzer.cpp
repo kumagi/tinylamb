@@ -17,7 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <utility>
+#include <string_view>
 
 #include "type/value.hpp"
 
@@ -28,20 +28,22 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
   if (size < 2) {
     return 0;
   }
+  // Split the input at every position and check that the memcomparable
+  // encoding preserves the VARCHAR total order.  The source strings must be
+  // compared before they are moved into the Value objects; comparing the
+  // moved-from strings would silently make every comparison false.
+  const std::string_view input(reinterpret_cast<const char*>(data), size);
   for (size_t i = 1; i < size - 1; ++i) {
-    std::string left(reinterpret_cast<const char*>(data), i);
-    std::string right(reinterpret_cast<const char*>(data + i), size - i);
-    Value l(std::move(left)), r(std::move(right));
-    std::string encoded_left = l.EncodeMemcomparableFormat(),
-                encoded_right = r.EncodeMemcomparableFormat();
-    if (left < right) {
-      if (encoded_right <= encoded_left) {
-        __builtin_trap();
-      }
-    } else if (right < left) {
-      if (encoded_left <= encoded_right) {
-        __builtin_trap();
-      }
+    const std::string_view left = input.substr(0, i);
+    const std::string_view right = input.substr(i);
+    const Value l{std::string(left)}, r{std::string(right)};
+    const std::string encoded_left = l.EncodeMemcomparableFormat();
+    const std::string encoded_right = r.EncodeMemcomparableFormat();
+    const int cmp = left < right ? -1 : (right < left ? 1 : 0);
+    const int encoded_cmp =
+        encoded_left < encoded_right ? -1 : (encoded_right < encoded_left ? 1 : 0);
+    if (cmp != encoded_cmp) {
+      __builtin_trap();
     }
   }
   return 0;

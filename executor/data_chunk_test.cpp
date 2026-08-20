@@ -68,4 +68,27 @@ TEST(DataChunkTest, MaintainsZoneMapsAcrossNullsAndReset) {
   EXPECT_EQ(chunk.ZoneMapAt(0).ValueCount(), 0U);
 }
 
+TEST(DataChunkTest, ResetWithSchemaOverridesInferredNullTypes) {
+  DataChunk chunk;
+  chunk.Append(Row({Value(), Value("a")}));
+  const Schema schema("orders", {Column("carrier", ValueType::kInt64),
+                                 Column("name", ValueType::kVarChar)});
+  chunk.Reset(schema, 4);
+  EXPECT_EQ(chunk.ColumnAt(0).Type(), ValueType::kInt64);
+  chunk.Append(Row({Value(), Value("b")}));
+  chunk.Append(Row({Value(int64_t{9}), Value("c")}));
+  EXPECT_TRUE(chunk.ColumnAt(0).IsNull(0));
+  EXPECT_EQ(chunk.ColumnAt(0).ValueAt(1), Value(int64_t{9}));
+}
+
+TEST(DataChunkTest, InfersNullThenPromotesType) {
+  DataChunk chunk;
+  chunk.Append(Row({Value(), Value("a")}));
+  chunk.Append(Row({Value(int64_t{7}), Value("b")}));
+  ASSERT_EQ(chunk.Size(), 2);
+  EXPECT_TRUE(chunk.ColumnAt(0).IsNull(0));
+  EXPECT_EQ(chunk.ColumnAt(0).ValueAt(1), Value(int64_t{7}));
+  EXPECT_EQ(chunk.ColumnAt(0).Type(), ValueType::kInt64);
+}
+
 }  // namespace tinylamb

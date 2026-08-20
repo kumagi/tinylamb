@@ -70,7 +70,7 @@ class LSMView {
 
     const LSMView* vm_;
     std::vector<SortedRun::Iterator> iters_;
-    size_t remaining_iters_;
+    size_t remaining_iters_{0};
   };
   [[nodiscard]] Iterator Begin() const;
   [[nodiscard]] StatusOr<std::string> Find(std::string_view key) const;

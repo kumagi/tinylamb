@@ -84,6 +84,13 @@ StatusOr<std::string> LSMTree::Read(std::string_view key) const {
       }
       return iter->second.payload;
     }
+    auto fiter = frozen_mem_tree_.find(std::string(key));
+    if (fiter != frozen_mem_tree_.end()) {
+      if (fiter->second.is_delete) {
+        return Status::kNotExists;
+      }
+      return fiter->second.payload;
+    }
   }
 
   std::unique_lock file_lk(file_tree_lock_);
@@ -110,7 +117,7 @@ bool LSMTree::Contains(std::string_view key) const {
       return true;
     }
     auto fiter = frozen_mem_tree_.find(std::string(key));
-    if (fiter != mem_tree_.end() && fiter->second.is_delete) {
+    if (fiter != frozen_mem_tree_.end() && fiter->second.is_delete) {
       return false;
     }
     if (fiter != frozen_mem_tree_.end()) {
@@ -121,7 +128,10 @@ bool LSMTree::Contains(std::string_view key) const {
   std::unique_lock file_lk(file_tree_lock_);
   for (const auto& it : index_) {
     auto result = it.Find(key, blob_);
-    if (result.GetStatus() == Status::kSuccess) {
+    if (result.GetStatus() == Status::kDeleted) {
+      return false;
+    }
+    if (result.HasValue()) {
       return true;
     }
   }
@@ -163,7 +173,11 @@ void LSMTree::Sync() {
 }
 
 void LSMTree::MergeAll() {
+  std::scoped_lock mem_lk(mem_tree_lock_);
   std::scoped_lock lk(file_tree_lock_);
+  if (index_.size() <= 1) {
+    return;
+  }
   LSMView view = GetViewImpl();
   std::filesystem::path path = root_dir_ / std::to_string(blob_.Written());
   view.CreateSingleRun(path);

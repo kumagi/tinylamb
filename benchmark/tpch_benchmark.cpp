@@ -21,8 +21,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <utility>
-#include <vector>
+#include <unordered_map>
 
 #include "benchmark/tpch_queries.hpp"
 #include "database/database.hpp"
@@ -136,7 +135,7 @@ struct Options {
   fs::path dbgen{TINYLAMB_TPCH_DBGEN_EXECUTABLE};
   fs::path dbgen_config{TINYLAMB_TPCH_DBGEN_CONFIG};
   double scale_factor{0};
-  size_t batch_rows{10000};
+  size_t batch_rows{50000};
   std::optional<size_t> query;
   bool force{false};
   bool reuse_database{false};
@@ -241,6 +240,45 @@ fs::path ManifestPath(const Options& options) {
   return options.data_dir / "tinylamb-tpch.manifest";
 }
 
+bool ReadManifestRowCounts(const Options& options,
+                           std::vector<uint64_t>* row_counts) {
+  std::ifstream manifest(ManifestPath(options));
+  if (!manifest) return false;
+  std::string key;
+  double scale = 0;
+  if (!(manifest >> key >> scale) || key != "scale_factor") return false;
+  if (std::abs(scale - options.scale_factor) > 1e-12) return false;
+  std::unordered_map<std::string, uint64_t> counts;
+  while (manifest >> key) {
+    if (key != "rows") continue;
+    std::string table;
+    uint64_t rows = 0;
+    if (!(manifest >> table >> rows)) return false;
+    counts.emplace(table, rows);
+  }
+  if (counts.size() != Tables().size()) return false;
+  row_counts->clear();
+  row_counts->reserve(Tables().size());
+  for (const TableSpec& table : Tables()) {
+    const auto found = counts.find(std::string(table.name));
+    if (found == counts.end()) return false;
+    row_counts->push_back(found->second);
+  }
+  return true;
+}
+
+void WriteManifestRowCounts(const Options& options,
+                            const std::vector<uint64_t>& row_counts) {
+  std::ifstream existing(ManifestPath(options));
+  std::ostringstream prior;
+  prior << existing.rdbuf();
+  std::ofstream manifest(ManifestPath(options), std::ios::trunc);
+  manifest << prior.str();
+  for (size_t i = 0; i < Tables().size(); ++i) {
+    manifest << "rows " << Tables()[i].name << ' ' << row_counts[i] << '\n';
+  }
+}
+
 bool ExistingDataMatches(const Options& options) {
   std::ifstream manifest(ManifestPath(options));
   std::string key;
@@ -302,6 +340,14 @@ bool GenerateData(const Options& options, std::string* error) {
       WEXITSTATUS(status) != 0) {
     *error = "DBGEN failed with status " + std::to_string(status);
     return false;
+  }
+  for (const TableSpec& table : Tables()) {
+    std::error_code chmod_error;
+    fs::permissions(TablePath(options, table.name),
+                    fs::perms::owner_read | fs::perms::owner_write |
+                        fs::perms::group_read | fs::perms::others_read,
+                    fs::perm_options::add, chmod_error);
+    (void)chmod_error;
   }
   std::ofstream manifest(ManifestPath(options), std::ios::trunc);
   manifest << "scale_factor " << std::setprecision(17) << options.scale_factor
@@ -443,8 +489,10 @@ bool ParseRow(std::string_view line, const TableSpec& table, tinylamb::Row* row,
         break;
       }
       case FieldKind::kString:
-      case FieldKind::kDate:
         values.emplace_back(std::string(fields[i]));
+        break;
+      case FieldKind::kDate:
+        values.push_back(tinylamb::Value::Date(fields[i]));
         break;
     }
   }
@@ -600,14 +648,30 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::vector<uint64_t> row_counts;
-  try {
-    if (!ValidateGeneratedData(options, &row_counts, &error)) {
-      std::cerr << "data validation failed: " << error << '\n';
+  if (options.reuse_database || ExistingDataMatches(options)) {
+    if (!ReadManifestRowCounts(options, &row_counts)) {
+      try {
+        if (!ValidateGeneratedData(options, &row_counts, &error)) {
+          std::cerr << "data validation failed: " << error << '\n';
+          return 1;
+        }
+        WriteManifestRowCounts(options, row_counts);
+      } catch (const std::exception& exception) {
+        std::cerr << "data validation failed: " << exception.what() << '\n';
+        return 1;
+      }
+    }
+  } else {
+    try {
+      if (!ValidateGeneratedData(options, &row_counts, &error)) {
+        std::cerr << "data validation failed: " << error << '\n';
+        return 1;
+      }
+      WriteManifestRowCounts(options, row_counts);
+    } catch (const std::exception& exception) {
+      std::cerr << "data validation failed: " << exception.what() << '\n';
       return 1;
     }
-  } catch (const std::exception& exception) {
-    std::cerr << "data validation failed: " << exception.what() << '\n';
-    return 1;
   }
   std::cout
       << "generation_seconds="
@@ -628,6 +692,9 @@ int main(int argc, char** argv) {
     RemoveDatabaseFiles(options.database_path);
   }
 
+  if (std::getenv("TINYLAMB_PAGE_POOL_BYTES") == nullptr) {
+    setenv("TINYLAMB_PAGE_POOL_BYTES", "17179869184", 0);
+  }
   const Clock::time_point load_begin = Clock::now();
   tinylamb::Database database(options.database_path.string());
   if (!options.reuse_database) {
@@ -656,11 +723,13 @@ int main(int argc, char** argv) {
   std::vector<QueryProfile> profiles;
   const size_t first_query = options.query.value_or(1);
   const size_t last_query = options.query.value_or(22);
+  bool any_failed = false;
   for (size_t query = first_query; query <= last_query; ++query) {
     QueryProfile profile;
     if (!RunQuery(database, query, &profile, &error)) {
       std::cerr << "query failed: " << error << '\n';
-      return 1;
+      any_failed = true;
+      continue;
     }
     profiles.push_back(std::move(profile));
   }
@@ -670,5 +739,5 @@ int main(int argc, char** argv) {
     std::cout << "Q" << profile.query << ' ' << profile.milliseconds
               << " ms rows=" << profile.rows << '\n';
   }
-  return 0;
+  return any_failed ? 1 : 0;
 }

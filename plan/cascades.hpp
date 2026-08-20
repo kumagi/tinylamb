@@ -119,7 +119,7 @@ class RuleSet {
   [[nodiscard]] bool Contains(std::string_view name) const;
   [[nodiscard]] const std::vector<Rule>& Rules() const { return rules_; }
 
-  static RuleSet Default();
+  static const RuleSet& Default();
 
  private:
   std::vector<Rule> rules_;
@@ -187,8 +187,8 @@ class SearchEngine {
       GroupId, const LogicalExpression&, const std::vector<BestPlan>&,
       const PhysicalProperties&)>;
 
-  SearchEngine(Memo memo, RuleSet rules)
-      : memo_(std::move(memo)), rules_(std::move(rules)) {}
+  SearchEngine(Memo memo, const RuleSet& rules)
+      : memo_(std::move(memo)), rules_(&rules) {}
 
   void Explore(GroupId root);
   [[nodiscard]] std::optional<BestPlan> Optimize(
@@ -208,7 +208,7 @@ class SearchEngine {
       const Implement& implement);
 
   Memo memo_;
-  RuleSet rules_;
+  const RuleSet* rules_;
   std::unordered_set<GroupId> explored_;
   std::unordered_set<GroupId> exploring_;
   std::unordered_map<std::string, std::optional<BestPlan>> best_;

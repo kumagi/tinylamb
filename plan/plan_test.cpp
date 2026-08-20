@@ -16,8 +16,10 @@
 
 #include "plan/plan.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <memory>
+#include <sstream>
 
 #include "aggregation_plan.hpp"
 #include "common/constants.hpp"
@@ -27,10 +29,13 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
+#include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "full_scan_plan.hpp"
 #include "gtest/gtest.h"
+#include "index/index.hpp"
+#include "index_only_scan_plan.hpp"
 #include "page/page_manager.hpp"
 #include "product_plan.hpp"
 #include "projection_plan.hpp"
@@ -276,6 +281,394 @@ TEST_F(PlanTest, AggregationPlan) {
   DumpAll(ap);
 
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
+}
+
+TEST_F(PlanTest, FullScanAccessors) {
+  // Arrange -- begin context, get Sc1 table and its real statistics
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        ctx.GetStats("Sc1"));
+
+  // Act -- construct FullScanPlan and query its accessors
+  Plan fs(new FullScanPlan(*tbl, *ts));
+
+  // Assert -- schema, row counts, stats, and dump output are consistent
+  EXPECT_EQ(fs->GetSchema().Name(), "Sc1");
+  EXPECT_EQ(fs->AccessRowCount(), ts->Rows());
+  EXPECT_EQ(fs->EmitRowCount(), ts->Rows());
+  EXPECT_EQ(fs->GetStats().Rows(), ts->Rows());
+  EXPECT_NE(fs->ScanSource(), nullptr);
+  EXPECT_NE(fs->ToString().find("FullScan: Sc1"), std::string::npos);
+  std::ostringstream oss;
+  fs->Dump(oss, 0);
+  EXPECT_NE(oss.str().find("FullScan: Sc1"), std::string::npos);
+}
+
+TEST_F(PlanTest, ProjectionExpressionColumn) {
+  // Arrange -- begin context, get Sc1 table
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  TableStatistics ts((Schema()));
+
+  // Act -- project a synthetic expression (non-column) and a named column
+  std::vector<NamedExpression> columns;
+  columns.emplace_back(NamedExpression("", ConstantValueExp(Value(1))));
+  columns.emplace_back(NamedExpression("c1"));
+  Plan pp(new ProjectionPlan(std::make_shared<FullScanPlan>(*tbl, ts),
+                             std::move(columns)));
+
+  // Assert -- the synthetic column is auto-named "$col<index>"
+  const Schema& sc = pp->GetSchema();
+  EXPECT_EQ(sc.ColumnCount(), 2);
+  EXPECT_EQ(sc.GetColumn(0).Name().name, "$col0");
+  EXPECT_EQ(sc.GetColumn(1).Name().name, "c1");
+}
+
+TEST_F(PlanTest, ProjectionToString) {
+  // Arrange -- begin context, get Sc1 table
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  TableStatistics ts((Schema()));
+
+  // Act -- construct ProjectionPlan and render it
+  Plan pp(new ProjectionPlan(std::make_shared<FullScanPlan>(*tbl, ts),
+                             {NamedExpression("c1", ColumnValueExp("c1"))}));
+  std::ostringstream oss;
+  pp->Dump(oss, 0);
+
+  // Assert -- both the tree dump and the string form carry the projection
+  EXPECT_NE(pp->ToString().find("Project: {c1}"), std::string::npos);
+  EXPECT_NE(oss.str().find("Project: {c1}"), std::string::npos);
+}
+
+TEST_F(PlanTest, SelectionToString) {
+  // Arrange -- begin context, get Sc1 table
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  TableStatistics ts((Schema()));
+
+  // Act -- construct SelectionPlan with a >= filter and render it
+  Expression exp = BinaryExpressionExp(ColumnValueExp("c1"),
+                                       BinaryOperation::kGreaterThanEquals,
+                                       ConstantValueExp(Value(100)));
+  Plan sp(new SelectionPlan(std::make_shared<FullScanPlan>(*tbl, ts), exp, ts));
+  std::ostringstream oss;
+  sp->Dump(oss, 0);
+
+  // Assert -- the predicate and cost are rendered
+  EXPECT_NE(sp->ToString().find("Select: ["), std::string::npos);
+  EXPECT_NE(sp->ToString().find(">="), std::string::npos);
+  EXPECT_EQ(sp->AccessRowCount(), ts.Rows());
+  EXPECT_NE(oss.str().find("Select: ["), std::string::npos);
+}
+
+TEST_F(PlanTest, AggregationAccessors) {
+  // Arrange -- begin context, get Sc1 table
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  TableStatistics ts((Schema()));
+  auto child = std::make_shared<FullScanPlan>(*tbl, ts);
+
+  // Act -- construct AggregationPlan with typed aggregates over c1 (int) and
+  // c3 (double)
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("count",
+                      AggregateExpressionExp(AggregationType::kCount,
+                                             ColumnValueExp("c1"))),
+      NamedExpression("sum", AggregateExpressionExp(AggregationType::kSum,
+                                                    ColumnValueExp("c3"))),
+      NamedExpression("avg", AggregateExpressionExp(AggregationType::kAvg,
+                                                    ColumnValueExp("c3"))),
+      NamedExpression("min", AggregateExpressionExp(AggregationType::kMin,
+                                                    ColumnValueExp("c1"))),
+      NamedExpression("max", AggregateExpressionExp(AggregationType::kMax,
+                                                    ColumnValueExp("c1")))};
+  Plan ap(new AggregationPlan(child, std::move(aggregates)));
+
+  // Assert -- per-aggregate result types and delegation of accessors
+  const Schema& sc = ap->GetSchema();
+  EXPECT_EQ(sc.ColumnCount(), 5);
+  EXPECT_EQ(sc.GetColumn(0).Type(), ValueType::kInt64);
+  EXPECT_EQ(sc.GetColumn(1).Type(), ValueType::kDouble);
+  EXPECT_EQ(sc.GetColumn(2).Type(), ValueType::kDouble);
+  EXPECT_EQ(sc.GetColumn(3).Type(), ValueType::kInt64);
+  EXPECT_EQ(sc.GetColumn(4).Type(), ValueType::kInt64);
+  EXPECT_EQ(ap->AccessRowCount(), child->AccessRowCount());
+  EXPECT_EQ(ap->EmitRowCount(), 1);
+  EXPECT_EQ(ap->ScanSource(), child->ScanSource());
+  EXPECT_EQ(ap->GetStats().Rows(), child->GetStats().Rows());
+  EXPECT_NE(ap->ToString().find("Aggregation {"), std::string::npos);
+  std::ostringstream oss;
+  ap->Dump(oss, 0);
+  EXPECT_NE(oss.str().find("Aggregation {"), std::string::npos);
+}
+
+TEST_F(PlanTest, ProductCrossJoinAccessors) {
+  // Arrange -- begin context, get Sc1 and Sc2 tables
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  TableStatistics ts((Schema()));
+  auto left = std::make_shared<FullScanPlan>(*tbl1, ts);
+  auto right = std::make_shared<FullScanPlan>(*tbl2, ts);
+
+  // Act -- construct a cross-join ProductPlan and query its accessors
+  Plan prop(new ProductPlan(left, right));
+
+  // Assert -- schema is the concatenation and costs reflect the cross join
+  EXPECT_EQ(prop->GetSchema().ColumnCount(), 7);
+  EXPECT_NE(prop->ToString().find("Cross Join"), std::string::npos);
+  EXPECT_EQ(prop->EmitRowCount(),
+            left->EmitRowCount() * right->EmitRowCount());
+  EXPECT_EQ(prop->AccessRowCount(),
+            left->AccessRowCount() +
+                (1 + left->EmitRowCount() * right->AccessRowCount()));
+  EXPECT_EQ(prop->ScanSource(), nullptr);
+  std::ostringstream oss;
+  prop->Dump(oss, 0);
+  EXPECT_NE(oss.str().find("Cross Join"), std::string::npos);
+}
+
+TEST_F(PlanTest, ProductHashJoinAccessors) {
+  // Arrange -- begin context, get Sc1 and Sc2 tables
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  TableStatistics ts((Schema()));
+  auto left = std::make_shared<FullScanPlan>(*tbl1, ts);
+  auto right = std::make_shared<FullScanPlan>(*tbl2, ts);
+
+  // Act -- construct a hash-join ProductPlan and query its accessors
+  Plan prop(new ProductPlan(left, {ColumnName("Sc1.c1")}, right,
+                            {ColumnName("Sc2.d1")}));
+
+  // Assert -- costs and rendered join keys are correct
+  EXPECT_EQ(prop->GetSchema().ColumnCount(), 7);
+  EXPECT_NE(prop->ToString().find("left:{Sc1.c1}"), std::string::npos);
+  EXPECT_NE(prop->ToString().find("right:{Sc2.d1}"), std::string::npos);
+  EXPECT_EQ(prop->EmitRowCount(),
+            std::min(left->EmitRowCount(), right->EmitRowCount()));
+  EXPECT_EQ(prop->AccessRowCount(),
+            left->AccessRowCount() + right->AccessRowCount());
+  std::ostringstream oss;
+  prop->Dump(oss, 0);
+  EXPECT_NE(oss.str().find("right:{Sc2.d1}"), std::string::npos);
+}
+
+TEST_F(PlanTest, ProductIndexJoinAccessors) {
+  // Arrange -- begin context, get Sc1 and Sc2 tables and the Sc2PK index
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts2,
+                        ctx.GetStats("Sc2"));
+  TableStatistics ts((Schema()));
+  auto left = std::make_shared<FullScanPlan>(*tbl1, ts);
+
+  // Act -- construct an index-join ProductPlan and query its accessors
+  Plan prop(new ProductPlan(left, {ColumnName("Sc1.c1")}, *tbl2,
+                            tbl2->GetIndex(0), {ColumnName("Sc2.d1")}, *ts2));
+
+  // Assert -- index join cost model and rendered keys are correct
+  EXPECT_EQ(prop->EmitRowCount(), std::min(left->EmitRowCount(), ts2->Rows()));
+  EXPECT_EQ(prop->AccessRowCount(), left->AccessRowCount() * 3);
+  EXPECT_NE(prop->ToString().find("left:{Sc1.c1}"), std::string::npos);
+  EXPECT_NE(prop->ToString().find("right:{Sc2.d1}"), std::string::npos);
+  std::ostringstream oss;
+  prop->Dump(oss, 0);
+  EXPECT_NE(oss.str().find("left:{Sc1.c1}"), std::string::npos);
+}
+
+TEST_F(PlanTest, IndexOnlyScanPlanBasic) {
+  // Arrange -- begin context, get Sc2 table and its Sc2PK index
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        ctx.GetStats("Sc2"));
+
+  // Act -- construct an unbounded index-only scan
+  Plan plan(new IndexOnlyScanPlan(*tbl, tbl->GetIndex(0), *ts, {}, {}, true,
+                                  nullptr));
+
+  // Assert -- the output schema covers the indexed key and costs follow stats
+  EXPECT_EQ(plan->GetSchema().ColumnCount(), 1);
+  EXPECT_EQ(plan->GetSchema().GetColumn(0).Name().name, "d1");
+  EXPECT_NE(plan->ToString().find("IndexOnlyScan: Sc2"), std::string::npos);
+  EXPECT_NE(plan->ToString().find("Sc2PK"), std::string::npos);
+  EXPECT_EQ(plan->EmitRowCount(), ts->Rows());
+  EXPECT_EQ(plan->AccessRowCount(), ts->Rows());
+  std::ostringstream oss;
+  plan->Dump(oss, 0);
+  EXPECT_NE(oss.str().find("IndexOnlyScan: Sc2"), std::string::npos);
+}
+
+TEST_F(PlanTest, IndexOnlyScanPlanUniqueLookup) {
+  // Arrange -- begin context, get Sc2 table and its unique Sc2PK index
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        ctx.GetStats("Sc2"));
+
+  // Act -- construct a point lookup on the unique key
+  Plan plan(new IndexOnlyScanPlan(*tbl, tbl->GetIndex(0), *ts, {Value(52)},
+                                  {Value(52)}, true, nullptr));
+
+  // Assert -- a unique full-key lookup emits exactly one row
+  EXPECT_EQ(plan->EmitRowCount(), 1);
+  EXPECT_EQ(plan->AccessRowCount(), 1);
+}
+
+TEST_F(PlanTest, IndexOnlyScanPlanOrderedBy) {
+  // Arrange -- begin context, get Sc2 table and its Sc2PK index
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        ctx.GetStats("Sc2"));
+
+  // Act -- construct an ascending index-only scan advertising its order
+  std::vector<ColumnName> provided{ColumnName("Sc2.d1")};
+  Plan plan(new IndexOnlyScanPlan(*tbl, tbl->GetIndex(0), *ts, {}, {}, true,
+                                  nullptr, provided));
+
+  // Assert -- order matches only for the same column and direction
+  EXPECT_TRUE(
+      plan->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d1"))}, {true}));
+  EXPECT_FALSE(
+      plan->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d1"))}, {false}));
+  EXPECT_FALSE(
+      plan->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d2"))}, {true}));
+  EXPECT_FALSE(plan->IsOrderedBy({}, {true}));
+  EXPECT_FALSE(plan->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d1"))}, {}));
+}
+
+TEST_F(PlanTest, IndexOnlyScanPlanHistoricalRead) {
+  // Arrange -- begin a writer that inserts an uncommitted row into Sc2
+  TransactionContext writer = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+                        writer.GetTable("Sc2"));
+  ASSERT_SUCCESS(tbl->Insert(writer.txn_, Row({Value(999), Value(1.0),
+                                               Value("new"), Value(8)}))
+                     .GetStatus());
+
+  // Act -- a later transaction must not see the uncommitted index entry.
+  // Pending writers do not force a FullScan plan gate.
+  TransactionContext reader = rs_->BeginContext();
+  ASSERT_FALSE(reader.txn_.RequiresHistoricalRead());
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        reader.GetStats("Sc2"));
+  Expression where = BinaryExpressionExp(ColumnValueExp("d1"),
+                                         BinaryOperation::kGreaterThanEquals,
+                                         ConstantValueExp(Value(0)));
+  Plan plan(new IndexOnlyScanPlan(*tbl, tbl->GetIndex(0), *ts, {}, {}, true,
+                                  where));
+  Executor scan = plan->EmitExecutor(reader);
+  Row result;
+  size_t count = 0;
+  while (scan->Next(&result, nullptr)) {
+    ++count;
+  }
+
+  // Assert -- only the 6 committed rows are visible to the reader
+  ASSERT_EQ(count, 6);
+  reader.txn_.Abort();
+  writer.txn_.Abort();
+}
+
+TEST_F(PlanTest, ProjectionExpressionCtorAccessors) {
+  // Arrange -- begin context, get Sc1 table and its real statistics
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        ctx.GetStats("Sc1"));
+  auto child = std::make_shared<FullScanPlan>(*tbl, *ts);
+
+  // Act -- project a column value, a renamed constant, and an anonymous one
+  std::vector<NamedExpression> columns;
+  columns.emplace_back(NamedExpression("first", ColumnValueExp("c1")));
+  columns.emplace_back(NamedExpression("second", ConstantValueExp(Value(7))));
+  columns.emplace_back(NamedExpression("", ConstantValueExp(Value(9))));
+  Plan pp(new ProjectionPlan(child, std::move(columns)));
+
+  // Assert -- named columns keep their names, anonymous ones become $col<i>
+  const Schema& sc = pp->GetSchema();
+  EXPECT_EQ(sc.ColumnCount(), 3);
+  EXPECT_EQ(sc.GetColumn(0).Name().name, "first");
+  EXPECT_EQ(sc.GetColumn(1).Name().name, "second");
+  EXPECT_EQ(sc.GetColumn(2).Name().name, "$col2");
+  // Assert -- accessors delegate to the child plan
+  EXPECT_EQ(pp->GetStats().Rows(), child->GetStats().Rows());
+  EXPECT_EQ(pp->GetStats().Rows(), ts->Rows());
+  EXPECT_EQ(pp->AccessRowCount(), child->AccessRowCount());
+  EXPECT_EQ(pp->EmitRowCount(), child->EmitRowCount());
+  EXPECT_EQ(pp->ScanSource(), child->ScanSource());
+  // Assert -- ordering is delegated (FullScanPlan advertises no order)
+  EXPECT_FALSE(pp->IsOrderedBy({ColumnValueExp("c1")}, {true}));
+  EXPECT_FALSE(pp->IsOrderedBy({ColumnValueExp("c1")}, {false}));
+  // Assert -- ToString and Dump render every projected column
+  EXPECT_NE(pp->ToString().find("Project: {first, second, }"),
+            std::string::npos);
+  std::ostringstream oss;
+  pp->Dump(oss, 0);
+  EXPECT_NE(oss.str().find("c1 AS first"), std::string::npos);
+  EXPECT_NE(oss.str().find("7 AS second"), std::string::npos);
+  EXPECT_NE(oss.str().find("FullScan"), std::string::npos);
+}
+
+TEST_F(PlanTest, ProjectionQualifiedColumnValueNames) {
+  // Arrange -- begin context, get Sc1 table and its real statistics
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        ctx.GetStats("Sc1"));
+  auto child = std::make_shared<FullScanPlan>(*tbl, *ts);
+
+  // Act -- project a qualified ColumnValue (auto-named by its column) and an
+  // explicitly renamed column
+  std::vector<NamedExpression> columns;
+  columns.emplace_back(
+      NamedExpression("", ColumnValueExp(ColumnName("Sc1.c1"))));
+  columns.emplace_back(
+      NamedExpression("renamed", ColumnValueExp(ColumnName("Sc1.c2"))));
+  Plan pp(new ProjectionPlan(child, std::move(columns)));
+
+  // Assert -- the schema carries the qualified name / the alias
+  const Schema& sc = pp->GetSchema();
+  EXPECT_EQ(sc.ColumnCount(), 2);
+  EXPECT_EQ(sc.GetColumn(0).Name().ToString(), "Sc1.c1");
+  EXPECT_EQ(sc.GetColumn(0).Name().schema, "Sc1");
+  EXPECT_EQ(sc.GetColumn(1).Name().name, "renamed");
+  EXPECT_EQ(pp->GetStats().Rows(), ts->Rows());
+}
+
+TEST_F(PlanTest, ProjectionEmitExecutorProjectsValues) {
+  // Arrange -- begin context, get Sc1 table and its real statistics
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        ctx.GetStats("Sc1"));
+  auto child = std::make_shared<FullScanPlan>(*tbl, *ts);
+
+  // Act -- project the int column and a constant 5
+  std::vector<NamedExpression> columns;
+  columns.emplace_back(NamedExpression("c1"));
+  columns.emplace_back(NamedExpression("", ConstantValueExp(Value(5))));
+  Plan pp(new ProjectionPlan(child, std::move(columns)));
+
+  // Assert -- each source row becomes a two-column projected row
+  Executor executor = pp->EmitExecutor(ctx);
+  Row result;
+  size_t count = 0;
+  int64_t sum = 0;
+  while (executor->Next(&result, nullptr)) {
+    ASSERT_EQ(result.values_.size(), 2);
+    EXPECT_EQ(result[0].type, ValueType::kInt64);
+    EXPECT_EQ(result[1], Value(5));
+    sum += result[0].value.int_value;
+    ++count;
+  }
+  EXPECT_EQ(count, 6);
+  EXPECT_EQ(sum, 847);  // 12 + 10 + 52 + 242 + 431 + 100
 }
 
 }  // namespace tinylamb

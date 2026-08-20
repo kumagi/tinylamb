@@ -305,6 +305,9 @@ void VMCacheImpl::FixPage(size_t page) const {
           std::scoped_lock lk(queue_lock_);
           if (state == PageState::kEvicted) {
             EnqueueToSmallFifo(&target);
+          } else {
+            std::erase(ghost_queue_, &target);
+            EnqueueToMainFifo(&target);
           }
         }
         Activate(page);
@@ -400,6 +403,7 @@ bool VMCacheImpl::SanityCheck() const {
 }
 
 std::string VMCacheImpl::Dump() const {
+  std::scoped_lock lk(queue_lock_);
   std::stringstream ss;
   ss << "[";
   for (size_t i = 0; i < small_queue_.size(); ++i) {

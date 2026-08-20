@@ -19,13 +19,23 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
+#include <limits>
 #include <memory>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "common/random_string.hpp"
+#include "common/test_util.hpp"
 #include "gtest/gtest.h"
-#include "page_ref.hpp"
+#include "page/page_manager.hpp"
+#include "page/page_ref.hpp"
+#include "recovery/logger.hpp"
+#include "recovery/recovery_manager.hpp"
+#include "transaction/lock_manager.hpp"
+#include "transaction/transaction.hpp"
+#include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
 
@@ -119,6 +129,212 @@ TEST_F(PagePoolTest, PersistencyWithReset) {
       EXPECT_EQ(buff[j], i);
     }
   }
+}
+
+TEST_F(PagePoolTest, PageAccessorsLSNAndChecksum) {
+  // Arrange -- fetch a fresh page from the pool (materialized as a free page)
+  // Act -- read and mutate the Page base-class accessors
+  PageRef page = pp->GetPage(5, nullptr);
+
+  // Assert -- ID/LSN accessors behave as documented
+  ASSERT_EQ(page->PageID(), 5);
+  ASSERT_EQ(page->PageLSN(), 0);
+  ASSERT_EQ(page->RecoveryLSN(), std::numeric_limits<lsn_t>::max());
+  page->SetPageLSN(42);
+  ASSERT_EQ(page->PageLSN(), 42);
+  page->SetRecLSN(17);
+  ASSERT_EQ(page->RecoveryLSN(), 17);
+  page->SetRecLSN(100);  // min() must keep the earlier (smaller) LSN.
+  ASSERT_EQ(page->RecoveryLSN(), 17);
+
+  // Assert -- checksum lifecycle: invalid before SetChecksum, valid after
+  ASSERT_FALSE(page->IsValid());
+  page->SetChecksum();
+  ASSERT_TRUE(page->IsValid());
+}
+
+TEST_F(PagePoolTest, PageInitForEveryPageType) {
+  // Arrange/Act -- construct a Page for every concrete page type
+  for (PageType type : {PageType::kMetaPage, PageType::kRowPage,
+                        PageType::kLeafPage, PageType::kBranchPage,
+                        PageType::kFreePage}) {
+    Page page(7, type);
+
+    // Assert -- header fields initialized by PageInit
+    ASSERT_EQ(page.PageID(), 7);
+    ASSERT_EQ(page.Type(), type);
+    ASSERT_EQ(page.PageLSN(), 0);
+    ASSERT_EQ(page.RecoveryLSN(), std::numeric_limits<lsn_t>::max());
+  }
+  Page unknown(8, PageType::kUnknown);
+  ASSERT_EQ(unknown.Type(), PageType::kUnknown);
+}
+
+TEST_F(PagePoolTest, DumpEveryPageType) {
+  // Act -- stream each page type through Page::Dump
+  std::ostringstream oss;
+  oss << Page(0, PageType::kFreePage);
+  oss << Page(1, PageType::kMetaPage);
+  oss << Page(2, PageType::kRowPage);
+  oss << Page(3, PageType::kLeafPage);
+  oss << Page(4, PageType::kBranchPage);
+  oss << Page(5, PageType::kUnknown);
+
+  // Assert -- the dump labels each page type
+  const std::string dumped = oss.str();
+  EXPECT_NE(dumped.find("FreePage"), std::string::npos);
+  EXPECT_NE(dumped.find("MetaPage"), std::string::npos);
+  EXPECT_NE(dumped.find("RowPage"), std::string::npos);
+  EXPECT_NE(dumped.find("LeafPage"), std::string::npos);
+  EXPECT_NE(dumped.find("BranchPage"), std::string::npos);
+  EXPECT_NE(dumped.find("PID: 0"), std::string::npos);
+  EXPECT_NE(dumped.find("PID: 4"), std::string::npos);
+}
+
+TEST_F(PagePoolTest, PageRowCountOverloads) {
+  // Arrange -- raw pages of each type (Transaction is unused on these paths)
+  Transaction txn;
+  Page row(1, PageType::kRowPage);
+  Page leaf(2, PageType::kLeafPage);
+  Page branch(3, PageType::kBranchPage);
+  Page meta(4, PageType::kMetaPage);
+
+  // Act/Assert -- Transaction-taking overload dispatches on page type
+  ASSERT_EQ(row.RowCount(txn), 0U);
+  ASSERT_EQ(leaf.RowCount(txn), 0U);
+  ASSERT_EQ(branch.RowCount(txn), 0U);
+  EXPECT_THROW(meta.RowCount(txn), std::runtime_error);
+
+  // Act/Assert -- slot_t overload dispatches on page type
+  ASSERT_EQ(row.RowCount(), 0U);
+  ASSERT_EQ(leaf.RowCount(), 0U);
+  ASSERT_EQ(branch.RowCount(), 0U);
+  EXPECT_THROW(meta.RowCount(), std::runtime_error);
+}
+
+TEST_F(PagePoolTest, PageReadKeyAndReadByType) {
+  // Arrange -- raw pages with recovery-style (log-less) payloads
+  Transaction txn;
+  Page row(1, PageType::kRowPage);
+  Page leaf(2, PageType::kLeafPage);
+  leaf.InsertImpl("a", "1");
+  Page branch(3, PageType::kBranchPage);
+  branch.InsertBranchImpl("k", 5);
+  Page meta(4, PageType::kMetaPage);
+
+  // Act/Assert -- ReadKey on a row page reports kUnknown
+  ASSERT_EQ(row.ReadKey(txn, 0).GetStatus(), Status::kUnknown);
+
+  // Act/Assert -- ReadKey on a leaf page returns the key; out-of-range fails
+  ASSERT_EQ(leaf.ReadKey(txn, 0).Value(), "a");
+  ASSERT_EQ(leaf.ReadKey(txn, 1).GetStatus(), Status::kNotExists);
+
+  // Act/Assert -- ReadKey on a branch page returns the stored key
+  ASSERT_EQ(branch.ReadKey(txn, 0).Value(), "k");
+
+  // Act/Assert -- ReadKey on unsupported types throws
+  EXPECT_THROW(meta.ReadKey(txn, 0), std::runtime_error);
+
+  // Act/Assert -- Read(slot) on a leaf page; out-of-range fails
+  ASSERT_EQ(leaf.Read(txn, 0).Value(), "1");
+  ASSERT_EQ(leaf.Read(txn, 1).GetStatus(), Status::kNotExists);
+
+  // Act/Assert -- Read(slot) on an unsupported type throws
+  EXPECT_THROW(meta.Read(txn, 0), std::runtime_error);
+}
+
+TEST_F(PagePoolTest, PageLowestHighestKeyOnEmptyLeaf) {
+  // Arrange -- empty raw leaf page
+  Transaction txn;
+  Page leaf(2, PageType::kLeafPage);
+
+  // Act/Assert -- no lowest/highest key exists on an empty page
+  ASSERT_EQ(leaf.LowestKey(txn).GetStatus(), Status::kNotExists);
+  ASSERT_EQ(leaf.HighestKey(txn).GetStatus(), Status::kNotExists);
+
+  // Act/Assert -- after one insert both endpoints collapse to the key
+  leaf.InsertImpl("a", "1");
+  ASSERT_EQ(leaf.LowestKey(txn).Value(), "a");
+  ASSERT_EQ(leaf.HighestKey(txn).Value(), "a");
+}
+
+TEST_F(PagePoolTest, PageUnsupportedOperationsThrow) {
+  // Arrange -- a row page cannot serve leaf/branch-only operations
+  Transaction txn;
+  Page row(1, PageType::kRowPage);
+  Page other(2, PageType::kLeafPage);
+
+  // Act/Assert -- each unsupported operation throws "Invalid page type"
+  EXPECT_THROW(row.Delete(txn, "key"), std::runtime_error);
+  EXPECT_THROW(row.SetLowFence(txn, IndexKey("a")), std::runtime_error);
+  EXPECT_THROW(row.SetHighFence(txn, IndexKey("z")), std::runtime_error);
+  EXPECT_THROW(row.GetLowFence(txn), std::runtime_error);
+  EXPECT_THROW(row.GetHighFence(txn), std::runtime_error);
+  EXPECT_THROW((void)row.SetFoster(txn, FosterPair("k", 1)),
+               std::runtime_error);
+  EXPECT_THROW((void)row.GetFoster(txn), std::runtime_error);
+  EXPECT_THROW((void)row.MoveRightToFoster(txn, other), std::runtime_error);
+  EXPECT_THROW((void)row.MoveLeftFromFoster(txn, other), std::runtime_error);
+  EXPECT_THROW(row.SetLowFenceImpl(IndexKey("a")), std::runtime_error);
+  EXPECT_THROW(row.SetHighFenceImpl(IndexKey("z")), std::runtime_error);
+  EXPECT_THROW(row.SetFosterImpl(FosterPair("k", 1)), std::runtime_error);
+}
+
+TEST_F(PagePoolTest, PageRefStreamInsertion) {
+  // Arrange -- a live pinned page
+  PageRef page = pp->GetPage(3, nullptr);
+
+  // Act -- stream the PageRef itself
+  std::ostringstream oss;
+  oss << page;
+
+  // Assert -- operator<< prints {Ref: <page_id>}
+  EXPECT_NE(oss.str().find("{Ref: 3}"), std::string::npos);
+}
+
+TEST_F(PagePoolTest, MetaPageAllocateDestroyReuse) {
+  // Arrange -- full page manager + transaction machinery
+  PageManager pm(filename_, kDefaultCapacity);
+  Logger log(filename_ + ".log");
+  LockManager lm;
+  RecoveryManager rm(filename_ + ".log", pm.GetPool());
+  TransactionManager tm(&lm, &pm, &log, &rm);
+
+  // Act 1 -- allocate two pages through the meta page
+  Transaction txn = tm.Begin();
+  PageRef p1 = pm.AllocateNewPage(txn, PageType::kRowPage);
+  PageRef p2 = pm.AllocateNewPage(txn, PageType::kLeafPage);
+  ASSERT_NE(p1->PageID(), p2->PageID());
+
+  // Act 2 -- destroy p2 (turns it into a free page on the free chain)
+  pm.DestroyPage(txn, p2.get());
+  // Release p2's exclusive latch before the pool is asked to relatch it.
+  p2.PageUnlock();
+
+  // Act 3 -- the next allocation must reuse the freed page ID
+  PageRef p3 = pm.AllocateNewPage(txn, PageType::kBranchPage);
+  ASSERT_EQ(p3->PageID(), p2->PageID());
+
+  // Assert -- the meta page tracks the allocated max page count
+  PageRef meta = pm.GetPool()->GetPage(0, nullptr);
+  ASSERT_GE(meta->body.meta_page.MaxPageCountForTest(), p3->PageID());
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(PagePoolTest, EvictionResumesAfterPoolGrewPastCapacity) {
+  std::vector<PageRef> pinned;
+  pinned.reserve(kDefaultCapacity);
+  for (int i = 0; i < kDefaultCapacity; ++i) {
+    pinned.push_back(pp->GetPage(static_cast<page_id_t>(i)));
+  }
+  {
+    PageRef extra = pp->GetPage(kDefaultCapacity);
+    EXPECT_GT(pp->Size(), static_cast<page_id_t>(kDefaultCapacity));
+    pinned.clear();
+  }
+  PageRef newer = pp->GetPage(kDefaultCapacity + 1);
+  EXPECT_LE(pp->Size(), static_cast<page_id_t>(kDefaultCapacity));
+  EXPECT_EQ(newer->PageID(), static_cast<page_id_t>(kDefaultCapacity + 1));
 }
 
 }  // namespace tinylamb

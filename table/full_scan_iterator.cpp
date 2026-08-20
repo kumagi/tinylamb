@@ -73,7 +73,9 @@ void FullScanIterator::SeekVisibleRow() {
       StatusOr<std::string_view> row = (*page_)->Read(*txn_, pos_.slot);
       if (row.HasValue()) {
         DeserializeCurrent(row.Value());
-        if (!txn_->IsReadOnly()) page_.reset();
+        if (!txn_->IsReadOnly()) {
+          page_.reset();
+        }
         return;
       }
       ++pos_.slot;

@@ -120,3 +120,150 @@ Completed queries: **17 / 22**. Crashes: Q8, Q9, Q12, Q13, Q22.
 3. TPC-H: DATE filters on `lineitem`/`orders` (Q1 empty after a full scan).
 4. TPC-H: crashes on Q8, Q9, Q12, Q13, Q22; plan `Dump()` must not crash after
    a successful query.
+
+## 2026-08-20 — after SF=2 OLTP backlog
+
+- **When:** 2026-08-20 04:52–04:58 JST
+- **Tree:** `cc204ea` plus uncommitted TPC-C work (statistics split across
+  B+tree keys, IndexScan no longer gated on pending writers, Stock-Level
+  rewritten onto `order_line_pk`/`stock_pk`, read-only Order-Status and
+  Stock-Level, DataChunk schema reset, per-warehouse load, ~2 GiB page pool,
+  sharded SQL template cache, hoisted Cascades defaults)
+- **Build:** `build-rel`, `CMAKE_BUILD_TYPE=Release`, sanitizers off
+- **Host:** AMD Ryzen 9 9950X3D (16 cores / 32 threads), 59 GiB RAM, NVMe
+- **Binary:** `build-rel/tinylamb_tpcc_benchmark`
+- **Seed:** `20260819` (same as the morning SF=1 snapshot)
+
+Think/keying time omitted (`tpmc_compliant=false`). Official Clause 4.3
+population. Driver exit status 3 means `engine_aborted_transactions > 0`, not
+a crash.
+
+### TPC-C SF=1, 1 client, warmup 2 s, 60 s
+
+Direct repeat of the 00:58 JST run (`--clients 1 --warmup 2 --seconds 60`).
+
+Load+verify finished well inside the 67 s wall (fixture is no longer one giant
+transaction). Verification: New-Order 38, Payment 7, Order-Status 3, Delivery
+70, Stock-Level **193** (was 2: `IN (subquery)` became last-20 `order_line`
+plus per-item `stock` probes). Peak RSS 444 MiB. Files: `.db` 224 MiB, WAL 469
+MiB.
+
+| Metric | 00:58 JST | this run |
+| --- | ---: | ---: |
+| `tps` | 0.283 | **821.1** |
+| `sql_qps` | 8.15 | **27466** |
+| `new_order_tpm` | 9.0 | **23047** |
+| New-Order latency | 6307 ms (9 committed) | **1.10 ms** (23047 committed, 210 user rollback) |
+| Payment latency | 5.1 ms (7) | **0.26 ms** (22143) |
+| Order-Status latency | 0 in sample | **8.72 ms** (2003) |
+| Delivery latency | 0 in sample | 1.10 ms (**0 committed / 2080 attempted**) |
+| Stock-Level latency | 857 ms (1) | **4.30 ms** (2073) |
+| Mix | `short_interval` (17 txns) | `short_interval` (payment 43.0%, order-status 3.90%) |
+| RSS | 570 MiB | 444 MiB |
+| Wall including load | 75.5 s | 67.5 s |
+
+`new_order_tpm` is still not tpmC (no think/keying, 1 terminal, mix not
+Clause 5.4.2). The ~2500× New-Order jump matches the intended work: table
+stats are used, IndexScan stays an index scan for a lone writer, and
+Stock-Level is no longer a 100 k-row `stock` full scan.
+
+Delivery is the remaining 1-client abort: every measurement Delivery fails
+with `delivery queue delete affected too few rows`. Verify-only Delivery
+passes, so the queue is readable just after load. The mix then does tens of
+thousands of New-Orders and zero successful Deliveries, which points at
+SELECT-then-DELETE on `new_order` not agreeing (plan/visibility), not at an
+empty queue after drain.
+
+### TPC-C SF=1, 10 clients (regulation default), warmup 2 s, 10 s
+
+Previously this aborted (`Cannot parse without type` / `data chunk row width
+mismatch`). This run **completed**. Peak RSS 506 MiB. CPU 354%. Exit 3.
+
+| Metric | Value |
+| --- | ---: |
+| `tps` | 6.90 |
+| `sql_qps` | 232.9 |
+| `new_order_tpm` | **198** |
+| New-Order | 1101 ms (33/33 committed) |
+| Payment | 1.12 ms (31/31) |
+| Order-Status | 3.67 ms (2/2) |
+| Delivery | 719 ms (1/3 committed) |
+| Stock-Level | 25.2 ms (2/2) |
+| engine aborts | 2 |
+| `first_error` | `invalid page type` |
+
+Ten terminals no longer fall over on chunk typing, but New-Order is ~1000×
+slower than the 1-client path (1.1 s vs 1.1 ms). `invalid page type` is a
+buffer-pool / latch bug under concurrent pins, not mix logic. Throughput does
+not scale with clients.
+
+### TPC-C SF=2, 1 client, warmup 2 s, 60 s
+
+Same seed. Verification identical in statement counts. Peak RSS 582 MiB.
+Files: `.db` 355 MiB, WAL 701 MiB. Wall 77.2 s.
+
+| Metric | SF=1 1c | SF=2 1c |
+| --- | ---: | ---: |
+| `tps` | 821.1 | **781.3** |
+| `sql_qps` | 27466 | 26716 |
+| `new_order_tpm` | 23047 | **22057** |
+| New-Order latency | 1.10 ms | **1.12 ms** |
+| Payment | 0.26 ms | 0.27 ms |
+| Order-Status | 8.72 ms | 8.39 ms |
+| Stock-Level | 4.30 ms | 4.45 ms |
+| Delivery committed | 0/2080 | 0/2004 |
+| engine aborts | 2137 | 2069 |
+
+SF=2 is essentially the SF=1 1-client curve. Warehouse-local point lookups
+are not scanning the extra warehouse. Delivery still commits nothing.
+
+### TPC-C SF=2, 20 clients (milestone shape), warmup 2 s, 60 s
+
+Did not crash. Peak RSS 1011 MiB. CPU 1034% (user 849 s + sys 209 s in 102 s
+wall). Voluntary context switches 28.3 M. Exit 3.
+
+| Metric | Value |
+| --- | ---: |
+| `tps` | 3.40 |
+| `sql_qps` | 108.6 |
+| `new_order_tpm` | **99** |
+| New-Order | 8604 ms (99 committed / 105 attempted) |
+| Payment | 2.33 ms (88/88) |
+| Order-Status | 541 ms (10/10) |
+| Delivery | 4177 ms (1/5 committed) |
+| Stock-Level | 22.1 ms (6/6) |
+| engine aborts | 10 |
+| `first_error` | `new-order stock update affected too few rows` |
+
+The SF=2 / 20-terminal / 60 s / zero engine-abort milestone is **not** met
+(10 engine aborts, New-Order ~8.6 s). Payment stays ~2 ms, so unique PK
+updates on `warehouse`/`district`/`customer` are fine; New-Order and
+Order-Status blow up once many writers share the pool and row locks. The
+syscall/context-switch ratio is a latch or lock convoy, not SQL parse.
+
+### Notes
+
+- 1-client New-Order/Stock-Level are in the right order of magnitude for an
+  in-process OLTP prototype (1 ms / 4 ms). Do not treat 23000 `new_order_tpm`
+  as tpmC.
+- Stock-Level statement count 193 at verify is expected: 1 district + 1
+  `order_line` range + ~191 `stock` probes for distinct items in the last 20
+  orders. Average runtime 4 ms says those probes hit `stock_pk`.
+- Multi-client survival is new; multi-client speed is not. Next limiter is
+  concurrent page validity (`invalid page type`) and New-Order/Delivery row
+  updates that report 0 rows under contention, plus the 1-client Delivery
+  DELETE mismatch.
+- WAL is still ~2× the `.db` file after a 60 s run (group commit helps fsync
+  count, not log volume).
+
+### What to fix next (from this snapshot)
+
+1. TPC-C Delivery: `new_order` SELECT MIN vs DELETE must affect the same row
+   on a single terminal (0/2000+ committed in the 1-client mix).
+2. TPC-C multi-client: `invalid page type` and New-Order latency (1 ms → 1–8 s
+   at 10–20 terminals). Page latch / pin / eviction under the 2 GiB pool.
+3. TPC-C: engine abort on `stock update affected too few rows` at 20
+   terminals; lock wait vs lost update.
+4. TPC-H leftovers from the morning snapshot (DATE filters, Q8/Q9/Q12/Q13/Q22
+   crashes) were not remeasured here.
+

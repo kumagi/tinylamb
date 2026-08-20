@@ -82,7 +82,7 @@ Schema IndexOnlyScanPlan::OutputSchema() const {
 }
 
 Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& ctx) const {
-  if (ctx.txn_.RequiresHistoricalRead()) {
+  if (ctx.txn_.IndexKeysMayBeStale()) {
     Executor executor = std::make_shared<FullScan>(ctx.txn_, table_);
     executor = std::make_shared<Selection>(where_, table_.GetSchema(),
                                            std::move(executor));

@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -130,6 +131,98 @@ TEST_F(LSMViewTest, ConstructEmptyRunIsSafe) {
   SortedRun::Construct(filepath, empty, *blob_, 0);
   SortedRun run(filepath);
   EXPECT_EQ(run.Size(), 0);
+}
+
+TEST_F(LSMViewTest, DuplicateKeyAcrossTwoRunsIteratorExhausts) {
+  // Two runs hold the SAME key: an older run {k:"a"} and a newer run
+  // {k:"b"}.  The heap build in LSMView::Iterator::Iterator() sees the equal
+  // keys and advances the older run's iterator past its only entry, leaving an
+  // INVALID SortedRun::Iterator in the heap.  remaining_iters_ is still 2, so
+  // after the first (and only) entry the view reports IsValid() even though
+  // iters_[0] points past the end of its run.  The next operator++/Key() then
+  // touches the exhausted iterator:
+  //   SortedRun::Iterator::Key() ... Assertion `IsValid()' failed.
+  // The fuzzer finds this with a two-run input sharing one key; it must yield
+  // exactly one merged entry and then exhaust cleanly.
+  std::map<std::string, LSMValue> old_run;
+  old_run.emplace("k", LSMValue("a"));
+  SortedRun::Construct(path_ / "old.idx", old_run, *blob_, 10);
+  std::map<std::string, LSMValue> new_run;
+  new_run.emplace("k", LSMValue("b"));
+  SortedRun::Construct(path_ / "new.idx", new_run, *blob_, 11);
+
+  std::vector<std::filesystem::path> files{path_ / "new.idx",
+                                           path_ / "old.idx"};
+  LSMView view(*blob_, files);
+  auto iter = view.Begin();
+  ASSERT_TRUE(iter.IsValid());
+  EXPECT_EQ(iter.Key(), "k");
+  EXPECT_EQ(iter.Value(), "b");
+  ++iter;
+  EXPECT_FALSE(iter.IsValid());
+}
+
+TEST_F(LSMViewTest, MergeSkipsDuplicateAndKeepsOrder) {
+  // Three runs: the oldest holds {a:"1", k:"x"}, the two newer runs hold the
+  // duplicate key {k:"y"} and {k:"z"}.  During the heap build the two newer
+  // runs' duplicate "k" entries cause the older run's iterator to be advanced
+  // past its entry, but only *after* it has already been compared against an
+  // invalidated heap slot.  SortedRun::Iterator::Compare() then dereferences
+  // the invalid slot (offset == size), reading garbage, so the k-way heap is
+  // ordered wrongly and the merge emits "k" ahead of the smaller key "a":
+  //   Try FATAL - key mismatch k vs a
+  // The correct order is a:"1", then k:"z".
+  std::map<std::string, LSMValue> old_run;
+  old_run.emplace("a", LSMValue("1"));
+  old_run.emplace("k", LSMValue("x"));
+  SortedRun::Construct(path_ / "old.idx", old_run, *blob_, 10);
+  std::map<std::string, LSMValue> mid_run;
+  mid_run.emplace("k", LSMValue("y"));
+  SortedRun::Construct(path_ / "mid.idx", mid_run, *blob_, 11);
+  std::map<std::string, LSMValue> new_run;
+  new_run.emplace("k", LSMValue("z"));
+  SortedRun::Construct(path_ / "new.idx", new_run, *blob_, 12);
+
+  std::vector<std::filesystem::path> files{path_ / "new.idx",
+                                           path_ / "mid.idx",
+                                           path_ / "old.idx"};
+  LSMView view(*blob_, files);
+  auto iter = view.Begin();
+  ASSERT_TRUE(iter.IsValid());
+  EXPECT_EQ(iter.Key(), "a");
+  EXPECT_EQ(iter.Value(), "1");
+  ++iter;
+  ASSERT_TRUE(iter.IsValid());
+  EXPECT_EQ(iter.Key(), "k");
+  EXPECT_EQ(iter.Value(), "z");
+  ++iter;
+  EXPECT_FALSE(iter.IsValid());
+}
+
+TEST_F(LSMViewTest, FindEmptyKeySkipsEmptyRun) {
+  // A view holding a real entry "" -> "\x05\x05" and a NEWER run that is
+  // legitimately empty (SortedRun::Construct on an empty map produces a valid
+  // empty run) defeats LSMView::Find.  SortedRun::Find (sorted_run.cpp:302)
+  // guards only the key range [min_key_, max_key_]; for an empty run both
+  // bounds are "" so ANY key passes, then the binary search assumes
+  // length_ >= 1 and reads GetEntry(0) past the end of the zero-entry index:
+  //   left = 0; right = 0;  while (1 < abs(0)) {}  // body never runs
+  //   Entry left_entry = GetEntry(0);              // OOB read
+  // The garbage entry Compare()s equal to "" here, so Find returns its bogus
+  // payload ("") instead of the real "\x05\x05" from the older run.  The
+  // fuzzer hits this with an 8-byte input: one store on "" followed by a
+  // second file whose byte stream runs dry before its first entry.
+  std::map<std::string, LSMValue> mem_value;
+  mem_value.emplace("", LSMValue("\x05\x05"));
+  SortedRun::Construct(path_ / "data.idx", mem_value, *blob_, 0);
+  std::map<std::string, LSMValue> empty;
+  SortedRun::Construct(path_ / "empty.idx", empty, *blob_, 1);
+
+  std::vector<std::filesystem::path> files{path_ / "empty.idx",
+                                           path_ / "data.idx"};
+  LSMView view(*blob_, files);
+  StatusOr<std::string> result = view.Find("");
+  ASSERT_SUCCESS_AND_EQ(result, "\x05\x05");
 }
 
 TEST_F(LSMViewTest, Merged) {
@@ -334,5 +427,75 @@ TEST_F(LSMViewTest, DeleteOverWriteScan) {
     }
     ++iter;
   }
+}
+
+TEST_F(LSMViewTest, IteratorEquality) {
+  // Arrange -- two fresh iterators over the same view
+  LSMView::Iterator first = view_->Begin();
+  LSMView::Iterator second = view_->Begin();
+  ASSERT_TRUE(first.IsValid());
+  ASSERT_TRUE(second.IsValid());
+
+  // Act -- compare them, then advance one
+  // Assert -- identical views/offsets compare equal, then differ after ++
+  ASSERT_TRUE(first == second);
+  ++first;
+  ASSERT_FALSE(first == second);
+}
+
+TEST_F(LSMViewTest, IteratorGetEntry) {
+  // Arrange -- begin iteration over the fixture view
+  LSMView::Iterator iter = view_->Begin();
+  ASSERT_TRUE(iter.IsValid());
+
+  // Act -- fetch the raw entry behind the top heap slot
+  SortedRun::Entry entry = iter.GetEntry();
+
+  // Assert -- the entry is live (not a tombstone) and matches the view key
+  ASSERT_FALSE(entry.IsDeleted());
+  ASSERT_EQ(iter.Key(), std::string("0"));
+  ASSERT_EQ(iter.Value(), std::string("0"));
+}
+
+TEST_F(LSMViewTest, IteratorStreamOperator) {
+  // Arrange -- begin iteration over the fixture view
+  LSMView::Iterator iter = view_->Begin();
+  ASSERT_TRUE(iter.IsValid());
+
+  // Act -- stream the iterator
+  std::stringstream ss;
+  ss << iter;
+  std::string dumped = ss.str();
+
+  // Assert -- the dump names the run index and the generation
+  EXPECT_NE(dumped.find("[0]"), std::string::npos);
+  EXPECT_NE(dumped.find("@"), std::string::npos);
+}
+
+TEST_F(LSMViewTest, ViewStreamOperator) {
+  // Arrange -- the fixture view holds 10 runs of 100 entries each
+  // Act -- stream the whole view
+  std::stringstream ss;
+  ss << *view_;
+  std::string dumped = ss.str();
+
+  // Assert -- every run's key range and entry count are printed
+  EXPECT_NE(dumped.find("key range:"), std::string::npos);
+  EXPECT_NE(dumped.find("Entries: 100"), std::string::npos);
+}
+
+TEST_F(LSMViewTest, CreateSingleRunOnEmptyView) {
+  // Arrange -- a view backed by no sorted runs
+  LSMView empty_view(*blob_, std::vector<std::filesystem::path>{});
+  std::filesystem::path merged_file = path_ / "empty_merged.idx";
+
+  // Act -- merge the (empty) view into a single run
+  empty_view.CreateSingleRun(merged_file);
+  SortedRun merged(merged_file);
+
+  // Assert -- the merged run is a valid empty run
+  EXPECT_EQ(merged.Size(), 0);
+  SortedRun::Iterator iter = merged.Begin(*blob_);
+  EXPECT_FALSE(iter.IsValid());
 }
 }  // namespace tinylamb

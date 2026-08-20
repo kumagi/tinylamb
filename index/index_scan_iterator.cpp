@@ -133,6 +133,11 @@ void IndexScanIterator::UpdateIteratorState() {
     include_ = rp.include;
   } else {
     auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
+    if (val.empty() || value_offset_ < 0 ||
+        static_cast<size_t>(value_offset_) >= val.size()) {
+      Clear();
+      return;
+    }
     const Table::IndexValueType& row_value = val[value_offset_];
     pos_ = row_value.pos;
     include_ = row_value.include;
@@ -157,6 +162,21 @@ void IndexScanIterator::ResolveRow() const {
 
 IteratorBase& IndexScanIterator::operator++() {
   current_row_resolved_ = false;
+  if (!ascending_) {
+    if (is_unique_) {
+      --iter_;
+    } else if (0 < value_offset_) {
+      --value_offset_;
+    } else {
+      --iter_;
+      if (iter_.IsValid()) {
+        auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
+        value_offset_ = static_cast<int>(val.size()) - 1;
+      }
+    }
+    UpdateIteratorState();
+    return *this;
+  }
   if (is_unique_) {
     ++iter_;
   } else {

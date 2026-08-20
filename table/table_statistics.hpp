@@ -147,6 +147,9 @@ class TableStatistics {
   void Concat(const TableStatistics& rhs);
   TableStatistics operator*(size_t multiplier) const;
 
+  // Rebuild from per-column catalog entries. Missing columns stay default.
+  void Assign(size_t rows, std::vector<ColumnStats> columns);
+
   friend Encoder& operator<<(Encoder& encoder, const TableStatistics& stats);
   friend Decoder& operator>>(Decoder& decoder, TableStatistics& stats);
   friend std::ostream& operator<<(std::ostream& out,

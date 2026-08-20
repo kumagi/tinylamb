@@ -105,8 +105,19 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
     }
   }
   ref.PageUnlock();
-  for (const auto& idx : indexes_) {
-    RETURN_IF_FAIL(IndexInsert(txn, idx, row, rp));
+  for (size_t i = 0; i < indexes_.size(); ++i) {
+    const Status status = IndexInsert(txn, indexes_[i], row, rp);
+    if (status != Status::kSuccess) {
+      // A rejected insert (e.g. a unique-key violation) must be atomic: undo
+      // the index entries added before the failing one and remove the row
+      // that was already written to the row page.
+      for (size_t j = 0; j < i; ++j) {
+        std::ignore = IndexDelete(txn, indexes_[j], rp);
+      }
+      PageRef written = txn.GetPageManager()->GetPage(rp.page_id);
+      std::ignore = written->Delete(txn, rp.slot);
+      return status;
+    }
   }
   return rp;
 }

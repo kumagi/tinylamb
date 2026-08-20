@@ -722,8 +722,10 @@ void CollectStatementColumns(const SelectStatement& statement,
 }
 
 std::vector<slot_t> RequiredColumns(const SelectStatement& statement,
-                                    const Schema& schema) {
+                                    const Schema& schema,
+                                    bool ignore_star = false) {
   const bool selects_star =
+      !ignore_star &&
       std::any_of(statement.SelectList().begin(), statement.SelectList().end(),
                   [](const NamedExpression& projection) {
                     return projection.expression->Type() ==
@@ -1620,9 +1622,49 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
   if (cached != active_runtime->correlated_indexes.end()) {
     index = cached->second.get();
   } else {
+    const SelectSource& from = statement.Sources()[0];
+    Schema peek_schema;
+    if (statement.Sources().size() == 1 && !from.query && !from.table.empty()) {
+      StatusOr<std::shared_ptr<Table>> table = context.GetTable(from.table);
+      if (table.HasValue()) peek_schema = table.Value()->GetSchema();
+    }
+    auto has_correlated_equality = [&](const Schema& schema) {
+      if (schema.ColumnCount() == 0) return false;
+      for (const Expression& predicate :
+           SplitConjuncts(statement.WhereClause())) {
+        if (predicate->Type() != TypeTag::kBinaryExp) continue;
+        const BinaryExpression& binary = predicate->AsBinaryExpression();
+        if (binary.Op() != BinaryOperation::kEquals ||
+            binary.Left()->Type() != TypeTag::kColumnValue ||
+            binary.Right()->Type() != TypeTag::kColumnValue) {
+          continue;
+        }
+        const ColumnName& left =
+            binary.Left()->AsColumnValue().GetColumnName();
+        const ColumnName& right =
+            binary.Right()->AsColumnValue().GetColumnName();
+        const auto left_local = LocalColumnOffset(schema, left);
+        const auto right_local = LocalColumnOffset(schema, right);
+        if ((left_local && !right_local) || (right_local && !left_local)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    if (statement.Sources().size() == 1 && peek_schema.ColumnCount() > 0 &&
+        !has_correlated_equality(peek_schema)) {
+      active_runtime->unindexable_queries.insert(&statement);
+      return std::nullopt;
+    }
     Relation source;
     if (statement.Sources().size() == 1) {
-      source = LoadSource(context, statement.Sources()[0], &outer, ctes);
+      std::vector<slot_t> projection;
+      if (peek_schema.ColumnCount() > 0) {
+        projection = RequiredColumns(statement, peek_schema, true);
+        if (projection.empty()) projection.push_back(0);
+      }
+      source = LoadSource(context, from, &outer, ctes,
+                          projection.empty() ? nullptr : &projection);
     } else {
       bool predicates_applied = false;
       source =

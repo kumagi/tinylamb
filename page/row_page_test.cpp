@@ -382,4 +382,185 @@ TEST_F(RowPageTest, UpdateAndDeleteHeavy) {
     ASSERT_EQ(rows[i], row);
   }
 }
+
+// Regression test for a heap-buffer-overflow in RowPage::UpdateRow
+// (page/row_page.cpp:153) reached through the crash-recovery undo path.
+//
+// Scenario:
+//   1. The page is filled near capacity with committed 2000-byte rows.
+//   2. Transaction T1 (never committed) shrinks slot 0 from 2000 to 100
+//      bytes, freeing ~1900 bytes.
+//   3. Transaction T2 (committed) inserts a ~1900-byte row into the freed
+//      space.
+//   4. The database "crashes" and is recovered via RecoverFrom().
+//
+// Recovery replays the log and then rolls back the uncommitted T1.  Rolling
+// back the shrink calls Page::UpdateImpl -> RowPage::UpdateRow with the old
+// 2000-byte value, but T2's committed row is still live so the page no longer
+// has room for it.  UpdateRow has no space check on this path (unlike the
+// guarded RowPage::Update): free_ptr_ is driven below the slot array and the
+// memcpy at row_page.cpp:153 writes out of bounds, corrupting the slot array
+// and, for large records, overflowing the page heap allocation.
+TEST_F(RowPageTest, RecoveryUndoOfUncommittedShrinkDoesNotCorruptPage) {
+  // Arrange -- fill the page near capacity with committed 2000-byte rows.
+  for (int i = 0; i < 16; ++i) {
+    ASSERT_TRUE(InsertRow(std::string(2000, 'a')));
+  }
+
+  // Act 1 -- an uncommitted transaction shrinks slot 0, freeing ~1900 bytes.
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_SUCCESS(page->Update(txn, 0, std::string(100, 'b')));
+    page.PageUnlock();
+    // Deliberately never commit or abort: recovery must roll it back.
+  }
+
+  // Act 2 -- a second, committed transaction consumes the freed space.
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(page_id_);
+    StatusOr<slot_t> slot = page->Insert(txn, std::string(1900, 'c'));
+    ASSERT_SUCCESS(slot.GetStatus());
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+
+  // Act 3 -- flush the page image, then crash and recover from the log.
+  Flush();
+  Recover();
+  ASSERT_NO_FATAL_FAILURE(r_->RecoverFrom(0, tm_.get()));
+
+  // Assert -- the page layout must stay intact: free_ptr_ never drops below
+  // the slot array end, every live row must sit fully inside the page body,
+  // and the row that T1 shrank must still be readable.
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(page_id_);
+  const RowPage& rp = page.GetRowPage();
+  const char* const body = reinterpret_cast<const char*>(&rp);
+  const char* const slot_array_end =
+      body + sizeof(RowPage) + rp.RowMax() * sizeof(RowPointer);
+  EXPECT_GE(body + rp.FreePtrForTest(), slot_array_end);
+  for (slot_t i = 0; i < rp.RowMax(); ++i) {
+    if (rp.rows_[i].offset == 0) {
+      continue;
+    }
+    const char* const row = body + rp.rows_[i].offset;
+    EXPECT_GE(row, slot_array_end);
+    EXPECT_LE(row + rp.rows_[i].size, body + kPageBodySize);
+  }
+  page.PageUnlock();
+  EXPECT_EQ(ReadRow(0), std::string(2000, 'a'));
+}
+
+// Regression test for the sibling heap-buffer-overflow in RowPage::InsertRow
+// (page/row_page.cpp:103) reached through the crash-recovery undo path.
+//
+// Same root cause as RecoveryUndoOfUncommittedShrinkDoesNotCorruptPage, but
+// through the delete path: an uncommitted DELETE frees slot 0, a committed
+// transaction consumes the freed space, and recovery then rolls the delete
+// back by re-inserting the old 2000-byte row via Page::InsertImpl.  InsertRow
+// has no space check on this path (unlike the guarded RowPage::Insert), so
+// free_ptr_ is driven below the slot array and the memcpy at row_page.cpp:103
+// writes out of bounds.
+TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
+  // Arrange -- fill the page near capacity with committed 2000-byte rows.
+  for (int i = 0; i < 16; ++i) {
+    ASSERT_TRUE(InsertRow(std::string(2000, 'a')));
+  }
+
+  // Act 1 -- an uncommitted transaction deletes slot 0, freeing 2000 bytes.
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_SUCCESS(page->Delete(txn, 0));
+    page.PageUnlock();
+    // Deliberately never commit or abort: recovery must roll it back.
+  }
+
+  // Act 2 -- a second, committed transaction grows a different row (slot 15,
+  // a position txn 1 does not lock) to consume the freed ~1900 bytes.
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_SUCCESS(page->Update(txn, 15, std::string(3900, 'c')));
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+
+  // Act 3 -- flush the page image, then crash and recover from the log.
+  Flush();
+  Recover();
+  ASSERT_NO_FATAL_FAILURE(r_->RecoverFrom(0, tm_.get()));
+
+  // Assert -- the page layout must stay intact: free_ptr_ never drops below
+  // the slot array end, every live row must sit fully inside the page body,
+  // and the deleted row must still be readable after the rollback.
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(page_id_);
+  const RowPage& rp = page.GetRowPage();
+  const char* const body = reinterpret_cast<const char*>(&rp);
+  const char* const slot_array_end =
+      body + sizeof(RowPage) + rp.RowMax() * sizeof(RowPointer);
+  EXPECT_GE(body + rp.FreePtrForTest(), slot_array_end);
+  for (slot_t i = 0; i < rp.RowMax(); ++i) {
+    if (rp.rows_[i].offset == 0) {
+      continue;
+    }
+    const char* const row = body + rp.rows_[i].offset;
+    EXPECT_GE(row, slot_array_end);
+    EXPECT_LE(row + rp.rows_[i].size, body + kPageBodySize);
+  }
+  page.PageUnlock();
+  EXPECT_EQ(ReadRow(0), std::string(2000, 'a'));
+}
+
+TEST_F(RowPageTest, UpdateAndDeleteOutOfRangeSlot) {
+  // Arrange -- a fresh, empty row page
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(page_id_);
+
+  // Act/Assert -- updating a non-existent slot reports kNotExists
+  ASSERT_EQ(page->Update(txn, 0, "x"), Status::kNotExists);
+
+  // Act/Assert -- deleting a non-existent slot reports kNotExists
+  ASSERT_EQ(page->Delete(txn, 0), Status::kNotExists);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(RowPageTest, ReadOnlyTransactionRejectedForWrites) {
+  // Arrange -- a read-only transaction cannot acquire write locks
+  auto txn = tm_->Begin(true);
+  PageRef page = p_->GetPage(page_id_);
+
+  // Act/Assert -- insert conflicts on a read-only transaction
+  ASSERT_EQ(page->Insert(txn, "hello").GetStatus(), Status::kConflicts);
+
+  // Act/Assert -- update conflicts on a read-only transaction
+  ASSERT_EQ(page->Update(txn, 0, "world"), Status::kConflicts);
+
+  // Act/Assert -- delete conflicts on a read-only transaction
+  ASSERT_EQ(page->Delete(txn, 0), Status::kConflicts);
+}
+
+TEST_F(RowPageTest, DeFragmentAndDump) {
+  // Arrange -- populate the page then leave a hole via delete
+  auto txn = tm_->Begin();
+  PageRef page = p_->GetPage(page_id_);
+  ASSERT_SUCCESS(page->Insert(txn, "row0").GetStatus());
+  ASSERT_SUCCESS(page->Insert(txn, "row1").GetStatus());
+  ASSERT_SUCCESS(page->Delete(txn, 0));
+
+  // Act -- compact the free space with the public DeFragment() entry point
+  page->body.row_page.DeFragment();
+  ASSERT_EQ(page->RowCount(), 1U);
+
+  // Act -- stream the page through the Dump path
+  std::ostringstream oss;
+  oss << *page;
+
+  // Assert -- the dump renders the page header and surviving row
+  const std::string dumped = oss.str();
+  EXPECT_NE(dumped.find("Rows: 1"), std::string::npos);
+  EXPECT_NE(dumped.find("row1"), std::string::npos);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
 }  // namespace tinylamb

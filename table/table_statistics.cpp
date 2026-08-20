@@ -739,6 +739,11 @@ void TableStatistics::Concat(const TableStatistics& rhs) {
   stats_.insert(stats_.end(), rhs.stats_.begin(), rhs.stats_.end());
 }
 
+void TableStatistics::Assign(size_t rows, std::vector<ColumnStats> columns) {
+  row_count_ = rows;
+  stats_ = std::move(columns);
+}
+
 TableStatistics TableStatistics::operator*(size_t multiplier) const {
   TableStatistics result(*this);
   result.row_count_ = ScaleCount(result.row_count_, multiplier);

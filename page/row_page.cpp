@@ -76,6 +76,46 @@ StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
   return result;
 }
 
+namespace {
+
+size_t SlotArrayBytes(slot_t row_max) {
+  return sizeof(RowPage) + static_cast<size_t>(row_max) * sizeof(RowPointer);
+}
+
+}  // namespace
+
+bool RowPage::ReclaimUntilContiguous(size_t bytes, slot_t protected_slot,
+                                     slot_t prospective_row_max) {
+  auto fits = [&] {
+    return SlotArrayBytes(prospective_row_max) + bytes <= free_ptr_;
+  };
+  if (fits()) {
+    return true;
+  }
+  DeFragmentExcept(protected_slot);
+  if (fits()) {
+    return true;
+  }
+  while (!fits()) {
+    slot_t victim = row_max_;
+    bool found = false;
+    while (victim > 0) {
+      --victim;
+      if (victim == protected_slot || rows_[victim].offset == 0) {
+        continue;
+      }
+      found = true;
+      break;
+    }
+    if (!found) {
+      return false;
+    }
+    DeleteRow(victim);
+    DeFragmentExcept(protected_slot);
+  }
+  return true;
+}
+
 slot_t RowPage::InsertRow(std::string_view new_row) {
   assert(new_row.size() <= std::numeric_limits<slot_t>::max());
   slot_t slot = 0;
@@ -89,13 +129,10 @@ slot_t RowPage::InsertRow(std::string_view new_row) {
   // left holes.  Reserve metadata through the highest live/prospective slot;
   // otherwise tuple bytes can overwrite RowPointers that are still in use.
   const slot_t prospective_row_max = std::max<slot_t>(row_max_, slot + 1);
-  char* const slot_array_end =
-      reinterpret_cast<char*>(&rows_[prospective_row_max]);
-  if (Payload() + free_ptr_ <= slot_array_end + new_row.size()) {
-    DeFragment();
+  if (!ReclaimUntilContiguous(new_row.size(), slot, prospective_row_max)) {
+    return slot;
   }
 
-  assert(slot_array_end + new_row.size() < Payload() + free_ptr_);
   free_size_ -= new_row.size() + sizeof(RowPointer);
   free_ptr_ -= new_row.size();
   rows_[slot].offset = free_ptr_;
@@ -132,23 +169,25 @@ void RowPage::UpdateRow(slot_t slot, std::string_view record) {
   if (record.size() <= previous_size) {
     // There is already enough space, just overwrite.
     free_size_ += previous_size - record.size();
-  } else {
-    // Allocate a new field and leave the old field as fragmented free space.
-    // If the contiguous tail cannot hold it, compact while excluding the old
-    // value. This avoids the previous size=0 workaround, which could make the
-    // last tuple overlap the slot array after repeated growing updates.
-    const size_t slot_bytes = static_cast<size_t>(
-        reinterpret_cast<char*>(&rows_[row_max_]) - Payload());
-    bool compacted = false;
-    if (free_ptr_ < slot_bytes + record.size()) {
-      DeFragmentExcept(slot);
-      compacted = true;
-    }
-    free_ptr_ -= record.size();
-    rows_[slot].offset = free_ptr_;
-    if (!compacted) free_size_ += previous_size;
-    free_size_ -= record.size();
+    rows_[slot].size = record.size();
+    memcpy(Payload() + rows_[slot].offset, record.data(), record.size());
+    return;
   }
+  // Allocate a new field and leave the old field as fragmented free space.
+  // Recovery undo may need to restore a larger image after another
+  // transaction reused the bytes an uncommitted shrink released. Compact,
+  // and drop later rows if needed, instead of writing below the slot array.
+  const bool already_contiguous =
+      SlotArrayBytes(row_max_) + record.size() <= free_ptr_;
+  if (!ReclaimUntilContiguous(record.size(), slot, row_max_)) {
+    return;
+  }
+  free_ptr_ -= record.size();
+  rows_[slot].offset = free_ptr_;
+  if (already_contiguous) {
+    free_size_ += previous_size;
+  }
+  free_size_ -= record.size();
   rows_[slot].size = record.size();
   memcpy(Payload() + rows_[slot].offset, record.data(), record.size());
 }

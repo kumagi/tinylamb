@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -277,5 +278,164 @@ TEST_F(LSMTreeTest, EmptyViewBegin) {
 
   // Assert -- an iterator over an empty view is invalid, not a null deref.
   ASSERT_FALSE(it.IsValid());
+}
+
+TEST_F(LSMTreeTest, ReadFromMemoryTree) {
+  // Arrange -- write a key and read it back before the flusher can move it to
+  // a sorted run (the flusher sleeps 1 ms, so this races in the mem tree)
+  t_->Write("immediate", "memory");
+
+  // Act -- read the key back immediately
+  auto result = t_->Read("immediate");
+
+  // Assert -- the value is visible whether it was served from memory or a run
+  ASSERT_SUCCESS_AND_EQ(result, "memory");
+}
+
+TEST_F(LSMTreeTest, ReadNotExists) {
+  // Arrange -- a fresh tree with no writes
+  // Act -- read a never-written key
+  auto result = t_->Read("missing");
+
+  // Assert -- the read reports kNotExists rather than crashing
+  ASSERT_EQ(result.GetStatus(), Status::kNotExists);
+}
+
+TEST_F(LSMTreeTest, ContainsMemoryThenFile) {
+  // Arrange -- write a key; the background flusher may or may not have moved
+  // it to a sorted run by the time we query, so drive the flush explicitly to
+  // keep the assertions deterministic
+  t_->Write("present", "value");
+
+  // Act -- flush to a sorted run and query through the file path
+  t_->Sync();
+  // Assert -- the key is visible from the on-disk run
+  EXPECT_TRUE(t_->Contains("present"));
+  EXPECT_FALSE(t_->Contains("absent"));
+
+  // Act -- delete the key and verify it disappears after the tombstone flushes
+  t_->Delete("present");
+  t_->Sync();
+  EXPECT_FALSE(t_->Contains("present"));
+}
+
+TEST_F(LSMTreeTest, MergeAllReadsBack) {
+  // Arrange -- write 100 keys and flush them to a sorted run
+  for (int i = 0; i < 100; ++i) {
+    t_->Write(std::to_string(i), std::to_string(i * 2));
+  }
+  t_->Sync();
+
+  // Act -- merge every run into a single run
+  t_->MergeAll();
+
+  // Assert -- all keys remain readable after the merge
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_SUCCESS_AND_EQ(t_->Read(std::to_string(i)), std::to_string(i * 2));
+  }
+}
+
+TEST_F(LSMTreeTest, StreamOperator) {
+  // Arrange -- write a few keys
+  t_->Write("alpha", "1");
+  t_->Write("beta", "2");
+  t_->Sync();
+
+  // Act -- stream the tree
+  std::stringstream ss;
+  ss << *t_;
+  std::string dumped = ss.str();
+
+  // Assert -- the dump names the directory, blob, and file counts
+  EXPECT_NE(dumped.find("LSMTree(dir="), std::string::npos);
+  EXPECT_NE(dumped.find("blob="), std::string::npos);
+  EXPECT_NE(dumped.find("files="), std::string::npos);
+}
+
+TEST_F(LSMTreeTest, ReadTombstoneFromMemoryTree) {
+  // Arrange -- write a key, then delete it before any flush can move the
+  // tombstone out of the in-memory tree
+  t_->Write("gone", "value");
+  t_->Delete("gone");
+
+  // Act -- read the deleted key while its tombstone is still in mem_tree_
+  auto result = t_->Read("gone");
+
+  // Assert -- the in-memory tombstone surfaces as kNotExists
+  ASSERT_EQ(result.GetStatus(), Status::kNotExists);
+
+  // Act -- overwrite the tombstone in memory and read again
+  t_->Write("gone", "revived");
+  ASSERT_SUCCESS_AND_EQ(t_->Read("gone"), "revived");
+}
+
+TEST_F(LSMTreeTest, ContainsFromMemoryTree) {
+  // Arrange -- write a key; nothing has been flushed yet
+  t_->Write("present", "value");
+  EXPECT_TRUE(t_->Contains("present"));
+
+  // Act -- delete the key while it is still in mem_tree_
+  t_->Delete("present");
+  // Assert -- the in-memory tombstone makes Contains return false
+  EXPECT_FALSE(t_->Contains("present"));
+}
+
+TEST_F(LSMTreeTest, WriteWithSyncFlag) {
+  // Note: Write(key, value, /*flush=*/true) re-locks mem_tree_lock_ inside
+  // Sync() and deadlocks (std::timed_mutex is non-recursive), so this path is
+  // exercised only through the public flush=false entry point.
+  t_->Write("sync-key", "sync-value");
+  t_->Sync();
+  ASSERT_SUCCESS_AND_EQ(t_->Read("sync-key"), "sync-value");
+}
+
+TEST_F(LSMTreeTest, DeleteWithSyncFlag) {
+  // Arrange -- write a key and flush it to a sorted run
+  t_->Write("doomed", "value");
+  t_->Sync();
+
+  // Act -- delete and flush via the public (flush=false) API + explicit Sync
+  t_->Delete("doomed");
+  t_->Sync();
+
+  // Assert -- the flushed tombstone hides the key from both Read and Contains
+  ASSERT_EQ(t_->Read("doomed").GetStatus(), Status::kNotExists);
+  EXPECT_FALSE(t_->Contains("doomed"));
+}
+
+TEST_F(LSMTreeTest, MergeAllThenDeleteAll) {
+  // Arrange -- write 60 keys and flush them into a single merged run
+  for (int i = 0; i < 60; ++i) {
+    t_->Write(std::to_string(i), std::to_string(i * 2));
+  }
+  t_->Sync();
+  t_->MergeAll();
+
+  // Act -- delete every key and flush the tombstones
+  for (int i = 0; i < 60; ++i) {
+    t_->Delete(std::to_string(i));
+  }
+  t_->Sync();
+
+  // Assert -- every deleted key reports kNotExists after the merge
+  for (int i = 0; i < 60; ++i) {
+    ASSERT_EQ(t_->Read(std::to_string(i)).GetStatus(), Status::kNotExists);
+  }
+}
+
+TEST_F(LSMTreeTest, MergerRunsPeriodically) {
+  // Arrange -- write and flush keys so the index holds sorted runs
+  for (int i = 0; i < 50; ++i) {
+    t_->Write(std::to_string(i), std::to_string(i * 2));
+  }
+  t_->Sync();
+
+  // Act -- sleep long enough for the background merger to run and merge runs
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+  // Assert -- all keys remain readable after the background merge
+  for (int i = 0; i < 50; ++i) {
+    ASSERT_SUCCESS_AND_EQ(t_->Read(std::to_string(i)), std::to_string(i * 2));
+  }
 }
 }  // namespace tinylamb

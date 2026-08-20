@@ -793,4 +793,138 @@ TEST_F(LeafPageTest, FosterChildCrash) {
   // Assert -- foster pair survived each crash/recovery round-trip
   // (implicit in Act assertions)
 }
+
+TEST_F(LeafPageTest, InsertTooBigData) {
+  // Arrange -- nothing more than fixture setup
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+
+  // Act -- a key/value pair larger than the per-entry limit must be rejected
+  Status result =
+      page->InsertLeaf(txn, std::string(20000, 'k'), std::string(100, 'v'));
+
+  // Assert -- kTooBigData
+  ASSERT_EQ(result, Status::kTooBigData);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(LeafPageTest, UpdateTooBigValue) {
+  // Arrange
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "hello", "world"));
+
+  // Act -- updating with an oversized value must be rejected up-front
+  Status result = page->Update(txn, "hello", std::string(20000, 'v'));
+
+  // Assert -- kTooBigData
+  ASSERT_EQ(result, Status::kTooBigData);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(LeafPageTest, ReadSlotOutOfRange) {
+  // Arrange -- empty leaf page
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+
+  // Act -- read a non-existent slot through both slot-based readers
+  ASSERT_EQ(page->Read(txn, 0).GetStatus(), Status::kNotExists);
+  ASSERT_EQ(page->ReadKey(txn, 0).GetStatus(), Status::kNotExists);
+
+  // Assert -- populated slot is readable via both readers
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "k", "v"));
+  ASSIGN_OR_ASSERT_FAIL(std::string_view, value, page->Read(txn, 0));
+  ASSERT_EQ(value, "v");
+  ASSIGN_OR_ASSERT_FAIL(std::string_view, key, page->ReadKey(txn, 0));
+  ASSERT_EQ(key, "k");
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(LeafPageTest, DumpLeafPage) {
+  // Arrange -- populated page with a foster pair
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "hello", "world"));
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "key", "value"));
+  ASSERT_SUCCESS(page->SetFoster(txn, FosterPair("zz", 42)));
+
+  // Act -- stream the page through the Dump path
+  std::ostringstream oss;
+  oss << *page;
+
+  // Assert -- header, rows and foster key are all rendered
+  const std::string dumped = oss.str();
+  EXPECT_NE(dumped.find("LeafPage"), std::string::npos);
+  EXPECT_NE(dumped.find("FosterKey"), std::string::npos);
+  EXPECT_NE(dumped.find("hello"), std::string::npos);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(LeafPageTest, SanityCheckDetectsFenceAndFosterViolations) {
+  // Arrange -- keys that fences/foster can be moved outside of
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "a", "1"));
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "c", "3"));
+
+  // Act/Assert -- a low fence above the first key violates sanity
+  ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey("b")));
+  EXPECT_FALSE(page->body.leaf_page.SanityCheckForTest());
+
+  // Act/Assert -- a high fence below the last key violates sanity
+  ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey::MinusInfinity()));
+  ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey("b")));
+  EXPECT_FALSE(page->body.leaf_page.SanityCheckForTest());
+
+  // Act/Assert -- a foster key not after the last key violates sanity
+  ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey::PlusInfinity()));
+  ASSERT_SUCCESS(page->SetFoster(txn, FosterPair("b", 99)));
+  EXPECT_FALSE(page->body.leaf_page.SanityCheckForTest());
+
+  // Act/Assert -- restoring consistent fences/foster restores sanity
+  ASSERT_SUCCESS(page->SetFoster(txn, FosterPair()));
+  ASSERT_SUCCESS(page->SetLowFence(txn, IndexKey::MinusInfinity()));
+  ASSERT_SUCCESS(page->SetHighFence(txn, IndexKey::PlusInfinity()));
+  EXPECT_TRUE(page->body.leaf_page.SanityCheckForTest());
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(LeafPageTest, InsertHugeKeyOverflowsPhysicalSize) {
+  // Real bug: LeafPage::Insert (page/leaf_page.cpp:57-59) accumulates the
+  // serialized sizes of key and value into a bin_size_t (uint16).  A key and
+  // value whose combined serialized size exceeds 65535 bytes make physical_size
+  // wrap around to a tiny value, so both the kFanoutThreshold guard and the
+  // free_size_ precheck at page/leaf_page.cpp:67 are bypassed.  InsertImpl then
+  // trusts the wrapped size and memcpy()s the full key bytes from a free_ptr_
+  // near the top of the page (page/leaf_page.cpp:91) -- a heap-buffer-overflow
+  // of the 32KiB page allocation.  An oversized entry must be rejected with
+  // kTooBigData instead of scribbling out of bounds.
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  // key(32766) serializes to 32768 bytes; value(32767) to 32769 bytes; the sum
+  // 65537 wraps physical_size to 1, fooling every size check.
+  std::string key(32766, 'k');
+  std::string value(32767, 'v');
+  Status result = page->InsertLeaf(txn, key, value);
+  ASSERT_EQ(result, Status::kTooBigData);
+}
+
+TEST_F(LeafPageTest, UpdateHugeValueOverflowsPhysicalSize) {
+  // Real bug: the same uint16 overflow as InsertHugeKeyOverflowsPhysicalSize,
+  // reached through LeafPage::Update (page/leaf_page.cpp:104-110).  For an
+  // existing key, a value large enough that key+value serialized size wraps
+  // physical_size below kFanoutThreshold bypasses the size guard; UpdateImpl
+  // then carries a real payload that is thousands of bytes, UpdateSlotImpl
+  // underflows free_ptr_ and memcpy()s the value past the end of the page
+  // (page/leaf_page.cpp:148).  An oversized value must be rejected with
+  // kTooBigData instead of overflowing the page.
+  auto txn = tm_->Begin();
+  PageRef page = Page();
+  ASSERT_SUCCESS(page->InsertLeaf(txn, "k", "v"));
+  // key("k") serializes to 3 bytes; value(65534) to 65536 bytes; the sum 65539
+  // wraps physical_size to 3, below the fanout threshold, so Update proceeds.
+  std::string value(65534, 'v');
+  Status result = page->Update(txn, "k", value);
+  ASSERT_EQ(result, Status::kTooBigData);
+}
 }  // namespace tinylamb
