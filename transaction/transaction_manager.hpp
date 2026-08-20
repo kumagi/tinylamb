@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_TRANSACTION_MANAGER_HPP
 #define TINYLAMB_TRANSACTION_MANAGER_HPP
 
+#include <array>
 #include <atomic>
 #include <limits>
 #include <mutex>
@@ -134,11 +135,22 @@ class TransactionManager {
   void ReleaseLocksAndForget(Transaction& txn);
   void GarbageCollectVersions();
 
+  static constexpr size_t kVersionShardCount = 64;
+
+  struct VersionShard {
+    mutable std::mutex mutex;
+    std::unordered_map<RowPosition, VersionChain> versions;
+  };
+
+  [[nodiscard]] static size_t VersionShardIndex(const RowPosition& rp) {
+    return static_cast<size_t>((rp.page_id * 131ull) + rp.slot) %
+           kVersionShardCount;
+  }
+
   std::atomic<uint64_t> commit_timestamp_{0};
   std::atomic<uint64_t> max_committed_begin_ts_{0};
   std::atomic<int> pending_txn_count_{0};
-  mutable std::mutex version_lock_;
-  std::unordered_map<RowPosition, VersionChain> versions_;
+  mutable std::array<VersionShard, kVersionShardCount> version_shards_;
   std::unordered_map<txn_id_t, uint64_t> active_snapshots_;
   LockManager* const lock_manager_;
   PageManager* const page_manager_;

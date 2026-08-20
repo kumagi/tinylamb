@@ -619,10 +619,14 @@ std::unique_ptr<Statement> GoogleSqlAstVisitor::Visit(
   if (root.kind == "InsertStatement") return VisitInsert(root);
   if (root.kind == "UpdateStatement") return VisitUpdate(root);
   if (root.kind == "DeleteStatement") return VisitDelete(root);
-  if (root.kind == "DropStatement") {
+  if (root.kind == "DropStatement" || root.kind == "DropStatement TABLE") {
     const GoogleSqlAstNode* path = root.Child("PathExpression");
     if (!path) throw std::runtime_error("GoogleSQL AST: bad DROP");
     return std::make_unique<DropTableStatement>(Path(*path));
+  }
+  if (root.kind.rfind("DropStatement", 0) == 0) {
+    throw std::runtime_error("GoogleSQL AST: unsupported statement " +
+                             root.kind);
   }
   throw std::runtime_error("GoogleSQL AST: unsupported statement " + root.kind);
 }

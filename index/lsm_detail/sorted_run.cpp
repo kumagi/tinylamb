@@ -305,7 +305,7 @@ void SortedRun::FlushInternal(const std::filesystem::path& path,
 
 auto SortedRun::Find(std::string_view key, const BlobFile& blob) const
     -> StatusOr<std::string> {
-  if (key < min_key_ || max_key_ < key) {
+  if (length_ == 0 || key < min_key_ || max_key_ < key) {
     return Status::kNotExists;
   }
 

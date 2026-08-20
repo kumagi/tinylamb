@@ -608,4 +608,423 @@ TEST(TableStatisticsSerializationTest, LegacyNullColumnThrows) {
   EXPECT_THROW(decoder >> statistics, std::runtime_error);
 }
 
+TEST(TableStatisticsSerializationTest, UnsupportedVersionThrows) {
+  // Act -- encode the v2 magic marker followed by an unknown version
+  std::stringstream stream;
+  Encoder encoder(stream);
+  encoder << uint64_t{0x544C535441545302ULL} << uint64_t{99};
+
+  TableStatistics statistics(Schema("T", {Column("v", ValueType::kInt64)}));
+  Decoder decoder(stream);
+  // Assert -- a blob whose version is not v2 is rejected loudly
+  EXPECT_THROW(decoder >> statistics, std::runtime_error);
+}
+
+TEST(TableStatisticsSerializationTest, LegacyVarcharEstimateFallback) {
+  // Arrange -- decode a legacy varchar blob that carries no histogram
+  std::stringstream stream;
+  Encoder encoder(stream);
+  encoder << uint64_t{1} << ValueType::kVarChar << uint64_t{7} << uint64_t{6};
+  TableStatistics statistics(
+      Schema("T", {Column("v", ValueType::kVarChar)}));
+  Decoder decoder(stream);
+  decoder >> statistics;
+
+  // Act -- ask for the equal-value estimate and a range estimate
+  // Assert -- no histogram means the estimate falls back to avg selectivity
+  EXPECT_DOUBLE_EQ(statistics.Column(0).EstimateEqual(Value("xyz")),
+                   7.0 / 6.0);
+  EXPECT_NEAR(
+      statistics.Column(0).EstimateRange(std::nullopt, false, Value("z"),
+                                         false),
+      7.0 * 0.5, 0.001);
+}
+
+TEST_F(TableStatisticsTest, CoercionAndRangeEstimatePaths) {
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
+                        db_->GetStatistics(context, "Sc1"));
+
+  // Act -- probe the double column with an int64 value (int -> double coerce)
+  EXPECT_NEAR(statistics.Column(2).EstimateEqual(Value(int64_t{10})), 1.0,
+              0.1);
+
+  // Act -- probe the int64 column with integral doubles (double -> int coerce)
+  EXPECT_NEAR(statistics.EstimateCount(0, Value(5.0), Value(10.0)), 6, 2);
+
+  // Act -- interpolate inside a double-column bucket (Position kDouble)
+  EXPECT_GT(statistics.Column(2).EstimateRange(std::nullopt, false, Value(50.0),
+                                               false),
+            0.0);
+  EXPECT_LE(statistics.Column(2).EstimateRange(std::nullopt, false, Value(50.0),
+                                               false),
+            100.0);
+
+  // Act -- interpolate inside a varchar-column bucket (Position kVarChar)
+  EXPECT_NEAR(
+      statistics.Column(1).EstimateRange(std::nullopt, false, Value("c2-30"),
+                                         false),
+      31, 8);
+
+  // Act -- a range whose upper bound sorts below the lower bound
+  EXPECT_DOUBLE_EQ(
+      statistics.Column(0).EstimateRange(Value(int64_t{10}), true,
+                                         Value(int64_t{5}), true),
+      0);
+
+  // Act -- a point range that is not inclusive on both ends
+  EXPECT_DOUBLE_EQ(
+      statistics.Column(0).EstimateRange(Value(int64_t{5}), true,
+                                         Value(int64_t{5}), false),
+      0);
+  // Act -- a fully inclusive point range collapses to EstimateEqual
+  EXPECT_NEAR(statistics.Column(0).EstimateRange(Value(int64_t{5}), true,
+                                                 Value(int64_t{5}), true),
+              1.0, 0.1);
+
+  // Act -- a boundary that cannot be coerced to the column type
+  EXPECT_DOUBLE_EQ(
+      statistics.Column(0).EstimateRange(Value(std::string("abc")), true,
+                                         Value(int64_t{10}), true),
+      0);
+
+  // Act -- scale beyond the size_t range (ScaleCount saturates)
+  TableStatistics huge = statistics.ScaleToRows(
+      std::numeric_limits<size_t>::max());
+  EXPECT_EQ(huge.Rows(), std::numeric_limits<size_t>::max());
+  EXPECT_EQ(huge.Column(0).NonNullCount(), std::numeric_limits<size_t>::max());
+
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, ValueSatisfiesSameAndCrossType) {
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
+                        db_->GetStatistics(context, "Sc1"));
+  const Schema& schema = table.GetSchema();
+
+  const auto col = [](std::string_view name) {
+    return ColumnValueExp(name);
+  };
+  const auto const_v = [](const Value& v) { return ConstantValueExp(v); };
+  const auto bin = [](const Expression& l, BinaryOperation op,
+                      const Expression& r) {
+    return BinaryExpressionExp(l, op, r);
+  };
+  const auto eq = [&](int64_t v) {
+    return bin(col("Sc1.c1"), BinaryOperation::kEquals, const_v(Value(v)));
+  };
+
+  // Act/Assert -- cross-type ValueSatisfies through AND/OR equal checks
+  // (c1 = 1) AND (c1 = 2.5): int vs double equality is false
+  EXPECT_DOUBLE_EQ(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(col("Sc1.c1"), BinaryOperation::kEquals,
+                          const_v(Value(2.5))))),
+      0);
+  // (c1 = 1) AND (c1 != 2.5): the int differs from the double, so it survives
+  EXPECT_NEAR(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(col("Sc1.c1"), BinaryOperation::kNotEquals,
+                          const_v(Value(2.5))))),
+      0.01, 0.01);
+  // (c1 = 1) AND (c1 < 2.5)
+  EXPECT_NEAR(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(col("Sc1.c1"), BinaryOperation::kLessThan,
+                          const_v(Value(2.5))))),
+      0.01, 0.01);
+  // (c1 = 1) AND (c1 <= 2.5)
+  EXPECT_NEAR(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(col("Sc1.c1"), BinaryOperation::kLessThanEquals,
+                          const_v(Value(2.5))))),
+      0.01, 0.01);
+  // (c1 = 1) AND (c1 >= 0.5)
+  EXPECT_NEAR(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(col("Sc1.c1"), BinaryOperation::kGreaterThanEquals,
+                          const_v(Value(0.5))))),
+      0.01, 0.01);
+  // (c1 = 2.5) AND (c1 < 1): the double equals check against an int bound
+  EXPECT_DOUBLE_EQ(
+      statistics.EstimateSelectivity(
+          schema,
+          bin(bin(col("Sc1.c1"), BinaryOperation::kEquals, const_v(Value(2.5))),
+              BinaryOperation::kAnd,
+              bin(col("Sc1.c1"), BinaryOperation::kLessThan, const_v(Value(1))))),
+      0);
+
+  // Act/Assert -- same-type ValueSatisfies through AND equal checks
+  EXPECT_DOUBLE_EQ(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(col("Sc1.c1"), BinaryOperation::kNotEquals,
+                          const_v(Value(int64_t{1}))))),
+      0);
+  EXPECT_DOUBLE_EQ(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(col("Sc1.c1"), BinaryOperation::kLessThan,
+                          const_v(Value(int64_t{1}))))),
+      0);
+  EXPECT_NEAR(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(col("Sc1.c1"), BinaryOperation::kLessThanEquals,
+                          const_v(Value(int64_t{1}))))),
+      0.01, 0.01);
+  EXPECT_DOUBLE_EQ(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(col("Sc1.c1"), BinaryOperation::kGreaterThan,
+                          const_v(Value(int64_t{1}))))),
+      0);
+  EXPECT_NEAR(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(col("Sc1.c1"), BinaryOperation::kGreaterThanEquals,
+                          const_v(Value(int64_t{1}))))),
+      0.01, 0.01);
+
+  // Act/Assert -- the equals side on the right drives the AND/OR outcome
+  // (c1 > 1) AND (c1 = 1) is contradictory
+  Expression greater_one = bin(col("Sc1.c1"), BinaryOperation::kGreaterThan,
+                               const_v(Value(int64_t{1})));
+  EXPECT_DOUBLE_EQ(
+      statistics.EstimateSelectivity(
+          schema, bin(greater_one, BinaryOperation::kAnd, eq(1))),
+      0);
+  // (c1 > 1) OR (c1 = 1) covers nearly every row
+  EXPECT_NEAR(
+      statistics.EstimateSelectivity(
+          schema, bin(greater_one, BinaryOperation::kOr, eq(1))),
+      0.99, 0.01);
+
+  // Act/Assert -- constant-on-left AND forms (ReverseComparison)
+  // (c1 = 1) AND (5 < c1)  ->  c1 > 5
+  EXPECT_DOUBLE_EQ(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(const_v(Value(int64_t{5})), BinaryOperation::kLessThan,
+                          col("Sc1.c1")))),
+      0);
+  // (c1 = 1) AND (5 <= c1) ->  c1 >= 5
+  EXPECT_DOUBLE_EQ(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(const_v(Value(int64_t{5})),
+                          BinaryOperation::kLessThanEquals, col("Sc1.c1")))),
+      0);
+  // (c1 = 1) AND (5 >= c1) ->  c1 <= 5
+  EXPECT_NEAR(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd,
+                      bin(const_v(Value(int64_t{5})),
+                          BinaryOperation::kGreaterThanEquals,
+                          col("Sc1.c1")))),
+      0.01, 0.01);
+
+  // Act/Assert -- identical children on both sides of AND
+  Expression same = bin(eq(1), BinaryOperation::kAnd, eq(1));
+  EXPECT_NEAR(statistics.EstimateSelectivity(schema, same), 0.01, 0.01);
+
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, NotXorAndFallbackPredicateShapes) {
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
+                        db_->GetStatistics(context, "Sc1"));
+  const Schema& schema = table.GetSchema();
+
+  // Act -- NOT inverts a unary predicate estimate
+  Expression equals_one = BinaryExpressionExp(
+      ColumnValueExp("Sc1.c1"), BinaryOperation::kEquals,
+      ConstantValueExp(Value(int64_t{1})));
+  Expression not_equals_one =
+      UnaryExpressionExp(equals_one, UnaryOperation::kNot);
+  EXPECT_NEAR(statistics.EstimateSelectivity(schema, not_equals_one), 0.99,
+              0.01);
+
+  // Act -- XOR over the same column
+  Expression greater_ten = BinaryExpressionExp(
+      ColumnValueExp("Sc1.c1"), BinaryOperation::kGreaterThan,
+      ConstantValueExp(Value(int64_t{10})));
+  Expression xor_pred = BinaryExpressionExp(equals_one, BinaryOperation::kXor,
+                                            greater_ten);
+  EXPECT_GT(statistics.EstimateSelectivity(schema, xor_pred), 0.0);
+  EXPECT_LE(statistics.EstimateSelectivity(schema, xor_pred), 1.0);
+
+  // Act -- OR over two different columns (independent selectivity)
+  Expression equals_name = BinaryExpressionExp(
+      ColumnValueExp("Sc1.c2"), BinaryOperation::kEquals,
+      ConstantValueExp(Value(std::string("c2-0"))));
+  Expression or_columns =
+      BinaryExpressionExp(equals_one, BinaryOperation::kOr, equals_name);
+  EXPECT_GT(statistics.EstimateSelectivity(schema, or_columns), 0.0);
+
+  // Act -- OR whose right side is not a binary predicate (atomic extraction
+  // fails and the fallback 0.25 is used for the child)
+  Expression or_column_child = BinaryExpressionExp(
+      equals_one, BinaryOperation::kOr, ColumnValueExp("Sc1.c1"));
+  EXPECT_GT(statistics.EstimateSelectivity(schema, or_column_child), 0.0);
+
+  // Act -- a non-equality comparison between two columns is unsupported
+  Expression column_compare = BinaryExpressionExp(
+      ColumnValueExp("Sc1.c1"), BinaryOperation::kLessThan,
+      ColumnValueExp("Sc1.c2"));
+  EXPECT_NEAR(statistics.EstimateSelectivity(schema, column_compare), 0.25,
+              0.001);
+
+  // Act -- an arithmetic binary predicate is not a comparison at all
+  Expression arithmetic = BinaryExpressionExp(
+      ColumnValueExp("Sc1.c1"), BinaryOperation::kAdd,
+      ConstantValueExp(Value(int64_t{5})));
+  EXPECT_DOUBLE_EQ(statistics.EstimateSelectivity(schema, arithmetic), 1.0);
+
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, IsNotNullEstimate) {
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
+                        db_->GetStatistics(context, "Sc2"));
+  const Schema& schema = table.GetSchema();
+
+  // Act -- Sc2.d4 has no nulls, so IS NOT NULL keeps every row
+  Expression is_not_null = UnaryExpressionExp(
+      ColumnValueExp("Sc2.d4"), UnaryOperation::kIsNotNull);
+  EXPECT_NEAR(statistics.EstimateSelectivity(schema, is_not_null), 1.0, 0.001);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, EstimateCountErrors) {
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
+                        db_->GetStatistics(context, "Sc1"));
+
+  // Act/Assert -- out-of-range column indices are rejected loudly
+  EXPECT_THROW(statistics.EstimateCount(3, Value(0), Value(1)),
+               std::out_of_range);
+  EXPECT_THROW(statistics.EstimateCount(-1, Value(0), Value(1)),
+               std::out_of_range);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, ConcatIntoEmptyStatistics) {
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
+                        db_->GetStatistics(context, "Sc1"));
+
+  // Act -- concatenate a non-empty statistics into a schema-less one
+  TableStatistics empty(Schema("E", {}));
+  ASSERT_EQ(empty.Columns(), 0);
+  empty.Concat(statistics);
+
+  // Assert -- the empty side adopts the row count and the appended columns
+  EXPECT_EQ(empty.Rows(), statistics.Rows());
+  EXPECT_EQ(empty.Columns(), statistics.Columns());
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST(TableStatisticsResolveColumnTest, SchemaQualifiedFallback) {
+  // Arrange -- a schema whose name does not match the column qualifier, so
+  // Schema::Offset() fails and ResolveColumn falls back to name matching.
+  Schema schema("Sc1", {Column(ColumnName("X", "c1"), ValueType::kInt64)});
+  TableStatistics statistics(schema);
+  std::vector<ColumnStats> columns;
+  columns.emplace_back(ValueType::kInt64);
+  statistics.Assign(10, std::move(columns));
+
+  // Act -- estimate a predicate whose column is qualified by "X"
+  Expression equals = BinaryExpressionExp(
+      ColumnValueExp("X.c1"), BinaryOperation::kEquals,
+      ConstantValueExp(Value(int64_t{5})));
+
+  // Assert -- the fallback resolves column 0 and the estimate is finite
+  const double selectivity = statistics.EstimateSelectivity(schema, equals);
+  EXPECT_GE(selectivity, 0.0);
+  EXPECT_LE(selectivity, 1.0);
+}
+
+TEST_F(TableStatisticsTest, AndFallbackAndValueSatisfiesDefaults) {
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
+                        db_->GetStatistics(context, "Sc1"));
+  const Schema& schema = table.GetSchema();
+
+  const auto col = [](std::string_view name) {
+    return ColumnValueExp(name);
+  };
+  const auto const_v = [](const Value& v) { return ConstantValueExp(v); };
+  const auto bin = [](const Expression& l, BinaryOperation op,
+                      const Expression& r) {
+    return BinaryExpressionExp(l, op, r);
+  };
+  const auto eq = [&](int64_t v) {
+    return bin(col("Sc1.c1"), BinaryOperation::kEquals, const_v(Value(v)));
+  };
+
+  // Act/Assert -- AND over two independent columns multiplies selectivities
+  Expression equals_name = bin(col("Sc1.c2"), BinaryOperation::kEquals,
+                               const_v(Value(std::string("c2-0"))));
+  EXPECT_NEAR(statistics.EstimateSelectivity(
+                  schema, bin(eq(1), BinaryOperation::kAnd, equals_name)),
+              0.01 * 0.01, 0.01);
+
+  // Act/Assert -- AND whose right side is a constant-only predicate: atomic
+  // extraction fails and the constant's truthiness is used directly
+  Expression five_equals_five =
+      bin(const_v(Value(int64_t{5})), BinaryOperation::kEquals,
+          const_v(Value(int64_t{5})));
+  EXPECT_NEAR(statistics.EstimateSelectivity(
+                  schema, bin(eq(1), BinaryOperation::kAnd, five_equals_five)),
+              0.01, 0.01);
+
+  // Act/Assert -- a LIKE constant against an int column: ValueSatisfies falls
+  // through its default (cross-type and same-type)
+  Expression like_double = bin(col("Sc1.c1"), BinaryOperation::kLike,
+                               const_v(Value(2.5)));
+  EXPECT_DOUBLE_EQ(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd, like_double)),
+      0);
+  Expression like_int = bin(col("Sc1.c1"), BinaryOperation::kLike,
+                            const_v(Value(int64_t{1})));
+  EXPECT_DOUBLE_EQ(
+      statistics.EstimateSelectivity(
+          schema, bin(eq(1), BinaryOperation::kAnd, like_int)),
+      0);
+
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST(TableStatisticsResolveColumnTest, UnknownSchemaQualifiedColumn) {
+  // Arrange -- a schema whose name does not match the column qualifier
+  Schema schema("Sc1", {Column(ColumnName("X", "c1"), ValueType::kInt64)});
+  TableStatistics statistics(schema);
+  std::vector<ColumnStats> columns;
+  columns.emplace_back(ValueType::kInt64);
+  statistics.Assign(10, std::move(columns));
+
+  // Act -- estimate a predicate over a column that is not in the schema
+  Expression equals = BinaryExpressionExp(
+      ColumnValueExp("X.missing"), BinaryOperation::kEquals,
+      ConstantValueExp(Value(int64_t{5})));
+
+  // Assert -- the unresolved column falls back to the 0.25 default
+  EXPECT_NEAR(statistics.EstimateSelectivity(schema, equals), 0.25, 0.001);
+}
+
 }  // namespace tinylamb

@@ -20,6 +20,9 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/random_string.hpp"
+#include "database/database.hpp"
+#include "database/transaction_context.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
@@ -1465,6 +1468,62 @@ TEST(ExpressionTest, FunctionCallNestedTouchedAndToString) {
   // Assert -- touched columns merge from every nested argument
   EXPECT_EQ(columns->TouchedColumns().size(), 2);
   EXPECT_EQ(columns->Type(), TypeTag::kFunctionCallExp);
+}
+
+TEST(ExpressionTest, FunctionCallDateAddSubTwoRowEvaluateThrows) {
+  Row row;
+  Schema schema;
+
+  // Act + Assert -- the 4-argument Evaluate overload must reject DATE_ADD
+  // calls whose second argument is not an INTERVAL, just like the 2-argument
+  // overload.
+  EXPECT_THROW(FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01")),
+                                            ConstantValueExp(Value(1))})
+                   ->Evaluate(&row, schema, &row, schema),
+               std::runtime_error);
+  EXPECT_THROW(FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01"))})
+                   ->Evaluate(&row, schema, &row, schema),
+               std::runtime_error);
+  // Act + Assert -- the same validation applies to DATE_SUB.
+  EXPECT_THROW(FunctionCallExp("date_sub", {ConstantValueExp(Value("1998-12-01")),
+                                            ConstantValueExp(Value(1))})
+                   ->Evaluate(&row, schema, &row, schema),
+               std::runtime_error);
+}
+
+TEST(ExpressionTest, FunctionCallValidateRegistersFunction) {
+  // Arrange -- a throwaway database and context so GetOrAddFunction can run.
+  const std::string dbname = "expression_test_" + RandomString();
+  {
+    auto db = std::make_unique<Database>(dbname);
+    TransactionContext ctx = db->BeginContext();
+    Schema schema("s", {Column("a", ValueType::kVarChar)});
+
+    // Act + Assert -- validating a known function succeeds and registers it.
+    Expression concat = FunctionCallExp(
+        "concat", {ColumnValueExp("a"), ConstantValueExp(Value("x"))});
+    EXPECT_EQ(concat->Validate(ctx, schema), Status::kSuccess);
+    EXPECT_EQ(concat->Validate(ctx, schema), Status::kSuccess);
+
+    // Act + Assert -- validating a previously unknown name also succeeds
+    // because GetOrAddFunction creates it on demand.
+    Expression custom =
+        FunctionCallExp("my_udf", {ConstantValueExp(Value(1))});
+    EXPECT_EQ(custom->Validate(ctx, schema), Status::kSuccess);
+    ctx.txn_.PreCommit();
+  }
+  {
+    // Arrange -- reopen the database to confirm the function survived.
+    auto db = std::make_unique<Database>(dbname);
+    TransactionContext ctx = db->BeginContext();
+    Schema schema("s", {Column("a", ValueType::kVarChar)});
+    Expression again =
+        FunctionCallExp("my_udf", {ConstantValueExp(Value(1))});
+    // Act + Assert -- the registered function is still valid.
+    EXPECT_EQ(again->Validate(ctx, schema), Status::kSuccess);
+    ctx.txn_.PreCommit();
+    db->DeleteAll();
+  }
 }
 
 }  // namespace tinylamb

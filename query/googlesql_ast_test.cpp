@@ -5,12 +5,41 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <string>
+#include <string_view>
 
 #include "parser/ast.hpp"
+#include "expression/constant_value.hpp"
+#include "expression/in_expression.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
 
 namespace tinylamb {
+
+namespace {
+
+std::unique_ptr<Statement> VisitSql(std::string_view sql) {
+  GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(sql);
+  EXPECT_TRUE(parsed.ok) << parsed.error;
+  if (!parsed.ok) return nullptr;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse(parsed.ast);
+  EXPECT_EQ(ast.GetStatus(), Status::kSuccess);
+  if (!ast.HasValue()) return nullptr;
+  return GoogleSqlAstVisitor::Visit(*ast.Value());
+}
+
+std::unique_ptr<Statement> VisitSqlOrThrow(std::string_view sql) {
+  GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(sql);
+  EXPECT_TRUE(parsed.ok) << parsed.error;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse(parsed.ast);
+  EXPECT_EQ(ast.GetStatus(), Status::kSuccess);
+  if (!ast.HasValue()) return nullptr;
+  return GoogleSqlAstVisitor::Visit(*ast.Value());
+}
+
+}  // namespace
 
 TEST(GoogleSqlAstTest, VisitsRichQueryWithoutReparsingSql) {
   GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(
@@ -34,6 +63,326 @@ TEST(GoogleSqlAstTest, VisitsRichQueryWithoutReparsingSql) {
   EXPECT_TRUE(select.Having());
   EXPECT_EQ(select.OrderBy().size(), 1);
   EXPECT_EQ(select.Limit(), 3);
+}
+
+TEST(GoogleSqlAstTest, SelectStarAndAllLiteralKinds) {
+  auto statement = VisitSql(
+      "SELECT *, 1, 1.5, TRUE, FALSE, NULL, DATE '2020-01-01', 'hello' "
+      "FROM t;");
+  ASSERT_TRUE(statement);
+  ASSERT_EQ(statement->Type(), StatementType::kSelect);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_EQ(select.SelectList().size(), 8);
+  EXPECT_EQ(select.FromClause().size(), 1);
+  EXPECT_EQ(select.FromClause()[0], "t");
+
+  EXPECT_EQ(select.SelectList()[0].expression->Type(), TypeTag::kColumnValue);
+  EXPECT_EQ(select.SelectList()[0].expression->ToString(), "*");
+  EXPECT_EQ(select.SelectList()[1].expression->ToString(), "1");
+  EXPECT_DOUBLE_EQ(select.SelectList()[2]
+                       .expression->AsConstantValue()
+                       .GetValue()
+                       .value.double_value,
+                   1.5);
+  EXPECT_EQ(select.SelectList()[3].expression->AsConstantValue().GetValue(),
+            Value(true));
+  EXPECT_EQ(select.SelectList()[4].expression->AsConstantValue().GetValue(),
+            Value(false));
+  EXPECT_TRUE(select.SelectList()[5]
+                  .expression->AsConstantValue()
+                  .GetValue()
+                  .IsNull());
+  EXPECT_EQ(select.SelectList()[6].expression->AsConstantValue().GetValue(),
+            Value::Date("2020-01-01"));
+  EXPECT_EQ(select.SelectList()[7].expression->AsConstantValue().GetValue(),
+            Value("hello"));
+}
+
+TEST(GoogleSqlAstTest, WhereClauseOperatorForms) {
+  auto statement = VisitSql(
+      "SELECT * FROM t WHERE a LIKE 'x%' AND b NOT LIKE 'y%' AND c IS NULL "
+      "AND d IS NOT NULL AND e NOT BETWEEN 1 AND 2 AND f IN (1, 2, 3) AND "
+      "g NOT IN (4, 5);");
+  ASSERT_TRUE(statement);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_TRUE(select.WhereClause());
+  const std::string where = select.WhereClause()->ToString();
+
+  EXPECT_NE(where.find("LIKE"), std::string::npos) << where;
+  EXPECT_NE(where.find("NOT LIKE"), std::string::npos) << where;
+  EXPECT_NE(where.find("IS NULL"), std::string::npos) << where;
+  EXPECT_NE(where.find("IS NOT NULL"), std::string::npos) << where;
+  EXPECT_NE(where.find("IN (1, 2, 3)"), std::string::npos) << where;
+  EXPECT_NE(where.find("NOT"), std::string::npos) << where;
+}
+
+TEST(GoogleSqlAstTest, NotBetweenAndInListSemantics) {
+  auto not_between = VisitSql(
+      "SELECT * FROM t WHERE a NOT BETWEEN 1 AND 2;");
+  ASSERT_TRUE(not_between);
+  const auto& not_between_select =
+      dynamic_cast<const SelectStatement&>(*not_between);
+  ASSERT_TRUE(not_between_select.WhereClause());
+  EXPECT_EQ(not_between_select.WhereClause()->Type(), TypeTag::kUnaryExp);
+
+  auto in_list = VisitSql("SELECT * FROM t WHERE a IN (1, 2, 3);");
+  ASSERT_TRUE(in_list);
+  const auto& in_select = dynamic_cast<const SelectStatement&>(*in_list);
+  ASSERT_TRUE(in_select.WhereClause());
+  EXPECT_EQ(in_select.WhereClause()->Type(), TypeTag::kInExp);
+  EXPECT_EQ(in_select.WhereClause()->ToString(), "a IN (1, 2, 3)");
+  EXPECT_EQ(in_select.WhereClause()->AsInExpression().list_.size(), 3);
+}
+
+TEST(GoogleSqlAstTest, InSubqueryAndScalarSubquery) {
+  auto in_subquery = VisitSql(
+      "SELECT * FROM t WHERE a IN (SELECT b FROM t2);");
+  ASSERT_TRUE(in_subquery);
+  const auto& in_select = dynamic_cast<const SelectStatement&>(*in_subquery);
+  ASSERT_TRUE(in_select.WhereClause());
+  EXPECT_EQ(in_select.WhereClause()->Type(), TypeTag::kQueryExp);
+  EXPECT_TRUE(in_select.RequiresRelationalEvaluation());
+
+  auto scalar = VisitSql("SELECT (SELECT 1);");
+  ASSERT_TRUE(scalar);
+  const auto& scalar_select = dynamic_cast<const SelectStatement&>(*scalar);
+  ASSERT_EQ(scalar_select.SelectList().size(), 1);
+  EXPECT_EQ(scalar_select.SelectList()[0].expression->Type(),
+            TypeTag::kQueryExp);
+
+  auto exists = VisitSql("SELECT * FROM t WHERE EXISTS (SELECT 1);");
+  ASSERT_TRUE(exists);
+  const auto& exists_select = dynamic_cast<const SelectStatement&>(*exists);
+  ASSERT_TRUE(exists_select.WhereClause());
+  EXPECT_EQ(exists_select.WhereClause()->Type(), TypeTag::kQueryExp);
+  EXPECT_TRUE(exists_select.RequiresRelationalEvaluation());
+}
+
+TEST(GoogleSqlAstTest, CaseExtractIntervalAndUnary) {
+  auto case_stmt = VisitSql(
+      "SELECT CASE WHEN a > 1 THEN 'big' ELSE 'small' END;");
+  ASSERT_TRUE(case_stmt);
+  const auto& case_select = dynamic_cast<const SelectStatement&>(*case_stmt);
+  ASSERT_EQ(case_select.SelectList().size(), 1);
+  EXPECT_EQ(case_select.SelectList()[0].expression->Type(),
+            TypeTag::kCaseExp);
+  EXPECT_NE(case_select.SelectList()[0].expression->ToString().find("CASE"),
+            std::string::npos);
+
+  auto extract = VisitSql("SELECT EXTRACT(YEAR FROM '2020-01-01');");
+  ASSERT_TRUE(extract);
+  const auto& extract_select =
+      dynamic_cast<const SelectStatement&>(*extract);
+  ASSERT_EQ(extract_select.SelectList().size(), 1);
+  EXPECT_EQ(extract_select.SelectList()[0].expression->Type(),
+            TypeTag::kFunctionCallExp);
+  EXPECT_EQ(extract_select.SelectList()[0].expression->ToString(),
+            "extract_year(\"2020-01-01\")");
+  EXPECT_TRUE(extract_select.RequiresRelationalEvaluation());
+
+  auto interval = VisitSql("SELECT INTERVAL 1 DAY;");
+  ASSERT_TRUE(interval);
+  const auto& interval_select =
+      dynamic_cast<const SelectStatement&>(*interval);
+  ASSERT_EQ(interval_select.SelectList().size(), 1);
+  EXPECT_EQ(interval_select.SelectList()[0].expression->Type(),
+            TypeTag::kIntervalExp);
+  EXPECT_TRUE(interval_select.RequiresRelationalEvaluation());
+
+  auto unary = VisitSql("SELECT -5;");
+  ASSERT_TRUE(unary);
+  const auto& unary_select = dynamic_cast<const SelectStatement&>(*unary);
+  ASSERT_EQ(unary_select.SelectList().size(), 1);
+  EXPECT_EQ(unary_select.SelectList()[0].expression->Type(),
+            TypeTag::kUnaryExp);
+  EXPECT_EQ(unary_select.SelectList()[0].expression->ToString(), "(-5)");
+}
+
+TEST(GoogleSqlAstTest, NonAggregateFunctionCalls) {
+  auto statement = VisitSql("SELECT CONCAT('a', 'b'), SUBSTR('hello', 2);");
+  ASSERT_TRUE(statement);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_EQ(select.SelectList().size(), 2);
+  EXPECT_EQ(select.SelectList()[0].expression->Type(),
+            TypeTag::kFunctionCallExp);
+  EXPECT_EQ(select.SelectList()[0].expression->ToString(),
+            "concat(\"a\", \"b\")");
+  EXPECT_EQ(select.SelectList()[1].expression->Type(),
+            TypeTag::kFunctionCallExp);
+  EXPECT_EQ(select.SelectList()[1].expression->ToString(),
+            "substr(\"hello\", 2)");
+}
+
+TEST(GoogleSqlAstTest, AggregateFunctionsIncludingDistinct) {
+  auto statement = VisitSql(
+      "SELECT COUNT(*), SUM(a), AVG(b), MIN(c), MAX(d), COUNT(DISTINCT e) "
+      "FROM t;");
+  ASSERT_TRUE(statement);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_EQ(select.SelectList().size(), 6);
+  EXPECT_EQ(select.SelectList()[0].expression->ToString(), "COUNT(*)");
+  EXPECT_EQ(select.SelectList()[1].expression->ToString(), "SUM(a)");
+  EXPECT_EQ(select.SelectList()[2].expression->ToString(), "AVG(b)");
+  EXPECT_EQ(select.SelectList()[3].expression->ToString(), "MIN(c)");
+  EXPECT_EQ(select.SelectList()[4].expression->ToString(), "MAX(d)");
+  EXPECT_EQ(select.SelectList()[5].expression->ToString(),
+            "COUNT(DISTINCT e)");
+}
+
+TEST(GoogleSqlAstTest, FoldBooleanChains) {
+  auto statement = VisitSql(
+      "SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3;");
+  ASSERT_TRUE(statement);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_TRUE(select.WhereClause());
+  EXPECT_NE(select.WhereClause()->ToString().find("a = 1"), std::string::npos);
+  EXPECT_NE(select.WhereClause()->ToString().find("b = 2"), std::string::npos);
+  EXPECT_NE(select.WhereClause()->ToString().find("c = 3"), std::string::npos);
+
+  auto or_stmt = VisitSql("SELECT * FROM t WHERE a = 1 OR b = 2;");
+  ASSERT_TRUE(or_stmt);
+  const auto& or_select = dynamic_cast<const SelectStatement&>(*or_stmt);
+  ASSERT_TRUE(or_select.WhereClause());
+  EXPECT_EQ(or_select.WhereClause()->Type(), TypeTag::kBinaryExp);
+  EXPECT_TRUE(or_select.RequiresRelationalEvaluation());
+}
+
+TEST(GoogleSqlAstTest, JoinsAndTableSubqueries) {
+  auto join = VisitSql("SELECT * FROM t JOIN t2 ON t.a = t2.a;");
+  ASSERT_TRUE(join);
+  const auto& join_select = dynamic_cast<const SelectStatement&>(*join);
+  ASSERT_EQ(join_select.Sources().size(), 2);
+  EXPECT_EQ(join_select.Sources()[0].table, "t");
+  EXPECT_EQ(join_select.Sources()[1].table, "t2");
+  EXPECT_TRUE(join_select.RequiresRelationalEvaluation());
+
+  auto left_join = VisitSql(
+      "SELECT * FROM t LEFT JOIN t2 ON t.a = t2.a;");
+  ASSERT_TRUE(left_join);
+  const auto& left_select = dynamic_cast<const SelectStatement&>(*left_join);
+  ASSERT_EQ(left_select.Sources().size(), 2);
+  EXPECT_EQ(left_select.Sources()[1].join_type, JoinType::kLeft);
+
+  auto subquery = VisitSql("SELECT * FROM (SELECT 1 AS x) AS s;");
+  ASSERT_TRUE(subquery);
+  const auto& sub_select = dynamic_cast<const SelectStatement&>(*subquery);
+  ASSERT_EQ(sub_select.Sources().size(), 1);
+  EXPECT_TRUE(sub_select.Sources()[0].query);
+  EXPECT_EQ(sub_select.Sources()[0].alias, "s");
+  EXPECT_TRUE(sub_select.RequiresRelationalEvaluation());
+}
+
+TEST(GoogleSqlAstTest, WithClause) {
+  auto statement = VisitSql(
+      "WITH cte AS (SELECT 1 AS x) SELECT * FROM cte;");
+  ASSERT_TRUE(statement);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  EXPECT_EQ(select.WithQueries().size(), 1);
+  EXPECT_TRUE(select.RequiresRelationalEvaluation());
+}
+
+TEST(GoogleSqlAstTest, CreateTableColumnTypes) {
+  auto statement = VisitSql(
+      "CREATE TABLE t (i INT, f FLOAT, n NUMERIC, d DOUBLE, s STRING, "
+      "c CHAR, ts TIMESTAMP, dt DATETIME, dd DATE, b BOOL);");
+  ASSERT_TRUE(statement);
+  ASSERT_EQ(statement->Type(), StatementType::kCreateTable);
+  const auto& create = dynamic_cast<const CreateTableStatement&>(*statement);
+  EXPECT_EQ(create.TableName(), "t");
+  ASSERT_EQ(create.Columns().size(), 10);
+  EXPECT_EQ(create.Columns()[0].Type(), ValueType::kInt64);
+  EXPECT_EQ(create.Columns()[1].Type(), ValueType::kDouble);
+  EXPECT_EQ(create.Columns()[2].Type(), ValueType::kDouble);
+  EXPECT_EQ(create.Columns()[3].Type(), ValueType::kDouble);
+  EXPECT_EQ(create.Columns()[4].Type(), ValueType::kVarChar);
+  EXPECT_EQ(create.Columns()[5].Type(), ValueType::kVarChar);
+  EXPECT_EQ(create.Columns()[6].Type(), ValueType::kVarChar);
+  EXPECT_EQ(create.Columns()[7].Type(), ValueType::kVarChar);
+  EXPECT_EQ(create.Columns()[8].Type(), ValueType::kDate);
+  EXPECT_EQ(create.Columns()[9].Type(), ValueType::kInt64);
+}
+
+TEST(GoogleSqlAstTest, InsertWithAndWithoutColumnList) {
+  auto with_columns = VisitSql("INSERT INTO t (a, b) VALUES (1, 2);");
+  ASSERT_TRUE(with_columns);
+  ASSERT_EQ(with_columns->Type(), StatementType::kInsert);
+  const auto& insert =
+      dynamic_cast<const InsertStatement&>(*with_columns);
+  EXPECT_EQ(insert.TableName(), "t");
+  EXPECT_EQ(insert.Columns().size(), 2);
+  EXPECT_EQ(insert.Columns()[0], "a");
+  EXPECT_EQ(insert.Columns()[1], "b");
+  ASSERT_EQ(insert.Values().size(), 1);
+  EXPECT_EQ(insert.Values()[0].size(), 2);
+
+  auto multi_row = VisitSql(
+      "INSERT INTO t VALUES (1, 'x'), (2, 'y');");
+  ASSERT_TRUE(multi_row);
+  const auto& multi = dynamic_cast<const InsertStatement&>(*multi_row);
+  EXPECT_TRUE(multi.Columns().empty());
+  ASSERT_EQ(multi.Values().size(), 2);
+  EXPECT_EQ(multi.Values()[0].size(), 2);
+  EXPECT_EQ(multi.Values()[1].size(), 2);
+}
+
+TEST(GoogleSqlAstTest, UpdateAndDeleteStatements) {
+  auto update = VisitSql("UPDATE t SET a = 1 WHERE b = 2;");
+  ASSERT_TRUE(update);
+  ASSERT_EQ(update->Type(), StatementType::kUpdate);
+  const auto& update_stmt = dynamic_cast<const UpdateStatement&>(*update);
+  EXPECT_EQ(update_stmt.TableName(), "t");
+  ASSERT_EQ(update_stmt.SetClause().size(), 1);
+  EXPECT_EQ(update_stmt.SetClause()[0].first.name, "a");
+  ASSERT_TRUE(update_stmt.WhereClause());
+  EXPECT_EQ(update_stmt.WhereClause()->ToString(), "(b = 2)");
+
+  auto delete_stmt = VisitSql("DELETE FROM t WHERE a = 1;");
+  ASSERT_TRUE(delete_stmt);
+  ASSERT_EQ(delete_stmt->Type(), StatementType::kDelete);
+  const auto& delete_st = dynamic_cast<const DeleteStatement&>(*delete_stmt);
+  EXPECT_EQ(delete_st.TableName(), "t");
+  ASSERT_TRUE(delete_st.WhereClause());
+  EXPECT_EQ(delete_st.WhereClause()->ToString(), "(a = 1)");
+}
+
+TEST(GoogleSqlAstTest, DropTableStatement) {
+  auto statement = VisitSql("DROP TABLE t;");
+  ASSERT_TRUE(statement);
+  ASSERT_EQ(statement->Type(), StatementType::kDropTable);
+  const auto& drop = dynamic_cast<const DropTableStatement&>(*statement);
+  EXPECT_EQ(drop.TableName(), "t");
+}
+
+TEST(GoogleSqlAstTest, CaseWhenConditionNeedsRelationalEvaluation) {
+  auto statement = VisitSql(
+      "SELECT CASE WHEN EXTRACT(YEAR FROM '2020-01-01') > 2000 THEN 'new' "
+      "ELSE 'old' END;");
+  ASSERT_TRUE(statement);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_EQ(select.SelectList().size(), 1);
+  EXPECT_EQ(select.SelectList()[0].expression->Type(), TypeTag::kCaseExp);
+  EXPECT_TRUE(select.RequiresRelationalEvaluation());
+}
+
+TEST(GoogleSqlAstTest, UnsupportedConstructsThrow) {
+  // Unsupported binary operators: the parser accepts them but the visitor
+  // rejects them during translation.
+  EXPECT_THROW(VisitSqlOrThrow("SELECT 1 IS DISTINCT FROM 2;"),
+               std::runtime_error);
+  EXPECT_THROW(VisitSqlOrThrow("SELECT 'a' || 'b';"), std::runtime_error);
+  EXPECT_THROW(VisitSqlOrThrow("SELECT 1 & 2;"), std::runtime_error);
+  // Aggregate arity is validated during translation.
+  EXPECT_THROW(VisitSqlOrThrow("SELECT COUNT(a, b);"), std::runtime_error);
+  // Intervals must have an integer literal magnitude.
+  EXPECT_THROW(VisitSqlOrThrow("SELECT INTERVAL '1' DAY;"),
+               std::runtime_error);
+  // Array constructors have no expression mapping.
+  EXPECT_THROW(VisitSqlOrThrow("SELECT ARRAY[1, 2];"), std::runtime_error);
+  // Unknown column types are rejected while building CREATE TABLE.
+  EXPECT_THROW(VisitSqlOrThrow("CREATE TABLE t (x BLOB);"),
+               std::runtime_error);
+  // Only DROP TABLE is translated; other DROP kinds are unsupported.
+  EXPECT_THROW(VisitSqlOrThrow("DROP DATABASE t;"), std::runtime_error);
 }
 
 }  // namespace tinylamb

@@ -3,6 +3,9 @@
 #define TINYLAMB_BENCHMARK_TPCH_QUERIES_HPP
 
 #include <array>
+#include <iomanip>
+#include <sstream>
+#include <string>
 #include <string_view>
 
 namespace tinylamb {
@@ -227,6 +230,22 @@ inline constexpr std::array<std::string_view, 22> kTpchBenchmarkQueries = {
                  IN ('10', '19', '14', '22', '23', '31', '13'))
             AND c_custkey NOT IN (SELECT o_custkey FROM orders)) custsale
       GROUP BY cntrycode ORDER BY cntrycode;)sql"};
+
+// TPC-H clause 2.4.11.3: FRACTION = 0.0001 / scale_factor.
+inline std::string TpchBenchmarkQueryText(size_t query_index,
+                                          double scale_factor) {
+  const std::string_view query = kTpchBenchmarkQueries.at(query_index);
+  if (query_index != 10) return std::string(query);
+
+  std::ostringstream fraction;
+  fraction << std::setprecision(17) << (0.0001 / scale_factor);
+  std::string sql(query);
+  const std::string placeholder = "0.0001000000";
+  const auto position = sql.find(placeholder);
+  if (position == std::string::npos) return sql;
+  sql.replace(position, placeholder.size(), fraction.str());
+  return sql;
+}
 
 }  // namespace tinylamb
 

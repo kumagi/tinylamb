@@ -17,7 +17,6 @@
 #ifndef TINYLAMB_PAGE_POOL_HPP
 #define TINYLAMB_PAGE_POOL_HPP
 
-#include <atomic>
 #include <cassert>
 #include <fstream>
 #include <list>
@@ -89,21 +88,17 @@ class PagePool {
 
   void Unpin(page_id_t page_id);
 
-  bool EvictPage(LruType::iterator target);
+  // Detach the LRU unpinned page from the pool maps. Caller writes it back
+  // after releasing pool_latch so file I/O does not serialize GetPage hits.
+  bool DetachVictim(std::unique_ptr<Page>* victim);
 
-  // Scan first unpinned page and evict it.
-  // Return false if all pages are pinned.
-  bool EvictOnePage();
-
- private:
-  PageRef AllocNewPage(page_id_t pid, std::unique_lock<std::mutex> lock);
   // Refresh the specified entry in LRU.
   void Touch(LruType::iterator it);
 
-  // Write `target` page into the file.
+  // Write `target` page into the file. Caller must hold file_latch_.
   void WriteBack(const Page* target);
 
-  // Read page at `pid` from the file to `target`.
+  // Read page at `pid` from the file to `target`. Caller must hold file_latch_.
   void ReadFrom(Page* target, page_id_t pid);
 
   std::string file_name_;
@@ -120,6 +115,10 @@ class PagePool {
   std::unordered_map<page_id_t, LruType::iterator> pool_;
 
   mutable std::mutex pool_latch;
+
+  // Serializes fstream seeks/reads/writes; held independently of pool_latch so
+  // concurrent table loads can keep resolving cached pages while one miss I/Os.
+  mutable std::mutex file_latch_;
 };
 
 }  // namespace tinylamb

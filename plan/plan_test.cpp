@@ -671,4 +671,140 @@ TEST_F(PlanTest, ProjectionEmitExecutorProjectsValues) {
   EXPECT_EQ(sum, 847);  // 12 + 10 + 52 + 242 + 431 + 100
 }
 
+TEST_F(PlanTest, ProjectionPlanIsOrderedByDelegatesToChild) {
+  // Arrange -- begin context, get Sc2 table and its Sc2PK index; the index
+  // scan advertises an ascending order on d1
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        ctx.GetStats("Sc2"));
+  std::vector<ColumnName> provided{ColumnName("Sc2.d1")};
+  auto scan = std::make_shared<IndexOnlyScanPlan>(
+      *tbl, tbl->GetIndex(0), *ts, std::vector<Value>{}, std::vector<Value>{},
+      true, nullptr, provided);
+
+  // Act -- project the index key column over the ordered scan
+  std::vector<NamedExpression> columns;
+  columns.emplace_back(NamedExpression("d1"));
+  Plan pp(new ProjectionPlan(scan, std::move(columns)));
+
+  // Assert -- ordering is delegated to the child plan
+  EXPECT_TRUE(
+      pp->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d1"))}, {true}));
+  EXPECT_FALSE(
+      pp->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d1"))}, {false}));
+  EXPECT_FALSE(
+      pp->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d2"))}, {true}));
+  // Assert -- Dump renders the whole tree, including the ordered child scan
+  std::ostringstream oss;
+  pp->Dump(oss, 0);
+  EXPECT_NE(oss.str().find("IndexOnlyScan: Sc2"), std::string::npos);
+}
+
+TEST_F(PlanTest, IndexOnlyScanPlanDescendingOrder) {
+  // Arrange -- begin context, get Sc2 table and its Sc2PK index
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        ctx.GetStats("Sc2"));
+
+  // Act -- construct a descending index-only scan advertising d1 order
+  std::vector<ColumnName> provided{ColumnName("Sc2.d1")};
+  Plan plan(new IndexOnlyScanPlan(*tbl, tbl->GetIndex(0), *ts, {}, {}, false,
+                                  nullptr, provided));
+
+  // Assert -- the order matches only for the descending direction
+  EXPECT_TRUE(
+      plan->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d1"))}, {false}));
+  EXPECT_FALSE(
+      plan->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d1"))}, {true}));
+  EXPECT_FALSE(
+      plan->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d2"))}, {false}));
+  EXPECT_NE(plan->ToString().find("IndexOnlyScan: Sc2"), std::string::npos);
+}
+
+TEST_F(PlanTest, IndexOnlyScanPlanStaleIndexKeysFallback) {
+  // Arrange -- begin a reader BEFORE a concurrent writer commits so the
+  // reader's snapshot predates the committed index mutation
+  TransactionContext reader = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, reader.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        reader.GetStats("Sc2"));
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSERT_SUCCESS(tbl->Insert(writer.txn_, Row({Value(999), Value(1.0),
+                                                 Value("new"), Value(8)}))
+                       .GetStatus());
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  ASSERT_TRUE(reader.txn_.IndexKeysMayBeStale());
+
+  // Act -- emit an index-only scan; stale index keys must degrade to the
+  // FullScan + Selection + Projection fallback path
+  Expression where = BinaryExpressionExp(ColumnValueExp("d1"),
+                                         BinaryOperation::kGreaterThanEquals,
+                                         ConstantValueExp(Value(0)));
+  Plan plan(new IndexOnlyScanPlan(*tbl, tbl->GetIndex(0), *ts, {}, {}, true,
+                                  where));
+  Executor scan = plan->EmitExecutor(reader);
+  Row result;
+  size_t count = 0;
+  while (scan->Next(&result, nullptr)) {
+    ASSERT_EQ(result.values_.size(), 1);
+    ++count;
+  }
+
+  // Assert -- the reader's snapshot hides the committed row: 6 rows visible
+  ASSERT_EQ(count, 6);
+  reader.txn_.Abort();
+}
+
+TEST_F(PlanTest, IndexOnlyScanPlanStaleFallbackProjectsIncludedColumns) {
+  // Arrange -- add a covering index whose key is d1 and includes d2 and d3
+  {
+    TransactionContext setup = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateIndex(
+        setup, "Sc2", IndexSchema("Sc2Inc", {0}, {1, 2})));
+    ASSERT_SUCCESS(setup.txn_.PreCommit());
+  }
+
+  // Act -- a reader begun before a later committed writer must use the
+  // FullScan fallback, which projects both key and included columns
+  TransactionContext reader = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, reader.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        reader.GetStats("Sc2"));
+  ASSERT_GE(tbl->IndexCount(), 2);
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSERT_SUCCESS(tbl->Insert(writer.txn_, Row({Value(777), Value(2.5),
+                                                 Value("inc"), Value(9)}))
+                       .GetStatus());
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  ASSERT_TRUE(reader.txn_.IndexKeysMayBeStale());
+
+  // NOTE: the stale fallback passes the where expression straight to a
+  // Selection executor; a null where crashes (see Selection/BytecodeCompiler
+  // handling of an empty expression), so supply a real predicate.
+  Expression where = BinaryExpressionExp(ColumnValueExp("d1"),
+                                         BinaryOperation::kGreaterThanEquals,
+                                         ConstantValueExp(Value(0)));
+  Plan plan(new IndexOnlyScanPlan(*tbl, tbl->GetIndex(1), *ts, {}, {}, true,
+                                  where));
+  EXPECT_EQ(plan->GetSchema().ColumnCount(), 3);
+
+  Executor scan = plan->EmitExecutor(reader);
+  Row result;
+  size_t count = 0;
+  while (scan->Next(&result, nullptr)) {
+    ASSERT_EQ(result.values_.size(), 3);
+    ++count;
+  }
+
+  // Assert -- only the 6 snapshot-visible rows are returned
+  ASSERT_EQ(count, 6);
+  reader.txn_.Abort();
+}
+
 }  // namespace tinylamb

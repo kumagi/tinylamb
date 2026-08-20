@@ -324,4 +324,158 @@ TEST_F(CatalogTest, GetTableNotExists) {
   ctx.txn_.Abort();
 }
 
+TEST_F(CatalogTest, PageStoragePoolCapacityFromEnvironment) {
+  // Arrange -- a pool capacity far above one page but below the default
+  ASSERT_EQ(setenv("TINYLAMB_PAGE_POOL_BYTES", "8388608", 1), 0);
+  {
+    Database env_db("catalog_test_env_pool-" + RandomString());
+    TransactionContext ctx = env_db.BeginContext();
+    Schema schema("env_tbl", {Column("c", ValueType::kInt64)});
+    ASSERT_SUCCESS(env_db.CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+    env_db.DeleteAll();
+  }
+  unsetenv("TINYLAMB_PAGE_POOL_BYTES");
+
+  // Arrange -- an env value below one page falls back to the default pool
+  ASSERT_EQ(setenv("TINYLAMB_PAGE_POOL_BYTES", "1000", 1), 0);
+  {
+    Database small_env_db("catalog_test_small_env-" + RandomString());
+    TransactionContext ctx = small_env_db.BeginContext();
+    Schema schema("small_tbl", {Column("c", ValueType::kVarChar)});
+    ASSERT_SUCCESS(small_env_db.CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+    small_env_db.DeleteAll();
+  }
+  unsetenv("TINYLAMB_PAGE_POOL_BYTES");
+}
+
+TEST_F(CatalogTest, PageStoragePageSlotsAllocateReuse) {
+  // Arrange -- begin a transaction backed by the PageStorage page manager
+  TransactionContext ctx = rs_->BeginContext();
+  Transaction& txn = ctx.txn_;
+  PageManager* pm = txn.GetPageManager();
+
+  page_id_t first_pid = 0;
+  {
+    // Act -- allocate a row page and write two slots into it
+    PageRef first = pm->AllocateNewPage(txn, PageType::kRowPage);
+    first_pid = first->PageID();
+    ASSERT_GT(first_pid, 0);
+
+    StatusOr<slot_t> slot_a = first->Insert(txn, "row-a");
+    ASSERT_SUCCESS(slot_a.GetStatus());
+    StatusOr<slot_t> slot_b = first->Insert(txn, "row-b");
+    ASSERT_SUCCESS(slot_b.GetStatus());
+    ASSERT_NE(slot_a.Value(), slot_b.Value());
+
+    // Assert -- each slot reads back its written payload
+    StatusOr<std::string_view> read_a = first->Read(txn, slot_a.Value());
+    ASSERT_SUCCESS(read_a.GetStatus());
+    EXPECT_EQ(read_a.Value(), "row-a");
+
+    // Act -- update one slot in place and read it back
+    ASSERT_SUCCESS(first->Update(txn, slot_b.Value(), "row-b-updated"));
+    StatusOr<std::string_view> read_b = first->Read(txn, slot_b.Value());
+    ASSERT_SUCCESS(read_b.GetStatus());
+    EXPECT_EQ(read_b.Value(), "row-b-updated");
+
+    // Act -- delete a slot and confirm it is gone
+    ASSERT_SUCCESS(first->Delete(txn, slot_a.Value()));
+    StatusOr<std::string_view> gone = first->Read(txn, slot_a.Value());
+    EXPECT_EQ(gone.GetStatus(), Status::kNotExists);
+
+    // Act -- destroy the page so its id returns to the free list
+    pm->DestroyPage(txn, first.get());
+  }
+
+  // Assert -- the next allocation reuses the freed page id
+  PageRef second = pm->AllocateNewPage(txn, PageType::kRowPage);
+  EXPECT_EQ(second->PageID(), first_pid);
+
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(CatalogTest, PageStorageAllocatesGrowingPageIds) {
+  // Arrange -- begin a transaction backed by the PageStorage page manager
+  TransactionContext ctx = rs_->BeginContext();
+  PageManager* pm = ctx.txn_.GetPageManager();
+
+  // Act -- allocate several row pages and record their ids
+  std::vector<page_id_t> pids;
+  for (int i = 0; i < 5; ++i) {
+    PageRef page = pm->AllocateNewPage(ctx.txn_, PageType::kRowPage);
+    pids.push_back(page->PageID());
+  }
+
+  // Assert -- every page id is distinct (the underlying file grew)
+  for (size_t i = 0; i < pids.size(); ++i) {
+    for (size_t j = i + 1; j < pids.size(); ++j) {
+      ASSERT_NE(pids[i], pids[j]);
+    }
+  }
+
+  // Act -- read back a slot written into the first allocated page
+  PageRef first = pm->GetPage(pids.front());
+  StatusOr<slot_t> slot = first->Insert(ctx.txn_, "growth-check");
+  ASSERT_SUCCESS(slot.GetStatus());
+  StatusOr<std::string_view> read = first->Read(ctx.txn_, slot.Value());
+  ASSERT_SUCCESS(read.GetStatus());
+  EXPECT_EQ(read.Value(), "growth-check");
+
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(CatalogTest, CreateTableWithUniqueColumn) {
+  // Arrange -- a schema whose key column carries a UNIQUE constraint
+  Schema schema("unique_tbl",
+                {Column("id", ValueType::kInt64, Constraint(Constraint::kUnique)),
+                 Column("name", ValueType::kVarChar)});
+
+  // Act -- create the table; this path builds a unique B+tree index
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Assert -- the catalog entry round-trips and carries the unique index
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+                          ctx.GetTable("unique_tbl"));
+    ASSERT_EQ(schema, tbl->GetSchema());
+    ASSERT_EQ(tbl->IndexCount(), 1u);
+    ASSERT_TRUE(tbl->GetIndex(0).IsUnique());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+}
+
+TEST_F(CatalogTest, UniqueIndexRejectsDuplicateKeys) {
+  // Arrange -- a UNIQUE-constrained table created through the catalog
+  Schema schema("uniq_ins",
+                {Column("id", ValueType::kInt64, Constraint(Constraint::kUnique)),
+                 Column("name", ValueType::kVarChar)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Act -- insert one row, then a second row that collides on the key
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+                          ctx.GetTable("uniq_ins"));
+    ASSERT_SUCCESS(
+        tbl->Insert(ctx.txn_, Row({Value(1), Value("alice")})).GetStatus());
+    const Status duplicate =
+        tbl->Insert(ctx.txn_, Row({Value(1), Value("bob")})).GetStatus();
+
+    // Assert -- the colliding insert is rejected by the unique index
+    EXPECT_NE(duplicate, Status::kSuccess);
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+}
+
 }  // namespace tinylamb

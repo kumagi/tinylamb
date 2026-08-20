@@ -337,4 +337,81 @@ TEST_F(PagePoolTest, EvictionResumesAfterPoolGrewPastCapacity) {
   EXPECT_EQ(newer->PageID(), static_cast<page_id_t>(kDefaultCapacity + 1));
 }
 
+TEST_F(PagePoolTest, CacheHitFlagReflectsMissAndHit) {
+  // Arrange -- nothing more than default PagePool (capacity 10) from SetUp()
+  // Act -- request page 9 once (miss) and again (hit), observing the flag.
+  // The PageRef holds the page's exclusive latch, so the second request must
+  // wait for the first ref to be destroyed.
+  bool hit = true;
+  {
+    PageRef miss = pp->GetPage(9, &hit);
+
+    // Assert -- the first request was a miss
+    ASSERT_FALSE(hit);
+  }
+  hit = false;
+  {
+    PageRef hit_ref = pp->GetPage(9, &hit);
+
+    // Assert -- the second request was served from the pool
+    ASSERT_TRUE(hit);
+    ASSERT_EQ(hit_ref->PageID(), 9U);
+  }
+}
+
+TEST_F(PagePoolTest, DropAllPagesClearsPool) {
+  // Arrange -- request 5 distinct pages so the pool is non-empty
+  for (int i = 0; i < 5; ++i) {
+    PageRef p = pp->GetPage(i, nullptr);
+    ASSERT_EQ(p->PageID(), i);
+  }
+  ASSERT_EQ(pp->Size(), 5);
+
+  // Act -- drop every buffered page without writing back
+  pp->DropAllPages();
+
+  // Assert -- the pool is empty and still serves fresh pages afterwards
+  ASSERT_EQ(pp->Size(), 0);
+  PageRef again = pp->GetPage(2, nullptr);
+  ASSERT_EQ(again->PageID(), 2);
+  ASSERT_EQ(pp->Size(), 1);
+}
+
+TEST_F(PagePoolTest, FlushPageForTestPersistsAndNoopsForMissing) {
+  // Arrange -- fill page 7's body with a deterministic pattern, then release
+  // the pin so the pool entry is unpinned before it is dropped below.
+  {
+    PageRef p = pp->GetPage(7, nullptr);
+    char* buff = p->body.free_page.FreeBody();
+    ASSERT_NE(buff, nullptr);
+    for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
+      buff[j] = static_cast<char>(0x5a);
+    }
+
+    // Act -- write back page 7; flushing a never-resident page is a no-op
+    pp->FlushPageForTest(7);
+    pp->FlushPageForTest(1234);
+  }
+
+  // Act -- discard the pool (without a second flush) and reload the page
+  pp->DropAllPages();
+  ASSERT_EQ(pp->Size(), 0);
+  PageRef reloaded = pp->GetPage(7, nullptr);
+
+  // Assert -- the flushed pattern survived the drop-and-reload cycle
+  ASSERT_EQ(reloaded->PageID(), 7);
+  const char* body = reloaded->body.free_page.FreeBody();
+  for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
+    EXPECT_EQ(body[j], static_cast<char>(0x5a));
+  }
+}
+
+TEST_F(PagePoolTest, ConstructorThrowsForUnopenablePath) {
+  // Arrange/Act -- a pool whose backing file cannot be created (missing parent
+  // directory); the constructor retries with O_TRUNC then throws
+  // Assert -- the constructor reports failure instead of silently proceeding
+  EXPECT_THROW(PagePool("/nonexistent_dir_tinylamb/foo.db", 10),
+               std::runtime_error);
+}
+
 }  // namespace tinylamb

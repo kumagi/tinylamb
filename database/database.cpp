@@ -175,6 +175,26 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
   return new_table;
 }
 
+Status Database::DropTable(TransactionContext& ctx,
+                           std::string_view schema_name) {
+  ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
+  const Schema& schema = tbl.GetSchema();
+  for (slot_t column = 0; column < schema.ColumnCount(); ++column) {
+    const Status deleted = statistics_.Delete(
+        ctx.txn_, StatisticsColumnKey(schema_name, column));
+    if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
+      return deleted;
+    }
+  }
+  {
+    const Status deleted = statistics_.Delete(ctx.txn_, schema_name);
+    if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
+      return deleted;
+    }
+  }
+  return catalog_.Delete(ctx.txn_, schema_name);
+}
+
 Status Database::CreateIndex(TransactionContext& ctx,
                              std::string_view schema_name,
                              const IndexSchema& idx) {

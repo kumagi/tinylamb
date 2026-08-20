@@ -1521,3 +1521,573 @@ TEST_F(ExecutorTest, LimitDump) {
   EXPECT_NE(ss.str().find("SyntheticBatchExecutor"), std::string::npos);
 }
 }  // namespace tinylamb
+
+// ===== RelationalExecutor (complex SELECT plans) coverage =====
+#include "query/sql_engine.hpp"
+
+namespace tinylamb {
+namespace {
+
+// Executes SQL through the SqlEngine (the same driver the server uses) in a
+// fresh committed context and returns every produced row. Queries that throw
+// must be tested separately (see the *Throws tests below).
+std::vector<Row> RelationalRun(Database& database, std::string_view sql) {
+  TransactionContext context = database.BeginContext();
+  SqlEngine engine(database);
+  StatusOr<Executor> prepared = engine.Prepare(context, sql);
+  std::vector<Row> rows;
+  if (!prepared.HasValue()) {
+    ADD_FAILURE() << sql << "\n" << engine.LastError();
+    context.Abort();
+    return rows;
+  }
+  Row row;
+  while (prepared.Value()->Next(&row, nullptr)) rows.push_back(row);
+  EXPECT_EQ(context.PreCommit(), Status::kSuccess);
+  return rows;
+}
+
+// Runs `sql` and captures the first std::exception message ("" if none).
+std::string RelationalThrow(Database& database, std::string_view sql) {
+  TransactionContext context = database.BeginContext();
+  SqlEngine engine(database);
+  StatusOr<Executor> prepared = engine.Prepare(context, sql);
+  if (!prepared.HasValue()) {
+    context.Abort();
+    return "<prepare: " + engine.LastError() + ">";
+  }
+  try {
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+  } catch (const std::exception& error) {
+    context.Abort();
+    return error.what();
+  }
+  context.Abort();
+  return "";
+}
+
+// Fails unless `message` contains `substring`.
+void ExpectMessageContains(const std::string& message,
+                           const std::string& substring) {
+  EXPECT_NE(message.find(substring), std::string::npos) << message;
+}
+
+}  // namespace
+
+TEST_F(ExecutorTest, RelationalTruthinessOfBareColumns) {
+  // name (varchar), score (double) and key (int64) are tested for truthiness
+  // directly inside the relational predicate evaluator (relational.cpp Truthy).
+  const auto rows = RelationalRun(
+      *rs_, "SELECT key FROM SampleTable WHERE (name AND score AND key) OR "
+            "key = 5 ORDER BY key;");
+  ASSERT_EQ(rows.size(), 3u);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[1][0], Value(2));
+  EXPECT_EQ(rows[2][0], Value(3));
+}
+
+TEST_F(ExecutorTest, RelationalNotEqualsAndLikePredicates) {
+  // kNotEquals on numeric operands and LIKE with a trailing '%'.
+  const auto not_equals = RelationalRun(
+      *rs_, "SELECT key FROM SampleTable WHERE key != 2 OR key = 5 ORDER BY "
+            "key;");
+  ASSERT_EQ(not_equals.size(), 3u);
+  EXPECT_EQ(not_equals[0][0], Value(0));
+  EXPECT_EQ(not_equals[1][0], Value(1));
+  EXPECT_EQ(not_equals[2][0], Value(3));
+
+  const auto like = RelationalRun(
+      *rs_, "SELECT key FROM SampleTable WHERE name LIKE 'hello%' OR key = 3 "
+            "ORDER BY key;");
+  ASSERT_EQ(like.size(), 2u);
+  EXPECT_EQ(like[0][0], Value(0));
+  EXPECT_EQ(like[1][0], Value(3));
+}
+
+TEST_F(ExecutorTest, RelationalStringConcatenationWithPlus) {
+  // '+' on two VARCHAR operands concatenates in the relational evaluator.
+  const auto rows = RelationalRun(
+      *rs_, "SELECT key FROM SampleTable WHERE key = 1 OR name + name = "
+            "'hellohello' ORDER BY key;");
+  ASSERT_EQ(rows.size(), 2u);
+  EXPECT_EQ(rows[0][0], Value(0));
+  EXPECT_EQ(rows[1][0], Value(1));
+}
+
+TEST_F(ExecutorTest, RelationalUnaryOperators) {
+  const auto minus = RelationalRun(
+      *rs_, "SELECT -key, -score FROM SampleTable WHERE key = 1 OR key = 2;");
+  ASSERT_EQ(minus.size(), 2u);
+  EXPECT_EQ(minus[0][0], Value(-1));
+  EXPECT_EQ(minus[0][1], Value(-4.9));
+  EXPECT_EQ(minus[1][0], Value(-2));
+  EXPECT_EQ(minus[1][1], Value(-4.14));
+
+  const auto is_null = RelationalRun(
+      *rs_, "SELECT key FROM SampleTable WHERE key IS NULL OR key IS NOT "
+            "NULL;");
+  EXPECT_EQ(is_null.size(), 4u);
+
+  const auto not_expr = RelationalRun(
+      *rs_, "SELECT key FROM SampleTable WHERE NOT (key = 1) OR key = 2 "
+            "ORDER BY key;");
+  ASSERT_EQ(not_expr.size(), 3u);
+  EXPECT_EQ(not_expr[0][0], Value(0));
+  EXPECT_EQ(not_expr[1][0], Value(2));
+  EXPECT_EQ(not_expr[2][0], Value(3));
+}
+
+TEST_F(ExecutorTest, RelationalAggregateInUnaryAndCase) {
+  const auto negated = RelationalRun(*rs_, "SELECT -COUNT(*) FROM SampleTable;");
+  ASSERT_EQ(negated.size(), 1u);
+  EXPECT_EQ(negated[0][0], Value(-4));
+
+  const auto conditional = RelationalRun(
+      *rs_,
+      "SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END FROM SampleTable;");
+  ASSERT_EQ(conditional.size(), 1u);
+  EXPECT_EQ(conditional[0][0], Value(1));
+
+  // Aggregate in the CASE else-clause (when-clauses carry no aggregate).
+  const auto aggregate_else = RelationalRun(
+      *rs_, "SELECT CASE WHEN key > 0 THEN 1 ELSE COUNT(*) END FROM "
+            "SampleTable;");
+  ASSERT_EQ(aggregate_else.size(), 1u);
+  EXPECT_EQ(aggregate_else[0][0], Value(4));
+}
+
+TEST_F(ExecutorTest, RelationalScalarFunctionsInGroupedQuery) {
+  const auto coalesce = RelationalRun(
+      *rs_, "SELECT COALESCE(NULL, key) AS c FROM SampleTable GROUP BY key;");
+  ASSERT_EQ(coalesce.size(), 4u);
+
+  const auto coalesce_all_null = RelationalRun(
+      *rs_, "SELECT COALESCE(NULL, NULL) AS c FROM SampleTable GROUP BY key;");
+  ASSERT_EQ(coalesce_all_null.size(), 4u);
+  EXPECT_TRUE(coalesce_all_null[0][0].IsNull());
+
+  const auto concat = RelationalRun(
+      *rs_, "SELECT CONCAT('a', NULL, 'b') FROM SampleTable GROUP BY key;");
+  ASSERT_EQ(concat.size(), 4u);
+  EXPECT_EQ(concat[0][0], Value("ab"));
+
+  const auto now = RelationalRun(
+      *rs_, "SELECT CURRENT_TIMESTAMP() FROM SampleTable GROUP BY key;");
+  ASSERT_EQ(now.size(), 4u);
+  EXPECT_EQ(now[0][0].type, ValueType::kVarChar);
+  EXPECT_FALSE(now[0][0].IsNull());
+}
+
+TEST_F(ExecutorTest, RelationalDateFunctions) {
+  const auto add = RelationalRun(*rs_, "SELECT DATE_ADD('2026-01-01', INTERVAL 3 DAY);");
+  ASSERT_EQ(add.size(), 1u);
+  EXPECT_EQ(add[0][0], Value("2026-01-04"));
+
+  const auto extract = RelationalRun(
+      *rs_, "SELECT EXTRACT(YEAR FROM '2026-08-21'), EXTRACT(MONTH FROM "
+            "'2026-08-21'), EXTRACT(DAY FROM '2026-08-21');");
+  ASSERT_EQ(extract.size(), 1u);
+  EXPECT_EQ(extract[0][0], Value(2026));
+  EXPECT_EQ(extract[0][1], Value(8));
+  EXPECT_EQ(extract[0][2], Value(21));
+}
+
+TEST_F(ExecutorTest, RelationalCorrelatedExistsBuildsIndex) {
+  // The correlated equality `o.key = key` drives the per-subquery correlated
+  // index (local key on the right-hand side of the equality).
+  const auto rows = RelationalRun(
+      *rs_, "SELECT o.key FROM SampleTable AS o WHERE EXISTS (SELECT 1 FROM "
+            "SampleTable WHERE o.key = key AND key > 1) ORDER BY o.key;");
+  ASSERT_EQ(rows.size(), 2u);
+  EXPECT_EQ(rows[0][0], Value(2));
+  EXPECT_EQ(rows[1][0], Value(3));
+}
+
+TEST_F(ExecutorTest, RelationalCorrelatedExistsCacheHits) {
+  // A cross join repeats every outer key 4 times; only the first evaluation
+  // per key builds the correlated index, the rest must hit the result cache.
+  const auto rows = RelationalRun(
+      *rs_, "SELECT o.key FROM SampleTable AS o CROSS JOIN SampleTable AS b "
+            "WHERE EXISTS (SELECT COUNT(*) FROM SampleTable WHERE o.key = key "
+            "HAVING COUNT(*) > 0) ORDER BY o.key;");
+  ASSERT_EQ(rows.size(), 16u);
+  for (const Row& row : rows) {
+    EXPECT_TRUE(row[0].value.int_value >= 0 && row[0].value.int_value <= 3);
+  }
+}
+
+TEST_F(ExecutorTest, RelationalInnerAndLeftJoins) {
+  // Inner join without an equality key uses the nested-loop fallback.
+  const auto inner = RelationalRun(
+      *rs_, "SELECT a.key FROM SampleTable AS a JOIN SampleTable AS b ON "
+            "a.key > b.key ORDER BY a.key;");
+  ASSERT_EQ(inner.size(), 6u);
+  // Left join without an equality key emits unmatched rows with NULLs.
+  const auto left = RelationalRun(
+      *rs_, "SELECT a.key FROM SampleTable AS a LEFT JOIN SampleTable AS b ON "
+            "a.key > b.key ORDER BY a.key;");
+  ASSERT_EQ(left.size(), 7u);
+  int64_t previous = -1;
+  for (const Row& row : left) {
+    EXPECT_GE(row[0].value.int_value, previous);
+    previous = row[0].value.int_value;
+  }
+}
+
+TEST_F(ExecutorTest, RelationalDistinctDeduplicatesJoinedRows) {
+  const auto rows = RelationalRun(
+      *rs_, "SELECT DISTINCT a.key FROM SampleTable AS a CROSS JOIN SampleTable "
+            "AS b WHERE a.key = 1 OR a.key = 2;");
+  ASSERT_EQ(rows.size(), 2u);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[1][0], Value(2));
+}
+
+TEST_F(ExecutorTest, RelationalSortAndLimitOffset) {
+  const auto sorted = RelationalRun(
+      *rs_, "SELECT key FROM SampleTable WHERE key = 1 OR key = 2 ORDER BY "
+            "key = 99;");
+  ASSERT_EQ(sorted.size(), 2u);
+
+  const auto limited = RelationalRun(
+      *rs_, "SELECT key FROM SampleTable WHERE key = 1 OR key = 2 LIMIT 1 "
+            "OFFSET 1;");
+  ASSERT_EQ(limited.size(), 1u);
+  EXPECT_EQ(limited[0][0], Value(2));
+}
+
+TEST_F(ExecutorTest, RelationalInSubqueriesAndScalarFallback) {
+  const auto uncorrelated = RelationalRun(
+      *rs_, "SELECT key FROM SampleTable WHERE key IN (SELECT key FROM "
+            "SampleTable ORDER BY key);");
+  EXPECT_EQ(uncorrelated.size(), 4u);
+
+  const auto derived_star = RelationalRun(
+      *rs_, "SELECT key FROM SampleTable WHERE key IN (SELECT * FROM (SELECT * "
+            "FROM SampleTable));");
+  EXPECT_EQ(derived_star.size(), 4u);
+
+  // Scalar subquery that is neither correlated-indexable nor cacheable must
+  // fall back to a full ExecuteQuery.
+  const auto scalar = RelationalRun(
+      *rs_, "SELECT (SELECT * FROM (SELECT * FROM SampleTable)) FROM "
+            "SampleTable;");
+  ASSERT_EQ(scalar.size(), 4u);
+  for (const Row& row : scalar) {
+    EXPECT_EQ(row[0], Value(0));
+  }
+
+  // A subquery whose JOIN condition references an outer-column qualifier is
+  // rejected as uncorrelated by StatementUsesOnlyScopes; the unresolvable join
+  // predicate is then dropped, leaving a cross join, so IN tests only match
+  // the returned constant.
+  const auto cross = RelationalRun(
+      *rs_, "SELECT key FROM SampleTable WHERE key IN (SELECT 1 FROM "
+            "SampleTable AS s JOIN SampleTable AS s2 ON s2.key = "
+            "SampleTable.key);");
+  ASSERT_EQ(cross.size(), 1u);
+  EXPECT_EQ(cross[0][0], Value(1));
+}
+
+TEST_F(ExecutorTest, RelationalScalarSubqueryReturnsNullWhenEmpty) {
+  const auto rows = RelationalRun(
+      *rs_, "SELECT (SELECT key FROM SampleTable WHERE key = 99) FROM "
+            "SampleTable;");
+  ASSERT_EQ(rows.size(), 4u);
+  EXPECT_TRUE(rows[0][0].IsNull());
+}
+
+TEST_F(ExecutorTest, RelationalIntervalAndNoFromQueries) {
+  const auto interval = RelationalRun(*rs_, "SELECT INTERVAL 3 DAY;");
+  ASSERT_EQ(interval.size(), 1u);
+  EXPECT_EQ(interval[0][0], Value("3 day"));
+
+  const auto boolean = RelationalRun(*rs_, "SELECT 1 OR 1;");
+  ASSERT_EQ(boolean.size(), 1u);
+  EXPECT_EQ(boolean[0][0], Value(1));
+}
+
+TEST_F(ExecutorTest, RelationalDdlAndDmlRoundTrip) {
+  RelationalRun(*rs_, "CREATE TABLE RoundTrip (id INT64, label STRING);");
+  RelationalRun(*rs_, "INSERT INTO RoundTrip VALUES (1, 'one'), (2, 'two');");
+  RelationalRun(*rs_, "UPDATE RoundTrip SET label = 'uno' WHERE id = 1;");
+  RelationalRun(*rs_, "DELETE FROM RoundTrip WHERE id = 2;");
+  const auto rows = RelationalRun(*rs_, "SELECT id, label FROM RoundTrip;");
+  ASSERT_EQ(rows.size(), 1u);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[0][1], Value("uno"));
+}
+
+TEST_F(ExecutorTest, RelationalExplainPlans) {
+  auto explain = [&](std::string_view sql) {
+    std::string text;
+    for (const Row& row :
+         RelationalRun(*rs_, std::string("EXPLAIN ") + std::string(sql))) {
+      text += row[0].AsString();
+      text += '\n';
+    }
+    return text;
+  };
+
+  const std::string derived = explain("SELECT * FROM (SELECT * FROM SampleTable);");
+  EXPECT_NE(derived.find("RelationalExecutor"), std::string::npos);
+  EXPECT_NE(derived.find("derived_query"), std::string::npos);
+
+  const std::string aliased = explain("SELECT * FROM SampleTable AS t;");
+  EXPECT_NE(aliased.find("AS t"), std::string::npos);
+
+  const std::string inner = explain(
+      "SELECT * FROM SampleTable AS a JOIN SampleTable AS b ON a.key = b.key;");
+  EXPECT_NE(inner.find("join=inner"), std::string::npos);
+  EXPECT_NE(inner.find("on="), std::string::npos);
+
+  const std::string left = explain(
+      "SELECT a.key FROM SampleTable AS a LEFT JOIN SampleTable AS b ON "
+      "a.key = b.key;");
+  EXPECT_NE(left.find("join=left"), std::string::npos);
+
+  const std::string limited = explain(
+      "SELECT key FROM SampleTable WHERE key = 1 OR key = 2 LIMIT 3 OFFSET 1;");
+  EXPECT_NE(limited.find("Limit(count=3"), std::string::npos);
+  EXPECT_NE(limited.find("offset=1"), std::string::npos);
+}
+
+TEST_F(ExecutorTest, RelationalAggregateOnVarcharThrows) {
+  ExpectMessageContains(
+      RelationalThrow(*rs_, "SELECT name, SUM(name) AS s FROM SampleTable "
+                            "GROUP BY name;"),
+      "numeric value required");
+}
+
+TEST_F(ExecutorTest, RelationalAmbiguousColumnThrows) {
+  ExpectMessageContains(RelationalThrow(*rs_, "SELECT key FROM SampleTable AS a "
+                                              "JOIN SampleTable AS b ON "
+                                              "a.key = b.key;"),
+                        "ambiguous column key");
+  ExpectMessageContains(RelationalThrow(*rs_, "SELECT a.key FROM SampleTable AS "
+                                              "a JOIN SampleTable AS b ON "
+                                              "a.key = b.key WHERE key > 1;"),
+                        "ambiguous column key");
+}
+
+TEST_F(ExecutorTest, RelationalUnknownColumnThrows) {
+  ExpectMessageContains(
+      RelationalThrow(*rs_, "SELECT (SELECT nope) FROM SampleTable;"),
+      "column nope not found");
+}
+
+TEST_F(ExecutorTest, RelationalLikeNonStringOperandThrows) {
+  ExpectMessageContains(RelationalThrow(*rs_, "SELECT key FROM SampleTable WHERE "
+                                              "key LIKE '5' OR key = 1;"),
+                        "LIKE requires string operands");
+}
+
+TEST_F(ExecutorTest, RelationalAggregateInWhereThrows) {
+  ExpectMessageContains(RelationalThrow(*rs_, "SELECT key FROM SampleTable WHERE "
+                                              "COUNT(*) > 0;"),
+                        "aggregate outside grouping");
+}
+
+TEST_F(ExecutorTest, RelationalMissingTableThrows) {
+  ExpectMessageContains(RelationalThrow(*rs_, "SELECT key FROM nonexistent JOIN "
+                                              "SampleTable ON TRUE;"),
+                        "table nonexistent not found");
+  ExpectMessageContains(RelationalThrow(*rs_, "SELECT (SELECT x FROM missing) "
+                                              "FROM SampleTable;"),
+                        "table missing not found");
+}
+
+TEST_F(ExecutorTest, RelationalUnsupportedFunctionThrows) {
+  ExpectMessageContains(RelationalThrow(*rs_, "SELECT FOOBAR(1) FROM SampleTable "
+                                              "GROUP BY key;"),
+                        "unsupported function foobar");
+}
+
+TEST_F(ExecutorTest, RelationalDateAddArityThrows) {
+  ExpectMessageContains(RelationalThrow(*rs_, "SELECT DATE_ADD('2026-01-01', "
+                                              "5);"),
+                        "DATE_ADD/DATE_SUB arity");
+}
+
+TEST_F(ExecutorTest, RelationalDatePlusDateThrows) {
+  RelationalRun(*rs_, "CREATE TABLE RelDate (d DATE, v INT64);");
+  RelationalRun(*rs_, "INSERT INTO RelDate VALUES (date '2026-01-01', 1);");
+  RelationalRun(*rs_, "INSERT INTO RelDate VALUES (date '2026-06-01', 2);");
+  ExpectMessageContains(RelationalThrow(*rs_, "SELECT v FROM RelDate WHERE v = 1 "
+                                              "OR d + d = 'x';"),
+                        "unsupported binary operation");
+}
+
+TEST_F(ExecutorTest, RelationalCorrelatedSubqueryOverNullOuterDocumentsBug) {
+  // PRODUCTION BUG: a correlated EXISTS whose outer column is NULL crashes.
+  // ExecuteCorrelatedSingleSource encodes the outer values (including NULL)
+  // into the cache key *before* the IsNull() guard at relational.cpp:1752, so
+  // Row::EncodeMemcomparableFormat() throws "Cannot encode unknown type"
+  // instead of returning an empty relation. The null-extension branch of the
+  // code is therefore dead and this test documents the observed behavior.
+  ExpectMessageContains(RelationalThrow(*rs_, "SELECT o.key FROM SampleTable AS "
+                                              "o LEFT JOIN SampleTable AS b ON "
+                                              "o.key = b.key AND b.key = 99 "
+                                              "WHERE EXISTS (SELECT 1 FROM "
+                                              "SampleTable WHERE b.key = key);"),
+                        "Cannot encode unknown type");
+}
+
+TEST_F(ExecutorTest, AggregationExpressionChildIsEvaluatedPerRow) {
+  // Arrange: the aggregate child is an expression (not a plain column), so the
+  // executor materializes each row and evaluates it via the expression.
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  std::vector<Row> rows{Row({Value(1)}), Row({Value(2)}), Row({Value(3)})};
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("sum_plus_one",
+                      AggregateExpressionExp(
+                          AggregationType::kSum,
+                          BinaryExpressionExp(ColumnValueExp("value"),
+                                              BinaryOperation::kAdd,
+                                              ConstantValueExp(Value(1)))))};
+  AggregationExecutor aggregate(
+      std::make_shared<ConstantExecutor>(std::move(rows)), schema,
+      std::move(aggregates));
+
+  // Act + Assert: (1+1)+(2+1)+(3+1) = 9
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+  EXPECT_EQ(result[0], Value(9));
+  EXPECT_FALSE(aggregate.Next(&result, nullptr));
+}
+
+TEST_F(ExecutorTest, AggregationMissingColumnThrows) {
+  // Arrange: the aggregate references a column that is not in the input schema.
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  std::vector<Row> rows{Row({Value(1)})};
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("sum_missing",
+                      AggregateExpressionExp(AggregationType::kSum,
+                                             ColumnValueExp("nope")))};
+  AggregationExecutor aggregate(
+      std::make_shared<ConstantExecutor>(std::move(rows)), schema,
+      std::move(aggregates));
+
+  // Act + Assert: evaluating the missing column throws.
+  Row result;
+  EXPECT_THROW(aggregate.Next(&result, nullptr), std::runtime_error);
+}
+
+TEST_F(ExecutorTest, AggregationAverageOverIntColumn) {
+  // Arrange: AVG over an INT64 column must convert each value to double.
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  std::vector<Row> rows{Row({Value(1)}), Row({Value(2)}), Row({Value(3)})};
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("avg", AggregateExpressionExp(AggregationType::kAvg,
+                                                    ColumnValueExp("value")))};
+  AggregationExecutor aggregate(
+      std::make_shared<ConstantExecutor>(std::move(rows)), schema,
+      std::move(aggregates));
+
+  // Act + Assert: (1+2+3)/3 = 2.0
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+  EXPECT_EQ(result[0], Value(2.0));
+  EXPECT_FALSE(aggregate.Next(&result, nullptr));
+}
+
+TEST_F(ExecutorTest, AggregationDumpListsAggregates) {
+  // Arrange: an aggregation over a two-row constant input.
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  std::vector<Row> rows{Row({Value(1)}), Row({Value(2)})};
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("count", AggregateExpressionExp(AggregationType::kCount,
+                                                      ColumnValueExp("value")))};
+  AggregationExecutor aggregate(
+      std::make_shared<ConstantExecutor>(std::move(rows)), schema,
+      std::move(aggregates));
+
+  // Act: dump the executor and then consume its single result row.
+  std::stringstream ss;
+  aggregate.Dump(ss, 0);
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+
+  // Assert: the dump names the executor and the aggregate; the count is 2.
+  EXPECT_NE(ss.str().find("AggregationExecutor"), std::string::npos);
+  EXPECT_NE(ss.str().find("count"), std::string::npos);
+  EXPECT_EQ(result[0], Value(2));
+  EXPECT_FALSE(aggregate.Next(&result, nullptr));
+}
+
+TEST_F(ExecutorTest, SortWithThrowingKeyExpressionRethrows) {
+  // Arrange: the sort key references a column missing from the schema, so the
+  // comparator throws inside the sort worker and must be rethrown.
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  auto input = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(2)}), Row({Value(1)})});
+  SortExecutor sort(input, schema, {{ColumnValueExp("nope"), true}});
+
+  // Act + Assert: materializing the sort rethrows the worker exception.
+  Row row;
+  RowPosition pos;
+  EXPECT_THROW(sort.Next(&row, &pos), std::runtime_error);
+}
+
+TEST_F(ExecutorTest, AggregationJitEligibleSumWithoutThresholdUsesFallback) {
+  // Arrange: a single INT64 SUM aggregate is JIT-eligible, but with a row
+  // count below the threshold the JIT is never compiled and every batch (one
+  // of which carries a NULL) must fall back to the row-wise accumulator.
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  std::vector<Row> rows{Row({Value(1)}), Row({Value(2)}), Row({Value()}),
+                        Row({Value(4)})};
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("sum",
+                      AggregateExpressionExp(AggregationType::kSum,
+                                             ColumnValueExp("value")))};
+  AggregationExecutor aggregate(
+      std::make_shared<ConstantExecutor>(std::move(rows)), schema,
+      std::move(aggregates));
+
+  // Act + Assert: the NULL is skipped and the remaining values sum to 7.
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+  EXPECT_EQ(result[0], Value(7));
+  EXPECT_FALSE(aggregate.Next(&result, nullptr));
+}
+
+TEST_F(ExecutorTest, AggregationCountStarCountsNullRows) {
+  // Arrange: COUNT(*) must count every row, including rows whose value column
+  // is NULL.
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  std::vector<Row> rows{Row({Value(1)}), Row({Value()}), Row({Value(3)})};
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("count_star",
+                      AggregateExpressionExp(AggregationType::kCount,
+                                             ColumnValueExp("*")))};
+  AggregationExecutor aggregate(
+      std::make_shared<ConstantExecutor>(std::move(rows)), schema,
+      std::move(aggregates));
+
+  // Act + Assert: all three rows are counted.
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+  EXPECT_EQ(result[0], Value(3));
+  EXPECT_FALSE(aggregate.Next(&result, nullptr));
+}
+
+TEST_F(ExecutorTest, AggregationAverageOverEmptyInputIsNull) {
+  // Arrange: AVG over an empty input has no values to average.
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("avg", AggregateExpressionExp(AggregationType::kAvg,
+                                                    ColumnValueExp("value")))};
+  AggregationExecutor aggregate(
+      std::make_shared<ConstantExecutor>(std::vector<Row>{}), schema,
+      std::move(aggregates));
+
+  // Act + Assert: the result is NULL rather than zero.
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+  EXPECT_TRUE(result[0].IsNull());
+  EXPECT_FALSE(aggregate.Next(&result, nullptr));
+}
+
+}  // namespace tinylamb

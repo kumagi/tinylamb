@@ -60,6 +60,10 @@ class BPlusTree {
                                      std::string_view foster_key);
   void GrowTreeHeightIfNeeded(Transaction& txn) const;
   PageRef FindLeaf(Transaction& txn, std::string_view key, bool less_than);
+  // Read-only leaf lookup that follows foster chains without absorbing them.
+  // If stop_before is non-zero, do not descend into that foster child.
+  PageRef FindLeafReadOnly(Transaction& txn, std::string_view key,
+                           bool less_than, page_id_t stop_before = 0);
 
   PageRef FindLeftmostPage(Transaction& txn, PageRef&& root);
   PageRef FindRightmostPage(Transaction& txn, PageRef&& root);

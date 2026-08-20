@@ -55,36 +55,76 @@ PagePool::PagePool(std::string_view file_name, size_t capacity)
 
 PageRef PagePool::GetPage(page_id_t page_id, bool* cache_hit, bool shared) {
   std::unique_lock latch(pool_latch);
-  auto entry = pool_.find(page_id);
-  if (entry != pool_.end()) {
-    entry->second->pin_count++;
-    Touch(entry->second);
-    // Touch moves the entry to the tail of pool_lru_ and invalidates the old
-    // list iterator. Resolve the new iterator before taking addresses from it;
-    // using entry->second here was a use-after-erase that could hand PageRef a
-    // stale page latch under concurrent reads.
-    const LruType::iterator refreshed = pool_.at(page_id);
-    Page* const page = refreshed->page.get();
-    std::shared_mutex* const page_latch = refreshed->page_latch.get();
-    if (cache_hit != nullptr) {
-      *cache_hit = true;
+  for (;;) {
+    auto entry = pool_.find(page_id);
+    if (entry != pool_.end()) {
+      entry->second->pin_count++;
+      Touch(entry->second);
+      // Touch moves the entry to the tail of pool_lru_ and invalidates the old
+      // list iterator. Resolve the new iterator before taking addresses from it;
+      // using entry->second here was a use-after-erase that could hand PageRef a
+      // stale page latch under concurrent reads.
+      const LruType::iterator refreshed = pool_.at(page_id);
+      Page* const page = refreshed->page.get();
+      std::shared_mutex* const page_latch = refreshed->page_latch.get();
+      if (cache_hit != nullptr) {
+        *cache_hit = true;
+      }
+      latch.unlock();
+      return {this, page, page_latch, shared};
     }
-    latch.unlock();
-    return {this, page, page_latch, shared};
-  }
 
-  if (pool_lru_.size() >= capacity_) {
-    while (pool_lru_.size() >= capacity_ && EvictOnePage()) {
+    while (pool_lru_.size() >= capacity_) {
+      std::unique_ptr<Page> victim;
+      if (!DetachVictim(&victim)) {
+        break;
+      }
+      latch.unlock();
+      {
+        std::scoped_lock file(file_latch_);
+        WriteBack(victim.get());
+      }
+      victim.reset();
+      latch.lock();
     }
+    if (pool_.contains(page_id)) {
+      continue;
+    }
+
+    if (cache_hit != nullptr) {
+      *cache_hit = false;
+    }
+
+    auto new_page = std::make_unique<Page>(page_id, PageType::kUnknown);
+    auto new_page_latch = std::make_unique<std::shared_mutex>();
+    latch.unlock();
+    {
+      std::scoped_lock file(file_latch_);
+      ReadFrom(new_page.get(), page_id);
+    }
+    latch.lock();
+    if (auto raced = pool_.find(page_id); raced != pool_.end()) {
+      // Another thread won the install race; pin their copy instead.
+      raced->second->pin_count++;
+      Touch(raced->second);
+      const LruType::iterator refreshed = pool_.at(page_id);
+      Page* const page = refreshed->page.get();
+      std::shared_mutex* const page_latch = refreshed->page_latch.get();
+      latch.unlock();
+      return {this, page, page_latch, shared};
+    }
+
+    Page* const raw_page = new_page.release();
+    std::shared_mutex* const raw_latch = new_page_latch.get();
+    pool_lru_.emplace_back(raw_page);
+    pool_lru_.back().page_latch = std::move(new_page_latch);
+    pool_.emplace(page_id, std::prev(pool_lru_.end()));
+    latch.unlock();
+    // A newly loaded page is returned with an exclusive latch. Downgrading it
+    // here would require releasing and reacquiring, and cache misses are rare on
+    // the read scaling path. Subsequent hits use the requested shared mode.
+    return {this, raw_page, raw_latch, false};
   }
-  if (cache_hit != nullptr) {
-    *cache_hit = false;
-  }
-  PageRef result = AllocNewPage(page_id, std::move(latch));
-  // A newly loaded page is returned with an exclusive latch. Downgrading it
-  // here would require releasing and reacquiring, and cache misses are rare on
-  // the read scaling path. Subsequent hits use the requested shared mode.
-  return result;
 }
 
 void PagePool::DropAllPages() {
@@ -99,6 +139,7 @@ void PagePool::FlushPageForTest(page_id_t page_id) {
   if (it == pool_.end()) {
     return;  // Already evicted.
   }
+  std::scoped_lock file(file_latch_);
   WriteBack(it->second->page.get());
 }
 
@@ -114,39 +155,19 @@ void PagePool::Unpin(page_id_t page_id) {
 }
 
 // Precondition: pool_latch is locked.
-bool PagePool::EvictPage(LruType::iterator target) {
+bool PagePool::DetachVictim(std::unique_ptr<Page>* victim) {
   assert(!pool_latch.try_lock());
-  assert(pool_.find(target->page->PageID()) != pool_.end());
-  if (0 < target->pin_count) {
-    return false;
+  for (auto target = pool_lru_.begin(); target != pool_lru_.end(); ++target) {
+    if (0 < target->pin_count) {
+      continue;
+    }
+    *victim = std::move(target->page);
+    const uint64_t page_id = (*victim)->PageID();
+    pool_lru_.erase(target);
+    pool_.erase(page_id);
+    return true;
   }
-  WriteBack(target->page.get());
-  uint64_t page_id = target->page->PageID();
-  pool_lru_.erase(target);
-  pool_.erase(page_id);
-  return true;
-}
-
-// Precondition: pool_latch is locked.
-bool PagePool::EvictOnePage() {
-  // assert(!pool_latch.try_lock());
-  auto target = pool_lru_.begin();
-  while (target != pool_lru_.end() && !EvictPage(target)) {
-    target++;
-  }
-  return target != pool_lru_.end();
-}
-
-// Precondition: pool_latch is locked.
-PageRef PagePool::AllocNewPage(page_id_t pid,
-                               std::unique_lock<std::mutex> lock) {
-  std::unique_ptr<Page> new_page(new Page(pid, PageType::kUnknown));
-  ReadFrom(new_page.get(), pid);
-  pool_lru_.emplace_back(new_page.release());
-  pool_.emplace(pid, std::prev(pool_lru_.end()));
-  lock.unlock();
-  return {this, pool_lru_.back().page.get(), pool_lru_.back().page_latch.get(),
-          false};
+  return false;
 }
 
 // Precondition: pool_latch is locked.
@@ -160,7 +181,8 @@ void PagePool::Touch(LruType::iterator it) {
 }
 
 PagePool::~PagePool() {
-  const std::scoped_lock latch(pool_latch);
+  std::scoped_lock latch(pool_latch);
+  std::scoped_lock file(file_latch_);
   for (auto& it : pool_lru_) {
     if (0 < it.pin_count) {
       LOG(ERROR) << "caution: pinned page(" << it.page->PageID()

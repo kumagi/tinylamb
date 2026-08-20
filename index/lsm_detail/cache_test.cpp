@@ -388,4 +388,182 @@ TEST_F(CacheTest, DISABLED_locked_read_past_max_size_indexes_meta_out_of_bounds)
   (void)out;
 }
 
+TEST_F(CacheTest, UnalignedReadsFillGhostQueue) {
+  // Arrange -- a 3-page cache (small=1, main=2, ghost=2).
+  Cache tiny(fd_, 3 * 4096);
+  auto read_int = [&](size_t byte_offset) {
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    int value = 0;
+    ::memcpy(&value, data.data(), sizeof(int));
+    return value;
+  };
+
+  // Act -- touch pages 0..2 once each at non-page-aligned offsets.  Unlike the
+  // aligned reads used elsewhere (whose first chunk is zero-length and fixes
+  // the page twice, marking it accessed), these reads fix each page exactly
+  // once so the pages stay kUnlocked and evict through small -> ghost.
+  ASSERT_EQ(read_int(8), Expected(2));
+  ASSERT_EQ(read_int(4096 + 8), Expected(1026));
+  ASSERT_EQ(read_int(2 * 4096 + 8), Expected(2050));
+
+  // Assert -- pages 0 and 1 were demoted to the ghost queue.
+  EXPECT_EQ(tiny.Dump(), "[2] {} [0, 1]");
+
+  // Assert -- evicted pages transparently reload with the right data.
+  ASSERT_EQ(read_int(8), Expected(2));
+  ASSERT_EQ(read_int(4096 + 8), Expected(1026));
+  EXPECT_EQ(tiny.Dump(), "[2] {} [0, 1]");
+}
+
+TEST_F(CacheTest, GhostOverflowEvictsMarkedEntry) {
+  // Arrange -- a 3-page cache (small=1, main=2, ghost=2).
+  Cache tiny(fd_, 3 * 4096);
+  auto read_int = [&](size_t byte_offset) {
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    int value = 0;
+    ::memcpy(&value, data.data(), sizeof(int));
+    return value;
+  };
+
+  // Act -- touch pages 0..3 once each at non-aligned offsets.  Page 3's
+  // enqueue overflows the ghost FIFO, dropping the kMarked page 0 back to
+  // kEvicted.
+  for (size_t page = 0; page < 4; ++page) {
+    ASSERT_EQ(read_int(page * 4096 + 8), Expected(page * 1024 + 2));
+  }
+
+  // Assert -- the ghost FIFO kept [1, 2] and page 0 was fully evicted.
+  EXPECT_EQ(tiny.Dump(), "[3] {} [1, 2]");
+
+  // Assert -- the evicted page 0 transparently reloads from the file.
+  ASSERT_EQ(read_int(8), Expected(2));
+  ASSERT_EQ(read_int(1 * 4096 + 8), Expected(1026));
+}
+
+TEST_F(CacheTest, RevivedGhostPageMovesToMainQueueOnOverflow) {
+  // Arrange -- a 3-page cache (small=1, main=2, ghost=2).  Cache::FixPage on a
+  // kMarked (ghost) page does not remove it from the ghost FIFO; it only flips
+  // the state to kLocked/kUnlocked, so the ghost FIFO can hold non-marked
+  // pages that overflow into the main queue.
+  Cache tiny(fd_, 3 * 4096);
+  auto read_int = [&](size_t byte_offset) {
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    int value = 0;
+    ::memcpy(&value, data.data(), sizeof(int));
+    return value;
+  };
+
+  // Act -- pages 0..2 churn into the ghost FIFO, then page 0 is revived while
+  // still in the ghost queue (kMarked -> kLocked -> kUnlocked).
+  read_int(8);
+  read_int(4096 + 8);
+  read_int(2 * 4096 + 8);
+  read_int(8);
+  ASSERT_EQ(read_int(8), Expected(2));
+  EXPECT_EQ(tiny.Dump(), "[2] {} [0, 1]");
+
+  // Act -- page 3's enqueue overflows the ghost FIFO; the front entry is the
+  // revived (kUnlocked) page 0, which is moved into the main queue.
+  read_int(3 * 4096 + 8);
+
+  // Assert -- page 0 now lives in the main queue.
+  EXPECT_EQ(tiny.Dump(), "[3] {0} [1, 2]");
+  ASSERT_EQ(read_int(8), Expected(2));
+  ASSERT_EQ(read_int(3 * 4096 + 8), Expected(3 * 1024 + 2));
+}
+
+TEST_F(CacheTest, AccessedGhostPageMovesToMainQueueOnOverflow) {
+  // Arrange -- a 3-page cache.  Re-reading a revived ghost page a second time
+  // leaves it kUnlockedAccessed inside the ghost FIFO.
+  Cache tiny(fd_, 3 * 4096);
+  auto read_int = [&](size_t byte_offset) {
+    std::string data = tiny.ReadAt(byte_offset, sizeof(int));
+    int value = 0;
+    ::memcpy(&value, data.data(), sizeof(int));
+    return value;
+  };
+
+  // Act -- fill the ghost FIFO, revive page 0 twice (kUnlockedAccessed), then
+  // overflow the FIFO so the accessed ghost page promotes into the main queue.
+  read_int(8);
+  read_int(4096 + 8);
+  read_int(2 * 4096 + 8);
+  read_int(8);
+  read_int(8);
+  ASSERT_EQ(read_int(8), Expected(2));
+  read_int(3 * 4096 + 8);
+
+  // Assert -- the accessed ghost page 0 moved to the main queue.
+  EXPECT_EQ(tiny.Dump(), "[3] {0} [1, 2]");
+  ASSERT_EQ(read_int(8), Expected(2));
+}
+
+TEST_F(CacheTest, MultiEntryDumpCoversAllThreeQueues) {
+  // Arrange -- a 20-page cache (small=2, main=18, ghost=18).
+  Cache wide(fd_, 20 * 4096);
+  auto read_int = [&](size_t byte_offset) {
+    std::string data = wide.ReadAt(byte_offset, sizeof(int));
+    int value = 0;
+    ::memcpy(&value, data.data(), sizeof(int));
+    return value;
+  };
+
+  // Act -- re-read pages promote to the main queue; single-touch non-aligned
+  // pages churn through the small -> ghost FIFO chain.  This leaves every
+  // queue holding multiple entries so the Dump comma separators are emitted.
+  read_int(8);              // page 0
+  read_int(4096 + 8);       // page 1
+  read_int(8);              // page 0 (accessed)
+  read_int(2 * 4096 + 8);   // page 2 -> page 0 to main
+  read_int(4096 + 8);       // page 1 (accessed)
+  read_int(3 * 4096 + 8);   // page 3 -> page 1 to main
+  read_int(2 * 4096 + 8);   // page 2 (accessed)
+  read_int(4 * 4096 + 8);   // page 4 -> page 2 to main
+  read_int(3 * 4096 + 8);   // page 3 (accessed)
+  read_int(5 * 4096 + 8);   // page 5 -> page 3 to main
+  read_int(6 * 4096 + 8);   // page 6 -> page 4 to ghost
+  read_int(7 * 4096 + 8);   // page 7 -> page 5 to ghost
+  read_int(8 * 4096 + 8);   // page 8 -> page 6 to ghost
+
+  // Assert -- small, main and ghost each hold multiple entries.
+  EXPECT_EQ(wide.Dump(), "[7, 8] {0, 1, 2, 3} [4, 5, 6]");
+
+  // Assert -- data stays intact after the churn.
+  ASSERT_EQ(read_int(8), Expected(2));
+  ASSERT_EQ(read_int(8 * 4096 + 8), Expected(8 * 1024 + 2));
+}
+
+TEST_F(CacheTest, LockedReadEarlyReturnsForOutOfRangeAndEmpty) {
+  // Arrange -- the fixture's 16 MiB file; max_size_ is the whole file.
+  const size_t kMaxSize = 4L * 1024L * 1024L * sizeof(int);
+
+  // Act -- lock-returning read at and beyond max_size_, and zero length.
+  std::string_view out;
+  {
+    Cache::Locks locks = cache_->ReadAt(kMaxSize, sizeof(int), out);
+    ASSERT_TRUE(locks.empty());
+    ASSERT_EQ(out.size(), 0U);
+  }
+  {
+    Cache::Locks locks = cache_->ReadAt(0, 0, out);
+    ASSERT_TRUE(locks.empty());
+    ASSERT_EQ(out.size(), 0U);
+  }
+
+  // Act -- a lock-returning read clamped to the very end of the address space.
+  {
+    Cache::Locks locks = cache_->ReadAt(kMaxSize - 2, 4, out);
+    ASSERT_EQ(out.size(), 2U);
+    ASSERT_EQ(locks.size(), 1U);
+  }
+}
+
+TEST_F(CacheTest, ZeroCapacityConstructorLogsFatalButDoesNotAbort) {
+  // Arrange/Act -- a zero-byte memory budget is rejected by a (non-fatal)
+  // LOG(FATAL) message; the constructor still completes and the cache is
+  // destructible.  It must never be used for actual reads.
+  Cache zero(fd_, 0);
+  SUCCEED();
+}
+
 }  // namespace tinylamb

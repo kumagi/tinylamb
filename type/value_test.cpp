@@ -515,4 +515,88 @@ TEST(DateTest, ValueDateFromDaysRoundTrip) {
   }
 }
 
+TEST(ValueTest, DateDaysRequiresDateType) {
+  // Act + Assert -- DateDays() rejects every non-date Value with a throw.
+  ASSERT_THROW(Value(1).DateDays(), std::runtime_error);
+  ASSERT_THROW(Value("x").DateDays(), std::runtime_error);
+  ASSERT_THROW(Value(1.5).DateDays(), std::runtime_error);
+  ASSERT_THROW(Value().DateDays(), std::runtime_error);
+}
+
+TEST(ValueTest, MixedTypeComparisonThrows) {
+  // Act + Assert -- ordering comparisons across different types throw.
+  ASSERT_THROW(Value(1) < Value("a"), std::runtime_error);
+  ASSERT_THROW(Value(1) > Value("a"), std::runtime_error);
+  ASSERT_THROW(Value(1.5) < Value(1), std::runtime_error);
+  ASSERT_THROW(Value("a") > Value(1.5), std::runtime_error);
+}
+
+TEST(ValueTest, NullComparisonThrows) {
+  // Act + Assert -- comparing null Values by ordering throws.
+  ASSERT_THROW(Value() < Value(), std::runtime_error);
+  ASSERT_THROW(Value() > Value(), std::runtime_error);
+  // Assert -- equality of two nulls still holds and is safe.
+  ASSERT_TRUE(Value() == Value());
+}
+
+TEST(ValueTest, MixedTypeArithmeticThrows) {
+  // Act + Assert -- every arithmetic/bitwise op rejects mixed operands.
+  ASSERT_THROW(Value(1) + Value("a"), std::runtime_error);
+  ASSERT_THROW(Value(1) - Value("a"), std::runtime_error);
+  ASSERT_THROW(Value(1) * Value("a"), std::runtime_error);
+  ASSERT_THROW(Value(1) / Value("a"), std::runtime_error);
+  ASSERT_THROW(Value(1) % Value("a"), std::runtime_error);
+  ASSERT_THROW(Value(1) & Value("a"), std::runtime_error);
+  ASSERT_THROW(Value(1) | Value("a"), std::runtime_error);
+  ASSERT_THROW(Value(1) ^ Value("a"), std::runtime_error);
+  ASSERT_THROW(Value(1.5) - Value(1), std::runtime_error);
+  ASSERT_THROW(Value("a") / Value(1.5), std::runtime_error);
+}
+
+TEST(ValueTest, NonNumericArithmeticThrows) {
+  // Act + Assert -- varchar/date operands cannot participate in arithmetic.
+  ASSERT_THROW(Value("a") - Value("b"), std::runtime_error);
+  ASSERT_THROW(Value("a") * Value("b"), std::runtime_error);
+  ASSERT_THROW(Value("a") / Value("b"), std::runtime_error);
+  ASSERT_THROW(Value("a") % Value("b"), std::runtime_error);
+  ASSERT_THROW(Value("a") & Value("b"), std::runtime_error);
+  ASSERT_THROW(Value("a") | Value("b"), std::runtime_error);
+  ASSERT_THROW(Value("a") ^ Value("b"), std::runtime_error);
+  ASSERT_THROW(Value::DateFromDays(1) - Value::DateFromDays(2),
+               std::runtime_error);
+}
+
+TEST(ValueTest, InvalidValueTypeThrows) {
+  // Arrange -- a Value with a corrupted type discriminator.
+  Value broken;
+  broken.type = static_cast<ValueType>(99);
+  char buffer[16] = {0};
+
+  // Act + Assert -- every type-switching entry point rejects the bad type.
+  ASSERT_THROW(broken.Size(), std::runtime_error);
+  ASSERT_THROW(broken.Serialize(buffer), std::runtime_error);
+  ASSERT_THROW(broken.Deserialize(buffer, static_cast<ValueType>(99)),
+               std::runtime_error);
+  ASSERT_THROW(broken.AsString(), std::runtime_error);
+  ASSERT_THROW(broken.EncodeMemcomparableFormat(), std::runtime_error);
+  ASSERT_THROW(broken < broken, std::runtime_error);
+  ASSERT_THROW(broken > broken, std::runtime_error);
+  ASSERT_THROW(broken == broken, std::runtime_error);
+  ASSERT_THROW(std::hash<Value>{}(broken), std::runtime_error);
+}
+
+TEST(ValueTest, DecodeMemcomparableRejectsNullAndBrokenPrefixes) {
+  // Arrange -- a destination Value and malformed encoded prefixes.
+  Value v;
+  // Act + Assert -- a kNull prefix byte and an out-of-range prefix both throw.
+  ASSERT_THROW(v.DecodeMemcomparableFormat("\x00"), std::runtime_error);
+  ASSERT_THROW(v.DecodeMemcomparableFormat("\x05"), std::runtime_error);
+}
+
+TEST(ValueTest, HashNullValueThrows) {
+  // Act + Assert -- hashing a null Value falls through to the default throw.
+  std::hash<Value> hasher;
+  ASSERT_THROW(hasher(Value()), std::runtime_error);
+}
+
 }  // namespace tinylamb

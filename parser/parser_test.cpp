@@ -521,4 +521,136 @@ TEST(ParserTest, CreateTableNumericTypeMustTerminateAtEof) {
   });
 }
 
+TEST(ParserTest, SelectListMissingCommaThrows) {
+  // Arrange -- SELECT list with two adjacent identifiers (no comma)
+  Tokenizer tokenizer("SELECT id name FROM users;");
+  // Act + Assert -- the parser rejects the missing comma / FROM terminator
+  EXPECT_THROW(Parser(tokenizer.Tokenize()).Parse(), std::runtime_error);
+}
+
+TEST(ParserTest, SelectTableAliasWithoutAs) {
+  // Arrange -- FROM users u (bare alias, no AS keyword)
+  Tokenizer tokenizer("SELECT id FROM users u;");
+  // Act -- parse into SelectStatement
+  Parser parser(tokenizer.Tokenize());
+  std::unique_ptr<Statement> stmt = parser.Parse();
+  // Assert -- the bare alias maps to the table
+  const auto& select = dynamic_cast<SelectStatement&>(*stmt);
+  EXPECT_EQ(select.Aliases().at("u"), "users");
+}
+
+TEST(ParserTest, SelectCommaSeparatedFromClause) {
+  // Arrange -- comma-separated FROM list with two tables
+  Tokenizer tokenizer("SELECT a, b FROM t1, t2;");
+  // Act -- parse into SelectStatement
+  Parser parser(tokenizer.Tokenize());
+  std::unique_ptr<Statement> stmt = parser.Parse();
+  // Assert -- both tables appear in order in the FROM clause
+  const auto& select = dynamic_cast<SelectStatement&>(*stmt);
+  ASSERT_EQ(select.FromClause().size(), 2U);
+  EXPECT_EQ(select.FromClause()[0], "t1");
+  EXPECT_EQ(select.FromClause()[1], "t2");
+}
+
+TEST(ParserTest, SelectCommaFromClauseWithAliases) {
+  // Arrange -- comma-separated FROM list exercising both AS and bare aliases
+  Tokenizer tokenizer("SELECT a FROM t1 x, t2 y, t3 AS z;");
+  // Act -- parse into SelectStatement
+  Parser parser(tokenizer.Tokenize());
+  std::unique_ptr<Statement> stmt = parser.Parse();
+  // Assert -- bare and AS aliases are both captured
+  const auto& select = dynamic_cast<SelectStatement&>(*stmt);
+  EXPECT_EQ(select.Aliases().at("x"), "t1");
+  EXPECT_EQ(select.Aliases().at("y"), "t2");
+  EXPECT_EQ(select.Aliases().at("z"), "t3");
+}
+
+TEST(ParserTest, InnerWithoutJoinThrows) {
+  // Arrange -- INNER that is not followed by JOIN
+  Tokenizer tokenizer("SELECT * FROM t1 INNER t2;");
+  // Act + Assert -- the parser rejects the malformed join clause
+  EXPECT_THROW(Parser(tokenizer.Tokenize()).Parse(), std::runtime_error);
+}
+
+TEST(ParserTest, JoinTargetAliasWithoutAs) {
+  // Arrange -- JOIN t2 tt (bare alias on the join target)
+  Tokenizer tokenizer("SELECT * FROM t1 JOIN t2 tt ON t1.x = t2.x;");
+  // Act -- parse into SelectStatement
+  Parser parser(tokenizer.Tokenize());
+  std::unique_ptr<Statement> stmt = parser.Parse();
+  // Assert -- the bare join-target alias is captured
+  const auto& select = dynamic_cast<SelectStatement&>(*stmt);
+  EXPECT_EQ(select.Aliases().at("tt"), "t2");
+}
+
+TEST(ParserTest, JoinWithoutOnThrows) {
+  // Arrange -- JOIN with no ON condition
+  Tokenizer tokenizer("SELECT * FROM t1 JOIN t2;");
+  // Act + Assert -- the parser rejects the missing ON clause
+  EXPECT_THROW(Parser(tokenizer.Tokenize()).Parse(), std::runtime_error);
+}
+
+TEST(ParserTest, OrderWithoutByThrows) {
+  // Arrange -- ORDER not followed by BY
+  Tokenizer tokenizer("SELECT id FROM t ORDER id;");
+  // Act + Assert -- the parser rejects the malformed ORDER clause
+  EXPECT_THROW(Parser(tokenizer.Tokenize()).Parse(), std::runtime_error);
+}
+
+TEST(ParserTest, UpdateSetWithoutEqualsThrows) {
+  // Arrange -- UPDATE SET assignment missing '='
+  Tokenizer tokenizer("UPDATE users SET name 'x';");
+  // Act + Assert -- the parser rejects the malformed assignment
+  EXPECT_THROW(Parser(tokenizer.Tokenize()).Parse(), std::runtime_error);
+}
+
+TEST(ParserTest, DanglingTokenAfterStatementThrows) {
+  // Arrange -- a stray identifier after the DROP TABLE terminator
+  Tokenizer tokenizer("DROP TABLE users x;");
+  // Act + Assert -- Expect(kSemicolon) sees an identifier and throws
+  EXPECT_THROW(Parser(tokenizer.Tokenize()).Parse(), std::runtime_error);
+}
+
+TEST(ParserTest, TrailingTokenInWhereThrows) {
+  // Arrange -- a WHERE term that does not consume its full token range
+  Tokenizer tokenizer("SELECT * FROM users WHERE id = 1 2;");
+  // Act + Assert -- the unsupported WHERE expression is rejected
+  EXPECT_THROW(Parser(tokenizer.Tokenize()).Parse(), std::runtime_error);
+}
+
+TEST(ParserTest, UnterminatedInSubqueryThrows) {
+  // Arrange -- IN (SELECT ...) without a closing parenthesis
+  Tokenizer tokenizer(
+      "SELECT * FROM users WHERE id IN (SELECT id FROM other");
+  // Act + Assert -- the unterminated IN subquery is rejected
+  EXPECT_THROW(Parser(tokenizer.Tokenize()).Parse(), std::runtime_error);
+}
+
+TEST(ParserTest, InSubqueryWithDistinctThrows) {
+  // Arrange -- an IN subquery whose shape is not supported (DISTINCT)
+  Tokenizer tokenizer(
+      "SELECT * FROM users WHERE id IN (SELECT DISTINCT id FROM other);");
+  // Act + Assert -- the unsupported IN subquery shape is rejected
+  EXPECT_THROW(Parser(tokenizer.Tokenize()).Parse(), std::runtime_error);
+}
+
+TEST(ParserTest, InSubqueryWithWhereCombinesPredicates) {
+  // Arrange -- IN (SELECT ... WHERE ...) must AND the subquery predicate with
+  // the equality term and append the subquery table to the FROM clause.
+  Tokenizer tokenizer(
+      "SELECT * FROM users WHERE id IN (SELECT id FROM other WHERE id > 0);");
+  // Act -- parse into SelectStatement
+  Parser parser(tokenizer.Tokenize());
+  std::unique_ptr<Statement> stmt = parser.Parse();
+  // Assert -- the subquery table is appended and WHERE is an AND of the
+  // equality term and the subquery predicate
+  const auto& select = dynamic_cast<SelectStatement&>(*stmt);
+  ASSERT_EQ(select.FromClause().size(), 2U);
+  EXPECT_EQ(select.FromClause()[1], "other");
+  ASSERT_NE(select.WhereClause(), nullptr);
+  EXPECT_EQ(select.WhereClause()->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(select.WhereClause()->AsBinaryExpression().Op(),
+            BinaryOperation::kAnd);
+}
+
 }  // namespace tinylamb

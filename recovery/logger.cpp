@@ -88,8 +88,11 @@ lsn_t Logger::AddLog(std::string_view payload) {
     const size_t flushed_lsn = flushed_lsn_.load(std::memory_order_seq_cst);
 
     if (buffered_lsn - flushed_lsn == buffer_.size()) {
-      // Has no space in the buffer, wait for worker.
+      // Do not sleep while holding the enqueue latch: concurrent writers would
+      // stall behind a parked holder even after the flusher frees space.
+      enq_lk.unlock();
       std::this_thread::sleep_for(std::chrono::microseconds(every_us_ / 2));
+      enq_lk.lock();
       continue;
     }
     const size_t buffered = buffered_lsn % buffer_.size();
@@ -110,11 +113,23 @@ lsn_t Logger::AddLog(std::string_view payload) {
 
 void Logger::LoggerWork() {
   assert(!buffer_.empty());
-  while (!finish_ || flushed_lsn_ < buffered_lsn_) {
+  using Clock = std::chrono::steady_clock;
+  auto last_sync = Clock::now();
+  constexpr auto kSyncInterval = std::chrono::milliseconds(10);
+  bool dirty = false;
+  while (!finish_ || flushed_lsn_ < buffered_lsn_ || dirty) {
     const size_t flushed_lsn = flushed_lsn_.load(std::memory_order_relaxed);
     const size_t buffered_lsn = buffered_lsn_.load(std::memory_order_acquire);
 
     if (flushed_lsn == buffered_lsn) {
+      if (dirty && (finish_ || Clock::now() - last_sync >= kSyncInterval)) {
+        FdataSync(dst_);
+        last_sync = Clock::now();
+        dirty = false;
+      }
+      if (finish_ && flushed_lsn_ >= buffered_lsn_ && !dirty) {
+        break;
+      }
       std::this_thread::sleep_for(std::chrono::microseconds(every_us_));
       continue;
     }
@@ -134,8 +149,13 @@ void Logger::LoggerWork() {
         return;
       }
       flushed_lsn_.store(flushed + flushed_size, std::memory_order_release);
+      dirty = true;
     }
-    FdataSync(dst_);
+    if (finish_ || Clock::now() - last_sync >= kSyncInterval) {
+      FdataSync(dst_);
+      last_sync = Clock::now();
+      dirty = false;
+    }
   }
   fsync(dst_);
 }

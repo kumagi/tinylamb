@@ -223,4 +223,59 @@ TEST_F(TransactionTest, CompensateLogsThroughManager) {
   // Assert -- implicit; every compensating record was appended without crash
 }
 
+TEST_F(TransactionTest, TransactionStatusStreaming) {
+  // Arrange -- one value per TransactionStatus enum member
+  // Act -- stream each status to a string buffer
+  std::ostringstream oss;
+  oss << TransactionStatus::kUnknown << "|" << TransactionStatus::kRunning << "|"
+      << TransactionStatus::kCommitted << "|" << TransactionStatus::kAborted;
+  // Assert -- every status has a documented textual representation
+  EXPECT_EQ(oss.str(), "Unknown|Running|Committed|Aborted");
+}
+
+TEST_F(TransactionTest, AddWriteSetRejectedOnReadOnlyTransaction) {
+  // Arrange -- a read-only transaction and a row position
+  Transaction txn = tm_->Begin(true);
+  const RowPosition rp(11, 1);
+  // Act + Assert -- read-only transactions refuse to join the write set
+  EXPECT_FALSE(txn.AddWriteSet(rp));
+  EXPECT_TRUE(txn.IsReadOnly());
+  ASSERT_EQ(txn.PreCommit(), Status::kSuccess);
+}
+
+TEST_F(TransactionTest, AddWriteSetFailsWhenLockHeldElsewhere) {
+  // Arrange -- a row position whose exclusive lock is owned outside the txn
+  const RowPosition rp(12, 1);
+  Transaction txn = tm_->Begin();
+  ASSERT_TRUE(lm_->GetExclusiveLock(rp));
+  // Act -- try to take the same row into the write set
+  EXPECT_FALSE(txn.AddWriteSet(rp));
+  // Assert -- the write set stays empty, so pre-commit has nothing to publish
+  EXPECT_TRUE(lm_->ReleaseExclusiveLock(rp));
+  ASSERT_EQ(txn.PreCommit(), Status::kSuccess);
+}
+
+TEST_F(TransactionTest, DefaultTransactionReadVersionWithoutManager) {
+  // Arrange -- a default-constructed Transaction (no TransactionManager)
+  Transaction txn;
+  const RowPosition rp(13, 1);
+  // Act -- read with and without a physical fallback value
+  auto without_physical = txn.ReadVersion(rp, std::nullopt);
+  auto with_physical = txn.ReadVersion(rp, std::string_view("fallback"));
+  // Assert -- no manager means no MVCC chain: physical or kNotExists
+  EXPECT_EQ(without_physical.GetStatus(), Status::kNotExists);
+  ASSERT_SUCCESS_AND_EQ(with_physical, "fallback");
+}
+
+TEST_F(TransactionTest, DefaultTransactionRegisterVersionWriteIsNoop) {
+  // Arrange -- a default-constructed Transaction (no TransactionManager)
+  Transaction txn;
+  const RowPosition rp(13, 2);
+  // Act + Assert -- version writes without a manager are silently ignored
+  EXPECT_NO_FATAL_FAILURE(
+      txn.RegisterVersionWrite(rp, std::nullopt, std::string_view("after")));
+  EXPECT_NO_FATAL_FAILURE(
+      txn.RegisterVersionWrite(rp, std::string_view("before"), std::nullopt));
+}
+
 }  // namespace tinylamb

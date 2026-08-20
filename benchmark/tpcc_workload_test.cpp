@@ -355,3 +355,145 @@ TEST_F(TpccWorkloadTest, PaymentNameLookupAndBcCreditUpdate) {
 
 }  // namespace
 }  // namespace tinylamb
+
+namespace tinylamb {
+namespace {
+
+TEST(TpccScaleTest, OfficialClampsScaleFactorBelowOne) {
+  EXPECT_EQ(TpccScale::Official(0).warehouses, 1);
+  EXPECT_EQ(TpccScale::Official(-3).warehouses, 1);
+  EXPECT_EQ(TpccScale::Official(0).Terminals(), 10);
+}
+
+TEST(TpccScaleTest, LastNameClampsOutOfRangeInputs) {
+  EXPECT_EQ(TpccLastName(-1), "BARBARBAR");
+  EXPECT_EQ(TpccLastName(1000), "EINGEINGEING");
+  EXPECT_EQ(TpccLastName(1500), "EINGEINGEING");
+}
+
+TEST(TpccScaleTest, NurandFromSeedIsDeterministic) {
+  const TpccNurand first = TpccNurand::FromSeed(77);
+  const TpccNurand second = TpccNurand::FromSeed(77);
+  ASSERT_TRUE(first.valid);
+  ASSERT_TRUE(second.valid);
+  EXPECT_EQ(first.c_id, second.c_id);
+  EXPECT_EQ(first.c_ol_i_id, second.c_ol_i_id);
+  EXPECT_EQ(first.c_last_load, second.c_last_load);
+  EXPECT_EQ(first.c_last_run, second.c_last_run);
+  EXPECT_GE(first.c_id, 0);
+  EXPECT_LE(first.c_id, 1023);
+  EXPECT_GE(first.c_ol_i_id, 0);
+  EXPECT_LE(first.c_ol_i_id, 8191);
+}
+
+TEST_F(TpccWorkloadTest, InitializeRejectsMaxLinesBelowMin) {
+  TpccScale scale = TpccScale::ForTest();
+  scale.max_order_lines = scale.min_order_lines - 1;
+  std::string error;
+  EXPECT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kUnknown);
+  EXPECT_FALSE(error.empty());
+}
+
+TEST_F(TpccWorkloadTest, PaymentRewritesBcCreditData) {
+  const TpccScale scale = TpccScale::ForTest();
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kSuccess)
+      << error;
+
+  // Seed 2 deterministically pays a BC-credit customer, whose c_data field is
+  // rewritten with the payment audit trail.
+  TpccWorkload workload(*database_, scale, 2, 0);
+  const TpccTransactionResult payment =
+      workload.Execute(TpccTransactionType::kPayment);
+  ASSERT_TRUE(payment.committed) << payment.error;
+
+  const std::vector<Row> rewritten =
+      Run("SELECT COUNT(*) FROM customer WHERE c_data <> 'customer data';");
+  ASSERT_EQ(rewritten.size(), 1);
+  EXPECT_EQ(rewritten[0][0], Value(1));
+  const std::vector<Row> history = Run("SELECT COUNT(*) FROM history;");
+  ASSERT_EQ(history.size(), 1);
+  EXPECT_EQ(history[0][0], Value(11));
+}
+
+TEST_F(TpccWorkloadTest, NewOrderRemoteSupplyUpdatesRemoteStock) {
+  TpccScale scale = TpccScale::ForTest();
+  scale.warehouses = 2;
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kSuccess)
+      << error;
+
+  // Seed 46 deterministically picks a remote supply warehouse for one line, so
+  // s_remote_cnt on warehouse 2 must increase.
+  TpccWorkload workload(*database_, scale, 46, 0);
+  const TpccTransactionResult new_order =
+      workload.Execute(TpccTransactionType::kNewOrder);
+  ASSERT_TRUE(new_order.committed) << new_order.error;
+
+  const std::vector<Row> remote =
+      Run("SELECT SUM(s_remote_cnt) FROM stock WHERE s_w_id = 2;");
+  ASSERT_EQ(remote.size(), 1);
+  EXPECT_GE(remote[0][0].value.int_value, 1);
+}
+
+TEST_F(TpccWorkloadTest, NewOrderRollsBackOnInvalidItem) {
+  TpccScale scale = TpccScale::ForTest();
+  scale.warehouses = 2;
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kSuccess)
+      << error;
+
+  // Seed 107 deterministically draws the 1%-probability rollback branch: the
+  // last order line references a non-existent item and the transaction must be
+  // rolled back instead of committed.
+  TpccWorkload workload(*database_, scale, 107, 0);
+  const TpccTransactionResult new_order =
+      workload.Execute(TpccTransactionType::kNewOrder);
+  EXPECT_TRUE(new_order.user_rollback);
+  EXPECT_FALSE(new_order.committed);
+
+  const std::vector<Row> queues =
+      Run("SELECT COUNT(*) FROM new_order;");
+  ASSERT_EQ(queues.size(), 1);
+  EXPECT_EQ(queues[0][0], Value(6));
+}
+
+TEST_F(TpccWorkloadTest, ExecuteCountTypeReportsError) {
+  // kCount is a sentinel, not a runnable transaction; it falls through the
+  // dispatch switch to the invalid-type error result.
+  TpccWorkload workload(*database_, TpccScale::ForTest(), 1, 0);
+  const TpccTransactionResult result =
+      workload.Execute(TpccTransactionType::kCount);
+  EXPECT_FALSE(result.committed);
+  EXPECT_EQ(result.error, "invalid TPC-C transaction type");
+}
+
+TEST_F(TpccWorkloadTest, PaymentChoosesRemoteCustomerWarehouse) {
+  TpccScale scale = TpccScale::ForTest();
+  scale.warehouses = 2;
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kSuccess)
+      << error;
+
+  // Seed 1 deterministically draws the 15% remote-customer branch: the payment
+  // targets a customer in warehouse 2, recorded in the history row. The seed
+  // history already contains one h_c_w_id=2 row per warehouse-2 customer (10),
+  // so the payment raises the count to 11.
+  TpccWorkload workload(*database_, scale, 1, 0);
+  const TpccTransactionResult payment =
+      workload.Execute(TpccTransactionType::kPayment);
+  ASSERT_TRUE(payment.committed) << payment.error;
+
+  const std::vector<Row> remote_history =
+      Run("SELECT COUNT(*) FROM history WHERE h_c_w_id = 2;");
+  ASSERT_EQ(remote_history.size(), 1);
+  EXPECT_EQ(remote_history[0][0], Value(11));
+}
+
+}  // namespace
+}  // namespace tinylamb

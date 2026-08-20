@@ -17,16 +17,20 @@
 #include "recovery_manager.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <ios>
 #include <istream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -274,6 +278,63 @@ void PageReplay(PageRef&& target,
   target.PageUnlock();
 }
 
+size_t RecoveryWorkerCount(size_t jobs) {
+  if (jobs <= 1) return jobs;
+  size_t workers = std::thread::hardware_concurrency();
+  if (workers == 0) workers = 1;
+  if (const char* env = std::getenv("TINYLAMB_RECOVERY_WORKERS");
+      env != nullptr && env[0] != '\0') {
+    const unsigned long parsed = std::strtoul(env, nullptr, 10);
+    if (parsed > 0) workers = parsed;
+  }
+  return std::min(jobs, workers);
+}
+
+void ReplayPagesInParallel(
+    PagePool* pool,
+    std::vector<
+        std::pair<page_id_t, std::vector<std::pair<lsn_t, LogRecord>>>>* jobs,
+    const std::unordered_set<txn_id_t>& committed_txn, TransactionManager* tm) {
+  if (jobs->empty()) return;
+  const size_t workers = RecoveryWorkerCount(jobs->size());
+  auto replay_one = [&](size_t index) {
+    auto& [page_id, logs] = (*jobs)[index];
+    // Lock and unlock on this worker thread. Moving a PageRef (and its
+    // unique_lock) across threads is undefined for std::shared_mutex.
+    PageRef page = pool->GetPage(page_id, nullptr);
+    PageReplay(std::move(page), logs, committed_txn, tm);
+  };
+  if (workers <= 1) {
+    for (size_t i = 0; i < jobs->size(); ++i) replay_one(i);
+    return;
+  }
+
+  std::atomic<size_t> next{0};
+  std::mutex error_mutex;
+  std::exception_ptr first_error;
+  auto worker = [&]() {
+    try {
+      for (;;) {
+        const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+        if (index >= jobs->size()) return;
+        replay_one(index);
+      }
+    } catch (...) {
+      std::scoped_lock lock(error_mutex);
+      if (!first_error) first_error = std::current_exception();
+      next.store(jobs->size(), std::memory_order_relaxed);
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(workers);
+  for (size_t i = 0; i < workers; ++i) {
+    threads.emplace_back(worker);
+  }
+  for (std::thread& thread : threads) thread.join();
+  if (first_error) std::rethrow_exception(first_error);
+}
+
 }  // namespace
 
 RecoveryManager::RecoveryManager(std::string_view log_path, PagePool* pp)
@@ -306,8 +367,6 @@ void RecoveryManager::SinglePageRecovery(PageRef&& page,
     }
   }
 
-  // Redo & Undo phase starts here.
-  // Note that this loop could be parallelized for each page.
   PageReplay(std::move(page), page_logs, committed_txn, tm);
 }
 
@@ -434,13 +493,18 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
     }
   }
 
-  // Redo & Undo phase starts here.
-  // Note that this loop could be parallelized for each page.
-  for (const auto& page_log : page_logs) {
-    const uint64_t& page_id = page_log.first;
-    PageReplay(std::move(pages.find(page_id)->second), page_log.second,
-               committed_txn, tm);
+  // Redo & Undo phase: Instant Recovery groups logs by page_id. Each dirty
+  // page is exclusively latched above so concurrent user transactions cannot
+  // touch them during analysis. Release those PageRefs on this thread (mutex
+  // unlock must stay on the locking thread), then re-acquire inside workers.
+  std::vector<std::pair<page_id_t, std::vector<std::pair<lsn_t, LogRecord>>>>
+      replay_jobs;
+  replay_jobs.reserve(page_logs.size());
+  for (auto& [page_id, logs] : page_logs) {
+    replay_jobs.emplace_back(page_id, std::move(logs));
   }
+  pages.clear();
+  ReplayPagesInParallel(pool_, &replay_jobs, committed_txn, tm);
 }
 
 bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {

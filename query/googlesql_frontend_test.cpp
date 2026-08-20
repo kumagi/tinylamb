@@ -246,4 +246,152 @@ TEST(GoogleSqlFrontendTest, CachesDistinctStatementTextsSeparately) {
   EXPECT_EQ(upper.ast, lower.ast);
 }
 
+TEST(GoogleSqlFrontendTest, ParsesSetOperations) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  const std::vector<std::string> statements = {
+      "SELECT a FROM t UNION ALL SELECT b FROM s;",
+      "SELECT a FROM t INTERSECT DISTINCT SELECT b FROM s;",
+      "SELECT a FROM t EXCEPT DISTINCT SELECT b FROM s;"};
+  for (const std::string& sql : statements) {
+    GoogleSqlParseResult result = GoogleSqlFrontend::Parse(sql);
+    ASSERT_TRUE(result.ok) << sql << "\n" << result.error;
+    EXPECT_NE(result.ast.find("SetOperation("), std::string::npos) << sql;
+  }
+  const GoogleSqlParseResult union_all =
+      GoogleSqlFrontend::Parse("SELECT a FROM t UNION ALL SELECT b FROM s;");
+  ASSERT_TRUE(union_all.ok) << union_all.error;
+  EXPECT_NE(union_all.ast.find("SetOperation(UNION ALL)"), std::string::npos);
+}
+
+TEST(GoogleSqlFrontendTest, ParsesCaseExpressions) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  const GoogleSqlParseResult simple = GoogleSqlFrontend::Parse(
+      "SELECT CASE WHEN a > 1 THEN 'x' ELSE 'y' END FROM t;");
+  ASSERT_TRUE(simple.ok) << simple.error;
+  EXPECT_NE(simple.ast.find("CaseNoValueExpression"), std::string::npos);
+  EXPECT_NE(simple.ast.find("StringLiteralComponent('x')"), std::string::npos);
+
+  const GoogleSqlParseResult searched = GoogleSqlFrontend::Parse(
+      "SELECT CASE a WHEN 1 THEN 'one' WHEN 2 THEN 'two' END FROM t;");
+  ASSERT_TRUE(searched.ok) << searched.error;
+  EXPECT_NE(searched.ast.find("CaseValueExpression"), std::string::npos);
+  EXPECT_NE(searched.ast.find("IntLiteral(1)"), std::string::npos);
+}
+
+TEST(GoogleSqlFrontendTest, ParsesRangeAndPatternPredicates) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  const GoogleSqlParseResult between = GoogleSqlFrontend::Parse(
+      "SELECT a FROM t WHERE a BETWEEN 1 AND 5;");
+  ASSERT_TRUE(between.ok) << between.error;
+  EXPECT_NE(between.ast.find("BetweenExpression(BETWEEN)"), std::string::npos);
+
+  const GoogleSqlParseResult like = GoogleSqlFrontend::Parse(
+      "SELECT a FROM t WHERE b LIKE 'a%';");
+  ASSERT_TRUE(like.ok) << like.error;
+  EXPECT_NE(like.ast.find("BinaryExpression(LIKE)"), std::string::npos);
+
+  const GoogleSqlParseResult is_null = GoogleSqlFrontend::Parse(
+      "SELECT a FROM t WHERE a IS NULL;");
+  ASSERT_TRUE(is_null.ok) << is_null.error;
+  EXPECT_NE(is_null.ast.find("BinaryExpression(IS)"), std::string::npos);
+}
+
+TEST(GoogleSqlFrontendTest, ParsesWindowFunctions) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  const GoogleSqlParseResult result = GoogleSqlFrontend::Parse(
+      "SELECT SUM(a) OVER (PARTITION BY b ORDER BY c ROWS BETWEEN UNBOUNDED "
+      "PRECEDING AND CURRENT ROW) AS s FROM t;");
+  ASSERT_TRUE(result.ok) << result.error;
+  EXPECT_NE(result.ast.find("AnalyticFunctionCall"), std::string::npos);
+  EXPECT_NE(result.ast.find("WindowSpecification"), std::string::npos);
+  EXPECT_NE(result.ast.find("PartitionBy"), std::string::npos);
+  EXPECT_NE(result.ast.find("OrderBy"), std::string::npos);
+}
+
+TEST(GoogleSqlFrontendTest, ParsesExistsAndCorrelatedSubqueries) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  const GoogleSqlParseResult exists = GoogleSqlFrontend::Parse(
+      "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM s);");
+  ASSERT_TRUE(exists.ok) << exists.error;
+  EXPECT_NE(exists.ast.find("ExpressionSubquery(modifier=EXISTS)"),
+            std::string::npos);
+
+  const GoogleSqlParseResult nested = GoogleSqlFrontend::Parse(
+      "SELECT a FROM t WHERE a IN (SELECT b FROM s);");
+  ASSERT_TRUE(nested.ok) << nested.error;
+  EXPECT_NE(nested.ast.find("InExpression"), std::string::npos);
+}
+
+TEST(GoogleSqlFrontendTest, ParsesDdlAndOtherStatementKinds) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  const std::vector<std::string> statements = {
+      "TRUNCATE TABLE t;",
+      "SHOW TABLES;",
+      "MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN DELETE;",
+      "CREATE INDEX i ON t (a);",
+      "ALTER TABLE t ADD COLUMN x INT64;",
+      "START TRANSACTION;"};
+  for (const std::string& sql : statements) {
+    GoogleSqlParseResult result = GoogleSqlFrontend::Parse(sql);
+    ASSERT_TRUE(result.ok) << sql << "\n" << result.error;
+    EXPECT_NE(result.ast.find("Statement"), std::string::npos) << sql;
+  }
+  EXPECT_NE(GoogleSqlFrontend::Parse("TRUNCATE TABLE t;").ast.find(
+                "TruncateStatement"),
+            std::string::npos);
+  EXPECT_NE(GoogleSqlFrontend::Parse("SHOW TABLES;").ast.find("ShowStatement"),
+            std::string::npos);
+  EXPECT_NE(GoogleSqlFrontend::Parse(
+                "MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN DELETE;")
+                .ast.find("MergeStatement"),
+            std::string::npos);
+}
+
+TEST(GoogleSqlFrontendTest, RejectsUnsupportedStatementKinds) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  // The pinned GoogleSQL parser does not accept these statement kinds; each
+  // must surface as a parse failure with a non-empty error payload.
+  const std::vector<std::string> unsupported = {
+      "GRANT SELECT ON t TO u;",
+      "COPY t FROM 'f.csv';",
+      "VACUUM;",
+      "SELECT a FROM t ORDER BY a FETCH FIRST 5 ROWS ONLY;"};
+  for (const std::string& sql : unsupported) {
+    GoogleSqlParseResult result = GoogleSqlFrontend::Parse(sql);
+    EXPECT_FALSE(result.ok) << sql;
+    EXPECT_FALSE(result.error.empty()) << sql;
+  }
+}
+
+TEST(GoogleSqlFrontendTest, EmptyInputReportsSuccessWithoutAst) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  // Quirk of the subprocess protocol: an empty input makes the parser exit 0
+  // with no output, which the frontend reports as a successful (but empty)
+  // parse. A lone semicolon, by contrast, is a syntax error.
+  const GoogleSqlParseResult empty = GoogleSqlFrontend::Parse("");
+  EXPECT_TRUE(empty.ok) << empty.error;
+  EXPECT_TRUE(empty.ast.empty());
+  EXPECT_TRUE(empty.error.empty());
+
+  const GoogleSqlParseResult semicolon = GoogleSqlFrontend::Parse(";");
+  EXPECT_FALSE(semicolon.ok);
+  EXPECT_FALSE(semicolon.error.empty());
+}
+
 }  // namespace tinylamb

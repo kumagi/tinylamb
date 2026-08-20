@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -15,13 +16,16 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "benchmark/tpch_queries.hpp"
 #include "database/database.hpp"
@@ -136,6 +140,7 @@ struct Options {
   fs::path dbgen_config{TINYLAMB_TPCH_DBGEN_CONFIG};
   double scale_factor{0};
   size_t batch_rows{50000};
+  size_t load_workers{0};
   std::optional<size_t> query;
   bool force{false};
   bool reuse_database{false};
@@ -151,7 +156,8 @@ void Usage(std::ostream& output, std::string_view program) {
       << "  --data-dir PATH    .tbl directory (default: <database>.tpch-data)\n"
       << "  --dbgen PATH       override the CMake-built DBGEN executable\n"
       << "  --dbgen-config DIR directory containing dists.dss\n"
-      << "  --batch-rows N     rows per load transaction (default: 10000)\n"
+      << "  --batch-rows N     rows per load transaction (default: 50000)\n"
+      << "  --load-workers N   parallel table loaders (default: #tables)\n"
       << "  --query N          run only query 1..22\n"
       << "  --generate-only    stop after DBGEN and cardinality validation\n"
       << "  --load-only        stop after loading all eight tables\n"
@@ -208,6 +214,8 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       options->dbgen_config = value;
     } else if (argument == "--batch-rows") {
       parsed = ParseInteger(value, &options->batch_rows);
+    } else if (argument == "--load-workers") {
+      parsed = ParseInteger(value, &options->load_workers);
     } else if (argument == "--query") {
       size_t query = 0;
       parsed = ParseInteger(value, &query);
@@ -502,7 +510,7 @@ bool ParseRow(std::string_view line, const TableSpec& table, tinylamb::Row* row,
 
 bool LoadTable(tinylamb::Database& database, const Options& options,
                const TableSpec& table, uint64_t expected_rows,
-               std::string* error) {
+               std::string* error, std::mutex* output_mutex = nullptr) {
   std::ifstream input(TablePath(options, table.name));
   if (!input) {
     *error = "cannot open " + TablePath(options, table.name).string();
@@ -520,6 +528,14 @@ bool LoadTable(tinylamb::Database& database, const Options& options,
   uint64_t rows = 0;
   size_t in_transaction = 0;
   std::string line;
+  auto emit = [&](std::string_view message) {
+    if (output_mutex == nullptr) {
+      std::cout << message << '\n';
+      return;
+    }
+    std::scoped_lock lock(*output_mutex);
+    std::cout << message << '\n';
+  };
   while (std::getline(input, line)) {
     tinylamb::Row row;
     if (!ParseRow(line, table, &row, error)) {
@@ -542,8 +558,8 @@ bool LoadTable(tinylamb::Database& database, const Options& options,
       context = database.BeginContext();
       in_transaction = 0;
       if (rows % 100000 == 0 || rows == expected_rows) {
-        std::cout << "load_progress." << table.name << '=' << rows << '/'
-                  << expected_rows << '\n';
+        emit("load_progress." + std::string(table.name) + '=' +
+             std::to_string(rows) + '/' + std::to_string(expected_rows));
       }
     }
   }
@@ -555,7 +571,62 @@ bool LoadTable(tinylamb::Database& database, const Options& options,
     *error = "loaded row count changed for " + std::string(table.name);
     return false;
   }
-  std::cout << "loaded_rows." << table.name << '=' << rows << '\n';
+  emit("loaded_rows." + std::string(table.name) + '=' + std::to_string(rows));
+  return true;
+}
+
+size_t ResolveLoadWorkers(const Options& options) {
+  if (options.load_workers > 0) return options.load_workers;
+  const size_t hardware = std::max<size_t>(1, std::thread::hardware_concurrency());
+  return std::min(Tables().size(), hardware);
+}
+
+bool LoadAllTables(tinylamb::Database& database, const Options& options,
+                   const std::vector<uint64_t>& row_counts,
+                   std::string* error) {
+  const size_t workers = ResolveLoadWorkers(options);
+  std::cout << "load_workers=" << workers << '\n';
+
+  std::mutex output_mutex;
+  std::mutex error_mutex;
+  std::atomic<bool> failed{false};
+  std::string first_error;
+  std::vector<double> seconds(Tables().size(), 0.0);
+  std::atomic<size_t> next_table{0};
+
+  auto worker = [&]() {
+    while (!failed.load(std::memory_order_relaxed)) {
+      const size_t index = next_table.fetch_add(1, std::memory_order_relaxed);
+      if (index >= Tables().size()) return;
+      const Clock::time_point begin = Clock::now();
+      std::string local_error;
+      if (!LoadTable(database, options, Tables()[index], row_counts[index],
+                     &local_error, &output_mutex)) {
+        failed.store(true, std::memory_order_relaxed);
+        std::scoped_lock lock(error_mutex);
+        if (first_error.empty()) first_error = std::move(local_error);
+        return;
+      }
+      seconds[index] =
+          std::chrono::duration<double>(Clock::now() - begin).count();
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(workers);
+  for (size_t i = 0; i < workers; ++i) {
+    threads.emplace_back(worker);
+  }
+  for (std::thread& thread : threads) thread.join();
+
+  if (failed.load(std::memory_order_relaxed)) {
+    *error = first_error.empty() ? "parallel load failed" : first_error;
+    return false;
+  }
+  for (size_t i = 0; i < Tables().size(); ++i) {
+    std::cout << "load_seconds." << Tables()[i].name << '=' << seconds[i]
+              << '\n';
+  }
   return true;
 }
 
@@ -579,13 +650,13 @@ struct QueryProfile {
   std::string plan;
 };
 
-bool RunQuery(tinylamb::Database& database, size_t query, QueryProfile* profile,
-              std::string* error) {
+bool RunQuery(tinylamb::Database& database, size_t query, double scale_factor,
+              QueryProfile* profile, std::string* error) {
   tinylamb::TransactionContext context = database.BeginReadOnlyContext();
   tinylamb::SqlEngine engine(database);
   const Clock::time_point begin = Clock::now();
-  tinylamb::StatusOr<tinylamb::Executor> prepared =
-      engine.Prepare(context, tinylamb::kTpchBenchmarkQueries.at(query - 1));
+  tinylamb::StatusOr<tinylamb::Executor> prepared = engine.Prepare(
+      context, tinylamb::TpchBenchmarkQueryText(query - 1, scale_factor));
   if (!prepared.HasValue()) {
     *error = "Q" + std::to_string(query) + ": " + engine.LastError();
     context.Abort();
@@ -702,16 +773,9 @@ int main(int argc, char** argv) {
       std::cerr << "schema initialization failed: " << error << '\n';
       return 1;
     }
-    for (size_t i = 0; i < Tables().size(); ++i) {
-      const Clock::time_point table_begin = Clock::now();
-      if (!LoadTable(database, options, Tables()[i], row_counts[i], &error)) {
-        std::cerr << "load failed: " << error << '\n';
-        return 1;
-      }
-      std::cout
-          << "load_seconds." << Tables()[i].name << '='
-          << std::chrono::duration<double>(Clock::now() - table_begin).count()
-          << '\n';
+    if (!LoadAllTables(database, options, row_counts, &error)) {
+      std::cerr << "load failed: " << error << '\n';
+      return 1;
     }
   }
   std::cout << (options.reuse_database ? "database_open_seconds="
@@ -726,7 +790,7 @@ int main(int argc, char** argv) {
   bool any_failed = false;
   for (size_t query = first_query; query <= last_query; ++query) {
     QueryProfile profile;
-    if (!RunQuery(database, query, &profile, &error)) {
+    if (!RunQuery(database, query, options.scale_factor, &profile, &error)) {
       std::cerr << "query failed: " << error << '\n';
       any_failed = true;
       continue;

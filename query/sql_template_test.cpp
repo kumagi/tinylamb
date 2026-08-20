@@ -125,3 +125,98 @@ TEST(SqlTemplateTest, BindsNegativeLiteralWithoutDoubleNegation) {
 
 }  // namespace
 }  // namespace tinylamb
+
+namespace tinylamb {
+namespace {
+
+TEST(SqlTemplateTest, ExtractsEscapedQuotesInsideStringLiterals) {
+  // A doubled '' inside a quoted literal is one quote character, not the end
+  // of the literal (sql_template.cpp escaped-quote handling).
+  const SqlTemplate extracted = ExtractSqlTemplate("SELECT 'it''s';");
+  ASSERT_TRUE(extracted.templatable);
+  ASSERT_EQ(extracted.parameters.size(), 1u);
+  EXPECT_EQ(extracted.parameters[0], Value("it's"));
+  EXPECT_EQ(extracted.fingerprint, "SELECT '?';");
+}
+
+TEST(SqlTemplateTest, PreservesLineCommentsInFingerprint) {
+  // "--" comments are copied verbatim into the fingerprint so that two
+  // queries differing only by a trailing comment stay distinct.
+  const SqlTemplate extracted =
+      ExtractSqlTemplate("SELECT 1 -- trailing note\n;");
+  EXPECT_EQ(extracted.fingerprint, "SELECT 0 -- trailing note\n;");
+  ASSERT_EQ(extracted.parameters.size(), 1u);
+  EXPECT_EQ(extracted.parameters[0], Value(1));
+}
+
+TEST(SqlTemplateTest, PreservesBlockCommentsInFingerprint) {
+  const SqlTemplate extracted = ExtractSqlTemplate("SELECT 1 /* block note */;");
+  EXPECT_EQ(extracted.fingerprint, "SELECT 0 /* block note */;");
+  ASSERT_EQ(extracted.parameters.size(), 1u);
+  EXPECT_EQ(extracted.parameters[0], Value(1));
+}
+
+TEST(SqlTemplateTest, ExtractsFloatExponentLiterals) {
+  const SqlTemplate extracted = ExtractSqlTemplate("SELECT 1e3, 2.5e-2, 3E+4;");
+  ASSERT_TRUE(extracted.templatable);
+  ASSERT_EQ(extracted.parameters.size(), 3u);
+  EXPECT_EQ(extracted.parameters[0], Value(1000.0));
+  EXPECT_EQ(extracted.parameters[1], Value(0.025));
+  EXPECT_EQ(extracted.parameters[2], Value(30000.0));
+  EXPECT_EQ(extracted.fingerprint, "SELECT 0.0, 0.0, 0.0;");
+}
+
+TEST(SqlTemplateTest, BindStatementLiteralsParameterUnderflowThrows) {
+  // Two constants in the cached tree but only one parameter supplied.
+  auto statement = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression("k", ColumnValueExp("k"))},
+      std::vector<std::string>{"t"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kEquals,
+                              ConstantValueExp(Value(1))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp("b"), BinaryOperation::kEquals,
+                              ConstantValueExp(Value(2)))));
+  EXPECT_THROW(BindStatementLiterals(*statement, {Value(9)}),
+               std::runtime_error);
+}
+
+TEST(SqlTemplateTest, BindStatementLiteralsPreservesAliases) {
+  // BindSelect copies the alias table into the bound statement.
+  auto statement = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression("k", ColumnValueExp("k"))},
+      std::vector<std::string>{"t"},
+      BinaryExpressionExp(ColumnValueExp("k"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(1))));
+  statement->AddAlias("alias_t", "t");
+  auto bound = BindStatementLiterals(*statement, {Value(7)});
+  ASSERT_EQ(bound->Type(), StatementType::kSelect);
+  const auto& select = dynamic_cast<const SelectStatement&>(*bound);
+  EXPECT_EQ(select.WhereClause()->ToString(), "(k = 7)");
+  const auto& aliases = select.Aliases();
+  const auto found = aliases.find("alias_t");
+  ASSERT_NE(found, aliases.end());
+  EXPECT_EQ(found->second, "t");
+}
+
+TEST(SqlTemplateTest, BindStatementLiteralsRejectsDdl) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  auto create = ParseSql("CREATE TABLE t (a INT64);");
+  ASSERT_TRUE(create);
+  EXPECT_THROW(BindStatementLiterals(*create, {}), std::runtime_error);
+}
+
+TEST(SqlTemplateTest, BindStatementLiteralsParameterCountMismatchThrows) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  auto statement = ParseSql("SELECT 1;");
+  ASSERT_TRUE(statement);
+  EXPECT_THROW(BindStatementLiterals(*statement, {Value(5), Value(6)}),
+               std::runtime_error);
+}
+
+}  // namespace
+}  // namespace tinylamb

@@ -107,9 +107,9 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
       valid_ = false;
       return *this;
     }
-    PageRef next_ref =
-        tree_->FindLeaf(*txn_, high_fence.GetKey().Value(), false);
     ref.PageUnlock();
+    PageRef next_ref =
+        tree_->FindLeafReadOnly(*txn_, high_fence.GetKey().Value(), false);
     idx_ = 0;
     pid_ = next_ref->PageID();
     if (next_ref->body.leaf_page.row_count_ == 0 ||
@@ -136,14 +136,36 @@ BPlusTreeIterator& BPlusTreeIterator::operator--() {
       valid_ = false;
       return *this;
     }
-    PageRef prev_ref = tree_->FindLeaf(*txn_, low_fence.GetKey().Value(), true);
+    const page_id_t left_from = pid_;
+    const std::string seek_key(low_fence.GetKey().Value());
+    ref.PageUnlock();
+    // Inclusive seek stops before re-entering the page we left (foster parent).
+    PageRef prev_ref =
+        tree_->FindLeafReadOnly(*txn_, seek_key, false, left_from);
+    if (prev_ref->PageID() == left_from) {
+      // We were the chain head: less_than yields the true left sibling.
+      prev_ref.PageUnlock();
+      prev_ref = tree_->FindLeafReadOnly(*txn_, seek_key, true, left_from);
+      while (auto foster = prev_ref->GetFoster(*txn_)) {
+        if (foster.Value().child_pid == left_from) {
+          break;
+        }
+        PageRef child = txn_->GetPageManager()->GetPage(
+            foster.Value().child_pid, txn_->IsReadOnly());
+        prev_ref.PageUnlock();
+        prev_ref = std::move(child);
+      }
+    }
+    if (prev_ref->PageID() == left_from ||
+        prev_ref->body.leaf_page.row_count_ == 0) {
+      valid_ = false;
+      return *this;
+    }
     idx_ = prev_ref->body.leaf_page.row_count_ - 1;
     pid_ = prev_ref->PageID();
-    if (prev_ref->body.leaf_page.row_count_ == 0 ||
-        (!begin_.empty() && prev_ref->body.leaf_page.GetKey(idx_) < begin_)) {
+    if (!begin_.empty() && prev_ref->body.leaf_page.GetKey(idx_) < begin_) {
       valid_ = false;
     }
-    ref.PageUnlock();
     return *this;
   }
   --idx_;

@@ -294,4 +294,248 @@ TEST_F(IndexScanIteratorTest, CompositeEqualityPointLookup) {
   ++it;
   EXPECT_FALSE(it.IsValid());
 }
+
+TEST_F(IndexScanIteratorTest, NonUniqueDescendingIncrement) {
+  // Arrange -- insert rows with duplicate NameIdx values
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  for (int i = 0; i < 120; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(ctx.txn_,
+                     Row({Value(i), Value("v" + std::to_string(i % 10)),
+                          Value(static_cast<double>(i * 2))}))
+            .GetStatus());
+  }
+
+  // Act -- walk a descending non-unique scan using operator++ (moves across
+  // value_offset_ within one key and across keys when it wraps)
+  Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(1), Value("v0"),
+                                      Value("v3"), false);
+  ASSERT_TRUE(it.IsValid());
+  int counter = 0;
+  while (it.IsValid()) {
+    Row row = *it;
+    ASSERT_DOUBLE_EQ(row[0].value.int_value * 2, row[2].value.double_value);
+    ++it;
+    ++counter;
+  }
+
+  // Assert -- v0..v3 inclusive covers 4 distinct values x 12 rows
+  ASSERT_EQ(counter, 12 * 4);
+  ASSERT_FALSE(it.IsValid());
+}
+
+TEST_F(IndexScanIteratorTest, DirectScanConstDereferenceAndAccessors) {
+  // Arrange -- insert rows and construct an IndexScanIterator directly
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                    Value(0.1 + i)}))
+            .GetStatus());
+  }
+  const Index& pk = table->GetIndex(0);
+  IndexScanIterator scan(*table, pk, ctx.txn_, Value(3), Value(8), true);
+  ASSERT_TRUE(scan.IsValid());
+
+  // Act -- dereference through a const reference (const operator*)
+  const IndexScanIterator& cscan = scan;
+  const Row& first = *cscan;
+  EXPECT_EQ(first[0], Value(3));
+  EXPECT_EQ(scan.GetKey()[0], Value(3));
+  EXPECT_FALSE(scan.GetValue().empty());
+  EXPECT_TRUE(scan.IsUnique());
+  RowPosition pos = scan.Position();
+  EXPECT_TRUE(pos.IsValid());
+
+  // Act -- exhaust the scan and query the invalid position
+  while (scan.IsValid()) {
+    ++scan;
+  }
+  ASSERT_FALSE(scan.IsValid());
+  EXPECT_FALSE(scan.Position().IsValid());
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(IndexScanIteratorTest, CompositeKeyAndIncludeAccessors) {
+  // Arrange -- insert rows, then construct a direct scan over the composite
+  // KeyScore index whose include set carries col1
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                    Value(0.1 + i)}))
+            .GetStatus());
+  }
+  const Index& key_score = table->GetIndex(2);
+  IndexScanIterator scan(*table, key_score, ctx.txn_,
+                         {Value(5), Value(0.1 + 5)}, {Value(5), Value(0.1 + 5)});
+  ASSERT_TRUE(scan.IsValid());
+
+  // Assert -- GetKey yields the composite key, Include yields the extra column
+  EXPECT_EQ(scan.GetKey()[0], Value(5));
+  EXPECT_EQ(scan.GetKey()[1], Value(0.1 + 5));
+  EXPECT_EQ(scan.Include()[0], Value("v5"));
+  EXPECT_FALSE(scan.GetValue().empty());
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(IndexScanIteratorTest, EmptyRangeAndDump) {
+  // Arrange -- insert a handful of rows
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                    Value(0.1 + i)}))
+            .GetStatus());
+  }
+
+  // Act -- a range entirely above the data yields an invalid iterator
+  Iterator empty = table->BeginIndexScan(ctx.txn_, table->GetIndex(0),
+                                         Value(100), Value(200));
+  ASSERT_FALSE(empty.IsValid());
+  EXPECT_FALSE(empty.Position().IsValid());
+
+  // Act -- dump an ascending and a descending scan (the descending dump prints
+  // end -> begin)
+  Iterator ascending = table->BeginIndexScan(ctx.txn_, table->GetIndex(0),
+                                             Value(0), Value(3));
+  std::ostringstream asc_dump;
+  asc_dump << ascending;
+  EXPECT_NE(asc_dump.str().find("SampleTable"), std::string::npos);
+
+  Iterator descending = table->BeginIndexScan(ctx.txn_, table->GetIndex(0),
+                                              Value(0), Value(3), false);
+  std::ostringstream desc_dump;
+  desc_dump << descending;
+  EXPECT_NE(desc_dump.str().find("SampleTable"), std::string::npos);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(IndexScanIteratorTest, UniqueDescendingIncrement) {
+  // Arrange -- insert rows with a unique PK
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                    Value(0.1 + i)}))
+            .GetStatus());
+  }
+
+  // Act -- walk a descending unique scan with operator++ (moves via --iter_)
+  Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(0), Value(0),
+                                      Value(10), false);
+  ASSERT_TRUE(it.IsValid());
+  int expected = 10;
+  while (it.IsValid()) {
+    Row row = *it;
+    EXPECT_EQ(row[0], Value(expected));
+    ++it;
+    --expected;
+  }
+  EXPECT_EQ(expected, -1);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(IndexScanIteratorTest, CompositePrefixRangeScan) {
+  // Arrange -- insert rows, then scan the two-part KeyScore index with a
+  // single-part bound so the end key is widened with a 0xff terminator
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  for (int i = 0; i < 40; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                    Value(0.1 + i)}))
+            .GetStatus());
+  }
+
+  // Act -- prefix scan covering col0 in [10, 20]
+  Iterator it = table->BeginIndexScan(ctx.txn_, table->GetIndex(2), Value(10),
+                                      Value(20));
+  ASSERT_TRUE(it.IsValid());
+  int counter = 0;
+  while (it.IsValid()) {
+    Row row = *it;
+    EXPECT_NEAR(row[0].value.int_value, row[2].value.double_value - 0.1, 1e-9);
+    ++it;
+    ++counter;
+  }
+  // Assert -- 11 distinct col0 keys survive the prefix bound
+  ASSERT_EQ(counter, 11);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(IndexScanIteratorTest, DumpCompositeAndPointScans) {
+  // Arrange -- insert rows and commit so a new index can be built on a fresh
+  // context (the cached Table object does not observe later index creation)
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          ctx.GetTable(kTableName));
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_SUCCESS(
+          table
+              ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                      Value(0.1 + i)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_SUCCESS(db_->CreateIndex(ctx, kTableName,
+                                    IndexSchema("TwoInc", {0}, {1, 2})));
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  ASSERT_EQ(table->IndexCount(), 4);
+
+  // Act -- dump a scan over the include-bearing NameIdx
+  Iterator name_it = table->BeginIndexScan(ctx.txn_, table->GetIndex(1),
+                                           Value("v0"), Value("v3"));
+  std::ostringstream name_dump;
+  name_dump << name_it;
+  EXPECT_NE(name_dump.str().find("NameIdx"), std::string::npos);
+  EXPECT_NE(name_dump.str().find("Include:"), std::string::npos);
+
+  // Act -- dump a scan over the two-key-column KeyScore index
+  Iterator key_it = table->BeginIndexScan(ctx.txn_, table->GetIndex(2),
+                                          Value(0), Value(3));
+  std::ostringstream key_dump;
+  key_dump << key_it;
+  EXPECT_NE(key_dump.str().find("KeyScore"), std::string::npos);
+
+  // Act -- dump a scan over the two-include TwoInc index
+  Iterator two_inc_it = table->BeginIndexScan(ctx.txn_, table->GetIndex(3),
+                                              Value(0), Value(3));
+  std::ostringstream two_inc_dump;
+  two_inc_dump << two_inc_it;
+  EXPECT_NE(two_inc_dump.str().find("TwoInc"), std::string::npos);
+
+  // Act -- dump a point scan where begin equals end
+  Iterator point = table->BeginIndexScan(ctx.txn_, table->GetIndex(0),
+                                         Value(2), Value(2));
+  std::ostringstream point_dump;
+  point_dump << point;
+  EXPECT_NE(point_dump.str().find("SampleTable"), std::string::npos);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
 }  // namespace tinylamb

@@ -62,13 +62,20 @@ PageRef BPlusTree::FindLeftmostPage(Transaction& txn, PageRef&& page) {
 }
 
 PageRef BPlusTree::FindRightmostPage(Transaction& txn, PageRef&& page) {
-  while (page->Type() != PageType::kLeafPage) {
+  for (;;) {
+    while (auto foster = page->GetFoster(txn)) {
+      page = txn.GetPageManager()->GetPage(foster.Value().child_pid,
+                                           txn.IsReadOnly());
+    }
+    if (page->Type() == PageType::kLeafPage) {
+      return std::move(page);
+    }
     assert(page->Type() == PageType::kBranchPage);
+    assert(page->body.branch_page.RowCount() > 0);
     page = txn.GetPageManager()->GetPage(
         page->body.branch_page.GetValue(page->body.branch_page.RowCount() - 1),
         txn.IsReadOnly());
   }
-  return std::move(page);
 }
 
 PageRef BPlusTree::LeftmostPage(Transaction& txn) {
@@ -170,6 +177,39 @@ PageRef BPlusTree::FindLeaf(Transaction& txn, std::string_view key,
     curr = std::move(next_page);  // Releases parent lock here.
   }
   return curr;
+}
+
+PageRef BPlusTree::FindLeafReadOnly(Transaction& txn, std::string_view key,
+                                    bool less_than, page_id_t stop_before) {
+  PageRef curr =
+      txn.GetPageManager()->GetPage(root_, txn.IsReadOnly());
+  const auto go_right = [&](std::string_view foster_key) {
+    return less_than ? foster_key < key : foster_key <= key;
+  };
+  for (;;) {
+    while (auto foster = curr->GetFoster(txn)) {
+      if (stop_before != 0 && foster.Value().child_pid == stop_before) {
+        break;
+      }
+      if (!go_right(foster.Value().key)) {
+        break;
+      }
+      PageRef child = txn.GetPageManager()->GetPage(foster.Value().child_pid,
+                                                    txn.IsReadOnly());
+      curr.PageUnlock();
+      curr = std::move(child);
+    }
+    if (curr->Type() == PageType::kLeafPage) {
+      return curr;
+    }
+    assert(curr->Type() == PageType::kBranchPage);
+    ASSIGN_OR_CRASH(page_id_t, next,
+                    curr->GetPageForKey(txn, key, less_than));
+    PageRef next_page =
+        txn.GetPageManager()->GetPage(next, txn.IsReadOnly());
+    curr.PageUnlock();
+    curr = std::move(next_page);
+  }
 }
 
 Status BPlusTree::LeafInsert(Transaction& txn, PageRef& leaf,

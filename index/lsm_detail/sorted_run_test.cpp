@@ -201,6 +201,27 @@ TEST_F(SortedRunTest, Find) {
   ASSERT_EQ(over.GetStatus(), Status::kNotExists);
 }
 
+TEST_F(SortedRunTest, FindOnEmptyRunIsNotExists) {
+  // An empty run (flushed from an empty map) must report kNotExists for every
+  // key.  SortedRun::Find currently admits the empty key past the range check
+  // (min_key_ == max_key_ == "") and then reads index entry 0 of a
+  // zero-length run out of bounds, returning garbage instead of kNotExists.
+  // This test documents that bug and should turn green once the empty run is
+  // guarded.
+  std::filesystem::path data_file =
+      "sorted_run_empty-test-" + RandomString() + ".db";
+  std::filesystem::path index_file =
+      "sorted_run_empty-test-index-" + RandomString() + ".idx";
+  auto blob = std::make_unique<BlobFile>(data_file);
+  const std::map<std::string, LSMValue> empty;
+  SortedRun::Construct(index_file, empty, *blob, 1);
+  const SortedRun run(index_file);
+  ASSERT_EQ(run.Find("", *blob).GetStatus(), Status::kNotExists);
+  ASSERT_EQ(run.Find("any key", *blob).GetStatus(), Status::kNotExists);
+  std::ignore = std::filesystem::remove(data_file);
+  std::ignore = std::filesystem::remove(index_file);
+}
+
 TEST_F(SortedRunTest, Delete) {
   // Arrange -- build a SortedRun with 1000 keys where i%3==0 are deletes, i%3==1 are values, i%3==2 absent
   std::filesystem::path data_file;

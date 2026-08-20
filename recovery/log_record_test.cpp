@@ -424,4 +424,63 @@ TEST_F(LogRecordTest, DecodeHugeEndCheckpointTableSizeRejected) {
   }
 }
 
+TEST_F(LogRecordTest, DumpUnknownRecordType) {
+  // Arrange -- a default-constructed record carries LogType::kUnknown.
+  LogRecord unknown;
+
+  // Act -- stream the record and its type.
+  std::stringstream ss;
+  ss << unknown;
+  std::stringstream type_ss;
+  type_ss << LogType::kUnknown;
+
+  // Assert -- the type tag renders as "(unknown)" and the record dump still
+  // prints the trailing LSN/txn metadata.
+  EXPECT_EQ(type_ss.str(), "(unknown) ");
+  EXPECT_NE(ss.str().find("(unknown)"), std::string::npos);
+  EXPECT_NE(ss.str().find("prev_lsn"), std::string::npos);
+}
+
+TEST_F(LogRecordTest, SizeOfUnknownLogAborts) {
+  // Known gap: LogRecord::Size() asserts for LogType::kUnknown
+  // (log_record.cpp:649-650), so a default-constructed record must die.
+  // assert() is a no-op under NDEBUG (Release), so skip there.
+#ifdef NDEBUG
+  GTEST_SKIP() << "assert() disabled in Release builds";
+#else
+  LogRecord unknown;
+  EXPECT_DEATH((void)unknown.Size(), "unknown");
+#endif
+}
+
+TEST_F(LogRecordTest, SerializeUnknownLogAborts) {
+  // Known gap: serializing a kUnknown record trips an assert in
+  // operator<<(Encoder&) (log_record.cpp:722-723).
+#ifdef NDEBUG
+  GTEST_SKIP() << "assert() disabled in Release builds";
+#else
+  LogRecord unknown;
+  EXPECT_DEATH((void)unknown.Serialize(), "unknown");
+#endif
+}
+
+TEST_F(LogRecordTest, DecodeUnknownLogTypeAborts) {
+  // Arrange -- a byte stream whose type field is not a defined LogType.
+#ifdef NDEBUG
+  GTEST_SKIP() << "assert() disabled in Release builds";
+#else
+  std::string bytes;
+  bytes.append(1, static_cast<char>(0xff)).append(1, static_cast<char>(0xff));  // uint16 LogType: 0xffff
+  bytes.append(8, '\x00');                // prev_lsn
+  bytes.append(8, '\x00');                // txn_id
+  bytes.append(1, '\x00');                // types: no pid / slot / key
+  std::istringstream ss(bytes, std::istringstream::binary);
+
+  // Act + Assert -- the decoder reaches its default arm and asserts.
+  LogRecord record;
+  Decoder dec(ss);
+  EXPECT_DEATH(dec >> record, "unknown log");
+#endif
+}
+
 }  // namespace tinylamb

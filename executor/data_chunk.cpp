@@ -213,9 +213,12 @@ void DataChunk::Append(const Row& row, RowPosition position) {
 
 void DataChunk::Append(Row&& row, RowPosition position) {
   EnsureLayout(row);
+  // Match the lvalue overload: append into columns first so a type mismatch
+  // cannot leave zone maps holding a value of the wrong type.
   for (size_t i = 0; i < columns_.size(); ++i) {
-    zone_maps_[i].Add(row[i]);
-    columns_[i].Append(std::move(row[i]));
+    Value value = std::move(row[i]);
+    columns_[i].Append(value);
+    zone_maps_[i].Add(value);
   }
   positions_.push_back(position);
   ++size_;

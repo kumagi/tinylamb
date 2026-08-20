@@ -319,11 +319,10 @@ TEST_F(QueryTest, SqlEngineDistinctAndDropTable) {
   EXPECT_EQ(distinct[1][0], Value(2));
   EXPECT_EQ(distinct[2][0], Value(3));
 
-  // Act + Assert -- DROP TABLE is not implemented (rejected by the frontend).
-  StatusOr<Executor> drop = engine.Prepare(ctx, "DROP TABLE t;");
-  EXPECT_FALSE(drop.HasValue());
-  EXPECT_NE(drop.GetStatus(), Status::kSuccess);
-  ctx.txn_.Abort();
+  // Act + Assert -- DROP TABLE removes the table from the catalog.
+  ASSERT_TRUE(engine.Prepare(ctx, "DROP TABLE t;").HasValue());
+  EXPECT_FALSE(ctx.GetTable("t").HasValue());
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
 TEST_F(QueryTest, SqlEngineQueryDataRewriteErrors) {

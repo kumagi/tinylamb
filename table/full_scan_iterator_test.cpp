@@ -177,3 +177,60 @@ TEST_F(FullScanIteratorTest, OldSnapshotScansPhysicallyDeletedTailRow) {
 }
 
 }  // namespace tinylamb
+
+#include <sstream>
+
+namespace tinylamb {
+
+TEST_F(FullScanIteratorTest, MorselScanIteratesOnlyRequestedPages) {
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
+  for (int i = 0; i < 130; ++i) {
+    ASSERT_SUCCESS(table.Insert(ctx.txn_,
+                                Row({Value(i), Value("v" + std::to_string(i)),
+                                     Value(0.1 + i)}))
+                       .GetStatus());
+  }
+  const std::vector<Table::ScanMorsel> morsels =
+      table.BuildScanMorsels(ctx.txn_, 2);
+  ASSERT_FALSE(morsels.empty());
+  int64_t seen = 0;
+  for (const Table::ScanMorsel& morsel : morsels) {
+    Iterator it = table.BeginMorselScan(ctx.txn_, morsel);
+    while (it.IsValid()) {
+      ASSERT_EQ((*it).values_.size(), 3u);
+      ++seen;
+      ++it;
+    }
+  }
+  EXPECT_EQ(seen, 130);
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest, EmptyTableScanYieldsNoRows) {
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
+  Iterator it = table.BeginFullScan(ctx.txn_);
+  EXPECT_FALSE(it.IsValid());
+  EXPECT_FALSE(it.Position().IsValid());
+  ++it;
+  EXPECT_FALSE(it.IsValid());
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest, DumpPrintsScanName) {
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
+  ASSERT_SUCCESS(
+      table.Insert(ctx.txn_, Row({Value(7), Value("seven"), Value(0.7)}))
+          .GetStatus());
+  Iterator it = table.BeginFullScan(ctx.txn_);
+  ASSERT_TRUE(it.IsValid());
+  std::ostringstream output;
+  output << it;
+  EXPECT_NE(output.str().find("FullScan"), std::string::npos);
+  EXPECT_NE(output.str().find("SampleTable"), std::string::npos);
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+}  // namespace tinylamb

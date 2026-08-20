@@ -23,6 +23,7 @@
 #include <mutex>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "page/page_manager.hpp"
@@ -43,10 +44,8 @@ Transaction TransactionManager::Begin(bool read_only) {
   }
   {
     std::scoped_lock lk(transaction_table_lock);
-    std::scoped_lock version_guard(version_lock_);
     // Snapshot acquisition and registration must be atomic with respect to
-    // version GC. Otherwise GC could observe no reader after this transaction
-    // captured an old timestamp but before it entered active_snapshots_.
+    // commit-timestamp publication in CommitVersions (same lock).
     new_txn.snapshot_ts_ = commit_timestamp_.load();
     active_transactions_.emplace(new_txn_id, &new_txn);
     active_snapshots_.emplace(new_txn_id, new_txn.snapshot_ts_);
@@ -97,9 +96,10 @@ void TransactionManager::Abort(Transaction& txn) {
 StatusOr<std::string> TransactionManager::ReadVersion(
     const Transaction& txn, const RowPosition& rp,
     std::optional<std::string_view> physical) const {
-  std::scoped_lock lock(version_lock_);
-  const auto found = versions_.find(rp);
-  if (found == versions_.end()) {
+  VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+  std::scoped_lock lock(shard.mutex);
+  const auto found = shard.versions.find(rp);
+  if (found == shard.versions.end()) {
     if (!physical) return Status::kNotExists;
     return std::string(*physical);
   }
@@ -123,13 +123,16 @@ void TransactionManager::RegisterVersionWrite(
     Transaction& txn, const RowPosition& rp,
     std::optional<std::string_view> before,
     std::optional<std::string_view> after) {
-  std::scoped_lock lock(version_lock_);
-  VersionChain& chain = versions_[rp];
+  std::optional<std::string> before_copy =
+      before ? std::optional<std::string>(std::string(*before)) : std::nullopt;
+  std::optional<std::string> after_copy =
+      after ? std::optional<std::string>(std::string(*after)) : std::nullopt;
+  VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+  std::scoped_lock lock(shard.mutex);
+  VersionChain& chain = shard.versions[rp];
   if (chain.committed.empty()) {
     chain.committed.push_back(
-        {0, std::numeric_limits<uint64_t>::max(),
-         before ? std::optional<std::string>(std::string(*before))
-                : std::nullopt});
+        {0, std::numeric_limits<uint64_t>::max(), std::move(before_copy)});
   }
   if (!chain.pending) {
     chain.pending = PendingVersion{txn.ID(), std::nullopt};
@@ -138,8 +141,7 @@ void TransactionManager::RegisterVersionWrite(
     }
   }
   assert(chain.pending->owner == txn.ID());
-  chain.pending->value =
-      after ? std::optional<std::string>(std::string(*after)) : std::nullopt;
+  chain.pending->value = std::move(after_copy);
 }
 
 bool TransactionManager::IndexKeysMayBeStale(const Transaction& txn) const {
@@ -155,17 +157,28 @@ bool TransactionManager::RequiresHistoricalRead(const Transaction& txn) const {
 
 void TransactionManager::CommitVersions(Transaction& txn) {
   // Publish a commit timestamp and all of its row versions atomically with
-  // snapshot acquisition in Begin().
+  // snapshot acquisition in Begin() (transaction_table_lock).
+  std::array<bool, kVersionShardCount> needed{};
+  for (const RowPosition& rp : txn.write_set_) {
+    needed[VersionShardIndex(rp)] = true;
+  }
+  std::vector<std::unique_lock<std::mutex>> shard_locks;
+  shard_locks.reserve(kVersionShardCount);
+  for (size_t i = 0; i < kVersionShardCount; ++i) {
+    if (needed[i]) {
+      shard_locks.emplace_back(version_shards_[i].mutex);
+    }
+  }
   std::scoped_lock transaction_guard(transaction_table_lock);
-  std::scoped_lock version_guard(version_lock_);
   const uint64_t commit_ts = commit_timestamp_.fetch_add(1) + 1;
   max_committed_begin_ts_.store(
       std::max(max_committed_begin_ts_.load(std::memory_order_relaxed),
                commit_ts),
       std::memory_order_release);
   for (const RowPosition& rp : txn.write_set_) {
-    const auto found = versions_.find(rp);
-    if (found == versions_.end() || !found->second.pending ||
+    VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+    const auto found = shard.versions.find(rp);
+    if (found == shard.versions.end() || !found->second.pending ||
         found->second.pending->owner != txn.ID()) {
       continue;
     }
@@ -181,10 +194,21 @@ void TransactionManager::CommitVersions(Transaction& txn) {
 }
 
 void TransactionManager::AbortVersions(Transaction& txn) {
-  std::scoped_lock lock(version_lock_);
+  std::array<bool, kVersionShardCount> needed{};
   for (const RowPosition& rp : txn.write_set_) {
-    const auto found = versions_.find(rp);
-    if (found != versions_.end() && found->second.pending &&
+    needed[VersionShardIndex(rp)] = true;
+  }
+  std::vector<std::unique_lock<std::mutex>> shard_locks;
+  shard_locks.reserve(kVersionShardCount);
+  for (size_t i = 0; i < kVersionShardCount; ++i) {
+    if (needed[i]) {
+      shard_locks.emplace_back(version_shards_[i].mutex);
+    }
+  }
+  for (const RowPosition& rp : txn.write_set_) {
+    VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+    const auto found = shard.versions.find(rp);
+    if (found != shard.versions.end() && found->second.pending &&
         found->second.pending->owner == txn.ID()) {
       found->second.pending.reset();
     }
@@ -216,26 +240,29 @@ void TransactionManager::GarbageCollectVersions() {
       }
     }
   }
-  std::scoped_lock lock(version_lock_);
-  for (auto chain_iter = versions_.begin(); chain_iter != versions_.end();) {
-    VersionChain& chain = chain_iter->second;
-    if (!oldest_snapshot && !chain.pending) {
-      // Keep the latest committed version so later snapshots can still
-      // reconstruct the row without a physical page copy.
-      if (chain.committed.size() > 1) {
-        chain.committed.erase(chain.committed.begin(),
-                              std::prev(chain.committed.end()));
+  for (VersionShard& shard : version_shards_) {
+    std::scoped_lock lock(shard.mutex);
+    for (auto chain_iter = shard.versions.begin();
+         chain_iter != shard.versions.end();) {
+      VersionChain& chain = chain_iter->second;
+      if (!oldest_snapshot && !chain.pending) {
+        // Keep the latest committed version so later snapshots can still
+        // reconstruct the row without a physical page copy.
+        if (chain.committed.size() > 1) {
+          chain.committed.erase(chain.committed.begin(),
+                                std::prev(chain.committed.end()));
+        }
+        ++chain_iter;
+        continue;
+      }
+      if (oldest_snapshot) {
+        while (chain.committed.size() > 1 &&
+               chain.committed[1].begin_ts <= *oldest_snapshot) {
+          chain.committed.erase(chain.committed.begin());
+        }
       }
       ++chain_iter;
-      continue;
     }
-    if (oldest_snapshot) {
-      while (chain.committed.size() > 1 &&
-             chain.committed[1].begin_ts <= *oldest_snapshot) {
-        chain.committed.erase(chain.committed.begin());
-      }
-    }
-    ++chain_iter;
   }
 }
 

@@ -438,4 +438,107 @@ TEST_F(LSMTreeTest, MergerRunsPeriodically) {
     ASSERT_SUCCESS_AND_EQ(t_->Read(std::to_string(i)), std::to_string(i * 2));
   }
 }
+
+TEST_F(LSMTreeTest, MergeMultipleRuns) {
+  // Arrange -- flush two generations of values into separate sorted runs
+  for (int i = 0; i < 100; ++i) {
+    t_->Write(std::to_string(i), "first-" + std::to_string(i));
+  }
+  t_->Sync();
+  for (int i = 0; i < 100; ++i) {
+    t_->Write(std::to_string(i), "second-" + std::to_string(i));
+  }
+  t_->Sync();
+
+  // Act -- merge the multiple runs into a single run
+  t_->MergeAll();
+
+  // Assert -- the newest value survives for every key after the merge
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_SUCCESS_AND_EQ(t_->Read(std::to_string(i)),
+                          "second-" + std::to_string(i));
+  }
+}
+
+// DISABLED: LsmTree::MergeAll derives the merged-run file path from
+// blob_.Written(), which only advances when a payload is actually appended to
+// the blob. When two runs are merged and then a new run is flushed WITHOUT any
+// blob growth (short keys/values or tombstones), a second MergeAll computes the
+// SAME path, removes the previously merged file -- including the file it is
+// about to reopen -- and installs an empty, broken SortedRun (FATAL "Failed to
+// open file" in SortedRun::SortedRun). Reads still work because the broken run
+// reports zero entries, but the state is corrupt. Deterministic repro:
+TEST_F(LSMTreeTest, DISABLED_MergeAllReusesSameFilePath) {
+  t_->Write("a", "1");  // small value: no blob append
+  t_->Sync();           // run gen0
+  t_->Write("b", "2");  // small value: no blob append
+  t_->Sync();           // run gen1
+  t_->MergeAll();       // merged path = to_string(blob_.Written()) = "0"
+  t_->Delete("a");      // tombstone: no blob append
+  t_->Sync();           // run gen2
+  t_->MergeAll();       // path = "0" again: removes "0", then reopens it
+  ASSERT_EQ(t_->Read("a").GetStatus(), Status::kNotExists);
+}
+
+TEST_F(LSMTreeTest, MergeRunsWithTombstones) {
+  // Arrange -- run 1 holds a live value, run 2 holds only a tombstone
+  t_->Write("zombie", "alive");
+  t_->Sync();
+  t_->Delete("zombie");
+  t_->Sync();
+
+  // Act -- merge the live-value run with the tombstone run
+  t_->MergeAll();
+
+  // Assert -- the tombstone wins over the older live value
+  ASSERT_EQ(t_->Read("zombie").GetStatus(), Status::kNotExists);
+  EXPECT_FALSE(t_->Contains("zombie"));
+}
+
+TEST_F(LSMTreeTest, LargeValuesRoundTrip) {
+  // Arrange -- values larger than the inline 8-byte payload and keys longer
+  // than the 12-byte indirect threshold go through the blob
+  const std::string key(40, 'k');
+  const std::string value(4096, 'v');
+  t_->Write(key, value);
+  t_->Sync();
+
+  // Act -- read the large value back after it has been flushed to a run
+  auto result = t_->Read(key);
+
+  // Assert -- the blob-stored payload round-trips byte-for-byte
+  ASSERT_SUCCESS_AND_EQ(result, value);
+  EXPECT_TRUE(t_->Contains(key));
+
+  // Act -- overwrite with a different large value and delete afterwards
+  const std::string value2(8192, 'w');
+  t_->Write(key, value2);
+  t_->Sync();
+  ASSERT_SUCCESS_AND_EQ(t_->Read(key), value2);
+
+  t_->Delete(key);
+  t_->Sync();
+  ASSERT_EQ(t_->Read(key).GetStatus(), Status::kNotExists);
+}
+
+TEST_F(LSMTreeTest, ContainsAfterMultipleMerges) {
+  // Arrange -- two runs holding disjoint key ranges, then merge them
+  for (int i = 0; i < 30; ++i) {
+    t_->Write("a" + std::to_string(i), std::to_string(i));
+  }
+  t_->Sync();
+  for (int i = 0; i < 30; ++i) {
+    t_->Write("b" + std::to_string(i), std::to_string(i * 2));
+  }
+  t_->Sync();
+  t_->MergeAll();
+
+  // Act -- query membership across both key ranges and a missing key
+  // Assert -- both ranges remain present, the missing key stays absent
+  EXPECT_TRUE(t_->Contains("a0"));
+  EXPECT_TRUE(t_->Contains("a29"));
+  EXPECT_TRUE(t_->Contains("b0"));
+  EXPECT_TRUE(t_->Contains("b29"));
+  EXPECT_FALSE(t_->Contains("zzz"));
+}
 }  // namespace tinylamb

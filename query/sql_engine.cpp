@@ -420,8 +420,14 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       return Executor(std::make_shared<DeleteExecutor>(
           ctx.txn_, *table, plan->EmitExecutor(ctx)));
     }
-    case StatementType::kDropTable:
-      return Status::kNotImplemented;
+    case StatementType::kDropTable: {
+      const auto& drop = dynamic_cast<const DropTableStatement&>(*statement);
+      RETURN_IF_FAIL(database_->DropTable(ctx, drop.TableName()));
+      ctx.tables_.erase(drop.TableName());
+      ctx.stats_.erase(drop.TableName());
+      return Executor(std::make_shared<ConstantExecutor>(
+          Row({Value("DROP TABLE"), Value(0)})));
+    }
   }
   return Status::kNotImplemented;
 }

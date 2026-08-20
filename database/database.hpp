@@ -52,6 +52,8 @@ class Database {
 
   StatusOr<Table> CreateTable(TransactionContext& ctx, const Schema& schema);
 
+  Status DropTable(TransactionContext& ctx, std::string_view schema_name);
+
   Status CreateIndex(TransactionContext& ctx, std::string_view schema_name,
                      const IndexSchema& idx);
 

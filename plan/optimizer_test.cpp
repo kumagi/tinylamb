@@ -416,4 +416,273 @@ TEST_F(OptimizerTest, Asterisk) {
   // Act + Assert: optimize + execute + dump
   ASSERT_SUCCESS(DumpAll(qd));
 }
+
+TEST_F(OptimizerTest, StrictRangePredicatesDriveIndexBounds) {
+  // Arrange: Sc1 has an index on c1 (Sc1PK) plus a composite index on (c2, c3).
+  // Strict inequalities, reversed operands and NOT-EQUALS exercise every branch
+  // of Range::Update and the index prefix construction in ScanCandidates.
+  TransactionContext context = rs_->BeginContext();
+  auto run = [&](const Expression& predicate, std::vector<int64_t> expected) {
+    QueryData query{{"Sc1"}, predicate, {NamedExpression("c1")}};
+    ASSERT_SUCCESS(query.Rewrite(context));
+    ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+    Executor executor = plan->EmitExecutor(context);
+    std::vector<int64_t> keys;
+    Row row;
+    while (executor->Next(&row, nullptr)) {
+      keys.push_back(row[0].value.int_value);
+    }
+    EXPECT_EQ(keys, expected);
+  };
+  auto range = [](int64_t begin, int64_t end) {
+    std::vector<int64_t> values;
+    for (int64_t i = begin; i < end; ++i) values.push_back(i);
+    return values;
+  };
+
+  // Act + Assert: NOT-EQUALS never narrows a range; upper/lower bounds and
+  // constant-on-left comparisons all produce the matching key sets.
+  std::vector<int64_t> all_but_five;
+  for (int64_t i = 0; i < 100; ++i) {
+    if (i != 5) all_but_five.push_back(i);
+  }
+  run(BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kNotEquals,
+                          ConstantValueExp(Value(5))),
+      all_but_five);
+  run(BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kLessThan,
+                          ConstantValueExp(Value(8))),
+      range(0, 8));
+  run(BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(2))),
+      range(3, 100));
+  run(BinaryExpressionExp(ConstantValueExp(Value(2)),
+                          BinaryOperation::kLessThan, ColumnValueExp("c1")),
+      range(3, 100));
+  run(BinaryExpressionExp(ConstantValueExp(Value(2)),
+                          BinaryOperation::kGreaterThan, ColumnValueExp("c1")),
+      range(0, 2));
+  run(BinaryExpressionExp(ConstantValueExp(Value(2)),
+                          BinaryOperation::kGreaterThanEquals,
+                          ColumnValueExp("c1")),
+      range(0, 3));
+  run(BinaryExpressionExp(ConstantValueExp(Value(2)),
+                          BinaryOperation::kLessThanEquals,
+                          ColumnValueExp("c1")),
+      range(2, 100));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, ResidualPredicateWrapsIndexScanInSelection) {
+  // Arrange: the predicate touches c1 (indexed) and c2 (only reachable through
+  // the composite index prefix), so the pushed predicate is not fully covered
+  // by any single index key and must be wrapped in a SelectionPlan.
+  QueryData query{
+      {"Sc1"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                              ConstantValueExp(Value(2))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
+                              ConstantValueExp(Value("c2-2")))),
+      {NamedExpression("c1"), NamedExpression("c2"), NamedExpression("c3")}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  // Act + Assert: optimize + execute, the residual c1/c2 predicate still
+  // produces exactly the matching row.
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  dump << plan;
+  EXPECT_NE(dump.str().find("Select:"), std::string::npos) << dump.str();
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(2));
+  EXPECT_EQ(row[1], Value("c2-2"));
+  EXPECT_FALSE(executor->Next(&row, nullptr));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, SelectStarSingleTableExpandsAllColumns) {
+  // Arrange: an un-rewritten QueryData keeps the literal "*" so ExpandSelect
+  // must turn it into every column of the single FROM table.
+  QueryData query{{"Sc1"}, nullptr, {NamedExpression("*")}};
+  TransactionContext context = rs_->BeginContext();
+
+  // Act: optimize the raw query without QueryData::Rewrite (which would expand
+  // the star itself).
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+
+  // Assert: the projected schema has all three Sc1 columns and every row flows
+  // through the executor.
+  EXPECT_EQ(plan->GetSchema().ColumnCount(), 3U);
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  size_t count = 0;
+  while (executor->Next(&row, nullptr)) {
+    ++count;
+  }
+  EXPECT_EQ(count, 100U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, SelectStarMultipleTablesThrows) {
+  // Arrange: SELECT * over more than one table is rejected by ExpandSelect.
+  QueryData query{{"Sc1", "Sc2"}, nullptr, {NamedExpression("*")}};
+  TransactionContext context = rs_->BeginContext();
+
+  // Act + Assert: the raw query (no Rewrite) throws at optimization time.
+  EXPECT_THROW(Optimizer::Optimize(query, context), std::runtime_error);
+  context.Abort();
+}
+
+TEST_F(OptimizerTest, OrderByCapsCostForIndexProvidedOrdering) {
+  // Arrange: an equality on c2 leaves c3 as the ordering suffix of the
+  // composite index (c2, c3), so the index-scan alternative reports that it
+  // satisfies ORDER BY c3 and its cost is capped at 1.0.
+  QueryData query{
+      {"Sc1"},
+      BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value("c2-32"))),
+      {NamedExpression("c1"), NamedExpression("c2")}};
+  query.order_expressions_ = {ColumnValueExp("c3")};
+  query.order_ascending_ = {true};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  // Act + Assert: optimize + execute and verify the matching row.
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(32));
+  EXPECT_EQ(row[1], Value("c2-32"));
+  EXPECT_FALSE(executor->Next(&row, nullptr));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, AggregateSelectBuildsAggregationPlan) {
+  // Arrange: a SELECT list consisting only of aggregate expressions must be
+  // capped with an AggregationPlan.
+  QueryData query{
+      {"Sc1"},
+      BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(2))),
+      {NamedExpression(
+          "sum_score",
+          AggregateExpressionExp(AggregationType::kSum,
+                                 ColumnValueExp("c3")))}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  // Act + Assert: optimize + execute, the single matching row c1=2 has
+  // c3 = 2 + 9.9 = 11.9.
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(11.9));
+  EXPECT_FALSE(executor->Next(&row, nullptr));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, MixedAggregateAndScalarSelectIsNotImplemented) {
+  // Arrange: a SELECT list mixing aggregates with scalar columns is rejected.
+  QueryData query{
+      {"Sc1"},
+      BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(2))),
+      {NamedExpression(
+           "sum_score",
+           AggregateExpressionExp(AggregationType::kSum,
+                                  ColumnValueExp("c3"))),
+       NamedExpression("c1")}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  // Act: optimize the mixed aggregate + scalar query.
+  StatusOr<Plan> result = Optimizer::Optimize(query, context);
+
+  // Assert: the optimizer reports the feature as not implemented.
+  EXPECT_FALSE(result.HasValue());
+  EXPECT_EQ(result.GetStatus(), Status::kNotImplemented);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, ConstantLeftPredicatesWithoutCanonicalization) {
+  // Arrange: the default "canonicalize_comparison" rule flips `2 < c1` into
+  // `c1 > 2`. With an empty expression rule set the constant-left shape stays
+  // intact and drives the reverse-direction Range::Update paths.
+  TransactionContext context = rs_->BeginContext();
+  OptimizerOptions options;
+  options.relational_rules = cascades::RuleSet::Default();
+  auto run = [&](const Expression& predicate, std::vector<int64_t> expected) {
+    QueryData query{{"Sc1"}, predicate, {NamedExpression("c1")}};
+    ASSERT_SUCCESS(query.Rewrite(context));
+    ASSIGN_OR_ASSERT_FAIL(Plan, plan,
+                          Optimizer::Optimize(query, context, options));
+    Executor executor = plan->EmitExecutor(context);
+    std::vector<int64_t> keys;
+    Row row;
+    while (executor->Next(&row, nullptr)) {
+      keys.push_back(row[0].value.int_value);
+    }
+    EXPECT_EQ(keys, expected);
+  };
+  auto range = [](int64_t begin, int64_t end) {
+    std::vector<int64_t> values;
+    for (int64_t i = begin; i < end; ++i) values.push_back(i);
+    return values;
+  };
+
+  // Act + Assert: each constant-on-the-left comparison selects the same keys
+  // as its flipped counterpart.
+  run(BinaryExpressionExp(ConstantValueExp(Value(2)),
+                          BinaryOperation::kLessThan, ColumnValueExp("c1")),
+      range(3, 100));
+  run(BinaryExpressionExp(ConstantValueExp(Value(2)),
+                          BinaryOperation::kLessThanEquals,
+                          ColumnValueExp("c1")),
+      range(2, 100));
+  run(BinaryExpressionExp(ConstantValueExp(Value(2)),
+                          BinaryOperation::kGreaterThan, ColumnValueExp("c1")),
+      range(0, 2));
+  run(BinaryExpressionExp(ConstantValueExp(Value(2)),
+                          BinaryOperation::kGreaterThanEquals,
+                          ColumnValueExp("c1")),
+      range(0, 3));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, ExtraImplementationRuleIsRegistered) {
+  // Arrange: an extra implementation rule is injected through
+  // OptimizerOptions.extra_implementation_rules. Its implement returns no
+  // alternatives, so the optimization result is unchanged.
+  QueryData query{
+      {"Sc1"},
+      BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(2))),
+      {NamedExpression("c1"), NamedExpression("c2")}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  OptimizerOptions options = OptimizerOptions::Default();
+  options.extra_implementation_rules.push_back(cascades::ImplementationRule(
+      "extra_scan_probe", cascades::dsl::Scan(),
+      [](const cascades::Bindings&, const cascades::LogicalExpression&,
+         const std::vector<cascades::BestPlan>&,
+         const cascades::PhysicalProperties&) {
+        return std::vector<cascades::PlanAlternative>{};
+      }));
+
+  // Act + Assert: the customized rule set still optimizes and the query returns
+  // the expected row.
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan,
+                        Optimizer::Optimize(query, context, options));
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(2));
+  EXPECT_FALSE(executor->Next(&row, nullptr));
+  ASSERT_SUCCESS(context.PreCommit());
+}
 }  // namespace tinylamb

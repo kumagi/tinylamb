@@ -226,6 +226,100 @@ TEST(TokenizerTest, NumbersAndOperators) {
   EXPECT_EQ(tokens[12].type, TokenType::kEof);
 }
 
+TEST(TokenizerTest, UnterminatedStringConsumesToEnd) {
+  // Act -- tokenize a string literal with no closing quote
+  Tokenizer tokenizer("'abc");
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Assert -- the unterminated literal still yields a string token + EOF
+  ASSERT_EQ(tokens.size(), 2);
+  EXPECT_EQ(tokens[0].type, TokenType::kString);
+  EXPECT_EQ(tokens[0].value, "abc");
+  EXPECT_EQ(tokens[1].type, TokenType::kEof);
+}
+
+TEST(TokenizerTest, UnterminatedQuotedIdentifierConsumesToEnd) {
+  // Act -- tokenize a quoted identifier with no closing backtick
+  Tokenizer tokenizer("`abc");
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Assert -- the identifier is still produced
+  ASSERT_EQ(tokens.size(), 2);
+  EXPECT_EQ(tokens[0].type, TokenType::kIdentifier);
+  EXPECT_EQ(tokens[0].value, "abc");
+  EXPECT_EQ(tokens[1].type, TokenType::kEof);
+}
+
+TEST(TokenizerTest, EmptyStringAndEmptyIdentifier) {
+  // Act -- tokenize adjacent empty string and empty backtick identifier
+  Tokenizer tokenizer("'' `` ''");
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Assert -- both produce empty-value tokens
+  ASSERT_EQ(tokens.size(), 4);
+  EXPECT_EQ(tokens[0].type, TokenType::kString);
+  EXPECT_EQ(tokens[0].value, "");
+  EXPECT_EQ(tokens[1].type, TokenType::kIdentifier);
+  EXPECT_EQ(tokens[1].value, "");
+  EXPECT_EQ(tokens[2].type, TokenType::kString);
+  EXPECT_EQ(tokens[2].value, "");
+  EXPECT_EQ(tokens[3].type, TokenType::kEof);
+}
+
+TEST(TokenizerTest, AllKeywords) {
+  // Act -- tokenize every keyword in the keyword table
+  Tokenizer tokenizer(
+      "select from where create drop table insert into values update set "
+      "delete and or not is null as distinct order by asc desc limit offset "
+      "join inner left right on case when then else end in group having "
+      "primary key unique references default true false");
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Assert -- every non-EOF token is a keyword
+  for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+    EXPECT_EQ(tokens[i].type, TokenType::kKeyword) << tokens[i].value;
+  }
+  EXPECT_EQ(tokens.back().type, TokenType::kEof);
+}
+
+TEST(TokenizerTest, IdentifierWithDigitsAndUnderscore) {
+  // Act -- tokenize identifiers containing digits, underscores, leading underscore
+  Tokenizer tokenizer("col1 my_table _private");
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Assert -- all lexed as identifiers with exact spelling
+  ASSERT_EQ(tokens.size(), 4);
+  EXPECT_EQ(tokens[0].type, TokenType::kIdentifier);
+  EXPECT_EQ(tokens[0].value, "col1");
+  EXPECT_EQ(tokens[1].type, TokenType::kIdentifier);
+  EXPECT_EQ(tokens[1].value, "my_table");
+  EXPECT_EQ(tokens[2].type, TokenType::kIdentifier);
+  EXPECT_EQ(tokens[2].value, "_private");
+  EXPECT_EQ(tokens[3].type, TokenType::kEof);
+}
+
+TEST(TokenizerTest, MixedAlphanumericNumericSplitting) {
+  // Act -- tokenize digit/letter runs, a trailing-dot numeric, and exponents
+  Tokenizer tokenizer("123abc 5. 1e5");
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Assert -- numeric scanning stops at the first letter
+  ASSERT_EQ(tokens.size(), 6);
+  EXPECT_EQ(tokens[0].type, TokenType::kNumeric);
+  EXPECT_EQ(tokens[0].value, "123");
+  EXPECT_EQ(tokens[1].type, TokenType::kIdentifier);
+  EXPECT_EQ(tokens[1].value, "abc");
+  // Assert -- a trailing dot stays part of the numeric token
+  EXPECT_EQ(tokens[2].type, TokenType::kNumeric);
+  EXPECT_EQ(tokens[2].value, "5.");
+  // Assert -- exponent splits into numeric + identifier
+  EXPECT_EQ(tokens[3].type, TokenType::kNumeric);
+  EXPECT_EQ(tokens[3].value, "1");
+  EXPECT_EQ(tokens[4].type, TokenType::kIdentifier);
+  EXPECT_EQ(tokens[4].value, "e5");
+  EXPECT_EQ(tokens[5].type, TokenType::kEof);
+}
+
 TEST(TokenizerTest, WhitespaceCommentsAndUnknowns) {
   // Act -- tokenize a statement broken up by tabs/newlines/CRLF plus comment-
   // looking input and unknown characters
