@@ -722,6 +722,7 @@ TEST_F(VMCacheTest, CrossPageStructReadWithTwelveByteElements) {
   ASSERT_EQ(second, Expected<Data>(341));
 }
 
+
 TEST_F(VMCacheTest, ConstructorWithExplicitFileSizeAndOffset) {
   // Arrange -- a file with 100 padding bytes followed by 1024 int32 values.
   constexpr size_t kCount = 1024;
