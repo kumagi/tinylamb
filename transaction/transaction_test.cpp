@@ -16,12 +16,15 @@
 
 #include "transaction/transaction.hpp"
 
+#include <cstdio>
 #include <memory>
 #include <string>
 
+#include "common/random_string.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
 #include "recovery/logger.hpp"
+#include "recovery/recovery_manager.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
@@ -276,6 +279,35 @@ TEST_F(TransactionTest, DefaultTransactionRegisterVersionWriteIsNoop) {
       txn.RegisterVersionWrite(rp, std::nullopt, std::string_view("after")));
   EXPECT_NO_FATAL_FAILURE(
       txn.RegisterVersionWrite(rp, std::string_view("before"), std::nullopt));
+}
+
+TEST(TransactionManagerTest, AbortedWriteIsNotVisibleToLaterReaders) {
+  // A writer's pending version write must be rolled back on Abort() so a
+  // later reader never observes the aborted value.  A write transaction logs
+  // its Begin record, so the manager needs a real RecoveryManager (the shared
+  // TransactionTest fixture intentionally runs without one).
+  const std::string db_name = "abort_txn-test-" + RandomString() + ".db";
+  const std::string log_name = "abort_txn-test-" + RandomString() + ".log";
+  {
+    PageManager pm(db_name, 10);
+    Logger logger(log_name);
+    LockManager lm;
+    RecoveryManager rm(log_name, pm.GetPool());
+    TransactionManager tm(&lm, &pm, &logger, &rm);
+
+    const RowPosition rp(1, 1);
+    Transaction writer = tm.Begin();
+    ASSERT_TRUE(writer.AddWriteSet(rp));
+    writer.RegisterVersionWrite(rp, std::nullopt, "ghost");
+    writer.Abort();
+    ASSERT_TRUE(writer.IsFinished());
+
+    Transaction reader = tm.Begin(true);
+    ASSERT_EQ(tm.ReadVersion(reader, rp, std::nullopt).GetStatus(),
+              Status::kNotExists);
+  }
+  std::ignore = std::remove(db_name.c_str());
+  std::ignore = std::remove(log_name.c_str());
 }
 
 }  // namespace tinylamb

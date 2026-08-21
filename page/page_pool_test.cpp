@@ -23,6 +23,7 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <string>
 #include <vector>
 
@@ -203,13 +204,13 @@ TEST_F(PagePoolTest, PageRowCountOverloads) {
   ASSERT_EQ(row.RowCount(txn), 0U);
   ASSERT_EQ(leaf.RowCount(txn), 0U);
   ASSERT_EQ(branch.RowCount(txn), 0U);
-  EXPECT_THROW(meta.RowCount(txn), std::runtime_error);
+  EXPECT_THROW(std::ignore = meta.RowCount(txn), std::runtime_error);
 
   // Act/Assert -- slot_t overload dispatches on page type
   ASSERT_EQ(row.RowCount(), 0U);
   ASSERT_EQ(leaf.RowCount(), 0U);
   ASSERT_EQ(branch.RowCount(), 0U);
-  EXPECT_THROW(meta.RowCount(), std::runtime_error);
+  EXPECT_THROW(std::ignore = meta.RowCount(), std::runtime_error);
 }
 
 TEST_F(PagePoolTest, PageReadKeyAndReadByType) {
@@ -268,8 +269,8 @@ TEST_F(PagePoolTest, PageUnsupportedOperationsThrow) {
   EXPECT_THROW(row.Delete(txn, "key"), std::runtime_error);
   EXPECT_THROW(row.SetLowFence(txn, IndexKey("a")), std::runtime_error);
   EXPECT_THROW(row.SetHighFence(txn, IndexKey("z")), std::runtime_error);
-  EXPECT_THROW(row.GetLowFence(txn), std::runtime_error);
-  EXPECT_THROW(row.GetHighFence(txn), std::runtime_error);
+  EXPECT_THROW(std::ignore = row.GetLowFence(txn), std::runtime_error);
+  EXPECT_THROW(std::ignore = row.GetHighFence(txn), std::runtime_error);
   EXPECT_THROW((void)row.SetFoster(txn, FosterPair("k", 1)),
                std::runtime_error);
   EXPECT_THROW((void)row.GetFoster(txn), std::runtime_error);
@@ -412,6 +413,119 @@ TEST_F(PagePoolTest, ConstructorThrowsForUnopenablePath) {
   // Assert -- the constructor reports failure instead of silently proceeding
   EXPECT_THROW(PagePool("/nonexistent_dir_tinylamb/foo.db", 10),
                std::runtime_error);
+}
+
+TEST_F(PagePoolTest, OutOfRangePageIdHandlesSeekFailure) {
+  // Arrange -- a page id so large that its file offset overflows the 64-bit
+  // stream position (kPageSize = 32 KiB, so 2^48 * 32KiB = 2^63)
+  constexpr page_id_t kHuge = (1ULL << 48) + 1;
+
+  // Act -- loading it fails the seek inside ReadFrom but still yields a ref
+  {
+    PageRef page = pp->GetPage(kHuge, nullptr);
+    ASSERT_EQ(page->PageID(), kHuge);
+  }
+  ASSERT_EQ(pp->Size(), 1);
+
+  // Act -- evicting the out-of-range page must tolerate the failed seek; the
+  // stream is cleared before the write-back attempt, which may then report
+  // failure depending on the file state.
+  for (int i = 0; i < kDefaultCapacity + 1; ++i) {
+    try {
+      PageRef page = pp->GetPage(static_cast<page_id_t>(1000 + i), nullptr);
+      EXPECT_EQ(page->PageID(), 1000 + i);
+    } catch (const std::runtime_error&) {
+      // WriteBack after a failed seek is allowed to throw.
+    }
+  }
+  pp->DropAllPages();
+  ASSERT_EQ(pp->Size(), 0);
+}
+
+TEST_F(PagePoolTest, WriteBackFailureOnFullDeviceThrows) {
+  // Arrange -- /dev/full answers reads with zeros but rejects every write
+  // with ENOSPC, so the write-back path during eviction must throw
+  auto pool = std::make_unique<PagePool>("/dev/full", 2);
+  pool->GetPage(0);
+  pool->GetPage(1);
+
+  // Act -- the third distinct page forces an eviction of page 0, whose
+  // write-back fails
+  EXPECT_THROW(pool->GetPage(2), std::runtime_error);
+
+  // Tear down without another write-back so the destructor does not rethrow.
+  pool->DropAllPages();
+}
+
+TEST_F(PagePoolTest, ConcurrentLoadsOfSamePageInstallOnce) {
+  // Arrange -- four threads request a cold page at the same instant; the pool
+  // must race safely and install exactly one copy
+  std::atomic<bool> go{false};
+  std::mutex mu;
+  std::vector<std::thread> threads;
+  for (int i = 0; i < 4; ++i) {
+    threads.emplace_back([&] {
+      while (!go.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      {
+        PageRef page = pp->GetPage(77, nullptr);
+        EXPECT_EQ(page->PageID(), 77U);
+      }
+      std::lock_guard<std::mutex> lock(mu);
+    });
+  }
+  go.store(true, std::memory_order_release);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  // Assert -- only one pool entry exists for the shared page
+  ASSERT_EQ(pp->Size(), 1);
+}
+
+// PRODUCTION BUG: concurrent GetPage misses racing an eviction violate pool
+// invariants. A load can return a Page whose PageID field is 0 (wrong page),
+// and the subsequent Unpin asserts `page_entry != pool_.end()` because the
+// returned page was evicted while the ref was alive
+// (page/page_pool.cpp:149). Disabled because it deterministically aborts.
+TEST_F(PagePoolTest, DISABLED_ConcurrentEvictionAcrossThreads) {
+  // Arrange -- two threads churn distinct page ids far beyond the pool
+  // capacity, forcing concurrent eviction and install-race handling
+  std::atomic<bool> go{false};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 2; ++t) {
+    threads.emplace_back([&, t] {
+      while (!go.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      for (int i = 0; i < 50; ++i) {
+        const page_id_t pid = static_cast<page_id_t>(1000 + t * 100 + i);
+        PageRef page = pp->GetPage(pid, nullptr);
+        EXPECT_EQ(page->PageID(), pid);
+      }
+    });
+  }
+  go.store(true, std::memory_order_release);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  // Assert -- the pool is back within its capacity once all pins are released
+  EXPECT_LE(pp->Size(), static_cast<page_id_t>(kDefaultCapacity));
+}
+
+TEST_F(PagePoolTest, DestructorWarnsOnPinnedPage) {
+  // Arrange -- pin page 3 and intentionally leak the PageRef so the pool is
+  // destroyed while the page is still pinned
+  auto* leaked = new PageRef(pp->GetPage(3, nullptr));
+  (void)leaked;
+
+  // Act -- destroying the pool with a pinned page logs a caution message
+  pp.reset();
+
+  // Assert -- no crash; the pinned page was written back before destruction
+  ASSERT_EQ(pp, nullptr);
 }
 
 }  // namespace tinylamb

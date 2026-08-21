@@ -29,6 +29,8 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/hash_join_mode.hpp"
+#include "executor/query_memory.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
@@ -445,6 +447,7 @@ TEST_F(PlanTest, ProductHashJoinAccessors) {
 
   // Assert -- costs and rendered join keys are correct
   EXPECT_EQ(prop->GetSchema().ColumnCount(), 7);
+  EXPECT_NE(prop->ToString().find("Hash Join"), std::string::npos);
   EXPECT_NE(prop->ToString().find("left:{Sc1.c1}"), std::string::npos);
   EXPECT_NE(prop->ToString().find("right:{Sc2.d1}"), std::string::npos);
   EXPECT_EQ(prop->EmitRowCount(),
@@ -454,6 +457,29 @@ TEST_F(PlanTest, ProductHashJoinAccessors) {
   std::ostringstream oss;
   prop->Dump(oss, 0);
   EXPECT_NE(oss.str().find("right:{Sc2.d1}"), std::string::npos);
+}
+
+TEST_F(PlanTest, ProductHybridHashJoinPreferredUnderTinyBudget) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  // Non-zero row estimates so PreferHybridHashJoin sees a real build footprint.
+  TableStatistics left_ts((Schema()));
+  TableStatistics right_ts((Schema()));
+  left_ts = left_ts.ScaleToRows(10'000);
+  right_ts = right_ts.ScaleToRows(10'000);
+  auto left = std::make_shared<FullScanPlan>(*tbl1, left_ts);
+  auto right = std::make_shared<FullScanPlan>(*tbl2, right_ts);
+
+  QueryMemoryBudget::Global().ResetForTest(64 * 1024);
+  Plan in_memory(new ProductPlan(left, {ColumnName("Sc1.c1")}, right,
+                                 {ColumnName("Sc2.d1")},
+                                 HashJoinMode::kInMemory));
+  Plan hybrid(new ProductPlan(left, {ColumnName("Sc1.c1")}, right,
+                              {ColumnName("Sc2.d1")}, HashJoinMode::kHybrid));
+  EXPECT_GT(in_memory->AccessRowCount(), hybrid->AccessRowCount());
+  EXPECT_NE(hybrid->ToString().find("Hybrid Hash Join"), std::string::npos);
+  QueryMemoryBudget::Global().ResetForTest(0);
 }
 
 TEST_F(PlanTest, ProductIndexJoinAccessors) {
@@ -805,6 +831,112 @@ TEST_F(PlanTest, IndexOnlyScanPlanStaleFallbackProjectsIncludedColumns) {
   // Assert -- only the 6 snapshot-visible rows are returned
   ASSERT_EQ(count, 6);
   reader.txn_.Abort();
+}
+
+// PRODUCTION BUG: ProjectionPlan(Plan, const std::vector<ColumnName>&) crashes.
+// The member initializer list moves `src` into `src_` and then evaluates
+// `stats_(src->GetStats())` (projection_plan.cpp:46-48). `Plan` is a
+// std::shared_ptr, so after the move `src` is null and `src->GetStats()` is a
+// null dereference (confirmed SIGSEGV). The constructor is therefore unusable
+// and cannot be covered without a production fix; this test documents the
+// crash so a future fix can re-enable it.
+TEST_F(PlanTest, DISABLED_ProjectionColumnNameCtorCrashesAfterMove) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  TableStatistics ts((Schema()));
+  auto child = std::make_shared<FullScanPlan>(*tbl, ts);
+
+  // Constructing through the ColumnName overload dereferences the moved-from
+  // `src` shared_ptr while computing stats_ and aborts the process.
+  Plan pp(new ProjectionPlan(child, {ColumnName("Sc1.c1"),
+                                     ColumnName("Sc1.c2")}));
+
+  const Schema& sc = pp->GetSchema();
+  EXPECT_EQ(sc.ColumnCount(), 2);
+  EXPECT_EQ(sc.GetColumn(0).Name().name, "c1");
+  EXPECT_EQ(sc.GetColumn(1).Name().name, "c2");
+  EXPECT_EQ(pp->AccessRowCount(), child->AccessRowCount());
+  EXPECT_EQ(pp->EmitRowCount(), child->EmitRowCount());
+  std::ostringstream oss;
+  pp->Dump(oss, 0);
+  EXPECT_NE(oss.str().find("Project: {Sc1.c1, Sc1.c2}"), std::string::npos);
+}
+
+TEST_F(PlanTest, ProjectionQualifiedColumnValueAccessorsAndRender) {
+  // Arrange -- begin context, get Sc1 table and its real statistics
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
+                        ctx.GetStats("Sc1"));
+  auto child = std::make_shared<FullScanPlan>(*tbl, *ts);
+
+  // Act -- project a fully qualified ColumnValue (auto-named by its column)
+  std::vector<NamedExpression> columns;
+  columns.emplace_back(NamedExpression("", ColumnValueExp(ColumnName("Sc1.c3"))));
+  Plan pp(new ProjectionPlan(child, std::move(columns)));
+
+  // Assert -- the schema carries the qualified name and all accessors delegate
+  // to the child plan
+  const Schema& sc = pp->GetSchema();
+  EXPECT_EQ(sc.ColumnCount(), 1);
+  EXPECT_EQ(sc.GetColumn(0).Name().ToString(), "Sc1.c3");
+  EXPECT_EQ(sc.GetColumn(0).Name().schema, "Sc1");
+  EXPECT_EQ(pp->AccessRowCount(), child->AccessRowCount());
+  EXPECT_EQ(pp->EmitRowCount(), child->EmitRowCount());
+  EXPECT_EQ(pp->GetStats().Rows(), child->GetStats().Rows());
+  EXPECT_EQ(pp->GetStats().Rows(), ts->Rows());
+  EXPECT_EQ(pp->ScanSource(), child->ScanSource());
+  // Assert -- ordering is delegated (FullScanPlan advertises no order)
+  EXPECT_FALSE(pp->IsOrderedBy({ColumnValueExp("c3")}, {true}));
+  // Assert -- both renderings name the projected column.  ToString uses the
+  // NamedExpression name (empty for an anonymous ColumnValue) while Dump
+  // renders the underlying expression's qualified column name.
+  EXPECT_NE(pp->ToString().find("Project: {}"), std::string::npos);
+  std::ostringstream oss;
+  pp->Dump(oss, 0);
+  EXPECT_NE(oss.str().find("Sc1.c3"), std::string::npos);
+  EXPECT_NE(oss.str().find("FullScan"), std::string::npos);
+}
+
+TEST_F(PlanTest, ProjectionAllAnonymousColumnsRenderAndEmit) {
+  // Arrange -- begin context, get Sc1 table
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  TableStatistics ts((Schema()));
+  auto child = std::make_shared<FullScanPlan>(*tbl, ts);
+
+  // Act -- project three anonymous constants so every column is auto-named
+  std::vector<NamedExpression> columns;
+  columns.emplace_back(NamedExpression("", ConstantValueExp(Value(1))));
+  columns.emplace_back(NamedExpression("", ConstantValueExp(Value(2))));
+  columns.emplace_back(NamedExpression("", ConstantValueExp(Value(3))));
+  Plan pp(new ProjectionPlan(child, std::move(columns)));
+
+  // Assert -- the schema auto-names each anonymous column
+  const Schema& sc = pp->GetSchema();
+  EXPECT_EQ(sc.ColumnCount(), 3);
+  EXPECT_EQ(sc.GetColumn(0).Name().name, "$col0");
+  EXPECT_EQ(sc.GetColumn(1).Name().name, "$col1");
+  EXPECT_EQ(sc.GetColumn(2).Name().name, "$col2");
+  // Assert -- ToString joins empty names with commas
+  EXPECT_NE(pp->ToString().find("Project: {, , }"), std::string::npos);
+  EXPECT_EQ(pp->EmitRowCount(), child->EmitRowCount());
+  // Assert -- executing the plan emits one row per source row
+  Executor executor = pp->EmitExecutor(ctx);
+  Row result;
+  size_t count = 0;
+  while (executor->Next(&result, nullptr)) {
+    ASSERT_EQ(result.values_.size(), 3);
+    EXPECT_EQ(result[0], Value(1));
+    EXPECT_EQ(result[1], Value(2));
+    EXPECT_EQ(result[2], Value(3));
+    ++count;
+  }
+  EXPECT_EQ(count, 6);
+  std::ostringstream oss;
+  pp->Dump(oss, 0);
+  EXPECT_NE(oss.str().find("Project: {"), std::string::npos);
+  EXPECT_NE(oss.str().find("FullScan"), std::string::npos);
 }
 
 }  // namespace tinylamb

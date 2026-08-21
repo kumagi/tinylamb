@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -54,8 +55,13 @@ std::string_view LeafPage::GetValue(size_t idx) const {
 Status LeafPage::Insert(page_id_t page_id, Transaction& txn,
                         std::string_view key, std::string_view value) {
   constexpr size_t kFanoutThreshold = kPageBodySize / 6;
-  const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
-  const bin_size_t expected_size = physical_size + sizeof(RowPointer);
+  // Compute in size_t first: bin_size_t addition wraps for huge payloads and
+  // would bypass the TooBig/NoSpace guards below.
+  const size_t physical_size = SerializeSize(key) + SerializeSize(value);
+  const size_t expected_size = physical_size + sizeof(RowPointer);
+  if (physical_size > std::numeric_limits<bin_size_t>::max()) {
+    return Status::kTooBigData;
+  }
   if (kFanoutThreshold < expected_size) {
     if (expected_size > kPageBodySize / 2) {
       return Status::kTooBigData;
@@ -101,7 +107,10 @@ void LeafPage::InsertImpl(std::string_view key, std::string_view value) {
 Status LeafPage::Update(page_id_t page_id, Transaction& txn,
                         std::string_view key, std::string_view value) {
   constexpr size_t kFanoutThreshold = kPageBodySize / 6;
-  const bin_size_t physical_size = SerializeSize(key) + SerializeSize(value);
+  const size_t physical_size = SerializeSize(key) + SerializeSize(value);
+  if (physical_size > std::numeric_limits<bin_size_t>::max()) {
+    return Status::kTooBigData;
+  }
   if (kFanoutThreshold < physical_size) {
     if (physical_size + sizeof(RowPointer) > kPageBodySize / 2) {
       return Status::kTooBigData;
@@ -109,7 +118,7 @@ Status LeafPage::Update(page_id_t page_id, Transaction& txn,
     return Status::kNoSpace;
   }
   ASSIGN_OR_RETURN(std::string_view, old_value, Read(page_id, txn, key));
-  const bin_size_t old_size = SerializeSize(key) + SerializeSize(old_value);
+  const size_t old_size = SerializeSize(key) + SerializeSize(old_value);
   if (old_size < physical_size && free_size_ < physical_size - old_size) {
     return Status::kNoSpace;
   }
@@ -226,15 +235,19 @@ void LeafPage::Split(page_id_t /*pid*/, Transaction& txn, std::string_view key,
                      SerializeSize(GetValue(pivot)) + sizeof(RowPointer);
     pivot++;
   }
-  while (GetKey(pivot) < key && consumed_size < expected_size) {
+  // Keep pivot in [0, row_count_]: never read GetKey(row_count_).
+  while (pivot < static_cast<size_t>(row_count_) && GetKey(pivot) < key &&
+         consumed_size < expected_size) {
+    consumed_size += SerializeSize(GetKey(pivot)) + SerializeSize(GetValue(pivot)) +
+                     sizeof(RowPointer);
     pivot++;
-    consumed_size +=
-        SerializeSize(GetKey(pivot)) + sizeof(RowPointer) + sizeof(RowPointer);
   }
-  while (key < GetKey(pivot) && kPayload < consumed_size + expected_size) {
-    consumed_size -=
-        SerializeSize(GetKey(pivot)) + sizeof(RowPointer) + sizeof(RowPointer);
+  while (pivot > 0 && pivot < static_cast<size_t>(row_count_) &&
+         key < GetKey(pivot) && kPayload < consumed_size + expected_size) {
     pivot--;
+    consumed_size -=
+        SerializeSize(GetKey(pivot)) + SerializeSize(GetValue(pivot)) +
+        sizeof(RowPointer);
   }
 
   const size_t original_row_count = row_count_;
@@ -485,7 +498,9 @@ Status LeafPage::MoveLeftFromFoster(Transaction& txn, Page& right) {
   std::string move_key(right.GetKey(0));
   std::string move_value(right.body.leaf_page.GetValue(0));
   Page* this_page = GET_PAGE_PTR(this);
-  COERCE(this_page->InsertLeaf(txn, move_key, move_value));
+  // Exclusive-sized entries cannot share a page; surface NoSpace to the caller
+  // instead of aborting so Delete/HandleFoster can leave the foster chain intact.
+  RETURN_IF_FAIL(this_page->InsertLeaf(txn, move_key, move_value));
   if (1 < right.RowCount()) {
     std::string next_foster_key(right.GetKey(1));
     COERCE(right.Delete(txn, move_key));
@@ -494,13 +509,19 @@ Status LeafPage::MoveLeftFromFoster(Transaction& txn, Page& right) {
     COERCE(right.SetLowFence(txn, IndexKey(move_key)));
     return Status::kSuccess;
   }
-  // Merge foster child into permanent foster parent.
+  // Merge foster child into permanent foster parent. Caller must adopt
+  // right's remaining foster chain onto this page (see HandleFoster/Delete).
   COERCE(right.Delete(txn, move_key));
   COERCE(this_page->SetFoster(txn, FosterPair()));
   return Status::kSuccess;
 }
 
 bool LeafPage::SanityCheckForTest() const {
+  if (row_count_ == 0) {
+    // Empty leaves can remain after deleting the last row while a foster child
+    // still holds higher keys; fences/foster alone are enough to navigate.
+    return true;
+  }
   if (GetLowFence().IsNotInfinity() &&
       GetKey(0) < GetLowFence().GetKey().Value()) {
     LOG(FATAL) << GET_PAGE_CONST_PTR(this)->PageID() << " Violated low fence: "
@@ -508,7 +529,7 @@ bool LeafPage::SanityCheckForTest() const {
                << HeadString(GetKey(0), 20);
     return false;
   }
-  for (slot_t i = 0; i < row_count_ - 1; ++i) {
+  for (slot_t i = 0; i + 1 < row_count_; ++i) {
     if (GetKey(i + 1) < GetKey(i)) {
       return false;
     }

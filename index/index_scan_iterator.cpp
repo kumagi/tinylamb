@@ -133,8 +133,7 @@ void IndexScanIterator::UpdateIteratorState() {
     include_ = rp.include;
   } else {
     auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
-    if (val.empty() || value_offset_ < 0 ||
-        static_cast<size_t>(value_offset_) >= val.size()) {
+    if (val.empty() || value_offset_ >= val.size()) {
       Clear();
       return;
     }

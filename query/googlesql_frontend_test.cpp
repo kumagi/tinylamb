@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/resource.h>
 #include <string>
 #include <vector>
 
@@ -392,6 +393,97 @@ TEST(GoogleSqlFrontendTest, EmptyInputReportsSuccessWithoutAst) {
   const GoogleSqlParseResult semicolon = GoogleSqlFrontend::Parse(";");
   EXPECT_FALSE(semicolon.ok);
   EXPECT_FALSE(semicolon.error.empty());
+}
+
+TEST(GoogleSqlFrontendTest, PipeCreationFailureReportsError) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  // Shrink the fd table so pipe() inside Parse() fails with EMFILE.
+  struct rlimit original = {};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &original), 0);
+  struct rlimit tight = original;
+  tight.rlim_cur = 16;
+  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &tight), 0);
+
+  std::vector<int> fds;
+  while (true) {
+    const int fd = dup(0);
+    if (fd < 0) {
+      break;
+    }
+    fds.push_back(fd);
+  }
+
+  const GoogleSqlParseResult result =
+      GoogleSqlFrontend::Parse("SELECT 271828;");
+  EXPECT_FALSE(result.ok);
+  EXPECT_NE(result.error.find("cannot create GoogleSQL pipe"),
+            std::string::npos);
+
+  for (const int fd : fds) {
+    close(fd);
+  }
+  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &original), 0);
+}
+
+TEST(GoogleSqlFrontendTest, ForkFailureReportsError) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  // Cap the process count so the parser subprocess cannot be forked.
+  struct rlimit original = {};
+  ASSERT_EQ(getrlimit(RLIMIT_NPROC, &original), 0);
+  struct rlimit tight = original;
+  tight.rlim_cur = 1;
+  ASSERT_EQ(setrlimit(RLIMIT_NPROC, &tight), 0);
+
+  const GoogleSqlParseResult result =
+      GoogleSqlFrontend::Parse("SELECT 1618033;");
+  EXPECT_FALSE(result.ok);
+  EXPECT_NE(result.error.find("cannot start GoogleSQL"), std::string::npos);
+
+  ASSERT_EQ(setrlimit(RLIMIT_NPROC, &original), 0);
+}
+
+TEST(GoogleSqlFrontendTest, NonZeroParserExitIsReportedAsFailure) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  // A NUL byte is rejected by the pinned parser with a hard error (exit 1),
+  // which the frontend must surface as a failed parse rather than ok.
+  std::string sql = "SELECT ";
+  sql.push_back('\0');
+  sql += " FROM t;";
+  const GoogleSqlParseResult result = GoogleSqlFrontend::Parse(sql);
+  EXPECT_FALSE(result.ok);
+  EXPECT_FALSE(result.error.empty());
+}
+
+TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  // Arm a SIGALRM while Parse() is blocked reading a slow-to-parse query.
+  // Without SA_RESTART the blocking read/write returns EINTR and must retry.
+  struct sigaction saved = {};
+  struct sigaction handler = {};
+  handler.sa_handler = [](int) {};
+  ASSERT_EQ(sigaction(SIGALRM, &handler, &saved), 0);
+
+  std::string big = "SELECT ";
+  big.reserve(2'000'000);
+  for (int i = 0; i < 1'000'000; ++i) {
+    big += "1+";
+  }
+  big += "1;";
+
+  alarm(1);
+  const GoogleSqlParseResult result = GoogleSqlFrontend::Parse(big);
+  alarm(0);
+  ASSERT_EQ(sigaction(SIGALRM, &saved, nullptr), 0);
+  ASSERT_TRUE(result.ok) << result.error;
+  EXPECT_NE(result.ast.find("QueryStatement"), std::string::npos);
 }
 
 }  // namespace tinylamb

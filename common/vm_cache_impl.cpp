@@ -121,9 +121,19 @@ void VMCacheImpl::Read(void* dst, size_t offset, size_t length) const {
 }
 
 void VMCacheImpl::Invalidate(size_t offset, size_t length) {
-  for (size_t target = offset / block_size_;
-       target <= (offset + length) / block_size_ && target < max_size_;
-       ++target) {
+  if (length == 0 || meta_.empty()) {
+    return;
+  }
+  const size_t file_bytes = meta_.size() * block_size_;
+  if (offset >= file_bytes) {
+    return;
+  }
+  const size_t end = std::min(offset + length, file_bytes);
+  const size_t first_page = offset / block_size_;
+  const size_t last_page = (end - 1) / block_size_;
+  const size_t last_valid = meta_.size() - 1;
+  const size_t clamped_last = std::min(last_page, last_valid);
+  for (size_t target = first_page; target <= clamped_last; ++target) {
     InvalidatePage(target);
   }
 }
@@ -342,11 +352,24 @@ void VMCacheImpl::InvalidatePage(size_t page) const {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
       continue;
     }
-    if (state == PageState::kEvicted ||
-        target.compare_exchange_weak(state, PageState::kEvicted,
+    if (state == PageState::kEvicted) {
+      std::scoped_lock lk(queue_lock_);
+      std::erase(small_queue_, &target);
+      std::erase(main_queue_, &target);
+      std::erase(ghost_queue_, &target);
+      return;
+    }
+    if (target.compare_exchange_weak(state, PageState::kEvicted,
                                      std::memory_order_relaxed,
                                      std::memory_order_relaxed)) {
-      break;
+      {
+        std::scoped_lock lk(queue_lock_);
+        std::erase(small_queue_, &target);
+        std::erase(main_queue_, &target);
+        std::erase(ghost_queue_, &target);
+      }
+      Release(page);
+      return;
     }
   }
 }

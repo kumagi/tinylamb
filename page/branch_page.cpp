@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -173,8 +174,7 @@ void BranchPage::SetFence(RowPointer& fence_pos, const IndexKey& new_fence) {
   } else if (new_fence.IsPlusInfinity()) {
     fence_pos = kPlusInfinity;
   } else {
-    const size_t physical_size = SerializeSize(new_fence);
-    assert(physical_size <= free_size_);
+    assert(SerializeSize(new_fence) <= free_size_);
     UpdateSlotImpl(fence_pos, SerializeIndexKey(new_fence));
   }
 }
@@ -407,6 +407,7 @@ std::string SmallestKey(PageRef&& page) {
     return std::string(page->body.branch_page.GetKey(0));
   }
   assert(!"invalid page type");
+  std::abort();
 }
 
 std::string BiggestKey(PageRef&& page) {
@@ -419,6 +420,7 @@ std::string BiggestKey(PageRef&& page) {
     return std::string(page->body.branch_page.GetKey(count - 1));
   }
   assert(!"invalid page type");
+  std::abort();
 }
 
 bool SanityCheck(PageRef&& page, PageManager* pm) {
@@ -429,6 +431,7 @@ bool SanityCheck(PageRef&& page, PageManager* pm) {
     return page->body.branch_page.SanityCheckForTest(pm);
   }
   assert(!"invalid page type");
+  std::abort();
 }
 
 bool BranchPage::SanityCheckForTest(PageManager* pm) const {

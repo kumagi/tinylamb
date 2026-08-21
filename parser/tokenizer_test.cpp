@@ -357,4 +357,18 @@ TEST(TokenizerTest, WhitespaceCommentsAndUnknowns) {
   EXPECT_EQ(tokens[13].type, TokenType::kEof);
 }
 
+TEST(TokenizerTest, TrailingWhitespaceStopsBeforeEofToken) {
+  // Act -- tokenize a statement whose last token is followed by whitespace
+  Tokenizer tokenizer("SELECT 1   \n\t ");
+  std::vector<Token> tokens = tokenizer.Tokenize();
+
+  // Assert -- trailing whitespace adds no extra tokens: keyword, numeric, EOF
+  ASSERT_EQ(tokens.size(), 3);
+  EXPECT_EQ(tokens[0].type, TokenType::kKeyword);
+  EXPECT_EQ(tokens[0].value, "SELECT");
+  EXPECT_EQ(tokens[1].type, TokenType::kNumeric);
+  EXPECT_EQ(tokens[1].value, "1");
+  EXPECT_EQ(tokens[2].type, TokenType::kEof);
+}
+
 }  // namespace tinylamb

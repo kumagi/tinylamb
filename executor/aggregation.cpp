@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "expression/aggregate_expression.hpp"
+#include "executor/query_memory.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -127,7 +128,14 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
           val = agg.Child()->Evaluate(*materialized, input_schema_);
         }
         if (val.IsNull()) continue;
-        if (agg.Distinct() && !distinct_values[i].insert(val).second) continue;
+        if (agg.Distinct()) {
+          const size_t bytes = EstimateValueBytes(val);
+          QueryMemoryBudget::Global().ReserveForced(bytes);
+          if (!distinct_values[i].insert(val).second) {
+            QueryMemoryBudget::Global().Release(bytes);
+            continue;
+          }
+        }
         switch (agg.GetType()) {
           case AggregationType::kSum:
             results[i] = results[i].IsNull() ? val : results[i] + val;

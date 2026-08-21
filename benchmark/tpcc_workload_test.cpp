@@ -495,5 +495,613 @@ TEST_F(TpccWorkloadTest, PaymentChoosesRemoteCustomerWarehouse) {
   EXPECT_EQ(remote_history[0][0], Value(11));
 }
 
+TEST_F(TpccWorkloadTest, InitializeTwiceRejectsExistingSchema) {
+  const TpccScale scale = TpccScale::ForTest();
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kSuccess)
+      << error;
+
+  // Act -- a second population must fail at the first CREATE TABLE because
+  // the schema already exists, and the partial schema transaction aborts.
+  std::string second_error;
+  EXPECT_EQ(TpccWorkload::Initialize(*database_, scale, &second_error),
+            Status::kConflicts);
+  EXPECT_FALSE(second_error.empty());
+}
+
+TEST(TpccWorkloadFailPathTest, NewOrderAbortsWhenSupportingRowsMissing) {
+  auto MakeDb = []() -> std::unique_ptr<Database> {
+    const std::string path = "tpcc_workload_failpath_test-" + RandomString();
+    auto database = std::make_unique<Database>(path);
+    std::string error;
+    if (TpccWorkload::Initialize(*database, TpccScale::ForTest(), &error) !=
+        Status::kSuccess) {
+      ADD_FAILURE() << error;
+      return nullptr;
+    }
+    return database;
+  };
+  auto RunSql = [](Database& database, std::string_view sql) {
+    TransactionContext context = database.BeginContext();
+    SqlEngine engine(database);
+    StatusOr<Executor> prepared = engine.Prepare(context, sql);
+    if (!prepared.HasValue()) {
+      ADD_FAILURE() << sql << "\n" << engine.LastError();
+      context.Abort();
+      return;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    if (context.PreCommit() != Status::kSuccess) {
+      ADD_FAILURE() << "commit failed: " << sql;
+    }
+  };
+  auto RunNewOrder = [](Database& database, uint64_t seed) {
+    TpccWorkload workload(database, TpccScale::ForTest(), seed, 0);
+    return workload.Execute(TpccTransactionType::kNewOrder);
+  };
+
+  {
+    // A missing district makes the d_tax/d_next_o_id read return no rows.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM district WHERE d_w_id = 1 AND d_id = 1;");
+    const TpccTransactionResult result = RunNewOrder(*database, 1);
+    EXPECT_FALSE(result.committed);
+    EXPECT_FALSE(result.user_rollback);
+    EXPECT_NE(result.error.find("new-order district read returned no rows"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // A missing customer row makes the c_discount/c_last read return no rows.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM customer;");
+    const TpccTransactionResult result = RunNewOrder(*database, 1);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("new-order customer read returned no rows"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // Missing stock makes the first line's s_quantity read return no rows.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM stock;");
+    const TpccTransactionResult result = RunNewOrder(*database, 1);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("new-order stock read returned no rows"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // Dropping the orders table makes the orders INSERT fail to prepare.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DROP TABLE orders;");
+    const TpccTransactionResult result = RunNewOrder(*database, 1);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("INSERT INTO orders"), std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // Dropping the new_order table makes the queue INSERT fail to prepare.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DROP TABLE new_order;");
+    const TpccTransactionResult result = RunNewOrder(*database, 1);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("INSERT INTO new_order"), std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // Dropping the order_line table makes the line INSERT fail to prepare.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DROP TABLE order_line;");
+    const TpccTransactionResult result = RunNewOrder(*database, 1);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("INSERT INTO order_line"), std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+}
+
+TEST(TpccWorkloadFailPathTest, PaymentAbortsWhenSupportingRowsMissing) {
+  auto MakeDb = []() -> std::unique_ptr<Database> {
+    const std::string path = "tpcc_workload_payment_test-" + RandomString();
+    auto database = std::make_unique<Database>(path);
+    std::string error;
+    if (TpccWorkload::Initialize(*database, TpccScale::ForTest(), &error) !=
+        Status::kSuccess) {
+      ADD_FAILURE() << error;
+      return nullptr;
+    }
+    return database;
+  };
+  auto RunSql = [](Database& database, std::string_view sql) {
+    TransactionContext context = database.BeginContext();
+    SqlEngine engine(database);
+    StatusOr<Executor> prepared = engine.Prepare(context, sql);
+    if (!prepared.HasValue()) {
+      ADD_FAILURE() << sql << "\n" << engine.LastError();
+      context.Abort();
+      return;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    if (context.PreCommit() != Status::kSuccess) {
+      ADD_FAILURE() << "commit failed: " << sql;
+    }
+  };
+
+  {
+    // A missing warehouse makes the first w_ytd UPDATE affect zero rows.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM warehouse;");
+    TpccWorkload workload(*database, TpccScale::ForTest(), 1, 0);
+    const TpccTransactionResult result =
+        workload.Execute(TpccTransactionType::kPayment);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(
+        result.error.find("payment warehouse update affected too few rows"),
+        std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // A missing district makes the d_ytd UPDATE affect zero rows.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM district WHERE d_w_id = 1 AND d_id = 1;");
+    TpccWorkload workload(*database, TpccScale::ForTest(), 1, 0);
+    const TpccTransactionResult result =
+        workload.Execute(TpccTransactionType::kPayment);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("payment district update affected too few rows"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // With every customer gone, the customer lookup (either by name or by
+    // id depending on the seed) returns no rows.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM customer;");
+    bool saw_name_lookup = false;
+    bool saw_id_lookup = false;
+    for (uint64_t seed = 1; seed <= 25; ++seed) {
+      TpccWorkload workload(*database, TpccScale::ForTest(), seed, 0);
+      const TpccTransactionResult result =
+          workload.Execute(TpccTransactionType::kPayment);
+      EXPECT_FALSE(result.committed) << result.error;
+      if (result.error.find("payment customer-name read returned no rows") !=
+          std::string::npos) {
+        saw_name_lookup = true;
+      } else if (result.error.find("payment customer read returned no rows") !=
+                 std::string::npos) {
+        saw_id_lookup = true;
+      } else {
+        ADD_FAILURE() << "unexpected payment failure: " << result.error;
+      }
+    }
+    EXPECT_TRUE(saw_name_lookup);
+    EXPECT_TRUE(saw_id_lookup);
+    database->DeleteAll();
+  }
+  {
+    // Dropping the history table makes the history INSERT fail to prepare.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DROP TABLE history;");
+    TpccWorkload workload(*database, TpccScale::ForTest(), 1, 0);
+    const TpccTransactionResult result =
+        workload.Execute(TpccTransactionType::kPayment);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("INSERT INTO history"), std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+}
+
+TEST(TpccWorkloadFailPathTest, OrderStatusAbortsWhenSupportingRowsMissing) {
+  auto MakeDb = []() -> std::unique_ptr<Database> {
+    const std::string path = "tpcc_workload_orderstatus_test-" +
+                             RandomString();
+    auto database = std::make_unique<Database>(path);
+    std::string error;
+    if (TpccWorkload::Initialize(*database, TpccScale::ForTest(), &error) !=
+        Status::kSuccess) {
+      ADD_FAILURE() << error;
+      return nullptr;
+    }
+    return database;
+  };
+  auto RunSql = [](Database& database, std::string_view sql) {
+    TransactionContext context = database.BeginContext();
+    SqlEngine engine(database);
+    StatusOr<Executor> prepared = engine.Prepare(context, sql);
+    if (!prepared.HasValue()) {
+      ADD_FAILURE() << sql << "\n" << engine.LastError();
+      context.Abort();
+      return;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    if (context.PreCommit() != Status::kSuccess) {
+      ADD_FAILURE() << "commit failed: " << sql;
+    }
+  };
+
+  {
+    // On a healthy fixture both the name-based and the id-based customer
+    // lookup paths must commit (seeds take each branch deterministically).
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    for (uint64_t seed = 1; seed <= 12; ++seed) {
+      TpccWorkload workload(*database, TpccScale::ForTest(), seed, 0);
+      const TpccTransactionResult result =
+          workload.Execute(TpccTransactionType::kOrderStatus);
+      EXPECT_TRUE(result.committed) << result.error;
+    }
+    database->DeleteAll();
+  }
+  {
+    // With every customer gone, either lookup path returns no rows.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM customer;");
+    bool saw_name_lookup = false;
+    bool saw_id_lookup = false;
+    for (uint64_t seed = 1; seed <= 25; ++seed) {
+      TpccWorkload workload(*database, TpccScale::ForTest(), seed, 0);
+      const TpccTransactionResult result =
+          workload.Execute(TpccTransactionType::kOrderStatus);
+      EXPECT_FALSE(result.committed) << result.error;
+      if (result.error.find("order-status customer-name read returned no "
+                            "rows") != std::string::npos) {
+        saw_name_lookup = true;
+      } else if (result.error.find(
+                     "order-status customer read returned no rows") !=
+                 std::string::npos) {
+        saw_id_lookup = true;
+      } else {
+        ADD_FAILURE() << "unexpected order-status failure: " << result.error;
+      }
+    }
+    EXPECT_TRUE(saw_name_lookup);
+    EXPECT_TRUE(saw_id_lookup);
+    database->DeleteAll();
+  }
+  {
+    // With every order gone, the latest-order read returns no rows.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM orders;");
+    TpccWorkload workload(*database, TpccScale::ForTest(), 1, 0);
+    const TpccTransactionResult result =
+        workload.Execute(TpccTransactionType::kOrderStatus);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("order-status order read returned no rows"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // With every order_line gone, the line read returns no rows.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM order_line;");
+    TpccWorkload workload(*database, TpccScale::ForTest(), 1, 0);
+    const TpccTransactionResult result =
+        workload.Execute(TpccTransactionType::kOrderStatus);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("order-status line read returned no rows"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+}
+
+TEST(TpccWorkloadFailPathTest, DeliveryAndStockLevelAbortWhenRowsMissing) {
+  auto MakeDb = []() -> std::unique_ptr<Database> {
+    const std::string path = "tpcc_workload_delivery_test-" + RandomString();
+    auto database = std::make_unique<Database>(path);
+    std::string error;
+    if (TpccWorkload::Initialize(*database, TpccScale::ForTest(), &error) !=
+        Status::kSuccess) {
+      ADD_FAILURE() << error;
+      return nullptr;
+    }
+    return database;
+  };
+  auto RunSql = [](Database& database, std::string_view sql) {
+    TransactionContext context = database.BeginContext();
+    SqlEngine engine(database);
+    StatusOr<Executor> prepared = engine.Prepare(context, sql);
+    if (!prepared.HasValue()) {
+      ADD_FAILURE() << sql << "\n" << engine.LastError();
+      context.Abort();
+      return;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    if (context.PreCommit() != Status::kSuccess) {
+      ADD_FAILURE() << "commit failed: " << sql;
+    }
+  };
+
+  {
+    // The queued orders are gone, so the delivery order read returns no rows.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM orders WHERE o_id >= 8;");
+    TpccWorkload workload(*database, TpccScale::ForTest(), 1, 0);
+    const TpccTransactionResult result =
+        workload.Execute(TpccTransactionType::kDelivery);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("delivery order read returned no rows"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // The order_line rows are gone, so the delivery line UPDATE affects zero
+    // rows even though the queue row and the order row are still present.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM order_line;");
+    TpccWorkload workload(*database, TpccScale::ForTest(), 1, 0);
+    const TpccTransactionResult result =
+        workload.Execute(TpccTransactionType::kDelivery);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("delivery line update affected too few rows"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // The customer rows are gone, so the delivery customer UPDATE affects
+    // zero rows after the SUM read succeeds.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM customer;");
+    TpccWorkload workload(*database, TpccScale::ForTest(), 1, 0);
+    const TpccTransactionResult result =
+        workload.Execute(TpccTransactionType::kDelivery);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("delivery customer update affected too few "
+                                "rows"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // Dropping new_order makes the delivery queue SELECT fail to prepare.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DROP TABLE new_order;");
+    TpccWorkload workload(*database, TpccScale::ForTest(), 1, 0);
+    const TpccTransactionResult result =
+        workload.Execute(TpccTransactionType::kDelivery);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("SELECT no_o_id FROM new_order"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // A missing district makes the stock-level d_next_o_id read return no
+    // rows.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DELETE FROM district WHERE d_w_id = 1 AND d_id = 1;");
+    TpccWorkload workload(*database, TpccScale::ForTest(), 1, 0);
+    const TpccTransactionResult result =
+        workload.Execute(TpccTransactionType::kStockLevel);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("stock-level district read returned no rows"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // Dropping order_line makes the stock-level line SELECT fail to prepare.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DROP TABLE order_line;");
+    TpccWorkload workload(*database, TpccScale::ForTest(), 1, 0);
+    const TpccTransactionResult result =
+        workload.Execute(TpccTransactionType::kStockLevel);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("SELECT ol_i_id FROM order_line"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+  {
+    // Dropping stock makes the per-item stock SELECT fail to prepare.
+    std::unique_ptr<Database> database = MakeDb();
+    ASSERT_NE(database, nullptr);
+    RunSql(*database, "DROP TABLE stock;");
+    TpccWorkload workload(*database, TpccScale::ForTest(), 1, 0);
+    const TpccTransactionResult result =
+        workload.Execute(TpccTransactionType::kStockLevel);
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.error.find("SELECT s_quantity FROM stock"),
+              std::string::npos)
+        << result.error;
+    database->DeleteAll();
+  }
+}
+
+TEST_F(TpccWorkloadTest, NewOrderCreatesOrderLineRows) {
+  const TpccScale scale = TpccScale::ForTest();
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kSuccess)
+      << error;
+
+  // NewOrder has a 1% rollback draw; retry with deterministic seeds until one
+  // commits so the data assertions below are stable.
+  TpccTransactionResult new_order;
+  for (uint64_t seed = 1; seed <= 50 && !new_order.committed; ++seed) {
+    TpccWorkload workload(*database_, scale, seed, 0);
+    new_order = workload.Execute(TpccTransactionType::kNewOrder);
+  }
+  ASSERT_TRUE(new_order.committed) << new_order.error;
+
+  // The transaction issues 6 fixed statements plus 4 per order line.
+  const int line_count = static_cast<int>((new_order.sql_statements - 6) / 4);
+  EXPECT_GE(line_count, scale.min_order_lines);
+  EXPECT_LE(line_count, scale.max_order_lines);
+
+  const std::vector<Row> line_rows =
+      Run("SELECT COUNT(*) FROM order_line WHERE ol_w_id = 1 AND ol_d_id = 1 "
+          "AND ol_o_id = " +
+          std::to_string(new_order.order_id) + ";");
+  ASSERT_EQ(line_rows.size(), 1);
+  EXPECT_EQ(line_rows[0][0], Value(line_count));
+
+  const std::vector<Row> all_local =
+      Run("SELECT o_all_local FROM orders WHERE o_w_id = 1 AND o_d_id = 1 "
+          "AND o_id = " +
+          std::to_string(new_order.order_id) + ";");
+  ASSERT_EQ(all_local.size(), 1);
+  EXPECT_EQ(all_local[0][0], Value(1));
+
+  const std::vector<Row> total =
+      Run("SELECT SUM(ol_amount) FROM order_line WHERE ol_w_id = 1 AND "
+          "ol_d_id = 1 AND ol_o_id = " +
+          std::to_string(new_order.order_id) + ";");
+  ASSERT_EQ(total.size(), 1);
+  EXPECT_NEAR(total[0][0].value.double_value, new_order.amount,
+              0.01 * line_count + 0.001);
+}
+
+TEST_F(TpccWorkloadTest, DeliveryWithEmptyQueueCommitsIdle) {
+  const TpccScale scale = TpccScale::ForTest();
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kSuccess)
+      << error;
+  TpccWorkload workload(*database_, scale, 42, 0);
+
+  // ForTest queues exactly new_orders_per_district = 3 orders per district;
+  // one district means three deliveries drain it and later ones are idle.
+  int total_delivered = 0;
+  for (int i = 0; i < 5; ++i) {
+    const TpccTransactionResult delivery =
+        workload.Execute(TpccTransactionType::kDelivery);
+    ASSERT_TRUE(delivery.committed) << delivery.error;
+    total_delivered += delivery.delivered_orders;
+  }
+  EXPECT_EQ(total_delivered, 3);
+
+  const std::vector<Row> queues = Run("SELECT COUNT(*) FROM new_order;");
+  ASSERT_EQ(queues.size(), 1);
+  EXPECT_EQ(queues[0][0], Value(0));
+  // The fixture stamps carrier ids on already-delivered orders (o_id 1..7), so
+  // the freshly delivered queued orders are precisely the last three.
+  const std::vector<Row> delivered =
+      Run("SELECT COUNT(*) FROM orders WHERE o_carrier_id IS NOT NULL AND "
+          "o_id >= 8;");
+  ASSERT_EQ(delivered.size(), 1);
+  EXPECT_EQ(delivered[0][0], Value(3));
+}
+
+TEST_F(TpccWorkloadTest, PaymentAdjustsCustomerBalances) {
+  const TpccScale scale = TpccScale::ForTest();
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kSuccess)
+      << error;
+
+  const std::vector<Row> before = Run("SELECT SUM(c_balance) FROM customer;");
+  ASSERT_EQ(before.size(), 1);
+  TpccWorkload workload(*database_, scale, 42, 0);
+  const TpccTransactionResult payment =
+      workload.Execute(TpccTransactionType::kPayment);
+  ASSERT_TRUE(payment.committed) << payment.error;
+  EXPECT_GT(payment.amount, 0.0);
+
+  // Every customer starts at -10.00; a payment shifts exactly the recorded
+  // (2-decimal rounded) amount out of the customer balance pool.
+  const std::vector<Row> after = Run("SELECT SUM(c_balance) FROM customer;");
+  ASSERT_EQ(after.size(), 1);
+  EXPECT_NEAR(after[0][0].value.double_value,
+              before[0][0].value.double_value - payment.amount, 0.01);
+}
+
+TEST_F(TpccWorkloadTest, TerminalIdBindsHomeWarehouseAndDistrict) {
+  TpccScale scale = TpccScale::ForTest();
+  scale.warehouses = 2;
+  scale.districts_per_warehouse = 2;
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kSuccess)
+      << error;
+
+  // Terminals are bound warehouse-major: 0 -> w1/d1, 1 -> w1/d2,
+  // 2 -> w2/d1, 3 -> w2/d2. The payment result reports the home district.
+  TpccWorkload t0(*database_, scale, 1, 0);
+  EXPECT_EQ(t0.Execute(TpccTransactionType::kPayment).warehouse_id, 1);
+  EXPECT_EQ(t0.Execute(TpccTransactionType::kPayment).district_id, 1);
+
+  TpccWorkload t1(*database_, scale, 1, 1);
+  EXPECT_EQ(t1.Execute(TpccTransactionType::kPayment).warehouse_id, 1);
+  EXPECT_EQ(t1.Execute(TpccTransactionType::kPayment).district_id, 2);
+
+  TpccWorkload t2(*database_, scale, 1, 2);
+  EXPECT_EQ(t2.Execute(TpccTransactionType::kPayment).warehouse_id, 2);
+  EXPECT_EQ(t2.Execute(TpccTransactionType::kPayment).district_id, 1);
+
+  TpccWorkload t3(*database_, scale, 1, 3);
+  EXPECT_EQ(t3.Execute(TpccTransactionType::kPayment).warehouse_id, 2);
+  EXPECT_EQ(t3.Execute(TpccTransactionType::kPayment).district_id, 2);
+}
+
+TEST_F(TpccWorkloadTest, StockLevelRespectsDistinctItemWindow) {
+  const TpccScale scale = TpccScale::ForTest();
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error),
+            Status::kSuccess)
+      << error;
+
+  // StockLevel counts distinct order-line items in
+  // [max(1, d_next_o_id - 20), d_next_o_id) whose stock is below the random
+  // threshold, so the result can never exceed the window's item count.
+  const std::vector<Row> next =
+      Run("SELECT d_next_o_id FROM district WHERE d_w_id = 1 AND d_id = 1;");
+  ASSERT_EQ(next.size(), 1);
+  const int64_t next_order = next[0][0].value.int_value;
+  const std::vector<Row> items =
+      Run("SELECT COUNT(DISTINCT ol_i_id) FROM order_line WHERE ol_w_id = 1 "
+          "AND ol_d_id = 1 AND ol_o_id >= 1 AND ol_o_id < " +
+          std::to_string(next_order) + ";");
+  ASSERT_EQ(items.size(), 1);
+  const int64_t distinct_items = items[0][0].value.int_value;
+
+  TpccWorkload workload(*database_, scale, 42, 0);
+  const TpccTransactionResult stock =
+      workload.Execute(TpccTransactionType::kStockLevel);
+  ASSERT_TRUE(stock.committed) << stock.error;
+  EXPECT_GE(stock.low_stock, 0);
+  EXPECT_LE(stock.low_stock, distinct_items);
+}
+
 }  // namespace
 }  // namespace tinylamb

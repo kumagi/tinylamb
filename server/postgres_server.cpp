@@ -80,6 +80,8 @@ std::string CommandTag(StatementType type, int64_t affected_rows) {
       return "UPDATE " + std::to_string(affected_rows);
     case StatementType::kDelete:
       return "DELETE " + std::to_string(affected_rows);
+    case StatementType::kAnalyze:
+      return "ANALYZE";
   }
   return "OK";
 }

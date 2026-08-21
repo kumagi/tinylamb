@@ -478,4 +478,64 @@ TEST_F(CatalogTest, UniqueIndexRejectsDuplicateKeys) {
   }
 }
 
+TEST_F(CatalogTest, DropTableRemovesCatalogAndStatistics) {
+  // Arrange -- create and commit a table with two columns.
+  Schema schema("drop_tbl",
+                {Column("c", ValueType::kInt64),
+                 Column("d", ValueType::kVarChar)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Act -- fetch the table, drop it, and commit.
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, before,
+                          ctx.GetTable("drop_tbl"));
+    EXPECT_EQ(schema, before->GetSchema());
+    ASSERT_SUCCESS(rs_->DropTable(ctx, "drop_tbl"));
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Assert -- the catalog entry and its split statistics are gone.
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    EXPECT_EQ(ctx.GetTable("drop_tbl").GetStatus(), Status::kNotExists);
+    EXPECT_EQ(ctx.GetStats("drop_tbl").GetStatus(), Status::kNotExists);
+    ctx.txn_.PreCommit();
+  }
+}
+
+TEST_F(CatalogTest, CreateIndexOnExistingTable) {
+  // Arrange -- create and commit a table without any index.
+  Schema schema("idx_tbl",
+                {Column("id", ValueType::kInt64),
+                 Column("name", ValueType::kVarChar)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Act -- add a secondary index on column 1.
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "idx_tbl",
+                                    IndexSchema("idx_tbl|name", {1})));
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Assert -- the updated catalog entry carries the new index.
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+                          ctx.GetTable("idx_tbl"));
+    EXPECT_EQ(tbl->IndexCount(), 1u);
+    EXPECT_EQ(tbl->GetIndex(0).sc_.name_, "idx_tbl|name");
+    ctx.txn_.PreCommit();
+  }
+}
+
 }  // namespace tinylamb

@@ -18,6 +18,7 @@
 
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -914,9 +915,9 @@ TEST_F(TableStatisticsTest, EstimateCountErrors) {
                         db_->GetStatistics(context, "Sc1"));
 
   // Act/Assert -- out-of-range column indices are rejected loudly
-  EXPECT_THROW(statistics.EstimateCount(3, Value(0), Value(1)),
+  EXPECT_THROW(std::ignore = statistics.EstimateCount(3, Value(0), Value(1)),
                std::out_of_range);
-  EXPECT_THROW(statistics.EstimateCount(-1, Value(0), Value(1)),
+  EXPECT_THROW(std::ignore = statistics.EstimateCount(-1, Value(0), Value(1)),
                std::out_of_range);
   ASSERT_SUCCESS(context.PreCommit());
 }

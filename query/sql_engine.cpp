@@ -40,6 +40,7 @@
 #include "query/query_data.hpp"
 #include "query/sql_template.hpp"
 #include "table/table.hpp"
+#include "table/table_statistics.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -137,6 +138,99 @@ std::shared_ptr<Statement> FindTemplate(const std::string& fingerprint) {
   return cached->second;
 }
 
+// ANALYZE [TABLE] [table [, ...]];  empty table list means every catalog table.
+struct AnalyzeRequest {
+  std::vector<std::string> tables;
+};
+
+std::optional<AnalyzeRequest> ParseAnalyze(std::string_view sql) {
+  auto trim = [](std::string_view value) {
+    while (!value.empty() &&
+           std::isspace(static_cast<unsigned char>(value.front()))) {
+      value.remove_prefix(1);
+    }
+    while (!value.empty() &&
+           std::isspace(static_cast<unsigned char>(value.back()))) {
+      value.remove_suffix(1);
+    }
+    return value;
+  };
+  auto consume = [&](std::string_view* input, std::string_view keyword) {
+    *input = trim(*input);
+    if (input->size() < keyword.size()) return false;
+    for (size_t i = 0; i < keyword.size(); ++i) {
+      if (std::toupper(static_cast<unsigned char>((*input)[i])) != keyword[i]) {
+        return false;
+      }
+    }
+    if (input->size() != keyword.size() &&
+        !std::isspace(static_cast<unsigned char>((*input)[keyword.size()])) &&
+        (*input)[keyword.size()] != ';') {
+      return false;
+    }
+    input->remove_prefix(keyword.size());
+    return true;
+  };
+
+  std::string_view remainder = sql;
+  if (!consume(&remainder, "ANALYZE")) return std::nullopt;
+  remainder = trim(remainder);
+  if (!remainder.empty() && remainder.back() == ';') {
+    remainder.remove_suffix(1);
+    remainder = trim(remainder);
+  }
+  std::ignore = consume(&remainder, "TABLE");
+  remainder = trim(remainder);
+
+  AnalyzeRequest request;
+  if (remainder.empty()) return request;
+
+  while (!remainder.empty()) {
+    remainder = trim(remainder);
+    if (remainder.empty()) break;
+    if (!std::isalpha(static_cast<unsigned char>(remainder.front())) &&
+        remainder.front() != '_') {
+      return std::nullopt;
+    }
+    size_t length = 1;
+    while (length < remainder.size() &&
+           (std::isalnum(static_cast<unsigned char>(remainder[length])) ||
+            remainder[length] == '_')) {
+      ++length;
+    }
+    request.tables.emplace_back(remainder.substr(0, length));
+    remainder.remove_prefix(length);
+    remainder = trim(remainder);
+    if (remainder.empty()) break;
+    if (remainder.front() != ',') return std::nullopt;
+    remainder.remove_prefix(1);
+  }
+  return request;
+}
+
+StatusOr<Executor> ExecuteAnalyze(Database& database, TransactionContext& ctx,
+                                  const AnalyzeRequest& request) {
+  std::vector<std::string> tables = request.tables;
+  if (tables.empty()) {
+    tables = database.ListTables(ctx);
+  }
+  std::vector<Row> rows;
+  rows.reserve(tables.size());
+  for (const std::string& table : tables) {
+    const Status refreshed = database.RefreshStatistics(ctx, table);
+    if (refreshed != Status::kSuccess) {
+      return refreshed;
+    }
+    ctx.stats_.erase(table);
+    ASSIGN_OR_RETURN(std::shared_ptr<TableStatistics>, stats,
+                     ctx.GetStats(table));
+    rows.emplace_back(std::vector<Value>{
+        Value(std::string("ANALYZE")), Value(std::string(table)),
+        Value(static_cast<int64_t>(stats->Rows()))});
+  }
+  return Executor(std::make_shared<ConstantExecutor>(std::move(rows)));
+}
+
 }  // namespace
 
 StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
@@ -187,6 +281,16 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     result_column_names_ = {"QUERY PLAN"};
     return Executor(
         std::make_shared<ConstantExecutor>(ExplainRows(output.str())));
+  }
+  if (const std::optional<AnalyzeRequest> analyze = ParseAnalyze(sql)) {
+    last_statement_type_ = StatementType::kAnalyze;
+    result_column_names_ = {"command", "table", "rows"};
+    StatusOr<Executor> executed = ExecuteAnalyze(*database_, ctx, *analyze);
+    if (!executed.HasValue()) {
+      last_error_ = "ANALYZE failed";
+      return executed.GetStatus();
+    }
+    return executed;
   }
   const SqlTemplate templated = ExtractSqlTemplate(sql);
   if (templated.templatable) {
@@ -428,6 +532,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       return Executor(std::make_shared<ConstantExecutor>(
           Row({Value("DROP TABLE"), Value(0)})));
     }
+    case StatementType::kAnalyze:
+      last_error_ = "ANALYZE is handled before statement binding";
+      return Status::kNotImplemented;
   }
   return Status::kNotImplemented;
 }

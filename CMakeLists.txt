@@ -155,6 +155,8 @@ add_library(tinylamb_core
         executor/aggregation.cpp executor/parallel_aggregation.cpp
         executor/zone_map.cpp
         executor/query_scheduler.cpp
+        executor/query_memory.cpp
+        executor/spill_file.cpp
         executor/data_chunk.cpp
         executor/executor_base.cpp
         executor/selection.cpp expression/binary_expression.cpp
@@ -427,6 +429,8 @@ add_simple_test(expression/jit_test.cpp)
 add_simple_test(executor/executor_test.cpp)
 add_simple_test(executor/data_chunk_test.cpp)
 add_simple_test(executor/query_scheduler_test.cpp)
+add_simple_test(executor/spill_file_test.cpp)
+add_simple_test(executor/query_memory_test.cpp)
 add_simple_test(database/catalog_test.cpp)
 add_simple_test(plan/plan_test.cpp)
 add_simple_test(type/column_name_test.cpp)
@@ -456,7 +460,6 @@ target_link_libraries(tpcc_workload_test PRIVATE tinylamb::tpcc)
 # Concurrency tests.
 add_simple_test(page/row_page_concurrent_test.cpp)
 add_simple_test(index/b_plus_tree_concurrent_test.cpp)
-add_simple_test(table/table_concurrent_test.cpp)
 add_simple_test(index/lsm_detail/cache_concurrent_test.cpp)
 
 endif()

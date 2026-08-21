@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "executor/executor_base.hpp"
+#include "executor/query_memory.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
@@ -38,6 +39,7 @@ class SortExecutor : public ExecutorBase {
   size_t offset_{0};
   bool materialized_{false};
   size_t worker_count_;
+  QueryMemoryCharge rows_charge_;
 };
 }  // namespace tinylamb
 #endif

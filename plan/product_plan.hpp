@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_PRODUCT_PLAN_HPP
 #define TINYLAMB_PRODUCT_PLAN_HPP
 
+#include "executor/hash_join_mode.hpp"
 #include "expression/expression.hpp"
 #include "plan/plan.hpp"
 #include "table/table_statistics.hpp"
@@ -27,7 +28,8 @@ class ExecutorBase;
 class ProductPlan final : public PlanBase {
  public:
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
-              std::vector<ColumnName> right_cols);
+              std::vector<ColumnName> right_cols,
+              HashJoinMode hash_mode = HashJoinMode::kInMemory);
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
               const Table& right_tbl, const Index& idx,
               std::vector<ColumnName> right_cols,
@@ -49,6 +51,7 @@ class ProductPlan final : public PlanBase {
 
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
+  [[nodiscard]] HashJoinMode GetHashJoinMode() const { return hash_mode_; }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
@@ -60,6 +63,7 @@ class ProductPlan final : public PlanBase {
   const Table* right_tbl_;
   const Index* right_idx_;
   const TableStatistics* right_ts_;
+  HashJoinMode hash_mode_{HashJoinMode::kInMemory};
   Schema output_schema_;
   TableStatistics stats_;
 };

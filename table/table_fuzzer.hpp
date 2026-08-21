@@ -65,8 +65,14 @@ void Try(const uint8_t* data, size_t size, bool verbose) {
         if (verbose) {
           LOG(DEBUG) << "Insert: " << new_row;
         }
-        ASSIGN_OR_CRASH(RowPosition, rp, table.Insert(ctx.txn_, new_row));
-        rows[rp] = new_row;
+        StatusOr<RowPosition> rp = table.Insert(ctx.txn_, new_row);
+        if (rp.GetStatus() == Status::kDuplicates) {
+          // A duplicate unique-index key is legitimately rejected; the
+          // rejected row is rolled back, so nothing is modeled.
+          break;
+        }
+        ASSIGN_OR_CRASH(RowPosition, pos, rp);
+        rows[pos] = new_row;
         break;
       }
       case 1: {  // Delete a row from the model.

@@ -109,17 +109,14 @@ int SortedRun::Entry::Compare(std::string_view rhs,
     uint64_t inlined = 0;
     memcpy(&inlined, rhs.data() + 4, std::min(rhs.length() - 4, 8UL));
     inlined = be64toh(inlined);
-    int64_t ret = inlined - key_.inline_;
-    if (ret != 0) {
-      if (0 < ret) {
-        return 1;
-      }
-      if (ret < 0) {
-        return -1;
-      }
-      return 0;
+    // Do not subtract: unsigned wrap flips the order for large suffixes.
+    if (inlined > key_.inline_) {
+      return 1;  // entry < rhs
     }
-    return rhs.length() - length_;
+    if (inlined < key_.inline_) {
+      return -1;  // entry > rhs
+    }
+    return static_cast<int>(rhs.length()) - static_cast<int>(length_);
   }
   // This is slow-path.
   std::string body = blob.ReadAt(key_.reference_, length_);
@@ -144,17 +141,13 @@ int SortedRun::Entry::Compare(const SortedRun::Entry& rhs,
   assert(4 < rhs.length_);
   assert(4 < length_);
   if (length_ <= kIndirectThreshold && rhs.length_ <= kIndirectThreshold) {
-    int64_t ret = rhs.key_.inline_ - key_.inline_;
-    if (ret != 0) {
-      if (0 < ret) {
-        return 1;
-      }
-      if (ret < 0) {
-        return -1;
-      }
-      return 0;
+    if (rhs.key_.inline_ > key_.inline_) {
+      return 1;  // *this < rhs
     }
-    return rhs.length_ - length_;
+    if (rhs.key_.inline_ < key_.inline_) {
+      return -1;  // *this > rhs
+    }
+    return static_cast<int>(rhs.length_) - static_cast<int>(length_);
   }
 
   assert(kIndirectThreshold < length_ || kIndirectThreshold < rhs.length_);
@@ -180,6 +173,9 @@ SortedRun::Entry::Entry(std::string_view key, const LSMValue& value,
   if (kIndirectThreshold < key.length()) {
     key_.reference_ = blob_.Append(key);
   } else if (sizeof(key_head_) < key.length()) {
+    // Zero the inline tail so Compare() does not read uninitialized bytes
+    // when the key is shorter than 12 bytes.
+    key_.inline_ = 0;
     std::memcpy(&key_.inline_, key.data() + 4, key.length() - 4);
     key_.inline_ = be64toh(key_.inline_);
   }

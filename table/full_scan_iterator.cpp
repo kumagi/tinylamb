@@ -32,11 +32,15 @@ namespace tinylamb {
 
 FullScanIterator::FullScanIterator(
     const Table* table, Transaction* txn,
-    std::optional<std::vector<slot_t>> projection)
+    std::optional<std::vector<slot_t>> projection,
+    const std::unordered_set<int64_t>* key_filter,
+    std::optional<slot_t> key_column)
     : table_(table),
       txn_(txn),
       pos_(table_->first_pid_, 0),
-      projection_(std::move(projection)) {
+      projection_(std::move(projection)),
+      key_filter_(key_filter),
+      key_column_(key_column) {
   page_ = std::make_unique<PageRef>(txn->GetPageManager()->GetPage(
       pos_.page_id, txn->IsReadOnly()));
   SeekVisibleRow();
@@ -44,12 +48,16 @@ FullScanIterator::FullScanIterator(
 
 FullScanIterator::FullScanIterator(
     const Table* table, Transaction* txn, std::vector<page_id_t> pages,
-    std::optional<std::vector<slot_t>> projection)
+    std::optional<std::vector<slot_t>> projection,
+    const std::unordered_set<int64_t>* key_filter,
+    std::optional<slot_t> key_column)
     : table_(table),
       txn_(txn),
       pos_(pages.empty() ? ~0ULL : pages.front(), 0),
       projection_(std::move(projection)),
-      pages_(std::move(pages)) {
+      pages_(std::move(pages)),
+      key_filter_(key_filter),
+      key_column_(key_column) {
   if (!pos_.IsValid()) return;
   page_ = std::make_unique<PageRef>(txn->GetPageManager()->GetPage(
       pos_.page_id, txn->IsReadOnly()));
@@ -72,6 +80,14 @@ void FullScanIterator::SeekVisibleRow() {
     while (pos_.slot < (*page_)->body.row_page.RowMax()) {
       StatusOr<std::string_view> row = (*page_)->Read(*txn_, pos_.slot);
       if (row.HasValue()) {
+        if (key_filter_ && key_column_) {
+          const auto key = Row::TryPeekInteger(
+              row.Value().data(), table_->GetSchema(), *key_column_);
+          if (!key || !key_filter_->contains(*key)) {
+            ++pos_.slot;
+            continue;
+          }
+        }
         DeserializeCurrent(row.Value());
         if (!txn_->IsReadOnly()) {
           page_.reset();

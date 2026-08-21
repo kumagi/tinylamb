@@ -15,6 +15,8 @@
 #include "type/schema.hpp"
 #include "type/value.hpp"
 
+#include <tuple>
+
 namespace tinylamb {
 
 TEST(ExpressionRewriteTest, DefaultRulesFoldAndNormalizeRecursively) {
@@ -346,15 +348,15 @@ TEST(ExpressionRewriteTest, ExpressionChildrenAndWithChildren) {
   EXPECT_TRUE(ExpressionChildren(ColumnValueExp("x")).empty());
   EXPECT_TRUE(ExpressionChildren(nullptr).empty());
 
-  EXPECT_THROW(WithExpressionChildren(ConstantValueExp(Value(1)),
-                                      {ConstantValueExp(Value(2))}),
+  EXPECT_THROW(std::ignore = WithExpressionChildren(
+                    ConstantValueExp(Value(1)), {ConstantValueExp(Value(2))}),
+                std::invalid_argument);
+  EXPECT_THROW(std::ignore = WithExpressionChildren(binary, {ColumnValueExp("x")}),
                std::invalid_argument);
-  EXPECT_THROW(WithExpressionChildren(binary, {ColumnValueExp("x")}),
+  EXPECT_THROW(std::ignore = WithExpressionChildren(in, {}),
                std::invalid_argument);
-  EXPECT_THROW(WithExpressionChildren(in, {}), std::invalid_argument);
-  EXPECT_THROW(WithExpressionChildren(query,
-                                      {ColumnValueExp("x"),
-                                       ColumnValueExp("y")}),
+  EXPECT_THROW(std::ignore = WithExpressionChildren(
+                    query, {ColumnValueExp("x"), ColumnValueExp("y")}),
                std::invalid_argument);
 }
 

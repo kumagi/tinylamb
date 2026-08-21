@@ -19,8 +19,10 @@
 
 #include <cstdint>
 #include <ostream>
+#include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "database/page_storage.hpp"
@@ -76,6 +78,9 @@ class Database {
 
   StatusOr<Table> GetTable(TransactionContext& ctx,
                            std::string_view schema_name);
+
+  // Catalog table names in ascending key order.
+  std::vector<std::string> ListTables(TransactionContext& ctx);
 
   void EmulateCrash();
 

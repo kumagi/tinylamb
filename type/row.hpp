@@ -18,6 +18,7 @@
 #define TINYLAMB_ROW_HPP
 
 #include <cstring>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -42,6 +43,9 @@ struct Row {
   size_t Deserialize(const char* src, const Schema& sc);
   size_t DeserializeProjected(const char* src, const Schema& sc,
                               const std::vector<slot_t>& columns);
+  // Read a single INT64/DATE column without materializing other values.
+  [[nodiscard]] static std::optional<int64_t> TryPeekInteger(
+      const char* src, const Schema& sc, slot_t column);
   [[nodiscard]] size_t Size() const;
   [[nodiscard]] std::string EncodeMemcomparableFormat() const;
   void DecodeMemcomparableFormat(std::string_view src);

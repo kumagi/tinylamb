@@ -16,8 +16,10 @@
 
 #ifndef TINYLAMB_FULL_SCAN_ITERATOR_HPP
 #define TINYLAMB_FULL_SCAN_ITERATOR_HPP
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 #include "page/page_ref.hpp"
@@ -53,11 +55,14 @@ class FullScanIterator : public IteratorBase {
   friend class Table;
   friend class FullScan;
   FullScanIterator(const Table* table, Transaction* txn,
-                   std::optional<std::vector<slot_t>> projection =
-                       std::nullopt);
+                   std::optional<std::vector<slot_t>> projection = std::nullopt,
+                   const std::unordered_set<int64_t>* key_filter = nullptr,
+                   std::optional<slot_t> key_column = std::nullopt);
   FullScanIterator(const Table* table, Transaction* txn,
                    std::vector<page_id_t> pages,
-                   std::optional<std::vector<slot_t>> projection);
+                   std::optional<std::vector<slot_t>> projection,
+                   const std::unordered_set<int64_t>* key_filter = nullptr,
+                   std::optional<slot_t> key_column = std::nullopt);
 
   void DeserializeCurrent(std::string_view row);
   void SeekVisibleRow();
@@ -71,6 +76,8 @@ class FullScanIterator : public IteratorBase {
   std::optional<std::vector<slot_t>> projection_;
   std::optional<std::vector<page_id_t>> pages_;
   size_t page_index_{0};
+  const std::unordered_set<int64_t>* key_filter_{nullptr};
+  std::optional<slot_t> key_column_;
 };
 
 }  // namespace tinylamb

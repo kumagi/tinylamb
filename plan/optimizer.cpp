@@ -298,8 +298,12 @@ std::vector<Plan> JoinCandidates(TransactionContext& context,
   }
 
   if (include_hash) {
-    candidates.push_back(std::make_shared<ProductPlan>(left, left_columns,
-                                                       right, right_columns));
+    // Offer both physical strategies; AccessRowCount penalizes in-memory when
+    // the estimated build footprint exceeds the query memory soft budget.
+    candidates.push_back(std::make_shared<ProductPlan>(
+        left, left_columns, right, right_columns, HashJoinMode::kInMemory));
+    candidates.push_back(std::make_shared<ProductPlan>(
+        left, left_columns, right, right_columns, HashJoinMode::kHybrid));
   }
 
   if (include_index) {

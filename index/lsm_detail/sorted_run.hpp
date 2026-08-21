@@ -87,7 +87,9 @@ class SortedRun {
     [[nodiscard]] std::string BuildValue(const BlobFile& blob) const;
 
     [[nodiscard]] bool IsDeleted() const {
-      return value_.offset_ == kDeletedValue;
+      // Tombstones set value_length_ to 0; an 8-byte inline payload of 0xff
+      // must not be treated as deleted (it aliases kDeletedValue in the union).
+      return value_length_ == 0 && value_.offset_ == kDeletedValue;
     }
     friend std::ostream& operator<<(std::ostream& o, const Entry& e) {
       o << "length: " << e.length_ << " head: " << e.key_head_;

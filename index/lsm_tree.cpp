@@ -179,7 +179,12 @@ void LSMTree::MergeAll() {
     return;
   }
   LSMView view = GetViewImpl();
-  std::filesystem::path path = root_dir_ / std::to_string(blob_.Written());
+  // Path must be unique even when blob_.Written() does not advance (short
+  // keys/tombstones). Reusing the same path would delete the file we are about
+  // to reopen as the merged run.
+  std::filesystem::path path =
+      root_dir_ / ("merged-" + std::to_string(generation_.fetch_add(1)) + "-" +
+                   std::to_string(blob_.Written()));
   view.CreateSingleRun(path);
   for (const auto& file : files_) {
     std::filesystem::remove(file);

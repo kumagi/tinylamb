@@ -650,6 +650,33 @@ struct QueryProfile {
   std::string plan;
 };
 
+bool AnalyzeAllTables(tinylamb::Database& database, std::string* error) {
+  tinylamb::TransactionContext context = database.BeginContext();
+  tinylamb::SqlEngine engine(database);
+  tinylamb::StatusOr<tinylamb::Executor> prepared =
+      engine.Prepare(context, "ANALYZE;");
+  if (!prepared.HasValue()) {
+    *error = engine.LastError().empty() ? "ANALYZE failed"
+                                        : engine.LastError();
+    context.Abort();
+    return false;
+  }
+  tinylamb::Row row;
+  size_t tables = 0;
+  while (prepared.Value()->Next(&row, nullptr)) {
+    ++tables;
+    if (row.Size() >= 3) {
+      std::cout << "analyze." << row[1] << '=' << row[2] << '\n';
+    }
+  }
+  if (context.PreCommit() != tinylamb::Status::kSuccess) {
+    *error = "ANALYZE commit failed";
+    return false;
+  }
+  std::cout << "analyze_tables=" << tables << '\n';
+  return true;
+}
+
 bool RunQuery(tinylamb::Database& database, size_t query, double scale_factor,
               QueryProfile* profile, std::string* error) {
   tinylamb::TransactionContext context = database.BeginReadOnlyContext();
@@ -766,6 +793,10 @@ int main(int argc, char** argv) {
   if (std::getenv("TINYLAMB_PAGE_POOL_BYTES") == nullptr) {
     setenv("TINYLAMB_PAGE_POOL_BYTES", "17179869184", 0);
   }
+  // Cap query working memory so join/agg/sort spill before the host thrashs.
+  if (std::getenv("TINYLAMB_QUERY_MEMORY_BYTES") == nullptr) {
+    setenv("TINYLAMB_QUERY_MEMORY_BYTES", "8589934592", 0);  // 8 GiB
+  }
   const Clock::time_point load_begin = Clock::now();
   tinylamb::Database database(options.database_path.string());
   if (!options.reuse_database) {
@@ -783,6 +814,19 @@ int main(int argc, char** argv) {
             << std::chrono::duration<double>(Clock::now() - load_begin).count()
             << '\n';
   if (options.load_only) return 0;
+
+  // Always refresh statistics before measurement so EXPLAIN/costing and
+  // Hybrid vs in-memory join choice see real cardinalities (including
+  // --reuse-database runs that skipped the load path).
+  const Clock::time_point analyze_begin = Clock::now();
+  if (!AnalyzeAllTables(database, &error)) {
+    std::cerr << "ANALYZE failed: " << error << '\n';
+    return 1;
+  }
+  std::cout << "analyze_seconds="
+            << std::chrono::duration<double>(Clock::now() - analyze_begin)
+                   .count()
+            << '\n';
 
   std::vector<QueryProfile> profiles;
   const size_t first_query = options.query.value_or(1);

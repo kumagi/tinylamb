@@ -17,6 +17,7 @@
 #include "expression/expression.hpp"
 
 #include <sstream>
+#include <tuple>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -632,6 +633,37 @@ TEST(ExpressionTest, SqlNullThreeValuedLogic) {
                   .IsNull());
 }
 
+TEST(ExpressionTest, ArithmeticNullPropagation) {
+  // SQL arithmetic and comparisons with a NULL operand yield NULL rather than
+  // a value or a crash.  This mirrors the SQL NULL semantics used by the
+  // executor for every binary operator and unary minus.
+  const Row row;
+  const Schema schema;
+  const Expression null_value = ConstantValueExp(Value());
+  const Expression one = ConstantValueExp(Value(1));
+  for (const BinaryOperation op : {BinaryOperation::kAdd,
+                                   BinaryOperation::kSubtract,
+                                   BinaryOperation::kMultiply,
+                                   BinaryOperation::kDivide,
+                                   BinaryOperation::kModulo}) {
+    const Value result =
+        BinaryExpressionExp(null_value, op, one)->Evaluate(row, schema);
+    EXPECT_TRUE(result.IsNull()) << "op " << static_cast<int>(op);
+  }
+  for (const BinaryOperation op : {BinaryOperation::kLessThan,
+                                   BinaryOperation::kLessThanEquals,
+                                   BinaryOperation::kGreaterThan,
+                                   BinaryOperation::kGreaterThanEquals}) {
+    const Value result =
+        BinaryExpressionExp(null_value, op, one)->Evaluate(row, schema);
+    EXPECT_TRUE(result.IsNull()) << "op " << static_cast<int>(op);
+  }
+  const Value neg =
+      UnaryExpressionExp(null_value, UnaryOperation::kMinus)
+          ->Evaluate(row, schema);
+  EXPECT_TRUE(neg.IsNull());
+}
+
 TEST(ExpressionTest, MixedNumericEvaluationAndTypeInference) {
   const Schema schema("numbers", {Column("integer", ValueType::kInt64),
                                   Column("floating", ValueType::kDouble)});
@@ -907,13 +939,14 @@ TEST(ExpressionTest, EvaluateBinaryLike) {
 }
 
 TEST(ExpressionTest, EvaluateBinaryErrors) {
-  EXPECT_THROW(
-      EvaluateBinary(BinaryOperation::kLike, Value(1), Value("a%")),
-      std::runtime_error);
-  EXPECT_THROW(
-      EvaluateBinary(BinaryOperation::kLike, Value("a"), Value(1)),
-      std::runtime_error);
-  EXPECT_THROW(EvaluateBinary(BinaryOperation::kAdd, Value(1), Value("a")),
+  EXPECT_THROW(std::ignore = EvaluateBinary(BinaryOperation::kLike, Value(1),
+                                            Value("a%")),
+               std::runtime_error);
+  EXPECT_THROW(std::ignore = EvaluateBinary(BinaryOperation::kLike, Value("a"),
+                                            Value(1)),
+               std::runtime_error);
+  EXPECT_THROW(std::ignore = EvaluateBinary(BinaryOperation::kAdd, Value(1),
+                                            Value("a")),
                std::runtime_error);
   EXPECT_TRUE(EvaluateBinary(BinaryOperation::kAdd, Value(1), Value())
                   .IsNull());

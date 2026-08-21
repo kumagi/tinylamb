@@ -196,6 +196,24 @@ size_t Value::Deserialize(const char* src, ValueType as_type) {
   throw std::runtime_error("undefined type");
 }
 
+size_t Value::SkipSerialized(const char* src, ValueType as_type) {
+  switch (as_type) {
+    case ValueType::kNull:
+      throw std::runtime_error("Cannot skip without type.");
+    case ValueType::kInt64:
+    case ValueType::kDate:
+      return sizeof(int64_t);
+    case ValueType::kDouble:
+      return sizeof(double);
+    case ValueType::kVarChar: {
+      bin_size_t len = 0;
+      std::memcpy(&len, src, sizeof(bin_size_t));
+      return sizeof(bin_size_t) + len;
+    }
+  }
+  throw std::runtime_error("undefined type");
+}
+
 [[nodiscard]] std::string Value::AsString() const {
   switch (type) {
     case ValueType::kNull:
@@ -298,26 +316,28 @@ size_t DecodeMemcomparableFormatVarchar(const char* src, std::string* dst) {
 std::string EncodeMemcomparableFormatDouble(double in) {
   std::string ret(1 + 8, '\0');
   ret[0] = static_cast<char>(ValueType::kDouble);  // Embeds prefix.
-  uint64_t be = htobe64(*reinterpret_cast<const uint64_t*>(&in));
+  uint64_t bits = 0;
+  std::memcpy(&bits, &in, sizeof(bits));
+  uint64_t be = htobe64(bits);
   if (0 <= in) {
     be |= 0x80;
   } else {
     be = ~be;
   }
-  memcpy(ret.data() + 1, &be, 8);
+  std::memcpy(ret.data() + 1, &be, 8);
   return ret;
 }
 
 size_t DecodeMemcomparableFormatDouble(const char* src, double* dst) {
-  int64_t loaded;
-  memcpy(&loaded, src, sizeof(int64_t));
+  int64_t loaded = 0;
+  std::memcpy(&loaded, src, sizeof(int64_t));
   uint64_t code = be64toh(loaded);
   if (0 < (src[0] & 0x80)) {
     code ^= 1LLU << 63;
   } else {
     code = ~code;
   }
-  *dst = *reinterpret_cast<double*>(&code);
+  std::memcpy(dst, &code, sizeof(*dst));
   return sizeof(double);
 }
 }  // anonymous namespace

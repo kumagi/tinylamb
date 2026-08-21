@@ -230,6 +230,15 @@ StatusOr<Table> Database::GetTable(TransactionContext& ctx,
   return tbl;
 }
 
+std::vector<std::string> Database::ListTables(TransactionContext& ctx) {
+  std::vector<std::string> names;
+  for (BPlusTreeIterator iter = catalog_.Begin(ctx.txn_); iter.IsValid();
+       ++iter) {
+    names.push_back(iter.Key());
+  }
+  return names;
+}
+
 [[maybe_unused]] void Database::DebugDump(Transaction& txn, std::ostream& o) {
   // FIXME(kumagi): The btree also has statistics entry.
   BPlusTreeIterator iter = catalog_.Begin(txn);

@@ -893,7 +893,7 @@ TEST_F(LeafPageTest, DISABLED_SanityCheckDetectsFenceAndFosterViolations) {
   ASSERT_SUCCESS(txn.PreCommit());
 }
 
-TEST_F(LeafPageTest, DISABLED_InsertHugeKeyOverflowsPhysicalSize) {
+TEST_F(LeafPageTest, InsertHugeKeyOverflowsPhysicalSize) {
   // Real bug: LeafPage::Insert (page/leaf_page.cpp:57-59) accumulates the
   // serialized sizes of key and value into a bin_size_t (uint16).  A key and
   // value whose combined serialized size exceeds 65535 bytes make physical_size
@@ -913,7 +913,7 @@ TEST_F(LeafPageTest, DISABLED_InsertHugeKeyOverflowsPhysicalSize) {
   ASSERT_EQ(result, Status::kTooBigData);
 }
 
-TEST_F(LeafPageTest, DISABLED_UpdateHugeValueOverflowsPhysicalSize) {
+TEST_F(LeafPageTest, UpdateHugeValueOverflowsPhysicalSize) {
   // Real bug: the same uint16 overflow as InsertHugeKeyOverflowsPhysicalSize,
   // reached through LeafPage::Update (page/leaf_page.cpp:104-110).  For an
   // existing key, a value large enough that key+value serialized size wraps

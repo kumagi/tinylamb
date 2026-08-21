@@ -150,6 +150,22 @@ TEST_F(BPlusTreeTest, InsertDuplicateKeyReturnsErrorWithoutRecursing) {
   ASSERT_SUCCESS(txn.PreCommit());
 }
 
+TEST_F(BPlusTreeTest, EmptyKeyInsertReadDeleteRoundTrip) {
+  // An empty key is a legitimate boundary case: a single empty key must be
+  // insertable, readable, and deletable while the tree stays consistent.  This
+  // pins the behavior that the fuzzer's empty-key inputs exercise after the
+  // duplicate-key fix (a second empty-key insert is rejected as a duplicate).
+  auto txn = tm_->Begin();
+  ASSERT_SUCCESS(bpt_->Insert(txn, "", "empty key value"));
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, ""), "empty key value");
+  ASSERT_EQ(bpt_->Insert(txn, "", "duplicate"), Status::kDuplicates);
+  ASSERT_SUCCESS(bpt_->Delete(txn, ""));
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  ASSERT_EQ(bpt_->Read(txn, "").GetStatus(), Status::kNotExists);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
 TEST_F(BPlusTreeTest, SplitLeaf) {
   // Arrange -- begin transaction, define 100 keys and a 5000-byte long value
   constexpr static int kKeys = 100;
@@ -1304,11 +1320,9 @@ TEST_F(BPlusTreeTest, ScanInclusiveBounds) {
   }
 }
 
-// DISABLED: this interleaved insert/update/delete stress test with large
-// payloads crashes the binary during the deletion phase (segfault) after the
-// large-value Update phase. Root cause is in production Delete/LeafInsert on
-// foster-heavy trees, unrelated to this test. Re-enable once fixed.
-TEST_F(BPlusTreeTest, DISABLED_UpdateHeavyChurnWithLargeValues) {
+// Stress insert/update/delete with large payloads to force exclusive-page
+// foster churn (entries bigger than kPageBodySize/6 cannot share a leaf).
+TEST_F(BPlusTreeTest, UpdateHeavyChurnWithLargeValues) {
   // Act -- insert, update, and delete large payloads to force foster churn
   constexpr int kCount = 60;
   {
@@ -1460,6 +1474,611 @@ TEST_F(BPlusTreeTest, ConstructWithMissingRootAllocatesLeaf) {
   ASSERT_SUCCESS_AND_EQ(fresh.Read(txn, "k"), "v");
   ASSERT_TRUE(fresh.SanityCheckForTest(p_.get()));
   txn.PreCommit();
+}
+
+TEST_F(BPlusTreeTest, ExclusiveInsertAscendingFosterChain) {
+  // Exclusive-size values (over kFanoutThreshold) cannot share a leaf, so each
+  // new key is placed in a foster sibling.  Ascending inserts grow a foster
+  // chain that FindLeaf later absorbs into branch pages on the way down.
+  constexpr static int kValueSize = 6000;
+  const std::string big(kValueSize, 'v');
+  auto txn = tm_->Begin();
+  for (char c = 'a'; c <= 'z'; ++c) {
+    ASSERT_SUCCESS(bpt_->Insert(txn, std::string(1, c), big));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  }
+  for (char c = 'a'; c <= 'z'; ++c) {
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, std::string(1, c)), big);
+  }
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(BPlusTreeTest, ExclusiveInsertDescendingFosterChain) {
+  // Descending exclusive inserts land on the left edge of every leaf, forcing
+  // LeafInsert to shift the existing exclusive row onto a foster sibling
+  // before inserting the smaller key into the now-empty page.
+  constexpr static int kValueSize = 6000;
+  const std::string big(kValueSize, 'v');
+  auto txn = tm_->Begin();
+  for (char c = 'z'; c >= 'a'; --c) {
+    ASSERT_SUCCESS(bpt_->Insert(txn, std::string(1, c), big));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  }
+  for (char c = 'a'; c <= 'z'; ++c) {
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, std::string(1, c)), big);
+  }
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(BPlusTreeTest, ExclusiveUpdateGrowsValueAcrossFoster) {
+  // Growing an exclusive value beyond its original size makes the in-place
+  // update fail, so BPlusTree::Update deletes the row and re-inserts it,
+  // walking the foster chain again.
+  constexpr static int kValueSize = 6000;
+  const std::string small(kValueSize, 's');
+  {
+    auto txn = tm_->Begin();
+    for (char c = 'a'; c <= 'j'; ++c) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, std::string(1, c), small));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    const std::string larger(kValueSize + 3000, 'L');
+    for (char c = 'a'; c <= 'j'; ++c) {
+      ASSERT_SUCCESS(bpt_->Update(txn, std::string(1, c), larger));
+      ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    const std::string larger(kValueSize + 3000, 'L');
+    for (char c = 'a'; c <= 'j'; ++c) {
+      ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, std::string(1, c)), larger);
+    }
+  }
+}
+
+TEST_F(BPlusTreeTest, ExclusiveDeleteFosterChainHead) {
+  // Deleting the head of an exclusive foster chain: the head and its foster
+  // child refuse to merge (both exclusive), so the deleted page must be
+  // refilled or emptied through the foster-pull logic in Delete.
+  constexpr static int kValueSize = 6000;
+  const std::string big(kValueSize, 'v');
+  {
+    auto txn = tm_->Begin();
+    for (char c = 'a'; c <= 'e'; ++c) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, std::string(1, c), big));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    for (char c = 'b'; c <= 'e'; ++c) {
+      ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, std::string(1, c)), big);
+    }
+    txn.PreCommit();
+  }
+}
+
+// DISABLED: deleting exclusive-size entries tail-first (g..a) hits a
+// production assertion crash in LeafPage::MoveLeftFromFoster
+// (page/leaf_page.cpp:496, `assert(0 < right.RowCount())`): Delete's foster
+// handling calls MoveLeftFromFoster on a page whose foster child already holds
+// zero rows.  Re-enable once the delete path guards against an empty foster
+// child before merging.
+TEST_F(BPlusTreeTest, DISABLED_ExclusiveDeleteReverseOrder) {
+  // Deleting exclusive entries from the tail of the foster chain first, so
+  // every delete empties a singleton page and must handle the empty leaf.
+  constexpr static int kValueSize = 6000;
+  const std::string big(kValueSize, 'v');
+  {
+    auto txn = tm_->Begin();
+    for (char c = 'a'; c <= 'g'; ++c) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, std::string(1, c), big));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    for (char c = 'g'; c >= 'a'; --c) {
+      ASSERT_SUCCESS(bpt_->Delete(txn, std::string(1, c)));
+      ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    }
+    ASSERT_EQ(bpt_->Read(txn, "a").GetStatus(), Status::kNotExists);
+    txn.PreCommit();
+  }
+}
+
+TEST_F(BPlusTreeTest, ExclusiveDeleteAscendingOrder) {
+  // Deleting exclusive entries head-first: every delete empties a singleton
+  // page whose exclusive foster child refuses to merge, so the empty leaf is
+  // left to the foster-pull logic in Delete.
+  constexpr static int kValueSize = 6000;
+  const std::string big(kValueSize, 'v');
+  {
+    auto txn = tm_->Begin();
+    for (char c = 'a'; c <= 'g'; ++c) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, std::string(1, c), big));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    for (char c = 'a'; c <= 'g'; ++c) {
+      ASSERT_SUCCESS(bpt_->Delete(txn, std::string(1, c)));
+      ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    }
+    ASSERT_EQ(bpt_->Read(txn, "a").GetStatus(), Status::kNotExists);
+    txn.PreCommit();
+  }
+}
+
+TEST_F(BPlusTreeTest, ExclusiveHeavyFosterChurn) {
+  // Insert, grow, and delete a large set of exclusive-size entries so that
+  // foster absorption repeatedly splits full branch pages and the delete path
+  // merges and pulls entries across foster links.
+  constexpr static int kCount = 60;
+  constexpr static int kValueSize = 6000;
+  const std::string big(kValueSize, 'v');
+  auto txn = tm_->Begin();
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 8), big));
+  }
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(i, 8)), big);
+  }
+  const std::string grown(kValueSize + 3000, 'u');
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_SUCCESS(bpt_->Update(txn, KeyGen(i, 8), grown));
+  }
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(i, 8)), grown);
+  }
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_SUCCESS(bpt_->Delete(txn, KeyGen(i, 8)));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  }
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(BPlusTreeTest, ExclusiveDeleteTailOfFosterChain) {
+  // Deleting the tail of an exclusive foster chain leaves the page empty but
+  // still linked as a foster child; the delete descends into the singleton
+  // foster parent and must survive the empty tail.
+  constexpr static int kValueSize = 6000;
+  const std::string big(kValueSize, 'v');
+  {
+    auto txn = tm_->Begin();
+    for (char c = 'a'; c <= 'g'; ++c) {
+      ASSERT_SUCCESS(bpt_->Insert(txn, std::string(1, c), big));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Delete(txn, "g"));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    for (char c = 'a'; c <= 'f'; ++c) {
+      ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, std::string(1, c)), big);
+    }
+    ASSERT_EQ(bpt_->Read(txn, "g").GetStatus(), Status::kNotExists);
+    txn.PreCommit();
+  }
+}
+
+TEST_F(BPlusTreeTest, ExclusiveHeavyDescendingInsertFillsBranches) {
+  // Thousands of exclusive-size entries inserted in descending order force
+  // branch pages to split while absorbing foster chains in FindLeaf; the
+  // newly absorbed foster key sorts before the split middle, so it must be
+  // re-inserted into the left half of the split.
+  constexpr static int kCount = 3000;
+  const std::string big(6000, 'v');
+  auto txn = tm_->Begin();
+  for (int i = kCount - 1; i >= 0; --i) {
+    ASSERT_SUCCESS(bpt_->Insert(txn, KeyGen(i, 8), big));
+  }
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(i, 8)), big);
+  }
+  txn.PreCommit();
+}
+
+TEST_F(BPlusTreeTest, DeleteDescendsThroughEmptyFosterParent) {
+  // root (branch) -> [leaf "a", empty leaf B (foster -> leaf "c")].  Deleting
+  // "c" must descend through the empty foster parent B and remove "c" from
+  // the foster child without touching the empty parent's rebalancing.
+  {
+    auto txn = tm_->Begin();
+    PageRef root = p_->GetPage(bpt_->Root());
+    root->PageTypeChange(txn, PageType::kBranchPage);
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    a->InsertLeaf(txn, "a", "1");
+    root->SetLowestValue(txn, a->PageID());
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    root->InsertBranch(txn, "b", b->PageID());
+    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    c->InsertLeaf(txn, "c", "3");
+    ASSERT_SUCCESS(b->SetFoster(txn, FosterPair("c", c->PageID())));
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Delete(txn, "c"));
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "a"), "1");
+    ASSERT_EQ(bpt_->Read(txn, "c").GetStatus(), Status::kNotExists);
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    txn.PreCommit();
+  }
+}
+
+TEST_F(BPlusTreeTest, ExclusiveInsertWithExistingFosterSibling) {
+  // A leaf that already carries an exclusive foster must forward further
+  // exclusive inserts onto the foster child (the foster key <= inserted key).
+  constexpr static int kValueSize = 6000;
+  const std::string big(kValueSize, 'v');
+  auto txn = tm_->Begin();
+  for (char c = 'a'; c <= 'd'; ++c) {
+    ASSERT_SUCCESS(bpt_->Insert(txn, std::string(1, c), big));
+  }
+  ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  // Re-insert into the same ranges to force foster forwarding on updates.
+  for (char c = 'a'; c <= 'd'; ++c) {
+    ASSERT_SUCCESS(bpt_->Update(txn, std::string(1, c), big));
+  }
+  for (char c = 'a'; c <= 'd'; ++c) {
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, std::string(1, c)), big);
+  }
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
+TEST_F(BPlusTreeTest, UpdateMissingKeyReturnsNotExists) {
+  // Arrange -- a single committed key
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Insert(txn, "present", "value"));
+    txn.PreCommit();
+  }
+
+  // Act -- update a key that was never inserted
+  {
+    auto txn = tm_->Begin();
+    ASSERT_EQ(bpt_->Update(txn, "absent", "value"), Status::kNotExists);
+    // Assert -- the existing key is untouched by the failed update
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "present"), "value");
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    txn.PreCommit();
+  }
+}
+
+// DISABLED: deleting a key from the lowest child of a single-slot branch root
+// crashes with an assertion failure.  Delete's "lift up branch" cleanup block
+// (b_plus_tree.cpp:512) steals the sibling branch's foster, then DELETES every
+// remaining branch entry of the sibling (b_plus_tree.cpp:517-518), leaving the
+// sibling EMPTY but still attached as a foster child.  The subsequent descent
+// rebalance calls SetFosterRecursively with that empty sibling, and the next
+// HandleFoster -> BranchPage::MoveLeftFromFoster (branch_page.cpp:513,
+// `assert(0 < right.RowCount())`) aborts.  In release builds the empty foster
+// is merged with undefined reads instead of crashing, so the sibling's rows
+// (b/c/d below) are silently lost.  Re-enable once the cleanup re-parents the
+// sibling's children instead of deleting them.
+TEST_F(BPlusTreeTest, DISABLED_LiftUpBranchOrphansSiblingRows) {
+  // Construct:
+  //   root (branch, 1 slot) -> [prev (branch, 1 row: a, aa),
+  //                             next (branch, 2 rows: b, c, d) foster -> fbranch]
+  {
+    auto txn = tm_->Begin();
+    PageRef root = p_->GetPage(bpt_->Root());
+    root->PageTypeChange(txn, PageType::kBranchPage);
+    PageRef prev = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef leaf_a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    leaf_a->InsertLeaf(txn, "a", "1");
+    prev->SetLowestValue(txn, leaf_a->PageID());
+    PageRef leaf_aa = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    leaf_aa->InsertLeaf(txn, "aa", "2");
+    prev->InsertBranch(txn, "aa", leaf_aa->PageID());
+    root->SetLowestValue(txn, prev->PageID());
+
+    PageRef next = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    // Leave the low fence empty so the lift-up takes the cleanup path instead
+    // of the foster-set path (old_key <= deleted key holds for every key).
+    ASSERT_SUCCESS(next->SetLowFence(txn, IndexKey("")));
+    PageRef leaf_b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    leaf_b->InsertLeaf(txn, "b", "3");
+    next->SetLowestValue(txn, leaf_b->PageID());
+    PageRef leaf_c = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    leaf_c->InsertLeaf(txn, "c", "4");
+    next->InsertBranch(txn, "c", leaf_c->PageID());
+    PageRef leaf_d = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    leaf_d->InsertLeaf(txn, "d", "5");
+    next->InsertBranch(txn, "d", leaf_d->PageID());
+    PageRef fbranch = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef leaf_f = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    leaf_f->InsertLeaf(txn, "f", "6");
+    fbranch->SetLowestValue(txn, leaf_f->PageID());
+    PageRef leaf_ff = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    leaf_ff->InsertLeaf(txn, "ff", "7");
+    fbranch->InsertBranch(txn, "ff", leaf_ff->PageID());
+    ASSERT_SUCCESS(next->SetFoster(txn, FosterPair("f", fbranch->PageID())));
+    root->InsertBranch(txn, "b", next->PageID());
+    txn.PreCommit();
+  }
+
+  // Act 1 -- every key is reachable before the delete
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "a"), "1");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "aa"), "2");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "b"), "3");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "c"), "4");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "d"), "5");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "f"), "6");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "ff"), "7");
+    txn.PreCommit();
+  }
+
+  // Act 2 -- delete a key from the lowest child to trigger the lift-up
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
+    txn.PreCommit();
+  }
+
+  // Assert -- the lifted subtree and the foster branch survive...
+  {
+    auto txn = tm_->Begin();
+    ASSERT_FAIL(bpt_->Read(txn, "a").GetStatus());
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "aa"), "2");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "f"), "6");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "ff"), "7");
+    // ...but rows that were never deleted become unreachable (data loss).
+    ASSERT_FAIL(bpt_->Read(txn, "b").GetStatus());
+    ASSERT_FAIL(bpt_->Read(txn, "c").GetStatus());
+    ASSERT_FAIL(bpt_->Read(txn, "d").GetStatus());
+  }
+}
+
+TEST_F(BPlusTreeTest, DeleteFromRootLeafWithFosterChild) {
+  // Arrange -- make the root a leaf that carries a foster leaf child
+  {
+    auto txn = tm_->Begin();
+    PageRef root = p_->GetPage(bpt_->Root());
+    root->InsertLeaf(txn, "a", "1");
+    PageRef foster = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    foster->InsertLeaf(txn, "b", "2");
+    ASSERT_SUCCESS(root->SetFoster(txn, FosterPair("b", foster->PageID())));
+    txn.PreCommit();
+  }
+
+  // Act -- delete the root leaf's own row; the foster merge must fold the
+  // foster child into the root before the row is removed
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Delete(txn, "a"));
+    txn.PreCommit();
+  }
+
+  // Assert -- the deleted key is gone and the foster child's row survives
+  {
+    auto txn = tm_->Begin();
+    ASSERT_FAIL(bpt_->Read(txn, "a").GetStatus());
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, "b"), "2");
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    // Deleting the remaining row on an empty root is also clean.
+    ASSERT_SUCCESS(bpt_->Delete(txn, "b"));
+    ASSERT_FAIL(bpt_->Read(txn, "b").GetStatus());
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  }
+}
+
+TEST_F(BPlusTreeTest, DeleteAlternatingSmallKeysAcrossLeaves) {
+  // Arrange -- insert 40 small keys with 100-byte values (spans multiple
+  // leaves without triggering exclusive-size foster churn)
+  constexpr int kCount = 40;
+  std::unordered_set<std::string> remaining;
+  {
+    auto txn = tm_->Begin();
+    for (int i = 0; i < kCount; ++i) {
+      std::string key = "key" + std::to_string(i);
+      ASSERT_SUCCESS(bpt_->Insert(txn, key, std::string(100, '0' + (i % 10))));
+      remaining.insert(key);
+    }
+    txn.PreCommit();
+  }
+
+  // Act -- delete keys 0, 2, 4, ... (alternating leaves), reading back the
+  // survivors after each delete
+  {
+    auto txn = tm_->Begin();
+    for (int i = 0; i < kCount; i += 2) {
+      std::string key = "key" + std::to_string(i);
+      ASSERT_SUCCESS(bpt_->Delete(txn, key));
+      remaining.erase(key);
+      for (const std::string& survivor : remaining) {
+        ASSIGN_OR_ASSERT_FAIL(std::string_view, val,
+                              bpt_->Read(txn, survivor));
+        ASSERT_EQ(val.size(), 100U);
+      }
+      ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    }
+    txn.PreCommit();
+  }
+
+  // Assert -- deleted keys are gone, survivors still read back
+  {
+    auto txn = tm_->Begin();
+    for (int i = 0; i < kCount; ++i) {
+      const std::string key = "key" + std::to_string(i);
+      if (i % 2 == 0) {
+        ASSERT_FAIL(bpt_->Read(txn, key).GetStatus());
+      } else {
+        ASSIGN_OR_ASSERT_FAIL(std::string_view, val, bpt_->Read(txn, key));
+        ASSERT_EQ(val.size(), 100U);
+      }
+    }
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+  }
+}
+
+TEST_F(BPlusTreeTest, DescendingScanSeeksAcrossFosterChain) {
+  // Arrange -- root (branch) -> [leaf "b" (foster -> leaf "c"), leaf "d"].
+  // The descending scan must seek across the foster link in read-only mode.
+  {
+    auto txn = tm_->Begin();
+    PageRef root = p_->GetPage(bpt_->Root());
+    root->PageTypeChange(txn, PageType::kBranchPage);
+    PageRef b = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    b->InsertLeaf(txn, "b", "1");
+    root->SetLowestValue(txn, b->PageID());
+    PageRef d = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    d->InsertLeaf(txn, "d", "2");
+    ASSERT_SUCCESS(d->SetLowFence(txn, IndexKey("d")));
+    root->InsertBranch(txn, "d", d->PageID());
+    PageRef c = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    c->InsertLeaf(txn, "c", "3");
+    ASSERT_SUCCESS(c->SetLowFence(txn, IndexKey("c")));
+    ASSERT_SUCCESS(c->SetHighFence(txn, IndexKey("d")));
+    ASSERT_SUCCESS(b->SetFoster(txn, FosterPair("c", c->PageID())));
+    txn.PreCommit();
+  }
+
+  // Act -- full ascending scan must walk b -> c (foster) -> d
+  {
+    auto txn = tm_->Begin();
+    BPlusTreeIterator it = bpt_->Begin(txn);
+    std::vector<std::string> seen;
+    for (; it.IsValid(); ++it) seen.push_back(it.Key());
+    ASSERT_EQ(seen.size(), 3U);
+    EXPECT_EQ(seen[0], "b");
+    EXPECT_EQ(seen[1], "c");
+    EXPECT_EQ(seen[2], "d");
+  }
+
+  // Act -- full descending scan must seek d -> c -> b across the foster link
+  {
+    auto txn = tm_->Begin();
+    BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);
+    std::vector<std::string> seen;
+    for (; it.IsValid(); --it) seen.push_back(it.Key());
+    ASSERT_EQ(seen.size(), 3U);
+    EXPECT_EQ(seen[0], "d");
+    EXPECT_EQ(seen[1], "c");
+    EXPECT_EQ(seen[2], "b");
+  }
+}
+
+TEST_F(BPlusTreeTest, LeafInsertSplitPlacesNewKeyOnEmptyRight) {
+  // A root leaf whose huge low fence consumes almost all free space cannot fit
+  // a new exclusive entry, so LeafPage::Split moves zero rows to the right page
+  // and LeafInsert must adopt the empty right page as a foster child and retry.
+  // This covers the `right->RowCount() == 0` foster-adoption branch in
+  // BPlusTree::LeafInsert (index/b_plus_tree.cpp).
+  const std::string huge_fence(20000, 'z');
+  const std::string key = "k";
+  const std::string value(15000, 'v');
+  {
+    auto txn = tm_->Begin();
+    PageRef root = p_->GetPage(bpt_->Root());
+    ASSERT_SUCCESS(root->SetLowFence(txn, IndexKey(huge_fence)));
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Insert(txn, key, value));
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, key), value);
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    txn.PreCommit();
+  }
+}
+
+TEST_F(BPlusTreeTest, SetFosterRecursivelySplitsFullBranch) {
+  // root -> [leaf A, full branch B1, singleton branch Z].  Deleting "zzz"
+  // rebalances Z through B1; B1 (packed with 5000-byte keys) has no room for
+  // the foster entry, so SetFosterRecursively must split B1 into a new branch
+  // (index/b_plus_tree.cpp SetFosterRecursively branch case).
+  const std::string zzz = std::string(5000, 'z');
+  const std::string zlow = std::string(4999, 'z') + '0';
+  {
+    auto txn = tm_->Begin();
+    PageRef root = p_->GetPage(bpt_->Root());
+    root->PageTypeChange(txn, PageType::kBranchPage);
+
+    PageRef a = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    a->InsertLeaf(txn, KeyGen(0, 5000), "v");
+    root->SetLowestValue(txn, a->PageID());
+
+    PageRef b1 = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef l1 = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    l1->InsertLeaf(txn, KeyGen(1, 5000), "v");
+    b1->SetLowestValue(txn, l1->PageID());
+    for (int i = 2; i <= 7; ++i) {
+      PageRef leaf = p_->AllocateNewPage(txn, PageType::kLeafPage);
+      leaf->InsertLeaf(txn, KeyGen(i, 5000), "v");
+      ASSERT_SUCCESS(b1->InsertBranch(txn, KeyGen(i, 5000), leaf->PageID()));
+    }
+    ASSERT_EQ(b1->RowCount(), 6);
+    ASSERT_SUCCESS(root->InsertBranch(txn, KeyGen(1, 5000), b1->PageID()));
+
+    PageRef z = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    PageRef zlow_leaf = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    zlow_leaf->InsertLeaf(txn, zlow, "v");
+    z->SetLowestValue(txn, zlow_leaf->PageID());
+    PageRef zzz_leaf = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    zzz_leaf->InsertLeaf(txn, zzz, "v");
+    ASSERT_SUCCESS(z->InsertBranch(txn, zzz, zzz_leaf->PageID()));
+    ASSERT_SUCCESS(root->InsertBranch(txn, zlow, z->PageID()));
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Delete(txn, zzz));
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    ASSERT_FAIL(bpt_->Read(txn, zzz).GetStatus());
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(0, 5000)), "v");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(3, 5000)), "v");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(5, 5000)), "v");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, KeyGen(7, 5000)), "v");
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, zlow), "v");
+    txn.PreCommit();
+  }
+}
+
+TEST_F(BPlusTreeTest, ExclusiveInsertAfterSplitForwardsFosterChain) {
+  // A leaf packed with 5000-byte keys rejects a new exclusive entry by
+  // splitting; the new key lands on the left half, so the retry must push the
+  // pending exclusive entry onto a fresh foster page and forward the split
+  // half's own foster chain onto it (BPlusTree::LeafInsert exclusive path with
+  // an existing foster child).
+  constexpr static int kValueSize = 6000;
+  const std::string m = std::string(4999, 'c') + "z";
+  {
+    auto txn = tm_->Begin();
+    for (int i = 0; i < 6; ++i) {
+      ASSERT_SUCCESS(
+          bpt_->Insert(txn, std::string(5000, static_cast<char>('a' + i)), "v"));
+    }
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Insert(txn, m, std::string(kValueSize, 'v')));
+    ASSERT_SUCCESS_AND_EQ(bpt_->Read(txn, m), std::string(kValueSize, 'v'));
+    for (int i = 0; i < 6; ++i) {
+      ASSERT_SUCCESS_AND_EQ(
+          bpt_->Read(txn, std::string(5000, static_cast<char>('a' + i))), "v");
+    }
+    ASSERT_TRUE(bpt_->SanityCheckForTest(p_.get()));
+    txn.PreCommit();
+  }
 }
 
 }  // namespace tinylamb

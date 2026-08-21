@@ -50,7 +50,9 @@ Encoder& operator<<(Encoder& a, const IndexSchema& idx) {
 }
 
 Decoder& operator>>(Decoder& e, IndexSchema& idx) {
-  e >> idx.name_ >> idx.key_ >> idx.include_ >> (bool&)idx.mode_;
+  bool mode = false;
+  e >> idx.name_ >> idx.key_ >> idx.include_ >> mode;
+  idx.mode_ = static_cast<IndexMode>(mode);
   return e;
 }
 

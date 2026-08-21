@@ -361,6 +361,7 @@ std::unique_ptr<Statement> BindStatementLiterals(
     }
     case StatementType::kCreateTable:
     case StatementType::kDropTable:
+    case StatementType::kAnalyze:
       throw std::runtime_error("SQL template does not bind DDL");
   }
   if (index != parameters.size()) {

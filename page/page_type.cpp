@@ -49,13 +49,14 @@ std::ostream& operator<<(std::ostream& o, const PageType& type) {
 }
 
 Encoder& operator<<(Encoder& e, const PageType& type) {
-  e << reinterpret_cast<const uint64_t&>(type);
+  e << static_cast<uint64_t>(type);
   return e;
 }
 
 Decoder& operator>>(Decoder& d, PageType& type) {
-  auto* type_p = reinterpret_cast<uint64_t*>(&type);
-  d >> *type_p;
+  uint64_t raw = 0;
+  d >> raw;
+  type = static_cast<PageType>(raw);
   return d;
 }
 

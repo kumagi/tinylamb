@@ -23,6 +23,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -64,6 +65,20 @@ TEST(ValueTest, SerializeDesrialize) {
   SerializeDeserializeTest(Value(301L));
   SerializeDeserializeTest(Value("hello"));
   SerializeDeserializeTest(Value(439.3));
+}
+
+TEST(ValueTest, SerializeRoundTripCoversDateNullAndBinaryVarchar) {
+  // The core round-trip only exercises int/double/varchar; these remaining
+  // shapes must also survive Serialize/Deserialize unchanged so rows, indexes,
+  // and WAL records can carry them losslessly.  (A NULL value is serialized
+  // but Deserialize(NULL) is deliberately rejected, so it is not round-tripped
+  // here.)
+  SerializeDeserializeTest(Value::Date("2020-01-02"));
+  SerializeDeserializeTest(Value(""));
+  const std::string binary("\x00\x01\xff embedded \x00 nulls", 20);
+  SerializeDeserializeTest(Value(std::string(binary)));
+  const std::string long_text(1000, 'x');
+  SerializeDeserializeTest(Value(std::string(long_text)));
 }
 
 TEST(ValueTest, Compare) {
@@ -433,10 +448,10 @@ TEST(ValueTest, OrderedComparisonOperators) {
 
 TEST(DateTest, ParseRejectsMalformedDates) {
   // Act + Assert -- non-ISO formats and impossible calendar days are rejected.
-  ASSERT_THROW(ParseDateDays("not-a-date"), std::runtime_error);
-  ASSERT_THROW(ParseDateDays("2024-13-01"), std::runtime_error);
-  ASSERT_THROW(ParseDateDays("2024-02-30"), std::runtime_error);
-  ASSERT_THROW(ParseDateDays("2023-02-29"), std::runtime_error);
+  ASSERT_THROW(std::ignore = ParseDateDays("not-a-date"), std::runtime_error);
+  ASSERT_THROW(std::ignore = ParseDateDays("2024-13-01"), std::runtime_error);
+  ASSERT_THROW(std::ignore = ParseDateDays("2024-02-30"), std::runtime_error);
+  ASSERT_THROW(std::ignore = ParseDateDays("2023-02-29"), std::runtime_error);
   // sscanf tolerates single-digit fields; it must still normalize to days.
   EXPECT_EQ(ParseDateDays("2024-1-1"), ParseDateDays("2024-01-01"));
 }
@@ -495,9 +510,11 @@ TEST(DateTest, AddDayMonthYearIntervals) {
 
 TEST(DateTest, AddIntervalRejectsUnknownUnits) {
   // Act + Assert -- unsupported interval units throw.
-  ASSERT_THROW(AddDateIntervalDays(ParseDateDays("2024-01-01"), 1, "week"),
+  ASSERT_THROW(std::ignore = AddDateIntervalDays(ParseDateDays("2024-01-01"), 1,
+                                                 "week"),
                std::runtime_error);
-  ASSERT_THROW(AddDateIntervalDays(ParseDateDays("2024-01-01"), 1, "hour"),
+  ASSERT_THROW(std::ignore = AddDateIntervalDays(ParseDateDays("2024-01-01"), 1,
+                                                 "hour"),
                std::runtime_error);
 }
 
@@ -517,10 +534,10 @@ TEST(DateTest, ValueDateFromDaysRoundTrip) {
 
 TEST(ValueTest, DateDaysRequiresDateType) {
   // Act + Assert -- DateDays() rejects every non-date Value with a throw.
-  ASSERT_THROW(Value(1).DateDays(), std::runtime_error);
-  ASSERT_THROW(Value("x").DateDays(), std::runtime_error);
-  ASSERT_THROW(Value(1.5).DateDays(), std::runtime_error);
-  ASSERT_THROW(Value().DateDays(), std::runtime_error);
+  ASSERT_THROW(std::ignore = Value(1).DateDays(), std::runtime_error);
+  ASSERT_THROW(std::ignore = Value("x").DateDays(), std::runtime_error);
+  ASSERT_THROW(std::ignore = Value(1.5).DateDays(), std::runtime_error);
+  ASSERT_THROW(std::ignore = Value().DateDays(), std::runtime_error);
 }
 
 TEST(ValueTest, MixedTypeComparisonThrows) {
@@ -573,12 +590,13 @@ TEST(ValueTest, InvalidValueTypeThrows) {
   char buffer[16] = {0};
 
   // Act + Assert -- every type-switching entry point rejects the bad type.
-  ASSERT_THROW(broken.Size(), std::runtime_error);
+  ASSERT_THROW(std::ignore = broken.Size(), std::runtime_error);
   ASSERT_THROW(broken.Serialize(buffer), std::runtime_error);
   ASSERT_THROW(broken.Deserialize(buffer, static_cast<ValueType>(99)),
                std::runtime_error);
-  ASSERT_THROW(broken.AsString(), std::runtime_error);
-  ASSERT_THROW(broken.EncodeMemcomparableFormat(), std::runtime_error);
+  ASSERT_THROW(std::ignore = broken.AsString(), std::runtime_error);
+  ASSERT_THROW(std::ignore = broken.EncodeMemcomparableFormat(),
+               std::runtime_error);
   ASSERT_THROW(broken < broken, std::runtime_error);
   ASSERT_THROW(broken > broken, std::runtime_error);
   ASSERT_THROW(broken == broken, std::runtime_error);

@@ -63,7 +63,9 @@ enum class LogType : uint16_t {
   kLowestValue,
 };
 inline std::istream& operator>>(std::istream& in, LogType& val) {
-  in >> *reinterpret_cast<uint16_t*>(&val);
+  uint16_t raw = 0;
+  in >> raw;
+  val = static_cast<LogType>(raw);
   return in;
 }
 

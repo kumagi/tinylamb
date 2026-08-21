@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <cstddef>
 #include <optional>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -77,9 +78,18 @@ class Table {
   Iterator BeginFullScan(Transaction& txn) const;
   Iterator BeginFullScan(Transaction& txn,
                          const std::vector<slot_t>& projection) const;
+  Iterator BeginFullScan(
+      Transaction& txn, const std::vector<slot_t>& projection,
+      const std::unordered_set<int64_t>* key_filter,
+      slot_t key_column) const;
+  Iterator BeginFullScan(Transaction& txn,
+                         const std::unordered_set<int64_t>* key_filter,
+                         slot_t key_column) const;
   Iterator BeginMorselScan(
       Transaction& txn, const ScanMorsel& pages,
-      std::optional<std::vector<slot_t>> projection = std::nullopt) const;
+      std::optional<std::vector<slot_t>> projection = std::nullopt,
+      const std::unordered_set<int64_t>* key_filter = nullptr,
+      std::optional<slot_t> key_column = std::nullopt) const;
   [[nodiscard]] std::vector<ScanMorsel> BuildScanMorsels(
       Transaction& txn, size_t pages_per_morsel = 8) const;
   Iterator BeginIndexScan(Transaction& txn, const Index& index,

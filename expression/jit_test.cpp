@@ -2,6 +2,7 @@
 #include "expression/jit.hpp"
 
 #include <numeric>
+#include <tuple>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -110,7 +111,8 @@ TEST(JitTest, WrongKernelUsageThrows) {
                std::logic_error);
   EXPECT_THROW(sum->Filter(input.data(), selected.data(), input.size(), 0),
                std::logic_error);
-  EXPECT_THROW(filter->Sum(input.data(), input.size()), std::logic_error);
+  EXPECT_THROW(std::ignore = filter->Sum(input.data(), input.size()),
+               std::logic_error);
   EXPECT_THROW(sum->Project(input.data(), output.data(), input.size(), 1, 1),
                std::logic_error);
 }

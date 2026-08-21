@@ -176,6 +176,22 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         }
       }));
     built.Add(ExpressionRule(
+      "fold_function", Is(TypeTag::kFunctionCallExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto is_literal = [](const Expression& arg) {
+          return arg && (arg->Type() == TypeTag::kConstantValue ||
+                         arg->Type() == TypeTag::kIntervalExp);
+        };
+        if (!std::ranges::all_of(ExpressionChildren(expression), is_literal)) {
+          return Expression{};
+        }
+        try {
+          return ConstantValueExp(expression->Evaluate(Row(), Schema()));
+        } catch (const std::exception&) {
+          return Expression{};
+        }
+      }));
+    built.Add(ExpressionRule(
       "singleton_in", Is(TypeTag::kInExp),
       [](const Expression& expression, const ExpressionBindings&) {
         const auto& in = expression->AsInExpression();

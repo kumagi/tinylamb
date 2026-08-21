@@ -661,4 +661,312 @@ TEST_F(RecoveryManagerTest, RecoverFromTwiceIsIdempotent) {
   ASSERT_EQ(ReadRow(0), "hoge");
 }
 
+TEST_F(RecoveryManagerTest, SinglePageRecoverySkipsRedoWhenLsnAlreadyApplied) {
+  // Arrange -- a committed insert sets the row page's PageLSN to the insert
+  // log's own offset, so every page log is at lsn <= PageLSN.
+  ASSERT_TRUE(InsertRow("already-applied"));
+
+  // Act -- replay the page's logs; LogRedo short-circuits on lsn <= PageLSN
+  // for both the allocation and the insert record.
+  PageRef page = p_->GetPage(page_id_);
+  ASSERT_FALSE(page.IsNull());
+  ASSERT_EQ(page->Type(), PageType::kRowPage);
+  r_->SinglePageRecovery(std::move(page), tm_.get());
+
+  // Assert -- the committed row survives untouched.
+  ASSERT_EQ(GetRowCount(), 1);
+  ASSERT_EQ(ReadRow(0), "already-applied");
+}
+
+TEST_F(RecoveryManagerTest, ReplayLeafPageLogsRedoAndUndo) {
+  // Arrange -- a freshly allocated leaf page plus a log tail of leaf
+  // manipulation records all owned by the uncommitted transaction 42.
+  page_id_t pid = 0;
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    pid = page->PageID();
+    page.PageUnlock();
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+  l_->AddLog(
+      LogRecord::InsertingLeafLogRecord(0, 42, pid, "k", "v1").Serialize());
+  l_->AddLog(LogRecord::CompensatingUpdateLeafLogRecord(42, pid, "k", "cv")
+                 .Serialize());
+  l_->AddLog(LogRecord::UpdatingLeafLogRecord(0, 42, pid, "k", "v2", "v1")
+                 .Serialize());
+  l_->AddLog(
+      LogRecord::DeletingLeafLogRecord(0, 42, pid, "k", "v2").Serialize());
+  l_->AddLog(LogRecord::SetLowFenceLogRecord(0, 42, pid, IndexKey("lo"),
+                                             IndexKey("undo-lo"))
+                 .Serialize());
+  l_->AddLog(LogRecord::SetHighFenceLogRecord(0, 42, pid, IndexKey("hi"),
+                                              IndexKey("undo-hi"))
+                 .Serialize());
+  l_->AddLog(LogRecord::SetFosterLogRecord(0, 42, pid, FosterPair("new", 1),
+                                           FosterPair("old", 2))
+                 .Serialize());
+  while (l_->CommittedLSN() < l_->BufferedLSN()) {
+    std::this_thread::yield();
+  }
+
+  // Act -- replay every log of this page (redo then undo; txn 42 is not
+  // committed so the undo phase runs too).
+  {
+    PageRef page = p_->GetPage(pid);
+    ASSERT_FALSE(page.IsNull());
+    ASSERT_EQ(page->Type(), PageType::kLeafPage);
+    r_->SinglePageRecovery(std::move(page), tm_.get());
+  }
+
+  // Assert -- the redo phase applied and the undo phase fully reversed the
+  // uncommitted writes, leaving an empty leaf page.
+  {
+    PageRef page = p_->GetPage(pid);
+    ASSERT_FALSE(page.IsNull());
+    ASSERT_EQ(page->Type(), PageType::kLeafPage);
+    ASSERT_EQ(page->RowCount(), 0);
+  }
+}
+
+TEST_F(RecoveryManagerTest, ReplayBranchPageLogsRedoAndUndo) {
+  // Arrange -- a freshly allocated branch page plus a log tail of branch
+  // manipulation records owned by the uncommitted transaction 42.
+  page_id_t pid = 0;
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    pid = page->PageID();
+    page.PageUnlock();
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+  l_->AddLog(
+      LogRecord::InsertingBranchLogRecord(0, 42, pid, "b", 50).Serialize());
+  l_->AddLog(LogRecord::UpdatingBranchLogRecord(0, 42, pid, "b", 51, 50)
+                 .Serialize());
+  l_->AddLog(
+      LogRecord::DeletingBranchLogRecord(0, 42, pid, "b", 51).Serialize());
+  l_->AddLog(LogRecord::SetLowestLogRecord(0, 42, pid, 60, 70).Serialize());
+  while (l_->CommittedLSN() < l_->BufferedLSN()) {
+    std::this_thread::yield();
+  }
+
+  // Act -- replay every log of this page (redo then undo).
+  {
+    PageRef page = p_->GetPage(pid);
+    ASSERT_FALSE(page.IsNull());
+    ASSERT_EQ(page->Type(), PageType::kBranchPage);
+    r_->SinglePageRecovery(std::move(page), tm_.get());
+  }
+
+  // Assert -- the branch-page redo and undo both ran; the page is empty again.
+  {
+    PageRef page = p_->GetPage(pid);
+    ASSERT_FALSE(page.IsNull());
+    ASSERT_EQ(page->Type(), PageType::kBranchPage);
+    ASSERT_EQ(page->RowCount(), 0);
+  }
+}
+
+TEST_F(RecoveryManagerTest, BrokenLeafPageRecoveryRedoAllocPageLog) {
+  // Arrange -- a committed leaf page that is also dirty (its allocation log).
+  page_id_t pid = 0;
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    pid = page->PageID();
+    page.PageUnlock();
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+
+  // Act -- corrupt the leaf page region, then recover; the broken page enters
+  // SinglePageRecovery with page_lsn reset to 0 so the allocation log must be
+  // redone (kSystemAllocPage arm of LogRedo).
+  SinglePageFailure(pid);
+  r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- the allocation redo re-initialized the page as a leaf page.
+  PageRef page = p_->GetPage(pid);
+  ASSERT_FALSE(page.IsNull());
+  ASSERT_EQ(page->Type(), PageType::kLeafPage);
+}
+
+TEST_F(RecoveryManagerTest, RecoverFromSkipsBeginCheckpointInAnalysis) {
+  // Arrange -- a BeginCheckpoint record appended after the fixture's
+  // committed row-page allocation.
+  l_->AddLog(LogRecord::BeginCheckpointLogRecord().Serialize());
+  while (l_->CommittedLSN() < l_->BufferedLSN()) {
+    std::this_thread::yield();
+  }
+
+  // Act -- recover from the beginning of the log.
+  r_->RecoverFrom(0, tm_.get());
+
+  // Assert -- the analysis phase took its default arm for the checkpoint
+  // record without crashing and the row page is still usable.
+  ASSERT_EQ(GetRowCount(), 0);
+}
+
+TEST_F(RecoveryManagerTest, RecoverFromParallelWithMultipleDirtyPages) {
+  // Arrange -- two committed row pages, each holding one row.
+  ASSERT_TRUE(InsertRow("first"));
+  page_id_t second_pid = 0;
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    second_pid = page->PageID();
+    ASSERT_SUCCESS(page->Insert(txn, "second").GetStatus());
+    page.PageUnlock();
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+
+  // Act -- flush both pages to disk so they stay valid across the reopen,
+  // crash and reopen; two valid dirty pages yield two replay jobs that reach
+  // ReplayPagesInParallel's multi-threaded worker branch.  Pin the worker
+  // count via the environment so the branch is deterministic.
+  Flush();
+  p_->GetPool()->FlushPageForTest(second_pid);
+  ASSERT_EQ(setenv("TINYLAMB_RECOVERY_WORKERS", "2", 1), 0);
+  Recover();
+  r_->RecoverFrom(0, tm_.get());
+  unsetenv("TINYLAMB_RECOVERY_WORKERS");
+
+  // Assert -- both rows survived (redo was already applied on disk).
+  ASSERT_EQ(GetRowCount(), 1);
+  ASSERT_EQ(ReadRow(0), "first");
+  {
+    PageRef page = p_->GetPage(second_pid);
+    ASSERT_FALSE(page.IsNull());
+    ASSERT_EQ(page->Type(), PageType::kRowPage);
+    ASSERT_EQ(page->RowCount(), 1);
+  }
+}
+
+TEST_F(RecoveryManagerTest, LogUndoWithPageUndoLeafInsert) {
+  // Arrange -- a leaf page that already holds key "k" (the pre-insert state).
+  page_id_t pid = 0;
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->AllocateNewPage(txn, PageType::kLeafPage);
+    pid = page->PageID();
+    page->InsertImpl("k", "v");
+    page.PageUnlock();
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+  LogRecord insert = LogRecord::InsertingLeafLogRecord(0, 42, pid, "k", "v");
+
+  // Act -- undo the insert of key "k".
+  r_->LogUndoWithPage(0, insert, tm_.get());
+
+  // Assert -- the leaf-page undo deleted the key.
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(pid);
+    ASSERT_FALSE(page.IsNull());
+    StatusOr<std::string_view> read = page->Read(txn, "k");
+    ASSERT_SUCCESS(txn.PreCommit());
+    EXPECT_EQ(read.GetStatus(), Status::kNotExists);
+  }
+}
+
+TEST_F(RecoveryManagerTest, LogUndoWithPageUndoBranchDelete) {
+  // Arrange -- an empty branch page; the undo of a branch delete re-inserts.
+  page_id_t pid = 0;
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->AllocateNewPage(txn, PageType::kBranchPage);
+    pid = page->PageID();
+    page.PageUnlock();
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+  LogRecord del = LogRecord::DeletingBranchLogRecord(0, 42, pid, "b", 17);
+
+  // Act -- undo the delete of branch entry "b".
+  r_->LogUndoWithPage(0, del, tm_.get());
+
+  // Assert -- implicit; the branch-page undo ran without crashing.
+  {
+    PageRef page = p_->GetPage(pid);
+    ASSERT_FALSE(page.IsNull());
+    ASSERT_EQ(page->Type(), PageType::kBranchPage);
+  }
+}
+
+TEST_F(RecoveryManagerTest, ParallelReplayRethrowsWorkerError) {
+  // Arrange -- two committed, on-disk-valid row pages so the recovery has two
+  // replay jobs, plus a DestroyPage log for the fixture page whose LogRedo arm
+  // throws std::runtime_error("not implemented yet").  The destroy log is
+  // appended after the pages were flushed, so its LSN exceeds the pages'
+  // PageLSN and the redo phase really reaches the throwing arm.
+  ASSERT_TRUE(InsertRow("first"));
+  page_id_t second_pid = 0;
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    second_pid = page->PageID();
+    ASSERT_SUCCESS(page->Insert(txn, "second").GetStatus());
+    page.PageUnlock();
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
+  Flush();
+  p_->GetPool()->FlushPageForTest(second_pid);
+  l_->AddLog(LogRecord::DestroyPageLogRecord(100, 1, page_id_).Serialize());
+  while (l_->CommittedLSN() < l_->BufferedLSN()) {
+    std::this_thread::yield();
+  }
+
+  // Act -- crash/reopen, then recover.  Force the multi-threaded worker branch
+  // so the exception thrown on a worker thread is funneled through the
+  // catch/rethrow plumbing inside ReplayPagesInParallel.
+  ASSERT_EQ(setenv("TINYLAMB_RECOVERY_WORKERS", "2", 1), 0);
+  Recover();
+  EXPECT_THROW(r_->RecoverFrom(0, tm_.get()), std::runtime_error);
+  unsetenv("TINYLAMB_RECOVERY_WORKERS");
+}
+
+TEST_F(RecoveryManagerTest, ReadLogDecodesCommittedInsert) {
+  // Arrange -- a committed insert leaves a durable log that must be readable.
+  ASSERT_TRUE(InsertRow("readable"));
+
+  // Act -- walk the log from LSN 0 looking for the insert record of the
+  // fixture page; every record must decode via ReadLog at its own offset.
+  std::uintmax_t filesize = std::filesystem::file_size(file_name_ + ".log");
+  lsn_t offset = 0;
+  bool saw_insert = false;
+  while (offset < filesize) {
+    LogRecord log;
+    ASSERT_TRUE(r_->ReadLog(offset, &log)) << "offset: " << offset;
+    if (log.type == LogType::kInsertRow && log.pid == page_id_) {
+      saw_insert = true;
+    }
+    offset += log.Size();
+  }
+
+  // Assert -- the committed insert record was reached and decoded.
+  ASSERT_TRUE(saw_insert);
+}
+
+TEST_F(RecoveryManagerTest, RecoveryTraceLogsExecuteInFreshProcess) {
+  // RecoveryTraceEnabled() caches getenv() in a process-local static, so a
+  // test that runs after the first recovery in this process can never flip it.
+  // Re-exec the current binary with only this test and the trace env set so a
+  // fresh process initializes the static to true and the trace LOG() lines in
+  // the analysis phase and PageReplay actually execute.
+  if (std::getenv("TINYLAMB_RECOVERY_TRACE") != nullptr) {
+    // Fresh process: recovery trace is active from the very first use.
+    ASSERT_TRUE(InsertRow("hoge"));
+    MediaFailure();
+    r_->RecoverFrom(0, tm_.get());
+    ASSERT_EQ(GetRowCount(), 1);
+    return;
+  }
+  const std::string self =
+      std::filesystem::read_symlink("/proc/self/exe").string();
+  const std::string filter =
+      "--gtest_filter=RecoveryManagerTest.RecoveryTraceLogsExecuteInFreshProcess";
+  const std::string cmd = "TINYLAMB_RECOVERY_TRACE=1 '" + self + "' " + filter +
+                          " --gtest_brief=1 >/dev/null 2>&1";
+  ASSERT_EQ(std::system(cmd.c_str()), 0);
+}
+
 }  // namespace tinylamb

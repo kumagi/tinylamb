@@ -222,6 +222,79 @@ TEST_F(SortedRunTest, FindOnEmptyRunIsNotExists) {
   std::ignore = std::filesystem::remove(index_file);
 }
 
+TEST_F(SortedRunTest, FindValueEqualToDeletedMarkerIsNotTombstone) {
+  // An inline value whose 8 bytes are all 0xff must not be mistaken for the
+  // deleted marker.  SortedRun::Entry stores values of up to 8 bytes inline in
+  // a union, and IsDeleted() tests value_.offset_ == kDeletedValue -- which
+  // reads the same bits as an all-0xff inline value -- so the stored value is
+  // misread as a tombstone and Find() reports kDeleted.  This test documents
+  // that bug and should turn green once IsDeleted() distinguishes inline
+  // values (value_length_ != 0) from tombstones.
+  std::filesystem::path data_file =
+      "sorted_run_ff-test-" + RandomString() + ".db";
+  std::filesystem::path index_file =
+      "sorted_run_ff-test-index-" + RandomString() + ".idx";
+  auto blob = std::make_unique<BlobFile>(data_file);
+  const std::string value(8, '\xff');
+  std::map<std::string, LSMValue> input;
+  input.emplace("key", LSMValue(value));
+  SortedRun::Construct(index_file, input, *blob, 1);
+  const SortedRun run(index_file);
+  ASSERT_SUCCESS_AND_EQ(run.Find("key", *blob), value);
+  std::ignore = std::filesystem::remove(data_file);
+  std::ignore = std::filesystem::remove(index_file);
+}
+
+TEST_F(SortedRunTest, FindDistinguishesKeysSharingTheFirstFourBytes) {
+  // Two keys of inline length (5..11) that share the same first four bytes
+  // must compare correctly.  SortedRun::Entry stores the key tail inline in
+  // an 8-byte field, copying only `length - 4` bytes and leaving the rest
+  // uninitialized; Compare() then reads that garbage tail, so the two entries
+  // are ordered wrongly and Find() misses a stored key.  This test documents
+  // that bug and should turn green once the inline tail is zero-initialized.
+  const std::string key_a("\x00\x00\x01\x10\x00\xd4", 6);
+  const std::string key_b("\x00\x00\x01\x10\xff\xff", 6);
+  std::filesystem::path data_file =
+      "sorted_run_inline-test-" + RandomString() + ".db";
+  std::filesystem::path index_file =
+      "sorted_run_inline-test-index-" + RandomString() + ".idx";
+  auto blob = std::make_unique<BlobFile>(data_file);
+  std::map<std::string, LSMValue> input;
+  input.emplace(key_a, LSMValue(std::string("\x00\x00", 2)));
+  input.emplace(key_b, LSMValue::Delete());
+  SortedRun::Construct(index_file, input, *blob, 1);
+  const SortedRun run(index_file);
+  ASSERT_SUCCESS_AND_EQ(run.Find(key_a, *blob), std::string("\x00\x00", 2));
+  std::ignore = std::filesystem::remove(data_file);
+  std::ignore = std::filesystem::remove(index_file);
+}
+
+TEST_F(SortedRunTest, InlineValueRoundTripsThroughFind) {
+  // Values of up to 8 bytes are stored inline in the Entry; every such length
+  // must be found back verbatim.  The all-0xff 8-byte value is a separate
+  // known bug covered by FindValueEqualToDeletedMarkerIsNotTombstone; this
+  // test pins the healthy inline path for ordinary payloads.
+  std::filesystem::path data_file =
+      "sorted_run_inlineval-test-" + RandomString() + ".db";
+  std::filesystem::path index_file =
+      "sorted_run_inlineval-test-index-" + RandomString() + ".idx";
+  auto blob = std::make_unique<BlobFile>(data_file);
+  std::map<std::string, LSMValue> input;
+  for (int len = 1; len <= 8; ++len) {
+    input.emplace("k" + std::to_string(len),
+                  LSMValue(std::string(len, static_cast<char>('a' + len - 1))));
+  }
+  SortedRun::Construct(index_file, input, *blob, 1);
+  const SortedRun run(index_file);
+  for (int len = 1; len <= 8; ++len) {
+    const std::string expected(len, static_cast<char>('a' + len - 1));
+    ASSERT_SUCCESS_AND_EQ(run.Find("k" + std::to_string(len), *blob),
+                          expected);
+  }
+  std::ignore = std::filesystem::remove(data_file);
+  std::ignore = std::filesystem::remove(index_file);
+}
+
 TEST_F(SortedRunTest, Delete) {
   // Arrange -- build a SortedRun with 1000 keys where i%3==0 are deletes, i%3==1 are values, i%3==2 absent
   std::filesystem::path data_file;

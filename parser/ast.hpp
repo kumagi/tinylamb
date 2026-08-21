@@ -48,6 +48,7 @@ enum class StatementType {
   kInsert,
   kUpdate,
   kDelete,
+  kAnalyze,
 };
 
 inline std::string StatementTypeName(StatementType t) {
@@ -64,6 +65,8 @@ inline std::string StatementTypeName(StatementType t) {
       return "Update";
     case StatementType::kDelete:
       return "Delete";
+    case StatementType::kAnalyze:
+      return "Analyze";
   }
   return "Unknown";
 }

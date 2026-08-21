@@ -704,7 +704,7 @@ size_t LogRecord::Size() const {
 }
 
 Encoder& operator<<(Encoder& e, const LogRecord& l) {
-  e << (uint16_t&)l.type << l.prev_lsn << l.txn_id;
+  e << static_cast<uint16_t>(l.type) << l.prev_lsn << l.txn_id;
   const uint8_t types = (l.HasPageID() ? kHasPageID : 0) |
                         (l.HasSlot() ? kHasSlot : 0) |
                         (!l.key.empty() ? kHasKey : 0);
@@ -760,7 +760,7 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
       break;
     }
     case LogType::kSystemAllocPage:
-      e << (uint64_t&)l.allocated_page_type;
+      e << static_cast<uint64_t>(l.allocated_page_type);
       break;
     case LogType::kBeginCheckpoint:
     case LogType::kCompensateInsertRow:
@@ -777,7 +777,9 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
 
 Decoder& operator>>(Decoder& d, LogRecord& l) {
   l.Clear();
-  d >> (uint16_t&)l.type >> l.prev_lsn >> l.txn_id;
+  uint16_t type_raw = 0;
+  d >> type_raw >> l.prev_lsn >> l.txn_id;
+  l.type = static_cast<LogType>(type_raw);
   uint8_t types = 0;
   d >> types;
   if ((types & kHasPageID) != 0) {

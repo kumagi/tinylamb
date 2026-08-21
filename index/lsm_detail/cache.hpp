@@ -87,17 +87,31 @@ class Cache final {
   class Lock {
    public:
     ~Lock() noexcept {
-      locked_page_->store(PageState::kUnlocked, std::memory_order_release);
+      if (locked_page_ != nullptr) {
+        locked_page_->store(PageState::kUnlocked, std::memory_order_release);
+      }
     }
     Lock(const Lock&) = delete;
     Lock& operator=(const Lock&) = delete;
-    Lock(Lock&&) = default;
-    Lock& operator=(Lock&&) = default;
+    Lock(Lock&& other) noexcept : locked_page_(other.locked_page_) {
+      other.locked_page_ = nullptr;
+    }
+    Lock& operator=(Lock&& other) noexcept {
+      if (this != &other) {
+        if (locked_page_ != nullptr) {
+          locked_page_->store(PageState::kUnlocked, std::memory_order_release);
+        }
+        locked_page_ = other.locked_page_;
+        other.locked_page_ = nullptr;
+      }
+      return *this;
+    }
 
    private:
     friend class Cache;
-    std::atomic<PageState>* locked_page_;
-    Lock(std::atomic<PageState>& target) : locked_page_(&target) {}
+    std::atomic<PageState>* locked_page_{nullptr};
+    explicit Lock(std::atomic<PageState>& target) : locked_page_(&target) {}
+    static Lock Pin(std::atomic<PageState>& target) { return Lock(target); }
   };
   typedef std::vector<Lock> Locks;
 

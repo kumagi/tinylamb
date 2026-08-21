@@ -336,6 +336,7 @@ class SqlEngineTpchTest : public ::testing::Test {
         "'1994-03-20','1994-03-25','DELIVER IN PERSON','AIR',''), "
         "(2,2,2,1,20.0,200.0,0.05,0.01,'N','F','1997-06-20',"
         "'1997-06-21','1997-06-22','DELIVER IN PERSON','MAIL','');");
+    Run(context, "ANALYZE;");
   }
 
   std::string path_;
@@ -383,14 +384,21 @@ TEST_F(SqlEngineTpchTest, ExplainReturnsPlanAndAnalyzeReturnsRuntimeProfile) {
   };
 
   const std::string plan = collect_plan("EXPLAIN ");
-  EXPECT_NE(plan.find("strategy=greedy_filtered_cardinality"),
+  EXPECT_NE(plan.find("JoinOrder=greedy_filtered_cardinality"),
             std::string::npos)
       << plan;
+  EXPECT_NE(plan.find("Relational Physical Plan"), std::string::npos) << plan;
+  EXPECT_NE(plan.find("rows~"), std::string::npos) << plan;
+  EXPECT_EQ(plan.find("rows~unknown"), std::string::npos) << plan;
   EXPECT_NE(plan.find("Planning Time:"), std::string::npos) << plan;
   EXPECT_EQ(plan.find("Execution Time:"), std::string::npos) << plan;
 
   const std::string analyzed = collect_plan("EXPLAIN ANALYZE ");
   EXPECT_NE(analyzed.find("hash_joins="), std::string::npos) << analyzed;
+  EXPECT_NE(analyzed.find("hybrid_hash_joins="), std::string::npos) << analyzed;
+  EXPECT_NE(analyzed.find("in_memory_hash_joins="), std::string::npos)
+      << analyzed;
+  EXPECT_NE(analyzed.find("Actual Joins:"), std::string::npos) << analyzed;
   EXPECT_NE(analyzed.find("Actual Rows: 2"), std::string::npos) << analyzed;
   EXPECT_NE(analyzed.find("Execution Time:"), std::string::npos) << analyzed;
   EXPECT_NE(analyzed.find("scan_ms="), std::string::npos) << analyzed;

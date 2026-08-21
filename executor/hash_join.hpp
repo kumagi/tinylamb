@@ -21,6 +21,8 @@
 #include <thread>
 
 #include "executor/executor_base.hpp"
+#include "executor/hash_join_mode.hpp"
+#include "executor/query_memory.hpp"
 #include "expression/expression.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -31,6 +33,9 @@ class HashJoin : public ExecutorBase {
  public:
   HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
            std::vector<slot_t> right_cols,
+           size_t worker_count = std::thread::hardware_concurrency());
+  HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
+           std::vector<slot_t> right_cols, HashJoinMode mode,
            size_t worker_count = std::thread::hardware_concurrency());
   HashJoin(const HashJoin&) = delete;
   HashJoin(HashJoin&&) = delete;
@@ -44,19 +49,24 @@ class HashJoin : public ExecutorBase {
   void Dump(std::ostream& o, int indent) const override;
 
   [[nodiscard]] size_t WorkerCount() const { return worker_count_; }
+  [[nodiscard]] HashJoinMode Mode() const { return mode_; }
 
  private:
   void Materialize();
+  void MaterializeInMemory();
+  void MaterializeHybrid();
 
   Executor left_;
   std::vector<slot_t> left_cols_;
   Executor right_;
   std::vector<slot_t> right_cols_;
 
+  HashJoinMode mode_{HashJoinMode::kInMemory};
   size_t worker_count_;
   bool materialized_{false};
   std::vector<std::pair<Row, RowPosition>> output_;
   size_t output_offset_{0};
+  QueryMemoryCharge output_charge_;
 };
 
 }  // namespace tinylamb

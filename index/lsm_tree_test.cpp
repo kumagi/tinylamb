@@ -468,7 +468,7 @@ TEST_F(LSMTreeTest, MergeMultipleRuns) {
 // about to reopen -- and installs an empty, broken SortedRun (FATAL "Failed to
 // open file" in SortedRun::SortedRun). Reads still work because the broken run
 // reports zero entries, but the state is corrupt. Deterministic repro:
-TEST_F(LSMTreeTest, DISABLED_MergeAllReusesSameFilePath) {
+TEST_F(LSMTreeTest, MergeAllReusesSameFilePath) {
   t_->Write("a", "1");  // small value: no blob append
   t_->Sync();           // run gen0
   t_->Write("b", "2");  // small value: no blob append

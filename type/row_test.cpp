@@ -72,4 +72,29 @@ TEST(RowTest, DeserializeProjectedKeepsOnlyRequestedColumns) {
   EXPECT_TRUE(count_star.values_.empty());
 }
 
+TEST(RowTest, SerializeRoundTripPreservesDateAndBinaryText) {
+  // Rows must round-trip every column type losslessly: a DATE, a VARCHAR that
+  // embeds NUL/0xff bytes, a double, and a NULL.  These are the shapes the
+  // row page and the secondary indexes persist.
+  const Schema schema("mixed", {Column("id", ValueType::kInt64),
+                                Column("when", ValueType::kDate),
+                                Column("blob", ValueType::kVarChar),
+                                Column("score", ValueType::kDouble),
+                                Column("note", ValueType::kVarChar)});
+  const std::string blob("\x00\x01\xff binary \x00 data", 17);
+  const Row original({Value(7), Value::Date("2021-03-04"),
+                      Value(std::string(blob)), Value(2.5), Value()});
+  std::vector<char> buffer(original.Size());
+  EXPECT_EQ(original.Serialize(buffer.data()), original.Size());
+
+  Row restored;
+  EXPECT_EQ(restored.Deserialize(buffer.data(), schema), original.Size());
+  ASSERT_EQ(restored.values_.size(), 5);
+  EXPECT_EQ(restored[0], Value(7));
+  EXPECT_EQ(restored[1], Value::Date("2021-03-04"));
+  EXPECT_EQ(restored[2], Value(std::string(blob)));
+  EXPECT_EQ(restored[3], Value(2.5));
+  EXPECT_TRUE(restored[4].IsNull());
+}
+
 }  // namespace tinylamb

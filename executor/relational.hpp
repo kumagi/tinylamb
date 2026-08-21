@@ -30,9 +30,12 @@ class RelationalExecutor : public ExecutorBase {
   size_t offset_{0};
   bool initialized_{false};
   size_t hash_joins_{0};
+  size_t hybrid_hash_joins_{0};
+  size_t in_memory_hash_joins_{0};
   size_t nested_loop_joins_{0};
   size_t join_comparisons_{0};
   size_t peak_intermediate_rows_{0};
+  size_t relation_spills_{0};
   size_t correlated_index_builds_{0};
   size_t correlated_index_probes_{0};
   size_t correlated_result_cache_hits_{0};

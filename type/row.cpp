@@ -104,14 +104,58 @@ size_t Row::DeserializeProjected(const char* src, const Schema& sc,
   for (slot_t i = 0; i < count; ++i) {
     const bool is_null =
         has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
-    Value value;
-    if (!is_null) src += value.Deserialize(src, sc.GetColumn(i).Type());
-    if (projection < columns.size() && columns[projection] == i) {
+    const bool keep =
+        projection < columns.size() && columns[projection] == i;
+    if (is_null) {
+      if (keep) {
+        values_.emplace_back();
+        ++projection;
+      }
+      continue;
+    }
+    const ValueType type = sc.GetColumn(i).Type();
+    if (keep) {
+      Value value;
+      src += value.Deserialize(src, type);
       values_.push_back(std::move(value));
       ++projection;
+    } else {
+      src += Value::SkipSerialized(src, type);
     }
   }
   return src - original_offset;
+}
+
+std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
+                                           slot_t column) {
+  constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
+  slot_t encoded_count;
+  src += DeserializeSlot(src, &encoded_count);
+  const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
+  const slot_t count = encoded_count & ~kNullBitmapFlag;
+  if (column >= count) return std::nullopt;
+  const char* bitmap = nullptr;
+  if (has_null) {
+    bitmap = src;
+    src += (count + 7) / 8;
+  }
+  for (slot_t i = 0; i < count; ++i) {
+    const bool is_null =
+        has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
+    if (i == column) {
+      if (is_null) return std::nullopt;
+      const ValueType type = sc.GetColumn(i).Type();
+      if (type != ValueType::kInt64 && type != ValueType::kDate) {
+        return std::nullopt;
+      }
+      Value value;
+      value.Deserialize(src, type);
+      return value.value.int_value;
+    }
+    if (is_null) continue;
+    src += Value::SkipSerialized(src, sc.GetColumn(i).Type());
+  }
+  return std::nullopt;
 }
 
 size_t Row::Size() const {

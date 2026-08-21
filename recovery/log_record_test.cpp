@@ -483,4 +483,133 @@ TEST_F(LogRecordTest, DecodeUnknownLogTypeAborts) {
 #endif
 }
 
+TEST_F(LogRecordTest, ThreeArgConstructorSetsFields) {
+  // Arrange + Act -- construct with explicit lsn / txn / type.
+  const LogRecord l(0xaabbccddeeff0011, 0x1122334455667788, LogType::kBegin);
+
+  // Assert -- the three keyed fields are stored verbatim.
+  EXPECT_EQ(l.type, LogType::kBegin);
+  EXPECT_EQ(l.prev_lsn, 0xaabbccddeeff0011);
+  EXPECT_EQ(l.txn_id, 0x1122334455667788);
+}
+
+TEST_F(LogRecordTest, ClearResetsAllFields) {
+  // Arrange -- a record of the widest category with every field populated.
+  LogRecord log = LogRecord::EndCheckpointLogRecord(
+      {{1, 2}, {3, 4}}, {{5, TransactionStatus::kCommitted, 6}});
+  log.pid = 123;
+  log.slot = 7;
+  log.key = "key";
+  log.undo_data = "undo";
+  log.redo_data = "redo";
+  log.redo_page = 5;
+  log.undo_page = 6;
+  log.allocated_page_type = PageType::kRowPage;
+
+  // Act -- reset the record to its empty state.
+  log.Clear();
+
+  // Assert -- every field returns to its documented default.
+  EXPECT_EQ(log.type, LogType::kUnknown);
+  EXPECT_EQ(log.prev_lsn, 0);
+  EXPECT_EQ(log.txn_id, 0);
+  EXPECT_EQ(log.pid, std::numeric_limits<page_id_t>::max());
+  EXPECT_EQ(log.slot, std::numeric_limits<slot_t>::max());
+  EXPECT_TRUE(log.key.empty());
+  EXPECT_TRUE(log.undo_data.empty());
+  EXPECT_TRUE(log.redo_data.empty());
+  EXPECT_EQ(log.redo_page, 0);
+  EXPECT_EQ(log.undo_page, 0);
+  EXPECT_TRUE(log.dirty_page_table.empty());
+  EXPECT_TRUE(log.active_transaction_table.empty());
+  EXPECT_EQ(log.allocated_page_type, PageType::kUnknown);
+  EXPECT_FALSE(log.HasPageID());
+  EXPECT_FALSE(log.HasSlot());
+}
+
+TEST_F(LogRecordTest, RoundTripAllRecordKindsWithSize) {
+  // One instance of every factory-built record kind, round-tripped through
+  // Serialize()/Decoder with Size() matching the byte count each time.
+  const std::vector<LogRecord> records{
+      LogRecord(0xaabbccddeeff0011, 0x1122334455667788, LogType::kBegin),
+      LogRecord(0xaabbccddeeff0011, 0x1122334455667788, LogType::kCommit),
+      LogRecord::InsertingLogRecord(1, 2, 3, 4, "redo"),
+      LogRecord::InsertingLeafLogRecord(1, 2, 3, "key", "redo"),
+      LogRecord::InsertingBranchLogRecord(1, 2, 3, "key", 44),
+      LogRecord::UpdatingLogRecord(1, 2, 3, 4, "redo", "undo"),
+      LogRecord::UpdatingLeafLogRecord(1, 2, 3, "key", "redo", "undo"),
+      LogRecord::UpdatingBranchLogRecord(1, 2, 3, "key", 5, 6),
+      LogRecord::DeletingLogRecord(1, 2, 3, 4, "undo"),
+      LogRecord::DeletingLeafLogRecord(1, 2, 3, "key", "undo"),
+      LogRecord::DeletingBranchLogRecord(1, 2, 3, "key", 5),
+      LogRecord::CompensatingInsertLogRecord(2, 3, 4),
+      LogRecord::CompensatingInsertLogRecord(2, 3, "key"),
+      LogRecord::CompensatingInsertBranchLogRecord(2, 3, "key"),
+      LogRecord::CompensatingUpdateLogRecord(2, 3, 4, "redo"),
+      LogRecord::CompensatingUpdateLeafLogRecord(2, 3, "key", "redo"),
+      LogRecord::CompensatingUpdateBranchLogRecord(2, 3, "key", 5),
+      LogRecord::CompensatingDeleteLogRecord(2, 3, 4, "redo"),
+      LogRecord::CompensatingDeleteLeafLogRecord(2, 3, "key", "redo"),
+      LogRecord::CompensatingDeleteBranchLogRecord(2, 3, "key", 5),
+      LogRecord::SetLowFenceLogRecord(1, 2, 3, IndexKey("redo"),
+                                      IndexKey("undo")),
+      LogRecord::SetHighFenceLogRecord(1, 2, 3, IndexKey("redo"),
+                                       IndexKey("undo")),
+      LogRecord::SetFosterLogRecord(1, 2, 3, FosterPair("new", 4),
+                                    FosterPair("old", 5)),
+      LogRecord::SetLowestLogRecord(1, 2, 3, 4, 5),
+      LogRecord::AllocatePageLogRecord(1, 2, 3, PageType::kRowPage),
+      LogRecord::DestroyPageLogRecord(1, 2, 3),
+      LogRecord::BeginCheckpointLogRecord(),
+      LogRecord::EndCheckpointLogRecord(
+          {{1, 2}, {3, 4}}, {{3, TransactionStatus::kCommitted, 4}}),
+  };
+
+  // Act + Assert -- each record round-trips byte-exactly and Size() is exact.
+  for (const auto& log : records) {
+    SCOPED_TRACE(static_cast<uint16_t>(log.type));
+    SerializeDeserializeCheck(log);
+    EXPECT_EQ(log.Serialize().size(), log.Size());
+  }
+}
+
+TEST_F(LogRecordTest, DumpPositionVariants) {
+  // Arrange -- records whose position renders from page-id only, slot only, or
+  // key only, so every branch of DumpPosition is visible in the output.
+  LogRecord page_only = LogRecord::BeginCheckpointLogRecord();
+  page_only.pid = 7;
+  LogRecord slot_only = LogRecord::CompensatingInsertLogRecord(3, 0, 9);
+  slot_only.pid = std::numeric_limits<page_id_t>::max();
+  LogRecord key_only =
+      LogRecord::CompensatingInsertLogRecord(3, 0, "the-key");
+
+  // Act -- render each position.
+  std::stringstream page_ss;
+  page_only.DumpPosition(page_ss);
+  std::stringstream slot_ss;
+  slot_only.DumpPosition(slot_ss);
+  std::stringstream key_ss;
+  key_only.DumpPosition(key_ss);
+
+  // Assert -- the page/slot/key selectors print exactly their own fields.
+  EXPECT_NE(page_ss.str().find("Page: 7"), std::string::npos);
+  EXPECT_EQ(page_ss.str().find('|'), std::string::npos);
+  EXPECT_NE(slot_ss.str().find("| 9"), std::string::npos);
+  EXPECT_NE(key_ss.str().find("the-key"), std::string::npos);
+}
+
+TEST_F(LogRecordTest, EqualityIsFieldSensitive) {
+  // Arrange -- two EndCheckpoint records that differ only in one table entry.
+  LogRecord a = LogRecord::EndCheckpointLogRecord(
+      {{1, 2}}, {{3, TransactionStatus::kCommitted, 4}});
+  LogRecord b = LogRecord::EndCheckpointLogRecord(
+      {{1, 99}}, {{3, TransactionStatus::kCommitted, 4}});
+
+  // Act + Assert -- operator== compares every field, so the LSN difference in
+  // the dirty-page table makes the records unequal while both serialize.
+  EXPECT_NE(a, b);
+  EXPECT_EQ(a.Serialize().size(), a.Size());
+  EXPECT_EQ(b.Serialize().size(), b.Size());
+}
+
 }  // namespace tinylamb

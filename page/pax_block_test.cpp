@@ -38,4 +38,34 @@ TEST(PaxBlockTest, DateUsesIntegerDaysAndCalendarArithmetic) {
   EXPECT_EQ(leap.Size(), sizeof(int64_t));
 }
 
+TEST(PaxBlockTest, PlainFallbackForHighCardinalityVarchar) {
+  const Schema schema("pax", {Column("name", ValueType::kVarChar)});
+  DataChunk chunk(schema, 64);
+  for (int64_t row = 0; row < 64; ++row) {
+    chunk.Append(Row({Value("unique_value_" + std::to_string(row) + "_" +
+                           std::string(32, 'x'))}));
+  }
+
+  const PaxBlock block = PaxBlock::Encode(chunk);
+  EXPECT_EQ(block.ColumnAt(0).Encoding(), PaxEncoding::kPlain);
+  for (size_t row = 0; row < chunk.Size(); ++row) {
+    EXPECT_EQ(block.RowAt(row), chunk.RowAt(row));
+  }
+}
+
+TEST(PaxBlockTest, PlainFallbackWithNullsPreserved) {
+  const Schema schema("pax", {Column("name", ValueType::kVarChar)});
+  DataChunk chunk(schema, 32);
+  for (int64_t row = 0; row < 32; ++row) {
+    chunk.Append(Row({row % 3 == 0 ? Value()
+                                   : Value("unique_" + std::to_string(row))}));
+  }
+
+  const PaxBlock block = PaxBlock::Encode(chunk);
+  EXPECT_EQ(block.ColumnAt(0).Encoding(), PaxEncoding::kPlain);
+  for (size_t row = 0; row < chunk.Size(); ++row) {
+    EXPECT_EQ(block.RowAt(row), chunk.RowAt(row));
+  }
+}
+
 }  // namespace tinylamb

@@ -99,7 +99,7 @@ Cache::Locks Cache::ReadAt(size_t offset, size_t length,
   locks.reserve(clamped_last >= first_page ? clamped_last - first_page + 1 : 0);
   for (size_t page = first_page; page <= clamped_last; ++page) {
     FixPage(page);
-    locks.push_back(meta_[page]);
+    locks.push_back(Lock::Pin(meta_[page]));
   }
   out = std::string_view(&buffer_[offset], take);
   return locks;
@@ -120,9 +120,15 @@ void Cache::Copy(void* dst, size_t offset, size_t length) const {
 }
 
 void Cache::Invalidate(size_t offset, size_t length) {
-  for (size_t target = offset / kBlockSize;
-       target <= (offset + length) / kBlockSize && target < max_size_;
-       ++target) {
+  if (length == 0 || offset >= max_size_ || meta_.empty()) {
+    return;
+  }
+  const size_t end = std::min(offset + length, max_size_);
+  const size_t first_page = offset / kBlockSize;
+  const size_t last_page = (end - 1) / kBlockSize;
+  const size_t last_valid = meta_.size() - 1;
+  const size_t clamped_last = std::min(last_page, last_valid);
+  for (size_t target = first_page; target <= clamped_last; ++target) {
     InvalidatePage(target);
   }
 }
@@ -140,6 +146,7 @@ size_t Cache::FindMetaPage(std::atomic<PageState>* page_ptr) const {
 }
 
 void Cache::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
+  size_t scanned_locked = 0;
   while (small_queue_.size() == small_queue_size_) {
     std::atomic<PageState>* dequeued = small_queue_.front();
     small_queue_.pop_front();
@@ -148,12 +155,20 @@ void Cache::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
       PageState prev = dequeued->load();
       switch (prev) {
         case PageState::kLocked: {
-          EnqueueToSmallFifo(dequeued);
+          // Pinned pages cannot be evicted; rotate and keep looking. If every
+          // resident small-fifo page is pinned, allow a temporary overflow.
+          small_queue_.push_back(dequeued);
+          ++scanned_locked;
+          if (scanned_locked >= small_queue_size_) {
+            scanned_locked = 0;
+            goto enqueue_small;
+          }
           dequeued = small_queue_.front();
           small_queue_.pop_front();
           continue;
         }
         case PageState::kUnlocked: {
+          scanned_locked = 0;
           if (!dequeued->compare_exchange_weak(prev, PageState::kMarked,
                                                std::memory_order_relaxed,
                                                std::memory_order_relaxed)) {
@@ -164,6 +179,7 @@ void Cache::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
           break;
         }
         case PageState::kLockedAccessed:
+          scanned_locked = 0;
           if (!dequeued->compare_exchange_weak(prev, PageState::kLocked,
                                                std::memory_order_relaxed,
                                                std::memory_order_relaxed)) {
@@ -172,6 +188,7 @@ void Cache::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
           EnqueueToMainFifo(dequeued);
           break;
         case PageState::kUnlockedAccessed:
+          scanned_locked = 0;
           if (!dequeued->compare_exchange_weak(prev, PageState::kUnlocked,
                                                std::memory_order_relaxed,
                                                std::memory_order_relaxed)) {
@@ -194,11 +211,12 @@ void Cache::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
       break;
     }
   }
+enqueue_small:
   small_queue_.push_back(page_ptr);
-  assert(small_queue_.size() <= small_queue_size_);
 }
 
 void Cache::EnqueueToMainFifo(std::atomic<PageState>* page_ptr) const {
+  size_t scanned_locked = 0;
   while (main_queue_.size() >= main_queue_size_) {
     std::atomic<PageState>* dequeued = main_queue_.front();
     main_queue_.pop_front();
@@ -206,12 +224,19 @@ void Cache::EnqueueToMainFifo(std::atomic<PageState>* page_ptr) const {
     for (;;) {
       PageState prev = dequeued->load(std::memory_order_acquire);
       switch (prev) {
-        case PageState::kLocked:
-          EnqueueToMainFifo(dequeued);
+        case PageState::kLocked: {
+          main_queue_.push_back(dequeued);
+          ++scanned_locked;
+          if (scanned_locked >= main_queue_size_) {
+            scanned_locked = 0;
+            goto enqueue_main;
+          }
           dequeued = main_queue_.front();
           main_queue_.pop_front();
           continue;
+        }
         case PageState::kUnlocked:
+          scanned_locked = 0;
           if (!dequeued->compare_exchange_weak(prev, PageState::kEvicted,
                                                std::memory_order_relaxed,
                                                std::memory_order_relaxed)) {
@@ -220,6 +245,7 @@ void Cache::EnqueueToMainFifo(std::atomic<PageState>* page_ptr) const {
           Release(FindMetaPage(dequeued));
           break;
         case PageState::kLockedAccessed:
+          scanned_locked = 0;
           if (!dequeued->compare_exchange_weak(prev, PageState::kLocked,
                                                std::memory_order_relaxed,
                                                std::memory_order_relaxed)) {
@@ -228,6 +254,7 @@ void Cache::EnqueueToMainFifo(std::atomic<PageState>* page_ptr) const {
           EnqueueToMainFifo(dequeued);
           break;
         case PageState::kUnlockedAccessed:
+          scanned_locked = 0;
           if (!dequeued->compare_exchange_weak(prev, PageState::kUnlocked,
                                                std::memory_order_relaxed,
                                                std::memory_order_relaxed)) {
@@ -252,8 +279,8 @@ void Cache::EnqueueToMainFifo(std::atomic<PageState>* page_ptr) const {
       break;
     }
   }
+enqueue_main:
   main_queue_.push_back(page_ptr);
-  assert(main_queue_.size() <= main_queue_size_);
 }
 
 void Cache::EnqueueToGhostFifo(std::atomic<PageState>* page_ptr) const {

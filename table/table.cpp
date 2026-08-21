@@ -287,11 +287,28 @@ Iterator Table::BeginFullScan(Transaction& txn,
   return Iterator(new FullScanIterator(this, &txn, projection));
 }
 
+Iterator Table::BeginFullScan(Transaction& txn,
+                              const std::vector<slot_t>& projection,
+                              const std::unordered_set<int64_t>* key_filter,
+                              slot_t key_column) const {
+  return Iterator(new FullScanIterator(this, &txn, projection, key_filter,
+                                       key_column));
+}
+
+Iterator Table::BeginFullScan(Transaction& txn,
+                              const std::unordered_set<int64_t>* key_filter,
+                              slot_t key_column) const {
+  return Iterator(new FullScanIterator(this, &txn, std::nullopt, key_filter,
+                                       key_column));
+}
+
 Iterator Table::BeginMorselScan(
     Transaction& txn, const ScanMorsel& pages,
-    std::optional<std::vector<slot_t>> projection) const {
-  return Iterator(
-      new FullScanIterator(this, &txn, pages, std::move(projection)));
+    std::optional<std::vector<slot_t>> projection,
+    const std::unordered_set<int64_t>* key_filter,
+    std::optional<slot_t> key_column) const {
+  return Iterator(new FullScanIterator(this, &txn, pages, std::move(projection),
+                                       key_filter, key_column));
 }
 
 std::vector<Table::ScanMorsel> Table::BuildScanMorsels(

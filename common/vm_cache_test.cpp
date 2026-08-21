@@ -553,12 +553,10 @@ TEST_F(VMCacheTest, InvalidateBeyondFileEndIsClamped) {
   }
 }
 
-// DISABLED_: crashes the binary via VMCacheImpl::SanityCheck() FATAL
-// "Duplicate: 0" (page 0 ends up in two queues simultaneously) after the
-// Invalidate(0)+Read+Invalidate(0)+Read reload sequence. Likely a production
-// bug in the reworked eviction/invalidate logic (vm_cache_impl.cpp).
-// Re-enable once vm_cache_impl.cpp is fixed.
-TEST_F(VMCacheTest, DISABLED_InvalidateMarkedAndUnlockedPagesThenReload) {
+// Invalidate marked (ghost) and unlocked (small) pages, then reload them.
+// Invalidate must drop the page from every FIFO so a later FixPage enqueue
+// cannot trip SanityCheck's duplicate detection.
+TEST_F(VMCacheTest, InvalidateMarkedAndUnlockedPagesThenReload) {
   // Arrange -- a 20-page budget (small queue capacity 2, ghost capacity 18).
   constexpr size_t kPages = 4;
   constexpr size_t kCount = kPages * 1024;
@@ -599,11 +597,11 @@ TEST_F(VMCacheTest, DISABLED_InvalidateMarkedAndUnlockedPagesThenReload) {
   cache.Read(&data, 1, 1);
   ASSERT_EQ(data, Expected<int32_t>(1));
 
-  // Assert -- the surviving ghost page 1 revives through the main queue and
-  // every page still returns the deterministic data.
+  // Assert -- ghost hit on page 1 revives into the main queue; page 0 stays in
+  // small with page 2 (small capacity is 2). Data must still round-trip.
   cache.Read(&data, 1025, 1);
   ASSERT_EQ(data, Expected<int32_t>(1025));
-  EXPECT_EQ(cache.Dump(), "[0] {1} [2]");
+  EXPECT_EQ(cache.Dump(), "[2, 0] {1} []");
   for (size_t i = 0; i < kCount; ++i) {
     cache.Read(&data, i, 1);
     ASSERT_EQ(data, Expected<int32_t>(i));
@@ -914,6 +912,553 @@ TEST_F(VMCacheTest, ZeroCapacityConstructorLogsFatalButDoesNotAbort) {
   // never be used for actual reads.
   VMCache<int32_t> zero(fd_, 0);
   SUCCEED();
+}
+
+TEST(VMCacheInvalidFd, ConstructorLogsFileSizeFailure) {
+  // Arrange/Act/Assert -- an invalid fd makes VMCacheImpl::FileSize() fail
+  // (logging a non-fatal FATAL line) and return -1, which expands max_size_ to
+  // SIZE_MAX.  The meta_ allocation then throws, proving the error path ran.
+  // The exception propagates out of the constructor and is caught here.
+  try {
+    VMCache<int32_t> cache(-1, 4096);
+    FAIL() << "meta_ allocation should throw after FileSize() failure";
+  } catch (const std::exception&) {
+    SUCCEED();
+  }
+}
+
+TEST_F(VMCacheTest, InvalidateZeroLengthIsNoop) {
+  // Arrange -- a single-page cache.
+  constexpr size_t kCount = 1024;
+  auto cache = MakeCache<int32_t>(kCount);
+
+  // Act -- warm the page, then invalidate zero-length ranges.
+  int32_t data;
+  cache->Read(&data, 0, 1);
+  ASSERT_EQ(data, Expected<int32_t>(0));
+  cache->Invalidate(0, 0);
+  cache->Invalidate(512, 0);
+  cache->Invalidate(1023, 0);
+
+  // Assert -- nothing was invalidated; the cache still serves every element.
+  for (size_t i = 0; i < 4; ++i) {
+    cache->Read(&data, i * 256, 1);
+    ASSERT_EQ(data, Expected<int32_t>(i * 256));
+  }
+}
+
+TEST_F(VMCacheTest, InvalidateSpanningMultipleResidentPages) {
+  // Arrange -- a three-page cache with all three pages resident.
+  constexpr size_t kCount = 3 * 1024;
+  auto cache = MakeCache<int32_t>(kCount);
+  int32_t data;
+  for (size_t page = 0; page < 3; ++page) {
+    cache->Read(&data, page * 1024, 1);
+    ASSERT_EQ(data, Expected<int32_t>(page * 1024));
+  }
+
+  // Act -- invalidate a range covering all three resident pages at once.
+  cache->Invalidate(0, kCount);
+
+  // Assert -- every element transparently reloads from the file afterwards.
+  for (size_t i = 0; i < kCount; ++i) {
+    cache->Read(&data, i, 1);
+    ASSERT_EQ(data, Expected<int32_t>(i));
+  }
+}
+
+TEST_F(VMCacheTest, SingleReadSpanningManyPagesWithTinyCache) {
+  // Arrange -- 64 pages of data behind a 2-page memory budget.
+  constexpr size_t kPages = 64;
+  constexpr size_t kCount = kPages * 1024;
+  path_ = "vm_cache_test-" + RandomString();
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0666);
+  std::vector<int32_t> value(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    value[i] = Expected<int32_t>(i);
+  }
+  size_t remaining = value.size() * sizeof(int32_t);
+  size_t written = 0;
+  while (0 < remaining) {
+    ssize_t wrote =
+        ::write(fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
+    ASSERT_LT(0, wrote);
+    written += wrote;
+    remaining -= wrote;
+  }
+  ::fsync(fd_);
+  VMCache<int32_t> cache(fd_, 2 * 4096);
+
+  // Act -- a single Read that spans all 64 pages, forcing ~62 evictions and
+  // reloads from inside the Read loop itself.
+  std::vector<int32_t> buffer(kCount);
+  cache.Read(buffer.data(), 0, kCount);
+
+  // Assert -- every element across the whole span is correct.
+  for (size_t i = 0; i < kCount; ++i) {
+    ASSERT_EQ(buffer[i], Expected<int32_t>(i));
+  }
+}
+
+TEST_F(VMCacheTest, OffsetConstructorWithEvictionPressure) {
+  // Arrange -- 100 padding bytes followed by 16 pages of data, served through
+  // a 2-page cache whose offset_ is 100 so every pread lands at offset+100.
+  constexpr size_t kOffset = 100;
+  constexpr size_t kPages = 16;
+  constexpr size_t kCount = kPages * 1024;
+  path_ = "vm_cache_test-" + RandomString();
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0666);
+  std::string padding(kOffset, 'x');
+  ASSERT_EQ(::write(fd_, padding.data(), padding.size()),
+            static_cast<ssize_t>(kOffset));
+  std::vector<int32_t> value(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    value[i] = Expected<int32_t>(i);
+  }
+  size_t remaining = value.size() * sizeof(int32_t);
+  size_t written = 0;
+  while (0 < remaining) {
+    ssize_t wrote =
+        ::write(fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
+    ASSERT_LT(0, wrote);
+    written += wrote;
+    remaining -= wrote;
+  }
+  ::fsync(fd_);
+  VMCache<int32_t> cache(fd_, 2 * 4096, kOffset);
+
+  // Act -- touch every page twice (unaligned then aligned) so pages churn
+  // through both the kUnlocked and accessed eviction paths.
+  int32_t data;
+  for (size_t page = 0; page < kPages; ++page) {
+    cache.Read(&data, page * 1024 + 7, 1);
+    ASSERT_EQ(data, Expected<int32_t>(page * 1024 + 7));
+    cache.Read(&data, page * 1024, 1);
+    ASSERT_EQ(data, Expected<int32_t>(page * 1024));
+  }
+}
+
+TEST_F(VMCacheTest, GhostHitPromotesToMainQueueWithExactDump) {
+  // Arrange -- a 3-page budget (small=1, main=2, ghost=2).
+  constexpr size_t kPages = 6;
+  constexpr size_t kCount = kPages * 1024;
+  path_ = "vm_cache_test-" + RandomString();
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0666);
+  std::vector<int32_t> value(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    value[i] = Expected<int32_t>(i);
+  }
+  size_t remaining = value.size() * sizeof(int32_t);
+  size_t written = 0;
+  while (0 < remaining) {
+    ssize_t wrote =
+        ::write(fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
+    ASSERT_LT(0, wrote);
+    written += wrote;
+    remaining -= wrote;
+  }
+  ::fsync(fd_);
+  VMCache<int32_t> cache(fd_, 3 * 4096);
+
+  int32_t data;
+  auto read1 = [&](size_t offset) {
+    cache.Read(&data, offset, 1);
+    return data;
+  };
+
+  // Act -- single-touch non-aligned reads leave pages kUnlocked so they churn
+  // through the small -> ghost FIFO chain with exact queue transitions.
+  ASSERT_EQ(read1(1), Expected<int32_t>(1));
+  EXPECT_EQ(cache.Dump(), "[0] {} []");
+  ASSERT_EQ(read1(1025), Expected<int32_t>(1025));
+  EXPECT_EQ(cache.Dump(), "[1] {} [0]");
+  ASSERT_EQ(read1(2049), Expected<int32_t>(2049));
+  EXPECT_EQ(cache.Dump(), "[2] {} [0, 1]");
+
+  // Act -- re-reading the kMarked ghost page revives it directly into the main
+  // queue (vm_cache_impl erases it from the ghost FIFO and enqueues to main).
+  ASSERT_EQ(read1(1), Expected<int32_t>(1));
+  EXPECT_EQ(cache.Dump(), "[2] {0} [1]");
+
+  // Act -- loading page 3 evicts the small-queue front into the ghost FIFO.
+  ASSERT_EQ(read1(3073), Expected<int32_t>(3073));
+  EXPECT_EQ(cache.Dump(), "[3] {0} [1, 2]");
+
+  // Assert -- every element still round-trips after the queue transitions.
+  for (size_t i = 0; i < kCount; ++i) {
+    cache.Read(&data, i, 1);
+    ASSERT_EQ(data, Expected<int32_t>(i));
+  }
+}
+
+TEST_F(VMCacheTest, AlignedAndUnalignedInterleavedChurn) {
+  // Arrange -- a 3-page budget and 12 pages of data.
+  constexpr size_t kPages = 12;
+  constexpr size_t kCount = kPages * 1024;
+  path_ = "vm_cache_test-" + RandomString();
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0666);
+  std::vector<int32_t> value(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    value[i] = Expected<int32_t>(i);
+  }
+  size_t remaining = value.size() * sizeof(int32_t);
+  size_t written = 0;
+  while (0 < remaining) {
+    ssize_t wrote =
+        ::write(fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
+    ASSERT_LT(0, wrote);
+    written += wrote;
+    remaining -= wrote;
+  }
+  ::fsync(fd_);
+  VMCache<int32_t> cache(fd_, 3 * 4096);
+
+  // Act -- alternate aligned reads (which fix each page twice and leave it
+  // accessed) with unaligned reads (which fix each page once) under heavy
+  // eviction pressure.
+  int32_t data;
+  for (size_t page = 0; page < kPages; ++page) {
+    cache.Read(&data, page * 1024, 1);
+    ASSERT_EQ(data, Expected<int32_t>(page * 1024));
+    cache.Read(&data, page * 1024 + 5, 1);
+    ASSERT_EQ(data, Expected<int32_t>(page * 1024 + 5));
+  }
+
+  // Assert -- the queues stay duplicate-free and all data remains intact.
+  EXPECT_EQ(cache.Dump().front(), '[');
+  for (size_t i = 0; i < kCount; ++i) {
+    cache.Read(&data, i, 1);
+    ASSERT_EQ(data, Expected<int32_t>(i));
+  }
+}
+
+TEST_F(VMCacheTest, RepeatedInvalidateAndReloadCycles) {
+  // Arrange -- a 3-page budget and 4 pages of data.
+  constexpr size_t kPages = 4;
+  constexpr size_t kCount = kPages * 1024;
+  path_ = "vm_cache_test-" + RandomString();
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0666);
+  std::vector<int32_t> value(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    value[i] = Expected<int32_t>(i);
+  }
+  size_t remaining = value.size() * sizeof(int32_t);
+  size_t written = 0;
+  while (0 < remaining) {
+    ssize_t wrote =
+        ::write(fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
+    ASSERT_LT(0, wrote);
+    written += wrote;
+    remaining -= wrote;
+  }
+  ::fsync(fd_);
+  VMCache<int32_t> cache(fd_, 3 * 4096);
+
+  // Act -- repeatedly warm all four pages (kUnlocked/accessed), invalidate the
+  // entire address space, then reload.  Invalidate must drop every page from
+  // all three FIFOs each round so SanityCheck never sees a duplicate.
+  int32_t data;
+  for (int round = 0; round < 8; ++round) {
+    for (size_t page = 0; page < kPages; ++page) {
+      cache.Read(&data, page * 1024 + 3, 1);
+      ASSERT_EQ(data, Expected<int32_t>(page * 1024 + 3));
+    }
+    cache.Invalidate(0, kCount);
+    for (size_t i = 0; i < kCount; ++i) {
+      cache.Read(&data, i, 1);
+      ASSERT_EQ(data, Expected<int32_t>(i));
+    }
+    EXPECT_EQ(cache.Dump().front(), '[');
+  }
+}
+
+// A page touched exactly once (non-aligned read) stays kUnlocked, so evictions
+// churn through the small -> ghost FIFO chain.  Revived ghost pages are
+// re-enqueued into the MAIN queue (kUnlocked).  When the main FIFO fills with
+// such revived pages, the next accessed page promoted from the small FIFO
+// evicts the oldest revived page (kUnlocked -> kEvicted in
+// EnqueueToMainFifo).
+TEST_F(VMCacheTest, GhostRevivedPagesInMainQueueAreEvictedUnderAccessPressure) {
+  // Arrange -- a 5-page budget (small=1, main=4, ghost=4).
+  constexpr size_t kPages = 7;
+  constexpr size_t kCount = kPages * 1024;
+  path_ = "vm_cache_test-" + RandomString();
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0666);
+  std::vector<int32_t> value(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    value[i] = Expected<int32_t>(i);
+  }
+  size_t remaining = value.size() * sizeof(int32_t);
+  size_t written = 0;
+  while (0 < remaining) {
+    ssize_t wrote =
+        ::write(fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
+    ASSERT_LT(0, wrote);
+    written += wrote;
+    remaining -= wrote;
+  }
+  ::fsync(fd_);
+  VMCache<int32_t> cache(fd_, 5 * 4096);
+
+  // Act -- touch pages 0..4 once (non-aligned, kUnlocked) so pages 0..3 land
+  // in the ghost FIFO while page 4 stays in the small FIFO.
+  int32_t data;
+  auto read1 = [&](size_t offset) {
+    cache.Read(&data, offset, 1);
+    return data;
+  };
+  for (size_t page = 0; page < 5; ++page) {
+    read1(page * 1024 + 3);
+  }
+  ASSERT_EQ(cache.Dump(), "[4] {} [0, 1, 2, 3]");
+
+  // Act -- revive pages 0..3; each kMarked ghost page is moved to the main
+  // queue (kUnlocked).
+  for (size_t page = 0; page < 4; ++page) {
+    read1(page * 1024 + 3);
+  }
+  ASSERT_EQ(cache.Dump(), "[4] {0, 1, 2, 3} []");
+
+  // Act -- make page 5 accessed (kUnlockedAccessed), then read page 6; the
+  // small FIFO promotes page 5 into the full main queue, evicting page 0.
+  read1(5 * 1024 + 3);
+  read1(5 * 1024 + 3);
+  ASSERT_EQ(cache.Dump(), "[5] {0, 1, 2, 3} [4]");
+  read1(6 * 1024 + 3);
+
+  // Assert -- the oldest revived page was evicted from the main queue.
+  ASSERT_EQ(cache.Dump(), "[6] {1, 2, 3, 5} [4]");
+
+  // Assert -- all data survives the main-queue evictions.
+  for (size_t i = 0; i < kCount; ++i) {
+    cache.Read(&data, i, 1);
+    ASSERT_EQ(data, Expected<int32_t>(i));
+  }
+}
+
+// Invalidate() of an accessed page resident in the MAIN queue removes it from
+// the queue and flips it to kEvicted; the next read reloads it as a fresh page
+// (small FIFO) and evicts the small-FIFO front into the main queue.
+TEST_F(VMCacheTest, InvalidateAccessedPageResidentInMainQueue) {
+  // Arrange -- a 5-page budget (small=1, main=4, ghost=4).
+  constexpr size_t kPages = 5;
+  constexpr size_t kCount = kPages * 1024;
+  path_ = "vm_cache_test-" + RandomString();
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0666);
+  std::vector<int32_t> value(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    value[i] = Expected<int32_t>(i);
+  }
+  size_t remaining = value.size() * sizeof(int32_t);
+  size_t written = 0;
+  while (0 < remaining) {
+    ssize_t wrote =
+        ::write(fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
+    ASSERT_LT(0, wrote);
+    written += wrote;
+    remaining -= wrote;
+  }
+  ::fsync(fd_);
+  VMCache<int32_t> cache(fd_, 5 * 4096);
+
+  // Act -- aligned reads fix each page twice (accessed), so pages 0..2 promote
+  // to the main queue and pages 3..4 churn through the small FIFO.
+  int32_t data;
+  auto read1 = [&](size_t offset) {
+    cache.Read(&data, offset, 1);
+    return data;
+  };
+  for (size_t page = 0; page < 3; ++page) {
+    read1(page * 1024);
+    read1(page * 1024);
+  }
+  read1(3 * 1024);
+  read1(4 * 1024);
+  ASSERT_EQ(cache.Dump(), "[4] {0, 1, 2, 3} []");
+
+  // Act -- invalidate the page-0 element range; page 0 leaves the main queue.
+  cache.Invalidate(0, 1024);
+  ASSERT_EQ(cache.Dump(), "[4] {1, 2, 3} []");
+
+  // Act -- re-read element 0; the fresh page 0 enters the small FIFO and the
+  // small-FIFO front (page 4) is promoted into the main queue.
+  ASSERT_EQ(read1(0), Expected<int32_t>(0));
+  ASSERT_EQ(cache.Dump(), "[0] {1, 2, 3, 4} []");
+
+  // Assert -- all data remains correct after the invalidate/reload cycle.
+  for (size_t i = 0; i < kCount; ++i) {
+    cache.Read(&data, i, 1);
+    ASSERT_EQ(data, Expected<int32_t>(i));
+  }
+}
+
+// An ALIGNED read at a page start has a zero-length first chunk, so it fixes
+// the page twice (kLocked -> kUnlocked -> kLockedAccessed -> kUnlockedAccessed)
+// and the page is treated as accessed: on eviction it is promoted to the main
+// queue instead of the ghost queue.
+TEST_F(VMCacheTest, AlignedReadIsAccessedAndEvictsToMainQueue) {
+  // Arrange -- a 3-page budget (small=1, main=2, ghost=2).
+  constexpr size_t kCount = 3 * 1024;
+  path_ = "vm_cache_test-" + RandomString();
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0666);
+  std::vector<int32_t> value(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    value[i] = Expected<int32_t>(i);
+  }
+  size_t remaining = value.size() * sizeof(int32_t);
+  size_t written = 0;
+  while (0 < remaining) {
+    ssize_t wrote =
+        ::write(fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
+    ASSERT_LT(0, wrote);
+    written += wrote;
+    remaining -= wrote;
+  }
+  ::fsync(fd_);
+  VMCache<int32_t> cache(fd_, 3 * 4096);
+
+  // Act -- one aligned read of page 0 is enough to mark it accessed.
+  int32_t data;
+  auto read1 = [&](size_t offset) {
+    cache.Read(&data, offset, 1);
+    return data;
+  };
+  read1(0);
+  ASSERT_EQ(cache.Dump(), "[0] {} []");
+
+  // Act -- the unaligned read of page 1 overflows the small FIFO; accessed
+  // page 0 is promoted to the main queue, not evicted to the ghost queue.
+  read1(1025);
+  ASSERT_EQ(cache.Dump(), "[1] {0} []");
+
+  // Act -- page 2's enqueue demotes page 1 (kUnlocked, single fix) to the
+  // ghost queue.
+  read1(2049);
+  ASSERT_EQ(cache.Dump(), "[2] {0} [1]");
+
+  // Assert -- all data still round-trips.
+  for (size_t i = 0; i < kCount; ++i) {
+    cache.Read(&data, i, 1);
+    ASSERT_EQ(data, Expected<int32_t>(i));
+  }
+}
+
+// An UNALIGNED read fixes the page exactly once (kLocked -> kUnlocked), so the
+// page stays "cold" and is evicted into the ghost queue on FIFO overflow.
+TEST_F(VMCacheTest, UnalignedReadStaysUnlockedAndEvictsToGhostQueue) {
+  // Arrange -- a 3-page budget (small=1, main=2, ghost=2).
+  constexpr size_t kCount = 3 * 1024;
+  path_ = "vm_cache_test-" + RandomString();
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0666);
+  std::vector<int32_t> value(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    value[i] = Expected<int32_t>(i);
+  }
+  size_t remaining = value.size() * sizeof(int32_t);
+  size_t written = 0;
+  while (0 < remaining) {
+    ssize_t wrote =
+        ::write(fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
+    ASSERT_LT(0, wrote);
+    written += wrote;
+    remaining -= wrote;
+  }
+  ::fsync(fd_);
+  VMCache<int32_t> cache(fd_, 3 * 4096);
+
+  // Act -- three non-aligned single-touch reads churn through small -> ghost.
+  int32_t data;
+  auto read1 = [&](size_t offset) {
+    cache.Read(&data, offset, 1);
+    return data;
+  };
+  read1(3);
+  ASSERT_EQ(cache.Dump(), "[0] {} []");
+  read1(1027);
+  ASSERT_EQ(cache.Dump(), "[1] {} [0]");
+  read1(2051);
+  ASSERT_EQ(cache.Dump(), "[2] {} [0, 1]");
+
+  // Assert -- the ghost pages transparently reload with the right data.
+  ASSERT_EQ(read1(3), Expected<int32_t>(3));
+  ASSERT_EQ(read1(1027), Expected<int32_t>(1027));
+}
+
+// A zero-length Read never fixes a page: the buffer contents stay untouched and
+// the queue layout is unchanged.
+TEST_F(VMCacheTest, ReadZeroLengthDoesNotTouchPages) {
+  // Arrange -- a single-page cache.
+  constexpr size_t kCount = 1024;
+  auto cache = MakeCache<int32_t>(kCount);
+
+  // Act -- warm page 0, then issue zero-length reads and invalidations.
+  int32_t data = -1;
+  cache->Read(&data, 0, 1);
+  ASSERT_EQ(data, Expected<int32_t>(0));
+  ASSERT_EQ(cache->Dump(), "[0] {} []");
+  cache->Read(&data, 0, 0);
+  cache->Read(&data, 512, 0);
+  cache->Invalidate(0, 0);
+  cache->Invalidate(512, 0);
+
+  // Assert -- the resident page and buffer are untouched.
+  ASSERT_EQ(cache->Dump(), "[0] {} []");
+  cache->Read(&data, 0, 1);
+  ASSERT_EQ(data, Expected<int32_t>(0));
+}
+
+// Invalidate() of a range covering every resident page must drop those pages
+// from all three FIFOs, leaving a completely empty cache.
+TEST_F(VMCacheTest, InvalidateWholeFileClearsAllQueues) {
+  // Arrange -- a 5-page budget (small=1, main=4, ghost=4).
+  constexpr size_t kPages = 7;
+  constexpr size_t kCount = kPages * 1024;
+  path_ = "vm_cache_test-" + RandomString();
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0666);
+  std::vector<int32_t> value(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    value[i] = Expected<int32_t>(i);
+  }
+  size_t remaining = value.size() * sizeof(int32_t);
+  size_t written = 0;
+  while (0 < remaining) {
+    ssize_t wrote =
+        ::write(fd_, reinterpret_cast<char*>(value.data()) + written, remaining);
+    ASSERT_LT(0, wrote);
+    written += wrote;
+    remaining -= wrote;
+  }
+  ::fsync(fd_);
+  VMCache<int32_t> cache(fd_, 5 * 4096);
+
+  // Act -- populate the small, main and ghost queues.
+  int32_t data;
+  auto read1 = [&](size_t offset) {
+    cache.Read(&data, offset, 1);
+    return data;
+  };
+  for (size_t page = 0; page < 5; ++page) {
+    read1(page * 1024 + 3);
+  }
+  for (size_t page = 0; page < 4; ++page) {
+    read1(page * 1024 + 3);
+  }
+  read1(5 * 1024 + 3);
+  read1(5 * 1024 + 3);
+  read1(6 * 1024 + 3);
+  ASSERT_EQ(cache.Dump(), "[6] {1, 2, 3, 5} [4]");
+
+  // Act -- invalidate the whole file.
+  cache.Invalidate(0, kCount);
+
+  // Assert -- every queue is empty.
+  ASSERT_EQ(cache.Dump(), "[] {} []");
+
+  // Assert -- the data still reloads correctly from the file.
+  for (size_t i = 0; i < kCount; ++i) {
+    cache.Read(&data, i, 1);
+    ASSERT_EQ(data, Expected<int32_t>(i));
+  }
 }
 
 }  // namespace

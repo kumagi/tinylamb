@@ -385,4 +385,88 @@ TEST(GoogleSqlAstTest, UnsupportedConstructsThrow) {
   EXPECT_THROW(VisitSqlOrThrow("DROP DATABASE t;"), std::runtime_error);
 }
 
+namespace {
+
+template <typename Fn>
+std::string ThrowMessage(Fn&& fn) {
+  try {
+    fn();
+  } catch (const std::runtime_error& e) {
+    return e.what();
+  }
+  return {};
+}
+
+}  // namespace
+
+TEST(GoogleSqlAstTest, BacktickIdentifiersAreDecoded) {
+  // The GoogleSQL AST keeps backticks in the Identifier detail for names that
+  // are not plain identifiers (for example names containing a space). The
+  // visitor must strip them both for columns, aliases, and table paths.
+  auto statement =
+      VisitSql("SELECT `my col` AS `alias name` FROM `table name`;");
+  ASSERT_TRUE(statement);
+  ASSERT_EQ(statement->Type(), StatementType::kSelect);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_EQ(select.SelectList().size(), 1);
+  EXPECT_EQ(select.SelectList()[0].name, "alias name");
+  EXPECT_EQ(select.SelectList()[0].expression->ToString(), "my col");
+  ASSERT_EQ(select.FromClause().size(), 1);
+  EXPECT_EQ(select.FromClause()[0], "table name");
+}
+
+TEST(GoogleSqlAstTest, TripleQuotedStringDecodesEmbeddedQuote) {
+  // GoogleSQL allows a triple-quoted string literal that contains an escaped
+  // single quote (''), which the visitor must decode into one quote character.
+  auto statement = VisitSql("SELECT '''a''b''';");
+  ASSERT_TRUE(statement);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_EQ(select.SelectList().size(), 1);
+  EXPECT_EQ(select.SelectList()[0].expression->AsConstantValue().GetValue(),
+            Value("'a'b'"));
+}
+
+TEST(GoogleSqlAstTest, InsertSelectWithoutValuesThrows) {
+  // INSERT ... SELECT parses into an InsertStatement with a Query child but no
+  // InsertValuesRowList; the visitor rejects it because only VALUES rows are
+  // supported.
+  const std::string message =
+      ThrowMessage([] { VisitSqlOrThrow("INSERT INTO t SELECT * FROM s;"); });
+  EXPECT_NE(message.find("INSERT VALUES required"), std::string::npos)
+      << message;
+}
+
+TEST(GoogleSqlAstTest, TableValuedFunctionSourceThrows) {
+  // A table-valued function in FROM parses into a TVF node, which is not a
+  // recognized table source kind.
+  const std::string message =
+      ThrowMessage([] { VisitSqlOrThrow("SELECT * FROM my_func(1);"); });
+  EXPECT_NE(message.find("unsupported table source TVF"), std::string::npos)
+      << message;
+}
+
+TEST(GoogleSqlAstTest, UnsupportedStatementKindsThrow) {
+  // Statements beyond SELECT / CREATE TABLE / INSERT / UPDATE / DELETE / DROP
+  // TABLE have no translation and must be rejected explicitly.
+  for (const char* sql : {"EXPLAIN SELECT 1;", "SHOW TABLES;", "BEGIN;",
+                          "COMMIT;", "CREATE INDEX i ON t(a);",
+                          "ALTER TABLE t ADD COLUMN b INT64;",
+                          "CREATE VIEW v AS SELECT 1;", "DESCRIBE t;"}) {
+    const std::string message = ThrowMessage([sql] { VisitSqlOrThrow(sql); });
+    EXPECT_NE(message.find("unsupported statement"), std::string::npos)
+        << sql << "\n" << message;
+  }
+}
+
+TEST(GoogleSqlAstTest, UnsupportedExpressionKindsThrow) {
+  // Expression node kinds without a mapping must be rejected with a precise
+  // diagnostic instead of silently producing a malformed plan.
+  for (const char* sql : {"SELECT t.* FROM t;", "SELECT a[0] FROM t;",
+                          "SELECT f(x => 1);"}) {
+    const std::string message = ThrowMessage([sql] { VisitSqlOrThrow(sql); });
+    EXPECT_NE(message.find("unsupported expression"), std::string::npos)
+        << sql << "\n" << message;
+  }
+}
+
 }  // namespace tinylamb
