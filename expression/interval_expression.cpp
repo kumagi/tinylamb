@@ -2,29 +2,33 @@
 #include "expression/interval_expression.hpp"
 
 #include <ostream>
+#include "type/value.hpp"
+#include "expression/expression.hpp"
+#include <string>
+#include "type/type.hpp"
 
 namespace tinylamb {
 
-Value IntervalExpression::Evaluate(const Row&, const Schema&) const {
-  return Value(std::to_string(amount_) + " " + unit_);
+Value IntervalExpression::Evaluate(const Row& /*row*/, const Schema& /*schema*/) const {
+  return Value(std::string(text_));
 }
 
-Value IntervalExpression::Evaluate(const Row*, const Schema&, const Row*,
-                                   const Schema&) const {
-  return Value(std::to_string(amount_) + " " + unit_);
+Value IntervalExpression::Evaluate(const Row* /*unused*/, const Schema& /*unused*/, const Row* /*unused*/,
+                                   const Schema& /*unused*/) const {
+  return Value(std::string(text_));
 }
 
-tinylamb::Type IntervalExpression::ResultType(const Schema&) const {
-  return tinylamb::Type(TypeTag::kVarChar);
+tinylamb::Type IntervalExpression::ResultType(const Schema& /*unused*/) const {
+  return {TypeTag::kVarChar};
 }
 
-tinylamb::Type IntervalExpression::ResultType(const Schema&,
-                                              const Schema&) const {
-  return tinylamb::Type(TypeTag::kVarChar);
+tinylamb::Type IntervalExpression::ResultType(const Schema& /*unused*/,
+                                              const Schema& /*unused*/) const {
+  return {TypeTag::kVarChar};
 }
 
 std::string IntervalExpression::ToString() const {
-  return "INTERVAL " + std::to_string(amount_) + " " + unit_;
+  return "INTERVAL " + text_;
 }
 
 void IntervalExpression::Dump(std::ostream& output) const {

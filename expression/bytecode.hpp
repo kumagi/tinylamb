@@ -3,7 +3,9 @@
 #define TINYLAMB_EXPRESSION_BYTECODE_HPP
 
 #include <cstddef>
+#include <limits>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 #include "executor/data_chunk.hpp"
@@ -44,6 +46,9 @@ class BytecodeProgram {
     instructions_.push_back(instruction);
   }
   [[nodiscard]] uint16_t AddConstant(Value value) {
+    if (constants_.size() >= std::numeric_limits<uint16_t>::max()) {
+      throw std::runtime_error("too many bytecode constants");
+    }
     constants_.push_back(std::move(value));
     return static_cast<uint16_t>(constants_.size() - 1);
   }

@@ -17,6 +17,30 @@ option(TINYLAMB_ENABLE_COVERAGE "Build with coverage instrumentation" OFF)
 option(TINYLAMB_ENABLE_GOOGLESQL
        "Build the direct GoogleSQL AST frontend" ON)
 option(TINYLAMB_ENABLE_LLVM_JIT "Build LLVM ORC expression kernels" ON)
+option(TINYLAMB_ENABLE_FUZZ "Build libFuzzer targets" OFF)
+option(TINYLAMB_ENABLE_TSAN "Build with ThreadSanitizer" OFF)
+option(TINYLAMB_ENABLE_LTO "Enable IPO/LTO for Release builds" OFF)
+
+# Centralized third-party versions (M6.6).
+set(TINYLAMB_GOOGLETEST_VERSION "1.14.0" CACHE STRING "GoogleTest version")
+set(TINYLAMB_GOOGLETEST_SHA256
+    "1f357c27ca988c3f7c6b4bf68a9395005ac6761f034046e9dde0896e3aba00e4"
+    CACHE STRING "GoogleTest archive SHA-256")
+
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+endif()
+
+if(TINYLAMB_ENABLE_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
+
+if(TINYLAMB_ENABLE_TSAN)
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=thread)
+endif()
 
 set(TINYLAMB_GOOGLESQL_VERSION "2026.7.2" CACHE STRING
     "Pinned GoogleSQL release used by the SQL frontend")
@@ -128,38 +152,135 @@ endfunction()
 
 add_library(tinylamb_parser
         STATIC
-        parser/tokenizer.cpp
-        parser/parser.cpp
-        parser/pratt_parser.cpp
+        legacy/parser/tokenizer.cpp
+        legacy/parser/parser.cpp
+        legacy/parser/pratt_parser.cpp
 )
 add_library(tinylamb::parser ALIAS tinylamb_parser)
 target_compile_features(tinylamb_parser PUBLIC cxx_std_20)
 tinylamb_apply_options(tinylamb_parser)
+target_include_directories(tinylamb_parser
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-add_library(tinylamb_core
-        STATIC
-        page/page.cpp transaction/lock_manager.cpp
-        page/page_pool.cpp page/row_page.cpp page/pax_block.cpp page/page_manager.cpp
-        recovery/logger.cpp type/row.cpp type/schema.cpp type/date.cpp
-        transaction/transaction.cpp recovery/log_record.cpp page/meta_page.cpp
-        recovery/recovery_manager.cpp recovery/checkpoint_manager.cpp
-        transaction/transaction_manager.cpp page/page_type.cpp type/column.cpp
-        common/serdes.cpp common/log_message.cpp page/page_ref.cpp
-        page/leaf_page.cpp page/branch_page.cpp index/b_plus_tree.cpp
-        type/value.cpp type/constraint.cpp table/table.cpp
-        index/index.cpp common/debug.cpp common/encoder.cpp
-        table/full_scan_iterator.cpp index/b_plus_tree_iterator.cpp
+function(tinylamb_add_layer target)
+    set(options "")
+    set(oneValueArgs ALIAS)
+    set(multiValueArgs SOURCES DEPENDS)
+    cmake_parse_arguments(TINYLAMB "${options}" "${oneValueArgs}"
+                          "${multiValueArgs}" ${ARGN})
+
+    add_library(${target} STATIC ${TINYLAMB_SOURCES})
+    if(TINYLAMB_ALIAS)
+        add_library(${TINYLAMB_ALIAS} ALIAS ${target})
+    endif()
+    target_compile_features(${target} PUBLIC cxx_std_20)
+    tinylamb_apply_options(${target})
+    target_include_directories(${target}
+            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    if(TINYLAMB_DEPENDS)
+        target_link_libraries(${target} PRIVATE ${TINYLAMB_DEPENDS})
+    endif()
+endfunction()
+
+set(TINYLAMB_LAYER_LIBS
+        tinylamb_common
+        tinylamb_type
+        tinylamb_page
+        tinylamb_index
+        tinylamb_table
+        tinylamb_database
+        tinylamb_expression
+        tinylamb_executor)
+
+# Layer 1: common utilities (no upstream tinylamb dependencies).
+tinylamb_add_layer(tinylamb_common
+        ALIAS tinylamb::common
+        SOURCES
+        common/serdes.cpp
+        common/log_message.cpp
+        common/debug.cpp
+        common/encoder.cpp
+        common/decoder.cpp
+        common/vm_cache_impl.cpp
+        common/vm_cache_impl.hpp
+        common/ring_buffer.hpp)
+
+# Layer 2: type system.
+tinylamb_add_layer(tinylamb_type
+        ALIAS tinylamb::type
+        SOURCES
+        type/row.cpp
+        type/schema.cpp
+        type/date.cpp
+        type/column.cpp
+        type/value.cpp
+        type/constraint.cpp
+        type/column_name.cpp
+        type/function.cpp
+        type/type.cpp
+        DEPENDS tinylamb::common)
+
+# Layer 3: page + recovery + transaction (tightly coupled storage foundation).
+tinylamb_add_layer(tinylamb_page
+        ALIAS tinylamb::page
+        SOURCES
+        page/page.cpp
+        page/page_pool.cpp
+        page/row_page.cpp
+        page/pax_block.cpp
+        page/page_manager.cpp
+        page/meta_page.cpp
+        page/page_type.cpp
+        page/page_ref.cpp
+        page/leaf_page.cpp
+        page/branch_page.cpp
+        recovery/logger.cpp
+        recovery/log_record.cpp
+        recovery/recovery_manager.cpp
+        recovery/checkpoint_manager.cpp
+        transaction/lock_manager.cpp
+        transaction/transaction.cpp
+        transaction/transaction_manager.cpp
+        DEPENDS tinylamb::type)
+
+# Layer 4: index structures (B+ tree, LSM).
+tinylamb_add_layer(tinylamb_index
+        ALIAS tinylamb::index
+        SOURCES
+        index/b_plus_tree.cpp
+        index/b_plus_tree_iterator.cpp
+        index/index.cpp
+        index/index_schema.cpp
+        index/lsm_tree.cpp
+        index/lsm_detail/lsm_view.cpp
+        index/lsm_detail/blob_file.cpp
+        index/lsm_detail/sorted_run.cpp
+        DEPENDS tinylamb::page)
+
+# Layer 5: table access (includes index_scan_iterator to avoid table<->index cycle).
+tinylamb_add_layer(tinylamb_table
+        ALIAS tinylamb::table
+        SOURCES
+        table/table.cpp
+        table/full_scan_iterator.cpp
+        table/table_statistics.cpp
         index/index_scan_iterator.cpp
-        database/database.cpp executor/full_scan.cpp executor/parallel_scan.cpp
-        executor/projection.cpp
-        executor/aggregation.cpp executor/parallel_aggregation.cpp
-        executor/zone_map.cpp
-        executor/query_scheduler.cpp
-        executor/query_memory.cpp
-        executor/spill_file.cpp
-        executor/data_chunk.cpp
-        executor/executor_base.cpp
-        executor/selection.cpp expression/binary_expression.cpp
+        DEPENDS tinylamb::index)
+
+# Layer 6: catalog and database orchestration.
+tinylamb_add_layer(tinylamb_database
+        ALIAS tinylamb::database
+        SOURCES
+        database/database.cpp
+        database/page_storage.cpp
+        database/transaction_context.cpp
+        DEPENDS tinylamb::table)
+
+# Layer 7: expression evaluation.
+tinylamb_add_layer(tinylamb_expression
+        ALIAS tinylamb::expression
+        SOURCES
+        expression/binary_expression.cpp
         expression/unary_expression.cpp
         expression/aggregate_expression.cpp
         expression/case_expression.cpp
@@ -167,42 +288,87 @@ add_library(tinylamb_core
         expression/function_call_expression.cpp
         expression/query_expression.cpp
         expression/interval_expression.cpp
-        expression/rewrite.cpp expression/bytecode.cpp expression/jit.cpp
-        expression/column_value.cpp executor/hash_join.cpp common/decoder.cpp
-        plan/full_scan_plan.cpp plan/projection_plan.cpp plan/selection_plan.cpp
-        plan/product_plan.cpp plan/optimizer.cpp plan/cascades.cpp
-        plan/index_only_scan_plan.cpp
-        plan/aggregation_plan.cpp plan/plan.cpp
-        executor/cross_join.cpp table/table_statistics.cpp expression/expression.cpp
-        database/page_storage.cpp index/index_schema.cpp
-        database/transaction_context.cpp executor/insert.cpp
-        executor/update.cpp executor/delete.cpp executor/sort.cpp
-        executor/limit.cpp executor/distinct.cpp
-        executor/relational.cpp
-        plan/index_scan_plan.cpp executor/index_scan.cpp
-        executor/index_only_scan.cpp type/column_name.cpp query/query_data.cpp
-                expression/named_expression.cpp executor/index_join.cpp
-        executor/constant_executor.cpp
-        index/lsm_tree.cpp
-        index/lsm_detail/lsm_view.cpp
-        index/lsm_detail/blob_file.cpp
-        index/lsm_detail/cache.cpp index/lsm_detail/sorted_run.cpp
-        common/ring_buffer.hpp
-        common/vm_cache_impl.cpp
-        common/vm_cache_impl.hpp
-        type/function.cpp
-        type/type.cpp
-)
-add_library(tinylamb::core ALIAS tinylamb_core)
-target_compile_features(tinylamb_core PUBLIC cxx_std_20)
-tinylamb_apply_options(tinylamb_core)
-target_link_libraries(tinylamb_core PUBLIC Threads::Threads)
+        expression/rewrite.cpp
+        expression/bytecode.cpp
+        expression/jit.cpp
+        expression/column_value.cpp
+        expression/expression.cpp
+        expression/named_expression.cpp
+        DEPENDS tinylamb::database)
+
 if(LLVM_FOUND AND TINYLAMB_ENABLE_LLVM_JIT)
-    target_compile_definitions(tinylamb_core PRIVATE TINYLAMB_HAS_LLVM=1)
-    target_include_directories(tinylamb_core SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+    target_compile_definitions(tinylamb_expression PRIVATE TINYLAMB_HAS_LLVM=1)
+    target_include_directories(tinylamb_expression SYSTEM PRIVATE
+            ${LLVM_INCLUDE_DIRS})
     llvm_map_components_to_libnames(TINYLAMB_LLVM_LIBS
-        Core OrcJIT ExecutionEngine RuntimeDyld Support native)
-    target_link_libraries(tinylamb_core PUBLIC ${TINYLAMB_LLVM_LIBS})
+            Core OrcJIT ExecutionEngine RuntimeDyld Support native)
+    target_link_libraries(tinylamb_expression PUBLIC ${TINYLAMB_LLVM_LIBS})
+endif()
+
+# Layer 8: plan + executor (+ query_data used by the optimizer).
+tinylamb_add_layer(tinylamb_executor
+        ALIAS tinylamb::executor
+        SOURCES
+        executor/full_scan.cpp
+        executor/parallel_scan.cpp
+        executor/projection.cpp
+        executor/aggregation.cpp
+        executor/parallel_aggregation.cpp
+        executor/zone_map.cpp
+        executor/query_scheduler.cpp
+        executor/query_memory.cpp
+        executor/spill_file.cpp
+        executor/data_chunk.cpp
+        executor/executor_base.cpp
+        executor/selection.cpp
+        executor/hash_join.cpp
+        executor/cross_join.cpp
+        executor/insert.cpp
+        executor/update.cpp
+        executor/delete.cpp
+        executor/sort.cpp
+        executor/limit.cpp
+        executor/distinct.cpp
+        executor/relational.cpp
+        executor/detail/relation.cpp
+        executor/detail/subquery_runtime.cpp
+        executor/detail/expression_eval.cpp
+        executor/detail/scan_filter.cpp
+        executor/detail/planning_heuristics.cpp
+        executor/detail/explain_format.cpp
+        executor/index_scan.cpp
+        executor/index_only_scan.cpp
+        executor/index_join.cpp
+        executor/constant_executor.cpp
+        plan/full_scan_plan.cpp
+        plan/projection_plan.cpp
+        plan/selection_plan.cpp
+        plan/product_plan.cpp
+        plan/optimizer.cpp
+        plan/cascades.cpp
+        plan/limit_plan.cpp
+        plan/relation_rename_plan.cpp
+        plan/implementation_rules.cpp
+        plan/index_only_scan_plan.cpp
+        plan/aggregation_plan.cpp
+        plan/plan.cpp
+        plan/index_scan_plan.cpp
+        query/query_data.cpp
+        DEPENDS tinylamb::expression)
+
+# Aggregate target preserving tinylamb::core backward compatibility.
+add_library(tinylamb_core INTERFACE)
+add_library(tinylamb::core ALIAS tinylamb_core)
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+    target_link_libraries(tinylamb_core INTERFACE
+            "$<LINK_GROUP:RESCAN,${TINYLAMB_LAYER_LIBS}>"
+            Threads::Threads)
+else()
+    target_link_libraries(tinylamb_core INTERFACE
+            "-Wl,--start-group"
+            ${TINYLAMB_LAYER_LIBS}
+            "-Wl,--end-group"
+            Threads::Threads)
 endif()
 
 add_library(tinylamb_sql
@@ -257,7 +423,7 @@ target_include_directories(
 
 target_include_directories(
         tinylamb_core
-        PUBLIC
+        INTERFACE
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -287,9 +453,13 @@ target_include_directories(
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR})
 
+# postgres_server.cpp uses Linux-only APIs (epoll/eventfd/accept4); the
+# standalone server executable is therefore not built on macOS.
+if(NOT APPLE)
 add_executable(tinylamb_server server/postgres_server_main.cpp)
 tinylamb_apply_options(tinylamb_server)
 target_link_libraries(tinylamb_server PRIVATE tinylamb::postgres_server)
+endif()
 
 add_executable(tinylamb_tpcc_benchmark benchmark/tpcc_benchmark.cpp)
 tinylamb_apply_options(tinylamb_tpcc_benchmark)
@@ -349,12 +519,10 @@ function(add_benchmark file_path)
     target_link_libraries(${target_name}
             PRIVATE
             tinylamb::core
-            leveldb
-            rocksdb
     )
 endfunction()
 
-#add_benchmark("index/lsm_detail/lsm_tree_bench.cpp")
+add_benchmark("index/lsm_detail/lsm_tree_bench.cpp")
 
 ########################################
 ## Testing
@@ -363,8 +531,8 @@ if(BUILD_TESTING)
     include(FetchContent)
     FetchContent_Declare(
             googletest
-            URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
-            URL_HASH SHA256=1f357c27ca988c3f7c6b4bf68a9395005ac6761f034046e9dde0896e3aba00e4
+            URL https://github.com/google/googletest/archive/refs/tags/v${TINYLAMB_GOOGLETEST_VERSION}.zip
+            URL_HASH SHA256=${TINYLAMB_GOOGLETEST_SHA256}
     )
 
     # Keep the dependency focused on the test library used here.
@@ -397,6 +565,7 @@ if(BUILD_TESTING)
 add_simple_test(common/vm_cache_test.cpp)
 add_simple_test(common/log_message_test.cpp)
 add_simple_test(common/debug_test.cpp)
+add_simple_test(common/crc32c_test.cpp)
 add_simple_test(type/value_test.cpp)
 add_simple_test(type/row_test.cpp)
 add_simple_test(type/constraint_test.cpp)
@@ -422,11 +591,13 @@ add_simple_test(table/index_test.cpp)
 add_simple_test(table/full_scan_iterator_test.cpp)
 add_simple_test(index/index_scan_iterator_test.cpp)
 add_simple_test(transaction/transaction_test.cpp)
+add_simple_test(transaction/lock_manager_test.cpp)
 add_simple_test(expression/expression_test.cpp)
 add_simple_test(expression/rewrite_test.cpp)
 add_simple_test(expression/bytecode_test.cpp)
 add_simple_test(expression/jit_test.cpp)
 add_simple_test(executor/executor_test.cpp)
+add_simple_test(executor/relational_regression_test.cpp)
 add_simple_test(executor/data_chunk_test.cpp)
 add_simple_test(executor/query_scheduler_test.cpp)
 add_simple_test(executor/spill_file_test.cpp)
@@ -491,56 +662,65 @@ endif()
 ########################################
 ## Fuzzing
 ########################################
-#function(add_fuzzer_test file_path)
-#    set(fuzzer_option "-fsanitize=fuzzer,undefined,bounds")
-#    get_filename_component(filename ${file_path} NAME)
-#    string(REPLACE ".cpp" "" target_name ${filename})
-#    add_executable(${target_name} ${file_path})
-#
-#    target_compile_options(${target_name} PRIVATE -g ${fuzzer_option})
-#    target_link_options(${target_name} PRIVATE ${fuzzer_option})
-#
-#    target_link_libraries(${target_name}
-#            libtinylamb
-#            libtinylamb_test_util
-#    )
-#endfunction()
-#
-#add_fuzzer_test(recovery/logger_fuzzer.cpp)
-#add_fuzzer_test(type/value_fuzzer.cpp)
-#add_fuzzer_test(page/row_page_fuzzer.cpp)
-#add_fuzzer_test(page/leaf_page_fuzzer.cpp)
-#add_fuzzer_test(index/lsm_detail/lsm_view_fuzzer.cpp)
-#add_fuzzer_test(index/lsm_detail/cache_fuzzer.cpp)
-#add_fuzzer_test(index/lsm_tree_fuzzer.cpp)
-#add_fuzzer_test(index/b_plus_tree_fuzzer.cpp)
-#add_fuzzer_test(table/table_fuzzer.cpp)
+if(TINYLAMB_ENABLE_FUZZ)
+function(add_fuzzer_test file_path)
+    set(fuzzer_option "-fsanitize=fuzzer,undefined,bounds")
+    get_filename_component(filename ${file_path} NAME)
+    string(REPLACE ".cpp" "" target_name ${filename})
+    add_executable(${target_name} ${file_path})
+    # -UNDEBUG keeps the harness assertions alive: several fuzzers encode
+    # commits and oracle checks inside assert(), and RelWithDebInfo's global
+    # -DNDEBUG would silently strip them out.
+    target_compile_options(${target_name} PRIVATE -g ${fuzzer_option}
+            -UNDEBUG)
+    target_link_options(${target_name} PRIVATE ${fuzzer_option})
+    # Optional extra libraries come first so a layer that links tinylamb::core
+    # itself (e.g. tinylamb::sql) does not shadow the default.
+    target_link_libraries(${target_name} PRIVATE ${ARGN} tinylamb::core)
+endfunction()
+
+add_fuzzer_test(recovery/logger_fuzzer.cpp)
+add_fuzzer_test(recovery/log_record_fuzzer.cpp)
+add_fuzzer_test(type/value_fuzzer.cpp)
+add_fuzzer_test(page/row_page_fuzzer.cpp)
+add_fuzzer_test(page/leaf_page_fuzzer.cpp)
+add_fuzzer_test(index/lsm_detail/lsm_view_fuzzer.cpp)
+add_fuzzer_test(index/lsm_detail/cache_fuzzer.cpp)
+add_fuzzer_test(index/lsm_tree_fuzzer.cpp)
+add_fuzzer_test(index/b_plus_tree_fuzzer.cpp)
+add_fuzzer_test(table/table_fuzzer.cpp)
+add_fuzzer_test(legacy/parser/parser_fuzzer.cpp tinylamb::parser)
+add_fuzzer_test(server/postgres_protocol_fuzzer.cpp tinylamb::postgres_server)
+add_fuzzer_test(query/googlesql_ast_fuzzer.cpp tinylamb::sql)
+endif()
 
 ########################################
 ## Fuzzing Replay
 ########################################
-#function(add_replay_test file_path)
-#    set(fuzzer_option "-fsanitize-trap=undefined,bounds")
-#    get_filename_component(filename ${file_path} NAME)
-#    string(REPLACE ".cpp" "" target_name ${filename})
-#    add_executable(${target_name} ${file_path})
-#
-#    target_compile_options(${target_name} PRIVATE -g ${fuzzer_option})
-#    target_link_options(${target_name} PRIVATE ${fuzzer_option})
-#
-#    target_link_libraries(${target_name}
-#            gtest_main
-#            libtinylamb
-#            libtinylamb_test_util
-#    )
-#endfunction()
-#
-#add_replay_test(recovery/logger_fuzzer_replay.cpp)
-#add_replay_test(page/row_page_fuzzer_replay.cpp)
-#add_replay_test(page/leaf_page_fuzzer_replay.cpp)
-#add_replay_test(index/lsm_detail/lsm_view_fuzzer_replay.cpp)
-#add_replay_test(index/lsm_detail/cache_fuzzer_replay.cpp)
-#add_replay_test(index/lsm_tree_fuzzer_replay.cpp)
-#add_replay_test(index/b_plus_tree_fuzzer_replay.cpp)
-#
-#add_replay_test(table/table_fuzzer_replay.cpp)
+if(TINYLAMB_ENABLE_FUZZ)
+function(add_replay_test file_path)
+    set(fuzzer_option "-fsanitize-trap=undefined,bounds")
+    get_filename_component(filename ${file_path} NAME)
+    string(REPLACE ".cpp" "" target_name ${filename})
+    add_executable(${target_name} ${file_path})
+    # -UNDEBUG keeps the harness assertions alive; see add_fuzzer_test.
+    target_compile_options(${target_name} PRIVATE -g ${fuzzer_option}
+            -UNDEBUG)
+    target_link_options(${target_name} PRIVATE ${fuzzer_option})
+    target_link_libraries(${target_name} PRIVATE gtest_main ${ARGN}
+            tinylamb::core)
+endfunction()
+
+add_replay_test(recovery/logger_fuzzer_replay.cpp)
+add_replay_test(recovery/log_record_fuzzer_replay.cpp)
+add_replay_test(page/row_page_fuzzer_replay.cpp)
+add_replay_test(page/leaf_page_fuzzer_replay.cpp)
+add_replay_test(index/lsm_detail/lsm_view_fuzzer_replay.cpp)
+add_replay_test(index/lsm_detail/cache_fuzzer_replay.cpp)
+add_replay_test(index/lsm_tree_fuzzer_replay.cpp)
+add_replay_test(index/b_plus_tree_fuzzer_replay.cpp)
+add_replay_test(table/table_fuzzer_replay.cpp)
+add_replay_test(server/postgres_protocol_fuzzer_replay.cpp
+        tinylamb::postgres_server)
+add_replay_test(query/googlesql_ast_fuzzer_replay.cpp tinylamb::sql)
+endif()

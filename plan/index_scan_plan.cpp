@@ -7,6 +7,10 @@
 
 #include <cstddef>
 #include <memory>
+#include <vector>
+#include <utility>
+#include <ostream>
+#include <string>
 
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
@@ -17,7 +21,12 @@
 #include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "table/table.hpp"
+#include "type/column_name.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
+
+#include <algorithm>
+#include <ranges>
 
 namespace tinylamb {
 namespace {
@@ -31,17 +40,41 @@ bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
-    if (expressions[i]->Type() != TypeTag::kColumnValue) return false;
+    if (expressions[i]->Type() != TypeTag::kColumnValue) { return false;
+}
     const ColumnName& column =
         expressions[i]->AsColumnValue().GetColumnName();
-    if (column.name != provided[i].name) return false;
-    if (ascending[i] != scan_ascending) return false;
+    if (column.name != provided[i].name) { return false;
+}
+    if (ascending[i] != scan_ascending) { return false;
+}
   }
   return true;
 }
 
 Value FirstOrNull(const std::vector<Value>& keys) {
   return keys.empty() ? Value() : keys.front();
+}
+
+// Bounds-based estimate for point-union scans: spans [min,max] across the
+// points. The residual predicate keeps results correct; the estimate stays
+// conservative.
+TableStatistics BoundsStats(const TableStatistics& ts, const Index& index,
+                            const std::vector<
+                                std::pair<std::vector<Value>,
+                                          std::vector<Value>>>& ranges) {
+  Value min;
+  Value max;
+  for (const auto& range : ranges) {
+    if (range.first.empty()) { continue;
+}
+    const Value& key = range.first.front();
+    if (min.IsNull() || key < min) { min = key;
+}
+    if (max.IsNull() || max < key) { max = key;
+}
+  }
+  return ts.TransformBy(index.sc_.key_[0], min, max);
 }
 
 }  // namespace
@@ -62,13 +95,37 @@ IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
       where_(std::move(where)),
       provided_order_(std::move(provided_order)) {}
 
-Executor IndexScanPlan::EmitExecutor(TransactionContext& ctx) const {
-  if (ctx.txn_.IndexKeysMayBeStale()) {
-    Executor scan = std::make_shared<FullScan>(ctx.txn_, table_);
+IndexScanPlan::IndexScanPlan(
+    const Table& table, const Index& index, const TableStatistics& ts,
+    std::vector<std::pair<std::vector<Value>, std::vector<Value>>> ranges,
+    bool ascending, Expression where,
+    std::vector<ColumnName> provided_order)
+    : table_(table),
+      index_(index),
+      stats_(BoundsStats(ts, index, ranges)),
+      begin_key_(),
+      end_key_(),
+      point_ranges_(std::move(ranges)),
+      ascending_(ascending),
+      where_(std::move(where)),
+      provided_order_(std::move(provided_order)) {}
+
+Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
+  if (txn.txn_.IndexKeysMayBeStale()) {
+    // Fallback route scans the table directly; Selection requires a real
+    // predicate, so pass the plain scan through when there is none.
+    Executor scan = std::make_shared<FullScan>(txn.txn_, table_);
+    if (!where_) { return scan;
+}
     return std::make_shared<Selection>(where_, table_.GetSchema(),
                                        std::move(scan));
   }
-  return std::make_shared<IndexScan>(ctx.txn_, table_, index_, begin_key_,
+  if (!point_ranges_.empty()) {
+    return std::make_shared<IndexScan>(txn.txn_, table_, index_,
+                                       point_ranges_, ascending_, where_,
+                                       GetSchema());
+  }
+  return std::make_shared<IndexScan>(txn.txn_, table_, index_, begin_key_,
                                      end_key_, ascending_, where_, GetSchema());
 }
 
@@ -77,6 +134,15 @@ const Schema& IndexScanPlan::GetSchema() const { return table_.GetSchema(); }
 size_t IndexScanPlan::AccessRowCount() const { return EmitRowCount(); }
 
 size_t IndexScanPlan::EmitRowCount() const {
+  if (!point_ranges_.empty()) {
+    if (index_.IsUnique() && begin_key_.empty() &&
+        std::ranges::all_of(point_ranges_, [this](const auto& range) {
+          return range.first.size() == index_.sc_.key_.size();
+        })) {
+      return point_ranges_.size();
+    }
+    return stats_.Rows();
+  }
   if (index_.IsUnique() && begin_key_ == end_key_ &&
       begin_key_.size() == index_.sc_.key_.size()) {
     return 1;
@@ -86,17 +152,28 @@ size_t IndexScanPlan::EmitRowCount() const {
 
 bool IndexScanPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                                 const std::vector<bool>& ascending) const {
+  // Concatenated point ranges only deliver a global order when a single
+  // range remains (ranges are sorted and disjoint).
+  if (point_ranges_.size() > 1) { return false;
+}
   return OrderMatches(provided_order_, ascending_, expressions, ascending);
 }
 
 void IndexScanPlan::Dump(std::ostream& o, int /*indent*/) const {
-  o << "IndexScan: " << table_.GetSchema().Name()
-    << " (estimated cost: " << AccessRowCount() << ")";
+  o << "IndexScan: " << table_.GetSchema().Name();
+  if (!point_ranges_.empty()) {
+    o << " x" << point_ranges_.size() << " points";
+  }
+  o << " (estimated cost: " << AccessRowCount() << ")";
 }
 
 std::string IndexScanPlan::ToString() const {
-  return "IndexScan: " + std::string(table_.GetSchema().Name()) +
-         " (estimated cost: " + std::to_string(AccessRowCount()) + ")";
+  std::string s = "IndexScan: " + std::string(table_.GetSchema().Name());
+  if (!point_ranges_.empty()) {
+    s += " x" + std::to_string(point_ranges_.size()) + " points";
+  }
+  s += " (estimated cost: " + std::to_string(AccessRowCount()) + ")";
+  return s;
 }
 
 }  // namespace tinylamb

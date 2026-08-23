@@ -69,11 +69,11 @@ class LeafPage final {
   [[nodiscard]] StatusOr<FosterPair> GetFoster() const;
 
   // Split utils.
-  void Split(page_id_t pid, Transaction& txn, std::string_view key,
-             std::string_view value, Page* right);
+  Status Split(page_id_t pid, Transaction& txn, std::string_view key,
+               std::string_view value, Page* right);
 
   void InsertImpl(std::string_view key, std::string_view value);
-  void UpdateImpl(std::string_view key, std::string_view value);
+  void UpdateImpl(std::string_view key, std::string_view redo);
   void DeleteImpl(std::string_view key);
   void SetFence(RowPointer& fence_pos, const IndexKey& new_fence);
   Status SetLowFence(page_id_t pid, Transaction& txn, const IndexKey& lf);

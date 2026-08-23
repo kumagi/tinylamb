@@ -16,22 +16,26 @@
 
 #include "table/table_statistics.hpp"
 
+#include <cstdint>
+#include <cstddef>
+#include <limits>
+#include <memory>
+#include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
-#include "expression/binary_expression.hpp"
-#include "expression/column_value.hpp"
-#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
-#include "expression/in_expression.hpp"
-#include "expression/unary_expression.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
 #include "table/table.hpp"
@@ -42,9 +46,6 @@
 #include "type/schema.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
-
-#include <limits>
-#include <stdexcept>
 
 namespace tinylamb {
 class TableStatisticsTest : public ::testing::Test {
@@ -127,7 +128,7 @@ TEST_F(TableStatisticsTest, Construct) {
 TEST_F(TableStatisticsTest, Update) {
   // Arrange -- begin context, get table "Sc1" and its statistics
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(ctx, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, tbl, db_->GetTable(ctx, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL(TableStatistics, ts, db_->GetStatistics(ctx, "Sc1"));
 
   // Act -- update the statistics from the table
@@ -138,7 +139,7 @@ TEST_F(TableStatisticsTest, Update) {
 TEST_F(TableStatisticsTest, Store) {
   // Arrange -- begin context, get table "Sc1" and its statistics
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(ctx, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, tbl, db_->GetTable(ctx, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL(TableStatistics, ts, db_->GetStatistics(ctx, "Sc1"));
 
   // Act -- update the statistics, then store them for "Sc2"
@@ -149,7 +150,7 @@ TEST_F(TableStatisticsTest, Store) {
 
 TEST_F(TableStatisticsTest, CollectsHistogramBoundariesAndCommonValues) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
                         db_->GetStatistics(context, "Sc1"));
 
@@ -180,8 +181,17 @@ TEST_F(TableStatisticsTest, UsesSkewAndNullsForSelectivity) {
             context,
             Schema("Distribution", {Column("skew", ValueType::kInt64),
                                     Column("nullable", ValueType::kVarChar)})));
+    const auto skew_of = [](int i) {
+      if (i < 60) {
+        return 1;
+      }
+      if (i < 80) {
+        return 2;
+      }
+      return i - 77;
+    };
     for (int i = 0; i < 100; ++i) {
-      const int skew = i < 60 ? 1 : (i < 80 ? 2 : i - 77);
+      const int skew = skew_of(i);
       const Value nullable =
           i % 10 == 0 ? Value() : Value("value-" + std::to_string(i));
       ASSERT_SUCCESS(
@@ -197,9 +207,10 @@ TEST_F(TableStatisticsTest, UsesSkewAndNullsForSelectivity) {
 
   Recover();
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Distribution"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Distribution"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table,
+                              db_->GetTable(context, "Distribution"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Distribution"));
 
   ASSERT_EQ(statistics.Rows(), 100);
   const ColumnStats& skew = statistics.Column(0);
@@ -250,7 +261,7 @@ TEST_F(TableStatisticsTest, PersistsWideTableAsSeparateColumnEntries) {
       std::vector<Value> values;
       values.reserve(20);
       for (int column = 0; column < 20; ++column) {
-        values.emplace_back(std::string(80, static_cast<char>('a' + (row + column) % 26)));
+        values.emplace_back(std::string(80, static_cast<char>('a' + ((row + column) % 26))));
       }
       ASSERT_SUCCESS(
           table.Insert(context.txn_, Row(std::move(values))).GetStatus());
@@ -264,8 +275,8 @@ TEST_F(TableStatisticsTest, PersistsWideTableAsSeparateColumnEntries) {
   }
 
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "WideStats"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "WideStats"));
   EXPECT_EQ(statistics.Rows(), 40);
   EXPECT_EQ(statistics.Columns(), 20);
   EXPECT_EQ(statistics.Column(0).NonNullCount(), 40);
@@ -291,8 +302,8 @@ TEST(TableStatisticsSerializationTest, ReadsLegacyStatistics) {
 
 TEST_F(TableStatisticsTest, ColumnStatsFitInOneLeafEntry) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
   std::stringstream stream;
   Encoder encoder(stream);
   encoder << statistics.Column(1);
@@ -303,9 +314,9 @@ TEST_F(TableStatisticsTest, ColumnStatsFitInOneLeafEntry) {
 
 TEST_F(TableStatisticsTest, ReductionFactorAndTransformBy) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
   // Act -- ask for the reduction factor of a selective predicate
@@ -332,9 +343,9 @@ TEST_F(TableStatisticsTest, ReductionFactorAndTransformBy) {
 
 TEST_F(TableStatisticsTest, ReverseComparisonWithConstantOnLeft) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
   // Act -- constant-on-left equality (exercises ReverseComparison through
@@ -354,9 +365,9 @@ TEST_F(TableStatisticsTest, ReverseComparisonWithConstantOnLeft) {
 
 TEST_F(TableStatisticsTest, NotEqualsAndLikeSelectivity) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
   // Act -- c1 != 5
@@ -380,9 +391,9 @@ TEST_F(TableStatisticsTest, NotEqualsAndLikeSelectivity) {
 
 TEST_F(TableStatisticsTest, CorrelatedRangeOnSameColumn) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
   Expression equals_one = BinaryExpressionExp(
@@ -421,9 +432,9 @@ TEST_F(TableStatisticsTest, CorrelatedRangeOnSameColumn) {
 
 TEST_F(TableStatisticsTest, InExpressionEstimate) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
   // Act -- c1 IN (1, 2)
@@ -450,9 +461,9 @@ TEST_F(TableStatisticsTest, InExpressionEstimate) {
 
 TEST_F(TableStatisticsTest, ColumnToColumnEquality) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
   // Act -- c1 = c1 (same column)
@@ -472,9 +483,9 @@ TEST_F(TableStatisticsTest, ColumnToColumnEquality) {
 
 TEST_F(TableStatisticsTest, ConstantAndUnknownPredicateShapes) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
   // Act -- a predicate over no columns that evaluates to true / false
@@ -496,8 +507,8 @@ TEST_F(TableStatisticsTest, ConstantAndUnknownPredicateShapes) {
 
 TEST_F(TableStatisticsTest, ScaleMultiplyConcatAssign) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
 
   // Act -- scale up to 200 rows (multiplier > 1)
   TableStatistics grown = statistics.ScaleToRows(200);
@@ -553,7 +564,7 @@ TEST(TableStatisticsSerializationTest, LegacyDoubleDateVarcharDecode) {
     // Act -- decode a legacy (no magic) statistics blob for a double column
     std::stringstream stream;
     Encoder encoder(stream);
-    encoder << uint64_t{1} << ValueType::kDouble << double{5.5} << double{1.5}
+    encoder << uint64_t{1} << ValueType::kDouble << 5.5 << 1.5
             << uint64_t{3} << uint64_t{2};
     TableStatistics statistics(
         Schema("T", {Column("d", ValueType::kDouble)}));
@@ -643,9 +654,8 @@ TEST(TableStatisticsSerializationTest, LegacyVarcharEstimateFallback) {
 
 TEST_F(TableStatisticsTest, CoercionAndRangeEstimatePaths) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
 
   // Act -- probe the double column with an int64 value (int -> double coerce)
   EXPECT_NEAR(statistics.Column(2).EstimateEqual(Value(int64_t{10})), 1.0,
@@ -701,9 +711,9 @@ TEST_F(TableStatisticsTest, CoercionAndRangeEstimatePaths) {
 
 TEST_F(TableStatisticsTest, ValueSatisfiesSameAndCrossType) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
   const auto col = [](std::string_view name) {
@@ -842,9 +852,9 @@ TEST_F(TableStatisticsTest, ValueSatisfiesSameAndCrossType) {
 
 TEST_F(TableStatisticsTest, NotXorAndFallbackPredicateShapes) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
   // Act -- NOT inverts a unary predicate estimate
@@ -897,9 +907,9 @@ TEST_F(TableStatisticsTest, NotXorAndFallbackPredicateShapes) {
 
 TEST_F(TableStatisticsTest, IsNotNullEstimate) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc2"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc2"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc2"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc2"));
   const Schema& schema = table.GetSchema();
 
   // Act -- Sc2.d4 has no nulls, so IS NOT NULL keeps every row
@@ -911,8 +921,8 @@ TEST_F(TableStatisticsTest, IsNotNullEstimate) {
 
 TEST_F(TableStatisticsTest, EstimateCountErrors) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
 
   // Act/Assert -- out-of-range column indices are rejected loudly
   EXPECT_THROW(std::ignore = statistics.EstimateCount(3, Value(0), Value(1)),
@@ -924,8 +934,8 @@ TEST_F(TableStatisticsTest, EstimateCountErrors) {
 
 TEST_F(TableStatisticsTest, ConcatIntoEmptyStatistics) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
 
   // Act -- concatenate a non-empty statistics into a schema-less one
   TableStatistics empty(Schema("E", {}));
@@ -960,9 +970,9 @@ TEST(TableStatisticsResolveColumnTest, SchemaQualifiedFallback) {
 
 TEST_F(TableStatisticsTest, AndFallbackAndValueSatisfiesDefaults) {
   TransactionContext context = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
-                        db_->GetStatistics(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "Sc1"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, statistics,
+                              db_->GetStatistics(context, "Sc1"));
   const Schema& schema = table.GetSchema();
 
   const auto col = [](std::string_view name) {
@@ -1026,6 +1036,83 @@ TEST(TableStatisticsResolveColumnTest, UnknownSchemaQualifiedColumn) {
 
   // Assert -- the unresolved column falls back to the 0.25 default
   EXPECT_NEAR(statistics.EstimateSelectivity(schema, equals), 0.25, 0.001);
+}
+
+// §4.13 regression: ANALYZE over a column whose cardinality exceeds the
+// internal reservoir must not materialize every distinct value.  The result
+// keeps exact row/null counts, exact extreme boundaries, a bounded histogram,
+// and identifies the skewed heavy hitter with a sane frequency estimate.
+TEST_F(TableStatisticsTest, HighCardinalityColumnStaysBoundedAndSane) {
+  constexpr int kUniqueRows = 5000;
+  constexpr int kHeavyRows = 1000;
+  {
+    TransactionContext context = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, table,
+        db_->CreateTable(context,
+                         Schema("HighCard", {Column("v", ValueType::kInt64),
+                                             Column("skew", ValueType::kInt64)})));
+    for (int i = 0; i < kUniqueRows; ++i) {
+      ASSERT_SUCCESS(table
+                         .Insert(context.txn_,
+                                 Row({Value(int64_t{i}), Value(int64_t{42})}))
+                         .GetStatus());
+    }
+    for (int i = 0; i < kHeavyRows; ++i) {
+      ASSERT_SUCCESS(
+          table
+              .Insert(context.txn_,
+                      Row({Value(int64_t{999999}), Value(int64_t{42})}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+
+  TransactionContext context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(context, "HighCard"));
+  ASSIGN_OR_ASSERT_FAIL(TableStatistics, statistics,
+                        db_->GetStatistics(context, "HighCard"));
+  ASSERT_SUCCESS(statistics.Update(context.txn_, table));
+
+  EXPECT_EQ(statistics.Rows(),
+            static_cast<size_t>(kUniqueRows + kHeavyRows));
+  const ColumnStats& values = statistics.Column(0);
+  EXPECT_EQ(values.NonNullCount(),
+            static_cast<size_t>(kUniqueRows + kHeavyRows));
+  EXPECT_EQ(values.NullCount(), 0U);
+
+  // Distinct is estimated, never below what the sample saw nor above the
+  // population size.
+  EXPECT_GE(values.Distinct(), 2000U);
+  EXPECT_LE(values.Distinct(), 6000U);
+
+  // The skewed heavy hitter wins most-common with roughly its true count.
+  ASSERT_FALSE(values.MostCommonValues().empty());
+  EXPECT_EQ(values.MostCommonValues().front().value, Value(int64_t{999999}));
+  EXPECT_GE(values.MostCommonValues().front().count, 500U);
+  EXPECT_LE(values.MostCommonValues().front().count, 1500U);
+  EXPECT_NEAR(values.EstimateEqual(Value(int64_t{999999})),
+              static_cast<double>(kHeavyRows), 500.0);
+
+  // Extremes stay exact even though they were seen only once.
+  ASSERT_FALSE(values.LowestValues().empty());
+  EXPECT_EQ(values.LowestValues().front().value, Value(int64_t{0}));
+  ASSERT_EQ(values.HighestValues().size(), kBoundaryValueCount);
+  // Top-5 largest distinct values are {4996..4999} plus the heavy hitter,
+  // so the smallest of them is kUniqueRows - kBoundaryValueCount + 1.
+  EXPECT_EQ(values.HighestValues().front().value,
+            Value(int64_t{kUniqueRows - kBoundaryValueCount + 1}));
+  EXPECT_EQ(values.HighestValues().back().value, Value(int64_t{999999}));
+
+  EXPECT_FALSE(values.Histogram().empty());
+  EXPECT_LE(values.Histogram().size(), kHistogramBucketCount);
+
+  // A constant column collapses to a single distinct value even when the
+  // collection ran through the sampled path.
+  const ColumnStats& skew = statistics.Column(1);
+  EXPECT_EQ(skew.Distinct(), 1U);
+  EXPECT_EQ(skew.MostCommonValues().front().value, Value(int64_t{42}));
+  ASSERT_SUCCESS(context.PreCommit());
 }
 
 }  // namespace tinylamb

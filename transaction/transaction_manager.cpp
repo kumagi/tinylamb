@@ -17,15 +17,25 @@
 #include "transaction/transaction_manager.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <array>
 #include <cassert>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <iterator>
 #include <mutex>
+#include <ranges>
+#include <string>
+#include <optional>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "page/page_manager.hpp"
 #include "page/row_page.hpp"
 #include "recovery/log_record.hpp"
@@ -51,16 +61,40 @@ Transaction TransactionManager::Begin(bool read_only) {
     active_snapshots_.emplace(new_txn_id, new_txn.snapshot_ts_);
   }
   assert(!new_txn.IsFinished());
+  // If the return move-constructs instead of eliding into the caller,
+  // Transaction's move operations repoint active_transactions_ at the new
+  // address; the registration never outlives this local.
   return new_txn;
 }
 
 Status TransactionManager::PreCommit(Transaction& txn) {
   assert(!txn.IsFinished());
-  if (!txn.IsReadOnly()) CommitVersions(txn);
+  if (!txn.IsReadOnly()) { CommitVersions(txn);
+}
   txn.SetStatus(TransactionStatus::kCommitted);
   if (!txn.IsReadOnly()) {
     LogRecord commit_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
-    txn.prev_lsn_ = logger_->AddLog(commit_log.Serialize());
+    try {
+      // The write locks stay held across AddLog/WaitForDurable (durability
+      // precedes release), so stretch contenders' wait timeout over any
+      // fsync stall instead of letting them die at kExclusiveWaitTimeout.
+      LockManager::DurabilityWaitGuard floor_guard(*lock_manager_);
+      txn.prev_lsn_ = logger_->AddLog(commit_log.Serialize());
+      // AddLog returns the LSN *before* the payload; durable point is end of
+      // the buffered commit record.
+      const lsn_t commit_end = logger_->BufferedLSN();
+      if (synchronous_commit_) {
+        logger_->WaitForDurable(commit_end);
+      }
+    } catch (...) {
+      // A dead logger cannot take compensation logs, so full rollback is
+      // impossible.  Still leave no half-finished state behind: drop the
+      // locks and the registry slot so other transactions are not blocked
+      // forever, and report the transaction as aborted, never committed.
+      ReleaseLocksAndForget(txn);
+      txn.SetStatus(TransactionStatus::kAborted);
+      throw;
+    }
   }
   ReleaseLocksAndForget(txn);
   return Status::kSuccess;
@@ -72,10 +106,17 @@ void TransactionManager::Abort(Transaction& txn) {
     ReleaseLocksAndForget(txn);
     return;
   }
+  // The undo walk holds every write lock, so contenders must not spuriously
+  // time out while this transaction flushes its tail or replays undo.
+  LockManager::DurabilityWaitGuard floor_guard(*lock_manager_);
   // Iterate prev_lsn to beginning of the transaction with undoing.
   {
     const uint64_t latest_log = txn.prev_lsn_;
     while (CommittedLSN() <= latest_log) {
+      // A dead logger never advances CommittedLSN; fall through and let the
+      // abort-log write below surface the failure instead of spinning.
+      if (logger_->Failed()) { break;
+}
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
@@ -88,8 +129,15 @@ void TransactionManager::Abort(Transaction& txn) {
   }
   AbortVersions(txn);
   txn.SetStatus(TransactionStatus::kAborted);
-  LogRecord abort_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
-  txn.prev_lsn_ = logger_->AddLog(abort_log.Serialize());
+  try {
+    LogRecord abort_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
+    txn.prev_lsn_ = logger_->AddLog(abort_log.Serialize());
+  } catch (...) {
+    // Same contract as PreCommit: release locks and leave an aborted state
+    // rather than a half-finished transaction blocking everyone.
+    ReleaseLocksAndForget(txn);
+    throw;
+  }
   ReleaseLocksAndForget(txn);
 }
 
@@ -100,23 +148,31 @@ StatusOr<std::string> TransactionManager::ReadVersion(
   std::scoped_lock lock(shard.mutex);
   const auto found = shard.versions.find(rp);
   if (found == shard.versions.end()) {
-    if (!physical) return Status::kNotExists;
+    if (!physical) { return Status::kNotExists;
+}
     return std::string(*physical);
   }
   const VersionChain& chain = found->second;
   if (chain.pending && chain.pending->owner == txn.ID()) {
-    if (!chain.pending->value) return Status::kNotExists;
+    if (!chain.pending->value) { return Status::kNotExists;
+}
     return *chain.pending->value;
   }
-  for (auto iter = chain.committed.rbegin(); iter != chain.committed.rend();
-       ++iter) {
-    if (iter->begin_ts <= txn.SnapshotTimestamp() &&
-        txn.SnapshotTimestamp() < iter->end_ts) {
-      if (!iter->value) return Status::kNotExists;
-      return *iter->value;
+  for (const auto& version : std::ranges::reverse_view(chain.committed)) {
+    if (version.begin_ts <= txn.SnapshotTimestamp() &&
+        txn.SnapshotTimestamp() < version.end_ts) {
+      if (!version.value) { return Status::kNotExists;
+}
+      return *version.value;
     }
   }
   return Status::kNotExists;
+}
+
+bool TransactionManager::HasVersionChain(const RowPosition& rp) const {
+  const VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+  std::scoped_lock lock(shard.mutex);
+  return shard.versions.contains(rp);
 }
 
 void TransactionManager::RegisterVersionWrite(
@@ -135,7 +191,7 @@ void TransactionManager::RegisterVersionWrite(
         {0, std::numeric_limits<uint64_t>::max(), std::move(before_copy)});
   }
   if (!chain.pending) {
-    chain.pending = PendingVersion{txn.ID(), std::nullopt};
+    chain.pending = PendingVersion{.owner=txn.ID(), .value=std::nullopt};
     if (txn.write_set_.size() == 1) {
       pending_txn_count_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -178,12 +234,15 @@ void TransactionManager::CommitVersions(Transaction& txn) {
   for (const RowPosition& rp : txn.write_set_) {
     VersionShard& shard = version_shards_[VersionShardIndex(rp)];
     const auto found = shard.versions.find(rp);
-    if (found == shard.versions.end() || !found->second.pending ||
-        found->second.pending->owner != txn.ID()) {
+    if (found == shard.versions.end()) {
       continue;
     }
     VersionChain& chain = found->second;
-    if (!chain.committed.empty()) chain.committed.back().end_ts = commit_ts;
+    if (!chain.pending || chain.pending->owner != txn.ID()) {
+      continue;
+    }
+    if (!chain.committed.empty()) { chain.committed.back().end_ts = commit_ts;
+}
     chain.committed.push_back({commit_ts, std::numeric_limits<uint64_t>::max(),
                                std::move(chain.pending->value)});
     chain.pending.reset();
@@ -218,16 +277,34 @@ void TransactionManager::AbortVersions(Transaction& txn) {
   }
 }
 
+void TransactionManager::MoveActiveTransaction(Transaction* from,
+                                               Transaction* to) {
+  std::scoped_lock lk(transaction_table_lock);
+  auto it = active_transactions_.find(from->txn_id_);
+  if (it != active_transactions_.end() && it->second == from) {
+    it->second = to;
+  }
+}
+
+void TransactionManager::UnregisterActiveTransaction(Transaction* txn) {
+  std::scoped_lock lk(transaction_table_lock);
+  auto it = active_transactions_.find(txn->txn_id_);
+  if (it != active_transactions_.end() && it->second == txn) {
+    active_transactions_.erase(it);
+  }
+}
+
 void TransactionManager::ReleaseLocksAndForget(Transaction& txn) {
   for (const RowPosition& row : txn.write_set_) {
-    lock_manager_->ReleaseExclusiveLock(row);
+    lock_manager_->ReleaseExclusiveLock(row, txn.txn_id_);
   }
   {
     std::scoped_lock lk(transaction_table_lock);
     active_transactions_.erase(txn.txn_id_);
     active_snapshots_.erase(txn.txn_id_);
   }
-  if (!txn.IsReadOnly()) GarbageCollectVersions();
+  if (!txn.IsReadOnly()) { GarbageCollectVersions();
+}
 }
 
 void TransactionManager::GarbageCollectVersions() {
@@ -362,16 +439,19 @@ void TransactionManager::CompensateSetFosterLog(txn_id_t txn_id, page_id_t pid,
           .Serialize());
 }
 
-bool TransactionManager::GetExclusiveLock(const RowPosition& rp) {
-  return lock_manager_->GetExclusiveLock(rp);
+bool TransactionManager::GetExclusiveLock(const RowPosition& rp,
+                                          txn_id_t owner) {
+  return lock_manager_->GetExclusiveLock(rp, owner);
 }
 
-bool TransactionManager::GetSharedLock(const RowPosition& rp) {
-  return lock_manager_->GetSharedLock(rp);
+bool TransactionManager::GetSharedLock(const RowPosition& rp,
+                                       txn_id_t owner) {
+  return lock_manager_->GetSharedLock(rp, owner);
 }
 
-bool TransactionManager::TryUpgradeLock(const RowPosition& rp) {
-  return lock_manager_->TryUpgradeLock(rp);
+bool TransactionManager::TryUpgradeLock(const RowPosition& rp,
+                                        txn_id_t owner) {
+  return lock_manager_->TryUpgradeLock(rp, owner);
 }
 
 uint64_t TransactionManager::AddLog(const LogRecord& lr) {

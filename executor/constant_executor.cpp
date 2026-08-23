@@ -16,9 +16,13 @@
 
 #include "executor/constant_executor.hpp"
 
+#include <cstddef>
 #include <ostream>
+#include <utility>
 
-#include "type/schema.hpp"
+#include "type/row.hpp"
+#include "page/row_position.hpp"
+#include "executor/data_chunk.hpp"
 
 namespace tinylamb {
 
@@ -26,14 +30,15 @@ bool ConstantExecutor::Next(Row* row, RowPosition* /*rp*/) {
   if (offset_ >= rows_.size()) {
     return false;
   }
-  *row = rows_[offset_++];
+  // Each row is emitted once, so moving out is safe.
+  *row = std::move(rows_[offset_++]);
   return true;
 }
 
 size_t ConstantExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
   while (offset_ < rows_.size() && destination->Size() < max_rows) {
-    destination->Append(rows_[offset_++]);
+    destination->Append(std::move(rows_[offset_++]));
   }
   return destination->Size();
 }

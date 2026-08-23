@@ -31,6 +31,11 @@ bool CrossJoin::Next(Row* dst, RowPosition* /*rp*/) {
   if (!table_constructed_) {
     TableConstruct();
   }
+  // An empty right side produces zero rows; without this guard the iterator
+  // below would dereference end().
+  if (right_table_.empty()) {
+    return false;
+  }
   if (right_iter_ == right_table_.end()) {
     if (!left_->Next(&hold_left_, nullptr)) {
       return false;
@@ -44,7 +49,7 @@ bool CrossJoin::Next(Row* dst, RowPosition* /*rp*/) {
 void CrossJoin::TableConstruct() {
   Row right_row;
   while (right_->Next(&right_row, nullptr)) {
-    right_table_.push_back(right_row);
+    right_table_.push_back(std::move(right_row));
   }
   right_iter_ = right_table_.end();
   table_constructed_ = true;

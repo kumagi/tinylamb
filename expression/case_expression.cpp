@@ -16,12 +16,17 @@
 
 #include "expression/case_expression.hpp"
 
+#include <ostream>
 #include <string>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "expression/expression.hpp"
+#include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -40,7 +45,8 @@ std::unordered_set<ColumnName> CaseExpression::TouchedColumns() const {
 
 Value CaseExpression::Evaluate(const Row& row, const Schema& schema) const {
   for (const auto& when : when_clauses_) {
-    if (when.first->Evaluate(row, schema).Truthy()) {
+    const Value condition = when.first->Evaluate(row, schema);
+    if (!condition.IsNull() && condition.Truthy()) {
       return when.second->Evaluate(row, schema);
     }
   }
@@ -49,6 +55,24 @@ Value CaseExpression::Evaluate(const Row& row, const Schema& schema) const {
   }
   return {};
 }
+
+namespace {
+
+Type UnifiedBranchType(std::vector<Type> branch_types) {
+  if (branch_types.empty()) { return {TypeTag::kInvalid};
+}
+  const Type first = branch_types.front();
+  for (const Type& type : branch_types) {
+    if (type.GetType() != first.GetType()) {
+      // Branches disagree on the result type; the declared type would not
+      // match the actually returned values.
+      return {TypeTag::kInvalid};
+    }
+  }
+  return first;
+}
+
+}  // namespace
 
 Value CaseExpression::Evaluate(const Row* left, const Schema& left_schema,
                                const Row* right,
@@ -66,19 +90,27 @@ Value CaseExpression::Evaluate(const Row* left, const Schema& left_schema,
 }
 
 Type CaseExpression::ResultType(const Schema& schema) const {
-  if (!when_clauses_.empty()) {
-    return when_clauses_.front().second->ResultType(schema);
+  std::vector<tinylamb::Type> branch_types;
+  branch_types.reserve(when_clauses_.size() + 1);
+  for (const auto& when : when_clauses_) {
+    branch_types.push_back(when.second->ResultType(schema));
   }
-  return else_clause_ ? else_clause_->ResultType(schema)
-                      : tinylamb::Type(TypeTag::kInvalid);
+  if (else_clause_) {
+    branch_types.push_back(else_clause_->ResultType(schema));
+  }
+  return UnifiedBranchType(std::move(branch_types));
 }
 
 Type CaseExpression::ResultType(const Schema& left, const Schema& right) const {
-  if (!when_clauses_.empty()) {
-    return when_clauses_.front().second->ResultType(left, right);
+  std::vector<tinylamb::Type> branch_types;
+  branch_types.reserve(when_clauses_.size() + 1);
+  for (const auto& when : when_clauses_) {
+    branch_types.push_back(when.second->ResultType(left, right));
   }
-  return else_clause_ ? else_clause_->ResultType(left, right)
-                      : tinylamb::Type(TypeTag::kInvalid);
+  if (else_clause_) {
+    branch_types.push_back(else_clause_->ResultType(left, right));
+  }
+  return UnifiedBranchType(std::move(branch_types));
 }
 
 std::string CaseExpression::ToString() const {

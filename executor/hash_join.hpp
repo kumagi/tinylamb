@@ -18,7 +18,10 @@
 #define TINYLAMB_HASH_JOIN_HPP
 
 #include <memory>
+#include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include "executor/executor_base.hpp"
 #include "executor/hash_join_mode.hpp"
@@ -55,6 +58,10 @@ class HashJoin : public ExecutorBase {
   void Materialize();
   void MaterializeInMemory();
   void MaterializeHybrid();
+  bool EmitNextMatch(Row* dst, RowPosition* rp);
+  // Wraps Materialize() so a failure never re-consumes the children (which
+  // would duplicate or drop rows on retry).
+  void MaterializeOrThrow();
 
   Executor left_;
   std::vector<slot_t> left_cols_;
@@ -64,6 +71,16 @@ class HashJoin : public ExecutorBase {
   HashJoinMode mode_{HashJoinMode::kInMemory};
   size_t worker_count_;
   bool materialized_{false};
+  bool materialize_failed_{false};
+  bool pipelined_{false};
+  bool right_built_{false};
+  bool left_exhausted_{false};
+  std::vector<Row> right_storage_;
+  std::unordered_multimap<std::string, const Row*> right_buckets_;
+  Row current_left_;
+  RowPosition current_left_pos_;
+  std::unordered_multimap<std::string, const Row*>::const_iterator match_iter_;
+  std::unordered_multimap<std::string, const Row*>::const_iterator match_end_;
   std::vector<std::pair<Row, RowPosition>> output_;
   size_t output_offset_{0};
   QueryMemoryCharge output_charge_;

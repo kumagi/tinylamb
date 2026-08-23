@@ -16,13 +16,15 @@
 
 #include "expression/expression.hpp"
 
-#include <iosfwd>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_set>
+#include <vector>
+#include <utility>
 
-#include "common/status_or.hpp"
-#include "database/transaction_context.hpp"
+#include "common/constants.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
@@ -34,7 +36,6 @@
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "type/column_name.hpp"
-#include "type/type.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -92,7 +93,7 @@ Expression ColumnValueExp(const ColumnName& col_name) {
   return std::make_shared<ColumnValue>(col_name);
 }
 
-Expression ColumnValueExp(const std::string_view& col_name) {
+Expression ColumnValueExp(std::string_view col_name) {
   return std::make_shared<ColumnValue>(ColumnName(std::string(col_name)));
 }
 
@@ -102,31 +103,34 @@ Expression ConstantValueExp(const Value& v) {
 
 Expression BinaryExpressionExp(Expression left, BinaryOperation op,
                                Expression right) {
-  return std::make_shared<BinaryExpression>(left, op, right);
+  return std::make_shared<BinaryExpression>(std::move(left), op,
+                                            std::move(right));
 }
 
 Expression UnaryExpressionExp(Expression child, UnaryOperation op) {
-  return std::make_shared<UnaryExpression>(child, op);
+  return std::make_shared<UnaryExpression>(std::move(child), op);
 }
 
 Expression AggregateExpressionExp(AggregationType type, Expression child,
                                   bool distinct) {
-  return std::make_shared<AggregateExpression>(type, child, distinct);
+  return std::make_shared<AggregateExpression>(type, std::move(child),
+                                               distinct);
 }
 
 Expression CaseExpressionExp(
     std::vector<std::pair<Expression, Expression>> when_clauses,
     Expression else_clause) {
-  return std::make_shared<CaseExpression>(when_clauses, else_clause);
+  return std::make_shared<CaseExpression>(std::move(when_clauses),
+                                          std::move(else_clause));
 }
 
 Expression InExpressionExp(Expression child, std::vector<Expression> list) {
-  return std::make_shared<InExpression>(child, list);
+  return std::make_shared<InExpression>(std::move(child), std::move(list));
 }
 
-Expression FunctionCallExp(const std::string& func_name,
-                           std::vector<Expression> args) {
-  return std::make_shared<FunctionCallExpression>(func_name, args);
+Expression FunctionCallExp(std::string func_name, std::vector<Expression> args) {
+  return std::make_shared<FunctionCallExpression>(std::move(func_name),
+                                                  std::move(args));
 }
 
 Expression QueryExpressionExp(std::shared_ptr<SelectStatement> query,

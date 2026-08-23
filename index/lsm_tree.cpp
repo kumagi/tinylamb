@@ -16,15 +16,19 @@
 
 #include "index/lsm_tree.hpp"
 
+#include <atomic>
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <mutex>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
@@ -34,32 +38,70 @@
 
 namespace tinylamb {
 
+namespace {
 std::filesystem::path BlobPath(const std::filesystem::path& dir) {
   return dir / "blob.db";
 }
+}  // namespace
 
 LSMTree::LSMTree(std::filesystem::path directory_path)
     : every_us_(1000),
       root_dir_(std::move(directory_path)),
       blob_(BlobPath(root_dir_)) {
   std::filesystem::create_directory(root_dir_);
-  flusher_ = std::thread([&](){Flusher(this);});
-  merger_ = std::thread([&](){Merger(this);});
+  try {
+    flusher_ = std::thread([&](){Flusher(this);});
+    merger_ = std::thread([&](){Merger(this);});
+  } catch (...) {
+    // Do not leak a half-constructed background thread pool.
+    stop_ = true;
+    if (flusher_.joinable()) {
+      flusher_.join();
+    }
+    throw;
+  }
 }
 
 LSMTree::~LSMTree() {
   stop_ = true;
-  flusher_.join();
-  merger_.join();
+  {
+    std::scoped_lock lk(mem_tree_lock_);
+    mem_tree_cv_.notify_all();
+  }
+  if (flusher_.joinable()) {
+    flusher_.join();
+  }
+  if (merger_.joinable()) {
+    merger_.join();
+  }
 }
 
 void Flusher(LSMTree* tree) {
+  uint64_t flushed_version = 0;
   for (;;) {
-    std::this_thread::sleep_for(std::chrono::microseconds(tree->every_us_));
-    if (tree->stop_.load()) {
-      break;
+    uint64_t target = 0;
+    {
+      // Wait for either a mem_tree_ mutation or the periodic tick; an idle
+      // tree never reaches Sync() and therefore never takes this mutex on
+      // the write path's behalf.
+      std::unique_lock lk(tree->mem_tree_lock_);
+      tree->mem_tree_cv_.wait_for(
+          lk, std::chrono::microseconds(tree->every_us_), [&] {
+            return tree->stop_.load(std::memory_order_relaxed) ||
+                   flushed_version != tree->mem_tree_version_;
+          });
+      if (tree->stop_.load(std::memory_order_relaxed)) {
+        break;
+      }
+      target = tree->mem_tree_version_;
+    }
+    if (target == flushed_version) {
+      continue;
     }
     tree->Sync();
+    // Record only the version observed before Sync(): writes that raced the
+    // flush stay pending above `target` and trigger the next round.
+    flushed_version = target;
   }
 }
 
@@ -141,6 +183,8 @@ bool LSMTree::Contains(std::string_view key) const {
 void LSMTree::Write(std::string_view key, std::string_view value, bool sync) {
   std::scoped_lock lk(mem_tree_lock_);
   mem_tree_[std::string(key)] = LSMValue(std::string(value));
+  ++mem_tree_version_;
+  mem_tree_cv_.notify_one();
   if (sync) {
     Sync();
   }
@@ -149,49 +193,110 @@ void LSMTree::Write(std::string_view key, std::string_view value, bool sync) {
 void LSMTree::Delete(std::string_view key, bool flush) {
   std::scoped_lock lk(mem_tree_lock_);
   mem_tree_[std::string(key)] = LSMValue::Delete();
+  ++mem_tree_version_;
+  mem_tree_cv_.notify_one();
   if (flush) {
     Sync();
   }
 }
 
 void LSMTree::Sync() {
-  std::unique_lock lk(mem_tree_lock_);
-  if (mem_tree_.empty()) {
+  // One flush at a time: snapshots must reach disk in mem_tree_ mutation
+  // order or a newer run can shadow an older tombstone (deleted-key
+  // resurrection) and identical runs get flushed twice.
+  std::scoped_lock flush_lk(sync_lock_);
+  std::map<std::string, LSMValue> to_flush;
+  std::filesystem::path new_index_file;
+  size_t generation = 0;
+  {
+    std::unique_lock lk(mem_tree_lock_);
+    if (mem_tree_.empty()) {
+      return;
+    }
+    std::swap(mem_tree_, frozen_mem_tree_);
+    to_flush = frozen_mem_tree_;
+    new_index_file =
+        root_dir_ / (std::to_string(generation_) + "-" +
+                     std::to_string(blob_.Written()));
+    generation = generation_.fetch_add(1);
+  }
+  if (const Status s =
+          SortedRun::Construct(new_index_file, to_flush, blob_, generation);
+      s != Status::kSuccess) {
+    // The run file was removed by FlushInternal; keep frozen_mem_tree_
+    // populated so readers still see the data and the next tick retries.
+    LOG(ERROR) << "flushing mem tree failed: " << s;
     return;
   }
-  std::swap(mem_tree_, frozen_mem_tree_);
-  std::filesystem::path new_index_file =
-      root_dir_ /
-      (std::to_string(generation_) + "-" + std::to_string(blob_.Written()));
-  SortedRun::Construct(new_index_file, frozen_mem_tree_, blob_,
-                       generation_.fetch_add(1));
-  frozen_mem_tree_.clear();
-
-  std::unique_lock file_lk(file_tree_lock_);
-  files_.push_front(new_index_file);
-  index_.emplace_front(new_index_file);
+  {
+    // Register the new run BEFORE dropping the frozen tree: readers must
+    // always find flushed keys in mem_tree_, frozen_mem_tree_ or index_.
+    // Clearing first would open a window where a concurrent Read() misses
+    // the data entirely (kNotExists). Both locks are taken in the canonical
+    // mem_tree_lock_ -> file_tree_lock_ order.
+    std::scoped_lock lk(mem_tree_lock_, file_tree_lock_);
+    files_.push_front(new_index_file);
+    index_.emplace_front(new_index_file);
+    frozen_mem_tree_.clear();
+  }
 }
 
 void LSMTree::MergeAll() {
+  constexpr size_t kMaxRuns = 4;
   std::scoped_lock mem_lk(mem_tree_lock_);
   std::scoped_lock lk(file_tree_lock_);
-  if (index_.size() <= 1) {
+  if (index_.size() <= kMaxRuns) {
     return;
   }
-  LSMView view = GetViewImpl();
-  // Path must be unique even when blob_.Written() does not advance (short
-  // keys/tombstones). Reusing the same path would delete the file we are about
-  // to reopen as the merged run.
+  // Copy the merge inputs first and only mutate the deques after the merged
+  // file is durable: an exception mid-merge must not orphan the source runs.
+  const SortedRun older = index_.back();
+  const std::filesystem::path older_file = files_.back();
+  const SortedRun newer = index_[index_.size() - 2];
+  const std::filesystem::path newer_file = files_[files_.size() - 2];
+
+  const std::vector<SortedRun> merge_inputs{older, newer};
+  LSMView view(blob_, merge_inputs);
+  // The merged run must NOT take a fresh generation: its payload is older
+  // than every run flushed after these inputs, and a fresh number would let
+  // it shadow newer tombstones (deleted keys resurface in scans). It instead
+  // inherits the largest input generation, whose slot the inputs vacate.
+  const size_t merged_generation =
+      std::max(older.Generation(), newer.Generation());
+  const size_t file_generation = generation_.fetch_add(1);
   std::filesystem::path path =
-      root_dir_ / ("merged-" + std::to_string(generation_.fetch_add(1)) + "-" +
+      root_dir_ / ("merged-" + std::to_string(file_generation) + "-" +
                    std::to_string(blob_.Written()));
-  view.CreateSingleRun(path);
-  for (const auto& file : files_) {
-    std::filesystem::remove(file);
+  std::vector<SortedRun::Entry> merged;
+  if (view.Size() != 0) {
+    std::string min_key;
+    std::string max_key;
+    for (LSMView::Iterator it = view.Begin(); it.IsValid(); ++it) {
+      if (merged.empty()) {
+        min_key = it.Key();
+      }
+      merged.push_back(it.TopIterator().GetEntry());
+      max_key = it.Key();
+    }
+    if (const Status s =
+            SortedRun::FlushInternal(path, min_key, max_key, merged,
+                                     merged_generation);
+        s != Status::kSuccess) {
+      // Sources stay registered; the merge is retried on a later tick.
+      LOG(ERROR) << "merge failed: " << s;
+      return;
+    }
   }
-  index_.clear();
-  files_.clear();
-  index_.emplace_front(path);
-  files_.push_front(std::move(path));
+
+  files_.pop_back();
+  files_.pop_back();
+  index_.pop_back();
+  index_.pop_back();
+  std::filesystem::remove(older_file);
+  std::filesystem::remove(newer_file);
+  if (!merged.empty()) {
+    index_.emplace_back(path);
+    files_.push_back(std::move(path));
+  }
 }
 }  // namespace tinylamb

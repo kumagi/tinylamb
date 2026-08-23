@@ -17,8 +17,10 @@
 #include "type/column.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <string_view>
+#include <utility>
 
 #include "column_name.hpp"
 #include "common/encoder.hpp"

@@ -45,7 +45,7 @@ class ExecutorBase {
   }
 };
 
-typedef std::shared_ptr<ExecutorBase> Executor;
+using Executor = std::shared_ptr<ExecutorBase>;
 
 }  // namespace tinylamb
 

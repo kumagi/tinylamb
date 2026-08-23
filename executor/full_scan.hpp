@@ -38,6 +38,7 @@ class FullScan : public ExecutorBase {
   void Dump(std::ostream& o, int indent) const override;
 
  private:
+  // Not owned; the executor must not outlive the Table.
   const Table* table_;
   Iterator iter_;
 };

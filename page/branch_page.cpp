@@ -23,9 +23,11 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -54,12 +56,17 @@ void BranchPage::SetLowestValue(page_id_t pid, Transaction& txn,
 
 Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
                           page_id_t value) {
-  const bin_size_t physical_size = SerializeSize(key) + sizeof(value);
-  if (kPageBodySize / 6 < physical_size) {
+  // Compute in size_t first: bin_size_t addition wraps for huge payloads and
+  // would bypass the TooBig/NoSpace guards below.
+  const size_t physical_size = SerializeSize(key) + sizeof(value);
+  if (physical_size > static_cast<size_t>(std::numeric_limits<bin_size_t>::max())) {
+    return Status::kTooBigData;
+  }
+  if (static_cast<size_t>(kPageBodySize / 6) < physical_size) {
     return Status::kTooBigData;
   }
   if (free_size_ <
-      physical_size + sizeof(RowPointer) * (row_count_ + kExtraIdx + 1)) {
+      physical_size + (sizeof(RowPointer) * (row_count_ + kExtraIdx + 1))) {
     return Status::kNoSpace;
   }
   size_t pos = SearchToInsert(key);
@@ -73,7 +80,11 @@ Status BranchPage::Insert(page_id_t pid, Transaction& txn, std::string_view key,
 }
 
 void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
-  const bin_size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
+  const size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
+  assert(physical_size <= std::numeric_limits<bin_size_t>::max());
+  if (physical_size > std::numeric_limits<bin_size_t>::max()) {
+    return;
+  }
   free_size_ -= physical_size + sizeof(RowPointer);
   if ((Payload() + free_ptr_ - physical_size) <=
       reinterpret_cast<char*>(&rows_[row_count_ + kExtraIdx + 2])) {
@@ -93,16 +104,23 @@ void BranchPage::InsertImpl(std::string_view key, page_id_t pid) {
 
 Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
                           page_id_t value) {
-  const bin_size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
-  if (kPageBodySize / 6 < physical_size) {
+  const size_t physical_size = SerializeSize(key) + sizeof(page_id_t);
+  if (physical_size > static_cast<size_t>(std::numeric_limits<bin_size_t>::max())) {
     return Status::kTooBigData;
   }
-  const size_t pos = Search(key, false);
-  if (row_count_ < pos || GetKey(pos) != key) {
+  if (static_cast<size_t>(kPageBodySize / 6) < physical_size) {
+    return Status::kTooBigData;
+  }
+  // Search returns -1 when no slot may hold |key|; keep the signed value so
+  // the miss is an explicit check instead of a huge size_t.
+  const int pos = Search(key, false);
+  if (pos < 0 || std::cmp_less_equal(row_count_, pos) || GetKey(pos) != key) {
     return Status::kNotExists;
   }
-  if (rows_[pos].size < physical_size &&
-      physical_size - rows_[pos].size > free_size_) {
+  // |pos| is a logical index; the slot array is prefixed by the fence/foster
+  // slots, so the size must be read from rows_[pos + kExtraIdx].
+  if (rows_[pos + kExtraIdx].size < physical_size &&
+      physical_size - rows_[pos + kExtraIdx].size > free_size_) {
     return Status::kNoSpace;
   }
   txn.UpdateBranchLog(pid, key, value, GetValue(pos));
@@ -111,11 +129,28 @@ Status BranchPage::Update(page_id_t pid, Transaction& txn, std::string_view key,
 }
 
 void BranchPage::UpdateImpl(std::string_view key, page_id_t pid) {
-  memcpy(Payload() + rows_[Search(key, false) + kExtraIdx].offset, &pid,
-         sizeof(pid));
+  // Recovery redo replays previously applied updates, so the key must exist.
+  // A missing key would make Search return -1 and rows_[kExtraIdx - 1] alias
+  // the foster slot; refuse instead of silently corrupting it.
+  const int pos = Search(key, false);
+  if (pos < 0) {
+    assert(!"UpdateImpl for a key that is not in this branch page");
+    LOG(ERROR) << "UpdateImpl: key not found, foster slot kept intact";
+    return;
+  }
+  memcpy(Payload() + rows_[pos + kExtraIdx].offset, &pid, sizeof(pid));
 }
 
 void BranchPage::UpdateSlotImpl(RowPointer& pos, std::string_view payload) {
+  // Redo/Impl callers reach here without the SetFence/SetFoster space checks;
+  // refuse impossible requests instead of underflowing free_ptr_ and writing
+  // past the page body.
+  if (payload.size() > static_cast<size_t>(free_size_)) {
+    assert(!"UpdateSlotImpl ran out of free space");
+    LOG(ERROR) << "UpdateSlotImpl needs " << payload.size()
+               << " bytes but free_size_ is " << free_size_;
+    return;
+  }
   assert(payload.size() <= free_size_);
   if (Payload() + free_ptr_ - payload.size() <=
       reinterpret_cast<char*>(&rows_[row_count_ + kExtraIdx + 1])) {
@@ -147,14 +182,14 @@ Status BranchPage::Delete(page_id_t pid, Transaction& txn,
 void BranchPage::DeleteImpl(std::string_view key) {
   assert(0 < row_count_);
   int pos = Search(key, false);
-  assert(pos < row_count_);
+  assert(std::cmp_less(pos, row_count_));
   if (pos < 0) {
     lowest_page_ = GetValue(0);
     ++pos;
   }
   free_size_ += SerializeSize(GetKey(pos)) + sizeof(page_id_t);
   memmove(rows_ + pos + kExtraIdx, rows_ + pos + kExtraIdx + 1,
-          sizeof(RowPointer) * (row_count_ - pos));
+          sizeof(RowPointer) * (row_count_ - pos - 1));
   --row_count_;
 }
 
@@ -221,14 +256,18 @@ IndexKey BranchPage::GetLowFence() const {
   if (rows_[kLowFenceIdx] == kMinusInfinity) {
     return IndexKey::MinusInfinity();
   }
-  return IndexKey::Deserialize(Payload() + rows_[kLowFenceIdx].offset);
+  // The payload region ends at the page body bound; Deserialize validates the
+  // length prefix against it so corrupt fences cannot read past the page.
+  return IndexKey::Deserialize(Payload() + rows_[kLowFenceIdx].offset,
+                               Payload() + kPageBodySize);
 }
 
 IndexKey BranchPage::GetHighFence() const {
   if (rows_[kHighFenceIdx] == kPlusInfinity) {
     return IndexKey::PlusInfinity();
   }
-  return IndexKey::Deserialize(Payload() + rows_[kHighFenceIdx].offset);
+  return IndexKey::Deserialize(Payload() + rows_[kHighFenceIdx].offset,
+                               Payload() + kPageBodySize);
 }
 
 void BranchPage::SetLowFenceImpl(const IndexKey& lf) {
@@ -262,8 +301,23 @@ void BranchPage::SetFosterImpl(const FosterPair& foster) {
     UpdateSlotImpl(rows_[kFosterIdx], "");
     return;
   }
-  bin_size_t physical_size =
+  // Compute in size_t first: a bin_size_t sum wraps for huge keys and would
+  // under-allocate the payload buffer below.
+  const size_t physical_size =
       SerializeSize(foster.key) + sizeof(foster.child_pid);
+  if (physical_size >
+      static_cast<size_t>(std::numeric_limits<bin_size_t>::max())) {
+    assert(!"foster payload does not fit in a page");
+    LOG(ERROR) << "SetFosterImpl: oversized foster key ("
+               << physical_size << " bytes) rejected";
+    return;
+  }
+  if (static_cast<size_t>(kPageBodySize) < physical_size) {
+    assert(!"foster payload does not fit in a page");
+    LOG(ERROR) << "SetFosterImpl: oversized foster key ("
+               << physical_size << " bytes) rejected";
+    return;
+  }
   std::string payload(physical_size, 0);
   SerializeStringView(payload.data(), foster.key);
   SerializePID(payload.data() + SerializeSize(foster.key), foster.child_pid);
@@ -282,8 +336,9 @@ StatusOr<FosterPair> BranchPage::GetFoster() const {
   return FosterPair(serialized_key, child);
 }
 
-void BranchPage::Split(page_id_t /*pid*/, Transaction& txn,
-                       std::string_view key, Page* right, std::string* middle) {
+Status BranchPage::Split(page_id_t /*pid*/, Transaction& txn,
+                         std::string_view key, Page* right,
+                         std::string* middle) {
   const size_t kPayload = kPageBodySize - offsetof(BranchPage, rows_);
   const size_t kThreshold = kPayload / 2;
   const size_t expected_size =
@@ -296,12 +351,16 @@ void BranchPage::Split(page_id_t /*pid*/, Transaction& txn,
     consumed_size +=
         SerializeSize(GetKey(pivot++)) + sizeof(page_id_t) + sizeof(RowPointer);
   }
-  while (GetKey(pivot) < key && consumed_size < expected_size) {
-    pivot++;
+  // Keep pivot in [0, row_count_]: never read GetKey(row_count_).
+  while (pivot < static_cast<size_t>(row_count_) && GetKey(pivot) < key &&
+         consumed_size < expected_size) {
     consumed_size +=
         SerializeSize(GetKey(pivot)) + sizeof(page_id_t) + sizeof(RowPointer);
+    pivot++;
   }
-  while (key < GetKey(pivot) && kPayload < consumed_size + expected_size) {
+  while (pivot > 0 && pivot < static_cast<size_t>(row_count_) &&
+         key < GetKey(pivot) &&
+         kPayload < consumed_size + expected_size) {
     consumed_size -=
         SerializeSize(GetKey(pivot)) + sizeof(page_id_t) + sizeof(RowPointer);
     pivot--;
@@ -311,17 +370,20 @@ void BranchPage::Split(page_id_t /*pid*/, Transaction& txn,
   *middle = GetKey(pivot);
   right->SetLowestValue(txn, GetValue(pivot));
   for (size_t i = pivot + 1; i < row_count_; ++i) {
-    right->InsertBranch(txn, GetKey(i), GetValue(i));
+    // Propagate failures so a partial move cannot silently drop keys from
+    // the tree.
+    RETURN_IF_FAIL(right->InsertBranch(txn, GetKey(i), GetValue(i)));
   }
   Page* this_page = GET_PAGE_PTR(this);
   for (size_t i = pivot; i < original_row_count; ++i) {
-    this_page->Delete(txn, GetKey(pivot));
+    RETURN_IF_FAIL(this_page->Delete(txn, GetKey(pivot)));
   }
   if (right->RowCount() == 0 || right->GetKey(0) <= key) {
     assert(expected_size <= right->body.branch_page.free_size_);
   } else {
     assert(expected_size <= free_size_);
   }
+  return Status::kSuccess;
 }
 
 bin_size_t BranchPage::SearchToInsert(std::string_view key) const {
@@ -399,6 +461,7 @@ void BranchPage::Dump(std::ostream& o, int indent) const {
   }
 }
 
+namespace {
 std::string SmallestKey(PageRef&& page) {
   if (page->Type() == PageType::kLeafPage) {
     return std::string(page->body.leaf_page.GetKey(0));
@@ -423,7 +486,9 @@ std::string BiggestKey(PageRef&& page) {
   std::abort();
 }
 
-bool SanityCheck(PageRef&& page, PageManager* pm) {
+// Recursion follows the B+tree descent; its depth is bounded by the tree
+// height (~log_fanout), which stays in single digits for 32 KiB pages.
+bool SanityCheck(PageRef&& page, PageManager* pm) {  // NOLINT(misc-no-recursion)
   if (page->Type() == PageType::kLeafPage) {
     return page->body.leaf_page.SanityCheckForTest();
   }
@@ -433,36 +498,43 @@ bool SanityCheck(PageRef&& page, PageManager* pm) {
   assert(!"invalid page type");
   std::abort();
 }
+}  // namespace
 
-bool BranchPage::SanityCheckForTest(PageManager* pm) const {
+bool BranchPage::SanityCheckForTest(PageManager* pm) const {  // NOLINT(misc-no-recursion)
+  // Violations are reported through the boolean result instead of
+  // LOG(FATAL)-and-continue: FATAL is about to become an aborting level, and
+  // continuing after a detected corruption only obscures the diagnosis.
+  // Violations are reported through the boolean result instead of
+  // LOG(FATAL)-and-continue: FATAL is about to become an aborting level, and
+  // continuing after a detected corruption only obscures the diagnosis.
   bool sanity = SanityCheck(pm->GetPage(lowest_page_), pm);
   if (!sanity) {
     return false;
   }
   if (row_count_ == 0) {
-    LOG(FATAL) << "Branch page is empty";
+    LOG(ERROR) << "Branch page is empty";
     return false;
   }
-  const Page* this_page = GET_CONST_PAGE_PTR(this);
   for (size_t i = 0; i + 1 < static_cast<size_t>(row_count_); ++i) {
     if (GetKey(i + 1) < GetKey(i)) {
-      LOG(FATAL) << "key not ordered";
+      LOG(ERROR) << "key not ordered";
       return false;
     }
     if (GetValue(i) == 0) {
-      LOG(FATAL) << "zero page at " << i;
+      LOG(ERROR) << "zero page at " << i;
       Dump(std::cerr, 0);
+      return false;
     }
     std::string smallest = SmallestKey(pm->GetPage(GetValue(i)));
     if (smallest < GetKey(i)) {
-      LOG(FATAL) << "Child smallest key is smaller than parent slot: "
+      LOG(ERROR) << "Child smallest key is smaller than parent slot: "
                  << smallest << " vs " << GetKey(i);
       return false;
     }
     std::string biggest = BiggestKey(pm->GetPage(GetValue(i)));
     if (GetKey(i + 1) < biggest) {
-      LOG(WARN) << *this_page;
-      LOG(FATAL) << "Child biggest key is bigger than parent next slot: "
+      LOG(WARN) << *this;
+      LOG(ERROR) << "Child biggest key is bigger than parent next slot: "
                  << GetKey(i + 1) << " vs " << biggest;
       return false;
     }
@@ -494,7 +566,7 @@ void BranchPage::DeFragment() {
 Status BranchPage::MoveRightToFoster(Transaction& txn, Page& right) {
   assert(right.Type() == PageType::kBranchPage);
   assert(0 < row_count_);
-  ASSIGN_OR_CRASH(FosterPair, old_foster, GetFoster());
+  ASSIGN_OR_CRASH_CONST(FosterPair, old_foster, GetFoster());
   assert(old_foster.child_pid == right.PageID());
   std::string move_key(GetKey(row_count_ - 1));
   page_id_t move_value = GetValue(row_count_ - 1);
@@ -512,7 +584,7 @@ Status BranchPage::MoveLeftFromFoster(Transaction& txn, Page& right) {
   assert(right.Type() == PageType::kBranchPage);
   assert(0 < right.RowCount());
   Page* this_page = GET_PAGE_PTR(this);
-  ASSIGN_OR_CRASH(FosterPair, old_foster, GetFoster());
+  ASSIGN_OR_CRASH_CONST(FosterPair, old_foster, GetFoster());
   assert(old_foster.child_pid == right.PageID());
   std::string move_key(right.GetKey(0));
   if (1 < right.RowCount()) {

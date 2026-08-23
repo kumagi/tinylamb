@@ -14,8 +14,17 @@
  * limitations under the License.
  */
 
+#include <cstdint>
+#include <cstddef>
+#include <exception>
 #include <memory>
+#include <optional>
+#include <vector>
+#include <utility>
+#include <string_view>
+#include <string>
 
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
@@ -25,18 +34,15 @@
 #include "executor/insert.hpp"
 #include "gtest/gtest.h"
 #include "parser/parser.hpp"
+#include "parser/token.hpp"
 #include "parser/tokenizer.hpp"
-#include "plan/aggregation_plan.hpp"
-#include "plan/full_scan_plan.hpp"
 #include "plan/index_only_scan_plan.hpp"
 #include "plan/index_scan_plan.hpp"
 #include "plan/optimizer.hpp"
 #include "plan/plan.hpp"
-#include "plan/product_plan.hpp"
-#include "plan/projection_plan.hpp"
-#include "plan/selection_plan.hpp"
 #include "query/query_data.hpp"
 #include "query/sql_engine.hpp"
+#include "query/statement.hpp"
 #include "table/table_statistics.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
@@ -53,7 +59,7 @@ class QueryTest : public ::testing::Test {
   }
 
   StatusOr<Executor> Execute(TransactionContext& ctx,
-                             std::unique_ptr<Statement> stmt) {
+                             std::unique_ptr<Statement> stmt) const {
     switch (stmt->Type()) {
       case StatementType::kCreateTable: {
         auto& create_table = dynamic_cast<CreateTableStatement&>(*stmt);
@@ -92,7 +98,7 @@ class QueryTest : public ::testing::Test {
   }
 
   StatusOr<Executor> ExecuteQuery(TransactionContext& ctx,
-                                  const std::string& sql) {
+                                  const std::string& sql) const {
     Tokenizer tokenizer(sql);
     std::vector<Token> tokens = tokenizer.Tokenize();
     Parser parser(tokens);
@@ -192,9 +198,11 @@ std::vector<Row> RunSql(TransactionContext& ctx, Database& db,
   EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
                                                     << engine.LastError();
   std::vector<Row> rows;
-  if (!prepared.HasValue()) return rows;
+  if (!prepared.HasValue()) { return rows;
+}
   Row row;
-  while (prepared.Value()->Next(&row, nullptr)) rows.push_back(row);
+  while (prepared.Value()->Next(&row, nullptr)) { rows.push_back(row);
+}
   return rows;
 }
 }  // namespace
@@ -238,8 +246,9 @@ TEST_F(QueryTest, SqlEngineExplainAnalyzeSelect) {
   StatusOr<Executor> prepared =
       engine.Prepare(ctx, "EXPLAIN ANALYZE SELECT a FROM t;");
   ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
-  ASSERT_TRUE(engine.LastStatementType().has_value());
-  EXPECT_EQ(engine.LastStatementType().value(), StatementType::kSelect);
+  const std::optional<StatementType> explain_type = engine.LastStatementType();
+  ASSERT_TRUE(explain_type.has_value());
+  EXPECT_EQ(explain_type, std::optional(StatementType::kSelect));
   Row row;
   std::string text;
   while (prepared.Value()->Next(&row, nullptr)) {
@@ -267,15 +276,18 @@ TEST_F(QueryTest, SqlEngineAnalyzeRefreshesStatistics) {
   run("CREATE TABLE stats_t (a INT64);");
   run("INSERT INTO stats_t VALUES (1), (2), (3);");
 
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, before,
-                        ctx.GetStats("stats_t"));
+  const auto stats_before = ctx.GetStats("stats_t");
+  ASSERT_EQ(stats_before.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& before = stats_before.Value();
+  EXPECT_EQ(before->Rows(), 0);
   EXPECT_EQ(before->Rows(), 0);
 
   // Act -- force a statistics refresh.
   StatusOr<Executor> analyzed = engine.Prepare(ctx, "ANALYZE stats_t;");
   ASSERT_TRUE(analyzed.HasValue()) << engine.LastError();
-  ASSERT_TRUE(engine.LastStatementType().has_value());
-  EXPECT_EQ(engine.LastStatementType().value(), StatementType::kAnalyze);
+  const std::optional<StatementType> analyzed_type = engine.LastStatementType();
+  ASSERT_TRUE(analyzed_type.has_value());
+  EXPECT_EQ(analyzed_type, std::optional(StatementType::kAnalyze));
   Row row;
   ASSERT_TRUE(analyzed.Value()->Next(&row, nullptr));
   EXPECT_EQ(row[0], Value(std::string("ANALYZE")));
@@ -283,16 +295,18 @@ TEST_F(QueryTest, SqlEngineAnalyzeRefreshesStatistics) {
   EXPECT_EQ(row[2], Value(int64_t{3}));
   ASSERT_FALSE(analyzed.Value()->Next(&row, nullptr));
 
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, after,
-                        ctx.GetStats("stats_t"));
+  const auto stats_after = ctx.GetStats("stats_t");
+  ASSERT_EQ(stats_after.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& after = stats_after.Value();
   EXPECT_EQ(after->Rows(), 3);
 
   // Act -- ANALYZE without a table list refreshes every catalog table.
   StatusOr<Executor> all = engine.Prepare(ctx, "ANALYZE;");
   ASSERT_TRUE(all.HasValue()) << engine.LastError();
   size_t analyze_rows = 0;
-  while (all.Value()->Next(&row, nullptr)) ++analyze_rows;
-  EXPECT_GE(analyze_rows, 1u);
+  while (all.Value()->Next(&row, nullptr)) { ++analyze_rows;
+}
+  EXPECT_GE(analyze_rows, 1U);
 
   ctx.txn_.Abort();
 }
@@ -424,8 +438,9 @@ TEST_F(QueryTest, SqlEngineAnalyzeEdgeCases) {
   ASSERT_TRUE(list.HasValue()) << engine.LastError();
   size_t analyzed = 0;
   Row row;
-  while (list.Value()->Next(&row, nullptr)) ++analyzed;
-  EXPECT_EQ(analyzed, 2u);
+  while (list.Value()->Next(&row, nullptr)) { ++analyzed;
+}
+  EXPECT_EQ(analyzed, 2U);
 
   // Act + Assert -- ANALYZE of a missing table fails with the engine error.
   StatusOr<Executor> missing = engine.Prepare(ctx, "ANALYZE no_such_table");
@@ -481,7 +496,7 @@ TEST_F(QueryTest, SqlEngineUpdateAndDelete) {
   Row update_result;
   ASSERT_TRUE(update_stmt.Value()->Next(&update_result, nullptr));
   std::vector<Row> updated = RunSql(ctx, *db_, "SELECT b FROM t WHERE a = 2;");
-  ASSERT_EQ(updated.size(), 1u);
+  ASSERT_EQ(updated.size(), 1U);
   EXPECT_EQ(updated[0][0], Value(99));
 
   // Act + Assert -- DELETE removes the matched row.
@@ -491,7 +506,7 @@ TEST_F(QueryTest, SqlEngineUpdateAndDelete) {
   Row delete_result;
   ASSERT_TRUE(delete_stmt.Value()->Next(&delete_result, nullptr));
   std::vector<Row> remaining = RunSql(ctx, *db_, "SELECT a FROM t;");
-  ASSERT_EQ(remaining.size(), 2u);
+  ASSERT_EQ(remaining.size(), 2U);
 
   ctx.txn_.Abort();
 }
@@ -506,7 +521,7 @@ TEST_F(QueryTest, SqlEngineSelectOrderByLimitOffset) {
   // Act + Assert -- ORDER BY over a hidden sort column is projected away and
   // rows come back sorted.
   std::vector<Row> sorted = RunSql(ctx, *db_, "SELECT b FROM t ORDER BY a;");
-  ASSERT_EQ(sorted.size(), 3u);
+  ASSERT_EQ(sorted.size(), 3U);
   EXPECT_EQ(sorted[0][0], Value(10));
   EXPECT_EQ(sorted[1][0], Value(20));
   EXPECT_EQ(sorted[2][0], Value(30));
@@ -514,9 +529,199 @@ TEST_F(QueryTest, SqlEngineSelectOrderByLimitOffset) {
   // Act + Assert -- ORDER BY over a selected column with LIMIT + OFFSET.
   std::vector<Row> page =
       RunSql(ctx, *db_, "SELECT a FROM t ORDER BY a DESC LIMIT 2 OFFSET 1;");
-  ASSERT_EQ(page.size(), 2u);
+  ASSERT_EQ(page.size(), 2U);
   EXPECT_EQ(page[0][0], Value(2));
   EXPECT_EQ(page[1][0], Value(1));
+
+  // Act + Assert -- LIMIT + OFFSET without ORDER BY is enforced exactly once,
+  // whether or not the optimizer folded it into the plan (D6).
+  std::vector<Row> window =
+      RunSql(ctx, *db_, "SELECT a FROM t LIMIT 2 OFFSET 1;");
+  ASSERT_EQ(window.size(), 2U);
+
+  // Act + Assert -- DISTINCT sees every row before truncation even when LIMIT
+  // is present; duplicates collapse first, then the limit applies.
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (3, 300);");
+  std::vector<Row> distinct_page =
+      RunSql(ctx, *db_, "SELECT DISTINCT a FROM t LIMIT 3;");
+  ASSERT_EQ(distinct_page.size(), 3U);
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineSingleTableAlias) {
+  // Phase 8: an aliased table resolves through the optimizer's relation-key
+  // schemas.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_, "SELECT a.v FROM t AS a WHERE a.k > 1 ORDER BY a.v;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(20));
+  EXPECT_EQ(rows[1][0], Value(30));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineSelfJoinEquiJoin) {
+  // Phase 8: two aliases of one physical table join through the optimizer;
+  // each side renames its schema so `a.k` and `b.k` stay distinguishable.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+  std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT a.v FROM t AS a JOIN t AS b ON a.k = b.k WHERE b.k >= 2 "
+      "ORDER BY a.v;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(20));
+  EXPECT_EQ(rows[1][0], Value(30));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineSelfJoinCommaWithWhere) {
+  // Phase 8: comma-separated self-join with the condition in WHERE.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_, "SELECT x.v FROM t AS x, t AS y WHERE x.k = y.k AND "
+                        "y.k < 3 ORDER BY x.v;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(10));
+  EXPECT_EQ(rows[1][0], Value(20));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineSelfJoinResidualCondition) {
+  // Phase 8: a non-equality ON condition cannot drive hash/index joins; the
+  // residual predicate is applied above the cross product.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE s (k INT64);");
+  RunSql(ctx, *db_, "INSERT INTO s VALUES (1), (2), (3);");
+
+  std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT a.k FROM s AS a JOIN s AS b ON a.k > b.k ORDER BY a.k;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0], Value(2));
+  EXPECT_EQ(rows[1][0], Value(3));
+  EXPECT_EQ(rows[2][0], Value(3));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineLeftJoinStaysCorrect) {
+  // Phase 8: LEFT JOIN keeps the relational path (null-padding is not yet
+  // modeled in the Cascades memo) and stays correct end-to-end.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE l (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE r (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO l VALUES (1, 10), (2, 20);");
+  RunSql(ctx, *db_, "INSERT INTO r VALUES (9, 90);");
+
+  std::vector<Row> rows =
+      RunSql(ctx, *db_, "SELECT a.v FROM l AS a LEFT JOIN r AS b ON a.k = b.k "
+                        "ORDER BY a.v;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(10));
+  EXPECT_EQ(rows[1][0], Value(20));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineSelfJoinAmbiguousColumnRejected) {
+  // Phase 8: unqualified references across aliased relations are ambiguous.
+  // The rejection surfaces either at prepare time or when the executor first
+  // resolves the column, depending on which engine plans the statement.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE t (k INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> prepared =
+      engine.Prepare(ctx, "SELECT k FROM t AS a JOIN t AS b ON a.k = b.k;");
+  if (!prepared.HasValue()) {
+    EXPECT_NE(engine.LastError().find("ambiguous"), std::string::npos)
+        << engine.LastError();
+  } else {
+    Row row;
+    bool rejected = false;
+    try {
+      while (prepared.Value()->Next(&row, nullptr)) {
+      }
+    } catch (const std::exception& error) {
+      rejected = true;
+      EXPECT_NE(std::string(error.what()).find("ambiguous"), std::string::npos)
+          << error.what();
+    }
+    EXPECT_TRUE(rejected) << "ambiguous column was silently resolved";
+  }
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineSelectLimitZeroReturnsNoRows) {
+  // Arrange -- a non-empty table; LIMIT 0 must yield an empty result (§6.3).
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_, "CREATE TABLE t (a INT64, b INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+  // Act + Assert -- explicit LIMIT 0 returns zero rows on every route.
+  EXPECT_TRUE(RunSql(ctx, *db_, "SELECT a FROM t LIMIT 0;").empty());
+  EXPECT_TRUE(RunSql(ctx, *db_, "SELECT a FROM t ORDER BY a LIMIT 0;").empty());
+  EXPECT_TRUE(RunSql(ctx, *db_, "SELECT DISTINCT a FROM t LIMIT 0;").empty());
+  EXPECT_TRUE(
+      RunSql(ctx, *db_, "SELECT a FROM t WHERE a > 1 LIMIT 0 OFFSET 2;")
+          .empty());
+  EXPECT_TRUE(
+      RunSql(ctx, *db_, "SELECT x.a FROM t AS x WHERE x.a = 2 LIMIT 0;")
+          .empty());
+
+  // Act + Assert -- neighbouring queries keep working after a LIMIT 0 ran.
+  std::vector<Row> limited = RunSql(ctx, *db_, "SELECT a FROM t LIMIT 2;");
+  ASSERT_EQ(limited.size(), 2U);
+  std::vector<Row> all = RunSql(ctx, *db_, "SELECT a FROM t;");
+  ASSERT_EQ(all.size(), 3U);
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineExplainDoesNotExecuteDdlOrDml) {
+  // Arrange
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_, "CREATE TABLE t (a INT64);");
+  RunSql(ctx, *db_, "INSERT INTO t VALUES (1);");
+
+  // Act + Assert -- EXPLAIN rejects DDL without executing it: the table must
+  // still exist and EXPLAIN CREATE must not have created anything.
+  StatusOr<Executor> explain_drop =
+      engine.Prepare(ctx, "EXPLAIN DROP TABLE t;");
+  EXPECT_FALSE(explain_drop.HasValue());
+  ASSERT_EQ(RunSql(ctx, *db_, "SELECT a FROM t;").size(), 1U);
+
+  StatusOr<Executor> explain_create =
+      engine.Prepare(ctx, "EXPLAIN CREATE TABLE ghost_t (a INT64);");
+  EXPECT_FALSE(explain_create.HasValue());
+  ASSERT_EQ(RunSql(ctx, *db_, "SELECT a FROM t;").size(), 1U);
+
+  // Act + Assert -- EXPLAIN INSERT neither inserts nor drains the executor.
+  StatusOr<Executor> explain_insert =
+      engine.Prepare(ctx, "EXPLAIN INSERT INTO t VALUES (2);");
+  EXPECT_FALSE(explain_insert.HasValue());
+  ASSERT_EQ(RunSql(ctx, *db_, "SELECT a FROM t;").size(), 1U);
+
+  // Act + Assert -- EXPLAIN over SELECT still works.
+  StatusOr<Executor> explain_select = engine.Prepare(ctx, "EXPLAIN SELECT a FROM t;");
+  ASSERT_TRUE(explain_select.HasValue()) << engine.LastError();
 
   ctx.txn_.Abort();
 }

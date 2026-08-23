@@ -8,6 +8,8 @@
 #include <cassert>
 #include <cstdint>
 #include <ostream>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -33,7 +35,9 @@ bool Update::Next(Row* dst, RowPosition* rp) {
   for (auto& [row, row_position] : pending) {
     StatusOr<RowPosition> p = target_->Update(*txn_, row_position, row);
     if (p.GetStatus() != Status::kSuccess) {
-      break;
+      // Do not report a partial update as successful.
+      throw std::runtime_error("update failed on table " +
+                               std::string(target_->GetSchema().Name()));
     }
     update_count++;
   }

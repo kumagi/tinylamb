@@ -15,6 +15,7 @@
  */
 
 #include "plan/plan.hpp"
+#include <ostream>
 
 namespace tinylamb {
 

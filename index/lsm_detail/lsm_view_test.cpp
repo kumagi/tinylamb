@@ -289,11 +289,6 @@ TEST_F(LSMViewTest, Overwrite) {
 
   // Act -- build a new LSMView from the single overwrite SortedRun
   std::vector<SortedRun> index_files{SortedRun(filepath)};
-  for (const auto& entry : std::filesystem::directory_iterator(path_)) {
-    if (!entry.path().string().ends_with(".db")) {
-      // index_files.emplace_back(entry.path());
-    }
-  }
   view_ = std::make_unique<LSMView>(*blob_, index_files);
 
   // Assert -- find each key; the overwrite run takes precedence so every key maps to i*2
@@ -469,7 +464,7 @@ TEST_F(LSMViewTest, IteratorStreamOperator) {
 
   // Assert -- the dump names the run index and the generation
   EXPECT_NE(dumped.find("[0]"), std::string::npos);
-  EXPECT_NE(dumped.find("@"), std::string::npos);
+  EXPECT_NE(dumped.find('@'), std::string::npos);
 }
 
 TEST_F(LSMViewTest, ViewStreamOperator) {

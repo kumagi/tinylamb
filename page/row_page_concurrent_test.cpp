@@ -21,9 +21,12 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/row_page_test.hpp"

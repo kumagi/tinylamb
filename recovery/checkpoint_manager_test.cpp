@@ -15,9 +15,24 @@
  */
 
 #include "recovery/checkpoint_manager.hpp"
+#include <string>
+#include <cstdio>
+#include <memory>
+#include <filesystem>
+#include <thread>
+#include <chrono>
 
+#include "common/random_string.hpp"
+#include "common/test_util.hpp"
+#include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "gtest/gtest.h"
+#include "page/page_ref.hpp"
+#include "page/page_type.hpp"
 #include "page/row_page_test.hpp"
+#include "recovery/logger.hpp"
+#include "transaction/lock_manager.hpp"
+#include "recovery/recovery_manager.hpp"
 
 namespace tinylamb {
 class CheckpointTest : public RowPageTest {
@@ -35,9 +50,10 @@ class CheckpointTest : public RowPageTest {
   }
 
   void TearDown() override {
-    std::remove(db_name_.c_str());
-    std::remove(log_name_.c_str());
-    std::remove(master_record_name_.c_str());
+    // Best-effort cleanup; a missing file must not fail the test.
+    (void)std::remove(db_name_.c_str());
+    (void)std::remove(log_name_.c_str());
+    (void)std::remove(master_record_name_.c_str());
   }
 
   void Recover() override {
@@ -79,12 +95,17 @@ TEST_F(CheckpointTest, DoCheckpoint) {
   // Act 1 -- insert a row, then checkpoint, then update+commit within {} scope
   InsertRow("expect this operation did not rerun");
   Transaction txn = tm_->Begin();
+  slot_t slot = 0;
   {
     PageRef page = p_->GetPage(page_id_);
-    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(txn, "inserted"));
-    p_->GetPool()->FlushPageForTest(page_id_);
-    cm_->WriteCheckpoint();
-    page->Update(txn, slot, "expect to be redone");
+    ASSIGN_OR_ASSERT_FAIL(slot_t, inserted, page->Insert(txn, "inserted"));
+    slot = inserted;
+  }
+  p_->GetPool()->FlushPageForTest(page_id_);
+  cm_->WriteCheckpoint();
+  {
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_SUCCESS(page->Update(txn, slot, "expect to be redone"));
     txn.PreCommit();
   }
 
@@ -106,10 +127,13 @@ TEST_F(CheckpointTest, CheckpointRecovery) {
   {
     PageRef page = p_->GetPage(page_id_);
     ASSIGN_OR_ASSERT_FAIL(slot_t, inserted, page->Insert(txn, "inserted"));
-    restart_point = cm_->WriteCheckpoint();
-    page->Update(txn, inserted, "expect to be redone");
-    txn.PreCommit();
     result = inserted;
+  }
+  restart_point = cm_->WriteCheckpoint();
+  {
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_SUCCESS(page->Update(txn, result, "expect to be redone"));
+    txn.PreCommit();
   }
 
   // Act 2 -- recover from restart_point; redo should replay the update
@@ -124,14 +148,13 @@ TEST_F(CheckpointTest, CheckpointAbortRecovery) {
   // Arrange -- row 0 = "original message" committed
   ASSERT_TRUE(InsertRow("original message"));
   Transaction txn = tm_->Begin();
-  slot_t slot = 0;
-  lsn_t restart_point = 0;
+  const slot_t slot = 0;
 
   // Act 1 -- checkpoint, then update+insert without committing
+  const lsn_t restart_point = cm_->WriteCheckpoint();
   {
     PageRef page = p_->GetPage(page_id_);
-    restart_point = cm_->WriteCheckpoint();
-    page->Update(txn, slot, "aborted");
+    ASSERT_SUCCESS(page->Update(txn, slot, "aborted"));
     ASSERT_SUCCESS(page->Insert(txn, "will be deleted").GetStatus());
   }
 
@@ -148,17 +171,16 @@ TEST_F(CheckpointTest, CheckpointUpdateAfterBeginCheckpoint) {
   // Arrange -- row 0 = "original message" committed
   ASSERT_TRUE(InsertRow("original message"));
   Transaction txn = tm_->Begin();
-  slot_t slot = 0;
-  lsn_t restart_point = 0;
+  const slot_t slot = 0;
 
-  // Act 1 -- checkpoint with lambda that updates+inserts but does not commit
-  {
+  // Act 1 -- checkpoint with lambda that updates+inserts but does not commit;
+  // the lambda acquires its own page latch so the checkpoint's DPT snapshot
+  // never overlaps a foreign exclusive latch.
+  const lsn_t restart_point = cm_->WriteCheckpoint([&]() {
     PageRef page = p_->GetPage(page_id_);
-    restart_point = cm_->WriteCheckpoint([&]() {
-      page->Update(txn, slot, "aborted");
-      ASSERT_SUCCESS(page->Insert(txn, "will be deleted").GetStatus());
-    });
-  }
+    ASSERT_SUCCESS(page->Update(txn, slot, "aborted"));
+    ASSERT_SUCCESS(page->Insert(txn, "will be deleted").GetStatus());
+  });
 
   // Act 2 -- recover from restart_point; uncommitted changes discarded
   Recover();
@@ -180,5 +202,33 @@ TEST_F(CheckpointTest, PeriodicCheckpointRuns) {
   // Assert -- the periodic worker called WriteCheckpoint, writing the master
   // record file
   EXPECT_TRUE(std::filesystem::exists(master_record_name_));
+}
+
+TEST_F(CheckpointTest, LoserBelowCheckpointIsUndoneGlobally) {
+  // Arrange -- commit a baseline row, then apply an uncommitted update whose
+  // log record lands BEFORE the upcoming checkpoint LSN. Flush the dirty page
+  // and empty the buffer pool before checkpointing, so the EndCheckpoint DPT
+  // does not list the page: only a global loser-chain UNDO can revert it.
+  ASSERT_TRUE(InsertRow("original message"));
+  Transaction loser = tm_->Begin();
+  {
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_SUCCESS(page->Update(loser, 0, "loser residue"));
+    page.PageUnlock();
+  }
+  while (l_->CommittedLSN() < l_->BufferedLSN()) {
+    std::this_thread::yield();
+  }
+  p_->GetPool()->FlushPageForTest(page_id_);
+  p_->GetPool()->DropAllPages();
+  const lsn_t restart_point = cm_->WriteCheckpoint();
+
+  // Act -- crash-reopen and recover from the checkpoint LSN.
+  Recover();
+  r_->RecoverFrom(restart_point, tm_.get());
+
+  // Assert -- the loser update below the scan start was compensated.
+  ASSERT_EQ(GetRowCount(), 1);
+  EXPECT_EQ(ReadRow(0), "original message");
 }
 }  // namespace tinylamb

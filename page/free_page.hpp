@@ -23,10 +23,16 @@
 namespace tinylamb {
 
 class FreePage {
-  void Initialize() { next_free_page = 0; }
+  // 0 terminates the free list. It never aliases a live link target because
+  // page 0 is reserved for the meta page.
+  static constexpr page_id_t kEndOfFreeList = 0;
+
+  void Initialize() { next_free_page = kEndOfFreeList; }
 
  public:
-  char* FreeBody() { return reinterpret_cast<char*>(&next_free_page + 1); }
+  char* FreeBody() {
+    return reinterpret_cast<char*>(this) + sizeof(FreePage);
+  }
   static constexpr size_t FreeBodySize() {
     return kPageBodySize - sizeof(FreePage);
   }

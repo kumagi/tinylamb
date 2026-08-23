@@ -39,6 +39,8 @@ class Iterator {
     --(*iter_);
     return *this;
   }
+  // See IteratorBase::DropPageLatch.
+  void DropPageLatch() { iter_->DropPageLatch(); }
   friend std::ostream& operator<<(std::ostream& o, const Iterator& it) {
     it.iter_->Dump(o, 0);
     return o;

@@ -15,13 +15,21 @@
  */
 
 #include "type/value.hpp"
+#include <endian.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <functional>
+#include <limits>
+#include <string>
+#include <utility>
+#include <stdexcept>
+#include <ostream>
 
+#include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
-#include "common/env_endian.hpp"
 #include "common/serdes.hpp"
 #include "type/value_type.hpp"
 #include "type/date.hpp"
@@ -98,7 +106,8 @@ Value Value::DateFromDays(int64_t days) {
 }
 
 int64_t Value::DateDays() const {
-  if (type != ValueType::kDate) throw std::runtime_error("DATE value required");
+  if (type != ValueType::kDate) { throw std::runtime_error("DATE value required");
+}
   return value.int_value;
 }
 
@@ -109,15 +118,19 @@ Value::Value(const Value& o) : value(o.value), type(o.type) {
   }
 }
 
-Value::Value(Value&& o) : value(o.value), type(o.type) {
+Value::Value(Value&& o) noexcept
+    : value(o.value), type(o.type), owned_data(std::move(o.owned_data)) {
   if (type == ValueType::kVarChar) {
-    owned_data.assign(o.value.varchar_value);
+    // Re-seat the view onto the buffer this object now owns.
     value.varchar_value = owned_data;
+    // Leave the source in a valid (null) state; its view would dangle.
+    o.type = ValueType::kNull;
   }
 }
 
 Value& Value::operator=(const Value& rhs) {
-  if (this == &rhs) return *this;
+  if (this == &rhs) { return *this;
+}
   type = rhs.type;
   value = rhs.value;
   owned_data.clear();
@@ -128,14 +141,17 @@ Value& Value::operator=(const Value& rhs) {
   return *this;
 }
 
-Value& Value::operator=(Value&& o) {
-  if (this == &o) return *this;
+Value& Value::operator=(Value&& o) noexcept {
+  if (this == &o) { return *this;
+}
+  owned_data = std::move(o.owned_data);
   type = o.type;
   value = o.value;
-  owned_data.clear();
   if (type == ValueType::kVarChar) {
-    owned_data.assign(o.value.varchar_value);
+    // Re-seat the view onto the buffer this object now owns.
     value.varchar_value = owned_data;
+    // Leave the source in a valid (null) state; its view would dangle.
+    o.type = ValueType::kNull;
   }
   return *this;
 }
@@ -188,8 +204,13 @@ size_t Value::Deserialize(const char* src, ValueType as_type) {
     case ValueType::kInt64:
     case ValueType::kDate:
       return DeserializeInteger(src, &value.int_value);
-    case ValueType::kVarChar:
-      return DeserializeStringView(src, &value.varchar_value);
+    case ValueType::kVarChar: {
+      std::string_view decoded;
+      const size_t consumed = DeserializeStringView(src, &decoded);
+      owned_data.assign(decoded);
+      value.varchar_value = owned_data;
+      return consumed;
+    }
     case ValueType::kDouble:
       return DeserializeDouble(src, &value.double_value);
   }
@@ -243,6 +264,8 @@ bool Value::operator==(const Value& rhs) const {
     case ValueType::kVarChar:
       return value.varchar_value == rhs.value.varchar_value;
     case ValueType::kDouble:
+      // Epsilon comparison: accumulated sums must compare equal to literals
+      // (e.g. SUM over doubles vs 22.44). Exact bit equality is too strict.
       return std::fabs(value.double_value - rhs.value.double_value) < 1e-9;
   }
   throw std::runtime_error("undefined type");
@@ -259,9 +282,12 @@ std::string EncodeMemcomparableFormatInteger(int64_t in) {
 }
 
 size_t DecodeMemcomparableFormatInteger(const char* src, int64_t* dst) {
-  int64_t loaded;
-  ::memcpy(&loaded, src, 8);
-  *dst = be64toh(loaded ^ 0x80);
+  uint64_t loaded = 0;
+  ::memcpy(&loaded, src, sizeof(loaded));
+  // Undo the sign flip the encoder applied to the top bit of the big-endian
+  // image. XOR must happen after byte-swap so the fix lands on bit 63 on any
+  // host endianness (XORing before the swap only works on little-endian).
+  *dst = static_cast<int64_t>(be64toh(loaded) ^ (uint64_t{1} << 63));
   return sizeof(int64_t);
 }
 
@@ -269,7 +295,7 @@ std::string EncodeMemcomparableFormatVarchar(std::string_view in) {
   if (in.empty()) {
     return {'\x02', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0'};
   }
-  std::string ret(1 + (in.size() + 7) / 8 * 9, '\0');
+  std::string ret(1 + ((in.size() + 7) / 8 * 9), '\0');
   ret[0] = static_cast<char>(ValueType::kVarChar);  // Embeds prefix.
   char* dst = ret.data() + 1;
   const char* src = in.data();
@@ -292,7 +318,7 @@ std::string EncodeMemcomparableFormatVarchar(std::string_view in) {
 
 size_t DecodeMemcomparableFormatVarchar(const char* src, std::string* dst) {
   dst->clear();
-  const char* buffer;
+  const char* buffer = nullptr;
   const char* const initial_offset = src;
   for (size_t size = 0;;) {
     buffer = src;
@@ -425,23 +451,20 @@ Value Value::operator+(const Value& rhs) const {
     throw std::runtime_error("Different type cannot be added.");
   }
   if (type == ValueType::kInt64) {
-    return Value(value.int_value + rhs.value.int_value);
+    int64_t result = 0;
+    if (__builtin_add_overflow(value.int_value, rhs.value.int_value,
+                               &result)) {
+      throw std::runtime_error("integer overflow on '+'");
+    }
+    return Value(result);
   }
   if (type == ValueType::kDouble) {
     return Value(value.double_value + rhs.value.double_value);
   }
   if (type == ValueType::kVarChar) {
-    std::string new_string(
-        value.varchar_value.size() + rhs.value.varchar_value.size(), '\0');
-    ::memcpy(new_string.data(), value.varchar_value.data(),
-             value.varchar_value.size());
-    ::memcpy(new_string.data() + value.varchar_value.size(),
-             rhs.value.varchar_value.data(), rhs.value.varchar_value.size());
-    Value new_value;
-    new_value.owned_data = new_string;
-    new_value.type = ValueType::kVarChar;
-    new_value.value.varchar_value = new_value.owned_data;
-    return new_value;
+    std::string new_string(value.varchar_value);
+    new_string += rhs.value.varchar_value;
+    return Value(std::move(new_string));
   }
   throw std::runtime_error("Cannot do '+' against this type");
 }
@@ -451,7 +474,12 @@ Value Value::operator-(const Value& rhs) const {
     throw std::runtime_error("Different type cannot be subtracted.");
   }
   if (type == ValueType::kInt64) {
-    return Value(value.int_value - rhs.value.int_value);
+    int64_t result = 0;
+    if (__builtin_sub_overflow(value.int_value, rhs.value.int_value,
+                               &result)) {
+      throw std::runtime_error("integer overflow on '-'");
+    }
+    return Value(result);
   }
   if (type == ValueType::kDouble) {
     return Value(value.double_value - rhs.value.double_value);
@@ -464,7 +492,12 @@ Value Value::operator*(const Value& rhs) const {
     throw std::runtime_error("Different type cannot be multiplied.");
   }
   if (type == ValueType::kInt64) {
-    return Value(value.int_value * rhs.value.int_value);
+    int64_t result = 0;
+    if (__builtin_mul_overflow(value.int_value, rhs.value.int_value,
+                               &result)) {
+      throw std::runtime_error("integer overflow on '*'");
+    }
+    return Value(result);
   }
   if (type == ValueType::kDouble) {
     return Value(value.double_value * rhs.value.double_value);
@@ -477,6 +510,14 @@ Value Value::operator/(const Value& rhs) const {
     throw std::runtime_error("Different type cannot be divided.");
   }
   if (type == ValueType::kInt64) {
+    if (rhs.value.int_value == 0) {
+      throw std::runtime_error("division by zero");
+    }
+    // INT64_MIN / -1 overflows int64 and would raise SIGFPE.
+    if (value.int_value == std::numeric_limits<int64_t>::min() &&
+        rhs.value.int_value == -1) {
+      throw std::runtime_error("integer overflow on '/'");
+    }
     return Value(value.int_value / rhs.value.int_value);
   }
   if (type == ValueType::kDouble) {
@@ -490,6 +531,15 @@ Value Value::operator%(const Value& rhs) const {
     throw std::runtime_error("Different type cannot do modulo.");
   }
   if (type == ValueType::kInt64) {
+    if (rhs.value.int_value == 0) {
+      throw std::runtime_error("modulo by zero");
+    }
+    // INT64_MIN % -1 would raise SIGFPE on x86 despite the mathematical
+    // result (0) being representable.
+    if (value.int_value == std::numeric_limits<int64_t>::min() &&
+        rhs.value.int_value == -1) {
+      throw std::runtime_error("integer overflow on '%'");
+    }
     return Value(value.int_value % rhs.value.int_value);
   }
   throw std::runtime_error("Cannot do '%' against this type");
@@ -565,6 +615,9 @@ Decoder& operator>>(Decoder& e, Value& v) {
     case tinylamb::ValueType::kDouble:
       e >> v.value.double_value;
       break;
+    default:
+      // Corrupted stream: the raw byte read into v.type was not a ValueType.
+      throw std::runtime_error("undefined type");
   }
   return e;
 }
@@ -574,7 +627,7 @@ uint64_t std::hash<tinylamb::Value>::operator()(
     const tinylamb::Value& v) const {
   switch (v.type) {
     case tinylamb::ValueType::kNull:
-      break;
+      return 0x9e3779b97f4a7c15ULL;
     case tinylamb::ValueType::kInt64:
     case tinylamb::ValueType::kDate:
       return std::hash<int64_t>()(v.value.int_value);

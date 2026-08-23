@@ -100,11 +100,11 @@ class TpccWorkload {
  private:
   Status RunSql(TransactionContext& context, std::string_view sql,
                 std::vector<Row>* rows, TpccTransactionResult* result);
-  bool RequireRows(const std::vector<Row>& rows, std::string_view operation,
-                   TpccTransactionResult* result) const;
-  bool RequireAffected(const std::vector<Row>& rows, int64_t minimum,
-                       std::string_view operation,
-                       TpccTransactionResult* result) const;
+  static bool RequireRows(const std::vector<Row>& rows, std::string_view operation,
+                   TpccTransactionResult* result) ;
+  static bool RequireAffected(const std::vector<Row>& rows, int64_t minimum,
+                              std::string_view operation,
+                              TpccTransactionResult* result);
 
   TpccTransactionResult NewOrder();
   TpccTransactionResult Payment();

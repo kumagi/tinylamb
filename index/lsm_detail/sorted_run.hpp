@@ -21,6 +21,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -42,10 +43,9 @@ namespace tinylamb {
 struct LSMValue {
   bool is_delete{false};
   std::string payload;
-  static LSMValue& Delete() {
-    static LSMValue instance = LSMValue();
-    return instance;
-  }
+  // Returns a fresh tombstone by value: handing out a reference to a shared
+  // static would let callers mutate its payload.
+  static LSMValue Delete() { return LSMValue(); }
   LSMValue() : is_delete(true) {}
   explicit LSMValue(std::string p) : is_delete(false), payload(std::move(p)) {}
   LSMValue(const LSMValue& rhs) = default;
@@ -65,8 +65,9 @@ struct LSMValue {
 
 class SortedRun {
   static std::string HeadString(uint32_t in) {
-    std::string out(4, 0);
-    *(reinterpret_cast<uint32_t*>(out.data())) = be32toh(in);
+    std::string out(4, '\0');
+    const uint32_t raw = be32toh(in);
+    memcpy(out.data(), &raw, sizeof(raw));
     return out;
   }
 
@@ -194,9 +195,9 @@ class SortedRun {
 
   SortedRun() = default;
   explicit SortedRun(const std::filesystem::path& file);
-  static void Construct(const std::filesystem::path& file,
-                        const std::map<std::string, LSMValue>& tree,
-                        BlobFile& blob_, size_t generation);
+  static Status Construct(const std::filesystem::path& file,
+                          const std::map<std::string, LSMValue>& tree,
+                          BlobFile& blob_, size_t generation);
 
   SortedRun(const SortedRun&) = default;
   SortedRun(SortedRun&&) = default;
@@ -216,17 +217,15 @@ class SortedRun {
     return {this, blob, 0};
   }
   friend std::ostream& operator<<(std::ostream& o, const SortedRun& s);
-  static void FlushInternal(const std::filesystem::path& path,
-                            std::string_view min, std::string_view max,
-                            const std::vector<Entry>& index, size_t generation);
+  // Writes the run file and fsyncs it; on any failure the partially written
+  // file is removed and an error Status returned.
+  static Status FlushInternal(const std::filesystem::path& path,
+                              std::string_view min, std::string_view max,
+                              const std::vector<Entry>& index,
+                              size_t generation);
   [[nodiscard]] Entry GetEntry(size_t offset) const;
 
  private:
-  static size_t FileOffset() {
-    return reinterpret_cast<intptr_t>(
-        &reinterpret_cast<SortedRun*>(NULL)->index_);
-  }
-
   std::string min_key_;
   std::string max_key_;
   size_t length_{0};

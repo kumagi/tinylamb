@@ -2,7 +2,10 @@
 
 #include "server/postgres_protocol.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -10,6 +13,7 @@
 #include "gtest/gtest.h"
 #include "type/row.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb::pgwire {
 namespace {
@@ -18,8 +22,16 @@ TEST(PostgresProtocolTest, ParsesStartupPacket) {
   std::string packet;
   AppendUint32(&packet, 0);
   AppendUint32(&packet, kProtocolVersion30);
-  packet.append("user\0alice\0database\0warehouse\0\0", 31);
-  const uint32_t size = static_cast<uint32_t>(packet.size());
+  packet += "user";
+  packet.push_back('\0');
+  packet += "alice";
+  packet.push_back('\0');
+  packet += "database";
+  packet.push_back('\0');
+  packet += "warehouse";
+  packet.push_back('\0');
+  packet.push_back('\0');
+  const auto size = static_cast<uint32_t>(packet.size());
   packet[0] = static_cast<char>((size >> 24U) & 0xffU);
   packet[1] = static_cast<char>((size >> 16U) & 0xffU);
   packet[2] = static_cast<char>((size >> 8U) & 0xffU);
@@ -29,6 +41,7 @@ TEST(PostgresProtocolTest, ParsesStartupPacket) {
   const std::optional<StartupPacket> parsed =
       ParseStartupPacket(packet, &error);
   ASSERT_TRUE(parsed) << error;
+  if (!parsed.has_value()) { return; }
   EXPECT_EQ(parsed->protocol_version, kProtocolVersion30);
   EXPECT_EQ(parsed->parameters.at("user"), "alice");
   EXPECT_EQ(parsed->parameters.at("database"), "warehouse");
@@ -42,7 +55,7 @@ std::string StartupWithPayload(const std::string& body) {
   AppendUint32(&packet, 0);
   AppendUint32(&packet, kProtocolVersion30);
   packet.append(body);
-  const uint32_t size = static_cast<uint32_t>(packet.size());
+  const auto size = static_cast<uint32_t>(packet.size());
   packet[0] = static_cast<char>((size >> 24U) & 0xffU);
   packet[1] = static_cast<char>((size >> 16U) & 0xffU);
   packet[2] = static_cast<char>((size >> 8U) & 0xffU);
@@ -56,7 +69,8 @@ TEST(PostgresProtocolTest, RejectsMalformedStartupPackets) {
     std::string error;
     // Act -- a packet whose declared length does not match its real size
     // Assert -- the parser reports malformed rather than reading garbage
-    std::string packet = StartupWithPayload("user\0alice\0\0");
+    // (explicit length: a plain literal would truncate at the first NUL)
+    std::string packet = StartupWithPayload(std::string("user\0alice\0\0", 12));
     packet[3] = static_cast<char>(packet[3] + 1);
     EXPECT_FALSE(ParseStartupPacket(packet, &error));
     EXPECT_NE(error.find("malformed"), std::string::npos);
@@ -237,6 +251,78 @@ TEST(PostgresProtocolTest, EncodesExpectedBackendMessageTypes) {
   EXPECT_EQ(ErrorResponse("bad SQL", "42601")[0], 'E');
   EXPECT_EQ(RowDescription({{"answer", ValueType::kInt64}})[0], 'T');
   EXPECT_EQ(CommandComplete("SELECT 1")[0], 'C');
+}
+
+// The wire format stores the column count as uint16; a silent truncation
+// would desynchronize RowDescription/DataRow from the actual payload.
+TEST(PostgresProtocolTest, RejectsMoreThanUint16Columns) {
+  std::vector<ColumnDescription> columns(
+      static_cast<size_t>(std::numeric_limits<uint16_t>::max()) + 1);
+  EXPECT_THROW(RowDescription(columns), std::runtime_error);
+}
+
+TEST(PostgresProtocolTest, RejectsMoreThanUint16Values) {
+  Row row(std::vector<Value>(
+      static_cast<size_t>(std::numeric_limits<uint16_t>::max()) + 1));
+  EXPECT_THROW(DataRow(row), std::runtime_error);
+}
+
+// Tests derived from postgres_protocol_fuzzer corpus analysis.  The fuzzer
+// showed SplitSqlStatements keeps a trailing line comment as its own
+// "statement" (the trim only strips whitespace, not the comment text), so a
+// client sending "select 1; -- note" gets a bogus second statement that can
+// only fail at parse time.
+TEST(PostgresProtocolTest, TrailingLineCommentIsNotAStatement) {
+  // Expected behaviour: the trailing comment produces no statement.
+  const auto statements = SplitSqlStatements("select 1; -- hi");
+  ASSERT_EQ(statements.size(), 1U);
+  EXPECT_EQ(statements[0], "select 1");
+}
+
+TEST(PostgresProtocolTest, TrailingLineCommentWithNewlineIsNotAStatement) {
+  const auto statements = SplitSqlStatements("select 1; -- hi\n");
+  ASSERT_EQ(statements.size(), 1U);
+  EXPECT_EQ(statements[0], "select 1");
+}
+
+TEST(PostgresProtocolTest, CommentOnlyInputYieldsNoStatements) {
+  const auto statements = SplitSqlStatements("-- just a note");
+  EXPECT_TRUE(statements.empty());
+}
+
+TEST(PostgresProtocolTest, UnterminatedQuotesAndCommentsDoNotHang) {
+  // Robustness pin (passing): unterminated quoting must neither throw nor
+  // split; everything up to EOF stays one statement.
+  EXPECT_EQ(SplitSqlStatements("select /* 1; 2").size(), 1U);
+  EXPECT_EQ(SplitSqlStatements("select 'a; b").size(), 1U);
+}
+
+TEST(PostgresProtocolTest, DuplicateStartupParametersKeepLastValue) {
+  // Pin (passing): insert_or_assign semantics - the last occurrence of a
+  // duplicated parameter name wins.  Derived from a fuzzer-oracle lesson:
+  // map range-construction keeps the FIRST duplicate instead.
+  std::string body;
+  body.append("user\0first\0", 11);
+  body.append("user\0second\0", 12);
+  body.push_back('\0');
+  const std::string packet = StartupWithPayload(body);
+
+  std::string error;
+  const std::optional<StartupPacket> parsed =
+      ParseStartupPacket(packet, &error);
+  ASSERT_TRUE(parsed) << error;
+  if (!parsed.has_value()) { return; }
+  ASSERT_EQ(parsed->parameters.size(), 1U);
+  EXPECT_EQ(parsed->parameters.at("user"), "second");
+}
+
+TEST(PostgresProtocolTest, SplitHandlesBacktickQuotedSemicolons) {
+  // Pin (passing) from the fuzzer corpus: backticks quote like double quotes,
+  // so semicolons inside them do not split.
+  const auto statements = SplitSqlStatements("select `a;b` as c; select 2");
+  ASSERT_EQ(statements.size(), 2U);
+  EXPECT_EQ(statements[0], "select `a;b` as c");
+  EXPECT_EQ(statements[1], "select 2");
 }
 
 }  // namespace tinylamb::pgwire

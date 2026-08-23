@@ -16,7 +16,9 @@
 
 #include "type/constraint.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <ostream>
 
 #include "common/decoder.hpp"

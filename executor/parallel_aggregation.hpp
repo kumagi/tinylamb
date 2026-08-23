@@ -3,6 +3,7 @@
 #define TINYLAMB_EXECUTOR_PARALLEL_AGGREGATION_HPP
 
 #include <cstddef>
+#include <exception>
 #include <memory>
 #include <thread>
 #include <unordered_set>
@@ -32,6 +33,15 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   [[nodiscard]] size_t WorkerCount() const { return worker_count_; }
 
  private:
+  // How each aggregate reads its input.  kInt64Column aggregates can run
+  // directly over the chunk's raw integer storage; everything else falls back
+  // to the per-row generic path.
+  enum class AggregateInputKind { kRowCount, kInt64Column, kGeneric };
+  struct AggregateInput {
+    AggregateInputKind kind{AggregateInputKind::kGeneric};
+    size_t column{0};
+  };
+
   struct PartialState {
     std::vector<Value> values;
     std::vector<int64_t> counts;
@@ -40,6 +50,13 @@ class ParallelAggregationExecutor final : public ExecutorBase {
 
   [[nodiscard]] PartialState MakeState() const;
   void Accumulate(PartialState* state, const DataChunk& chunk) const;
+  // Walks `always_generic` and `fallback` (both ascending, disjoint) as one
+  // ascending index sequence.
+  void AccumulateGeneric(PartialState* state, const DataChunk& chunk,
+                         const std::vector<size_t>& always_generic,
+                         const std::vector<size_t>& fallback) const;
+  void AccumulateInt64Column(PartialState* state, size_t aggregate_index,
+                             const ColumnVector& column) const;
   void AccumulateValue(PartialState* state, size_t aggregate_index,
                        const Value& value, bool apply_distinct) const;
   void Merge(PartialState* destination, const PartialState& source) const;
@@ -48,8 +65,21 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   std::shared_ptr<ExecutorBase> child_;
   Schema input_schema_;
   std::vector<NamedExpression> aggregates_;
+  std::vector<AggregateInput> inputs_;
+  // Aggregate indices grouped by input kind, computed once in the
+  // constructor so Accumulate never rebuilds per-chunk selection state.
+  std::vector<size_t> row_count_indices_;
+  std::vector<size_t> int64_column_indices_;
+  std::vector<size_t> generic_indices_;
+  // Scratch for per-chunk generic fallbacks; capacity is retained across
+  // chunks so the hot path stays allocation-free.
+  mutable std::vector<size_t> generic_scratch_;
   size_t worker_count_;
   bool executed_{false};
+  // A failed execution must never degrade into a normal-looking empty
+  // aggregate on a subsequent Next(); the original error is rethrown.
+  bool errored_{false};
+  std::exception_ptr error_;
 };
 
 }  // namespace tinylamb

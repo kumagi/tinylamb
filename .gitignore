@@ -1,4 +1,13 @@
 build/
-cmake-build-*
+build-*/
+cmake-build-*/
 .idea/
 build-coverage/
+CMakeFiles/
+Testing/
+*.o
+*.a
+*.so
+*.dylib
+compile_commands.json
+.cache/

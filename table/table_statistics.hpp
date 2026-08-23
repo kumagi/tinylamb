@@ -42,8 +42,8 @@ struct ValueFrequency {
   size_t count{0};
 
   bool operator==(const ValueFrequency&) const = default;
-  friend Encoder& operator<<(Encoder& encoder, const ValueFrequency& value);
-  friend Decoder& operator>>(Decoder& decoder, ValueFrequency& value);
+  friend Encoder& operator<<(Encoder& encoder, const ValueFrequency& frequency);
+  friend Decoder& operator>>(Decoder& decoder, ValueFrequency& frequency);
 };
 
 // Equi-depth histogram bucket. Values are inclusive at both boundaries.

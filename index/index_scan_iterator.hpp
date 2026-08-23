@@ -17,6 +17,8 @@
 #ifndef TINYLAMB_UNIQUE_INDEX_SCAN_ITERATOR_HPP
 #define TINYLAMB_UNIQUE_INDEX_SCAN_ITERATOR_HPP
 
+#include <cstdint>
+
 #include "index/b_plus_tree.hpp"
 #include "index/b_plus_tree_iterator.hpp"
 #include "table/iterator_base.hpp"
@@ -33,10 +35,11 @@ class Transaction;
 class IndexScanIterator : public IteratorBase {
  public:
   IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
-                    Value begin = Value(), Value end = Value(),
+                    const Value& begin = Value(), const Value& end = Value(),
                     bool ascending = true);
   IndexScanIterator(const Table& table, const Index& index, Transaction& txn,
-                    std::vector<Value> begin_key, std::vector<Value> end_key,
+                    const std::vector<Value>& begin_key,
+                    const std::vector<Value>& end_key,
                     bool ascending = true);
   IndexScanIterator(const IndexScanIterator&) = delete;
   IndexScanIterator(IndexScanIterator&&) = delete;
@@ -74,7 +77,12 @@ class IndexScanIterator : public IteratorBase {
   Value end_;
   bool ascending_;
   bool is_unique_;
-  size_t value_offset_;
+  // Set by Clear(): once cleared the iterator must never report valid again
+  // even though the underlying BPlusTreeIterator may still iterate.
+  bool invalidated_{false};
+  // -1 means "not positioned"; otherwise an index into the non-unique
+  // value list of the current key. Signed so the sentinel cannot wrap.
+  int64_t value_offset_{-1};
   BPlusTree bpt_;
   BPlusTreeIterator iter_;
   RowPosition pos_;

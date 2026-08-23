@@ -27,6 +27,10 @@ class JitInt64Kernels {
   JitInt64Kernels& operator=(JitInt64Kernels&&) noexcept;
   ~JitInt64Kernels();
 
+  // Lifetime contract: the returned function pointers point into code owned
+  // by process-lifetime caches inside the JIT; they remain valid as long as
+  // no cache eviction is introduced and must not be called during/after
+  // process shutdown.
   void Filter(const int64_t* input, uint8_t* output, size_t count,
               int64_t constant) const;
   void Project(const int64_t* input, int64_t* output, size_t count,
@@ -35,8 +39,8 @@ class JitInt64Kernels {
   [[nodiscard]] double CompileMilliseconds() const;
 
  private:
-  explicit JitInt64Kernels(std::unique_ptr<Impl> impl);
-  std::unique_ptr<Impl> impl_;
+  explicit JitInt64Kernels(std::shared_ptr<Impl> impl);
+  std::shared_ptr<Impl> impl_;
 };
 
 }  // namespace tinylamb

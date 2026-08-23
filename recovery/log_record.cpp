@@ -22,6 +22,7 @@
 #include <iostream>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -45,11 +46,6 @@ enum KeyTypes : uint8_t {
   kHasSlot = 0x2,
   kHasKey = 0x4,
 };
-
-template <typename T>
-void Read(std::istream& in, T& dst) {
-  in.read(reinterpret_cast<char*>(&dst), sizeof(T));
-}
 
 [[maybe_unused]] std::string OmittedString(std::string_view original,
                                            size_t length) {
@@ -228,7 +224,6 @@ std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
       }
       o << "}";
       return o;
-      break;
     case LogType::kSetLowFence:
     case LogType::kSetHighFence:
     case LogType::kSetFoster:
@@ -252,28 +247,29 @@ std::ostream& operator<<(std::ostream& o, const LogRecord& l) {
 LogRecord::LogRecord(lsn_t prev, txn_id_t txn, LogType t)
     : type(t), prev_lsn(prev), txn_id(txn) {}
 
-LogRecord LogRecord::InsertingLogRecord(lsn_t p, txn_id_t txn, page_id_t pid,
-                                        slot_t slot, std::string_view r) {
+LogRecord LogRecord::InsertingLogRecord(lsn_t prev_lsn, txn_id_t txn,
+                                        page_id_t pid, slot_t key,
+                                        std::string_view redo) {
   LogRecord l;
-  l.prev_lsn = p;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
-  l.slot = slot;
+  l.slot = key;
   l.type = LogType::kInsertRow;
-  l.redo_data = r;
+  l.redo_data = redo;
   return l;
 }
 
-LogRecord LogRecord::InsertingLeafLogRecord(lsn_t p, txn_id_t txn,
+LogRecord LogRecord::InsertingLeafLogRecord(lsn_t prev_lsn, txn_id_t txn,
                                             page_id_t pid, std::string_view key,
-                                            std::string_view value) {
+                                            std::string_view redo) {
   LogRecord l;
-  l.prev_lsn = p;
+  l.prev_lsn = prev_lsn;
   l.txn_id = txn;
   l.pid = pid;
   l.key = key;
   l.type = LogType::kInsertLeaf;
-  l.redo_data = value;
+  l.redo_data = redo;
   return l;
 }
 
@@ -367,12 +363,12 @@ LogRecord LogRecord::UpdatingBranchLogRecord(lsn_t prev_lsn, txn_id_t txn,
 }
 
 LogRecord LogRecord::CompensatingUpdateLogRecord(txn_id_t txn, page_id_t pid,
-                                                 slot_t slot,
+                                                 slot_t key,
                                                  std::string_view redo) {
   LogRecord l;
   l.txn_id = txn;
   l.pid = pid;
-  l.slot = slot;
+  l.slot = key;
   l.type = LogType::kCompensateUpdateRow;
   l.redo_data = redo;
   return l;
@@ -647,7 +643,10 @@ size_t LogRecord::Size() const {
   size += offset;
   switch (type) {
     case LogType::kUnknown:
+      // kUnknown has no defined record layout: abort in debug, throw in
+      // NDEBUG instead of silently returning a redo_data-based size.
       assert(!"Don't call Size() of unknown log");
+      throw std::runtime_error("Size() of unknown log record");
     case LogType::kInsertRow:
     case LogType::kInsertLeaf:
     case LogType::kCompensateUpdateRow:
@@ -683,10 +682,10 @@ size_t LogRecord::Size() const {
       break;
     case LogType::kEndCheckpoint:
       size += sizeof(dirty_page_table.size()) +
-              dirty_page_table.size() * sizeof(std::pair<page_id_t, lsn_t>);
+              (dirty_page_table.size() * sizeof(std::pair<page_id_t, lsn_t>));
       size += sizeof(active_transaction_table.size()) +
-              active_transaction_table.size() *
-                  CheckpointManager::ActiveTransactionEntry::Size();
+              (active_transaction_table.size() *
+                  CheckpointManager::ActiveTransactionEntry::Size());
       break;
     case LogType::kSystemAllocPage:
       size += sizeof(PageType);
@@ -720,7 +719,10 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
   }
   switch (l.type) {
     case LogType::kUnknown:
+      // Fail loudly in NDEBUG builds instead of serializing a garbage
+      // record.
       assert(!"unknown type log must not be serialized");
+      throw std::runtime_error("unknown type log must not be serialized");
     case LogType::kInsertRow:
     case LogType::kCompensateUpdateLeaf:
     case LogType::kInsertLeaf:
@@ -775,11 +777,21 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
   return e;
 }
 
+// Deserializes a LogRecord.
+//
+// Stream-state contract: this operator does not consume the Decoder's
+// underlying istream state itself; a truncated payload yields zero-filled
+// fields (Decoder has no fail accessor). Callers that must reject torn
+// records (e.g. RecoveryManager::ReadLog) validate the stream state and the
+// decoded LogType around this call. An undefined/unknown LogType fails
+// loudly below instead of returning a half-decoded record silently.
 Decoder& operator>>(Decoder& d, LogRecord& l) {
   l.Clear();
   uint16_t type_raw = 0;
   d >> type_raw >> l.prev_lsn >> l.txn_id;
   l.type = static_cast<LogType>(type_raw);
+  // NOTE: a truncated header cannot be observed here (Decoder exposes no
+  // stream-state accessor); ReadLog validates the stream around this call.
   uint8_t types = 0;
   d >> types;
   if ((types & kHasPageID) != 0) {
@@ -806,6 +818,8 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
     case LogType::kCompensateUpdateLeaf:
     case LogType::kCompensateDeleteRow:
     case LogType::kCompensateDeleteLeaf:
+    case LogType::kCompensateSetLowFence:
+    case LogType::kCompensateSetHighFence:
     case LogType::kCompensateSetFoster:
       d >> l.redo_data;
       break;
@@ -840,8 +854,11 @@ Decoder& operator>>(Decoder& d, LogRecord& l) {
       break;
     }
     default:
+      // Never return a half-decoded record with an undefined type: reject
+      // with a catchable exception so RecoveryManager can skip torn tails
+      // and the fuzzers treat it as ordinary rejection.
       LOG(ERROR) << "unknown log type: " << l.type;
-      assert(!"unknown log");
+      throw std::runtime_error("unknown log type");
   }
   return d;
 }

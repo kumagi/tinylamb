@@ -16,7 +16,10 @@
 
 #include "expression/expression.hpp"
 
+#include <ostream>
+#include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <tuple>
 #include <vector>
 
@@ -26,11 +29,8 @@
 #include "database/transaction_context.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
-#include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
-#include "expression/constant_value.hpp"
 #include "expression/function_call_expression.hpp"
-#include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
@@ -40,6 +40,7 @@
 #include "type/column.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
@@ -554,12 +555,12 @@ TEST(ExpressionTest, PathologicalCases) {
 
   // Subcase 1 -- (1 + 2) * 3 = 9
   // Arrange 1 -- nested binary expression: (1+2)*3
-  Expression exp1 = BinaryExpressionExp(
+  Expression nested_product = BinaryExpressionExp(
       BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kAdd,
                           ConstantValueExp(Value(2))),
       BinaryOperation::kMultiply, ConstantValueExp(Value(3)));
   // Act 1 + Assert 1 -- evaluate and verify result equals 9
-  ASSERT_EQ(exp1->Evaluate(dummy, dummy_schema), Value(9));
+  ASSERT_EQ(nested_product->Evaluate(dummy, dummy_schema), Value(9));
 
   // Subcase 2 -- 1 + (2 * 3) = 7
   // Arrange 2 -- nested binary expression: 1+(2*3)
@@ -708,9 +709,14 @@ class BareExpression : public ExpressionBase {
  public:
   using ExpressionBase::Evaluate;
   using ExpressionBase::ResultType;
-  TypeTag Type() const override { return TypeTag::kConstantValue; }
-  Value Evaluate(const Row&, const Schema&) const override { return Value(1); }
-  std::string ToString() const override { return "bare"; }
+  [[nodiscard]] TypeTag Type() const override {
+    return TypeTag::kConstantValue;
+  }
+  [[nodiscard]] Value Evaluate(const Row& /*row*/,
+                               const Schema& /*schema*/) const override {
+    return Value(1);
+  }
+  [[nodiscard]] std::string ToString() const override { return "bare"; }
   void Dump(std::ostream& o) const override { o << "bare"; }
 };
 
@@ -776,7 +782,9 @@ TEST(ExpressionTest, AggregateResultTypeAndDistinct) {
   EXPECT_EQ(count->ResultType(schema, schema).GetType(), TypeTag::kBigInt);
   EXPECT_EQ(avg->ResultType(schema, schema).GetType(), TypeTag::kDouble);
 
-  EXPECT_TRUE(count->Evaluate(row, schema).IsNull());
+  // Direct evaluation of an aggregate is a misuse; it must throw instead of
+  // silently returning an empty value.
+  EXPECT_THROW(count->Evaluate(row, schema), std::logic_error);
   EXPECT_EQ(count->ToString(), "COUNT(amount)");
   EXPECT_EQ(AggregateExpressionExp(AggregationType::kCount,
                                    ColumnValueExp("amount"), true)
@@ -1099,6 +1107,25 @@ TEST(ExpressionTest, FunctionCallSubstr) {
                                  ConstantValueExp(Value("x"))})
           ->Evaluate(row, schema),
       std::runtime_error);
+  // A non-positive length yields the empty string instead of wrapping the
+  // negative length around to a size_t near SIZE_MAX.
+  Expression substr_negative_length = FunctionCallExp(
+      "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(1)),
+                 ConstantValueExp(Value(-1))});
+  EXPECT_EQ(substr_negative_length->Evaluate(row, schema),
+            Value(std::string()));
+  Expression substr_zero_length = FunctionCallExp(
+      "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(2)),
+                 ConstantValueExp(Value(0))});
+  EXPECT_EQ(substr_zero_length->Evaluate(row, schema), Value(std::string()));
+  // Start positions before the string are clamped to its beginning.
+  Expression substr_start_zero = FunctionCallExp(
+      "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(0))});
+  EXPECT_EQ(substr_start_zero->Evaluate(row, schema), Value("abc"));
+  Expression substr_start_negative =
+      FunctionCallExp("substr", {ConstantValueExp(Value("abc")),
+                                 ConstantValueExp(Value(-5))});
+  EXPECT_EQ(substr_start_negative->Evaluate(row, schema), Value("abc"));
   EXPECT_EQ(substr2->ToString(), "substr(\"hello\", 2)");
   std::ostringstream oss;
   substr2->Dump(oss);

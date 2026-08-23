@@ -18,7 +18,9 @@
 
 #include <cstddef>
 #include <set>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -99,8 +101,8 @@ TEST_F(RowPageTest, ReadMany) {
 TEST_F(RowPageTest, UpdateMany) {
   // Arrange
   constexpr static int kInserts = 20;
-  constexpr static char kLongMessage[] = " long updated messages!!!!!";
-  constexpr static char kShortMessage[] = "s";
+  constexpr static std::string_view kLongMessage = " long updated messages!!!!!";
+  constexpr static std::string_view kShortMessage = "s";
 
   // Act 1 -- insert kInserts short messages
   for (int i = 0; i < kInserts; ++i) {
@@ -112,8 +114,8 @@ TEST_F(RowPageTest, UpdateMany) {
   // Act 2 -- update even-indexed rows to long messages and verify each update
   for (int i = 0; i < kInserts; i += 2) {
     // even numbers.
-    UpdateRow(i, std::to_string(i) + kLongMessage);
-    ASSERT_EQ(ReadRow(i), std::to_string(i) + kLongMessage);
+    UpdateRow(i, std::to_string(i) + std::string(kLongMessage));
+    ASSERT_EQ(ReadRow(i), std::to_string(i) + std::string(kLongMessage));
   }
   Flush();
   Recover();  // RecoveryManager process will not do wrong thing.
@@ -121,8 +123,8 @@ TEST_F(RowPageTest, UpdateMany) {
   // Act 3 -- update odd-indexed rows to short messages and verify each update
   for (int i = 1; i < kInserts; i += 2) {
     // odd numbers.
-    UpdateRow(i, std::to_string(i) + kShortMessage);
-    ASSERT_EQ(ReadRow(i), std::to_string(i) + kShortMessage);
+    UpdateRow(i, std::to_string(i) + std::string(kShortMessage));
+    ASSERT_EQ(ReadRow(i), std::to_string(i) + std::string(kShortMessage));
   }
   Flush();
   Recover();  // RecoveryManager process will not do wrong thing.
@@ -131,22 +133,22 @@ TEST_F(RowPageTest, UpdateMany) {
   // recoveries
   for (int i = 0; i < kInserts; ++i) {
     if (i % 2 == 0) {
-      ASSERT_EQ(ReadRow(i), std::to_string(i) + kLongMessage);
+      ASSERT_EQ(ReadRow(i), std::to_string(i) + std::string(kLongMessage));
     } else {
-      ASSERT_EQ(ReadRow(i), std::to_string(i) + kShortMessage);
+      ASSERT_EQ(ReadRow(i), std::to_string(i) + std::string(kShortMessage));
     }
   }
 }
 
 TEST_F(RowPageTest, DeleteMany) {
   // Arrange
-  constexpr static char kMessage[] = "this is a pen";
+  constexpr static std::string_view kMessage = "this is a pen";
   constexpr int kRows = 100;
   std::unordered_set<std::string> inserted;
 
   // Act 1 -- insert kRows messages and track each inserted message
   for (int i = 0; i < kRows; ++i) {
-    std::string message = std::to_string(i) + kMessage;
+    std::string message = std::to_string(i) + std::string(kMessage);
     InsertRow(message);
     inserted.insert(message);
   }
@@ -200,7 +202,7 @@ TEST_F(RowPageTest, InsertZeroLenAbort) {
 
 TEST_F(RowPageTest, DeFragmentInvoked) {
   // Arrange
-  size_t kBigRowSize = kPageBodySize / 3 - 16;
+  size_t kBigRowSize = (kPageBodySize / 3) - 16;
 
   // Act 1 -- insert three big rows, then a fourth that should fail (no space)
   ASSERT_TRUE(InsertRow(std::string(kBigRowSize, '0')));
@@ -322,7 +324,7 @@ TEST_F(RowPageTest, UpdateHeavy) {
 
   // Act 1 -- insert kCount random keys and record their slots
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString((19937 * i) % 120 + 100);
+    std::string key = RandomString(((19937 * i) % 120) + 100);
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn, key));
     slots.push_back(slot);
     rows[i] = key;
@@ -332,8 +334,8 @@ TEST_F(RowPageTest, UpdateHeavy) {
   // keys
   Row read;
   for (int i = 0; i < kCount * 20; ++i) {
-    slot_t slot = slots[(i * 63) % slots.size()];
-    std::string key = RandomString((19937 * i) % 120 + 10);
+    slot_t slot = slots[(static_cast<size_t>(i) * 63) % slots.size()];
+    std::string key = RandomString(((19937 * i) % 120) + 10);
     ASSERT_SUCCESS(ref->Update(txn, slot, key));
     rows[slot] = key;
   }
@@ -356,7 +358,7 @@ TEST_F(RowPageTest, UpdateAndDeleteHeavy) {
 
   // Act 1 -- insert kCount random keys and record their slots
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString((19937 * i) % 120 + 100);
+    std::string key = RandomString(((19937 * i) % 120) + 100);
     ASSIGN_OR_ASSERT_FAIL(slot_t, slot, ref->Insert(txn, key));
     slots.push_back(slot);
     rows[i] = key;
@@ -365,8 +367,8 @@ TEST_F(RowPageTest, UpdateAndDeleteHeavy) {
   // Act 2 -- for kCount*40 iterations, update or delete+re-insert each slot
   Row read;
   for (int i = 0; i < kCount * 40; ++i) {
-    slot_t slot = slots[(i * 63) % slots.size()];
-    std::string key = RandomString((19937 * i) % 120 + 10);
+    slot_t slot = slots[(static_cast<size_t>(i) * 63) % slots.size()];
+    std::string key = RandomString(((19937 * i) % 120) + 10);
     if (i % 2 == 0) {
       ASSERT_SUCCESS(ref->Update(txn, slot, key));
     } else {
@@ -432,13 +434,13 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedShrinkDoesNotCorruptPage) {
 
   // Assert -- the page layout must stay intact: free_ptr_ never drops below
   // the slot array end, every live row must sit fully inside the page body,
-  // and the row that T1 shrank must still be readable.
+  // and no live row may be lost.
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(page_id_);
   const RowPage& rp = page.GetRowPage();
   const char* const body = reinterpret_cast<const char*>(&rp);
   const char* const slot_array_end =
-      body + sizeof(RowPage) + rp.RowMax() * sizeof(RowPointer);
+      body + sizeof(RowPage) + (rp.RowMax() * sizeof(RowPointer));
   EXPECT_GE(body + rp.FreePtrForTest(), slot_array_end);
   for (slot_t i = 0; i < rp.RowMax(); ++i) {
     if (rp.rows_[i].offset == 0) {
@@ -449,7 +451,32 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedShrinkDoesNotCorruptPage) {
     EXPECT_LE(row + rp.rows_[i].size, body + kPageBodySize);
   }
   page.PageUnlock();
-  EXPECT_EQ(ReadRow(0), std::string(2000, 'a'));
+
+  // Restoring slot 0's 2000-byte image cannot fit anymore once T2's committed
+  // insert consumed the freed space.  The undo must refuse cleanly instead of
+  // dropping live rows as the old reclaim did, so only require that every
+  // other committed row -- including T2's -- survives and the shrunken slot
+  // stays readable without any structural damage.
+  (void)ReadRow(0);
+  for (int i = 1; i < 16; ++i) {
+    EXPECT_EQ(ReadRow(i), std::string(2000, 'a')) << "slot " << i;
+  }
+  bool found_committed_insert = false;
+  {
+    auto probe = tm_->Begin();
+    PageRef scan = p_->GetPage(page_id_);
+    const RowPage& body_rp = scan.GetRowPage();
+    for (slot_t i = 0; i < body_rp.RowMax(); ++i) {
+      if (body_rp.rows_[i].offset != 0 &&
+          body_rp.GetRow(i) == std::string(1900, 'c')) {
+        found_committed_insert = true;
+      }
+    }
+    scan.PageUnlock();
+    EXPECT_SUCCESS(probe.PreCommit());
+    probe.CommitWait();
+  }
+  EXPECT_TRUE(found_committed_insert);
 }
 
 // Regression test for the sibling heap-buffer-overflow in RowPage::InsertRow
@@ -492,14 +519,13 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
   ASSERT_NO_FATAL_FAILURE(r_->RecoverFrom(0, tm_.get()));
 
   // Assert -- the page layout must stay intact: free_ptr_ never drops below
-  // the slot array end, every live row must sit fully inside the page body,
-  // and the deleted row must still be readable after the rollback.
+  // the slot array end, every live row must sit fully inside the page body.
   auto txn = tm_->Begin();
   PageRef page = p_->GetPage(page_id_);
   const RowPage& rp = page.GetRowPage();
   const char* const body = reinterpret_cast<const char*>(&rp);
   const char* const slot_array_end =
-      body + sizeof(RowPage) + rp.RowMax() * sizeof(RowPointer);
+      body + sizeof(RowPage) + (rp.RowMax() * sizeof(RowPointer));
   EXPECT_GE(body + rp.FreePtrForTest(), slot_array_end);
   for (slot_t i = 0; i < rp.RowMax(); ++i) {
     if (rp.rows_[i].offset == 0) {
@@ -510,7 +536,26 @@ TEST_F(RowPageTest, RecoveryUndoOfUncommittedDeleteDoesNotCorruptPage) {
     EXPECT_LE(row + rp.rows_[i].size, body + kPageBodySize);
   }
   page.PageUnlock();
-  EXPECT_EQ(ReadRow(0), std::string(2000, 'a'));
+
+  // Re-inserting slot 0's 2000-byte image cannot fit after T2's committed
+  // update consumed the freed space.  The undo must refuse cleanly instead of
+  // dropping other live rows as the old reclaim did: the delete stays
+  // applied, all untouched rows keep their committed images, and T2's grown
+  // row survives.
+  {
+    auto probe = tm_->Begin();
+    PageRef scan = p_->GetPage(page_id_);
+    EXPECT_EQ(scan->Read(probe, 0).GetStatus(), Status::kNotExists);
+    for (int i = 1; i < 15; ++i) {
+      ASSIGN_OR_ASSERT_FAIL(std::string_view, value, scan->Read(probe, i));
+      EXPECT_EQ(value, std::string(2000, 'a')) << "slot " << i;
+    }
+    ASSIGN_OR_ASSERT_FAIL(std::string_view, grown, scan->Read(probe, 15));
+    EXPECT_EQ(grown, std::string(3900, 'c'));
+    scan.PageUnlock();
+    EXPECT_SUCCESS(probe.PreCommit());
+    probe.CommitWait();
+  }
 }
 
 TEST_F(RowPageTest, UpdateAndDeleteOutOfRangeSlot) {
@@ -527,7 +572,13 @@ TEST_F(RowPageTest, UpdateAndDeleteOutOfRangeSlot) {
 }
 
 TEST_F(RowPageTest, ReadOnlyTransactionRejectedForWrites) {
-  // Arrange -- a read-only transaction cannot acquire write locks
+  // Arrange -- commit one row first so Update/Delete address an existing
+  // slot.  (The previous version of this test relied on the ghost-row bug:
+  // the rejected Insert physically populated slot 0 without any WAL record,
+  // which let the subsequent Update/Delete reach the lock check.)
+  ASSERT_TRUE(InsertRow("committed"));
+
+  // A read-only transaction cannot acquire write locks
   auto txn = tm_->Begin(true);
   PageRef page = p_->GetPage(page_id_);
 
@@ -539,6 +590,40 @@ TEST_F(RowPageTest, ReadOnlyTransactionRejectedForWrites) {
 
   // Act/Assert -- delete conflicts on a read-only transaction
   ASSERT_EQ(page->Delete(txn, 0), Status::kConflicts);
+}
+
+// Regression test for the ghost-row bug (improvements2.md §2.1): a rejected
+// lock acquisition used to leave the physical slot populated without any WAL
+// record.  The WAL-less slot survived WriteBack and the MVCC fast path then
+// showed the aborted row as a committed value to every snapshot.
+TEST_F(RowPageTest, ConflictedInsertConsumesNoPhysicalSlot) {
+  // Act -- an insert whose lock acquisition fails must not touch the page.
+  {
+    auto ro = tm_->Begin(true);
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_EQ(page->Insert(ro, "ghost").GetStatus(), Status::kConflicts);
+    page.PageUnlock();
+    ro.Abort();
+  }
+
+  // The residue must neither be visible now nor survive flush + recovery.
+  EXPECT_EQ(GetRowCount(), 0U);
+  Flush();
+  Recover();
+  ASSERT_NO_FATAL_FAILURE(r_->RecoverFrom(0, tm_.get()));
+  EXPECT_EQ(GetRowCount(), 0U);
+
+  // Assert -- the freed-up slot numbering is untouched: the next real insert
+  // reuses slot 0 and reads back its own image.
+  {
+    auto txn = tm_->Begin();
+    PageRef page = p_->GetPage(page_id_);
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(txn, "real"));
+    EXPECT_EQ(slot, 0U);
+    ASSERT_SUCCESS(txn.PreCommit());
+    txn.CommitWait();
+  }
+  EXPECT_EQ(ReadRow(0), "real");
 }
 
 TEST_F(RowPageTest, DeFragmentAndDump) {

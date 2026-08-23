@@ -31,6 +31,7 @@
 #include "index/lsm_detail/sorted_run.hpp"
 
 namespace tinylamb {
+namespace {
 // Treats invalid iterator as infinity big.
 bool IsRightIteratorBigger(int left, int right,
                            const std::vector<SortedRun::Iterator>& iters) {
@@ -46,6 +47,7 @@ bool IsRightIteratorBigger(int left, int right,
   }
   return iters[right].Generation() < iters[left].Generation();
 }
+}  // namespace
 
 LSMView::Iterator LSMView::Begin() const { return {this, true}; }
 
@@ -85,12 +87,9 @@ void LSMView::CreateSingleRun(const std::filesystem::path& path) const {
   std::string min_key = it.Key();
   std::string max_key;
 
-  size_t pos = 0;
   while (it.IsValid()) {
     merged.push_back(it.TopIterator().GetEntry());
-    if (++pos == merged.size()) {
-      max_key = it.Key();
-    }
+    max_key = it.Key();
     ++it;
   }
   SortedRun::FlushInternal(path, min_key, max_key, merged, max_generation + 1);
@@ -106,32 +105,22 @@ LSMView::Iterator::Iterator(const LSMView* vm, bool head)
         continue;
       }
       iters_.emplace_back(iter);
-      size_t curr = iters_.size() - 1;
-      if (curr == 0) {
-        continue;
-      }
+    }
+    remaining_iters_ = iters_.size();
+    // Single min-heap build. Ordering: by key; equal keys keep the newest
+    // run (largest generation number) on top so duplicates are emitted from
+    // the newest source first and skipped by AdvanceSkippingTombstones().
+    // Exhausted iterators act as +infinity sentinels.
+    for (size_t i = 1; i < iters_.size(); ++i) {
+      size_t curr = i;
       while (0 < curr) {
-        if (!iters_[curr].IsValid() || !iters_[curr / 2].IsValid()) {
-          break;
-        }
         int result = iters_[curr].Compare(iters_[curr / 2]);
         if (result == 0) {
-          if (iters_[curr].Generation() < iters_[curr / 2].Generation()) {
-            ++iters_[curr];
-            if (!iters_[curr].IsValid()) {
-              break;
-            }
-            result--;
-          } else {
-            ++iters_[curr / 2];
-            if (!iters_[curr / 2].IsValid()) {
-              break;
-            }
-            result++;
-          }
+          result =
+              iters_[curr].Generation() < iters_[curr / 2].Generation() ? -1
+                                                                        : 1;
         }
         if (0 < result) {
-          // curr/2 has smaller value.
           std::swap(iters_[curr], iters_[curr / 2]);
           curr /= 2;
         } else {
@@ -139,40 +128,9 @@ LSMView::Iterator::Iterator(const LSMView* vm, bool head)
         }
       }
     }
-    {
-      std::vector<SortedRun::Iterator> valid;
-      valid.reserve(iters_.size());
-      for (const SortedRun::Iterator& it : iters_) {
-        if (it.IsValid()) valid.push_back(it);
-      }
-      iters_ = std::move(valid);
-      remaining_iters_ = iters_.size();
-      for (size_t i = 1; i < iters_.size(); ++i) {
-        size_t curr = i;
-        while (0 < curr) {
-          int result = iters_[curr].Compare(iters_[curr / 2]);
-          if (result == 0) {
-            result = iters_[curr].Generation() < iters_[curr / 2].Generation()
-                         ? -1
-                         : 1;
-          }
-          if (0 < result) {
-            std::swap(iters_[curr], iters_[curr / 2]);
-            curr /= 2;
-          } else {
-            break;
-          }
-        }
-      }
-    }
 
     if (!iters_.empty() && iters_[0].IsValid() && iters_[0].IsDeleted()) {
-      std::string deleted_key;
-      do {
-        deleted_key = iters_[0].Key();
-        ++*this;
-      } while (IsValid() && !iters_.empty() && iters_[0].IsValid() &&
-               (deleted_key == iters_[0].Key() || iters_[0].IsDeleted()));
+      AdvanceSkippingTombstones();
     }
   }
 }
@@ -215,7 +173,7 @@ void LSMView::Iterator::Forward() {
   }
   std::swap(iters_[0], iters_[curr]);
   while (curr * 2 < iters_.size()) {
-    if (curr * 2 + 1 == iters_.size() ||
+    if ((curr * 2) + 1 == iters_.size() ||
         IsRightIteratorBigger(curr * 2, (curr * 2) + 1, iters_)) {
       if (!iters_[curr].IsValid() ||
           (iters_[curr * 2].IsValid() &&
@@ -230,7 +188,7 @@ void LSMView::Iterator::Forward() {
     } else {
       if (IsRightIteratorBigger((curr * 2) + 1, curr, iters_)) {
         std::swap(iters_[curr], iters_[(curr * 2) + 1]);
-        curr = curr * 2 + 1;
+        curr = (curr * 2) + 1;
       } else {
         break;
       }
@@ -238,17 +196,22 @@ void LSMView::Iterator::Forward() {
   }
 }
 
-LSMView::Iterator& LSMView::Iterator::operator++() {
-  if (!IsValid() || iters_.empty() || !iters_[0].IsValid()) {
-    remaining_iters_ = 0;
-    return *this;
-  }
+void LSMView::Iterator::AdvanceSkippingTombstones() {
+  assert(IsValid() && !iters_.empty() && iters_[0].IsValid());
   std::string previous_key;
   do {
     previous_key = Key();
     Forward();
   } while (IsValid() && !iters_.empty() && iters_[0].IsValid() &&
            (Key() == previous_key || iters_[0].IsDeleted()));
+}
+
+LSMView::Iterator& LSMView::Iterator::operator++() {
+  if (!IsValid() || iters_.empty() || !iters_[0].IsValid()) {
+    remaining_iters_ = 0;
+    return *this;
+  }
+  AdvanceSkippingTombstones();
   return *this;
 }
 

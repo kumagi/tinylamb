@@ -20,6 +20,7 @@
 #include <iterator>
 #include <memory>
 #include <random>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -27,7 +28,6 @@
 #include <vector>
 
 #include "common/constants.hpp"
-#include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
@@ -528,7 +528,7 @@ TEST_F(BranchPageTest, DeleteAbort) {
 
 TEST_F(BranchPageTest, UpdateHeavy) {
   // Arrange
-  std::mt19937 random(0);
+  std::mt19937 random(0);  // NOLINT(cert-msc32-c,cert-msc51-cpp) fixed seed keeps the test reproducible
   constexpr int kCount = 40;
   Transaction txn = tm_->Begin();
   std::vector<std::string> keys;
@@ -618,7 +618,7 @@ TEST_F(BranchPageTest, FosterChild) {
   for (int i = 0; i < 100; ++i) {
     std::string key = RandomString(((19937 * i) % 12) + 5000, false);
     ASSERT_SUCCESS(page->SetFoster(txn, {key, page_id_t(i)}));
-    ASSIGN_OR_ASSERT_FAIL(FosterPair, result, page->GetFoster(txn));
+    ASSIGN_OR_ASSERT_FAIL_CONST(FosterPair, result, page->GetFoster(txn));
     ASSERT_EQ(result.key, key);
     ASSERT_EQ(result.child_pid, i);
     ASSERT_SUCCESS(page->SetFoster(txn, FosterPair()));
@@ -641,7 +641,7 @@ TEST_F(BranchPageTest, FosterChildCrash) {
       Transaction txn = tm_->Begin();
       PageRef page = Page();
       ASSERT_SUCCESS(page->SetFoster(txn, {key, page_id_t(i)}));
-      ASSIGN_OR_ASSERT_FAIL(FosterPair, result, page->GetFoster(txn));
+      ASSIGN_OR_ASSERT_FAIL_CONST(FosterPair, result, page->GetFoster(txn));
       ASSERT_EQ(result.key, key);
       ASSERT_EQ(result.child_pid, i);
       ASSERT_SUCCESS(txn.PreCommit());
@@ -651,7 +651,7 @@ TEST_F(BranchPageTest, FosterChildCrash) {
     {
       Transaction txn = tm_->Begin();
       PageRef page = Page();
-      ASSIGN_OR_ASSERT_FAIL(FosterPair, result, page->GetFoster(txn));
+      ASSIGN_OR_ASSERT_FAIL_CONST(FosterPair, result, page->GetFoster(txn));
       ASSERT_EQ(result.key, key);
       ASSERT_EQ(result.child_pid, i);
     }
@@ -926,7 +926,7 @@ TEST_F(BranchPageTest, MoveRightToFosterKeepsLookupsOrdered) {
   ASSERT_EQ(page->RowCount(), 2U);
   ASSERT_EQ(page->GetKey(0), "a");
   ASSERT_EQ(page->GetKey(1), "b");
-  ASSIGN_OR_ASSERT_FAIL(FosterPair, foster_pair, page->GetFoster(txn));
+  ASSIGN_OR_ASSERT_FAIL_CONST(FosterPair, foster_pair, page->GetFoster(txn));
   ASSERT_EQ(foster_pair.key, "c");
   ASSERT_EQ(foster_pair.child_pid, foster->PageID());
   ASSERT_SUCCESS_AND_EQ(page->GetPageForKey(txn, "a", false), 2);

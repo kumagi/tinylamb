@@ -15,16 +15,24 @@
  */
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <cctype>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
@@ -33,10 +41,13 @@
 #include "executor/aggregation.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/cross_join.hpp"
+#include "executor/data_chunk.hpp"
 #include "executor/delete.hpp"
 #include "executor/distinct.hpp"
+#include "executor/executor_base.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/hash_join.hpp"
+#include "executor/hash_join_mode.hpp"
 #include "executor/index_join.hpp"
 #include "executor/index_scan.hpp"
 #include "executor/insert.hpp"
@@ -67,9 +78,12 @@ class SyntheticBatchExecutor final : public ExecutorBase {
   explicit SyntheticBatchExecutor(size_t row_count) : row_count_(row_count) {}
 
   bool Next(Row* destination, RowPosition* position) override {
-    if (next_row_ == row_count_) return false;
+    if (next_row_ == row_count_) { return false;
+}
     *destination = Row({Value(static_cast<int64_t>(next_row_ % 100))});
-    if (position) *position = RowPosition(1, next_row_);
+    if (position != nullptr) {
+      *position = RowPosition(1, next_row_);
+    }
     ++next_row_;
     return true;
   }
@@ -149,7 +163,9 @@ TEST_F(ExecutorTest, Construct) {
 TEST_F(ExecutorTest, FullScan) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   FullScan fs(ctx.txn_, *tbl);
   std::unordered_set rows({Row({Value(0), Value("hello"), Value(1.2)}),
                             Row({Value(3), Value("piyo"), Value(12.2)}),
@@ -181,7 +197,9 @@ TEST_F(ExecutorTest, FullScan) {
 TEST_F(ExecutorTest, IndexScan) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   ASSERT_EQ(tbl->IndexCount(), 2);
   const Schema sc = tbl->GetSchema();
   IndexScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value("he"), Value("q"), true,
@@ -206,7 +224,9 @@ TEST_F(ExecutorTest, IndexScan) {
 TEST_F(ExecutorTest, IndexOnlyScan) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   ASSERT_EQ(tbl->IndexCount(), 2);
   const Schema sc = tbl->GetSchema();
   IndexOnlyScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value("he"), Value("q"),
@@ -232,7 +252,9 @@ TEST_F(ExecutorTest, IndexOnlyScan) {
 TEST_F(ExecutorTest, IndexOnlyFullScan) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   ASSERT_EQ(tbl->IndexCount(), 2);
   const Schema sc = tbl->GetSchema();
   IndexOnlyScan fs(ctx.txn_, *tbl, tbl->GetIndex(0), Value(), Value(), true,
@@ -261,7 +283,9 @@ TEST_F(ExecutorTest, IndexOnlyFullScan) {
 TEST_F(ExecutorTest, Projection) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   auto fs = std::make_shared<FullScan>(ctx.txn_, *tbl);
   Projection proj({NamedExpression("key"), NamedExpression("score")},
                    tbl->GetSchema(), std::move(fs));
@@ -293,7 +317,9 @@ TEST_F(ExecutorTest, Projection) {
 TEST_F(ExecutorTest, Selection) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   Expression key_is_1 =
       BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kEquals,
                            ConstantValueExp(Value(1)));
@@ -313,8 +339,9 @@ TEST_F(ExecutorTest, Selection) {
 
 TEST_F(ExecutorTest, SelectionSkipsImpossibleZoneMapBatch) {
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                        ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> table_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& table = table_status.Value();
   Selection selection(
       BinaryExpressionExp(ColumnValueExp("key"),
                           BinaryOperation::kGreaterThan,
@@ -339,7 +366,8 @@ TEST_F(ExecutorTest, SelectionUsesJitForLargeIntegerBatches) {
       schema, std::make_shared<ConstantExecutor>(std::move(rows)), 1024);
   DataChunk output;
   size_t selected = 0;
-  while (selection.NextBatch(&output) != 0) selected += output.Size();
+  while (selection.NextBatch(&output) != 0) { selected += output.Size();
+}
   EXPECT_EQ(selected, 1047U);
   EXPECT_GE(selection.JitBatches(), 1U);
 }
@@ -366,7 +394,7 @@ TEST_F(ExecutorTest, ProjectionUsesJitForLargeAffineIntegerBatches) {
   while (projection.NextBatch(&output) != 0) {
     for (size_t row = 0; row < output.Size(); ++row) {
       EXPECT_EQ(output.ColumnAt(0).ValueAt(row),
-                Value(static_cast<int64_t>((offset + row) * 3 + 7)));
+                Value(static_cast<int64_t>(((offset + row) * 3) + 7)));
     }
     offset += output.Size();
   }
@@ -398,7 +426,9 @@ TEST_F(ExecutorTest, AggregationUsesJitForLargeIntegerSumBatches) {
 TEST_F(ExecutorTest, BasicJoin) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   ASSIGN_OR_ASSERT_FAIL(
       Table, right_tbl,
       rs_->CreateTable(ctx, Schema{"RightTable",
@@ -448,7 +478,9 @@ TEST_F(ExecutorTest, BasicJoin) {
 TEST_F(ExecutorTest, IndexJoin) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   ASSIGN_OR_ASSERT_FAIL(
       Table, right_tbl,
       rs_->CreateTable(ctx, Schema{"RightTable",
@@ -465,8 +497,9 @@ TEST_F(ExecutorTest, IndexJoin) {
   ASSERT_SUCCESS(rs_->CreateIndex(
       ctx, "RightTable",
       IndexSchema("RightIdx", {0}, {}, IndexMode::kNonUnique)));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, reload_right,
-                        ctx.GetTable("RightTable"));
+  const StatusOr<std::shared_ptr<Table>> reload_right_status = ctx.GetTable("RightTable");
+  ASSERT_EQ(reload_right_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& reload_right = reload_right_status.Value();
   ASSERT_EQ(reload_right->IndexCount(), 1);
   IndexJoin ij(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0},
                 *reload_right, reload_right->GetIndex(0), {0});
@@ -509,7 +542,9 @@ TEST_F(ExecutorTest, IndexJoin) {
 TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   ASSIGN_OR_ASSERT_FAIL(
       Table, right_tbl,
       rs_->CreateTable(ctx, Schema{"RightTable",
@@ -527,8 +562,9 @@ TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
   ASSERT_SUCCESS(rs_->CreateIndex(
       ctx, "RightTable",
       IndexSchema("RightIdx", {0}, {}, IndexMode::kNonUnique)));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, reload_right,
-                        ctx.GetTable("RightTable"));
+  const StatusOr<std::shared_ptr<Table>> reload_right_status = ctx.GetTable("RightTable");
+  ASSERT_EQ(reload_right_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& reload_right = reload_right_status.Value();
   ASSERT_EQ(reload_right->IndexCount(), 1);
   IndexJoin ij(ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *tbl), {0, 1},
                *reload_right, reload_right->GetIndex(0), {0, 2});
@@ -560,14 +596,17 @@ TEST_F(ExecutorTest, IndexJoinWithCompositeKey) {
 TEST_F(ExecutorTest, Insert) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   Schema src_schema{
       "SrcTable",
       {Column("key2", ValueType::kInt64), Column("name2", ValueType::kVarChar),
        Column("score2", ValueType::kDouble)}};
   rs_->CreateTable(ctx, src_schema);
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, right_tbl,
-                        ctx.GetTable("SrcTable"));
+  const StatusOr<std::shared_ptr<Table>> right_tbl_status = ctx.GetTable("SrcTable");
+  ASSERT_EQ(right_tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& right_tbl = right_tbl_status.Value();
   BulkInsert(ctx.txn_, *right_tbl,
              {{Row({Value(9), Value("troop"), Value(1.2)})},
               {Row({Value(7), Value("arise"), Value(3.9)})},
@@ -619,14 +658,16 @@ TEST_F(ExecutorTest, Insert) {
 TEST_F(ExecutorTest, Update) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   Schema src_schema{
       "SrcTable",
       {Column("key2", ValueType::kInt64), Column("name2", ValueType::kVarChar),
        Column("score2", ValueType::kDouble)}};
   rs_->CreateTable(ctx, src_schema);
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, right_tbl,
-                        ctx.GetTable("SrcTable"));
+  const StatusOr<std::shared_ptr<Table>> right_tbl_status = ctx.GetTable("SrcTable");
+  ASSERT_EQ(right_tbl_status.GetStatus(), Status::kSuccess);
 
   std::vector<NamedExpression> update_rule = {
       NamedExpression("key", ColumnValueExp("key")),
@@ -673,7 +714,9 @@ TEST_F(ExecutorTest, Update) {
 TEST_F(ExecutorTest, Aggregation) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   auto fs = std::make_shared<FullScan>(ctx.txn_, *tbl);
   std::vector<NamedExpression> aggregates = {
       NamedExpression("count", AggregateExpressionExp(AggregationType::kCount,
@@ -695,8 +738,10 @@ TEST_F(ExecutorTest, Aggregation) {
 
   // Assert -- aggregated values match expected statistics
   ASSERT_EQ(result[0], Value(4));
-  ASSERT_EQ(result[1], Value(22.44));
-  ASSERT_EQ(result[2], Value(5.61));
+  // Accumulating doubles loses low-order bits, so a strict equality against
+  // the decimal literal is not a stable contract; allow rounding slack.
+  EXPECT_NEAR(result[1].value.double_value, 22.44, 1e-9);
+  EXPECT_NEAR(result[2].value.double_value, 5.61, 1e-9);
   ASSERT_EQ(result[3], Value(1.2));
   ASSERT_EQ(result[4], Value(12.2));
   ASSERT_FALSE(agg.Next(&result, nullptr));
@@ -704,8 +749,9 @@ TEST_F(ExecutorTest, Aggregation) {
 
 TEST_F(ExecutorTest, VectorizedScanFilterProjectAggregatePipeline) {
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                        ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> table_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& table = table_status.Value();
   const Schema input_schema = table->GetSchema();
   auto scan = std::make_shared<FullScan>(ctx.txn_, *table);
   auto filter = std::make_shared<Selection>(
@@ -738,12 +784,13 @@ TEST_F(ExecutorTest, VectorizedScanFilterProjectAggregatePipeline) {
   ASSERT_EQ(output.Size(), 1);
   const Row result = output.RowAt(0);
   EXPECT_EQ(result[0], Value(3));
-  EXPECT_EQ(result[1], Value(42.48));
+  // Accumulated double sum: allow rounding slack against the literal.
+  EXPECT_NEAR(result[1].value.double_value, 42.48, 1e-9);
   EXPECT_EQ(aggregate.NextBatch(&output, 8), 0);
 }
 
 TEST_F(ExecutorTest, MorselDrivenParallelScanReadsEveryPageOnce) {
-  constexpr char kParallelTable[] = "ParallelScanTable";
+  constexpr std::string_view kParallelTable = "ParallelScanTable";
   constexpr int64_t kRows = 2000;
   {
     TransactionContext writer = rs_->BeginContext();
@@ -761,8 +808,9 @@ TEST_F(ExecutorTest, MorselDrivenParallelScanReadsEveryPageOnce) {
   }
 
   TransactionContext reader = rs_->BeginReadOnlyContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                        reader.GetTable(kParallelTable));
+  const StatusOr<std::shared_ptr<Table>> table_status = reader.GetTable(kParallelTable);
+  ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& table = table_status.Value();
   ParallelScan scan(reader.txn_, *table, 4, 1);
   ASSERT_GT(scan.MorselCount(), 4U);
   EXPECT_EQ(scan.WorkerCount(), 4U);
@@ -854,6 +902,7 @@ TEST_F(ExecutorTest, DistinctEmptyInput) {
 
 TEST_F(ExecutorTest, DistinctAllDuplicates) {
   std::vector<Row> rows;
+  rows.reserve(6);
   for (int i = 0; i < 6; ++i) {
     rows.emplace_back(std::vector<Value>{Value(7)});
   }
@@ -915,19 +964,29 @@ TEST_F(ExecutorTest, DistinctMultipleColumns) {
   EXPECT_TRUE(seen.contains(Row({Value(2), Value("c")})));
 }
 
-TEST_F(ExecutorTest, DistinctNullValueThrowsFromHash) {
-  // std::hash<Value> throws for kNull, so DistinctExecutor (which deduplicates
-  // via std::unordered_set<Row>) cannot handle NULL-containing rows.
-  std::vector<Row> rows{Row({Value()}), Row({Value(5)})};
+TEST_F(ExecutorTest, DistinctNullValueTreatedAsValue) {
+  // std::hash<Value> maps kNull to a constant (it no longer throws), so
+  // DistinctExecutor deduplicates NULL-containing rows like any other value.
+  std::vector<Row> rows{Row({Value()}), Row({Value()}), Row({Value(5)})};
   DistinctExecutor distinct(std::make_shared<ConstantExecutor>(std::move(rows)));
   Row row;
   RowPosition pos;
-  EXPECT_THROW(distinct.Next(&row, &pos), std::runtime_error);
+  size_t count = 0;
+  bool saw_null = false;
+  while (distinct.Next(&row, &pos)) {
+    if (row[0].IsNull()) { saw_null = true;
+}
+    ++count;
+  }
+  EXPECT_EQ(count, 2U);
+  EXPECT_TRUE(saw_null);
 }
 
 TEST_F(ExecutorTest, DistinctOverFullScanPreservesRowsAndPositions) {
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   DistinctExecutor distinct(std::make_shared<FullScan>(ctx.txn_, *tbl));
   LOG(INFO) << distinct;
   std::unordered_set<Row> expected({
@@ -972,10 +1031,45 @@ TEST_F(ExecutorTest, CrossJoinProducesCartesianProduct) {
   EXPECT_NE(ss.str().find("CrossJoin"), std::string::npos);
 }
 
+TEST_F(ExecutorTest, CrossJoinEmptyRightSideYieldsNoRows) {
+  auto left = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1)}), Row({Value(2)})});
+  auto right =
+      std::make_shared<ConstantExecutor>(std::vector<Row>{});
+  CrossJoin join(left, right);
+  Row got;
+  RowPosition pos;
+  ASSERT_FALSE(join.Next(&got, &pos));
+}
+
+TEST_F(ExecutorTest, CrossJoinEmptyLeftSideYieldsNoRows) {
+  auto left =
+      std::make_shared<ConstantExecutor>(std::vector<Row>{});
+  auto right = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value("a")}), Row({Value("b")})});
+  CrossJoin join(left, right);
+  Row got;
+  ASSERT_FALSE(join.Next(&got, nullptr));
+}
+
+TEST_F(ExecutorTest, CrossJoinBothSidesEmptyYieldsNoRows) {
+  auto left =
+      std::make_shared<ConstantExecutor>(std::vector<Row>{});
+  auto right =
+      std::make_shared<ConstantExecutor>(std::vector<Row>{});
+  CrossJoin join(left, right);
+  Row got;
+  DataChunk chunk;
+  ASSERT_FALSE(join.Next(&got, nullptr));
+  EXPECT_EQ(join.NextBatch(&chunk, 8), 0U);
+}
+
 // ===== DeleteExecutor =====
 TEST_F(ExecutorTest, DeleteRemovesAllRows) {
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   auto deleter = std::make_shared<DeleteExecutor>(
       ctx.txn_, *tbl, std::make_shared<FullScan>(ctx.txn_, *tbl));
   LOG(INFO) << *deleter;
@@ -994,7 +1088,9 @@ TEST_F(ExecutorTest, DeleteRemovesAllRows) {
 
 TEST_F(ExecutorTest, DeleteEmptySourceCountsZero) {
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   auto deleter = std::make_shared<DeleteExecutor>(
       ctx.txn_, *tbl, std::make_shared<ConstantExecutor>(std::vector<Row>{}));
   Row result;
@@ -1025,6 +1121,7 @@ TEST_F(ExecutorTest, ConstantExecutorNextBatchSplitsRows) {
 // ===== ZoneMap =====
 TEST_F(ExecutorTest, ZoneMapTracksStats) {
   ZoneMap map;
+  EXPECT_FALSE(map.Initialized());
   EXPECT_EQ(map.NullCount(), 0U);
   EXPECT_EQ(map.ValueCount(), 0U);
   EXPECT_FALSE(map.Minimum().has_value());
@@ -1033,13 +1130,19 @@ TEST_F(ExecutorTest, ZoneMapTracksStats) {
   map.Add(Value(3));
   map.Add(Value(7));
   map.Add(Value());
+  EXPECT_TRUE(map.Initialized());
   EXPECT_EQ(map.NullCount(), 1U);
   EXPECT_EQ(map.ValueCount(), 3U);
-  ASSERT_TRUE(map.Minimum().has_value());
-  ASSERT_TRUE(map.Maximum().has_value());
-  EXPECT_EQ(*map.Minimum(), Value(3));
-  EXPECT_EQ(*map.Maximum(), Value(10));
+  const std::optional<Value> minimum = map.Minimum();
+  const std::optional<Value> maximum = map.Maximum();
+  if (!minimum || !maximum) {
+    GTEST_FAIL() << "zone map not populated";
+    return;
+  }
+  EXPECT_EQ(*minimum, Value(3));
+  EXPECT_EQ(*maximum, Value(10));
   map.Reset();
+  EXPECT_FALSE(map.Initialized());
   EXPECT_EQ(map.NullCount(), 0U);
   EXPECT_EQ(map.ValueCount(), 0U);
   EXPECT_FALSE(map.Minimum().has_value());
@@ -1074,11 +1177,21 @@ TEST_F(ExecutorTest, ZoneMapMayMatchDegenerateCases) {
   EXPECT_TRUE(single.MayMatch(BinaryOperation::kAdd, Value(1)));
   EXPECT_FALSE(single.MayMatch(BinaryOperation::kEquals, Value()));
   ZoneMap empty;
-  EXPECT_FALSE(empty.MayMatch(BinaryOperation::kEquals, Value(1)));
+  // An uninitialized zone map proves nothing: the producer may not have
+  // maintained it, so MayMatch must stay conservative (§6.8).
+  EXPECT_FALSE(empty.Initialized());
+  EXPECT_TRUE(empty.MayMatch(BinaryOperation::kEquals, Value(1)));
+  ZoneMap null_only;
+  null_only.AddNull();
+  // An initialized zone holding only NULLs can never satisfy a comparison.
+  EXPECT_TRUE(null_only.Initialized());
+  EXPECT_FALSE(null_only.MayMatch(BinaryOperation::kEquals, Value(1)));
   ZoneMap doubles;
   doubles.Add(Value(1.0));
-  EXPECT_FALSE(doubles.MayMatch(BinaryOperation::kEquals, Value(1)));
-  EXPECT_FALSE(doubles.MayMatch(BinaryOperation::kLessThan, Value(2)));
+  // Type-mismatched constants must be conservative: the comparison may match
+  // after implicit conversion, so pruning is not allowed.
+  EXPECT_TRUE(doubles.MayMatch(BinaryOperation::kEquals, Value(1)));
+  EXPECT_TRUE(doubles.MayMatch(BinaryOperation::kLessThan, Value(2)));
 }
 
 // ===== Selection edge cases =====
@@ -1093,7 +1206,7 @@ TEST_F(ExecutorTest, SelectionConstantOnLeftIsFlipped) {
     while (sel.Next(&got, nullptr)) {
       keys.push_back(got[0].value.int_value);
     }
-    std::sort(keys.begin(), keys.end());
+    std::ranges::sort(keys);
     return keys;
   };
   EXPECT_EQ(collect_keys(BinaryExpressionExp(
@@ -1124,7 +1237,9 @@ TEST_F(ExecutorTest, SelectionConstantOnLeftIsFlipped) {
 
 TEST_F(ExecutorTest, SelectionSupportsOrPredicate) {
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   Expression key_is_0 =
       BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(0)));
@@ -1143,16 +1258,18 @@ TEST_F(ExecutorTest, SelectionSupportsOrPredicate) {
 
 // ===== ParallelScan =====
 TEST_F(ExecutorTest, ParallelScanEmptyTableReturnsNoRows) {
-  constexpr char kTable[] = "EmptyScanTable";
+  constexpr std::string_view kTable = "EmptyScanTable";
   {
     TransactionContext writer = rs_->BeginContext();
     Schema schema{kTable, {Column("key", ValueType::kInt64)}};
-    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    const StatusOr<Table> table_status = rs_->CreateTable(writer, schema);
+    ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
     ASSERT_SUCCESS(writer.txn_.PreCommit());
   }
   TransactionContext reader = rs_->BeginReadOnlyContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                        reader.GetTable(kTable));
+  const StatusOr<std::shared_ptr<Table>> table_status = reader.GetTable(kTable);
+  ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& table = table_status.Value();
   ParallelScan scan(reader.txn_, *table, 2, 1);
   DataChunk chunk;
   EXPECT_EQ(scan.NextBatch(&chunk), 0U);
@@ -1160,7 +1277,7 @@ TEST_F(ExecutorTest, ParallelScanEmptyTableReturnsNoRows) {
 }
 
 TEST_F(ExecutorTest, ParallelScanNextScalarPath) {
-  constexpr char kTable[] = "ParallelScalarTable";
+  constexpr std::string_view kTable = "ParallelScalarTable";
   constexpr int64_t kRows = 500;
   {
     TransactionContext writer = rs_->BeginContext();
@@ -1172,8 +1289,9 @@ TEST_F(ExecutorTest, ParallelScanNextScalarPath) {
     ASSERT_SUCCESS(writer.txn_.PreCommit());
   }
   TransactionContext reader = rs_->BeginReadOnlyContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                        reader.GetTable(kTable));
+  const StatusOr<std::shared_ptr<Table>> table_status = reader.GetTable(kTable);
+  ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& table = table_status.Value();
   ParallelScan scan(reader.txn_, *table, 2, 1);
   LOG(INFO) << scan;
   std::unordered_set<int64_t> keys;
@@ -1190,7 +1308,7 @@ TEST_F(ExecutorTest, ParallelScanNextScalarPath) {
 }
 
 TEST_F(ExecutorTest, ParallelScanProjectedColumns) {
-  constexpr char kTable[] = "ParallelProjectionTable";
+  constexpr std::string_view kTable = "ParallelProjectionTable";
   constexpr int64_t kRows = 800;
   {
     TransactionContext writer = rs_->BeginContext();
@@ -1205,8 +1323,9 @@ TEST_F(ExecutorTest, ParallelScanProjectedColumns) {
     ASSERT_SUCCESS(writer.txn_.PreCommit());
   }
   TransactionContext reader = rs_->BeginReadOnlyContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                        reader.GetTable(kTable));
+  const StatusOr<std::shared_ptr<Table>> table_status = reader.GetTable(kTable);
+  ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& table = table_status.Value();
   ParallelScan scan(reader.txn_, *table, 2, 1, std::vector<slot_t>{0, 1});
   DataChunk chunk;
   size_t total = 0;
@@ -1227,7 +1346,7 @@ TEST_F(ExecutorTest, ParallelScanReorderedProjectionThrows) {
   // Row::DeserializeProjected assumes an ascending projection column list, so
   // a reordered projection like {1, 0} yields a projected row narrower than the
   // chunk layout ParallelScan initializes, and the worker throws.
-  constexpr char kTable[] = "ParallelProjectionTable";
+  constexpr std::string_view kTable = "ParallelProjectionTable";
   constexpr int64_t kRows = 800;
   {
     TransactionContext writer = rs_->BeginContext();
@@ -1242,8 +1361,9 @@ TEST_F(ExecutorTest, ParallelScanReorderedProjectionThrows) {
     ASSERT_SUCCESS(writer.txn_.PreCommit());
   }
   TransactionContext reader = rs_->BeginReadOnlyContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                        reader.GetTable(kTable));
+  const StatusOr<std::shared_ptr<Table>> table_status = reader.GetTable(kTable);
+  ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& table = table_status.Value();
   ParallelScan scan(reader.txn_, *table, 2, 1, std::vector<slot_t>{1, 0});
   DataChunk chunk;
   EXPECT_THROW(scan.NextBatch(&chunk, 64), std::invalid_argument);
@@ -1251,7 +1371,7 @@ TEST_F(ExecutorTest, ParallelScanReorderedProjectionThrows) {
 }
 
 TEST_F(ExecutorTest, ParallelScanSplitsLargeChunksWhenAskedSmallBatches) {
-  constexpr char kTable[] = "ParallelSplitTable";
+  constexpr std::string_view kTable = "ParallelSplitTable";
   constexpr int64_t kRows = 2000;
   {
     TransactionContext writer = rs_->BeginContext();
@@ -1263,8 +1383,9 @@ TEST_F(ExecutorTest, ParallelScanSplitsLargeChunksWhenAskedSmallBatches) {
     ASSERT_SUCCESS(writer.txn_.PreCommit());
   }
   TransactionContext reader = rs_->BeginReadOnlyContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                        reader.GetTable(kTable));
+  const StatusOr<std::shared_ptr<Table>> table_status = reader.GetTable(kTable);
+  ASSERT_EQ(table_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& table = table_status.Value();
   ParallelScan scan(reader.txn_, *table, 4, 1);
   DataChunk chunk;
   ASSERT_GT(scan.NextBatch(&chunk, 1000), 0U);
@@ -1272,7 +1393,8 @@ TEST_F(ExecutorTest, ParallelScanSplitsLargeChunksWhenAskedSmallBatches) {
   size_t batches = 0;
   while (true) {
     const size_t got = scan.NextBatch(&chunk, 1);
-    if (got == 0) break;
+    if (got == 0) { break;
+}
     EXPECT_EQ(got, 1U);
     total += got;
     ++batches;
@@ -1349,10 +1471,138 @@ TEST_F(ExecutorTest, ParallelAggregationMissingColumnThrows) {
   EXPECT_THROW(aggregate.Next(&result, nullptr), std::runtime_error);
 }
 
+namespace {
+// Emits a few normal batches, then throws from NextBatch.
+class FailingBatchExecutor final : public ExecutorBase {
+ public:
+  explicit FailingBatchExecutor(size_t good_batches)
+      : remaining_(good_batches) {}
+
+  bool Next(Row* dst, RowPosition* position) override {
+    if (remaining_ == 0 || failed_) { return false;
+}
+    *dst = Row({Value(static_cast<int64_t>(emitted_))});
+    if (position != nullptr) { *position = RowPosition(1, emitted_);
+}
+    ++emitted_;
+    --remaining_;
+    return true;
+  }
+
+  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+    destination->Reset();
+    for (size_t i = 0; i < max_rows && !failed_; ++i) {
+      if (remaining_ == 0) { break;
+}
+      if (remaining_ == 1) {
+        failed_ = true;
+        throw std::runtime_error("synthetic aggregation failure");
+      }
+      destination->Append(Row({Value(static_cast<int64_t>(emitted_))}),
+                          RowPosition(1, emitted_));
+      ++emitted_;
+      --remaining_;
+    }
+    return destination->Size();
+  }
+
+  void Dump(std::ostream& out, int /*indent*/) const override {
+    out << "FailingBatchExecutor";
+  }
+
+ private:
+  size_t remaining_;
+  size_t emitted_{0};
+  bool failed_{false};
+};
+}  // namespace
+
+TEST_F(ExecutorTest, ParallelAggregationRethrowsOnRetry) {
+  // Regression (§6.4): after a worker failure the executor used to answer a
+  // later Next() with a well-formed empty aggregate (COUNT=0 / SUM=NULL).
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("count",
+                      AggregateExpressionExp(AggregationType::kCount,
+                                             ColumnValueExp("value"))),
+      NamedExpression("sum",
+                      AggregateExpressionExp(AggregationType::kSum,
+                                             ColumnValueExp("value")))};
+  ParallelAggregationExecutor aggregate(
+      std::make_shared<FailingBatchExecutor>(3), schema, aggregates, 2);
+  Row result;
+  EXPECT_THROW(aggregate.Next(&result, nullptr), std::runtime_error);
+  EXPECT_THROW(aggregate.Next(&result, nullptr), std::runtime_error);
+}
+
+TEST_F(ExecutorTest, ParallelAggregationInt64FastPathMatchesSequential) {
+  const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
+  // Values 1..100 with one interior and one trailing null: the columnar fast
+  // path must skip nulls exactly like the generic per-row path.
+  std::vector<Row> rows;
+  for (int64_t value = 1; value <= 100; ++value) {
+    rows.push_back(Row({Value(value)}));
+  }
+  rows[56] = Row({Value()});
+  rows.push_back(Row({Value()}));
+  auto make_aggregates = [] {
+    return std::vector<NamedExpression>{
+        NamedExpression("sum", AggregateExpressionExp(AggregationType::kSum,
+                                                      ColumnValueExp("value"))),
+        NamedExpression("min", AggregateExpressionExp(AggregationType::kMin,
+                                                      ColumnValueExp("value"))),
+        NamedExpression("max", AggregateExpressionExp(AggregationType::kMax,
+                                                      ColumnValueExp("value"))),
+        NamedExpression("avg", AggregateExpressionExp(AggregationType::kAvg,
+                                                      ColumnValueExp("value"))),
+        NamedExpression(
+            "count", AggregateExpressionExp(AggregationType::kCount,
+                                            ColumnValueExp("value"))),
+        NamedExpression(
+            "count_star", AggregateExpressionExp(AggregationType::kCount,
+                                                 ColumnValueExp("*"))),
+        NamedExpression("sum_expr",
+                        AggregateExpressionExp(
+                            AggregationType::kSum,
+                            BinaryExpressionExp(ColumnValueExp("value"),
+                                                BinaryOperation::kAdd,
+                                                ConstantValueExp(Value(1)))))};
+  };
+
+  AggregationExecutor sequential(std::make_shared<ConstantExecutor>(rows),
+                                 schema, make_aggregates());
+  Row expected;
+  ASSERT_TRUE(sequential.Next(&expected, nullptr));
+
+  ParallelAggregationExecutor parallel(std::make_shared<ConstantExecutor>(rows),
+                                       schema, make_aggregates(), 4);
+  Row actual;
+  ASSERT_TRUE(parallel.Next(&actual, nullptr));
+
+  // sum(1..100) - 57 = 4993 over 99 non-null values, 101 rows in total.
+  ASSERT_EQ(expected.values_.size(), 7U);
+  EXPECT_EQ(actual[0], Value(4993));
+  EXPECT_EQ(actual[1], Value(1));
+  EXPECT_EQ(actual[2], Value(100));
+  EXPECT_DOUBLE_EQ(actual[3].value.double_value, 4993.0 / 99.0);
+  EXPECT_EQ(actual[4], Value(99));
+  EXPECT_EQ(actual[5], Value(101));
+  EXPECT_EQ(actual[6], Value(4993 + 99));
+  for (size_t column = 0; column < expected.values_.size(); ++column) {
+    if (column == 3) { continue;
+}
+    EXPECT_EQ(actual[column], expected[column]) << "column " << column;
+  }
+  EXPECT_DOUBLE_EQ(actual[3].value.double_value,
+                   expected[3].value.double_value);
+}
+
 // ===== Insert / Update =====
 TEST_F(ExecutorTest, InsertWithRowPosition) {
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   auto insert = std::make_shared<Insert>(
       ctx.txn_, &*tbl,
       std::make_shared<ConstantExecutor>(
@@ -1366,7 +1616,9 @@ TEST_F(ExecutorTest, InsertWithRowPosition) {
 
 TEST_F(ExecutorTest, UpdateWithRowPosition) {
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  const StatusOr<std::shared_ptr<Table>> tbl_status = ctx.GetTable(kTableName);
+  ASSERT_EQ(tbl_status.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_status.Value();
   std::vector<NamedExpression> update_rule = {
       NamedExpression("key", ColumnValueExp("key")),
       NamedExpression("name", ConstantValueExp(Value("changed"))),
@@ -1543,7 +1795,8 @@ std::vector<Row> RelationalRun(Database& database, std::string_view sql) {
     return rows;
   }
   Row row;
-  while (prepared.Value()->Next(&row, nullptr)) rows.push_back(row);
+  while (prepared.Value()->Next(&row, nullptr)) { rows.push_back(row);
+}
   EXPECT_EQ(context.PreCommit(), Status::kSuccess);
   return rows;
 }
@@ -1583,7 +1836,7 @@ TEST_F(ExecutorTest, RelationalTruthinessOfBareColumns) {
   const auto rows = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE (name AND score AND key) OR "
             "key = 5 ORDER BY key;");
-  ASSERT_EQ(rows.size(), 3u);
+  ASSERT_EQ(rows.size(), 3U);
   EXPECT_EQ(rows[0][0], Value(1));
   EXPECT_EQ(rows[1][0], Value(2));
   EXPECT_EQ(rows[2][0], Value(3));
@@ -1594,7 +1847,7 @@ TEST_F(ExecutorTest, RelationalNotEqualsAndLikePredicates) {
   const auto not_equals = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE key != 2 OR key = 5 ORDER BY "
             "key;");
-  ASSERT_EQ(not_equals.size(), 3u);
+  ASSERT_EQ(not_equals.size(), 3U);
   EXPECT_EQ(not_equals[0][0], Value(0));
   EXPECT_EQ(not_equals[1][0], Value(1));
   EXPECT_EQ(not_equals[2][0], Value(3));
@@ -1602,7 +1855,7 @@ TEST_F(ExecutorTest, RelationalNotEqualsAndLikePredicates) {
   const auto like = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE name LIKE 'hello%' OR key = 3 "
             "ORDER BY key;");
-  ASSERT_EQ(like.size(), 2u);
+  ASSERT_EQ(like.size(), 2U);
   EXPECT_EQ(like[0][0], Value(0));
   EXPECT_EQ(like[1][0], Value(3));
 }
@@ -1612,7 +1865,7 @@ TEST_F(ExecutorTest, RelationalStringConcatenationWithPlus) {
   const auto rows = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE key = 1 OR name + name = "
             "'hellohello' ORDER BY key;");
-  ASSERT_EQ(rows.size(), 2u);
+  ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0][0], Value(0));
   EXPECT_EQ(rows[1][0], Value(1));
 }
@@ -1620,7 +1873,7 @@ TEST_F(ExecutorTest, RelationalStringConcatenationWithPlus) {
 TEST_F(ExecutorTest, RelationalUnaryOperators) {
   const auto minus = RelationalRun(
       *rs_, "SELECT -key, -score FROM SampleTable WHERE key = 1 OR key = 2;");
-  ASSERT_EQ(minus.size(), 2u);
+  ASSERT_EQ(minus.size(), 2U);
   EXPECT_EQ(minus[0][0], Value(-1));
   EXPECT_EQ(minus[0][1], Value(-4.9));
   EXPECT_EQ(minus[1][0], Value(-2));
@@ -1629,12 +1882,12 @@ TEST_F(ExecutorTest, RelationalUnaryOperators) {
   const auto is_null = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE key IS NULL OR key IS NOT "
             "NULL;");
-  EXPECT_EQ(is_null.size(), 4u);
+  EXPECT_EQ(is_null.size(), 4U);
 
   const auto not_expr = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE NOT (key = 1) OR key = 2 "
             "ORDER BY key;");
-  ASSERT_EQ(not_expr.size(), 3u);
+  ASSERT_EQ(not_expr.size(), 3U);
   EXPECT_EQ(not_expr[0][0], Value(0));
   EXPECT_EQ(not_expr[1][0], Value(2));
   EXPECT_EQ(not_expr[2][0], Value(3));
@@ -1642,54 +1895,54 @@ TEST_F(ExecutorTest, RelationalUnaryOperators) {
 
 TEST_F(ExecutorTest, RelationalAggregateInUnaryAndCase) {
   const auto negated = RelationalRun(*rs_, "SELECT -COUNT(*) FROM SampleTable;");
-  ASSERT_EQ(negated.size(), 1u);
+  ASSERT_EQ(negated.size(), 1U);
   EXPECT_EQ(negated[0][0], Value(-4));
 
   const auto conditional = RelationalRun(
       *rs_,
       "SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END FROM SampleTable;");
-  ASSERT_EQ(conditional.size(), 1u);
+  ASSERT_EQ(conditional.size(), 1U);
   EXPECT_EQ(conditional[0][0], Value(1));
 
   // Aggregate in the CASE else-clause (when-clauses carry no aggregate).
   const auto aggregate_else = RelationalRun(
       *rs_, "SELECT CASE WHEN key > 0 THEN 1 ELSE COUNT(*) END FROM "
             "SampleTable;");
-  ASSERT_EQ(aggregate_else.size(), 1u);
+  ASSERT_EQ(aggregate_else.size(), 1U);
   EXPECT_EQ(aggregate_else[0][0], Value(4));
 }
 
 TEST_F(ExecutorTest, RelationalScalarFunctionsInGroupedQuery) {
   const auto coalesce = RelationalRun(
       *rs_, "SELECT COALESCE(NULL, key) AS c FROM SampleTable GROUP BY key;");
-  ASSERT_EQ(coalesce.size(), 4u);
+  ASSERT_EQ(coalesce.size(), 4U);
 
   const auto coalesce_all_null = RelationalRun(
       *rs_, "SELECT COALESCE(NULL, NULL) AS c FROM SampleTable GROUP BY key;");
-  ASSERT_EQ(coalesce_all_null.size(), 4u);
+  ASSERT_EQ(coalesce_all_null.size(), 4U);
   EXPECT_TRUE(coalesce_all_null[0][0].IsNull());
 
   const auto concat = RelationalRun(
       *rs_, "SELECT CONCAT('a', NULL, 'b') FROM SampleTable GROUP BY key;");
-  ASSERT_EQ(concat.size(), 4u);
+  ASSERT_EQ(concat.size(), 4U);
   EXPECT_EQ(concat[0][0], Value("ab"));
 
   const auto now = RelationalRun(
       *rs_, "SELECT CURRENT_TIMESTAMP() FROM SampleTable GROUP BY key;");
-  ASSERT_EQ(now.size(), 4u);
+  ASSERT_EQ(now.size(), 4U);
   EXPECT_EQ(now[0][0].type, ValueType::kVarChar);
   EXPECT_FALSE(now[0][0].IsNull());
 }
 
 TEST_F(ExecutorTest, RelationalDateFunctions) {
   const auto add = RelationalRun(*rs_, "SELECT DATE_ADD('2026-01-01', INTERVAL 3 DAY);");
-  ASSERT_EQ(add.size(), 1u);
+  ASSERT_EQ(add.size(), 1U);
   EXPECT_EQ(add[0][0], Value("2026-01-04"));
 
   const auto extract = RelationalRun(
       *rs_, "SELECT EXTRACT(YEAR FROM '2026-08-21'), EXTRACT(MONTH FROM "
             "'2026-08-21'), EXTRACT(DAY FROM '2026-08-21');");
-  ASSERT_EQ(extract.size(), 1u);
+  ASSERT_EQ(extract.size(), 1U);
   EXPECT_EQ(extract[0][0], Value(2026));
   EXPECT_EQ(extract[0][1], Value(8));
   EXPECT_EQ(extract[0][2], Value(21));
@@ -1701,7 +1954,7 @@ TEST_F(ExecutorTest, RelationalCorrelatedExistsBuildsIndex) {
   const auto rows = RelationalRun(
       *rs_, "SELECT o.key FROM SampleTable AS o WHERE EXISTS (SELECT 1 FROM "
             "SampleTable WHERE o.key = key AND key > 1) ORDER BY o.key;");
-  ASSERT_EQ(rows.size(), 2u);
+  ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0][0], Value(2));
   EXPECT_EQ(rows[1][0], Value(3));
 }
@@ -1713,7 +1966,7 @@ TEST_F(ExecutorTest, RelationalCorrelatedExistsCacheHits) {
       *rs_, "SELECT o.key FROM SampleTable AS o CROSS JOIN SampleTable AS b "
             "WHERE EXISTS (SELECT COUNT(*) FROM SampleTable WHERE o.key = key "
             "HAVING COUNT(*) > 0) ORDER BY o.key;");
-  ASSERT_EQ(rows.size(), 16u);
+  ASSERT_EQ(rows.size(), 16U);
   for (const Row& row : rows) {
     EXPECT_TRUE(row[0].value.int_value >= 0 && row[0].value.int_value <= 3);
   }
@@ -1724,12 +1977,12 @@ TEST_F(ExecutorTest, RelationalInnerAndLeftJoins) {
   const auto inner = RelationalRun(
       *rs_, "SELECT a.key FROM SampleTable AS a JOIN SampleTable AS b ON "
             "a.key > b.key ORDER BY a.key;");
-  ASSERT_EQ(inner.size(), 6u);
+  ASSERT_EQ(inner.size(), 6U);
   // Left join without an equality key emits unmatched rows with NULLs.
   const auto left = RelationalRun(
       *rs_, "SELECT a.key FROM SampleTable AS a LEFT JOIN SampleTable AS b ON "
             "a.key > b.key ORDER BY a.key;");
-  ASSERT_EQ(left.size(), 7u);
+  ASSERT_EQ(left.size(), 7U);
   int64_t previous = -1;
   for (const Row& row : left) {
     EXPECT_GE(row[0].value.int_value, previous);
@@ -1741,7 +1994,7 @@ TEST_F(ExecutorTest, RelationalDistinctDeduplicatesJoinedRows) {
   const auto rows = RelationalRun(
       *rs_, "SELECT DISTINCT a.key FROM SampleTable AS a CROSS JOIN SampleTable "
             "AS b WHERE a.key = 1 OR a.key = 2;");
-  ASSERT_EQ(rows.size(), 2u);
+  ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0][0], Value(1));
   EXPECT_EQ(rows[1][0], Value(2));
 }
@@ -1750,12 +2003,12 @@ TEST_F(ExecutorTest, RelationalSortAndLimitOffset) {
   const auto sorted = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE key = 1 OR key = 2 ORDER BY "
             "key = 99;");
-  ASSERT_EQ(sorted.size(), 2u);
+  ASSERT_EQ(sorted.size(), 2U);
 
   const auto limited = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE key = 1 OR key = 2 LIMIT 1 "
             "OFFSET 1;");
-  ASSERT_EQ(limited.size(), 1u);
+  ASSERT_EQ(limited.size(), 1U);
   EXPECT_EQ(limited[0][0], Value(2));
 }
 
@@ -1763,19 +2016,19 @@ TEST_F(ExecutorTest, RelationalInSubqueriesAndScalarFallback) {
   const auto uncorrelated = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE key IN (SELECT key FROM "
             "SampleTable ORDER BY key);");
-  EXPECT_EQ(uncorrelated.size(), 4u);
+  EXPECT_EQ(uncorrelated.size(), 4U);
 
   const auto derived_star = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE key IN (SELECT * FROM (SELECT * "
             "FROM SampleTable));");
-  EXPECT_EQ(derived_star.size(), 4u);
+  EXPECT_EQ(derived_star.size(), 4U);
 
   // Scalar subquery that is neither correlated-indexable nor cacheable must
   // fall back to a full ExecuteQuery.
   const auto scalar = RelationalRun(
       *rs_, "SELECT (SELECT * FROM (SELECT * FROM SampleTable)) FROM "
             "SampleTable;");
-  ASSERT_EQ(scalar.size(), 4u);
+  ASSERT_EQ(scalar.size(), 4U);
   for (const Row& row : scalar) {
     EXPECT_EQ(row[0], Value(0));
   }
@@ -1788,7 +2041,7 @@ TEST_F(ExecutorTest, RelationalInSubqueriesAndScalarFallback) {
       *rs_, "SELECT key FROM SampleTable WHERE key IN (SELECT 1 FROM "
             "SampleTable AS s JOIN SampleTable AS s2 ON s2.key = "
             "SampleTable.key);");
-  ASSERT_EQ(cross.size(), 1u);
+  ASSERT_EQ(cross.size(), 1U);
   EXPECT_EQ(cross[0][0], Value(1));
 }
 
@@ -1796,17 +2049,17 @@ TEST_F(ExecutorTest, RelationalScalarSubqueryReturnsNullWhenEmpty) {
   const auto rows = RelationalRun(
       *rs_, "SELECT (SELECT key FROM SampleTable WHERE key = 99) FROM "
             "SampleTable;");
-  ASSERT_EQ(rows.size(), 4u);
+  ASSERT_EQ(rows.size(), 4U);
   EXPECT_TRUE(rows[0][0].IsNull());
 }
 
 TEST_F(ExecutorTest, RelationalIntervalAndNoFromQueries) {
   const auto interval = RelationalRun(*rs_, "SELECT INTERVAL 3 DAY;");
-  ASSERT_EQ(interval.size(), 1u);
+  ASSERT_EQ(interval.size(), 1U);
   EXPECT_EQ(interval[0][0], Value("3 day"));
 
   const auto boolean = RelationalRun(*rs_, "SELECT 1 OR 1;");
-  ASSERT_EQ(boolean.size(), 1u);
+  ASSERT_EQ(boolean.size(), 1U);
   EXPECT_EQ(boolean[0][0], Value(1));
 }
 
@@ -1816,7 +2069,7 @@ TEST_F(ExecutorTest, RelationalDdlAndDmlRoundTrip) {
   RelationalRun(*rs_, "UPDATE RoundTrip SET label = 'uno' WHERE id = 1;");
   RelationalRun(*rs_, "DELETE FROM RoundTrip WHERE id = 2;");
   const auto rows = RelationalRun(*rs_, "SELECT id, label FROM RoundTrip;");
-  ASSERT_EQ(rows.size(), 1u);
+  ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(1));
   EXPECT_EQ(rows[0][1], Value("uno"));
 }
@@ -2109,6 +2362,10 @@ class ScopedQueryMemory {
   ~ScopedQueryMemory() { QueryMemoryBudget::Global().ResetForTest(original_); }
   ScopedQueryMemory(const ScopedQueryMemory&) = delete;
   ScopedQueryMemory& operator=(const ScopedQueryMemory&) = delete;
+  // A scope guard must not be moved: restoring the original limit twice or
+  // dropping it would corrupt the global test budget.
+  ScopedQueryMemory(ScopedQueryMemory&&) = delete;
+  ScopedQueryMemory& operator=(ScopedQueryMemory&&) = delete;
 
  private:
   size_t original_;
@@ -2123,7 +2380,7 @@ void CreateWideTable(Database& rs, std::string_view name, size_t rows) {
                  Column("name", ValueType::kVarChar)}};
   StatusOr<Table> created = rs.CreateTable(ctx, schema);
   ASSERT_SUCCESS(created.GetStatus());
-  for (int64_t key = 0; key < static_cast<int64_t>(rows); ++key) {
+  for (int64_t key = 0; std::cmp_less(key, rows); ++key) {
     std::string payload = "row-" + std::to_string(key);
     payload.resize(96, 'x');
     ASSERT_SUCCESS(created.Value()
@@ -2137,10 +2394,13 @@ void CreateWideTable(Database& rs, std::string_view name, size_t rows) {
 // Returns the integer immediately following `key` in `text` (or -1).
 long StatsValue(const std::string& text, const std::string& key) {
   const size_t pos = text.find(key);
-  if (pos == std::string::npos) return -1;
+  if (pos == std::string::npos) { return -1;
+}
   const size_t begin = pos + key.size();
   size_t end = begin;
-  while (end < text.size() && std::isdigit(text[end])) ++end;
+  while (end < text.size() && std::isdigit(text[end]) != 0) {
+    ++end;
+}
   return begin == end ? -1 : std::stol(text.substr(begin, end - begin));
 }
 
@@ -2161,21 +2421,26 @@ std::string RelationalExplain(Database& database, std::string_view sql,
 TEST_F(ExecutorTest, RelationalHybridHashJoinSpillsUnderBudget) {
   CreateWideTable(*rs_, "WideJoin", 200);
   ScopedQueryMemory memory(65536);  // 200 x ~236B rows cannot all stay resident
+  // The EXISTS marker forces the relational engine (Phase 8 routes plain
+  // aliased joins to the cost-based optimizer); it is semantically neutral.
   const auto rows = RelationalRun(
       *rs_,
-      "SELECT a.key FROM WideJoin AS a JOIN WideJoin AS b ON a.key = b.key;");
-  ASSERT_EQ(rows.size(), 200u);
+      "SELECT a.key FROM WideJoin AS a JOIN WideJoin AS b ON a.key = b.key "
+      "WHERE EXISTS (SELECT 1 FROM WideJoin);");
+  ASSERT_EQ(rows.size(), 200U);
   std::unordered_set<int64_t> keys;
   for (const Row& row : rows) {
     EXPECT_TRUE(keys.insert(row[0].value.int_value).second);
   }
-  EXPECT_EQ(keys.size(), 200u);
+  EXPECT_EQ(keys.size(), 200U);
   EXPECT_TRUE(keys.contains(0));
   EXPECT_TRUE(keys.contains(199));
   const std::string plan = RelationalExplain(*rs_,
                                              "SELECT a.key FROM WideJoin AS a "
                                              "JOIN WideJoin AS b ON a.key = "
-                                             "b.key;",
+                                             "b.key "
+                                             "WHERE EXISTS (SELECT 1 FROM "
+                                             "WideJoin);",
                                              /*analyze=*/true);
   EXPECT_EQ(StatsValue(plan, "hybrid_hash_joins="), 1);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
@@ -2190,7 +2455,7 @@ TEST_F(ExecutorTest, RelationalHybridHashLeftJoinSpillsUnderBudget) {
   const auto rows = RelationalRun(
       *rs_, "SELECT a.key FROM WideLeft AS a LEFT JOIN WideLeft AS b ON "
             "a.key = b.key AND b.key = 999;");
-  ASSERT_EQ(rows.size(), 200u);
+  ASSERT_EQ(rows.size(), 200U);
   const std::string plan = RelationalExplain(*rs_,
                                              "SELECT a.key FROM WideLeft AS a "
                                              "LEFT JOIN WideLeft AS b ON "
@@ -2200,6 +2465,39 @@ TEST_F(ExecutorTest, RelationalHybridHashLeftJoinSpillsUnderBudget) {
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
 }
 
+TEST_F(ExecutorTest, RelationalNullableJoinKeysDoNotMatch) {
+  // Regression (§6.2): equi-joins over nullable columns crashed with
+  // "Cannot encode unknown type." as soon as a NULL key row arrived.
+  // NULL keys are non-matching rows, so only the (1,1) pair joins.
+  RelationalRun(*rs_, "CREATE TABLE NullJoinA (k INT64, tag STRING);");
+  RelationalRun(*rs_, "CREATE TABLE NullJoinB (k INT64, tag STRING);");
+  RelationalRun(*rs_, "INSERT INTO NullJoinA VALUES (1, 'a1');");
+  RelationalRun(*rs_, "INSERT INTO NullJoinA VALUES (NULL, 'an');");
+  RelationalRun(*rs_, "INSERT INTO NullJoinA VALUES (2, 'a2');");
+  RelationalRun(*rs_, "INSERT INTO NullJoinB VALUES (NULL, 'bn');");
+  RelationalRun(*rs_, "INSERT INTO NullJoinB VALUES (1, 'b1');");
+  const auto rows = RelationalRun(
+      *rs_,
+      "SELECT a.tag, b.tag FROM NullJoinA AS a JOIN NullJoinB AS b ON "
+      "a.k = b.k WHERE EXISTS (SELECT 1 FROM NullJoinA);");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0], Row({Value("a1"), Value("b1")}));
+
+  // LEFT JOIN keeps the unmatched NULL-key left rows null-extended.
+  const auto left_rows = RelationalRun(
+      *rs_,
+      "SELECT a.tag, b.tag FROM NullJoinA AS a LEFT JOIN NullJoinB AS b ON "
+      "a.k = b.k;");
+  ASSERT_EQ(left_rows.size(), 3U);
+  std::unordered_set<Row> null_extended;
+  for (const Row& row : left_rows) { null_extended.insert(row);
+}
+  EXPECT_EQ(null_extended,
+            (std::unordered_set<Row>{Row({Value("a1"), Value("b1")}),
+                                     Row({Value("a2"), Value()}),
+                                     Row({Value("an"), Value()})}));
+}
+
 TEST_F(ExecutorTest, RelationalPartitionedAggregationSpillsUnderBudget) {
   // 400 rows: the key-only projection (~104B/row) still exceeds the soft budget
   // so the partitioned aggregation path (spill-by-hash-partition) is forced.
@@ -2207,7 +2505,7 @@ TEST_F(ExecutorTest, RelationalPartitionedAggregationSpillsUnderBudget) {
   ScopedQueryMemory memory(65536);
   const auto rows = RelationalRun(
       *rs_, "SELECT key, COUNT(*) FROM WideAgg GROUP BY key;");
-  ASSERT_EQ(rows.size(), 400u);
+  ASSERT_EQ(rows.size(), 400U);
   for (const Row& row : rows) {
     EXPECT_EQ(row[1], Value(1));  // keys are unique, every group is size 1
   }
@@ -2224,7 +2522,7 @@ TEST_F(ExecutorTest, RelationalGroupByOrderBySpillsUnderBudget) {
   ScopedQueryMemory memory(65536);
   const auto rows = RelationalRun(
       *rs_, "SELECT key, COUNT(*) FROM WideSort GROUP BY key ORDER BY key;");
-  ASSERT_EQ(rows.size(), 200u);
+  ASSERT_EQ(rows.size(), 200U);
   for (size_t i = 0; i < rows.size(); ++i) {
     EXPECT_EQ(rows[i][0], Value(static_cast<int64_t>(i)));
   }
@@ -2233,64 +2531,59 @@ TEST_F(ExecutorTest, RelationalGroupByOrderBySpillsUnderBudget) {
 TEST_F(ExecutorTest, RelationalDistinctCrossJoinSpillsUnderBudget) {
   CreateWideTable(*rs_, "WideDistinct", 200);
   ScopedQueryMemory memory(65536);
+  // EXISTS marker: keeps this on the relational engine (see
+  // RelationalHybridHashJoinSpillsUnderBudget).
   const auto rows = RelationalRun(
       *rs_,
       "SELECT DISTINCT a.key FROM WideDistinct AS a CROSS JOIN WideDistinct AS "
-      "b;");
-  ASSERT_EQ(rows.size(), 200u);
+      "b WHERE EXISTS (SELECT 1 FROM WideDistinct);");
+  ASSERT_EQ(rows.size(), 200U);
   const std::string plan = RelationalExplain(
       *rs_, "SELECT DISTINCT a.key FROM WideDistinct AS a CROSS JOIN "
-            "WideDistinct AS b;",
+            "WideDistinct AS b WHERE EXISTS (SELECT 1 FROM WideDistinct);",
       /*analyze=*/true);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
 }
 
-TEST_F(ExecutorTest, RelationalScalarSubqueryDropsSpilledRowsDocumentsBug) {
-  // PRODUCTION BUG: the scalar-subquery evaluation reads `relation->rows`
-  // (relational.cpp ~837), which is empty once the cached subquery result has
-  // spilled to disk. Every outer row therefore sees an empty subquery result
-  // and produces NULL instead of the scalar key value 0.
+TEST_F(ExecutorTest, RelationalScalarSubquerySurvivesSpilledRows) {
+  // Regression guard: scalar-subquery evaluation must read spilled rows too,
+  // not just the in-memory portion of the cached subquery result. Every outer
+  // row therefore sees the scalar key value instead of NULL.
   CreateWideTable(*rs_, "WideScalar", 200);
   ScopedQueryMemory memory(65536);
   const auto rows = RelationalRun(
       *rs_,
       "SELECT (SELECT * FROM (SELECT * FROM WideScalar)) FROM WideScalar;");
-  ASSERT_EQ(rows.size(), 200u);
+  ASSERT_EQ(rows.size(), 200U);
   for (const Row& row : rows) {
     EXPECT_FALSE(row[0].IsNull());
   }
 }
 
-TEST_F(ExecutorTest, RelationalCorrelatedExistsDropsSpilledRowsDocumentsBug) {
-  // PRODUCTION BUG: under a finite query-memory budget the correlated index
-  // (ExecuteCorrelatedSingleSource, relational.cpp:2383-2384) is built only
-  // from `source.rows`, i.e. the in-memory portion of the relation. Once the
-  // source relation spills, the index is empty, so every EXISTS probe finds no
-  // candidate and the query silently returns zero rows instead of 49
-  // (keys 151..199).
+TEST_F(ExecutorTest, RelationalCorrelatedExistsKeepsSpilledRows) {
+  // Regression guard: under a finite query-memory budget the correlated index
+  // must be built from the full source relation including spilled rows, so
+  // EXISTS probes still find the 49 qualifying keys (151..199).
   CreateWideTable(*rs_, "WideExists", 200);
   ScopedQueryMemory memory(65536);
   const auto rows = RelationalRun(
       *rs_, "SELECT o.key FROM WideExists AS o WHERE EXISTS (SELECT 1 FROM "
             "WideExists WHERE o.key = key AND key > 150);");
-  EXPECT_EQ(rows.size(), 49u);
+  EXPECT_EQ(rows.size(), 49U);
 }
 
-TEST_F(ExecutorTest, RelationalInSubqueryDropsSpilledRowsDocumentsBug) {
-  // PRODUCTION BUG: the uncorrelated IN-subquery membership cache is built by
-  // iterating `relation->rows` (relational.cpp:816-817), which is empty once
-  // the cached subquery relation has spilled to disk. Every outer row then
-  // fails the IN test and the query returns zero rows instead of 200.
+TEST_F(ExecutorTest, RelationalInSubqueryKeepsSpilledRows) {
+  // Regression guard: the uncorrelated IN-subquery membership cache must be
+  // built from spilled rows as well; every outer key passes the IN test.
   CreateWideTable(*rs_, "WideIn", 200);
   ScopedQueryMemory memory(65536);
   const auto rows = RelationalRun(
       *rs_, "SELECT key FROM WideIn WHERE key IN (SELECT key FROM WideIn);");
-  EXPECT_EQ(rows.size(), 200u);
+  EXPECT_EQ(rows.size(), 200U);
 }
 
-// DISABLED_: currently crashes with std::vector<Row>::operator[] OOB while the
-// production spill code is being reworked by another team. Re-enable once the
-// correlated-EXISTS spill path is stable.
+// Segfaults: correlated EXISTS + cross join under memory budget (spill path).
+// TODO: file/track this crash in the issue tracker before enabling.
 TEST_F(ExecutorTest, DISABLED_RelationalCorrelatedExistsCrossJoinSpillsUnderBudget) {
   // A correlated EXISTS under a finite budget where the inner source still
   // fits in memory; the correlated index stays populated and the result cache
@@ -2301,7 +2594,7 @@ TEST_F(ExecutorTest, DISABLED_RelationalCorrelatedExistsCrossJoinSpillsUnderBudg
       *rs_, "SELECT o.key FROM WideCrossExists AS o CROSS JOIN WideCrossExists "
             "AS b WHERE EXISTS (SELECT COUNT(*) FROM WideCrossExists WHERE "
             "o.key = key HAVING COUNT(*) > 0);");
-  EXPECT_EQ(rows.size(), 40000u);
+  EXPECT_EQ(rows.size(), 40000U);
   const std::string plan = RelationalExplain(
       *rs_, "SELECT o.key FROM WideCrossExists AS o CROSS JOIN WideCrossExists "
             "AS b WHERE EXISTS (SELECT COUNT(*) FROM WideCrossExists WHERE "
@@ -2315,16 +2608,16 @@ TEST_F(ExecutorTest, RelationalAggregateSumEmptyAndDouble) {
   // SUM over an empty (all-filtered) input yields NULL, not 0.
   const auto empty = RelationalRun(
       *rs_, "SELECT SUM(score) FROM SampleTable WHERE key = 99;");
-  ASSERT_EQ(empty.size(), 1u);
+  ASSERT_EQ(empty.size(), 1U);
   EXPECT_TRUE(empty[0][0].IsNull());
 
   // SUM over a DOUBLE column returns a double; over INT64 an integer.
   const auto doubles = RelationalRun(*rs_, "SELECT SUM(score) FROM SampleTable;");
-  ASSERT_EQ(doubles.size(), 1u);
-  EXPECT_EQ(doubles[0][0], Value(22.44));
+  ASSERT_EQ(doubles.size(), 1U);
+  EXPECT_NEAR(doubles[0][0].value.double_value, 22.44, 1e-9);
 
   const auto ints = RelationalRun(*rs_, "SELECT SUM(key) FROM SampleTable;");
-  ASSERT_EQ(ints.size(), 1u);
+  ASSERT_EQ(ints.size(), 1U);
   EXPECT_EQ(ints[0][0], Value(6));
 }
 
@@ -2387,14 +2680,14 @@ TEST_F(ExecutorTest, RelationalInSubqueryMissingTableThrows) {
 TEST_F(ExecutorTest, RelationalDateSubAndDateColumnArithmetic) {
   const auto sub = RelationalRun(
       *rs_, "SELECT DATE_SUB('2026-03-01', INTERVAL 2 DAY);");
-  ASSERT_EQ(sub.size(), 1u);
+  ASSERT_EQ(sub.size(), 1U);
   EXPECT_EQ(sub[0][0], Value("2026-02-27"));
 
   RelationalRun(*rs_, "CREATE TABLE RelDateArith (d DATE, v INT64);");
   RelationalRun(*rs_, "INSERT INTO RelDateArith VALUES (DATE '2026-01-01', 1);");
   const auto add = RelationalRun(
       *rs_, "SELECT DATE_ADD(d, INTERVAL 1 MONTH) FROM RelDateArith;");
-  ASSERT_EQ(add.size(), 1u);
+  ASSERT_EQ(add.size(), 1U);
   EXPECT_EQ(add[0][0].AsString(), "2026-02-01");
 }
 
@@ -2403,12 +2696,12 @@ TEST_F(ExecutorTest, RelationalWithClauseMaterializesCte) {
   // every time a source references them.
   const auto single = RelationalRun(
       *rs_, "WITH w AS (SELECT key FROM SampleTable) SELECT * FROM w;");
-  ASSERT_EQ(single.size(), 4u);
+  ASSERT_EQ(single.size(), 4U);
 
   const auto joined = RelationalRun(
       *rs_, "WITH w AS (SELECT key FROM SampleTable) SELECT a.key FROM w AS a "
             "JOIN w AS b ON a.key = b.key;");
-  ASSERT_EQ(joined.size(), 4u);
+  ASSERT_EQ(joined.size(), 4U);
 }
 
 TEST_F(ExecutorTest, RelationalStringKeyHybridHashJoinSpillsUnderBudget) {
@@ -2416,13 +2709,15 @@ TEST_F(ExecutorTest, RelationalStringKeyHybridHashJoinSpillsUnderBudget) {
   // (no integer fast path), spilling both build and probe sides.
   CreateWideTable(*rs_, "WideStrJoin", 400);
   ScopedQueryMemory memory(65536);
+  // EXISTS marker: keeps this on the relational engine (see
+  // RelationalHybridHashJoinSpillsUnderBudget).
   const auto rows = RelationalRun(
       *rs_, "SELECT a.key FROM WideStrJoin AS a JOIN WideStrJoin AS b ON "
-            "a.name = b.name;");
-  ASSERT_EQ(rows.size(), 400u);
+            "a.name = b.name WHERE EXISTS (SELECT 1 FROM WideStrJoin);");
+  ASSERT_EQ(rows.size(), 400U);
   const std::string plan = RelationalExplain(
       *rs_, "SELECT a.key FROM WideStrJoin AS a JOIN WideStrJoin AS b ON "
-            "a.name = b.name;",
+            "a.name = b.name WHERE EXISTS (SELECT 1 FROM WideStrJoin);",
       /*analyze=*/true);
   EXPECT_EQ(StatsValue(plan, "hybrid_hash_joins="), 1);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
@@ -2436,7 +2731,7 @@ TEST_F(ExecutorTest, RelationalStringKeyHybridLeftJoinSpillsUnderBudget) {
   const auto rows = RelationalRun(
       *rs_, "SELECT a.key FROM WideStrLeft AS a LEFT JOIN WideStrLeft AS b ON "
             "a.name = b.name AND b.key = 999;");
-  ASSERT_EQ(rows.size(), 400u);
+  ASSERT_EQ(rows.size(), 400U);
   const std::string plan = RelationalExplain(
       *rs_, "SELECT a.key FROM WideStrLeft AS a LEFT JOIN WideStrLeft AS b ON "
             "a.name = b.name AND b.key = 999;",
@@ -2450,17 +2745,17 @@ TEST_F(ExecutorTest, RelationalLikeWildcardBacktracking) {
   // (relational.cpp Like), plus a mid-pattern '%' that is not a trailing match.
   const auto back = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE name LIKE 'h%o' ORDER BY key;");
-  ASSERT_EQ(back.size(), 1u);
+  ASSERT_EQ(back.size(), 1U);
   EXPECT_EQ(back[0][0], Value(0));
 
   const auto suffix = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE name LIKE '%lo' ORDER BY key;");
-  ASSERT_EQ(suffix.size(), 1u);
+  ASSERT_EQ(suffix.size(), 1U);
   EXPECT_EQ(suffix[0][0], Value(0));
 
   const auto single = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE name LIKE 'h_llo' ORDER BY key;");
-  ASSERT_EQ(single.size(), 1u);
+  ASSERT_EQ(single.size(), 1U);
   EXPECT_EQ(single[0][0], Value(0));
 }
 
@@ -2470,7 +2765,7 @@ TEST_F(ExecutorTest, RelationalNumericAndVarcharBinaryOperators) {
   const auto numeric = RelationalRun(
       *rs_, "SELECT key + 1, key - 1, key * 2, key / 2 FROM SampleTable GROUP "
             "BY key;");
-  ASSERT_EQ(numeric.size(), 4u);
+  ASSERT_EQ(numeric.size(), 4U);
   std::unordered_set<int64_t> seen;
   for (const Row& row : numeric) {
     seen.insert(row[0].value.int_value - 1);  // undo "key + 1"
@@ -2482,18 +2777,18 @@ TEST_F(ExecutorTest, RelationalNumericAndVarcharBinaryOperators) {
   // Double multiply inside a relational WHERE clause.
   const auto double_where = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE score * 2 > 4 GROUP BY key;");
-  ASSERT_EQ(double_where.size(), 3u);
+  ASSERT_EQ(double_where.size(), 3U);
 
   // Non-numeric (VARCHAR) comparison operators in a relational filter.
   const auto below = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE name < 'm' GROUP BY key;");
-  EXPECT_EQ(below.size(), 2u);
+  EXPECT_EQ(below.size(), 2U);
   const auto above_or_equal = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE name >= 'a' GROUP BY key;");
-  EXPECT_EQ(above_or_equal.size(), 4u);
+  EXPECT_EQ(above_or_equal.size(), 4U);
   const auto not_equals = RelationalRun(
       *rs_, "SELECT key FROM SampleTable WHERE name != 'hello' GROUP BY key;");
-  EXPECT_EQ(not_equals.size(), 3u);
+  EXPECT_EQ(not_equals.size(), 3U);
 }
 
 // ===== HashJoin executor spill-to-disk coverage =====
@@ -2559,16 +2854,62 @@ TEST_F(ExecutorTest, HashJoinEmptyInputs) {
   EXPECT_NE(ss.str().find("PartitionedHashJoin"), std::string::npos);
 }
 
-TEST_F(ExecutorTest, HashJoinNullJoinKeyThrows) {
-  // A NULL join key cannot be memcomparable-encoded, so materializing the
-  // hash table throws "Cannot encode unknown type." instead of matching.
+TEST_F(ExecutorTest, HashJoinNullJoinKeysDoNotMatch) {
+  // Regression (§6.2): a NULL join key cannot be memcomparable-encoded and
+  // used to throw "Cannot encode unknown type.".  SQL semantics say NULL
+  // never equals anything, so NULL-key rows are skipped on both sides.
   auto left = std::make_shared<ConstantExecutor>(
-      std::vector<Row>{Row({Value(1)}), Row({Value()})});
-  auto right =
-      std::make_shared<ConstantExecutor>(std::vector<Row>{Row({Value(1)})});
+      std::vector<Row>{Row({Value(1)}), Row({Value()}), Row({Value(2)})});
+  auto right = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1)}), Row({Value()}), Row({Value(2)})});
+
+  // Pipelined probe path.
   HashJoin join(left, {0}, right, {0}, HashJoinMode::kInMemory, 2);
+  std::unordered_set<Row> matches;
   Row got;
-  EXPECT_THROW(join.Next(&got, nullptr), std::runtime_error);
+  while (join.Next(&got, nullptr)) {
+    ASSERT_EQ(got[0], got[1]);
+    matches.insert(got);
+  }
+  EXPECT_EQ(matches,
+            (std::unordered_set<Row>{Row({Value(1), Value(1)}),
+                                     Row({Value(2), Value(2)})}));
+
+  // Reactive-spill path: the same rows joined through spill partitions.
+  {
+    ScopedQueryMemory memory(256);
+    auto spill_left = std::make_shared<ConstantExecutor>(std::vector<Row>{
+        Row({Value(1)}), Row({Value()}), Row({Value(2)})});
+    auto spill_right = std::make_shared<ConstantExecutor>(std::vector<Row>{
+        Row({Value(1)}), Row({Value()}), Row({Value(2)})});
+    HashJoin spilled(spill_left, {0}, spill_right, {0},
+                     HashJoinMode::kInMemory, 2);
+    size_t count = 0;
+    while (spilled.Next(&got, nullptr)) {
+      ASSERT_EQ(got[0], got[1]);
+      ASSERT_FALSE(got[0].IsNull());
+      ++count;
+    }
+    EXPECT_EQ(count, 2U);
+  }
+
+  // Hybrid path: partition-0 resident plus spilled partitions.
+  {
+    ScopedQueryMemory memory(256);
+    auto hybrid_left = std::make_shared<ConstantExecutor>(std::vector<Row>{
+        Row({Value(1)}), Row({Value()}), Row({Value(2)})});
+    auto hybrid_right = std::make_shared<ConstantExecutor>(std::vector<Row>{
+        Row({Value(1)}), Row({Value()}), Row({Value(2)})});
+    HashJoin hybrid(hybrid_left, {0}, hybrid_right, {0}, HashJoinMode::kHybrid,
+                    2);
+    size_t count = 0;
+    while (hybrid.Next(&got, nullptr)) {
+      ASSERT_EQ(got[0], got[1]);
+      ASSERT_FALSE(got[0].IsNull());
+      ++count;
+    }
+    EXPECT_EQ(count, 2U);
+  }
 }
 
 TEST_F(ExecutorTest, HashJoinNextBatchSplitsOutput) {
@@ -2589,7 +2930,8 @@ TEST_F(ExecutorTest, HashJoinNextBatchSplitsOutput) {
   size_t total = 0;
   while (true) {
     const size_t got = join.NextBatch(&chunk, 2);
-    if (got == 0) break;
+    if (got == 0) { break;
+}
     EXPECT_LE(got, 2U);
     for (size_t r = 0; r < got; ++r) {
       ASSERT_TRUE(expected.erase(chunk.RowAt(r)));
@@ -2617,13 +2959,15 @@ TEST_F(ExecutorTest, HashJoinReactiveSpillIntKeyUnderBudget) {
    public:
     explicit PositionedRows(std::vector<Row> rows) : rows_(std::move(rows)) {}
     bool Next(Row* dst, RowPosition* rp) override {
-      if (offset_ >= rows_.size()) return false;
+      if (offset_ >= rows_.size()) { return false;
+}
       *dst = rows_[offset_];
-      if (rp != nullptr) *rp = RowPosition(7, static_cast<slot_t>(offset_));
+      if (rp != nullptr) { *rp = RowPosition(7, static_cast<slot_t>(offset_));
+}
       ++offset_;
       return true;
     }
-    void Dump(std::ostream& out, int) const override { out << "PositionedRows"; }
+    void Dump(std::ostream& out, int /*indent*/) const override { out << "PositionedRows"; }
 
    private:
     std::vector<Row> rows_;
@@ -2806,7 +3150,8 @@ TEST_F(ExecutorTest, SortIntAscendingAndDescending) {
   Row row;
   RowPosition pos;
   std::vector<int64_t> asc_order;
-  while (asc.Next(&row, &pos)) asc_order.push_back(row[0].value.int_value);
+  while (asc.Next(&row, &pos)) { asc_order.push_back(row[0].value.int_value);
+}
   EXPECT_EQ(asc_order, (std::vector<int64_t>{1, 1, 2, 3}));
 
   auto desc_input = std::make_shared<ConstantExecutor>(
@@ -2814,7 +3159,8 @@ TEST_F(ExecutorTest, SortIntAscendingAndDescending) {
                        Row({Value(1)})});
   SortExecutor desc(desc_input, schema, {{ColumnValueExp("value"), false}});
   std::vector<int64_t> desc_order;
-  while (desc.Next(&row, &pos)) desc_order.push_back(row[0].value.int_value);
+  while (desc.Next(&row, &pos)) { desc_order.push_back(row[0].value.int_value);
+}
   EXPECT_EQ(desc_order, (std::vector<int64_t>{3, 2, 1, 1}));
 }
 
@@ -2830,7 +3176,8 @@ TEST_F(ExecutorTest, SortMultipleKeysTieBreak) {
   Row row;
   RowPosition pos;
   std::vector<Row> out;
-  while (sort.Next(&row, &pos)) out.push_back(row);
+  while (sort.Next(&row, &pos)) { out.push_back(row);
+}
   EXPECT_EQ(out, std::vector<Row>({Row({Value(1), Value("a")}),
                                    Row({Value(1), Value("b")}),
                                    Row({Value(2), Value("a")}),
@@ -2861,9 +3208,11 @@ TEST_F(ExecutorTest, SortDoubleAndDateKeys) {
   Row row;
   RowPosition pos;
   std::vector<double> out;
-  while (dbl_sort.Next(&row, &pos)) out.push_back(row[0].value.double_value);
+  while (dbl_sort.Next(&row, &pos)) { out.push_back(row[0].value.double_value);
+}
   ASSERT_EQ(out.size(), 4U);
-  for (size_t i = 1; i < out.size(); ++i) EXPECT_LE(out[i - 1], out[i]);
+  for (size_t i = 1; i < out.size(); ++i) { EXPECT_LE(out[i - 1], out[i]);
+}
 
   const Schema date("synthetic", {Column("d", ValueType::kDate),
                                   Column("v", ValueType::kInt64)});
@@ -2874,7 +3223,8 @@ TEST_F(ExecutorTest, SortDoubleAndDateKeys) {
       Row({Value::Date("2026-01-15"), Value(4)})});
   SortExecutor date_sort(date_input, date, {{ColumnValueExp("d"), true}});
   std::vector<int64_t> v;
-  while (date_sort.Next(&row, &pos)) v.push_back(row[1].value.int_value);
+  while (date_sort.Next(&row, &pos)) { v.push_back(row[1].value.int_value);
+}
   // Equal dates keep their input order (stable sort).
   EXPECT_EQ(v, (std::vector<int64_t>{3, 2, 4, 1}));
 }
@@ -2892,7 +3242,8 @@ TEST_F(ExecutorTest, SortNullsAscendingFirstDescendingLast) {
     std::vector<bool> null_flags;
     while (sort.Next(&row, &pos)) {
       null_flags.push_back(row[0].IsNull());
-      if (!row[0].IsNull()) ints.push_back(row[0].value.int_value);
+      if (!row[0].IsNull()) { ints.push_back(row[0].value.int_value);
+}
     }
     return std::make_pair(ints, null_flags);
   };
@@ -2956,13 +3307,15 @@ TEST_F(ExecutorTest, SortExternalSpillDescendingPreservesPositions) {
    public:
     explicit PositionedRows(std::vector<Row> rows) : rows_(std::move(rows)) {}
     bool Next(Row* dst, RowPosition* rp) override {
-      if (offset_ >= rows_.size()) return false;
+      if (offset_ >= rows_.size()) { return false;
+}
       *dst = rows_[offset_];
-      if (rp != nullptr) *rp = RowPosition(7, static_cast<slot_t>(offset_));
+      if (rp != nullptr) { *rp = RowPosition(7, static_cast<slot_t>(offset_));
+}
       ++offset_;
       return true;
     }
-    void Dump(std::ostream& out, int) const override { out << "PositionedRows"; }
+    void Dump(std::ostream& out, int /*indent*/) const override { out << "PositionedRows"; }
 
    private:
     std::vector<Row> rows_;

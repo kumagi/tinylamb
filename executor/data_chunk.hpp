@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_EXECUTOR_DATA_CHUNK_HPP
 #define TINYLAMB_EXECUTOR_DATA_CHUNK_HPP
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -23,7 +24,10 @@ class ColumnVector {
   explicit ColumnVector(ValueType type = ValueType::kNull,
                         size_t capacity = kDefaultVectorSize);
 
-  void Append(Value value);
+  void Append(const Value& value);
+  // Copies one value from another column without boxing it into a Value.
+  // The source must share this column's type (or be an all-null kNull column).
+  void AppendFrom(const ColumnVector& source, size_t index);
   void Reset();
   void Reserve(size_t capacity);
 
@@ -37,6 +41,12 @@ class ColumnVector {
   }
   [[nodiscard]] const std::vector<int64_t>& IntegerData() const {
     return integers_;
+  }
+  [[nodiscard]] const std::vector<double>& DoubleData() const {
+    return doubles_;
+  }
+  [[nodiscard]] const std::vector<std::string>& StringData() const {
+    return strings_;
   }
 
  private:
@@ -59,12 +69,12 @@ class DataChunk {
   DataChunk() = default;
   explicit DataChunk(const Schema& schema,
                      size_t capacity = kDefaultVectorSize);
-  explicit DataChunk(std::vector<ValueType> types,
+  explicit DataChunk(const std::vector<ValueType>& types,
                      size_t capacity = kDefaultVectorSize);
 
   void Initialize(const Schema& schema,
                   size_t capacity = kDefaultVectorSize);
-  void Initialize(std::vector<ValueType> types,
+  void Initialize(const std::vector<ValueType>& types,
                   size_t capacity = kDefaultVectorSize);
   void Reset();
   void Reset(const Schema& schema,
@@ -75,9 +85,16 @@ class DataChunk {
               RowPosition position = RowPosition());
   void Append(Row&& row, RowPosition position = RowPosition());
   void Append(const DataChunk& source, size_t row_index);
+  // Appends one row assembled column-wise from `sources` without
+  // materializing an intermediate Row.  On an empty chunk the layout is
+  // inferred from the source column types.
+  void AppendRowFromColumns(const std::vector<const ColumnVector*>& sources,
+                            size_t row_index,
+                            RowPosition position = RowPosition());
 
   [[nodiscard]] Row RowAt(size_t row_index) const;
   [[nodiscard]] const RowPosition& PositionAt(size_t row_index) const {
+    assert(row_index < size_ && "DataChunk::PositionAt out of range");
     return positions_[row_index];
   }
   [[nodiscard]] size_t Size() const { return size_; }
@@ -85,12 +102,15 @@ class DataChunk {
   [[nodiscard]] size_t ColumnCount() const { return columns_.size(); }
   [[nodiscard]] bool HasLayout(const Schema& schema) const;
   [[nodiscard]] const ColumnVector& ColumnAt(size_t index) const {
+    assert(index < columns_.size() && "DataChunk::ColumnAt out of range");
     return columns_[index];
   }
   [[nodiscard]] ColumnVector& ColumnAt(size_t index) {
+    assert(index < columns_.size() && "DataChunk::ColumnAt out of range");
     return columns_[index];
   }
   [[nodiscard]] const ZoneMap& ZoneMapAt(size_t index) const {
+    assert(index < zone_maps_.size() && "DataChunk::ZoneMapAt out of range");
     return zone_maps_[index];
   }
 

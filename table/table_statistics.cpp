@@ -18,28 +18,36 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
-#include <map>
 #include <optional>
 #include <ostream>
-#include <ranges>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/unary_expression.hpp"
+#include "table/iterator.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
+#include "type/column_name.hpp"
 #include "type/row.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
+#include "type/type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -47,6 +55,10 @@ namespace {
 constexpr uint64_t kStatisticsMagic = 0x544C535441545302ULL;  // TLSTATS + v2.
 constexpr uint64_t kStatisticsVersion = 2;
 constexpr size_t kStoredStringPrefixLength = 32;
+// Reservoir size per column: a multiple of the histogram bucket count so
+// every bucket rests on >=256 sampled values.  Populations up to this size
+// are still collected exactly.
+constexpr size_t kStatSampleSize = kHistogramBucketCount * 256;
 
 Value CompactValue(const Value& value) {
   if (value.type != ValueType::kVarChar ||
@@ -79,6 +91,20 @@ struct CollectedColumn {
   std::vector<ValueFrequency> most_common;
 };
 
+bool SameValue(const Value& left, const Value& right) {
+  return left.type == right.type && left == right;
+}
+
+size_t ScaleCount(size_t count, double multiplier) {
+  if (count == 0 || multiplier <= 0) { return 0;
+}
+  const long double scaled = static_cast<long double>(count) * multiplier;
+  if (scaled >= std::numeric_limits<size_t>::max()) {
+    return std::numeric_limits<size_t>::max();
+  }
+  return static_cast<size_t>(std::llround(scaled));
+}
+
 class ColumnCollector {
  public:
   explicit ColumnCollector(ValueType type) : type_(type) {}
@@ -91,23 +117,49 @@ class ColumnCollector {
     if (value.type != type_) {
       throw std::runtime_error("column statistics type mismatch");
     }
-    ++frequencies_[value];
+    ++non_null_count_;
+    const Value compacted = CompactValue(value);
+    TrackLowest(compacted);
+    TrackHighest(compacted);
+    Sample(compacted);
   }
 
   [[nodiscard]] CollectedColumn Finish() const {
     CollectedColumn result;
     result.null_count = null_count_;
-    result.distinct_count = frequencies_.size();
+    result.non_null_count = non_null_count_;
 
+    // Aggregate the reservoir into sorted per-value runs.  When every value
+    // fit into the sample the runs are the exact frequency table; otherwise
+    // they are a uniform sample whose counts scale up to the population.
+    std::vector<Value> sorted(sample_);
+    std::ranges::sort(sorted, ValueLess{});
     std::vector<ValueFrequency> values;
-    values.reserve(frequencies_.size());
-    for (const auto& [value, count] : frequencies_) {
-      values.push_back(ValueFrequency{value, count});
-      result.non_null_count += count;
+    values.reserve(sorted.size());
+    for (const Value& value : sorted) {
+      if (!values.empty() && SameValue(values.back().value, value)) {
+        ++values.back().count;
+      } else {
+        values.push_back(ValueFrequency{.value=value, .count=1});
+      }
     }
-    const size_t boundary_count = std::min(kBoundaryValueCount, values.size());
-    result.lowest.assign(values.begin(), values.begin() + boundary_count);
-    result.highest.assign(values.end() - boundary_count, values.end());
+
+    result.distinct_count = values.size();
+    double scale = 1.0;
+    if (non_null_count_ > kStatSampleSize) {
+      scale = static_cast<double>(non_null_count_) /
+              static_cast<double>(sorted.size());
+      result.distinct_count = EstimateDistinct(values, sorted.size());
+      for (ValueFrequency& frequency : values) {
+        frequency.count = ScaleCount(frequency.count, scale);
+      }
+    }
+
+    // The trackers keep the true kBoundaryValueCount smallest/largest
+    // distinct values with their exact occurrence counts, regardless of the
+    // population size.
+    result.lowest.assign(lowest_.begin(), lowest_.end());
+    result.highest.assign(highest_.rbegin(), highest_.rend());
 
     result.most_common = values;
     std::ranges::sort(result.most_common, [](const ValueFrequency& left,
@@ -124,7 +176,8 @@ class ColumnCollector {
     CompactFrequencies(&result.highest);
     CompactFrequencies(&result.most_common);
 
-    if (values.empty()) return result;
+    if (values.empty()) { return result;
+}
     const size_t bucket_target = std::max<size_t>(
         1, (result.non_null_count + kHistogramBucketCount - 1) /
                kHistogramBucketCount);
@@ -135,7 +188,8 @@ class ColumnCollector {
         result.histogram.push_back(std::move(bucket));
         bucket = HistogramBucket{};
       }
-      if (bucket.distinct == 0) bucket.lower = frequency.value;
+      if (bucket.distinct == 0) { bucket.lower = frequency.value;
+}
       bucket.upper = frequency.value;
       bucket.count += frequency.count;
       ++bucket.distinct;
@@ -149,14 +203,93 @@ class ColumnCollector {
   }
 
  private:
+  // Good-Turing style distinct estimate from the uniform sample: shrink by
+  // the fraction of singleton observations that suggests unseen values.
+  [[nodiscard]] size_t EstimateDistinct(
+      const std::vector<ValueFrequency>& runs, size_t sampled) const {
+    size_t singletons = 0;
+    for (const ValueFrequency& frequency : runs) {
+      if (frequency.count == 1) { ++singletons;
+}
+    }
+    auto estimate = static_cast<double>(runs.size());
+    if (singletons > 0 && singletons < sampled) {
+      const double coverage =
+          1.0 - (static_cast<double>(singletons) / static_cast<double>(sampled));
+      if (coverage >= 0.05) {
+        estimate = static_cast<double>(runs.size()) / coverage;
+      } else {
+        estimate = static_cast<double>(non_null_count_);
+      }
+    }
+    const double capped =
+        std::clamp(estimate, static_cast<double>(runs.size()),
+                   static_cast<double>(non_null_count_));
+    return static_cast<size_t>(std::llround(capped));
+  }
+
+  void TrackLowest(const Value& value) {
+    for (size_t i = 0; i < lowest_.size(); ++i) {
+      if (SameValue(lowest_[i].value, value)) {
+        ++lowest_[i].count;
+        return;
+      }
+      if (value < lowest_[i].value) {
+        lowest_.insert(lowest_.begin() + i, ValueFrequency{.value=value, .count=1});
+        if (lowest_.size() > kBoundaryValueCount) { lowest_.pop_back();
+}
+        return;
+      }
+    }
+    if (lowest_.size() < kBoundaryValueCount) {
+      lowest_.push_back(ValueFrequency{.value=value, .count=1});
+    }
+  }
+
+  void TrackHighest(const Value& value) {
+    for (size_t i = 0; i < highest_.size(); ++i) {
+      if (SameValue(highest_[i].value, value)) {
+        ++highest_[i].count;
+        return;
+      }
+      if (highest_[i].value < value) {
+        highest_.insert(highest_.begin() + i, ValueFrequency{.value=value, .count=1});
+        if (highest_.size() > kBoundaryValueCount) { highest_.pop_back();
+}
+        return;
+      }
+    }
+    if (highest_.size() < kBoundaryValueCount) {
+      highest_.push_back(ValueFrequency{.value=value, .count=1});
+    }
+  }
+
+  // Reservoir sampling (Algorithm R): after the reservoir fills, the n-th
+  // value replaces a uniformly chosen slot with probability S/n.
+  void Sample(const Value& value) {
+    if (sample_.size() < kStatSampleSize) {
+      if (sample_.capacity() == 0) { sample_.reserve(kStatSampleSize);
+}
+      sample_.push_back(value);
+      return;
+    }
+    std::uniform_int_distribution<uint64_t> pick(0, non_null_count_ - 1);
+    const uint64_t slot = pick(rng_);
+    if (slot < kStatSampleSize) {
+      sample_[slot] = value;
+    }
+  }
+
   ValueType type_;
   size_t null_count_{0};
-  std::map<Value, size_t, ValueLess> frequencies_;
+  size_t non_null_count_{0};
+  std::vector<Value> sample_;
+  std::vector<ValueFrequency> lowest_;
+  std::vector<ValueFrequency> highest_;
+  // Deterministic on purpose: reproducible samples keep query plans and
+  // statistics tests stable across runs. Not used for any security purpose.
+  std::mt19937_64 rng_{kStatisticsMagic ^ 0x9E3779B97F4A7C15ULL};  // NOLINT(cert-msc32-c,cert-msc51-cpp)
 };
-
-bool SameValue(const Value& left, const Value& right) {
-  return left.type == right.type && left == right;
-}
 
 long double Position(const Value& value) {
   switch (value.type) {
@@ -182,18 +315,11 @@ long double Position(const Value& value) {
   return 0;
 }
 
-size_t ScaleCount(size_t count, double multiplier) {
-  if (count == 0 || multiplier <= 0) return 0;
-  const long double scaled = static_cast<long double>(count) * multiplier;
-  if (scaled >= std::numeric_limits<size_t>::max()) {
-    return std::numeric_limits<size_t>::max();
-  }
-  return static_cast<size_t>(std::llround(scaled));
-}
-
 std::optional<Value> CoerceValue(const Value& value, ValueType type) {
-  if (value.IsNull()) return std::nullopt;
-  if (value.type == type) return value;
+  if (value.IsNull()) { return std::nullopt;
+}
+  if (value.type == type) { return value;
+}
   if (type == ValueType::kDouble && value.type == ValueType::kInt64) {
     return Value(static_cast<double>(value.value.int_value));
   }
@@ -225,7 +351,8 @@ BinaryOperation ReverseComparison(BinaryOperation operation) {
 
 int ResolveColumn(const Schema& schema, const ColumnName& column) {
   const int exact = schema.Offset(column);
-  if (exact >= 0) return exact;
+  if (exact >= 0) { return exact;
+}
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     const ColumnName& candidate = schema.GetColumn(i).Name();
     if (candidate.name == column.name &&
@@ -237,16 +364,19 @@ int ResolveColumn(const Schema& schema, const ColumnName& column) {
 }
 
 double ClampProbability(double probability) {
-  if (!std::isfinite(probability)) return 0;
+  if (!std::isfinite(probability)) { return 0;
+}
   return std::clamp(probability, 0.0, 1.0);
 }
 
 double ColumnConstantSelectivity(const ColumnStats& stats, size_t rows,
                                  BinaryOperation operation,
                                  const Value& raw_value) {
-  if (rows == 0 || raw_value.IsNull()) return 0;
+  if (rows == 0 || raw_value.IsNull()) { return 0;
+}
   const std::optional<Value> value = CoerceValue(raw_value, stats.Type());
-  if (!value) return 0;
+  if (!value) { return 0;
+}
 
   double count = 0;
   switch (operation) {
@@ -300,28 +430,30 @@ std::optional<AtomicColumnPredicate> ExtractAtomicPredicate(
   if (binary.Left()->Type() == TypeTag::kColumnValue &&
       binary.Right()->Type() == TypeTag::kConstantValue) {
     return AtomicColumnPredicate{
-        ResolveColumn(schema, binary.Left()->AsColumnValue().GetColumnName()),
-        binary.Op(), binary.Right()->AsConstantValue().GetValue()};
+        .column=ResolveColumn(schema, binary.Left()->AsColumnValue().GetColumnName()),
+        .operation=binary.Op(), .value=binary.Right()->AsConstantValue().GetValue()};
   }
   if (binary.Left()->Type() == TypeTag::kConstantValue &&
       binary.Right()->Type() == TypeTag::kColumnValue) {
     return AtomicColumnPredicate{
-        ResolveColumn(schema, binary.Right()->AsColumnValue().GetColumnName()),
-        ReverseComparison(binary.Op()),
-        binary.Left()->AsConstantValue().GetValue()};
+        .column=ResolveColumn(schema, binary.Right()->AsColumnValue().GetColumnName()),
+        .operation=ReverseComparison(binary.Op()),
+        .value=binary.Left()->AsConstantValue().GetValue()};
   }
   return std::nullopt;
 }
 
 bool ValueSatisfies(const Value& value, BinaryOperation operation,
                     const Value& boundary) {
-  if (value.IsNull() || boundary.IsNull()) return false;
+  if (value.IsNull() || boundary.IsNull()) { return false;
+}
   if (value.type != boundary.type) {
     const bool numeric_value =
         value.type == ValueType::kInt64 || value.type == ValueType::kDouble;
     const bool numeric_boundary = boundary.type == ValueType::kInt64 ||
                                   boundary.type == ValueType::kDouble;
-    if (!numeric_value || !numeric_boundary) return false;
+    if (!numeric_value || !numeric_boundary) { return false;
+}
     const double left = value.type == ValueType::kDouble
                             ? value.value.double_value
                             : static_cast<double>(value.value.int_value);
@@ -363,13 +495,18 @@ bool ValueSatisfies(const Value& value, BinaryOperation operation,
   }
 }
 
-double EstimatePredicate(const TableStatistics& table, const Schema& schema,
+// Recursion mirrors the expression tree structure by design: each node type
+  // combines the selectivity estimates of its children.
+double EstimatePredicate(const TableStatistics& table, const Schema& schema,  // NOLINT(misc-no-recursion)
                          const Expression& predicate) {
-  if (!predicate) return 1;
+  if (!predicate) { return 1;
+}
   if (predicate->TouchedColumns().empty()) {
     try {
       const Value value = predicate->Evaluate(Row(), Schema());
-      return value.IsNull() ? 0 : (value.Truthy() ? 1 : 0);
+      if (value.IsNull()) { return 0;
+}
+      return value.Truthy() ? 1 : 0;
     } catch (const std::exception&) {
       return 1;
     }
@@ -385,7 +522,8 @@ double EstimatePredicate(const TableStatistics& table, const Schema& schema,
         unary.Child()->Type() == TypeTag::kColumnValue) {
       const int offset =
           ResolveColumn(schema, unary.Child()->AsColumnValue().GetColumnName());
-      if (offset < 0 || table.Rows() == 0) return 0;
+      if (offset < 0 || table.Rows() == 0) { return 0;
+}
       const double null_fraction =
           table.Column(offset).NullCount() / static_cast<double>(table.Rows());
       return unary.Op() == UnaryOperation::kIsNull ? null_fraction
@@ -395,13 +533,16 @@ double EstimatePredicate(const TableStatistics& table, const Schema& schema,
 
   if (predicate->Type() == TypeTag::kInExp) {
     const auto& in = predicate->AsInExpression();
-    if (in.child_->Type() != TypeTag::kColumnValue) return 0.25;
+    if (in.child_->Type() != TypeTag::kColumnValue) { return 0.25;
+}
     const int offset =
         ResolveColumn(schema, in.child_->AsColumnValue().GetColumnName());
-    if (offset < 0) return 0.25;
+    if (offset < 0) { return 0.25;
+}
     double selectivity = 0;
     for (const Expression& item : in.list_) {
-      if (item->Type() != TypeTag::kConstantValue) return 0.25;
+      if (item->Type() != TypeTag::kConstantValue) { return 0.25;
+}
       selectivity += ColumnConstantSelectivity(
           table.Column(offset), table.Rows(), BinaryOperation::kEquals,
           item->AsConstantValue().GetValue());
@@ -409,7 +550,8 @@ double EstimatePredicate(const TableStatistics& table, const Schema& schema,
     return ClampProbability(selectivity);
   }
 
-  if (predicate->Type() != TypeTag::kBinaryExp) return 0.25;
+  if (predicate->Type() != TypeTag::kBinaryExp) { return 0.25;
+}
   const auto& binary = predicate->AsBinaryExpression();
   if (binary.Op() == BinaryOperation::kAnd) {
     if (binary.Left()->ToString() == binary.Right()->ToString()) {
@@ -460,12 +602,12 @@ double EstimatePredicate(const TableStatistics& table, const Schema& schema,
       }
       return std::max(left, right);
     }
-    return ClampProbability(left + right - left * right);
+    return ClampProbability(left + right - (left * right));
   }
   if (binary.Op() == BinaryOperation::kXor) {
     const double left = EstimatePredicate(table, schema, binary.Left());
     const double right = EstimatePredicate(table, schema, binary.Right());
-    return ClampProbability(left * (1 - right) + right * (1 - left));
+    return ClampProbability((left * (1 - right)) + (right * (1 - left)));
   }
 
   const bool left_column = binary.Left()->Type() == TypeTag::kColumnValue;
@@ -475,7 +617,8 @@ double EstimatePredicate(const TableStatistics& table, const Schema& schema,
   if (left_column && right_constant) {
     const int offset =
         ResolveColumn(schema, binary.Left()->AsColumnValue().GetColumnName());
-    if (offset < 0) return 0.25;
+    if (offset < 0) { return 0.25;
+}
     return ColumnConstantSelectivity(
         table.Column(offset), table.Rows(), binary.Op(),
         binary.Right()->AsConstantValue().GetValue());
@@ -483,7 +626,8 @@ double EstimatePredicate(const TableStatistics& table, const Schema& schema,
   if (left_constant && right_column) {
     const int offset =
         ResolveColumn(schema, binary.Right()->AsColumnValue().GetColumnName());
-    if (offset < 0) return 0.25;
+    if (offset < 0) { return 0.25;
+}
     return ColumnConstantSelectivity(
         table.Column(offset), table.Rows(), ReverseComparison(binary.Op()),
         binary.Left()->AsConstantValue().GetValue());
@@ -493,14 +637,16 @@ double EstimatePredicate(const TableStatistics& table, const Schema& schema,
         ResolveColumn(schema, binary.Left()->AsColumnValue().GetColumnName());
     const int right_offset =
         ResolveColumn(schema, binary.Right()->AsColumnValue().GetColumnName());
-    if (left_offset < 0 || right_offset < 0 || table.Rows() == 0) return 0.1;
+    if (left_offset < 0 || right_offset < 0 || table.Rows() == 0) { return 0.1;
+}
     const ColumnStats& left = table.Column(left_offset);
     const ColumnStats& right = table.Column(right_offset);
     if (left_offset == right_offset) {
       return left.NonNullCount() / static_cast<double>(table.Rows());
     }
     const size_t max_distinct = std::max(left.Distinct(), right.Distinct());
-    if (max_distinct == 0) return 0;
+    if (max_distinct == 0) { return 0;
+}
     const double both_non_null =
         (left.NonNullCount() / static_cast<double>(table.Rows())) *
         (right.NonNullCount() / static_cast<double>(table.Rows()));
@@ -513,20 +659,26 @@ double EstimatePredicate(const TableStatistics& table, const Schema& schema,
 
 double ColumnStats::EstimateEqual(const Value& raw_value) const {
   std::optional<Value> value = CoerceValue(raw_value, type_);
-  if (!value || non_null_count_ == 0 || distinct_count_ == 0) return 0;
+  if (!value || non_null_count_ == 0 || distinct_count_ == 0) { return 0;
+}
   *value = CompactValue(*value);
   for (const ValueFrequency& frequency : most_common_values_) {
-    if (SameValue(frequency.value, *value)) return frequency.count;
+    if (SameValue(frequency.value, *value)) { return frequency.count;
+}
   }
   for (const ValueFrequency& frequency : lowest_values_) {
-    if (SameValue(frequency.value, *value)) return frequency.count;
+    if (SameValue(frequency.value, *value)) { return frequency.count;
+}
   }
   for (const ValueFrequency& frequency : highest_values_) {
-    if (SameValue(frequency.value, *value)) return frequency.count;
+    if (SameValue(frequency.value, *value)) { return frequency.count;
+}
   }
   for (const HistogramBucket& bucket : histogram_) {
-    if (*value < bucket.lower || bucket.upper < *value) continue;
-    if (bucket.distinct == 0) return 0;
+    if (*value < bucket.lower || bucket.upper < *value) { continue;
+}
+    if (bucket.distinct == 0) { return 0;
+}
     return static_cast<double>(bucket.count) / bucket.distinct;
   }
   // Legacy varchar statistics do not have persisted boundaries.
@@ -538,13 +690,16 @@ double ColumnStats::EstimateEqual(const Value& raw_value) const {
 
 double ColumnStats::EstimateLessThan(const Value& raw_value) const {
   std::optional<Value> value = CoerceValue(raw_value, type_);
-  if (!value || non_null_count_ == 0) return 0;
+  if (!value || non_null_count_ == 0) { return 0;
+}
   *value = CompactValue(*value);
-  if (histogram_.empty()) return non_null_count_ * 0.5;
+  if (histogram_.empty()) { return non_null_count_ * 0.5;
+}
 
   double result = 0;
   for (const HistogramBucket& bucket : histogram_) {
-    if (*value <= bucket.lower) break;
+    if (*value <= bucket.lower) { break;
+}
     if (bucket.upper < *value) {
       result += bucket.count;
       continue;
@@ -575,25 +730,33 @@ double ColumnStats::EstimateRange(const std::optional<Value>& raw_lower,
                                   bool upper_inclusive) const {
   std::optional<Value> lower;
   std::optional<Value> upper;
-  if (raw_lower) lower = CoerceValue(*raw_lower, type_);
-  if (raw_upper) upper = CoerceValue(*raw_upper, type_);
-  if ((raw_lower && !lower) || (raw_upper && !upper)) return 0;
-  if (lower) *lower = CompactValue(*lower);
-  if (upper) *upper = CompactValue(*upper);
-  if (lower && upper && *upper < *lower) return 0;
+  if (raw_lower) { lower = CoerceValue(*raw_lower, type_);
+}
+  if (raw_upper) { upper = CoerceValue(*raw_upper, type_);
+}
+  if ((raw_lower && !lower) || (raw_upper && !upper)) { return 0;
+}
+  if (lower) { *lower = CompactValue(*lower);
+}
+  if (upper) { *upper = CompactValue(*upper);
+}
+  if (lower && upper && *upper < *lower) { return 0;
+}
   if (lower && upper && SameValue(*lower, *upper)) {
     return lower_inclusive && upper_inclusive ? EstimateEqual(*lower) : 0;
   }
 
-  double before_upper = static_cast<double>(non_null_count_);
+  auto before_upper = static_cast<double>(non_null_count_);
   if (upper) {
     before_upper = EstimateLessThan(*upper);
-    if (upper_inclusive) before_upper += EstimateEqual(*upper);
+    if (upper_inclusive) { before_upper += EstimateEqual(*upper);
+}
   }
   double before_lower = 0;
   if (lower) {
     before_lower = EstimateLessThan(*lower);
-    if (!lower_inclusive) before_lower += EstimateEqual(*lower);
+    if (!lower_inclusive) { before_lower += EstimateEqual(*lower);
+}
   }
   return std::clamp(before_upper - before_lower, 0.0,
                     static_cast<double>(non_null_count_));
@@ -653,18 +816,20 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
     collectors.emplace_back(schema.GetColumn(i).Type());
   }
 
-  row_count_ = 0;
+  // Collect into locals first: if a row trips a type-mismatch throw, the
+  // previous statistics stay intact instead of being half-cleared.
+  size_t scanned_rows = 0;
   for (Iterator iterator = target.BeginFullScan(txn); iterator.IsValid();
        ++iterator) {
     const Row& row = *iterator;
-    ++row_count_;
+    ++scanned_rows;
     for (size_t i = 0; i < collectors.size(); ++i) {
       collectors[i].Add(row[i]);
     }
   }
 
-  stats_.clear();
-  stats_.reserve(collectors.size());
+  std::vector<ColumnStats> rebuilt;
+  rebuilt.reserve(collectors.size());
   for (size_t i = 0; i < collectors.size(); ++i) {
     CollectedColumn collected = collectors[i].Finish();
     ColumnStats stats(schema.GetColumn(i).Type());
@@ -675,21 +840,25 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
     stats.lowest_values_ = std::move(collected.lowest);
     stats.highest_values_ = std::move(collected.highest);
     stats.most_common_values_ = std::move(collected.most_common);
-    stats_.push_back(std::move(stats));
+    rebuilt.push_back(std::move(stats));
   }
+  row_count_ = scanned_rows;
+  stats_ = std::move(rebuilt);
   return Status::kSuccess;
 }
 
 double TableStatistics::EstimateSelectivity(const Schema& schema,
                                             const Expression& predicate) const {
-  if (row_count_ == 0) return 0;
+  if (row_count_ == 0) { return 0;
+}
   return ClampProbability(EstimatePredicate(*this, schema, predicate));
 }
 
 double TableStatistics::ReductionFactor(const Schema& schema,
                                         const Expression& predicate) const {
   const double selectivity = EstimateSelectivity(schema, predicate);
-  if (selectivity <= 0) return std::numeric_limits<double>::max();
+  if (selectivity <= 0) { return std::numeric_limits<double>::max();
+}
   return std::max(1.0, 1.0 / selectivity);
 }
 
@@ -700,8 +869,10 @@ double TableStatistics::EstimateCount(int column_index, const Value& from,
   }
   std::optional<Value> lower = CoerceValue(from, stats_[column_index].Type());
   std::optional<Value> upper = CoerceValue(to, stats_[column_index].Type());
-  if (!lower || !upper) return 0;
-  if (*upper < *lower) std::swap(lower, upper);
+  if (!lower || !upper) { return 0;
+}
+  if (*upper < *lower) { std::swap(lower, upper);
+}
   return stats_[column_index].EstimateRange(lower, true, upper, true);
 }
 
@@ -712,7 +883,8 @@ TableStatistics TableStatistics::TransformBy(int column_index,
   const double estimated = EstimateCount(column_index, from, to);
   const double multiplier = row_count_ == 0 ? 0 : estimated / row_count_;
   result.row_count_ = ScaleCount(row_count_, multiplier);
-  for (ColumnStats& stats : result.stats_) stats *= multiplier;
+  for (ColumnStats& stats : result.stats_) { stats *= multiplier;
+}
   return result;
 }
 
@@ -721,7 +893,8 @@ TableStatistics TableStatistics::Filter(const Schema& schema,
   TableStatistics result(*this);
   const double multiplier = EstimateSelectivity(schema, predicate);
   result.row_count_ = ScaleCount(row_count_, multiplier);
-  for (ColumnStats& stats : result.stats_) stats *= multiplier;
+  for (ColumnStats& stats : result.stats_) { stats *= multiplier;
+}
   return result;
 }
 
@@ -730,12 +903,14 @@ TableStatistics TableStatistics::ScaleToRows(size_t rows) const {
   const double multiplier =
       row_count_ == 0 ? 0 : rows / static_cast<double>(row_count_);
   result.row_count_ = rows;
-  for (ColumnStats& stats : result.stats_) stats *= multiplier;
+  for (ColumnStats& stats : result.stats_) { stats *= multiplier;
+}
   return result;
 }
 
 void TableStatistics::Concat(const TableStatistics& rhs) {
-  if (stats_.empty()) row_count_ = rhs.row_count_;
+  if (stats_.empty()) { row_count_ = rhs.row_count_;
+}
   stats_.insert(stats_.end(), rhs.stats_.begin(), rhs.stats_.end());
 }
 
@@ -747,7 +922,8 @@ void TableStatistics::Assign(size_t rows, std::vector<ColumnStats> columns) {
 TableStatistics TableStatistics::operator*(size_t multiplier) const {
   TableStatistics result(*this);
   result.row_count_ = ScaleCount(result.row_count_, multiplier);
-  for (ColumnStats& stats : result.stats_) stats.Duplicate(multiplier);
+  for (ColumnStats& stats : result.stats_) { stats.Duplicate(multiplier);
+}
   return result;
 }
 
@@ -822,6 +998,11 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
   }
 
   // Legacy format started directly with vector<ColumnStats>::size().
+  constexpr uint64_t kMaxLegacyColumnCount = 4096;
+  if (marker > kMaxLegacyColumnCount) {
+    // Corrupt/fuzzed input must not turn the marker into an allocation bomb.
+    throw std::runtime_error("corrupt legacy table statistics header");
+  }
   stats.stats_.clear();
   stats.stats_.resize(marker);
   stats.row_count_ = 0;
@@ -836,7 +1017,7 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
         decoder >> maximum >> minimum >> count >> distinct;
         if (count > 0) {
           column.histogram_.push_back(
-              HistogramBucket{Value(minimum), Value(maximum), count, distinct});
+              HistogramBucket{.lower=Value(minimum), .upper=Value(maximum), .count=count, .distinct=distinct});
         }
         break;
       }
@@ -846,8 +1027,8 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
         decoder >> maximum >> minimum >> count >> distinct;
         if (count > 0) {
           column.histogram_.push_back(HistogramBucket{
-              Value::DateFromDays(minimum), Value::DateFromDays(maximum),
-              count, distinct});
+              .lower=Value::DateFromDays(minimum), .upper=Value::DateFromDays(maximum),
+              .count=count, .distinct=distinct});
         }
         break;
       }
@@ -857,7 +1038,7 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
         decoder >> maximum >> minimum >> count >> distinct;
         if (count > 0) {
           column.histogram_.push_back(
-              HistogramBucket{Value(minimum), Value(maximum), count, distinct});
+              HistogramBucket{.lower=Value(minimum), .upper=Value(maximum), .count=count, .distinct=distinct});
         }
         break;
       }
@@ -879,7 +1060,8 @@ std::ostream& operator<<(std::ostream& out, const ColumnStats& stats) {
       << " NonNull: " << stats.non_null_count_ << " Null: " << stats.null_count_
       << " Distinct: " << stats.distinct_count_ << " Histogram: [";
   for (size_t i = 0; i < stats.histogram_.size(); ++i) {
-    if (i > 0) out << ", ";
+    if (i > 0) { out << ", ";
+}
     const HistogramBucket& bucket = stats.histogram_[i];
     out << bucket.lower << ".." << bucket.upper << ":" << bucket.count << "/"
         << bucket.distinct;
@@ -890,7 +1072,8 @@ std::ostream& operator<<(std::ostream& out, const ColumnStats& stats) {
 
 std::ostream& operator<<(std::ostream& out, const TableStatistics& stats) {
   out << "Rows: " << stats.row_count_ << "\n";
-  for (const ColumnStats& column : stats.stats_) out << column << "\n";
+  for (const ColumnStats& column : stats.stats_) { out << column << "\n";
+}
   return out;
 }
 

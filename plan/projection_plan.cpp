@@ -20,6 +20,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -32,6 +33,7 @@
 #include "type/column.hpp"
 #include "type/column_name.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 
 namespace tinylamb {
 ProjectionPlan::ProjectionPlan(Plan src,
@@ -43,13 +45,12 @@ ProjectionPlan::ProjectionPlan(Plan src,
 
 ProjectionPlan::ProjectionPlan(Plan src,
                                const std::vector<ColumnName>& project_columns)
-    : src_(std::move(std::move(src))),
-      output_schema_(CalcSchema()),
-      stats_(src->GetStats()) {
+    : src_(std::move(src)), stats_(src_->GetStats()) {
   columns_.reserve(project_columns.size());
   for (const auto& col : project_columns) {
     columns_.emplace_back(col);
   }
+  output_schema_ = CalcSchema();
 }
 
 Schema ProjectionPlan::CalcSchema() const {

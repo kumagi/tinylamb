@@ -4,6 +4,92 @@ Measurements of tinylamb's bundled TPC-C and TPC-H drivers. These are
 engineering numbers, not audited TPC results (no think/keying time, no
 auditor, no 2-hour TPC-C window, no TPC-H power/throughput mix).
 
+## 2026-08-23 — SF=1 clean `--force` reload (post M5–M8 + test fixes)
+
+- **When:** 2026-08-23
+- **Build:** `CMAKE_BUILD_TYPE=Release` (`build-rel/`), current working tree
+- **Command:** `./tinylamb_tpch_benchmark ./tpch-run/sf1 --scale-factor 1 \
+  --data-dir ./tpch-run/sf1.tpch-data --force`
+- **Fixture:** fresh CRC32C pages at `./tpch-run/sf1` (`.db`/`.log`/`.last_checkpoint`
+  replaced; `.tbl` data reused)
+- **Load:** 126.39 s total (`lineitem` 126.3 s, `orders` 33.5 s, 8 workers)
+- **Analyze:** 50.40 s (8 tables)
+- **Query sum (Q1–Q22):** **81.30 s** (`build-rel/tpch-run/sf1-fresh-20260823-bench.log`)
+- **Slowest:** Q21 **21.05 s**, Q19 **9.59 s**, Q18 **6.04 s**, Q7 **4.00 s**, Q1 **3.76 s**
+- **End-to-end wall (load + analyze + queries):** ~258 s
+- **Compare:** prior `--force` **85.05 s** (2026-08-22 M4.5–8); plan-start reuse baseline
+  **45.34 s** (`sf1-opt16c-bench.log`, pre-CRC32C fixture — not apples-to-apples)
+
+## 2026-08-22 — M4.5–M4.8 LSM tiered merge, cache padding, HashJoin pipeline, TPC-H heuristics
+
+- **When:** 2026-08-22 (post M4.4)
+- **Changes:**
+  - LSM `Sync()` swaps under lock, `SortedRun::Construct` outside; `frozen_mem_tree_`
+    stays visible until flush completes. `MergeAll()` tiered: merge two oldest runs
+    only when `index_.size() > 4` (no full compaction on every pair).
+  - LSM cache `PageMeta` with `alignas(64)` per page state (false-sharing mitigation).
+  - `HashJoin` in-memory: build right hash table, stream left in `Next`/`NextBatch`
+    (spill path unchanged).
+  - TPC-H: `CompileScanFilter` OR branches; `part` before `lineitem` in load order;
+    `stream_agg` skips row cache when `GROUP BY` is present (Q21 subqueries).
+- **lsm_tree_bench** (`-k -s -m`, 500k keys): write **4587 w/ms**, find **1142 r/ms**,
+  post-merge find **2232 r/ms**. Tiered merge avoids rewriting all runs when only
+  two levels exist (write amplification note: background merger merges 2 oldest
+  when depth exceeds 4).
+- **SF=1 `--force` reload (CRC32C pages):** query sum **85.05 s**
+  (`build-rel/tpch-run/sf1-opt18-m48-bench.log`). Compare opt16c **45.34 s**
+  (`--reuse-database`, pre-CRC32C fixture). Q19 **9.81 s**, Q21 **23.03 s**.
+- **Note:** apples-to-apples TPC-H comparison requires `--reuse-database` on a DB
+  opened cleanly once after `--force`; interrupted runs trigger slow SPR recovery.
+
+## 2026-08-22 — M3.6 Relational parallel morsel (gated)
+
+- **When:** 2026-08-22 (post M3.4 PagePool I/O)
+- **Change:** `TryParallelTableScan` wired into `LoadSource`; parallel only for
+  read-only scans without pushed filters, integer peeks, or key filters (TPC-H
+  keeps serial peek path).
+- **SF=1 `--force` reload:** query sum **78.68 s**
+  (`build-rel/tpch-run/sf1-opt17-m36b-bench.log`). opt16c baseline **45.34 s**
+  used `--reuse-database` on a pre-CRC32C fixture; fresh CRC32C pages add
+  ~2× scan time on hot scans (Q1 scan_ms 1739→3525).
+- **Note:** reopening the `--force` DB with `--reuse-database` currently triggers
+  slow per-page SPR recovery; separate durability follow-up.
+- **Correctness:** `ExecutesAllTwentyTwoQueries` PASS
+
+## 2026-08-22 — PagePool concurrency + pread (pg_read_benchmark)
+
+- **When:** 2026-08-22 (post M3.1–M3.4: shared_mutex hit path, miss shared latch,
+  `pread`/`pwrite` I/O)
+- **Build:** `CMAKE_BUILD_TYPE=Release` (`build-rel/`)
+- **Fixture:** `read_scale` table, 50,000 `INT64` rows (`/tmp/pg_read_bench/read_scale.db`)
+- **Server:** `tinylamb_server --read-workers 8`, port 54322
+- **Query:** `SELECT SUM(id) FROM read_scale;` (10 s measurement, 2 s warmup)
+
+| clients | completed_queries | qps |
+| --- | ---: | ---: |
+| 1 | 1247 | 124.7 |
+| 2 | 2420 | 242.0 |
+| 4 | 4648 | 464.8 |
+| 8 | 8524 | 852.4 |
+| 16 | 8930 | 893.0 |
+
+- **Scaling:** ~1.9× at 2 clients, ~3.7× at 4, ~6.8× at 8 vs 1 client; plateaus
+  near 8 workers (~893 qps at 16 clients). No pre-M3 baseline captured; treat as
+  post-Phase-3a reference for future regressions.
+- **Gate:** `page_pool_test` 26 PASS, TPC-H Q1–22 PASS
+
+## 2026-08-22 — improvement.md plan baseline (SF=1 TPC-H)
+
+- **When:** 2026-08-22 (opt16c after decode-before-filter peeks + filtered
+  reusable cache)
+- **Tree:** post-TPC-H optimization work on top of `f072a22`
+- **Build:** `CMAKE_BUILD_TYPE=Release` (`build-rel/`)
+- **Result:** query execution sum **45.34 s** (Q1–Q22 `TPCH_PROFILE`), wall
+  ~90 s including ANALYZE. Log: `build-rel/tpch-run/sf1-opt16c-bench.log`
+- **Correctness:** `sql_engine_tpch_test.ExecutesAllTwentyTwoQueries` PASS
+- **Note:** This is the §19 M0 baseline. Do not regress below this sum while
+  landing PagePool / durability / structure work from `improvement.md`.
+
 ## 2026-08-20 — SF=1 snapshot
 
 - **When:** 2026-08-20 00:58–01:10 JST

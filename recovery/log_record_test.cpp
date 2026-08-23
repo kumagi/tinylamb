@@ -16,10 +16,20 @@
 
 #include "log_record.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
+#include "common/constants.hpp"
 #include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "gtest/gtest.h"
 #include "page/index_key.hpp"
 #include "page/page_type.hpp"
@@ -248,7 +258,9 @@ TEST_F(LogRecordTest, LogTypeStreamOperator) {
   begin << LogType::kBegin;
   EXPECT_EQ(begin.str(), "BEGIN");
   std::stringstream unknown;
-  unknown << static_cast<LogType>(0xffff);
+  // Deliberately out-of-range LogType to probe the "undefined" fallback arm
+  // of operator<<.
+  unknown << static_cast<LogType>(0xffff);  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
   EXPECT_NE(unknown.str().find("undefined"), std::string::npos);
 }
 
@@ -352,40 +364,54 @@ TEST_F(LogRecordTest, CompensatingFenceFosterAndLowestConstructors) {
   EXPECT_EQ(lowest.Serialize().size(), lowest.Size());
   EXPECT_EQ(lowest.redo_page, 4);
 
-  // Act + Assert -- foster and lowest round-trip through the decoder; the two
-  // compensating fence types are intentionally not decoded because the decoder
-  // has no case for kCompensateSetLowFence / kCompensateSetHighFence and
-  // aborts in the default arm.
+  // Act + Assert -- foster and lowest round-trip through the decoder, along
+  // with the two compensating fence types (kCompensateSetLowFence /
+  // kCompensateSetHighFence now have decoder cases).
   SerializeDeserializeCheck(foster);
   SerializeDeserializeCheck(lowest);
+  SerializeDeserializeCheck(high_fence);
 }
 
-TEST_F(LogRecordTest, DecodeMissingCasesForCompensatingFences) {
-  // Known gap: Decoder& operator>> has no case for kCompensateSetLowFence or
-  // kCompensateSetHighFence (it falls through to `default: assert(!"unknown
-  // log")`).  Encoding works, so the serialized form is stable; only the
-  // decode direction is missing.  This test pins the encoder side and
-  // documents that the round-trip must remain uncovered until the decoder
-  // gains the two cases.
+TEST_F(LogRecordTest, CompensatingFenceRoundTrip) {
+  // Regression: the decoder switch had no case for kCompensateSetLowFence /
+  // kCompensateSetHighFence, so abort recovery of a fence-splitting
+  // transaction failed to parse its own CLRs. Both must now survive a full
+  // serialize -> deserialize round trip with redo_data intact.
   LogRecord low_fence =
-      LogRecord::CompensateSetLowFenceLogRecord(12, 3, 1, IndexKey("redo"));
-  LogRecord high_fence =
-      LogRecord::CompensateSetHighFenceLogRecord(12, 3, 1, IndexKey("redo"));
-  EXPECT_EQ(low_fence.Serialize().size(), low_fence.Size());
-  EXPECT_EQ(high_fence.Serialize().size(), high_fence.Size());
+      LogRecord::CompensateSetLowFenceLogRecord(42, 7, 9, IndexKey("low-key"));
+  LogRecord high_fence = LogRecord::CompensateSetHighFenceLogRecord(
+      43, 8, 10, IndexKey("high-key"));
+  ASSERT_EQ(low_fence.Serialize().size(), low_fence.Size());
+  ASSERT_EQ(high_fence.Serialize().size(), high_fence.Size());
+
+  SerializeDeserializeCheck(low_fence);
+  SerializeDeserializeCheck(high_fence);
+
+  // Act -- decode manually to pin the restored fields.
+  LogRecord parsed;
+  std::istringstream ss(low_fence.Serialize(), std::istringstream::binary);
+  Decoder dec(ss);
+  dec >> parsed;
+
+  // Assert -- type, position and redo payload match the encoded CLR.
+  EXPECT_EQ(parsed.type, LogType::kCompensateSetLowFence);
+  EXPECT_EQ(parsed.prev_lsn, 42);
+  EXPECT_EQ(parsed.txn_id, 7);
+  EXPECT_EQ(parsed.pid, 9);
+  EXPECT_TRUE(parsed.key.empty());
+  EXPECT_TRUE(parsed.undo_data.empty());
+  EXPECT_EQ(parsed.redo_data, Encode(IndexKey("low-key")));
 }
 
 TEST_F(LogRecordTest, DecodeHugeEndCheckpointTableSizeRejected) {
   // Fuzzer regression (log_record_fuzzer): a kEndCheckpoint record whose
   // encoded dirty_page_table / active_transaction_table size field is huge
-  // makes Decoder::operator>>(std::vector<T>&) (common/decoder.hpp:43) call
-  // vec.resize(size) with no bound against the remaining input bytes
-  // (recovery/log_record.cpp:836-838).  A malicious or corrupt WAL record then
-  // triggers an unbounded allocation (OOM) or a std::length_error thrown from
-  // resize, which propagates out of the decoder and std::terminate()s the
-  // process.  Decoding must reject the record cleanly instead of allocating an
-  // unbounded vector.  This test currently FAILS: the decode throws
-  // std::length_error and the EXPECT_NO_THROW / empty-table assertions fail.
+  // once made Decoder::operator>>(std::vector<T>&)
+  // (common/decoder.hpp) call vec.resize(size) with no bound against the
+  // remaining input bytes, triggering an unbounded allocation (OOM).
+  // common/decoder.hpp now guards this via kMaxDecodedElements +
+  // setstate(failbit), so decoding rejects the record cleanly: no throw and
+  // both tables stay empty. This test pins that behavior.
   const auto kEndCheckpointPrefix = [] {
     std::string bytes;
     bytes.append(1, 0x1c).append(1, 0x00);  // LogType::kEndCheckpoint (uint16)
@@ -403,9 +429,8 @@ TEST_F(LogRecordTest, DecodeHugeEndCheckpointTableSizeRejected) {
     LogRecord record;
     Decoder dec(ss);
 
-    // Act + Assert -- decoding must not allocate an unbounded vector; it
-    // should reject the record cleanly.
-    EXPECT_NO_THROW(dec >> record);  // FAILS today: std::length_error
+    // Act + Assert -- the oversized length is rejected via failbit.
+    EXPECT_NO_THROW(dec >> record);
     EXPECT_TRUE(record.dirty_page_table.empty());
   }
 
@@ -419,7 +444,7 @@ TEST_F(LogRecordTest, DecodeHugeEndCheckpointTableSizeRejected) {
     Decoder dec(ss);
 
     // Act + Assert -- same clean-rejection requirement.
-    EXPECT_NO_THROW(dec >> record);  // FAILS today: std::length_error
+    EXPECT_NO_THROW(dec >> record);
     EXPECT_TRUE(record.active_transaction_table.empty());
   }
 }
@@ -444,9 +469,9 @@ TEST_F(LogRecordTest, DumpUnknownRecordType) {
 TEST_F(LogRecordTest, SizeOfUnknownLogAborts) {
   // Known gap: LogRecord::Size() asserts for LogType::kUnknown
   // (log_record.cpp:649-650), so a default-constructed record must die.
-  // assert() is a no-op under NDEBUG (Release), so skip there.
+  // Requires assert()-based death checks; NDEBUG builds skip intentionally.
 #ifdef NDEBUG
-  GTEST_SKIP() << "assert() disabled in Release builds";
+  GTEST_SKIP() << "Death tests require a Debug build (assert() is enabled)";
 #else
   LogRecord unknown;
   EXPECT_DEATH((void)unknown.Size(), "unknown");
@@ -457,18 +482,18 @@ TEST_F(LogRecordTest, SerializeUnknownLogAborts) {
   // Known gap: serializing a kUnknown record trips an assert in
   // operator<<(Encoder&) (log_record.cpp:722-723).
 #ifdef NDEBUG
-  GTEST_SKIP() << "assert() disabled in Release builds";
+  GTEST_SKIP() << "Death tests require a Debug build (assert() is enabled)";
 #else
   LogRecord unknown;
   EXPECT_DEATH((void)unknown.Serialize(), "unknown");
 #endif
 }
 
-TEST_F(LogRecordTest, DecodeUnknownLogTypeAborts) {
+TEST_F(LogRecordTest, DecodeUnknownLogTypeThrowsCleanly) {
   // Arrange -- a byte stream whose type field is not a defined LogType.
-#ifdef NDEBUG
-  GTEST_SKIP() << "assert() disabled in Release builds";
-#else
+  // The decoder rejects it with a catchable exception (never a half-record,
+  // never an assert): RecoveryManager skips such torn tails and the fuzzers
+  // treat this as ordinary rejection.
   std::string bytes;
   bytes.append(1, static_cast<char>(0xff)).append(1, static_cast<char>(0xff));  // uint16 LogType: 0xffff
   bytes.append(8, '\x00');                // prev_lsn
@@ -476,11 +501,10 @@ TEST_F(LogRecordTest, DecodeUnknownLogTypeAborts) {
   bytes.append(1, '\x00');                // types: no pid / slot / key
   std::istringstream ss(bytes, std::istringstream::binary);
 
-  // Act + Assert -- the decoder reaches its default arm and asserts.
+  // Act + Assert -- the decoder reaches its default arm and throws.
   LogRecord record;
   Decoder dec(ss);
-  EXPECT_DEATH(dec >> record, "unknown log");
-#endif
+  EXPECT_THROW(dec >> record, std::runtime_error);
 }
 
 TEST_F(LogRecordTest, ThreeArgConstructorSetsFields) {
@@ -551,6 +575,8 @@ TEST_F(LogRecordTest, RoundTripAllRecordKindsWithSize) {
       LogRecord::CompensatingDeleteLogRecord(2, 3, 4, "redo"),
       LogRecord::CompensatingDeleteLeafLogRecord(2, 3, "key", "redo"),
       LogRecord::CompensatingDeleteBranchLogRecord(2, 3, "key", 5),
+      LogRecord::CompensateSetLowFenceLogRecord(2, 3, 4, IndexKey("redo")),
+      LogRecord::CompensateSetHighFenceLogRecord(2, 3, 4, IndexKey("redo")),
       LogRecord::SetLowFenceLogRecord(1, 2, 3, IndexKey("redo"),
                                       IndexKey("undo")),
       LogRecord::SetHighFenceLogRecord(1, 2, 3, IndexKey("redo"),
@@ -610,6 +636,123 @@ TEST_F(LogRecordTest, EqualityIsFieldSensitive) {
   EXPECT_NE(a, b);
   EXPECT_EQ(a.Serialize().size(), a.Size());
   EXPECT_EQ(b.Serialize().size(), b.Size());
+}
+
+}  // namespace tinylamb
+
+// Tests below mirror the log_record_fuzzer oracle (recovery/
+// log_record_fuzzer.hpp): decoding arbitrary bytes must never throw for a
+// defined LogType, and every successfully decoded record must round-trip
+// byte-stably through Serialize/Deserialize.
+namespace tinylamb {
+namespace {
+
+constexpr uint8_t kMaskPageID = 0x1;
+constexpr uint8_t kMaskSlot = 0x2;
+constexpr uint8_t kMaskKey = 0x4;
+
+// Builds a record payload for |type| with the optional fields selected by
+// |types_mask| present, |body_len| filler bytes where type-specific data
+// would go, truncated to |truncate_to| bytes overall.
+std::string FuzzShapedRecord(LogType type, uint8_t types_mask, size_t body_len,
+                             size_t truncate_to) {
+  std::string bytes;
+  const auto raw = static_cast<uint16_t>(type);
+  bytes.append(reinterpret_cast<const char*>(&raw), sizeof(raw));
+  bytes.append(8, '\x01');  // prev_lsn
+  bytes.append(8, '\x02');  // txn_id
+  bytes.append(1, static_cast<char>(types_mask));
+  if ((types_mask & kMaskPageID) != 0) { bytes.append(4, '\x03'); }
+  if ((types_mask & kMaskSlot) != 0) { bytes.append(2, '\x04'); }
+  if ((types_mask & kMaskKey) != 0) {
+    const uint64_t key_len = 3;
+    bytes.append(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+    bytes.append("abc");
+  }
+  bytes.append(body_len, '\x7f');
+  bytes.resize(std::min(truncate_to, bytes.size()));
+  return bytes;
+}
+
+void RoundTripMustBeStable(const std::string& input) {
+  LogRecord first;
+  {
+    std::istringstream ss(input, std::istringstream::binary);
+    Decoder dec(ss);
+    // A throw here is ordinary rejection (truncation can zero out the type
+    // field, undefined types throw); the fuzzer treats it the same way.
+    try {
+      dec >> first;
+    } catch (const std::exception&) {
+      return;
+    }
+  }
+  // Undefined types never reach this point; nothing to round-trip otherwise.
+  if (first.type == LogType::kUnknown) {
+    return;
+  }
+  const std::string serialized = first.Serialize();
+  LogRecord second;
+  {
+    std::istringstream ss(serialized, std::istringstream::binary);
+    Decoder dec(ss);
+    ASSERT_NO_THROW(dec >> second);
+  }
+  EXPECT_EQ(second.Serialize(), serialized);
+}
+
+}  // namespace
+
+
+TEST_F(LogRecordTest, TruncatedRecordsDecodeAndRoundTripStably) {
+  // Every (record kind x field-mask x truncation point) combination behaves
+  // like the fuzzer expects: clean decode of defined types and byte-stable
+  // re-encode of whatever was decoded.
+  const std::array<LogType, 13> kinds = {
+      LogType::kBegin,
+      LogType::kCommit,
+      LogType::kInsertRow,
+      LogType::kInsertLeaf,
+      LogType::kInsertBranch,
+      LogType::kUpdateRow,
+      LogType::kDeleteRow,
+      LogType::kUpdateBranch,
+      LogType::kSetFoster,
+      LogType::kCompensateInsertRow,
+      LogType::kEndCheckpoint,
+      LogType::kSystemAllocPage,
+      LogType::kLowestValue,
+  };
+  const std::array<uint8_t, 4> masks = {
+      static_cast<uint8_t>(0x00),
+      kMaskPageID,
+      static_cast<uint8_t>(kMaskPageID | kMaskSlot),
+      static_cast<uint8_t>(kMaskPageID | kMaskSlot | kMaskKey),
+  };
+  for (const LogType kind : kinds) {
+    for (const uint8_t mask : masks) {
+      for (const size_t cut : {size_t{0}, size_t{9}, size_t{17}, size_t{21},
+                               size_t{23}, size_t{40}}) {
+        SCOPED_TRACE(testing::Message()
+                     << "type=" << static_cast<int>(kind)
+                     << " mask=" << static_cast<int>(mask) << " cut=" << cut);
+        RoundTripMustBeStable(FuzzShapedRecord(kind, mask, 16, cut));
+      }
+    }
+  }
+}
+
+TEST_F(LogRecordTest, UndefinedLogTypeInTruncatedTailThrowsCleanly) {
+  // An out-of-range type value must never return a half-record: the decoder
+  // rejects the torn tail with a catchable exception in every build type.
+  std::string bytes;
+  const uint16_t raw = 0xffff;  // not a defined LogType
+  bytes.append(reinterpret_cast<const char*>(&raw), sizeof(raw));
+  bytes.append(17, '\x00');
+  std::istringstream ss(bytes, std::istringstream::binary);
+  LogRecord record;
+  Decoder dec(ss);
+  EXPECT_THROW(dec >> record, std::runtime_error);
 }
 
 }  // namespace tinylamb

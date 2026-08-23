@@ -28,6 +28,7 @@ namespace tinylamb {
 class Parser {
  public:
   explicit Parser(const std::vector<Token>& tokens);
+  explicit Parser(std::vector<Token>&& tokens);
   std::unique_ptr<Statement> Parse();
 
  private:
@@ -44,6 +45,7 @@ class Parser {
   Token Peek();
   Token Advance();
   void Expect(TokenType type);
+  void ExpectKeyword(const std::string& keyword);
 
   std::vector<Token> tokens_;
   size_t pos_{0};

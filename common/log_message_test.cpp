@@ -20,8 +20,8 @@
 
 TEST(LogMessage, Log) {
   // Arrange -- nothing more than the LOG macro itself
-  // Act -- stream one message at each severity level (no assertion; output-only)
-  LOG(FATAL) << "FATAL";
+  // Act -- stream one message at each survivable severity level (no assertion;
+  // output-only).  FATAL is excluded: it aborts the process.
   LOG(ERROR) << "ERROR";
   LOG(ALERT) << "ALERT";
   LOG(WARN) << "WARN";
@@ -31,4 +31,9 @@ TEST(LogMessage, Log) {
   LOG(DEBUG) << "DEBUG";
   LOG(TRACE) << "TRACE";
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
+}
+
+TEST(LogMessage, FatalAborts) {
+  // Act/Assert -- FATAL logs the message and then terminates the process.
+  ASSERT_DEATH({ LOG(FATAL) << "FATAL"; }, "FATAL");
 }

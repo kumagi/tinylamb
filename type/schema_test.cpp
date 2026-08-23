@@ -17,6 +17,7 @@
 #include "schema.hpp"
 
 #include <sstream>
+#include <string>
 #include <unordered_set>
 
 #include "column_name.hpp"

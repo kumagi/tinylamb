@@ -49,12 +49,14 @@ class SpillFile {
       throw std::runtime_error("ForEachRow on positioned spill");
     }
     EnsureReader();
-    uint64_t stored = 0;
-    stream_.read(reinterpret_cast<char*>(&stored), sizeof(stored));
+    const uint64_t stored = ReadStoredCount();
     Decoder dec(stream_);
     for (uint64_t i = 0; i < stored; ++i) {
       Row row;
       dec >> row;
+      if (!stream_) {
+        throw std::runtime_error("truncated spill file: " + path_.string());
+      }
       fn(row);
     }
   }
@@ -64,6 +66,8 @@ class SpillFile {
  private:
   void OpenForWrite();
   void EnsureReader();
+  // Reads and validates the row-count header at the start of the file.
+  [[nodiscard]] uint64_t ReadStoredCount();
 
   std::filesystem::path path_;
   std::fstream stream_;

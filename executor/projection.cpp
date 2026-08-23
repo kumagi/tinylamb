@@ -17,41 +17,54 @@
 #include "projection.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <ostream>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
+#include "executor/executor_base.hpp"
+#include "expression/bytecode.hpp"
+#include "executor/data_chunk.hpp"
+#include "expression/jit.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/constant_value.hpp"
+#include "type/value_type.hpp"
 
 namespace {
 
 bool IntConstant(const tinylamb::Expression& expression, int64_t* value) {
-  if (expression->Type() != tinylamb::TypeTag::kConstantValue) return false;
+  if (expression->Type() != tinylamb::TypeTag::kConstantValue) { return false;
+}
   const tinylamb::Value constant =
       expression->AsConstantValue().GetValue();
-  if (constant.type != tinylamb::ValueType::kInt64) return false;
+  if (constant.type != tinylamb::ValueType::kInt64) { return false;
+}
   *value = constant.value.int_value;
   return true;
 }
 
-bool Affine(const tinylamb::Expression& expression,
-            const tinylamb::Schema& schema, uint16_t* column,
-            int64_t* multiplier, int64_t* addend) {
+bool Affine(  // NOLINT(misc-no-recursion)
+    const tinylamb::Expression& expression, const tinylamb::Schema& schema,
+    uint16_t* column, int64_t* multiplier, int64_t* addend) {
   if (expression->Type() == tinylamb::TypeTag::kColumnValue) {
     const int offset = schema.Offset(
         expression->AsColumnValue().GetColumnName());
     if (offset < 0 || schema.GetColumn(offset).Type() !=
-                          tinylamb::ValueType::kInt64) return false;
+                          tinylamb::ValueType::kInt64) { return false;
+}
     *column = static_cast<uint16_t>(offset);
     return true;
   }
-  if (expression->Type() != tinylamb::TypeTag::kBinaryExp) return false;
+  if (expression->Type() != tinylamb::TypeTag::kBinaryExp) { return false;
+}
   const auto& binary = expression->AsBinaryExpression();
   int64_t constant = 0;
   if (binary.Op() == tinylamb::BinaryOperation::kMultiply &&
@@ -96,11 +109,13 @@ Projection::Projection(std::vector<NamedExpression> expressions,
 
 bool Projection::Next(Row* dst, RowPosition* rp) {
   if (output_offset_ >= output_batch_.Size()) {
-    if (NextBatch(&output_batch_) == 0) return false;
+    if (NextBatch(&output_batch_) == 0) { return false;
+}
     output_offset_ = 0;
   }
   *dst = output_batch_.RowAt(output_offset_);
-  if (rp) *rp = output_batch_.PositionAt(output_offset_);
+  if (rp != nullptr) { *rp = output_batch_.PositionAt(output_offset_);
+}
   ++output_offset_;
   return true;
 }
@@ -108,7 +123,8 @@ bool Projection::Next(Row* dst, RowPosition* rp) {
 size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
   destination->Reserve(max_rows);
-  if (src_->NextBatch(&input_batch_, max_rows) == 0) return 0;
+  if (src_->NextBatch(&input_batch_, max_rows) == 0) { return 0;
+}
   std::vector<std::optional<ColumnVector>> evaluated(expressions_.size());
   for (size_t index = 0; index < bytecodes_.size(); ++index) {
     JitProjectionState& jit = jit_states_[index];
@@ -118,18 +134,39 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
       jit.attempted = true;
       jit.kernel = JitInt64Kernels::CompileProjection();
     }
-    if (jit.kernel && input_batch_.ZoneMapAt(jit.column).NullCount() == 0) {
+    if (jit.kernel && input_batch_.ZoneMapAt(jit.column).Initialized() &&
+        input_batch_.ZoneMapAt(jit.column).NullCount() == 0) {
       std::vector<int64_t> output(input_batch_.Size());
       jit.kernel->Project(input_batch_.ColumnAt(jit.column).IntegerData().data(),
                           output.data(), output.size(), jit.multiplier,
                           jit.addend);
       evaluated[index].emplace(ValueType::kInt64, output.size());
-      for (int64_t value : output) evaluated[index]->Append(Value(value));
+      for (int64_t value : output) { evaluated[index]->Append(Value(value));
+}
       ++jit_batches_;
     } else if (bytecodes_[index]) {
       evaluated[index].emplace(
           bytecodes_[index]->EvaluateBatch(input_batch_));
     }
+  }
+  bool all_evaluated = true;
+  for (const std::optional<ColumnVector>& column : evaluated) {
+    if (!column) {
+      all_evaluated = false;
+      break;
+    }
+  }
+  if (all_evaluated) {
+    std::vector<const ColumnVector*> sources;
+    sources.reserve(evaluated.size());
+    for (const std::optional<ColumnVector>& column : evaluated) {
+      sources.push_back(&*column);
+    }
+    for (size_t row_index = 0; row_index < input_batch_.Size(); ++row_index) {
+      destination->AppendRowFromColumns(sources, row_index,
+                                        input_batch_.PositionAt(row_index));
+    }
+    return destination->Size();
   }
   for (size_t row_index = 0; row_index < input_batch_.Size(); ++row_index) {
     std::vector<Value> result;
@@ -152,7 +189,8 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
           continue;
         }
       }
-      if (!row) row = input_batch_.RowAt(row_index);
+      if (!row) { row = input_batch_.RowAt(row_index);
+}
       result.push_back(named.expression->Evaluate(*row, input_schema_));
     }
     destination->Append(Row(std::move(result)),

@@ -20,11 +20,19 @@
 
 #include "page_storage.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <ios>
+#include <ostream>
 #include <string_view>
 
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
+#include "recovery/log_record.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
@@ -40,6 +48,24 @@ size_t PagePoolCapacityFromEnv() {
   }
   return static_cast<size_t>(bytes / kPageSize);
 }
+
+// Reads the checkpoint LSN from the master record written by
+// CheckpointManager. Missing/truncated files resolve to 0; callers
+// additionally verify the value against the WAL itself.
+lsn_t ReadMasterRecordLsn(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return 0;
+  }
+  std::array<char, sizeof(lsn_t)> buffer{};
+  in.read(buffer.data(), sizeof(buffer));
+  if (in.gcount() != static_cast<std::streamsize>(sizeof(buffer))) {
+    return 0;
+  }
+  lsn_t lsn = 0;
+  std::memcpy(&lsn, buffer.data(), sizeof(lsn));
+  return lsn;
+}
 }  // namespace
 
 PageStorage::PageStorage(std::string_view dbname)
@@ -49,7 +75,27 @@ PageStorage::PageStorage(std::string_view dbname)
       rm_(LogName(), pm_.GetPool()),
       tm_(&lm_, &pm_, &logger_, &rm_),
       cm_(MasterRecordName(), &tm_, pm_.GetPool()) {
-  rm_.RecoverFrom(0, &tm_);
+  // WAL rule for evictions: a dirty page must never reach disk ahead of the
+  // log records its page_lsn covers. The gate fires outside the pool latch,
+  // so blocking on the group-commit flush here is deadlock-free. Declared
+  // member order guarantees the pool drains before the logger shuts down.
+  pm_.GetPool()->SetDurabilityGate(
+      [this](lsn_t lsn) { logger_.WaitForDurable(lsn); });
+  // Resume from the last durable checkpoint when the master record points at
+  // a real one; otherwise fall back to replaying the whole log. The hint is
+  // only trusted when it lands on a decodable kBeginCheckpoint record -- a
+  // garbage or torn hint must widen the recovery window, never skip it.
+  lsn_t checkpoint = ReadMasterRecordLsn(MasterRecordName());
+  if (checkpoint != 0) {
+    LogRecord probe;
+    if (!rm_.ReadLog(checkpoint, &probe) ||
+        probe.type != LogType::kBeginCheckpoint) {
+      LOG(WARN) << "Ignoring invalid master record at " << checkpoint
+                << " for " << dbname_;
+      checkpoint = 0;
+    }
+  }
+  rm_.RecoverFrom(checkpoint, &tm_);
 }
 
 void PageStorage::DiscardAllUpdates() { pm_.GetPool()->DropAllPages(); }

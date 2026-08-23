@@ -8,9 +8,11 @@
 #include <cstddef>
 #include <memory>
 #include <ostream>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/full_scan.hpp"
@@ -19,10 +21,13 @@
 #include "executor/selection.hpp"
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "index/index.hpp"
 #include "index/index_schema.hpp"
 #include "table/table.hpp"
 #include "type/column.hpp"
+#include "type/column_name.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -37,12 +42,14 @@ bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
-    if (expressions[i]->Type() != TypeTag::kColumnValue) return false;
+    if (expressions[i]->Type() != TypeTag::kColumnValue) { return false;
+}
     if (expressions[i]->AsColumnValue().GetColumnName().name !=
         provided[i].name) {
       return false;
     }
-    if (ascending[i] != scan_ascending) return false;
+    if (ascending[i] != scan_ascending) { return false;
+}
   }
   return true;
 }
@@ -72,6 +79,7 @@ IndexOnlyScanPlan::IndexOnlyScanPlan(const Table& table, const Index& index,
 
 Schema IndexOnlyScanPlan::OutputSchema() const {
   std::vector<Column> cols;
+  cols.reserve(index_.sc_.key_.size() + index_.sc_.include_.size());
   for (const auto& key : index_.sc_.key_) {
     cols.push_back(table_.GetSchema().GetColumn(key));
   }
@@ -81,11 +89,15 @@ Schema IndexOnlyScanPlan::OutputSchema() const {
   return {"", cols};
 }
 
-Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& ctx) const {
-  if (ctx.txn_.IndexKeysMayBeStale()) {
-    Executor executor = std::make_shared<FullScan>(ctx.txn_, table_);
-    executor = std::make_shared<Selection>(where_, table_.GetSchema(),
-                                           std::move(executor));
+Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& txn) const {
+  if (txn.txn_.IndexKeysMayBeStale()) {
+    // Fallback route reads the table directly; Selection requires a real
+    // predicate, so skip it when there is none.
+    Executor executor = std::make_shared<FullScan>(txn.txn_, table_);
+    if (where_) {
+      executor = std::make_shared<Selection>(where_, table_.GetSchema(),
+                                             std::move(executor));
+    }
     std::vector<NamedExpression> columns;
     columns.reserve(index_.sc_.key_.size() + index_.sc_.include_.size());
     for (slot_t offset : index_.sc_.key_) {
@@ -97,7 +109,7 @@ Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& ctx) const {
     return std::make_shared<Projection>(std::move(columns), table_.GetSchema(),
                                         std::move(executor));
   }
-  return std::make_shared<IndexOnlyScan>(ctx.txn_, table_, index_, begin_key_,
+  return std::make_shared<IndexOnlyScan>(txn.txn_, table_, index_, begin_key_,
                                          end_key_, ascending_, where_,
                                          table_.GetSchema());
 }

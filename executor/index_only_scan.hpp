@@ -42,7 +42,8 @@ class IndexOnlyScan : public ExecutorBase {
                 const Value& begin, const Value& end, bool ascending,
                 Expression where, const Schema& sc);
   IndexOnlyScan(Transaction& txn, const Table& table, const Index& index,
-                std::vector<Value> begin_key, std::vector<Value> end_key,
+                const std::vector<Value>& begin_key,
+                const std::vector<Value>& end_key,
                 bool ascending, Expression where, const Schema& sc);
   IndexOnlyScan(const IndexOnlyScan&) = delete;
   IndexOnlyScan(IndexOnlyScan&&) = delete;

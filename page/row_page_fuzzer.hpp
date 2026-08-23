@@ -99,7 +99,9 @@ class Operation {
   size_t Execute(std::string_view input, bool verbose = false) {
     uint8_t operation = input[0];
     input.remove_prefix(1);
-    switch (operation % 6) {
+    // % 7 so case 6 (crash recovery) stays reachable; with % 6 the fuzzer
+    // never exercised the crash/recovery path at all.
+    switch (operation % 7) {
       case 0: {  // Read
         slot_t slot;
         if (input.size() < sizeof(slot)) {
@@ -176,8 +178,10 @@ class Operation {
       }
       case 5: {  // Abort
         if (verbose) {
-          LOG(TRACE) << "Commit";
+          LOG(TRACE) << "Abort";
         }
+        // Intentionally leaves |txn_| unfinished while the environment is
+        // rebuilt below: this simulates a crash without a recovery pass.
         page_.PageUnlock();
         txn_.Abort();
         StartTransaction();
@@ -188,6 +192,8 @@ class Operation {
         if (verbose) {
           LOG(TRACE) << "Crash";
         }
+        // Same as Abort: the live txn_ dies with the old environment on
+        // purpose so recovery replays its uncommitted write set.
         page_.PageUnlock();
         env_->Recover();
         StartTransaction();

@@ -1,10 +1,13 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <numeric>
+#include <ratio>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "expression/jit.hpp"
 
 int main() {
@@ -27,7 +30,7 @@ int main() {
     const auto scalar_begin = Clock::now();
     for (size_t repeat = 0; repeat < repetitions; ++repeat) {
       for (size_t index = 0; index < rows; ++index) {
-        output[index] = input[index] > 12345;
+        output[index] = static_cast<uint8_t>(input[index] > 12345);
         checksum = checksum + output[index];
       }
     }

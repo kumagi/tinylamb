@@ -4,19 +4,24 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <array>
 #include <cstdlib>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
 #include "query/sql_engine.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -38,7 +43,8 @@ class TpccWorkloadTest : public ::testing::Test {
     std::vector<Row> rows;
     if (prepared.HasValue()) {
       Row row;
-      while (prepared.Value()->Next(&row, nullptr)) rows.push_back(row);
+      while (prepared.Value()->Next(&row, nullptr)) { rows.push_back(row);
+}
     }
     EXPECT_EQ(context.PreCommit(), Status::kSuccess);
     return rows;
@@ -151,7 +157,7 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
   if (new_order.committed) {
     EXPECT_EQ(new_order.order_id, 11);
     EXPECT_GE(new_order.sql_statements,
-              6 + 4 * static_cast<size_t>(scale.min_order_lines));
+              6 + (4 * static_cast<size_t>(scale.min_order_lines)));
   }
   const std::vector<Row> queues_after_new_order =
       Run("SELECT COUNT(*) FROM new_order;");
@@ -295,7 +301,9 @@ TEST(TpccScaleTest, ToStringCoversEveryTransactionType) {
   EXPECT_EQ(ToString(TpccTransactionType::kDelivery), "delivery");
   EXPECT_EQ(ToString(TpccTransactionType::kStockLevel), "stock_level");
   EXPECT_EQ(ToString(TpccTransactionType::kCount), "unknown");
-  EXPECT_EQ(ToString(static_cast<TpccTransactionType>(99)), "unknown");
+  // Deliberately out-of-range value to probe the fallback arm.
+  EXPECT_EQ(ToString(static_cast<TpccTransactionType>(99)),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+            "unknown");
 }
 
 TEST_F(TpccWorkloadTest, ExecuteOnUninitializedDatabaseReportsError) {
@@ -312,9 +320,9 @@ TEST_F(TpccWorkloadTest, ExecuteOnUninitializedDatabaseReportsError) {
   EXPECT_NE(new_order.error.find("new_order"), std::string::npos)
       << new_order.error;
 
-  // Act -- execute an invalid transaction type.
+  // Act -- execute an invalid transaction type (deliberately out of range).
   const TpccTransactionResult invalid =
-      workload.Execute(static_cast<TpccTransactionType>(99));
+      workload.Execute(static_cast<TpccTransactionType>(99));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
 
   // Assert -- the invalid type is reported precisely.
   EXPECT_FALSE(invalid.committed);
@@ -989,7 +997,7 @@ TEST_F(TpccWorkloadTest, NewOrderCreatesOrderLineRows) {
           std::to_string(new_order.order_id) + ";");
   ASSERT_EQ(total.size(), 1);
   EXPECT_NEAR(total[0][0].value.double_value, new_order.amount,
-              0.01 * line_count + 0.001);
+              (0.01 * line_count) + 0.001);
 }
 
 TEST_F(TpccWorkloadTest, DeliveryWithEmptyQueueCommitsIdle) {

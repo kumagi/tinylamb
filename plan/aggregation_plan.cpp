@@ -16,14 +16,27 @@
 
 #include "plan/aggregation_plan.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <memory>
+#include <thread>
+#include <utility>
+#include <string>
+#include <ostream>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "executor/aggregation.hpp"
+#include "executor/executor_base.hpp"
+#include "executor/parallel_aggregation.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "plan/parallel_thresholds.hpp"
 #include "plan/plan.hpp"
 #include "type/column.hpp"
+#include "type/schema.hpp"
+#include "type/type.hpp"
+#include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -37,6 +50,17 @@ AggregationPlan::AggregationPlan(Plan child,
 const Schema& AggregationPlan::GetSchema() const { return schema_; }
 
 Executor AggregationPlan::EmitExecutor(TransactionContext& ctx) const {
+  if (child_->EmitRowCount() >= kParallelAggregationMinRows) {
+    // Cap workers like the parallel table scan path; unbounded
+    // hardware_concurrency() oversubscribes under nested or concurrent
+    // aggregations.
+    constexpr size_t kMaxParallelAggregationWorkers = 16;
+    const size_t workers =
+        std::min(kMaxParallelAggregationWorkers,
+                 std::max<size_t>(1, std::thread::hardware_concurrency()));
+    return std::make_shared<ParallelAggregationExecutor>(
+        child_->EmitExecutor(ctx), child_->GetSchema(), aggregates_, workers);
+  }
   return std::make_shared<AggregationExecutor>(
       child_->EmitExecutor(ctx), child_->GetSchema(), aggregates_);
 }
@@ -57,8 +81,13 @@ size_t AggregationPlan::EmitRowCount() const { return 1; }
 
 std::string AggregationPlan::ToString() const {
   std::string s = "Aggregation {";
+  bool first = true;
   for (const auto& agg : aggregates_) {
-    s += agg.name + ": " + agg.expression->ToString() + ", ";
+    if (!first) {
+      s += ", ";
+    }
+    first = false;
+    s += agg.name + ": " + agg.expression->ToString();
   }
   s += "}";
   return s;
@@ -76,13 +105,25 @@ Schema AggregationPlan::GenerateSchema() const {
     ValueType type = ValueType::kInt64;
     if (expression.GetType() == AggregationType::kAvg) {
       type = ValueType::kDouble;
-    } else if (expression.GetType() != AggregationType::kCount &&
-               expression.Child()->Type() == TypeTag::kColumnValue) {
-      const int offset = child_->GetSchema().Offset(
-          expression.Child()->AsColumnValue().GetColumnName());
-      if (offset >= 0) {
-        type =
-            child_->GetSchema().GetColumn(static_cast<size_t>(offset)).Type();
+    } else if (expression.GetType() != AggregationType::kCount) {
+      // SUM/MIN/MAX inherit their argument's evaluated type so that
+      // arithmetic arguments (e.g. TPC-H Q1
+      // sum(l_extendedprice*(1-l_discount))) do not silently claim Int64.
+      // When the argument type cannot be resolved, keep the legacy Int64
+      // default.
+      const Type result = expression.Child()->ResultType(child_->GetSchema());
+      switch (result.GetType()) {
+        case TypeTag::kDouble:
+          type = ValueType::kDouble;
+          break;
+        case TypeTag::kVarChar:
+          type = ValueType::kVarChar;
+          break;
+        case TypeTag::kDate:
+          type = ValueType::kDate;
+          break;
+        default:
+          break;
       }
     }
     columns.emplace_back(agg.name, type);

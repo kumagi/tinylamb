@@ -33,14 +33,19 @@ class IteratorBase {
   IteratorBase& operator=(IteratorBase&&) = delete;
   [[nodiscard]] virtual bool IsValid() const = 0;
   [[nodiscard]] virtual RowPosition Position() const = 0;
-  bool operator==(const IteratorBase&) const = default;
-  bool operator<=>(const IteratorBase&) const = default;
+  // No member-wise operator== / operator<=> here: a defaulted version would
+  // report every pair of iterators equal.  Concrete iterators that need
+  // comparison define their own.
   virtual const Row& operator*() const = 0;
   virtual Row& operator*() = 0;
   const Row* operator->() const { return &operator*(); }
   Row* operator->() { return &operator*(); }
   virtual IteratorBase& operator++() = 0;
   virtual IteratorBase& operator--() = 0;
+  // Releases any held page latch without advancing.  Used by morsel scan
+  // workers before they may block on a full output queue, so a blocked
+  // worker never stands between a writer and its page.
+  virtual void DropPageLatch() {}
   virtual void Dump(std::ostream& o, int indent) const = 0;
   friend std::ostream& operator<<(std::ostream& o, const IteratorBase& it) {
     it.Dump(o, 0);

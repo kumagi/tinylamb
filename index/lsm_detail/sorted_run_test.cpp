@@ -20,8 +20,10 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -55,6 +57,7 @@ TEST_F(SortedRunEntryTest, Generate) {
 
   // Act -- wait for 6 writes to land, then destroy the writer
   while (l->Written() < 6) {
+    std::this_thread::yield();
   }
   l.reset();
 
@@ -78,6 +81,7 @@ TEST_F(SortedRunEntryTest, Compare) {
 
   // Act -- wait for 6 writes to land, then destroy the writer
   while (l->Written() < 6) {
+    std::this_thread::yield();
   }
   l.reset();
 
@@ -391,8 +395,6 @@ TEST_F(SortedRunTest, IteratorEquality) {
   ++first;
   ASSERT_TRUE(copy != first);
   ASSERT_FALSE(copy == first);
-  // Drain the writer before teardown (see EntryStreamOperatorVariants).
-  blob_->Flush();
 }
 TEST_F(SortedRunTest, IteratorStreamOperator) {
   // Arrange -- an iterator pointing at a live (non-deleted) entry
@@ -408,8 +410,6 @@ TEST_F(SortedRunTest, IteratorStreamOperator) {
   std::string dumped = ss.str();
   EXPECT_NE(dumped.find("=>"), std::string::npos);
   EXPECT_NE(dumped.find(it.Key()), std::string::npos);
-  // Drain the writer before teardown (see EntryStreamOperatorVariants).
-  blob_->Flush();
 }
 TEST_F(SortedRunTest, SortedRunStreamOperator) {
   // Arrange -- the fixture SortedRun holds 1000 entries
@@ -422,8 +422,6 @@ TEST_F(SortedRunTest, SortedRunStreamOperator) {
   EXPECT_NE(dumped.find("key range:"), std::string::npos);
   EXPECT_NE(dumped.find("Entries: 1000"), std::string::npos);
   EXPECT_NE(dumped.find("Generation:"), std::string::npos);
-  // Drain the writer before teardown (see EntryStreamOperatorVariants).
-  blob_->Flush();
 }
 TEST_F(SortedRunTest, EntryStreamOperatorVariants) {
   // Arrange -- entries with short/inline, long/indirect, deleted, and large
@@ -451,10 +449,5 @@ TEST_F(SortedRunTest, EntryStreamOperatorVariants) {
   EXPECT_NE(dumped.find("(deleted)"), std::string::npos);
   EXPECT_NE(dumped.find("value_len:"), std::string::npos);
   EXPECT_NE(dumped.find(" offset: "), std::string::npos);
-
-  // Drain the writer: BlobFile destroys its cache (which closes the shared
-  // fd) before the Logger's worker thread, so any still-pending append makes
-  // the worker fail with EBADF and Logger::Finish() deadlocks.
-  blob_->Flush();
 }
 }  // namespace tinylamb

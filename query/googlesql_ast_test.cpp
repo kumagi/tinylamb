@@ -4,15 +4,23 @@
 
 #include <gtest/gtest.h>
 
+#include <exception>
+#include <array>
+#include <cstddef>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
-#include "parser/ast.hpp"
+#include "common/status_or.hpp"
+#include "common/constants.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/in_expression.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
+#include "query/statement.hpp"
+#include "type/type.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -21,11 +29,13 @@ namespace {
 std::unique_ptr<Statement> VisitSql(std::string_view sql) {
   GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(sql);
   EXPECT_TRUE(parsed.ok) << parsed.error;
-  if (!parsed.ok) return nullptr;
+  if (!parsed.ok) { return nullptr;
+}
   StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
       GoogleSqlAstParser::Parse(parsed.ast);
   EXPECT_EQ(ast.GetStatus(), Status::kSuccess);
-  if (!ast.HasValue()) return nullptr;
+  if (!ast.HasValue()) { return nullptr;
+}
   return GoogleSqlAstVisitor::Visit(*ast.Value());
 }
 
@@ -35,7 +45,8 @@ std::unique_ptr<Statement> VisitSqlOrThrow(std::string_view sql) {
   StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
       GoogleSqlAstParser::Parse(parsed.ast);
   EXPECT_EQ(ast.GetStatus(), Status::kSuccess);
-  if (!ast.HasValue()) return nullptr;
+  if (!ast.HasValue()) { return nullptr;
+}
   return GoogleSqlAstVisitor::Visit(*ast.Value());
 }
 
@@ -254,7 +265,10 @@ TEST(GoogleSqlAstTest, JoinsAndTableSubqueries) {
   ASSERT_EQ(join_select.Sources().size(), 2);
   EXPECT_EQ(join_select.Sources()[0].table, "t");
   EXPECT_EQ(join_select.Sources()[1].table, "t2");
-  EXPECT_TRUE(join_select.RequiresRelationalEvaluation());
+  // Phase 8: plain cross/inner joins stay on the cost-based optimizer path;
+  // the engine folds the ON condition into the WHERE conjunction.
+  EXPECT_FALSE(join_select.RequiresRelationalEvaluation());
+  EXPECT_TRUE(join_select.Sources()[1].join_condition);
 
   auto left_join = VisitSql(
       "SELECT * FROM t LEFT JOIN t2 ON t.a = t2.a;");
@@ -391,7 +405,10 @@ template <typename Fn>
 std::string ThrowMessage(Fn&& fn) {
   try {
     fn();
-  } catch (const std::runtime_error& e) {
+  } catch (const std::exception& e) {
+    // Visitor errors are runtime_error, but catch std::exception so a stray
+    // logic_error (e.g. from a numeric parse) fails the message assertion
+    // instead of aborting the test binary.
     return e.what();
   }
   return {};
@@ -467,6 +484,125 @@ TEST(GoogleSqlAstTest, UnsupportedExpressionKindsThrow) {
     EXPECT_NE(message.find("unsupported expression"), std::string::npos)
         << sql << "\n" << message;
   }
+}
+
+TEST(GoogleSqlAstTest, DeeplyNestedExpressionsFailWithDiagnostic) {
+  // The parser accepts arbitrarily deep expressions; visitation must reject
+  // nesting beyond the depth cap with an exception instead of overflowing
+  // the C++ stack (a stack overflow is unrecoverable).
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
+  }
+  std::string sql = "SELECT 1";
+  for (int i = 0; i < 600; ++i) { sql += "+1";
+}
+  sql += ";";
+  const std::string message =
+      ThrowMessage([&sql] { VisitSqlOrThrow(sql); });
+  // Either layer must reject the input instead of overflowing the stack: the
+  // ZetaSQL parser ("binary expression arity") or the visitor depth cap
+  // ("nesting exceeds").
+  EXPECT_TRUE(message.find("nesting exceeds") != std::string::npos ||
+              message.find("arity") != std::string::npos)
+      << message;
+}
+
+TEST(GoogleSqlAstTest, ExplicitZeroLimitDistinguishesFromAbsent) {
+  auto zero = VisitSql("SELECT a FROM t LIMIT 0;");
+  ASSERT_TRUE(zero);
+  const auto& zero_select = dynamic_cast<const SelectStatement&>(*zero);
+  EXPECT_TRUE(zero_select.HasLimit());
+  EXPECT_EQ(zero_select.Limit(), 0U);
+
+  auto none = VisitSql("SELECT a FROM t;");
+  ASSERT_TRUE(none);
+  const auto& none_select = dynamic_cast<const SelectStatement&>(*none);
+  EXPECT_FALSE(none_select.HasLimit());
+}
+
+// Tests below are derived from googlesql_ast_fuzzer: the AST dump arrives
+// from an external parser process, so the dump parser and the visitor must
+// treat arbitrary text as untrusted input - reject, never crash.
+TEST(GoogleSqlAstTest, MalformedDumpsAreRejectedWithoutCrashing) {
+  const std::array<std::string_view, 6> broken_dumps = {
+      "",                             // empty: no root
+      "\n",                           // only blank lines
+      "  bad\n",                      // odd indentation
+      "a\nb\n",                       // two roots at depth zero
+      "root\n   three-space\n",       // odd indent below root
+      "root\n  child\n grandchild\n"  // depth jumps by one level only
+  };
+  for (const std::string_view dump : broken_dumps) {
+    SCOPED_TRACE(testing::Message() << "dump=[" << dump << "]");
+    const StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+        GoogleSqlAstParser::Parse(dump);
+    EXPECT_FALSE(ast.HasValue());
+  }
+}
+
+TEST(GoogleSqlAstTest, LabelsWithoutRangeSuffixAreAcceptedLeniently) {
+  // A location suffix only counts when the label ends in ']'; anything else
+  // becomes the node's literal kind. Leniency pins from the fuzzer corpus:
+  // unparsable ranges and unbalanced parens survive as opaque nodes.
+  for (const std::string_view dump :
+       {"q [0-1] extra\n", "x [not-a-range]\n", "y(-\n"}) {
+    SCOPED_TRACE(testing::Message() << "dump=[" << dump << "]");
+    const StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+        GoogleSqlAstParser::Parse(dump);
+    ASSERT_TRUE(ast.HasValue());
+    EXPECT_EQ(ast.Value()->children.size(), 0U);
+  }
+}
+
+TEST(GoogleSqlAstTest, DeeplyIndentedDumpParsesIteratively) {
+  // The fuzzer explores very deep trees; parsing must stay iterative so a
+  // deep dump cannot exhaust the stack. Depth 2000 is well beyond anything
+  // the real parser emits but cheap here.
+  std::string dump = "root\n";
+  for (int i = 0; i < 2000; ++i) {
+    dump.append(static_cast<size_t>(i + 1) * 2, ' ');
+    dump.append("node\n");
+  }
+  const StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse(dump);
+  ASSERT_TRUE(ast.HasValue());
+  EXPECT_EQ(ast.Value()->kind, "root");
+  EXPECT_EQ(ast.Value()->children.size(), 1U);
+}
+
+TEST(GoogleSqlAstTest, UnknownStatementKindThrowsDiagnosticForVisitor) {
+  // The visitor reports trees whose root it does not understand by throwing;
+  // sql_engine catches. Pin that contract including the message shape.
+  const StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse("Statement\n  WeirdThing(zzz)\n");
+  ASSERT_TRUE(ast.HasValue());
+  try {
+    const std::unique_ptr<Statement> statement =
+        GoogleSqlAstVisitor::Visit(*ast.Value());
+    FAIL() << "expected a throw for an unsupported statement kind";
+  } catch (const std::exception& error) {
+    EXPECT_NE(std::string(error.what()).find("unsupported"), std::string::npos);
+  }
+}
+
+TEST(GoogleSqlAstTest, ChildAccessorOccurrenceSemantics) {
+  // Visitor code relies on Child(kind, n) returning the n-th matching child
+  // and nullptr past the last one; pin it with same-kind siblings.
+  const StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse(
+          "root\n"
+          "  leaf(a)\n"
+          "  other(x)\n"
+          "  leaf(b)\n");
+  ASSERT_TRUE(ast.HasValue());
+  const GoogleSqlAstNode& root = *ast.Value();
+  ASSERT_NE(root.Child("leaf", 0), nullptr);
+  EXPECT_EQ(root.Child("leaf", 0)->detail, "a");
+  ASSERT_NE(root.Child("leaf", 1), nullptr);
+  EXPECT_EQ(root.Child("leaf", 1)->detail, "b");
+  EXPECT_EQ(root.Child("leaf", 2), nullptr);
+  EXPECT_EQ(root.Child("missing", 0), nullptr);
+  EXPECT_EQ(root.Children("leaf").size(), 2U);
 }
 
 }  // namespace tinylamb

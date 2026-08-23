@@ -94,6 +94,13 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   auto expected_it = expected.begin();
   for (auto actual_it = v.Begin(); actual_it.IsValid();
        ++actual_it, ++expected_it) {
+    if (expected_it == expected.end()) {
+      // The view enumerated more entries than the model: stop instead of
+      // dereferencing past the map's end.
+      LOG(ERROR) << "view yields more keys than the model: "
+                 << actual_it.Key();
+      exit(1);
+    }
     if (actual_it.Key() != expected_it->first) {
       LOG(ERROR) << actual_it.Key() << " != " << expected_it->first;
       exit(1);
@@ -110,6 +117,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   }
   if (expected_it != expected.end()) {
     LOG(ERROR) << expected_it->first << " not finished";
+    exit(1);
   }
   std::filesystem::remove_all(base_path);
   if (verbose) {

@@ -23,26 +23,42 @@
 #include <unordered_set>
 #include <vector>
 
+// NOTE: LOG() never filters levels. LOG(FATAL) flushes the message to stderr
+// and then aborts the process; callers wanting a survivable diagnostic must
+// use LOG(ERROR) or below.
 #define LOG(level) LogMessage(level, __FILE__, __LINE__, __func__).stream()
-#define STATUS(s, message)                  \
-  {                                         \
-    if ((s) != Status::kSuccess) {          \
-      LOG(FATAL) << (message) << ": " << s; \
-      abort();                              \
-    }                                       \
-  }
+#define STATUS(s, message)                   \
+  do {                                       \
+    if ((s) != Status::kSuccess) {           \
+      LOG(FATAL) << (message) << ": " << s;  \
+      abort();                               \
+    }                                        \
+  } while (0)
 
 #ifndef ERROR_CODES_DEFINE
 #define ERROR_CODES_DEFINE
-#define FATAL 9000
-#define ERROR 5000
-#define ALERT 4000
-#define WARN 3000
-#define NOTICE 2500
-#define INFO 2000
-#define USER 1500
-#define DEBUG 1000
-#define TRACE 0
+
+enum class LogLevel : int {
+  kTrace = 0,
+  kDebug = 1000,
+  kUser = 1500,
+  kInfo = 2000,
+  kNotice = 2500,
+  kWarn = 3000,
+  kAlert = 4000,
+  kError = 5000,
+  kFatal = 9000,
+};
+
+#define FATAL LogLevel::kFatal
+#define ERROR LogLevel::kError
+#define ALERT LogLevel::kAlert
+#define WARN LogLevel::kWarn
+#define NOTICE LogLevel::kNotice
+#define INFO LogLevel::kInfo
+#define USER LogLevel::kUser
+#define DEBUG LogLevel::kDebug
+#define TRACE LogLevel::kTrace
 #endif  // ERROR_CODE_DEFINE
 
 class LogMessage;
@@ -117,11 +133,12 @@ class LogStream {
 
  private:
   std::stringstream message_;
+  bool fatal_{false};
 };
 
 class LogMessage {
  public:
-  LogMessage(int log_level, const char* filename, int lineno,
+  LogMessage(LogLevel log_level, const char* filename, int lineno,
              const char* func_name);
   LogStream& stream() { return ls; }
 

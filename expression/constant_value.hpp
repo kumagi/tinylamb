@@ -17,13 +17,15 @@
 #ifndef TINYLAMB_CONSTANT_VALUE_HPP
 #define TINYLAMB_CONSTANT_VALUE_HPP
 
+#include <utility>
+
 #include "expression/expression.hpp"
 
 namespace tinylamb {
 
 class ConstantValue : public ExpressionBase {
  public:
-  explicit ConstantValue(const Value& v) : val_(v) {}
+  explicit ConstantValue(Value v) : val_(std::move(v)) {}
   [[nodiscard]] TypeTag Type() const override {
     return TypeTag::kConstantValue;
   }
@@ -37,7 +39,7 @@ class ConstantValue : public ExpressionBase {
                                const Schema& /*right_schema*/) const override {
     return val_;
   }
-  [[nodiscard]] Value GetValue() const { return val_; }
+  [[nodiscard]] const Value& GetValue() const { return val_; }
   [[nodiscard]] tinylamb::Type ResultType(const Schema&) const override {
     return TypeForValue();
   }

@@ -16,10 +16,13 @@
 
 #include "expression/in_expression.hpp"
 
+#include <cstddef>
+#include <ostream>
 #include <string>
 #include <unordered_set>
 
 #include "expression/expression.hpp"
+#include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"

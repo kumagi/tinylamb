@@ -42,7 +42,9 @@ class AggregationPlan : public PlanBase {
   [[nodiscard]] Schema GenerateSchema() const;
   Plan child_;
   std::vector<NamedExpression> aggregates_;
-  mutable Schema schema_;
+  // Declaration order matters: schema_ is initialized from child_ and
+  // aggregates_ in the constructor's initializer list.
+  Schema schema_;
 };
 
 }  // namespace tinylamb

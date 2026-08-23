@@ -16,21 +16,24 @@
 
 #include "expression/unary_expression.hpp"
 
+#include <cstdint>
+#include <limits>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
 
 #include "expression/expression.hpp"
+#include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
-namespace {
 
-}  // namespace
-
-Value EvaluateUnary(UnaryOperation operation, Value child) {
+Value EvaluateUnary(UnaryOperation operation, const Value& child) {
   switch (operation) {
     case UnaryOperation::kIsNull:
       return Value(child.IsNull());
@@ -39,24 +42,35 @@ Value EvaluateUnary(UnaryOperation operation, Value child) {
     case UnaryOperation::kNot:
       return child.IsNull() ? Value() : Value(!child.Truthy());
     case UnaryOperation::kMinus:
-      if (child.IsNull()) return Value();
+      if (child.IsNull()) { return {};
+}
       if (child.type == ValueType::kDouble) {
         return Value(-child.value.double_value);
       }
-      if (child.type == ValueType::kInt64) return Value(-child.value.int_value);
+      if (child.type == ValueType::kInt64) {
+        if (child.value.int_value ==
+            std::numeric_limits<int64_t>::min()) {
+          throw std::runtime_error("integer overflow in unary minus");
+        }
+        return Value(-child.value.int_value);
+      }
       throw std::runtime_error("unary minus requires a number");
   }
   throw std::logic_error("invalid unary operation");
 }
 
+namespace {
+
 Type UnaryResultType(UnaryOperation operation, const Type& child) {
   if (operation == UnaryOperation::kIsNull ||
       operation == UnaryOperation::kIsNotNull ||
       operation == UnaryOperation::kNot) {
-    return Type(TypeTag::kBigInt);
+    return {TypeTag::kBigInt};
   }
   return child;
 }
+
+}  // namespace
 
 std::unordered_set<ColumnName> UnaryExpression::TouchedColumns() const {
   return child_->TouchedColumns();

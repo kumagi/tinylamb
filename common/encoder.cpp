@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <string_view>
 
 #include "constants.hpp"
@@ -27,7 +28,11 @@
 namespace tinylamb {
 
 Encoder& Encoder::operator<<(std::string_view sv) {
-  assert(sv.size() < std::numeric_limits<bin_size_t>::max());
+  // bin_size_t cannot represent longer strings; truncating silently would
+  // corrupt the stream (the length prefix would no longer match the payload).
+  if (sv.size() > std::numeric_limits<bin_size_t>::max()) {
+    throw std::runtime_error("string too long to encode");
+  }
   const auto sz = static_cast<bin_size_t>(sv.size());
   os_->write(reinterpret_cast<const char*>(&sz), sizeof(bin_size_t));
   os_->write(sv.data(), sv.size());
@@ -65,7 +70,10 @@ Encoder& Encoder::operator<<(ValueType v) {
 }
 
 Encoder& Encoder::operator<<(bool v) {
-  os_->write(reinterpret_cast<const char*>(&v), sizeof(v));
+  // Normalize to 0/1 instead of writing the implementation-defined bool
+  // representation; keeps the on-disk format stable.
+  const uint8_t normalized = v ? 1 : 0;
+  os_->write(reinterpret_cast<const char*>(&normalized), sizeof(normalized));
   return *this;
 }
 

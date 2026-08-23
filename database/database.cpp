@@ -19,17 +19,21 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <mutex>
 #include <ostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
-#include "common/log_message.hpp"
 #include "common/status_or.hpp"
 #include "database/page_storage.hpp"
 #include "index/b_plus_tree_iterator.hpp"
@@ -46,9 +50,9 @@
 
 namespace tinylamb {
 
-constexpr int kDefaultTableRoot = 1;
-constexpr int kDefaultStatisticsRoot = 2;
-constexpr int kDefaultFunctionRoot = 3;
+constexpr page_id_t kDefaultTableRoot = 1;
+constexpr page_id_t kDefaultStatisticsRoot = 2;
+constexpr page_id_t kDefaultFunctionRoot = 3;
 
 Database::Database(std::string_view dbname)
     : catalog_(kDefaultTableRoot),
@@ -60,8 +64,10 @@ Database::Database(std::string_view dbname)
   statistics_ = BPlusTree(ctx.txn_, kDefaultStatisticsRoot);
   functions_ = BPlusTree(ctx.txn_, kDefaultFunctionRoot);
   if (ctx.txn_.PreCommit() != Status::kSuccess) {
-    LOG(FATAL) << "Failed to initialize relations";
-    exit(1);
+    // Let the embedder decide how to fail (the CLI main catches this);
+    // exit(1) here would skip Logger fsync and PagePool cleanup.
+    throw std::runtime_error("Failed to initialize relations: " +
+                             std::string(dbname));
   }
 }
 
@@ -71,23 +77,28 @@ std::ostream& operator<<(std::ostream& o, const Database& db) {
   return o;
 }
 
+namespace {
+
 template <typename Serializable>
-static std::string Serialize(const Serializable& from) {
+std::string Serialize(const Serializable& from) {
   std::stringstream ss;
   Encoder arc(ss);
   arc << from;
   return ss.str();
 }
 
+// Returns false when the payload was truncated/corrupt; a partially decoded
+// object must never leak out as a valid catalog entry.
 template <typename Deserializable>
-static void Deserialize(std::string_view from, Deserializable& dst) {
+bool Deserialize(std::string_view from, Deserializable* dst) {
   std::string v(from);
   std::stringstream ss(v);
   Decoder ext(ss);
-  ext >> dst;
+  ext >> *dst;
+  // eofbit alone is fine (payload fully consumed); failbit/badbit mean a
+  // short read or an oversized length field.
+  return !ss.fail();
 }
-
-namespace {
 
 constexpr uint64_t kStatisticsMetaMagic = 0x544C53544D455441ULL;  // TLSTMETA
 
@@ -112,11 +123,8 @@ uint64_t PeekUint64(std::string_view payload) {
   if (payload.size() < sizeof(uint64_t)) {
     return 0;
   }
-  std::string copy(payload);
-  std::stringstream stream(copy);
-  Decoder decoder(stream);
   uint64_t value = 0;
-  decoder >> value;
+  std::memcpy(&value, payload.data(), sizeof(value));
   return value;
 }
 
@@ -134,10 +142,11 @@ Status WriteSplitStatistics(BPlusTree& tree, Transaction& txn,
                             const TableStatistics& stats) {
   RETURN_IF_FAIL(UpsertStatistics(tree, txn, table_name,
                                   EncodeStatisticsMeta(stats.Rows())));
-  for (slot_t column = 0; column < stats.Columns(); ++column) {
-    RETURN_IF_FAIL(UpsertStatistics(tree, txn,
-                                    StatisticsColumnKey(table_name, column),
-                                    Serialize(stats.Column(column))));
+  for (size_t column = 0; column < stats.Columns(); ++column) {
+    RETURN_IF_FAIL(
+        UpsertStatistics(tree, txn, StatisticsColumnKey(table_name,
+                                                        static_cast<slot_t>(column)),
+                         Serialize(stats.Column(column))));
   }
   return Status::kSuccess;
 }
@@ -146,6 +155,13 @@ Status WriteSplitStatistics(BPlusTree& tree, Transaction& txn,
 
 StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
                                       const Schema& schema) {
+  // Serializes the existence check with the catalog insert within this
+  // process. B+tree inserts reject duplicates, but by the time Insert fails
+  // the table page (and any unique indexes) are already allocated and
+  // cannot be reclaimed -- kSystemDestroyPage redo is unimplemented, so a
+  // lost race would leak pages permanently. Close the race before the
+  // allocation instead of compensating afterwards.
+  std::scoped_lock lock(catalog_mu_);
   if (catalog_.Read(ctx.txn_, schema.Name()).GetStatus() !=
       Status::kNotExists) {
     return Status::kConflicts;
@@ -192,7 +208,15 @@ Status Database::DropTable(TransactionContext& ctx,
       return deleted;
     }
   }
-  return catalog_.Delete(ctx.txn_, schema_name);
+  RETURN_IF_FAIL(catalog_.Delete(ctx.txn_, schema_name));
+  // KNOWN LIMITATION: the table's row/index pages stay allocated (space
+  // leak). Reclaiming them needs kSystemDestroyPage redo support in the
+  // recovery manager -- do NOT wire PageManager::DestroyPage here until that
+  // lands, or a crash after DROP would make the next startup fail.
+  // Invalidate cached images so later lookups observe the drop.
+  ctx.tables_.erase(std::string(schema_name));
+  ctx.stats_.erase(std::string(schema_name));
+  return Status::kSuccess;
 }
 
 Status Database::CreateIndex(TransactionContext& ctx,
@@ -200,12 +224,20 @@ Status Database::CreateIndex(TransactionContext& ctx,
                              const IndexSchema& idx) {
   ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
   RETURN_IF_FAIL(tbl.CreateIndex(ctx.txn_, idx));
-  return catalog_.Update(ctx.txn_, schema_name, Serialize(tbl));
+  RETURN_IF_FAIL(catalog_.Update(ctx.txn_, schema_name, Serialize(tbl)));
+  // Refresh the cached image so later inserts maintain the new index.
+  ctx.tables_[std::string(schema_name)] =
+      std::make_shared<Table>(std::move(tbl));
+  return Status::kSuccess;
 }
 
 StatusOr<Function> Database::GetOrAddFunction(TransactionContext& ctx,
                                               std::string_view function_name,
                                               int argument_count) {
+  // Same TOCTOU shape as CreateTable: hold the catalog mutex across the
+  // Read→Insert pair so concurrent registrations cannot both take the
+  // insert path.
+  std::scoped_lock lock(catalog_mu_);
   StatusOr<std::string_view> val = functions_.Read(ctx.txn_, function_name);
   if (val.GetStatus() != Status::kSuccess &&
       val.GetStatus() != Status::kNotExists) {
@@ -218,7 +250,9 @@ StatusOr<Function> Database::GetOrAddFunction(TransactionContext& ctx,
     return new_func;
   }
   Function func;
-  Deserialize(val.Value(), func);
+  if (!Deserialize(val.Value(), &func)) {
+    return Status::kCorrupt;
+  }
   return func;
 }
 
@@ -226,7 +260,11 @@ StatusOr<Table> Database::GetTable(TransactionContext& ctx,
                                    std::string_view schema_name) {
   ASSIGN_OR_RETURN(std::string_view, val, catalog_.Read(ctx.txn_, schema_name));
   Table tbl;
-  Deserialize(val, tbl);
+  if (!Deserialize(val, &tbl)) {
+    // A corrupt catalog entry must abort the lookup instead of handing out
+    // a garbage schema.
+    return Status::kCorrupt;
+  }
   return tbl;
 }
 
@@ -243,9 +281,13 @@ std::vector<std::string> Database::ListTables(TransactionContext& ctx) {
   // FIXME(kumagi): The btree also has statistics entry.
   BPlusTreeIterator iter = catalog_.Begin(txn);
   while (iter.IsValid()) {
-    Schema sc;
-    Deserialize(iter.Value(), sc);
-    o << sc << "\n";
+    Table tbl;
+    if (!Deserialize(iter.Value(), &tbl)) {
+      o << "(corrupt catalog entry)\n";
+      ++iter;
+      continue;
+    }
+    o << tbl << "\n";
     ++iter;
   }
 }
@@ -257,7 +299,9 @@ StatusOr<TableStatistics> Database::GetStatistics(
                    statistics_.Read(ctx.txn_, schema_name));
   TableStatistics ts(tbl.GetSchema());
   if (PeekUint64(meta) != kStatisticsMetaMagic) {
-    Deserialize(meta, ts);
+    if (!Deserialize(meta, &ts)) {
+      return Status::kCorrupt;
+    }
     return ts;
   }
   uint64_t magic = 0;
@@ -267,6 +311,9 @@ StatusOr<TableStatistics> Database::GetStatistics(
     std::stringstream stream(copy);
     Decoder decoder(stream);
     decoder >> magic >> rows;
+    if (stream.fail()) {
+      return Status::kCorrupt;
+    }
   }
   const Schema& schema = tbl.GetSchema();
   std::vector<ColumnStats> columns;
@@ -279,7 +326,9 @@ StatusOr<TableStatistics> Database::GetStatistics(
       continue;
     }
     ColumnStats stats;
-    Deserialize(payload.Value(), stats);
+    if (!Deserialize(payload.Value(), &stats)) {
+      return Status::kCorrupt;
+    }
     columns.push_back(std::move(stats));
   }
   ts.Assign(rows, std::move(columns));

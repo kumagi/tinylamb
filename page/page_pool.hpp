@@ -17,13 +17,16 @@
 #ifndef TINYLAMB_PAGE_POOL_HPP
 #define TINYLAMB_PAGE_POOL_HPP
 
+#include <atomic>
 #include <cassert>
-#include <fstream>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "common/constants.hpp"
@@ -42,7 +45,7 @@ class PagePool {
         : pin_count(1), page(p), page_latch(new std::shared_mutex()) {}
 
     // If pinned, this page will never been evicted.
-    uint32_t pin_count = 0;
+    std::atomic<uint32_t> pin_count{0};
 
     // A pointer to physical page in memory.
     std::unique_ptr<Page> page = nullptr;
@@ -52,8 +55,18 @@ class PagePool {
 
     Entry(const Entry&) = delete;
     Entry& operator=(const Entry&) = delete;
-    Entry(Entry&&) = default;
-    Entry& operator=(Entry&&) = default;
+    Entry(Entry&& other) noexcept
+        : pin_count(other.pin_count.load()),
+          page(std::move(other.page)),
+          page_latch(std::move(other.page_latch)) {}
+    Entry& operator=(Entry&& other) noexcept {
+      if (this != &other) {
+        pin_count.store(other.pin_count.load());
+        page = std::move(other.page);
+        page_latch = std::move(other.page_latch);
+      }
+      return *this;
+    }
   };
   typedef std::list<Entry> LruType;
 
@@ -64,13 +77,18 @@ class PagePool {
   PageRef GetPage(page_id_t page_id, bool* cache_hit = nullptr,
                   bool shared = false);
 
+  // Like GetPage, but a corrupt on-disk image is returned verbatim instead of
+  // rejected. RecoveryManager needs the raw bytes to run Single Page
+  // Recovery; every other caller should use GetPage.
+  PageRef GetPageForRecovery(page_id_t page_id, bool* cache_hit = nullptr);
+
   page_id_t Size() const {
-    std::scoped_lock latch(pool_latch);
+    std::shared_lock latch(pool_latch);
     return pool_lru_.size();
   }
 
   friend std::ostream& operator<<(std::ostream& o, const PagePool& pp) {
-    std::scoped_lock latch(pp.pool_latch);
+    std::shared_lock latch(pp.pool_latch);
     o << "PagePool(file=" << pp.file_name_ << ", capacity=" << pp.capacity_
       << ", pages=" << pp.pool_lru_.size() << ")";
     return o;
@@ -80,6 +98,14 @@ class PagePool {
   void DropAllPages();
 
   void FlushPageForTest(page_id_t page_id);
+
+  // Installs a WAL durability hook: before a dirty page image is pwritten,
+  // the pool invokes gate(page->PageLSN()) so the caller can guarantee every
+  // log record up to that LSN is already durable (WAL write-ahead rule).
+  // The gate runs while the pool latch is NOT held; it may block on fsync.
+  // Must be wired before the pool is used concurrently. An empty gate keeps
+  // the previous behavior of writing back without any durability check.
+  void SetDurabilityGate(std::function<void(lsn_t)> gate);
 
  private:
   friend class PageRef;
@@ -95,15 +121,21 @@ class PagePool {
   // Refresh the specified entry in LRU.
   void Touch(LruType::iterator it);
 
-  // Write `target` page into the file. Caller must hold file_latch_.
+  // Write `target` page into the file. Caller must hold file_latch_ but NOT
+  // pool_latch, so the durability gate may block without stalling the pool.
   void WriteBack(const Page* target);
 
-  // Read page at `pid` from the file to `target`. Caller must hold file_latch_.
-  void ReadFrom(Page* target, page_id_t pid);
+  // Read page at `pid` from the file to `target`. Caller must hold
+  // file_latch_. With validate, a non-zero but corrupt checksum throws;
+  // without it, broken images are handed back for Single Page Recovery.
+  void ReadFrom(Page* target, page_id_t pid, bool validate) const;
+
+  PageRef GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
+                      bool validate);
 
   std::string file_name_;
 
-  std::fstream src_;
+  int fd_{-1};
 
   // Rows of allowed max pages entry in memory.
   size_t capacity_;
@@ -114,10 +146,24 @@ class PagePool {
   // A map to find PageID -> page*.
   std::unordered_map<page_id_t, LruType::iterator> pool_;
 
-  mutable std::mutex pool_latch;
+  // Page ids detached from the pool whose dirty images have not reached the
+  // file yet. Guarded by pool_latch; misses on these ids must wait so a stale
+  // on-disk image is never read and installed.
+  std::unordered_set<page_id_t> flushing_;
 
-  // Serializes fstream seeks/reads/writes; held independently of pool_latch so
-  // concurrent table loads can keep resolving cached pages while one miss I/Os.
+  // Entries stranded by DropAllPages while still pinned by live PageRefs.
+  // They are kept alive here (without write back) until the pool dies so a
+  // late Unpin never touches freed entries.
+  LruType retired_;
+
+  // WAL durability hook; see SetDurabilityGate. Read without extra locking,
+  // so it must be installed before the pool is used concurrently.
+  std::function<void(lsn_t)> durability_gate_;
+
+  mutable std::shared_mutex pool_latch;
+
+  // Serializes pread/pwrite; held independently of pool_latch so concurrent
+  // table loads can keep resolving cached pages while one miss I/Os.
   mutable std::mutex file_latch_;
 };
 

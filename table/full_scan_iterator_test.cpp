@@ -17,9 +17,12 @@
 #include "full_scan_iterator.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
@@ -110,7 +113,10 @@ TEST_F(FullScanIteratorTest, ProjectedScanReturnsRequestedColumnsInOrder) {
   EXPECT_EQ((*projected)[0], Value(42));
   EXPECT_EQ((*projected)[1], Value(3.5));
 
-  Iterator no_columns = table.BeginFullScan(ctx.txn_, {});
+  // Spell out the type: a bare `{}` would resolve to the
+  // IntegerPeekCompare-pointer overload added alongside peek scans.
+  Iterator no_columns =
+      table.BeginFullScan(ctx.txn_, std::vector<slot_t>{});
   ASSERT_TRUE(no_columns.IsValid());
   EXPECT_TRUE((*no_columns).values_.empty());
   ASSERT_SUCCESS(ctx.PreCommit());
@@ -125,7 +131,8 @@ TEST_F(FullScanIteratorTest, ScanAfterDeletingFirstSlot) {
         RowPosition, position,
         table.Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
                                     Value(0.1 + i)})));
-    if (i == 0) first = position;
+    if (i == 0) { first = position;
+}
   }
   ASSERT_SUCCESS(table.Delete(ctx.txn_, first));
 
@@ -178,8 +185,6 @@ TEST_F(FullScanIteratorTest, OldSnapshotScansPhysicallyDeletedTailRow) {
 
 }  // namespace tinylamb
 
-#include <sstream>
-
 namespace tinylamb {
 
 TEST_F(FullScanIteratorTest, MorselScanIteratesOnlyRequestedPages) {
@@ -198,7 +203,7 @@ TEST_F(FullScanIteratorTest, MorselScanIteratesOnlyRequestedPages) {
   for (const Table::ScanMorsel& morsel : morsels) {
     Iterator it = table.BeginMorselScan(ctx.txn_, morsel);
     while (it.IsValid()) {
-      ASSERT_EQ((*it).values_.size(), 3u);
+      ASSERT_EQ((*it).values_.size(), 3U);
       ++seen;
       ++it;
     }
@@ -209,7 +214,7 @@ TEST_F(FullScanIteratorTest, MorselScanIteratesOnlyRequestedPages) {
 
 TEST_F(FullScanIteratorTest, EmptyTableScanYieldsNoRows) {
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(ctx, "SampleTable"));
   Iterator it = table.BeginFullScan(ctx.txn_);
   EXPECT_FALSE(it.IsValid());
   EXPECT_FALSE(it.Position().IsValid());

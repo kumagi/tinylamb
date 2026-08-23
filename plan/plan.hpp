@@ -50,13 +50,20 @@ class PlanBase {
       const std::vector<bool>& /*ascending*/) const {
     return false;
   }
+  // True when the plan already caps its output to `limit_count` rows after
+  // skipping `limit_offset`, so callers must not apply the same LIMIT/OFFSET
+  // again (D6: single enforcement point).
+  [[nodiscard]] virtual bool EnforcesLimit(
+      size_t /*limit_count*/, size_t /*limit_offset*/) const {
+    return false;
+  }
 
   virtual void Dump(std::ostream& o, int indent) const = 0;
   [[nodiscard]] virtual std::string ToString() const = 0;
   friend std::ostream& operator<<(std::ostream& o, const PlanBase& p);
 };
 
-typedef std::shared_ptr<PlanBase> Plan;
+using Plan = std::shared_ptr<PlanBase>;
 
 inline std::ostream& operator<<(std::ostream& o, const Plan& p) {
   if (p) {

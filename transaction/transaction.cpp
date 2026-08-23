@@ -16,13 +16,22 @@
 
 #include "transaction/transaction.hpp"
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstdint>
+#include <cstddef>
 #include <iostream>
+#include <mutex>
+#include <memory>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "page/page_type.hpp"
 #include "page/row_position.hpp"
 #include "recovery/log_record.hpp"
@@ -52,13 +61,45 @@ Transaction::Transaction(txn_id_t txn_id, TransactionManager* tm,
                          bool read_only)
     : txn_id_(txn_id),
       snapshot_ts_(tm->CurrentCommitTimestamp()),
+      shard_epoch_(NextShardEpoch()),
       status_(TransactionStatus::kRunning),
       read_only_(read_only),
       transaction_manager_(tm) {}
 
+// Begin() registers the address of the Transaction it is about to return.
+// NRVO usually makes that address the final one; when the return instead
+// move-constructs (e.g. Database::BeginContext moves the result into
+// TransactionContext::txn_), follow the registration so the manager's
+// active_transactions_ map never points at the moved-from object.
+Transaction::Transaction(Transaction&& o) noexcept
+    : txn_id_(o.txn_id_),
+      snapshot_ts_(o.snapshot_ts_),
+      read_set_(std::move(o.read_set_)),
+      write_set_(std::move(o.write_set_)),
+      shard_epoch_(o.shard_epoch_),
+      write_epoch_(o.write_epoch_.load(std::memory_order_acquire)),
+      version_read_caches_(std::move(o.version_read_caches_)),
+      read_state_mutex_(std::move(o.read_state_mutex_)),
+      prev_lsn_(o.prev_lsn_),
+      status_(o.status_),
+      read_only_(o.read_only_),
+      transaction_manager_(o.transaction_manager_) {
+  if (o.transaction_manager_ != nullptr) {
+    o.transaction_manager_->MoveActiveTransaction(&o, this);
+  }
+  // Neutralize the moved-from object: it no longer owns a registry slot or
+  // manager services (mirrors PageRef's move convention).
+  o.transaction_manager_ = nullptr;
+}
+
 Status Transaction::PreCommit() {
   Status result = transaction_manager_->PreCommit(*this);
-  status_ = TransactionStatus::kCommitted;
+  if (result == Status::kSuccess) {
+    status_ = TransactionStatus::kCommitted;
+  } else {
+    // A failed PreCommit must not be reported as committed.
+    status_ = TransactionStatus::kAborted;
+  }
   return result;
 }
 
@@ -76,11 +117,12 @@ bool Transaction::AddReadSet(const RowPosition& rp) {
 
 bool Transaction::AddWriteSet(const RowPosition& rp) {
   assert(!IsFinished());
-  if (read_only_) return false;
-  if (write_set_.find(rp) != write_set_.end()) {
+  if (read_only_) { return false;
+}
+  if (write_set_.contains(rp)) {
     return true;
   }
-  if (!transaction_manager_->GetExclusiveLock(rp)) {
+  if (!transaction_manager_->GetExclusiveLock(rp, txn_id_)) {
     return false;
   }
   // Do not remember a write lock until it has actually been acquired.
@@ -88,45 +130,116 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
   return true;
 }
 
+Transaction::VersionCacheShard& Transaction::ThreadShard() {
+  // Thread-local shortcut so the shard-map lock is taken once per thread
+  // instead of once per row.  The process-wide epoch guards against stale
+  // entries when a destroyed transaction's address or id is reused.
+  thread_local uint64_t owner_epoch = 0;
+  thread_local VersionCacheShard* shard = nullptr;
+  if (owner_epoch == shard_epoch_ && shard != nullptr) {
+    return *shard;
+  }
+  std::scoped_lock state_guard(*read_state_mutex_);
+  std::unique_ptr<VersionCacheShard>& entry =
+      version_read_caches_[std::this_thread::get_id()];
+  if (!entry) { entry = std::make_unique<VersionCacheShard>();
+}
+  owner_epoch = shard_epoch_;
+  shard = entry.get();
+  return *shard;
+}
+
+uint64_t Transaction::NextShardEpoch() {
+  static std::atomic<uint64_t> counter{1};
+  return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
 StatusOr<std::string_view> Transaction::ReadVersion(
     const RowPosition& rp, std::optional<std::string_view> physical) {
   assert(!IsFinished());
-  std::scoped_lock state_guard(*read_state_mutex_);
-  AddReadSet(rp);
-  if (!transaction_manager_) {
-    if (!physical) return Status::kNotExists;
+  // Fast path: a row without a version chain has exactly one version -- the
+  // physical image inside the caller's pinned page -- which every snapshot
+  // sees as-is.  Return it directly: no copy, no cache entry, and no locks.
+  if (transaction_manager_ != nullptr && physical &&
+      !transaction_manager_->HasVersionChain(rp)) {
     return *physical;
+  }
+  // Note: read_set_ is diagnostic bookkeeping only (MV2PL readers never
+  // conflict with writers), so this path does not populate it; per-row
+  // insertion under a shared lock would serialize concurrent scan workers.
+  if (transaction_manager_ == nullptr) {
+    if (!physical) { return Status::kNotExists;
+}
+    return *physical;
+  }
+  {
+    // Cache hit for this thread.  Only read-only transactions may serve a
+    // cached value directly: they never write, so an epoch-current entry is
+    // provably identical to what the manager would return for the fixed
+    // snapshot.  Read-write transactions always consult the manager below so
+    // their own in-flight writes are never masked by any shard's cache --
+    // this is the cross-worker read-your-writes guarantee.
+    if (read_only_) {
+      VersionCacheShard& shard = ThreadShard();
+      std::scoped_lock shard_lock(shard.mutex);
+      const auto found = shard.entries.find(rp);
+      if (found != shard.entries.end() &&
+          CacheEntryCurrent(found->second.epoch)) {
+        return std::string_view(found->second.value);
+      }
+    }
   }
   StatusOr<std::string> visible =
       transaction_manager_->ReadVersion(*this, rp, physical);
-  if (!visible.HasValue()) return visible.GetStatus();
-  auto [iter, inserted] =
-      version_read_cache_.insert_or_assign(rp, std::move(visible.Value()));
+  if (!visible.HasValue()) { return visible.GetStatus();
+}
+  VersionCacheShard& shard = ThreadShard();
+  std::scoped_lock shard_lock(shard.mutex);
+  const uint64_t epoch = write_epoch_.load(std::memory_order_acquire);
+  auto [iter, inserted] = shard.entries.insert_or_assign(
+      rp, VersionCacheEntry{.epoch=epoch, .value=std::move(visible.Value())});
   constexpr size_t kMaxVersionReadCache = 4096;
-  if (version_read_cache_.size() > kMaxVersionReadCache) {
-    std::string keep = std::move(iter->second);
-    version_read_cache_.clear();
-    iter = version_read_cache_.insert_or_assign(rp, std::move(keep)).first;
+  if (shard.entries.size() > kMaxVersionReadCache) {
+    // Evict a single entry (never the one just inserted): clearing the whole
+    // shard would invalidate every string_view this thread still holds from
+    // earlier reads.
+    auto victim = shard.entries.begin();
+    if (victim == iter) { ++victim;
+}
+    shard.entries.erase(victim);
   }
-  return std::string_view(iter->second);
+  return std::string_view(iter->second.value);
 }
 
 void Transaction::RegisterVersionWrite(const RowPosition& rp,
                                        std::optional<std::string_view> before,
                                        std::optional<std::string_view> after) {
   std::scoped_lock state_guard(*read_state_mutex_);
-  if (!transaction_manager_) return;
+  if (transaction_manager_ == nullptr) { return;
+}
+  // Invalidate every shard's cached entries for this generation: any worker
+  // under this transaction that reads after the new version registers must
+  // not serve a pre-write value from its cache.  Entries tagged with the
+  // older epoch are simply skipped; they are never freed out from under
+  // their readers.
+  write_epoch_.fetch_add(1, std::memory_order_release);
   transaction_manager_->RegisterVersionWrite(*this, rp, before, after);
-  version_read_cache_.erase(rp);
+  // Drop this thread's own copy eagerly to bound memory; other threads'
+  // shards keep theirs until natural eviction, neutralized by the epoch tag.
+  auto found = version_read_caches_.find(std::this_thread::get_id());
+  if (found != version_read_caches_.end()) {
+    std::scoped_lock shard_lock(found->second->mutex);
+    found->second->entries.erase(rp);
+  }
 }
 
 bool Transaction::RequiresHistoricalRead() const {
-  return transaction_manager_ &&
+  return transaction_manager_ != nullptr &&
          transaction_manager_->RequiresHistoricalRead(*this);
 }
 
 bool Transaction::IndexKeysMayBeStale() const {
-  return transaction_manager_ &&
+  return transaction_manager_ != nullptr &&
          transaction_manager_->IndexKeysMayBeStale(*this);
 }
 

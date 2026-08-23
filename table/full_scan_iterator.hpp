@@ -22,6 +22,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "page/page_ref.hpp"
 #include "page/row_position.hpp"
 #include "table/iterator_base.hpp"
@@ -31,6 +32,40 @@ namespace tinylamb {
 class Table;
 class Transaction;
 
+// Pre-decode reject for INT64/DATE `column <cmp> constant` (full schema index).
+struct IntegerPeekCompare {
+  slot_t column{0};
+  BinaryOperation op{BinaryOperation::kEquals};
+  int64_t constant{0};
+};
+
+[[nodiscard]] inline bool MatchIntegerCompare(int64_t left, BinaryOperation op,
+                                              int64_t right) {
+  switch (op) {
+    case BinaryOperation::kEquals:
+      return left == right;
+    case BinaryOperation::kNotEquals:
+      return left != right;
+    case BinaryOperation::kLessThan:
+      return left < right;
+    case BinaryOperation::kLessThanEquals:
+      return left <= right;
+    case BinaryOperation::kGreaterThan:
+      return left > right;
+    case BinaryOperation::kGreaterThanEquals:
+      return left >= right;
+    default:
+      return false;
+  }
+}
+
+// Full scan over a table's row-page chain (or an explicit page list).
+//
+// Lifetime contract: table_ and txn_ must outlive the iterator.  If
+// key_filter_ / peek_compares_ are supplied, those objects must also outlive
+// the iterator -- they are held as raw pointers, so passing the address of a
+// temporary is a dangling-pointer bug.  Rows handed out via operator*
+// own their data and stay valid after the iterator's page latch is dropped.
 class FullScanIterator : public IteratorBase {
  public:
   ~FullScanIterator() override = default;
@@ -47,6 +82,7 @@ class FullScanIterator : public IteratorBase {
   [[nodiscard]] RowPosition Position() const override { return pos_; }
   IteratorBase& operator++() override;
   IteratorBase& operator--() override;
+  void DropPageLatch() override;
   const Row& operator*() const override;
   Row& operator*() override;
   void Dump(std::ostream& o, int indent) const override;
@@ -54,17 +90,21 @@ class FullScanIterator : public IteratorBase {
  private:
   friend class Table;
   friend class FullScan;
-  FullScanIterator(const Table* table, Transaction* txn,
-                   std::optional<std::vector<slot_t>> projection = std::nullopt,
-                   const std::unordered_set<int64_t>* key_filter = nullptr,
-                   std::optional<slot_t> key_column = std::nullopt);
-  FullScanIterator(const Table* table, Transaction* txn,
-                   std::vector<page_id_t> pages,
-                   std::optional<std::vector<slot_t>> projection,
-                   const std::unordered_set<int64_t>* key_filter = nullptr,
-                   std::optional<slot_t> key_column = std::nullopt);
+  FullScanIterator(
+      const Table* table, Transaction* txn,
+      std::optional<std::vector<slot_t>> projection = std::nullopt,
+      const std::unordered_set<int64_t>* key_filter = nullptr,
+      std::optional<slot_t> key_column = std::nullopt,
+      const std::vector<IntegerPeekCompare>* peek_compares = nullptr);
+  FullScanIterator(
+      const Table* table, Transaction* txn, std::vector<page_id_t> pages,
+      std::optional<std::vector<slot_t>> projection,
+      const std::unordered_set<int64_t>* key_filter = nullptr,
+      std::optional<slot_t> key_column = std::nullopt,
+      const std::vector<IntegerPeekCompare>* peek_compares = nullptr);
 
   void DeserializeCurrent(std::string_view row);
+  [[nodiscard]] bool PassesPeekFilters(std::string_view row) const;
   void SeekVisibleRow();
   bool AdvancePage();
 
@@ -78,6 +118,7 @@ class FullScanIterator : public IteratorBase {
   size_t page_index_{0};
   const std::unordered_set<int64_t>* key_filter_{nullptr};
   std::optional<slot_t> key_column_;
+  const std::vector<IntegerPeekCompare>* peek_compares_{nullptr};
 };
 
 }  // namespace tinylamb

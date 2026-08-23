@@ -16,11 +16,19 @@
 
 #include "recovery/checkpoint_manager.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <chrono>
 #include <cstddef>
+#include <exception>
+#include <filesystem>
 #include <fstream>
 #include <functional>
+#include <ios>
 #include <mutex>
+#include <shared_mutex>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -33,6 +41,41 @@
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
+namespace {
+
+// Persists the master record so a crash can never leave a torn or empty
+// file: write to a temp path, fsync it, then atomically rename over the real
+// path. The directory fsync afterwards is best-effort -- without it a crash
+// may revert the rename, but the previous (still valid) master record simply
+// keeps recovery conservative.
+void WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
+  const std::filesystem::path tmp = path.string() + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      throw std::runtime_error("Failed to open master record: " +
+                               tmp.string());
+    }
+    out.write(reinterpret_cast<const char*>(&lsn), sizeof(lsn));
+    out.flush();
+    if (!out) {
+      throw std::runtime_error("Failed to write master record: " +
+                               tmp.string());
+    }
+  }
+  std::filesystem::rename(tmp, path);
+  const std::filesystem::path dir = path.has_parent_path()
+                                        ? path.parent_path()
+                                        : std::filesystem::path(".");
+  const int dir_fd = ::open(dir.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+  if (dir_fd >= 0) {
+    ::fsync(dir_fd);
+    ::close(dir_fd);
+  }
+}
+
+}  // namespace
+
 CheckpointManager::~CheckpointManager() {
   stop_ = true;
   checkpoint_worker_.join();
@@ -49,13 +92,21 @@ void CheckpointManager::WorkerThreadTask() {
     }
     if (!stop_) {
       LOG(INFO) << "Start periodic checkpointing";
-      WriteCheckpoint();
+      try {
+        WriteCheckpoint();
+      } catch (const std::exception& e) {
+        // The worker thread must never die from an IO failure; log and keep
+        // retrying on the next tick.
+        LOG(ERROR) << "Periodic checkpoint failed: " << e.what();
+      }
     }
   }
 }
 
 lsn_t CheckpointManager::WriteCheckpoint(
     const std::function<void()>& func_for_test) {
+  // The DPT snapshot takes each page's shared latch; callers must not hold
+  // any page latch (PageRef) on this thread while checkpointing.
   LogRecord begin = LogRecord::BeginCheckpointLogRecord();
 
   // Write [BeginFullScan-Checkpoint] log.
@@ -63,10 +114,15 @@ lsn_t CheckpointManager::WriteCheckpoint(
 
   std::vector<std::pair<page_id_t, lsn_t> > dirty_page_table;
   {
-    std::scoped_lock latch(pp_->pool_latch);
+    // page_lsn/recovery_lsn are plain (non-atomic) fields mutated under the
+    // per-page latch; read them under the shared page latch so a concurrent
+    // SetRecLSN/SetPageLSN cannot tear the DPT entries published here.
+    std::shared_lock latch(pp_->pool_latch);
     dirty_page_table.reserve(pp_->pool_.size());
     for (const auto& it : pp_->pool_) {
-      dirty_page_table.emplace_back(it.first, it.second->page->RecoveryLSN());
+      PagePool::Entry& entry = *it.second;
+      std::shared_lock page_latch(*entry.page_latch);
+      dirty_page_table.emplace_back(it.first, entry.page->RecoveryLSN());
     }
   }
   std::vector<ActiveTransactionEntry> active_transaction_table;
@@ -86,10 +142,12 @@ lsn_t CheckpointManager::WriteCheckpoint(
 
   // Write [End-Checkpoint] log.
   tm_->AddLog(end);
+  // The master record must not overtake the WAL: wait until every record up
+  // to (and including) EndCheckpoint is on stable storage, so a reader that
+  // trusts begin_lsn always finds a complete checkpoint pair behind it.
+  tm_->logger_->WaitForDurable(tm_->logger_->BufferedLSN());
 
-  std::ofstream master_log_file;
-  master_log_file.open(master_record_path);
-  master_log_file.write(reinterpret_cast<char*>(&begin_lsn), sizeof(begin_lsn));
+  WriteMasterRecord(master_record_path, begin_lsn);
   return begin_lsn;
 }
 }  // namespace tinylamb

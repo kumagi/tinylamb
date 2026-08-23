@@ -1,13 +1,17 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/spill_file.hpp"
 
-#include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
+#include <utility>
+#include <vector>
+
+// setenv/unsetenv below are POSIX APIs that <cstdlib> does not declare.
+// NOLINTNEXTLINE(modernize-deprecated-headers)
+#include <stdlib.h>
 
 #include "gtest/gtest.h"
 #include "type/row.hpp"
-#include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -148,16 +152,26 @@ TEST(SpillFileTest, FinishWritingIsIdempotent) {
   EXPECT_EQ(rows[0], Row({Value(3)}));
 }
 
-TEST(SpillFileTest, MoveConstructorTransfersRows) {
+namespace {
+
+// Moves a two-row spill out of its builder so the moved-from object is
+// destroyed while the destination is still alive elsewhere.
+std::pair<SpillFile, std::filesystem::path> MoveTwoRowSpillOutOfScope() {
   SpillFile src;
   src.Append(Row({Value(1), Value("a")}));
   src.Append(Row({Value(2), Value("b")}));
   src.FinishWriting();
   const std::filesystem::path path = src.Path();
-  EXPECT_TRUE(std::filesystem::exists(path));
   SpillFile dst(std::move(src));
-  EXPECT_TRUE(src.Empty());
-  EXPECT_EQ(src.Count(), 0U);
+  return {std::move(dst), path};  // src's destructor runs on return
+}
+
+}  // namespace
+
+TEST(SpillFileTest, MoveConstructorTransfersRows) {
+  auto [dst, path] = MoveTwoRowSpillOutOfScope();
+  // The moved-from destructor already ran; it must not have deleted the file.
+  EXPECT_TRUE(std::filesystem::exists(path));
   EXPECT_EQ(dst.Count(), 2U);
   EXPECT_EQ(dst.Path(), path);
   auto rows = dst.ReadAllRows();
@@ -183,7 +197,9 @@ TEST(SpillFileTest, MoveAssignmentDeletesOldTargetFile) {
   EXPECT_TRUE(std::filesystem::exists(old_b));
   b = std::move(a);
   EXPECT_FALSE(std::filesystem::exists(old_b));
-  EXPECT_TRUE(a.Empty());
+  // The move must empty the source file handle; asserting that contract is
+  // the purpose of this test.
+  EXPECT_TRUE(a.Empty());  // NOLINT(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
   EXPECT_EQ(b.Count(), 1U);
   auto rows = b.ReadAllRows();
   ASSERT_EQ(rows.size(), 1U);
@@ -195,7 +211,10 @@ TEST(SpillFileTest, SelfMoveAssignmentIsSafe) {
   spill.Append(Row({Value(5)}));
   spill.FinishWriting();
   const std::filesystem::path path = spill.Path();
-  spill = std::move(spill);
+  // Self-move must be safe; go through a reference so the compiler cannot
+  // prove the self-move and warn about it.
+  SpillFile& spill_alias = spill;
+  spill = std::move(spill_alias);
   EXPECT_EQ(spill.Count(), 1U);
   EXPECT_TRUE(std::filesystem::exists(path));
   auto rows = spill.ReadAllRows();

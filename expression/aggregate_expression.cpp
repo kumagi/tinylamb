@@ -16,12 +16,16 @@
 
 #include "expression/aggregate_expression.hpp"
 
+#include <ostream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
 #include "expression/expression.hpp"
+#include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -30,18 +34,18 @@ std::unordered_set<ColumnName> AggregateExpression::TouchedColumns() const {
   return child_->TouchedColumns();
 }
 
-Value AggregateExpression::Evaluate(const Row&, const Schema&) const {
-  // This method should not be called directly.
-  // The value of an aggregate expression is calculated by the aggregator.
-  return {};
+Value AggregateExpression::Evaluate(const Row& /*row*/, const Schema& /*schema*/) const {
+  // This method must not be called directly: the value of an aggregate
+  // expression is calculated by the aggregator.
+  throw std::logic_error("aggregate expression cannot be evaluated directly");
 }
 
 Type AggregateExpression::ResultType(const Schema& schema) const {
   if (type_ == AggregationType::kCount) {
-    return tinylamb::Type(TypeTag::kBigInt);
+    return {TypeTag::kBigInt};
   }
   if (type_ == AggregationType::kAvg) {
-    return tinylamb::Type(TypeTag::kDouble);
+    return {TypeTag::kDouble};
   }
   return child_->ResultType(schema);
 }
@@ -49,10 +53,10 @@ Type AggregateExpression::ResultType(const Schema& schema) const {
 Type AggregateExpression::ResultType(const Schema& left,
                                      const Schema& right) const {
   if (type_ == AggregationType::kCount) {
-    return tinylamb::Type(TypeTag::kBigInt);
+    return {TypeTag::kBigInt};
   }
   if (type_ == AggregationType::kAvg) {
-    return tinylamb::Type(TypeTag::kDouble);
+    return {TypeTag::kDouble};
   }
   return child_->ResultType(left, right);
 }

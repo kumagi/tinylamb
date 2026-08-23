@@ -30,6 +30,8 @@ class Transaction;
 
 class BPlusTreeIterator {
  public:
+  // Lifetime contract: `tree` and `txn` must both outlive this iterator, and
+  // the iterator is only valid within the transaction that created it.
   BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
                     std::string_view begin = "", std::string_view end = "",
                     bool ascending = true);

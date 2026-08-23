@@ -25,25 +25,39 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <ostream>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "common/log_message.hpp"
 
 namespace tinylamb {
 namespace {
-int FileSize(int fd) {
-  struct stat s;
+uint64_t FileSize(int fd) {
+  struct stat s {};
   if (::fstat(fd, &s) == -1) {
-    LOG(FATAL) << "Cannot get filesize: " << strerror(errno);
-    return -1;
+    throw std::runtime_error(std::string("Cannot get filesize: ") +
+                             strerror(errno));
   }
-  return s.st_size;
+  if (s.st_size < 0) {
+    throw std::runtime_error("Negative filesize from fstat");
+  }
+  return static_cast<uint64_t>(s.st_size);
+}
+
+size_t AddressableSize(int fd, size_t offset, size_t file_size) {
+  if (file_size != 0) {
+    return file_size;
+  }
+  const uint64_t on_disk = FileSize(fd);
+  return on_disk >= offset ? static_cast<size_t>(on_disk - offset) : 0;
 }
 }  // namespace
 
@@ -75,24 +89,35 @@ std::ostream& operator<<(std::ostream& o, const VMCacheImpl::PageState& s) {
 }
 
 VMCacheImpl::VMCacheImpl(int fd, size_t block_size, size_t memory_capacity,
-                         size_t offset, size_t file_size)
+                         size_t offset, size_t file_size, bool own_fd)
     : fd_(fd),
+      own_fd_(own_fd),
       block_size_(block_size),
       max_memory_pages_((memory_capacity + block_size - 1) / block_size),
-      max_size_(file_size != 0 ? file_size - offset : FileSize(fd) - file_size),
+      // An explicit `file_size` is the addressable window (e.g. a blob's
+      // maximum size, since the file keeps growing); otherwise fall back to
+      // the current on-disk size. Always map at least one block so empty
+      // files stay usable.
+      max_size_(
+          std::max<size_t>(AddressableSize(fd, offset, file_size), block_size)),
       offset_(offset),
       meta_(((max_size_ / block_size)) + 1),
-      small_queue_size_((max_memory_pages_ + 9) / 10),
-      main_queue_size_(max_memory_pages_ - small_queue_size_),
-      ghost_queue_size_(max_memory_pages_ - small_queue_size_) {
+      // Degenerated configurations (e.g. memory_capacity < block_size) would
+      // otherwise produce zero-sized queues whose front()/pop_front() are UB.
+      small_queue_size_(std::max<size_t>(1, (max_memory_pages_ + 9) / 10)),
+      main_queue_size_(std::max<size_t>(
+          1, max_memory_pages_ - ((max_memory_pages_ + 9) / 10))),
+      ghost_queue_size_(std::max<size_t>(
+          1, max_memory_pages_ - ((max_memory_pages_ + 9) / 10))) {
   if (memory_capacity == 0) {
-    LOG(FATAL) << "Cache size is 0";
+    throw std::runtime_error("Cache size is 0");
   }
   buffer_ = reinterpret_cast<char*>(
       ::mmap(nullptr, max_size_, PROT_READ | PROT_WRITE,
              MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE, -1, 0));
-  if (buffer_ == nullptr) {
-    LOG(FATAL) << strerror(errno);
+  if (buffer_ == MAP_FAILED) {
+    buffer_ = nullptr;
+    throw std::runtime_error(std::string("mmap failed: ") + strerror(errno));
   }
   for (auto& m : meta_) {
     m.store(PageState::kEvicted, std::memory_order_relaxed);
@@ -108,6 +133,16 @@ VMCacheImpl::VMCacheImpl(int fd, size_t block_size, size_t memory_capacity,
 
 void VMCacheImpl::Read(void* dst, size_t offset, size_t length) const {
   char* dst_ptr = reinterpret_cast<char*>(dst);
+  // Clamp to the mapped window exactly like the string-returning ReadAt();
+  // reading past max_size_ would touch unmapped memory.
+  if (length == 0 || max_size_ <= offset) {
+    return;
+  }
+  length = std::min(length, max_size_ - offset);
+  // NOTE: deliberately the ceil-style formula. For block-aligned offsets it
+  // yields 0, producing an extra Fix/Unfix round trip that marks the page as
+  // accessed; the S3-FIFO promotion policy (and Dump()-based tests) rely on
+  // that observable behavior.
   size_t to_next_boundary =
       (((offset + block_size_ - 1) / block_size_) * block_size_) - offset;
   size_t read_size = std::min(to_next_boundary, length);
@@ -118,6 +153,34 @@ void VMCacheImpl::Read(void* dst, size_t offset, size_t length) const {
     dst_ptr += read_size;
     read_size = std::min(block_size_, length);
   }
+}
+
+std::string VMCacheImpl::ReadAt(size_t offset, size_t length) const {
+  std::string result(length, '\0');
+  Copy(result.data(), offset, length);
+  return result;
+}
+
+VMCacheImpl::Locks VMCacheImpl::ReadAt(size_t offset, size_t length,
+                                       std::string_view& out) const {
+  Locks locks;
+  if (offset >= max_size_ || length == 0) {
+    out = {};
+    return locks;
+  }
+  const size_t take = std::min(length, max_size_ - offset);
+  const size_t first_page = offset / block_size_;
+  const size_t last_page = (offset + take - 1) / block_size_;
+  const size_t last_valid = meta_.empty() ? 0 : meta_.size() - 1;
+  const size_t clamped_last = std::min(last_page, last_valid);
+
+  locks.reserve(clamped_last >= first_page ? clamped_last - first_page + 1 : 0);
+  for (size_t page = first_page; page <= clamped_last; ++page) {
+    FixPage(page);
+    locks.push_back(PageLock::Pin(meta_[page]));
+  }
+  out = std::string_view(&buffer_[offset], take);
+  return locks;
 }
 
 void VMCacheImpl::Invalidate(size_t offset, size_t length) {
@@ -151,7 +214,8 @@ size_t VMCacheImpl::FindMetaPage(std::atomic<PageState>* page_ptr) const {
 }
 
 void VMCacheImpl::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
-  while (small_queue_.size() == small_queue_size_) {
+  size_t scanned_locked = 0;
+  while (small_queue_.size() >= small_queue_size_) {
     std::atomic<PageState>* dequeued = small_queue_.front();
     small_queue_.pop_front();
     assert(dequeued != nullptr);
@@ -159,18 +223,32 @@ void VMCacheImpl::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
       PageState prev = dequeued->load();
       switch (prev) {
         case PageState::kLocked: {
-          EnqueueToSmallFifo(dequeued);
+          // Pinned pages cannot be evicted; rotate and keep looking. If every
+          // resident small-fifo page is pinned, allow a temporary overflow.
+          small_queue_.push_back(dequeued);
+          ++scanned_locked;
+          if (scanned_locked >= small_queue_size_) {
+            goto enqueue_small;
+          }
           dequeued = small_queue_.front();
           small_queue_.pop_front();
           continue;
         }
         case PageState::kUnlocked: {
           if (!dequeued->compare_exchange_weak(prev, PageState::kMarked,
-                                               std::memory_order_relaxed,
-                                               std::memory_order_relaxed)) {
+                                                std::memory_order_relaxed,
+                                                std::memory_order_relaxed)) {
             continue;
           }
-          Release(FindMetaPage(dequeued));
+          // Two-phase eviction: MADV_DONTNEED only fires while queue_lock_ is
+          // held and the page is still kMarked. A concurrent FixPage that won
+          // the kMarked->kLocked race is guaranteed to be waiting for this
+          // lock before it reloads the page, so its Activate() pread always
+          // lands after our madvise (or wins the race and cancels it).
+          if (dequeued->load(std::memory_order_acquire) ==
+              PageState::kMarked) {
+            Release(FindMetaPage(dequeued));
+          }
           EnqueueToGhostFifo(dequeued);
           break;
         }
@@ -190,26 +268,28 @@ void VMCacheImpl::EnqueueToSmallFifo(std::atomic<PageState>* page_ptr) const {
           }
           EnqueueToMainFifo(dequeued);
           break;
-        case PageState::kMarked:
-          LOG(ERROR) << "Already marked!?";
-          break;
-        case PageState::kEvicted:
-          LOG(ERROR) << "Evicted Page inside small fifo?!?";
+        case PageState::kMarked:  // Ghost promotion raced the scan; leaving.
+        case PageState::kEvicted:  // InvalidatePage retired this page in fifo.
+          // The page is leaving anyway; just drop it from the small fifo.
           break;
         case PageState::kUnknown:
         default:
-          LOG(FATAL) << "never reach here";
-          _exit(1);
-          break;
+          assert(!"never reach here");
+          throw std::runtime_error("VMCacheImpl: unknown page state");
       }
       break;
     }
   }
+enqueue_small:
   small_queue_.push_back(page_ptr);
-  assert(small_queue_.size() <= small_queue_size_);
 }
 
-void VMCacheImpl::EnqueueToMainFifo(std::atomic<PageState>* page_ptr) const {
+// Bounded state-machine re-queue, not a growing recursion: each nested call
+// only consumes a page's accessed bit (k*Accessed -> k*) before re-entering,
+// so the chain cannot cycle forever.
+void VMCacheImpl::EnqueueToMainFifo(  // NOLINT(misc-no-recursion)
+    std::atomic<PageState>* page_ptr) const {
+  size_t scanned_locked = 0;
   while (main_queue_.size() >= main_queue_size_) {
     std::atomic<PageState>* dequeued = main_queue_.front();
     LOG(TRACE) << "loading page: " << dequeued;
@@ -218,18 +298,31 @@ void VMCacheImpl::EnqueueToMainFifo(std::atomic<PageState>* page_ptr) const {
     for (;;) {
       PageState prev = dequeued->load(std::memory_order_acquire);
       switch (prev) {
-        case PageState::kLocked:
-          EnqueueToMainFifo(dequeued);
+        case PageState::kLocked: {
+          // Pinned pages cannot be evicted; rotate and keep looking. If every
+          // resident main-fifo page is pinned, allow a temporary overflow.
+          main_queue_.push_back(dequeued);
+          ++scanned_locked;
+          if (scanned_locked >= main_queue_size_) {
+            goto enqueue_main;
+          }
           dequeued = main_queue_.front();
           main_queue_.pop_front();
           continue;
+        }
         case PageState::kUnlocked:
           if (!dequeued->compare_exchange_weak(prev, PageState::kEvicted,
-                                               std::memory_order_relaxed,
-                                               std::memory_order_relaxed)) {
+                                                std::memory_order_relaxed,
+                                                std::memory_order_relaxed)) {
             continue;
           }
-          Release(FindMetaPage(dequeued));
+          // Two-phase eviction (see EnqueueToSmallFifo): drop the page only
+          // under queue_lock_ and only while it is still kEvicted; a racing
+          // FixPage reloads strictly after this madvise completes.
+          if (dequeued->load(std::memory_order_acquire) ==
+              PageState::kEvicted) {
+            Release(FindMetaPage(dequeued));
+          }
           break;
         case PageState::kLockedAccessed:
           if (!dequeued->compare_exchange_weak(prev, PageState::kLocked,
@@ -247,25 +340,20 @@ void VMCacheImpl::EnqueueToMainFifo(std::atomic<PageState>* page_ptr) const {
           }
           EnqueueToMainFifo(dequeued);
           break;
-        case PageState::kMarked:
-          LOG(ERROR) << "Already marked!?";
-          break;
-        case PageState::kEvicted:
-          LOG(ERROR) << "Evicted Page inside main fifo?!?: "
-                     << FindMetaPage(page_ptr);
-          assert(false);
+        case PageState::kMarked:  // Ghost promotion raced the scan; leaving.
+        case PageState::kEvicted:  // InvalidatePage retired this page in fifo.
+          // The page is leaving anyway; just drop it from the main fifo.
           break;
         case PageState::kUnknown:
         default:
-          LOG(FATAL) << "never reach here";
-          _exit(1);
-          break;
+          assert(!"never reach here");
+          throw std::runtime_error("VMCacheImpl: unknown page state");
       }
       break;
     }
   }
+enqueue_main:
   main_queue_.push_back(page_ptr);
-  assert(main_queue_.size() <= main_queue_size_);
 }
 
 void VMCacheImpl::EnqueueToGhostFifo(std::atomic<PageState>* page_ptr) const {
@@ -291,10 +379,9 @@ void VMCacheImpl::EnqueueToGhostFifo(std::atomic<PageState>* page_ptr) const {
           EnqueueToMainFifo(dequeued);
           break;
         case PageState::kEvicted:
+          // InvalidatePage retired this page while it sat in the ghost fifo.
         case PageState::kUnknown:
-          LOG(FATAL) << "unexpected ghost path: " << prev << " for page "
-                     << FindMetaPage(page_ptr);
-          assert(false);
+          // Nothing sensible to requeue; drop the stale entry.
           break;
       }
       break;
@@ -323,12 +410,16 @@ void VMCacheImpl::FixPage(size_t page) const {
         Activate(page);
         return;
       }
-    } else if (state == PageState::kMarked || state == PageState::kUnlocked ||
+    } else if (state == PageState::kUnlocked ||
                state == PageState::kUnlockedAccessed) {
       if (std::atomic_compare_exchange_weak(&target, &state,
                                             PageState::kLockedAccessed)) {
         return;
       }
+    } else {
+      // kLocked/kLockedAccessed: another thread pins this page. Back off so
+      // contention degrades to a pause instead of a busy spin.
+      std::this_thread::yield();
     }
   }
 }
@@ -340,37 +431,40 @@ void VMCacheImpl::UnfixPage(size_t page) const {
   } else if (state == PageState::kLockedAccessed) {
     meta_[page].store(PageState::kUnlockedAccessed, std::memory_order_release);
   } else {
-    LOG(FATAL) << "Invalid state sequence: " << (int)state;
+    assert(!"Invalid state sequence");
+    throw std::runtime_error("UnfixPage: invalid state sequence");
   }
 }
 
 void VMCacheImpl::InvalidatePage(size_t page) const {
   std::atomic<PageState>& target = meta_[page];
   for (;;) {
-    PageState state = target.load(std::memory_order_acquire);
-    if (state == PageState::kLocked || state == PageState::kLockedAccessed) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      continue;
-    }
-    if (state == PageState::kEvicted) {
+    {
+      // Retire the page atomically under queue_lock_ (two-phase protocol): a
+      // concurrent FixPage either pins the page before our CAS succeeds (we
+      // observe the pin and retry later), or observes kEvicted afterwards and
+      // must take queue_lock_ to re-register -- so its Activate() pread always
+      // lands after the madvise below.  Doing the transition and the queue
+      // erase under one lock keeps a re-fixed page from being erased out of
+      // every FIFO while resident (permanent tracking loss).
       std::scoped_lock lk(queue_lock_);
-      std::erase(small_queue_, &target);
-      std::erase(main_queue_, &target);
-      std::erase(ghost_queue_, &target);
-      return;
-    }
-    if (target.compare_exchange_weak(state, PageState::kEvicted,
-                                     std::memory_order_relaxed,
-                                     std::memory_order_relaxed)) {
-      {
-        std::scoped_lock lk(queue_lock_);
+      PageState state = target.load(std::memory_order_acquire);
+      if (state == PageState::kLocked || state == PageState::kLockedAccessed) {
+        // Pinned elsewhere; drop the lock and retry after it is released.
+      } else if (state == PageState::kEvicted ||
+                 target.compare_exchange_weak(state, PageState::kEvicted,
+                                              std::memory_order_relaxed,
+                                              std::memory_order_relaxed)) {
         std::erase(small_queue_, &target);
         std::erase(main_queue_, &target);
         std::erase(ghost_queue_, &target);
+        if (state != PageState::kEvicted) {
+          Release(page);
+        }
+        return;
       }
-      Release(page);
-      return;
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 }
 
@@ -381,7 +475,10 @@ void VMCacheImpl::Activate(size_t page) const {
     ssize_t read_bytes =
         ::pread(fd_, &buffer_[offset], rest_size, offset + offset_);
     if (read_bytes < 0) {
-      LOG(ERROR) << strerror(errno);
+      // A failed pread must not decrement rest_size below zero (the loop would
+      // never terminate); treat it as fatal like the mmap failure path.
+      throw std::runtime_error(std::string("pread failed: ") +
+                               strerror(errno));
     }
     if (read_bytes == 0) {
       break;
@@ -396,30 +493,36 @@ void VMCacheImpl::Release(size_t page) const {
   LOG(DEBUG) << " release: " << page << " current: " << --activated_pages
              << " | " << Dump();
   //*/
-  ::madvise(&buffer_[page * block_size_], block_size_, MADV_DONTNEED);
+  if (::madvise(&buffer_[page * block_size_], block_size_, MADV_DONTNEED) !=
+      0) {
+    // Only reachable when block_size_ is not page-aligned or the range is not
+    // mapped; the page then silently keeps its RSS.
+    LOG(ERROR) << "madvise failed on page " << page << ": " << strerror(errno);
+    assert(!"madvise failed");
+  }
 }
 
 bool VMCacheImpl::SanityCheck() const {
   std::set<std::atomic<PageState>*> pages;
   for (const auto& c : small_queue_) {
     if (pages.contains(c)) {
-      LOG(FATAL) << "Duplicate: " << FindMetaPage(c);
+      assert(!"Duplicate fifo entry");
+      throw std::runtime_error("SanityCheck: duplicate entry in small fifo");
     }
-    assert(!pages.contains(c));
     pages.emplace(c);
   }
   for (const auto& c : main_queue_) {
     if (pages.contains(c)) {
-      LOG(FATAL) << "Duplicate: " << FindMetaPage(c);
+      assert(!"Duplicate fifo entry");
+      throw std::runtime_error("SanityCheck: duplicate entry in main fifo");
     }
-    assert(!pages.contains(c));
     pages.emplace(c);
   }
   for (const auto& c : ghost_queue_) {
     if (pages.contains(c)) {
-      LOG(FATAL) << "Duplicate: " << FindMetaPage(c);
+      assert(!"Duplicate fifo entry");
+      throw std::runtime_error("SanityCheck: duplicate entry in ghost fifo");
     }
-    assert(!pages.contains(c));
     pages.emplace(c);
   }
   return true;
@@ -455,9 +558,14 @@ std::string VMCacheImpl::Dump() const {
 }
 
 VMCacheImpl::~VMCacheImpl() {
-  if (::munmap(buffer_, max_size_) != 0) {
-    LOG(FATAL) << "Destructing cache: " << strerror(errno);
+  if (buffer_ != nullptr &&
+      ::munmap(buffer_, max_size_) != 0) {
+    // Destructors must not throw; report loudly and continue shutdown.
+    LOG(ERROR) << "Destructing cache: " << strerror(errno);
+    assert(!"munmap failed");
   }
-  ::close(fd_);
+  if (own_fd_) {
+    ::close(fd_);
+  }
 }
 }  // namespace tinylamb

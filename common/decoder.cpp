@@ -15,13 +15,30 @@
  */
 
 #include "decoder.hpp"
+#include <string>
+#include "common/constants.hpp"
+#include <ios>
+#include <cstdint>
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 Decoder& Decoder::operator>>(std::string& str) {
-  bin_size_t size;
+  bin_size_t size = 0;
   is_->read(reinterpret_cast<char*>(&size), sizeof(size));
+  // A failed/corrupt length prefix must not resize with garbage; mirror the
+  // vector overload and leave the string empty with failbit set.
+  if (!*is_) {
+    str.clear();
+    return *this;
+  }
   str.resize(size);
-  is_->read(str.data(), size);
+  if (size > 0) {
+    is_->read(str.data(), size);
+    // A truncated stream must not silently yield a zero-padded string.
+    if (is_->gcount() != static_cast<std::streamsize>(size)) {
+      is_->setstate(std::ios::failbit);
+    }
+  }
   return *this;
 }
 

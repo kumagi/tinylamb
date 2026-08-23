@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <iterator>
 #include <string>
 #include <string_view>
 
@@ -43,8 +44,14 @@ int main(int argc, char** argv) {
   std::filesystem::directory_iterator dir(target_dir);
   for (const auto& file : dir) {
     std::ifstream case_data(file.path(), std::ios::in | std::ios::binary);
-    std::string file_content;
-    case_data >> file_content;
+    if (!case_data) {
+      LOG(ERROR) << "cannot open: " << file.path();
+      continue;
+    }
+    // Formatted extraction stops at the first whitespace; fuzz inputs are
+    // binary and must be replayed verbatim.
+    std::string file_content((std::istreambuf_iterator<char>(case_data)),
+                             std::istreambuf_iterator<char>());
     LOG(ERROR) << "test: " << file.path();
     TestCase(file_content);
   }

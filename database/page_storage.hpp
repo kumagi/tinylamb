@@ -46,8 +46,17 @@ class PageStorage {
 
  private:
   friend class Database;
-  friend class Database;
 
+  // Construction follows declaration order; destruction reverses it. Both
+  // directions are LOAD-BEARING -- do not reorder these members:
+  //  * logger_ is constructed before rm_: RecoveryManager replays the WAL
+  //    file, so Logger must have created/opened it first (page_storage.cpp
+  //    relies on this at startup).
+  //  * tm_/cm_ hold raw pointers into lm_/pm_(pool)/logger_/rm_.
+  //  * cm_ is declared LAST on purpose: ~CheckpointManager() joins its
+  //    background worker, which keeps dereferencing tm_/pp_/logger_ until
+  //    that join completes. Any other order risks use-after-free at
+  //    shutdown or a failed startup.
   std::string dbname_;
   LockManager lm_;
   Logger logger_;

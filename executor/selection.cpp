@@ -16,16 +16,26 @@
 
 #include "selection.hpp"
 
+#include <cstddef>
+#include <optional>
+#include <cstdint>
 #include <ostream>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
+#include "executor/data_chunk.hpp"
 #include "executor_base.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/bytecode.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/jit.hpp"
 #include "page/row_position.hpp"
+#include "type/type.hpp"
+#include "type/value_type.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 namespace {
@@ -45,9 +55,11 @@ BinaryOperation Flip(BinaryOperation operation) {
   }
 }
 
-bool BatchMayMatch(const Expression& expression, const Schema& schema,
-                   const DataChunk& chunk) {
-  if (!expression || expression->Type() != TypeTag::kBinaryExp) return true;
+bool BatchMayMatch(  // NOLINT(misc-no-recursion)
+    const Expression& expression, const Schema& schema,
+    const DataChunk& chunk) {
+  if (!expression || expression->Type() != TypeTag::kBinaryExp) { return true;
+}
   const BinaryExpression& binary = expression->AsBinaryExpression();
   if (binary.Op() == BinaryOperation::kAnd) {
     return BatchMayMatch(binary.Left(), schema, chunk) &&
@@ -57,7 +69,8 @@ bool BatchMayMatch(const Expression& expression, const Schema& schema,
     return BatchMayMatch(binary.Left(), schema, chunk) ||
            BatchMayMatch(binary.Right(), schema, chunk);
   }
-  if (!IsComparison(binary.Op())) return true;
+  if (!IsComparison(binary.Op())) { return true;
+}
   const Expression* column = &binary.Left();
   const Expression* constant = &binary.Right();
   BinaryOperation operation = binary.Op();
@@ -72,7 +85,8 @@ bool BatchMayMatch(const Expression& expression, const Schema& schema,
   }
   const int offset =
       schema.Offset((*column)->AsColumnValue().GetColumnName());
-  if (offset < 0) return true;
+  if (offset < 0) { return true;
+}
   return chunk.ZoneMapAt(static_cast<size_t>(offset))
       .MayMatch(operation, (*constant)->AsConstantValue().GetValue());
 }
@@ -90,11 +104,13 @@ Selection::Selection(Expression exp, Schema schema, Executor src,
 
 bool Selection::Next(Row* dst, RowPosition* rp) {
   if (output_offset_ >= output_batch_.Size()) {
-    if (NextBatch(&output_batch_) == 0) return false;
+    if (NextBatch(&output_batch_) == 0) { return false;
+}
     output_offset_ = 0;
   }
   *dst = output_batch_.RowAt(output_offset_);
-  if (rp) *rp = output_batch_.PositionAt(output_offset_);
+  if (rp != nullptr) { *rp = output_batch_.PositionAt(output_offset_);
+}
   ++output_offset_;
   return true;
 }
@@ -103,7 +119,8 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset(schema_, max_rows);
   while (destination->Size() < max_rows) {
     const size_t requested = max_rows - destination->Size();
-    if (src_->NextBatch(&input_batch_, requested) == 0) break;
+    if (src_->NextBatch(&input_batch_, requested) == 0) { break;
+}
     if (!BatchMayMatch(exp_, schema_, input_batch_)) {
       ++skipped_batches_;
       continue;
@@ -126,12 +143,16 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
         jit_filter_ = JitInt64Kernels::CompileFilter(jit_operation_);
       }
     }
-    if (jit_filter_ && input_batch_.ZoneMapAt(jit_column_).NullCount() == 0) {
+    if (jit_filter_ && input_batch_.ColumnAt(jit_column_).Type() ==
+                           ValueType::kInt64 &&
+        input_batch_.ZoneMapAt(jit_column_).Initialized() &&
+        input_batch_.ZoneMapAt(jit_column_).NullCount() == 0) {
       std::vector<uint8_t> result(input_batch_.Size());
       jit_filter_->Filter(input_batch_.ColumnAt(jit_column_).IntegerData().data(),
                           result.data(), result.size(), jit_constant_);
       predicates.emplace(ValueType::kInt64, input_batch_.Size());
-      for (uint8_t value : result) predicates->Append(Value(value != 0));
+      for (uint8_t value : result) { predicates->Append(Value(value != 0));
+}
       ++jit_batches_;
     } else if (bytecode_) {
       predicates.emplace(bytecode_->EvaluateBatch(input_batch_));

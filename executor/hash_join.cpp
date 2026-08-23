@@ -17,17 +17,25 @@
 #include "hash_join.hpp"
 
 #include <algorithm>
-#include <exception>
-#include <iterator>
-#include <mutex>
-#include <thread>
+#include <cstddef>
+#include <functional>
+#include <ostream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include "common/debug.hpp"
+#include "common/constants.hpp"
+#include "executor/executor_base.hpp"
+#include "executor/hash_join_mode.hpp"
+#include "executor/data_chunk.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/spill_file.hpp"
+#include "type/row.hpp"
+#include "type/value.hpp"
+#include "page/row_position.hpp"
 
 namespace tinylamb {
 namespace {
@@ -38,6 +46,22 @@ size_t ReactivePartitionOf(const std::string& key) {
   return std::hash<std::string>{}(key) % kReactiveSpillPartitions;
 }
 
+// Encodes the join key columns; returns false when any component is NULL.
+// SQL semantics: NULL never compares equal to anything, so such rows cannot
+// match and must be skipped rather than memcomparable-encoded (encoding a
+// kNull Value throws).
+bool EncodeJoinKey(const Row& row, const std::vector<slot_t>& cols,
+                   std::string* out) {
+  const Row keys = row.Extract(cols);
+  for (const Value& value : keys.values_) {
+    if (value.IsNull()) {
+      return false;
+    }
+  }
+  *out = keys.EncodeMemcomparableFormat();
+  return true;
+}
+
 void JoinPartition(
     const std::vector<slot_t>& left_cols, const std::vector<slot_t>& right_cols,
     const std::vector<std::pair<Row, RowPosition>>& left_rows,
@@ -46,12 +70,15 @@ void JoinPartition(
   std::unordered_multimap<std::string, const Row*> buckets;
   buckets.reserve(right_rows.size());
   for (const Row& right_row : right_rows) {
-    buckets.emplace(right_row.Extract(right_cols).EncodeMemcomparableFormat(),
-                    &right_row);
+    std::string key;
+    if (!EncodeJoinKey(right_row, right_cols, &key)) { continue;
+}
+    buckets.emplace(std::move(key), &right_row);
   }
   for (const auto& left : left_rows) {
-    const std::string key =
-        left.first.Extract(left_cols).EncodeMemcomparableFormat();
+    std::string key;
+    if (!EncodeJoinKey(left.first, left_cols, &key)) { continue;
+}
     const auto [begin, end] = buckets.equal_range(key);
     for (auto match = begin; match != end; ++match) {
       output->emplace_back(left.first + *match->second, left.second);
@@ -85,18 +112,83 @@ HashJoin::HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
       mode_(mode),
       worker_count_(std::max<size_t>(1, worker_count)) {}
 
+bool HashJoin::EmitNextMatch(Row* dst, RowPosition* rp) {
+  while (true) {
+    if (match_iter_ != match_end_) {
+      *dst = current_left_ + *match_iter_->second;
+      if (rp != nullptr) {
+        *rp = current_left_pos_;
+      }
+      ++match_iter_;
+      return true;
+    }
+    Row row;
+    RowPosition position;
+    bool have_probe_row = false;
+    std::string key;
+    while (left_->Next(&row, &position)) {
+      if (!EncodeJoinKey(row, left_cols_, &key)) { continue;  // NULL key never matches
+}
+      current_left_ = std::move(row);
+      current_left_pos_ = position;
+      have_probe_row = true;
+      break;
+    }
+    if (!have_probe_row) {
+      left_exhausted_ = true;
+      return false;
+    }
+    const auto [begin, end] = right_buckets_.equal_range(key);
+    match_iter_ = begin;
+    match_end_ = end;
+  }
+}
+
+void HashJoin::MaterializeOrThrow() {
+  if (materialize_failed_) {
+    // A previous attempt threw midway; children are partially consumed and
+    // retrying would corrupt results.
+    throw std::runtime_error("hash join materialization previously failed");
+  }
+  try {
+    Materialize();
+  } catch (...) {
+    materialize_failed_ = true;
+    throw;
+  }
+}
+
 bool HashJoin::Next(Row* dst, RowPosition* rp) {
-  if (!materialized_) Materialize();
-  if (output_offset_ == output_.size()) return false;
+  if (!materialized_) {
+    MaterializeOrThrow();
+  }
+  if (pipelined_) {
+    return EmitNextMatch(dst, rp);
+  }
+  if (output_offset_ == output_.size()) {
+    return false;
+  }
   *dst = output_[output_offset_].first;
-  if (rp) *rp = output_[output_offset_].second;
+  if (rp != nullptr) {
+    *rp = output_[output_offset_].second;
+  }
   ++output_offset_;
   return true;
 }
 
 size_t HashJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
-  if (!materialized_) Materialize();
+  if (!materialized_) {
+    MaterializeOrThrow();
+  }
+  if (pipelined_) {
+    Row row;
+    RowPosition position;
+    while (destination->Size() < max_rows && EmitNextMatch(&row, &position)) {
+      destination->Append(row, position);
+    }
+    return destination->Size();
+  }
   while (output_offset_ < output_.size() &&
          destination->Size() < max_rows) {
     destination->Append(output_[output_offset_].first,
@@ -107,6 +199,10 @@ size_t HashJoin::NextBatch(DataChunk* destination, size_t max_rows) {
 }
 
 void HashJoin::Materialize() {
+  // Never resume from a partially filled output of a failed attempt; a retry
+  // must start from an empty output or it would emit duplicate rows.
+  output_.clear();
+  output_offset_ = 0;
   if (mode_ == HashJoinMode::kHybrid) {
     MaterializeHybrid();
   } else {
@@ -115,66 +211,31 @@ void HashJoin::Materialize() {
 }
 
 void HashJoin::MaterializeInMemory() {
-  using PositionedRow = std::pair<Row, RowPosition>;
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   QueryMemoryCharge charge;
 
-  std::vector<PositionedRow> left_rows;
   std::vector<Row> right_rows;
-  std::vector<SpillFile> left_spill(kReactiveSpillPartitions);
   std::vector<SpillFile> right_spill(kReactiveSpillPartitions);
   bool spilled = false;
+  std::string key;
 
   Row row;
-  RowPosition position;
-  while (left_->Next(&row, &position)) {
-    const size_t bytes = EstimateRowBytes(row) + sizeof(RowPosition);
-    if (!spilled && !budget.CanReserve(bytes)) {
-      spilled = true;
-      for (const PositionedRow& existing : left_rows) {
-        const std::string key =
-            existing.first.Extract(left_cols_).EncodeMemcomparableFormat();
-        left_spill[ReactivePartitionOf(key)].Append(existing.first,
-                                                    existing.second);
-      }
-      charge.ReleaseAll();
-      left_rows.clear();
-      left_rows.shrink_to_fit();
-    }
-    if (spilled) {
-      const std::string key =
-          row.Extract(left_cols_).EncodeMemcomparableFormat();
-      left_spill[ReactivePartitionOf(key)].Append(row, position);
-    } else {
-      charge.Add(bytes);
-      left_rows.emplace_back(std::move(row), position);
-    }
-  }
-
   while (right_->Next(&row, nullptr)) {
     const size_t bytes = EstimateRowBytes(row);
     if (!spilled && !budget.CanReserve(bytes)) {
       spilled = true;
-      for (const PositionedRow& existing : left_rows) {
-        const std::string key =
-            existing.first.Extract(left_cols_).EncodeMemcomparableFormat();
-        left_spill[ReactivePartitionOf(key)].Append(existing.first,
-                                                    existing.second);
-      }
       for (const Row& existing : right_rows) {
-        const std::string key =
-            existing.Extract(right_cols_).EncodeMemcomparableFormat();
+        if (!EncodeJoinKey(existing, right_cols_, &key)) { continue;
+}
         right_spill[ReactivePartitionOf(key)].Append(existing);
       }
       charge.ReleaseAll();
-      left_rows.clear();
-      left_rows.shrink_to_fit();
       right_rows.clear();
       right_rows.shrink_to_fit();
     }
     if (spilled) {
-      const std::string key =
-          row.Extract(right_cols_).EncodeMemcomparableFormat();
+      if (!EncodeJoinKey(row, right_cols_, &key)) { continue;
+}
       right_spill[ReactivePartitionOf(key)].Append(row);
     } else {
       charge.Add(bytes);
@@ -183,70 +244,47 @@ void HashJoin::MaterializeInMemory() {
   }
 
   if (!spilled) {
-    const size_t partitions = std::min(
-        worker_count_,
-        std::max<size_t>(1, left_rows.size() + right_rows.size()));
-    std::vector<std::vector<PositionedRow>> left_partitions(partitions);
-    std::vector<std::vector<Row>> right_partitions(partitions);
-    const std::hash<std::string> hash;
-    for (PositionedRow& left : left_rows) {
-      std::string key =
-          left.first.Extract(left_cols_).EncodeMemcomparableFormat();
-      left_partitions[hash(key) % partitions].push_back(std::move(left));
+    // Build side fit in memory: keep it resident and probe pipelined.
+    right_storage_ = std::move(right_rows);
+    right_buckets_.reserve(right_storage_.size());
+    for (const Row& stored : right_storage_) {
+      if (!EncodeJoinKey(stored, right_cols_, &key)) { continue;
+}
+      right_buckets_.emplace(key, &stored);
     }
-    for (Row& right_row : right_rows) {
-      std::string key =
-          right_row.Extract(right_cols_).EncodeMemcomparableFormat();
-      right_partitions[hash(key) % partitions].push_back(std::move(right_row));
-    }
-    left_rows.clear();
-    right_rows.clear();
+    pipelined_ = true;
+    materialized_ = true;
+    charge.ReleaseAll();
+    return;
+  }
 
-    std::vector<std::vector<PositionedRow>> partition_output(partitions);
-    std::exception_ptr error;
-    std::mutex error_mutex;
-    std::vector<std::jthread> workers;
-    workers.reserve(partitions);
-    for (size_t partition = 0; partition < partitions; ++partition) {
-      workers.emplace_back([&, partition] {
-        try {
-          JoinPartition(left_cols_, right_cols_, left_partitions[partition],
-                        right_partitions[partition],
-                        &partition_output[partition]);
-        } catch (...) {
-          std::scoped_lock lock(error_mutex);
-          if (!error) error = std::current_exception();
-        }
-      });
+  // Spilled build side: partition the probe side symmetrically and join each
+  // partition pair from disk. (The former in-memory / parallel-partition
+  // branches here were unreachable: `spilled` is always true past the early
+  // return above, so they were removed rather than revived — reviving them
+  // without flushing the in-memory probe rows would lose data.)
+  std::vector<SpillFile> left_spill(kReactiveSpillPartitions);
+  RowPosition position;
+  while (left_->Next(&row, &position)) {
+    if (!EncodeJoinKey(row, left_cols_, &key)) { continue;
+}
+    left_spill[ReactivePartitionOf(key)].Append(row, position);
+  }
+  for (size_t i = 0; i < kReactiveSpillPartitions; ++i) {
+    left_spill[i].FinishWriting();
+    right_spill[i].FinishWriting();
+  }
+  for (size_t i = 0; i < kReactiveSpillPartitions; ++i) {
+    auto left_part = left_spill[i].ReadAllPositioned();
+    auto right_part = right_spill[i].ReadAllRows();
+    QueryMemoryCharge part_charge;
+    for (const auto& left : left_part) {
+      part_charge.Add(EstimateRowBytes(left.first));
     }
-    workers.clear();
-    if (error) std::rethrow_exception(error);
-    size_t output_size = 0;
-    for (const auto& partition : partition_output) {
-      output_size += partition.size();
+    for (const Row& right : right_part) {
+      part_charge.Add(EstimateRowBytes(right));
     }
-    output_.reserve(output_size);
-    for (auto& partition : partition_output) {
-      std::move(partition.begin(), partition.end(),
-                std::back_inserter(output_));
-    }
-  } else {
-    for (size_t i = 0; i < kReactiveSpillPartitions; ++i) {
-      left_spill[i].FinishWriting();
-      right_spill[i].FinishWriting();
-    }
-    for (size_t i = 0; i < kReactiveSpillPartitions; ++i) {
-      auto left_part = left_spill[i].ReadAllPositioned();
-      auto right_part = right_spill[i].ReadAllRows();
-      QueryMemoryCharge part_charge;
-      for (const auto& left : left_part) {
-        part_charge.Add(EstimateRowBytes(left.first));
-      }
-      for (const Row& right : right_part) {
-        part_charge.Add(EstimateRowBytes(right));
-      }
-      JoinPartition(left_cols_, right_cols_, left_part, right_part, &output_);
-    }
+    JoinPartition(left_cols_, right_cols_, left_part, right_part, &output_);
   }
 
   charge.ReleaseAll();
@@ -268,12 +306,13 @@ void HashJoin::MaterializeHybrid() {
   QueryMemoryCharge resident_charge;
   std::vector<SpillFile> right_spill(kPartitions);
   std::vector<SpillFile> left_spill(kPartitions);
+  std::string key;
 
   Row row;
   RowPosition position;
   while (right_->Next(&row, nullptr)) {
-    const std::string key =
-        row.Extract(right_cols_).EncodeMemcomparableFormat();
+    if (!EncodeJoinKey(row, right_cols_, &key)) { continue;
+}
     const size_t part = partition_of(key);
     const size_t bytes = EstimateRowBytes(row);
     if (part == 0 && budget.CanReserve(bytes)) {
@@ -287,13 +326,14 @@ void HashJoin::MaterializeHybrid() {
   std::unordered_multimap<std::string, const Row*> buckets;
   buckets.reserve(resident_right.size());
   for (const Row& right_row : resident_right) {
-    buckets.emplace(right_row.Extract(right_cols_).EncodeMemcomparableFormat(),
-                    &right_row);
+    if (!EncodeJoinKey(right_row, right_cols_, &key)) { continue;
+}
+    buckets.emplace(key, &right_row);
   }
 
   while (left_->Next(&row, &position)) {
-    const std::string key =
-        row.Extract(left_cols_).EncodeMemcomparableFormat();
+    if (!EncodeJoinKey(row, left_cols_, &key)) { continue;  // NULL key never matches
+}
     const size_t part = partition_of(key);
     if (part == 0 && right_spill[0].Empty()) {
       // Pure resident partition: probe immediately.
@@ -364,6 +404,10 @@ void HashJoin::Dump(std::ostream& o, int indent) const {
   if (mode_ == HashJoinMode::kHybrid) {
     o << "HybridHashJoin (" << worker_count_ << " workers): " << ss.str()
       << "\n"
+      << Indent(indent + 2);
+  } else if (pipelined_) {
+    o << "PartitionedHashJoin (pipelined, " << worker_count_ << " workers): "
+      << ss.str() << "\n"
       << Indent(indent + 2);
   } else {
     o << "PartitionedHashJoin (" << worker_count_ << " workers): " << ss.str()

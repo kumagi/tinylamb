@@ -176,7 +176,7 @@ TEST_F(LSMTreeTest, LongKeyRangeScan) {
   // Arrange -- write 300 key-value pairs with long keys (i*i+1 bytes of 'x'), wait for sync
   std::map<std::string, std::string> expected;
   for (int i = 0; i < 300; ++i) {
-    std::string key(i * i + 1, 'x');
+    std::string key((i * i) + 1, 'x');
     t_->Write(key, std::to_string(i * 2));
     expected.emplace(key, std::to_string(i * 2));
   }

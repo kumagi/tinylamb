@@ -21,10 +21,12 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
+#include "common/crc32c.hpp"
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
 #include "index_key.hpp"
@@ -35,10 +37,15 @@
 #include "page_ref.hpp"
 #include "transaction/transaction.hpp"
 
-#define ASSERT_PAGE_TYPE(expected_type)            \
-  if (type != (expected_type)) {                   \
-    throw std::runtime_error("Invalid page type"); \
-  }
+// do/while wrap keeps the macro a single statement so it cannot glue onto a
+// dangling `else`; the message carries the offending type for diagnosis.
+#define ASSERT_PAGE_TYPE(expected_type)                                     \
+  do {                                                                      \
+    if (type != (expected_type)) {                                          \
+      throw std::runtime_error("Invalid page type: actual=" +               \
+                               PageTypeString(type));                       \
+    }                                                                       \
+  } while (false)
 
 namespace tinylamb {
 Page::Page(page_id_t pid, PageType page_type) { PageInit(pid, page_type); }
@@ -74,7 +81,7 @@ void Page::PageInit(page_id_t pid, PageType page_type) {
 // Meta page functions.
 PageRef Page::AllocateNewPage(Transaction& txn, PagePool& pool,
                               PageType new_page_type) {
-  ASSERT_PAGE_TYPE(PageType::kMetaPage)
+  ASSERT_PAGE_TYPE(PageType::kMetaPage);
   PageRef ret = body.meta_page.AllocateNewPage(txn, pool, new_page_type);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
@@ -82,7 +89,7 @@ PageRef Page::AllocateNewPage(Transaction& txn, PagePool& pool,
 }
 
 void Page::DestroyPage(Transaction& txn, Page* target) {
-  ASSERT_PAGE_TYPE(PageType::kMetaPage)
+  ASSERT_PAGE_TYPE(PageType::kMetaPage);
   body.meta_page.DestroyPage(txn, target);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
@@ -112,19 +119,24 @@ StatusOr<std::string_view> Page::Read(Transaction& txn, slot_t slot) const {
 }
 
 std::string_view Page::GetKey(slot_t slot) const {
-  if (type == PageType::kLeafPage) {
-    return body.leaf_page.GetKey(slot);
+  switch (type) {
+    case PageType::kLeafPage:
+      return body.leaf_page.GetKey(slot);
+    case PageType::kBranchPage:
+      return body.branch_page.GetKey(slot);
+    default:
+      throw std::runtime_error("GetKey is not implemented for: " +
+                               PageTypeString(type));
   }
-  return body.branch_page.GetKey(slot);
 }
 
 page_id_t Page::GetPage(slot_t slot) const {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  ASSERT_PAGE_TYPE(PageType::kBranchPage);
   return body.branch_page.GetValue(slot);
 }
 
 StatusOr<slot_t> Page::Insert(Transaction& txn, std::string_view record) {
-  ASSERT_PAGE_TYPE(PageType::kRowPage)
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
   StatusOr<slot_t> result = body.row_page.Insert(PageID(), txn, record);
   if (result.GetStatus() == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
@@ -134,7 +146,7 @@ StatusOr<slot_t> Page::Insert(Transaction& txn, std::string_view record) {
 }
 
 Status Page::Update(Transaction& txn, slot_t slot, std::string_view row) {
-  ASSERT_PAGE_TYPE(PageType::kRowPage)
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
   Status result = body.row_page.Update(PageID(), txn, slot, row);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
@@ -144,7 +156,7 @@ Status Page::Update(Transaction& txn, slot_t slot, std::string_view row) {
 }
 
 Status Page::Delete(Transaction& txn, const slot_t pos) {
-  ASSERT_PAGE_TYPE(PageType::kRowPage)
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
   Status result = body.row_page.Delete(PageID(), txn, pos);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
@@ -182,7 +194,7 @@ StatusOr<std::string_view> Page::ReadKey(Transaction& txn, slot_t slot) const {
 // Leaf page manipulations.
 Status Page::InsertLeaf(Transaction& txn, std::string_view key,
                         std::string_view value) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage)
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
   Status result = body.leaf_page.Insert(PageID(), txn, key, value);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
@@ -193,7 +205,7 @@ Status Page::InsertLeaf(Transaction& txn, std::string_view key,
 
 Status Page::Update(Transaction& txn, std::string_view key,
                     std::string_view value) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage)
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
   Status result = body.leaf_page.Update(PageID(), txn, key, value);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
@@ -203,7 +215,7 @@ Status Page::Update(Transaction& txn, std::string_view key,
 }
 
 Status Page::Delete(Transaction& txn, std::string_view key) {
-  Status result;
+  Status result = Status::kUnknown;
   switch (type) {
     case PageType::kLeafPage:
       result = body.leaf_page.Delete(PageID(), txn, key);
@@ -224,23 +236,23 @@ Status Page::Delete(Transaction& txn, std::string_view key) {
 
 StatusOr<std::string_view> Page::Read(Transaction& txn,
                                       std::string_view key) const {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage)
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
   return body.leaf_page.Read(PageID(), txn, key);
 }
 
 StatusOr<std::string_view> Page::LowestKey(Transaction& txn) const {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage)
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
   return body.leaf_page.LowestKey(txn);
 }
 
 StatusOr<std::string_view> Page::HighestKey(Transaction& txn) const {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage)
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
   return body.leaf_page.HighestKey(txn);
 }
 
 Status Page::InsertBranch(Transaction& txn, std::string_view key,
                           page_id_t pid) {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  ASSERT_PAGE_TYPE(PageType::kBranchPage);
   Status result = body.branch_page.Insert(PageID(), txn, key, pid);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
@@ -251,7 +263,7 @@ Status Page::InsertBranch(Transaction& txn, std::string_view key,
 
 Status Page::UpdateBranch(Transaction& txn, std::string_view key,
                           page_id_t pid) {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  ASSERT_PAGE_TYPE(PageType::kBranchPage);
   Status result = body.branch_page.Update(PageID(), txn, key, pid);
   if (result == Status::kSuccess) {
     SetPageLSN(txn.PrevLSN());
@@ -262,12 +274,12 @@ Status Page::UpdateBranch(Transaction& txn, std::string_view key,
 
 StatusOr<page_id_t> Page::GetPageForKey(Transaction& txn, std::string_view key,
                                         bool less_than) const {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  ASSERT_PAGE_TYPE(PageType::kBranchPage);
   return body.branch_page.GetPageForKey(txn, key, less_than);
 }
 
 void Page::SetLowestValue(Transaction& txn, page_id_t v) {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  ASSERT_PAGE_TYPE(PageType::kBranchPage);
   body.branch_page.SetLowestValue(PageID(), txn, v);
   SetPageLSN(txn.PrevLSN());
   SetRecLSN(txn.PrevLSN());
@@ -275,7 +287,7 @@ void Page::SetLowestValue(Transaction& txn, page_id_t v) {
 
 void Page::SplitInto(Transaction& txn, std::string_view new_key, Page* right,
                      std::string* middle) {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  ASSERT_PAGE_TYPE(PageType::kBranchPage);
   body.branch_page.Split(PageID(), txn, new_key, right, middle);
 }
 
@@ -286,35 +298,61 @@ void Page::PageTypeChange(Transaction& txn, PageType new_type) {
   SetRecLSN(txn.PrevLSN());
 }
 
-void Page::SetChecksum() const { checksum = std::hash<Page>()(*this); }
+namespace {
+// The persistent checksum covers the whole page except runtime-only metadata:
+// the recovery_lsn slot, which PagePool::ReadFrom resets to kMaxLsn after
+// loading a clean page image, and the checksum slot itself. Both skipped
+// slots make StoredChecksum a pure function of immutable-on-disk bytes.
+uint64_t StoredChecksum(const Page& p) {
+  const auto* base = reinterpret_cast<const uint8_t*>(&p);
+  const auto offset_of = [&](const void* field) {
+    return static_cast<size_t>(reinterpret_cast<const uint8_t*>(field) - base);
+  };
+  const size_t rec_offset = offset_of(&p.recovery_lsn);
+  const size_t checksum_offset = offset_of(&p.checksum);
+  constexpr size_t kSlot = sizeof(uint64_t);
+  uint32_t crc = Crc32CExtend(0xffffffffU, base, rec_offset);
+  crc = Crc32CExtend(crc, base + rec_offset + kSlot,
+                     checksum_offset - rec_offset - kSlot);
+  crc = Crc32CExtend(crc, base + checksum_offset + kSlot,
+                     kPageSize - checksum_offset - kSlot);
+  return static_cast<uint64_t>(crc ^ 0xffffffffU);
+}
+}  // namespace
+
+void Page::SetChecksum() const { checksum = StoredChecksum(*this); }
+
+bool Page::IsValid() const { return checksum == StoredChecksum(*this); }
+
+bool Page::ChecksumMatches() const { return IsValid(); }
 
 void Page::InsertImpl(std::string_view redo) {
-  ASSERT_PAGE_TYPE(PageType::kRowPage)
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
   body.row_page.InsertRow(redo);
 }
 
 void Page::UpdateImpl(slot_t slot, std::string_view redo) {
-  ASSERT_PAGE_TYPE(PageType::kRowPage)
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
   body.row_page.UpdateRow(slot, redo);
 }
 
 void Page::DeleteImpl(slot_t slot) {
-  ASSERT_PAGE_TYPE(PageType::kRowPage)
+  ASSERT_PAGE_TYPE(PageType::kRowPage);
   body.row_page.DeleteRow(slot);
 }
 
 void Page::InsertImpl(std::string_view key, std::string_view value) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage)
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
   body.leaf_page.InsertImpl(key, value);
 }
 
 void Page::UpdateImpl(std::string_view key, std::string_view value) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage)
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
   body.leaf_page.UpdateImpl(key, value);
 }
 
 void Page::DeleteImpl(std::string_view key) {
-  ASSERT_PAGE_TYPE(PageType::kLeafPage)
+  ASSERT_PAGE_TYPE(PageType::kLeafPage);
   body.leaf_page.DeleteImpl(key);
 }
 
@@ -424,21 +462,17 @@ Status Page::MoveRightToFoster(Transaction& txn, Page& foster) {
     default:
       throw std::runtime_error("Invalid page type");
   }
-  return Status::kSuccess;
 }
 
 Status Page::MoveLeftFromFoster(Transaction& txn, Page& foster) {
   switch (type) {
     case PageType::kLeafPage:
       return body.leaf_page.MoveLeftFromFoster(txn, foster);
-      break;
     case PageType::kBranchPage:
       return body.branch_page.MoveLeftFromFoster(txn, foster);
-      break;
     default:
       throw std::runtime_error("Invalid page type");
   }
-  return Status::kSuccess;
 }
 
 void Page::SetLowFenceImpl(const IndexKey& key) {
@@ -481,30 +515,28 @@ void Page::SetFosterImpl(const FosterPair& foster) {
 }
 
 void Page::InsertBranchImpl(std::string_view key, page_id_t pid) {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  ASSERT_PAGE_TYPE(PageType::kBranchPage);
   body.branch_page.InsertImpl(key, pid);
 }
 
 void Page::UpdateBranchImpl(std::string_view key, page_id_t pid) {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  ASSERT_PAGE_TYPE(PageType::kBranchPage);
   body.branch_page.UpdateImpl(key, pid);
 }
 
 void Page::DeleteBranchImpl(std::string_view key) {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  ASSERT_PAGE_TYPE(PageType::kBranchPage);
   body.branch_page.DeleteImpl(key);
 }
 
 void Page::SetLowestValueBranchImpl(page_id_t lowest_value) {
-  ASSERT_PAGE_TYPE(PageType::kBranchPage)
+  ASSERT_PAGE_TYPE(PageType::kBranchPage);
   body.branch_page.SetLowestValueImpl(lowest_value);
 }
 
 void Page::PageTypeChangeImpl(PageType new_type) {
   PageInit(page_id, new_type);
 }
-
-bool Page::IsValid() const { return checksum == std::hash<Page>()(*this); }
 
 void* Page::operator new(size_t /*unused*/) {
   void* ret = new char[kPageSize];
@@ -513,7 +545,9 @@ void* Page::operator new(size_t /*unused*/) {
 }
 
 void Page::operator delete(void* page) noexcept {
-  delete[] reinterpret_cast<char*>(page);
+  // Matches the class operator new above (new char[kPageSize]); the deallocation
+  // type must stay char[] to pair with it.
+  delete[] reinterpret_cast<char*>(page);  // NOLINT(cppcoreguidelines-owning-memory)
 }
 
 void Page::Dump(std::ostream& o, int indent) const {

@@ -4,7 +4,9 @@
 
 #include <gtest/gtest.h>
 
+#include <signal.h>  // NOLINT(modernize-deprecated-headers) // POSIX sigaction/SIGALRM below are only provided by this header.
 #include <sys/resource.h>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
@@ -139,7 +141,7 @@ TEST(GoogleSqlFrontendTest, ParsesInsertVariants) {
     GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
   }
   const GoogleSqlParseResult multi = GoogleSqlFrontend::Parse(
-      "INSERT INTO t (a, b) VALUES (1, \"x\"), (2, \"y\");");
+      R"(INSERT INTO t (a, b) VALUES (1, "x"), (2, "y");)");
   ASSERT_TRUE(multi.ok) << multi.error;
   EXPECT_NE(multi.ast.find("InsertStatement"), std::string::npos);
   EXPECT_NE(multi.ast.find("ColumnList"), std::string::npos);

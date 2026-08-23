@@ -18,9 +18,13 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <optional>
+#include <cstdint>
+#include <ostream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -36,6 +40,8 @@
 #include "page/page_manager.hpp"
 #include "page/page_type.hpp"
 #include "page/row_position.hpp"
+#include "table/scan_options.hpp"
+#include "common/log_message.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
@@ -53,18 +59,26 @@ Decoder& operator>>(Decoder& d, Table::IndexValueType& t) {
 }
 
 Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
+  page_id_t root_pid = 0;
   {
     PageRef root_page =
         txn.GetPageManager()->AllocateNewPage(txn, PageType::kLeafPage);
-    page_id_t new_root = root_page->PageID();
-    indexes_.emplace_back(idx.name_, idx.key_, root_page->PageID(),
-                          idx.include_, idx.mode_);
-    BPlusTree new_bpt(new_root);
+    root_pid = root_page->PageID();
+    indexes_.emplace_back(idx.name_, idx.key_, root_pid, idx.include_,
+                          idx.mode_);
   }
 
   Iterator it = BeginFullScan(txn);
   while (it.IsValid()) {
-    RETURN_IF_FAIL(IndexInsert(txn, indexes_.back(), *it, it.Position()));
+    const Status status = IndexInsert(txn, indexes_.back(), *it, it.Position());
+    if (status != Status::kSuccess) {
+      // Drop the half-built index so later Insert/Delete stop touching it,
+      // and recycle the root page onto the free list.
+      indexes_.pop_back();
+      PageRef root = txn.GetPageManager()->GetPage(root_pid);
+      txn.GetPageManager()->DestroyPage(txn, root.get());
+      return status;
+    }
     ++it;
   }
   return Status::kSuccess;
@@ -72,7 +86,7 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
 
 StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
   PageRef ref = txn.GetPageManager()->GetPage(last_pid_);
-  std::string serialized_row(row.Size(), ' ');
+  std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
   StatusOr<slot_t> pos = ref->Insert(txn, serialized_row);
   RowPosition rp;
@@ -92,18 +106,35 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
         finished = true;
         break;
       }
+      if (next_pos.GetStatus() != Status::kNoSpace) {
+        // Only a full page justifies walking the chain; anything else
+        // (corruption, conflicts) must abort the insert.
+        ref.PageUnlock();
+        return next_pos.GetStatus();
+      }
     }
     if (!finished) {
       PageRef new_page =
           txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage);
-      ASSIGN_OR_RETURN(slot_t, new_pos, new_page->Insert(txn, serialized_row));
+      StatusOr<slot_t> new_pos = new_page->Insert(txn, serialized_row);
+      if (!new_pos.HasValue()) {
+        // The page is still unlinked, so recycle it instead of leaking it;
+        // the error itself must propagate without touching the indexes.
+        txn.GetPageManager()->DestroyPage(txn, new_page.get());
+        return new_pos.GetStatus();
+      }
       rp.page_id = new_page->PageID();
-      rp.slot = new_pos;
+      rp.slot = new_pos.Value();
       ref->body.row_page.next_page_id_ = new_page->PageID();
       new_page->body.row_page.prev_page_id_ = ref->PageID();
       last_pid_ = new_page->PageID();
     }
+  } else {
+    return pos.GetStatus();
   }
+  // Release the latch early: the index updates below re-enter row pages via
+  // GetPage(), which would otherwise self-deadlock on this page's latch.
+  // PageRef::PageUnlock is idempotent, so the destructor stays safe.
   ref.PageUnlock();
   for (size_t i = 0; i < indexes_.size(); ++i) {
     const Status status = IndexInsert(txn, indexes_[i], row, rp);
@@ -122,14 +153,16 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
   return rp;
 }
 
+namespace {
 bool IndexCoversUnchanged(const Index& idx, const Row& original,
                           const Row& updated) {
-  if (idx.GenerateKey(original) != idx.GenerateKey(updated)) return false;
-  for (slot_t slot : idx.sc_.include_) {
-    if (original[slot] != updated[slot]) return false;
-  }
-  return true;
+  if (idx.GenerateKey(original) != idx.GenerateKey(updated)) { return false;
 }
+  return std::ranges::all_of(idx.sc_.include_, [&](slot_t slot) {
+    return original[slot] == updated[slot];
+  });
+}
+}  // namespace
 
 StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
                                     const Row& row) {
@@ -147,25 +180,82 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   }
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
+  // Best-effort compensations: a failed index mutation must not leave applied
+  // entries behind (old keys deleted / new keys partially inserted).
+  const auto reinstate_old_keys = [&](size_t count, const RowPosition& at) {
+    for (size_t j = 0; j < count; ++j) {
+      std::ignore = IndexInsert(txn, indexes_[j], original_row, at);
+    }
+  };
+  const auto undo_index_inserts = [&](size_t count) {
+    for (size_t j = 0; j < count; ++j) {
+      std::ignore = IndexDelete(txn, indexes_[j], new_pos, row);
+    }
+  };
+  const auto restore_physical_row = [&]() {
+    std::string image(original_row.Size(), '\0');
+    original_row.Serialize(image.data());
+    PageRef written = txn.GetPageManager()->GetPage(pos.page_id);
+    std::ignore = written->Update(txn, pos.slot, image);
+  };
+
   PageRef page = txn.GetPageManager()->GetPage(new_pos.page_id);
   Status s = page->Update(txn, new_pos.slot, serialized_row);
   if (s == Status::kSuccess && indexes_unchanged) {
     return new_pos;
   }
   if (s == Status::kSuccess) {
-    for (const auto& idx : indexes_) {
-      RETURN_IF_FAIL(IndexDelete(txn, idx, pos, original_row));
+    Status failure = Status::kSuccess;
+    size_t deleted = 0;
+    for (; deleted < indexes_.size(); ++deleted) {
+      failure = IndexDelete(txn, indexes_[deleted], pos, original_row);
+      if (failure != Status::kSuccess) { break;
+}
     }
-    for (const auto& idx : indexes_) {
-      RETURN_IF_FAIL(IndexInsert(txn, idx, row, new_pos));
+    if (deleted < indexes_.size()) {
+      // The physical row was rewritten in place: put back the deleted keys
+      // and roll the row image back to the pre-update one.
+      reinstate_old_keys(deleted, pos);
+      restore_physical_row();
+      return failure;
+    }
+    size_t inserted = 0;
+    for (; inserted < indexes_.size(); ++inserted) {
+      failure = IndexInsert(txn, indexes_[inserted], row, new_pos);
+      if (failure != Status::kSuccess) { break;
+}
+    }
+    if (inserted < indexes_.size()) {
+      // Fully restore the pre-update state: undo the applied inserts,
+      // reinstate every original key, and rewrite the original row image.
+      undo_index_inserts(inserted);
+      reinstate_old_keys(indexes_.size(), pos);
+      restore_physical_row();
+      return failure;
     }
     return new_pos;
   }
-  if (s != Status::kNoSpace) return s;
-  for (const auto& idx : indexes_) {
-    RETURN_IF_FAIL(IndexDelete(txn, idx, pos, original_row));
+  if (s != Status::kNoSpace) { return s;
+}
+  Status failure = Status::kSuccess;
+  size_t deleted = 0;
+  for (; deleted < indexes_.size(); ++deleted) {
+    failure = IndexDelete(txn, indexes_[deleted], pos, original_row);
+    if (failure != Status::kSuccess) { break;
+}
   }
-  page->Delete(txn, new_pos.slot);
+  if (deleted < indexes_.size()) {
+    // The physical row is untouched at pos; reinstating the keys suffices.
+    reinstate_old_keys(deleted, pos);
+    return failure;
+  }
+  const Status delete_status = page->Delete(txn, new_pos.slot);
+  if (delete_status != Status::kSuccess) {
+    // The old row image survives at pos; roll the index deletes back instead
+    // of leaving "row present × all index entries gone".
+    reinstate_old_keys(indexes_.size(), pos);
+    return delete_status;
+  }
   bool finished = false;
   while (page->body.row_page.next_page_id_ != 0) {
     page_id_t next_page = page->body.row_page.next_page_id_;
@@ -177,12 +267,26 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
       finished = true;
       break;
     }
+    if (next_pos.GetStatus() != Status::kNoSpace) {
+      // A rejected insertion (lock conflict, corruption) must not be mistaken
+      // for a full page: stop the walk and compensate below.
+      reinstate_old_keys(indexes_.size(), pos);
+      return next_pos.GetStatus();
+    }
   }
   if (!finished) {
     PageRef new_page =
         txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage);
-    ASSIGN_OR_RETURN(slot_t, new_slot, new_page->Insert(txn, serialized_row));
-    RowPosition new_row_pos(new_page->PageID(), new_slot);
+    StatusOr<slot_t> new_slot = new_page->Insert(txn, serialized_row);
+    if (!new_slot.HasValue()) {
+      txn.GetPageManager()->DestroyPage(txn, new_page.get());
+      reinstate_old_keys(indexes_.size(), pos);
+      return new_slot.GetStatus();
+    }
+    RowPosition new_row_pos(new_page->PageID(), new_slot.Value());
+    // Release the latch early: relinking below pins last_pid_, and this page
+    // may be the very page GetPage(last_pid_) returns.  PageUnlock is
+    // idempotent, so the destructor stays safe.
     page.PageUnlock();
     {
       PageRef last_page = txn.GetPageManager()->GetPage(last_pid_);
@@ -192,8 +296,19 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     new_pos = new_row_pos;
     last_pid_ = new_page->PageID();
   }
-  for (const auto& idx : indexes_) {
-    RETURN_IF_FAIL(IndexInsert(txn, idx, row, new_pos));
+  size_t inserted = 0;
+  for (; inserted < indexes_.size(); ++inserted) {
+    failure = IndexInsert(txn, indexes_[inserted], row, new_pos);
+    if (failure != Status::kSuccess) { break;
+}
+  }
+  if (inserted < indexes_.size()) {
+    // The row has already been relocated to new_pos, so the exact pre-update
+    // state is unrecoverable; undo the partial inserts and repoint the
+    // original keys at the relocated position (best effort).
+    undo_index_inserts(inserted);
+    reinstate_old_keys(indexes_.size(), new_pos);
+    return failure;
   }
   return new_pos;
 }
@@ -202,18 +317,47 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
   if (!txn.AddWriteSet(pos)) {
     return Status::kConflicts;
   }
-  for (const auto& idx : indexes_) {
-    RETURN_IF_FAIL(IndexDelete(txn, idx, pos));
+  ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
+  Status failure = Status::kSuccess;
+  size_t deleted = 0;
+  for (; deleted < indexes_.size(); ++deleted) {
+    failure = IndexDelete(txn, indexes_[deleted], pos, original_row);
+    if (failure != Status::kSuccess) { break;
+}
   }
-  return txn.GetPageManager()->GetPage(pos.page_id)->Delete(txn, pos.slot);
+  if (deleted < indexes_.size()) {
+    // The row survives, so every applied index deletion must be undone:
+    // "row present x some index entries gone" is not a legal state.
+    for (size_t j = 0; j < deleted; ++j) {
+      std::ignore = IndexInsert(txn, indexes_[j], original_row, pos);
+    }
+    return failure;
+  }
+  const Status delete_status =
+      txn.GetPageManager()->GetPage(pos.page_id)->Delete(txn, pos.slot);
+  if (delete_status != Status::kSuccess && !indexes_.empty()) {
+    // The physical delete failed after all keys were removed: reinstate them
+    // so the surviving row stays reachable from every index.
+    for (size_t i = indexes_.size(); 0 < i; --i) {
+      std::ignore = IndexInsert(txn, indexes_[i - 1], original_row, pos);
+    }
+  }
+  return delete_status;
 }
 
 StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
-  ASSIGN_OR_RETURN(
-      std::string_view, read_row,
-      txn.GetPageManager()->GetPage(pos.page_id)->Read(txn, pos.slot));
+  // Keep the PageRef alive while decoding: read_row points into the page
+  // buffer, which is only guaranteed stable while the page stays pinned.
+  // (The resulting Row owns its strings; Value::Deserialize copies varchar
+  // data out of the buffer.)
+  PageRef page = txn.GetPageManager()->GetPage(pos.page_id);
+  ASSIGN_OR_RETURN(std::string_view, read_row, page->Read(txn, pos.slot));
   Row result;
-  result.Deserialize(read_row.data(), schema_);
+  // Length-prefixed row image from a checksummed page: consumed by offsets,
+  // never as a C string.
+  result.Deserialize(
+      read_row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+      schema_);
   return result;
 }
 
@@ -250,7 +394,7 @@ Status Table::IndexInsert(Transaction& txn, const Index& idx,
 }
 
 Status Table::IndexDelete(Transaction& txn, const Index& idx,
-                          const RowPosition& pos) {
+                          const RowPosition& pos) const {
   ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
   return IndexDelete(txn, idx, pos, original_row);
 }
@@ -265,10 +409,8 @@ Status Table::IndexDelete(Transaction& txn, const Index& idx,
     ASSIGN_OR_RETURN(std::string_view, existing_data,
                      bpt.Read(txn, idx.GenerateKey(original_row)));
     auto values = Decode<std::vector<IndexValueType>>(existing_data);
-    auto new_end =
-        std::remove_if(values.begin(), values.end(),
-                       [&](const IndexValueType& v) { return v.pos == pos; });
-    values.erase(new_end, values.end());
+    std::erase_if(values,
+                  [&](const IndexValueType& v) { return v.pos == pos; });
     if (values.empty()) {
       RETURN_IF_FAIL(bpt.Delete(txn, key));
     } else {
@@ -278,37 +420,21 @@ Status Table::IndexDelete(Transaction& txn, const Index& idx,
   return Status::kSuccess;
 }
 
-Iterator Table::BeginFullScan(Transaction& txn) const {
-  return Iterator(new FullScanIterator(this, &txn));
-}
-
 Iterator Table::BeginFullScan(Transaction& txn,
-                              const std::vector<slot_t>& projection) const {
-  return Iterator(new FullScanIterator(this, &txn, projection));
-}
-
-Iterator Table::BeginFullScan(Transaction& txn,
-                              const std::vector<slot_t>& projection,
-                              const std::unordered_set<int64_t>* key_filter,
-                              slot_t key_column) const {
-  return Iterator(new FullScanIterator(this, &txn, projection, key_filter,
-                                       key_column));
-}
-
-Iterator Table::BeginFullScan(Transaction& txn,
-                              const std::unordered_set<int64_t>* key_filter,
-                              slot_t key_column) const {
-  return Iterator(new FullScanIterator(this, &txn, std::nullopt, key_filter,
-                                       key_column));
+                              const TableScanOptions& options) const {
+  return Iterator(new FullScanIterator(
+      this, &txn, options.projection, options.key_filter,
+      options.key_column, options.peek_compares));
 }
 
 Iterator Table::BeginMorselScan(
     Transaction& txn, const ScanMorsel& pages,
     std::optional<std::vector<slot_t>> projection,
     const std::unordered_set<int64_t>* key_filter,
-    std::optional<slot_t> key_column) const {
+    std::optional<slot_t> key_column,
+    const std::vector<IntegerPeekCompare>* peek_compares) const {
   return Iterator(new FullScanIterator(this, &txn, pages, std::move(projection),
-                                       key_filter, key_column));
+                                       key_filter, key_column, peek_compares));
 }
 
 std::vector<Table::ScanMorsel> Table::BuildScanMorsels(
@@ -316,7 +442,10 @@ std::vector<Table::ScanMorsel> Table::BuildScanMorsels(
   pages_per_morsel = std::max<size_t>(1, pages_per_morsel);
   std::vector<ScanMorsel> morsels;
   page_id_t page_id = first_pid_;
-  while (page_id != 0) {
+  // Guard against a cyclic next_page_id_ chain (corrupt page / fuzzer input):
+  // a revisited page terminates the walk instead of looping forever.
+  std::unordered_set<page_id_t> visited;
+  while (page_id != 0 && visited.insert(page_id).second) {
     if (morsels.empty() || morsels.back().size() == pages_per_morsel) {
       morsels.emplace_back();
       morsels.back().reserve(pages_per_morsel);
@@ -340,16 +469,19 @@ Iterator Table::BeginIndexScan(Transaction& txn, const Index& index,
 }
 
 Iterator Table::BeginIndexScan(Transaction& txn, const Index& index,
-                               std::vector<Value> begin_key,
-                               std::vector<Value> end_key,
+                               const std::vector<Value>& begin_key,
+                               const std::vector<Value>& end_key,
                                bool ascending) const {
-  return Iterator(new IndexScanIterator(*this, index, txn, std::move(begin_key),
-                                        std::move(end_key), ascending));
+  return Iterator(
+      new IndexScanIterator(*this, index, txn, begin_key, end_key, ascending));
 }
 
 std::unordered_map<slot_t, size_t> Table::AvailableKeyIndex() const {
   std::unordered_map<slot_t, size_t> ret;
   for (size_t i = 0; i < indexes_.size(); ++i) {
+    // Skip key-less indexes instead of reading key_[0] out of bounds.
+    if (indexes_[i].sc_.key_.empty()) { continue;
+}
     ret.emplace(indexes_[i].sc_.key_[0], i);
   }
   return ret;
@@ -364,7 +496,7 @@ std::ostream& operator<<(std::ostream& o, const Table& t) {
   o << "Table(schema=" << t.schema_ << ", first_pid=" << t.first_pid_
     << ", last_pid=" << t.last_pid_ << ", indexes=[";
   for (size_t i = 0; i < t.indexes_.size(); i++) {
-    if (i) {
+    if (i != 0) {
       o << ", ";
     }
     o << t.indexes_[i];

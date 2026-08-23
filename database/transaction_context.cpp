@@ -19,6 +19,11 @@
 //
 
 #include "database/transaction_context.hpp"
+#include <memory>
+#include <string_view>
+#include <string>
+#include <utility>
+#include <ostream>
 
 #include "common/status_or.hpp"
 #include "database/database.hpp"

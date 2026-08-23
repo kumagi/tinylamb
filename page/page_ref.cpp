@@ -54,7 +54,11 @@ PageRef::~PageRef() {
 }
 
 std::ostream& operator<<(std::ostream& o, const PageRef& p) {
-  o << "{Ref: " << p.page_->PageID() << "}";
+  if (p.page_ == nullptr) {
+    o << "{Ref: null}";
+  } else {
+    o << "{Ref: " << p.page_->PageID() << "}";
+  }
   return o;
 }
 

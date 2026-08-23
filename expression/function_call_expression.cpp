@@ -17,35 +17,60 @@
 #include "expression/function_call_expression.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <iomanip>
+#include <ostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <vector>
+#include <utility>
 
+#include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "database/database.hpp"
+#include "database/transaction_context.hpp"
 #include "expression/interval_expression.hpp"
+#include "type/column_name.hpp"
 #include "type/function.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 #include "type/date.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
+Value AddOrSubInterval(const std::string& func_name, const Value& date,
+                       const IntervalExpression& interval) {
+  const int64_t amount =
+      func_name == "date_sub" ? -interval.Amount() : interval.Amount();
+  const int64_t days = date.type == ValueType::kDate
+                           ? date.DateDays()
+                           : ParseDateDays(date.value.varchar_value);
+  const int64_t result = AddDateIntervalDays(days, amount, interval.Unit());
+  return date.type == ValueType::kDate ? Value::DateFromDays(result)
+                                       : Value(FormatDateDays(result));
+}
+
 Value ExecuteFunction(const std::string& name,
                       const std::vector<Value>& values) {
   if (name == "coalesce") {
     for (const auto& val : values) {
-      if (!val.IsNull()) return val;
+      if (!val.IsNull()) { return val;
+}
     }
-    return Value();
+    return {};
   }
   if (name == "concat") {
     std::string result;
     for (const auto& value : values) {
-      if (value.IsNull()) return Value();
+      if (value.IsNull()) { return {};
+}
       if (value.type != ValueType::kVarChar) {
         throw std::runtime_error("CONCAT currently requires string arguments");
       }
@@ -59,7 +84,7 @@ Value ExecuteFunction(const std::string& name,
     }
     if (values[0].IsNull() || values[1].IsNull() ||
         (values.size() == 3 && values[2].IsNull())) {
-      return Value();
+      return {};
     }
     if (values[0].type != ValueType::kVarChar ||
         values[1].type != ValueType::kInt64 ||
@@ -68,11 +93,18 @@ Value ExecuteFunction(const std::string& name,
     }
     const std::string input(values[0].value.varchar_value);
     const int64_t start = values[1].value.int_value;
+    // A non-positive length yields the empty string. Casting a negative
+    // length to size_t would wrap around near SIZE_MAX and return the whole
+    // rest of the string (e.g. SUBSTR('abc', 1, -1) -> 'abc').
+    if (values.size() == 3 && values[2].value.int_value <= 0) {
+      return Value(std::string());
+    }
     const size_t begin = start <= 1 ? 0 : static_cast<size_t>(start - 1);
     const size_t length = values.size() == 3
                               ? static_cast<size_t>(values[2].value.int_value)
                               : std::string::npos;
-    if (begin >= input.size()) return Value(std::string());
+    if (begin >= input.size()) { return Value(std::string());
+}
     return Value(input.substr(begin, length));
   }
   if (name == "extract_year" || name == "extract_month" ||
@@ -80,14 +112,30 @@ Value ExecuteFunction(const std::string& name,
     if (values.size() != 1) {
       throw std::runtime_error("EXTRACT requires one argument");
     }
-    if (values[0].IsNull()) return Value();
+    if (values[0].IsNull()) { return {};
+}
+    if (values[0].type != ValueType::kDate &&
+        values[0].type != ValueType::kVarChar) {
+      throw std::runtime_error("EXTRACT requires DATE or STRING");
+    }
     const std::string date = values[0].type == ValueType::kDate
                                  ? values[0].AsString()
                                  : std::string(values[0].value.varchar_value);
-    if (date.size() < 10) throw std::runtime_error("invalid DATE value");
-    if (name == "extract_year") return Value(std::stoll(date.substr(0, 4)));
-    if (name == "extract_month") return Value(std::stoll(date.substr(5, 2)));
-    return Value(std::stoll(date.substr(8, 2)));
+    if (date.size() < 10) { throw std::runtime_error("invalid DATE value");
+}
+    int64_t part = 0;
+    try {
+      if (name == "extract_year") {
+        part = std::stoll(date.substr(0, 4));
+      } else if (name == "extract_month") {
+        part = std::stoll(date.substr(5, 2));
+      } else {
+        part = std::stoll(date.substr(8, 2));
+      }
+    } catch (const std::logic_error&) {
+      throw std::runtime_error("invalid DATE value: " + date);
+    }
+    return Value(part);
   }
   if (name == "current_timestamp") {
     if (!values.empty()) {
@@ -120,17 +168,10 @@ Value FunctionCallExpression::Evaluate(const Row& row,
       throw std::runtime_error("DATE_ADD/DATE_SUB requires DATE and INTERVAL");
     }
     const Value date = args_[0]->Evaluate(row, schema);
-    if (date.IsNull()) return Value();
-    const auto& interval = args_[1]->AsIntervalExpression();
-    const int64_t amount = func_name_ == "date_sub" ? -interval.Amount()
-                                                     : interval.Amount();
-    const int64_t days = date.type == ValueType::kDate
-                             ? date.DateDays()
-                             : ParseDateDays(date.value.varchar_value);
-    const int64_t result = AddDateIntervalDays(days, amount, interval.Unit());
-    return date.type == ValueType::kDate
-               ? Value::DateFromDays(result)
-               : Value(FormatDateDays(result));
+    if (date.IsNull()) { return {};
+}
+    return AddOrSubInterval(func_name_, date,
+                            args_[1]->AsIntervalExpression());
   }
   std::vector<Value> values;
   values.reserve(args_.size());
@@ -165,17 +206,10 @@ Value FunctionCallExpression::Evaluate(const Row* left,
     }
     const Value date =
         args_[0]->Evaluate(left, left_schema, right, right_schema);
-    if (date.IsNull()) return Value();
-    const auto& interval = args_[1]->AsIntervalExpression();
-    const int64_t amount = func_name_ == "date_sub" ? -interval.Amount()
-                                                     : interval.Amount();
-    const int64_t days = date.type == ValueType::kDate
-                             ? date.DateDays()
-                             : ParseDateDays(date.value.varchar_value);
-    const int64_t result = AddDateIntervalDays(days, amount, interval.Unit());
-    return date.type == ValueType::kDate
-               ? Value::DateFromDays(result)
-               : Value(FormatDateDays(result));
+    if (date.IsNull()) { return {};
+}
+    return AddOrSubInterval(func_name_, date,
+                            args_[1]->AsIntervalExpression());
   }
   std::vector<Value> values;
   values.reserve(args_.size());
@@ -187,17 +221,19 @@ Value FunctionCallExpression::Evaluate(const Row* left,
 
 Type FunctionCallExpression::ResultType(const Schema& schema) const {
   if (func_name_ == "coalesce") {
+    if (args_.empty()) { return {TypeTag::kInvalid};
+}
     return args_[0]->ResultType(schema);
   }
   if (func_name_ == "concat" || func_name_ == "current_timestamp" ||
       func_name_ == "substr" || func_name_ == "substring") {
-    return tinylamb::Type(TypeTag::kVarChar);
+    return {TypeTag::kVarChar};
   }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     return args_[0]->ResultType(schema);
   }
   if (func_name_.starts_with("extract_")) {
-    return tinylamb::Type(TypeTag::kBigInt);
+    return {TypeTag::kBigInt};
   }
   throw std::runtime_error("Function calls are not yet executable.");
 }
@@ -205,17 +241,19 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
 Type FunctionCallExpression::ResultType(const Schema& left,
                                         const Schema& right) const {
   if (func_name_ == "coalesce") {
+    if (args_.empty()) { return {TypeTag::kInvalid};
+}
     return args_[0]->ResultType(left, right);
   }
   if (func_name_ == "concat" || func_name_ == "current_timestamp" ||
       func_name_ == "substr" || func_name_ == "substring") {
-    return tinylamb::Type(TypeTag::kVarChar);
+    return {TypeTag::kVarChar};
   }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     return args_[0]->ResultType(left, right);
   }
   if (func_name_.starts_with("extract_")) {
-    return tinylamb::Type(TypeTag::kBigInt);
+    return {TypeTag::kBigInt};
   }
   throw std::runtime_error("Function calls are not yet executable.");
 }

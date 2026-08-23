@@ -32,6 +32,15 @@ class PagePool;
 class MetaPage {
  public:
   [[nodiscard]] page_id_t MaxPageCountForTest() const { return max_page_count; }
+  [[nodiscard]] page_id_t MaxPageCount() const { return max_page_count; }
+  // Recovery: re-derive the allocator high-water mark after a crash. The
+  // counter mutates outside the WAL, so RecoveryManager rebuilds it from
+  // every page id the log touches (see RecoverFrom).
+  void RestoreMaxPageCount(page_id_t high_water) {
+    if (max_page_count < high_water) {
+      max_page_count = high_water;
+    }
+  }
 
  private:
   void Initialize() {

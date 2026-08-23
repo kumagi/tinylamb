@@ -34,6 +34,13 @@ class ProductPlan final : public PlanBase {
               const Table& right_tbl, const Index& idx,
               std::vector<ColumnName> right_cols,
               const TableStatistics& right_ts);
+  // Index Join whose right side is exposed under a relation-renamed schema:
+  // `right_cols` resolve against the physical table while `declared_output`
+  // names the emitted columns (Phase 8 self-joins).
+  ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
+              const Table& right_tbl, const Index& idx,
+              std::vector<ColumnName> right_cols,
+              const TableStatistics& right_ts, Schema declared_output);
   ProductPlan(Plan left_src, Plan right_src);
   ProductPlan(const ProductPlan&) = delete;
   ProductPlan(ProductPlan&&) = delete;

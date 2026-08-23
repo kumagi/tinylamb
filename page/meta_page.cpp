@@ -33,8 +33,13 @@ PageRef MetaPage::AllocateNewPage(Transaction& txn, PagePool& pool,
   page_id_t new_page_id = 0;
   PageRef ret = [&]() {
     if (first_free_page == 0) {
-      new_page_id = ++max_page_count;
-      return pool.GetPage(max_page_count, nullptr);
+      // Reserve nothing before the load succeeds: a throwing GetPage must not
+      // permanently advance max_page_count (that would strand a page-id hole).
+      const page_id_t candidate = max_page_count + 1;
+      PageRef page = pool.GetPage(candidate, nullptr);
+      new_page_id = candidate;
+      max_page_count = candidate;
+      return page;
     }
     new_page_id = first_free_page;
     PageRef page = pool.GetPage(new_page_id, nullptr);
@@ -53,15 +58,13 @@ void MetaPage::DestroyPage(Transaction& txn, Page* target) {
   target->PageInit(free_page_id, PageType::kFreePage);
   assert(target->PageID() == free_page_id);
   FreePage& free_page = target->body.free_page;
-  assert(target->PageID() == free_page_id);
   // Add the free page to the free page chain.
   free_page.next_free_page = first_free_page;
-  assert(target->PageID() == free_page_id);
   first_free_page = free_page_id;
   txn.DestroyPageLog(free_page_id);
 }
 
-void MetaPage::Dump(std::ostream& o, int) const {
+void MetaPage::Dump(std::ostream& o, int /*unused*/) const {
   o << "[FirstFree: " << first_free_page << "]";
 }
 }  // namespace tinylamb

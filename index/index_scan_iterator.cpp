@@ -17,14 +17,14 @@
 #include "index_scan_iterator.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <ostream>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "common/constants.hpp"
 #include "common/decoder.hpp"
-#include "common/log_message.hpp"
 #include "common/status_or.hpp"
 #include "index/b_plus_tree.hpp"
 #include "index/index.hpp"
@@ -41,7 +41,8 @@ namespace {
 std::string EncodeParts(const std::vector<Value>& parts) {
   std::string encoded;
   for (const Value& value : parts) {
-    if (value.IsNull()) break;
+    if (value.IsNull()) { break;
+}
     encoded += value.EncodeMemcomparableFormat();
   }
   return encoded;
@@ -62,19 +63,19 @@ Value FirstOrNull(const std::vector<Value>& parts) {
 }  // namespace
 
 IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
-                                     Transaction& txn, Value begin, Value end,
-                                     bool ascending)
+                                     Transaction& txn, const Value& begin,
+                                     const Value& end, bool ascending)
     : IndexScanIterator(table, index, txn,
                         begin.IsNull() ? std::vector<Value>{}
-                                       : std::vector<Value>{std::move(begin)},
+                                       : std::vector<Value>{begin},
                         end.IsNull() ? std::vector<Value>{}
-                                     : std::vector<Value>{std::move(end)},
+                                     : std::vector<Value>{end},
                         ascending) {}
 
 IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
                                      Transaction& txn,
-                                     std::vector<Value> begin_key,
-                                     std::vector<Value> end_key,
+                                     const std::vector<Value>& begin_key,
+                                     const std::vector<Value>& end_key,
                                      bool ascending)
     : table_(table),
       index_(index),
@@ -83,7 +84,6 @@ IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
       end_(FirstOrNull(end_key)),
       ascending_(ascending),
       is_unique_(index.sc_.mode_ == IndexMode::kUnique),
-      value_offset_(ascending_ ? 0 : -1),
       bpt_(index.Root()),
       iter_(&bpt_, &txn, EncodeParts(begin_key), EncodeEndParts(index, end_key),
             ascending) {
@@ -97,24 +97,36 @@ IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
     include_ = val.include;
   } else {
     auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
-    value_offset_ = ascending ? 0 : val.size() - 1;
-    pos_ = val[value_offset_].pos;
-    include_ = val[value_offset_].include;
+    if (val.empty()) {
+      // A corrupted (or future empty) value list must not underflow the
+      // offset below; leave the row state cleared.
+      Clear();
+      return;
+    }
+    value_offset_ =
+        ascending_ ? 0 : static_cast<int64_t>(val.size()) - 1;
+    pos_ = val[static_cast<size_t>(value_offset_)].pos;
+    include_ = val[static_cast<size_t>(value_offset_)].include;
   }
 }
 
-bool IndexScanIterator::IsValid() const { return iter_.IsValid(); }
+bool IndexScanIterator::IsValid() const {
+  return !invalidated_ && iter_.IsValid();
+}
 
 std::string IndexScanIterator::GetValue() const { return iter_.Value(); }
 
 RowPosition IndexScanIterator::Position() const {
-  if (!iter_.IsValid()) {
+  if (!IsValid()) {
     return {};
   }
   return pos_;
 }
 
 void IndexScanIterator::Clear() {
+  // A cleared iterator must behave as exhausted: Position()/operator++ on it
+  // used to leak a valid-looking {0,0} row position to IndexScan::Next.
+  invalidated_ = true;
   pos_ = RowPosition();
   keys_.Clear();
   include_.Clear();
@@ -133,11 +145,13 @@ void IndexScanIterator::UpdateIteratorState() {
     include_ = rp.include;
   } else {
     auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
-    if (val.empty() || value_offset_ >= val.size()) {
+    if (val.empty() || value_offset_ < 0 ||
+        static_cast<size_t>(value_offset_) >= val.size()) {
       Clear();
       return;
     }
-    const Table::IndexValueType& row_value = val[value_offset_];
+    const Table::IndexValueType& row_value =
+        val[static_cast<size_t>(value_offset_)];
     pos_ = row_value.pos;
     include_ = row_value.include;
   }
@@ -148,19 +162,28 @@ void IndexScanIterator::ResolveRow() const {
   if (!ref.IsValid()) {
     return;
   }
-  txn_.AddReadSet(pos_);
   StatusOr<std::string_view> row = ref->Read(txn_, pos_.slot);
   if (!row.HasValue()) {
     current_row_.Clear();
     current_row_resolved_ = true;
     return;
   }
-  current_row_.Deserialize(row.Value().data(), table_.schema_);
+  // Only register rows that actually exist so the read set stays clean.
+  txn_.AddReadSet(pos_);
+  // Length-prefixed page images: decoded by offsets, never as C strings.
+  current_row_.Deserialize(
+      row.Value().data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+      table_.schema_);
   current_row_resolved_ = true;
 }
 
 IteratorBase& IndexScanIterator::operator++() {
   current_row_resolved_ = false;
+  if (!IsValid()) {
+    // Guard against advancing past the end (IndexScanIterator::operator++ is
+    // called unconditionally by some loops).
+    return *this;
+  }
   if (!ascending_) {
     if (is_unique_) {
       --iter_;
@@ -170,7 +193,7 @@ IteratorBase& IndexScanIterator::operator++() {
       --iter_;
       if (iter_.IsValid()) {
         auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
-        value_offset_ = static_cast<int>(val.size()) - 1;
+        value_offset_ = static_cast<int64_t>(val.size()) - 1;
       }
     }
     UpdateIteratorState();
@@ -181,7 +204,7 @@ IteratorBase& IndexScanIterator::operator++() {
   } else {
     auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
     ++value_offset_;
-    if (val.size() <= value_offset_) {
+    if (std::cmp_less_equal(val.size(), value_offset_)) {
       ++iter_;
       value_offset_ = 0;
     }
@@ -192,6 +215,9 @@ IteratorBase& IndexScanIterator::operator++() {
 
 IteratorBase& IndexScanIterator::operator--() {
   current_row_resolved_ = false;
+  if (!IsValid()) {
+    return *this;
+  }
   if (is_unique_) {
     --iter_;
   } else {
@@ -201,7 +227,7 @@ IteratorBase& IndexScanIterator::operator--() {
       --iter_;
       if (iter_.IsValid()) {
         auto val = Decode<std::vector<Table::IndexValueType> >(iter_.Value());
-        value_offset_ = val.size() - 1;
+        value_offset_ = static_cast<int64_t>(val.size()) - 1;
       }
     }
   }

@@ -46,10 +46,22 @@ class PageRef final {
   PageRef() : pool_(nullptr), page_(nullptr) {}
 
  public:
-  Page& operator*() { return *page_; }
-  const Page& operator*() const { return *page_; }
-  Page* operator->() { return page_; }
-  const Page* operator->() const { return page_; }
+  Page& operator*() {
+    assert(page_ != nullptr);
+    return *page_;
+  }
+  const Page& operator*() const {
+    assert(page_ != nullptr);
+    return *page_;
+  }
+  Page* operator->() {
+    assert(page_ != nullptr);
+    return page_;
+  }
+  const Page* operator->() const {
+    assert(page_ != nullptr);
+    return page_;
+  }
 
   void PageUnlock();
   RowPage& GetRowPage();
@@ -57,12 +69,11 @@ class PageRef final {
   [[nodiscard]] bool IsNull() const { return page_ == nullptr; }
   Page* get() { return page_; }
   [[nodiscard]] const Page* get() const { return page_; }
-  void Swap(PageRef& other) {
-    std::swap(pool_, other.pool_);
-    std::swap(page_, other.page_);
-    std::swap(exclusive_page_lock_, other.exclusive_page_lock_);
-    std::swap(shared_page_lock_, other.shared_page_lock_);
-  }
+
+  // Note: no Swap(). Swapping raw page pointers independently of the owned
+  // locks lets a ref end up holding a latch for a different page than
+  // page_, after which PageUnlock would release the wrong mutex and unpin a
+  // foreign page id. Move between named PageRef variables instead.
 
   ~PageRef();
 
@@ -77,13 +88,17 @@ class PageRef final {
   }
   PageRef& operator=(const PageRef&) = delete;
   PageRef& operator=(PageRef&& o) noexcept {
-    if (page_ != nullptr) PageUnlock();
-    pool_ = o.pool_;
-    page_ = o.page_;
-    exclusive_page_lock_ = std::move(o.exclusive_page_lock_);
-    shared_page_lock_ = std::move(o.shared_page_lock_);
-    o.pool_ = nullptr;
-    o.page_ = nullptr;
+    if (this != &o) {
+      // Self-move must not unlock: PageUnlock on our own state followed by
+      // move-assigning the std lock types from ourselves is undefined.
+      if (page_ != nullptr) PageUnlock();
+      pool_ = o.pool_;
+      page_ = o.page_;
+      exclusive_page_lock_ = std::move(o.exclusive_page_lock_);
+      shared_page_lock_ = std::move(o.shared_page_lock_);
+      o.pool_ = nullptr;
+      o.page_ = nullptr;
+    }
     return *this;
   }
   bool operator==(const PageRef& r) const {

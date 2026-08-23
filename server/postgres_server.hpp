@@ -3,6 +3,7 @@
 #ifndef TINYLAMB_POSTGRES_SERVER_HPP
 #define TINYLAMB_POSTGRES_SERVER_HPP
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -17,11 +18,20 @@ struct PostgresServerOptions {
   size_t max_message_bytes{16U * 1024U * 1024U};
   // Zero selects std::thread::hardware_concurrency().
   size_t read_worker_threads{0};
+  // Connections beyond this limit are shed immediately (client sees EOF).
+  size_t max_connections{1024};
+  // Truncate a torn/unparsable WAL tail to its intact prefix at boot instead
+  // of treating the corruption as fatal (see RecoveryManager).
+  bool force_recovery{false};
+  // Clients sending nothing for this long are disconnected. Zero disables
+  // the sweep.
+  std::chrono::seconds idle_timeout{3600};
 };
 
 class PostgresServer {
  public:
-  PostgresServer(std::string database_path, PostgresServerOptions options);
+  PostgresServer(const std::string& database_path,
+                 PostgresServerOptions options);
   ~PostgresServer();
 
   PostgresServer(const PostgresServer&) = delete;

@@ -16,7 +16,10 @@
 
 #include "type/type.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace tinylamb {
 

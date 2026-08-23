@@ -3,10 +3,15 @@
 
 #include <ostream>
 #include <stdexcept>
+#include "type/value.hpp"
+#include "expression/expression.hpp"
+#include <unordered_set>
+#include "type/column_name.hpp"
+#include <string>
 
 namespace tinylamb {
 
-Value QueryExpression::Evaluate(const Row&, const Schema&) const {
+Value QueryExpression::Evaluate(const Row& /*row*/, const Schema& /*schema*/) const {
   throw std::runtime_error("query expression requires relational evaluation");
 }
 
@@ -15,9 +20,11 @@ std::unordered_set<ColumnName> QueryExpression::TouchedColumns() const {
 }
 
 std::string QueryExpression::ToString() const {
-  if (exists_) return negated_ ? "NOT EXISTS(...)" : "EXISTS(...)";
-  if (test_)
+  if (exists_) { return negated_ ? "NOT EXISTS(...)" : "EXISTS(...)";
+}
+  if (test_) {
     return test_->ToString() + (negated_ ? " NOT IN(...)" : " IN(...)");
+}
   return "SCALAR_SUBQUERY(...)";
 }
 

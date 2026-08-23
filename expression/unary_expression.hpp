@@ -24,7 +24,8 @@
 
 namespace tinylamb {
 
-[[nodiscard]] Value EvaluateUnary(UnaryOperation operation, Value child);
+[[nodiscard]] Value EvaluateUnary(UnaryOperation operation,
+                                  const Value& child);
 
 class UnaryExpression : public ExpressionBase {
  public:
@@ -39,7 +40,7 @@ class UnaryExpression : public ExpressionBase {
   [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
                                           const Schema& right) const override;
-  [[nodiscard]] Expression Child() const { return child_; }
+  [[nodiscard]] const Expression& Child() const { return child_; }
   [[nodiscard]] UnaryOperation Op() const { return operation_; }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;

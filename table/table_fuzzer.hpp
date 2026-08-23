@@ -35,7 +35,7 @@ namespace tinylamb {
 // Verify operation stream with row values taken from the same buffer, so
 // libFuzzer can steer value shapes and interleavings toward row-page and
 // secondary-index edge cases instead of sampling a PRNG.
-void Try(const uint8_t* data, size_t size, bool verbose) {
+inline void Try(const uint8_t* data, size_t size, bool verbose) {
   ByteStream stream(data, size);
   std::string db_name = RandomString();
   Database db(db_name);
@@ -96,7 +96,20 @@ void Try(const uint8_t* data, size_t size, bool verbose) {
         break;
       }
     }
-    ctx.txn_.PreCommit();
+    assert(ctx.txn_.PreCommit() == Status::kSuccess);
+    if (stream.Pick(4) == 0) {
+      db.EmulateCrash();
+      Database recovered(db_name);
+      TransactionContext verify_ctx = recovered.BeginContext();
+      ASSIGN_OR_CRASH(Table, verify_table, recovered.GetTable(verify_ctx, "FuzzerTable"));
+      for (const auto& [rp, expected_row] : rows) {
+        ASSIGN_OR_CRASH(Row, read_row, verify_table.Read(verify_ctx.txn_, rp));
+        assert(expected_row == read_row);
+      }
+      assert(verify_ctx.txn_.PreCommit() == Status::kSuccess);
+      db.DeleteAll();
+      return;
+    }
   }
   db.DeleteAll();
 }

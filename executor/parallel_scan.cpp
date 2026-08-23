@@ -2,11 +2,21 @@
 #include "executor/parallel_scan.hpp"
 
 #include <algorithm>
+#include <cstddef>
+#include <optional>
+#include <mutex>
+#include <exception>
 #include <ostream>
 #include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
+#include "executor/data_chunk.hpp"
+#include "page/row_position.hpp"
 #include "table/iterator.hpp"
+#include "table/table.hpp"
 #include "transaction/transaction.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -36,34 +46,53 @@ ParallelScan::~ParallelScan() {
 
 void ParallelScan::Start(size_t batch_size) {
   std::scoped_lock lock(mutex_);
-  if (started_) return;
+  if (started_) { return;
+}
   started_ = true;
-  if (morsels_.empty()) return;
-  active_workers_ = worker_count_;
+  if (morsels_.empty()) { return;
+}
   workers_.reserve(worker_count_);
+  size_t launched = 0;
   for (size_t worker = 0; worker < worker_count_; ++worker) {
-    workers_.emplace_back(
-        [this, batch_size] { RunWorker(batch_size); });
+    try {
+      workers_.emplace_back(
+          [this, batch_size] { RunWorker(batch_size); });
+      ++launched;
+    } catch (...) {
+      // Thread creation can fail (e.g. resource_unavailable). Account only
+      // for the workers that actually started and wake the consumer via
+      // worker_error_ instead of blocking on active_workers_ forever.
+      if (!worker_error_) { worker_error_ = std::current_exception();
+}
+      break;
+    }
   }
+  active_workers_ = launched;
+  ready_cv_.notify_all();
 }
 
 void ParallelScan::RunWorker(size_t batch_size) {
   try {
+    // The projection layout never changes during the scan, so build the type
+    // vector once and reuse it for every chunk refill.
+    std::vector<ValueType> projection_types;
+    if (projection_) {
+      projection_types.reserve(projection_->size());
+      for (slot_t slot : *projection_) {
+        projection_types.push_back(table_->GetSchema().GetColumn(slot).Type());
+      }
+    }
     while (true) {
       const size_t morsel_index = next_morsel_.fetch_add(1);
-      if (morsel_index >= morsels_.size()) break;
+      if (morsel_index >= morsels_.size()) { break;
+}
       Iterator iterator = table_->BeginMorselScan(
           *txn_, morsels_[morsel_index], projection_);
-      DataChunk chunk(projection_ ? std::vector<ValueType>{}
-                                  : std::vector<ValueType>{},
-                      batch_size);
+      // The layout never changes across refill, so Initialize is the single
+      // reset path for both the first and subsequent chunks.
+      DataChunk chunk;
       if (projection_) {
-        std::vector<ValueType> types;
-        types.reserve(projection_->size());
-        for (slot_t slot : *projection_) {
-          types.push_back(table_->GetSchema().GetColumn(slot).Type());
-        }
-        chunk.Initialize(std::move(types), batch_size);
+        chunk.Initialize(projection_types, batch_size);
       } else {
         chunk.Initialize(table_->GetSchema(), batch_size);
       }
@@ -71,24 +100,35 @@ void ParallelScan::RunWorker(size_t batch_size) {
         chunk.Append(*iterator, iterator.Position());
         ++iterator;
         if (chunk.Size() == batch_size) {
-          if (!Enqueue(std::move(chunk))) return;
+          // Never block on a full output queue while holding a page latch:
+          // a writer waiting for that latch could be the very consumer that
+          // would otherwise drain the queue.
+          iterator.DropPageLatch();
+          if (!Enqueue(std::move(chunk))) { return;
+}
+          // The chunk above was handed off; start the refill from a
+          // well-defined state instead of re-initializing a moved-from one.
+          chunk = DataChunk{};
           if (projection_) {
-            std::vector<ValueType> types;
-            types.reserve(projection_->size());
-            for (slot_t slot : *projection_) {
-              types.push_back(table_->GetSchema().GetColumn(slot).Type());
-            }
-            chunk.Initialize(std::move(types), batch_size);
+            chunk.Initialize(projection_types, batch_size);
           } else {
-            chunk.Reset(table_->GetSchema(), batch_size);
+            chunk.Initialize(table_->GetSchema(), batch_size);
           }
         }
       }
-      if (!chunk.Empty() && !Enqueue(std::move(chunk))) return;
+      iterator.DropPageLatch();
+      if (!chunk.Empty()) {
+        if (!Enqueue(std::move(chunk))) { return;
+}
+        // Handing off moved out of `chunk`; restore a well-defined state so
+        // the next morsel iteration starts from a fresh object.
+        chunk = DataChunk{};
+      }
     }
   } catch (...) {
     std::scoped_lock lock(mutex_);
-    if (!worker_error_) worker_error_ = std::current_exception();
+    if (!worker_error_) { worker_error_ = std::current_exception();
+}
     cancelled_ = true;
   }
   {
@@ -104,7 +144,8 @@ bool ParallelScan::Enqueue(DataChunk chunk) {
   space_cv_.wait(lock, [this] {
     return cancelled_ || ready_.size() < max_ready_chunks_;
   });
-  if (cancelled_) return false;
+  if (cancelled_) { return false;
+}
   ready_.push_back(std::move(chunk));
   lock.unlock();
   ready_cv_.notify_one();
@@ -126,13 +167,17 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
     return destination->Size();
   }
 
-  Start(max_rows);
+  // Workers use a fixed chunk size; per-consumer max_rows is absorbed by the
+  // pending_ split below so the first caller cannot dictate global capacity.
+  Start(kDefaultVectorSize);
   std::unique_lock lock(mutex_);
   ready_cv_.wait(lock, [this] {
     return !ready_.empty() || active_workers_ == 0 || worker_error_;
   });
-  if (worker_error_) std::rethrow_exception(worker_error_);
-  if (ready_.empty()) return 0;
+  if (worker_error_) { std::rethrow_exception(worker_error_);
+}
+  if (ready_.empty()) { return 0;
+}
   DataChunk chunk = std::move(ready_.front());
   ready_.pop_front();
   lock.unlock();
@@ -153,11 +198,13 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
 
 bool ParallelScan::Next(Row* destination, RowPosition* position) {
   if (scalar_offset_ == scalar_batch_.Size()) {
-    if (NextBatch(&scalar_batch_) == 0) return false;
+    if (NextBatch(&scalar_batch_) == 0) { return false;
+}
     scalar_offset_ = 0;
   }
   *destination = scalar_batch_.RowAt(scalar_offset_);
-  if (position) *position = scalar_batch_.PositionAt(scalar_offset_);
+  if (position != nullptr) { *position = scalar_batch_.PositionAt(scalar_offset_);
+}
   ++scalar_offset_;
   return true;
 }

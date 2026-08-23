@@ -18,8 +18,9 @@
 
 #include <cstddef>
 #include <cstdio>
-#include <iostream>
 #include <memory>
+#include <stdexcept>
+#include <sstream>
 #include <string>
 #include <tuple>
 
@@ -27,6 +28,7 @@
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/page.hpp"
@@ -155,8 +157,11 @@ TEST_F(BPlusTreeIteratorTest, RangeDescending) {
     Insert(txn, c, 1000, 100);
   }
 
-  // Act -- begin a descending range scan iterator ["", "d"] and walk backward
-  BPlusTreeIterator it = bpt_->Begin(txn, "", "d", false);
+  // Act -- begin a descending range scan with an upper bound just above the
+  // "d" group ("d" alone sorts below the stored dddd... key, and since
+  // improvements2.md 4.2 a bound-exceeding key must never be yielded)
+  const std::string end = std::string(999, 'd') + "~";
+  BPlusTreeIterator it = bpt_->Begin(txn, "", end, false);
   EXPECT_EQ(it.Value(), std::string(100, 'd'));
   --it;
   EXPECT_TRUE(it.IsValid());
@@ -312,16 +317,15 @@ TEST_F(BPlusTreeIteratorTest, EndOpenFullScanReverse) {
   EXPECT_FALSE(it.IsValid());
 }
 
-// PRODUCTION BUG: BPlusTreeIterator's invalid-range guard never throws. The
-// constructor computes `std::runtime_error("invalid begin & end")` without a
-// `throw` (index/b_plus_tree_iterator.cpp:34-36), so it only constructs and
-// discards an exception object. Both EXPECT_THROWs below fail.
+// The invalid-range guard throws std::runtime_error since
+// b_plus_tree_iterator.cpp grew a real `throw` (the old "computes but never
+// throws" bug is fixed); these expectations pin that behavior.
 TEST_F(BPlusTreeIteratorTest, ThrowsOnInvalidRange) {
   // Arrange -- begin transaction, no inserts needed
   auto txn = tm_->Begin();
 
-  // Act/Assert -- a range whose begin sorts after end SHOULD be rejected in
-  // both directions, but the missing `throw` lets it pass silently
+  // Act/Assert -- a range whose begin sorts after end is rejected in both
+  // directions.
   EXPECT_THROW(bpt_->Begin(txn, "z", "a"), std::runtime_error);
   EXPECT_THROW(bpt_->Begin(txn, "z", "a", false), std::runtime_error);
 
@@ -755,6 +759,94 @@ TEST_F(BPlusTreeIteratorTest, BoundedAscendingStopsBeforeMissingUpperBound) {
     ASSERT_TRUE(it.IsValid());
     ASSERT_EQ(it.Value(), std::string(100, c));
     ++it;
+  }
+  EXPECT_FALSE(it.IsValid());
+}
+
+// Regression for improvements2.md 4.2(a): a descending scan whose upper
+// bound is absent must start on the last key strictly BELOW the bound, not
+// on the first key above it.
+TEST_F(BPlusTreeIteratorTest, DescendingStartsBelowMissingUpperBound) {
+  // Arrange -- one leaf holds a..g
+  auto txn = tm_->Begin();
+  for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
+    Insert(txn, c, 1000, 100);
+  }
+
+  // Act -- "d~" sorts between the stored keys d and e
+  const std::string between = std::string(999, 'd') + "~";
+  BPlusTreeIterator it = bpt_->Begin(txn, "", between, false);
+  for (const auto& c : {'d', 'c', 'b', 'a'}) {
+    SCOPED_TRACE(c);
+    ASSERT_TRUE(it.IsValid());
+    ASSERT_EQ(it.Value(), std::string(100, c));
+    --it;
+  }
+
+  // Assert -- exhausted after the smallest key
+  EXPECT_FALSE(it.IsValid());
+}
+
+// Regression for improvements2.md 4.2(b): when every stored key is below the
+// upper bound the descending scan must yield the whole tree instead of being
+// born invalid.
+TEST_F(BPlusTreeIteratorTest, DescendingWithUpperBoundAboveAllKeys) {
+  // Arrange -- one leaf holds a..g
+  auto txn = tm_->Begin();
+  for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
+    Insert(txn, c, 1000, 100);
+  }
+
+  // Act -- upper bound sorts past every stored key
+  BPlusTreeIterator it = bpt_->Begin(txn, "", std::string(1000, 'z'), false);
+  for (const auto& c : {'g', 'f', 'e', 'd', 'c', 'b', 'a'}) {
+    SCOPED_TRACE(c);
+    ASSERT_TRUE(it.IsValid());
+    ASSERT_EQ(it.Value(), std::string(100, c));
+    --it;
+  }
+  EXPECT_FALSE(it.IsValid());
+}
+
+// Regression for improvements2.md 4.2(a) across leaves: the landing leaf
+// starts entirely above the absent upper bound, so construction must retreat
+// into the previous leaf.
+TEST_F(BPlusTreeIteratorTest, DescendingMissingBoundRetreatsToPrevLeaf) {
+  // Arrange -- exclusive-size rows split the seven keys across leaves
+  constexpr int kSize = 2723;
+  auto txn = tm_->Begin();
+  for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
+    Insert(txn, c, kSize, kSize);
+  }
+
+  // Act -- bound sorts between the stored keys c and d; the leaf holding
+  // d..g contains no key below it
+  const std::string between = std::string(kSize - 1, 'c') + "~";
+  BPlusTreeIterator it = bpt_->Begin(txn, "", between, false);
+  for (const auto& c : {'c', 'b', 'a'}) {
+    SCOPED_TRACE(c);
+    ASSERT_TRUE(it.IsValid());
+    ASSERT_EQ(it.Value(), std::string(kSize, c));
+    --it;
+  }
+  EXPECT_FALSE(it.IsValid());
+}
+
+// Same retreat, but over a pure exclusive foster chain.
+TEST_F(BPlusTreeIteratorTest, DescendingMissingBoundRetreatsOverFosterChain) {
+  constexpr static int kExclusiveValue = 6000;
+  auto txn = tm_->Begin();
+  for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
+    Insert(txn, c, 1, kExclusiveValue);
+  }
+
+  const std::string between = std::string(1, 'c') + "~";
+  BPlusTreeIterator it = bpt_->Begin(txn, "", between, false);
+  for (const auto& c : {'c', 'b', 'a'}) {
+    SCOPED_TRACE(c);
+    ASSERT_TRUE(it.IsValid());
+    ASSERT_EQ(it.Value(), std::string(kExclusiveValue, c));
+    --it;
   }
   EXPECT_FALSE(it.IsValid());
 }

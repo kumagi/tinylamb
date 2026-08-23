@@ -22,11 +22,20 @@
 #include <vector>
 
 #include "executor/executor_base.hpp"
+#include "expression/aggregate_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/jit.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
+
+// COUNT(*) is spelled as a kCount aggregate whose child is the column "*".
+// This predicate is the single authority for that shape.
+[[nodiscard]] inline bool IsCountStar(const AggregateExpression& aggregate) {
+  return aggregate.GetType() == AggregationType::kCount &&
+         aggregate.Child()->Type() == TypeTag::kColumnValue &&
+         aggregate.Child()->AsColumnValue().GetColumnName().name == "*";
+}
 
 class AggregationExecutor : public ExecutorBase {
  public:
@@ -40,6 +49,8 @@ class AggregationExecutor : public ExecutorBase {
   [[nodiscard]] size_t JitBatches() const { return jit_batches_; }
 
  private:
+  bool NextGeneric(Row* dst);
+
   std::shared_ptr<ExecutorBase> child_;
   Schema input_schema_;
   std::vector<NamedExpression> aggregates_;

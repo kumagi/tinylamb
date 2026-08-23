@@ -2,11 +2,14 @@
 #include "executor/query_memory.hpp"
 
 #include <cstdlib>
+// setenv/unsetenv below are POSIX APIs that <cstdlib> does not declare.
+// NOLINTNEXTLINE(modernize-deprecated-headers)
+#include <stdlib.h>
 #include <string>
+#include <utility>
 
 #include "gtest/gtest.h"
 #include "type/row.hpp"
-#include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -155,15 +158,20 @@ TEST(QueryMemoryTest, QueryMemoryChargeMove) {
   budget.ResetForTest(0);
   QueryMemoryCharge a(100);
   QueryMemoryCharge c(std::move(a));
-  EXPECT_EQ(a.Bytes(), 0U);
+  // The moved-from charge must report zero bytes; verifying that contract is
+  // the point of this test (QueryMemoryCharge zeroes its source on move).
+  EXPECT_EQ(a.Bytes(), 0U);  // NOLINT(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
   EXPECT_EQ(c.Bytes(), 100U);
   EXPECT_EQ(budget.Used(), 100U);
   QueryMemoryCharge d(30);
   d = std::move(c);
-  EXPECT_EQ(c.Bytes(), 0U);
+  EXPECT_EQ(c.Bytes(), 0U);  // NOLINT(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
   EXPECT_EQ(d.Bytes(), 100U);
   EXPECT_EQ(budget.Used(), 100U);
-  d = std::move(d);
+  // Self-move must be a no-op; go through a reference so the compiler cannot
+  // prove the self-move and warn about it.
+  QueryMemoryCharge& d_alias = d;
+  d = std::move(d_alias);
   EXPECT_EQ(d.Bytes(), 100U);
   EXPECT_EQ(budget.Used(), 100U);
   d.ReleaseAll();

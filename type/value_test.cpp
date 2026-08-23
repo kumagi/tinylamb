@@ -17,19 +17,24 @@
 #include "type/value.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
-#include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "gtest/gtest.h"
 #include "type/date.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 TEST(ValueTest, DefaultConstruct) {
@@ -47,6 +52,7 @@ TEST(ValueTest, Calculate) {
   ASSERT_EQ(Value(3) - Value(4), Value(-1));
 }
 
+namespace {
 void SerializeDeserializeTest(const Value& v) {
   std::string buff;
   const size_t estimated_footprint = v.Size();
@@ -101,22 +107,39 @@ TEST(ValueTest, VarcharCopiesOwnTheReferencedBytes) {
   EXPECT_EQ(copied.value.varchar_value, "statistics-boundary");
 }
 
+TEST(ValueTest, VarcharDeserializeOwnsTheBytes) {
+  // Deserialize must copy the payload: the returned value outlives the page
+  // buffer it was decoded from.
+  const Value original(std::string("page-payload"));
+  std::string buffer(original.Size(), '\0');
+  ASSERT_EQ(original.Serialize(buffer.data()), buffer.size());
+
+  Value restored;
+  restored.Deserialize(buffer.data(), ValueType::kVarChar);
+
+  // Overwrite the source bytes; the decoded value must be unaffected.
+  buffer.assign(buffer.size(), '#');
+  EXPECT_EQ(restored.value.varchar_value, "page-payload");
+  EXPECT_EQ(restored.owned_data, "page-payload");
+}
+
 TEST(ValueTest, Dump) {
   // Arrange -- six Values of different types/levels for LOG streaming
   // Act -- stream each Value to LOG at various levels (no assertion;
-  // output-only)
+  // output-only). LOG(FATAL) aborts by contract, so the highest streamed
+  // level here is ALERT.
   LOG(TRACE) << Value(12);
   LOG(DEBUG) << Value(120214143342323);
   LOG(INFO) << Value("foo-bar");
   LOG(WARN) << Value(1.23e3);
   LOG(ERROR) << Value();
-  LOG(FATAL) << Value("foo");
+  LOG(ALERT) << Value("foo");
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
 void MemcomparableFormatEncodeTest(const std::vector<Value>& input) {
   std::vector<Value> values(input);
-  std::sort(values.begin(), values.end());
+  std::ranges::sort(values);
   std::vector<std::string> encoded;
   encoded.reserve(values.size());
   for (const auto& v : values) {
@@ -217,6 +240,10 @@ TEST(ValueTest, MemcomparableOrderDouble) {
                                  Value(-1.0), Value(0.0), Value(1.0)});
 }
 
+}  // namespace
+
+namespace {
+
 void EncodeDecodeTest(const Value& v) {
   std::string encoded = v.EncodeMemcomparableFormat();
   Value another;
@@ -262,7 +289,7 @@ TEST(ValueTest, EncodeDecodeDouble) {
 
 void MemcomparableFormatDecodeTest(const std::vector<std::string>& input) {
   std::vector<std::string> values(input);
-  std::sort(values.begin(), values.end());
+  std::ranges::sort(values);
   std::vector<Value> decoded;
   decoded.reserve(values.size());
   for (const auto& value : values) {
@@ -277,6 +304,8 @@ void MemcomparableFormatDecodeTest(const std::vector<std::string>& input) {
   }
 }
 
+}  // namespace
+
 TEST(ValueTest, MemComparableFormatDecodeInt) {
   // Arrange -- 7-byte source string and its 5040 permutations as targets
   std::string src = "\x60\x70\x80\x90\x10\x11\x12";
@@ -284,7 +313,7 @@ TEST(ValueTest, MemComparableFormatDecodeInt) {
   std::vector<std::string> targets;
   do {
     targets.emplace_back("\x01" + src + "\x01");
-  } while (std::next_permutation(src.begin(), src.end()));
+  } while (std::ranges::next_permutation(src).found);
 
   // Act + Assert -- MemcomparableFormatDecodeTest asserts decoded Values are
   // strictly ascending
@@ -303,7 +332,7 @@ TEST(ValueTest, MemComparableFormatDecodeVarchar) {
     v.push_back(static_cast<char>(v.size() - 1));
     ASSERT_EQ(v.size(), 10);
     targets.push_back(v);
-  } while (std::next_permutation(src.begin(), src.end()));
+  } while (std::ranges::next_permutation(src).found);
 
   // Act + Assert -- MemcomparableFormatDecodeTest asserts decoded Values are
   // strictly ascending
@@ -317,7 +346,7 @@ TEST(ValueTest, MemComparableFormatDecodeDouble) {
   std::vector<std::string> targets;
   do {
     targets.emplace_back("\x03" + src + "\x01");
-  } while (std::next_permutation(src.begin(), src.end()));
+  } while (std::ranges::next_permutation(src).found);
 
   // Act + Assert -- MemcomparableFormatDecodeTest asserts decoded Values are
   // strictly ascending
@@ -329,27 +358,30 @@ TEST(ValueTest, UnaryAndAggregationToString) {
   std::ostringstream unary;
   unary << UnaryOperation::kIsNull << "|" << UnaryOperation::kIsNotNull << "|"
         << UnaryOperation::kNot << "|" << UnaryOperation::kMinus << "|"
-        << static_cast<UnaryOperation>(99);
+        << static_cast<UnaryOperation>(  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+            99);  // Deliberately invalid: ToString must fall back to UNKNOWN.
   // Assert -- every enum member has a textual name, unknown falls back
   ASSERT_EQ(unary.str(), "IS NULL|IS NOT NULL|NOT|-|UNKNOWN");
 
   std::ostringstream agg;
   agg << AggregationType::kCount << "|" << AggregationType::kSum << "|"
       << AggregationType::kAvg << "|" << AggregationType::kMin << "|"
-      << AggregationType::kMax << "|" << static_cast<AggregationType>(99);
+      << AggregationType::kMax << "|"
+      << static_cast<AggregationType>(  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+          99);  // Deliberately invalid: ToString must fall back to UNKNOWN.
   ASSERT_EQ(agg.str(), "COUNT|SUM|AVG|MIN|MAX|UNKNOWN");
 }
 
 TEST(ValueTest, NullSizeAndSerialize) {
   // Arrange -- a default (null) Value
   Value v;
-  char buffer[4] = {0};
+  std::array<char, 4> buffer{};
   // Act + Assert -- null has a 1-byte serialized footprint
   ASSERT_EQ(v.Size(), 1);
-  ASSERT_EQ(v.Serialize(buffer), 1);
+  ASSERT_EQ(v.Serialize(buffer.data()), 1);
   // Act -- deserializing as kNull requires an explicit type and is rejected
   Value restored;
-  ASSERT_THROW(restored.Deserialize(buffer, ValueType::kNull),
+  ASSERT_THROW(restored.Deserialize(buffer.data(), ValueType::kNull),
                std::runtime_error);
 }
 
@@ -382,6 +414,28 @@ TEST(ValueTest, DoubleArithmetic) {
   ASSERT_EQ(Value(2.0) * Value(3.0), Value(6.0));
   ASSERT_EQ(Value(6.0) / Value(2.0), Value(3.0));
   ASSERT_EQ(Value(7) / Value(2), Value(3));
+}
+
+TEST(ValueTest, DoubleEqualityUsesEpsilon) {
+  // Equality on doubles is tolerant: accumulated sums (e.g. SUM over doubles)
+  // must compare equal to their literal, so values within 1e-9 are equal.
+  const Value one(1.0);
+  const Value neighbor(std::nextafter(1.0, 2.0));
+  EXPECT_TRUE(one == neighbor);
+  EXPECT_FALSE(one != neighbor);
+  EXPECT_TRUE(one < Value(std::nextafter(1.0 + 2e-9, 2.0)));
+  EXPECT_TRUE(one == Value(1.0 + 0.9e-9));
+  EXPECT_FALSE(one == Value(1.1));
+}
+
+TEST(ValueTest, DoubleEqualityAgreesWithHash) {
+  const double a = 1.0;
+  const double b = std::nextafter(a, 2.0);
+  std::hash<Value> hasher;
+  EXPECT_NE(hasher(Value(a)), hasher(Value(b)));
+  std::unordered_set<Value> seen;
+  seen.insert(Value(a));
+  EXPECT_EQ(seen.count(Value(b)), 0U);
 }
 
 TEST(ValueTest, ModuloAndBitwise) {
@@ -586,14 +640,20 @@ TEST(ValueTest, NonNumericArithmeticThrows) {
 TEST(ValueTest, InvalidValueTypeThrows) {
   // Arrange -- a Value with a corrupted type discriminator.
   Value broken;
-  broken.type = static_cast<ValueType>(99);
-  char buffer[16] = {0};
+  // Deliberately corrupted type discriminator: exercising the fallback paths.
+  broken.type =
+      static_cast<ValueType>(99);  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+  std::array<char, 16> buffer{};
 
   // Act + Assert -- every type-switching entry point rejects the bad type.
   ASSERT_THROW(std::ignore = broken.Size(), std::runtime_error);
-  ASSERT_THROW(broken.Serialize(buffer), std::runtime_error);
-  ASSERT_THROW(broken.Deserialize(buffer, static_cast<ValueType>(99)),
-               std::runtime_error);
+  ASSERT_THROW(broken.Serialize(buffer.data()), std::runtime_error);
+  ASSERT_THROW(
+      broken.Deserialize(
+          buffer.data(),
+          static_cast<
+              ValueType>(99)),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+      std::runtime_error);
   ASSERT_THROW(std::ignore = broken.AsString(), std::runtime_error);
   ASSERT_THROW(std::ignore = broken.EncodeMemcomparableFormat(),
                std::runtime_error);
@@ -611,10 +671,65 @@ TEST(ValueTest, DecodeMemcomparableRejectsNullAndBrokenPrefixes) {
   ASSERT_THROW(v.DecodeMemcomparableFormat("\x05"), std::runtime_error);
 }
 
-TEST(ValueTest, HashNullValueThrows) {
-  // Act + Assert -- hashing a null Value falls through to the default throw.
+TEST(ValueTest, HashNullValueIsStable) {
+  // Act + Assert -- hashing a null Value neither throws nor varies.
   std::hash<Value> hasher;
-  ASSERT_THROW(hasher(Value()), std::runtime_error);
+  ASSERT_EQ(hasher(Value()), hasher(Value()));
+  ASSERT_EQ(hasher(Value()), 0x9e3779b97f4a7c15ULL);
+}
+
+TEST(ValueTest, NullValuesSurviveUnorderedContainers) {
+  // Regression: DISTINCT/GROUP BY keep values in unordered containers; a NULL
+  // key used to throw from std::hash<Value> and crash the aggregation.
+  std::unordered_set<Value> distinct;
+  distinct.insert(Value());
+  EXPECT_EQ(distinct.count(Value()), 1U);
+  EXPECT_EQ(distinct.size(), 1U);
+  distinct.insert(Value(1));
+  EXPECT_EQ(distinct.size(), 2U);
+
+  std::unordered_map<Value, int> groups;
+  ++groups[Value()];
+  ++groups[Value()];
+  EXPECT_EQ(groups[Value()], 2);
+}
+
+// Pins derived from the value_fuzzer oracle (type/value_fuzzer.cpp): for any
+// two strings, memcomparable encoding must preserve the source total order.
+// The fuzzer explores arbitrary split points; these cases cover the boundary
+// shapes that historically break order-preserving encoders.
+TEST(ValueTest, MemcomparableVarcharFuzzerEdgeShapes) {
+  // Empty string sorts before everything; prefix sorts before extension.
+  MemcomparableFormatEncodeTest(
+      {Value(""), Value("a"), Value("ab"), Value("abc")});
+
+  // Embedded NUL bytes must not create false equalities.
+  MemcomparableFormatEncodeTest(
+      {Value(std::string("a\0b", 3)), Value(std::string("a", 1)),
+       Value(std::string("a\0", 2)), Value(std::string("a!", 2))});
+
+  // High-bit bytes keep their unsigned order after encoding.
+  MemcomparableFormatEncodeTest({Value(std::string("\x01", 1)),
+                                 Value(std::string("\x7f", 1)),
+                                 Value(std::string("\x80", 1)),
+                                 Value(std::string("\xff", 1))});
+
+  // Long shared prefixes with divergent tails.
+  MemcomparableFormatEncodeTest({
+      Value(std::string(64, 'x') + "a"),
+      Value(std::string(64, 'x') + "b"),
+      Value(std::string(63, 'x') + "za"),
+      Value(std::string(65, 'x')),
+  });
+}
+
+TEST(ValueTest, MemcomparableVarcharEmptyIsLessThanOneChar) {
+  // Explicit pairwise pin (not just sorted-vector): empty < "a".
+  const std::string empty = Value("").EncodeMemcomparableFormat();
+  const std::string one = Value("a").EncodeMemcomparableFormat();
+  EXPECT_LT(empty, one);
+  // And the encoded forms of distinct strings never collide.
+  EXPECT_NE(empty, one);
 }
 
 }  // namespace tinylamb

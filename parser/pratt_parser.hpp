@@ -33,20 +33,21 @@ class PrattParser {
   [[nodiscard]] size_t GetPos() const {
     return std::distance(begin_pos_, current_pos_);
   }
-  void SetPos(size_t p) { current_pos_ = begin_pos_ + p; }
 
  private:
   Expression ParsePrimary();
   Expression ParseUnary();
   int GetPrecedence();
 
-  Token Peek();
+  // Returns a shared EOF sentinel token at the end of input.
+  const Token& Peek();
   Token Advance();
   void Expect(TokenType type);
 
   std::vector<Token>::const_iterator begin_pos_;
   std::vector<Token>::const_iterator current_pos_;
   std::vector<Token>::const_iterator end_pos_;
+  size_t depth_{0};
 };
 
 }  // namespace tinylamb

@@ -47,49 +47,57 @@ void Try(const uint8_t* data, size_t size, bool verbose) {
   ByteStream stream(data, size);
   std::string db_name = RandomString();
   std::string log_name = db_name + ".log";
-  PageManager page_manager(db_name + ".db", 20);
-  Logger logger(log_name);
-  LockManager lm;
-  RecoveryManager rm(log_name, page_manager.GetPool());
-  TransactionManager tm(&lm, &page_manager, &logger, &rm);
-  Transaction txn = tm.Begin();
-  PageRef page = page_manager.AllocateNewPage(txn, PageType::kLeafPage);
-  std::map<std::string, std::string> kvp;
-  constexpr size_t kMaxOps = 300;
-  for (size_t op = 0; op < kMaxOps && stream.Remaining(); ++op) {
-    switch (stream.Pick(3)) {
-      case 0: {  // Insert
-        std::string key(stream.Bytes(stream.Pick(256)));
-        std::string value(stream.Bytes(stream.Pick(256)));
-        if (verbose) {
-          LOG(TRACE) << "Insert: " << key << " : " << value;
+  {
+    PageManager page_manager(db_name + ".db", 20);
+    Logger logger(log_name);
+    LockManager lm;
+    RecoveryManager rm(log_name, page_manager.GetPool());
+    TransactionManager tm(&lm, &page_manager, &logger, &rm);
+    Transaction txn = tm.Begin();
+    {
+      PageRef page = page_manager.AllocateNewPage(txn, PageType::kLeafPage);
+      std::map<std::string, std::string> kvp;
+      constexpr size_t kMaxOps = 300;
+      for (size_t op = 0; op < kMaxOps && stream.Remaining(); ++op) {
+        switch (stream.Pick(3)) {
+          case 0: {  // Insert
+            std::string key(stream.Bytes(stream.Pick(256)));
+            std::string value(stream.Bytes(stream.Pick(256)));
+            if (verbose) {
+              LOG(TRACE) << "Insert: " << key << " : " << value;
+            }
+            if (page->InsertLeaf(txn, key, value) == Status::kSuccess) {
+              kvp[key] = value;
+              ASSIGN_OR_CRASH(std::string_view, val, page->Read(txn, key));
+              assert(val == value);
+            }
+            break;
+          }
+          case 1: {  // Delete
+            std::string key(stream.Bytes(stream.Pick(256)));
+            if (verbose) {
+              LOG(TRACE) << "Delete: " << key;
+            }
+            if (page->Delete(txn, key) == Status::kSuccess) {
+              kvp.erase(key);
+            }
+            break;
+          }
+          default: {  // Verify the whole model against the page.
+            for (const auto& [key, value] : kvp) {
+              ASSIGN_OR_CRASH(std::string_view, val, page->Read(txn, key));
+              assert(val == value);
+            }
+            break;
+          }
         }
-        if (page->InsertLeaf(txn, key, value) == Status::kSuccess) {
-          kvp[key] = value;
-          ASSIGN_OR_CRASH(std::string_view, val, page->Read(txn, key));
-          assert(val == value);
-        }
-        break;
-      }
-      case 1: {  // Delete
-        std::string key(stream.Bytes(stream.Pick(256)));
-        if (verbose) {
-          LOG(TRACE) << "Delete: " << key;
-        }
-        if (page->Delete(txn, key) == Status::kSuccess) {
-          kvp.erase(key);
-        }
-        break;
-      }
-      default: {  // Verify the whole model against the page.
-        for (const auto& [key, value] : kvp) {
-          ASSIGN_OR_CRASH(std::string_view, val, page->Read(txn, key));
-          assert(val == value);
-        }
-        break;
       }
     }
+    // End the transaction explicitly instead of leaving its fate to the
+    // destructor ordering.
+    txn.Abort();
   }
+  // Remove the files only after every RAII handle above has closed them.
   std::remove((db_name + ".db").c_str());
   std::remove(log_name.c_str());
 }

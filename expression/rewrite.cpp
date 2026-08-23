@@ -2,19 +2,32 @@
 #include "expression/rewrite.hpp"
 
 #include <algorithm>
+#include <cstddef>
+#include <exception>
+#include <optional>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
+#include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -29,9 +42,11 @@ bool IsConstant(const Expression& expression) {
 }
 
 bool ConstantBool(const Expression& expression, bool* value) {
-  if (!IsConstant(expression)) return false;
+  if (!IsConstant(expression)) { return false;
+}
   const Value constant = expression->AsConstantValue().GetValue();
-  if (constant.IsNull()) return false;
+  if (constant.IsNull()) { return false;
+}
   *value = constant.Truthy();
   return true;
 }
@@ -48,6 +63,85 @@ BinaryOperation FlipComparison(BinaryOperation operation) {
       return BinaryOperation::kLessThanEquals;
     default:
       return operation;
+  }
+}
+
+BinaryOperation NegateComparison(BinaryOperation operation) {
+  switch (operation) {
+    case BinaryOperation::kEquals:
+      return BinaryOperation::kNotEquals;
+    case BinaryOperation::kNotEquals:
+      return BinaryOperation::kEquals;
+    case BinaryOperation::kLessThan:
+      return BinaryOperation::kGreaterThanEquals;
+    case BinaryOperation::kLessThanEquals:
+      return BinaryOperation::kGreaterThan;
+    case BinaryOperation::kGreaterThan:
+      return BinaryOperation::kLessThanEquals;
+    case BinaryOperation::kGreaterThanEquals:
+      return BinaryOperation::kLessThan;
+    default:
+      return operation;
+  }
+}
+
+bool IsZero(const Expression& expression) {
+  if (!IsConstant(expression)) { return false;
+}
+  const Value constant = expression->AsConstantValue().GetValue();
+  if (constant.IsNull()) { return false;
+}
+  if (constant.type == ValueType::kInt64) {
+    return constant.value.int_value == 0;
+  }
+  if (constant.type == ValueType::kDouble) {
+    return constant.value.double_value == 0.0;
+  }
+  return false;
+}
+
+bool IsOne(const Expression& expression) {
+  if (!IsConstant(expression)) { return false;
+}
+  const Value constant = expression->AsConstantValue().GetValue();
+  if (constant.IsNull()) { return false;
+}
+  if (constant.type == ValueType::kInt64) {
+    return constant.value.int_value == 1;
+  }
+  if (constant.type == ValueType::kDouble) {
+    return constant.value.double_value == 1.0;
+  }
+  return false;
+}
+
+bool IsInt64Constant(const Expression& expression) {
+  if (!IsConstant(expression)) { return false;
+}
+  const Value constant = expression->AsConstantValue().GetValue();
+  return !constant.IsNull() && constant.type == ValueType::kInt64;
+}
+
+bool HasLikeWildcard(std::string_view pattern) {
+  return pattern.find('%') != std::string_view::npos ||
+         pattern.find('_') != std::string_view::npos;
+}
+
+// Recursing per child without a bound lets attacker-controlled deeply nested
+// SQL overflow the stack and kill the whole process.
+constexpr size_t kMaxRewriteDepth = 512;
+
+// True when the expression produces an int64 regardless of input rows. Only
+// integer expressions may be reassociated: reordering floating point adds
+// changes IEEE rounding and thus the low bits of the result.
+bool StaticallyInt64(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  try {
+    return expression->ResultType(Schema()).GetType() == TypeTag::kBigInt;
+  } catch (const std::exception&) {
+    return false;
   }
 }
 
@@ -89,10 +183,12 @@ ExpressionPattern ExpressionPattern::Unary(
   return pattern;
 }
 
-bool ExpressionPattern::Match(const Expression& expression,
-                              ExpressionBindings* bindings) const {
-  if (!expression) return false;
-  if (type_ && expression->Type() != *type_) return false;
+bool ExpressionPattern::Match(  // NOLINT(misc-no-recursion)
+    const Expression& expression, ExpressionBindings* bindings) const {
+  if (!expression) { return false;
+}
+  if (type_ && expression->Type() != *type_) { return false;
+}
   if (binary_operation_ &&
       expression->AsBinaryExpression().Op() != *binary_operation_) {
     return false;
@@ -102,15 +198,18 @@ bool ExpressionPattern::Match(const Expression& expression,
     return false;
   }
   const std::vector<Expression> children = ExpressionChildren(expression);
-  if (!children_.empty() && children.size() != children_.size()) return false;
+  if (!children_.empty() && children.size() != children_.size()) { return false;
+}
 
   ExpressionBindings local = *bindings;
   if (!capture_.empty()) {
     auto [iter, inserted] = local.emplace(capture_, expression);
-    if (!inserted && !Same(iter->second, expression)) return false;
+    if (!inserted && !Same(iter->second, expression)) { return false;
+}
   }
   for (size_t i = 0; i < children_.size(); ++i) {
-    if (!children_[i].Match(children[i], &local)) return false;
+    if (!children_[i].Match(children[i], &local)) { return false;
+}
   }
   *bindings = std::move(local);
   return true;
@@ -118,7 +217,8 @@ bool ExpressionPattern::Match(const Expression& expression,
 
 Expression ExpressionRule::Apply(const Expression& expression) const {
   ExpressionBindings bindings;
-  if (!pattern_.Match(expression, &bindings)) return nullptr;
+  if (!pattern_.Match(expression, &bindings)) { return nullptr;
+}
   return rewrite_(expression, bindings);
 }
 
@@ -168,7 +268,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
       "fold_in", Is(TypeTag::kInExp),
       [](const Expression& expression, const ExpressionBindings&) {
         const std::vector<Expression> children = ExpressionChildren(expression);
-        if (!std::ranges::all_of(children, IsConstant)) return Expression{};
+        if (!std::ranges::all_of(children, IsConstant)) { return Expression{};
+}
         try {
           return ConstantValueExp(expression->Evaluate(Row(), Schema()));
         } catch (const std::exception&) {
@@ -195,7 +296,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
       "singleton_in", Is(TypeTag::kInExp),
       [](const Expression& expression, const ExpressionBindings&) {
         const auto& in = expression->AsInExpression();
-        if (in.list_.size() != 1) return Expression{};
+        if (in.list_.size() != 1) { return Expression{};
+}
         return BinaryExpressionExp(in.child_, BinaryOperation::kEquals,
                                    in.list_.front());
       }));
@@ -220,15 +322,19 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         const bool has_left = ConstantBool(bindings.at("left"), &left);
         const bool has_right = ConstantBool(bindings.at("right"), &right);
         if (operation == BinaryOperation::kAnd) {
-          if (has_left && left) return bindings.at("right");
-          if (has_right && right) return bindings.at("left");
+          if (has_left && left) { return bindings.at("right");
+}
+          if (has_right && right) { return bindings.at("left");
+}
           if ((has_left && !left) || (has_right && !right)) {
             return ConstantValueExp(Value(false));
           }
         }
         if (operation == BinaryOperation::kOr) {
-          if (has_left && !left) return bindings.at("right");
-          if (has_right && !right) return bindings.at("left");
+          if (has_left && !left) { return bindings.at("right");
+}
+          if (has_right && !right) { return bindings.at("left");
+}
           if ((has_left && left) || (has_right && right)) {
             return ConstantValueExp(Value(true));
           }
@@ -271,16 +377,354 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           changed = true;
           const Value value = condition->AsConstantValue().GetValue();
-          if (value.IsNull() || !value.Truthy()) continue;
+          if (value.IsNull() || !value.Truthy()) { continue;
+}
           otherwise = result;
           break;
         }
-        if (!changed) return Expression{};
+        if (!changed) { return Expression{};
+}
         if (clauses.empty()) {
           return otherwise ? otherwise : ConstantValueExp(Value());
         }
         return CaseExpressionExp(std::move(clauses), std::move(otherwise));
       }));
+    built.Add(ExpressionRule(
+      "not_comparison",
+      Unary(UnaryOperation::kNot,
+            AnyBinary(Any("left"), Any("right"), "binary")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const auto operation = bindings.at("binary")->AsBinaryExpression().Op();
+        if (!IsComparison(operation)) { return Expression{};
+}
+        return BinaryExpressionExp(bindings.at("left"),
+                                   NegateComparison(operation),
+                                   bindings.at("right"));
+      }));
+    built.Add(ExpressionRule(
+      "not_like",
+      Unary(UnaryOperation::kNot,
+            Binary(BinaryOperation::kLike, Any("left"), Any("right"))),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        return BinaryExpressionExp(bindings.at("left"),
+                                   BinaryOperation::kNotLike,
+                                   bindings.at("right"));
+      }));
+    built.Add(ExpressionRule(
+      "not_not_like",
+      Unary(UnaryOperation::kNot,
+            Binary(BinaryOperation::kNotLike, Any("left"), Any("right"))),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        return BinaryExpressionExp(bindings.at("left"), BinaryOperation::kLike,
+                                   bindings.at("right"));
+      }));
+    built.Add(ExpressionRule(
+      "not_is_null",
+      Unary(UnaryOperation::kNot,
+            Unary(UnaryOperation::kIsNull, Any("child"))),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        return UnaryExpressionExp(bindings.at("child"),
+                                  UnaryOperation::kIsNotNull);
+      }));
+    built.Add(ExpressionRule(
+      "not_is_not_null",
+      Unary(UnaryOperation::kNot,
+            Unary(UnaryOperation::kIsNotNull, Any("child"))),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        return UnaryExpressionExp(bindings.at("child"),
+                                  UnaryOperation::kIsNull);
+      }));
+    built.Add(ExpressionRule(
+      "xor_boolean_identity",
+      Binary(BinaryOperation::kXor, Any("left"), Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        bool left = false;
+        bool right = false;
+        const bool has_left = ConstantBool(bindings.at("left"), &left);
+        const bool has_right = ConstantBool(bindings.at("right"), &right);
+        if (has_right) {
+          if (right) {
+            return UnaryExpressionExp(bindings.at("left"),
+                                      UnaryOperation::kNot);
+          }
+          return bindings.at("left");
+        }
+        if (has_left) {
+          if (left) {
+            return UnaryExpressionExp(bindings.at("right"),
+                                      UnaryOperation::kNot);
+          }
+          return bindings.at("right");
+        }
+        return Expression{};
+      }));
+    built.Add(ExpressionRule(
+      "and_idempotent", Binary(BinaryOperation::kAnd, Any("x"), Any("x")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        return bindings.at("x");
+      }));
+    built.Add(ExpressionRule(
+      "or_idempotent", Binary(BinaryOperation::kOr, Any("x"), Any("x")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        return bindings.at("x");
+      }));
+    built.Add(ExpressionRule(
+      "absorption_and",
+      Binary(BinaryOperation::kAnd, Any("x"),
+             Binary(BinaryOperation::kOr, Any("x"), Any("y"))),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        return bindings.at("x");
+      }));
+    built.Add(ExpressionRule(
+      "absorption_and_reversed",
+      Binary(BinaryOperation::kAnd,
+             Binary(BinaryOperation::kOr, Any("x"), Any("y")), Any("x")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        return bindings.at("x");
+      }));
+    built.Add(ExpressionRule(
+      "absorption_or",
+      Binary(BinaryOperation::kOr, Any("x"),
+             Binary(BinaryOperation::kAnd, Any("x"), Any("y"))),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        return bindings.at("x");
+      }));
+    built.Add(ExpressionRule(
+      "absorption_or_reversed",
+      Binary(BinaryOperation::kOr,
+             Binary(BinaryOperation::kAnd, Any("x"), Any("y")), Any("x")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        return bindings.at("x");
+      }));
+    built.Add(ExpressionRule(
+      "identity_add_zero",
+      Binary(BinaryOperation::kAdd, Any("left"), Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        if (IsZero(bindings.at("left"))) { return bindings.at("right");
+}
+        if (IsZero(bindings.at("right"))) { return bindings.at("left");
+}
+        return Expression{};
+      }));
+    built.Add(ExpressionRule(
+      "identity_subtract_zero",
+      Binary(BinaryOperation::kSubtract, Any("left"), Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        if (!IsZero(bindings.at("right"))) { return Expression{};
+}
+        return bindings.at("left");
+      }));
+    built.Add(ExpressionRule(
+      "identity_multiply_one",
+      Binary(BinaryOperation::kMultiply, Any("left"), Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        if (IsOne(bindings.at("left"))) { return bindings.at("right");
+}
+        if (IsOne(bindings.at("right"))) { return bindings.at("left");
+}
+        return Expression{};
+      }));
+    built.Add(ExpressionRule(
+      "identity_divide_one",
+      Binary(BinaryOperation::kDivide, Any("left"), Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        if (!IsOne(bindings.at("right"))) { return Expression{};
+}
+        return bindings.at("left");
+      }));
+    built.Add(ExpressionRule(
+      "double_negation_arithmetic",
+      Unary(UnaryOperation::kMinus,
+            Unary(UnaryOperation::kMinus, Any("child"))),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        return bindings.at("child");
+      }));
+    built.Add(ExpressionRule(
+      "reassociate_add_constants",
+      Binary(BinaryOperation::kAdd,
+             Binary(BinaryOperation::kAdd, Any("inner"),
+                    Is(TypeTag::kConstantValue, "first")),
+             Is(TypeTag::kConstantValue, "second")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        if (!StaticallyInt64(bindings.at("inner")) ||
+            !IsInt64Constant(bindings.at("first")) ||
+            !IsInt64Constant(bindings.at("second"))) {
+          return Expression{};
+        }
+        try {
+          const Value folded = EvaluateBinary(
+              BinaryOperation::kAdd,
+              bindings.at("first")->AsConstantValue().GetValue(),
+              bindings.at("second")->AsConstantValue().GetValue());
+          return BinaryExpressionExp(bindings.at("inner"),
+                                     BinaryOperation::kAdd,
+                                     ConstantValueExp(folded));
+        } catch (const std::exception&) {
+          return Expression{};
+        }
+      }));
+    built.Add(ExpressionRule(
+      "reassociate_subtract_constants",
+      Binary(BinaryOperation::kSubtract,
+             Binary(BinaryOperation::kSubtract, Any("inner"),
+                    Is(TypeTag::kConstantValue, "first")),
+             Is(TypeTag::kConstantValue, "second")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        if (!StaticallyInt64(bindings.at("inner")) ||
+            !IsInt64Constant(bindings.at("first")) ||
+            !IsInt64Constant(bindings.at("second"))) {
+          return Expression{};
+        }
+        try {
+          const Value folded = EvaluateBinary(
+              BinaryOperation::kAdd,
+              bindings.at("first")->AsConstantValue().GetValue(),
+              bindings.at("second")->AsConstantValue().GetValue());
+          return BinaryExpressionExp(bindings.at("inner"),
+                                     BinaryOperation::kSubtract,
+                                     ConstantValueExp(folded));
+        } catch (const std::exception&) {
+          return Expression{};
+        }
+      }));
+    built.Add(ExpressionRule(
+      "dedupe_in_list", Is(TypeTag::kInExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& in = expression->AsInExpression();
+        std::vector<Expression> items;
+        bool changed = false;
+        for (const Expression& item : in.list_) {
+          if (std::ranges::any_of(items, [&](const Expression& kept) {
+                return Same(kept, item);
+              })) {
+            changed = true;
+            continue;
+          }
+          items.push_back(item);
+        }
+        if (!changed) { return Expression{};
+}
+        return InExpressionExp(in.child_, std::move(items));
+      }));
+    built.Add(ExpressionRule(
+      "uniform_case_result", Is(TypeTag::kCaseExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& source = expression->AsCaseExpression();
+        if (!source.else_clause_) { return Expression{};
+}
+        for (const auto& [condition, result] : source.when_clauses_) {
+          (void)condition;
+          if (!Same(result, source.else_clause_)) { return Expression{};
+}
+        }
+        return source.else_clause_;
+      }));
+    built.Add(ExpressionRule(
+      "like_equality",
+      Binary(BinaryOperation::kLike, Any("left"),
+             Is(TypeTag::kConstantValue, "pattern")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const Value pattern =
+            bindings.at("pattern")->AsConstantValue().GetValue();
+        if (pattern.IsNull() || pattern.type != ValueType::kVarChar) {
+          return Expression{};
+        }
+        if (HasLikeWildcard(pattern.value.varchar_value)) { return Expression{};
+}
+        return BinaryExpressionExp(bindings.at("left"),
+                                   BinaryOperation::kEquals,
+                                   bindings.at("pattern"));
+      }));
+    built.Add(ExpressionRule(
+      "not_like_equality",
+      Binary(BinaryOperation::kNotLike, Any("left"),
+             Is(TypeTag::kConstantValue, "pattern")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const Value pattern =
+            bindings.at("pattern")->AsConstantValue().GetValue();
+        if (pattern.IsNull() || pattern.type != ValueType::kVarChar) {
+          return Expression{};
+        }
+        if (HasLikeWildcard(pattern.value.varchar_value)) { return Expression{};
+}
+        return BinaryExpressionExp(bindings.at("left"),
+                                   BinaryOperation::kNotEquals,
+                                   bindings.at("pattern"));
+      }));
+    built.Add(ExpressionRule(
+      "is_null_of_null_check",
+      Unary(UnaryOperation::kIsNull, Is(TypeTag::kUnaryExp, "inner")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const auto inner_op = bindings.at("inner")->AsUnaryExpression().Op();
+        if (inner_op != UnaryOperation::kIsNull &&
+            inner_op != UnaryOperation::kIsNotNull) {
+          return Expression{};
+        }
+        return ConstantValueExp(Value(false));
+      }));
+    built.Add(ExpressionRule(
+      "is_not_null_of_null_check",
+      Unary(UnaryOperation::kIsNotNull, Is(TypeTag::kUnaryExp, "inner")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const auto inner_op = bindings.at("inner")->AsUnaryExpression().Op();
+        if (inner_op != UnaryOperation::kIsNull &&
+            inner_op != UnaryOperation::kIsNotNull) {
+          return Expression{};
+        }
+        return ConstantValueExp(Value(true));
+      }));
+    built.Add(ExpressionRule(
+      "reassociate_subtract_add_constants",
+      Binary(BinaryOperation::kAdd,
+             Binary(BinaryOperation::kSubtract, Any("inner"),
+                    Is(TypeTag::kConstantValue, "first")),
+             Is(TypeTag::kConstantValue, "second")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        if (!StaticallyInt64(bindings.at("inner")) ||
+            !IsInt64Constant(bindings.at("first")) ||
+            !IsInt64Constant(bindings.at("second"))) {
+          return Expression{};
+        }
+        try {
+          const Value folded = EvaluateBinary(
+              BinaryOperation::kSubtract,
+              bindings.at("second")->AsConstantValue().GetValue(),
+              bindings.at("first")->AsConstantValue().GetValue());
+          return BinaryExpressionExp(bindings.at("inner"),
+                                     BinaryOperation::kAdd,
+                                     ConstantValueExp(folded));
+        } catch (const std::exception&) {
+          return Expression{};
+        }
+      }));
+    built.Add(ExpressionRule(
+      "reassociate_add_subtract_constants",
+      Binary(BinaryOperation::kSubtract,
+             Binary(BinaryOperation::kAdd, Any("inner"),
+                    Is(TypeTag::kConstantValue, "first")),
+             Is(TypeTag::kConstantValue, "second")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        if (!StaticallyInt64(bindings.at("inner")) ||
+            !IsInt64Constant(bindings.at("first")) ||
+            !IsInt64Constant(bindings.at("second"))) {
+          return Expression{};
+        }
+        try {
+          const Value folded = EvaluateBinary(
+              BinaryOperation::kSubtract,
+              bindings.at("first")->AsConstantValue().GetValue(),
+              bindings.at("second")->AsConstantValue().GetValue());
+          return BinaryExpressionExp(bindings.at("inner"),
+                                     BinaryOperation::kAdd,
+                                     ConstantValueExp(folded));
+        } catch (const std::exception&) {
+          return Expression{};
+        }
+      }));
+    // NOTE: "complementary_absorption" rules (x AND (NOT x OR y) -> x AND y)
+    // were removed: they are valid only in two-valued logic and produce wrong
+    // results under SQL three-valued logic (x = NULL, y = FALSE gives
+    // UNKNOWN on the left side but FALSE on the right).
     return built;
   }();
   return rules;
@@ -289,19 +733,25 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 Expression ExpressionRewriter::Rewrite(const Expression& expression) const {
   Expression current = expression;
   for (size_t pass = 0; pass < 32; ++pass) {
-    Expression next = RewriteOnce(current);
-    if (Same(current, next)) return next;
+    Expression next = RewriteOnce(current, 0);
+    if (Same(current, next)) { return next;
+}
     current = std::move(next);
   }
   throw std::runtime_error("expression rewrite did not converge");
 }
 
-Expression ExpressionRewriter::RewriteOnce(const Expression& expression) const {
-  if (!expression) return nullptr;
+Expression ExpressionRewriter::RewriteOnce(  // NOLINT(misc-no-recursion)
+    const Expression& expression, size_t depth) const {
+  if (!expression) { return nullptr;
+}
+  if (depth >= kMaxRewriteDepth) {
+    throw std::runtime_error("expression too deep");
+  }
   std::vector<Expression> children = ExpressionChildren(expression);
   bool children_changed = false;
   for (Expression& child : children) {
-    Expression rewritten = RewriteOnce(child);
+    Expression rewritten = RewriteOnce(child, depth + 1);
     children_changed |= !Same(child, rewritten);
     child = std::move(rewritten);
   }
@@ -309,13 +759,15 @@ Expression ExpressionRewriter::RewriteOnce(const Expression& expression) const {
       children_changed ? WithExpressionChildren(expression, std::move(children))
                        : expression;
   for (const ExpressionRule& rule : rules_->Rules()) {
-    if (Expression replacement = rule.Apply(current)) return replacement;
+    if (Expression replacement = rule.Apply(current)) { return replacement;
+}
   }
   return current;
 }
 
 std::vector<Expression> ExpressionChildren(const Expression& expression) {
-  if (!expression) return {};
+  if (!expression) { return {};
+}
   switch (expression->Type()) {
     case TypeTag::kBinaryExp: {
       const auto& binary = expression->AsBinaryExpression();
@@ -328,7 +780,7 @@ std::vector<Expression> ExpressionChildren(const Expression& expression) {
     case TypeTag::kCaseExp: {
       const auto& case_expression = expression->AsCaseExpression();
       std::vector<Expression> children;
-      children.reserve(case_expression.when_clauses_.size() * 2 + 1);
+      children.reserve((case_expression.when_clauses_.size() * 2) + 1);
       for (const auto& [condition, result] : case_expression.when_clauses_) {
         children.push_back(condition);
         children.push_back(result);
@@ -359,17 +811,20 @@ Expression WithExpressionChildren(const Expression& expression,
                                   std::vector<Expression> children) {
   switch (expression->Type()) {
     case TypeTag::kBinaryExp: {
-      if (children.size() != 2) throw std::invalid_argument("binary arity");
+      if (children.size() != 2) { throw std::invalid_argument("binary arity");
+}
       return BinaryExpressionExp(std::move(children[0]),
                                  expression->AsBinaryExpression().Op(),
                                  std::move(children[1]));
     }
     case TypeTag::kUnaryExp:
-      if (children.size() != 1) throw std::invalid_argument("unary arity");
+      if (children.size() != 1) { throw std::invalid_argument("unary arity");
+}
       return UnaryExpressionExp(std::move(children[0]),
                                 expression->AsUnaryExpression().Op());
     case TypeTag::kAggregateExp: {
-      if (children.size() != 1) throw std::invalid_argument("aggregate arity");
+      if (children.size() != 1) { throw std::invalid_argument("aggregate arity");
+}
       const auto& aggregate = expression->AsAggregateExpression();
       return AggregateExpressionExp(aggregate.GetType(), std::move(children[0]),
                                     aggregate.Distinct());
@@ -377,9 +832,10 @@ Expression WithExpressionChildren(const Expression& expression,
     case TypeTag::kCaseExp: {
       const auto& source = expression->AsCaseExpression();
       const size_t required =
-          source.when_clauses_.size() * 2 + (source.else_clause_ ? 1 : 0);
-      if (children.size() != required)
+          (source.when_clauses_.size() * 2) + (source.else_clause_ ? 1 : 0);
+      if (children.size() != required) {
         throw std::invalid_argument("case arity");
+}
       std::vector<std::pair<Expression, Expression>> clauses;
       clauses.reserve(source.when_clauses_.size());
       size_t offset = 0;
@@ -393,7 +849,8 @@ Expression WithExpressionChildren(const Expression& expression,
       return CaseExpressionExp(std::move(clauses), std::move(otherwise));
     }
     case TypeTag::kInExp: {
-      if (children.empty()) throw std::invalid_argument("in arity");
+      if (children.empty()) { throw std::invalid_argument("in arity");
+}
       Expression child = std::move(children.front());
       children.erase(children.begin());
       return InExpressionExp(std::move(child), std::move(children));
@@ -403,19 +860,23 @@ Expression WithExpressionChildren(const Expression& expression,
                              std::move(children));
     case TypeTag::kQueryExp: {
       const auto& query = expression->AsQueryExpression();
-      if (children.size() > 1) throw std::invalid_argument("query arity");
+      if (children.size() > 1) { throw std::invalid_argument("query arity");
+}
       return QueryExpressionExp(query.Query(),
                                 children.empty() ? nullptr : children.front(),
                                 query.Exists(), query.Negated());
     }
     default:
-      if (!children.empty()) throw std::invalid_argument("leaf has children");
+      if (!children.empty()) { throw std::invalid_argument("leaf has children");
+}
       return expression;
   }
 }
 
-std::vector<Expression> SplitConjuncts(const Expression& expression) {
-  if (!expression) return {};
+std::vector<Expression> SplitConjuncts(  // NOLINT(misc-no-recursion)
+    const Expression& expression) {
+  if (!expression) { return {};
+}
   if (expression->Type() == TypeTag::kBinaryExp &&
       expression->AsBinaryExpression().Op() == BinaryOperation::kAnd) {
     std::vector<Expression> left =
@@ -429,7 +890,8 @@ std::vector<Expression> SplitConjuncts(const Expression& expression) {
 }
 
 Expression CombineConjuncts(const std::vector<Expression>& expressions) {
-  if (expressions.empty()) return ConstantValueExp(Value(true));
+  if (expressions.empty()) { return ConstantValueExp(Value(true));
+}
   Expression result = expressions.front();
   for (size_t i = 1; i < expressions.size(); ++i) {
     result = BinaryExpressionExp(std::move(result), BinaryOperation::kAnd,
@@ -440,13 +902,13 @@ Expression CombineConjuncts(const std::vector<Expression>& expressions) {
 
 bool ReferencesOnly(const Expression& expression,
                     const std::unordered_set<std::string>& relation_names) {
-  if (!expression) return true;
-  for (const ColumnName& column : expression->TouchedColumns()) {
-    if (column.schema.empty() || !relation_names.contains(column.schema)) {
-      return false;
-    }
-  }
-  return true;
+  if (!expression) { return true;
+}
+  return std::ranges::all_of(expression->TouchedColumns(),
+                             [&](const ColumnName& column) {
+                               return !column.schema.empty() &&
+                                      relation_names.contains(column.schema);
+                             });
 }
 
 }  // namespace tinylamb

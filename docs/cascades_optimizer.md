@@ -43,6 +43,8 @@ The built-in logical rules are:
 
 - `join_commutativity`
 - `join_enumeration`
+- `join_associativity_left`
+- `join_associativity_right`
 
 The built-in physical rules are:
 
@@ -60,13 +62,17 @@ list already matches the child schema one-to-one.
 
 Scalar defaults include constant folding for binary, unary, and `IN`
 expressions, comparison canonicalization, boolean identities, singleton `IN`
-lowering, double negation, De Morgan, constant `CASE` pruning, `NOT`
-comparison unwrapping, negated NULL checks, arithmetic identities (`x + 0`,
-`x * 1`), AND/OR idempotence, OR-of-equalities to `IN`, `IN` list dedupe,
-equality transitivity derivation (`a = b AND b = 5` derives `a = 5`),
-wildcard-free and prefix `LIKE` lowering to equality/range bounds, redundant
-`DISTINCT` removal on `MIN`/`MAX`, and boolean `XOR` identities. Rewriting is
-bottom-up and continues to a fixed point.
+
+lowering, double-negation, De Morgan, and constant `CASE` pruning. Further
+normalizations cover `NOT` push-down over comparisons, `LIKE`, and null
+checks; XOR boolean identities; idempotence (`x AND x`) and absorption
+(`x AND (x OR y)`); arithmetic identities (`x + 0`, `x * 1`, `-(-x)`);
+constant reassociation (`(x + 1) + 2` to `x + 3`); duplicate elimination in
+`IN` lists; and uniform-result `CASE` flattening. Wildcard-free `LIKE`
+constants become equality comparisons, stacked null checks collapse to
+constants, `(x - c1) + c2` style mixed reassociation merges the constants,
+and `x AND (NOT x OR y)` shrinks to `x AND y`. Rewriting is bottom-up and
+continues to a fixed point.
 
 ## Selecting rules per optimization
 

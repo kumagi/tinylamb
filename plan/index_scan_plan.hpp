@@ -17,12 +17,13 @@
 #ifndef TINYLAMB_INDEX_SCAN_PLAN_HPP
 #define TINYLAMB_INDEX_SCAN_PLAN_HPP
 
+#include <utility>
+#include <vector>
+
 #include "plan/plan.hpp"
 #include "table/table_statistics.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
-
-#include <vector>
 
 namespace tinylamb {
 class Index;
@@ -34,6 +35,13 @@ class IndexScanPlan final : public PlanBase {
                 const TableStatistics& ts, std::vector<Value> begin_key,
                 std::vector<Value> end_key, bool ascending, Expression where,
                 std::vector<ColumnName> provided_order = {});
+  // Point-union access for constant IN lists: one [begin,end] pair per
+  // distinct value. Ordering credit only survives a single range.
+  IndexScanPlan(
+      const Table& table, const Index& index, const TableStatistics& ts,
+      std::vector<std::pair<std::vector<Value>, std::vector<Value>>> ranges,
+      bool ascending, Expression where,
+      std::vector<ColumnName> provided_order = {});
   IndexScanPlan(const IndexScanPlan&) = delete;
   IndexScanPlan(IndexScanPlan&&) = delete;
   IndexScanPlan& operator=(const IndexScanPlan&) = delete;
@@ -61,6 +69,7 @@ class IndexScanPlan final : public PlanBase {
   TableStatistics stats_;
   std::vector<Value> begin_key_;
   std::vector<Value> end_key_;
+  std::vector<std::pair<std::vector<Value>, std::vector<Value>>> point_ranges_;
   bool ascending_;
   Expression where_;
   std::vector<ColumnName> provided_order_;

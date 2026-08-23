@@ -14,21 +14,22 @@
  * limitations under the License.
  */
 
-// inFullScan(txn)) {}
 //  Created by kumagi on 2022/02/21.
 //
 
 #include "executor/full_scan.hpp"
 
+#include <cstddef>
 #include <ostream>
 
+#include "executor/data_chunk.hpp"
 #include "table/table.hpp"
 
 namespace tinylamb {
 FullScan::FullScan(Transaction& txn, const Table& table)
     : table_(&table), iter_(table_->BeginFullScan(txn)) {}
 
-bool tinylamb::FullScan::Next(Row* dst, RowPosition* rp) {
+bool FullScan::Next(Row* dst, RowPosition* rp) {
   if (!iter_.IsValid()) {
     return false;
   }

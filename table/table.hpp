@@ -29,6 +29,7 @@
 #include "index/index.hpp"
 #include "iterator.hpp"
 #include "page/row_position.hpp"
+#include "table/scan_options.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
 
@@ -75,21 +76,51 @@ class Table {
 
   StatusOr<Row> Read(Transaction& txn, RowPosition pos) const;
 
-  Iterator BeginFullScan(Transaction& txn) const;
   Iterator BeginFullScan(Transaction& txn,
-                         const std::vector<slot_t>& projection) const;
+                         const TableScanOptions& options = {}) const;
+  // Backward-compatible overloads forwarding to TableScanOptions.
+  Iterator BeginFullScan(
+      Transaction& txn,
+      const std::vector<IntegerPeekCompare>* peek_compares) const {
+    TableScanOptions options;
+    options.peek_compares = peek_compares;
+    return BeginFullScan(txn, options);
+  }
   Iterator BeginFullScan(
       Transaction& txn, const std::vector<slot_t>& projection,
-      const std::unordered_set<int64_t>* key_filter,
-      slot_t key_column) const;
-  Iterator BeginFullScan(Transaction& txn,
-                         const std::unordered_set<int64_t>* key_filter,
-                         slot_t key_column) const;
+      const std::vector<IntegerPeekCompare>* peek_compares = nullptr) const {
+    TableScanOptions options;
+    options.projection = projection;
+    options.peek_compares = peek_compares;
+    return BeginFullScan(txn, options);
+  }
+  Iterator BeginFullScan(
+      Transaction& txn, const std::vector<slot_t>& projection,
+      const std::unordered_set<int64_t>* key_filter, slot_t key_column,
+      const std::vector<IntegerPeekCompare>* peek_compares = nullptr) const {
+    TableScanOptions options;
+    options.projection = projection;
+    options.key_filter = key_filter;
+    options.key_column = key_column;
+    options.peek_compares = peek_compares;
+    return BeginFullScan(txn, options);
+  }
+  Iterator BeginFullScan(
+      Transaction& txn, const std::unordered_set<int64_t>* key_filter,
+      slot_t key_column,
+      const std::vector<IntegerPeekCompare>* peek_compares = nullptr) const {
+    TableScanOptions options;
+    options.key_filter = key_filter;
+    options.key_column = key_column;
+    options.peek_compares = peek_compares;
+    return BeginFullScan(txn, options);
+  }
   Iterator BeginMorselScan(
       Transaction& txn, const ScanMorsel& pages,
       std::optional<std::vector<slot_t>> projection = std::nullopt,
       const std::unordered_set<int64_t>* key_filter = nullptr,
-      std::optional<slot_t> key_column = std::nullopt) const;
+      std::optional<slot_t> key_column = std::nullopt,
+      const std::vector<IntegerPeekCompare>* peek_compares = nullptr) const;
   [[nodiscard]] std::vector<ScanMorsel> BuildScanMorsels(
       Transaction& txn, size_t pages_per_morsel = 8) const;
   Iterator BeginIndexScan(Transaction& txn, const Index& index,
@@ -97,8 +128,8 @@ class Table {
                           const Value& end = Value(),
                           bool ascending = true) const;
   Iterator BeginIndexScan(Transaction& txn, const Index& index,
-                          std::vector<Value> begin_key,
-                          std::vector<Value> end_key,
+                          const std::vector<Value>& begin_key,
+                          const std::vector<Value>& end_key,
                           bool ascending = true) const;
 
   [[nodiscard]] std::unordered_map<slot_t, size_t> AvailableKeyIndex() const;
@@ -115,11 +146,11 @@ class Table {
   }
 
  private:
-  Status IndexInsert(Transaction& txn, const Index& idx, const Row& new_row,
+  static Status IndexInsert(Transaction& txn, const Index& idx, const Row& new_row,
                      const RowPosition& pos);
   Status IndexDelete(Transaction& txn, const Index& idx,
-                     const RowPosition& pos);
-  Status IndexDelete(Transaction& txn, const Index& idx, const RowPosition& pos,
+                     const RowPosition& pos) const;
+  static Status IndexDelete(Transaction& txn, const Index& idx, const RowPosition& pos,
                      const Row& original_row);
 
   friend class Database;

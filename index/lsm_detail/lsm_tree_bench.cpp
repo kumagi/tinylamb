@@ -13,13 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <leveldb/db.h>
-#include <leveldb/iterator.h>
-#include <leveldb/status.h>
-// #include <rocksdb/db.h>
-// #include <rocksdb/metadata.h>
-// #include <rocksdb/options.h>
-
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -27,30 +20,32 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
-#include <memory>
 #include <random>
 #include <set>
 #include <string>
 #include <string_view>
 
-#include "common/constants.hpp"
-#include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "index/lsm_tree.hpp"
 #include "lsm_view.hpp"
 
 using namespace tinylamb;
 
-static void Bench(size_t count, const std::function<void()>& fun,
-                  std::string_view name, std::string_view unit) {
-  auto begin = std::chrono::system_clock::now();
+namespace {
+void Bench(size_t count, const std::function<void()>& fun,
+           std::string_view name, std::string_view unit) {
+  auto begin = std::chrono::steady_clock::now();
   fun();
-  auto finish = std::chrono::system_clock::now();
-  int us = std::chrono::duration_cast<std::chrono::milliseconds>(finish - begin)
+  auto finish = std::chrono::steady_clock::now();
+  int ms = std::chrono::duration_cast<std::chrono::milliseconds>(finish - begin)
                .count();
-  std::cout << std::setw(25) << name << ": " << (double)count / us << " "
+  if (ms == 0) {
+    ms = 1;
+  }
+  std::cout << std::setw(25) << name << ": " << (double)count / ms << " "
             << unit << "\n";
 }
+}  // namespace
 
 int main(int argc, char** argv) {
   std::set<char> opts;
@@ -60,82 +55,19 @@ int main(int argc, char** argv) {
       opts.emplace(j);
     }
   }
+  if (opts.empty()) {
+    opts.emplace('k');
+    opts.emplace('s');
+    opts.emplace('m');
+  }
   std::random_device rd;
   std::mt19937 random(rd());
   size_t kCount = 500000;
 
-  if (opts.contains('l')) {
-    std::filesystem::path ldb_path = "leveldb-" + RandomString() + "-";
-    leveldb::DB* ldb = nullptr;
-    std::unique_ptr<leveldb::DB> ptr;
-    leveldb::Options options;
-    options.create_if_missing = true;
-    leveldb::Status status = leveldb::DB::Open(options, ldb_path.c_str(), &ldb);
-    ptr.reset(ldb);
-
-    if (!status.ok()) {
-      LOG(FATAL) << "Unable to open/create test database " << ldb_path << " : "
-                 << status.ToString();
-      return -1;
-    }
-    Bench(
-        kCount,
-        [&]() {
-          leveldb::WriteOptions wo;
-          for (size_t i = 0; i < kCount; ++i) {
-            ldb->Put(wo, std::to_string(i), std::to_string(i));
-          }
-        },
-        "LDB Write", "writes/ms");
-    if (opts.contains('s')) {
-      Bench(
-          kCount,
-          [&]() {
-            leveldb::ReadOptions ro;
-            for (size_t i = 0; i < kCount; ++i) {
-              std::string val;
-              std::string key = std::to_string(random() % kCount);
-              auto v = ldb->Get(ro, key, &val);
-            }
-          },
-          "LDB Success Find", "reads/ms");
-    }
-    if (opts.contains('f')) {
-      Bench(
-          kCount,
-          [&]() {
-            leveldb::ReadOptions ro;
-            for (size_t i = 0; i < kCount; ++i) {
-              std::string val;
-              std::string key = std::to_string(random() % kCount) + "k";
-              volatile auto v = ldb->Get(ro, key, &val);
-            }
-          },
-          "LDB Failed Find", "reads/ms");
-    }
-    if (opts.contains('i')) {
-      Bench(
-          kCount,
-          [&]() {
-            leveldb::ReadOptions ro;
-            leveldb::Iterator* it = ldb->NewIterator(ro);
-            for (it->SeekToFirst(); it->Valid(); it->Next()) {
-              volatile std::string key = it->key().ToString();
-              volatile std::string value = it->value().ToString();
-            }
-            assert(it->status().ok());
-            delete it;
-          },
-          "LDB Full Scan", "reads/ms");
-    }
-    std::filesystem::remove_all(ldb_path);
-  }
-
   if (opts.contains('k')) {
     std::filesystem::path path = "tmp_blob_file_test-" + RandomString();
     std::filesystem::create_directory(path);
-    std::string blob_path = path / "blob.db";
-    LSMTree tree(blob_path);
+    LSMTree tree(path);
     Bench(
         kCount,
         [&]() {
@@ -173,9 +105,11 @@ int main(int argc, char** argv) {
       Bench(
           kCount,
           [&]() {
+            volatile size_t sink = 0;
             for (LSMView::Iterator it = vm.Begin(); it.IsValid(); ++it) {
-              volatile std::string key = it.Key();
-              volatile std::string value = it.Value();
+              std::string key = it.Key();
+              std::string value = it.Value();
+              sink += key.size() + value.size();
             }
           },
           "KDB Full Scan before merge", "reads/ms");
@@ -208,9 +142,11 @@ int main(int argc, char** argv) {
         Bench(
             kCount,
             [&]() {
+              volatile size_t sink = 0;
               for (LSMView::Iterator it = vm2.Begin(); it.IsValid(); ++it) {
-                volatile std::string key = it.Key();
-                volatile std::string value = it.Value();
+                std::string key = it.Key();
+                std::string value = it.Value();
+                sink += key.size() + value.size();
               }
             },
             "KDB Full Scan after merge", "reads/ms");

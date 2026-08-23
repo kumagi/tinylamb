@@ -39,7 +39,8 @@ namespace tinylamb {
 // stream (Insert / Delete / Read / Verify) with key and value bytes taken from
 // the same buffer, so libFuzzer can evolve exact key bytes and interleavings
 // that push page splits, foster children, and rebalances.
-void Try(const uint8_t* data, size_t size, bool verbose) {
+inline void Try(const uint8_t* data, size_t size, bool verbose) {
+  RandomStringInitialize();
   ByteStream stream(data, size);
   std::string db_name = RandomString();
   std::string log_name = db_name + ".log";

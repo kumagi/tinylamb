@@ -1,0 +1,19 @@
+name: tsan
+on: [ push, pull_request ]
+jobs:
+  concurrency:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build and test concurrency subset
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DTINYLAMB_ENABLE_TSAN=ON \
+            -DTINYLAMB_ENABLE_GOOGLESQL=OFF
+          cmake --build build -j"$(nproc)"
+          ctest --test-dir build -R 'lock_manager|cache_concurrent|page_pool' \
+            -j"$(nproc)" --output-on-failure

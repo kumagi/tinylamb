@@ -4,11 +4,20 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdint>
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <cctype>
+#include <string>
+#include <string_view>
+#include "type/value.hpp"
+#include "type/value_type.hpp"
+#include <vector>
+#include "type/row.hpp"
 
 namespace tinylamb::pgwire {
 namespace {
@@ -18,18 +27,18 @@ void AppendCString(std::string* output, std::string_view value) {
   output->push_back('\0');
 }
 
-std::string Message(char type, std::string payload) {
+std::string Message(char type, const std::string& payload) {
   std::string result;
   result.reserve(payload.size() + 5);
   result.push_back(type);
   AppendUint32(&result, static_cast<uint32_t>(payload.size() + 4));
-  result += std::move(payload);
+  result += payload;
   return result;
 }
 
 std::string SanitizeField(std::string_view value) {
   std::string result(value);
-  std::replace(result.begin(), result.end(), '\0', ' ');
+  std::ranges::replace(result, '\0', ' ');
   return result;
 }
 
@@ -61,21 +70,22 @@ struct PgType {
 PgType ToPgType(ValueType type) {
   switch (type) {
     case ValueType::kInt64:
-      return {20, 8};  // int8
+      return {.oid=20, .length=8};  // int8
     case ValueType::kDouble:
-      return {701, 8};  // float8
+      return {.oid=701, .length=8};  // float8
     case ValueType::kDate:
-      return {1082, 4};  // date
+      return {.oid=1082, .length=4};  // date
     case ValueType::kNull:
     case ValueType::kVarChar:
-      return {25, -1};  // text
+      return {.oid=25, .length=-1};  // text
   }
-  return {25, -1};
+  return {.oid=25, .length=-1};
 }
 
 std::string Trim(std::string_view value) {
   const size_t begin = value.find_first_not_of(" \t\r\n");
-  if (begin == std::string_view::npos) return {};
+  if (begin == std::string_view::npos) { return {};
+}
   const size_t end = value.find_last_not_of(" \t\r\n");
   return std::string(value.substr(begin, end - begin + 1));
 }
@@ -154,21 +164,21 @@ std::optional<StartupPacket> ParseStartupPacket(std::string_view packet,
 std::string AuthenticationOk() {
   std::string payload;
   AppendUint32(&payload, 0);
-  return Message('R', std::move(payload));
+  return Message('R', payload);
 }
 
 std::string ParameterStatus(std::string_view name, std::string_view value) {
   std::string payload;
   AppendCString(&payload, name);
   AppendCString(&payload, value);
-  return Message('S', std::move(payload));
+  return Message('S', payload);
 }
 
 std::string BackendKeyData(uint32_t process_id, uint32_t secret_key) {
   std::string payload;
   AppendUint32(&payload, process_id);
   AppendUint32(&payload, secret_key);
-  return Message('K', std::move(payload));
+  return Message('K', payload);
 }
 
 std::string ReadyForQuery(char transaction_status) {
@@ -186,12 +196,17 @@ std::string ErrorResponse(std::string_view message, std::string_view sqlstate) {
   payload.push_back('M');
   AppendCString(&payload, SanitizeField(message));
   payload.push_back('\0');
-  return Message('E', std::move(payload));
+  return Message('E', payload);
 }
 
 std::string EmptyQueryResponse() { return Message('I', {}); }
 
 std::string RowDescription(const std::vector<ColumnDescription>& columns) {
+  if (columns.size() > std::numeric_limits<uint16_t>::max()) {
+    // The wire format declares the column count as uint16; truncating would
+    // desynchronize the protocol stream.
+    throw std::runtime_error("too many columns for PostgreSQL protocol");
+  }
   std::string payload;
   AppendUint16(&payload, static_cast<uint16_t>(columns.size()));
   for (const ColumnDescription& column : columns) {
@@ -204,10 +219,13 @@ std::string RowDescription(const std::vector<ColumnDescription>& columns) {
     AppendUint32(&payload, std::numeric_limits<uint32_t>::max());
     AppendUint16(&payload, 0);  // Text format.
   }
-  return Message('T', std::move(payload));
+  return Message('T', payload);
 }
 
 std::string DataRow(const Row& row) {
+  if (row.values_.size() > std::numeric_limits<uint16_t>::max()) {
+    throw std::runtime_error("too many values for PostgreSQL protocol");
+  }
   std::string payload;
   AppendUint16(&payload, static_cast<uint16_t>(row.values_.size()));
   for (const Value& value : row.values_) {
@@ -219,13 +237,13 @@ std::string DataRow(const Row& row) {
     AppendUint32(&payload, static_cast<uint32_t>(text.size()));
     payload.append(text);
   }
-  return Message('D', std::move(payload));
+  return Message('D', payload);
 }
 
 std::string CommandComplete(std::string_view tag) {
   std::string payload;
   AppendCString(&payload, tag);
-  return Message('C', std::move(payload));
+  return Message('C', payload);
 }
 
 std::string NegotiateProtocolVersion(
@@ -237,72 +255,110 @@ std::string NegotiateProtocolVersion(
   for (const std::string& parameter : unsupported_parameters) {
     AppendCString(&payload, parameter);
   }
-  return Message('v', std::move(payload));
+  return Message('v', payload);
 }
 
 std::vector<std::string> SplitSqlStatements(std::string_view sql) {
   std::vector<std::string> statements;
-  size_t statement_begin = 0;
+  std::string current;
+  // Length of `current` up to the last character that is neither whitespace
+  // nor comment bytes. A trailing comment (or trailing whitespace/comment
+  // run) after the final real token of a statement is dropped, so a client
+  // sending "select 1; -- note" does not get a bogus second statement.
+  size_t meaningful = 0;
   bool single_quote = false;
   bool double_quote = false;
   bool backtick_quote = false;
   bool line_comment = false;
   bool block_comment = false;
+  const auto Append = [&](char c) {
+    current.push_back(c);
+    if (!std::isspace(static_cast<unsigned char>(c))) {
+      meaningful = current.size();
+    }
+  };
+  const auto FlushCurrent = [&]() {
+    current.resize(meaningful);
+    current = Trim(current);
+    if (!current.empty()) {
+      statements.push_back(current);
+    }
+    current.clear();
+    meaningful = 0;
+  };
   for (size_t i = 0; i < sql.size(); ++i) {
-    const char current = sql[i];
+    const char current_char = sql[i];
     const char next = i + 1 < sql.size() ? sql[i + 1] : '\0';
     if (line_comment) {
-      if (current == '\n') line_comment = false;
+      // Comment bytes are buffered verbatim but do not count as meaningful;
+      // a trailing comment with no real content after it is dropped at
+      // flush time (see `meaningful`).
+      current.push_back(current_char);
+      if (current_char == '\n') {
+        line_comment = false;
+      }
       continue;
     }
     if (block_comment) {
-      if (current == '*' && next == '/') {
+      current.push_back(current_char);
+      if (current_char == '*' && next == '/') {
         block_comment = false;
         ++i;
+        current.push_back('/');
       }
       continue;
     }
     if (!single_quote && !double_quote && !backtick_quote) {
-      if (current == '-' && next == '-') {
+      if (current_char == '-' && next == '-') {
         line_comment = true;
         ++i;
+        current.push_back(current_char);
+        current.push_back('-');
         continue;
       }
-      if (current == '/' && next == '*') {
+      if (current_char == '/' && next == '*') {
         block_comment = true;
         ++i;
+        current.push_back(current_char);
+        current.push_back('*');
         continue;
       }
     }
-    if (!double_quote && !backtick_quote && current == '\'') {
+    if (!double_quote && !backtick_quote && current_char == '\'') {
       if (single_quote && next == '\'') {
         ++i;
-      } else {
-        single_quote = !single_quote;
+        Append(current_char);
+        Append(next);
+        continue;
       }
+      single_quote = !single_quote;
+      Append(current_char);
       continue;
     }
-    if (!single_quote && !backtick_quote && current == '"') {
+    if (!single_quote && !backtick_quote && current_char == '"') {
       if (double_quote && next == '"') {
         ++i;
-      } else {
-        double_quote = !double_quote;
+        Append(current_char);
+        Append(next);
+        continue;
       }
+      double_quote = !double_quote;
+      Append(current_char);
       continue;
     }
-    if (!single_quote && !double_quote && current == '`') {
+    if (!single_quote && !double_quote && current_char == '`') {
       backtick_quote = !backtick_quote;
+      Append(current_char);
       continue;
     }
-    if (current == ';' && !single_quote && !double_quote && !backtick_quote) {
-      std::string statement =
-          Trim(sql.substr(statement_begin, i - statement_begin));
-      if (!statement.empty()) statements.push_back(std::move(statement));
-      statement_begin = i + 1;
+    if (current_char == ';' && !single_quote && !double_quote &&
+        !backtick_quote) {
+      FlushCurrent();
+      continue;
     }
+    Append(current_char);
   }
-  std::string statement = Trim(sql.substr(statement_begin));
-  if (!statement.empty()) statements.push_back(std::move(statement));
+  FlushCurrent();
   return statements;
 }
 

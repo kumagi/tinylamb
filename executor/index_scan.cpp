@@ -43,27 +43,74 @@ IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
                 ascending, std::move(where), sc) {}
 
 IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
-                     std::vector<Value> begin_key, std::vector<Value> end_key,
-                     bool ascending, Expression where, const Schema& sc)
-    : iter_(new IndexScanIterator(table, index, txn, std::move(begin_key),
-                                  std::move(end_key), ascending)),
+                     const std::vector<Value>& begin_key,
+                     const std::vector<Value>& end_key,
+                     bool ascending, Expression where, Schema sc)
+    : txn_(txn),
+      table_(table),
+      index_(index),
+      ascending_(ascending),
+      iter_(new IndexScanIterator(table, index, txn, begin_key, end_key,
+                                  ascending)),
       cond_(std::move(where)),
-      schema_(sc) {}
+      schema_(std::move(sc)) {}
+
+IndexScan::IndexScan(
+    Transaction& txn, const Table& table, const Index& index,
+    std::vector<std::pair<std::vector<Value>, std::vector<Value>>> ranges,
+    bool ascending, Expression where, Schema sc)
+    : txn_(txn),
+      table_(table),
+      index_(index),
+      ascending_(ascending),
+      // Contract: at least one range. Callers build one entry per distinct
+      // IN value.
+      iter_(new IndexScanIterator(
+          table, index, txn,
+          ranges.empty() ? std::vector<Value>{} : ranges.front().first,
+          ranges.empty() ? std::vector<Value>{} : ranges.front().second,
+          ascending)),
+      cond_(std::move(where)),
+      schema_(std::move(sc)) {
+  if (!ranges.empty()) {
+    pending_.assign(std::make_move_iterator(ranges.begin()) + 1,
+                    std::make_move_iterator(ranges.end()));
+  }
+}
+
+void IndexScan::OpenRange(const std::vector<Value>& begin_key,
+                          const std::vector<Value>& end_key) {
+  iter_ = Iterator(new IndexScanIterator(table_, index_, txn_, begin_key,
+                                         end_key, ascending_));
+}
 
 bool IndexScan::Next(Row* dst, RowPosition* rp) {
-  while (iter_.IsValid()) {
+  for (;;) {
+    while (!iter_.IsValid()) {
+      if (pending_.empty()) { return false;
+}
+      auto range = std::move(pending_.front());
+      pending_.erase(pending_.begin());
+      OpenRange(range.first, range.second);
+    }
     const RowPosition pointed_row = iter_.Position();
     *dst = *iter_;
     ++iter_;
-    if (!dst->IsValid()) continue;
-    if (rp != nullptr) *rp = pointed_row;
-    if (cond_->Evaluate(*dst, schema_).Truthy()) return true;
+    if (!dst->IsValid()) { continue;
+}
+    if (rp != nullptr) { *rp = pointed_row;
+}
+    if (cond_ && !cond_->Evaluate(*dst, schema_).Truthy()) { continue;
+}
+    return true;
   }
-  return false;
 }
 
 void IndexScan::Dump(std::ostream& o, int /*indent*/) const {
-  o << "IndexScan: " << iter_ << " WHERE " << *cond_;
+  o << "IndexScan: " << iter_;
+  if (cond_) {
+    o << " WHERE " << *cond_;
+  }
 }
 
 }  // namespace tinylamb

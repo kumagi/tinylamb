@@ -16,6 +16,11 @@
 
 #include "type/row.hpp"
 
+#include <cstddef>
+#include <functional>
+#include <unordered_map>
+#include <vector>
+
 #include "gtest/gtest.h"
 #include "type/column.hpp"
 #include "type/schema.hpp"
@@ -95,6 +100,28 @@ TEST(RowTest, SerializeRoundTripPreservesDateAndBinaryText) {
   EXPECT_EQ(restored[2], Value(std::string(blob)));
   EXPECT_EQ(restored[3], Value(2.5));
   EXPECT_TRUE(restored[4].IsNull());
+}
+
+TEST(RowTest, HashIsOrderSensitive) {
+  // The combine step rotates and multiplies, so {1,2} and {2,1} -- which the
+  // old commutative addition merged into one bucket -- hash differently.
+  std::hash<Row> hasher;
+  const Row forward({Value(1), Value(2)});
+  const Row swapped({Value(2), Value(1)});
+  EXPECT_NE(hasher(forward), hasher(swapped));
+  EXPECT_EQ(hasher(forward), hasher(forward));
+}
+
+TEST(RowTest, RowsWithNullKeysWorkInUnorderedMap) {
+  // Regression: GROUP BY keeps keys in unordered_map<Row, ...>; hashing rows
+  // that contain NULL columns used to throw from std::hash<Value>.
+  std::unordered_map<Row, size_t> groups;
+  ++groups[Row({Value(), Value("a")})];
+  ++groups[Row({Value(), Value("a")})];
+  ++groups[Row({Value(1), Value("a")})];
+
+  ASSERT_EQ(groups.size(), 2U);
+  EXPECT_EQ(groups[Row({Value(), Value("a")})], 2U);
 }
 
 }  // namespace tinylamb

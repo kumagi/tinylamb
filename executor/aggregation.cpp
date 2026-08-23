@@ -16,15 +16,29 @@
 
 #include "executor/aggregation.hpp"
 
+#include <memory>
+#include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <stdexcept>
+#include <ostream>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include "executor/executor_base.hpp"
+#include "executor/data_chunk.hpp"
+#include "common/constants.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "executor/query_memory.hpp"
+#include "expression/named_expression.hpp"
+#include "page/row_position.hpp"
+#include "expression/jit.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -66,12 +80,19 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
       }
       const ColumnVector& column = input_batch_.ColumnAt(jit_sum_column_);
       if (jit_sum_ && input_batch_.ZoneMapAt(jit_sum_column_).NullCount() == 0) {
+        // The JIT kernel reads raw int64 storage; verify the child batch
+        // really has the declared layout before trusting it.
+        if (!input_batch_.HasLayout(input_schema_) ||
+            column.Type() != ValueType::kInt64) {
+          throw std::runtime_error("aggregation input layout mismatch");
+        }
         total += jit_sum_->Sum(column.IntegerData().data(), column.Size());
         any = any || column.Size() != 0;
         ++jit_batches_;
       } else {
         for (size_t row = 0; row < column.Size(); ++row) {
-          if (column.IsNull(row)) continue;
+          if (column.IsNull(row)) { continue;
+}
           total += column.ValueAt(row).value.int_value;
           any = true;
         }
@@ -81,6 +102,10 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
     executed_ = true;
     return true;
   }
+  return NextGeneric(dst);
+}
+
+bool AggregationExecutor::NextGeneric(Row* dst) {
   std::vector<Value> results;
   results.resize(aggregates_.size());
   std::vector<int64_t> counts(aggregates_.size(), 0);
@@ -106,12 +131,8 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
       std::optional<Row> materialized;
       for (size_t i = 0; i < aggregates_.size(); ++i) {
         const auto& agg = aggregates_[i].expression->AsAggregateExpression();
-        const bool count_star =
-            agg.GetType() == AggregationType::kCount &&
-            agg.Child()->Type() == TypeTag::kColumnValue &&
-            agg.Child()->AsColumnValue().GetColumnName().name == "*";
         Value val;
-        if (count_star) {
+        if (IsCountStar(agg)) {
           val = Value(1);
         } else if (agg.Child()->Type() == TypeTag::kColumnValue) {
           const int offset = input_schema_.Offset(
@@ -120,14 +141,17 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
             val = input_batch_.ColumnAt(static_cast<size_t>(offset))
                       .ValueAt(row_index);
           } else {
-            if (!materialized) materialized = input_batch_.RowAt(row_index);
+            if (!materialized) { materialized = input_batch_.RowAt(row_index);
+}
             val = agg.Child()->Evaluate(*materialized, input_schema_);
           }
         } else {
-          if (!materialized) materialized = input_batch_.RowAt(row_index);
+          if (!materialized) { materialized = input_batch_.RowAt(row_index);
+}
           val = agg.Child()->Evaluate(*materialized, input_schema_);
         }
-        if (val.IsNull()) continue;
+        if (val.IsNull()) { continue;
+}
         if (agg.Distinct()) {
           const size_t bytes = EstimateValueBytes(val);
           QueryMemoryBudget::Global().ReserveForced(bytes);
@@ -135,6 +159,20 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
             QueryMemoryBudget::Global().Release(bytes);
             continue;
           }
+        }
+        switch (agg.GetType()) {
+          case AggregationType::kSum:
+          case AggregationType::kAvg:
+            // SUM/AVG are numeric aggregates; reading the union of a
+            // non-numeric value would be garbage (SUM(varchar) must not
+            // degrade to string concatenation).
+            if (val.type != ValueType::kInt64 &&
+                val.type != ValueType::kDouble) {
+              throw std::runtime_error("numeric value required");
+            }
+            break;
+          default:
+            break;
         }
         switch (agg.GetType()) {
           case AggregationType::kSum:
@@ -148,10 +186,12 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
             ++counts[i];
             break;
           case AggregationType::kMin:
-            if (results[i].IsNull() || val < results[i]) results[i] = val;
+            if (results[i].IsNull() || val < results[i]) { results[i] = val;
+}
             break;
           case AggregationType::kMax:
-            if (results[i].IsNull() || results[i] < val) results[i] = val;
+            if (results[i].IsNull() || results[i] < val) { results[i] = val;
+}
             break;
           case AggregationType::kCount:
             ++results[i].value.int_value;
@@ -184,9 +224,11 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
 size_t AggregationExecutor::NextBatch(DataChunk* destination,
                                       size_t max_rows) {
   destination->Reset();
-  if (max_rows == 0) return 0;
+  if (max_rows == 0) { return 0;
+}
   Row row;
-  if (!Next(&row, nullptr)) return 0;
+  if (!Next(&row, nullptr)) { return 0;
+}
   destination->Append(std::move(row));
   return 1;
 }

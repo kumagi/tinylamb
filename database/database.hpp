@@ -17,14 +17,14 @@
 #ifndef TINYLAMB_DATABASE_HPP
 #define TINYLAMB_DATABASE_HPP
 
-#include <cstdint>
+#include <mutex>
 #include <ostream>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "database/page_storage.hpp"
 #include "database/transaction_context.hpp"
 #include "index/b_plus_tree.hpp"
@@ -67,13 +67,13 @@ class Database {
 
   friend std::ostream& operator<<(std::ostream& o, const Database& db);
 
-  StatusOr<TableStatistics> GetStatistics(TransactionContext& txn,
+  StatusOr<TableStatistics> GetStatistics(TransactionContext& ctx,
                                           std::string_view schema_name);
 
-  Status UpdateStatistics(TransactionContext& txn, std::string_view schema_name,
+  Status UpdateStatistics(TransactionContext& ctx, std::string_view schema_name,
                           const TableStatistics& ts);
 
-  Status RefreshStatistics(TransactionContext& txn,
+  Status RefreshStatistics(TransactionContext& ctx,
                            std::string_view schema_name);
 
   StatusOr<Table> GetTable(TransactionContext& ctx,
@@ -99,6 +99,11 @@ class Database {
 
   // Persistent { Name => Function } storage.
   BPlusTree functions_;
+
+  // Guards the Read→Insert sequences against catalog entries (CreateTable,
+  // GetOrAddFunction). Held across page allocation so a concurrent duplicate
+  // registration can no longer allocate pages it would never reclaim.
+  std::mutex catalog_mu_;
 
   PageStorage storage_;
 };

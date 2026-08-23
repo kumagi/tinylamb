@@ -19,16 +19,23 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <iostream>
 #include <tuple>
 
 LogStream::~LogStream() {
   std::cerr << message_.str() << "\033[0;39;49m\n";
+  if (fatal_) {
+    std::abort();
+  }
 }
 
-LogMessage::LogMessage(int log_level, const char* filename, int lineno,
+LogMessage::LogMessage(LogLevel log_level, const char* filename, int lineno,
                        const char* func_name) {
+  if (log_level == LogLevel::kFatal) {
+    ls.fatal_ = true;
+  }
   std::array<char, 70> buff{};
   auto now = std::chrono::system_clock::now();
   std::time_t now_time = std::chrono::system_clock::to_time_t(now);
@@ -37,30 +44,30 @@ LogMessage::LogMessage(int log_level, const char* filename, int lineno,
       strftime(buff.data(), buff.size(), "%Y-%m-%d %H:%M:%S ", &now_tm);
 
   switch (log_level) {
-    case FATAL:
+    case LogLevel::kFatal:
       ls << "\033[1;31m";
       break;
-    case ERROR:
+    case LogLevel::kError:
       ls << "\033[4;31m";
       break;
-    case ALERT:
+    case LogLevel::kAlert:
       ls << "\033[1;5;95m";
       break;
-    case WARN:
+    case LogLevel::kWarn:
       ls << "\033[33m";
       break;
-    case NOTICE:
+    case LogLevel::kNotice:
       ls << "\033[1;36m";
       break;
-    case INFO:
+    case LogLevel::kInfo:
       break;  // Do nothing.
-    case USER:
+    case LogLevel::kUser:
       ls << "\033[7;32m";
       break;
-    case DEBUG:
+    case LogLevel::kDebug:
       ls << "\033[1;34m";
       break;
-    case TRACE:
+    case LogLevel::kTrace:
       ls << "\033[4;36m";
       break;
     default:
@@ -68,31 +75,31 @@ LogMessage::LogMessage(int log_level, const char* filename, int lineno,
   }
   ls << buff.data() << filename << ":" << lineno << " " << func_name;
   switch (log_level) {
-    case FATAL:
+    case LogLevel::kFatal:
       ls << " FATAL  ";
       break;
-    case ERROR:
+    case LogLevel::kError:
       ls << " ERROR  ";
       break;
-    case ALERT:
+    case LogLevel::kAlert:
       ls << " ALERT  ";
       break;
-    case WARN:
+    case LogLevel::kWarn:
       ls << " WARN   ";
       break;
-    case NOTICE:
+    case LogLevel::kNotice:
       ls << " NOTICE ";
       break;
-    case INFO:
+    case LogLevel::kInfo:
       ls << " INFO   ";
       break;
-    case USER:
+    case LogLevel::kUser:
       ls << " USER   ";
       break;
-    case DEBUG:
+    case LogLevel::kDebug:
       ls << " DEBUG  ";
       break;
-    case TRACE:
+    case LogLevel::kTrace:
       ls << " TRACE  ";
       break;
     default:

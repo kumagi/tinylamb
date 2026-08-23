@@ -3,14 +3,21 @@
 #include "server/postgres_server.hpp"
 
 #include <arpa/inet.h>
-#include <csignal>
-#include <pthread.h>
+#include <chrono>
+#include <netinet/in.h>
+#include <asm-generic/socket.h>
+#include <bits/pthreadtypes.h>
 #include <poll.h>
+#include <sys/poll.h>
+#include <signal.h>  // NOLINT(modernize-deprecated-headers) // POSIX sigaction/sigemptyset below are only provided by this header.
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,7 +35,8 @@ bool SendAll(int fd, const std::string& bytes) {
   while (offset < bytes.size()) {
     const ssize_t sent =
         send(fd, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
-    if (sent <= 0) return false;
+    if (sent <= 0) { return false;
+}
     offset += static_cast<size_t>(sent);
   }
   return true;
@@ -37,18 +45,22 @@ bool SendAll(int fd, const std::string& bytes) {
 std::string ReadUntilReady(int fd) {
   std::string result;
   while (true) {
-    pollfd descriptor{fd, POLLIN, 0};
-    if (poll(&descriptor, 1, 5000) <= 0) return {};
+    pollfd descriptor{.fd=fd, .events=POLLIN, .revents=0};
+    if (poll(&descriptor, 1, 5000) <= 0) { return {};
+}
     std::array<char, 4096> buffer{};
     const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
-    if (received <= 0) return {};
+    if (received <= 0) { return {};
+}
     result.append(buffer.data(), static_cast<size_t>(received));
 
     size_t cursor = 0;
     while (cursor + 5 <= result.size()) {
       const uint32_t length = pgwire::ReadUint32(result, cursor + 1);
-      if (length < 4 || cursor + 1 + length > result.size()) break;
-      if (result[cursor] == 'Z') return result;
+      if (length < 4 || cursor + 1 + length > result.size()) { break;
+}
+      if (result[cursor] == 'Z') { return result;
+}
       cursor += 1 + length;
     }
   }
@@ -59,7 +71,7 @@ std::string StartupMessage() {
   pgwire::AppendUint32(&message, 0);
   pgwire::AppendUint32(&message, pgwire::kProtocolVersion30);
   message.append("user\0test\0database\0test\0\0", 25);
-  const uint32_t size = static_cast<uint32_t>(message.size());
+  const auto size = static_cast<uint32_t>(message.size());
   message[0] = static_cast<char>((size >> 24U) & 0xffU);
   message[1] = static_cast<char>((size >> 16U) & 0xffU);
   message[2] = static_cast<char>((size >> 8U) & 0xffU);
@@ -77,7 +89,8 @@ std::string QueryMessage(const std::string& sql) {
 
 int ConnectClient(uint16_t port) {
   const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (client < 0) return -1;
+  if (client < 0) { return -1;
+}
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_port = htons(port);
@@ -91,6 +104,22 @@ int ConnectClient(uint16_t port) {
   return client;
 }
 
+// Requests a clean server shutdown on scope exit. Copy/move are deleted so
+// exactly one guard owns the shutdown of a given server instance.
+class StopGuard {
+ public:
+  explicit StopGuard(PostgresServer* server) : server_(server) {}
+  ~StopGuard() { server_->RequestStop(); }
+
+  StopGuard(const StopGuard&) = delete;
+  StopGuard& operator=(const StopGuard&) = delete;
+  StopGuard(StopGuard&&) = delete;
+  StopGuard& operator=(StopGuard&&) = delete;
+
+ private:
+  PostgresServer* server_;
+};
+
 TEST(PostgresServerTest, ExecutesQueriesOverTcpProtocol) {
   const std::string path = "postgres_server_test-" + RandomString();
   {
@@ -102,10 +131,7 @@ TEST(PostgresServerTest, ExecutesQueriesOverTcpProtocol) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     ASSERT_GE(client, 0);
@@ -175,10 +201,7 @@ TEST(PostgresServerTest, ExecutesIndependentReadsConcurrently) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int setup = ConnectClient(server.BoundPort());
     ASSERT_GE(setup, 0);
@@ -187,7 +210,8 @@ TEST(PostgresServerTest, ExecutesIndependentReadsConcurrently) {
     ASSERT_FALSE(ReadUntilReady(setup).empty());
     std::string insert = "INSERT INTO parallel_rows VALUES ";
     for (int64_t value = 1; value <= 200; ++value) {
-      if (value != 1) insert += ',';
+      if (value != 1) { insert += ',';
+}
       insert += '(' + std::to_string(value) + ')';
     }
     insert += ';';
@@ -235,10 +259,7 @@ TEST(PostgresServerTest, TransactionsOverTcpProtocol) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     ASSERT_GE(client, 0);
@@ -286,7 +307,7 @@ TEST(PostgresServerTest, TransactionsOverTcpProtocol) {
     const std::string after_commit = ReadUntilReady(client);
     EXPECT_NE(after_commit.find("SELECT 1"), std::string::npos);
     EXPECT_NE(after_commit.find('D'), std::string::npos);
-    EXPECT_NE(after_commit.find("2"), std::string::npos);
+    EXPECT_NE(after_commit.find('2'), std::string::npos);
 
     // Act -- a SET command is accepted as a no-op
     ASSERT_TRUE(SendAll(client, QueryMessage("SET search_path TO public;")));
@@ -320,10 +341,7 @@ TEST(PostgresServerTest, ServerProtocolErrorResponses) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -348,11 +366,13 @@ TEST(PostgresServerTest, ServerProtocolErrorResponses) {
     // without a ReadyForQuery
     std::string response;
     while (true) {
-      pollfd descriptor{client, POLLIN, 0};
-      if (poll(&descriptor, 1, 5000) <= 0) break;
+      pollfd descriptor{.fd=client, .events=POLLIN, .revents=0};
+      if (poll(&descriptor, 1, 5000) <= 0) { break;
+}
       std::array<char, 4096> buffer{};
       const ssize_t received = recv(client, buffer.data(), buffer.size(), 0);
-      if (received <= 0) break;
+      if (received <= 0) { break;
+}
       response.append(buffer.data(), static_cast<size_t>(received));
     }
     EXPECT_NE(response.find('E'), std::string::npos);
@@ -379,10 +399,7 @@ TEST(PostgresServerTest, ReadWorkerReportsPrepareErrors) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -416,10 +433,7 @@ TEST(PostgresServerTest, EmptyQueryResponseOverTcp) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -450,14 +464,12 @@ TEST(PostgresServerTest, StartupPacketVariants) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     auto ConnectRaw = [&]() {
       const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-      if (client < 0) return -1;
+      if (client < 0) { return -1;
+}
       sockaddr_in address{};
       address.sin_family = AF_INET;
       address.sin_port = htons(server.BoundPort());
@@ -474,7 +486,7 @@ TEST(PostgresServerTest, StartupPacketVariants) {
       pgwire::AppendUint32(&packet, 0);
       pgwire::AppendUint32(&packet, version);
       packet.append(body);
-      const uint32_t size = static_cast<uint32_t>(packet.size());
+      const auto size = static_cast<uint32_t>(packet.size());
       packet[0] = static_cast<char>((size >> 24U) & 0xffU);
       packet[1] = static_cast<char>((size >> 16U) & 0xffU);
       packet[2] = static_cast<char>((size >> 8U) & 0xffU);
@@ -484,11 +496,13 @@ TEST(PostgresServerTest, StartupPacketVariants) {
     auto ReadAll = [](int fd) {
       std::string result;
       while (true) {
-        pollfd descriptor{fd, POLLIN, 0};
-        if (poll(&descriptor, 1, 5000) <= 0) break;
+        pollfd descriptor{.fd=fd, .events=POLLIN, .revents=0};
+        if (poll(&descriptor, 1, 5000) <= 0) { break;
+}
         std::array<char, 4096> buffer{};
         const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
-        if (received <= 0) break;
+        if (received <= 0) { break;
+}
         result.append(buffer.data(), static_cast<size_t>(received));
       }
       return result;
@@ -594,10 +608,7 @@ TEST(PostgresServerTest, TransactionAbortErrorState) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -659,10 +670,7 @@ TEST(PostgresServerTest, OversizedMessageLimit) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -673,11 +681,13 @@ TEST(PostgresServerTest, OversizedMessageLimit) {
     ASSERT_TRUE(SendAll(client, QueryMessage(long_sql)));
     std::string reply;
     while (true) {
-      pollfd descriptor{client, POLLIN, 0};
-      if (poll(&descriptor, 1, 5000) <= 0) break;
+      pollfd descriptor{.fd=client, .events=POLLIN, .revents=0};
+      if (poll(&descriptor, 1, 5000) <= 0) { break;
+}
       std::array<char, 4096> buffer{};
       const ssize_t received = recv(client, buffer.data(), buffer.size(), 0);
-      if (received <= 0) break;
+      if (received <= 0) { break;
+}
       reply.append(buffer.data(), static_cast<size_t>(received));
     }
     EXPECT_NE(reply.find('E'), std::string::npos);
@@ -703,10 +713,7 @@ TEST(PostgresServerTest, SyncAndFlushMessages) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -750,10 +757,7 @@ TEST(PostgresServerTest, DropTableCommandTagOverTcp) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -797,10 +801,7 @@ TEST(PostgresServerTest, SelectInsideExplicitTransaction) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -844,10 +845,7 @@ TEST(PostgresServerTest, InvalidStartupPacketLength) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     ASSERT_GE(client, 0);
@@ -864,11 +862,13 @@ TEST(PostgresServerTest, InvalidStartupPacketLength) {
     ASSERT_TRUE(SendAll(client, std::string("\0\0\0\4", 4)));
     std::string reply;
     while (true) {
-      pollfd descriptor{client, POLLIN, 0};
-      if (poll(&descriptor, 1, 5000) <= 0) break;
+      pollfd descriptor{.fd=client, .events=POLLIN, .revents=0};
+      if (poll(&descriptor, 1, 5000) <= 0) { break;
+}
       std::array<char, 4096> buffer{};
       const ssize_t received = recv(client, buffer.data(), buffer.size(), 0);
-      if (received <= 0) break;
+      if (received <= 0) { break;
+}
       reply.append(buffer.data(), static_cast<size_t>(received));
     }
     // Assert -- the server reports the invalid packet and drops the client
@@ -895,10 +895,7 @@ TEST(PostgresServerTest, MalformedStartupPacketWithoutTerminator) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     ASSERT_GE(client, 0);
@@ -916,7 +913,7 @@ TEST(PostgresServerTest, MalformedStartupPacketWithoutTerminator) {
     pgwire::AppendUint32(&packet, 0);
     pgwire::AppendUint32(&packet, pgwire::kProtocolVersion30);
     packet.append(std::string("user\0test\0", 10));
-    const uint32_t size = static_cast<uint32_t>(packet.size());
+    const auto size = static_cast<uint32_t>(packet.size());
     packet[0] = static_cast<char>((size >> 24U) & 0xffU);
     packet[1] = static_cast<char>((size >> 16U) & 0xffU);
     packet[2] = static_cast<char>((size >> 8U) & 0xffU);
@@ -924,11 +921,13 @@ TEST(PostgresServerTest, MalformedStartupPacketWithoutTerminator) {
     ASSERT_TRUE(SendAll(client, packet));
     std::string reply;
     while (true) {
-      pollfd descriptor{client, POLLIN, 0};
-      if (poll(&descriptor, 1, 5000) <= 0) break;
+      pollfd descriptor{.fd=client, .events=POLLIN, .revents=0};
+      if (poll(&descriptor, 1, 5000) <= 0) { break;
+}
       std::array<char, 4096> buffer{};
       const ssize_t received = recv(client, buffer.data(), buffer.size(), 0);
-      if (received <= 0) break;
+      if (received <= 0) { break;
+}
       reply.append(buffer.data(), static_cast<size_t>(received));
     }
     // Assert -- the parse failure surfaces as an 08P01 protocol error
@@ -1035,10 +1034,7 @@ TEST(PostgresServerTest, FailedAutomaticTransactionRecoversSession) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -1098,10 +1094,7 @@ TEST(PostgresServerTest, StartTransactionAndEndAliases) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -1144,8 +1137,7 @@ TEST(PostgresServerTest, StartTransactionAndEndAliases) {
   database.DeleteAll();
 }
 
-// DISABLED: see DISABLED_StartTransactionAndEndAliases — every client/server
-// exchange throws EDEADLK from the page-pool meta-page lock.
+// Multi-statement simple query: exercises sequential DDL/DML/SELECT in one message.
 TEST(PostgresServerTest, MultiStatementSimpleQueryMessage) {
   const std::string path = "postgres_server_multistmt_test-" + RandomString();
   {
@@ -1157,10 +1149,7 @@ TEST(PostgresServerTest, MultiStatementSimpleQueryMessage) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -1205,6 +1194,63 @@ TEST(PostgresServerTest, MultiStatementSimpleQueryMessage) {
   database.DeleteAll();
 }
 
+// §7.3: all statements of one Query message form a single implicit
+// transaction -- a failing statement must roll back the successful ones.
+TEST(PostgresServerTest, MultiStatementImplicitTransactionIsAtomic) {
+  const std::string path = "postgres_server_atomic_test-" + RandomString();
+  {
+    PostgresServerOptions options;
+    options.port = 0;
+    PostgresServer server(path, options);
+    std::string listen_error;
+    ASSERT_TRUE(server.Listen(&listen_error)) << listen_error;
+    std::string run_error;
+    int run_result = -1;
+    std::jthread server_thread([&] { run_result = server.Run(&run_error); });
+    StopGuard stop_guard{&server};
+
+    const int client = ConnectClient(server.BoundPort());
+    ASSERT_GE(client, 0);
+    ASSERT_TRUE(SendAll(
+        client, QueryMessage("CREATE TABLE atomic_rows (id INT64);")));
+    EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
+
+    // Act -- the first INSERT succeeds and reports its tag, then the second
+    // statement fails; the whole implicit transaction must roll back.
+    ASSERT_TRUE(SendAll(
+        client, QueryMessage("INSERT INTO atomic_rows VALUES (1); "
+                             "INSERT INTO missing_table VALUES (2);")));
+    const std::string failed = ReadUntilReady(client);
+    EXPECT_NE(failed.find("ERROR"), std::string::npos);
+
+    // Assert -- nothing from the failed message is durable.
+    ASSERT_TRUE(SendAll(client, QueryMessage("SELECT id FROM atomic_rows;")));
+    const std::string selected = ReadUntilReady(client);
+    EXPECT_NE(selected.find("SELECT 0"), std::string::npos);
+    EXPECT_EQ(selected.find('D'), std::string::npos);
+
+    // Act -- a fully successful multi-statement message commits everything.
+    ASSERT_TRUE(SendAll(
+        client, QueryMessage("INSERT INTO atomic_rows VALUES (10); "
+                             "INSERT INTO atomic_rows VALUES (20);")));
+    const std::string committed = ReadUntilReady(client);
+    EXPECT_EQ(committed.find("ERROR"), std::string::npos);
+    ASSERT_TRUE(SendAll(client,
+                        QueryMessage("SELECT COUNT(*) FROM atomic_rows;")));
+    const std::string counted = ReadUntilReady(client);
+    EXPECT_NE(counted.find("SELECT 1"), std::string::npos);
+    EXPECT_NE(counted.find('2'), std::string::npos);
+
+    ASSERT_TRUE(SendAll(client, std::string("X\0\0\0\4", 5)));
+    close(client);
+    server.RequestStop();
+    server_thread.join();
+    EXPECT_EQ(run_result, 0) << run_error;
+  }
+  Database database(path);
+  database.DeleteAll();
+}
+
 TEST(PostgresServerTest, ReadCompletionAfterClientCloseIsIgnored) {
   const std::string path = "postgres_server_stale_test-" + RandomString();
   {
@@ -1217,10 +1263,7 @@ TEST(PostgresServerTest, ReadCompletionAfterClientCloseIsIgnored) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int setup = ConnectClient(server.BoundPort());
     ASSERT_GE(setup, 0);
@@ -1230,8 +1273,9 @@ TEST(PostgresServerTest, ReadCompletionAfterClientCloseIsIgnored) {
     for (int64_t batch = 0; batch < 3; ++batch) {
       std::string insert = "INSERT INTO stale_rows VALUES ";
       for (int64_t offset = 0; offset < 10000; ++offset) {
-        if (offset != 0) insert += ',';
-        const int64_t value = batch * 10000 + offset + 1;
+        if (offset != 0) { insert += ',';
+}
+        const int64_t value = (batch * 10000) + offset + 1;
         insert += "(" + std::to_string(value) + ")";
       }
       insert += ';';
@@ -1278,16 +1322,14 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     // Connect with a tiny receive window so the server cannot write a large
     // reply in one pass and must keep output pending.
     auto ConnectSmallWindow = [&]() {
       const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-      if (client < 0) return -1;
+      if (client < 0) { return -1;
+}
       const int receive_buffer = 4096;
       setsockopt(client, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
                  sizeof(receive_buffer));
@@ -1313,8 +1355,9 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
     for (int64_t batch = 0; batch < 5; ++batch) {
       std::string insert = "INSERT INTO queue_rows VALUES ";
       for (int64_t offset = 0; offset < 10000; ++offset) {
-        if (offset != 0) insert += ',';
-        const int64_t value = batch * 10000 + offset + 1;
+        if (offset != 0) { insert += ',';
+}
+        const int64_t value = (batch * 10000) + offset + 1;
         insert += "(" + std::to_string(value) + ")";
       }
       insert += ';';
@@ -1337,9 +1380,10 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
     // Wait until the server has begun writing the large reply: the client's
     // tiny receive window then stalls the write part-way through the response.
     {
-      struct pollfd ready{client, POLLIN, 0};
+      struct pollfd ready{.fd=client, .events=POLLIN, .revents=0};
       for (int attempt = 0; attempt < 100; ++attempt) {
-        if (poll(&ready, 1, 100) > 0 && (ready.revents & POLLIN) != 0) break;
+        if (poll(&ready, 1, 100) > 0 && (ready.revents & POLLIN) != 0) { break;
+}
       }
     }
     ASSERT_TRUE(
@@ -1348,11 +1392,13 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
     auto ReadUntil = [](int fd, const std::string& needle) {
       std::string result;
       while (result.find(needle) == std::string::npos) {
-        pollfd descriptor{fd, POLLIN, 0};
-        if (poll(&descriptor, 1, 5000) <= 0) break;
+        pollfd descriptor{.fd=fd, .events=POLLIN, .revents=0};
+        if (poll(&descriptor, 1, 5000) <= 0) { break;
+}
         std::array<char, 4096> buffer{};
         const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
-        if (received <= 0) break;
+        if (received <= 0) { break;
+}
         result.append(buffer.data(), static_cast<size_t>(received));
       }
       return result;
@@ -1383,10 +1429,7 @@ TEST(PostgresServerTest, DropAndRecreateTableOverTcp) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -1439,10 +1482,7 @@ TEST(PostgresServerTest, ConcurrentWriteTransactionsOverTcp) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int setup = ConnectClient(server.BoundPort());
     ASSERT_GE(setup, 0);
@@ -1482,7 +1522,7 @@ TEST(PostgresServerTest, ConcurrentWriteTransactionsOverTcp) {
                                              "conc_writes;")));
     const std::string counted = ReadUntilReady(verify);
     EXPECT_NE(counted.find("SELECT 1"), std::string::npos);
-    EXPECT_NE(counted.find("4"), std::string::npos);
+    EXPECT_NE(counted.find('4'), std::string::npos);
     close(verify);
 
     server.RequestStop();
@@ -1504,10 +1544,7 @@ TEST(PostgresServerTest, ReadWorkerRejectsDataModifyingWith) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -1567,10 +1604,7 @@ TEST(PostgresServerTest, SelectConstantExpressionNoTable) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -1614,10 +1648,7 @@ TEST(PostgresServerTest, ExtendedQueryMessagesRejectedKeepSessionAlive) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -1674,10 +1705,7 @@ TEST(PostgresServerTest, DisconnectDuringLargeResponse) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int setup = ConnectClient(server.BoundPort());
     ASSERT_GE(setup, 0);
@@ -1687,8 +1715,9 @@ TEST(PostgresServerTest, DisconnectDuringLargeResponse) {
     for (int64_t batch = 0; batch < 2; ++batch) {
       std::string insert = "INSERT INTO disconnect_rows VALUES ";
       for (int64_t offset = 0; offset < 10000; ++offset) {
-        if (offset != 0) insert += ',';
-        insert += "(" + std::to_string(batch * 10000 + offset + 1) + ")";
+        if (offset != 0) { insert += ',';
+}
+        insert += "(" + std::to_string((batch * 10000) + offset + 1) + ")";
       }
       insert += ';';
       ASSERT_TRUE(SendAll(setup, QueryMessage(insert)));
@@ -1723,9 +1752,10 @@ TEST(PostgresServerTest, DisconnectDuringLargeResponse) {
     // Wait until the server has begun streaming the large reply, then
     // disconnect mid-write so the server's next send() must fail.
     {
-      struct pollfd ready{client, POLLIN, 0};
+      struct pollfd ready{.fd=client, .events=POLLIN, .revents=0};
       for (int attempt = 0; attempt < 100; ++attempt) {
-        if (poll(&ready, 1, 100) > 0 && (ready.revents & POLLIN) != 0) break;
+        if (poll(&ready, 1, 100) > 0 && (ready.revents & POLLIN) != 0) { break;
+}
       }
     }
     close(client);
@@ -1750,17 +1780,14 @@ TEST(PostgresServerTest, ClientResetForcesRecvError) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     // Act -- a client declares a startup packet larger than it sends and then
     // closes with SO_LINGER, forcing an RST.  The server's next recv fails
     // with ECONNRESET and must drop the client without taking the server down.
     const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     ASSERT_GE(client, 0);
-    linger reset{1, 0};
+    linger reset{.l_onoff=1, .l_linger=0};
     setsockopt(client, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -1800,10 +1827,7 @@ TEST(PostgresServerTest, SignalInterruptsEpollWaitAndServerSurvives) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     // Install a no-op SIGUSR1 handler without SA_RESTART so the server's
     // blocking epoll_wait returns EINTR when the signal is delivered.
@@ -1859,10 +1883,7 @@ TEST(PostgresServerTest, GssEncRequestDeclinedThenNormalStartup) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     ASSERT_GE(client, 0);
@@ -1909,10 +1930,7 @@ TEST(PostgresServerTest, MultiStatementDdlInsertSelectOverTcp) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -1957,10 +1975,7 @@ TEST(PostgresServerTest, RollbackAfterStatementErrorClearsAbortedState) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -2017,10 +2032,7 @@ TEST(PostgresServerTest, ReadWorkerCompletionForDisconnectedClientIsDropped) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int setup = ConnectClient(server.BoundPort());
     ASSERT_GE(setup, 0);
@@ -2030,8 +2042,9 @@ TEST(PostgresServerTest, ReadWorkerCompletionForDisconnectedClientIsDropped) {
     for (int64_t batch = 0; batch < 4; ++batch) {
       std::string insert = "INSERT INTO stale_rows2 VALUES ";
       for (int64_t offset = 0; offset < 10000; ++offset) {
-        if (offset != 0) insert += ',';
-        const int64_t value = batch * 10000 + offset + 1;
+        if (offset != 0) { insert += ',';
+}
+        const int64_t value = (batch * 10000) + offset + 1;
         insert += "(" + std::to_string(value) + ")";
       }
       insert += ';';
@@ -2079,10 +2092,7 @@ TEST(PostgresServerTest, DropTableInsideExplicitTransactionCommits) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -2127,10 +2137,7 @@ TEST(PostgresServerTest, RuntimeErrorInSynchronousTransaction) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -2186,10 +2193,7 @@ TEST(PostgresServerTest, RuntimeErrorInReadWorker) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -2227,7 +2231,7 @@ TEST(PostgresServerTest, RuntimeErrorInReadWorker) {
   database.DeleteAll();
 }
 
-TEST(PostgresServerTest, MultiStatementReadWorkerRuntimeErrorAfterCommit) {
+TEST(PostgresServerTest, MultiStatementReadWorkerRuntimeErrorStopsBatch) {
   const std::string path = "postgres_server_runtime_multi-" + RandomString();
   {
     PostgresServerOptions options;
@@ -2239,10 +2243,7 @@ TEST(PostgresServerTest, MultiStatementReadWorkerRuntimeErrorAfterCommit) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
@@ -2255,10 +2256,10 @@ TEST(PostgresServerTest, MultiStatementReadWorkerRuntimeErrorAfterCommit) {
                                      "(1, 'abc');")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
 
-    // Act -- a single message with two read-only statements: the first one
-    // succeeds and commits its per-statement context, then the second throws
-    // at execution time. The worker must not abort the already-finished
-    // context and must stop at the failing statement.
+    // Act -- a single message with two read-only statements sharing one
+    // read-only snapshot (§7.3): the first streams its rows, then the second
+    // throws at execution time. The worker aborts the shared snapshot,
+    // stops at the failing statement, and still answers ReadyForQuery.
     ASSERT_TRUE(SendAll(client, QueryMessage(
                                     "SELECT id FROM runtime_multi; "
                                     "SELECT id + body FROM runtime_multi; "
@@ -2300,10 +2301,7 @@ TEST(PostgresServerTest, StaleReadCompletionDroppedAfterFdReuse) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int setup = ConnectClient(server.BoundPort());
     ASSERT_GE(setup, 0);
@@ -2313,8 +2311,9 @@ TEST(PostgresServerTest, StaleReadCompletionDroppedAfterFdReuse) {
     for (int64_t batch = 0; batch < 4; ++batch) {
       std::string insert = "INSERT INTO stale_fd VALUES ";
       for (int64_t offset = 0; offset < 10000; ++offset) {
-        if (offset != 0) insert += ',';
-        insert += "(" + std::to_string(batch * 10000 + offset + 1) + ")";
+        if (offset != 0) { insert += ',';
+}
+        insert += "(" + std::to_string((batch * 10000) + offset + 1) + ")";
       }
       insert += ';';
       ASSERT_TRUE(SendAll(setup, QueryMessage(insert)));
@@ -2376,10 +2375,7 @@ TEST(PostgresServerTest, DropTableInsideAbortedTransaction) {
     std::string run_error;
     int run_result = -1;
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
-    struct StopGuard {
-      PostgresServer* server;
-      ~StopGuard() { server->RequestStop(); }
-    } stop_guard{&server};
+    StopGuard stop_guard{&server};
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);

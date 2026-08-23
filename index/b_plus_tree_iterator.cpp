@@ -16,9 +16,12 @@
 
 #include "b_plus_tree_iterator.hpp"
 
+#include <cstddef>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
+#include "common/constants.hpp"
 #include "index/b_plus_tree.hpp"
 #include "page/index_key.hpp"
 #include "page/page_manager.hpp"
@@ -28,11 +31,11 @@
 namespace tinylamb {
 
 BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
-                                     std::string_view begin,
-                                     std::string_view end, bool ascending)
+                                      std::string_view begin,
+                                      std::string_view end, bool ascending)
     : tree_(tree), txn_(txn), begin_(begin), end_(end) {
   if (!end.empty() && !begin.empty() && end < begin) {
-    std::runtime_error("invalid begin & end");
+    throw std::runtime_error("invalid begin & end");
   }
   if (ascending) {
     if (begin.empty()) {
@@ -41,7 +44,9 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
       idx_ = 0;
       valid_ = true;
     } else {
-      PageRef leaf = tree_->FindLeaf(*txn_, begin, false);
+      // Construction never mutates: read-only lookups keep RO transactions
+      // on shared latches and avoid GrowTreeHeightIfNeeded/foster absorption.
+      PageRef leaf = tree_->FindLeafReadOnly(*txn_, begin, false);
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.Find(begin);
       valid_ = idx_ < static_cast<size_t>(leaf->body.leaf_page.row_count_);
@@ -55,14 +60,23 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
       PageRef leaf = tree->RightmostPage(*txn_);
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.row_count_ == 0
-                 ? 0
-                 : leaf->body.leaf_page.row_count_ - 1;
+                  ? 0
+                  : leaf->body.leaf_page.row_count_ - 1;
       valid_ = leaf->body.leaf_page.row_count_ > 0;
     } else {
-      PageRef leaf = tree_->FindLeaf(*txn_, end, false);
+      // Find() is only a lower_bound: when `end` is absent we must not start
+      // on a key above `end`, nor report an empty scan when keys below `end`
+      // exist. PositionBelow lands on the last key < `end` instead.
+      PageRef leaf = tree_->FindLeafReadOnly(*txn_, end, false);
       pid_ = leaf->PageID();
-      idx_ = leaf->body.leaf_page.Find(end);
-      valid_ = idx_ < static_cast<size_t>(leaf->body.leaf_page.row_count_);
+      valid_ = tree_->PositionBelow(leaf, idx_, *txn_, end);
+      if (valid_) {
+        pid_ = leaf->PageID();
+        if (!begin_.empty() &&
+            leaf->body.leaf_page.GetKey(idx_) < begin_) {
+          valid_ = false;
+        }
+      }
     }
   }
 }
@@ -80,6 +94,11 @@ std::string BPlusTreeIterator::Value() const {
 }
 
 BPlusTreeIterator& BPlusTreeIterator::operator++() {
+  if (!valid_) {
+    // Advancing past the end must stay a no-op instead of touching pages
+    // through a stale pid/index pair.
+    return *this;
+  }
   PageRef ref = txn_->GetPageManager()->GetPage(pid_, txn_->IsReadOnly());
   LeafPage* const lp = &ref->body.leaf_page;
   idx_++;
@@ -125,6 +144,10 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
 }
 
 BPlusTreeIterator& BPlusTreeIterator::operator--() {
+  if (!valid_) {
+    // Moving back before the begin must stay a no-op like operator++.
+    return *this;
+  }
   PageRef ref = txn_->GetPageManager()->GetPage(pid_, txn_->IsReadOnly());
   LeafPage* const lp = &ref->body.leaf_page;
   if (0 == idx_) {

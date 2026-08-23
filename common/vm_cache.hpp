@@ -16,6 +16,7 @@
 #ifndef TINYLAMB_VM_CACHE_HPP
 #define TINYLAMB_VM_CACHE_HPP
 
+#include <algorithm>
 #include <cstddef>
 #include <numeric>
 #include <ostream>
@@ -27,13 +28,20 @@ namespace tinylamb {
 template <typename T>
 class VMCache {
  public:
-  size_t FindNearestSize(size_t target = sizeof(T), size_t around = 4096) {
-    size_t upper = target * ((around + target - 1) / target);
-    size_t lower = target * (around / target);
-    if (upper - around < lower - around) {
-      return upper;
-    }
-    return lower;
+  // Block boundaries double as MADV_DONTNEED ranges, so the block size must be
+  // a page multiple (otherwise madvise fails with EINVAL and evicted pages
+  // keep their RSS).  Returns the page-aligned size nearest to `around` that
+  // still fits at least one `T`.
+  static size_t FindNearestSize(size_t target = sizeof(T),
+                                size_t around = 4096) {
+    constexpr size_t kBlockSizeForAlign = 4096;
+    const size_t min_size =
+        ((target + kBlockSizeForAlign - 1) / kBlockSizeForAlign) *
+        kBlockSizeForAlign;
+    const size_t rounded =
+        ((around + kBlockSizeForAlign / 2) / kBlockSizeForAlign) *
+        kBlockSizeForAlign;
+    return std::max(std::max(min_size, rounded), kBlockSizeForAlign);
   }
   VMCache(int fd, size_t memory_capacity, size_t offset = 0,
           size_t file_size = 0)

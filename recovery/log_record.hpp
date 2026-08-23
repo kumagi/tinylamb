@@ -17,18 +17,30 @@
 #ifndef TINYLAMB_LOG_RECORD_HPP
 #define TINYLAMB_LOG_RECORD_HPP
 
+#include <cstddef>
+#include <cstdint>
 #include <istream>
 #include <limits>
 #include <ostream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #include "checkpoint_manager.hpp"
+#include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
-#include "page/page.hpp"
+#include "page/foster_pair.hpp"
+#include "page/index_key.hpp"
+#include "page/page_type.hpp"
 
 namespace tinylamb {
 
-enum class LogType : uint16_t {
+// The 16-bit base is part of the WAL record format: records serialize the
+// type as a raw uint16_t (see the Decoder/Encoder operators below), so the
+// narrower base suggested by performance-enum-size must not be applied.
+enum class LogType : uint16_t {  // NOLINT(performance-enum-size)
   kUnknown,
   kBegin,
   kInsertRow,
@@ -113,7 +125,7 @@ struct LogRecord {
                                            page_id_t pid, std::string_view key,
                                            page_id_t redo, page_id_t undo);
 
-  static LogRecord CompensatingUpdateLogRecord(lsn_t txn, page_id_t pid,
+  static LogRecord CompensatingUpdateLogRecord(txn_id_t txn, page_id_t pid,
                                                slot_t key,
                                                std::string_view redo);
   static LogRecord CompensatingUpdateLeafLogRecord(lsn_t txn, page_id_t pid,
@@ -202,14 +214,14 @@ struct LogRecord {
   txn_id_t txn_id = 0;
   page_id_t pid = std::numeric_limits<page_id_t>::max();
   slot_t slot = std::numeric_limits<slot_t>::max();
-  std::string key{};
-  std::string undo_data{};
-  std::string redo_data{};
+  std::string key;
+  std::string undo_data;
+  std::string redo_data;
   page_id_t redo_page = 0;
   page_id_t undo_page = 0;
-  std::vector<std::pair<page_id_t, lsn_t>> dirty_page_table{};
+  std::vector<std::pair<page_id_t, lsn_t>> dirty_page_table;
   std::vector<CheckpointManager::ActiveTransactionEntry>
-      active_transaction_table{};
+      active_transaction_table;
   // Page alloc/destroy target.b
   PageType allocated_page_type = PageType::kUnknown;
 };

@@ -20,6 +20,7 @@
 
 #include "executor/index_join.hpp"
 
+#include <cstddef>
 #include <memory>
 #include <ostream>
 #include <sstream>
@@ -28,6 +29,8 @@
 
 #include "common/constants.hpp"
 #include "executor/executor_base.hpp"
+#include "index/index.hpp"
+#include "index/index_scan_iterator.hpp"
 #include "table/table.hpp"
 #include "type/value.hpp"
 

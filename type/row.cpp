@@ -21,9 +21,11 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -32,6 +34,7 @@
 #include "common/serdes.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 Value& Row::operator[](size_t i) { return values_[i]; }
@@ -41,21 +44,22 @@ const Value& Row::operator[](size_t i) const { return values_[i]; }
 size_t Row::Serialize(char* dst) const {
   const char* const original_offset = dst;
   const bool has_null =
-      std::any_of(values_.begin(), values_.end(),
-                  [](const Value& value) { return value.IsNull(); });
+      std::ranges::any_of(values_, [](const Value& value) { return value.IsNull(); });
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
-  const slot_t count = static_cast<slot_t>(values_.size());
+  const auto count = static_cast<slot_t>(values_.size());
   dst += SerializeSlot(dst, has_null ? count | kNullBitmapFlag : count);
   if (has_null) {
     const size_t bitmap_size = (values_.size() + 7) / 8;
     memset(dst, 0, bitmap_size);
     for (size_t i = 0; i < values_.size(); ++i) {
-      if (values_[i].IsNull()) dst[i / 8] |= static_cast<char>(1U << (i % 8));
+      if (values_[i].IsNull()) { dst[i / 8] |= static_cast<char>(1U << (i % 8));
+}
     }
     dst += bitmap_size;
   }
   for (const Value& value : values_) {
-    if (!value.IsNull()) dst += value.Serialize(dst);
+    if (!value.IsNull()) { dst += value.Serialize(dst);
+}
   }
   return dst - original_offset;
 }
@@ -63,7 +67,7 @@ size_t Row::Serialize(char* dst) const {
 size_t Row::Deserialize(const char* src, const Schema& sc) {
   const char* const original_offset = src;
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
-  slot_t encoded_count;
+  slot_t encoded_count = 0;
   src += DeserializeSlot(src, &encoded_count);
   const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
   const slot_t count = encoded_count & ~kNullBitmapFlag;
@@ -78,7 +82,8 @@ size_t Row::Deserialize(const char* src, const Schema& sc) {
     const bool is_null =
         has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
     Value v;
-    if (!is_null) src += v.Deserialize(src, sc.GetColumn(i).Type());
+    if (!is_null) { src += v.Deserialize(src, sc.GetColumn(i).Type());
+}
     values_.push_back(v);
   }
   return src - original_offset;
@@ -88,7 +93,7 @@ size_t Row::DeserializeProjected(const char* src, const Schema& sc,
                                  const std::vector<slot_t>& columns) {
   const char* const original_offset = src;
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
-  slot_t encoded_count;
+  slot_t encoded_count = 0;
   src += DeserializeSlot(src, &encoded_count);
   const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
   const slot_t count = encoded_count & ~kNullBitmapFlag;
@@ -129,11 +134,12 @@ size_t Row::DeserializeProjected(const char* src, const Schema& sc,
 std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
                                            slot_t column) {
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
-  slot_t encoded_count;
+  slot_t encoded_count = 0;
   src += DeserializeSlot(src, &encoded_count);
   const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
   const slot_t count = encoded_count & ~kNullBitmapFlag;
-  if (column >= count) return std::nullopt;
+  if (column >= count) { return std::nullopt;
+}
   const char* bitmap = nullptr;
   if (has_null) {
     bitmap = src;
@@ -143,7 +149,8 @@ std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
     const bool is_null =
         has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
     if (i == column) {
-      if (is_null) return std::nullopt;
+      if (is_null) { return std::nullopt;
+}
       const ValueType type = sc.GetColumn(i).Type();
       if (type != ValueType::kInt64 && type != ValueType::kDate) {
         return std::nullopt;
@@ -152,7 +159,8 @@ std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
       value.Deserialize(src, type);
       return value.value.int_value;
     }
-    if (is_null) continue;
+    if (is_null) { continue;
+}
     src += Value::SkipSerialized(src, sc.GetColumn(i).Type());
   }
   return std::nullopt;
@@ -160,12 +168,13 @@ std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
 
 size_t Row::Size() const {
   const bool has_null =
-      std::any_of(values_.begin(), values_.end(),
-                  [](const Value& value) { return value.IsNull(); });
+      std::ranges::any_of(values_, [](const Value& value) { return value.IsNull(); });
   size_t ret = sizeof(uint16_t);
-  if (has_null) ret += (values_.size() + 7) / 8;
+  if (has_null) { ret += (values_.size() + 7) / 8;
+}
   for (const auto& v : values_) {
-    if (!v.IsNull()) ret += v.Size();
+    if (!v.IsNull()) { ret += v.Size();
+}
   }
   return ret;
 }
@@ -182,7 +191,10 @@ void Row::DecodeMemcomparableFormat(std::string_view src) {
   values_.clear();
   while (!src.empty()) {
     Value v;
-    size_t advanced = v.DecodeMemcomparableFormat(src.data());
+    // Self-delimiting memcomparable chunks: the callee consumes by offsets,
+    // never as a C string.
+    size_t advanced = v.DecodeMemcomparableFormat(
+        src.data());  // NOLINT(bugprone-suspicious-stringview-data-usage)
     src.remove_prefix(advanced);
     values_.push_back(v);
   }
@@ -203,7 +215,7 @@ Row Row::Extract(const std::vector<slot_t>& elms) const {
 
 Row Row::operator+(const Row& rhs) const {
   std::vector v(values_);
-  v.reserve(v.size() + rhs.Size());
+  v.reserve(v.size() + rhs.values_.size());
   for (const auto& r : rhs.values_) {
     v.push_back(r);
   }
@@ -234,9 +246,11 @@ Decoder& operator>>(Decoder& d, Row& r) {
 }  // namespace tinylamb
 
 uint64_t std::hash<tinylamb::Row>::operator()(const tinylamb::Row& row) const {
-  uint64_t ret = 0xcafe;
+  uint64_t ret = 0x9e3779b97f4a7c15ULL;
   for (const auto& v : row.values_) {
-    ret += std::hash<tinylamb::Value>()(v);
+    ret = (ret << 7) | (ret >> 57);
+    ret ^= std::hash<tinylamb::Value>()(v);
+    ret *= 0x100000001b3ULL;
   }
   return ret;
 }

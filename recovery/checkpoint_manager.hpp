@@ -58,15 +58,19 @@ class CheckpointManager {
     }
 
     friend Encoder& operator<<(Encoder& e, const ActiveTransactionEntry& t) {
-      e << t.txn_id << (uint_fast8_t)t.status << t.last_lsn;
+      // TransactionStatus is serialized as a fixed-width uint8_t so the WAL
+      // encoding does not depend on uint_fast8_t's platform-defined width.
+      e << t.txn_id << static_cast<uint8_t>(t.status) << t.last_lsn;
       return e;
     }
     friend Decoder& operator>>(Decoder& d, ActiveTransactionEntry& t) {
-      d >> t.txn_id >> (uint_fast8_t&)t.status >> t.last_lsn;
+      uint8_t raw_status = 0;
+      d >> t.txn_id >> raw_status >> t.last_lsn;
+      t.status = static_cast<TransactionStatus>(raw_status);
       return d;
     }
     static size_t Size() {
-      return sizeof(txn_id_t) + sizeof(TransactionStatus) + sizeof(lsn_t);
+      return sizeof(txn_id_t) + sizeof(uint8_t) + sizeof(lsn_t);
     }
     bool operator==(const ActiveTransactionEntry& rhs) const = default;
     txn_id_t txn_id = 0;

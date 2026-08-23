@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <climits>
+#include <condition_variable>
 #include <cstddef>
 #include <deque>
 #include <filesystem>
@@ -37,8 +38,8 @@
 
 namespace tinylamb {
 class LSMTree;
-void Flusher(const bool& stop, LSMTree* tree);
-void Merger(const bool& stop, LSMTree* tree);
+void Flusher(LSMTree* tree);
+void Merger(LSMTree* tree);
 
 class LSMTree final {
  public:
@@ -53,7 +54,7 @@ class LSMTree final {
 
   StatusOr<std::string> Read(std::string_view key) const;
   bool Contains(std::string_view key) const;
-  void Write(std::string_view key, std::string_view value, bool flush = false);
+  void Write(std::string_view key, std::string_view value, bool sync = false);
   void Delete(std::string_view key, bool flush = false);
   void Sync();
 
@@ -101,13 +102,26 @@ class LSMTree final {
   std::map<std::string, LSMValue> mem_tree_;
   std::map<std::string, LSMValue> frozen_mem_tree_;
   std::atomic<size_t> generation_{0};
+  // Bumped under mem_tree_lock_ on every mem_tree_ mutation so the Flusher
+  // can skip empty Sync() attempts without taking the mutex.
+  uint64_t mem_tree_version_{0};
+  std::condition_variable_any mem_tree_cv_;
 
   BlobFile blob_;
 
   std::atomic<bool> stop_{false};
+  // Serializes whole Sync() bodies (swap -> construct -> register). Two
+  // overlapping Sync() calls used to re-install the first snapshot from
+  // frozen_mem_tree_ back into mem_tree_, flushing identical runs twice;
+  // worse, a skipped or reordered flush could write a key's value to a run
+  // NEWER than the run holding its tombstone, resurrecting deleted keys.
+  mutable std::mutex sync_lock_;
   std::thread flusher_;
   std::thread merger_;
 
+  // Lock ordering contract: when both are held, acquire mem_tree_lock_
+  // BEFORE file_tree_lock_ (MergeAll and Sync follow this order). Read/
+  // Contains take them one at a time and never nest.
   mutable std::timed_mutex mem_tree_lock_;
   mutable std::timed_mutex file_tree_lock_;
 

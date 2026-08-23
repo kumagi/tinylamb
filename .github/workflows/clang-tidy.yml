@@ -1,0 +1,20 @@
+name: clang-tidy
+on: [ push, pull_request ]
+jobs:
+  tidy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: install deps
+        run: sudo apt-get update && sudo apt-get install -y cmake clang clang-tidy
+
+      - name: configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DTINYLAMB_ENABLE_GOOGLESQL=OFF
+
+      - name: clang-tidy diff
+        run: |
+          git diff -U0 origin/main...HEAD -- '*.cpp' '*.hpp' | \
+            clang-tidy-diff.py -p build -checks='bugprone-*,performance-*' -quiet || true

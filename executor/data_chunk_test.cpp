@@ -1,8 +1,19 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/data_chunk.hpp"
+#include <cstdint>
+#include <optional>
+#include <vector>
+#include <stdexcept>
+#include <utility>
 
+#include "executor/zone_map.hpp"
+#include "common/constants.hpp"
 #include "gtest/gtest.h"
 #include "type/column.hpp"
+#include "type/schema.hpp"
+#include "type/value_type.hpp"
+#include "type/row.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 
@@ -55,8 +66,10 @@ TEST(DataChunkTest, MaintainsZoneMapsAcrossNullsAndReset) {
   chunk.Append(Row({Value(2)}));
   chunk.Append(Row({Value(7)}));
   const ZoneMap& zone = chunk.ZoneMapAt(0);
-  ASSERT_TRUE(zone.Minimum());
-  ASSERT_TRUE(zone.Maximum());
+  if (!zone.Minimum() || !zone.Maximum()) {
+    GTEST_FAIL() << "zone map not populated";
+    return;
+  }
   EXPECT_EQ(*zone.Minimum(), Value(2));
   EXPECT_EQ(*zone.Maximum(), Value(9));
   EXPECT_EQ(zone.NullCount(), 1U);
@@ -198,6 +211,102 @@ TEST(DataChunkTest, ReserveThenAppendBeyondCapacity) {
     EXPECT_EQ(chunk.RowAt(i), Row({Value(int64_t{i}), Value("row")}));
     EXPECT_EQ(chunk.PositionAt(i), RowPosition(1, static_cast<slot_t>(i)));
   }
+}
+
+TEST(DataChunkTest, AppendRowFromColumnsBuildsRowsColumnWise) {
+  DataChunk input(std::vector<ValueType>{ValueType::kInt64,
+                                         ValueType::kVarChar});
+  input.Append(Row({Value(1), Value("one")}), RowPosition(2, 0));
+  input.Append(Row({Value(), Value()}), RowPosition(2, 1));
+  input.Append(Row({Value(3), Value("three")}), RowPosition(2, 2));
+
+  DataChunk projected;
+  std::vector<const ColumnVector*> sources = {&input.ColumnAt(1),
+                                              &input.ColumnAt(0)};
+  projected.AppendRowFromColumns(sources, 0, input.PositionAt(0));
+  projected.AppendRowFromColumns(sources, 2, input.PositionAt(2));
+
+  ASSERT_EQ(projected.Size(), 2);
+  ASSERT_EQ(projected.ColumnCount(), 2);
+  EXPECT_EQ(projected.ColumnAt(0).Type(), ValueType::kVarChar);
+  EXPECT_EQ(projected.ColumnAt(1).Type(), ValueType::kInt64);
+  EXPECT_EQ(projected.RowAt(0), Row({Value("one"), Value(1)}));
+  EXPECT_EQ(projected.RowAt(1), Row({Value("three"), Value(3)}));
+  EXPECT_EQ(projected.PositionAt(1), RowPosition(2, 2));
+  const ZoneMap& names = projected.ZoneMapAt(0);
+  if (!names.Minimum() || !names.Maximum()) {
+    GTEST_FAIL() << "zone map not populated";
+    return;
+  }
+  EXPECT_EQ(*names.Minimum(), Value("one"));
+  EXPECT_EQ(*names.Maximum(), Value("three"));
+  EXPECT_EQ(projected.ZoneMapAt(1).NullCount(), 0U);
+}
+
+TEST(DataChunkTest, AppendRowFromColumnsInfersNullOnlyColumns) {
+  DataChunk input(std::vector<ValueType>{ValueType::kInt64});
+  input.Append(Row({Value()}));
+  input.Append(Row({Value(5)}));
+
+  DataChunk projected;
+  std::vector<const ColumnVector*> sources = {&input.ColumnAt(0)};
+  projected.AppendRowFromColumns(sources, 0);
+  projected.AppendRowFromColumns(sources, 1);
+  ASSERT_EQ(projected.Size(), 2);
+  EXPECT_TRUE(projected.ColumnAt(0).IsNull(0));
+  EXPECT_FALSE(projected.ColumnAt(0).IsNull(1));
+  EXPECT_EQ(projected.ColumnAt(0).ValueAt(1), Value(5));
+  EXPECT_EQ(projected.ZoneMapAt(0).NullCount(), 1U);
+  EXPECT_EQ(projected.ZoneMapAt(0).ValueCount(), 1U);
+}
+
+TEST(DataChunkTest, AppendRowFromColumnsWidthMismatchThrows) {
+  DataChunk input(std::vector<ValueType>{ValueType::kInt64,
+                                         ValueType::kVarChar});
+  input.Append(Row({Value(1), Value("x")}));
+  DataChunk target(std::vector<ValueType>{ValueType::kInt64});
+  std::vector<const ColumnVector*> sources = {&input.ColumnAt(0),
+                                              &input.ColumnAt(1)};
+  EXPECT_ANY_THROW(target.AppendRowFromColumns(sources, 0));
+}
+
+TEST(DataChunkTest, CopyRowBetweenChunksPreservesNullsAndZoneMap) {
+  DataChunk input(std::vector<ValueType>{ValueType::kInt64,
+                                         ValueType::kVarChar,
+                                         ValueType::kDate});
+  input.Append(Row({Value(4), Value("b"), Value::DateFromDays(9)}));
+  input.Append(Row({Value(), Value("a"), Value()}));
+  DataChunk output;
+  output.Append(input, 1);
+  output.Append(input, 0);
+  ASSERT_EQ(output.Size(), 2);
+  EXPECT_EQ(output.ColumnAt(0).Type(), ValueType::kInt64);
+  EXPECT_TRUE(output.ColumnAt(0).IsNull(0));
+  EXPECT_EQ(output.ColumnAt(0).ValueAt(1), Value(4));
+  EXPECT_EQ(output.ColumnAt(1).ValueAt(0), Value("a"));
+  EXPECT_EQ(output.ColumnAt(2).ValueAt(1), Value::DateFromDays(9));
+  // Zone maps must survive the unboxed copy, including the date type.
+  const std::optional<Value> date_minimum = output.ZoneMapAt(2).Minimum();
+  if (!date_minimum) {
+    GTEST_FAIL() << "zone map not populated";
+    return;
+  }
+  EXPECT_EQ(*date_minimum, Value::DateFromDays(9));
+  EXPECT_TRUE(output.ZoneMapAt(2).MayMatch(BinaryOperation::kEquals,
+                                           Value::DateFromDays(9)));
+  EXPECT_FALSE(output.ZoneMapAt(2).MayMatch(BinaryOperation::kEquals,
+                                            Value::DateFromDays(10)));
+  EXPECT_EQ(output.ZoneMapAt(0).NullCount(), 1U);
+  EXPECT_EQ(output.ZoneMapAt(1).Minimum(), Value("a"));
+}
+
+TEST(DataChunkTest, CopyRowTypeMismatchThrowsWithoutPartialAppend) {
+  DataChunk source(std::vector<ValueType>{ValueType::kDouble});
+  source.Append(Row({Value(1.5)}));
+  DataChunk target(std::vector<ValueType>{ValueType::kInt64});
+  EXPECT_THROW(target.Append(source, 0), std::invalid_argument);
+  EXPECT_EQ(target.Size(), 0U);
+  EXPECT_NO_THROW(target.Append(Row({Value(int64_t{2})})));
 }
 
 }  // namespace tinylamb

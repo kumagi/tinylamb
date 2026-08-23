@@ -12,24 +12,35 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- */
+  */
 
-#include <iostream>
+#include <stdlib.h>  // NOLINT(modernize-deprecated-headers) // POSIX setenv/unsetenv below are only provided by this header.
+#include <algorithm>
+#include <cstddef>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
+#include <tuple>
+#include <utility>
 
+#include "common/constants.hpp"
 #include "common/encoder.hpp"
+#include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
+#include "page/page_ref.hpp"
+#include "page/page_type.hpp"
+#include "table/iterator.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "transaction_context.hpp"
+#include "type/constraint.hpp"
 #include "type/function.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -71,7 +82,7 @@ TEST_F(CatalogTest, CreateTable) {
                                     Column("col3", ValueType::kVarChar)});
 
   // Act -- create table and pre-commit
-  rs_->CreateTable(ctx, new_schema);
+  ASSERT_SUCCESS(rs_->CreateTable(ctx, new_schema).GetStatus());
   ctx.txn_.PreCommit();
 
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
@@ -84,14 +95,14 @@ TEST_F(CatalogTest, GetTable) {
                                     Column("col3", ValueType::kVarChar)});
   {
     TransactionContext ctx = rs_->BeginContext();
-    rs_->CreateTable(ctx, new_schema);
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, new_schema).GetStatus());
     ctx.txn_.PreCommit();
   }
 
   // Act -- open second context, get table, pre-commit
   {
     TransactionContext ctx = rs_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                           ctx.GetTable("test_schema"));
     ctx.txn_.PreCommit();
 
@@ -120,7 +131,7 @@ TEST_F(CatalogTest, Recover) {
   Recover();
   {
     TransactionContext ctx = rs_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                           ctx.GetTable("test_schema"));
     ctx.txn_.PreCommit();
 
@@ -178,7 +189,7 @@ TEST_F(CatalogTest, StatisticsUpdateAndRefresh) {
   }
   {
     TransactionContext ctx = rs_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                           ctx.GetTable("stats_tbl"));
     ASSERT_SUCCESS(
         tbl->Insert(ctx.txn_, Row({Value(1)})).GetStatus());
@@ -189,7 +200,7 @@ TEST_F(CatalogTest, StatisticsUpdateAndRefresh) {
 
   {
     TransactionContext ctx = rs_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<TableStatistics>, stats,
                           ctx.GetStats("stats_tbl"));
 
     // Assert -- statistics are not updated implicitly by inserts
@@ -201,7 +212,7 @@ TEST_F(CatalogTest, StatisticsUpdateAndRefresh) {
   }
   {
     TransactionContext ctx = rs_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, refreshed,
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<TableStatistics>, refreshed,
                           ctx.GetStats("stats_tbl"));
     EXPECT_EQ(refreshed->Rows(), 2);
 
@@ -212,7 +223,7 @@ TEST_F(CatalogTest, StatisticsUpdateAndRefresh) {
   }
   {
     TransactionContext ctx = rs_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, updated,
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<TableStatistics>, updated,
                           ctx.GetStats("stats_tbl"));
     EXPECT_EQ(updated->Rows(), 6);
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
@@ -230,7 +241,7 @@ TEST_F(CatalogTest, BeginReadOnlyContext) {
 
   // Act -- open a read-only context and fetch the table
   TransactionContext ctx = rs_->BeginReadOnlyContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                         ctx.GetTable("ro_tbl"));
 
   // Assert -- the table is visible to the read-only transaction
@@ -247,10 +258,8 @@ TEST_F(CatalogTest, StreamDatabaseAndContext) {
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
-                        ctx.GetTable("stream_tbl"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
-                        ctx.GetStats("stream_tbl"));
+  ASSERT_TRUE(ctx.GetTable("stream_tbl").HasValue());
+  ASSERT_TRUE(ctx.GetStats("stream_tbl").HasValue());
 
   // Act -- stream the context and the database
   std::ostringstream oss;
@@ -277,13 +286,13 @@ TEST_F(CatalogTest, TransactionContextCache) {
   TransactionContext ctx = rs_->BeginContext();
 
   // Act -- request the table and stats twice each
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl1,
                         ctx.GetTable("cache_tbl"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl2,
                         ctx.GetTable("cache_tbl"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, s1,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<TableStatistics>, s1,
                         ctx.GetStats("cache_tbl"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, s2,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<TableStatistics>, s2,
                         ctx.GetStats("cache_tbl"));
 
   // Assert -- subsequent requests hit the context-local cache
@@ -386,6 +395,10 @@ TEST_F(CatalogTest, PageStoragePageSlotsAllocateReuse) {
     EXPECT_EQ(gone.GetStatus(), Status::kNotExists);
 
     // Act -- destroy the page so its id returns to the free list
+    // HAZARD: this commits a kSystemDestroyPage record whose redo is not
+    // implemented (recovery_manager.cpp throws on replay). A crash followed
+    // by recovery of THIS database would fail at startup. Pinned here until
+    // destroy-redo is designed; do not copy this pattern into other tests.
     pm->DestroyPage(txn, first.get());
   }
 
@@ -442,10 +455,10 @@ TEST_F(CatalogTest, CreateTableWithUniqueColumn) {
   // Assert -- the catalog entry round-trips and carries the unique index
   {
     TransactionContext ctx = rs_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                           ctx.GetTable("unique_tbl"));
     ASSERT_EQ(schema, tbl->GetSchema());
-    ASSERT_EQ(tbl->IndexCount(), 1u);
+    ASSERT_EQ(tbl->IndexCount(), 1U);
     ASSERT_TRUE(tbl->GetIndex(0).IsUnique());
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
@@ -465,7 +478,7 @@ TEST_F(CatalogTest, UniqueIndexRejectsDuplicateKeys) {
   // Act -- insert one row, then a second row that collides on the key
   {
     TransactionContext ctx = rs_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                           ctx.GetTable("uniq_ins"));
     ASSERT_SUCCESS(
         tbl->Insert(ctx.txn_, Row({Value(1), Value("alice")})).GetStatus());
@@ -492,7 +505,7 @@ TEST_F(CatalogTest, DropTableRemovesCatalogAndStatistics) {
   // Act -- fetch the table, drop it, and commit.
   {
     TransactionContext ctx = rs_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, before,
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, before,
                           ctx.GetTable("drop_tbl"));
     EXPECT_EQ(schema, before->GetSchema());
     ASSERT_SUCCESS(rs_->DropTable(ctx, "drop_tbl"));
@@ -530,12 +543,304 @@ TEST_F(CatalogTest, CreateIndexOnExistingTable) {
   // Assert -- the updated catalog entry carries the new index.
   {
     TransactionContext ctx = rs_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                           ctx.GetTable("idx_tbl"));
-    EXPECT_EQ(tbl->IndexCount(), 1u);
+    EXPECT_EQ(tbl->IndexCount(), 1U);
     EXPECT_EQ(tbl->GetIndex(0).sc_.name_, "idx_tbl|name");
     ctx.txn_.PreCommit();
   }
+}
+
+TEST_F(CatalogTest, CreateIndexRefreshesContextCache) {
+  // Arrange -- create and commit a table without indexes.
+  Schema schema("cache_idx", {Column("id", ValueType::kInt64),
+                              Column("name", ValueType::kVarChar)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Act -- warm the context cache with the pre-index image, then run the DDL
+  // on the same context.
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, stale,
+                          ctx.GetTable("cache_idx"));
+    EXPECT_EQ(stale->IndexCount(), 0U);
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "cache_idx",
+                                    IndexSchema("cache_idx|name", {1})));
+
+    // Assert -- lookups now serve a refreshed image that carries the index.
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, fresh,
+                          ctx.GetTable("cache_idx"));
+    ASSERT_EQ(fresh->IndexCount(), 1U);
+    EXPECT_EQ(fresh->GetIndex(0).sc_.name_, "cache_idx|name");
+
+    // A row written through the refreshed image must maintain the new index;
+    // through the stale one the entry would be missing for good.
+    ASSERT_SUCCESS(
+        fresh->Insert(ctx.txn_, Row({Value(1), Value("alice")})).GetStatus());
+    Iterator it = fresh->BeginIndexScan(ctx.txn_, fresh->GetIndex(0));
+    ASSERT_TRUE(it.IsValid());
+    EXPECT_EQ((*it)[1], Value("alice"));
+    ++it;
+    EXPECT_FALSE(it.IsValid());
+
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+}
+
+TEST_F(CatalogTest, DropTableInvalidatesContextCache) {
+  // Arrange -- create and commit a table.
+  Schema schema("cache_drop", {Column("c", ValueType::kInt64)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Act -- populate the context cache, then drop on the same context.
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, cached,
+                        ctx.GetTable("cache_drop"));
+  std::ignore = cached;
+  ASSERT_SUCCESS(rs_->DropTable(ctx, "cache_drop"));
+
+  // Assert -- the dropped table is no longer served from the cache.
+  EXPECT_EQ(ctx.GetTable("cache_drop").GetStatus(), Status::kNotExists);
+  ctx.txn_.Abort();
+}
+
+TEST_F(CatalogTest, MoveAssignmentClearsCaches) {
+  // Arrange -- create and commit a table, then warm the context cache.
+  Schema schema("move_ctx", {Column("c", ValueType::kInt64)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl, ctx.GetTable("move_ctx"));
+  std::ignore = tbl;
+
+  // Act -- move-assign a fresh context over this one.
+  TransactionContext moved = rs_->BeginReadOnlyContext();
+  moved = std::move(ctx);
+
+  // Assert -- the inherited caches were cleared with the moved txn.
+  std::ostringstream oss;
+  oss << moved;
+  EXPECT_EQ(oss.str().find("move_ctx"), std::string::npos);
+  EXPECT_NE(oss.str().find("TransactionContext"), std::string::npos);
+  moved.txn_.Abort();
+}
+
+// Regression test derived from table_fuzzer (crash-5983ad8f). The fuzzer
+// commits a table plus two secondary indexes and then emulates a crash on its
+// first input byte; reopening failed with kNotExists even though plain
+// CreateTable survives (CatalogTest.Recover). These tests pin down the
+// index-carrying catalog across the same crash boundary.
+TEST_F(CatalogTest, TableWithIndexesSurvivesCrash) {
+  // Arrange -- create a table and two secondary indexes, then commit.
+  Schema schema("fuzz_tbl",
+                {Column("f_id", ValueType::kInt64, Constraint(Constraint::kIndex)),
+                 Column("name", ValueType::kVarChar),
+                 Column("double", ValueType::kDouble)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "fuzz_tbl", IndexSchema("num_idx", {0})));
+    ASSERT_SUCCESS(rs_->CreateIndex(ctx, "fuzz_tbl", IndexSchema("str_idx", {1})));
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Act -- emulate a crash and recover from the log.
+  Recover();
+
+  // Assert -- the table and both indexes come back.
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl, ctx.GetTable("fuzz_tbl"));
+  EXPECT_EQ(tbl->IndexCount(), 2U);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(CatalogTest, CreateIndexAloneSurvivesCrash) {
+  // Arrange -- commit a bare table first (this is known to survive recovery).
+  Schema schema("solo_idx",
+                {Column("id", ValueType::kInt64),
+                 Column("name", ValueType::kVarChar)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  Recover();
+
+  // Act -- add one secondary index in its own committed transaction.
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(ctx, "solo_idx", IndexSchema("by_name", {1})));
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Act -- crash again and recover.
+  Recover();
+
+  // Assert -- the index added after recovery is still attached.
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl, ctx.GetTable("solo_idx"));
+  EXPECT_EQ(tbl->IndexCount(), 1U);
+  EXPECT_EQ(tbl->GetIndex(0).sc_.name_, "by_name");
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(CatalogTest, EmptyReadCommitBeforeCrashKeepsTable) {
+  // Regression test derived from table_fuzzer (crash-5983ad8f, input 0x1d).
+  // The fuzzer commits a table plus two secondary indexes, then commits one
+  // read-only context (GetTable + PreCommit with no writes), then emulates a
+  // crash; reopening loses the table even though either step alone survives.
+  Schema schema("empty_read_tbl",
+                {Column("f_id", ValueType::kInt64,
+                         Constraint(Constraint::kIndex)),
+                 Column("name", ValueType::kVarChar),
+                 Column("double", ValueType::kDouble)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(ctx, "empty_read_tbl", IndexSchema("num_idx", {0})));
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(ctx, "empty_read_tbl", IndexSchema("str_idx", {1})));
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Act -- a committed read that touches the catalog, then a crash.
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_TRUE(ctx.GetTable("empty_read_tbl").HasValue());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  // Crash exactly like the fuzzer does: discard updates and tear down the
+  // old instance BEFORE opening a fresh one, so no shutdown-time writeback
+  // can resurrect buffer-pool images that never reached the disk.
+  rs_->EmulateCrash();
+  rs_.reset();
+  rs_ = std::make_unique<Database>(prefix_);
+
+  // Assert -- the table survives.
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                        ctx.GetTable("empty_read_tbl"));
+  EXPECT_EQ(tbl->GetSchema().Name(), "empty_read_tbl");
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+// Bug probes derived from the table_fuzzer / standalone reproduction
+// (twogen*.cpp).  Three facts established empirically:
+//  - Two clean crash-recovery cycles keep a committed table (passes today).
+//  - Database::CreateIndex returns kNotExists on ANY recovered database,
+//    even though GetTable on the same instance resolves the table.
+//  - Committing that failed CreateIndex context poisons the log: the table
+//    is gone after the next recovery.
+TEST_F(CatalogTest, TwoCleanRecoveryCyclesKeepTable) {
+  Schema schema("two_gen", {Column("id", ValueType::kInt64),
+                            Column("name", ValueType::kVarChar)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  Recover();
+  Recover();  // second crash-recovery cycle without any DDL in between
+
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl, ctx.GetTable("two_gen"));
+  EXPECT_EQ(tbl->GetSchema().Name(), "two_gen");
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(CatalogTest, CreateIndexOnRecoveredTableFails) {
+  // Documents bug: CreateIndex must succeed on a recovered database, but
+  // currently returns kNotExists there while GetTable resolves the same
+  // name just fine.
+  Schema schema("recovered_idx", {Column("id", ValueType::kInt64),
+                                  Column("name", ValueType::kVarChar)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  Recover();
+
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    // Sanity: the plain lookup works on this very instance.
+    ASSERT_TRUE(ctx.GetTable("recovered_idx").HasValue());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    const Status created =
+        rs_->CreateIndex(ctx, "recovered_idx", IndexSchema("by_name", {1}));
+    // Expected behaviour; currently fails with kNotExists.
+    EXPECT_EQ(created, Status::kSuccess);
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+}
+
+TEST_F(CatalogTest, FailedCreateIndexCommitDoesNotPoisonCatalog) {
+  // Documents bug: committing the context whose CreateIndex failed wipes the
+  // previously committed table at the NEXT recovery.
+  Schema schema("poison_probe", {Column("id", ValueType::kInt64),
+                                 Column("name", ValueType::kVarChar)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  Recover();
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    const Status created =
+        rs_->CreateIndex(ctx, "poison_probe", IndexSchema("by_name", {1}));
+    if (created != Status::kSuccess) {
+      // Current behaviour lands here; committing anyway mirrors what a
+      // caller that ignores the status would do.
+      ctx.txn_.PreCommit();
+    } else {
+      ASSERT_SUCCESS(ctx.txn_.PreCommit());
+    }
+  }
+  Recover();
+
+  TransactionContext ctx = rs_->BeginContext();
+  // Must still resolve: a failed CreateIndex commit must not poison the log.
+  ASSERT_TRUE(ctx.GetTable("poison_probe").HasValue());
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(CatalogTest, ListTablesAfterRecover) {
+  // Catalog listing must survive crash recovery together with GetTable.
+  Schema schema("listed_tbl", {Column("id", ValueType::kInt64),
+                               Column("name", ValueType::kVarChar)});
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(ctx, schema).GetStatus());
+    ASSERT_SUCCESS(rs_->CreateTable(
+                        ctx, Schema("other_tbl", {Column("id", ValueType::kInt64),
+                                               Column("name", ValueType::kVarChar)}))
+                       .GetStatus());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  Recover();
+
+  TransactionContext ctx = rs_->BeginContext();
+  const std::vector<std::string> names = rs_->ListTables(ctx);
+  EXPECT_NE(std::ranges::find(names, "listed_tbl"), names.end());
+  EXPECT_NE(std::ranges::find(names, "other_tbl"), names.end());
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
 }  // namespace tinylamb

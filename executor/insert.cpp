@@ -22,6 +22,8 @@
 
 #include <cstdint>
 #include <ostream>
+#include <stdexcept>
+#include <string>
 
 #include "common/constants.hpp"
 #include "table/table.hpp"
@@ -36,7 +38,12 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
   int64_t insertion_count = 0;
   Row new_row;
   while (src_->Next(&new_row, nullptr)) {
-    target_->Insert(*txn_, new_row);
+    if (target_->Insert(*txn_, new_row).GetStatus() != Status::kSuccess) {
+      // A failed insert (e.g. UNIQUE violation) must not be counted as
+      // inserted; surface the failure instead of reporting success.
+      throw std::runtime_error("insert failed on table " +
+                               std::string(target_->GetSchema().Name()));
+    }
     insertion_count++;
   }
   *dst = Row({Value("Insert Rows"), Value(insertion_count)});

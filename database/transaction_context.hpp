@@ -17,6 +17,9 @@
 #ifndef TINYLAMB_TRANSACTION_CONTEXT_HPP
 #define TINYLAMB_TRANSACTION_CONTEXT_HPP
 
+#include <string>
+#include <unordered_map>
+
 #include "transaction/transaction.hpp"
 // #include "transaction/transaction_manager.hpp"
 
@@ -37,6 +40,9 @@ class TransactionContext {
   TransactionContext& operator=(TransactionContext&& o) noexcept {
     txn_ = std::move(o.txn_);
     rs_ = o.rs_;
+    // Caches belong to the old context; the moved-in txn must not reuse them.
+    tables_.clear();
+    stats_.clear();
     return *this;
   }
   Database* GetDB() { return rs_; }
@@ -46,6 +52,8 @@ class TransactionContext {
 
   Status PreCommit() { return txn_.PreCommit(); }
   void Abort() { txn_.Abort(); }
+  // True once the underlying transaction committed or aborted.
+  [[nodiscard]] bool IsFinished() const { return txn_.IsFinished(); }
   friend std::ostream& operator<<(std::ostream& o,
                                   const TransactionContext& ctx);
 

@@ -1,14 +1,17 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/query_scheduler.hpp"
 
-#include <atomic>
 #include <chrono>
 #include <future>
 #include <memory>
 #include <sstream>
+#include <utility>
+#include <string>
 #include <vector>
 
 #include "executor/constant_executor.hpp"
+#include "executor/executor_base.hpp"
+#include "executor/data_chunk.hpp"
 #include "gtest/gtest.h"
 #include "type/row.hpp"
 #include "type/value.hpp"
@@ -89,7 +92,9 @@ TEST(QuerySchedulerTest, MovedFromLeaseReleaseIsNoOp) {
   auto lease = scheduler.Acquire(1, 64);
   QueryScheduler::Lease moved(std::move(lease));
   EXPECT_EQ(scheduler.UsedCpuSlots(), 1U);
-  lease.Release();
+  // Release on a moved-from lease must be a no-op; that contract is what
+  // this test verifies.
+  lease.Release();  // NOLINT(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
   EXPECT_EQ(scheduler.UsedCpuSlots(), 1U);
   moved.Release();
   EXPECT_EQ(scheduler.UsedCpuSlots(), 0U);

@@ -49,7 +49,7 @@ class Schema {
   bool operator==(const Schema& rhs) const = default;
   friend std::ostream& operator<<(std::ostream& o, const Schema& s);
   friend Encoder& operator<<(Encoder& a, const Schema& sc);
-  friend Decoder& operator>>(Decoder& a, Schema& sc);
+  friend Decoder& operator>>(Decoder& e, Schema& sc);
 
  private:
   std::string name_;

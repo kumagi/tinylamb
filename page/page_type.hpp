@@ -53,7 +53,7 @@ inline std::string PageTypeString(enum PageType type) {
 
 std::ostream& operator<<(std::ostream& o, const PageType& type);
 Encoder& operator<<(Encoder& e, const PageType& type);
-Decoder& operator>>(Decoder& e, PageType& type);
+Decoder& operator>>(Decoder& d, PageType& type);
 
 }  // namespace tinylamb
 

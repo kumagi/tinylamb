@@ -89,6 +89,12 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   while (iter.IsValid()) {
     std::string key = iter.Key();
     std::string value = iter.Value();
+    if (expected_iter == expected.end()) {
+      // The view enumerated more entries than the model: stop instead of
+      // dereferencing past the map's end.
+      LOG(FATAL) << "view yields more keys than the model: " << key;
+      exit(1);
+    }
     if (key != expected_iter->first) {
       LOG(FATAL) << "key mismatch " << key << " vs " << expected_iter->first;
       exit(1);

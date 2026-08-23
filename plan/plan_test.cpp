@@ -17,12 +17,16 @@
 #include "plan/plan.hpp"
 
 #include <algorithm>
-#include <iostream>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <sstream>
+#include <vector>
+#include <utility>
 
 #include "aggregation_plan.hpp"
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
@@ -31,7 +35,6 @@
 #include "executor/executor_base.hpp"
 #include "executor/hash_join_mode.hpp"
 #include "executor/query_memory.hpp"
-#include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "full_scan_plan.hpp"
@@ -159,7 +162,9 @@ TEST_F(PlanTest, ScanPlan) {
   // Arrange -- begin context, get Sc1 table, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
 
   // Act -- construct FullScanPlan and dump via LOG(INFO)
   Plan fs(new FullScanPlan(*tbl, ts));
@@ -172,7 +177,9 @@ TEST_F(PlanTest, ProjectPlan) {
   // Arrange -- begin context, get Sc1 table, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
 
   // Act -- construct ProjectionPlan projecting c1, dump via LOG(INFO)
   Plan pp(new ProjectionPlan(std::make_shared<FullScanPlan>(*tbl, ts),
@@ -186,7 +193,9 @@ TEST_F(PlanTest, SelectionPlan) {
   // Arrange -- begin context, get Sc1 table, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
 
   // Act -- construct SelectionPlan with filter c1 >= 100, dump via LOG(INFO)
   Expression exp = BinaryExpressionExp(ColumnValueExp("c1"),
@@ -202,8 +211,12 @@ TEST_F(PlanTest, HashJoinPlan) {
   // Arrange -- begin context, get Sc1 and Sc2 tables, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  const auto tbl1_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl1_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl1 = tbl1_or.Value();
+  const auto tbl2_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl2_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl2 = tbl2_or.Value();
 
   // Act -- construct ProductPlan (hash join on Sc1.c1 = Sc2.d1), dump via LOG(INFO)
   Plan prop(new ProductPlan(
@@ -218,8 +231,12 @@ TEST_F(PlanTest, IndexJoinPlan) {
   // Arrange -- begin context, get Sc1 and Sc2 tables, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  const auto tbl1_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl1_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl1 = tbl1_or.Value();
+  const auto tbl2_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl2_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl2 = tbl2_or.Value();
 
   // Act -- construct ProductPlan (index join on Sc2PK index), dump via LOG(INFO)
   Plan prop(new ProductPlan(std::make_shared<FullScanPlan>(*tbl1, ts),
@@ -234,8 +251,12 @@ TEST_F(PlanTest, ProductPlanCrossJoin) {
   // Arrange -- begin context, get Sc1 and Sc2 tables, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  const auto tbl1_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl1_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl1 = tbl1_or.Value();
+  const auto tbl2_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl2_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl2 = tbl2_or.Value();
 
   // Act -- construct ProductPlan (cross join), dump via LOG(INFO)
   Plan prop(new ProductPlan(std::make_shared<FullScanPlan>(*tbl1, ts),
@@ -249,7 +270,9 @@ TEST_F(PlanTest, UnaryPlan) {
   // Arrange -- begin context, get Sc1 table, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
 
   // Act -- construct SelectionPlan with IS NULL filter on c1, dump via LOG(INFO)
   Expression exp =
@@ -264,7 +287,9 @@ TEST_F(PlanTest, AggregationPlan) {
   // Arrange -- begin context, get Sc1 table, empty statistics
   TableStatistics ts((Schema()));
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
 
   // Act -- construct AggregationPlan with count/sum/avg/min/max on c1/c3, dump via LOG(INFO)
   std::vector<NamedExpression> aggregates = {
@@ -288,9 +313,12 @@ TEST_F(PlanTest, AggregationPlan) {
 TEST_F(PlanTest, FullScanAccessors) {
   // Arrange -- begin context, get Sc1 table and its real statistics
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        ctx.GetStats("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (ctx.GetStats("Sc1"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
 
   // Act -- construct FullScanPlan and query its accessors
   Plan fs(new FullScanPlan(*tbl, *ts));
@@ -310,13 +338,15 @@ TEST_F(PlanTest, FullScanAccessors) {
 TEST_F(PlanTest, ProjectionExpressionColumn) {
   // Arrange -- begin context, get Sc1 table
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
   TableStatistics ts((Schema()));
 
   // Act -- project a synthetic expression (non-column) and a named column
   std::vector<NamedExpression> columns;
-  columns.emplace_back(NamedExpression("", ConstantValueExp(Value(1))));
-  columns.emplace_back(NamedExpression("c1"));
+  columns.emplace_back("", ConstantValueExp(Value(1)));
+  columns.emplace_back("c1");
   Plan pp(new ProjectionPlan(std::make_shared<FullScanPlan>(*tbl, ts),
                              std::move(columns)));
 
@@ -330,7 +360,9 @@ TEST_F(PlanTest, ProjectionExpressionColumn) {
 TEST_F(PlanTest, ProjectionToString) {
   // Arrange -- begin context, get Sc1 table
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
   TableStatistics ts((Schema()));
 
   // Act -- construct ProjectionPlan and render it
@@ -347,7 +379,9 @@ TEST_F(PlanTest, ProjectionToString) {
 TEST_F(PlanTest, SelectionToString) {
   // Arrange -- begin context, get Sc1 table
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
   TableStatistics ts((Schema()));
 
   // Act -- construct SelectionPlan with a >= filter and render it
@@ -368,7 +402,9 @@ TEST_F(PlanTest, SelectionToString) {
 TEST_F(PlanTest, AggregationAccessors) {
   // Arrange -- begin context, get Sc1 table
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
   TableStatistics ts((Schema()));
   auto child = std::make_shared<FullScanPlan>(*tbl, ts);
 
@@ -409,8 +445,12 @@ TEST_F(PlanTest, AggregationAccessors) {
 TEST_F(PlanTest, ProductCrossJoinAccessors) {
   // Arrange -- begin context, get Sc1 and Sc2 tables
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  const auto tbl1_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl1_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl1 = tbl1_or.Value();
+  const auto tbl2_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl2_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl2 = tbl2_or.Value();
   TableStatistics ts((Schema()));
   auto left = std::make_shared<FullScanPlan>(*tbl1, ts);
   auto right = std::make_shared<FullScanPlan>(*tbl2, ts);
@@ -435,8 +475,12 @@ TEST_F(PlanTest, ProductCrossJoinAccessors) {
 TEST_F(PlanTest, ProductHashJoinAccessors) {
   // Arrange -- begin context, get Sc1 and Sc2 tables
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  const auto tbl1_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl1_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl1 = tbl1_or.Value();
+  const auto tbl2_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl2_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl2 = tbl2_or.Value();
   TableStatistics ts((Schema()));
   auto left = std::make_shared<FullScanPlan>(*tbl1, ts);
   auto right = std::make_shared<FullScanPlan>(*tbl2, ts);
@@ -461,8 +505,12 @@ TEST_F(PlanTest, ProductHashJoinAccessors) {
 
 TEST_F(PlanTest, ProductHybridHashJoinPreferredUnderTinyBudget) {
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  const auto tbl1_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl1_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl1 = tbl1_or.Value();
+  const auto tbl2_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl2_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl2 = tbl2_or.Value();
   // Non-zero row estimates so PreferHybridHashJoin sees a real build footprint.
   TableStatistics left_ts((Schema()));
   TableStatistics right_ts((Schema()));
@@ -471,7 +519,8 @@ TEST_F(PlanTest, ProductHybridHashJoinPreferredUnderTinyBudget) {
   auto left = std::make_shared<FullScanPlan>(*tbl1, left_ts);
   auto right = std::make_shared<FullScanPlan>(*tbl2, right_ts);
 
-  QueryMemoryBudget::Global().ResetForTest(64 * 1024);
+  QueryMemoryBudget::Global().ResetForTest(
+      static_cast<size_t>(64) * static_cast<size_t>(1024));
   Plan in_memory(new ProductPlan(left, {ColumnName("Sc1.c1")}, right,
                                  {ColumnName("Sc2.d1")},
                                  HashJoinMode::kInMemory));
@@ -485,10 +534,15 @@ TEST_F(PlanTest, ProductHybridHashJoinPreferredUnderTinyBudget) {
 TEST_F(PlanTest, ProductIndexJoinAccessors) {
   // Arrange -- begin context, get Sc1 and Sc2 tables and the Sc2PK index
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts2,
-                        ctx.GetStats("Sc2"));
+  const auto tbl1_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl1_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl1 = tbl1_or.Value();
+  const auto tbl2_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl2_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl2 = tbl2_or.Value();
+  const auto ts2_or = (ctx.GetStats("Sc2"));
+  ASSERT_EQ(ts2_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts2 = ts2_or.Value();
   TableStatistics ts((Schema()));
   auto left = std::make_shared<FullScanPlan>(*tbl1, ts);
 
@@ -509,9 +563,12 @@ TEST_F(PlanTest, ProductIndexJoinAccessors) {
 TEST_F(PlanTest, IndexOnlyScanPlanBasic) {
   // Arrange -- begin context, get Sc2 table and its Sc2PK index
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc2"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        ctx.GetStats("Sc2"));
+  const auto tbl_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (ctx.GetStats("Sc2"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
 
   // Act -- construct an unbounded index-only scan
   Plan plan(new IndexOnlyScanPlan(*tbl, tbl->GetIndex(0), *ts, {}, {}, true,
@@ -532,9 +589,12 @@ TEST_F(PlanTest, IndexOnlyScanPlanBasic) {
 TEST_F(PlanTest, IndexOnlyScanPlanUniqueLookup) {
   // Arrange -- begin context, get Sc2 table and its unique Sc2PK index
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc2"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        ctx.GetStats("Sc2"));
+  const auto tbl_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (ctx.GetStats("Sc2"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
 
   // Act -- construct a point lookup on the unique key
   Plan plan(new IndexOnlyScanPlan(*tbl, tbl->GetIndex(0), *ts, {Value(52)},
@@ -548,9 +608,12 @@ TEST_F(PlanTest, IndexOnlyScanPlanUniqueLookup) {
 TEST_F(PlanTest, IndexOnlyScanPlanOrderedBy) {
   // Arrange -- begin context, get Sc2 table and its Sc2PK index
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc2"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        ctx.GetStats("Sc2"));
+  const auto tbl_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (ctx.GetStats("Sc2"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
 
   // Act -- construct an ascending index-only scan advertising its order
   std::vector<ColumnName> provided{ColumnName("Sc2.d1")};
@@ -571,8 +634,9 @@ TEST_F(PlanTest, IndexOnlyScanPlanOrderedBy) {
 TEST_F(PlanTest, IndexOnlyScanPlanHistoricalRead) {
   // Arrange -- begin a writer that inserts an uncommitted row into Sc2
   TransactionContext writer = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
-                        writer.GetTable("Sc2"));
+  const auto tbl_or = (writer.GetTable("Sc2"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
   ASSERT_SUCCESS(tbl->Insert(writer.txn_, Row({Value(999), Value(1.0),
                                                Value("new"), Value(8)}))
                      .GetStatus());
@@ -581,8 +645,9 @@ TEST_F(PlanTest, IndexOnlyScanPlanHistoricalRead) {
   // Pending writers do not force a FullScan plan gate.
   TransactionContext reader = rs_->BeginContext();
   ASSERT_FALSE(reader.txn_.RequiresHistoricalRead());
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        reader.GetStats("Sc2"));
+  const auto ts_or = (reader.GetStats("Sc2"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
   Expression where = BinaryExpressionExp(ColumnValueExp("d1"),
                                          BinaryOperation::kGreaterThanEquals,
                                          ConstantValueExp(Value(0)));
@@ -604,16 +669,19 @@ TEST_F(PlanTest, IndexOnlyScanPlanHistoricalRead) {
 TEST_F(PlanTest, ProjectionExpressionCtorAccessors) {
   // Arrange -- begin context, get Sc1 table and its real statistics
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        ctx.GetStats("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (ctx.GetStats("Sc1"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
   auto child = std::make_shared<FullScanPlan>(*tbl, *ts);
 
   // Act -- project a column value, a renamed constant, and an anonymous one
   std::vector<NamedExpression> columns;
-  columns.emplace_back(NamedExpression("first", ColumnValueExp("c1")));
-  columns.emplace_back(NamedExpression("second", ConstantValueExp(Value(7))));
-  columns.emplace_back(NamedExpression("", ConstantValueExp(Value(9))));
+  columns.emplace_back("first", ColumnValueExp("c1"));
+  columns.emplace_back("second", ConstantValueExp(Value(7)));
+  columns.emplace_back("", ConstantValueExp(Value(9)));
   Plan pp(new ProjectionPlan(child, std::move(columns)));
 
   // Assert -- named columns keep their names, anonymous ones become $col<i>
@@ -644,18 +712,21 @@ TEST_F(PlanTest, ProjectionExpressionCtorAccessors) {
 TEST_F(PlanTest, ProjectionQualifiedColumnValueNames) {
   // Arrange -- begin context, get Sc1 table and its real statistics
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        ctx.GetStats("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (ctx.GetStats("Sc1"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
   auto child = std::make_shared<FullScanPlan>(*tbl, *ts);
 
   // Act -- project a qualified ColumnValue (auto-named by its column) and an
   // explicitly renamed column
   std::vector<NamedExpression> columns;
   columns.emplace_back(
-      NamedExpression("", ColumnValueExp(ColumnName("Sc1.c1"))));
+      "", ColumnValueExp(ColumnName("Sc1.c1")));
   columns.emplace_back(
-      NamedExpression("renamed", ColumnValueExp(ColumnName("Sc1.c2"))));
+      "renamed", ColumnValueExp(ColumnName("Sc1.c2")));
   Plan pp(new ProjectionPlan(child, std::move(columns)));
 
   // Assert -- the schema carries the qualified name / the alias
@@ -670,15 +741,18 @@ TEST_F(PlanTest, ProjectionQualifiedColumnValueNames) {
 TEST_F(PlanTest, ProjectionEmitExecutorProjectsValues) {
   // Arrange -- begin context, get Sc1 table and its real statistics
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        ctx.GetStats("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (ctx.GetStats("Sc1"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
   auto child = std::make_shared<FullScanPlan>(*tbl, *ts);
 
   // Act -- project the int column and a constant 5
   std::vector<NamedExpression> columns;
-  columns.emplace_back(NamedExpression("c1"));
-  columns.emplace_back(NamedExpression("", ConstantValueExp(Value(5))));
+  columns.emplace_back("c1");
+  columns.emplace_back("", ConstantValueExp(Value(5)));
   Plan pp(new ProjectionPlan(child, std::move(columns)));
 
   // Assert -- each source row becomes a two-column projected row
@@ -701,9 +775,12 @@ TEST_F(PlanTest, ProjectionPlanIsOrderedByDelegatesToChild) {
   // Arrange -- begin context, get Sc2 table and its Sc2PK index; the index
   // scan advertises an ascending order on d1
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc2"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        ctx.GetStats("Sc2"));
+  const auto tbl_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (ctx.GetStats("Sc2"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
   std::vector<ColumnName> provided{ColumnName("Sc2.d1")};
   auto scan = std::make_shared<IndexOnlyScanPlan>(
       *tbl, tbl->GetIndex(0), *ts, std::vector<Value>{}, std::vector<Value>{},
@@ -711,7 +788,7 @@ TEST_F(PlanTest, ProjectionPlanIsOrderedByDelegatesToChild) {
 
   // Act -- project the index key column over the ordered scan
   std::vector<NamedExpression> columns;
-  columns.emplace_back(NamedExpression("d1"));
+  columns.emplace_back("d1");
   Plan pp(new ProjectionPlan(scan, std::move(columns)));
 
   // Assert -- ordering is delegated to the child plan
@@ -730,9 +807,12 @@ TEST_F(PlanTest, ProjectionPlanIsOrderedByDelegatesToChild) {
 TEST_F(PlanTest, IndexOnlyScanPlanDescendingOrder) {
   // Arrange -- begin context, get Sc2 table and its Sc2PK index
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc2"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        ctx.GetStats("Sc2"));
+  const auto tbl_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (ctx.GetStats("Sc2"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
 
   // Act -- construct a descending index-only scan advertising d1 order
   std::vector<ColumnName> provided{ColumnName("Sc2.d1")};
@@ -753,9 +833,12 @@ TEST_F(PlanTest, IndexOnlyScanPlanStaleIndexKeysFallback) {
   // Arrange -- begin a reader BEFORE a concurrent writer commits so the
   // reader's snapshot predates the committed index mutation
   TransactionContext reader = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, reader.GetTable("Sc2"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        reader.GetStats("Sc2"));
+  const auto tbl_or = (reader.GetTable("Sc2"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (reader.GetStats("Sc2"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
   {
     TransactionContext writer = rs_->BeginContext();
     ASSERT_SUCCESS(tbl->Insert(writer.txn_, Row({Value(999), Value(1.0),
@@ -797,9 +880,12 @@ TEST_F(PlanTest, IndexOnlyScanPlanStaleFallbackProjectsIncludedColumns) {
   // Act -- a reader begun before a later committed writer must use the
   // FullScan fallback, which projects both key and included columns
   TransactionContext reader = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, reader.GetTable("Sc2"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        reader.GetStats("Sc2"));
+  const auto tbl_or = (reader.GetTable("Sc2"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (reader.GetStats("Sc2"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
   ASSERT_GE(tbl->IndexCount(), 2);
   {
     TransactionContext writer = rs_->BeginContext();
@@ -833,21 +919,18 @@ TEST_F(PlanTest, IndexOnlyScanPlanStaleFallbackProjectsIncludedColumns) {
   reader.txn_.Abort();
 }
 
-// PRODUCTION BUG: ProjectionPlan(Plan, const std::vector<ColumnName>&) crashes.
-// The member initializer list moves `src` into `src_` and then evaluates
-// `stats_(src->GetStats())` (projection_plan.cpp:46-48). `Plan` is a
-// std::shared_ptr, so after the move `src` is null and `src->GetStats()` is a
-// null dereference (confirmed SIGSEGV). The constructor is therefore unusable
-// and cannot be covered without a production fix; this test documents the
-// crash so a future fix can re-enable it.
-TEST_F(PlanTest, DISABLED_ProjectionColumnNameCtorCrashesAfterMove) {
+// ProjectionPlan(Plan, vector<ColumnName>) used to dereference a moved-from src;
+// fixed in projection_plan.cpp (stats_/CalcSchema ordering).
+TEST_F(PlanTest, ProjectionColumnNameCtorBuildsSchema) {
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
   TableStatistics ts((Schema()));
   auto child = std::make_shared<FullScanPlan>(*tbl, ts);
 
-  // Constructing through the ColumnName overload dereferences the moved-from
-  // `src` shared_ptr while computing stats_ and aborts the process.
+  // Constructing through the ColumnName overload must not crash and must
+  // preserve child statistics and schema.
   Plan pp(new ProjectionPlan(child, {ColumnName("Sc1.c1"),
                                      ColumnName("Sc1.c2")}));
 
@@ -865,14 +948,17 @@ TEST_F(PlanTest, DISABLED_ProjectionColumnNameCtorCrashesAfterMove) {
 TEST_F(PlanTest, ProjectionQualifiedColumnValueAccessorsAndRender) {
   // Arrange -- begin context, get Sc1 table and its real statistics
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts,
-                        ctx.GetStats("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (ctx.GetStats("Sc1"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
   auto child = std::make_shared<FullScanPlan>(*tbl, *ts);
 
   // Act -- project a fully qualified ColumnValue (auto-named by its column)
   std::vector<NamedExpression> columns;
-  columns.emplace_back(NamedExpression("", ColumnValueExp(ColumnName("Sc1.c3"))));
+  columns.emplace_back("", ColumnValueExp(ColumnName("Sc1.c3")));
   Plan pp(new ProjectionPlan(child, std::move(columns)));
 
   // Assert -- the schema carries the qualified name and all accessors delegate
@@ -901,15 +987,17 @@ TEST_F(PlanTest, ProjectionQualifiedColumnValueAccessorsAndRender) {
 TEST_F(PlanTest, ProjectionAllAnonymousColumnsRenderAndEmit) {
   // Arrange -- begin context, get Sc1 table
   auto ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  const auto tbl_or = (ctx.GetTable("Sc1"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
   TableStatistics ts((Schema()));
   auto child = std::make_shared<FullScanPlan>(*tbl, ts);
 
   // Act -- project three anonymous constants so every column is auto-named
   std::vector<NamedExpression> columns;
-  columns.emplace_back(NamedExpression("", ConstantValueExp(Value(1))));
-  columns.emplace_back(NamedExpression("", ConstantValueExp(Value(2))));
-  columns.emplace_back(NamedExpression("", ConstantValueExp(Value(3))));
+  columns.emplace_back("", ConstantValueExp(Value(1)));
+  columns.emplace_back("", ConstantValueExp(Value(2)));
+  columns.emplace_back("", ConstantValueExp(Value(3)));
   Plan pp(new ProjectionPlan(child, std::move(columns)));
 
   // Assert -- the schema auto-names each anonymous column

@@ -1,4 +1,4 @@
-/**cache_
+/**
  * Copyright 2024 KUMAZAKI Hiroki
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,10 +18,12 @@
 #define TINYLAMB_BLOB_FILE_HPP
 
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -53,6 +55,12 @@ class BlobFile final {
   void Flush() const {
     const lsn_t lsn = file_writer_.BufferedLSN();
     while (file_writer_.CommittedLSN() < lsn) {
+      // A dead writer would stall this loop forever; surface its error.
+      if (file_writer_.Failed()) {
+        throw std::runtime_error("BlobFile flush failed: " +
+                                 std::string(std::strerror(
+                                     file_writer_.ErrorNumber())));
+      }
       std::this_thread::yield();
     }
   }
@@ -63,6 +71,8 @@ class BlobFile final {
   }
 
  private:
+  // Member order matters: `file_writer_` owns the fd, `cache_` only borrows
+  // it (Cache never closes), so the Logger is the sole closer of the file.
   Logger file_writer_;
   Cache cache_;
   std::mutex writer_lock_;

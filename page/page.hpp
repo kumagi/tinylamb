@@ -22,6 +22,7 @@
 #include <array>
 #include <cstdint>
 #include <iostream>
+#include <type_traits>
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
@@ -150,7 +151,11 @@ class Page {
 
   [[nodiscard]] bool IsValid() const;
 
-  void* operator new(size_t page_id);
+  // True when the cached checksum matches the current page image, i.e. the
+  // in-memory content equals what the last WriteBack persisted.
+  [[nodiscard]] bool ChecksumMatches() const;
+
+  void* operator new(size_t /*byte size, always kPageSize*/);
 
   void operator delete(void* page) noexcept;
 
@@ -198,6 +203,12 @@ static_assert(std::is_trivially_destructible<Page>::value == true,
               "Page must be trivially destructible");
 static_assert(sizeof(Page) == kPageSize,
               "Page size must be equal to kPageSize");
+// Page images are persisted as raw host-endian bytes (see StoredChecksum), so
+// the layout must stay standard and stable; mixed endianness across hosts is
+// NOT portable by design.
+static_assert(std::is_standard_layout_v<Page>,
+              "Page is written to disk as raw bytes; standard layout is "
+              "required");
 }  // namespace tinylamb
 
 template <>

@@ -17,16 +17,32 @@
 #include "page_pool.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
+#include <fstream>
+#include <ios>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 #include <string>
 #include <vector>
+#include "page/page_type.hpp"
 
+#ifdef __has_include
+#if __has_include(<sanitizer/lsan_interface.h>)
+#if defined(__SANITIZE_ADDRESS__) ||                 \
+    (defined(__has_feature) && __has_feature(address_sanitizer))
+#define TINYLAMB_HAS_LSAN 1
+#endif
+#endif
+#endif
+
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
@@ -48,7 +64,7 @@ class PagePoolTest : public ::testing::Test {
     Reset();
   }
   void Reset() { pp = std::make_unique<PagePool>(filename_, kDefaultCapacity); }
-  void TearDown() override { std::remove(filename_.c_str()); }
+  void TearDown() override { std::ignore = std::remove(filename_.c_str()); }
 
   std::string filename_;
   std::unique_ptr<PagePool> pp = nullptr;
@@ -115,7 +131,9 @@ TEST_F(PagePoolTest, PersistencyWithReset) {
     char* buff = p->body.free_page.FreeBody();
     ASSERT_NE(buff, nullptr);
     for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
-      buff[j] = i;
+      // The union overlay makes the whole kPageSize image writable; the
+      // analyzer cannot see that FreeBody() stays inside the allocation.
+      buff[j] = i;  // NOLINT(clang-analyzer-security.ArrayBound)
     }
   }
   // Reset();
@@ -152,6 +170,30 @@ TEST_F(PagePoolTest, PageAccessorsLSNAndChecksum) {
   ASSERT_FALSE(page->IsValid());
   page->SetChecksum();
   ASSERT_TRUE(page->IsValid());
+}
+
+TEST_F(PagePoolTest, ReadFromRejectsCorruptChecksum) {
+  {
+    PageRef page = pp->GetPage(3, nullptr);
+    page->PageInit(3, PageType::kFreePage);
+    page->SetPageLSN(1);
+    page->SetChecksum();
+    ASSERT_TRUE(page->IsValid());
+  }
+  pp->FlushPageForTest(3);
+  pp->DropAllPages();
+
+  {
+    std::fstream file(filename_,
+                      std::ios_base::in | std::ios_base::out | std::ios_base::binary);
+    ASSERT_TRUE(file.good());
+    file.seekp(static_cast<std::streamoff>((3 * kPageSize) + 8));
+    char flip = 0x5a;
+    file.write(&flip, 1);
+    ASSERT_TRUE(file.good());
+  }
+
+  EXPECT_THROW(pp->GetPage(3, nullptr), std::runtime_error);
 }
 
 TEST_F(PagePoolTest, PageInitForEveryPageType) {
@@ -378,6 +420,49 @@ TEST_F(PagePoolTest, DropAllPagesClearsPool) {
   ASSERT_EQ(pp->Size(), 1);
 }
 
+TEST_F(PagePoolTest, DropAllPagesWithPinnedRefsRetiresEntries) {
+  // Arrange -- pin one page for the whole test and another transiently
+  auto keep = pp->GetPage(4);
+  {
+    PageRef transient = pp->GetPage(5);
+    ASSERT_EQ(pp->Size(), 2);
+
+    // Act -- discard every buffered page while both refs are alive
+    pp->DropAllPages();
+    ASSERT_EQ(pp->Size(), 0);
+
+    // Assert -- the surviving refs still address live memory; their later
+    // unlatches/unpins must not touch freed entries.
+    EXPECT_EQ(keep->PageID(), 4U);
+    EXPECT_EQ(transient->PageID(), 5U);
+    // Union overlay: the write stays inside the kPageSize allocation.
+    keep->body.free_page.FreeBody()[0] = 'r';  // NOLINT(clang-analyzer-security.ArrayBound)
+  }
+  PageRef fresh = pp->GetPage(6);
+  ASSERT_EQ(fresh->PageID(), 6U);
+}
+
+TEST_F(PagePoolTest, DurabilityGateFiresForDirtyPagesOnly) {
+  // Arrange -- record every LSN the gate observes before a pwrite
+  std::vector<lsn_t> gated;
+  pp->SetDurabilityGate([&gated](lsn_t lsn) { gated.push_back(lsn); });
+
+  PageRef page = pp->GetPage(8);
+  page->SetPageLSN(77);
+  // Union overlay: the write stays inside the kPageSize allocation.
+  page->body.free_page.FreeBody()[0] = 'z';  // NOLINT(clang-analyzer-security.ArrayBound)
+
+  // Act -- flushing the dirty page must gate its page LSN first
+  pp->FlushPageForTest(8);
+  ASSERT_EQ(gated.size(), 1U);
+  ASSERT_EQ(gated[0], 77U);
+
+  // Act -- an already-persisted image carries no new information, so the
+  // gate stays silent even though WriteBack rewrites the bytes
+  pp->FlushPageForTest(8);
+  ASSERT_EQ(gated.size(), 1U);
+}
+
 TEST_F(PagePoolTest, FlushPageForTestPersistsAndNoopsForMissing) {
   // Arrange -- fill page 7's body with a deterministic pattern, then release
   // the pin so the pool entry is unpinned before it is dropped below.
@@ -386,7 +471,8 @@ TEST_F(PagePoolTest, FlushPageForTestPersistsAndNoopsForMissing) {
     char* buff = p->body.free_page.FreeBody();
     ASSERT_NE(buff, nullptr);
     for (size_t j = 0; j < FreePage::FreeBodySize(); ++j) {
-      buff[j] = static_cast<char>(0x5a);
+      // Union overlay: the write stays inside the kPageSize allocation.
+      buff[j] = static_cast<char>(0x5a);  // NOLINT(clang-analyzer-security.ArrayBound)
     }
 
     // Act -- write back page 7; flushing a never-resident page is a no-op
@@ -415,28 +501,21 @@ TEST_F(PagePoolTest, ConstructorThrowsForUnopenablePath) {
                std::runtime_error);
 }
 
-TEST_F(PagePoolTest, OutOfRangePageIdHandlesSeekFailure) {
-  // Arrange -- a page id so large that its file offset overflows the 64-bit
-  // stream position (kPageSize = 32 KiB, so 2^48 * 32KiB = 2^63)
+TEST_F(PagePoolTest, OutOfRangePageIdIsHardError) {
+  // Arrange -- a page id so large that its file offset overflows off_t
+  // (kPageSize = 32 KiB, so ids beyond 2^48 wrap the offset negative)
   constexpr page_id_t kHuge = (1ULL << 48) + 1;
 
-  // Act -- loading it fails the seek inside ReadFrom but still yields a ref
-  {
-    PageRef page = pp->GetPage(kHuge, nullptr);
-    ASSERT_EQ(page->PageID(), kHuge);
-  }
-  ASSERT_EQ(pp->Size(), 1);
+  // Act/Assert -- loading must report a hard error instead of silently
+  // materializing an empty free page that could later be persisted.
+  EXPECT_THROW(pp->GetPage(kHuge, nullptr), std::runtime_error);
+  ASSERT_EQ(pp->Size(), 0);
 
-  // Act -- evicting the out-of-range page must tolerate the failed seek; the
-  // stream is cleared before the write-back attempt, which may then report
-  // failure depending on the file state.
+  // Act -- ordinary ids keep working afterwards; the extra page forces one
+  // clean eviction round.
   for (int i = 0; i < kDefaultCapacity + 1; ++i) {
-    try {
-      PageRef page = pp->GetPage(static_cast<page_id_t>(1000 + i), nullptr);
-      EXPECT_EQ(page->PageID(), 1000 + i);
-    } catch (const std::runtime_error&) {
-      // WriteBack after a failed seek is allowed to throw.
-    }
+    PageRef page = pp->GetPage(static_cast<page_id_t>(1000) + i, nullptr);
+    ASSERT_EQ(page->PageID(), 1000 + i);
   }
   pp->DropAllPages();
   ASSERT_EQ(pp->Size(), 0);
@@ -463,6 +542,7 @@ TEST_F(PagePoolTest, ConcurrentLoadsOfSamePageInstallOnce) {
   std::atomic<bool> go{false};
   std::mutex mu;
   std::vector<std::thread> threads;
+  threads.reserve(4);
   for (int i = 0; i < 4; ++i) {
     threads.emplace_back([&] {
       while (!go.load(std::memory_order_acquire)) {
@@ -472,7 +552,7 @@ TEST_F(PagePoolTest, ConcurrentLoadsOfSamePageInstallOnce) {
         PageRef page = pp->GetPage(77, nullptr);
         EXPECT_EQ(page->PageID(), 77U);
       }
-      std::lock_guard<std::mutex> lock(mu);
+      std::scoped_lock lock(mu);
     });
   }
   go.store(true, std::memory_order_release);
@@ -484,23 +564,26 @@ TEST_F(PagePoolTest, ConcurrentLoadsOfSamePageInstallOnce) {
   ASSERT_EQ(pp->Size(), 1);
 }
 
-// PRODUCTION BUG: concurrent GetPage misses racing an eviction violate pool
-// invariants. A load can return a Page whose PageID field is 0 (wrong page),
-// and the subsequent Unpin asserts `page_entry != pool_.end()` because the
-// returned page was evicted while the ref was alive
-// (page/page_pool.cpp:149). Disabled because it deterministically aborts.
-TEST_F(PagePoolTest, DISABLED_ConcurrentEvictionAcrossThreads) {
+// Regression coverage for a former production bug: concurrent GetPage misses
+// racing an eviction used to violate pool invariants (a load could return a
+// Page whose PageID field was 0, and Unpin of a live ref could assert because
+// the returned page had been evicted underneath it). The install path now
+// serializes against write-back via flushing_ + file_latch_ and revalidates
+// capacity before installing, so this must stay green.
+TEST_F(PagePoolTest, ConcurrentEvictionAcrossThreads) {
   // Arrange -- two threads churn distinct page ids far beyond the pool
   // capacity, forcing concurrent eviction and install-race handling
   std::atomic<bool> go{false};
   std::vector<std::thread> threads;
+  threads.reserve(2);
   for (int t = 0; t < 2; ++t) {
     threads.emplace_back([&, t] {
       while (!go.load(std::memory_order_acquire)) {
         std::this_thread::yield();
       }
       for (int i = 0; i < 50; ++i) {
-        const page_id_t pid = static_cast<page_id_t>(1000 + t * 100 + i);
+        const auto pid = static_cast<page_id_t>(1000) +
+                         static_cast<page_id_t>((t * 100) + i);
         PageRef page = pp->GetPage(pid, nullptr);
         EXPECT_EQ(page->PageID(), pid);
       }
@@ -518,13 +601,20 @@ TEST_F(PagePoolTest, DISABLED_ConcurrentEvictionAcrossThreads) {
 TEST_F(PagePoolTest, DestructorWarnsOnPinnedPage) {
   // Arrange -- pin page 3 and intentionally leak the PageRef so the pool is
   // destroyed while the page is still pinned
-  auto* leaked = new PageRef(pp->GetPage(3, nullptr));
+  auto* leaked = new PageRef(
+      pp->GetPage(3, nullptr));  // Intentional leak: pins page across pool
+                                 // destruction for the test below.
   (void)leaked;
+#ifdef TINYLAMB_HAS_LSAN
+  // The leak above is deliberate; keep LeakSanitizer from flagging it.
+  __lsan_ignore_object(leaked);
+#endif
 
   // Act -- destroying the pool with a pinned page logs a caution message
-  pp.reset();
+  pp.reset();  // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks)
 
-  // Assert -- no crash; the pinned page was written back before destruction
+  // Assert -- no crash; the pinned page is deliberately NOT written back
+  // (writing under a live ref would be a data race), its dirty image is lost.
   ASSERT_EQ(pp, nullptr);
 }
 

@@ -5,39 +5,37 @@
 #ifndef TINYLAMB_RING_BUFFER_HPP
 #define TINYLAMB_RING_BUFFER_HPP
 
-#include <assert.h>
+#include <cassert>
 
 #include <atomic>
 #include <bit>
 #include <chrono>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <ostream>
 #include <thread>
-#include <valarray>
 #include <vector>
 
 namespace tinylamb {
 
-namespace {
+namespace detail {
 inline size_t NearestPowerOf2(size_t n) {
   if (n == 0) {
     return 1;
   }
   return std::bit_ceil(n);
 }
-}  // namespace
+}  // namespace detail
 
 // Thread UN-safe ring buffer.
 template <typename T>
 class SimpleRingBuffer {
  public:
-  explicit SimpleRingBuffer(size_t size) : buffer_(NearestPowerOf2(size)) {
+  explicit SimpleRingBuffer(size_t size) : buffer_(detail::NearestPowerOf2(size)) {
     assert(std::popcount(buffer_.size()) == 1);
   }
 
-  // Returns true on success. Fails if the buffer is empty.
+  // Returns true on success. Fails if the buffer is full.
   bool Enqueue(T item) {
     if (write_idx_ - read_idx_ == buffer_.size()) {
       return false;
@@ -47,7 +45,7 @@ class SimpleRingBuffer {
     return true;
   }
 
-  // Returns true on success. Fails if the buffer is full.
+  // Returns true on success. Fails if the buffer is empty.
   bool Dequeue(T* dest) {
     if (write_idx_ == read_idx_) {
       return false;
@@ -82,7 +80,8 @@ class RingBuffer {
   static_assert(static_cast<bool>(std::is_trivially_copyable_v<T>));
 
  public:
-  explicit RingBuffer(size_t size = 256) : buffer_(NearestPowerOf2(size)) {
+  explicit RingBuffer(size_t size = 256)
+      : buffer_(detail::NearestPowerOf2(size)) {
     assert(std::popcount(buffer_.size()) == 1);
   }
   RingBuffer(const RingBuffer&) = delete;
@@ -91,7 +90,9 @@ class RingBuffer {
   RingBuffer& operator=(RingBuffer&&) = delete;
   ~RingBuffer() = default;
 
-  // Returns true on success. Fails if the buffer is empty.
+  // Returns true on success. Fails if the buffer is full. On failure the
+  // caller is expected to retry (this implementation sleeps 1ms before
+  // returning; there is no wake-up mechanism yet).
   bool Enqueue(T item) {
     uint64_t write_idx = write_idx_.load(std::memory_order_relaxed);
     if (write_idx - cached_read_idx_ == buffer_.size()) {
@@ -102,14 +103,18 @@ class RingBuffer {
         return false;
       }
     }
+    // Indices grow unbounded; the mask folds them into the power-of-two
+    // buffer so wrap-around needs no modulo.
     buffer_[write_idx & (buffer_.size() - 1)] = item;
     write_idx_.store(write_idx + 1, std::memory_order_release);
     return true;
   }
 
-  // Returns true on success. Fails if the buffer is full.
+  // Returns true on success. Fails if the buffer is empty. On failure the
+  // caller is expected to retry (this implementation sleeps 1ms before
+  // returning; there is no wake-up mechanism yet).
   bool Dequeue(T* dest) {
-    uint64_t read_idx = read_idx_.load(std::memory_order_release);
+    uint64_t read_idx = read_idx_.load(std::memory_order_relaxed);
     if (cached_write_idx_ == read_idx) {
       cached_write_idx_ = write_idx_.load(std::memory_order_acquire);
       assert(read_idx <= cached_write_idx_);

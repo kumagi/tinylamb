@@ -31,13 +31,17 @@ namespace tinylamb {
 class ExecutorBase;
 class TransactionContext;
 class PlanBase;
-typedef std::shared_ptr<PlanBase> Plan;
+using Plan = std::shared_ptr<PlanBase>;
 
 struct OptimizerOptions {
   cascades::RuleSet relational_rules;
   ExpressionRuleSet expression_rules;
   std::vector<cascades::ImplementationRule> extra_implementation_rules;
   std::unordered_set<std::string> disabled_implementation_rules;
+  // Phase 5 access-path hint applied to the root physical properties.
+  cascades::AccessMethod access_method{cascades::AccessMethod::kAny};
+  // Phase 9 diagnostics: log the explored memo and the chosen plan.
+  bool dump_memo{false};
 
   [[nodiscard]] static const OptimizerOptions& Default() {
     static const OptimizerOptions options = [] {

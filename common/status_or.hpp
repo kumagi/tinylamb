@@ -24,6 +24,7 @@
 #include <cassert>
 #include <optional>
 #include <ostream>
+#include <stdexcept>
 
 #include "common/constants.hpp"
 
@@ -41,6 +42,14 @@
   ASSERT_EQ(value##_tmp.GetStatus(), Status::kSuccess); \
   type value(value##_tmp.Value())
 
+// Like ASSIGN_OR_ASSERT_FAIL, but binds `value` as a const reference into the
+// temporary StatusOr so large values (Table, Row, TableStatistics, ...) are
+// not copied. Use only when `value` is never mutated afterwards.
+#define ASSIGN_OR_ASSERT_FAIL_CONST(type, value, expr) \
+  auto value##_const_tmp = expr;                       \
+  ASSERT_EQ(value##_const_tmp.GetStatus(), Status::kSuccess); \
+  const type& value(value##_const_tmp.Value())
+
 #define COERCE(x)                                              \
   {                                                            \
     Status tmp_status = (x);                                   \
@@ -57,13 +66,24 @@
     ASSERT_EQ(tmp.Value(), expected);             \
   }
 
-#define ASSIGN_OR_CRASH(type, value, expr)                \
-  StatusOr<type> value##_tmp = expr;                      \
-  if (value##_tmp.GetStatus() != Status::kSuccess) {      \
-    LOG(FATAL) << "Crashed: " << value##_tmp.GetStatus(); \
-  }                                                       \
-  assert(value##_tmp.GetStatus() == Status::kSuccess);    \
+#define ASSIGN_OR_CRASH(type, value, expr)                       \
+  StatusOr<type> value##_tmp = expr;                             \
+  if (UNLIKELY(value##_tmp.GetStatus() != Status::kSuccess)) {   \
+    LOG(FATAL) << "Crashed: " << value##_tmp.GetStatus();        \
+    abort();                                                     \
+  }                                                              \
   type value = value##_tmp.Value()
+
+// Like ASSIGN_OR_CRASH, but binds `value` as a const reference into the
+// temporary StatusOr so the value is not copied. Use only when `value` is
+// never mutated afterwards.
+#define ASSIGN_OR_CRASH_CONST(type, value, expr)                        \
+  auto value##_const_tmp = expr;                                        \
+  if (UNLIKELY(value##_const_tmp.GetStatus() != Status::kSuccess)) {    \
+    LOG(FATAL) << "Crashed: " << value##_const_tmp.GetStatus();         \
+    abort();                                                            \
+  }                                                                     \
+  const type& value = value##_const_tmp.Value()
 
 namespace tinylamb {
 
@@ -76,16 +96,21 @@ class StatusOr {
   StatusOr(T v) : status_(Status::kSuccess), value_(std::move(v)) {}  // NOLINT
 
   [[nodiscard]] bool HasValue() const { return status_ == Status::kSuccess; }
+  // Callers must check HasValue() first: accessing the value of a failed
+  // StatusOr throws instead of dereferencing an empty optional (UB).
   T& Value() {
-    assert(status_ == Status::kSuccess);
+    if (!HasValue()) throw std::runtime_error("StatusOr has no value");
     return *value_;
   }
+  // Moves the value out and consumes the StatusOr: a second MoveValue() (or
+  // Value()) on the same object throws.
   T&& MoveValue() {
-    assert(status_ == Status::kSuccess);
+    if (!HasValue()) throw std::runtime_error("StatusOr has no value");
+    status_ = Status::kUnknown;
     return std::move(*value_);
   }
   const T& Value() const {
-    assert(status_ == Status::kSuccess);
+    if (!HasValue()) throw std::runtime_error("StatusOr has no value");
     return *value_;
   }
   [[nodiscard]] Status GetStatus() const { return status_; }

@@ -18,18 +18,22 @@
 
 #include <gtest/gtest.h>
 
-#include <memory>
+#include <string>
+#include <stdexcept>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "parser/token.hpp"
 #include "parser/tokenizer.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -54,7 +58,7 @@ TEST(ExpressionParserTest, Simple) {
 
   // Assert
   ASSERT_EQ(expr->Type(), TypeTag::kBinaryExp);
-  auto& be = expr->AsBinaryExpression();
+  const auto& be = expr->AsBinaryExpression();
   ASSERT_EQ(be.Op(), BinaryOperation::kAdd);
   ASSERT_EQ(be.Left()->Type(), TypeTag::kConstantValue);
   ASSERT_EQ(be.Right()->Type(), TypeTag::kConstantValue);
@@ -71,11 +75,11 @@ TEST(ExpressionParserTest, Precedence) {
 
   // Assert
   ASSERT_EQ(expr->Type(), TypeTag::kBinaryExp);
-  auto& be = expr->AsBinaryExpression();
+  const auto& be = expr->AsBinaryExpression();
   ASSERT_EQ(be.Op(), BinaryOperation::kAdd);
   ASSERT_EQ(be.Left()->Type(), TypeTag::kConstantValue);
   ASSERT_EQ(be.Right()->Type(), TypeTag::kBinaryExp);
-  auto& be2 = be.Right()->AsBinaryExpression();
+  const auto& be2 = be.Right()->AsBinaryExpression();
   ASSERT_EQ(be2.Op(), BinaryOperation::kMultiply);
 }
 
@@ -90,11 +94,11 @@ TEST(ExpressionParserTest, Parentheses) {
 
   // Assert
   ASSERT_EQ(expr->Type(), TypeTag::kBinaryExp);
-  auto& be = expr->AsBinaryExpression();
+  const auto& be = expr->AsBinaryExpression();
   ASSERT_EQ(be.Op(), BinaryOperation::kMultiply);
   ASSERT_EQ(be.Left()->Type(), TypeTag::kBinaryExp);
   ASSERT_EQ(be.Right()->Type(), TypeTag::kConstantValue);
-  auto& be2 = be.Left()->AsBinaryExpression();
+  const auto& be2 = be.Left()->AsBinaryExpression();
   ASSERT_EQ(be2.Op(), BinaryOperation::kAdd);
 }
 
@@ -174,7 +178,7 @@ TEST(ExpressionParserTest, FunctionCall) {
 
   // Assert
   ASSERT_EQ(expr->Type(), TypeTag::kFunctionCallExp);
-  auto& fce = expr->AsFunctionCallExpression();
+  const auto& fce = expr->AsFunctionCallExpression();
   ASSERT_EQ(fce.FuncName(), "f");
   ASSERT_EQ(fce.Args().size(), 2);
   ASSERT_EQ(fce.Args()[0]->ToString(), "1");
@@ -249,11 +253,8 @@ TEST(ExpressionParserTest, InExpression) {
 }
 
 TEST(ExpressionParserTest, InExpressionEmpty) {
-  // Arrange + Act -- parse IN with an empty list
-  Expression expr = ParseExpressionString("a IN ()");
-  // Assert -- InExpression with an empty list
-  ASSERT_EQ(expr->Type(), TypeTag::kInExp);
-  ASSERT_TRUE(expr->AsInExpression().list_.empty());
+  // Arrange + Act + Assert -- an empty IN list is a parse error
+  EXPECT_THROW(ParseExpressionString("a IN ()"), std::runtime_error);
 }
 
 TEST(ExpressionParserTest, IsNull) {
@@ -377,6 +378,26 @@ TEST(ExpressionParserTest, ParseErrors) {
   EXPECT_THROW(ParseExpressionString("COUNT(1, 2)"), std::runtime_error);
   EXPECT_THROW(ParseExpressionString("t.1"), std::runtime_error);
   EXPECT_THROW(ParseExpressionString("+"), std::runtime_error);
+  // Malformed / out-of-range numeric literals must not leak stod/stoll
+  // exception types.
+  EXPECT_THROW(ParseExpressionString("1.2.3 + 4"), std::runtime_error);
+  EXPECT_THROW(ParseExpressionString("99999999999999999999999"),
+               std::runtime_error);
+}
+
+TEST(ExpressionParserTest, DeepNestingIsRejected) {
+  // Arrange -- deeply nested parentheses exceed the parser depth limit.
+  const std::string deep(10000, '(');
+  const std::string sql = deep + "1" + std::string(10000, ')');
+
+  // Act + Assert -- throws runtime_error instead of overflowing the stack.
+  EXPECT_THROW(ParseExpressionString(sql), std::runtime_error);
+
+  // Moderate nesting below the limit still parses.
+  const std::string moderate(100, '(');
+  const Expression ok =
+      ParseExpressionString(moderate + "1" + std::string(100, ')'));
+  ASSERT_EQ(ok->Type(), TypeTag::kConstantValue);
 }
 
 TEST(ExpressionParserTest, UnaryMinusWithArithmetic) {

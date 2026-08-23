@@ -1,10 +1,14 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/query_memory.hpp"
 
+#include <atomic>
+#include <cerrno>
 #include <cstdlib>
-#include <string>
 
+#include "common/log_message.hpp"
+#include "type/row.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -16,7 +20,15 @@ size_t QueryMemoryBudget::LimitFromEnv() {
   if (env == nullptr || env[0] == '\0') {
     return kDefaultQueryMemoryBytes;
   }
-  const unsigned long long bytes = std::strtoull(env, nullptr, 10);
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long bytes = std::strtoull(env, &end, 10);
+  if (errno != 0 || end == env || *end != '\0') {
+    // Garbage in the environment variable must not silently disable the
+    // budget ("abc" would parse as 0 == unlimited).
+    LOG(WARN) << "Invalid TINYLAMB_QUERY_MEMORY_BYTES: " << env;
+    return kDefaultQueryMemoryBytes;
+  }
   return static_cast<size_t>(bytes);
 }
 

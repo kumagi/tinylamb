@@ -54,6 +54,15 @@ class TransactionManager {
 
   Status PreCommit(Transaction& txn);
 
+  // When true (default), PreCommit waits until the commit LSN is fsynced.
+  // See docs/commit_durability.md.
+  void SetSynchronousCommit(bool enabled) {
+    synchronous_commit_.store(enabled);
+  }
+  [[nodiscard]] bool SynchronousCommit() const {
+    return synchronous_commit_.load();
+  }
+
   void Abort(Transaction& txn);
 
   void CompensateInsertLog(txn_id_t txn_id, page_id_t pid, slot_t slot);
@@ -81,10 +90,12 @@ class TransactionManager {
                                  const IndexKey& redo);
   void CompensateSetFosterLog(txn_id_t txn_id, page_id_t pid,
                               const FosterPair& foster);
-  bool GetExclusiveLock(const RowPosition& rp);
-  bool GetSharedLock(const RowPosition& rp);
+  // owner defaults to an anonymous holder for tests; production callers pass
+  // the transaction id so locks can only be released by their owner.
+  bool GetExclusiveLock(const RowPosition& rp, txn_id_t owner = 0);
+  bool GetSharedLock(const RowPosition& rp, txn_id_t owner = 0);
 
-  bool TryUpgradeLock(const RowPosition& rp);
+  bool TryUpgradeLock(const RowPosition& rp, txn_id_t owner = 0);
 
   [[nodiscard]] uint64_t CurrentCommitTimestamp() const {
     return commit_timestamp_.load();
@@ -92,6 +103,10 @@ class TransactionManager {
   StatusOr<std::string> ReadVersion(
       const Transaction& txn, const RowPosition& rp,
       std::optional<std::string_view> physical) const;
+  // True when any version chain entry exists for the row.  Without one, the
+  // physical row image is the only version and is visible to every snapshot,
+  // letting readers skip the copy/cache slow path in Transaction::ReadVersion.
+  [[nodiscard]] bool HasVersionChain(const RowPosition& rp) const;
   void RegisterVersionWrite(Transaction& txn, const RowPosition& rp,
                             std::optional<std::string_view> before,
                             std::optional<std::string_view> after);
@@ -114,6 +129,7 @@ class TransactionManager {
  private:
   friend class RecoveryManager;
   friend class CheckpointManager;
+  friend class Transaction;
 
   std::unordered_map<txn_id_t, Transaction*> active_transactions_;
   std::atomic<txn_id_t> next_txn_id_ = 1;
@@ -134,6 +150,13 @@ class TransactionManager {
   void AbortVersions(Transaction& txn);
   void ReleaseLocksAndForget(Transaction& txn);
   void GarbageCollectVersions();
+
+  // Transaction move operations use these to keep active_transactions_
+  // pointing at the live object: Begin() registers the address of the
+  // Transaction it returns, and a move must carry the registration over to
+  // the new address instead of leaving a pointer to the moved-from object.
+  void MoveActiveTransaction(Transaction* from, Transaction* to);
+  void UnregisterActiveTransaction(Transaction* txn);
 
   static constexpr size_t kVersionShardCount = 64;
 
@@ -157,6 +180,7 @@ class TransactionManager {
   Logger* const logger_;
   RecoveryManager* const recovery_;
   mutable std::mutex transaction_table_lock;
+  std::atomic<bool> synchronous_commit_{true};
 };
 
 }  // namespace tinylamb

@@ -26,9 +26,13 @@
 #include <thread>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "expression/binary_expression.hpp"
 #include "parser/token.hpp"
 #include "parser/tokenizer.hpp"
+#include "query/statement.hpp"
+#include "type/value_type.hpp"
+#include "type/type.hpp"
 
 namespace tinylamb {
 
@@ -462,13 +466,10 @@ TEST(ParserTest, ParseErrors) {
                std::runtime_error);
 }
 
-// Bug: an unterminated INSERT column list runs forever.
-// ParseInsert()'s column-list loop (parser/parser.cpp:63-68) only exits on
-// TokenType::kRParen.  Once the trailing EOF sentinel is reached,
-// Parser::Advance() (parser/parser.cpp:352-357) returns {kEof, ""} without
-// advancing pos_, so `while (Peek() != kRParen)` spins forever, appending
-// empty strings to `columns` until it exhausts memory.  The fuzzer observed
-// this as malloc(2147483648) / OOM followed by a timeout.
+// Regression: an unterminated INSERT column list used to spin forever when
+// the EOF sentinel was reached. Parser::Advance() now throws at end of input,
+// so parsing fails with runtime_error instead of hanging. The watchdog below
+// guards against regressions to that historical behavior.
 TEST(ParserTest, InsertColumnListMustTerminateAtEof) {
   // Arrange -- tokenize INSERT with an unterminated column list
   const std::string sql = "INSERT INTO users (id";
@@ -479,10 +480,8 @@ TEST(ParserTest, InsertColumnListMustTerminateAtEof) {
   });
 }
 
-// Bug: CREATE TABLE with a column but no closing ')' loops forever.
-// The per-column constraint skip loop (parser/parser.cpp:329-335) repeats
-// until a Comma/RParen at depth 0; at end of input Peek() is forever Eof and
-// Advance() never moves pos_, so the loop never exits.
+// Regression: CREATE TABLE with a column but no closing ')' used to loop
+// forever at end of input; Advance() now throws instead.
 TEST(ParserTest, CreateTableColumnConstraintMustTerminateAtEof) {
   // Arrange -- tokenize CREATE TABLE with a column type but no closing ')'
   const std::string sql = "CREATE TABLE users (id INT";
@@ -493,10 +492,8 @@ TEST(ParserTest, CreateTableColumnConstraintMustTerminateAtEof) {
   });
 }
 
-// Bug: CREATE TABLE with a dangling PRIMARY/UNIQUE constraint loops forever.
-// The table-level constraint skip loop (parser/parser.cpp:287-292) has the
-// same EOF defect: at end of input Advance() returns Eof without advancing,
-// so `while (!(depth == 0 && (Comma || RParen)))` never terminates.
+// Regression: CREATE TABLE with a dangling PRIMARY/UNIQUE constraint used to
+// loop forever at end of input; Advance() now throws instead.
 TEST(ParserTest, CreateTableTableConstraintMustTerminateAtEof) {
   // Arrange -- tokenize CREATE TABLE with a dangling PRIMARY constraint
   const std::string sql = "CREATE TABLE users (PRIMARY";
@@ -507,10 +504,8 @@ TEST(ParserTest, CreateTableTableConstraintMustTerminateAtEof) {
   });
 }
 
-// Bug: a NUMERIC/DECIMAL/FLOAT type with '(' but no closing ')' loops forever.
-// The type-suffix skip loop (parser/parser.cpp:321-324) repeats
-// `while (Peek() != kRParen) Advance();`; at end of input Advance() returns
-// Eof without moving pos_, so the loop never exits.
+// Regression: a NUMERIC/DECIMAL/FLOAT type with '(' but no closing ')' used
+// to loop forever at end of input; Advance() now throws instead.
 TEST(ParserTest, CreateTableNumericTypeMustTerminateAtEof) {
   // Arrange -- tokenize CREATE TABLE with a NUMERIC type and no closing ')'
   const std::string sql = "CREATE TABLE users (score NUMERIC(";
@@ -651,6 +646,20 @@ TEST(ParserTest, InSubqueryWithWhereCombinesPredicates) {
   EXPECT_EQ(select.WhereClause()->Type(), TypeTag::kBinaryExp);
   EXPECT_EQ(select.WhereClause()->AsBinaryExpression().Op(),
             BinaryOperation::kAnd);
+}
+
+TEST(ParserTest, LimitZeroIsExplicitAndAbsentLimitIsNot) {
+  // An explicit LIMIT 0 must be distinguishable from an absent LIMIT clause.
+  Tokenizer zero("SELECT id FROM users LIMIT 0;");
+  std::unique_ptr<Statement> zero_stmt = Parser(zero.Tokenize()).Parse();
+  const auto& zero_select = dynamic_cast<SelectStatement&>(*zero_stmt);
+  EXPECT_TRUE(zero_select.HasLimit());
+  EXPECT_EQ(zero_select.Limit(), 0U);
+
+  Tokenizer none("SELECT id FROM users;");
+  std::unique_ptr<Statement> none_stmt = Parser(none.Tokenize()).Parse();
+  const auto& none_select = dynamic_cast<SelectStatement&>(*none_stmt);
+  EXPECT_FALSE(none_select.HasLimit());
 }
 
 }  // namespace tinylamb

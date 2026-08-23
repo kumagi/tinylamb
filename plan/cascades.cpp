@@ -3,20 +3,46 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <functional>
+#include <iterator>
 #include <limits>
-#include <ranges>
+#include <ostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <unordered_set>
 #include <utility>
+#include <vector>
+
+#include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
+#include "common/constants.hpp"
+#include "expression/rewrite.hpp"
+#include "query/query_data.hpp"
+#include "type/column_name.hpp"
 
 namespace tinylamb::cascades {
 namespace {
 
+// Practical ceiling for exhaustive join enumeration: the join_enumeration
+// rule walks 2^n bipartitions per join group, and memo construction
+// multiplies that by every subset explored. Beyond this limit planning cost
+// explodes combinatorially (n=30 is already intractable), so enumeration is
+// skipped and the connected-split join order built during Memo::Build serves
+// as the fallback plan.
+constexpr size_t kMaxJoinEnumerationRelations = 16;
+
 std::vector<std::string> Normalize(std::vector<std::string> relations) {
   std::ranges::sort(relations);
-  relations.erase(std::unique(relations.begin(), relations.end()),
-                  relations.end());
+  const auto [first, last] = std::ranges::unique(relations);
+  relations.erase(first, last);
   return relations;
 }
 
@@ -27,12 +53,66 @@ std::vector<std::string> UnionRelations(const std::vector<std::string>& left,
   return result;
 }
 
+// Canonical conjunct form: split, sort by printed representation, drop
+// duplicates, recombine. Fingerprint stability for payload-bearing
+// expressions depends on this.
+Expression CanonicalizeConjuncts(const Expression& predicate) {
+  if (!predicate) { return nullptr;
+}
+  std::vector<Expression> conjuncts = SplitConjuncts(predicate);
+  std::ranges::sort(conjuncts, [](const Expression& a, const Expression& b) {
+    return a->ToString() < b->ToString();
+  });
+  conjuncts.erase(std::ranges::unique(
+                      conjuncts,
+                      [](const Expression& a, const Expression& b) {
+                        return a->ToString() == b->ToString();
+                      })
+                      .begin(),
+                  conjuncts.end());
+  return CombineConjuncts(conjuncts);
+}
+
+// Pushes every single-relation conjunct of `predicate` into the matching scan
+// group's filter. Returns the conjuncts that have no single-relation home and
+// therefore must stay in the Selection. Guard rail (Phase 2): nothing here
+// reasons about null-rejection, so the rule must never be used to push
+// predicates through outer joins once those exist.
+std::vector<Expression> PushSingleRelationConjuncts(
+    Memo& memo, const Expression& predicate,
+    const std::function<bool(const std::string&)>& relation_enabled) {
+  std::vector<Expression> residual;
+  for (const Expression& conjunct : SplitConjuncts(predicate)) {
+    std::unordered_set<std::string> touched;
+    for (const ColumnName& column : conjunct->TouchedColumns()) {
+      if (!column.schema.empty()) { touched.insert(column.schema);
+}
+    }
+    if (touched.size() == 1 && relation_enabled(*touched.begin())) {
+      memo.MergeScanFilter(memo.EnsureGroup({*touched.begin()}), conjunct);
+      continue;
+    }
+    residual.push_back(conjunct);
+  }
+  return residual;
+}
+
 }  // namespace
 
 std::string LogicalExpression::Fingerprint() const {
   std::ostringstream out;
   out << static_cast<int>(operation) << ':' << table;
-  for (GroupId child : children) out << ':' << child;
+  for (GroupId child : children) { out << ':' << child;
+}
+  if (predicate) {
+    out << "#p:" << (*predicate)->ToString();
+  }
+  for (const NamedExpression& item : target_list) {
+    out << "#t:" << item.name << '=' << item.expression->ToString();
+  }
+  if (operation == LogicalOperator::kLimit) {
+    out << "#l:" << limit_offset << ',' << limit_count;
+  }
   return out.str();
 }
 
@@ -48,16 +128,162 @@ std::string Memo::GroupKey(const std::vector<std::string>& relations) {
 }
 
 GroupId Memo::Build(const std::vector<std::string>& relations) {
-  if (relations.empty()) throw std::invalid_argument("empty join graph");
+  return Build(relations, {});
+}
+
+GroupId Memo::Build(const std::vector<std::string>& relations,
+                    const std::vector<ConjunctInfo>& conjuncts) {
+  if (relations.empty()) { throw std::invalid_argument("empty join graph");
+}
   if (Normalize(relations).size() != relations.size()) {
     throw std::invalid_argument("duplicate relation in join graph");
+  }
+  if (relations.size() >= std::numeric_limits<uint64_t>::digits) {
+    throw std::invalid_argument("join graph is too large for enumeration");
+  }
+  relation_index_.clear();
+  const std::vector<std::string> normalized = Normalize(relations);
+  for (size_t i = 0; i < normalized.size(); ++i) {
+    relation_index_.emplace(normalized[i], i);
+  }
+  conjuncts_.clear();
+  conjunct_masks_.clear();
+  for (const ConjunctInfo& info : conjuncts) {
+    uint64_t mask = 0;
+    bool outside = false;
+    for (const std::string& relation : info.relations) {
+      const auto found = relation_index_.find(relation);
+      if (found == relation_index_.end()) {
+        outside = true;
+        continue;
+      }
+      mask |= uint64_t{1} << found->second;
+    }
+    // A conjunct that references something outside the join graph stays at
+    // the root join (it can never be pushed below).
+    conjunct_masks_.push_back(outside ? ~uint64_t{0} : mask);
+    conjuncts_.push_back(info.conjunct);
   }
   return EnsureGroup(relations);
 }
 
-GroupId Memo::EnsureGroup(std::vector<std::string> relations) {
+uint64_t Memo::RelationMask(const std::vector<std::string>& relations) const {
+  uint64_t mask = 0;
+  for (const std::string& relation : relations) {
+    const auto found = relation_index_.find(relation);
+    if (found == relation_index_.end()) {
+      throw std::invalid_argument("relation outside the join graph: " +
+                                  relation);
+    }
+    mask |= uint64_t{1} << found->second;
+  }
+  return mask;
+}
+
+Expression Memo::ScanFilterFor(const Group& group) const {
+  std::vector<Expression> matching;
+  for (size_t i = 0; i < conjuncts_.size(); ++i) {
+    if (conjunct_masks_[i] == group.relation_mask) {
+      matching.push_back(conjuncts_[i]);
+    }
+  }
+  if (matching.empty()) { return nullptr;
+}
+  return CanonicalizeConjuncts(CombineConjuncts(matching));
+}
+
+Expression Memo::JoinConditionFor(const Group& left, const Group& right) const {
+  const uint64_t union_mask = left.relation_mask | right.relation_mask;
+  std::vector<Expression> spanning;
+  for (size_t i = 0; i < conjuncts_.size(); ++i) {
+    const uint64_t mask = conjunct_masks_[i];
+    if ((mask & ~union_mask) != 0) { continue;
+}
+    if (mask == 0) { continue;
+}
+    if ((mask & ~left.relation_mask) == 0) { continue;
+}
+    if ((mask & ~right.relation_mask) == 0) { continue;
+}
+    spanning.push_back(conjuncts_[i]);
+  }
+  if (spanning.empty()) { return nullptr;
+}
+  return CanonicalizeConjuncts(CombineConjuncts(spanning));
+}
+
+// Chooses the first relation whose singleton cut is crossed by a conjunct so
+// the initial join tree avoids cross products whenever the subgraph is
+// connected (Phase 7 pruning also applies to memo construction).
+namespace {
+std::pair<std::vector<std::string>, std::vector<std::string>> ConnectedSplit(
+    const Memo& memo, const std::vector<std::string>& relations) {
+  const uint64_t within = memo.RelationMask(relations);
+  for (const std::string& pivot : relations) {
+    const uint64_t pivot_mask = memo.RelationMask({pivot});
+    if (!memo.CutConnected(pivot_mask, within)) { continue;
+}
+    std::vector<std::string> left{pivot};
+    std::vector<std::string> right;
+    for (const std::string& relation : relations) {
+      if (relation != pivot) { right.push_back(relation);
+}
+    }
+    return {std::move(left), std::move(right)};
+  }
+  std::vector<std::string> left{relations.front()};
+  std::vector<std::string> right(relations.begin() + 1, relations.end());
+  return {std::move(left), std::move(right)};
+}
+}  // namespace
+
+LogicalExpression Memo::NewJoin(GroupId left, GroupId right) const {
+  LogicalExpression join{.operation = LogicalOperator::kJoin,
+                         .children = {left, right}};
+  const Expression condition = JoinConditionFor(Get(left), Get(right));
+  if (condition) { join.predicate = condition;
+}
+  return join;
+}
+
+void Memo::MergeScanFilter(GroupId group, const Expression& predicate) {
+  Group& target = Get(group);
+  if (target.relations.size() != 1) {
+    throw std::invalid_argument("scan filter requires a single-relation group");
+  }
+  const Expression next = CanonicalizeConjuncts(
+      target.filter ? BinaryExpressionExp(target.filter,
+                                          BinaryOperation::kAnd, predicate)
+                    : predicate);
+  target.filter = next;
+}
+
+bool Memo::CutConnected(uint64_t left_mask, uint64_t within_mask) const {
+  const uint64_t right_mask = within_mask & ~left_mask;
+  if (left_mask == 0 || right_mask == 0) { return false;
+}
+  return std::ranges::any_of(conjunct_masks_, [left_mask, right_mask](
+                                                  uint64_t mask) {
+    return (mask & left_mask) != 0 && (mask & right_mask) != 0;
+  });
+}
+
+bool Memo::JoinGraphDisconnected() const {
+  return std::ranges::none_of(conjunct_masks_, [](uint64_t mask) {
+    return mask != 0 && std::popcount(mask) > 1;
+  });
+}
+
+std::vector<GroupId> Memo::DrainTouchedGroups() {
+  std::vector<GroupId> touched;
+  std::swap(touched, touched_groups_);
+  return touched;
+}
+
+GroupId Memo::EnsureGroup(std::vector<std::string> relations) {  // NOLINT(misc-no-recursion) // Cascades memo construction recurses over join operands by design; relation count is bounded (kMaxJoinEnumerationRelations).
   relations = Normalize(std::move(relations));
-  if (relations.empty()) throw std::invalid_argument("empty memo group");
+  if (relations.empty()) { throw std::invalid_argument("empty memo group");
+}
   const std::string key = GroupKey(relations);
   if (const auto found = groups_by_key_.find(key);
       found != groups_by_key_.end()) {
@@ -66,43 +292,96 @@ GroupId Memo::EnsureGroup(std::vector<std::string> relations) {
 
   const GroupId id = groups_.size();
   groups_by_key_.emplace(key, id);
-  groups_.push_back(Group{id, relations, {}});
+  const uint64_t mask = RelationMask(relations);
+  groups_.push_back(Group{.id=id, .relations=relations, .expressions={}, .filter=nullptr, .relation_mask=mask, .tag=""});
   if (relations.size() == 1) {
+    groups_.back().filter = ScanFilterFor(groups_.back());
     AddExpression(
-        id, LogicalExpression{LogicalOperator::kScan, {}, relations.front()});
+        id, LogicalExpression{.operation = LogicalOperator::kScan,
+                              .table = relations.front()});
     return id;
   }
 
-  std::vector<std::string> left{relations.front()};
-  std::vector<std::string> right(relations.begin() + 1, relations.end());
+  auto [left, right] = ConnectedSplit(*this, relations);
   const GroupId left_group = EnsureGroup(std::move(left));
   const GroupId right_group = EnsureGroup(std::move(right));
-  AddExpression(id, LogicalExpression{
-                        LogicalOperator::kJoin, {left_group, right_group}, {}});
+  AddExpression(id, NewJoin(left_group, right_group));
+  return id;
+}
+
+GroupId Memo::EnsureDerivedGroup(const std::vector<std::string>& relations,
+                                 std::string_view tag) {
+  const std::vector<std::string> normalized = Normalize(relations);
+  std::string key(tag);
+  key.push_back('|');
+  key.append(GroupKey(normalized));
+  if (const auto found = groups_by_key_.find(key);
+      found != groups_by_key_.end()) {
+    return found->second;
+  }
+  const GroupId id = groups_.size();
+  groups_by_key_.emplace(std::move(key), id);
+  groups_.push_back(
+      Group{.id=id, .relations=normalized, .expressions={}, .filter=nullptr, .relation_mask=RelationMask(normalized),
+            .tag=std::string(tag)});
   return id;
 }
 
 bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
   Group& target = Get(group);
-  if (expression.operation == LogicalOperator::kScan) {
-    if (target.relations.size() != 1 ||
-        target.relations.front() != expression.table ||
-        !expression.children.empty()) {
-      throw std::invalid_argument("scan does not belong to memo group");
+  switch (expression.operation) {
+    case LogicalOperator::kScan:
+      if (target.relations.size() != 1 ||
+          target.relations.front() != expression.table ||
+          !expression.children.empty() || expression.predicate) {
+        throw std::invalid_argument("scan does not belong to memo group");
+      }
+      break;
+    case LogicalOperator::kJoin: {
+      if (expression.children.size() != 2) {
+        throw std::invalid_argument("join must have two child groups");
+      }
+      const Group& left = Get(expression.children[0]);
+      const Group& right = Get(expression.children[1]);
+      std::vector<std::string> intersection;
+      std::ranges::set_intersection(left.relations, right.relations,
+                                    std::back_inserter(intersection));
+      if (!intersection.empty() ||
+          UnionRelations(left.relations, right.relations) != target.relations) {
+        throw std::invalid_argument("join children are not equivalent to group");
+      }
+      break;
     }
-  } else {
-    if (expression.children.size() != 2) {
-      throw std::invalid_argument("join must have two child groups");
+    case LogicalOperator::kSelection:
+    case LogicalOperator::kProjection:
+    case LogicalOperator::kAggregation:
+    case LogicalOperator::kLimit: {
+      if (expression.children.size() != 1) {
+        throw std::invalid_argument("single-child logical operator");
+      }
+      if (expression.children[0] == group) {
+        throw std::invalid_argument("logical operator references its own group");
+      }
+      if (Get(expression.children[0]).relations != target.relations) {
+        throw std::invalid_argument(
+            "operator must preserve the group's relation set");
+      }
+      if (expression.operation == LogicalOperator::kSelection &&
+          (!expression.predicate || !*expression.predicate)) {
+        throw std::invalid_argument("selection must carry a predicate");
+      }
+      if ((expression.operation == LogicalOperator::kProjection ||
+           expression.operation == LogicalOperator::kAggregation) &&
+          expression.target_list.empty()) {
+        throw std::invalid_argument(
+            "projection/aggregation needs a target list");
+      }
+      break;
     }
-    const Group& left = Get(expression.children[0]);
-    const Group& right = Get(expression.children[1]);
-    std::vector<std::string> intersection;
-    std::ranges::set_intersection(left.relations, right.relations,
-                                  std::back_inserter(intersection));
-    if (!intersection.empty() ||
-        UnionRelations(left.relations, right.relations) != target.relations) {
-      throw std::invalid_argument("join children are not equivalent to group");
-    }
+  }
+  if (target.expressions.size() >= expression_cap_) {
+    degraded_ = true;
+    return false;
   }
   const std::string fingerprint = expression.Fingerprint();
   if (std::ranges::any_of(target.expressions, [&](const auto& existing) {
@@ -111,21 +390,44 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
     return false;
   }
   target.expressions.push_back(std::move(expression));
+  touched_groups_.push_back(group);
   return true;
 }
 
 const Group& Memo::Get(GroupId group) const {
-  if (group >= groups_.size()) throw std::out_of_range("memo group");
+  if (group >= groups_.size()) { throw std::out_of_range("memo group");
+}
   return groups_[group];
 }
 
 Group& Memo::Get(GroupId group) {
-  if (group >= groups_.size()) throw std::out_of_range("memo group");
+  if (group >= groups_.size()) { throw std::out_of_range("memo group");
+}
   return groups_[group];
 }
 
 size_t Memo::ExpressionCount(GroupId group) const {
   return Get(group).expressions.size();
+}
+
+void Memo::Dump(std::ostream& out) const {
+  for (const Group& group : groups_) {
+    out << "group " << group.id << " relations={";
+    for (size_t i = 0; i < group.relations.size(); ++i) {
+      if (i > 0) { out << ",";
+}
+      out << group.relations[i];
+    }
+    out << "}";
+    if (!group.tag.empty()) { out << " tag=" << group.tag;
+}
+    if (group.filter) { out << " filter=" << *group.filter;
+}
+    out << " expressions=" << group.expressions.size() << "\n";
+    for (const LogicalExpression& expression : group.expressions) {
+      out << "  [" << expression.Fingerprint() << "]\n";
+    }
+  }
 }
 
 Pattern Pattern::Any(std::string capture) {
@@ -143,48 +445,89 @@ Pattern Pattern::Op(LogicalOperator operation, std::vector<Pattern> children,
   return pattern;
 }
 
-bool Pattern::MatchGroup(const Memo& memo, GroupId group,
+Pattern Pattern::Op(LogicalOperator operation, std::vector<Pattern> children,
+                    std::string capture, PayloadConstraint payload) {
+  Pattern pattern =
+      Op(operation, std::move(children), std::move(capture));
+  pattern.payload_ = payload;
+  return pattern;
+}
+
+bool Pattern::MatchGroup(const Memo& memo, GroupId group,  // NOLINT(misc-no-recursion) // Cascades pattern matching recurses over the expression tree by design; depth is bounded by the memo built from a finite query.
                          Bindings* bindings) const {
   if (!capture_.empty()) {
     auto [iter, inserted] = bindings->emplace(capture_, group);
-    if (!inserted && iter->second != group) return false;
+    if (!inserted && iter->second != group) { return false;
+}
   }
-  if (!operation_) return true;
-  for (const LogicalExpression& expression : memo.Get(group).expressions) {
-    Bindings local = *bindings;
-    if (Match(memo, group, expression, &local)) {
-      *bindings = std::move(local);
-      return true;
-    }
-  }
-  return false;
+  if (!operation_) { return true;
+}
+  return std::ranges::any_of(
+      memo.Get(group).expressions,
+      [&](const LogicalExpression& expression) {  // NOLINT(misc-no-recursion) // Part of Pattern::MatchGroup recursion; bounded by the finite memo.
+        Bindings local = *bindings;
+        if (Match(memo, group, expression, &local)) {
+          *bindings = std::move(local);
+          return true;
+        }
+        return false;
+      });
 }
 
-bool Pattern::Match(const Memo& memo, GroupId group,
+bool Pattern::MatchPayload(const Memo& memo, const LogicalExpression& expression,
+                           [[maybe_unused]] const Bindings& bindings) const {
+  if (payload_.requires_predicate && !expression.predicate) { return false;
+}
+  if (!payload_.predicate_within_child) { return true;
+}
+  const size_t child_index = *payload_.predicate_within_child;
+  if (!expression.predicate || child_index >= expression.children.size()) {
+    return false;
+  }
+  const Group& child = memo.Get(expression.children[child_index]);
+  return std::ranges::all_of(
+      (*expression.predicate)->TouchedColumns(),
+      [&child](const ColumnName& column) {
+        // Unqualified names cannot be proven to belong to the child, so they
+        // fail the constraint (strict interpretation).
+        return !column.schema.empty() &&
+               std::ranges::find(child.relations, column.schema) !=
+                   child.relations.end();
+      });
+}
+
+bool Pattern::Match(const Memo& memo, GroupId group,  // NOLINT(misc-no-recursion) // Cascades pattern matching recurses over the expression tree by design; depth is bounded by the memo built from a finite query.
                     const LogicalExpression& expression,
                     Bindings* bindings) const {
-  if (operation_ && expression.operation != *operation_) return false;
+  if (operation_ && expression.operation != *operation_) { return false;
+}
   if (!children_.empty() && children_.size() != expression.children.size()) {
     return false;
   }
   Bindings local = *bindings;
   if (!capture_.empty()) {
     auto [iter, inserted] = local.emplace(capture_, group);
-    if (!inserted && iter->second != group) return false;
+    if (!inserted && iter->second != group) { return false;
+}
   }
   for (size_t i = 0; i < children_.size(); ++i) {
     if (!children_[i].MatchGroup(memo, expression.children[i], &local)) {
       return false;
     }
   }
+  if (!MatchPayload(memo, expression, local)) { return false;
+}
   *bindings = std::move(local);
   return true;
 }
 
 bool Rule::Apply(Memo& memo, GroupId group,
                  const LogicalExpression& expression) const {
+  if (!MayApply(expression.operation)) { return false;
+}
   Bindings bindings;
-  if (!pattern_.Match(memo, group, expression, &bindings)) return false;
+  if (!pattern_.Match(memo, group, expression, &bindings)) { return false;
+}
   const size_t before_groups = memo.GroupCount();
   const size_t before_expressions = memo.ExpressionCount(group);
   transform_(bindings, memo, group, expression);
@@ -209,44 +552,156 @@ bool RuleSet::Contains(std::string_view name) const {
       rules_, [&](const Rule& rule) { return rule.Name() == name; });
 }
 
+std::vector<std::string> RuleSet::Names() const {
+  std::vector<std::string> names;
+  names.reserve(rules_.size());
+  for (const Rule& rule : rules_) { names.push_back(rule.Name());
+}
+  return names;
+}
+
 const RuleSet& RuleSet::Default() {
   static const RuleSet rules = [] {
     using namespace dsl;
     RuleSet built;
-    built.Add(Rule("join_commutativity", Join(Any("left"), Any("right")),
-                   [](const Bindings&, Memo& memo, GroupId group,
-                      const LogicalExpression& expression) {
-                     memo.AddExpression(
-                         group, LogicalExpression{LogicalOperator::kJoin,
-                                                  {expression.children[1],
-                                                   expression.children[0]},
-                                                  {}});
-                   }));
+    built.Add(Rule(
+        "join_commutativity", Join(Any("left"), Any("right")),
+        [](const Bindings&, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          memo.AddExpression(
+              group, memo.NewJoin(expression.children[1], expression.children[0]));
+        },
+        LogicalOperator::kJoin));
     built.Add(Rule(
         "join_enumeration", Join(),
         [](const Bindings&, Memo& memo, GroupId group,
            const LogicalExpression&) {
           const std::vector<std::string> relations = memo.Get(group).relations;
-          if (relations.size() < 3) return;
-          if (relations.size() >= std::numeric_limits<uint64_t>::digits) {
-            throw std::runtime_error("join graph is too large for enumeration");
-          }
+          if (relations.size() < 3) { return;
+}
+          // Fallback for very large joins: keep the initial connected-split
+          // join order instead of walking 2^n bipartitions.
+          if (relations.size() > kMaxJoinEnumerationRelations) { return;
+}
+          const uint64_t within = memo.Get(group).relation_mask;
+          // Phase 7: with a connected join graph, bipartitions whose cut is
+          // not crossed by any conjunct are pure cross products and can be
+          // pruned; a fully disconnected graph keeps exhaustive enumeration.
+          const bool prune = !memo.JoinGraphDisconnected();
           const uint64_t limit = uint64_t{1} << relations.size();
           for (uint64_t mask = 1; mask + 1 < limit; ++mask) {
-            if ((mask & 1U) == 0) continue;
+            if ((mask & 1U) == 0) { continue;
+}
+            if (prune && !memo.CutConnected(mask, within)) { continue;
+}
             std::vector<std::string> left;
             std::vector<std::string> right;
             for (size_t i = 0; i < relations.size(); ++i) {
               ((mask >> i) & 1U ? left : right).push_back(relations[i]);
             }
-            if (left.empty() || right.empty()) continue;
+            if (left.empty() || right.empty()) { continue;
+}
             const GroupId left_group = memo.EnsureGroup(std::move(left));
             const GroupId right_group = memo.EnsureGroup(std::move(right));
-            memo.AddExpression(
-                group, LogicalExpression{LogicalOperator::kJoin,
-                                         {left_group, right_group}, {}});
+            memo.AddExpression(group, memo.NewJoin(left_group, right_group));
           }
-        }));
+        },
+        LogicalOperator::kJoin));
+    built.Add(Rule(
+        "join_associativity_left",
+        Join(Pattern::Op(LogicalOperator::kJoin, {Any("ll"), Any("lr")}, "left"),
+             Any("right")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression&) {
+          const GroupId inner = memo.EnsureGroup(UnionRelations(
+              memo.Get(bindings.at("lr")).relations,
+              memo.Get(bindings.at("right")).relations));
+          memo.AddExpression(group,
+                             memo.NewJoin(bindings.at("ll"), inner));
+        },
+        LogicalOperator::kJoin));
+    built.Add(Rule(
+        "join_associativity_right",
+        Join(Any("left"),
+             Pattern::Op(LogicalOperator::kJoin, {Any("rl"), Any("rr")},
+                         "right")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression&) {
+          const GroupId inner = memo.EnsureGroup(UnionRelations(
+              memo.Get(bindings.at("left")).relations,
+              memo.Get(bindings.at("rl")).relations));
+          memo.AddExpression(group,
+                             memo.NewJoin(inner, bindings.at("rr")));
+        },
+        LogicalOperator::kJoin));
+    // Selection(Selection(X, p1), p2) -> Selection(X, p1 AND p2): adds the
+    // merged expression (same child group) with canonical conjunct order.
+    built.Add(Rule(
+        "merge_selections",
+        Selection(Selection(Any(), "inner")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          const Group& inner_group = memo.Get(bindings.at("inner"));
+          for (const LogicalExpression& inner : inner_group.expressions) {
+            if (inner.operation != LogicalOperator::kSelection) { continue;
+}
+            const Expression merged = CanonicalizeConjuncts(BinaryExpressionExp(
+                *inner.predicate, BinaryOperation::kAnd,
+                *expression.predicate));
+            memo.AddExpression(group,
+                               LogicalExpression{.operation = LogicalOperator::kSelection,
+                                                 .children = expression.children,
+                                                 .predicate = merged});
+          }
+        },
+        LogicalOperator::kSelection));
+    // Selection(Scan(t), p): annotate the scan group's filter so
+    // implementation rules can choose IndexScan/RangeScan. Guard rail: never
+    // push through outer joins (null-rejection analysis does not exist yet).
+    built.Add(Rule(
+        "push_selection_into_scan",
+        SelectionWithin(0, Scan("scan")),
+        [](const Bindings& bindings, Memo& memo, GroupId,
+           const LogicalExpression& expression) {
+          memo.MergeScanFilter(bindings.at("scan"), *expression.predicate);
+        },
+        LogicalOperator::kSelection));
+    // Selection(Join(L, R), p) with p touching only relations of L: move the
+    // single-relation conjuncts of p into the scan groups of that side. The
+    // Selection keeps applying whatever could not be pushed (idempotent).
+    // Guard rail: no outer-join pushdown until null-rejection analysis.
+    built.Add(Rule(
+        "push_selection_through_join",
+        Selection(Join(Any(), Any(), "input")),
+        [](const Bindings& bindings, Memo& memo, GroupId,
+           const LogicalExpression& expression) {
+          std::unordered_set<std::string> left_relations;
+          for (const LogicalExpression& join :
+               memo.Get(bindings.at("input")).expressions) {
+            if (join.operation != LogicalOperator::kJoin) { continue;
+}
+            const std::vector<std::string>& relations =
+                memo.Get(join.children[0]).relations;
+            left_relations.insert(relations.begin(), relations.end());
+          }
+          PushSingleRelationConjuncts(
+              memo, *expression.predicate, [&](const std::string& relation) {
+                return left_relations.contains(relation);
+              });
+        },
+        LogicalOperator::kSelection));
+    // Selection(Join(L, R), A AND B) with A over L and B over R: push both
+    // sides. Guard rail: no outer-join pushdown yet.
+    built.Add(Rule(
+        "split_selection_over_join",
+        Selection(Join(Any(), Any(), "input")),
+        [](const Bindings&, Memo& memo, GroupId,
+           const LogicalExpression& expression) {
+          PushSingleRelationConjuncts(
+              memo, *expression.predicate,
+              [](const std::string&) { return true; });
+        },
+        LogicalOperator::kSelection));
     return built;
   }();
   return rules;
@@ -258,16 +713,31 @@ std::string PhysicalProperties::Key() const {
     key.push_back('|');
     key.append(column.ToString());
   }
+  key.append("|lim:");
+  key.append(std::to_string(limit_hint));
+  key.append("|am:");
+  key.append(std::to_string(static_cast<int>(access_method)));
+  key.append("|dist:");
+  key.append(std::to_string(static_cast<int>(distribution)));
   return key;
+}
+
+const RuleContext& RuleContext::Empty() {
+  static const RuleContext empty;
+  return empty;
 }
 
 std::vector<PlanAlternative> ImplementationRule::Apply(
     const Memo& memo, GroupId group, const LogicalExpression& expression,
     const std::vector<BestPlan>& children,
-    const PhysicalProperties& properties) const {
+    const PhysicalProperties& properties, const RuleContext& context) const {
+  if (!MayApply(expression.operation)) { return {};
+}
   Bindings bindings;
-  if (!pattern_.Match(memo, group, expression, &bindings)) return {};
-  return implement_(bindings, expression, children, properties);
+  if (!pattern_.Match(memo, group, expression, &bindings)) { return {};
+}
+  return implement_(group, memo, bindings, expression, children,
+                    properties, context);
 }
 
 ImplementationRuleSet& ImplementationRuleSet::Add(ImplementationRule rule) {
@@ -291,94 +761,163 @@ bool ImplementationRuleSet::Contains(std::string_view name) const {
 }
 
 void SearchEngine::Explore(GroupId root) {
-  ExploreGroup(root);
   best_.clear();
+  next_expression_.clear();
+  std::deque<GroupId> queue;
+  std::unordered_set<GroupId> queued;
+  const std::function<void(GroupId)> enqueue = [&](GroupId group) {
+    if (group == kInvalidGroup) { return;
+}
+    if (queued.insert(group).second) { queue.push_back(group);
+}
+  };
+  enqueue(root);
+  while (!queue.empty()) {
+    const GroupId group = queue.front();
+    queue.pop_front();
+    ExploreGroup(group, enqueue);
+    for (GroupId touched : memo_.DrainTouchedGroups()) { enqueue(touched);
+}
+  }
 }
 
-void SearchEngine::ExploreGroup(GroupId group) {
-  if (explored_.contains(group) || exploring_.contains(group)) return;
-  exploring_.insert(group);
-  for (size_t pass = 0; pass < 64; ++pass) {
-    bool changed = false;
-    const std::vector<LogicalExpression> snapshot =
-        memo_.Get(group).expressions;
-    for (const LogicalExpression& expression : snapshot) {
-      for (const Rule& rule : rules_->Rules()) {
-        changed |= rule.Apply(memo_, group, expression);
-      }
+// Phase 7 worklist exploration: each group keeps a cursor over its
+// expressions; rules appending expressions (here or in other groups) extend
+// the work instead of rescanning settled state. No pass cap or convergence
+// exception is needed because the memo is append-only and fingerprints
+// deduplicate.
+void SearchEngine::ExploreGroup(
+    GroupId group, const std::function<void(GroupId)>& enqueue) {
+  size_t& next = next_expression_[group];
+  while (next < memo_.Get(group).expressions.size()) {
+    const LogicalExpression expression = memo_.Get(group).expressions[next];
+    ++next;
+    for (const Rule& rule : rules_->Rules()) {
+      if (!rule.MayApply(expression.operation)) { continue;
+}
+      // Transformation rules may legitimately decline; the return value is
+      // only advisory for callers that track memo growth.
+      std::ignore = rule.Apply(memo_, group, expression);
     }
-    if (!changed) break;
-    if (pass == 63) throw std::runtime_error("cascades rules did not converge");
+    for (GroupId child : expression.children) { enqueue(child);
+}
   }
-  const std::vector<LogicalExpression> expressions =
-      memo_.Get(group).expressions;
-  for (const LogicalExpression& expression : expressions) {
-    for (GroupId child : expression.children) ExploreGroup(child);
-  }
-  exploring_.erase(group);
-  explored_.insert(group);
 }
 
 std::optional<BestPlan> SearchEngine::Optimize(
     GroupId root, const PhysicalProperties& properties,
-    const Implement& implement) {
+    const Implement& implement, const RuleContext& context) {
   Explore(root);
-  return OptimizeGroup(root, properties, implement);
+  return OptimizeGroup(root, properties, implement, context);
 }
 
 std::optional<BestPlan> SearchEngine::Optimize(
     GroupId root, const PhysicalProperties& properties,
-    const ImplementationRuleSet& implementation_rules) {
+    const ImplementationRuleSet& implementation_rules,
+    const RuleContext& context) {
   return Optimize(
       root, properties,
-      [&](GroupId group, const LogicalExpression& expression,
+      [&](GroupId group, const Memo&, const LogicalExpression& expression,
           const std::vector<BestPlan>& children,
-          const PhysicalProperties& required) {
+          const PhysicalProperties& required, const RuleContext& ctx) {
         std::vector<PlanAlternative> alternatives;
         for (const ImplementationRule& rule : implementation_rules.Rules()) {
+          if (!rule.MayApply(expression.operation)) { continue;
+}
           std::vector<PlanAlternative> generated =
-              rule.Apply(memo_, group, expression, children, required);
+              rule.Apply(memo_, group, expression, children, required, ctx);
           alternatives.insert(alternatives.end(),
                               std::make_move_iterator(generated.begin()),
                               std::make_move_iterator(generated.end()));
         }
         return alternatives;
-      });
+      },
+      context);
 }
 
-std::optional<BestPlan> SearchEngine::OptimizeGroup(
+std::optional<BestPlan> SearchEngine::Optimize(
+    GroupId root, const PhysicalProperties& properties,
+    const ImplementationRuleSet& implementation_rules) {
+  return Optimize(root, properties, implementation_rules, RuleContext::Empty());
+}
+
+std::vector<PhysicalProperties> SearchEngine::RequiredChildProperties(
+    const LogicalExpression& expression, const PhysicalProperties& required) {
+  switch (expression.operation) {
+    case LogicalOperator::kScan:
+      return {};
+    case LogicalOperator::kJoin:
+      // Joins reorder rows: they neither preserve row position nor deliver
+      // the parent's ordering, and a limit hint below them is meaningless.
+      return {PhysicalProperties{}, PhysicalProperties{}};
+    case LogicalOperator::kAggregation:
+      // Aggregation collapses the input; ordering and row positions die here.
+      return {PhysicalProperties{}};
+    case LogicalOperator::kSelection:
+    case LogicalOperator::kProjection:
+    case LogicalOperator::kLimit:
+      // Row-filtering and row-shaping operators pass rows through in order.
+      return {required};
+  }
+  return {};
+}
+
+std::optional<BestPlan> SearchEngine::OptimizeGroup(  // NOLINT(misc-no-recursion) // Cascades branch-and-bound search recurses over memo groups by design; memo depth is bounded by the finite query.
     GroupId group, const PhysicalProperties& properties,
-    const Implement& implement) {
+    const Implement& implement, const RuleContext& context) {
   const std::string cache_key = std::to_string(group) + '/' + properties.Key();
   if (const auto found = best_.find(cache_key); found != best_.end()) {
     return found->second;
   }
 
+  const bool needs_ordering =
+      !properties.ordering.empty() && context.query != nullptr &&
+      !context.query->order_expressions_.empty();
   std::optional<BestPlan> best;
   const Group& memo_group = memo_.Get(group);
   for (size_t index = 0; index < memo_group.expressions.size(); ++index) {
     const LogicalExpression& expression = memo_group.expressions[index];
+    const std::vector<PhysicalProperties> child_properties =
+        RequiredChildProperties(expression, properties);
+    if (child_properties.size() != expression.children.size()) { continue;
+}
     std::vector<BestPlan> children;
     double child_cost = 0;
+    double child_rows = 0;
     bool valid = true;
-    for (GroupId child : expression.children) {
-      std::optional<BestPlan> child_plan =
-          OptimizeGroup(child, properties, implement);
+    for (size_t child = 0; child < expression.children.size(); ++child) {
+      std::optional<BestPlan> child_plan = OptimizeGroup(
+          expression.children[child], child_properties[child], implement,
+          context);
       if (!child_plan) {
         valid = false;
         break;
       }
       child_cost += child_plan->cost;
+      child_rows += child_plan->estimated_rows;
       children.push_back(std::move(*child_plan));
     }
-    if (!valid) continue;
+    if (!valid) { continue;
+}
 
     for (PlanAlternative alternative :
-         implement(group, expression, children, properties)) {
-      if (!alternative.plan) continue;
-      const double cost = child_cost + alternative.local_cost;
+         implement(group, memo_, expression, children, properties,
+              context)) {
+      if (!alternative.plan) { continue;
+}
+      double cost = child_cost + alternative.local_cost;
+      // Property-driven ordering decision (D6): alternatives that cannot
+      // deliver the required ordering carry the sort the engine would have
+      // to insert; the engine-side SortExecutor remains the safety net.
+      if (needs_ordering &&
+          !alternative.plan->IsOrderedBy(context.query->order_expressions_,
+                                         context.query->order_ascending_)) {
+        const double rows = std::max(alternative.estimated_rows, child_rows);
+        cost += rows <= 1 ? rows : rows * std::log2(rows);
+      }
       if (!best || cost < best->cost) {
-        best = BestPlan{std::move(alternative.plan), cost, group, index};
+        best = BestPlan{.plan=std::move(alternative.plan), .cost=cost,
+                        .estimated_rows=alternative.estimated_rows, .group=group, .expression_index=index};
       }
     }
   }

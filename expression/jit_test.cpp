@@ -1,10 +1,15 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "expression/jit.hpp"
 
+#include <cstdint>
+#include <cstddef>
 #include <numeric>
+#include <stdexcept>
 #include <tuple>
+#include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
 #include "gtest/gtest.h"
 
 namespace tinylamb {
@@ -16,16 +21,17 @@ TEST(JitTest, FilterProjectionAndAggregateKernelsMatchScalarResults) {
       BinaryOperation::kGreaterThanEquals);
   auto projection = JitInt64Kernels::CompileProjection();
   auto sum = JitInt64Kernels::CompileSum();
-  ASSERT_TRUE(filter);
-  ASSERT_TRUE(projection);
-  ASSERT_TRUE(sum);
+  if (!filter.has_value() || !projection.has_value() || !sum.has_value()) {
+    GTEST_FAIL() << "kernel compilation failed";
+    return;
+  }
   std::vector<uint8_t> selected(input.size());
   filter->Filter(input.data(), selected.data(), input.size(), 17);
   std::vector<int64_t> projected(input.size());
   projection->Project(input.data(), projected.data(), input.size(), 3, 7);
   for (size_t index = 0; index < input.size(); ++index) {
     EXPECT_EQ(selected[index], input[index] >= 17);
-    EXPECT_EQ(projected[index], input[index] * 3 + 7);
+    EXPECT_EQ(projected[index], (input[index] * 3) + 7);
   }
   EXPECT_EQ(sum->Sum(input.data(), input.size()),
             std::accumulate(input.begin(), input.end(), int64_t{0}));
@@ -66,7 +72,10 @@ TEST(JitTest, FilterKernelsForEveryComparisonOperator) {
   // scalar reference implementation.
   for (const BinaryOperation op : operations) {
     auto kernel = JitInt64Kernels::CompileFilter(op);
-    ASSERT_TRUE(kernel);
+    if (!kernel.has_value()) {
+      GTEST_FAIL() << "kernel compilation failed";
+      return;
+    }
     std::vector<uint8_t> selected(input.size());
     kernel->Filter(input.data(), selected.data(), input.size(), constant);
     for (size_t index = 0; index < input.size(); ++index) {
@@ -78,8 +87,10 @@ TEST(JitTest, FilterKernelsForEveryComparisonOperator) {
 TEST(JitTest, MoveAssignmentTransfersKernel) {
   auto filter = JitInt64Kernels::CompileFilter(BinaryOperation::kEquals);
   auto projection = JitInt64Kernels::CompileProjection();
-  ASSERT_TRUE(filter);
-  ASSERT_TRUE(projection);
+  if (!filter.has_value() || !projection.has_value()) {
+    GTEST_FAIL() << "kernel compilation failed";
+    return;
+  }
 
   // Act -- move-assign the filter kernel over the projection kernel.
   projection = std::move(filter);
@@ -93,13 +104,37 @@ TEST(JitTest, MoveAssignmentTransfersKernel) {
                std::logic_error);
 }
 
+TEST(JitTest, ReusesCompiledKernelsProcessWide) {
+  auto first = JitInt64Kernels::CompileFilter(BinaryOperation::kEquals);
+  if (!first.has_value()) {
+    GTEST_FAIL() << "kernel compilation failed";
+    return;
+  }
+  const double first_ms = first->CompileMilliseconds();
+  auto second = JitInt64Kernels::CompileFilter(BinaryOperation::kEquals);
+  if (!second.has_value()) {
+    GTEST_FAIL() << "kernel compilation failed";
+    return;
+  }
+  EXPECT_DOUBLE_EQ(second->CompileMilliseconds(), first_ms);
+  EXPECT_GT(first_ms, 0.0);
+}
+
+TEST(JitTest, NonComparisonFilterIsRejected) {
+  // Act + Assert -- non-comparison operations have no JIT kernel and must
+  // fall back to std::nullopt instead of compiling.
+  EXPECT_FALSE(JitInt64Kernels::CompileFilter(BinaryOperation::kAdd));
+  EXPECT_FALSE(JitInt64Kernels::CompileFilter(BinaryOperation::kAnd));
+}
+
 TEST(JitTest, WrongKernelUsageThrows) {
   auto filter = JitInt64Kernels::CompileFilter(BinaryOperation::kLessThan);
   auto projection = JitInt64Kernels::CompileProjection();
   auto sum = JitInt64Kernels::CompileSum();
-  ASSERT_TRUE(filter);
-  ASSERT_TRUE(projection);
-  ASSERT_TRUE(sum);
+  if (!filter.has_value() || !projection.has_value() || !sum.has_value()) {
+    GTEST_FAIL() << "kernel compilation failed";
+    return;
+  }
 
   std::vector<int64_t> input{1, 2, 3};
   std::vector<uint8_t> selected(input.size());

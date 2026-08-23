@@ -113,6 +113,24 @@ sets, each with a small C++ pattern DSL and add/remove APIs. See
 [`docs/cascades_optimizer.md`](docs/cascades_optimizer.md) for the architecture
 and extension examples.
 
+**Call path:** `SqlEngine` builds `QueryData`, runs `Rewrite`, then calls
+`Optimizer::Optimize` (`plan/optimizer.cpp`). That entry point normalizes
+predicates, constructs a Cascades `Search`, and delegates join/order
+enumeration to `plan/cascades.cpp` via `RuleSet` / `ImplementationRuleSet`.
+There is no second standalone DP optimizer; `optimizer.cpp` is the façade and
+post-processing layer (aggregates, residual predicates).
+
+**Statement AST:** SQL DML/SELECT shapes live in `query/statement.hpp`
+(legacy include path `parser/ast.hpp`). The legacy Tokenizer/Parser/Pratt
+implementations under `legacy/parser/` are not used by the GoogleSQL path.
+
+**Layer libraries:** `tinylamb_core` is an INTERFACE aggregate over
+`tinylamb_common` → … → `tinylamb_executor` (see `CMakeLists.txt`).
+
+**Docs index:** WAL/page format, lock order, recovery, checksum, durability, and
+Value storage notes are under `docs/`. See [`CONTRIBUTING.md`](CONTRIBUTING.md)
+for error-handling policy.
+
 TPC-C workload benchmark
 ========================
 

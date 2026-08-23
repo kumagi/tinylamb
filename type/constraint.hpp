@@ -62,7 +62,7 @@ struct Constraint {
   }
   friend std::ostream& operator<<(std::ostream& o, const Constraint& c);
   friend Encoder& operator<<(Encoder& a, const Constraint& c);
-  friend Decoder& operator>>(Decoder& a, Constraint& c);
+  friend Decoder& operator>>(Decoder& e, Constraint& c);
 
   ConstraintType ctype{kNothing};
   Value value{};

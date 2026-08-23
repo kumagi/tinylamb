@@ -17,7 +17,9 @@
 #include "index_scan_iterator.hpp"
 
 #include <memory>
+#include <sstream>
 #include <string>
+#include <string_view>
 
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -39,7 +41,7 @@
 namespace tinylamb {
 class IndexScanIteratorTest : public ::testing::Test {
  public:
-  static constexpr char kTableName[] = "SampleTable";
+  static constexpr std::string_view kTableName = "SampleTable";
 
   void SetUp() override {
     prefix_ = "index_scan_iterator_test-" + RandomString();
@@ -56,7 +58,7 @@ class IndexScanIteratorTest : public ::testing::Test {
         IndexSchema("NameIdx", {1}, {2}, IndexMode::kNonUnique)));
     ASSERT_SUCCESS(db_->CreateIndex(ctx, kTableName,
                                     IndexSchema("KeyScore", {0, 2}, {1})));
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                           ctx.GetTable(kTableName));
     ASSERT_EQ(table->IndexCount(), 3);
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
@@ -84,7 +86,7 @@ TEST_F(IndexScanIteratorTest, Construct) {
 TEST_F(IndexScanIteratorTest, ScanAscending) {
   // Arrange -- begin context, get table, insert 230 rows with ascending PK
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 230; ++i) {
     ASSERT_SUCCESS(
@@ -115,7 +117,7 @@ TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
   // Arrange -- begin context, get table, insert 120 rows with duplicate NameIdx
   // values
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 120; ++i) {
     ASSERT_SUCCESS(
@@ -191,10 +193,10 @@ TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
   }
 }
 
-TEST_F(IndexScanIteratorTest, ScanDecending) {
+TEST_F(IndexScanIteratorTest, ScanDescending) {
   // Arrange -- begin context, get table, insert 230 rows with ascending PK
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 230; ++i) {
     ASSERT_SUCCESS(
@@ -225,7 +227,7 @@ TEST_F(IndexScanIteratorTest, NonUniqueDescending) {
   // Arrange -- begin context, get table, insert 120 rows with duplicate NameIdx
   // values
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 120; ++i) {
     ASSERT_SUCCESS(
@@ -274,7 +276,7 @@ TEST_F(IndexScanIteratorTest, NonUniqueDescending) {
 
 TEST_F(IndexScanIteratorTest, CompositeEqualityPointLookup) {
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 40; ++i) {
     ASSERT_SUCCESS(
@@ -298,7 +300,7 @@ TEST_F(IndexScanIteratorTest, CompositeEqualityPointLookup) {
 TEST_F(IndexScanIteratorTest, NonUniqueDescendingIncrement) {
   // Arrange -- insert rows with duplicate NameIdx values
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 120; ++i) {
     ASSERT_SUCCESS(
@@ -330,7 +332,7 @@ TEST_F(IndexScanIteratorTest, NonUniqueDescendingIncrement) {
 TEST_F(IndexScanIteratorTest, DirectScanConstDereferenceAndAccessors) {
   // Arrange -- insert rows and construct an IndexScanIterator directly
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 20; ++i) {
     ASSERT_SUCCESS(
@@ -362,11 +364,43 @@ TEST_F(IndexScanIteratorTest, DirectScanConstDereferenceAndAccessors) {
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
+// Regression for improvements2.md 4.11: a cleared iterator must report
+// invalid (and an invalid Position) instead of leaking a valid-looking
+// {0,0} row position to IndexScan::Next.
+TEST_F(IndexScanIteratorTest, ClearInvalidatesTheIterator) {
+  // Arrange -- insert rows and construct a direct scan over the PK index
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_SUCCESS(
+        table
+            ->Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
+                                    Value(0.1 + i)}))
+            .GetStatus());
+  }
+  const Index& pk = table->GetIndex(0);
+  IndexScanIterator scan(*table, pk, ctx.txn_, Value(3), Value(8), true);
+  ASSERT_TRUE(scan.IsValid());
+
+  // Act -- clear while positioned on a live entry
+  scan.Clear();
+
+  // Assert -- every validity probe reports exhausted
+  EXPECT_FALSE(scan.IsValid());
+  EXPECT_FALSE(scan.Position().IsValid());
+  ++scan;
+  EXPECT_FALSE(scan.IsValid());
+  --scan;
+  EXPECT_FALSE(scan.IsValid());
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
 TEST_F(IndexScanIteratorTest, CompositeKeyAndIncludeAccessors) {
   // Arrange -- insert rows, then construct a direct scan over the composite
   // KeyScore index whose include set carries col1
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 10; ++i) {
     ASSERT_SUCCESS(
@@ -391,7 +425,7 @@ TEST_F(IndexScanIteratorTest, CompositeKeyAndIncludeAccessors) {
 TEST_F(IndexScanIteratorTest, EmptyRangeAndDump) {
   // Arrange -- insert a handful of rows
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 5; ++i) {
     ASSERT_SUCCESS(
@@ -426,7 +460,7 @@ TEST_F(IndexScanIteratorTest, EmptyRangeAndDump) {
 TEST_F(IndexScanIteratorTest, UniqueDescendingIncrement) {
   // Arrange -- insert rows with a unique PK
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 20; ++i) {
     ASSERT_SUCCESS(
@@ -455,7 +489,7 @@ TEST_F(IndexScanIteratorTest, CompositePrefixRangeScan) {
   // Arrange -- insert rows, then scan the two-part KeyScore index with a
   // single-part bound so the end key is widened with a 0xff terminator
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   for (int i = 0; i < 40; ++i) {
     ASSERT_SUCCESS(
@@ -486,7 +520,7 @@ TEST_F(IndexScanIteratorTest, DumpCompositeAndPointScans) {
   // context (the cached Table object does not observe later index creation)
   {
     TransactionContext ctx = db_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                           ctx.GetTable(kTableName));
     for (int i = 0; i < 10; ++i) {
       ASSERT_SUCCESS(
@@ -504,7 +538,7 @@ TEST_F(IndexScanIteratorTest, DumpCompositeAndPointScans) {
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
   TransactionContext ctx = db_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
                         ctx.GetTable(kTableName));
   ASSERT_EQ(table->IndexCount(), 4);
 

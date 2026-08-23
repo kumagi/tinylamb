@@ -1,21 +1,24 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "expression/rewrite.hpp"
 
-#include "expression/aggregate_expression.hpp"
+#include "common/constants.hpp"
 #include "expression/binary_expression.hpp"
-#include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
-#include "expression/function_call_expression.hpp"
+#include "expression/expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "gtest/gtest.h"
-#include "type/row.hpp"
-#include "type/schema.hpp"
+#include "type/column_name.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 
+#include <memory>
+#include <stdexcept>
 #include <tuple>
+#include <utility>
+#include <vector>
 
 namespace tinylamb {
 
@@ -41,7 +44,7 @@ TEST(ExpressionRewriteTest, RuleCanBeRemovedWithoutChangingOtherRules) {
                           BinaryOperation::kLessThan, ColumnValueExp("value"));
 
   Expression rewritten =
-      ExpressionRewriter(std::move(rules)).Rewrite(expression);
+      ExpressionRewriter(rules).Rewrite(expression);
 
   ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
   EXPECT_EQ(rewritten->AsBinaryExpression().Op(),
@@ -63,7 +66,7 @@ TEST(ExpressionRewriteTest, CustomDslRuleIsIndependent) {
       }));
 
   Expression rewritten =
-      ExpressionRewriter(std::move(rules))
+      ExpressionRewriter(rules)
           .Rewrite(BinaryExpressionExp(ColumnValueExp("old"),
                                        BinaryOperation::kEquals,
                                        ConstantValueExp(Value(1))));
@@ -408,9 +411,32 @@ TEST(ExpressionRewriteTest, NonConvergingRewriteThrows) {
         return ConstantValueExp(Value(1));
       }));
   EXPECT_THROW(
-      (void)ExpressionRewriter(std::move(rules))
+      (void)ExpressionRewriter(rules)
           .Rewrite(ConstantValueExp(Value(1))),
       std::runtime_error);
+}
+
+TEST(ExpressionRewriteTest, DeeplyNestedExpressionThrowsInsteadOfCrashing) {
+  // Attacker-controlled SQL such as ((((((...1...)))))) must surface as an
+  // exception instead of overflowing the stack and killing the process.
+  Expression expression = ColumnValueExp("v");
+  for (int i = 0; i < 1024; ++i) {
+    expression = UnaryExpressionExp(expression, UnaryOperation::kMinus);
+  }
+  EXPECT_THROW((void)ExpressionRewriter(ExpressionRuleSet::Default())
+                   .Rewrite(expression),
+               std::runtime_error);
+}
+
+TEST(ExpressionRewriteTest, NestedExpressionWithinDepthLimitStillRewrites) {
+  Expression expression = ColumnValueExp("v");
+  for (int i = 0; i < 400; ++i) {
+    expression = UnaryExpressionExp(expression, UnaryOperation::kMinus);
+  }
+  Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  // An even number of negations collapses back to the bare column.
+  EXPECT_EQ(rewritten->Type(), TypeTag::kColumnValue);
 }
 
 TEST(ExpressionRewriteTest, RewriteAppliesSingleRule) {
@@ -425,9 +451,416 @@ TEST(ExpressionRewriteTest, RewriteAppliesSingleRule) {
   Expression expr = BinaryExpressionExp(ConstantValueExp(Value(1)),
                                         BinaryOperation::kAdd,
                                         ConstantValueExp(Value(2)));
-  Expression once = ExpressionRewriter(std::move(rules)).Rewrite(expr);
+  Expression once = ExpressionRewriter(rules).Rewrite(expr);
   ASSERT_EQ(once->Type(), TypeTag::kConstantValue);
   EXPECT_EQ(once->AsConstantValue().GetValue(), Value(42));
+}
+
+TEST(ExpressionRewriteTest, NotPushdownRewritesComparisons) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+  Expression x = ColumnValueExp("x");
+  Expression y = ColumnValueExp("y");
+
+  Expression not_less =
+      UnaryExpressionExp(BinaryExpressionExp(x, BinaryOperation::kLessThan, y),
+                         UnaryOperation::kNot);
+  Expression rewritten = rewrite(not_less);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(),
+            BinaryOperation::kGreaterThanEquals);
+
+  Expression not_equals = UnaryExpressionExp(
+      BinaryExpressionExp(x, BinaryOperation::kEquals, y),
+      UnaryOperation::kNot);
+  rewritten = rewrite(not_equals);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(),
+            BinaryOperation::kNotEquals);
+
+  // NOT over AND stays under De Morgan control, not comparison negation.
+  Expression not_and =
+      UnaryExpressionExp(BinaryExpressionExp(x, BinaryOperation::kAnd, y),
+                         UnaryOperation::kNot);
+  rewritten = rewrite(not_and);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kOr);
+}
+
+TEST(ExpressionRewriteTest, NotPushdownRewritesLikeAndNullChecks) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+  Expression name = ColumnValueExp("name");
+
+  Expression not_like = UnaryExpressionExp(
+      BinaryExpressionExp(name, BinaryOperation::kLike,
+                          ConstantValueExp(Value("a%"))),
+      UnaryOperation::kNot);
+  Expression rewritten = rewrite(not_like);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kNotLike);
+
+  Expression not_not_like = UnaryExpressionExp(
+      BinaryExpressionExp(name, BinaryOperation::kNotLike,
+                          ConstantValueExp(Value("a%"))),
+      UnaryOperation::kNot);
+  rewritten = rewrite(not_not_like);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kLike);
+
+  Expression not_is_null = UnaryExpressionExp(
+      UnaryExpressionExp(ColumnValueExp("x"), UnaryOperation::kIsNull),
+      UnaryOperation::kNot);
+  rewritten = rewrite(not_is_null);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(rewritten->AsUnaryExpression().Op(), UnaryOperation::kIsNotNull);
+
+  Expression not_is_not_null = UnaryExpressionExp(
+      UnaryExpressionExp(ColumnValueExp("x"), UnaryOperation::kIsNotNull),
+      UnaryOperation::kNot);
+  rewritten = rewrite(not_is_not_null);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(rewritten->AsUnaryExpression().Op(), UnaryOperation::kIsNull);
+}
+
+TEST(ExpressionRewriteTest, XorBooleanIdentity) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+  Expression x = ColumnValueExp("x");
+
+  Expression xor_true = BinaryExpressionExp(
+      x, BinaryOperation::kXor, ConstantValueExp(Value(true)));
+  Expression rewritten = rewrite(xor_true);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(rewritten->AsUnaryExpression().Op(), UnaryOperation::kNot);
+
+  Expression false_xor = BinaryExpressionExp(
+      ConstantValueExp(Value(false)), BinaryOperation::kXor, x);
+  rewritten = rewrite(false_xor);
+  EXPECT_EQ(rewritten->Type(), TypeTag::kColumnValue);
+
+  Expression xor_columns = BinaryExpressionExp(x, BinaryOperation::kXor,
+                                               ColumnValueExp("y"));
+  EXPECT_EQ(rewrite(xor_columns)->Type(), TypeTag::kBinaryExp);
+}
+
+TEST(ExpressionRewriteTest, IdempotenceAndAbsorption) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+  Expression x = ColumnValueExp("x");
+  Expression y = ColumnValueExp("y");
+
+  Expression and_idempotent = BinaryExpressionExp(
+      x, BinaryOperation::kAnd, ColumnValueExp("x"));
+  EXPECT_EQ(rewrite(and_idempotent)->Type(), TypeTag::kColumnValue);
+
+  Expression or_idempotent = BinaryExpressionExp(
+      y, BinaryOperation::kOr, ColumnValueExp("y"));
+  EXPECT_EQ(rewrite(or_idempotent)->Type(), TypeTag::kColumnValue);
+
+  Expression absorption = BinaryExpressionExp(
+      x, BinaryOperation::kAnd,
+      BinaryExpressionExp(x, BinaryOperation::kOr, y));
+  EXPECT_EQ(rewrite(absorption)->Type(), TypeTag::kColumnValue);
+
+  Expression absorption_reversed = BinaryExpressionExp(
+      BinaryExpressionExp(x, BinaryOperation::kOr, y),
+      BinaryOperation::kAnd, x);
+  EXPECT_EQ(rewrite(absorption_reversed)->Type(), TypeTag::kColumnValue);
+
+  Expression absorption_or = BinaryExpressionExp(
+      x, BinaryOperation::kOr,
+      BinaryExpressionExp(x, BinaryOperation::kAnd, y));
+  EXPECT_EQ(rewrite(absorption_or)->Type(), TypeTag::kColumnValue);
+
+  // Non-absorption shapes survive unchanged.
+  Expression kept = BinaryExpressionExp(
+      x, BinaryOperation::kAnd,
+      BinaryExpressionExp(y, BinaryOperation::kOr, ColumnValueExp("z")));
+  EXPECT_EQ(rewrite(kept)->Type(), TypeTag::kBinaryExp);
+}
+
+TEST(ExpressionRewriteTest, ArithmeticIdentitiesAndDoubleNegation) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+  Expression x = ColumnValueExp("x");
+
+  EXPECT_EQ(rewrite(BinaryExpressionExp(x, BinaryOperation::kAdd,
+                                        ConstantValueExp(Value(0))))
+                ->Type(),
+            TypeTag::kColumnValue);
+  EXPECT_EQ(rewrite(BinaryExpressionExp(ConstantValueExp(Value(0)),
+                                        BinaryOperation::kAdd, x))
+                ->Type(),
+            TypeTag::kColumnValue);
+  EXPECT_EQ(rewrite(BinaryExpressionExp(x, BinaryOperation::kSubtract,
+                                        ConstantValueExp(Value(0))))
+                ->Type(),
+            TypeTag::kColumnValue);
+  EXPECT_EQ(rewrite(BinaryExpressionExp(x, BinaryOperation::kMultiply,
+                                        ConstantValueExp(Value(1))))
+                ->Type(),
+            TypeTag::kColumnValue);
+  EXPECT_EQ(rewrite(BinaryExpressionExp(ConstantValueExp(Value(1)),
+                                        BinaryOperation::kMultiply, x))
+                ->Type(),
+            TypeTag::kColumnValue);
+  EXPECT_EQ(rewrite(BinaryExpressionExp(x, BinaryOperation::kDivide,
+                                        ConstantValueExp(Value(1))))
+                ->Type(),
+            TypeTag::kColumnValue);
+
+  Expression double_minus = UnaryExpressionExp(
+      UnaryExpressionExp(x, UnaryOperation::kMinus), UnaryOperation::kMinus);
+  EXPECT_EQ(rewrite(double_minus)->Type(), TypeTag::kColumnValue);
+
+  // Non-identity operands stay untouched.
+  Expression kept = BinaryExpressionExp(x, BinaryOperation::kAdd,
+                                        ConstantValueExp(Value(2)));
+  EXPECT_EQ(rewrite(kept)->Type(), TypeTag::kBinaryExp);
+}
+
+TEST(ExpressionRewriteTest, ReassociateConstantArithmetic) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+  // A statically int64 inner expression that no rule can constant-fold.
+  const auto int64_inner = [] {
+    return FunctionCallExp("extract_year", {ColumnValueExp("event_date")});
+  };
+
+  Expression nested_add = BinaryExpressionExp(
+      BinaryExpressionExp(int64_inner(), BinaryOperation::kAdd,
+                          ConstantValueExp(Value(1))),
+      BinaryOperation::kAdd, ConstantValueExp(Value(2)));
+  Expression rewritten = rewrite(nested_add);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(
+      rewritten->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+      Value(3));
+  Expression nested_subtract = BinaryExpressionExp(
+      BinaryExpressionExp(int64_inner(), BinaryOperation::kSubtract,
+                          ConstantValueExp(Value(5))),
+      BinaryOperation::kSubtract, ConstantValueExp(Value(3)));
+  rewritten = rewrite(nested_subtract);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(
+      rewritten->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+      Value(8));
+  EXPECT_EQ(rewritten->AsBinaryExpression().Left()->Type(),
+            TypeTag::kFunctionCallExp);
+}
+
+TEST(ExpressionRewriteTest, ReassociationRestrictedToIntegerExpressions) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+
+  // Reassociating floating point arithmetic changes the IEEE rounding order,
+  // so statically double-typed inners must be left alone.
+  Expression avg =
+      AggregateExpressionExp(AggregationType::kAvg, ColumnValueExp("amount"));
+  Expression fp_nested = BinaryExpressionExp(
+      BinaryExpressionExp(avg, BinaryOperation::kAdd,
+                          ConstantValueExp(Value(1))),
+      BinaryOperation::kAdd, ConstantValueExp(Value(2)));
+  Expression rewritten = rewrite(fp_nested);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(
+      rewritten->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+      Value(2));
+  ASSERT_EQ(rewritten->AsBinaryExpression().Left()->Type(),
+            TypeTag::kBinaryExp);
+
+  // The type of a bare column is unknown without a schema; keep the shape.
+  Expression column_nested = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kAdd,
+                          ConstantValueExp(Value(1))),
+      BinaryOperation::kAdd, ConstantValueExp(Value(2)));
+  rewritten = rewrite(column_nested);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Left()->Type(),
+            TypeTag::kBinaryExp);
+}
+
+TEST(ExpressionRewriteTest, DedupeInListAndUniformCaseResult) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+
+  Expression duplicated = InExpressionExp(
+      ColumnValueExp("x"),
+      {ConstantValueExp(Value(1)), ConstantValueExp(Value(1)),
+       ConstantValueExp(Value(2))});
+  Expression rewritten = rewrite(duplicated);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kInExp);
+  EXPECT_EQ(rewritten->AsInExpression().list_.size(), 2U);
+
+  Expression unique = InExpressionExp(
+      ColumnValueExp("x"),
+      {ConstantValueExp(Value(1)), ConstantValueExp(Value(2))});
+  EXPECT_EQ(rewrite(unique)->AsInExpression().list_.size(), 2U);
+
+  Expression uniform = CaseExpressionExp(
+      {{ColumnValueExp("a"), ConstantValueExp(Value(7))},
+       {ColumnValueExp("b"), ConstantValueExp(Value(7))}},
+      ConstantValueExp(Value(7)));
+  rewritten = rewrite(uniform);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten->AsConstantValue().GetValue(), Value(7));
+
+  Expression mixed = CaseExpressionExp(
+      {{ColumnValueExp("a"), ConstantValueExp(Value(7))},
+       {ColumnValueExp("b"), ConstantValueExp(Value(8))}},
+      ConstantValueExp(Value(7)));
+  EXPECT_EQ(rewrite(mixed)->Type(), TypeTag::kCaseExp);
+}
+
+TEST(ExpressionRewriteTest, WildcardFreeLikeBecomesEquality) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+
+  Expression like_exact =
+      BinaryExpressionExp(ColumnValueExp("name"), BinaryOperation::kLike,
+                          ConstantValueExp(Value("abc")));
+  Expression rewritten = rewrite(like_exact);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kEquals);
+  EXPECT_EQ(
+      rewritten->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+      Value("abc"));
+
+  Expression not_like_exact =
+      BinaryExpressionExp(ColumnValueExp("name"), BinaryOperation::kNotLike,
+                          ConstantValueExp(Value("abc")));
+  rewritten = rewrite(not_like_exact);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kNotEquals);
+
+  // Wildcards keep the LIKE operator.
+  Expression like_percent =
+      BinaryExpressionExp(ColumnValueExp("name"), BinaryOperation::kLike,
+                          ConstantValueExp(Value("a%")));
+  EXPECT_EQ(rewrite(like_percent)->AsBinaryExpression().Op(),
+            BinaryOperation::kLike);
+
+  Expression like_underscore =
+      BinaryExpressionExp(ColumnValueExp("name"), BinaryOperation::kLike,
+                          ConstantValueExp(Value("a_c")));
+  EXPECT_EQ(rewrite(like_underscore)->AsBinaryExpression().Op(),
+            BinaryOperation::kLike);
+}
+
+TEST(ExpressionRewriteTest, NullCheckCompositionCollapsesToConstant) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+
+  Expression is_null_of_is_null = UnaryExpressionExp(
+      UnaryExpressionExp(ColumnValueExp("x"), UnaryOperation::kIsNull),
+      UnaryOperation::kIsNull);
+  Expression rewritten = rewrite(is_null_of_is_null);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kConstantValue);
+  EXPECT_FALSE(rewritten->AsConstantValue().GetValue().Truthy());
+
+  Expression is_not_null_of_is_null = UnaryExpressionExp(
+      UnaryExpressionExp(ColumnValueExp("x"), UnaryOperation::kIsNull),
+      UnaryOperation::kIsNotNull);
+  rewritten = rewrite(is_not_null_of_is_null);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kConstantValue);
+  EXPECT_TRUE(rewritten->AsConstantValue().GetValue().Truthy());
+
+  Expression is_null_of_is_not_null = UnaryExpressionExp(
+      UnaryExpressionExp(ColumnValueExp("x"), UnaryOperation::kIsNotNull),
+      UnaryOperation::kIsNull);
+  rewritten = rewrite(is_null_of_is_not_null);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kConstantValue);
+  EXPECT_FALSE(rewritten->AsConstantValue().GetValue().Truthy());
+
+  // NOT over a null check uses the pushdown rules instead of collapsing.
+  Expression not_is_null = UnaryExpressionExp(
+      UnaryExpressionExp(ColumnValueExp("x"), UnaryOperation::kIsNull),
+      UnaryOperation::kNot);
+  rewritten = rewrite(not_is_null);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(rewritten->AsUnaryExpression().Op(), UnaryOperation::kIsNotNull);
+}
+
+TEST(ExpressionRewriteTest, MixedReassociationOfConstants) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+  // A statically int64 inner expression that no rule can constant-fold.
+  const auto int64_inner = [] {
+    return FunctionCallExp("extract_year", {ColumnValueExp("event_date")});
+  };
+
+  // (x - 5) + 3 -> x + (-2)
+  Expression subtract_then_add = BinaryExpressionExp(
+      BinaryExpressionExp(int64_inner(), BinaryOperation::kSubtract,
+                          ConstantValueExp(Value(5))),
+      BinaryOperation::kAdd, ConstantValueExp(Value(3)));
+  Expression rewritten = rewrite(subtract_then_add);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(
+      rewritten->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+      Value(-2));
+
+  // (x + 5) - 3 -> x + 2
+  Expression add_then_subtract = BinaryExpressionExp(
+      BinaryExpressionExp(int64_inner(), BinaryOperation::kAdd,
+                          ConstantValueExp(Value(5))),
+      BinaryOperation::kSubtract, ConstantValueExp(Value(3)));
+  rewritten = rewrite(add_then_subtract);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(
+      rewritten->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+      Value(2));
+}
+
+TEST(ExpressionRewriteTest, ComplementaryAbsorptionDisabled) {
+  auto rewrite = [](const Expression& expression) {
+    return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  };
+  Expression x = ColumnValueExp("x");
+  Expression y = ColumnValueExp("y");
+
+  // x AND (NOT x OR y) must NOT be rewritten to x AND y: the identity fails
+  // under SQL three-valued logic (x = NULL, y = FALSE yields UNKNOWN on the
+  // left side but FALSE on the right). The rule was therefore removed.
+  Expression complement = BinaryExpressionExp(
+      x, BinaryOperation::kAnd,
+      BinaryExpressionExp(UnaryExpressionExp(x, UnaryOperation::kNot),
+                          BinaryOperation::kOr, y));
+  Expression rewritten = rewrite(complement);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kAnd);
+  const Expression& or_clause = rewritten->AsBinaryExpression().Right();
+  ASSERT_EQ(or_clause->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(or_clause->AsBinaryExpression().Op(), BinaryOperation::kOr);
+
+  Expression complement_reversed = BinaryExpressionExp(
+      BinaryExpressionExp(UnaryExpressionExp(x, UnaryOperation::kNot),
+                          BinaryOperation::kOr, y),
+      BinaryOperation::kAnd, x);
+  rewritten = rewrite(complement_reversed);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kAnd);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Right()->Type(),
+            TypeTag::kColumnValue);
+
+  // The negation inside must reference the same operand; otherwise keep.
+  Expression unrelated = BinaryExpressionExp(
+      x, BinaryOperation::kAnd,
+      BinaryExpressionExp(UnaryExpressionExp(y, UnaryOperation::kNot),
+                          BinaryOperation::kOr, ColumnValueExp("z")));
+  EXPECT_EQ(rewrite(unrelated)->Type(), TypeTag::kBinaryExp);
 }
 
 }  // namespace tinylamb

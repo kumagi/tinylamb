@@ -36,7 +36,7 @@ class AggregateExpression : public ExpressionBase {
   [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
                                           const Schema& right) const override;
   [[nodiscard]] AggregationType GetType() const { return type_; }
-  [[nodiscard]] Expression Child() const { return child_; }
+  [[nodiscard]] const Expression& Child() const { return child_; }
   [[nodiscard]] bool Distinct() const { return distinct_; }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;

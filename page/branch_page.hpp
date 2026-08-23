@@ -51,7 +51,7 @@ class BranchPage final {
   }
   [[nodiscard]] slot_t RowCount() const;
 
-  void SetLowestValue(page_id_t pid, Transaction& txn, page_id_t page);
+  void SetLowestValue(page_id_t pid, Transaction& txn, page_id_t value);
   page_id_t GetLowestValue(Transaction&) { return lowest_page_; }
 
   void SetLowestValueImpl(page_id_t value) { lowest_page_ = value; }
@@ -80,8 +80,8 @@ class BranchPage final {
   void SetFosterImpl(const FosterPair& foster);
   [[nodiscard]] StatusOr<FosterPair> GetFoster() const;
 
-  void Split(page_id_t, Transaction& txn, std::string_view key, Page* right,
-             std::string* middle);
+  Status Split(page_id_t, Transaction& txn, std::string_view key, Page* right,
+               std::string* middle);
 
   // Return lowest page_id which may contain the specified |key|.
   [[nodiscard]] bin_size_t SearchToInsert(std::string_view key) const;
@@ -91,8 +91,8 @@ class BranchPage final {
   [[nodiscard]] std::string_view GetKey(size_t idx) const;
   [[nodiscard]] page_id_t GetValue(size_t idx) const;
 
-  void InsertImpl(std::string_view key, page_id_t redo);
-  void UpdateImpl(std::string_view key, page_id_t redo);
+  void InsertImpl(std::string_view key, page_id_t pid);
+  void UpdateImpl(std::string_view key, page_id_t pid);
   void DeleteImpl(std::string_view key);
 
   void Dump(std::ostream& o, int indent) const;
@@ -118,7 +118,8 @@ class BranchPage final {
 
   page_id_t lowest_page_ = 0;
   slot_t row_count_ = 0;
-  bin_size_t free_ptr_ = sizeof(BranchPage);
+  // Defaults mirror Initialize(); PageInit always runs Initialize before use.
+  bin_size_t free_ptr_ = kPageBodySize;
   bin_size_t free_size_ = kPageBodySize - sizeof(BranchPage);
   // The flexible tail is part of the fixed-size page format.  Its offset is
   // used for both slot storage and payload placement.

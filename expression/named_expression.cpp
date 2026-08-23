@@ -21,12 +21,14 @@
 #include "expression/named_expression.hpp"
 
 #include <ostream>
+#include <string>
 
 namespace tinylamb {
 
 std::ostream& operator<<(std::ostream& o, const NamedExpression& ne) {
-  o << *ne.expression;
-  if (!ne.name.empty() && ne.name != ne.expression->ToString()) {
+  const std::string expression_text = ne.expression->ToString();
+  o << expression_text;
+  if (!ne.name.empty() && ne.name != expression_text) {
     o << " AS " << ne.name;
   }
   return o;

@@ -54,7 +54,15 @@ struct QueryData {
       }
       o << q.from_[i];
     }
-    o << "\nWHERE\n  " << *q.where_ << ";";
+    o << "\nWHERE\n  ";
+    // where_ is optional (e.g. QueryData{{"t"}, nullptr, {…}} built by
+    // tests/UPDATE paths); logging must not crash on a missing predicate.
+    if (q.where_) {
+      o << *q.where_;
+    } else {
+      o << "(none)";
+    }
+    o << ";";
     return o;
   }
   Status Rewrite(TransactionContext& ctx);
@@ -67,6 +75,11 @@ struct QueryData {
   bool require_row_position_{false};
   std::vector<Expression> order_expressions_;
   std::vector<bool> order_ascending_;
+  // LIMIT/OFFSET made visible to the optimizer (Phase 5 Top-K). The plan may
+  // fold them into a LimitPlan; the engine skips its own wrapper when the
+  // plan reports EnforcesLimit (D6).
+  size_t limit_count_{0};
+  size_t limit_offset_{0};
 };
 
 }  // namespace tinylamb

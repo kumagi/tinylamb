@@ -18,8 +18,10 @@
 #define TINYLAMB_LOGGER_HPP
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -40,15 +42,40 @@ class Logger final {
 
   void Finish();
 
+  // Bytes written to the log file (may not be fsynced yet).
   [[nodiscard]] lsn_t CommittedLSN() const { return flushed_lsn_; }
+  // Bytes that have survived fdatasync (durable).
+  [[nodiscard]] lsn_t DurableLSN() const {
+    return durable_lsn_.load(std::memory_order_acquire);
+  }
   [[nodiscard]] lsn_t BufferedLSN() const { return buffered_lsn_; }
 
+  // Appends payload to the write buffer and returns the LSN at which the
+  // record STARTS. The record is only enqueued: nothing is flushed yet.
+  // To wait for the record's own durability, pass BufferedLSN() read AFTER
+  // this call to WaitForDurable() (AddLog()'s return value alone only
+  // guarantees the PREVIOUS records are durable).
   lsn_t AddLog(std::string_view payload);
+
+  // Block until DurableLSN() >= lsn (group commit).
+  // Throws std::runtime_error if the worker hit an unrecoverable write error.
+  void WaitForDurable(lsn_t lsn);
 
   [[nodiscard]] int Fd() const { return dst_; }
 
+  // True once the worker thread gave up after a write error (e.g. ENOSPC,
+  // EIO). Every subsequent AddLog/WaitForDurable/Finish throws.
+  [[nodiscard]] bool Failed() const {
+    return failed_.load(std::memory_order_acquire);
+  }
+  // errno captured at the failing write; valid only when Failed().
+  [[nodiscard]] int ErrorNumber() const {
+    return error_number_.load(std::memory_order_acquire);
+  }
+
   friend std::ostream& operator<<(std::ostream& o, const Logger& l) {
     o << "Logger(committed_lsn=" << l.flushed_lsn_.load()
+      << ", durable_lsn=" << l.durable_lsn_.load()
       << ", buffered_lsn=" << l.buffered_lsn_.load()
       << ", finish=" << l.finish_.load() << ")";
     return o;
@@ -56,14 +83,27 @@ class Logger final {
 
  private:
   void LoggerWork();
+  void AdvanceDurable(lsn_t to);
+  void NotifyWorker();
+  // Marks the logger as failed, wakes every waiter and stops the worker.
+  void SetFailed(int err);
+  // Throws std::runtime_error when Failed().
+  void RaiseIfFailed() const;
+  // Signals the worker to quit and joins it. Never throws.
+  void DrainAndStopWorker();
 
-  // This order of member is suggested by Clang-Tidy to minimize the padding.
   std::atomic<bool> finish_ = false;
+  alignas(64) std::atomic<bool> failed_{false};
+  alignas(64) std::atomic<int> error_number_{0};
   alignas(64) std::atomic<lsn_t> flushed_lsn_{0};
-  const size_t every_us_;
+  alignas(64) std::atomic<lsn_t> durable_lsn_{0};
   std::string buffer_;
   int dst_ = -1;
   std::mutex enqueue_latch_;
+  std::mutex work_mu_;
+  std::condition_variable work_cv_;
+  std::mutex durable_mu_;
+  std::condition_variable durable_cv_;
   alignas(64) std::atomic<lsn_t> buffered_lsn_{0};
   std::thread worker_;
 };

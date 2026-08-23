@@ -22,7 +22,6 @@
 
 #include <cstddef>
 #include <ostream>
-#include <sstream>
 #include <string>
 
 #include "common/decoder.hpp"
@@ -37,15 +36,16 @@ std::ostream& operator<<(std::ostream& o, const IndexMode& mode) {
 }
 
 std::string IndexSchema::GenerateKey(const Row& row) const {
-  std::stringstream s;
+  std::string key;
   for (const auto& k : key_) {
-    s << row[k].EncodeMemcomparableFormat();
+    key += row[k].EncodeMemcomparableFormat();
   }
-  return s.str();
+  return key;
 }
 
 Encoder& operator<<(Encoder& a, const IndexSchema& idx) {
-  a << idx.name_ << idx.key_ << idx.include_ << (bool)idx.mode_;
+  a << idx.name_ << idx.key_ << idx.include_
+    << (idx.mode_ == IndexMode::kUnique);
   return a;
 }
 

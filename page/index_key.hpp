@@ -18,6 +18,7 @@
 #define TINYLAMB_INDEX_KEY_HPP
 
 #include <cstring>
+#include <stdexcept>
 #include <string>
 
 #include "common/constants.hpp"
@@ -47,9 +48,21 @@ class IndexKey final {
       : is_plus_infinity_(false), is_minus_infinity_(false), key_(key) {}
   static IndexKey PlusInfinity() { return {true, false, ""}; }
   static IndexKey MinusInfinity() { return {false, true, ""}; }
-  static IndexKey Deserialize(const char* src) {
+  // Rebuild an IndexKey from its length-prefixed page image. |end| must bound
+  // the readable payload region (page images are only trusted up to the page
+  // body); a corrupt or partially written image is reported instead of
+  // producing a string_view that runs past the 32 KiB page.
+  static IndexKey Deserialize(const char* src, const char* end) {
+    if (end < src ||
+        static_cast<size_t>(end - src) < sizeof(bin_size_t)) {
+      throw std::runtime_error("corrupt index key: truncated header");
+    }
     bin_size_t size = 0;
     memcpy(&size, src, sizeof(bin_size_t));
+    if (static_cast<size_t>(size) >
+        static_cast<size_t>(end - src) - sizeof(bin_size_t)) {
+      throw std::runtime_error("corrupt index key: length prefix out of range");
+    }
     return IndexKey(std::string_view{src + sizeof(bin_size_t), size});
   }
   IndexKey(const IndexKey&) = default;
@@ -114,7 +127,13 @@ class IndexKey final {
         std::string decoded_key;
         d >> decoded_key;
         key = {false, false, decoded_key};
+        break;
       }
+      default:
+        // Unknown type bytes mean a broken image; failing loudly keeps the
+        // caller's stale |key| from being mistaken for a decode result.
+        throw std::runtime_error("corrupt index key: unknown encoding " +
+                                 std::to_string(static_cast<int>(type)));
     }
     return d;
   }
@@ -147,6 +166,9 @@ class IndexKey final {
   std::string key_;
 };
 
+// Serialized byte count of |ik| on a page. Infinity keys occupy no payload
+// (they are encoded as fence sentinels, not bytes); SerializeIndexKey asserts
+// IsNotInfinity, so only non-infinity keys may pass through both.
 inline size_t SerializeSize(const IndexKey& ik) {
   if (ik.IsMinusInfinity() || ik.IsPlusInfinity()) {
     return 0;

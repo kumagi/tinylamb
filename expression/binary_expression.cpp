@@ -17,10 +17,20 @@
 #include "binary_expression.hpp"
 
 #include <cmath>
+#include <cstddef>
+#include <ostream>
 #include <stdexcept>
+#include <string_view>
+#include <string>
 #include <unordered_set>
 
+#include "type/column_name.hpp"
+#include "common/constants.hpp"
+#include "expression/expression.hpp"
 #include "type/schema.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
+#include "type/type.hpp"
 
 namespace tinylamb {
 
@@ -67,7 +77,8 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         (!right.IsNull() && !right.Truthy())) {
       return Value(false);
     }
-    if (left.IsNull() || right.IsNull()) return Value();
+    if (left.IsNull() || right.IsNull()) { return {};
+}
     return Value(true);
   }
   if (op == BinaryOperation::kOr) {
@@ -75,14 +86,17 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         (!right.IsNull() && right.Truthy())) {
       return Value(true);
     }
-    if (left.IsNull() || right.IsNull()) return Value();
+    if (left.IsNull() || right.IsNull()) { return {};
+}
     return Value(false);
   }
   if (op == BinaryOperation::kXor) {
-    if (left.IsNull() || right.IsNull()) return Value();
+    if (left.IsNull() || right.IsNull()) { return {};
+}
     return Value(left.Truthy() != right.Truthy());
   }
-  if (left.IsNull() || right.IsNull()) return Value();
+  if (left.IsNull() || right.IsNull()) { return {};
+}
   if (op == BinaryOperation::kLike || op == BinaryOperation::kNotLike) {
     if (left.type != ValueType::kVarChar || right.type != ValueType::kVarChar) {
       throw std::runtime_error("LIKE requires strings");
@@ -159,12 +173,22 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     case BinaryOperation::kXor:
     case BinaryOperation::kLike:
     case BinaryOperation::kNotLike:
+      // Already handled above; kept for -Wswitch completeness.
       break;
   }
   throw std::logic_error("invalid binary operation");
 }
 
 Value BinaryExpression::Evaluate(const Row& row, const Schema& schema) const {
+  // AND/OR are short-circuited: the right child must not be evaluated when
+  // the left operand already decides the result (three-valued logic).
+  if (op_ == BinaryOperation::kAnd || op_ == BinaryOperation::kOr) {
+    const Value left = left_->Evaluate(row, schema);
+    if (!left.IsNull() && left.Truthy() != (op_ == BinaryOperation::kAnd)) {
+      return Value(op_ == BinaryOperation::kOr);
+    }
+    return EvaluateBinary(op_, left, right_->Evaluate(row, schema));
+  }
   return EvaluateBinary(op_, left_->Evaluate(row, schema),
                         right_->Evaluate(row, schema));
 }
@@ -172,6 +196,17 @@ Value BinaryExpression::Evaluate(const Row& row, const Schema& schema) const {
 Value BinaryExpression::Evaluate(const Row* left, const Schema& left_schema,
                                  const Row* right,
                                  const Schema& right_schema) const {
+  if (op_ == BinaryOperation::kAnd || op_ == BinaryOperation::kOr) {
+    const Value left_value =
+        left_->Evaluate(left, left_schema, right, right_schema);
+    if (!left_value.IsNull() &&
+        left_value.Truthy() != (op_ == BinaryOperation::kAnd)) {
+      return Value(op_ == BinaryOperation::kOr);
+    }
+    return EvaluateBinary(
+        op_, left_value,
+        right_->Evaluate(left, left_schema, right, right_schema));
+  }
   return EvaluateBinary(
       op_, left_->Evaluate(left, left_schema, right, right_schema),
       right_->Evaluate(left, left_schema, right, right_schema));
@@ -184,18 +219,18 @@ Type BinaryResultType(BinaryOperation operation, const Type& left,
       operation == BinaryOperation::kOr || operation == BinaryOperation::kXor ||
       operation == BinaryOperation::kLike ||
       operation == BinaryOperation::kNotLike) {
-    return Type(TypeTag::kBigInt);
+    return {TypeTag::kBigInt};
   }
   if (left.GetType() == TypeTag::kDouble ||
       right.GetType() == TypeTag::kDouble) {
-    return Type(TypeTag::kDouble);
+    return {TypeTag::kDouble};
   }
   if (operation == BinaryOperation::kAdd &&
       left.GetType() == TypeTag::kVarChar &&
       right.GetType() == TypeTag::kVarChar) {
-    return Type(TypeTag::kVarChar);
+    return {TypeTag::kVarChar};
   }
-  return Type(TypeTag::kBigInt);
+  return {TypeTag::kBigInt};
 }
 }  // namespace
 
@@ -211,9 +246,8 @@ Type BinaryExpression::ResultType(const Schema& left,
 }
 
 std::string BinaryExpression::ToString() const {
-  std::stringstream o;
-  o << "(" << *left_ << " " << tinylamb::ToString(op_) << " " << *right_ << ")";
-  return o.str();
+  return "(" + left_->ToString() + " " +
+         std::string(tinylamb::ToString(op_)) + " " + right_->ToString() + ")";
 }
 
 void BinaryExpression::Dump(std::ostream& o) const { o << ToString(); }

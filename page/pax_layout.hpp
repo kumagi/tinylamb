@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace tinylamb {
 
@@ -51,6 +52,14 @@ struct PaxColumnDirectory {
 [[nodiscard]] constexpr size_t PaxDirectoryBytes(size_t column_count) {
   return column_count * sizeof(PaxColumnDirectory);
 }
+
+// The structures above are addressed by fixed on-disk offsets; keep their
+// sizes and standard-layout guarantee visible from the header itself instead
+// of relying on tests.
+static_assert(sizeof(PaxPageHeader) == 32, "on-disk header layout");
+static_assert(sizeof(PaxColumnDirectory) == 28, "on-disk directory layout");
+static_assert(std::is_standard_layout_v<PaxPageHeader>);
+static_assert(std::is_standard_layout_v<PaxColumnDirectory>);
 
 }  // namespace tinylamb
 

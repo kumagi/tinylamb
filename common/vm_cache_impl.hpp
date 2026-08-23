@@ -23,6 +23,7 @@
 #include <iosfwd>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tinylamb {
@@ -53,14 +54,65 @@ class VMCacheImpl {
   friend std::ostream& operator<<(std::ostream& o, const PageState& s);
 
  public:
+  class PageLock {
+    // Mirrors UnfixPage(): the accessed bit must survive unlocking, otherwise
+    // every pinned read demotes an SLRU main-queue candidate back to small.
+    static void Release(std::atomic<PageState>* page) noexcept {
+      const PageState state = page->load(std::memory_order_relaxed);
+      page->store(state == PageState::kLockedAccessed
+                      ? PageState::kUnlockedAccessed
+                      : PageState::kUnlocked,
+                  std::memory_order_release);
+    }
+
+   public:
+    ~PageLock() noexcept {
+      if (locked_page_ != nullptr) {
+        Release(locked_page_);
+      }
+    }
+    PageLock(const PageLock&) = delete;
+    PageLock& operator=(const PageLock&) = delete;
+    PageLock(PageLock&& other) noexcept : locked_page_(other.locked_page_) {
+      other.locked_page_ = nullptr;
+    }
+    PageLock& operator=(PageLock&& other) noexcept {
+      if (this != &other) {
+        if (locked_page_ != nullptr) {
+          Release(locked_page_);
+        }
+        locked_page_ = other.locked_page_;
+        other.locked_page_ = nullptr;
+      }
+      return *this;
+    }
+
+   private:
+    friend class VMCacheImpl;
+    std::atomic<PageState>* locked_page_{nullptr};
+    explicit PageLock(std::atomic<PageState>& target) : locked_page_(&target) {}
+    static PageLock Pin(std::atomic<PageState>& target) {
+      return PageLock(target);
+    }
+  };
+  using Locks = std::vector<PageLock>;
+
+  // If `own_fd` is true (default) the destructor closes `fd`. Pass false when
+  // the descriptor is owned by someone else (e.g. BlobFile's Logger) so two
+  // objects never close the same fd.
   VMCacheImpl(int fd, size_t block_size, size_t memory_capacity,
-              size_t offset = 0, size_t file_size = 0);
+              size_t offset = 0, size_t file_size = 0, bool own_fd = true);
   ~VMCacheImpl();
   VMCacheImpl(const VMCacheImpl&) = delete;
   VMCacheImpl(VMCacheImpl&&) = delete;
   VMCacheImpl& operator=(const VMCacheImpl&) = delete;
   VMCacheImpl& operator=(VMCacheImpl&&) = delete;
   void Read(void* dst, size_t offset, size_t length) const;
+  [[nodiscard]] std::string ReadAt(size_t offset, size_t length) const;
+  Locks ReadAt(size_t offset, size_t length, std::string_view& out) const;
+  void Copy(void* dst, size_t offset, size_t length) const {
+    Read(dst, offset, length);
+  }
   void Invalidate(size_t offset, size_t length);
   [[nodiscard]] std::string Dump() const;
 
@@ -80,6 +132,7 @@ class VMCacheImpl {
   bool SanityCheck() const;
 
   int fd_;
+  const bool own_fd_;
   const size_t block_size_;
   mutable char* buffer_;
   const size_t max_memory_pages_;

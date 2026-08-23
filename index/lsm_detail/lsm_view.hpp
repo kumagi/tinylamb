@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_LSM_VIEW_HPP
 #define TINYLAMB_LSM_VIEW_HPP
 
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
 #include <initializer_list>
@@ -49,6 +50,9 @@ class LSMView {
    public:
     Iterator(const LSMView* vm, bool head);
     ~Iterator() = default;
+    // Note: a moved-from view leaves previously created Iterators dangling
+    // (they keep a back pointer to the view). Treat LSMView as effectively
+    // immovable while iterators are alive.
     Iterator(Iterator&& o) = default;
     Iterator(const Iterator& o) = default;
     Iterator& operator=(Iterator&& o) = default;
@@ -67,6 +71,9 @@ class LSMView {
 
    private:
     void Forward();
+    // Advances until the top entry holds a fresh, live key: skips duplicate
+    // keys (keeping the newest generation's value) and tombstones.
+    void AdvanceSkippingTombstones();
 
     const LSMView* vm_;
     std::vector<SortedRun::Iterator> iters_;
@@ -79,6 +86,8 @@ class LSMView {
   friend std::ostream& operator<<(std::ostream& o, const LSMView& v);
 
  private:
+  // Lifetime: `blob_` must outlive the view (and any iterator taken from
+  // it); LSMTree::GetView() results are only valid while the tree lives.
   const BlobFile& blob_;
   std::vector<SortedRun> indexes_;
 };

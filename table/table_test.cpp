@@ -16,15 +16,27 @@
 
 #include "table/table.hpp"
 
+#include <cstddef>
+#include <cstdint>
+#include <iomanip>
 #include <memory>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <unordered_set>
+#include <utility>
 
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
+#include "database/transaction_context.hpp"
 #include "gtest/gtest.h"
 #include "page/page_manager.hpp"
 #include "recovery/recovery_manager.hpp"
+#include "table/iterator.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/constraint.hpp"
 #include "type/row.hpp"
@@ -33,7 +45,7 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
-static const char* kTableName = "SampleTable";
+static constexpr std::string_view kTableName = "SampleTable";
 
 class TableTest : public ::testing::Test {
  public:
@@ -73,7 +85,8 @@ TEST_F(TableTest, Construct) {
 TEST_F(TableTest, Insert) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   Row r({Value(1), Value("fuga"), Value(3.3)});
 
   // Act
@@ -86,11 +99,12 @@ TEST_F(TableTest, Read) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
   Row r({Value(1), Value("string"), Value(3.3)});
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
 
   // Act
   ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl->Insert(ctx.txn_, r));
-  ASSIGN_OR_ASSERT_FAIL(Row, read, tbl->Read(ctx.txn_, rp));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl->Read(ctx.txn_, rp));
 
   // Assert
   ASSERT_EQ(read, r);
@@ -99,7 +113,8 @@ TEST_F(TableTest, Read) {
 TEST_F(TableTest, Update) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   Row new_row({Value(1), Value("hogefuga"), Value(99e8)});
 
   // Act
@@ -107,7 +122,7 @@ TEST_F(TableTest, Update) {
       RowPosition, rp,
       tbl->Insert(ctx.txn_, Row({Value(1), Value("string"), Value(3.3)})));
   ASSERT_SUCCESS(tbl->Update(ctx.txn_, rp, new_row).GetStatus());
-  ASSIGN_OR_ASSERT_FAIL(Row, read, tbl->Read(ctx.txn_, rp));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl->Read(ctx.txn_, rp));
 
   // Assert
   ASSERT_EQ(read, new_row);
@@ -116,7 +131,8 @@ TEST_F(TableTest, Update) {
 TEST_F(TableTest, UpdateMany) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   std::vector<RowPosition> rps;
 
   // Act -- insert 30 rows then update each 260 times via round-robin
@@ -139,7 +155,8 @@ TEST_F(TableTest, UpdateMany) {
 TEST_F(TableTest, Delete) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
 
   // Act
   ASSIGN_OR_ASSERT_FAIL(
@@ -154,7 +171,8 @@ TEST_F(TableTest, Delete) {
 TEST_F(TableTest, IndexRead) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
 
   // Act -- insert three rows into the indexed table
   ASSERT_SUCCESS(
@@ -173,7 +191,8 @@ TEST_F(TableTest, IndexRead) {
 TEST_F(TableTest, IndexUpdateRead) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
 
   // Act -- insert three rows then update one via index
   ASSIGN_OR_ASSERT_FAIL(
@@ -197,7 +216,8 @@ TEST_F(TableTest, IndexUpdateRead) {
 TEST_F(TableTest, IndexUpdateDelete) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
 
   // Act -- insert three rows then delete one via index
   ASSIGN_OR_ASSERT_FAIL(
@@ -230,7 +250,8 @@ TEST_F(TableTest, InsertDuplicateUniqueKey) {
   TransactionContext ctx = rs_->BeginContext();
   ASSERT_SUCCESS(
       rs_->CreateIndex(ctx, kTableName, IndexSchema("col1_unique", {0})));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   ASSERT_SUCCESS(tbl->Insert(ctx.txn_,
                              Row({Value(1), Value("first"), Value(3.3)}))
                      .GetStatus());
@@ -251,7 +272,8 @@ TEST_F(TableTest, InsertDuplicateUniqueKey) {
 TEST_F(TableTest, InsertDuplicateUniqueKeyLeavesNoOrphan) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   ASSERT_SUCCESS(tbl->Insert(ctx.txn_,
                              Row({Value(1), Value("dup"), Value(3.3)}))
                      .GetStatus());
@@ -269,19 +291,172 @@ TEST_F(TableTest, InsertDuplicateUniqueKeyLeavesNoOrphan) {
     ++count;
     ++it;
   }
-  ASSERT_EQ(count, 1u);
+  ASSERT_EQ(count, 1U);
 }
 
+// §4.3 regression: when the physical insert fails without consuming a slot
+// (RowPage::Insert now reports kConflicts before writing anything), the
+// failure must propagate and neither a phantom row position {0,0} nor an
+// index entry for it may be created.
+TEST_F(TableTest, InsertConflictPropagatesWithoutPhantomIndexEntry) {
+  // Arrange -- a single-column unique index plus a committed control row keep
+  // the probes below well-defined and non-degenerate.
+  TransactionContext setup = rs_->BeginContext();
+  ASSERT_SUCCESS(
+      rs_->CreateIndex(setup, kTableName, IndexSchema("probe_unique", {0})));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl0,
+                              setup.GetTable(kTableName));
+  ASSERT_SUCCESS(tbl0->Insert(setup.txn_,
+                              Row({Value(10), Value("ctrl"), Value(9.9)}))
+                     .GetStatus());
+  ASSERT_SUCCESS(setup.txn_.PreCommit());
+
+  // T1 inserts and deletes a row but keeps its uncommitted lock on the freed
+  // slot.
+  TransactionContext t1 = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl1,
+                              t1.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL(
+      RowPosition, rp1,
+      tbl1->Insert(t1.txn_, Row({Value(1), Value("a"), Value(1.1)})));
+  ASSERT_SUCCESS(tbl1->Delete(t1.txn_, rp1));
+
+  // Act -- T2's insert targets the same still-locked slot and must fail
+  // without consuming it.
+  TransactionContext t2 = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl2,
+                              t2.GetTable(kTableName));
+  StatusOr<RowPosition> conflicting =
+      tbl2->Insert(t2.txn_, Row({Value(2), Value("b"), Value(2.2)}));
+  ASSERT_EQ(conflicting.GetStatus(), Status::kConflicts);
+
+  // Assert -- no phantom row was written: only the control row is visible.
+  size_t rows = 0;
+  Iterator scan = tbl2->BeginFullScan(t2.txn_);
+  while (scan.IsValid()) {
+    ++rows;
+    ++scan;
+  }
+  ASSERT_EQ(rows, 1U);
+
+  // Assert -- no phantom index entry for the rejected key either: a range
+  // scan over exactly that key finds nothing.
+  size_t probe_entries = 0;
+  for (size_t i = 0; i < tbl2->IndexCount(); ++i) {
+    if (tbl2->GetIndex(i).sc_.name_ == "probe_unique") {
+      Iterator key_scan = tbl2->BeginIndexScan(t2.txn_, tbl2->GetIndex(i),
+                                               Value(2), Value(2), true);
+      while (key_scan.IsValid()) {
+        ++probe_entries;
+        ++key_scan;
+      }
+    }
+  }
+  ASSERT_EQ(probe_entries, 0U);
+
+  // The control row stays reachable through the same index.
+  for (size_t i = 0; i < tbl2->IndexCount(); ++i) {
+    if (tbl2->GetIndex(i).sc_.name_ == "probe_unique") {
+      Iterator ctrl_scan = tbl2->BeginIndexScan(t2.txn_, tbl2->GetIndex(i),
+                                                Value(10), Value(10), true);
+      ASSERT_TRUE(ctrl_scan.IsValid());
+    }
+  }
+}
+
+// §4.8 regression: a CreateIndex whose backfill fails midway must remove the
+// half-built index from the table metadata and recycle its root page, so the
+// dropped index neither receives future entries nor leaks a page ID.
+TEST_F(TableTest, CreateIndexFailureCleansUpHalfBuiltIndex) {
+  // Arrange -- two rows sharing the col1 value that will be indexed uniquely
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
+  ASSERT_SUCCESS(
+      tbl->Insert(ctx.txn_, Row({Value(7), Value("a"), Value(3.3)}))
+          .GetStatus());
+  ASSERT_SUCCESS(
+      tbl->Insert(ctx.txn_, Row({Value(7), Value("b"), Value(4.4)}))
+          .GetStatus());
+  const size_t indexes_before = tbl->IndexCount();
+
+  // Act -- backfill hits the duplicate on the second row
+  Status created =
+      rs_->CreateIndex(ctx, kTableName, IndexSchema("dup_idx", {0}));
+  ASSERT_EQ(created, Status::kDuplicates);
+
+  // Assert -- the half-built index is gone from the table image
+  ASSERT_EQ(tbl->IndexCount(), indexes_before);
+  TransactionContext fresh_ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, reloaded,
+                              fresh_ctx.GetTable(kTableName));
+  ASSERT_EQ(reloaded->IndexCount(), indexes_before);
+
+  // Assert -- later inserts keep working and only touch the surviving index
+  ASSERT_SUCCESS(
+      tbl->Insert(ctx.txn_, Row({Value(8), Value("c"), Value(5.5)}))
+          .GetStatus());
+
+  // Assert -- a subsequent valid index creation succeeds (the recycled root
+  // page is reusable)
+  ASSERT_SUCCESS(rs_->CreateIndex(fresh_ctx, kTableName,
+                                  IndexSchema("col3_idx", {2})));
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+// §4.4 companion check: Delete must leave the remaining index entries intact
+// (the compensation logic must not over-fire and reinstate deleted keys).
+TEST_F(TableTest, DeleteRemovesOnlyItsOwnIndexEntries) {
+  // Arrange
+  TransactionContext ctx = rs_->BeginContext();
+  ASSERT_SUCCESS(
+      rs_->CreateIndex(ctx, kTableName, IndexSchema("col1_idx", {0})));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
+  ASSERT_SUCCESS(
+      tbl->Insert(ctx.txn_, Row({Value(1), Value("one"), Value(1.1)}))
+          .GetStatus());
+  ASSERT_SUCCESS(
+      tbl->Insert(ctx.txn_, Row({Value(2), Value("two"), Value(2.2)}))
+          .GetStatus());
+
+  // Act -- capture the indexed positions before deleting one of them
+  std::vector<RowPosition> victims;
+  const Index& by_col1 = tbl->GetIndex(1);
+  {
+    Iterator it = tbl->BeginIndexScan(ctx.txn_, by_col1);
+    while (it.IsValid()) {
+      victims.push_back(it.Position());
+      ++it;
+    }
+  }
+  ASSERT_EQ(victims.size(), 2U);
+  ASSERT_SUCCESS(tbl->Delete(ctx.txn_, victims.front()));
+
+  // Assert -- exactly the deleted entry disappeared from the index
+  size_t remaining = 0;
+  Iterator it = tbl->BeginIndexScan(ctx.txn_, by_col1);
+  while (it.IsValid()) {
+    ++remaining;
+    EXPECT_NE(it.Position(), victims.front());
+    ++it;
+  }
+  ASSERT_EQ(remaining, 1U);
+}
+
+namespace {
 std::string KeyPayload(int num, int width) {
   std::stringstream ss;
   ss << std::setw(width) << std::setfill('0') << num;
   return ss.str();
 }
+}  // namespace
 
 TEST_F(TableTest, InsertMany) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   std::unordered_set<Row> rows;
   std::unordered_set<RowPosition> rps;
 
@@ -291,14 +466,14 @@ TEST_F(TableTest, InsertMany) {
     Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
     ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl->Insert(ctx.txn_, new_row));
     rps.insert(rp);
-    ASSIGN_OR_ASSERT_FAIL(Row, read, tbl->Read(ctx.txn_, rp));
+    ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl->Read(ctx.txn_, rp));
     ASSERT_EQ(read, new_row);
     rows.insert(new_row);
   }
 
   // Assert -- every inserted row is readable via its row position
   for (const auto& row : rps) {
-    ASSIGN_OR_ASSERT_FAIL(Row, read, tbl->Read(ctx.txn_, row));
+    ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl->Read(ctx.txn_, row));
     ASSERT_NE(rows.find(read), rows.end());
   }
 }
@@ -307,23 +482,24 @@ TEST_F(TableTest, UpdateHeavy) {
   // Arrange
   constexpr int kCount = 50;
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   std::unordered_set<Row> rows;
   std::vector<RowPosition> rps;
   rps.reserve(kCount);
 
   // Act -- insert kCount rows then update each kCount*4 times via round-robin
   for (int i = 0; i < kCount; ++i) {
-    std::string key = RandomString((19937 * i) % 120 + 10, false);
+    std::string key = RandomString(((19937 * i) % 120) + 10, false);
     Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
     ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl->Insert(ctx.txn_, new_row));
     rps.push_back(rp);
   }
   Row read;
   for (int i = 0; i < kCount * 4; ++i) {
-    const size_t target = (i * 63) % rps.size();
+    const size_t target = (static_cast<size_t>(i) * 63) % rps.size();
     RowPosition& pos = rps[target];
-    std::string key = RandomString((19937 * i) % 1000 + 800, false);
+    std::string key = RandomString(((19937 * i) % 1000) + 800, false);
     Row new_row({Value(i), Value(std::move(key)), Value(i * 3.3)});
     ASSIGN_OR_ASSERT_FAIL(RowPosition, rp, tbl->Update(ctx.txn_, pos, new_row));
     rps[target] = rp;
@@ -337,7 +513,8 @@ TEST_F(TableTest, ReadOnlyUpdateConflicts) {
   RowPosition rp;
   {
     TransactionContext ctx = rs_->BeginContext();
-    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                                ctx.GetTable(kTableName));
     ASSIGN_OR_ASSERT_FAIL(RowPosition, inserted,
                           tbl->Insert(ctx.txn_,
                                       Row({Value(1), Value("string"),
@@ -348,7 +525,8 @@ TEST_F(TableTest, ReadOnlyUpdateConflicts) {
 
   // Act -- update and delete through a read-only transaction
   TransactionContext ctx = rs_->BeginReadOnlyContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   ASSERT_EQ(tbl->Update(ctx.txn_, rp,
                         Row({Value(1), Value("new"), Value(4.4)}))
                 .GetStatus(),
@@ -359,7 +537,8 @@ TEST_F(TableTest, ReadOnlyUpdateConflicts) {
 TEST_F(TableTest, InsertAllocatesNewPageWhenFull) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   std::vector<RowPosition> rps;
   std::string payload(300, 'x');
 
@@ -374,7 +553,7 @@ TEST_F(TableTest, InsertAllocatesNewPageWhenFull) {
   ASSERT_NE(rps.front().page_id, rps.back().page_id);
   // Assert -- every inserted row reads back intact across page boundaries
   for (int i = 0; i < 600; ++i) {
-    ASSIGN_OR_ASSERT_FAIL(Row, read, tbl->Read(ctx.txn_, rps[i]));
+    ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl->Read(ctx.txn_, rps[i]));
     ASSERT_EQ(read, Row({Value(i), Value(std::string(payload)), Value(i * 1.5)}));
   }
 }
@@ -382,7 +561,8 @@ TEST_F(TableTest, InsertAllocatesNewPageWhenFull) {
 TEST_F(TableTest, UpdateNonIndexedColumnFastPath) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   ASSIGN_OR_ASSERT_FAIL(
       RowPosition, rp,
       tbl->Insert(ctx.txn_, Row({Value(1), Value("string"), Value(3.3)})));
@@ -394,7 +574,7 @@ TEST_F(TableTest, UpdateNonIndexedColumnFastPath) {
 
   // Assert -- the indexed columns are unchanged so the row stays in place
   ASSERT_EQ(new_pos, rp);
-  ASSIGN_OR_ASSERT_FAIL(Row, read, tbl->Read(ctx.txn_, new_pos));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl->Read(ctx.txn_, new_pos));
   ASSERT_EQ(read, updated);
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
@@ -404,7 +584,8 @@ TEST_F(TableTest, IndexWithIncludeColumnUpdate) {
   TransactionContext ctx = rs_->BeginContext();
   ASSERT_SUCCESS(
       rs_->CreateIndex(ctx, kTableName, IndexSchema("idx_inc", {0}, {2})));
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   ASSIGN_OR_ASSERT_FAIL(
       RowPosition, rp,
       tbl->Insert(ctx.txn_, Row({Value(1), Value("string"), Value(3.3)})));
@@ -417,9 +598,9 @@ TEST_F(TableTest, IndexWithIncludeColumnUpdate) {
 
   // Assert -- the updated row reads back through a fresh transaction
   TransactionContext read_ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2,
-                        read_ctx.GetTable(kTableName));
-  ASSIGN_OR_ASSERT_FAIL(Row, read, tbl2->Read(read_ctx.txn_, new_pos));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl2,
+                              read_ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl2->Read(read_ctx.txn_, new_pos));
   ASSERT_EQ(read, updated);
   ASSERT_SUCCESS(read_ctx.txn_.PreCommit());
 }
@@ -427,7 +608,8 @@ TEST_F(TableTest, IndexWithIncludeColumnUpdate) {
 TEST_F(TableTest, BuildScanMorselsAndMorselScan) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   std::string payload(200, 'x');
   for (int i = 0; i < 400; ++i) {
     Row r({Value(i), Value(std::string(payload)), Value(i * 1.5)});
@@ -447,14 +629,15 @@ TEST_F(TableTest, BuildScanMorselsAndMorselScan) {
       ++it;
     }
   }
-  ASSERT_EQ(count, 400u);
+  ASSERT_EQ(count, 400U);
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
 TEST_F(TableTest, IndexScanFullRange) {
   // Arrange -- insert 20 rows into the indexed table
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
   for (int i = 0; i < 20; ++i) {
     Row r({Value(i), Value("str" + std::to_string(i)), Value(1.0 * i)});
     ASSERT_SUCCESS(tbl->Insert(ctx.txn_, r).GetStatus());
@@ -493,17 +676,94 @@ TEST_F(TableTest, IndexScanFullRange) {
 TEST_F(TableTest, AvailableKeyIndexAndStreamOperator) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
 
   // Act -- query which schema slots back the table's indexes
   auto available = tbl->AvailableKeyIndex();
-  ASSERT_EQ(available.size(), 1u);
-  ASSERT_EQ(available.count(0), 1u);
+  ASSERT_EQ(available.size(), 1U);
+  ASSERT_EQ(available.count(0), 1U);
 
   // Act -- stream the table
   std::stringstream ss;
   ss << *tbl;
   EXPECT_NE(ss.str().find("Table(schema="), std::string::npos);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+// Regression tests derived from table_fuzzer (crash-5983ad8f, input 0x1d).
+// The fuzzer creates a table plus two secondary indexes, commits, then hits
+// its EmulateCrash path on the very first input byte: reopening the database
+// reports pages 1..4 broken and GetTable() fails with kNotExists.  A commit
+// that only touched buffer-pool images must still survive via WAL replay.
+TEST_F(TableTest, TableWithIndexSurvivesCrash) {
+  // Arrange -- SetUp() committed a table with one index; nothing to add.
+
+  // Act -- lose the buffer pool and recover from the log.
+  Recover();
+  TransactionContext ctx = rs_->BeginContext();
+
+  // Assert -- the catalog entry (and its index) is still resolvable.
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
+  EXPECT_EQ(tbl->GetSchema().Name(), kTableName);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(TableTest, RowSurvivesCrashAfterCommit) {
+  // Arrange -- insert one row and commit it.
+  RowPosition rp;
+  {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                                ctx.GetTable(kTableName));
+    const Row r({Value(42), Value("survivor"), Value(3.5)});
+    ASSIGN_OR_ASSERT_FAIL(RowPosition, inserted, tbl->Insert(ctx.txn_, r));
+    rp = inserted;
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+
+  // Act -- crash and recover.
+  Recover();
+
+  // Assert -- the committed row reads back unchanged.
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl->Read(ctx.txn_, rp));
+  EXPECT_EQ(read, (Row({Value(42), Value("survivor"), Value(3.5)})));
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(TableTest, WritesAcrossTwoRecoveryCyclesAccumulate) {
+  // Data-level analogue of CatalogTest.TwoCleanRecoveryCyclesKeepTable:
+  // rows written before and after a crash must all be visible afterwards.
+  auto InsertRow = [this](int64_t id, const char* name) {
+    TransactionContext ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                                ctx.GetTable(kTableName));
+    EXPECT_TRUE(tbl->Insert(ctx.txn_,
+                            Row({Value(id), Value(name), Value(1.0)}))
+                    .HasValue());
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  };
+  InsertRow(1, "before-crash");
+  Recover();
+  InsertRow(2, "after-crash");
+  Recover();
+
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
+  size_t seen = 0;
+  for (Iterator iter = tbl->BeginFullScan(ctx.txn_); iter.IsValid(); ++iter) {
+    ++seen;
+    const Row& row = *iter;
+    ASSERT_EQ(row.values_.size(), 3U);
+    EXPECT_TRUE(row.values_[0].value.int_value == 1 ||
+                row.values_[0].value.int_value == 2);
+  }
+  EXPECT_EQ(seen, 2U);
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 }  // namespace tinylamb

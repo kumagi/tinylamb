@@ -16,9 +16,9 @@
 
 #include "plan/selection_plan.hpp"
 
-#include <cmath>
 #include <cstddef>
 #include <memory>
+#include <ostream>
 #include <string>
 
 #include "common/constants.hpp"

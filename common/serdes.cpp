@@ -16,18 +16,23 @@
 
 #include "common/serdes.hpp"
 
-#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <string_view>
 
 #include "constants.hpp"
 
 namespace tinylamb {
+
 size_t SerializeStringView(char* pos, std::string_view bin) {
-  assert(bin.size() <= std::numeric_limits<bin_size_t>::max());
-  const bin_size_t len = static_cast<bin_size_t>(bin.size());
+  // bin_size_t cannot represent longer strings; truncating silently would
+  // corrupt the serialized image (length prefix vs payload mismatch).
+  if (bin.size() > std::numeric_limits<bin_size_t>::max()) {
+    throw std::runtime_error("string too long to serialize");
+  }
+  const auto len = static_cast<bin_size_t>(bin.size());
   memcpy(pos, &len, sizeof(len));
   memcpy(pos + sizeof(len), bin.data(), bin.size());
   return sizeof(len) + bin.size();
@@ -69,6 +74,20 @@ size_t DeserializeStringView(const char* pos, std::string_view* out) {
   return sizeof(len) + len;
 }
 
+size_t DeserializeStringView(const char* pos, const char* end,
+                             std::string_view* out) {
+  if (end == nullptr || static_cast<size_t>(end - pos) < sizeof(bin_size_t)) {
+    return 0;
+  }
+  bin_size_t len = 0;
+  memcpy(&len, pos, sizeof(bin_size_t));
+  if (static_cast<size_t>(end - pos) - sizeof(bin_size_t) < len) {
+    return 0;
+  }
+  *out = {pos + sizeof(len), len};
+  return sizeof(len) + len;
+}
+
 size_t DeserializeSlot(const char* pos, slot_t* out) {
   memcpy(out, pos, sizeof(*out));
   return sizeof(slot_t);
@@ -80,8 +99,8 @@ size_t DeserializePID(const char* pos, page_id_t* out) {
 }
 
 size_t DeserializeInteger(const char* pos, int64_t* out) {
-  memcpy(out, pos, sizeof(int64_t));
-  return sizeof(uint64_t);
+  memcpy(out, pos, sizeof(*out));
+  return sizeof(int64_t);
 }
 
 size_t DeserializeDouble(const char* pos, double* out) {

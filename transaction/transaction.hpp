@@ -17,11 +17,13 @@
 #ifndef TINYLAMB_TRANSACTION_HPP
 #define TINYLAMB_TRANSACTION_HPP
 
+#include <atomic>
 #include <optional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -55,18 +57,37 @@ class Transaction final {
   Transaction() = default;  // For test purpose only.
   Transaction(txn_id_t txn_id, TransactionManager* tm, bool read_only = false);
   Transaction(const Transaction& o) = delete;
-  Transaction(Transaction&& o) = default;
+  // Moving re-registers the transaction with its TransactionManager so a
+  // Begin()-created object keeps its active_transactions_ entry valid at the
+  // new address. The moved-from object is left manager-less.
+  Transaction(Transaction&& o) noexcept;
   Transaction& operator=(const Transaction& o) = delete;
   Transaction& operator=(Transaction&& o) noexcept {
+    if (this == &o) return *this;
+    // This object may itself be registered under its old identity; drop that
+    // entry before adopting the source's fields and registration slot.
+    if (transaction_manager_ != nullptr) {
+      transaction_manager_->UnregisterActiveTransaction(this);
+    }
     txn_id_ = o.txn_id_;
     snapshot_ts_ = o.snapshot_ts_;
     read_set_ = std::move(o.read_set_);
     write_set_ = std::move(o.write_set_);
-    version_read_cache_ = std::move(o.version_read_cache_);
+    shard_epoch_ = o.shard_epoch_;
+    write_epoch_.store(o.write_epoch_.load(std::memory_order_acquire),
+                       std::memory_order_release);
+    version_read_caches_ = std::move(o.version_read_caches_);
+    read_state_mutex_ = std::move(o.read_state_mutex_);
     prev_lsn_ = o.prev_lsn_;
     status_ = o.status_;
     transaction_manager_ = o.transaction_manager_;
     read_only_ = o.read_only_;
+    if (o.transaction_manager_ != nullptr) {
+      o.transaction_manager_->MoveActiveTransaction(&o, this);
+    }
+    // Neutralize the moved-from object (PageRef-style): it no longer owns a
+    // registry slot or manager services.
+    o.transaction_manager_ = nullptr;
     return *this;
   }
   ~Transaction() = default;
@@ -108,9 +129,9 @@ class Transaction final {
   lsn_t UpdateBranchLog(page_id_t pid, std::string_view key, page_id_t redo,
                         page_id_t undo);
 
-  lsn_t DeleteLog(page_id_t pid, slot_t key, std::string_view prev);
+  lsn_t DeleteLog(page_id_t pid, slot_t slot, std::string_view undo);
   lsn_t DeleteLeafLog(page_id_t pid, std::string_view key,
-                      std::string_view prev);
+                      std::string_view undo);
   lsn_t DeleteBranchLog(page_id_t pid, std::string_view key, page_id_t undo);
 
   lsn_t SetLowestLog(page_id_t pid, page_id_t redo, page_id_t undo);
@@ -145,12 +166,58 @@ class Transaction final {
   friend class TransactionManager;
   friend class CheckpointManager;
 
+  // Version cache sharded per reading thread, each with its own lock.  Scan
+  // workers read concurrently through one transaction: steady-state reads
+  // touch only their own (uncontended) shard, and a shard eviction can only
+  // invalidate string views previously handed to the SAME thread, which by
+  // construction consumed them before its next read.  The shard map itself is
+  // guarded by read_state_mutex_; per-call access goes through a thread-local
+  // shortcut so it is taken once per thread, not once per row.
+  //
+  // Every entry carries the transaction's write epoch at insertion time.
+  // RegisterVersionWrite bumps the epoch, so entries in all shards go stale
+  // at once without cross-thread erasure (which would dangle views other
+  // workers still hold).  A cached entry may be served only while
+  // CacheEntryCurrent(entry.epoch) holds -- see ReadVersion for where this
+  // is enforced; it is what keeps any worker under this transaction from
+  // reading a pre-write value out of its shard's cache.
+  struct VersionCacheEntry {
+    uint64_t epoch{0};
+    std::string value;
+  };
+  struct VersionCacheShard {
+    std::mutex mutex;
+    std::unordered_map<RowPosition, VersionCacheEntry> entries;
+  };
+  // Returns this calling thread's version cache shard in this transaction.
+  VersionCacheShard& ThreadShard();
+  [[nodiscard]] static uint64_t NextShardEpoch();
+  [[nodiscard]] bool CacheEntryCurrent(uint64_t entry_epoch) const {
+    return entry_epoch == write_epoch_.load(std::memory_order_acquire);
+  }
+
+ public:
+  // Current write generation; bumped by every RegisterVersionWrite.  Cache
+  // entries tagged with any older generation are logically invalidated.
+  [[nodiscard]] uint64_t WriteEpoch() const {
+    return write_epoch_.load(std::memory_order_acquire);
+  }
+
+ private:
   txn_id_t txn_id_{static_cast<txn_id_t>(-1)};
   uint64_t snapshot_ts_{0};
 
   std::unordered_set<RowPosition> read_set_{};
   std::unordered_set<RowPosition> write_set_{};
-  std::unordered_map<RowPosition, std::string> version_read_cache_{};
+  // Process-wide generation, unique across every Transaction ever created.
+  // Thread-local shard caches key on it so a destroyed transaction whose
+  // address (or even id, across Database instances) is reused can never be
+  // mistaken for the cached owner.
+  uint64_t shard_epoch_{0};
+  // Write generation for version cache invalidation (see VersionCacheEntry).
+  std::atomic<uint64_t> write_epoch_{0};
+  std::unordered_map<std::thread::id, std::unique_ptr<VersionCacheShard>>
+      version_read_caches_{};
   // A read-only query may hand page morsels to multiple scan workers.  The
   // version cache and read set are transaction-local, so guard them while
   // preserving a single MVCC snapshot across those workers.

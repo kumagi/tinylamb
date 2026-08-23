@@ -22,7 +22,6 @@
 
 #include <cstddef>
 #include <memory>
-#include <stack>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -42,23 +41,29 @@
 #include "table/table.hpp"
 #include "type/column_name.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 
 namespace tinylamb {
 
 namespace {
 
-Status ResolveExpression(
+Status ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree resolution by design; trees are parser-bounded in depth.
     Expression& exp,
     const std::unordered_map<std::string, std::string>& col_table_map,
     const std::unordered_set<std::string>& ambiguous_colum_name,
-    const std::unordered_map<std::string, std::string>& aliases) {
-  if (!exp) return Status::kSuccess;
+    const std::unordered_set<std::string>& relations) {
+  if (!exp) { return Status::kSuccess;
+}
   if (exp->Type() == TypeTag::kColumnValue) {
     auto& cv = exp->AsColumnValue();
     const ColumnName& col_name = cv.GetColumnName();
+    // Qualified references must name a FROM relation: its alias when one is
+    // given, else the table name. The qualifier is kept verbatim so scan
+    // implementations can rename their output schemas to match it
+    // (Phase 8 aliases/self-joins).
     if (!col_name.schema.empty()) {
-      const auto alias = aliases.find(col_name.schema);
-      if (alias != aliases.end()) cv.SetSchemaName(alias->second);
+      if (!relations.contains(col_name.schema)) { return Status::kNotExists;
+}
       return Status::kSuccess;
     }
     if (ambiguous_colum_name.contains(col_name.name)) {
@@ -75,13 +80,13 @@ Status ResolveExpression(
     Expression left = exp->AsBinaryExpression().Left();
     Expression right = exp->AsBinaryExpression().Right();
     RETURN_IF_FAIL(
-        ResolveExpression(left, col_table_map, ambiguous_colum_name, aliases));
+        ResolveExpression(left, col_table_map, ambiguous_colum_name, relations));
     RETURN_IF_FAIL(
-        ResolveExpression(right, col_table_map, ambiguous_colum_name, aliases));
+        ResolveExpression(right, col_table_map, ambiguous_colum_name, relations));
   } else if (exp->Type() == TypeTag::kUnaryExp) {
     Expression child = exp->AsUnaryExpression().Child();
     RETURN_IF_FAIL(
-        ResolveExpression(child, col_table_map, ambiguous_colum_name, aliases));
+        ResolveExpression(child, col_table_map, ambiguous_colum_name, relations));
   } else if (exp->Type() == TypeTag::kAggregateExp) {
     Expression child = exp->AsAggregateExpression().Child();
     if (child->Type() == TypeTag::kColumnValue &&
@@ -89,33 +94,33 @@ Status ResolveExpression(
       return Status::kSuccess;
     }
     RETURN_IF_FAIL(
-        ResolveExpression(child, col_table_map, ambiguous_colum_name, aliases));
+        ResolveExpression(child, col_table_map, ambiguous_colum_name, relations));
   } else if (exp->Type() == TypeTag::kCaseExp) {
     const auto& case_expression = exp->AsCaseExpression();
     for (const auto& clause : case_expression.when_clauses_) {
       Expression condition = clause.first;
       Expression value = clause.second;
       RETURN_IF_FAIL(ResolveExpression(condition, col_table_map,
-                                       ambiguous_colum_name, aliases));
+                                       ambiguous_colum_name, relations));
       RETURN_IF_FAIL(ResolveExpression(value, col_table_map,
-                                       ambiguous_colum_name, aliases));
+                                       ambiguous_colum_name, relations));
     }
     Expression otherwise = case_expression.else_clause_;
     RETURN_IF_FAIL(ResolveExpression(otherwise, col_table_map,
-                                     ambiguous_colum_name, aliases));
+                                     ambiguous_colum_name, relations));
   } else if (exp->Type() == TypeTag::kInExp) {
     const auto& in = exp->AsInExpression();
     Expression child = in.child_;
     RETURN_IF_FAIL(
-        ResolveExpression(child, col_table_map, ambiguous_colum_name, aliases));
+        ResolveExpression(child, col_table_map, ambiguous_colum_name, relations));
     for (Expression item : in.list_) {
       RETURN_IF_FAIL(ResolveExpression(item, col_table_map,
-                                       ambiguous_colum_name, aliases));
+                                       ambiguous_colum_name, relations));
     }
   } else if (exp->Type() == TypeTag::kFunctionCallExp) {
     for (Expression argument : exp->AsFunctionCallExpression().Args()) {
       RETURN_IF_FAIL(ResolveExpression(argument, col_table_map,
-                                       ambiguous_colum_name, aliases));
+                                       ambiguous_colum_name, relations));
     }
   }
   return Status::kSuccess;
@@ -126,7 +131,7 @@ Status ResolveSelect(
     const std::unordered_map<std::string, std::string>& col_table_map,
     const std::unordered_set<std::string>& ambiguous_colum_name,
     const std::vector<ColumnName>& all_cols,
-    const std::unordered_map<std::string, std::string>& aliases) {
+    const std::unordered_set<std::string>& relations) {
   for (auto it = select.begin(); it != select.end();) {
     if (it->expression->Type() == TypeTag::kColumnValue) {
       auto& cv = it->expression->AsColumnValue();
@@ -146,7 +151,7 @@ Status ResolveSelect(
       if (!col_name.schema.empty()) {
         Expression expression = it->expression;
         RETURN_IF_FAIL(ResolveExpression(expression, col_table_map,
-                                         ambiguous_colum_name, aliases));
+                                         ambiguous_colum_name, relations));
         ++it;
         continue;
       }
@@ -159,7 +164,7 @@ Status ResolveSelect(
     } else {
       Expression expression = it->expression;
       RETURN_IF_FAIL(ResolveExpression(expression, col_table_map,
-                                       ambiguous_colum_name, aliases));
+                                       ambiguous_colum_name, relations));
       ++it;
     }
   }
@@ -169,18 +174,27 @@ Status ResolveSelect(
 }  // namespace
 
 Status QueryData::Rewrite(TransactionContext& ctx) {
+  // from_ entries are relation identities: the alias when one is given, else
+  // the table name (Phase 8). Column qualifiers are validated against these
+  // relations and kept verbatim; unqualified columns are attributed to their
+  // owning relation. Scan implementations rename their output schemas to the
+  // relation identity so every downstream lookup resolves uniformly.
+  const std::unordered_set<std::string> relations(from_.begin(), from_.end());
   std::unordered_map<std::string, std::string> col_table_map;
   std::unordered_set<std::string> ambiguous_colum_name;
   std::vector<ColumnName> all_cols;
 
-  for (const auto& table : from_) {
-    ASSIGN_OR_RETURN(std::shared_ptr<Table>, from_table, ctx.GetTable(table));
+  for (const auto& relation : from_) {
+    const auto aliased = aliases_.find(relation);
+    const std::string& physical =
+        aliased == aliases_.end() ? relation : aliased->second;
+    ASSIGN_OR_RETURN(std::shared_ptr<Table>, from_table, ctx.GetTable(physical));
     const Schema& sc = from_table->GetSchema();
     for (size_t i = 0; i < sc.ColumnCount(); ++i) {
       const ColumnName& col_name = sc.GetColumn(i).Name();
-      all_cols.emplace_back(sc.Name(), col_name.name);
-      if (col_table_map.find(col_name.name) == col_table_map.end()) {
-        col_table_map.emplace(col_name.name, table);
+      all_cols.emplace_back(relation, col_name.name);
+      if (!col_table_map.contains(col_name.name)) {
+        col_table_map.emplace(col_name.name, relation);
       } else {
         ambiguous_colum_name.emplace(col_name.name);
       }
@@ -189,11 +203,11 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
 
   // Rewrite SELECT clause.
   RETURN_IF_FAIL(ResolveSelect(select_, col_table_map, ambiguous_colum_name,
-                               all_cols, aliases_));
+                               all_cols, relations));
 
   // Rewrite WHERE clause.
   return ResolveExpression(where_, col_table_map, ambiguous_colum_name,
-                           aliases_);
+                           relations);
 }
 
 }  // namespace tinylamb

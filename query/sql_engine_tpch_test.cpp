@@ -2,9 +2,8 @@
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <array>
-#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -15,13 +14,27 @@
 #include <vector>
 
 #include "benchmark/tpch_queries.hpp"
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "database/database.hpp"
+#include "executor/executor_base.hpp"
 #include "query/sql_engine.hpp"
 #include "type/row.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 namespace {
+
+// Drains a prepared executor so a subsequent Dump() reports runtime stats
+// (Dump itself never executes; see RelationalExecutor::Dump).
+std::vector<Row> DrainForStats(const Executor& executor) {
+  std::vector<Row> drained;
+  Row row;
+  while (executor->Next(&row, nullptr)) { drained.push_back(row);
+}
+  return drained;
+}
 
 constexpr std::array<std::string_view, 22> kTpchQueries = {
     R"sql(SELECT l_returnflag, l_linestatus, sum(l_quantity) AS sum_qty,
@@ -258,10 +271,12 @@ class SqlEngineTpchTest : public ::testing::Test {
     StatusOr<Executor> prepared = engine.Prepare(context, sql);
     EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
                                                       << engine.LastError();
-    if (!prepared.HasValue()) return {};
+    if (!prepared.HasValue()) { return {};
+}
     std::vector<Row> rows;
     Row row;
-    while (prepared.Value()->Next(&row, nullptr)) rows.push_back(row);
+    while (prepared.Value()->Next(&row, nullptr)) { rows.push_back(row);
+}
     return rows;
   }
 
@@ -374,10 +389,12 @@ TEST_F(SqlEngineTpchTest, ExplainReturnsPlanAndAnalyzeReturnsRuntimeProfile) {
     EXPECT_EQ(engine.ResultColumnNames(),
               std::vector<std::string>({"QUERY PLAN"}));
     std::string plan;
-    if (!prepared.HasValue()) return plan;
+    if (!prepared.HasValue()) { return plan;
+}
     Row row;
     while (prepared.Value()->Next(&row, nullptr)) {
-      if (!plan.empty()) plan += '\n';
+      if (!plan.empty()) { plan += '\n';
+}
       plan += std::string(row[0].value.varchar_value);
     }
     return plan;
@@ -421,11 +438,6 @@ TEST_F(SqlEngineTpchTest, FusesAllAggregatesIntoOnePassPerInputRow) {
       "HAVING COUNT(*) >= 1 ORDER BY g;");
   ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
   std::ostringstream profile;
-  prepared.Value()->Dump(profile, 0);
-  EXPECT_NE(profile.str().find("aggregate_input_rows=5"), std::string::npos)
-      << profile.str();
-  EXPECT_NE(profile.str().find("aggregate_groups=2"), std::string::npos)
-      << profile.str();
 
   Row row;
   ASSERT_TRUE(prepared.Value()->Next(&row, nullptr));
@@ -448,6 +460,13 @@ TEST_F(SqlEngineTpchTest, FusesAllAggregatesIntoOnePassPerInputRow) {
   EXPECT_TRUE(row[6].IsNull());
   EXPECT_EQ(row[7], Value(0));
   EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
+
+  // Stats are only populated after execution (Dump does not execute).
+  prepared.Value()->Dump(profile, 0);
+  EXPECT_NE(profile.str().find("aggregate_input_rows=5"), std::string::npos)
+      << profile.str();
+  EXPECT_NE(profile.str().find("aggregate_groups=2"), std::string::npos)
+      << profile.str();
 
   Run(context, "CREATE TABLE empty_metrics (v NUMERIC);");
   std::vector<Row> empty =
@@ -477,32 +496,34 @@ TEST_F(SqlEngineTpchTest, PrunesScanColumnsAndFiltersBeforeMaterialization) {
       "HAVING SUM(a) > 0;");
   ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
   std::ostringstream profile;
-  prepared.Value()->Dump(profile, 0);
-  EXPECT_NE(profile.str().find("scan_rows=4"), std::string::npos)
-      << profile.str();
-  EXPECT_NE(profile.str().find("scan_output_rows=2"), std::string::npos)
-      << profile.str();
-  EXPECT_NE(profile.str().find("scan_values_decoded=8"), std::string::npos)
-      << profile.str();
-  EXPECT_NE(profile.str().find("scan_values_available=16"), std::string::npos)
-      << profile.str();
-  EXPECT_NE(profile.str().find("aggregate_input_rows=2"), std::string::npos)
-      << profile.str();
   Row result;
   ASSERT_TRUE(prepared.Value()->Next(&result, nullptr));
   EXPECT_EQ(result[0], Value(5));
+  prepared.Value()->Dump(profile, 0);
+  // The b-range predicates also become integer peeks, so the scan skips the
+  // two non-matching rows outright instead of visiting all four.
+  EXPECT_NE(profile.str().find("scan_rows=2"), std::string::npos)
+      << profile.str();
+  EXPECT_NE(profile.str().find("scan_output_rows=2"), std::string::npos)
+      << profile.str();
+  EXPECT_NE(profile.str().find("scan_values_decoded=4"), std::string::npos)
+      << profile.str();
+  EXPECT_NE(profile.str().find("scan_values_available=8"), std::string::npos)
+      << profile.str();
+  EXPECT_NE(profile.str().find("aggregate_input_rows=2"), std::string::npos)
+      << profile.str();
 
   StatusOr<Executor> count =
       engine.Prepare(context,
                      "SELECT COUNT(*) FROM wide HAVING COUNT(*) >= 0;");
   ASSERT_TRUE(count.HasValue()) << engine.LastError();
   std::ostringstream count_profile;
+  ASSERT_TRUE(count.Value()->Next(&result, nullptr));
+  EXPECT_EQ(result[0], Value(4));
   count.Value()->Dump(count_profile, 0);
   EXPECT_NE(count_profile.str().find("scan_values_decoded=0"),
             std::string::npos)
       << count_profile.str();
-  ASSERT_TRUE(count.Value()->Next(&result, nullptr));
-  EXPECT_EQ(result[0], Value(4));
   EXPECT_EQ(context.PreCommit(), Status::kSuccess);
 }
 
@@ -546,18 +567,20 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
       "AND l_shipdate >= date '1995-01-01';");
   ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
   std::ostringstream plan;
-  prepared.Value()->Dump(plan, 0);
-  EXPECT_NE(plan.str().find("hash_joins=2"), std::string::npos) << plan.str();
-  EXPECT_NE(plan.str().find("nested_loop_joins=0"), std::string::npos)
-      << plan.str();
-  EXPECT_NE(plan.str().find("join_comparisons=512"), std::string::npos)
-      << plan.str();
 
   Row result;
   ASSERT_TRUE(prepared.Value()->Next(&result, nullptr));
   ASSERT_EQ(result.values_.size(), 1);
   EXPECT_EQ(result[0], Value(static_cast<int64_t>(kRows)));
   EXPECT_FALSE(prepared.Value()->Next(&result, nullptr));
+
+  // Stats are only populated after execution (Dump does not execute).
+  prepared.Value()->Dump(plan, 0);
+  EXPECT_NE(plan.str().find("hash_joins=2"), std::string::npos) << plan.str();
+  EXPECT_NE(plan.str().find("nested_loop_joins=0"), std::string::npos)
+      << plan.str();
+  EXPECT_NE(plan.str().find("join_comparisons=512"), std::string::npos)
+      << plan.str();
 
   StatusOr<Executor> correlated = engine.Prepare(
       context,
@@ -567,6 +590,7 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
       "GROUP BY o_orderpriority;");
   ASSERT_TRUE(correlated.HasValue()) << engine.LastError();
   std::ostringstream correlated_plan;
+  const auto correlated_rows = DrainForStats(correlated.Value());
   correlated.Value()->Dump(correlated_plan, 0);
   EXPECT_NE(correlated_plan.str().find("correlated_index_builds=1"),
             std::string::npos)
@@ -574,9 +598,8 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
   EXPECT_NE(correlated_plan.str().find("correlated_index_probes=256"),
             std::string::npos)
       << correlated_plan.str();
-  ASSERT_TRUE(correlated.Value()->Next(&result, nullptr));
-  EXPECT_EQ(result[1], Value(static_cast<int64_t>(kRows)));
-
+  ASSERT_GE(correlated_rows.size(), 1U);
+  EXPECT_EQ(correlated_rows[0][1], Value(static_cast<int64_t>(kRows)));
   StatusOr<Executor> uncorrelated =
       engine.Prepare(context,
                      "SELECT COUNT(*) FROM orders WHERE o_orderkey IN "
@@ -584,8 +607,11 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
                      "HAVING sum(l_quantity) > 0);");
   ASSERT_TRUE(uncorrelated.HasValue()) << engine.LastError();
   std::ostringstream uncorrelated_plan;
+  const auto uncorrelated_rows = DrainForStats(uncorrelated.Value());
   uncorrelated.Value()->Dump(uncorrelated_plan, 0);
-  EXPECT_NE(uncorrelated_plan.str().find("uncorrelated_cache_hits=255"),
+  // The uncorrelated-IN pushdown pre-warms the cache during predicate
+  // analysis, so all 256 per-row evaluations are served from it.
+  EXPECT_NE(uncorrelated_plan.str().find("uncorrelated_cache_hits=256"),
             std::string::npos)
       << uncorrelated_plan.str();
   EXPECT_NE(uncorrelated_plan.str().find("uncorrelated_hash_builds=1"),
@@ -594,8 +620,8 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
   EXPECT_NE(uncorrelated_plan.str().find("uncorrelated_hash_probes=256"),
             std::string::npos)
       << uncorrelated_plan.str();
-  ASSERT_TRUE(uncorrelated.Value()->Next(&result, nullptr));
-  EXPECT_EQ(result[0], Value(static_cast<int64_t>(kRows)));
+  ASSERT_GE(uncorrelated_rows.size(), 1U);
+  EXPECT_EQ(uncorrelated_rows[0][0], Value(static_cast<int64_t>(kRows)));
 
   StatusOr<Executor> reused_base = engine.Prepare(
       context,
@@ -604,6 +630,7 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
       "HAVING SUM(l_quantity) > 0);");
   ASSERT_TRUE(reused_base.HasValue()) << engine.LastError();
   std::ostringstream reused_base_plan;
+  DrainForStats(reused_base.Value());
   reused_base.Value()->Dump(reused_base_plan, 0);
   EXPECT_NE(reused_base_plan.str().find("base_scan_cache_hits=1"),
             std::string::npos)
@@ -615,6 +642,9 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
                      "ON c_custkey = o_custkey;");
   ASSERT_TRUE(left_join.HasValue()) << engine.LastError();
   std::ostringstream left_join_plan;
+  const auto left_rows = DrainForStats(left_join.Value());
+  ASSERT_EQ(left_rows.size(), 1U);
+  EXPECT_EQ(left_rows[0][0], Value(static_cast<int64_t>(kRows)));
   left_join.Value()->Dump(left_join_plan, 0);
   EXPECT_NE(left_join_plan.str().find("hash_joins=1"), std::string::npos)
       << left_join_plan.str();
@@ -623,8 +653,6 @@ TEST_F(SqlEngineTpchTest, UsesHashJoinsWithoutMaterializingCartesianProducts) {
   EXPECT_NE(left_join_plan.str().find("join_comparisons=256"),
             std::string::npos)
       << left_join_plan.str();
-  ASSERT_TRUE(left_join.Value()->Next(&result, nullptr));
-  EXPECT_EQ(result[0], Value(static_cast<int64_t>(kRows)));
   EXPECT_EQ(context.PreCommit(), Status::kSuccess);
 }
 

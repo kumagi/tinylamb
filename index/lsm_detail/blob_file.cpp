@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 #include "index/lsm_detail/blob_file.hpp"
+#include <endian.h>
 
-#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -23,20 +23,13 @@
 #include <string>
 #include <string_view>
 
-#include "cache.hpp"
 #include "common/constants.hpp"
-#include "common/env_endian.hpp"
 
 namespace tinylamb {
 BlobFile::BlobFile(const std::filesystem::path& path, size_t memory_capacity,
                    size_t max_filesize)
     : file_writer_(path),
-      cache_(file_writer_.Fd(), memory_capacity, max_filesize) {
-  if (!path.parent_path().empty() &&
-      !std::filesystem::exists(path.parent_path())) {
-    std::filesystem::create_directory(path.parent_path());
-  }
-}
+      cache_(file_writer_.Fd(), memory_capacity, max_filesize) {}
 
 std::string BlobFile::ReadAt(size_t offset, size_t length) const {
   // Appends are asynchronous. A reader on the same BlobFile must nevertheless
@@ -47,10 +40,16 @@ std::string BlobFile::ReadAt(size_t offset, size_t length) const {
 
 Cache::Locks BlobFile::ReadAt(size_t offset, std::string_view& out) const {
   Flush();
+  out = {};
+  constexpr size_t kHeaderSize = sizeof(int32_t);
   int32_t key_size = 0;
-  cache_.Copy(&key_size, offset, sizeof(key_size));
+  cache_.Copy(&key_size, offset, kHeaderSize);
   key_size = be32toh(key_size);
-  return cache_.ReadAt(offset + sizeof(int32_t), key_size, out);
+  if (key_size < 0) {
+    // Disk-derived length is bogus; refuse instead of propagating garbage.
+    return {};
+  }
+  return cache_.ReadAt(offset + kHeaderSize, key_size, out);
 }
 
 lsn_t BlobFile::Append(std::string_view payload) {

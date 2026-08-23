@@ -57,22 +57,22 @@ class Value {
  public:
   Value() : type(ValueType::kNull) {}
   explicit Value(int int_val);
-  explicit Value(int64_t int64_val);
+  explicit Value(int64_t int_val);
   explicit Value(std::string&& str_val);
   explicit Value(double double_value);
   [[nodiscard]] static Value Date(std::string_view date);
   [[nodiscard]] static Value DateFromDays(int64_t days);
   [[nodiscard]] int64_t DateDays() const;
   Value(const Value& o);
-  Value(Value&& o);
+  Value(Value&& o) noexcept;
 
   template <typename I,
             typename std::enable_if<std::is_integral<I>::value, int>::type = 0>
   explicit Value(I val) : type(ValueType::kInt64) {
     value.int_value = static_cast<int64_t>(val);
   }
-  Value& operator=(const Value& o);
-  Value& operator=(Value&& o);
+  Value& operator=(const Value& rhs);
+  Value& operator=(Value&& o) noexcept;
   ~Value() = default;
 
   [[nodiscard]] bool Truthy() const;
@@ -109,8 +109,8 @@ class Value {
   friend std::ostream& operator<<(std::ostream& o, const Value& v);
 
   // Read/Write with type info.
-  friend Encoder& operator<<(Encoder& o, const Value& v);
-  friend Decoder& operator>>(Decoder& o, Value& v);
+  friend Encoder& operator<<(Encoder& a, const Value& v);
+  friend Decoder& operator>>(Decoder& e, Value& v);
 
   [[nodiscard]] bool IsNull() const { return type == ValueType::kNull; }
 
@@ -128,7 +128,7 @@ class Value {
 template <>
 class std::hash<tinylamb::Value> {
  public:
-  uint64_t operator()(const tinylamb::Value& c) const;
+  uint64_t operator()(const tinylamb::Value& v) const;
 };
 
 #endif  // TINYLAMB_VALUE_HPP

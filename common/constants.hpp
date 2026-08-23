@@ -17,26 +17,20 @@
 #ifndef TINYLAMB_CONSTANTS_HPP
 #define TINYLAMB_CONSTANTS_HPP
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <ostream>
 #include <string_view>
 
-#ifndef ERROR_CODES_DEFINE
-#define ERROR_CODES_DEFINE
-#define FATAL 9000
-#define ERROR 5000
-#define ALERT 4000
-#define WARN 3000
-#define NOTICE 2500
-#define INFO 2000
-#define USER 1500
-#define DEBUG 1000
-#define TRACE 0
-#endif  // ERROR_CODE_DEFINE
-
 namespace tinylamb {
+
+// The on-disk page/WAL formats are written as raw host memory (see
+// encoder.cpp / serdes.cpp), i.e. little-endian. Declare the assumption
+// instead of silently corrupting data on big-endian hosts.
+static_assert(std::endian::native == std::endian::little,
+              "tinylamb disk formats require a little-endian host");
 
 static constexpr size_t kPageSize = 1024 * 32;
 static constexpr size_t kPageHeaderSize = sizeof(uint64_t) +  // page_id
@@ -64,12 +58,6 @@ static constexpr size_t kDefaultPagePoolCapacity = (size_t{2} << 30) / kPageSize
     if (tmp_status != Status::kSuccess) return tmp_status; \
   }
 
-#define CRASH_IF_FAIL(expr)                                \
-  {                                                        \
-    Status tmp_status = expr;                              \
-    if (tmp_status != Status::kSuccess) assert(!## #expr); \
-  }
-
 enum class Status : uint8_t {
   kUnknown,
   kSuccess,
@@ -83,6 +71,7 @@ enum class Status : uint8_t {
   kAmbiguousQuery,
   kIsInfinity,
   kDeleted,
+  kCorrupt,
 };
 
 enum class BinaryOperation {
@@ -162,11 +151,14 @@ inline bool IsComparison(enum BinaryOperation op) {
   }
 }
 
-typedef uint64_t lsn_t;
-typedef uint64_t txn_id_t;
-typedef uint64_t page_id_t;
-typedef uint16_t slot_t;
-typedef uint16_t bin_size_t;
+using lsn_t = uint64_t;
+using txn_id_t = uint64_t;
+using page_id_t = uint64_t;
+using slot_t = uint16_t;
+using bin_size_t = uint16_t;
+
+// Page id reserved for the MetaPage (allocator state).
+constexpr page_id_t kMetaPageId = 0;
 
 static_assert(kPageSize <= std::numeric_limits<slot_t>::max());
 static_assert(kPageSize <= std::numeric_limits<bin_size_t>::max());
@@ -193,6 +185,12 @@ inline std::string_view ToString(Status s) {
       return "TooBigData";
     case Status::kAmbiguousQuery:
       return "AmbiguousQuery";
+    case Status::kIsInfinity:
+      return "IsInfinity";
+    case Status::kDeleted:
+      return "Deleted";
+    case Status::kCorrupt:
+      return "Corrupt";
     default:
       return "INVALID STATUS";
   }

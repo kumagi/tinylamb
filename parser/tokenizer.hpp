@@ -18,6 +18,7 @@
 #define TINYLAMB_TOKENIZER_HPP
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "parser/token.hpp"
@@ -26,7 +27,7 @@ namespace tinylamb {
 
 class Tokenizer {
  public:
-  explicit Tokenizer(const std::string& sql);
+  explicit Tokenizer(std::string sql);
   std::vector<Token> Tokenize();
 
  private:
@@ -43,6 +44,7 @@ class Tokenizer {
 
   std::string sql_;
   size_t pos_{0};
+  std::string error_;
 };
 
 }  // namespace tinylamb

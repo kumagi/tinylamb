@@ -4,7 +4,8 @@
 
 #include <algorithm>
 #include <array>
-#include <exception>
+#include <cstdint>
+#include <cstddef>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -27,6 +28,7 @@
 #include "table/table.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 namespace {
@@ -46,7 +48,8 @@ int64_t IntValue(const Value& value) {
 }
 
 double DoubleValue(const Value& value) {
-  if (value.type == ValueType::kDouble) return value.value.double_value;
+  if (value.type == ValueType::kDouble) { return value.value.double_value;
+}
   if (value.type == ValueType::kInt64) {
     return static_cast<double>(value.value.int_value);
   }
@@ -100,7 +103,8 @@ std::string SqlLiteral(std::string_view text) {
   out.reserve(text.size() + 2);
   out.push_back('\'');
   for (char ch : text) {
-    if (ch == '\'') out.push_back('\'');
+    if (ch == '\'') { out.push_back('\'');
+}
     out.push_back(ch);
   }
   out.push_back('\'');
@@ -121,14 +125,15 @@ TpccNurand TpccNurand::FromSeed(uint64_t seed) {
   std::vector<int> deltas;
   deltas.reserve(53);
   for (int delta = 65; delta <= 119; ++delta) {
-    if (delta == 96 || delta == 112) continue;
+    if (delta == 96 || delta == 112) { continue;
+}
     deltas.push_back(delta);
   }
   for (;;) {
     const int delta = deltas[static_cast<size_t>(
         pick(0, static_cast<int>(deltas.size()) - 1))];
     const int sign = pick(0, 1) == 0 ? -1 : 1;
-    const int run = nurand.c_last_load + sign * delta;
+    const int run = nurand.c_last_load + (sign * delta);
     if (run >= 0 && run <= 255) {
       nurand.c_last_run = run;
       nurand.valid = true;
@@ -199,8 +204,8 @@ TpccWorkload::TpccWorkload(Database& database, TpccScale scale, uint64_t seed,
   if (terminal_id >= 0) {
     const int terminals = std::max(1, scale_.Terminals());
     const int id = terminal_id % terminals;
-    home_warehouse_ = id / scale_.districts_per_warehouse + 1;
-    home_district_ = id % scale_.districts_per_warehouse + 1;
+    home_warehouse_ = (id / scale_.districts_per_warehouse) + 1;
+    home_district_ = (id % scale_.districts_per_warehouse) + 1;
   } else {
     home_warehouse_ = Random(1, scale_.warehouses);
     home_district_ = Random(1, scale_.districts_per_warehouse);
@@ -214,7 +219,8 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
       scale.initial_orders_per_district < 1 ||
       scale.new_orders_per_district < 1 || scale.min_order_lines < 1 ||
       scale.max_order_lines < scale.min_order_lines) {
-    if (error != nullptr) *error = "invalid TPC-C scale values";
+    if (error != nullptr) { *error = "invalid TPC-C scale values";
+}
     return Status::kUnknown;
   }
   if (scale.initial_orders_per_district < scale.customers_per_district) {
@@ -282,14 +288,16 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
                   {0, 1, 4, 2}, IndexMode::kNonUnique)};
   for (Status status : index_statuses) {
     if (status != Status::kSuccess) {
-      if (error != nullptr) *error = "failed to create TPC-C index";
+      if (error != nullptr) { *error = "failed to create TPC-C index";
+}
       schema_context.Abort();
       return status;
     }
   }
   Status status = schema_context.PreCommit();
   if (status != Status::kSuccess) {
-    if (error != nullptr) *error = "failed to commit TPC-C schema";
+    if (error != nullptr) { *error = "failed to commit TPC-C schema";
+}
     return status;
   }
 
@@ -300,7 +308,8 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
     for (size_t i = 0; i < kTpccTables.size(); ++i) {
       StatusOr<std::shared_ptr<Table>> table = context.GetTable(kTpccTables[i]);
       if (!table.HasValue()) {
-        if (error != nullptr) *error = "failed to open TPC-C table";
+        if (error != nullptr) { *error = "failed to open TPC-C table";
+}
         return table.GetStatus();
       }
       tables[i] = table.Value();
@@ -322,7 +331,7 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
       item_context.Abort();
       return tables.GetStatus();
     }
-    auto insert = [&](size_t table, Row row) {
+    auto insert = [&](size_t table, const Row& row) {
       return tables.Value()[table]->Insert(item_context.txn_, row).GetStatus();
     };
     for (int item_id = 1; item_id <= scale.items; ++item_id) {
@@ -331,16 +340,19 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
           4, Row({Value(item_id), Value("Item#" + std::to_string(item_id)),
                   Value(static_cast<double>(load_random(100, 10000)) / 100.0),
                   Value(original ? "ORIGINAL" : "DATA")}));
-      if (status != Status::kSuccess) break;
+      if (status != Status::kSuccess) { break;
+}
     }
     if (status != Status::kSuccess) {
-      if (error != nullptr) *error = "failed to load TPC-C fixture";
+      if (error != nullptr) { *error = "failed to load TPC-C fixture";
+}
       item_context.Abort();
       return status;
     }
     status = item_context.PreCommit();
     if (status != Status::kSuccess) {
-      if (error != nullptr) *error = "failed to commit TPC-C fixture";
+      if (error != nullptr) { *error = "failed to commit TPC-C fixture";
+}
       return status;
     }
   }
@@ -353,7 +365,7 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
       load_context.Abort();
       return tables.GetStatus();
     }
-    auto insert = [&](size_t table, Row row) {
+    auto insert = [&](size_t table, const Row& row) {
       return tables.Value()[table]->Insert(load_context.txn_, row).GetStatus();
     };
     status =
@@ -438,13 +450,15 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
       }
     }
     if (status != Status::kSuccess) {
-      if (error != nullptr) *error = "failed to load TPC-C fixture";
+      if (error != nullptr) { *error = "failed to load TPC-C fixture";
+}
       load_context.Abort();
       return status;
     }
     status = load_context.PreCommit();
     if (status != Status::kSuccess) {
-      if (error != nullptr) *error = "failed to commit TPC-C fixture";
+      if (error != nullptr) { *error = "failed to commit TPC-C fixture";
+}
       return status;
     }
   }
@@ -490,10 +504,14 @@ std::string TpccWorkload::PickCustomerLastName() {
 
 TpccTransactionType TpccWorkload::NextTransactionType() {
   const int choice = Random(1, 100);
-  if (choice <= 45) return TpccTransactionType::kNewOrder;
-  if (choice <= 88) return TpccTransactionType::kPayment;
-  if (choice <= 92) return TpccTransactionType::kOrderStatus;
-  if (choice <= 96) return TpccTransactionType::kDelivery;
+  if (choice <= 45) { return TpccTransactionType::kNewOrder;
+}
+  if (choice <= 88) { return TpccTransactionType::kPayment;
+}
+  if (choice <= 92) { return TpccTransactionType::kOrderStatus;
+}
+  if (choice <= 96) { return TpccTransactionType::kDelivery;
+}
   return TpccTransactionType::kStockLevel;
 }
 
@@ -512,21 +530,23 @@ Status TpccWorkload::RunSql(TransactionContext& context, std::string_view sql,
   }
   ++result->sql_statements;
   Row row;
-  while (prepared.Value()->Next(&row, nullptr)) rows->push_back(row);
+  while (prepared.Value()->Next(&row, nullptr)) { rows->push_back(row);
+}
   return Status::kSuccess;
 }
 
 bool TpccWorkload::RequireRows(const std::vector<Row>& rows,
                                std::string_view operation,
-                               TpccTransactionResult* result) const {
-  if (!rows.empty() && rows.front().IsValid()) return true;
+                               TpccTransactionResult* result) {
+  if (!rows.empty() && rows.front().IsValid()) { return true;
+}
   result->error = std::string(operation) + " returned no rows";
   return false;
 }
 
 bool TpccWorkload::RequireAffected(const std::vector<Row>& rows,
                                    int64_t minimum, std::string_view operation,
-                                   TpccTransactionResult* result) const {
+                                   TpccTransactionResult* result) {
   if (RequireRows(rows, operation, result) &&
       rows.front().values_.size() >= 2 &&
       IntValue(rows.front()[1]) >= minimum) {
@@ -576,12 +596,14 @@ TpccTransactionResult TpccWorkload::NewOrder() {
     quantities[static_cast<size_t>(line)] = Random(1, 10);
     if (scale_.warehouses > 1 && Random(1, 100) == 1) {
       int remote = result.warehouse_id;
-      while (remote == result.warehouse_id) remote = Random(1, scale_.warehouses);
+      while (remote == result.warehouse_id) { remote = Random(1, scale_.warehouses);
+}
       supply_warehouses[static_cast<size_t>(line)] = remote;
       all_local = 0;
     }
   }
-  if (rollback) item_ids.back() = scale_.items + 1;
+  if (rollback) { item_ids.back() = scale_.items + 1;
+}
 
   TransactionContext context = database_->BeginContext();
   auto fail = [&]() {
@@ -697,7 +719,8 @@ TpccTransactionResult TpccWorkload::NewOrder() {
   }
   const Status commit = context.PreCommit();
   result.committed = commit == Status::kSuccess;
-  if (!result.committed) result.error = "new-order commit failed";
+  if (!result.committed) { result.error = "new-order commit failed";
+}
   return result;
 }
 
@@ -782,7 +805,8 @@ TpccTransactionResult TpccWorkload::Payment() {
            << result.warehouse_id << ',' << Number(result.amount) << ','
            << customer_data;
       std::string next = data.str();
-      if (next.size() > 500) next.resize(500);
+      if (next.size() > 500) { next.resize(500);
+}
       sql << ", c_data = " << SqlLiteral(next);
     }
     sql << " WHERE c_w_id = " << customer_warehouse
@@ -811,7 +835,8 @@ TpccTransactionResult TpccWorkload::Payment() {
            << result.warehouse_id << ',' << Number(result.amount) << ','
            << customer_data;
       std::string next = data.str();
-      if (next.size() > 500) next.resize(500);
+      if (next.size() > 500) { next.resize(500);
+}
       sql << ", c_data = " << SqlLiteral(next);
     }
     sql << " WHERE c_w_id = " << customer_warehouse
@@ -834,7 +859,8 @@ TpccTransactionResult TpccWorkload::Payment() {
   }
   const Status commit = context.PreCommit();
   result.committed = commit == Status::kSuccess;
-  if (!result.committed) result.error = "payment commit failed";
+  if (!result.committed) { result.error = "payment commit failed";
+}
   return result;
 }
 
@@ -894,7 +920,8 @@ TpccTransactionResult TpccWorkload::OrderStatus() {
   }
   const Status commit = context.PreCommit();
   result.committed = commit == Status::kSuccess;
-  if (!result.committed) result.error = "order-status commit failed";
+  if (!result.committed) { result.error = "order-status commit failed";
+}
   return result;
 }
 
@@ -920,7 +947,8 @@ TpccTransactionResult TpccWorkload::Delivery() {
     if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess) {
       return fail();
     }
-    if (rows.empty()) continue;
+    if (rows.empty()) { continue;
+}
     const int order_id = static_cast<int>(IntValue(rows.front()[0]));
     rows.clear();
     sql.str("");
@@ -989,7 +1017,8 @@ TpccTransactionResult TpccWorkload::Delivery() {
   }
   const Status commit = context.PreCommit();
   result.committed = commit == Status::kSuccess;
-  if (!result.committed) result.error = "delivery commit failed";
+  if (!result.committed) { result.error = "delivery commit failed";
+}
   return result;
 }
 
@@ -1025,7 +1054,8 @@ TpccTransactionResult TpccWorkload::StockLevel() {
   std::unordered_set<int64_t> items;
   items.reserve(rows.size());
   for (const Row& row : rows) {
-    if (!row.IsValid() || row.values_.empty()) continue;
+    if (!row.IsValid() || row.values_.empty()) { continue;
+}
     items.insert(IntValue(row[0]));
   }
   int64_t low_stock = 0;
@@ -1037,13 +1067,16 @@ TpccTransactionResult TpccWorkload::StockLevel() {
     if (RunSql(context, sql.str(), &stock_rows, &result) != Status::kSuccess) {
       return fail();
     }
-    if (stock_rows.empty() || !stock_rows.front().IsValid()) continue;
-    if (IntValue(stock_rows.front()[0]) < threshold) ++low_stock;
+    if (stock_rows.empty() || !stock_rows.front().IsValid()) { continue;
+}
+    if (IntValue(stock_rows.front()[0]) < threshold) { ++low_stock;
+}
   }
   result.low_stock = low_stock;
   const Status commit = context.PreCommit();
   result.committed = commit == Status::kSuccess;
-  if (!result.committed) result.error = "stock-level commit failed";
+  if (!result.committed) { result.error = "stock-level commit failed";
+}
   return result;
 }
 

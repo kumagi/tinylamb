@@ -115,7 +115,8 @@ class ExpressionRewriter {
   [[nodiscard]] Expression Rewrite(const Expression& expression) const;
 
  private:
-  [[nodiscard]] Expression RewriteOnce(const Expression& expression) const;
+  [[nodiscard]] Expression RewriteOnce(const Expression& expression,
+                                       size_t depth) const;
   const ExpressionRuleSet* rules_;
 };
 

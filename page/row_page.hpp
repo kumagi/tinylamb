@@ -86,9 +86,9 @@ class RowPage {
             static_cast<size_t>(rows_[slot].size)};
   }
 
-  bin_size_t InsertRow(std::string_view new_row);
+  StatusOr<slot_t> InsertRow(std::string_view new_row);
 
-  void UpdateRow(slot_t slot, std::string_view record);
+  Status UpdateRow(slot_t slot, std::string_view record);
 
   void DeleteRow(slot_t slot);
 
@@ -99,8 +99,11 @@ class RowPage {
   page_id_t next_page_id_ = 0;
   slot_t row_max_ = 0;
   slot_t row_count_ = 0;
-  bin_size_t free_ptr_ = kPageSize;
-  bin_size_t free_size_ = kPageSize - sizeof(RowPage);
+  // Defaults mirror Initialize() (page-body based); PageInit always runs
+  // Initialize before use, so these only guard against misuse of a bare
+  // RowPage.
+  bin_size_t free_ptr_ = kPageBodySize;
+  bin_size_t free_size_ = kPageBodySize - sizeof(RowPage);
   // This zero-sized tail keeps the on-disk page header at the exact offset
   // where the variable-sized slot array begins.  Changing it to [1] would
   // alter sizeof(RowPage) and corrupt the fixed-size page layout.

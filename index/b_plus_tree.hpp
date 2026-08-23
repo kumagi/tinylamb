@@ -39,7 +39,7 @@ class BPlusTree {
   explicit BPlusTree(page_id_t given_root);
   Status Insert(Transaction& txn, std::string_view key, std::string_view value);
   Status Update(Transaction& txn, std::string_view key, std::string_view value);
-  Status Delete(Transaction& txn, std::string_view key);
+  Status Delete(Transaction& txn, std::string_view key) const;
   StatusOr<std::string_view> Read(Transaction& txn, std::string_view key) const;
   void Dump(Transaction& txn, std::ostream& o, int indent = 0) const;
   [[nodiscard]] page_id_t Root() const { return root_; }
@@ -51,24 +51,39 @@ class BPlusTree {
   }
   bool operator==(const BPlusTree& rhs) const = default;
   bool SanityCheckForTest(PageManager* pm) const;
+  // Returns a page emptied by a merge to the MetaPage free list. No-op unless
+  // the page is provably orphaned: not `protected_pid`, row-less,
+  // foster-less, and (for branches) without a remaining lowest child.
+  // Public only so the file-local foster-merge helper can recycle pages.
+  static void ReclaimIfOrphaned(Transaction& txn, PageRef& page,
+                                page_id_t protected_pid);
 
  private:
   static Status LeafInsert(Transaction& txn, PageRef& leaf,
                            std::string_view key, std::string_view value);
+  // Descending-scan start position: last key strictly below `end`, retreating
+  // leftwards through leaves; false when no such key exists.
+  bool PositionBelow(PageRef& leaf, size_t& idx, Transaction& txn,
+                     std::string_view end);
   static Status SetFosterRecursively(Transaction& txn, PageRef& parent,
                                      PageRef& new_child,
                                      std::string_view foster_key);
+  // Mutates the tree (allocates pages and rebuilds the root); deliberately
+  // non-const so read-only paths cannot grow the tree by accident.
   void GrowTreeHeightIfNeeded(Transaction& txn) const;
+  // Follows the foster chain rightwards while the chain key is <= `key`.
+  static void FollowFosterChain(Transaction& txn, PageRef& leaf,
+                                std::string_view key);
   PageRef FindLeaf(Transaction& txn, std::string_view key, bool less_than);
   // Read-only leaf lookup that follows foster chains without absorbing them.
   // If stop_before is non-zero, do not descend into that foster child.
   PageRef FindLeafReadOnly(Transaction& txn, std::string_view key,
-                           bool less_than, page_id_t stop_before = 0);
+                           bool less_than, page_id_t stop_before = 0) const;
 
-  PageRef FindLeftmostPage(Transaction& txn, PageRef&& root);
-  PageRef FindRightmostPage(Transaction& txn, PageRef&& root);
-  PageRef LeftmostPage(Transaction& txn);
-  PageRef RightmostPage(Transaction& txn);
+  static PageRef FindLeftmostPage(Transaction& txn, PageRef&& page);
+  static PageRef FindRightmostPage(Transaction& txn, PageRef&& page);
+  PageRef LeftmostPage(Transaction& txn) const;
+  PageRef RightmostPage(Transaction& txn) const;
 
   friend class BPlusTreeIterator;
   friend class IndexScanIterator;

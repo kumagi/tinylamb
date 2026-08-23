@@ -89,9 +89,9 @@ class ExpressionBase {
   }
 };
 
-typedef std::shared_ptr<ExpressionBase> Expression;
+using Expression = std::shared_ptr<ExpressionBase>;
 Expression ColumnValueExp(const ColumnName& col_name);
-Expression ColumnValueExp(const std::string_view& col_name);
+Expression ColumnValueExp(std::string_view col_name);
 Expression ConstantValueExp(const Value& v);
 Expression BinaryExpressionExp(Expression left, BinaryOperation op,
                                Expression right);
@@ -102,7 +102,7 @@ Expression CaseExpressionExp(
     std::vector<std::pair<Expression, Expression>> when_clauses,
     Expression else_clause);
 Expression InExpressionExp(Expression child, std::vector<Expression> list);
-Expression FunctionCallExp(const std::string& func_name,
+Expression FunctionCallExp(std::string func_name,
                            std::vector<Expression> args);
 Expression QueryExpressionExp(std::shared_ptr<SelectStatement> query,
                               Expression test = nullptr, bool exists = false,

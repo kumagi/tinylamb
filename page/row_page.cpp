@@ -23,6 +23,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -32,6 +33,7 @@
 #include "common/debug.hpp"
 #include "common/log_message.hpp"
 #include "common/status_or.hpp"
+#include "page/row_position.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
@@ -63,23 +65,34 @@ StatusOr<std::string_view> RowPage::Read(page_id_t page_id, Transaction& txn,
  */
 StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
                                  std::string_view record) {
-  if (free_size_ <= record.size() + sizeof(RowPointer)) {
+  const size_t needed = record.size() + sizeof(RowPointer);
+  if (free_size_ < needed) {
     return Status::kNoSpace;
   }
-  // Scan the first vacant slot.
-  slot_t result = InsertRow(record);
-  if (!txn.AddWriteSet(RowPosition(page_id, result))) {
+  // Determine the destination slot before taking the lock: a lock conflict
+  // must return without consuming a physical slot, otherwise the WAL-less
+  // residue would become visible as a committed row to concurrent readers.
+  slot_t slot = 0;
+  while (slot < row_max_ && rows_[slot].offset != 0) {
+    ++slot;
+  }
+  if (!txn.AddWriteSet(RowPosition(page_id, slot))) {
     return Status::kConflicts;
   }
-  txn.RegisterVersionWrite(RowPosition(page_id, result), std::nullopt, record);
-  txn.InsertLog(page_id, result, record);
-  return result;
+  const StatusOr<slot_t> inserted = InsertRow(record);
+  if (!inserted.HasValue()) {
+    return inserted.GetStatus();
+  }
+  txn.RegisterVersionWrite(RowPosition(page_id, inserted.Value()), std::nullopt,
+                           record);
+  txn.InsertLog(page_id, inserted.Value(), record);
+  return inserted.Value();
 }
 
 namespace {
 
 size_t SlotArrayBytes(slot_t row_max) {
-  return sizeof(RowPage) + static_cast<size_t>(row_max) * sizeof(RowPointer);
+  return sizeof(RowPage) + (static_cast<size_t>(row_max) * sizeof(RowPointer));
 }
 
 }  // namespace
@@ -93,30 +106,13 @@ bool RowPage::ReclaimUntilContiguous(size_t bytes, slot_t protected_slot,
     return true;
   }
   DeFragmentExcept(protected_slot);
-  if (fits()) {
-    return true;
-  }
-  while (!fits()) {
-    slot_t victim = row_max_;
-    bool found = false;
-    while (victim > 0) {
-      --victim;
-      if (victim == protected_slot || rows_[victim].offset == 0) {
-        continue;
-      }
-      found = true;
-      break;
-    }
-    if (!found) {
-      return false;
-    }
-    DeleteRow(victim);
-    DeFragmentExcept(protected_slot);
-  }
-  return true;
+  // Live rows are never dropped here: only logged transaction deletes may
+  // remove them.  When even a full compaction cannot satisfy the request the
+  // caller must fail (and surface kNoSpace) instead of losing rows.
+  return fits();
 }
 
-slot_t RowPage::InsertRow(std::string_view new_row) {
+StatusOr<slot_t> RowPage::InsertRow(std::string_view new_row) {
   assert(new_row.size() <= std::numeric_limits<slot_t>::max());
   slot_t slot = 0;
   for (; slot < row_max_; ++slot) {
@@ -130,7 +126,7 @@ slot_t RowPage::InsertRow(std::string_view new_row) {
   // otherwise tuple bytes can overwrite RowPointers that are still in use.
   const slot_t prospective_row_max = std::max<slot_t>(row_max_, slot + 1);
   if (!ReclaimUntilContiguous(new_row.size(), slot, prospective_row_max)) {
-    return slot;
+    return Status::kNoSpace;
   }
 
   free_size_ -= new_row.size() + sizeof(RowPointer);
@@ -148,7 +144,9 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
   if (row_max_ <= slot || rows_[slot].offset == 0) {
     return Status::kNotExists;
   }
-  std::string_view prev_row = GetRow(slot);
+  // Own a copy of the previous image: applying the update may defragment the
+  // page and move or release the bytes this view points into.
+  const std::string prev_row(GetRow(slot));
   if (prev_row.size() < record.size() &&
       free_size_ < record.size() - prev_row.size()) {
     return Status::kNoSpace;
@@ -158,20 +156,22 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
     LOG(ERROR) << "cannot add write-set";
     return Status::kConflicts;
   }
+  // Reserve contiguous space before any WAL write: a failed allocation must
+  // not leave a log record describing an update that never reached the page.
+  RETURN_IF_FAIL(UpdateRow(pos.slot, record));
   txn.RegisterVersionWrite(pos, prev_row, record);
   txn.UpdateLog(page_id, slot, record, prev_row);
-  UpdateRow(pos.slot, record);
   return Status::kSuccess;
 }
 
-void RowPage::UpdateRow(slot_t slot, std::string_view record) {
+Status RowPage::UpdateRow(slot_t slot, std::string_view record) {
   const size_t previous_size = rows_[slot].size;
   if (record.size() <= previous_size) {
     // There is already enough space, just overwrite.
     free_size_ += previous_size - record.size();
     rows_[slot].size = record.size();
     memcpy(Payload() + rows_[slot].offset, record.data(), record.size());
-    return;
+    return Status::kSuccess;
   }
   // Allocate a new field and leave the old field as fragmented free space.
   // Recovery undo may need to restore a larger image after another
@@ -179,8 +179,22 @@ void RowPage::UpdateRow(slot_t slot, std::string_view record) {
   // and drop later rows if needed, instead of writing below the slot array.
   const bool already_contiguous =
       SlotArrayBytes(row_max_) + record.size() <= free_ptr_;
-  if (!ReclaimUntilContiguous(record.size(), slot, row_max_)) {
-    return;
+  if (!already_contiguous) {
+    // The compaction below releases the current image of |slot| back to the
+    // free area.  Verify up front that even that cannot leave the request
+    // unsatisfiable; otherwise fail before mutating anything so callers can
+    // stop without writing WAL records for an update that never applied.
+    size_t live_bytes = 0;
+    for (slot_t i = 0; i < row_max_; ++i) {
+      if (rows_[i].offset != 0 && static_cast<size_t>(i) != slot) {
+        live_bytes += rows_[i].size;
+      }
+    }
+    if (SlotArrayBytes(row_max_) + record.size() >
+        kPageBodySize - live_bytes) {
+      return Status::kNoSpace;
+    }
+    DeFragmentExcept(slot);
   }
   free_ptr_ -= record.size();
   rows_[slot].offset = free_ptr_;
@@ -190,6 +204,7 @@ void RowPage::UpdateRow(slot_t slot, std::string_view record) {
   free_size_ -= record.size();
   rows_[slot].size = record.size();
   memcpy(Payload() + rows_[slot].offset, record.data(), record.size());
+  return Status::kSuccess;
 }
 
 Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
@@ -232,7 +247,8 @@ void RowPage::DeFragmentExcept(slot_t excluded_slot) {
   free_ptr_ = kPageBodySize;
   for (size_t i = 0; i < row_max_; ++i) {
     if (rows_[i].offset == 0 || i == excluded_slot) {
-      if (i == excluded_slot) rows_[i].size = rows_[i].offset = 0;
+      if (i == excluded_slot) { rows_[i].size = rows_[i].offset = 0;
+}
       continue;
     }
 
@@ -240,7 +256,7 @@ void RowPage::DeFragmentExcept(slot_t excluded_slot) {
     rows_[i].offset = free_ptr_;
     memcpy(Payload() + free_ptr_, tmp_buffer[i].data(), tmp_buffer[i].size());
   }
-  const size_t slot_bytes = static_cast<size_t>(
+  const auto slot_bytes = static_cast<size_t>(
       reinterpret_cast<char*>(&rows_[row_max_]) - Payload());
   assert(slot_bytes <= free_ptr_);
   free_size_ = free_ptr_ - slot_bytes;
@@ -270,7 +286,7 @@ uint64_t std::hash<tinylamb::RowPage>::operator()(
   ret += std::hash<tinylamb::slot_t>()(r.row_count_);
   ret += std::hash<tinylamb::bin_size_t>()(r.free_ptr_);
   ret += std::hash<tinylamb::bin_size_t>()(r.free_size_);
-  for (int i = 0; i < r.row_count_; ++i) {
+  for (tinylamb::slot_t i = 0; i < r.row_count_; ++i) {
     ret += std::hash<std::string_view>()(r.GetRow(i));
   }
   return ret;

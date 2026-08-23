@@ -16,15 +16,17 @@
 
 #include "index/lsm_detail/blob_file.hpp"
 
-#include <chrono>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
-#include <thread>
+#include <string_view>
 
+#include "common/constants.hpp"
 #include "common/random_string.hpp"
 #include "gtest/gtest.h"
+#include "index/lsm_detail/cache.hpp"
 #include "recovery/logger.hpp"
 
 namespace tinylamb {
@@ -36,8 +38,11 @@ class BlobFileTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    // Drain the writer explicitly instead of sleeping and hoping.
+    if (blob_) {
+      blob_->Flush();
+    }
     blob_.reset();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
     std::filesystem::remove_all(path_);
   }
 

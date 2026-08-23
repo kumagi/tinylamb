@@ -21,6 +21,7 @@
 #include <ios>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -67,6 +68,9 @@ class Decoder {
   std::istream* is_;
 };
 
+// Decode an object from its in-memory encoded form. Throws when the stream
+// runs out mid-decode so callers never receive a partially built object.
+// T must be default constructible and provide `Decoder& operator>>(Decoder&, T&)`.
 template <typename T>
 T Decode(std::string_view src) {
   std::string buffer(src);
@@ -74,6 +78,9 @@ T Decode(std::string_view src) {
   Decoder dec(ss);
   T ret;
   dec >> ret;
+  if (!ss) {
+    throw std::runtime_error("Decode failed: truncated or corrupt input");
+  }
   return ret;
 }
 

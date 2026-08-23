@@ -16,13 +16,14 @@
 
 #include "type/constraint.hpp"
 
+#include <cstddef>
 #include <functional>
 #include <sstream>
 
-#include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
+#include "type/value_type.hpp"
 #include "value.hpp"
 
 namespace tinylamb {

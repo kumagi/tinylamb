@@ -24,6 +24,8 @@ class RelationalExecutor : public ExecutorBase {
  private:
   void Initialize();
 
+  // Not owned. The executor must not outlive the TransactionContext it was
+  // created with (same lifetime contract as full_scan.hpp's `table_`).
   TransactionContext* context_;
   std::shared_ptr<const SelectStatement> statement_;
   std::vector<Row> rows_;

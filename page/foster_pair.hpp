@@ -37,7 +37,7 @@ struct FosterPair {
     if (f.key.empty()) {
       o << "(empty pair)";
     } else {
-      o << f.key << " -> " << f.key;
+      o << f.key << " -> " << f.child_pid;
     }
     return o;
   }
@@ -50,7 +50,9 @@ struct FosterPair {
     return d;
   }
   std::string key;
-  page_id_t child_pid;
+  // Defaulted so an empty pair never propagates an indeterminate child pid
+  // even when a caller forgets to initialize it.
+  page_id_t child_pid = 0;
 };
 
 }  // namespace tinylamb

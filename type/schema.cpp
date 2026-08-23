@@ -57,14 +57,14 @@ int Schema::Offset(const ColumnName& col_name) const {
       Name() != col_name.schema) {
     return -1;
   }
-  for (int i = 0; i < static_cast<int>(columns_.size()); ++i) {
+  for (size_t i = 0; i < columns_.size(); ++i) {
     const ColumnName& cn = columns_[i].Name();
     if (col_name.schema.empty()) {
       if (cn.name == col_name.name) {
-        return i;
+        return static_cast<int>(i);
       }
     } else if (cn == col_name) {
-      return i;
+      return static_cast<int>(i);
     }
   }
   return -1;

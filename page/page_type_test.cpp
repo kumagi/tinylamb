@@ -16,6 +16,7 @@
 
 #include "page/page_type.hpp"
 
+#include <cstdint>
 #include <sstream>
 
 #include "common/decoder.hpp"
@@ -87,7 +88,11 @@ TEST(PageTypeTest, PageTypeStringHelper) {
   EXPECT_EQ(PageTypeString(PageType::kLeafPage), "LeafPage");
   EXPECT_EQ(PageTypeString(PageType::kBranchPage), "BranchPage");
   EXPECT_EQ(PageTypeString(PageType::kUnknown), "(unknown)");
-  EXPECT_EQ(PageTypeString(static_cast<PageType>(999)), "(unknown)");
+  // Deliberately invalid value: exercises the "(unknown)" fallback path.
+  EXPECT_EQ(
+      PageTypeString(
+          static_cast<PageType>(999)),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+      "(unknown)");
 }
 
 }  // namespace tinylamb

@@ -2,20 +2,28 @@
 #include "query/googlesql_ast.hpp"
 
 #include <charconv>
+#include <cstddef>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
+#include "common/status_or.hpp"
+#include "common/constants.hpp"
 
 namespace tinylamb {
 namespace {
 
 bool ParseLocation(std::string& label, size_t* start, size_t* end) {
-  if (label.empty() || label.back() != ']') return false;
+  if (label.empty() || label.back() != ']') { return false;
+}
   const size_t open = label.rfind(" [");
-  if (open == std::string::npos) return false;
+  if (open == std::string::npos) { return false;
+}
   const size_t dash = label.find('-', open + 2);
-  if (dash == std::string::npos) return false;
+  if (dash == std::string::npos) { return false;
+}
   const char* first = label.data() + open + 2;
   const char* middle = label.data() + dash;
   const char* last = label.data() + label.size() - 1;
@@ -49,7 +57,8 @@ std::unique_ptr<GoogleSqlAstNode> ParseNode(std::string label) {
 const GoogleSqlAstNode* GoogleSqlAstNode::Child(std::string_view child_kind,
                                                 size_t occurrence) const {
   for (const auto& child : children) {
-    if (child->kind == child_kind && occurrence-- == 0) return child.get();
+    if (child->kind == child_kind && occurrence-- == 0) { return child.get();
+}
   }
   return nullptr;
 }
@@ -58,7 +67,8 @@ std::vector<const GoogleSqlAstNode*> GoogleSqlAstNode::Children(
     std::string_view child_kind) const {
   std::vector<const GoogleSqlAstNode*> result;
   for (const auto& child : children) {
-    if (child->kind == child_kind) result.push_back(child.get());
+    if (child->kind == child_kind) { result.push_back(child.get());
+}
   }
   return result;
 }
@@ -70,30 +80,39 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
   size_t cursor = 0;
   while (cursor < dump.size()) {
     size_t line_end = dump.find('\n', cursor);
-    if (line_end == std::string_view::npos) line_end = dump.size();
+    if (line_end == std::string_view::npos) { line_end = dump.size();
+}
     std::string_view line = dump.substr(cursor, line_end - cursor);
-    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    if (!line.empty() && line.back() == '\r') { line.remove_suffix(1);
+}
     cursor = line_end + 1;
-    if (line.empty()) continue;
+    if (line.empty()) { continue;
+}
 
     size_t spaces = 0;
-    while (spaces < line.size() && line[spaces] == ' ') ++spaces;
-    if (spaces % 2 != 0 || spaces == line.size()) return Status::kUnknown;
+    while (spaces < line.size() && line[spaces] == ' ') { ++spaces;
+}
+    if (spaces % 2 != 0 || spaces == line.size()) { return Status::kUnknown;
+}
     const size_t depth = spaces / 2;
     auto node = ParseNode(std::string(line.substr(spaces)));
     GoogleSqlAstNode* raw = node.get();
     if (depth == 0) {
-      if (root) return Status::kUnknown;
+      if (root) { return Status::kUnknown;
+}
       root = std::move(node);
     } else {
-      if (depth > parents.size()) return Status::kUnknown;
+      if (depth > parents.size()) { return Status::kUnknown;
+}
       parents[depth - 1]->children.push_back(std::move(node));
     }
-    if (parents.size() <= depth) parents.resize(depth + 1);
+    if (parents.size() <= depth) { parents.resize(depth + 1);
+}
     parents[depth] = raw;
     parents.resize(depth + 1);
   }
-  if (!root) return Status::kUnknown;
+  if (!root) { return Status::kUnknown;
+}
   return root;
 }
 

@@ -18,6 +18,8 @@
 
 #include <cstdint>
 #include <ostream>
+#include <stdexcept>
+#include <string>
 
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
@@ -44,6 +46,9 @@ std::ostream& operator<<(std::ostream& o, const PageType& type) {
     case PageType::kBranchPage:
       o << "BranchPageType";
       break;
+    default:
+      o << "(unknown)";
+      break;
   }
   return o;
 }
@@ -54,8 +59,15 @@ Encoder& operator<<(Encoder& e, const PageType& type) {
 }
 
 Decoder& operator>>(Decoder& d, PageType& type) {
+  constexpr auto kMaxValid =
+      static_cast<uint64_t>(PageType::kBranchPage);
   uint64_t raw = 0;
   d >> raw;
+  if (raw > kMaxValid) {
+    // Broken images must not leak out-of-range enum values into downstream
+    // switches; fail loudly instead.
+    throw std::runtime_error("corrupt page type: " + std::to_string(raw));
+  }
   type = static_cast<PageType>(raw);
   return d;
 }

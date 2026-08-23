@@ -41,8 +41,15 @@ class IndexScan : public ExecutorBase {
             const Value& begin, const Value& end, bool ascending,
             Expression where, const Schema& sc);
   IndexScan(Transaction& txn, const Table& table, const Index& index,
-            std::vector<Value> begin_key, std::vector<Value> end_key,
-            bool ascending, Expression where, const Schema& sc);
+            const std::vector<Value>& begin_key,
+            const std::vector<Value>& end_key,
+            bool ascending, Expression where, Schema sc);
+  // Point-union access (Phase 8 IN lists): scans each [begin,end] key range
+  // in sequence. Ranges must be sorted and disjoint for ordered output.
+  IndexScan(Transaction& txn, const Table& table, const Index& index,
+            std::vector<std::pair<std::vector<Value>, std::vector<Value>>>
+                ranges,
+            bool ascending, Expression where, Schema sc);
   IndexScan(const IndexScan&) = delete;
   IndexScan(IndexScan&&) = delete;
   IndexScan& operator=(const IndexScan&) = delete;
@@ -53,9 +60,19 @@ class IndexScan : public ExecutorBase {
   void Dump(std::ostream& o, int indent) const override;
 
  private:
+  void OpenRange(const std::vector<Value>& begin_key,
+                 const std::vector<Value>& end_key);
+
+  Transaction& txn_;
+  const Table& table_;
+  const Index& index_;
+  bool ascending_;
+  // Ranges not opened yet (multi-range access only).
+  std::vector<std::pair<std::vector<Value>, std::vector<Value>>> pending_;
   Iterator iter_;
   Expression cond_;
-  const Schema& schema_;
+  // Held by value (not reference): callers often pass a temporary Schema.
+  Schema schema_;
 };
 
 }  // namespace tinylamb

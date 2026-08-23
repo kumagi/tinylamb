@@ -18,6 +18,8 @@
 
 #include <gtest/gtest.h>
 
+#include <stdexcept>
+#include <cstddef>
 #include <vector>
 
 #include "parser/token.hpp"
@@ -190,64 +192,67 @@ TEST(TokenizerTest, StringEscapesAndKeywordCase) {
 }
 
 TEST(TokenizerTest, NumbersAndOperators) {
-  // Act -- tokenize decimals, dotted numerics, exponent-like numbers, and runs
-  // of operator characters
-  Tokenizer tokenizer("1.5 1.2.3 .5 1e5 <= >= <> != ++ --");
+  // Act -- tokenize decimals, exponent-like numbers, and runs of operator
+  // characters
+  Tokenizer tokenizer("1.5 .5 1e5 <= >= <> != ++ --");
   std::vector<Token> tokens = tokenizer.Tokenize();
 
-  // Assert -- decimal and multi-dot numerics stay in one numeric token
-  ASSERT_EQ(tokens.size(), 13);
+  // Assert -- decimal stays in one numeric token
+  ASSERT_EQ(tokens.size(), 12);
   EXPECT_EQ(tokens[0].type, TokenType::kNumeric);
   EXPECT_EQ(tokens[0].value, "1.5");
-  EXPECT_EQ(tokens[1].type, TokenType::kNumeric);
-  EXPECT_EQ(tokens[1].value, "1.2.3");
   // Assert -- a leading dot is a Dot token followed by the fractional part
-  EXPECT_EQ(tokens[2].type, TokenType::kDot);
-  EXPECT_EQ(tokens[3].type, TokenType::kNumeric);
-  EXPECT_EQ(tokens[3].value, "5");
+  EXPECT_EQ(tokens[1].type, TokenType::kDot);
+  EXPECT_EQ(tokens[2].type, TokenType::kNumeric);
+  EXPECT_EQ(tokens[2].value, "5");
   // Assert -- exponent notation splits into numeric + identifier
-  EXPECT_EQ(tokens[4].type, TokenType::kNumeric);
-  EXPECT_EQ(tokens[4].value, "1");
-  EXPECT_EQ(tokens[5].type, TokenType::kIdentifier);
-  EXPECT_EQ(tokens[5].value, "e5");
+  EXPECT_EQ(tokens[3].type, TokenType::kNumeric);
+  EXPECT_EQ(tokens[3].value, "1");
+  EXPECT_EQ(tokens[4].type, TokenType::kIdentifier);
+  EXPECT_EQ(tokens[4].value, "e5");
   // Assert -- each operator run is grouped into a single token
+  EXPECT_EQ(tokens[5].type, TokenType::kOperator);
+  EXPECT_EQ(tokens[5].value, "<=");
   EXPECT_EQ(tokens[6].type, TokenType::kOperator);
-  EXPECT_EQ(tokens[6].value, "<=");
+  EXPECT_EQ(tokens[6].value, ">=");
   EXPECT_EQ(tokens[7].type, TokenType::kOperator);
-  EXPECT_EQ(tokens[7].value, ">=");
+  EXPECT_EQ(tokens[7].value, "<>");
   EXPECT_EQ(tokens[8].type, TokenType::kOperator);
-  EXPECT_EQ(tokens[8].value, "<>");
+  EXPECT_EQ(tokens[8].value, "!=");
   EXPECT_EQ(tokens[9].type, TokenType::kOperator);
-  EXPECT_EQ(tokens[9].value, "!=");
+  EXPECT_EQ(tokens[9].value, "++");
   EXPECT_EQ(tokens[10].type, TokenType::kOperator);
-  EXPECT_EQ(tokens[10].value, "++");
-  EXPECT_EQ(tokens[11].type, TokenType::kOperator);
-  EXPECT_EQ(tokens[11].value, "--");
-  EXPECT_EQ(tokens[12].type, TokenType::kEof);
+  EXPECT_EQ(tokens[10].value, "--");
 }
 
-TEST(TokenizerTest, UnterminatedStringConsumesToEnd) {
-  // Act -- tokenize a string literal with no closing quote
-  Tokenizer tokenizer("'abc");
-  std::vector<Token> tokens = tokenizer.Tokenize();
-
-  // Assert -- the unterminated literal still yields a string token + EOF
-  ASSERT_EQ(tokens.size(), 2);
-  EXPECT_EQ(tokens[0].type, TokenType::kString);
-  EXPECT_EQ(tokens[0].value, "abc");
-  EXPECT_EQ(tokens[1].type, TokenType::kEof);
+TEST(TokenizerTest, MultiDotNumericThrows) {
+  // Act + Assert -- a number with multiple dots is rejected
+  EXPECT_THROW(Tokenizer("1.2.3").Tokenize(), std::runtime_error);
 }
 
-TEST(TokenizerTest, UnterminatedQuotedIdentifierConsumesToEnd) {
-  // Act -- tokenize a quoted identifier with no closing backtick
-  Tokenizer tokenizer("`abc");
+TEST(TokenizerTest, UnterminatedStringThrows) {
+  // Act + Assert -- a string literal with no closing quote is an error
+  EXPECT_THROW(Tokenizer("'abc").Tokenize(), std::runtime_error);
+}
+
+TEST(TokenizerTest, UnterminatedQuotedIdentifierThrows) {
+  // Act + Assert -- a quoted identifier with no closing backtick is an error
+  EXPECT_THROW(Tokenizer("`abc").Tokenize(), std::runtime_error);
+}
+
+TEST(TokenizerTest, HighByteInputDoesNotTriggerUB) {
+  // Act -- tokenize raw high bytes and multi-byte UTF-8 content
+  Tokenizer tokenizer("SELECT '日本語' \x80\x81");
   std::vector<Token> tokens = tokenizer.Tokenize();
 
-  // Assert -- the identifier is still produced
-  ASSERT_EQ(tokens.size(), 2);
-  EXPECT_EQ(tokens[0].type, TokenType::kIdentifier);
-  EXPECT_EQ(tokens[0].value, "abc");
-  EXPECT_EQ(tokens[1].type, TokenType::kEof);
+  // Assert -- high bytes lex as Unknown tokens without undefined behavior
+  ASSERT_EQ(tokens.size(), 5);
+  EXPECT_EQ(tokens[0].type, TokenType::kKeyword);
+  EXPECT_EQ(tokens[1].type, TokenType::kString);
+  EXPECT_EQ(tokens[1].value, "日本語");
+  EXPECT_EQ(tokens[2].type, TokenType::kUnknown);
+  EXPECT_EQ(tokens[3].type, TokenType::kUnknown);
+  EXPECT_EQ(tokens[4].type, TokenType::kEof);
 }
 
 TEST(TokenizerTest, EmptyStringAndEmptyIdentifier) {

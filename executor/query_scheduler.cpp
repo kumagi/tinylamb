@@ -2,9 +2,17 @@
 #include "executor/query_scheduler.hpp"
 
 #include <algorithm>
+#include <cstddef>
+#include <mutex>
+#include <cstdint>
+#include <memory>
 #include <ostream>
 #include <thread>
 #include <utility>
+#include "type/row.hpp"
+#include "page/row_position.hpp"
+#include "executor/data_chunk.hpp"
+#include "common/constants.hpp"
 
 namespace tinylamb {
 
@@ -28,7 +36,7 @@ QueryScheduler::Lease QueryScheduler::Acquire(size_t cpu_slots,
   ++serving_ticket_;
   lock.unlock();
   available_.notify_all();
-  return Lease(this, cpu_slots, memory_bytes);
+  return {this, cpu_slots, memory_bytes};
 }
 
 void QueryScheduler::Release(size_t cpu_slots, size_t memory_bytes) {
@@ -63,7 +71,8 @@ QueryScheduler::Lease::Lease(Lease&& other) noexcept
       memory_bytes_(other.memory_bytes_) {}
 
 QueryScheduler::Lease& QueryScheduler::Lease::operator=(Lease&& other) noexcept {
-  if (this == &other) return *this;
+  if (this == &other) { return *this;
+}
   Release();
   scheduler_ = std::exchange(other.scheduler_, nullptr);
   cpu_slots_ = other.cpu_slots_;
@@ -74,7 +83,8 @@ QueryScheduler::Lease& QueryScheduler::Lease::operator=(Lease&& other) noexcept 
 QueryScheduler::Lease::~Lease() { Release(); }
 
 void QueryScheduler::Lease::Release() {
-  if (!scheduler_) return;
+  if (scheduler_ == nullptr) { return;
+}
   scheduler_->Release(cpu_slots_, memory_bytes_);
   scheduler_ = nullptr;
 }
@@ -89,14 +99,16 @@ void ScheduledExecutor::EnsureLease() {
 bool ScheduledExecutor::Next(Row* destination, RowPosition* position) {
   EnsureLease();
   const bool produced = child_->Next(destination, position);
-  if (!produced) lease_.reset();
+  if (!produced) { lease_.reset();
+}
   return produced;
 }
 
 size_t ScheduledExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   EnsureLease();
   const size_t produced = child_->NextBatch(destination, max_rows);
-  if (produced == 0) lease_.reset();
+  if (produced == 0) { lease_.reset();
+}
   return produced;
 }
 

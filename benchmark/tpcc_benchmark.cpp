@@ -8,12 +8,15 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <ratio>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
 
 #include "benchmark/tpcc_workload.hpp"
+#include "common/constants.hpp"
 #include "database/database.hpp"
 
 namespace {
@@ -68,10 +71,13 @@ bool ParseInteger(std::string_view value, Integer* destination) {
 
 bool ParseOptions(int argc, char** argv, Options* options) {
   for (int i = 1; i < argc; ++i) {
-    if (std::string_view(argv[i]) == "--help") return false;
+    if (std::string_view(argv[i]) == "--help") { return false;
+}
   }
-  if (argc < 2) return false;
-  if (std::string_view(argv[1]).starts_with("--")) return false;
+  if (argc < 2) { return false;
+}
+  if (std::string_view(argv[1]).starts_with("--")) { return false;
+}
   options->database_path = argv[1];
   for (int i = 2; i < argc; ++i) {
     const std::string_view argument(argv[i]);
@@ -79,8 +85,10 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       options->verify_only = true;
       continue;
     }
-    if (argument == "--help") return false;
-    if (i + 1 >= argc) return false;
+    if (argument == "--help") { return false;
+}
+    if (i + 1 >= argc) { return false;
+}
     const std::string_view value(argv[++i]);
     bool parsed = false;
     if (argument == "--scale-factor" || argument == "--sf") {
@@ -94,7 +102,8 @@ bool ParseOptions(int argc, char** argv, Options* options) {
     } else if (argument == "--seed") {
       parsed = ParseInteger(value, &options->seed);
     }
-    if (!parsed) return false;
+    if (!parsed) { return false;
+}
   }
   return options->scale_factor >= 1 && options->clients >= 0 &&
          options->warmup_seconds >= 0 && options->measure_seconds > 0;
@@ -118,7 +127,8 @@ bool VerifyTransactions(tinylamb::Database& database,
       std::cout << "verification." << tinylamb::ToString(type) << '='
                 << (pass ? "PASS" : "FAIL")
                 << " statements=" << result.sql_statements;
-      if (!result.error.empty()) std::cout << " error=\"" << result.error << '"';
+      if (!result.error.empty()) { std::cout << " error=\"" << result.error << '"';
+}
       std::cout << '\n';
       ok = ok && pass;
     } catch (const std::exception& ex) {
@@ -142,7 +152,8 @@ int main(int argc, char** argv) {
       tinylamb::TpccScale::Official(options.scale_factor);
   const tinylamb::TpccNurand nurand =
       tinylamb::TpccNurand::FromSeed(options.seed);
-  if (options.clients == 0) options.clients = scale.Terminals();
+  if (options.clients == 0) { options.clients = scale.Terminals();
+}
 
   std::cout << "benchmark=tinylamb_tpcc\n"
             << "tpmc_compliant=false\n"
@@ -177,12 +188,14 @@ int main(int argc, char** argv) {
     return 1;
   }
   try {
-    if (!VerifyTransactions(database, scale, nurand, options.seed)) return 1;
+    if (!VerifyTransactions(database, scale, nurand, options.seed)) { return 1;
+}
   } catch (const std::exception& ex) {
     std::cerr << "verification aborted: " << ex.what() << '\n';
     return 1;
   }
-  if (options.verify_only) return 0;
+  if (options.verify_only) { return 0;
+}
 
   std::cout << "clients=" << options.clients << '\n'
             << "warmup_seconds=" << options.warmup_seconds << '\n'
@@ -234,12 +247,14 @@ int main(int argc, char** argv) {
       }
     });
   }
-  for (std::thread& worker : workers) worker.join();
+  for (std::thread& worker : workers) { worker.join();
+}
 
   std::array<TypeStats, tinylamb::kTpccTransactionTypeCount> totals;
   std::string first_error;
   for (const WorkerStats& worker : worker_stats) {
-    if (first_error.empty()) first_error = worker.first_error;
+    if (first_error.empty()) { first_error = worker.first_error;
+}
     for (size_t i = 0; i < totals.size(); ++i) {
       totals[i].attempted += worker.types[i].attempted;
       totals[i].committed += worker.types[i].committed;
@@ -274,7 +289,7 @@ int main(int argc, char** argv) {
               << ".average_latency_ms=" << std::fixed << std::setprecision(3)
               << average_ms << '\n';
   }
-  const double seconds = static_cast<double>(options.measure_seconds);
+  const auto seconds = static_cast<double>(options.measure_seconds);
   const uint64_t new_order_committed =
       totals[static_cast<size_t>(tinylamb::TpccTransactionType::kNewOrder)]
           .committed;
@@ -314,7 +329,8 @@ int main(int argc, char** argv) {
             << "mix.delivery.percent=" << delivery_pct << '\n'
             << "mix.stock_level.percent=" << stock_level_pct << '\n'
             << "mix_clause_542=" << (mix_ok ? "ok" : "short_interval") << '\n';
-  if (!first_error.empty())
+  if (!first_error.empty()) {
     std::cout << "first_error=\"" << first_error << "\"\n";
+}
   return engine_aborts == 0 ? 0 : 3;
 }
