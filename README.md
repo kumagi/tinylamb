@@ -121,11 +121,17 @@ There is no second standalone DP optimizer; `optimizer.cpp` is the façade and
 post-processing layer (aggregates, residual predicates).
 
 **Statement AST:** SQL DML/SELECT shapes live in `query/statement.hpp`
-(legacy include path `parser/ast.hpp`). The legacy Tokenizer/Parser/Pratt
-implementations under `legacy/parser/` are not used by the GoogleSQL path.
+(executor-side code includes it directly; the `parser/ast.hpp` shim remains
+only for the legacy parser headers under `parser/` and is slated for removal).
+The legacy Tokenizer/Parser/Pratt implementations under `legacy/parser/` are
+an archive used by historical tests only (see `legacy/parser/README.md`) and
+are not part of the GoogleSQL path.
 
 **Layer libraries:** `tinylamb_core` is an INTERFACE aggregate over
-`tinylamb_common` → … → `tinylamb_executor` (see `CMakeLists.txt`).
+`tinylamb_common` → … → `tinylamb_executor` (see `CMakeLists.txt`). The
+layer map, ownership table, and include rules are documented in
+[`ARCHITECTURE.md`](ARCHITECTURE.md); dependency direction is enforced by
+`python3 scripts/check_layering.py`.
 
 **Docs index:** WAL/page format, lock order, recovery, checksum, durability, and
 Value storage notes are under `docs/`. See [`CONTRIBUTING.md`](CONTRIBUTING.md)

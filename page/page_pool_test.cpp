@@ -568,8 +568,8 @@ TEST_F(PagePoolTest, ConcurrentLoadsOfSamePageInstallOnce) {
 // racing an eviction used to violate pool invariants (a load could return a
 // Page whose PageID field was 0, and Unpin of a live ref could assert because
 // the returned page had been evicted underneath it). The install path now
-// serializes against write-back via flushing_ + file_latch_ and revalidates
-// capacity before installing, so this must stay green.
+// serializes against write-back via flushing_ + the page id's IO latch and
+// revalidates capacity before installing, so this must stay green.
 TEST_F(PagePoolTest, ConcurrentEvictionAcrossThreads) {
   // Arrange -- two threads churn distinct page ids far beyond the pool
   // capacity, forcing concurrent eviction and install-race handling
@@ -595,6 +595,70 @@ TEST_F(PagePoolTest, ConcurrentEvictionAcrossThreads) {
   }
 
   // Assert -- the pool is back within its capacity once all pins are released
+  EXPECT_LE(pp->Size(), static_cast<page_id_t>(kDefaultCapacity));
+}
+
+// Stress: several threads hammer a mix of shared hot ids and thread-private
+// cold ids under the tiny default capacity. This forces cache-hit pin/unpin
+// storms, concurrent miss loads of the same id, and dirty write-back/reload
+// cycles to happen at the same time. Every returned ref must carry the
+// requested page id, and privately written payloads must survive eviction
+// round-trips (guards the flushing_/install ordering: a stale image must
+// never replace a dirty page that is being written back).
+TEST_F(PagePoolTest, ParallelGetPageStressMixedIdsWithDirtyReload) {
+  constexpr int kThreads = 8;
+  constexpr int kIterations = 250;
+  constexpr int kHotPages = 16;  // Exceeds capacity so hot ids thrash too.
+  std::atomic<bool> go{false};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      while (!go.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      // Private id ranges are disjoint across threads (stride 1000), so the
+      // payload assertions below have a single writer per page.
+      const page_id_t base = static_cast<page_id_t>(10000) + t * 1000;
+      for (int i = 0; i < kIterations; ++i) {
+        // Hot fan-out: read-only shared pages; only the id is checked
+        // because several threads overlap on these ids.
+        const auto hot = static_cast<page_id_t>(i % kHotPages);
+        {
+          PageRef page = pp->GetPage(hot, nullptr);
+          ASSERT_EQ(page->PageID(), hot);
+        }
+        // Private churn: dirty the page, release it (forcing a write-back on
+        // eviction), then reload and verify the bytes came back intact.
+        const page_id_t mine = base + static_cast<page_id_t>(i);
+        const auto stamp = static_cast<char>((i % 200) + 1);
+        {
+          PageRef page = pp->GetPage(mine, nullptr);
+          // Union overlay: the write stays inside the kPageSize allocation.
+          page->body.free_page.FreeBody()[0] = stamp;  // NOLINT(clang-analyzer-security.ArrayBound)
+        }
+        {
+          PageRef reloaded = pp->GetPage(mine, nullptr);
+          EXPECT_EQ(reloaded->PageID(), mine);
+          EXPECT_EQ(reloaded->body.free_page.FreeBody()[0],  // NOLINT(clang-analyzer-security.ArrayBound)
+                    stamp);
+        }
+      }
+    });
+  }
+  go.store(true, std::memory_order_release);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  // Quiet phase: push the working set out so the pool shrinks back under its
+  // capacity now that every pin is gone.
+  for (int i = 0; i <= kDefaultCapacity; ++i) {
+    PageRef page =
+        pp->GetPage(static_cast<page_id_t>(900000) + static_cast<page_id_t>(i),
+                    nullptr);
+    ASSERT_EQ(page->PageID(), 900000 + i);
+  }
   EXPECT_LE(pp->Size(), static_cast<page_id_t>(kDefaultCapacity));
 }
 

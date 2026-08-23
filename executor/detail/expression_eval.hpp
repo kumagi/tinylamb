@@ -14,7 +14,7 @@
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
-#include "parser/ast.hpp"
+#include "query/statement.hpp"
 #include "type/column_name.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"

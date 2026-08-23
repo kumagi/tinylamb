@@ -32,6 +32,38 @@ Regression guards added to `query/query_test.cpp`
 (`SqlEngineSelectOrderByLimitOffset` covers unordered ORDER BY+LIMIT+OFFSET,
 plain LIMIT+OFFSET single application, and DISTINCT+LIMIT).
 
+## Optimizer Capability Follow-ups (2026-08, post-Phase 8)
+
+Three improvements landed after auditing the aliased/self-join path:
+
+1. **Index nested-loop join for renamed (aliased) inputs**
+   (`implementation_rules.cpp`, `product_plan.hpp`). The index-join branch
+   now locates the owning relation key for statistics, translates join-key
+   qualifiers to physical names, and declares a renamed full-width output
+   schema via a new `ProductPlan` constructor — previously the alias-
+   qualified keys never matched the physical schema, silently disabling
+   index joins for every self-join. A soundness guard skips index joins when
+   the right scan group carries a pushed filter: the IndexJoin executor
+   probes the raw table through its index and bypasses the child plan, so a
+   filter implemented by that child would otherwise vanish.
+2. **Ordering visibility across renames** (`plan/relation_rename_plan.*`).
+   The rename is now a dedicated positional pass-through plan whose
+   `IsOrderedBy` translates requests back to physical names and whose
+   executor surfaces a `Rename:` node in EXPLAIN. Aliased ORDER BY + LIMIT
+   queries regain index-provided-order credit and Top-K folding
+   (`AliasedOrderByLimitFoldsTopK`).
+3. **Constant IN lists drive point-union index access**
+   (`executor/index_scan.*`, `plan/index_scan_plan.*`). A constant IN list
+   on a leading index key becomes one point range per distinct value,
+   offered as an alternative against full/range scans; the IN conjunct stays
+   in the scan predicate so correctness never depends on bound tightness.
+   Multi-range scans keep global order only when a single range remains.
+
+Routing note: plain multi-table joins with table aliases now go to the
+cost-based optimizer; the relational-engine EXPLAIN/spill tests that pin
+relational internals use a semantically neutral `EXISTS` marker to stay on
+that path.
+
 ---
 
 ## Current Status

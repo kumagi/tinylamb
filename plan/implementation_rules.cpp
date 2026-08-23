@@ -308,6 +308,66 @@ std::vector<PlanAlternative> ScanAlternatives(
     for (size_t index_offset = 0; index_offset < table.IndexCount();
          ++index_offset) {
       const Index& index = table.GetIndex(index_offset);
+
+      // Point-union alternative for a constant IN list on the leading key
+      // (Phase 8 B). Offered alongside the range-based candidate so the cost
+      // model picks; the IN conjunct stays in the scan predicate, keeping
+      // correctness independent of bound tightness. Runs before the prefix
+      // consumption below, which may `continue` past this index.
+      const slot_t first_key_slot = index.sc_.key_.front();
+      const auto points = point_sets.find(first_key_slot);
+      if (points != point_sets.end() &&
+          ranges.find(first_key_slot) == ranges.end()) {
+        std::vector<Value> values = points->second;
+        std::ranges::sort(values);
+        values.erase(std::ranges::unique(values).begin(), values.end());
+        if (!values.empty()) {
+          std::vector<std::pair<std::vector<Value>, std::vector<Value>>>
+              scan_ranges;
+          scan_ranges.reserve(values.size());
+          for (const Value& value : values) {
+            scan_ranges.emplace_back(std::vector<Value>{value},
+                                     std::vector<Value>{value});
+          }
+          std::vector<ColumnName> point_order;
+          if (scan_ranges.size() == 1) {
+            for (size_t key = 1; key < index.sc_.key_.size(); ++key) {
+              point_order.push_back(
+                  schema.GetColumn(index.sc_.key_[key]).Name());
+            }
+          }
+          Plan point_candidate = std::make_shared<IndexScanPlan>(
+              table, index, statistics, std::move(scan_ranges), true,
+              scan_predicate, std::move(point_order));
+          if (fallback_select.size() !=
+              point_candidate->GetSchema().ColumnCount()) {
+            point_candidate = std::make_shared<ProjectionPlan>(
+                point_candidate, fallback_select);
+          }
+          point_candidate = finalize(point_candidate);
+          auto point_cost =
+              static_cast<double>(point_candidate->AccessRowCount());
+          // Per-point cardinality: rows / NDV of the leading key column.
+          double ndv = 1.0;
+          if (first_key_slot < statistics.Columns()) {
+            ndv = std::max<double>(
+                1.0, statistics.Column(first_key_slot).Distinct());
+          }
+          double point_rows =
+              std::min<double>(static_cast<double>(statistics.Rows()),
+                               static_cast<double>(values.size()) *
+                                   std::max(1.0, static_cast<double>(
+                                                     statistics.Rows()) /
+                                                     ndv));
+          point_rows = std::max(point_rows, 1.0);
+          ApplyLimitHint(point_candidate, required, context,
+                         filter_selectivity, &point_cost, &point_rows);
+          candidates.push_back(PlanAlternative{
+              .plan=std::move(point_candidate),
+              .local_cost=point_cost, .estimated_rows=point_rows});
+        }
+      }
+
       std::vector<Value> begin_key;
       std::vector<Value> end_key;
       std::unordered_set<slot_t> consumed;
@@ -395,68 +455,6 @@ std::vector<PlanAlternative> ScanAlternatives(
                      &local_cost, &estimated_rows);
       candidates.push_back(
           PlanAlternative{.plan=std::move(candidate), .local_cost=local_cost, .estimated_rows=estimated_rows});
-
-      // Point-union alternative for a constant IN list on the leading key
-      // (Phase 8 B). Offered alongside the range-based candidate so the cost
-      // model picks; the IN conjunct stays in the scan predicate, keeping
-      // correctness independent of bound tightness.
-      const slot_t first_key_slot = index.sc_.key_.front();
-      const auto points = point_sets.find(first_key_slot);
-      if (points != point_sets.end() &&
-          ranges.find(first_key_slot) == ranges.end()) {
-        std::vector<Value> values = points->second;
-        std::ranges::sort(values);
-        values.erase(std::ranges::unique(values).begin(), values.end());
-        if (!values.empty()) {
-          std::vector<std::pair<std::vector<Value>, std::vector<Value>>>
-              scan_ranges;
-          scan_ranges.reserve(values.size());
-          for (const Value& value : values) {
-            scan_ranges.emplace_back(std::vector<Value>{value},
-                                     std::vector<Value>{value});
-          }
-          std::vector<ColumnName> point_order;
-          if (scan_ranges.size() == 1) {
-            for (size_t key = 1; key < index.sc_.key_.size(); ++key) {
-              point_order.push_back(
-                  schema.GetColumn(index.sc_.key_[key]).Name());
-            }
-          }
-          Plan point_candidate = std::make_shared<IndexScanPlan>(
-              table, index, statistics, std::move(scan_ranges), true,
-              scan_predicate, std::move(point_order));
-          if (fallback_select.size() !=
-              point_candidate->GetSchema().ColumnCount()) {
-            point_candidate = std::make_shared<ProjectionPlan>(
-                point_candidate, fallback_select);
-          }
-          point_candidate = finalize(point_candidate);
-          auto point_cost =
-              static_cast<double>(point_candidate->AccessRowCount());
-          // Per-point cardinality: rows / NDV of the leading key column.
-          double ndv = 1.0;
-          const int first_offset = schema.Offset(
-              schema.GetColumn(first_key_slot).Name());
-          if (first_offset >= 0 &&
-              static_cast<size_t>(first_offset) < statistics.Columns()) {
-            ndv = std::max<double>(
-                1.0, statistics.Column(static_cast<size_t>(first_offset))
-                         .Distinct());
-          }
-          double point_rows =
-              std::min<double>(static_cast<double>(statistics.Rows()),
-                               static_cast<double>(values.size()) *
-                                   std::max(1.0, static_cast<double>(
-                                                     statistics.Rows()) /
-                                                     ndv));
-          point_rows = std::max(point_rows, 1.0);
-          ApplyLimitHint(point_candidate, required, context,
-                         filter_selectivity, &point_cost, &point_rows);
-          candidates.push_back(PlanAlternative{
-              .plan=std::move(point_candidate),
-              .local_cost=point_cost, .estimated_rows=point_rows});
-        }
-      }
     }
   }
 

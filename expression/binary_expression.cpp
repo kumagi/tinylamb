@@ -99,7 +99,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
 }
   if (op == BinaryOperation::kLike || op == BinaryOperation::kNotLike) {
     if (left.type != ValueType::kVarChar || right.type != ValueType::kVarChar) {
-      throw std::runtime_error("LIKE requires strings");
+      throw std::runtime_error("LIKE requires string operands");
     }
     const bool matched =
         Like(left.value.varchar_value, right.value.varchar_value);

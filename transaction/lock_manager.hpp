@@ -80,6 +80,15 @@ class LockManager {
   // Promotes the caller's sole shared lock to exclusive.
   bool TryUpgradeLock(const RowPosition& row, txn_id_t owner);
 
+  // Number of exclusive waits that gave up with no observable release
+  // progress anywhere in the lock table: the only situation where a timeout
+  // means "genuinely stuck" rather than "holder is merely slow".  Callers
+  // (executors) can surface this as a retryable conflict instead of a lost
+  // update.
+  [[nodiscard]] uint64_t WaitTimeouts() const {
+    return wait_timeouts_.load(std::memory_order_relaxed);
+  }
+
   friend std::ostream& operator<<(std::ostream& o, const LockManager& lm) {
     std::scoped_lock lk(lm.latch_);
     o << "LockManager(shared=" << lm.shared_locks_.size()
@@ -94,6 +103,17 @@ class LockManager {
   std::unordered_map<RowPosition, std::unordered_set<txn_id_t>> shared_locks_;
   std::unordered_map<RowPosition, txn_id_t> exclusive_locks_;
   std::atomic<uint32_t> durability_waits_{0};
+  // Bumped on every release/upgrade anywhere in the table.  A waiter that
+  // observed no bump across a whole timeout window is provably not waiting
+  // on progress; one that did see releases is extended instead of failing
+  // (bounded by kDurabilityWaitFloor) so a slow lock holder under active
+  // system load cannot fake an abort.
+  std::atomic<uint64_t> release_epoch_{0};
+  std::atomic<uint64_t> wait_timeouts_{0};
+
+  void BumpReleaseEpoch() noexcept {
+    release_epoch_.fetch_add(1, std::memory_order_relaxed);
+  }
 };
 
 }  // namespace tinylamb

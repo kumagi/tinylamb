@@ -17,20 +17,64 @@
 #ifndef TINYLAMB_HASH_JOIN_HPP
 #define TINYLAMB_HASH_JOIN_HPP
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "executor/executor_base.hpp"
 #include "executor/hash_join_mode.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/expression.hpp"
+#include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
+
+// Open-addressing join index (multiplicative hash + linear probing, load
+// factor <= 0.7) with a per-key entry chain for duplicate matches.  Defined
+// in hash_join.cpp.
+class JoinHashIndex {
+ public:
+  static constexpr size_t kNil = ~size_t{0};
+  enum class KeyMode : uint8_t { kInt64, kBytes };
+
+  void Init(KeyMode mode, size_t expected_entries);
+  void Insert(uint64_t hash, int64_t int_key, std::string_view byte_key,
+              size_t row_index);
+  [[nodiscard]] size_t Find(uint64_t hash, int64_t int_key,
+                            std::string_view byte_key) const;
+  [[nodiscard]] size_t ChainNext(size_t entry) const;
+  [[nodiscard]] size_t RowIndex(size_t entry) const;
+
+  [[nodiscard]] static uint64_t HashInt64(int64_t key);
+  [[nodiscard]] static uint64_t HashBytes(std::string_view key);
+
+ private:
+  struct Entry {
+    size_t row;
+    size_t next;
+  };
+
+  void StoreSlotKey(size_t slot, int64_t int_key, std::string_view byte_key);
+  [[nodiscard]] bool SlotKeyEquals(size_t slot, int64_t int_key,
+                                   std::string_view byte_key) const;
+  void Grow();
+
+  KeyMode mode_{KeyMode::kBytes};
+  std::vector<size_t> slots_;
+  size_t mask_{0};
+  size_t occupied_slots_{0};
+  std::vector<Entry> entries_;
+  std::vector<int64_t> slot_int_keys_;
+  std::string arena_;
+  std::vector<std::pair<uint32_t, uint32_t>> slot_byte_keys_;
+};
 
 class HashJoin : public ExecutorBase {
  public:
@@ -44,7 +88,7 @@ class HashJoin : public ExecutorBase {
   HashJoin(HashJoin&&) = delete;
   HashJoin& operator=(const HashJoin&) = delete;
   HashJoin& operator=(HashJoin&&) = delete;
-  ~HashJoin() override = default;
+  ~HashJoin() override;
 
   bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
@@ -55,13 +99,25 @@ class HashJoin : public ExecutorBase {
   [[nodiscard]] HashJoinMode Mode() const { return mode_; }
 
  private:
+  struct JoinState;
+
   void Materialize();
   void MaterializeInMemory();
   void MaterializeHybrid();
-  bool EmitNextMatch(Row* dst, RowPosition* rp);
-  // Wraps Materialize() so a failure never re-consumes the children (which
-  // would duplicate or drop rows on retry).
   void MaterializeOrThrow();
+
+  void IntakeBothSides();
+  void BuildShards();
+  uint32_t ShardOf(uint64_t hash) const;
+  bool FetchNextProbe();
+  void SetupInMemoryJoin();
+  void SetupOneSideSpilled();
+  void SetupBothSpilled();
+  void JoinPartitionPair(const std::vector<std::pair<Row, RowPosition>>& left_part,
+                         const std::vector<Row>& right_part,
+                         std::vector<std::pair<Row, RowPosition>>* out);
+  void RunStripedProbe();
+  bool EmitNextMatch(Row* dst, RowPosition* rp);
 
   Executor left_;
   std::vector<slot_t> left_cols_;
@@ -73,17 +129,13 @@ class HashJoin : public ExecutorBase {
   bool materialized_{false};
   bool materialize_failed_{false};
   bool pipelined_{false};
-  bool right_built_{false};
-  bool left_exhausted_{false};
-  std::vector<Row> right_storage_;
-  std::unordered_multimap<std::string, const Row*> right_buckets_;
-  Row current_left_;
-  RowPosition current_left_pos_;
-  std::unordered_multimap<std::string, const Row*>::const_iterator match_iter_;
-  std::unordered_multimap<std::string, const Row*>::const_iterator match_end_;
+  bool build_left_side_{false};
+  // The hybrid path keeps its fully materialized output (frozen spill spec).
   std::vector<std::pair<Row, RowPosition>> output_;
   size_t output_offset_{0};
   QueryMemoryCharge output_charge_;
+
+  std::unique_ptr<JoinState> state_;
 };
 
 }  // namespace tinylamb

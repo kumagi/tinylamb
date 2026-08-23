@@ -115,32 +115,39 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
   constexpr int kMaxInstallAttempts = 4;
   int attempts = 0;
   for (;;) {
-    // Fast hit path: shared lock + atomic pin. LRU Touch is best-effort.
+    // Fast hit path: stripe-local map + atomic pin. pool_latch is not
+    // touched at all; LRU Touch below stays best-effort.
+    Page* hit_page = nullptr;
+    std::shared_mutex* hit_page_latch = nullptr;
     {
-      std::shared_lock shared_latch(pool_latch);
-      auto entry = pool_.find(page_id);
-      if (entry != pool_.end()) {
-        entry->second->pin_count.fetch_add(1, std::memory_order_relaxed);
-        Page* const page = entry->second->page.get();
-        std::shared_mutex* const page_latch = entry->second->page_latch.get();
+      PoolShard& shard = shards_[ShardIndex(page_id)];
+      std::scoped_lock shard_latch(shard.mu);
+      if (auto entry = shard.map.find(page_id); entry != shard.map.end()) {
+        Entry& resident = *entry->second;
+        resident.pin_count.fetch_add(1, std::memory_order_relaxed);
+        hit_page = resident.page.get();
+        hit_page_latch = resident.page_latch.get();
         if (cache_hit != nullptr) {
           *cache_hit = true;
         }
-        shared_latch.unlock();
-        {
-          std::unique_lock touch_latch(pool_latch, std::try_to_lock);
-          if (touch_latch.owns_lock()) {
-            if (auto again = pool_.find(page_id); again != pool_.end()) {
-              Touch(again->second);
-            }
+      }
+    }
+    if (hit_page != nullptr) {
+      {
+        std::unique_lock touch_latch(pool_latch, std::try_to_lock);
+        if (touch_latch.owns_lock()) {
+          if (auto again = pool_.find(page_id); again != pool_.end()) {
+            Touch(again->second);
           }
         }
-        return {this, page, page_latch, shared};
       }
+      return {this, hit_page, hit_page_latch, shared};
     }
 
     std::unique_lock latch(pool_latch);
-    // Recheck under exclusive lock in case another thread installed the page.
+    // Recheck under exclusive lock: another thread may have installed the
+    // page, or eviction bookkeeping may have detached it from its stripe map
+    // only (see DetachVictim).
     if (auto entry = pool_.find(page_id); entry != pool_.end()) {
       entry->second->pin_count.fetch_add(1, std::memory_order_relaxed);
       Touch(entry->second);
@@ -163,7 +170,7 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
       flushing_.insert(victim_id);
       latch.unlock();
       try {
-        std::scoped_lock file(file_latch_);
+        std::scoped_lock io(io_latches_[ShardIndex(victim_id)].mu);
         WriteBack(victim.get());
       } catch (...) {
         latch.lock();
@@ -175,7 +182,11 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
         if (!pool_.contains(victim_id)) {
           pool_lru_.emplace_back(victim.release());
           pool_lru_.back().pin_count.store(0, std::memory_order_relaxed);
-          pool_.emplace(victim_id, std::prev(pool_lru_.end()));
+          const LruType::iterator restored = std::prev(pool_lru_.end());
+          pool_.emplace(victim_id, restored);
+          PoolShard& shard = shards_[ShardIndex(victim_id)];
+          std::scoped_lock shard_latch(shard.mu);
+          shard.map.emplace(victim_id, &*restored);
         } else {
           victim.reset();
         }
@@ -197,18 +208,17 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
     auto new_page_latch = std::make_unique<std::shared_mutex>();
     latch.unlock();
     // Ordering protocol against concurrent evictions: an evictor registers
-    // the victim in flushing_ (under pool_latch) BEFORE taking file_latch_ to
-    // pwrite it. By checking flushing_ only while holding file_latch_, a
-    // clear check means any racing write-back of this page id has already
-    // finished, or is serialized strictly after our ReadFrom below.
+    // the victim in flushing_ (under pool_latch) BEFORE taking this page
+    // id's IO latch to pwrite it. By checking flushing_ while holding the
+    // same IO latch as ReadFrom below, a clear check means any racing
+    // write-back of this page id has already finished, or is serialized
+    // strictly after our ReadFrom.
     for (;;) {
+      bool pending = false;
       {
-        std::scoped_lock file(file_latch_);
-        bool pending = false;
-        {
-          std::shared_lock check(pool_latch);
-          pending = flushing_.contains(page_id);
-        }
+        std::scoped_lock io(io_latches_[ShardIndex(page_id)].mu);
+        std::shared_lock check(pool_latch);
+        pending = flushing_.contains(page_id);
         if (!pending) {
           ReadFrom(new_page.get(), page_id, validate);
           break;
@@ -227,11 +237,34 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
       return {this, page, page_latch, shared};
     }
 
+    // A racing eviction may have detached this very page id after our read
+    // began: installing our stale on-disk image while that dirty write-back
+    // is still in flight would resurrect outdated contents (and surface
+    // wrong page types to callers). Never install under a pending flush;
+    // discard the load and retry once the write-back completes.
+    if (flushing_.contains(page_id)) {
+      latch.unlock();
+      std::this_thread::yield();
+      continue;
+    }
+
+    // Page-id verification: only an image that claims this very id may be
+    // installed, so a misdirected/torn load can never surface a foreign
+    // page (the "invalid page type" corruption class). The recovery path
+    // (validate=false) deliberately hands broken images back verbatim.
+    if (validate && new_page->PageID() != page_id) {
+      latch.unlock();
+      LOG(ERROR) << "loaded page image id mismatch: requested=" << page_id
+                 << " image=" << new_page->PageID() << " status="
+                 << Status::kCorrupt;
+      throw std::runtime_error("page id mismatch on load: page_id=" +
+                               std::to_string(page_id));
+    }
+
     // Capacity was last validated before the latch was released for I/O; a
     // concurrent miss may have filled the pool meanwhile. Discard this load
     // and retry so the eviction loop runs first.
-    if (pool_lru_.size() >= capacity_ &&
-        ++attempts < kMaxInstallAttempts) {
+    if (pool_lru_.size() >= capacity_ && ++attempts < kMaxInstallAttempts) {
       continue;
     }
 
@@ -239,7 +272,13 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
     std::shared_mutex* const raw_latch = new_page_latch.get();
     pool_lru_.emplace_back(raw_page);
     pool_lru_.back().page_latch = std::move(new_page_latch);
-    pool_.emplace(page_id, std::prev(pool_lru_.end()));
+    const LruType::iterator installed = std::prev(pool_lru_.end());
+    pool_.emplace(page_id, installed);
+    {
+      PoolShard& shard = shards_[ShardIndex(page_id)];
+      std::scoped_lock shard_latch(shard.mu);
+      shard.map.emplace(page_id, &*installed);
+    }
     latch.unlock();
     // Page content was loaded without holding page_latch, so the caller may
     // take a shared page latch when requested.
@@ -249,18 +288,16 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
 
 void PagePool::DropAllPages() {
   std::unique_lock latch(pool_latch);
-  // Entries still pinned by live PageRefs must outlive this call; splicing
-  // them into retired_ keeps their memory alive so a later PageRef
-  // destructor never dereferences a freed entry.
-  for (auto it = pool_lru_.begin(); it != pool_lru_.end();) {
-    if (0 < it->pin_count.load(std::memory_order_relaxed)) {
-      retired_.splice(retired_.end(), pool_lru_, it++);
-    } else {
-      ++it;
-    }
-  }
+  // Everything moves to retired_: pinned entries keep their live PageRefs
+  // working as before, and unpinned-but-referenced entries (a stripe-map hit
+  // between lookup and pin) can never dangle because their memory outlives
+  // the pool. Nothing here is written back, matching the contract.
+  retired_.splice(retired_.end(), pool_lru_);
   pool_.clear();
-  pool_lru_.clear();
+  for (PoolShard& shard : shards_) {
+    std::scoped_lock shard_latch(shard.mu);
+    shard.map.clear();
+  }
 }
 
 void PagePool::FlushPageForTest(page_id_t page_id) {
@@ -275,23 +312,41 @@ void PagePool::FlushPageForTest(page_id_t page_id) {
   }
   // The entry cannot be evicted while this thread's PageRef-free flush runs;
   // test-only callers hold no competing pins, so the raw pointer stays valid.
-  std::scoped_lock file(file_latch_);
+  std::scoped_lock io(io_latches_[ShardIndex(page_id)].mu);
   WriteBack(target);
 }
 
 void PagePool::Unpin(page_id_t page_id) {
-  // Fast path: the decrement happens outside the exclusive latch so parallel
-  // unpins and hit-path pins never serialize behind eviction bookkeeping.
+  // Fast path: resolve the entry via its stripe and decrement outside any
+  // pool-wide latch so parallel unpins and hit-path pins never serialize
+  // behind eviction bookkeeping.
+  {
+    PoolShard& shard = shards_[ShardIndex(page_id)];
+    std::scoped_lock shard_latch(shard.mu);
+    if (auto entry = shard.map.find(page_id); entry != shard.map.end()) {
+      ReleasePin(*entry->second, page_id);
+      return;
+    }
+  }
+  // Slow path: the entry is momentarily absent from its stripe map (mid
+  // eviction bookkeeping) or retired by DropAllPages; resolve it through the
+  // pool map instead. A pinned entry always remains in pool_ until its pins
+  // drop to zero, so a legitimate unpin never misses here silently.
   std::shared_lock latch(pool_latch);
   const auto entry = pool_.find(page_id);
   if (entry == pool_.end()) {
     return;  // Dropped or retired; nothing to release.
   }
-  uint32_t pins = entry->second->pin_count.load(std::memory_order_relaxed);
+  ReleasePin(*entry->second, page_id);
+}
+
+// Precondition: no latch requirement; operates on the entry atomically.
+void PagePool::ReleasePin(Entry& entry, page_id_t page_id) {
+  uint32_t pins = entry.pin_count.load(std::memory_order_relaxed);
   while (pins != 0) {
-    if (entry->second->pin_count.compare_exchange_weak(
-            pins, pins - 1, std::memory_order_release,
-            std::memory_order_relaxed)) {
+    if (entry.pin_count.compare_exchange_weak(pins, pins - 1,
+                                              std::memory_order_release,
+                                              std::memory_order_relaxed)) {
       return;
     }
   }
@@ -305,8 +360,27 @@ bool PagePool::DetachVictim(std::unique_ptr<Page>* victim) {
     if (0 < target->pin_count.load(std::memory_order_relaxed)) {
       continue;
     }
+    const uint64_t page_id = target->page->PageID();
+    PoolShard& shard = shards_[ShardIndex(page_id)];
+    bool confirmed = false;
+    {
+      // Remove from the stripe map first so no new pin can start, then
+      // recheck pin count under the same mutex: a racer that already loaded
+      // this entry must have completed its fetch_add inside that critical
+      // section, so a zero here means nobody can hold or obtain this entry
+      // anymore.
+      std::scoped_lock shard_latch(shard.mu);
+      shard.map.erase(page_id);
+      if (0 < target->pin_count.load(std::memory_order_relaxed)) {
+        shard.map.emplace(page_id, &*target);  // Still pinned; restore.
+      } else {
+        confirmed = true;
+      }
+    }
+    if (!confirmed) {
+      continue;
+    }
     *victim = std::move(target->page);
-    const uint64_t page_id = (*victim)->PageID();
     pool_lru_.erase(target);
     pool_.erase(page_id);
     return true;
@@ -317,11 +391,10 @@ bool PagePool::DetachVictim(std::unique_ptr<Page>* victim) {
 // Precondition: pool_latch is locked exclusively.
 void PagePool::Touch(LruType::iterator it) {
   assert(!pool_latch.try_lock());
-  Entry tmp(std::move(*it));
-  const page_id_t page_id = tmp.page->PageID();
-  pool_lru_.erase(it);
-  pool_lru_.push_back(std::move(tmp));
-  pool_[page_id] = std::prev(pool_lru_.end());
+  // Splice the node instead of moving the Entry value: list nodes (and with
+  // them the Entry addresses published in the stripe maps) stay stable.
+  pool_lru_.splice(pool_lru_.end(), pool_lru_, it);
+  pool_[it->page->PageID()] = it;
 }
 
 PagePool::~PagePool() {
@@ -347,8 +420,8 @@ PagePool::~PagePool() {
     retired_.clear();
   }
   try {
-    std::scoped_lock file(file_latch_);
     for (Page* page : dirty) {
+      std::scoped_lock io(io_latches_[ShardIndex(page->PageID())].mu);
       WriteBack(page);
     }
     if (fd_ >= 0) {

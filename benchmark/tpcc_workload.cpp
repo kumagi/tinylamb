@@ -935,10 +935,17 @@ TpccTransactionResult TpccWorkload::Delivery() {
     context.Abort();
     return result;
   };
-  std::vector<Row> rows;
-  std::ostringstream sql;
-  for (int district_id = 1; district_id <= scale_.districts_per_warehouse;
-       ++district_id) {
+  // A statement whose executor throws (partial apply, lock timeout) must
+  // still roll the transaction back: without an explicit Abort() the local
+  // context dies holding its write locks, its snapshot stays pinned in the
+  // manager, and its physical page/index mutations remain half-applied --
+  // which then poisons every later transaction with spurious conflicts.
+  // Roll back here and let the engine-abort accounting see the exception.
+  auto run = [&]() -> TpccTransactionResult {
+    std::vector<Row> rows;
+    std::ostringstream sql;
+    for (int district_id = 1; district_id <= scale_.districts_per_warehouse;
+         ++district_id) {
     rows.clear();
     sql.str("");
     sql << "SELECT no_o_id FROM new_order WHERE no_w_id = "
@@ -1015,11 +1022,25 @@ TpccTransactionResult TpccWorkload::Delivery() {
     result.amount += amount;
     ++result.delivered_orders;
   }
-  const Status commit = context.PreCommit();
-  result.committed = commit == Status::kSuccess;
-  if (!result.committed) { result.error = "delivery commit failed";
+    const Status commit = context.PreCommit();
+    result.committed = commit == Status::kSuccess;
+    if (!result.committed) { result.error = "delivery commit failed";
 }
-  return result;
+    return result;
+  };
+  try {
+    return run();
+  } catch (...) {
+    if (!context.IsFinished()) {
+      try {
+        context.Abort();
+      } catch (const std::exception&) {
+        // The undo path itself hit a broken WAL; the original error below
+        // is the one worth propagating.
+      }
+    }
+    throw;
+  }
 }
 
 TpccTransactionResult TpccWorkload::StockLevel() {

@@ -17,94 +17,424 @@
 #include "hash_join.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
-#include <functional>
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
+#include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/hash_join_mode.hpp"
-#include "executor/data_chunk.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/spill_file.hpp"
+#include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
-#include "page/row_position.hpp"
 
 namespace tinylamb {
 namespace {
 
-constexpr size_t kReactiveSpillPartitions = 16;
+using PositionedRow = std::pair<Row, RowPosition>;
 
-size_t ReactivePartitionOf(const std::string& key) {
-  return std::hash<std::string>{}(key) % kReactiveSpillPartitions;
+constexpr size_t kReactiveSpillPartitions = 16;
+constexpr size_t kHybridPartitions = 32;
+constexpr size_t kParallelBuildMinRows = 4096;
+constexpr size_t kParallelProbeMinRows = size_t{1} << 15;
+
+uint64_t BSwap64(uint64_t v) { return __builtin_bswap64(v); }
+
+uint64_t MixHash(uint64_t h) {
+  h *= 0x9E3779B97F4A7C15ULL;
+  h ^= h >> 32;
+  h *= 0xBF58476D1CE4E5B9ULL;
+  h ^= h >> 29;
+  return h;
 }
 
-// Encodes the join key columns; returns false when any component is NULL.
-// SQL semantics: NULL never compares equal to anything, so such rows cannot
-// match and must be skipped rather than memcomparable-encoded (encoding a
-// kNull Value throws).
-bool EncodeJoinKey(const Row& row, const std::vector<slot_t>& cols,
-                   std::string* out) {
-  const Row keys = row.Extract(cols);
-  for (const Value& value : keys.values_) {
+uint64_t HashInt64Key(int64_t key) {
+  return MixHash(static_cast<uint64_t>(key));
+}
+
+uint64_t HashBytesKey(std::string_view key) {
+  uint64_t h = 14695981039346656037ULL;
+  for (const char c : key) {
+    h ^= static_cast<unsigned char>(c);
+    h *= 1099511628211ULL;
+  }
+  return MixHash(h);
+}
+
+void AppendMemComparableValue(const Value& v, std::string* out) {
+  switch (v.type) {
+    case ValueType::kInt64:
+    case ValueType::kDate: {
+      out->push_back(static_cast<char>(v.type));
+      const uint64_t be = BSwap64(static_cast<uint64_t>(v.value.int_value));
+      char buf[8];
+      std::memcpy(buf, &be, sizeof(buf));
+      buf[0] ^= static_cast<char>(0x80);
+      out->append(buf, sizeof(buf));
+      break;
+    }
+    case ValueType::kVarChar: {
+      const std::string_view s(v.value.varchar_value.data(),
+                               v.value.varchar_value.size());
+      out->push_back(static_cast<char>(ValueType::kVarChar));
+      if (s.empty()) {
+        out->append(9, '\0');
+        break;
+      }
+      for (size_t i = 0;; i += 8) {
+        if (9 <= s.size() - i) {
+          out->append(s.substr(i, 8));
+          out->push_back('\x09');
+        } else {
+          const size_t tail = s.size() - i;
+          out->append(s.substr(i, tail));
+          out->append(8 - tail, '\0');
+          out->push_back(
+              static_cast<char>((s.size() % 8) + (s.size() % 8 == 0 ? 8 : 0)));
+          break;
+        }
+      }
+      break;
+    }
+    case ValueType::kDouble: {
+      out->push_back(static_cast<char>(ValueType::kDouble));
+      uint64_t bits = 0;
+      std::memcpy(&bits, &v.value.double_value, sizeof(bits));
+      uint64_t be = BSwap64(bits);
+      if (0 <= v.value.double_value) {
+        be |= 0x80;
+      } else {
+        be = ~be;
+      }
+      char buf[8];
+      std::memcpy(buf, &be, sizeof(buf));
+      out->append(buf, sizeof(buf));
+      break;
+    }
+    case ValueType::kNull:
+      throw std::runtime_error("Cannot encode unknown type.");
+  }
+}
+
+bool EncodeJoinKeyInto(const Row& row, const std::vector<slot_t>& cols,
+                       std::string* out) {
+  out->clear();
+  for (const slot_t col : cols) {
+    const Value& value = row[col];
     if (value.IsNull()) {
       return false;
     }
+    AppendMemComparableValue(value, out);
   }
-  *out = keys.EncodeMemcomparableFormat();
   return true;
 }
 
-void JoinPartition(
-    const std::vector<slot_t>& left_cols, const std::vector<slot_t>& right_cols,
-    const std::vector<std::pair<Row, RowPosition>>& left_rows,
-    const std::vector<Row>& right_rows,
-    std::vector<std::pair<Row, RowPosition>>* output) {
-  std::unordered_multimap<std::string, const Row*> buckets;
-  buckets.reserve(right_rows.size());
-  for (const Row& right_row : right_rows) {
-    std::string key;
-    if (!EncodeJoinKey(right_row, right_cols, &key)) { continue;
+struct KeyRef {
+  bool valid{false};
+  int64_t int_key{0};
+  std::string_view byte_key;
+  uint64_t hash{0};
+};
+
+KeyRef KeyOf(const Row& row, const std::vector<slot_t>& cols,
+             JoinHashIndex::KeyMode mode, ValueType int_mode_type,
+             std::string* scratch) {
+  if (mode == JoinHashIndex::KeyMode::kInt64) {
+    const Value& v = row[cols[0]];
+    if (v.IsNull() || v.type != int_mode_type) { return {};
 }
-    buckets.emplace(std::move(key), &right_row);
+    return {true, v.value.int_value, {}, HashInt64Key(v.value.int_value)};
   }
-  for (const auto& left : left_rows) {
-    std::string key;
-    if (!EncodeJoinKey(left.first, left_cols, &key)) { continue;
+  if (!EncodeJoinKeyInto(row, cols, scratch)) { return {};
 }
-    const auto [begin, end] = buckets.equal_range(key);
-    for (auto match = begin; match != end; ++match) {
-      output->emplace_back(left.first + *match->second, left.second);
-    }
-  }
+  return {true, 0, std::string_view(*scratch), HashBytesKey(*scratch)};
 }
 
-void ChargeOutput(std::vector<std::pair<Row, RowPosition>>* output,
-                  QueryMemoryCharge* output_charge) {
-  size_t output_bytes = 0;
-  for (const auto& out : *output) {
-    output_bytes += EstimateRowBytes(out.first);
+const Row& RowOf(const Row& row) { return row; }
+const Row& RowOf(const PositionedRow& positioned) { return positioned.first; }
+
+template <typename Container>
+std::optional<ValueType> UniformIntLikeType(const Container& rows,
+                                            const std::vector<slot_t>& cols) {
+  if (cols.size() != 1) { return std::nullopt;
+}
+  std::optional<ValueType> found;
+  for (const auto& item : rows) {
+    const Value& v = RowOf(item)[cols[0]];
+    if (v.IsNull()) { continue;
+}
+    if ((v.type != ValueType::kInt64 && v.type != ValueType::kDate) ||
+        (found && *found != v.type)) {
+      return std::nullopt;
+    }
+    found = v.type;
   }
-  *output_charge = QueryMemoryCharge(output_bytes);
+  return found;
+}
+
+struct SideIndex {
+  JoinHashIndex index;
+  JoinHashIndex::KeyMode mode = JoinHashIndex::KeyMode::kBytes;
+  ValueType int_type = ValueType::kInt64;
+};
+
+template <typename Container>
+SideIndex BuildSideIndex(const Container& rows,
+                         const std::vector<slot_t>& cols) {
+  SideIndex side;
+  if (auto uniform = UniformIntLikeType(rows, cols)) {
+    side.mode = JoinHashIndex::KeyMode::kInt64;
+    side.int_type = *uniform;
+  }
+  side.index.Init(side.mode, rows.size());
+  std::string scratch;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const KeyRef k =
+        KeyOf(RowOf(rows[i]), cols, side.mode, side.int_type, &scratch);
+    if (k.valid) {
+      side.index.Insert(k.hash, k.int_key, k.byte_key, i);
+    }
+  }
+  return side;
+}
+
+template <typename Container>
+size_t SumRowBytes(const Container& rows) {
+  size_t total = 0;
+  for (const auto& item : rows) {
+    total += EstimateRowBytes(RowOf(item));
+  }
+  return total;
 }
 
 }  // namespace
 
-HashJoin::HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
-                   std::vector<slot_t> right_cols, size_t worker_count)
+void JoinHashIndex::Init(KeyMode mode, size_t expected_entries) {
+  mode_ = mode;
+  entries_.clear();
+  arena_.clear();
+  slot_int_keys_.clear();
+  slot_byte_keys_.clear();
+  size_t slots = 16;
+  while (slots * 7 < expected_entries * 10) {
+    slots <<= 1;
+  }
+  slots_.assign(slots, kNil);
+  mask_ = slots - 1;
+  occupied_slots_ = 0;
+  entries_.reserve(expected_entries);
+}
+
+uint64_t JoinHashIndex::HashInt64(int64_t key) { return HashInt64Key(key); }
+
+uint64_t JoinHashIndex::HashBytes(std::string_view key) {
+  return HashBytesKey(key);
+}
+
+void JoinHashIndex::StoreSlotKey(size_t slot, int64_t int_key,
+                                 std::string_view byte_key) {
+  if (mode_ == KeyMode::kInt64) {
+    slot_int_keys_[slot] = int_key;
+    return;
+  }
+  const uint32_t off = static_cast<uint32_t>(arena_.size());
+  arena_.append(byte_key);
+  slot_byte_keys_[slot] = {off, static_cast<uint32_t>(byte_key.size())};
+}
+
+bool JoinHashIndex::SlotKeyEquals(size_t slot, int64_t int_key,
+                                  std::string_view byte_key) const {
+  if (mode_ == KeyMode::kInt64) {
+    return slot_int_keys_[slot] == int_key;
+  }
+  const auto& span = slot_byte_keys_[slot];
+  return std::string_view(arena_.data() + span.first, span.second) == byte_key;
+}
+
+void JoinHashIndex::Insert(uint64_t hash, int64_t int_key,
+                           std::string_view byte_key, size_t row_index) {
+  if (occupied_slots_ * 10 >= slots_.size() * 7) {
+    Grow();
+  }
+  size_t idx = hash & mask_;
+  for (;;) {
+    const size_t head = slots_[idx];
+    if (head == kNil) {
+      StoreSlotKey(idx, int_key, byte_key);
+      ++occupied_slots_;
+      slots_[idx] = entries_.size();
+      entries_.push_back(Entry{row_index, kNil});
+      return;
+    }
+    if (SlotKeyEquals(idx, int_key, byte_key)) {
+      entries_.push_back(Entry{row_index, slots_[idx]});
+      slots_[idx] = entries_.size() - 1;
+      return;
+    }
+    idx = (idx + 1) & mask_;
+  }
+}
+
+size_t JoinHashIndex::Find(uint64_t hash, int64_t int_key,
+                           std::string_view byte_key) const {
+  size_t idx = hash & mask_;
+  for (;;) {
+    const size_t head = slots_[idx];
+    if (head == kNil) { return kNil;
+}
+    if (SlotKeyEquals(idx, int_key, byte_key)) { return head;
+}
+    idx = (idx + 1) & mask_;
+  }
+}
+
+size_t JoinHashIndex::ChainNext(size_t entry) const {
+  return entries_[entry].next;
+}
+
+size_t JoinHashIndex::RowIndex(size_t entry) const {
+  return entries_[entry].row;
+}
+
+void JoinHashIndex::Grow() {
+  const size_t new_count = slots_.size() * 2;
+  const size_t new_mask = new_count - 1;
+  std::vector<size_t> new_slots(new_count, kNil);
+  std::vector<int64_t> new_int_keys;
+  std::vector<std::pair<uint32_t, uint32_t>> new_byte_keys;
+  if (mode_ == KeyMode::kInt64) {
+    new_int_keys.resize(new_count);
+  } else {
+    new_byte_keys.resize(new_count);
+  }
+  for (size_t old = 0; old <= mask_; ++old) {
+    if (slots_[old] == kNil) { continue;
+}
+    const uint64_t hash =
+        mode_ == KeyMode::kInt64
+            ? HashInt64Key(slot_int_keys_[old])
+            : HashBytesKey(std::string_view(
+                  arena_.data() + slot_byte_keys_[old].first,
+                  slot_byte_keys_[old].second));
+    size_t idx = hash & new_mask;
+    while (new_slots[idx] != kNil) { idx = (idx + 1) & new_mask;
+}
+    if (mode_ == KeyMode::kInt64) {
+      new_int_keys[idx] = slot_int_keys_[old];
+    } else {
+      new_byte_keys[idx] = slot_byte_keys_[old];
+    }
+    new_slots[idx] = slots_[old];
+  }
+  slots_ = std::move(new_slots);
+  slot_int_keys_ = std::move(new_int_keys);
+  slot_byte_keys_ = std::move(new_byte_keys);
+  mask_ = new_mask;
+}
+
+struct HashJoin::JoinState {
+  struct Side {
+    std::vector<PositionedRow> rows;
+    std::vector<SpillFile> spills;
+    QueryMemoryCharge charge;
+
+    [[nodiscard]] bool Spilled() const { return !spills.empty(); }
+
+    void Flush(const std::vector<slot_t>& cols) {
+      spills.resize(kReactiveSpillPartitions);
+      std::string key;
+      for (const PositionedRow& item : rows) {
+        if (!EncodeJoinKeyInto(item.first, cols, &key)) { continue;
+}
+        spills[HashBytesKey(key) % kReactiveSpillPartitions].Append(
+            item.first, item.second);
+      }
+      charge.ReleaseAll();
+      rows.clear();
+      rows.shrink_to_fit();
+    }
+  };
+
+  Side left;
+  Side right;
+  JoinHashIndex::KeyMode key_mode = JoinHashIndex::KeyMode::kBytes;
+  ValueType int_mode_type = ValueType::kInt64;
+
+  const std::vector<PositionedRow>* build_rows = nullptr;
+  const std::vector<slot_t>* build_cols = nullptr;
+  const std::vector<slot_t>* probe_cols = nullptr;
+  bool left_builds = false;
+
+  std::vector<JoinHashIndex> shards;
+  uint32_t shard_bits = 0;
+
+  const std::vector<PositionedRow>* probe_rows = nullptr;
+  std::vector<SpillFile>* probe_spills = nullptr;
+  size_t probe_cursor = 0;
+  size_t probe_index = 0;
+  size_t spill_partition = 0;
+  size_t spill_cursor = 0;
+  std::vector<PositionedRow> spill_cache;
+  bool have_probe_row = false;
+  size_t cur_shard = 0;
+  size_t cur_entry = JoinHashIndex::kNil;
+
+  std::vector<std::vector<PositionedRow>> stripe_outputs;
+  std::vector<std::vector<PositionedRow>> part_outputs;
+  size_t queue_index = 0;
+  size_t queue_offset = 0;
+
+  std::string scratch;
+
+  void Consume(ExecutorBase* child, const std::vector<slot_t>& cols,
+               Side* side) {
+    QueryMemoryBudget& budget = QueryMemoryBudget::Global();
+    std::string key;
+    Row row;
+    RowPosition position;
+    while (child->Next(&row, &position)) {
+      const size_t bytes = EstimateRowBytes(row);
+      if (!side->Spilled() && !budget.CanReserve(bytes)) {
+        side->Flush(cols);
+      }
+      if (side->Spilled()) {
+        if (!EncodeJoinKeyInto(row, cols, &key)) { continue;
+}
+        side->spills[HashBytesKey(key) % kReactiveSpillPartitions].Append(
+            row, position);
+      } else {
+        side->charge.Add(bytes);
+        side->rows.emplace_back(std::move(row), position);
+      }
+    }
+  }
+};
+
+HashJoin::HashJoin(Executor left, std::vector<slot_t> left_cols,
+                   Executor right, std::vector<slot_t> right_cols,
+                   size_t worker_count)
     : HashJoin(std::move(left), std::move(left_cols), std::move(right),
                std::move(right_cols), HashJoinMode::kInMemory, worker_count) {}
 
-HashJoin::HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
-                   std::vector<slot_t> right_cols, HashJoinMode mode,
-                   size_t worker_count)
+HashJoin::HashJoin(Executor left, std::vector<slot_t> left_cols,
+                   Executor right, std::vector<slot_t> right_cols,
+                   HashJoinMode mode, size_t worker_count)
     : left_(std::move(left)),
       left_cols_(std::move(left_cols)),
       right_(std::move(right)),
@@ -112,42 +442,10 @@ HashJoin::HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
       mode_(mode),
       worker_count_(std::max<size_t>(1, worker_count)) {}
 
-bool HashJoin::EmitNextMatch(Row* dst, RowPosition* rp) {
-  while (true) {
-    if (match_iter_ != match_end_) {
-      *dst = current_left_ + *match_iter_->second;
-      if (rp != nullptr) {
-        *rp = current_left_pos_;
-      }
-      ++match_iter_;
-      return true;
-    }
-    Row row;
-    RowPosition position;
-    bool have_probe_row = false;
-    std::string key;
-    while (left_->Next(&row, &position)) {
-      if (!EncodeJoinKey(row, left_cols_, &key)) { continue;  // NULL key never matches
-}
-      current_left_ = std::move(row);
-      current_left_pos_ = position;
-      have_probe_row = true;
-      break;
-    }
-    if (!have_probe_row) {
-      left_exhausted_ = true;
-      return false;
-    }
-    const auto [begin, end] = right_buckets_.equal_range(key);
-    match_iter_ = begin;
-    match_end_ = end;
-  }
-}
+HashJoin::~HashJoin() = default;
 
 void HashJoin::MaterializeOrThrow() {
   if (materialize_failed_) {
-    // A previous attempt threw midway; children are partially consumed and
-    // retrying would corrupt results.
     throw std::runtime_error("hash join materialization previously failed");
   }
   try {
@@ -181,9 +479,9 @@ size_t HashJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   if (!materialized_) {
     MaterializeOrThrow();
   }
+  Row row;
+  RowPosition position;
   if (pipelined_) {
-    Row row;
-    RowPosition position;
     while (destination->Size() < max_rows && EmitNextMatch(&row, &position)) {
       destination->Append(row, position);
     }
@@ -199,119 +497,422 @@ size_t HashJoin::NextBatch(DataChunk* destination, size_t max_rows) {
 }
 
 void HashJoin::Materialize() {
-  // Never resume from a partially filled output of a failed attempt; a retry
-  // must start from an empty output or it would emit duplicate rows.
   output_.clear();
   output_offset_ = 0;
   if (mode_ == HashJoinMode::kHybrid) {
     MaterializeHybrid();
+    pipelined_ = false;
   } else {
     MaterializeInMemory();
+    pipelined_ = true;
   }
+  materialized_ = true;
+}
+
+void HashJoin::IntakeBothSides() {
+  JoinState& s = *state_;
+  std::exception_ptr left_error;
+  std::exception_ptr right_error;
+  std::jthread left_thread([&] {
+    try {
+      s.Consume(left_.get(), left_cols_, &s.left);
+    } catch (...) {
+      left_error = std::current_exception();
+    }
+  });
+  try {
+    s.Consume(right_.get(), right_cols_, &s.right);
+  } catch (...) {
+    right_error = std::current_exception();
+  }
+  left_thread.join();
+  if (left_error) { std::rethrow_exception(left_error);
+}
+  if (right_error) { std::rethrow_exception(right_error);
+}
+}
+
+void HashJoin::BuildShards() {
+  JoinState& s = *state_;
+  const std::vector<PositionedRow>& rows = *s.build_rows;
+  const std::vector<slot_t>& cols = *s.build_cols;
+  if (auto uniform = UniformIntLikeType(rows, cols)) {
+    s.key_mode = JoinHashIndex::KeyMode::kInt64;
+    s.int_mode_type = *uniform;
+  } else {
+    s.key_mode = JoinHashIndex::KeyMode::kBytes;
+  }
+
+  const bool parallel_build =
+      worker_count_ > 1 && rows.size() >= kParallelBuildMinRows;
+  uint32_t bits = 0;
+  if (parallel_build) {
+    const size_t want = std::min(worker_count_, size_t{8});
+    while ((size_t{1} << bits) < want) { ++bits;
+}
+  }
+  s.shard_bits = bits;
+  const size_t shard_count = size_t{1} << bits;
+
+  const auto shard_of = [bits](uint64_t hash) -> size_t {
+    return bits == 0 ? 0 : static_cast<size_t>(hash >> (64 - bits));
+  };
+
+  std::vector<uint64_t> hashes(rows.size());
+  std::vector<size_t> counts(shard_count + 1, 0);
+  std::string scratch;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const KeyRef k =
+        KeyOf(rows[i].first, cols, s.key_mode, s.int_mode_type, &scratch);
+    hashes[i] = k.hash;
+    ++counts[shard_of(hashes[i]) + 1];
+  }
+  for (size_t i = 0; i < shard_count; ++i) { counts[i + 1] += counts[i];
+}
+  std::vector<size_t> sizes(shard_count, 0);
+  for (size_t i = 0; i < rows.size(); ++i) { ++sizes[shard_of(hashes[i])];
+}
+  std::vector<size_t> ordered(rows.size());
+  {
+    std::vector<size_t> cursor(counts.begin(), counts.end() - 1);
+    for (size_t i = 0; i < rows.size(); ++i) {
+      ordered[cursor[shard_of(hashes[i])]++] = i;
+    }
+  }
+
+  s.shards.resize(shard_count);
+  for (size_t k = 0; k < shard_count; ++k) {
+    s.shards[k].Init(s.key_mode, sizes[k]);
+  }
+
+  const auto fill_range = [&](size_t begin, size_t end) {
+    std::string local_scratch;
+    for (size_t pos = begin; pos < end; ++pos) {
+      const size_t i = ordered[pos];
+      const KeyRef k = KeyOf(rows[i].first, cols, s.key_mode, s.int_mode_type,
+                             &local_scratch);
+      s.shards[shard_of(k.hash)].Insert(k.hash, k.int_key, k.byte_key, i);
+    }
+  };
+
+  if (!parallel_build || shard_count == 1) {
+    fill_range(0, ordered.size());
+    return;
+  }
+  std::exception_ptr error;
+  std::mutex error_mutex;
+  std::vector<std::jthread> threads;
+  threads.reserve(shard_count);
+  for (size_t k = 0; k < shard_count; ++k) {
+    const size_t begin = counts[k];
+    const size_t end =
+        k + 1 < shard_count ? counts[k + 1] : ordered.size();
+    threads.emplace_back([&, begin, end] {
+      try {
+        fill_range(begin, end);
+      } catch (...) {
+        std::scoped_lock lock(error_mutex);
+        if (!error) { error = std::current_exception();
+}
+      }
+    });
+  }
+  threads.clear();
+  if (error) { std::rethrow_exception(error);
+}
+}
+
+uint32_t HashJoin::ShardOf(uint64_t hash) const {
+  if (state_->shard_bits == 0) { return 0;
+}
+  return static_cast<uint32_t>(hash >> (64 - state_->shard_bits));
+}
+
+bool HashJoin::FetchNextProbe() {
+  JoinState& s = *state_;
+  if (s.probe_spills != nullptr) {
+    while (s.spill_cursor >= s.spill_cache.size()) {
+      if (s.spill_partition >= s.probe_spills->size()) {
+        s.have_probe_row = false;
+        return false;
+      }
+      s.spill_cache = (*s.probe_spills)[s.spill_partition++].ReadAllPositioned();
+      s.spill_cursor = 0;
+    }
+    s.probe_index = s.spill_cursor++;
+    s.have_probe_row = true;
+    return true;
+  }
+  if (s.probe_cursor >= s.probe_rows->size()) {
+    s.have_probe_row = false;
+    return false;
+  }
+  s.probe_index = s.probe_cursor++;
+  s.have_probe_row = true;
+  return true;
+}
+
+void HashJoin::SetupInMemoryJoin() {
+  JoinState& s = *state_;
+  s.left_builds =
+      SumRowBytes(s.left.rows) < SumRowBytes(s.right.rows);
+  build_left_side_ = s.left_builds;
+  if (s.left_builds) {
+    s.build_rows = &s.left.rows;
+    BuildShards();
+    s.probe_rows = &s.right.rows;
+    s.probe_cols = &right_cols_;
+  } else {
+    s.build_rows = &s.right.rows;
+    BuildShards();
+    s.probe_rows = &s.left.rows;
+    s.probe_cols = &left_cols_;
+  }
+  s.left.charge.ReleaseAll();
+  s.right.charge.ReleaseAll();
+  if (worker_count_ > 1 && s.probe_rows->size() >= kParallelProbeMinRows) {
+    RunStripedProbe();
+  }
+}
+
+void HashJoin::SetupOneSideSpilled() {
+  JoinState& s = *state_;
+  s.left_builds = !s.left.Spilled();
+  build_left_side_ = s.left_builds;
+  if (s.left_builds) {
+    s.build_rows = &s.left.rows;
+    BuildShards();
+    s.probe_spills = &s.right.spills;
+    s.probe_cols = &right_cols_;
+  } else {
+    s.build_rows = &s.right.rows;
+    BuildShards();
+    s.probe_spills = &s.left.spills;
+    s.probe_cols = &left_cols_;
+  }
+  s.left.charge.ReleaseAll();
+  s.right.charge.ReleaseAll();
+}
+
+void HashJoin::JoinPartitionPair(const std::vector<PositionedRow>& left_part,
+                                 const std::vector<Row>& right_part,
+                                 std::vector<PositionedRow>* out) {
+  if (left_part.empty() || right_part.empty()) { return;
+}
+  const bool left_builds =
+      SumRowBytes(left_part) < SumRowBytes(right_part);
+  const SideIndex build =
+      left_builds ? BuildSideIndex(left_part, left_cols_)
+                  : BuildSideIndex(right_part, right_cols_);
+  const std::vector<slot_t>& probe_cols = left_builds ? right_cols_ : left_cols_;
+  std::string scratch;
+  if (left_builds) {
+    for (const Row& probe_row : right_part) {
+      const KeyRef k = KeyOf(probe_row, probe_cols, build.mode, build.int_type,
+                             &scratch);
+      if (!k.valid) { continue;
+}
+      for (size_t e = build.index.Find(k.hash, k.int_key, k.byte_key);
+           e != JoinHashIndex::kNil; e = build.index.ChainNext(e)) {
+        const PositionedRow& b = left_part[build.index.RowIndex(e)];
+        out->emplace_back(b.first + probe_row, b.second);
+      }
+    }
+  } else {
+    for (const PositionedRow& probe : left_part) {
+      const KeyRef k = KeyOf(probe.first, probe_cols, build.mode,
+                             build.int_type, &scratch);
+      if (!k.valid) { continue;
+}
+      for (size_t e = build.index.Find(k.hash, k.int_key, k.byte_key);
+           e != JoinHashIndex::kNil; e = build.index.ChainNext(e)) {
+        out->emplace_back(probe.first + right_part[build.index.RowIndex(e)],
+                          probe.second);
+      }
+    }
+  }
+}
+
+void HashJoin::SetupBothSpilled() {
+  JoinState& s = *state_;
+  s.part_outputs.assign(kReactiveSpillPartitions, {});
+  const size_t workers =
+      std::min(worker_count_, kReactiveSpillPartitions);
+  std::atomic<size_t> next_partition{0};
+  std::exception_ptr error;
+  std::mutex error_mutex;
+  std::vector<std::jthread> threads;
+  threads.reserve(workers);
+  for (size_t worker = 0; worker < workers; ++worker) {
+    threads.emplace_back([&] {
+      try {
+        for (;;) {
+          const size_t p = next_partition.fetch_add(1);
+          if (p >= kReactiveSpillPartitions) { break;
+}
+          auto left_part = s.left.spills[p].ReadAllPositioned();
+          auto right_part = s.right.spills[p].ReadAllRows();
+          JoinPartitionPair(left_part, right_part, &s.part_outputs[p]);
+        }
+      } catch (...) {
+        std::scoped_lock lock(error_mutex);
+        if (!error) { error = std::current_exception();
+}
+      }
+    });
+  }
+  threads.clear();
+  if (error) { std::rethrow_exception(error); }
+  size_t output_bytes = 0;
+  for (const auto& part : s.part_outputs) {
+    for (const auto& item : part) {
+      output_bytes += EstimateRowBytes(item.first);
+    }
+  }
+  output_charge_.Add(output_bytes);
+}
+
+void HashJoin::RunStripedProbe() {
+  JoinState& s = *state_;
+  const size_t n = s.probe_rows->size();
+  const size_t workers = std::min(worker_count_, n);
+  const size_t chunk = (n + workers - 1) / workers;
+  std::vector<std::vector<PositionedRow>> outs(workers);
+  std::exception_ptr error;
+  std::mutex error_mutex;
+  std::vector<std::jthread> threads;
+  threads.reserve(workers);
+  for (size_t worker = 0; worker < workers; ++worker) {
+    const size_t begin = worker * chunk;
+    const size_t end = std::min(n, begin + chunk);
+    if (begin >= end) { break;
+}
+    threads.emplace_back([&, begin, end] {
+      try {
+        std::string scratch;
+        for (size_t i = begin; i < end; ++i) {
+          const PositionedRow& probe = (*s.probe_rows)[i];
+          const KeyRef k = KeyOf(probe.first, *s.probe_cols, s.key_mode,
+                                 s.int_mode_type, &scratch);
+          if (!k.valid) { continue;
+}
+          const size_t shard =
+              s.shard_bits == 0 ? 0 : k.hash >> (64 - s.shard_bits);
+          const JoinHashIndex& table = s.shards[shard];
+          for (size_t e = table.Find(k.hash, k.int_key, k.byte_key);
+               e != JoinHashIndex::kNil; e = table.ChainNext(e)) {
+            const PositionedRow& b = (*s.build_rows)[table.RowIndex(e)];
+            if (s.left_builds) {
+              outs[worker].emplace_back(b.first + probe.first, b.second);
+            } else {
+              outs[worker].emplace_back(probe.first + b.first, probe.second);
+            }
+          }
+        }
+      } catch (...) {
+        std::scoped_lock lock(error_mutex);
+        if (!error) { error = std::current_exception();
+}
+      }
+    });
+  }
+  threads.clear();
+  if (error) { std::rethrow_exception(error); }
+  size_t output_bytes = 0;
+  for (const auto& stripe : outs) {
+    for (const auto& item : stripe) {
+      output_bytes += EstimateRowBytes(item.first);
+    }
+  }
+  output_charge_.Add(output_bytes);
+  s.stripe_outputs = std::move(outs);
 }
 
 void HashJoin::MaterializeInMemory() {
-  QueryMemoryBudget& budget = QueryMemoryBudget::Global();
-  QueryMemoryCharge charge;
-
-  std::vector<Row> right_rows;
-  std::vector<SpillFile> right_spill(kReactiveSpillPartitions);
-  bool spilled = false;
-  std::string key;
-
-  Row row;
-  while (right_->Next(&row, nullptr)) {
-    const size_t bytes = EstimateRowBytes(row);
-    if (!spilled && !budget.CanReserve(bytes)) {
-      spilled = true;
-      for (const Row& existing : right_rows) {
-        if (!EncodeJoinKey(existing, right_cols_, &key)) { continue;
+  state_ = std::make_unique<JoinState>();
+  IntakeBothSides();
+  JoinState& s = *state_;
+  const bool left_spilled = s.left.Spilled();
+  const bool right_spilled = s.right.Spilled();
+  if (left_spilled && right_spilled) {
+    SetupBothSpilled();
+  } else if (left_spilled || right_spilled) {
+    SetupOneSideSpilled();
+  } else {
+    SetupInMemoryJoin();
+  }
 }
-        right_spill[ReactivePartitionOf(key)].Append(existing);
+
+bool HashJoin::EmitNextMatch(Row* dst, RowPosition* rp) {
+  JoinState& s = *state_;
+  if (!s.stripe_outputs.empty() || !s.part_outputs.empty()) {
+    auto& queues =
+        s.stripe_outputs.empty() ? s.part_outputs : s.stripe_outputs;
+    while (s.queue_index < queues.size()) {
+      auto& queue = queues[s.queue_index];
+      if (s.queue_offset < queue.size()) {
+        PositionedRow& item = queue[s.queue_offset++];
+        *dst = std::move(item.first);
+        if (rp != nullptr) { *rp = item.second;
+}
+        return true;
       }
-      charge.ReleaseAll();
-      right_rows.clear();
-      right_rows.shrink_to_fit();
+      ++s.queue_index;
+      s.queue_offset = 0;
     }
-    if (spilled) {
-      if (!EncodeJoinKey(row, right_cols_, &key)) { continue;
-}
-      right_spill[ReactivePartitionOf(key)].Append(row);
-    } else {
-      charge.Add(bytes);
-      right_rows.push_back(std::move(row));
-    }
+    return false;
   }
 
-  if (!spilled) {
-    // Build side fit in memory: keep it resident and probe pipelined.
-    right_storage_ = std::move(right_rows);
-    right_buckets_.reserve(right_storage_.size());
-    for (const Row& stored : right_storage_) {
-      if (!EncodeJoinKey(stored, right_cols_, &key)) { continue;
+  while (true) {
+    if (s.have_probe_row && s.cur_entry != JoinHashIndex::kNil) {
+      const PositionedRow& probe = s.probe_spills != nullptr
+                                       ? s.spill_cache[s.probe_index]
+                                       : (*s.probe_rows)[s.probe_index];
+      const PositionedRow& b =
+          (*s.build_rows)[s.shards[s.cur_shard].RowIndex(s.cur_entry)];
+      if (s.left_builds) {
+        *dst = b.first + probe.first;
+        if (rp != nullptr) { *rp = b.second;
 }
-      right_buckets_.emplace(key, &stored);
-    }
-    pipelined_ = true;
-    materialized_ = true;
-    charge.ReleaseAll();
-    return;
-  }
-
-  // Spilled build side: partition the probe side symmetrically and join each
-  // partition pair from disk. (The former in-memory / parallel-partition
-  // branches here were unreachable: `spilled` is always true past the early
-  // return above, so they were removed rather than revived — reviving them
-  // without flushing the in-memory probe rows would lose data.)
-  std::vector<SpillFile> left_spill(kReactiveSpillPartitions);
-  RowPosition position;
-  while (left_->Next(&row, &position)) {
-    if (!EncodeJoinKey(row, left_cols_, &key)) { continue;
+      } else {
+        *dst = probe.first + b.first;
+        if (rp != nullptr) { *rp = probe.second;
 }
-    left_spill[ReactivePartitionOf(key)].Append(row, position);
-  }
-  for (size_t i = 0; i < kReactiveSpillPartitions; ++i) {
-    left_spill[i].FinishWriting();
-    right_spill[i].FinishWriting();
-  }
-  for (size_t i = 0; i < kReactiveSpillPartitions; ++i) {
-    auto left_part = left_spill[i].ReadAllPositioned();
-    auto right_part = right_spill[i].ReadAllRows();
-    QueryMemoryCharge part_charge;
-    for (const auto& left : left_part) {
-      part_charge.Add(EstimateRowBytes(left.first));
+      }
+      s.cur_entry = s.shards[s.cur_shard].ChainNext(s.cur_entry);
+      return true;
     }
-    for (const Row& right : right_part) {
-      part_charge.Add(EstimateRowBytes(right));
-    }
-    JoinPartition(left_cols_, right_cols_, left_part, right_part, &output_);
+    if (!FetchNextProbe()) { return false;
+}
+    const PositionedRow& probe = s.probe_spills != nullptr
+                                     ? s.spill_cache[s.probe_index]
+                                     : (*s.probe_rows)[s.probe_index];
+    const KeyRef k = KeyOf(probe.first, *s.probe_cols, s.key_mode,
+                           s.int_mode_type, &s.scratch);
+    if (!k.valid) { continue;
+}
+    s.cur_shard = ShardOf(k.hash);
+    s.cur_entry = s.shards[s.cur_shard].Find(k.hash, k.int_key, k.byte_key);
   }
-
-  charge.ReleaseAll();
-  ChargeOutput(&output_, &output_charge_);
-  materialized_ = true;
 }
 
 void HashJoin::MaterializeHybrid() {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
 
-  // First pass estimate: stream right into spills with a provisional partition
-  // count, keeping partition 0 resident when it fits.
-  constexpr size_t kPartitions = 32;
-  const auto partition_of = [](const std::string& key) {
-    return std::hash<std::string>{}(key) % kPartitions;
+  const auto partition_of = [](std::string_view key) {
+    return HashBytesKey(key) % kHybridPartitions;
   };
 
   std::vector<Row> resident_right;
   QueryMemoryCharge resident_charge;
-  std::vector<SpillFile> right_spill(kPartitions);
-  std::vector<SpillFile> left_spill(kPartitions);
+  std::vector<SpillFile> right_spill(kHybridPartitions);
+  std::vector<SpillFile> left_spill(kHybridPartitions);
   std::string key;
 
   Row row;
   RowPosition position;
   while (right_->Next(&row, nullptr)) {
-    if (!EncodeJoinKey(row, right_cols_, &key)) { continue;
+    if (!EncodeJoinKeyInto(row, right_cols_, &key)) { continue;
 }
     const size_t part = partition_of(key);
     const size_t bytes = EstimateRowBytes(row);
@@ -323,35 +924,30 @@ void HashJoin::MaterializeHybrid() {
     }
   }
 
-  std::unordered_multimap<std::string, const Row*> buckets;
-  buckets.reserve(resident_right.size());
-  for (const Row& right_row : resident_right) {
-    if (!EncodeJoinKey(right_row, right_cols_, &key)) { continue;
-}
-    buckets.emplace(key, &right_row);
-  }
+  const SideIndex resident = BuildSideIndex(resident_right, right_cols_);
+  std::string probe_scratch;
 
   while (left_->Next(&row, &position)) {
-    if (!EncodeJoinKey(row, left_cols_, &key)) { continue;  // NULL key never matches
+    if (!EncodeJoinKeyInto(row, left_cols_, &key)) { continue;
 }
     const size_t part = partition_of(key);
     if (part == 0 && right_spill[0].Empty()) {
-      // Pure resident partition: probe immediately.
-      const auto [begin, end] = buckets.equal_range(key);
-      for (auto match = begin; match != end; ++match) {
-        output_.emplace_back(row + *match->second, position);
+      const KeyRef k =
+          KeyOf(row, left_cols_, resident.mode, resident.int_type, &probe_scratch);
+      if (k.valid) {
+        for (size_t e = resident.index.Find(k.hash, k.int_key, k.byte_key);
+             e != JoinHashIndex::kNil; e = resident.index.ChainNext(e)) {
+          output_.emplace_back(row + resident_right[resident.index.RowIndex(e)],
+                               position);
+        }
       }
     } else {
-      // Non-resident partitions, or resident partition with overflow build
-      // rows (join resident+overflow together after the probe scan).
       left_spill[part].Append(row, position);
     }
   }
 
-  buckets.clear();
   if (!right_spill[0].Empty()) {
-    // Fold the resident build into partition 0's spilled join.
-    for (Row& right_row : resident_right) {
+    for (const Row& right_row : resident_right) {
       right_spill[0].Append(right_row);
     }
   }
@@ -359,29 +955,24 @@ void HashJoin::MaterializeHybrid() {
   resident_right.shrink_to_fit();
   resident_charge.ReleaseAll();
 
-  for (size_t i = 0; i < kPartitions; ++i) {
+  for (size_t i = 0; i < kHybridPartitions; ++i) {
     left_spill[i].FinishWriting();
     right_spill[i].FinishWriting();
   }
 
-  for (size_t i = 0; i < kPartitions; ++i) {
-    if (left_spill[i].Empty() && right_spill[i].Empty()) {
-      continue;
-    }
+  for (size_t i = 0; i < kHybridPartitions; ++i) {
+    if (left_spill[i].Empty() && right_spill[i].Empty()) { continue;
+}
     auto left_part = left_spill[i].ReadAllPositioned();
     auto right_part = right_spill[i].ReadAllRows();
-    QueryMemoryCharge part_charge;
-    for (const auto& left : left_part) {
-      part_charge.Add(EstimateRowBytes(left.first));
-    }
-    for (const Row& right : right_part) {
-      part_charge.Add(EstimateRowBytes(right));
-    }
-    JoinPartition(left_cols_, right_cols_, left_part, right_part, &output_);
+    JoinPartitionPair(left_part, right_part, &output_);
   }
 
-  ChargeOutput(&output_, &output_charge_);
-  materialized_ = true;
+  size_t output_bytes = 0;
+  for (const auto& item : output_) {
+    output_bytes += EstimateRowBytes(item.first);
+  }
+  output_charge_.Add(output_bytes);
 }
 
 void HashJoin::Dump(std::ostream& o, int indent) const {
@@ -406,8 +997,9 @@ void HashJoin::Dump(std::ostream& o, int indent) const {
       << "\n"
       << Indent(indent + 2);
   } else if (pipelined_) {
-    o << "PartitionedHashJoin (pipelined, " << worker_count_ << " workers): "
-      << ss.str() << "\n"
+    o << "PartitionedHashJoin (pipelined, " << worker_count_
+      << " workers, build:" << (build_left_side_ ? "left" : "right")
+      << "): " << ss.str() << "\n"
       << Indent(indent + 2);
   } else {
     o << "PartitionedHashJoin (" << worker_count_ << " workers): " << ss.str()

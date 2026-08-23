@@ -10,7 +10,7 @@
 #include <vector>
 
 #include "executor/detail/relation.hpp"
-#include "parser/ast.hpp"
+#include "query/statement.hpp"
 #include "type/column_name.hpp"
 #include "type/value.hpp"
 

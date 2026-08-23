@@ -29,6 +29,7 @@
 #include <ranges>
 #include <string>
 #include <optional>
+#include <set>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -45,6 +46,41 @@
 
 namespace tinylamb {
 
+TransactionManager::~TransactionManager() {
+  gc_stop_.store(true, std::memory_order_release);
+  {
+    std::scoped_lock wake(gc_mutex_);
+  }
+  gc_cv_.notify_all();
+  if (gc_worker_.joinable()) {
+    gc_worker_.join();
+  }
+}
+
+void TransactionManager::StartGcWorker() {
+  gc_worker_ = std::thread([this] { GcWorkerLoop(); });
+}
+
+void TransactionManager::GcWorkerLoop() {
+  constexpr auto kGcPollInterval = std::chrono::milliseconds(10);
+  while (!gc_stop_.load(std::memory_order_acquire)) {
+    std::unique_lock<std::mutex> lk(gc_mutex_);
+    gc_cv_.wait_for(lk, kGcPollInterval, [&] {
+      return gc_stop_.load(std::memory_order_acquire) ||
+             commits_since_gc_.load(std::memory_order_relaxed) >=
+                 kGcCommitThreshold;
+    });
+    if (gc_stop_.load(std::memory_order_acquire)) { break;
+}
+    lk.unlock();
+    // Nothing to do when no commit accumulated since the last pass.
+    if (commits_since_gc_.exchange(0, std::memory_order_relaxed) == 0) {
+      continue;
+    }
+    GarbageCollectVersions();
+  }
+}
+
 Transaction TransactionManager::Begin(bool read_only) {
   txn_id_t new_txn_id = next_txn_id_.fetch_add(1);
   Transaction new_txn(new_txn_id, this, read_only);
@@ -54,9 +90,12 @@ Transaction TransactionManager::Begin(bool read_only) {
   }
   {
     std::scoped_lock lk(transaction_table_lock);
-    // Snapshot acquisition and registration must be atomic with respect to
-    // commit-timestamp publication in CommitVersions (same lock).
-    new_txn.snapshot_ts_ = commit_timestamp_.load();
+    // The snapshot must be taken under the registry lock so a concurrent
+    // GarbageCollectVersions (which computes the oldest active snapshot
+    // under the same lock) can never trim versions this snapshot still
+    // needs.  Reading stable_timestamp_ keeps Begin off the shard locks and
+    // off the commit publication path entirely.
+    new_txn.snapshot_ts_ = stable_timestamp_.load(std::memory_order_acquire);
     active_transactions_.emplace(new_txn_id, &new_txn);
     active_snapshots_.emplace(new_txn_id, new_txn.snapshot_ts_);
   }
@@ -109,15 +148,17 @@ void TransactionManager::Abort(Transaction& txn) {
   // The undo walk holds every write lock, so contenders must not spuriously
   // time out while this transaction flushes its tail or replays undo.
   LockManager::DurabilityWaitGuard floor_guard(*lock_manager_);
-  // Iterate prev_lsn to beginning of the transaction with undoing.
+  // Wait on the logger's durability condition variable instead of polling:
+  // the worker wakes every waiter once records are fsynced, and a dead
+  // logger (Failed()) also releases the wait.  A failure falls through to
+  // the abort-log write below, which surfaces it.
   {
     const uint64_t latest_log = txn.prev_lsn_;
-    while (CommittedLSN() <= latest_log) {
-      // A dead logger never advances CommittedLSN; fall through and let the
-      // abort-log write below surface the failure instead of spinning.
-      if (logger_->Failed()) { break;
-}
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    try {
+      logger_->WaitForDurable(latest_log);
+    } catch (const std::exception&) {
+      // Fall through; the undo replay reads what was flushed and the abort
+      // log write reports the broken WAL.
     }
   }
   lsn_t prev = txn.prev_lsn_;
@@ -211,13 +252,42 @@ bool TransactionManager::RequiresHistoricalRead(const Transaction& txn) const {
   return IndexKeysMayBeStale(txn);
 }
 
+void TransactionManager::RegisterPendingCommit(uint64_t ts) {
+  std::scoped_lock lk(pending_commits_mutex_);
+  unpublished_commits_.insert(ts);
+}
+
+void TransactionManager::PublishCommit(uint64_t ts) {
+  uint64_t next_stable = ts;
+  {
+    std::scoped_lock lk(pending_commits_mutex_);
+    unpublished_commits_.erase(ts);
+    // Only advance to the smallest still-unpublished timestamp - 1: a
+    // snapshot at or below it is guaranteed to see every version with
+    // begin_ts <= it, because those publications completed before this
+    // store (release) and Begin() reads stable_timestamp_ with acquire.
+    next_stable =
+        unpublished_commits_.empty()
+            ? commit_timestamp_.load(std::memory_order_relaxed)
+            : *unpublished_commits_.begin() - 1;
+  }
+  const uint64_t current = stable_timestamp_.load(std::memory_order_relaxed);
+  if (current < next_stable) {
+    stable_timestamp_.store(next_stable, std::memory_order_release);
+  }
+}
+
 void TransactionManager::CommitVersions(Transaction& txn) {
-  // Publish a commit timestamp and all of its row versions atomically with
-  // snapshot acquisition in Begin() (transaction_table_lock).
+  // Publish row versions under shard locks alone; only the timestamp itself
+  // comes from an atomic fetch_add.  A concurrent Begin() takes its snapshot
+  // from stable_timestamp_, which lags commit_timestamp_ until this
+  // publication completes, so no global lock serializes commits anymore.
   std::array<bool, kVersionShardCount> needed{};
   for (const RowPosition& rp : txn.write_set_) {
     needed[VersionShardIndex(rp)] = true;
   }
+  const uint64_t commit_ts = commit_timestamp_.fetch_add(1) + 1;
+  RegisterPendingCommit(commit_ts);
   std::vector<std::unique_lock<std::mutex>> shard_locks;
   shard_locks.reserve(kVersionShardCount);
   for (size_t i = 0; i < kVersionShardCount; ++i) {
@@ -225,12 +295,6 @@ void TransactionManager::CommitVersions(Transaction& txn) {
       shard_locks.emplace_back(version_shards_[i].mutex);
     }
   }
-  std::scoped_lock transaction_guard(transaction_table_lock);
-  const uint64_t commit_ts = commit_timestamp_.fetch_add(1) + 1;
-  max_committed_begin_ts_.store(
-      std::max(max_committed_begin_ts_.load(std::memory_order_relaxed),
-               commit_ts),
-      std::memory_order_release);
   for (const RowPosition& rp : txn.write_set_) {
     VersionShard& shard = version_shards_[VersionShardIndex(rp)];
     const auto found = shard.versions.find(rp);
@@ -247,6 +311,16 @@ void TransactionManager::CommitVersions(Transaction& txn) {
                                std::move(chain.pending->value)});
     chain.pending.reset();
   }
+  shard_locks.clear();
+  max_committed_begin_ts_.store(
+      std::max(max_committed_begin_ts_.load(std::memory_order_relaxed),
+               commit_ts),
+      std::memory_order_release);
+  // From here on every snapshot >= commit_ts observes this publication.  If
+  // the (allocation-free in practice) publication above ever throws,
+  // commit_ts stays registered as unpublished: correct (snapshots stall at
+  // the previous stable point), just conservatively slow.
+  PublishCommit(commit_ts);
   if (!txn.write_set_.empty()) {
     pending_txn_count_.fetch_sub(1, std::memory_order_relaxed);
   }
@@ -303,8 +377,11 @@ void TransactionManager::ReleaseLocksAndForget(Transaction& txn) {
     active_transactions_.erase(txn.txn_id_);
     active_snapshots_.erase(txn.txn_id_);
   }
-  if (!txn.IsReadOnly()) { GarbageCollectVersions();
-}
+  // GC no longer runs on the commit critical path: the background worker
+  // picks the work up (threshold-driven) within a few milliseconds.
+  if (!txn.IsReadOnly()) {
+    commits_since_gc_.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 void TransactionManager::GarbageCollectVersions() {

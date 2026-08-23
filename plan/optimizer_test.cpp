@@ -955,6 +955,147 @@ TEST_F(OptimizerTest, SelfJoinWithAliasesUsesRelationSchemas) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+TEST_F(OptimizerTest, FilteredSelfJoinKeepsRightSidePredicate) {
+  // Phase 8 follow-up: the IndexJoin executor bypasses its right child plan
+  // entirely, so an index join must never be offered when the right scan
+  // group carries a pushed filter -- otherwise that filter silently
+  // disappears. Whichever join strategy wins, the predicate holds.
+  QueryData query{
+      {"a", "b"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp(ColumnName("a", "c1")),
+                              BinaryOperation::kEquals,
+                              ColumnValueExp(ColumnName("b", "c1"))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp(ColumnName("b", "c3")),
+                              BinaryOperation::kGreaterThan,
+                              ConstantValueExp(Value(107.0)))),
+      {NamedExpression("ac3", ColumnValueExp(ColumnName("a", "c3")))}};
+  query.aliases_ = {{"a", "Sc1"}, {"b", "Sc1"}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  std::vector<double> sums;
+  while (executor->Next(&row, nullptr)) {
+    sums.push_back(row[0].value.double_value);
+  }
+  std::sort(sums.begin(), sums.end());
+  // b.c3 > 107 pins b.c1 to {98, 99}; the equality join copies those to a.
+  EXPECT_EQ(sums, (std::vector<double>{107.9, 108.9}));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, AliasedSelfJoinCanUseIndexNestedLoop) {
+  // Phase 8 follow-up: with hash/NL joins disabled the aliased self-join
+  // must still plan through the index nested-loop path, which resolves keys
+  // physically while declaring renamed output columns.
+  QueryData query{
+      {"a", "b"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp(ColumnName("a", "c1")),
+                              BinaryOperation::kEquals,
+                              ColumnValueExp(ColumnName("b", "c1"))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp(ColumnName("a", "c1")),
+                              BinaryOperation::kLessThan,
+                              ConstantValueExp(Value(5)))),
+      {NamedExpression("ac3", ColumnValueExp(ColumnName("a", "c3")))}};
+  query.aliases_ = {{"a", "Sc1"}, {"b", "Sc1"}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  OptimizerOptions options = OptimizerOptions::Default();
+  options.disabled_implementation_rules = {"hash_join", "nested_loop_join"};
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan,
+                        Optimizer::Optimize(query, context, options));
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("Rename"), std::string::npos) << dump.str();
+
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  std::vector<double> sums;
+  while (executor->Next(&row, nullptr)) {
+    sums.push_back(row[0].value.double_value);
+  }
+  std::sort(sums.begin(), sums.end());
+  const std::vector<double> expected{9.9, 10.9, 11.9, 12.9, 13.9};
+  ASSERT_EQ(sums.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); ++i) {
+    EXPECT_DOUBLE_EQ(sums[i], expected[i]);
+  }
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, AliasedOrderByLimitFoldsTopK) {
+  // Phase 8 follow-up: the relation rename translates ordering requests back
+  // to physical names, so an ordered index scan keeps delivering ORDER BY
+  // above the rename and LIMIT folds into a Top-K plan.
+  QueryData query{
+      {"a"},
+      BinaryExpressionExp(ColumnValueExp(ColumnName("a", "c1")),
+                          BinaryOperation::kGreaterThanEquals,
+                          ConstantValueExp(Value(80))),
+      {NamedExpression("ac1", ColumnValueExp(ColumnName("a", "c1")))}};
+  query.aliases_ = {{"a", "Sc1"}};
+  query.order_expressions_ = {ColumnValueExp(ColumnName("a", "c1"))};
+  query.order_ascending_ = {true};
+  query.limit_count_ = 5;
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("Limit"), std::string::npos) << dump.str();
+  EXPECT_NE(dump.str().find("Rename"), std::string::npos) << dump.str();
+
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  std::vector<int64_t> keys;
+  while (executor->Next(&row, nullptr)) {
+    keys.push_back(row[0].value.int_value);
+  }
+  EXPECT_EQ(keys, (std::vector<int64_t>{80, 81, 82, 83, 84}));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, InListDrivesPointUnionIndexAccess) {
+  // Phase 8 follow-up: a constant IN list on the leading index key becomes
+  // one point range per distinct value instead of a full scan.
+  QueryData query{
+      {"a"},
+      InExpressionExp(ColumnValueExp(ColumnName("a", "c1")),
+                      {ConstantValueExp(Value(2)), ConstantValueExp(Value(97)),
+                       ConstantValueExp(Value(99))}),
+      {NamedExpression("ac3", ColumnValueExp(ColumnName("a", "c3")))}};
+  query.aliases_ = {{"a", "Sc1"}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("x3 points"), std::string::npos) << dump.str();
+
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  std::vector<double> sums;
+  while (executor->Next(&row, nullptr)) {
+    sums.push_back(row[0].value.double_value);
+  }
+  std::sort(sums.begin(), sums.end());
+  const std::vector<double> expected{11.9, 106.9, 108.9};
+  ASSERT_EQ(sums.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); ++i) {
+    EXPECT_DOUBLE_EQ(sums[i], expected[i]);
+  }
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, AccessMethodHintAndMemoDumpDiagnosticsSmoke) {  // Arrange: a plain equality query planned with the Phase 5 access-method
   // hint and Phase 9 memo dumping enabled.
   QueryData query{

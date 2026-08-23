@@ -70,6 +70,15 @@ class PagePool {
   };
   typedef std::list<Entry> LruType;
 
+  // Number of independent lock stripes. Both the fast-path map and the file
+  // I/O latches are addressed by page_id % kPoolShards so operations on
+  // distinct pages rarely share a lock.
+  static constexpr size_t kPoolShards = 64;
+
+  static constexpr size_t ShardIndex(page_id_t page_id) {
+    return static_cast<size_t>(page_id % kPoolShards);
+  }
+
  public:
   PagePool(std::string_view file_name, size_t capacity);
   ~PagePool();
@@ -112,7 +121,24 @@ class PagePool {
   friend class CheckpointManager;
   friend class RecoveryManager;
 
+  // Cache-line padded so neighboring stripes never share a coherence line.
+  struct alignas(64) PoolShard {
+    std::mutex mu;
+    // Fast lookup: page id -> resident entry. Guarded by mu. Entries live in
+    // pool_lru_ and are spliced (never value-moved) by Touch, so the stored
+    // pointers stay stable until DetachVictim removes them under both this
+    // mutex and pool_latch.
+    std::unordered_map<page_id_t, Entry*> map;
+  };
+
+  struct alignas(64) IoLatch {
+    std::mutex mu;
+  };
+
   void Unpin(page_id_t page_id);
+
+  // Decrement pin_count once; log instead of wrapping on underflow.
+  static void ReleasePin(Entry& entry, page_id_t page_id);
 
   // Detach the LRU unpinned page from the pool maps. Caller writes it back
   // after releasing pool_latch so file I/O does not serialize GetPage hits.
@@ -121,13 +147,16 @@ class PagePool {
   // Refresh the specified entry in LRU.
   void Touch(LruType::iterator it);
 
-  // Write `target` page into the file. Caller must hold file_latch_ but NOT
-  // pool_latch, so the durability gate may block without stalling the pool.
+  // Write `target` page into the file. Caller must hold the IO latch of the
+  // target's page id (io_latches_[ShardIndex(...)].mu) but NOT pool_latch,
+  // so the durability gate may block without stalling the pool.
   void WriteBack(const Page* target);
 
-  // Read page at `pid` from the file to `target`. Caller must hold
-  // file_latch_. With validate, a non-zero but corrupt checksum throws;
-  // without it, broken images are handed back for Single Page Recovery.
+  // Read page at `pid` from the file to `target`. Caller must hold the IO
+  // latch of pid and must have observed flushing_ without pid under
+  // pool_latch inside that same IO latch scope. With validate, a non-zero
+  // but corrupt checksum throws; without it, broken images are handed back
+  // for Single Page Recovery.
   void ReadFrom(Page* target, page_id_t pid, bool validate) const;
 
   PageRef GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
@@ -151,9 +180,9 @@ class PagePool {
   // on-disk image is never read and installed.
   std::unordered_set<page_id_t> flushing_;
 
-  // Entries stranded by DropAllPages while still pinned by live PageRefs.
-  // They are kept alive here (without write back) until the pool dies so a
-  // late Unpin never touches freed entries.
+  // Entries stranded by DropAllPages (which retires every buffered page
+  // without write back). They are kept alive here until the pool dies so a
+  // live PageRef or an in-flight stripe-map hit never touches freed memory.
   LruType retired_;
 
   // WAL durability hook; see SetDurabilityGate. Read without extra locking,
@@ -162,9 +191,17 @@ class PagePool {
 
   mutable std::shared_mutex pool_latch;
 
-  // Serializes pread/pwrite; held independently of pool_latch so concurrent
-  // table loads can keep resolving cached pages while one miss I/Os.
-  mutable std::mutex file_latch_;
+  // Per-stripe fast maps for the GetPage/Unpin hot path; see PoolShard.
+  // Mutations are nested under pool_latch (lock order pool_latch -> shard),
+  // while hits and unpins take only their single stripe mutex.
+  PoolShard shards_[kPoolShards];
+
+  // Per-page-id file I/O latches. Held across pread/pwrite so two threads
+  // never interleave accesses to the SAME page image, while distinct page
+  // ids keep streaming in parallel. Lock order: a miss takes an IO latch
+  // first and pool_latch (shared, briefly) inside it to check flushing_;
+  // no path acquires an IO latch while holding pool_latch.
+  IoLatch io_latches_[kPoolShards];
 };
 
 }  // namespace tinylamb

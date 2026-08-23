@@ -520,29 +520,27 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       // them there.
       bool has_unqualified_column = false;
       if (select->Sources().size() > 1) {
-        for (const NamedExpression& item : select->SelectList()) {
+        // A bare `*` is an expansion directive, not a column reference.
+        const auto touches_unqualified = [](const NamedExpression& item) {
           for (const ColumnName& column : item.expression->TouchedColumns()) {
-            if (column.schema.empty()) { has_unqualified_column = true;
+            if (column.schema.empty() && column.name != "*") { return true;
 }
           }
-        }
-        if (select->WhereClause()) {
-          for (const ColumnName& column :
-               select->WhereClause()->TouchedColumns()) {
-            if (column.schema.empty()) { has_unqualified_column = true;
-}
-          }
-        }
+          return false;
+        };
+        has_unqualified_column =
+            std::ranges::any_of(select->SelectList(), touches_unqualified) ||
+            (select->WhereClause() &&
+             std::ranges::any_of(select->WhereClause()->TouchedColumns(),
+                                 [](const ColumnName& column) {
+                                   return column.schema.empty() &&
+                                          column.name != "*";
+                                 }));
       }
       const bool multi_relation = select->Sources().size() > 1;
-      fprintf(stderr, "[ROUTE] multi=%zu uses_aliases=%d unq=%d\n",
-              select->Sources().size(), (int)uses_aliases,
-              (int)has_unqualified_column);
       if (multi_relation && (!uses_aliases || has_unqualified_column)) {
-        fprintf(stderr, "[ROUTE] -> relational\n");
         return Executor(std::make_shared<RelationalExecutor>(ctx, select));
       }
-      fprintf(stderr, "[ROUTE] -> optimizer\n");
       QueryData query;
       Expression where = select->WhereClause();
       std::unordered_set<std::string> seen_relations;

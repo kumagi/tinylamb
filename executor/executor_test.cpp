@@ -2094,7 +2094,8 @@ TEST_F(ExecutorTest, RelationalExplainPlans) {
   EXPECT_NE(aliased.find("AS t"), std::string::npos) << aliased;
 
   const std::string inner = explain(
-      "SELECT * FROM SampleTable AS a JOIN SampleTable AS b ON a.key = b.key;");
+      "SELECT * FROM SampleTable AS a JOIN SampleTable AS b ON a.key = b.key "
+      "WHERE EXISTS (SELECT 1 FROM SampleTable);");
   EXPECT_TRUE(inner.find("HashJoin") != std::string::npos ||
               inner.find("HybridHashJoin") != std::string::npos)
       << inner;
@@ -2646,26 +2647,26 @@ TEST_F(ExecutorTest, RelationalExplainNestedLoopUnknownRows) {
 }
 
 TEST_F(ExecutorTest, RelationalExplainMemoryLimitBranches) {
+  // EXISTS marker: keeps these joins on the relational engine so the
+  // QueryMemory reporting branches stay covered (see
+  // RelationalHybridHashJoinSpillsUnderBudget).
+  const std::string sql =
+      "SELECT * FROM SampleTable AS a JOIN SampleTable AS b ON a.key = b.key "
+      "WHERE EXISTS (SELECT 1 FROM SampleTable);";
   {
     ScopedQueryMemory unlimited(0);
-    const std::string plan = RelationalExplain(
-        *rs_, "SELECT * FROM SampleTable AS a JOIN SampleTable AS b ON a.key = "
-              "b.key;");
+    const std::string plan = RelationalExplain(*rs_, sql);
     EXPECT_NE(plan.find("QueryMemory limit=unlimited"), std::string::npos)
         << plan;
   }
   {
     ScopedQueryMemory kib(2048);
-    const std::string plan = RelationalExplain(
-        *rs_, "SELECT * FROM SampleTable AS a JOIN SampleTable AS b ON a.key = "
-              "b.key;");
+    const std::string plan = RelationalExplain(*rs_, sql);
     EXPECT_NE(plan.find("QueryMemory limit=2.0KiB"), std::string::npos) << plan;
   }
   {
     ScopedQueryMemory bytes(128);
-    const std::string plan = RelationalExplain(
-        *rs_, "SELECT * FROM SampleTable AS a JOIN SampleTable AS b ON a.key = "
-              "b.key;");
+    const std::string plan = RelationalExplain(*rs_, sql);
     EXPECT_NE(plan.find("QueryMemory limit=128B"), std::string::npos) << plan;
   }
 }

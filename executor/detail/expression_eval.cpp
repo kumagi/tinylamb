@@ -215,7 +215,7 @@ Value Binary(BinaryOperation operation, const Value& left, const Value& right) {
           return Value(lhs * rhs);
         case BinaryOperation::kModulo:
           if (right.value.int_value == 0) {
-            throw std::runtime_error("integer modulo by zero");
+            throw std::runtime_error("modulo by zero");
           }
           if (left.value.int_value != std::numeric_limits<int64_t>::min() ||
               right.value.int_value != -1) {
@@ -619,6 +619,10 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
         return Value(-child.value.double_value);
       }
       if (child.type == ValueType::kInt64) {
+        if (child.value.int_value ==
+            std::numeric_limits<int64_t>::min()) {
+          throw std::runtime_error("integer overflow in unary minus");
+        }
         return Value(-child.value.int_value);
       }
       throw std::runtime_error("numeric value required");

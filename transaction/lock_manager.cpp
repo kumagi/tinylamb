@@ -5,6 +5,7 @@
 
 #include "transaction/lock_manager.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <mutex>
@@ -38,6 +39,7 @@ bool LockManager::ReleaseSharedLock(const RowPosition& row, txn_id_t owner) {
   if (it->second.empty()) {
     shared_locks_.erase(it);
   }
+  BumpReleaseEpoch();
   available_.notify_all();
   return true;
 }
@@ -64,10 +66,36 @@ bool LockManager::GetExclusiveLock(const RowPosition& row, txn_id_t owner,
     if (blocked()) { return false;
 }
   } else {
-    const bool granted =
-        available_.wait_for(lk, timeout, [&] { return !blocked(); });
-    if (!granted) { return false;
+    // Wait up to |timeout| without any release progress; while other lock
+    // activity keeps releasing rows the system is moving, so extend the
+    // wait (bounded by kDurabilityWaitFloor) instead of reporting a
+    // spurious conflict that executors would treat as a lost update.
+    const auto total_cap = std::chrono::duration_cast<std::chrono::milliseconds>(
+        kDurabilityWaitFloor);
+    const auto start = std::chrono::steady_clock::now();
+    auto patience = timeout;
+    for (;;) {
+      const uint64_t quiet_epoch =
+          release_epoch_.load(std::memory_order_relaxed);
+      if (available_.wait_for(lk, patience, [&] { return !blocked(); })) {
+        break;
+      }
+      if (!blocked()) { break;
 }
+      const bool progressed =
+          release_epoch_.load(std::memory_order_relaxed) != quiet_epoch;
+      if (!progressed) {
+        wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+      }
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start);
+      if (elapsed >= total_cap) {
+        wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+      }
+      patience = std::min(total_cap - elapsed, timeout);
+    }
   }
   exclusive_locks_[row] = owner;
   return true;
@@ -85,6 +113,7 @@ bool LockManager::ReleaseExclusiveLock(const RowPosition& row,
     return false;
   }
   exclusive_locks_.erase(it);
+  BumpReleaseEpoch();
   available_.notify_all();
   return true;
 }
@@ -103,6 +132,7 @@ bool LockManager::TryUpgradeLock(const RowPosition& row, txn_id_t owner) {
   }
   shared_locks_.erase(shared);
   exclusive_locks_[row] = owner;
+  BumpReleaseEpoch();
   available_.notify_all();
   return true;
 }

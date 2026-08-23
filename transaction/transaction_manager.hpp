@@ -19,11 +19,14 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <ostream>
+#include <set>
 #include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -48,7 +51,13 @@ class TransactionManager {
  public:
   TransactionManager(LockManager* lm, PageManager* pm, Logger* l,
                      RecoveryManager* r)
-      : lock_manager_(lm), page_manager_(pm), logger_(l), recovery_(r) {}
+      : lock_manager_(lm), page_manager_(pm), logger_(l), recovery_(r) {
+    StartGcWorker();
+  }
+
+  // Stops the background GC worker.  Must not race other TransactionManager
+  // calls (same teardown contract as the rest of the storage stack).
+  ~TransactionManager();
 
   Transaction Begin(bool read_only = false);
 
@@ -99,6 +108,12 @@ class TransactionManager {
 
   [[nodiscard]] uint64_t CurrentCommitTimestamp() const {
     return commit_timestamp_.load();
+  }
+  // Highest timestamp whose every version is published and therefore visible
+  // to a new snapshot.  Begin() takes snapshots here instead of from
+  // commit_timestamp_, whose latest allocation may still be mid-publication.
+  [[nodiscard]] uint64_t StableTimestamp() const {
+    return stable_timestamp_.load(std::memory_order_acquire);
   }
   StatusOr<std::string> ReadVersion(
       const Transaction& txn, const RowPosition& rp,
@@ -151,6 +166,20 @@ class TransactionManager {
   void ReleaseLocksAndForget(Transaction& txn);
   void GarbageCollectVersions();
 
+  // ---- commit sequencing ----
+  // Timestamps are handed out with a plain atomic fetch_add; versions are
+  // then published under shard locks alone.  A freshly allocated timestamp is
+  // registered as "unpublished" before publication starts, and
+  // stable_timestamp_ only ever advances to (smallest unpublished - 1), so a
+  // snapshot taken from it can never observe a half-published commit.
+  void RegisterPendingCommit(uint64_t ts);
+  void PublishCommit(uint64_t ts);
+
+  // ---- background GC ----
+  static constexpr uint64_t kGcCommitThreshold = 8;
+  void StartGcWorker();
+  void GcWorkerLoop();
+
   // Transaction move operations use these to keep active_transactions_
   // pointing at the live object: Begin() registers the address of the
   // Transaction it returns, and a move must carry the registration over to
@@ -171,6 +200,9 @@ class TransactionManager {
   }
 
   std::atomic<uint64_t> commit_timestamp_{0};
+  std::atomic<uint64_t> stable_timestamp_{0};
+  mutable std::mutex pending_commits_mutex_;
+  std::set<uint64_t> unpublished_commits_;
   std::atomic<uint64_t> max_committed_begin_ts_{0};
   std::atomic<int> pending_txn_count_{0};
   mutable std::array<VersionShard, kVersionShardCount> version_shards_;
@@ -181,6 +213,14 @@ class TransactionManager {
   RecoveryManager* const recovery_;
   mutable std::mutex transaction_table_lock;
   std::atomic<bool> synchronous_commit_{true};
+
+  // Background GC (declared last so the worker thread only starts after
+  // every member it may touch is fully constructed).
+  std::atomic<uint64_t> commits_since_gc_{0};
+  std::atomic<bool> gc_stop_{false};
+  std::mutex gc_mutex_;
+  std::condition_variable gc_cv_;
+  std::thread gc_worker_;
 };
 
 }  // namespace tinylamb

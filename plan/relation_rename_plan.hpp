@@ -4,9 +4,31 @@
 
 #include <string>
 
+#include "executor/executor_base.hpp"
 #include "plan/plan.hpp"
 
 namespace tinylamb {
+
+// Streaming pass-through that surfaces the rename in EXPLAIN/Dump output;
+// rows and row positions flow through untouched.
+class RelationRenameExecutor final : public ExecutorBase {
+ public:
+  RelationRenameExecutor(Executor src, std::string relation,
+                         std::string physical)
+      : src_(std::move(src)),
+        relation_(std::move(relation)),
+        physical_(std::move(physical)) {}
+
+  bool Next(Row* dst, RowPosition* rp) override {
+    return src_->Next(dst, rp);
+  }
+  void Dump(std::ostream& o, int indent) const override;
+
+ private:
+  Executor src_;
+  std::string relation_;
+  std::string physical_;
+};
 
 // Presents a child plan's output under a different relation identity
 // (Phase 8 aliases/self-joins): rows stream through unchanged and positions

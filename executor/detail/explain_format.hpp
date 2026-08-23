@@ -6,7 +6,7 @@
 #include <string>
 #include <string_view>
 
-#include "parser/ast.hpp"
+#include "query/statement.hpp"
 
 namespace tinylamb {
 class TransactionContext;

@@ -13,7 +13,7 @@
 #include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/expression.hpp"
-#include "parser/ast.hpp"
+#include "query/statement.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
