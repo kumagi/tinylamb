@@ -1925,7 +1925,7 @@ TEST_F(ExecutorTest, RelationalScalarFunctionsInGroupedQuery) {
   const auto concat = RelationalRun(
       *rs_, "SELECT CONCAT('a', NULL, 'b') FROM SampleTable GROUP BY key;");
   ASSERT_EQ(concat.size(), 4U);
-  EXPECT_EQ(concat[0][0], Value("ab"));
+  EXPECT_TRUE(concat[0][0].IsNull());
 
   const auto now = RelationalRun(
       *rs_, "SELECT CURRENT_TIMESTAMP() FROM SampleTable GROUP BY key;");

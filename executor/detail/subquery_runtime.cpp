@@ -49,19 +49,59 @@ double ElapsedMs(std::chrono::steady_clock::time_point begin) {
 
 namespace {
 
+void CountStatementTablesImpl(  // NOLINT(misc-no-recursion)
+    const SelectStatement& statement,
+    std::unordered_map<std::string, size_t>* counts,
+    const std::unordered_set<std::string>& inherited_ctes);
+
 void CountExpressionTables(  // NOLINT(misc-no-recursion)
     const Expression& expression,
-    std::unordered_map<std::string, size_t>* counts) {
+    std::unordered_map<std::string, size_t>* counts,
+    const std::unordered_set<std::string>& visible_ctes) {
   if (!expression) { return;
 }
   if (expression->Type() == TypeTag::kQueryExp) {
     const QueryExpression& query = expression->AsQueryExpression();
-    CountStatementTables(*query.Query(), counts);
-    CountExpressionTables(query.Test(), counts);
+    CountStatementTablesImpl(*query.Query(), counts, visible_ctes);
+    CountExpressionTables(query.Test(), counts, visible_ctes);
     return;
   }
   for (const Expression& child : ExpressionChildren(expression)) {
-    CountExpressionTables(child, counts);
+    CountExpressionTables(child, counts, visible_ctes);
+  }
+}
+
+void CountStatementTablesImpl(  // NOLINT(misc-no-recursion)
+    const SelectStatement& statement,
+    std::unordered_map<std::string, size_t>* counts,
+    const std::unordered_set<std::string>& inherited_ctes) {
+  std::unordered_set<std::string> visible_ctes = inherited_ctes;
+  for (const auto& [name, query] : statement.WithQueries()) {
+    (void)query;
+    visible_ctes.insert(name);
+  }
+  for (const auto& [name, query] : statement.WithQueries()) {
+    (void)name;
+    CountStatementTablesImpl(*query, counts, visible_ctes);
+  }
+  for (const SelectSource& source : statement.Sources()) {
+    if (source.query) {
+      CountStatementTablesImpl(*source.query, counts, visible_ctes);
+    } else if (!visible_ctes.contains(source.table)) {
+      ++(*counts)[source.table];
+    }
+    CountExpressionTables(source.join_condition, counts, visible_ctes);
+  }
+  CountExpressionTables(statement.WhereClause(), counts, visible_ctes);
+  for (const NamedExpression& item : statement.SelectList()) {
+    CountExpressionTables(item.expression, counts, visible_ctes);
+  }
+  for (const Expression& expression : statement.GroupBy()) {
+    CountExpressionTables(expression, counts, visible_ctes);
+  }
+  CountExpressionTables(statement.Having(), counts, visible_ctes);
+  for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
+    CountExpressionTables(term.expression, counts, visible_ctes);
   }
 }
 }  // namespace
@@ -69,29 +109,7 @@ void CountExpressionTables(  // NOLINT(misc-no-recursion)
 void CountStatementTables(  // NOLINT(misc-no-recursion)
     const SelectStatement& statement,
     std::unordered_map<std::string, size_t>* counts) {
-  for (const auto& [name, query] : statement.WithQueries()) {
-    (void)name;
-    CountStatementTables(*query, counts);
-  }
-  for (const SelectSource& source : statement.Sources()) {
-    if (source.query) {
-      CountStatementTables(*source.query, counts);
-    } else if (!statement.WithQueries().contains(source.table)) {
-      ++(*counts)[source.table];
-    }
-    CountExpressionTables(source.join_condition, counts);
-  }
-  CountExpressionTables(statement.WhereClause(), counts);
-  for (const NamedExpression& item : statement.SelectList()) {
-    CountExpressionTables(item.expression, counts);
-  }
-  for (const Expression& expression : statement.GroupBy()) {
-    CountExpressionTables(expression, counts);
-  }
-  CountExpressionTables(statement.Having(), counts);
-  for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
-    CountExpressionTables(term.expression, counts);
-  }
+  CountStatementTablesImpl(statement, counts, {});
 }
 bool ContainsOnlyUncorrelatedQueries(  // NOLINT(misc-no-recursion)
     TransactionContext& context, const Expression& expression,
@@ -125,11 +143,12 @@ void EnsureReusableProjections(TransactionContext& context,
   }
 }
 
-const std::vector<slot_t>* ReusableProjection(std::string_view table) {
-  if (active_runtime == nullptr) { return nullptr;
+const std::vector<slot_t>* ReusableProjection(TransactionContext& context,
+                                              std::string_view table) {
+  if (context.execution_runtime() == nullptr) { return nullptr;
 }
-  const auto found = active_runtime->reusable_projections.find(std::string(table));
-  if (found == active_runtime->reusable_projections.end() ||
+  const auto found = context.execution_runtime()->reusable_projections.find(std::string(table));
+  if (found == context.execution_runtime()->reusable_projections.end() ||
       found->second.empty()) {
     return nullptr;
   }
@@ -138,17 +157,17 @@ const std::vector<slot_t>* ReusableProjection(std::string_view table) {
 std::optional<Relation> ExecuteCorrelatedSingleSource(
     TransactionContext& context, const SelectStatement& statement,
     const Scope& outer, const CteMap& ctes) {
-  if (active_runtime == nullptr || statement.Sources().empty() ||
+  if (context.execution_runtime() == nullptr || statement.Sources().empty() ||
       std::ranges::any_of(
           statement.Sources(),
           [](const SelectSource& source) { return source.query != nullptr; }) ||
-      active_runtime->unindexable_queries.contains(&statement)) {
+      context.execution_runtime()->unindexable_queries.contains(&statement)) {
     return std::nullopt;
   }
 
   CorrelatedIndex* index = nullptr;
-  const auto cached = active_runtime->correlated_indexes.find(&statement);
-  if (cached != active_runtime->correlated_indexes.end()) {
+  const auto cached = context.execution_runtime()->correlated_indexes.find(&statement);
+  if (cached != context.execution_runtime()->correlated_indexes.end()) {
     index = cached->second.get();
   } else {
     const SelectSource& from = statement.Sources()[0];
@@ -183,7 +202,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     };
     if (statement.Sources().size() == 1 && peek_schema.ColumnCount() > 0 &&
         !has_correlated_equality(peek_schema)) {
-      active_runtime->unindexable_queries.insert(&statement);
+      context.execution_runtime()->unindexable_queries.insert(&statement);
       return std::nullopt;
     }
     Relation source;
@@ -191,7 +210,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       std::vector<slot_t> projection;
       if (peek_schema.ColumnCount() > 0) {
         if (const std::vector<slot_t>* shared =
-                ReusableProjection(from.table)) {
+                ReusableProjection(context, from.table)) {
           projection = *shared;
         } else {
           projection = RequiredColumns(statement, peek_schema, true);
@@ -238,7 +257,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       }
     }
     if (created->local_columns.empty()) {
-      active_runtime->unindexable_queries.insert(&statement);
+      context.execution_runtime()->unindexable_queries.insert(&statement);
       return std::nullopt;
     }
     std::vector<Expression> correlated_expressions =
@@ -307,7 +326,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         check(statement.Having());
       }
       if (references_outer) {
-        active_runtime->unindexable_queries.insert(&statement);
+        context.execution_runtime()->unindexable_queries.insert(&statement);
         return std::nullopt;
       }
     }
@@ -425,11 +444,11 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     source.spill.reset();
     source.spill_tail_.reset();
     index = created.get();
-    active_runtime->correlated_indexes.emplace(&statement, std::move(created));
-    ++active_runtime->correlated_index_builds;
+    context.execution_runtime()->correlated_indexes.emplace(&statement, std::move(created));
+    ++context.execution_runtime()->correlated_index_builds;
   }
 
-  ++active_runtime->correlated_index_probes;
+  ++context.execution_runtime()->correlated_index_probes;
 
   std::vector<Value> cache_values;
   cache_values.reserve(index->cache_outer_columns.size());
@@ -440,7 +459,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       Row(std::move(cache_values)).EncodeMemcomparableFormat();
   if (const auto cached_result = index->cached_results.find(cache_key);
       cached_result != index->cached_results.end()) {
-    ++active_runtime->correlated_result_cache_hits;
+    ++context.execution_runtime()->correlated_result_cache_hits;
     return MaterializeRelation(*cached_result->second);
   }
 
@@ -589,13 +608,13 @@ bool ExpressionsAreLocal(TransactionContext& context,
 const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
                                           const SelectStatement& statement,
                                           const CteMap& ctes) {
-  if (active_runtime == nullptr ||
-      active_runtime->noncacheable_queries.contains(&statement)) {
+  if (context.execution_runtime() == nullptr ||
+      context.execution_runtime()->noncacheable_queries.contains(&statement)) {
     return nullptr;
   }
-  const auto cached = active_runtime->uncorrelated_results.find(&statement);
-  if (cached != active_runtime->uncorrelated_results.end()) {
-    ++active_runtime->uncorrelated_cache_hits;
+  const auto cached = context.execution_runtime()->uncorrelated_results.find(&statement);
+  if (cached != context.execution_runtime()->uncorrelated_results.end()) {
+    ++context.execution_runtime()->uncorrelated_cache_hits;
     return cached->second.get();
   }
 
@@ -605,7 +624,7 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
     Relation metadata;
     if (source.query) {
       if (!StatementUsesOnlyScopes(context, *source.query, {}, ctes)) {
-        active_runtime->noncacheable_queries.insert(&statement);
+        context.execution_runtime()->noncacheable_queries.insert(&statement);
         return nullptr;
       }
       std::vector<Column> columns;
@@ -615,7 +634,7 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
         if (projection.expression->Type() == TypeTag::kColumnValue &&
             projection.expression->AsColumnValue().GetColumnName().name ==
                 "*") {
-          active_runtime->noncacheable_queries.insert(&statement);
+          context.execution_runtime()->noncacheable_queries.insert(&statement);
           return nullptr;
         }
         columns.emplace_back(ProjectionName(projection, i), ValueType::kNull);
@@ -626,7 +645,7 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
     } else {
       StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
       if (!table.HasValue()) {
-        active_runtime->noncacheable_queries.insert(&statement);
+        context.execution_runtime()->noncacheable_queries.insert(&statement);
         return nullptr;
       }
       metadata.schema = table.Value()->GetSchema();
@@ -639,15 +658,13 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
     schemas.push_back(std::move(metadata));
   }
   if (!ExpressionsAreLocal(context, statement, schemas, ctes)) {
-    active_runtime->noncacheable_queries.insert(&statement);
+    context.execution_runtime()->noncacheable_queries.insert(&statement);
     return nullptr;
   }
   Relation result = ExecuteQuery(context, statement, nullptr, ctes);
-  auto [iter, inserted] = active_runtime->uncorrelated_results.emplace(
+  auto [iter, inserted] = context.execution_runtime()->uncorrelated_results.emplace(
       &statement, std::make_shared<Relation>(std::move(result)));
   return iter->second.get();
 }
-
-thread_local ExecutionRuntime* active_runtime = nullptr;
 
 }  // namespace tinylamb::relational_detail

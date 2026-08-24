@@ -46,6 +46,9 @@ std::ostream& operator<<(std::ostream& o, const PageType& type) {
     case PageType::kBranchPage:
       o << "BranchPageType";
       break;
+    case PageType::kPaxPage:
+      o << "PaxPageType";
+      break;
     default:
       o << "(unknown)";
       break;
@@ -60,7 +63,7 @@ Encoder& operator<<(Encoder& e, const PageType& type) {
 
 Decoder& operator>>(Decoder& d, PageType& type) {
   constexpr auto kMaxValid =
-      static_cast<uint64_t>(PageType::kBranchPage);
+      static_cast<uint64_t>(PageType::kPaxPage);
   uint64_t raw = 0;
   d >> raw;
   if (raw > kMaxValid) {

@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_EXECUTOR_QUERY_SCHEDULER_HPP
 #define TINYLAMB_EXECUTOR_QUERY_SCHEDULER_HPP
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +12,12 @@
 #include "executor/executor_base.hpp"
 
 namespace tinylamb {
+
+struct QuerySchedulerStats {
+  uint64_t acquire_count{0};
+  uint64_t acquire_wait_ns{0};
+  uint64_t contended_acquires{0};
+};
 
 class QueryScheduler {
  public:
@@ -41,6 +48,10 @@ class QueryScheduler {
   [[nodiscard]] size_t UsedMemoryBytes() const;
   [[nodiscard]] size_t CpuCapacity() const { return cpu_capacity_; }
   [[nodiscard]] size_t MemoryCapacity() const { return memory_capacity_; }
+  void SetMetricsEnabled(bool enabled) {
+    metrics_enabled_.store(enabled, std::memory_order_relaxed);
+  }
+  [[nodiscard]] QuerySchedulerStats Stats() const;
 
   static QueryScheduler& Global();
 
@@ -55,6 +66,10 @@ class QueryScheduler {
   size_t used_memory_{0};
   uint64_t next_ticket_{0};
   uint64_t serving_ticket_{0};
+  std::atomic<bool> metrics_enabled_{false};
+  std::atomic<uint64_t> acquire_count_{0};
+  std::atomic<uint64_t> acquire_wait_ns_{0};
+  std::atomic<uint64_t> contended_acquires_{0};
 };
 
 // Keeps a query-level lease from its first pull until exhaustion or executor

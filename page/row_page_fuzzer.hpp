@@ -68,7 +68,7 @@ class RowPageEnvironment {
     l_ = std::make_unique<Logger>(log_name_);
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
     lm_ = std::make_unique<LockManager>();
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
                                                r_.get());
   }
 

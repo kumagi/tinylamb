@@ -24,12 +24,10 @@
 #include <vector>
 
 #include "common/constants.hpp"
-#include "common/random_string.hpp"
-#include "database/database.hpp"
-#include "database/transaction_context.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
+#include "expression/evaluation_context.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/interval_expression.hpp"
 #include "expression/named_expression.hpp"
@@ -37,6 +35,7 @@
 #include "expression/unary_expression.hpp"
 #include "common/log_message.hpp"
 #include "gtest/gtest.h"
+#include "query/statement.hpp"
 #include "type/column.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -1551,39 +1550,170 @@ TEST(ExpressionTest, FunctionCallDateAddSubTwoRowEvaluateThrows) {
                std::runtime_error);
 }
 
-TEST(ExpressionTest, FunctionCallValidateRegistersFunction) {
-  // Arrange -- a throwaway database and context so GetOrAddFunction can run.
-  const std::string dbname = "expression_test_" + RandomString();
-  {
-    auto db = std::make_unique<Database>(dbname);
-    TransactionContext ctx = db->BeginContext();
-    Schema schema("s", {Column("a", ValueType::kVarChar)});
+// Fake EvaluationContext: lets expression nodes be unit-tested without a
+// Database (the headline goal of improvement3.md A1/S3).
+class FakeEvaluationContext : public EvaluationContext {
+ public:
+  FakeEvaluationContext() = default;
+  explicit FakeEvaluationContext(std::vector<std::vector<Value>> results)
+      : results_(std::move(results)) {}
 
-    // Act + Assert -- validating a known function succeeds and registers it.
-    Expression concat = FunctionCallExp(
-        "concat", {ColumnValueExp("a"), ConstantValueExp(Value("x"))});
-    EXPECT_EQ(concat->Validate(ctx, schema), Status::kSuccess);
-    EXPECT_EQ(concat->Validate(ctx, schema), Status::kSuccess);
+  StatusOr<std::vector<Value>> RunSubquery(const SelectStatement&,
+                                           const Row*) override {
+    ++subquery_calls_;
+    if (next_result_ < results_.size()) {
+      return StatusOr<std::vector<Value>>(results_[next_result_++]);
+    }
+    return StatusOr<std::vector<Value>>(std::vector<Value>{});
+  }
+  const AggregateResultMap* CurrentAggregates() const override {
+    return nullptr;
+  }
+  Status GetOrAddFunction(std::string_view name, int argument_count) override {
+    registered.emplace_back(std::string(name), argument_count);
+    return registration_status;
+  }
 
-    // Act + Assert -- validating a previously unknown name also succeeds
-    // because GetOrAddFunction creates it on demand.
-    Expression custom =
-        FunctionCallExp("my_udf", {ConstantValueExp(Value(1))});
-    EXPECT_EQ(custom->Validate(ctx, schema), Status::kSuccess);
-    ctx.txn_.PreCommit();
-  }
-  {
-    // Arrange -- reopen the database to confirm the function survived.
-    auto db = std::make_unique<Database>(dbname);
-    TransactionContext ctx = db->BeginContext();
-    Schema schema("s", {Column("a", ValueType::kVarChar)});
-    Expression again =
-        FunctionCallExp("my_udf", {ConstantValueExp(Value(1))});
-    // Act + Assert -- the registered function is still valid.
-    EXPECT_EQ(again->Validate(ctx, schema), Status::kSuccess);
-    ctx.txn_.PreCommit();
-    db->DeleteAll();
-  }
+  // Recorded interactions.
+  std::vector<std::pair<std::string, int>> registered;
+  int subquery_calls_{0};
+
+  // Scriptable behaviour.
+  Status registration_status = Status::kSuccess;
+
+ private:
+  std::vector<std::vector<Value>> results_;
+  size_t next_result_{0};
+};
+
+TEST(ExpressionTest, FunctionCallValidateRegistersThroughEvaluationContext) {
+  // Arrange -- no database involved any more; the context records the
+  // GetOrAddFunction calls (improvement3.md A1).
+  Schema schema("s", {Column("a", ValueType::kVarChar)});
+  Expression concat =
+      FunctionCallExp("concat", {ColumnValueExp("a"), ConstantValueExp(Value("x"))});
+
+  FakeEvaluationContext ctx;
+  // Act + Assert -- validating registers the function signature exactly once
+  // per Validate call, through the abstract context only.
+  EXPECT_EQ(concat->Validate(ctx, schema), Status::kSuccess);
+  EXPECT_EQ(concat->Validate(ctx, schema), Status::kSuccess);
+  ASSERT_EQ(ctx.registered.size(), 2U);
+  EXPECT_EQ(ctx.registered[0], std::make_pair(std::string("concat"), 2));
+  EXPECT_EQ(ctx.registered[1], std::make_pair(std::string("concat"), 2));
+
+  // Act + Assert -- a failing registration propagates out of Validate.
+  FakeEvaluationContext failing_ctx;
+  failing_ctx.registration_status = Status::kNotExists;
+  Expression custom = FunctionCallExp("my_udf", {ConstantValueExp(Value(1))});
+  EXPECT_EQ(custom->Validate(failing_ctx, schema), Status::kNotExists);
+  EXPECT_EQ(failing_ctx.registered.size(), 1U);
+
+  // Act + Assert -- argument failures short-circuit before registration.
+  FakeEvaluationContext arg_ctx;
+  arg_ctx.registration_status = Status::kSuccess;
+  Expression nested = FunctionCallExp(
+      "concat", {FunctionCallExp("inner", {}), ConstantValueExp(Value("y"))});
+  EXPECT_EQ(nested->Validate(arg_ctx, schema), Status::kSuccess);
+  ASSERT_EQ(arg_ctx.registered.size(), 2U);
+  EXPECT_EQ(arg_ctx.registered[0], std::make_pair(std::string("inner"), 0));
+  EXPECT_EQ(arg_ctx.registered[1], std::make_pair(std::string("concat"), 2));
+}
+
+TEST(ExpressionTest, QueryExpressionEvaluatesThroughEvaluationContext) {
+  // Arrange -- a fake context scripts the subquery projection so the three
+  // subquery shapes are covered without any executor involvement.
+  Schema schema("s", {Column("i", ValueType::kInt64)});
+  Row row({Value(int64_t{7})});
+  auto statement = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression("v")}, std::vector<std::string>{"t"},
+      nullptr);
+
+  // EXISTS / NOT EXISTS over an empty and a non-empty projection.
+  FakeEvaluationContext empty_ctx;
+  const Expression exists_empty =
+      QueryExpressionExp(statement, nullptr, true, false);
+  EXPECT_EQ(exists_empty->Evaluate(row, schema, empty_ctx), Value(false));
+  const Expression not_exists_empty =
+      QueryExpressionExp(statement, nullptr, true, true);
+  EXPECT_EQ(not_exists_empty->Evaluate(row, schema, empty_ctx), Value(true));
+  EXPECT_EQ(empty_ctx.subquery_calls_, 2);
+
+  FakeEvaluationContext filled_ctx({{Value(int64_t{7}), Value(int64_t{9})},
+                                    {Value(int64_t{7}), Value(int64_t{9})}});
+  const Expression exists =
+      QueryExpressionExp(statement, nullptr, true, false);
+  EXPECT_EQ(exists->Evaluate(row, schema, filled_ctx), Value(true));
+  const Expression not_exists =
+      QueryExpressionExp(statement, nullptr, true, true);
+  EXPECT_EQ(not_exists->Evaluate(row, schema, filled_ctx), Value(false));
+
+  // Scalar subquery: first row wins, empty projection yields NULL.
+  FakeEvaluationContext scalar_ctx({{Value(int64_t{42})}});
+  const Expression scalar =
+      QueryExpressionExp(statement, nullptr, false, false);
+  EXPECT_EQ(scalar->Evaluate(row, schema, scalar_ctx), Value(int64_t{42}));
+  EXPECT_EQ(scalar->Evaluate(row, schema, empty_ctx), Value());
+
+  // IN subquery with SQL three-valued membership.
+  const Expression in_subquery = QueryExpressionExp(
+      statement, ConstantValueExp(Value(int64_t{7})), false, false);
+  FakeEvaluationContext hit_ctx({{Value(int64_t{7}), Value()}});
+  EXPECT_EQ(in_subquery->Evaluate(row, schema, hit_ctx), Value(true));
+  const Expression miss_subquery = QueryExpressionExp(
+      statement, ConstantValueExp(Value(int64_t{8})), false, false);
+  FakeEvaluationContext null_list_ctx({{Value(int64_t{1}), Value()},
+                                       {Value(int64_t{1}), Value()}});
+  EXPECT_EQ(miss_subquery->Evaluate(row, schema, null_list_ctx), Value());
+  FakeEvaluationContext plain_miss_ctx({{Value(int64_t{1})},
+                                        {Value(int64_t{1})}});
+  EXPECT_EQ(miss_subquery->Evaluate(row, schema, plain_miss_ctx),
+            Value(false));
+  const Expression null_test_subquery = QueryExpressionExp(
+      statement, ConstantValueExp(Value()), false, false);
+  FakeEvaluationContext fresh_ctx({{Value(int64_t{1})}});
+  EXPECT_EQ(null_test_subquery->Evaluate(row, schema, fresh_ctx), Value());
+  // NOT IN over a NULL-containing projection stays UNKNOWN (three-valued).
+  const Expression not_in_subquery = QueryExpressionExp(
+      statement, ConstantValueExp(Value(int64_t{8})), false, true);
+  EXPECT_EQ(not_in_subquery->Evaluate(row, schema, null_list_ctx), Value());
+  // NOT IN over a NULL-free miss is TRUE.
+  EXPECT_EQ(not_in_subquery->Evaluate(row, schema, plain_miss_ctx),
+            Value(true));
+}
+
+TEST(ExpressionTest, ContextAwareEvaluationMatchesPlainEvaluator) {
+  // Arrange -- migrated node types must agree between the plain and the
+  // context-aware overloads when no subquery is involved.
+  Schema schema("s", {Column("i", ValueType::kInt64)});
+  Row row({Value(int64_t{5})});
+  FakeEvaluationContext ctx;
+  const Expression binary =
+      BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kAdd,
+                          ConstantValueExp(Value(int64_t{3})));
+  const Expression negated = UnaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{3}))),
+      UnaryOperation::kNot);
+  const Expression case_expr = CaseExpressionExp(
+      {{BinaryExpressionExp(ColumnValueExp("i"), BinaryOperation::kGreaterThan,
+                            ConstantValueExp(Value(int64_t{3}))),
+        ConstantValueExp(Value(int64_t{10}))}},
+      ConstantValueExp(Value(int64_t{20})));
+  const Expression in_expr =
+      InExpressionExp(ColumnValueExp("i"), {ConstantValueExp(Value(int64_t{4})),
+                                            ConstantValueExp(Value(int64_t{5}))});
+  const Expression call =
+      FunctionCallExp("substr", {ConstantValueExp(Value("hello")),
+                                 ConstantValueExp(Value(int64_t{2}))});
+
+  // Act + Assert.
+  EXPECT_EQ(binary->Evaluate(row, schema, ctx), binary->Evaluate(row, schema));
+  EXPECT_EQ(negated->Evaluate(row, schema, ctx), negated->Evaluate(row, schema));
+  EXPECT_EQ(case_expr->Evaluate(row, schema, ctx),
+            case_expr->Evaluate(row, schema));
+  EXPECT_EQ(in_expr->Evaluate(row, schema, ctx), in_expr->Evaluate(row, schema));
+  EXPECT_EQ(call->Evaluate(row, schema, ctx), call->Evaluate(row, schema));
 }
 
 }  // namespace tinylamb

@@ -61,7 +61,7 @@ class PageManagerTest : public ::testing::Test {
     // Wire the real recovery stack so a re-open after the simulated crash
     // replays committed WAL records exactly like PageStorage does.
     rm_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
                                                rm_.get());
     // Boot-time recovery, same as PageStorage's constructor would do.
     // Tests that poke raw page bodies (unlogged) disable this to emulate a
@@ -185,12 +185,17 @@ TEST_F(PageManagerTest, DestroyPage) {
 // currently returns an empty PageRef in this situation, which callers
 // dereference unguarded.
 TEST_F(PageManagerTest, CommittedPageSurvivesCrashWithoutFlush) {
-  // Arrange -- allocate a page and commit the allocation durably.
-  Transaction system_txn = tm_->Begin();
-  PageRef allocated = p_->AllocateNewPage(system_txn, PageType::kFreePage);
-  const uint64_t page_id = allocated->PageID();
-  ASSERT_SUCCESS(system_txn.PreCommit());
-  ASSERT_FALSE(allocated.IsNull());
+  uint64_t page_id = 0;
+  {
+    // Arrange -- allocate a page and commit the allocation durably.  The
+    // PageRef/Transaction must die *before* the simulated crash: a real
+    // crash cannot leave live references into the destroyed pool.
+    Transaction system_txn = tm_->Begin();
+    PageRef allocated = p_->AllocateNewPage(system_txn, PageType::kFreePage);
+    page_id = allocated->PageID();
+    ASSERT_SUCCESS(system_txn.PreCommit());
+    ASSERT_FALSE(allocated.IsNull());
+  }
 
   // Act -- emulate a crash: discard every resident page without writeback,
   // then rebuild all managers on top of the surviving WAL.
@@ -211,14 +216,21 @@ TEST_F(PageManagerTest, CommittedPageSurvivesCrashWithoutFlush) {
 // These pin the blast radius of the "committed page lost" behaviour.
 TEST_F(PageManagerTest, CommittedRowPageWithRowsSurvivesCrash) {
   // Arrange -- allocate a row page, insert two rows, commit everything.
-  Transaction txn = tm_->Begin();
-  PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
-  const uint64_t page_id = page->PageID();
-  const StatusOr<slot_t> s1 = page->Insert(txn, "first-row");
-  const StatusOr<slot_t> s2 = page->Insert(txn, "second-row");
-  ASSERT_SUCCESS(s1.GetStatus());
-  ASSERT_SUCCESS(s2.GetStatus());
-  ASSERT_SUCCESS(txn.PreCommit());
+  uint64_t page_id = 0;
+  slot_t first_slot = 0;
+  slot_t second_slot = 0;
+  {
+    Transaction txn = tm_->Begin();
+    PageRef page = p_->AllocateNewPage(txn, PageType::kRowPage);
+    page_id = page->PageID();
+    const StatusOr<slot_t> s1 = page->Insert(txn, "first-row");
+    const StatusOr<slot_t> s2 = page->Insert(txn, "second-row");
+    ASSERT_SUCCESS(s1.GetStatus());
+    ASSERT_SUCCESS(s2.GetStatus());
+    ASSERT_SUCCESS(txn.PreCommit());
+    first_slot = s1.Value();
+    second_slot = s2.Value();
+  }
 
   // Act -- crash: drop every resident page, rebuild from the WAL.
   p_->GetPool()->DropAllPages();
@@ -229,12 +241,13 @@ TEST_F(PageManagerTest, CommittedRowPageWithRowsSurvivesCrash) {
   ASSERT_FALSE(recovered.IsNull())
       << "row page " << page_id << " lost by crash recovery";
   Transaction read_txn = tm_->Begin();
-  const StatusOr<std::string_view> r1 = recovered->Read(read_txn, s1.Value());
+  const StatusOr<std::string_view> r1 =
+      recovered->Read(read_txn, first_slot);
   EXPECT_EQ(r1.GetStatus(), Status::kSuccess);
   if (r1.HasValue()) {
     EXPECT_EQ(r1.Value(), "first-row");
   }
-  const StatusOr<std::string_view> r2 = recovered->Read(read_txn, s2.Value());
+  const StatusOr<std::string_view> r2 = recovered->Read(read_txn, second_slot);
   EXPECT_EQ(r2.GetStatus(), Status::kSuccess);
   if (r2.HasValue()) {
     EXPECT_EQ(r2.Value(), "second-row");
@@ -266,9 +279,11 @@ TEST_F(PageManagerTest, MultipleCommittedPagesSurviveCrash) {
 
 TEST_F(PageManagerTest, MetaPageSurvivesCrash) {
   // Arrange -- one committed allocation so the meta page has content.
-  Transaction txn = tm_->Begin();
-  PageRef page = p_->AllocateNewPage(txn, PageType::kFreePage);
-  ASSERT_SUCCESS(txn.PreCommit());
+  {
+    Transaction txn = tm_->Begin();
+    PageRef page = p_->AllocateNewPage(txn, PageType::kFreePage);
+    ASSERT_SUCCESS(txn.PreCommit());
+  }
 
   // Act -- crash and rebuild.
   p_->GetPool()->DropAllPages();
@@ -292,6 +307,21 @@ TEST_F(PageManagerTest, GetPageForUnknownPageIdReturnsNullRef) {
   const PageRef meta = p_->GetPage(0);  // id 0 = meta page
   EXPECT_FALSE(meta.IsNull());
   txn.PreCommit();
+}
+
+TEST_F(PageManagerTest, TableTailHintAdvancesWithoutRegressing) {
+  constexpr page_id_t first = 41;
+  EXPECT_EQ(p_->GetTableTail(first, 41), 41);
+
+  p_->AdvanceTableTail(first, 41, 42);
+  EXPECT_EQ(p_->GetTableTail(first, 41), 42);
+
+  // A thread that started from the old tail must not overwrite a newer hint.
+  p_->AdvanceTableTail(first, 41, 99);
+  EXPECT_EQ(p_->GetTableTail(first, 41), 42);
+
+  p_->AdvanceTableTail(first, 42, 43);
+  EXPECT_EQ(p_->GetTableTail(first, 41), 43);
 }
 
 }  // namespace tinylamb

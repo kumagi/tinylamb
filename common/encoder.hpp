@@ -36,6 +36,7 @@ class Encoder {
   explicit Encoder(std::ostream& os) : os_(&os) {}
   Encoder& operator<<(std::string_view sv);
   Encoder& operator<<(uint8_t u8);
+  Encoder& operator<<(uint32_t u32);
   Encoder& operator<<(slot_t slot);
   Encoder& operator<<(int64_t i64);
   Encoder& operator<<(uint64_t u64);
@@ -46,7 +47,7 @@ class Encoder {
   template <typename T>
   Encoder& operator<<(const std::vector<T>& vec) {
     uint64_t size = vec.size();
-    os_->write(reinterpret_cast<const char*>(&size), sizeof(size));
+    *this << size;
     for (const auto& elm : vec) {
       *this << elm;
     }

@@ -31,6 +31,7 @@
 #include "page/free_page.hpp"
 #include "page/leaf_page.hpp"
 #include "page/meta_page.hpp"
+#include "page/pax_page.hpp"
 #include "page/row_page.hpp"
 
 namespace tinylamb {
@@ -125,7 +126,7 @@ class Page {
   void PageTypeChange(Transaction& txn, PageType new_type);
 
   // Internal methods exposed for recovery.
-  void InsertImpl(std::string_view redo);
+  void InsertImpl(slot_t slot, std::string_view redo);
 
   void UpdateImpl(slot_t slot, std::string_view redo);
 
@@ -155,6 +156,11 @@ class Page {
   // in-memory content equals what the last WriteBack persisted.
   [[nodiscard]] bool ChecksumMatches() const;
 
+  // Version-1 disk codec. The in-memory Page remains a directly addressable
+  // object, while its fixed header is emitted/accepted in big-endian order.
+  void EncodeDisk(char* destination) const;
+  void DecodeDisk(const char* source);
+
   void* operator new(size_t /*byte size, always kPageSize*/);
 
   void operator delete(void* page) noexcept;
@@ -165,6 +171,9 @@ class Page {
     p.Dump(o, 0);
     return o;
   }
+
+  uint32_t format_magic = 0;
+  uint32_t format_version = 0;
 
   // The ID for this page. This ID is also an offset of this page in file.
   page_id_t page_id = 0;
@@ -190,6 +199,7 @@ class Page {
     RowPage row_page;
     LeafPage leaf_page;
     BranchPage branch_page;
+    PaxPage pax_page;
 
     PageBody() : dummy_() {}
   };
@@ -203,12 +213,8 @@ static_assert(std::is_trivially_destructible<Page>::value == true,
               "Page must be trivially destructible");
 static_assert(sizeof(Page) == kPageSize,
               "Page size must be equal to kPageSize");
-// Page images are persisted as raw host-endian bytes (see StoredChecksum), so
-// the layout must stay standard and stable; mixed endianness across hosts is
-// NOT portable by design.
 static_assert(std::is_standard_layout_v<Page>,
-              "Page is written to disk as raw bytes; standard layout is "
-              "required");
+              "Page codec depends on a standard in-memory layout");
 }  // namespace tinylamb
 
 template <>

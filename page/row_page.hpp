@@ -87,6 +87,7 @@ class RowPage {
   }
 
   StatusOr<slot_t> InsertRow(std::string_view new_row);
+  StatusOr<slot_t> InsertRowAt(slot_t slot, std::string_view new_row);
 
   Status UpdateRow(slot_t slot, std::string_view record);
 

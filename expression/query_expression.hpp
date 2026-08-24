@@ -9,6 +9,7 @@
 
 namespace tinylamb {
 
+class EvaluationContext;
 class SelectStatement;
 
 class QueryExpression : public ExpressionBase {
@@ -22,6 +23,10 @@ class QueryExpression : public ExpressionBase {
 
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kQueryExp; }
   [[nodiscard]] Value Evaluate(const Row&, const Schema&) const override;
+  // Stage 1 of the A1 migration: subquery execution goes through the abstract
+  // EvaluationContext instead of the relational_detail interpreter.
+  [[nodiscard]] Value Evaluate(const Row& row, const Schema& schema,
+                               EvaluationContext& context) const override;
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& output) const override;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;

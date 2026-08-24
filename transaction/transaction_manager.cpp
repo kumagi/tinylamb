@@ -41,7 +41,6 @@
 #include "page/row_page.hpp"
 #include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
@@ -84,10 +83,10 @@ void TransactionManager::GcWorkerLoop() {
 Transaction TransactionManager::Begin(bool read_only) {
   txn_id_t new_txn_id = next_txn_id_.fetch_add(1);
   Transaction new_txn(new_txn_id, this, read_only);
-  if (!read_only) {
-    new_txn.prev_lsn_ =
-        logger_->AddLog(LogRecord(0, new_txn_id, LogType::kBegin).Serialize());
-  }
+  // No kBegin record: the undo walk follows prev_lsn_ chains rooted at each
+  // write, and recovery classifies losers as "transactions whose newest LSN
+  // has no matching kCommit". A per-transaction BEGIN record cost one WAL
+  // append per transaction and carried no information the chains lack.
   {
     std::scoped_lock lk(transaction_table_lock);
     // The snapshot must be taken under the registry lock so a concurrent
@@ -114,48 +113,59 @@ Status TransactionManager::PreCommit(Transaction& txn) {
   if (!txn.IsReadOnly()) {
     LogRecord commit_log(txn.prev_lsn_, txn.txn_id_, LogType::kCommit);
     try {
-      // The write locks stay held across AddLog/WaitForDurable (durability
-      // precedes release), so stretch contenders' wait timeout over any
-      // fsync stall instead of letting them die at kExclusiveWaitTimeout.
-      LockManager::DurabilityWaitGuard floor_guard(*lock_manager_);
       txn.prev_lsn_ = logger_->AddLog(commit_log.Serialize());
       // AddLog returns the LSN *before* the payload; durable point is end of
       // the buffered commit record.
       const lsn_t commit_end = logger_->BufferedLSN();
       if (synchronous_commit_) {
+        const bool measure = metrics_enabled_.load(std::memory_order_relaxed);
+        const auto wait_start = measure ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
         logger_->WaitForDurable(commit_end);
+        if (measure) {
+          wal_wait_count_.fetch_add(1, std::memory_order_relaxed);
+          wal_wait_ns_.fetch_add(
+              static_cast<uint64_t>(std::chrono::duration_cast<
+                                        std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() -
+                                        wait_start)
+                                        .count()),
+              std::memory_order_relaxed);
+        }
       }
     } catch (...) {
       // A dead logger cannot take compensation logs, so full rollback is
       // impossible.  Still leave no half-finished state behind: drop the
-      // locks and the registry slot so other transactions are not blocked
-      // forever, and report the transaction as aborted, never committed.
-      ReleaseLocksAndForget(txn);
+      // registry slot so the transaction cannot remain active forever, and
+      // report it as aborted, never committed.
+      ForgetTransaction(txn);
       txn.SetStatus(TransactionStatus::kAborted);
       throw;
     }
   }
-  ReleaseLocksAndForget(txn);
+  ForgetTransaction(txn);
   return Status::kSuccess;
 }
 
 void TransactionManager::Abort(Transaction& txn) {
   if (txn.IsReadOnly()) {
     txn.SetStatus(TransactionStatus::kAborted);
-    ReleaseLocksAndForget(txn);
+    ForgetTransaction(txn);
     return;
   }
-  // The undo walk holds every write lock, so contenders must not spuriously
-  // time out while this transaction flushes its tail or replays undo.
-  LockManager::DurabilityWaitGuard floor_guard(*lock_manager_);
   // Wait on the logger's durability condition variable instead of polling:
   // the worker wakes every waiter once records are fsynced, and a dead
   // logger (Failed()) also releases the wait.  A failure falls through to
   // the abort-log write below, which surfaces it.
   {
-    const uint64_t latest_log = txn.prev_lsn_;
+    // Wait for the *end* of this transaction's last record, not the record
+    // start: AddLog returns the LSN before the payload, so waiting on
+    // prev_lsn_ alone could let the undo walk below read a record whose tail
+    // is still in the logger buffer (strace-confirmed source of the -j32
+    // "Invalid format log" flakiness).
+    const uint64_t latest_log_end = logger_->BufferedLSN();
     try {
-      logger_->WaitForDurable(latest_log);
+      logger_->WaitForDurable(latest_log_end);
     } catch (const std::exception&) {
       // Fall through; the undo replay reads what was flushed and the abort
       // log write reports the broken WAL.
@@ -164,7 +174,12 @@ void TransactionManager::Abort(Transaction& txn) {
   lsn_t prev = txn.prev_lsn_;
   while (prev != 0) {
     LogRecord lr;
-    recovery_->ReadLog(prev, &lr);
+    if (!recovery_->ReadLog(prev, &lr)) {
+      // The record never became durable (logger failure path above) or the
+      // tail was truncated: there is nothing on this chain left to undo.
+      LOG(WARN) << "Abort undo: unreadable log at " << prev << ", stopping";
+      break;
+    }
     recovery_->LogUndoWithPage(prev, lr, txn.transaction_manager_);
     prev = lr.prev_lsn;
   }
@@ -176,10 +191,70 @@ void TransactionManager::Abort(Transaction& txn) {
   } catch (...) {
     // Same contract as PreCommit: release locks and leave an aborted state
     // rather than a half-finished transaction blocking everyone.
-    ReleaseLocksAndForget(txn);
+    ForgetTransaction(txn);
     throw;
   }
-  ReleaseLocksAndForget(txn);
+  ForgetTransaction(txn);
+}
+
+bool TransactionManager::AcquireWriteIntent(Transaction& txn,
+                                            const RowPosition& rp,
+                                            bool wait) {
+  VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+  const bool measure = metrics_enabled_.load(std::memory_order_relaxed);
+  const auto wait_start = measure ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+  std::unique_lock lock(shard.mutex);
+  if (measure) {
+    write_intent_attempts_.fetch_add(1, std::memory_order_relaxed);
+    write_intent_mutex_wait_ns_.fetch_add(
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wait_start)
+                .count()),
+        std::memory_order_relaxed);
+  }
+  auto available = [&] {
+    const auto found = shard.versions.find(rp);
+    return found == shard.versions.end() || !found->second.pending ||
+           found->second.pending->owner == txn.ID();
+  };
+  if (!available() && (!wait ||
+      !shard.write_intent_released.wait_for(lock, std::chrono::milliseconds(1),
+                                            available))) {
+    if (measure) {
+      write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+  }
+  VersionChain& chain = shard.versions[rp];
+  if (chain.pending) { return chain.pending->owner == txn.ID(); }
+  // Strict write locking: a conflicting writer waits, then evaluates against
+  // the latest physical row after reserving its own unstaged intent. This is
+  // the TPC-C isolation behavior (T2 waits and completes), not SI's
+  // first-updater-wins abort.
+  chain.pending = PendingVersion{.owner=txn.ID(),
+                                 .value=std::nullopt,
+                                 .staged=false};
+  if (txn.write_set_.empty()) {
+    pending_txn_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return true;
+}
+
+TransactionRuntimeStats TransactionManager::RuntimeStats() const {
+  return {
+      .wal_wait_count = wal_wait_count_.load(std::memory_order_relaxed),
+      .wal_wait_ns = wal_wait_ns_.load(std::memory_order_relaxed),
+      .write_intent_attempts =
+          write_intent_attempts_.load(std::memory_order_relaxed),
+      .write_intent_conflicts =
+          write_intent_conflicts_.load(std::memory_order_relaxed),
+      .write_intent_mutex_wait_ns =
+          write_intent_mutex_wait_ns_.load(std::memory_order_relaxed),
+      .commit_shard_mutex_wait_ns =
+          commit_shard_mutex_wait_ns_.load(std::memory_order_relaxed),
+  };
 }
 
 StatusOr<std::string> TransactionManager::ReadVersion(
@@ -194,10 +269,25 @@ StatusOr<std::string> TransactionManager::ReadVersion(
     return std::string(*physical);
   }
   const VersionChain& chain = found->second;
-  if (chain.pending && chain.pending->owner == txn.ID()) {
+  if (chain.pending && chain.pending->owner == txn.ID() &&
+      chain.pending->staged) {
     if (!chain.pending->value) { return Status::kNotExists;
 }
     return *chain.pending->value;
+  }
+  // A writer that waited for a predecessor implements strict write locking,
+  // not first-updater-wins snapshot isolation: its SET expression must see
+  // the predecessor's committed result.  The newest committed entry is kept
+  // while this unstaged intent exists.  When GC removed a redundant chain
+  // before the intent was acquired, the heap is the authoritative latest
+  // image and the physical fallback below is equivalent.
+  if (chain.pending && chain.pending->owner == txn.ID()) {
+    if (!chain.committed.empty()) {
+      const CommittedVersion& latest = chain.committed.back();
+      if (!latest.value) { return Status::kNotExists; }
+      return *latest.value;
+    }
+    if (physical) { return std::string(*physical); }
   }
   for (const auto& version : std::ranges::reverse_view(chain.committed)) {
     if (version.begin_ts <= txn.SnapshotTimestamp() &&
@@ -231,14 +321,12 @@ void TransactionManager::RegisterVersionWrite(
     chain.committed.push_back(
         {0, std::numeric_limits<uint64_t>::max(), std::move(before_copy)});
   }
-  if (!chain.pending) {
-    chain.pending = PendingVersion{.owner=txn.ID(), .value=std::nullopt};
-    if (txn.write_set_.size() == 1) {
-      pending_txn_count_.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
+  // AddWriteSet reserves the pending slot before the physical image changes.
+  // Reaching this function without that reservation is an invariant breach.
+  assert(chain.pending.has_value());
   assert(chain.pending->owner == txn.ID());
   chain.pending->value = std::move(after_copy);
+  chain.pending->staged = true;
 }
 
 bool TransactionManager::IndexKeysMayBeStale(const Transaction& txn) const {
@@ -246,6 +334,13 @@ bool TransactionManager::IndexKeysMayBeStale(const Transaction& txn) const {
   // Concurrent pending writers are resolved per row via ReadVersion.
   return txn.SnapshotTimestamp() <
          max_committed_begin_ts_.load(std::memory_order_acquire);
+}
+
+bool TransactionManager::IndexKeysMayBeStale(
+    const Transaction& txn, page_id_t index_root) const {
+  return txn.SnapshotTimestamp() <
+         max_index_mutation_ts_[IndexMutationShardIndex(index_root)].load(
+             std::memory_order_acquire);
 }
 
 bool TransactionManager::RequiresHistoricalRead(const Transaction& txn) const {
@@ -292,7 +387,18 @@ void TransactionManager::CommitVersions(Transaction& txn) {
   shard_locks.reserve(kVersionShardCount);
   for (size_t i = 0; i < kVersionShardCount; ++i) {
     if (needed[i]) {
+      const bool measure = metrics_enabled_.load(std::memory_order_relaxed);
+      const auto wait_start = measure ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
       shard_locks.emplace_back(version_shards_[i].mutex);
+      if (measure) {
+        commit_shard_mutex_wait_ns_.fetch_add(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start)
+                    .count()),
+            std::memory_order_relaxed);
+      }
     }
   }
   for (const RowPosition& rp : txn.write_set_) {
@@ -305,17 +411,33 @@ void TransactionManager::CommitVersions(Transaction& txn) {
     if (!chain.pending || chain.pending->owner != txn.ID()) {
       continue;
     }
+    if (!chain.pending->staged) {
+      chain.pending.reset();
+      shard.write_intent_released.notify_all();
+      continue;
+    }
     if (!chain.committed.empty()) { chain.committed.back().end_ts = commit_ts;
 }
     chain.committed.push_back({commit_ts, std::numeric_limits<uint64_t>::max(),
                                std::move(chain.pending->value)});
     chain.pending.reset();
+    shard.write_intent_released.notify_all();
   }
   shard_locks.clear();
   max_committed_begin_ts_.store(
       std::max(max_committed_begin_ts_.load(std::memory_order_relaxed),
                commit_ts),
       std::memory_order_release);
+  for (page_id_t root : txn.mutated_index_roots_) {
+    std::atomic<uint64_t>& latest =
+        max_index_mutation_ts_[IndexMutationShardIndex(root)];
+    uint64_t observed = latest.load(std::memory_order_relaxed);
+    while (observed < commit_ts &&
+           !latest.compare_exchange_weak(observed, commit_ts,
+                                         std::memory_order_release,
+                                         std::memory_order_relaxed)) {
+    }
+  }
   // From here on every snapshot >= commit_ts observes this publication.  If
   // the (allocation-free in practice) publication above ever throws,
   // commit_ts stays registered as unpublished: correct (snapshots stall at
@@ -344,6 +466,7 @@ void TransactionManager::AbortVersions(Transaction& txn) {
     if (found != shard.versions.end() && found->second.pending &&
         found->second.pending->owner == txn.ID()) {
       found->second.pending.reset();
+      shard.write_intent_released.notify_all();
     }
   }
   if (!txn.write_set_.empty()) {
@@ -368,10 +491,7 @@ void TransactionManager::UnregisterActiveTransaction(Transaction* txn) {
   }
 }
 
-void TransactionManager::ReleaseLocksAndForget(Transaction& txn) {
-  for (const RowPosition& row : txn.write_set_) {
-    lock_manager_->ReleaseExclusiveLock(row, txn.txn_id_);
-  }
+void TransactionManager::ForgetTransaction(Transaction& txn) {
   {
     std::scoped_lock lk(transaction_table_lock);
     active_transactions_.erase(txn.txn_id_);
@@ -399,14 +519,15 @@ void TransactionManager::GarbageCollectVersions() {
     for (auto chain_iter = shard.versions.begin();
          chain_iter != shard.versions.end();) {
       VersionChain& chain = chain_iter->second;
-      if (!oldest_snapshot && !chain.pending) {
-        // Keep the latest committed version so later snapshots can still
-        // reconstruct the row without a physical page copy.
-        if (chain.committed.size() > 1) {
-          chain.committed.erase(chain.committed.begin(),
-                                std::prev(chain.committed.end()));
-        }
-        ++chain_iter;
+      // The heap page is the authoritative latest image. Once no active
+      // snapshot can need an older image, retaining the latest committed
+      // value here is both redundant and disastrous for OLTP: GC would scan
+      // every row ever loaded on every pass. A deleted row needs no tombstone
+      // for future snapshots either -- its physical slot/index entry is gone.
+      if (!chain.pending &&
+          (!oldest_snapshot || chain.committed.empty() ||
+           chain.committed.back().begin_ts <= *oldest_snapshot)) {
+        chain_iter = shard.versions.erase(chain_iter);
         continue;
       }
       if (oldest_snapshot) {
@@ -414,6 +535,10 @@ void TransactionManager::GarbageCollectVersions() {
                chain.committed[1].begin_ts <= *oldest_snapshot) {
           chain.committed.erase(chain.committed.begin());
         }
+      }
+      if (!chain.pending && chain.committed.empty()) {
+        chain_iter = shard.versions.erase(chain_iter);
+        continue;
       }
       ++chain_iter;
     }
@@ -514,21 +639,6 @@ void TransactionManager::CompensateSetFosterLog(txn_id_t txn_id, page_id_t pid,
   logger_->AddLog(
       LogRecord::CompensateSetFosterLogRecord(0, txn_id, pid, foster)
           .Serialize());
-}
-
-bool TransactionManager::GetExclusiveLock(const RowPosition& rp,
-                                          txn_id_t owner) {
-  return lock_manager_->GetExclusiveLock(rp, owner);
-}
-
-bool TransactionManager::GetSharedLock(const RowPosition& rp,
-                                       txn_id_t owner) {
-  return lock_manager_->GetSharedLock(rp, owner);
-}
-
-bool TransactionManager::TryUpgradeLock(const RowPosition& rp,
-                                        txn_id_t owner) {
-  return lock_manager_->TryUpgradeLock(rp, owner);
 }
 
 uint64_t TransactionManager::AddLog(const LogRecord& lr) {

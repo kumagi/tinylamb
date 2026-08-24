@@ -50,9 +50,15 @@ ParallelAggregationExecutor::ParallelAggregationExecutor(
       const int offset = input_schema_.Offset(
           aggregate.Child()->AsColumnValue().GetColumnName());
       if (offset >= 0) {
-        input.kind = AggregateInputKind::kInt64Column;
-        input.column = static_cast<size_t>(offset);
-        int64_column_indices_.push_back(index);
+        if (input_schema_.GetColumn(offset).Type() == ValueType::kDouble) {
+          input.kind = AggregateInputKind::kDoubleColumn;
+          input.column = static_cast<size_t>(offset);
+          double_column_indices_.push_back(index);
+        } else {
+          input.kind = AggregateInputKind::kInt64Column;
+          input.column = static_cast<size_t>(offset);
+          int64_column_indices_.push_back(index);
+        }
       } else {
         generic_indices_.push_back(index);
       }
@@ -144,6 +150,14 @@ void ParallelAggregationExecutor::Accumulate(PartialState* state,
     const AggregateInput& input = inputs_[index];
     if (chunk.ColumnAt(input.column).Type() == ValueType::kInt64) {
       AccumulateInt64Column(state, index, chunk.ColumnAt(input.column));
+    } else {
+      generic_scratch_.push_back(index);
+    }
+  }
+  for (const size_t index : double_column_indices_) {
+    const AggregateInput& input = inputs_[index];
+    if (chunk.ColumnAt(input.column).Type() == ValueType::kDouble) {
+      AccumulateDoubleColumn(state, index, chunk.ColumnAt(input.column));
     } else {
       generic_scratch_.push_back(index);
     }
@@ -257,6 +271,74 @@ void ParallelAggregationExecutor::AccumulateInt64Column(
         if (column.IsNull(row)) { continue;
 }
         if (best.IsNull() || best.value.int_value < data[row]) {
+          best = Value(data[row]);
+        }
+      }
+      break;
+    }
+  }
+}
+
+void ParallelAggregationExecutor::AccumulateDoubleColumn(
+    PartialState* state, size_t aggregate_index,
+    const ColumnVector& column) const {
+  const AggregationType type =
+      aggregates_[aggregate_index].expression->AsAggregateExpression().GetType();
+  const std::vector<double>& data = column.DoubleData();
+  switch (type) {
+    case AggregationType::kCount: {
+      int64_t& count = state->values[aggregate_index].value.int_value;
+      for (size_t row = 0; row < column.Size(); ++row) {
+        if (!column.IsNull(row)) { ++count;
+}
+      }
+      break;
+    }
+    case AggregationType::kSum: {
+      double sum = 0.0;
+      bool any = false;
+      for (size_t row = 0; row < column.Size(); ++row) {
+        if (column.IsNull(row)) { continue;
+}
+        sum += data[row];
+        any = true;
+      }
+      if (!any) { break;
+}
+      Value& total = state->values[aggregate_index];
+      total = total.IsNull() ? Value(sum)
+                             : Value(total.value.double_value + sum);
+      break;
+    }
+    case AggregationType::kAvg: {
+      double& total =
+          state->values[aggregate_index].value.double_value;
+      int64_t& count = state->counts[aggregate_index];
+      for (size_t row = 0; row < column.Size(); ++row) {
+        if (column.IsNull(row)) { continue;
+}
+        total += data[row];
+        ++count;
+      }
+      break;
+    }
+    case AggregationType::kMin: {
+      Value& best = state->values[aggregate_index];
+      for (size_t row = 0; row < column.Size(); ++row) {
+        if (column.IsNull(row)) { continue;
+}
+        if (best.IsNull() || data[row] < best.value.double_value) {
+          best = Value(data[row]);
+        }
+      }
+      break;
+    }
+    case AggregationType::kMax: {
+      Value& best = state->values[aggregate_index];
+      for (size_t row = 0; row < column.Size(); ++row) {
+        if (column.IsNull(row)) { continue;
+}
+        if (best.IsNull() || best.value.double_value < data[row]) {
           best = Value(data[row]);
         }
       }

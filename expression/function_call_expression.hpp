@@ -28,6 +28,8 @@
 
 namespace tinylamb {
 
+class EvaluationContext;
+
 class FunctionCallExpression : public ExpressionBase {
  public:
   FunctionCallExpression(std::string func_name, std::vector<Expression> args)
@@ -42,10 +44,14 @@ class FunctionCallExpression : public ExpressionBase {
   [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,
                                const Row* right,
                                const Schema& right_schema) const override;
+  // Stage 3 of the A1 migration: arguments resolve through the abstract
+  // EvaluationContext.
+  [[nodiscard]] Value Evaluate(const Row& row, const Schema& schema,
+                               EvaluationContext& context) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
                                           const Schema& right) const override;
-  Status Validate(TransactionContext& ctx, const Schema& schema) const override;
+  Status Validate(EvaluationContext& context, const Schema& schema) const override;
   [[nodiscard]] const std::string& FuncName() const { return func_name_; }
   [[nodiscard]] const std::vector<Expression>& Args() const { return args_; }
   [[nodiscard]] std::string ToString() const override;

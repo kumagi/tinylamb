@@ -85,8 +85,6 @@ struct ExecutionRuntime {
   size_t key_filter_rejected{0};
 };
 
-extern thread_local ExecutionRuntime* active_runtime;
-
 double ElapsedMs(std::chrono::steady_clock::time_point begin);
 
 void CountStatementTables(const SelectStatement& statement,
@@ -95,7 +93,8 @@ void CountStatementTables(const SelectStatement& statement,
 void EnsureReusableProjections(TransactionContext& context,
                                ExecutionRuntime* runtime);
 
-const std::vector<slot_t>* ReusableProjection(std::string_view table);
+const std::vector<slot_t>* ReusableProjection(TransactionContext& context,
+                                              std::string_view table);
 
 Relation ExecuteQuery(TransactionContext& context,
                       const SelectStatement& statement, const Scope* outer,

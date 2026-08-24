@@ -73,6 +73,9 @@ struct QueryData {
   // UPDATE/DELETE executors need the physical row position. An index-only
   // scan deliberately has no table row position and must not be selected.
   bool require_row_position_{false};
+  // UPDATE waits briefly for a conflicting writer; DELETE defaults to
+  // NOWAIT so queue consumers can retry rather than convoy behind one row.
+  bool wait_for_write_intent_{true};
   std::vector<Expression> order_expressions_;
   std::vector<bool> order_ascending_;
   // LIMIT/OFFSET made visible to the optimizer (Phase 5 Top-K). The plan may

@@ -27,6 +27,11 @@ Audit found the plan-level LIMIT work half-wired, producing wrong results:
   plan output, so a plan-level limit would truncate before dedup. The engine
   therefore withholds LIMIT from `QueryData` when `select->Distinct()` is
   set; Distinct → Sort → Limit stays ordered correctly above the plan.
+- **Nested-loop predicate loss**: the `nested_loop_join` implementation built
+  a cross product but reapplied only non-equality residuals, even though the
+  cross-product executor does not enforce equality keys. With hash/index join
+  rules disabled this returned unrelated row pairs. It now evaluates the full
+  join predicate; the physical-rule subset sweep guards this fallback path.
 
 Regression guards added to `query/query_test.cpp`
 (`SqlEngineSelectOrderByLimitOffset` covers unordered ORDER BY+LIMIT+OFFSET,
@@ -175,30 +180,25 @@ relational executor; each needs its own design note):
 - RIGHT/FULL OUTER joins: not parsed at all (frontend supports kCross/kInner/
   kLeft only).
 
-Known routing limitation (performance, not correctness): ORDER BY credit is
-not yet propagated across renamed schemas — aliased queries lose the
-index-provides-ordering bonus and always sort engine-side.
-
-## Phase 9 — Hardening (partially complete)
+## Phase 9 — Hardening
 
 - [x] Plan-dump diagnostics (`dump_memo`).
 - [x] End-to-end suites: `SqlEngineTpchTest` / `SqlEngineTpccTest` exercise
       the Cascades path and pass.
 - [ ] Widen golden-result comparisons for join-order-sensitive queries
       (TPC-H Q8/Q9-style chains) against captured outputs.
-- [ ] Fuzz the memo under randomized rule subsets
-      (`OptimizerOptions::disabled_implementation_rules`) to catch
-      unsound-rule interactions like the LIMIT ones fixed in this revision.
+- [x] Deterministically sweep pseudo-randomized physical-rule subsets
+      (`OptimizerOptions::disabled_implementation_rules`) and compare every
+      executable plan after the engine's Sort/Limit safety-net semantics.
+      `PhysicalRuleSubsetsPreserveOrderedLimitResults` covers alternative
+      scan and join combinations and reproduces failures by a fixed seed.
 
-## Known Unrelated Failures (out of optimizer scope)
+## Executor regression status
 
-`executor_test` fails 4 cases (`Aggregation`,
-`VectorizedScanFilterProjectAggregatePipeline`,
-`RelationalAggregateSumEmptyAndDouble`, `DistinctNullValueThrowsFromHash`).
-They construct executors directly without the optimizer; symptoms are
-floating-point bit mismatches on printed-equal doubles and a missing throw on
-NULL distinct hashing. Likely introduced by the concurrent
-executor/data_chunk workstream in this tree; tracked separately.
+The four previously recorded direct-executor failures are resolved. Floating
+point aggregate assertions use numeric tolerance, and NULL has defined hash
+semantics so DISTINCT treats it as a value. The complete `executor_test` suite
+passes (140 tests as of 2026-08-24).
 
 ---
 

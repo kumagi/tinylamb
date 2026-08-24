@@ -413,12 +413,14 @@ TEST_F(LogRecordTest, DecodeHugeEndCheckpointTableSizeRejected) {
   // setstate(failbit), so decoding rejects the record cleanly: no throw and
   // both tables stay empty. This test pins that behavior.
   const auto kEndCheckpointPrefix = [] {
-    std::string bytes;
-    bytes.append(1, 0x1c).append(1, 0x00);  // LogType::kEndCheckpoint (uint16)
-    bytes.append(8, '\x00');                // prev_lsn
-    bytes.append(8, '\x00');                // txn_id
-    bytes.append(1, '\x00');                // types: no pid / slot / key
-    return bytes;
+    std::ostringstream stream(std::ios::binary);
+    Encoder encoder(stream);
+    encoder << kSerdesMagic << kSerdesVersion
+            << static_cast<uint16_t>(LogType::kEndCheckpoint)
+            << uint64_t{0}  // prev_lsn
+            << uint64_t{0}  // txn_id
+            << uint8_t{0};  // types: no pid / slot / key
+    return stream.str();
   }();
   const std::string huge_size(8, '\x20');  // 0x2020202020202020 elements
 

@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cerrno>
@@ -46,6 +47,7 @@
 #include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/log_message.hpp"
+#include "common/serdes.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
 #include "recovery/log_record.hpp"
@@ -120,7 +122,11 @@ bool IsPageManipulation(LogType type) {
 }
 
 void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
-  if (!IsPageManipulation(log.type) || lsn <= target->PageLSN()) {
+  // The apply/no-apply decision (page_lsn vs record LSN) belongs to
+  // PageReplay, which is this function's only caller. In particular a
+  // kSystemAllocPage at LSN 0 on a freshly recovered page must run even
+  // though page_lsn also reads 0 there.
+  if (!IsPageManipulation(log.type)) {
     return;
   }
 
@@ -129,7 +135,7 @@ void LogRedo(PageRef& target, lsn_t lsn, const LogRecord& log) {
       assert(!"unknown log type must not be parsed");
     case LogType::kInsertRow:
     case LogType::kCompensateDeleteRow:
-      target->InsertImpl(log.redo_data);
+      target->InsertImpl(log.slot, log.redo_data);
       break;
     case LogType::kUpdateRow:
     case LogType::kCompensateUpdateRow:
@@ -220,7 +226,7 @@ void LogUndo(PageRef& target, lsn_t lsn, const LogRecord& log,
       break;
     case LogType::kDeleteRow:
       tm->CompensateDeleteLog(log.txn_id, log.pid, log.slot, log.undo_data);
-      target->InsertImpl(log.undo_data);
+      target->InsertImpl(log.slot, log.undo_data);
       break;
     case LogType::kSystemDestroyPage:
       // Undoing a destroy cannot restore the lost page image: the record
@@ -317,7 +323,14 @@ void PageReplay(PageRef&& target,
     assert(log.pid == target->PageID());
 
     const lsn_t& lsn = lsn_log.first;
-    if (target->PageLSN() < lsn) {
+    // A freshly recovered (broken) page starts at page_lsn == 0 meaning
+    // *nothing* has been applied -- including a record that itself sits at
+    // LSN 0. Since the kBegin removal the very first WAL record can be the
+    // idempotent kSystemAllocPage at LSN 0, so treat "applied == 0" as
+    // "nothing applied yet". Flushed images with page_lsn == 0 can only
+    // contain such an ALLOCATE, whose redo (PageInit) is a no-op on them.
+    const bool nothing_applied_yet = target->PageLSN() == 0;
+    if (nothing_applied_yet || target->PageLSN() < lsn) {
       if (RecoveryTraceEnabled()) { LOG(INFO) << "redo: " << log;
 }
       LogRedo(target, lsn, log);
@@ -713,13 +726,22 @@ bool RecoveryManager::ReadLog(lsn_t lsn, LogRecord* dst) const {
   // Validate the record type from a private pread snapshot BEFORE decoding:
   // garbage bytes must fail here instead of reaching LogRecord's decoder
   // switch, which asserts on unknown types in debug builds.
-  uint16_t raw_type = 0;
+  std::array<char, sizeof(uint32_t) * 2 + sizeof(uint16_t)> header{};
   ssize_t nhead = 0;
   do {
-    nhead = ::pread(read_fd_, &raw_type, sizeof(raw_type),
+    nhead = ::pread(read_fd_, header.data(), header.size(),
                     static_cast<off_t>(lsn));
   } while (nhead < 0 && errno == EINTR);
-  if (std::cmp_less(nhead, sizeof(raw_type)) ||
+  uint32_t magic = 0;
+  uint32_t version = 0;
+  uint16_t raw_type = 0;
+  if (!std::cmp_less(nhead, header.size())) {
+    DeserializeU32(header.data(), &magic);
+    DeserializeU32(header.data() + sizeof(uint32_t), &version);
+    DeserializeU16(header.data() + sizeof(uint32_t) * 2, &raw_type);
+  }
+  if (std::cmp_less(nhead, header.size()) || magic != kSerdesMagic ||
+      version != kSerdesVersion ||
       !IsKnownLogType(static_cast<LogType>(raw_type))) {
     return false;
   }

@@ -4,8 +4,8 @@
 
 #include <gtest/gtest.h>
 
-#include <cstdint>
 #include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -43,8 +43,9 @@ class TpccWorkloadTest : public ::testing::Test {
     std::vector<Row> rows;
     if (prepared.HasValue()) {
       Row row;
-      while (prepared.Value()->Next(&row, nullptr)) { rows.push_back(row);
-}
+      while (prepared.Value()->Next(&row, nullptr)) {
+        rows.push_back(row);
+      }
     }
     EXPECT_EQ(context.PreCommit(), Status::kSuccess);
     return rows;
@@ -110,8 +111,7 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
       Run("SELECT COUNT(*) FROM new_order;");
   ASSERT_EQ(initial_queues.size(), 1);
   EXPECT_EQ(initial_queues[0][0], Value(3));
-  const std::vector<Row> initial_history =
-      Run("SELECT COUNT(*) FROM history;");
+  const std::vector<Row> initial_history = Run("SELECT COUNT(*) FROM history;");
   ASSERT_EQ(initial_history.size(), 1);
   EXPECT_EQ(initial_history[0][0], Value(10));
   ASSERT_EQ(Run("SELECT s_quantity FROM stock WHERE s_w_id = 1 AND s_i_id = 1;")
@@ -135,7 +135,8 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
     return text;
   };
   const std::string customer_plan = ExplainText(
-      "SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 4;");
+      "SELECT c_id FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = "
+      "4;");
   EXPECT_NE(customer_plan.find("Index"), std::string::npos) << customer_plan;
   EXPECT_EQ(customer_plan.find("ParallelSort"), std::string::npos)
       << customer_plan;
@@ -153,17 +154,19 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
 
   const TpccTransactionResult new_order =
       workload.Execute(TpccTransactionType::kNewOrder);
-  ASSERT_TRUE(new_order.committed || new_order.user_rollback) << new_order.error;
+  ASSERT_TRUE(new_order.committed || new_order.user_rollback)
+      << new_order.error;
+  EXPECT_GT(new_order.sql_statements, 0);
   if (new_order.committed) {
     EXPECT_EQ(new_order.order_id, 11);
-    EXPECT_GE(new_order.sql_statements,
-              6 + (4 * static_cast<size_t>(scale.min_order_lines)));
+    // Six fixed statements plus batched item read, stock read/update and the
+    // multi-row order-line insert at this all-local test scale.
+    EXPECT_EQ(new_order.sql_statements, 10);
   }
   const std::vector<Row> queues_after_new_order =
       Run("SELECT COUNT(*) FROM new_order;");
   ASSERT_EQ(queues_after_new_order.size(), 1);
-  EXPECT_EQ(queues_after_new_order[0][0],
-            Value(new_order.committed ? 4 : 3));
+  EXPECT_EQ(queues_after_new_order[0][0], Value(new_order.committed ? 4 : 3));
 
   const TpccTransactionResult payment =
       workload.Execute(TpccTransactionType::kPayment);
@@ -178,12 +181,12 @@ TEST_F(TpccWorkloadTest, CommitsFiveTransactionsAndPreservesInvariants) {
   const TpccTransactionResult delivery =
       workload.Execute(TpccTransactionType::kDelivery);
   ASSERT_TRUE(delivery.committed) << delivery.error;
+  EXPECT_GT(delivery.sql_statements, 0);
   EXPECT_EQ(delivery.delivered_orders, 1);
   const std::vector<Row> queues_after_delivery =
       Run("SELECT COUNT(*) FROM new_order;");
   ASSERT_EQ(queues_after_delivery.size(), 1);
-  EXPECT_EQ(queues_after_delivery[0][0],
-            Value(new_order.committed ? 3 : 2));
+  EXPECT_EQ(queues_after_delivery[0][0], Value(new_order.committed ? 3 : 2));
 
   const TpccTransactionResult stock_level =
       workload.Execute(TpccTransactionType::kStockLevel);
@@ -302,7 +305,8 @@ TEST(TpccScaleTest, ToStringCoversEveryTransactionType) {
   EXPECT_EQ(ToString(TpccTransactionType::kStockLevel), "stock_level");
   EXPECT_EQ(ToString(TpccTransactionType::kCount), "unknown");
   // Deliberately out-of-range value to probe the fallback arm.
-  EXPECT_EQ(ToString(static_cast<TpccTransactionType>(99)),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+  EXPECT_EQ(ToString(static_cast<TpccTransactionType>(
+                99)),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
             "unknown");
 }
 
@@ -322,7 +326,8 @@ TEST_F(TpccWorkloadTest, ExecuteOnUninitializedDatabaseReportsError) {
 
   // Act -- execute an invalid transaction type (deliberately out of range).
   const TpccTransactionResult invalid =
-      workload.Execute(static_cast<TpccTransactionType>(99));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+      workload.Execute(static_cast<TpccTransactionType>(
+          99));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
 
   // Assert -- the invalid type is reported precisely.
   EXPECT_FALSE(invalid.committed);
@@ -410,20 +415,24 @@ TEST_F(TpccWorkloadTest, PaymentRewritesBcCreditData) {
             Status::kSuccess)
       << error;
 
-  // Seed 2 deterministically pays a BC-credit customer, whose c_data field is
-  // rewritten with the payment audit trail.
-  TpccWorkload workload(*database_, scale, 2, 0);
-  const TpccTransactionResult payment =
-      workload.Execute(TpccTransactionType::kPayment);
-  ASSERT_TRUE(payment.committed) << payment.error;
-
-  const std::vector<Row> rewritten =
-      Run("SELECT COUNT(*) FROM customer WHERE c_data <> 'customer data';");
+  // D_ID now consumes its mandated per-transaction random draw, so branch
+  // tests must not bake in the old PRNG call position. Search a bounded,
+  // deterministic seed range until a BC customer is selected.
+  std::vector<Row> rewritten;
+  for (uint64_t seed = 1; seed <= 128; ++seed) {
+    TpccWorkload workload(*database_, scale, seed, 0);
+    const TpccTransactionResult payment =
+        workload.Execute(TpccTransactionType::kPayment);
+    ASSERT_TRUE(payment.committed) << payment.error;
+    rewritten =
+        Run("SELECT COUNT(*) FROM customer WHERE c_data <> 'customer data';");
+    if (rewritten[0][0].value.int_value != 0) { break; }
+  }
   ASSERT_EQ(rewritten.size(), 1);
   EXPECT_EQ(rewritten[0][0], Value(1));
   const std::vector<Row> history = Run("SELECT COUNT(*) FROM history;");
   ASSERT_EQ(history.size(), 1);
-  EXPECT_EQ(history[0][0], Value(11));
+  EXPECT_GT(history[0][0].value.int_value, 10);
 }
 
 TEST_F(TpccWorkloadTest, NewOrderRemoteSupplyUpdatesRemoteStock) {
@@ -434,15 +443,16 @@ TEST_F(TpccWorkloadTest, NewOrderRemoteSupplyUpdatesRemoteStock) {
             Status::kSuccess)
       << error;
 
-  // Seed 46 deterministically picks a remote supply warehouse for one line, so
-  // s_remote_cnt on warehouse 2 must increase.
-  TpccWorkload workload(*database_, scale, 46, 0);
-  const TpccTransactionResult new_order =
-      workload.Execute(TpccTransactionType::kNewOrder);
-  ASSERT_TRUE(new_order.committed) << new_order.error;
-
-  const std::vector<Row> remote =
-      Run("SELECT SUM(s_remote_cnt) FROM stock WHERE s_w_id = 2;");
+  std::vector<Row> remote;
+  for (uint64_t seed = 1; seed <= 128; ++seed) {
+    TpccWorkload workload(*database_, scale, seed, 0);
+    const TpccTransactionResult new_order =
+        workload.Execute(TpccTransactionType::kNewOrder);
+    ASSERT_TRUE(new_order.committed || new_order.user_rollback)
+        << new_order.error;
+    remote = Run("SELECT SUM(s_remote_cnt) FROM stock WHERE s_w_id = 2;");
+    if (remote[0][0].value.int_value != 0) { break; }
+  }
   ASSERT_EQ(remote.size(), 1);
   EXPECT_GE(remote[0][0].value.int_value, 1);
 }
@@ -455,19 +465,25 @@ TEST_F(TpccWorkloadTest, NewOrderRollsBackOnInvalidItem) {
             Status::kSuccess)
       << error;
 
-  // Seed 107 deterministically draws the 1%-probability rollback branch: the
-  // last order line references a non-existent item and the transaction must be
-  // rolled back instead of committed.
-  TpccWorkload workload(*database_, scale, 107, 0);
-  const TpccTransactionResult new_order =
-      workload.Execute(TpccTransactionType::kNewOrder);
-  EXPECT_TRUE(new_order.user_rollback);
-  EXPECT_FALSE(new_order.committed);
+  bool observed_rollback = false;
+  int64_t committed = 0;
+  for (uint64_t seed = 1; seed <= 512; ++seed) {
+    TpccWorkload workload(*database_, scale, seed, 0);
+    const TpccTransactionResult new_order =
+        workload.Execute(TpccTransactionType::kNewOrder);
+    if (new_order.user_rollback) {
+      observed_rollback = true;
+      EXPECT_FALSE(new_order.committed);
+      break;
+    }
+    ASSERT_TRUE(new_order.committed) << new_order.error;
+    ++committed;
+  }
+  EXPECT_TRUE(observed_rollback);
 
-  const std::vector<Row> queues =
-      Run("SELECT COUNT(*) FROM new_order;");
+  const std::vector<Row> queues = Run("SELECT COUNT(*) FROM new_order;");
   ASSERT_EQ(queues.size(), 1);
-  EXPECT_EQ(queues[0][0], Value(6));
+  EXPECT_EQ(queues[0][0], Value(6 + committed));
 }
 
 TEST_F(TpccWorkloadTest, ExecuteCountTypeReportsError) {
@@ -559,7 +575,7 @@ TEST(TpccWorkloadFailPathTest, NewOrderAbortsWhenSupportingRowsMissing) {
     const TpccTransactionResult result = RunNewOrder(*database, 1);
     EXPECT_FALSE(result.committed);
     EXPECT_FALSE(result.user_rollback);
-    EXPECT_NE(result.error.find("new-order district read returned no rows"),
+    EXPECT_NE(result.error.find("new-order district update affected too few rows"),
               std::string::npos)
         << result.error;
     database->DeleteAll();
@@ -583,7 +599,7 @@ TEST(TpccWorkloadFailPathTest, NewOrderAbortsWhenSupportingRowsMissing) {
     RunSql(*database, "DELETE FROM stock;");
     const TpccTransactionResult result = RunNewOrder(*database, 1);
     EXPECT_FALSE(result.committed);
-    EXPECT_NE(result.error.find("new-order stock read returned no rows"),
+    EXPECT_NE(result.error.find("new-order stock batch returned too few rows"),
               std::string::npos)
         << result.error;
     database->DeleteAll();
@@ -661,9 +677,8 @@ TEST(TpccWorkloadFailPathTest, PaymentAbortsWhenSupportingRowsMissing) {
     const TpccTransactionResult result =
         workload.Execute(TpccTransactionType::kPayment);
     EXPECT_FALSE(result.committed);
-    EXPECT_NE(
-        result.error.find("payment warehouse update affected too few rows"),
-        std::string::npos)
+    EXPECT_NE(result.error.find("payment warehouse read returned no rows"),
+              std::string::npos)
         << result.error;
     database->DeleteAll();
   }
@@ -676,7 +691,7 @@ TEST(TpccWorkloadFailPathTest, PaymentAbortsWhenSupportingRowsMissing) {
     const TpccTransactionResult result =
         workload.Execute(TpccTransactionType::kPayment);
     EXPECT_FALSE(result.committed);
-    EXPECT_NE(result.error.find("payment district update affected too few rows"),
+    EXPECT_NE(result.error.find("payment district read returned no rows"),
               std::string::npos)
         << result.error;
     database->DeleteAll();
@@ -725,8 +740,7 @@ TEST(TpccWorkloadFailPathTest, PaymentAbortsWhenSupportingRowsMissing) {
 
 TEST(TpccWorkloadFailPathTest, OrderStatusAbortsWhenSupportingRowsMissing) {
   auto MakeDb = []() -> std::unique_ptr<Database> {
-    const std::string path = "tpcc_workload_orderstatus_test-" +
-                             RandomString();
+    const std::string path = "tpcc_workload_orderstatus_test-" + RandomString();
     auto database = std::make_unique<Database>(path);
     std::string error;
     if (TpccWorkload::Initialize(*database, TpccScale::ForTest(), &error) !=
@@ -941,7 +955,7 @@ TEST(TpccWorkloadFailPathTest, DeliveryAndStockLevelAbortWhenRowsMissing) {
     database->DeleteAll();
   }
   {
-    // Dropping stock makes the per-item stock SELECT fail to prepare.
+    // Dropping stock makes the batched low-stock SELECT fail to prepare.
     std::unique_ptr<Database> database = MakeDb();
     ASSERT_NE(database, nullptr);
     RunSql(*database, "DROP TABLE stock;");
@@ -949,7 +963,7 @@ TEST(TpccWorkloadFailPathTest, DeliveryAndStockLevelAbortWhenRowsMissing) {
     const TpccTransactionResult result =
         workload.Execute(TpccTransactionType::kStockLevel);
     EXPECT_FALSE(result.committed);
-    EXPECT_NE(result.error.find("SELECT s_quantity FROM stock"),
+    EXPECT_NE(result.error.find("SELECT s_i_id FROM stock"),
               std::string::npos)
         << result.error;
     database->DeleteAll();
@@ -972,8 +986,12 @@ TEST_F(TpccWorkloadTest, NewOrderCreatesOrderLineRows) {
   }
   ASSERT_TRUE(new_order.committed) << new_order.error;
 
-  // The transaction issues 6 fixed statements plus 4 per order line.
-  const int line_count = static_cast<int>((new_order.sql_statements - 6) / 4);
+  const std::vector<Row> order =
+      Run("SELECT o_ol_cnt, o_all_local FROM orders WHERE o_w_id = 1 AND "
+          "o_d_id = 1 AND o_id = " +
+          std::to_string(new_order.order_id) + ";");
+  ASSERT_EQ(order.size(), 1);
+  const int line_count = static_cast<int>(order[0][0].value.int_value);
   EXPECT_GE(line_count, scale.min_order_lines);
   EXPECT_LE(line_count, scale.max_order_lines);
 
@@ -984,12 +1002,7 @@ TEST_F(TpccWorkloadTest, NewOrderCreatesOrderLineRows) {
   ASSERT_EQ(line_rows.size(), 1);
   EXPECT_EQ(line_rows[0][0], Value(line_count));
 
-  const std::vector<Row> all_local =
-      Run("SELECT o_all_local FROM orders WHERE o_w_id = 1 AND o_d_id = 1 "
-          "AND o_id = " +
-          std::to_string(new_order.order_id) + ";");
-  ASSERT_EQ(all_local.size(), 1);
-  EXPECT_EQ(all_local[0][0], Value(1));
+  EXPECT_EQ(order[0][1], Value(1));
 
   const std::vector<Row> total =
       Run("SELECT SUM(ol_amount) FROM order_line WHERE ol_w_id = 1 AND "
@@ -1054,7 +1067,7 @@ TEST_F(TpccWorkloadTest, PaymentAdjustsCustomerBalances) {
               before[0][0].value.double_value - payment.amount, 0.01);
 }
 
-TEST_F(TpccWorkloadTest, TerminalIdBindsHomeWarehouseAndDistrict) {
+TEST_F(TpccWorkloadTest, TerminalBindsWarehouseAndOnlyStockLevelDistrict) {
   TpccScale scale = TpccScale::ForTest();
   scale.warehouses = 2;
   scale.districts_per_warehouse = 2;
@@ -1063,23 +1076,27 @@ TEST_F(TpccWorkloadTest, TerminalIdBindsHomeWarehouseAndDistrict) {
             Status::kSuccess)
       << error;
 
-  // Terminals are bound warehouse-major: 0 -> w1/d1, 1 -> w1/d2,
-  // 2 -> w2/d1, 3 -> w2/d2. The payment result reports the home district.
+  // Every terminal keeps its home warehouse.  TPC-C randomizes Payment's
+  // district per invocation (§2.5.1.2); only Stock-Level owns a unique fixed
+  // (warehouse,district) pair (§2.8.1.1).
   TpccWorkload t0(*database_, scale, 1, 0);
-  EXPECT_EQ(t0.Execute(TpccTransactionType::kPayment).warehouse_id, 1);
-  EXPECT_EQ(t0.Execute(TpccTransactionType::kPayment).district_id, 1);
+  const auto t0_payment = t0.Execute(TpccTransactionType::kPayment);
+  EXPECT_EQ(t0_payment.warehouse_id, 1);
+  EXPECT_GE(t0_payment.district_id, 1);
+  EXPECT_LE(t0_payment.district_id, 2);
+  EXPECT_EQ(t0.Execute(TpccTransactionType::kStockLevel).district_id, 1);
 
   TpccWorkload t1(*database_, scale, 1, 1);
   EXPECT_EQ(t1.Execute(TpccTransactionType::kPayment).warehouse_id, 1);
-  EXPECT_EQ(t1.Execute(TpccTransactionType::kPayment).district_id, 2);
+  EXPECT_EQ(t1.Execute(TpccTransactionType::kStockLevel).district_id, 2);
 
   TpccWorkload t2(*database_, scale, 1, 2);
   EXPECT_EQ(t2.Execute(TpccTransactionType::kPayment).warehouse_id, 2);
-  EXPECT_EQ(t2.Execute(TpccTransactionType::kPayment).district_id, 1);
+  EXPECT_EQ(t2.Execute(TpccTransactionType::kStockLevel).district_id, 1);
 
   TpccWorkload t3(*database_, scale, 1, 3);
   EXPECT_EQ(t3.Execute(TpccTransactionType::kPayment).warehouse_id, 2);
-  EXPECT_EQ(t3.Execute(TpccTransactionType::kPayment).district_id, 2);
+  EXPECT_EQ(t3.Execute(TpccTransactionType::kStockLevel).district_id, 2);
 }
 
 TEST_F(TpccWorkloadTest, StockLevelRespectsDistinctItemWindow) {

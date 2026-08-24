@@ -18,6 +18,7 @@
 #define TINYLAMB_LOGGER_HPP
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <filesystem>
@@ -98,6 +99,7 @@ class Logger final {
   alignas(64) std::atomic<lsn_t> flushed_lsn_{0};
   alignas(64) std::atomic<lsn_t> durable_lsn_{0};
   std::string buffer_;
+  std::chrono::milliseconds sync_interval_{1};
   int dst_ = -1;
   std::mutex enqueue_latch_;
   std::mutex work_mu_;

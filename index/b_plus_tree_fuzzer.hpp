@@ -48,7 +48,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   Logger logger(log_name);
   LockManager lm;
   RecoveryManager rm(log_name, page_manager.GetPool());
-  TransactionManager tm(&lm, &page_manager, &logger, &rm);
+  TransactionManager tm(&page_manager, &logger, &rm);
   page_id_t root;
   {
     auto txn = tm.Begin();

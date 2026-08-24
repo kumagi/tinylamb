@@ -31,6 +31,7 @@
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
 #include "plan/relation_rename_plan.hpp"
+#include "plan/relational_plan.hpp"
 #include "projection_plan.hpp"
 #include "query/query_data.hpp"
 #include "selection_plan.hpp"
@@ -165,6 +166,7 @@ Plan BuildIndexScan(const Table& table, const Index& index,
                     bool ascending, const Expression& predicate,
                     const std::vector<NamedExpression>& select,
                     bool require_row_position,
+                    bool wait_for_write_intent,
                     std::vector<ColumnName> provided_order) {
   std::unordered_set<ColumnName> touched = predicate->TouchedColumns();
   for (const NamedExpression& item : select) {
@@ -176,7 +178,7 @@ Plan BuildIndexScan(const Table& table, const Index& index,
     if (offset >= 0) { touched_offsets.insert(static_cast<slot_t>(offset));
 }
   }
-  if (!require_row_position &&
+  if (!require_row_position && !index.RetainsDeletedEntries() &&
       Covered(index.CoveredColumns(), touched_offsets)) {
     return std::make_shared<IndexOnlyScanPlan>(
         table, index, statistics, std::move(begin_key), std::move(end_key),
@@ -184,7 +186,8 @@ Plan BuildIndexScan(const Table& table, const Index& index,
   }
   return std::make_shared<IndexScanPlan>(
       table, index, statistics, std::move(begin_key), std::move(end_key),
-      ascending, predicate, std::move(provided_order));
+      ascending, predicate, std::move(provided_order), require_row_position,
+      wait_for_write_intent);
 }
 
 // Top-K costing (Phase 5): an alternative that already delivers the required
@@ -203,6 +206,113 @@ void ApplyLimitHint(const Plan& plan, const PhysicalProperties& required,
   const auto rows = static_cast<double>(required.limit_hint);
   *local_cost = std::min(*local_cost, rows / std::max(selectivity, 0.01));
   *estimated_rows = std::min(*estimated_rows, rows);
+}
+
+// Independent-column statistics are sufficient to distinguish two common
+// composite-index choices even without multi-column histograms.  In
+// particular, (warehouse,district,customer,order) is far narrower for three
+// equality predicates than (warehouse,district,order).  Costing only the
+// first key made both look identical and a LIMIT 1 tie selected the latter,
+// scanning and sorting an entire TPC-C district.
+double EqualityPrefixRows(const TableStatistics& statistics,
+                          const Index& index,
+                          const std::vector<Value>& equality_values) {
+  if (statistics.Rows() == 0) { return 0;
+}
+  double rows = static_cast<double>(statistics.Rows());
+  for (size_t key = 0;
+       key < equality_values.size() && key < index.sc_.key_.size(); ++key) {
+    const slot_t column = index.sc_.key_[key];
+    if (column >= statistics.Columns()) { break;
+}
+    const ColumnStats& stats = statistics.Column(column);
+    double selectivity = 1.0;
+    if (stats.NonNullCount() != 0) {
+      const double frequency = stats.EstimateEqual(equality_values[key]);
+      if (frequency > 0) {
+        selectivity = frequency / stats.NonNullCount();
+      } else if (stats.Distinct() != 0) {
+        selectivity = 1.0 / stats.Distinct();
+      }
+    }
+    rows *= std::clamp(selectivity, 0.0, 1.0);
+  }
+  return std::max(1.0, rows);
+}
+
+std::vector<Expression> SplitDisjuncts(  // NOLINT(misc-no-recursion)
+    const Expression& expression) {
+  if (expression && expression->Type() == TypeTag::kBinaryExp &&
+      expression->AsBinaryExpression().Op() == BinaryOperation::kOr) {
+    std::vector<Expression> result =
+        SplitDisjuncts(expression->AsBinaryExpression().Left());
+    std::vector<Expression> right =
+        SplitDisjuncts(expression->AsBinaryExpression().Right());
+    result.insert(result.end(), std::make_move_iterator(right.begin()),
+                  std::make_move_iterator(right.end()));
+    return result;
+  }
+  return {expression};
+}
+
+std::optional<std::vector<std::vector<Value>>> DisjunctiveIndexPrefixes(
+    const Expression& filter, const Schema& schema, const Index& index) {
+  const std::vector<Expression> disjuncts = SplitDisjuncts(filter);
+  if (disjuncts.size() < 2) { return std::nullopt;
+}
+  std::vector<std::vector<Value>> prefixes;
+  prefixes.reserve(disjuncts.size());
+  size_t common_size = 0;
+  for (const Expression& disjunct : disjuncts) {
+    std::unordered_map<slot_t, Value> equalities;
+    for (const Expression& conjunct : SplitConjuncts(disjunct)) {
+      if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) { continue;
+}
+      const auto& binary = conjunct->AsBinaryExpression();
+      if (binary.Op() != BinaryOperation::kEquals) { continue;
+}
+      const ColumnValue* column = nullptr;
+      const ConstantValue* constant = nullptr;
+      if (binary.Left()->Type() == TypeTag::kColumnValue &&
+          binary.Right()->Type() == TypeTag::kConstantValue) {
+        column = &binary.Left()->AsColumnValue();
+        constant = &binary.Right()->AsConstantValue();
+      } else if (binary.Right()->Type() == TypeTag::kColumnValue &&
+                 binary.Left()->Type() == TypeTag::kConstantValue) {
+        column = &binary.Right()->AsColumnValue();
+        constant = &binary.Left()->AsConstantValue();
+      }
+      if (column == nullptr || constant == nullptr) { continue;
+}
+      const int offset = schema.Offset(column->GetColumnName());
+      if (offset >= 0) {
+        equalities.insert_or_assign(static_cast<slot_t>(offset),
+                                    constant->GetValue());
+      }
+    }
+    std::vector<Value> prefix;
+    for (slot_t slot : index.sc_.key_) {
+      const auto value = equalities.find(slot);
+      if (value == equalities.end()) { break;
+}
+      prefix.push_back(value->second);
+    }
+    if (prefix.empty()) { return std::nullopt;
+}
+    if (common_size == 0) {
+      common_size = prefix.size();
+    } else if (prefix.size() != common_size) {
+      return std::nullopt;
+    }
+    prefixes.push_back(std::move(prefix));
+  }
+  std::ranges::sort(prefixes);
+  prefixes.erase(std::ranges::unique(prefixes).begin(), prefixes.end());
+  if (prefixes.size() != disjuncts.size()) {
+    // Overlapping prefixes could emit a physical row more than once.
+    return std::nullopt;
+  }
+  return prefixes;
 }
 
 std::vector<PlanAlternative> ScanAlternatives(
@@ -309,15 +419,63 @@ std::vector<PlanAlternative> ScanAlternatives(
          ++index_offset) {
       const Index& index = table.GetIndex(index_offset);
 
-      // Point-union alternative for a constant IN list on the leading key
-      // (Phase 8 B). Offered alongside the range-based candidate so the cost
-      // model picks; the IN conjunct stays in the scan predicate, keeping
-      // correctness independent of bound tightness. Runs before the prefix
-      // consumption below, which may `continue` past this index.
-      const slot_t first_key_slot = index.sc_.key_.front();
-      const auto points = point_sets.find(first_key_slot);
+      // OR-of-conjunctions over distinct composite-key prefixes is a union
+      // of disjoint index ranges.  This keeps batched OLTP DML on its indexes
+      // instead of turning `(...pk...) OR (...pk...)` into a table scan.
+      if (const auto prefixes =
+              DisjunctiveIndexPrefixes(filter, schema, index)) {
+        std::vector<
+            std::pair<std::vector<Value>, std::vector<Value>>> scan_ranges;
+        scan_ranges.reserve(prefixes->size());
+        double access_rows = 0;
+        for (const std::vector<Value>& prefix : *prefixes) {
+          scan_ranges.emplace_back(prefix, prefix);
+          access_rows += EqualityPrefixRows(statistics, index, prefix);
+        }
+        Plan disjunctive = std::make_shared<IndexScanPlan>(
+            table, index, statistics, std::move(scan_ranges), true,
+            scan_predicate, std::vector<ColumnName>{},
+            required.require_row_position,
+            required.wait_for_write_intent);
+        if (fallback_select.size() != disjunctive->GetSchema().ColumnCount()) {
+          disjunctive = std::make_shared<ProjectionPlan>(
+              disjunctive, fallback_select);
+        }
+        disjunctive = finalize(disjunctive);
+        candidates.push_back(PlanAlternative{
+            .plan=std::move(disjunctive),
+            .local_cost=std::max(1.0, access_rows),
+            .estimated_rows=std::max(
+                1.0, access_rows * filter_selectivity)});
+      }
+
+      // Point-union alternative for a constant IN list after an equality
+      // prefix. Examples: `id IN (...)` and a composite `(warehouse,item)`
+      // index queried by `warehouse = ? AND item IN (...)`. Each point is a
+      // complete seek key through the IN column; the residual predicate keeps
+      // correctness independent of bound construction.
+      size_t point_key_offset = 0;
+      std::vector<Value> equality_prefix_values;
+      while (point_key_offset < index.sc_.key_.size()) {
+        const slot_t slot = index.sc_.key_[point_key_offset];
+        if (point_sets.contains(slot)) { break;
+}
+        const auto range = ranges.find(slot);
+        if (range == ranges.end() || !range->second.min ||
+            !range->second.max || *range->second.min != *range->second.max) {
+          point_key_offset = index.sc_.key_.size();
+          break;
+        }
+        equality_prefix_values.push_back(*range->second.min);
+        ++point_key_offset;
+      }
+      const bool has_point_column = point_key_offset < index.sc_.key_.size();
+      const slot_t point_key_slot =
+          has_point_column ? index.sc_.key_[point_key_offset] : slot_t{0};
+      const auto points = has_point_column ? point_sets.find(point_key_slot)
+                                           : point_sets.end();
       if (points != point_sets.end() &&
-          ranges.find(first_key_slot) == ranges.end()) {
+          ranges.find(point_key_slot) == ranges.end()) {
         std::vector<Value> values = points->second;
         std::ranges::sort(values);
         values.erase(std::ranges::unique(values).begin(), values.end());
@@ -326,19 +484,24 @@ std::vector<PlanAlternative> ScanAlternatives(
               scan_ranges;
           scan_ranges.reserve(values.size());
           for (const Value& value : values) {
-            scan_ranges.emplace_back(std::vector<Value>{value},
-                                     std::vector<Value>{value});
+            std::vector<Value> key = equality_prefix_values;
+            key.push_back(value);
+            std::vector<Value> end_key = key;
+            scan_ranges.emplace_back(std::move(key), std::move(end_key));
           }
           std::vector<ColumnName> point_order;
           if (scan_ranges.size() == 1) {
-            for (size_t key = 1; key < index.sc_.key_.size(); ++key) {
+            for (size_t key = point_key_offset + 1;
+                 key < index.sc_.key_.size(); ++key) {
               point_order.push_back(
                   schema.GetColumn(index.sc_.key_[key]).Name());
             }
           }
           Plan point_candidate = std::make_shared<IndexScanPlan>(
               table, index, statistics, std::move(scan_ranges), true,
-              scan_predicate, std::move(point_order));
+              scan_predicate, std::move(point_order),
+              required.require_row_position,
+              required.wait_for_write_intent);
           if (fallback_select.size() !=
               point_candidate->GetSchema().ColumnCount()) {
             point_candidate = std::make_shared<ProjectionPlan>(
@@ -349,9 +512,9 @@ std::vector<PlanAlternative> ScanAlternatives(
               static_cast<double>(point_candidate->AccessRowCount());
           // Per-point cardinality: rows / NDV of the leading key column.
           double ndv = 1.0;
-          if (first_key_slot < statistics.Columns()) {
+          if (point_key_slot < statistics.Columns()) {
             ndv = std::max<double>(
-                1.0, statistics.Column(first_key_slot).Distinct());
+                1.0, statistics.Column(point_key_slot).Distinct());
           }
           double point_rows =
               std::min<double>(static_cast<double>(statistics.Rows()),
@@ -426,6 +589,7 @@ std::vector<PlanAlternative> ScanAlternatives(
       Plan candidate = BuildIndexScan(
           table, index, statistics, begin_key, end_key, true, scan_predicate,
           fallback_select, required.require_row_position,
+          required.wait_for_write_intent,
           std::move(provided_order));
       // The scan filter is applied either by the scan itself or, when its
       // columns are not covered by the index key, by a Selection on top.
@@ -447,6 +611,9 @@ std::vector<PlanAlternative> ScanAlternatives(
       }
       candidate = finalize(candidate);
       auto local_cost = static_cast<double>(candidate->AccessRowCount());
+      local_cost = std::min(
+          local_cost,
+          EqualityPrefixRows(statistics, index, equality_prefix_values));
       // Residual (non-range) conjuncts narrow the output further.
       double estimated_rows =
           static_cast<double>(candidate->EmitRowCount()) * filter_selectivity;
@@ -575,9 +742,19 @@ std::vector<PlanAlternative> JoinAlternatives(
     const double cross_estimate = equi_conjuncts.empty()
                                       ? l_rows * r_rows
                                       : equi_estimate;
-    auto [plan, est] = with_residual(std::move(product), cross_estimate);
+    // The cross-product executor does not consume join keys.  A nested-loop
+    // implementation must therefore evaluate the complete join predicate,
+    // including equality conjuncts; `with_residual` is only valid for hash
+    // and index joins that already enforce those equalities themselves.
+    if (predicate) {
+      product = std::make_shared<SelectionPlan>(product, predicate,
+                                                product->GetStats());
+    }
     const double local_cost = (l_rows * r_rows) + l_rows + r_rows;
-    candidates.push_back(PlanAlternative{.plan=std::move(plan), .local_cost=local_cost, .estimated_rows=est});
+    candidates.push_back(PlanAlternative{
+        .plan=std::move(product),
+        .local_cost=local_cost,
+        .estimated_rows=cross_estimate});
   }
   if (equi_conjuncts.empty()) { return candidates;
 }
@@ -681,6 +858,62 @@ std::vector<PlanAlternative> JoinAlternatives(
 
 }  // namespace
 
+StatusOr<Plan> OptimizeSingleRelation(
+    const QueryData& query, const Expression& predicate,
+    const std::vector<NamedExpression>& projection_items, bool has_aggregate,
+    const cascades::PhysicalProperties& required,
+    const cascades::RuleContext& context) {
+  if (query.from_.size() != 1) { return Status::kNotImplemented; }
+
+  const std::string& relation = query.from_.front();
+  cascades::Memo memo;
+  const cascades::GroupId group = memo.Build(
+      query.from_, {{predicate, std::vector<std::string>{relation}}});
+  const cascades::Group& scan_group = memo.Get(group);
+  if (scan_group.expressions.size() != 1 ||
+      scan_group.expressions.front().operation !=
+          cascades::LogicalOperator::kScan) {
+    return Status::kNotImplemented;
+  }
+
+  std::vector<PlanAlternative> alternatives = ScanAlternatives(
+      memo, group, scan_group.expressions.front(), required, context,
+      /*include_indexes=*/true, /*include_full_scan=*/true);
+  if (alternatives.empty()) { return Status::kNotImplemented; }
+  auto ordered = [&](const PlanAlternative& alternative) {
+    return query.order_expressions_.empty() ||
+           alternative.plan->IsOrderedBy(query.order_expressions_,
+                                         query.order_ascending_);
+  };
+  const bool ordered_candidate =
+      std::ranges::any_of(alternatives, ordered);
+  const auto best = std::ranges::min_element(
+      alternatives, {}, [&](const PlanAlternative& alternative) {
+        // A physically ordered candidate avoids the engine-side sort.  The
+        // general Cascades search enforces this required property before
+        // comparing costs; mirror that behavior in the direct path.
+        return std::pair{ordered_candidate && !ordered(alternative),
+                         alternative.local_cost};
+      });
+  Plan plan = best->plan;
+  if (has_aggregate) {
+    if (required.require_row_position) { return Status::kNotImplemented; }
+    plan = std::make_shared<AggregationPlan>(plan, projection_items);
+  } else {
+    plan = std::make_shared<ProjectionPlan>(plan, projection_items);
+  }
+
+  if (query.limit_count_ != 0 || query.limit_offset_ != 0) {
+    const bool needs_ordering = !query.order_expressions_.empty();
+    if (!needs_ordering ||
+        plan->IsOrderedBy(query.order_expressions_, query.order_ascending_)) {
+      plan = std::make_shared<LimitPlan>(plan, query.limit_count_,
+                                         query.limit_offset_);
+    }
+  }
+  return plan;
+}
+
 const cascades::ImplementationRuleSet& DefaultImplementationRules() {
   using cascades::dsl::Any;
   using cascades::dsl::Scan;
@@ -689,6 +922,22 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
   namespace c = cascades;
   static const c::ImplementationRuleSet rules = [] {
     c::ImplementationRuleSet built;
+    built.Add(c::ImplementationRule(
+        "relational_ir",
+        c::Pattern::Op(c::LogicalOperator::kRelational, {}),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>&, const PhysicalProperties&,
+           const c::RuleContext&) {
+          if (!logical.relational_statement) {
+            return std::vector<PlanAlternative>{};
+          }
+          Plan plan = std::make_shared<RelationalPlan>(
+              logical.relational_statement, logical.output_schema);
+          return std::vector<PlanAlternative>{PlanAlternative{
+              .plan=std::move(plan), .local_cost=1.0, .estimated_rows=1.0}};
+        },
+        c::LogicalOperator::kRelational));
     built.Add(c::ImplementationRule(
         "index_scan", Scan(),
         [](c::GroupId group, const c::Memo& memo, const c::Bindings&,

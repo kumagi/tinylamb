@@ -58,7 +58,7 @@ class IndexKey final {
       throw std::runtime_error("corrupt index key: truncated header");
     }
     bin_size_t size = 0;
-    memcpy(&size, src, sizeof(bin_size_t));
+    DeserializeU16(src, &size);
     if (static_cast<size_t>(size) >
         static_cast<size_t>(end - src) - sizeof(bin_size_t)) {
       throw std::runtime_error("corrupt index key: length prefix out of range");

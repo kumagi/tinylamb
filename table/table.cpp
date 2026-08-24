@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <optional>
 #include <cstdint>
 #include <ostream>
@@ -84,8 +85,18 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
   return Status::kSuccess;
 }
 
+namespace {
+// Phase1-4: once the append point has less free space left than this, the
+// next Insert call pre-allocates and links a fresh tail page so the
+// allocation cost (and the page-full chain walk) leaves the hot path.
+constexpr bin_size_t kTailPreallocateThreshold = kPageBodySize / 16;
+}  // namespace
+
 StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
-  PageRef ref = txn.GetPageManager()->GetPage(last_pid_);
+  PageManager* const page_manager = txn.GetPageManager();
+  const page_id_t cached_tail =
+      page_manager->GetTableTail(first_pid_, last_pid_);
+  PageRef ref = page_manager->GetPage(cached_tail);
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
   StatusOr<slot_t> pos = ref->Insert(txn, serialized_row);
@@ -96,8 +107,10 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
   } else if (pos.GetStatus() == Status::kNoSpace) {
     bool finished = false;
     while (ref->body.row_page.next_page_id_ != 0) {
+      const page_id_t previous = ref->PageID();
       PageRef next =
-          txn.GetPageManager()->GetPage(ref->body.row_page.next_page_id_);
+          page_manager->GetPage(ref->body.row_page.next_page_id_);
+      page_manager->AdvanceTableTail(first_pid_, previous, next->PageID());
       ref = std::move(next);
       StatusOr<slot_t> next_pos = ref->Insert(txn, serialized_row);
       if (next_pos.GetStatus() == Status::kSuccess) {
@@ -127,7 +140,8 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
       rp.slot = new_pos.Value();
       ref->body.row_page.next_page_id_ = new_page->PageID();
       new_page->body.row_page.prev_page_id_ = ref->PageID();
-      last_pid_ = new_page->PageID();
+      page_manager->AdvanceTableTail(first_pid_, ref->PageID(),
+                                     new_page->PageID());
     }
   } else {
     return pos.GetStatus();
@@ -135,6 +149,23 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
   // Release the latch early: the index updates below re-enter row pages via
   // GetPage(), which would otherwise self-deadlock on this page's latch.
   // PageRef::PageUnlock is idempotent, so the destructor stays safe.
+  //
+  // Phase1-4 hotspot spread: while still holding the landing page's latch,
+  // pre-link an empty successor when it is nearly full and still the chain
+  // tail. Concurrent appenders then find last_pid_ already advanced instead
+  // of piling onto the same nearly-full page (and paying the allocation
+  // under its latch). The `next_page_id_ == 0` guard makes the rotation
+  // idempotent under latch serialization: whoever runs second sees the link
+  // and skips. Chain order and last_pid_'s "tail" meaning are unchanged.
+  if (ref->body.row_page.free_size_ < kTailPreallocateThreshold &&
+      ref->body.row_page.next_page_id_ == 0) {
+    PageRef successor =
+        txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage);
+    successor->body.row_page.prev_page_id_ = ref->PageID();
+    ref->body.row_page.next_page_id_ = successor->PageID();
+    page_manager->AdvanceTableTail(first_pid_, ref->PageID(),
+                                   successor->PageID());
+  }
   ref.PageUnlock();
   for (size_t i = 0; i < indexes_.size(); ++i) {
     const Status status = IndexInsert(txn, indexes_[i], row, rp);
@@ -154,49 +185,137 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
 }
 
 namespace {
-bool IndexCoversUnchanged(const Index& idx, const Row& original,
-                          const Row& updated) {
-  if (idx.GenerateKey(original) != idx.GenerateKey(updated)) { return false;
+// Phase2-5: index-maintenance decisions come from comparing column offsets,
+// not from regenerating every index key. Only columns some index consumes
+// are examined.
+// Key columns feed GenerateKey, i.e. EncodeMemcomparableFormat: equality
+// must mirror the encoded bytes exactly, so doubles compare bit-wise here
+// (Value::operator== applies an epsilon that would miss real key drift).
+bool KeyColumnChanged(const Value& a, const Value& b) {
+  if (a.type != b.type) {
+    return true;
+  }
+  switch (a.type) {
+    case ValueType::kInt64:
+    case ValueType::kDate:
+      return a.value.int_value != b.value.int_value;
+    case ValueType::kVarChar:
+      return a.value.varchar_value != b.value.varchar_value;
+    case ValueType::kDouble:
+      return std::memcmp(&a.value.double_value, &b.value.double_value,
+                         sizeof(double)) != 0;
+    case ValueType::kNull:
+      return false;
+  }
+  return true;
 }
-  return std::ranges::all_of(idx.sc_.include_, [&](slot_t slot) {
-    return original[slot] == updated[slot];
-  });
+
+// True when no column feeding this index (key or include) differs between
+// the original and the updated row.
+bool IndexCoversUnchanged(
+    const Index& idx, const std::vector<slot_t>& changed_key_columns,
+    const std::vector<slot_t>& changed_include_columns) {
+  const auto untouched = [](const std::vector<slot_t>& columns,
+                            const std::vector<slot_t>& changed) {
+    return std::ranges::all_of(columns, [&](slot_t slot) {
+      return std::find(changed.begin(), changed.end(), slot) == changed.end();
+    });
+  };
+  return untouched(idx.sc_.key_, changed_key_columns) &&
+         untouched(idx.sc_.include_, changed_include_columns);
 }
 }  // namespace
 
 StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
                                     const Row& row) {
-  if (!txn.AddWriteSet(pos)) {
-    return Status::kConflicts;
+  // Phase2-3: the previous image feeds index maintenance only. Tables
+  // without indexes skip the deserialize roundtrip entirely; RowPage::Update
+  // still rejects absent/invisible slots with the same status Table::Read
+  // would have produced. Read before RowPage::Update reserves the write
+  // intent: an unstaged intent is deliberately invisible even to its owner.
+  // The reservation still enforces first-updater-wins against any writer
+  // that commits between this snapshot read and the physical update.
+  Row original_row;
+  if (!indexes_.empty()) {
+    StatusOr<Row> visible = Read(txn, pos);
+    RETURN_IF_FAIL(visible.GetStatus());
+    original_row = visible.MoveValue();
   }
-  ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
   RowPosition new_pos = pos;
+  // Changed-column offsets among the columns indexes consume. Two tiny
+  // sorted-unique lists replace two GenerateKey() string builds per index.
+  std::vector<slot_t> changed_key_columns;
+  std::vector<slot_t> changed_include_columns;
   bool indexes_unchanged = true;
-  for (const auto& idx : indexes_) {
-    if (!IndexCoversUnchanged(idx, original_row, row)) {
-      indexes_unchanged = false;
-      break;
+  if (!indexes_.empty()) {
+    for (const auto& idx : indexes_) {
+      changed_key_columns.insert(changed_key_columns.end(),
+                                 idx.sc_.key_.begin(), idx.sc_.key_.end());
+      changed_include_columns.insert(changed_include_columns.end(),
+                                     idx.sc_.include_.begin(),
+                                     idx.sc_.include_.end());
     }
+    std::sort(changed_key_columns.begin(), changed_key_columns.end());
+    changed_key_columns.erase(
+        std::unique(changed_key_columns.begin(), changed_key_columns.end()),
+        changed_key_columns.end());
+    std::sort(changed_include_columns.begin(), changed_include_columns.end());
+    changed_include_columns.erase(
+        std::unique(changed_include_columns.begin(),
+                    changed_include_columns.end()),
+        changed_include_columns.end());
+    const auto changed = [&](const std::vector<slot_t>& watched, bool key) {
+      std::vector<slot_t> diff;
+      for (slot_t slot : watched) {
+        if (slot < original_row.values_.size() && slot < row.values_.size()) {
+          const Value& before = original_row[slot];
+          const Value& after = row[slot];
+          const bool differs =
+              key ? KeyColumnChanged(before, after) : before != after;
+          if (differs) {
+            diff.push_back(slot);
+          }
+        }
+      }
+      return diff;
+    };
+    changed_key_columns = changed(changed_key_columns, true);
+    changed_include_columns = changed(changed_include_columns, false);
+    indexes_unchanged = std::ranges::all_of(indexes_, [&](const Index& idx) {
+      return IndexCoversUnchanged(idx, changed_key_columns,
+                                  changed_include_columns);
+    });
   }
+  // Per-index B+Tree landing-leaf cursors: shared by the delete and insert
+  // phases below so the second descent on the same tree reuses the leaf the
+  // first one landed on whenever the live routing agrees.
+  std::vector<page_id_t> idx_cursors(indexes_.size(), 0);
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
   // Best-effort compensations: a failed index mutation must not leave applied
   // entries behind (old keys deleted / new keys partially inserted).
   const auto reinstate_old_keys = [&](size_t count, const RowPosition& at) {
     for (size_t j = 0; j < count; ++j) {
-      std::ignore = IndexInsert(txn, indexes_[j], original_row, at);
+      std::ignore = IndexInsert(txn, indexes_[j], original_row, at,
+                                &idx_cursors[j]);
     }
   };
   const auto undo_index_inserts = [&](size_t count) {
     for (size_t j = 0; j < count; ++j) {
-      std::ignore = IndexDelete(txn, indexes_[j], new_pos, row);
+      std::ignore = IndexDelete(txn, indexes_[j], new_pos, row,
+                                &idx_cursors[j]);
     }
   };
+  // Phase2-3: serialize the pre-update image once, on first use, instead of
+  // rebuilding it for every compensation attempt.
+  std::string original_image;
   const auto restore_physical_row = [&]() {
-    std::string image(original_row.Size(), '\0');
-    original_row.Serialize(image.data());
+    if (original_image.empty()) {
+      original_image.resize(original_row.Size());
+      std::ignore = original_row.Serialize(original_image.data());
+    }
     PageRef written = txn.GetPageManager()->GetPage(pos.page_id);
-    std::ignore = written->Update(txn, pos.slot, image);
+    std::ignore = written->Update(txn, pos.slot, original_image);
   };
 
   PageRef page = txn.GetPageManager()->GetPage(new_pos.page_id);
@@ -208,7 +327,8 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     Status failure = Status::kSuccess;
     size_t deleted = 0;
     for (; deleted < indexes_.size(); ++deleted) {
-      failure = IndexDelete(txn, indexes_[deleted], pos, original_row);
+      failure = IndexDelete(txn, indexes_[deleted], pos, original_row,
+                            &idx_cursors[deleted]);
       if (failure != Status::kSuccess) { break;
 }
     }
@@ -221,7 +341,8 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     }
     size_t inserted = 0;
     for (; inserted < indexes_.size(); ++inserted) {
-      failure = IndexInsert(txn, indexes_[inserted], row, new_pos);
+      failure = IndexInsert(txn, indexes_[inserted], row, new_pos,
+                            &idx_cursors[inserted]);
       if (failure != Status::kSuccess) { break;
 }
     }
@@ -240,7 +361,8 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   Status failure = Status::kSuccess;
   size_t deleted = 0;
   for (; deleted < indexes_.size(); ++deleted) {
-    failure = IndexDelete(txn, indexes_[deleted], pos, original_row);
+    failure = IndexDelete(txn, indexes_[deleted], pos, original_row,
+                          &idx_cursors[deleted]);
     if (failure != Status::kSuccess) { break;
 }
   }
@@ -284,21 +406,23 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
       return new_slot.GetStatus();
     }
     RowPosition new_row_pos(new_page->PageID(), new_slot.Value());
-    // Release the latch early: relinking below pins last_pid_, and this page
-    // may be the very page GetPage(last_pid_) returns.  PageUnlock is
+    // Release the latch early: relinking below re-pins the tail page. PageUnlock is
     // idempotent, so the destructor stays safe.
+    const page_id_t tail_page_id = page->PageID();
     page.PageUnlock();
     {
-      PageRef last_page = txn.GetPageManager()->GetPage(last_pid_);
+      PageRef last_page = txn.GetPageManager()->GetPage(tail_page_id);
       last_page->body.row_page.next_page_id_ = new_page->PageID();
       new_page->body.row_page.prev_page_id_ = last_page->PageID();
     }
     new_pos = new_row_pos;
-    last_pid_ = new_page->PageID();
+    txn.GetPageManager()->AdvanceTableTail(first_pid_, tail_page_id,
+                                           new_page->PageID());
   }
   size_t inserted = 0;
   for (; inserted < indexes_.size(); ++inserted) {
-    failure = IndexInsert(txn, indexes_[inserted], row, new_pos);
+    failure = IndexInsert(txn, indexes_[inserted], row, new_pos,
+                          &idx_cursors[inserted]);
     if (failure != Status::kSuccess) { break;
 }
   }
@@ -335,6 +459,26 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
   }
   const Status delete_status =
       txn.GetPageManager()->GetPage(pos.page_id)->Delete(txn, pos.slot);
+  if (delete_status == Status::kNotExists) {
+    // The snapshot read above proved the row is logically visible, yet its
+    // physical image is gone from the slot: RowPage::Read fell back to the
+    // MVCC version chain because the slot is vacant.  That displaced state
+    // is produced by abort-time undo restoring a deleted row into the first
+    // free slot instead of its original one (recovery LogUndo ->
+    // Page::InsertImpl -> RowPage::InsertRow), leaving the index pointing at
+    // an empty slot over a still-visible version.  Failing here turned every
+    // later DELETE of such a row into a hard error -- the TPC-C Delivery
+    // "delivery queue delete affected too few rows" outage.  Complete the
+    // delete logically instead: the index keys are already removed above and
+    // the tombstone below hides the row from future snapshots while older
+    // snapshots keep reading their own version.  No kDeleteRow record is
+    // written on purpose: redoing a physical delete against a vacant slot
+    // would corrupt row accounting after restart.
+    std::string image(original_row.Size(), '\0');
+    original_row.Serialize(image.data());
+    txn.RegisterVersionWrite(pos, image, std::nullopt);
+    return Status::kSuccess;
+  }
   if (delete_status != Status::kSuccess && !indexes_.empty()) {
     // The physical delete failed after all keys were removed: reinstate them
     // so the surviving row stays reachable from every index.
@@ -350,7 +494,7 @@ StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
   // buffer, which is only guaranteed stable while the page stays pinned.
   // (The resulting Row owns its strings; Value::Deserialize copies varchar
   // data out of the buffer.)
-  PageRef page = txn.GetPageManager()->GetPage(pos.page_id);
+  PageRef page = txn.GetPageManager()->GetPage(pos.page_id, true);
   ASSIGN_OR_RETURN(std::string_view, read_row, page->Read(txn, pos.slot));
   Row result;
   // Length-prefixed row image from a checksummed page: consumed by offsets,
@@ -362,33 +506,56 @@ StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
 }
 
 Status Table::IndexInsert(Transaction& txn, const Index& idx,
-                          const Row& new_row, const RowPosition& pos) {
+                          const Row& new_row, const RowPosition& pos,
+                          page_id_t* hint_leaf) const {
   BPlusTree bpt(idx.pid_);
+  const std::string key = idx.GenerateKey(new_row);
   std::vector<Value> include_values;
   include_values.reserve(idx.sc_.include_.size());
   for (const auto& in : idx.sc_.include_) {
     include_values.push_back(new_row[in]);
   }
   Row include(include_values);
-  if (idx.IsUnique()) {
+  // One landing-leaf cursor serves the read-modify-write pair below.
+  page_id_t cursor = 0;
+  if (hint_leaf != nullptr) {
+    cursor = *hint_leaf;
+  }
+  if (idx.StoresSingleValue()) {
     // BTree value is encoded pair<RowPosition, vector<Value>>.
     IndexValueType val;
     val.pos = pos;
     val.include = include;
-    RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(new_row), Encode(val)));
+    RETURN_IF_FAIL(bpt.Insert(txn, key, Encode(val), &cursor));
   } else {
     // BTree value is encoded vector<pair<RowPosition, vector<Value>>>.
-    StatusOr<std::string_view> existing_value =
-        bpt.Read(txn, idx.GenerateKey(new_row));
+    StatusOr<std::string_view> existing_value = bpt.Read(txn, key, &cursor);
     if (existing_value.HasValue()) {
       std::string_view existing_data = existing_value.Value();
       auto rps = Decode<std::vector<IndexValueType>>(existing_data);
+      if (idx.IsUnique()) {
+        for (const IndexValueType& value : rps) {
+          if (value.pos == pos) {
+            // An UPDATE whose key did not change needs no second entry.  The
+            // heap supplies the versioned row; index-only scans are not used
+            // for this mode because INCLUDE values are not versioned here.
+            if (hint_leaf != nullptr) { *hint_leaf = cursor; }
+            return Status::kSuccess;
+          }
+          if (Read(txn, value.pos).HasValue()) {
+            return Status::kDuplicates;
+          }
+        }
+      }
       rps.push_back({pos, include});
-      RETURN_IF_FAIL(bpt.Update(txn, idx.GenerateKey(new_row), Encode(rps)));
+      RETURN_IF_FAIL(bpt.Update(txn, key, Encode(rps), &cursor));
     } else {
       std::vector<IndexValueType> rps{{pos, include}};
-      RETURN_IF_FAIL(bpt.Insert(txn, idx.GenerateKey(new_row), Encode(rps)));
+      RETURN_IF_FAIL(bpt.Insert(txn, key, Encode(rps), &cursor));
     }
+  }
+  if (hint_leaf != nullptr) {
+    *hint_leaf = cursor;
   }
   return Status::kSuccess;
 }
@@ -400,23 +567,35 @@ Status Table::IndexDelete(Transaction& txn, const Index& idx,
 }
 
 Status Table::IndexDelete(Transaction& txn, const Index& idx,
-                          const RowPosition& pos, const Row& original_row) {
+                          const RowPosition& pos, const Row& original_row,
+                          page_id_t* hint_leaf) {
   BPlusTree bpt(idx.pid_);
-  std::string key = idx.GenerateKey(original_row);
-  if (idx.IsUnique()) {
+  const std::string key = idx.GenerateKey(original_row);
+  page_id_t cursor = 0;
+  if (idx.RetainsDeletedEntries()) {
+    // Keep the key -> RowPosition edge.  RowPage MVCC decides whether the
+    // pointed version is visible, which makes the same index usable by both
+    // a pre-delete reader and a post-delete reader without a table scan.
+    if (hint_leaf != nullptr) { *hint_leaf = cursor; }
+    return Status::kSuccess;
+  }
+  if (idx.StoresSingleValue()) {
     RETURN_IF_FAIL(bpt.Delete(txn, key));
   } else {
-    ASSIGN_OR_RETURN(std::string_view, existing_data,
-                     bpt.Read(txn, idx.GenerateKey(original_row)));
+    ASSIGN_OR_RETURN(std::string_view, existing_data, bpt.Read(txn, key, &cursor));
     auto values = Decode<std::vector<IndexValueType>>(existing_data);
     std::erase_if(values,
                   [&](const IndexValueType& v) { return v.pos == pos; });
     if (values.empty()) {
       RETURN_IF_FAIL(bpt.Delete(txn, key));
     } else {
-      RETURN_IF_FAIL(bpt.Update(txn, key, Encode(values)));
+      RETURN_IF_FAIL(bpt.Update(txn, key, Encode(values), &cursor));
     }
   }
+  if (hint_leaf != nullptr) {
+    *hint_leaf = cursor;
+  }
+  txn.MarkIndexKeysChanged(idx.Root());
   return Status::kSuccess;
 }
 

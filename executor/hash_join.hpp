@@ -28,6 +28,7 @@
 
 #include "executor/executor_base.hpp"
 #include "executor/hash_join_mode.hpp"
+#include "executor/join_kind.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
@@ -84,6 +85,12 @@ class HashJoin : public ExecutorBase {
   HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
            std::vector<slot_t> right_cols, HashJoinMode mode,
            size_t worker_count = std::thread::hardware_concurrency());
+  // Semi/anti variants (decorrelated IN / EXISTS / NOT EXISTS). The probe
+  // side is always the left child: matching emits that row once (semi) or
+  // not at all (anti), and its row position survives for UPDATE/DELETE.
+  HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
+           std::vector<slot_t> right_cols, HashJoinMode mode, JoinKind kind,
+           size_t worker_count = std::thread::hardware_concurrency());
   HashJoin(const HashJoin&) = delete;
   HashJoin(HashJoin&&) = delete;
   HashJoin& operator=(const HashJoin&) = delete;
@@ -97,6 +104,7 @@ class HashJoin : public ExecutorBase {
 
   [[nodiscard]] size_t WorkerCount() const { return worker_count_; }
   [[nodiscard]] HashJoinMode Mode() const { return mode_; }
+  [[nodiscard]] JoinKind Kind() const { return kind_; }
 
  private:
   struct JoinState;
@@ -105,6 +113,11 @@ class HashJoin : public ExecutorBase {
   void MaterializeInMemory();
   void MaterializeHybrid();
   void MaterializeOrThrow();
+  // Dedicated semi/anti pipeline: materialize both sides (reactive spill
+  // aware), index the right side, and stream left rows through an existence
+  // check. Output rows are the untouched probe rows, so row positions are
+  // preserved for UPDATE/DELETE consumers.
+  void MaterializeSemiAnti();
 
   void IntakeBothSides();
   void BuildShards();
@@ -113,8 +126,9 @@ class HashJoin : public ExecutorBase {
   void SetupInMemoryJoin();
   void SetupOneSideSpilled();
   void SetupBothSpilled();
+  template <typename RightCont>
   void JoinPartitionPair(const std::vector<std::pair<Row, RowPosition>>& left_part,
-                         const std::vector<Row>& right_part,
+                         const RightCont& right_part,
                          std::vector<std::pair<Row, RowPosition>>* out);
   void RunStripedProbe();
   bool EmitNextMatch(Row* dst, RowPosition* rp);
@@ -125,6 +139,7 @@ class HashJoin : public ExecutorBase {
   std::vector<slot_t> right_cols_;
 
   HashJoinMode mode_{HashJoinMode::kInMemory};
+  JoinKind kind_{JoinKind::kInner};
   size_t worker_count_;
   bool materialized_{false};
   bool materialize_failed_{false};

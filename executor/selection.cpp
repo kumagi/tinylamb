@@ -40,6 +40,11 @@
 namespace tinylamb {
 namespace {
 
+// OLAP early promotion: a stream of full batches this deep implies an
+// estimated row count far beyond the JIT compile break-even, so waiting for
+// the cumulative 20M-evaluation threshold would waste most of the scan.
+constexpr size_t kJitEarlyPromotionRows = 512 * 1024;
+
 BinaryOperation Flip(BinaryOperation operation) {
   switch (operation) {
     case BinaryOperation::kLessThan:
@@ -127,7 +132,15 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
     }
     std::optional<ColumnVector> predicates;
     rows_seen_ += input_batch_.Size();
-    if (bytecode_ && !jit_attempted_ && rows_seen_ >= jit_threshold_rows_) {
+    // Early promotion OR-condition: once the scan has streamed enough full
+    // batches, its estimated row count dwarfs the JIT break-even point
+    // (docs/jit_profile.md), so compiling now pays off long before the
+    // cumulative threshold would fire.  That cumulative threshold remains as
+    // the fallback for short or fragmented scans.
+    if (bytecode_ && !jit_attempted_ &&
+        (rows_seen_ >= jit_threshold_rows_ ||
+         (rows_seen_ >= kJitEarlyPromotionRows &&
+          input_batch_.Size() >= kDefaultVectorSize))) {
       jit_attempted_ = true;
       const auto& instructions = bytecode_->Instructions();
       if (instructions.size() == 3 &&
@@ -157,14 +170,32 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
     } else if (bytecode_) {
       predicates.emplace(bytecode_->EvaluateBatch(input_batch_));
     }
-    for (size_t i = 0; i < input_batch_.Size(); ++i) {
-      const Value predicate = predicates
-                                  ? predicates->ValueAt(i)
-                                  : exp_->Evaluate(input_batch_.RowAt(i),
-                                                   schema_);
-      if (!predicate.IsNull() && predicate.Truthy()) {
-        destination->Append(input_batch_, i);
+    selection_vector_.clear();
+    if (predicates &&
+        predicates->Type() == ValueType::kInt64) {
+      // Batch-evaluated predicates: read the boolean column straight from
+      // typed storage instead of boxing one Value per row.
+      const std::vector<int64_t>& bits = predicates->IntegerData();
+      for (size_t i = 0; i < input_batch_.Size(); ++i) {
+        if (!predicates->IsNull(i) && bits[i] != 0) {
+          selection_vector_.push_back(static_cast<uint32_t>(i));
+        }
       }
+    } else {
+      for (size_t i = 0; i < input_batch_.Size(); ++i) {
+        const Value predicate = predicates
+                                    ? predicates->ValueAt(i)
+                                    : exp_->Evaluate(input_batch_.RowAt(i),
+                                                     schema_);
+        if (!predicate.IsNull() && predicate.Truthy()) {
+          selection_vector_.push_back(static_cast<uint32_t>(i));
+        }
+      }
+    }
+    // Gather-append the surviving rows in one bulk copy.
+    if (!selection_vector_.empty()) {
+      destination->AppendGather(input_batch_, selection_vector_.data(),
+                                selection_vector_.size());
     }
   }
   return destination->Size();

@@ -40,6 +40,7 @@
 #include "plan/index_scan_plan.hpp"
 #include "plan/optimizer.hpp"
 #include "plan/plan.hpp"
+#include "query/plan_cache.hpp"
 #include "query/query_data.hpp"
 #include "query/sql_engine.hpp"
 #include "query/statement.hpp"
@@ -722,6 +723,135 @@ TEST_F(QueryTest, SqlEngineExplainDoesNotExecuteDdlOrDml) {
   // Act + Assert -- EXPLAIN over SELECT still works.
   StatusOr<Executor> explain_select = engine.Prepare(ctx, "EXPLAIN SELECT a FROM t;");
   ASSERT_TRUE(explain_select.HasValue()) << engine.LastError();
+
+  ctx.txn_.Abort();
+}
+
+namespace {
+// Drains one statement through `engine` and returns the materialized rows.
+std::vector<Row> RunPrepared(SqlEngine* engine, TransactionContext* ctx,
+                             const std::string& sql) {
+  std::vector<Row> rows;
+  StatusOr<Executor> prepared = engine->Prepare(*ctx, sql);
+  EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
+                                                    << engine->LastError();
+  if (!prepared.HasValue()) { return rows;
+}
+  Row row;
+  while (prepared.Value()->Next(&row, nullptr)) { rows.push_back(row);
+}
+  return rows;
+}
+}  // namespace
+
+TEST_F(QueryTest, SqlEnginePlanCacheHitsOnRepeatedStatement) {
+  // Arrange -- a unique table so no other test shares this fingerprint.
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_, "CREATE TABLE pcache_hit (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO pcache_hit VALUES (7, 70), (8, 80);");
+
+  // Act -- run the identical templatable SELECT twice.
+  const std::string sql = "SELECT v FROM pcache_hit WHERE k = 7;";
+  std::vector<Row> first = RunPrepared(&engine, &ctx, sql);
+  const uint64_t hits_before = PlanCacheStats().hits.load();
+  std::vector<Row> second = RunPrepared(&engine, &ctx, sql);
+
+  // Assert -- the second execution is a compiled-plan cache hit and both
+  // executions agree with the table contents.
+  ASSERT_EQ(first.size(), 1U);
+  EXPECT_EQ(first[0][0], Value(70));
+  ASSERT_EQ(second.size(), 1U);
+  EXPECT_EQ(second[0][0], Value(70));
+  EXPECT_EQ(PlanCacheStats().hits.load(), hits_before + 1);
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEnginePlanCacheInvalidatedByDdlAndAnalyze) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_, "CREATE TABLE pcache_ddl (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO pcache_ddl VALUES (5, 50);");
+  ASSERT_EQ(RunPrepared(&engine, &ctx,
+                        "SELECT v FROM pcache_ddl WHERE k = 5;")[0][0],
+            Value(50));
+
+  // Act (a) -- DROP + re-CREATE the same-named table with different data.
+  // The fingerprint of the SELECT is unchanged, but the stale entry must be
+  // discarded via the epoch check instead of replaying old page contents.
+  ASSERT_TRUE(engine.Prepare(ctx, "DROP TABLE pcache_ddl;").HasValue());
+  RunSql(ctx, *db_, "CREATE TABLE pcache_ddl (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO pcache_ddl VALUES (5, 555);");
+  const uint64_t invalidations_before = PlanCacheStats().epoch_invalidations.load();
+  std::vector<Row> recreated =
+      RunPrepared(&engine, &ctx, "SELECT v FROM pcache_ddl WHERE k = 5;");
+
+  // Assert (a) -- fresh compile observed the new table contents.
+  ASSERT_EQ(recreated.size(), 1U);
+  EXPECT_EQ(recreated[0][0], Value(555));
+  EXPECT_GT(PlanCacheStats().epoch_invalidations.load(), invalidations_before);
+
+  // Act (b) -- ANALYZE refreshes statistics and must invalidate too.
+  RunSql(ctx, *db_, "INSERT INTO pcache_ddl VALUES (6, 60);");
+  ASSERT_TRUE(engine.Prepare(ctx, "ANALYZE pcache_ddl;").HasValue());
+  const uint64_t invalidations_mid = PlanCacheStats().epoch_invalidations.load();
+  std::vector<Row> analyzed =
+      RunPrepared(&engine, &ctx, "SELECT v FROM pcache_ddl WHERE k = 6;");
+  ASSERT_EQ(analyzed.size(), 1U);
+  EXPECT_EQ(analyzed[0][0], Value(60));
+  EXPECT_GT(PlanCacheStats().epoch_invalidations.load(), invalidations_mid);
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEnginePlanCacheParameterCorrectness) {
+  // (1) SELECT with differing literals: a specialized entry is only served
+  // for identical parameters, and differing parameters re-specialize it.
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_, "CREATE TABLE pcache_param (k INT64, v INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO pcache_param VALUES (1, 10), (2, 20), (3, 30);");
+  ASSERT_EQ(RunPrepared(&engine, &ctx,
+                        "SELECT v FROM pcache_param WHERE k = 1;")[0][0],
+            Value(10));  // fills the entry with k=1's plan
+  ASSERT_EQ(RunPrepared(&engine, &ctx,
+                        "SELECT v FROM pcache_param WHERE k = 2;")[0][0],
+            Value(20));  // parameter mismatch: legacy compile, refresh entry
+  uint64_t hits_before = PlanCacheStats().hits.load();
+  ASSERT_EQ(RunPrepared(&engine, &ctx,
+                        "SELECT v FROM pcache_param WHERE k = 2;")[0][0],
+            Value(20));  // repeat must HIT the refreshed k=2 plan
+  EXPECT_EQ(PlanCacheStats().hits.load(), hits_before + 1);
+  EXPECT_EQ(RunPrepared(&engine, &ctx,
+                        "SELECT v FROM pcache_param WHERE k = 3;")[0][0],
+            Value(30));
+
+  // (2) INSERT artifacts are parametric: every repeated shape hits regardless
+  // of its literal values because slots receive per-execution values.
+  RunSql(ctx, *db_, "CREATE TABLE pcache_ins (a INT64, b STRING(8));");
+  RunSql(ctx, *db_, "INSERT INTO pcache_ins VALUES (11, 'x');");
+  hits_before = PlanCacheStats().hits.load();
+  RunSql(ctx, *db_, "INSERT INTO pcache_ins VALUES (12, 'y');");
+  EXPECT_GT(PlanCacheStats().hits.load(), hits_before);
+  // Explicit column lists exercise the baked reorder map under the cache.
+  RunSql(ctx, *db_, "INSERT INTO pcache_ins (b, a) VALUES ('z', 13);");
+  hits_before = PlanCacheStats().hits.load();
+  RunSql(ctx, *db_, "INSERT INTO pcache_ins (b, a) VALUES ('w', 14);");
+  EXPECT_GT(PlanCacheStats().hits.load(), hits_before);
+
+  // Assert -- exactly the inserted rows are visible.
+  std::vector<Row> contents = RunPrepared(
+      &engine, &ctx, "SELECT a, b FROM pcache_ins ORDER BY a;");
+  ASSERT_EQ(contents.size(), 4U);
+  EXPECT_EQ(contents[0][0], Value(11));
+  EXPECT_EQ(contents[0][1], Value("x"));
+  EXPECT_EQ(contents[1][0], Value(12));
+  EXPECT_EQ(contents[1][1], Value("y"));
+  EXPECT_EQ(contents[2][0], Value(13));
+  EXPECT_EQ(contents[2][1], Value("z"));
+  EXPECT_EQ(contents[3][0], Value(14));
+  EXPECT_EQ(contents[3][1], Value("w"));
 
   ctx.txn_.Abort();
 }

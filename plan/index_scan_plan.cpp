@@ -13,10 +13,6 @@
 #include <string>
 
 #include "database/transaction_context.hpp"
-#include "executor/executor_base.hpp"
-#include "executor/full_scan.hpp"
-#include "executor/index_scan.hpp"
-#include "executor/selection.hpp"
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 #include "index/index.hpp"
@@ -84,7 +80,8 @@ IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
                              std::vector<Value> begin_key,
                              std::vector<Value> end_key, bool ascending,
                              Expression where,
-                             std::vector<ColumnName> provided_order)
+                             std::vector<ColumnName> provided_order,
+                             bool lock_rows, bool wait_for_write_intent)
     : table_(table),
       index_(index),
       stats_(ts.TransformBy(index.sc_.key_[0], FirstOrNull(begin_key),
@@ -92,6 +89,8 @@ IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
       begin_key_(std::move(begin_key)),
       end_key_(std::move(end_key)),
       ascending_(ascending),
+      lock_rows_(lock_rows),
+      wait_for_write_intent_(wait_for_write_intent),
       where_(std::move(where)),
       provided_order_(std::move(provided_order)) {}
 
@@ -99,7 +98,8 @@ IndexScanPlan::IndexScanPlan(
     const Table& table, const Index& index, const TableStatistics& ts,
     std::vector<std::pair<std::vector<Value>, std::vector<Value>>> ranges,
     bool ascending, Expression where,
-    std::vector<ColumnName> provided_order)
+    std::vector<ColumnName> provided_order, bool lock_rows,
+    bool wait_for_write_intent)
     : table_(table),
       index_(index),
       stats_(BoundsStats(ts, index, ranges)),
@@ -107,27 +107,12 @@ IndexScanPlan::IndexScanPlan(
       end_key_(),
       point_ranges_(std::move(ranges)),
       ascending_(ascending),
+      lock_rows_(lock_rows),
+      wait_for_write_intent_(wait_for_write_intent),
       where_(std::move(where)),
       provided_order_(std::move(provided_order)) {}
 
-Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
-  if (txn.txn_.IndexKeysMayBeStale()) {
-    // Fallback route scans the table directly; Selection requires a real
-    // predicate, so pass the plain scan through when there is none.
-    Executor scan = std::make_shared<FullScan>(txn.txn_, table_);
-    if (!where_) { return scan;
-}
-    return std::make_shared<Selection>(where_, table_.GetSchema(),
-                                       std::move(scan));
-  }
-  if (!point_ranges_.empty()) {
-    return std::make_shared<IndexScan>(txn.txn_, table_, index_,
-                                       point_ranges_, ascending_, where_,
-                                       GetSchema());
-  }
-  return std::make_shared<IndexScan>(txn.txn_, table_, index_, begin_key_,
-                                     end_key_, ascending_, where_, GetSchema());
-}
+// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
 
 const Schema& IndexScanPlan::GetSchema() const { return table_.GetSchema(); }
 

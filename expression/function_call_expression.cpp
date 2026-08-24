@@ -31,8 +31,7 @@
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
-#include "database/database.hpp"
-#include "database/transaction_context.hpp"
+#include "expression/evaluation_context.hpp"
 #include "expression/interval_expression.hpp"
 #include "type/column_name.hpp"
 #include "type/function.hpp"
@@ -219,6 +218,28 @@ Value FunctionCallExpression::Evaluate(const Row* left,
   return ExecuteFunction(func_name_, values);
 }
 
+// Context-aware form: same dispatch as the plain evaluator with the context
+// threaded into every argument (A1 stage 3).
+Value FunctionCallExpression::Evaluate(const Row& row, const Schema& schema,
+                                       EvaluationContext& context) const {
+  if (func_name_ == "date_add" || func_name_ == "date_sub") {
+    if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
+      throw std::runtime_error("DATE_ADD/DATE_SUB requires DATE and INTERVAL");
+    }
+    const Value date = args_[0]->Evaluate(row, schema, context);
+    if (date.IsNull()) { return {};
+}
+    return AddOrSubInterval(func_name_, date,
+                            args_[1]->AsIntervalExpression());
+  }
+  std::vector<Value> values;
+  values.reserve(args_.size());
+  for (const auto& arg : args_) {
+    values.emplace_back(arg->Evaluate(row, schema, context));
+  }
+  return ExecuteFunction(func_name_, values);
+}
+
 Type FunctionCallExpression::ResultType(const Schema& schema) const {
   if (func_name_ == "coalesce") {
     if (args_.empty()) { return {TypeTag::kInvalid};
@@ -258,19 +279,19 @@ Type FunctionCallExpression::ResultType(const Schema& left,
   throw std::runtime_error("Function calls are not yet executable.");
 }
 
-Status FunctionCallExpression::Validate(TransactionContext& ctx,
+Status FunctionCallExpression::Validate(EvaluationContext& context,
                                         const Schema& schema) const {
   for (const auto& arg : args_) {
-    Status s = arg->Validate(ctx, schema);
+    Status s = arg->Validate(context, schema);
     if (s != Status::kSuccess) {
       return s;
     }
   }
-  ASSIGN_OR_RETURN(
-      Function, func,
-      ctx.GetDB()->GetOrAddFunction(ctx, func_name_, args_.size()));
-  // TODO type check here.
-  return Status::kSuccess;
+  // Function registration goes through the abstract context; the production
+  // implementation forwards to Database::GetOrAddFunction (improvement3.md
+  // A1).  Type check is still TODO.
+  return context.GetOrAddFunction(func_name_,
+                                  static_cast<int>(args_.size()));
 }
 
 }  // namespace tinylamb

@@ -17,8 +17,10 @@
 #ifndef TINYLAMB_SELECTION_HPP
 #define TINYLAMB_SELECTION_HPP
 
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "executor_base.hpp"
 #include "expression/expression.hpp"
@@ -65,6 +67,9 @@ class Selection : public ExecutorBase {
   size_t jit_batches_{0};
   size_t jit_threshold_rows_;
   size_t rows_seen_{0};
+  // Surviving row indices of the current input batch; reused across batches
+  // so the hot path stays allocation-free.
+  std::vector<uint32_t> selection_vector_;
 };
 }  // namespace tinylamb
 

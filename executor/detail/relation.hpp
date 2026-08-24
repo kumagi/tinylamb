@@ -13,6 +13,7 @@
 namespace tinylamb::relational_detail {
 
 constexpr size_t kSpillPartitions = 32;
+struct ExecutionRuntime;
 
 struct Relation {
   Schema schema;
@@ -28,7 +29,7 @@ struct Relation {
   size_t peak_intermediate_rows{0};
   size_t spilled_rows_{0};
 
-  Relation() = default;
+  explicit Relation(ExecutionRuntime* runtime = nullptr) : runtime_(runtime) {}
   Relation(const Relation&) = delete;
   Relation& operator=(const Relation&) = delete;
   Relation(Relation&& other) noexcept;
@@ -44,6 +45,8 @@ struct Relation {
   // rows afterwards starts a fresh spill cycle instead of appending to the
   // finished spill files.
   void ResetContents();
+  void set_runtime(ExecutionRuntime* runtime) { runtime_ = runtime; }
+  [[nodiscard]] ExecutionRuntime* runtime() const { return runtime_; }
 
   template <typename Fn>
   void ForEachRow(Fn&& fn) {
@@ -82,6 +85,9 @@ struct Relation {
     if (spill_tail_) total += spill_tail_->Count();
     return total;
   }
+
+ private:
+  ExecutionRuntime* runtime_{nullptr};
 };
 
 using RelationPtr = std::shared_ptr<Relation>;
@@ -90,7 +96,7 @@ Relation MaterializeRelation(const Relation& source);
 
 void CopyExecutionStats(Relation* destination, const Relation& source);
 
-void NoteRelationSpill();
+void NoteRelationSpill(ExecutionRuntime* runtime);
 
 }  // namespace tinylamb::relational_detail
 

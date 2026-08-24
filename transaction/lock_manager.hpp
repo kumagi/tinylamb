@@ -6,10 +6,12 @@
 #ifndef TINYLAMB_LOCK_MANAGER_HPP
 #define TINYLAMB_LOCK_MANAGER_HPP
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
 #include <mutex>
+#include <functional>
 #include <ostream>
 #include <unordered_map>
 #include <unordered_set>
@@ -89,19 +91,27 @@ class LockManager {
     return wait_timeouts_.load(std::memory_order_relaxed);
   }
 
-  friend std::ostream& operator<<(std::ostream& o, const LockManager& lm) {
-    std::scoped_lock lk(lm.latch_);
-    o << "LockManager(shared=" << lm.shared_locks_.size()
-      << ", exclusive=" << lm.exclusive_locks_.size() << ")";
-    return o;
-  }
+  friend std::ostream& operator<<(std::ostream& o, const LockManager& lm);
 
  private:
-  mutable std::mutex latch_;
-  std::condition_variable available_;
-  // Owners per shared-locked row (empty entries are removed immediately).
-  std::unordered_map<RowPosition, std::unordered_set<txn_id_t>> shared_locks_;
-  std::unordered_map<RowPosition, txn_id_t> exclusive_locks_;
+  // Row locks are striped across independent shards so TPC-C style write
+  // bursts stop serializing on one global mutex.  A lock operation takes
+  // exactly one shard mutex (never nested), so shard ordering cannot
+  // deadlock; release_epoch_ stays global because a waiter only needs to
+  // know whether *the system* made progress while it waited, not which
+  // shard released.
+  static constexpr size_t kShards = 64;
+  struct Shard {
+    mutable std::mutex mu;
+    std::condition_variable cv;
+    // Owners per shared-locked row (empty entries are removed immediately).
+    std::unordered_map<RowPosition, std::unordered_set<txn_id_t>> shared;
+    std::unordered_map<RowPosition, txn_id_t> exclusive;
+  };
+  [[nodiscard]] static size_t ShardIndex(const RowPosition& row) {
+    return std::hash<RowPosition>{}(row) % kShards;
+  }
+  std::array<Shard, kShards> shards_;
   std::atomic<uint32_t> durability_waits_{0};
   // Bumped on every release/upgrade anywhere in the table.  A waiter that
   // observed no bump across a whole timeout window is provably not waiting

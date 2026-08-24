@@ -57,8 +57,8 @@ struct RowPosition {
 
   [[nodiscard]] std::string Serialize() const {
     std::string s(Size(), '\0');
-    memcpy(s.data(), &page_id, sizeof(page_id));
-    memcpy(s.data() + sizeof(page_id), &slot, sizeof(slot));
+    SerializePID(s.data(), page_id);
+    SerializeSlot(s.data() + sizeof(page_id), slot);
     return s;
   }
   size_t Deserialize(const char* src) {

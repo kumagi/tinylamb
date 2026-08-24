@@ -14,11 +14,6 @@
 
 #include "common/constants.hpp"
 #include "database/transaction_context.hpp"
-#include "executor/executor_base.hpp"
-#include "executor/full_scan.hpp"
-#include "executor/index_only_scan.hpp"
-#include "executor/projection.hpp"
-#include "executor/selection.hpp"
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
@@ -89,30 +84,7 @@ Schema IndexOnlyScanPlan::OutputSchema() const {
   return {"", cols};
 }
 
-Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& txn) const {
-  if (txn.txn_.IndexKeysMayBeStale()) {
-    // Fallback route reads the table directly; Selection requires a real
-    // predicate, so skip it when there is none.
-    Executor executor = std::make_shared<FullScan>(txn.txn_, table_);
-    if (where_) {
-      executor = std::make_shared<Selection>(where_, table_.GetSchema(),
-                                             std::move(executor));
-    }
-    std::vector<NamedExpression> columns;
-    columns.reserve(index_.sc_.key_.size() + index_.sc_.include_.size());
-    for (slot_t offset : index_.sc_.key_) {
-      columns.emplace_back(table_.GetSchema().GetColumn(offset).Name());
-    }
-    for (slot_t offset : index_.sc_.include_) {
-      columns.emplace_back(table_.GetSchema().GetColumn(offset).Name());
-    }
-    return std::make_shared<Projection>(std::move(columns), table_.GetSchema(),
-                                        std::move(executor));
-  }
-  return std::make_shared<IndexOnlyScan>(txn.txn_, table_, index_, begin_key_,
-                                         end_key_, ascending_, where_,
-                                         table_.GetSchema());
-}
+// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
 
 size_t IndexOnlyScanPlan::AccessRowCount() const { return EmitRowCount(); }
 

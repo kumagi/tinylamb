@@ -341,7 +341,7 @@ TEST_F(PagePoolTest, MetaPageAllocateDestroyReuse) {
   Logger log(filename_ + ".log");
   LockManager lm;
   RecoveryManager rm(filename_ + ".log", pm.GetPool());
-  TransactionManager tm(&lm, &pm, &log, &rm);
+  TransactionManager tm(&pm, &log, &rm);
 
   // Act 1 -- allocate two pages through the meta page
   Transaction txn = tm.Begin();

@@ -29,6 +29,10 @@ namespace tinylamb {
 
 class Schema {
  public:
+  // Value type: every instance owns its name and column data (copies are deep
+  // copies). Copying from a reference whose pointee was destroyed therefore
+  // faults right here in the copy constructor -- if this line crashes, the
+  // *source* Schema (or its owning Table) had a dangling lifetime.
   Schema() = default;
   Schema(const Schema&) = default;
   Schema(Schema&&) = default;

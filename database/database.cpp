@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -54,11 +55,11 @@ constexpr page_id_t kDefaultTableRoot = 1;
 constexpr page_id_t kDefaultStatisticsRoot = 2;
 constexpr page_id_t kDefaultFunctionRoot = 3;
 
-Database::Database(std::string_view dbname)
+Database::Database(std::string_view dbname, size_t wal_sync_ms)
     : catalog_(kDefaultTableRoot),
       statistics_(kDefaultStatisticsRoot),
       functions_(kDefaultFunctionRoot),
-      storage_(dbname) {
+      storage_(dbname, wal_sync_ms) {
   auto ctx = BeginContext();
   catalog_ = BPlusTree(ctx.txn_, kDefaultTableRoot);
   statistics_ = BPlusTree(ctx.txn_, kDefaultStatisticsRoot);
@@ -124,7 +125,7 @@ uint64_t PeekUint64(std::string_view payload) {
     return 0;
   }
   uint64_t value = 0;
-  std::memcpy(&value, payload.data(), sizeof(value));
+  DeserializeU64(payload.data(), &value);
   return value;
 }
 
@@ -188,6 +189,8 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
       catalog_.Insert(ctx.txn_, schema.Name(), Serialize(new_table)));
   RETURN_IF_FAIL(
       WriteSplitStatistics(statistics_, ctx.txn_, schema.Name(), new_stat));
+  // Compiled plans may reference the previous catalog shape; drop them.
+  BumpSchemaEpoch();
   return new_table;
 }
 
@@ -216,6 +219,7 @@ Status Database::DropTable(TransactionContext& ctx,
   // Invalidate cached images so later lookups observe the drop.
   ctx.tables_.erase(std::string(schema_name));
   ctx.stats_.erase(std::string(schema_name));
+  BumpSchemaEpoch();
   return Status::kSuccess;
 }
 
@@ -228,6 +232,8 @@ Status Database::CreateIndex(TransactionContext& ctx,
   // Refresh the cached image so later inserts maintain the new index.
   ctx.tables_[std::string(schema_name)] =
       std::make_shared<Table>(std::move(tbl));
+  // New access paths may change plan choices; invalidate compiled plans.
+  BumpSchemaEpoch();
   return Status::kSuccess;
 }
 
@@ -294,6 +300,30 @@ std::vector<std::string> Database::ListTables(TransactionContext& ctx) {
 
 StatusOr<TableStatistics> Database::GetStatistics(
     TransactionContext& ctx, std::string_view schema_name) {
+  // Statistics are immutable between schema/statistics epochs. Query plans
+  // ask for them on every fresh TransactionContext; reading the split
+  // catalog records (and decoding the table schema first) repeatedly made
+  // OLTP prepare spend as much time in metadata as in planning. Keep the
+  // estimate cache thread-local so lookup is lock-free. A rare DDL/ANALYZE
+  // race can only use a conservative old estimate for one epoch; execution
+  // never depends on statistics for correctness.
+  struct ThreadStatsCache {
+    const Database* owner{nullptr};
+    uint64_t epoch{0};
+    std::unordered_map<std::string, TableStatistics> entries;
+  };
+  thread_local ThreadStatsCache cache;
+  const uint64_t epoch = SchemaEpoch();
+  if (cache.owner != this || cache.epoch != epoch) {
+    cache.owner = this;
+    cache.epoch = epoch;
+    cache.entries.clear();
+  }
+  const std::string name(schema_name);
+  if (const auto found = cache.entries.find(name);
+      found != cache.entries.end()) {
+    return found->second;
+  }
   ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
   ASSIGN_OR_RETURN(std::string_view, meta,
                    statistics_.Read(ctx.txn_, schema_name));
@@ -302,6 +332,7 @@ StatusOr<TableStatistics> Database::GetStatistics(
     if (!Deserialize(meta, &ts)) {
       return Status::kCorrupt;
     }
+    cache.entries.emplace(name, ts);
     return ts;
   }
   uint64_t magic = 0;
@@ -332,13 +363,20 @@ StatusOr<TableStatistics> Database::GetStatistics(
     columns.push_back(std::move(stats));
   }
   ts.Assign(rows, std::move(columns));
+  cache.entries.emplace(name, ts);
   return ts;
 }
 
 Status Database::UpdateStatistics(TransactionContext& ctx,
                                   std::string_view schema_name,
                                   const TableStatistics& ts) {
-  return WriteSplitStatistics(statistics_, ctx.txn_, schema_name, ts);
+  const Status updated =
+      WriteSplitStatistics(statistics_, ctx.txn_, schema_name, ts);
+  if (updated == Status::kSuccess) {
+    // ANALYZE (and any other refresh) changes cost inputs for compiled plans.
+    BumpSchemaEpoch();
+  }
+  return updated;
 }
 
 Status Database::RefreshStatistics(TransactionContext& ctx,

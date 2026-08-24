@@ -69,17 +69,21 @@ StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
   if (free_size_ < needed) {
     return Status::kNoSpace;
   }
-  // Determine the destination slot before taking the lock: a lock conflict
-  // must return without consuming a physical slot, otherwise the WAL-less
-  // residue would become visible as a committed row to concurrent readers.
+  // Reuse the first hole whose MVCC intent is available. A concurrent delete
+  // can leave an earlier physical hole reserved until commit; repeatedly
+  // choosing only that hole would starve every inserter on the page.
   slot_t slot = 0;
-  while (slot < row_max_ && rows_[slot].offset != 0) {
-    ++slot;
+  for (; slot < row_max_; ++slot) {
+    if (rows_[slot].offset == 0 &&
+        txn.AddWriteSet(RowPosition(page_id, slot))) {
+      break;
+    }
   }
-  if (!txn.AddWriteSet(RowPosition(page_id, slot))) {
+  if (slot == row_max_ &&
+      !txn.AddWriteSet(RowPosition(page_id, slot))) {
     return Status::kConflicts;
   }
-  const StatusOr<slot_t> inserted = InsertRow(record);
+  const StatusOr<slot_t> inserted = InsertRowAt(slot, record);
   if (!inserted.HasValue()) {
     return inserted.GetStatus();
   }
@@ -113,12 +117,17 @@ bool RowPage::ReclaimUntilContiguous(size_t bytes, slot_t protected_slot,
 }
 
 StatusOr<slot_t> RowPage::InsertRow(std::string_view new_row) {
-  assert(new_row.size() <= std::numeric_limits<slot_t>::max());
   slot_t slot = 0;
-  for (; slot < row_max_; ++slot) {
-    if (rows_[slot].offset == 0) {
-      break;
-    }
+  while (slot < row_max_ && rows_[slot].offset != 0) {
+    ++slot;
+  }
+  return InsertRowAt(slot, new_row);
+}
+
+StatusOr<slot_t> RowPage::InsertRowAt(slot_t slot, std::string_view new_row) {
+  assert(new_row.size() <= std::numeric_limits<slot_t>::max());
+  if (slot < row_max_ && rows_[slot].offset != 0) {
+    return Status::kConflicts;
   }
 
   // row_count_ cannot describe the end of the slot array when deletions have
@@ -129,7 +138,9 @@ StatusOr<slot_t> RowPage::InsertRow(std::string_view new_row) {
     return Status::kNoSpace;
   }
 
-  free_size_ -= new_row.size() + sizeof(RowPointer);
+  const size_t slot_growth =
+      static_cast<size_t>(prospective_row_max - row_max_) * sizeof(RowPointer);
+  free_size_ -= new_row.size() + slot_growth;
   free_ptr_ -= new_row.size();
   rows_[slot].offset = free_ptr_;
   rows_[slot].size = new_row.size();
@@ -153,7 +164,6 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
   }
   RowPosition pos(page_id, slot);
   if (!txn.AddWriteSet(pos)) {
-    LOG(ERROR) << "cannot add write-set";
     return Status::kConflicts;
   }
   // Reserve contiguous space before any WAL write: a failed allocation must

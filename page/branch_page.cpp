@@ -138,7 +138,7 @@ void BranchPage::UpdateImpl(std::string_view key, page_id_t pid) {
     LOG(ERROR) << "UpdateImpl: key not found, foster slot kept intact";
     return;
   }
-  memcpy(Payload() + rows_[pos + kExtraIdx].offset, &pid, sizeof(pid));
+  SerializePID(Payload() + rows_[pos + kExtraIdx].offset, pid);
 }
 
 void BranchPage::UpdateSlotImpl(RowPointer& pos, std::string_view payload) {
@@ -432,7 +432,7 @@ std::string_view BranchPage::GetRow(size_t idx) const {
 page_id_t BranchPage::GetValue(size_t idx) const {
   page_id_t result = 0;
   assert(idx < row_count_);
-  memcpy(&result, Payload() + rows_[idx + kExtraIdx].offset, sizeof(result));
+  DeserializePID(Payload() + rows_[idx + kExtraIdx].offset, &result);
   return result;
 }
 

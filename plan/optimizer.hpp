@@ -31,6 +31,7 @@ namespace tinylamb {
 class ExecutorBase;
 class TransactionContext;
 class PlanBase;
+class SelectStatement;
 using Plan = std::shared_ptr<PlanBase>;
 
 struct OptimizerOptions {
@@ -63,6 +64,9 @@ class Optimizer {
   static StatusOr<Plan> Optimize(const QueryData& query,
                                  TransactionContext& ctx,
                                  const OptimizerOptions& options);
+  static StatusOr<Plan> OptimizeRelational(
+      std::shared_ptr<const SelectStatement> statement, Schema output_schema,
+      TransactionContext& ctx);
 };
 
 }  // namespace tinylamb

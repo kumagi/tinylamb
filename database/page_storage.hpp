@@ -25,14 +25,13 @@
 #include "page/page_manager.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
 
 class PageStorage {
  public:
-  explicit PageStorage(std::string_view dbname);
+  explicit PageStorage(std::string_view dbname, size_t wal_sync_ms = 1);
 
   Transaction Begin();
   Transaction BeginReadOnly();
@@ -52,13 +51,12 @@ class PageStorage {
   //  * logger_ is constructed before rm_: RecoveryManager replays the WAL
   //    file, so Logger must have created/opened it first (page_storage.cpp
   //    relies on this at startup).
-  //  * tm_/cm_ hold raw pointers into lm_/pm_(pool)/logger_/rm_.
+  //  * tm_/cm_ hold raw pointers into pm_(pool)/logger_/rm_.
   //  * cm_ is declared LAST on purpose: ~CheckpointManager() joins its
   //    background worker, which keeps dereferencing tm_/pp_/logger_ until
   //    that join completes. Any other order risks use-after-free at
   //    shutdown or a failed startup.
   std::string dbname_;
-  LockManager lm_;
   Logger logger_;
   PageManager pm_;
   RecoveryManager rm_;

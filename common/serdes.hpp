@@ -27,13 +27,18 @@
 
 namespace tinylamb {
 
-// Target on-disk layout for a future format revision: fixed-width integers in
-// big-endian byte order with a magic/version header (v1).  NOT enabled yet:
-// some page-layer code serializes scalars via raw memcpy outside these
-// helpers, so flipping the layout here alone would corrupt those images.
-// Migration must first route those sites through Serialize*/Deserialize*.
+// Version-1 on-disk layout. All fixed-width scalars are big-endian and every
+// top-level page/WAL object carries this magic/version pair. Version 0 is
+// intentionally unsupported: the v1 migration is a destructive format bump.
 inline constexpr uint32_t kSerdesMagic = 0x54594231U;  // "TYB1"
 inline constexpr uint32_t kSerdesVersion = 1U;
+
+size_t SerializeU16(char* pos, uint16_t value);
+size_t SerializeU32(char* pos, uint32_t value);
+size_t SerializeU64(char* pos, uint64_t value);
+size_t DeserializeU16(const char* pos, uint16_t* out);
+size_t DeserializeU32(const char* pos, uint32_t* out);
+size_t DeserializeU64(const char* pos, uint64_t* out);
 
 // Contract: the caller must guarantee that `pos` holds at least
 // SerializeSize(bin) writable/readable bytes. DeserializeStringView trusts the

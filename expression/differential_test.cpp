@@ -8,8 +8,10 @@
 //   (c) JIT      : JitInt64Kernels filter/projection kernels (narrow shapes,
 //                  non-NULL INT64 inputs only; otherwise skipped)
 // relational_detail::Evaluate (scan-filter fallback) is additionally observed
-// where it is expected to agree, and its known divergences are pinned by
-// XFAIL-style tests at the bottom of this file.
+// where it is expected to agree.  Its former divergences (three-valued logic,
+// numeric edge cases) were resolved by forwarding its Binary/Unary dispatch to
+// the canonical evaluators, and conformance tests at the bottom of this file
+// pin that agreement so it cannot drift back.
 //
 // Matrix: {arithmetic, comparison, logical, LIKE, concat, CASE, IN,
 // date_add/date_sub, extract} x {int64, double, varchar, date, bool-as-int64}
@@ -28,6 +30,11 @@
 #include <vector>
 
 #include "common/constants.hpp"
+// Pulls the production EvaluationContext adapter, which transitively provides
+// the concrete TransactionContext needed by the relational_detail driver
+// below while keeping this expression-directory TU free of database/
+// includes.
+#include "query/evaluation_context_impl.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "expression/binary_expression.hpp"
@@ -890,21 +897,26 @@ TEST(DifferentialTest, DetailPathAgreesWithCanonicalEvaluator) {
   EXPECT_TRUE(SameValue(detail_extract.value, Value(int64_t{1996})));
 }
 
-// XFAIL equivalent (improvement3.md A6-1 leftover): the relational_detail
-// interpreter collapses SQL three-valued logic to two-valued logic in three
-// places.  Unifying means changing scan-filter results, which is a semantic
-// change rather than a message unification - therefore skipped after
-// pinning today's exact behaviour:
-//   - AND with NULL left operand returns FALSE; canonical 3VL returns NULL
-//     unless the right side decides (the "!Truthy(left)" dispatch treats NULL
-//     as false).
-//   - OR with NULL left operand returns NULL even when the right side is TRUE
-//     (Binary()'s leading null check fires before the kOr rule).
-//   - NOT NULL returns TRUE; canonical 3VL returns NULL.
-TEST(DifferentialTest, XfailDetailPathThreeValuedLogic) {
+// Former XFAIL (improvement3.md A6-1), now resolved: the relational_detail
+// interpreter used to collapse SQL three-valued logic to two-valued logic in
+// three places (AND with a NULL left operand returned FALSE, OR with a NULL
+// left operand ignored a TRUE right operand, NOT NULL returned TRUE).  Its
+// Binary()/unary dispatch now forwards to the canonical AST evaluators, so
+// the full AND/OR/NOT truth table including UNKNOWN must agree between the
+// detail path and the canonical evaluator.
+TEST(DifferentialTest, DetailPathThreeValuedLogicMatchesCanonical) {
   const Schema& schema = IntSchema();
-  const Row null_true({Value(), Value(int64_t{1})});
-  const Row null_null({Value(), Value()});
+  const std::vector<Row> rows{
+      Row({Value(int64_t{1}), Value(int64_t{1})}),  // T T
+      Row({Value(int64_t{1}), Value(int64_t{0})}),  // T F
+      Row({Value(int64_t{0}), Value(int64_t{1})}),  // F T
+      Row({Value(int64_t{0}), Value(int64_t{0})}),  // F F
+      Row({Value(int64_t{1}), Value()}),            // T N
+      Row({Value(), Value(int64_t{1})}),            // N T
+      Row({Value(int64_t{0}), Value()}),            // F N
+      Row({Value(), Value(int64_t{0})}),            // N F
+      Row({Value(), Value()}),                      // N N
+  };
   const Expression conjunction = BinaryExpressionExp(ColumnValueExp("i"),
                                                      BinaryOperation::kAnd,
                                                      ColumnValueExp("j"));
@@ -913,50 +925,39 @@ TEST(DifferentialTest, XfailDetailPathThreeValuedLogic) {
                                                      ColumnValueExp("j"));
   const Expression negation =
       UnaryExpressionExp(ColumnValueExp("i"), UnaryOperation::kNot);
-  const Attempt detail_and =
-      EvaluateDetailPath(conjunction, null_true, schema);
-  const Attempt ast_and = EvaluateAst(conjunction, null_true, schema);
-  EXPECT_EQ(detail_and.kind, Attempt::Kind::kValue);
-  EXPECT_TRUE(SameValue(detail_and.value, Value(false)))
-      << "detail AND(NULL,TRUE)=" << Describe(detail_and);
-  EXPECT_TRUE(ast_and.value.IsNull())
-      << "canonical AND(NULL,TRUE)=" << Describe(ast_and);
-
-  const Attempt detail_and_nn =
-      EvaluateDetailPath(conjunction, null_null, schema);
-  EXPECT_TRUE(SameValue(detail_and_nn.value, Value(false)))
-      << "detail AND(NULL,NULL)=" << Describe(detail_and_nn);
-
-  const Attempt detail_or =
-      EvaluateDetailPath(disjunction, null_true, schema);
-  const Attempt ast_or = EvaluateAst(disjunction, null_true, schema);
-  EXPECT_TRUE(SameValue(detail_or.value, Value()))
-      << "detail OR(NULL,TRUE)=" << Describe(detail_or);
-  EXPECT_TRUE(SameValue(ast_or.value, Value(true)))
-      << "canonical OR(NULL,TRUE)=" << Describe(ast_or);
-
-  const Attempt detail_not = EvaluateDetailPath(negation, null_true, schema);
-  const Attempt ast_not = EvaluateAst(negation, null_true, schema);
-  EXPECT_TRUE(SameValue(detail_not.value, Value(true)))
-      << "detail NOT(NULL)=" << Describe(detail_not);
-  EXPECT_TRUE(ast_not.value.IsNull())
-      << "canonical NOT(NULL)=" << Describe(ast_not);
-
-  GTEST_SKIP() << "known divergence: relational_detail lacks SQL "
-                  "three-valued logic (AND/OR with NULL left operand, NOT "
-                  "NULL); unifying requires a scan-filter semantics change "
-                  "(A6 leftover)";
+  for (size_t r = 0; r < rows.size(); ++r) {
+    const std::string input = DescribeRow(schema, rows[r]);
+    for (const auto& [name, expr] :
+         {std::pair{"and", conjunction}, {"or", disjunction}}) {
+      const Attempt ast = EvaluateAst(expr, rows[r], schema);
+      const Attempt detail = EvaluateDetailPath(expr, rows[r], schema);
+      EXPECT_EQ(detail.kind, ast.kind)
+          << "[differential][MISMATCH] " << name << " [" << input << "]";
+      if (detail.kind == ast.kind && ast.kind == Attempt::Kind::kValue) {
+        EXPECT_TRUE(SameValue(detail.value, ast.value))
+            << "[differential][MISMATCH] " << name << " [" << input
+            << "] canonical=" << Describe(ast) << " detail=" << Describe(detail);
+      }
+    }
+    const Attempt ast_not = EvaluateAst(negation, rows[r], schema);
+    const Attempt detail_not = EvaluateDetailPath(negation, rows[r], schema);
+    EXPECT_EQ(detail_not.kind, ast_not.kind)
+        << "[differential][MISMATCH] not [" << input << "]";
+    if (detail_not.kind == ast_not.kind &&
+        ast_not.kind == Attempt::Kind::kValue) {
+      EXPECT_TRUE(SameValue(detail_not.value, ast_not.value))
+          << "[differential][MISMATCH] not [" << input
+          << "] canonical=" << Describe(ast_not)
+          << " detail=" << Describe(detail_not);
+    }
+  }
 }
 
-// XFAIL equivalent (A6 leftover): numeric edge-case semantics differ by
-// design today.  Characterised here so any change shows up explicitly:
-//   - int64/int64 division returns a DOUBLE in relational_detail (real-number
-//     division) but truncates to INT64 in the canonical AST evaluator.
-//   - int64 add/sub/mul overflow falls back to doubles instead of raising the
-//     canonical "integer overflow" error.
-//   - INT64_MIN % -1 returns 0 instead of raising "integer overflow on '%'".
-//   - concat() skips NULL arguments instead of propagating NULL.
-TEST(DifferentialTest, XfailDetailPathNumericDivergences) {
+// Former XFAIL (A6 leftover), now resolved: the detail-path numeric core was
+// forwarded to the canonical EvaluateBinary, so int/int division truncates to
+// INT64 and add/sub/mul overflow plus INT64_MIN % -1 raise the canonical
+// errors -- exactly like the AST evaluator.
+TEST(DifferentialTest, DetailPathNumericEdgeCasesMatchCanonical) {
   const Schema& schema = IntSchema();
   const Row seven_three({Value(int64_t{7}), Value(int64_t{3})});
   const Expression division = BinaryExpressionExp(ColumnValueExp("i"),
@@ -965,43 +966,48 @@ TEST(DifferentialTest, XfailDetailPathNumericDivergences) {
   const Attempt detail_div = EvaluateDetailPath(division, seven_three, schema);
   const Attempt ast_div = EvaluateAst(division, seven_three, schema);
   EXPECT_EQ(detail_div.kind, Attempt::Kind::kValue);
-  EXPECT_EQ(detail_div.value.type, ValueType::kDouble);
   EXPECT_EQ(ast_div.kind, Attempt::Kind::kValue);
-  EXPECT_EQ(ast_div.value.type, ValueType::kInt64);
+  EXPECT_EQ(detail_div.value.type, ValueType::kInt64);
+  EXPECT_TRUE(SameValue(detail_div.value, ast_div.value))
+      << "int/int division must truncate like the canonical evaluator";
 
   const Row max_one({Value(kInt64Max), Value(int64_t{1})});
   const Expression overflow_add = BinaryExpressionExp(ColumnValueExp("i"),
                                                       BinaryOperation::kAdd,
                                                       ColumnValueExp("j"));
-  EXPECT_EQ(EvaluateDetailPath(overflow_add, max_one, schema).kind,
-            Attempt::Kind::kValue);
-  EXPECT_EQ(EvaluateAst(overflow_add, max_one, schema).kind,
-            Attempt::Kind::kThrow);
+  const Attempt detail_add = EvaluateDetailPath(overflow_add, max_one, schema);
+  const Attempt ast_add = EvaluateAst(overflow_add, max_one, schema);
+  EXPECT_EQ(detail_add.kind, Attempt::Kind::kThrow);
+  EXPECT_EQ(ast_add.kind, Attempt::Kind::kThrow);
+  EXPECT_EQ(detail_add.exception, ast_add.exception);
+  EXPECT_EQ(detail_add.note, ast_add.note) << "add overflow message";
 
   const Row min_minus_one({Value(kInt64Min), Value(int64_t{-1})});
   const Expression extreme_modulo = BinaryExpressionExp(
       ColumnValueExp("i"), BinaryOperation::kModulo, ColumnValueExp("j"));
   const Attempt detail_extreme =
       EvaluateDetailPath(extreme_modulo, min_minus_one, schema);
-  EXPECT_EQ(detail_extreme.kind, Attempt::Kind::kValue);
-  EXPECT_TRUE(SameValue(detail_extreme.value, Value(int64_t{0})));
-  EXPECT_EQ(EvaluateAst(extreme_modulo, min_minus_one, schema).kind,
-            Attempt::Kind::kThrow);
+  const Attempt ast_extreme =
+      EvaluateAst(extreme_modulo, min_minus_one, schema);
+  EXPECT_EQ(detail_extreme.kind, Attempt::Kind::kThrow);
+  EXPECT_EQ(ast_extreme.kind, Attempt::Kind::kThrow);
+  EXPECT_EQ(detail_extreme.exception, ast_extreme.exception);
+  EXPECT_EQ(detail_extreme.note, ast_extreme.note)
+      << "INT64_MIN % -1 message";
+}
 
-  const Schema& strings = StringSchema();
-  const Row null_concat({Value(), TextValue("b")});
+TEST(DifferentialTest, DetailPathConcatNullMatchesCanonical) {
+  const Schema schema("strings", {Column("s", ValueType::kVarChar)});
+  const Row row({Value()});
   const Expression concat = FunctionCallExp(
-      "concat", {ColumnValueExp("s"), ColumnValueExp("t")});
-  const Attempt detail_concat =
-      EvaluateDetailPath(concat, null_concat, strings);
-  EXPECT_EQ(detail_concat.kind, Attempt::Kind::kValue);
-  EXPECT_TRUE(SameValue(detail_concat.value, TextValue("b")));
-  EXPECT_TRUE(EvaluateAst(concat, null_concat, strings).value.IsNull());
-
-  GTEST_SKIP() << "known divergences: detail-path int/int division returns "
-                  "double, add/sub/mul overflow falls back to double, "
-                  "INT64_MIN % -1 returns 0, concat skips NULLs; see "
-                  "improvement3.md A6";
+      "concat", {ConstantValueExp(Value("a")), ColumnValueExp("s"),
+                 ConstantValueExp(Value("b"))});
+  const Attempt ast = EvaluateAst(concat, row, schema);
+  const Attempt detail = EvaluateDetailPath(concat, row, schema);
+  ASSERT_EQ(ast.kind, Attempt::Kind::kValue);
+  ASSERT_EQ(detail.kind, Attempt::Kind::kValue);
+  EXPECT_TRUE(ast.value.IsNull());
+  EXPECT_TRUE(detail.value.IsNull());
 }
 
 }  // namespace tinylamb

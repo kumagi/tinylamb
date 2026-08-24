@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <optional>
@@ -58,7 +59,7 @@ class TransactionTest : public ::testing::Test {
     // Fixture premise: pm_/recovery_ stay null on purpose.  The tests below
     // only exercise lock/version bookkeeping; any page-accessing method would
     // crash on the null PageManager.
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), pm_.get(), l_.get(),
+    tm_ = std::make_unique<TransactionManager>(pm_.get(), l_.get(),
                                                nullptr);
   }
 
@@ -209,24 +210,56 @@ TEST_F(TransactionTest, ReadVersionPhysicalFallback) {
   txn.PreCommit();
 }
 
-TEST_F(TransactionTest, LockManagementThroughManager) {
-  // Arrange -- a row position with no locks held yet
+TEST_F(TransactionTest, GcDropsRedundantLatestVersionBeforeDeleteIntentRead) {
+  const RowPosition rp(78, 1);
+  {
+    Transaction writer = tm_->Begin();
+    ASSERT_TRUE(writer.AddWriteSet(rp));
+    writer.RegisterVersionWrite(rp, std::nullopt, "physical");
+    ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
+    writer.CommitWait();
+  }
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (tm_->HasVersionChain(rp) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_FALSE(tm_->HasVersionChain(rp));
+
+  // Delete reserves an unstaged write intent before it asks MVCC for the
+  // before-image. With the redundant committed chain collected, the owner
+  // must still see the authoritative physical row.
+  Transaction deleting = tm_->Begin();
+  ASSERT_TRUE(deleting.AddWriteSet(rp));
+  ASSERT_SUCCESS_AND_EQ(
+      tm_->ReadVersion(deleting, rp, std::string_view("physical")),
+      "physical");
+  deleting.Abort();
+}
+
+TEST_F(TransactionTest, MvccWriteIntentCanFollowACommittedWriter) {
   const RowPosition rp(5, 1);
+  Transaction first = tm_->Begin();
+  Transaction concurrent = tm_->Begin();
+  ASSERT_TRUE(first.AddWriteSet(rp));
+  EXPECT_FALSE(concurrent.AddWriteSet(rp));
+  first.RegisterVersionWrite(rp, "old", "new");
+  ASSERT_EQ(first.PreCommit(), Status::kSuccess);
 
-  // Act -- take an exclusive lock through the TransactionManager
-  ASSERT_TRUE(tm_->GetExclusiveLock(rp));
-  ASSERT_FALSE(tm_->GetExclusiveLock(rp));
-  ASSERT_FALSE(tm_->GetSharedLock(rp));
-  // Assert -- a foreign owner cannot release it; the owner can
-  EXPECT_FALSE(lm_->ReleaseExclusiveLock(rp, 9));
-  ASSERT_TRUE(lm_->ReleaseExclusiveLock(rp, 0));
+  // Strict write locking lets the concurrently-started transaction proceed
+  // once the former owner commits; DML scans then resolve the predecessor's
+  // newest committed image under this unstaged intent, not their old Begin
+  // snapshot.
+  EXPECT_TRUE(concurrent.AddWriteSet(rp));
+  ASSERT_SUCCESS_AND_EQ(
+      tm_->ReadVersion(concurrent, rp, std::string_view("new")), "new");
+  concurrent.Abort();
 
-  // Act -- take a shared lock and upgrade it to exclusive
-  ASSERT_TRUE(tm_->GetSharedLock(rp));
-  ASSERT_TRUE(tm_->TryUpgradeLock(rp));
-
-  // Assert -- the upgraded exclusive lock releases cleanly
-  ASSERT_TRUE(lm_->ReleaseExclusiveLock(rp, 0));
+  Transaction fresh = tm_->Begin();
+  EXPECT_TRUE(fresh.AddWriteSet(rp));
+  fresh.Abort();
 }
 
 TEST_F(TransactionTest, CompensateLogsThroughManager) {
@@ -269,17 +302,15 @@ TEST_F(TransactionTest, AddWriteSetRejectedOnReadOnlyTransaction) {
   ASSERT_EQ(txn.PreCommit(), Status::kSuccess);
 }
 
-TEST_F(TransactionTest, AddWriteSetFailsWhenLockHeldElsewhere) {
-  // Arrange -- a row position whose exclusive lock is owned outside the txn
+TEST_F(TransactionTest, AddWriteSetFailsWhenMvccIntentHeldElsewhere) {
   const RowPosition rp(12, 1);
-  Transaction txn = tm_->Begin();
-  ASSERT_TRUE(lm_->GetExclusiveLock(rp, 42));
-  // Act -- try to take the same row into the write set
-  EXPECT_FALSE(txn.AddWriteSet(rp));
-  // Assert -- the write set stays empty, so pre-commit has nothing to publish
-  EXPECT_FALSE(lm_->ReleaseExclusiveLock(rp, txn.ID()));
-  EXPECT_TRUE(lm_->ReleaseExclusiveLock(rp, 42));
-  ASSERT_EQ(txn.PreCommit(), Status::kSuccess);
+  Transaction owner = tm_->Begin();
+  Transaction contender = tm_->Begin();
+  ASSERT_TRUE(owner.AddWriteSet(rp));
+  EXPECT_FALSE(contender.AddWriteSet(rp));
+  owner.Abort();
+  EXPECT_TRUE(contender.AddWriteSet(rp));
+  contender.Abort();
 }
 
 TEST_F(TransactionTest, DefaultTransactionReadVersionWithoutManager) {
@@ -389,12 +420,11 @@ TEST_F(TransactionTest, PreCommitLoggerFailureLeavesAbortedNotHalfCommitted) {
 
   EXPECT_THROW(txn.PreCommit(), std::runtime_error);
 
-  // No half-finished state: locks were released (a foreign owner can take
-  // the row) and the transaction reports finished instead of staying
-  // committed-with-locks-forever.
+  // No half-finished state: the transaction reports finished and its MVCC
+  // write intent is released even though WAL durability failed.
   EXPECT_TRUE(txn.IsFinished());
-  EXPECT_TRUE(lm_->GetExclusiveLock(rp, 4242));
-  EXPECT_TRUE(lm_->ReleaseExclusiveLock(rp, 4242));
+  Transaction retry = tm_->Begin();
+  EXPECT_TRUE(retry.AddWriteSet(rp));
 }
 
 TEST(TransactionManagerTest, AbortedWriteIsNotVisibleToLaterReaders) {
@@ -409,7 +439,7 @@ TEST(TransactionManagerTest, AbortedWriteIsNotVisibleToLaterReaders) {
     Logger logger(log_name);
     LockManager lm;
     RecoveryManager rm(log_name, pm.GetPool());
-    TransactionManager tm(&lm, &pm, &logger, &rm);
+    TransactionManager tm(&pm, &logger, &rm);
 
     const RowPosition rp(1, 1);
     Transaction writer = tm.Begin();

@@ -31,7 +31,17 @@
 namespace tinylamb {
 
 std::ostream& operator<<(std::ostream& o, const IndexMode& mode) {
-  o << (mode == IndexMode::kUnique ? "Unique" : "NonUnique");
+  switch (mode) {
+    case IndexMode::kUnique:
+      o << "Unique";
+      break;
+    case IndexMode::kNonUnique:
+      o << "NonUnique";
+      break;
+    case IndexMode::kVersionedUnique:
+      o << "VersionedUnique";
+      break;
+  }
   return o;
 }
 
@@ -45,12 +55,12 @@ std::string IndexSchema::GenerateKey(const Row& row) const {
 
 Encoder& operator<<(Encoder& a, const IndexSchema& idx) {
   a << idx.name_ << idx.key_ << idx.include_
-    << (idx.mode_ == IndexMode::kUnique);
+    << static_cast<uint8_t>(idx.mode_);
   return a;
 }
 
 Decoder& operator>>(Decoder& e, IndexSchema& idx) {
-  bool mode = false;
+  uint8_t mode = 0;
   e >> idx.name_ >> idx.key_ >> idx.include_ >> mode;
   idx.mode_ = static_cast<IndexMode>(mode);
   return e;

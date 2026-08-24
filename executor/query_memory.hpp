@@ -14,7 +14,7 @@ namespace tinylamb {
 // with EstimateRowBytes / TryReserve and spill before the OS starts thrashing.
 //
 // Config: TINYLAMB_QUERY_MEMORY_BYTES
-//   - unset: default 1 GiB
+//   - unset: default 8 GiB (SF=10 stays RAM-resident; see query_memory.cpp)
 //   - "0": unlimited (legacy / debugging)
 class QueryMemoryBudget {
  public:

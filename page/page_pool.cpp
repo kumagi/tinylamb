@@ -20,6 +20,8 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <array>
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
@@ -30,6 +32,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -119,6 +122,7 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
     // touched at all; LRU Touch below stays best-effort.
     Page* hit_page = nullptr;
     std::shared_mutex* hit_page_latch = nullptr;
+    std::atomic<uint32_t>* hit_pin_count = nullptr;
     {
       PoolShard& shard = shards_[ShardIndex(page_id)];
       std::scoped_lock shard_latch(shard.mu);
@@ -127,13 +131,20 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
         resident.pin_count.fetch_add(1, std::memory_order_relaxed);
         hit_page = resident.page.get();
         hit_page_latch = resident.page_latch.get();
+        hit_pin_count = &resident.pin_count;
         if (cache_hit != nullptr) {
           *cache_hit = true;
         }
       }
     }
     if (hit_page != nullptr) {
-      {
+      // A hit already proved recency. Updating the global LRU list on every
+      // B-tree level/heap lookup turns one contended cache line into the OLTP
+      // bottleneck while adding almost no eviction information for hot
+      // pages. Sample touches; misses and the slow recheck path still touch
+      // unconditionally, preserving cold-page admission behavior.
+      thread_local uint32_t touch_sample = 0;
+      if ((++touch_sample & 63U) == 0) {
         std::unique_lock touch_latch(pool_latch, std::try_to_lock);
         if (touch_latch.owns_lock()) {
           if (auto again = pool_.find(page_id); again != pool_.end()) {
@@ -141,7 +152,7 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
           }
         }
       }
-      return {this, hit_page, hit_page_latch, shared};
+      return {this, hit_page, hit_page_latch, shared, hit_pin_count};
     }
 
     std::unique_lock latch(pool_latch);
@@ -154,11 +165,12 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
       const LruType::iterator refreshed = pool_.at(page_id);
       Page* const page = refreshed->page.get();
       std::shared_mutex* const page_latch = refreshed->page_latch.get();
+      std::atomic<uint32_t>* const pin_count = &refreshed->pin_count;
       if (cache_hit != nullptr) {
         *cache_hit = true;
       }
       latch.unlock();
-      return {this, page, page_latch, shared};
+      return {this, page, page_latch, shared, pin_count};
     }
 
     while (pool_lru_.size() >= capacity_) {
@@ -233,8 +245,9 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
       const LruType::iterator refreshed = pool_.at(page_id);
       Page* const page = refreshed->page.get();
       std::shared_mutex* const page_latch = refreshed->page_latch.get();
+      std::atomic<uint32_t>* const pin_count = &refreshed->pin_count;
       latch.unlock();
-      return {this, page, page_latch, shared};
+      return {this, page, page_latch, shared, pin_count};
     }
 
     // A racing eviction may have detached this very page id after our read
@@ -273,6 +286,7 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
     pool_lru_.emplace_back(raw_page);
     pool_lru_.back().page_latch = std::move(new_page_latch);
     const LruType::iterator installed = std::prev(pool_lru_.end());
+    std::atomic<uint32_t>* const installed_pin_count = &installed->pin_count;
     pool_.emplace(page_id, installed);
     {
       PoolShard& shard = shards_[ShardIndex(page_id)];
@@ -282,7 +296,7 @@ PageRef PagePool::GetPageImpl(page_id_t page_id, bool* cache_hit, bool shared,
     latch.unlock();
     // Page content was loaded without holding page_latch, so the caller may
     // take a shared page latch when requested.
-    return {this, raw_page, raw_latch, shared};
+    return {this, raw_page, raw_latch, shared, installed_pin_count};
   }
 }
 
@@ -443,12 +457,14 @@ void PagePool::WriteBack(const Page* target) {
     durability_gate_(target->PageLSN());
   }
   target->SetChecksum();
+  std::array<char, kPageSize> disk_image{};
+  target->EncodeDisk(disk_image.data());
   off_t offset = 0;
   if (!PageOffset(target->PageID(), &offset)) {
     throw std::runtime_error("page offset out of range: page_id=" +
                              std::to_string(target->PageID()));
   }
-  const char* buffer = reinterpret_cast<const char*>(target);
+  const char* buffer = disk_image.data();
   size_t remaining = kPageSize;
   while (remaining > 0) {
     const ssize_t written = ::pwrite(fd_, buffer, remaining, offset);
@@ -475,9 +491,10 @@ void PagePool::ReadFrom(Page* target, page_id_t pid, bool validate) const {
     throw std::runtime_error("page offset out of range: page_id=" +
                              std::to_string(pid));
   }
+  std::array<char, kPageSize> disk_image{};
   ssize_t nread = 0;
   do {
-    nread = ::pread(fd_, target, kPageSize, offset);
+    nread = ::pread(fd_, disk_image.data(), kPageSize, offset);
   } while (nread < 0 && RetryableErrno(errno));
   if (nread < 0) {
     // EINVAL (offset overflow) and friends are hard failures, never a
@@ -498,7 +515,28 @@ void PagePool::ReadFrom(Page* target, page_id_t pid, bool validate) const {
                << kPageSize << " bytes; possible torn write, treating the "
                << "image as a fresh free page";
     target->PageInit(pid, PageType::kFreePage);
-  } else if (!target->IsValid()) {
+  } else {
+    const bool all_zero = std::ranges::all_of(
+        disk_image, [](char byte) { return byte == 0; });
+    if (all_zero) {
+      target->PageInit(pid, PageType::kFreePage);
+      nread = 0;  // Fresh sparse region has no checksum to validate.
+    } else {
+      try {
+        target->DecodeDisk(disk_image.data());
+      } catch (const std::runtime_error& error) {
+        // Preserve a recoverable, checksum-invalid placeholder. Recovery
+        // opens pages without validation and reconstructs this image from
+        // WAL; ordinary readers still hit the validation failure below.
+        LOG(ERROR) << "invalid page format on page_id=" << pid << ": "
+                   << error.what();
+        target->PageInit(pid, PageType::kUnknown);
+        target->format_magic = 0;
+        target->checksum = 0;
+      }
+    }
+  }
+  if (nread == kPageSize && !target->IsValid()) {
     if (target->type == PageType::kUnknown && target->checksum == 0) {
       // A freshly extended file region reads as zeros; uninitialized rather
       // than corrupt. Real pages always carry a non-zero CRC after WriteBack.

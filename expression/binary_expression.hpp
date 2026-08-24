@@ -24,6 +24,8 @@
 
 namespace tinylamb {
 
+class EvaluationContext;
+
 [[nodiscard]] Value EvaluateBinary(BinaryOperation operation,
                                    const Value& left, const Value& right);
 
@@ -37,6 +39,10 @@ class BinaryExpression : public ExpressionBase {
   [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,
                                const Row* right,
                                const Schema& right_schema) const override;
+  // Stage 2 of the A1 migration: threads EvaluationContext down to children
+  // so nested subqueries resolve through the abstract interface.
+  [[nodiscard]] Value Evaluate(const Row& row, const Schema& schema,
+                               EvaluationContext& context) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
                                           const Schema& right) const override;

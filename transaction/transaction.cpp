@@ -76,6 +76,7 @@ Transaction::Transaction(Transaction&& o) noexcept
       snapshot_ts_(o.snapshot_ts_),
       read_set_(std::move(o.read_set_)),
       write_set_(std::move(o.write_set_)),
+      mutated_index_roots_(std::move(o.mutated_index_roots_)),
       shard_epoch_(o.shard_epoch_),
       write_epoch_(o.write_epoch_.load(std::memory_order_acquire)),
       version_read_caches_(std::move(o.version_read_caches_)),
@@ -122,10 +123,23 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
   if (write_set_.contains(rp)) {
     return true;
   }
-  if (!transaction_manager_->GetExclusiveLock(rp, txn_id_)) {
+  if (!transaction_manager_->AcquireWriteIntent(*this, rp, true)) {
     return false;
   }
-  // Do not remember a write lock until it has actually been acquired.
+  // Do not remember a write until its MVCC intent has been reserved.
+  write_set_.insert(rp);
+  return true;
+}
+
+bool Transaction::TryAddWriteSet(const RowPosition& rp) {
+  assert(!IsFinished());
+  if (read_only_) { return false;
+}
+  if (write_set_.contains(rp)) { return true;
+}
+  if (!transaction_manager_->AcquireWriteIntent(*this, rp, false)) {
+    return false;
+  }
   write_set_.insert(rp);
   return true;
 }
@@ -241,6 +255,11 @@ bool Transaction::RequiresHistoricalRead() const {
 bool Transaction::IndexKeysMayBeStale() const {
   return transaction_manager_ != nullptr &&
          transaction_manager_->IndexKeysMayBeStale(*this);
+}
+
+bool Transaction::IndexKeysMayBeStale(page_id_t index_root) const {
+  return transaction_manager_ != nullptr &&
+         transaction_manager_->IndexKeysMayBeStale(*this, index_root);
 }
 
 lsn_t Transaction::InsertLog(page_id_t pid, slot_t slot,

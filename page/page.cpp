@@ -35,6 +35,7 @@
 #include "page/page_type.hpp"
 #include "page/row_page.hpp"
 #include "page_ref.hpp"
+#include "common/serdes.hpp"
 #include "transaction/transaction.hpp"
 
 // do/while wrap keeps the macro a single statement so it cannot glue onto a
@@ -52,6 +53,8 @@ Page::Page(page_id_t pid, PageType page_type) { PageInit(pid, page_type); }
 
 void Page::PageInit(page_id_t pid, PageType page_type) {
   body.dummy_.fill(0);
+  format_magic = kSerdesMagic;
+  format_version = kSerdesVersion;
   page_id = pid;
   page_lsn = 0;
   type = page_type;
@@ -75,7 +78,48 @@ void Page::PageInit(page_id_t pid, PageType page_type) {
     case PageType::kBranchPage:
       body.branch_page.Initialize();
       break;
+    case PageType::kPaxPage:
+      body.pax_page.Initialize();
+      break;
   }
+}
+
+void Page::EncodeDisk(char* destination) const {
+  size_t offset = 0;
+  offset += SerializeU32(destination + offset, format_magic);
+  offset += SerializeU32(destination + offset, format_version);
+  offset += SerializeU64(destination + offset, page_id);
+  offset += SerializeU64(destination + offset, page_lsn);
+  offset += SerializeU64(destination + offset, recovery_lsn);
+  offset += SerializeU64(destination + offset, static_cast<uint64_t>(type));
+  offset += SerializeU64(destination + offset, checksum);
+  if (offset != kPageHeaderSize) {
+    throw std::runtime_error("page header codec size mismatch");
+  }
+  std::memcpy(destination + offset, &body, kPageBodySize);
+}
+
+void Page::DecodeDisk(const char* source) {
+  size_t offset = 0;
+  offset += DeserializeU32(source + offset, &format_magic);
+  offset += DeserializeU32(source + offset, &format_version);
+  if (format_magic != kSerdesMagic) {
+    throw std::runtime_error("invalid page magic");
+  }
+  if (format_version != kSerdesVersion) {
+    throw std::runtime_error("unsupported page version");
+  }
+  offset += DeserializeU64(source + offset, &page_id);
+  offset += DeserializeU64(source + offset, &page_lsn);
+  offset += DeserializeU64(source + offset, &recovery_lsn);
+  uint64_t raw_type = 0;
+  offset += DeserializeU64(source + offset, &raw_type);
+  type = static_cast<PageType>(raw_type);
+  offset += DeserializeU64(source + offset, &checksum);
+  if (offset != kPageHeaderSize) {
+    throw std::runtime_error("page header codec size mismatch");
+  }
+  std::memcpy(&body, source + offset, kPageBodySize);
 }
 
 // Meta page functions.
@@ -326,9 +370,9 @@ bool Page::IsValid() const { return checksum == StoredChecksum(*this); }
 
 bool Page::ChecksumMatches() const { return IsValid(); }
 
-void Page::InsertImpl(std::string_view redo) {
+void Page::InsertImpl(slot_t slot, std::string_view redo) {
   ASSERT_PAGE_TYPE(PageType::kRowPage);
-  body.row_page.InsertRow(redo);
+  body.row_page.InsertRowAt(slot, redo);
 }
 
 void Page::UpdateImpl(slot_t slot, std::string_view redo) {

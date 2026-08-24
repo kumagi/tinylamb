@@ -2,6 +2,7 @@
 #include "executor/query_scheduler.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <mutex>
 #include <cstdint>
@@ -22,6 +23,9 @@ QueryScheduler::QueryScheduler(size_t cpu_slots, size_t memory_bytes)
 
 QueryScheduler::Lease QueryScheduler::Acquire(size_t cpu_slots,
                                               size_t memory_bytes) {
+  const bool measure = metrics_enabled_.load(std::memory_order_relaxed);
+  const auto wait_start = measure ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
   cpu_slots = std::clamp<size_t>(cpu_slots, 1, cpu_capacity_);
   memory_bytes = std::min(memory_bytes, memory_capacity_);
   std::unique_lock lock(mutex_);
@@ -34,9 +38,29 @@ QueryScheduler::Lease QueryScheduler::Acquire(size_t cpu_slots,
   used_cpu_ += cpu_slots;
   used_memory_ += memory_bytes;
   ++serving_ticket_;
+  if (measure) {
+    const uint64_t wait_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_start)
+            .count());
+    acquire_count_.fetch_add(1, std::memory_order_relaxed);
+    acquire_wait_ns_.fetch_add(wait_ns, std::memory_order_relaxed);
+    if (wait_ns >= 1000) {
+      contended_acquires_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   lock.unlock();
   available_.notify_all();
   return {this, cpu_slots, memory_bytes};
+}
+
+QuerySchedulerStats QueryScheduler::Stats() const {
+  return {
+      .acquire_count = acquire_count_.load(std::memory_order_relaxed),
+      .acquire_wait_ns = acquire_wait_ns_.load(std::memory_order_relaxed),
+      .contended_acquires =
+          contended_acquires_.load(std::memory_order_relaxed),
+  };
 }
 
 void QueryScheduler::Release(size_t cpu_slots, size_t memory_bytes) {

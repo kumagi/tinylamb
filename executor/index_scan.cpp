@@ -21,6 +21,8 @@
 #include "index_scan.hpp"
 
 #include <ostream>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -28,6 +30,8 @@
 #include "index/index.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "page/row_position.hpp"
+#include "table/table.hpp"
+#include "transaction/transaction.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
 
@@ -35,21 +39,26 @@ namespace tinylamb {
 
 IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
                      const Value& begin, const Value& end, bool ascending,
-                     Expression where, const Schema& sc)
+                     Expression where, const Schema& sc, bool lock_rows,
+                     bool wait_for_write_intent)
     : IndexScan(txn, table, index,
                 begin.IsNull() ? std::vector<Value>{}
                                : std::vector<Value>{begin},
                 end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end},
-                ascending, std::move(where), sc) {}
+                ascending, std::move(where), sc, lock_rows,
+                wait_for_write_intent) {}
 
 IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
                      const std::vector<Value>& begin_key,
                      const std::vector<Value>& end_key,
-                     bool ascending, Expression where, Schema sc)
+                     bool ascending, Expression where, Schema sc,
+                     bool lock_rows, bool wait_for_write_intent)
     : txn_(txn),
       table_(table),
       index_(index),
       ascending_(ascending),
+      lock_rows_(lock_rows),
+      wait_for_write_intent_(wait_for_write_intent),
       iter_(new IndexScanIterator(table, index, txn, begin_key, end_key,
                                   ascending)),
       cond_(std::move(where)),
@@ -58,11 +67,14 @@ IndexScan::IndexScan(Transaction& txn, const Table& table, const Index& index,
 IndexScan::IndexScan(
     Transaction& txn, const Table& table, const Index& index,
     std::vector<std::pair<std::vector<Value>, std::vector<Value>>> ranges,
-    bool ascending, Expression where, Schema sc)
+    bool ascending, Expression where, Schema sc, bool lock_rows,
+    bool wait_for_write_intent)
     : txn_(txn),
       table_(table),
       index_(index),
       ascending_(ascending),
+      lock_rows_(lock_rows),
+      wait_for_write_intent_(wait_for_write_intent),
       // Contract: at least one range. Callers build one entry per distinct
       // IN value.
       iter_(new IndexScanIterator(
@@ -87,13 +99,20 @@ void IndexScan::OpenRange(const std::vector<Value>& begin_key,
 bool IndexScan::Next(Row* dst, RowPosition* rp) {
   for (;;) {
     while (!iter_.IsValid()) {
-      if (pending_.empty()) { return false;
+      if (pending_offset_ == pending_.size()) { return false;
 }
-      auto range = std::move(pending_.front());
-      pending_.erase(pending_.begin());
+      auto range = std::move(pending_[pending_offset_++]);
       OpenRange(range.first, range.second);
     }
     const RowPosition pointed_row = iter_.Position();
+    const bool locked = !lock_rows_ ||
+                        (wait_for_write_intent_
+                             ? txn_.AddWriteSet(pointed_row)
+                             : txn_.TryAddWriteSet(pointed_row));
+    if (!locked) {
+      throw std::runtime_error("write intent wait timed out on table " +
+                               std::string(table_.GetSchema().Name()));
+    }
     *dst = *iter_;
     ++iter_;
     if (!dst->IsValid()) { continue;

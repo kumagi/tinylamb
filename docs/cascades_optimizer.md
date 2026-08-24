@@ -1,43 +1,30 @@
 # Cascades optimizer
 
-tinylamb's optimizer is split into four independent rule layers:
+tinylamb's optimizer is split into three independent rule layers:
 
 1. `ExpressionRuleSet` normalizes and folds scalar expression trees.
-2. `AlgebraRuleSet` distributes predicates over a small Filter/Join/Scan tree
-   before memo exploration (pushdown and absorption).
-3. `cascades::RuleSet` inserts equivalent logical expressions into a memo.
-4. `cascades::ImplementationRuleSet` turns logical expressions into physical
+2. `cascades::RuleSet` inserts equivalent logical expressions and scan-filter
+   annotations into a memo.
+3. `cascades::ImplementationRuleSet` turns logical expressions into physical
    plans, which are costed and cached by required physical properties.
 
 The layers depend on their small pattern and binding APIs, not on one another.
-Adding or removing a scalar rule therefore does not require editing memo
-exploration, adding a pushdown transformation does not require touching join
-enumeration, and adding a logical equivalence does not require changing the
-physical implementations.
+Adding or removing a scalar rule does not require editing memo exploration,
+and adding a logical equivalence does not require changing the physical
+implementations.
 
 ## Search flow
 
-`Optimizer::Optimize` rewrites the predicate, normalizes the query through the
-algebra layer, builds one memo group for every equivalent relation set,
-explores logical rules to a fixed point, and performs a top-down cost search
+`Optimizer::Optimize` rewrites expressions, decomposes conjuncts while building
+the memo, builds one memo group for every equivalent relation set, explores
+logical rules with an append-only worklist, and performs a top-down cost search
 from the root group. A memo group can contain multiple join trees. The best
 physical plan is cached with a `(group, PhysicalProperties)` key.
 
-After algebra normalization every predicate conjunct lives either inside a
-scan payload (applied as index bounds plus a local selection) or in the
-residual selection applied once above the join tree; nothing is applied twice.
-
-The built-in algebra rules are:
-
-- `filter_conjoin`
-- `filter_true_elimination`
-- `filter_pushdown_join`
-- `filter_absorb_scan`
-- `join_condition_side_extraction`
-
-Conjuncts that reference more than one relation become join conditions.
-Conjuncts containing subqueries never move because their evaluation context
-is the full joined row.
+Every predicate conjunct is attached to the deepest covering join or to a
+single-relation scan filter. A residual `Selection` remains where the chosen
+physical access path cannot prove it consumed a conjunct, so bounds are an
+optimization and never the sole correctness check.
 
 The built-in logical rules are:
 
@@ -45,24 +32,30 @@ The built-in logical rules are:
 - `join_enumeration`
 - `join_associativity_left`
 - `join_associativity_right`
+- `merge_selections`
+- `push_selection_into_scan`
+- `push_selection_through_join`
+- `split_selection_over_join`
 
 The built-in physical rules are:
 
 - `full_scan`
 - `index_scan`
-- `index_only_scan`
+- `selection`
+- `projection`
+- `aggregation`
+- `limit`
 - `hash_join`
 - `index_join`
 - `nested_loop_join`
 
-Plan construction adds the `empty_result_shortcut` (a constant-FALSE
-predicate collapses into an `EmptyPlan`, while aggregations on top still emit
-their summary row over the empty input) and elides projections whose select
-list already matches the child schema one-to-one.
+`index_scan` may produce an `IndexOnlyScanPlan` when the chosen index covers
+the requested columns. `hash_join` offers both in-memory and hybrid variants;
+`nested_loop_join` is a cross product followed by evaluation of the complete
+join predicate.
 
 Scalar defaults include constant folding for binary, unary, and `IN`
 expressions, comparison canonicalization, boolean identities, singleton `IN`
-
 lowering, double-negation, De Morgan, and constant `CASE` pruning. Further
 normalizations cover `NOT` push-down over comparisons, `LIKE`, and null
 checks; XOR boolean identities; idempotence (`x AND x`) and absorption
@@ -80,37 +73,19 @@ Rules are values held by `OptimizerOptions`; no global registry is mutated.
 
 ```cpp
 tinylamb::OptimizerOptions options = tinylamb::OptimizerOptions::Default();
-options.algebra_rules.Remove("filter_pushdown_join");
 options.relational_rules.Remove("join_commutativity");
 options.expression_rules.Remove("de_morgan");
 options.disabled_implementation_rules.insert("index_join");
 
-auto plan = tinylamb::Optimizer::Optimize(query, context, options);
+auto plan_or = tinylamb::Optimizer::Optimize(query, context, options);
+if (!plan_or) {
+  return plan_or.GetStatus();
+}
+auto plan = plan_or.Value();
 ```
 
 `Add` replaces a rule with the same name, which makes a local override
 explicit and avoids ordering two implementations with the same identity.
-
-## Adding an algebra rule
-
-Algebra rules receive one normalized subtree and return the replacement, or
-`nullptr` when they do not apply. Rules must be convergent: each application
-has to reduce a monotone measure (nesting depth, conjunct count, or predicate
-height), otherwise the rewriter throws after exhausting its pass budget.
-
-```cpp
-using namespace tinylamb;
-
-options.algebra_rules.Add(AlgebraRule(
-    "my_filter_merge", [](const AlgebraTree& node) -> AlgebraTree {
-      if (node->kind != AlgebraNode::Kind::kFilter ||
-          node->children.front()->kind != AlgebraNode::Kind::kFilter) {
-        return nullptr;
-      }
-      return AlgebraNode::Filter(node->children.front()->children.front(),
-                                 node->children.front()->predicate);
-    }));
-```
 
 ## Adding a scalar rule with the C++ DSL
 
@@ -142,10 +117,8 @@ options.relational_rules.Add(Rule(
     "my_join_swap", Join(Any("left"), Any("right")),
     [](const Bindings&, Memo& memo, GroupId group,
        const LogicalExpression& expression) {
-      memo.AddExpression(
-          group, LogicalExpression{LogicalOperator::kJoin,
-                                   {expression.children[1],
-                                    expression.children[0]}, {}});
+      memo.AddExpression(group, memo.NewJoin(expression.children[1],
+                                             expression.children[0]));
     }));
 ```
 
@@ -163,5 +136,26 @@ name, or disabled by placing its name in
 `disabled_implementation_rules` when it is a built-in rule.
 
 Tests for rule isolation and memo enumeration are in
-`expression/rewrite_test.cpp`, `plan/algebra_test.cpp`,
-`plan/cascades_test.cpp`, and `plan/optimizer_test.cpp`.
+`expression/rewrite_test.cpp`, `plan/cascades_test.cpp`, and
+`plan/optimizer_test.cpp`.
+
+## Implementation notes (reviewed 2026-08-24)
+
+- `Optimizer::Optimize` returns `StatusOr<Plan>` and uses
+  `Status::kNotImplemented` when no enabled implementation-rule combination
+  can produce the root.
+- Total cost is child cost plus each rule's `local_cost`. Scan rules use
+  statistics/selectivity and Top-K hints; joins use cardinality estimates and
+  spill penalties. A plan that misses required ordering also pays an estimated
+  `N log N` engine-side sort cost.
+- `PhysicalProperties` contains `require_row_position`, `ordering`,
+  `limit_hint`, `access_method`, and the reserved `distribution`. Selection,
+  projection, and limit forward requirements; joins and aggregation drop them.
+- Logical exploration has no pass cap: an append-only worklist and expression
+  fingerprints drive it to completion. Groups have an expression cap and set
+  `Memo::Degraded()` when alternatives are dropped. Join enumeration skips
+  exponential bipartitions above 16 relations and keeps the initial order.
+  Scalar rewriting still throws if it does not converge within 32 passes.
+- Logical and implementation rules all get a chance to apply in registration
+  order. `Add` replaces an existing rule of the same name. Scalar rewriting is
+  first-success per node and also supports literal function-call folding.

@@ -445,15 +445,13 @@ bool ValidateGeneratedData(const Options& options,
 bool RunSql(tinylamb::Database& database, tinylamb::TransactionContext& context,
             std::string_view sql, std::string* error) {
   tinylamb::SqlEngine engine(database);
-  tinylamb::StatusOr<tinylamb::Executor> prepared =
-      engine.Prepare(context, sql);
-  if (!prepared.HasValue()) {
+  tinylamb::StatusOr<tinylamb::QueryResult> result =
+      engine.Execute(context, sql);
+  if (!result.HasValue()) {
     *error = engine.LastError();
     return false;
   }
-  tinylamb::Row row;
-  while (prepared.Value()->Next(&row, nullptr)) {
-  }
+  result.Value().Drain();
   return true;
 }
 
@@ -681,22 +679,21 @@ struct QueryProfile {
 bool AnalyzeAllTables(tinylamb::Database& database, std::string* error) {
   tinylamb::TransactionContext context = database.BeginContext();
   tinylamb::SqlEngine engine(database);
-  tinylamb::StatusOr<tinylamb::Executor> prepared =
-      engine.Prepare(context, "ANALYZE;");
-  if (!prepared.HasValue()) {
+  tinylamb::StatusOr<tinylamb::QueryResult> result =
+      engine.Execute(context, "ANALYZE;");
+  if (!result.HasValue()) {
     *error = engine.LastError().empty() ? "ANALYZE failed"
                                         : engine.LastError();
     context.Abort();
     return false;
   }
-  tinylamb::Row row;
   size_t tables = 0;
-  while (prepared.Value()->Next(&row, nullptr)) {
+  result.Value().ForEach([&](const tinylamb::Row& row) {
     ++tables;
     if (row.Size() >= 3) {
       std::cout << "analyze." << row[1] << '=' << row[2] << '\n';
     }
-  }
+  });
   if (context.PreCommit() != tinylamb::Status::kSuccess) {
     *error = "ANALYZE commit failed";
     return false;
@@ -710,18 +707,16 @@ bool RunQuery(tinylamb::Database& database, size_t query, double scale_factor,
   tinylamb::TransactionContext context = database.BeginReadOnlyContext();
   tinylamb::SqlEngine engine(database);
   const Clock::time_point begin = Clock::now();
-  tinylamb::StatusOr<tinylamb::Executor> prepared = engine.Prepare(
+  tinylamb::StatusOr<tinylamb::QueryResult> result = engine.Execute(
       context, tinylamb::TpchBenchmarkQueryText(query - 1, scale_factor));
-  if (!prepared.HasValue()) {
+  if (!result.HasValue()) {
     *error = "Q" + std::to_string(query) + ": " + engine.LastError();
     context.Abort();
     return false;
   }
-  tinylamb::Row row;
   size_t rows = 0;
   try {
-    while (prepared.Value()->Next(&row, nullptr)) { ++rows;
-}
+    rows = result.Value().Drain();
   } catch (const std::exception& exception) {
     *error = "Q" + std::to_string(query) + ": " + exception.what();
     context.Abort();
@@ -730,7 +725,7 @@ bool RunQuery(tinylamb::Database& database, size_t query, double scale_factor,
   const double milliseconds =
       std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
   std::ostringstream plan;
-  prepared.Value()->Dump(plan, 0);
+  result.Value().Dump(plan, 0);
   if (context.PreCommit() != tinylamb::Status::kSuccess) {
     *error = "Q" + std::to_string(query) + ": read transaction failed";
     return false;

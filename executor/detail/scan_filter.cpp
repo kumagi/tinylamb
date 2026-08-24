@@ -361,7 +361,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                 // Worker threads only evaluate the simple (constant-vs-column)
                 // predicates. Residual predicates may contain query
                 // expressions whose evaluation touches the shared
-                // TransactionContext and needs thread_local active_runtime,
+                // TransactionContext and its explicit execution runtime,
                 // neither of which is safe on worker threads.
                 for (const SimpleComparePredicate& pred :
                      scan_filter->simple) {
@@ -413,13 +413,13 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
     }
   }
   for (size_t w = 0; w < workers; ++w) {
-    if (active_runtime != nullptr) {
-      active_runtime->scan_rows += shard_seen[w];
-      active_runtime->scan_values_available +=
+    if (context.execution_runtime() != nullptr) {
+      context.execution_runtime()->scan_rows += shard_seen[w];
+      context.execution_runtime()->scan_values_available +=
           shard_seen[w] * table.GetSchema().ColumnCount();
-      active_runtime->scan_values_decoded +=
+      context.execution_runtime()->scan_values_decoded +=
           shard_out[w] * result_schema.ColumnCount();
-      active_runtime->scan_output_rows += shard_out[w];
+      context.execution_runtime()->scan_output_rows += shard_out[w];
     }
   }
   return true;
@@ -430,7 +430,7 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
                     const std::vector<Expression>* scan_predicates,
                     const std::unordered_set<int64_t>* int_key_filter,
                     std::optional<slot_t> int_key_column) {
-  Relation result;
+  Relation result(context.execution_runtime());
   if (source.query) {
     result = ExecuteQuery(context, *source.query, outer, ctes);
   } else if (const auto cte = ctes.find(source.table); cte != ctes.end()) {
@@ -440,16 +440,16 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
         [&](const Row& row) { result.AddRow(row); });
   } else {
     const bool reusable =
-        active_runtime != nullptr &&
-        active_runtime->reusable_base_relations.contains(source.table);
+        context.execution_runtime() != nullptr &&
+        context.execution_runtime()->reusable_base_relations.contains(source.table);
     const std::string cache_key =
         BaseRelationCacheKey(source.table, projection);
     const bool filter_during_scan =
         !reusable && scan_predicates != nullptr && !scan_predicates->empty();
     RelationPtr cached_entry;
     if (reusable) {
-      const auto cached = active_runtime->base_relations.find(cache_key);
-      if (cached != active_runtime->base_relations.end()) {
+      const auto cached = context.execution_runtime()->base_relations.find(cache_key);
+      if (cached != context.execution_runtime()->base_relations.end()) {
         cached_entry = cached->second;
       }
     }
@@ -503,9 +503,9 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
         } else {
           emit_filtered(cached_relation);
         }
-        active_runtime->filter_ms += ElapsedMs(filter_begin);
+        context.execution_runtime()->filter_ms += ElapsedMs(filter_begin);
       }
-      ++active_runtime->base_scan_cache_hits;
+      ++context.execution_runtime()->base_scan_cache_hits;
     } else {
       StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
       if (!table.HasValue()) {
@@ -551,10 +551,10 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
           return table.Value()->BeginFullScan(context.txn_);
         }();
         while (iterator.IsValid()) {
-          if (active_runtime != nullptr) {
-            ++active_runtime->scan_rows;
-            active_runtime->scan_values_available += table_schema.ColumnCount();
-            active_runtime->scan_values_decoded += result.schema.ColumnCount();
+          if (context.execution_runtime() != nullptr) {
+            ++context.execution_runtime()->scan_rows;
+            context.execution_runtime()->scan_values_available += table_schema.ColumnCount();
+            context.execution_runtime()->scan_values_decoded += result.schema.ColumnCount();
           }
           bool matches = true;
           if (full_key_column == std::nullopt && int_key_filter != nullptr &&
@@ -563,7 +563,7 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
             if (key.IsNull() ||
                 !int_key_filter->contains(key.value.int_value)) {
               matches = false;
-              if (active_runtime != nullptr) { ++active_runtime->key_filter_rejected;
+              if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->key_filter_rejected;
 }
             }
           }
@@ -573,20 +573,20 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
           }
           if (matches) {
             result.AddRow(*iterator);
-            if (active_runtime != nullptr) { ++active_runtime->scan_output_rows;
+            if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->scan_output_rows;
 }
           }
           ++iterator;
         }
       }
-      if (active_runtime != nullptr) {
-        active_runtime->scan_ms += ElapsedMs(scan_begin);
+      if (context.execution_runtime() != nullptr) {
+        context.execution_runtime()->scan_ms += ElapsedMs(scan_begin);
         if (filter_during_scan) {
-          active_runtime->filter_ms += ElapsedMs(filter_begin);
+          context.execution_runtime()->filter_ms += ElapsedMs(filter_begin);
         }
         if (reusable && int_key_filter == nullptr) {
           auto cached = std::make_shared<Relation>(std::move(result));
-          active_runtime->base_relations.emplace(cache_key, cached);
+          context.execution_runtime()->base_relations.emplace(cache_key, cached);
           // The contents moved into the cache above; start from a fresh
           // relation before refilling so we never touch a moved-from object.
           result = Relation{};
@@ -681,7 +681,7 @@ void FilterRelation(TransactionContext& context, Relation* relation,
   });
   filtered.FinishSpill();
   *relation = std::move(filtered);
-  if (active_runtime != nullptr) { active_runtime->filter_ms += ElapsedMs(filter_begin);
+  if (context.execution_runtime() != nullptr) { context.execution_runtime()->filter_ms += ElapsedMs(filter_begin);
 }
 }
 

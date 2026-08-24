@@ -113,6 +113,9 @@ std::string LogicalExpression::Fingerprint() const {
   if (operation == LogicalOperator::kLimit) {
     out << "#l:" << limit_offset << ',' << limit_count;
   }
+  if (operation == LogicalOperator::kRelational) {
+    out << "#relational:" << static_cast<const void*>(relational_statement.get());
+  }
   return out.str();
 }
 
@@ -378,15 +381,26 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
       }
       break;
     }
+    case LogicalOperator::kRelational:
+      if (!expression.children.empty() || !expression.relational_statement) {
+        throw std::invalid_argument(
+            "relational IR must carry a statement and have no children");
+      }
+      break;
   }
-  if (target.expressions.size() >= expression_cap_) {
-    degraded_ = true;
-    return false;
-  }
+  // Duplicate rejection runs BEFORE the cap check counts against it, but a
+  // rejected duplicate must not trip the degradation flag either (§6.10):
+  // mirrored associativity rotations re-derive existing expressions by
+  // design and those retries have to stay free.
   const std::string fingerprint = expression.Fingerprint();
-  if (std::ranges::any_of(target.expressions, [&](const auto& existing) {
+  const bool duplicate =
+      std::ranges::any_of(target.expressions, [&](const auto& existing) {
         return existing.Fingerprint() == fingerprint;
-      })) {
+      });
+  if (!duplicate && target.expressions.size() >= expression_cap_) {
+    degraded_ = true;
+  }
+  if (duplicate || target.expressions.size() >= expression_cap_) {
     return false;
   }
   target.expressions.push_back(std::move(expression));
@@ -607,6 +621,12 @@ const RuleSet& RuleSet::Default() {
           }
         },
         LogicalOperator::kJoin));
+    // Two complementary associativity rotations (§6.10). They look redundant,
+    // but the worklist applies each rule once per expression occurrence, so
+    // neither direction alone sees every child-group state in time; together
+    // they derive every join shape. Their overlapping OUTPUTS are duplicates
+    // by fingerprint, and Memo::AddExpression rejects those for free (before
+    // the cap), so the pair no longer pollutes the expression budget.
     built.Add(Rule(
         "join_associativity_left",
         Join(Pattern::Op(LogicalOperator::kJoin, {Any("ll"), Any("lr")}, "left"),
@@ -709,6 +729,7 @@ const RuleSet& RuleSet::Default() {
 
 std::string PhysicalProperties::Key() const {
   std::string key = require_row_position ? "rowpos:1" : "rowpos:0";
+  key.append(wait_for_write_intent ? "|wait:1" : "|wait:0");
   for (const ColumnName& column : ordering) {
     key.push_back('|');
     key.append(column.ToString());
@@ -845,6 +866,7 @@ std::vector<PhysicalProperties> SearchEngine::RequiredChildProperties(
     const LogicalExpression& expression, const PhysicalProperties& required) {
   switch (expression.operation) {
     case LogicalOperator::kScan:
+    case LogicalOperator::kRelational:
       return {};
     case LogicalOperator::kJoin:
       // Joins reorder rows: they neither preserve row position nor deliver

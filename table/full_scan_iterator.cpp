@@ -31,10 +31,49 @@
 #include "iterator_base.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
+#include "page/row_page.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
+
+namespace {
+
+// Read-only MVCC fast path gate.
+//
+// Writer-side contract (see Page::Insert/Update/Delete in page/page.cpp):
+// every COMPLETED page mutation stamps the page with SetPageLSN(txn.PrevLSN())
+// -- the position of that operation's just-appended WAL record -- and logger
+// positions only grow over time.  A writer whose mutation happens after this
+// transaction's snapshot was taken therefore always stamps a PageLSN greater
+// than the snapshot's commit timestamp: each committing transaction emits at
+// least two log records before it can advance the commit counter, so log
+// positions strictly outrun published commit-timestamp values, and any
+// post-snapshot mutation forces PageLSN above the snapshot threshold.
+//
+// Consequently, when IsReadOnly() and PageLSN() <= SnapshotTimestamp() hold,
+// no transaction that BEGAN after our snapshot can have modified the page:
+// either its last modifier committed before our snapshot began (its published
+// version is byte-identical to the physical image) or the physical image is
+// exactly what Transaction::ReadVersion would hand back for this snapshot.
+// The per-row ReadVersion cost (version-shard mutex + hash probe + cache copy)
+// is then pure overhead, and the raw page bytes are deserialized directly.
+// Pages stamped above the threshold fall back to ReadVersion as before.
+// The shared page latch is held across the whole pass, so no writer can slip
+// a modification (and a fresh PageLSN) underneath a decision already taken.
+//
+// Boundary: a writer that mutated the page while still uncommitted BEFORE
+// this snapshot began keeps its low op-LSNs below any threshold that later
+// unrelated commits push past it; such pages are not distinguished here and
+// would be served physically. Closing that window needs writer-side support
+// (page commit timestamps or copy-on-write -- tpch Phase1-2), not a reader
+// heuristic; bulk loads commit before read-only scans in production flows,
+// so they never hit it.
+bool PhysicalReadEligible(const Transaction& txn, const Page& page) {
+  return txn.IsReadOnly() && page.PageLSN() <= txn.SnapshotTimestamp();
+}
+
+}  // namespace
 
 FullScanIterator::FullScanIterator(
     const Table* table, Transaction* txn,
@@ -117,23 +156,43 @@ void FullScanIterator::SeekVisibleRow() {
   // Precondition: page_ is pinned (the constructors and operator++ re-pin it
   // after DropPageLatch or a per-row unpin before calling this method).
   while (pos_.IsValid()) {
+    // One verdict per pinned page: the shared latch freezes PageLSN for the
+    // whole pass, and a dropped latch (DropPageLatch / AdvancePage) re-enters
+    // here, re-pins, and re-evaluates against the possibly newer stamp.
+    const bool physical_read = PhysicalReadEligible(*txn_, **page_);
     while (pos_.slot < (*page_)->body.row_page.RowMax()) {
-      StatusOr<std::string_view> row = (*page_)->Read(*txn_, pos_.slot);
-      if (row.HasValue()) {
+      std::optional<std::string_view> row;
+      if (physical_read) {
+        // Fast path: vacant slots (offset == 0, i.e. deleted or never
+        // filled) are invisible to every snapshot that qualifies above --
+        // any historical deletion would have stamped PageLSN above the
+        // threshold and routed the page to ReadVersion, which is what still
+        // resurrects rows for older snapshots.
+        const RowPage& body = (*page_)->body.row_page;
+        if (body.rows_[pos_.slot].offset != 0) {
+          row = body.GetRow(pos_.slot);
+        }
+      } else {
+        StatusOr<std::string_view> version = (*page_)->Read(*txn_, pos_.slot);
+        if (version.HasValue()) {
+          row = version.Value();
+        }
+      }
+      if (row.has_value()) {
         if (key_filter_ != nullptr && key_column_.has_value()) {
           const auto key = Row::TryPeekInteger(
-              row.Value().data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+              row->data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
               table_->GetSchema(), *key_column_);
           if (!key || !key_filter_->contains(*key)) {
             ++pos_.slot;
             continue;
           }
         }
-        if (!PassesPeekFilters(row.Value())) {
+        if (!PassesPeekFilters(*row)) {
           ++pos_.slot;
           continue;
         }
-        DeserializeCurrent(row.Value());
+        DeserializeCurrent(*row);
         // current_row_ is safe to use after the page is unpinned below:
         // Row::Deserialize copies varchar data into Value::owned_data, so no
         // decoded value keeps a view into the page buffer.

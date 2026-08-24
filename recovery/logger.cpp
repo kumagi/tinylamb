@@ -64,10 +64,9 @@ int FdataSync(int fd) {
 
 Logger::Logger(const std::filesystem::path& logfile, size_t buffer_size,
                size_t every_ms)
-    : buffer_(buffer_size, 0), dst_(CreateFile(logfile)) {
-  // Sync cadence is fixed (kSyncInterval below); every_ms is kept in the
-  // signature for API compatibility.
-  (void)every_ms;
+    : buffer_(buffer_size, 0),
+      sync_interval_(std::chrono::milliseconds(std::max<size_t>(1, every_ms))),
+      dst_(CreateFile(logfile)) {
   if (dst_ == -1) {
     throw std::runtime_error("Failed to open log file: " +
                              std::string(std::strerror(errno)) + " for " +
@@ -207,7 +206,6 @@ void Logger::LoggerWork() {
   assert(!buffer_.empty());
   using Clock = std::chrono::steady_clock;
   auto last_sync = Clock::now();
-  constexpr auto kSyncInterval = std::chrono::milliseconds(10);
   bool dirty = false;
   while (!failed_.load(std::memory_order_acquire) &&
          (!finish_.load(std::memory_order_acquire) ||
@@ -219,7 +217,7 @@ void Logger::LoggerWork() {
 
     if (flushed_lsn == buffered_lsn) {
       if (dirty && (finish_.load(std::memory_order_acquire) ||
-                    Clock::now() - last_sync >= kSyncInterval)) {
+                    Clock::now() - last_sync >= sync_interval_)) {
         if (FdataSync(dst_) != 0) {
           SetFailed(errno);
           return;
@@ -235,7 +233,7 @@ void Logger::LoggerWork() {
         break;
       }
       std::unique_lock work_lk(work_mu_);
-      work_cv_.wait_for(work_lk, kSyncInterval, [&] {
+      work_cv_.wait_for(work_lk, sync_interval_, [&] {
         return finish_.load(std::memory_order_acquire) ||
                flushed_lsn_.load(std::memory_order_acquire) <
                    buffered_lsn_.load(std::memory_order_acquire);
@@ -269,7 +267,7 @@ void Logger::LoggerWork() {
       NotifyWorker();
     }
     if (finish_.load(std::memory_order_acquire) ||
-        Clock::now() - last_sync >= kSyncInterval) {
+        Clock::now() - last_sync >= sync_interval_) {
       if (FdataSync(dst_) != 0) {
         SetFailed(errno);
         return;

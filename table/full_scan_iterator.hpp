@@ -61,6 +61,14 @@ struct IntegerPeekCompare {
 
 // Full scan over a table's row-page chain (or an explicit page list).
 //
+// Visibility contract: rows are served through Transaction::ReadVersion so
+// every snapshot sees its own MVCC version.  Read-only transactions may skip
+// that path per page when PageLSN() <= SnapshotTimestamp() (see
+// PhysicalReadEligible in full_scan_iterator.cpp): the writer-side contract
+// stamps PageLSN on every completed mutation, so such pages carry no
+// modification newer than the snapshot and their physical rows are served
+// directly.  Pages stamped above the threshold fall back to ReadVersion.
+//
 // Lifetime contract: table_ and txn_ must outlive the iterator.  If
 // key_filter_ / peek_compares_ are supplied, those objects must also outlive
 // the iterator -- they are held as raw pointers, so passing the address of a

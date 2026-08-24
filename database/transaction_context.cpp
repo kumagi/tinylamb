@@ -22,11 +22,12 @@
 #include <memory>
 #include <string_view>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <ostream>
 
 #include "common/status_or.hpp"
-#include "database/database.hpp"
+#include "database/catalog_reader.hpp"
 
 namespace tinylamb {
 StatusOr<std::shared_ptr<Table> > TransactionContext::GetTable(
@@ -35,7 +36,8 @@ StatusOr<std::shared_ptr<Table> > TransactionContext::GetTable(
   if (it != tables_.end()) {
     return it->second;
   }
-  ASSIGN_OR_RETURN(Table, tbl, rs_->GetTable(*this, table_name));
+  if (catalog_ == nullptr) { return Status::kNotExists; }
+  ASSIGN_OR_RETURN(Table, tbl, catalog_->GetTable(*this, table_name));
   auto result =
       tables_.emplace(table_name, std::make_shared<Table>(std::move(tbl)));
   return result.first->second;
@@ -47,9 +49,30 @@ StatusOr<std::shared_ptr<TableStatistics> > TransactionContext::GetStats(
   if (it != stats_.end()) {
     return it->second;
   }
-  ASSIGN_OR_RETURN(TableStatistics, tbl, rs_->GetStatistics(*this, table_name));
-  auto result = stats_.emplace(
-      table_name, std::make_shared<TableStatistics>(std::move(tbl)));
+  if (catalog_ == nullptr) { return Status::kNotExists; }
+  struct ThreadStatsCache {
+    CatalogReader* owner{nullptr};
+    uint64_t epoch{0};
+    std::unordered_map<std::string, std::shared_ptr<TableStatistics>> entries;
+  };
+  thread_local ThreadStatsCache cache;
+  const uint64_t epoch = catalog_->CatalogEpoch();
+  if (cache.owner != catalog_ || cache.epoch != epoch) {
+    cache.owner = catalog_;
+    cache.epoch = epoch;
+    cache.entries.clear();
+  }
+  const std::string name(table_name);
+  if (const auto cached = cache.entries.find(name);
+      cached != cache.entries.end()) {
+    stats_.emplace(name, cached->second);
+    return cached->second;
+  }
+  ASSIGN_OR_RETURN(TableStatistics, tbl,
+                   catalog_->GetStatistics(*this, table_name));
+  auto shared = std::make_shared<TableStatistics>(std::move(tbl));
+  cache.entries.emplace(name, shared);
+  auto result = stats_.emplace(table_name, std::move(shared));
   return result.first->second;
 }
 

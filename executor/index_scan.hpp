@@ -39,17 +39,20 @@ class IndexScan : public ExecutorBase {
  public:
   IndexScan(Transaction& txn, const Table& table, const Index& index,
             const Value& begin, const Value& end, bool ascending,
-            Expression where, const Schema& sc);
+            Expression where, const Schema& sc, bool lock_rows = false,
+            bool wait_for_write_intent = true);
   IndexScan(Transaction& txn, const Table& table, const Index& index,
             const std::vector<Value>& begin_key,
             const std::vector<Value>& end_key,
-            bool ascending, Expression where, Schema sc);
+            bool ascending, Expression where, Schema sc,
+            bool lock_rows = false, bool wait_for_write_intent = true);
   // Point-union access (Phase 8 IN lists): scans each [begin,end] key range
   // in sequence. Ranges must be sorted and disjoint for ordered output.
   IndexScan(Transaction& txn, const Table& table, const Index& index,
             std::vector<std::pair<std::vector<Value>, std::vector<Value>>>
                 ranges,
-            bool ascending, Expression where, Schema sc);
+            bool ascending, Expression where, Schema sc,
+            bool lock_rows = false, bool wait_for_write_intent = true);
   IndexScan(const IndexScan&) = delete;
   IndexScan(IndexScan&&) = delete;
   IndexScan& operator=(const IndexScan&) = delete;
@@ -67,8 +70,11 @@ class IndexScan : public ExecutorBase {
   const Table& table_;
   const Index& index_;
   bool ascending_;
+  bool lock_rows_;
+  bool wait_for_write_intent_;
   // Ranges not opened yet (multi-range access only).
   std::vector<std::pair<std::vector<Value>, std::vector<Value>>> pending_;
+  size_t pending_offset_{0};
   Iterator iter_;
   Expression cond_;
   // Held by value (not reference): callers often pass a temporary Schema.

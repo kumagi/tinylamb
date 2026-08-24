@@ -6,14 +6,18 @@
 #ifndef TINYLAMB_SQL_ENGINE_HPP
 #define TINYLAMB_SQL_ENGINE_HPP
 
+#include <functional>
 #include <memory>
 #include <optional>
+#include <ostream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "common/status_or.hpp"
 #include "executor/executor_base.hpp"
+#include "type/row.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 
@@ -22,11 +26,53 @@ class Statement;
 class TransactionContext;
 enum class StatementType;
 
+struct SqlRuntimeStats {
+  uint64_t prepare_ns{0};
+  uint64_t collect_ns{0};
+};
+
+// Unified streaming result returned to CLI, pgwire and benchmarks. Consumers
+// choose a sink, but preparation, row iteration and affected-row decoding no
+// longer get reimplemented at every boundary.
+class QueryResult {
+ public:
+  QueryResult(Executor executor, std::optional<StatementType> type,
+              std::vector<std::string> column_names)
+      : executor_(std::move(executor)),
+        statement_type_(type),
+        column_names_(std::move(column_names)) {}
+
+  bool Next(Row* row);
+  size_t ForEach(const std::function<void(const Row&)>& sink);
+  size_t Drain();
+  std::vector<Row> Collect();
+  int64_t AffectedRows();
+  void Dump(std::ostream& output, int indent = 0) const;
+  [[nodiscard]] const std::optional<StatementType>& Statement() const {
+    return statement_type_;
+  }
+  [[nodiscard]] const std::vector<std::string>& ColumnNames() const {
+    return column_names_;
+  }
+
+ private:
+  Executor executor_;
+  std::optional<StatementType> statement_type_;
+  std::vector<std::string> column_names_;
+};
+
 class SqlEngine {
  public:
   explicit SqlEngine(Database& database) : database_(&database) {}
 
+  StatusOr<QueryResult> Execute(TransactionContext& ctx, std::string_view sql);
   StatusOr<Executor> Prepare(TransactionContext& ctx, std::string_view sql);
+  // Per-worker ingress count used by benchmark integrity gates.  It advances
+  // before parsing/preparing, so exceptions cannot make an SQL invocation
+  // disappear from the measurement.
+  [[nodiscard]] static uint64_t ThreadExecutionCount();
+  static void SetThreadRuntimeProfiling(bool enabled);
+  [[nodiscard]] static SqlRuntimeStats ThreadRuntimeStats();
   [[nodiscard]] const std::string& LastError() const { return last_error_; }
   [[nodiscard]] const std::optional<StatementType>& LastStatementType() const {
     return last_statement_type_;
@@ -39,12 +85,43 @@ class SqlEngine {
   StatusOr<Executor> PrepareStatement(TransactionContext& ctx,
                                       std::unique_ptr<Statement> statement);
 
+  // Phase 2-1 compiled-plan cache. Returns a served Executor on a hit
+  // (nullopt = miss or any doubt; callers fall back to the legacy path).
+  std::optional<Executor> ServeFromPlanCache(
+      TransactionContext& ctx, const std::string& fingerprint,
+      const std::vector<Value>& parameters);
+
+  // Fingerprint/parameters of the statement currently being prepared; fill
+  // sites inside PrepareStatement consult these. An empty fingerprint
+  // disables caching (EXPLAIN, non-templatable SQL).
+  void set_plan_cache_candidate(std::string fingerprint,
+                                std::vector<Value> parameters) {
+    plan_cache_fingerprint_ = std::move(fingerprint);
+    plan_cache_parameters_ = std::move(parameters);
+  }
+  void clear_plan_cache_candidate() {
+    plan_cache_fingerprint_.clear();
+    plan_cache_parameters_.clear();
+  }
+  // Disarms the fill sites no matter how Prepare() exits.
+  class PlanCacheCandidateGuard {
+   public:
+    explicit PlanCacheCandidateGuard(SqlEngine* engine) : engine_(engine) {}
+    ~PlanCacheCandidateGuard() { engine_->clear_plan_cache_candidate(); }
+
+   private:
+    SqlEngine* engine_;
+  };
+
   Database* database_;
   std::string last_error_;
   std::optional<StatementType> last_statement_type_;
   std::vector<std::string> result_column_names_;
+  std::string plan_cache_fingerprint_;
+  std::vector<Value> plan_cache_parameters_;
 };
 
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_SQL_ENGINE_HPP
+#include <functional>

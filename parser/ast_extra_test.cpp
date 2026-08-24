@@ -23,7 +23,7 @@
 #include <vector>
 
 #include "expression/binary_expression.hpp"
-#include "parser/ast.hpp"
+#include "query/statement.hpp"
 #include "parser/parser.hpp"
 #include "parser/pratt_parser.hpp"
 #include "parser/tokenizer.hpp"
@@ -48,7 +48,7 @@ std::string DumpStatement(const Statement& statement) {
 
 }  // namespace
 
-// Targets parser/ast.hpp:96-105 (CreateTableStatement::Dump)
+// Targets query/statement.hpp:96-105 (CreateTableStatement::Dump)
 TEST(AstDumpTest, CreateTableDump) {
   // Arrange -- tokenize CREATE TABLE with three columns
   std::unique_ptr<Statement> stmt = ParseSql(
@@ -65,7 +65,7 @@ TEST(AstDumpTest, CreateTableDump) {
   EXPECT_TRUE(Contains(dump, "]"));
 }
 
-// Targets parser/ast.hpp:119 (DropTableStatement::Dump)
+// Targets query/statement.hpp:119 (DropTableStatement::Dump)
 TEST(AstDumpTest, DropTableDump) {
   // Arrange -- tokenize DROP TABLE
   std::unique_ptr<Statement> stmt = ParseSql("DROP TABLE users;");
@@ -78,7 +78,7 @@ TEST(AstDumpTest, DropTableDump) {
   EXPECT_EQ(dump, "DropTable table=users");
 }
 
-// Targets parser/ast.hpp:189-206 (SelectStatement::Dump with WHERE)
+// Targets query/statement.hpp:189-206 (SelectStatement::Dump with WHERE)
 TEST(AstDumpTest, SelectDumpWithWhere) {
   // Arrange -- tokenize SELECT with two items, two tables and a WHERE clause
   std::unique_ptr<Statement> stmt =
@@ -94,7 +94,7 @@ TEST(AstDumpTest, SelectDumpWithWhere) {
   EXPECT_TRUE(Contains(dump, "where=(id = 1)"));
 }
 
-// Targets parser/ast.hpp:207-208 (SelectStatement::Dump null WHERE branch)
+// Targets query/statement.hpp:207-208 (SelectStatement::Dump null WHERE branch)
 TEST(AstDumpTest, SelectDumpWithoutWhere) {
   // Arrange -- tokenize SELECT without WHERE
   std::unique_ptr<Statement> stmt = ParseSql("SELECT id FROM users;");
@@ -109,7 +109,7 @@ TEST(AstDumpTest, SelectDumpWithoutWhere) {
   EXPECT_TRUE(Contains(dump, "where=(null)"));
 }
 
-// Targets parser/ast.hpp:242-258 (InsertStatement::Dump)
+// Targets query/statement.hpp:242-258 (InsertStatement::Dump)
 TEST(AstDumpTest, InsertDump) {
   // Arrange -- tokenize INSERT with a column list and two value tuples
   std::unique_ptr<Statement> stmt = ParseSql(
@@ -127,7 +127,7 @@ TEST(AstDumpTest, InsertDump) {
   EXPECT_TRUE(Contains(dump, "]"));
 }
 
-// Targets parser/ast.hpp:281-291 (UpdateStatement::Dump with WHERE)
+// Targets query/statement.hpp:281-291 (UpdateStatement::Dump with WHERE)
 TEST(AstDumpTest, UpdateDump) {
   // Arrange -- tokenize UPDATE with two assignments and a WHERE clause
   std::unique_ptr<Statement> stmt =
@@ -145,7 +145,7 @@ TEST(AstDumpTest, UpdateDump) {
   EXPECT_TRUE(Contains(dump, "where=(id = 1)"));
 }
 
-// Targets parser/ast.hpp:292-293 (UpdateStatement::Dump null WHERE branch)
+// Targets query/statement.hpp:292-293 (UpdateStatement::Dump null WHERE branch)
 TEST(AstDumpTest, UpdateDumpWithoutWhere) {
   // Arrange -- tokenize UPDATE without WHERE
   std::unique_ptr<Statement> stmt = ParseSql("UPDATE users SET name = 'a';");
@@ -159,7 +159,7 @@ TEST(AstDumpTest, UpdateDumpWithoutWhere) {
   EXPECT_TRUE(Contains(dump, "where=(null)"));
 }
 
-// Targets parser/ast.hpp:312-315 (DeleteStatement::Dump with WHERE)
+// Targets query/statement.hpp:312-315 (DeleteStatement::Dump with WHERE)
 TEST(AstDumpTest, DeleteDumpWithWhere) {
   // Arrange -- tokenize DELETE with a WHERE clause
   std::unique_ptr<Statement> stmt = ParseSql("DELETE FROM users WHERE id = 3;");
@@ -173,7 +173,7 @@ TEST(AstDumpTest, DeleteDumpWithWhere) {
   EXPECT_TRUE(Contains(dump, "(id = 3)"));
 }
 
-// Targets parser/ast.hpp:316-318 (DeleteStatement::Dump null WHERE branch)
+// Targets query/statement.hpp:316-318 (DeleteStatement::Dump null WHERE branch)
 TEST(AstDumpTest, DeleteDumpWithoutWhere) {
   // Arrange -- tokenize DELETE without FROM/WHERE
   std::unique_ptr<Statement> stmt = ParseSql("DELETE users;");

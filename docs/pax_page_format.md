@@ -1,6 +1,11 @@
 # PAX page format v1
 
-PAXページは、同じページ内で行のMVCC可視性と列ごとの連続領域を分離する。既存`RowPage`とは別のページ型として導入し、移行中のDBを読み書きできるようにする。
+> **Status(2026-08-24)**: v1 実装済み (`PageType::kPaxPage`,
+> `PaxPage::Store/Load`)。全固定幅フィールドは big-endian で、未知の
+> version・範囲外/重複領域・未対応 encoding/type は破損として拒否する。
+
+
+PAXページは、同じページ内で行のMVCC可視性と列ごとの連続領域を分離する。既存`RowPage`とは別のページ型であり、v0 DB との混在読み込みは行わない。
 
 ## レイアウト
 

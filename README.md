@@ -158,10 +158,13 @@ cmake --build build -j --target tinylamb_tpcc_benchmark
 Each SQL statement goes through the GoogleSQL frontend, tinylamb optimizer,
 executor, and transaction commit path. The client reports committed
 transactions per second (`tps`), SQL statements per second (`sql_qps`), and
-committed New-Order transactions per minute (`new_order_tpm`). Think/keying
-time is omitted, so the number is not an audited TPC-C `tpmC` score. Scale
-factor 1 is a large load (on the order of 100k items and ~300k order lines).
-Unit tests use a reduced `TpccScale::ForTest()` population, not SF=1.
+committed New-Order transactions per minute (`new_order_tpm`). Preflight checks
+all five transaction types, and the run fails unless every measured transaction
+executes at least one statement through `SqlEngine` (`sql_path_gate=PASS`).
+Think/keying time is omitted, so the number is not an audited TPC-C `tpmC`
+score. Scale factor 1 is a large load (on the order of 100k items and ~300k
+order lines). Unit tests use a reduced `TpccScale::ForTest()` population, not
+SF=1.
 
 License
 ==========

@@ -18,6 +18,7 @@
 #define TINYLAMB_PAGE_REF_HPP
 #include <assert.h>
 
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 
@@ -34,8 +35,9 @@ class FreePage;
 class PageRef final {
  private:
   // Precondition: page is locked.
-  PageRef(PagePool* src, Page* page, std::shared_mutex* page_lock, bool shared)
-      : pool_(src), page_(page) {
+  PageRef(PagePool* src, Page* page, std::shared_mutex* page_lock, bool shared,
+          std::atomic<uint32_t>* pin_count)
+      : pool_(src), page_(page), pin_count_(pin_count) {
     if (shared) {
       shared_page_lock_ = std::shared_lock<std::shared_mutex>(*page_lock);
     } else {
@@ -43,7 +45,7 @@ class PageRef final {
     }
   }
 
-  PageRef() : pool_(nullptr), page_(nullptr) {}
+  PageRef() : pool_(nullptr), page_(nullptr), pin_count_(nullptr) {}
 
  public:
   Page& operator*() {
@@ -81,10 +83,12 @@ class PageRef final {
   PageRef(PageRef&& o) noexcept
       : pool_(o.pool_),
         page_(o.page_),
+        pin_count_(o.pin_count_),
         exclusive_page_lock_(std::move(o.exclusive_page_lock_)),
         shared_page_lock_(std::move(o.shared_page_lock_)) {
     o.pool_ = nullptr;
     o.page_ = nullptr;
+    o.pin_count_ = nullptr;
   }
   PageRef& operator=(const PageRef&) = delete;
   PageRef& operator=(PageRef&& o) noexcept {
@@ -94,10 +98,12 @@ class PageRef final {
       if (page_ != nullptr) PageUnlock();
       pool_ = o.pool_;
       page_ = o.page_;
+      pin_count_ = o.pin_count_;
       exclusive_page_lock_ = std::move(o.exclusive_page_lock_);
       shared_page_lock_ = std::move(o.shared_page_lock_);
       o.pool_ = nullptr;
       o.page_ = nullptr;
+      o.pin_count_ = nullptr;
     }
     return *this;
   }
@@ -114,6 +120,9 @@ class PageRef final {
   friend class FullScanIterator;
   PagePool* pool_ = nullptr;
   Page* page_ = nullptr;
+  // Entry storage cannot be evicted while this ref's pin is non-zero; the
+  // counter pointer therefore remains valid until PageUnlock decrements it.
+  std::atomic<uint32_t>* pin_count_ = nullptr;
   std::unique_lock<std::shared_mutex> exclusive_page_lock_;
   std::shared_lock<std::shared_mutex> shared_page_lock_;
 };

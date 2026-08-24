@@ -26,14 +26,10 @@
 
 namespace tinylamb {
 
-// The on-disk page/WAL formats are written as raw host memory (see
-// encoder.cpp / serdes.cpp), i.e. little-endian. Declare the assumption
-// instead of silently corrupting data on big-endian hosts.
-static_assert(std::endian::native == std::endian::little,
-              "tinylamb disk formats require a little-endian host");
-
 static constexpr size_t kPageSize = 1024 * 32;
-static constexpr size_t kPageHeaderSize = sizeof(uint64_t) +  // page_id
+static constexpr size_t kPageHeaderSize = sizeof(uint32_t) +  // magic
+                                          sizeof(uint32_t) +  // version
+                                          sizeof(uint64_t) +  // page_id
                                           sizeof(uint64_t) +  // page_lsn
                                           sizeof(uint64_t) +  // rec_lsn
                                           sizeof(uint64_t) +  // page_type

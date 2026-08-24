@@ -24,8 +24,6 @@
 #include <vector>
 
 #include "common/constants.hpp"
-#include "executor/executor_base.hpp"
-#include "executor/projection.hpp"
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
@@ -73,10 +71,7 @@ Schema ProjectionPlan::CalcSchema() const {
   return {"", cols};
 }
 
-Executor ProjectionPlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<Projection>(columns_, src_->GetSchema(),
-                                      src_->EmitExecutor(ctx));
-}
+// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
 
 const Schema& ProjectionPlan::GetSchema() const { return output_schema_; }
 

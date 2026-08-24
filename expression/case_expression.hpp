@@ -25,6 +25,8 @@
 
 namespace tinylamb {
 
+class EvaluationContext;
+
 class CaseExpression : public ExpressionBase {
  public:
   CaseExpression(std::vector<std::pair<Expression, Expression>> when_clauses,
@@ -37,6 +39,10 @@ class CaseExpression : public ExpressionBase {
   [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,
                                const Row* right,
                                const Schema& right_schema) const override;
+  // Stage 2 of the A1 migration: threads EvaluationContext down to the
+  // conditions and result expressions.
+  [[nodiscard]] Value Evaluate(const Row& row, const Schema& schema,
+                               EvaluationContext& context) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
                                           const Schema& right) const override;

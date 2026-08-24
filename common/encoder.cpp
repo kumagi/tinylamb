@@ -23,6 +23,7 @@
 #include <string_view>
 
 #include "constants.hpp"
+#include "common/serdes.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -34,7 +35,9 @@ Encoder& Encoder::operator<<(std::string_view sv) {
     throw std::runtime_error("string too long to encode");
   }
   const auto sz = static_cast<bin_size_t>(sv.size());
-  os_->write(reinterpret_cast<const char*>(&sz), sizeof(bin_size_t));
+  char prefix[sizeof(bin_size_t)];
+  SerializeU16(prefix, sz);
+  os_->write(prefix, sizeof(prefix));
   os_->write(sv.data(), sv.size());
   return *this;
 }
@@ -44,23 +47,38 @@ Encoder& Encoder::operator<<(uint8_t u8) {
   return *this;
 }
 
+Encoder& Encoder::operator<<(uint32_t u32) {
+  char bytes[sizeof(u32)];
+  SerializeU32(bytes, u32);
+  os_->write(bytes, sizeof(bytes));
+  return *this;
+}
+
 Encoder& Encoder::operator<<(slot_t slot) {
-  os_->write(reinterpret_cast<const char*>(&slot), sizeof(slot));
+  char bytes[sizeof(slot)];
+  SerializeSlot(bytes, slot);
+  os_->write(bytes, sizeof(bytes));
   return *this;
 }
 
 Encoder& Encoder::operator<<(int64_t i64) {
-  os_->write(reinterpret_cast<const char*>(&i64), sizeof(i64));
+  char bytes[sizeof(i64)];
+  SerializeInteger(bytes, i64);
+  os_->write(bytes, sizeof(bytes));
   return *this;
 }
 
 Encoder& Encoder::operator<<(uint64_t u64) {
-  os_->write(reinterpret_cast<const char*>(&u64), sizeof(u64));
+  char bytes[sizeof(u64)];
+  SerializeU64(bytes, u64);
+  os_->write(bytes, sizeof(bytes));
   return *this;
 }
 
 Encoder& Encoder::operator<<(double d) {
-  os_->write(reinterpret_cast<const char*>(&d), sizeof(d));
+  char bytes[sizeof(d)];
+  SerializeDouble(bytes, d);
+  os_->write(bytes, sizeof(bytes));
   return *this;
 }
 

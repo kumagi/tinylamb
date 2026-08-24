@@ -31,6 +31,7 @@
 #include "database/transaction_context.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/delete.hpp"
+#include "executor/detail/subquery_runtime.hpp"
 #include "executor/distinct.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/insert.hpp"
@@ -46,6 +47,7 @@
 #include "query/googlesql_ast.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
+#include "query/plan_cache.hpp"
 #include "query/query_data.hpp"
 #include "query/sql_template.hpp"
 #include "query/statement.hpp"
@@ -58,7 +60,124 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
 namespace {
+thread_local uint64_t tls_sql_execution_count = 0;
+thread_local bool tls_sql_runtime_profiling = false;
+thread_local SqlRuntimeStats tls_sql_runtime_stats;
+}  // namespace
+
+bool QueryResult::Next(Row* row) { return executor_->Next(row, nullptr); }
+
+size_t QueryResult::ForEach(const std::function<void(const Row&)>& sink) {
+  size_t rows = 0;
+  Row row;
+  while (Next(&row)) {
+    sink(row);
+    ++rows;
+    row = Row();
+  }
+  return rows;
+}
+
+size_t QueryResult::Drain() {
+  return ForEach([](const Row&) {});
+}
+
+std::vector<Row> QueryResult::Collect() {
+  const auto started = tls_sql_runtime_profiling
+                           ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+  std::vector<Row> rows;
+  ForEach([&](const Row& row) { rows.push_back(row); });
+  if (tls_sql_runtime_profiling) {
+    tls_sql_runtime_stats.collect_ns += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+  }
+  return rows;
+}
+
+int64_t QueryResult::AffectedRows() {
+  Row row;
+  if (!Next(&row) || row.values_.size() < 2 ||
+      row[1].type != ValueType::kInt64) {
+    return 0;
+  }
+  return row[1].value.int_value;
+}
+
+void QueryResult::Dump(std::ostream& output, int indent) const {
+  executor_->Dump(output, indent);
+}
+
+StatusOr<QueryResult> SqlEngine::Execute(TransactionContext& ctx,
+                                         std::string_view sql) {
+  ++tls_sql_execution_count;
+  const auto started = tls_sql_runtime_profiling
+                           ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+  StatusOr<Executor> prepared = Prepare(ctx, sql);
+  if (tls_sql_runtime_profiling) {
+    tls_sql_runtime_stats.prepare_ns += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+  }
+  if (!prepared.HasValue()) { return prepared.GetStatus(); }
+  return QueryResult(std::move(prepared.Value()), last_statement_type_,
+                     result_column_names_);
+}
+
+uint64_t SqlEngine::ThreadExecutionCount() {
+  return tls_sql_execution_count;
+}
+
+void SqlEngine::SetThreadRuntimeProfiling(bool enabled) {
+  tls_sql_runtime_profiling = enabled;
+  tls_sql_runtime_stats = {};
+}
+
+SqlRuntimeStats SqlEngine::ThreadRuntimeStats() {
+  return tls_sql_runtime_stats;
+}
+
+namespace {
+
+// Physical plans and mutation executors borrow Table/Index objects from their
+// compiled-plan artifact.  A concurrent execution of the same fingerprint
+// may replace that cache entry while an older executor is still streaming;
+// keep the exact artifact that emitted this executor alive until the stream
+// itself is destroyed.
+class RetainedExecutor final : public ExecutorBase {
+ public:
+  RetainedExecutor(Executor inner, CompiledPlanPtr retained)
+      : retained_(std::move(retained)), inner_(std::move(inner)) {}
+
+  bool Next(Row* row, RowPosition* position) override {
+    return inner_->Next(row, position);
+  }
+  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+    return inner_->NextBatch(destination, max_rows);
+  }
+  void Dump(std::ostream& output, int indent) const override {
+    inner_->Dump(output, indent);
+  }
+  void Explain(std::ostream& output, int indent) const override {
+    inner_->Explain(output, indent);
+  }
+
+ private:
+  // Members are destroyed in reverse declaration order: tear down the
+  // borrowing executor before releasing the artifact it borrows from.
+  CompiledPlanPtr retained_;
+  Executor inner_;
+};
+
+Executor RetainCompiledPlan(Executor executor, const CompiledPlanPtr& plan) {
+  return std::make_shared<RetainedExecutor>(std::move(executor), plan);
+}
 
 struct ExplainRequest {
   bool analyze{false};
@@ -139,6 +258,8 @@ struct TemplateShard {
 };
 
 std::array<TemplateShard, kTemplateCacheShards> template_shards;
+thread_local std::unordered_map<std::string, std::shared_ptr<Statement>>
+    local_templates;
 
 TemplateShard& ShardFor(const std::string& fingerprint) {
   return template_shards[std::hash<std::string>{}(fingerprint) %
@@ -147,21 +268,33 @@ TemplateShard& ShardFor(const std::string& fingerprint) {
 
 void RememberTemplate(const std::string& fingerprint,
                       std::unique_ptr<Statement> statement) {
+  std::shared_ptr<Statement> shared(std::move(statement));
+  if (local_templates.size() >= kMaxCachedTemplates) {
+    local_templates.clear();
+  }
+  local_templates.insert_or_assign(fingerprint, shared);
   TemplateShard& shard = ShardFor(fingerprint);
   std::scoped_lock lock(shard.mutex);
   if (shard.cache.size() >= kMaxCachedTemplatesPerShard) {
     shard.cache.erase(shard.cache.begin());
   }
-  shard.cache.insert_or_assign(fingerprint,
-                               std::shared_ptr<Statement>(std::move(statement)));
+  shard.cache.insert_or_assign(fingerprint, std::move(shared));
 }
 
 std::shared_ptr<Statement> FindTemplate(const std::string& fingerprint) {
+  if (const auto local = local_templates.find(fingerprint);
+      local != local_templates.end()) {
+    return local->second;
+  }
   TemplateShard& shard = ShardFor(fingerprint);
   std::scoped_lock lock(shard.mutex);
   const auto cached = shard.cache.find(fingerprint);
   if (cached == shard.cache.end()) { return nullptr;
 }
+  if (local_templates.size() >= kMaxCachedTemplates) {
+    local_templates.clear();
+  }
+  local_templates.emplace(fingerprint, cached->second);
   return cached->second;
 }
 
@@ -264,6 +397,119 @@ StatusOr<Executor> ExecuteAnalyze(Database& database, TransactionContext& ctx,
   return Executor(std::make_shared<ConstantExecutor>(std::move(rows)));
 }
 
+// --- Phase 2-1 compiled-plan cache ("prepared plans") -----------------------
+//
+// Serving helpers below replay a cached CompiledPlan. They must stay
+// side-effect free: any doubt returns nullopt and the legacy Prepare path
+// produces the authoritative result/error.
+
+std::optional<Executor> ServeCompiledSelect(TransactionContext& ctx,
+                                            const CompiledPlan& compiled) {
+  // Mirrors the executor-construction tail of PrepareStatement(kSelect);
+  // shape metadata was captured from an identical bound statement at fill.
+  const CompiledPlan::SelectShape& shape = *compiled.select_shape;
+  Executor executor = compiled.plan->EmitExecutor(ctx);
+  if (shape.distinct) {
+    executor = std::make_shared<DistinctExecutor>(std::move(executor));
+  }
+  if (!shape.order_expressions.empty() &&
+      !compiled.plan->IsOrderedBy(shape.order_expressions,
+                                  shape.order_ascending)) {
+    std::vector<SortExecutor::Key> keys;
+    keys.reserve(shape.sort_keys.size());
+    for (const auto& key : shape.sort_keys) {
+      keys.push_back({key.first, key.second});
+    }
+    executor = std::make_shared<SortExecutor>(std::move(executor),
+                                              compiled.plan->GetSchema(),
+                                              std::move(keys));
+  }
+  if ((shape.has_limit || shape.offset != 0) &&
+      !compiled.plan->EnforcesLimit(shape.limit, shape.offset)) {
+    executor = std::make_shared<LimitExecutor>(std::move(executor), shape.limit,
+                                               shape.offset);
+  }
+  if (shape.visible_columns != shape.final_select_size) {
+    std::vector<NamedExpression> visible;
+    visible.reserve(shape.visible_columns);
+    const Schema& schema = compiled.plan->GetSchema();
+    for (size_t i = 0; i < shape.visible_columns; ++i) {
+      visible.emplace_back(schema.GetColumn(i).Name());
+    }
+    executor = std::make_shared<Projection>(std::move(visible), schema,
+                                            std::move(executor));
+  }
+  return executor;
+}
+
+std::optional<Executor> ServeCompiledInsert(TransactionContext& ctx,
+                                            const CompiledPlan& compiled,
+                                            std::vector<Value> parameters) {
+  const CompiledPlan::InsertShape& shape = *compiled.insert_shape;
+  auto values = std::make_shared<const PreparedValues>(std::move(parameters));
+  std::vector<Row> rows;
+  rows.reserve(shape.cells.size());
+  for (const auto& cells : shape.cells) {
+    std::vector<Value> evaluated;
+    evaluated.reserve(cells.size());
+    for (const Expression& cell : cells) {
+      // Slots receive this execution's values; slot-free subtrees are shared
+      // immutable nodes, so cloning cost is proportional to literals only.
+      evaluated.push_back(CloneWithPreparedValues(cell, values)
+                              ->Evaluate(Row(), Schema()));
+    }
+    if (shape.has_named_columns) {
+      // Destination offsets were validated at fill time; replay them.
+      std::vector<Value> reordered(shape.schema.ColumnCount());
+      for (size_t i = 0; i < evaluated.size(); ++i) {
+        reordered[shape.reorder[i]] = evaluated[i];
+      }
+      evaluated = std::move(reordered);
+    }
+    for (size_t i = 0; i < evaluated.size(); ++i) {
+      // Same coercion rules as the legacy INSERT path so behavior is
+      // identical for every parameter combination.
+      const ValueType expected = shape.schema.GetColumn(i).Type();
+      if (evaluated[i].IsNull() || evaluated[i].type == expected) {
+        continue;
+      }
+      if (expected == ValueType::kDouble &&
+          evaluated[i].type == ValueType::kInt64) {
+        evaluated[i] =
+            Value(static_cast<double>(evaluated[i].value.int_value));
+        continue;
+      }
+      if (expected == ValueType::kDate &&
+          evaluated[i].type == ValueType::kVarChar) {
+        evaluated[i] = Value::Date(evaluated[i].value.varchar_value);
+        continue;
+      }
+      return std::nullopt;  // Legacy path reports the precise error.
+    }
+    rows.emplace_back(std::move(evaluated));
+  }
+  return Executor(std::make_shared<Insert>(
+      ctx.txn_, shape.table.get(),
+      std::make_shared<ConstantExecutor>(std::move(rows))));
+}
+
+// Fill-time helper shared by the specialized tiers.
+void RememberSpecializedPlan(const std::string& fingerprint, uint64_t epoch,
+                             std::vector<Value> parameters,
+                             CompiledPlan::Kind kind, Plan plan,
+                             std::shared_ptr<Table> table) {
+  if (fingerprint.empty() || IsVolatileSpecializedPlan(fingerprint)) {
+    return;
+  }
+  auto compiled = std::make_shared<CompiledPlan>();
+  compiled->kind = kind;
+  compiled->epoch = epoch;
+  compiled->parameters = std::move(parameters);
+  compiled->plan = std::move(plan);
+  compiled->table = std::move(table);
+  StoreThreadCompiledPlan(fingerprint, std::move(compiled));
+}
+
 }  // namespace
 
 StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
@@ -305,6 +551,14 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   } catch (const std::exception& error) {
     last_error_ = error.what();
     return Status::kUnknown;
+  }
+  // Phase 2-1: consult the compiled-plan cache before any parse/bind/plan
+  // work. Only non-EXPLAIN, templatable statements participate.
+  if (!explain && templated.templatable) {
+    if (std::optional<Executor> served = ServeFromPlanCache(
+            ctx, templated.fingerprint, templated.parameters)) {
+      return std::move(*served);
+    }
   }
   if (templated.templatable) {
     if (const std::shared_ptr<Statement> cached =
@@ -386,6 +640,10 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch) // Template caching is best-effort; any bind failure just means the statement is parsed verbatim next time.
     }
   }
+  // Arm the compiled-plan fill sites inside PrepareStatement; the guard
+  // disarms them on every exit (including EXPLAIN, which never sets one).
+  set_plan_cache_candidate(templated.fingerprint, templated.parameters);
+  PlanCacheCandidateGuard candidate_guard{this};
   return PrepareStatement(ctx, std::move(statement));
 }
 
@@ -468,6 +726,54 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         }
         rows.emplace_back(std::move(row));
       }
+      // Phase 2-1 fill: build the parametric INSERT artifact. Bindable
+      // literals become ParameterSlot placeholders; runtime values are
+      // injected per execution, so any literal combination hits.
+      if (!plan_cache_fingerprint_.empty()) {
+        auto shape = std::make_shared<CompiledPlan::InsertShape>();
+        bool ok = true;
+        size_t slot_cursor = 0;
+        shape->cells.reserve(insert.Values().size());
+        for (const auto& values : insert.Values()) {
+          std::vector<Expression> cells;
+          cells.reserve(values.size());
+          for (const Expression& value : values) {
+            if (ContainsNonDeterministicCall(value)) {
+              ok = false;
+              break;
+            }
+            cells.push_back(SlotizeLiterals(value, &slot_cursor, &ok));
+            if (!ok) {
+              break;
+            }
+          }
+          if (!ok) {
+            break;
+          }
+          shape->cells.push_back(std::move(cells));
+        }
+        // Slot count must match the extracted parameter count exactly;
+        // otherwise text-order alignment is broken and caching stays off.
+        if (ok && slot_cursor == plan_cache_parameters_.size()) {
+          shape->table = table;
+          shape->schema = table->GetSchema();
+          shape->has_named_columns = !insert.Columns().empty();
+          if (shape->has_named_columns) {
+            // Offsets were validated above (no duplicates, all known).
+            shape->reorder.reserve(insert.Columns().size());
+            for (const std::string& column : insert.Columns()) {
+              shape->reorder.push_back(static_cast<size_t>(
+                  shape->schema.Offset(ColumnName(column))));
+            }
+          }
+          auto compiled = std::make_shared<CompiledPlan>();
+          compiled->kind = CompiledPlan::Kind::kInsert;
+          compiled->epoch = database_->SchemaEpoch();
+          compiled->parameters = plan_cache_parameters_;
+          compiled->insert_shape = std::move(shape);
+          StoreCompiledPlan(plan_cache_fingerprint_, std::move(compiled));
+        }
+      }
       return Executor(std::make_shared<Insert>(
           ctx.txn_, table.get(),
           std::make_shared<ConstantExecutor>(std::move(rows))));
@@ -481,11 +787,36 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       }
       auto select = std::shared_ptr<SelectStatement>(
           dynamic_cast<SelectStatement*>(statement.release()));
+      // Bind every base relation up front, including those nested in IN,
+      // EXISTS, scalar subqueries, and CTE definitions. Lazy expression
+      // evaluation must not let a missing table go unnoticed merely because
+      // an outer predicate produced no rows.
+      std::unordered_map<std::string, size_t> referenced_tables;
+      relational_detail::CountStatementTables(*select, &referenced_tables);
+      for (const auto& [table_name, count] : referenced_tables) {
+        (void)count;
+        StatusOr<std::shared_ptr<Table>> table = ctx.GetTable(table_name);
+        if (!table.HasValue()) {
+          last_error_ = "table " + table_name + " not found";
+          return table.GetStatus();
+        }
+      }
       result_column_names_.reserve(select->SelectList().size());
       for (const NamedExpression& item : select->SelectList()) {
         result_column_names_.push_back(
             item.name.empty() ? item.expression->ToString() : item.name);
       }
+      const auto emit_relational = [&]() -> StatusOr<Executor> {
+        std::vector<Column> columns;
+        columns.reserve(result_column_names_.size());
+        for (const std::string& name : result_column_names_) {
+          columns.emplace_back(name, ValueType::kNull);
+        }
+        StatusOr<Plan> optimized = Optimizer::OptimizeRelational(
+            select, Schema("", std::move(columns)), ctx);
+        if (!optimized.HasValue()) { return optimized.GetStatus(); }
+        return optimized.Value()->EmitExecutor(ctx);
+      };
       // An explicit LIMIT 0 yields zero rows on every route (relational or
       // optimizer); neither LimitExecutor nor LimitedRows can express that
       // because they read limit==0 as "unbounded" (§6.3).
@@ -494,7 +825,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             std::vector<Row>{}));
       }
       if (select->RequiresRelationalEvaluation()) {
-        return Executor(std::make_shared<RelationalExecutor>(ctx, select));
+        return emit_relational();
       }
       // Phase 8 routing: queries whose FROM uses table aliases (including
       // self-joins of one physical table) go through the cost-based
@@ -539,7 +870,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       }
       const bool multi_relation = select->Sources().size() > 1;
       if (multi_relation && (!uses_aliases || has_unqualified_column)) {
-        return Executor(std::make_shared<RelationalExecutor>(ctx, select));
+        return emit_relational();
       }
       QueryData query;
       Expression where = select->WhereClause();
@@ -625,6 +956,40 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         executor = std::make_shared<Projection>(
             std::move(visible), plan->GetSchema(), std::move(executor));
       }
+      // Phase 2-1 fill: capture the compiled plan plus the executor-shape
+      // metadata so identical-parameter repeats skip parse/bind/rewrite/
+      // optimize entirely. Only optimizer-route statements reach this point.
+      if (!plan_cache_fingerprint_.empty()) {
+        auto shape = std::make_shared<CompiledPlan::SelectShape>();
+        shape->column_names = result_column_names_;
+        shape->order_expressions = query.order_expressions_;
+        shape->order_ascending = query.order_ascending_;
+        shape->sort_keys.reserve(sort_expressions.size());
+        for (size_t i = 0; i < sort_expressions.size(); ++i) {
+          shape->sort_keys.emplace_back(sort_expressions[i],
+                                        static_cast<bool>(sort_ascending[i]));
+        }
+        shape->distinct = select->Distinct();
+        shape->has_limit = select->HasLimit();
+        shape->limit = select->Limit();
+        shape->offset = select->Offset();
+        shape->visible_columns = visible_columns;
+        shape->final_select_size = query.select_.size();
+        auto compiled = std::make_shared<CompiledPlan>();
+        compiled->kind = CompiledPlan::Kind::kSelect;
+        compiled->epoch = database_->SchemaEpoch();
+        compiled->parameters = plan_cache_parameters_;
+        compiled->plan = plan;
+        // The plan tree borrows fill-time Tables (and their indexes) that only
+        // this transaction context owns; pin them so cache hits after this
+        // transaction ends do not replay freed memory.
+        compiled->retained_tables.reserve(ctx.tables_.size());
+        for (const auto& entry : ctx.tables_) {
+          compiled->retained_tables.push_back(entry.second);
+        }
+        compiled->select_shape = std::move(shape);
+        StoreThreadCompiledPlan(plan_cache_fingerprint_, std::move(compiled));
+      }
       return executor;
     }
     case StatementType::kUpdate: {
@@ -671,6 +1036,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       query.require_row_position_ = true;
       RETURN_IF_FAIL(query.Rewrite(ctx));
       ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
+      RememberSpecializedPlan(plan_cache_fingerprint_, database_->SchemaEpoch(),
+                              plan_cache_parameters_,
+                              CompiledPlan::Kind::kUpdate, plan, table);
       return Executor(std::make_shared<Update>(ctx.txn_, table.get(),
                                                plan->EmitExecutor(ctx)));
     }
@@ -690,8 +1058,12 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                                           : ConstantValueExp(Value(true));
       query.select_ = std::move(output);
       query.require_row_position_ = true;
+      query.wait_for_write_intent_ = false;
       RETURN_IF_FAIL(query.Rewrite(ctx));
       ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
+      RememberSpecializedPlan(plan_cache_fingerprint_, database_->SchemaEpoch(),
+                              plan_cache_parameters_,
+                              CompiledPlan::Kind::kDelete, plan, table);
       return Executor(std::make_shared<DeleteExecutor>(
           ctx.txn_, *table, plan->EmitExecutor(ctx)));
     }
@@ -708,6 +1080,77 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       return Status::kNotImplemented;
   }
   return Status::kNotImplemented;
+}
+
+std::optional<Executor> SqlEngine::ServeFromPlanCache(
+    TransactionContext& ctx, const std::string& fingerprint,
+    const std::vector<Value>& parameters) {
+  if (IsVolatileSpecializedPlan(fingerprint)) { return std::nullopt; }
+  CompiledPlanPtr compiled =
+      FindThreadCompiledPlan(fingerprint, database_->SchemaEpoch());
+  if (!compiled) {
+    compiled = PreparedPlanCache::Instance().Find(
+        fingerprint, database_->SchemaEpoch());
+  }
+  if (!compiled) {
+    return std::nullopt;
+  }
+  RememberThreadCompiledPlan(fingerprint, compiled);
+  // Specialized tiers replay only with identical parameters: identical
+  // parameters imply an identical bound statement, so the baked constants
+  // and index ranges of the fill-time plan remain correct. Differing
+  // literals fall back to a fresh compile, which then re-specializes the
+  // entry (adaptive refresh).
+  if (compiled->kind != CompiledPlan::Kind::kInsert &&
+      compiled->parameters != parameters) {
+    PlanCacheStats().parameter_mismatches.fetch_add(1,
+                                                    std::memory_order_relaxed);
+    NoteSpecializedParameterMismatch(fingerprint);
+    return std::nullopt;
+  }
+  try {
+    switch (compiled->kind) {
+      case CompiledPlan::Kind::kSelect: {
+        std::optional<Executor> served = ServeCompiledSelect(ctx, *compiled);
+        if (!served) {
+          return std::nullopt;
+        }
+        last_statement_type_ = StatementType::kSelect;
+        result_column_names_ = compiled->select_shape->column_names;
+        PlanCacheStats().replays.fetch_add(1, std::memory_order_relaxed);
+        return RetainCompiledPlan(std::move(*served), compiled);
+      }
+      case CompiledPlan::Kind::kInsert: {
+        std::optional<Executor> served =
+            ServeCompiledInsert(ctx, *compiled, parameters);
+        if (!served) {
+          // Keep the entry: bad literal types must reach the legacy path for
+          // its precise diagnostics, while valid combinations keep hitting.
+          return std::nullopt;
+        }
+        last_statement_type_ = StatementType::kInsert;
+        PlanCacheStats().replays.fetch_add(1, std::memory_order_relaxed);
+        return RetainCompiledPlan(std::move(*served), compiled);
+      }
+      case CompiledPlan::Kind::kUpdate: {
+        last_statement_type_ = StatementType::kUpdate;
+        Executor executor = std::make_shared<Update>(
+            ctx.txn_, compiled->table.get(),
+            compiled->plan->EmitExecutor(ctx));
+        PlanCacheStats().replays.fetch_add(1, std::memory_order_relaxed);
+        return RetainCompiledPlan(std::move(executor), compiled);
+      }
+      case CompiledPlan::Kind::kDelete: {
+        last_statement_type_ = StatementType::kDelete;
+        Executor executor = std::make_shared<DeleteExecutor>(
+            ctx.txn_, *compiled->table, compiled->plan->EmitExecutor(ctx));
+        PlanCacheStats().replays.fetch_add(1, std::memory_order_relaxed);
+        return RetainCompiledPlan(std::move(executor), compiled);
+      }
+    }
+  } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch) // Any fast-path doubt falls back to the authoritative legacy compile.
+  }
+  return std::nullopt;
 }
 
 }  // namespace tinylamb

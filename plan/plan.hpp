@@ -20,7 +20,6 @@
 #include <memory>
 #include <vector>
 
-#include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
 
 namespace tinylamb {
@@ -28,6 +27,11 @@ class Table;
 class TransactionContext;
 class TableStatistics;
 class Index;
+// The executor handle is opaque at the plan layer (V4): plans carry logical
+// information, and the relational factory in the executor layer implements
+// EmitExecutor for every concrete plan node.
+class ExecutorBase;
+using Executor = std::shared_ptr<ExecutorBase>;
 
 class PlanBase {
  public:

@@ -33,10 +33,11 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   [[nodiscard]] size_t WorkerCount() const { return worker_count_; }
 
  private:
-  // How each aggregate reads its input.  kInt64Column aggregates can run
-  // directly over the chunk's raw integer storage; everything else falls back
-  // to the per-row generic path.
-  enum class AggregateInputKind { kRowCount, kInt64Column, kGeneric };
+  // How each aggregate reads its input.  kInt64Column / kDoubleColumn
+  // aggregates can run directly over the chunk's raw numeric storage;
+  // everything else falls back to the per-row generic path.
+  enum class AggregateInputKind { kRowCount, kInt64Column, kDoubleColumn,
+                                  kGeneric };
   struct AggregateInput {
     AggregateInputKind kind{AggregateInputKind::kGeneric};
     size_t column{0};
@@ -57,6 +58,8 @@ class ParallelAggregationExecutor final : public ExecutorBase {
                          const std::vector<size_t>& fallback) const;
   void AccumulateInt64Column(PartialState* state, size_t aggregate_index,
                              const ColumnVector& column) const;
+  void AccumulateDoubleColumn(PartialState* state, size_t aggregate_index,
+                              const ColumnVector& column) const;
   void AccumulateValue(PartialState* state, size_t aggregate_index,
                        const Value& value, bool apply_distinct) const;
   void Merge(PartialState* destination, const PartialState& source) const;
@@ -70,6 +73,7 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   // constructor so Accumulate never rebuilds per-chunk selection state.
   std::vector<size_t> row_count_indices_;
   std::vector<size_t> int64_column_indices_;
+  std::vector<size_t> double_column_indices_;
   std::vector<size_t> generic_indices_;
   // Scratch for per-chunk generic fallbacks; capacity is retained across
   // chunks so the hot path stays allocation-free.

@@ -16,10 +16,12 @@
 
 #include "plan/optimizer.hpp"
 
+#include <array>
 #include <cstdint>
 #include <cstddef>
 #include <algorithm>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -32,26 +34,48 @@
 #include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/constant_executor.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/hash_join.hpp"
 #include "executor/update.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/query_expression.hpp"
 #include "gtest/gtest.h"
 #include "index/index_schema.hpp"
 #include "plan/cascades.hpp"
 #include "plan/plan.hpp"
 #include "query/query_data.hpp"
+#include "query/statement.hpp"
 #include "table/iterator.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
 #include "type/column_name.hpp"
+#include "type/constraint.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
 static const char* const kIndexName = "SampleIndex";
+
+namespace {
+
+// Builds `EXISTS (SELECT <inner_select> FROM <table> WHERE <where>)` shaped
+// subquery expressions for the decorrelation tests.
+Expression ExistsSubquery(const std::vector<NamedExpression>& select,
+                          const std::string& table, Expression where,
+                          bool negated = false) {
+  auto statement = std::make_shared<SelectStatement>(
+      select, std::vector<std::string>{table}, std::move(where));
+  Expression expression =
+      QueryExpressionExp(std::move(statement), nullptr, true, false);
+  return negated ? UnaryExpressionExp(std::move(expression),
+                                      UnaryOperation::kNot)
+                 : expression;
+}
+}  // namespace
 
 class OptimizerTest : public ::testing::Test {
  public:
@@ -294,6 +318,95 @@ TEST_F(OptimizerTest, PhysicalRulesCanBeRemovedIndependently) {
   std::ostringstream index_dump;
   index_dump << index_plan;
   EXPECT_NE(index_dump.str().find("IndexScan"), std::string::npos);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, PhysicalRuleSubsetsPreserveOrderedLimitResults) {
+  // Phase 9 hardening: exercise every useful subset of the alternative scan
+  // and join implementations.  A subset may legitimately be unable to plan,
+  // but every plan it does produce must retain the same ORDER BY/LIMIT
+  // semantics as the complete rule set.
+  QueryData query{
+      {"Sc1", "Sc2"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(
+              ColumnValueExp(ColumnName("Sc1", "c1")),
+              BinaryOperation::kEquals,
+              ColumnValueExp(ColumnName("Sc2", "d1"))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(
+              ColumnValueExp(ColumnName("Sc1", "c1")),
+              BinaryOperation::kLessThan, ConstantValueExp(Value(6)))),
+      {NamedExpression("key", ColumnName("Sc1", "c1"))}};
+  query.order_expressions_ = {
+      ColumnValueExp(ColumnName("Sc1", "c1"))};
+  query.order_ascending_ = {true};
+  query.limit_count_ = 2;
+  query.limit_offset_ = 1;
+
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const std::array<std::string, 5> optional_rules = {
+      "index_scan", "full_scan", "hash_join", "index_join",
+      "nested_loop_join"};
+  std::vector<uint32_t> masks;
+  masks.reserve(1U << optional_rules.size());
+  for (uint32_t mask = 0; mask < (1U << optional_rules.size()); ++mask) {
+    masks.push_back(mask);
+  }
+  // A fixed seed makes failures reproducible while avoiding reliance on rule
+  // registration order during the subset sweep.
+  std::mt19937 rng(0x54494E59U);  // "TINY"
+  std::shuffle(masks.begin(), masks.end(), rng);
+
+  size_t planned_subsets = 0;
+  for (const uint32_t mask : masks) {
+    const bool has_scan = (mask & 0b00011U) != 0;
+    const bool has_join = (mask & 0b11100U) != 0;
+    if (!has_scan || !has_join) {
+      continue;
+    }
+
+    OptimizerOptions options = OptimizerOptions::Default();
+    for (size_t bit = 0; bit < optional_rules.size(); ++bit) {
+      if ((mask & (1U << bit)) == 0) {
+        options.disabled_implementation_rules.insert(optional_rules[bit]);
+      }
+    }
+
+    const auto plan_or = Optimizer::Optimize(query, context, options);
+    if (plan_or.GetStatus() == Status::kNotImplemented) {
+      continue;
+    }
+    ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess) << "rule mask=" << mask;
+    const Plan& plan = plan_or.Value();
+    Executor executor = plan->EmitExecutor(context);
+    Row row;
+    std::vector<int64_t> keys;
+    while (executor->Next(&row, nullptr)) {
+      keys.push_back(row[0].value.int_value);
+    }
+
+    const bool ordered =
+        plan->IsOrderedBy(query.order_expressions_, query.order_ascending_);
+    const bool limited =
+        plan->EnforcesLimit(query.limit_count_, query.limit_offset_);
+    if (!ordered) {
+      std::sort(keys.begin(), keys.end());
+    }
+    if (!limited) {
+      const size_t begin = std::min(query.limit_offset_, keys.size());
+      const size_t end = std::min(begin + query.limit_count_, keys.size());
+      keys = std::vector<int64_t>(keys.begin() + begin, keys.begin() + end);
+    }
+
+    EXPECT_EQ(keys, (std::vector<int64_t>{1, 2}))
+        << "rule mask=" << mask;
+    ++planned_subsets;
+  }
+
+  EXPECT_GE(planned_subsets, 10U);
   ASSERT_SUCCESS(context.PreCommit());
 }
 
@@ -1096,6 +1209,42 @@ TEST_F(OptimizerTest, InListDrivesPointUnionIndexAccess) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+TEST_F(OptimizerTest, EqualityPrefixAndInListDriveCompositePointUnion) {
+  // A predicate such as (warehouse = ?) AND (item IN (...)) must use one
+  // composite point range per item instead of scanning every warehouse's
+  // stock rows. NameIdx has the equivalent two-column shape (d3, d4).
+  QueryData query{
+      {"a"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp(ColumnName("a", "d3")),
+                              BinaryOperation::kEquals,
+                              ConstantValueExp(Value("d3-2"))),
+          BinaryOperation::kAnd,
+          InExpressionExp(ColumnValueExp(ColumnName("a", "d4")),
+                          {ConstantValueExp(Value(16)),
+                           ConstantValueExp(Value(17))})),
+      {NamedExpression("ad1", ColumnValueExp(ColumnName("a", "d1")))} };
+  query.aliases_ = {{"a", "Sc2"}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("x2 points"), std::string::npos) << dump.str();
+
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  std::vector<int64_t> keys;
+  while (executor->Next(&row, nullptr)) {
+    keys.push_back(row[0].value.int_value);
+  }
+  EXPECT_EQ(keys.size(), 20);
+  EXPECT_TRUE(std::all_of(keys.begin(), keys.end(),
+                          [](int64_t key) { return key % 10 == 2; }));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, AccessMethodHintAndMemoDumpDiagnosticsSmoke) {  // Arrange: a plain equality query planned with the Phase 5 access-method
   // hint and Phase 9 memo dumping enabled.
   QueryData query{
@@ -1288,4 +1437,246 @@ TEST_F(OptimizerTest, UpdateOverParallelScanStaysCorrect) {
   EXPECT_EQ(mismatched, 0);
   ASSERT_SUCCESS(reader.PreCommit());
 }
+// ---------------------------------------------------------------------------
+// Semi/anti join decorrelation (tpch Phase2-4 / P1-5).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+int CountRows(Executor executor) {
+  Row row;
+  int count = 0;
+  while (executor->Next(&row, nullptr)) { ++count;
+}
+  return count;
+}
+
+}  // namespace
+
+TEST_F(OptimizerTest, InSubqueryBecomesSemiJoin) {
+  // Arrange: Sc1.c1 = 0..99, Sc3.e1 = 1..20. `c1 IN (SELECT e1 FROM Sc3)`
+  // must keep exactly the 20 intersecting rows.
+  auto statement = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression(ColumnName("Sc3", "e1"))},
+      std::vector<std::string>{"Sc3"}, Expression());
+  QueryData query;
+  query.from_ = {"Sc1"};
+  query.where_ = QueryExpressionExp(std::move(statement),
+                                    ColumnValueExp(ColumnName("Sc1", "c1")),
+                                    false, false);
+  query.select_ = {NamedExpression("c1")};
+
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  const auto plan_or = (Optimizer::Optimize(query, context));
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  const Plan& plan = plan_or.Value();
+  std::ostringstream logical;
+  logical << *plan;
+  EXPECT_NE(logical.str().find("Semi Join"), std::string::npos)
+      << logical.str();
+
+  // Act + Assert: emit and count.
+  Executor executor = plan->EmitExecutor(context);
+  EXPECT_EQ(CountRows(executor), 20);
+}
+
+TEST_F(OptimizerTest, CorrelatedExistsBecomesSemiJoin) {
+  // Arrange: EXISTS(SELECT ... FROM Sc3 WHERE Sc3.e1 = Sc1.c1) decorrelates
+  // to a semi join on that equality; inner-only conjuncts stay as filters.
+  Expression sub_where = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc3", "e1")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("Sc1", "c1"))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc3", "e1")),
+                          BinaryOperation::kLessThan,
+                          ConstantValueExp(Value(10))));
+  QueryData query;
+  query.from_ = {"Sc1"};
+  query.where_ =
+      ExistsSubquery({NamedExpression("e1")}, "Sc3", std::move(sub_where));
+  query.select_ = {NamedExpression("c1")};
+
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  const auto plan_or = (Optimizer::Optimize(query, context));
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  const Plan& plan = plan_or.Value();
+  std::ostringstream logical;
+  logical << *plan;
+  EXPECT_NE(logical.str().find("Semi Join"), std::string::npos)
+      << logical.str();
+
+  Executor executor = plan->EmitExecutor(context);
+  EXPECT_EQ(CountRows(executor), 9);  // c1 in 1..9
+}
+
+TEST_F(OptimizerTest, NotExistsBecomesAntiJoin) {
+  // Arrange: NOT EXISTS keeps rows with no match: c1 outside 1..20 -> 80.
+  QueryData query;
+  query.from_ = {"Sc1"};
+  query.where_ = ExistsSubquery(
+      {NamedExpression("e1")}, "Sc3",
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc3", "e1")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("Sc1", "c1"))),
+      true);
+  query.select_ = {NamedExpression("c1")};
+
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  const auto plan_or = (Optimizer::Optimize(query, context));
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  const Plan& plan = plan_or.Value();
+  std::ostringstream logical;
+  logical << *plan;
+  EXPECT_NE(logical.str().find("Anti Join"), std::string::npos)
+      << logical.str();
+
+  Executor executor = plan->EmitExecutor(context);
+  EXPECT_EQ(CountRows(executor), 80);
+}
+
+TEST_F(OptimizerTest, NotInWithoutNotNullConstraintStaysOnOldPath) {
+  // Arrange: fixture columns carry no NOT NULL constraint, so `NOT IN` must
+  // NOT become an anti join (NULLs in the set would flip UNKNOWN into TRUE).
+  auto statement = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression(ColumnName("Sc3", "e1"))},
+      std::vector<std::string>{"Sc3"}, Expression());
+  QueryData query;
+  query.from_ = {"Sc1"};
+  query.where_ = QueryExpressionExp(std::move(statement),
+                                    ColumnValueExp(ColumnName("Sc1", "c1")),
+                                    false, true);
+  query.select_ = {NamedExpression("c1")};
+
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  const auto plan_or = (Optimizer::Optimize(query, context));
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  const Plan& plan = plan_or.Value();
+  std::ostringstream logical;
+  logical << *plan;
+  EXPECT_EQ(logical.str().find("Anti Join"), std::string::npos)
+      << logical.str();
+
+  // Act + Assert: the untouched conjunct still evaluates per-row and throws
+  // (QueryExpression requires relational evaluation), exactly as before.
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  EXPECT_THROW(static_cast<void>(executor->Next(&row, nullptr)),
+               std::runtime_error);
+}
+
+TEST_F(OptimizerTest, NotInWithNotNullKeysBecomesAntiJoin) {
+  // Arrange: both key columns are declared NOT NULL (primary keys), which is
+  // exactly the gate that makes `NOT IN` -> anti join sound.
+  TransactionContext writer = rs_->BeginContext();
+  {
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, tbl,
+        rs_->CreateTable(
+            writer,
+            Schema("Po", {Column("c", ValueType::kInt64,
+                                 Constraint(Constraint::kPrimaryKey))})));
+    for (int i = 0; i < 20; ++i) {
+      ASSERT_SUCCESS(tbl.Insert(writer.txn_, Row({Value(i)})).GetStatus());
+    }
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, tbl2,
+        rs_->CreateTable(
+            writer,
+            Schema("Nn", {Column("k", ValueType::kInt64,
+                                 Constraint(Constraint::kPrimaryKey))})));
+    for (int i = 5; i <= 7; ++i) {
+      ASSERT_SUCCESS(tbl2.Insert(writer.txn_, Row({Value(i)})).GetStatus());
+    }
+  }
+  ASSERT_SUCCESS(rs_->RefreshStatistics(writer, "Po"));
+  ASSERT_SUCCESS(rs_->RefreshStatistics(writer, "Nn"));
+  ASSERT_SUCCESS(writer.txn_.PreCommit());
+
+  auto statement = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression(ColumnName("Nn", "k"))},
+      std::vector<std::string>{"Nn"}, Expression());
+  QueryData query;
+  query.from_ = {"Po"};
+  query.where_ = QueryExpressionExp(std::move(statement),
+                                    ColumnValueExp(ColumnName("Po", "c")),
+                                    false, true);
+  query.select_ = {NamedExpression("c")};
+
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  const auto plan_or = (Optimizer::Optimize(query, context));
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  const Plan& plan = plan_or.Value();
+  std::ostringstream logical;
+  logical << *plan;
+  EXPECT_NE(logical.str().find("Anti Join"), std::string::npos)
+      << logical.str();
+
+  Executor executor = plan->EmitExecutor(context);
+  EXPECT_EQ(CountRows(executor), 17);  // 0..19 minus 5..7
+}
+
+TEST(HashJoinKindTest, SemiJoinEmitsProbeRowOnceAndNullNeverMatches) {
+  using tinylamb::Value;
+  // Build side holds duplicates of 5 plus a NULL: semi emits each matching
+  // probe row once regardless of duplicate build matches.
+  std::vector<Row> right_rows{
+      Row({Value(int64_t{5})}),
+      Row({Value(int64_t{5})}),
+      Row({Value()})};
+  std::vector<Row> left_rows{
+      Row({Value(int64_t{5})}),
+      Row({Value(int64_t{7})}),
+      Row({Value()})};
+  HashJoin join(std::make_shared<ConstantExecutor>(left_rows),
+                std::vector<slot_t>{0},
+                std::make_shared<ConstantExecutor>(right_rows),
+                std::vector<slot_t>{0}, HashJoinMode::kInMemory,
+                JoinKind::kSemi);
+  Row row;
+  ASSERT_TRUE(join.Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(5));
+  EXPECT_FALSE(join.Next(&row, nullptr));  // 7 unmatched, NULL never matches
+}
+
+TEST(HashJoinKindTest, AntiJoinKeepsUnmatchedRowsOnly) {
+  std::vector<Row> right_rows{Row({Value(int64_t{5})})};
+  std::vector<Row> left_rows{
+      Row({Value(int64_t{5})}), Row({Value(int64_t{7})}),
+      Row({Value(int64_t{9})})};
+  HashJoin join(std::make_shared<ConstantExecutor>(left_rows),
+                std::vector<slot_t>{0},
+                std::make_shared<ConstantExecutor>(right_rows),
+                std::vector<slot_t>{0}, HashJoinMode::kInMemory,
+                JoinKind::kAnti);
+  Row row;
+  ASSERT_TRUE(join.Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(7));
+  ASSERT_TRUE(join.Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(9));
+  EXPECT_FALSE(join.Next(&row, nullptr));
+}
+
+TEST(HashJoinKindTest, AntiJoinEmptyBuildSideEmitsEverythingIncludingNull) {
+  // `x NOT IN ()` is TRUE even for x IS NULL: every probe row survives,
+  // NULL keys included.
+  std::vector<Row> left_rows{Row({Value()}), Row({Value(int64_t{1})})};
+  HashJoin join(std::make_shared<ConstantExecutor>(left_rows),
+                std::vector<slot_t>{0},
+                std::make_shared<ConstantExecutor>(std::vector<Row>{}),
+                std::vector<slot_t>{0}, HashJoinMode::kInMemory,
+                JoinKind::kAnti);
+  Row row;
+  ASSERT_TRUE(join.Next(&row, nullptr));
+  EXPECT_TRUE(row[0].IsNull());
+  ASSERT_TRUE(join.Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(1));
+  EXPECT_FALSE(join.Next(&row, nullptr));
+}
+
 }  // namespace tinylamb

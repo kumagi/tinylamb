@@ -26,6 +26,8 @@
 #include "expression/named_expression.hpp"
 #include "expression/jit.hpp"
 #include "type/schema.hpp"
+#include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -51,9 +53,32 @@ class AggregationExecutor : public ExecutorBase {
  private:
   bool NextGeneric(Row* dst);
 
+  // How each aggregate reads its input for the vectorized accumulator path.
+  // kGeneric falls back to the per-row Evaluate loop below.
+  enum class AggregateInputKind {
+    kCountStar,     // COUNT(*): fed straight from the batch row count.
+    kTypedColumn,   // non-distinct column reference over int64/double data.
+    kTypedConstant, // non-distinct constant argument folded once per batch.
+    kGeneric,
+  };
+  struct AggregateInput {
+    AggregateInputKind kind{AggregateInputKind::kGeneric};
+    size_t column{0};
+    ValueType type{ValueType::kNull};
+    Value constant;
+  };
+  // Accumulates one whole batch through the typed accumulators.  Returns
+  // false when the batch layout does not match the declared types; the caller
+  // must then run the generic per-row loop for that batch untouched.
+  bool AccumulateTypedBatch(std::vector<Value>* results,
+                            std::vector<int64_t>* counts,
+                            const DataChunk& chunk) const;
+
   std::shared_ptr<ExecutorBase> child_;
   Schema input_schema_;
   std::vector<NamedExpression> aggregates_;
+  std::vector<AggregateInput> inputs_;
+  bool all_typed_{false};
   bool executed_ = false;
   DataChunk input_batch_;
   bool jit_sum_eligible_{false};

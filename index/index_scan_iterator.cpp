@@ -83,7 +83,7 @@ IndexScanIterator::IndexScanIterator(const Table& table, const Index& index,
       begin_(FirstOrNull(begin_key)),
       end_(FirstOrNull(end_key)),
       ascending_(ascending),
-      is_unique_(index.sc_.mode_ == IndexMode::kUnique),
+      is_unique_(index.StoresSingleValue()),
       bpt_(index.Root()),
       iter_(&bpt_, &txn, EncodeParts(begin_key), EncodeEndParts(index, end_key),
             ascending) {
@@ -158,7 +158,7 @@ void IndexScanIterator::UpdateIteratorState() {
 }
 
 void IndexScanIterator::ResolveRow() const {
-  PageRef ref = txn_.GetPageManager()->GetPage(pos_.page_id, txn_.IsReadOnly());
+  PageRef ref = txn_.GetPageManager()->GetPage(pos_.page_id, true);
   if (!ref.IsValid()) {
     return;
   }
@@ -174,6 +174,14 @@ void IndexScanIterator::ResolveRow() const {
   current_row_.Deserialize(
       row.Value().data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
       table_.schema_);
+  if (index_.RetainsDeletedEntries() &&
+      index_.GenerateKey(current_row_) != iter_.Key()) {
+    // A retained entry may point at a row whose indexed key was changed by a
+    // newer visible version.  It is valid for an old snapshot, but not this
+    // one.  Rechecking here also keeps direct BeginIndexScan callers correct
+    // when no SQL predicate is available above the iterator.
+    current_row_.Clear();
+  }
   current_row_resolved_ = true;
 }
 

@@ -18,12 +18,14 @@
 #include "expression/named_expression.hpp"
 #include "plan/plan.hpp"
 #include "type/column_name.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
 class TransactionContext;
 class Table;
 class TableStatistics;
 struct QueryData;
+class SelectStatement;
 }  // namespace tinylamb
 
 namespace tinylamb::cascades {
@@ -38,6 +40,9 @@ enum class LogicalOperator {
   kProjection,
   kAggregation,
   kLimit,
+  // Opaque relational IR (outer/semi/anti joins, subqueries and CTEs). The
+  // memo can cost/select it while its internal lowering remains specialized.
+  kRelational,
 };
 
 // One logical expression inside a memo group. `predicate` carries the
@@ -53,6 +58,8 @@ struct LogicalExpression {
   std::vector<NamedExpression> target_list{};
   size_t limit_count{0};
   size_t limit_offset{0};
+  std::shared_ptr<const SelectStatement> relational_statement{};
+  Schema output_schema{};
 
   [[nodiscard]] std::string Fingerprint() const;
 };
@@ -302,6 +309,7 @@ enum class Distribution : uint8_t { kAny, kSingleNode };
 
 struct PhysicalProperties {
   bool require_row_position{false};
+  bool wait_for_write_intent{true};
   std::vector<ColumnName> ordering;
   // Upper bound on interesting output rows (OFFSET + LIMIT) when the required
   // ordering is delivered; enables Top-K costing on ordered scans.

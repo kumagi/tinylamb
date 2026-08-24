@@ -212,6 +212,23 @@ Value BinaryExpression::Evaluate(const Row* left, const Schema& left_schema,
       right_->Evaluate(left, left_schema, right, right_schema));
 }
 
+// Context-aware form: identical dispatch to the plain evaluator, with the
+// context threaded into both children (A1 stage 2).
+Value BinaryExpression::Evaluate(const Row& row, const Schema& schema,
+                                 EvaluationContext& context) const {
+  if (op_ == BinaryOperation::kAnd || op_ == BinaryOperation::kOr) {
+    const Value left_value = left_->Evaluate(row, schema, context);
+    if (!left_value.IsNull() &&
+        left_value.Truthy() != (op_ == BinaryOperation::kAnd)) {
+      return Value(op_ == BinaryOperation::kOr);
+    }
+    return EvaluateBinary(
+        op_, left_value, right_->Evaluate(row, schema, context));
+  }
+  return EvaluateBinary(op_, left_->Evaluate(row, schema, context),
+                        right_->Evaluate(row, schema, context));
+}
+
 namespace {
 Type BinaryResultType(BinaryOperation operation, const Type& left,
                       const Type& right) {

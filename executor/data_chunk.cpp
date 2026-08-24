@@ -357,6 +357,36 @@ void DataChunk::AppendRowFromColumns(
   ++size_;
 }
 
+void DataChunk::AppendGather(const DataChunk& source,
+                             const uint32_t* selection, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    if (selection[i] >= source.Size()) {
+      throw std::out_of_range("data chunk append row out of range");
+    }
+  }
+  if (columns_.empty() && size_ == 0) {
+    std::vector<ValueType> types;
+    types.reserve(source.ColumnCount());
+    for (size_t i = 0; i < source.ColumnCount(); ++i) {
+      types.push_back(source.ColumnAt(i).Type());
+    }
+    Initialize(types);
+  }
+  if (ColumnCount() != source.ColumnCount()) {
+    throw std::invalid_argument("data chunk width mismatch");
+  }
+  for (size_t i = 0; i < count; ++i) {
+    const size_t row_index = selection[i];
+    for (size_t c = 0; c < columns_.size(); ++c) {
+      const ColumnVector& column = source.ColumnAt(c);
+      columns_[c].AppendFrom(column, row_index);
+      UpdateZoneMapFrom(column, row_index, &zone_maps_[c]);
+    }
+    positions_.push_back(source.PositionAt(row_index));
+    ++size_;
+  }
+}
+
 Row DataChunk::RowAt(size_t row_index) const {
   assert(row_index < size_ && "DataChunk::RowAt out of range");
   std::vector<Value> values;

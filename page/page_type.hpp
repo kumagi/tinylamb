@@ -32,6 +32,7 @@ enum class PageType : uint64_t {
   kRowPage,
   kLeafPage,
   kBranchPage,
+  kPaxPage,
 };
 
 inline std::string PageTypeString(enum PageType type) {
@@ -46,6 +47,8 @@ inline std::string PageTypeString(enum PageType type) {
       return "LeafPage";
     case PageType::kBranchPage:
       return "BranchPage";
+    case PageType::kPaxPage:
+      return "PaxPage";
     default:
       return "(unknown)";
   }

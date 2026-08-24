@@ -4,6 +4,171 @@ Measurements of tinylamb's bundled TPC-C and TPC-H drivers. These are
 engineering numbers, not audited TPC results (no think/keying time, no
 auditor, no 2-hour TPC-C window, no TPC-H power/throughput mix).
 
+## 2026-08-24 — TPC-C SQL frontend restored and enforced
+
+- The standard TPC-C workload again sends every measured DML statement through
+  `SqlEngine::Execute`, including GoogleSQL parsing, planning, execution, and
+  transaction processing. The typed `Table`/`IndexScanIterator` transaction
+  implementations were removed from this driver.
+- Preflight now rejects any of the five transaction types if it executes zero
+  SQL statements. Runtime accounting also rejects the run if any individual
+  measured transaction reports zero statements (`sql_path_gate=FAIL`, exit 4).
+- **SF=1 preflight:** New-Order 54 statements, Payment 7, Order-Status 3,
+  Delivery 70, Stock-Level 210; every `sql_path` check passed.
+- **SF=1 integration diagnostic:** default build, one client, 0 s warmup, 1 s
+  measure, no-sync commit: 114 attempts, 113 commits, one expected rollback,
+  zero engine aborts, **3,647 executed SQL statements**, `sql_path_gate=PASS`,
+  113 TPS. This short run validates wiring only; it is not a performance result.
+- Delivery SQL now supplies the complete `ol_number` key bounds for its
+  order-line update and aggregate. Without the bounds, repeated SF=1 Delivery
+  transactions could miss rows through the composite-prefix scan path.
+- The 18,548/45,963 TPS figures below bypassed the SQL frontend. They remain
+  useful only as typed storage-engine upper bounds and must not be compared as
+  SQL end-to-end TPC-C throughput.
+
+## 2026-08-24 — TPC-C typed-API upper bound (not SQL end-to-end; superseded)
+
+- **Build:** default CMake `build/` (assertions enabled), current working tree.
+- **Host:** AMD Ryzen 9 9950X3D, 16 cores / 32 threads, 59 GiB RAM.
+- **Shape:** official SF=1 population, 10 clients, 1 s warmup, 5 s measure,
+  seed `20260824`, Clause 5.2 mix, no think/keying time.
+- **Upper bound (`--no-sync-commit --profile-waits`):** **18,548 committed
+  TPS**, 19,548 attempted TPS, **481,440 new-order TPM**. 92,740 commits,
+  422 expected New-Order rollbacks, 4,580 engine aborts. Average latency:
+  New-Order 0.516 ms, Payment 0.399 ms, Order-Status 0.062 ms, Delivery
+  0.455 ms, Stock-Level 2.178 ms. MVCC intent conflict rate: **0.372%**.
+- **Release confirmation (`build-rel/`, same shape):** **45,963 committed
+  TPS**, 48,454 attempted TPS, 1,182,804 new-order TPM. New-Order 0.213 ms,
+  Payment 0.190 ms, Order-Status 0.020 ms, Delivery 0.095 ms, Stock-Level
+  0.589 ms; MVCC intent conflicts 0.386%.
+- **Durable 1 ms group commit:** **4,370.6 committed TPS**, 167,832
+  new-order TPM. WAL wait averaged 1.086 ms over 22,779 waits; this is now the
+  dominant limit. Payment admission is disabled for this mode so the gate
+  does not serialize fsync/group commit.
+- **Release durable confirmation:** **5,001.2 committed TPS**, 190,464
+  new-order TPM; WAL wait averaged 1.264 ms and MVCC intent conflicts were
+  2.538%.
+- **Previous upper-bound observation:** about 4,295 TPS after typed TPC-C and
+  MVCC GC work. The final no-sync result is about **4.3x** that figure and
+  exceeds the 18k engineering target.
+
+**Bottlenecks removed**
+
+1. MVCC GC retained the newest version of every loaded row and rescanned the
+   entire map every ~10 ms. The heap is authoritative for the latest image;
+   chains no active snapshot needs are now erased completely. One-client
+   intent-mutex time fell from ~1.25 s to ~4 ms in a 3 s sample.
+2. `Table::last_pid_` came from stale catalog bytes in every transaction, so
+   each append walked the row-page chain from its first page. A PageManager
+   tail cache now advances monotonically across independently decoded Table
+   objects. New-Order latency fell below 0.6 ms.
+3. Delivery performed one B+Tree descent per order line. A bounded exact-key
+   range (`line 1..o_ol_cnt`) replaces those probes. Queue deletes and
+   New-Order index inserts are deferred until after conflict-prone row writes,
+   avoiding unsafe structural WAL undo after an ordinary MVCC abort.
+4. The unused `order_line_item_idx` doubled every order-line index write but
+   was not read by any of the five TPC-C transactions, so the fixture no
+   longer creates it.
+5. SF=1 Payment snapshots repeatedly lost on the single W_YTD row. For the
+   no-sync upper-bound run, per-warehouse admission prevents complete work on
+   snapshots guaranteed to abort; the durable run leaves it disabled to keep
+   group commit parallel.
+
+These remain engineering throughput figures, not audited tpmC. The durable
+result shows that getting 18k with synchronous commit requires a different
+commit publication/grouping design; lock-table lock-freedom is not the next
+limiter.
+
+## 2026-08-24 — TPC-C OLTP fast paths and MVCC sharding
+
+- **Build:** `CMAKE_BUILD_TYPE=Release` (`build-rel/`), current working tree.
+- **Durability:** synchronous commit enabled, WAL group-commit interval 1 ms.
+- **Command shape:** `tinylamb_tpcc_benchmark <fresh-db> --warmup 2
+  --seconds 5 --seed 20260824 --profile-waits`. These short samples are for
+  engineering direction, not audited tpmC or a stable release gate.
+- **SF=1, 10 clients:** **993.6 TPS**, **29,796 new-order TPM**, 4,968 commits
+  from 6,045 attempts; 29 expected New-Order rollbacks and 1,048 engine aborts.
+  Average latency: New-Order 12.87 ms, Payment 1.10 ms, Order-Status 0.04 ms,
+  Delivery 23.14 ms, Stock-Level 16.52 ms.
+- **SF=2, 10 clients:** **433.0 TPS**, **12,828 new-order TPM**, 2,165 commits
+  from 2,513 attempts; 12 expected rollbacks and 336 engine aborts. Average
+  latency: New-Order 30.83 ms, Payment 2.25 ms, Order-Status 0.57 ms, Delivery
+  55.54 ms, Stock-Level 69.51 ms.
+- **Conclusion on scale factor:** SF=2 did not improve throughput at a fixed
+  client count; it was 56% slower than SF=1. The SF=1 result is therefore not
+  being held back by too few warehouses. The larger B+Tree/data footprint is
+  currently more expensive than the reduction in warehouse contention.
+- **Implemented:** typed index/MVCC paths for Delivery and Order-Status;
+  typed customer-name lookup in Payment; one multi-row order-line INSERT;
+  composite equality-prefix + `IN` point unions; per-index stale-key epochs;
+  exact full-key bounds for TPC-C composite scans; per-warehouse Delivery
+  admission; configurable 1 ms WAL group commit; wait/abort instrumentation;
+  MVCC version shards increased from 64 to 256.
+- **Observed waits at SF=1/10:** WAL 4.17 s cumulative, write-intent mutex
+  3.38 s, commit-shard mutex 0.12 s across ten workers. Write-intent conflicts
+  were 2.18%. The remaining dominant correctness/performance loss is retry-free
+  first-updater-wins aborts on warehouse/stock rows, not the scheduler
+  (`wait.scheduler.acquires=0`). A lock-free table may reduce mutex time, but
+  transaction retry and warehouse hot-row redesign have higher expected value.
+- **Caveat:** repeated fresh-load attempts can still terminate with exit 139
+  for some seed/B+Tree shapes. Successful samples above completed all five
+  preflight transaction checks, but fixture-load stability needs a separate
+  sanitizer/fuzzer investigation before using this as a release gate.
+
+## 2026-08-24 — TPC-C SF=1, 10 clients, 60 seconds, MVCC v1
+
+- **Build:** `CMAKE_BUILD_TYPE=Release` (`build-rel/`), current working tree
+- **Command:** `./tinylamb_tpcc_benchmark ./tpcc-run/sf1-v1-20260824-final \
+  --scale-factor 1 --clients 10 --warmup 2 --seconds 60 --seed 20260819`
+- **Fixture:** freshly loaded incompatible big-endian v1 database. All five
+  transaction-shape verifications passed before warmup.
+- **Result:** **50.533 TPS**, **1,851.433 SQL QPS**, **1,395 new-order TPM**.
+  This is an engineering throughput number, not audited tpmC (think/keying
+  time omitted).
+- **Outcomes:** 3,180 attempted, 3,032 committed, 15 expected New-Order user
+  rollbacks, and 133 engine aborts (**4.18%**). Warmup had 18 engine aborts.
+- **Average latency:** New-Order **126.254 ms** (1,395/1,456 committed),
+  Payment **11.008 ms** (1,333/1,344), Order-Status **1.233 ms** (133/134),
+  Delivery **1,713.804 ms** (35/110), Stock-Level **756.091 ms** (136/136).
+- **Mix:** New-Order 45.786%, Payment 42.264%, Order-Status 4.214%, Delivery
+  3.459%, Stock-Level 4.277%; `mix_clause_542=short_interval` because Payment
+  and Delivery fell below their minimum percentages.
+- **Resources:** wall **87.63 s** including load/verification and worker drain,
+  CPU user/system **179.88/15.97 s**, peak RSS **463,192 KiB**.
+- **Comparison:** the previous SF=1/10-client sample was only 10 seconds, so it
+  is not strictly apples-to-apples. Against that run, TPS rose 6.90 -> 50.533
+  (+632%) and new-order TPM rose 198 -> 1,395 (+605%); New-Order latency fell
+  1,101 -> 126 ms. Payment, Delivery, and Stock-Level latency regressed.
+- **Correctness fixes required to measure:** update now reads its indexed old
+  row before reserving an invisible unstaged intent; TPC-C catches executor
+  conflicts and aborts the transaction; insertion skips holes reserved by a
+  concurrent delete while WAL replay preserves the selected slot.
+- **Log:** `build-rel/tpcc-run/sf1-v1-20260824-10c60s-final.log`.
+
+## 2026-08-24 — SF=1 big-endian v1 format remeasurement
+
+- **Build:** `CMAKE_BUILD_TYPE=Release` (`build-rel/`), current working tree
+- **Fresh command:** `./tinylamb_tpch_benchmark ./tpch-run/sf1 --scale-factor 1 \
+  --data-dir ./tpch-run/sf1.tpch-data --force`
+- **Fixture:** DBGEN `.tbl` files reused; database, WAL, and checkpoint files
+  recreated in the incompatible big-endian v1 format.
+- **Load:** **112.57 s** total (`lineitem` 112.47 s, `orders` 23.62 s, 8 workers),
+  down 10.9% from 126.39 s.
+- **Analyze:** **8.17 s**, down 83.8% from 50.40 s.
+- **Query sum (Q1–Q22):** **58.40 s**, down 28.2% from 81.30 s
+  (`build-rel/tpch-run/sf1-v1-20260824-bench.log`). All 22 queries completed
+  with their expected row counts.
+- **Slowest:** Q22 **16.07 s**, Q21 **8.67 s**, Q1 **3.88 s**, Q18 **3.20 s**,
+  Q9 **2.85 s**.
+- **End-to-end wall:** **207.89 s**; peak RSS **9,539,152 KiB**.
+- **Warm/reopen check:** query sum **50.29 s**, database open **33.00 s**,
+  ANALYZE **5.56 s**, wall **97.08 s**
+  (`build-rel/tpch-run/sf1-v1-20260824-reuse.log`).
+- **Regression:** Q22 repeatedly took **16.07–17.68 s** versus **1.00 s** in the
+  2026-08-23 run; its `filter_ms` rose to 15.81–17.51 s. Q17 also rose from
+  **0.94 s** to **2.05–2.36 s**. These are follow-up optimization targets even
+  though the total improved.
+
 ## 2026-08-23 — SF=1 clean `--force` reload (post M5–M8 + test fixes)
 
 - **When:** 2026-08-23
@@ -353,3 +518,77 @@ syscall/context-switch ratio is a latch or lock convoy, not SQL parse.
 4. TPC-H leftovers from the morning snapshot (DATE filters, Q8/Q9/Q12/Q13/Q22
    crashes) were not remeasured here.
 
+## 2026-08-24 — SQL-only TPC-C regulation pass and OLTP tuning
+
+- **Build:** `build-rel`, Release, sanitizers off
+- **Shape:** SF=1, 10 terminals, official population and 45/43/4/4/4 input mix
+- **SQL integrity:** every measured transaction enters `SqlEngine::Execute`;
+  preflight statement counts are New-Order 10, Payment 7, Order-Status 3,
+  Delivery 70, Stock-Level 3. All five `sql_path` checks and the aggregate
+  `sql_path_gate` pass. No typed-table benchmark path is present.
+- **Regulation correction:** New-Order, Payment and Order-Status now choose
+  D_ID randomly in 1..10 per transaction. Only Stock-Level retains the fixed,
+  unique terminal `(W_ID,D_ID)` pair. NURand, official cardinalities, 1%
+  invalid-item rollback and mix generation remain enabled.
+- **Not an audited tpmC result:** keying/think time, remote terminal emulation,
+  screens, 120-minute run and durability audit are absent. The binary prints
+  `tpmc_compliant=false`.
+
+### No-sync CPU upper bound, warmup 3 s, measurement 10 s
+
+Command: `tinylamb_tpcc_benchmark <db> --scale-factor 1 --clients 10
+--warmup 3 --seconds 10 --seed 20260824 --no-sync-commit --profile-waits`.
+
+| Metric | Value |
+| --- | ---: |
+| committed throughput | **13,218.7 TPS** |
+| SQL throughput | **110,680.4 statements/s** |
+| New-Order | 61,524 / 62,462 committed, 0.728 ms average |
+| Payment | 59,276 / 59,537 committed, 0.372 ms average |
+| Order-Status | 5,522 / 5,577 committed, 0.384 ms average |
+| Delivery | 389 / 5,562 committed, 3.774 ms average |
+| Stock-Level | 5,476 / 5,476 committed, 1.684 ms average |
+| engine aborts / user rollbacks | 5,794 / 633 |
+| New-Order diagnostic rate | 369,144/min |
+| prepare / collect CPU across 10 workers | 50.40 s / 41.64 s |
+| MVCC intent conflicts | 6,678 / 2,112,542 (0.316%) |
+
+The 10-second mix landed at 45.062/42.952/4.023/4.013/3.951%; the Stock-Level
+share missed the 4% lower bound by 0.049 point, so the driver correctly reports
+`short_interval`. This is random short-window variance, not a substituted mix;
+use the documented 60-second gate for a mix decision.
+
+### Synchronous commit, warmup 2 s, measurement 5 s
+
+The same shape with the default 1 ms group-commit interval produced
+**6,384.4 TPS**, 55,135 SQL statements/s and 176,820 diagnostic New-Orders/min.
+WAL durability wait averaged 837.9 us over 37,354 waits. This is the durable
+number to compare with future WAL/group-commit work; the 13.2k value above is
+the CPU/concurrency upper bound.
+
+### Changes retained from the tuning loop
+
+- versioned-unique index mode retains key→row-position history and lets heap
+  MVCC decide visibility; TPC-C `orders`, `new_order`, and `order_line` primary
+  indexes use it so rollback/delete cannot poison later point scans;
+- strict write-intent waiting reads the predecessor's newest committed image,
+  matching the TPC-C isolation-test wait semantics; DELETE remains no-wait to
+  prevent ten concurrent Delivery inputs from forming a convoy;
+- composite equality-prefix costing and OR/IN point-union ranges keep OLTP
+  queries on the correct composite indexes;
+- SQL template/compiled-plan caches are worker-local on churn and expose real
+  replay vs parameter-mismatch counters; high-cardinality replacement queues
+  are suppressed;
+- statistics are reused as immutable, epoch-keyed thread-local metadata;
+- buffer-pool LRU touches are sampled at 1/64 resident hits and PageRef keeps
+  its atomic pin counter, removing a second stripe-map lookup on every unpin;
+- point-union scans advance a cursor instead of repeatedly erasing the front
+  of a vector; benchmark diagnostics truncate giant first-error SQL strings.
+
+The 30k TPS target is **not reached**. At the current point, prepare plus
+executor collection consume about 92 of the available 100 worker-seconds per
+10-second run. Delivery is deliberately not serialized by a benchmark-only
+warehouse mutex and therefore aborts heavily under a no-think-time input
+storm. The next compliant step is a real deferred Delivery/RTE queue plus
+generic parameterized index-bound plans; simply skipping SQL/parser work or
+adding a warehouse gate would make the number incomparable.

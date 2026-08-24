@@ -91,6 +91,11 @@ class DataChunk {
   void AppendRowFromColumns(const std::vector<const ColumnVector*>& sources,
                             size_t row_index,
                             RowPosition position = RowPosition());
+  // Appends the rows picked by a selection vector without materializing
+  // intermediate Rows.  Every index must be < source.Size(); on an empty
+  // chunk the layout is inferred from the source column types.
+  void AppendGather(const DataChunk& source, const uint32_t* selection,
+                    size_t count);
 
   [[nodiscard]] Row RowAt(size_t row_index) const;
   [[nodiscard]] const RowPosition& PositionAt(size_t row_index) const {

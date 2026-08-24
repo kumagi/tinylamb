@@ -17,6 +17,7 @@
 #include "decoder.hpp"
 #include <string>
 #include "common/constants.hpp"
+#include "common/serdes.hpp"
 #include <ios>
 #include <cstdint>
 #include "type/value_type.hpp"
@@ -24,7 +25,9 @@
 namespace tinylamb {
 Decoder& Decoder::operator>>(std::string& str) {
   bin_size_t size = 0;
-  is_->read(reinterpret_cast<char*>(&size), sizeof(size));
+  char prefix[sizeof(size)]{};
+  is_->read(prefix, sizeof(prefix));
+  DeserializeU16(prefix, &size);
   // A failed/corrupt length prefix must not resize with garbage; mirror the
   // vector overload and leave the string empty with failbit set.
   if (!*is_) {
@@ -47,25 +50,40 @@ Decoder& Decoder::operator>>(uint8_t& u8) {
   return *this;
 }
 
+Decoder& Decoder::operator>>(uint32_t& u32) {
+  char bytes[sizeof(u32)]{};
+  is_->read(bytes, sizeof(bytes));
+  DeserializeU32(bytes, &u32);
+  return *this;
+}
+
 Decoder& Decoder::operator>>(slot_t& slot) {
-  is_->read(reinterpret_cast<char*>(&slot), sizeof(slot));
+  char bytes[sizeof(slot)]{};
+  is_->read(bytes, sizeof(bytes));
+  DeserializeSlot(bytes, &slot);
   return *this;
 }
 
 Decoder& Decoder::operator>>(int64_t& i64) {
-  is_->read(reinterpret_cast<char*>(&i64), sizeof(i64));
+  char bytes[sizeof(i64)]{};
+  is_->read(bytes, sizeof(bytes));
+  DeserializeInteger(bytes, &i64);
   return *this;
 }
 
 Decoder& Decoder::operator>>(uint64_t& u64) {
-  is_->read(reinterpret_cast<char*>(&u64), sizeof(u64));
+  char bytes[sizeof(u64)]{};
+  is_->read(bytes, sizeof(bytes));
+  DeserializeU64(bytes, &u64);
   return *this;
 }
 
 
 
 Decoder& Decoder::operator>>(double& d) {
-  is_->read(reinterpret_cast<char*>(&d), sizeof(d));
+  char bytes[sizeof(d)]{};
+  is_->read(bytes, sizeof(bytes));
+  DeserializeDouble(bytes, &d);
   return *this;
 }
 

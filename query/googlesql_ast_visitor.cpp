@@ -230,9 +230,10 @@ bool NeedsRelationalEvaluation(const Expression& expression,  // NOLINT(misc-no-
       return !top_level || NeedsRelationalEvaluation(
                                expression->AsAggregateExpression().Child());
     case TypeTag::kBinaryExp:
-      if (expression->AsBinaryExpression().Op() == BinaryOperation::kOr) {
-        return true;
-      }
+      // OR used to force the materializing relational executor because the
+      // cost-based scan rules could not derive an access path for it.  They
+      // now support both a full-scan residual and disjoint composite-prefix
+      // index unions, so OR is no longer a complexity boundary.
       return NeedsRelationalEvaluation(expression->AsBinaryExpression().Left(),
                                        false) ||
              NeedsRelationalEvaluation(expression->AsBinaryExpression().Right(),

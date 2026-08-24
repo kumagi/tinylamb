@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <cstddef>
 #include <cctype>
 #include <exception>
@@ -133,23 +134,20 @@ int main(int argc, char** argv) {
   // failure aborts the whole run instead of terminating the process.
   for (const std::string& statement : statements) {
     try {
-      tinylamb::StatusOr<tinylamb::Executor> prepared =
-          engine.Prepare(context, statement);
-      if (!prepared.HasValue()) {
+      tinylamb::StatusOr<tinylamb::QueryResult> executed =
+          engine.Execute(context, statement);
+      if (!executed.HasValue()) {
         const std::string& last_error = engine.LastError();
         std::cerr << "SQL error: " << last_error;
         if (last_error.empty()) {
-          std::cerr << prepared.GetStatus();
+          std::cerr << executed.GetStatus();
         }
         std::cerr << '\n';
         context.Abort();
         return 1;
       }
-      tinylamb::Row row;
-      tinylamb::Executor executor = std::move(prepared.Value());
-      while (executor->Next(&row, nullptr)) {
-        std::cout << row << '\n';
-      }
+      executed.Value().ForEach(
+          [](const tinylamb::Row& row) { std::cout << row << '\n'; });
     } catch (const std::exception& error) {
       std::cerr << "error executing statement: " << error.what() << '\n';
       context.Abort();

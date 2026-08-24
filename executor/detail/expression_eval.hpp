@@ -77,7 +77,8 @@ Schema ProjectSchema(const Schema& schema,
 std::string BaseRelationCacheKey(
     std::string_view table, const std::vector<slot_t>* projection);
 
-bool ReusesBaseRelation(const SelectSource& source);
+bool ReusesBaseRelation(TransactionContext& context,
+                        const SelectSource& source);
 
 std::string ProjectionName(const NamedExpression& projection, size_t index);
 

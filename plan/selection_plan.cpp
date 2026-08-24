@@ -22,18 +22,13 @@
 #include <string>
 
 #include "common/constants.hpp"
-#include "executor/executor_base.hpp"
-#include "executor/selection.hpp"
 #include "expression/expression.hpp"
 #include "plan.hpp"
 #include "table/table_statistics.hpp"
 
 namespace tinylamb {
 
-Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<Selection>(exp_, src_->GetSchema(),
-                                     src_->EmitExecutor(ctx));
-}
+// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
 
 const Schema& SelectionPlan::GetSchema() const { return src_->GetSchema(); }
 

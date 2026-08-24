@@ -65,6 +65,22 @@ Value InExpression::Evaluate(const Row* left, const Schema& left_schema,
   return saw_null ? Value() : Value(false);
 }
 
+// Context-aware form: same three-valued membership as the plain evaluator
+// with the context threaded into every child (A1 stage 2).
+Value InExpression::Evaluate(const Row& row, const Schema& schema,
+                             EvaluationContext& context) const {
+  const Value child = child_->Evaluate(row, schema, context);
+  bool saw_null = child.IsNull();
+  for (const auto& item : list_) {
+    const Value candidate = item->Evaluate(row, schema, context);
+    saw_null |= candidate.IsNull();
+    if (!child.IsNull() && !candidate.IsNull() && child == candidate) {
+      return Value(true);
+    }
+  }
+  return saw_null ? Value() : Value(false);
+}
+
 std::string InExpression::ToString() const {
   std::string result = child_->ToString() + " IN (";
   for (size_t i = 0; i < list_.size(); ++i) {

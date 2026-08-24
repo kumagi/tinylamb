@@ -44,17 +44,11 @@ struct RowPosition;
 class Table {
  public:
   using ScanMorsel = std::vector<page_id_t>;
-  struct IndexValueType {
-    RowPosition pos;
-    Row include;
-    friend Encoder& operator<<(Encoder& e, const IndexValueType& v);
-    friend Decoder& operator>>(Decoder& d, IndexValueType& t);
-    friend std::ostream& operator<<(std::ostream& o,
-                                    const IndexValueType& v) {
-      o << "IndexValueType(pos=" << v.pos << ", include=" << v.include << ")";
-      return o;
-    }
-  };
+  // IndexValueType moved to index/index_schema.hpp (improvement3 S5).  The
+  // using-declaration is a compatibility bridge for TUs that still spell
+  // Table::IndexValueType (table.cpp, index_scan_iterator.cpp); it adds no
+  // second definition and the disk encoding is unchanged.
+  using IndexValueType = tinylamb::IndexValueType;
 
   Table() = default;
   Table(Schema sc, page_id_t pid)
@@ -146,12 +140,18 @@ class Table {
   }
 
  private:
-  static Status IndexInsert(Transaction& txn, const Index& idx, const Row& new_row,
-                     const RowPosition& pos);
+  // |hint_leaf| threads a BPlusTree landing-leaf cursor so consecutive index
+  // operations on the same tree (e.g. the delete+insert pair of one UPDATE)
+  // skip the root-to-leaf walk when the remembered leaf still covers the
+  // key. nullptr keeps the plain always-descend behavior.
+  Status IndexInsert(Transaction& txn, const Index& idx, const Row& new_row,
+                     const RowPosition& pos,
+                     page_id_t* hint_leaf = nullptr) const;
   Status IndexDelete(Transaction& txn, const Index& idx,
                      const RowPosition& pos) const;
   static Status IndexDelete(Transaction& txn, const Index& idx, const RowPosition& pos,
-                     const Row& original_row);
+                     const Row& original_row,
+                     page_id_t* hint_leaf = nullptr);
 
   friend class Database;
   friend class FullScanIterator;

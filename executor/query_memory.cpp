@@ -12,7 +12,12 @@
 
 namespace tinylamb {
 namespace {
-constexpr size_t kDefaultQueryMemoryBytes = size_t{1} << 30;  // 1 GiB
+// RAM-resident SF=10 (tpch Phase3-1): a full lineitem probe (~60M rows x
+// ~100B) plus join/agg working copies fits in ~6-8 GiB, so the previous 1 GiB
+// default spilled immediately on every large query. 8 GiB matches the value
+// benchmark/tpch_benchmark.cpp sets via the environment variable; operators
+// can still override or disable ("0") with TINYLAMB_QUERY_MEMORY_BYTES.
+constexpr size_t kDefaultQueryMemoryBytes = size_t{8} << 30;  // 8 GiB
 }
 
 size_t QueryMemoryBudget::LimitFromEnv() {

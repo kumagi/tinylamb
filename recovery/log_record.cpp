@@ -629,7 +629,8 @@ void LogRecord::Clear() {
 }
 
 size_t LogRecord::Size() const {
-  size_t size = sizeof(type) + sizeof(prev_lsn) + sizeof(txn_id);
+  size_t size = sizeof(kSerdesMagic) + sizeof(kSerdesVersion) + sizeof(type) +
+                sizeof(prev_lsn) + sizeof(txn_id);
   size_t offset = 1;
   if ((*this).HasPageID()) {
     offset += sizeof(page_id_t);
@@ -703,7 +704,8 @@ size_t LogRecord::Size() const {
 }
 
 Encoder& operator<<(Encoder& e, const LogRecord& l) {
-  e << static_cast<uint16_t>(l.type) << l.prev_lsn << l.txn_id;
+  e << kSerdesMagic << kSerdesVersion << static_cast<uint16_t>(l.type)
+    << l.prev_lsn << l.txn_id;
   const uint8_t types = (l.HasPageID() ? kHasPageID : 0) |
                         (l.HasSlot() ? kHasSlot : 0) |
                         (!l.key.empty() ? kHasKey : 0);
@@ -787,6 +789,15 @@ Encoder& operator<<(Encoder& e, const LogRecord& l) {
 // loudly below instead of returning a half-decoded record silently.
 Decoder& operator>>(Decoder& d, LogRecord& l) {
   l.Clear();
+  uint32_t magic = 0;
+  uint32_t version = 0;
+  d >> magic >> version;
+  if (magic != kSerdesMagic) {
+    throw std::runtime_error("invalid WAL record magic");
+  }
+  if (version != kSerdesVersion) {
+    throw std::runtime_error("unsupported WAL record version");
+  }
   uint16_t type_raw = 0;
   d >> type_raw >> l.prev_lsn >> l.txn_id;
   l.type = static_cast<LogType>(type_raw);

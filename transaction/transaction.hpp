@@ -73,6 +73,7 @@ class Transaction final {
     snapshot_ts_ = o.snapshot_ts_;
     read_set_ = std::move(o.read_set_);
     write_set_ = std::move(o.write_set_);
+    mutated_index_roots_ = std::move(o.mutated_index_roots_);
     shard_epoch_ = o.shard_epoch_;
     write_epoch_.store(o.write_epoch_.load(std::memory_order_acquire),
                        std::memory_order_release);
@@ -101,6 +102,7 @@ class Transaction final {
 
   bool AddReadSet(const RowPosition& rp);
   bool AddWriteSet(const RowPosition& rp);
+  bool TryAddWriteSet(const RowPosition& rp);
   StatusOr<std::string_view> ReadVersion(
       const RowPosition& rp, std::optional<std::string_view> physical);
   void RegisterVersionWrite(const RowPosition& rp,
@@ -111,6 +113,13 @@ class Transaction final {
   [[nodiscard]] uint64_t SnapshotTimestamp() const { return snapshot_ts_; }
   [[nodiscard]] bool RequiresHistoricalRead() const;
   [[nodiscard]] bool IndexKeysMayBeStale() const;
+  [[nodiscard]] bool IndexKeysMayBeStale(page_id_t index_root) const;
+  // Index insertions need no stale-key fallback: MVCC hides rows newer than
+  // the snapshot. Deletion/replacement can remove a key an old snapshot still
+  // needs, so Table records those roots here and commit publishes their epoch.
+  void MarkIndexKeysChanged(page_id_t index_root) {
+    mutated_index_roots_.insert(index_root);
+  }
   [[nodiscard]] bool IsReadOnly() const { return read_only_; }
 
   Status PreCommit();
@@ -209,6 +218,7 @@ class Transaction final {
 
   std::unordered_set<RowPosition> read_set_{};
   std::unordered_set<RowPosition> write_set_{};
+  std::unordered_set<page_id_t> mutated_index_roots_{};
   // Process-wide generation, unique across every Transaction ever created.
   // Thread-local shard caches key on it so a destroyed transaction whose
   // address (or even id, across Database instances) is reused can never be

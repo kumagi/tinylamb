@@ -228,6 +228,7 @@ tinylamb_add_layer(tinylamb_page
         page/page_pool.cpp
         page/row_page.cpp
         page/pax_block.cpp
+        page/pax_page.cpp
         page/page_manager.cpp
         page/meta_page.cpp
         page/page_type.cpp
@@ -330,6 +331,7 @@ tinylamb_add_layer(tinylamb_executor
         executor/limit.cpp
         executor/distinct.cpp
         executor/relational.cpp
+        executor/relational_factory.cpp
         executor/detail/relation.cpp
         executor/detail/subquery_runtime.cpp
         executor/detail/expression_eval.cpp
@@ -344,6 +346,7 @@ tinylamb_add_layer(tinylamb_executor
         plan/projection_plan.cpp
         plan/selection_plan.cpp
         plan/product_plan.cpp
+        plan/relational_plan.cpp
         plan/optimizer.cpp
         plan/cascades.cpp
         plan/limit_plan.cpp
@@ -578,6 +581,7 @@ add_simple_test(page/page_manager_test.cpp)
 add_simple_test(page/row_page_test.cpp)
 add_simple_test(page/pax_layout_test.cpp)
 add_simple_test(page/pax_block_test.cpp)
+add_simple_test(page/pax_page_test.cpp)
 add_simple_test(page/page_type_test.cpp)
 add_simple_test(recovery/logger_test.cpp)
 add_simple_test(recovery/log_record_test.cpp)
@@ -589,6 +593,7 @@ add_simple_test(index/lsm_tree_test.cpp)
 add_simple_test(table/table_test.cpp)
 add_simple_test(table/index_test.cpp)
 add_simple_test(table/full_scan_iterator_test.cpp)
+add_simple_test(table/full_scan_mvcc_fastpath_test.cpp)
 add_simple_test(index/index_scan_iterator_test.cpp)
 add_simple_test(transaction/transaction_test.cpp)
 add_simple_test(transaction/lock_manager_test.cpp)

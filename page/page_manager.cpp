@@ -43,6 +43,21 @@ PageRef PageManager::GetPage(uint64_t page_id, bool shared) {
   return ref;
 }
 
+page_id_t PageManager::GetTableTail(page_id_t first_page,
+                                    page_id_t catalog_hint) {
+  std::scoped_lock lock(table_tails_mu_);
+  return table_tails_.try_emplace(first_page, catalog_hint).first->second;
+}
+
+void PageManager::AdvanceTableTail(page_id_t first_page, page_id_t expected,
+                                   page_id_t next) {
+  std::scoped_lock lock(table_tails_mu_);
+  auto [it, inserted] = table_tails_.try_emplace(first_page, next);
+  if (!inserted && it->second == expected) {
+    it->second = next;
+  }
+}
+
 // Logically delete the page.
 void PageManager::DestroyPage(Transaction& system_txn, Page* target) {
   GetMetaPage()->DestroyPage(system_txn, target);

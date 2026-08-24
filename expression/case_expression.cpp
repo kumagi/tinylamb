@@ -89,6 +89,20 @@ Value CaseExpression::Evaluate(const Row* left, const Schema& left_schema,
              : Value();
 }
 
+// Context-aware form: same dispatch as the plain evaluator with the context
+// threaded into every child expression (A1 stage 2).
+Value CaseExpression::Evaluate(const Row& row, const Schema& schema,
+                               EvaluationContext& context) const {
+  for (const auto& when : when_clauses_) {
+    const Value condition = when.first->Evaluate(row, schema, context);
+    if (!condition.IsNull() && condition.Truthy()) {
+      return when.second->Evaluate(row, schema, context);
+    }
+  }
+  return else_clause_ ? else_clause_->Evaluate(row, schema, context)
+                      : Value();
+}
+
 Type CaseExpression::ResultType(const Schema& schema) const {
   std::vector<tinylamb::Type> branch_types;
   branch_types.reserve(when_clauses_.size() + 1);

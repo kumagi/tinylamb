@@ -34,6 +34,7 @@ class Decoder {
   explicit Decoder(std::istream& is) : is_(&is) {}
   Decoder& operator>>(std::string& str);
   Decoder& operator>>(uint8_t& u8);
+  Decoder& operator>>(uint32_t& u32);
   Decoder& operator>>(slot_t& slot);
   Decoder& operator>>(int64_t& i64);
   Decoder& operator>>(uint64_t& u64);
@@ -44,7 +45,7 @@ class Decoder {
   template <typename T>
   Decoder& operator>>(std::vector<T>& vec) {
     uint64_t size = 0;
-    is_->read(reinterpret_cast<char*>(&size), sizeof(size));
+    *this >> size;
     vec.clear();
     constexpr uint64_t kMaxDecodedElements = 1 << 20;
     if (size > kMaxDecodedElements) {

@@ -24,16 +24,30 @@
 #include "page_type.hpp"
 
 namespace tinylamb {
+namespace {
+void ReleasePin(std::atomic<uint32_t>* pin_count, page_id_t page_id) {
+  if (pin_count == nullptr) { return; }
+  uint32_t pins = pin_count->load(std::memory_order_relaxed);
+  while (pins != 0) {
+    if (pin_count->compare_exchange_weak(pins, pins - 1,
+                                         std::memory_order_release,
+                                         std::memory_order_relaxed)) {
+      return;
+    }
+  }
+  LOG(ERROR) << "unpin underflow on page " << page_id;
+}
+}  // namespace
 
 void PageRef::PageUnlock() {
   assert(page_);
   assert(pool_);
   if (exclusive_page_lock_.owns_lock()) {
     exclusive_page_lock_.unlock();
-    pool_->Unpin(page_->PageID());
+    ReleasePin(pin_count_, page_->PageID());
   } else if (shared_page_lock_.owns_lock()) {
     shared_page_lock_.unlock();
-    pool_->Unpin(page_->PageID());
+    ReleasePin(pin_count_, page_->PageID());
   }
 }
 

@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <exception>
@@ -35,6 +36,7 @@
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
+#include "common/serdes.hpp"
 #include "page/page_pool.hpp"
 #include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
@@ -56,7 +58,9 @@ void WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
       throw std::runtime_error("Failed to open master record: " +
                                tmp.string());
     }
-    out.write(reinterpret_cast<const char*>(&lsn), sizeof(lsn));
+    std::array<char, sizeof(lsn_t)> encoded{};
+    SerializeU64(encoded.data(), lsn);
+    out.write(encoded.data(), encoded.size());
     out.flush();
     if (!out) {
       throw std::runtime_error("Failed to write master record: " +

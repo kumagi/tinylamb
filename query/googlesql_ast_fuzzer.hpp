@@ -9,7 +9,7 @@
 #include <string_view>
 
 #include "common/log_message.hpp"
-#include "parser/ast.hpp"
+#include "query/statement.hpp"
 #include "query/googlesql_ast.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 

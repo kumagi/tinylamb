@@ -83,13 +83,13 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
 
 std::string BPlusTreeIterator::Key() const {
   return std::string(txn_->GetPageManager()
-                         ->GetPage(pid_, txn_->IsReadOnly())
+                         ->GetPage(pid_, true)
                          ->body.leaf_page.GetKey(idx_));
 }
 
 std::string BPlusTreeIterator::Value() const {
   return std::string(txn_->GetPageManager()
-                         ->GetPage(pid_, txn_->IsReadOnly())
+                         ->GetPage(pid_, true)
                          ->body.leaf_page.GetValue(idx_));
 }
 
@@ -99,7 +99,7 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
     // through a stale pid/index pair.
     return *this;
   }
-  PageRef ref = txn_->GetPageManager()->GetPage(pid_, txn_->IsReadOnly());
+  PageRef ref = txn_->GetPageManager()->GetPage(pid_, true);
   LeafPage* const lp = &ref->body.leaf_page;
   idx_++;
   if (lp->row_count_ <= idx_) {
@@ -111,7 +111,7 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
       const FosterPair& foster_pair = foster.Value();
       pid_ = foster_pair.child_pid;
       PageRef next_ref =
-          txn_->GetPageManager()->GetPage(pid_, txn_->IsReadOnly());
+          txn_->GetPageManager()->GetPage(pid_, true);
       ref.PageUnlock();
       idx_ = 0;
       if (next_ref->body.leaf_page.row_count_ == 0 ||
@@ -148,7 +148,7 @@ BPlusTreeIterator& BPlusTreeIterator::operator--() {
     // Moving back before the begin must stay a no-op like operator++.
     return *this;
   }
-  PageRef ref = txn_->GetPageManager()->GetPage(pid_, txn_->IsReadOnly());
+  PageRef ref = txn_->GetPageManager()->GetPage(pid_, true);
   LeafPage* const lp = &ref->body.leaf_page;
   if (0 == idx_) {
     if (pid_ == 0) {
@@ -174,7 +174,7 @@ BPlusTreeIterator& BPlusTreeIterator::operator--() {
           break;
         }
         PageRef child = txn_->GetPageManager()->GetPage(
-            foster.Value().child_pid, txn_->IsReadOnly());
+            foster.Value().child_pid, true);
         prev_ref.PageUnlock();
         prev_ref = std::move(child);
       }

@@ -55,15 +55,6 @@ bool Truthy(const Value& value) {
 
 namespace {
 
-double Number(const Value& value) {
-  if (value.type == ValueType::kDouble) { return value.value.double_value;
-}
-  if (value.type == ValueType::kInt64) {
-    return static_cast<double>(value.value.int_value);
-  }
-  throw std::runtime_error("numeric value required");
-}
-
 int FindColumn(const Schema& schema, const ColumnName& name) {
   int match = -1;
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
@@ -161,140 +152,24 @@ bool Like(std::string_view value, std::string_view pattern) {
 }
 
 Value Binary(BinaryOperation operation, const Value& left, const Value& right) {
-  if (left.IsNull() || right.IsNull()) { return {};
-}
-  if (operation == BinaryOperation::kAnd) {
-    return Value(Truthy(left) && Truthy(right));
-  }
-  if (operation == BinaryOperation::kOr) {
-    return Value(Truthy(left) || Truthy(right));
-  }
-  if (operation == BinaryOperation::kXor) {
-    return Value(Truthy(left) != Truthy(right));
-  }
-  if (operation == BinaryOperation::kLike ||
-      operation == BinaryOperation::kNotLike) {
-    if (left.type != ValueType::kVarChar || right.type != ValueType::kVarChar) {
+  // Canonical evaluation rules live in the AST evaluator (EvaluateBinary,
+  // binary_expression.cpp): forwarding keeps SQL three-valued logic for
+  // AND/OR/XOR, int64 overflow guards and mixed-type promotion identical
+  // across the bytecode, AST and scan-filter paths (improvement3.md A6/S7).
+  try {
+    return EvaluateBinary(operation, left, right);
+  } catch (const std::runtime_error& error) {
+    // Message texts pinned by executor tests for this path; the semantics
+    // above are already canonical.
+    const std::string_view what = error.what();
+    if (what == "LIKE requires strings") {
       throw std::runtime_error("LIKE requires string operands");
     }
-    const bool matched =
-        Like(left.value.varchar_value, right.value.varchar_value);
-    return Value(operation == BinaryOperation::kLike ? matched : !matched);
-  }
-
-  const bool numeric =
-      (left.type == ValueType::kInt64 || left.type == ValueType::kDouble) &&
-      (right.type == ValueType::kInt64 || right.type == ValueType::kDouble);
-  if (numeric) {
-    const bool integral =
-        left.type == ValueType::kInt64 && right.type == ValueType::kInt64;
-    const double lhs = Number(left);
-    const double rhs = Number(right);
-    if (integral) {
-      // Keep int64 arithmetic and comparisons exact; only overflow falls back
-      // to double (signed overflow would be UB).
-      int64_t wide = 0;
-      switch (operation) {
-        case BinaryOperation::kAdd:
-          if (!__builtin_add_overflow(left.value.int_value,
-                                      right.value.int_value, &wide)) {
-            return Value(wide);
-          }
-          return Value(lhs + rhs);
-        case BinaryOperation::kSubtract:
-          if (!__builtin_sub_overflow(left.value.int_value,
-                                      right.value.int_value, &wide)) {
-            return Value(wide);
-          }
-          return Value(lhs - rhs);
-        case BinaryOperation::kMultiply:
-          if (!__builtin_mul_overflow(left.value.int_value,
-                                      right.value.int_value, &wide)) {
-            return Value(wide);
-          }
-          return Value(lhs * rhs);
-        case BinaryOperation::kModulo:
-          if (right.value.int_value == 0) {
-            throw std::runtime_error("modulo by zero");
-          }
-          if (left.value.int_value != std::numeric_limits<int64_t>::min() ||
-              right.value.int_value != -1) {
-            return Value(left.value.int_value % right.value.int_value);
-          }
-          return Value(0);  // MIN % -1 overflows only at the extreme pair.
-        case BinaryOperation::kEquals:
-          return Value(left.value.int_value == right.value.int_value);
-        case BinaryOperation::kNotEquals:
-          return Value(left.value.int_value != right.value.int_value);
-        case BinaryOperation::kLessThan:
-          return Value(left.value.int_value < right.value.int_value);
-        case BinaryOperation::kLessThanEquals:
-          return Value(left.value.int_value <= right.value.int_value);
-        case BinaryOperation::kGreaterThan:
-          return Value(left.value.int_value > right.value.int_value);
-        case BinaryOperation::kGreaterThanEquals:
-          return Value(left.value.int_value >= right.value.int_value);
-        default:
-          break;
-      }
-    } else {
-      switch (operation) {
-        case BinaryOperation::kEquals:
-          return Value(lhs == rhs);
-        case BinaryOperation::kNotEquals:
-          return Value(lhs != rhs);
-        case BinaryOperation::kLessThan:
-          return Value(lhs < rhs);
-        case BinaryOperation::kLessThanEquals:
-          return Value(lhs <= rhs);
-        case BinaryOperation::kGreaterThan:
-          return Value(lhs > rhs);
-        case BinaryOperation::kGreaterThanEquals:
-          return Value(lhs >= rhs);
-        default:
-          break;
-      }
+    if (what.starts_with("Cannot do ")) {
+      throw std::runtime_error("unsupported binary operation");
     }
-    switch (operation) {
-      case BinaryOperation::kAdd:
-        return Value(lhs + rhs);
-      case BinaryOperation::kSubtract:
-        return Value(lhs - rhs);
-      case BinaryOperation::kMultiply:
-        return Value(lhs * rhs);
-      case BinaryOperation::kDivide:
-        return Value(lhs / rhs);
-      case BinaryOperation::kModulo:
-        return Value(std::fmod(lhs, rhs));
-      default:
-        break;
-    }
+    throw;
   }
-  if (left.type != right.type) { throw std::runtime_error("type mismatch");
-}
-  switch (operation) {
-    case BinaryOperation::kEquals:
-      return Value(left == right);
-    case BinaryOperation::kNotEquals:
-      return Value(left != right);
-    case BinaryOperation::kLessThan:
-      return Value(left < right);
-    case BinaryOperation::kLessThanEquals:
-      return Value(left <= right);
-    case BinaryOperation::kGreaterThan:
-      return Value(left > right);
-    case BinaryOperation::kGreaterThanEquals:
-      return Value(left >= right);
-    case BinaryOperation::kAdd:
-      if (left.type == ValueType::kVarChar) {
-        return Value(std::string(left.value.varchar_value) +
-                     std::string(right.value.varchar_value));
-      }
-      break;
-    default:
-      break;
-  }
-  throw std::runtime_error("unsupported binary operation");
 }
 
 bool ContainsAggregate(  // NOLINT(misc-no-recursion)
@@ -489,42 +364,61 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         Evaluate(argument, scope, aggregates, context, ctes));
   }
   if (name == "substr" || name == "substring") {
-    if (arguments.size() < 2 || arguments[0].IsNull()) { return {};
-}
-    if (arguments[1].IsNull() ||
-        (arguments.size() >= 3 && arguments[2].IsNull())) {
+    // Canonical guards (FunctionCallExpression ExecuteFunction): a
+    // non-positive or NULL length yields NULL/"" instead of wrapping around.
+    if (arguments.size() < 2 || arguments.size() > 3) {
+      throw std::runtime_error("SUBSTR requires two or three arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull() ||
+        (arguments.size() == 3 && arguments[2].IsNull())) {
       return {};
     }
     if (arguments[0].type != ValueType::kVarChar ||
         arguments[1].type != ValueType::kInt64 ||
-        (arguments.size() >= 3 && arguments[2].type != ValueType::kInt64)) {
-      throw std::runtime_error("substr requires (string, int[, int])");
+        (arguments.size() == 3 && arguments[2].type != ValueType::kInt64)) {
+      throw std::runtime_error("SUBSTR argument type mismatch");
     }
     const std::string input(arguments[0].value.varchar_value);
     const int64_t start = arguments[1].value.int_value;
+    if (arguments.size() == 3 && arguments[2].value.int_value <= 0) {
+      return Value(std::string());
+    }
     const size_t begin = start <= 1 ? 0 : static_cast<size_t>(start - 1);
+    if (begin >= input.size()) { return Value(std::string());
+}
     const size_t length =
-        arguments.size() >= 3
+        arguments.size() == 3
             ? static_cast<size_t>(arguments[2].value.int_value)
             : std::string::npos;
     return Value(input.substr(begin, length));
   }
   if (name.starts_with("extract_")) {
-    if (arguments.size() != 1 || arguments[0].IsNull()) { return {};
+    // Canonical guards (FunctionCallExpression ExecuteFunction): message
+    // texts and the malformed-date handling must match the AST path.
+    if (arguments.size() != 1) {
+      throw std::runtime_error("EXTRACT requires one argument");
+    }
+    if (arguments[0].IsNull()) { return {};
 }
     if (arguments[0].type != ValueType::kDate &&
         arguments[0].type != ValueType::kVarChar) {
-      throw std::runtime_error(name + " requires a date");
+      throw std::runtime_error("EXTRACT requires DATE or STRING");
     }
     const std::string date = arguments[0].type == ValueType::kDate
                                  ? arguments[0].AsString()
                                  : std::string(arguments[0].value.varchar_value);
-    if (name == "extract_year") { return Value(std::stoll(date.substr(0, 4)));
+    if (date.size() < 10) { throw std::runtime_error("invalid DATE value");
 }
-    if (name == "extract_month") { return Value(std::stoll(date.substr(5, 2)));
+    try {
+      if (name == "extract_year") { return Value(std::stoll(date.substr(0, 4)));
 }
-    if (name == "extract_day") { return Value(std::stoll(date.substr(8, 2)));
+      if (name == "extract_month") { return Value(std::stoll(date.substr(5, 2)));
 }
+      if (name == "extract_day") { return Value(std::stoll(date.substr(8, 2)));
+}
+    } catch (const std::logic_error&) {
+      throw std::runtime_error("invalid DATE value: " + date);
+    }
   }
   if (name == "coalesce") {
     for (Value& value : arguments) {
@@ -536,12 +430,14 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
   if (name == "concat") {
     std::string result;
     for (const Value& value : arguments) {
-      if (!value.IsNull()) {
-        if (value.type != ValueType::kVarChar) {
-          throw std::runtime_error("concat requires string arguments");
-        }
-        result += std::string(value.value.varchar_value);
+      // Match FunctionCallExpression::Evaluate: CONCAT is strict, so any
+      // NULL argument makes the result NULL.
+      if (value.IsNull()) { return {};
       }
+      if (value.type != ValueType::kVarChar) {
+        throw std::runtime_error("CONCAT currently requires string arguments");
+      }
+      result += std::string(value.value.varchar_value);
     }
     return Value(std::move(result));
   }
@@ -578,20 +474,17 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       return expression->AsConstantValue().GetValue();
     case TypeTag::kBinaryExp: {
       const auto& value = expression->AsBinaryExpression();
-      if (value.Op() == BinaryOperation::kAnd) {
+      // Canonical short-circuit dispatch (BinaryExpression::Evaluate): only a
+      // non-NULL left operand that already decides the result skips the right
+      // child; NULL falls through to the three-valued Binary() rules.
+      if (value.Op() == BinaryOperation::kAnd ||
+          value.Op() == BinaryOperation::kOr) {
         const Value left =
             Evaluate(value.Left(), scope, aggregates, context, ctes);
-        if (!Truthy(left)) { return Value(false);
-}
-        return Binary(value.Op(), left,
-                      Evaluate(value.Right(), scope, aggregates, context,
-                               ctes));
-      }
-      if (value.Op() == BinaryOperation::kOr) {
-        const Value left =
-            Evaluate(value.Left(), scope, aggregates, context, ctes);
-        if (Truthy(left)) { return Value(true);
-}
+        if (!left.IsNull() &&
+            left.Truthy() != (value.Op() == BinaryOperation::kAnd)) {
+          return Value(value.Op() == BinaryOperation::kOr);
+        }
         return Binary(value.Op(), left,
                       Evaluate(value.Right(), scope, aggregates, context,
                                ctes));
@@ -603,29 +496,11 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kUnaryExp: {
       const auto& value = expression->AsUnaryExpression();
-      Value child =
-          Evaluate(value.Child(), scope, aggregates, context, ctes);
-      if (value.Op() == UnaryOperation::kIsNull) { return Value(child.IsNull());
-}
-      if (value.Op() == UnaryOperation::kIsNotNull) {
-        return Value(!child.IsNull());
-}
-      if (value.Op() == UnaryOperation::kNot) { return Value(!Truthy(child));
-}
-      // Unary minus: NULL propagates and only numeric values are negated.
-      if (child.IsNull()) { return {};
-}
-      if (child.type == ValueType::kDouble) {
-        return Value(-child.value.double_value);
-      }
-      if (child.type == ValueType::kInt64) {
-        if (child.value.int_value ==
-            std::numeric_limits<int64_t>::min()) {
-          throw std::runtime_error("integer overflow in unary minus");
-        }
-        return Value(-child.value.int_value);
-      }
-      throw std::runtime_error("numeric value required");
+      // Canonical semantics via the AST evaluator: NOT NULL is NULL (three-
+      // valued), IS [NOT] NULL never propagates NULL, minus guards overflow.
+      return EvaluateUnary(
+          value.Op(), Evaluate(value.Child(), scope, aggregates, context,
+                               ctes));
     }
     case TypeTag::kAggregateExp:
       if (aggregates == nullptr) {
@@ -646,16 +521,25 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kInExp: {
       const auto& value = expression->AsInExpression();
+      // Canonical three-valued membership (InExpression::Evaluate): a match
+      // decides TRUE; otherwise any NULL (test value or list item) yields
+      // UNKNOWN instead of FALSE.
       const Value test =
           Evaluate(value.child_, scope, aggregates, context, ctes);
+      bool found = false;
+      bool saw_null = test.IsNull();
       for (const Expression& item : value.list_) {
-        if (Binary(BinaryOperation::kEquals, test,
-                   Evaluate(item, scope, aggregates, context, ctes))
-                .Truthy()) {
-          return Value(true);
+        const Value candidate =
+            Evaluate(item, scope, aggregates, context, ctes);
+        saw_null = saw_null || candidate.IsNull();
+        if (!found && !test.IsNull() && !candidate.IsNull() &&
+            Binary(BinaryOperation::kEquals, test, candidate).Truthy()) {
+          found = true;
         }
       }
-      return Value(false);
+      if (found) { return Value(true);
+}
+      return saw_null ? Value() : Value(false);
     }
     case TypeTag::kFunctionCallExp:
       return EvaluateFunction(expression->AsFunctionCallExpression(), scope,
@@ -683,10 +567,13 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       if (value.Test()) {
         const Value test =
             Evaluate(value.Test(), scope, aggregates, context, ctes);
+        // Canonical three-valued IN membership: a match decides TRUE, any
+        // NULL (test value or row value) turns a miss into UNKNOWN.
         bool found = false;
-        if (uncorrelated && active_runtime != nullptr) {
+        bool saw_null = test.IsNull();
+        if (uncorrelated && context.execution_runtime() != nullptr) {
           auto [cached, inserted] =
-              active_runtime->uncorrelated_membership.try_emplace(
+              context.execution_runtime()->uncorrelated_membership.try_emplace(
                   value.Query().get());
           if (inserted) {
             cached->second.reserve(relation->TotalRows());
@@ -695,20 +582,35 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
                 cached->second.insert(row[0]);
               }
             });
-            ++active_runtime->uncorrelated_hash_builds;
+            ++context.execution_runtime()->uncorrelated_hash_builds;
           }
-          ++active_runtime->uncorrelated_hash_probes;
+          ++context.execution_runtime()->uncorrelated_hash_probes;
           found = !test.IsNull() && cached->second.contains(test);
+          if (!found && !test.IsNull() &&
+              cached->second.size() <
+                  static_cast<size_t>(relation->TotalRows())) {
+            // The hash set excludes NULL keys; a size shortfall means the
+            // relation may contain NULLs that turn the miss into UNKNOWN.
+            row_source.ForEachRow([&](const Row& row) {
+              if (!row.values_.empty() && row[0].IsNull()) { saw_null = true;
+}
+            });
+          }
         } else {
           row_source.ForEachRow([&](const Row& row) {
             if (found || row.values_.empty()) { return;
 }
+            saw_null = saw_null || row[0].IsNull();
             if (Truthy(Binary(BinaryOperation::kEquals, test, row[0]))) {
               found = true;
             }
           });
         }
-        return Value(value.Negated() ? !found : found);
+        const Value membership =
+            found ? Value(true) : (saw_null ? Value() : Value(false));
+        if (!value.Negated()) { return membership;
+}
+        return membership.IsNull() ? Value() : Value(!membership.Truthy());
       }
       std::optional<Row> first;
       row_source.ForEachRow([&](const Row& row) {
@@ -835,9 +737,10 @@ std::string BaseRelationCacheKey(
   return key;
 }
 
-bool ReusesBaseRelation(const SelectSource& source) {
-  return active_runtime != nullptr &&
-         active_runtime->reusable_base_relations.contains(source.table);
+bool ReusesBaseRelation(TransactionContext& context,
+                        const SelectSource& source) {
+  return context.execution_runtime() != nullptr &&
+         context.execution_runtime()->reusable_base_relations.contains(source.table);
 }
 
 ValueType ValueTypeOf(const Value& value) { return value.type; }

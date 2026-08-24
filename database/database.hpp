@@ -17,6 +17,8 @@
 #ifndef TINYLAMB_DATABASE_HPP
 #define TINYLAMB_DATABASE_HPP
 
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <ostream>
 #include <string>
@@ -25,6 +27,7 @@
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
+#include "database/catalog_reader.hpp"
 #include "database/page_storage.hpp"
 #include "database/transaction_context.hpp"
 #include "index/b_plus_tree.hpp"
@@ -42,14 +45,23 @@ class TableStatistics;
 class PageStorage;
 class Function;
 
-class Database {
+class Database final : public CatalogReader {
  public:
-  explicit Database(std::string_view dbname);
+  explicit Database(std::string_view dbname, size_t wal_sync_ms = 1);
 
   // Transaction Begin() { return storage_.Begin(); }
   TransactionContext BeginContext() { return {storage_.Begin(), this}; }
   TransactionContext BeginReadOnlyContext() {
     return {storage_.BeginReadOnly(), this};
+  }
+  void SetSynchronousCommit(bool enabled) {
+    storage_.tm_.SetSynchronousCommit(enabled);
+  }
+  void SetTransactionMetricsEnabled(bool enabled) {
+    storage_.tm_.SetMetricsEnabled(enabled);
+  }
+  [[nodiscard]] TransactionRuntimeStats TransactionStats() const {
+    return storage_.tm_.RuntimeStats();
   }
 
   StatusOr<Table> CreateTable(TransactionContext& ctx, const Schema& schema);
@@ -61,14 +73,14 @@ class Database {
 
   StatusOr<Function> GetOrAddFunction(TransactionContext& ctx,
                                       std::string_view function_name,
-                                      int argument_count);
+                                      int argument_count) override;
 
   [[maybe_unused]] void DebugDump(Transaction& txn, std::ostream& o);
 
   friend std::ostream& operator<<(std::ostream& o, const Database& db);
 
   StatusOr<TableStatistics> GetStatistics(TransactionContext& ctx,
-                                          std::string_view schema_name);
+                                          std::string_view schema_name) override;
 
   Status UpdateStatistics(TransactionContext& ctx, std::string_view schema_name,
                           const TableStatistics& ts);
@@ -77,7 +89,7 @@ class Database {
                            std::string_view schema_name);
 
   StatusOr<Table> GetTable(TransactionContext& ctx,
-                           std::string_view schema_name);
+                           std::string_view schema_name) override;
 
   // Catalog table names in ascending key order.
   std::vector<std::string> ListTables(TransactionContext& ctx);
@@ -85,6 +97,19 @@ class Database {
   void EmulateCrash();
 
   void DeleteAll();
+
+  // Monotonic catalog/statistics generation used by the SQL engine's
+  // compiled-plan cache (Phase 2-1). Every successful DDL or statistics
+  // refresh advances it; cached plans stamped with an older epoch are stale.
+  [[nodiscard]] uint64_t SchemaEpoch() const noexcept {
+    return schema_epoch_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] uint64_t CatalogEpoch() const noexcept override {
+    return SchemaEpoch();
+  }
+  uint64_t BumpSchemaEpoch() noexcept {
+    return schema_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  }
 
  private:
   friend class TransactionContext;
@@ -104,6 +129,9 @@ class Database {
   // GetOrAddFunction). Held across page allocation so a concurrent duplicate
   // registration can no longer allocate pages it would never reclaim.
   std::mutex catalog_mu_;
+
+  // Compiled-plan invalidation epoch; see SchemaEpoch()/BumpSchemaEpoch().
+  std::atomic<uint64_t> schema_epoch_{0};
 
   PageStorage storage_;
 };

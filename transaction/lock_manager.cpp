@@ -9,6 +9,7 @@
 #include <cassert>
 #include <chrono>
 #include <mutex>
+#include <ostream>
 
 #include "common/constants.hpp"
 #include "page/row_position.hpp"
@@ -16,31 +17,33 @@
 namespace tinylamb {
 
 bool LockManager::GetSharedLock(const RowPosition& row, txn_id_t owner) {
-  std::unique_lock lk(latch_);
+  Shard& sh = shards_[ShardIndex(row)];
+  std::unique_lock lk(sh.mu);
   // Any exclusive holder -- even the caller itself -- blocks shared
   // acquisition; an exclusive lock never coexists with shared entries.
-  if (exclusive_locks_.contains(row)) {
+  if (sh.exclusive.contains(row)) {
     return false;
   }
-  shared_locks_[row].insert(owner);
+  sh.shared[row].insert(owner);
   return true;
 }
 
 bool LockManager::ReleaseSharedLock(const RowPosition& row, txn_id_t owner) {
-  std::unique_lock lk(latch_);
-  auto it = shared_locks_.find(row);
-  if (it == shared_locks_.end() || it->second.erase(owner) == 0) {
+  Shard& sh = shards_[ShardIndex(row)];
+  std::unique_lock lk(sh.mu);
+  auto it = sh.shared.find(row);
+  if (it == sh.shared.end() || it->second.erase(owner) == 0) {
     // Double release, a never-acquired lock, or a foreign owner's release
     // must not decrement through the end iterator (undefined behavior in
     // NDEBUG builds).
     return false;
   }
-  assert(!exclusive_locks_.contains(row));
+  assert(!sh.exclusive.contains(row));
   if (it->second.empty()) {
-    shared_locks_.erase(it);
+    sh.shared.erase(it);
   }
   BumpReleaseEpoch();
-  available_.notify_all();
+  sh.cv.notify_all();
   return true;
 }
 
@@ -56,15 +59,17 @@ bool LockManager::GetExclusiveLock(const RowPosition& row, txn_id_t owner,
 
 bool LockManager::GetExclusiveLock(const RowPosition& row, txn_id_t owner,
                                    std::chrono::milliseconds timeout) {
-  std::unique_lock lk(latch_);
+  Shard& sh = shards_[ShardIndex(row)];
+  std::unique_lock lk(sh.mu);
   auto blocked = [&] {
-    const auto shared = shared_locks_.find(row);
-    return (shared != shared_locks_.end() && !shared->second.empty()) ||
-           exclusive_locks_.contains(row);
+    const auto shared = sh.shared.find(row);
+    return (shared != sh.shared.end() && !shared->second.empty()) ||
+           sh.exclusive.contains(row);
   };
   if (timeout.count() <= 0) {
-    if (blocked()) { return false;
-}
+    if (blocked()) {
+      return false;
+    }
   } else {
     // Wait up to |timeout| without any release progress; while other lock
     // activity keeps releasing rows the system is moving, so extend the
@@ -77,11 +82,12 @@ bool LockManager::GetExclusiveLock(const RowPosition& row, txn_id_t owner,
     for (;;) {
       const uint64_t quiet_epoch =
           release_epoch_.load(std::memory_order_relaxed);
-      if (available_.wait_for(lk, patience, [&] { return !blocked(); })) {
+      if (sh.cv.wait_for(lk, patience, [&] { return !blocked(); })) {
         break;
       }
-      if (!blocked()) { break;
-}
+      if (!blocked()) {
+        break;
+      }
       const bool progressed =
           release_epoch_.load(std::memory_order_relaxed) != quiet_epoch;
       if (!progressed) {
@@ -97,44 +103,60 @@ bool LockManager::GetExclusiveLock(const RowPosition& row, txn_id_t owner,
       patience = std::min(total_cap - elapsed, timeout);
     }
   }
-  exclusive_locks_[row] = owner;
+  sh.exclusive[row] = owner;
   return true;
 }
 
 bool LockManager::ReleaseExclusiveLock(const RowPosition& row,
                                        txn_id_t owner) {
-  std::unique_lock lk(latch_);
-  const auto it = exclusive_locks_.find(row);
-  const bool released = it != exclusive_locks_.end() && it->second == owner;
+  Shard& sh = shards_[ShardIndex(row)];
+  std::unique_lock lk(sh.mu);
+  const auto it = sh.exclusive.find(row);
+  const bool released = it != sh.exclusive.end() && it->second == owner;
   // A foreign or double release is a documented false return, not a bug:
   // callers probe ownership through this path (see lock_manager_test).
-  assert(!shared_locks_.contains(row));
+  assert(!sh.shared.contains(row));
   if (!released) {
     return false;
   }
-  exclusive_locks_.erase(it);
+  sh.exclusive.erase(it);
   BumpReleaseEpoch();
-  available_.notify_all();
+  sh.cv.notify_all();
   return true;
 }
 
 bool LockManager::TryUpgradeLock(const RowPosition& row, txn_id_t owner) {
-  std::unique_lock lk(latch_);
-  const auto exclusive = exclusive_locks_.find(row);
-  if (exclusive != exclusive_locks_.end()) {
+  Shard& sh = shards_[ShardIndex(row)];
+  std::unique_lock lk(sh.mu);
+  const auto exclusive = sh.exclusive.find(row);
+  if (exclusive != sh.exclusive.end()) {
     // Already upgraded by this owner: idempotent success.
     return exclusive->second == owner;
   }
-  const auto shared = shared_locks_.find(row);
-  if (shared == shared_locks_.end() || shared->second.size() != 1 ||
+  const auto shared = sh.shared.find(row);
+  if (shared == sh.shared.end() || shared->second.size() != 1 ||
       !shared->second.contains(owner)) {
     return false;
   }
-  shared_locks_.erase(shared);
-  exclusive_locks_[row] = owner;
+  sh.shared.erase(shared);
+  sh.exclusive[row] = owner;
   BumpReleaseEpoch();
-  available_.notify_all();
+  sh.cv.notify_all();
   return true;
+}
+
+std::ostream& operator<<(std::ostream& o, const LockManager& lm) {
+  size_t shared = 0;
+  size_t exclusive = 0;
+  // Debug dump: take shard mutexes one at a time; counts may be momentarily
+  // inconsistent across shards, which is fine for diagnostics.
+  for (const auto& sh : lm.shards_) {
+    std::scoped_lock lk(sh.mu);
+    shared += sh.shared.size();
+    exclusive += sh.exclusive.size();
+  }
+  o << "LockManager(shared=" << shared << ", exclusive=" << exclusive << ")";
+  return o;
 }
 
 }  // namespace tinylamb

@@ -25,7 +25,8 @@ Relation::Relation(Relation&& other) noexcept
       nested_loop_joins(other.nested_loop_joins),
       join_comparisons(other.join_comparisons),
       peak_intermediate_rows(other.peak_intermediate_rows),
-      spilled_rows_(other.spilled_rows_) {
+      spilled_rows_(other.spilled_rows_),
+      runtime_(other.runtime_) {
   other.charged_bytes_ = 0;
   other.hash_joins = 0;
   other.hybrid_hash_joins = 0;
@@ -52,6 +53,7 @@ Relation& Relation::operator=(Relation&& other) noexcept {
     join_comparisons = other.join_comparisons;
     peak_intermediate_rows = other.peak_intermediate_rows;
     spilled_rows_ = other.spilled_rows_;
+    runtime_ = other.runtime_;
     other.hash_joins = 0;
     other.hybrid_hash_joins = 0;
     other.in_memory_hash_joins = 0;
@@ -76,7 +78,7 @@ void Relation::EnsureSpill() {
   if (spill) {
     return;
   }
-  NoteRelationSpill();
+  NoteRelationSpill(runtime_);
   spill = std::make_shared<SpillFile>();
   for (const Row& row : rows) {
     spill->Append(row);
@@ -121,20 +123,21 @@ void Relation::ResetContents() {
   ReleaseCharge();
 }
 
-void NoteRelationSpill() {
-  if (active_runtime != nullptr) {
-    ++active_runtime->relation_spills;
+void NoteRelationSpill(ExecutionRuntime* runtime) {
+  if (runtime != nullptr) {
+    ++runtime->relation_spills;
   }
 }
 
 Relation MaterializeRelation(const Relation& source) {
-  Relation out;
+  Relation out(source.runtime());
   out.schema = source.schema;
   source.ForEachRow([&](const Row& row) { out.AddRow(row); });
   return out;
 }
 
 void CopyExecutionStats(Relation* destination, const Relation& source) {
+  destination->set_runtime(source.runtime());
   destination->hash_joins = source.hash_joins;
   destination->hybrid_hash_joins = source.hybrid_hash_joins;
   destination->in_memory_hash_joins = source.in_memory_hash_joins;

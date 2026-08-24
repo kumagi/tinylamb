@@ -78,7 +78,7 @@ class BranchPageTest : public ::testing::Test {
     l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
                                                r_.get());
     // r_->RecoverFrom(0, tm_.get());
   }

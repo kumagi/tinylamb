@@ -36,8 +36,16 @@
 
 namespace tinylamb {
 
+struct TransactionRuntimeStats {
+  uint64_t wal_wait_count{0};
+  uint64_t wal_wait_ns{0};
+  uint64_t write_intent_attempts{0};
+  uint64_t write_intent_conflicts{0};
+  uint64_t write_intent_mutex_wait_ns{0};
+  uint64_t commit_shard_mutex_wait_ns{0};
+};
+
 class IndexKey;
-class LockManager;
 class Logger;
 class PageManager;
 class Transaction;
@@ -49,9 +57,8 @@ struct RowPosition;
 
 class TransactionManager {
  public:
-  TransactionManager(LockManager* lm, PageManager* pm, Logger* l,
-                     RecoveryManager* r)
-      : lock_manager_(lm), page_manager_(pm), logger_(l), recovery_(r) {
+  TransactionManager(PageManager* pm, Logger* l, RecoveryManager* r)
+      : page_manager_(pm), logger_(l), recovery_(r) {
     StartGcWorker();
   }
 
@@ -71,6 +78,10 @@ class TransactionManager {
   [[nodiscard]] bool SynchronousCommit() const {
     return synchronous_commit_.load();
   }
+  void SetMetricsEnabled(bool enabled) {
+    metrics_enabled_.store(enabled, std::memory_order_relaxed);
+  }
+  [[nodiscard]] TransactionRuntimeStats RuntimeStats() const;
 
   void Abort(Transaction& txn);
 
@@ -99,12 +110,10 @@ class TransactionManager {
                                  const IndexKey& redo);
   void CompensateSetFosterLog(txn_id_t txn_id, page_id_t pid,
                               const FosterPair& foster);
-  // owner defaults to an anonymous holder for tests; production callers pass
-  // the transaction id so locks can only be released by their owner.
-  bool GetExclusiveLock(const RowPosition& rp, txn_id_t owner = 0);
-  bool GetSharedLock(const RowPosition& rp, txn_id_t owner = 0);
-
-  bool TryUpgradeLock(const RowPosition& rp, txn_id_t owner = 0);
+  // Non-waiting first-updater-wins reservation stored in the same shard as
+  // the row's MVCC chain. A stale snapshot or another pending writer loses.
+  bool AcquireWriteIntent(Transaction& txn, const RowPosition& rp,
+                          bool wait);
 
   [[nodiscard]] uint64_t CurrentCommitTimestamp() const {
     return commit_timestamp_.load();
@@ -127,6 +136,8 @@ class TransactionManager {
                             std::optional<std::string_view> after);
   [[nodiscard]] bool RequiresHistoricalRead(const Transaction& txn) const;
   [[nodiscard]] bool IndexKeysMayBeStale(const Transaction& txn) const;
+  [[nodiscard]] bool IndexKeysMayBeStale(const Transaction& txn,
+                                         page_id_t index_root) const;
 
   lsn_t AddLog(const LogRecord& lr);
   lsn_t CommittedLSN() const;
@@ -156,6 +167,7 @@ class TransactionManager {
   struct PendingVersion {
     txn_id_t owner{0};
     std::optional<std::string> value;
+    bool staged{false};
   };
   struct VersionChain {
     std::vector<CommittedVersion> committed;
@@ -163,7 +175,7 @@ class TransactionManager {
   };
   void CommitVersions(Transaction& txn);
   void AbortVersions(Transaction& txn);
-  void ReleaseLocksAndForget(Transaction& txn);
+  void ForgetTransaction(Transaction& txn);
   void GarbageCollectVersions();
 
   // ---- commit sequencing ----
@@ -187,10 +199,12 @@ class TransactionManager {
   void MoveActiveTransaction(Transaction* from, Transaction* to);
   void UnregisterActiveTransaction(Transaction* txn);
 
-  static constexpr size_t kVersionShardCount = 64;
+  static constexpr size_t kVersionShardCount = 256;
+  static constexpr size_t kIndexMutationShardCount = 256;
 
   struct VersionShard {
     mutable std::mutex mutex;
+    std::condition_variable write_intent_released;
     std::unordered_map<RowPosition, VersionChain> versions;
   };
 
@@ -198,21 +212,37 @@ class TransactionManager {
     return static_cast<size_t>((rp.page_id * 131ull) + rp.slot) %
            kVersionShardCount;
   }
+  [[nodiscard]] static size_t IndexMutationShardIndex(page_id_t root) {
+    return static_cast<size_t>(root * 11400714819323198485ull) %
+           kIndexMutationShardCount;
+  }
 
   std::atomic<uint64_t> commit_timestamp_{0};
   std::atomic<uint64_t> stable_timestamp_{0};
   mutable std::mutex pending_commits_mutex_;
   std::set<uint64_t> unpublished_commits_;
   std::atomic<uint64_t> max_committed_begin_ts_{0};
+  // Conservative per-index mutation epochs. Hash collisions only cause an
+  // unnecessary fallback; they can never expose a stale key. This avoids a
+  // mutex on every OLTP index probe while preventing an unrelated table's
+  // delete from degrading all indexes to full scans.
+  std::array<std::atomic<uint64_t>, kIndexMutationShardCount>
+      max_index_mutation_ts_{};
   std::atomic<int> pending_txn_count_{0};
   mutable std::array<VersionShard, kVersionShardCount> version_shards_;
   std::unordered_map<txn_id_t, uint64_t> active_snapshots_;
-  LockManager* const lock_manager_;
   PageManager* const page_manager_;
   Logger* const logger_;
   RecoveryManager* const recovery_;
   mutable std::mutex transaction_table_lock;
   std::atomic<bool> synchronous_commit_{true};
+  std::atomic<bool> metrics_enabled_{false};
+  std::atomic<uint64_t> wal_wait_count_{0};
+  std::atomic<uint64_t> wal_wait_ns_{0};
+  std::atomic<uint64_t> write_intent_attempts_{0};
+  std::atomic<uint64_t> write_intent_conflicts_{0};
+  std::atomic<uint64_t> write_intent_mutex_wait_ns_{0};
+  std::atomic<uint64_t> commit_shard_mutex_wait_ns_{0};
 
   // Background GC (declared last so the worker thread only starts after
   // every member it may touch is fully constructed).

@@ -26,9 +26,6 @@
 #include <vector>
 
 #include "common/constants.hpp"
-#include "executor/aggregation.hpp"
-#include "executor/executor_base.hpp"
-#include "executor/parallel_aggregation.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "plan/parallel_thresholds.hpp"
@@ -49,21 +46,7 @@ AggregationPlan::AggregationPlan(Plan child,
 
 const Schema& AggregationPlan::GetSchema() const { return schema_; }
 
-Executor AggregationPlan::EmitExecutor(TransactionContext& ctx) const {
-  if (child_->EmitRowCount() >= kParallelAggregationMinRows) {
-    // Cap workers like the parallel table scan path; unbounded
-    // hardware_concurrency() oversubscribes under nested or concurrent
-    // aggregations.
-    constexpr size_t kMaxParallelAggregationWorkers = 16;
-    const size_t workers =
-        std::min(kMaxParallelAggregationWorkers,
-                 std::max<size_t>(1, std::thread::hardware_concurrency()));
-    return std::make_shared<ParallelAggregationExecutor>(
-        child_->EmitExecutor(ctx), child_->GetSchema(), aggregates_, workers);
-  }
-  return std::make_shared<AggregationExecutor>(
-      child_->EmitExecutor(ctx), child_->GetSchema(), aggregates_);
-}
+// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
 
 const Table* AggregationPlan::ScanSource() const {
   return child_->ScanSource();

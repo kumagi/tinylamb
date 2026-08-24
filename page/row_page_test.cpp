@@ -626,6 +626,31 @@ TEST_F(RowPageTest, ConflictedInsertConsumesNoPhysicalSlot) {
   EXPECT_EQ(ReadRow(0), "real");
 }
 
+TEST_F(RowPageTest, InsertSkipsHoleReservedByConcurrentDelete) {
+  ASSERT_TRUE(InsertRow("row0"));
+  ASSERT_TRUE(InsertRow("row1"));
+
+  auto deleter = tm_->Begin();
+  {
+    PageRef page = p_->GetPage(page_id_);
+    ASSERT_SUCCESS(page->Delete(deleter, 0));
+  }
+
+  auto inserter = tm_->Begin();
+  {
+    PageRef page = p_->GetPage(page_id_);
+    ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(inserter, "replacement"));
+    EXPECT_EQ(slot, 2U);
+  }
+  ASSERT_SUCCESS(inserter.PreCommit());
+  inserter.CommitWait();
+  deleter.Abort();
+
+  EXPECT_EQ(ReadRow(0), "row0");
+  EXPECT_EQ(ReadRow(1), "row1");
+  EXPECT_EQ(ReadRow(2), "replacement");
+}
+
 TEST_F(RowPageTest, DeFragmentAndDump) {
   // Arrange -- populate the page then leave a hole via delete
   auto txn = tm_->Begin();

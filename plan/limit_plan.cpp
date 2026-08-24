@@ -10,16 +10,11 @@
 
 #include "common/constants.hpp"
 #include "database/transaction_context.hpp"
-#include "executor/executor_base.hpp"
-#include "executor/limit.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
 
-Executor LimitPlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<LimitExecutor>(src_->EmitExecutor(ctx), limit_count_,
-                                         limit_offset_);
-}
+// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
 
 const Schema& LimitPlan::GetSchema() const { return src_->GetSchema(); }
 

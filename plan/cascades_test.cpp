@@ -212,7 +212,8 @@ TEST(CascadesTest, AssociativityRulesEnumerateJoinOrdersWithoutEnumeration) {
   search.Explore(root);
 
   // Assert: all six ordered splits ({a}|{b,c}, {b,c}|{a}, {a,b}|{c},
-  // {c}|{a,b}, {a,c}|{b}, {b}|{a,c}) appear in the root group.
+  // {c}|{a,b}, {a,c}|{b}, {b}|{a,c}) appear in the root group; the mirrored
+  // rotation is derivable from commutativity + the left rotation alone.
   EXPECT_GE(search.GetMemo().ExpressionCount(root), 6U);
 }
 

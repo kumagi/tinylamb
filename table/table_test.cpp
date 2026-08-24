@@ -294,11 +294,91 @@ TEST_F(TableTest, InsertDuplicateUniqueKeyLeavesNoOrphan) {
   ASSERT_EQ(count, 1U);
 }
 
+TEST_F(TableTest, VersionedUniqueIndexServesOldAndNewSnapshots) {
+  // The versioned representation retains old row positions while enforcing
+  // uniqueness among rows visible to the inserting transaction.
+  {
+    TransactionContext setup = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateIndex(
+        setup, kTableName,
+        IndexSchema("col3_versioned", {2}, {},
+                    IndexMode::kVersionedUnique)));
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                setup.GetTable(kTableName));
+    ASSERT_SUCCESS(
+        table->Insert(setup.txn_,
+                      Row({Value(1), Value("old"), Value(3.3)}))
+            .GetStatus());
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+
+  TransactionContext old_reader = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, old_table,
+                              old_reader.GetTable(kTableName));
+  const Index& versioned = old_table->GetIndex(old_table->IndexCount() - 1);
+
+  {
+    TransactionContext deleter = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                deleter.GetTable(kTableName));
+    Iterator rows = table->BeginFullScan(deleter.txn_);
+    ASSERT_TRUE(rows.IsValid());
+    ASSERT_SUCCESS(table->Delete(deleter.txn_, rows.Position()));
+    ASSERT_SUCCESS(deleter.PreCommit());
+  }
+
+  // A reader predating the delete can keep using this root instead of
+  // degrading to a FullScan.
+  EXPECT_FALSE(old_reader.txn_.IndexKeysMayBeStale(versioned.Root()));
+
+  {
+    TransactionContext inserter = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                inserter.GetTable(kTableName));
+    ASSERT_SUCCESS(
+        table->Insert(inserter.txn_,
+                      Row({Value(2), Value("new"), Value(3.3)}))
+            .GetStatus());
+    ASSERT_SUCCESS(inserter.PreCommit());
+  }
+
+  auto visible_rows = [&](TransactionContext& context,
+                          const std::shared_ptr<Table>& table) {
+    const Index& idx = table->GetIndex(table->IndexCount() - 1);
+    Iterator scan = table->BeginIndexScan(context.txn_, idx, Value(3.3),
+                                          Value(3.3));
+    std::vector<Row> rows;
+    while (scan.IsValid()) {
+      if ((*scan).IsValid()) { rows.push_back(*scan); }
+      ++scan;
+    }
+    return rows;
+  };
+
+  const std::vector<Row> old_rows = visible_rows(old_reader, old_table);
+  ASSERT_EQ(old_rows.size(), 1U);
+  EXPECT_EQ(old_rows[0][1], Value("old"));
+
+  TransactionContext current = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, current_table,
+                              current.GetTable(kTableName));
+  const std::vector<Row> current_rows = visible_rows(current, current_table);
+  ASSERT_EQ(current_rows.size(), 1U);
+  EXPECT_EQ(current_rows[0][1], Value("new"));
+  EXPECT_EQ(current_table
+                ->Insert(current.txn_,
+                         Row({Value(3), Value("duplicate"), Value(3.3)}))
+                .GetStatus(),
+            Status::kDuplicates);
+  current.Abort();
+  old_reader.Abort();
+}
+
 // §4.3 regression: when the physical insert fails without consuming a slot
 // (RowPage::Insert now reports kConflicts before writing anything), the
 // failure must propagate and neither a phantom row position {0,0} nor an
 // index entry for it may be created.
-TEST_F(TableTest, InsertConflictPropagatesWithoutPhantomIndexEntry) {
+TEST_F(TableTest, InsertSkipsConflictedHoleAndMaintainsIndexEntry) {
   // Arrange -- a single-column unique index plus a committed control row keep
   // the probes below well-defined and non-degenerate.
   TransactionContext setup = rs_->BeginContext();
@@ -321,26 +401,25 @@ TEST_F(TableTest, InsertConflictPropagatesWithoutPhantomIndexEntry) {
       tbl1->Insert(t1.txn_, Row({Value(1), Value("a"), Value(1.1)})));
   ASSERT_SUCCESS(tbl1->Delete(t1.txn_, rp1));
 
-  // Act -- T2's insert targets the same still-locked slot and must fail
-  // without consuming it.
+  // Act -- T2 skips the still-reserved hole and inserts into another slot.
   TransactionContext t2 = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl2,
                               t2.GetTable(kTableName));
-  StatusOr<RowPosition> conflicting =
-      tbl2->Insert(t2.txn_, Row({Value(2), Value("b"), Value(2.2)}));
-  ASSERT_EQ(conflicting.GetStatus(), Status::kConflicts);
+  ASSIGN_OR_ASSERT_FAIL(
+      RowPosition, inserted,
+      tbl2->Insert(t2.txn_, Row({Value(2), Value("b"), Value(2.2)})));
+  EXPECT_NE(inserted, rp1);
 
-  // Assert -- no phantom row was written: only the control row is visible.
+  // Assert -- the control row and T2's own insert are visible.
   size_t rows = 0;
   Iterator scan = tbl2->BeginFullScan(t2.txn_);
   while (scan.IsValid()) {
     ++rows;
     ++scan;
   }
-  ASSERT_EQ(rows, 1U);
+  ASSERT_EQ(rows, 2U);
 
-  // Assert -- no phantom index entry for the rejected key either: a range
-  // scan over exactly that key finds nothing.
+  // Assert -- exactly one index entry points at the successful insert.
   size_t probe_entries = 0;
   for (size_t i = 0; i < tbl2->IndexCount(); ++i) {
     if (tbl2->GetIndex(i).sc_.name_ == "probe_unique") {
@@ -352,7 +431,7 @@ TEST_F(TableTest, InsertConflictPropagatesWithoutPhantomIndexEntry) {
       }
     }
   }
-  ASSERT_EQ(probe_entries, 0U);
+  ASSERT_EQ(probe_entries, 1U);
 
   // The control row stays reachable through the same index.
   for (size_t i = 0; i < tbl2->IndexCount(); ++i) {
@@ -362,6 +441,8 @@ TEST_F(TableTest, InsertConflictPropagatesWithoutPhantomIndexEntry) {
       ASSERT_TRUE(ctrl_scan.IsValid());
     }
   }
+  ASSERT_SUCCESS(t2.PreCommit());
+  t1.Abort();
 }
 
 // §4.8 regression: a CreateIndex whose backfill fails midway must remove the

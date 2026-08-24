@@ -32,16 +32,22 @@
 #include "common/log_message.hpp"
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
+#include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
+#include "expression/unary_expression.hpp"
 #include "plan/cascades.hpp"
 #include "plan/implementation_rules.hpp"
 #include "plan/plan.hpp"
+#include "plan/product_plan.hpp"
 #include "query/query_data.hpp"
+#include "query/statement.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
+#include "type/column.hpp"
 #include "type/column_name.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
@@ -115,11 +121,405 @@ bool ConjunctRelations(const Expression& conjunct,
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Subquery decorrelation (tpch Phase2-4 / P1-5): the canonical correlated
+// shapes `x IN (SELECT c ...)`, `EXISTS (SELECT ... WHERE outer = inner)` and
+// their negations become semi/anti hash joins. The tuned relational path keeps
+// every other subquery shape via subquery_runtime; only conjuncts that reach
+// this optimizer AND match a pattern exactly are rewritten.
+// ---------------------------------------------------------------------------
+
+constexpr size_t kMaxDecorrelationDepth = 8;
+thread_local size_t tls_decorrelation_depth = 0;
+
+enum class ColumnSide { kOuter, kInner };
+
+struct ScopeMaps {
+  // Column resolution mirrors QueryData::Rewrite: qualified names must name a
+  // FROM relation; unqualified names map first-match with an ambiguity set.
+  std::unordered_set<std::string> relations;
+  std::unordered_map<std::string, std::string> by_name;
+  std::unordered_set<std::string> ambiguous;
+  // relation identity -> physical table name (for catalog lookups).
+  std::unordered_map<std::string, std::string> physical_of;
+
+  [[nodiscard]] std::optional<ColumnName> Resolve(
+      const ColumnName& column) const {
+    if (!column.schema.empty()) {
+      if (!relations.contains(column.schema)) { return std::nullopt;
+}
+      return column;
+    }
+    if (ambiguous.contains(column.name)) { return std::nullopt;
+}
+    const auto found = by_name.find(column.name);
+    if (found == by_name.end()) { return std::nullopt;
+}
+    return ColumnName(found->second, column.name);
+  }
+};
+
+ScopeMaps BuildScopeMaps(
+    const std::vector<std::pair<std::string, const Schema*>>& relations) {
+  ScopeMaps maps;
+  for (const auto& [relation, schema] : relations) {
+    maps.relations.insert(relation);
+    maps.physical_of.emplace(relation, schema->Name());
+    for (size_t i = 0; i < schema->ColumnCount(); ++i) {
+      const std::string& name = schema->GetColumn(i).Name().name;
+      if (!maps.by_name.contains(name)) {
+        maps.by_name.emplace(name, relation);
+      } else {
+        maps.ambiguous.insert(name);
+      }
+    }
+  }
+  return maps;
+}
+
+// Resolves one column against the inner scope first (subquery shadowing),
+// falling back to the outer scope. Unresolvable names reject the rewrite.
+std::optional<std::pair<ColumnSide, ColumnName>> ResolveScoped(
+    const ColumnName& column, const ScopeMaps& inner, const ScopeMaps& outer) {
+  if (column.name == "*") { return std::nullopt;
+}
+  if (!column.schema.empty()) {
+    if (inner.relations.contains(column.schema)) {
+      return std::make_pair(ColumnSide::kInner, column);
+    }
+    if (outer.relations.contains(column.schema)) {
+      return std::make_pair(ColumnSide::kOuter, column);
+    }
+    return std::nullopt;
+  }
+  if (const auto resolved = inner.Resolve(column)) {
+    return std::make_pair(ColumnSide::kInner, *resolved);
+  }
+  if (const auto resolved = outer.Resolve(column)) {
+    return std::make_pair(ColumnSide::kOuter, *resolved);
+  }
+  return std::nullopt;
+}
+
+// Rewrites every column reference into its scope-resolved qualified form.
+std::optional<Expression> QualifyExpression(  // NOLINT(misc-no-recursion)
+    const Expression& expression, const ScopeMaps& inner,
+    const ScopeMaps& outer) {
+  if (!expression) { return expression;
+}
+  if (expression->Type() == TypeTag::kColumnValue) {
+    const auto resolved =
+        ResolveScoped(expression->AsColumnValue().GetColumnName(), inner,
+                      outer);
+    if (!resolved) { return std::nullopt;
+}
+    return ColumnValueExp(resolved->second);
+  }
+  const std::vector<Expression> children = ExpressionChildren(expression);
+  std::vector<Expression> qualified;
+  qualified.reserve(children.size());
+  for (const Expression& child : children) {
+    auto rewritten = QualifyExpression(child, inner, outer);
+    if (!rewritten) { return std::nullopt;
+}
+    qualified.push_back(std::move(*rewritten));
+  }
+  return WithExpressionChildren(expression, qualified);
+}
+
+bool ContainsAggregateExp(const Expression& expression) {  // NOLINT(misc-no-recursion)
+  if (!expression) { return false;
+}
+  if (expression->Type() == TypeTag::kAggregateExp) { return true;
+}
+  return std::ranges::any_of(ExpressionChildren(expression), [](const Expression& child) {
+    return ContainsAggregateExp(child);
+  });
+}
+
+struct DecorrelationSpec {
+  JoinKind kind{};
+  Expression outer_key;   // resolved qualified column of the outer query
+  Expression inner_key;   // resolved qualified column inside the subquery
+  std::vector<std::string> from;
+  std::unordered_map<std::string, std::string> aliases;
+  std::vector<Expression> inner_conjuncts;
+};
+
+using TablesMap = std::unordered_map<std::string, std::shared_ptr<Table>>;
+
+// True when the underlying table column cannot hold NULL: the gate that makes
+// `NOT IN -> anti join` sound.
+bool ColumnIsNonNull(const ScopeMaps& scope, const ColumnName& column,
+                     TransactionContext& ctx) {
+  const auto found_relation = scope.physical_of.find(column.schema);
+  if (found_relation == scope.physical_of.end()) { return false;
+}
+  const StatusOr<std::shared_ptr<Table>> table =
+      ctx.GetTable(found_relation->second);
+  if (!table.HasValue()) { return false;
+}
+  const int offset =
+      table.Value()->GetSchema().Offset(ColumnName("", column.name));
+  if (offset < 0) { return false;
+}
+  const Constraint::ConstraintType ctype =
+      table.Value()->GetSchema().GetColumn(offset).GetConstraint().ctype;
+  return ctype == Constraint::kNotNull || ctype == Constraint::kPrimaryKey;
+}
+
+enum class ConjunctClass { kInnerOnly, kCrossEquality, kReject };
+
+// Sorts one subquery conjunct: an equality whose operands live on opposite
+// sides is the correlation key candidate; anything referencing only the inner
+// scope rides along as build-side filter; everything else rejects.
+ConjunctClass ClassifySubqueryConjunct(const Expression& conjunct,
+                                       const ScopeMaps& inner,
+                                       const ScopeMaps& outer,
+                                       Expression* outer_key,
+                                       Expression* inner_key) {
+  ColumnSide left_side{ColumnSide::kInner};
+  ColumnSide right_side{ColumnSide::kInner};
+  Expression left_exp;
+  Expression right_exp;
+  const auto resolve_operand = [&](const Expression& operand,
+                                   ColumnSide* side,
+                                   Expression* qualified) {
+    if (!operand || operand->Type() != TypeTag::kColumnValue) { return false;
+}
+    if (operand->TouchedColumns().size() != 1) { return false;
+}
+    const auto resolved = ResolveScoped(
+        operand->AsColumnValue().GetColumnName(), inner, outer);
+    if (!resolved) { return false;
+}
+    *side = resolved->first;
+    *qualified = ColumnValueExp(resolved->second);
+    return true;
+  };
+  if (conjunct->Type() == TypeTag::kBinaryExp &&
+      conjunct->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
+    const auto& binary = conjunct->AsBinaryExpression();
+    if (resolve_operand(binary.Left(), &left_side, &left_exp) &&
+        resolve_operand(binary.Right(), &right_side, &right_exp)) {
+      if (left_side == right_side) {
+        // Equality within one scope is an ordinary predicate of that scope.
+        return left_side == ColumnSide::kInner ? ConjunctClass::kInnerOnly
+                                               : ConjunctClass::kReject;
+      }
+      if (left_side == ColumnSide::kOuter) {
+        *outer_key = std::move(left_exp);
+        *inner_key = std::move(right_exp);
+      } else {
+        *outer_key = std::move(right_exp);
+        *inner_key = std::move(left_exp);
+      }
+      return ConjunctClass::kCrossEquality;
+    }
+  }
+  // Non-equality conjuncts survive only when purely inner-local.
+  for (const ColumnName& column : conjunct->TouchedColumns()) {
+    const auto resolved = ResolveScoped(column, inner, outer);
+    if (!resolved || resolved->first != ColumnSide::kInner) {
+      return ConjunctClass::kReject;
+    }
+  }
+  return ConjunctClass::kInnerOnly;
+}
+
+// Attempts to turn one WHERE conjunct into a semi/anti join spec. Anything
+// that does not match a canonical pattern exactly stays untouched so the
+// existing evaluation paths keep handling it.
+std::optional<DecorrelationSpec> TryDecorrelate(
+    const Expression& conjunct, const ScopeMaps& outer_scope,
+    TransactionContext& ctx) {
+  Expression current = conjunct;
+  bool negated = false;
+  while (current->Type() == TypeTag::kUnaryExp &&
+         current->AsUnaryExpression().Op() == UnaryOperation::kNot) {
+    negated = !negated;
+    current = current->AsUnaryExpression().Child();
+  }
+  if (current->Type() != TypeTag::kQueryExp) { return std::nullopt;
+}
+  const QueryExpression& query_expression = current->AsQueryExpression();
+  const bool exists_form = query_expression.Exists();
+  negated = negated != query_expression.Negated();
+
+  const SelectStatement& sub = *query_expression.Query();
+  // Shapes the planner cannot preserve semantically stay on their existing
+  // paths: aggregation/LIMIT/DISTINCT change the membership set; CTEs and
+  // FROM-subqueries need their own runtime.
+  if (!sub.WithQueries().empty() || !sub.GroupBy().empty() || sub.Having() ||
+      sub.HasLimit() || sub.Offset() != 0 || sub.Distinct() ||
+      sub.Sources().empty()) {
+    return std::nullopt;
+  }
+
+  DecorrelationSpec spec;
+  spec.kind = negated ? AntiJoinKind() : SemiJoinKind();
+
+  // IN-form projects exactly one plain column; EXISTS ignores the list but
+  // still rejects aggregates (EXISTS(SELECT COUNT(*)) is constant true).
+  Expression test_column;
+  if (!exists_form) {
+    if (sub.SelectList().size() != 1) { return std::nullopt;
+}
+    test_column = sub.SelectList().front().expression;
+    if (!test_column || test_column->Type() != TypeTag::kColumnValue) {
+      return std::nullopt;
+    }
+  }
+  for (const NamedExpression& item : sub.SelectList()) {
+    if (ContainsAggregateExp(item.expression)) { return std::nullopt;
+}
+  }
+  if (exists_form && query_expression.Test()) { return std::nullopt;
+}
+
+  std::vector<std::pair<std::string, const Schema*>> schemas;
+  std::vector<Expression> join_conditions;
+  for (const SelectSource& source : sub.Sources()) {
+    if (source.query != nullptr || source.join_type == JoinType::kLeft) {
+      return std::nullopt;
+    }
+    const std::string relation =
+        source.alias.empty() ? source.table : source.alias;
+    spec.from.push_back(relation);
+    if (!source.alias.empty() && source.alias != source.table) {
+      spec.aliases.emplace(source.alias, source.table);
+    }
+    if (source.join_condition) { join_conditions.push_back(source.join_condition);
+}
+  }
+  for (const std::string& relation : spec.from) {
+    const auto aliased = spec.aliases.find(relation);
+    const std::string& physical =
+        aliased == spec.aliases.end() ? relation : aliased->second;
+    const StatusOr<std::shared_ptr<Table>> table = ctx.GetTable(physical);
+    if (!table.HasValue()) { return std::nullopt;
+}
+    schemas.emplace_back(relation, &table.Value()->GetSchema());
+  }
+  const ScopeMaps inner_scope = BuildScopeMaps(schemas);
+
+  bool have_key = false;
+  for (const Expression& extra : join_conditions) {
+    Expression outer_key;
+    Expression inner_key;
+    switch (ClassifySubqueryConjunct(extra, inner_scope, outer_scope,
+                                     &outer_key, &inner_key)) {
+      case ConjunctClass::kInnerOnly: {
+        auto qualified = QualifyExpression(extra, inner_scope, outer_scope);
+        if (!qualified) { return std::nullopt;
+}
+        spec.inner_conjuncts.push_back(std::move(*qualified));
+        break;
+      }
+      case ConjunctClass::kCrossEquality:
+        // Correlated IN and second key pairs are not supported in V1.
+        if (!exists_form || have_key) { return std::nullopt;
+}
+        spec.outer_key = std::move(outer_key);
+        spec.inner_key = std::move(inner_key);
+        have_key = true;
+        break;
+      case ConjunctClass::kReject:
+        return std::nullopt;
+    }
+  }
+  for (const Expression& predicate : SplitConjuncts(sub.WhereClause())) {
+    Expression outer_key;
+    Expression inner_key;
+    switch (ClassifySubqueryConjunct(predicate, inner_scope, outer_scope,
+                                     &outer_key, &inner_key)) {
+      case ConjunctClass::kInnerOnly: {
+        auto qualified = QualifyExpression(predicate, inner_scope, outer_scope);
+        if (!qualified) { return std::nullopt;
+}
+        spec.inner_conjuncts.push_back(std::move(*qualified));
+        break;
+      }
+      case ConjunctClass::kCrossEquality:
+        if (!exists_form || have_key) { return std::nullopt;
+}
+        spec.outer_key = std::move(outer_key);
+        spec.inner_key = std::move(inner_key);
+        have_key = true;
+        break;
+      case ConjunctClass::kReject:
+        return std::nullopt;
+    }
+  }
+
+  if (exists_form) {
+    // Uncorrelated EXISTS has no join keys; leave it to the runtime path.
+    if (!have_key) { return std::nullopt;
+}
+  } else {
+    // The IN probe belongs to the outer scope, the projected column to the
+    // subquery.
+    if (!query_expression.Test() ||
+        query_expression.Test()->Type() != TypeTag::kColumnValue ||
+        query_expression.Test()->TouchedColumns().size() != 1) {
+      return std::nullopt;
+    }
+    const auto probe =
+        ResolveScoped(query_expression.Test()->AsColumnValue().GetColumnName(),
+                      inner_scope, outer_scope);
+    if (!probe || probe->first != ColumnSide::kOuter) { return std::nullopt;
+}
+    spec.outer_key = ColumnValueExp(probe->second);
+    const auto member = ResolveScoped(
+        sub.SelectList().front().expression->AsColumnValue().GetColumnName(),
+        inner_scope, outer_scope);
+    if (!member || member->first != ColumnSide::kInner) { return std::nullopt;
+}
+    spec.inner_key = ColumnValueExp(member->second);
+    if (have_key) { return std::nullopt;  // correlated IN: not in V1
+}
+    // NOT IN -> anti join only when neither side can hold NULL: NULLs in the
+    // set make `x NOT IN S` UNKNOWN rather than FALSE, which an anti join
+    // would silently turn back into TRUE. NOT EXISTS has no such hazard.
+    if (spec.kind == AntiJoinKind()) {
+      const ColumnName& outer_column =
+          spec.outer_key->AsColumnValue().GetColumnName();
+      if (!ColumnIsNonNull(outer_scope, outer_column, ctx) ||
+          !ColumnIsNonNull(inner_scope,
+                           spec.inner_key->AsColumnValue().GetColumnName(),
+                           ctx)) {
+        return std::nullopt;
+      }
+    }
+  }
+  return spec;
+}
+
 }  // namespace
 
 StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                                    TransactionContext& ctx) {
   return Optimize(query, ctx, OptimizerOptions::Default());
+}
+
+StatusOr<Plan> Optimizer::OptimizeRelational(
+    std::shared_ptr<const SelectStatement> statement, Schema output_schema,
+    TransactionContext& ctx) {
+  (void)ctx;
+  cascades::Memo memo;
+  const cascades::GroupId root =
+      memo.EnsureDerivedGroup({}, "relational-ir-root");
+  cascades::LogicalExpression logical;
+  logical.operation = cascades::LogicalOperator::kRelational;
+  logical.relational_statement = std::move(statement);
+  logical.output_schema = std::move(output_schema);
+  memo.AddExpression(root, std::move(logical));
+
+  cascades::SearchEngine search(std::move(memo), cascades::RuleSet::Default());
+  const std::optional<cascades::BestPlan> best = search.Optimize(
+      root, cascades::PhysicalProperties{}, DefaultImplementationRules());
+  if (!best) { return Status::kNotImplemented; }
+  return best->plan;
 }
 
 StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
@@ -142,11 +542,6 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   const Expression predicate =
       ExpressionRewriter(options.expression_rules).Rewrite(source_predicate);
 
-  std::unordered_set<ColumnName> touched = predicate->TouchedColumns();
-  for (const NamedExpression& selected : expanded_select) {
-    touched.merge(selected.expression->TouchedColumns());
-  }
-
   cascades::RuleContext rule_context;
   rule_context.transaction = &ctx;
   rule_context.query = &query;
@@ -162,6 +557,73 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                      ctx.GetStats(physical));
     rule_context.tables.emplace(relation, std::move(table));
     rule_context.statistics.emplace(relation, std::move(table_statistics));
+  }
+
+  // Subquery decorrelation (tpch Phase2-4 / P1-5): canonical IN / EXISTS /
+  // NOT EXISTS conjuncts become semi/anti hash joins wrapped around the
+  // optimized core. Skipped when a LIMIT/OFFSET folds into the plan: the
+  // semi join must sit below any truncation to preserve SQL evaluation
+  // order, and the memo has no operator between the two.
+  std::vector<DecorrelationSpec> decorrelations;
+  std::vector<NamedExpression> projection_items = expanded_select;
+  const Expression effective_predicate = [&] {
+    std::vector<Expression> kept;
+    if (query.limit_count_ == 0 && query.limit_offset_ == 0 &&
+        tls_decorrelation_depth < kMaxDecorrelationDepth &&
+        predicate->Type() != TypeTag::kConstantValue) {
+      ++tls_decorrelation_depth;
+      struct DepthGuard {
+        ~DepthGuard() { --tls_decorrelation_depth; }
+      } guard;
+      std::vector<std::pair<std::string, const Schema*>> outer_schemas;
+      for (const auto& [relation, table] : rule_context.tables) {
+        outer_schemas.emplace_back(relation, &table->GetSchema());
+      }
+      const ScopeMaps outer_scope = BuildScopeMaps(outer_schemas);
+      std::vector<std::pair<DecorrelationSpec, Expression>> candidates;
+      for (const Expression& conjunct : SplitConjuncts(predicate)) {
+        if (std::optional<DecorrelationSpec> spec =
+                TryDecorrelate(conjunct, outer_scope, ctx)) {
+          candidates.emplace_back(std::move(*spec), conjunct);
+        } else {
+          kept.push_back(conjunct);
+        }
+      }
+      // The semi/anti join wraps ABOVE the root projection, so every probe
+      // key must survive into the projection output; hidden `$semiN` items
+      // keep unselected keys visible and the engine trims them afterwards.
+      for (size_t i = 0; i < candidates.size(); ++i) {
+        const ColumnName& key = candidates[i]
+                                    .first.outer_key->AsColumnValue()
+                                    .GetColumnName();
+        bool covered = std::ranges::any_of(
+            expanded_select, [&](const NamedExpression& item) {
+              return item.expression->Type() == TypeTag::kColumnValue &&
+                     item.expression->AsColumnValue().GetColumnName() == key;
+            });
+        if (!covered && !has_aggregate) {
+          projection_items.emplace_back("$semi" + std::to_string(i),
+                                        candidates[i].first.outer_key);
+          covered = true;
+        }
+        if (covered) {
+          decorrelations.push_back(std::move(candidates[i].first));
+        } else {
+          kept.push_back(candidates[i].second);  // keep the old route
+        }
+      }
+    }
+    if (!decorrelations.empty()) {
+      return kept.empty() ? Expression(ConstantValueExp(Value(true)))
+                          : CombineConjuncts(kept);
+    }
+    return predicate;
+  }();
+
+  std::unordered_set<ColumnName> touched =
+      effective_predicate->TouchedColumns();
+  for (const NamedExpression& selected : projection_items) {
+    touched.merge(selected.expression->TouchedColumns());
   }
 
   // Required-column computation (Phase 3): every touched column is needed on
@@ -188,7 +650,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   // conditions at their deepest covering join.
   std::vector<cascades::ConjunctInfo> conjuncts;
   bool needs_root_selection = false;
-  for (const Expression& conjunct : SplitConjuncts(predicate)) {
+  for (const Expression& conjunct : SplitConjuncts(effective_predicate)) {
     std::unordered_set<std::string> relations;
     if (!ConjunctRelations(conjunct, rule_context.tables, &relations) ||
         relations.empty()) {
@@ -214,7 +676,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                        cascades::LogicalExpression{
                            .operation = cascades::LogicalOperator::kSelection,
                            .children = {search_root},
-                           .predicate = predicate});
+                           .predicate = effective_predicate});
     search_root = selection;
   }
   if (has_aggregate) {
@@ -223,7 +685,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     memo.AddExpression(aggregation, cascades::LogicalExpression{
                                         .operation=cascades::LogicalOperator::kAggregation,
                                         .children={search_root}, .table="", .predicate=std::nullopt,
-                                        .target_list=expanded_select});
+                                        .target_list=projection_items});
     search_root = aggregation;
   } else {
     const cascades::GroupId projection =
@@ -231,7 +693,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     memo.AddExpression(projection, cascades::LogicalExpression{
                                        .operation=cascades::LogicalOperator::kProjection,
                                        .children={search_root}, .table="", .predicate=std::nullopt,
-                                       .target_list=expanded_select});
+                                       .target_list=projection_items});
     search_root = projection;
   }
   if (query.limit_count_ != 0 || query.limit_offset_ != 0) {
@@ -246,6 +708,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
 
   cascades::PhysicalProperties properties;
   properties.require_row_position = query.require_row_position_;
+  properties.wait_for_write_intent = query.wait_for_write_intent_;
   properties.access_method = options.access_method;
   if (query.order_expressions_.size() == query.order_ascending_.size() &&
       !query.order_expressions_.empty()) {
@@ -263,6 +726,22 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   }
   if (query.limit_count_ != 0 || query.limit_offset_ != 0) {
     properties.limit_hint = query.limit_offset_ + query.limit_count_;
+  }
+
+  // OLTP statements overwhelmingly consist of one indexed relation.  Their
+  // search space has no joins and therefore no useful Cascades exploration:
+  // cost the exact same scan alternatives directly and build the root layers
+  // without memo worklists, rule matching, or best-property hash tables.
+  // Keep the general search for custom rule sets and decorrelated subqueries.
+  const bool default_rules =
+      options.relational_rules.Names() ==
+          cascades::RuleSet::Default().Names() &&
+      options.disabled_implementation_rules.empty() &&
+      options.extra_implementation_rules.empty();
+  if (query.from_.size() == 1 && default_rules && decorrelations.empty() &&
+      !needs_root_selection) {
+    return OptimizeSingleRelation(query, effective_predicate, projection_items,
+                                  has_aggregate, properties, rule_context);
   }
 
   const cascades::ImplementationRuleSet* implementation_rules =
@@ -287,6 +766,30 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                       rule_context);
   if (!best) { return Status::kNotImplemented;
 }
+
+  // Emit the decorrelated semi/anti joins around the optimized core: the
+  // inner side is planned recursively (nested subqueries recurse further),
+  // then the wrap keeps the outer schema, rows, and row positions.
+  for (DecorrelationSpec& spec : decorrelations) {
+    QueryData inner_query;
+    inner_query.from_ = spec.from;
+    inner_query.aliases_ = spec.aliases;
+    inner_query.where_ = CombineConjuncts(spec.inner_conjuncts);
+    if (!inner_query.where_) {
+      inner_query.where_ = ConstantValueExp(Value(true));
+    }
+    inner_query.select_.emplace_back(
+        spec.inner_key->AsColumnValue().GetColumnName());
+    ASSIGN_OR_RETURN(Plan, inner_plan, Optimize(inner_query, ctx, options));
+    best->plan = std::make_shared<ProductPlan>(
+        best->plan,
+        std::vector<ColumnName>{
+            spec.outer_key->AsColumnValue().GetColumnName()},
+        inner_plan,
+        std::vector<ColumnName>{
+            spec.inner_key->AsColumnValue().GetColumnName()},
+        spec.kind);
+  }
 
   if (options.dump_memo) {
     std::ostringstream dump;

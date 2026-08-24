@@ -228,7 +228,7 @@ size_t Value::SkipSerialized(const char* src, ValueType as_type) {
       return sizeof(double);
     case ValueType::kVarChar: {
       bin_size_t len = 0;
-      std::memcpy(&len, src, sizeof(bin_size_t));
+      DeserializeU16(src, &len);
       return sizeof(bin_size_t) + len;
     }
   }

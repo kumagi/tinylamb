@@ -739,33 +739,26 @@ class PostgresServer::Impl {
 
     try {
       SqlEngine engine(database_);
-      StatusOr<Executor> prepared = engine.Prepare(*context, sql);
-      if (!prepared.HasValue()) {
+      StatusOr<QueryResult> executed = engine.Execute(*context, sql);
+      if (!executed.HasValue()) {
         const std::string error = engine.LastError().empty()
-                                      ? StatusMessage(prepared.GetStatus())
+                                      ? StatusMessage(executed.GetStatus())
                                       : engine.LastError();
         FailStatement(client, automatic, implicit, error, "42601");
         return false;
       }
-      Executor executor = std::move(prepared.Value());
-      if (!engine.LastStatementType()) {
+      QueryResult result = std::move(executed.Value());
+      if (!result.Statement()) {
         FailStatement(client, automatic, implicit,
                       "SQL statement type is unavailable", "XX000");
         return false;
       }
-      const StatementType type = *engine.LastStatementType();
+      const StatementType type = *result.Statement();
       if (type == StatementType::kSelect) {
-        Queue(client, StreamSelectResult(engine.ResultColumnNames(), executor));
+        Queue(client, StreamSelectResult(result));
       } else {
-        int64_t affected = 0;
-        Row row;
-        // SQL engine contract: non-SELECT executors emit a single result
-        // row whose SECOND column carries the affected-row count.
-        if (executor->Next(&row, nullptr) && row.values_.size() >= 2 &&
-            row[1].type == ValueType::kInt64) {
-          affected = row[1].value.int_value;
-        }
-        Queue(client, pgwire::CommandComplete(CommandTag(type, affected)));
+        Queue(client, pgwire::CommandComplete(
+                          CommandTag(type, result.AffectedRows())));
       }
       if (automatic) {
         // Standalone statement in a transaction-control message: legacy
@@ -804,13 +797,12 @@ class PostgresServer::Impl {
     return columns;
   }
 
-  static std::string StreamSelectResult(const std::vector<std::string>& names,
-                                        Executor& executor) {
+  static std::string StreamSelectResult(QueryResult& query_result) {
+    const std::vector<std::string>& names = query_result.ColumnNames();
     std::string result;
     size_t row_count = 0;
     bool header_sent = false;
-    Row row;
-    while (executor->Next(&row, nullptr)) {
+    query_result.ForEach([&](const Row& row) {
       if (++row_count > kMaxServerResultRows) {
         throw std::runtime_error("result row limit exceeded");
       }
@@ -820,8 +812,7 @@ class PostgresServer::Impl {
         header_sent = true;
       }
       result += pgwire::DataRow(row);
-      row = Row();
-    }
+    });
     if (!header_sent) {
       result += pgwire::RowDescription(
           BuildColumnDescriptions(names, Row(), names.size()));
@@ -941,24 +932,24 @@ class PostgresServer::Impl {
     for (const std::string& statement : statements) {
       try {
         SqlEngine engine(database_);
-        StatusOr<Executor> prepared = engine.Prepare(*context, statement);
-        if (!prepared.HasValue()) {
+        StatusOr<QueryResult> executed = engine.Execute(*context, statement);
+        if (!executed.HasValue()) {
           const std::string error = engine.LastError().empty()
-                                        ? StatusMessage(prepared.GetStatus())
+                                        ? StatusMessage(executed.GetStatus())
                                         : engine.LastError();
           response += pgwire::ErrorResponse(error, "42601");
           ok = false;
           break;
         }
-        if (!engine.LastStatementType() ||
-            *engine.LastStatementType() != StatementType::kSelect) {
+        QueryResult result = std::move(executed.Value());
+        if (!result.Statement() ||
+            *result.Statement() != StatementType::kSelect) {
           response += pgwire::ErrorResponse(
               "only SELECT statements may use a read worker", "0A000");
           ok = false;
           break;
         }
-        Executor executor = std::move(prepared.Value());
-        response += StreamSelectResult(engine.ResultColumnNames(), executor);
+        response += StreamSelectResult(result);
       } catch (const std::exception& exception) {
         response += pgwire::ErrorResponse(exception.what(), "XX000");
         ok = false;

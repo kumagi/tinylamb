@@ -46,19 +46,8 @@ RelationRenamePlan::RelationRenamePlan(Plan src, std::string relation,
   renamed_schema_ = Schema("", std::move(columns));
 }
 
-Executor RelationRenamePlan::EmitExecutor(TransactionContext& ctx) const {
-  // Rows are positional: streaming the child through unchanged is exactly a
-  // rename, and row positions survive for UPDATE/DELETE consumers. The
-  // wrapper exists so EXPLAIN surfaces the rename boundary.
-  return std::make_shared<RelationRenameExecutor>(src_->EmitExecutor(ctx),
-                                                  relation_, physical_);
-}
-
-void RelationRenameExecutor::Dump(std::ostream& o, int indent) const {
-  o << "Rename: " << physical_ << " AS " << relation_ << "\n"
-    << Indent(indent + 2);
-  src_->Dump(o, indent + 2);
-}
+// EmitExecutor and the RelationRenameExecutor it builds live in the
+// relational factory (executor/relational_factory.cpp).
 
 const Schema& RelationRenamePlan::GetSchema() const { return renamed_schema_; }
 

@@ -37,10 +37,19 @@ class BPlusTree {
  public:
   BPlusTree(Transaction& txn, page_id_t default_root);
   explicit BPlusTree(page_id_t given_root);
-  Status Insert(Transaction& txn, std::string_view key, std::string_view value);
-  Status Update(Transaction& txn, std::string_view key, std::string_view value);
+  // The optional |hint_leaf| carries the leaf where a previous operation on
+  // this same tree landed. When the live tree still routes |key| to that
+  // page (verified against the current root and the leaf fences), the
+  // root-to-leaf walk is skipped; otherwise a normal descent runs. On
+  // success the finally-latched landing leaf is stored back, so consecutive
+  // operations can chain the cursor. Pass nullptr (default) to opt out.
+  Status Insert(Transaction& txn, std::string_view key, std::string_view value,
+                page_id_t* hint_leaf = nullptr);
+  Status Update(Transaction& txn, std::string_view key, std::string_view value,
+                page_id_t* hint_leaf = nullptr);
   Status Delete(Transaction& txn, std::string_view key) const;
-  StatusOr<std::string_view> Read(Transaction& txn, std::string_view key) const;
+  StatusOr<std::string_view> Read(Transaction& txn, std::string_view key,
+                                  page_id_t* hint_leaf = nullptr) const;
   void Dump(Transaction& txn, std::ostream& o, int indent = 0) const;
   [[nodiscard]] page_id_t Root() const { return root_; }
   BPlusTreeIterator Begin(Transaction& txn, std::string_view left = "",
@@ -75,6 +84,11 @@ class BPlusTree {
   static void FollowFosterChain(Transaction& txn, PageRef& leaf,
                                 std::string_view key);
   PageRef FindLeaf(Transaction& txn, std::string_view key, bool less_than);
+  // Landing-leaf reuse: validate `hint` against the live tree (current root
+  // routing plus fence bracketing) and return it latched, following foster
+  // chains rightwards; fall back to a full FindLeaf descent otherwise.
+  PageRef FindLeafFromHint(Transaction& txn, std::string_view key,
+                           page_id_t hint);
   // Read-only leaf lookup that follows foster chains without absorbing them.
   // If stop_before is non-zero, do not descend into that foster child.
   PageRef FindLeafReadOnly(Transaction& txn, std::string_view key,

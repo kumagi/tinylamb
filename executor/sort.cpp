@@ -269,16 +269,17 @@ class KeyOrdering {
       }
       if (!nulls.empty()) {
         if (encoder_.SingleAscending()) {
+          std::copy(nulls.begin(), nulls.end(), perm.begin());
+          std::copy(non_nulls.begin(), non_nulls.end(),
+                    perm.begin() +
+                        static_cast<std::ptrdiff_t>(nulls.size()));
+          sortable_begin = nulls.size();
+        } else {
           std::copy(non_nulls.begin(), non_nulls.end(), perm.begin());
           std::copy(nulls.begin(), nulls.end(),
                     perm.begin() +
                         static_cast<std::ptrdiff_t>(non_nulls.size()));
           sortable_end = non_nulls.size();
-        } else {
-          std::copy(nulls.begin(), nulls.end(), perm.begin());
-          std::copy(non_nulls.begin(), non_nulls.end(),
-                    perm.begin() + static_cast<std::ptrdiff_t>(nulls.size()));
-          sortable_begin = nulls.size();
         }
       }
     }

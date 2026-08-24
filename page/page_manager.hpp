@@ -17,7 +17,9 @@
 #ifndef TINYLAMB_PAGE_MANAGER_HPP
 #define TINYLAMB_PAGE_MANAGER_HPP
 
+#include <mutex>
 #include <string_view>
+#include <unordered_map>
 
 #include "common/log_message.hpp"
 #include "page/page.hpp"
@@ -42,6 +44,13 @@ class PageManager {
 
   PageRef AllocateNewPage(Transaction& txn, PageType new_page_type);
 
+  // Table metadata on disk records a conservative append starting point.
+  // Keep the live tail per table in the PageManager so independently decoded
+  // Table objects do not rescan the complete row-page chain on every insert.
+  page_id_t GetTableTail(page_id_t first_page, page_id_t catalog_hint);
+  void AdvanceTableTail(page_id_t first_page, page_id_t expected,
+                        page_id_t next);
+
   // Logically delete the page.
   void DestroyPage(Transaction& txn, Page* target);
 
@@ -57,6 +66,8 @@ class PageManager {
 
   friend class RecoveryManager;
   PagePool pool_;
+  std::mutex table_tails_mu_;
+  std::unordered_map<page_id_t, page_id_t> table_tails_;
 };
 
 }  // namespace tinylamb

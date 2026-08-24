@@ -4,8 +4,8 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -48,8 +49,9 @@ int64_t IntValue(const Value& value) {
 }
 
 double DoubleValue(const Value& value) {
-  if (value.type == ValueType::kDouble) { return value.value.double_value;
-}
+  if (value.type == ValueType::kDouble) {
+    return value.value.double_value;
+  }
   if (value.type == ValueType::kInt64) {
     return static_cast<double>(value.value.int_value);
   }
@@ -66,18 +68,16 @@ std::string StringValue(const Value& value) {
 Status ExecuteSql(Database& database, TransactionContext& context,
                   std::string_view sql, std::string* error) {
   SqlEngine engine(database);
-  StatusOr<Executor> prepared = engine.Prepare(context, sql);
-  if (!prepared.HasValue()) {
+  StatusOr<QueryResult> result = engine.Execute(context, sql);
+  if (!result.HasValue()) {
     if (error != nullptr) {
       *error = engine.LastError().empty()
-                   ? std::string(ToString(prepared.GetStatus()))
+                   ? std::string(ToString(result.GetStatus()))
                    : engine.LastError();
     }
-    return prepared.GetStatus();
+    return result.GetStatus();
   }
-  Row row;
-  while (prepared.Value()->Next(&row, nullptr)) {
-  }
+  result.Value().Drain();
   return Status::kSuccess;
 }
 
@@ -90,8 +90,8 @@ Status CreateIndex(Database& database, TransactionContext& context,
 }
 
 constexpr std::array<std::string_view, 10> kLastNameSyllables = {
-    "BAR", "OUGHT", "ABLE", "PRI", "PRES", "ESE", "ANTI", "CALLY", "ATION",
-    "EING"};
+    "BAR", "OUGHT", "ABLE",  "PRI",   "PRES",
+    "ESE", "ANTI",  "CALLY", "ATION", "EING"};
 
 int ComputeNURand(int a, int x, int y, int c, int rand_a, int rand_xy) {
   (void)a;
@@ -103,8 +103,9 @@ std::string SqlLiteral(std::string_view text) {
   out.reserve(text.size() + 2);
   out.push_back('\'');
   for (char ch : text) {
-    if (ch == '\'') { out.push_back('\'');
-}
+    if (ch == '\'') {
+      out.push_back('\'');
+    }
     out.push_back(ch);
   }
   out.push_back('\'');
@@ -125,8 +126,9 @@ TpccNurand TpccNurand::FromSeed(uint64_t seed) {
   std::vector<int> deltas;
   deltas.reserve(53);
   for (int delta = 65; delta <= 119; ++delta) {
-    if (delta == 96 || delta == 112) { continue;
-}
+    if (delta == 96 || delta == 112) {
+      continue;
+    }
     deltas.push_back(delta);
   }
   for (;;) {
@@ -198,6 +200,7 @@ std::string_view ToString(TpccTransactionType type) {
 TpccWorkload::TpccWorkload(Database& database, TpccScale scale, uint64_t seed,
                            int terminal_id, TpccNurand nurand)
     : database_(&database),
+      sql_engine_(database),
       scale_(scale),
       random_(seed),
       nurand_(nurand.valid ? nurand : TpccNurand::FromSeed(seed)) {
@@ -219,8 +222,9 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
       scale.initial_orders_per_district < 1 ||
       scale.new_orders_per_district < 1 || scale.min_order_lines < 1 ||
       scale.max_order_lines < scale.min_order_lines) {
-    if (error != nullptr) { *error = "invalid TPC-C scale values";
-}
+    if (error != nullptr) {
+      *error = "invalid TPC-C scale values";
+    }
     return Status::kUnknown;
   }
   if (scale.initial_orders_per_district < scale.customers_per_district) {
@@ -268,7 +272,7 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
     }
   }
 
-  const std::array<Status, 11> index_statuses = {
+  const std::array<Status, 10> index_statuses = {
       CreateIndex(database, schema_context, "warehouse", "warehouse_pk", {0}),
       CreateIndex(database, schema_context, "district", "district_pk", {0, 1}),
       CreateIndex(database, schema_context, "customer", "customer_pk",
@@ -277,39 +281,41 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
                   {0, 1, 5, 3}, IndexMode::kNonUnique),
       CreateIndex(database, schema_context, "item", "item_pk", {0}),
       CreateIndex(database, schema_context, "stock", "stock_pk", {0, 1}),
-      CreateIndex(database, schema_context, "orders", "orders_pk", {0, 1, 2}),
+      CreateIndex(database, schema_context, "orders", "orders_pk", {0, 1, 2},
+                  IndexMode::kVersionedUnique),
       CreateIndex(database, schema_context, "orders", "orders_customer_idx",
                   {0, 1, 3, 2}, IndexMode::kNonUnique),
       CreateIndex(database, schema_context, "new_order", "new_order_pk",
-                  {0, 1, 2}),
+                  {0, 1, 2}, IndexMode::kVersionedUnique),
       CreateIndex(database, schema_context, "order_line", "order_line_pk",
-                  {0, 1, 2, 3}),
-      CreateIndex(database, schema_context, "order_line", "order_line_item_idx",
-                  {0, 1, 4, 2}, IndexMode::kNonUnique)};
+                  {0, 1, 2, 3}, IndexMode::kVersionedUnique)};
   for (Status status : index_statuses) {
     if (status != Status::kSuccess) {
-      if (error != nullptr) { *error = "failed to create TPC-C index";
-}
+      if (error != nullptr) {
+        *error = "failed to create TPC-C index";
+      }
       schema_context.Abort();
       return status;
     }
   }
   Status status = schema_context.PreCommit();
   if (status != Status::kSuccess) {
-    if (error != nullptr) { *error = "failed to commit TPC-C schema";
-}
+    if (error != nullptr) {
+      *error = "failed to commit TPC-C schema";
+    }
     return status;
   }
 
-  auto open_tables =
-      [&](TransactionContext& context)
-      -> StatusOr<std::array<std::shared_ptr<Table>, kTpccTables.size()>> {
+  auto open_tables = [&](TransactionContext & context)
+                         ->StatusOr<std::array<std::shared_ptr<Table>,
+                                               kTpccTables.size()>> {
     std::array<std::shared_ptr<Table>, kTpccTables.size()> tables;
     for (size_t i = 0; i < kTpccTables.size(); ++i) {
       StatusOr<std::shared_ptr<Table>> table = context.GetTable(kTpccTables[i]);
       if (!table.HasValue()) {
-        if (error != nullptr) { *error = "failed to open TPC-C table";
-}
+        if (error != nullptr) {
+          *error = "failed to open TPC-C table";
+        }
         return table.GetStatus();
       }
       tables[i] = table.Value();
@@ -340,19 +346,22 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
           4, Row({Value(item_id), Value("Item#" + std::to_string(item_id)),
                   Value(static_cast<double>(load_random(100, 10000)) / 100.0),
                   Value(original ? "ORIGINAL" : "DATA")}));
-      if (status != Status::kSuccess) { break;
-}
+      if (status != Status::kSuccess) {
+        break;
+      }
     }
     if (status != Status::kSuccess) {
-      if (error != nullptr) { *error = "failed to load TPC-C fixture";
-}
+      if (error != nullptr) {
+        *error = "failed to load TPC-C fixture";
+      }
       item_context.Abort();
       return status;
     }
     status = item_context.PreCommit();
     if (status != Status::kSuccess) {
-      if (error != nullptr) { *error = "failed to commit TPC-C fixture";
-}
+      if (error != nullptr) {
+        *error = "failed to commit TPC-C fixture";
+      }
       return status;
     }
   }
@@ -368,17 +377,17 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
     auto insert = [&](size_t table, const Row& row) {
       return tables.Value()[table]->Insert(load_context.txn_, row).GetStatus();
     };
-    status =
-        insert(0, Row({Value(warehouse_id), Value(300000.0),
-                       Value(static_cast<double>(load_random(0, 2000)) / 10000.0),
-                       Value("Warehouse#" + std::to_string(warehouse_id))}));
+    status = insert(
+        0, Row({Value(warehouse_id), Value(300000.0),
+                Value(static_cast<double>(load_random(0, 2000)) / 10000.0),
+                Value("Warehouse#" + std::to_string(warehouse_id))}));
     for (int item_id = 1; status == Status::kSuccess && item_id <= scale.items;
          ++item_id) {
       const bool original = load_random(1, 10) == 1;
-      status = insert(
-          5, Row({Value(warehouse_id), Value(item_id),
-                  Value(load_random(10, 100)), Value(0.0), Value(0), Value(0),
-                  Value(original ? "ORIGINAL" : "DATA")}));
+      status =
+          insert(5, Row({Value(warehouse_id), Value(item_id),
+                         Value(load_random(10, 100)), Value(0.0), Value(0),
+                         Value(0), Value(original ? "ORIGINAL" : "DATA")}));
     }
     for (int district_id = 1; status == Status::kSuccess &&
                               district_id <= scale.districts_per_warehouse;
@@ -405,11 +414,11 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
                     Value(-10.0), Value(10.0), Value(1), Value(0),
                     Value("customer data")}));
         if (status == Status::kSuccess) {
-          status = insert(
-              3, Row({Value(warehouse_id), Value(district_id),
-                      Value(customer_id), Value(warehouse_id),
-                      Value(district_id), Value("2026-01-01 00:00:00"),
-                      Value(10.0), Value("history")}));
+          status =
+              insert(3, Row({Value(warehouse_id), Value(district_id),
+                             Value(customer_id), Value(warehouse_id),
+                             Value(district_id), Value("2026-01-01 00:00:00"),
+                             Value(10.0), Value("history")}));
         }
       }
       std::vector<int> customer_permutation(
@@ -422,9 +431,8 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
       for (int order_id = 1; status == Status::kSuccess &&
                              order_id <= scale.initial_orders_per_district;
            ++order_id) {
-        const int customer_id =
-            customer_permutation[static_cast<size_t>(
-                (order_id - 1) % scale.customers_per_district)];
+        const int customer_id = customer_permutation[static_cast<size_t>(
+            (order_id - 1) % scale.customers_per_district)];
         const int line_count =
             load_random(scale.min_order_lines, scale.max_order_lines);
         const bool queued = order_id > delivered_orders;
@@ -440,25 +448,26 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
         for (int line = 1; status == Status::kSuccess && line <= line_count;
              ++line) {
           const int item_id = load_random(1, scale.items);
-          status = insert(8, Row({Value(warehouse_id), Value(district_id),
-                                  Value(order_id), Value(line), Value(item_id),
-                                  Value(warehouse_id),
-                                  queued ? Value()
-                                         : Value("2026-01-01 00:00:00"),
-                                  Value(5), Value(5.0)}));
+          status = insert(
+              8, Row({Value(warehouse_id), Value(district_id), Value(order_id),
+                      Value(line), Value(item_id), Value(warehouse_id),
+                      queued ? Value() : Value("2026-01-01 00:00:00"), Value(5),
+                      Value(5.0)}));
         }
       }
     }
     if (status != Status::kSuccess) {
-      if (error != nullptr) { *error = "failed to load TPC-C fixture";
-}
+      if (error != nullptr) {
+        *error = "failed to load TPC-C fixture";
+      }
       load_context.Abort();
       return status;
     }
     status = load_context.PreCommit();
     if (status != Status::kSuccess) {
-      if (error != nullptr) { *error = "failed to commit TPC-C fixture";
-}
+      if (error != nullptr) {
+        *error = "failed to commit TPC-C fixture";
+      }
       return status;
     }
   }
@@ -504,42 +513,50 @@ std::string TpccWorkload::PickCustomerLastName() {
 
 TpccTransactionType TpccWorkload::NextTransactionType() {
   const int choice = Random(1, 100);
-  if (choice <= 45) { return TpccTransactionType::kNewOrder;
-}
-  if (choice <= 88) { return TpccTransactionType::kPayment;
-}
-  if (choice <= 92) { return TpccTransactionType::kOrderStatus;
-}
-  if (choice <= 96) { return TpccTransactionType::kDelivery;
-}
+  if (choice <= 45) {
+    return TpccTransactionType::kNewOrder;
+  }
+  if (choice <= 88) {
+    return TpccTransactionType::kPayment;
+  }
+  if (choice <= 92) {
+    return TpccTransactionType::kOrderStatus;
+  }
+  if (choice <= 96) {
+    return TpccTransactionType::kDelivery;
+  }
   return TpccTransactionType::kStockLevel;
 }
 
 Status TpccWorkload::RunSql(TransactionContext& context, std::string_view sql,
                             std::vector<Row>* rows,
                             TpccTransactionResult* result) {
-  SqlEngine engine(*database_);
-  StatusOr<Executor> prepared = engine.Prepare(context, sql);
-  if (!prepared.HasValue()) {
+  StatusOr<QueryResult> query_result = sql_engine_.Execute(context, sql);
+  if (!query_result.HasValue()) {
     result->error = std::string(ToString(result->type)) + ": " +
-                    (engine.LastError().empty()
-                         ? std::string(ToString(prepared.GetStatus()))
-                         : engine.LastError()) +
+                    (sql_engine_.LastError().empty()
+                         ? std::string(ToString(query_result.GetStatus()))
+                         : sql_engine_.LastError()) +
                     " [" + std::string(sql) + "]";
-    return prepared.GetStatus();
+    return query_result.GetStatus();
   }
   ++result->sql_statements;
-  Row row;
-  while (prepared.Value()->Next(&row, nullptr)) { rows->push_back(row);
-}
+  try {
+    *rows = query_result.Value().Collect();
+  } catch (const std::exception& ex) {
+    result->error = std::string(ToString(result->type)) + ": " + ex.what() +
+                    " [" + std::string(sql) + "]";
+    return Status::kConflicts;
+  }
   return Status::kSuccess;
 }
 
 bool TpccWorkload::RequireRows(const std::vector<Row>& rows,
                                std::string_view operation,
                                TpccTransactionResult* result) {
-  if (!rows.empty() && rows.front().IsValid()) { return true;
-}
+  if (!rows.empty() && rows.front().IsValid()) {
+    return true;
+  }
   result->error = std::string(operation) + " returned no rows";
   return false;
 }
@@ -581,29 +598,39 @@ TpccTransactionResult TpccWorkload::NewOrder() {
   TpccTransactionResult result;
   result.type = TpccTransactionType::kNewOrder;
   result.warehouse_id = home_warehouse_;
-  result.district_id = home_district_;
+  // TPC-C 5.11.0 §2.4.1.2: unlike Stock-Level, New-Order does not stay on
+  // the terminal's fixed district; it chooses one of the home warehouse's
+  // ten districts for every transaction.
+  result.district_id = Random(1, scale_.districts_per_warehouse);
   result.customer_id = PickCustomerId();
-  const int line_count =
-      Random(scale_.min_order_lines, scale_.max_order_lines);
+  const int line_count = Random(scale_.min_order_lines, scale_.max_order_lines);
   const bool rollback = Random(1, 100) == 1;
   std::vector<int> item_ids(static_cast<size_t>(line_count));
   std::vector<int> supply_warehouses(static_cast<size_t>(line_count),
                                      result.warehouse_id);
   std::vector<int> quantities(static_cast<size_t>(line_count));
+  std::unordered_set<int> chosen_items;
+  chosen_items.reserve(static_cast<size_t>(line_count));
   int all_local = 1;
   for (int line = 0; line < line_count; ++line) {
-    item_ids[static_cast<size_t>(line)] = PickItemId();
+    int item_id = 0;
+    do {
+      item_id = PickItemId();
+    } while (!chosen_items.insert(item_id).second);
+    item_ids[static_cast<size_t>(line)] = item_id;
     quantities[static_cast<size_t>(line)] = Random(1, 10);
     if (scale_.warehouses > 1 && Random(1, 100) == 1) {
       int remote = result.warehouse_id;
-      while (remote == result.warehouse_id) { remote = Random(1, scale_.warehouses);
-}
+      while (remote == result.warehouse_id) {
+        remote = Random(1, scale_.warehouses);
+      }
       supply_warehouses[static_cast<size_t>(line)] = remote;
       all_local = 0;
     }
   }
-  if (rollback) { item_ids.back() = scale_.items + 1;
-}
+  if (rollback) {
+    item_ids.back() = scale_.items + 1;
+  }
 
   TransactionContext context = database_->BeginContext();
   auto fail = [&]() {
@@ -612,27 +639,30 @@ TpccTransactionResult TpccWorkload::NewOrder() {
   };
   std::vector<Row> rows;
   std::ostringstream sql;
+  const auto reserve_order_id = [&]() -> bool {
+    rows.clear();
+    sql.str("");
+    sql << "UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_w_id = "
+        << result.warehouse_id << " AND d_id = " << result.district_id << ';';
+    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+        !RequireAffected(rows, 1, "new-order district update", &result)) {
+      return false;
+    }
+    rows.clear();
+    sql.str("");
+    sql << "SELECT d_tax, d_next_o_id FROM district WHERE d_w_id = "
+        << result.warehouse_id << " AND d_id = " << result.district_id << ';';
+    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+        !RequireRows(rows, "new-order district read", &result)) {
+      return false;
+    }
+    result.order_id = static_cast<int>(IntValue(rows.front()[1])) - 1;
+    return true;
+  };
   sql << "SELECT w_tax FROM warehouse WHERE w_id = " << result.warehouse_id
       << ';';
   if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
       !RequireRows(rows, "new-order warehouse read", &result)) {
-    return fail();
-  }
-  rows.clear();
-  sql.str("");
-  sql << "SELECT d_tax, d_next_o_id FROM district WHERE d_w_id = "
-      << result.warehouse_id << " AND d_id = " << result.district_id << ';';
-  if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-      !RequireRows(rows, "new-order district read", &result)) {
-    return fail();
-  }
-  result.order_id = static_cast<int>(IntValue(rows.front()[1]));
-  rows.clear();
-  sql.str("");
-  sql << "UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_w_id = "
-      << result.warehouse_id << " AND d_id = " << result.district_id << ';';
-  if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-      !RequireAffected(rows, 1, "new-order district update", &result)) {
     return fail();
   }
   rows.clear();
@@ -643,6 +673,99 @@ TpccTransactionResult TpccWorkload::NewOrder() {
   if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
       !RequireRows(rows, "new-order customer read", &result)) {
     return fail();
+  }
+
+  // Read every item in one SQL statement. The input item ids are distinct,
+  // matching the TPC-C New-Order input rule, so cardinality also validates
+  // the mandatory 1% unused-item rollback.
+  rows.clear();
+  sql.str("");
+  sql << "SELECT i_id, i_price FROM item WHERE i_id IN (";
+  for (int line = 0; line < line_count; ++line) {
+    if (line != 0) { sql << ','; }
+    sql << item_ids[static_cast<size_t>(line)];
+  }
+  sql << ");";
+  if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+      rows.size() != static_cast<size_t>(line_count)) {
+    if (rollback) {
+      // Clause 2.4.3.4 requires the rolled-back O_ID to be displayed. Reserve
+      // it transactionally, then abort it along with the invalid item.
+      if (!reserve_order_id()) { return fail(); }
+      result.user_rollback = true;
+      result.error = "new-order unused item rollback";
+    } else if (result.error.empty()) {
+      result.error = "new-order item batch returned too few rows";
+    }
+    return fail();
+  }
+  std::unordered_map<int64_t, double> prices;
+  prices.reserve(rows.size());
+  for (const Row& row : rows) {
+    prices.emplace(IntValue(row[0]), DoubleValue(row[1]));
+  }
+
+  // TPC-C is normally all-local at SF=1. At larger scales, one batch per
+  // supplying warehouse preserves remote-stock semantics without N+1 SQL.
+  std::unordered_map<int, std::vector<size_t>> lines_by_warehouse;
+  for (size_t line = 0; line < static_cast<size_t>(line_count); ++line) {
+    lines_by_warehouse[supply_warehouses[line]].push_back(line);
+  }
+  for (const auto& [supply_warehouse, lines] : lines_by_warehouse) {
+    rows.clear();
+    sql.str("");
+    sql << "SELECT s_i_id FROM stock WHERE s_w_id = " << supply_warehouse
+        << " AND s_i_id IN (";
+    for (size_t offset = 0; offset < lines.size(); ++offset) {
+      if (offset != 0) { sql << ','; }
+      sql << item_ids[lines[offset]];
+    }
+    sql << ");";
+    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+        rows.size() != lines.size()) {
+      if (result.error.empty()) {
+        result.error = "new-order stock batch returned too few rows";
+      }
+      return fail();
+    }
+  }
+
+  // Reserve the district sequence only after all potentially expensive
+  // read-only validation. Strict write intent waiting makes the increment
+  // observe the predecessor's committed value; the SELECT reads our staged
+  // increment and derives the allocated O_ID.
+  if (!reserve_order_id()) { return fail(); }
+
+  for (const auto& [supply_warehouse, lines] : lines_by_warehouse) {
+    rows.clear();
+    sql.str("");
+    sql << "UPDATE stock SET s_quantity = CASE";
+    for (size_t line : lines) {
+      const int item_id = item_ids[line];
+      const int quantity = quantities[line];
+      sql << " WHEN s_i_id = " << item_id << " THEN CASE WHEN s_quantity >= "
+          << quantity + 10 << " THEN s_quantity - " << quantity
+          << " ELSE s_quantity + 91 - " << quantity << " END";
+    }
+    sql << " ELSE s_quantity END, s_ytd = s_ytd + CASE";
+    for (size_t line : lines) {
+      sql << " WHEN s_i_id = " << item_ids[line] << " THEN "
+          << quantities[line];
+    }
+    sql << " ELSE 0 END, s_order_cnt = s_order_cnt + 1, "
+        << "s_remote_cnt = s_remote_cnt + "
+        << (supply_warehouse == result.warehouse_id ? 0 : 1)
+        << " WHERE s_w_id = " << supply_warehouse << " AND s_i_id IN (";
+    for (size_t offset = 0; offset < lines.size(); ++offset) {
+      if (offset != 0) { sql << ','; }
+      sql << item_ids[lines[offset]];
+    }
+    sql << ");";
+    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+        !RequireAffected(rows, static_cast<int64_t>(lines.size()),
+                         "new-order stock batch update", &result)) {
+      return fail();
+    }
   }
 
   rows.clear();
@@ -664,63 +787,32 @@ TpccTransactionResult TpccWorkload::NewOrder() {
     return fail();
   }
 
+  rows.clear();
+  sql.str("");
+  sql << "INSERT INTO order_line VALUES ";
   for (int line = 0; line < line_count; ++line) {
-    const int item_id = item_ids[static_cast<size_t>(line)];
-    const int quantity = quantities[static_cast<size_t>(line)];
-    const int supply_warehouse = supply_warehouses[static_cast<size_t>(line)];
-    rows.clear();
-    sql.str("");
-    sql << "SELECT i_price, i_name, i_data FROM item WHERE i_id = " << item_id
-        << ';';
-    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-        !RequireRows(rows, "new-order item read", &result)) {
-      if (rollback && line == line_count - 1) {
-        result.user_rollback = true;
-        result.error = "new-order unused item rollback";
-      }
-      return fail();
-    }
-    const double price = DoubleValue(rows.front()[0]);
-    rows.clear();
-    sql.str("");
-    sql << "SELECT s_quantity, s_data FROM stock WHERE s_w_id = "
-        << supply_warehouse << " AND s_i_id = " << item_id << ';';
-    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-        !RequireRows(rows, "new-order stock read", &result)) {
-      return fail();
-    }
-    rows.clear();
-    sql.str("");
-    sql << "UPDATE stock SET s_quantity = CASE WHEN s_quantity >= "
-        << quantity + 10 << " THEN s_quantity - " << quantity
-        << " ELSE s_quantity + 91 - " << quantity << " END, s_ytd = s_ytd + "
-        << Number(static_cast<double>(quantity))
-        << ", s_order_cnt = s_order_cnt + 1, s_remote_cnt = "
-        << "s_remote_cnt + "
-        << (supply_warehouse == result.warehouse_id ? 0 : 1)
-        << " WHERE s_w_id = " << supply_warehouse << " AND s_i_id = " << item_id
-        << ';';
-    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-        !RequireAffected(rows, 1, "new-order stock update", &result)) {
-      return fail();
-    }
-    const double line_amount = price * quantity;
+    const size_t offset = static_cast<size_t>(line);
+    const int item_id = item_ids[offset];
+    const int quantity = quantities[offset];
+    const double line_amount = prices[item_id] * quantity;
     result.amount += line_amount;
-    rows.clear();
-    sql.str("");
-    sql << "INSERT INTO order_line VALUES (" << result.warehouse_id << ','
-        << result.district_id << ',' << result.order_id << ',' << (line + 1)
-        << ',' << item_id << ',' << supply_warehouse << ",NULL," << quantity
-        << ',' << Number(line_amount) << ");";
-    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-        !RequireAffected(rows, 1, "new-order line insert", &result)) {
-      return fail();
-    }
+    if (line != 0) { sql << ','; }
+    sql << '(' << result.warehouse_id << ',' << result.district_id << ','
+        << result.order_id << ',' << (line + 1) << ',' << item_id << ','
+        << supply_warehouses[offset] << ",NULL," << quantity << ','
+        << Number(line_amount) << ')';
+  }
+  sql << ';';
+  if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+      !RequireAffected(rows, line_count, "new-order line batch insert",
+                       &result)) {
+    return fail();
   }
   const Status commit = context.PreCommit();
   result.committed = commit == Status::kSuccess;
-  if (!result.committed) { result.error = "new-order commit failed";
-}
+  if (!result.committed) {
+    result.error = "new-order commit failed";
+  }
   return result;
 }
 
@@ -728,9 +820,10 @@ TpccTransactionResult TpccWorkload::Payment() {
   TpccTransactionResult result;
   result.type = TpccTransactionType::kPayment;
   result.warehouse_id = home_warehouse_;
-  result.district_id = home_district_;
+  // §2.5.1.2 requires a fresh paying district on every transaction.
+  result.district_id = Random(1, scale_.districts_per_warehouse);
   int customer_warehouse = home_warehouse_;
-  int customer_district = home_district_;
+  int customer_district = result.district_id;
   if (scale_.warehouses > 1 && Random(1, 100) <= 15) {
     do {
       customer_warehouse = Random(1, scale_.warehouses);
@@ -746,27 +839,10 @@ TpccTransactionResult TpccWorkload::Payment() {
   };
   std::vector<Row> rows;
   std::ostringstream sql;
-  sql << "UPDATE warehouse SET w_ytd = w_ytd + " << Number(result.amount)
-      << " WHERE w_id = " << result.warehouse_id << ';';
-  if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-      !RequireAffected(rows, 1, "payment warehouse update", &result)) {
-    return fail();
-  }
-  rows.clear();
-  sql.str("");
   sql << "SELECT w_name, w_ytd FROM warehouse WHERE w_id = "
       << result.warehouse_id << ';';
   if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
       !RequireRows(rows, "payment warehouse read", &result)) {
-    return fail();
-  }
-  rows.clear();
-  sql.str("");
-  sql << "UPDATE district SET d_ytd = d_ytd + " << Number(result.amount)
-      << " WHERE d_w_id = " << result.warehouse_id
-      << " AND d_id = " << result.district_id << ';';
-  if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-      !RequireAffected(rows, 1, "payment district update", &result)) {
     return fail();
   }
   rows.clear();
@@ -805,8 +881,9 @@ TpccTransactionResult TpccWorkload::Payment() {
            << result.warehouse_id << ',' << Number(result.amount) << ','
            << customer_data;
       std::string next = data.str();
-      if (next.size() > 500) { next.resize(500);
-}
+      if (next.size() > 500) {
+        next.resize(500);
+      }
       sql << ", c_data = " << SqlLiteral(next);
     }
     sql << " WHERE c_w_id = " << customer_warehouse
@@ -835,8 +912,9 @@ TpccTransactionResult TpccWorkload::Payment() {
            << result.warehouse_id << ',' << Number(result.amount) << ','
            << customer_data;
       std::string next = data.str();
-      if (next.size() > 500) { next.resize(500);
-}
+      if (next.size() > 500) {
+        next.resize(500);
+      }
       sql << ", c_data = " << SqlLiteral(next);
     }
     sql << " WHERE c_w_id = " << customer_warehouse
@@ -857,10 +935,31 @@ TpccTransactionResult TpccWorkload::Payment() {
       !RequireAffected(rows, 1, "payment history insert", &result)) {
     return fail();
   }
+  // Keep the hot aggregate rows out of the write set until the commit tail.
+  // The transaction's final state is unchanged, while SF=1 Payments no
+  // longer hold the single warehouse row throughout customer lookup/update.
+  rows.clear();
+  sql.str("");
+  sql << "UPDATE district SET d_ytd = d_ytd + " << Number(result.amount)
+      << " WHERE d_w_id = " << result.warehouse_id
+      << " AND d_id = " << result.district_id << ';';
+  if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+      !RequireAffected(rows, 1, "payment district update", &result)) {
+    return fail();
+  }
+  rows.clear();
+  sql.str("");
+  sql << "UPDATE warehouse SET w_ytd = w_ytd + " << Number(result.amount)
+      << " WHERE w_id = " << result.warehouse_id << ';';
+  if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+      !RequireAffected(rows, 1, "payment warehouse update", &result)) {
+    return fail();
+  }
   const Status commit = context.PreCommit();
   result.committed = commit == Status::kSuccess;
-  if (!result.committed) { result.error = "payment commit failed";
-}
+  if (!result.committed) {
+    result.error = "payment commit failed";
+  }
   return result;
 }
 
@@ -868,7 +967,9 @@ TpccTransactionResult TpccWorkload::OrderStatus() {
   TpccTransactionResult result;
   result.type = TpccTransactionType::kOrderStatus;
   result.warehouse_id = home_warehouse_;
-  result.district_id = home_district_;
+  // §2.6.1.2 uses a fresh district, whereas §2.8.1.1 reserves the fixed
+  // terminal district specifically for Stock-Level.
+  result.district_id = Random(1, scale_.districts_per_warehouse);
   result.customer_id = PickCustomerId();
   TransactionContext context = database_->BeginReadOnlyContext();
   auto fail = [&]() {
@@ -880,8 +981,7 @@ TpccTransactionResult TpccWorkload::OrderStatus() {
   if (Random(1, 100) <= 60) {
     sql << "SELECT c_id, c_first, c_balance FROM customer WHERE c_w_id = "
         << result.warehouse_id << " AND c_d_id = " << result.district_id
-        << " AND c_last = '" << PickCustomerLastName()
-        << "' ORDER BY c_first;";
+        << " AND c_last = '" << PickCustomerLastName() << "' ORDER BY c_first;";
     if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
         !RequireRows(rows, "order-status customer-name read", &result)) {
       return fail();
@@ -913,15 +1013,18 @@ TpccTransactionResult TpccWorkload::OrderStatus() {
   sql << "SELECT ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, "
       << "ol_delivery_d FROM order_line WHERE ol_w_id = " << result.warehouse_id
       << " AND ol_d_id = " << result.district_id
-      << " AND ol_o_id = " << result.order_id << " ORDER BY ol_number;";
+      << " AND ol_o_id = " << result.order_id << " AND ol_number >= 1"
+      << " AND ol_number <= " << scale_.max_order_lines
+      << " ORDER BY ol_number;";
   if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
       !RequireRows(rows, "order-status line read", &result)) {
     return fail();
   }
   const Status commit = context.PreCommit();
   result.committed = commit == Status::kSuccess;
-  if (!result.committed) { result.error = "order-status commit failed";
-}
+  if (!result.committed) {
+    result.error = "order-status commit failed";
+  }
   return result;
 }
 
@@ -946,86 +1049,93 @@ TpccTransactionResult TpccWorkload::Delivery() {
     std::ostringstream sql;
     for (int district_id = 1; district_id <= scale_.districts_per_warehouse;
          ++district_id) {
-    rows.clear();
-    sql.str("");
-    sql << "SELECT no_o_id FROM new_order WHERE no_w_id = "
-        << result.warehouse_id << " AND no_d_id = " << district_id
-        << " ORDER BY no_o_id LIMIT 1;";
-    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess) {
-      return fail();
+      rows.clear();
+      sql.str("");
+      sql << "SELECT no_o_id FROM new_order WHERE no_w_id = "
+          << result.warehouse_id << " AND no_d_id = " << district_id
+          << " ORDER BY no_o_id LIMIT 1;";
+      if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess) {
+        return fail();
+      }
+      if (rows.empty()) {
+        continue;
+      }
+      const int order_id = static_cast<int>(IntValue(rows.front()[0]));
+      rows.clear();
+      sql.str("");
+      sql << "DELETE FROM new_order WHERE no_w_id = " << result.warehouse_id
+          << " AND no_d_id = " << district_id << " AND no_o_id = " << order_id
+          << ';';
+      if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+          !RequireAffected(rows, 1, "delivery queue delete", &result)) {
+        return fail();
+      }
+      if (IntValue(rows.front()[1]) != 1) {
+        result.error = "delivery queue delete affected " +
+                       std::to_string(IntValue(rows.front()[1])) + " rows";
+        return fail();
+      }
+      rows.clear();
+      sql.str("");
+      sql << "SELECT o_c_id FROM orders WHERE o_w_id = " << result.warehouse_id
+          << " AND o_d_id = " << district_id << " AND o_id = " << order_id
+          << ';';
+      if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+          !RequireRows(rows, "delivery order read", &result)) {
+        return fail();
+      }
+      const int customer_id = static_cast<int>(IntValue(rows.front()[0]));
+      rows.clear();
+      sql.str("");
+      sql << "UPDATE orders SET o_carrier_id = " << carrier_id
+          << " WHERE o_w_id = " << result.warehouse_id
+          << " AND o_d_id = " << district_id << " AND o_id = " << order_id
+          << ';';
+      if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+          !RequireAffected(rows, 1, "delivery order update", &result)) {
+        return fail();
+      }
+      rows.clear();
+      sql.str("");
+      sql << "UPDATE order_line SET ol_delivery_d = CURRENT_TIMESTAMP() "
+          << "WHERE ol_w_id = " << result.warehouse_id
+          << " AND ol_d_id = " << district_id << " AND ol_o_id = " << order_id
+          << " AND ol_number >= 1 AND ol_number <= " << scale_.max_order_lines
+          << ';';
+      if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+          !RequireAffected(rows, 1, "delivery line update", &result)) {
+        return fail();
+      }
+      rows.clear();
+      sql.str("");
+      sql << "SELECT SUM(ol_amount) FROM order_line WHERE ol_w_id = "
+          << result.warehouse_id << " AND ol_d_id = " << district_id
+          << " AND ol_o_id = " << order_id
+          << " AND ol_number >= 1 AND ol_number <= " << scale_.max_order_lines
+          << ';';
+      if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+          !RequireRows(rows, "delivery amount read", &result)) {
+        return fail();
+      }
+      const double amount = DoubleValue(rows.front()[0]);
+      rows.clear();
+      sql.str("");
+      sql << "UPDATE customer SET c_balance = c_balance + " << Number(amount)
+          << ", c_delivery_cnt = c_delivery_cnt + 1 WHERE c_w_id = "
+          << result.warehouse_id << " AND c_d_id = " << district_id
+          << " AND c_id = " << customer_id << ';';
+      if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
+          !RequireAffected(rows, 1, "delivery customer update", &result)) {
+        return fail();
+      }
+      result.amount += amount;
+      ++result.delivered_orders;
     }
-    if (rows.empty()) { continue;
-}
-    const int order_id = static_cast<int>(IntValue(rows.front()[0]));
-    rows.clear();
-    sql.str("");
-    sql << "DELETE FROM new_order WHERE no_w_id = " << result.warehouse_id
-        << " AND no_d_id = " << district_id << " AND no_o_id = " << order_id
-        << ';';
-    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-        !RequireAffected(rows, 1, "delivery queue delete", &result)) {
-      return fail();
-    }
-    if (IntValue(rows.front()[1]) != 1) {
-      result.error = "delivery queue delete affected " +
-                     std::to_string(IntValue(rows.front()[1])) + " rows";
-      return fail();
-    }
-    rows.clear();
-    sql.str("");
-    sql << "SELECT o_c_id FROM orders WHERE o_w_id = " << result.warehouse_id
-        << " AND o_d_id = " << district_id << " AND o_id = " << order_id << ';';
-    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-        !RequireRows(rows, "delivery order read", &result)) {
-      return fail();
-    }
-    const int customer_id = static_cast<int>(IntValue(rows.front()[0]));
-    rows.clear();
-    sql.str("");
-    sql << "UPDATE orders SET o_carrier_id = " << carrier_id
-        << " WHERE o_w_id = " << result.warehouse_id
-        << " AND o_d_id = " << district_id << " AND o_id = " << order_id << ';';
-    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-        !RequireAffected(rows, 1, "delivery order update", &result)) {
-      return fail();
-    }
-    rows.clear();
-    sql.str("");
-    sql << "UPDATE order_line SET ol_delivery_d = CURRENT_TIMESTAMP() "
-        << "WHERE ol_w_id = " << result.warehouse_id
-        << " AND ol_d_id = " << district_id << " AND ol_o_id = " << order_id
-        << ';';
-    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-        !RequireAffected(rows, 1, "delivery line update", &result)) {
-      return fail();
-    }
-    rows.clear();
-    sql.str("");
-    sql << "SELECT SUM(ol_amount) FROM order_line WHERE ol_w_id = "
-        << result.warehouse_id << " AND ol_d_id = " << district_id
-        << " AND ol_o_id = " << order_id << ';';
-    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-        !RequireRows(rows, "delivery amount read", &result)) {
-      return fail();
-    }
-    const double amount = DoubleValue(rows.front()[0]);
-    rows.clear();
-    sql.str("");
-    sql << "UPDATE customer SET c_balance = c_balance + " << Number(amount)
-        << ", c_delivery_cnt = c_delivery_cnt + 1 WHERE c_w_id = "
-        << result.warehouse_id << " AND c_d_id = " << district_id
-        << " AND c_id = " << customer_id << ';';
-    if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess ||
-        !RequireAffected(rows, 1, "delivery customer update", &result)) {
-      return fail();
-    }
-    result.amount += amount;
-    ++result.delivered_orders;
-  }
     const Status commit = context.PreCommit();
     result.committed = commit == Status::kSuccess;
-    if (!result.committed) { result.error = "delivery commit failed";
-}
+    if (!result.committed) {
+      result.error = "delivery commit failed";
+    }
     return result;
   };
   try {
@@ -1067,37 +1177,44 @@ TpccTransactionResult TpccWorkload::StockLevel() {
   sql.str("");
   sql << "SELECT ol_i_id FROM order_line WHERE ol_w_id = "
       << result.warehouse_id << " AND ol_d_id = " << result.district_id
-      << " AND ol_o_id >= " << std::max(1, next_order - 20)
-      << " AND ol_o_id < " << next_order << ';';
+      << " AND ol_o_id >= " << std::max(1, next_order - 20) << " AND ol_o_id < "
+      << next_order << ';';
   if (RunSql(context, sql.str(), &rows, &result) != Status::kSuccess) {
     return fail();
   }
   std::unordered_set<int64_t> items;
   items.reserve(rows.size());
   for (const Row& row : rows) {
-    if (!row.IsValid() || row.values_.empty()) { continue;
-}
+    if (!row.IsValid() || row.values_.empty()) {
+      continue;
+    }
     items.insert(IntValue(row[0]));
   }
-  int64_t low_stock = 0;
-  for (int64_t item_id : items) {
-    std::vector<Row> stock_rows;
+  std::vector<Row> stock_rows;
+  if (!items.empty()) {
     sql.str("");
-    sql << "SELECT s_quantity FROM stock WHERE s_w_id = " << result.warehouse_id
-        << " AND s_i_id = " << item_id << ';';
+    sql << "SELECT s_i_id FROM stock WHERE s_w_id = " << result.warehouse_id
+        << " AND s_quantity < " << threshold << " AND s_i_id IN (";
+    bool first = true;
+    for (int64_t item_id : items) {
+      if (!first) { sql << ','; }
+      first = false;
+      sql << item_id;
+    }
+    sql << ");";
     if (RunSql(context, sql.str(), &stock_rows, &result) != Status::kSuccess) {
       return fail();
     }
-    if (stock_rows.empty() || !stock_rows.front().IsValid()) { continue;
-}
-    if (IntValue(stock_rows.front()[0]) < threshold) { ++low_stock;
-}
   }
-  result.low_stock = low_stock;
+  // STOCK has a unique (warehouse,item) key, hence each returned row is one
+  // distinct low-stock item.  This is the same TPC-C predicate without an
+  // application-side N+1 query per item.
+  result.low_stock = static_cast<int64_t>(stock_rows.size());
   const Status commit = context.PreCommit();
   result.committed = commit == Status::kSuccess;
-  if (!result.committed) { result.error = "stock-level commit failed";
-}
+  if (!result.committed) {
+    result.error = "stock-level commit failed";
+  }
   return result;
 }
 

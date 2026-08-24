@@ -17,6 +17,8 @@
 #ifndef TINYLAMB_ROW_PAGE_TEST_HPP
 #define TINYLAMB_ROW_PAGE_TEST_HPP
 
+#include <thread>
+
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
@@ -55,7 +57,7 @@ class RowPageTest : public ::testing::Test {
     l_ = std::make_unique<Logger>(file_name_ + ".log");
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(file_name_ + ".log", p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(lm_.get(), p_.get(), l_.get(),
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
                                                r_.get());
   }
 
@@ -90,17 +92,29 @@ class RowPageTest : public ::testing::Test {
   }
 
   void UpdateRow(int slot, std::string_view str, bool commit = true) {
-    auto txn = tm_->Begin();
-    PageRef page = p_->GetPage(page_id_);
-    ASSERT_EQ(page->Type(), PageType::kRowPage);
-    ASSERT_SUCCESS(page->Update(txn, slot, str));
-    if (commit) {
-      ASSERT_SUCCESS(txn.PreCommit());
-    } else {
-      page.PageUnlock();
-      txn.Abort();
+    constexpr size_t kMaxFirstUpdaterRetries = 1000;
+    for (size_t attempt = 0; attempt < kMaxFirstUpdaterRetries; ++attempt) {
+      auto txn = tm_->Begin();
+      PageRef page = p_->GetPage(page_id_);
+      ASSERT_EQ(page->Type(), PageType::kRowPage);
+      const Status status = page->Update(txn, slot, str);
+      if (status == Status::kConflicts) {
+        page.PageUnlock();
+        txn.Abort();
+        std::this_thread::yield();
+        continue;
+      }
+      ASSERT_SUCCESS(status);
+      if (commit) {
+        ASSERT_SUCCESS(txn.PreCommit());
+      } else {
+        page.PageUnlock();
+        txn.Abort();
+      }
+      txn.CommitWait();
+      return;
     }
-    txn.CommitWait();
+    FAIL() << "first-updater-wins retry budget exhausted";
   }
 
   void DeleteRow(int slot, bool commit = true) {

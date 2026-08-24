@@ -97,13 +97,13 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
           IsCountStar(aggregate)
               ? Value(1)
               : Evaluate(aggregate.Child(), scope, nullptr, context, ctes));
-      if (active_runtime != nullptr) { ++active_runtime->aggregate_updates;
+      if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->aggregate_updates;
 }
     }
     // Only new groups need a representative row.
     if (inserted) { group.representative = row;
 }
-    if (active_runtime != nullptr) { ++active_runtime->aggregate_input_rows;
+    if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->aggregate_input_rows;
 }
   };
   auto make_group = [&]() {
@@ -167,11 +167,11 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
         groups.push_back(make_group());
       }
     }
-    if (active_runtime != nullptr) { active_runtime->aggregate_groups += groups.size();
+    if (context.execution_runtime() != nullptr) { context.execution_runtime()->aggregate_groups += groups.size();
 }
   }
 
-  Relation output;
+  Relation output(context.execution_runtime());
   CopyExecutionStats(&output, input);
   std::vector<Column> output_columns;
   for (size_t i = 0; i < statement.SelectList().size(); ++i) {
@@ -234,7 +234,7 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     }
   }
   output.schema = Schema("", std::move(output_columns));
-  if (active_runtime != nullptr) { active_runtime->project_ms += ElapsedMs(project_begin);
+  if (context.execution_runtime() != nullptr) { context.execution_runtime()->project_ms += ElapsedMs(project_begin);
 }
   return output;
 }
@@ -301,7 +301,7 @@ void ApplyOrderBy(TransactionContext& context, const SelectStatement& statement,
     output->AddRow(std::move(keyed.row));
   }
   output->FinishSpill();
-  if (active_runtime != nullptr) { active_runtime->sort_ms += ElapsedMs(sort_begin);
+  if (context.execution_runtime() != nullptr) { context.execution_runtime()->sort_ms += ElapsedMs(sort_begin);
 }
 }
 
@@ -335,7 +335,7 @@ Relation FinishQuery(TransactionContext& context,
                      bool apply_where) {
   if (apply_where && statement.WhereClause()) {
     const auto filter_begin = std::chrono::steady_clock::now();
-    Relation filtered;
+    Relation filtered(context.execution_runtime());
     filtered.schema = input.schema;
     CopyExecutionStats(&filtered, input);
     input.FinishSpill();
@@ -348,7 +348,7 @@ Relation FinishQuery(TransactionContext& context,
     });
     filtered.FinishSpill();
     input = std::move(filtered);
-    if (active_runtime != nullptr) { active_runtime->filter_ms += ElapsedMs(filter_begin);
+    if (context.execution_runtime() != nullptr) { context.execution_runtime()->filter_ms += ElapsedMs(filter_begin);
 }
   }
 
@@ -364,7 +364,7 @@ Relation FinishQuery(TransactionContext& context,
 Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     TransactionContext& context, const SelectStatement& statement,
     const Scope* outer, const CteMap& inherited_ctes) {
-  EnsureReusableProjections(context, active_runtime);
+  EnsureReusableProjections(context, context.execution_runtime());
   CteMap ctes = inherited_ctes;
   for (const auto& [name, query] : statement.WithQueries()) {
     ctes[name] = std::make_shared<Relation>(
@@ -389,15 +389,16 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
   if (stream_agg) {
     const SelectSource& source = statement.Sources()[0];
     const bool reusable =
-        active_runtime != nullptr &&
-        active_runtime->reusable_base_relations.contains(source.table);
+        context.execution_runtime() != nullptr &&
+        context.execution_runtime()->reusable_base_relations.contains(source.table);
     StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
     if (!table.HasValue()) {
       throw std::runtime_error("table " + source.table + " not found");
     }
     const Schema& table_schema = table.Value()->GetSchema();
     std::vector<slot_t> projection = RequiredColumns(statement, table_schema);
-    if (const std::vector<slot_t>* shared = ReusableProjection(source.table)) {
+    if (const std::vector<slot_t>* shared =
+            ReusableProjection(context, source.table)) {
       projection = *shared;
     }
     Schema scan_schema = projection.empty()
@@ -471,7 +472,7 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
 
     const auto scan_begin = std::chrono::steady_clock::now();
     auto accumulate_row = [&](Row row) {
-      if (active_runtime != nullptr) { ++active_runtime->scan_output_rows;
+      if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->scan_output_rows;
 }
       Scope scope{.row=&row, .schema=&input.schema, .outer=outer};
       std::vector<Value> key_values;
@@ -508,10 +509,10 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
           accumulator.Add(Evaluate(aggregate_expressions[i]->Child(), scope,
                                    nullptr, context, ctes));
         }
-        if (active_runtime != nullptr) { ++active_runtime->aggregate_updates;
+        if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->aggregate_updates;
 }
       }
-      if (active_runtime != nullptr) { ++active_runtime->aggregate_input_rows;
+      if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->aggregate_input_rows;
 }
     };
 
@@ -525,9 +526,9 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     if (reusable) {
       const std::string cache_key = BaseRelationCacheKey(
           source.table, projection.empty() ? nullptr : &projection);
-      auto cached = active_runtime->base_relations.find(cache_key);
-      if (cached == active_runtime->base_relations.end()) {
-        Relation cache_rel;
+      auto cached = context.execution_runtime()->base_relations.find(cache_key);
+      if (cached == context.execution_runtime()->base_relations.end()) {
+        Relation cache_rel(context.execution_runtime());
         cache_rel.schema = scan_schema;
         // Fill the shared cache with UNFILTERED rows: the cache key carries no
         // predicates (and no stashed key filters are applied here), so every
@@ -537,21 +538,21 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
                 ? table.Value()->BeginFullScan(context.txn_)
                 : table.Value()->BeginFullScan(context.txn_, projection);
         while (iterator.IsValid()) {
-          if (active_runtime != nullptr) {
-            ++active_runtime->scan_rows;
-            active_runtime->scan_values_available += table_schema.ColumnCount();
-            active_runtime->scan_values_decoded += scan_schema.ColumnCount();
+          if (context.execution_runtime() != nullptr) {
+            ++context.execution_runtime()->scan_rows;
+            context.execution_runtime()->scan_values_available += table_schema.ColumnCount();
+            context.execution_runtime()->scan_values_decoded += scan_schema.ColumnCount();
           }
           cache_rel.AddRow(*iterator);
           ++iterator;
         }
         cache_rel.FinishSpill();
         cached =
-            active_runtime->base_relations
+            context.execution_runtime()->base_relations
                 .emplace(cache_key, std::make_shared<Relation>(std::move(cache_rel)))
                 .first;
       } else {
-        ++active_runtime->base_scan_cache_hits;
+        ++context.execution_runtime()->base_scan_cache_hits;
       }
       // Aggregation always reads through the shared cache so the first user
       // and later users see exactly the same rows.
@@ -585,21 +586,21 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
           ++iterator;
           continue;
         }
-        if (active_runtime != nullptr) {
-          ++active_runtime->scan_rows;
-          active_runtime->scan_values_available += table_schema.ColumnCount();
-          active_runtime->scan_values_decoded += scan_schema.ColumnCount();
+        if (context.execution_runtime() != nullptr) {
+          ++context.execution_runtime()->scan_rows;
+          context.execution_runtime()->scan_values_available += table_schema.ColumnCount();
+          context.execution_runtime()->scan_values_decoded += scan_schema.ColumnCount();
         }
         accumulate_row(*iterator);
         ++iterator;
       }
     }
-    if (active_runtime != nullptr) {
-      active_runtime->scan_ms += ElapsedMs(scan_begin);
+    if (context.execution_runtime() != nullptr) {
+      context.execution_runtime()->scan_ms += ElapsedMs(scan_begin);
       // filter_ms intentionally includes the same interval: filtering happened
       // inline with the scan, so both counters cover this phase.
-      active_runtime->filter_ms += ElapsedMs(scan_begin);
-      active_runtime->aggregate_groups += groups.size();
+      context.execution_runtime()->filter_ms += ElapsedMs(scan_begin);
+      context.execution_runtime()->aggregate_groups += groups.size();
     }
     if (groups.empty() && statement.GroupBy().empty()) {
       GroupState group;
@@ -610,7 +611,7 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       groups.push_back(std::move(group));
     }
 
-    Relation output;
+    Relation output(context.execution_runtime());
     output.schema = input.schema;
     std::vector<Column> output_columns;
     for (size_t i = 0; i < statement.SelectList().size(); ++i) {
@@ -673,7 +674,6 @@ using relational_detail::ExecuteQuery;
 using relational_detail::CountStatementTables;
 using relational_detail::ExecutionRuntime;
 using relational_detail::WriteEstimatedPhysicalPlan;
-using relational_detail::active_runtime;
 using relational_detail::Relation;
 
 RelationalExecutor::RelationalExecutor(
@@ -692,16 +692,16 @@ void RelationalExecutor::Initialize() {
     if (count > 1) { runtime.reusable_base_relations.insert(table);
 }
   }
-  ExecutionRuntime* previous_runtime = active_runtime;
-  active_runtime = &runtime;
+  ExecutionRuntime* previous_runtime = context_->execution_runtime();
+  context_->set_execution_runtime(&runtime);
   Relation result;
   try {
     result = ExecuteQuery(*context_, *statement_, nullptr, {});
   } catch (...) {
-    active_runtime = previous_runtime;
+    context_->set_execution_runtime(previous_runtime);
     throw;
   }
-  active_runtime = previous_runtime;
+  context_->set_execution_runtime(previous_runtime);
   result.FinishSpill();
   rows_.clear();
   result.ForEachRow([&](const Row& row) { rows_.push_back(row); });

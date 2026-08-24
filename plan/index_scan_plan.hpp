@@ -34,14 +34,17 @@ class IndexScanPlan final : public PlanBase {
   IndexScanPlan(const Table& table, const Index& index,
                 const TableStatistics& ts, std::vector<Value> begin_key,
                 std::vector<Value> end_key, bool ascending, Expression where,
-                std::vector<ColumnName> provided_order = {});
+                std::vector<ColumnName> provided_order = {},
+                bool lock_rows = false,
+                bool wait_for_write_intent = true);
   // Point-union access for constant IN lists: one [begin,end] pair per
   // distinct value. Ordering credit only survives a single range.
   IndexScanPlan(
       const Table& table, const Index& index, const TableStatistics& ts,
       std::vector<std::pair<std::vector<Value>, std::vector<Value>>> ranges,
       bool ascending, Expression where,
-      std::vector<ColumnName> provided_order = {});
+      std::vector<ColumnName> provided_order = {}, bool lock_rows = false,
+      bool wait_for_write_intent = true);
   IndexScanPlan(const IndexScanPlan&) = delete;
   IndexScanPlan(IndexScanPlan&&) = delete;
   IndexScanPlan& operator=(const IndexScanPlan&) = delete;
@@ -71,6 +74,8 @@ class IndexScanPlan final : public PlanBase {
   std::vector<Value> end_key_;
   std::vector<std::pair<std::vector<Value>, std::vector<Value>>> point_ranges_;
   bool ascending_;
+  bool lock_rows_;
+  bool wait_for_write_intent_;
   Expression where_;
   std::vector<ColumnName> provided_order_;
 };

@@ -17,6 +17,7 @@
 #include "common/serdes.hpp"
 
 #include <cstdint>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -26,6 +27,52 @@
 
 namespace tinylamb {
 
+size_t SerializeU16(char* pos, uint16_t value) {
+  pos[0] = static_cast<char>((value >> 8U) & 0xffU);
+  pos[1] = static_cast<char>(value & 0xffU);
+  return sizeof(value);
+}
+
+size_t SerializeU32(char* pos, uint32_t value) {
+  for (size_t i = 0; i < sizeof(value); ++i) {
+    pos[i] = static_cast<char>((value >> ((3U - i) * 8U)) & 0xffU);
+  }
+  return sizeof(value);
+}
+
+size_t SerializeU64(char* pos, uint64_t value) {
+  for (size_t i = 0; i < sizeof(value); ++i) {
+    pos[i] = static_cast<char>((value >> ((7U - i) * 8U)) & 0xffU);
+  }
+  return sizeof(value);
+}
+
+size_t DeserializeU16(const char* pos, uint16_t* out) {
+  *out = (static_cast<uint16_t>(static_cast<unsigned char>(pos[0])) << 8U) |
+         static_cast<uint16_t>(static_cast<unsigned char>(pos[1]));
+  return sizeof(*out);
+}
+
+size_t DeserializeU32(const char* pos, uint32_t* out) {
+  uint32_t value = 0;
+  for (size_t i = 0; i < sizeof(value); ++i) {
+    value = (value << 8U) |
+            static_cast<uint32_t>(static_cast<unsigned char>(pos[i]));
+  }
+  *out = value;
+  return sizeof(*out);
+}
+
+size_t DeserializeU64(const char* pos, uint64_t* out) {
+  uint64_t value = 0;
+  for (size_t i = 0; i < sizeof(value); ++i) {
+    value = (value << 8U) |
+            static_cast<uint64_t>(static_cast<unsigned char>(pos[i]));
+  }
+  *out = value;
+  return sizeof(*out);
+}
+
 size_t SerializeStringView(char* pos, std::string_view bin) {
   // bin_size_t cannot represent longer strings; truncating silently would
   // corrupt the serialized image (length prefix vs payload mismatch).
@@ -33,18 +80,18 @@ size_t SerializeStringView(char* pos, std::string_view bin) {
     throw std::runtime_error("string too long to serialize");
   }
   const auto len = static_cast<bin_size_t>(bin.size());
-  memcpy(pos, &len, sizeof(len));
+  SerializeU16(pos, len);
   memcpy(pos + sizeof(len), bin.data(), bin.size());
   return sizeof(len) + bin.size();
 }
 
 size_t SerializeSlot(char* pos, slot_t slot) {
-  memcpy(pos, &slot, sizeof(slot));
+  SerializeU16(pos, slot);
   return sizeof(slot_t);
 }
 
 size_t SerializePID(char* pos, page_id_t pid) {
-  memcpy(pos, &pid, sizeof(pid));
+  SerializeU64(pos, pid);
   return sizeof(page_id_t);
 }
 
@@ -58,18 +105,18 @@ size_t SerializeNull(char* pos) {
 }
 
 size_t SerializeInteger(char* pos, int64_t i) {
-  memcpy(pos, &i, sizeof(i));
+  SerializeU64(pos, std::bit_cast<uint64_t>(i));
   return sizeof(int64_t);
 }
 
 size_t SerializeDouble(char* pos, double d) {
-  memcpy(pos, &d, sizeof(d));
+  SerializeU64(pos, std::bit_cast<uint64_t>(d));
   return sizeof(double);
 }
 
 size_t DeserializeStringView(const char* pos, std::string_view* out) {
   bin_size_t len = 0;
-  memcpy(&len, pos, sizeof(bin_size_t));
+  DeserializeU16(pos, &len);
   *out = {pos + sizeof(len), len};
   return sizeof(len) + len;
 }
@@ -80,7 +127,7 @@ size_t DeserializeStringView(const char* pos, const char* end,
     return 0;
   }
   bin_size_t len = 0;
-  memcpy(&len, pos, sizeof(bin_size_t));
+  DeserializeU16(pos, &len);
   if (static_cast<size_t>(end - pos) - sizeof(bin_size_t) < len) {
     return 0;
   }
@@ -89,22 +136,26 @@ size_t DeserializeStringView(const char* pos, const char* end,
 }
 
 size_t DeserializeSlot(const char* pos, slot_t* out) {
-  memcpy(out, pos, sizeof(*out));
+  DeserializeU16(pos, out);
   return sizeof(slot_t);
 }
 
 size_t DeserializePID(const char* pos, page_id_t* out) {
-  memcpy(out, pos, sizeof(page_id_t));
+  DeserializeU64(pos, out);
   return sizeof(page_id_t);
 }
 
 size_t DeserializeInteger(const char* pos, int64_t* out) {
-  memcpy(out, pos, sizeof(*out));
+  uint64_t bits = 0;
+  DeserializeU64(pos, &bits);
+  *out = std::bit_cast<int64_t>(bits);
   return sizeof(int64_t);
 }
 
 size_t DeserializeDouble(const char* pos, double* out) {
-  memcpy(out, pos, sizeof(double));
+  uint64_t bits = 0;
+  DeserializeU64(pos, &bits);
+  *out = std::bit_cast<double>(bits);
   return sizeof(double);
 }
 }  // namespace tinylamb

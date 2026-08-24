@@ -299,7 +299,7 @@ Relation HybridHashJoin(
     }
   }
 
-  Relation result;
+  Relation result(left.runtime());
   result.schema = left.schema + right.schema;
   const size_t right_width = right.schema.ColumnCount();
 
@@ -442,7 +442,7 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
               const SelectSource& source, const Scope* outer,
               const CteMap& ctes) {
   const auto join_begin = std::chrono::steady_clock::now();
-  Relation result;
+  Relation result(context.execution_runtime());
   result.schema = left.schema + right.schema;
   result.hash_joins = left.hash_joins + right.hash_joins;
   result.hybrid_hash_joins = left.hybrid_hash_joins + right.hybrid_hash_joins;
@@ -512,7 +512,7 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
       joined.in_memory_hash_joins = result.in_memory_hash_joins;
       joined.nested_loop_joins = result.nested_loop_joins;
       joined.join_comparisons = result.join_comparisons;
-      if (active_runtime != nullptr) { active_runtime->join_ms += ElapsedMs(join_begin);
+      if (context.execution_runtime() != nullptr) { context.execution_runtime()->join_ms += ElapsedMs(join_begin);
 }
       return joined;
     }
@@ -575,7 +575,7 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
   result.FinishSpill();
   result.peak_intermediate_rows =
       std::max(result.peak_intermediate_rows, result.TotalRows());
-  if (active_runtime != nullptr) { active_runtime->join_ms += ElapsedMs(join_begin);
+  if (context.execution_runtime() != nullptr) { context.execution_runtime()->join_ms += ElapsedMs(join_begin);
 }
   return result;
 }
@@ -584,7 +584,7 @@ Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
                    const std::vector<Expression>& predicates,
                    const Scope* outer, const CteMap& ctes) {
   const auto join_begin = std::chrono::steady_clock::now();
-  Relation result;
+  Relation result(context.execution_runtime());
   result.schema = left.schema + right.schema;
   result.hash_joins = left.hash_joins + right.hash_joins;
   result.hybrid_hash_joins = left.hybrid_hash_joins + right.hybrid_hash_joins;
@@ -641,7 +641,7 @@ Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
       joined.in_memory_hash_joins = result.in_memory_hash_joins;
       joined.nested_loop_joins = result.nested_loop_joins;
       joined.join_comparisons = result.join_comparisons;
-      if (active_runtime != nullptr) { active_runtime->join_ms += ElapsedMs(join_begin);
+      if (context.execution_runtime() != nullptr) { context.execution_runtime()->join_ms += ElapsedMs(join_begin);
 }
       return joined;
     }
@@ -694,7 +694,7 @@ Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
   result.FinishSpill();
   result.peak_intermediate_rows =
       std::max(result.peak_intermediate_rows, result.TotalRows());
-  if (active_runtime != nullptr) { active_runtime->join_ms += ElapsedMs(join_begin);
+  if (context.execution_runtime() != nullptr) { context.execution_runtime()->join_ms += ElapsedMs(join_begin);
 }
   return result;
 }
@@ -737,7 +737,7 @@ Relation BuildInput(TransactionContext& context,
                                               qualifier);
     projections[i] = RequiredColumns(statement, relations[i].schema);
     if (const std::vector<slot_t>* shared =
-            ReusableProjection(source.table)) {
+            ReusableProjection(context, source.table)) {
       projections[i] = *shared;
     }
   }
@@ -747,7 +747,8 @@ Relation BuildInput(TransactionContext& context,
   {
     std::unordered_map<std::string, std::set<slot_t>> column_union;
     for (size_t i = 0; i < statement.Sources().size(); ++i) {
-      if (!base_sources[i] || !ReusesBaseRelation(statement.Sources()[i])) {
+      if (!base_sources[i] ||
+          !ReusesBaseRelation(context, statement.Sources()[i])) {
         continue;
       }
       auto& columns = column_union[statement.Sources()[i].table];
@@ -755,7 +756,8 @@ Relation BuildInput(TransactionContext& context,
 }
     }
     for (size_t i = 0; i < statement.Sources().size(); ++i) {
-      if (!base_sources[i] || !ReusesBaseRelation(statement.Sources()[i])) {
+      if (!base_sources[i] ||
+          !ReusesBaseRelation(context, statement.Sources()[i])) {
         continue;
       }
       const auto& columns = column_union[statement.Sources()[i].table];
@@ -829,7 +831,7 @@ Relation BuildInput(TransactionContext& context,
 
   // Push uncorrelated `col IN (SELECT ...)` results as integer key filters
   // before scanning the owning base table (TPC-H Q18).
-  if (active_runtime != nullptr) {
+  if (context.execution_runtime() != nullptr) {
     for (const Expression& expression :
          SplitConjuncts(statement.WhereClause())) {
       if (!expression || expression->Type() != TypeTag::kQueryExp) { continue;
@@ -878,7 +880,7 @@ Relation BuildInput(TransactionContext& context,
           continue;
         }
         const std::string& table = statement.Sources()[i].table;
-        TableKeyFilter& stored = active_runtime->table_key_filters[table];
+        TableKeyFilter& stored = context.execution_runtime()->table_key_filters[table];
         if (stored.keys.empty() || keys.size() < stored.keys.size()) {
           stored.keys = keys;
           stored.column = static_cast<slot_t>(*offset);
@@ -898,9 +900,9 @@ Relation BuildInput(TransactionContext& context,
     const auto rank = [&](size_t i) {
       if (!local_predicates[i].empty()) { return 0;
 }
-      const auto stored = active_runtime->table_key_filters.find(
+      const auto stored = context.execution_runtime()->table_key_filters.find(
           statement.Sources()[i].table);
-      if (stored != active_runtime->table_key_filters.end() &&
+      if (stored != context.execution_runtime()->table_key_filters.end() &&
           stored->second.owner == &statement) {
         return 0;
       }
@@ -942,11 +944,11 @@ Relation BuildInput(TransactionContext& context,
 }
       const bool other_selective =
           !local_predicates[other].empty() ||
-          (active_runtime != nullptr &&
+          (context.execution_runtime() != nullptr &&
            [&] {
-             const auto stored = active_runtime->table_key_filters.find(
+             const auto stored = context.execution_runtime()->table_key_filters.find(
                  statement.Sources()[other].table);
-             return stored != active_runtime->table_key_filters.end() &&
+             return stored != context.execution_runtime()->table_key_filters.end() &&
                     stored->second.owner == &statement;
            }());
       const size_t driver_rows = relations[other].TotalRows();
@@ -1013,9 +1015,9 @@ Relation BuildInput(TransactionContext& context,
     const bool use_key_filter = key_column.has_value();
     const std::unordered_set<int64_t>* filter_ptr = nullptr;
     std::optional<slot_t> filter_col = use_key_filter ? key_column : std::nullopt;
-    if (use_key_filter && active_runtime != nullptr) {
-      ++active_runtime->key_filter_scans;
-      active_runtime->key_filter_keys += key_filter.size();
+    if (use_key_filter && context.execution_runtime() != nullptr) {
+      ++context.execution_runtime()->key_filter_scans;
+      context.execution_runtime()->key_filter_keys += key_filter.size();
       // Remember for later scans of this base table within this statement.
       // The stash is owner-scoped so other statements never inherit it.
       // Column is stored as the full-schema slot so other projections can
@@ -1023,18 +1025,18 @@ Relation BuildInput(TransactionContext& context,
       const auto& proj = projections[idx];
       const slot_t full_slot = proj[*key_column];
       TableKeyFilter& stored =
-          active_runtime->table_key_filters[statement.Sources()[idx].table];
+          context.execution_runtime()->table_key_filters[statement.Sources()[idx].table];
       stored.keys = std::move(key_filter);
       stored.column = full_slot;
       stored.owner = &statement;
       filter_ptr = &stored.keys;
-    } else if (!use_key_filter && active_runtime != nullptr) {
+    } else if (!use_key_filter && context.execution_runtime() != nullptr) {
       // Fall back to a stash created earlier within this same statement (e.g.
       // an uncorrelated IN pushdown). Entries owned by other statements are
       // never applied here.
-      const auto stored = active_runtime->table_key_filters.find(
+      const auto stored = context.execution_runtime()->table_key_filters.find(
           statement.Sources()[idx].table);
-      if (stored != active_runtime->table_key_filters.end() &&
+      if (stored != context.execution_runtime()->table_key_filters.end() &&
           stored->second.owner == &statement) {
         const auto& proj = projections[idx];
         const auto proj_it = std::ranges::find(proj, stored->second.column);

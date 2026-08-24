@@ -23,9 +23,6 @@
 
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
-#include "executor/executor_base.hpp"
-#include "executor/full_scan.hpp"
-#include "executor/parallel_scan.hpp"
 #include "plan/parallel_thresholds.hpp"
 #include "table/table.hpp"
 
@@ -34,12 +31,7 @@ namespace tinylamb {
 FullScanPlan::FullScanPlan(const Table& table, const TableStatistics& stats)
     : table_(table), stats_(stats) {}
 
-Executor FullScanPlan::EmitExecutor(TransactionContext& txn) const {
-  if (stats_.Rows() >= kParallelScanMinRows) {
-    return std::make_shared<ParallelScan>(txn.txn_, table_);
-  }
-  return std::make_shared<FullScan>(txn.txn_, table_);
-}
+// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
 
 const Schema& FullScanPlan::GetSchema() const { return table_.GetSchema(); }
 

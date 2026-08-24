@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "query/sql_engine.hpp"
 
 namespace tinylamb {
 
@@ -100,8 +101,9 @@ class TpccWorkload {
  private:
   Status RunSql(TransactionContext& context, std::string_view sql,
                 std::vector<Row>* rows, TpccTransactionResult* result);
-  static bool RequireRows(const std::vector<Row>& rows, std::string_view operation,
-                   TpccTransactionResult* result) ;
+  static bool RequireRows(const std::vector<Row>& rows,
+                          std::string_view operation,
+                          TpccTransactionResult* result);
   static bool RequireAffected(const std::vector<Row>& rows, int64_t minimum,
                               std::string_view operation,
                               TpccTransactionResult* result);
@@ -120,6 +122,11 @@ class TpccWorkload {
   std::string PickCustomerLastName();
 
   Database* database_;
+  // One workload is owned by one terminal thread.  Reusing the facade avoids
+  // reconstructing its scratch strings/vectors for every one of the tens of
+  // thousands of SQL statements issued per second; every statement still
+  // enters SqlEngine::Execute and therefore remains covered by the SQL gate.
+  SqlEngine sql_engine_;
   TpccScale scale_;
   std::mt19937_64 random_;
   int home_warehouse_{1};

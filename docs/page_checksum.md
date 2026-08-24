@@ -5,8 +5,8 @@
 On-disk pages carry a `uint64_t checksum` field in the page header
 (`page/page.hpp`). As of the Phase-2 change in `improvement.md` §M2, the
 value is **CRC-32C (Castagnoli)**, computed by `common/crc32c.hpp` over the
-full `kPageSize` bytes with the checksum field itself forced to zero during
-the digest.
+page image excluding the runtime-only `recovery_lsn` and `checksum` slots.
+The 32-bit digest is stored zero-extended in the 64-bit checksum field.
 
 `Page::SetChecksum()` writes the digest; `Page::IsValid()` recomputes and
 compares. `PagePool::WriteBack` always refreshes the checksum before I/O.
@@ -35,3 +35,8 @@ implementation-defined. There is **no automatic migration**:
 - Detects torn writes and random bit flips better than additive header hashes.
 - Hardware CRC32C can replace the software loop later without changing the
   on-disk value for the same bytes.
+
+## 実装上の注意(2026-08-24 レビュー反映)
+
+- ダイジェスト範囲に recovery_lsn を含まない。リカバリ経路(GetPageForRecovery)は意図的に検証をバイパス。
+- 全ゼロ領域/EINVAL/CRC==0 の境界挙動、uint64 フィールドに実効32bit値を格納している点、WriteBack 呼び出し元とエラー時挙動、bit-by-bit CRC の計算コスト、`SetChecksum`/`IsValid` の排他ラッチ前提契約——詳細は page.cpp/hpp のコメントと page_pool 実装を参照。

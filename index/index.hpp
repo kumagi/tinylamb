@@ -39,6 +39,12 @@ class Index {
         std::vector<slot_t> include = {}, IndexMode mode = IndexMode::kUnique)
       : sc_(name, std::move(key), std::move(include), mode), pid_(pid) {}
   [[nodiscard]] bool IsUnique() const { return sc_.IsUnique(); }
+  [[nodiscard]] bool StoresSingleValue() const {
+    return sc_.StoresSingleValue();
+  }
+  [[nodiscard]] bool RetainsDeletedEntries() const {
+    return sc_.RetainsDeletedEntries();
+  }
   [[nodiscard]] page_id_t Root() const { return pid_; }
   [[nodiscard]] std::unordered_set<slot_t> CoveredColumns() const;
   friend Encoder& operator<<(Encoder& a, const Index& idx);

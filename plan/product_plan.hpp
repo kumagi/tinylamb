@@ -17,19 +17,37 @@
 #ifndef TINYLAMB_PRODUCT_PLAN_HPP
 #define TINYLAMB_PRODUCT_PLAN_HPP
 
-#include "executor/hash_join_mode.hpp"
 #include "expression/expression.hpp"
 #include "plan/plan.hpp"
 #include "table/table_statistics.hpp"
 
 namespace tinylamb {
+
+// Physical join configuration types owned by the executor layer
+// (executor/hash_join_mode.hpp, executor/join_kind.hpp). The plan layer only
+// carries their values opaquely; the relational factory translates them when
+// emitting executors.
+enum class HashJoinMode : uint8_t;
+enum class JoinKind : uint8_t;
+
 class ExecutorBase;
 
 class ProductPlan final : public PlanBase {
  public:
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
+              std::vector<ColumnName> right_cols);
+  ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
               std::vector<ColumnName> right_cols,
-              HashJoinMode hash_mode = HashJoinMode::kInMemory);
+              HashJoinMode hash_mode);
+  // Semi/anti hash join (decorrelated IN / EXISTS / NOT EXISTS): emits only
+  // the left child's columns and rows.
+  ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
+              std::vector<ColumnName> right_cols, HashJoinMode hash_mode,
+              JoinKind kind);
+  // Same, always executing in memory (the decorrelation rewrite in the
+  // optimizer emits this shape).
+  ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
+              std::vector<ColumnName> right_cols, JoinKind kind);
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
               const Table& right_tbl, const Index& idx,
               std::vector<ColumnName> right_cols,
@@ -59,6 +77,7 @@ class ProductPlan final : public PlanBase {
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
   [[nodiscard]] HashJoinMode GetHashJoinMode() const { return hash_mode_; }
+  [[nodiscard]] JoinKind Kind() const { return kind_; }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
@@ -70,10 +89,19 @@ class ProductPlan final : public PlanBase {
   const Table* right_tbl_;
   const Index* right_idx_;
   const TableStatistics* right_ts_;
-  HashJoinMode hash_mode_{HashJoinMode::kInMemory};
+  HashJoinMode hash_mode_{};
+  JoinKind kind_{};
   Schema output_schema_;
   TableStatistics stats_;
 };
+
+// Opaque accessors for the executor-layer enum values: the plan layer sees
+// only the forward-declared JoinKind, so callers pick a side by name instead
+// of naming enumerators.
+[[nodiscard]] bool IsSemiJoinKind(JoinKind kind);
+[[nodiscard]] bool IsAntiJoinKind(JoinKind kind);
+[[nodiscard]] JoinKind SemiJoinKind();
+[[nodiscard]] JoinKind AntiJoinKind();
 
 }  // namespace tinylamb
 

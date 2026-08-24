@@ -62,7 +62,7 @@ TEST(CommitPublicationTest, ReaderNeverSeesLaterCommitWithoutEarlierOne) {
       "commit_publication-test-" + RandomString() + ".log";
   Logger logger(log_name);
   LockManager lm;
-  TransactionManager tm(&lm, nullptr, &logger, nullptr);
+  TransactionManager tm(nullptr, &logger, nullptr);
   // Visibility is decided at version publication; durability waits would
   // only slow this test down.
   tm.SetSynchronousCommit(false);
@@ -137,7 +137,7 @@ TEST(CommitPublicationTest, SnapshotIsRepeatableAcrossConcurrentCommits) {
       "snapshot_repeatable-test-" + RandomString() + ".log";
   Logger logger(log_name);
   LockManager lm;
-  TransactionManager tm(&lm, nullptr, &logger, nullptr);
+  TransactionManager tm(nullptr, &logger, nullptr);
 
   const RowPosition rp(43, 1);
   {
@@ -413,6 +413,103 @@ TEST_F(QueueTableTest, PointRangeOnKeyPrefixResolvesHeapRows) {
   // with the heap exactly.
   EXPECT_TRUE(mismatches.empty());
   ASSERT_EQ(ctx.PreCommit(), Status::kSuccess);
+}
+
+// Regression pin for the second half of the Delivery failure chain
+// ("delivery queue delete affected too few rows"): abort-time undo restores a
+// deleted row into the FIRST free slot of its page (recovery LogUndo ->
+// Page::InsertImpl -> RowPage::InsertRow ignores log.slot), so after an
+// aborted delete whose page already had holes from earlier committed deletes,
+// the index keeps pointing at the now-vacant original slots while RowPage::
+// Read serves the still-visible MVCC version from the fallback path.  In that
+// state Table::Delete used to return kNotExists even though its own snapshot
+// read had just proved the row exists -- SELECT MIN and DELETE disagreed and
+// every later Delivery died.  The contract under test: once the snapshot read
+// sees the row, Delete must complete (index keys removed + tombstone
+// published) instead of surfacing the displaced physical image as a failure.
+TEST_F(QueueTableTest, DeleteCompletesWhenPhysicalImageWasDisplaced) {
+  LoadQueue(1, 1, 64);  // orders 1..64 x 8 lines, sequential heap layout.
+
+  // Committed deletes leave permanent holes directly below order 10's rows.
+  TransactionContext setup = database_->BeginContext();
+  StatusOr<std::shared_ptr<Table>> setup_table = setup.GetTable("new_order_t");
+  ASSERT_TRUE(setup_table.HasValue());
+  std::vector<RowPosition> nine;
+  std::vector<RowPosition> ten;
+  for (Iterator it = setup_table.Value()->BeginFullScan(setup.txn_);
+       it.IsValid(); ++it) {
+    const int order = static_cast<int>(IntValue((*it)[2]));
+    if (order == 9) {
+      nine.push_back(it.Position());
+    } else if (order == 10) {
+      ten.push_back(it.Position());
+    }
+  }
+  ASSERT_EQ(nine.size(), static_cast<size_t>(8));
+  ASSERT_EQ(ten.size(), static_cast<size_t>(8));
+  for (const RowPosition& pos : nine) {
+    ASSERT_EQ(setup_table.Value()->Delete(setup.txn_, pos), Status::kSuccess);
+  }
+  ASSERT_EQ(setup.PreCommit(), Status::kSuccess);
+
+  // An aborted delete of order 10: undo puts each image into order 9's old
+  // holes while the index entries keep targeting order 10's vacant slots.
+  TransactionContext doomed = database_->BeginContext();
+  StatusOr<std::shared_ptr<Table>> doomed_table =
+      doomed.GetTable("new_order_t");
+  ASSERT_TRUE(doomed_table.HasValue());
+  for (const RowPosition& pos : ten) {
+    ASSERT_EQ(doomed_table.Value()->Delete(doomed.txn_, pos),
+              Status::kSuccess);
+  }
+  doomed.Abort();
+
+  // Precondition: the queue-head slot no longer holds its physical image
+  // (undo restored order 10's images into order 9's old holes), yet the row
+  // stays logically reachable -- RowPage::Read serves the MVCC version from
+  // the vacant slot.  Visibility, not physical presence, must decide.
+  TransactionContext probe = database_->BeginReadOnlyContext();
+  StatusOr<std::shared_ptr<Table>> probe_table = probe.GetTable("new_order_t");
+  ASSERT_TRUE(probe_table.HasValue());
+  const RowPosition head = ten.front();
+  auto still_visible = probe_table.Value()->Read(probe.txn_, head);
+  ASSERT_TRUE(still_visible.HasValue())
+      << "aborted queue head must stay visible through its version chain";
+  ASSERT_EQ(probe.PreCommit(), Status::kSuccess);
+
+  // The contract: a snapshot-visible row must be deletable even though its
+  // physical image sits elsewhere.  (Read falls back to the version chain,
+  // so this succeeds only because visibility -- not physical presence --
+  // decides.)
+  TransactionContext ctx = database_->BeginContext();
+  StatusOr<std::shared_ptr<Table>> table = ctx.GetTable("new_order_t");
+  ASSERT_TRUE(table.HasValue());
+  EXPECT_EQ(table.Value()->Delete(ctx.txn_, head), Status::kSuccess);
+  ASSERT_EQ(ctx.PreCommit(), Status::kSuccess);
+
+  // After commit the deleted queue head is gone for fresh snapshots.  Probe
+  // with the exact four-column key: full-key ranges resolve reliably (the
+  // shorter-prefix shapes above are the separately documented index-layer
+  // defect).
+  TransactionContext verify = database_->BeginReadOnlyContext();
+  StatusOr<std::shared_ptr<Table>> vtable = verify.GetTable("new_order_t");
+  ASSERT_TRUE(vtable.HasValue());
+  const Index& vidx = vtable.Value()->GetIndex(0);
+  const std::vector<Value> head_key{Value(static_cast<int64_t>(1)),
+                                    Value(static_cast<int64_t>(1)),
+                                    Value(static_cast<int64_t>(10)),
+                                    Value(static_cast<int64_t>(1))};
+  int remaining_head = 0;
+  for (Iterator it =
+           vtable.Value()->BeginIndexScan(verify.txn_, vidx, head_key, head_key,
+                                          /*ascending=*/true);
+       it.IsValid(); ++it) {
+    ++remaining_head;
+  }
+  EXPECT_EQ(remaining_head, 0);
+  auto gone = vtable.Value()->Read(verify.txn_, head);
+  EXPECT_FALSE(gone.HasValue());
+  ASSERT_EQ(verify.PreCommit(), Status::kSuccess);
 }
 
 }  // namespace

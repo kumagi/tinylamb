@@ -24,7 +24,6 @@
 #include <unordered_set>
 
 #include "common/status_or.hpp"
-#include "database/transaction_context.hpp"
 #include "type/column_name.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
@@ -43,6 +42,7 @@ class FunctionCallExpression;
 class QueryExpression;
 class IntervalExpression;
 class SelectStatement;
+class EvaluationContext;
 
 class ExpressionBase {
  public:
@@ -71,6 +71,17 @@ class ExpressionBase {
                                        const Schema&) const {
     throw std::runtime_error("not implemented");
   }
+  // Context-aware evaluation (improvement3.md A1): subqueries and aggregates
+  // are resolved through the abstract EvaluationContext instead of database
+  // types.  The default keeps unmigrated node types working by ignoring the
+  // context; nodes override it in the recommended migration order
+  // QueryExpression -> Binary/Case/In -> FunctionCall, so nested subqueries
+  // route through the abstract interface as soon as every ancestor on their
+  // path propagates it.
+  [[nodiscard]] virtual Value Evaluate(const Row& row, const Schema& schema,
+                                       EvaluationContext&) const {
+    return Evaluate(row, schema);
+  }
   [[nodiscard]] virtual tinylamb::Type ResultType(const Schema&) const {
     throw std::runtime_error("not implemented");
   }
@@ -78,7 +89,10 @@ class ExpressionBase {
                                                   const Schema&) const {
     throw std::runtime_error("not implemented");
   }
-  virtual Status Validate(TransactionContext&, const Schema&) const {
+  // Validates the expression against the schema, resolving function
+  // signatures through EvaluationContext (improvement3.md A1: the database
+  // type stays behind the context boundary).
+  virtual Status Validate(EvaluationContext&, const Schema&) const {
     return Status::kSuccess;
   }
   [[nodiscard]] virtual std::string ToString() const = 0;

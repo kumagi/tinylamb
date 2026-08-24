@@ -25,6 +25,8 @@
 
 namespace tinylamb {
 
+class EvaluationContext;
+
 class InExpression : public ExpressionBase {
  public:
   InExpression(Expression child, std::vector<Expression> list)
@@ -35,6 +37,10 @@ class InExpression : public ExpressionBase {
   [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,
                                const Row* right,
                                const Schema& right_schema) const override;
+  // Stage 2 of the A1 migration: threads EvaluationContext down to the test
+  // value and list items.
+  [[nodiscard]] Value Evaluate(const Row& row, const Schema& schema,
+                               EvaluationContext& context) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema&) const override {
     return tinylamb::Type(TypeTag::kBigInt);
   }

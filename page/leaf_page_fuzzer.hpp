@@ -52,7 +52,7 @@ void Try(const uint8_t* data, size_t size, bool verbose) {
     Logger logger(log_name);
     LockManager lm;
     RecoveryManager rm(log_name, page_manager.GetPool());
-    TransactionManager tm(&lm, &page_manager, &logger, &rm);
+    TransactionManager tm(&page_manager, &logger, &rm);
     Transaction txn = tm.Begin();
     {
       PageRef page = page_manager.AllocateNewPage(txn, PageType::kLeafPage);
