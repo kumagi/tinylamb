@@ -4,6 +4,7 @@
 #include "common/constants.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/cast_expression.hpp"
+#include "expression/function_call_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
@@ -893,6 +894,128 @@ TEST(ExpressionRewriteTest, ExpressionChildrenRewritesCast) {
   std::vector<Expression> children = ExpressionChildren(cast);
   ASSERT_EQ(children.size(), 1);
   EXPECT_EQ(WithExpressionChildren(cast, children)->Type(), TypeTag::kCastExp);
+}
+
+namespace {
+
+Expression RangeOn(const char* column, BinaryOperation op, int64_t bound) {
+  return BinaryExpressionExp(ColumnValueExp(column), op,
+                             ConstantValueExp(Value(bound)));
+}
+
+}  // namespace
+
+TEST(ExpressionRewriteTest, RangePredicateMergeKeepsStrongerBound) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  // x > 1 AND x > 5 -> x > 5
+  Expression merged = rewriter.Rewrite(BinaryExpressionExp(
+      RangeOn("x", BinaryOperation::kGreaterThan, 1), BinaryOperation::kAnd,
+      RangeOn("x", BinaryOperation::kGreaterThan, 5)));
+  ASSERT_EQ(merged->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(merged->AsBinaryExpression().Op(), BinaryOperation::kGreaterThan);
+  EXPECT_EQ(merged->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+            Value(5));
+
+  // x < 10 AND x <= 3 -> x <= 3 (upper bounds keep the smaller value)
+  Expression upper = rewriter.Rewrite(BinaryExpressionExp(
+      RangeOn("x", BinaryOperation::kLessThan, 10), BinaryOperation::kAnd,
+      RangeOn("x", BinaryOperation::kLessThanEquals, 3)));
+  ASSERT_EQ(upper->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(upper->AsBinaryExpression().Op(),
+            BinaryOperation::kLessThanEquals);
+  EXPECT_EQ(
+      upper->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+      Value(3));
+
+  // x >= 5 AND x > 5 -> x > 5 (ties prefer the strict comparison)
+  Expression strict = rewriter.Rewrite(BinaryExpressionExp(
+      RangeOn("x", BinaryOperation::kGreaterThanEquals, 5),
+      BinaryOperation::kAnd, RangeOn("x", BinaryOperation::kGreaterThan, 5)));
+  ASSERT_EQ(strict->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(strict->AsBinaryExpression().Op(), BinaryOperation::kGreaterThan);
+
+  // Contradictions and different columns stay untouched.
+  Expression contradiction = rewriter.Rewrite(BinaryExpressionExp(
+      RangeOn("x", BinaryOperation::kGreaterThan, 5), BinaryOperation::kAnd,
+      RangeOn("x", BinaryOperation::kLessThan, 1)));
+  EXPECT_EQ(contradiction->AsBinaryExpression().Op(), BinaryOperation::kAnd);
+  Expression different_columns = rewriter.Rewrite(BinaryExpressionExp(
+      RangeOn("x", BinaryOperation::kGreaterThan, 1), BinaryOperation::kAnd,
+      RangeOn("y", BinaryOperation::kGreaterThan, 5)));
+  EXPECT_EQ(different_columns->AsBinaryExpression().Op(),
+            BinaryOperation::kAnd);
+}
+
+TEST(ExpressionRewriteTest, ComparisonOfSameExprBecomesIsNotNull) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  Expression rewritten = rewriter.Rewrite(
+      BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kEquals,
+                          ColumnValueExp("x")));
+  ASSERT_EQ(rewritten->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(rewritten->AsUnaryExpression().Op(), UnaryOperation::kIsNotNull);
+  EXPECT_EQ(rewritten->AsUnaryExpression().Child()->Type(),
+            TypeTag::kColumnValue);
+}
+
+TEST(ExpressionRewriteTest, EmptyInListFoldsToFalse) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  Expression rewritten =
+      rewriter.Rewrite(InExpressionExp(ColumnValueExp("x"), {}));
+  ASSERT_EQ(rewritten->Type(), TypeTag::kConstantValue);
+  EXPECT_FALSE(rewritten->AsConstantValue().GetValue().Truthy());
+
+  // A singleton list is handled by the pre-existing singleton_in rule.
+  Expression kept = rewriter.Rewrite(InExpressionExp(
+      ColumnValueExp("x"), {ConstantValueExp(Value(1))}));
+  ASSERT_EQ(kept->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(kept->AsBinaryExpression().Op(), BinaryOperation::kEquals);
+}
+
+TEST(ExpressionRewriteTest, CoalesceFlattensNestedCoalesce) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  Expression rewritten = rewriter.Rewrite(FunctionCallExp(
+      "coalesce",
+      {FunctionCallExp("coalesce",
+                       {ColumnValueExp("a"), ColumnValueExp("b")}),
+       ColumnValueExp("c")}));
+  ASSERT_EQ(rewritten->Type(), TypeTag::kFunctionCallExp);
+  const auto& func = rewritten->AsFunctionCallExpression();
+  EXPECT_EQ(func.FuncName(), "coalesce");
+  ASSERT_EQ(func.Args().size(), 3U);
+  EXPECT_EQ(func.Args()[0]->AsColumnValue().GetName(), "a");
+  EXPECT_EQ(func.Args()[2]->AsColumnValue().GetName(), "c");
+}
+
+TEST(ExpressionRewriteTest, AbsOfAbsCollapses) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  Expression rewritten = rewriter.Rewrite(
+      FunctionCallExp("abs", {FunctionCallExp("abs", {ColumnValueExp("x")})}));
+  ASSERT_EQ(rewritten->Type(), TypeTag::kFunctionCallExp);
+  EXPECT_EQ(rewritten->AsFunctionCallExpression().FuncName(), "abs");
+  EXPECT_EQ(rewritten->AsFunctionCallExpression().Args().size(), 1U);
+  EXPECT_EQ(rewritten->AsFunctionCallExpression().Args().front()->Type(),
+            TypeTag::kColumnValue);
+}
+
+TEST(ExpressionRewriteTest, RedundantCastRemovalDropsIdentityCast) {
+  using namespace expression_dsl;
+  ExpressionRuleSet rules;
+  for (const ExpressionRule& rule : ExpressionRuleSet::Default().Rules()) {
+    if (rule.Name() == "redundant_cast_removal") { rules.Add(rule);
+}
+  }
+  Expression arithmetic = BinaryExpressionExp(ConstantValueExp(Value(1)),
+                                               BinaryOperation::kAdd,
+                                               ConstantValueExp(Value(2)));
+  Expression rewritten =
+      ExpressionRewriter(rules).Rewrite(CastExpressionExp(arithmetic, "INT64"));
+  EXPECT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+
+  // Non-matching target types are kept.
+  Expression kept = ExpressionRewriter(rules).Rewrite(
+      CastExpressionExp(arithmetic, "VARCHAR"));
+  EXPECT_EQ(kept->Type(), TypeTag::kCastExp);
 }
 
 }  // namespace tinylamb

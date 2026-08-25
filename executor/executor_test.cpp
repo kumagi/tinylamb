@@ -3339,4 +3339,115 @@ TEST_F(ExecutorTest, SortExternalSpillDescendingPreservesPositions) {
   EXPECT_EQ(count, 300U);
 }
 
+TEST_F(ExecutorTest, HashJoinVarcharAndDoubleKeysAndGrowth) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, left_tbl,
+      rs_->CreateTable(ctx, Schema{"LeftTbl",
+                                   {Column("vkey", ValueType::kVarChar),
+                                    Column("dkey", ValueType::kDouble),
+                                    Column("val", ValueType::kInt64)}}));
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, right_tbl,
+      rs_->CreateTable(ctx, Schema{"RightTbl",
+                                   {Column("vkey", ValueType::kVarChar),
+                                    Column("dkey", ValueType::kDouble),
+                                    Column("val", ValueType::kInt64)}}));
+  std::vector<Row> left_rows;
+  std::vector<Row> right_rows;
+  for (int i = 0; i < 30; ++i) {
+    std::string v = "long_varchar_key_" + std::to_string(i);
+    double d = static_cast<double>(i) * 1.5;
+    left_rows.emplace_back(Row({Value(std::string(v)), Value(d), Value(int64_t{i})}));
+    if (i % 2 == 0) {
+      right_rows.emplace_back(Row({Value(std::string(v)), Value(d), Value(int64_t{i * 10})}));
+    }
+  }
+  for (const auto& r : left_rows) {
+    ASSERT_SUCCESS(left_tbl.Insert(ctx.txn_, r).GetStatus());
+  }
+  for (const auto& r : right_rows) {
+    ASSERT_SUCCESS(right_tbl.Insert(ctx.txn_, r).GetStatus());
+  }
+
+  // Hash join on varchar key (> 8 chars, triggers grow and multi-block encoding)
+  HashJoin hj_varchar(std::make_shared<FullScan>(ctx.txn_, left_tbl), {0},
+                      std::make_shared<FullScan>(ctx.txn_, right_tbl), {0});
+  size_t count_v = 0;
+  Row r;
+  while (hj_varchar.Next(&r, nullptr)) {
+    ++count_v;
+  }
+  EXPECT_EQ(count_v, 15U);
+
+  // Hash join on double key
+  HashJoin hj_double(std::make_shared<FullScan>(ctx.txn_, left_tbl), {1},
+                     std::make_shared<FullScan>(ctx.txn_, right_tbl), {1});
+  size_t count_d = 0;
+  while (hj_double.Next(&r, nullptr)) {
+    ++count_d;
+  }
+  EXPECT_EQ(count_d, 15U);
+}
+
+TEST_F(ExecutorTest, AggregationTypedConstantFastPath) {
+  std::vector<Row> rows;
+  for (int64_t i = 0; i < 100; ++i) {
+    rows.emplace_back(std::vector<Value>{Value(i)});
+  }
+  const Schema schema("s", {Column("v", ValueType::kInt64)});
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("sum_c", AggregateExpressionExp(AggregationType::kSum,
+                                                      ConstantValueExp(Value(int64_t{1})))),
+      NamedExpression("count_c", AggregateExpressionExp(AggregationType::kCount,
+                                                        ConstantValueExp(Value(int64_t{42})))),
+      NamedExpression("min_c", AggregateExpressionExp(AggregationType::kMin,
+                                                      ConstantValueExp(Value(int64_t{5})))),
+      NamedExpression("max_c", AggregateExpressionExp(AggregationType::kMax,
+                                                      ConstantValueExp(Value(int64_t{5}))))};
+  AggregationExecutor aggregate(
+      std::make_shared<ConstantExecutor>(std::move(rows)), schema,
+      std::move(aggregates), 64);
+  Row result;
+  ASSERT_TRUE(aggregate.Next(&result, nullptr));
+  EXPECT_EQ(result[0], Value(int64_t{100}));
+  EXPECT_EQ(result[1], Value(int64_t{100}));
+  EXPECT_EQ(result[2], Value(int64_t{5}));
+  EXPECT_EQ(result[3], Value(int64_t{5}));
+}
+
+TEST_F(ExecutorTest, ParallelAggregationLogicalAndOr) {
+  std::vector<Row> rows = {
+      Row({Value(int64_t{1}), Value(int64_t{1})}),
+      Row({Value(int64_t{1}), Value(int64_t{0})}),
+      Row({Value(int64_t{1}), Value(int64_t{1})})};
+  const Schema schema("s", {Column("c1", ValueType::kInt64),
+                            Column("c2", ValueType::kInt64)});
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("and1", AggregateExpressionExp(
+                                  AggregationType::kLogicalAnd,
+                                  BinaryExpressionExp(ColumnValueExp("c1"),
+                                                      BinaryOperation::kAdd,
+                                                      ConstantValueExp(Value(int64_t{0}))))),
+      NamedExpression("and2", AggregateExpressionExp(
+                                  AggregationType::kLogicalAnd,
+                                  BinaryExpressionExp(ColumnValueExp("c2"),
+                                                      BinaryOperation::kAdd,
+                                                      ConstantValueExp(Value(int64_t{0}))))),
+      NamedExpression("or2", AggregateExpressionExp(
+                                 AggregationType::kLogicalOr,
+                                 BinaryExpressionExp(ColumnValueExp("c2"),
+                                                     BinaryOperation::kAdd,
+                                                     ConstantValueExp(Value(int64_t{0})))))};
+  ParallelAggregationExecutor agg(
+      std::make_shared<ConstantExecutor>(std::move(rows)), schema,
+      std::move(aggregates), 64);
+  Row result;
+  ASSERT_TRUE(agg.Next(&result, nullptr));
+  EXPECT_EQ(result[0], Value(int64_t{1}));
+  EXPECT_EQ(result[1], Value(int64_t{0}));
+  EXPECT_EQ(result[2], Value(int64_t{1}));
+}
+
 }  // namespace tinylamb
+

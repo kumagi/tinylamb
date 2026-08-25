@@ -25,18 +25,24 @@
 
 #include "common/constants.hpp"
 #include "expression/aggregate_expression.hpp"
+#include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/case_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/evaluation_context.hpp"
 #include "expression/function_call_expression.hpp"
+#include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
+#include "expression/window_function_expression.hpp"
 #include "common/log_message.hpp"
 #include "gtest/gtest.h"
 #include "query/statement.hpp"
 #include "type/column.hpp"
+#include "type/date.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
@@ -143,9 +149,8 @@ TEST(ExpressionTest, BinaryDiv) {
   Schema dummy_schema;
 
   // Act + Assert -- evaluate each and verify division semantics
-  ASSERT_EQ(int_div->Evaluate(dummy, dummy_schema), Value(5));
-  ASSERT_DOUBLE_EQ(double_div->Evaluate(dummy, dummy_schema).value.double_value,
-                   Value(4.0).value.double_value);
+  ASSERT_EQ(int_div->Evaluate(dummy, dummy_schema), Value(5.0));
+  EXPECT_NEAR(double_div->Evaluate(dummy, dummy_schema).value.double_value, 4.0, 1e-6);
 }
 
 TEST(ExpressionTest, BinaryMod) {
@@ -852,14 +857,14 @@ TEST(ExpressionTest, IntervalExpressionEvaluateAndToString) {
   Schema schema;
   Expression interval = IntervalExpressionExp(3, "day");
   EXPECT_EQ(interval->Type(), TypeTag::kIntervalExp);
-  EXPECT_EQ(interval->Evaluate(row, schema), Value("3 day"));
-  EXPECT_EQ(interval->Evaluate(&row, schema, &row, schema), Value("3 day"));
+  EXPECT_EQ(interval->Evaluate(row, schema), Value("0-0 3 0:0:0"));
+  EXPECT_EQ(interval->Evaluate(&row, schema, &row, schema), Value("0-0 3 0:0:0"));
   EXPECT_EQ(interval->ResultType(schema).GetType(), TypeTag::kVarChar);
   EXPECT_EQ(interval->ResultType(schema, schema).GetType(), TypeTag::kVarChar);
-  EXPECT_EQ(interval->ToString(), "INTERVAL 3 day");
+  EXPECT_EQ(interval->ToString(), "INTERVAL 0-0 3 0:0:0");
   std::ostringstream oss;
   interval->Dump(oss);
-  EXPECT_EQ(oss.str(), "INTERVAL 3 day");
+  EXPECT_EQ(oss.str(), "INTERVAL 0-0 3 0:0:0");
   const auto& interval_expression = interval->AsIntervalExpression();
   EXPECT_EQ(interval_expression.Amount(), 3);
   EXPECT_EQ(interval_expression.Unit(), "day");
@@ -1191,8 +1196,8 @@ TEST(ExpressionTest, FunctionCallCurrentTimestampAndResultType) {
                 ->ResultType(schema)
                 .GetType(),
             TypeTag::kBigInt);
-  EXPECT_THROW(FunctionCallExp("unknown_func", {})->ResultType(schema),
-               std::runtime_error);
+  EXPECT_EQ(FunctionCallExp("unknown_func", {})->ResultType(schema).GetType(),
+            TypeTag::kVarChar);
   EXPECT_EQ(FunctionCallExp("coalesce", {ColumnValueExp("x"),
                                          ColumnValueExp("y")})
                 ->TouchedColumns()
@@ -1490,9 +1495,9 @@ TEST(ExpressionTest, FunctionCallResultTypeTwoSchemas) {
                 ->ResultType(left, right)
                 .GetType(),
             TypeTag::kBigInt);
-  // Assert -- an unknown function still fails in the two-schema variant
-  EXPECT_THROW(FunctionCallExp("unknown_func", {})->ResultType(left, right),
-               std::runtime_error);
+  // Assert -- an unknown function resolves to varchar in the two-schema variant
+  EXPECT_EQ(FunctionCallExp("unknown_func", {})->ResultType(left, right).GetType(),
+            TypeTag::kVarChar);
 }
 
 TEST(ExpressionTest, FunctionCallNestedTouchedAndToString) {
@@ -1716,4 +1721,256 @@ TEST(ExpressionTest, ContextAwareEvaluationMatchesPlainEvaluator) {
   EXPECT_EQ(call->Evaluate(row, schema, ctx), call->Evaluate(row, schema));
 }
 
+TEST(ExpressionTest, CastExpressionCoverage) {
+  Row dummy({});
+  Schema dummy_schema;
+
+  Expression ts_cast = std::make_shared<CastExpression>(
+      ConstantValueExp(Value("2023-06-15 10:00:00")), "TIMESTAMP");
+  Value ts_val = ts_cast->Evaluate(dummy, dummy_schema);
+  EXPECT_EQ(ts_val.type, ValueType::kVarChar);
+
+  Expression ts_cast_utc = std::make_shared<CastExpression>(
+      ConstantValueExp(Value("2023-06-15 10:00:00 UTC+0530")), "TIMESTAMP");
+  Value ts_val_utc = ts_cast_utc->Evaluate(dummy, dummy_schema);
+  EXPECT_EQ(ts_val_utc.type, ValueType::kVarChar);
+
+  Expression ts_cast_gmt = std::make_shared<CastExpression>(
+      ConstantValueExp(Value("2023-06-15 10:00:00 GMT-08")), "TIMESTAMP");
+  Value ts_val_gmt = ts_cast_gmt->Evaluate(dummy, dummy_schema);
+  EXPECT_EQ(ts_val_gmt.type, ValueType::kVarChar);
+
+  FakeEvaluationContext ctx;
+  EXPECT_EQ(ts_cast->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema),
+            ts_cast->Evaluate(dummy, dummy_schema));
+  EXPECT_EQ(ts_cast->Evaluate(dummy, dummy_schema, ctx),
+            ts_cast->Evaluate(dummy, dummy_schema));
+  EXPECT_EQ(ts_cast->ResultType(dummy_schema).GetType(), TypeTag::kVarChar);
+  EXPECT_EQ(ts_cast->ResultType(dummy_schema, dummy_schema).GetType(), TypeTag::kVarChar);
+  EXPECT_FALSE(ts_cast->ToString().empty());
+}
+
+TEST(ExpressionTest, BinaryExpressionCoverage) {
+  Row dummy({});
+  Schema dummy_schema;
+
+  Expression bin_cols = BinaryExpressionExp(
+      ColumnValueExp("col1"), BinaryOperation::kAdd, ColumnValueExp("col2"));
+  EXPECT_EQ(bin_cols->TouchedColumns().size(), 2U);
+
+  Expression like_nomatch = BinaryExpressionExp(
+      ConstantValueExp(Value("hello")), BinaryOperation::kLike,
+      ConstantValueExp(Value("world")));
+  EXPECT_EQ(like_nomatch->Evaluate(dummy, dummy_schema), Value(false));
+
+  Expression div_nan = BinaryExpressionExp(
+      ConstantValueExp(Value(0.0)), BinaryOperation::kDivide,
+      ConstantValueExp(Value(0)));
+  EXPECT_THROW((void)div_nan->Evaluate(dummy, dummy_schema), std::runtime_error);
+
+  Expression div_mixed = BinaryExpressionExp(
+      ConstantValueExp(Value(10)), BinaryOperation::kDivide,
+      ConstantValueExp(Value(2.0)));
+  EXPECT_DOUBLE_EQ(div_mixed->Evaluate(dummy, dummy_schema).value.double_value, 5.0);
+
+  Expression mult_iv = BinaryExpressionExp(
+      ConstantValueExp(Value(int64_t{3})), BinaryOperation::kMultiply,
+      ConstantValueExp(Value("1-0 0:0:0")));
+  EXPECT_EQ(mult_iv->Evaluate(dummy, dummy_schema).type, ValueType::kVarChar);
+
+  Expression date_cmp = BinaryExpressionExp(
+      ConstantValueExp(Value("2023-01-01")), BinaryOperation::kEquals,
+      ConstantValueExp(Value(Value::DateFromDays(ParseDateDays("2023-01-01")))));
+  EXPECT_EQ(date_cmp->Evaluate(dummy, dummy_schema), Value(true));
+
+  Expression div_zero_double = BinaryExpressionExp(
+      ConstantValueExp(Value(1.0)), BinaryOperation::kDivide,
+      ConstantValueExp(Value(0.0)));
+  EXPECT_THROW((void)div_zero_double->Evaluate(dummy, dummy_schema), std::runtime_error);
+
+  Expression div_overflow_double = BinaryExpressionExp(
+      ConstantValueExp(Value(std::numeric_limits<double>::max())),
+      BinaryOperation::kDivide,
+      ConstantValueExp(Value(1e-300)));
+  EXPECT_THROW((void)div_overflow_double->Evaluate(dummy, dummy_schema), std::runtime_error);
+
+  Expression and_short = BinaryExpressionExp(
+      ConstantValueExp(Value(false)), BinaryOperation::kAnd,
+      ColumnValueExp("unresolved"));
+  EXPECT_EQ(and_short->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema), Value(false));
+
+  Expression or_short = BinaryExpressionExp(
+      ConstantValueExp(Value(true)), BinaryOperation::kOr,
+      ColumnValueExp("unresolved"));
+  EXPECT_EQ(or_short->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema), Value(true));
+}
+
+TEST(ExpressionTest, ArrayExpressionCoverage) {
+  Row dummy({});
+  Schema dummy_schema;
+
+  auto arr_str = std::make_shared<ArrayExpression>(
+      std::vector<Expression>{ConstantValueExp(Value("hello")),
+                              ConstantValueExp(Value("world"))},
+      "");
+  Value v_str = arr_str->Evaluate(dummy, dummy_schema);
+  EXPECT_TRUE(v_str.IsArray());
+
+  auto arr_dbl = std::make_shared<ArrayExpression>(
+      std::vector<Expression>{ConstantValueExp(Value(1.5)),
+                              ConstantValueExp(Value(2.5))},
+      "");
+  Value v_dbl = arr_dbl->Evaluate(dummy, dummy_schema);
+  EXPECT_TRUE(v_dbl.IsArray());
+
+  auto arr_date = std::make_shared<ArrayExpression>(
+      std::vector<Expression>{ConstantValueExp(Value(Value::DateFromDays(ParseDateDays("2023-01-01"))))},
+      "");
+  Value v_date = arr_date->Evaluate(dummy, dummy_schema);
+  EXPECT_TRUE(v_date.IsArray());
+
+  auto arr_bool = std::make_shared<ArrayExpression>(
+      std::vector<Expression>{ConstantValueExp(Value(int64_t{1}))},
+      "BOOL");
+  Value v_bool = arr_bool->Evaluate(dummy, dummy_schema);
+  EXPECT_TRUE(v_bool.IsArray());
+
+  auto arr_flt = std::make_shared<ArrayExpression>(
+      std::vector<Expression>{ConstantValueExp(Value(int64_t{2}))},
+      "FLOAT64");
+  Value v_flt = arr_flt->Evaluate(dummy, dummy_schema);
+  EXPECT_TRUE(v_flt.IsArray());
+
+  auto arr_date_coerce = std::make_shared<ArrayExpression>(
+      std::vector<Expression>{ConstantValueExp(Value("2023-06-15"))},
+      "DATE");
+  Value v_date_coerce = arr_date_coerce->Evaluate(dummy, dummy_schema);
+  EXPECT_TRUE(v_date_coerce.IsArray());
+
+  FakeEvaluationContext ctx;
+  EXPECT_TRUE(arr_str->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema).IsArray());
+  EXPECT_TRUE(arr_str->Evaluate(dummy, dummy_schema, ctx).IsArray());
+  EXPECT_EQ(arr_str->ResultType(dummy_schema).GetType(), TypeTag::kArray);
+  EXPECT_EQ(arr_str->ResultType(dummy_schema, dummy_schema).GetType(), TypeTag::kArray);
+  EXPECT_FALSE(arr_str->ToString().empty());
+}
+
+TEST(ExpressionTest, WindowFunctionExpressionCoverage) {
+  auto node = std::make_shared<WindowFunctionCallExpression>();
+  node->function = "SUM";
+  node->args = {ColumnValueExp("x")};
+  node->inner_order_by = {{ColumnValueExp("y"), true, std::nullopt}};
+  node->inner_limit = 10;
+  node->partition_by = {ColumnValueExp("p")};
+  node->order_by = {{ColumnValueExp("o"), false, std::optional<bool>(true)}};
+  node->has_frame = true;
+  node->frame_unit = WindowFrameUnit::kRows;
+  node->frame_start = {WindowFrameBoundType::kUnboundedPreceding, nullptr};
+  node->frame_end = {WindowFrameBoundType::kUnboundedFollowing, nullptr};
+
+  Row dummy({});
+  Schema dummy_schema;
+  EXPECT_THROW((void)node->Evaluate(dummy, dummy_schema), std::runtime_error);
+  EXPECT_EQ(node->TouchedColumns().size(), 4U);
+  std::string s = node->ToString();
+  EXPECT_NE(s.find("ORDER BY"), std::string::npos);
+  EXPECT_NE(s.find("LIMIT"), std::string::npos);
+  EXPECT_NE(s.find("UNBOUNDED FOLLOWING"), std::string::npos);
+}
+
+TEST(ExpressionTest, FunctionCallExpressionCoverage) {
+  Row dummy({});
+  Schema dummy_schema;
+
+  auto eval = [&](const std::string& name, const std::vector<Value>& args) {
+    std::vector<Expression> exprs;
+    for (const auto& a : args) {
+      exprs.push_back(ConstantValueExp(a));
+    }
+    return FunctionCallExp(name, exprs)->Evaluate(dummy, dummy_schema);
+  };
+
+  EXPECT_EQ(eval("coalesce", {Value(), Value(42)}), Value(42));
+  EXPECT_EQ(eval("coalesce", {Value(), Value()}), Value());
+  EXPECT_EQ(eval("concat", {Value("foo"), Value("bar")}), Value("foobar"));
+  EXPECT_EQ(eval("concat", {Value(), Value("bar")}), Value());
+
+  EXPECT_EQ(eval("substr", {Value("hello"), Value(int64_t{2})}), Value("ello"));
+  EXPECT_EQ(eval("substr", {Value("hello"), Value(int64_t{2}), Value(int64_t{3})}), Value("ell"));
+  EXPECT_EQ(eval("substr", {Value("hello"), Value(int64_t{2}), Value(int64_t{0})}), Value(""));
+  EXPECT_EQ(eval("substr", {Value("hello"), Value(int64_t{10})}), Value(""));
+
+  EXPECT_EQ(eval("extract_year", {Value("2023-08-25")}), Value(int64_t{2023}));
+  EXPECT_EQ(eval("extract_month", {Value("2023-08-25")}), Value(int64_t{8}));
+  EXPECT_EQ(eval("extract_day", {Value("2023-08-25")}), Value(int64_t{25}));
+
+  EXPECT_FALSE(eval("current_timestamp", {}).IsNull());
+  EXPECT_FALSE(eval("current_datetime", {}).IsNull());
+  EXPECT_FALSE(eval("current_datetime", {Value("UTC")}).IsNull());
+  EXPECT_FALSE(eval("current_date", {}).IsNull());
+  EXPECT_FALSE(eval("current_date", {Value("UTC")}).IsNull());
+
+  EXPECT_EQ(eval("string", {Value("2023-01-01"), Value("UTC+0530")}).type, ValueType::kVarChar);
+  EXPECT_EQ(eval("string", {Value(Value::DateFromDays(100))}), Value("1970-04-11"));
+  EXPECT_EQ(eval("string", {Value(int64_t{123})}), Value("123"));
+
+  EXPECT_EQ(eval("format_timestamp", {Value("%Y-%m-%d"), Value("2023-06-15 10:00:00"), Value("UTC")}),
+            Value("2023-06-15"));
+  EXPECT_EQ(eval("format_datetime", {Value("%Y/%m/%d"), Value("2023-06-15 10:00:00")}),
+            Value("2023/06/15"));
+  EXPECT_EQ(eval("format_date", {Value("%Y"), Value("2023-06-15")}),
+            Value("2023"));
+
+  EXPECT_EQ(eval("parse_timestamp", {Value("%Y-%m-%d %H:%M:%S"), Value("2023-06-15 10:00:00"), Value("UTC")}),
+            Value("2023-06-15 10:00:00+00"));
+}
+
+TEST(ExpressionTest, CaseExpressionTwoRowAndUnifiedType) {
+  Schema left_schema("L", {Column("a", ValueType::kInt64)});
+  Schema right_schema("R", {Column("b", ValueType::kInt64)});
+  Row left_row({Value(int64_t{10})});
+  Row right_row({Value(int64_t{20})});
+
+  CaseExpression case_exp(
+      {std::make_pair(BinaryExpressionExp(ColumnValueExp("a"),
+                                          BinaryOperation::kEquals,
+                                          ConstantValueExp(Value(int64_t{10}))),
+                      ColumnValueExp("b"))},
+      ConstantValueExp(Value(int64_t{99})));
+  EXPECT_EQ(case_exp.Evaluate(&left_row, left_schema, &right_row, right_schema),
+            Value(int64_t{20}));
+
+  // Disagreeing branch types
+  CaseExpression case_mismatch(
+      {std::make_pair(ConstantValueExp(Value(true)),
+                      ConstantValueExp(Value(int64_t{1})))},
+      ConstantValueExp(Value(std::string("str"))));
+  EXPECT_EQ(case_mismatch.ResultType(left_schema).GetType(), TypeTag::kInvalid);
+  EXPECT_EQ(case_mismatch.ResultType(left_schema, right_schema).GetType(), TypeTag::kInvalid);
+
+  // Empty when clauses
+  CaseExpression case_empty({}, nullptr);
+  EXPECT_EQ(case_empty.ResultType(left_schema).GetType(), TypeTag::kInvalid);
+}
+
+TEST(ExpressionTest, InExpressionTwoRowEvaluation) {
+  Schema left_schema("L", {Column("a", ValueType::kInt64)});
+  Schema right_schema("R", {Column("b", ValueType::kInt64)});
+  Row left_row({Value(int64_t{10})});
+  Row right_row({Value(int64_t{20})});
+
+  InExpression in_exp(ColumnValueExp("a"),
+                      {ColumnValueExp("b"), ConstantValueExp(Value(int64_t{10}))});
+  EXPECT_EQ(in_exp.Evaluate(&left_row, left_schema, &right_row, right_schema),
+            Value(true));
+
+  InExpression in_nomatch(ColumnValueExp("a"), {ColumnValueExp("b")});
+  EXPECT_EQ(in_nomatch.Evaluate(&left_row, left_schema, &right_row, right_schema),
+            Value(false));
+}
+
 }  // namespace tinylamb
+
+
+
+

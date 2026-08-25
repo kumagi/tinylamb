@@ -847,4 +847,83 @@ TEST_F(TableTest, WritesAcrossTwoRecoveryCyclesAccumulate) {
   EXPECT_EQ(seen, 2U);
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
+
+TEST_F(TableTest, InsertMultiplePagesAndScan) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
+  for (int i = 0; i < 20; ++i) {
+    std::string large_payload(4096, 'a');
+    Row r({Value(i), Value(std::move(large_payload)), Value(i * 1.5)});
+    ASSERT_SUCCESS(tbl->Insert(ctx.txn_, r).GetStatus());
+  }
+
+  size_t count = 0;
+  for (Iterator iter = tbl->BeginFullScan(ctx.txn_); iter.IsValid(); ++iter) {
+    ++count;
+    EXPECT_EQ((*iter).values_.size(), 3U);
+  }
+  EXPECT_EQ(count, 20U);
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(TableTest, UpdateWithIndexCoverage) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
+  Row initial_row({Value(100), Value("initial"), Value(1.0)});
+  ASSIGN_OR_ASSERT_FAIL(RowPosition, pos, tbl->Insert(ctx.txn_, initial_row));
+
+  Row updated_row({Value(200), Value("updated"), Value(2.0)});
+  ASSERT_SUCCESS(tbl->Update(ctx.txn_, pos, updated_row).GetStatus());
+
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, read_back, tbl->Read(ctx.txn_, pos));
+  EXPECT_EQ(read_back[0], Value(200));
+  EXPECT_EQ(read_back[1], Value("updated"));
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
+TEST_F(TableTest, InsertTooBigDataRejected) {
+  std::string huge_payload(65536, 'x');
+  Row huge_row({Value(1), Value(std::move(huge_payload)), Value(1.0)});
+  std::vector<char> buf(huge_row.Size());
+  EXPECT_THROW((void)huge_row.Serialize(buf.data()), std::runtime_error);
+}
+
+TEST_F(TableTest, FullScanIteratorProjectionAndKeyFilter) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable(kTableName));
+  for (int i = 0; i < 10; ++i) {
+    Row r({Value(i), Value("row_" + std::to_string(i)), Value(static_cast<double>(i))});
+    ASSERT_SUCCESS(tbl->Insert(ctx.txn_, r).GetStatus());
+  }
+
+  // Projection: only column 0 and column 2
+  std::vector<slot_t> proj = {0, 2};
+  std::unordered_set<int64_t> key_set = {2, 5, 8};
+  Iterator iter = tbl->BeginFullScan(ctx.txn_, proj, &key_set, 0, nullptr);
+  size_t count = 0;
+  for (; iter.IsValid(); ++iter) {
+    ++count;
+    Row r = *iter;
+    EXPECT_EQ(r.values_.size(), 2U);
+  }
+  EXPECT_EQ(count, 3U);
+
+  // Morsel scan
+  auto morsels = tbl->BuildScanMorsels(ctx.txn_, 2);
+  EXPECT_FALSE(morsels.empty());
+  Iterator m_iter = tbl->BeginMorselScan(ctx.txn_, morsels.front(), proj);
+  EXPECT_TRUE(m_iter.IsValid());
+
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
 }  // namespace tinylamb
+
+
+
+
+
+

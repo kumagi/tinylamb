@@ -124,4 +124,22 @@ TEST(RowTest, RowsWithNullKeysWorkInUnorderedMap) {
   EXPECT_EQ(groups[Row({Value(), Value("a")})], 2U);
 }
 
+TEST(RowTest, TryPeekIntegerCoverage) {
+  const Schema schema("s", {Column("name", ValueType::kVarChar),
+                            Column("id", ValueType::kInt64)});
+  const Row row({Value("hello"), Value(int64_t{42})});
+  std::vector<char> buf(row.Size());
+  row.Serialize(buf.data());
+  EXPECT_EQ(Row::TryPeekInteger(buf.data(), schema, 0), std::nullopt);
+  EXPECT_EQ(Row::TryPeekInteger(buf.data(), schema, 1), 42);
+  EXPECT_EQ(Row::TryPeekInteger(buf.data(), schema, 5), std::nullopt);
+}
+
+TEST(RowTest, ExtractOutOfBoundsReturnsEmpty) {
+  const Row row({Value(1), Value(2)});
+  const Row extracted = row.Extract({5});
+  EXPECT_EQ(extracted.values_.size(), 0U);
+}
+
 }  // namespace tinylamb
+

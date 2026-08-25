@@ -125,6 +125,59 @@ bool IsInt64Constant(const Expression& expression) {
   return !constant.IsNull() && constant.type == ValueType::kInt64;
 }
 
+// One side of a conjunctive range predicate, normalized to
+// `<operand> <op> <constant>` with op in {<, <=, >, >=}.
+struct RangeBound {
+  Expression operand;
+  BinaryOperation op{BinaryOperation::kEquals};
+  Expression constant;
+};
+
+bool TryExtractRangeBound(const Expression& expression, RangeBound* bound) {
+  if (!expression || expression->Type() != TypeTag::kBinaryExp) {
+    return false;
+  }
+  const auto& binary = expression->AsBinaryExpression();
+  switch (binary.Op()) {
+    case BinaryOperation::kLessThan:
+    case BinaryOperation::kLessThanEquals:
+    case BinaryOperation::kGreaterThan:
+    case BinaryOperation::kGreaterThanEquals:
+      break;
+    default:
+      return false;
+  }
+  const bool left_constant = IsConstant(binary.Left());
+  const bool right_constant = IsConstant(binary.Right());
+  if (left_constant == right_constant) { return false;
+}
+  if (left_constant) {
+    *bound = {.operand = binary.Right(),
+              .op = FlipComparison(binary.Op()),
+              .constant = binary.Left()};
+  } else {
+    *bound = {.operand = binary.Left(),
+              .op = binary.Op(),
+              .constant = binary.Right()};
+  }
+  return true;
+}
+
+std::optional<double> NumericBoundValue(const Expression& constant) {
+  if (!IsConstant(constant)) { return std::nullopt;
+}
+  const Value value = constant->AsConstantValue().GetValue();
+  if (value.IsNull()) { return std::nullopt;
+}
+  if (value.type == ValueType::kInt64) {
+    return static_cast<double>(value.value.int_value);
+  }
+  if (value.type == ValueType::kDouble) {
+    return value.value.double_value;
+  }
+  return std::nullopt;
+}
+
 bool HasLikeWildcard(std::string_view pattern) {
   return pattern.find('%') != std::string_view::npos ||
          pattern.find('_') != std::string_view::npos;
@@ -776,6 +829,157 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         } catch (const std::exception&) {
           return Expression{};
         }
+      }));
+    // a > 1 AND a > 5 -> a > 5 (range merge). Dropping the implied conjunct
+    // is exact under three-valued logic: both bounds yield UNKNOWN for NULL,
+    // and one implies the other for every non-NULL value.
+    built.Add(ExpressionRule(
+      "range_predicate_merge",
+      Binary(BinaryOperation::kAnd, Any("left"), Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        RangeBound left_bound;
+        RangeBound right_bound;
+        if (!TryExtractRangeBound(bindings.at("left"), &left_bound) ||
+            !TryExtractRangeBound(bindings.at("right"), &right_bound)) {
+          return Expression{};
+        }
+        if (!Same(left_bound.operand, right_bound.operand)) {
+          return Expression{};
+        }
+        const bool left_lower =
+            left_bound.op == BinaryOperation::kGreaterThan ||
+            left_bound.op == BinaryOperation::kGreaterThanEquals;
+        const bool right_lower =
+            right_bound.op == BinaryOperation::kGreaterThan ||
+            right_bound.op == BinaryOperation::kGreaterThanEquals;
+        // Contradictions (a > 5 AND a < 3) are kept as-is: collapsing them to
+        // FALSE would change NULL-row results from UNKNOWN to FALSE.
+        if (left_lower != right_lower) { return Expression{};
+}
+        const auto left_value = NumericBoundValue(left_bound.constant);
+        const auto right_value = NumericBoundValue(right_bound.constant);
+        if (!left_value || !right_value) { return Expression{};
+}
+        // Mixing int64 and double bounds through double conversion could
+        // declare distinct bounds equal; merge only same-representation pairs.
+        if (left_bound.constant->AsConstantValue().GetValue().type !=
+            right_bound.constant->AsConstantValue().GetValue().type) {
+          return Expression{};
+        }
+        const bool left_strict =
+            left_bound.op == BinaryOperation::kGreaterThan ||
+            left_bound.op == BinaryOperation::kLessThan;
+        const bool right_strict =
+            right_bound.op == BinaryOperation::kGreaterThan ||
+            right_bound.op == BinaryOperation::kLessThan;
+        const double l = *left_value;
+        const double r = *right_value;
+        // Lower bound dominates when its value is larger; upper bound when it
+        // is smaller; ties prefer the strict comparison.
+        const bool left_dominates =
+            (left_lower ? l > r : l < r) ||
+            (l == r && left_strict && !right_strict);
+        const bool right_dominates =
+            (left_lower ? r > l : r < l) ||
+            (l == r && right_strict && !left_strict);
+        const RangeBound* stronger = nullptr;
+        if (left_dominates) {
+          stronger = &left_bound;
+        } else if (right_dominates) {
+          stronger = &right_bound;
+        }
+        if (!stronger) { return Expression{};
+}
+        return BinaryExpressionExp(stronger->operand, stronger->op,
+                                   stronger->constant);
+      }));
+    built.Add(ExpressionRule(
+      "comparison_of_same_expr",
+      Binary(BinaryOperation::kEquals, Any("x"), Any("x")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        // x = x is TRUE iff x is not NULL and otherwise FALSE/UNKNOWN-free:
+        // exactly the meaning of x IS NOT NULL under three-valued logic.
+        return UnaryExpressionExp(bindings.at("x"),
+                                  UnaryOperation::kIsNotNull);
+      }));
+    built.Add(ExpressionRule(
+      "in_empty_list", Is(TypeTag::kInExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& in = expression->AsInExpression();
+        if (!in.list_.empty()) { return Expression{};
+}
+        // x IN () is FALSE even when x is NULL.
+        return ConstantValueExp(Value(false));
+      }));
+    built.Add(ExpressionRule(
+      "coalesce_flatten", Is(TypeTag::kFunctionCallExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& func = expression->AsFunctionCallExpression();
+        if (func.FuncName() != "coalesce") { return Expression{};
+}
+        std::vector<Expression> flattened;
+        bool changed = false;
+        for (const Expression& arg : func.Args()) {
+          if (arg && arg->Type() == TypeTag::kFunctionCallExp &&
+              arg->AsFunctionCallExpression().FuncName() == "coalesce") {
+            for (const Expression& inner :
+                 arg->AsFunctionCallExpression().Args()) {
+              flattened.push_back(inner);
+            }
+            changed = true;
+            continue;
+          }
+          flattened.push_back(arg);
+        }
+        if (!changed) { return Expression{};
+}
+        return FunctionCallExp(func.FuncName(), std::move(flattened));
+      }));
+    built.Add(ExpressionRule(
+      "abs_of_abs", Is(TypeTag::kFunctionCallExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& outer = expression->AsFunctionCallExpression();
+        if (outer.FuncName() != "abs" || outer.Args().size() != 1) {
+          return Expression{};
+        }
+        const Expression& child = outer.Args().front();
+        if (!child || child->Type() != TypeTag::kFunctionCallExp) {
+          return Expression{};
+        }
+        if (child->AsFunctionCallExpression().FuncName() != "abs") {
+          return Expression{};
+        }
+        return child;
+      }));
+    built.Add(ExpressionRule(
+      "redundant_cast_removal", Is(TypeTag::kCastExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& cast = expression->AsCastExpression();
+        if (!cast.Child() || cast.ReturnNullOnError()) {
+          return Expression{};
+        }
+        Type child_type;
+        Type cast_type;
+        try {
+          child_type = cast.Child()->ResultType(Schema());
+          cast_type = cast.ResultType(Schema());
+        } catch (const std::exception&) {
+          return Expression{};
+        }
+        // Same-type conversion is the identity for these tags; string types
+        // may carry length semantics, so they stay conservative.
+        switch (child_type.GetType()) {
+          case TypeTag::kInteger:
+          case TypeTag::kBigInt:
+          case TypeTag::kDouble:
+            break;
+          default:
+            return Expression{};
+        }
+        if (child_type.GetType() != cast_type.GetType()) {
+          return Expression{};
+        }
+        return cast.Child();
       }));
     // NOTE: "complementary_absorption" rules (x AND (NOT x OR y) -> x AND y)
     // were removed: they are valid only in two-valued logic and produce wrong

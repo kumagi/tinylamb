@@ -651,6 +651,31 @@ TEST(CascadesTest, EliminateTrueSelectionCopiesChildScan) {
   EXPECT_TRUE(has_scan);
 }
 
+TEST(CascadesTest, EliminateFalseSelectionBecomesEmptyLimit) {
+  Memo memo;
+  const GroupId scan = memo.Build({"a"});
+  const GroupId selection = memo.EnsureDerivedGroup({"a"}, "false-sel");
+  LogicalExpression contradiction;
+  contradiction.operation = LogicalOperator::kSelection;
+  contradiction.children = {scan};
+  contradiction.predicate = ConstantValueExp(Value(false));
+  ASSERT_TRUE(memo.AddExpression(selection, contradiction));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+
+  search.Explore(selection);
+
+  bool has_empty_limit = false;
+  for (const LogicalExpression& expression :
+       search.GetMemo().Get(selection).expressions) {
+    if (expression.operation == LogicalOperator::kLimit &&
+        expression.children == std::vector<GroupId>{scan} &&
+        expression.limit_count == 0 && expression.limit_offset == 0) {
+      has_empty_limit = true;
+    }
+  }
+  EXPECT_TRUE(has_empty_limit);
+}
+
 TEST(CascadesTest, DefaultRulesIncludePredicateAndProjectionTransforms) {
   const RuleSet& rules = RuleSet::Default();
   EXPECT_TRUE(rules.Contains("merge_projections"));
@@ -660,6 +685,7 @@ TEST(CascadesTest, DefaultRulesIncludePredicateAndProjectionTransforms) {
   EXPECT_TRUE(rules.Contains("infer_join_predicates"));
   EXPECT_TRUE(rules.Contains("merge_limits"));
   EXPECT_TRUE(rules.Contains("eliminate_true_selection"));
+  EXPECT_TRUE(rules.Contains("eliminate_false_selection"));
 }
 
 TEST(CascadesTest, PushLimitThroughProjectionAddsLimitBelow) {

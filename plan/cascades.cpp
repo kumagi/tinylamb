@@ -1064,6 +1064,28 @@ const RuleSet& RuleSet::Default() {
           }
         },
         LogicalOperator::kSelection));
+    // Selection(false, X) / Selection(NULL, X) produce no rows while keeping
+    // X's schema (FilterFalse). Expressed as LIMIT 0 until the memo grows a
+    // dedicated empty-relation operator; the Limit executor short-circuits.
+    built.Add(Rule(
+        "eliminate_false_selection", Selection(Any("input")),
+        [](const Bindings&, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (!expression.predicate || !*expression.predicate ||
+              (*expression.predicate)->Type() != TypeTag::kConstantValue) {
+            return;
+          }
+          const Value value =
+              (*expression.predicate)->AsConstantValue().GetValue();
+          if (!value.IsNull() && value.Truthy()) { return;
+}
+          memo.AddExpression(
+              group, LogicalExpression{.operation = LogicalOperator::kLimit,
+                                       .children = expression.children,
+                                       .limit_count = 0,
+                                       .limit_offset = 0});
+        },
+        LogicalOperator::kSelection));
     return built;
   }();
   return rules;

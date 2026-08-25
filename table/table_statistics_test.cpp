@@ -1115,4 +1115,30 @@ TEST_F(TableStatisticsTest, HighCardinalityColumnStaysBoundedAndSane) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+TEST_F(TableStatisticsTest, LongVarcharTruncationAndScaleOverflow) {
+  TransactionContext ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, tbl,
+      db_->CreateTable(ctx, Schema("LongStrTable",
+                                   {Column("long_col", ValueType::kVarChar)})));
+  std::string long_str_1(100, 'a');
+  std::string long_str_2(100, 'b');
+  ASSERT_SUCCESS(tbl.Insert(ctx.txn_, Row({Value(std::move(long_str_1))})).GetStatus());
+  ASSERT_SUCCESS(tbl.Insert(ctx.txn_, Row({Value(std::move(long_str_2))})).GetStatus());
+
+  TableStatistics stats(tbl.GetSchema());
+  stats.Update(ctx.txn_, tbl);
+  const ColumnStats& cs = stats.Column(0);
+  EXPECT_EQ(cs.NonNullCount(), 2U);
+  ASSERT_FALSE(cs.LowestValues().empty());
+  EXPECT_LE(cs.LowestValues().front().value.value.varchar_value.size(), 32U);
+
+  // Test multiplier overflow clamp
+  ColumnStats scaled = cs;
+  scaled *= 1e30;
+  EXPECT_EQ(scaled.NonNullCount(), std::numeric_limits<size_t>::max());
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+}
+
 }  // namespace tinylamb
+

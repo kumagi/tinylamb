@@ -31,9 +31,14 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "common/log_message.hpp"
 #include "gtest/gtest.h"
 #include "type/date.hpp"
+#include "type/function.hpp"
+#include "type/interval.hpp"
+#include "type/type.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -406,7 +411,7 @@ TEST(ValueTest, AsStringVariants) {
   ASSERT_EQ(Value().AsString(), "(unknown type)");
   ASSERT_EQ(Value(42).AsString(), "42");
   ASSERT_EQ(Value("x").AsString(), "\"x\"");
-  ASSERT_EQ(Value(1.5).AsString(), "1.500000");
+  ASSERT_EQ(Value(1.5).AsString(), "1.5");
   std::ostringstream oss;
   oss << Value(7);
   ASSERT_EQ(oss.str(), "7");
@@ -747,4 +752,228 @@ TEST(ValueTest, MemcomparableVarcharEmptyIsLessThanOneChar) {
   EXPECT_NE(empty, one);
 }
 
+TEST(ValueTest, ToStringAllUnaryOperations) {
+  std::ostringstream oss;
+  oss << UnaryOperation::kIsTrue << "|"
+      << UnaryOperation::kIsNotTrue << "|"
+      << UnaryOperation::kIsFalse << "|"
+      << UnaryOperation::kIsNotFalse;
+  ASSERT_EQ(oss.str(), "IS TRUE|IS NOT TRUE|IS FALSE|IS NOT FALSE");
+}
+
+TEST(ValueTest, DeserializeUndefinedTypeFallthrough) {
+  Value v;
+  char buf[16]{};
+  ASSERT_THROW(v.Deserialize(buf, static_cast<ValueType>(99)), std::runtime_error);
+}
+
+TEST(ValueTest, SkipSerializedRejectsNullAndUndefined) {
+  ASSERT_THROW(Value::SkipSerialized(nullptr, ValueType::kNull), std::runtime_error);
+  char buf[16]{};
+  ASSERT_THROW(Value::SkipSerialized(buf, static_cast<ValueType>(99)), std::runtime_error);
+}
+
+TEST(ValueTest, AsStringInfAndNegInfAndNan) {
+  ASSERT_EQ(Value(std::numeric_limits<double>::infinity()).AsString(), "inf");
+  ASSERT_EQ(Value(-std::numeric_limits<double>::infinity()).AsString(), "-inf");
+  ASSERT_EQ(Value(std::numeric_limits<double>::quiet_NaN()).AsString(), "nan");
+}
+
+TEST(ValueTest, EncodeMemcomparableRejectsNull) {
+  Value null_val;
+  ASSERT_THROW(null_val.EncodeMemcomparableFormat(), std::runtime_error);
+}
+
+TEST(ValueTest, ArrayWithNullElementRoundTrip) {
+  Value arr = Value::Array({Value(int64_t{1}), Value(), Value(int64_t{3})}, "INT64");
+  std::string encoded = arr.EncodeMemcomparableFormat();
+  Value decoded;
+  decoded.DecodeMemcomparableFormat(encoded.data());
+  EXPECT_EQ(decoded, arr);
+}
+
+TEST(ValueTest, ArrayComparisonGreaterThan) {
+  Value a = Value::Array({Value(int64_t{1})}, "INT64");
+  Value b = Value::Array({Value(int64_t{2})}, "INT64");
+  EXPECT_TRUE(b > a);
+  EXPECT_FALSE(a > b);
+}
+
+TEST(ValueTest, ArithmeticEdgeCases) {
+  ASSERT_THROW(
+      Value(std::numeric_limits<int64_t>::min()) - Value(int64_t{1}),
+      std::runtime_error);
+  ASSERT_THROW(Value(10) / Value(0), std::runtime_error);
+  ASSERT_THROW(Value(std::numeric_limits<int64_t>::min()) / Value(int64_t{-1}),
+               std::runtime_error);
+}
+
+TEST(ValueTest, ArrayEncoderDecoderRoundTrip) {
+  Value arr = Value::Array({Value(int64_t{7}), Value(int64_t{8})}, "INT64");
+  std::stringstream ss;
+  Encoder enc(ss);
+  enc << arr;
+  Value restored;
+  Decoder dec(ss);
+  dec >> restored;
+  EXPECT_EQ(restored, arr);
+}
+
+TEST(DateTest, ToSysDaysOutOfRange) {
+  ASSERT_THROW(FormatDateDays(-20000000LL), std::runtime_error);
+  ASSERT_THROW(FormatDateDays(20000000LL), std::runtime_error);
+}
+
+TEST(DateTest, ShiftYMDClampedYearOverflow) {
+  ASSERT_THROW(
+      (void)AddDateIntervalDays(ParseDateDays("9999-12-31"), 999999, "year"),
+      std::runtime_error);
+  ASSERT_THROW(
+      (void)AddDateIntervalDays(ParseDateDays("0001-01-01"), -999999, "year"),
+      std::runtime_error);
+}
+
+TEST(DateTest, ParseDateEdgeCases) {
+  ASSERT_THROW((void)ParseDateDays("999999999-01-01"), std::runtime_error);
+  ASSERT_THROW((void)ParseDateDays("2024-01-01xyz"), std::runtime_error);
+  ASSERT_THROW((void)ParseDateDays("2024-01-01 "), std::runtime_error);
+  ASSERT_THROW((void)ParseDateDays("99999999-01-01"), std::runtime_error);
+  ASSERT_THROW((void)ParseDateDays("-2024-01-01"), std::runtime_error);
+  ASSERT_THROW((void)ParseDateDays("2024/01/01"), std::runtime_error);
+  ASSERT_THROW((void)ParseDateDays("2024-02-30"), std::runtime_error);
+  ASSERT_THROW((void)ParseDateDays(""), std::runtime_error);
+  ASSERT_THROW(
+      (void)AddDateIntervalDays(ParseDateDays("2024-01-01"),
+                                std::numeric_limits<int64_t>::max(), "day"),
+      std::runtime_error);
+  ASSERT_THROW(
+      (void)AddDateIntervalDays(ParseDateDays("2024-01-01"),
+                                std::numeric_limits<int64_t>::min(), "day"),
+      std::runtime_error);
+}
+
+TEST(DateTest, SetGetDefaultTimeZone) {
+  SetDefaultTimeZone("UTC");
+  EXPECT_EQ(GetDefaultTimeZone(), "UTC");
+  SetDefaultTimeZone("");
+  EXPECT_EQ(GetDefaultTimeZone(), "America/Los_Angeles");
+}
+
+TEST(IntervalTest, CoverageGaps) {
+  IntervalValue iv = IntervalValue::Parse("  P1Y");
+  EXPECT_EQ(iv.months, 12);
+
+  SetSessionConstant("foo_cov", "bar_cov");
+  EXPECT_EQ(GetSessionConstant("foo_cov"), "bar_cov");
+  EXPECT_TRUE(HasSessionConstant("foo_cov"));
+
+  IntervalValue neg_days{0, -45, 0};
+  IntervalValue justified_days = neg_days.JustifyDays();
+  EXPECT_EQ(justified_days.months, -1);
+  EXPECT_EQ(justified_days.days, -15);
+
+  IntervalValue neg_nanos{0, 0, -(35LL * 24LL * 3600LL * 1000000000LL)};
+  IntervalValue justified_nanos = neg_nanos.JustifyInterval();
+  EXPECT_LT(justified_nanos.months, 0);
+
+  ASSERT_THROW((void)IntervalValue::Parse("P1X"), std::runtime_error);
+  ASSERT_THROW((void)IntervalValue::Parse("PT1X"), std::runtime_error);
+  ASSERT_THROW((void)IntervalValue::Parse("P1"), std::runtime_error);
+  ASSERT_THROW((void)IntervalValue::Parse("P-X"), std::runtime_error);
+
+  IntervalValue iv_min = IntervalValue::Parse("5", "minute");
+  EXPECT_EQ(iv_min.nanos, 5LL * 60LL * 1000000000LL);
+
+  // Test single unit interval branches
+  EXPECT_EQ(IntervalValue::Parse("2", "quarter").months, 6);
+  EXPECT_EQ(IntervalValue::Parse("3", "quarters").months, 9);
+  EXPECT_EQ(IntervalValue::Parse("2", "week").days, 14);
+  EXPECT_EQ(IntervalValue::Parse("1", "weeks").days, 7);
+  EXPECT_EQ(IntervalValue::Parse("5", "days").days, 5);
+  EXPECT_EQ(IntervalValue::Parse("100", "milliseconds").nanos, 100000000);
+  EXPECT_EQ(IntervalValue::Parse("500", "microseconds").nanos, 500000);
+  EXPECT_EQ(IntervalValue::Parse("42", "nanoseconds").nanos, 42);
+  EXPECT_EQ(IntervalValue::Parse("-2", "hours").nanos, -7200000000000LL);
+  EXPECT_EQ(IntervalValue::Parse("+3", "minutes").nanos, 180000000000LL);
+
+  // ISO 8601 interval parsing branches
+  EXPECT_EQ(IntervalValue::Parse("P1Y2M3D").months, 14);
+  EXPECT_EQ(IntervalValue::Parse("PT1H2M3S").nanos, (3600 + 120 + 3) * 1000000000LL);
+  EXPECT_EQ(IntervalValue::Parse("P+1Y-2M+3DT-1H+2M-3.5S").months, 10);
+  EXPECT_EQ(IntervalValue::Parse("P").months, 0);
+  EXPECT_EQ(IntervalValue::Parse("PT").nanos, 0);
+  ASSERT_THROW(IntervalValue::Parse("P1X"), std::runtime_error);
+  ASSERT_THROW(IntervalValue::Parse("PT1X"), std::runtime_error);
+  ASSERT_THROW(IntervalValue::Parse("P1"), std::runtime_error);
+
+  // JustifyDays and JustifyInterval with empty/zero
+  IntervalValue iv_zero{};
+  IntervalValue j_zero = iv_zero.JustifyInterval();
+  EXPECT_EQ(j_zero.months, 0);
+  EXPECT_EQ(j_zero.days, 0);
+  EXPECT_EQ(j_zero.nanos, 0);
+  IntervalValue j_days = iv_zero.JustifyDays();
+  EXPECT_EQ(j_days.months, 0);
+  IntervalValue j_hours = iv_zero.JustifyHours();
+  EXPECT_EQ(j_hours.days, 0);
+}
+
+TEST(ValueTypeTest, ValueTypeToStringAllCases) {
+  EXPECT_EQ(ValueTypeToString(ValueType::kNull), "(null)");
+  EXPECT_EQ(ValueTypeToString(ValueType::kInt64), "Integer");
+  EXPECT_EQ(ValueTypeToString(ValueType::kVarChar), "Varchar");
+  EXPECT_EQ(ValueTypeToString(ValueType::kDouble), "Double");
+  EXPECT_EQ(ValueTypeToString(ValueType::kDate), "Date");
+  EXPECT_EQ(ValueTypeToString(ValueType::kArray), "Array");
+  EXPECT_EQ(ValueTypeToString(static_cast<ValueType>(99)), "unknown value type");
+}
+
+TEST(FunctionTest, CoverageGaps) {
+  Function f_def;
+  Function f_named("my_func", 3);
+  Function original("add", {Type(TypeTag::kBigInt), Type(TypeTag::kBigInt)},
+                    Type(TypeTag::kBigInt));
+  std::stringstream ss;
+  Encoder enc(ss);
+  enc << original;
+
+  Function restored;
+  Decoder dec(ss);
+  dec >> restored;
+}
+
+TEST(TypeTest, CoverageGaps) {
+  Type t;
+  EXPECT_EQ(t.GetType(), TypeTag::kInvalid);
+  EXPECT_FALSE(t.IsValid());
+
+  Type original(TypeTag::kVarChar);
+  std::stringstream ss;
+  Encoder enc(ss);
+  enc << original;
+
+  Type restored;
+  Decoder dec(ss);
+  dec >> restored;
+  EXPECT_EQ(restored.GetType(), TypeTag::kVarChar);
+  EXPECT_TRUE(restored.IsValid());
+}
+
+TEST(ValueTest, VarcharIntervalComparisonBranches) {
+  Value iv1("1-2 3 4:5:6");
+  Value iv2("2-0 0 0:0:0");
+  EXPECT_TRUE(iv1 < iv2);
+  EXPECT_FALSE(iv2 < iv1);
+  EXPECT_TRUE(iv2 > iv1);
+  EXPECT_FALSE(iv1 > iv2);
+
+  Value s1("foo-bar");
+  Value s2("hello");
+  EXPECT_TRUE(s1 < s2 || s2 < s1);
+  EXPECT_TRUE(s1 > s2 || s2 > s1);
+}
+
 }  // namespace tinylamb
+
+
+

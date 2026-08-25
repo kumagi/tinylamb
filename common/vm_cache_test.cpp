@@ -1468,5 +1468,31 @@ TEST_F(VMCacheTest, InvalidateWholeFileClearsAllQueues) {
   }
 }
 
+TEST_F(VMCacheTest, ReadAtStringAndZeroLengthCoverage) {
+  constexpr size_t kCount = 100;
+  path_ = "vm_cache_test-" + RandomString();
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0666);
+  std::vector<int32_t> value(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    value[i] = Expected<int32_t>(i);
+  }
+  ssize_t written = ::write(fd_, value.data(), value.size() * sizeof(int32_t));
+  EXPECT_EQ(written, value.size() * sizeof(int32_t));
+
+  VMCacheImpl impl(fd_, 4096, 16384, 0, 0, false);
+  std::string s = impl.ReadAt(0, sizeof(int32_t) * 5);
+  EXPECT_EQ(s.size(), sizeof(int32_t) * 5);
+
+  std::string_view sv;
+  auto locks_zero = impl.ReadAt(0, 0, sv);
+  EXPECT_TRUE(locks_zero.empty());
+  EXPECT_TRUE(sv.empty());
+
+  auto locks_oob = impl.ReadAt(100000000, 10, sv);
+  EXPECT_TRUE(locks_oob.empty());
+  EXPECT_TRUE(sv.empty());
+}
+
 }  // namespace
 }  // namespace tinylamb
+
