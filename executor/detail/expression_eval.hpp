@@ -61,11 +61,13 @@ struct AggregateAccumulator {
   const AggregateExpression* expression;
   int64_t count = 0;
   double total = 0.0;
-  // Integer sums accumulate exactly here (uint64 to keep overflow defined);
+  // Integer sums accumulate exactly here (int64 with overflow checks);
   // `total` only carries double inputs.
-  uint64_t int_total = 0;
+  int64_t int_total = 0;
   bool total_is_double = false;
   Value extreme;
+  // GoogleSQL MIN/MAX: a NaN input poisons the result.
+  mutable bool saw_nan_{false};
   std::unique_ptr<std::unordered_set<Value>> distinct;
   std::unique_ptr<std::unordered_set<int64_t>> distinct_ints;
 
@@ -79,7 +81,22 @@ struct AggregateAccumulator {
   mutable std::unique_ptr<std::vector<BufferedRow>> buffer_;
   mutable std::vector<Value> array_values_;
   mutable std::optional<std::string> delimiter_;
+  // BIT_AND/OR/XOR fold state.
+  mutable int64_t bit_acc_{0};
+  mutable bool bit_saw_value_{false};
+  // ARRAY_CONCAT_AGG declared element type (captured even for empty arrays).
+  mutable std::string concat_elem_type_;
+  // ELEMENTWISE_SUM/AVG positional state.
+  mutable std::vector<int64_t> ew_int_sum_;
+  mutable std::vector<double> ew_double_sum_;
+  mutable std::vector<int64_t> ew_count_;
+  mutable std::vector<bool> ew_saw_double_;
+  mutable size_t ew_len_{0};
+  mutable bool ew_any_input_{false};
+  mutable std::string ew_input_elem_type_;
 
+  void ElementwiseApply(const Value& array);
+  Value FinishApproxTop(const std::vector<BufferedRow>& rows) const;
   void ApplyCore(const Value& value);
 };
 

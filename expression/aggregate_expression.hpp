@@ -70,15 +70,26 @@ class AggregateExpression : public ExpressionBase {
     return secondary_arg_;
   }
   void SetSecondaryArg(Expression arg) { secondary_arg_ = std::move(arg); }
+  // Additional per-row arguments (e.g. APPROX_TOP_SUM weight / top-N count),
+  // evaluated per row and carried through the buffer in AggregateInput.
+  [[nodiscard]] const std::vector<Expression>& ExtraArgs() const {
+    return extra_args_;
+  }
+  void SetExtraArgs(std::vector<Expression> args) {
+    extra_args_ = std::move(args);
+  }
   // Row-level pre-filter: `AGG(x WHERE cond)` skips rows where cond is not
   // true; streaming-safe, unlike the HAVING MAX/MIN modifier.
   [[nodiscard]] const Expression& WhereFilter() const { return where_filter_; }
   void SetWhereFilter(Expression filter) { where_filter_ = std::move(filter); }
   // Aggregates that cannot stream row-at-a-time: they need whole-group
-  // context for their HAVING modifier, inner ORDER BY, or LIMIT.
+  // context for their HAVING modifier, inner ORDER BY, or LIMIT.  The
+  // APPROX_TOP_* family additionally needs its per-row extra arguments.
   [[nodiscard]] bool NeedsGroupContext() const {
     return having_ != AggregateHavingModifier::kNone ||
-           !inner_order_by_.empty() || inner_limit_.has_value();
+           !inner_order_by_.empty() || inner_limit_.has_value() ||
+           type_ == AggregationType::kApproxTopCount ||
+           type_ == AggregationType::kApproxTopSum;
   }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
@@ -93,6 +104,7 @@ class AggregateExpression : public ExpressionBase {
   std::vector<WindowOrderTerm> inner_order_by_;
   std::optional<size_t> inner_limit_;
   Expression secondary_arg_;
+  std::vector<Expression> extra_args_;
   Expression where_filter_;
 };
 

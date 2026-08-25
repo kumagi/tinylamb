@@ -464,6 +464,13 @@ struct WindowRuntime {
       return Value(static_cast<int64_t>(total));
     }
     if (fn == "MIN" || fn == "MAX") {
+      // GoogleSQL: any NaN in the frame makes MIN/MAX NaN.
+      for (const Value& value : non_null) {
+        if (value.type == ValueType::kDouble &&
+            std::isnan(value.value.double_value)) {
+          return Value(std::numeric_limits<double>::quiet_NaN());
+        }
+      }
       const Value* best = &non_null[0];
       for (const Value& value : non_null) {
         if (fn == "MIN" ? ValueLess(value, *best, true)
@@ -509,6 +516,71 @@ struct WindowRuntime {
       }
       if (saw_true) { return Value(static_cast<int64_t>(1)); }
       return Value(static_cast<int64_t>(0));
+    }
+    if (fn == "ELEMENTWISE_SUM" || fn == "ELEMENTWISE_AVG") {
+      const bool is_avg = fn == "ELEMENTWISE_AVG";
+      size_t len = 0;
+      std::string input_elem_type;
+      for (const Value& array : non_null) {
+        if (!array.IsArray()) { continue; }
+        if (input_elem_type.empty()) {
+          input_elem_type = array.ArrayElementSqlType();
+        }
+        len = std::max(len, array.ArrayElements().size());
+      }
+      std::vector<int64_t> int_sum(len, 0);
+      std::vector<double> double_sum(len, 0.0);
+      std::vector<int64_t> counts(len, 0);
+      std::vector<bool> saw_double(len, false);
+      for (const Value& array : non_null) {
+        if (!array.IsArray()) { continue; }
+        const auto& elements = array.ArrayElements();
+        for (size_t i = 0; i < elements.size(); ++i) {
+          const Value& element = elements[i];
+          if (element.IsNull()) { continue; }
+          ++counts[i];
+          if (element.type == ValueType::kDouble) {
+            saw_double[i] = true;
+            double_sum[i] += element.value.double_value;
+          } else {
+            int_sum[i] += element.value.int_value;
+          }
+        }
+      }
+      auto mapped_elem_type = [](const std::string& input) {
+        std::string upper;
+        upper.reserve(input.size());
+        for (char c : input) {
+          upper.push_back(
+              static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        }
+        if (upper.find("UINT") != std::string::npos) { return "UINT64"; }
+        if (upper.find("DOUBLE") != std::string::npos ||
+            upper.find("FLOAT") != std::string::npos) {
+          return "DOUBLE";
+        }
+        return "INT64";
+      };
+      std::vector<Value> elements;
+      elements.reserve(len);
+      for (size_t i = 0; i < len; ++i) {
+        if (counts[i] == 0) {
+          elements.push_back(Value());
+          continue;
+        }
+        if (is_avg || saw_double[i]) {
+          const double sum =
+              double_sum[i] + static_cast<double>(int_sum[i]);
+          elements.push_back(
+              is_avg ? Value(sum / static_cast<double>(counts[i]))
+                     : Value(sum));
+        } else {
+          elements.push_back(Value(int_sum[i]));
+        }
+      }
+      return Value::Array(std::move(elements),
+                          is_avg ? std::string("DOUBLE")
+                                 : mapped_elem_type(input_elem_type));
     }
     if (fn == "BIT_AND" || fn == "BIT_OR" || fn == "BIT_XOR") {
       int64_t acc = non_null[0].value.int_value;

@@ -52,6 +52,14 @@ enum class AggregationType : int {
   kArrayAgg,
   kStringAgg,
   kCountIf,
+  kBitAnd,
+  kBitOr,
+  kBitXor,
+  kArrayConcatAgg,
+  kElementwiseSum,
+  kElementwiseAvg,
+  kApproxTopCount,
+  kApproxTopSum,
 };
 
 std::string ToString(AggregationType type);

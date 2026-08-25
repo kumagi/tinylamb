@@ -3,12 +3,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <ctime>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <vector>
 #include <unordered_set>
@@ -293,8 +295,41 @@ AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate)
                      : nullptr) {
     if (aggregate->GetType() == AggregationType::kArrayAgg ||
         aggregate->GetType() == AggregationType::kStringAgg ||
+        aggregate->GetType() == AggregationType::kArrayConcatAgg ||
         aggregate->NeedsGroupContext()) {
       buffer_ = std::make_unique<std::vector<BufferedRow>>();
+    }
+  }
+
+void AggregateAccumulator::ElementwiseApply(const Value& arr) {
+    if (!arr.IsArray()) {
+      throw std::runtime_error(
+          expression->GetType() == AggregationType::kElementwiseSum
+              ? "ELEMENTWISE_SUM requires an ARRAY argument"
+              : "ELEMENTWISE_AVG requires an ARRAY argument");
+    }
+    ew_any_input_ = true;
+    if (ew_input_elem_type_.empty()) {
+      ew_input_elem_type_ = arr.ArrayElementSqlType();
+    }
+    const auto& elements = arr.ArrayElements();
+    if (elements.size() > ew_len_) {
+      ew_len_ = elements.size();
+      ew_int_sum_.resize(ew_len_, 0);
+      ew_double_sum_.resize(ew_len_, 0.0);
+      ew_count_.resize(ew_len_, 0);
+      ew_saw_double_.resize(ew_len_, false);
+    }
+    for (size_t i = 0; i < elements.size(); ++i) {
+      const Value& element = elements[i];
+      if (element.IsNull()) { continue; }
+      ++ew_count_[i];
+      if (element.type == ValueType::kDouble) {
+        ew_saw_double_[i] = true;
+        ew_double_sum_[i] += element.value.double_value;
+      } else {
+        ew_int_sum_[i] += element.value.int_value;
+      }
     }
   }
 
@@ -325,23 +360,50 @@ void AggregateAccumulator::ApplyCore(const Value& value) {
         ++count;
         break;
       case AggregationType::kSum:
-      case AggregationType::kAvg:
         if (value.type == ValueType::kDouble) {
           total += value.value.double_value;
           total_is_double = true;
         } else if (value.type == ValueType::kInt64 ||
                    value.type == ValueType::kDate) {
-          int_total += static_cast<uint64_t>(value.value.int_value);
+          // Signed accumulation keeps negative inputs exact (GoogleSQL SUM
+          // raises on INT64 overflow rather than wrapping).
+          int64_t updated = 0;
+          if (__builtin_add_overflow(int_total, value.value.int_value,
+                                     &updated)) {
+            throw std::runtime_error("integer overflow in SUM");
+          }
+          int_total = updated;
+        } else {
+          throw std::runtime_error("numeric value required");
+        }
+        ++count;
+        break;
+      case AggregationType::kAvg:
+        // AVG(INT64) returns FLOAT64 and sums through a double intermediate,
+        // so INT64 overflow never applies here.
+        if (value.type == ValueType::kDouble) {
+          total += value.value.double_value;
+        } else if (value.type == ValueType::kInt64 ||
+                   value.type == ValueType::kDate) {
+          total += static_cast<double>(value.value.int_value);
         } else {
           throw std::runtime_error("numeric value required");
         }
         ++count;
         break;
       case AggregationType::kMin:
+        if (!value.IsNull() && value.type == ValueType::kDouble &&
+            std::isnan(value.value.double_value)) {
+          saw_nan_ = true;
+        }
         if (extreme.IsNull() || value < extreme) { extreme = value;
 }
         break;
       case AggregationType::kMax:
+        if (!value.IsNull() && value.type == ValueType::kDouble &&
+            std::isnan(value.value.double_value)) {
+          saw_nan_ = true;
+        }
         if (extreme.IsNull() || extreme < value) { extreme = value; }
         break;
       case AggregationType::kLogicalAnd:
@@ -369,6 +431,38 @@ void AggregateAccumulator::ApplyCore(const Value& value) {
       case AggregationType::kStringAgg:
         array_values_.push_back(value);
         break;
+      case AggregationType::kBitAnd:
+      case AggregationType::kBitOr:
+      case AggregationType::kBitXor: {
+        const int64_t next = value.value.int_value;
+        if (!bit_saw_value_) {
+          bit_acc_ = next;
+          bit_saw_value_ = true;
+        } else if (expression->GetType() == AggregationType::kBitAnd) {
+          bit_acc_ &= next;
+        } else if (expression->GetType() == AggregationType::kBitOr) {
+          bit_acc_ |= next;
+        } else {
+          bit_acc_ ^= next;
+        }
+        break;
+      }
+      case AggregationType::kArrayConcatAgg:
+        if (!value.IsArray()) {
+          throw std::runtime_error(
+              "ARRAY_CONCAT_AGG requires an ARRAY argument");
+        }
+        if (concat_elem_type_.empty()) {
+          concat_elem_type_ = value.ArrayElementSqlType();
+        }
+        for (const Value& element : value.ArrayElements()) {
+          array_values_.push_back(element);
+        }
+        break;
+      case AggregationType::kElementwiseSum:
+      case AggregationType::kElementwiseAvg:
+        ElementwiseApply(value);
+        break;
     }
   }
 
@@ -389,12 +483,121 @@ void AggregateAccumulator::Add(const Value& value) {
     ApplyCore(value);
   }
 
+// APPROX_TOP_COUNT(value, number) / APPROX_TOP_SUM(value, weight, number):
+// exact top-N over the buffered rows (the approximation only affects the
+// reference's accuracy guarantees).  Elements are struct-like JSON strings
+// matching the engine's STRUCT representation.
+Value AggregateAccumulator::FinishApproxTop(
+    const std::vector<BufferedRow>& rows) const {
+  const bool is_sum = expression->GetType() == AggregationType::kApproxTopSum;
+  struct Entry {
+    Value value;
+    double weight{0.0};
+    int64_t int_weight{0};
+    bool is_double{false};
+  };
+  std::vector<Entry> entries;
+  std::optional<int64_t> top_n;
+  for (const BufferedRow& row : rows) {
+    // Extras carry the trailing arguments: [number] or [weight, number].
+    if (!row.order_keys.empty()) {
+      const Value& last = row.order_keys.back();
+      if (!top_n.has_value() && !last.IsNull() &&
+          last.type == ValueType::kInt64) {
+        top_n = last.value.int_value;
+      }
+    }
+    const Value& value = row.value;
+    Entry* found = nullptr;
+    for (Entry& entry : entries) {
+      if (entry.value == value) { found = &entry; break; }
+    }
+    if (found == nullptr) {
+      Entry entry;
+      entry.value = value;
+      if (is_sum) {
+        const Value& weight =
+            row.order_keys.empty() ? Value() : row.order_keys.front();
+        if (weight.type == ValueType::kDouble) {
+          entry.is_double = true;
+          entry.weight = weight.value.double_value;
+        } else if (weight.type == ValueType::kInt64) {
+          entry.int_weight = weight.value.int_value;
+        }
+      } else {
+        entry.int_weight = 1;
+      }
+      entries.push_back(std::move(entry));
+      continue;
+    }
+    if (is_sum) {
+      const Value& weight =
+          row.order_keys.empty() ? Value() : row.order_keys.front();
+      if (weight.type == ValueType::kDouble) {
+        found->is_double = true;
+        found->weight += weight.value.double_value;
+      } else if (weight.type == ValueType::kInt64) {
+        found->int_weight += weight.value.int_value;
+      }
+    } else {
+      found->int_weight += 1;
+    }
+  }
+  auto weight_of = [](const Entry& e) {
+    return e.is_double ? e.weight : static_cast<double>(e.int_weight);
+  };
+  std::stable_sort(entries.begin(), entries.end(),
+                   [&weight_of](const Entry& a, const Entry& b) {
+                     return weight_of(a) > weight_of(b);
+                   });
+  size_t limit = entries.size();
+  if (top_n.has_value() && *top_n >= 0 &&
+      static_cast<size_t>(*top_n) < limit) {
+    limit = static_cast<size_t>(*top_n);
+  }
+  auto field_text = [](const Value& v) -> std::string {
+    if (v.IsNull()) { return "null"; }
+    switch (v.type) {
+      case ValueType::kInt64:
+      case ValueType::kDate:
+        return std::to_string(v.value.int_value);
+      case ValueType::kDouble:
+        return std::to_string(v.value.double_value);
+      default: {
+        std::string escaped;
+        for (char c : v.AsString()) {
+          if (c == '"') { escaped += "\\\""; }
+          else { escaped.push_back(c); }
+        }
+        return "\"" + escaped + "\"";
+      }
+    }
+  };
+  std::vector<Value> elements;
+  elements.reserve(limit);
+  for (size_t i = 0; i < limit; ++i) {
+    const Entry& entry = entries[i];
+    std::string json = "{\"value\":";
+    json += field_text(entry.value);
+    json += is_sum ? ",\"sum\":" : ",\"count\":";
+    json += entry.is_double ? std::to_string(entry.weight)
+                            : std::to_string(entry.int_weight);
+    json += "}";
+    elements.push_back(Value(std::move(json)));
+  }
+  return Value::Array(std::move(elements), "STRING");
+}
+
 Value AggregateAccumulator::Finish() const {
     // Replay buffered rows: gate through the HAVING modifier, apply inner
     // ORDER BY / LIMIT, then feed the survivors into the streaming logic
     // (or build the ARRAY/STRING payload directly).
     if (buffer_ != nullptr) {
       std::vector<BufferedRow>& rows = *buffer_;
+      if (expression->GetType() == AggregationType::kApproxTopCount ||
+          expression->GetType() == AggregationType::kApproxTopSum) {
+        return FinishApproxTop(rows);
+      }
       if (expression->Having() != AggregateHavingModifier::kNone) {
         bool saw_threshold = false;
         Value threshold;
@@ -481,6 +684,10 @@ Value AggregateAccumulator::Finish() const {
         return Value(total + static_cast<double>(int_total));
       case AggregationType::kMin:
       case AggregationType::kMax:
+        // GoogleSQL: any NaN in the group makes MIN/MAX NaN.
+        if (saw_nan_) {
+          return Value(std::numeric_limits<double>::quiet_NaN());
+        }
         return extreme;
       case AggregationType::kLogicalAnd:
       case AggregationType::kLogicalOr:
@@ -505,6 +712,62 @@ Value AggregateAccumulator::Finish() const {
       }
       case AggregationType::kCountIf:
         return Value(count);
+      case AggregationType::kBitAnd:
+      case AggregationType::kBitOr:
+      case AggregationType::kBitXor:
+        return bit_saw_value_ ? Value(bit_acc_) : Value();
+      case AggregationType::kArrayConcatAgg:
+        if (concat_elem_type_.empty() && array_values_.empty()) {
+          // No non-NULL input arrays reached the accumulator: the result is
+          // a NULL array.
+          return {};
+        }
+        if (concat_elem_type_.empty()) { concat_elem_type_ = "INT64"; }
+        return Value::Array(array_values_, concat_elem_type_);
+      case AggregationType::kElementwiseSum:
+      case AggregationType::kElementwiseAvg: {
+        const bool is_avg =
+            expression->GetType() == AggregationType::kElementwiseAvg;
+        if (!ew_any_input_) {
+          // All input arrays were NULL: NULL result.
+          return {};
+        }
+        auto mapped_elem_type = [](const std::string& input) {
+          std::string upper;
+          upper.reserve(input.size());
+          for (char c : input) {
+            upper.push_back(static_cast<char>(
+                std::toupper(static_cast<unsigned char>(c))));
+          }
+          if (upper.find("UINT") != std::string::npos) { return "UINT64"; }
+          if (upper.find("DOUBLE") != std::string::npos ||
+              upper.find("FLOAT") != std::string::npos) {
+            return "DOUBLE";
+          }
+          return "INT64";
+        };
+        std::vector<Value> elements;
+        elements.reserve(ew_len_);
+        for (size_t i = 0; i < ew_len_; ++i) {
+          if (ew_count_[i] == 0) {
+            elements.push_back(Value());
+            continue;
+          }
+          if (is_avg || ew_saw_double_[i]) {
+            const double sum =
+                ew_double_sum_[i] + static_cast<double>(ew_int_sum_[i]);
+            elements.push_back(
+                is_avg
+                    ? Value(sum / static_cast<double>(ew_count_[i]))
+                    : Value(sum));
+          } else {
+            elements.push_back(Value(ew_int_sum_[i]));
+          }
+        }
+        const std::string elem_type =
+            is_avg ? "DOUBLE" : mapped_elem_type(ew_input_elem_type_);
+        return Value::Array(std::move(elements), elem_type);
+      }
     }
     return {};
   }
@@ -2261,6 +2524,29 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
 
   // String functions
   if (name == "concat") {
+    // `array || array` shares the CONCAT AST node: when any operand is an
+    // array the call is array concatenation (NULL operands yield NULL),
+    // otherwise it is string concatenation.
+    const bool any_array =
+        std::any_of(arguments.begin(), arguments.end(),
+                    [](const Value& v) { return v.IsArray(); });
+    if (any_array) {
+      std::vector<Value> merged;
+      std::string element_type;
+      for (const Value& arr : arguments) {
+        if (arr.IsNull()) { return {}; }
+        if (!arr.IsArray()) {
+          throw std::runtime_error(
+              "Cannot concatenate ARRAY with a non-array");
+        }
+        if (element_type.empty()) {
+          element_type = arr.ArrayElementSqlType();
+        }
+        const auto& elements = arr.ArrayElements();
+        merged.insert(merged.end(), elements.begin(), elements.end());
+      }
+      return Value::Array(std::move(merged), element_type);
+    }
     std::string result;
     for (const Value& value : arguments) {
       if (value.IsNull()) { return {}; }
@@ -4164,6 +4450,124 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     return v.WithCollation(code);
   }
 
+  if (name == "array_length") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("ARRAY_LENGTH requires 1 argument");
+    }
+    const Value& arr = arguments[0];
+    if (arr.IsNull()) { return {}; }
+    if (!arr.IsArray()) {
+      throw std::runtime_error("ARRAY_LENGTH requires an ARRAY argument");
+    }
+    return Value(static_cast<int64_t>(arr.ArrayElements().size()));
+  }
+
+  if (name == "array_concat") {
+    if (arguments.empty()) {
+      throw std::runtime_error("ARRAY_CONCAT requires at least 1 argument");
+    }
+    std::vector<Value> merged;
+    std::string element_type;
+    for (const Value& arr : arguments) {
+      if (arr.IsNull()) { return {}; }
+      if (!arr.IsArray()) {
+        throw std::runtime_error("ARRAY_CONCAT requires ARRAY arguments");
+      }
+      if (element_type.empty()) { element_type = arr.ArrayElementSqlType(); }
+      const auto& elements = arr.ArrayElements();
+      merged.insert(merged.end(), elements.begin(), elements.end());
+    }
+    return Value::Array(std::move(merged), element_type);
+  }
+
+  if (name == "array_includes" || name == "array_includes_any" ||
+      name == "array_includes_all") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error(name + " requires 2 arguments");
+    }
+    const Value& input = arguments[0];
+    const Value& target = arguments[1];
+    // GoogleSQL: a NULL array or NULL target yields NULL.
+    if (input.IsNull() || target.IsNull()) { return {}; }
+    if (!input.IsArray() ||
+        (name != "array_includes" && !target.IsArray())) {
+      throw std::runtime_error(name + " requires ARRAY arguments");
+    }
+    auto equals = [](const Value& left, const Value& right) {
+      try {
+        return Binary(BinaryOperation::kEquals, left, right).Truthy();
+      } catch (...) {
+        return false;
+      }
+    };
+    const auto& haystack = input.ArrayElements();
+    bool result;
+    if (name == "array_includes") {
+      result = false;
+      for (const Value& element : haystack) {
+        if (!element.IsNull() && equals(element, target)) {
+          result = true;
+          break;
+        }
+      }
+    } else {
+      const auto& targets = target.ArrayElements();
+      result = name != "array_includes_any";
+      for (const Value& wanted : targets) {
+        if (wanted.IsNull()) {
+          // NULL target elements match nothing: ANY cannot use them and ALL
+          // fails outright.
+          if (name == "array_includes_all") { result = false; }
+          continue;
+        }
+        bool found = false;
+        for (const Value& element : haystack) {
+          if (!element.IsNull() && equals(element, wanted)) {
+            found = true;
+            break;
+          }
+        }
+        if (name == "array_includes_any") {
+          if (found) { result = true; break; }
+        } else if (!found) {
+          result = false;
+          break;
+        }
+      }
+    }
+    return Value(result);
+  }
+
+  if (name == "is_nan" || name == "is_inf") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error(name + " requires 1 argument");
+    }
+    const Value& v = arguments[0];
+    if (v.IsNull()) { return {}; }
+    double d = 0.0;
+    if (v.type == ValueType::kDouble) {
+      d = v.value.double_value;
+    } else if (v.type == ValueType::kInt64 || v.type == ValueType::kDate) {
+      d = static_cast<double>(v.value.int_value);
+    } else {
+      throw std::runtime_error(name + " requires a numeric argument");
+    }
+    return Value(name == "is_nan" ? std::isnan(d) : std::isinf(d));
+  }
+
+  if (name == "rand") {
+    if (!arguments.empty()) {
+      throw std::runtime_error("RAND requires no arguments");
+    }
+    static thread_local std::mt19937_64 rng(
+        std::random_device{}() ^
+        static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    static thread_local std::uniform_real_distribution<double> uniform(
+        0.0, 1.0);
+    return Value(uniform(rng));
+  }
+
   throw std::runtime_error("unsupported function " + name);
 }
 
@@ -4275,9 +4679,51 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
                               aggregates, context, ctes);
     case TypeTag::kArrayExp: {
       const auto& array = expression->AsArrayExpression();
-      std::vector<Value> elements;
-      elements.reserve(array.Elements().size());
       std::string inferred_type = array.ElementSqlType();
+      std::vector<Value> elements;
+      // ARRAY(subquery): a lone query child contributes one element per
+      // result row instead of a single scalar projection.
+      if (array.Elements().size() == 1 &&
+          array.Elements()[0]->Type() == TypeTag::kQueryExp) {
+        const auto& value = array.Elements()[0]->AsQueryExpression();
+        if (!value.Exists() && !value.Test()) {
+          std::optional<Relation> indexed =
+              ExecuteCorrelatedSingleSource(context, *value.Query(), scope,
+                                            ctes);
+          std::optional<Relation> executed;
+          const Relation* relation = indexed ? &*indexed : nullptr;
+          if (relation == nullptr) {
+            relation =
+                ExecuteCachedUncorrelated(context, *value.Query(), ctes);
+          }
+          if (relation == nullptr) {
+            executed = ExecuteQuery(context, *value.Query(), &scope, ctes);
+            relation = &*executed;
+          }
+          const bool as_struct = value.Query()->AsStruct();
+          elements.reserve(relation->TotalRows());
+          relation->ForEachRow([&](const Row& row) {
+            Value projected = ProjectSubqueryRow(row, as_struct);
+            if ((inferred_type.empty() || inferred_type == "INT64") &&
+                !projected.IsNull()) {
+              if (projected.type == ValueType::kVarChar) {
+                inferred_type = "STRING";
+              } else if (projected.type == ValueType::kDouble) {
+                inferred_type = "DOUBLE";
+              } else if (projected.type == ValueType::kDate) {
+                inferred_type = "DATE";
+              } else if (projected.IsArray()) {
+                inferred_type =
+                    "ARRAY<" + projected.ArrayElementSqlType() + ">";
+              }
+            }
+            elements.push_back(std::move(projected));
+          });
+          if (inferred_type.empty()) { inferred_type = "INT64"; }
+          return Value::Array(std::move(elements), inferred_type);
+        }
+      }
+      elements.reserve(array.Elements().size());
       for (const Expression& element : array.Elements()) {
         Value val = Evaluate(element, scope, aggregates, context, ctes);
         if ((inferred_type.empty() || inferred_type == "INT64") && !val.IsNull()) {

@@ -436,8 +436,11 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
             input.order_keys.push_back(
                 Evaluate(term.expression, scope, nullptr, context, ctes));
           }
-          if (aggregate.GetType() == AggregationType::kStringAgg &&
-              aggregate.SecondaryArg()) {
+          for (const Expression& extra : aggregate.ExtraArgs()) {
+            input.order_keys.push_back(
+                Evaluate(extra, scope, nullptr, context, ctes));
+          }
+          if (aggregate.SecondaryArg()) {
             input.auxiliary =
                 Evaluate(aggregate.SecondaryArg(), scope, nullptr, context,
                          ctes);
