@@ -94,9 +94,84 @@ std::string ToString(AggregationType type) {
       return "STRING_AGG";
     case AggregationType::kCountIf:
       return "COUNTIF";
+    case AggregationType::kAnyValue:
+      return "ANY_VALUE";
+    case AggregationType::kVarSamp:
+      return "VAR_SAMP";
+    case AggregationType::kVarPop:
+      return "VAR_POP";
+    case AggregationType::kStddevSamp:
+      return "STDDEV_SAMP";
+    case AggregationType::kStddevPop:
+      return "STDDEV_POP";
+    case AggregationType::kCovarSamp:
+      return "COVAR_SAMP";
+    case AggregationType::kCovarPop:
+      return "COVAR_POP";
+    case AggregationType::kCorr:
+      return "CORR";
+    case AggregationType::kApproxQuantiles:
+      return "APPROX_QUANTILES";
+    case AggregationType::kApproxTopCount:
+      return "APPROX_TOP_COUNT";
+    case AggregationType::kApproxTopSum:
+      return "APPROX_TOP_SUM";
+    case AggregationType::kHllInit:
+      return "HLL_COUNT.INIT";
+    case AggregationType::kHllMerge:
+      return "HLL_COUNT.MERGE";
+    case AggregationType::kHllMergePartial:
+      return "HLL_COUNT.MERGE_PARTIAL";
+    case AggregationType::kKllInitInt64:
+      return "KLL_QUANTILES.INIT_INT64";
+    case AggregationType::kKllInitUint64:
+      return "KLL_QUANTILES.INIT_UINT64";
+    case AggregationType::kKllInitDouble:
+      return "KLL_QUANTILES.INIT_DOUBLE";
+    case AggregationType::kKllMergePartial:
+      return "KLL_QUANTILES.MERGE_PARTIAL";
     default:
       return "UNKNOWN";
   }
+}
+
+bool IsStatisticalAggregate(AggregationType type) {
+  switch (type) {
+    case AggregationType::kVarSamp:
+    case AggregationType::kVarPop:
+    case AggregationType::kStddevSamp:
+    case AggregationType::kStddevPop:
+    case AggregationType::kCovarSamp:
+    case AggregationType::kCovarPop:
+    case AggregationType::kCorr:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsSketchAggregate(AggregationType type) {
+  switch (type) {
+    case AggregationType::kApproxQuantiles:
+    case AggregationType::kApproxTopCount:
+    case AggregationType::kApproxTopSum:
+    case AggregationType::kHllInit:
+    case AggregationType::kHllMerge:
+    case AggregationType::kHllMergePartial:
+    case AggregationType::kKllInitInt64:
+    case AggregationType::kKllInitUint64:
+    case AggregationType::kKllInitDouble:
+    case AggregationType::kKllMergePartial:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Everything from ANY_VALUE onward is an extended aggregate implemented by
+// the relational accumulator only.
+bool IsExtendedAggregate(AggregationType type) {
+  return type >= AggregationType::kAnyValue;
 }
 
 Value::Value(int int_val) {

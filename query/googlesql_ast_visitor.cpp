@@ -500,9 +500,16 @@ bool NeedsRelationalEvaluation(const Expression& expression,  // NOLINT(misc-no-
     case TypeTag::kQueryExp:
     case TypeTag::kIntervalExp:
       return true;
-    case TypeTag::kAggregateExp:
-      return !top_level || NeedsRelationalEvaluation(
-                               expression->AsAggregateExpression().Child());
+    case TypeTag::kAggregateExp: {
+      const AggregateExpression& aggregate =
+          expression->AsAggregateExpression();
+      // Statistical / sketching aggregates are only implemented by the
+      // relational interpreter's accumulator; keep them off the physical
+      // aggregation operators at any nesting depth.
+      if (IsExtendedAggregate(aggregate.GetType())) { return true;
+}
+      return !top_level || NeedsRelationalEvaluation(aggregate.Child());
+    }
     case TypeTag::kBinaryExp:
       // OR used to force the materializing relational executor because the
       // cost-based scan rules could not derive an access path for it.  They
@@ -755,6 +762,8 @@ Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recu
     if (inner_limit.has_value()) { aggregate->SetInnerLimit(inner_limit); }
     if (type == AggregationType::kStringAgg && arguments.size() > 1) {
       aggregate->SetSecondaryArg(arguments[1]);
+    } else if (IsExtendedAggregate(type) && arguments.size() > 1) {
+      aggregate->SetTrailingArgs({arguments.begin() + 1, arguments.end()});
     }
     return aggregate;
   };
@@ -780,6 +789,71 @@ Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recu
     if (name == "string_agg") { type = AggregationType::kStringAgg; }
     if (name == "countif") { type = AggregationType::kCountIf; }
     return finish_aggregate(type);
+  }
+
+  // Statistical and approximate aggregates. Multi-argument forms keep their
+  // first argument as the aggregate child; the rest ride along as trailing
+  // arguments evaluated per row.
+  {
+    AggregationType extended{};
+    size_t min_arity = 1;
+    size_t max_arity = 1;
+    bool matched = true;
+    if (name == "any_value") {
+      extended = AggregationType::kAnyValue;
+    } else if (name == "var_samp" || name == "variance") {
+      extended = AggregationType::kVarSamp;
+    } else if (name == "var_pop") {
+      extended = AggregationType::kVarPop;
+    } else if (name == "stddev_samp" || name == "stddev") {
+      extended = AggregationType::kStddevSamp;
+    } else if (name == "stddev_pop") {
+      extended = AggregationType::kStddevPop;
+    } else if (name == "covar_samp") {
+      extended = AggregationType::kCovarSamp;
+      min_arity = max_arity = 2;
+    } else if (name == "covar_pop") {
+      extended = AggregationType::kCovarPop;
+      min_arity = max_arity = 2;
+    } else if (name == "corr") {
+      extended = AggregationType::kCorr;
+      min_arity = max_arity = 2;
+    } else if (name == "approx_quantiles") {
+      extended = AggregationType::kApproxQuantiles;
+      min_arity = max_arity = 2;
+    } else if (name == "approx_top_count") {
+      extended = AggregationType::kApproxTopCount;
+      min_arity = max_arity = 2;
+    } else if (name == "approx_top_sum") {
+      extended = AggregationType::kApproxTopSum;
+      min_arity = max_arity = 3;
+    } else if (name == "hll_count.init") {
+      extended = AggregationType::kHllInit;
+      max_arity = 2;
+    } else if (name == "hll_count.merge") {
+      extended = AggregationType::kHllMerge;
+    } else if (name == "hll_count.merge_partial") {
+      extended = AggregationType::kHllMergePartial;
+    } else if (name == "kll_quantiles.init_int64") {
+      extended = AggregationType::kKllInitInt64;
+      max_arity = 2;
+    } else if (name == "kll_quantiles.init_uint64") {
+      extended = AggregationType::kKllInitUint64;
+      max_arity = 2;
+    } else if (name == "kll_quantiles.init_double") {
+      extended = AggregationType::kKllInitDouble;
+      max_arity = 2;
+    } else if (name == "kll_quantiles.merge_partial") {
+      extended = AggregationType::kKllMergePartial;
+    } else {
+      matched = false;
+    }
+    if (matched) {
+      if (arguments.size() < min_arity || arguments.size() > max_arity) {
+        throw std::runtime_error("GoogleSQL AST: aggregate arity");
+      }
+      return finish_aggregate(extended);
+    }
   }
   return FunctionCallExp(name, std::move(arguments));
 }
@@ -1366,22 +1440,32 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     Expression base;
     const GoogleSqlAstNode* index_node = nullptr;
     std::string accessor;
+    auto accessor_name = [](const GoogleSqlAstNode& call) -> std::string {
+      if (call.children.empty() ||
+          call.children.front()->kind != "PathExpression") {
+        return {};
+      }
+      std::string name = UpperCopy(Path(*call.children.front()));
+      if (name == "OFFSET" || name == "ORDINAL" || name == "SAFE_OFFSET" ||
+          name == "SAFE_ORDINAL") {
+        return name;
+      }
+      return {};
+    };
     for (const auto& child : node.children) {
       if (child->kind == "Location") { continue; }
       if (child->kind == "FunctionCall") {
-        if (!child->children.empty() &&
-            child->children.front()->kind == "PathExpression") {
-          accessor = UpperCopy(Path(*child->children.front()));
-          const GoogleSqlAstNode* arg = nullptr;
+        const std::string name = accessor_name(*child);
+        if (!name.empty()) {
+          accessor = name;
           for (size_t i = 1; i < child->children.size(); ++i) {
             if (child->children[i]->kind != "Location") {
-              arg = child->children[i].get();
+              index_node = child->children[i].get();
               break;
             }
           }
-          if (arg != nullptr) { index_node = arg; }
+          continue;
         }
-        continue;
       }
       if (!base && child->kind != "Location") { base = VisitExpression(*child); }
     }
@@ -1748,7 +1832,11 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         if (val_expr) {
           try {
             Value v = val_expr->Evaluate(Row(), Schema());
-            if (!v.IsNull()) {
+            if (v.IsNull()) {
+              // Keep the JSON object well-formed so downstream struct
+              // parsing (UNNEST, TO_JSON_STRING) sees an explicit null.
+              field.text = "null";
+            } else {
               any_ci = any_ci || v.IsCaseInsensitive();
               if (v.type == ValueType::kVarChar) {
                 field.text = std::string(v.value.varchar_value);

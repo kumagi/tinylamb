@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -38,12 +39,15 @@ void CollectAggregates(const Expression& expression,
 
 // One row fed into an aggregate.  `order_keys` carries the evaluated inner
 // ORDER BY terms and `condition` the HAVING MAX/MIN condition value; both are
-// only populated when the aggregate declares them.
+// only populated when the aggregate declares them.  `trailing_values` carries
+// evaluated trailing arguments (COVAR's second input, sketch precision /
+// count parameters).
 struct AggregateInput {
   Value value;
   std::vector<Value> order_keys;
   Value condition;
   Value auxiliary;  // STRING_AGG delimiter
+  std::vector<Value> trailing_values;
 };
 
 std::string ElementSqlTypeName(ValueType type);
@@ -75,12 +79,55 @@ struct AggregateAccumulator {
     std::vector<Value> order_keys;
     Value condition;
     Value auxiliary;
+    std::vector<Value> trailing_values;
   };
   mutable std::unique_ptr<std::vector<BufferedRow>> buffer_;
   mutable std::vector<Value> array_values_;
   mutable std::optional<std::string> delimiter_;
 
-  void ApplyCore(const Value& value);
+  // Extended-aggregate state. Kept in one variant-ish blob so the common
+  // aggregate path stays lean.
+  struct StatState {
+    long double sx = 0;   // Σx (or Σy for two-input forms)
+    long double sxx = 0;  // Σx²
+    long double sy = 0;   // Σy
+    long double syy = 0;  // Σy²
+    long double sxy = 0;  // Σxy
+  };
+  StatState stat_;
+  bool saw_any_ = false;                        // ANY_VALUE captured its value
+  bool saw_null_param_ = false;                 // KLL INIT: NULL precision seen
+  mutable std::vector<Value> quantile_values_;  // APPROX_QUANTILES inputs
+  int64_t quantile_count_ = 0;
+  bool quantile_count_valid_ = false;
+  int64_t top_count_limit_ = 0;
+  bool top_count_valid_ = false;
+  struct SumWeight {
+    Value value;
+    long double sum = 0;
+    int64_t weights = 0;  // non-null weight count (0 => NULL sum)
+    bool is_double = false;
+  };
+  // Entries kept insertion-ordered; lookup uses NULL-aware equality because
+  // NULL is a legitimate APPROX_TOP_* input and Value::operator< rejects it.
+  mutable std::vector<SumWeight> top_sums_;
+  mutable std::vector<Value> top_count_values_;
+  mutable std::vector<int64_t> top_count_counts_;
+  mutable std::vector<std::string> sketch_values_;  // HLL/KLL distinct entries
+  mutable int sketch_type_ = 0;                     // 0 = unset
+  mutable int64_t sketch_precision_ = 0;
+
+  void ApplyCore(const Value& value,
+                 const std::vector<Value>& trailing_values = {});
+  void RecordQuantileParam(const std::vector<Value>& trailing_values);
+  void RecordLimitParam(const std::vector<Value>& trailing_values);
+  SumWeight& FindOrAddTopSum(const Value& value);
+  int64_t& FindOrAddTopCount(const Value& value);
+  void SketchAdd(const Value& value, const std::vector<Value>& trailing_values);
+  void SketchMerge(const Value& sketch_bytes);
+  // HLL_COUNT.MERGE folds EXTRACT into the aggregate; MERGE_PARTIAL returns
+  // the merged sketch bytes instead.
+  Value FinishSketch(bool extract_count) const;
 };
 
 using AggregateResultMap =
@@ -88,8 +135,7 @@ using AggregateResultMap =
 
 Value Evaluate(const Expression& expression, const Scope& scope,
                const AggregateResultMap* aggregates,
-               TransactionContext& context,
-               const CteMap& ctes);
+               TransactionContext& context, const CteMap& ctes);
 
 Schema QualifySchema(const Schema& schema, std::string_view qualifier);
 
@@ -103,8 +149,8 @@ std::vector<slot_t> RequiredColumns(const SelectStatement& statement,
 Schema ProjectSchema(const Schema& schema,
                      const std::vector<slot_t>& projection);
 
-std::string BaseRelationCacheKey(
-    std::string_view table, const std::vector<slot_t>* projection);
+std::string BaseRelationCacheKey(std::string_view table,
+                                 const std::vector<slot_t>* projection);
 
 bool ReusesBaseRelation(TransactionContext& context,
                         const SelectSource& source);
