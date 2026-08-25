@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <random>
 #include <regex>
 #include <set>
 #include <stdexcept>
@@ -6257,6 +6258,106 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     return ExtractSketchQuantilesStatic(sketch, number.value.int_value);
+  }
+
+  if (name == "array_concat") {
+    if (arguments.empty()) {
+      throw std::runtime_error("ARRAY_CONCAT requires at least 1 argument");
+    }
+    std::vector<Value> merged;
+    std::string element_type;
+    for (const Value& arr : arguments) {
+      if (arr.IsNull()) {
+        return {};
+      }
+      if (!arr.IsArray()) {
+        throw std::runtime_error("ARRAY_CONCAT requires ARRAY arguments");
+      }
+      if (element_type.empty()) {
+        element_type = arr.ArrayElementSqlType();
+      }
+      const auto& elements = arr.ArrayElements();
+      merged.insert(merged.end(), elements.begin(), elements.end());
+    }
+    return Value::Array(std::move(merged), element_type);
+  }
+
+  if (name == "array_includes" || name == "array_includes_any" ||
+      name == "array_includes_all") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error(name + " requires 2 arguments");
+    }
+    const Value& input = arguments[0];
+    const Value& target = arguments[1];
+    // GoogleSQL: a NULL array or NULL target yields NULL.
+    if (input.IsNull() || target.IsNull()) {
+      return {};
+    }
+    if (!input.IsArray() ||
+        (name != "array_includes" && !target.IsArray())) {
+      throw std::runtime_error(name + " requires ARRAY arguments");
+    }
+    auto equals = [](const Value& left, const Value& right) {
+      try {
+        return Binary(BinaryOperation::kEquals, left, right).Truthy();
+      } catch (...) {
+        return false;
+      }
+    };
+    const auto& haystack = input.ArrayElements();
+    bool result;
+    if (name == "array_includes") {
+      result = false;
+      for (const Value& element : haystack) {
+        if (!element.IsNull() && equals(element, target)) {
+          result = true;
+          break;
+        }
+      }
+    } else {
+      const auto& targets = target.ArrayElements();
+      result = name != "array_includes_any";
+      for (const Value& wanted : targets) {
+        if (wanted.IsNull()) {
+          // NULL target elements match nothing: ANY cannot use them and ALL
+          // fails outright.
+          if (name == "array_includes_all") {
+            result = false;
+          }
+          continue;
+        }
+        bool found = false;
+        for (const Value& element : haystack) {
+          if (!element.IsNull() && equals(element, wanted)) {
+            found = true;
+            break;
+          }
+        }
+        if (name == "array_includes_any") {
+          if (found) {
+            result = true;
+            break;
+          }
+        } else if (!found) {
+          result = false;
+          break;
+        }
+      }
+    }
+    return Value(result);
+  }
+
+  if (name == "rand") {
+    if (!arguments.empty()) {
+      throw std::runtime_error("RAND requires no arguments");
+    }
+    static thread_local std::mt19937_64 rng(
+        std::random_device{}() ^
+        static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    static thread_local std::uniform_real_distribution<double> uniform(0.0,
+                                                                       1.0);
+    return Value(uniform(rng));
   }
 
   throw std::runtime_error("unsupported function " + name);
