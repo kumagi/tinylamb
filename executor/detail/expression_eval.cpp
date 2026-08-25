@@ -336,7 +336,44 @@ std::vector<std::string> SplitDottedName(const std::string& name) {
 
 }  // namespace
 
+namespace {
+
+// Strict resolution: an explicitly qualified reference only matches a column
+// carrying that qualifier (or an unqualified name when the reference has
+// none).  Unlike FindColumn it never falls back to bare-name matches, so a
+// qualified reference to an OUTER scope is not hijacked by a same-named
+// column of an inner relation whose qualifiers were stripped by projection.
+int FindColumnStrict(const Schema& schema, const ColumnName& name) {
+  int match = -1;
+  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+    const ColumnName& candidate = schema.GetColumn(i).Name();
+    const bool ok = name.schema.empty()
+                        ? IdentifierEquals(candidate.name, name.name) &&
+                              candidate.schema.empty()
+                        : IdentifierEquals(candidate.schema, name.schema) &&
+                              IdentifierEquals(candidate.name, name.name);
+    if (!ok) { continue; }
+    if (match >= 0 && name.schema.empty()) {
+      throw std::runtime_error("ambiguous column " + name.name);
+    }
+    if (match < 0) { match = static_cast<int>(i); }
+  }
+  return match;
+}
+
+}  // namespace
+
 Value Lookup(const ColumnName& name, const Scope& scope) {
+  // Pass 1: strict resolution, innermost scope outward.
+  for (const Scope* current = &scope; current != nullptr;
+       current = current->outer) {
+    if (current->row == nullptr || current->schema == nullptr) { continue; }
+    const int offset = FindColumnStrict(*current->schema, name);
+    if (offset >= 0) { return (*current->row)[static_cast<size_t>(offset)]; }
+  }
+  // Pass 2: loose per-level resolution.  Projections may strip qualifiers,
+  // so a qualified name may still denote a local column by bare name when no
+  // strict interpretation exists anywhere on the chain.
   for (const Scope* current = &scope; current != nullptr;
        current = current->outer) {
     if (current->row == nullptr || current->schema == nullptr) { continue; }
@@ -1147,6 +1184,18 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(FormatCivilTime(utc_ct) + "+00");
     }
     return Value(FormatCivilTime(res_ct));
+  }
+  // IF() must evaluate only the taken branch: untaken branches are not
+  // allowed to raise errors (division by zero, empty subquery failures).
+  if (name == "if") {
+    if (call.Args().size() != 3) {
+      throw std::runtime_error("IF requires 3 arguments");
+    }
+    const Value condition =
+        Evaluate(call.Args()[0], scope, aggregates, context, ctes);
+    const bool take_then = !condition.IsNull() && Truthy(condition);
+    return Evaluate(call.Args()[take_then ? 1 : 2], scope, aggregates,
+                    context, ctes);
   }
   std::vector<Value> arguments;
   for (const Expression& argument : call.Args()) {
@@ -4770,12 +4819,13 @@ std::vector<slot_t> RequiredColumns(const SelectStatement& statement,
   result.reserve(schema.ColumnCount());
   for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
     const ColumnName& candidate = schema.GetColumn(i).Name();
+    // Match on bare column name only: references may qualify this relation by
+    // table name or by any alias, while stored schemas qualify columns by the
+    // physical table name.  Over-projecting a scan is harmless; dropping a
+    // column that some scope reference needs breaks evaluation.
     const bool needed =
         selects_star || std::ranges::any_of(bases, [&](const auto& name) {
-          if (name.name == "*") { return false;
-}
-          return name.name == candidate.name &&
-                 (name.schema.empty() || name.schema == candidate.schema);
+          return name.name != "*" && name.name == candidate.name;
         });
     if (needed) { result.push_back(i);
 }

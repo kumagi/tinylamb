@@ -499,9 +499,46 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     const Scope* outer, const CteMap& inherited_ctes) {
   EnsureReusableProjections(context, context.execution_runtime());
   CteMap ctes = inherited_ctes;
-  for (const auto& [name, query] : statement.WithQueries()) {
-    ctes[name] = std::make_shared<Relation>(
-        ExecuteQuery(context, *query, outer, ctes));
+  // WITH entries live in an unordered map, so declaration order is lost;
+  // execute them in dependency order (a CTE may reference earlier ones).
+  if (!statement.WithQueries().empty()) {
+    std::unordered_set<std::string> pending;
+    for (const auto& [name, query] : statement.WithQueries()) {
+      (void)query;
+      pending.insert(name);
+    }
+    while (!pending.empty()) {
+      bool progress = false;
+      for (auto iter = pending.begin(); iter != pending.end();) {
+        const std::string& name = *iter;
+        const SelectStatement& query = *statement.WithQueries().at(name);
+        bool ready = true;
+        for (const SelectSource& source : query.Sources()) {
+          if (!source.table.empty() && pending.contains(source.table)) {
+            ready = false;
+            break;
+          }
+        }
+        if (ready) {
+          ctes[name] = std::make_shared<Relation>(
+              ExecuteQuery(context, query, outer, ctes));
+          iter = pending.erase(iter);
+          progress = true;
+        } else {
+          ++iter;
+        }
+      }
+      if (!progress) {
+        // Cyclic references cannot be satisfied; run whatever remains in
+        // map order so the failure mirrors a missing relation.
+        for (const std::string& name : pending) {
+          ctes[name] = std::make_shared<Relation>(
+              ExecuteQuery(context, *statement.WithQueries().at(name), outer,
+                           ctes));
+        }
+        break;
+      }
+    }
   }
 
   // Single-table aggregation: filter and aggregate while scanning so we never
@@ -794,6 +831,14 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       output_columns.emplace_back(ProjectionName(projection_item, i),
                                   ValueType::kNull);
     }
+    // Inline ORDER BY handling: keys may reference select aliases (output
+    // schema), grouping base columns (representative row) or outer scopes.
+    const Schema initial_output_schema("", output_columns);
+    struct KeyedRow {
+      std::vector<Value> keys;
+      Row row;
+    };
+    std::vector<KeyedRow> sortable;
     for (const GroupState& group : groups) {
       AggregateResultMap aggregate_results;
       aggregate_results.reserve(aggregate_expressions.size());
@@ -814,7 +859,55 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
         values.push_back(Evaluate(projection_item.expression, scope,
                                   &aggregate_results, context, ctes));
       }
-      output.AddRow(Row(std::move(values)));
+      Row output_row(std::move(values));
+      // Sort keys may reference base columns of the grouped relation
+      // (`ORDER BY str_val` where str_val is a grouping key); chain the
+      // projected row to the group's representative row so those resolve.
+      if (!stmt.OrderBy().empty()) {
+        Scope base_scope{.row=&group.representative, .schema=&input.schema,
+                         .outer=outer};
+        Scope proj_scope{.row=&output_row, .schema=&initial_output_schema,
+                         .outer=&base_scope};
+        std::vector<Value> keys;
+        keys.reserve(stmt.OrderBy().size());
+        for (const auto& key : stmt.OrderBy()) {
+          keys.push_back(
+              Evaluate(key.expression, proj_scope, &aggregate_results,
+                       context, ctes));
+        }
+        sortable.push_back(KeyedRow{.keys=std::move(keys),
+                                    .row=std::move(output_row)});
+      } else {
+        output.AddRow(std::move(output_row));
+      }
+    }
+    if (!sortable.empty()) {
+      const auto sort_begin = std::chrono::steady_clock::now();
+      std::ranges::stable_sort(
+          sortable,
+          [&stmt](const KeyedRow& left, const KeyedRow& right) {
+            for (size_t i = 0; i < stmt.OrderBy().size(); ++i) {
+              const Value& a = left.keys[i];
+              const Value& b = right.keys[i];
+              if (a == b) { continue;
+}
+              const bool nulls_first =
+                  stmt.OrderBy()[i].nulls_first.value_or(
+                      stmt.OrderBy()[i].ascending);
+              if (a.IsNull()) { return nulls_first;
+}
+              if (b.IsNull()) { return !nulls_first;
+}
+              return stmt.OrderBy()[i].ascending ? a < b : b < a;
+            }
+            return false;
+          });
+      for (KeyedRow& keyed : sortable) {
+        output.AddRow(std::move(keyed.row));
+      }
+      if (context.execution_runtime() != nullptr) {
+        context.execution_runtime()->sort_ms += ElapsedMs(sort_begin);
+      }
     }
     for (size_t i = 0; i < output_columns.size() && !output.rows.empty(); ++i) {
       output_columns[i] =
@@ -822,12 +915,12 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     }
     output.schema = Schema("", std::move(output_columns));
     output.FinishSpill();
-    // DISTINCT / ORDER BY / LIMIT without running Project again.
+    // DISTINCT / LIMIT without running Project again; ORDER BY was applied
+    // inline above (its keys may reference grouping base columns that are no
+    // longer reachable from the projected output alone), and DistinctOf
+    // preserves row order.
     if (stmt.Distinct()) {
       output = DistinctOf(std::move(output));
-    }
-    if (!stmt.OrderBy().empty()) {
-      ApplyOrderBy(context, statement, &output, outer, ctes);
     }
     return LimitedRows(statement, std::move(output));
   }
