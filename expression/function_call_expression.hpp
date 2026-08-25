@@ -32,8 +32,10 @@ class EvaluationContext;
 
 class FunctionCallExpression : public ExpressionBase {
  public:
-  FunctionCallExpression(std::string func_name, std::vector<Expression> args)
-      : func_name_(std::move(func_name)), args_(std::move(args)) {
+  FunctionCallExpression(std::string func_name, std::vector<Expression> args,
+                         bool canonical_if = false)
+      : func_name_(std::move(func_name)), args_(std::move(args)),
+        canonical_if_(canonical_if) {
     std::transform(
         func_name_.begin(), func_name_.end(), func_name_.begin(),
         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -54,6 +56,7 @@ class FunctionCallExpression : public ExpressionBase {
   Status Validate(EvaluationContext& context, const Schema& schema) const override;
   [[nodiscard]] const std::string& FuncName() const { return func_name_; }
   [[nodiscard]] const std::vector<Expression>& Args() const { return args_; }
+  [[nodiscard]] bool IsCanonicalIf() const { return canonical_if_; }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
   [[nodiscard]] TypeTag Type() const override {
@@ -64,6 +67,7 @@ class FunctionCallExpression : public ExpressionBase {
  private:
   std::string func_name_;
   std::vector<Expression> args_;
+  bool canonical_if_{false};
 };
 
 }  // namespace tinylamb

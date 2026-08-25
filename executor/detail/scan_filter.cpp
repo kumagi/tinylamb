@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <exception>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -429,11 +430,16 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
                     const std::vector<slot_t>* projection,
                     const std::vector<Expression>* scan_predicates,
                     const std::unordered_set<int64_t>* int_key_filter,
-                    std::optional<slot_t> int_key_column) {
+                    std::optional<slot_t> int_key_column,
+                    size_t max_rows) {
   Relation result(context.execution_runtime());
   if (source.unnest) {
+    Scope unnest_scope;
+    if (outer != nullptr) {
+      unnest_scope = *outer;
+    }
     const Value array_val =
-        Evaluate(source.unnest, Scope{.outer = outer}, nullptr, context, ctes);
+        Evaluate(source.unnest, unnest_scope, nullptr, context, ctes);
     std::string col_name = source.alias.empty() ? "unnest" : source.alias;
     ValueType elem_type = ValueType::kNull;
     std::vector<Value> elements;
@@ -698,7 +704,8 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
                  projection == nullptr) {
         full_key_column = int_key_column;
       }
-      const bool parallel_ok = TryParallelTableScan(
+      const bool parallel_ok = max_rows == std::numeric_limits<size_t>::max() &&
+          TryParallelTableScan(
           context, *table.Value(), projection, int_key_filter, full_key_column,
           filter_during_scan, filter_during_scan ? &scan_filter : nullptr,
           result.schema, outer, ctes, &result);
@@ -717,7 +724,8 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
           }
           return table.Value()->BeginFullScan(context.txn_);
         }();
-        while (iterator.IsValid()) {
+        size_t emitted_rows = 0;
+        while (iterator.IsValid() && emitted_rows < max_rows) {
           if (context.execution_runtime() != nullptr) {
             ++context.execution_runtime()->scan_rows;
             context.execution_runtime()->scan_values_available += table_schema.ColumnCount();
@@ -740,6 +748,7 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
           }
           if (matches) {
             result.AddRow(*iterator);
+            ++emitted_rows;
             if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->scan_output_rows;
 }
           }

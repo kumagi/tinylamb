@@ -32,6 +32,7 @@
 #include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
+#include "distinct_plan.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/hash_join_mode.hpp"
 #include "executor/query_memory.hpp"
@@ -41,17 +42,22 @@
 #include "gtest/gtest.h"
 #include "index/index.hpp"
 #include "index_only_scan_plan.hpp"
+#include "merge_join_plan.hpp"
 #include "page/page_manager.hpp"
 #include "product_plan.hpp"
 #include "projection_plan.hpp"
 #include "selection_plan.hpp"
+#include "set_operation_plan.hpp"
+#include "sort_plan.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
+#include "topn_plan.hpp"
 #include "transaction/transaction.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
+#include "values_plan.hpp"
 
 namespace tinylamb {
 
@@ -156,6 +162,49 @@ TEST_F(PlanTest, Construct) {
   // Arrange -- nothing to set up; default database created by SetUp()
   // Act -- nothing to execute; default constructed via SetUp()
   // Assert -- nothing to verify; gtest green on pass, death on crash
+}
+
+TEST_F(PlanTest, ValuesPlanEmitsTypedMultiColumnRowsAndValidatesWidth) {
+  const Schema schema("values", {Column("id", ValueType::kInt64),
+                                  Column("name", ValueType::kVarChar)});
+  ValuesPlan values(schema, {Row({Value(1), Value("one")}),
+                             Row({Value(2), Value("two")})});
+  EXPECT_EQ(values.AccessRowCount(), 2U);
+  EXPECT_EQ(values.GetSchema().ColumnCount(), 2U);
+  EXPECT_EQ(values.ToString(), "Values (rows=2)");
+
+  TransactionContext context = rs_->BeginContext();
+  Executor executor = values.EmitExecutor(context);
+  Row row;
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(1), Value("one")}));
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(2), Value("two")}));
+  EXPECT_FALSE(executor->Next(&row, nullptr));
+
+  EXPECT_THROW(ValuesPlan(schema, {Row({Value(1)})}), std::invalid_argument);
+}
+
+TEST_F(PlanTest, SetOperationPlanPublishesNumericCommonSchema) {
+  Plan left = std::make_shared<ValuesPlan>(
+      Schema("left", {Column("v", ValueType::kInt64)}),
+      std::vector<Row>{Row({Value(1)})});
+  Plan right = std::make_shared<ValuesPlan>(
+      Schema("right", {Column("v", ValueType::kDouble)}),
+      std::vector<Row>{Row({Value(2.5)})});
+  SetOperationPlan plan({std::move(left), std::move(right)},
+                        SetOperationKind::kUnionAll);
+  ASSERT_EQ(plan.GetSchema().ColumnCount(), 1U);
+  EXPECT_EQ(plan.GetSchema().GetColumn(0).Type(), ValueType::kDouble);
+
+  TransactionContext context = rs_->BeginContext();
+  Executor executor = plan.EmitExecutor(context);
+  Row row;
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(1.0)}));
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(2.5)}));
+  EXPECT_FALSE(executor->Next(&row, nullptr));
 }
 
 TEST_F(PlanTest, ScanPlan) {
@@ -310,6 +359,28 @@ TEST_F(PlanTest, AggregationPlan) {
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
+TEST_F(PlanTest, AggregatePhysicalStrategiesHaveDistinctPlanContracts) {
+  auto ctx = rs_->BeginContext();
+  const auto table_or = ctx.GetTable("Sc1");
+  ASSERT_TRUE(table_or.HasValue());
+  const auto stats_or = ctx.GetStats("Sc1");
+  ASSERT_TRUE(stats_or.HasValue());
+  const Plan child = std::make_shared<FullScanPlan>(*table_or.Value(),
+                                                    *stats_or.Value());
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("n", AggregateExpressionExp(
+                                AggregationType::kCount, ColumnValueExp("c1")))};
+
+  const HashAggregatePlan hash(child, aggregates);
+  const SortAggregatePlan sort(child, aggregates);
+  const StreamAggregatePlan stream(child, aggregates);
+  EXPECT_EQ(hash.Strategy(), AggregationStrategy::kHash);
+  EXPECT_EQ(sort.Strategy(), AggregationStrategy::kSort);
+  EXPECT_EQ(stream.Strategy(), AggregationStrategy::kStream);
+  EXPECT_NE(hash.ToString(), sort.ToString());
+  EXPECT_NE(sort.ToString(), stream.ToString());
+}
+
 TEST_F(PlanTest, FullScanAccessors) {
   // Arrange -- begin context, get Sc1 table and its real statistics
   auto ctx = rs_->BeginContext();
@@ -333,6 +404,20 @@ TEST_F(PlanTest, FullScanAccessors) {
   std::ostringstream oss;
   fs->Dump(oss, 0);
   EXPECT_NE(oss.str().find("FullScan: Sc1"), std::string::npos);
+}
+
+TEST_F(PlanTest, FullScanWithRowLimit_ReportsCappedCostAndCardinality) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
+                        ctx.GetStats("Sc1"));
+
+  FullScanPlan scan(*table, *stats, 2);
+  EXPECT_EQ(scan.MaxRows(), 2U);
+  const size_t expected = stats->Rows() < 2 ? stats->Rows() : 2;
+  EXPECT_EQ(scan.AccessRowCount(), expected);
+  EXPECT_EQ(scan.EmitRowCount(), expected);
+  EXPECT_NE(scan.ToString().find("max rows: 2"), std::string::npos);
 }
 
 TEST_F(PlanTest, ProjectionExpressionColumn) {
@@ -442,6 +527,92 @@ TEST_F(PlanTest, AggregationAccessors) {
   EXPECT_NE(oss.str().find("Aggregation {"), std::string::npos);
 }
 
+TEST_F(PlanTest, SortPlanOrdersRowsAndReportsOrdering) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
+                        ctx.GetStats("Sc1"));
+  Plan child(new FullScanPlan(*table, *stats));
+  Plan sorted(new SortPlan(
+      child, {SortKey{ColumnValueExp(ColumnName("Sc1.c1")), true}}));
+
+  EXPECT_TRUE(sorted->IsOrderedBy({ColumnValueExp(ColumnName("Sc1.c1"))},
+                                  {true}));
+  EXPECT_FALSE(sorted->IsOrderedBy({ColumnValueExp(ColumnName("Sc1.c1"))},
+                                   {false}));
+  EXPECT_NE(sorted->ToString().find("Sort"), std::string::npos);
+
+  Executor executor = sorted->EmitExecutor(ctx);
+  Row row;
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(10));
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(12));
+}
+
+TEST_F(PlanTest, SortAndTopNPlansReportSortedPrefixes) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
+                        ctx.GetStats("Sc1"));
+  Plan scan = std::make_shared<FullScanPlan>(*table, *stats);
+  const Expression first = ColumnValueExp(ColumnName("Sc1.c1"));
+  const Expression second = ColumnValueExp(ColumnName("Sc1.c2"));
+  Plan sorted = std::make_shared<SortPlan>(
+      scan, std::vector<SortKey>{{first, true}, {second, true}});
+  Plan topn = std::make_shared<TopNPlan>(
+      scan, std::vector<TopNKey>{{first, true}, {second, true}}, 3, 0);
+
+  for (const Plan& plan : {sorted, topn}) {
+    EXPECT_TRUE(plan->IsOrderedBy({first}, {true}));
+    EXPECT_TRUE(plan->IsOrderedBy({first, second}, {true, true}));
+    EXPECT_FALSE(plan->IsOrderedBy({first}, {false}));
+  }
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(PlanTest, ProjectionTranslatesAliasedOrderKeysToChildExpressions) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
+                        ctx.GetStats("Sc1"));
+  const Expression source_key = ColumnValueExp(ColumnName("Sc1.c1"));
+  Plan sorted = std::make_shared<SortPlan>(
+      std::make_shared<FullScanPlan>(*table, *stats),
+      std::vector<SortKey>{{source_key, true}});
+  Plan projected = std::make_shared<ProjectionPlan>(
+      sorted, std::vector<NamedExpression>{NamedExpression(
+                  "$order0", ColumnValueExp(ColumnName("Sc1.c1")))});
+
+  EXPECT_TRUE(projected->IsOrderedBy(
+      {ColumnValueExp(ColumnName("$order0"))}, {true}));
+  EXPECT_FALSE(projected->IsOrderedBy(
+      {ColumnValueExp(ColumnName("$order0"))}, {false}));
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(PlanTest, DistinctPlanUsesHashExecutorAndPreservesOrderingMetadata) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
+                        ctx.GetStats("Sc1"));
+  Plan child(new FullScanPlan(*table, *stats));
+  Plan distinct(new DistinctPlan(child));
+
+  EXPECT_EQ(distinct->EmitRowCount(), child->EmitRowCount());
+  EXPECT_FALSE(distinct->IsOrderedBy({ColumnValueExp(ColumnName("Sc1.c1"))},
+                                     {true}));
+  EXPECT_EQ(distinct->ToString(), "Distinct");
+
+  Executor executor = distinct->EmitExecutor(ctx);
+  Row row;
+  size_t count = 0;
+  while (executor->Next(&row, nullptr)) {
+    ++count;
+  }
+  EXPECT_EQ(count, 6U);
+}
+
 TEST_F(PlanTest, ProductCrossJoinAccessors) {
   // Arrange -- begin context, get Sc1 and Sc2 tables
   auto ctx = rs_->BeginContext();
@@ -501,6 +672,116 @@ TEST_F(PlanTest, ProductHashJoinAccessors) {
   std::ostringstream oss;
   prop->Dump(oss, 0);
   EXPECT_NE(oss.str().find("right:{Sc2.d1}"), std::string::npos);
+}
+
+TEST_F(PlanTest, MergeJoinPlanCarriesSortedKeyContractAndOutputSchema) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  TableStatistics ts((Schema()));
+  auto left_scan = std::make_shared<FullScanPlan>(*tbl1, ts);
+  auto left = std::make_shared<SortPlan>(
+      left_scan,
+      std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc1.c1")), true}});
+  auto right = std::make_shared<FullScanPlan>(*tbl2, ts);
+
+  Plan plan(new MergeJoinPlan(left, {ColumnName("Sc1.c1")}, right,
+                              {ColumnName("Sc2.d1")}));
+  EXPECT_EQ(plan->GetSchema().ColumnCount(), 7U);
+  EXPECT_EQ(plan->EmitRowCount(),
+            std::min(left->EmitRowCount(), right->EmitRowCount()));
+  EXPECT_TRUE(plan->IsOrderedBy(
+      {ColumnValueExp(ColumnName("Sc1.c1"))}, {true}));
+  EXPECT_FALSE(plan->IsOrderedBy(
+      {ColumnValueExp(ColumnName("Sc2.d1"))}, {true}));
+  EXPECT_NE(plan->ToString().find("MergeJoin"), std::string::npos);
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("keys=1"), std::string::npos);
+}
+
+TEST_F(PlanTest, MergeSemiAndAntiJoinPlansExposeProbeSchema) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, left_table,
+                        ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, right_table,
+                        ctx.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, left_stats,
+                        ctx.GetStats("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, right_stats,
+                        ctx.GetStats("Sc2"));
+  Plan left = std::make_shared<FullScanPlan>(*left_table, *left_stats);
+  Plan right = std::make_shared<FullScanPlan>(*right_table, *right_stats);
+
+  MergeJoinPlan semi(left, {ColumnName("Sc1.c1")}, right,
+                     {ColumnName("Sc2.d1")}, SemiJoinKind());
+  MergeJoinPlan anti(left, {ColumnName("Sc1.c1")}, right,
+                     {ColumnName("Sc2.d1")}, AntiJoinKind());
+  EXPECT_EQ(semi.GetSchema().ColumnCount(), left->GetSchema().ColumnCount());
+  EXPECT_EQ(anti.GetSchema().ColumnCount(), left->GetSchema().ColumnCount());
+  EXPECT_EQ(semi.Kind(), SemiJoinKind());
+  EXPECT_EQ(anti.Kind(), AntiJoinKind());
+  EXPECT_NE(semi.ToString().find("MergeSemiJoin"), std::string::npos);
+  EXPECT_NE(anti.ToString().find("MergeAntiJoin"), std::string::npos);
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(PlanTest, ProductSemiAndAntiJoinPreserveProbeSchemaAndCardinalityBound) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts1,
+                        ctx.GetStats("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts2,
+                        ctx.GetStats("Sc2"));
+  auto left = std::make_shared<FullScanPlan>(*tbl1, *ts1);
+  auto right = std::make_shared<FullScanPlan>(*tbl2, *ts2);
+
+  Plan semi(new ProductPlan(left, {ColumnName("Sc1.c1")}, right,
+                            {ColumnName("Sc2.d1")}, SemiJoinKind()));
+  Plan anti(new ProductPlan(left, {ColumnName("Sc1.c1")}, right,
+                            {ColumnName("Sc2.d1")}, AntiJoinKind()));
+
+  EXPECT_EQ(semi->GetSchema().ColumnCount(), left->GetSchema().ColumnCount());
+  EXPECT_EQ(anti->GetSchema().ColumnCount(), left->GetSchema().ColumnCount());
+  EXPECT_EQ(semi->EmitRowCount(), std::min(left->EmitRowCount(),
+                                           right->EmitRowCount()));
+  EXPECT_EQ(anti->EmitRowCount(), left->EmitRowCount());
+  EXPECT_NE(semi->ToString().find("Semi Join"), std::string::npos);
+  EXPECT_NE(anti->ToString().find("Anti Join"), std::string::npos);
+}
+
+TEST_F(PlanTest, ProductOuterJoinPreservesBothSchemasAndOuterCardinalityBound) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts1,
+                        ctx.GetStats("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, ts2,
+                        ctx.GetStats("Sc2"));
+  auto left = std::make_shared<FullScanPlan>(*tbl1, *ts1);
+  auto right = std::make_shared<FullScanPlan>(*tbl2, *ts2);
+
+  Plan left_outer(new ProductPlan(left, {ColumnName("Sc1.c1")}, right,
+                                  {ColumnName("Sc2.d1")},
+                                  LeftOuterJoinKind()));
+  Plan right_outer(new ProductPlan(left, {ColumnName("Sc1.c1")}, right,
+                                   {ColumnName("Sc2.d1")},
+                                   RightOuterJoinKind()));
+  Plan full_outer(new ProductPlan(left, {ColumnName("Sc1.c1")}, right,
+                                  {ColumnName("Sc2.d1")},
+                                  FullOuterJoinKind()));
+
+  for (const Plan& plan : {left_outer, right_outer, full_outer}) {
+    EXPECT_EQ(plan->GetSchema().ColumnCount(),
+              left->GetSchema().ColumnCount() + right->GetSchema().ColumnCount());
+    EXPECT_EQ(plan->EmitRowCount(),
+              std::max(left->EmitRowCount(), right->EmitRowCount()));
+  }
+  EXPECT_NE(left_outer->ToString().find("Left Outer Join"), std::string::npos);
+  EXPECT_NE(right_outer->ToString().find("Right Outer Join"),
+            std::string::npos);
+  EXPECT_NE(full_outer->ToString().find("Full Outer Join"), std::string::npos);
 }
 
 TEST_F(PlanTest, ProductHybridHashJoinPreferredUnderTinyBudget) {

@@ -1077,6 +1077,137 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     throw std::runtime_error("requires DATE");
   };
 
+  // Array generators deliberately return an array value rather than owning a
+  // separate scan operator.  The existing UNNEST source then provides the
+  // same row-source contract for both literal and correlated generators.
+  if (name == "generate_array" || name == "generate_series") {
+    if (arguments.size() < 2 || arguments.size() > 3) {
+      throw std::runtime_error(name + " requires 2 or 3 arguments");
+    }
+    if (std::ranges::any_of(arguments, [](const Value& value) {
+          return value.IsNull();
+        })) {
+      return {};
+    }
+    const Value& start = arguments[0];
+    const Value& stop = arguments[1];
+    if ((start.type != ValueType::kInt64 && start.type != ValueType::kDouble) ||
+        (stop.type != ValueType::kInt64 && stop.type != ValueType::kDouble)) {
+      throw std::runtime_error(name + " requires numeric arguments");
+    }
+    const bool use_double = start.type == ValueType::kDouble ||
+                            stop.type == ValueType::kDouble ||
+                            (arguments.size() == 3 &&
+                             arguments[2].type == ValueType::kDouble);
+    const double step_double =
+        arguments.size() == 3
+            ? (arguments[2].type == ValueType::kInt64
+                   ? static_cast<double>(arguments[2].value.int_value)
+                   : arguments[2].value.double_value)
+            : 1.0;
+    if (step_double == 0.0 || !std::isfinite(step_double)) {
+      throw std::runtime_error(name + " step must be finite and non-zero");
+    }
+    const double start_double = start.type == ValueType::kInt64
+                                    ? static_cast<double>(start.value.int_value)
+                                    : start.value.double_value;
+    const double stop_double = stop.type == ValueType::kInt64
+                                   ? static_cast<double>(stop.value.int_value)
+                                   : stop.value.double_value;
+    if (!std::isfinite(start_double) || !std::isfinite(stop_double) ||
+        (step_double > 0.0 && start_double > stop_double) ||
+        (step_double < 0.0 && start_double < stop_double)) {
+      return Value::Array({}, use_double ? "DOUBLE" : "INT64");
+    }
+    std::vector<Value> values;
+    constexpr size_t kMaxGeneratedElements = 1'000'000;
+    if (use_double) {
+      for (double current = start_double;
+           (step_double > 0.0 ? current <= stop_double
+                              : current >= stop_double);
+           current += step_double) {
+        if (values.size() == kMaxGeneratedElements) {
+          throw std::runtime_error(name + " generated too many elements");
+        }
+        values.emplace_back(current);
+        if (!std::isfinite(current + step_double)) { break; }
+      }
+    } else {
+      const int64_t begin = start.value.int_value;
+      const int64_t end = stop.value.int_value;
+      const int64_t step = arguments.size() == 3
+                               ? arguments[2].value.int_value
+                               : int64_t{1};
+      for (int64_t current = begin;;) {
+        if (values.size() == kMaxGeneratedElements) {
+          throw std::runtime_error(name + " generated too many elements");
+        }
+        values.emplace_back(current);
+        if (current == end) { break; }
+        int64_t next = 0;
+        if (__builtin_add_overflow(current, step, &next)) { break; }
+        current = next;
+        if ((step > 0 && current > end) || (step < 0 && current < end)) {
+          break;
+        }
+      }
+    }
+    return Value::Array(std::move(values), use_double ? "DOUBLE" : "INT64");
+  }
+
+  if (name == "generate_date_array") {
+    if (arguments.size() < 2 || arguments.size() > 3) {
+      throw std::runtime_error("generate_date_array requires 2 or 3 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    const int64_t start = parse_date_val(arguments[0]);
+    const int64_t stop = parse_date_val(arguments[1]);
+    int64_t step = 1;
+    if (arguments.size() == 3) {
+      if (call.Args()[2]->Type() == TypeTag::kIntervalExp) {
+        const auto& interval = call.Args()[2]->AsIntervalExpression();
+        if (interval.Unit() == "day" || interval.Unit() == "days") {
+          step = interval.Amount();
+        } else if (interval.Unit() == "week" || interval.Unit() == "weeks") {
+          if (__builtin_mul_overflow(interval.Amount(), int64_t{7}, &step)) {
+            throw std::runtime_error("generate_date_array interval overflow");
+          }
+        } else {
+          throw std::runtime_error(
+              "generate_date_array currently supports DAY and WEEK intervals");
+        }
+      } else if (arguments[2].type == ValueType::kInt64) {
+        step = arguments[2].value.int_value;
+      } else {
+        throw std::runtime_error(
+            "generate_date_array step must be an integer number of days");
+      }
+    }
+    if (step == 0 || (step > 0 && start > stop) ||
+        (step < 0 && start < stop)) {
+      if (step == 0) {
+        throw std::runtime_error("generate_date_array step must be non-zero");
+      }
+      return Value::Array({}, "DATE");
+    }
+    std::vector<Value> values;
+    constexpr size_t kMaxGeneratedElements = 1'000'000;
+    for (int64_t current = start;;) {
+      if (values.size() == kMaxGeneratedElements) {
+        throw std::runtime_error("generate_date_array generated too many elements");
+      }
+      values.push_back(Value::DateFromDays(current));
+      if (current == stop) { break; }
+      int64_t next = 0;
+      if (__builtin_add_overflow(current, step, &next)) { break; }
+      current = next;
+      if ((step > 0 && current > stop) || (step < 0 && current < stop)) {
+        break;
+      }
+    }
+    return Value::Array(std::move(values), "DATE");
+  }
+
   if (name == "unix_date") {
     if (arguments.size() != 1) { throw std::runtime_error("UNIX_DATE requires 1 argument"); }
     if (arguments[0].IsNull()) { return {}; }
@@ -4240,6 +4371,24 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
     case TypeTag::kQueryExp: {
 
       const auto& value = expression->AsQueryExpression();
+      if (value.Exists() &&
+          StatementUsesOnlyScopes(context, *value.Query(), {}, ctes)) {
+        // EXISTS is a boolean question, so carrying the first row is enough.
+        // Preserve an explicit LIMIT 0 and OFFSET/ORDER BY semantics while
+        // adding a cap to an otherwise unbounded subquery.  BuildInput then
+        // pushes this cap into a simple base-table scan when it is safe.
+        SelectStatement limited = *value.Query();
+        if (!limited.HasLimit() || limited.Limit() > 1) {
+          limited.SetLimit(1);
+        }
+        if (context.execution_runtime() != nullptr) {
+          ++context.execution_runtime()->exists_short_circuit_queries;
+        }
+        Relation exists_relation =
+            ExecuteQuery(context, limited, &scope, ctes);
+        const bool exists = exists_relation.TotalRows() > 0;
+        return Value(value.Negated() ? !exists : exists);
+      }
       std::optional<Relation> indexed =
           ExecuteCorrelatedSingleSource(context, *value.Query(), scope, ctes);
       std::optional<Relation> executed;
@@ -4254,10 +4403,6 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
         relation = &*executed;
       }
       auto& row_source = const_cast<Relation&>(*relation);
-      if (value.Exists()) {
-        const bool exists = relation->TotalRows() > 0;
-        return Value(value.Negated() ? !exists : exists);
-      }
       if (value.Test()) {
         const Value test =
             Evaluate(value.Test(), scope, aggregates, context, ctes);
@@ -4308,9 +4453,11 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       }
       std::optional<Row> first;
       row_source.ForEachRow([&](const Row& row) {
-        // Scalar subquery: only the first row matters.
-        if (!first) { first = row;
-}
+        if (!first) {
+          first = row;
+          return;
+        }
+        throw std::runtime_error("Scalar subquery produced more than one element.");
       });
       if (!first || first->values_.empty()) { return {};
 }

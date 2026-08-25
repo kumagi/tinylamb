@@ -280,6 +280,18 @@ TEST(GoogleSqlAstTest, JoinsAndTableSubqueries) {
   ASSERT_EQ(left_select.Sources().size(), 2);
   EXPECT_EQ(left_select.Sources()[1].join_type, JoinType::kLeft);
 
+  auto right_join = VisitSql(
+      "SELECT * FROM t RIGHT JOIN t2 ON t.a = t2.a;");
+  ASSERT_TRUE(right_join);
+  const auto& right_select = dynamic_cast<const SelectStatement&>(*right_join);
+  EXPECT_EQ(right_select.Sources()[1].join_type, JoinType::kRight);
+
+  auto full_join = VisitSql(
+      "SELECT * FROM t FULL JOIN t2 ON t.a = t2.a;");
+  ASSERT_TRUE(full_join);
+  const auto& full_select = dynamic_cast<const SelectStatement&>(*full_join);
+  EXPECT_EQ(full_select.Sources()[1].join_type, JoinType::kFull);
+
   auto subquery = VisitSql("SELECT * FROM (SELECT 1 AS x) AS s;");
   ASSERT_TRUE(subquery);
   const auto& sub_select = dynamic_cast<const SelectStatement&>(*subquery);
@@ -459,14 +471,14 @@ TEST(GoogleSqlAstTest, TripleQuotedStringDecodesEmbeddedQuote) {
             Value("'a'b'"));
 }
 
-TEST(GoogleSqlAstTest, InsertSelectWithoutValuesThrows) {
-  // INSERT ... SELECT parses into an InsertStatement with a Query child but no
-  // InsertValuesRowList; the visitor rejects it because only VALUES rows are
-  // supported.
-  const std::string message =
-      ThrowMessage([] { VisitSqlOrThrow("INSERT INTO t SELECT * FROM s;"); });
-  EXPECT_NE(message.find("INSERT VALUES required"), std::string::npos)
-      << message;
+TEST(GoogleSqlAstTest, VisitsInsertSelectQuery) {
+  auto statement = VisitSqlOrThrow("INSERT INTO t SELECT * FROM s;");
+  ASSERT_TRUE(statement);
+  ASSERT_EQ(statement->Type(), StatementType::kInsert);
+  const auto& insert = dynamic_cast<const InsertStatement&>(*statement);
+  EXPECT_TRUE(insert.IsSelect());
+  ASSERT_TRUE(insert.Query());
+  EXPECT_EQ(insert.Query()->FromClause(), std::vector<std::string>{"s"});
 }
 
 TEST(GoogleSqlAstTest, TableValuedFunctionSourceThrows) {

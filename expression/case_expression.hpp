@@ -30,9 +30,9 @@ class EvaluationContext;
 class CaseExpression : public ExpressionBase {
  public:
   CaseExpression(std::vector<std::pair<Expression, Expression>> when_clauses,
-                 Expression else_clause)
+                 Expression else_clause, bool from_if = false)
       : when_clauses_(std::move(when_clauses)),
-        else_clause_(std::move(else_clause)) {}
+        else_clause_(std::move(else_clause)), from_if_(from_if) {}
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kCaseExp; }
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override;
@@ -49,9 +49,11 @@ class CaseExpression : public ExpressionBase {
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
+  [[nodiscard]] bool IsFromIf() const { return from_if_; }
 
   std::vector<std::pair<Expression, Expression>> when_clauses_;
   Expression else_clause_;
+  bool from_if_{false};
 };
 
 }  // namespace tinylamb

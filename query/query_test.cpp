@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <cstdint>
 #include <cstddef>
 #include <exception>
@@ -30,8 +31,10 @@
 #include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "executor/constant_executor.hpp"
+#include "executor/detail/window_eval.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/insert.hpp"
+#include "expression/window_function_expression.hpp"
 #include "gtest/gtest.h"
 #include "parser/parser.hpp"
 #include "parser/token.hpp"
@@ -534,6 +537,16 @@ TEST_F(QueryTest, SqlEngineSelectOrderByLimitOffset) {
   EXPECT_EQ(page[0][0], Value(2));
   EXPECT_EQ(page[1][0], Value(1));
 
+  // A literal ORDER BY key cannot distinguish rows and must not introduce a
+  // physical sort or disturb LIMIT enforcement.
+  std::vector<Row> literal_order =
+      RunSql(ctx, *db_, "SELECT a FROM t ORDER BY 1 LIMIT 2;");
+  ASSERT_EQ(literal_order.size(), 2U);
+
+  const std::vector<Row> repeated_projection = RunSql(
+      ctx, *db_, "SELECT a + 1 AS first, a + 1 AS second FROM t ORDER BY a;");
+  ASSERT_EQ(repeated_projection[0], Row({Value(2), Value(2)}));
+
   // Act + Assert -- LIMIT + OFFSET without ORDER BY is enforced exactly once,
   // whether or not the optimizer folded it into the plan (D6).
   std::vector<Row> window =
@@ -547,6 +560,265 @@ TEST_F(QueryTest, SqlEngineSelectOrderByLimitOffset) {
       RunSql(ctx, *db_, "SELECT DISTINCT a FROM t LIMIT 3;");
   ASSERT_EQ(distinct_page.size(), 3U);
 
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineWindowFunctionsPartitionRankAndCumulativeSum) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE w (g INT64, v INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO w VALUES (1, 20), (1, 10), (2, 5), (2, 15);");
+
+  const std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT g, v, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v), "
+      "SUM(v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN "
+      "UNBOUNDED PRECEDING AND CURRENT ROW) FROM w ORDER BY g, v;");
+
+  ASSERT_EQ(rows.size(), 4U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(10), Value(1), Value(10)}));
+  EXPECT_EQ(rows[1], Row({Value(1), Value(20), Value(2), Value(30)}));
+  EXPECT_EQ(rows[2], Row({Value(2), Value(5), Value(1), Value(5)}));
+  EXPECT_EQ(rows[3], Row({Value(2), Value(15), Value(2), Value(20)}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, WindowGroupsFrameUsesPeerGroups) {
+  TransactionContext ctx = db_->BeginContext();
+  auto window = std::make_shared<WindowFunctionCallExpression>();
+  window->function = "SUM";
+  window->args = {ColumnValueExp(ColumnName("v"))};
+  window->order_by = {
+      WindowOrderTerm{ColumnValueExp(ColumnName("v")), true, std::nullopt}};
+  window->frame_unit = WindowFrameUnit::kGroups;
+  window->has_frame = true;
+  window->frame_start = {WindowFrameBoundType::kOffsetPreceding,
+                         ConstantValueExp(Value(1))};
+  window->frame_end = {WindowFrameBoundType::kCurrentRow, nullptr};
+  SelectStatement statement({NamedExpression("sum", Expression(window))},
+                            {}, nullptr);
+  relational_detail::Relation input;
+  input.schema = Schema("", {Column("v", ValueType::kInt64)});
+  input.rows = {Row({Value(10)}), Row({Value(10)}), Row({Value(20)}),
+                Row({Value(30)})};
+  auto windowed = relational_detail::ApplyWindows(
+      ctx, statement, std::move(input), nullptr, {});
+  std::vector<Row> rows;
+  windowed.input.ForEachRow([&](const Row& row) { rows.push_back(row); });
+  ASSERT_EQ(rows.size(), 4U);
+  EXPECT_EQ(rows[0][1], Value(20));
+  EXPECT_EQ(rows[1][1], Value(20));
+  EXPECT_EQ(rows[2][1], Value(40));
+  EXPECT_EQ(rows[3][1], Value(50));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, WindowFrameExclusionRemovesCurrentRow) {
+  TransactionContext ctx = db_->BeginContext();
+  auto window = std::make_shared<WindowFunctionCallExpression>();
+  window->function = "SUM";
+  window->args = {ColumnValueExp(ColumnName("v"))};
+  window->order_by = {
+      WindowOrderTerm{ColumnValueExp(ColumnName("v")), true, std::nullopt}};
+  window->frame_unit = WindowFrameUnit::kRows;
+  window->has_frame = true;
+  window->frame_start = {WindowFrameBoundType::kUnboundedPreceding, nullptr};
+  window->frame_end = {WindowFrameBoundType::kCurrentRow, nullptr};
+  window->exclusion = WindowFrameExclusion::kCurrentRow;
+  SelectStatement statement({NamedExpression("sum", Expression(window))},
+                            {}, nullptr);
+  relational_detail::Relation input;
+  input.schema = Schema("", {Column("v", ValueType::kInt64)});
+  input.rows = {Row({Value(10)}), Row({Value(20)}), Row({Value(30)})};
+  auto windowed = relational_detail::ApplyWindows(
+      ctx, statement, std::move(input), nullptr, {});
+  std::vector<Row> rows;
+  windowed.input.ForEachRow([&](const Row& row) { rows.push_back(row); });
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_TRUE(rows[0][1].IsNull());
+  EXPECT_EQ(rows[1][1], Value(10));
+  EXPECT_EQ(rows[2][1], Value(30));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, WindowFrameExclusionHandlesPeerGroupsAndTies) {
+  for (const auto [exclusion, expected] :
+       std::vector<std::pair<WindowFrameExclusion, std::vector<Value>>>{
+           {WindowFrameExclusion::kGroup,
+            {Value(20), Value(20), Value(20)}},
+           {WindowFrameExclusion::kTies,
+            {Value(30), Value(30), Value(40)}}}) {
+    TransactionContext ctx = db_->BeginContext();
+    auto window = std::make_shared<WindowFunctionCallExpression>();
+    window->function = "SUM";
+    window->args = {ColumnValueExp(ColumnName("v"))};
+    window->order_by = {
+        WindowOrderTerm{ColumnValueExp(ColumnName("v")), true, std::nullopt}};
+    window->frame_unit = WindowFrameUnit::kRows;
+    window->has_frame = true;
+    window->frame_start = {WindowFrameBoundType::kUnboundedPreceding, nullptr};
+    window->frame_end = {WindowFrameBoundType::kUnboundedFollowing, nullptr};
+    window->exclusion = exclusion;
+    SelectStatement statement({NamedExpression("sum", Expression(window))},
+                              {}, nullptr);
+    relational_detail::Relation input;
+    input.schema = Schema("", {Column("v", ValueType::kInt64)});
+    input.rows = {Row({Value(10)}), Row({Value(10)}), Row({Value(20)})};
+    auto windowed = relational_detail::ApplyWindows(
+        ctx, statement, std::move(input), nullptr, {});
+    std::vector<Row> rows;
+    windowed.input.ForEachRow([&](const Row& row) { rows.push_back(row); });
+    ASSERT_EQ(rows.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+      EXPECT_EQ(rows[i][1], expected[i]) << "row " << i;
+    }
+    ctx.txn_.Abort();
+  }
+}
+
+TEST_F(QueryTest, SqlEngineUnionAllConcatenatesMultipleBranches) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE u (v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO u VALUES (1), (2);");
+
+  const std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT v FROM u WHERE v = 1 UNION ALL "
+      "SELECT v FROM u WHERE v >= 1 UNION ALL SELECT v FROM u WHERE v = 2;");
+  ASSERT_EQ(rows.size(), 4U);
+  EXPECT_EQ(rows[0], Row({Value(1)}));
+  EXPECT_EQ(rows[1], Row({Value(1)}));
+  EXPECT_EQ(rows[2], Row({Value(2)}));
+  EXPECT_EQ(rows[3], Row({Value(2)}));
+  const std::vector<Row> distinct = RunSql(
+      ctx, *db_, "SELECT v FROM u UNION DISTINCT SELECT v FROM u;");
+  EXPECT_EQ(distinct,
+            (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
+  const std::vector<Row> except = RunSql(
+      ctx, *db_,
+      "SELECT v FROM u EXCEPT DISTINCT SELECT v FROM u WHERE v = 2;");
+  EXPECT_EQ(except, (std::vector<Row>{Row({Value(1)})}));
+  const std::vector<Row> intersect = RunSql(
+      ctx, *db_,
+      "SELECT v FROM u INTERSECT DISTINCT SELECT v FROM u WHERE v = 2;");
+  EXPECT_EQ(intersect, (std::vector<Row>{Row({Value(2)})}));
+  const std::vector<Row> promoted = RunSql(
+      ctx, *db_, "SELECT 1 AS v UNION ALL SELECT 2.5 AS v;");
+  EXPECT_EQ(promoted,
+            (std::vector<Row>{Row({Value(1.0)}), Row({Value(2.5)})}));
+  const std::vector<Row> limited_union = RunSql(
+      ctx, *db_, "SELECT v FROM u UNION ALL SELECT v FROM u LIMIT 3;");
+  EXPECT_EQ(limited_union,
+            (std::vector<Row>{Row({Value(1)}), Row({Value(2)}),
+                              Row({Value(1)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, CteIsMaterializedOnceAndCanBeReadByMultipleConsumers) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE cte_source (v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO cte_source VALUES (1), (2), (3);");
+
+  const std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "WITH filtered AS (SELECT v FROM cte_source WHERE v > 1) "
+      "SELECT v FROM filtered UNION ALL SELECT v FROM filtered ORDER BY v;");
+  EXPECT_EQ(rows,
+            (std::vector<Row>{Row({Value(2)}), Row({Value(2)}),
+                              Row({Value(3)}), Row({Value(3)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineUnnestExpandsArraysAndEmitsOffsets) {
+  TransactionContext ctx = db_->BeginContext();
+  const std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT x, p FROM UNNEST([3, NULL]) x WITH OFFSET p ORDER BY p;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(3), Value(0)}));
+  EXPECT_EQ(rows[1][0], Value());
+  EXPECT_EQ(rows[1][1], Value(1));
+  EXPECT_TRUE(
+      RunSql(ctx, *db_, "SELECT x FROM UNNEST([]) x;").empty());
+
+  const std::vector<Row> product = RunSql(
+      ctx, *db_,
+      "SELECT a, b FROM UNNEST([1, 2]) a, UNNEST([10, 20]) b "
+      "ORDER BY a, b;");
+  EXPECT_EQ(product,
+            (std::vector<Row>{Row({Value(1), Value(10)}),
+                              Row({Value(1), Value(20)}),
+                              Row({Value(2), Value(10)}),
+                              Row({Value(2), Value(20)})}));
+
+  const std::vector<Row> lateral = RunSql(
+      ctx, *db_,
+      "SELECT x FROM UNNEST([[1, 2], [3]]) arr, UNNEST(arr) x ORDER BY x;");
+  EXPECT_EQ(lateral,
+            (std::vector<Row>{Row({Value(1)}), Row({Value(2)}),
+                              Row({Value(3)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineArrayGeneratorsFeedUnnest) {
+  TransactionContext ctx = db_->BeginContext();
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT x FROM UNNEST(GENERATE_ARRAY(1, 5, 2)) x ORDER BY x;"),
+      (std::vector<Row>{Row({Value(1)}), Row({Value(3)}), Row({Value(5)})}));
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT x FROM UNNEST(GENERATE_SERIES(3, 1, -1)) x ORDER BY x DESC;"),
+      (std::vector<Row>{Row({Value(3)}), Row({Value(2)}), Row({Value(1)})}));
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT x FROM UNNEST(GENERATE_DATE_ARRAY('2020-01-01', '2020-01-03')) x ORDER BY x;"),
+      (std::vector<Row>{Row({Value::Date("2020-01-01")}),
+                        Row({Value::Date("2020-01-02")}),
+                        Row({Value::Date("2020-01-03")})}));
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT x FROM UNNEST(GENERATE_DATE_ARRAY('2020-01-01', '2020-01-05', INTERVAL 2 DAY)) x ORDER BY x;"),
+      (std::vector<Row>{Row({Value::Date("2020-01-01")}),
+                        Row({Value::Date("2020-01-03")}),
+                        Row({Value::Date("2020-01-05")})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineInsertSelectCopiesAndMapsRows) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+
+  ASSERT_TRUE(engine.Execute(ctx, "CREATE TABLE src (id INT, name VARCHAR(10));")
+                  .HasValue());
+  ASSERT_TRUE(engine.Execute(ctx, "CREATE TABLE dst (name VARCHAR(10), id INT);")
+                  .HasValue());
+  auto source_insert = engine.Execute(
+      ctx, "INSERT INTO src VALUES (1, 'one'), (2, 'two');");
+  ASSERT_TRUE(source_insert.HasValue()) << engine.LastError();
+  EXPECT_EQ(source_insert.Value().AffectedRows(), 2);
+
+  auto inserted = engine.Execute(
+      ctx, "INSERT INTO dst (id, name) SELECT id, name FROM src WHERE id > 1;");
+  ASSERT_TRUE(inserted.HasValue()) << engine.LastError();
+  EXPECT_EQ(inserted.Value().AffectedRows(), 1);
+
+  auto selected = engine.Execute(ctx, "SELECT name, id FROM dst;");
+  ASSERT_TRUE(selected.HasValue()) << engine.LastError();
+  const std::vector<Row> rows = selected.Value().Collect();
+  ASSERT_EQ(rows.size(), 1);
+  EXPECT_EQ(rows[0][0], Value("two"));
+  EXPECT_EQ(rows[0][1], Value(2));
+}
+
+TEST_F(QueryTest, SqlEngineUnionAllAppliesLimitAfterConcatenation) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE ul (v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO ul VALUES (1), (2);");
+
+  const std::vector<Row> rows = RunSql(
+      ctx, *db_, "SELECT v FROM ul UNION ALL SELECT v FROM ul LIMIT 3;");
+  EXPECT_EQ(rows.size(), 3U);
   ctx.txn_.Abort();
 }
 
@@ -619,8 +891,8 @@ TEST_F(QueryTest, SqlEngineSelfJoinResidualCondition) {
 }
 
 TEST_F(QueryTest, SqlEngineLeftJoinStaysCorrect) {
-  // Phase 8: LEFT JOIN keeps the relational path (null-padding is not yet
-  // modeled in the Cascades memo) and stays correct end-to-end.
+  // Outer joins keep the syntactic relational path and preserve NULL padding
+  // semantics end-to-end.
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE l (k INT64, v INT64);");
   RunSql(ctx, *db_, "CREATE TABLE r (k INT64, w INT64);");
@@ -633,6 +905,41 @@ TEST_F(QueryTest, SqlEngineLeftJoinStaysCorrect) {
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0][0], Value(10));
   EXPECT_EQ(rows[1][0], Value(20));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineRightAndFullJoinPreserveUnmatchedRows) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE l (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE r (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO l VALUES (1, 10), (2, 20);");
+  RunSql(ctx, *db_, "INSERT INTO r VALUES (2, 200), (3, 300);");
+
+  std::vector<Row> right_rows = RunSql(
+      ctx, *db_,
+      "SELECT a.v, b.w FROM l AS a RIGHT JOIN r AS b ON a.k = b.k;");
+  ASSERT_EQ(right_rows.size(), 2U);
+  EXPECT_TRUE(std::ranges::any_of(right_rows, [](const Row& row) {
+    return row == Row({Value(20), Value(200)});
+  }));
+  EXPECT_TRUE(std::ranges::any_of(right_rows, [](const Row& row) {
+    return row == Row({Value(), Value(300)});
+  }));
+
+  std::vector<Row> full_rows = RunSql(
+      ctx, *db_,
+      "SELECT a.v, b.w FROM l AS a FULL JOIN r AS b ON a.k = b.k;");
+  ASSERT_EQ(full_rows.size(), 3U);
+  EXPECT_TRUE(std::ranges::any_of(full_rows, [](const Row& row) {
+    return row == Row({Value(10), Value()});
+  }));
+  EXPECT_TRUE(std::ranges::any_of(full_rows, [](const Row& row) {
+    return row == Row({Value(20), Value(200)});
+  }));
+  EXPECT_TRUE(std::ranges::any_of(full_rows, [](const Row& row) {
+    return row == Row({Value(), Value(300)});
+  }));
 
   ctx.txn_.Abort();
 }

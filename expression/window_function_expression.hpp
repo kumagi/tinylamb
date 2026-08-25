@@ -12,7 +12,9 @@
 
 namespace tinylamb {
 
-enum class WindowFrameUnit { kDefault, kRows, kRange };
+enum class WindowFrameUnit { kDefault, kRows, kRange, kGroups };
+
+enum class WindowFrameExclusion { kNone, kCurrentRow, kGroup, kTies };
 
 enum class WindowFrameBoundType {
   kUnboundedPreceding,
@@ -57,6 +59,7 @@ class WindowFunctionCallExpression : public ExpressionBase {
   WindowFrameBound frame_start;
   WindowFrameBound frame_end;
   bool has_frame{false};
+  WindowFrameExclusion exclusion{WindowFrameExclusion::kNone};
 
   WindowFunctionCallExpression() = default;
   [[nodiscard]] TypeTag Type() const override {

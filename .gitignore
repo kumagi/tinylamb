@@ -12,3 +12,5 @@ Testing/
 compile_commands.json
 .cache/
 repro-drs-*/
+*.db
+*.log

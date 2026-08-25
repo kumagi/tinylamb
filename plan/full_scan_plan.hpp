@@ -17,6 +17,8 @@
 #ifndef TINYLAMB_FULL_SCAN_PLAN_HPP
 #define TINYLAMB_FULL_SCAN_PLAN_HPP
 
+#include <limits>
+
 #include "plan/plan.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
@@ -25,7 +27,9 @@ namespace tinylamb {
 
 class FullScanPlan : public PlanBase {
  public:
-  explicit FullScanPlan(const Table& table, const TableStatistics& ts);
+  explicit FullScanPlan(
+      const Table& table, const TableStatistics& ts,
+      size_t max_rows = std::numeric_limits<size_t>::max());
   FullScanPlan(const FullScanPlan&) = delete;
   FullScanPlan(FullScanPlan&&) = delete;
   FullScanPlan& operator=(const FullScanPlan&) = delete;
@@ -42,12 +46,14 @@ class FullScanPlan : public PlanBase {
 
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
+  [[nodiscard]] size_t MaxRows() const { return max_rows_; }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
  private:
   const Table& table_;
   const TableStatistics& stats_;
+  size_t max_rows_;
 };
 
 }  // namespace tinylamb

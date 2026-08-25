@@ -39,9 +39,11 @@
 namespace tinylamb {
 
 AggregationPlan::AggregationPlan(Plan child,
-                                 std::vector<NamedExpression> aggregates)
+                                 std::vector<NamedExpression> aggregates,
+                                 AggregationStrategy strategy)
     : child_(std::move(child)),
       aggregates_(std::move(aggregates)),
+      strategy_(strategy),
       schema_(GenerateSchema()) {}
 
 const Schema& AggregationPlan::GetSchema() const { return schema_; }
@@ -63,7 +65,13 @@ size_t AggregationPlan::AccessRowCount() const {
 size_t AggregationPlan::EmitRowCount() const { return 1; }
 
 std::string AggregationPlan::ToString() const {
-  std::string s = "Aggregation {";
+  const char* name = "HashAggregate";
+  if (strategy_ == AggregationStrategy::kSort) {
+    name = "SortAggregate";
+  } else if (strategy_ == AggregationStrategy::kStream) {
+    name = "StreamAggregate";
+  }
+  std::string s = std::string(name) + " {";
   bool first = true;
   for (const auto& agg : aggregates_) {
     if (!first) {

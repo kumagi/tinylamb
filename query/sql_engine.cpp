@@ -415,16 +415,13 @@ std::optional<Executor> ServeCompiledSelect(TransactionContext& ctx,
   // shape metadata was captured from an identical bound statement at fill.
   const CompiledPlan::SelectShape& shape = *compiled.select_shape;
   Executor executor = compiled.plan->EmitExecutor(ctx);
-  if (shape.distinct) {
-    executor = std::make_shared<DistinctExecutor>(std::move(executor));
-  }
   if (!shape.order_expressions.empty() &&
       !compiled.plan->IsOrderedBy(shape.order_expressions,
                                   shape.order_ascending)) {
     std::vector<SortExecutor::Key> keys;
     keys.reserve(shape.sort_keys.size());
     for (const auto& key : shape.sort_keys) {
-      keys.push_back({key.first, key.second});
+      keys.push_back({key.expression, key.ascending, key.nulls_first});
     }
     executor = std::make_shared<SortExecutor>(std::move(executor),
                                               compiled.plan->GetSchema(),
@@ -708,19 +705,32 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       const auto& insert = dynamic_cast<const InsertStatement&>(*statement);
       ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
                        ctx.GetTable(insert.TableName()));
-      if (insert.Values().empty()) {
-        return Status::kUnknown;
-      }
       std::vector<Row> rows;
-      rows.reserve(insert.Values().size());
-      for (const auto& values : insert.Values()) {
-        std::vector<Value> row;
-        row.reserve(values.size());
-        for (const auto& value : values) {
-          row.push_back(value->Evaluate(Row(), Schema()));
+      if (insert.IsSelect()) {
+        if (insert.Query() == nullptr) {
+          last_error_ = "INSERT SELECT query is missing";
+          return Status::kUnknown;
         }
+        relational_detail::Relation materialized = relational_detail::ExecuteQuery(
+            ctx, *insert.Query(), nullptr, {});
+        materialized.ForEachRow([&rows](const Row& row) { rows.push_back(row); });
+      } else {
+        if (insert.Values().empty()) {
+          return Status::kUnknown;
+        }
+        rows.reserve(insert.Values().size());
+        for (const auto& values : insert.Values()) {
+          std::vector<Value> row;
+          row.reserve(values.size());
+          for (const auto& value : values) {
+            row.push_back(value->Evaluate(Row(), Schema()));
+          }
+          rows.emplace_back(std::move(row));
+        }
+      }
+      for (Row& row : rows) {
         if (!insert.Columns().empty()) {
-          if (insert.Columns().size() != row.size()) {
+          if (insert.Columns().size() != row.values_.size()) {
             last_error_ = "INSERT column/value count mismatch";
             return Status::kUnknown;
           }
@@ -741,15 +751,15 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             }
             reordered[static_cast<size_t>(destination)] = row[i];
           }
-          row = std::move(reordered);
+          row = Row(std::move(reordered));
         }
-        if (row.size() != table->GetSchema().ColumnCount()) {
+        if (row.values_.size() != table->GetSchema().ColumnCount()) {
           last_error_ = "INSERT value count does not match table schema (got " +
-                        std::to_string(row.size()) + ", expected " +
+                        std::to_string(row.values_.size()) + ", expected " +
                         std::to_string(table->GetSchema().ColumnCount()) + ")";
           return Status::kUnknown;
         }
-        for (size_t i = 0; i < row.size(); ++i) {
+        for (size_t i = 0; i < row.values_.size(); ++i) {
           const ValueType expected = table->GetSchema().GetColumn(i).Type();
           if (row[i].IsNull() || row[i].type == expected) {
             continue;
@@ -768,12 +778,11 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                         table->GetSchema().GetColumn(i).Name().name;
           return Status::kUnknown;
         }
-        rows.emplace_back(std::move(row));
       }
       // Phase 2-1 fill: build the parametric INSERT artifact. Bindable
       // literals become ParameterSlot placeholders; runtime values are
       // injected per execution, so any literal combination hits.
-      if (!plan_cache_fingerprint_.empty()) {
+      if (!insert.IsSelect() && !plan_cache_fingerprint_.empty()) {
         auto shape = std::make_shared<CompiledPlan::InsertShape>();
         bool ok = true;
         size_t slot_cursor = 0;
@@ -941,14 +950,20 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       }
       query.where_ = where ? where : ConstantValueExp(Value(true));
       query.select_ = select->SelectList();
+      query.distinct_ = select->Distinct();
       const size_t visible_columns = query.select_.size();
       std::vector<Expression> sort_expressions;
       std::vector<bool> sort_ascending;
       sort_expressions.reserve(select->OrderBy().size());
       for (size_t i = 0; i < select->OrderBy().size(); ++i) {
         const auto& order = select->OrderBy()[i];
+        if (order.expression &&
+            order.expression->Type() == TypeTag::kConstantValue) {
+          continue;
+        }
         query.order_expressions_.push_back(order.expression);
         query.order_ascending_.push_back(order.ascending);
+        query.order_nulls_first_.push_back(order.nulls_first);
         auto selected = std::ranges::find_if(
             query.select_, [&](const auto& item) {
               return item.expression->ToString() ==
@@ -970,6 +985,11 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         }
         sort_ascending.push_back(order.ascending);
       }
+      // The physical plan sorts its output schema, not the pre-projection
+      // relation schema. Keep the optimizer's required ordering in that same
+      // coordinate system: selected expressions use their output name, and
+      // hidden ORDER BY expressions use the hidden projection column.
+      query.order_expressions_ = sort_expressions;
       // DISTINCT must see every row before truncation, so the optimizer is
       // not told about LIMIT here; Distinct -> Sort -> Limit stays in this
       // order above an untruncated plan (D6 soundness).
@@ -978,15 +998,13 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       RETURN_IF_FAIL(query.Rewrite(ctx));
       ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
       Executor executor = plan->EmitExecutor(ctx);
-      if (select->Distinct()) {
-        executor = std::make_shared<DistinctExecutor>(std::move(executor));
-      }
-      if (!select->OrderBy().empty() &&
+      if (!query.order_expressions_.empty() &&
           !plan->IsOrderedBy(query.order_expressions_, query.order_ascending_)) {
         std::vector<SortExecutor::Key> keys;
-        keys.reserve(select->OrderBy().size());
-        for (size_t i = 0; i < select->OrderBy().size(); ++i) {
-          keys.push_back({sort_expressions[i], sort_ascending[i]});
+        keys.reserve(sort_expressions.size());
+        for (size_t i = 0; i < sort_expressions.size(); ++i) {
+          keys.push_back({sort_expressions[i], sort_ascending[i],
+                          query.order_nulls_first_[i]});
         }
         executor = std::make_shared<SortExecutor>(
             std::move(executor), plan->GetSchema(), std::move(keys));
@@ -1013,10 +1031,12 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         shape->column_names = result_column_names_;
         shape->order_expressions = query.order_expressions_;
         shape->order_ascending = query.order_ascending_;
+        shape->order_nulls_first = query.order_nulls_first_;
         shape->sort_keys.reserve(sort_expressions.size());
         for (size_t i = 0; i < sort_expressions.size(); ++i) {
-          shape->sort_keys.emplace_back(sort_expressions[i],
-                                        static_cast<bool>(sort_ascending[i]));
+          shape->sort_keys.push_back(
+              {sort_expressions[i], static_cast<bool>(sort_ascending[i]),
+               query.order_nulls_first_[i]});
         }
         shape->distinct = select->Distinct();
         shape->has_limit = select->HasLimit();

@@ -21,10 +21,12 @@ const Schema& LimitPlan::GetSchema() const { return src_->GetSchema(); }
 size_t LimitPlan::AccessRowCount() const { return src_->AccessRowCount(); }
 
 size_t LimitPlan::EmitRowCount() const {
-  const size_t capped =
-      limit_count_ == 0 ? src_->EmitRowCount()
-                        : std::min(src_->EmitRowCount(), limit_count_);
-  return capped;
+  const size_t input = src_->EmitRowCount();
+  if (input <= limit_offset_) {
+    return 0;
+  }
+  const size_t remaining = input - limit_offset_;
+  return limit_count_ == 0 ? remaining : std::min(remaining, limit_count_);
 }
 
 void LimitPlan::Dump(std::ostream& o, int indent) const {

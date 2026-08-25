@@ -34,15 +34,21 @@
 #include "database/transaction_context.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "plan/cascades.hpp"
+#include "plan/distinct_plan.hpp"
+#include "plan/empty_plan.hpp"
 #include "plan/implementation_rules.hpp"
+#include "plan/limit_plan.hpp"
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
+#include "plan/projection_plan.hpp"
+#include "plan/values_plan.hpp"
 #include "query/query_data.hpp"
 #include "query/statement.hpp"
 #include "table/table.hpp"
@@ -89,6 +95,25 @@ std::vector<NamedExpression> ExpandSelect(const QueryData& query,
 
 bool IsAggregate(const NamedExpression& expression) {
   return expression.expression->Type() == TypeTag::kAggregateExp;
+}
+
+std::vector<Expression> NormalizeOrderingForOutput(
+    const std::vector<Expression>& ordering,
+    const std::vector<NamedExpression>& outputs) {
+  std::vector<Expression> normalized;
+  normalized.reserve(ordering.size());
+  for (const Expression& expression : ordering) {
+    const auto found = std::ranges::find_if(
+        outputs, [&](const NamedExpression& output) {
+          return output.expression->ToString() == expression->ToString();
+        });
+    if (found != outputs.end() && !found->name.empty()) {
+      normalized.push_back(ColumnValueExp(found->name));
+    } else {
+      normalized.push_back(expression);
+    }
+  }
+  return normalized;
 }
 
 // Relations a conjunct touches. Qualified names are relation identities
@@ -248,8 +273,9 @@ struct DecorrelationSpec {
 
 using TablesMap = std::unordered_map<std::string, std::shared_ptr<Table>>;
 
-// True when the underlying table column cannot hold NULL: the gate that makes
-// `NOT IN -> anti join` sound.
+// True when the underlying table column cannot hold NULL. When this is false,
+// NOT IN uses the null-aware anti implementation instead of the regular anti
+// join.
 bool ColumnIsNonNull(const ScopeMaps& scope, const ColumnName& column,
                      TransactionContext& ctx) {
   const auto found_relation = scope.physical_of.find(column.schema);
@@ -380,7 +406,9 @@ std::optional<DecorrelationSpec> TryDecorrelate(
   std::vector<std::pair<std::string, const Schema*>> schemas;
   std::vector<Expression> join_conditions;
   for (const SelectSource& source : sub.Sources()) {
-    if (source.query != nullptr || source.join_type == JoinType::kLeft) {
+    if (source.query != nullptr || source.join_type == JoinType::kLeft ||
+        source.join_type == JoinType::kRight ||
+        source.join_type == JoinType::kFull) {
       return std::nullopt;
     }
     const std::string relation =
@@ -478,9 +506,9 @@ std::optional<DecorrelationSpec> TryDecorrelate(
     spec.inner_key = ColumnValueExp(member->second);
     if (have_key) { return std::nullopt;  // correlated IN: not in V1
 }
-    // NOT IN -> anti join only when neither side can hold NULL: NULLs in the
-    // set make `x NOT IN S` UNKNOWN rather than FALSE, which an anti join
-    // would silently turn back into TRUE. NOT EXISTS has no such hazard.
+    // NOT IN uses the cheaper regular anti join when both keys are known
+    // non-null. Otherwise retain SQL's three-valued behavior in the
+    // null-aware anti executor; NOT EXISTS has no such hazard.
     if (spec.kind == AntiJoinKind()) {
       const ColumnName& outer_column =
           spec.outer_key->AsColumnValue().GetColumnName();
@@ -488,7 +516,7 @@ std::optional<DecorrelationSpec> TryDecorrelate(
           !ColumnIsNonNull(inner_scope,
                            spec.inner_key->AsColumnValue().GetColumnName(),
                            ctx)) {
-        return std::nullopt;
+        spec.kind = NullAwareAntiJoinKind();
       }
     }
   }
@@ -525,9 +553,29 @@ StatusOr<Plan> Optimizer::OptimizeRelational(
 StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                                    TransactionContext& ctx,
                                    const OptimizerOptions& options) {
-  if (query.from_.empty()) { throw std::runtime_error("No table specified");
-}
-
+  // ORDER BY literals do not distinguish rows. Remove them before building
+  // the logical sort/top-N layers so direct optimizer callers and the SQL
+  // facade share the same property and limit behavior.
+  if (std::ranges::any_of(query.order_expressions_, [](const Expression& key) {
+        return key && key->Type() == TypeTag::kConstantValue;
+      })) {
+    QueryData normalized = query;
+    normalized.order_expressions_.clear();
+    normalized.order_ascending_.clear();
+    normalized.order_nulls_first_.clear();
+    for (size_t i = 0; i < query.order_expressions_.size(); ++i) {
+      const Expression& key = query.order_expressions_[i];
+      if (key && key->Type() == TypeTag::kConstantValue) { continue; }
+      normalized.order_expressions_.push_back(key);
+      if (i < query.order_ascending_.size()) {
+        normalized.order_ascending_.push_back(query.order_ascending_[i]);
+      }
+      if (i < query.order_nulls_first_.size()) {
+        normalized.order_nulls_first_.push_back(query.order_nulls_first_[i]);
+      }
+    }
+    return Optimize(normalized, ctx, options);
+  }
   const std::vector<NamedExpression> expanded_select =
       ExpandSelect(query, ctx);
 
@@ -535,6 +583,35 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
       std::ranges::any_of(expanded_select, IsAggregate);
   if (has_aggregate && !std::ranges::all_of(expanded_select, IsAggregate)) {
     return Status::kNotImplemented;
+  }
+
+  if (query.from_.empty()) {
+    if (has_aggregate || expanded_select.empty()) {
+      return Status::kNotImplemented;
+    }
+    Plan source = std::make_shared<DummyScanPlan>();
+    const Expression predicate =
+        query.where_ ? ExpressionRewriter(options.expression_rules).Rewrite(
+                           query.where_)
+                     : ConstantValueExp(Value(true));
+    if (predicate && predicate->Type() == TypeTag::kConstantValue) {
+      const Value value = predicate->AsConstantValue().GetValue();
+      if (value.IsNull() || !value.Truthy()) {
+        source = std::make_shared<EmptyPlan>(std::move(source));
+      }
+    } else if (predicate) {
+      return Status::kNotImplemented;
+    }
+    Plan plan = std::make_shared<ProjectionPlan>(std::move(source),
+                                                 expanded_select);
+    if (query.distinct_) {
+      plan = std::make_shared<DistinctPlan>(std::move(plan));
+    }
+    if (query.limit_count_ != 0 || query.limit_offset_ != 0) {
+      plan = std::make_shared<LimitPlan>(std::move(plan), query.limit_count_,
+                                         query.limit_offset_);
+    }
+    return plan;
   }
 
   const Expression source_predicate =
@@ -696,7 +773,56 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                                        .target_list=projection_items});
     search_root = projection;
   }
-  if (query.limit_count_ != 0 || query.limit_offset_ != 0) {
+  if (query.distinct_) {
+    const cascades::GroupId distinct =
+        memo.EnsureDerivedGroup(query.from_, "distinct");
+    memo.AddExpression(distinct, cascades::LogicalExpression{
+                                      .operation = cascades::LogicalOperator::kDistinct,
+                                      .children = {search_root}});
+    search_root = distinct;
+  }
+  if (!query.order_expressions_.empty() &&
+      query.order_expressions_.size() == query.order_ascending_.size() &&
+      query.limit_count_ != 0) {
+    const std::vector<Expression> sort_expressions =
+        NormalizeOrderingForOutput(query.order_expressions_, projection_items);
+    const cascades::GroupId topn =
+        memo.EnsureDerivedGroup(query.from_, "topn");
+    std::vector<NamedExpression> topn_keys;
+    topn_keys.reserve(sort_expressions.size());
+    for (const Expression& expression : sort_expressions) {
+      topn_keys.emplace_back("", expression);
+    }
+    memo.AddExpression(topn, cascades::LogicalExpression{
+                                  .operation = cascades::LogicalOperator::kTopN,
+                                  .children = {search_root},
+                                  .target_list = std::move(topn_keys),
+                                  .sort_ascending = query.order_ascending_,
+                                  .sort_nulls_first = query.order_nulls_first_,
+                                  .limit_count = query.limit_count_,
+                                  .limit_offset = query.limit_offset_});
+    search_root = topn;
+  } else if (!query.order_expressions_.empty() &&
+             query.order_expressions_.size() == query.order_ascending_.size()) {
+    const std::vector<Expression> sort_expressions =
+        NormalizeOrderingForOutput(query.order_expressions_, projection_items);
+    const cascades::GroupId sort = memo.EnsureDerivedGroup(query.from_, "sort");
+    std::vector<NamedExpression> sort_keys;
+    sort_keys.reserve(sort_expressions.size());
+    for (const Expression& expression : sort_expressions) {
+      sort_keys.emplace_back("", expression);
+    }
+    memo.AddExpression(sort, cascades::LogicalExpression{
+                                .operation = cascades::LogicalOperator::kSort,
+                                .children = {search_root},
+                                .target_list = std::move(sort_keys),
+                                .sort_ascending = query.order_ascending_,
+                                .sort_nulls_first = query.order_nulls_first_});
+    search_root = sort;
+  }
+  if ((query.limit_count_ != 0 || query.limit_offset_ != 0) &&
+      !(query.limit_count_ != 0 && !query.order_expressions_.empty() &&
+        query.order_expressions_.size() == query.order_ascending_.size())) {
     const cascades::GroupId limit =
         memo.EnsureDerivedGroup(query.from_, "limit");
     memo.AddExpression(limit, cascades::LogicalExpression{
@@ -741,7 +867,8 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   if (query.from_.size() == 1 && default_rules && decorrelations.empty() &&
       !needs_root_selection) {
     return OptimizeSingleRelation(query, effective_predicate, projection_items,
-                                  has_aggregate, properties, rule_context);
+                                  has_aggregate, query.distinct_, properties,
+                                  rule_context);
   }
 
   const cascades::ImplementationRuleSet* implementation_rules =

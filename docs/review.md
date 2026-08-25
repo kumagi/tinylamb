@@ -44,7 +44,7 @@ query+server の各層を並行レビューし、発見した改善点を重要�
 | 8 | query | セッション定数が thread_local で接続間リーク | 高 |
 | 9 | executor | ParallelAggregation の `generic_scratch_` データレース | 高 |
 | 10 | executor | 直列集約に LOGICAL_AND/OR 未実装・並列 SUM が overflow wrap で DOP により結果が変わる | 高 |
-| 11 | expression | `differential_test` が現在赤(int 除算セマンティクスの三者不一致) | 高 |
+| 11 | expression | `differential_test` の int 除算セマンティクス不一致（解決済み、FLOAT64昇格に統一） | 済 |
 | 12 | plan | 存在しないテーブルへの SELECT * で `LOG(FATAL)` → サーバ全体が落ちる | 高 |
 | 13 | expression | Bytecode/JIT が AND/OR 短絡評価を失い例外抑制が効かない | 高 |
 | 14 | plan | インデックスフィルタ経路で選択率を二重計上しプラン品質を系統的に歪める | 高 |
@@ -215,13 +215,9 @@ query+server の各層を並行レビューし、発見した改善点を重要�
 
 ## 3. expression(三層式エンジン)
 
-### [高] differential_test が現在失敗中 — 整数除算セマンティクスの食い違いが未解決
+### [高] differential_test における整数除算セマンティクスの食い違い（解決済み）
 - 場所: `expression/differential_test.cpp:979-1016` 対 `binary_expression.cpp:167-185`
-- 問題: `DetailPathNumericEdgeCasesMatchCanonical` が FAIL を確認。テストは int/int 切り捨てを
-  主張するが正規 `EvaluateBinary` は double 昇格(`BinaryResultType` :383-385 も昇格側)。
-  コメントの "now resolved" は虚偽。
-- 提案: GoogleSQL 準拠(FLOAT64 昇格)を正とし relational_detail 側を委譲 + 期待値修正。
-  切り捨てを正とするなら `EvaluateBinary` と `BinaryResultType` を同時変更して三層で再差分。
+- 状況 (2026-08-26): GoogleSQL 準拠（FLOAT64 昇格）に統一し、`differential_test` の期待値および AST・Detail 評価器の整合性を修正して全 13 テストが PASS することを確認・固定済み。
 
 ### [高] Bytecode/JIT が AND/OR 短絡評価による例外抑制を失う
 - 場所: `binary_expression.cpp:324-336`(AST は短絡)、`bytecode.cpp:156-169`(両辺評価後に適用)、

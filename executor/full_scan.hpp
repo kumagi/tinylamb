@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_FULL_SCAN_HPP
 #define TINYLAMB_FULL_SCAN_HPP
 
+#include <limits>
 #include <memory>
 
 #include "executor/executor_base.hpp"
@@ -30,7 +31,8 @@ struct RowPosition;
 
 class FullScan : public ExecutorBase {
  public:
-  FullScan(Transaction& txn, const Table& table);
+  FullScan(Transaction& txn, const Table& table,
+           size_t max_rows = std::numeric_limits<size_t>::max());
   ~FullScan() override = default;
   bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
@@ -41,6 +43,8 @@ class FullScan : public ExecutorBase {
   // Not owned; the executor must not outlive the Table.
   const Table* table_;
   Iterator iter_;
+  size_t max_rows_;
+  size_t emitted_{0};
 };
 
 }  // namespace tinylamb

@@ -19,6 +19,7 @@
 
 #include "executor/full_scan.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <ostream>
 
@@ -26,11 +27,11 @@
 #include "table/table.hpp"
 
 namespace tinylamb {
-FullScan::FullScan(Transaction& txn, const Table& table)
-    : table_(&table), iter_(table_->BeginFullScan(txn)) {}
+FullScan::FullScan(Transaction& txn, const Table& table, size_t max_rows)
+    : table_(&table), iter_(table_->BeginFullScan(txn)), max_rows_(max_rows) {}
 
 bool FullScan::Next(Row* dst, RowPosition* rp) {
-  if (!iter_.IsValid()) {
+  if (!iter_.IsValid() || emitted_ >= max_rows_) {
     return false;
   }
   *dst = *iter_;
@@ -38,19 +39,27 @@ bool FullScan::Next(Row* dst, RowPosition* rp) {
     *rp = iter_.Position();
   }
   ++iter_;
+  ++emitted_;
   return true;
 }
 
 size_t FullScan::NextBatch(DataChunk* destination, size_t max_rows) {
-  destination->Reset(table_->GetSchema(), max_rows);
-  while (iter_.IsValid() && destination->Size() < max_rows) {
+  const size_t remaining = max_rows_ - std::min(emitted_, max_rows_);
+  const size_t batch_limit = std::min(max_rows, remaining);
+  destination->Reset(table_->GetSchema(), batch_limit);
+  while (iter_.IsValid() && emitted_ < max_rows_ &&
+         destination->Size() < batch_limit) {
     destination->Append(*iter_, iter_.Position());
     ++iter_;
+    ++emitted_;
   }
   return destination->Size();
 }
 
 void FullScan::Dump(std::ostream& o, int /*indent*/) const {
   o << "FullScan: " << table_->GetSchema().Name();
+  if (max_rows_ != std::numeric_limits<size_t>::max()) {
+    o << " (max rows: " << max_rows_ << ")";
+  }
 }
 }  // namespace tinylamb

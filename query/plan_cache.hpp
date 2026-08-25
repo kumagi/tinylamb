@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -201,8 +202,19 @@ inline bool ContainsParameterSlot(  // NOLINT(misc-no-recursion)
     case TypeTag::kUnaryExp:
       return ContainsParameterSlot(expression->AsUnaryExpression().Child());
     case TypeTag::kAggregateExp:
-      return ContainsParameterSlot(
-          expression->AsAggregateExpression().Child());
+      {
+        const auto& aggregate = expression->AsAggregateExpression();
+        if (ContainsParameterSlot(aggregate.Child()) ||
+            ContainsParameterSlot(aggregate.HavingCondition()) ||
+            ContainsParameterSlot(aggregate.WhereFilter()) ||
+            ContainsParameterSlot(aggregate.SecondaryArg())) {
+          return true;
+        }
+        for (const auto& term : aggregate.InnerOrderBy()) {
+          if (ContainsParameterSlot(term.expression)) { return true; }
+        }
+        return false;
+      }
     case TypeTag::kCaseExp: {
       const auto& searched = expression->AsCaseExpression();
       for (const auto& clause : searched.when_clauses_) {
@@ -273,10 +285,37 @@ inline Expression CloneWithPreparedValues(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kAggregateExp: {
       const auto& aggregate = expression->AsAggregateExpression();
-      return AggregateExpressionExp(
+      auto rebuilt = std::make_shared<AggregateExpression>(
           aggregate.GetType(),
           CloneWithPreparedValues(aggregate.Child(), values),
           aggregate.Distinct());
+      if (aggregate.Having() != AggregateHavingModifier::kNone) {
+        rebuilt->SetHaving(
+            aggregate.Having(),
+            CloneWithPreparedValues(aggregate.HavingCondition(), values));
+      }
+      if (aggregate.WhereFilter()) {
+        rebuilt->SetWhereFilter(
+            CloneWithPreparedValues(aggregate.WhereFilter(), values));
+      }
+      if (!aggregate.InnerOrderBy().empty()) {
+        std::vector<WindowOrderTerm> terms;
+        terms.reserve(aggregate.InnerOrderBy().size());
+        for (const auto& term : aggregate.InnerOrderBy()) {
+          terms.push_back(WindowOrderTerm{
+              CloneWithPreparedValues(term.expression, values),
+              term.ascending, term.nulls_first});
+        }
+        rebuilt->SetInnerOrderBy(std::move(terms));
+      }
+      if (aggregate.InnerLimit().has_value()) {
+        rebuilt->SetInnerLimit(aggregate.InnerLimit());
+      }
+      if (aggregate.SecondaryArg()) {
+        rebuilt->SetSecondaryArg(
+            CloneWithPreparedValues(aggregate.SecondaryArg(), values));
+      }
+      return rebuilt;
     }
     case TypeTag::kCaseExp: {
       const auto& searched = expression->AsCaseExpression();
@@ -307,7 +346,8 @@ inline Expression CloneWithPreparedValues(  // NOLINT(misc-no-recursion)
       for (const Expression& arg : call.Args()) {
         args.push_back(CloneWithPreparedValues(arg, values));
       }
-      return FunctionCallExp(call.FuncName(), std::move(args));
+      return FunctionCallExp(call.FuncName(), std::move(args),
+                             call.IsCanonicalIf());
     }
     case TypeTag::kArrayExp: {
       const auto& array = expression->AsArrayExpression();
@@ -423,10 +463,37 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kAggregateExp: {
       const auto& aggregate = expression->AsAggregateExpression();
-      return AggregateExpressionExp(
+      auto rebuilt = std::make_shared<AggregateExpression>(
           aggregate.GetType(),
           SlotizeLiterals(aggregate.Child(), slot_cursor, ok),
           aggregate.Distinct());
+      if (aggregate.Having() != AggregateHavingModifier::kNone) {
+        rebuilt->SetHaving(
+            aggregate.Having(),
+            SlotizeLiterals(aggregate.HavingCondition(), slot_cursor, ok));
+      }
+      if (aggregate.WhereFilter()) {
+        rebuilt->SetWhereFilter(
+            SlotizeLiterals(aggregate.WhereFilter(), slot_cursor, ok));
+      }
+      if (!aggregate.InnerOrderBy().empty()) {
+        std::vector<WindowOrderTerm> terms;
+        terms.reserve(aggregate.InnerOrderBy().size());
+        for (const auto& term : aggregate.InnerOrderBy()) {
+          terms.push_back(WindowOrderTerm{
+              SlotizeLiterals(term.expression, slot_cursor, ok),
+              term.ascending, term.nulls_first});
+        }
+        rebuilt->SetInnerOrderBy(std::move(terms));
+      }
+      if (aggregate.InnerLimit().has_value()) {
+        rebuilt->SetInnerLimit(aggregate.InnerLimit());
+      }
+      if (aggregate.SecondaryArg()) {
+        rebuilt->SetSecondaryArg(
+            SlotizeLiterals(aggregate.SecondaryArg(), slot_cursor, ok));
+      }
+      return rebuilt;
     }
     case TypeTag::kCaseExp: {
       const auto& searched = expression->AsCaseExpression();
@@ -466,7 +533,8 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
           return expression;
         }
       }
-      return FunctionCallExp(call.FuncName(), std::move(args));
+      return FunctionCallExp(call.FuncName(), std::move(args),
+                             call.IsCanonicalIf());
     }
     case TypeTag::kArrayExp: {
       const auto& array = expression->AsArrayExpression();
@@ -527,7 +595,13 @@ struct CompiledPlan {
     std::vector<std::string> column_names;
     std::vector<Expression> order_expressions;
     std::vector<bool> order_ascending;
-    std::vector<std::pair<Expression, bool>> sort_keys;
+    std::vector<std::optional<bool>> order_nulls_first;
+    struct SortKey {
+      Expression expression;
+      bool ascending{true};
+      std::optional<bool> nulls_first;
+    };
+    std::vector<SortKey> sort_keys;
     bool distinct{false};
     bool has_limit{false};
     size_t limit{0};

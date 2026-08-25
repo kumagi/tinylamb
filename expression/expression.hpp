@@ -122,10 +122,11 @@ Expression AggregateExpressionExp(AggregationType type, Expression child,
                                   bool distinct = false);
 Expression CaseExpressionExp(
     std::vector<std::pair<Expression, Expression>> when_clauses,
-    Expression else_clause);
+    Expression else_clause, bool from_if = false);
 Expression InExpressionExp(Expression child, std::vector<Expression> list);
 Expression FunctionCallExp(std::string func_name,
-                           std::vector<Expression> args);
+                           std::vector<Expression> args,
+                           bool canonical_if = false);
 Expression QueryExpressionExp(std::shared_ptr<SelectStatement> query,
                               Expression test = nullptr, bool exists = false,
                               bool negated = false);

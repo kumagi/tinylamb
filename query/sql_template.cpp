@@ -186,7 +186,8 @@ Expression BindExpression(const Expression& expression,  // NOLINT(misc-no-recur
       for (const Expression& arg : call.Args()) {
         args.push_back(BindExpression(arg, parameters, index));
       }
-      return FunctionCallExp(call.FuncName(), std::move(args));
+      return FunctionCallExp(call.FuncName(), std::move(args),
+                             call.IsCanonicalIf());
     }
     case TypeTag::kArrayExp: {
       const auto& array = expression->AsArrayExpression();
@@ -635,6 +636,12 @@ std::unique_ptr<Statement> BindStatementLiterals(
     }
     case StatementType::kInsert: {
       const auto& insert = dynamic_cast<const InsertStatement&>(statement);
+      if (insert.IsSelect()) {
+        bound = std::make_unique<InsertStatement>(
+            insert.TableName(),
+            BindSelect(*insert.Query(), parameters, &index), insert.Columns());
+        break;
+      }
       std::vector<std::vector<Expression>> rows;
       rows.reserve(insert.Values().size());
       for (const auto& row : insert.Values()) {

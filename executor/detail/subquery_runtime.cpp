@@ -106,6 +106,9 @@ void CountStatementTablesImpl(  // NOLINT(misc-no-recursion)
   for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
     CountExpressionTables(term.expression, counts, visible_ctes);
   }
+  for (const std::shared_ptr<SelectStatement>& branch : statement.UnionAll()) {
+    CountStatementTablesImpl(*branch, counts, visible_ctes);
+  }
 }
 }  // namespace
 

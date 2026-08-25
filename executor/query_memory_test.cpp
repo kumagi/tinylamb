@@ -14,7 +14,7 @@
 
 namespace tinylamb {
 
-TEST(QueryMemoryTest, BudgetTracksUsage) {
+TEST(QueryMemoryTest, QueryMemoryBudget_ReserveAndRelease_TracksUsage) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(1000);
   EXPECT_FALSE(budget.Unlimited());
@@ -28,7 +28,7 @@ TEST(QueryMemoryTest, BudgetTracksUsage) {
   EXPECT_EQ(budget.Used(), 60U);
 }
 
-TEST(QueryMemoryTest, CanReserveSoftLimit) {
+TEST(QueryMemoryTest, CanReserve_PastSoftLimit_RejectsReservation) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(1000);
   // Soft limit is 80% (800): reserving up to and including 800 is allowed,
@@ -42,21 +42,21 @@ TEST(QueryMemoryTest, CanReserveSoftLimit) {
   EXPECT_TRUE(budget.Unlimited());
 }
 
-TEST(QueryMemoryTest, EstimateRowBytes) {
+TEST(QueryMemoryTest, EstimateRowBytes_SampleRowAndValues_ReturnsExpectedEstimates) {
   Row row({Value(1), Value("hello")});
   EXPECT_GT(EstimateRowBytes(row), 0U);
   EXPECT_GE(EstimateValueBytes(Value("hello")), 5U);
   EXPECT_GE(EstimateValueBytes(Value(1)), 0U);
 }
 
-TEST(QueryMemoryTest, GlobalIsSingleton) {
+TEST(QueryMemoryTest, Global_MultipleCalls_ReturnsSameInstance) {
   QueryMemoryBudget& a = QueryMemoryBudget::Global();
   QueryMemoryBudget& b = QueryMemoryBudget::Global();
   EXPECT_EQ(&a, &b);
   a.ResetForTest(0);
 }
 
-TEST(QueryMemoryTest, EnvVarIsReadOnlyAtFirstInit) {
+TEST(QueryMemoryTest, ResetForTest_WithEnvVar_MaintainsCorrectLimit) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   setenv("TINYLAMB_QUERY_MEMORY_BYTES", "424242", 1);
   budget.ResetForTest(1024);
@@ -71,7 +71,7 @@ TEST(QueryMemoryTest, EnvVarIsReadOnlyAtFirstInit) {
   budget.ResetForTest(0);
 }
 
-TEST(QueryMemoryTest, UnlimitedRemainingIsSizedMax) {
+TEST(QueryMemoryTest, Remaining_WhenUnlimited_ReturnsMaxSize) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(0);
   EXPECT_TRUE(budget.Unlimited());
@@ -83,7 +83,7 @@ TEST(QueryMemoryTest, UnlimitedRemainingIsSizedMax) {
   EXPECT_EQ(budget.Remaining(), static_cast<size_t>(-1));
 }
 
-TEST(QueryMemoryTest, RemainingClampsAtZero) {
+TEST(QueryMemoryTest, Remaining_WhenExceedingLimit_ClampsAtZero) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(100);
   EXPECT_EQ(budget.Remaining(), 100U);
@@ -94,7 +94,7 @@ TEST(QueryMemoryTest, RemainingClampsAtZero) {
   EXPECT_EQ(budget.Remaining(), 0U);
 }
 
-TEST(QueryMemoryTest, CanReserveZeroAndSoftBoundaries) {
+TEST(QueryMemoryTest, CanReserve_AtBoundaries_ReturnsExpectedBoolean) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(1000);
   EXPECT_TRUE(budget.CanReserve(0));
@@ -106,7 +106,7 @@ TEST(QueryMemoryTest, CanReserveZeroAndSoftBoundaries) {
   EXPECT_TRUE(budget.CanReserve(0));  // bytes==0 is always allowed
 }
 
-TEST(QueryMemoryTest, ReserveForcedAndReleaseClamp) {
+TEST(QueryMemoryTest, ReserveForcedAndRelease_VariousAmounts_ClampsUsageCorrectly) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(1000);
   budget.ReserveForced(0);
@@ -120,7 +120,7 @@ TEST(QueryMemoryTest, ReserveForcedAndReleaseClamp) {
   EXPECT_EQ(budget.Used(), 0U);
 }
 
-TEST(QueryMemoryTest, EstimateValueBytesForAllTypes) {
+TEST(QueryMemoryTest, EstimateValueBytes_AllTypes_ReturnsExpectedByteSizes) {
   EXPECT_EQ(EstimateValueBytes(Value()), 32U);
   EXPECT_EQ(EstimateValueBytes(Value(1)), 40U);
   EXPECT_EQ(EstimateValueBytes(Value(2.5)), 40U);
@@ -131,7 +131,7 @@ TEST(QueryMemoryTest, EstimateValueBytesForAllTypes) {
             64U + 40U + 34U);
 }
 
-TEST(QueryMemoryTest, QueryMemoryChargeRaii) {
+TEST(QueryMemoryTest, QueryMemoryCharge_RaiiScope_AcquiresAndReleasesMemory) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(0);
   EXPECT_EQ(budget.Used(), 0U);
@@ -153,7 +153,7 @@ TEST(QueryMemoryTest, QueryMemoryChargeRaii) {
   EXPECT_EQ(default_ctor.Bytes(), 0U);
 }
 
-TEST(QueryMemoryTest, QueryMemoryChargeMove) {
+TEST(QueryMemoryTest, QueryMemoryCharge_MoveSemantics_TransfersOwnership) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(0);
   QueryMemoryCharge a(100);

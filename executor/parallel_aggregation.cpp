@@ -42,10 +42,10 @@ ParallelAggregationExecutor::ParallelAggregationExecutor(
     const auto& aggregate =
         aggregates_[index].expression->AsAggregateExpression();
     AggregateInput input;
-    if (IsCountStar(aggregate)) {
+    if (!aggregate.WhereFilter() && IsCountStar(aggregate)) {
       input.kind = AggregateInputKind::kRowCount;
       row_count_indices_.push_back(index);
-    } else if (!aggregate.Distinct() &&
+    } else if (!aggregate.Distinct() && !aggregate.WhereFilter() &&
                aggregate.Child()->Type() == TypeTag::kColumnValue) {
       const int offset = input_schema_.Offset(
           aggregate.Child()->AsColumnValue().GetColumnName());
@@ -201,6 +201,13 @@ void ParallelAggregationExecutor::AccumulateGeneric(
       }
       const auto& aggregate =
           aggregates_[index].expression->AsAggregateExpression();
+      if (aggregate.WhereFilter()) {
+        if (!materialized) { materialized = chunk.RowAt(row_index); }
+        if (!aggregate.WhereFilter()->Evaluate(*materialized, input_schema_)
+                 .Truthy()) {
+          continue;
+        }
+      }
       Value value;
       if (IsCountStar(aggregate)) {
         value = Value(1);

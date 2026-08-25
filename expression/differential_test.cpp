@@ -374,7 +374,7 @@ std::vector<InCell> BuildInCells() {
 
 }  // namespace
 
-TEST(DifferentialTest, ArithmeticMatrixMatchesAcrossPaths) {
+TEST(DifferentialTest, Evaluate_ArithmeticMatrix_MatchesAcrossPaths) {
   const std::vector<std::pair<std::string, BinaryOperation>> operations{
       {"add", BinaryOperation::kAdd},
       {"sub", BinaryOperation::kSubtract},
@@ -427,7 +427,7 @@ TEST(DifferentialTest, ArithmeticMatrixMatchesAcrossPaths) {
   tally.Summarize("arithmetic");
 }
 
-TEST(DifferentialTest, ComparisonMatrixMatchesAcrossPaths) {
+TEST(DifferentialTest, Evaluate_ComparisonMatrix_MatchesAcrossPaths) {
   const std::vector<std::pair<std::string, BinaryOperation>> operations{
       {"eq", BinaryOperation::kEquals},
       {"ne", BinaryOperation::kNotEquals},
@@ -492,7 +492,7 @@ TEST(DifferentialTest, ComparisonMatrixMatchesAcrossPaths) {
   tally.Summarize("comparison");
 }
 
-TEST(DifferentialTest, LogicalThreeValuedLogicMatchesAcrossPaths) {
+TEST(DifferentialTest, Evaluate_LogicalThreeValuedLogic_MatchesAcrossPaths) {
   const std::vector<Row> rows{
       Row({Value(int64_t{1}), Value(int64_t{1})}),  // T T
       Row({Value(int64_t{1}), Value(int64_t{0})}),  // T F
@@ -566,7 +566,7 @@ TEST(DifferentialTest, LogicalThreeValuedLogicMatchesAcrossPaths) {
 }
 
 
-TEST(DifferentialTest, LikePatternsMatchAcrossPaths) {
+TEST(DifferentialTest, Evaluate_LikePatterns_MatchesAcrossPaths) {
   const std::vector<const char*> patterns{
       "abc", "a%", "%c", "a%c", "_bc", "%", "ab_", "a_c"};
   const std::vector<Value> values{
@@ -632,7 +632,7 @@ TEST(DifferentialTest, LikePatternsMatchAcrossPaths) {
   tally.Summarize("like");
 }
 
-TEST(DifferentialTest, StringConcatenationMatchesAcrossPaths) {
+TEST(DifferentialTest, Evaluate_StringConcatenation_MatchesAcrossPaths) {
   const std::vector<Row> rows{
       Row({TextValue("foo"), TextValue("bar")}),
       Row({Value(), TextValue("bar")}),
@@ -666,7 +666,7 @@ TEST(DifferentialTest, StringConcatenationMatchesAcrossPaths) {
   tally.Summarize("concat");
 }
 
-TEST(DifferentialTest, CaseAndInMatchAcrossPaths) {
+TEST(DifferentialTest, Evaluate_CaseAndIn_MatchesAcrossPaths) {
   const Schema& schema = IntSchema();
   const std::vector<Row> rows{
       Row({Value(int64_t{9}), Value(int64_t{0})}),
@@ -698,7 +698,7 @@ TEST(DifferentialTest, CaseAndInMatchAcrossPaths) {
   tally.Summarize("case-in");
 }
 
-TEST(DifferentialTest, DateFunctionsMatchAcrossPaths) {
+TEST(DifferentialTest, Evaluate_DateFunctions_MatchesAcrossPaths) {
   DifferentialTally tally;
   const Row empty_row;
 
@@ -788,7 +788,7 @@ TEST(DifferentialTest, DateFunctionsMatchAcrossPaths) {
   tally.Summarize("date-functions");
 }
 
-TEST(DifferentialTest, JitFilterMatchesAstAndBytecodeOnSupportedOps) {
+TEST(DifferentialTest, CompileFilter_SupportedOperations_MatchesAstAndBytecode) {
   const std::vector<std::pair<std::string, BinaryOperation>> operations{
       {"eq", BinaryOperation::kEquals},
       {"ne", BinaryOperation::kNotEquals},
@@ -833,7 +833,7 @@ TEST(DifferentialTest, JitFilterMatchesAstAndBytecodeOnSupportedOps) {
   }
 }
 
-TEST(DifferentialTest, JitProjectionMatchesAstAndBytecode) {
+TEST(DifferentialTest, CompileProjection_LinearTransformation_MatchesAstAndBytecode) {
   const auto jit = JitInt64Kernels::CompileProjection();
   if (!jit.has_value()) {
     GTEST_SKIP() << "JIT projection kernel unavailable (LLVM disabled)";
@@ -866,7 +866,7 @@ TEST(DifferentialTest, JitProjectionMatchesAstAndBytecode) {
 // messages/semantics wherever the intent was identical (LIKE message, modulo
 // by zero message, unary-minus overflow guard).  These cells assert the newly
 // unified behaviour so it cannot drift back.
-TEST(DifferentialTest, DetailPathAgreesWithCanonicalEvaluator) {
+TEST(DifferentialTest, EvaluateDetailPath_CommonExpressions_AgreesWithCanonicalEvaluator) {
   const Schema& schema = IntSchema();
   const Row zero_division({Value(int64_t{5}), Value(int64_t{0})});
   const Expression modulo_zero = BinaryExpressionExp(ColumnValueExp("i"),
@@ -923,7 +923,7 @@ TEST(DifferentialTest, DetailPathAgreesWithCanonicalEvaluator) {
 // Binary()/unary dispatch now forwards to the canonical AST evaluators, so
 // the full AND/OR/NOT truth table including UNKNOWN must agree between the
 // detail path and the canonical evaluator.
-TEST(DifferentialTest, DetailPathThreeValuedLogicMatchesCanonical) {
+TEST(DifferentialTest, EvaluateDetailPath_ThreeValuedLogic_MatchesCanonical) {
   const Schema& schema = IntSchema();
   const std::vector<Row> rows{
       Row({Value(int64_t{1}), Value(int64_t{1})}),  // T T
@@ -976,7 +976,7 @@ TEST(DifferentialTest, DetailPathThreeValuedLogicMatchesCanonical) {
 // forwarded to the canonical EvaluateBinary, so int/int division truncates to
 // INT64 and add/sub/mul overflow plus INT64_MIN % -1 raise the canonical
 // errors -- exactly like the AST evaluator.
-TEST(DifferentialTest, DetailPathNumericEdgeCasesMatchCanonical) {
+TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
   const Schema& schema = IntSchema();
   const Row seven_three({Value(int64_t{7}), Value(int64_t{3})});
   const Expression division = BinaryExpressionExp(ColumnValueExp("i"),
@@ -986,9 +986,9 @@ TEST(DifferentialTest, DetailPathNumericEdgeCasesMatchCanonical) {
   const Attempt ast_div = EvaluateAst(division, seven_three, schema);
   EXPECT_EQ(detail_div.kind, Attempt::Kind::kValue);
   EXPECT_EQ(ast_div.kind, Attempt::Kind::kValue);
-  EXPECT_EQ(detail_div.value.type, ValueType::kInt64);
+  EXPECT_EQ(detail_div.value.type, ValueType::kDouble);
   EXPECT_TRUE(SameValue(detail_div.value, ast_div.value))
-      << "int/int division must truncate like the canonical evaluator";
+      << "int/int division must produce double like the canonical evaluator";
 
   const Row max_one({Value(kInt64Max), Value(int64_t{1})});
   const Expression overflow_add = BinaryExpressionExp(ColumnValueExp("i"),
@@ -1015,7 +1015,7 @@ TEST(DifferentialTest, DetailPathNumericEdgeCasesMatchCanonical) {
       << "INT64_MIN % -1 message";
 }
 
-TEST(DifferentialTest, DetailPathConcatNullMatchesCanonical) {
+TEST(DifferentialTest, EvaluateDetailPath_ConcatNull_MatchesCanonical) {
   const Schema schema("strings", {Column("s", ValueType::kVarChar)});
   const Row row({Value()});
   const Expression concat = FunctionCallExp(

@@ -79,6 +79,29 @@ size_t ProjectionPlan::AccessRowCount() const { return src_->AccessRowCount(); }
 
 size_t ProjectionPlan::EmitRowCount() const { return src_->EmitRowCount(); }
 
+bool ProjectionPlan::IsOrderedBy(
+    const std::vector<Expression>& expressions,
+    const std::vector<bool>& ascending) const {
+  if (expressions.size() != ascending.size()) { return false; }
+  std::vector<Expression> child_expressions;
+  child_expressions.reserve(expressions.size());
+  for (const Expression& expression : expressions) {
+    Expression translated = expression;
+    if (expression && expression->Type() == TypeTag::kColumnValue) {
+      const std::string& name =
+          expression->AsColumnValue().GetColumnName().name;
+      for (const NamedExpression& column : columns_) {
+        if (column.name == name) {
+          translated = column.expression;
+          break;
+        }
+      }
+    }
+    child_expressions.push_back(std::move(translated));
+  }
+  return src_->IsOrderedBy(child_expressions, ascending);
+}
+
 void ProjectionPlan::Dump(std::ostream& o, int indent) const {
   o << "Project: {";
   for (size_t i = 0; i < columns_.size(); ++i) {

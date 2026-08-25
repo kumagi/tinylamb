@@ -72,18 +72,12 @@ class FullScanIteratorTest : public ::testing::Test {
   std::unique_ptr<Database> db_;
 };
 
-TEST_F(FullScanIteratorTest, Construct) {
-  // Arrange -- nothing to set up; default FullScanIteratorTest environment via
-  // SetUp() Act -- nothing to execute; default constructed via SetUp() Assert
-  // -- nothing to verify; gtest green on pass, death on crash
-}
+TEST_F(FullScanIteratorTest, Construct_Default_Succeeds) {}
 
-TEST_F(FullScanIteratorTest, Scan) {
-  // Arrange -- begin context, get table "SampleTable"
+TEST_F(FullScanIteratorTest, BeginFullScan_AllRows_ScansSuccessfully) {
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
 
-  // Act -- insert 130 rows, then run a full scan iterator through all rows
   for (int i = 0; i < 130; ++i) {
     ASSERT_SUCCESS(
         table
@@ -96,11 +90,9 @@ TEST_F(FullScanIteratorTest, Scan) {
     LOG(TRACE) << *it;
     ++it;
   }
-
-  // Assert -- implicit; full scan completes without crash; gtest green on pass
 }
 
-TEST_F(FullScanIteratorTest, ProjectedScanReturnsRequestedColumnsInOrder) {
+TEST_F(FullScanIteratorTest, BeginFullScan_WithProjection_ReturnsRequestedColumnsInOrder) {
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
   ASSERT_SUCCESS(
@@ -113,8 +105,6 @@ TEST_F(FullScanIteratorTest, ProjectedScanReturnsRequestedColumnsInOrder) {
   EXPECT_EQ((*projected)[0], Value(42));
   EXPECT_EQ((*projected)[1], Value(3.5));
 
-  // Spell out the type: a bare `{}` would resolve to the
-  // IntegerPeekCompare-pointer overload added alongside peek scans.
   Iterator no_columns =
       table.BeginFullScan(ctx.txn_, std::vector<slot_t>{});
   ASSERT_TRUE(no_columns.IsValid());
@@ -122,7 +112,7 @@ TEST_F(FullScanIteratorTest, ProjectedScanReturnsRequestedColumnsInOrder) {
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
-TEST_F(FullScanIteratorTest, ScanAfterDeletingFirstSlot) {
+TEST_F(FullScanIteratorTest, BeginFullScan_AfterDeletingFirstSlot_ScansRemainingRows) {
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
   RowPosition first;
@@ -130,9 +120,10 @@ TEST_F(FullScanIteratorTest, ScanAfterDeletingFirstSlot) {
     ASSIGN_OR_ASSERT_FAIL(
         RowPosition, position,
         table.Insert(ctx.txn_, Row({Value(i), Value("v" + std::to_string(i)),
-                                    Value(0.1 + i)})));
-    if (i == 0) { first = position;
-}
+                                     Value(0.1 + i)})));
+    if (i == 0) {
+      first = position;
+    }
   }
   ASSERT_SUCCESS(table.Delete(ctx.txn_, first));
 
@@ -148,7 +139,7 @@ TEST_F(FullScanIteratorTest, ScanAfterDeletingFirstSlot) {
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
-TEST_F(FullScanIteratorTest, OldSnapshotScansPhysicallyDeletedTailRow) {
+TEST_F(FullScanIteratorTest, BeginFullScan_OldSnapshotAfterDelete_ScansPhysicallyDeletedTailRow) {
   TransactionContext seed = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(seed, "SampleTable"));
   RowPosition tail;
@@ -183,11 +174,7 @@ TEST_F(FullScanIteratorTest, OldSnapshotScansPhysicallyDeletedTailRow) {
   ASSERT_SUCCESS(fresh_reader.PreCommit());
 }
 
-}  // namespace tinylamb
-
-namespace tinylamb {
-
-TEST_F(FullScanIteratorTest, MorselScanIteratesOnlyRequestedPages) {
+TEST_F(FullScanIteratorTest, BeginMorselScan_WithMorsels_IteratesOnlyRequestedPages) {
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
   for (int i = 0; i < 130; ++i) {
@@ -199,6 +186,7 @@ TEST_F(FullScanIteratorTest, MorselScanIteratesOnlyRequestedPages) {
   const std::vector<Table::ScanMorsel> morsels =
       table.BuildScanMorsels(ctx.txn_, 2);
   ASSERT_FALSE(morsels.empty());
+
   int64_t seen = 0;
   for (const Table::ScanMorsel& morsel : morsels) {
     Iterator it = table.BeginMorselScan(ctx.txn_, morsel);
@@ -212,10 +200,11 @@ TEST_F(FullScanIteratorTest, MorselScanIteratesOnlyRequestedPages) {
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
-TEST_F(FullScanIteratorTest, EmptyTableScanYieldsNoRows) {
+TEST_F(FullScanIteratorTest, BeginFullScan_EmptyTable_YieldsNoRows) {
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, table, db_->GetTable(ctx, "SampleTable"));
   Iterator it = table.BeginFullScan(ctx.txn_);
+
   EXPECT_FALSE(it.IsValid());
   EXPECT_FALSE(it.Position().IsValid());
   ++it;
@@ -223,7 +212,7 @@ TEST_F(FullScanIteratorTest, EmptyTableScanYieldsNoRows) {
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
-TEST_F(FullScanIteratorTest, DumpPrintsScanName) {
+TEST_F(FullScanIteratorTest, OutputOperator_WhenCalled_PrintsScanName) {
   TransactionContext ctx = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "SampleTable"));
   ASSERT_SUCCESS(
@@ -231,11 +220,14 @@ TEST_F(FullScanIteratorTest, DumpPrintsScanName) {
           .GetStatus());
   Iterator it = table.BeginFullScan(ctx.txn_);
   ASSERT_TRUE(it.IsValid());
+
   std::ostringstream output;
   output << it;
+
   EXPECT_NE(output.str().find("FullScan"), std::string::npos);
   EXPECT_NE(output.str().find("SampleTable"), std::string::npos);
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
 }  // namespace tinylamb
+

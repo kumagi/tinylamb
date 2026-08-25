@@ -26,20 +26,23 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `Projection` + `ProjectionPlan`
 - [x] `Aggregation` + `AggregationPlan`（＋ `ParallelAggregation`）
 - [x] `Limit` + `LimitPlan`
-- [x] `HashJoin`（in-memory / hybrid spill）+ `JoinKind`: inner / semi / anti
+- [x] `HashJoin`（in-memory / hybrid spill）+ `JoinKind`: inner / semi / anti /
+      null-aware anti
 - [x] `IndexJoin` + エイリアス付き自己結合
 - [x] `CrossJoin` / nested-loop（完全述語評価）
 - [x] `Sort`（外部マージ）※計画ノードとしてはエンジン安全網が主
 - [x] `Distinct`
 - [x] `Insert` / `Update` / `Delete`
 - [x] `ConstantExecutor`
+- [x] `EmptyPlan`（定数 FALSE / NULL の結果をスキャンなしで返す）
 - [x] `RelationRename` + `RelationRenamePlan`
 - [x] `Relational` 不透明 IR + `RelationalPlan`（外側結合・CTE などの避難所）
 - [x] `DataChunk` ベクトル化、`SpillFile`、`QueryMemory`、`QueryScheduler`
 - [x] `ZoneMap`（スキャン補助）
 
-`JoinKind::kSemi` / `kAnti` はハッシュ結合実行器にあるが、**Cascades の
-論理 Semi/Anti と実装規則は未接続**。下の Semi/Anti 節を優先する。
+`JoinKind::kSemi` / `kAnti` はハッシュ結合実行器にあり、等価キーの
+論理 Semi/Anti から実装規則まで接続済み。残余述語や Mark/Null-aware
+形状は下の未完了項目として扱う。
 
 ---
 
@@ -47,34 +50,49 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 ### Merge / sort-merge
 
-- [ ] `MergeJoinPlan` / `MergeJoinExecutor`（等価、両側昇順、NULL 処理）
-- [ ] 複合キー、不等号残余フィルタ
-- [ ] LEFT / RIGHT / FULL outer merge join
-- [ ] SEMI / ANTI merge join（重複キーで probe を 1 回だけ）
-- [ ] 片側未ソートなら `Sort` を子として要求する実装規則
-- [ ] 興味深い順序を出力（join キー順）
-- [ ] many-to-many の交差（マーク＆リセット）
+- [x] `MergeJoinPlan`（キーと両側スキーマの物理契約）
+- [x] required ordering / implementation rule（interesting order まで。Cascades の
+      MergeJoinAlternative が子 SortPlan 要求を構築）
+- [x] `MergeJoinExecutor`（等価、両側昇順、NULL 非マッチ、重複キー run）
+- [x] 複合キー（キー配列と回帰テスト）
+- [ ] 不等号残余フィルタ
+- [x] LEFT / RIGHT / FULL outer merge join（NULL キーを非マッチとして左右の
+      unmatched 行を NULL padding。空入力の幅は `MergeJoinPlan` から伝播し、
+      `MergeJoinSupportsOuterKindsAndNullKeys` で回帰）
+- [x] SEMI / ANTI merge join（重複キーで probe を 1 回だけ、NULL キー非一致、物理
+      実装規則と回帰テスト付き）
+- [x] 片側未ソートなら `SortPlan` を子として要求する実装規則（MergeJoin の
+      コストにソート費用を加算し、他方式との比較対象にする）
+- [x] 興味深い順序を出力（左入力の join キー昇順を `IsOrderedBy` で伝播）
+- [x] many-to-many の交差（重複キー run の直積を出力）
 - [ ] 非等価 merge（`a.x < b.y` のバンドジョイン）は後回しでも項目化:
       - [ ] inequality merge / band join
 
 ### Outer hash / nested loop
 
-- [ ] `LeftHashJoin`（ビルド右、マッチしなければ NULL pad）
-- [ ] `RightHashJoin`（または左右入替で Left に帰着）
-- [ ] `FullHashJoin`（両側未マッチ）
-- [ ] spill 付き hybrid outer hash（既存 hybrid の拡張）
-- [ ] `LeftNestedLoopJoin` / `Right` / `Full`
+- [x] `LeftHashJoin`（ビルド右、マッチしなければ NULL pad。`HashJoin`
+      の `JoinKind::kLeftOuter` として実装）
+- [x] `RightHashJoin`（`HashJoin::JoinKind::kRightOuter`。左右の未マッチ行と
+      NULL キーを保持）
+- [x] `FullHashJoin`（`HashJoin::JoinKind::kFullOuter`。両側未マッチ）
+- [x] spill 付き hybrid outer hash（`HashJoin::MaterializeOuter` が両辺を
+      budget-aware に取り込み、spill partition を再走査。LEFT JOIN の整数キー・
+      文字列キー回帰 `Relational_WithHybridHashLeftJoinUnderBudget_SpillsToDisk` /
+      `Relational_WithStringKeyHybridLeftJoinUnderBudget_SpillsToDisk`）
+- [x] `LeftNestedLoopJoin` / `Right` / `Full`（非等価外部結合の relational fallback と回帰テストあり）
 - [ ] outer の Semi ではない null-aware マッチ
 - [ ] 右側フィルタが null-rejecting でないときの実行時 NULL 生成
 
 ### Semi / Anti / Mark / Single（実行器は部分的に既存）
 
-- [ ] Cascades から `JoinKind::kSemi` / `kAnti` を選ぶ物理規則
+- [x] Cascades から `JoinKind::kSemi` / `kAnti` を選ぶ物理規則
+      （等価キー・残余なしの HashJoin。半結合は probe 側スキーマを保持）
 - [ ] `MarkJoin`（一致フラグ列を追加、`IN` の UNKNOWN）
-- [ ] `SingleJoin` / `Max1Row`（スカラサブクエリ、2 行目でエラー）
-- [ ] `NullAwareAntiJoin`（`NOT IN`、ビルド側 NULL の短絡）
+- [x] `SingleJoin` / `Max1Row` の意味論（スカラサブクエリは 2 行目で
+      cardinality error。`Max1RowPlan` / `Max1RowExecutor` も接続）
+- [x] `NullAwareAntiJoin`（`NOT IN`、ビルド側 NULL の短絡）
 - [ ] uniqueness 付き semi → inner に落とさない実行時 assert
-- [ ] EXISTS 用 short-circuit nested loop（1 ヒットで内側打ち切り）
+- [x] EXISTS 用 short-circuit nested loop（単一表の安全な LIMIT 1 pushdown、相関 index 経路は維持）
 
 ### その他の結合形
 
@@ -85,44 +103,56 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [ ] `LateMaterializationJoin`（RID 結合 → 列フェッチ）
 - [ ] `DynamicFilterJoin` / sideway information passing（ブルームをスキャンへ）
 - [ ] `HashSemiReduction`（巨大ファクトの前に次元を縮約）
-- [ ] `CrossJoinUnnest`（1 行定数 × 表）
+- [x] `CrossJoinUnnest`（定数/相関配列を通常の cross/lateral 行源として結合、SQL 回帰あり）
 - [ ] `AsOfJoin` / `IntervalJoin`（時系列、将来）
 
 ---
 
 ## P0 — ソート・Top-N・順序
 
-- [ ] `SortPlan` を Cascades 実装規則から明示生成（エンジン安全網と二重適用禁止）
-- [ ] `ExternalMergeSort` のプラン接続（実行器 `sort.cpp` の正式化）
+- [x] `SortPlan` を単一リレーションおよび一般 Cascades 最適化経路から明示生成
+      （`IsOrderedBy` でエンジン安全網との二重適用を防止）
+- [x] `ExternalMergeSort` のプラン接続（`SortPlan` が既存
+      `SortExecutor` を駆動。単一キー radix / 複合キー安定ソートも既存実装）
 - [ ] `InMemoryQuickSort` / `pdqsort` 経路
-- [ ] `TopNHeapPlan` / `TopNExecutor`（k 小さい ORDER BY LIMIT）
-- [ ] `TopNPlusOffset`
-- [ ] `WITH TIES` Top-N
+- [x] `TopNPlan` / `TopNExecutor`（ヒープで `OFFSET + LIMIT` 件だけ保持）
+- [x] `TopNPlusOffset`（TopNの容量と出力位置で対応）
+- [x] `WITH TIES` Top-N（TopNExecutor の ties 境界拡張）
 - [ ] `IncrementalSort`（入力が prefix ソート済み）
 - [ ] `PartialSort`
 - [ ] `ClusteredIndexOrder` を FullScan が報告（PK 順ページ）
-- [ ] `LimitPushdownScan`（unordered LIMIT の early stop）
+- [x] `LimitPushdownScan`（unordered LIMIT の OFFSET + LIMIT 上限を FullScan が
+     受け取り、スカラー/バッチ双方で early stop）
 - [ ] `SkipScanDistinct`（インデックスで DISTINCT キーを飛ばす）
-- [ ] collation / nulls first/last を比較器に
-- [ ] 安定ソート vs 非安定の文書化
-- [ ] 並行ソート（モーセルマージ）
+- [x] collation / nulls first/last を比較器に（Sort / TopN と SQL の明示
+      `NULLS FIRST` / `NULLS LAST` を接続。collation の多言語拡張は別項目）
+- [x] 安定ソート vs 非安定の文書化（SortExecutor は安定ソートを保証）
+- [x] 並行ソート（モーセル分割と安定マージを `ParallelSort` 経路で実行）
 
 ---
 
 ## P0 — 集約
 
-- [ ] `HashAggregatePlan` と `SortAggregatePlan` の分離選択
+- [x] `HashAggregatePlan` と `SortAggregatePlan` の分離選択（スカラー集約の
+      物理 plan 型と `AggregationStrategy` を分離。GROUP BY payload の
+      Cascades 接続までは別項目）
 - [ ] `StreamAggregate`（入力が group キー順）
 - [ ] `PartialAggregate` + `FinalizeAggregate`（並列・分散）
-- [ ] `DistinctAggregate`（`COUNT(DISTINCT x)` 専用パス）
+- [x] `DistinctAggregate`（逐次・並列 `Aggregation` が aggregate metadata の
+      DISTINCT 集合を保持して `COUNT(DISTINCT x)` を処理）
 - [ ] `TwoPhaseDistinctAgg`
 - [ ] `MinMaxIndexScan`（INDEX ONLY で MIN/MAX）
-- [ ] `FilteredAggregate`（`AGG(...) FILTER (WHERE …)`）
+- [x] `FilteredAggregate`（GoogleSQL `AGG(x WHERE …)`。直列・並列集約と
+      `COUNT(*)` のフィルタ順序を回帰）
+- [ ] SQL 標準 `AGG(...) FILTER (WHERE …)` の AST 接続
 - [ ] `OrderedSetAggregate`（`PERCENTILE_CONT` / `WITHIN GROUP`）
 - [ ] `GroupingSetsExecutor` / `Rollup` / `Cube`（Expand + Agg または複数 Agg）
-- [ ] `ScalarAggEmptyInput`（0 行で COUNT=0、SUM=NULL）
-- [ ] spill 付きハッシュ集約の計画接続（並列集約は既存）
-- [ ] `MemoryLimitedAgg` の強制 spill
+- [x] `ScalarAggEmptyInput`（0 行で COUNT=0、SUM=NULL。AVG/MIN/MAX の NULL も
+      含め、逐次・並列集約で回帰テスト済み）
+- [x] spill 付きハッシュ集約の計画接続（Relational fallback の partitioned aggregation、予算超過回帰テストあり）
+- [x] `MemoryLimitedAgg` の強制 spill（grouped relational aggregation が
+      `QueryMemoryBudget` を監視して hash partition + `SpillFile` に切り替え。
+      `Relational_WithPartitionedAggregationUnderBudget_SpillsToDisk` で回帰）
 - [ ] bitwise / bool_and / bool_or のベクトル化パス
 - [ ] `ANY_VALUE` 短絡
 
@@ -143,13 +173,15 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [ ] `ParallelIndexScan`
 - [ ] `RangePartitionedScan`（ページ範囲の分割）
 - [ ] `SampleScan`（BERNOULLI / SYSTEM）
-- [ ] `DummyScan` / `OneRow`（`SELECT 1`、既存 Constant の計画化）
-- [ ] `ValuesScan`（多行 VALUES）
-- [ ] `FunctionScan` / TVF
-- [ ] `UnnestScan`
+- [x] `DummyScan` / `OneRow`（`DummyScanPlan` + `ValuesExecutor`。SELECT 1 を
+      Optimizer 経路で実行）
+- [x] `ValuesScan`（多行 VALUES の `ValuesPlan` / `ValuesExecutor`）
+- [x] `FunctionScan` / TVF（関数由来の配列を `LoadSource` が行源化）
+- [x] `UnnestScan`（配列、STRUCT/PROTO、WITH OFFSET、相関 lateral 経路）
 - [ ] `WorkTableScan`（再帰 CTE）
 - [ ] `ForeignScan`（将来の外部データ）
-- [ ] `FilteredScanPushdown` と残余フィルタの EXPLAIN 区別
+- [x] `FilteredScanPushdown` と残余フィルタの EXPLAIN 区別（IndexScan の predicate
+      と、非カバー条件を Selection に残す経路を分離）
 - [ ] 複数レンジ IndexScan の大域順序保証（1 レンジ以外は順序なし、既存）の
       マージによる順序回復
 - [ ] LSM / WiscKey 経路の `LsmScan` 実装規則
@@ -158,68 +190,88 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 ## P1 — DISTINCT・集合演算
 
-- [ ] `HashDistinctPlan` / `HashDistinctExecutor`
-- [ ] `SortDistinct`（ソート済み unique）
-- [ ] `UnionAllExecutor`（n-ary append、スキーマ強制）
-- [ ] `UnionDistinct`（hash または sort+unique）
-- [ ] `Intersect` / `IntersectAll`
-- [ ] `Except` / `ExceptAll`
-- [ ] 集合演算の spill
-- [ ] `MergeAppend`（ソート済み子供のマージ、PARTITION UNION）
-- [ ] `Append`（順序なし UNION ALL）
-- [ ] 子供への LIMIT 分配（UNION ALL）
+- [x] `HashDistinctPlan` / `HashDistinctExecutor`（`DistinctPlan` + 既存ハッシュ集合実行器）
+- [x] `SortDistinct`（ソート済み入力の adjacent unique。Cascades は必要なら
+      SortPlan を前置し、ハッシュ方式とコスト比較）
+- [x] `UnionAllExecutor`（n-ary append、列数のスキーマ強制）
+- [x] `UnionDistinct`（hash による重複排除）
+- [x] `Intersect` / `IntersectAll`（行多重度を保持）
+- [x] `Except` / `ExceptAll`（行多重度を保持）
+- [x] 集合演算の型変換・共通型解決（INT64 / DOUBLE を共通 DOUBLE に昇格し、
+      plan schema と executor の行値を一致させる）
+- [x] 集合演算の spill（重複判定が必要な UNION DISTINCT / INTERSECT /
+      EXCEPT は hash partition を `SpillFile` へ退避し、partition 単位で再実行。
+      共通型を確定してから再 partition するため INT64/DOUBLE の重複も保持）
+- [x] `MergeAppend`（ソート済み UNION ALL 子供のマージ。未ソート子は
+      implementation rule 内で SortPlan を前置し、共通型を出力スキーマへ合わせる）
+- [x] `Append`（順序なし UNION ALL）
+- [x] 子供への LIMIT 分配（UNION ALL。有限 LIMIT・順序なしの連結で
+      branch cap を適用）
 
 ---
 
 ## P1 — Window
 
-- [ ] `WindowAggPlan` / `WindowExecutor`
-- [ ] パーティション切替
-- [ ] ROWS フレーム（BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW 等）
-- [ ] RANGE フレーム（ORDER BY キーの同値）
-- [ ] GROUPS フレーム
-- [ ] EXCLUDE CURRENT ROW / GROUP / TIES
-- [ ] フレーム無しランキング（ROW_NUMBER / RANK / DENSE_RANK / NTILE）
-- [ ] オフセット（LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE）
-- [ ] 累積 AGG（SUM/AVG OVER）
-- [ ] 複数 window のソート共有
+- [x] `WindowAggPlan` / `WindowExecutor` 相当（`ApplyWindows` + `ComputeOneWindow`）
+- [x] パーティション切替
+- [x] ROWS フレーム（BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW 等）
+- [x] RANGE フレーム（ORDER BY キーの同値）
+- [x] GROUPS フレーム（peer group 単位の preceding/current/following 境界と回帰テスト）
+- [x] EXCLUDE CURRENT ROW / GROUP / TIES
+- [x] フレーム無しランキング（ROW_NUMBER / RANK / DENSE_RANK / NTILE）
+- [x] オフセット（LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE）
+- [x] 累積 AGG（SUM/AVG OVER）
+- [x] 複数 window のソート共有
 - [ ] ハッシュ・パーティション + ソート（メモリ）
 - [ ] spill 付き window
-- [ ] `QUALIFY` を Window の後段 Filter として実行
+- [x] `QUALIFY` を Window の後段 Filter として実行
 
 ---
 
 ## P2 — UNNEST / 配列 / VALUES / 生成
 
-- [ ] `UnnestExecutor`（配列の行展開）
-- [ ] `WITH ORDINALITY`
-- [ ] 複数 UNNEST の zip / 直積方針（GoogleSQL に合わせる）
-- [ ] `UnnestJoin`（相関 UNNEST）
-- [ ] `GenerateSeriesExecutor`
-- [ ] `GenerateDateArray` 等
-- [ ] `ValuesExecutor` 多列
-- [ ] 空配列 UNNEST の 0 行 vs NULL 行
+- [x] `UnnestExecutor` 相当（`LoadSource` の配列行展開）
+- [x] `WITH ORDINALITY`（`SelectSource::offset_alias` と 0-based offset 列を
+      `Unnest` 出力へ付加。`SqlEngineUnnestExpandsArraysAndEmitsOffsets` で回帰）
+- [x] 複数 UNNEST の zip / 直積方針（GoogleSQL の FROM 複数項目を直積として
+      実行し、回帰テストで固定）
+- [x] `UnnestJoin`（相関 UNNEST。先行行スコープで配列を評価する lateral
+      経路と回帰テスト）
+- [x] `GenerateSeriesExecutor`（`GENERATE_SERIES` / `GENERATE_ARRAY` を配列値として
+      生成し、既存の `Unnest` row source へ接続。要素数上限と step 検証を実装）
+- [x] `GenerateDateArray` 等（`GENERATE_DATE_ARRAY` を DATE 配列として生成し、
+      `UNNEST` で展開する回帰テスト付き）
+- [x] `ValuesExecutor` 多列（`ValuesPlan` のスキーマ幅検証と複数列 `Row` を
+      そのままベクトル出力）
+- [x] 空配列 UNNEST の 0 行 vs NULL 行
 
 ---
 
 ## P2 — CTE・再帰・マテリアライズ
 
-- [ ] `MaterializePlan` / `EagerSpool`（CTE 複数参照）
-- [ ] `LazySpool` / `ConsumerSpool`（再スキャン可能バッファ）
-- [ ] `CteScan`（実体化された CTE の読み）
+- [x] `MaterializePlan` / `EagerSpool`（CTE 複数参照。`ExecuteQuery` が
+      `CteMap` に一度だけ materialize）
+- [x] `LazySpool` / `ConsumerSpool`（再スキャン可能バッファ。`Relation` の
+      `ForEachRow` を複数 consumer から利用）
+- [x] `CteScan`（実体化された CTE の読み。`LoadSource` の `CteMap` 経路）
 - [ ] `RecursiveUnion`（作業表の反復）
 - [ ] 再帰の UNION vs UNION ALL
 - [ ] サイクル検出オプション
 - [ ] 再帰深さリミット
 - [ ] `WorkTableIndex`（再帰結合用）
-- [ ] `CacheSubquery`（非相関スカラを 1 回）
+- [x] `CacheSubquery`（`ExecuteCachedUncorrelated` が非相関サブクエリを 1 回だけ
+      materialize。再利用と cache hit を回帰テスト）
 
 ---
 
 ## P2 — DML・ロック
 
-- [ ] `InsertSelectPlan`（SELECT 結果の一括挿入、計画接続）
-- [ ] `BatchInsert`
+- [x] `InsertSelectPlan` 相当（`INSERT ... SELECT` を relational executor で
+      materialize し、既存 `Insert` に一括接続。対象列順・型変換を含む
+      `SqlEngineInsertSelectCopiesAndMapsRows` で回帰。専用 Cascades DML plan は
+      DML 論理ノード導入時に置換する）
+- [x] `BatchInsert`（`Insert` が複数行 source を最後まで消費して一括挿入。
+      `Insert_FromSourceTable_InsertsAllRows` と上記 INSERT SELECT 回帰で確認）
 - [ ] `Upsert` / `ON CONFLICT`
 - [ ] `MergeExecutor`（MATCHED / NOT MATCHED）
 - [ ] `UpdateFrom` / `DeleteUsing`（結合更新）
@@ -266,7 +318,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [ ] `Filter` の短絡順序（選択性の高い述語先、副作用に注意）
 - [ ] `ConjunctReordering` 実行時
 - [ ] バイトコード / JIT フィルタの選択（既存 expression 層と接続）
-- [ ] `Projection` の CSE（同一式を 1 回）
+- [x] `Projection` の CSE（同一式を 1 回、行ごとの評価キャッシュ）
 - [ ] `VirtualComputedColumn` の遅延評価
 - [ ] `DictionaryProjection`
 - [ ] `ConstantFolding` はオプティマイザ側。実行器は residual のみ
@@ -318,14 +370,15 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 ## P6 — 正しさ・テスト
 
-- [ ] 各結合種の NULL キー・空入力・1 行・重複キー
-- [ ] outer join の null pad ゴールデン
-- [ ] `NOT IN` vs anti join の三値論理
-- [ ] Window フレーム境界
-- [ ] 集合演算 ALL vs DISTINCT の多重度
-- [ ] Top-N + OFFSET + ties
-- [ ] spill 強制（メモリキャップを極端に下げる）
-- [ ] 並列と直列の結果一致
+- [x] 各結合種の NULL キー・空入力・1 行・重複キー（outer hash の回帰テスト）
+- [x] outer join の null pad ゴールデン（left / right / full hash）
+- [x] `NOT IN` vs anti join の三値論理
+- [x] Window フレーム境界（ROWS / RANGE の回帰テスト）
+- [x] 集合演算 ALL vs DISTINCT の多重度
+- [x] Top-N + OFFSET + ties
+- [x] spill 強制（メモリキャップを極端に下げる。HashJoin / HashAgg / Sort の
+      回帰テストで結果と spill 統計を確認）
+- [x] 並列と直列の結果一致（ParallelAggregation の int64 fast path 回帰）
 - [ ] MVCC スナップショット visiblity を IndexOnly / Bitmap で
 - [ ] キャンセル途中のリーク無し
 - [ ] エンジン安全網（Sort/Limit/Distinct）との二重適用が無いこと
@@ -355,13 +408,13 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 ## 推奨実装順（最初のスライス）
 
-1. Semi/Anti を Cascades 実装規則から既存 `HashJoin`+`JoinKind` へ接続。
-2. `SortPlan` を明示し、Limit/Top-N と二重適用を潰す。
-3. `TopNHeap`（ORDER BY LIMIT が TPC-H で効く）。
-4. `MergeJoin` + interesting order。
-5. `LeftHashJoin`（メモに `kOuterJoin` が入った直後）。
-6. `HashAgg` vs `SortAgg` / `StreamAgg` の分離。
-7. `Append` / `UnionAll`。
-8. `WindowAgg` の最小セット（ROW_NUMBER + 累積 SUM）。
-9. `Unnest`。
-10. Bitmap スキャンと Min/Max インデックス。
+1. `SortPlan` を明示し、Limit/Top-N と二重適用を潰す。
+2. `TopNHeap`（ORDER BY LIMIT が TPC-H で効く）。
+3. `MergeJoin` + interesting order。
+4. `LeftHashJoin` / `RightHashJoin` / `FullHashJoin`（`kOuterJoin` と
+   null-producing side の実装を先に固定）。
+5. `HashAgg` vs `SortAgg` / `StreamAgg` の分離。
+6. `Append` / `UnionAll`。
+7. `WindowAgg` の最小セット（ROW_NUMBER + 累積 SUM）。
+8. `Unnest`。
+9. Bitmap スキャンと Min/Max インデックス。

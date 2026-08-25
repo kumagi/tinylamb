@@ -17,7 +17,7 @@
 
 namespace tinylamb {
 
-TEST(DataChunkTest, StoresTypedColumnsNullsAndRowPositions) {
+TEST(DataChunkTest, Append_TypedColumnsAndNulls_StoresCorrectValuesAndPositions) {
   const Schema schema("batch", {Column("id", ValueType::kInt64),
                                  Column("name", ValueType::kVarChar),
                                  Column("score", ValueType::kDouble)});
@@ -39,7 +39,7 @@ TEST(DataChunkTest, StoresTypedColumnsNullsAndRowPositions) {
   EXPECT_EQ(chunk.ColumnCount(), 3);
 }
 
-TEST(DataChunkTest, SupportsZeroColumnCountStarBatches) {
+TEST(DataChunkTest, Append_ZeroColumns_StoresRowCount) {
   DataChunk chunk(std::vector<ValueType>{}, 2);
   chunk.Append(Row(), RowPosition(1, 1));
   chunk.Append(Row(), RowPosition(1, 2));
@@ -48,7 +48,7 @@ TEST(DataChunkTest, SupportsZeroColumnCountStarBatches) {
   EXPECT_TRUE(chunk.RowAt(0).values_.empty());
 }
 
-TEST(DataChunkTest, CopiesSelectedRowsBetweenChunks) {
+TEST(DataChunkTest, Append_FromAnotherChunk_CopiesSelectedRows) {
   DataChunk input(std::vector<ValueType>{ValueType::kInt64,
                                          ValueType::kVarChar});
   input.Append(Row({Value(1), Value("drop")}));
@@ -59,7 +59,7 @@ TEST(DataChunkTest, CopiesSelectedRowsBetweenChunks) {
   EXPECT_EQ(output.RowAt(0), Row({Value(2), Value("keep")}));
 }
 
-TEST(DataChunkTest, MaintainsZoneMapsAcrossNullsAndReset) {
+TEST(DataChunkTest, ZoneMap_AfterAppendsAndReset_MaintainsStatistics) {
   DataChunk chunk(std::vector<ValueType>{ValueType::kInt64});
   chunk.Append(Row({Value(9)}));
   chunk.Append(Row({Value()}));
@@ -81,7 +81,7 @@ TEST(DataChunkTest, MaintainsZoneMapsAcrossNullsAndReset) {
   EXPECT_EQ(chunk.ZoneMapAt(0).ValueCount(), 0U);
 }
 
-TEST(DataChunkTest, ResetWithSchemaOverridesInferredNullTypes) {
+TEST(DataChunkTest, Reset_WithSchema_OverridesInferredNullTypes) {
   DataChunk chunk;
   chunk.Append(Row({Value(), Value("a")}));
   const Schema schema("orders", {Column("carrier", ValueType::kInt64),
@@ -94,7 +94,7 @@ TEST(DataChunkTest, ResetWithSchemaOverridesInferredNullTypes) {
   EXPECT_EQ(chunk.ColumnAt(0).ValueAt(1), Value(int64_t{9}));
 }
 
-TEST(DataChunkTest, InfersNullThenPromotesType) {
+TEST(DataChunkTest, Append_NullThenNonNull_InfersAndPromotesType) {
   DataChunk chunk;
   chunk.Append(Row({Value(), Value("a")}));
   chunk.Append(Row({Value(int64_t{7}), Value("b")}));
@@ -104,7 +104,7 @@ TEST(DataChunkTest, InfersNullThenPromotesType) {
   EXPECT_EQ(chunk.ColumnAt(0).Type(), ValueType::kInt64);
 }
 
-TEST(DataChunkTest, AppendTypeMismatchThrows) {
+TEST(DataChunkTest, Append_TypeMismatch_ThrowsInvalidArgument) {
   DataChunk chunk(std::vector<ValueType>{ValueType::kInt64});
   // Appending a double into an int64 column must be rejected.
   EXPECT_THROW(chunk.Append(Row({Value(1.5)})), std::invalid_argument);
@@ -114,7 +114,7 @@ TEST(DataChunkTest, AppendTypeMismatchThrows) {
   EXPECT_EQ(chunk.ColumnAt(0).ValueAt(0), Value(int64_t{3}));
 }
 
-TEST(DataChunkTest, AppendNullToDoubleColumnKeepsType) {
+TEST(DataChunkTest, Append_NullToDoubleColumn_PreservesType) {
   DataChunk chunk(std::vector<ValueType>{ValueType::kDouble});
   chunk.Append(Row({Value()}));
   chunk.Append(Row({Value(2.5)}));
@@ -125,7 +125,7 @@ TEST(DataChunkTest, AppendNullToDoubleColumnKeepsType) {
   EXPECT_EQ(chunk.ColumnAt(0).ValueAt(1), Value(2.5));
 }
 
-TEST(DataChunkTest, InfersDoubleStorageFromFirstNonNull) {
+TEST(DataChunkTest, Append_NullThenDouble_InfersDoubleType) {
   DataChunk chunk;
   chunk.Append(Row({Value()}));
   chunk.Append(Row({Value(1.5)}));
@@ -136,7 +136,7 @@ TEST(DataChunkTest, InfersDoubleStorageFromFirstNonNull) {
   EXPECT_EQ(chunk.RowAt(1), Row({Value(1.5)}));
 }
 
-TEST(DataChunkTest, HasLayoutMatchesSchema) {
+TEST(DataChunkTest, HasLayout_DifferentSchemas_ReturnsExpectedBoolean) {
   const Schema schema("t", {Column("id", ValueType::kInt64),
                              Column("name", ValueType::kVarChar)});
   DataChunk chunk(schema);
@@ -148,14 +148,14 @@ TEST(DataChunkTest, HasLayoutMatchesSchema) {
   EXPECT_FALSE(chunk.HasLayout(wide));
 }
 
-TEST(DataChunkTest, HasLayoutAcceptsNullTypeColumns) {
+TEST(DataChunkTest, HasLayout_WithNullColumn_MatchesSchema) {
   DataChunk chunk;
   chunk.Append(Row({Value()}));
   const Schema schema("t", {Column("id", ValueType::kInt64)});
   EXPECT_TRUE(chunk.HasLayout(schema));
 }
 
-TEST(DataChunkTest, AppendChunkWidthMismatchThrows) {
+TEST(DataChunkTest, Append_ChunkWidthMismatch_Throws) {
   DataChunk source(std::vector<ValueType>{ValueType::kInt64,
                                           ValueType::kVarChar});
   source.Append(Row({Value(1), Value("x")}));
@@ -163,7 +163,7 @@ TEST(DataChunkTest, AppendChunkWidthMismatchThrows) {
   EXPECT_ANY_THROW(target.Append(source, 0));
 }
 
-TEST(DataChunkTest, AppendLvalueRowWithPositions) {
+TEST(DataChunkTest, Append_LvalueRowWithPositions_StoresCorrectly) {
   DataChunk chunk(std::vector<ValueType>{ValueType::kInt64,
                                          ValueType::kVarChar});
   Row row({Value(10), Value("ten")});
@@ -176,7 +176,7 @@ TEST(DataChunkTest, AppendLvalueRowWithPositions) {
   EXPECT_EQ(chunk.RowAt(1), Row({Value(20), Value("twenty")}));
 }
 
-TEST(DataChunkTest, AppendDateColumnRoundTrips) {
+TEST(DataChunkTest, Append_DateColumn_RoundTripsCorrectly) {
   DataChunk chunk(std::vector<ValueType>{ValueType::kDate});
   chunk.Append(Row({Value::DateFromDays(5)}));
   chunk.Append(Row({Value()}));
@@ -188,7 +188,7 @@ TEST(DataChunkTest, AppendDateColumnRoundTrips) {
   EXPECT_EQ(chunk.RowAt(2), Row({Value::DateFromDays(3)}));
 }
 
-TEST(DataChunkTest, AppendRowCopiesValuesForLaterMutation) {
+TEST(DataChunkTest, Append_RowValueMutatedAfterAppend_KeepsOriginalValue) {
   DataChunk chunk(std::vector<ValueType>{ValueType::kVarChar});
   std::string text = "hello";
   Row row({Value(std::move(text))});
@@ -197,7 +197,7 @@ TEST(DataChunkTest, AppendRowCopiesValuesForLaterMutation) {
   EXPECT_EQ(chunk.RowAt(0), Row({Value("hello")}));
 }
 
-TEST(DataChunkTest, ReserveThenAppendBeyondCapacity) {
+TEST(DataChunkTest, Reserve_ThenAppendBeyondCapacity_GrowsAndStoresData) {
   DataChunk chunk(std::vector<ValueType>{ValueType::kInt64,
                                          ValueType::kVarChar},
                   2);
@@ -213,7 +213,7 @@ TEST(DataChunkTest, ReserveThenAppendBeyondCapacity) {
   }
 }
 
-TEST(DataChunkTest, AppendRowFromColumnsBuildsRowsColumnWise) {
+TEST(DataChunkTest, AppendRowFromColumns_GivenColumnSources_BuildsRowsColumnWise) {
   DataChunk input(std::vector<ValueType>{ValueType::kInt64,
                                          ValueType::kVarChar});
   input.Append(Row({Value(1), Value("one")}), RowPosition(2, 0));
@@ -243,7 +243,7 @@ TEST(DataChunkTest, AppendRowFromColumnsBuildsRowsColumnWise) {
   EXPECT_EQ(projected.ZoneMapAt(1).NullCount(), 0U);
 }
 
-TEST(DataChunkTest, AppendRowFromColumnsInfersNullOnlyColumns) {
+TEST(DataChunkTest, AppendRowFromColumns_WithNullValues_InfersNullOnlyColumns) {
   DataChunk input(std::vector<ValueType>{ValueType::kInt64});
   input.Append(Row({Value()}));
   input.Append(Row({Value(5)}));
@@ -260,7 +260,7 @@ TEST(DataChunkTest, AppendRowFromColumnsInfersNullOnlyColumns) {
   EXPECT_EQ(projected.ZoneMapAt(0).ValueCount(), 1U);
 }
 
-TEST(DataChunkTest, AppendRowFromColumnsWidthMismatchThrows) {
+TEST(DataChunkTest, AppendRowFromColumns_WidthMismatch_Throws) {
   DataChunk input(std::vector<ValueType>{ValueType::kInt64,
                                          ValueType::kVarChar});
   input.Append(Row({Value(1), Value("x")}));
@@ -270,7 +270,7 @@ TEST(DataChunkTest, AppendRowFromColumnsWidthMismatchThrows) {
   EXPECT_ANY_THROW(target.AppendRowFromColumns(sources, 0));
 }
 
-TEST(DataChunkTest, CopyRowBetweenChunksPreservesNullsAndZoneMap) {
+TEST(DataChunkTest, Append_FromSourceChunk_PreservesNullsAndZoneMaps) {
   DataChunk input(std::vector<ValueType>{ValueType::kInt64,
                                          ValueType::kVarChar,
                                          ValueType::kDate});
@@ -300,7 +300,7 @@ TEST(DataChunkTest, CopyRowBetweenChunksPreservesNullsAndZoneMap) {
   EXPECT_EQ(output.ZoneMapAt(1).Minimum(), Value("a"));
 }
 
-TEST(DataChunkTest, CopyRowTypeMismatchThrowsWithoutPartialAppend) {
+TEST(DataChunkTest, Append_TypeMismatchFromSourceChunk_ThrowsWithoutPartialAppend) {
   DataChunk source(std::vector<ValueType>{ValueType::kDouble});
   source.Append(Row({Value(1.5)}));
   DataChunk target(std::vector<ValueType>{ValueType::kInt64});

@@ -83,6 +83,7 @@ struct ExecutionRuntime {
   size_t key_filter_scans{0};
   size_t key_filter_keys{0};
   size_t key_filter_rejected{0};
+  size_t exists_short_circuit_queries{0};
 };
 
 double ElapsedMs(std::chrono::steady_clock::time_point begin);

@@ -130,18 +130,19 @@ Expression AggregateExpressionExp(AggregationType type, Expression child,
 
 Expression CaseExpressionExp(
     std::vector<std::pair<Expression, Expression>> when_clauses,
-    Expression else_clause) {
+    Expression else_clause, bool from_if) {
   return std::make_shared<CaseExpression>(std::move(when_clauses),
-                                          std::move(else_clause));
+                                          std::move(else_clause), from_if);
 }
 
 Expression InExpressionExp(Expression child, std::vector<Expression> list) {
   return std::make_shared<InExpression>(std::move(child), std::move(list));
 }
 
-Expression FunctionCallExp(std::string func_name, std::vector<Expression> args) {
-  return std::make_shared<FunctionCallExpression>(std::move(func_name),
-                                                  std::move(args));
+Expression FunctionCallExp(std::string func_name, std::vector<Expression> args,
+                           bool canonical_if) {
+  return std::make_shared<FunctionCallExpression>(
+      std::move(func_name), std::move(args), canonical_if);
 }
 
 Expression QueryExpressionExp(std::shared_ptr<SelectStatement> query,
@@ -170,4 +171,3 @@ Expression CastExpressionExp(Expression child, std::string target_type_name,
 }
 
 }  // namespace tinylamb
-

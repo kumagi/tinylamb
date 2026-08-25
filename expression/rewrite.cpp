@@ -130,6 +130,30 @@ bool HasLikeWildcard(std::string_view pattern) {
          pattern.find('_') != std::string_view::npos;
 }
 
+bool IsNondeterministicFunction(std::string_view name) {
+  return name == "current_timestamp" || name == "current_date" ||
+         name == "current_time" || name == "now" || name == "rand" ||
+         name == "random" || name == "generate_uuid" || name == "new_uuid";
+}
+
+bool IsBooleanExpression(const Expression& expression) {
+  if (!expression) { return false;
+}
+  if (expression->Type() == TypeTag::kBinaryExp) {
+    const auto operation = expression->AsBinaryExpression().Op();
+    return operation == BinaryOperation::kAnd ||
+           operation == BinaryOperation::kOr ||
+           operation == BinaryOperation::kXor || IsComparison(operation);
+  }
+  if (expression->Type() == TypeTag::kUnaryExp) {
+    const auto operation = expression->AsUnaryExpression().Op();
+    return operation == UnaryOperation::kNot ||
+           operation == UnaryOperation::kIsNull ||
+           operation == UnaryOperation::kIsNotNull;
+  }
+  return false;
+}
+
 // Recursing per child without a bound lets attacker-controlled deeply nested
 // SQL overflow the stack and kill the whole process.
 constexpr size_t kMaxRewriteDepth = 512;
@@ -265,7 +289,147 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           return ConstantValueExp(expression->Evaluate(Row(), Schema()));
         } catch (const std::exception&) {
           return Expression{};
+          }
+      }));
+    // For a stable column reference, `x = x` is true exactly when x is not
+    // NULL.  Restrict this rewrite to columns: evaluating a volatile or
+    // otherwise expensive expression twice is not interchangeable with an
+    // IS NOT NULL test under SQL's expression semantics.
+    built.Add(ExpressionRule(
+      "comparison_of_same_column",
+      AnyBinary(Any("left"), Any("right")),
+      [](const Expression& expression, const ExpressionBindings& bindings) {
+        const Expression& left = bindings.at("left");
+        const Expression& right = bindings.at("right");
+        if (expression->AsBinaryExpression().Op() != BinaryOperation::kEquals ||
+            !Same(left, right) || left->Type() != TypeTag::kColumnValue) {
+          return Expression{};
         }
+        return UnaryExpressionExp(left, UnaryOperation::kIsNotNull);
+      }));
+    built.Add(ExpressionRule(
+      "self_strict_inequality",
+      AnyBinary(Any("left"), Any("right")),
+      [](const Expression& expression, const ExpressionBindings& bindings) {
+        const auto operation = expression->AsBinaryExpression().Op();
+        const Expression& left = bindings.at("left");
+        const Expression& right = bindings.at("right");
+        if ((operation != BinaryOperation::kLessThan &&
+             operation != BinaryOperation::kGreaterThan) ||
+            left->Type() != TypeTag::kColumnValue || !Same(left, right)) {
+          return Expression{};
+        }
+        // x < x is FALSE for non-NULL x and UNKNOWN for NULL x.  A bare
+        // FALSE would incorrectly reject the UNKNOWN case in contexts that
+        // preserve three-valued results, so retain the null branch explicitly.
+        return CaseExpressionExp(
+            {{UnaryExpressionExp(left, UnaryOperation::kIsNull),
+              ConstantValueExp(Value())}},
+            ConstantValueExp(Value(false)));
+      }));
+    built.Add(ExpressionRule(
+      "range_predicate_merge",
+      Binary(BinaryOperation::kAnd, Any("left"), Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const Expression& lhs = bindings.at("left");
+        const Expression& rhs = bindings.at("right");
+        if (lhs->Type() != TypeTag::kBinaryExp ||
+            rhs->Type() != TypeTag::kBinaryExp) {
+          return Expression{};
+        }
+        const auto& left = lhs->AsBinaryExpression();
+        const auto& right = rhs->AsBinaryExpression();
+        if (left.Left()->Type() != TypeTag::kColumnValue ||
+            right.Left()->Type() != TypeTag::kColumnValue ||
+            !Same(left.Left(), right.Left()) ||
+            left.Right()->Type() != TypeTag::kConstantValue ||
+            right.Right()->Type() != TypeTag::kConstantValue) {
+          return Expression{};
+        }
+        if (left.Op() != right.Op() ||
+            (left.Op() != BinaryOperation::kGreaterThan &&
+             left.Op() != BinaryOperation::kGreaterThanEquals &&
+             left.Op() != BinaryOperation::kLessThan &&
+             left.Op() != BinaryOperation::kLessThanEquals)) {
+          return Expression{};
+        }
+        const Value first = left.Right()->AsConstantValue().GetValue();
+        const Value second = right.Right()->AsConstantValue().GetValue();
+        if (first.IsNull() || second.IsNull()) { return Expression{}; }
+        const bool choose_second =
+            left.Op() == BinaryOperation::kGreaterThan ||
+            left.Op() == BinaryOperation::kGreaterThanEquals
+                ? first < second
+                : second < first;
+        return BinaryExpressionExp(
+            left.Left(), left.Op(),
+            choose_second ? right.Right() : left.Right());
+      }));
+    built.Add(ExpressionRule(
+      "redundant_filter_removal",
+      Binary(BinaryOperation::kAnd, Any("left"), Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const auto implies = [](const Expression& stronger,
+                                const Expression& weaker) {
+          if (stronger->Type() != TypeTag::kBinaryExp ||
+              weaker->Type() != TypeTag::kBinaryExp) {
+            return false;
+          }
+          const auto& strong = stronger->AsBinaryExpression();
+          const auto& weak = weaker->AsBinaryExpression();
+          if (strong.Op() != BinaryOperation::kEquals ||
+              !IsComparison(weak.Op()) ||
+              strong.Left()->Type() != TypeTag::kColumnValue ||
+              weak.Left()->Type() != TypeTag::kColumnValue ||
+              !Same(strong.Left(), weak.Left()) ||
+              strong.Right()->Type() != TypeTag::kConstantValue ||
+              weak.Right()->Type() != TypeTag::kConstantValue) {
+            return false;
+          }
+          const Value strong_value =
+              strong.Right()->AsConstantValue().GetValue();
+          const Value weak_value = weak.Right()->AsConstantValue().GetValue();
+          if (strong_value.IsNull() || weak_value.IsNull()) { return false;
+}
+          try {
+            const Value result =
+                EvaluateBinary(weak.Op(), strong_value, weak_value);
+            return !result.IsNull() && result.Truthy();
+          } catch (const std::exception&) {
+            return false;
+          }
+        };
+        const Expression& left = bindings.at("left");
+        const Expression& right = bindings.at("right");
+        if (implies(left, right)) { return left;
+}
+        if (implies(right, left)) { return right;
+}
+        return Expression{};
+      }));
+    built.Add(ExpressionRule(
+      "or_to_in",
+      Binary(BinaryOperation::kOr, Any("left"), Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const Expression& lhs = bindings.at("left");
+        const Expression& rhs = bindings.at("right");
+        if (lhs->Type() != TypeTag::kBinaryExp ||
+            rhs->Type() != TypeTag::kBinaryExp) {
+          return Expression{};
+        }
+        const auto& left = lhs->AsBinaryExpression();
+        const auto& right = rhs->AsBinaryExpression();
+        if (left.Op() != BinaryOperation::kEquals ||
+            right.Op() != BinaryOperation::kEquals ||
+            left.Left()->Type() != TypeTag::kColumnValue ||
+            !Same(left.Left(), right.Left()) ||
+            right.Right()->Type() != TypeTag::kConstantValue) {
+          return Expression{};
+        }
+        if (left.Right()->Type() != TypeTag::kConstantValue) {
+          return Expression{};
+        }
+        return InExpressionExp(left.Left(), {left.Right(), right.Right()});
       }));
     built.Add(ExpressionRule(
       "fold_in", Is(TypeTag::kInExp),
@@ -280,8 +444,25 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         }
       }));
     built.Add(ExpressionRule(
+      "fold_array", Is(TypeTag::kArrayExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& array = expression->AsArrayExpression();
+        if (!std::ranges::all_of(array.Elements(), IsConstant)) {
+          return Expression{};
+        }
+        try {
+          return ConstantValueExp(expression->Evaluate(Row(), Schema()));
+        } catch (const std::exception&) {
+          return Expression{};
+        }
+      }));
+    built.Add(ExpressionRule(
       "fold_function", Is(TypeTag::kFunctionCallExp),
       [](const Expression& expression, const ExpressionBindings&) {
+        if (IsNondeterministicFunction(
+                expression->AsFunctionCallExpression().FuncName())) {
+          return Expression{};
+        }
         const auto is_literal = [](const Expression& arg) {
           return arg && (arg->Type() == TypeTag::kConstantValue ||
                          arg->Type() == TypeTag::kIntervalExp);
@@ -294,6 +475,142 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         } catch (const std::exception&) {
           return Expression{};
         }
+      }));
+    built.Add(ExpressionRule(
+      "coalesce_flatten", Is(TypeTag::kFunctionCallExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& call = expression->AsFunctionCallExpression();
+        if (call.FuncName() != "coalesce") { return Expression{}; }
+        std::vector<Expression> flattened;
+        bool changed = false;
+        for (const Expression& argument : call.Args()) {
+          if (argument && argument->Type() == TypeTag::kFunctionCallExp &&
+              argument->AsFunctionCallExpression().FuncName() == "coalesce") {
+            const auto& nested = argument->AsFunctionCallExpression();
+            flattened.insert(flattened.end(), nested.Args().begin(),
+                             nested.Args().end());
+            changed = true;
+          } else {
+            flattened.push_back(argument);
+          }
+        }
+        if (!changed) { return Expression{}; }
+        return FunctionCallExp("coalesce", std::move(flattened));
+      }));
+    built.Add(ExpressionRule(
+      "concat_flatten", Is(TypeTag::kFunctionCallExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& call = expression->AsFunctionCallExpression();
+        if (call.FuncName() != "concat") { return Expression{};
+}
+        std::vector<Expression> flattened;
+        bool changed = false;
+        for (const Expression& argument : call.Args()) {
+          if (argument && argument->Type() == TypeTag::kFunctionCallExp &&
+              argument->AsFunctionCallExpression().FuncName() == "concat") {
+            const auto& nested = argument->AsFunctionCallExpression();
+            flattened.insert(flattened.end(), nested.Args().begin(),
+                             nested.Args().end());
+            changed = true;
+          } else {
+            flattened.push_back(argument);
+          }
+        }
+        if (!changed) { return Expression{};
+}
+        return FunctionCallExp("concat", std::move(flattened));
+      }));
+    built.Add(ExpressionRule(
+      "greatest_least_single_arg", Is(TypeTag::kFunctionCallExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& call = expression->AsFunctionCallExpression();
+        if ((call.FuncName() != "greatest" && call.FuncName() != "least") ||
+            call.Args().size() != 1) {
+          return Expression{};
+        }
+        return call.Args().front();
+      }));
+    built.Add(ExpressionRule(
+      "abs_of_abs", Is(TypeTag::kFunctionCallExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& outer = expression->AsFunctionCallExpression();
+        if (outer.FuncName() != "abs" || outer.Args().size() != 1 ||
+            outer.Args().front()->Type() != TypeTag::kFunctionCallExp) {
+          return Expression{};
+        }
+        const auto& inner = outer.Args().front()->AsFunctionCallExpression();
+        if (inner.FuncName() != "abs" || inner.Args().size() != 1) {
+          return Expression{};
+        }
+        return outer.Args().front();
+      }));
+    built.Add(ExpressionRule(
+      "nullif_to_case", Is(TypeTag::kFunctionCallExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& call = expression->AsFunctionCallExpression();
+        if (call.FuncName() != "nullif" || call.Args().size() != 2 ||
+            call.Args()[0]->Type() != TypeTag::kColumnValue ||
+            call.Args()[1]->Type() != TypeTag::kConstantValue) {
+          return Expression{};
+        }
+        return CaseExpressionExp(
+            {{BinaryExpressionExp(call.Args()[0], BinaryOperation::kEquals,
+                                   call.Args()[1]),
+              ConstantValueExp(Value())}},
+            call.Args()[0]);
+      }));
+    built.Add(ExpressionRule(
+      "if_to_case", Is(TypeTag::kFunctionCallExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& call = expression->AsFunctionCallExpression();
+        if (call.FuncName() != "if" || call.IsCanonicalIf() ||
+            call.Args().size() != 3) {
+          return Expression{};
+        }
+        // CASE evaluates only the selected branch, matching IF's
+        // conditional-evaluation contract while exposing a standard scalar
+        // form to subsequent rewrite rules.
+        return CaseExpressionExp(
+            {{call.Args()[0], call.Args()[1]}}, call.Args()[2], true);
+      }));
+    built.Add(ExpressionRule(
+      "simplify_coalesce_null_test",
+      Is(TypeTag::kUnaryExp, "check"),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const Expression& expression = bindings.at("check");
+        const auto& unary = expression->AsUnaryExpression();
+        if (unary.Op() != UnaryOperation::kIsNull &&
+            unary.Op() != UnaryOperation::kIsNotNull) {
+          return Expression{};
+        }
+        if (!unary.Child() ||
+            unary.Child()->Type() != TypeTag::kFunctionCallExp) {
+          return Expression{};
+        }
+        const auto& call = unary.Child()->AsFunctionCallExpression();
+        if (call.FuncName() != "coalesce") { return Expression{}; }
+        // A non-NULL literal reached after only NULL literals fixes the
+        // result without evaluating later arguments.  Do not apply this to
+        // arbitrary expressions: they may throw or be volatile.
+        for (const Expression& argument : call.Args()) {
+          if (!IsConstant(argument)) { return Expression{}; }
+          const Value value = argument->AsConstantValue().GetValue();
+          if (value.IsNull()) { continue; }
+          return ConstantValueExp(Value(unary.Op() == UnaryOperation::kIsNotNull));
+        }
+        return Expression{};
+      }));
+    built.Add(ExpressionRule(
+      "in_single_null", Is(TypeTag::kInExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& in = expression->AsInExpression();
+        if (in.child_->Type() != TypeTag::kColumnValue ||
+            in.list_.size() != 1 ||
+            in.list_.front()->Type() != TypeTag::kConstantValue ||
+            !in.list_.front()->AsConstantValue().GetValue().IsNull()) {
+          return Expression{};
+        }
+        return ConstantValueExp(Value());
       }));
     built.Add(ExpressionRule(
       "singleton_in", Is(TypeTag::kInExp),
@@ -315,6 +632,64 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         return BinaryExpressionExp(bindings.at("right"),
                                    FlipComparison(binary.Op()),
                                    bindings.at("left"));
+      }));
+    built.Add(ExpressionRule(
+      "sargable_rewrite", AnyBinary(Any("left"), Any("right")),
+      [](const Expression& expression, const ExpressionBindings& bindings) {
+        const auto& binary = expression->AsBinaryExpression();
+        if (!IsComparison(binary.Op())) { return Expression{}; }
+        const Expression& left = bindings.at("left");
+        const Expression& right = bindings.at("right");
+        if (!right || right->Type() != TypeTag::kConstantValue ||
+            !left || left->Type() != TypeTag::kBinaryExp) {
+          return Expression{};
+        }
+        const auto& arithmetic = left->AsBinaryExpression();
+        if (arithmetic.Op() != BinaryOperation::kAdd &&
+            arithmetic.Op() != BinaryOperation::kSubtract) {
+          return Expression{};
+        }
+        if (arithmetic.Left()->Type() != TypeTag::kColumnValue ||
+            arithmetic.Right()->Type() != TypeTag::kConstantValue) {
+          return Expression{};
+        }
+        const Value rhs = right->AsConstantValue().GetValue();
+        const Value offset = arithmetic.Right()->AsConstantValue().GetValue();
+        if (rhs.IsNull() || offset.IsNull() ||
+            (rhs.type != ValueType::kInt64 && rhs.type != ValueType::kDouble) ||
+            (offset.type != ValueType::kInt64 &&
+             offset.type != ValueType::kDouble)) {
+          return Expression{};
+        }
+        try {
+          const Value bound = EvaluateBinary(
+              arithmetic.Op() == BinaryOperation::kAdd
+                  ? BinaryOperation::kSubtract
+                  : BinaryOperation::kAdd,
+              rhs, offset);
+          return BinaryExpressionExp(arithmetic.Left(), binary.Op(),
+                                     ConstantValueExp(bound));
+        } catch (const std::exception&) {
+          return Expression{};
+        }
+      }));
+    built.Add(ExpressionRule(
+      "comparison_with_null",
+      AnyBinary(Any("left"), Any("right")),
+      [](const Expression& expression, const ExpressionBindings& bindings) {
+        const auto operation = expression->AsBinaryExpression().Op();
+        if (!IsComparison(operation)) { return Expression{}; }
+        const auto is_null_constant = [](const Expression& item) {
+          return IsConstant(item) &&
+                 item->AsConstantValue().GetValue().IsNull();
+        };
+        if (!is_null_constant(bindings.at("left")) &&
+            !is_null_constant(bindings.at("right"))) {
+          return Expression{};
+        }
+        // SQL comparisons involving NULL evaluate to UNKNOWN, represented by
+        // the engine's NULL Value.  A Selection can then turn it into Empty.
+        return ConstantValueExp(Value());
       }));
     built.Add(ExpressionRule(
       "boolean_identity", AnyBinary(Any("left"), Any("right")),
@@ -343,6 +718,56 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
         }
         return Expression{};
+      }));
+    built.Add(ExpressionRule(
+      "xor_to_or_and_not", Binary(BinaryOperation::kXor, Any("left"),
+                                    Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const Expression& left = bindings.at("left");
+        const Expression& right = bindings.at("right");
+        const Expression either =
+            BinaryExpressionExp(left, BinaryOperation::kOr, right);
+        const Expression both =
+            BinaryExpressionExp(left, BinaryOperation::kAnd, right);
+        return BinaryExpressionExp(either, BinaryOperation::kAnd,
+                                   UnaryExpressionExp(both,
+                                                       UnaryOperation::kNot));
+      }));
+    built.Add(ExpressionRule(
+      "boolean_eq_true_false", AnyBinary(Any("left"), Any("right")),
+      [](const Expression& expression, const ExpressionBindings& bindings) {
+        const auto operation = expression->AsBinaryExpression().Op();
+        if (operation != BinaryOperation::kEquals &&
+            operation != BinaryOperation::kNotEquals) {
+          return Expression{};
+        }
+        Expression boolean;
+        Value literal;
+        const auto inspect = [&](const Expression& candidate,
+                                 const Expression& other) {
+          if (!IsBooleanExpression(candidate) ||
+              other->Type() != TypeTag::kConstantValue) {
+            return false;
+          }
+          const Value value = other->AsConstantValue().GetValue();
+          if (value.IsNull() || value.type != ValueType::kInt64 ||
+              (value.value.int_value != 0 && value.value.int_value != 1)) {
+            return false;
+          }
+          boolean = candidate;
+          literal = value;
+          return true;
+        };
+        if (!inspect(bindings.at("left"), bindings.at("right")) &&
+            !inspect(bindings.at("right"), bindings.at("left"))) {
+          return Expression{};
+        }
+        const bool is_true = literal.value.int_value != 0;
+        const bool negate = operation == BinaryOperation::kNotEquals
+                                ? is_true
+                                : !is_true;
+        return negate ? UnaryExpressionExp(boolean, UnaryOperation::kNot)
+                      : boolean;
       }));
     built.Add(ExpressionRule(
       "double_negation",
@@ -391,6 +816,21 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           return otherwise ? otherwise : ConstantValueExp(Value());
         }
         return CaseExpressionExp(std::move(clauses), std::move(otherwise));
+      }));
+    built.Add(ExpressionRule(
+      "case_to_if", Is(TypeTag::kCaseExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& source = expression->AsCaseExpression();
+        if (source.IsFromIf() || source.when_clauses_.size() != 1) {
+          return Expression{};
+        }
+        Expression otherwise = source.else_clause_
+                                   ? source.else_clause_
+                                   : ConstantValueExp(Value());
+        return FunctionCallExp(
+            "if", {source.when_clauses_[0].first,
+                    source.when_clauses_[0].second, std::move(otherwise)},
+            true);
       }));
     built.Add(ExpressionRule(
       "not_comparison",
@@ -608,6 +1048,13 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         if (!changed) { return Expression{};
 }
         return InExpressionExp(in.child_, std::move(items));
+      }));
+    built.Add(ExpressionRule(
+      "in_empty_list", Is(TypeTag::kInExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& in = expression->AsInExpression();
+        if (!in.list_.empty()) { return Expression{}; }
+        return ConstantValueExp(Value(false));
       }));
     built.Add(ExpressionRule(
       "uniform_case_result", Is(TypeTag::kCaseExp),
@@ -886,8 +1333,24 @@ Expression WithExpressionChildren(const Expression& expression,
       if (children.size() != 1) { throw std::invalid_argument("aggregate arity");
 }
       const auto& aggregate = expression->AsAggregateExpression();
-      return AggregateExpressionExp(aggregate.GetType(), std::move(children[0]),
-                                    aggregate.Distinct());
+      auto rebuilt = std::make_shared<AggregateExpression>(
+          aggregate.GetType(), std::move(children[0]), aggregate.Distinct());
+      if (aggregate.Having() != AggregateHavingModifier::kNone) {
+        rebuilt->SetHaving(aggregate.Having(), aggregate.HavingCondition());
+      }
+      if (aggregate.WhereFilter()) {
+        rebuilt->SetWhereFilter(aggregate.WhereFilter());
+      }
+      if (!aggregate.InnerOrderBy().empty()) {
+        rebuilt->SetInnerOrderBy(aggregate.InnerOrderBy());
+      }
+      if (aggregate.InnerLimit().has_value()) {
+        rebuilt->SetInnerLimit(aggregate.InnerLimit());
+      }
+      if (aggregate.SecondaryArg()) {
+        rebuilt->SetSecondaryArg(aggregate.SecondaryArg());
+      }
+      return rebuilt;
     }
     case TypeTag::kCaseExp: {
       const auto& source = expression->AsCaseExpression();
@@ -906,7 +1369,8 @@ Expression WithExpressionChildren(const Expression& expression,
       }
       Expression otherwise =
           source.else_clause_ ? std::move(children[offset]) : Expression{};
-      return CaseExpressionExp(std::move(clauses), std::move(otherwise));
+      return CaseExpressionExp(std::move(clauses), std::move(otherwise),
+                               source.from_if_);
     }
     case TypeTag::kInExp: {
       if (children.empty()) { throw std::invalid_argument("in arity");
@@ -916,8 +1380,9 @@ Expression WithExpressionChildren(const Expression& expression,
       return InExpressionExp(std::move(child), std::move(children));
     }
     case TypeTag::kFunctionCallExp:
-      return FunctionCallExp(expression->AsFunctionCallExpression().FuncName(),
-                             std::move(children));
+      return FunctionCallExp(
+          expression->AsFunctionCallExpression().FuncName(), std::move(children),
+          expression->AsFunctionCallExpression().IsCanonicalIf());
     case TypeTag::kArrayExp:
       return ArrayExpressionExp(
           std::move(children),

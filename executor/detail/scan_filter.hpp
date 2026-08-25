@@ -3,6 +3,7 @@
 #define TINYLAMB_EXECUTOR_DETAIL_SCAN_FILTER_HPP
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -68,7 +69,8 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
                     const std::vector<slot_t>* projection = nullptr,
                     const std::vector<Expression>* scan_predicates = nullptr,
                     const std::unordered_set<int64_t>* int_key_filter = nullptr,
-                    std::optional<slot_t> int_key_column = std::nullopt);
+                    std::optional<slot_t> int_key_column = std::nullopt,
+                    size_t max_rows = std::numeric_limits<size_t>::max());
 
 bool ContainsQuery(const Expression& expression);
 

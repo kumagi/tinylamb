@@ -2,24 +2,25 @@
 #include "expression/bytecode.hpp"
 
 #include <algorithm>
-#include "executor/data_chunk.hpp"
-#include "common/constants.hpp"
-#include <vector>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <cstddef>
+#include <vector>
+
+#include "common/constants.hpp"
+#include "executor/data_chunk.hpp"
 #include "expression/expression.hpp"
 #include "expression/jit.hpp"
 #include "gtest/gtest.h"
-#include "type/value_type.hpp"
 #include "type/value.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
-TEST(BytecodeTest, CompilesTypedInstructionsAndEvaluatesBatch) {
+TEST(BytecodeTest, Compile_WithArithmeticAndPredicate_GeneratesTypedBytecodeAndEvaluatesBatch) {
   const Schema schema("input", {Column("id", ValueType::kInt64),
-                                  Column("price", ValueType::kDouble),
-                                  Column("date", ValueType::kDate)});
+                                Column("price", ValueType::kDouble),
+                                Column("date", ValueType::kDate)});
   DataChunk input(schema);
   input.Append(Row({Value(2), Value(1.5), Value::Date("1995-01-01")}));
   input.Append(Row({Value(5), Value(2.0), Value::Date("1996-01-01")}));
@@ -30,62 +31,65 @@ TEST(BytecodeTest, CompilesTypedInstructionsAndEvaluatesBatch) {
       BinaryOperation::kMultiply, ConstantValueExp(Value(3)));
   Expression predicate = BinaryExpressionExp(
       arithmetic, BinaryOperation::kGreaterThan, ConstantValueExp(Value(10)));
+
   auto program = BytecodeCompiler::Compile(predicate, schema);
   if (!program.has_value()) {
     GTEST_FAIL() << "compilation failed";
     return;
   }
   const BytecodeProgram& compiled = *program;
+  const ColumnVector output = compiled.EvaluateBatch(input);
+
   EXPECT_TRUE(std::ranges::any_of(
       compiled.Instructions(), [](const BytecodeInstruction& instruction) {
         return instruction.opcode == BytecodeOp::kBinaryInt64;
       }));
-
-  const ColumnVector output = compiled.EvaluateBatch(input);
   EXPECT_EQ(output.ValueAt(0), Value(true));
   EXPECT_EQ(output.ValueAt(1), Value(true));
   EXPECT_TRUE(output.ValueAt(2).IsNull());
 }
 
-TEST(BytecodeTest, ConstantFoldingReducesProgramToOneLoad) {
+TEST(BytecodeTest, Compile_WithConstantExpressions_FoldsToOneLoadInstruction) {
   const Schema schema;
   Expression constants = BinaryExpressionExp(
       ConstantValueExp(Value(2)), BinaryOperation::kAdd,
       BinaryExpressionExp(ConstantValueExp(Value(3)),
                           BinaryOperation::kMultiply,
                           ConstantValueExp(Value(4))));
+
   auto program = BytecodeCompiler::Compile(constants, schema);
   if (!program.has_value()) {
     GTEST_FAIL() << "compilation failed";
     return;
   }
   const BytecodeProgram& folded = *program;
+
   EXPECT_EQ(folded.Instructions().size(), 1U);
   EXPECT_EQ(folded.Constants(), std::vector<Value>{Value(14)});
 }
 
-TEST(BytecodeTest, DateComparisonUsesTypedDateOpcode) {
+TEST(BytecodeTest, Compile_WithDateComparison_UsesTypedDateOpcode) {
   const Schema schema("dates", {Column("date", ValueType::kDate)});
   DataChunk input(schema);
   input.Append(Row({Value::Date("1995-06-01")}));
   Expression predicate = BinaryExpressionExp(
       ColumnValueExp("date"), BinaryOperation::kLessThan,
       ConstantValueExp(Value::Date("1996-01-01")));
+
   auto program = BytecodeCompiler::Compile(predicate, schema);
   if (!program.has_value()) {
     GTEST_FAIL() << "compilation failed";
     return;
   }
   const BytecodeProgram& date_program = *program;
+  const ColumnVector output = date_program.EvaluateBatch(input);
+
   ASSERT_EQ(date_program.Instructions().size(), 3U);
   EXPECT_EQ(date_program.Instructions().back().opcode, BytecodeOp::kBinaryDate);
-  EXPECT_EQ(date_program.EvaluateBatch(input).ValueAt(0), Value(true));
+  EXPECT_EQ(output.ValueAt(0), Value(true));
 }
 
-TEST(BytecodeTest, SemanticsMatchAstAndJitOnInt64Compares) {
-  // Bytecode defines the batch semantics; JIT filters must match it on the
-  // narrow INT64 column-vs-constant shape Selection promotes (see
-  // docs/expression_evaluation.md).
+TEST(BytecodeTest, EvaluateBatch_WithInt64Comparisons_MatchesAstAndJitSemantics) {
   constexpr int64_t kConstant = 17;
   const Schema schema("input", {Column("x", ValueType::kInt64)});
   DataChunk chunk(schema);
@@ -136,8 +140,9 @@ TEST(BytecodeTest, SemanticsMatchAstAndJitOnInt64Compares) {
       size_t jit_row = 0;
       for (size_t row = 0; row < chunk.Size(); ++row) {
         const Value bytecode = bytecode_out.ValueAt(row);
-        if (bytecode.IsNull()) { continue;
-}
+        if (bytecode.IsNull()) {
+          continue;
+        }
         EXPECT_EQ(bytecode, Value(jit_out[jit_row++] != 0))
             << row << ' ' << static_cast<int>(op);
       }

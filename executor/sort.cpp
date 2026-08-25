@@ -119,6 +119,7 @@ class SortKeyEncoder {
       Spec spec;
       spec.expr = key.expression;
       spec.ascending = key.ascending;
+      spec.nulls_first = key.nulls_first.value_or(key.ascending);
       if (key.expression->Type() == TypeTag::kColumnValue) {
         const int offset =
             schema.Offset(key.expression->AsColumnValue().GetColumnName());
@@ -138,6 +139,9 @@ class SortKeyEncoder {
 
   [[nodiscard]] Kind GetKind() const { return kind_; }
   [[nodiscard]] bool SingleAscending() const { return specs_[0].ascending; }
+  [[nodiscard]] bool SingleNullsFirst() const {
+    return specs_[0].nulls_first;
+  }
 
   uint64_t SingleKey(const Row& row, bool* is_null) const {
     const Value& v = row.values_[static_cast<size_t>(specs_[0].column)];
@@ -160,19 +164,20 @@ class SortKeyEncoder {
         evaluated = spec.expr->Evaluate(row, *schema_);
         v = &evaluated;
       }
+      const bool nulls_first = spec.nulls_first;
       if (spec.ascending) {
         if (v->IsNull()) {
-          out->push_back('\x00');
+          out->push_back(nulls_first ? '\x00' : '\x01');
           continue;
         }
-        out->push_back('\x01');
+        out->push_back(nulls_first ? '\x01' : '\x00');
         AppendMemComparableValue(*v, out);
       } else {
         if (v->IsNull()) {
-          out->push_back('\xff');
+          out->push_back(nulls_first ? '\x00' : '\xff');
           continue;
         }
-        out->push_back('\x00');
+        out->push_back(nulls_first ? '\x01' : '\x00');
         const size_t begin = out->size();
         AppendMemComparableValue(*v, out);
         for (size_t i = begin; i < out->size(); ++i) {
@@ -186,6 +191,7 @@ class SortKeyEncoder {
   struct Spec {
     Expression expr;
     bool ascending{true};
+    bool nulls_first{true};
     int column{-1};
   };
   const Schema* schema_;
@@ -271,7 +277,7 @@ class KeyOrdering {
         (null_flags_[i] ? nulls : non_nulls).push_back(i);
       }
       if (!nulls.empty()) {
-        if (encoder_.SingleAscending()) {
+        if (encoder_.SingleNullsFirst()) {
           std::copy(nulls.begin(), nulls.end(), perm.begin());
           std::copy(non_nulls.begin(), non_nulls.end(),
                     perm.begin() +

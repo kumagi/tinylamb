@@ -18,7 +18,7 @@
 
 namespace tinylamb {
 
-TEST(QuerySchedulerTest, EnforcesCpuAndMemoryBudgets) {
+TEST(QuerySchedulerTest, Acquire_WhenCapacityExceeded_BlocksUntilReleased) {
   QueryScheduler scheduler(2, 100);
   auto first = scheduler.Acquire(2, 80);
   EXPECT_EQ(scheduler.UsedCpuSlots(), 2U);
@@ -40,7 +40,7 @@ TEST(QuerySchedulerTest, EnforcesCpuAndMemoryBudgets) {
   EXPECT_EQ(scheduler.UsedMemoryBytes(), 0U);
 }
 
-TEST(QuerySchedulerTest, ScheduledExecutorReleasesLeaseAtEndOfQuery) {
+TEST(QuerySchedulerTest, Next_ExhaustsQuery_ReleasesLease) {
   QueryScheduler scheduler(1, 128);
   Executor values = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(1)}), Row({Value(2)})});
@@ -56,13 +56,13 @@ TEST(QuerySchedulerTest, ScheduledExecutorReleasesLeaseAtEndOfQuery) {
   EXPECT_EQ(scheduler.UsedMemoryBytes(), 0U);
 }
 
-TEST(QuerySchedulerTest, ZeroCapacityIsClampedToOne) {
+TEST(QuerySchedulerTest, Constructor_ZeroCapacity_ClampsToOne) {
   QueryScheduler scheduler(0, 0);
   EXPECT_EQ(scheduler.CpuCapacity(), 1U);
   EXPECT_EQ(scheduler.MemoryCapacity(), 1U);
 }
 
-TEST(QuerySchedulerTest, AcquireClampsRequestsToCapacity) {
+TEST(QuerySchedulerTest, Acquire_RequestExceedsCapacity_ClampsToCapacity) {
   QueryScheduler scheduler(2, 100);
   auto lease = scheduler.Acquire(100, 1000);
   EXPECT_EQ(scheduler.CpuCapacity(), 2U);
@@ -74,7 +74,7 @@ TEST(QuerySchedulerTest, AcquireClampsRequestsToCapacity) {
   EXPECT_EQ(scheduler.UsedMemoryBytes(), 0U);
 }
 
-TEST(QuerySchedulerTest, LeaseMoveAssignmentReleasesPreviousLease) {
+TEST(QuerySchedulerTest, Lease_MoveAssignment_ReleasesPreviousLease) {
   QueryScheduler scheduler(2, 100);
   auto first = scheduler.Acquire(1, 30);
   auto second = scheduler.Acquire(1, 30);
@@ -87,7 +87,7 @@ TEST(QuerySchedulerTest, LeaseMoveAssignmentReleasesPreviousLease) {
   EXPECT_EQ(scheduler.UsedMemoryBytes(), 0U);
 }
 
-TEST(QuerySchedulerTest, MovedFromLeaseReleaseIsNoOp) {
+TEST(QuerySchedulerTest, Release_OnMovedFromLease_IsNoOp) {
   QueryScheduler scheduler(1, 64);
   auto lease = scheduler.Acquire(1, 64);
   QueryScheduler::Lease moved(std::move(lease));
@@ -100,7 +100,7 @@ TEST(QuerySchedulerTest, MovedFromLeaseReleaseIsNoOp) {
   EXPECT_EQ(scheduler.UsedCpuSlots(), 0U);
 }
 
-TEST(QuerySchedulerTest, ScheduledExecutorReleasesLeaseOnDestruction) {
+TEST(QuerySchedulerTest, Destructor_WhenExecutorDestroyed_ReleasesLease) {
   QueryScheduler scheduler(1, 128);
   {
     ScheduledExecutor executor(
@@ -116,7 +116,7 @@ TEST(QuerySchedulerTest, ScheduledExecutorReleasesLeaseOnDestruction) {
   EXPECT_EQ(scheduler.UsedMemoryBytes(), 0U);
 }
 
-TEST(QuerySchedulerTest, ScheduledExecutorNextBatchKeepsLeaseUntilExhausted) {
+TEST(QuerySchedulerTest, NextBatch_MultipleBatches_KeepsLeaseUntilExhausted) {
   QueryScheduler scheduler(1, 128);
   Executor values = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(1)}), Row({Value(2)}), Row({Value(3)})});
@@ -131,7 +131,7 @@ TEST(QuerySchedulerTest, ScheduledExecutorNextBatchKeepsLeaseUntilExhausted) {
   EXPECT_EQ(scheduler.UsedMemoryBytes(), 0U);
 }
 
-TEST(QuerySchedulerTest, ScheduledExecutorDumpAndExplain) {
+TEST(QuerySchedulerTest, DumpAndExplain_ScheduledQuery_ContainsScheduledQueryString) {
   QueryScheduler scheduler(1, 128);
   Executor values = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(1)})});
@@ -144,7 +144,7 @@ TEST(QuerySchedulerTest, ScheduledExecutorDumpAndExplain) {
   EXPECT_NE(explain.str().find("ScheduledQuery"), std::string::npos);
 }
 
-TEST(QuerySchedulerTest, GlobalReturnsSameSingleton) {
+TEST(QuerySchedulerTest, Global_MultipleCalls_ReturnsSameSingleton) {
   QueryScheduler& a = QueryScheduler::Global();
   QueryScheduler& b = QueryScheduler::Global();
   EXPECT_EQ(&a, &b);

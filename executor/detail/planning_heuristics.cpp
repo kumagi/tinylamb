@@ -25,6 +25,7 @@
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/detail/subquery_runtime.hpp"
+#include "executor/detail/window_eval.hpp"
 #include "executor/hash_join_mode.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/spill_file.hpp"
@@ -466,8 +467,68 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
     return std::ranges::all_of(
         residual, [&](const Expression& predicate) {
           return Truthy(Evaluate(predicate, scope, nullptr, context, ctes));
-        });
+    });
   };
+  const bool outer_join = source.join_type == JoinType::kRight ||
+                          source.join_type == JoinType::kFull;
+  if (outer_join) {
+    // Outer joins are kept in syntactic order.  Materializing both inputs
+    // here gives the fallback the same NULL-key and residual-predicate
+    // semantics for hashable and non-hashable ON clauses, including spilled
+    // relations.  The executor-layer HashJoin supplies the optimized
+    // in-memory implementation for physical plans; this relational path is
+    // the correctness fallback for rich SQL expressions.
+    std::vector<Row> left_rows;
+    std::vector<Row> right_rows;
+    const auto outer_matches = [&](const Row& combined) {
+      if (predicates.empty()) { return true; }
+      Scope scope{.row=&combined, .schema=&result.schema, .outer=outer};
+      return std::ranges::all_of(
+          predicates, [&](const Expression& predicate) {
+            return Truthy(Evaluate(predicate, scope, nullptr, context, ctes));
+          });
+    };
+    left.FinishSpill();
+    right.FinishSpill();
+    left.ForEachRow([&](const Row& row) { left_rows.push_back(row); });
+    right.ForEachRow([&](const Row& row) { right_rows.push_back(row); });
+    std::vector<bool> matched_right(right_rows.size(), false);
+    ++result.nested_loop_joins;
+    for (const Row& left_row : left_rows) {
+      bool matched = false;
+      for (size_t right_index = 0; right_index < right_rows.size();
+           ++right_index) {
+        ++result.join_comparisons;
+        Row combined = left_row + right_rows[right_index];
+        if (!outer_matches(combined)) { continue; }
+        result.AddRow(std::move(combined));
+        matched = true;
+        matched_right[right_index] = true;
+      }
+      if (!matched && (source.join_type == JoinType::kLeft ||
+                       source.join_type == JoinType::kFull)) {
+        result.AddRow(left_row +
+                      Row(std::vector<Value>(right.schema.ColumnCount())));
+      }
+    }
+    if (source.join_type == JoinType::kRight ||
+        source.join_type == JoinType::kFull) {
+      for (size_t right_index = 0; right_index < right_rows.size();
+           ++right_index) {
+        if (matched_right[right_index]) { continue; }
+        result.AddRow(
+            Row(std::vector<Value>(left.schema.ColumnCount())) +
+            right_rows[right_index]);
+      }
+    }
+    result.FinishSpill();
+    result.peak_intermediate_rows =
+        std::max(result.peak_intermediate_rows, result.TotalRows());
+    if (context.execution_runtime() != nullptr) {
+      context.execution_runtime()->join_ms += ElapsedMs(join_begin);
+    }
+    return result;
+  }
   auto emit_unmatched = [&](const Row& left_row) {
     if (source.join_type != JoinType::kLeft) { return;
 }
@@ -715,6 +776,47 @@ Relation BuildInput(TransactionContext& context,
     return singleton;
   }
 
+  // A correlated UNNEST is a lateral row source: its array expression must
+  // be evaluated once for each row produced by the preceding source.  The
+  // ordinary source pre-load below is intentionally independent and cannot
+  // provide that row scope, so handle the common two-source form directly.
+  if (statement.Sources().size() == 2 &&
+      statement.Sources()[1].unnest &&
+      (statement.Sources()[1].join_type == JoinType::kCross ||
+       statement.Sources()[1].join_type == JoinType::kInner) &&
+      !statement.Sources()[1].unnest->TouchedColumns().empty()) {
+    Relation left = LoadSource(context, statement.Sources()[0], outer, ctes);
+    Relation result(context.execution_runtime());
+    result.schema = left.schema;
+    bool schema_initialized = false;
+    left.FinishSpill();
+    left.ForEachRow([&](const Row& left_row) {
+      Scope row_scope{.row=&left_row, .schema=&left.schema, .outer=outer};
+      Relation right = LoadSource(context, statement.Sources()[1], &row_scope,
+                                  ctes);
+      if (!schema_initialized) {
+        result.schema = left.schema + right.schema;
+        schema_initialized = true;
+      }
+      right.FinishSpill();
+      right.ForEachRow([&](const Row& right_row) {
+        result.AddRow(left_row + right_row);
+      });
+    });
+    std::vector<Expression> predicates = SplitConjuncts(statement.WhereClause());
+    if (statement.Sources()[1].join_condition) {
+      predicates.push_back(statement.Sources()[1].join_condition);
+    }
+    if (!predicates.empty()) {
+      FilterRelation(context, &result, predicates, outer, ctes);
+      *where_fully_applied = true;
+    }
+    result.FinishSpill();
+    result.peak_intermediate_rows =
+        std::max(result.peak_intermediate_rows, result.TotalRows());
+    return result;
+  }
+
   std::vector<Relation> relations(statement.Sources().size());
   std::vector<bool> base_sources(statement.Sources().size(), false);
   std::vector<std::vector<slot_t>> projections(statement.Sources().size());
@@ -767,14 +869,16 @@ Relation BuildInput(TransactionContext& context,
     }
   }
 
-  // LEFT JOIN predicates have null-extension semantics, so retain their
+  // Outer JOIN predicates have null-extension semantics, so retain their
   // syntactic order. The optimizer below is valid for inner/cross joins.
-  const bool has_left_join =
+  const bool has_outer_join =
       std::any_of(statement.Sources().begin() + 1, statement.Sources().end(),
                   [](const SelectSource& source) {
-                    return source.join_type == JoinType::kLeft;
+                    return source.join_type == JoinType::kLeft ||
+                           source.join_type == JoinType::kRight ||
+                           source.join_type == JoinType::kFull;
                   });
-  if (has_left_join) {
+  if (has_outer_join) {
     for (size_t i = 0; i < relations.size(); ++i) {
       if (base_sources[i]) {
         relations[i] = LoadSource(context, statement.Sources()[i], outer,
@@ -1049,9 +1153,29 @@ Relation BuildInput(TransactionContext& context,
         }
       }
     }
+    size_t max_rows = std::numeric_limits<size_t>::max();
+    // A finite LIMIT can stop a single unordered, non-aggregating scan after
+    // enough qualifying rows have been found.  The cap is only safe after all
+    // WHERE predicates are applied during the scan; otherwise a residual
+    // predicate could reject the first rows and change the result.
+    const bool simple_single_source_limit =
+        statement.Sources().size() == 1 && idx == 0 &&
+        statement.HasLimit() && statement.Limit() != 0 &&
+        statement.OrderBy().empty() && statement.GroupBy().empty() &&
+        !statement.Distinct() && !HasWindowFunctions(statement) &&
+        !ContainsAggregate(statement.Having()) &&
+        std::ranges::all_of(
+            statement.SelectList(), [](const NamedExpression& item) {
+              return !ContainsAggregate(item.expression);
+            });
+    if (simple_single_source_limit && *where_fully_applied &&
+        statement.Offset() <=
+            std::numeric_limits<size_t>::max() - statement.Limit()) {
+      max_rows = statement.Offset() + statement.Limit();
+    }
     relations[idx] = LoadSource(context, statement.Sources()[idx], outer, ctes,
                                 &projections[idx], &local_predicates[idx],
-                                filter_ptr, filter_col);
+                                filter_ptr, filter_col, max_rows);
     loaded[idx] = true;
   }
 

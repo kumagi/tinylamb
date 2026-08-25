@@ -234,6 +234,64 @@ struct WindowRuntime {
       // Default frame: RANGE UNBOUNDED PRECEDING .. CURRENT ROW.
       return {0, peer_end[position]};
     }
+    if (window.frame_unit == WindowFrameUnit::kGroups) {
+      if (window.order_by.empty()) {
+        throw std::runtime_error("GROUPS frame requires an ORDER BY key");
+      }
+      std::vector<size_t> group_start;
+      std::vector<size_t> group_end;
+      for (size_t i = 0; i < m;) {
+        const size_t end = peer_end[i];
+        group_start.push_back(i);
+        group_end.push_back(end);
+        i = end + 1;
+      }
+      size_t current_group = 0;
+      while (group_end[current_group] < position) { ++current_group; }
+      const size_t group_count = group_start.size();
+      auto offset_of = [](const WindowFrameBound& bound) -> size_t {
+        if (!bound.offset || bound.offset->Type() != TypeTag::kConstantValue) {
+          throw std::runtime_error("GROUPS offset requires a constant value");
+        }
+        const double value = NumericOf(bound.offset->AsConstantValue().GetValue());
+        if (value < 0) { throw std::runtime_error("GROUPS offset is negative"); }
+        return static_cast<size_t>(value);
+      };
+      auto group_for_preceding = [&](size_t offset) {
+        return offset > current_group ? size_t{0} : current_group - offset;
+      };
+      auto group_for_following = [&](size_t offset) {
+        return std::min(current_group + offset, group_count - 1);
+      };
+      auto groups_start = [&](const WindowFrameBound& bound) {
+        switch (bound.type) {
+          case WindowFrameBoundType::kUnboundedPreceding: return size_t{0};
+          case WindowFrameBoundType::kOffsetPreceding:
+            return group_start[group_for_preceding(offset_of(bound))];
+          case WindowFrameBoundType::kCurrentRow: return group_start[current_group];
+          case WindowFrameBoundType::kOffsetFollowing:
+            return group_start[group_for_following(offset_of(bound))];
+          case WindowFrameBoundType::kUnboundedFollowing: return m - 1;
+        }
+        return size_t{0};
+      };
+      auto groups_end = [&](const WindowFrameBound& bound) {
+        switch (bound.type) {
+          case WindowFrameBoundType::kUnboundedPreceding: return size_t{0};
+          case WindowFrameBoundType::kOffsetPreceding:
+            return group_end[group_for_preceding(offset_of(bound))];
+          case WindowFrameBoundType::kCurrentRow: return group_end[current_group];
+          case WindowFrameBoundType::kOffsetFollowing:
+            return group_end[group_for_following(offset_of(bound))];
+          case WindowFrameBoundType::kUnboundedFollowing: return m - 1;
+        }
+        return size_t{0};
+      };
+      const size_t lo = groups_start(window.frame_start);
+      const size_t hi = groups_end(window.frame_end);
+      return lo > hi ? std::pair<size_t, size_t>{1, 0}
+                     : std::pair<size_t, size_t>{lo, hi};
+    }
     auto start_of = [&](const WindowFrameBound& bound) -> std::optional<size_t> {
       switch (bound.type) {
         case WindowFrameBoundType::kUnboundedPreceding:
@@ -324,8 +382,9 @@ struct WindowRuntime {
 
   Value AggregateOverFrame(const WindowFunctionCallExpression& window,
                            const std::vector<Row>& rows,
-                           const std::vector<size_t>& ordered, size_t lo,
-                           size_t hi) const {
+                           const std::vector<size_t>& ordered,
+                           const std::vector<std::vector<Value>>& order_values,
+                           size_t current, size_t lo, size_t hi) const {
     const std::string& fn = window.function;
     if (hi < lo || ordered.empty() || hi >= ordered.size()) {
       if (fn == "COUNT") { return Value(static_cast<int64_t>(0)); }
@@ -341,6 +400,46 @@ struct WindowRuntime {
     std::vector<Value> values;
     Value delimiter;
     for (size_t p = lo; p <= hi; ++p) {
+      bool excluded = false;
+      switch (window.exclusion) {
+        case WindowFrameExclusion::kCurrentRow:
+          excluded = p == current;
+          break;
+        case WindowFrameExclusion::kGroup: {
+          if (window.order_by.empty()) {
+            excluded = true;
+          } else if (order_values.empty() || order_values[current].empty()) {
+            excluded = p == current;
+          } else {
+            excluded = order_values[p].size() == order_values[current].size();
+            for (size_t t = 0; excluded && t < order_values[current].size();
+                 ++t) {
+              excluded = ValuesEqual(order_values[p][t],
+                                    order_values[current][t]);
+            }
+          }
+          break;
+        }
+        case WindowFrameExclusion::kTies: {
+          if (window.order_by.empty()) {
+            excluded = p != current;
+          } else if (order_values.empty() || order_values[current].empty()) {
+            excluded = false;
+          } else {
+            excluded = p != current &&
+                       order_values[p].size() == order_values[current].size();
+            for (size_t t = 0; excluded && t < order_values[current].size();
+                 ++t) {
+              excluded = ValuesEqual(order_values[p][t],
+                                    order_values[current][t]);
+            }
+          }
+          break;
+        }
+        case WindowFrameExclusion::kNone:
+          break;
+      }
+      if (excluded) { continue; }
       const Row& row = rows[ordered[p]];
       Scope scope{.row=&row, .schema=schema, .outer=outer};
       // AGG(x WHERE cond) OVER (...): skip rows failing the filter.
@@ -528,28 +627,50 @@ struct WindowRuntime {
   }
 };
 
-void ComputeOneWindow(TransactionContext& context,
-                      const WindowFunctionCallExpression& window,
-                      std::vector<Row>& rows, const Schema& schema,
-                      const Scope* outer, const CteMap& ctes,
-                      std::vector<Value>* out) {
-  const size_t n = rows.size();
-  out->assign(n, Value());
-  if (n == 0) { return; }
+struct WindowPartitionLayout {
+  std::vector<size_t> ordered;
+  std::vector<std::vector<Value>> order_values;
+  std::vector<size_t> peer_end;
+};
 
-  WindowRuntime runtime{context, outer, &ctes, &schema};
+struct WindowOrderLayout {
+  std::vector<WindowPartitionLayout> partitions;
+};
 
-  // Partition the rows: group indices by partition-key tuples.  Sequential
-  // grouping keeps NULL-safe equality without ordering Values.
-  std::vector<std::vector<size_t>> partitions;
+std::string WindowLayoutKey(const WindowFunctionCallExpression& window) {
+  std::string key;
+  key.reserve(128);
+  key.append("P:");
+  for (const Expression& expression : window.partition_by) {
+    key.append(expression ? expression->ToString() : "(null)");
+    key.push_back('|');
+  }
+  key.append("O:");
+  for (const WindowOrderTerm& term : window.order_by) {
+    key.append(term.expression ? term.expression->ToString() : "(null)");
+    key.push_back(term.ascending ? 'A' : 'D');
+    if (term.nulls_first.has_value()) {
+      key.push_back(*term.nulls_first ? 'F' : 'L');
+    } else {
+      key.push_back('D');
+    }
+    key.push_back('|');
+  }
+  return key;
+}
+
+WindowOrderLayout BuildWindowOrderLayout(
+    const WindowFunctionCallExpression& window, std::vector<Row>& rows,
+    const WindowRuntime& runtime) {
+  WindowOrderLayout layout;
   std::vector<std::vector<Value>> partition_keys;
-  for (size_t i = 0; i < n; ++i) {
+  for (size_t i = 0; i < rows.size(); ++i) {
     std::vector<Value> keys;
     keys.reserve(window.partition_by.size());
     for (const Expression& key : window.partition_by) {
       keys.push_back(runtime.EvalAt(key, rows, i));
     }
-    size_t group = partitions.size();
+    size_t group = layout.partitions.size();
     for (size_t g = 0; g < partition_keys.size(); ++g) {
       bool equal = partition_keys[g].size() == keys.size();
       for (size_t t = 0; equal && t < keys.size(); ++t) {
@@ -560,60 +681,59 @@ void ComputeOneWindow(TransactionContext& context,
         break;
       }
     }
-    if (group == partitions.size()) {
-      partitions.emplace_back();
+    if (group == layout.partitions.size()) {
+      layout.partitions.emplace_back();
       partition_keys.push_back(std::move(keys));
     }
-    partitions[group].push_back(i);
+    layout.partitions[group].ordered.push_back(i);
   }
 
-  for (auto& members : partitions) {
-    // Order inside the partition.
-    std::vector<size_t> ordered = members;
-    std::vector<std::vector<Value>> order_values(ordered.size());
+  for (WindowPartitionLayout& partition : layout.partitions) {
+    partition.order_values.resize(partition.ordered.size());
     if (!window.order_by.empty()) {
-      for (size_t k = 0; k < ordered.size(); ++k) {
-        order_values[k].reserve(window.order_by.size());
-        for (const auto& term : window.order_by) {
-          order_values[k].push_back(runtime.EvalAt(term.expression, rows,
-                                                   ordered[k]));
+      for (size_t k = 0; k < partition.ordered.size(); ++k) {
+        auto& values = partition.order_values[k];
+        values.reserve(window.order_by.size());
+        for (const WindowOrderTerm& term : window.order_by) {
+          values.push_back(
+              runtime.EvalAt(term.expression, rows, partition.ordered[k]));
         }
       }
-      std::vector<size_t> positions(ordered.size());
+      std::vector<size_t> positions(partition.ordered.size());
       std::iota(positions.begin(), positions.end(), 0);
       std::stable_sort(positions.begin(), positions.end(),
                        [&](size_t a, size_t b) {
                          for (size_t t = 0; t < window.order_by.size(); ++t) {
                            const WindowOrderTerm& term = window.order_by[t];
-                           if (ValuesEqual(order_values[a][t],
-                                           order_values[b][t])) {
+                           if (ValuesEqual(partition.order_values[a][t],
+                                           partition.order_values[b][t])) {
                              continue;
                            }
-                           return ValueLess(order_values[a][t],
-                                            order_values[b][t], term.ascending,
-                                            term.nulls_first);
+                           return ValueLess(partition.order_values[a][t],
+                                            partition.order_values[b][t],
+                                            term.ascending, term.nulls_first);
                          }
                          return false;
                        });
-      std::vector<size_t> sorted_members(ordered.size());
-      std::vector<std::vector<Value>> sorted_values(ordered.size());
+      std::vector<size_t> sorted_members(partition.ordered.size());
+      std::vector<std::vector<Value>> sorted_values(partition.ordered.size());
       for (size_t k = 0; k < positions.size(); ++k) {
-        sorted_members[k] = ordered[positions[k]];
-        sorted_values[k] = std::move(order_values[positions[k]]);
+        sorted_members[k] = partition.ordered[positions[k]];
+        sorted_values[k] = std::move(partition.order_values[positions[k]]);
       }
-      ordered = std::move(sorted_members);
-      order_values = std::move(sorted_values);
+      partition.ordered = std::move(sorted_members);
+      partition.order_values = std::move(sorted_values);
     }
-    const size_t m = ordered.size();
 
-    // Peer boundaries: last index of each row's peer group (equal order keys).
-    std::vector<size_t> peer_end(m);
+    const size_t m = partition.ordered.size();
+    partition.peer_end.resize(m);
     for (size_t a = 0; a < m; ++a) {
       size_t end = a;
       while (end + 1 < m) {
         bool equal = true;
-        for (size_t t = 0; t < order_values[a].size(); ++t) {
-          if (!ValuesEqual(order_values[a][t], order_values[end + 1][t])) {
+        for (size_t t = 0; t < partition.order_values[a].size(); ++t) {
+          if (!ValuesEqual(partition.order_values[a][t],
+                           partition.order_values[end + 1][t])) {
             equal = false;
             break;
           }
@@ -621,8 +741,37 @@ void ComputeOneWindow(TransactionContext& context,
         if (!equal) { break; }
         ++end;
       }
-      peer_end[a] = end;
+      partition.peer_end[a] = end;
     }
+  }
+  return layout;
+}
+
+void ComputeOneWindow(TransactionContext& context,
+                      const WindowFunctionCallExpression& window,
+                      std::vector<Row>& rows, const Schema& schema,
+                      const Scope* outer, const CteMap& ctes,
+                      std::vector<Value>* out,
+                      const WindowOrderLayout* cached_layout = nullptr) {
+  const size_t n = rows.size();
+  out->assign(n, Value());
+  if (n == 0) { return; }
+
+  WindowRuntime runtime{context, outer, &ctes, &schema};
+
+  WindowOrderLayout local_layout;
+  const WindowOrderLayout* layout = cached_layout;
+  if (layout == nullptr) {
+    local_layout = BuildWindowOrderLayout(window, rows, runtime);
+    layout = &local_layout;
+  }
+
+  for (const WindowPartitionLayout& partition : layout->partitions) {
+    const std::vector<size_t>& ordered = partition.ordered;
+    const std::vector<std::vector<Value>>& order_values =
+        partition.order_values;
+    const std::vector<size_t>& peer_end = partition.peer_end;
+    const size_t m = ordered.size();
 
     const std::string& fn = window.function;
 
@@ -707,25 +856,61 @@ void ComputeOneWindow(TransactionContext& context,
             runtime.ResolveFrame(window, rows, ordered, order_values, k,
                                  peer_end);
         if (hi < lo) { continue; }
-        size_t target;
+        auto excluded = [&](size_t candidate) {
+          if (window.exclusion == WindowFrameExclusion::kCurrentRow) {
+            return candidate == k;
+          }
+          if (window.exclusion == WindowFrameExclusion::kNone) {
+            return false;
+          }
+          if (window.order_by.empty()) {
+            return window.exclusion == WindowFrameExclusion::kGroup ||
+                   candidate != k;
+          }
+          if (order_values.empty() || order_values[k].empty()) {
+            return window.exclusion == WindowFrameExclusion::kGroup
+                       ? candidate == k
+                       : false;
+          }
+          bool peer = order_values[candidate].size() == order_values[k].size();
+          for (size_t t = 0; peer && t < order_values[k].size(); ++t) {
+            peer = ValuesEqual(order_values[candidate][t], order_values[k][t]);
+          }
+          return window.exclusion == WindowFrameExclusion::kGroup
+                     ? peer
+                     : peer && candidate != k;
+        };
+        size_t target = lo;
         if (fn == "FIRST_VALUE") {
-          target = lo;
+          while (target <= hi && excluded(target)) { ++target; }
         } else if (fn == "LAST_VALUE") {
           target = hi;
+          while (target >= lo && excluded(target)) {
+            if (target == 0) { break; }
+            --target;
+          }
         } else {
           if (window.args.size() < 2) {
             throw std::runtime_error("NTH_VALUE requires two arguments");
           }
           const Value nth_value =
               runtime.EvalAt(window.args[1], rows, ordered[k]);
-          const int64_t nth = nth_value.value.int_value;
-          const int64_t frame_size =
-              static_cast<int64_t>(hi) - static_cast<int64_t>(lo) + 1;
-          if (nth <= 0 || nth > frame_size) {
+          int64_t nth = nth_value.value.int_value;
+          size_t frame_size = 0;
+          for (size_t candidate = lo; candidate <= hi; ++candidate) {
+            if (!excluded(candidate)) { ++frame_size; }
+          }
+          if (nth <= 0 || static_cast<size_t>(nth) > frame_size) {
             continue;
           }
-          target = lo + static_cast<size_t>(nth - 1);
+          for (size_t candidate = lo; candidate <= hi; ++candidate) {
+            if (!excluded(candidate) && --nth == 0) {
+              target = candidate;
+              break;
+            }
+          }
         }
+        if (target < lo || target > hi || excluded(target)) { continue; }
         (*out)[ordered[k]] = runtime.EvalAt(window.args[0], rows, ordered[target]);
       }
       continue;
@@ -737,7 +922,8 @@ void ComputeOneWindow(TransactionContext& context,
           runtime.ResolveFrame(window, rows, ordered, order_values, k,
                                peer_end);
       (*out)[ordered[k]] =
-          runtime.AggregateOverFrame(window, rows, ordered, lo, hi);
+          runtime.AggregateOverFrame(window, rows, ordered, order_values,
+                                     k, lo, hi);
     }
   }
 }
@@ -846,13 +1032,20 @@ WindowedInput ApplyWindows(TransactionContext& context,
   }
 
   // Compute every hidden column.
+  std::unordered_map<std::string, WindowOrderLayout> layouts;
   std::vector<std::vector<Value>> computed;
   computed.reserve(windows.size());
   for (const auto& [window_node, index] : windows) {
     (void)index;
+    const std::string layout_key = WindowLayoutKey(*window_node);
+    auto [layout_it, inserted] = layouts.try_emplace(layout_key);
+    if (inserted) {
+      WindowRuntime runtime{context, outer, &ctes, &base_schema};
+      layout_it->second = BuildWindowOrderLayout(*window_node, rows, runtime);
+    }
     computed.emplace_back();
     ComputeOneWindow(context, *window_node, rows, base_schema, outer, ctes,
-                     &computed.back());
+                     &computed.back(), &layout_it->second);
   }
   for (size_t r = 0; r < rows.size(); ++r) {
     for (size_t w = 0; w < windows.size(); ++w) {

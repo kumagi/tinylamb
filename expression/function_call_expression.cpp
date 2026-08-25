@@ -536,6 +536,15 @@ std::unordered_set<ColumnName> FunctionCallExpression::TouchedColumns() const {
 
 Value FunctionCallExpression::Evaluate(const Row& row,
                                        const Schema& schema) const {
+  if (func_name_ == "if") {
+    if (args_.size() != 3) {
+      throw std::runtime_error("IF requires three arguments");
+    }
+    const Value condition = args_[0]->Evaluate(row, schema);
+    return (condition.IsNull() || !condition.Truthy())
+               ? args_[2]->Evaluate(row, schema)
+               : args_[1]->Evaluate(row, schema);
+  }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
       throw std::runtime_error("DATE_ADD/DATE_SUB requires DATE and INTERVAL");
@@ -573,6 +582,16 @@ Value FunctionCallExpression::Evaluate(const Row* left,
                                        const Schema& left_schema,
                                        const Row* right,
                                        const Schema& right_schema) const {
+  if (func_name_ == "if") {
+    if (args_.size() != 3) {
+      throw std::runtime_error("IF requires three arguments");
+    }
+    const Value condition =
+        args_[0]->Evaluate(left, left_schema, right, right_schema);
+    return (condition.IsNull() || !condition.Truthy())
+               ? args_[2]->Evaluate(left, left_schema, right, right_schema)
+               : args_[1]->Evaluate(left, left_schema, right, right_schema);
+  }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
       throw std::runtime_error("DATE_ADD/DATE_SUB requires DATE and INTERVAL");
@@ -596,6 +615,15 @@ Value FunctionCallExpression::Evaluate(const Row* left,
 // threaded into every argument (A1 stage 3).
 Value FunctionCallExpression::Evaluate(const Row& row, const Schema& schema,
                                        EvaluationContext& context) const {
+  if (func_name_ == "if") {
+    if (args_.size() != 3) {
+      throw std::runtime_error("IF requires three arguments");
+    }
+    const Value condition = args_[0]->Evaluate(row, schema, context);
+    return (condition.IsNull() || !condition.Truthy())
+               ? args_[2]->Evaluate(row, schema, context)
+               : args_[1]->Evaluate(row, schema, context);
+  }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
       throw std::runtime_error("DATE_ADD/DATE_SUB requires DATE and INTERVAL");
@@ -625,7 +653,9 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
     if (args_.size() < 2) { return {TypeTag::kInvalid}; }
     return args_[1]->ResultType(schema);
   }
-  if (func_name_ == "split" || func_name_ == "regexp_extract_all" || func_name_.ends_with("_array")) {
+  if (func_name_ == "split" || func_name_ == "regexp_extract_all" ||
+      func_name_ == "generate_array" || func_name_ == "generate_series" ||
+      func_name_ == "generate_date_array" || func_name_.ends_with("_array")) {
     return {TypeTag::kArray};
   }
   if (func_name_ == "concat" || func_name_ == "current_timestamp" ||
@@ -697,7 +727,9 @@ Type FunctionCallExpression::ResultType(const Schema& left,
     if (args_.size() < 2) { return {TypeTag::kInvalid}; }
     return args_[1]->ResultType(left, right);
   }
-  if (func_name_ == "split" || func_name_ == "regexp_extract_all" || func_name_.ends_with("_array")) {
+  if (func_name_ == "split" || func_name_ == "regexp_extract_all" ||
+      func_name_ == "generate_array" || func_name_ == "generate_series" ||
+      func_name_ == "generate_date_array" || func_name_.ends_with("_array")) {
     return {TypeTag::kArray};
   }
   if (func_name_ == "concat" || func_name_ == "current_timestamp" ||

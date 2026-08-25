@@ -44,9 +44,21 @@ namespace {
 constexpr uint8_t kJoinKindInner = 0;
 constexpr uint8_t kJoinKindSemi = 1;
 constexpr uint8_t kJoinKindAnti = 2;
+constexpr uint8_t kJoinKindNullAwareAnti = 3;
+constexpr uint8_t kJoinKindLeftOuter = 4;
+constexpr uint8_t kJoinKindRightOuter = 5;
+constexpr uint8_t kJoinKindFullOuter = 6;
 
 [[nodiscard]] bool IsSemiOrAnti(JoinKind kind) {
-  return static_cast<uint8_t>(kind) != kJoinKindInner;
+  const uint8_t value = static_cast<uint8_t>(kind);
+  return value == kJoinKindSemi || value == kJoinKindAnti ||
+         value == kJoinKindNullAwareAnti;
+}
+
+[[nodiscard]] bool IsOuter(JoinKind kind) {
+  const uint8_t value = static_cast<uint8_t>(kind);
+  return value == kJoinKindLeftOuter || value == kJoinKindRightOuter ||
+         value == kJoinKindFullOuter;
 }
 
 // Row-count statistics feed cost comparisons only; a pathological estimate
@@ -83,9 +95,23 @@ TableStatistics HashJoinStats(const TableStatistics& left,
 // Semi/anti joins emit only the left side's columns, with at most one output
 // row per left row.
 TableStatistics SemiAntiJoinStats(const TableStatistics& left,
-                                  const TableStatistics& right) {
+                                  const TableStatistics& right,
+                                  JoinKind kind) {
+  if (IsAntiJoinKind(kind) || IsNullAwareAntiJoinKind(kind)) {
+    // Anti joins can retain every probe row; without a null-aware/selectivity
+    // estimate, the probe cardinality is the sound upper-bound estimate.
+    return left;
+  }
   const size_t output_rows = std::min(left.Rows(), right.Rows());
   return left.ScaleToRows(output_rows);
+}
+
+TableStatistics OuterJoinStats(const TableStatistics& left,
+                               const TableStatistics& right) {
+  const size_t output_rows = std::max(left.Rows(), right.Rows());
+  TableStatistics ans = left.ScaleToRows(output_rows);
+  ans.Concat(right.ScaleToRows(output_rows));
+  return ans;
 }
 
 size_t EstimatedBuildBytes(const Plan& right_src) {
@@ -128,9 +154,14 @@ ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
       right_ts_(nullptr),
       hash_mode_(hash_mode),
       kind_(kind),
-      output_schema_(left_src_->GetSchema()),
-      stats_(SemiAntiJoinStats(left_src_->GetStats(),
-                               right_src_->GetStats())) {}
+      output_schema_(IsSemiOrAnti(kind_) ? left_src_->GetSchema()
+                                         : left_src_->GetSchema() +
+                                               right_src_->GetSchema()),
+      stats_(IsSemiOrAnti(kind_)
+                 ? SemiAntiJoinStats(left_src_->GetStats(),
+                                     right_src_->GetStats(), kind)
+                 : OuterJoinStats(left_src_->GetStats(),
+                                  right_src_->GetStats())) {}
 
 ProductPlan::ProductPlan(Plan left_src, std::vector<ColumnName> left_cols,
                          Plan right_src, std::vector<ColumnName> right_cols,
@@ -147,9 +178,41 @@ bool IsAntiJoinKind(JoinKind kind) {
   return static_cast<uint8_t>(kind) == kJoinKindAnti;
 }
 
+bool IsNullAwareAntiJoinKind(JoinKind kind) {
+  return static_cast<uint8_t>(kind) == kJoinKindNullAwareAnti;
+}
+
+bool IsLeftOuterJoinKind(JoinKind kind) {
+  return static_cast<uint8_t>(kind) == kJoinKindLeftOuter;
+}
+
+bool IsRightOuterJoinKind(JoinKind kind) {
+  return static_cast<uint8_t>(kind) == kJoinKindRightOuter;
+}
+
+bool IsFullOuterJoinKind(JoinKind kind) {
+  return static_cast<uint8_t>(kind) == kJoinKindFullOuter;
+}
+
 JoinKind SemiJoinKind() { return static_cast<JoinKind>(kJoinKindSemi); }
 
 JoinKind AntiJoinKind() { return static_cast<JoinKind>(kJoinKindAnti); }
+
+JoinKind NullAwareAntiJoinKind() {
+  return static_cast<JoinKind>(kJoinKindNullAwareAnti);
+}
+
+JoinKind LeftOuterJoinKind() {
+  return static_cast<JoinKind>(kJoinKindLeftOuter);
+}
+
+JoinKind RightOuterJoinKind() {
+  return static_cast<JoinKind>(kJoinKindRightOuter);
+}
+
+JoinKind FullOuterJoinKind() {
+  return static_cast<JoinKind>(kJoinKindFullOuter);
+}
 
 
 // For Index Join.
@@ -232,11 +295,10 @@ size_t ProductPlan::AccessRowCount() const {
 
 size_t ProductPlan::EmitRowCount() const {
   if (IsSemiOrAnti(kind_)) {
-    // Semi: one output per matching left row; anti: the non-matching rest.
+    // Semi: one output per matching left row; anti: any probe row may remain.
     const size_t l = left_src_->EmitRowCount();
     const size_t r = right_src_->EmitRowCount();
-    return static_cast<uint8_t>(kind_) == kJoinKindSemi ? std::min(l, r)
-                                                  : (l > r ? l - r : 0);
+    return IsSemiJoinKind(kind_) ? std::min(l, r) : l;
   }
   if (left_cols_.empty() && right_cols_.empty()) {
     // CrossJoin.
@@ -247,6 +309,9 @@ size_t ProductPlan::EmitRowCount() const {
     // IndexJoin
     return std::min(left_src_->EmitRowCount(), right_ts_->Rows());
   }
+  if (IsOuter(kind_)) {
+    return std::max(left_src_->EmitRowCount(), right_src_->EmitRowCount());
+  }
   return std::min(left_src_->EmitRowCount(), right_src_->EmitRowCount());
 }
 
@@ -256,6 +321,14 @@ void ProductPlan::Dump(std::ostream& o, int indent) const {
     o << "Semi Join ";
   } else if (static_cast<uint8_t>(kind_) == kJoinKindAnti) {
     o << "Anti Join ";
+  } else if (static_cast<uint8_t>(kind_) == kJoinKindNullAwareAnti) {
+    o << "Null-aware Anti Join ";
+  } else if (static_cast<uint8_t>(kind_) == kJoinKindLeftOuter) {
+    o << "Left Outer Join ";
+  } else if (static_cast<uint8_t>(kind_) == kJoinKindRightOuter) {
+    o << "Right Outer Join ";
+  } else if (static_cast<uint8_t>(kind_) == kJoinKindFullOuter) {
+    o << "Full Outer Join ";
   } else if (left_cols_.empty() && right_cols_.empty()) {
     o << "Cross Join ";
   } else if (right_tbl_ != nullptr) {
@@ -301,6 +374,14 @@ std::string ProductPlan::ToString() const {
     s += "Semi Join ";
   } else if (static_cast<uint8_t>(kind_) == kJoinKindAnti) {
     s += "Anti Join ";
+  } else if (static_cast<uint8_t>(kind_) == kJoinKindNullAwareAnti) {
+    s += "Null-aware Anti Join ";
+  } else if (static_cast<uint8_t>(kind_) == kJoinKindLeftOuter) {
+    s += "Left Outer Join ";
+  } else if (static_cast<uint8_t>(kind_) == kJoinKindRightOuter) {
+    s += "Right Outer Join ";
+  } else if (static_cast<uint8_t>(kind_) == kJoinKindFullOuter) {
+    s += "Full Outer Join ";
   } else if (left_cols_.empty() && right_cols_.empty()) {
     s += "Cross Join ";
   } else if (right_tbl_ != nullptr) {

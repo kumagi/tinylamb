@@ -99,9 +99,25 @@ std::string WindowFunctionCallExpression::ToString() const {
     out << "ORDER BY " << OrderTermsToString(order_by) << " ";
   }
   if (has_frame) {
-    const char* unit = frame_unit == WindowFrameUnit::kRange ? "RANGE" : "ROWS";
+    const char* unit = frame_unit == WindowFrameUnit::kRange
+                           ? "RANGE"
+                           : frame_unit == WindowFrameUnit::kGroups ? "GROUPS"
+                                                                    : "ROWS";
     out << unit << " BETWEEN " << FrameBoundToString(frame_start) << " AND "
         << FrameBoundToString(frame_end);
+    switch (exclusion) {
+      case WindowFrameExclusion::kCurrentRow:
+        out << " EXCLUDE CURRENT ROW";
+        break;
+      case WindowFrameExclusion::kGroup:
+        out << " EXCLUDE GROUP";
+        break;
+      case WindowFrameExclusion::kTies:
+        out << " EXCLUDE TIES";
+        break;
+      case WindowFrameExclusion::kNone:
+        break;
+    }
   }
   out << ")";
   return out.str();

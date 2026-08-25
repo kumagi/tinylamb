@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/set_operation.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "type/column.hpp"
@@ -32,7 +33,7 @@ namespace tinylamb {
 
 class SelectStatement;
 
-enum class JoinType { kCross, kInner, kLeft };
+enum class JoinType { kCross, kInner, kLeft, kRight, kFull };
 
 struct SelectSource {
   SelectSource() = default;
@@ -202,6 +203,7 @@ class SelectStatement : public Statement {
     has_limit_ = limit.has_value();
     limit_ = limit.value_or(0);
   }
+  void SetOffset(size_t offset) { offset_ = offset; }
   size_t Offset() const { return offset_; }
   bool Distinct() const { return distinct_; }
   const std::vector<SelectSource>& Sources() const { return sources_; }
@@ -249,9 +251,21 @@ class SelectStatement : public Statement {
   const std::vector<std::shared_ptr<SelectStatement>>& UnionAll() const {
     return union_all_;
   }
-  void AddUnionAll(std::shared_ptr<SelectStatement> query) {
+  const std::vector<SetOperationKind>& SetOperationKinds() const {
+    return set_operation_kinds_;
+  }
+  void AddSetOperation(SetOperationKind kind,
+                       std::shared_ptr<SelectStatement> query) {
+    set_operation_kinds_.push_back(kind);
     union_all_.push_back(std::move(query));
     complex_ = true;
+  }
+  void AddUnionAll(std::shared_ptr<SelectStatement> query) {
+    AddSetOperation(SetOperationKind::kUnionAll, std::move(query));
+  }
+  void ClearUnionAll() {
+    union_all_.clear();
+    set_operation_kinds_.clear();
   }
   void MarkComplex() { complex_ = true; }
   void Dump(std::ostream& o) const override {
@@ -294,6 +308,7 @@ class SelectStatement : public Statement {
   std::unordered_map<std::string, std::shared_ptr<SelectStatement>>
       with_queries_;
   std::vector<std::shared_ptr<SelectStatement>> union_all_;
+  std::vector<SetOperationKind> set_operation_kinds_;
   bool complex_{false};
 };
 
@@ -307,11 +322,26 @@ class InsertStatement : public Statement {
         values_(std::move(values)),
         columns_(std::move(columns)) {}
 
+  InsertStatement(std::string table_name,
+                  std::shared_ptr<SelectStatement> query,
+                  std::vector<std::string> columns = {})
+      : Statement(StatementType::kInsert),
+        table_name_(std::move(table_name)),
+        columns_(std::move(columns)),
+        query_(std::move(query)) {}
+
   const std::string& TableName() const { return table_name_; }
   const std::vector<std::vector<Expression>>& Values() const { return values_; }
   const std::vector<std::string>& Columns() const { return columns_; }
+  const std::shared_ptr<SelectStatement>& Query() const { return query_; }
+  bool IsSelect() const { return query_ != nullptr; }
   void Dump(std::ostream& o) const override {
-    o << "table=" << table_name_ << " values=[";
+    o << "table=" << table_name_;
+    if (query_) {
+      o << " AS SELECT";
+      return;
+    }
+    o << " values=[";
     for (size_t i = 0; i < values_.size(); i++) {
       if (i) {
         o << "; ";
@@ -332,6 +362,7 @@ class InsertStatement : public Statement {
   std::string table_name_;
   std::vector<std::vector<Expression>> values_;
   std::vector<std::string> columns_;
+  std::shared_ptr<SelectStatement> query_;
 };
 
 class UpdateStatement : public Statement {

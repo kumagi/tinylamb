@@ -16,11 +16,20 @@ namespace tinylamb {
 // - `x IN S`: rows with x = NULL or no match are filtered out either way.
 // - `NOT EXISTS`: anti join reproduces it exactly.
 // `NOT IN` additionally requires both key columns to be NOT NULL before it
-// may become an anti join (the planner gates this; see optimizer.cpp).
+// may become a regular anti join (the planner gates this; see optimizer.cpp).
+// kNullAwareAnti implements three-valued `NOT IN` behavior directly.
+// Outer kinds preserve unmatched rows from the named side(s), padding the
+// other side with NULL values. They are kept distinct from HashJoinMode so a
+// physical implementation can choose in-memory or hybrid execution
+// independently of SQL join semantics.
 enum class JoinKind : uint8_t {
   kInner = 0,
   kSemi = 1,
   kAnti = 2,
+  kNullAwareAnti = 3,
+  kLeftOuter = 4,
+  kRightOuter = 5,
+  kFullOuter = 6,
 };
 
 inline std::string_view JoinKindName(JoinKind kind) {
@@ -31,6 +40,14 @@ inline std::string_view JoinKindName(JoinKind kind) {
       return "SemiHashJoin";
     case JoinKind::kAnti:
       return "AntiHashJoin";
+    case JoinKind::kNullAwareAnti:
+      return "NullAwareAntiHashJoin";
+    case JoinKind::kLeftOuter:
+      return "LeftHashJoin";
+    case JoinKind::kRightOuter:
+      return "RightHashJoin";
+    case JoinKind::kFullOuter:
+      return "FullHashJoin";
   }
   return "HashJoin";
 }

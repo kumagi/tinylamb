@@ -29,31 +29,32 @@
 
 namespace tinylamb {
 
-TEST(RowTest, construct) {
-  // Arrange -- nothing more than default Row ctor
-  // Act -- default-construct a Row
+TEST(RowTest, DefaultConstructor_WhenCalled_CreatesEmptyRow) {
   Row r;
-  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
+
+  EXPECT_TRUE(r.values_.empty());
 }
 
-TEST(RowTest, SerializeDeserializePreservesNulls) {
+TEST(RowTest, SerializeDeserialize_WithNullValues_PreservesNulls) {
   const Schema schema("nullable", {Column("integer", ValueType::kInt64),
                                    Column("text", ValueType::kVarChar),
                                    Column("number", ValueType::kDouble)});
   const Row original({Value(42), Value(), Value(3.5)});
   std::vector<char> buffer(original.Size());
 
-  EXPECT_EQ(original.Serialize(buffer.data()), original.Size());
+  const size_t written = original.Serialize(buffer.data());
   Row restored;
-  EXPECT_EQ(restored.Deserialize(buffer.data(), schema), original.Size());
+  const size_t read = restored.Deserialize(buffer.data(), schema);
 
+  EXPECT_EQ(written, original.Size());
+  EXPECT_EQ(read, original.Size());
   ASSERT_EQ(restored.values_.size(), 3);
   EXPECT_EQ(restored[0], Value(42));
   EXPECT_TRUE(restored[1].IsNull());
   EXPECT_EQ(restored[2], Value(3.5));
 }
 
-TEST(RowTest, DeserializeProjectedKeepsOnlyRequestedColumns) {
+TEST(RowTest, DeserializeProjected_WithSubsetIndices_KeepsOnlyRequestedColumns) {
   const Schema schema("projected", {Column("id", ValueType::kInt64),
                                      Column("ignored", ValueType::kVarChar),
                                      Column("nullable", ValueType::kDouble),
@@ -64,23 +65,20 @@ TEST(RowTest, DeserializeProjectedKeepsOnlyRequestedColumns) {
   original.Serialize(buffer.data());
 
   Row projected;
-  EXPECT_EQ(projected.DeserializeProjected(buffer.data(), schema, {0, 2, 3}),
-            original.Size());
+  const size_t read_proj = projected.DeserializeProjected(buffer.data(), schema, {0, 2, 3});
+  Row count_star;
+  const size_t read_star = count_star.DeserializeProjected(buffer.data(), schema, {});
+
+  EXPECT_EQ(read_proj, original.Size());
   ASSERT_EQ(projected.values_.size(), 3);
   EXPECT_EQ(projected[0], Value(7));
   EXPECT_TRUE(projected[1].IsNull());
   EXPECT_EQ(projected[2], Value("kept"));
-
-  Row count_star;
-  EXPECT_EQ(count_star.DeserializeProjected(buffer.data(), schema, {}),
-            original.Size());
+  EXPECT_EQ(read_star, original.Size());
   EXPECT_TRUE(count_star.values_.empty());
 }
 
-TEST(RowTest, SerializeRoundTripPreservesDateAndBinaryText) {
-  // Rows must round-trip every column type losslessly: a DATE, a VARCHAR that
-  // embeds NUL/0xff bytes, a double, and a NULL.  These are the shapes the
-  // row page and the secondary indexes persist.
+TEST(RowTest, SerializeRoundTrip_WithDateAndBinaryData_PreservesAllFields) {
   const Schema schema("mixed", {Column("id", ValueType::kInt64),
                                 Column("when", ValueType::kDate),
                                 Column("blob", ValueType::kVarChar),
@@ -90,10 +88,13 @@ TEST(RowTest, SerializeRoundTripPreservesDateAndBinaryText) {
   const Row original({Value(7), Value::Date("2021-03-04"),
                       Value(std::string(blob)), Value(2.5), Value()});
   std::vector<char> buffer(original.Size());
-  EXPECT_EQ(original.Serialize(buffer.data()), original.Size());
 
+  const size_t written = original.Serialize(buffer.data());
   Row restored;
-  EXPECT_EQ(restored.Deserialize(buffer.data(), schema), original.Size());
+  const size_t read = restored.Deserialize(buffer.data(), schema);
+
+  EXPECT_EQ(written, original.Size());
+  EXPECT_EQ(read, original.Size());
   ASSERT_EQ(restored.values_.size(), 5);
   EXPECT_EQ(restored[0], Value(7));
   EXPECT_EQ(restored[1], Value::Date("2021-03-04"));
@@ -102,20 +103,22 @@ TEST(RowTest, SerializeRoundTripPreservesDateAndBinaryText) {
   EXPECT_TRUE(restored[4].IsNull());
 }
 
-TEST(RowTest, HashIsOrderSensitive) {
-  // The combine step rotates and multiplies, so {1,2} and {2,1} -- which the
-  // old commutative addition merged into one bucket -- hash differently.
+TEST(RowTest, Hash_WithSwappedValues_ProducesDifferentHashes) {
   std::hash<Row> hasher;
   const Row forward({Value(1), Value(2)});
   const Row swapped({Value(2), Value(1)});
-  EXPECT_NE(hasher(forward), hasher(swapped));
-  EXPECT_EQ(hasher(forward), hasher(forward));
+
+  const size_t h_fwd = hasher(forward);
+  const size_t h_swap = hasher(swapped);
+  const size_t h_fwd2 = hasher(forward);
+
+  EXPECT_NE(h_fwd, h_swap);
+  EXPECT_EQ(h_fwd, h_fwd2);
 }
 
-TEST(RowTest, RowsWithNullKeysWorkInUnorderedMap) {
-  // Regression: GROUP BY keeps keys in unordered_map<Row, ...>; hashing rows
-  // that contain NULL columns used to throw from std::hash<Value>.
+TEST(RowTest, UnorderedMap_WithNullKeyRows_SupportsInsertionAndLookup) {
   std::unordered_map<Row, size_t> groups;
+
   ++groups[Row({Value(), Value("a")})];
   ++groups[Row({Value(), Value("a")})];
   ++groups[Row({Value(1), Value("a")})];
@@ -124,4 +127,29 @@ TEST(RowTest, RowsWithNullKeysWorkInUnorderedMap) {
   EXPECT_EQ(groups[Row({Value(), Value("a")})], 2U);
 }
 
+TEST(RowTest, TryPeekInteger_ForIntAndNonIntColumns_ReturnsValueOrNullopt) {
+  const Schema schema("s", {Column("name", ValueType::kVarChar),
+                            Column("id", ValueType::kInt64)});
+  const Row row({Value("hello"), Value(int64_t{42})});
+  std::vector<char> buf(row.Size());
+  row.Serialize(buf.data());
+
+  const auto peek_str = Row::TryPeekInteger(buf.data(), schema, 0);
+  const auto peek_int = Row::TryPeekInteger(buf.data(), schema, 1);
+  const auto peek_oob = Row::TryPeekInteger(buf.data(), schema, 5);
+
+  EXPECT_EQ(peek_str, std::nullopt);
+  EXPECT_EQ(peek_int, 42);
+  EXPECT_EQ(peek_oob, std::nullopt);
+}
+
+TEST(RowTest, Extract_WithOutOfBoundsIndices_ReturnsEmptyRow) {
+  const Row row({Value(1), Value(2)});
+
+  const Row extracted = row.Extract({5});
+
+  EXPECT_EQ(extracted.values_.size(), 0U);
+}
+
 }  // namespace tinylamb
+

@@ -53,7 +53,8 @@ AggregationExecutor::AggregationExecutor(
   if (aggregates_.size() == 1) {
     const auto& aggregate =
         aggregates_[0].expression->AsAggregateExpression();
-    if (aggregate.GetType() == AggregationType::kSum && !aggregate.Distinct() &&
+    if (aggregate.GetType() == AggregationType::kSum &&
+        !aggregate.Distinct() && !aggregate.WhereFilter() &&
         aggregate.Child()->Type() == TypeTag::kColumnValue) {
       const int offset = input_schema_.Offset(
           aggregate.Child()->AsColumnValue().GetColumnName());
@@ -74,9 +75,9 @@ AggregationExecutor::AggregationExecutor(
   for (const NamedExpression& named : aggregates_) {
     AggregateInput input;
     const auto& agg = named.expression->AsAggregateExpression();
-    if (!agg.Distinct() && IsCountStar(agg)) {
+    if (!agg.Distinct() && !agg.WhereFilter() && IsCountStar(agg)) {
       input.kind = AggregateInputKind::kCountStar;
-    } else if (!agg.Distinct() &&
+    } else if (!agg.Distinct() && !agg.WhereFilter() &&
                agg.Child()->Type() == TypeTag::kColumnValue) {
       const int offset =
           input_schema_.Offset(agg.Child()->AsColumnValue().GetColumnName());
@@ -88,7 +89,7 @@ AggregationExecutor::AggregationExecutor(
           input.type = declared;
         }
       }
-    } else if (!agg.Distinct() &&
+    } else if (!agg.Distinct() && !agg.WhereFilter() &&
                agg.Child()->Type() == TypeTag::kConstantValue) {
       const Value constant = agg.Child()->AsConstantValue().GetValue();
       if (!constant.IsNull() && (constant.type == ValueType::kInt64 ||
@@ -356,6 +357,13 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
       std::optional<Row> materialized;
       for (size_t i = 0; i < aggregates_.size(); ++i) {
         const auto& agg = aggregates_[i].expression->AsAggregateExpression();
+        if (agg.WhereFilter()) {
+          if (!materialized) { materialized = input_batch_.RowAt(row_index); }
+          if (!agg.WhereFilter()->Evaluate(*materialized, input_schema_)
+                   .Truthy()) {
+            continue;
+          }
+        }
         Value val;
         if (IsCountStar(agg)) {
           val = Value(1);

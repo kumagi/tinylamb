@@ -210,15 +210,17 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       nodes.push_back(MakeScanNode(context, source, empty_ctes));
     }
 
-    const bool has_left_join = std::any_of(
+    const bool has_outer_join = std::any_of(
         statement.Sources().begin() + 1, statement.Sources().end(),
         [](const SelectSource& source) {
-          return source.join_type == JoinType::kLeft;
+          return source.join_type == JoinType::kLeft ||
+                 source.join_type == JoinType::kRight ||
+                 source.join_type == JoinType::kFull;
         });
 
     EstimatedPlanNode plan;
-    if (has_left_join) {
-      output << pad << "JoinOrder=syntactic (left joins present)\n";
+    if (has_outer_join) {
+      output << pad << "JoinOrder=syntactic (outer joins present)\n";
       plan = std::move(nodes.front());
       for (size_t i = 1; i < nodes.size(); ++i) {
         const SelectSource& source = statement.Sources()[i];
@@ -228,6 +230,10 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         if (source.join_type == JoinType::kInner) { kind = "inner";
 }
         if (source.join_type == JoinType::kLeft) { kind = "left";
+}
+        if (source.join_type == JoinType::kRight) { kind = "right";
+}
+        if (source.join_type == JoinType::kFull) { kind = "full";
 }
         plan = MakeJoinNode(plan, nodes[i], predicates, kind);
       }

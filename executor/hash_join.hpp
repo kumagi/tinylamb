@@ -90,7 +90,8 @@ class HashJoin : public ExecutorBase {
   // not at all (anti), and its row position survives for UPDATE/DELETE.
   HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
            std::vector<slot_t> right_cols, HashJoinMode mode, JoinKind kind,
-           size_t worker_count = std::thread::hardware_concurrency());
+           size_t worker_count = std::thread::hardware_concurrency(),
+           size_t right_width = 0, size_t left_width = 0);
   HashJoin(const HashJoin&) = delete;
   HashJoin(HashJoin&&) = delete;
   HashJoin& operator=(const HashJoin&) = delete;
@@ -118,6 +119,7 @@ class HashJoin : public ExecutorBase {
   // check. Output rows are the untouched probe rows, so row positions are
   // preserved for UPDATE/DELETE consumers.
   void MaterializeSemiAnti();
+  void MaterializeOuter();
 
   void IntakeBothSides();
   void BuildShards();
@@ -140,6 +142,8 @@ class HashJoin : public ExecutorBase {
 
   HashJoinMode mode_{HashJoinMode::kInMemory};
   JoinKind kind_{JoinKind::kInner};
+  size_t right_width_{0};
+  size_t left_width_{0};
   size_t worker_count_;
   bool materialized_{false};
   bool materialize_failed_{false};

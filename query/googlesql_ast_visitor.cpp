@@ -826,6 +826,7 @@ struct NamedWindowParts {
   WindowFrameBound frame_start;
   WindowFrameBound frame_end;
   bool has_frame{false};
+  WindowFrameExclusion exclusion{WindowFrameExclusion::kNone};
 };
 
 thread_local std::unordered_map<std::string, NamedWindowParts>
@@ -874,9 +875,11 @@ NamedWindowParts ParseWindowSpecification(const GoogleSqlAstNode& spec) {
     parts.order_by = ParseOrderingList(*order);
   }
   if (const GoogleSqlAstNode* frame = spec.Child("WindowFrame")) {
-    parts.frame_unit = UpperCopy(frame->detail) == "RANGE"
+    const std::string unit = UpperCopy(frame->detail);
+    parts.frame_unit = unit == "RANGE"
                            ? WindowFrameUnit::kRange
-                           : WindowFrameUnit::kRows;
+                           : unit == "GROUPS" ? WindowFrameUnit::kGroups
+                                                : WindowFrameUnit::kRows;
     const auto bounds = frame->Children("WindowFrameExpr");
     // GoogleSQL allows only `CURRENT ROW` as a single-bound frame; offset
     // bounds require the full BETWEEN .. AND .. form (corpus row_number_3).
@@ -893,6 +896,24 @@ NamedWindowParts ParseWindowSpecification(const GoogleSqlAstNode& spec) {
     } else {
       throw std::runtime_error(
           "GoogleSQL AST: window frame requires BETWEEN x AND y");
+    }
+    for (const auto& child : frame->children) {
+      const std::string kind = UpperCopy(child->kind);
+      const std::string detail = UpperCopy(child->detail);
+      if (kind.find("EXCLUDE") == std::string::npos &&
+          detail.find("EXCLUDE") == std::string::npos) {
+        continue;
+      }
+      if (detail.find("CURRENT ROW") != std::string::npos ||
+          kind.find("CURRENT") != std::string::npos) {
+        parts.exclusion = WindowFrameExclusion::kCurrentRow;
+      } else if (detail.find("GROUP") != std::string::npos ||
+                 kind.find("GROUP") != std::string::npos) {
+        parts.exclusion = WindowFrameExclusion::kGroup;
+      } else if (detail.find("TIES") != std::string::npos ||
+                 kind.find("TIES") != std::string::npos) {
+        parts.exclusion = WindowFrameExclusion::kTies;
+      }
     }
   }
   return parts;
@@ -963,6 +984,7 @@ Expression VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
       window->frame_start = found->second.frame_start;
       window->frame_end = found->second.frame_end;
       window->has_frame = found->second.has_frame;
+      window->exclusion = found->second.exclusion;
     } else {
       NamedWindowParts parts = ParseWindowSpecification(*spec);
       window->partition_by = std::move(parts.partition_by);
@@ -971,6 +993,7 @@ Expression VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
       window->frame_start = parts.frame_start;
       window->frame_end = parts.frame_end;
       window->has_frame = parts.has_frame;
+      window->exclusion = parts.exclusion;
     }
   }
   return window;
@@ -1852,13 +1875,13 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
       }
       if (const GoogleSqlAstNode* with_offset = node.Child("WithOffset")) {
         if (const GoogleSqlAstNode* alias = with_offset->Child("Alias")) {
-          source.offset_alias = Identifier(*alias);
+          source.offset_alias = Alias(*with_offset);
         } else {
           source.offset_alias = "offset";
         }
       } else if (const GoogleSqlAstNode* with_offset2 = node.Child("WithOffsetClause")) {
         if (const GoogleSqlAstNode* alias = with_offset2->Child("Alias")) {
-          source.offset_alias = Identifier(*alias);
+          source.offset_alias = Alias(*with_offset2);
         } else {
           source.offset_alias = "offset";
         }
@@ -1866,7 +1889,7 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
         for (const auto& child : node.children) {
           if (child->kind.find("Offset") != std::string::npos) {
             if (const GoogleSqlAstNode* alias = child->Child("Alias")) {
-              source.offset_alias = Identifier(*alias);
+              source.offset_alias = Alias(*child);
             } else {
               source.offset_alias = "offset";
             }
@@ -1922,9 +1945,14 @@ void AppendSources(const GoogleSqlAstNode& node, JoinType incoming,  // NOLINT(m
   }
   AppendSources(*operands[0], incoming, std::move(condition), sources);
   JoinType type = JoinType::kInner;
-  if (node.detail == "COMMA") { type = JoinType::kCross;
+  const std::string join_detail = UpperCopy(node.detail);
+  if (join_detail == "COMMA") { type = JoinType::kCross;
 }
-  if (node.detail == "LEFT") { type = JoinType::kLeft;
+  if (join_detail.find("LEFT") != std::string::npos) { type = JoinType::kLeft;
+}
+  if (join_detail.find("RIGHT") != std::string::npos) { type = JoinType::kRight;
+}
+  if (join_detail.find("FULL") != std::string::npos) { type = JoinType::kFull;
 }
   Expression join_expression;
   if (on != nullptr && !on->children.empty()) {
@@ -1974,8 +2002,116 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
       }
       if (!operands.empty()) {
         auto first_stmt = VisitQuery(*operands[0]);
+        std::vector<SetOperationKind> operations;
+        if (const GoogleSqlAstNode* metadata_list =
+                set_op->Child("SetOperationMetadataList")) {
+          size_t metadata_index = 0;
+          for (const GoogleSqlAstNode* metadata :
+               metadata_list->Children("SetOperationMetadata")) {
+            const GoogleSqlAstNode* type =
+                metadata->Child("SetOperationType");
+            const GoogleSqlAstNode* all_or_distinct =
+                metadata->Child("SetOperationAllOrDistinct");
+            std::string op = type == nullptr ? "" : UpperCopy(type->detail);
+            if (op.empty() && metadata_index == 0) {
+              op = UpperCopy(set_op->detail);
+            }
+            const bool all = all_or_distinct != nullptr &&
+                             UpperCopy(all_or_distinct->detail) == "ALL";
+            const bool op_all = all || op.find("ALL") != std::string::npos;
+            if (op.find("UNION") != std::string::npos) {
+              operations.push_back(op_all ? SetOperationKind::kUnionAll
+                                        : SetOperationKind::kUnion);
+            } else if (op.find("INTERSECT") != std::string::npos) {
+              operations.push_back(op_all ? SetOperationKind::kIntersectAll
+                                          : SetOperationKind::kIntersect);
+            } else if (op.find("EXCEPT") != std::string::npos) {
+              operations.push_back(op_all ? SetOperationKind::kExceptAll
+                                          : SetOperationKind::kExcept);
+            } else if (!op.empty()) {
+              throw std::runtime_error("GoogleSQL AST: unsupported set operation " +
+                                       op);
+            }
+            ++metadata_index;
+          }
+        }
+        if (operations.empty()) {
+          const std::string op = UpperCopy(set_op->detail);
+          operations.push_back(
+              op.find("INTERSECT") != std::string::npos
+                  ? (op.find("ALL") != std::string::npos
+                         ? SetOperationKind::kIntersectAll
+                         : SetOperationKind::kIntersect)
+                  : op.find("EXCEPT") != std::string::npos
+                        ? (op.find("ALL") != std::string::npos
+                               ? SetOperationKind::kExceptAll
+                               : SetOperationKind::kExcept)
+                        : (op.find("ALL") != std::string::npos
+                               ? SetOperationKind::kUnionAll
+                               : SetOperationKind::kUnion));
+        }
+        while (operations.size() < operands.size() - 1) {
+          operations.push_back(operations.back());
+        }
         for (size_t i = 1; i < operands.size(); ++i) {
-          first_stmt->AddUnionAll(VisitQuery(*operands[i]));
+          const SetOperationKind operation =
+              i - 1 < operations.size() ? operations[i - 1]
+                                         : SetOperationKind::kUnionAll;
+          first_stmt->AddSetOperation(operation, VisitQuery(*operands[i]));
+        }
+        // ORDER BY/LIMIT/OFFSET are attached to the Query parent of a set
+        // operation. Preserve them on the synthetic head statement so the
+        // relational executor can apply them after all UNION ALL branches.
+        std::vector<SelectStatement::OrderByTerm> order_by;
+        if (const GoogleSqlAstNode* order = query.Child("OrderBy")) {
+          for (const GoogleSqlAstNode* term :
+               order->Children("OrderingExpression")) {
+            WindowOrderTerm parsed = ParseOrderingTerm(term);
+            if (parsed.expression) {
+              order_by.push_back({std::move(parsed.expression),
+                                  parsed.ascending, parsed.nulls_first});
+            }
+          }
+        }
+        if (!order_by.empty()) {
+          first_stmt->SetOrderBy(std::move(order_by));
+        }
+        std::optional<size_t> limit;
+        size_t offset = 0;
+        if (const GoogleSqlAstNode* limit_offset =
+                query.Child("LimitOffset")) {
+          if (const GoogleSqlAstNode* limit_node =
+                  limit_offset->Child("Limit")) {
+            if (const GoogleSqlAstNode* value =
+                    limit_node->Child("IntLiteral")) {
+              limit = static_cast<size_t>(ParseUnsignedLiteral(*value));
+            }
+          }
+          for (const auto& child : limit_offset->children) {
+            if (child->kind == "IntLiteral") {
+              offset = ParseUnsignedLiteral(*child);
+            }
+          }
+        }
+        if (limit.has_value()) {
+          first_stmt->SetLimit(limit);
+        }
+        first_stmt->SetOffset(offset);
+        // The WITH clause belongs to the query wrapper around a set
+        // operation, not to its first SELECT operand.  Preserve it on the
+        // synthetic head so CTE visibility and materialization are identical
+        // for `WITH cte AS (...) SELECT ... UNION ALL SELECT ...`.
+        if (const GoogleSqlAstNode* with = query.Child("WithClause")) {
+          for (const GoogleSqlAstNode* entry :
+               with->Children("WithClauseEntry")) {
+            const GoogleSqlAstNode* aliased = entry->Child("AliasedQuery");
+            if (aliased == nullptr) { continue; }
+            const GoogleSqlAstNode* name = aliased->Child("Identifier");
+            const GoogleSqlAstNode* nested = aliased->Child("Query");
+            if (name != nullptr && nested != nullptr) {
+              first_stmt->AddWithQuery(Identifier(*name), VisitQuery(*nested));
+            }
+          }
         }
         return first_stmt;
       }
@@ -2022,6 +2158,9 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
         parts.frame_start = own.frame_start;
         parts.frame_end = own.frame_end;
         parts.has_frame = true;
+      }
+      if (own.exclusion != WindowFrameExclusion::kNone) {
+        parts.exclusion = own.exclusion;
       }
       t_named_windows[Identifier(*name_node)] = std::move(parts);
     }
@@ -2172,7 +2311,9 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
   // features the optimizer cannot represent yet force the relational
   // executor: FROM-subqueries and outer joins.
   for (const SelectSource& source : statement->Sources()) {
-    if (source.query || source.join_type == JoinType::kLeft) {
+    if (source.query || source.join_type == JoinType::kLeft ||
+        source.join_type == JoinType::kRight ||
+        source.join_type == JoinType::kFull) {
       statement->MarkComplex();
     }
   }
@@ -2251,6 +2392,10 @@ std::unique_ptr<Statement> VisitInsert(const GoogleSqlAstNode& root) {
     for (const GoogleSqlAstNode* name : list->Children("Identifier")) {
       columns.push_back(Identifier(*name));
     }
+  }
+  if (const GoogleSqlAstNode* query = root.Child("Query")) {
+    return std::make_unique<InsertStatement>(Path(*path), VisitQuery(*query),
+                                             std::move(columns));
   }
   std::vector<std::vector<Expression>> rows;
   const GoogleSqlAstNode* row_list = root.Child("InsertValuesRowList");
