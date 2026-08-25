@@ -63,6 +63,12 @@ enum class AggregationType : int {
   kCorr,
   // Approximate / sketching aggregates.
   kApproxQuantiles,
+  kBitAnd,
+  kBitOr,
+  kBitXor,
+  kArrayConcatAgg,
+  kElementwiseSum,
+  kElementwiseAvg,
   kApproxTopCount,
   kApproxTopSum,
   kHllInit,

@@ -106,7 +106,11 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
     std::istringstream features(value);
     while (std::getline(features, feature, ',')) {
       feature = Trim(feature);
-      if (!feature.empty()) { file_default_features->push_back(feature); }
+      if (!feature.empty()) {
+        file_default_features->push_back(feature);
+        // The declaration inside a segment also gates that segment itself.
+        out->required_features.push_back(feature);
+      }
     }
     return true;
   }
@@ -463,7 +467,8 @@ std::vector<std::string> SplitTopLevel(std::string_view text) {
 }
 
 bool ParseArrayToken(std::string_view token, std::string* sql_type,
-                     std::vector<std::string>* elements) {
+                     std::vector<std::string>* elements,
+                     bool* unordered = nullptr) {
   const std::string text = Trim(token);
   constexpr std::string_view kPrefix = "ARRAY<";
   if (text.size() < kPrefix.size() ||
@@ -496,6 +501,7 @@ bool ParseArrayToken(std::string_view token, std::string* sql_type,
     inner = Trim(inner.substr(kKnown.size()));
   } else if (lower.starts_with(kUnknown)) {
     inner = Trim(inner.substr(kUnknown.size()));
+    if (unordered != nullptr) { *unordered = true; }
   }
   *elements = SplitTopLevel(inner);
   return true;
@@ -632,12 +638,27 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   if (actual.IsArray()) {
     std::string sql_type;
     std::vector<std::string> elements;
-    if (!ParseArrayToken(want, &sql_type, &elements)) { return false; }
-    if (!sql_type.empty() &&
-        ToLower(sql_type) != ToLower(actual.ArrayElementSqlType())) {
-      const std::string lower_type = ToLower(sql_type);
-      const bool struct_or_proto = lower_type.starts_with("struct<") || lower_type.starts_with("proto<");
-      if (!struct_or_proto || ToLower(actual.ArrayElementSqlType()) != "string") {
+    bool unordered = false;
+    if (!ParseArrayToken(want, &sql_type, &elements, &unordered)) {
+      return false;
+    }
+    std::string lower_type = ToLower(sql_type);
+    const std::string lower_actual_type =
+        ToLower(actual.ArrayElementSqlType());
+    // ENUM<T> / PROTO<T> goldens match engines that carry the bare type path
+    // (ENUM<googlesql_test.X> vs "googlesql_test.X").
+    if (lower_type != lower_actual_type &&
+        (lower_type.starts_with("enum<") || lower_type.starts_with("proto<")) &&
+        lower_type.back() == '>') {
+      const std::string unwrapped =
+          Trim(lower_type.substr(lower_type.find('<') + 1,
+                                 lower_type.size() - lower_type.find('<') - 2));
+      if (unwrapped == lower_actual_type) { lower_type = lower_actual_type; }
+    }
+    if (!lower_type.empty() && lower_type != lower_actual_type) {
+      const bool struct_or_proto =
+          lower_type.starts_with("struct<") || lower_type.starts_with("proto<");
+      if (!struct_or_proto || lower_actual_type != "string") {
         bool all_null = true;
         for (const auto& elem : actual.ArrayElements()) {
           if (!elem.IsNull()) {
@@ -651,6 +672,23 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       }
     }
     if (elements.size() != actual.ArrayElements().size()) { return false; }
+    if (unordered) {
+      // The reference does not guarantee element order: match as a multiset.
+      std::vector<bool> used(elements.size(), false);
+      for (const Value& element : actual.ArrayElements()) {
+        bool found = false;
+        for (size_t i = 0; i < elements.size(); ++i) {
+          if (used[i]) { continue; }
+          if (ComplianceValueMatches(element, elements[i])) {
+            used[i] = true;
+            found = true;
+            break;
+          }
+        }
+        if (!found) { return false; }
+      }
+      return true;
+    }
     for (size_t i = 0; i < elements.size(); ++i) {
       if (!ComplianceValueMatches(actual.ArrayElements()[i], elements[i])) {
         return false;

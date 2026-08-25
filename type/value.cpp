@@ -112,6 +112,18 @@ std::string ToString(AggregationType type) {
       return "CORR";
     case AggregationType::kApproxQuantiles:
       return "APPROX_QUANTILES";
+    case AggregationType::kBitAnd:
+      return "BIT_AND";
+    case AggregationType::kBitOr:
+      return "BIT_OR";
+    case AggregationType::kBitXor:
+      return "BIT_XOR";
+    case AggregationType::kArrayConcatAgg:
+      return "ARRAY_CONCAT_AGG";
+    case AggregationType::kElementwiseSum:
+      return "ELEMENTWISE_SUM";
+    case AggregationType::kElementwiseAvg:
+      return "ELEMENTWISE_AVG";
     case AggregationType::kApproxTopCount:
       return "APPROX_TOP_COUNT";
     case AggregationType::kApproxTopSum:
@@ -487,10 +499,17 @@ bool Value::operator==(const Value& rhs) const {
       }
       return false;
     }
-    case ValueType::kDouble:
+    case ValueType::kDouble: {
+      const double lhs = value.double_value;
+      const double rhs_double = rhs.value.double_value;
       // Epsilon comparison: accumulated sums must compare equal to literals
       // (e.g. SUM over doubles vs 22.44). Exact bit equality is too strict.
-      return std::fabs(value.double_value - rhs.value.double_value) < 1e-9;
+      // Infinities compare equal only to themselves (inf - inf is NaN, so
+      // the epsilon test alone would report two -inf values unequal).
+      if (lhs == rhs_double) { return true; }
+      if (std::isnan(lhs) || std::isnan(rhs_double)) { return false; }
+      return std::fabs(lhs - rhs_double) < 1e-9;
+    }
     case ValueType::kArray:
       return ArrayElementSqlType() == rhs.ArrayElementSqlType() &&
              ArrayElements() == rhs.ArrayElements();

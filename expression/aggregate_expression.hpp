@@ -79,6 +79,14 @@ class AggregateExpression : public ExpressionBase {
   void SetTrailingArgs(std::vector<Expression> args) {
     trailing_args_ = std::move(args);
   }
+  // Alias kept for call sites that model per-row extras as named arguments
+  // (APPROX_TOP_SUM weight / top-N count); same storage as TrailingArgs.
+  [[nodiscard]] const std::vector<Expression>& ExtraArgs() const {
+    return trailing_args_;
+  }
+  void SetExtraArgs(std::vector<Expression> args) {
+    trailing_args_ = std::move(args);
+  }
   // Row-level pre-filter: `AGG(x WHERE cond)` skips rows where cond is not
   // true; streaming-safe, unlike the HAVING MAX/MIN modifier.
   [[nodiscard]] const Expression& WhereFilter() const { return where_filter_; }
@@ -89,7 +97,9 @@ class AggregateExpression : public ExpressionBase {
   [[nodiscard]] bool NeedsGroupContext() const {
     return having_ != AggregateHavingModifier::kNone ||
            !inner_order_by_.empty() || inner_limit_.has_value() ||
-           !trailing_args_.empty();
+           !trailing_args_.empty() ||
+           type_ == AggregationType::kApproxTopCount ||
+           type_ == AggregationType::kApproxTopSum;
   }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;

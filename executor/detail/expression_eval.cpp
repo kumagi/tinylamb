@@ -128,260 +128,9 @@ int FindColumn(const Schema& schema, const ColumnName& name) {
   return match;
 }
 
-// ---- Nested field resolution ----------------------------------------------
-// GoogleSQL allows dotted references into STRUCT/PROTO values (`t.Info.x`,
-// `t.Info.str_value`).  Base relations store such values as text: struct
-// constructors produce JSON-like objects, proto constructors the proto text
-// format.  The helpers below resolve remaining path segments against those
-// encodings so a single Lookup covers plain columns and nested fields.
-
-std::string TrimFieldToken(std::string_view s) {
-  size_t begin = 0;
-  size_t end = s.size();
-  while (begin < end && std::isspace(static_cast<unsigned char>(s[begin]))) { ++begin; }
-  while (end > begin && std::isspace(static_cast<unsigned char>(s[end - 1]))) { --end; }
-  return std::string(s.substr(begin, end - begin));
-}
-
-Value ScalarFromText(std::string_view raw) {
-  std::string token = TrimFieldToken(raw);
-  if (token == "null" || token.empty()) { return {}; }
-  if (token == "true") { return Value(int64_t{1}); }
-  if (token == "false") { return Value(int64_t{0}); }
-  if (token.front() == '"' && token.back() == '"' && token.size() >= 2) {
-    return Value(token.substr(1, token.size() - 2));
-  }
-  if (token.front() == '{' && token.back() == '}') {
-    return Value(std::move(token));  // nested struct stays encoded
-  }
-  if (token.find('.') != std::string::npos || token.find('e') != std::string::npos ||
-      token.find('E') != std::string::npos) {
-    try { return Value(std::stod(token)); } catch (...) {}
-  }
-  try { return Value(static_cast<int64_t>(std::stoll(token))); } catch (...) {}
-  return Value(std::move(token));
-}
-
-std::string InferElementSqlType(const std::vector<Value>& elements) {
-  for (const Value& element : elements) {
-    if (element.IsNull()) { continue; }
-    switch (element.type) {
-      case ValueType::kInt64: return "INT64";
-      case ValueType::kDouble: return "DOUBLE";
-      case ValueType::kVarChar: return "STRING";
-      default: return {};
-    }
-  }
-  return "INT64";
-}
-
-// Extracts `key` from a JSON object string.  Returns false when the object
-// has no such key.  Array values become Value arrays.
-bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
-  if (json.size() < 2 || json.front() != '{' || json.back() != '}') { return false; }
-  const std::string needle = "\"" + std::string(key) + "\":";
-  auto top_level_prefix = [](std::string_view text) {
-    int depth = 0;
-    bool in_string = false;
-    for (size_t k = 0; k < text.size(); ++k) {
-      char c = text[k];
-      if (in_string) {
-        if (c == '\\' ) { ++k; continue; }
-        if (c == '"') { in_string = false; }
-        continue;
-      }
-      if (c == '"') { in_string = true; continue; }
-      if (c == '{' || c == '[') { ++depth; }
-      if (c == '}' || c == ']') { --depth; }
-      if (depth < 0) { return false; }
-    }
-    return depth == 0 && !in_string;
-  };
-  size_t search_from = 1;
-  size_t pos;
-  while ((pos = json.find(needle, search_from)) != std::string_view::npos &&
-         !top_level_prefix(json.substr(1, pos - 1))) {
-    search_from = pos + 1;
-  }
-  if (pos == std::string_view::npos ||
-      !top_level_prefix(json.substr(1, pos - 1))) {
-    return false;
-  }
-  size_t value_start = pos + needle.size();
-  while (value_start < json.size() &&
-         std::isspace(static_cast<unsigned char>(json[value_start]))) { ++value_start; }
-  size_t value_end;
-  if (json[value_start] == '"') {
-    value_end = value_start + 1;
-    while (value_end < json.size() && json[value_end] != '"') {
-      if (json[value_end] == '\\') { ++value_end; }
-      ++value_end;
-    }
-    ++value_end;
-  } else if (json[value_start] == '{' || json[value_start] == '[') {
-    int nest = 0;
-    value_end = value_start;
-    for (; value_end < json.size(); ++value_end) {
-      if (json[value_end] == '{' || json[value_end] == '[') { ++nest; }
-      else if (json[value_end] == '}' || json[value_end] == ']') {
-        --nest;
-        if (nest == 0) { ++value_end; break; }
-      }
-    }
-  } else {
-    value_end = value_start;
-    while (value_end < json.size() && json[value_end] != ',') { ++value_end; }
-  }
-  std::string_view raw = json.substr(value_start, value_end - value_start);
-  if (!raw.empty() && raw.front() == '[') {
-    // Split top-level elements and decode each.
-    std::string_view inner = raw.substr(1, raw.size() > 1 ? raw.size() - 2 : 0);
-    std::vector<Value> elements;
-    int nest = 0;
-    bool str = false;
-    size_t start = 0;
-    for (size_t k = 0; k < inner.size(); ++k) {
-      char d = inner[k];
-      if (str) {
-        if (d == '\\') { ++k; continue; }
-        if (d == '"') { str = false; }
-        continue;
-      }
-      if (d == '"') { str = true; continue; }
-      if (d == '{' || d == '[') { ++nest; continue; }
-      if (d == '}' || d == ']') { --nest; continue; }
-      if (d == ',' && nest == 0) {
-        elements.push_back(ScalarFromText(inner.substr(start, k - start)));
-        start = k + 1;
-      }
-    }
-    if (!inner.empty()) {
-      elements.push_back(ScalarFromText(inner.substr(start)));
-    }
-    *out = Value::Array(std::move(elements), InferElementSqlType(elements));
-    return true;
-  }
-  *out = ScalarFromText(raw);
-  return true;
-}
-
-// Proto text format: repeated `field: value` entries separated by whitespace,
-// strings double-quoted.  A field occurring once yields a scalar; repeated
-// occurrences yield an array.
-bool ProtoTextExtractField(std::string_view text, std::string_view key,
-                           Value* out) {
-  std::vector<Value> matches;
-  size_t i = 0;
-  while (i < text.size()) {
-    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) { ++i; }
-    size_t name_start = i;
-    while (i < text.size() && text[i] != ':') { ++i; }
-    if (i >= text.size()) { break; }
-    std::string_view field_name = text.substr(name_start, i - name_start);
-    ++i;  // skip ':'
-    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) { ++i; }
-    size_t value_begin = i;
-    size_t value_end;
-    if (i < text.size() && text[i] == '"') {
-      ++i;
-      while (i < text.size() && text[i] != '"') {
-        if (text[i] == '\\' && i + 1 < text.size()) { ++i; }
-        ++i;
-      }
-      value_end = std::min(text.size(), i + 1);
-      i = value_end;
-    } else {
-      while (i < text.size() && !std::isspace(static_cast<unsigned char>(text[i]))) { ++i; }
-      value_end = i;
-    }
-    if (IdentifierEquals(field_name, key)) {
-      matches.push_back(
-          ScalarFromText(text.substr(value_begin, value_end - value_begin)));
-    }
-  }
-  if (matches.empty()) { return false; }
-  if (matches.size() == 1) {
-    *out = std::move(matches[0]);
-  } else {
-    *out = Value::Array(std::move(matches), InferElementSqlType(matches));
-  }
-  return true;
-}
-
-Value ResolveFieldPath(const Value& base,
-                       const std::vector<std::string>& fields) {
-  Value current = base;
-  for (const std::string& field : fields) {
-    if (current.IsNull()) { return {}; }
-    if (current.type != ValueType::kVarChar) {
-      throw std::runtime_error("cannot access field " + field +
-                               " of a non-struct value");
-    }
-    const std::string_view text(current.value.varchar_value);
-    bool resolved = JsonExtractField(text, field, &current) ||
-                    ProtoTextExtractField(text, field, &current);
-    if (!resolved) {
-      throw std::runtime_error("field " + field + " not found");
-    }
-  }
-  return current;
-}
-
-std::vector<std::string> SplitDottedName(const std::string& name) {
-  std::vector<std::string> parts;
-  size_t start = 0;
-  while (true) {
-    size_t dot = name.find('.', start);
-    if (dot == std::string::npos) {
-      parts.push_back(name.substr(start));
-      break;
-    }
-    parts.push_back(name.substr(start, dot - start));
-    start = dot + 1;
-  }
-  return parts;
-}
-
-}  // namespace
-
-namespace {
-
-// Strict resolution: an explicitly qualified reference only matches a column
-// carrying that qualifier (or an unqualified name when the reference has
-// none).  Unlike FindColumn it never falls back to bare-name matches, so a
-// qualified reference to an OUTER scope is not hijacked by a same-named
-// column of an inner relation whose qualifiers were stripped by projection.
-int FindColumnStrict(const Schema& schema, const ColumnName& name) {
-  int match = -1;
-  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-    const ColumnName& candidate = schema.GetColumn(i).Name();
-    const bool ok = name.schema.empty()
-                        ? IdentifierEquals(candidate.name, name.name) &&
-                              candidate.schema.empty()
-                        : IdentifierEquals(candidate.schema, name.schema) &&
-                              IdentifierEquals(candidate.name, name.name);
-    if (!ok) { continue; }
-    if (match >= 0 && name.schema.empty()) {
-      throw std::runtime_error("ambiguous column " + name.name);
-    }
-    if (match < 0) { match = static_cast<int>(i); }
-  }
-  return match;
-}
-
 }  // namespace
 
 Value Lookup(const ColumnName& name, const Scope& scope) {
-  // Pass 1: strict resolution, innermost scope outward.
-  for (const Scope* current = &scope; current != nullptr;
-       current = current->outer) {
-    if (current->row == nullptr || current->schema == nullptr) { continue; }
-    const int offset = FindColumnStrict(*current->schema, name);
-    if (offset >= 0) { return (*current->row)[static_cast<size_t>(offset)]; }
-  }
-  // Pass 2: loose per-level resolution.  Projections may strip qualifiers,
-  // so a qualified name may still denote a local column by bare name when no
-  // strict interpretation exists anywhere on the chain.
   for (const Scope* current = &scope; current != nullptr;
        current = current->outer) {
     if (current->row == nullptr || current->schema == nullptr) {
@@ -390,35 +139,6 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
     const int offset = FindColumn(*current->schema, name);
     if (offset >= 0) {
       return (*current->row)[static_cast<size_t>(offset)];
-    }
-  }
-  // Dotted references (`t.Info.str_value`, `s.x`) may address nested fields
-  // of a STRUCT/PROTO value rather than a plain column.  Resolve the base
-  // column per scope level, then walk the remaining path segments.
-  std::vector<std::string> parts = SplitDottedName(
-      name.schema.empty() ? name.name : name.name);
-  if (!parts.empty() && (parts.size() > 1 || !name.schema.empty())) {
-    for (const Scope* current = &scope; current != nullptr;
-         current = current->outer) {
-      if (current->row == nullptr || current->schema == nullptr) { continue; }
-      const ColumnName base(name.schema, parts.front());
-      const int offset = FindColumn(*current->schema, base);
-      if (offset >= 0) {
-        return ResolveFieldPath((*current->row)[static_cast<size_t>(offset)],
-                                std::vector<std::string>(parts.begin() + 1,
-                                                         parts.end()));
-      }
-    }
-    // A dotted qualifier (`t.Info.str_value`) may also mean the qualifier is
-    // itself a field path prefix: try the full schema-less name per scope.
-    if (!name.schema.empty()) {
-      const ColumnName unqualified("", name.schema + "." + name.name);
-      for (const Scope* current = &scope; current != nullptr;
-           current = current->outer) {
-        if (current->row == nullptr || current->schema == nullptr) { continue; }
-        const int offset = FindColumn(*current->schema, unqualified);
-        if (offset >= 0) { return (*current->row)[static_cast<size_t>(offset)]; }
-      }
     }
   }
   throw std::runtime_error("column " + name.ToString() + " not found");
@@ -685,24 +405,51 @@ void AggregateAccumulator::ApplyCore(
       ++count;
       break;
     case AggregationType::kSum:
-    case AggregationType::kAvg:
       if (value.type == ValueType::kDouble) {
         total += value.value.double_value;
         total_is_double = true;
       } else if (value.type == ValueType::kInt64 ||
                  value.type == ValueType::kDate) {
-        int_total += static_cast<uint64_t>(value.value.int_value);
+        // Signed accumulation keeps negative inputs exact (GoogleSQL SUM
+        // raises on INT64 overflow rather than wrapping).
+        int64_t updated = 0;
+        if (__builtin_add_overflow(int_total, value.value.int_value,
+                                   &updated)) {
+          throw std::runtime_error("integer overflow in SUM");
+        }
+        int_total = updated;
+      } else {
+        throw std::runtime_error("numeric value required");
+      }
+      ++count;
+      break;
+    case AggregationType::kAvg:
+      // AVG(INT64) returns FLOAT64 and sums through a double intermediate,
+      // so INT64 overflow never applies here.
+      if (value.type == ValueType::kDouble) {
+        total += value.value.double_value;
+      } else if (value.type == ValueType::kInt64 ||
+                 value.type == ValueType::kDate) {
+        total += static_cast<double>(value.value.int_value);
       } else {
         throw std::runtime_error("numeric value required");
       }
       ++count;
       break;
     case AggregationType::kMin:
+      if (!value.IsNull() && value.type == ValueType::kDouble &&
+          std::isnan(value.value.double_value)) {
+        saw_nan_ = true;
+      }
       if (extreme.IsNull() || value < extreme) {
         extreme = value;
       }
       break;
     case AggregationType::kMax:
+      if (!value.IsNull() && value.type == ValueType::kDouble &&
+          std::isnan(value.value.double_value)) {
+        saw_nan_ = true;
+      }
       if (extreme.IsNull() || extreme < value) {
         extreme = value;
       }
@@ -735,6 +482,38 @@ void AggregateAccumulator::ApplyCore(
     case AggregationType::kArrayAgg:
     case AggregationType::kStringAgg:
       array_values_.push_back(value);
+      break;
+    case AggregationType::kBitAnd:
+    case AggregationType::kBitOr:
+    case AggregationType::kBitXor: {
+      const int64_t next = value.value.int_value;
+      if (!bit_saw_value_) {
+        bit_acc_ = next;
+        bit_saw_value_ = true;
+      } else if (expression->GetType() == AggregationType::kBitAnd) {
+        bit_acc_ &= next;
+      } else if (expression->GetType() == AggregationType::kBitOr) {
+        bit_acc_ |= next;
+      } else {
+        bit_acc_ ^= next;
+      }
+      break;
+    }
+    case AggregationType::kArrayConcatAgg:
+      if (!value.IsArray()) {
+        throw std::runtime_error(
+            "ARRAY_CONCAT_AGG requires an ARRAY argument");
+      }
+      if (concat_elem_type_.empty()) {
+        concat_elem_type_ = value.ArrayElementSqlType();
+      }
+      for (const Value& element : value.ArrayElements()) {
+        array_values_.push_back(element);
+      }
+      break;
+    case AggregationType::kElementwiseSum:
+    case AggregationType::kElementwiseAvg:
+      ElementwiseApply(value);
       break;
     case AggregationType::kAnyValue:
       // GoogleSQL leaves the choice unspecified; keep the first non-NULL
@@ -791,6 +570,40 @@ void AggregateAccumulator::ApplyCore(
     case AggregationType::kKllMergePartial:
       SketchMerge(value);
       break;
+  }
+}
+
+void AggregateAccumulator::ElementwiseApply(const Value& arr) {
+  if (!arr.IsArray()) {
+    throw std::runtime_error(
+        expression->GetType() == AggregationType::kElementwiseSum
+            ? "ELEMENTWISE_SUM requires an ARRAY argument"
+            : "ELEMENTWISE_AVG requires an ARRAY argument");
+  }
+  ew_any_input_ = true;
+  if (ew_input_elem_type_.empty()) {
+    ew_input_elem_type_ = arr.ArrayElementSqlType();
+  }
+  const auto& elements = arr.ArrayElements();
+  if (elements.size() > ew_len_) {
+    ew_len_ = elements.size();
+    ew_int_sum_.resize(ew_len_, 0);
+    ew_double_sum_.resize(ew_len_, 0.0);
+    ew_count_.resize(ew_len_, 0);
+    ew_saw_double_.resize(ew_len_, false);
+  }
+  for (size_t i = 0; i < elements.size(); ++i) {
+    const Value& element = elements[i];
+    if (element.IsNull()) {
+      continue;
+    }
+    ++ew_count_[i];
+    if (element.type == ValueType::kDouble) {
+      ew_saw_double_[i] = true;
+      ew_double_sum_[i] += element.value.double_value;
+    } else {
+      ew_int_sum_[i] += element.value.int_value;
+    }
   }
 }
 
@@ -1449,6 +1262,10 @@ Value AggregateAccumulator::Finish() const {
       return Value(total + static_cast<double>(int_total));
     case AggregationType::kMin:
     case AggregationType::kMax:
+      // GoogleSQL: any NaN in the group makes MIN/MAX NaN.
+      if (saw_nan_) {
+        return Value(std::numeric_limits<double>::quiet_NaN());
+      }
       return extreme;
     case AggregationType::kLogicalAnd:
     case AggregationType::kLogicalOr:
@@ -1634,6 +1451,64 @@ Value AggregateAccumulator::Finish() const {
             Value(TopEntryString(weight.value, std::move(sum_text))));
       }
       return Value::Array(std::move(elements), "STRING");
+    }
+    case AggregationType::kBitAnd:
+    case AggregationType::kBitOr:
+    case AggregationType::kBitXor:
+      return bit_saw_value_ ? Value(bit_acc_) : Value();
+    case AggregationType::kArrayConcatAgg:
+      if (concat_elem_type_.empty() && array_values_.empty()) {
+        // No non-NULL input arrays reached the accumulator: NULL array.
+        return {};
+      }
+      if (concat_elem_type_.empty()) {
+        concat_elem_type_ = "INT64";
+      }
+      return Value::Array(array_values_, concat_elem_type_);
+    case AggregationType::kElementwiseSum:
+    case AggregationType::kElementwiseAvg: {
+      const bool is_avg =
+          expression->GetType() == AggregationType::kElementwiseAvg;
+      if (!ew_any_input_) {
+        // All input arrays were NULL: NULL result.
+        return {};
+      }
+      auto mapped_elem_type = [](const std::string& input) {
+        std::string upper;
+        upper.reserve(input.size());
+        for (char c : input) {
+          upper.push_back(
+              static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        }
+        if (upper.find("UINT") != std::string::npos) {
+          return "UINT64";
+        }
+        if (upper.find("DOUBLE") != std::string::npos ||
+            upper.find("FLOAT") != std::string::npos) {
+          return "DOUBLE";
+        }
+        return "INT64";
+      };
+      std::vector<Value> elements;
+      elements.reserve(ew_len_);
+      for (size_t i = 0; i < ew_len_; ++i) {
+        if (ew_count_[i] == 0) {
+          elements.push_back(Value());
+          continue;
+        }
+        if (is_avg || ew_saw_double_[i]) {
+          const double sum =
+              ew_double_sum_[i] + static_cast<double>(ew_int_sum_[i]);
+          elements.push_back(is_avg
+                                 ? Value(sum / static_cast<double>(ew_count_[i]))
+                                 : Value(sum));
+        } else {
+          elements.push_back(Value(ew_int_sum_[i]));
+        }
+      }
+      const std::string elem_type =
+          is_avg ? "DOUBLE" : mapped_elem_type(ew_input_elem_type_);
+      return Value::Array(std::move(elements), elem_type);
     }
     case AggregationType::kHllMerge:
       if (sketch_type_ == 0) {
@@ -2147,18 +2022,6 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(FormatCivilTime(utc_ct) + "+00");
     }
     return Value(FormatCivilTime(res_ct));
-  }
-  // IF() must evaluate only the taken branch: untaken branches are not
-  // allowed to raise errors (division by zero, empty subquery failures).
-  if (name == "if") {
-    if (call.Args().size() != 3) {
-      throw std::runtime_error("IF requires 3 arguments");
-    }
-    const Value condition =
-        Evaluate(call.Args()[0], scope, aggregates, context, ctes);
-    const bool take_then = !condition.IsNull() && Truthy(condition);
-    return Evaluate(call.Args()[take_then ? 1 : 2], scope, aggregates,
-                    context, ctes);
   }
   std::vector<Value> arguments;
   for (const Expression& argument : call.Args()) {
@@ -6560,29 +6423,6 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       }
       auto& row_source = const_cast<Relation&>(*relation);
       const bool as_struct = value.Query()->AsStruct();
-      const Schema& subquery_schema = relation->schema;
-      if (value.ArrayResult()) {
-        // ARRAY(SELECT ...): every projected row becomes one array element.
-        std::vector<Value> elements;
-        elements.reserve(relation->TotalRows());
-        row_source.ForEachRow([&](const Row& row) {
-          elements.push_back(
-              ProjectSubqueryRow(row, as_struct, &subquery_schema));
-        });
-        std::string element_type;
-        for (const Value& element : elements) {
-          if (!element.IsNull()) {
-            element_type = ElementSqlTypeName(element.type);
-            if (element.IsArray()) {
-              element_type =
-                  "ARRAY<" + element.ArrayElementSqlType() + ">";
-            }
-            break;
-          }
-        }
-        return Value::Array(std::move(elements),
-                            element_type.empty() ? "INT64" : element_type);
-      }
       if (value.Exists()) {
         const bool exists = relation->TotalRows() > 0;
         return Value(value.Negated() ? !exists : exists);
@@ -6594,7 +6434,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
           std::vector<Value> candidates;
           candidates.reserve(relation->TotalRows());
           row_source.ForEachRow([&](const Row& row) {
-            candidates.push_back(ProjectSubqueryRow(row, as_struct, &subquery_schema));
+            candidates.push_back(ProjectSubqueryRow(row, as_struct));
           });
           return EvaluateQuantifiedComparison(value.Op(), value.Mode(), test,
                                               candidates);
@@ -6615,7 +6455,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
           if (inserted) {
             cached->second.reserve(relation->TotalRows());
             row_source.ForEachRow([&](const Row& row) {
-              const Value projected = ProjectSubqueryRow(row, as_struct, &subquery_schema);
+              const Value projected = ProjectSubqueryRow(row, as_struct);
               if (collation_conflict(projected)) {
                 throw std::runtime_error(
                     "Collation conflict between the IN "
@@ -6636,8 +6476,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
             // relation may contain NULLs that turn the miss into UNKNOWN.
             row_source.ForEachRow([&](const Row& row) {
               if (!row.values_.empty() &&
-                  ProjectSubqueryRow(row, as_struct, &subquery_schema)
-                      .IsNull()) {
+                  ProjectSubqueryRow(row, as_struct).IsNull()) {
                 saw_null = true;
               }
             });
@@ -6647,8 +6486,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
             if (found || row.values_.empty()) {
               return;
             }
-            const Value projected =
-                ProjectSubqueryRow(row, as_struct, &subquery_schema);
+            const Value projected = ProjectSubqueryRow(row, as_struct);
             if (collation_conflict(projected)) {
               throw std::runtime_error(
                   "Collation conflict between the IN "
@@ -6677,7 +6515,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       if (!first || first->values_.empty()) {
         return {};
       }
-      return ProjectSubqueryRow(*first, as_struct, &subquery_schema);
+      return ProjectSubqueryRow(*first, as_struct);
     }
     case TypeTag::kIntervalExp:
       return expression->Evaluate(Row(), Schema());
@@ -6735,10 +6573,6 @@ void CollectStatementColumns(  // NOLINT(misc-no-recursion)
   }
   for (const SelectSource& source : statement.Sources()) {
     CollectExpressionColumns(source.join_condition, columns);
-    // Implicit-unnest FROM paths (`FROM t.array_val`) reference columns of
-    // enclosing scopes; without this the projected scan of the outer table
-    // would drop the array column before the subquery reads it.
-    CollectExpressionColumns(source.unnest, columns);
     if (source.query) {
       CollectStatementColumns(*source.query, columns);
     }
@@ -6763,30 +6597,17 @@ std::vector<slot_t> RequiredColumns(const SelectStatement& statement,
                   });
   std::unordered_set<ColumnName> referenced;
   CollectStatementColumns(statement, &referenced);
-  // Dotted nested-field references (`t.Info.str_value`) resolve through a
-  // chain that starts at the struct/struct-array column (`t.Info`); make sure
-  // those base columns survive projection.
-  std::unordered_set<ColumnName> bases = referenced;
-  for (const ColumnName& name : referenced) {
-    std::string prefix = name.name;
-    size_t dot = prefix.rfind('.');
-    while (dot != std::string::npos) {
-      prefix.resize(dot);
-      bases.insert(ColumnName(name.schema, prefix));
-      dot = prefix.rfind('.');
-    }
-  }
   std::vector<slot_t> result;
   result.reserve(schema.ColumnCount());
   for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
     const ColumnName& candidate = schema.GetColumn(i).Name();
-    // Match on bare column name only: references may qualify this relation by
-    // table name or by any alias, while stored schemas qualify columns by the
-    // physical table name.  Over-projecting a scan is harmless; dropping a
-    // column that some scope reference needs breaks evaluation.
     const bool needed =
-        selects_star || std::ranges::any_of(bases, [&](const auto& name) {
-          return name.name != "*" && name.name == candidate.name;
+        selects_star || std::ranges::any_of(referenced, [&](const auto& name) {
+          if (name.name == "*") {
+            return false;
+          }
+          return name.name == candidate.name &&
+                 (name.schema.empty() || name.schema == candidate.schema);
         });
     if (needed) {
       result.push_back(i);

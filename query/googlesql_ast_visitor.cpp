@@ -507,8 +507,9 @@ bool NeedsRelationalEvaluation(const Expression& expression,  // NOLINT(misc-no-
       // Statistical / sketching aggregates are only implemented by the
       // relational interpreter's accumulator; keep them off the physical
       // aggregation operators at any nesting depth.
-      if (IsExtendedAggregate(aggregate.GetType())) { return true;
-}
+      if (IsExtendedAggregate(aggregate.GetType())) {
+        return true;
+      }
       return !top_level || NeedsRelationalEvaluation(aggregate.Child());
     }
     case TypeTag::kBinaryExp:
@@ -766,17 +767,42 @@ Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recu
     } else if (IsExtendedAggregate(type) && arguments.size() > 1) {
       aggregate->SetTrailingArgs({arguments.begin() + 1, arguments.end()});
     }
+    // APPROX_TOP_COUNT(value, number) / APPROX_TOP_SUM(value, weight,
+    // number): the trailing arguments ride along as per-row extras.
+    if (type == AggregationType::kApproxTopCount ||
+        type == AggregationType::kApproxTopSum) {
+      std::vector<Expression> extras;
+      for (size_t i = 1; i < arguments.size(); ++i) {
+        extras.push_back(arguments[i]);
+      }
+      aggregate->SetExtraArgs(std::move(extras));
+    }
     return aggregate;
   };
 
   if (name == "count" || name == "sum" || name == "avg" || name == "min" ||
       name == "max" || name == "logical_and" || name == "logical_or" ||
-      name == "array_agg" || name == "string_agg" || name == "countif") {
-    if ((name == "count" || name == "sum" || name == "avg" ||
-         name == "min" || name == "max" || name == "logical_and" ||
-         name == "logical_or" || name == "array_agg" ||
-         name == "countif") &&
-        arguments.size() != 1 && !(name == "count" && !arguments.empty())) {
+      name == "array_agg" || name == "string_agg" || name == "countif" ||
+      name == "bit_and" || name == "bit_or" || name == "bit_xor" ||
+      name == "array_concat_agg" || name == "elementwise_sum" ||
+      name == "elementwise_avg" || name == "any_value" ||
+      name == "approx_top_count" || name == "approx_top_sum") {
+    const bool is_bit = name == "bit_and" || name == "bit_or" ||
+                        name == "bit_xor";
+    const bool is_approx_top =
+        name == "approx_top_count" || name == "approx_top_sum";
+    const size_t approx_arity = name == "approx_top_count" ? 2 : 3;
+    // STRING_AGG accepts 1 or 2 arguments and is exempt from the strict
+    // single-argument aggregate arity check.
+    const bool arity_checked =
+        !is_bit && !is_approx_top && name != "string_agg";
+    const bool arity_ok =
+        !arity_checked ||
+        (name == "count" && !arguments.empty()) ||
+        arguments.size() == 1 ||
+        (is_bit && arguments.size() == 2) ||
+        (is_approx_top && arguments.size() == approx_arity);
+    if (!arity_ok) {
       throw std::runtime_error("GoogleSQL AST: aggregate arity");
     }
     AggregationType type = AggregationType::kCount;
@@ -789,6 +815,17 @@ Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recu
     if (name == "array_agg") { type = AggregationType::kArrayAgg; }
     if (name == "string_agg") { type = AggregationType::kStringAgg; }
     if (name == "countif") { type = AggregationType::kCountIf; }
+    // ANY_VALUE may legally return any non-NULL group value; MIN provides
+    // that with deterministic streaming semantics.
+    if (name == "any_value") { type = AggregationType::kMin; }
+    if (name == "bit_and") { type = AggregationType::kBitAnd; }
+    if (name == "bit_or") { type = AggregationType::kBitOr; }
+    if (name == "bit_xor") { type = AggregationType::kBitXor; }
+    if (name == "array_concat_agg") { type = AggregationType::kArrayConcatAgg; }
+    if (name == "elementwise_sum") { type = AggregationType::kElementwiseSum; }
+    if (name == "elementwise_avg") { type = AggregationType::kElementwiseAvg; }
+    if (name == "approx_top_count") { type = AggregationType::kApproxTopCount; }
+    if (name == "approx_top_sum") { type = AggregationType::kApproxTopSum; }
     return finish_aggregate(type);
   }
 
@@ -1137,6 +1174,94 @@ Expression VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
 }
 
 
+// Normalizes a TIMESTAMP string to UTC ("...+00"), interpreting an explicit
+// offset / UTC marker when present and the session default time zone
+// otherwise.  Shared by TIMESTAMP literals and typed array elements.
+std::string NormalizeTimestampText(const std::string& text) {
+  std::string norm_ts = text;
+  if (text.size() < 10) { return norm_ts; }
+  size_t tz_pos = std::string::npos;
+  for (size_t i = 10; i < text.size(); ++i) {
+    if (text[i] == '+' || text[i] == '-') {
+      tz_pos = i;
+      break;
+    }
+  }
+  int total_offset_mins = 0;
+  bool has_explicit_tz = false;
+  if (text.find("UTC") != std::string::npos || text.find("utc") != std::string::npos ||
+      text.find('Z') != std::string::npos || text.find('z') != std::string::npos) {
+    total_offset_mins = 0;
+    has_explicit_tz = true;
+  }
+  std::string base_time = text;
+  if (tz_pos != std::string::npos) {
+    has_explicit_tz = true;
+    base_time = text.substr(0, tz_pos);
+    char sign = text[tz_pos];
+    std::string tz_part = text.substr(tz_pos + 1);
+    int tz_hours = 0, tz_mins = 0;
+    size_t colon = tz_part.find(':');
+    if (colon != std::string::npos) {
+      try {
+        tz_hours = std::stoi(tz_part.substr(0, colon));
+        tz_mins = std::stoi(tz_part.substr(colon + 1));
+      } catch (...) {}
+    } else {
+      try { tz_hours = std::stoi(tz_part); } catch (...) {}
+    }
+    total_offset_mins = (tz_hours * 60 + tz_mins) * (sign == '-' ? -1 : 1);
+  }
+  bool is_leap_sec = false;
+  if (base_time.find(":59:60") != std::string::npos) {
+    is_leap_sec = true;
+    size_t pos = base_time.find(":59:60");
+    base_time.replace(pos, 6, ":59:00");
+  }
+  int Y = 0, M = 0, D = 0, h = 0, m = 0;
+  double s_val = 0;
+  int matched = sscanf(base_time.c_str(), "%d-%d-%d %d:%d:%lf", &Y, &M, &D, &h, &m, &s_val);
+  if (matched < 3) {
+    matched = sscanf(base_time.c_str(), "%d-%d-%d", &Y, &M, &D);
+  }
+  if (matched < 3) { return norm_ts; }
+  if (is_leap_sec) { m += 1; s_val = 0.0; }
+  if (!has_explicit_tz) {
+    total_offset_mins =
+        ParseTimeZoneOffset(GetDefaultTimeZone(), Y, M, D, h, m,
+                            static_cast<int>(s_val), -8 * 3600) / 60;
+  }
+  struct tm t = {};
+  t.tm_year = Y - 1900;
+  t.tm_mon = M - 1;
+  t.tm_mday = D;
+  t.tm_hour = h;
+  t.tm_min = m - total_offset_mins;
+  t.tm_sec = static_cast<int>(s_val);
+  t.tm_isdst = 0;
+  time_t epoch = timegm(&t);
+  struct tm utc = {};
+  gmtime_r(&epoch, &utc);
+  char buf[64];
+  size_t dot_pos = text.find('.');
+  if (dot_pos != std::string::npos) {
+    size_t end_digit = dot_pos + 1;
+    while (end_digit < text.size() && text[end_digit] >= '0' &&
+           text[end_digit] <= '9') {
+      ++end_digit;
+    }
+    std::string frac_str = text.substr(dot_pos, end_digit - dot_pos);
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d%s+00",
+             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+             utc.tm_hour, utc.tm_min, utc.tm_sec, frac_str.c_str());
+  } else {
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d+00",
+             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+             utc.tm_hour, utc.tm_min, utc.tm_sec);
+  }
+  return std::string(buf);
+}
+
 Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recursion) // Recursive AST descent by design; stack overflow guarded via ExpressionDepthGuard.
   const ExpressionDepthGuard depth_guard;
   if (node.kind == "PathExpression") {
@@ -1194,88 +1319,7 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
       return ConstantValueExp(Value(std::string(text)));
     }
     // TYPE_TIMESTAMP
-    std::string norm_ts = text;
-    if (text.size() >= 10) {
-      size_t tz_pos = std::string::npos;
-      for (size_t i = 10; i < text.size(); ++i) {
-        if (text[i] == '+' || text[i] == '-') {
-          tz_pos = i;
-          break;
-        }
-      }
-      int total_offset_mins = 0;
-      bool has_explicit_tz = false;
-      if (text.find("UTC") != std::string::npos || text.find("utc") != std::string::npos ||
-          text.find('Z') != std::string::npos || text.find('z') != std::string::npos) {
-        total_offset_mins = 0;
-        has_explicit_tz = true;
-      }
-      std::string base_time = text;
-      if (tz_pos != std::string::npos) {
-        has_explicit_tz = true;
-        base_time = text.substr(0, tz_pos);
-        char sign = text[tz_pos];
-        std::string tz_part = text.substr(tz_pos + 1);
-        int tz_hours = 0, tz_mins = 0;
-        size_t colon = tz_part.find(':');
-        if (colon != std::string::npos) {
-          try {
-            tz_hours = std::stoi(tz_part.substr(0, colon));
-            tz_mins = std::stoi(tz_part.substr(colon + 1));
-          } catch (...) {}
-        } else {
-          try { tz_hours = std::stoi(tz_part); } catch (...) {}
-        }
-        total_offset_mins = (tz_hours * 60 + tz_mins) * (sign == '-' ? -1 : 1);
-      }
-      bool is_leap_sec = false;
-      if (base_time.find(":59:60") != std::string::npos) {
-        is_leap_sec = true;
-        size_t pos = base_time.find(":59:60");
-        base_time.replace(pos, 6, ":59:00");
-      }
-      int Y = 0, M = 0, D = 0, h = 0, m = 0;
-      double s = 0;
-      int matched = sscanf(base_time.c_str(), "%d-%d-%d %d:%d:%lf", &Y, &M, &D, &h, &m, &s);
-      if (matched < 3) {
-        matched = sscanf(base_time.c_str(), "%d-%d-%d", &Y, &M, &D);
-      }
-      if (matched >= 3) {
-        if (is_leap_sec) { m += 1; s = 0.0; }
-        if (!has_explicit_tz) {
-          total_offset_mins = ParseTimeZoneOffset(GetDefaultTimeZone(), Y, M, D, h, m, static_cast<int>(s), -8 * 3600) / 60;
-        }
-        struct tm t = {};
-        t.tm_year = Y - 1900;
-        t.tm_mon = M - 1;
-        t.tm_mday = D;
-        t.tm_hour = h;
-        t.tm_min = m - total_offset_mins;
-        t.tm_sec = static_cast<int>(s);
-        t.tm_isdst = 0;
-        time_t epoch = timegm(&t);
-        struct tm utc = {};
-        gmtime_r(&epoch, &utc);
-        char buf[64];
-        size_t dot_pos = text.find('.');
-        if (dot_pos != std::string::npos) {
-          size_t end_digit = dot_pos + 1;
-          while (end_digit < text.size() && text[end_digit] >= '0' && text[end_digit] <= '9') {
-            ++end_digit;
-          }
-          std::string frac_str = text.substr(dot_pos, end_digit - dot_pos);
-          snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d%s+00",
-                   utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-                   utc.tm_hour, utc.tm_min, utc.tm_sec, frac_str.c_str());
-        } else {
-          snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d+00",
-                   utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-                   utc.tm_hour, utc.tm_min, utc.tm_sec);
-        }
-        norm_ts = buf;
-      }
-    }
-    return ConstantValueExp(Value(std::move(norm_ts)));
+    return ConstantValueExp(Value(NormalizeTimestampText(text)));
   }
 
 
@@ -1302,6 +1346,14 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
             break;
           }
         }
+        continue;
+      }
+      // Typed TIMESTAMP arrays normalize string elements to UTC, mirroring
+      // standalone TIMESTAMP literal handling.
+      if (UpperCopy(element_type) == "TIMESTAMP" &&
+          child->kind == "StringLiteral") {
+        elements.push_back(ConstantValueExp(
+            Value(NormalizeTimestampText(DecodeString(*child)))));
         continue;
       }
       elements.push_back(VisitExpression(*child));
@@ -1613,7 +1665,7 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     const GoogleSqlAstNode* query = node.Child("Query");
     if (query == nullptr) {
       throw std::runtime_error("GoogleSQL AST: subquery without query");
-}
+    }
     // ARRAY(SELECT ...): the subquery result is consumed as one array value.
     if (node.detail == "modifier=ARRAY") {
       auto array_query = std::make_shared<QueryExpression>(

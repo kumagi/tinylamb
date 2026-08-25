@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -29,10 +30,15 @@
 #include "executor/query_memory.hpp"
 #include "executor/spill_file.hpp"
 #include "expression/aggregate_expression.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
+#include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
+#include "expression/unary_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "query/statement.hpp"
 #include "table/full_scan_iterator.hpp"
@@ -46,6 +52,87 @@
 namespace tinylamb::relational_detail {
 
 namespace {
+
+// HAVING may reference select-list aliases (`HAVING double_avg > 0.7`).
+// Alias references that are not real input columns are rewritten to the
+// aliased expression so aggregate aliases resolve during grouping.
+Expression InlineHavingAliases(const SelectStatement& statement,
+                               const Schema& schema) {
+  const Expression& having = statement.Having();
+  if (!having) { return having; }
+  std::unordered_map<std::string, Expression> aliases;
+  for (const NamedExpression& projection : statement.SelectList()) {
+    if (!projection.name.empty() && projection.name != "*") {
+      aliases.emplace(projection.name, projection.expression);
+    }
+  }
+  if (aliases.empty()) { return having; }
+  auto schema_has_column = [&schema](std::string_view name) {
+    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+      if (name == schema.GetColumn(i).Name().name) { return true; }
+    }
+    return false;
+  };
+  std::function<Expression(const Expression&)> walk =
+      [&](const Expression& expression) -> Expression {  // NOLINT(misc-no-recursion)
+    if (!expression) { return expression; }
+    switch (expression->Type()) {
+      case TypeTag::kColumnValue: {
+        const ColumnName& name =
+            expression->AsColumnValue().GetColumnName();
+        if (!name.schema.empty() || schema_has_column(name.name)) {
+          return expression;
+        }
+        const auto found = aliases.find(name.name);
+        return found != aliases.end() ? found->second : expression;
+      }
+      case TypeTag::kBinaryExp:
+        return BinaryExpressionExp(
+            walk(expression->AsBinaryExpression().Left()),
+            expression->AsBinaryExpression().Op(),
+            walk(expression->AsBinaryExpression().Right()));
+      case TypeTag::kUnaryExp:
+        return UnaryExpressionExp(
+            walk(expression->AsUnaryExpression().Child()),
+            expression->AsUnaryExpression().Op());
+      case TypeTag::kCaseExp: {
+        const auto& value = expression->AsCaseExpression();
+        std::vector<std::pair<Expression, Expression>> clauses;
+        clauses.reserve(value.when_clauses_.size());
+        for (const auto& [condition, result] : value.when_clauses_) {
+          clauses.emplace_back(walk(condition), walk(result));
+        }
+        return CaseExpressionExp(std::move(clauses),
+                                 walk(value.else_clause_));
+      }
+      case TypeTag::kInExp: {
+        const auto& value = expression->AsInExpression();
+        std::vector<Expression> items;
+        items.reserve(value.list_.size());
+        for (const Expression& item : value.list_) {
+          items.push_back(walk(item));
+        }
+        return InExpressionExp(walk(value.child_), std::move(items));
+      }
+      case TypeTag::kFunctionCallExp:
+        return FunctionCallExp(
+            expression->AsFunctionCallExpression().FuncName(), [&] {
+              std::vector<Expression> out;
+              out.reserve(
+                  expression->AsFunctionCallExpression().Args().size());
+              for (const Expression& argument :
+                   expression->AsFunctionCallExpression().Args()) {
+                out.push_back(walk(argument));
+              }
+              return out;
+            }());
+      default:
+        // Aggregates, subqueries and casts keep their own scope.
+        return expression;
+    }
+  };
+  return walk(having);
+}
 
 Relation Project(TransactionContext& context, const SelectStatement& statement,
                  Relation input, const Scope* outer, const CteMap& ctes,
@@ -69,14 +156,16 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
                     return ContainsAggregate(projection.expression);
                   }) ||
       ContainsAggregate(statement.Having());
+  const Expression having_expr =
+      grouped ? InlineHavingAliases(statement, input.schema)
+              : statement.Having();
   std::vector<const AggregateExpression*> aggregate_expressions;
   std::unordered_set<const AggregateExpression*> seen_aggregates;
   for (const NamedExpression& projection : statement.SelectList()) {
     CollectAggregates(projection.expression, &aggregate_expressions,
                       &seen_aggregates);
   }
-  CollectAggregates(statement.Having(), &aggregate_expressions,
-                    &seen_aggregates);
+  CollectAggregates(having_expr, &aggregate_expressions, &seen_aggregates);
 
   struct GroupState {
     Row representative;
@@ -127,8 +216,11 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
         input.order_keys.push_back(
             Evaluate(term.expression, scope, nullptr, context, ctes));
       }
-      if (aggregate.GetType() == AggregationType::kStringAgg &&
-          aggregate.SecondaryArg()) {
+      for (const Expression& extra : aggregate.ExtraArgs()) {
+        input.order_keys.push_back(
+            Evaluate(extra, scope, nullptr, context, ctes));
+      }
+      if (aggregate.SecondaryArg()) {
         input.auxiliary =
             Evaluate(aggregate.SecondaryArg(), scope, nullptr, context, ctes);
       }
@@ -280,8 +372,8 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
                   const AggregateResultMap* aggregates) {
     Scope scope{
         .row = &representative, .schema = &input.schema, .outer = outer};
-    if (statement.Having() && !Truthy(Evaluate(statement.Having(), scope,
-                                               aggregates, context, ctes))) {
+    if (having_expr &&
+        !Truthy(Evaluate(having_expr, scope, aggregates, context, ctes))) {
       return;
     }
     std::vector<Value> values;
@@ -629,14 +721,14 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     input.schema = qualified_schema;
     // Project aggregates against the qualified schema; feed rows one at a time
     // without retaining them in input.rows.
+    const Expression having_expr = InlineHavingAliases(statement, input.schema);
     std::vector<const AggregateExpression*> aggregate_expressions;
     std::unordered_set<const AggregateExpression*> seen_aggregates;
     for (const NamedExpression& projection_item : stmt.SelectList()) {
       CollectAggregates(projection_item.expression, &aggregate_expressions,
                         &seen_aggregates);
     }
-    CollectAggregates(stmt.Having(), &aggregate_expressions,
-                      &seen_aggregates);
+    CollectAggregates(having_expr, &aggregate_expressions, &seen_aggregates);
 
     struct GroupState {
       Row representative;
@@ -890,9 +982,9 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       Scope scope{.row = &group.representative,
                   .schema = &input.schema,
                   .outer = outer};
-      if (stmt.Having() &&
-          !Truthy(Evaluate(stmt.Having(), scope, &aggregate_results,
-                           context, ctes))) {
+      if (having_expr &&
+          !Truthy(Evaluate(having_expr, scope, &aggregate_results, context,
+                           ctes))) {
         continue;
       }
       std::vector<Value> values;
