@@ -52,7 +52,31 @@ enum class AggregationType : int {
   kArrayAgg,
   kStringAgg,
   kCountIf,
+  // Statistical aggregates (long-double accumulation).
+  kAnyValue,
+  kVarSamp,
+  kVarPop,
+  kStddevSamp,
+  kStddevPop,
+  kCovarSamp,
+  kCovarPop,
+  kCorr,
+  // Approximate / sketching aggregates.
+  kApproxQuantiles,
+  kApproxTopCount,
+  kApproxTopSum,
+  kHllInit,
+  kHllMerge,
+  kHllMergePartial,
+  kKllInitInt64,
+  kKllInitUint64,
+  kKllInitDouble,
+  kKllMergePartial,
 };
+
+bool IsStatisticalAggregate(AggregationType type);
+bool IsSketchAggregate(AggregationType type);
+bool IsExtendedAggregate(AggregationType type);
 
 std::string ToString(AggregationType type);
 inline std::ostream& operator<<(std::ostream& o, const AggregationType& at) {

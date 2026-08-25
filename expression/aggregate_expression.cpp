@@ -41,6 +41,9 @@ std::unordered_set<ColumnName> AggregateExpression::TouchedColumns() const {
   for (const auto& term : inner_order_by_) {
     columns.merge(term.expression->TouchedColumns());
   }
+  for (const Expression& argument : trailing_args_) {
+    if (argument) { columns.merge(argument->TouchedColumns()); }
+  }
   return columns;
 }
 
@@ -54,8 +57,12 @@ Type AggregateExpression::ResultType(const Schema& schema) const {
   if (type_ == AggregationType::kCount) {
     return {TypeTag::kBigInt};
   }
-  if (type_ == AggregationType::kAvg) {
+  if (type_ == AggregationType::kAvg || IsStatisticalAggregate(type_) ||
+      type_ == AggregationType::kHllMerge) {
     return {TypeTag::kDouble};
+  }
+  if (IsSketchAggregate(type_)) {
+    return {TypeTag::kVarChar};
   }
   return child_->ResultType(schema);
 }
@@ -65,8 +72,12 @@ Type AggregateExpression::ResultType(const Schema& left,
   if (type_ == AggregationType::kCount) {
     return {TypeTag::kBigInt};
   }
-  if (type_ == AggregationType::kAvg) {
+  if (type_ == AggregationType::kAvg || IsStatisticalAggregate(type_) ||
+      type_ == AggregationType::kHllMerge) {
     return {TypeTag::kDouble};
+  }
+  if (IsSketchAggregate(type_)) {
+    return {TypeTag::kVarChar};
   }
   return child_->ResultType(left, right);
 }
@@ -74,6 +85,9 @@ Type AggregateExpression::ResultType(const Schema& left,
 std::string AggregateExpression::ToString() const {
   std::string out = ::tinylamb::ToString(type_) + "(" +
                     (distinct_ ? "DISTINCT " : "") + child_->ToString();
+  for (const Expression& argument : trailing_args_) {
+    if (argument) { out += ", " + argument->ToString(); }
+  }
   if (having_ != AggregateHavingModifier::kNone && having_cond_) {
     out += having_ == AggregateHavingModifier::kMax ? " HAVING MAX "
                                                     : " HAVING MIN ";

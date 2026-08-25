@@ -70,15 +70,26 @@ class AggregateExpression : public ExpressionBase {
     return secondary_arg_;
   }
   void SetSecondaryArg(Expression arg) { secondary_arg_ = std::move(arg); }
+  // Trailing arguments of multi-argument aggregates (COVAR(y, x),
+  // APPROX_QUANTILES(x, n), APPROX_TOP_SUM(x, w, k), HLL_COUNT.INIT(x, p));
+  // evaluated per row and handed to the accumulator.
+  [[nodiscard]] const std::vector<Expression>& TrailingArgs() const {
+    return trailing_args_;
+  }
+  void SetTrailingArgs(std::vector<Expression> args) {
+    trailing_args_ = std::move(args);
+  }
   // Row-level pre-filter: `AGG(x WHERE cond)` skips rows where cond is not
   // true; streaming-safe, unlike the HAVING MAX/MIN modifier.
   [[nodiscard]] const Expression& WhereFilter() const { return where_filter_; }
   void SetWhereFilter(Expression filter) { where_filter_ = std::move(filter); }
   // Aggregates that cannot stream row-at-a-time: they need whole-group
-  // context for their HAVING modifier, inner ORDER BY, or LIMIT.
+  // context for their HAVING modifier, inner ORDER BY, LIMIT, or per-row
+  // trailing arguments (two-input statistics, sketch parameters).
   [[nodiscard]] bool NeedsGroupContext() const {
     return having_ != AggregateHavingModifier::kNone ||
-           !inner_order_by_.empty() || inner_limit_.has_value();
+           !inner_order_by_.empty() || inner_limit_.has_value() ||
+           !trailing_args_.empty();
   }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
@@ -93,6 +104,7 @@ class AggregateExpression : public ExpressionBase {
   std::vector<WindowOrderTerm> inner_order_by_;
   std::optional<size_t> inner_limit_;
   Expression secondary_arg_;
+  std::vector<Expression> trailing_args_;
   Expression where_filter_;
 };
 

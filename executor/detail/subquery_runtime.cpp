@@ -4,19 +4,19 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
-#include <memory>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <ratio>
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <vector>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
-#include "common/status_or.hpp"
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -37,11 +37,11 @@
 #include "expression/unary_expression.hpp"
 #include "query/statement.hpp"
 #include "table/table.hpp"
-#include "type/type.hpp"
-#include "type/schema.hpp"
-#include "type/column_name.hpp"
-#include "type/value.hpp"
 #include "type/column.hpp"
+#include "type/column_name.hpp"
+#include "type/schema.hpp"
+#include "type/type.hpp"
+#include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb::relational_detail {
@@ -211,8 +211,9 @@ Value ProjectSubqueryRow(const Row& row, bool as_struct,
   if (row.values_.size() == 1) {
     const Value& only = row.values_[0];
     // A fully-NULL single-field struct is a scalar NULL.
-    if (only.IsNull()) { return {};
-}
+    if (only.IsNull()) {
+      return {};
+    }
   }
   auto field_key = [&](size_t index) -> std::string {
     if (schema != nullptr && index < schema->ColumnCount()) {
@@ -286,8 +287,9 @@ void CountExpressionTables(  // NOLINT(misc-no-recursion)
     const Expression& expression,
     std::unordered_map<std::string, size_t>* counts,
     const std::unordered_set<std::string>& visible_ctes) {
-  if (!expression) { return;
-}
+  if (!expression) {
+    return;
+  }
   if (expression->Type() == TypeTag::kQueryExp) {
     const QueryExpression& query = expression->AsQueryExpression();
     CountStatementTablesImpl(*query.Query(), counts, visible_ctes);
@@ -345,8 +347,9 @@ void CountStatementTables(  // NOLINT(misc-no-recursion)
 bool ContainsOnlyUncorrelatedQueries(  // NOLINT(misc-no-recursion)
     TransactionContext& context, const Expression& expression,
     const CteMap& ctes) {
-  if (!expression) { return true;
-}
+  if (!expression) {
+    return true;
+  }
   if (expression->Type() == TypeTag::kQueryExp) {
     const QueryExpression& query = expression->AsQueryExpression();
     return StatementUsesOnlyScopes(context, *query.Query(), {}, ctes) &&
@@ -367,8 +370,9 @@ void EnsureReusableProjections(TransactionContext& context,
   }
   for (const std::string& table : runtime->reusable_base_relations) {
     StatusOr<std::shared_ptr<Table>> loaded = context.GetTable(table);
-    if (!loaded.HasValue()) { continue;
-}
+    if (!loaded.HasValue()) {
+      continue;
+    }
     runtime->reusable_projections[table] =
         RequiredColumns(*runtime->root_statement, loaded.Value()->GetSchema());
   }
@@ -376,9 +380,11 @@ void EnsureReusableProjections(TransactionContext& context,
 
 const std::vector<slot_t>* ReusableProjection(TransactionContext& context,
                                               std::string_view table) {
-  if (context.execution_runtime() == nullptr) { return nullptr;
-}
-  const auto found = context.execution_runtime()->reusable_projections.find(std::string(table));
+  if (context.execution_runtime() == nullptr) {
+    return nullptr;
+  }
+  const auto found = context.execution_runtime()->reusable_projections.find(
+      std::string(table));
   if (found == context.execution_runtime()->reusable_projections.end() ||
       found->second.empty()) {
     return nullptr;
@@ -397,7 +403,8 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
   }
 
   CorrelatedIndex* index = nullptr;
-  const auto cached = context.execution_runtime()->correlated_indexes.find(&statement);
+  const auto cached =
+      context.execution_runtime()->correlated_indexes.find(&statement);
   if (cached != context.execution_runtime()->correlated_indexes.end()) {
     index = cached->second.get();
   } else {
@@ -417,13 +424,15 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       }
     }
     auto has_correlated_equality = [&](const Schema& schema) {
-      if (schema.ColumnCount() == 0) { return false;
-}
+      if (schema.ColumnCount() == 0) {
+        return false;
+      }
       return std::ranges::any_of(
           SplitConjuncts(statement.WhereClause()),
           [&](const Expression& predicate) {
-            if (predicate->Type() != TypeTag::kBinaryExp) { return false;
-}
+            if (predicate->Type() != TypeTag::kBinaryExp) {
+              return false;
+            }
             const BinaryExpression& binary = predicate->AsBinaryExpression();
             if (binary.Op() != BinaryOperation::kEquals ||
                 binary.Left()->Type() != TypeTag::kColumnValue ||
@@ -455,8 +464,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
           // peek_schema already carries the alias-qualified names.
           projection = RequiredColumns(statement, peek_schema, true);
         }
-        if (projection.empty()) { projection.push_back(0);
-}
+        if (projection.empty()) {
+          projection.push_back(0);
+        }
       }
       // NOTE: table_key_filters are intentionally NOT applied here. The stash
       // is owned by the statement that derived it; applying it to correlated
@@ -474,8 +484,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     std::vector<Expression> indexed_equalities;
     for (const Expression& predicate :
          SplitConjuncts(statement.WhereClause())) {
-      if (predicate->Type() != TypeTag::kBinaryExp) { continue;
-}
+      if (predicate->Type() != TypeTag::kBinaryExp) {
+        continue;
+      }
       const BinaryExpression& binary = predicate->AsBinaryExpression();
       if (binary.Op() != BinaryOperation::kEquals ||
           binary.Left()->Type() != TypeTag::kColumnValue ||
@@ -513,10 +524,12 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     }
     for (const Expression& expression : correlated_expressions) {
       for (const ColumnName& column : expression->TouchedColumns()) {
-        if (column.name == "*") { continue;
-}
-        if (LocalColumnOffset(source.schema, column)) { continue;
-}
+        if (column.name == "*") {
+          continue;
+        }
+        if (LocalColumnOffset(source.schema, column)) {
+          continue;
+        }
         if (std::ranges::find(created->cache_outer_columns, column) ==
             created->cache_outer_columns.end()) {
           created->cache_outer_columns.push_back(column);
@@ -526,18 +539,19 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
 
     const bool aggregate_only =
         statement.GroupBy().empty() && !statement.SelectList().empty() &&
-        std::all_of(statement.SelectList().begin(), statement.SelectList().end(),
+        std::all_of(statement.SelectList().begin(),
+                    statement.SelectList().end(),
                     [](const NamedExpression& item) {
                       return ContainsAggregate(item.expression);
                     });
     std::vector<Expression> local_predicates;
     for (const Expression& predicate :
          SplitConjuncts(statement.WhereClause())) {
-      const bool indexed =
-          std::ranges::find(indexed_equalities, predicate) !=
-          indexed_equalities.end();
-      if (indexed) { continue;
-}
+      const bool indexed = std::ranges::find(indexed_equalities, predicate) !=
+                           indexed_equalities.end();
+      if (indexed) {
+        continue;
+      }
       local_predicates.push_back(predicate);
     }
 
@@ -548,17 +562,21 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     {
       bool references_outer = false;
       auto check = [&](const Expression& expression) {
-        if (!expression) { return;
-}
+        if (!expression) {
+          return;
+        }
         for (const ColumnName& column : expression->TouchedColumns()) {
-          if (column.name == "*") { continue;
-}
-          if (!LocalColumnOffset(source.schema, column)) { references_outer = true;
-}
+          if (column.name == "*") {
+            continue;
+          }
+          if (!LocalColumnOffset(source.schema, column)) {
+            references_outer = true;
+          }
         }
       };
-      for (const Expression& predicate : local_predicates) { check(predicate);
-}
+      for (const Expression& predicate : local_predicates) {
+        check(predicate);
+      }
       if (aggregate_only) {
         for (const NamedExpression& item : statement.SelectList()) {
           check(item.expression);
@@ -592,8 +610,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       const CompiledScanFilter local_filter =
           CompileScanFilter(local_predicates, source.schema);
       source.ForEachRow([&](const Row& row) {
-        if (HasNullKey(row, created->local_columns)) { return;
-}
+        if (HasNullKey(row, created->local_columns)) {
+          return;
+        }
         if (!MatchScanFilter(row, source.schema, local_filter, nullptr, context,
                              ctes)) {
           return;
@@ -614,12 +633,12 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
             group->accumulators.emplace_back(aggregate);
           }
         }
-        Scope scope{.row=&row, .schema=&source.schema, .outer=nullptr};
+        Scope scope{.row = &row, .schema = &source.schema, .outer = nullptr};
         for (size_t i = 0; i < aggregate_expressions.size(); ++i) {
           const AggregateExpression& aggregate = *aggregate_expressions[i];
           if (aggregate.WhereFilter() &&
-              !Truthy(Evaluate(aggregate.WhereFilter(), scope, nullptr,
-                               context, ctes))) {
+              !Truthy(Evaluate(aggregate.WhereFilter(), scope, nullptr, context,
+                               ctes))) {
             continue;
           }
           if (IsCountStar(aggregate)) {
@@ -640,9 +659,14 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
           }
           if (aggregate.GetType() == AggregationType::kStringAgg &&
               aggregate.SecondaryArg()) {
-            input.auxiliary =
-                Evaluate(aggregate.SecondaryArg(), scope, nullptr, context,
-                         ctes);
+            input.auxiliary = Evaluate(aggregate.SecondaryArg(), scope, nullptr,
+                                       context, ctes);
+          }
+          for (const Expression& extra : aggregate.TrailingArgs()) {
+            if (extra) {
+              input.trailing_values.push_back(
+                  Evaluate(extra, scope, nullptr, context, ctes));
+            }
           }
           group->accumulators[i].Add(std::move(input));
         }
@@ -655,7 +679,8 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                                     accumulator.Finish());
         }
         Row representative;
-        Scope scope{.row=&representative, .schema=&source.schema, .outer=nullptr};
+        Scope scope{
+            .row = &representative, .schema = &source.schema, .outer = nullptr};
         std::vector<Value> values;
         values.reserve(statement.SelectList().size());
         for (const NamedExpression& item : statement.SelectList()) {
@@ -687,10 +712,11 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       }
     } else {
       source.ForEachRow([&](const Row& row) {
-        if (HasNullKey(row, created->local_columns)) { return;
-}
+        if (HasNullKey(row, created->local_columns)) {
+          return;
+        }
         if (!local_predicates.empty()) {
-          Scope scope{.row=&row, .schema=&source.schema, .outer=nullptr};
+          Scope scope{.row = &row, .schema = &source.schema, .outer = nullptr};
           for (const Expression& predicate : local_predicates) {
             if (!Truthy(Evaluate(predicate, scope, nullptr, context, ctes))) {
               return;
@@ -707,7 +733,8 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     source.spill.reset();
     source.spill_tail_.reset();
     index = created.get();
-    context.execution_runtime()->correlated_indexes.emplace(&statement, std::move(created));
+    context.execution_runtime()->correlated_indexes.emplace(&statement,
+                                                            std::move(created));
     ++context.execution_runtime()->correlated_index_builds;
   }
 
@@ -763,12 +790,14 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
 bool ExpressionUsesOnlyScopes(  // NOLINT(misc-no-recursion)
     TransactionContext& context, const Expression& expression,
     const std::vector<Relation>& sources, const CteMap& ctes) {
-  if (!expression) { return true;
-}
+  if (!expression) {
+    return true;
+  }
   if (expression->Type() == TypeTag::kColumnValue) {
     const ColumnName& column = expression->AsColumnValue().GetColumnName();
-    if (column.name == "*") { return true;
-}
+    if (column.name == "*") {
+      return true;
+    }
     return std::ranges::any_of(sources, [&](const Relation& source) {
       return LocalColumnOffset(source.schema, column).has_value();
     });
@@ -796,15 +825,18 @@ bool StatementUsesOnlyScopes(  // NOLINT(misc-no-recursion)
     scopes.push_back(std::move(metadata));
   }
   for (const SelectSource& source : statement.Sources()) {
-    if (source.query || source.unnest) { return false; }
+    if (source.query || source.unnest) {
+      return false;
+    }
     Relation metadata;
 
     if (const auto cte = ctes.find(source.table); cte != ctes.end()) {
       metadata.schema = cte->second->schema;
     } else {
       StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
-      if (!table.HasValue()) { return false;
-}
+      if (!table.HasValue()) {
+        return false;
+      }
       metadata.schema = table.Value()->GetSchema();
     }
     const std::string qualifier =
@@ -824,14 +856,17 @@ bool StatementUsesOnlyScopes(  // NOLINT(misc-no-recursion)
   }
   expressions.insert(expressions.end(), statement.GroupBy().begin(),
                      statement.GroupBy().end());
-  if (statement.Having()) { expressions.push_back(statement.Having());
-}
+  if (statement.Having()) {
+    expressions.push_back(statement.Having());
+  }
   for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
     expressions.push_back(term.expression);
   }
-  return std::ranges::all_of(expressions, [&](const Expression& expression) {  // NOLINT(misc-no-recursion)
-    return ExpressionUsesOnlyScopes(context, expression, scopes, ctes);
-  });
+  return std::ranges::all_of(
+      expressions,
+      [&](const Expression& expression) {  // NOLINT(misc-no-recursion)
+        return ExpressionUsesOnlyScopes(context, expression, scopes, ctes);
+      });
 }
 
 bool ExpressionsAreLocal(TransactionContext& context,
@@ -844,8 +879,9 @@ bool ExpressionsAreLocal(TransactionContext& context,
   }
   expressions.insert(expressions.end(), statement.GroupBy().begin(),
                      statement.GroupBy().end());
-  if (statement.Having()) { expressions.push_back(statement.Having());
-}
+  if (statement.Having()) {
+    expressions.push_back(statement.Having());
+  }
   for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
     expressions.push_back(term.expression);
   }
@@ -861,8 +897,9 @@ bool ExpressionsAreLocal(TransactionContext& context,
           break;
         }
       }
-      if (!found) { return false;
-}
+      if (!found) {
+        return false;
+      }
     }
   }
   return true;
@@ -875,7 +912,8 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
       context.execution_runtime()->noncacheable_queries.contains(&statement)) {
     return nullptr;
   }
-  const auto cached = context.execution_runtime()->uncorrelated_results.find(&statement);
+  const auto cached =
+      context.execution_runtime()->uncorrelated_results.find(&statement);
   if (cached != context.execution_runtime()->uncorrelated_results.end()) {
     ++context.execution_runtime()->uncorrelated_cache_hits;
     return cached->second.get();
@@ -901,7 +939,8 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
           return nullptr;
         }
         std::string col_name = ProjectionName(projection, i);
-        if (source.query->SelectList().size() == 1 && !source.alias.empty() && projection.name.empty()) {
+        if (source.query->SelectList().size() == 1 && !source.alias.empty() &&
+            projection.name.empty()) {
           col_name = source.alias;
         }
         columns.emplace_back(std::move(col_name), ValueType::kNull);
@@ -915,6 +954,15 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
         columns.emplace_back(source.offset_alias, ValueType::kInt64);
       }
       metadata.schema = Schema("", std::move(columns));
+      // The array expression itself must be resolvable from the local scope:
+      // cached execution runs without an outer scope, so an UNNEST over an
+      // outer column (UNNEST(outer.a) WITH OFFSET) is correlated.
+      for (const ColumnName& column : source.unnest->TouchedColumns()) {
+        if (!LocalColumnOffset(metadata.schema, column)) {
+          context.execution_runtime()->noncacheable_queries.insert(&statement);
+          return nullptr;
+        }
+      }
     } else if (const auto cte = ctes.find(source.table); cte != ctes.end()) {
       metadata.schema = cte->second->schema;
     } else {
@@ -948,8 +996,9 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
     return nullptr;
   }
   Relation result = ExecuteQuery(context, statement, nullptr, ctes);
-  auto [iter, inserted] = context.execution_runtime()->uncorrelated_results.emplace(
-      &statement, std::make_shared<Relation>(std::move(result)));
+  auto [iter, inserted] =
+      context.execution_runtime()->uncorrelated_results.emplace(
+          &statement, std::make_shared<Relation>(std::move(result)));
   return iter->second.get();
 }
 
