@@ -32,6 +32,13 @@ class Update : public ExecutorBase {
   explicit Update(Transaction& txn, Table* target, Executor src)
       : txn_(&txn), target_(target), src_(std::move(src)) {}
 
+  Update(Transaction& txn, Table* target, Executor src,
+         int64_t assert_rows_modified)
+      : txn_(&txn),
+        target_(target),
+        src_(std::move(src)),
+        assert_rows_modified_(assert_rows_modified) {}
+
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& o, int indent) const override;
 
@@ -39,6 +46,7 @@ class Update : public ExecutorBase {
   Transaction* txn_;
   Table* target_;
   Executor src_;
+  int64_t assert_rows_modified_{-1};
   bool finished_{false};
 };
 }  // namespace tinylamb

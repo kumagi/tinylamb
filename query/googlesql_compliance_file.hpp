@@ -23,6 +23,9 @@ struct GoogleSqlComplianceCase {
   std::vector<std::vector<std::string>> expected_rows;
   bool unknown_order{false};
   std::vector<std::string> required_features;
+  // primary_key_mode option: "" (driver default), "no_primary_key", or
+  // "first_column_is_primary_key".
+  std::string primary_key_mode;
   std::vector<std::pair<std::string, std::string>> parameters;
   std::string default_time_zone;
   std::string raw_result;

@@ -301,6 +301,8 @@ class SelectStatement : public Statement {
   bool complex_{false};
 };
 
+enum class InsertMode { kDefault, kIgnore, kUpdate, kReplace };
+
 class InsertStatement : public Statement {
  public:
   InsertStatement(std::string table_name,
@@ -314,6 +316,19 @@ class InsertStatement : public Statement {
   const std::string& TableName() const { return table_name_; }
   const std::vector<std::vector<Expression>>& Values() const { return values_; }
   const std::vector<std::string>& Columns() const { return columns_; }
+  // INSERT ... SELECT: rows come from the query instead of VALUES tuples.
+  const std::shared_ptr<SelectStatement>& Query() const { return query_; }
+  void SetQuery(std::shared_ptr<SelectStatement> query) {
+    query_ = std::move(query);
+  }
+  InsertMode Mode() const { return mode_; }
+  void SetMode(InsertMode mode) { mode_ = mode; }
+  // -1 = no ASSERT_ROWS_MODIFIED clause.
+  int64_t AssertRowsModified() const { return assert_rows_modified_; }
+  void SetAssertRowsModified(int64_t expected) {
+    assert_rows_modified_ = expected;
+  }
+  bool HasAssert() const { return assert_rows_modified_ >= 0; }
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " values=[";
     for (size_t i = 0; i < values_.size(); i++) {
@@ -329,6 +344,9 @@ class InsertStatement : public Statement {
       }
       o << ")";
     }
+    if (query_) {
+      o << "query={" << *query_ << "}";
+    }
     o << "]";
   }
 
@@ -336,6 +354,9 @@ class InsertStatement : public Statement {
   std::string table_name_;
   std::vector<std::vector<Expression>> values_;
   std::vector<std::string> columns_;
+  std::shared_ptr<SelectStatement> query_;
+  InsertMode mode_{InsertMode::kDefault};
+  int64_t assert_rows_modified_{-1};
 };
 
 class UpdateStatement : public Statement {
@@ -353,6 +374,12 @@ class UpdateStatement : public Statement {
     return set_clause_;
   }
   const Expression& WhereClause() const { return where_clause_; }
+  // -1 = no ASSERT_ROWS_MODIFIED clause.
+  int64_t AssertRowsModified() const { return assert_rows_modified_; }
+  void SetAssertRowsModified(int64_t expected) {
+    assert_rows_modified_ = expected;
+  }
+  bool HasAssert() const { return assert_rows_modified_ >= 0; }
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " set=[";
     for (size_t i = 0; i < set_clause_.size(); i++) {
@@ -373,6 +400,7 @@ class UpdateStatement : public Statement {
   std::string table_name_;
   std::vector<std::pair<ColumnName, Expression>> set_clause_;
   Expression where_clause_;
+  int64_t assert_rows_modified_{-1};
 };
 
 class DeleteStatement : public Statement {
@@ -384,6 +412,12 @@ class DeleteStatement : public Statement {
 
   const std::string& TableName() const { return table_name_; }
   const Expression& WhereClause() const { return where_clause_; }
+  // -1 = no ASSERT_ROWS_MODIFIED clause.
+  int64_t AssertRowsModified() const { return assert_rows_modified_; }
+  void SetAssertRowsModified(int64_t expected) {
+    assert_rows_modified_ = expected;
+  }
+  bool HasAssert() const { return assert_rows_modified_ >= 0; }
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " where=";
     if (where_clause_) {
@@ -396,6 +430,7 @@ class DeleteStatement : public Statement {
  private:
   std::string table_name_;
   Expression where_clause_;
+  int64_t assert_rows_modified_{-1};
 };
 
 }  // namespace tinylamb

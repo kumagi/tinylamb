@@ -459,14 +459,14 @@ TEST(GoogleSqlAstTest, TripleQuotedStringDecodesEmbeddedQuote) {
             Value("'a'b'"));
 }
 
-TEST(GoogleSqlAstTest, InsertSelectWithoutValuesThrows) {
-  // INSERT ... SELECT parses into an InsertStatement with a Query child but no
-  // InsertValuesRowList; the visitor rejects it because only VALUES rows are
-  // supported.
-  const std::string message =
-      ThrowMessage([] { VisitSqlOrThrow("INSERT INTO t SELECT * FROM s;"); });
-  EXPECT_NE(message.find("INSERT VALUES required"), std::string::npos)
-      << message;
+TEST(GoogleSqlAstTest, InsertSelectMapsToQuerySource) {
+  // INSERT ... SELECT parses into an InsertStatement with a Query child; the
+  // visitor maps it to a query-backed InsertStatement instead of rejecting it.
+  auto statement = VisitSqlOrThrow("INSERT INTO t SELECT * FROM s;");
+  const auto* insert = dynamic_cast<const InsertStatement*>(statement.get());
+  ASSERT_NE(insert, nullptr);
+  EXPECT_EQ(insert->TableName(), "t");
+  EXPECT_NE(insert->Query(), nullptr);
 }
 
 TEST(GoogleSqlAstTest, TableValuedFunctionSourceThrows) {

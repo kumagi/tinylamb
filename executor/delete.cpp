@@ -31,6 +31,12 @@ bool DeleteExecutor::Next(Row* dst, RowPosition* rp) {
     }
     ++count;
   }
+  if (assert_rows_modified_ >= 0 && count != assert_rows_modified_) {
+    throw std::runtime_error("ASSERT_ROWS_MODIFIED was specified with " +
+                             std::to_string(assert_rows_modified_) +
+                             " rows, but " + std::to_string(count) +
+                             " rows were modified");
+  }
   *dst = Row({Value("Delete Rows"), Value(count)});
   if (rp != nullptr) { *rp = RowPosition();
 }

@@ -66,7 +66,17 @@ namespace {
 thread_local uint64_t tls_sql_execution_count = 0;
 thread_local bool tls_sql_runtime_profiling = false;
 thread_local SqlRuntimeStats tls_sql_runtime_stats;
+// Compliance-driver switch; production paths never enable it.
+thread_local bool compliance_primary_key_mode = false;
 }  // namespace
+
+void SqlEngine::SetCompliancePrimaryKeyMode(bool enabled) {
+  compliance_primary_key_mode = enabled;
+}
+
+bool SqlEngine::CompliancePrimaryKeyMode() {
+  return compliance_primary_key_mode;
+}
 
 bool QueryResult::Next(Row* row) { return executor_->Next(row, nullptr); }
 
@@ -543,7 +553,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     }
   }
 
-  // Parse (reusing the template cache when possible). This stage is pure:
+
   // no DDL/DML side effect may happen before the statement kind is known,
   // so EXPLAIN can reject non-SELECT statements without executing them.
   std::unique_ptr<Statement> statement;
@@ -656,10 +666,12 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
 StatusOr<Executor> SqlEngine::PrepareStatement(
     TransactionContext& ctx, std::unique_ptr<Statement> statement) {
   last_statement_type_ = statement->Type();
+
   switch (statement->Type()) {
     case StatementType::kCreateTable: {
       const auto& create =
           dynamic_cast<const CreateTableStatement&>(*statement);
+      last_dml_table_ = create.TableName();
       if (create.IsAsSelect()) {
         // Materialize through the relational engine so the star-expanded
         // output schema is available: a raw select list still holds the
@@ -708,48 +720,71 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       const auto& insert = dynamic_cast<const InsertStatement&>(*statement);
       ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
                        ctx.GetTable(insert.TableName()));
-      if (insert.Values().empty()) {
-        return Status::kUnknown;
-      }
+      last_dml_table_ = insert.TableName();
       std::vector<Row> rows;
-      rows.reserve(insert.Values().size());
-      for (const auto& values : insert.Values()) {
-        std::vector<Value> row;
-        row.reserve(values.size());
-        for (const auto& value : values) {
-          row.push_back(value->Evaluate(Row(), Schema()));
+      if (insert.Query() != nullptr) {
+        // INSERT ... SELECT: materialize the source query, then feed its
+        // rows through the same column mapping / coercion as VALUES rows.
+        plan_cache_fingerprint_.clear();
+        plan_cache_parameters_.clear();
+        relational_detail::Relation materialized =
+            relational_detail::ExecuteQuery(ctx, *insert.Query(), nullptr, {});
+        materialized.ForEachRow([&rows](Row row) { rows.push_back(std::move(row)); });
+      } else {
+        if (insert.Values().empty()) {
+          return Status::kUnknown;
         }
+        rows.reserve(insert.Values().size());
+        for (const auto& values : insert.Values()) {
+          std::vector<Value> row;
+          row.reserve(values.size());
+          for (const auto& value : values) {
+            row.push_back(value->Evaluate(Row(), Schema()));
+          }
+          rows.emplace_back(std::move(row));
+        }
+      }
+      // Column mapping and assignment coercion, shared by VALUES rows and
+      // INSERT ... SELECT rows.
+      std::vector<size_t> upsert_offsets;
+      if (!insert.Columns().empty()) {
+        std::unordered_set<std::string> seen_columns;
+        upsert_offsets.reserve(insert.Columns().size());
+        for (const std::string& column : insert.Columns()) {
+          if (!seen_columns.insert(column).second) {
+            // A duplicate target would silently overwrite the earlier
+            // value; reject it instead.
+            last_error_ = "duplicate INSERT column: " + column;
+            return Status::kUnknown;
+          }
+          const int destination =
+              table->GetSchema().Offset(ColumnName(column));
+          if (destination < 0) {
+            last_error_ = "unknown INSERT column: " + column;
+            return Status::kNotExists;
+          }
+          upsert_offsets.push_back(static_cast<size_t>(destination));
+        }
+      }
+      for (auto& row : rows) {
         if (!insert.Columns().empty()) {
-          if (insert.Columns().size() != row.size()) {
+          if (insert.Columns().size() != row.values_.size()) {
             last_error_ = "INSERT column/value count mismatch";
             return Status::kUnknown;
           }
-          std::unordered_set<std::string> seen_columns;
           std::vector<Value> reordered(table->GetSchema().ColumnCount());
           for (size_t i = 0; i < insert.Columns().size(); ++i) {
-            if (!seen_columns.insert(insert.Columns()[i]).second) {
-              // A duplicate target would silently overwrite the earlier
-              // value; reject it instead.
-              last_error_ = "duplicate INSERT column: " + insert.Columns()[i];
-              return Status::kUnknown;
-            }
-            const int destination =
-                table->GetSchema().Offset(ColumnName(insert.Columns()[i]));
-            if (destination < 0) {
-              last_error_ = "unknown INSERT column: " + insert.Columns()[i];
-              return Status::kNotExists;
-            }
-            reordered[static_cast<size_t>(destination)] = row[i];
+            reordered[upsert_offsets[i]] = row[i];
           }
-          row = std::move(reordered);
+          row = Row(std::move(reordered));
         }
-        if (row.size() != table->GetSchema().ColumnCount()) {
+        if (row.values_.size() != table->GetSchema().ColumnCount()) {
           last_error_ = "INSERT value count does not match table schema (got " +
-                        std::to_string(row.size()) + ", expected " +
+                        std::to_string(row.values_.size()) + ", expected " +
                         std::to_string(table->GetSchema().ColumnCount()) + ")";
           return Status::kUnknown;
         }
-        for (size_t i = 0; i < row.size(); ++i) {
+        for (size_t i = 0; i < row.values_.size(); ++i) {
           const ValueType expected = table->GetSchema().GetColumn(i).Type();
           if (row[i].IsNull() || row[i].type == expected) {
             continue;
@@ -768,12 +803,16 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                         table->GetSchema().GetColumn(i).Name().name;
           return Status::kUnknown;
         }
-        rows.emplace_back(std::move(row));
       }
       // Phase 2-1 fill: build the parametric INSERT artifact. Bindable
       // literals become ParameterSlot placeholders; runtime values are
       // injected per execution, so any literal combination hits.
-      if (!plan_cache_fingerprint_.empty()) {
+      // Conflict-handling inserts (modes / PK emulation / row-count asserts)
+      // always take the authoritative path so their semantics cannot be
+      // lost in a replayed shape.
+      if (!plan_cache_fingerprint_.empty() &&
+          insert.Mode() == InsertMode::kDefault && !insert.HasAssert() &&
+          !CompliancePrimaryKeyMode()) {
         auto shape = std::make_shared<CompiledPlan::InsertShape>();
         bool ok = true;
         size_t slot_cursor = 0;
@@ -818,9 +857,26 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           StoreCompiledPlan(plan_cache_fingerprint_, std::move(compiled));
         }
       }
+      InsertExecutionMode exec_mode = InsertExecutionMode::kDefault;
+      switch (insert.Mode()) {
+        case InsertMode::kDefault:
+          exec_mode = InsertExecutionMode::kDefault;
+          break;
+        case InsertMode::kIgnore:
+          exec_mode = InsertExecutionMode::kIgnore;
+          break;
+        case InsertMode::kUpdate:
+          exec_mode = InsertExecutionMode::kUpsert;
+          break;
+        case InsertMode::kReplace:
+          exec_mode = InsertExecutionMode::kReplace;
+          break;
+      }
       return Executor(std::make_shared<Insert>(
           ctx.txn_, table.get(),
-          std::make_shared<ConstantExecutor>(std::move(rows))));
+          std::make_shared<ConstantExecutor>(std::move(rows)), exec_mode,
+          CompliancePrimaryKeyMode(), upsert_offsets,
+          insert.AssertRowsModified()));
     }
     case StatementType::kSelect: {
       // Verify the concrete kind before releasing: a Type()/type mismatch
@@ -941,6 +997,48 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       }
       query.where_ = where ? where : ConstantValueExp(Value(true));
       query.select_ = select->SelectList();
+      // Expand "*" projections here so the visible output width is the
+      // expanded width; the optimizer's internal expansion would otherwise
+      // disagree with visible_columns and truncate the final projection.
+      {
+        std::vector<NamedExpression> expanded;
+        bool has_star = false;
+        for (const NamedExpression& item : query.select_) {
+          if (item.expression->Type() == TypeTag::kColumnValue) {
+            const ColumnName& column =
+                item.expression->AsColumnValue().GetColumnName();
+            if (column.name == "*") {
+              has_star = true;
+              for (const std::string& relation : query.from_) {
+                const auto aliased = query.aliases_.find(relation);
+                const std::string& physical =
+                    aliased == query.aliases_.end() ? relation
+                                                    : aliased->second;
+                if (!column.schema.empty() && column.schema != relation &&
+                    column.schema != physical) { continue;
+}
+                StatusOr<std::shared_ptr<Table>> found =
+                    ctx.GetTable(physical);
+                if (!found.HasValue()) { continue;
+}
+                for (size_t i = 0;
+                     i < found.Value()->GetSchema().ColumnCount(); ++i) {
+                  expanded.emplace_back(
+                      ColumnName(relation,
+                                 found.Value()->GetSchema()
+                                     .GetColumn(i)
+                                     .Name()
+                                     .name));
+                }
+              }
+              continue;
+            }
+          }
+          expanded.push_back(item);
+        }
+        if (has_star && !expanded.empty()) { query.select_ = std::move(expanded);
+}
+      }
       const size_t visible_columns = query.select_.size();
       std::vector<Expression> sort_expressions;
       std::vector<bool> sort_ascending;
@@ -1045,6 +1143,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       const auto& update = dynamic_cast<const UpdateStatement&>(*statement);
       ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
                        ctx.GetTable(update.TableName()));
+      last_dml_table_ = update.TableName();
       std::vector<NamedExpression> output;
       const Schema& schema = table->GetSchema();
       output.reserve(schema.ColumnCount());
@@ -1085,16 +1184,20 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       query.require_row_position_ = true;
       RETURN_IF_FAIL(query.Rewrite(ctx));
       ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
-      RememberSpecializedPlan(plan_cache_fingerprint_, database_->SchemaEpoch(),
-                              plan_cache_parameters_,
-                              CompiledPlan::Kind::kUpdate, plan, table);
-      return Executor(std::make_shared<Update>(ctx.txn_, table.get(),
-                                               plan->EmitExecutor(ctx)));
+      if (!update.HasAssert()) {
+        RememberSpecializedPlan(
+            plan_cache_fingerprint_, database_->SchemaEpoch(),
+            plan_cache_parameters_, CompiledPlan::Kind::kUpdate, plan, table);
+      }
+      return Executor(std::make_shared<Update>(
+          ctx.txn_, table.get(), plan->EmitExecutor(ctx),
+          update.AssertRowsModified()));
     }
     case StatementType::kDelete: {
       const auto& remove = dynamic_cast<const DeleteStatement&>(*statement);
       ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
                        ctx.GetTable(remove.TableName()));
+      last_dml_table_ = remove.TableName();
       std::vector<NamedExpression> output;
       const Schema& schema = table->GetSchema();
       output.reserve(schema.ColumnCount());
@@ -1110,11 +1213,14 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       query.wait_for_write_intent_ = false;
       RETURN_IF_FAIL(query.Rewrite(ctx));
       ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
-      RememberSpecializedPlan(plan_cache_fingerprint_, database_->SchemaEpoch(),
-                              plan_cache_parameters_,
-                              CompiledPlan::Kind::kDelete, plan, table);
+      if (!remove.HasAssert()) {
+        RememberSpecializedPlan(
+            plan_cache_fingerprint_, database_->SchemaEpoch(),
+            plan_cache_parameters_, CompiledPlan::Kind::kDelete, plan, table);
+      }
       return Executor(std::make_shared<DeleteExecutor>(
-          ctx.txn_, *table, plan->EmitExecutor(ctx)));
+          ctx.txn_, *table, plan->EmitExecutor(ctx),
+          remove.AssertRowsModified()));
     }
     case StatementType::kDropTable: {
       const auto& drop = dynamic_cast<const DropTableStatement&>(*statement);
@@ -1178,11 +1284,15 @@ std::optional<Executor> SqlEngine::ServeFromPlanCache(
           return std::nullopt;
         }
         last_statement_type_ = StatementType::kInsert;
+        if (compiled->insert_shape) {
+          last_dml_table_ = compiled->insert_shape->schema.Name();
+        }
         PlanCacheStats().replays.fetch_add(1, std::memory_order_relaxed);
         return RetainCompiledPlan(std::move(*served), compiled);
       }
       case CompiledPlan::Kind::kUpdate: {
         last_statement_type_ = StatementType::kUpdate;
+        last_dml_table_ = compiled->table->GetSchema().Name();
         Executor executor = std::make_shared<Update>(
             ctx.txn_, compiled->table.get(),
             compiled->plan->EmitExecutor(ctx));
@@ -1190,7 +1300,8 @@ std::optional<Executor> SqlEngine::ServeFromPlanCache(
         return RetainCompiledPlan(std::move(executor), compiled);
       }
       case CompiledPlan::Kind::kDelete: {
-        last_statement_type_ = StatementType::kDelete;
+          last_statement_type_ = StatementType::kDelete;
+        last_dml_table_ = compiled->table->GetSchema().Name();
         Executor executor = std::make_shared<DeleteExecutor>(
             ctx.txn_, *compiled->table, compiled->plan->EmitExecutor(ctx));
         PlanCacheStats().replays.fetch_add(1, std::memory_order_relaxed);

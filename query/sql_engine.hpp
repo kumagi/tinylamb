@@ -77,9 +77,22 @@ class SqlEngine {
   [[nodiscard]] const std::optional<StatementType>& LastStatementType() const {
     return last_statement_type_;
   }
+  // Target table of the most recent DDL/DML statement (INSERT target, UPDATE
+  // target, DELETE FROM target, or the created table); used by the compliance
+  // driver to inspect post-statement table state.
+  [[nodiscard]] const std::string& LastDmlTable() const {
+    return last_dml_table_;
+  }
   [[nodiscard]] const std::vector<std::string>& ResultColumnNames() const {
     return result_column_names_;
   }
+
+  // Compliance-driver hook: when enabled, INSERT statements emulate
+  // first_column_is_primary_key semantics (duplicate-key errors, and
+  // IGNORE/UPDATE/REPLACE conflict handling). Off by default; plain heap
+  // semantics otherwise.
+  static void SetCompliancePrimaryKeyMode(bool enabled);
+  [[nodiscard]] static bool CompliancePrimaryKeyMode();
 
  private:
   StatusOr<Executor> PrepareStatement(TransactionContext& ctx,
@@ -116,6 +129,7 @@ class SqlEngine {
   Database* database_;
   std::string last_error_;
   std::optional<StatementType> last_statement_type_;
+  std::string last_dml_table_;
   std::vector<std::string> result_column_names_;
   std::string plan_cache_fingerprint_;
   std::vector<Value> plan_cache_parameters_;

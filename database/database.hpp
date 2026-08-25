@@ -114,6 +114,13 @@ class Database final : public CatalogReader {
  private:
   friend class TransactionContext;
 
+  // Process-global epoch base so every Database instance owns a disjoint
+  // epoch range (see schema_epoch_ below).
+  static uint64_t next_database_epoch_base() noexcept {
+    static std::atomic<uint64_t> base{0};
+    return base.fetch_add(1ULL << 32, std::memory_order_acq_rel) + 1;
+  }
+
   // Persistent { Name => Table } storage.
   BPlusTree catalog_;
 
@@ -131,7 +138,11 @@ class Database final : public CatalogReader {
   std::mutex catalog_mu_;
 
   // Compiled-plan invalidation epoch; see SchemaEpoch()/BumpSchemaEpoch().
-  std::atomic<uint64_t> schema_epoch_{0};
+  // Starts from a process-global counter so two Database instances never
+  // share an epoch: plan caches stamp entries with the epoch and a fresh
+  // database starting at 0 would otherwise replay artifacts that reference
+  // the destroyed predecessor's tables.
+  std::atomic<uint64_t> schema_epoch_{next_database_epoch_base()};
 
   PageStorage storage_;
 };
