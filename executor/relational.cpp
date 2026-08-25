@@ -532,7 +532,23 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       throw std::runtime_error("table " + source.table + " not found");
     }
     const Schema& table_schema = table.Value()->GetSchema();
-    std::vector<slot_t> projection = RequiredColumns(statement, table_schema);
+    const std::string qualifier =
+        source.alias.empty() ? source.table : source.alias;
+    // Alias/ordinal resolution needs the qualified column names the grouping
+    // expressions see; offsets are identical in the raw table schema.
+    std::shared_ptr<SelectStatement> resolved_statement =
+        ResolveGroupingAliases(
+            statement, qualifier.empty()
+                           ? table_schema
+                           : QualifySchema(table_schema, qualifier));
+    const SelectStatement& stmt =
+        resolved_statement != nullptr ? *resolved_statement : statement;
+    // RequiredColumns must run against the qualified names the statement
+    // references (`t4.array_val`); QualifySchema preserves column order so
+    // the resulting offsets index the raw table scan unchanged.
+    const Schema qualified_table_schema =
+        qualifier.empty() ? table_schema : QualifySchema(table_schema, qualifier);
+    std::vector<slot_t> projection = RequiredColumns(stmt, qualified_table_schema);
     if (const std::vector<slot_t>* shared =
             ReusableProjection(context, source.table)) {
       projection = *shared;
@@ -540,14 +556,12 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     Schema scan_schema = projection.empty()
                              ? Schema("", std::vector<Column>{})
                              : ProjectSchema(table_schema, projection);
-    const std::string qualifier =
-        source.alias.empty() ? source.table : source.alias;
     Schema qualified_schema =
         qualifier.empty() ? scan_schema
                           : QualifySchema(scan_schema, qualifier);
 
     std::vector<Expression> scan_predicates =
-        SplitConjuncts(statement.WhereClause());
+        SplitConjuncts(stmt.WhereClause());
     CompiledScanFilter scan_filter =
         CompileScanFilter(scan_predicates, scan_schema);
 
@@ -557,11 +571,11 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     // without retaining them in input.rows.
     std::vector<const AggregateExpression*> aggregate_expressions;
     std::unordered_set<const AggregateExpression*> seen_aggregates;
-    for (const NamedExpression& projection_item : statement.SelectList()) {
+    for (const NamedExpression& projection_item : stmt.SelectList()) {
       CollectAggregates(projection_item.expression, &aggregate_expressions,
                         &seen_aggregates);
     }
-    CollectAggregates(statement.Having(), &aggregate_expressions,
+    CollectAggregates(stmt.Having(), &aggregate_expressions,
                       &seen_aggregates);
 
     struct GroupState {
@@ -573,9 +587,9 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     std::unordered_map<Row, size_t> offsets;
 
     std::vector<std::optional<slot_t>> group_offsets;
-    group_offsets.reserve(statement.GroupBy().size());
+    group_offsets.reserve(stmt.GroupBy().size());
     bool group_keys_are_columns = true;
-    for (const Expression& key : statement.GroupBy()) {
+    for (const Expression& key : stmt.GroupBy()) {
       if (key->Type() != TypeTag::kColumnValue) {
         group_keys_are_columns = false;
         group_offsets.emplace_back(std::nullopt);
@@ -612,13 +626,13 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
 }
       Scope scope{.row=&row, .schema=&input.schema, .outer=outer};
       std::vector<Value> key_values;
-      key_values.reserve(statement.GroupBy().size());
+      key_values.reserve(stmt.GroupBy().size());
       if (group_keys_are_columns) {
         for (const auto& offset : group_offsets) {
           key_values.push_back(row[*offset]);
         }
       } else {
-        for (const Expression& key : statement.GroupBy()) {
+        for (const Expression& key : stmt.GroupBy()) {
           key_values.push_back(Evaluate(key, scope, nullptr, context, ctes));
         }
       }
@@ -762,7 +776,7 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       context.execution_runtime()->filter_ms += ElapsedMs(scan_begin);
       context.execution_runtime()->aggregate_groups += groups.size();
     }
-    if (groups.empty() && statement.GroupBy().empty()) {
+    if (groups.empty() && stmt.GroupBy().empty()) {
       GroupState group;
       group.representative = Row(std::vector<Value>(input.schema.ColumnCount(), Value()));
       group.accumulator_offset = aggregate_states.size();
@@ -775,8 +789,8 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     Relation output(context.execution_runtime());
     output.schema = input.schema;
     std::vector<Column> output_columns;
-    for (size_t i = 0; i < statement.SelectList().size(); ++i) {
-      const NamedExpression& projection_item = statement.SelectList()[i];
+    for (size_t i = 0; i < stmt.SelectList().size(); ++i) {
+      const NamedExpression& projection_item = stmt.SelectList()[i];
       output_columns.emplace_back(ProjectionName(projection_item, i),
                                   ValueType::kNull);
     }
@@ -789,14 +803,14 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
             aggregate_states[group.accumulator_offset + i].Finish());
       }
       Scope scope{.row=&group.representative, .schema=&input.schema, .outer=outer};
-      if (statement.Having() &&
-          !Truthy(Evaluate(statement.Having(), scope, &aggregate_results,
+      if (stmt.Having() &&
+          !Truthy(Evaluate(stmt.Having(), scope, &aggregate_results,
                            context, ctes))) {
         continue;
       }
       std::vector<Value> values;
-      values.reserve(statement.SelectList().size());
-      for (const NamedExpression& projection_item : statement.SelectList()) {
+      values.reserve(stmt.SelectList().size());
+      for (const NamedExpression& projection_item : stmt.SelectList()) {
         values.push_back(Evaluate(projection_item.expression, scope,
                                   &aggregate_results, context, ctes));
       }
@@ -809,10 +823,10 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     output.schema = Schema("", std::move(output_columns));
     output.FinishSpill();
     // DISTINCT / ORDER BY / LIMIT without running Project again.
-    if (statement.Distinct()) {
+    if (stmt.Distinct()) {
       output = DistinctOf(std::move(output));
     }
-    if (!statement.OrderBy().empty()) {
+    if (!stmt.OrderBy().empty()) {
       ApplyOrderBy(context, statement, &output, outer, ctes);
     }
     return LimitedRows(statement, std::move(output));
@@ -825,8 +839,14 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
   size_t hidden_columns = 0;
   const SelectStatement* effective = &statement;
   std::shared_ptr<SelectStatement> windowed_statement;
-  if (HasWindowFunctions(statement)) {
-    WindowedInput windowed = ApplyWindows(context, statement,
+  std::shared_ptr<SelectStatement> resolved_statement;
+  if (!HasWindowFunctions(statement)) {
+    // Grouped queries may reference select-list aliases in GROUP BY / HAVING.
+    resolved_statement = ResolveGroupingAliases(statement, input.schema);
+    if (resolved_statement != nullptr) { effective = resolved_statement.get(); }
+  }
+  if (HasWindowFunctions(*effective)) {
+    WindowedInput windowed = ApplyWindows(context, *effective,
                                           std::move(input), outer, ctes);
     windowed_statement = windowed.statement;
     hidden_columns = windowed.hidden_columns;

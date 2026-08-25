@@ -30,6 +30,7 @@
 #include "executor/detail/expression_eval.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "query/googlesql_ast.hpp"
@@ -1241,6 +1242,17 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
       }
     }
     if (element_type.empty()) { element_type = "INT64"; }
+    // ARRAY(SELECT ...) projects the whole subquery result as one array
+    // value; a plain QueryExpression would only expose its first row.
+    if (elements.size() == 1 && elements[0]->Type() == TypeTag::kQueryExp) {
+      const QueryExpression& query = elements[0]->AsQueryExpression();
+      if (!query.Exists() && !query.Test()) {
+        auto array_query = std::make_shared<QueryExpression>(
+            query.Query(), nullptr, false, false);
+        array_query->SetArrayResult(true);
+        return Expression(array_query);
+      }
+    }
     return ArrayExpressionExp(std::move(elements), std::move(element_type));
   }
   if (node.kind == "BinaryExpression") {
@@ -1518,6 +1530,13 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     if (query == nullptr) {
       throw std::runtime_error("GoogleSQL AST: subquery without query");
 }
+    // ARRAY(SELECT ...): the subquery result is consumed as one array value.
+    if (node.detail == "modifier=ARRAY") {
+      auto array_query = std::make_shared<QueryExpression>(
+          VisitQuery(*query), nullptr, false, false);
+      array_query->SetArrayResult(true);
+      return Expression(array_query);
+    }
     return QueryExpressionExp(VisitQuery(*query), nullptr,
                               node.detail == "modifier=EXISTS", false);
   }
@@ -2069,7 +2088,21 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
     if (path == nullptr) {
       throw std::runtime_error("GoogleSQL AST: table without path");
     }
-    source.table = Path(*path);
+    // GoogleSQL FROM items may be qualified field paths (`t4.array_val`,
+    // `t.Info.str_value`): an implicit UNNEST of an array-typed column or
+    // nested field reached through a scope alias.  Such paths never name a
+    // base relation, so map them to an unnest source whose expression is
+    // resolved against the enclosing scope chain at execution time.
+    const std::string dotted = Path(*path);
+    if (dotted.find('.') != std::string::npos &&
+        dotted.back() != '.') {
+      source.unnest = VisitExpression(*path);
+      if (source.alias.empty()) {
+        source.alias = dotted.substr(dotted.rfind('.') + 1);
+      }
+      return source;
+    }
+    source.table = dotted;
     if (source.alias.empty()) { source.alias = source.table; }
   } else if (node.kind == "TableSubquery") {
     const GoogleSqlAstNode* query = node.Child("Query");
@@ -2276,6 +2309,7 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
   }
 
   std::vector<SelectSource> sources;
+
   std::vector<std::string> tables;
   if (const GoogleSqlAstNode* from = select->Child("FromClause")) {
     for (const auto& child : from->children) {
@@ -2365,7 +2399,8 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
   // features the optimizer cannot represent yet force the relational
   // executor: FROM-subqueries and outer joins.
   for (const SelectSource& source : statement->Sources()) {
-    if (source.query || source.join_type == JoinType::kLeft) {
+    if (source.query || source.join_type == JoinType::kLeft ||
+        NeedsRelationalEvaluation(source.join_condition)) {
       statement->MarkComplex();
     }
   }
@@ -2377,6 +2412,20 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
   if (NeedsRelationalEvaluation(statement->WhereClause()) ||
       NeedsRelationalEvaluation(statement->Having())) {
     statement->MarkComplex();
+  }
+  // SELECT AS STRUCT / AS VALUE shape the projected value: STRUCT rows are
+  // consumed by outer expressions as whole struct values (encoded like the
+  // struct constructor output), VALUE strips the single column.
+  statement->SetAsStruct(is_as_struct && !as_value);
+  // Sort keys and grouping keys are evaluated by the plan executor with a
+  // plain AST walk, so query expressions (EXISTS / scalar subqueries) there
+  // must route to the relational interpreter, which resolves them against
+  // the enclosing scope chain.
+  for (const auto& term : statement->OrderBy()) {
+    if (NeedsRelationalEvaluation(term.expression)) {
+      statement->MarkComplex();
+      break;
+    }
   }
   return statement;
 }

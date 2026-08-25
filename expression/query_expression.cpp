@@ -102,6 +102,9 @@ Value QueryExpression::Evaluate(const Row& row, const Schema& schema,
                              std::string(tinylamb::ToString(rows.GetStatus())));
   }
   const std::vector<Value> values = std::move(rows).MoveValue();
+  if (array_result_) {
+    return Value::Array(values, "INT64");
+  }
   if (exists_) {
     const bool any = !values.empty();
     return Value(negated_ ? !any : any);

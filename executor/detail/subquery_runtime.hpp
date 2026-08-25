@@ -106,11 +106,19 @@ Relation FinishQuery(TransactionContext& context,
                      bool apply_where = true,
                      size_t hidden_columns = 0);
 
+// GoogleSQL name resolution for grouped queries: GROUP BY / HAVING items may
+// reference SELECT-list aliases or ordinals when they do not resolve against
+// the input columns.  Returns nullptr when nothing needed rewriting.
+std::shared_ptr<SelectStatement> ResolveGroupingAliases(
+    const SelectStatement& statement, const Schema& input_schema);
+
 // Projects one subquery result row for expression consumption: the first
 // column value, or -- for SELECT AS STRUCT subqueries -- the whole row
 // encoded as struct-like JSON so quantified comparisons and membership see a
-// single comparable value.
-Value ProjectSubqueryRow(const Row& row, bool as_struct);
+// single comparable value.  `schema` (optional) supplies the declared field
+// names; without it positional "fN" keys are used.
+Value ProjectSubqueryRow(const Row& row, bool as_struct,
+                         const Schema* schema = nullptr);
 
 std::optional<Relation> ExecuteCorrelatedSingleSource(
     TransactionContext& context, const SelectStatement& statement,

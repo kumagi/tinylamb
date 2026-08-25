@@ -54,6 +54,10 @@ class QueryExpression : public ExpressionBase {
   [[nodiscard]] const Expression& Test() const { return test_; }
   [[nodiscard]] bool Exists() const { return exists_; }
   [[nodiscard]] bool Negated() const { return negated_; }
+  // ARRAY(SELECT ...) mode: evaluation collects every projected row into a
+  // single array value instead of scalar/EXISTS/IN semantics.
+  [[nodiscard]] bool ArrayResult() const { return array_result_; }
+  void SetArrayResult(bool array_result) { array_result_ = array_result; }
   [[nodiscard]] BinaryOperation Op() const { return op_; }
   [[nodiscard]] QuantifierMode Mode() const { return mode_; }
 
@@ -62,6 +66,7 @@ class QueryExpression : public ExpressionBase {
   Expression test_;
   bool exists_{false};
   bool negated_{false};
+  bool array_result_{false};
   BinaryOperation op_{BinaryOperation::kEquals};
   QuantifierMode mode_{QuantifierMode::kIn};
 };

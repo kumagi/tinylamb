@@ -203,8 +203,12 @@ Expression BindExpression(const Expression& expression,  // NOLINT(misc-no-recur
       // first, the subquery body afterwards.
       Expression test = BindExpression(query.Test(), parameters, index);
       auto subquery = BindSelect(*query.Query(), parameters, index);
-      return QueryExpressionExp(std::move(subquery), std::move(test),
-                                query.Exists(), query.Negated());
+      auto bound = std::make_shared<QueryExpression>(
+          std::move(subquery), std::move(test), query.Exists(),
+          query.Negated());
+      // Preserve ARRAY(SELECT ...) semantics across template rebinding.
+      bound->SetArrayResult(query.ArrayResult());
+      return Expression(bound);
     }
     case TypeTag::kIntervalExp: {
       const auto& interval = expression->AsIntervalExpression();

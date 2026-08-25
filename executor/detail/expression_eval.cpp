@@ -120,6 +120,220 @@ int FindColumn(const Schema& schema, const ColumnName& name) {
   return match;
 }
 
+// ---- Nested field resolution ----------------------------------------------
+// GoogleSQL allows dotted references into STRUCT/PROTO values (`t.Info.x`,
+// `t.Info.str_value`).  Base relations store such values as text: struct
+// constructors produce JSON-like objects, proto constructors the proto text
+// format.  The helpers below resolve remaining path segments against those
+// encodings so a single Lookup covers plain columns and nested fields.
+
+std::string TrimFieldToken(std::string_view s) {
+  size_t begin = 0;
+  size_t end = s.size();
+  while (begin < end && std::isspace(static_cast<unsigned char>(s[begin]))) { ++begin; }
+  while (end > begin && std::isspace(static_cast<unsigned char>(s[end - 1]))) { --end; }
+  return std::string(s.substr(begin, end - begin));
+}
+
+Value ScalarFromText(std::string_view raw) {
+  std::string token = TrimFieldToken(raw);
+  if (token == "null" || token.empty()) { return {}; }
+  if (token == "true") { return Value(int64_t{1}); }
+  if (token == "false") { return Value(int64_t{0}); }
+  if (token.front() == '"' && token.back() == '"' && token.size() >= 2) {
+    return Value(token.substr(1, token.size() - 2));
+  }
+  if (token.front() == '{' && token.back() == '}') {
+    return Value(std::move(token));  // nested struct stays encoded
+  }
+  if (token.find('.') != std::string::npos || token.find('e') != std::string::npos ||
+      token.find('E') != std::string::npos) {
+    try { return Value(std::stod(token)); } catch (...) {}
+  }
+  try { return Value(static_cast<int64_t>(std::stoll(token))); } catch (...) {}
+  return Value(std::move(token));
+}
+
+std::string InferElementSqlType(const std::vector<Value>& elements) {
+  for (const Value& element : elements) {
+    if (element.IsNull()) { continue; }
+    switch (element.type) {
+      case ValueType::kInt64: return "INT64";
+      case ValueType::kDouble: return "DOUBLE";
+      case ValueType::kVarChar: return "STRING";
+      default: return {};
+    }
+  }
+  return "INT64";
+}
+
+// Extracts `key` from a JSON object string.  Returns false when the object
+// has no such key.  Array values become Value arrays.
+bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
+  if (json.size() < 2 || json.front() != '{' || json.back() != '}') { return false; }
+  const std::string needle = "\"" + std::string(key) + "\":";
+  auto top_level_prefix = [](std::string_view text) {
+    int depth = 0;
+    bool in_string = false;
+    for (size_t k = 0; k < text.size(); ++k) {
+      char c = text[k];
+      if (in_string) {
+        if (c == '\\' ) { ++k; continue; }
+        if (c == '"') { in_string = false; }
+        continue;
+      }
+      if (c == '"') { in_string = true; continue; }
+      if (c == '{' || c == '[') { ++depth; }
+      if (c == '}' || c == ']') { --depth; }
+      if (depth < 0) { return false; }
+    }
+    return depth == 0 && !in_string;
+  };
+  size_t search_from = 1;
+  size_t pos;
+  while ((pos = json.find(needle, search_from)) != std::string_view::npos &&
+         !top_level_prefix(json.substr(1, pos - 1))) {
+    search_from = pos + 1;
+  }
+  if (pos == std::string_view::npos ||
+      !top_level_prefix(json.substr(1, pos - 1))) {
+    return false;
+  }
+  size_t value_start = pos + needle.size();
+  while (value_start < json.size() &&
+         std::isspace(static_cast<unsigned char>(json[value_start]))) { ++value_start; }
+  size_t value_end;
+  if (json[value_start] == '"') {
+    value_end = value_start + 1;
+    while (value_end < json.size() && json[value_end] != '"') {
+      if (json[value_end] == '\\') { ++value_end; }
+      ++value_end;
+    }
+    ++value_end;
+  } else if (json[value_start] == '{' || json[value_start] == '[') {
+    int nest = 0;
+    value_end = value_start;
+    for (; value_end < json.size(); ++value_end) {
+      if (json[value_end] == '{' || json[value_end] == '[') { ++nest; }
+      else if (json[value_end] == '}' || json[value_end] == ']') {
+        --nest;
+        if (nest == 0) { ++value_end; break; }
+      }
+    }
+  } else {
+    value_end = value_start;
+    while (value_end < json.size() && json[value_end] != ',') { ++value_end; }
+  }
+  std::string_view raw = json.substr(value_start, value_end - value_start);
+  if (!raw.empty() && raw.front() == '[') {
+    // Split top-level elements and decode each.
+    std::string_view inner = raw.substr(1, raw.size() > 1 ? raw.size() - 2 : 0);
+    std::vector<Value> elements;
+    int nest = 0;
+    bool str = false;
+    size_t start = 0;
+    for (size_t k = 0; k < inner.size(); ++k) {
+      char d = inner[k];
+      if (str) {
+        if (d == '\\') { ++k; continue; }
+        if (d == '"') { str = false; }
+        continue;
+      }
+      if (d == '"') { str = true; continue; }
+      if (d == '{' || d == '[') { ++nest; continue; }
+      if (d == '}' || d == ']') { --nest; continue; }
+      if (d == ',' && nest == 0) {
+        elements.push_back(ScalarFromText(inner.substr(start, k - start)));
+        start = k + 1;
+      }
+    }
+    if (!inner.empty()) {
+      elements.push_back(ScalarFromText(inner.substr(start)));
+    }
+    *out = Value::Array(std::move(elements), InferElementSqlType(elements));
+    return true;
+  }
+  *out = ScalarFromText(raw);
+  return true;
+}
+
+// Proto text format: repeated `field: value` entries separated by whitespace,
+// strings double-quoted.  A field occurring once yields a scalar; repeated
+// occurrences yield an array.
+bool ProtoTextExtractField(std::string_view text, std::string_view key,
+                           Value* out) {
+  std::vector<Value> matches;
+  size_t i = 0;
+  while (i < text.size()) {
+    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) { ++i; }
+    size_t name_start = i;
+    while (i < text.size() && text[i] != ':') { ++i; }
+    if (i >= text.size()) { break; }
+    std::string_view field_name = text.substr(name_start, i - name_start);
+    ++i;  // skip ':'
+    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) { ++i; }
+    size_t value_begin = i;
+    size_t value_end;
+    if (i < text.size() && text[i] == '"') {
+      ++i;
+      while (i < text.size() && text[i] != '"') {
+        if (text[i] == '\\' && i + 1 < text.size()) { ++i; }
+        ++i;
+      }
+      value_end = std::min(text.size(), i + 1);
+      i = value_end;
+    } else {
+      while (i < text.size() && !std::isspace(static_cast<unsigned char>(text[i]))) { ++i; }
+      value_end = i;
+    }
+    if (IdentifierEquals(field_name, key)) {
+      matches.push_back(
+          ScalarFromText(text.substr(value_begin, value_end - value_begin)));
+    }
+  }
+  if (matches.empty()) { return false; }
+  if (matches.size() == 1) {
+    *out = std::move(matches[0]);
+  } else {
+    *out = Value::Array(std::move(matches), InferElementSqlType(matches));
+  }
+  return true;
+}
+
+Value ResolveFieldPath(const Value& base,
+                       const std::vector<std::string>& fields) {
+  Value current = base;
+  for (const std::string& field : fields) {
+    if (current.IsNull()) { return {}; }
+    if (current.type != ValueType::kVarChar) {
+      throw std::runtime_error("cannot access field " + field +
+                               " of a non-struct value");
+    }
+    const std::string_view text(current.value.varchar_value);
+    bool resolved = JsonExtractField(text, field, &current) ||
+                    ProtoTextExtractField(text, field, &current);
+    if (!resolved) {
+      throw std::runtime_error("field " + field + " not found");
+    }
+  }
+  return current;
+}
+
+std::vector<std::string> SplitDottedName(const std::string& name) {
+  std::vector<std::string> parts;
+  size_t start = 0;
+  while (true) {
+    size_t dot = name.find('.', start);
+    if (dot == std::string::npos) {
+      parts.push_back(name.substr(start));
+      break;
+    }
+    parts.push_back(name.substr(start, dot - start));
+    start = dot + 1;
+  }
+  return parts;
+}
+
 }  // namespace
 
 Value Lookup(const ColumnName& name, const Scope& scope) {
@@ -128,6 +342,35 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
     if (current->row == nullptr || current->schema == nullptr) { continue; }
     const int offset = FindColumn(*current->schema, name);
     if (offset >= 0) { return (*current->row)[static_cast<size_t>(offset)]; }
+  }
+  // Dotted references (`t.Info.str_value`, `s.x`) may address nested fields
+  // of a STRUCT/PROTO value rather than a plain column.  Resolve the base
+  // column per scope level, then walk the remaining path segments.
+  std::vector<std::string> parts = SplitDottedName(
+      name.schema.empty() ? name.name : name.name);
+  if (!parts.empty() && (parts.size() > 1 || !name.schema.empty())) {
+    for (const Scope* current = &scope; current != nullptr;
+         current = current->outer) {
+      if (current->row == nullptr || current->schema == nullptr) { continue; }
+      const ColumnName base(name.schema, parts.front());
+      const int offset = FindColumn(*current->schema, base);
+      if (offset >= 0) {
+        return ResolveFieldPath((*current->row)[static_cast<size_t>(offset)],
+                                std::vector<std::string>(parts.begin() + 1,
+                                                         parts.end()));
+      }
+    }
+    // A dotted qualifier (`t.Info.str_value`) may also mean the qualifier is
+    // itself a field path prefix: try the full schema-less name per scope.
+    if (!name.schema.empty()) {
+      const ColumnName unqualified("", name.schema + "." + name.name);
+      for (const Scope* current = &scope; current != nullptr;
+           current = current->outer) {
+        if (current->row == nullptr || current->schema == nullptr) { continue; }
+        const int offset = FindColumn(*current->schema, unqualified);
+        if (offset >= 0) { return (*current->row)[static_cast<size_t>(offset)]; }
+      }
+    }
   }
   throw std::runtime_error("column " + name.ToString() + " not found");
 }
@@ -4318,6 +4561,29 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       }
       auto& row_source = const_cast<Relation&>(*relation);
       const bool as_struct = value.Query()->AsStruct();
+      const Schema& subquery_schema = relation->schema;
+      if (value.ArrayResult()) {
+        // ARRAY(SELECT ...): every projected row becomes one array element.
+        std::vector<Value> elements;
+        elements.reserve(relation->TotalRows());
+        row_source.ForEachRow([&](const Row& row) {
+          elements.push_back(
+              ProjectSubqueryRow(row, as_struct, &subquery_schema));
+        });
+        std::string element_type;
+        for (const Value& element : elements) {
+          if (!element.IsNull()) {
+            element_type = ElementSqlTypeName(element.type);
+            if (element.IsArray()) {
+              element_type =
+                  "ARRAY<" + element.ArrayElementSqlType() + ">";
+            }
+            break;
+          }
+        }
+        return Value::Array(std::move(elements),
+                            element_type.empty() ? "INT64" : element_type);
+      }
       if (value.Exists()) {
         const bool exists = relation->TotalRows() > 0;
         return Value(value.Negated() ? !exists : exists);
@@ -4329,7 +4595,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
           std::vector<Value> candidates;
           candidates.reserve(relation->TotalRows());
           row_source.ForEachRow([&](const Row& row) {
-            candidates.push_back(ProjectSubqueryRow(row, as_struct));
+            candidates.push_back(ProjectSubqueryRow(row, as_struct, &subquery_schema));
           });
           return EvaluateQuantifiedComparison(value.Op(), value.Mode(), test,
                                               candidates);
@@ -4350,7 +4616,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
           if (inserted) {
             cached->second.reserve(relation->TotalRows());
             row_source.ForEachRow([&](const Row& row) {
-              const Value projected = ProjectSubqueryRow(row, as_struct);
+              const Value projected = ProjectSubqueryRow(row, as_struct, &subquery_schema);
               if (collation_conflict(projected)) {
                 throw std::runtime_error("Collation conflict between the IN "
                                          "operands");
@@ -4368,7 +4634,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
             // relation may contain NULLs that turn the miss into UNKNOWN.
             row_source.ForEachRow([&](const Row& row) {
               if (!row.values_.empty() &&
-                  ProjectSubqueryRow(row, as_struct).IsNull()) { saw_null = true;
+                  ProjectSubqueryRow(row, as_struct, &subquery_schema).IsNull()) { saw_null = true;
 }
             });
           }
@@ -4376,7 +4642,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
           row_source.ForEachRow([&](const Row& row) {
             if (found || row.values_.empty()) { return;
 }
-            const Value projected = ProjectSubqueryRow(row, as_struct);
+            const Value projected = ProjectSubqueryRow(row, as_struct, &subquery_schema);
             if (collation_conflict(projected)) {
               throw std::runtime_error("Collation conflict between the IN "
                                        "operands");
@@ -4401,7 +4667,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       });
       if (!first || first->values_.empty()) { return {};
 }
-      return ProjectSubqueryRow(*first, as_struct);
+      return ProjectSubqueryRow(*first, as_struct, &subquery_schema);
     }
     case TypeTag::kIntervalExp:
       return expression->Evaluate(Row(), Schema());
@@ -4459,6 +4725,10 @@ void CollectStatementColumns(  // NOLINT(misc-no-recursion)
   }
   for (const SelectSource& source : statement.Sources()) {
     CollectExpressionColumns(source.join_condition, columns);
+    // Implicit-unnest FROM paths (`FROM t.array_val`) reference columns of
+    // enclosing scopes; without this the projected scan of the outer table
+    // would drop the array column before the subquery reads it.
+    CollectExpressionColumns(source.unnest, columns);
     if (source.query) { CollectStatementColumns(*source.query, columns);
 }
   }
@@ -4483,12 +4753,25 @@ std::vector<slot_t> RequiredColumns(const SelectStatement& statement,
                   });
   std::unordered_set<ColumnName> referenced;
   CollectStatementColumns(statement, &referenced);
+  // Dotted nested-field references (`t.Info.str_value`) resolve through a
+  // chain that starts at the struct/struct-array column (`t.Info`); make sure
+  // those base columns survive projection.
+  std::unordered_set<ColumnName> bases = referenced;
+  for (const ColumnName& name : referenced) {
+    std::string prefix = name.name;
+    size_t dot = prefix.rfind('.');
+    while (dot != std::string::npos) {
+      prefix.resize(dot);
+      bases.insert(ColumnName(name.schema, prefix));
+      dot = prefix.rfind('.');
+    }
+  }
   std::vector<slot_t> result;
   result.reserve(schema.ColumnCount());
   for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
     const ColumnName& candidate = schema.GetColumn(i).Name();
     const bool needed =
-        selects_star || std::ranges::any_of(referenced, [&](const auto& name) {
+        selects_star || std::ranges::any_of(bases, [&](const auto& name) {
           if (name.name == "*") { return false;
 }
           return name.name == candidate.name &&

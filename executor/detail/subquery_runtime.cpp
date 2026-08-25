@@ -24,12 +24,17 @@
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "expression/aggregate_expression.hpp"
+#include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
+#include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
+#include "expression/unary_expression.hpp"
 #include "query/statement.hpp"
 #include "table/table.hpp"
 #include "type/type.hpp"
@@ -41,7 +46,164 @@
 
 namespace tinylamb::relational_detail {
 
-Value ProjectSubqueryRow(const Row& row, bool as_struct) {
+namespace {
+
+bool AliasEquals(std::string_view left, std::string_view right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(),
+                    [](char lhs, char rhs) {
+                      return std::tolower(static_cast<unsigned char>(lhs)) ==
+                             std::tolower(static_cast<unsigned char>(rhs));
+                    });
+}
+
+const Expression* FindSelectAlias(
+    const std::vector<NamedExpression>& select_list, std::string_view name) {
+  for (const NamedExpression& item : select_list) {
+    if (!item.name.empty() && AliasEquals(item.name, name)) {
+      return &item.expression;
+    }
+  }
+  return nullptr;
+}
+
+// Rebuilds `expression` replacing bare column references that resolve to a
+// select-list alias (and not to an input column).  Aggregate subtrees are
+// kept intact: their children always refer to base columns.
+Expression ResolveAliasInTree(  // NOLINT(misc-no-recursion)
+    const Expression& expression, const Schema& schema,
+    const std::vector<NamedExpression>& select_list) {
+  if (!expression) { return expression;
+}
+  switch (expression->Type()) {
+    case TypeTag::kColumnValue: {
+      const ColumnName& name = expression->AsColumnValue().GetColumnName();
+      if (!name.schema.empty() || name.name == "*") { return expression; }
+      if (LocalColumnOffset(schema, name)) { return expression; }
+      if (const Expression* aliased = FindSelectAlias(select_list, name.name)) {
+        return *aliased;
+      }
+      return expression;
+    }
+    case TypeTag::kBinaryExp:
+      return BinaryExpressionExp(
+          ResolveAliasInTree(expression->AsBinaryExpression().Left(), schema,
+                             select_list),
+          expression->AsBinaryExpression().Op(),
+          ResolveAliasInTree(expression->AsBinaryExpression().Right(), schema,
+                             select_list));
+    case TypeTag::kUnaryExp:
+      return UnaryExpressionExp(
+          ResolveAliasInTree(expression->AsUnaryExpression().Child(), schema,
+                             select_list),
+          expression->AsUnaryExpression().Op());
+    case TypeTag::kCaseExp: {
+      const auto& value = expression->AsCaseExpression();
+      std::vector<std::pair<Expression, Expression>> clauses;
+      for (const auto& [condition, result] : value.when_clauses_) {
+        clauses.emplace_back(ResolveAliasInTree(condition, schema, select_list),
+                             ResolveAliasInTree(result, schema, select_list));
+      }
+      return CaseExpressionExp(std::move(clauses),
+                               ResolveAliasInTree(value.else_clause_, schema,
+                                                  select_list));
+    }
+    case TypeTag::kInExp: {
+      const auto& value = expression->AsInExpression();
+      std::vector<Expression> items;
+      items.reserve(value.list_.size());
+      for (const Expression& item : value.list_) {
+        items.push_back(ResolveAliasInTree(item, schema, select_list));
+      }
+      return InExpressionExp(ResolveAliasInTree(value.child_, schema,
+                                                select_list),
+                             std::move(items));
+    }
+    case TypeTag::kFunctionCallExp:
+      return FunctionCallExp(
+          expression->AsFunctionCallExpression().FuncName(),
+          [&] {
+            std::vector<Expression> args;
+            args.reserve(expression->AsFunctionCallExpression().Args().size());
+            for (const Expression& argument :
+                 expression->AsFunctionCallExpression().Args()) {
+              args.push_back(
+                  ResolveAliasInTree(argument, schema, select_list));
+            }
+            return args;
+          }());
+    case TypeTag::kArrayExp: {
+      const auto& array = expression->AsArrayExpression();
+      std::vector<Expression> elements;
+      elements.reserve(array.Elements().size());
+      for (const Expression& element : array.Elements()) {
+        elements.push_back(ResolveAliasInTree(element, schema, select_list));
+      }
+      return ArrayExpressionExp(std::move(elements),
+                                array.ElementSqlType());
+    }
+    default:
+      // Aggregates, casts of aggregates, subqueries and constants stay as-is.
+      return expression;
+  }
+}
+
+}  // namespace
+
+std::shared_ptr<SelectStatement> ResolveGroupingAliases(
+    const SelectStatement& statement, const Schema& input_schema) {
+  const std::vector<NamedExpression>& select_list = statement.SelectList();
+  if (select_list.empty()) { return nullptr; }
+  bool changed = false;
+  std::vector<Expression> group_by;
+  group_by.reserve(statement.GroupBy().size());
+  for (const Expression& key : statement.GroupBy()) {
+    Expression resolved = key;
+    if (key && key->Type() == TypeTag::kColumnValue) {
+      const ColumnName& name =
+          key->AsColumnValue().GetColumnName();
+      // GoogleSQL grouping items may be a select-list alias or an ordinal
+      // position; base columns take precedence over both.
+      const bool unqualified = name.schema.empty() && name.name != "*";
+      if (unqualified && !LocalColumnOffset(input_schema, name)) {
+        if (const Expression* aliased =
+                FindSelectAlias(select_list, name.name)) {
+          resolved = *aliased;
+          changed = true;
+        } else if (name.name.find_first_not_of("0123456789") ==
+                   std::string::npos) {
+          try {
+            const size_t ordinal = std::stoul(name.name);
+            if (ordinal >= 1 && ordinal <= select_list.size()) {
+              resolved = select_list[ordinal - 1].expression;
+              changed = true;
+            }
+          } catch (...) {
+          }
+        }
+      }
+    } else if (key) {
+      resolved = ResolveAliasInTree(key, input_schema, select_list);
+      if (!(resolved == key)) { changed = true;
+}
+    }
+    group_by.push_back(std::move(resolved));
+  }
+  Expression having =
+      statement.Having()
+          ? ResolveAliasInTree(statement.Having(), input_schema, select_list)
+          : statement.Having();
+  if (statement.Having() && !(having == statement.Having())) { changed = true;
+}
+  if (!changed) { return nullptr; }
+  auto adjusted = std::make_shared<SelectStatement>(statement);
+  adjusted->SetGroupBy(std::move(group_by));
+  if (statement.Having()) { adjusted->SetHaving(std::move(having)); }
+  return adjusted;
+}
+
+Value ProjectSubqueryRow(const Row& row, bool as_struct,
+                         const Schema* schema) {
   if (row.values_.empty()) { return {};
 }
   if (!as_struct) { return row[0];
@@ -52,6 +214,13 @@ Value ProjectSubqueryRow(const Row& row, bool as_struct) {
     if (only.IsNull()) { return {};
 }
   }
+  auto field_key = [&](size_t index) -> std::string {
+    if (schema != nullptr && index < schema->ColumnCount()) {
+      const std::string& name = schema->GetColumn(index).Name().name;
+      if (!name.empty() && !name.starts_with("$expr")) { return name; }
+    }
+    return "f" + std::to_string(index + 1);
+  };
   auto scalar_to_json = [](const Value& v) -> std::string {
     switch (v.type) {
       case ValueType::kNull:
@@ -62,6 +231,31 @@ Value ProjectSubqueryRow(const Row& row, bool as_struct) {
         return std::to_string(v.value.double_value);
       case ValueType::kVarChar:
         return "\"" + std::string(v.value.varchar_value) + "\"";
+      case ValueType::kArray: {
+        std::string inner;
+        const std::vector<Value>& elements = v.ArrayElements();
+        for (size_t i = 0; i < elements.size(); ++i) {
+          if (i > 0) { inner += ","; }
+          const Value& element = elements[i];
+          switch (element.type) {
+            case ValueType::kNull:
+              inner += "null";
+              break;
+            case ValueType::kInt64:
+              inner += std::to_string(element.value.int_value);
+              break;
+            case ValueType::kDouble:
+              inner += std::to_string(element.value.double_value);
+              break;
+            case ValueType::kVarChar:
+              inner += "\"" + std::string(element.value.varchar_value) + "\"";
+              break;
+            default:
+              inner += element.AsString();
+          }
+        }
+        return "[" + inner + "]";
+      }
       default:
         return v.AsString();
     }
@@ -69,8 +263,7 @@ Value ProjectSubqueryRow(const Row& row, bool as_struct) {
   std::string json = "{";
   for (size_t i = 0; i < row.values_.size(); ++i) {
     if (i > 0) { json += ","; }
-    json += "\"f" + std::to_string(i + 1) + "\":" +
-            scalar_to_json(row.values_[i]);
+    json += "\"" + field_key(i) + "\":" + scalar_to_json(row.values_[i]);
   }
   json += "}";
   return Value(std::move(json));
@@ -212,8 +405,16 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     Schema peek_schema;
     if (statement.Sources().size() == 1 && !from.query && !from.table.empty()) {
       StatusOr<std::shared_ptr<Table>> table = context.GetTable(from.table);
-      if (table.HasValue()) { peek_schema = table.Value()->GetSchema();
-}
+      if (table.HasValue()) {
+        peek_schema = table.Value()->GetSchema();
+        // Alias-qualified view so qualified references resolve; order is
+        // identical to the raw table schema.
+        const std::string peek_qualifier =
+            from.alias.empty() ? from.table : from.alias;
+        if (!peek_qualifier.empty()) {
+          peek_schema = QualifySchema(peek_schema, peek_qualifier);
+        }
+      }
     }
     auto has_correlated_equality = [&](const Schema& schema) {
       if (schema.ColumnCount() == 0) { return false;
@@ -251,6 +452,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                 ReusableProjection(context, from.table)) {
           projection = *shared;
         } else {
+          // peek_schema already carries the alias-qualified names.
           projection = RequiredColumns(statement, peek_schema, true);
         }
         if (projection.empty()) { projection.push_back(0);
@@ -729,6 +931,17 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
       metadata.schema = QualifySchema(metadata.schema, qualifier);
     }
     schemas.push_back(std::move(metadata));
+  }
+  // An UNNEST source whose argument references columns outside this
+  // statement's own sources is inherently correlated (`FROM t.Info.str_value`
+  // inside a subquery); it must never run with a detached (null) outer scope.
+  for (const SelectSource& source : statement.Sources()) {
+    if (!source.unnest) { continue;
+}
+    if (!ExpressionUsesOnlyScopes(context, source.unnest, schemas, ctes)) {
+      context.execution_runtime()->noncacheable_queries.insert(&statement);
+      return nullptr;
+    }
   }
   if (!ExpressionsAreLocal(context, statement, schemas, ctes)) {
     context.execution_runtime()->noncacheable_queries.insert(&statement);
