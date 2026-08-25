@@ -70,7 +70,8 @@ std::vector<std::string> SplitCases(std::string_view contents) {
   return cases;
 }
 
-bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out) {
+bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
+                       std::vector<std::string>* file_default_features) {
   const std::string trimmed = Trim(line);
   if (trimmed.size() < 2 || trimmed.front() != '[' || trimmed.back() != ']') {
     return false;
@@ -98,6 +99,21 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out) {
     }
     return true;
   }
+  if (key == "default required_features" ||
+      key == "default required_feature") {
+    file_default_features->clear();
+    std::string feature;
+    std::istringstream features(value);
+    while (std::getline(features, feature, ',')) {
+      feature = Trim(feature);
+      if (!feature.empty()) { file_default_features->push_back(feature); }
+    }
+    return true;
+  }
+  if (key == "primary_key_mode") {
+    out->primary_key_mode = value;
+    return true;
+  }
   if (key == "parameters" || key == "parameter") {
     for (const auto& item : SplitTopLevel(value)) {
       const std::string s = Trim(item);
@@ -106,6 +122,16 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out) {
       if (as_pos != std::string::npos) {
         const std::string expr = Trim(s.substr(0, as_pos));
         const std::string name = Trim(s.substr(as_pos + 4));
+        if (!name.empty() && !expr.empty()) {
+          out->parameters.push_back({name, expr});
+        }
+        continue;
+      }
+      // Compact "<value> <name>" form (e.g. "1 param", "NULL param").
+      const size_t space = s.rfind(' ');
+      if (space != std::string::npos) {
+        const std::string expr = Trim(s.substr(0, space));
+        const std::string name = Trim(s.substr(space + 1));
         if (!name.empty() && !expr.empty()) {
           out->parameters.push_back({name, expr});
         }
@@ -207,14 +233,53 @@ void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
       ++offset;
       continue;
     }
-    if (result[offset] != '{') {
-      const size_t next = result.find('{', offset);
-      if (next == std::string_view::npos) { break; }
-      offset = next;
+    // Skip an ordering annotation before the first element.
+    const std::string lower_rest =
+        ToLower(std::string(result.substr(offset, 14)));
+    if (lower_rest.starts_with("unknown order:")) {
+      offset += 14;
+    } else if (lower_rest.starts_with("known order:")) {
+      offset += 12;
+    }
+    while (offset < result.size() &&
+           std::isspace(static_cast<unsigned char>(result[offset])) != 0) {
+      ++offset;
     }
     std::vector<std::string> fields;
-    if (!ParseStructRow(result, &offset, &fields)) { break; }
-    out->expected_rows.push_back(std::move(fields));
+    if (result[offset] == '{') {
+      if (!ParseStructRow(result, &offset, &fields)) { break; }
+      out->expected_rows.push_back(std::move(fields));
+      continue;
+    }
+    // Bare scalar element (e.g. ARRAY<INT64>[10, 20] or value-table rows):
+    // one row per comma-separated token until the closing bracket.
+    size_t end = offset;
+    int depth = 0;
+    bool in_string = false;
+    char quote = '\0';
+    while (end < result.size()) {
+      const char c = result[end];
+      if (in_string) {
+        if (c == '\\' && end + 1 < result.size()) { ++end; }
+        else if (c == quote) { in_string = false; }
+        ++end;
+        continue;
+      }
+      if (c == '"' || c == '\'') {
+        in_string = true;
+        quote = c;
+        ++end;
+        continue;
+      }
+      if (c == '<' || c == '[' || c == '(' || c == '{') { ++depth; }
+      else if (c == '>' && depth > 0) { --depth; }
+      else if ((c == ')' || c == '}') && depth > 0) { --depth; }
+      else if ((c == ',' && depth == 0) || c == ']') { break; }
+      ++end;
+    }
+    const std::string token = Trim(result.substr(offset, end - offset));
+    offset = end;
+    if (!token.empty()) { out->expected_rows.push_back({token}); }
   }
 }
 
@@ -252,10 +317,12 @@ std::string ApplyParameters(
 
 GoogleSqlComplianceCase ParseSegment(std::string_view file,
                                      std::string_view segment,
-                                     std::string* current_default_tz) {
+                                     std::string* current_default_tz,
+                                     std::vector<std::string>* default_features) {
   GoogleSqlComplianceCase test_case;
   test_case.file = std::string(file);
   test_case.default_time_zone = *current_default_tz;
+  test_case.required_features = *default_features;
   std::istringstream stream{std::string(segment)};
   std::string line;
   bool in_options = true;
@@ -264,7 +331,7 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
     const std::string trimmed = Trim(line);
     if (in_options) {
       if (trimmed.empty() || trimmed.starts_with('#')) { continue; }
-      if (ConsumeOptionLine(line, &test_case)) {
+      if (ConsumeOptionLine(line, &test_case, default_features)) {
         if (!test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
@@ -285,7 +352,7 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
     }
     if (sql.empty()) {
       if (trimmed.empty() || trimmed.starts_with('#')) { continue; }
-      if (ConsumeOptionLine(line, &test_case)) {
+      if (ConsumeOptionLine(line, &test_case, default_features)) {
         if (!test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
@@ -453,9 +520,11 @@ std::vector<GoogleSqlComplianceCase> ParseGoogleSqlComplianceFile(
   std::vector<GoogleSqlComplianceCase> cases;
   size_t unnamed = 0;
   std::string current_default_tz = "America/Los_Angeles";
+  std::vector<std::string> default_features;
   for (const std::string& segment : SplitCases(contents)) {
     if (Trim(segment).empty()) { continue; }
-    GoogleSqlComplianceCase test_case = ParseSegment(file, segment, &current_default_tz);
+    GoogleSqlComplianceCase test_case =
+        ParseSegment(file, segment, &current_default_tz, &default_features);
     if (test_case.name == "unnamed" ||
         test_case.name.starts_with("prepare_database")) {
       if (test_case.name.find('_') == std::string::npos ||

@@ -41,6 +41,12 @@ bool Update::Next(Row* dst, RowPosition* rp) {
     }
     update_count++;
   }
+  if (assert_rows_modified_ >= 0 && update_count != assert_rows_modified_) {
+    throw std::runtime_error("ASSERT_ROWS_MODIFIED was specified with " +
+                             std::to_string(assert_rows_modified_) +
+                             " rows, but " + std::to_string(update_count) +
+                             " rows were modified");
+  }
   *dst = Row({Value("Update Rows"), Value(update_count)});
   if (rp != nullptr) {
     *rp = RowPosition();

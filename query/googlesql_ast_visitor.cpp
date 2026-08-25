@@ -1121,8 +1121,13 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
 
   if (node.kind == "NullLiteral") { return ConstantValueExp(Value());
 }
+  // INSERT ... VALUES (30, DEFAULT): tables built by this engine carry no
+  // column defaults, so DEFAULT resolves to NULL.
+  if (node.kind == "DefaultLiteral") { return ConstantValueExp(Value());
+}
   if (node.kind == "BooleanLiteral") {
-    return ConstantValueExp(Value(node.detail == "TRUE" || node.detail == "true"));
+    const std::string upper_literal = UpperCopy(node.detail);
+    return ConstantValueExp(Value(upper_literal == "TRUE"));
   }
   if (node.kind == "ArrayConstructor") {
     std::string element_type;
@@ -1391,11 +1396,37 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
                  : result;
     }
     const GoogleSqlAstNode* query = node.Child("Query");
-    if (query == nullptr) {
-      throw std::runtime_error("GoogleSQL AST: IN without values");
+    if (query != nullptr) {
+      return QueryExpressionExp(VisitQuery(*query), std::move(test), false,
+                                negated);
     }
-    return QueryExpressionExp(VisitQuery(*query), std::move(test), false,
-                              negated);
+    for (const auto& child : node.children) {
+      if (child->kind != "UnnestExpression") { continue;
+}
+      // `x [NOT] IN UNNEST(arr)`: three-valued membership over a runtime
+      // array, reusing the quantified-comparison runtime helper.
+      const GoogleSqlAstNode* inner = child->Child("ExpressionWithOptAlias");
+      if (inner == nullptr || inner->children.empty()) {
+        throw std::runtime_error("GoogleSQL AST: malformed UNNEST");
+      }
+      Expression array;
+      for (const auto& expr_child : inner->children) {
+        if (expr_child->kind != "Location" && expr_child->kind != "Alias" &&
+            expr_child->kind != "Identifier") {
+          array = VisitExpression(*expr_child);
+          break;
+        }
+      }
+      Expression result =
+          FunctionCallExp("__quantified__",
+                          {std::move(test), std::move(array),
+                           ConstantValueExp(Value(std::string("="))),
+                           ConstantValueExp(Value(std::string("ANY")))});
+      return negated
+                 ? UnaryExpressionExp(std::move(result), UnaryOperation::kNot)
+                 : result;
+    }
+    throw std::runtime_error("GoogleSQL AST: IN without values");
   }
   if (node.kind == "ExpressionSubquery") {
     const GoogleSqlAstNode* query = node.Child("Query");
@@ -1852,13 +1883,21 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
       }
       if (const GoogleSqlAstNode* with_offset = node.Child("WithOffset")) {
         if (const GoogleSqlAstNode* alias = with_offset->Child("Alias")) {
-          source.offset_alias = Identifier(*alias);
+          if (alias->Child("Identifier") != nullptr) {
+            source.offset_alias = Identifier(*alias->Child("Identifier"));
+          } else {
+            source.offset_alias = "offset";
+          }
         } else {
           source.offset_alias = "offset";
         }
       } else if (const GoogleSqlAstNode* with_offset2 = node.Child("WithOffsetClause")) {
         if (const GoogleSqlAstNode* alias = with_offset2->Child("Alias")) {
-          source.offset_alias = Identifier(*alias);
+          if (alias->Child("Identifier") != nullptr) {
+            source.offset_alias = Identifier(*alias->Child("Identifier"));
+          } else {
+            source.offset_alias = "offset";
+          }
         } else {
           source.offset_alias = "offset";
         }
@@ -1866,7 +1905,11 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
         for (const auto& child : node.children) {
           if (child->kind.find("Offset") != std::string::npos) {
             if (const GoogleSqlAstNode* alias = child->Child("Alias")) {
-              source.offset_alias = Identifier(*alias);
+              if (alias->Child("Identifier") != nullptr) {
+                source.offset_alias = Identifier(*alias->Child("Identifier"));
+              } else {
+                source.offset_alias = "offset";
+              }
             } else {
               source.offset_alias = "offset";
             }
@@ -2053,7 +2096,12 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
   const bool is_as_struct = upper_select_detail.find("STRUCT") != std::string::npos ||
                             (select_as != nullptr && UpperCopy(select_as->detail).find("STRUCT") != std::string::npos) ||
                             as_struct != nullptr;
-  if (!is_as_struct && (select_as != nullptr || (upper_select_detail.find("AS_MODE=") != std::string::npos && upper_select_detail.find("AS_MODE=VALUE") == std::string::npos))) {
+  // SELECT AS VALUE yields the bare value as the sole column; only named
+  // proto/struct targets are folded into a field-list literal.
+  const bool as_value = select_as != nullptr &&
+                        UpperCopy(select_as->detail).find("VALUE") !=
+                            std::string::npos;
+  if (!is_as_struct && !as_value && (select_as != nullptr || (upper_select_detail.find("AS_MODE=") != std::string::npos && upper_select_detail.find("AS_MODE=VALUE") == std::string::npos))) {
     std::string proto_str;
     bool all_const = true;
     for (size_t i = 0; i < projections.size(); ++i) {
@@ -2241,6 +2289,28 @@ std::unique_ptr<Statement> VisitCreate(const GoogleSqlAstNode& root) {
   throw std::runtime_error("GoogleSQL AST: bad CREATE");
 }
 
+InsertMode InsertModeFromDetail(const std::string& detail) {
+  if (detail.find("insert_mode=IGNORE") != std::string::npos) {
+    return InsertMode::kIgnore;
+  }
+  if (detail.find("insert_mode=REPLACE") != std::string::npos) {
+    return InsertMode::kReplace;
+  }
+  if (detail.find("insert_mode=UPDATE") != std::string::npos) {
+    return InsertMode::kUpdate;
+  }
+  return InsertMode::kDefault;
+}
+
+int64_t AssertRowsModifiedValue(const GoogleSqlAstNode& node) {
+  const GoogleSqlAstNode* literal = node.Child("IntLiteral");
+  if (literal == nullptr) {
+    throw std::runtime_error(
+        "GoogleSQL AST: ASSERT_ROWS_MODIFIED without count");
+  }
+  return ParseIntLiteral(*literal);
+}
+
 std::unique_ptr<Statement> VisitInsert(const GoogleSqlAstNode& root) {
   const GoogleSqlAstNode* path = root.Child("PathExpression");
   if (path == nullptr) {
@@ -2254,20 +2324,27 @@ std::unique_ptr<Statement> VisitInsert(const GoogleSqlAstNode& root) {
   }
   std::vector<std::vector<Expression>> rows;
   const GoogleSqlAstNode* row_list = root.Child("InsertValuesRowList");
-  if (row_list == nullptr) {
-    throw std::runtime_error("GoogleSQL AST: INSERT VALUES required");
-  }
-  for (const GoogleSqlAstNode* row : row_list->Children("InsertValuesRow")) {
-    std::vector<Expression> values;
-    for (const auto& value : row->children) {
-      if (value->kind == "Location" || value->kind == "Hint") { continue;
+  if (row_list != nullptr) {
+    for (const GoogleSqlAstNode* row : row_list->Children("InsertValuesRow")) {
+      std::vector<Expression> values;
+      for (const auto& value : row->children) {
+        if (value->kind == "Location" || value->kind == "Hint") { continue;
 }
-      values.push_back(VisitExpression(*value));
+        values.push_back(VisitExpression(*value));
+      }
+      rows.push_back(std::move(values));
     }
-    rows.push_back(std::move(values));
   }
-  return std::make_unique<InsertStatement>(Path(*path), std::move(rows),
-                                           std::move(columns));
+  auto statement = std::make_unique<InsertStatement>(
+      Path(*path), std::move(rows), std::move(columns));
+  statement->SetMode(InsertModeFromDetail(root.detail));
+  if (const GoogleSqlAstNode* query = root.Child("Query")) {
+    statement->SetQuery(VisitQuery(*query));
+  }
+  if (const GoogleSqlAstNode* assert = root.Child("AssertRowsModified")) {
+    statement->SetAssertRowsModified(AssertRowsModifiedValue(*assert));
+  }
+  return statement;
 }
 
 std::unique_ptr<Statement> VisitUpdate(const GoogleSqlAstNode& root) {
@@ -2286,13 +2363,17 @@ std::unique_ptr<Statement> VisitUpdate(const GoogleSqlAstNode& root) {
                              VisitExpression(*set->children[1]));
   }
   // The WHERE clause is the single remaining child once the target path and
-  // the assignment list are removed. Collect candidates instead of taking the
-  // last one so unmapped siblings (hints etc.) cannot silently overwrite an
-  // earlier WHERE.
+  // the assignment list are removed. Table aliases, ASSERT_ROWS_MODIFIED,
+  // THEN RETURN and UPDATE...FROM siblings are recognized but not mapped
+  // (returning/join-update are gated features); they must not masquerade as
+  // WHERE candidates.
   std::vector<const GoogleSqlAstNode*> where_candidates;
   for (const auto& child : root.children) {
     if (child->kind == "PathExpression" || child->kind == "UpdateItemList" ||
-        child->kind == "Location" || child->kind == "Hint") {
+        child->kind == "Location" || child->kind == "Hint" ||
+        child->kind == "Alias" || child->kind == "AssertRowsModified" ||
+        child->kind == "ReturningClause" ||
+        child->kind == "FromClause") {
       continue;
     }
     where_candidates.push_back(child.get());
@@ -2305,8 +2386,12 @@ std::unique_ptr<Statement> VisitUpdate(const GoogleSqlAstNode& root) {
   if (!where_candidates.empty()) {
     where = VisitExpression(*where_candidates.front());
   }
-  return std::make_unique<UpdateStatement>(Path(*path), std::move(assignments),
-                                           std::move(where));
+  auto statement = std::make_unique<UpdateStatement>(
+      Path(*path), std::move(assignments), std::move(where));
+  if (const GoogleSqlAstNode* assert = root.Child("AssertRowsModified")) {
+    statement->SetAssertRowsModified(AssertRowsModifiedValue(*assert));
+  }
+  return statement;
 }
 
 std::unique_ptr<Statement> VisitDelete(const GoogleSqlAstNode& root) {
@@ -2317,7 +2402,10 @@ std::unique_ptr<Statement> VisitDelete(const GoogleSqlAstNode& root) {
   std::vector<const GoogleSqlAstNode*> where_candidates;
   for (const auto& child : root.children) {
     if (child->kind == "PathExpression" || child->kind == "Location" ||
-        child->kind == "Hint") {
+        child->kind == "Hint" || child->kind == "Alias" ||
+        child->kind == "AssertRowsModified" ||
+        child->kind == "ReturningClause" ||
+        child->kind == "FromClause") {
       continue;
     }
     where_candidates.push_back(child.get());
@@ -2330,7 +2418,12 @@ std::unique_ptr<Statement> VisitDelete(const GoogleSqlAstNode& root) {
   if (!where_candidates.empty()) {
     where = VisitExpression(*where_candidates.front());
   }
-  return std::make_unique<DeleteStatement>(Path(*path), std::move(where));
+  auto statement =
+      std::make_unique<DeleteStatement>(Path(*path), std::move(where));
+  if (const GoogleSqlAstNode* assert = root.Child("AssertRowsModified")) {
+    statement->SetAssertRowsModified(AssertRowsModifiedValue(*assert));
+  }
+  return statement;
 }
 
 }  // namespace

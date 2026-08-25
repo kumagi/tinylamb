@@ -556,6 +556,25 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       }
       continue;
     }
+    if (KeywordAt(sql, i, "ASSERT_ROWS_MODIFIED")) {
+      // The row-count assert is statement metadata carried outside the
+      // expression tree; parameterizing its literal would let two asserts
+      // that differ only in the count collide on one fingerprint (and one
+      // cached shape) while binding substitutes the wrong value.
+      constexpr std::string_view kAssert = "ASSERT_ROWS_MODIFIED";
+      result.fingerprint.append(kAssert);
+      i += kAssert.size();
+      while (i < sql.size() &&
+             std::isspace(static_cast<unsigned char>(sql[i])) != 0) {
+        result.fingerprint.push_back(sql[i]);
+        ++i;
+      }
+      while (i < sql.size() && std::isdigit(static_cast<unsigned char>(sql[i])) != 0) {
+        result.fingerprint.push_back(sql[i]);
+        ++i;
+      }
+      continue;
+    }
     if (KeywordAt(sql, i, "CREATE") || KeywordAt(sql, i, "DROP")) {
       result.templatable = false;
     }
@@ -645,9 +664,15 @@ std::unique_ptr<Statement> BindStatementLiterals(
         }
         rows.push_back(std::move(values));
       }
-      bound = std::make_unique<InsertStatement>(insert.TableName(),
-                                                std::move(rows),
-                                                insert.Columns());
+      auto bound_insert = std::make_unique<InsertStatement>(
+          insert.TableName(), std::move(rows), insert.Columns());
+      // Preserve conflict-handling attributes across template rebinding;
+      // dropping them would silently turn INSERT IGNORE/UPDATE/REPLACE and
+      // ASSERT_ROWS_MODIFIED into plain inserts.
+      bound_insert->SetMode(insert.Mode());
+      bound_insert->SetAssertRowsModified(insert.AssertRowsModified());
+      bound_insert->SetQuery(insert.Query());
+      bound = std::move(bound_insert);
       break;
     }
     case StatementType::kUpdate: {
@@ -659,16 +684,20 @@ std::unique_ptr<Statement> BindStatementLiterals(
             assignment.first,
             BindExpression(assignment.second, parameters, &index));
       }
-      bound = std::make_unique<UpdateStatement>(
+      auto bound_update = std::make_unique<UpdateStatement>(
           update.TableName(), std::move(assignments),
           BindExpression(update.WhereClause(), parameters, &index));
+      bound_update->SetAssertRowsModified(update.AssertRowsModified());
+      bound = std::move(bound_update);
       break;
     }
     case StatementType::kDelete: {
       const auto& remove = dynamic_cast<const DeleteStatement&>(statement);
-      bound = std::make_unique<DeleteStatement>(
+      auto bound_delete = std::make_unique<DeleteStatement>(
           remove.TableName(),
           BindExpression(remove.WhereClause(), parameters, &index));
+      bound_delete->SetAssertRowsModified(remove.AssertRowsModified());
+      bound = std::move(bound_delete);
       break;
     }
     case StatementType::kCreateTable:

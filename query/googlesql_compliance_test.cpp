@@ -9,7 +9,9 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
+#include <unordered_set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +25,7 @@
 #include "executor/executor_base.hpp"
 #include "query/googlesql_frontend.hpp"
 #include "query/sql_engine.hpp"
+#include "query/statement.hpp"
 #include "type/date.hpp"
 #include "type/row.hpp"
 #endif
@@ -282,6 +285,33 @@ TEST(GoogleSqlComplianceFile, SkipsDifferentialPrivacy) {
 }
 
 #ifdef TINYLAMB_GOOGLESQL_COMPLIANCE_RUN
+// Features this engine claims for compliance feature-gating. A case tagged
+// with required_features outside this set is skipped, mirroring the reference
+// TestDriver contract (unsupported-feature cases are neither pass nor fail).
+bool CaseFeatureSupported(const GoogleSqlComplianceCase& test_case) {
+  static const std::unordered_set<std::string> kSupported = {};
+  for (const std::string& feature : test_case.required_features) {
+    if (kSupported.find(feature) == kSupported.end()) { return false; }
+  }
+  return true;
+}
+
+bool IsMutatingSql(std::string_view sql) {
+  size_t begin = 0;
+  while (begin < sql.size() && std::isspace(static_cast<unsigned char>(sql[begin])) != 0) {
+    ++begin;
+  }
+  sql = sql.substr(begin);
+  auto prefix = [&sql](std::string_view keyword) {
+    if (sql.size() < keyword.size()) { return false; }
+    if (sql.substr(0, keyword.size()) != keyword) { return false; }
+    if (sql.size() == keyword.size()) { return true; }
+    const char next = sql[keyword.size()];
+    return !std::isalnum(static_cast<unsigned char>(next)) && next != '_';
+  };
+  return prefix("INSERT") || prefix("UPDATE") || prefix("DELETE");
+}
+
 class GoogleSqlComplianceFileTest
     : public ::testing::TestWithParam<std::string> {};
 
@@ -299,20 +329,46 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
   const std::vector<GoogleSqlComplianceCase> cases =
       ParseGoogleSqlComplianceFile(path.string(), ReadFile(path));
 
+  bool file_mutates_state = false;
+  for (const GoogleSqlComplianceCase& test_case : cases) {
+    if (!test_case.prepare_database && IsMutatingSql(test_case.sql)) {
+      file_mutates_state = true;
+      break;
+    }
+  }
+
   const std::string path_prefix = "googlesql_compliance-" + RandomString(8);
-  Database database(path_prefix);
-  TransactionContext context = database.BeginContext();
-  SqlEngine engine(database);
+  auto database = std::make_unique<Database>(path_prefix);
+  auto context = std::make_unique<TransactionContext>(database->BeginContext());
+  auto engine = std::make_unique<SqlEngine>(*database);
+
+  // Files whose cases mutate tables get per-case isolation: each case runs
+  // against a freshly created database with the prepared state replayed,
+  // mirroring the reference driver's per-case test database. A distinct
+  // storage prefix per rebuild keeps a destroyed instance's WAL from being
+  // recovered into its replacement.
+  std::vector<std::vector<std::string>> prepare_segments;
+  int environment_generation = 0;
+  auto replay_prepared_state = [&]() {
+    SqlEngine::SetCompliancePrimaryKeyMode(false);
+    for (const auto& segment : prepare_segments) {
+      for (const std::string& stmt : segment) {
+        Status s_status = Status::kSuccess;
+        Drain(*engine, *context, stmt, &s_status);
+      }
+    }
+  };
 
   for (const GoogleSqlComplianceCase& test_case : cases) {
     if (IsDifferentialPrivacyCase(test_case)) { continue; }
     SetDefaultTimeZone(test_case.default_time_zone.empty() ? "America/Los_Angeles" : test_case.default_time_zone);
     if (test_case.prepare_database) {
       const std::vector<std::string> stmts = SplitStatements(test_case.sql);
+      prepare_segments.push_back(stmts);
       for (const std::string& stmt : stmts) {
         Status s_status = Status::kSuccess;
         try {
-          Drain(engine, context, stmt, &s_status);
+          Drain(*engine, *context, stmt, &s_status);
         } catch (const std::exception& ex) {
           ADD_FAILURE() << GetParam() << " / " << test_case.name
                         << " prepare threw: " << ex.what() << "\n"
@@ -322,7 +378,7 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
         if (s_status != Status::kSuccess) {
           EXPECT_EQ(s_status, Status::kSuccess)
               << GetParam() << " / " << test_case.name
-              << " prepare failed: " << engine.LastError() << "\n"
+              << " prepare failed: " << engine->LastError() << "\n"
               << stmt;
           break;
         }
@@ -330,12 +386,41 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
       continue;
     }
 
+    if (!CaseFeatureSupported(test_case)) { continue; }
+    if (file_mutates_state) {
+      engine.reset();
+      context.reset();
+      database->DeleteAll();
+      database.reset();
+      const std::string case_prefix =
+          path_prefix + "-" + std::to_string(++environment_generation);
+      database = std::make_unique<Database>(case_prefix);
+      context = std::make_unique<TransactionContext>(database->BeginContext());
+      engine = std::make_unique<SqlEngine>(*database);
+      replay_prepared_state();
+    }
+    SqlEngine::SetCompliancePrimaryKeyMode(
+        test_case.primary_key_mode == "first_column_is_primary_key");
 
     Status status = Status::kSuccess;
     std::string error_msg;
     std::vector<Row> rows;
     try {
-      rows = Drain(engine, context, test_case.sql, &status, &error_msg);
+      rows = Drain(*engine, *context, test_case.sql, &status, &error_msg);
+      if (status == Status::kSuccess &&
+          engine->LastStatementType().has_value()) {
+        const StatementType executed = *engine->LastStatementType();
+        if (executed == StatementType::kInsert ||
+            executed == StatementType::kUpdate ||
+            executed == StatementType::kDelete) {
+          // The reference driver reports num_rows_modified plus the full
+          // post-statement table contents; mirror that by scanning the
+          // target table after a successful mutation.
+          rows = Drain(*engine, *context,
+                       "SELECT * FROM `" + engine->LastDmlTable() + "`",
+                       &status, &error_msg);
+        }
+      }
     } catch (const std::exception& ex) {
       if (!test_case.expect_error) {
         ADD_FAILURE() << GetParam() << " / " << test_case.name
@@ -362,7 +447,7 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
           << test_case.raw_result;
     }
   }
-  database.DeleteAll();
+  database->DeleteAll();
 }
 
 std::vector<std::string> ComplianceFileNames() {
