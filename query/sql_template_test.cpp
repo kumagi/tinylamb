@@ -297,11 +297,11 @@ TEST(SqlTemplateTest, BindsJoinConditionBeforeWhereClause) {
       BinaryExpressionExp(ColumnValueExp("wb"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(2))));
   std::vector<SelectSource> sources;
-  sources.push_back(SelectSource{.table="t", .alias="t", .query=nullptr, .join_type=JoinType::kCross, .join_condition=nullptr});
-  sources.push_back(SelectSource{
-      .table="u", .alias="u", .query=nullptr, .join_type=JoinType::kInner,
-      .join_condition=BinaryExpressionExp(ColumnValueExp("ja"), BinaryOperation::kEquals,
-                          ConstantValueExp(Value(1)))});
+  sources.push_back(SelectSource("t", "t", nullptr, JoinType::kCross, nullptr));
+  sources.push_back(SelectSource(
+      "u", "u", nullptr, JoinType::kInner,
+      BinaryExpressionExp(ColumnValueExp("ja"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(1)))));
   cached->SetSources(std::move(sources));
 
   const SqlTemplate hit =

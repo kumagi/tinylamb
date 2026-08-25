@@ -1,0 +1,68 @@
+[name=constant_1]
+SELECT NULL
+--
+ARRAY<STRUCT<INT64>>[{NULL}]
+==
+[name=constant_2]
+SELECT 1
+--
+ARRAY<STRUCT<INT64>>[{1}]
+==
+[name=constant_3]
+SELECT 3.0
+--
+ARRAY<STRUCT<DOUBLE>>[{3}]
+==
+[name=constant_4]
+SELECT 'hi'
+--
+ARRAY<STRUCT<STRING>>[{"hi"}]
+==
+[name=constant_5]
+SELECT 1
+--
+ARRAY<STRUCT<INT64>>[{1}]
+==
+[name=constant_subquery_array]
+SELECT (SELECT [1])
+--
+ARRAY<STRUCT<ARRAY<>>>[{ARRAY<INT64>[1]}]
+==
+[name=constant_no_from_limit0]
+SELECT 1 as a
+LIMIT 0;
+--
+ARRAY<STRUCT<a INT64>>[]
+==
+[name=constant_no_from_limit1]
+SELECT 1 as a
+LIMIT 1;
+--
+ARRAY<STRUCT<a INT64>>[{1}]
+==
+[name=constant_no_from_limit2]
+SELECT 1 as a
+LIMIT 5;
+--
+ARRAY<STRUCT<a INT64>>[{1}]
+==
+[name=constant_no_from_limit_offset0]
+SELECT 1 as b, 'b' as b
+LIMIT 0 OFFSET 1;
+--
+ARRAY<STRUCT<b INT64, b STRING>>[]
+==
+[name=constant_no_from_limit_offset1]
+SELECT 1 as b, 'b' as b
+LIMIT 1 OFFSET 1;
+--
+ARRAY<STRUCT<b INT64, b STRING>>[]
+==
+[name=constant_no_from_limit_offset2]
+SELECT 1 as b, 'b' as b
+LIMIT 1 OFFSET 0;
+--
+ARRAY<STRUCT<b INT64, b STRING>>[{1, "b"}]
+==
+
+

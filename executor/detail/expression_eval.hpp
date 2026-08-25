@@ -36,10 +36,26 @@ void CollectAggregates(const Expression& expression,
                        std::vector<const AggregateExpression*>* aggregates,
                        std::unordered_set<const AggregateExpression*>* seen);
 
+// One row fed into an aggregate.  `order_keys` carries the evaluated inner
+// ORDER BY terms and `condition` the HAVING MAX/MIN condition value; both are
+// only populated when the aggregate declares them.
+struct AggregateInput {
+  Value value;
+  std::vector<Value> order_keys;
+  Value condition;
+  Value auxiliary;  // STRING_AGG delimiter
+};
+
+std::string ElementSqlTypeName(ValueType type);
+
 struct AggregateAccumulator {
   explicit AggregateAccumulator(const AggregateExpression* aggregate);
 
+  // Row-at-a-time accumulation for streaming aggregates.
   void Add(const Value& value);
+  // Full-input accumulation: buffers rows for aggregates that need whole-group
+  // context (HAVING modifier, inner ORDER BY/LIMIT, ARRAY_AGG, STRING_AGG).
+  void Add(const AggregateInput& input);
   Value Finish() const;
 
   const AggregateExpression* expression;
@@ -52,6 +68,19 @@ struct AggregateAccumulator {
   Value extreme;
   std::unique_ptr<std::unordered_set<Value>> distinct;
   std::unique_ptr<std::unordered_set<int64_t>> distinct_ints;
+
+ private:
+  struct BufferedRow {
+    Value value;
+    std::vector<Value> order_keys;
+    Value condition;
+    Value auxiliary;
+  };
+  mutable std::unique_ptr<std::vector<BufferedRow>> buffer_;
+  mutable std::vector<Value> array_values_;
+  mutable std::optional<std::string> delimiter_;
+
+  void ApplyCore(const Value& value);
 };
 
 using AggregateResultMap =

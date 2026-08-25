@@ -15,8 +15,10 @@
 #include <vector>
 
 #include "expression/aggregate_expression.hpp"
+#include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
@@ -186,6 +188,15 @@ Expression BindExpression(const Expression& expression,  // NOLINT(misc-no-recur
       }
       return FunctionCallExp(call.FuncName(), std::move(args));
     }
+    case TypeTag::kArrayExp: {
+      const auto& array = expression->AsArrayExpression();
+      std::vector<Expression> elements;
+      elements.reserve(array.Elements().size());
+      for (const Expression& element : array.Elements()) {
+        elements.push_back(BindExpression(element, parameters, index));
+      }
+      return ArrayExpressionExp(std::move(elements), array.ElementSqlType());
+    }
     case TypeTag::kQueryExp: {
       const auto& query = expression->AsQueryExpression();
       // Text order inside "test IN (SELECT ...)": the tested expression comes
@@ -198,6 +209,11 @@ Expression BindExpression(const Expression& expression,  // NOLINT(misc-no-recur
     case TypeTag::kIntervalExp: {
       const auto& interval = expression->AsIntervalExpression();
       return IntervalExpressionExp(interval.Amount(), interval.Unit());
+    }
+    case TypeTag::kCastExp: {
+      const auto& cast = expression->AsCastExpression();
+      Expression child = BindExpression(cast.Child(), parameters, index);
+      return std::make_shared<CastExpression>(std::move(child), cast.TargetTypeName(), cast.ReturnNullOnError());
     }
     default:
       // Unhandled expression kinds return the cached tree's subtree SHARED
@@ -286,11 +302,21 @@ bool ContainsBindableConstant(const Expression& expression) {  // NOLINT(misc-no
 }
       }
       return false;
+    case TypeTag::kArrayExp:
+      for (const Expression& element :
+           expression->AsArrayExpression().Elements()) {
+        if (ContainsBindableConstant(element)) { return true;
+}
+      }
+      return false;
     case TypeTag::kQueryExp: {
       const auto& query = expression->AsQueryExpression();
       return ContainsBindableConstant(query.Test()) ||
              SelectHasBindableConstant(*query.Query());
     }
+    case TypeTag::kCastExp:
+      return ContainsBindableConstant(
+          expression->AsCastExpression().Child());
     default:
       return false;
   }

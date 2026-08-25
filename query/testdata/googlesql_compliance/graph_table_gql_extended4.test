@@ -1,0 +1,1047 @@
+[default reserve_graph_table]
+[default required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY]
+[prepare_database]
+CREATE TABLE person AS
+(SELECT 1 AS id, "name1" AS name) UNION ALL
+(SELECT 2 AS id, "name2" AS name) UNION ALL
+(SELECT 3 as id, "name3" AS name)
+--
+ARRAY<STRUCT<id INT64, name STRING>>[{1, "name1"}, {2, "name2"}, {3, "name3"}]
+==
+[prepare_database]
+CREATE TABLE person_knows_person AS
+(SELECT 100 AS id, 1 AS from_person_id, 1 AS to_person_id, TIMESTAMP '2000-01-01 00:00:00' AS since) UNION ALL
+(SELECT 200 AS id, 1 AS from_person_id, 2 AS to_person_id, TIMESTAMP '2000-01-02 00:00:00' AS since) UNION ALL
+(SELECT 300 AS id, 2 AS from_person_id, 1 AS to_person_id, TIMESTAMP '2000-01-03 00:00:00' AS since)
+--
+ARRAY<STRUCT<id INT64, from_person_id INT64, to_person_id INT64, since TIMESTAMP>>[
+  {
+    100,
+    1,
+    1,
+    2000-01-01 08:00:00+00
+  },
+  {
+    200,
+    1,
+    2,
+    2000-01-02 08:00:00+00
+  },
+  {
+    300,
+    2,
+    1,
+    2000-01-03 08:00:00+00
+  }
+]
+==
+[prepare_database]
+CREATE TABLE account AS
+(SELECT 10 AS acct_id, 1 AS owner_id, "checking" AS kind
+) UNION ALL
+(SELECT 20 AS acct_id, 1 AS owner_id, "savings" AS kind
+) UNION ALL
+(SELECT 30 AS acct_id, 2 AS owner_id, "checking" AS kind
+)UNION ALL
+(SELECT 40 AS acct_id, 2 AS owner_id, "savings" as kind)
+--
+ARRAY<STRUCT<acct_id INT64, owner_id INT64, kind STRING>>[
+  {10, 1, "checking"},
+  {20, 1, "savings"},
+  {30, 2, "checking"},
+  {40, 2, "savings"}
+]
+==
+
+[prepare_database]
+CREATE TABLE transfer AS
+(SELECT 1 AS id, 10 AS from_account_id, 20 AS to_account_id, 100 AS amount) UNION ALL
+(SELECT 2 AS id, 10 AS from_account_id, 20 AS to_account_id, 200 AS amount) UNION ALL
+(SELECT 3 AS id, 20 AS from_account_id, 30 AS to_account_id, 300 AS amount) UNION ALL
+(SELECT 4 AS id, 20 AS from_account_id, 30 AS to_account_id, 400 AS amount) UNION ALL
+(SELECT 5 AS id, 30 AS from_account_id, 10 AS to_account_id, 500 AS amount) UNION ALL
+(SELECT 6 AS id, 10 AS from_account_id, 10 AS to_account_id, 600 AS amount)
+--
+ARRAY<STRUCT<
+        id INT64,
+        from_account_id INT64,
+        to_account_id INT64,
+        amount INT64
+      >>
+[{1, 10, 20, 100},
+ {2, 10, 20, 200},
+ {3, 20, 30, 300},
+ {4, 20, 30, 400},
+ {5, 30, 10, 500},
+ {6, 10, 10, 600}]
+==
+[prepare_database]
+CREATE TABLE login AS
+(SELECT 1 AS person_id, 10 AS account_id, TIMESTAMP "2023-01-01 00:00:00 UTC" AS timestamp) UNION ALL
+(SELECT 2 AS person_id, 30 AS account_id, TIMESTAMP "2023-01-04 00:00:00 UTC" AS timestamp)
+--
+ARRAY<STRUCT<person_id INT64, account_id INT64, timestamp TIMESTAMP>>[
+  {
+    1,
+    10,
+    2023-01-01 00:00:00+00
+  },
+  {
+    2,
+    30,
+    2023-01-04 00:00:00+00
+  }
+]
+==
+# This edge table is "compressed". Each row represents M*N edges from M nodes
+# to N nodes.
+[prepare_database]
+CREATE TABLE can_transfer AS
+(SELECT "checking" AS src_acct_kind, "savings" AS dest_acct_kind)
+--
+ARRAY<STRUCT<
+        src_acct_kind STRING,
+        dest_acct_kind STRING
+      >>[{"checking", "savings"}]
+==
+[prepare_database]
+CREATE PROPERTY GRAPH aml
+  NODE TABLES (
+    Account KEY(acct_id)
+    DEFAULT LABEL PROPERTIES(
+      1000 + acct_id AS account_id,
+      owner_id,
+      kind AS account_kind)
+    LABEL HasId PROPERTIES (acct_id AS key_id),
+    Person KEY(id)
+    LABEL Human PROPERTIES(
+      100 AS id,
+      name)
+    LABEL HasId PROPERTIES (id as key_id))
+  EDGE TABLES (
+    person_knows_person AS Knows KEY(id)
+              SOURCE KEY(from_person_id) REFERENCES Person(id)
+              DESTINATION KEY(to_person_id) REFERENCES Person(id)
+              DEFAULT LABEL PROPERTIES(since),
+    Transfer KEY(id, from_account_id, to_account_id)
+              SOURCE KEY(from_account_id) REFERENCES Account(acct_id)
+              DESTINATION KEY(to_account_id) REFERENCES Account(acct_id)
+              DEFAULT LABEL PROPERTIES(amount),
+    Login KEY(person_id, account_id, timestamp)
+          SOURCE KEY(person_id) REFERENCES Person(id)
+          DESTINATION KEY(account_id) REFERENCES Account(acct_id)
+          DEFAULT LABEL PROPERTIES(timestamp),
+    can_transfer AS CanTransfer KEY(src_acct_kind, dest_acct_kind)
+                  SOURCE KEY(src_acct_kind) REFERENCES Account(kind)
+                  DESTINATION KEY(dest_acct_kind) REFERENCES Account(kind)
+                  LABEL can_transfer
+  )
+==
+
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION]
+[name=any_with_ties]
+select * from graph_table(aml
+  MATCH ANY (x:Account)((a)-[e:Transfer WHERE e.amount != 400 AND e.amount != 200]->(b)){2, 4}(y:Account)
+  return x.account_id AS x_id, y.account_id AS y_id
+)
+order by x_id, y_id
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64>>[known order:
+  {1010, 1010},
+  {1010, 1020},
+  {1010, 1030},
+  {1020, 1010},
+  {1020, 1020},
+  {1020, 1030},
+  {1030, 1010},
+  {1030, 1020},
+  {1030, 1030}
+]
+==
+
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_SEARCH_PREFIX_PATH_COUNT]
+[name=any_0_with_ties_counting_hops]
+select * from graph_table(aml
+  MATCH ANY 0 (x:Account)((a)-[e:Transfer]->(b)){1, 3}(y:Account)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id, hops
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_SEARCH_PREFIX_PATH_COUNT]
+[name=shortest_0_with_ties_counting_hops]
+select * from graph_table(aml
+  MATCH SHORTEST 0 (x:Account)((a)-[e:Transfer]->(b)){1, 3}(y:Account)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id, hops
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_SEARCH_PREFIX_PATH_COUNT]
+[name=any_2_with_ties]
+select x_id, y_id from graph_table(aml
+  MATCH ANY 2 (x:Account)((a)-[e:Transfer]->(b)){1, 3}(y:Account)
+  return x.account_id AS x_id, y.account_id AS y_id
+)
+order by x_id, y_id
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64>>[known order:
+  {1010, 1010},
+  {1010, 1010},
+  {1010, 1020},
+  {1010, 1020},
+  {1010, 1030},
+  {1010, 1030},
+  {1020, 1010},
+  {1020, 1010},
+  {1020, 1020},
+  {1020, 1020},
+  {1020, 1030},
+  {1020, 1030},
+  {1030, 1010},
+  {1030, 1010},
+  {1030, 1020},
+  {1030, 1020},
+  {1030, 1030},
+  {1030, 1030}
+]
+
+NOTE: Reference implementation reports non-determinism.
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_SEARCH_PREFIX_PATH_COUNT]
+[name=shortest_2_with_ties_counting_hops]
+select * from graph_table(aml
+  MATCH SHORTEST 2 (x:Account)((a)-[e:Transfer]->(b)){1, 3}(y:Account)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id, hops
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[known order:
+  {1010, 1010, 1},
+  {1010, 1010, 2},
+  {1010, 1020, 1},
+  {1010, 1020, 1},
+  {1010, 1030, 2},
+  {1010, 1030, 2},
+  {1020, 1010, 2},
+  {1020, 1010, 2},
+  {1020, 1020, 3},
+  {1020, 1020, 3},
+  {1020, 1030, 1},
+  {1020, 1030, 1},
+  {1030, 1010, 1},
+  {1030, 1010, 2},
+  {1030, 1020, 2},
+  {1030, 1020, 2},
+  {1030, 1030, 3},
+  {1030, 1030, 3}
+]
+
+NOTE: Reference implementation reports non-determinism.
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_SEARCH_PREFIX_PATH_COUNT]
+[name=shortest_10_with_ties_counting_hops]
+select * from graph_table(aml
+  MATCH SHORTEST 10 (x:Account)((a)-[e:Transfer]->(b)){1, 3}(y:Account)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id, hops
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[known order:
+  {1010, 1010, 1},
+  {1010, 1010, 2},
+  {1010, 1010, 3},
+  {1010, 1010, 3},
+  {1010, 1010, 3},
+  {1010, 1010, 3},
+  {1010, 1010, 3},
+  {1010, 1020, 1},
+  {1010, 1020, 1},
+  {1010, 1020, 2},
+  {1010, 1020, 2},
+  {1010, 1020, 3},
+  {1010, 1020, 3},
+  {1010, 1030, 2},
+  {1010, 1030, 2},
+  {1010, 1030, 2},
+  {1010, 1030, 2},
+  {1010, 1030, 3},
+  {1010, 1030, 3},
+  {1010, 1030, 3},
+  {1010, 1030, 3},
+  {1020, 1010, 2},
+  {1020, 1010, 2},
+  {1020, 1010, 3},
+  {1020, 1010, 3},
+  {1020, 1020, 3},
+  {1020, 1020, 3},
+  {1020, 1020, 3},
+  {1020, 1020, 3},
+  {1020, 1030, 1},
+  {1020, 1030, 1},
+  {1030, 1010, 1},
+  {1030, 1010, 2},
+  {1030, 1010, 3},
+  {1030, 1020, 2},
+  {1030, 1020, 2},
+  {1030, 1020, 3},
+  {1030, 1020, 3},
+  {1030, 1030, 3},
+  {1030, 1030, 3},
+  {1030, 1030, 3},
+  {1030, 1030, 3}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_SEARCH_PREFIX_PATH_COUNT]
+[name=any_10_with_ties_counting_hops]
+select * from graph_table(aml
+  MATCH ANY 10 (x:Account)((a)-[e:Transfer]->(b)){1, 3}(y:Account)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id, hops
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[known order:
+  {1010, 1010, 1},
+  {1010, 1010, 2},
+  {1010, 1010, 3},
+  {1010, 1010, 3},
+  {1010, 1010, 3},
+  {1010, 1010, 3},
+  {1010, 1010, 3},
+  {1010, 1020, 1},
+  {1010, 1020, 1},
+  {1010, 1020, 2},
+  {1010, 1020, 2},
+  {1010, 1020, 3},
+  {1010, 1020, 3},
+  {1010, 1030, 2},
+  {1010, 1030, 2},
+  {1010, 1030, 2},
+  {1010, 1030, 2},
+  {1010, 1030, 3},
+  {1010, 1030, 3},
+  {1010, 1030, 3},
+  {1010, 1030, 3},
+  {1020, 1010, 2},
+  {1020, 1010, 2},
+  {1020, 1010, 3},
+  {1020, 1010, 3},
+  {1020, 1020, 3},
+  {1020, 1020, 3},
+  {1020, 1020, 3},
+  {1020, 1020, 3},
+  {1020, 1030, 1},
+  {1020, 1030, 1},
+  {1030, 1010, 1},
+  {1030, 1010, 2},
+  {1030, 1010, 3},
+  {1030, 1020, 2},
+  {1030, 1020, 2},
+  {1030, 1020, 3},
+  {1030, 1020, 3},
+  {1030, 1030, 3},
+  {1030, 1030, 3},
+  {1030, 1030, 3},
+  {1030, 1030, 3}
+]
+==
+
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_SEARCH_PREFIX_PATH_COUNT]
+[name=any_0_with_no_ties_counting_hops]
+select * from graph_table(aml
+  MATCH ANY 0 (x:Account)((a)-[e:Transfer WHERE e.amount != 400 AND e.amount != 200]->(b)){2}(y:Account)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id, hops
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_SEARCH_PREFIX_PATH_COUNT]
+[name=shortest_0_with_no_ties_counting_hops]
+select * from graph_table(aml
+  MATCH SHORTEST 0 (x:Account)((a)-[e:Transfer WHERE e.amount != 400 AND e.amount != 200]->(b)){2}(y:Account)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id, hops
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_SEARCH_PREFIX_PATH_COUNT]
+[name=any_2_with_no_ties_counting_hops]
+select * from graph_table(aml
+  MATCH ANY 2 (x:Account)((a)-[e:Transfer WHERE e.amount != 400 AND e.amount != 200]->(b)){2}(y:Account)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id, hops
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[known order:
+  {1010, 1010, 2},
+  {1010, 1020, 2},
+  {1010, 1030, 2},
+  {1020, 1010, 2},
+  {1030, 1010, 2},
+  {1030, 1020, 2}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_SEARCH_PREFIX_PATH_COUNT]
+[name=shortest_2_with_no_ties_counting_hops]
+select * from graph_table(aml
+  MATCH SHORTEST 2 (x:Account)((a)-[e:Transfer WHERE e.amount != 400 AND e.amount != 200]->(b)){2}(y:Account)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id, hops
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[known order:
+  {1010, 1010, 2},
+  {1010, 1020, 2},
+  {1010, 1030, 2},
+  {1020, 1010, 2},
+  {1030, 1010, 2},
+  {1030, 1020, 2}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_SEARCH_PREFIX_PATH_COUNT]
+[name=shortest_10_with_no_ties_counting_hops]
+select * from graph_table(aml
+  MATCH SHORTEST 10 (x:Account)((a)-[e:Transfer WHERE e.amount != 400 AND e.amount != 200]->(b)){2}(y:Account)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id, hops
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[known order:
+  {1010, 1010, 2},
+  {1010, 1020, 2},
+  {1010, 1030, 2},
+  {1020, 1010, 2},
+  {1030, 1010, 2},
+  {1030, 1020, 2}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_SEARCH_PREFIX_PATH_COUNT]
+[name=any_10_with_no_ties_counting_hops]
+select * from graph_table(aml
+  MATCH ANY 10 (x:Account)((a)-[e:Transfer WHERE e.amount != 400 AND e.amount != 200]->(b)){2}(y:Account)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id, hops
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[known order:
+  {1010, 1010, 2},
+  {1010, 1020, 2},
+  {1010, 1030, 2},
+  {1020, 1010, 2},
+  {1030, 1010, 2},
+  {1030, 1020, 2}
+]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION]
+[name=no_match_from_label_or_where_or_quantifier_1]
+# path pattern finds no matches due to label-expr
+select * from graph_table(aml
+  MATCH ANY (x:Account)-[e]->{2, 4}(y:Human)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.id AS y_id, hops
+  UNION ALL
+  MATCH ANY SHORTEST ((x:Account)-[e:Transfer]->{2, 4}(y) WHERE false)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+  UNION ALL
+  MATCH ANY ((x:Account)-[e]->{1}(y:Account) WHERE x.account_id = 1010 AND y.account_id = 1030)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[]
+
+NOTE: Reference implementation reports non-determinism.
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION]
+[name=no_match_from_label_or_where_or_quantifier_2]
+# path pattern finds no matches due to label-expr
+select * from graph_table(aml
+  MATCH ANY SHORTEST (x:Account)-[e]->{2, 4}(y:Human)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.id AS y_id, hops
+  UNION ALL
+  MATCH ANY ((x:Account)-[e:Transfer]->{2, 4}(y) WHERE false)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+  UNION ALL
+  MATCH ANY SHORTEST ((x:Account)-[e]->{1}(y:Account) WHERE x.account_id = 1010 AND y.account_id = 1030)
+  let hops = ARRAY_LENGTH(e)
+  return x.account_id AS x_id, y.account_id AS y_id, hops
+)
+order by x_id, y_id
+--
+ARRAY<STRUCT<x_id INT64, y_id INT64, hops INT64>>[]
+
+NOTE: Reference implementation reports non-determinism.
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY]
+[name=unspecified_path_mode_with_scalar_edges]
+# This serves as a baseline for the following path mode tests. Note the repeated edges and nodes in the results.
+select * from graph_table(aml
+  MATCH (a:Account {account_id: 1010})-[e1:Transfer]->(b:Account)-[e2:Transfer]->(c:Account)-[e3:Transfer]->(d:Account)
+  return a.account_id as a_id, e1.amount as e1_amount, b.account_id as b_id, e2.amount as e2_amount, c.account_id as c_id, e3.amount as e3_amount, d.account_id as d_id
+)
+ORDER BY 1, 2, 3, 4, 5, 6, 7
+--
+ARRAY<STRUCT<a_id INT64,
+             e1_amount INT64,
+             b_id INT64,
+             e2_amount INT64,
+             c_id INT64,
+             e3_amount INT64,
+             d_id INT64>>
+[known order:
+  {1010, 100, 1020, 300, 1030, 500, 1010},
+  {1010, 100, 1020, 400, 1030, 500, 1010},
+  {1010, 200, 1020, 300, 1030, 500, 1010},
+  {1010, 200, 1020, 400, 1030, 500, 1010},
+  {1010, 600, 1010, 100, 1020, 300, 1030},
+  {1010, 600, 1010, 100, 1020, 400, 1030},
+  {1010, 600, 1010, 200, 1020, 300, 1030},
+  {1010, 600, 1010, 200, 1020, 400, 1030},
+  {1010, 600, 1010, 600, 1010, 100, 1020},
+  {1010, 600, 1010, 600, 1010, 200, 1020},
+  {1010, 600, 1010, 600, 1010, 600, 1010}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE]
+[name=walk_path_mode_with_scalar_edges]
+# Similar to unspecified path mode case above.
+select * from graph_table(aml
+  MATCH WALK (a:Account {account_id: 1010})-[e1:Transfer]->(b:Account)-[e2:Transfer]->(c:Account)-[e3:Transfer]->(d:Account)
+  return a.account_id as a_id, e1.amount as e1_amount, b.account_id as b_id, e2.amount as e2_amount, c.account_id as c_id, e3.amount as e3_amount, d.account_id as d_id
+)
+ORDER BY 1, 2, 3, 4, 5, 6, 7
+--
+ARRAY<STRUCT<a_id INT64,
+             e1_amount INT64,
+             b_id INT64,
+             e2_amount INT64,
+             c_id INT64,
+             e3_amount INT64,
+             d_id INT64>>
+[known order:
+  {1010, 100, 1020, 300, 1030, 500, 1010},
+  {1010, 100, 1020, 400, 1030, 500, 1010},
+  {1010, 200, 1020, 300, 1030, 500, 1010},
+  {1010, 200, 1020, 400, 1030, 500, 1010},
+  {1010, 600, 1010, 100, 1020, 300, 1030},
+  {1010, 600, 1010, 100, 1020, 400, 1030},
+  {1010, 600, 1010, 200, 1020, 300, 1030},
+  {1010, 600, 1010, 200, 1020, 400, 1030},
+  {1010, 600, 1010, 600, 1010, 100, 1020},
+  {1010, 600, 1010, 600, 1010, 200, 1020},
+  {1010, 600, 1010, 600, 1010, 600, 1010}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE]
+[name=trail_path_mode_with_scalar_edges]
+select * from graph_table(aml
+  MATCH TRAIL (a:Account {account_id: 1010})-[e1:Transfer]->(b:Account)-[e2:Transfer]->(c:Account)-[e3:Transfer]->(d:Account)
+  return a.account_id as a_id, e1.amount as e1_amount, b.account_id as b_id, e2.amount as e2_amount, c.account_id as c_id, e3.amount as e3_amount, d.account_id as d_id
+)
+ORDER BY 1, 2, 3, 4, 5, 6, 7
+--
+ARRAY<STRUCT<a_id INT64,
+             e1_amount INT64,
+             b_id INT64,
+             e2_amount INT64,
+             c_id INT64,
+             e3_amount INT64,
+             d_id INT64>>
+[known order:
+  {1010, 100, 1020, 300, 1030, 500, 1010},
+  {1010, 100, 1020, 400, 1030, 500, 1010},
+  {1010, 200, 1020, 300, 1030, 500, 1010},
+  {1010, 200, 1020, 400, 1030, 500, 1010},
+  {1010, 600, 1010, 100, 1020, 300, 1030},
+  {1010, 600, 1010, 100, 1020, 400, 1030},
+  {1010, 600, 1010, 200, 1020, 300, 1030},
+  {1010, 600, 1010, 200, 1020, 400, 1030}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE]
+[name=acyclic_path_mode_with_scalar_edges]
+select * from graph_table(aml
+  MATCH ACYCLIC (a:Account {account_id: 1010})-[e1:Transfer]->(b:Account)-[e2:Transfer]->(c:Account)-[e3:Transfer]->(d:Account)
+  return a.account_id as a_id, e1.amount as e1_amount, b.account_id as b_id, e2.amount as e2_amount, c.account_id as c_id, e3.amount as e3_amount, d.account_id as d_id
+)
+ORDER BY 1, 2, 3, 4, 5, 6, 7
+--
+ARRAY<STRUCT<a_id INT64,
+             e1_amount INT64,
+             b_id INT64,
+             e2_amount INT64,
+             c_id INT64,
+             e3_amount INT64,
+             d_id INT64>>[]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE]
+[name=simple_path_mode_with_scalar_edges]
+select * from graph_table(aml
+  MATCH SIMPLE (a:Account {account_id: 1010})-[e1:Transfer]->(b:Account)-[e2:Transfer]->(c:Account)-[e3:Transfer]->(d:Account)
+  return a.account_id as a_id, e1.amount as e1_amount, b.account_id as b_id, e2.amount as e2_amount, c.account_id as c_id, e3.amount as e3_amount, d.account_id as d_id
+)
+ORDER BY 1, 2, 3, 4, 5, 6, 7
+--
+ARRAY<STRUCT<a_id INT64,
+             e1_amount INT64,
+             b_id INT64,
+             e2_amount INT64,
+             c_id INT64,
+             e3_amount INT64,
+             d_id INT64>>
+[known order:
+  {1010, 100, 1020, 300, 1030, 500, 1010},
+  {1010, 100, 1020, 400, 1030, 500, 1010},
+  {1010, 200, 1020, 300, 1030, 500, 1010},
+  {1010, 200, 1020, 400, 1030, 500, 1010}
+]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE]
+[name=trail_path_mode_with_scalar_edges_of_different_types]
+select * from graph_table(aml
+  MATCH TRAIL (a)-[e1]->(b)-[e2:Transfer]->(c)-[e3]->(d)
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{57}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE]
+[name=acyclic_path_mode_with_scalar_edges_of_different_types]
+select * from graph_table(aml
+  MATCH ACYCLIC (a)-[e1]->(b)-[e2:Transfer]->(c)-[e3]->(d)
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{16}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE]
+[name=simple_path_mode_with_scalar_edges_of_different_types]
+select * from graph_table(aml
+  MATCH SIMPLE (a)-[e1]->(b)-[e2:Transfer]->(c)-[e3]->(d)
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{32}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE]
+[name=trail_path_mode_with_duplicate_scalar_nodes]
+select * from graph_table(aml
+  MATCH TRAIL (a)->(b)(->(c)->(d))()
+  RETURN COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{87}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE]
+[name=acyclic_path_mode_with_duplicate_scalar_nodes]
+select * from graph_table(aml
+  MATCH ACYCLIC (a)->(b)(->(c)->(d))()
+  RETURN COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{25}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE]
+[name=simple_path_mode_with_duplicate_scalar_nodes]
+select * from graph_table(aml
+  MATCH SIMPLE (a)->(b)(->(c)->(d))()
+  RETURN COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{43}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=trail_path_mode_with_array_edges]
+select * from graph_table(aml
+  MATCH TRAIL ((a:Account)-[e:Transfer]->(b:Account)){3}
+  RETURN COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{20}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=acyclic_path_mode_with_array_edges]
+select * from graph_table(aml
+  MATCH ACYCLIC ((a:Account)-[e:Transfer]->(b:Account)){3}
+  RETURN COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{0}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=simple_path_mode_with_array_edges]
+select * from graph_table(aml
+  MATCH SIMPLE ((a:Account)-[e:Transfer]->(b:Account)){3}
+  RETURN COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{12}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=trail_path_mode_with_array_edges_of_different_types]
+select * from graph_table(aml
+  MATCH TRAIL (a)-[e1]->{1,3}(b)
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{140}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=acyclic_path_mode_with_array_edges_of_different_types]
+select * from graph_table(aml
+  MATCH ACYCLIC (a)-[e1]->{1,3}(b)
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{61}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=simple_path_mode_with_array_edges_of_different_types]
+select * from graph_table(aml
+  MATCH SIMPLE (a)-[e1]->{1,3}(b)
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{87}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=trail_path_mode_with_scalar_and_array_edges]
+select * from graph_table(aml
+  MATCH TRAIL (a:Human)-[e1]->(b:Human)-[e2]->{1,3}(c:Human)
+  RETURN a.key_id as a_id, b.key_id as b_id, c.key_id as c_id, ARRAY_LENGTH(e2) as path_legnth
+  ORDER BY a_id, b_id, c_id, path_legnth
+)
+--
+ARRAY<STRUCT<a_id INT64, b_id INT64, c_id INT64, path_legnth INT64>>[unknown order:
+  {1, 1, 1, 2},
+  {1, 1, 2, 1},
+  {1, 2, 1, 1},
+  {1, 2, 1, 2},
+  {2, 1, 1, 1},
+  {2, 1, 2, 1},
+  {2, 1, 2, 2}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=acyclic_path_mode_with_scalar_and_array_edges]
+select * from graph_table(aml
+  MATCH ACYCLIC (a:Human)-[e1]->(b:Human)-[e2]->{1,3}(c:Human)
+  RETURN a.key_id as a_id, b.key_id as b_id, c.key_id as c_id, ARRAY_LENGTH(e2) as path_legnth
+  ORDER BY a_id, b_id, c_id, path_legnth
+)
+--
+ARRAY<STRUCT<a_id INT64, b_id INT64, c_id INT64, path_legnth INT64>>[]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=simple_path_mode_with_scalar_and_array_edges]
+select * from graph_table(aml
+  MATCH SIMPLE (a:Human)-[e1]->(b:Human)-[e2]->{1,3}(c:Human)
+  RETURN a.key_id as a_id, b.key_id as b_id, c.key_id as c_id, ARRAY_LENGTH(e2) as path_legnth
+  ORDER BY a_id, b_id, c_id, path_legnth
+)
+--
+ARRAY<STRUCT<a_id INT64, b_id INT64, c_id INT64, path_legnth INT64>>[unknown order:
+  {1, 2, 1, 1},
+  {2, 1, 2, 1}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE,UNNEST_AND_FLATTEN_ARRAYS]
+[name=trail_path_mode_with_scalar_and_long_array_edges_of_different_types]
+select * from graph_table(aml
+  MATCH TRAIL (a)-[e1]->((b:Account)-[e2:Transfer WHERE MOD(e2.amount, 200) != 0]->(c:Account)-[e3:Transfer WHERE MOD(e3.amount, 200) != 0]->(d:Account)){1}(e:Account)
+  RETURN a.key_id as a_id, flatten(b.account_id) as b_ids, flatten(c.account_id) as c_ids, flatten(d.account_id) as d_ids
+  ORDER BY a_id, e.key_id
+)
+--
+ARRAY<STRUCT<a_id INT64, b_ids ARRAY<>, c_ids ARRAY<>, d_ids ARRAY<>>>[unknown order:
+  {1, ARRAY<INT64>[1010], ARRAY<INT64>[1020], ARRAY<INT64>[1030]},
+  {2, ARRAY<INT64>[1030], ARRAY<INT64>[1010], ARRAY<INT64>[1020]},
+  {10, ARRAY<INT64>[1020], ARRAY<INT64>[1030], ARRAY<INT64>[1010]},
+  {10, ARRAY<INT64>[1020], ARRAY<INT64>[1030], ARRAY<INT64>[1010]},
+  {10, ARRAY<INT64>[1020], ARRAY<INT64>[1030], ARRAY<INT64>[1010]},
+  {10, ARRAY<INT64>[1010], ARRAY<INT64>[1020], ARRAY<INT64>[1030]},
+  {20, ARRAY<INT64>[1030], ARRAY<INT64>[1010], ARRAY<INT64>[1020]},
+  {20, ARRAY<INT64>[1030], ARRAY<INT64>[1010], ARRAY<INT64>[1020]},
+  {30, ARRAY<INT64>[1020], ARRAY<INT64>[1030], ARRAY<INT64>[1010]},
+  {30, ARRAY<INT64>[1010], ARRAY<INT64>[1020], ARRAY<INT64>[1030]}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE,UNNEST_AND_FLATTEN_ARRAYS]
+[name=acyclic_path_mode_with_scalar_and_long_array_edges_of_different_types]
+select * from graph_table(aml
+  MATCH ACYCLIC (a)-[e1]->((b:Account)-[e2:Transfer WHERE MOD(e2.amount, 200) != 0]->(c:Account)-[e3:Transfer WHERE MOD(e3.amount, 200) != 0]->(d:Account)){1}(e:Account)
+  RETURN a.key_id as a_id, flatten(b.account_id) as b_ids, flatten(c.account_id) as c_ids, flatten(d.account_id) as d_ids
+  ORDER BY a_id, e.key_id
+)
+--
+ARRAY<STRUCT<a_id INT64, b_ids ARRAY<>, c_ids ARRAY<>, d_ids ARRAY<>>>[unknown order:
+  {1, ARRAY<INT64>[1010], ARRAY<INT64>[1020], ARRAY<INT64>[1030]},
+  {2, ARRAY<INT64>[1030], ARRAY<INT64>[1010], ARRAY<INT64>[1020]}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE,UNNEST_AND_FLATTEN_ARRAYS]
+[name=simple_path_mode_with_scalar_and_long_array_edges_of_different_types]
+select * from graph_table(aml
+  MATCH SIMPLE (a)-[e1]->((b:Account)-[e2:Transfer WHERE MOD(e2.amount, 200) != 0]->(c:Account)-[e3:Transfer WHERE MOD(e3.amount, 200) != 0]->(d:Account)){1}(e:Account)
+  RETURN a.key_id as a_id, flatten(b.account_id) as b_ids, flatten(c.account_id) as c_ids, flatten(d.account_id) as d_ids
+  ORDER BY a_id, e.key_id
+)
+--
+ARRAY<STRUCT<a_id INT64, b_ids ARRAY<>, c_ids ARRAY<>, d_ids ARRAY<>>>[unknown order:
+  {1, ARRAY<INT64>[1010], ARRAY<INT64>[1020], ARRAY<INT64>[1030]},
+  {2, ARRAY<INT64>[1030], ARRAY<INT64>[1010], ARRAY<INT64>[1020]},
+  {10, ARRAY<INT64>[1020], ARRAY<INT64>[1030], ARRAY<INT64>[1010]},
+  {10, ARRAY<INT64>[1020], ARRAY<INT64>[1030], ARRAY<INT64>[1010]},
+  {10, ARRAY<INT64>[1020], ARRAY<INT64>[1030], ARRAY<INT64>[1010]},
+  {20, ARRAY<INT64>[1030], ARRAY<INT64>[1010], ARRAY<INT64>[1020]},
+  {20, ARRAY<INT64>[1030], ARRAY<INT64>[1010], ARRAY<INT64>[1020]},
+  {30, ARRAY<INT64>[1010], ARRAY<INT64>[1020], ARRAY<INT64>[1030]}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=trail_path_mode_with_array_edges_and_duplicate_scalar_nodes]
+select * from graph_table(aml
+  MATCH TRAIL (a)((b)-[e1]->){2}->(c)
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{87}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=acyclic_path_mode_with_array_edges_and_duplicate_scalar_nodes]
+select * from graph_table(aml
+  MATCH ACYCLIC (a)((b)-[e1]->){2}->(c)
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{25}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=simple_path_mode_with_array_edges_and_duplicate_scalar_nodes]
+select * from graph_table(aml
+  MATCH SIMPLE (a)((b)-[e1]->){2}->(c)
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{43}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=trail_path_mode_with_scalar_and_array_edges_of_different_types]
+select * from graph_table(aml
+  MATCH TRAIL (a)-[e1:Transfer]->(b)-[e2]->{1,3}(c)
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{133}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=acyclic_path_mode_with_scalar_and_array_edges_of_different_types]
+select * from graph_table(aml
+  MATCH ACYCLIC (a)-[e1:Transfer]->(b)-[e2]->{1,3}(c)
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{18}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=simple_path_mode_with_scalar_and_array_edges_of_different_types]
+select * from graph_table(aml
+  MATCH SIMPLE (a)-[e1:Transfer]->(b)-[e2]->{1,3}(c)
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{36}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=trail_path_mode_with_array_edges_over_quantified_paths]
+select * from graph_table(aml
+  MATCH TRAIL ((-[e]->)){1,3}
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{140}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=acyclic_path_mode_with_array_edges_over_quantified_paths]
+select * from graph_table(aml
+  MATCH ACYCLIC ((-[e]->)){1,3}
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{61}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=simple_path_mode_with_array_edges_over_quantified_paths]
+select * from graph_table(aml
+  MATCH SIMPLE ((-[e]->)){1,3}
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{87}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=trail_path_mode_with_scalar_edges_within_quantified_paths]
+select * from graph_table(aml
+  MATCH (TRAIL (-[e]->)){1,3}
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{159}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=acyclic_path_mode_with_scalar_edges_within_quantified_paths]
+select * from graph_table(aml
+  MATCH (ACYCLIC (-[e]->)){1,3}
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{107}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE]
+[name=simple_path_mode_with_scalar_edges_within_quantified_paths]
+select * from graph_table(aml
+  MATCH (SIMPLE (-[e]->)){1,3}
+  return COUNT(1) as num_paths
+)
+--
+ARRAY<STRUCT<num_paths INT64>>[{159}]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE,SQL_GRAPH_PATH_TYPE]
+[name=walk_path_mode_with_scalar_edges_with_path_variable]
+# This serves as a baseline for the following trail test. Note the repeated edge on the results.
+select * from graph_table(aml
+  MATCH p=WALK (a:Account {account_id: 1010})-[e1:Transfer]->(b:Account {account_id: 1010})-[e2:Transfer]->(c:Account)
+  return a.account_id as a_id, e1.amount as e1_amount, b.account_id as b_id, e2.amount as e2_amount, c.account_id as c_id, path_length(p) as len
+)
+ORDER BY 1, 2, 3, 4, 5, 6
+--
+
+ARRAY<STRUCT<a_id INT64,
+             e1_amount INT64,
+             b_id INT64,
+             e2_amount INT64,
+             c_id INT64,
+             len INT64>>
+[known order:
+  {1010, 600, 1010, 100, 1020, 2},
+  {1010, 600, 1010, 200, 1020, 2},
+  {1010, 600, 1010, 600, 1010, 2}
+]
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE,SQL_GRAPH_PATH_TYPE]
+[name=trail_path_mode_with_scalar_edges_with_path_variable]
+select * from graph_table(aml
+  MATCH p=TRAIL (a:Account {account_id: 1010})-[e1:Transfer]->(b:Account {account_id: 1010})-[e2:Transfer]->(c:Account)
+  return a.account_id as a_id, e1.amount as e1_amount, b.account_id as b_id, e2.amount as e2_amount, c.account_id as c_id, path_length(p) as len
+)
+ORDER BY 1, 2, 3, 4, 5, 6
+--
+ARRAY<STRUCT<a_id INT64,
+             e1_amount INT64,
+             b_id INT64,
+             e2_amount INT64,
+             c_id INT64,
+             len INT64>>
+[known order:
+  {1010, 600, 1010, 100, 1020, 2},
+  {1010, 600, 1010, 200, 1020, 2}
+]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_PATH_MODE,SQL_GRAPH_PATH_TYPE]
+[name=trail_path_mode_with_scalar_edges_of_different_types_with_path_variable]
+select distinct len from graph_table(aml
+  MATCH p=TRAIL (a)-[e1]->(b)-[e2:Transfer]->(c)-[e3]->(d)
+  return path_length(p) as len
+)
+order by 1
+--
+ARRAY<STRUCT<len INT64>>[{3}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE,SQL_GRAPH_PATH_TYPE]
+[name=trail_path_mode_with_array_edges_with_path_variable]
+select distinct len from graph_table(aml
+  MATCH p=TRAIL (a)-[e1]->{1,3}(b)
+  return path_length(p) as len
+)
+order by 1
+--
+ARRAY<STRUCT<len INT64>>[known order:{1}, {2}, {3}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE,SQL_GRAPH_PATH_TYPE]
+[name=trail_path_mode_with_scalar_and_array_edges_with_path_variable]
+select distinct len from graph_table(aml
+  MATCH p=TRAIL (a)-[e1]->(b)-[e2]->{1,3}(c)
+  return path_length(p) as len
+)
+order by 1
+--
+ARRAY<STRUCT<len INT64>>[known order:{2}, {3}, {4}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE,SQL_GRAPH_PATH_TYPE]
+[name=trail_path_mode_with_scalar_and_array_edges_of_different_types_with_path_variable]
+select distinct len from graph_table(aml
+  MATCH p=TRAIL (a)-[e1:Transfer]->(b)-[e2]->{1,3}(c)
+  return path_length(p) as len
+)
+order by 1
+--
+ARRAY<STRUCT<len INT64>>[known order:{2}, {3}, {4}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE,SQL_GRAPH_PATH_TYPE]
+[name=trail_path_mode_with_array_edges_over_quantified_paths_with_path_variable]
+select distinct len from graph_table(aml
+  MATCH p=TRAIL ((-[e]->)){1,3}
+  return path_length(p) as len
+)
+order by 1
+--
+ARRAY<STRUCT<len INT64>>[known order:{1}, {2}, {3}]
+
+==
+[required_features=SQL_GRAPH,SQL_GRAPH_ADVANCED_QUERY,SQL_GRAPH_BOUNDED_PATH_QUANTIFICATION,SQL_GRAPH_PATH_MODE,SQL_GRAPH_PATH_TYPE]
+[name=trail_path_mode_with_scalar_edges_within_quantified_paths_with_path_variable]
+select distinct len from graph_table(aml
+  MATCH p=(TRAIL (-[e]->)){1,3}
+  return path_length(p) as len
+)
+order by 1
+--
+ARRAY<STRUCT<len INT64>>[known order:{1}, {2}, {3}]

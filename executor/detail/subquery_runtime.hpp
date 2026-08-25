@@ -103,7 +103,8 @@ Relation ExecuteQuery(TransactionContext& context,
 Relation FinishQuery(TransactionContext& context,
                      const SelectStatement& statement, Relation input,
                      const Scope* outer, const CteMap& ctes,
-                     bool apply_where = true);
+                     bool apply_where = true,
+                     size_t hidden_columns = 0);
 
 std::optional<Relation> ExecuteCorrelatedSingleSource(
     TransactionContext& context, const SelectStatement& statement,

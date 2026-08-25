@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <exception>
 #include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -14,8 +15,10 @@
 
 #include "common/constants.hpp"
 #include "expression/aggregate_expression.hpp"
+#include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
@@ -698,6 +701,59 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         }
       }));
     built.Add(ExpressionRule(
+      "collapse_nested_identical_cast", Is(TypeTag::kCastExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& outer = expression->AsCastExpression();
+        if (!outer.Child() || outer.Child()->Type() != TypeTag::kCastExp) {
+          return Expression{};
+        }
+        const auto& inner = outer.Child()->AsCastExpression();
+        if (inner.TargetTypeName() != outer.TargetTypeName() ||
+            inner.ReturnNullOnError() != outer.ReturnNullOnError()) {
+          return Expression{};
+        }
+        return outer.Child();
+      }));
+    built.Add(ExpressionRule(
+      "factor_or_common_and", AnyBinary(Any("left"), Any("right")),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& binary = expression->AsBinaryExpression();
+        if (binary.Op() != BinaryOperation::kOr) { return Expression{};
+}
+        const std::vector<Expression> left = SplitConjuncts(binary.Left());
+        const std::vector<Expression> right = SplitConjuncts(binary.Right());
+        if (left.empty() || right.empty()) { return Expression{};
+}
+        std::vector<Expression> common;
+        std::vector<Expression> left_rest;
+        for (const Expression& conjunct : left) {
+          const bool shared = std::ranges::any_of(
+              right, [&](const Expression& candidate) {
+                return Same(conjunct, candidate);
+              });
+          (shared ? common : left_rest).push_back(conjunct);
+        }
+        if (common.empty()) { return Expression{};
+}
+        std::vector<Expression> right_rest;
+        for (const Expression& conjunct : right) {
+          const bool shared = std::ranges::any_of(
+              common, [&](const Expression& candidate) {
+                return Same(conjunct, candidate);
+              });
+          if (!shared) { right_rest.push_back(conjunct);
+}
+        }
+        if (left_rest.empty() || right_rest.empty()) {
+          return CombineConjuncts(common);
+        }
+        return BinaryExpressionExp(
+            CombineConjuncts(common), BinaryOperation::kAnd,
+            BinaryExpressionExp(CombineConjuncts(left_rest),
+                                BinaryOperation::kOr,
+                                CombineConjuncts(right_rest)));
+      }));
+    built.Add(ExpressionRule(
       "reassociate_add_subtract_constants",
       Binary(BinaryOperation::kSubtract,
              Binary(BinaryOperation::kAdd, Any("inner"),
@@ -798,6 +854,10 @@ std::vector<Expression> ExpressionChildren(const Expression& expression) {
     }
     case TypeTag::kFunctionCallExp:
       return expression->AsFunctionCallExpression().Args();
+    case TypeTag::kArrayExp:
+      return expression->AsArrayExpression().Elements();
+    case TypeTag::kCastExp:
+      return {expression->AsCastExpression().Child()};
     case TypeTag::kQueryExp: {
       const auto& test = expression->AsQueryExpression().Test();
       return test ? std::vector<Expression>{test} : std::vector<Expression>{};
@@ -858,6 +918,17 @@ Expression WithExpressionChildren(const Expression& expression,
     case TypeTag::kFunctionCallExp:
       return FunctionCallExp(expression->AsFunctionCallExpression().FuncName(),
                              std::move(children));
+    case TypeTag::kArrayExp:
+      return ArrayExpressionExp(
+          std::move(children),
+          expression->AsArrayExpression().ElementSqlType());
+    case TypeTag::kCastExp: {
+      if (children.size() != 1) { throw std::invalid_argument("cast arity");
+}
+      const auto& cast = expression->AsCastExpression();
+      return CastExpressionExp(std::move(children[0]), cast.TargetTypeName(),
+                               cast.ReturnNullOnError());
+    }
     case TypeTag::kQueryExp: {
       const auto& query = expression->AsQueryExpression();
       if (children.size() > 1) { throw std::invalid_argument("query arity");

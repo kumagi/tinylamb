@@ -14,6 +14,8 @@
 #include <unordered_set>
 #include <string>
 #include <utility>
+#include <regex>
+
 
 #include "common/constants.hpp"
 #include "database/transaction_context.hpp"
@@ -22,10 +24,13 @@
 #include "executor/detail/relation.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
+
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
+#include "expression/array_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
 #include "expression/named_expression.hpp"
@@ -35,6 +40,7 @@
 #include "type/column_name.hpp"
 #include "query/statement.hpp"
 #include "type/date.hpp"
+#include "type/interval.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 #include "type/schema.hpp"
@@ -53,16 +59,40 @@ bool Truthy(const Value& value) {
   return !value.value.varchar_value.empty();
 }
 
+std::string ElementSqlTypeName(ValueType type) {
+  switch (type) {
+    case ValueType::kInt64:
+      return "INT64";
+    case ValueType::kDouble:
+      return "FLOAT64";
+    case ValueType::kVarChar:
+      return "STRING";
+    case ValueType::kDate:
+      return "DATE";
+    default:
+      return {};
+  }
+}
+
 namespace {
+
+bool IdentifierEquals(std::string_view left, std::string_view right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(),
+                    [](char lhs, char rhs) {
+                      return std::tolower(static_cast<unsigned char>(lhs)) ==
+                             std::tolower(static_cast<unsigned char>(rhs));
+                    });
+}
 
 int FindColumn(const Schema& schema, const ColumnName& name) {
   int match = -1;
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     const ColumnName& candidate = schema.GetColumn(i).Name();
     const bool exact = !name.schema.empty() &&
-                       candidate.schema == name.schema &&
-                       candidate.name == name.name;
-    const bool unqualified = name.schema.empty() && candidate.name == name.name;
+                       IdentifierEquals(candidate.schema, name.schema) &&
+                       IdentifierEquals(candidate.name, name.name);
+    const bool unqualified = name.schema.empty() && IdentifierEquals(candidate.name, name.name);
     if (exact || unqualified) {
       if (match >= 0 && unqualified) {
         throw std::runtime_error("ambiguous column " + name.name);
@@ -72,9 +102,16 @@ int FindColumn(const Schema& schema, const ColumnName& name) {
   }
   if (match < 0 && !name.schema.empty()) {
     for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-      if (schema.GetColumn(i).Name().name == name.name) {
-        if (match >= 0) { return -1;
-}
+      if (IdentifierEquals(schema.GetColumn(i).Name().name, name.name)) {
+        if (match >= 0) { return -1; }
+        match = static_cast<int>(i);
+      }
+    }
+  }
+  if (match < 0 && name.schema.empty()) {
+    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+      if (IdentifierEquals(schema.GetColumn(i).Name().schema, name.name)) {
+        if (match >= 0) { return -1; }
         match = static_cast<int>(i);
       }
     }
@@ -87,11 +124,9 @@ int FindColumn(const Schema& schema, const ColumnName& name) {
 Value Lookup(const ColumnName& name, const Scope& scope) {
   for (const Scope* current = &scope; current != nullptr;
        current = current->outer) {
-    if (current->row == nullptr || current->schema == nullptr) { continue;
-}
+    if (current->row == nullptr || current->schema == nullptr) { continue; }
     const int offset = FindColumn(*current->schema, name);
-    if (offset >= 0) { return (*current->row)[static_cast<size_t>(offset)];
-}
+    if (offset >= 0) { return (*current->row)[static_cast<size_t>(offset)]; }
   }
   throw std::runtime_error("column " + name.ToString() + " not found");
 }
@@ -208,6 +243,12 @@ bool ContainsAggregate(  // NOLINT(misc-no-recursion)
 }
       }
       return false;
+    case TypeTag::kArrayExp:
+      return std::ranges::any_of(
+          expression->AsArrayExpression().Elements(),
+          [](const Expression& element) {  // NOLINT(misc-no-recursion)
+            return ContainsAggregate(element);
+          });
     default:
       return false;
   }
@@ -248,9 +289,15 @@ AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate)
       : expression(aggregate),
         distinct(aggregate->Distinct()
                      ? std::make_unique<std::unordered_set<Value>>()
-                     : nullptr) {}
+                     : nullptr) {
+    if (aggregate->GetType() == AggregationType::kArrayAgg ||
+        aggregate->GetType() == AggregationType::kStringAgg ||
+        aggregate->NeedsGroupContext()) {
+      buffer_ = std::make_unique<std::vector<BufferedRow>>();
+    }
+  }
 
-void AggregateAccumulator::Add(const Value& value) {
+void AggregateAccumulator::ApplyCore(const Value& value) {
     if (value.IsNull()) { return;
 }
     if (distinct) {
@@ -294,13 +341,129 @@ void AggregateAccumulator::Add(const Value& value) {
 }
         break;
       case AggregationType::kMax:
-        if (extreme.IsNull() || extreme < value) { extreme = value;
-}
+        if (extreme.IsNull() || extreme < value) { extreme = value; }
+        break;
+      case AggregationType::kLogicalAnd:
+        if (!value.IsNull()) {
+          if (extreme.IsNull()) {
+            extreme = Value(value.Truthy() ? int64_t{1} : int64_t{0});
+          } else {
+            extreme = Value((extreme.Truthy() && value.Truthy()) ? int64_t{1} : int64_t{0});
+          }
+        }
+        break;
+      case AggregationType::kLogicalOr:
+        if (!value.IsNull()) {
+          if (extreme.IsNull()) {
+            extreme = Value(value.Truthy() ? int64_t{1} : int64_t{0});
+          } else {
+            extreme = Value((extreme.Truthy() || value.Truthy()) ? int64_t{1} : int64_t{0});
+          }
+        }
+        break;
+      case AggregationType::kCountIf:
+        if (!value.IsNull() && Truthy(value)) { ++count; }
+        break;
+      case AggregationType::kArrayAgg:
+      case AggregationType::kStringAgg:
+        array_values_.push_back(value);
         break;
     }
   }
 
+void AggregateAccumulator::Add(const AggregateInput& input) {
+    if (!buffer_) {
+      ApplyCore(input.value);
+      return;
+    }
+    buffer_->push_back(BufferedRow{input.value, input.order_keys,
+                                   input.condition, input.auxiliary});
+  }
+
+void AggregateAccumulator::Add(const Value& value) {
+    if (buffer_) {
+      buffer_->push_back(BufferedRow{value, {}, Value(), Value()});
+      return;
+    }
+    ApplyCore(value);
+  }
+
 Value AggregateAccumulator::Finish() const {
+    // Replay buffered rows: gate through the HAVING modifier, apply inner
+    // ORDER BY / LIMIT, then feed the survivors into the streaming logic
+    // (or build the ARRAY/STRING payload directly).
+    if (buffer_ != nullptr) {
+      std::vector<BufferedRow>& rows = *buffer_;
+      if (expression->Having() != AggregateHavingModifier::kNone) {
+        bool saw_threshold = false;
+        Value threshold;
+        for (const BufferedRow& row : rows) {
+          if (row.condition.IsNull()) { continue; }
+          if (!saw_threshold) {
+            threshold = row.condition;
+            saw_threshold = true;
+          } else if (expression->Having() ==
+                     AggregateHavingModifier::kMax) {
+            if (threshold < row.condition) { threshold = row.condition; }
+          } else if (row.condition < threshold) {
+            threshold = row.condition;
+          }
+        }
+        std::vector<BufferedRow> gated;
+        for (BufferedRow& row : rows) {
+          if (saw_threshold && !row.condition.IsNull() &&
+              row.condition == threshold) {
+            gated.push_back(std::move(row));
+          }
+        }
+        rows = std::move(gated);
+      }
+      if (!expression->InnerOrderBy().empty()) {
+        const auto& terms = expression->InnerOrderBy();
+        std::stable_sort(rows.begin(), rows.end(),
+                         [&](const BufferedRow& left,
+                             const BufferedRow& right) {
+                           for (size_t t = 0; t < terms.size(); ++t) {
+                             const WindowOrderTerm& term = terms[t];
+                             const Value& a =
+                                 t < left.order_keys.size()
+                                     ? left.order_keys[t]
+                                     : Value();
+                             const Value& b =
+                                 t < right.order_keys.size()
+                                     ? right.order_keys[t]
+                                     : Value();
+                             const bool a_null = a.IsNull();
+                             const bool b_null = b.IsNull();
+                             if (a_null && b_null) { continue; }
+                             const bool nulls_first =
+                                 term.nulls_first.value_or(term.ascending);
+                             if (a_null) { return nulls_first; }
+                             if (b_null) { return !nulls_first; }
+                             try {
+                               return term.ascending ? a < b : b < a;
+                             } catch (...) {
+                               return false;
+                             }
+                           }
+                           return false;
+                         });
+      }
+      if (expression->InnerLimit().has_value()) {
+        const size_t limit = *expression->InnerLimit();
+        if (rows.size() > limit) { rows.resize(limit); }
+      }
+      for (const BufferedRow& row : rows) {
+        // Finish() is const by contract; replay mutates only scratch state.
+        const_cast<AggregateAccumulator*>(this)->ApplyCore(row.value);
+        // STRING_AGG delimiter comes from the first buffered row.
+        if (expression->GetType() == AggregationType::kStringAgg &&
+            !delimiter_.has_value() && !row.auxiliary.IsNull()) {
+          delimiter_ = row.auxiliary.AsString();
+        }
+      }
+      buffer_.reset();  // replayed
+    }
     switch (expression->GetType()) {
       case AggregationType::kCount:
         return Value(count);
@@ -310,8 +473,7 @@ Value AggregateAccumulator::Finish() const {
                    : Value((total + static_cast<double>(int_total)) /
                            static_cast<double>(count));
       case AggregationType::kSum:
-        if (count == 0) { return {};
-}
+        if (count == 0) { return {}; }
         if (!total_is_double && total == 0.0) {
           return Value(static_cast<int64_t>(int_total));
         }
@@ -319,6 +481,29 @@ Value AggregateAccumulator::Finish() const {
       case AggregationType::kMin:
       case AggregationType::kMax:
         return extreme;
+      case AggregationType::kLogicalAnd:
+      case AggregationType::kLogicalOr:
+        return extreme.IsNull() ? Value(int64_t{1}) : extreme;
+      case AggregationType::kArrayAgg: {
+        std::string element_type;
+        for (const Value& value : array_values_) {
+          if (!value.IsNull()) {
+            element_type = ElementSqlTypeName(value.type);
+            break;
+          }
+        }
+        return Value::Array(array_values_, element_type);
+      }
+      case AggregationType::kStringAgg: {
+        std::string out;
+        for (size_t i = 0; i < array_values_.size(); ++i) {
+          if (i) { out += delimiter_.value_or(","); }
+          out += array_values_[i].AsString();
+        }
+        return Value(std::move(out));
+      }
+      case AggregationType::kCountIf:
+        return Value(count);
     }
     return {};
   }
@@ -326,46 +511,1958 @@ Value AggregateAccumulator::Finish() const {
 
 namespace {
 
+struct CivilTime {
+  int year{1970};
+  int month{1};
+  int day{1};
+  int hour{0};
+  int minute{0};
+  int second{0};
+  int64_t subsecond_nanos{0};
+};
+
+bool ParseCivilTime(std::string_view s, CivilTime* ct) {
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) { s.remove_prefix(1); }
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) { s.remove_suffix(1); }
+  if (s.empty()) { return false; }
+  int Y = 0, M = 0, D = 0;
+  if (s.size() == 10 && sscanf(std::string(s).c_str(), "%d-%d-%d", &Y, &M, &D) == 3) {
+    ct->year = Y; ct->month = M; ct->day = D;
+    ct->hour = 0; ct->minute = 0; ct->second = 0;
+    ct->subsecond_nanos = 0;
+    return true;
+  }
+  int h = 0, m = 0, sec = 0;
+  char sep = ' ';
+  if (sscanf(std::string(s).c_str(), "%d-%d-%d%c%d:%d:%d", &Y, &M, &D, &sep, &h, &m, &sec) >= 6) {
+    ct->year = Y; ct->month = M; ct->day = D;
+    ct->hour = h; ct->minute = m; ct->second = sec;
+    ct->subsecond_nanos = 0;
+    size_t dot = s.find('.', 11);
+    if (dot != std::string_view::npos) {
+      size_t end_digits = dot + 1;
+      while (end_digits < s.size() && s[end_digits] >= '0' && s[end_digits] <= '9') {
+        ++end_digits;
+      }
+      std::string frac_str(s.substr(dot + 1, end_digits - (dot + 1)));
+      while (frac_str.size() < 9) { frac_str.push_back('0'); }
+      if (frac_str.size() > 9) { frac_str = frac_str.substr(0, 9); }
+      ct->subsecond_nanos = std::stoll(frac_str);
+    }
+    return true;
+  }
+  if (sscanf(std::string(s).c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
+    ct->year = 1970; ct->month = 1; ct->day = 1;
+    ct->hour = h; ct->minute = m; ct->second = sec;
+    ct->subsecond_nanos = 0;
+    size_t dot = s.find('.');
+    if (dot != std::string_view::npos) {
+      size_t end_digits = dot + 1;
+      while (end_digits < s.size() && s[end_digits] >= '0' && s[end_digits] <= '9') {
+        ++end_digits;
+      }
+      std::string frac_str(s.substr(dot + 1, end_digits - (dot + 1)));
+      while (frac_str.size() < 9) { frac_str.push_back('0'); }
+      if (frac_str.size() > 9) { frac_str = frac_str.substr(0, 9); }
+      ct->subsecond_nanos = std::stoll(frac_str);
+    }
+    return true;
+  }
+  return false;
+}
+
+CivilTime ShiftCivilTimeHours(const CivilTime& ct, int offset_hours) {
+  CivilTime res = ct;
+  int total_hours = res.hour + offset_hours;
+  int day_diff = 0;
+  if (total_hours >= 0) {
+    day_diff = total_hours / 24;
+    res.hour = total_hours % 24;
+  } else {
+    day_diff = (total_hours - 23) / 24;
+    res.hour = (total_hours % 24 + 24) % 24;
+  }
+  if (day_diff != 0) {
+    std::chrono::year_month_day ymd{std::chrono::year{res.year},
+                                    std::chrono::month{static_cast<unsigned>(res.month)},
+                                    std::chrono::day{static_cast<unsigned>(res.day)}};
+    int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count() + day_diff;
+    std::chrono::sys_days new_sd{std::chrono::days{days}};
+    std::chrono::year_month_day new_ymd{new_sd};
+    res.year = int(new_ymd.year());
+    res.month = unsigned(new_ymd.month());
+    res.day = unsigned(new_ymd.day());
+  }
+  return res;
+}
+
+int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr, int default_offset = 0) {
+  if (tz_str.empty()) { return default_offset; }
+  if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" || tz_str == "gmt" ||
+      tz_str == "Z" || tz_str == "z" || tz_str == "Etc/Greenwich" || tz_str == "Etc/UTC" || tz_str == "Etc/GMT") {
+    return 0;
+  }
+  if (tz_str.starts_with("UTC+") || tz_str.starts_with("UTC-") ||
+      tz_str.starts_with("GMT+") || tz_str.starts_with("GMT-")) {
+    char sign = tz_str[3];
+    int h = 0, m = 0;
+    std::string rem(tz_str.substr(4));
+    if (rem.find(':') != std::string::npos) {
+      sscanf(rem.c_str(), "%d:%d", &h, &m);
+    } else if (rem.size() == 4) {
+      sscanf(rem.c_str(), "%2d%2d", &h, &m);
+    } else {
+      sscanf(rem.c_str(), "%d", &h);
+    }
+    return (h * 3600 + m * 60) * (sign == '-' ? -1 : 1);
+  }
+  if (tz_str[0] == '+' || tz_str[0] == '-') {
+    char sign = tz_str[0];
+    int h = 0, m = 0;
+    std::string rem(tz_str.substr(1));
+    if (rem.find(':') != std::string::npos) {
+      sscanf(rem.c_str(), "%d:%d", &h, &m);
+    } else if (rem.size() == 4) {
+      sscanf(rem.c_str(), "%2d%2d", &h, &m);
+    } else {
+      sscanf(rem.c_str(), "%d", &h);
+    }
+    return (h * 3600 + m * 60) * (sign == '-' ? -1 : 1);
+  }
+  std::string zone_name(tz_str);
+  if (zone_name == "NZ-CHAT") { zone_name = "Pacific/Chatham"; }
+  try {
+    const auto* zone = std::chrono::locate_zone(zone_name);
+    if (zone) {
+      int y = ct ? ct->year : 2000;
+      int mon = ct ? ct->month : 1;
+      int d = ct ? ct->day : 1;
+      int h = ct ? ct->hour : 0;
+      int min = ct ? ct->minute : 0;
+      int s = ct ? ct->second : 0;
+      if (y < 1970) { y = 1970; }
+      std::chrono::year_month_day ymd{std::chrono::year{y},
+                                      std::chrono::month{static_cast<unsigned>(mon)},
+                                      std::chrono::day{static_cast<unsigned>(d)}};
+      std::chrono::local_days loc_d{ymd};
+      auto loc_tp = loc_d + std::chrono::hours{h} +
+                    std::chrono::minutes{min} + std::chrono::seconds{s};
+      auto loc_info = zone->get_info(loc_tp);
+      return static_cast<int>(loc_info.first.offset.count());
+    }
+  } catch (...) {}
+  return default_offset;
+}
+
+std::string FormatTimeZoneOffset(int tz_offset_sec) {
+  char buf[16];
+  int abs_sec = std::abs(tz_offset_sec);
+  int h = abs_sec / 3600;
+  int m = (abs_sec % 3600) / 60;
+  char sign = tz_offset_sec < 0 ? '-' : '+';
+  if (m == 0) {
+    snprintf(buf, sizeof(buf), "%c%02d", sign, h);
+  } else {
+    snprintf(buf, sizeof(buf), "%c%02d:%02d", sign, h, m);
+  }
+  return std::string(buf);
+}
+
+CivilTime ValueToCivilTime(const Value& val) {
+  CivilTime ct;
+  if (val.type == ValueType::kDate) {
+    std::chrono::sys_days sys_d{std::chrono::days{val.DateDays()}};
+    std::chrono::year_month_day ymd{sys_d};
+    ct.year = int(ymd.year());
+    ct.month = unsigned(ymd.month());
+    ct.day = unsigned(ymd.day());
+    return ct;
+  }
+  if (val.type == ValueType::kVarChar) {
+    if (ParseCivilTime(val.value.varchar_value, &ct)) {
+      return ct;
+    }
+  }
+  std::string s = val.AsString();
+  if (ParseCivilTime(s, &ct)) {
+    return ct;
+  }
+  throw std::runtime_error("requires DATE, DATETIME or TIMESTAMP");
+}
+
+int64_t CivilTimeToNanos(const CivilTime& ct) {
+  std::chrono::year_month_day ymd{std::chrono::year{ct.year},
+                                  std::chrono::month{static_cast<unsigned>(ct.month)},
+                                  std::chrono::day{static_cast<unsigned>(ct.day)}};
+  int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
+  int64_t secs = days * 86400LL + ct.hour * 3600LL + ct.minute * 60LL + ct.second;
+  return secs * 1000000000LL + ct.subsecond_nanos;
+}
+
+CivilTime NanosToCivilTime(int64_t nanos) {
+  auto floor_div = [](int64_t a, int64_t b) -> int64_t {
+    const int64_t q = a / b;
+    return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+  };
+  int64_t secs = floor_div(nanos, 1000000000LL);
+  int64_t sub_ns = nanos - secs * 1000000000LL;
+  int64_t days = floor_div(secs, 86400LL);
+  int64_t day_secs = secs - days * 86400LL;
+
+  std::chrono::sys_days sys_d{std::chrono::days{days}};
+  std::chrono::year_month_day ymd{sys_d};
+
+  CivilTime ct;
+  ct.year = int(ymd.year());
+  ct.month = unsigned(ymd.month());
+  ct.day = unsigned(ymd.day());
+  ct.hour = day_secs / 3600;
+  ct.minute = (day_secs % 3600) / 60;
+  ct.second = day_secs % 60;
+  ct.subsecond_nanos = sub_ns;
+  return ct;
+}
+
+std::string FormatCivilTime(const CivilTime& ct, bool include_subsecond = true, bool is_date_only = false) {
+  char buf[64];
+  if (is_date_only) {
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", ct.year, ct.month, ct.day);
+    return std::string(buf);
+  }
+  if (include_subsecond && ct.subsecond_nanos != 0) {
+    if (ct.subsecond_nanos % 1000000 == 0) {
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
+               ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000000);
+    } else if (ct.subsecond_nanos % 1000 == 0) {
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06ld",
+               ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000);
+    } else {
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%09ld",
+               ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
+    }
+    return std::string(buf);
+  }
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+           ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second);
+  return std::string(buf);
+}
+
 // Mutual recursion with Evaluate above; expression trees are the intended
 // shape here.
 Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     const FunctionCallExpression& call, const Scope& scope,
     const AggregateResultMap* aggregates, TransactionContext& context,
     const CteMap& ctes) {
-  const std::string& name = call.FuncName();
-  if (name == "date_add" || name == "date_sub") {
+  auto raw_str = [](const Value& val) -> std::string {
+    if (val.type == ValueType::kVarChar) {
+      return std::string(val.value.varchar_value);
+    }
+    return val.AsString();
+  };
+  std::string name = call.FuncName();
+  for (char& c : name) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+  if (name == "date_add" || name == "date_sub" ||
+      name == "datetime_add" || name == "datetime_sub" ||
+      name == "timestamp_add" || name == "timestamp_sub") {
     if (call.Args().size() != 2 ||
         call.Args()[1]->Type() != TypeTag::kIntervalExp) {
-      throw std::runtime_error("DATE_ADD/DATE_SUB arity");
+      throw std::runtime_error(name + " arity");
     }
-    const Value date =
+    const Value base =
         Evaluate(call.Args()[0], scope, aggregates, context, ctes);
-    if (date.IsNull()) { return {};
-}
+    if (base.IsNull()) { return {}; }
     const auto& interval = call.Args()[1]->AsIntervalExpression();
-    const int64_t amount = name == "date_sub" ? -interval.Amount()
-                                                : interval.Amount();
-    int64_t days = 0;
-    if (date.type == ValueType::kDate) {
-      days = date.DateDays();
-    } else if (date.type == ValueType::kVarChar) {
-      days = ParseDateDays(date.value.varchar_value);
-    } else {
-      throw std::runtime_error("DATE_ADD/DATE_SUB requires a date");
+    const bool is_sub = name.ends_with("_sub");
+    const int64_t raw_amount = interval.Amount();
+    std::string unit = std::string(interval.Unit());
+    for (char& c : unit) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+
+    CivilTime ct = ValueToCivilTime(base);
+    std::string base_s = raw_str(base);
+    bool is_timestamp = (base_s.find('+') != std::string::npos || base_s.find('Z') != std::string::npos || base_s.find('z') != std::string::npos);
+    if (is_timestamp) {
+      int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
+      int64_t ns = CivilTimeToNanos(ct) + tz_offset_sec * 1000000000LL;
+      ct = NanosToCivilTime(ns);
     }
-    const int64_t result = AddDateIntervalDays(days, amount, interval.Unit());
-    return date.type == ValueType::kDate
-               ? Value::DateFromDays(result)
-               : Value(FormatDateDays(result));
+    const bool is_date = (base.type == ValueType::kDate && (name == "date_add" || name == "date_sub"));
+
+    if (unit == "year" || unit == "years" || unit == "quarter" || unit == "quarters" || unit == "month" || unit == "months") {
+      int64_t amount = is_sub ? -raw_amount : raw_amount;
+      int64_t add_m = amount;
+      if (unit.starts_with("year")) { add_m = amount * 12; }
+      else if (unit.starts_with("quarter")) { add_m = amount * 3; }
+      int64_t total_m = (ct.year * 12 + (ct.month - 1)) + add_m;
+      int target_y = total_m / 12;
+      int target_m = (total_m % 12) + 1;
+      if (target_m <= 0) {
+        target_m += 12;
+        target_y -= 1;
+      }
+      using std::chrono::year_month_day_last;
+      using std::chrono::month_day_last;
+      using std::chrono::year;
+      using std::chrono::month;
+      year_month_day_last last_of_target{year{target_y}, month_day_last{month{static_cast<unsigned>(target_m)}}};
+      unsigned target_d = ct.day;
+      if (target_d > unsigned(last_of_target.day())) {
+        target_d = unsigned(last_of_target.day());
+      }
+      ct.year = target_y;
+      ct.month = target_m;
+      ct.day = target_d;
+      if (ct.year < 1 || ct.year > 9999) {
+        throw std::runtime_error("DATETIME out of range");
+      }
+      if (is_date) {
+        std::chrono::year_month_day ymd{year{ct.year}, month{static_cast<unsigned>(ct.month)}, std::chrono::day{static_cast<unsigned>(ct.day)}};
+        return Value::DateFromDays(std::chrono::sys_days{ymd}.time_since_epoch().count());
+      }
+      if (is_timestamp) {
+        int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
+        int64_t ns = CivilTimeToNanos(ct) - tz_offset_sec * 1000000000LL;
+        CivilTime utc_ct = NanosToCivilTime(ns);
+        return Value(FormatCivilTime(utc_ct) + "+00");
+      }
+      return Value(FormatCivilTime(ct));
+    }
+
+    int64_t delta_days = 0;
+    int64_t delta_sub_ns = 0;
+    if (raw_amount == std::numeric_limits<int64_t>::min()) {
+      uint64_t uamount = 9223372036854775808ULL;
+      if (unit == "nanosecond" || unit == "nanoseconds") {
+        delta_days = static_cast<int64_t>(uamount / (86400ULL * 1000000000ULL));
+        delta_sub_ns = static_cast<int64_t>(uamount % (86400ULL * 1000000000ULL));
+      }
+      if (!is_sub) { delta_days = -delta_days; delta_sub_ns = -delta_sub_ns; }
+    } else {
+      int64_t amount = is_sub ? -raw_amount : raw_amount;
+      if (unit == "day" || unit == "days") { delta_days = amount; }
+      else if (unit == "week" || unit == "weeks") { delta_days = amount * 7LL; }
+      else if (unit == "hour" || unit == "hours") {
+        delta_days = amount / 24;
+        delta_sub_ns = (amount % 24) * 3600LL * 1000000000LL;
+      } else if (unit == "minute" || unit == "minutes") {
+        delta_days = amount / (24 * 60);
+        delta_sub_ns = (amount % (24 * 60)) * 60LL * 1000000000LL;
+      } else if (unit == "second" || unit == "seconds") {
+        delta_days = amount / 86400LL;
+        delta_sub_ns = (amount % 86400LL) * 1000000000LL;
+      } else if (unit == "millisecond" || unit == "milliseconds") {
+        delta_days = amount / (86400LL * 1000LL);
+        delta_sub_ns = (amount % (86400LL * 1000LL)) * 1000000LL;
+      } else if (unit == "microsecond" || unit == "microseconds") {
+        delta_days = amount / (86400LL * 1000000LL);
+        delta_sub_ns = (amount % (86400LL * 1000000LL)) * 1000LL;
+      } else if (unit == "nanosecond" || unit == "nanoseconds") {
+        delta_days = amount / (86400LL * 1000000000LL);
+        delta_sub_ns = amount % (86400LL * 1000000000LL);
+      } else {
+        throw std::runtime_error("unsupported interval unit " + unit);
+      }
+    }
+
+    int64_t day_nanos = (ct.hour * 3600LL + ct.minute * 60LL + ct.second) * 1000000000LL + ct.subsecond_nanos + delta_sub_ns;
+    int64_t total_day_nanos = 86400LL * 1000000000LL;
+    auto floor_div = [](int64_t a, int64_t b) -> int64_t {
+      const int64_t q = a / b;
+      return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+    };
+    int64_t extra_days = floor_div(day_nanos, total_day_nanos);
+    int64_t rem_day_nanos = day_nanos - extra_days * total_day_nanos;
+
+    std::chrono::year_month_day cur_ymd{std::chrono::year{ct.year},
+                                        std::chrono::month{static_cast<unsigned>(ct.month)},
+                                        std::chrono::day{static_cast<unsigned>(ct.day)}};
+    int64_t cur_days = std::chrono::sys_days{cur_ymd}.time_since_epoch().count();
+    int64_t target_days = cur_days + delta_days + extra_days;
+    std::chrono::sys_days target_sys_days{std::chrono::days{target_days}};
+    std::chrono::year_month_day target_ymd{target_sys_days};
+
+    CivilTime res_ct;
+    res_ct.year = int(target_ymd.year());
+    res_ct.month = unsigned(target_ymd.month());
+    res_ct.day = unsigned(target_ymd.day());
+    int64_t rem_secs = rem_day_nanos / 1000000000LL;
+    res_ct.subsecond_nanos = rem_day_nanos % 1000000000LL;
+    res_ct.hour = rem_secs / 3600;
+    res_ct.minute = (rem_secs % 3600) / 60;
+    res_ct.second = rem_secs % 60;
+
+    if (res_ct.year < 1 || res_ct.year > 9999) {
+      throw std::runtime_error("DATETIME out of range");
+    }
+    if (is_date) {
+      std::chrono::year_month_day ymd{std::chrono::year{res_ct.year}, std::chrono::month{static_cast<unsigned>(res_ct.month)}, std::chrono::day{static_cast<unsigned>(res_ct.day)}};
+      return Value::DateFromDays(std::chrono::sys_days{ymd}.time_since_epoch().count());
+    }
+    if (is_timestamp) {
+      int64_t ns = CivilTimeToNanos(res_ct) + (8 * 3600LL) * 1000000000LL;
+      CivilTime utc_ct = NanosToCivilTime(ns);
+      return Value(FormatCivilTime(utc_ct) + "+00");
+    }
+    return Value(FormatCivilTime(res_ct));
   }
   std::vector<Value> arguments;
   for (const Expression& argument : call.Args()) {
     arguments.push_back(
         Evaluate(argument, scope, aggregates, context, ctes));
   }
+
+
+
+  auto to_lower = [](std::string_view s) -> std::string {
+    std::string out(s);
+    for (char& c : out) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+    return out;
+  };
+
+  if (name.starts_with("extract_")) {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error("EXTRACT requires 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    std::string arg0_str = raw_str(arguments[0]);
+    if (arguments[0].type == ValueType::kVarChar &&
+        arg0_str.find('-') != std::string::npos &&
+        arg0_str.find(' ') != std::string::npos &&
+        arg0_str.find('-') < arg0_str.find(' ')) {
+      IntervalValue iv = IntervalValue::Parse(arg0_str);
+      int64_t y = iv.months / 12;
+      int64_t m = iv.months % 12;
+      int64_t total_sec = iv.nanos / 1000000000LL;
+      int64_t sub_ns = iv.nanos % 1000000000LL;
+      int64_t h = total_sec / 3600;
+      int64_t min = (total_sec % 3600) / 60;
+      int64_t s = total_sec % 60;
+      if (name == "extract_year") { return Value(y); }
+      if (name == "extract_month") { return Value(m); }
+      if (name == "extract_day") { return Value(iv.days); }
+      if (name == "extract_hour") { return Value(h); }
+      if (name == "extract_minute") { return Value(min); }
+      if (name == "extract_second") { return Value(s); }
+      if (name == "extract_millisecond") { return Value(sub_ns / 1000000LL); }
+      if (name == "extract_microsecond") { return Value(sub_ns / 1000LL); }
+      if (name == "extract_nanosecond") { return Value(sub_ns); }
+    }
+    CivilTime ct = ValueToCivilTime(arguments[0]);
+    if (arguments.size() == 2) {
+      if (arguments[1].IsNull()) { return {}; }
+      std::string tz_str = raw_str(arguments[1]);
+      if (tz_str.empty() || tz_str == "invalid_time_zone") {
+        throw std::runtime_error("invalid timezone: " + tz_str);
+      }
+      int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct);
+      ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
+      int rem_mins = (tz_offset_sec % 3600) / 60;
+      if (rem_mins != 0) {
+        int total_m = ct.minute + rem_mins;
+        if (total_m >= 60) {
+          ct.minute = total_m - 60;
+          ct = ShiftCivilTimeHours(ct, 1);
+        } else if (total_m < 0) {
+          ct.minute = total_m + 60;
+          ct = ShiftCivilTimeHours(ct, -1);
+        } else {
+          ct.minute = total_m;
+        }
+      }
+    }
+    if (name == "extract_date") {
+      std::chrono::year_month_day ymd{std::chrono::year{ct.year}, std::chrono::month{static_cast<unsigned>(ct.month)}, std::chrono::day{static_cast<unsigned>(ct.day)}};
+      return Value::DateFromDays(std::chrono::sys_days{ymd}.time_since_epoch().count());
+    }
+    if (name == "extract_time") {
+      char buf[64];
+      if (ct.subsecond_nanos != 0) {
+        if (ct.subsecond_nanos % 1000000 == 0) {
+          snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000000);
+        } else if (ct.subsecond_nanos % 1000 == 0) {
+          snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000);
+        } else {
+          snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%09ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
+        }
+      } else {
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute, ct.second);
+      }
+      return Value(std::string(buf));
+    }
+    if (name == "extract_datetime") {
+      return Value(FormatCivilTime(ct));
+    }
+    if (name == "extract_year") { return Value(static_cast<int64_t>(ct.year)); }
+    if (name == "extract_quarter") { return Value(static_cast<int64_t>((ct.month - 1) / 3 + 1)); }
+    if (name == "extract_month") { return Value(static_cast<int64_t>(ct.month)); }
+    if (name == "extract_day") { return Value(static_cast<int64_t>(ct.day)); }
+    if (name == "extract_hour") { return Value(static_cast<int64_t>(ct.hour)); }
+    if (name == "extract_minute") { return Value(static_cast<int64_t>(ct.minute)); }
+    if (name == "extract_second") { return Value(static_cast<int64_t>(ct.second)); }
+    if (name == "extract_millisecond") { return Value(static_cast<int64_t>(ct.subsecond_nanos / 1000000LL)); }
+    if (name == "extract_microsecond") { return Value(static_cast<int64_t>(ct.subsecond_nanos / 1000LL)); }
+    if (name == "extract_nanosecond") { return Value(static_cast<int64_t>(ct.subsecond_nanos)); }
+    if (name == "extract_week") {
+      std::chrono::year_month_day ymd{std::chrono::year{ct.year}, std::chrono::month{static_cast<unsigned>(ct.month)}, std::chrono::day{static_cast<unsigned>(ct.day)}};
+      std::chrono::sys_days sd{ymd};
+      std::chrono::year_month_day year_start{std::chrono::year{ct.year}, std::chrono::month{1}, std::chrono::day{1}};
+      int start_wd = std::chrono::weekday{std::chrono::sys_days{year_start}}.c_encoding();
+      int yday = (sd - std::chrono::sys_days{year_start}).count();
+      int week_num = (yday + start_wd) / 7;
+      return Value(static_cast<int64_t>(week_num));
+    }
+    if (name == "extract_dayofweek") {
+      std::chrono::year_month_day ymd{std::chrono::year{ct.year}, std::chrono::month{static_cast<unsigned>(ct.month)}, std::chrono::day{static_cast<unsigned>(ct.day)}};
+      int wd = std::chrono::weekday{std::chrono::sys_days{ymd}}.c_encoding();
+      return Value(static_cast<int64_t>(wd + 1));
+    }
+    if (name == "extract_dayofyear") {
+      std::chrono::year_month_day ymd{std::chrono::year{ct.year}, std::chrono::month{static_cast<unsigned>(ct.month)}, std::chrono::day{static_cast<unsigned>(ct.day)}};
+      std::chrono::year_month_day year_start{std::chrono::year{ct.year}, std::chrono::month{1}, std::chrono::day{1}};
+      int yday = (std::chrono::sys_days{ymd} - std::chrono::sys_days{year_start}).count() + 1;
+      return Value(static_cast<int64_t>(yday));
+    }
+    if (name == "extract_isoyear" || name == "extract_isoweek") {
+      std::chrono::year_month_day ymd{std::chrono::year{ct.year}, std::chrono::month{static_cast<unsigned>(ct.month)}, std::chrono::day{static_cast<unsigned>(ct.day)}};
+      std::chrono::sys_days sd{ymd};
+      int iso_wd = std::chrono::weekday{sd}.iso_encoding();
+      std::chrono::sys_days thu = sd + std::chrono::days{4 - iso_wd};
+      std::chrono::year_month_day thu_ymd{thu};
+      int isoyear = int(thu_ymd.year());
+      if (name == "extract_isoyear") { return Value(static_cast<int64_t>(isoyear)); }
+      std::chrono::year_month_day iso_start{std::chrono::year{isoyear}, std::chrono::month{1}, std::chrono::day{4}};
+      int start_iso_wd = std::chrono::weekday{std::chrono::sys_days{iso_start}}.iso_encoding();
+      std::chrono::sys_days first_mon = std::chrono::sys_days{iso_start} - std::chrono::days{start_iso_wd - 1};
+      int isoweek = (sd - first_mon).count() / 7 + 1;
+      return Value(static_cast<int64_t>(isoweek));
+    }
+    throw std::runtime_error("unsupported extract field: " + name);
+  }
+  // Control flow
+  if (name == "if") {
+    if (arguments.size() != 3) {
+      throw std::runtime_error("IF requires 3 arguments");
+    }
+    return arguments[0].Truthy() ? arguments[1] : arguments[2];
+  }
+  if (name == "coalesce") {
+    for (Value& value : arguments) {
+      if (!value.IsNull()) { return value; }
+    }
+    return {};
+  }
+  if (name == "nullif") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("NULLIF requires 2 arguments");
+    }
+    if (arguments[0] == arguments[1]) { return {}; }
+    return arguments[0];
+  }
+  if (name == "ifnull") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("IFNULL requires 2 arguments");
+    }
+    return !arguments[0].IsNull() ? arguments[0] : arguments[1];
+  }
+
+  auto parse_date_val = [](const Value& val) -> int64_t {
+    if (val.type == ValueType::kDate) { return val.DateDays(); }
+    if (val.type == ValueType::kInt64) { return val.value.int_value; }
+    if (val.type == ValueType::kVarChar) {
+      std::string_view s = val.value.varchar_value;
+      if (s.size() >= 10 && s[4] == '-' && s[7] == '-') {
+        return ParseDateDays(s.substr(0, 10));
+      }
+      return ParseDateDays(s);
+    }
+    throw std::runtime_error("requires DATE");
+  };
+
+  if (name == "unix_date") {
+    if (arguments.size() != 1) { throw std::runtime_error("UNIX_DATE requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    return Value(parse_date_val(arguments[0]));
+  }
+  if (name == "date_from_unix_date") {
+    if (arguments.size() != 1) { throw std::runtime_error("DATE_FROM_UNIX_DATE requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    int64_t days = arguments[0].type == ValueType::kInt64 ? arguments[0].value.int_value : parse_date_val(arguments[0]);
+    return Value::DateFromDays(days);
+  }
+  if (name == "current_time") {
+    if (arguments.size() > 1) { throw std::runtime_error("CURRENT_TIME takes at most 1 argument"); }
+    if (arguments.size() == 1 && arguments[0].IsNull()) { return {}; }
+    int tz_offset_sec = 0;
+    if (arguments.size() == 1 && !arguments[0].IsNull()) {
+      std::string tz_str = raw_str(arguments[0]);
+      if (tz_str == "UTC" || tz_str == "utc" || tz_str == "Z" || tz_str == "z") {
+        tz_offset_sec = 0;
+      } else if (!tz_str.empty() && (tz_str[0] == '+' || tz_str[0] == '-')) {
+        char sign = tz_str[0];
+        int h = 0, m = 0;
+        if (tz_str.find(':') != std::string::npos) {
+          if (sscanf(tz_str.c_str() + 1, "%d:%d", &h, &m) < 1) {
+            throw std::runtime_error("invalid timezone: " + tz_str);
+          }
+        } else {
+          if (sscanf(tz_str.c_str() + 1, "%d", &h) < 1) {
+            throw std::runtime_error("invalid timezone: " + tz_str);
+          }
+        }
+        tz_offset_sec = (h * 3600 + m * 60) * (sign == '-' ? -1 : 1);
+      } else {
+        throw std::runtime_error("invalid timezone: " + tz_str);
+      }
+    }
+    time_t now = time(nullptr) + tz_offset_sec;
+    struct tm t = {};
+    gmtime_r(&now, &t);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+    return Value(std::string(buf));
+  }
+  if (name == "current_datetime") {
+    if (arguments.size() > 1) { throw std::runtime_error("CURRENT_DATETIME takes at most 1 argument"); }
+    if (arguments.size() == 1 && arguments[0].IsNull()) { return {}; }
+    int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone());
+    if (arguments.size() == 1 && !arguments[0].IsNull()) {
+      std::string tz_str = raw_str(arguments[0]);
+      if (tz_str.empty() || tz_str == "invalid_time_zone") {
+        throw std::runtime_error("invalid timezone: " + tz_str);
+      }
+      tz_offset_sec = ParseTimeZoneOffset(tz_str);
+    }
+    time_t now = time(nullptr) + tz_offset_sec;
+    struct tm t = {};
+    gmtime_r(&now, &t);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec);
+    return Value(std::string(buf));
+  }
+  if (name == "current_date") {
+    if (arguments.size() > 1) { throw std::runtime_error("CURRENT_DATE takes at most 1 argument"); }
+    if (arguments.size() == 1 && arguments[0].IsNull()) { return {}; }
+    int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone());
+    if (arguments.size() == 1 && !arguments[0].IsNull()) {
+      std::string tz_str = raw_str(arguments[0]);
+      if (tz_str.empty() || tz_str == "invalid_time_zone") {
+        throw std::runtime_error("invalid timezone: " + tz_str);
+      }
+      tz_offset_sec = ParseTimeZoneOffset(tz_str);
+    }
+    time_t now = time(nullptr) + tz_offset_sec;
+    struct tm t = {};
+    gmtime_r(&now, &t);
+    std::chrono::year_month_day ymd{std::chrono::year{t.tm_year + 1900},
+                                    std::chrono::month{static_cast<unsigned>(t.tm_mon + 1)},
+                                    std::chrono::day{static_cast<unsigned>(t.tm_mday)}};
+    return Value::DateFromDays(std::chrono::sys_days{ymd}.time_since_epoch().count());
+  }
+  if (name == "string") {
+    if (arguments.empty() || arguments.size() > 2) { throw std::runtime_error("STRING requires 1 or 2 arguments"); }
+    if (arguments[0].IsNull() || (arguments.size() == 2 && arguments[1].IsNull())) { return {}; }
+    if (arguments.size() == 2) {
+      CivilTime ct = ValueToCivilTime(arguments[0]);
+      std::string tz_str = raw_str(arguments[1]);
+      if (tz_str.empty() || tz_str == "invalid_time_zone") {
+        throw std::runtime_error("invalid timezone: " + tz_str);
+      }
+      int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct);
+      ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
+      int rem_mins = (tz_offset_sec % 3600) / 60;
+      if (rem_mins != 0) {
+        int total_m = ct.minute + rem_mins;
+        if (total_m >= 60) {
+          ct.minute = total_m - 60;
+          ct = ShiftCivilTimeHours(ct, 1);
+        } else if (total_m < 0) {
+          ct.minute = total_m + 60;
+          ct = ShiftCivilTimeHours(ct, -1);
+        } else {
+          ct.minute = total_m;
+        }
+      }
+      return Value(FormatCivilTime(ct) + FormatTimeZoneOffset(tz_offset_sec));
+    }
+    if (arguments[0].type == ValueType::kDate) {
+      return Value(FormatDateDays(arguments[0].DateDays()));
+    }
+    return Value(raw_str(arguments[0]));
+  }
+  if (name == "date") {
+    if (arguments.empty() || arguments.size() > 2) { throw std::runtime_error("DATE takes 1 or 2 arguments"); }
+    if (arguments[0].IsNull() || (arguments.size() == 2 && arguments[1].IsNull())) { return {}; }
+    if (arguments[0].type == ValueType::kDate && arguments.size() == 1) { return arguments[0]; }
+    std::string s = raw_str(arguments[0]);
+    if (s.size() >= 10 && s[4] == '-' && s[7] == '-') {
+      if (s.size() > 10) {
+        int Y = 0, M = 0, D = 0, h = 0, m = 0;
+        double sec = 0;
+        if (sscanf(s.c_str(), "%d-%d-%d %d:%d:%lf", &Y, &M, &D, &h, &m, &sec) >= 5) {
+          int tz_offset_sec = 0;
+          bool has_tz = false;
+          size_t tz_pos = s.find_first_of("+-", 10);
+          if (tz_pos != std::string::npos) {
+            char sign = s[tz_pos];
+            int tz_h = 0, tz_m = 0;
+            if (s.find(':', tz_pos) != std::string::npos) {
+              sscanf(s.c_str() + tz_pos + 1, "%d:%d", &tz_h, &tz_m);
+            } else {
+              sscanf(s.c_str() + tz_pos + 1, "%d", &tz_h);
+            }
+            tz_offset_sec = (tz_h * 3600 + tz_m * 60) * (sign == '-' ? -1 : 1);
+            has_tz = true;
+          } else if (s.ends_with('Z') || s.ends_with('z')) {
+            has_tz = true;
+          }
+          if (arguments.size() == 2) {
+            std::string tz2 = raw_str(arguments[1]);
+            int tz2_sec = 0;
+            if (!tz2.empty() && (tz2[0] == '+' || tz2[0] == '-')) {
+              char sign = tz2[0];
+              int tz_h = 0, tz_m = 0;
+              if (tz2.find(':') != std::string::npos) {
+                sscanf(tz2.c_str() + 1, "%d:%d", &tz_h, &tz_m);
+              } else {
+                sscanf(tz2.c_str() + 1, "%d", &tz_h);
+              }
+              tz2_sec = (tz_h * 3600 + tz_m * 60) * (sign == '-' ? -1 : 1);
+            }
+            struct tm t = {};
+            t.tm_year = Y - 1900; t.tm_mon = M - 1; t.tm_mday = D;
+            t.tm_hour = h; t.tm_min = m; t.tm_sec = static_cast<int>(sec);
+            time_t epoch = timegm(&t) - tz_offset_sec + tz2_sec;
+            struct tm target = {};
+            gmtime_r(&epoch, &target);
+            std::chrono::year_month_day ymd{std::chrono::year{target.tm_year + 1900},
+                                            std::chrono::month{static_cast<unsigned>(target.tm_mon + 1)},
+                                            std::chrono::day{static_cast<unsigned>(target.tm_mday)}};
+            return Value::DateFromDays(std::chrono::sys_days{ymd}.time_since_epoch().count());
+          } else if (has_tz) {
+            CivilTime ct_tmp{Y, static_cast<unsigned>(M), static_cast<unsigned>(D), h, m, static_cast<int>(sec)};
+            int default_tz_sec = ParseTimeZoneOffset(GetDefaultTimeZone(), &ct_tmp, -8 * 3600);
+            struct tm t = {};
+            t.tm_year = Y - 1900; t.tm_mon = M - 1; t.tm_mday = D;
+            t.tm_hour = h; t.tm_min = m; t.tm_sec = static_cast<int>(sec);
+            time_t epoch = timegm(&t) - tz_offset_sec + default_tz_sec;
+            struct tm target = {};
+            gmtime_r(&epoch, &target);
+            std::chrono::year_month_day ymd{std::chrono::year{target.tm_year + 1900},
+                                            std::chrono::month{static_cast<unsigned>(target.tm_mon + 1)},
+                                            std::chrono::day{static_cast<unsigned>(target.tm_mday)}};
+            return Value::DateFromDays(std::chrono::sys_days{ymd}.time_since_epoch().count());
+          }
+        }
+      }
+      return Value::Date(s.substr(0, 10));
+    }
+    return Value::Date(s);
+  }
+  if (name == "datetime") {
+    if (arguments.empty() || arguments.size() > 7) {
+      throw std::runtime_error("DATETIME takes 1 to 7 arguments");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    if (arguments.size() == 1) {
+      if (arguments[0].type == ValueType::kDate) {
+        return Value(FormatDateDays(arguments[0].DateDays()) + " 00:00:00");
+      }
+      CivilTime ct = ValueToCivilTime(arguments[0]);
+      std::string s = raw_str(arguments[0]);
+      if (s.find('+') != std::string::npos || s.find('Z') != std::string::npos || s.find('z') != std::string::npos) {
+        int64_t ns = CivilTimeToNanos(ct) + (-8 * 3600LL) * 1000000000LL;
+        ct = NanosToCivilTime(ns);
+      }
+      return Value(FormatCivilTime(ct));
+    }
+    if (arguments.size() == 2) {
+      std::string arg1_str = raw_str(arguments[1]);
+      if (arg1_str.find(':') != std::string::npos && arg1_str.size() <= 8 && arg1_str[0] != '+' && arg1_str[0] != '-') {
+        std::string d = raw_str(arguments[0]);
+        if (d.size() > 10) { d = d.substr(0, 10); }
+        return Value(d + " " + arg1_str);
+      }
+      CivilTime ct = ValueToCivilTime(arguments[0]);
+      int tz_offset_sec = ParseTimeZoneOffset(arg1_str, &ct, 0);
+      if (tz_offset_sec != 0) {
+        int64_t ns = CivilTimeToNanos(ct) + tz_offset_sec * 1000000000LL;
+        ct = NanosToCivilTime(ns);
+      }
+      return Value(FormatCivilTime(ct));
+    }
+    if (arguments.size() == 3) {
+      std::string d = raw_str(arguments[0]);
+      std::string t = raw_str(arguments[1]);
+      if (d.size() > 10) { d = d.substr(0, 10); }
+      CivilTime ct;
+      ParseCivilTime(d + " " + t, &ct);
+      return Value(FormatCivilTime(ct));
+    }
+    if (arguments.size() >= 6) {
+      int Y = arguments[0].type == ValueType::kInt64 ? arguments[0].value.int_value : std::stoi(raw_str(arguments[0]));
+      int M = arguments[1].type == ValueType::kInt64 ? arguments[1].value.int_value : std::stoi(raw_str(arguments[1]));
+      int D = arguments[2].type == ValueType::kInt64 ? arguments[2].value.int_value : std::stoi(raw_str(arguments[2]));
+      int h = arguments[3].type == ValueType::kInt64 ? arguments[3].value.int_value : std::stoi(raw_str(arguments[3]));
+      int m = arguments[4].type == ValueType::kInt64 ? arguments[4].value.int_value : std::stoi(raw_str(arguments[4]));
+      int s = arguments[5].type == ValueType::kInt64 ? arguments[5].value.int_value : std::stoi(raw_str(arguments[5]));
+      CivilTime ct;
+      ct.year = Y; ct.month = M; ct.day = D; ct.hour = h; ct.minute = m; ct.second = s;
+      if (arguments.size() == 7) {
+        int64_t sub = arguments[6].type == ValueType::kInt64 ? arguments[6].value.int_value : std::stoll(raw_str(arguments[6]));
+        ct.subsecond_nanos = sub;
+      }
+      return Value(FormatCivilTime(ct));
+    }
+  }
+  if (name == "timestamp") {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error("TIMESTAMP takes 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull() || (arguments.size() == 2 && arguments[1].IsNull())) { return {}; }
+    CivilTime ct = ValueToCivilTime(arguments[0]);
+    std::string tz_str = (arguments.size() == 2) ? raw_str(arguments[1]) : GetDefaultTimeZone();
+    int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct, -8 * 3600);
+    int64_t ns = CivilTimeToNanos(ct) - tz_offset_sec * 1000000000LL;
+    CivilTime utc_ct = NanosToCivilTime(ns);
+    return Value(FormatCivilTime(utc_ct) + "+00");
+  }
+  if (name == "time") {
+    if (arguments.empty() || arguments.size() > 4) {
+      throw std::runtime_error("TIME takes 1 to 4 arguments");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    if (arguments.size() == 1) {
+      std::string s = raw_str(arguments[0]);
+      CivilTime ct;
+      if (ParseCivilTime(s, &ct)) {
+        size_t tz_pos = s.find_first_of("+-", 11);
+        if (tz_pos != std::string::npos || s.find('Z') != std::string::npos || s.find('z') != std::string::npos) {
+          int tz_offset_sec = 0;
+          if (tz_pos != std::string::npos) {
+            tz_offset_sec = ParseTimeZoneOffset(s.substr(tz_pos), &ct, 0);
+          }
+          int64_t ns = CivilTimeToNanos(ct) - tz_offset_sec * 1000000000LL + (-8 * 3600LL) * 1000000000LL;
+          ct = NanosToCivilTime(ns);
+        }
+        char buf[64];
+        if (ct.subsecond_nanos != 0) {
+          if (ct.subsecond_nanos % 1000000 == 0) {
+            snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000000);
+          } else if (ct.subsecond_nanos % 1000 == 0) {
+            snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000);
+          } else {
+            snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%09ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
+          }
+        } else {
+          snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute, ct.second);
+        }
+        return Value(std::string(buf));
+      }
+      size_t space = s.find(' ');
+      if (space == std::string::npos) { space = s.find('T'); }
+      if (space != std::string::npos) {
+        s = s.substr(space + 1);
+      }
+      size_t tz_pos = s.find_first_of("+-Zz");
+      if (tz_pos != std::string::npos) {
+        s = s.substr(0, tz_pos);
+      }
+      return Value(std::move(s));
+    }
+    if (arguments.size() == 2) {
+      CivilTime ct = ValueToCivilTime(arguments[0]);
+      std::string tz_str = raw_str(arguments[1]);
+      int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct, 0);
+      if (tz_offset_sec != 0) {
+        int64_t ns = CivilTimeToNanos(ct) + tz_offset_sec * 1000000000LL;
+        ct = NanosToCivilTime(ns);
+      }
+      char buf[64];
+      if (ct.subsecond_nanos != 0) {
+        if (ct.subsecond_nanos % 1000000 == 0) {
+          snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000000);
+        } else if (ct.subsecond_nanos % 1000 == 0) {
+          snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos / 1000);
+        } else {
+          snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%09ld", ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
+        }
+      } else {
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ct.hour, ct.minute, ct.second);
+      }
+      return Value(std::string(buf));
+    }
+    if (arguments.size() >= 3) {
+      int h = arguments[0].type == ValueType::kInt64 ? arguments[0].value.int_value : std::stoi(raw_str(arguments[0]));
+      int m = arguments[1].type == ValueType::kInt64 ? arguments[1].value.int_value : std::stoi(raw_str(arguments[1]));
+      int s = arguments[2].type == ValueType::kInt64 ? arguments[2].value.int_value : std::stoi(raw_str(arguments[2]));
+      char buf[64];
+      if (arguments.size() == 4) {
+        int sub = arguments[3].type == ValueType::kInt64 ? arguments[3].value.int_value : std::stoi(raw_str(arguments[3]));
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%06d", h, m, s, sub);
+      } else {
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
+      }
+      return Value(std::string(buf));
+    }
+  }
+  if (name == "__quantified__") {
+    // __quantified__(lhs, array, op, ANY|ALL): three-valued SQL semantics.
+    if (arguments.size() != 4) {
+      throw std::runtime_error("quantified comparison requires 4 arguments");
+    }
+    const Value& lhs = arguments[0];
+    const Value& arr = arguments[1];
+    const std::string op = raw_str(arguments[2]);
+    const std::string mode = raw_str(arguments[3]);
+    if (arr.IsNull()) { return {}; }
+    if (!arr.IsArray()) {
+      throw std::runtime_error("quantified comparison requires an array");
+    }
+    struct OpEntry {
+      const char* text;
+      BinaryOperation op;
+    };
+    static constexpr OpEntry kOps[] = {
+        {"=", BinaryOperation::kEquals},
+        {"!=", BinaryOperation::kNotEquals},
+        {"<>", BinaryOperation::kNotEquals},
+        {"<", BinaryOperation::kLessThan},
+        {"<=", BinaryOperation::kLessThanEquals},
+        {">", BinaryOperation::kGreaterThan},
+        {">=", BinaryOperation::kGreaterThanEquals},
+    };
+    BinaryOperation operation = BinaryOperation::kEquals;
+    bool found = false;
+    for (const auto& entry : kOps) {
+      if (op == entry.text) {
+        operation = entry.op;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      throw std::runtime_error("quantified comparison: unsupported operator " +
+                               op);
+    }
+    const bool is_any = mode == "ANY" || mode == "SOME";
+    bool saw_true = false;
+    bool saw_null = false;
+    for (const Value& element : arr.ArrayElements()) {
+      Value result;
+      try {
+        result = Binary(operation, lhs, element);
+      } catch (...) {
+        result = Value();
+      }
+      if (result.IsNull()) {
+        saw_null = true;
+        continue;
+      }
+      if (Truthy(result)) {
+        saw_true = true;
+        if (is_any) { return Value(int64_t{1}); }
+      } else if (!is_any) {
+        return Value(int64_t{0});
+      }
+    }
+    if (is_any) {
+      if (saw_true) { return Value(int64_t{1}); }
+      return saw_null ? Value() : Value(int64_t{0});
+    }
+    // ALL: true when nothing was false and no NULL blocked certainty.
+    if (saw_null) { return {}; }
+    return Value(int64_t{1});
+  }
+  if (name == "array_element_offset" || name == "array_element_ordinal") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("array element access requires 2 arguments");
+    }
+    const Value& arr = arguments[0];
+    if (arr.IsNull()) { return {}; }
+    if (!arr.IsArray()) {
+      throw std::runtime_error("array element access requires an array");
+    }
+    const auto& elements = arr.ArrayElements();
+    int64_t index = arguments[1].IsNull() ? -1 : arguments[1].value.int_value;
+    if (name == "array_element_ordinal") { --index; }
+    if (index < 0 || index >= static_cast<int64_t>(elements.size())) {
+      // Out-of-range plain accesses are errors in GoogleSQL; SAFE variants
+      // and this fallback yield NULL.
+      return {};
+    }
+    return elements[static_cast<size_t>(index)];
+  }
+  if (name == "get_field") {    if (arguments.size() != 2) { throw std::runtime_error("get_field requires 2 arguments"); }
+    if (arguments[0].IsNull()) { return {}; }
+    std::string s0 = raw_str(arguments[0]);
+    if (s0.empty()) { return {}; }
+    if (s0.find("\x18\x00") != std::string::npos || (s0.size() >= 2 && s0[0] == '\x18')) {
+      throw std::runtime_error("invalid datetime_micros in proto");
+    }
+    std::string field_name = raw_str(arguments[1]);
+    if (s0.starts_with("{") && s0.ends_with("}")) {
+      std::string search_key = "\"" + field_name + "\":";
+      size_t pos = s0.find(search_key);
+      if (pos == std::string::npos) {
+        return {};
+      }
+      size_t val_start = pos + search_key.size();
+      size_t val_end = s0.find_first_of(",}", val_start);
+      std::string val_str = s0.substr(val_start, val_end - val_start);
+      if (val_str == "null") { return {}; }
+      if (val_str.size() >= 2 && val_str.front() == '"' && val_str.back() == '"') {
+        val_str = val_str.substr(1, val_str.size() - 2);
+      }
+      return Value(std::move(val_str));
+    }
+    return {};
+  }
+  if (name == "date_diff" || name == "datetime_diff" || name == "timestamp_diff") {
+    if (call.Args().size() != 3) { throw std::runtime_error(name + " requires 3 arguments"); }
+    const Value d1 = Evaluate(call.Args()[0], scope, aggregates, context, ctes);
+    const Value d2 = Evaluate(call.Args()[1], scope, aggregates, context, ctes);
+    if (d1.IsNull() || d2.IsNull()) { return {}; }
+    std::string unit = "day";
+    if (call.Args()[2]->Type() == TypeTag::kColumnValue) {
+      unit = to_lower(call.Args()[2]->AsColumnValue().GetColumnName().name);
+    } else {
+      const Value uval = Evaluate(call.Args()[2], scope, aggregates, context, ctes);
+      if (!uval.IsNull()) { unit = to_lower(raw_str(uval)); }
+    }
+    CivilTime ct1 = ValueToCivilTime(d1);
+    CivilTime ct2 = ValueToCivilTime(d2);
+    std::string s1 = raw_str(d1);
+    std::string s2 = raw_str(d2);
+    if (s1.find('+') != std::string::npos || s1.find('Z') != std::string::npos || s1.find('z') != std::string::npos) {
+      int64_t ns = CivilTimeToNanos(ct1) + (-8 * 3600LL) * 1000000000LL;
+      ct1 = NanosToCivilTime(ns);
+    }
+    if (s2.find('+') != std::string::npos || s2.find('Z') != std::string::npos || s2.find('z') != std::string::npos) {
+      int64_t ns = CivilTimeToNanos(ct2) + (-8 * 3600LL) * 1000000000LL;
+      ct2 = NanosToCivilTime(ns);
+    }
+    auto floor_div = [](int64_t a, int64_t b) -> int64_t {
+      const int64_t q = a / b;
+      return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+    };
+    if (unit == "year" || unit == "years") {
+      return Value(static_cast<int64_t>(ct1.year - ct2.year));
+    }
+    if (unit == "quarter" || unit == "quarters") {
+      return Value(static_cast<int64_t>((ct1.year - ct2.year) * 4 + ((ct1.month - 1) / 3 - (ct2.month - 1) / 3)));
+    }
+    if (unit == "month" || unit == "months") {
+      return Value(static_cast<int64_t>((ct1.year - ct2.year) * 12 + (ct1.month - ct2.month)));
+    }
+
+    auto trunc_to_unit = [](CivilTime ct, std::string_view u) -> CivilTime {
+      if (u == "week" || u == "weeks") {
+        std::chrono::year_month_day ymd{std::chrono::year{ct.year}, std::chrono::month{static_cast<unsigned>(ct.month)}, std::chrono::day{static_cast<unsigned>(ct.day)}};
+        std::chrono::sys_days sd{ymd};
+        int wd = std::chrono::weekday{sd}.iso_encoding();
+        int days_back = (wd == 7) ? 0 : wd;
+        std::chrono::sys_days week_start = sd - std::chrono::days{days_back};
+        std::chrono::year_month_day res_ymd{week_start};
+        ct.year = int(res_ymd.year()); ct.month = unsigned(res_ymd.month()); ct.day = unsigned(res_ymd.day());
+        ct.hour = 0; ct.minute = 0; ct.second = 0; ct.subsecond_nanos = 0;
+      } else if (u == "day" || u == "days") {
+        ct.hour = 0; ct.minute = 0; ct.second = 0; ct.subsecond_nanos = 0;
+      } else if (u == "hour" || u == "hours") {
+        ct.minute = 0; ct.second = 0; ct.subsecond_nanos = 0;
+      } else if (u == "minute" || u == "minutes") {
+        ct.second = 0; ct.subsecond_nanos = 0;
+      } else if (u == "second" || u == "seconds") {
+        ct.subsecond_nanos = 0;
+      } else if (u == "millisecond" || u == "milliseconds") {
+        ct.subsecond_nanos = (ct.subsecond_nanos / 1000000LL) * 1000000LL;
+      } else if (u == "microsecond" || u == "microseconds") {
+        ct.subsecond_nanos = (ct.subsecond_nanos / 1000LL) * 1000LL;
+      }
+      return ct;
+    };
+
+    CivilTime t1 = trunc_to_unit(ct1, unit);
+    CivilTime t2 = trunc_to_unit(ct2, unit);
+    int64_t ns1 = CivilTimeToNanos(t1);
+    int64_t ns2 = CivilTimeToNanos(t2);
+    int64_t diff_ns = ns1 - ns2;
+    if (unit == "week" || unit == "weeks") {
+      return Value(diff_ns / (7LL * 86400LL * 1000000000LL));
+    }
+    if (unit == "day" || unit == "days") {
+      return Value(diff_ns / (86400LL * 1000000000LL));
+    }
+    if (unit == "hour" || unit == "hours") {
+      return Value(diff_ns / (3600LL * 1000000000LL));
+    }
+    if (unit == "minute" || unit == "minutes") {
+      return Value(diff_ns / (60LL * 1000000000LL));
+    }
+    if (unit == "second" || unit == "seconds") {
+      return Value(diff_ns / 1000000000LL);
+    }
+    if (unit == "millisecond" || unit == "milliseconds") {
+      return Value(diff_ns / 1000000LL);
+    }
+    if (unit == "microsecond" || unit == "microseconds") {
+      return Value(diff_ns / 1000LL);
+    }
+    if (unit == "nanosecond" || unit == "nanoseconds") {
+      return Value(diff_ns);
+    }
+    throw std::runtime_error("unsupported unit in " + name + ": " + unit);
+  }
+  if (name == "date_trunc" || name == "datetime_trunc" || name == "timestamp_trunc") {
+    if (call.Args().size() < 2 || call.Args().size() > 3) {
+      throw std::runtime_error(name + " requires 2 or 3 arguments");
+    }
+    const Value d = Evaluate(call.Args()[0], scope, aggregates, context, ctes);
+    if (d.IsNull()) { return {}; }
+    std::string unit = "day";
+    if (call.Args()[1]->Type() == TypeTag::kColumnValue) {
+      unit = to_lower(call.Args()[1]->AsColumnValue().GetColumnName().name);
+    } else {
+      const Value uval = Evaluate(call.Args()[1], scope, aggregates, context, ctes);
+      if (!uval.IsNull()) { unit = to_lower(raw_str(uval)); }
+    }
+    std::string s_orig = raw_str(d);
+    bool has_explicit_tz = (s_orig.find('+') != std::string::npos || s_orig.find('Z') != std::string::npos || s_orig.find('z') != std::string::npos);
+    if (!has_explicit_tz) {
+      for (size_t i = 10; i < s_orig.size(); ++i) {
+        if (s_orig[i] == '+' || s_orig[i] == '-') { has_explicit_tz = true; break; }
+      }
+    }
+    bool is_timestamp = (name == "timestamp_trunc" || has_explicit_tz);
+    std::string trunc_tz = GetDefaultTimeZone();
+    if (call.Args().size() == 3) {
+      const Value tz_val = Evaluate(call.Args()[2], scope, aggregates, context, ctes);
+      if (tz_val.IsNull()) { return {}; }
+      std::string tz_str = raw_str(tz_val);
+      if (tz_str.empty() || tz_str == "invalid_time_zone") {
+        throw std::runtime_error("invalid timezone: " + tz_str);
+      }
+      trunc_tz = tz_str;
+    }
+
+    CivilTime ct = ValueToCivilTime(d);
+    if (is_timestamp) {
+      int64_t d_utc_ns = CivilTimeToNanos(ct);
+      if (!has_explicit_tz) {
+        int parse_tz_sec = ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
+        d_utc_ns -= parse_tz_sec * 1000000000LL;
+      }
+      int trunc_tz_sec = ParseTimeZoneOffset(trunc_tz, &ct, -8 * 3600);
+      CivilTime trunc_local_ct = NanosToCivilTime(d_utc_ns + trunc_tz_sec * 1000000000LL);
+      if (unit == "year" || unit == "years") {
+        trunc_local_ct.month = 1; trunc_local_ct.day = 1; trunc_local_ct.hour = 0; trunc_local_ct.minute = 0; trunc_local_ct.second = 0; trunc_local_ct.subsecond_nanos = 0;
+      } else if (unit == "quarter" || unit == "quarters") {
+        trunc_local_ct.month = ((trunc_local_ct.month - 1) / 3) * 3 + 1; trunc_local_ct.day = 1; trunc_local_ct.hour = 0; trunc_local_ct.minute = 0; trunc_local_ct.second = 0; trunc_local_ct.subsecond_nanos = 0;
+      } else if (unit == "month" || unit == "months") {
+        trunc_local_ct.day = 1; trunc_local_ct.hour = 0; trunc_local_ct.minute = 0; trunc_local_ct.second = 0; trunc_local_ct.subsecond_nanos = 0;
+      } else if (unit == "week" || unit == "weeks") {
+        std::chrono::year_month_day ymd{std::chrono::year{trunc_local_ct.year}, std::chrono::month{static_cast<unsigned>(trunc_local_ct.month)}, std::chrono::day{static_cast<unsigned>(trunc_local_ct.day)}};
+        std::chrono::sys_days sd{ymd};
+        int wd = std::chrono::weekday{sd}.iso_encoding();
+        int days_back = (wd == 7) ? 0 : wd;
+        std::chrono::sys_days week_start = sd - std::chrono::days{days_back};
+        std::chrono::year_month_day res_ymd{week_start};
+        trunc_local_ct.year = int(res_ymd.year()); trunc_local_ct.month = unsigned(res_ymd.month()); trunc_local_ct.day = unsigned(res_ymd.day());
+        trunc_local_ct.hour = 0; trunc_local_ct.minute = 0; trunc_local_ct.second = 0; trunc_local_ct.subsecond_nanos = 0;
+      } else if (unit == "day" || unit == "days") {
+        trunc_local_ct.hour = 0; trunc_local_ct.minute = 0; trunc_local_ct.second = 0; trunc_local_ct.subsecond_nanos = 0;
+      } else if (unit == "hour" || unit == "hours") {
+        trunc_local_ct.minute = 0; trunc_local_ct.second = 0; trunc_local_ct.subsecond_nanos = 0;
+      } else if (unit == "minute" || unit == "minutes") {
+        trunc_local_ct.second = 0; trunc_local_ct.subsecond_nanos = 0;
+      } else if (unit == "second" || unit == "seconds") {
+        trunc_local_ct.subsecond_nanos = 0;
+      } else if (unit == "millisecond" || unit == "milliseconds") {
+        trunc_local_ct.subsecond_nanos = (trunc_local_ct.subsecond_nanos / 1000000LL) * 1000000LL;
+      } else if (unit == "microsecond" || unit == "microseconds") {
+        trunc_local_ct.subsecond_nanos = (trunc_local_ct.subsecond_nanos / 1000LL) * 1000LL;
+      } else if (unit == "nanosecond" || unit == "nanoseconds") {
+        // no change
+      } else {
+        throw std::runtime_error("unsupported unit in " + name + ": " + unit);
+      }
+      int new_trunc_tz_sec = ParseTimeZoneOffset(trunc_tz, &trunc_local_ct, -8 * 3600);
+      int64_t res_utc_ns = CivilTimeToNanos(trunc_local_ct) - new_trunc_tz_sec * 1000000000LL;
+      CivilTime res_utc_ct = NanosToCivilTime(res_utc_ns);
+      return Value(FormatCivilTime(res_utc_ct) + "+00");
+    }
+    if (unit == "year" || unit == "years") {
+      ct.month = 1; ct.day = 1; ct.hour = 0; ct.minute = 0; ct.second = 0; ct.subsecond_nanos = 0;
+    } else if (unit == "quarter" || unit == "quarters") {
+      ct.month = ((ct.month - 1) / 3) * 3 + 1; ct.day = 1; ct.hour = 0; ct.minute = 0; ct.second = 0; ct.subsecond_nanos = 0;
+    } else if (unit == "month" || unit == "months") {
+      ct.day = 1; ct.hour = 0; ct.minute = 0; ct.second = 0; ct.subsecond_nanos = 0;
+    } else if (unit == "week" || unit == "weeks") {
+      std::chrono::year_month_day ymd{std::chrono::year{ct.year}, std::chrono::month{static_cast<unsigned>(ct.month)}, std::chrono::day{static_cast<unsigned>(ct.day)}};
+      std::chrono::sys_days sd{ymd};
+      int wd = std::chrono::weekday{sd}.iso_encoding();
+      int days_back = (wd == 7) ? 0 : wd;
+      std::chrono::sys_days week_start = sd - std::chrono::days{days_back};
+      std::chrono::year_month_day res_ymd{week_start};
+      ct.year = int(res_ymd.year()); ct.month = unsigned(res_ymd.month()); ct.day = unsigned(res_ymd.day());
+      ct.hour = 0; ct.minute = 0; ct.second = 0; ct.subsecond_nanos = 0;
+    } else if (unit == "day" || unit == "days") {
+      ct.hour = 0; ct.minute = 0; ct.second = 0; ct.subsecond_nanos = 0;
+    } else if (unit == "hour" || unit == "hours") {
+      ct.minute = 0; ct.second = 0; ct.subsecond_nanos = 0;
+    } else if (unit == "minute" || unit == "minutes") {
+      ct.second = 0; ct.subsecond_nanos = 0;
+    } else if (unit == "second" || unit == "seconds") {
+      ct.subsecond_nanos = 0;
+    } else if (unit == "millisecond" || unit == "milliseconds") {
+      ct.subsecond_nanos = (ct.subsecond_nanos / 1000000LL) * 1000000LL;
+    } else if (unit == "microsecond" || unit == "microseconds") {
+      ct.subsecond_nanos = (ct.subsecond_nanos / 1000LL) * 1000LL;
+    } else if (unit == "nanosecond" || unit == "nanoseconds") {
+      // no change
+    } else {
+      throw std::runtime_error("unsupported unit in " + name + ": " + unit);
+    }
+    if (d.type == ValueType::kDate && name == "date_trunc") {
+      std::chrono::year_month_day ymd{std::chrono::year{ct.year}, std::chrono::month{static_cast<unsigned>(ct.month)}, std::chrono::day{static_cast<unsigned>(ct.day)}};
+      return Value::DateFromDays(std::chrono::sys_days{ymd}.time_since_epoch().count());
+    }
+    return Value(FormatCivilTime(ct));
+  }
+  if (name == "format_date" || name == "format_datetime" || name == "format_timestamp") {
+    if (arguments.size() < 2 || arguments.size() > 3) {
+      throw std::runtime_error(name + " takes 2 or 3 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    std::string fmt = raw_str(arguments[0]);
+    CivilTime ct = ValueToCivilTime(arguments[1]);
+    int tz_offset_sec = 0;
+    if (arguments.size() == 3) {
+      if (arguments[2].IsNull()) { return {}; }
+      std::string tz_str = raw_str(arguments[2]);
+      if (tz_str.empty() || tz_str == "invalid_time_zone") {
+        throw std::runtime_error("invalid timezone: " + tz_str);
+      }
+      tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct);
+    } else if (name == "format_datetime" || name == "format_timestamp") {
+      tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
+    }
+    ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
+    int rem_mins = (tz_offset_sec % 3600) / 60;
+    if (rem_mins != 0) {
+      int total_m = ct.minute + rem_mins;
+      if (total_m >= 60) {
+        ct.minute = total_m - 60;
+        ct = ShiftCivilTimeHours(ct, 1);
+      } else if (total_m < 0) {
+        ct.minute = total_m + 60;
+        ct = ShiftCivilTimeHours(ct, -1);
+      } else {
+        ct.minute = total_m;
+      }
+    }
+    struct tm tm = {};
+    tm.tm_year = ct.year - 1900;
+    tm.tm_mon = ct.month - 1;
+    tm.tm_mday = ct.day;
+    tm.tm_hour = ct.hour;
+    tm.tm_min = ct.minute;
+    tm.tm_sec = ct.second;
+    timegm(&tm);
+    char buf[128];
+    strftime(buf, sizeof(buf), fmt.c_str(), &tm);
+    return Value(std::string(buf));
+  }
+  if (name == "parse_timestamp") {
+    if (arguments.size() < 2 || arguments.size() > 3) {
+      throw std::runtime_error("PARSE_TIMESTAMP requires 2 or 3 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    if (arguments.size() == 3 && arguments[2].IsNull()) { return {}; }
+    std::string fmt = raw_str(arguments[0]);
+    std::string input = raw_str(arguments[1]);
+    int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone(), nullptr, -8 * 3600);
+    if (arguments.size() == 3) {
+      std::string tz_str = raw_str(arguments[2]);
+      if (tz_str.empty() || tz_str == "invalid_time_zone") {
+        throw std::runtime_error("invalid timezone: " + tz_str);
+      }
+      tz_offset_sec = ParseTimeZoneOffset(tz_str);
+    }
+    struct tm tm = {};
+    tm.tm_year = 100; // 2000 default
+    tm.tm_mon = 0; tm.tm_mday = 1;
+    char* parsed_end = strptime(input.c_str(), fmt.c_str(), &tm);
+    if (parsed_end == nullptr) {
+      throw std::runtime_error("PARSE_TIMESTAMP failed for: " + input);
+    }
+    CivilTime ct;
+    ct.year = tm.tm_year + 1900;
+    ct.month = tm.tm_mon + 1;
+    ct.day = tm.tm_mday;
+    ct.hour = tm.tm_hour;
+    ct.minute = tm.tm_min;
+    ct.second = tm.tm_sec;
+    ct = ShiftCivilTimeHours(ct, -tz_offset_sec / 3600);
+    int rem_mins = (tz_offset_sec % 3600) / 60;
+    if (rem_mins != 0) {
+      int total_m = ct.minute - rem_mins;
+      if (total_m >= 60) {
+        ct.minute = total_m - 60;
+        ct = ShiftCivilTimeHours(ct, 1);
+      } else if (total_m < 0) {
+        ct.minute = total_m + 60;
+        ct = ShiftCivilTimeHours(ct, -1);
+      } else {
+        ct.minute = total_m;
+      }
+    }
+    return Value(FormatCivilTime(ct) + "+00");
+  }
+  if (name == "date_bucket" || name == "timestamp_bucket" || name == "datetime_bucket") {
+    if (call.Args().size() < 2 || call.Args().size() > 3) {
+      throw std::runtime_error(name + " takes 2 or 3 arguments");
+    }
+    const Value d = Evaluate(call.Args()[0], scope, aggregates, context, ctes);
+    if (d.IsNull()) { return {}; }
+    CivilTime d_ct = ValueToCivilTime(d);
+    std::string d_s = raw_str(d);
+    bool d_has_tz = (d_s.find('+') != std::string::npos || d_s.find('Z') != std::string::npos || d_s.find('z') != std::string::npos);
+    if (!d_has_tz) {
+      for (size_t i = 10; i < d_s.size(); ++i) {
+        if (d_s[i] == '+' || d_s[i] == '-') { d_has_tz = true; break; }
+      }
+    }
+    bool is_ts = (name == "timestamp_bucket" || d_has_tz);
+
+    CivilTime orig_ct{1970, 1, 1, 0, 0, 0, 0};
+    bool has_origin = false;
+    bool orig_has_tz = false;
+    if (call.Args().size() == 3) {
+      const Value orig = Evaluate(call.Args()[2], scope, aggregates, context, ctes);
+      if (orig.IsNull()) { return {}; }
+      orig_ct = ValueToCivilTime(orig);
+      std::string orig_s = raw_str(orig);
+      orig_has_tz = (orig_s.find('+') != std::string::npos || orig_s.find('Z') != std::string::npos || orig_s.find('z') != std::string::npos);
+      if (!orig_has_tz) {
+        for (size_t i = 10; i < orig_s.size(); ++i) {
+          if (orig_s[i] == '+' || orig_s[i] == '-') { orig_has_tz = true; break; }
+        }
+      }
+      if (orig_has_tz) { is_ts = true; }
+      has_origin = true;
+    }
+    if (call.Args()[1]->Type() == TypeTag::kIntervalExp) {
+      const auto& interval = call.Args()[1]->AsIntervalExpression();
+      int64_t amount = interval.Amount();
+      std::string unit = to_lower(std::string(interval.Unit()));
+      double sec_amount = 0.0;
+      bool is_fractional_second = false;
+      if (unit == "second" || unit == "seconds") {
+        std::string raw_amount = interval.RawAmount();
+        if (!raw_amount.empty() && raw_amount.find('.') != std::string::npos) {
+          sec_amount = std::stod(raw_amount);
+          is_fractional_second = true;
+        }
+      }
+      auto floor_div = [](int64_t a, int64_t b) -> int64_t {
+        const int64_t q = a / b;
+        return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+      };
+      if (unit == "month" || unit == "months" || unit == "quarter" || unit == "quarters" || unit == "year" || unit == "years") {
+        int64_t step_m = amount;
+        if (unit.starts_with("year")) { step_m = amount * 12; }
+        else if (unit.starts_with("quarter")) { step_m = amount * 3; }
+        int64_t m_diff = (d_ct.year - orig_ct.year) * 12 + (d_ct.month - orig_ct.month);
+        int64_t bucket_m = floor_div(m_diff, step_m) * step_m;
+        int64_t total_m = (orig_ct.year * 12 + orig_ct.month - 1) + bucket_m;
+        int bucket_y = floor_div(total_m, 12);
+        int bucket_mon = total_m - bucket_y * 12 + 1;
+        CivilTime res_ct = orig_ct;
+        res_ct.year = bucket_y;
+        res_ct.month = bucket_mon;
+        if (d.type == ValueType::kDate && name == "date_bucket") {
+          std::chrono::year_month_day ymd{std::chrono::year{res_ct.year}, std::chrono::month{static_cast<unsigned>(res_ct.month)}, std::chrono::day{static_cast<unsigned>(res_ct.day)}};
+          return Value::DateFromDays(std::chrono::sys_days{ymd}.time_since_epoch().count());
+        }
+        if (is_ts) {
+          return Value(FormatCivilTime(res_ct) + "+00");
+        }
+        return Value(FormatCivilTime(res_ct));
+      }
+
+      int64_t step_ns = 0;
+      if (is_fractional_second) {
+        step_ns = static_cast<int64_t>(std::round(sec_amount * 1000000000.0));
+      } else if (unit == "nanosecond" || unit == "nanoseconds") {
+        step_ns = amount;
+      } else if (unit == "microsecond" || unit == "microseconds") {
+        step_ns = amount * 1000LL;
+      } else if (unit == "millisecond" || unit == "milliseconds") {
+        step_ns = amount * 1000000LL;
+      } else if (unit == "second" || unit == "seconds") {
+        step_ns = amount * 1000000000LL;
+      } else if (unit == "minute" || unit == "minutes") {
+        step_ns = amount * 60LL * 1000000000LL;
+      } else if (unit == "hour" || unit == "hours") {
+        step_ns = amount * 3600LL * 1000000000LL;
+      } else if (unit == "day" || unit == "days") {
+        step_ns = amount * 86400LL * 1000000000LL;
+        if (!has_origin && amount % 7 == 0) {
+          orig_ct.year = 1970; orig_ct.month = 1; orig_ct.day = 4; // Sunday
+        }
+      } else if (unit == "week" || unit == "weeks") {
+        step_ns = amount * 7LL * 86400LL * 1000000000LL;
+        if (!has_origin) {
+          orig_ct.year = 1970; orig_ct.month = 1; orig_ct.day = 4; // Sunday
+        }
+      } else {
+        throw std::runtime_error("unsupported interval unit in " + name + ": " + unit);
+      }
+
+      int64_t d_ns = CivilTimeToNanos(d_ct);
+      if (is_ts && !d_has_tz) {
+        int tz_sec = ParseTimeZoneOffset(GetDefaultTimeZone(), &d_ct, -8 * 3600);
+        d_ns -= tz_sec * 1000000000LL;
+      }
+      int64_t orig_ns = CivilTimeToNanos(orig_ct);
+      if (is_ts && (!has_origin || !orig_has_tz)) {
+        int tz_sec = ParseTimeZoneOffset(GetDefaultTimeZone(), &orig_ct, -8 * 3600);
+        orig_ns -= tz_sec * 1000000000LL;
+      }
+      int64_t diff_ns = d_ns - orig_ns;
+      int64_t bucket_ns = orig_ns + floor_div(diff_ns, step_ns) * step_ns;
+      CivilTime res_ct = NanosToCivilTime(bucket_ns);
+
+      if (d.type == ValueType::kDate && name == "date_bucket") {
+        std::chrono::year_month_day ymd{std::chrono::year{res_ct.year}, std::chrono::month{static_cast<unsigned>(res_ct.month)}, std::chrono::day{static_cast<unsigned>(res_ct.day)}};
+        return Value::DateFromDays(std::chrono::sys_days{ymd}.time_since_epoch().count());
+      }
+      if (is_ts) {
+        return Value(FormatCivilTime(res_ct) + "+00");
+      }
+      return Value(FormatCivilTime(res_ct));
+    }
+    return {};
+  }
+  if (name == "parse_date") {
+    if (arguments.size() != 2) { throw std::runtime_error("PARSE_DATE requires 2 arguments"); }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    std::string fmt = raw_str(arguments[0]);
+    std::string val = raw_str(arguments[1]);
+    for (char c : val) {
+      if (c == '\r' || c == '\n' || c == '\0') {
+        throw std::runtime_error("invalid character in PARSE_DATE: " + val);
+      }
+    }
+    if (fmt.find(' ') == std::string::npos && val.find(' ') != std::string::npos) {
+      throw std::runtime_error("unexpected whitespace in PARSE_DATE: " + val);
+    }
+    if (fmt.find("%C") != std::string::npos || fmt.find("%g") != std::string::npos) {
+      throw std::runtime_error("incomplete date format in PARSE_DATE");
+    }
+    if (fmt == "%W%y") {
+      if (val.size() < 3 || val.size() > 4) {
+        throw std::runtime_error("invalid format for %W%y: " + val);
+      }
+      for (char c : val) {
+        if (c < '0' || c > '9') { throw std::runtime_error("invalid digit in PARSE_DATE: " + val); }
+      }
+      int w = 0, y = 0;
+      if (val.size() == 3) {
+        w = std::stoi(val.substr(0, 2));
+        y = std::stoi(val.substr(2, 1));
+      } else {
+        w = std::stoi(val.substr(0, 2));
+        y = std::stoi(val.substr(2, 2));
+      }
+      if (w < 0 || w > 53) {
+        throw std::runtime_error("week out of range in PARSE_DATE: " + val);
+      }
+      int full_year = y < 69 ? 2000 + y : 1900 + y;
+      std::chrono::year_month_day jan1{std::chrono::year{full_year}, std::chrono::month{1}, std::chrono::day{1}};
+      std::chrono::sys_days jan1_days{jan1};
+      std::chrono::weekday wd{jan1_days};
+      int jan1_wd = wd.iso_encoding(); // 1=Monday .. 7=Sunday
+      int days_to_first_monday = (jan1_wd == 1) ? 0 : (8 - jan1_wd);
+      std::chrono::sys_days target_days = jan1_days + std::chrono::days{days_to_first_monday + (w - 1) * 7};
+      return Value::DateFromDays(target_days.time_since_epoch().count());
+    }
+    struct tm tm = {};
+    tm.tm_year = 70;
+    tm.tm_mday = 1;
+    char* res = strptime(val.c_str(), fmt.c_str(), &tm);
+    if (res == nullptr || *res != '\0') {
+      throw std::runtime_error("failed to parse date: " + val);
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    return Value::Date(std::string(buf));
+  }
+  if (name == "last_day") {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error("LAST_DAY takes 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull() || (arguments.size() == 2 && arguments[1].IsNull())) { return {}; }
+    int64_t days = parse_date_val(arguments[0]);
+    std::string part = "month";
+    if (arguments.size() == 2) {
+      part = to_lower(raw_str(arguments[1]));
+    }
+    using std::chrono::year_month_day;
+    using std::chrono::year_month_day_last;
+    using std::chrono::month_day_last;
+    using std::chrono::sys_days;
+    using std::chrono::year;
+    using std::chrono::month;
+    using std::chrono::day;
+
+    year_month_day ymd{sys_days{std::chrono::days{days}}};
+    int y = int(ymd.year());
+    unsigned m = unsigned(ymd.month());
+
+    if (part == "year" || part == "years") {
+      year_month_day last_ymd{year{y}, month{12}, day{31}};
+      return Value::DateFromDays(sys_days{last_ymd}.time_since_epoch().count());
+    }
+    if (part == "month" || part == "months") {
+      year_month_day last_ymd{year_month_day_last{year{y}, month_day_last{month{m}}}};
+      return Value::DateFromDays(sys_days{last_ymd}.time_since_epoch().count());
+    }
+    if (part == "quarter" || part == "quarters") {
+      unsigned q_last_month = ((m - 1) / 3 + 1) * 3;
+      year_month_day last_ymd{year_month_day_last{year{y}, month_day_last{month{q_last_month}}}};
+      return Value::DateFromDays(sys_days{last_ymd}.time_since_epoch().count());
+    }
+    if (part == "week" || part == "weeks" || part.starts_with("week(")) {
+      int last_day_iso = 6;
+      if (part == "week(monday)") { last_day_iso = 7; }
+      else if (part == "week(tuesday)") { last_day_iso = 1; }
+      else if (part == "week(wednesday)") { last_day_iso = 2; }
+      else if (part == "week(thursday)") { last_day_iso = 3; }
+      else if (part == "week(friday)") { last_day_iso = 4; }
+      else if (part == "week(saturday)") { last_day_iso = 5; }
+      else if (part == "week(sunday)") { last_day_iso = 6; }
+      std::chrono::sys_days cur_days{std::chrono::days{days}};
+      int cur_iso = std::chrono::weekday{cur_days}.iso_encoding();
+      int add_days = (last_day_iso >= cur_iso) ? (last_day_iso - cur_iso) : (7 + last_day_iso - cur_iso);
+      return Value::DateFromDays(days + add_days);
+    }
+    if (part == "isoyear") {
+      year_month_day dec31{year{y}, month{12}, day{31}};
+      sys_days dec31_days{dec31};
+      int iso_wd = std::chrono::weekday{dec31_days}.iso_encoding();
+      int days_to_sun = (iso_wd == 7) ? 0 : ((iso_wd >= 4) ? (7 - iso_wd) : -(iso_wd));
+      return Value::DateFromDays((dec31_days + std::chrono::days{days_to_sun}).time_since_epoch().count());
+    }
+    throw std::runtime_error("unsupported LAST_DAY date_part " + part);
+  }
+  if (name == "week" && arguments.size() == 1) {
+    return Value("week(" + to_lower(raw_str(arguments[0])) + ")");
+  }
+  if (name == "add_months") {
+    if (arguments.size() != 2) { throw std::runtime_error("ADD_MONTHS requires 2 arguments"); }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    int64_t days = parse_date_val(arguments[0]);
+    int64_t n = arguments[1].type == ValueType::kInt64 ? arguments[1].value.int_value : std::stoll(raw_str(arguments[1]));
+    using std::chrono::year_month_day;
+    using std::chrono::year_month_day_last;
+    using std::chrono::month_day_last;
+    using std::chrono::sys_days;
+    using std::chrono::year;
+    using std::chrono::month;
+    using std::chrono::day;
+
+    year_month_day ymd{sys_days{std::chrono::days{days}}};
+    year_month_day_last last_of_orig_month{ymd.year(), month_day_last{ymd.month()}};
+    bool is_last_day_of_month = (ymd.day() == last_of_orig_month.day());
+
+    auto floor_div = [](int64_t a, int64_t b) -> int64_t {
+      const int64_t q = a / b;
+      return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+    };
+    int64_t total_m = (int(ymd.year()) * 12 + unsigned(ymd.month()) - 1) + n;
+    int target_y = floor_div(total_m, 12);
+    if (target_y < 1 || target_y > 9999) {
+      throw std::runtime_error("DATE value out of range");
+    }
+    int target_m = total_m - target_y * 12 + 1;
+
+    year_month_day_last last_of_target{year{target_y}, month_day_last{month{static_cast<unsigned>(target_m)}}};
+    unsigned target_day = unsigned(ymd.day());
+    if (is_last_day_of_month || target_day > unsigned(last_of_target.day())) {
+      target_day = unsigned(last_of_target.day());
+    }
+    year_month_day target_ymd{year{target_y}, month{static_cast<unsigned>(target_m)}, day{target_day}};
+    int64_t res_days = sys_days{target_ymd}.time_since_epoch().count();
+    if (res_days < -719162 || res_days > 2932896) {
+      throw std::runtime_error("DATE value out of range");
+    }
+
+    if (arguments[0].type == ValueType::kDate) {
+      return Value::DateFromDays(res_days);
+    }
+    std::string s0 = raw_str(arguments[0]);
+    if (s0.size() > 10) {
+      return Value(FormatDateDays(res_days) + s0.substr(10));
+    }
+    return Value::DateFromDays(res_days);
+  }
+  if (name == "next_day") {
+    if (arguments.size() != 2) { throw std::runtime_error("NEXT_DAY requires 2 arguments"); }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    int64_t days = parse_date_val(arguments[0]);
+    std::string target_day_str = to_lower(raw_str(arguments[1]));
+    int target_iso = 0;
+    if (target_day_str.starts_with("mon")) { target_iso = 1; }
+    else if (target_day_str.starts_with("tue")) { target_iso = 2; }
+    else if (target_day_str.starts_with("wed")) { target_iso = 3; }
+    else if (target_day_str.starts_with("thu")) { target_iso = 4; }
+    else if (target_day_str.starts_with("fri")) { target_iso = 5; }
+    else if (target_day_str.starts_with("sat")) { target_iso = 6; }
+    else if (target_day_str.starts_with("sun")) { target_iso = 7; }
+    else { throw std::runtime_error("invalid day name in NEXT_DAY: " + target_day_str); }
+
+    std::chrono::sys_days cur_days{std::chrono::days{days}};
+    int cur_iso = std::chrono::weekday{cur_days}.iso_encoding();
+    int diff = target_iso - cur_iso;
+    int add_days = (diff > 0) ? diff : (diff + 7);
+    int64_t res_days = days + add_days;
+    if (res_days < -719162 || res_days > 2932896) {
+      throw std::runtime_error("DATE value out of range");
+    }
+
+    return Value::DateFromDays(res_days);
+  }
+  if (name == "months_between") {
+    if (arguments.size() != 2) { throw std::runtime_error("MONTHS_BETWEEN requires 2 arguments"); }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    int64_t days1 = parse_date_val(arguments[0]);
+    int64_t days2 = parse_date_val(arguments[1]);
+    using std::chrono::year_month_day;
+    using std::chrono::year_month_day_last;
+    using std::chrono::month_day_last;
+    using std::chrono::sys_days;
+
+    year_month_day ymd1{sys_days{std::chrono::days{days1}}};
+    year_month_day ymd2{sys_days{std::chrono::days{days2}}};
+    year_month_day_last last1{ymd1.year(), month_day_last{ymd1.month()}};
+    year_month_day_last last2{ymd2.year(), month_day_last{ymd2.month()}};
+
+    int y1 = int(ymd1.year()), y2 = int(ymd2.year());
+    int m1 = unsigned(ymd1.month()), m2 = unsigned(ymd2.month());
+    int d1 = unsigned(ymd1.day()), d2 = unsigned(ymd2.day());
+
+    double full_months = static_cast<double>((y1 - y2) * 12 + (m1 - m2));
+
+    bool is_last1 = (d1 == unsigned(last1.day()));
+    bool is_last2 = (d2 == unsigned(last2.day()));
+
+    if ((d1 == d2) || (is_last1 && is_last2)) {
+      return Value(full_months);
+    }
+
+    std::string s1 = raw_str(arguments[0]);
+    std::string s2 = raw_str(arguments[1]);
+    double time_frac1 = 0.0;
+    double time_frac2 = 0.0;
+    int h = 0, m = 0, s = 0;
+    if (s1.size() > 11 && sscanf(s1.c_str() + 11, "%d:%d:%d", &h, &m, &s) >= 2) {
+      time_frac1 = (h * 3600 + m * 60 + s) / 86400.0;
+    }
+    if (s2.size() > 11 && sscanf(s2.c_str() + 11, "%d:%d:%d", &h, &m, &s) >= 2) {
+      time_frac2 = (h * 3600 + m * 60 + s) / 86400.0;
+    }
+
+    double day_diff = (d1 + time_frac1) - (d2 + time_frac2);
+    return Value(full_months + day_diff / 31.0);
+  }
+
+  auto utf8_offsets = [](std::string_view s) -> std::vector<size_t> {
+    std::vector<size_t> offsets;
+    offsets.reserve(s.size() + 1);
+    for (size_t i = 0; i < s.size();) {
+      offsets.push_back(i);
+      const unsigned char c = static_cast<unsigned char>(s[i]);
+      if ((c & 0x80) == 0) {
+        i += 1;
+      } else if ((c & 0xE0) == 0xC0) {
+        i += (i + 1 < s.size()) ? 2 : 1;
+      } else if ((c & 0xF0) == 0xE0) {
+        i += (i + 2 < s.size()) ? 3 : (i + 1 < s.size() ? 2 : 1);
+      } else if ((c & 0xF8) == 0xF0) {
+        i += (i + 3 < s.size()) ? 4 : (i + 2 < s.size() ? 3 : (i + 1 < s.size() ? 2 : 1));
+      } else {
+        i += 1;
+      }
+    }
+    offsets.push_back(s.size());
+    return offsets;
+  };
+
+  auto utf8_len = [&](std::string_view s) -> size_t {
+    return utf8_offsets(s).size() - 1;
+  };
+
+  auto utf8_substr = [&](std::string_view s, size_t start_cp, size_t count_cp) -> std::string {
+    const auto offsets = utf8_offsets(s);
+    const size_t total_cps = offsets.size() - 1;
+    if (start_cp >= total_cps) { return ""; }
+    const size_t end_cp = std::min(start_cp + count_cp, total_cps);
+    const size_t byte_start = offsets[start_cp];
+    const size_t byte_end = offsets[end_cp];
+    return std::string(s.substr(byte_start, byte_end - byte_start));
+  };
+
+  // String functions
+  if (name == "concat") {
+    std::string result;
+    for (const Value& value : arguments) {
+      if (value.IsNull()) { return {}; }
+      if (value.type != ValueType::kVarChar) {
+        result.append(value.AsString());
+      } else {
+        result.append(value.value.varchar_value);
+      }
+    }
+    return Value(std::move(result));
+  }
+  if (name == "byte_length" || name == "octet_length") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error(name + " requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    return Value(static_cast<int64_t>(raw_str(arguments[0]).size()));
+  }
+  if (name == "length" || name == "char_length" ||
+      name == "character_length") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error(name + " requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    return Value(static_cast<int64_t>(utf8_len(raw_str(arguments[0]))));
+  }
+  if (name == "upper") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("UPPER requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    std::string s = raw_str(arguments[0]);
+    for (char& c : s) {
+      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return Value(std::move(s));
+  }
+  if (name == "lower") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("LOWER requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    std::string s = raw_str(arguments[0]);
+    for (char& c : s) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return Value(std::move(s));
+  }
+  if (name == "trim") {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error("TRIM requires 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull() || (arguments.size() == 2 && arguments[1].IsNull())) {
+      return {};
+    }
+    std::string s = raw_str(arguments[0]);
+    const std::string cutset = arguments.size() == 2 ? raw_str(arguments[1]) : " \t\n\r\f\v";
+    const size_t start = s.find_first_not_of(cutset);
+    if (start == std::string::npos) { return Value(std::string()); }
+    const size_t end = s.find_last_not_of(cutset);
+    return Value(s.substr(start, end - start + 1));
+  }
+  if (name == "ltrim") {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error("LTRIM requires 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull() || (arguments.size() == 2 && arguments[1].IsNull())) {
+      return {};
+    }
+    std::string s = raw_str(arguments[0]);
+    const std::string cutset = arguments.size() == 2 ? raw_str(arguments[1]) : " \t\n\r\f\v";
+    const size_t start = s.find_first_not_of(cutset);
+    if (start == std::string::npos) { return Value(std::string()); }
+    return Value(s.substr(start));
+  }
+  if (name == "rtrim") {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error("RTRIM requires 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull() || (arguments.size() == 2 && arguments[1].IsNull())) {
+      return {};
+    }
+    std::string s = raw_str(arguments[0]);
+    const std::string cutset = arguments.size() == 2 ? raw_str(arguments[1]) : " \t\n\r\f\v";
+    const size_t end = s.find_last_not_of(cutset);
+    if (end == std::string::npos) { return Value(std::string()); }
+    return Value(s.substr(0, end + 1));
+  }
+  if (name == "starts_with") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("STARTS_WITH requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    return Value(raw_str(arguments[0]).starts_with(raw_str(arguments[1])));
+  }
+  if (name == "ends_with") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("ENDS_WITH requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    return Value(raw_str(arguments[0]).ends_with(raw_str(arguments[1])));
+  }
+  if (name == "strpos") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("STRPOS requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    const std::string s = raw_str(arguments[0]);
+    const std::string sub = raw_str(arguments[1]);
+    if (sub.empty()) { return Value(int64_t{1}); }
+    const size_t pos = s.find(sub);
+    if (pos == std::string::npos) { return Value(int64_t{0}); }
+    return Value(static_cast<int64_t>(utf8_len(std::string_view(s.data(), pos)) + 1));
+  }
+  if (name == "instr") {
+    if (arguments.size() < 2 || arguments.size() > 4) {
+      throw std::runtime_error("INSTR requires 2 to 4 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull() ||
+        (arguments.size() >= 3 && arguments[2].IsNull()) ||
+        (arguments.size() == 4 && arguments[3].IsNull())) {
+      return {};
+    }
+    const std::string source = raw_str(arguments[0]);
+    const std::string target = raw_str(arguments[1]);
+    auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
+      if (v.type == ValueType::kInt64) { return v.value.int_value; }
+      if (v.type == ValueType::kDouble) { return static_cast<int64_t>(v.value.double_value); }
+      if (v.type == ValueType::kVarChar) {
+        try { return std::stoll(std::string(v.value.varchar_value)); } catch (...) {}
+      }
+      return def;
+    };
+    const int64_t position = arguments.size() >= 3 ? to_i64(arguments[2], 1) : 1;
+    const int64_t occurrence = arguments.size() == 4 ? to_i64(arguments[3], 1) : 1;
+
+    if (position == 0 || occurrence <= 0) {
+      return Value(int64_t{0});
+    }
+
+    const auto s_offsets = utf8_offsets(source);
+    const size_t s_cps = s_offsets.size() > 1 ? s_offsets.size() - 1 : 0;
+    const auto t_offsets = utf8_offsets(target);
+    const size_t t_cps = t_offsets.size() > 1 ? t_offsets.size() - 1 : 0;
+
+    if (t_cps == 0) {
+      if (position > 0 && static_cast<size_t>(position) <= s_cps + 1) {
+        return Value(position);
+      }
+      return Value(int64_t{0});
+    }
+
+    std::vector<size_t> matches;
+    if (position > 0) {
+      size_t start_cp = static_cast<size_t>(position - 1);
+      for (size_t cp = start_cp; cp + t_cps <= s_cps; ++cp) {
+        size_t b_start = s_offsets[cp];
+        size_t b_end = s_offsets[cp + t_cps];
+        if (source.substr(b_start, b_end - b_start) == target) {
+          matches.push_back(cp + 1);
+        }
+      }
+    } else {
+      int64_t target_cp = static_cast<int64_t>(s_cps) + position;
+      if (target_cp >= 0) {
+        for (int64_t cp = target_cp; cp >= 0; --cp) {
+          if (static_cast<size_t>(cp) + t_cps <= s_cps) {
+            size_t b_start = s_offsets[cp];
+            size_t b_end = s_offsets[cp + t_cps];
+            if (source.substr(b_start, b_end - b_start) == target) {
+              matches.push_back(cp + 1);
+            }
+          }
+        }
+      }
+    }
+
+    if (static_cast<size_t>(occurrence) <= matches.size()) {
+      return Value(static_cast<int64_t>(matches[occurrence - 1]));
+    }
+    return Value(int64_t{0});
+  }
+  if (name == "replace") {
+    if (arguments.size() != 3) {
+      throw std::runtime_error("REPLACE requires 3 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull() ||
+        arguments[2].IsNull()) {
+      return {};
+    }
+    std::string s = raw_str(arguments[0]);
+    const std::string from = raw_str(arguments[1]);
+    const std::string to = raw_str(arguments[2]);
+    if (from.empty()) { return Value(std::move(s)); }
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+      s.replace(pos, from.size(), to);
+      pos += to.size();
+    }
+    return Value(std::move(s));
+  }
+  if (name == "repeat") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("REPEAT requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    const std::string s = raw_str(arguments[0]);
+    auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
+      if (v.type == ValueType::kInt64) { return v.value.int_value; }
+      if (v.type == ValueType::kDouble) { return static_cast<int64_t>(v.value.double_value); }
+      if (v.type == ValueType::kVarChar) {
+        try { return std::stoll(std::string(v.value.varchar_value)); } catch (...) {}
+      }
+      return def;
+    };
+    const int64_t n = to_i64(arguments[1], 0);
+    if (n < 0) {
+      throw std::runtime_error("Second argument (repeat count) for REPEAT cannot be negative");
+    }
+    if (n == 0) { return Value(std::string()); }
+    if (static_cast<uint64_t>(s.size()) * static_cast<uint64_t>(n) > 1000000) {
+      throw std::runtime_error("Output of REPEAT exceeds max allowed output size of 1MB");
+    }
+    std::string res;
+    res.reserve(s.size() * n);
+    for (int64_t i = 0; i < n; ++i) { res += s; }
+    return Value(std::move(res));
+  }
+
+  if (name == "reverse") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("REVERSE requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    const std::string s = raw_str(arguments[0]);
+    const auto offsets = utf8_offsets(s);
+    const size_t total_cps = offsets.size() - 1;
+    std::string res;
+    res.reserve(s.size());
+    for (size_t i = total_cps; i > 0; --i) {
+      const size_t start = offsets[i - 1];
+      const size_t len = offsets[i] - start;
+      res.append(s, start, len);
+    }
+    return Value(std::move(res));
+  }
   if (name == "substr" || name == "substring") {
-    // Canonical guards (FunctionCallExpression ExecuteFunction): a
-    // non-positive or NULL length yields NULL/"" instead of wrapping around.
     if (arguments.size() < 2 || arguments.size() > 3) {
       throw std::runtime_error("SUBSTR requires two or three arguments");
     }
@@ -373,74 +2470,1593 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 3 && arguments[2].IsNull())) {
       return {};
     }
-    if (arguments[0].type != ValueType::kVarChar ||
-        arguments[1].type != ValueType::kInt64 ||
-        (arguments.size() == 3 && arguments[2].type != ValueType::kInt64)) {
-      throw std::runtime_error("SUBSTR argument type mismatch");
+    const std::string input = raw_str(arguments[0]);
+    auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
+      if (v.type == ValueType::kInt64) { return v.value.int_value; }
+      if (v.type == ValueType::kDouble) { return static_cast<int64_t>(v.value.double_value); }
+      if (v.type == ValueType::kVarChar) {
+        try { return std::stoll(std::string(v.value.varchar_value)); } catch (...) {}
+      }
+      return def;
+    };
+    const int64_t start = to_i64(arguments[1], 1);
+    if (arguments.size() == 3) {
+      const int64_t len = to_i64(arguments[2], 0);
+      if (len < 0) {
+        throw std::runtime_error("SUBSTR length cannot be negative");
+      }
+      if (len == 0) {
+        return Value(std::string());
+      }
     }
-    const std::string input(arguments[0].value.varchar_value);
-    const int64_t start = arguments[1].value.int_value;
-    if (arguments.size() == 3 && arguments[2].value.int_value <= 0) {
+
+    const size_t total_cps = utf8_len(input);
+    int64_t actual_start = 0;
+    if (start > 0) {
+      actual_start = start - 1;
+    } else if (start < 0) {
+      actual_start = static_cast<int64_t>(total_cps) + start;
+    } else {
+      actual_start = 0;
+    }
+    if (actual_start < 0) { actual_start = 0; }
+    if (actual_start >= static_cast<int64_t>(total_cps)) {
       return Value(std::string());
     }
-    const size_t begin = start <= 1 ? 0 : static_cast<size_t>(start - 1);
-    if (begin >= input.size()) { return Value(std::string());
-}
+
     const size_t length =
         arguments.size() == 3
-            ? static_cast<size_t>(arguments[2].value.int_value)
-            : std::string::npos;
-    return Value(input.substr(begin, length));
+            ? static_cast<size_t>(std::max(int64_t{0}, to_i64(arguments[2], 0)))
+            : total_cps;
+    return Value(utf8_substr(input, static_cast<size_t>(actual_start), length));
   }
-  if (name.starts_with("extract_")) {
-    // Canonical guards (FunctionCallExpression ExecuteFunction): message
-    // texts and the malformed-date handling must match the AST path.
+
+  if (name == "byte_substr") {
+    if (arguments.size() < 2 || arguments.size() > 3) {
+      throw std::runtime_error("SUBSTR requires two or three arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull() ||
+        (arguments.size() == 3 && arguments[2].IsNull())) {
+      return {};
+    }
+    const std::string input = raw_str(arguments[0]);
+    auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
+      if (v.type == ValueType::kInt64) { return v.value.int_value; }
+      if (v.type == ValueType::kDouble) { return static_cast<int64_t>(v.value.double_value); }
+      if (v.type == ValueType::kVarChar) {
+        try { return std::stoll(std::string(v.value.varchar_value)); } catch (...) {}
+      }
+      return def;
+    };
+    const int64_t start = to_i64(arguments[1], 1);
+    if (arguments.size() == 3) {
+      const int64_t len = to_i64(arguments[2], 0);
+      if (len < 0) {
+        throw std::runtime_error("SUBSTR length cannot be negative");
+      }
+      if (len == 0) {
+        return Value(std::string());
+      }
+    }
+
+    const size_t total_bytes = input.size();
+    int64_t actual_start = 0;
+    if (start > 0) {
+      actual_start = start - 1;
+    } else if (start < 0) {
+      actual_start = static_cast<int64_t>(total_bytes) + start;
+    } else {
+      actual_start = 0;
+    }
+    if (actual_start < 0) { actual_start = 0; }
+    if (actual_start >= static_cast<int64_t>(total_bytes)) {
+      return Value(std::string());
+    }
+
+    const size_t length =
+        arguments.size() == 3
+            ? static_cast<size_t>(std::max(int64_t{0}, to_i64(arguments[2], 0)))
+            : total_bytes;
+    return Value(input.substr(static_cast<size_t>(actual_start), length));
+  }
+
+  if (name == "byte_reverse") {
     if (arguments.size() != 1) {
-      throw std::runtime_error("EXTRACT requires one argument");
+      throw std::runtime_error("REVERSE requires 1 argument");
     }
-    if (arguments[0].IsNull()) { return {};
-}
-    if (arguments[0].type != ValueType::kDate &&
-        arguments[0].type != ValueType::kVarChar) {
-      throw std::runtime_error("EXTRACT requires DATE or STRING");
+    if (arguments[0].IsNull()) { return {}; }
+    std::string s = raw_str(arguments[0]);
+    std::reverse(s.begin(), s.end());
+    return Value(std::move(s));
+  }
+
+
+  if (name == "left") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("LEFT requires 2 arguments");
     }
-    const std::string date = arguments[0].type == ValueType::kDate
-                                 ? arguments[0].AsString()
-                                 : std::string(arguments[0].value.varchar_value);
-    if (date.size() < 10) { throw std::runtime_error("invalid DATE value");
-}
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    const std::string s = raw_str(arguments[0]);
+    auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
+      if (v.type == ValueType::kInt64) { return v.value.int_value; }
+      if (v.type == ValueType::kDouble) { return static_cast<int64_t>(v.value.double_value); }
+      if (v.type == ValueType::kVarChar) {
+        try { return std::stoll(std::string(v.value.varchar_value)); } catch (...) {}
+      }
+      return def;
+    };
+    const int64_t len = to_i64(arguments[1], 0);
+    if (len < 0) {
+      throw std::runtime_error("Second argument (length) for LEFT cannot be negative");
+    }
+    if (len == 0) { return Value(std::string()); }
+    return Value(utf8_substr(s, 0, static_cast<size_t>(len)));
+  }
+
+  if (name == "right") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("RIGHT requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    const std::string s = raw_str(arguments[0]);
+    auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
+      if (v.type == ValueType::kInt64) { return v.value.int_value; }
+      if (v.type == ValueType::kDouble) { return static_cast<int64_t>(v.value.double_value); }
+      if (v.type == ValueType::kVarChar) {
+        try { return std::stoll(std::string(v.value.varchar_value)); } catch (...) {}
+      }
+      return def;
+    };
+    const int64_t len = to_i64(arguments[1], 0);
+    if (len < 0) {
+      throw std::runtime_error("Second argument (length) for RIGHT cannot be negative");
+    }
+    if (len == 0) { return Value(std::string()); }
+    const size_t total_cps = utf8_len(s);
+    const size_t start_cp =
+        total_cps >= static_cast<size_t>(len) ? total_cps - static_cast<size_t>(len) : 0;
+    return Value(utf8_substr(s, start_cp, static_cast<size_t>(len)));
+  }
+
+
+  if (name == "lpad" || name == "rpad") {
+    if (arguments.size() < 2 || arguments.size() > 3) {
+      throw std::runtime_error(name + " requires 2 or 3 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull() ||
+        (arguments.size() == 3 && arguments[2].IsNull())) {
+      return {};
+    }
+    const std::string s = raw_str(arguments[0]);
+    auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
+      if (v.type == ValueType::kInt64) { return v.value.int_value; }
+      if (v.type == ValueType::kDouble) { return static_cast<int64_t>(v.value.double_value); }
+      if (v.type == ValueType::kVarChar) {
+        try { return std::stoll(std::string(v.value.varchar_value)); } catch (...) {}
+      }
+      return def;
+    };
+    const int64_t target_len = to_i64(arguments[1], 0);
+    if (target_len < 0) {
+      throw std::runtime_error("Second argument (output size) for LPAD/RPAD cannot be negative");
+    }
+    if (target_len > 1000000) {
+      throw std::runtime_error("Output of LPAD/RPAD exceeds max allowed output size of 1MB");
+    }
+    if (target_len == 0) { return Value(std::string()); }
+    const std::string pad =
+        arguments.size() == 3 ? raw_str(arguments[2]) : " ";
+    if (pad.empty()) {
+      throw std::runtime_error("Pattern in LPAD/RPAD cannot be empty");
+    }
+    const size_t total_cps = utf8_len(s);
+    if (static_cast<size_t>(target_len) <= total_cps) {
+      return Value(utf8_substr(s, 0, static_cast<size_t>(target_len)));
+    }
+    const size_t pad_cps = utf8_len(pad);
+    const size_t needed = static_cast<size_t>(target_len) - total_cps;
+    std::string pad_str;
+    for (size_t i = 0; i < needed / pad_cps; ++i) { pad_str += pad; }
+    if (needed % pad_cps != 0) {
+      pad_str += utf8_substr(pad, 0, needed % pad_cps);
+    }
+    return Value(name == "lpad" ? pad_str + s : s + pad_str);
+  }
+
+
+  if (name == "ascii") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("ASCII requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    const std::string s = raw_str(arguments[0]);
+    if (s.empty()) { return Value(int64_t{0}); }
+    return Value(static_cast<int64_t>(static_cast<unsigned char>(s[0])));
+  }
+
+  if (name == "unicode") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("UNICODE requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    const std::string s = raw_str(arguments[0]);
+    if (s.empty()) { return Value(int64_t{0}); }
+    const auto offsets = utf8_offsets(s);
+    const size_t first_len = offsets[1];
+    uint32_t code = 0;
+    if (first_len == 1) {
+      code = static_cast<unsigned char>(s[0]);
+    } else if (first_len == 2) {
+      code = ((static_cast<unsigned char>(s[0]) & 0x1F) << 6) |
+             (static_cast<unsigned char>(s[1]) & 0x3F);
+    } else if (first_len == 3) {
+      code = ((static_cast<unsigned char>(s[0]) & 0x0F) << 12) |
+             ((static_cast<unsigned char>(s[1]) & 0x3F) << 6) |
+             (static_cast<unsigned char>(s[2]) & 0x3F);
+    } else if (first_len == 4) {
+      code = ((static_cast<unsigned char>(s[0]) & 0x07) << 18) |
+             ((static_cast<unsigned char>(s[1]) & 0x3F) << 12) |
+             ((static_cast<unsigned char>(s[2]) & 0x3F) << 6) |
+             (static_cast<unsigned char>(s[3]) & 0x3F);
+    }
+    return Value(static_cast<int64_t>(code));
+  }
+
+  if (name == "chr") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("CHR requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    const int64_t code =
+        arguments[0].type == ValueType::kInt64 ? arguments[0].value.int_value : 0;
+    std::string res;
+    if (code < 0 || code > 0x10FFFF) {
+      throw std::runtime_error("CHR argument out of range");
+    }
+    if (code <= 0x7F) {
+      res.push_back(static_cast<char>(code));
+    } else if (code <= 0x7FF) {
+      res.push_back(static_cast<char>(0xC0 | ((code >> 6) & 0x1F)));
+      res.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    } else if (code <= 0xFFFF) {
+      res.push_back(static_cast<char>(0xE0 | ((code >> 12) & 0x0F)));
+      res.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+      res.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    } else {
+      res.push_back(static_cast<char>(0xF0 | ((code >> 18) & 0x07)));
+      res.push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
+      res.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+      res.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    }
+    return Value(std::move(res));
+  }
+
+  if (name == "code_points_to_string") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("CODE_POINTS_TO_STRING requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    const Value& arr = arguments[0];
+    if (arr.type != ValueType::kArray) { return {}; }
+    std::string res;
+    for (const Value& elem : arr.ArrayElements()) {
+      if (elem.IsNull()) { return {}; }
+      int64_t cp = elem.type == ValueType::kInt64 ? elem.value.int_value : 0;
+      if (cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+        throw std::runtime_error("invalid code point for CODE_POINTS_TO_STRING: " + std::to_string(cp));
+      }
+      if (cp <= 0x7F) {
+        res.push_back(static_cast<char>(cp));
+      } else if (cp <= 0x7FF) {
+        res.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
+        res.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+      } else if (cp <= 0xFFFF) {
+        res.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
+        res.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        res.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+      } else {
+        res.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
+        res.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        res.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        res.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+      }
+    }
+    return Value(std::move(res));
+  }
+
+  if (name == "code_points_to_bytes") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("CODE_POINTS_TO_BYTES requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    const Value& arr = arguments[0];
+    if (arr.type != ValueType::kArray) { return {}; }
+    std::string res;
+    for (const Value& elem : arr.ArrayElements()) {
+      if (elem.IsNull()) { return {}; }
+      int64_t b = elem.type == ValueType::kInt64 ? elem.value.int_value : 0;
+      if (b < 0 || b > 255) {
+        throw std::runtime_error("invalid byte for CODE_POINTS_TO_BYTES: " + std::to_string(b));
+      }
+      res.push_back(static_cast<char>(b));
+    }
+    return Value(std::move(res));
+  }
+
+
+  if (name == "initcap") {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error("INITCAP requires 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull() || (arguments.size() == 2 && arguments[1].IsNull())) {
+      return {};
+    }
+    std::string s = raw_str(arguments[0]);
+    const bool has_delim = arguments.size() == 2;
+    const std::string delims = has_delim ? raw_str(arguments[1]) : "";
+    auto is_delim = [&](char c) {
+      if (has_delim) {
+        return delims.find(c) != std::string::npos;
+      }
+      return !std::isalnum(static_cast<unsigned char>(c));
+    };
+    bool new_word = true;
+    for (char& c : s) {
+      if (!is_delim(c)) {
+        if (new_word) {
+          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+          new_word = false;
+        } else {
+          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+      } else {
+        new_word = true;
+      }
+    }
+    return Value(std::move(s));
+  }
+
+
+  if (name == "regexp_contains") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("REGEXP_CONTAINS requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    const std::string s = raw_str(arguments[0]);
+    const std::string pat = raw_str(arguments[1]);
     try {
-      if (name == "extract_year") { return Value(std::stoll(date.substr(0, 4)));
-}
-      if (name == "extract_month") { return Value(std::stoll(date.substr(5, 2)));
-}
-      if (name == "extract_day") { return Value(std::stoll(date.substr(8, 2)));
-}
-    } catch (const std::logic_error&) {
-      throw std::runtime_error("invalid DATE value: " + date);
+      const std::regex re(pat);
+      return Value(std::regex_search(s, re));
+    } catch (...) {
+      throw std::runtime_error("invalid regular expression: " + pat);
     }
   }
-  if (name == "coalesce") {
-    for (Value& value : arguments) {
-      if (!value.IsNull()) { return value;
-}
+
+  if (name == "regexp_match") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("REGEXP_MATCH requires 2 arguments");
     }
-    return {};
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    const std::string s = raw_str(arguments[0]);
+    const std::string pat = raw_str(arguments[1]);
+    try {
+      const std::regex re(pat);
+      return Value(std::regex_match(s, re));
+    } catch (...) {
+      throw std::runtime_error("invalid regular expression: " + pat);
+    }
   }
-  if (name == "concat") {
+
+  if (name == "regexp_instr") {
+    if (arguments.size() < 2 || arguments.size() > 5) {
+      throw std::runtime_error("REGEXP_INSTR requires 2 to 5 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull() ||
+        (arguments.size() >= 3 && arguments[2].IsNull()) ||
+        (arguments.size() >= 4 && arguments[3].IsNull()) ||
+        (arguments.size() == 5 && arguments[4].IsNull())) {
+      return {};
+    }
+    const std::string s = raw_str(arguments[0]);
+    const std::string pat = raw_str(arguments[1]);
+    if (pat.empty()) { return Value(int64_t{0}); }
+    auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
+      if (v.type == ValueType::kInt64) { return v.value.int_value; }
+      if (v.type == ValueType::kDouble) { return static_cast<int64_t>(v.value.double_value); }
+      if (v.type == ValueType::kVarChar) {
+        try { return std::stoll(std::string(v.value.varchar_value)); } catch (...) {}
+      }
+      return def;
+    };
+    const int64_t pos_arg = arguments.size() >= 3 ? to_i64(arguments[2], 1) : 1;
+    const int64_t occ_arg = arguments.size() >= 4 ? to_i64(arguments[3], 1) : 1;
+    const int64_t return_pos = arguments.size() == 5 ? to_i64(arguments[4], 0) : 0;
+    if (pos_arg <= 0 || occ_arg <= 0) {
+      throw std::runtime_error("REGEXP_INSTR position and occurrence must be positive");
+    }
+    const auto offsets = utf8_offsets(s);
+    const size_t total_cps = offsets.size() - 1;
+    if (static_cast<size_t>(pos_arg) > total_cps + 1) {
+      return Value(int64_t{0});
+    }
+    const size_t byte_start = offsets[static_cast<size_t>(pos_arg - 1)];
+    try {
+      const std::regex re(pat);
+      std::string search_str = s.substr(byte_start);
+      std::sregex_iterator it(search_str.begin(), search_str.end(), re);
+      std::sregex_iterator end;
+      int64_t current_occ = 1;
+      while (it != end) {
+        if (current_occ == occ_arg) {
+          const auto& match = *it;
+          const bool has_capture = match.size() > 1 && match[1].matched;
+          const size_t target_start = has_capture && return_pos == 0
+                                          ? byte_start + static_cast<size_t>(match.position(1))
+                                          : byte_start + static_cast<size_t>(match.position());
+          const size_t target_end = byte_start + static_cast<size_t>(match.position()) +
+                                    static_cast<size_t>(match.length());
+          size_t match_cp_start = 1;
+          size_t match_cp_end = 1;
+          for (size_t i = 0; i + 1 < offsets.size(); ++i) {
+            if (offsets[i] <= target_start && target_start < offsets[i + 1]) {
+              match_cp_start = i + 1;
+            }
+            if (offsets[i] < target_end && target_end <= offsets[i + 1]) {
+              match_cp_end = i + 1;
+            }
+          }
+          if (target_end >= s.size()) {
+            match_cp_end = total_cps;
+          }
+          return Value(static_cast<int64_t>(return_pos == 1 ? match_cp_end : match_cp_start));
+        }
+        ++current_occ;
+        ++it;
+      }
+      return Value(int64_t{0});
+    } catch (...) {
+      throw std::runtime_error("invalid regular expression: " + pat);
+    }
+  }
+
+
+  if (name == "regexp_extract_all") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("REGEXP_EXTRACT_ALL requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    const std::string s = raw_str(arguments[0]);
+    const std::string pat = raw_str(arguments[1]);
+    try {
+      const std::regex re(pat);
+      std::vector<Value> results;
+      std::sregex_iterator it(s.begin(), s.end(), re);
+      std::sregex_iterator end;
+      while (it != end) {
+        if (it->size() > 1) {
+          results.push_back(Value(it->str(1)));
+        } else {
+          results.push_back(Value(it->str(0)));
+        }
+        ++it;
+      }
+      return Value::Array(std::move(results), "STRING");
+    } catch (...) {
+      throw std::runtime_error("invalid regular expression: " + pat);
+    }
+  }
+
+  if (name == "regexp_extract") {
+    if (arguments.size() < 2 || arguments.size() > 4) {
+      throw std::runtime_error("REGEXP_EXTRACT requires 2 to 4 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    const std::string s = raw_str(arguments[0]);
+    const std::string pat = raw_str(arguments[1]);
+    try {
+      const std::regex re(pat);
+      std::smatch match;
+      if (std::regex_search(s, match, re)) {
+        if (match.size() > 1) {
+          return Value(match[1].str());
+        }
+        return Value(match[0].str());
+      }
+      return {};
+    } catch (...) {
+      throw std::runtime_error("invalid regular expression: " + pat);
+    }
+  }
+
+  if (name == "regexp_replace") {
+    if (arguments.size() != 3) {
+      throw std::runtime_error("REGEXP_REPLACE requires 3 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull() || arguments[2].IsNull()) {
+      return {};
+    }
+    const std::string s = raw_str(arguments[0]);
+    const std::string pat = raw_str(arguments[1]);
+    const std::string rep = raw_str(arguments[2]);
+    try {
+      const std::regex re(pat);
+      return Value(std::regex_replace(s, re, rep));
+    } catch (...) {
+      throw std::runtime_error("invalid regular expression: " + pat);
+    }
+  }
+
+
+  if (name == "split_substr") {
+    if (arguments.size() < 2 || arguments.size() > 4) {
+      throw std::runtime_error("SPLIT_SUBSTR requires 2 to 4 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull() ||
+        (arguments.size() >= 3 && arguments[2].IsNull()) ||
+        (arguments.size() == 4 && arguments[3].IsNull())) {
+      return {};
+    }
+    const std::string str = raw_str(arguments[0]);
+    const std::string delim = raw_str(arguments[1]);
+    auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
+      if (v.type == ValueType::kInt64) { return v.value.int_value; }
+      if (v.type == ValueType::kDouble) { return static_cast<int64_t>(v.value.double_value); }
+      if (v.type == ValueType::kVarChar) {
+        try { return std::stoll(std::string(v.value.varchar_value)); } catch (...) {}
+      }
+      return def;
+    };
+    const int64_t occ = arguments.size() >= 3 ? to_i64(arguments[2], 1) : 1;
+
+    std::vector<std::string> parts;
+    if (delim.empty()) {
+      parts.push_back(str);
+    } else {
+      size_t start = 0;
+      while (true) {
+        size_t pos = str.find(delim, start);
+        if (pos == std::string::npos) {
+          parts.push_back(str.substr(start));
+          break;
+        }
+        parts.push_back(str.substr(start, pos - start));
+        start = pos + delim.size();
+      }
+    }
+
+    const int64_t len =
+        arguments.size() == 4
+            ? to_i64(arguments[3], 1)
+            : ((occ == 0 || occ == 1) ? static_cast<int64_t>(parts.size()) : 1);
+    if (len <= 0) { return Value(std::string()); }
+
+
+    int64_t start_idx = 0;
+    if (occ > 0) {
+      start_idx = occ - 1;
+      if (start_idx >= static_cast<int64_t>(parts.size())) {
+        return Value(std::string());
+      }
+    } else if (occ < 0) {
+      start_idx = static_cast<int64_t>(parts.size()) + occ;
+      if (start_idx < 0) { start_idx = 0; }
+    } else {
+      start_idx = 0;
+    }
+
+    int64_t end_idx =
+        std::min(start_idx + len, static_cast<int64_t>(parts.size()));
+    std::string res = parts[start_idx];
+    for (int64_t i = start_idx + 1; i < end_idx; ++i) {
+      res += delim + parts[i];
+    }
+    return Value(std::move(res));
+  }
+
+  if (name == "split") {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error("SPLIT requires 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull() || (arguments.size() == 2 && arguments[1].IsNull())) {
+      return {};
+    }
+    const std::string s = raw_str(arguments[0]);
+    const std::string delim = arguments.size() == 2 ? raw_str(arguments[1]) : ",";
+    std::vector<Value> elems;
+    if (delim.empty()) {
+      if (s.empty()) {
+        elems.push_back(Value(std::string()));
+        return Value::Array(std::move(elems), "STRING");
+      }
+      const auto offsets = utf8_offsets(s);
+      for (size_t i = 1; i < offsets.size(); ++i) {
+        elems.push_back(Value(s.substr(offsets[i - 1], offsets[i] - offsets[i - 1])));
+      }
+      return Value::Array(std::move(elems), "STRING");
+    }
+    if (s.empty()) {
+      elems.push_back(Value(std::string()));
+      return Value::Array(std::move(elems), "STRING");
+    }
+    size_t start = 0;
+    while (true) {
+      size_t pos = s.find(delim, start);
+      if (pos == std::string::npos) {
+        elems.push_back(Value(s.substr(start)));
+        break;
+      }
+      elems.push_back(Value(s.substr(start, pos - start)));
+      start = pos + delim.size();
+    }
+    return Value::Array(std::move(elems), "STRING");
+  }
+
+  if (name == "soundex") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("SOUNDEX requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    std::string s = raw_str(arguments[0]);
+    size_t first_char = 0;
+    while (first_char < s.size() && std::isspace(static_cast<unsigned char>(s[first_char]))) {
+      ++first_char;
+    }
+    if (first_char >= s.size() || !std::isalpha(static_cast<unsigned char>(s[first_char]))) {
+      return Value(std::string());
+    }
+    std::string res;
+    char first_letter = static_cast<char>(std::toupper(static_cast<unsigned char>(s[first_char])));
+    res.push_back(first_letter);
+
+    auto soundex_code = [](char c) -> char {
+      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      if (c == 'B' || c == 'F' || c == 'P' || c == 'V') return '1';
+      if (c == 'C' || c == 'G' || c == 'J' || c == 'K' || c == 'Q' || c == 'S' || c == 'X' || c == 'Z') return '2';
+      if (c == 'D' || c == 'T') return '3';
+      if (c == 'L') return '4';
+      if (c == 'M' || c == 'N') return '5';
+      if (c == 'R') return '6';
+      if (c == 'A' || c == 'E' || c == 'I' || c == 'O' || c == 'U' || c == 'Y') return 'V';
+      if (c == 'H' || c == 'W') return 'H';
+      return '0';
+    };
+
+    char prev_code = soundex_code(first_letter);
+    if (prev_code == 'V' || prev_code == 'H') { prev_code = '0'; }
+    for (size_t i = first_char + 1; i < s.size() && res.size() < 4; ++i) {
+      if (!std::isalpha(static_cast<unsigned char>(s[i]))) { continue; }
+      char code = soundex_code(s[i]);
+      if (code == 'H') {
+        continue;
+      }
+      if (code == 'V' || code == '0') {
+        prev_code = '0';
+        continue;
+      }
+      if (code != prev_code) {
+        res.push_back(code);
+        prev_code = code;
+      }
+    }
+    while (res.size() < 4) {
+      res.push_back('0');
+    }
+    return Value(std::move(res));
+  }
+
+
+  if (name == "translate") {
+    if (arguments.size() != 3) {
+      throw std::runtime_error("TRANSLATE requires 3 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull() || arguments[2].IsNull()) {
+      return {};
+    }
+    const std::string s = raw_str(arguments[0]);
+    const std::string src = raw_str(arguments[1]);
+    const std::string dst = raw_str(arguments[2]);
+    const auto s_offsets = utf8_offsets(s);
+    const auto src_offsets = utf8_offsets(src);
+    const auto dst_offsets = utf8_offsets(dst);
+    const size_t s_len = s_offsets.size() - 1;
+    const size_t src_len = src_offsets.size() - 1;
+    const size_t dst_len = dst_offsets.size() - 1;
+
+    std::vector<std::string> src_chars;
+    for (size_t i = 0; i < src_len; ++i) {
+      src_chars.push_back(src.substr(src_offsets[i], src_offsets[i + 1] - src_offsets[i]));
+    }
+    std::vector<std::string> dst_chars;
+    for (size_t i = 0; i < dst_len; ++i) {
+      dst_chars.push_back(dst.substr(dst_offsets[i], dst_offsets[i + 1] - dst_offsets[i]));
+    }
+
+    std::string res;
+    for (size_t i = 0; i < s_len; ++i) {
+      std::string ch = s.substr(s_offsets[i], s_offsets[i + 1] - s_offsets[i]);
+      bool replaced = false;
+      for (size_t j = 0; j < src_chars.size(); ++j) {
+        if (ch == src_chars[j]) {
+          if (j < dst_chars.size()) {
+            res += dst_chars[j];
+          }
+          replaced = true;
+          break;
+        }
+      }
+      if (!replaced) {
+        res += ch;
+      }
+    }
+    return Value(std::move(res));
+  }
+
+
+  // JSON functions
+  if (name == "json_extract" || name == "json_query" ||
+      name == "json_value" || name == "json_extract_scalar" ||
+      name == "json_extract_array" || name == "json_query_array" ||
+      name == "json_value_array" || name == "json_extract_string_array") {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error(name + " requires 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull() || (arguments.size() == 2 && arguments[1].IsNull())) {
+      return {};
+    }
+    const std::string json_str = raw_str(arguments[0]);
+    const std::string path = arguments.size() == 2 ? raw_str(arguments[1]) : "$";
+    struct JVal {
+      enum T { kNull, kBool, kNum, kStr, kArr, kObj } type{kNull};
+      std::string raw;
+      std::string str;
+      std::vector<JVal> arr;
+      std::vector<std::pair<std::string, JVal>> obj;
+
+      std::string canonical() const {
+        if (type == kNull) { return "null"; }
+        if (type == kBool) { return str; }
+        if (type == kNum) { return raw; }
+        if (type == kStr) {
+          std::string res = "\"";
+          for (char c : str) {
+            if (c == '"') { res += "\\\""; }
+            else if (c == '\\') { res += "\\\\"; }
+            else if (c == '\b') { res += "\\b"; }
+            else if (c == '\f') { res += "\\f"; }
+            else if (c == '\n') { res += "\\n"; }
+            else if (c == '\r') { res += "\\r"; }
+            else if (c == '\t') { res += "\\t"; }
+            else if (static_cast<unsigned char>(c) < 0x20) {
+              char buf[8];
+              snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+              res += buf;
+            } else {
+              res.push_back(c);
+            }
+          }
+          res += "\"";
+          return res;
+        }
+        if (type == kArr) {
+          std::string res = "[";
+          for (size_t i = 0; i < arr.size(); ++i) {
+            if (i > 0) { res += ","; }
+            res += arr[i].canonical();
+          }
+          res += "]";
+          return res;
+        }
+        if (type == kObj) {
+          std::string res = "{";
+          for (size_t i = 0; i < obj.size(); ++i) {
+            if (i > 0) { res += ","; }
+            res += "\"" + obj[i].first + "\":" + obj[i].second.canonical();
+          }
+          res += "}";
+          return res;
+        }
+        return raw;
+      }
+    };
+    auto skip_ws = [](std::string_view s, size_t& pos) {
+      while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' ||
+                                s[pos] == '\n' || s[pos] == '\r')) {
+        ++pos;
+      }
+    };
+    auto parse_str = [](std::string_view s, size_t& pos, std::string& out) {
+      if (pos >= s.size() || s[pos] != '"') { return false; }
+      ++pos;
+      out.clear();
+      while (pos < s.size()) {
+        if (s[pos] == '\\' && pos + 1 < s.size()) {
+          char next = s[++pos];
+          if (next == '"') { out.push_back('"'); ++pos; }
+          else if (next == '\\') { out.push_back('\\'); ++pos; }
+          else if (next == '/') { out.push_back('/'); ++pos; }
+          else if (next == 'b') { out.push_back('\b'); ++pos; }
+          else if (next == 'f') { out.push_back('\f'); ++pos; }
+          else if (next == 'n') { out.push_back('\n'); ++pos; }
+          else if (next == 'r') { out.push_back('\r'); ++pos; }
+          else if (next == 't') { out.push_back('\t'); ++pos; }
+          else if (next == 'u' && pos + 4 < s.size()) {
+            std::string hex_str = std::string(s.substr(pos + 1, 4));
+            try {
+              uint32_t cp = std::stoul(hex_str, nullptr, 16);
+              if (cp <= 0x7F) {
+                out.push_back(static_cast<char>(cp));
+              } else if (cp <= 0x7FF) {
+                out.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+              } else if (cp <= 0xFFFF) {
+                out.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+              } else {
+                out.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+              }
+              pos += 5;
+            } catch (...) {
+              out.push_back(next);
+              ++pos;
+            }
+          } else {
+            out.push_back(next);
+            ++pos;
+          }
+        } else if (s[pos] == '"') {
+          ++pos;
+          return true;
+        } else {
+          out.push_back(s[pos++]);
+        }
+      }
+      return false;
+    };
+    std::function<bool(std::string_view, size_t&, JVal&)> parse_j =
+        [&](std::string_view s, size_t& pos, JVal& out) -> bool {
+      skip_ws(s, pos);
+      if (pos >= s.size()) { return false; }
+      const size_t st = pos;
+      if (s[pos] == '"') {
+        out.type = JVal::kStr;
+        if (!parse_str(s, pos, out.str)) { return false; }
+        out.raw = std::string(s.substr(st, pos - st));
+        return true;
+      }
+      if (s[pos] == '{') {
+        out.type = JVal::kObj;
+        ++pos;
+        skip_ws(s, pos);
+        if (pos < s.size() && s[pos] == '}') {
+          ++pos;
+          out.raw = std::string(s.substr(st, pos - st));
+          return true;
+        }
+        while (pos < s.size()) {
+          skip_ws(s, pos);
+          std::string k;
+          if (!parse_str(s, pos, k)) { return false; }
+          skip_ws(s, pos);
+          if (pos >= s.size() || s[pos] != ':') { return false; }
+          ++pos;
+          JVal v;
+          if (!parse_j(s, pos, v)) { return false; }
+          out.obj.emplace_back(std::move(k), std::move(v));
+          skip_ws(s, pos);
+          if (pos < s.size() && s[pos] == ',') {
+            ++pos;
+          } else if (pos < s.size() && s[pos] == '}') {
+            ++pos;
+            out.raw = std::string(s.substr(st, pos - st));
+            return true;
+          } else {
+            return false;
+          }
+        }
+        return false;
+      }
+      if (s[pos] == '[') {
+        out.type = JVal::kArr;
+        ++pos;
+        skip_ws(s, pos);
+        if (pos < s.size() && s[pos] == ']') {
+          ++pos;
+          out.raw = std::string(s.substr(st, pos - st));
+          return true;
+        }
+        while (pos < s.size()) {
+          JVal elem;
+          if (!parse_j(s, pos, elem)) { return false; }
+          out.arr.push_back(std::move(elem));
+          skip_ws(s, pos);
+          if (pos < s.size() && s[pos] == ',') {
+            ++pos;
+          } else if (pos < s.size() && s[pos] == ']') {
+            ++pos;
+            out.raw = std::string(s.substr(st, pos - st));
+            return true;
+          } else {
+            return false;
+          }
+        }
+        return false;
+      }
+      if (s.substr(pos, 4) == "true") {
+        out.type = JVal::kBool;
+        out.str = "true";
+        out.raw = "true";
+        pos += 4;
+        return true;
+      }
+      if (s.substr(pos, 5) == "false") {
+        out.type = JVal::kBool;
+        out.str = "false";
+        out.raw = "false";
+        pos += 5;
+        return true;
+      }
+      if (s.substr(pos, 4) == "null") {
+        out.type = JVal::kNull;
+        out.raw = "null";
+        pos += 4;
+        return true;
+      }
+      while (pos < s.size() &&
+             (std::isdigit(static_cast<unsigned char>(s[pos])) ||
+              s[pos] == '-' || s[pos] == '+' || s[pos] == '.' ||
+              s[pos] == 'e' || s[pos] == 'E')) {
+        ++pos;
+      }
+      out.type = JVal::kNum;
+      out.raw = std::string(s.substr(st, pos - st));
+      out.str = out.raw;
+      return true;
+    };
+
+    size_t p = 0;
+    JVal root;
+    if (!parse_j(json_str, p, root)) { return {}; }
+    const JVal* cur = &root;
+    size_t path_pos = 0;
+    if (path_pos < path.size() && path[path_pos] == '$') { ++path_pos; }
+    while (path_pos < path.size() && cur != nullptr) {
+      if (path[path_pos] == '.') {
+        ++path_pos;
+        std::string key;
+        if (path_pos < path.size() && path[path_pos] == '"') {
+          if (!parse_str(path, path_pos, key)) { cur = nullptr; break; }
+        } else {
+          size_t end = path_pos;
+          while (end < path.size() && path[end] != '.' && path[end] != '[') {
+            ++end;
+          }
+          key = std::string(path.substr(path_pos, end - path_pos));
+          path_pos = end;
+        }
+        if (cur->type != JVal::kObj) { cur = nullptr; break; }
+        const JVal* next = nullptr;
+        for (const auto& [k, v] : cur->obj) {
+          if (k == key) { next = &v; break; }
+        }
+        cur = next;
+      } else if (path[path_pos] == '[') {
+        ++path_pos;
+        size_t end = path_pos;
+        while (end < path.size() && path[end] != ']') { ++end; }
+        if (end >= path.size()) { cur = nullptr; break; }
+        const std::string idx_str =
+            std::string(path.substr(path_pos, end - path_pos));
+        path_pos = end + 1;
+        int64_t idx = 0;
+        try { idx = std::stoll(idx_str); } catch (...) { cur = nullptr; break; }
+        if (cur->type != JVal::kArr || idx < 0 ||
+            idx >= static_cast<int64_t>(cur->arr.size())) {
+          cur = nullptr;
+          break;
+        }
+        cur = &cur->arr[idx];
+      } else {
+        cur = nullptr;
+        break;
+      }
+    }
+    if (cur == nullptr) { return {}; }
+    const bool is_array_func = name.ends_with("_array");
+    if (is_array_func) {
+      if (cur->type != JVal::kArr) { return {}; }
+      std::vector<Value> elems;
+      elems.reserve(cur->arr.size());
+      for (const auto& item : cur->arr) {
+        if (name == "json_value_array" || name == "json_extract_string_array") {
+          if (item.type == JVal::kNull) {
+            elems.push_back(Value());
+          } else if (item.type == JVal::kStr) {
+            elems.push_back(Value(std::string(item.str)));
+          } else {
+            elems.push_back(Value(item.canonical()));
+          }
+        } else {
+          elems.push_back(Value(item.canonical()));
+        }
+      }
+      return Value::Array(std::move(elems), "STRING");
+    }
+    if (cur->type == JVal::kNull) { return {}; }
+    if (name == "json_value" || name == "json_extract_scalar") {
+      if (cur->type == JVal::kArr || cur->type == JVal::kObj) { return {}; }
+      return Value(std::string(cur->type == JVal::kStr ? cur->str : cur->raw));
+    }
+    return Value(cur->canonical());
+  }
+
+  if (name == "to_json_string") {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error("TO_JSON_STRING requires 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    const std::string s = raw_str(arguments[0]);
+    return Value(std::string(s));
+  }
+
+
+
+
+
+  // Math functions
+  if (name == "abs") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("ABS requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    if (arguments[0].type == ValueType::kInt64) {
+      return Value(std::abs(arguments[0].value.int_value));
+    }
+    if (arguments[0].type == ValueType::kDouble) {
+      return Value(std::fabs(arguments[0].value.double_value));
+    }
+    throw std::runtime_error("ABS requires a numeric argument");
+  }
+  if (name == "sign") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("SIGN requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    if (arguments[0].type == ValueType::kInt64) {
+      const int64_t v = arguments[0].value.int_value;
+      return Value(v > 0 ? int64_t{1} : (v < 0 ? int64_t{-1} : int64_t{0}));
+    }
+    if (arguments[0].type == ValueType::kDouble) {
+      const double v = arguments[0].value.double_value;
+      return Value(v > 0.0 ? 1.0 : (v < 0.0 ? -1.0 : 0.0));
+    }
+    throw std::runtime_error("SIGN requires a numeric argument");
+  }
+  if (name == "round") {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error("ROUND requires 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull() ||
+        (arguments.size() == 2 && arguments[1].IsNull())) {
+      return {};
+    }
+    const double val = arguments[0].type == ValueType::kInt64
+                           ? static_cast<double>(arguments[0].value.int_value)
+                           : arguments[0].value.double_value;
+    const int64_t digits =
+        arguments.size() == 2 ? (arguments[1].type == ValueType::kInt64
+                                     ? arguments[1].value.int_value
+                                     : 0)
+                              : 0;
+    const double factor = std::pow(10.0, digits);
+    const double res = std::round(val * factor) / factor;
+    if (arguments[0].type == ValueType::kInt64 && digits <= 0) {
+      return Value(static_cast<int64_t>(res));
+    }
+    return Value(res);
+  }
+  if (name == "trunc" || name == "truncate") {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error(name + " requires 1 or 2 arguments");
+    }
+    if (arguments[0].IsNull() ||
+        (arguments.size() == 2 && arguments[1].IsNull())) {
+      return {};
+    }
+    const double val = arguments[0].type == ValueType::kInt64
+                           ? static_cast<double>(arguments[0].value.int_value)
+                           : arguments[0].value.double_value;
+    const int64_t digits =
+        arguments.size() == 2 ? (arguments[1].type == ValueType::kInt64
+                                     ? arguments[1].value.int_value
+                                     : 0)
+                              : 0;
+    const double factor = std::pow(10.0, digits);
+    const double res = std::trunc(val * factor) / factor;
+    if (arguments[0].type == ValueType::kInt64 && digits <= 0) {
+      return Value(static_cast<int64_t>(res));
+    }
+    return Value(res);
+  }
+  if (name == "ceil" || name == "ceiling") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error(name + " requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    if (arguments[0].type == ValueType::kInt64) { return arguments[0]; }
+    return Value(std::ceil(arguments[0].value.double_value));
+  }
+  if (name == "floor") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("FLOOR requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    if (arguments[0].type == ValueType::kInt64) { return arguments[0]; }
+    return Value(std::floor(arguments[0].value.double_value));
+  }
+  if (name == "mod") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("MOD requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    if (arguments[0].type == ValueType::kInt64 &&
+        arguments[1].type == ValueType::kInt64) {
+      if (arguments[1].value.int_value == 0) {
+        throw std::runtime_error("division by zero in MOD");
+      }
+      return Value(arguments[0].value.int_value % arguments[1].value.int_value);
+    }
+    const double l = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    const double r = arguments[1].type == ValueType::kInt64
+                         ? arguments[1].value.int_value
+                         : arguments[1].value.double_value;
+    return Value(std::fmod(l, r));
+  }
+  if (name == "pow" || name == "power") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error(name + " requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    const double l = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    const double r = arguments[1].type == ValueType::kInt64
+                         ? arguments[1].value.int_value
+                         : arguments[1].value.double_value;
+    return Value(std::pow(l, r));
+  }
+  if (name == "sqrt") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("SQRT requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    if (v < 0.0) { throw std::runtime_error("SQRT of negative number"); }
+    return Value(std::sqrt(v));
+  }
+  if (name == "cbrt") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("CBRT requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    return Value(std::cbrt(v));
+  }
+  if (name == "greatest" || name == "least") {
+    if (arguments.empty()) {
+      throw std::runtime_error(name + " requires at least 1 argument");
+    }
+    for (const auto& v : arguments) {
+      if (v.IsNull()) { return {}; }
+    }
+    Value best = arguments[0];
+    for (size_t i = 1; i < arguments.size(); ++i) {
+      if (name == "greatest") {
+        if (arguments[i] > best) { best = arguments[i]; }
+      } else {
+        if (arguments[i] < best) { best = arguments[i]; }
+      }
+    }
+    return best;
+  }
+  if (name == "ln") {
+    if (arguments.size() != 1) { throw std::runtime_error("LN requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    return Value(std::log(v));
+  }
+  if (name == "log" || name == "log10") {
+    if (arguments.empty() || arguments.size() > 2) {
+      throw std::runtime_error(name + " argument count mismatch");
+    }
+    if (arguments[0].IsNull() ||
+        (arguments.size() == 2 && arguments[1].IsNull())) {
+      return {};
+    }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    if (name == "log10") { return Value(std::log10(v)); }
+    if (arguments.size() == 1) { return Value(std::log(v)); }
+    const double base = arguments[1].type == ValueType::kInt64
+                            ? arguments[1].value.int_value
+                            : arguments[1].value.double_value;
+    return Value(std::log(v) / std::log(base));
+  }
+  if (name == "exp") {
+    if (arguments.size() != 1) { throw std::runtime_error("EXP requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    return Value(std::exp(v));
+  }
+  if (name == "cos") {
+    if (arguments.size() != 1) { throw std::runtime_error("COS requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    return Value(std::cos(v));
+  }
+  if (name == "sin") {
+    if (arguments.size() != 1) { throw std::runtime_error("SIN requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    return Value(std::sin(v));
+  }
+  if (name == "tan") {
+    if (arguments.size() != 1) { throw std::runtime_error("TAN requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    return Value(std::tan(v));
+  }
+  if (name == "acos") {
+    if (arguments.size() != 1) { throw std::runtime_error("ACOS requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    return Value(std::acos(v));
+  }
+  if (name == "asin") {
+    if (arguments.size() != 1) { throw std::runtime_error("ASIN requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    return Value(std::asin(v));
+  }
+  if (name == "atan") {
+    if (arguments.size() != 1) { throw std::runtime_error("ATAN requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    return Value(std::atan(v));
+  }
+  if (name == "atan2") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("ATAN2 requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    const double y = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    const double x = arguments[1].type == ValueType::kInt64
+                         ? arguments[1].value.int_value
+                         : arguments[1].value.double_value;
+    return Value(std::atan2(y, x));
+  }
+  if (name == "pi") {
+    if (!arguments.empty()) { throw std::runtime_error("PI takes no arguments"); }
+    return Value(M_PI);
+  }
+  if (name == "radians") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("RADIANS requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    auto to_double_val = [](const Value& val) -> double {
+      if (val.type == ValueType::kInt64) {
+        return static_cast<double>(val.value.int_value);
+      }
+      if (val.type == ValueType::kDouble) {
+        return val.value.double_value;
+      }
+      if (val.type == ValueType::kVarChar) {
+        return std::stod(std::string(val.value.varchar_value));
+      }
+      throw std::runtime_error("cannot convert value to double");
+    };
+    return Value(to_double_val(arguments[0]) * (M_PI / 180.0));
+  }
+  if (name == "degrees") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("DEGREES requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    auto to_double_val = [](const Value& val) -> double {
+      if (val.type == ValueType::kInt64) {
+        return static_cast<double>(val.value.int_value);
+      }
+      if (val.type == ValueType::kDouble) {
+        return val.value.double_value;
+      }
+      if (val.type == ValueType::kVarChar) {
+        return std::stod(std::string(val.value.varchar_value));
+      }
+      throw std::runtime_error("cannot convert value to double");
+    };
+    return Value(to_double_val(arguments[0]) * (180.0 / M_PI));
+  }
+
+  if (name == "cosh") {
+    if (arguments.size() != 1) { throw std::runtime_error("COSH requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    return Value(std::cosh(v));
+  }
+  if (name == "sinh") {
+    if (arguments.size() != 1) { throw std::runtime_error("SINH requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    return Value(std::sinh(v));
+  }
+  if (name == "tanh") {
+    if (arguments.size() != 1) { throw std::runtime_error("TANH requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    const double v = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    return Value(std::tanh(v));
+  }
+  if (name == "div") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("DIV requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    if (arguments[0].type == ValueType::kInt64 &&
+        arguments[1].type == ValueType::kInt64) {
+      if (arguments[1].value.int_value == 0) {
+        throw std::runtime_error("division by zero in DIV");
+      }
+      if (arguments[0].value.int_value ==
+              std::numeric_limits<int64_t>::min() &&
+          arguments[1].value.int_value == -1) {
+        throw std::runtime_error("integer overflow in DIV");
+      }
+      return Value(arguments[0].value.int_value / arguments[1].value.int_value);
+    }
+    const double l = arguments[0].type == ValueType::kInt64
+                         ? static_cast<double>(arguments[0].value.int_value)
+                         : arguments[0].value.double_value;
+    const double r = arguments[1].type == ValueType::kInt64
+                         ? static_cast<double>(arguments[1].value.int_value)
+                         : arguments[1].value.double_value;
+    if (r == 0.0) { throw std::runtime_error("division by zero in DIV"); }
+    return Value(static_cast<int64_t>(std::trunc(l / r)));
+  }
+  if (name == "ieee_divide" || name == "safe_divide") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error(name + " requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    const double l = arguments[0].type == ValueType::kInt64
+                         ? static_cast<double>(arguments[0].value.int_value)
+                         : arguments[0].value.double_value;
+    const double r = arguments[1].type == ValueType::kInt64
+                         ? static_cast<double>(arguments[1].value.int_value)
+                         : arguments[1].value.double_value;
+    if (r == 0.0) { return name == "safe_divide" ? Value() : Value(l / r); }
+    const double res = l / r;
+    if (name == "safe_divide" && (std::isinf(res) || std::isnan(res))) {
+      return Value();
+    }
+    return Value(res);
+  }
+
+  if (name == "safe_add" || name == "safe_subtract" ||
+      name == "safe_multiply") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error(name + " requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    if (arguments[0].type == ValueType::kInt64 &&
+        arguments[1].type == ValueType::kInt64) {
+      const int64_t l = arguments[0].value.int_value;
+      const int64_t r = arguments[1].value.int_value;
+      if (name == "safe_add") {
+        int64_t res = 0;
+        if (__builtin_add_overflow(l, r, &res)) { return {}; }
+        return Value(res);
+      }
+      if (name == "safe_subtract") {
+        int64_t res = 0;
+        if (__builtin_sub_overflow(l, r, &res)) { return {}; }
+        return Value(res);
+      }
+      if (name == "safe_multiply") {
+        int64_t res = 0;
+        if (__builtin_mul_overflow(l, r, &res)) { return {}; }
+        return Value(res);
+      }
+    }
+    const double l = arguments[0].type == ValueType::kInt64
+                         ? arguments[0].value.int_value
+                         : arguments[0].value.double_value;
+    const double r = arguments[1].type == ValueType::kInt64
+                         ? arguments[1].value.int_value
+                         : arguments[1].value.double_value;
+    if (name == "safe_add") { return Value(l + r); }
+    if (name == "safe_subtract") { return Value(l - r); }
+    return Value(l * r);
+  }
+  if (name == "safe_negate") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("SAFE_NEGATE requires 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    if (arguments[0].type == ValueType::kInt64) {
+      if (arguments[0].value.int_value ==
+          std::numeric_limits<int64_t>::min()) {
+        return {};
+      }
+      return Value(-arguments[0].value.int_value);
+    }
+    return Value(-arguments[0].value.double_value);
+  }
+  if (name == "format") {
+    if (arguments.empty()) {
+      throw std::runtime_error("FORMAT requires at least 1 argument");
+    }
+    if (arguments[0].IsNull()) { return {}; }
+    const std::string fmt = raw_str(arguments[0]);
     std::string result;
-    for (const Value& value : arguments) {
-      // Match FunctionCallExpression::Evaluate: CONCAT is strict, so any
-      // NULL argument makes the result NULL.
-      if (value.IsNull()) { return {};
+    size_t arg_idx = 1;
+    for (size_t i = 0; i < fmt.size(); ++i) {
+      if (fmt[i] == '%' && i + 1 < fmt.size()) {
+        ++i;
+        if (fmt[i] == '%') {
+          result.push_back('%');
+          continue;
+        }
+        bool hash_flag = false;
+        bool zero_pad = false;
+        if (fmt[i] == '#') { hash_flag = true; ++i; }
+        if (i < fmt.size() && fmt[i] == '0') { zero_pad = true; ++i; }
+        int width = 0;
+        while (i < fmt.size() && std::isdigit(static_cast<unsigned char>(fmt[i]))) {
+          width = width * 10 + (fmt[i] - '0');
+          ++i;
+        }
+        int precision = -1;
+        if (i < fmt.size() && fmt[i] == '.') {
+          ++i;
+          precision = 0;
+          while (i < fmt.size() && std::isdigit(static_cast<unsigned char>(fmt[i]))) {
+            precision = precision * 10 + (fmt[i] - '0');
+            ++i;
+          }
+        }
+        if (i >= fmt.size()) { break; }
+        char spec = fmt[i];
+
+        if (arg_idx >= arguments.size()) {
+          throw std::runtime_error("FORMAT: not enough arguments for format string");
+        }
+        const Value& arg = arguments[arg_idx++];
+        std::string formatted_item;
+        if (spec == 'T' || spec == 't') {
+          if (arg.IsNull()) {
+            formatted_item = "NULL";
+          } else if (arg.type == ValueType::kVarChar) {
+            std::string s = raw_str(arg);
+            formatted_item += "\"";
+            for (char c : s) {
+              if (c == '"') { formatted_item += "\\\""; }
+              else if (c == '\\') { formatted_item += "\\\\"; }
+              else if (c == '\n') { formatted_item += "\\n"; }
+              else if (c == '\r') { formatted_item += "\\r"; }
+              else if (c == '\t') { formatted_item += "\\t"; }
+              else { formatted_item.push_back(c); }
+            }
+            formatted_item += "\"";
+          } else if (arg.type == ValueType::kInt64) {
+            formatted_item = std::to_string(arg.value.int_value);
+          } else if (arg.type == ValueType::kDouble) {
+            formatted_item = std::to_string(arg.value.double_value);
+          } else {
+            formatted_item = arg.AsString();
+          }
+        } else if (spec == 's') {
+          if (arg.IsNull()) {
+            formatted_item = "NULL";
+          } else {
+            formatted_item = raw_str(arg);
+          }
+        } else if (spec == 'd' || spec == 'i' || spec == 'u' || spec == 'x' || spec == 'X' || spec == 'o') {
+          if (arg.IsNull()) {
+            formatted_item = "NULL";
+          } else if (arg.type == ValueType::kInt64) {
+            if (spec == 'x') {
+              char buf[32];
+              snprintf(buf, sizeof(buf), hash_flag ? "0x%lx" : "%lx", static_cast<unsigned long>(arg.value.int_value));
+              formatted_item = buf;
+            } else if (spec == 'X') {
+              char buf[32];
+              snprintf(buf, sizeof(buf), hash_flag ? "0X%lX" : "%lX", static_cast<unsigned long>(arg.value.int_value));
+              formatted_item = buf;
+            } else if (spec == 'o') {
+              char buf[32];
+              snprintf(buf, sizeof(buf), hash_flag ? "0%lo" : "%lo", static_cast<unsigned long>(arg.value.int_value));
+              formatted_item = buf;
+            } else {
+              formatted_item = std::to_string(arg.value.int_value);
+            }
+          } else if (arg.type == ValueType::kDouble) {
+            formatted_item = std::to_string(static_cast<int64_t>(arg.value.double_value));
+          } else {
+            throw std::runtime_error("FORMAT: invalid argument type for integer specifier");
+          }
+        } else if (spec == 'f' || spec == 'g' || spec == 'e' || spec == 'E') {
+          if (arg.IsNull()) {
+            formatted_item = "NULL";
+          } else if (arg.type == ValueType::kDouble) {
+            formatted_item = std::to_string(arg.value.double_value);
+          } else if (arg.type == ValueType::kInt64) {
+            formatted_item = std::to_string(static_cast<double>(arg.value.int_value));
+          } else {
+            throw std::runtime_error("FORMAT: invalid argument type for float specifier");
+          }
+        } else {
+          result.push_back('%');
+          result.push_back(spec);
+          continue;
+        }
+
+        if (precision >= 0 && (spec == 't' || spec == 'T' || spec == 's')) {
+          if (formatted_item.size() > static_cast<size_t>(precision)) {
+            formatted_item = formatted_item.substr(0, static_cast<size_t>(precision));
+          }
+        }
+        if (width > 0 && formatted_item.size() < static_cast<size_t>(width)) {
+          const size_t pad_len = static_cast<size_t>(width) - formatted_item.size();
+          char pad_char = zero_pad ? '0' : ' ';
+          formatted_item = std::string(pad_len, pad_char) + formatted_item;
+        }
+        result += formatted_item;
+      } else {
+        result.push_back(fmt[i]);
       }
-      if (value.type != ValueType::kVarChar) {
-        throw std::runtime_error("CONCAT currently requires string arguments");
-      }
-      result += std::string(value.value.varchar_value);
+    }
+    if (arg_idx < arguments.size()) {
+      throw std::runtime_error("FORMAT: too many arguments for format string");
     }
     return Value(std::move(result));
   }
+
+
+
   if (name == "current_timestamp") {
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
@@ -452,8 +4068,43 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(std::string(buffer.data()));
   }
+
+  if (name == "make_interval") {
+    if (arguments.size() < 2) {
+      throw std::runtime_error("make_interval requires at least 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    std::string val_str = raw_str(arguments[0]);
+    std::string unit_str = raw_str(arguments[1]);
+    IntervalValue iv = IntervalValue::Parse(val_str, unit_str);
+    return Value(iv.ToString());
+  }
+
+  if (name == "justify_hours") {
+    if (arguments.empty()) { throw std::runtime_error("JUSTIFY_HOURS requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    IntervalValue iv = IntervalValue::Parse(raw_str(arguments[0]));
+    return Value(iv.JustifyHours().ToString());
+  }
+
+  if (name == "justify_days") {
+    if (arguments.empty()) { throw std::runtime_error("JUSTIFY_DAYS requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    IntervalValue iv = IntervalValue::Parse(raw_str(arguments[0]));
+    return Value(iv.JustifyDays().ToString());
+  }
+
+  if (name == "justify_interval") {
+    if (arguments.empty()) { throw std::runtime_error("JUSTIFY_INTERVAL requires 1 argument"); }
+    if (arguments[0].IsNull()) { return {}; }
+    IntervalValue iv = IntervalValue::Parse(raw_str(arguments[0]));
+    return Value(iv.JustifyInterval().ToString());
+  }
+
   throw std::runtime_error("unsupported function " + name);
 }
+
+
 
 }  // namespace
 
@@ -466,9 +4117,24 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
   switch (expression->Type()) {
     case TypeTag::kColumnValue: {
       const ColumnName& name = expression->AsColumnValue().GetColumnName();
-      if (name.name == "*") { return Value(1);
-}
-      return Lookup(name, scope);
+      if (name.name == "*") { return Value(1); }
+      try {
+        return Lookup(name, scope);
+      } catch (const std::runtime_error&) {
+        std::string upper_name = name.name;
+        for (char& c : upper_name) { c = static_cast<char>(std::toupper(static_cast<unsigned char>(c))); }
+        if (upper_name == "DAY" || upper_name == "WEEK" || upper_name == "MONTH" ||
+            upper_name == "QUARTER" || upper_name == "YEAR" || upper_name == "HOUR" ||
+            upper_name == "MINUTE" || upper_name == "SECOND" || upper_name == "MILLISECOND" ||
+            upper_name == "MICROSECOND" || upper_name == "NANOSECOND" ||
+            upper_name == "MONDAY" || upper_name == "TUESDAY" || upper_name == "WEDNESDAY" ||
+            upper_name == "THURSDAY" || upper_name == "FRIDAY" || upper_name == "SATURDAY" ||
+            upper_name == "SUNDAY" || upper_name == "ISOYEAR" || upper_name == "ISOWEEK" ||
+            upper_name == "DATE") {
+          return Value(std::move(upper_name));
+        }
+        throw;
+      }
     }
     case TypeTag::kConstantValue:
       return expression->AsConstantValue().GetValue();
@@ -544,7 +4210,35 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
     case TypeTag::kFunctionCallExp:
       return EvaluateFunction(expression->AsFunctionCallExpression(), scope,
                               aggregates, context, ctes);
+    case TypeTag::kArrayExp: {
+      const auto& array = expression->AsArrayExpression();
+      std::vector<Value> elements;
+      elements.reserve(array.Elements().size());
+      std::string inferred_type = array.ElementSqlType();
+      for (const Expression& element : array.Elements()) {
+        Value val = Evaluate(element, scope, aggregates, context, ctes);
+        if ((inferred_type.empty() || inferred_type == "INT64") && !val.IsNull()) {
+          if (val.type == ValueType::kVarChar) { inferred_type = "STRING"; }
+          else if (val.type == ValueType::kDouble) { inferred_type = "DOUBLE"; }
+          else if (val.type == ValueType::kDate) { inferred_type = "DATE"; }
+          else if (val.IsArray()) { inferred_type = "ARRAY<" + val.ArrayElementSqlType() + ">"; }
+        }
+        elements.push_back(std::move(val));
+      }
+      if (inferred_type.empty()) { inferred_type = "INT64"; }
+      return Value::Array(std::move(elements), inferred_type);
+    }
+    case TypeTag::kCastExp: {
+      const auto& cast = expression->AsCastExpression();
+      const Value val =
+          Evaluate(cast.Child(), scope, aggregates, context, ctes);
+      return CastExpressionExp(ConstantValueExp(val), cast.TargetTypeName(),
+                               cast.ReturnNullOnError())
+          ->Evaluate(Row(), Schema());
+    }
+
     case TypeTag::kQueryExp: {
+
       const auto& value = expression->AsQueryExpression();
       std::optional<Relation> indexed =
           ExecuteCorrelatedSingleSource(context, *value.Query(), scope, ctes);
@@ -633,7 +4327,11 @@ Schema QualifySchema(const Schema& schema, std::string_view qualifier) {
   columns.reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     const Column& column = schema.GetColumn(i);
-    columns.emplace_back(ColumnName(qualifier, column.Name().name),
+    std::string col_name = column.Name().name;
+    if (col_name.empty() || (col_name.starts_with("$expr") && schema.ColumnCount() == 1)) {
+      col_name = std::string(qualifier);
+    }
+    columns.emplace_back(ColumnName(qualifier, col_name),
                          column.Type());
   }
   return {"", std::move(columns)};

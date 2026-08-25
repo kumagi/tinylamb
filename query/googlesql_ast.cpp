@@ -80,40 +80,46 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
   size_t cursor = 0;
   while (cursor < dump.size()) {
     size_t line_end = dump.find('\n', cursor);
-    if (line_end == std::string_view::npos) { line_end = dump.size();
-}
-    std::string_view line = dump.substr(cursor, line_end - cursor);
-    if (!line.empty() && line.back() == '\r') { line.remove_suffix(1);
-}
+    if (line_end == std::string_view::npos) { line_end = dump.size(); }
+    std::string full_line = std::string(dump.substr(cursor, line_end - cursor));
+    if (!full_line.empty() && full_line.back() == '\r') { full_line.pop_back(); }
     cursor = line_end + 1;
-    if (line.empty()) { continue;
-}
+    if (full_line.empty()) { continue; }
+
+    size_t tmp_start = 0;
+    size_t tmp_end = 0;
+    std::string test_label = full_line;
+    while (!ParseLocation(test_label, &tmp_start, &tmp_end) && cursor < dump.size()) {
+      size_t next_line_end = dump.find('\n', cursor);
+      if (next_line_end == std::string_view::npos) { next_line_end = dump.size(); }
+      std::string_view next_line = dump.substr(cursor, next_line_end - cursor);
+      if (!next_line.empty() && next_line.back() == '\r') { next_line.remove_suffix(1); }
+      cursor = next_line_end + 1;
+      full_line.push_back('\n');
+      full_line.append(next_line);
+      test_label = full_line;
+    }
 
     size_t spaces = 0;
-    while (spaces < line.size() && line[spaces] == ' ') { ++spaces;
-}
-    if (spaces % 2 != 0 || spaces == line.size()) { return Status::kUnknown;
-}
+    while (spaces < full_line.size() && full_line[spaces] == ' ') { ++spaces; }
+    if (spaces % 2 != 0 || spaces == full_line.size()) { return Status::kUnknown; }
     const size_t depth = spaces / 2;
-    auto node = ParseNode(std::string(line.substr(spaces)));
+    auto node = ParseNode(full_line.substr(spaces));
     GoogleSqlAstNode* raw = node.get();
     if (depth == 0) {
-      if (root) { return Status::kUnknown;
-}
+      if (root) { return Status::kUnknown; }
       root = std::move(node);
     } else {
-      if (depth > parents.size()) { return Status::kUnknown;
-}
+      if (depth > parents.size()) { return Status::kUnknown; }
       parents[depth - 1]->children.push_back(std::move(node));
     }
-    if (parents.size() <= depth) { parents.resize(depth + 1);
-}
+    if (parents.size() <= depth) { parents.resize(depth + 1); }
     parents[depth] = raw;
     parents.resize(depth + 1);
   }
-  if (!root) { return Status::kUnknown;
-}
+  if (!root) { return Status::kUnknown; }
   return root;
 }
+
 
 }  // namespace tinylamb

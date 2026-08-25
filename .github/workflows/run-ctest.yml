@@ -16,3 +16,19 @@ jobs:
             -DTINYLAMB_ENABLE_GOOGLESQL=OFF
           cmake --build build -j"$(nproc)"
           ctest --test-dir build -j"$(nproc)" --output-on-failure
+
+  googlesql-compliance:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build and run GoogleSQL compliance
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DTINYLAMB_ENABLE_GOOGLESQL=ON
+          cmake --build build -j"$(nproc)" --target googlesql_compliance_test
+          ctest --test-dir build -R googlesql_compliance --output-on-failure

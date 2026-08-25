@@ -1,0 +1,282 @@
+[prepare_database]
+CREATE TABLE TestTable_gt_any AS (
+  SELECT 1 AS id, [1, 2, 3] AS arr UNION ALL
+  SELECT 2, [4, 5, 6] UNION ALL
+  SELECT 3, []
+);
+--
+ARRAY<STRUCT<id INT64, arr ARRAY<>>>[
+  {
+    1,
+    ARRAY<INT64>[1, 2, 3]
+  },
+  {
+    2,
+    ARRAY<INT64>[4, 5, 6]
+  },
+  {3, ARRAY<INT64>[]}
+]
+==
+
+# =============================================================================
+# UNNEST(ARRAY) Tests
+# =============================================================================
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_basic_gt_any_for_array]
+SELECT 5 > any UNNEST([4, 5, 6])
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_empty_array_gt_any_for_array]
+SELECT 1 > any UNNEST(CAST([] AS ARRAY<INT64>))
+--
+ARRAY<STRUCT<BOOL>>[{false}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_null_lhs_gt_any_for_array]
+SELECT CAST(NULL AS INT64) > any UNNEST([1, 2, 3])
+--
+ARRAY<STRUCT<BOOL>>[{NULL}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_null_elements_gt_any_for_array]
+SELECT 2 > any UNNEST([1, NULL, 3])
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_null_array_gt_any_for_array]
+SELECT 1 > any UNNEST(CAST(NULL AS ARRAY<INT64>))
+--
+ARRAY<STRUCT<BOOL>>[{false}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_strings_gt_any_for_array]
+SELECT 'b' > any UNNEST(['a', 'b', 'c'])
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS,COLLATION_SUPPORT,ANNOTATION_FRAMEWORK]
+[name=quantified_comparison_collation_gt_any_for_array_lhs]
+SELECT COLLATE('C', 'und:ci') > any UNNEST(['a', 'b'])
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS,COLLATION_SUPPORT,ANNOTATION_FRAMEWORK]
+[name=quantified_comparison_collation_gt_any_for_array_rhs]
+SELECT 'C' > any UNNEST(['a', COLLATE('b', 'und:ci')])
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_table_column_gt_any_for_array]
+SELECT id > any UNNEST(arr)
+FROM TestTable_gt_any ORDER BY id
+--
+ARRAY<STRUCT<BOOL>>[known order:{false}, {false}, {false}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_expressions_gt_any_for_array]
+SELECT (id + 10) > any UNNEST([id, id + 5, id + 10])
+FROM TestTable_gt_any ORDER BY id
+--
+ARRAY<STRUCT<BOOL>>[known order:{true}, {true}, {true}]
+==
+
+# =============================================================================
+# LIST (...) Tests
+# =============================================================================
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_basic_gt_any_for_list]
+SELECT 5 > any (4, 5, 6)
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_null_lhs_gt_any_for_list]
+SELECT CAST(NULL AS INT64) > any (1, 2, 3)
+--
+ARRAY<STRUCT<BOOL>>[{NULL}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_null_elements_gt_any_for_list]
+SELECT 2 > any (1, NULL, 3)
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_strings_gt_any_for_list]
+SELECT 'b' > any ('a', 'b', 'c')
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS,ARRAY_ORDERING]
+[name=quantified_comparison_arrays_gt_any_for_list]
+SELECT [1] > any ([1], [2])
+--
+ARRAY<STRUCT<BOOL>>[{false}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS,ARRAY_ORDERING]
+[name=quantified_comparison_arrays_with_nulls_gt_any_for_list]
+SELECT
+  [NULL] > any ([1],[2],[3]),
+  [1] > any ([1],[NULL],[1]),
+  [1] > any ([0],[NULL],[2])
+--
+ARRAY<STRUCT<BOOL, BOOL, BOOL>>[{NULL, NULL, true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS,COLLATION_SUPPORT,ANNOTATION_FRAMEWORK]
+[name=quantified_comparison_collation_gt_any_for_list_lhs]
+SELECT COLLATE('C', 'und:ci') > any ('a', 'b')
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS,COLLATION_SUPPORT,ANNOTATION_FRAMEWORK]
+[name=quantified_comparison_collation_gt_any_for_list_rhs]
+SELECT 'C' > any ('a', COLLATE('b', 'und:ci'))
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_expressions_gt_any_for_list]
+SELECT (id + 10) > any (id, id + 5, id + 10)
+FROM TestTable_gt_any ORDER BY id
+--
+ARRAY<STRUCT<BOOL>>[known order:{true}, {true}, {true}]
+==
+
+# =============================================================================
+# Subquery (...) Tests
+# =============================================================================
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_basic_gt_any_for_subquery]
+SELECT 5 > any (SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6)
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_empty_subquery_gt_any_for_subquery]
+SELECT 1 > any (SELECT x FROM UNNEST(CAST([] AS ARRAY<INT64>)) AS x)
+--
+ARRAY<STRUCT<BOOL>>[{false}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_null_lhs_gt_any_for_subquery]
+SELECT CAST(NULL AS INT64) > any (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3)
+--
+ARRAY<STRUCT<BOOL>>[{NULL}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_null_elements_gt_any_for_subquery]
+SELECT 2 > any (SELECT 1 UNION ALL SELECT NULL UNION ALL SELECT 3)
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_strings_gt_any_for_subquery]
+SELECT 'b' > any (SELECT 'a' UNION ALL SELECT 'b' UNION ALL SELECT 'c')
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS,ARRAY_ORDERING]
+[name=quantified_comparison_arrays_with_nulls_gt_any_for_subquery]
+SELECT
+  [NULL] > any (SELECT [1] UNION ALL SELECT [2] UNION ALL SELECT [3]),
+  [1] > any (SELECT [1] UNION ALL SELECT [NULL] UNION ALL SELECT [1]),
+  [1] > any (SELECT [0] UNION ALL SELECT [NULL] UNION ALL SELECT [2])
+--
+ARRAY<STRUCT<BOOL, BOOL, BOOL>>[{NULL, NULL, true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS,ARRAY_ORDERING]
+[name=quantified_comparison_arrays_gt_any_for_subquery]
+SELECT [1] > any (SELECT [1] UNION ALL SELECT [2])
+--
+ARRAY<STRUCT<BOOL>>[{false}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS,COLLATION_SUPPORT,ANNOTATION_FRAMEWORK]
+[name=quantified_comparison_collation_gt_any_for_subquery_lhs]
+SELECT COLLATE('C', 'und:ci') > any (SELECT 'a' UNION ALL SELECT 'b')
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS,COLLATION_SUPPORT,ANNOTATION_FRAMEWORK]
+[name=quantified_comparison_collation_gt_any_for_subquery_rhs]
+SELECT 'C' > any (SELECT 'a' UNION ALL SELECT COLLATE('b', 'und:ci'))
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_table_column_gt_any_for_subquery]
+SELECT id > any (SELECT x FROM UNNEST(arr) AS x)
+FROM TestTable_gt_any ORDER BY id
+--
+ARRAY<STRUCT<BOOL>>[known order:{false}, {false}, {false}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_expressions_gt_any_for_subquery]
+SELECT (id + 10) > any (SELECT id UNION ALL SELECT id + 5 UNION ALL SELECT id + 10)
+FROM TestTable_gt_any ORDER BY id
+--
+ARRAY<STRUCT<BOOL>>[known order:{true}, {true}, {true}]
+==
+
+# =============================================================================
+# NaN handling tests
+# =============================================================================
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_nan_gt_any_array]
+SELECT
+  CAST('NaN' AS FLOAT64) > any UNNEST([1.0, 2.0]),
+  1.0 > any UNNEST([2.0, CAST('NaN' AS FLOAT64)])
+--
+ARRAY<STRUCT<BOOL, BOOL>>[{false, false}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_nan_gt_any_list]
+SELECT
+  CAST('NaN' AS FLOAT64) > any (1.0, 2.0),
+  1.0 > any (2.0, CAST('NaN' AS FLOAT64))
+--
+ARRAY<STRUCT<BOOL, BOOL>>[{false, false}]
+==
+
+[required_features=GENERAL_QUANTIFIED_COMPARISONS]
+[name=quantified_comparison_nan_gt_any_subquery]
+SELECT
+  CAST('NaN' AS FLOAT64) > any (SELECT 1.0 UNION ALL SELECT 2.0),
+  1.0 > any (SELECT 2.0 UNION ALL SELECT CAST('NaN' AS FLOAT64))
+--
+ARRAY<STRUCT<BOOL, BOOL>>[{false, false}]

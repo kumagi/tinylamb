@@ -204,6 +204,9 @@ bool KeyColumnChanged(const Value& a, const Value& b) {
     case ValueType::kDouble:
       return std::memcmp(&a.value.double_value, &b.value.double_value,
                          sizeof(double)) != 0;
+    case ValueType::kArray:
+      return a.ArrayElementSqlType() != b.ArrayElementSqlType() ||
+             a.ArrayElements() != b.ArrayElements();
     case ValueType::kNull:
       return false;
   }

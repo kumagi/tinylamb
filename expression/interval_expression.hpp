@@ -8,28 +8,21 @@
 #include <utility>
 
 #include "expression/expression.hpp"
+#include "type/interval.hpp"
 
 namespace tinylamb {
 
 class IntervalExpression : public ExpressionBase {
  public:
-  IntervalExpression(int64_t amount, std::string unit)
-      : amount_(amount), unit_(std::move(unit)) {
-    // Validate eagerly so malformed units fail at construction instead of
-    // leaking out of date_add/date_sub evaluation.
-    static const char* kUnits[] = {"day",   "days",   "month", "months",
-                                   "year",  "years"};
-    bool known = false;
-    for (const char* candidate : kUnits) {
-      if (unit_ == candidate) {
-        known = true;
-        break;
-      }
+  IntervalExpression(int64_t amount, std::string unit, std::string raw_amount = "")
+      : amount_(amount), unit_(std::move(unit)), raw_amount_(std::move(raw_amount)) {
+    for (char& c : unit_) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+    if (!raw_amount_.empty()) {
+      value_ = IntervalValue::Parse(raw_amount_, unit_);
+    } else {
+      value_ = IntervalValue::Parse(std::to_string(amount_), unit_);
     }
-    if (!known) {
-      throw std::runtime_error("unsupported interval unit " + unit_);
-    }
-    text_ = std::to_string(amount_) + " " + unit_;
+    text_ = value_.ToString();
   }
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kIntervalExp; }
   [[nodiscard]] Value Evaluate(const Row&, const Schema&) const override;
@@ -42,10 +35,14 @@ class IntervalExpression : public ExpressionBase {
   void Dump(std::ostream& output) const override;
   [[nodiscard]] int64_t Amount() const { return amount_; }
   [[nodiscard]] const std::string& Unit() const { return unit_; }
+  [[nodiscard]] const std::string& RawAmount() const { return raw_amount_; }
+  [[nodiscard]] const IntervalValue& GetIntervalValue() const { return value_; }
 
  private:
   int64_t amount_;
   std::string unit_;
+  std::string raw_amount_;
+  IntervalValue value_;
   std::string text_;
 };
 

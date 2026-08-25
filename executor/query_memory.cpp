@@ -99,6 +99,13 @@ size_t EstimateValueBytes(const Value& value) {
       return kBase + 8;
     case ValueType::kVarChar:
       return kBase + value.value.varchar_value.size();
+    case ValueType::kArray: {
+      size_t bytes = kBase + value.ArrayElementSqlType().size();
+      for (const Value& element : value.ArrayElements()) {
+        bytes += EstimateValueBytes(element);
+      }
+      return bytes;
+    }
     default:
       return kBase + 16;
   }

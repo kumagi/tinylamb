@@ -1,0 +1,93 @@
+[name=parse_numeric]
+[required_features=NUMERIC_TYPE]
+SELECT parse_numeric(' - 1,2.34 '), parse_numeric(' 12.34e-1  +');
+--
+ARRAY<STRUCT<NUMERIC, NUMERIC>>[{-12.34, 1.234}]
+==
+
+[name=parse_bignumeric]
+[required_features=BIGNUMERIC_TYPE]
+SELECT parse_bignumeric(' - 1,2.34 '), parse_bignumeric(' 12.34e-1  +');
+--
+ARRAY<STRUCT<BIGNUMERIC, BIGNUMERIC>>[{-12.34, 1.234}]
+==
+
+[name=numeric_self_cast]
+[required_features=NUMERIC_TYPE,PARAMETERIZED_TYPES]
+SELECT CAST(NUMERIC '1.234' AS NUMERIC(4, 3))
+--
+ARRAY<STRUCT<NUMERIC>>[{1.234}]
+==
+
+[name=sum_numeric]
+[required_features=NUMERIC_TYPE]
+SELECT SUM(x) FROM UNNEST([NUMERIC '1', NUMERIC '2']) AS x;
+--
+ARRAY<STRUCT<NUMERIC>>[{3}]
+==
+
+[name=window_sum_numeric]
+[required_features=NUMERIC_TYPE,ANALYTIC_FUNCTIONS]
+SELECT SUM(price) OVER () FROM (
+SELECT "apple" as fruit, NUMERIC '1' AS price,
+UNION ALL SELECT "pear", NUMERIC '2'
+UNION ALL SELECT "banana", NUMERIC '3');
+--
+ARRAY<STRUCT<NUMERIC>>[unknown order:{6}, {6}, {6}]
+==
+
+[name=window_sum_numeric_partition_by]
+[required_features=NUMERIC_TYPE,ANALYTIC_FUNCTIONS]
+SELECT fruit, SUM(price) OVER (PARTITION BY fruit) FROM (
+SELECT "apple" as fruit, NUMERIC '1' AS price,
+UNION ALL SELECT "pear", NUMERIC '2'
+UNION ALL SELECT "banana", NUMERIC '3') ORDER BY fruit;
+--
+ARRAY<STRUCT<fruit STRING, NUMERIC>>[known order:
+  {"apple", 1},
+  {"banana", 3},
+  {"pear", 2}
+]
+==
+
+[name=window_sum_numeric_order_by]
+[required_features=NUMERIC_TYPE,ANALYTIC_FUNCTIONS]
+SELECT fruit, SUM(price) OVER (ORDER BY price) FROM (
+SELECT "apple" as fruit, NUMERIC '1' AS price,
+UNION ALL SELECT "pear", NUMERIC '2'
+UNION ALL SELECT "banana", NUMERIC '3') ORDER BY fruit;
+--
+ARRAY<STRUCT<fruit STRING, NUMERIC>>[known order:
+  {"apple", 1},
+  {"banana", 6},
+  {"pear", 3}
+]
+==
+
+[name=window_sum_numeric_order_by_with_range]
+[required_features=NUMERIC_TYPE,ANALYTIC_FUNCTIONS]
+SELECT fruit, SUM(price) OVER
+(ORDER BY price RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM (
+SELECT "apple" as fruit, NUMERIC '1' AS price,
+UNION ALL SELECT "pear", NUMERIC '2'
+UNION ALL SELECT "banana", NUMERIC '3') ORDER BY fruit;
+--
+ARRAY<STRUCT<fruit STRING, NUMERIC>>[known order:
+  {"apple", 3},
+  {"banana", 5},
+  {"pear", 6}
+]
+==
+
+[name=truncation_in_array_does_not_change_orderedness]
+[required_features=NUMERIC_TYPE,PARAMETERIZED_TYPES]
+SELECT
+  CAST([NUMERIC '1.2', NUMERIC '1.3'] AS ARRAY<NUMERIC(5,0)>) AS ordered,
+  CAST(ARRAY(SELECT * FROM UNNEST([NUMERIC '1.2', NUMERIC '1.3'])) AS ARRAY<NUMERIC(5,0)>) AS unordered
+--
+ARRAY<STRUCT<ordered ARRAY<>, unordered ARRAY<>>>[
+  {
+    ARRAY<NUMERIC>[known order:1, 1],
+    ARRAY<NUMERIC>[unknown order:1, 1]
+  }
+]

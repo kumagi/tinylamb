@@ -31,6 +31,7 @@ enum class TypeTag {
   kDouble,
   kVarChar,
   kDate,
+  kArray,
   kBinaryExp,
   kColumnValue,
   kConstantValue,
@@ -41,7 +42,11 @@ enum class TypeTag {
   kFunctionCallExp,
   kQueryExp,
   kIntervalExp,
+  kArrayExp,
+  kCastExp,
+  kWindowFunctionExp,
 };
+
 
 class Type {
  public:
@@ -49,7 +54,9 @@ class Type {
   Type(TypeTag type) : type_(type) {}
   TypeTag GetType() const { return type_; }
   bool IsValid() const { return type_ != TypeTag::kInvalid; }
-  bool IsVariableLength() const { return type_ == TypeTag::kVarChar; }
+  bool IsVariableLength() const {
+    return type_ == TypeTag::kVarChar || type_ == TypeTag::kArray;
+  }
   size_t Size() const;
   std::string ToString() const;
 

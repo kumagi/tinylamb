@@ -69,6 +69,8 @@ class ConstantValue : public ExpressionBase {
         return tinylamb::Type(TypeTag::kVarChar);
       case ValueType::kDate:
         return tinylamb::Type(TypeTag::kDate);
+      case ValueType::kArray:
+        return tinylamb::Type(TypeTag::kArray);
       case ValueType::kNull:
         return tinylamb::Type(TypeTag::kInvalid);
     }

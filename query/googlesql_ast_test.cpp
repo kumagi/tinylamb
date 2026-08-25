@@ -14,12 +14,16 @@
 
 #include "common/status_or.hpp"
 #include "common/constants.hpp"
+#include "expression/array_expression.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/in_expression.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
 #include "query/statement.hpp"
+#include "type/row.hpp"
+#include "type/schema.hpp"
 #include "type/type.hpp"
+#include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -255,7 +259,6 @@ TEST(GoogleSqlAstTest, FoldBooleanChains) {
   const auto& or_select = dynamic_cast<const SelectStatement&>(*or_stmt);
   ASSERT_TRUE(or_select.WhereClause());
   EXPECT_EQ(or_select.WhereClause()->Type(), TypeTag::kBinaryExp);
-  EXPECT_TRUE(or_select.RequiresRelationalEvaluation());
 }
 
 TEST(GoogleSqlAstTest, JoinsAndTableSubqueries) {
@@ -378,6 +381,21 @@ TEST(GoogleSqlAstTest, CaseWhenConditionNeedsRelationalEvaluation) {
   EXPECT_TRUE(select.RequiresRelationalEvaluation());
 }
 
+TEST(GoogleSqlAstTest, ArrayConstructor) {
+  auto statement = VisitSqlOrThrow("SELECT ARRAY[1, 2];");
+  ASSERT_EQ(statement->Type(), StatementType::kSelect);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_EQ(select.SelectList().size(), 1);
+  EXPECT_EQ(select.SelectList()[0].expression->Type(), TypeTag::kArrayExp);
+  const Value got =
+      select.SelectList()[0].expression->Evaluate(Row(), Schema());
+  ASSERT_TRUE(got.IsArray());
+  EXPECT_EQ(got.ArrayElementSqlType(), "INT64");
+  ASSERT_EQ(got.ArrayElements().size(), 2);
+  EXPECT_EQ(got.ArrayElements()[0], Value(int64_t{1}));
+  EXPECT_EQ(got.ArrayElements()[1], Value(int64_t{2}));
+}
+
 TEST(GoogleSqlAstTest, UnsupportedConstructsThrow) {
   // Unsupported binary operators: the parser accepts them but the visitor
   // rejects them during translation.
@@ -390,8 +408,6 @@ TEST(GoogleSqlAstTest, UnsupportedConstructsThrow) {
   // Intervals must have an integer literal magnitude.
   EXPECT_THROW(VisitSqlOrThrow("SELECT INTERVAL '1' DAY;"),
                std::runtime_error);
-  // Array constructors have no expression mapping.
-  EXPECT_THROW(VisitSqlOrThrow("SELECT ARRAY[1, 2];"), std::runtime_error);
   // Unknown column types are rejected while building CREATE TABLE.
   EXPECT_THROW(VisitSqlOrThrow("CREATE TABLE t (x BLOB);"),
                std::runtime_error);

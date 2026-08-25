@@ -10,8 +10,9 @@
 #include <functional>
 #include <iterator>
 #include <limits>
-#include <ostream>
 #include <optional>
+#include <ostream>
+#include <ranges>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -21,12 +22,19 @@
 #include <utility>
 #include <vector>
 
+#include "expression/binary_expression.hpp"
+#include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
+#include "common/constants.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
-#include "common/constants.hpp"
 #include "expression/rewrite.hpp"
 #include "query/query_data.hpp"
 #include "type/column_name.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb::cascades {
 namespace {
@@ -95,6 +103,121 @@ std::vector<Expression> PushSingleRelationConjuncts(
     residual.push_back(conjunct);
   }
   return residual;
+}
+
+bool ContainsAggregate(const Expression& expression) {
+  if (!expression) { return false;
+}
+  if (expression->Type() == TypeTag::kAggregateExp) { return true;
+}
+  return std::ranges::any_of(ExpressionChildren(expression), ContainsAggregate);
+}
+
+bool OutputMatchesColumn(const NamedExpression& output,
+                         const ColumnName& column) {
+  if (!output.name.empty() &&
+      (output.name == column.name || output.name == column.ToString())) {
+    return true;
+  }
+  if (output.expression && output.expression->Type() == TypeTag::kColumnValue) {
+    const ColumnName& source =
+        output.expression->AsColumnValue().GetColumnName();
+    return source == column || source.name == column.name;
+  }
+  return false;
+}
+
+std::optional<Expression> RewriteThroughOutputs(
+    const Expression& expression,
+    const std::vector<NamedExpression>& outputs) {  // NOLINT(misc-no-recursion)
+  if (!expression) { return expression;
+}
+  if (expression->Type() == TypeTag::kColumnValue) {
+    const ColumnName& column = expression->AsColumnValue().GetColumnName();
+    for (const NamedExpression& output : outputs) {
+      if (OutputMatchesColumn(output, column)) { return output.expression;
+}
+    }
+    return std::nullopt;
+  }
+  std::vector<Expression> children = ExpressionChildren(expression);
+  if (children.empty()) { return expression;
+}
+  std::vector<Expression> rewritten;
+  rewritten.reserve(children.size());
+  for (const Expression& child : children) {
+    std::optional<Expression> mapped = RewriteThroughOutputs(child, outputs);
+    if (!mapped) { return std::nullopt;
+}
+    rewritten.push_back(std::move(*mapped));
+  }
+  return WithExpressionChildren(expression, std::move(rewritten));
+}
+
+std::vector<NamedExpression> GroupingOutputs(
+    const std::vector<NamedExpression>& outputs) {
+  std::vector<NamedExpression> grouping;
+  for (const NamedExpression& output : outputs) {
+    if (!ContainsAggregate(output.expression)) { grouping.push_back(output);
+}
+  }
+  return grouping;
+}
+
+std::optional<Value> EqualityConstant(const Expression& predicate,
+                                      const ColumnName& column) {
+  if (!predicate) { return std::nullopt;
+}
+  for (const Expression& conjunct : SplitConjuncts(predicate)) {
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) { continue;
+}
+    const auto& binary = conjunct->AsBinaryExpression();
+    if (binary.Op() != BinaryOperation::kEquals) { continue;
+}
+    if (binary.Left()->Type() == TypeTag::kColumnValue &&
+        binary.Right()->Type() == TypeTag::kConstantValue &&
+        binary.Left()->AsColumnValue().GetColumnName() == column) {
+      return binary.Right()->AsConstantValue().GetValue();
+    }
+    if (binary.Right()->Type() == TypeTag::kColumnValue &&
+        binary.Left()->Type() == TypeTag::kConstantValue &&
+        binary.Right()->AsColumnValue().GetColumnName() == column) {
+      return binary.Left()->AsConstantValue().GetValue();
+    }
+  }
+  return std::nullopt;
+}
+
+void InferJoinConstants(Memo& memo, const Expression& join_predicate) {
+  if (!join_predicate) { return;
+}
+  for (const Expression& conjunct : SplitConjuncts(join_predicate)) {
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) { continue;
+}
+    const auto& binary = conjunct->AsBinaryExpression();
+    if (binary.Op() != BinaryOperation::kEquals ||
+        binary.Left()->Type() != TypeTag::kColumnValue ||
+        binary.Right()->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const ColumnName left = binary.Left()->AsColumnValue().GetColumnName();
+    const ColumnName right = binary.Right()->AsColumnValue().GetColumnName();
+    const auto push = [&](const ColumnName& from, const ColumnName& to) {
+      if (from.schema.empty() || to.schema.empty()) { return;
+}
+      const std::optional<Value> constant =
+          EqualityConstant(memo.Get(memo.EnsureGroup({from.schema})).filter,
+                           from);
+      if (!constant) { return;
+}
+      memo.MergeScanFilter(
+          memo.EnsureGroup({to.schema}),
+          BinaryExpressionExp(ColumnValueExp(to), BinaryOperation::kEquals,
+                              ConstantValueExp(*constant)));
+    };
+    push(left, right);
+    push(right, left);
+  }
 }
 
 }  // namespace
@@ -720,6 +843,225 @@ const RuleSet& RuleSet::Default() {
           PushSingleRelationConjuncts(
               memo, *expression.predicate,
               [](const std::string&) { return true; });
+        },
+        LogicalOperator::kSelection));
+    // Projection(Projection(X)): compose the outer target list through the
+    // inner one so later costing sees a single projection (Calcite
+    // ProjectMerge).
+    built.Add(Rule(
+        "merge_projections",
+        Projection(Projection(Any(), "inner")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          for (const LogicalExpression& inner :
+               memo.Get(bindings.at("inner")).expressions) {
+            if (inner.operation != LogicalOperator::kProjection) { continue;
+}
+            std::vector<NamedExpression> composed;
+            composed.reserve(expression.target_list.size());
+            bool ok = true;
+            for (const NamedExpression& output : expression.target_list) {
+              std::optional<Expression> rewritten =
+                  RewriteThroughOutputs(output.expression, inner.target_list);
+              if (!rewritten) {
+                ok = false;
+                break;
+              }
+              composed.emplace_back(output.name, *rewritten);
+            }
+            if (!ok || composed.empty()) { continue;
+}
+            memo.AddExpression(group,
+                               LogicalExpression{
+                                   .operation = LogicalOperator::kProjection,
+                                   .children = inner.children,
+                                   .target_list = std::move(composed)});
+          }
+        },
+        LogicalOperator::kProjection));
+    // Selection(Projection(X), p): rewrite p in terms of X and push it under
+    // the projection (FilterProjectTranspose). The group keeps producing the
+    // projected schema.
+    built.Add(Rule(
+        "push_selection_through_projection",
+        Selection(Projection(Any(), "proj")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          for (const LogicalExpression& projection :
+               memo.Get(bindings.at("proj")).expressions) {
+            if (projection.operation != LogicalOperator::kProjection) {
+              continue;
+            }
+            std::optional<Expression> rewritten = RewriteThroughOutputs(
+                *expression.predicate, projection.target_list);
+            if (!rewritten) { continue;
+}
+            const GroupId input = projection.children[0];
+            const GroupId filtered = memo.EnsureDerivedGroup(
+                memo.Get(input).relations,
+                "sel-below-proj:" + (*rewritten)->ToString());
+            memo.AddExpression(
+                filtered, LogicalExpression{.operation = LogicalOperator::kSelection,
+                                            .children = {input},
+                                            .predicate = *rewritten});
+            memo.AddExpression(
+                group, LogicalExpression{.operation = LogicalOperator::kProjection,
+                                         .children = {filtered},
+                                         .target_list = projection.target_list});
+          }
+        },
+        LogicalOperator::kSelection));
+    // Limit(Projection(X)): project after the cut so the scan/join below
+    // produces fewer rows (ProjectLimitTranspose / LimitProjectTranspose).
+    built.Add(Rule(
+        "push_limit_through_projection",
+        Limit(Projection(Any(), "proj")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          for (const LogicalExpression& projection :
+               memo.Get(bindings.at("proj")).expressions) {
+            if (projection.operation != LogicalOperator::kProjection) {
+              continue;
+            }
+            const GroupId input = projection.children[0];
+            const GroupId limited = memo.EnsureDerivedGroup(
+                memo.Get(input).relations,
+                "lim-below-proj:" + std::to_string(expression.limit_count) +
+                    ":" + std::to_string(expression.limit_offset));
+            memo.AddExpression(
+                limited,
+                LogicalExpression{.operation = LogicalOperator::kLimit,
+                                  .children = {input},
+                                  .limit_count = expression.limit_count,
+                                  .limit_offset = expression.limit_offset});
+            memo.AddExpression(
+                group, LogicalExpression{.operation = LogicalOperator::kProjection,
+                                         .children = {limited},
+                                         .target_list = projection.target_list});
+          }
+        },
+        LogicalOperator::kLimit));
+    // Selection(Aggregation(X), p) for conjuncts that only mention grouping
+    // keys: push them below the aggregate (FilterAggregateTranspose). Residual
+    // HAVING conjuncts stay above.
+    built.Add(Rule(
+        "push_selection_through_aggregation",
+        Selection(Aggregation(Any(), "agg")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          for (const LogicalExpression& aggregation :
+               memo.Get(bindings.at("agg")).expressions) {
+            if (aggregation.operation != LogicalOperator::kAggregation) {
+              continue;
+            }
+            const std::vector<NamedExpression> grouping =
+                GroupingOutputs(aggregation.target_list);
+            std::vector<Expression> pushed;
+            std::vector<Expression> residual;
+            for (const Expression& conjunct :
+                 SplitConjuncts(*expression.predicate)) {
+              std::optional<Expression> rewritten =
+                  RewriteThroughOutputs(conjunct, grouping);
+              if (rewritten && !ContainsAggregate(*rewritten)) {
+                pushed.push_back(*rewritten);
+              } else {
+                residual.push_back(conjunct);
+              }
+            }
+            if (pushed.empty()) { continue;
+}
+            const GroupId input = aggregation.children[0];
+            const GroupId filtered = memo.EnsureDerivedGroup(
+                memo.Get(input).relations,
+                "sel-below-agg:" + CombineConjuncts(pushed)->ToString());
+            memo.AddExpression(
+                filtered, LogicalExpression{.operation = LogicalOperator::kSelection,
+                                            .children = {input},
+                                            .predicate = CombineConjuncts(pushed)});
+            if (residual.empty()) {
+              memo.AddExpression(
+                  group,
+                  LogicalExpression{.operation = LogicalOperator::kAggregation,
+                                    .children = {filtered},
+                                    .target_list = aggregation.target_list});
+              continue;
+            }
+            const GroupId new_agg = memo.EnsureDerivedGroup(
+                memo.Get(group).relations,
+                "agg-after-sel-push:" + CombineConjuncts(residual)->ToString());
+            memo.AddExpression(
+                new_agg,
+                LogicalExpression{.operation = LogicalOperator::kAggregation,
+                                  .children = {filtered},
+                                  .target_list = aggregation.target_list});
+            memo.AddExpression(
+                group, LogicalExpression{.operation = LogicalOperator::kSelection,
+                                         .children = {new_agg},
+                                         .predicate = CombineConjuncts(residual)});
+          }
+        },
+        LogicalOperator::kSelection));
+    // Inner-join equality a.x = b.y plus a.x = k implies b.y = k (predicate
+    // inference / transitive closure). Outer joins are not in this memo.
+    built.Add(Rule(
+        "infer_join_predicates", Join(),
+        [](const Bindings&, Memo& memo, GroupId,
+           const LogicalExpression& expression) {
+          if (expression.predicate) {
+            InferJoinConstants(memo, *expression.predicate);
+          }
+        },
+        LogicalOperator::kJoin));
+    // Limit(Limit(X)): compose offset and take the tighter remaining count
+    // (LimitMerge).
+    built.Add(Rule(
+        "merge_limits",
+        Limit(Limit(Any(), "inner")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          for (const LogicalExpression& inner :
+               memo.Get(bindings.at("inner")).expressions) {
+            if (inner.operation != LogicalOperator::kLimit) { continue;
+}
+            const size_t offset = inner.limit_offset + expression.limit_offset;
+            size_t count = 0;
+            if (inner.limit_count == 0) {
+              count = expression.limit_count;
+            } else if (expression.limit_offset >= inner.limit_count) {
+              count = 0;
+            } else if (expression.limit_count == 0) {
+              count = inner.limit_count - expression.limit_offset;
+            } else {
+              count = std::min(expression.limit_count,
+                               inner.limit_count - expression.limit_offset);
+            }
+            memo.AddExpression(
+                group, LogicalExpression{.operation = LogicalOperator::kLimit,
+                                         .children = inner.children,
+                                         .limit_count = count,
+                                         .limit_offset = offset});
+          }
+        },
+        LogicalOperator::kLimit));
+    // Selection(true, X) ≡ X (FilterTrue). Copy child alternatives into this
+    // group so costing can skip a residual filter.
+    built.Add(Rule(
+        "eliminate_true_selection",
+        Selection(Any("input")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (!expression.predicate || !*expression.predicate ||
+              (*expression.predicate)->Type() != TypeTag::kConstantValue) {
+            return;
+          }
+          const Value value =
+              (*expression.predicate)->AsConstantValue().GetValue();
+          if (value.IsNull() || !value.Truthy()) { return;
+}
+          for (const LogicalExpression& child :
+               memo.Get(bindings.at("input")).expressions) {
+            memo.AddExpression(group, child);
+          }
         },
         LogicalOperator::kSelection));
     return built;

@@ -89,6 +89,9 @@ void AppendMemComparableValue(const Value& v, std::string* out) {
       out->append(buf, sizeof(buf));
       break;
     }
+    case ValueType::kArray:
+      out->append(v.EncodeMemcomparableFormat());
+      break;
     case ValueType::kNull:
       throw std::runtime_error("Cannot encode unknown type.");
   }

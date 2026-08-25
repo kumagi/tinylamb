@@ -75,6 +75,8 @@ Type ColumnType(const Column& column) {
       return {TypeTag::kVarChar};
     case ValueType::kDate:
       return {TypeTag::kDate};
+    case ValueType::kArray:
+      return {TypeTag::kArray};
     case ValueType::kNull:
       return {TypeTag::kInvalid};
   }

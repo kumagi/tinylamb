@@ -135,6 +135,20 @@ void ParallelAggregationExecutor::AccumulateValue(
     case AggregationType::kCount:
       ++state->values[index].value.int_value;
       break;
+    case AggregationType::kLogicalAnd:
+      if (state->values[index].IsNull()) {
+        state->values[index] = Value(value.Truthy() ? int64_t{1} : int64_t{0});
+      } else {
+        state->values[index] = Value((state->values[index].Truthy() && value.Truthy()) ? int64_t{1} : int64_t{0});
+      }
+      break;
+    case AggregationType::kLogicalOr:
+      if (state->values[index].IsNull()) {
+        state->values[index] = Value(value.Truthy() ? int64_t{1} : int64_t{0});
+      } else {
+        state->values[index] = Value((state->values[index].Truthy() || value.Truthy()) ? int64_t{1} : int64_t{0});
+      }
+      break;
   }
 }
 
@@ -389,6 +403,24 @@ void ParallelAggregationExecutor::Merge(PartialState* destination,
       case AggregationType::kCount:
         destination->values[index].value.int_value +=
             source.values[index].value.int_value;
+        break;
+      case AggregationType::kLogicalAnd:
+        if (!source.values[index].IsNull()) {
+          if (destination->values[index].IsNull()) {
+            destination->values[index] = source.values[index];
+          } else {
+            destination->values[index] = Value((destination->values[index].Truthy() && source.values[index].Truthy()) ? int64_t{1} : int64_t{0});
+          }
+        }
+        break;
+      case AggregationType::kLogicalOr:
+        if (!source.values[index].IsNull()) {
+          if (destination->values[index].IsNull()) {
+            destination->values[index] = source.values[index];
+          } else {
+            destination->values[index] = Value((destination->values[index].Truthy() || source.values[index].Truthy()) ? int64_t{1} : int64_t{0});
+          }
+        }
         break;
     }
   }

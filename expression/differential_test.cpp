@@ -544,8 +544,27 @@ TEST(DifferentialTest, LogicalThreeValuedLogicMatchesAcrossPaths) {
                   {{"ast", EvaluateAst(expr, Row(), IntSchema())},
                    {"bytecode", EvaluateBytecode(program, IntSchema(), Row())}});
   }
+  const std::vector<std::pair<std::string, UnaryOperation>> unary_predicates{
+      {"is_null", UnaryOperation::kIsNull},
+      {"is_not_null", UnaryOperation::kIsNotNull},
+      {"is_true", UnaryOperation::kIsTrue},
+      {"is_not_true", UnaryOperation::kIsNotTrue},
+      {"is_false", UnaryOperation::kIsFalse},
+      {"is_not_false", UnaryOperation::kIsNotFalse}};
+  for (const auto& [name, op] : unary_predicates) {
+    for (const Value& child : booleans) {
+      const Expression expr =
+          UnaryExpressionExp(ConstantValueExp(child), op);
+      auto program = BytecodeCompiler::Compile(expr, IntSchema());
+      tally.Compare("logic/" + name, "child=" + DescribeValue(child),
+                    {{"ast", EvaluateAst(expr, Row(), IntSchema())},
+                     {"bytecode",
+                      EvaluateBytecode(program, IntSchema(), Row())}});
+    }
+  }
   tally.Summarize("logical");
 }
+
 
 TEST(DifferentialTest, LikePatternsMatchAcrossPaths) {
   const std::vector<const char*> patterns{

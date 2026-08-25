@@ -31,7 +31,17 @@
 namespace tinylamb {
 
 std::unordered_set<ColumnName> AggregateExpression::TouchedColumns() const {
-  return child_->TouchedColumns();
+  std::unordered_set<ColumnName> columns = child_->TouchedColumns();
+  if (having_cond_) {
+    columns.merge(having_cond_->TouchedColumns());
+  }
+  if (where_filter_) {
+    columns.merge(where_filter_->TouchedColumns());
+  }
+  for (const auto& term : inner_order_by_) {
+    columns.merge(term.expression->TouchedColumns());
+  }
+  return columns;
 }
 
 Value AggregateExpression::Evaluate(const Row& /*row*/, const Schema& /*schema*/) const {
@@ -62,13 +72,29 @@ Type AggregateExpression::ResultType(const Schema& left,
 }
 
 std::string AggregateExpression::ToString() const {
-  return ::tinylamb::ToString(type_) + "(" + (distinct_ ? "DISTINCT " : "") +
-         child_->ToString() + ")";
+  std::string out = ::tinylamb::ToString(type_) + "(" +
+                    (distinct_ ? "DISTINCT " : "") + child_->ToString();
+  if (having_ != AggregateHavingModifier::kNone && having_cond_) {
+    out += having_ == AggregateHavingModifier::kMax ? " HAVING MAX "
+                                                    : " HAVING MIN ";
+    out += having_cond_->ToString();
+  }
+  if (!inner_order_by_.empty()) {
+    out += " ORDER BY ";
+    for (size_t i = 0; i < inner_order_by_.size(); ++i) {
+      if (i) { out += ", "; }
+      out += inner_order_by_[i].expression->ToString();
+      if (!inner_order_by_[i].ascending) { out += " DESC"; }
+    }
+  }
+  if (inner_limit_.has_value()) {
+    out += " LIMIT " + std::to_string(*inner_limit_);
+  }
+  return out + ")";
 }
 
 void AggregateExpression::Dump(std::ostream& o) const {
-  o << ::tinylamb::ToString(type_) << "(" << (distinct_ ? "DISTINCT " : "")
-    << *child_ << ")";
+  o << ToString();
 }
 
 }  // namespace tinylamb

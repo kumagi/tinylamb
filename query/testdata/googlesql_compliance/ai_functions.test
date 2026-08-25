@@ -1,0 +1,47 @@
+# Full compliance testing for AI functions aren't possible due to the nature of
+# LLMs.
+
+[name=ai_if_empty_string_prompt]
+[required_features=AI_IF,NAMED_ARGUMENTS]
+SELECT AI.IF("", "payload", model => "gemini")
+--
+ARRAY<STRUCT<BOOL>>[{NULL}]
+==
+
+[name=ai_if_prompt_arg_is_null]
+[required_features=AI_IF]
+SELECT AI.IF(NULL)
+--
+ARRAY<STRUCT<BOOL>>[{NULL}]
+==
+
+[name=ai_if_payload_arg_is_null]
+[required_features=AI_IF,NAMED_ARGUMENTS]
+SELECT AI.IF("prompt", NULL, model => "gemini")
+--
+ARRAY<STRUCT<BOOL>>[{NULL}]
+==
+
+[name=ai_if_model_arg_is_null]
+[required_features=AI_IF,NAMED_ARGUMENTS]
+SELECT AI.IF("prompt", "payload", model => NULL)
+--
+ARRAY<STRUCT<BOOL>>[{NULL}]
+==
+
+[name=ai_if_options_arg_is_null]
+[required_features=AI_IF,NAMED_ARGUMENTS]
+SELECT AI.IF("prompt", "payload", model => "", options => NULL)
+--
+ARRAY<STRUCT<BOOL>>[{NULL}]
+==
+
+# Test case kept to annotate that non-deterministic output is expected for
+# AI.IF.
+[name=ai_if_non_deterministic_output]
+[required_features=AI_IF,NAMED_ARGUMENTS]
+SELECT IF(AI.IF("prompt", "payload", model => "gemini"), true, true)
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+
+NOTE: Reference implementation reports non-determinism.

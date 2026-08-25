@@ -1,0 +1,90 @@
+[name=default_error_int64]
+SELECT ERROR("message")
+--
+ERROR: generic::out_of_range: message
+==
+
+[name=default_safe_error_int64]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT SAFE.ERROR("message")
+--
+ARRAY<STRUCT<INT64>>[{NULL}]
+==
+
+[name=default_error_no_rows]
+SELECT ERROR("message") FROM UNNEST([])
+--
+ARRAY<STRUCT<INT64>>[]
+==
+
+# Tests that an engine can properly handle ERROR() with a non-INT64 return type.
+# (The tests for INT64 are in the code-based tests.)
+[name=cast_error_as_string]
+SELECT CAST(ERROR("message") AS BYTES)
+--
+ERROR: generic::out_of_range: message
+==
+
+[name=cast_safe_error_as_string]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT CAST(SAFE.ERROR("message") AS STRING)
+--
+ARRAY<STRUCT<STRING>>[{NULL}]
+==
+
+[name=if_error]
+SELECT IF(TRUE, ERROR("message"), "foo")
+--
+ERROR: generic::out_of_range: message
+==
+
+[name=if_no_error]
+SELECT IF(FALSE, ERROR("message"), "foo")
+--
+ARRAY<STRUCT<STRING>>[{"foo"}]
+==
+
+[name=safe_error_fn_with_division_by_zero]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT SAFE.ERROR(IF(1/0 = 0, "abc", ""));
+--
+ERROR: generic::out_of_range: division by zero: 1 / 0
+==
+
+[name=safe_error_fn_with_error]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT SAFE.ERROR(ERROR("custom error message"))
+--
+ERROR: generic::out_of_range: custom error message
+==
+
+[name=error_as_interval]
+[required_features=INTERVAL_TYPE]
+SELECT IF(FALSE, MAKE_INTERVAL(0, 10, 2), ERROR("error"))
+--
+ERROR: generic::out_of_range: error
+==
+
+[name=interval_to_interval_cast]
+[required_features=INTERVAL_TYPE]
+# This query is useful because it doesn't fold the INTERVAL -> INTERVAL cast
+# on the THEN side.
+SELECT IF(TRUE, MAKE_INTERVAL(0, 10, 2), ERROR("error"))
+--
+ARRAY<STRUCT<INTERVAL>>[{0-10 2 0:0:0}]
+==
+
+[name=error_as_json]
+[required_features=JSON_TYPE]
+SELECT IF(FALSE, JSON '1', ERROR("error"))
+--
+ERROR: generic::out_of_range: error
+==
+
+[name=json_cast_to_json]
+[required_features=JSON_TYPE]
+# The IF expression is one way to get a self-cast to appear in the
+# ResolvedAST that wont be removed by the Resolver.
+SELECT IF(TRUE, JSON '1', ERROR("error"))
+--
+ARRAY<STRUCT<JSON>>[{1}]

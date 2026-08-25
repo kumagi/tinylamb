@@ -39,11 +39,18 @@ Value EvaluateUnary(UnaryOperation operation, const Value& child) {
       return Value(child.IsNull());
     case UnaryOperation::kIsNotNull:
       return Value(!child.IsNull());
+    case UnaryOperation::kIsTrue:
+      return Value(!child.IsNull() && child.Truthy());
+    case UnaryOperation::kIsNotTrue:
+      return Value(child.IsNull() || !child.Truthy());
+    case UnaryOperation::kIsFalse:
+      return Value(!child.IsNull() && !child.Truthy());
+    case UnaryOperation::kIsNotFalse:
+      return Value(child.IsNull() || child.Truthy());
     case UnaryOperation::kNot:
       return child.IsNull() ? Value() : Value(!child.Truthy());
     case UnaryOperation::kMinus:
-      if (child.IsNull()) { return {};
-}
+      if (child.IsNull()) { return {}; }
       if (child.type == ValueType::kDouble) {
         return Value(-child.value.double_value);
       }
@@ -64,6 +71,10 @@ namespace {
 Type UnaryResultType(UnaryOperation operation, const Type& child) {
   if (operation == UnaryOperation::kIsNull ||
       operation == UnaryOperation::kIsNotNull ||
+      operation == UnaryOperation::kIsTrue ||
+      operation == UnaryOperation::kIsNotTrue ||
+      operation == UnaryOperation::kIsFalse ||
+      operation == UnaryOperation::kIsNotFalse ||
       operation == UnaryOperation::kNot) {
     return {TypeTag::kBigInt};
   }
@@ -71,6 +82,7 @@ Type UnaryResultType(UnaryOperation operation, const Type& child) {
 }
 
 }  // namespace
+
 
 std::unordered_set<ColumnName> UnaryExpression::TouchedColumns() const {
   return child_->TouchedColumns();

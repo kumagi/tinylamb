@@ -1,0 +1,1133 @@
+[prepare_database]
+CREATE CONSTANT INTERVAL_STRING_YTS  = "1-2 3 4:5:6.789";
+==
+
+[prepare_database]
+CREATE CONSTANT INTERVAL_STRING_YTM  = "1-2";
+==
+
+[prepare_database]
+CREATE CONSTANT YEAR_STRING  = CONCAT("10","0");
+==
+
+[required_features=INTERVAL_TYPE]
+[prepare_database]
+CREATE TABLE Intervals AS
+SELECT 1 id, CAST(NULL AS INTERVAL) value UNION ALL
+SELECT 2, interval 0 year UNION ALL
+SELECT 3, interval '0.000001' second UNION ALL
+SELECT 4, interval -1 second UNION ALL
+SELECT 5, interval 1 month UNION ALL
+SELECT 6, interval 30 day UNION ALL
+SELECT 7, interval 720 hour UNION ALL
+SELECT 8, interval 10000 year UNION ALL
+SELECT 9, interval '1-2 3 4:5:6.789' year to second UNION ALL
+SELECT 10, interval 2 hour UNION ALL
+SELECT 11, interval '1:59:59.999999' hour to second UNION ALL
+SELECT 12, interval '1:00:00.000001' hour to second UNION ALL
+SELECT 13, interval '-0.000001' second UNION ALL
+SELECT 14, interval '-4:5:6.789' hour to second
+--
+ARRAY<STRUCT<id INT64, value INTERVAL>>[
+  {1, NULL},
+  {2, 0-0 0 0:0:0},
+  {3, 0-0 0 0:0:0.000001},
+  {4, 0-0 0 -0:0:1},
+  {5, 0-1 0 0:0:0},
+  {6, 0-0 30 0:0:0},
+  {7, 0-0 0 720:0:0},
+  {8, 10000-0 0 0:0:0},
+  {9, 1-2 3 4:5:6.789},
+  {10, 0-0 0 2:0:0},
+  {11, 0-0 0 1:59:59.999999},
+  {12, 0-0 0 1:0:0.000001},
+  {13, 0-0 0 -0:0:0.000001},
+  {14, 0-0 0 -4:5:6.789}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=error_messages]
+WITH t AS (SELECT "P1Y2M<3D" a) SELECT CAST(a AS INTERVAL) FROM t;
+--
+ERROR: generic::out_of_range: Invalid INTERVAL value 'P1Y2M<3D': Unexpected '<'
+==
+
+# Repro test for b/268563477
+[required_features=INTERVAL_TYPE]
+[name=error_message_expected_parse_number1]
+SELECT CAST('P-aY2M3D' AS INTERVAL);
+--
+ERROR: generic::out_of_range: Invalid INTERVAL value 'P-aY2M3D': Expected number at 'a'
+==
+
+# Repro test for b/268563477
+[required_features=INTERVAL_TYPE]
+[name=error_message_expected_parse_number2]
+SELECT CAST('P-' AS INTERVAL);
+--
+ERROR: generic::out_of_range: Invalid INTERVAL value 'P-': Expected number at end of string
+==
+[required_features=INTERVAL_TYPE]
+[name=literal]
+SELECT INTERVAL '1' YEAR, INTERVAL '-20 30' MONTH TO DAY, INTERVAL '-10000' MINUTE, INTERVAL '10:20:30.456789' HOUR TO SECOND
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL, INTERVAL, INTERVAL>>[
+  {
+    1-0 0 0:0:0,
+    -1-8 30 0:0:0,
+    0-0 0 -166:40:0,
+    0-0 0 10:20:30.456789
+  }
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=constructor]
+SELECT INTERVAL n YEAR, INTERVAL 10 * n + 5 DAY, INTERVAL 10001 * n SECOND
+FROM UNNEST([NULL, 0, 1, -2]) n
+ORDER BY n
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL, INTERVAL>>[known order:
+  {NULL, NULL, NULL},
+  {-2-0 0 0:0:0, 0-0 -15 0:0:0, 0-0 0 -5:33:22},
+  {0-0 0 0:0:0, 0-0 5 0:0:0, 0-0 0 0:0:0},
+  {1-0 0 0:0:0, 0-0 15 0:0:0, 0-0 0 2:46:41}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=parametrized_constructor]
+[parameters=-10 AS back_ten, NULL AS nothing]
+SELECT INTERVAL @back_ten QUARTER, INTERVAL @nothing WEEK
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL>>[{-2-6 0 0:0:0, NULL}]
+==
+[required_features=INTERVAL_TYPE]
+[name=null]
+SELECT CAST(NULL AS INTERVAL)
+--
+ARRAY<STRUCT<INTERVAL>>[{NULL}]
+==
+[required_features=INTERVAL_TYPE]
+[name=cast]
+SELECT
+  CAST('-1-2 -3 -4:5:6.789' AS INTERVAL), CAST('P1Y2M3DT4H5M6.789S' AS INTERVAL)
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL>>[{-1-2 -3 -4:5:6.789, 1-2 3 4:5:6.789}]
+==
+[required_features=INTERVAL_TYPE]
+[name=safe_cast]
+SELECT
+  SAFE_CAST('1-2' AS INTERVAL), SAFE_CAST('PT1H2M' AS INTERVAL),
+  SAFE_CAST('1' AS INTERVAL), SAFE_CAST('P1' AS INTERVAL)
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL, INTERVAL, INTERVAL>>[
+  {1-2 0 0:0:0, 0-0 0 1:2:0, NULL, NULL}
+]
+==
+[required_features=INTERVAL_TYPE]
+[forbidden_features=TIMESTAMP_NANOS]
+[name=cast_nanos_without_nanos_support]
+SELECT
+  CAST('1-2 3 4:5:6.123456789' AS INTERVAL),
+  CAST('-1-2 -3 -4:5:6.123456789' AS INTERVAL),
+  CAST('P1Y2M3DT4H5M6.123456789S' AS INTERVAL)
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL, INTERVAL>>[
+  {
+    1-2 3 4:5:6.123456789,
+    -1-2 -3 -4:5:6.123456789,
+    1-2 3 4:5:6.123456789
+  }
+]
+==
+[required_features=INTERVAL_TYPE,ENFORCE_MICROS_MODE_IN_INTERVAL_TYPE]
+[forbidden_features=TIMESTAMP_NANOS]
+[name=cast_nanos_without_nanos_support_enforcement_enabled]
+SELECT
+  CAST('1-2 3 4:5:6.123456789' AS INTERVAL),
+  CAST('-1-2 -3 -4:5:6.123456789' AS INTERVAL),
+  CAST('P1Y2M3DT4H5M6.123456789S' AS INTERVAL)
+--
+ERROR: generic::out_of_range: Invalid INTERVAL value '1-2 3 4:5:6.123456789'
+==
+[required_features=INTERVAL_TYPE,NAMED_ARGUMENTS]
+[name=make_interval]
+select
+  make_interval(year => 1),
+  make_interval(second => -6),
+  make_interval(),
+  make_interval(1,-2,3,-4,5,-6),
+  make_interval(second=>-6, minute=>5, hour=>-4, day=>3, month=>-2, year=>1),
+  make_interval(1,-2,3),
+  make_interval(hour=>-4, minute=>5),
+  make_interval(second=>-6, month=>-2),
+  make_interval(1, day=>3),
+  make_interval(NULL),
+  make_interval(1, 2, 3, 4, 5, NULL),
+  make_interval(year => 1, minute => NULL),
+--
+ARRAY<STRUCT<INTERVAL,
+             INTERVAL,
+             INTERVAL,
+             INTERVAL,
+             INTERVAL,
+             INTERVAL,
+             INTERVAL,
+             INTERVAL,
+             INTERVAL,
+             INTERVAL,
+             INTERVAL,
+             INTERVAL>>
+[{1-0 0 0:0:0,
+  0-0 0 -0:0:6,
+  0-0 0 0:0:0,
+  0-10 3 -3:55:6,
+  0-10 3 -3:55:6,
+  0-10 3 0:0:0,
+  0-0 0 -3:55:0,
+  -0-2 0 -0:0:6,
+  1-0 3 0:0:0,
+  NULL,
+  NULL,
+  NULL}]
+==
+[required_features=INTERVAL_TYPE,NAMED_ARGUMENTS]
+[name=make_interval_overflow]
+select make_interval(year => 10000, month => 1)
+--
+ERROR: generic::out_of_range: Interval field months '120001' is out of range -120000 to 120000
+==
+[required_features=INTERVAL_TYPE]
+[name=cmp_scalar]
+SELECT
+  CAST(NULL AS INTERVAL) <= INTERVAL 1 DAY,
+  CAST(NULL AS INTERVAL) = CAST(NULL AS INTERVAL),
+  INTERVAL 1 YEAR > INTERVAL 360 DAY
+--
+ARRAY<STRUCT<BOOL, BOOL, BOOL>>[{NULL, NULL, false}]
+==
+[required_features=INTERVAL_TYPE,ARRAY_EQUALITY]
+[name=cmp_array]
+SELECT
+  [INTERVAL 1 DAY, INTERVAL -2 MINUTE] = [INTERVAL 24 HOUR, INTERVAL -120 SECOND],
+  [INTERVAL -1 DAY, NULL] = [INTERVAL -1 DAY, NULL],
+  [INTERVAL 1 SECOND, INTERVAL 1 HOUR] = [INTERVAL 1 SECOND, INTERVAL -1 HOUR]
+--
+ARRAY<STRUCT<BOOL, BOOL, BOOL>>[{true, NULL, false}]
+==
+[required_features=INTERVAL_TYPE]
+[name=cmp_struct]
+SELECT
+  STRUCT(1, INTERVAL '1 2:0:0' DAY TO SECOND) = STRUCT(1, INTERVAL 26 HOUR),
+  STRUCT(1, INTERVAL 1 HOUR) = STRUCT(1, NULL),
+  STRUCT(1, INTERVAL '1 23:59:59.999999' DAY TO SECOND) = STRUCT(1, INTERVAL 2 DAY),
+--
+ARRAY<STRUCT<BOOL, BOOL, BOOL>>[{true, NULL, false}]
+==
+[required_features=INTERVAL_TYPE,CIVIL_TIME]
+[name=add_interval]
+SELECT
+  DATE '2010-10-10' + INTERVAL '10 20:20:20' DAY TO SECOND,
+  INTERVAL '24' HOUR + DATE '1999-12-31',
+  DATETIME  '1970-01-02 03:04:05.678' + INTERVAL '1-1 1 1:1:1.1111' YEAR TO SECOND,
+  INTERVAL 1 YEAR + DATETIME '0201-02-02 02:02:02',
+  TIMESTAMP '1970-01-01 02:03:04.567' + INTERVAL '1 1:1:1.1111' DAY TO SECOND,
+  INTERVAL 1 SECOND + TIMESTAMP '1999-12-31 23:59:59',
+--
+ARRAY<STRUCT<DATETIME, DATETIME, DATETIME, DATETIME, TIMESTAMP, TIMESTAMP>>[
+  {
+    2010-10-20 20:20:20,
+    2000-01-01 00:00:00,
+    1971-02-03 04:05:06.789100,
+    0202-02-02 02:02:02,
+    1970-01-02 11:04:05.678100+00,
+    2000-01-01 08:00:00+00
+  }
+]
+==
+[required_features=INTERVAL_TYPE,CIVIL_TIME]
+[name=subtract_interval]
+SELECT
+  DATE '2010-10-10' - INTERVAL '10 1:1:1' DAY TO SECOND,
+  DATETIME  '1970-01-02 03:04:05.678' - INTERVAL '1-1 1 1:1:1.111' YEAR TO SECOND,
+  TIMESTAMP '1970-01-01 02:03:04.567' - INTERVAL '1 1:1:1.111' DAY TO SECOND,
+--
+ARRAY<STRUCT<DATETIME, DATETIME, TIMESTAMP>>[
+  {
+    2010-09-29 22:58:59,
+    1968-12-01 02:03:04.567,
+    1969-12-31 09:02:03.456+00
+  }
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=multiply_divide]
+SELECT interval '1' month * 20, interval '2' hour / 4
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL>>[{1-8 0 0:0:0, 0-0 0 0:30:0}]
+==
+[required_features=INTERVAL_TYPE]
+[name=multiply_double]
+SELECT interval '1' month * 3.5, 4.5 * interval '2' hour, interval '2' day * 2.0;
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL, INTERVAL>>[
+  {0-3 15 0:0:0, 0-0 0 9:0:0, 0-0 4 0:0:0}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=multiply_float]
+SELECT interval '1' month * cast(3.5 as float), cast(4.5 as float) * interval '2' hour, interval '2' day * cast(2.0 as float);
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL, INTERVAL>>[
+  {0-3 15 0:0:0, 0-0 0 9:0:0, 0-0 4 0:0:0}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=multiply_double_without_nanos_feature]
+SELECT interval '1' second * (1.0 / 3.0), (1.0 / 7.0) * interval '1' second
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL>>[{0-0 0 0:0:0.333333, 0-0 0 0:0:0.142857}]
+==
+[required_features=INTERVAL_TYPE,TIMESTAMP_NANOS]
+[name=multiply_double_with_nanos_feature]
+SELECT interval '1' second * (1.0 / 3.0), (1.0 / 7.0) * interval '1' second
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL>>[
+  {
+    0-0 0 0:0:0.333333333,
+    0-0 0 0:0:0.142857142
+  }
+]
+==
+[required_features=INTERVAL_TYPE,TIMESTAMP_NANOS]
+[name=divide_fractional_micros_with_nanos_feature]
+SELECT (interval '0.000008' SECOND) / 3,  -- 2.666666666...
+       (interval '0.000008' SECOND) / 4,  -- 2.0
+       (interval '0.000008' SECOND) / 6,  -- 1.333333333...
+       (interval '0.000008' SECOND) / -3,  -- 2.666666666...
+       (interval '0.000008' SECOND) / -4,  -- 2.0
+       (interval '0.000008' SECOND) / -6;  -- 1.333333333...
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL, INTERVAL, INTERVAL, INTERVAL, INTERVAL>>[
+  {
+    0-0 0 0:0:0.000002666,
+    0-0 0 0:0:0.000002,
+    0-0 0 0:0:0.000001333,
+    0-0 0 -0:0:0.000002666,
+    0-0 0 -0:0:0.000002,
+    0-0 0 -0:0:0.000001333
+  }
+]
+==
+[required_features=INTERVAL_TYPE]
+[forbidden_features=TIMESTAMP_NANOS]
+[name=divide_fractional_micros_without_nanos_feature]
+SELECT (interval '0.000008' SECOND) / 3,  -- 2.666666666...
+       (interval '0.000008' SECOND) / 4,  -- 2.0
+       (interval '0.000008' SECOND) / 6,  -- 1.333333333...
+       (interval '0.000008' SECOND) / -3,  -- 2.666666666...
+       (interval '0.000008' SECOND) / -4,  -- 2.0
+       (interval '0.000008' SECOND) / -6;  -- 1.333333333...
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL, INTERVAL, INTERVAL, INTERVAL, INTERVAL>>[
+  {0-0 0 0:0:0.000002,
+   0-0 0 0:0:0.000002,
+   0-0 0 0:0:0.000001,
+   0-0 0 -0:0:0.000002,
+   0-0 0 -0:0:0.000002,
+   0-0 0 -0:0:0.000001}
+]
+==
+[required_features=INTERVAL_TYPE,TIMESTAMP_NANOS]
+[name=divide_fractional_nanos]
+SELECT (interval '0.000000008' SECOND) / 3,
+       (interval '0.000000008' SECOND) / 4,
+       (interval '0.000000008' SECOND) / 6,
+       (interval '0.000000008' SECOND) / -3,
+       (interval '0.000000008' SECOND) / -4,
+       (interval '0.000000008' SECOND) / -6;
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL, INTERVAL, INTERVAL, INTERVAL, INTERVAL>>[
+  {
+    0-0 0 0:0:0.000000002,
+    0-0 0 0:0:0.000000002,
+    0-0 0 0:0:0.000000001,
+    0-0 0 -0:0:0.000000002,
+    0-0 0 -0:0:0.000000002,
+    0-0 0 -0:0:0.000000001
+  }
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=count_distinct]
+SELECT COUNT(*) num_rows, COUNT(value) num_values, COUNT(DISTINCT value) num_uniques FROM Intervals
+--
+ARRAY<STRUCT<num_rows INT64, num_values INT64, num_uniques INT64>>[
+  {14, 13, 11}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=min_max]
+SELECT MIN(value) min, MAX(value) max FROM Intervals
+--
+ARRAY<STRUCT<min INTERVAL, max INTERVAL>>[{0-0 0 -4:5:6.789, 10000-0 0 0:0:0}]
+==
+[required_features=INTERVAL_TYPE]
+[name=sum]
+SELECT SUM(i) sum FROM UNNEST([
+  interval 1 year, interval 2 month, interval 3 day, NULL,
+  interval 4 hour, interval 5 minute, interval '6.789' second, NULL
+]) i
+--
+ARRAY<STRUCT<sum INTERVAL>>[{1-2 3 4:5:6.789}]
+==
+[required_features=INTERVAL_TYPE]
+[name=sum_all_nulls]
+SELECT SUM(i) sum FROM UNNEST([CAST(NULL AS INTERVAL), NULL, NULL]) i
+--
+ARRAY<STRUCT<sum INTERVAL>>[{NULL}]
+==
+[required_features=INTERVAL_TYPE]
+[name=sum_overflow]
+SELECT SUM(i) sum FROM UNNEST([
+  interval 10000 year, interval '1' month
+]) i
+--
+ERROR: generic::out_of_range: Interval field months '120001' is out of range -120000 to 120000
+==
+[required_features=INTERVAL_TYPE]
+[name=sum_handles_intermediate_overflow]
+SELECT SUM(i) sum FROM UNNEST([
+  interval '10000' year,
+  interval '10000' year,
+  interval '10000' year,
+  interval '-120000' month,
+  interval '-120000' month
+]) i
+--
+ARRAY<STRUCT<sum INTERVAL>>[{10000-0 0 0:0:0}]
+==
+[required_features=INTERVAL_TYPE]
+[name=avg]
+SELECT AVG(i) avg FROM UNNEST([
+  interval 1 year, interval 1 month, interval 1 day, NULL, interval 1 hour, interval 1 second, NULL
+]) i
+--
+ARRAY<STRUCT<avg INTERVAL>>[{0-2 18 5:0:0.200}]
+==
+[required_features=INTERVAL_TYPE]
+[name=avg_1_element]
+SELECT AVG(i) avg FROM UNNEST([
+  interval '1-2 3 4:5:6.789' year to second
+]) i
+--
+ARRAY<STRUCT<avg INTERVAL>>[{1-2 3 4:5:6.789}]
+==
+[required_features=INTERVAL_TYPE]
+[name=avg_handles_intermediate_overflow]
+SELECT AVG(i) avg FROM UNNEST([
+  interval 10000 year, interval 8000 year, interval 3660000 day, interval 366000 day
+]) i
+--
+ARRAY<STRUCT<avg INTERVAL>>[{4500-0 1006500 0:0:0}]
+==
+[required_features=INTERVAL_TYPE]
+[name=avg_positive_negative_cancel_each_other]
+SELECT AVG(i) avg FROM UNNEST([
+  interval -1 year,  interval -5 day, interval -1 hour,   interval -1 minute,
+  interval 12 month, interval 5 day,  interval 60 minute, interval 60 second
+]) i
+--
+ARRAY<STRUCT<avg INTERVAL>>[{0-0 0 0:0:0}]
+==
+[required_features=INTERVAL_TYPE]
+[name=avg_nano_truncation]
+SELECT AVG(i) avg FROM UNNEST([
+  interval 0 second, interval '0.000000001' second
+]) i
+--
+ARRAY<STRUCT<avg INTERVAL>>[{0-0 0 0:0:0}]
+==
+# Regression test against AVG(INTERVAL) to ensure nanos precision is only
+# non-zero when FEATURE_TIMESTAMP_NANOS is on. See b/245617716.
+[required_features=INTERVAL_TYPE,TIMESTAMP_NANOS]
+[name=avg_nano_truncation2_nanos]
+SELECT AVG(i) avg FROM UNNEST([
+  interval 0 second, interval '-0.000000003' second
+]) i
+--
+ARRAY<STRUCT<avg INTERVAL>>[{0-0 0 -0:0:0.000000001}]
+==
+# Regression test against AVG(INTERVAL) to ensure nanos precision is only
+# non-zero when FEATURE_TIMESTAMP_NANOS is on. See b/245617716.
+[required_features=INTERVAL_TYPE]
+[forbidden_features=TIMESTAMP_NANOS]
+[name=avg_nano_truncation2_micros]
+SELECT AVG(i) avg FROM UNNEST([
+  interval 0 second, interval '-0.000000003' second
+]) i
+--
+ARRAY<STRUCT<avg INTERVAL>>[{0-0 0 0:0:0}]
+==
+# Regression test against AVG(INTERVAL) to ensure nanos precision is only
+# non-zero when FEATURE_TIMESTAMP_NANOS is on. See b/245617716.
+[name=avg_nano_truncation3_nanos]
+[required_features=INTERVAL_TYPE,TIMESTAMP_NANOS]
+SELECT AVG(e)
+FROM UNNEST([INTERVAL "-7959-1 -153930 54938167:22:41.712081" YEAR TO SECOND,
+            INTERVAL "8630-9 3512412 62113018:54:19.721996" YEAR TO SECOND,
+            INTERVAL "675-8 -224302 -58850294:15:14.439522" YEAR TO SECOND,
+            INTERVAL "2580-1 -200995 40403849:16:44.554610" YEAR TO SECOND]) AS e
+--
+ARRAY<STRUCT<INTERVAL>>[{981-10 733303 24651203:19:37.887291250}]
+==
+# Regression test against AVG(INTERVAL) to ensure nanos precision is only
+# non-zero when FEATURE_TIMESTAMP_NANOS is on. See b/245617716.
+[name=avg_nano_truncation3_micros]
+[required_features=INTERVAL_TYPE]
+[forbidden_features=TIMESTAMP_NANOS]
+SELECT AVG(e)
+FROM UNNEST([INTERVAL "-7959-1 -153930 54938167:22:41.712081" YEAR TO SECOND,
+            INTERVAL "8630-9 3512412 62113018:54:19.721996" YEAR TO SECOND,
+            INTERVAL "675-8 -224302 -58850294:15:14.439522" YEAR TO SECOND,
+            INTERVAL "2580-1 -200995 40403849:16:44.554610" YEAR TO SECOND]) AS e
+--
+ARRAY<STRUCT<INTERVAL>>[{981-10 733303 24651203:19:37.887291}]
+==
+[required_features=INTERVAL_TYPE]
+[name=avg_all_nulls]
+SELECT AVG(i) avg FROM UNNEST([
+  CAST(NULL AS INTERVAL), NULL, NULL
+]) i
+--
+ARRAY<STRUCT<avg INTERVAL>>[{NULL}]
+==
+[required_features=INTERVAL_TYPE]
+[name=any_value]
+SELECT ANY_VALUE(i) FROM UNNEST([interval 1 day, interval 1 day]) i
+--
+ARRAY<STRUCT<INTERVAL>>[{0-0 1 0:0:0}]
+==
+[required_features=INTERVAL_TYPE]
+[name=array_agg]
+SELECT ARRAY_AGG(i) FROM UNNEST([interval 1 day, interval 1 day]) i
+--
+ARRAY<STRUCT<ARRAY<>>>[
+  {ARRAY<INTERVAL>[unknown order:0-0 1 0:0:0, 0-0 1 0:0:0]}
+]
+==
+[required_features=INTERVAL_TYPE,ORDER_BY_IN_AGGREGATE]
+[name=array_agg_orderby]
+SELECT ARRAY_AGG(value ORDER BY value, id) FROM Intervals
+--
+ARRAY<STRUCT<ARRAY<>>>[
+  {ARRAY<INTERVAL>[known order:
+     NULL,
+     0-0 0 -4:5:6.789,
+     0-0 0 -0:0:1,
+     0-0 0 -0:0:0.000001,
+     0-0 0 0:0:0,
+     0-0 0 0:0:0.000001,
+     0-0 0 1:0:0.000001,
+     0-0 0 1:59:59.999999,
+     0-0 0 2:0:0,
+     0-1 0 0:0:0,
+     0-0 30 0:0:0,
+     0-0 0 720:0:0,
+     1-2 3 4:5:6.789,
+     10000-0 0 0:0:0
+   ]}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=approx_count_distinct]
+SELECT APPROX_COUNT_DISTINCT(value) approx_uniques FROM Intervals
+--
+ARRAY<STRUCT<approx_uniques INT64>>[{11}]
+==
+[required_features=INTERVAL_TYPE]
+[name=approx_quantiles]
+SELECT
+  -- JUSTIFY_INTERVAL() makes the test robust against different engines making
+  -- different decisions about the relative order of 1 MONTH and 30 DAYS, which
+  -- can affect the result.
+  ARRAY_LENGTH(quantiles) AS length, -- Make sure array is exactly 4 elements
+  JUSTIFY_INTERVAL(quantiles[ORDINAL(1)]) AS first_quantile,
+  JUSTIFY_INTERVAL(quantiles[ORDINAL(2)]) AS second_quantile,
+  JUSTIFY_INTERVAL(quantiles[ORDINAL(3)]) AS third_quantile,
+  JUSTIFY_INTERVAL(quantiles[ORDINAL(4)]) AS fourth_quantile
+FROM (
+  SELECT APPROX_QUANTILES(value, 3) AS quantiles
+  FROM Intervals
+)
+--
+ARRAY<STRUCT<
+        length INT64,
+        first_quantile INTERVAL,
+        second_quantile INTERVAL,
+        third_quantile INTERVAL,
+        fourth_quantile INTERVAL
+      >>[
+  {4, 0-0 0 -4:5:6.789, 0-0 0 0:0:0.000001, 0-1 0 0:0:0, 10000-0 0 0:0:0}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=approx_top_count]
+SELECT APPROX_TOP_COUNT(value, 1) FROM Intervals
+--
+ARRAY<STRUCT<ARRAY<>>>[
+  {ARRAY<STRUCT<value INTERVAL, count INT64>>[{0-0 30 0:0:0, 3}]}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=approx_top_sum]
+SELECT APPROX_TOP_SUM(value, EXTRACT(YEAR FROM value), 2) FROM Intervals
+--
+ARRAY<STRUCT<ARRAY<>>>[
+  {ARRAY<STRUCT<value INTERVAL, sum INT64>>[known order:
+     {10000-0 0 0:0:0, 10000},
+     {1-2 3 4:5:6.789, 1}
+   ]}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=orderby]
+SELECT id, value FROM Intervals ORDER BY value DESC, id ASC
+--
+ARRAY<STRUCT<id INT64, value INTERVAL>>[known order:
+  {8, 10000-0 0 0:0:0},
+  {9, 1-2 3 4:5:6.789},
+  {5, 0-1 0 0:0:0},
+  {6, 0-0 30 0:0:0},
+  {7, 0-0 0 720:0:0},
+  {10, 0-0 0 2:0:0},
+  {11, 0-0 0 1:59:59.999999},
+  {12, 0-0 0 1:0:0.000001},
+  {3, 0-0 0 0:0:0.000001},
+  {2, 0-0 0 0:0:0},
+  {13, 0-0 0 -0:0:0.000001},
+  {4, 0-0 0 -0:0:1},
+  {14, 0-0 0 -4:5:6.789},
+  {1, NULL}
+]
+==
+# Different interval values can compare equal (1 month = 30 days), so the are
+# manually normalized since test harness compares string representations.
+[required_features=INTERVAL_TYPE]
+[name=groupby]
+SELECT IF(value = interval 1 month, '1 month', cast(value as string)) value, cnt FROM
+(SELECT value, COUNT(id) cnt FROM Intervals GROUP BY value)
+ORDER BY cnt DESC, value ASC
+--
+ARRAY<STRUCT<value STRING, cnt INT64>>[known order:
+  {"1 month", 3},
+  {NULL, 1},
+  {
+    "0-0 0 -0:0:0.000001",
+    1
+  },
+  {"0-0 0 -0:0:1", 1},
+  {"0-0 0 -4:5:6.789", 1},
+  {"0-0 0 0:0:0", 1},
+  {"0-0 0 0:0:0.000001", 1},
+  {"0-0 0 1:0:0.000001", 1},
+  {
+    "0-0 0 1:59:59.999999",
+    1
+  },
+  {"0-0 0 2:0:0", 1},
+  {"1-2 3 4:5:6.789", 1},
+  {"10000-0 0 0:0:0", 1}
+]
+==
+# Different interval values can compare equal (1 month = 30 days), so the are
+# manually normalized since test harness compares string representations.
+[required_features=INTERVAL_TYPE]
+[name=distinct]
+SELECT IF(value = interval 1 month, '1 month', cast(value as string)) value FROM
+(SELECT DISTINCT value FROM Intervals)
+ORDER BY value
+--
+ARRAY<STRUCT<value STRING>>[known order:
+  {NULL},
+  {"0-0 0 -0:0:0.000001"},
+  {"0-0 0 -0:0:1"},
+  {"0-0 0 -4:5:6.789"},
+  {"0-0 0 0:0:0"},
+  {"0-0 0 0:0:0.000001"},
+  {"0-0 0 1:0:0.000001"},
+  {"0-0 0 1:59:59.999999"},
+  {"0-0 0 2:0:0"},
+  {"1 month"},
+  {"1-2 3 4:5:6.789"},
+  {"10000-0 0 0:0:0"}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=join]
+SELECT id, value, i FROM Intervals
+INNER JOIN
+(SELECT i FROM UNNEST([interval 1 month, interval 31 day, interval 2 hour]) i)
+ON value = i
+ORDER BY id ASC
+--
+ARRAY<STRUCT<id INT64, value INTERVAL, i INTERVAL>>[known order:
+  {5, 0-1 0 0:0:0, 0-1 0 0:0:0},
+  {6, 0-0 30 0:0:0, 0-1 0 0:0:0},
+  {7, 0-0 0 720:0:0, 0-1 0 0:0:0},
+  {10, 0-0 0 2:0:0, 0-0 0 2:0:0}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=in_semijoin]
+SELECT id, value FROM Intervals
+WHERE value IN (SELECT i FROM UNNEST([interval -1 second, interval 31 day, interval 30 day]) i)
+ORDER BY id ASC
+--
+ARRAY<STRUCT<id INT64, value INTERVAL>>[known order:
+  {4, 0-0 0 -0:0:1},
+  {5, 0-1 0 0:0:0},
+  {6, 0-0 30 0:0:0},
+  {7, 0-0 0 720:0:0}
+]
+==
+[required_features=INTERVAL_TYPE,ANALYTIC_FUNCTIONS]
+[name=analytic_running_sum]
+SELECT
+  SUM(value) OVER(
+    ORDER BY value ASC, id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  )
+FROM Intervals
+WHERE value < INTERVAL 1 year
+--
+ARRAY<STRUCT<INTERVAL>>[unknown order:
+  {0-0 0 -4:5:6.789},
+  {0-0 0 -4:5:7.789},
+  {0-0 0 -4:5:7.789001},
+  {0-0 0 -4:5:7.789001},
+  {0-0 0 -4:5:7.789},
+  {0-0 0 -3:5:7.788999},
+  {0-0 0 -1:5:7.789},
+  {0-0 0 0:54:52.211},
+  {0-1 0 0:54:52.211},
+  {0-1 30 0:54:52.211},
+  {0-1 30 720:54:52.211}
+]
+==
+[required_features=INTERVAL_TYPE,ANALYTIC_FUNCTIONS,TIMESTAMP_NANOS]
+[name=analytic_moving_avg_nanos]
+SELECT AVG(value) OVER(ORDER BY value, id ASC ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) FROM Intervals
+--
+ARRAY<STRUCT<INTERVAL>>[unknown order:
+  {NULL},
+  {0-0 0 -4:5:6.789},
+  {0-0 0 -2:2:33.894500},
+  {0-0 0 -1:21:42.596333666},
+  {0-0 0 -1:1:16.947250250},
+  {0-0 0 -0:0:0.250},
+  {0-0 0 0:15:0.000000250},
+  {0-0 0 0:45:0.000000250},
+  {0-0 0 1:15:0.000000250},
+  {0-0 7 13:15:0},
+  {0-0 15 0:59:59.999999750},
+  {0-0 15 180:30:0},
+  {0-3 30 199:1:16.697250},
+  {2500-3 23 187:1:16.697250}
+]
+==
+[required_features=INTERVAL_TYPE,ANALYTIC_FUNCTIONS]
+[forbidden_features=TIMESTAMP_NANOS]
+[name=analytic_moving_avg]
+SELECT AVG(value) OVER(ORDER BY value, id ASC ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) FROM Intervals
+--
+ARRAY<STRUCT<INTERVAL>>[unknown order:
+  {NULL},
+  {0-0 0 -4:5:6.789},
+  {0-0 0 -2:2:33.894500},
+  {0-0 0 -1:21:42.596333},
+  {0-0 0 -1:1:16.947250},
+  {0-0 0 -0:0:0.250},
+  {0-0 0 0:15:0},
+  {0-0 0 0:45:0},
+  {0-0 0 1:15:0},
+  {0-0 7 13:15:0},
+  {0-0 15 0:59:59.999999},
+  {0-0 15 180:30:0},
+  {0-3 30 199:1:16.697250},
+  {2500-3 23 187:1:16.697250}
+]
+==
+[required_features=INTERVAL_TYPE,ANALYTIC_FUNCTIONS]
+[name=analytic_min_max]
+SELECT MIN(value) OVER(w), MAX(value) OVER w FROM Intervals
+WINDOW w AS (ORDER BY value ASC, id ASC ROWS BETWEEN CURRENT ROW AND 3 FOLLOWING)
+--
+ARRAY<STRUCT<INTERVAL, INTERVAL>>[unknown order:
+  {0-0 0 -4:5:6.789, 0-0 0 -0:0:0.000001},
+  {0-0 0 -4:5:6.789, 0-0 0 0:0:0},
+  {0-0 0 -0:0:1, 0-0 0 0:0:0.000001},
+  {0-0 0 -0:0:0.000001, 0-0 0 1:0:0.000001},
+  {0-0 0 0:0:0, 0-0 0 1:59:59.999999},
+  {0-0 0 0:0:0.000001, 0-0 0 2:0:0},
+  {0-0 0 1:0:0.000001, 0-1 0 0:0:0},
+  {0-0 0 1:59:59.999999, 0-1 0 0:0:0},
+  {0-0 0 2:0:0, 0-1 0 0:0:0},
+  {0-1 0 0:0:0, 1-2 3 4:5:6.789},
+  {0-0 30 0:0:0, 10000-0 0 0:0:0},
+  {0-0 0 720:0:0, 10000-0 0 0:0:0},
+  {1-2 3 4:5:6.789, 10000-0 0 0:0:0},
+  {10000-0 0 0:0:0, 10000-0 0 0:0:0}
+]
+==
+[required_features=INTERVAL_TYPE,ANALYTIC_FUNCTIONS]
+[name=analytic_partitionby]
+SELECT value, COUNT(*) OVER(PARTITION BY value)
+FROM Intervals
+ORDER BY value ASC, id ASC
+--
+ARRAY<STRUCT<value INTERVAL, INT64>>[known order:
+  {NULL, 1},
+  {0-0 0 -4:5:6.789, 1},
+  {0-0 0 -0:0:1, 1},
+  {0-0 0 -0:0:0.000001, 1},
+  {0-0 0 0:0:0, 1},
+  {0-0 0 0:0:0.000001, 1},
+  {0-0 0 1:0:0.000001, 1},
+  {0-0 0 1:59:59.999999, 1},
+  {0-0 0 2:0:0, 1},
+  {0-1 0 0:0:0, 3},
+  {0-0 30 0:0:0, 3},
+  {0-0 0 720:0:0, 3},
+  {1-2 3 4:5:6.789, 1},
+  {10000-0 0 0:0:0, 1}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=group_by_multiple_intervals]
+WITH t AS (
+  SELECT * FROM UNNEST(
+    [
+       STRUCT(1 AS n, INTERVAL 29 DAY + INTERVAL 24 HOUR AS i1,
+                      INTERVAL 31 DAY - INTERVAL 24 HOUR AS i2),
+       STRUCT(2 AS n, INTERVAL 28 DAY + INTERVAL 48 HOUR AS i1,
+                      INTERVAL 32 DAY - INTERVAL 48 HOUR AS i2)
+    ]))
+SELECT
+  CAST(i1 AS STRING) IN ('0-0 29 24:0:0', '0-0 28 48:0:0'),
+  CAST(i2 AS STRING) IN ('0-0 31 -24:0:0', '0-0 32 -48:0:0'),
+  ARRAY_AGG(CONCAT(CAST(i1 AS STRING), '/', CAST(i2 AS STRING)))
+FROM t
+GROUP BY i1, i2;
+--
+ARRAY<STRUCT<BOOL, BOOL, ARRAY<>>>[
+  {true,
+   true,
+   ARRAY<STRING>[unknown order:
+     "0-0 28 48:0:0/0-0 32 -48:0:0",
+     "0-0 29 24:0:0/0-0 31 -24:0:0"
+   ]}
+]
+==
+
+[required_features=INTERVAL_TYPE]
+[name=group_by_multiple_intervals_and_non_interval]
+WITH t AS (
+  SELECT * FROM UNNEST(
+    [
+       STRUCT(1 AS x, 10 AS y, INTERVAL 29 DAY + INTERVAL 24 HOUR AS i1,
+                      INTERVAL 31 DAY - INTERVAL 24 HOUR AS i2),
+       STRUCT(2 AS x, 11 AS y, INTERVAL 28 DAY + INTERVAL 48 HOUR AS i1,
+                      INTERVAL 32 DAY - INTERVAL 48 HOUR AS i2),
+       STRUCT(1 AS x, 10 AS y, INTERVAL 29 DAY + INTERVAL 24 HOUR AS i1,
+                      INTERVAL 31 DAY - INTERVAL 24 HOUR AS i2),
+       STRUCT(1 AS x, 11 AS y, INTERVAL 28 DAY + INTERVAL 48 HOUR AS i1,
+                      INTERVAL 32 DAY - INTERVAL 48 HOUR AS i2)
+    ]))
+SELECT
+  CAST(i1 AS STRING) IN ('0-0 29 24:0:0', '0-0 28 48:0:0'),
+  x,
+  CAST(i2 AS STRING) IN ('0-0 31 -24:0:0', '0-0 32 -48:0:0'),
+  ARRAY_AGG(CONCAT(CAST(i1 AS STRING), '/', CAST(i2 AS STRING)))
+FROM t
+GROUP BY i1, x, i2;
+--
+ARRAY<STRUCT<BOOL, x INT64, BOOL, ARRAY<>>>[unknown order:
+  {
+    true,
+    2,
+    true,
+    ARRAY<STRING>["0-0 28 48:0:0/0-0 32 -48:0:0"]
+  },
+  {true,
+   1,
+   true,
+   ARRAY<STRING>[unknown order:
+     "0-0 29 24:0:0/0-0 31 -24:0:0",
+     "0-0 29 24:0:0/0-0 31 -24:0:0",
+     "0-0 28 48:0:0/0-0 32 -48:0:0"
+   ]}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=group_by_interval_nanosecond_precision]
+WITH t AS (
+  SELECT * FROM UNNEST(
+    [
+       STRUCT(1 AS n, INTERVAL '0.123456789' SECOND AS i),
+       STRUCT(2 AS n, INTERVAL '0.123456788' SECOND AS i),
+       STRUCT(3 AS n, INTERVAL '-0.123456789' SECOND AS i),
+       STRUCT(4 AS n, INTERVAL '-0.123456788' SECOND AS i),
+       STRUCT(5 AS n, INTERVAL '0.000000001' SECOND AS i),
+       STRUCT(6 AS n, INTERVAL 0 SECOND AS i),
+       STRUCT(7 AS n, INTERVAL '-0.000000001' SECOND AS i),
+       STRUCT(8 AS n, INTERVAL '-0' SECOND AS i),
+
+       STRUCT(9 AS n, INTERVAL 1 DAY + INTERVAL '0.000000001' SECOND AS i),
+       STRUCT(10 AS n, INTERVAL '86400.000000001' SECOND AS i)
+]))
+SELECT i, ARRAY_AGG(n), ARRAY_AGG(i)
+FROM t
+GROUP BY i;
+--
+ARRAY<STRUCT<i INTERVAL, ARRAY<>, ARRAY<>>>[unknown order:
+  {
+    0-0 0 -0:0:0.123456789,
+    ARRAY<INT64>[3],
+    ARRAY<INTERVAL>[0-0 0 -0:0:0.123456789]
+  },
+  {
+    0-0 0 -0:0:0.123456788,
+    ARRAY<INT64>[4],
+    ARRAY<INTERVAL>[0-0 0 -0:0:0.123456788]
+  },
+  {
+    0-0 0 -0:0:0.000000001,
+    ARRAY<INT64>[7],
+    ARRAY<INTERVAL>[0-0 0 -0:0:0.000000001]
+  },
+  {
+    0-0 0 0:0:0,
+    ARRAY<INT64>[unknown order:8, 6],
+    ARRAY<INTERVAL>[unknown order:0-0 0 0:0:0, 0-0 0 0:0:0]
+  },
+  {
+    0-0 0 0:0:0.000000001,
+    ARRAY<INT64>[5],
+    ARRAY<INTERVAL>[0-0 0 0:0:0.000000001]
+  },
+  {
+    0-0 0 0:0:0.123456788,
+    ARRAY<INT64>[2],
+    ARRAY<INTERVAL>[0-0 0 0:0:0.123456788]
+  },
+  {
+    0-0 0 0:0:0.123456789,
+    ARRAY<INT64>[1],
+    ARRAY<INTERVAL>[0-0 0 0:0:0.123456789]
+  },
+  {0-0 0 24:0:0.000000001,
+   ARRAY<INT64>[unknown order:10, 9],
+   ARRAY<INTERVAL>[unknown order:
+     0-0 0 24:0:0.000000001,
+     0-0 1 0:0:0.000000001
+   ]}
+]
+==
+[required_features=INTERVAL_TYPE,ANALYTIC_FUNCTIONS]
+[name=count_distinct_analytic]
+SELECT
+  COUNT(DISTINCT value) OVER()
+FROM Intervals;
+--
+ARRAY<STRUCT<INT64>>[unknown order:
+  {11},
+  {11},
+  {11},
+  {11},
+  {11},
+  {11},
+  {11},
+  {11},
+  {11},
+  {11},
+  {11},
+  {11},
+  {11},
+  {11}
+]
+==
+[required_features=INTERVAL_TYPE,ANALYTIC_FUNCTIONS]
+[name=sum_distinct_analytic]
+SELECT SUM(DISTINCT value) OVER() FROM Intervals
+WHERE value >= INTERVAL 29 DAY AND value <= Interval 31 DAY
+--
+ARRAY<STRUCT<INTERVAL>>[unknown order:
+  {0-1 0 0:0:0},
+  {0-1 0 0:0:0},
+  {0-1 0 0:0:0}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=array_agg_distinct]
+SELECT JUSTIFY_INTERVAL(i) as justified_i FROM UNNEST(
+  (SELECT ARRAY_AGG(DISTINCT value) AS a FROM Intervals)) AS i ORDER BY i;
+--
+ARRAY<STRUCT<justified_i INTERVAL>>[known order:
+  {NULL},
+  {0-0 0 -4:5:6.789},
+  {0-0 0 -0:0:1},
+  {0-0 0 -0:0:0.000001},
+  {0-0 0 0:0:0},
+  {0-0 0 0:0:0.000001},
+  {0-0 0 1:0:0.000001},
+  {0-0 0 1:59:59.999999},
+  {0-0 0 2:0:0},
+  {0-1 0 0:0:0},
+  {1-2 3 4:5:6.789},
+  {10000-0 0 0:0:0}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=between]
+SELECT value, value BETWEEN INTERVAL 30 DAY AND INTERVAL 40 DAY FROM Intervals;
+--
+ARRAY<STRUCT<value INTERVAL, BOOL>>[unknown order:
+  {0-0 0 0:0:0, false},
+  {0-0 0 -0:0:1, false},
+  {0-0 30 0:0:0, true},
+  {10000-0 0 0:0:0, false},
+  {0-0 0 2:0:0, false},
+  {0-0 0 1:0:0.000001, false},
+  {0-0 0 -4:5:6.789, false},
+  {NULL, NULL},
+  {0-0 0 0:0:0.000001, false},
+  {0-1 0 0:0:0, true},
+  {0-0 0 720:0:0, true},
+  {1-2 3 4:5:6.789, false},
+  {0-0 0 1:59:59.999999, false},
+  {0-0 0 -0:0:0.000001, false}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=justify_interval]
+SELECT JUSTIFY_INTERVAL(i) AS justified_interval,
+  EXTRACT(YEAR FROM JUSTIFY_INTERVAL(i)) AS year,
+  EXTRACT(MONTH FROM JUSTIFY_INTERVAL(i)) AS month,
+  EXTRACT(DAY FROM JUSTIFY_INTERVAL(i)) AS day,
+  EXTRACT(HOUR FROM JUSTIFY_INTERVAL(i)) AS hour,
+  EXTRACT(MINUTE FROM JUSTIFY_INTERVAL(i)) AS minute,
+  EXTRACT(SECOND FROM JUSTIFY_INTERVAL(i)) AS second,
+  EXTRACT(MILLISECOND FROM JUSTIFY_INTERVAL(i)) AS milli,
+  EXTRACT(MICROSECOND FROM JUSTIFY_INTERVAL(i)) AS micro
+FROM UNNEST([INTERVAL '1-2 3 4:5:6.789' YEAR TO SECOND,
+          INTERVAL '1-2 35 4:5:6.789' YEAR TO SECOND,
+          INTERVAL '1-2 -35 4:5:6.789' YEAR TO SECOND,
+          INTERVAL '1-2 12 40:5:6.789' YEAR TO SECOND,
+          INTERVAL '1-2 -12 -40:5:6.789' YEAR TO SECOND,
+          INTERVAL '1-2 48 75:7:4.657' YEAR TO SECOND,
+          INTERVAL '1-2 -48 -75:7:4.657' YEAR TO SECOND]) AS i;
+--
+ARRAY<STRUCT<
+        justified_interval INTERVAL,
+        year INT64,
+        month INT64,
+        day INT64,
+        hour INT64,
+        minute INT64,
+        second INT64,
+        milli INT64,
+        micro INT64
+      >>
+[unknown order:
+  {1-3 5 4:5:6.789, 1, 3, 5, 4, 5, 6, 789, 789000},
+  {1-2 13 16:5:6.789, 1, 2, 13, 16, 5, 6, 789, 789000},
+  {1-3 21 3:7:4.657, 1, 3, 21, 3, 7, 4, 657, 657000},
+  {1-2 3 4:5:6.789, 1, 2, 3, 4, 5, 6, 789, 789000},
+  {1-0 25 4:5:6.789, 1, 0, 25, 4, 5, 6, 789, 789000},
+  {1-1 16 7:54:53.211, 1, 1, 16, 7, 54, 53, 211, 211000},
+  {1-0 8 20:52:55.343, 1, 0, 8, 20, 52, 55, 343, 343000}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=justify_days]
+SELECT JUSTIFY_DAYS(i) AS justified_days,
+  EXTRACT(YEAR FROM JUSTIFY_DAYS(i)) AS year,
+  EXTRACT(MONTH FROM JUSTIFY_DAYS(i)) AS month,
+  EXTRACT(DAY FROM JUSTIFY_DAYS(i)) AS day,
+  EXTRACT(HOUR FROM JUSTIFY_DAYS(i)) AS hour,
+  EXTRACT(MINUTE FROM JUSTIFY_DAYS(i)) AS minute,
+  EXTRACT(SECOND FROM JUSTIFY_DAYS(i)) AS second,
+  EXTRACT(MILLISECOND FROM JUSTIFY_DAYS(i)) AS milli,
+  EXTRACT(MICROSECOND FROM JUSTIFY_DAYS(i)) AS micro
+FROM UNNEST([INTERVAL '1-2 3 4:5:6.789' YEAR TO SECOND,
+          INTERVAL '1-2 35 48:5:6.789' YEAR TO SECOND,
+          INTERVAL '1-2 -35 -48:5:6.789' YEAR TO SECOND]) AS i;
+--
+ARRAY<STRUCT<
+        justified_days INTERVAL,
+        year INT64,
+        month INT64,
+        day INT64,
+        hour INT64,
+        minute INT64,
+        second INT64,
+        milli INT64,
+        micro INT64
+      >>
+[unknown order:
+  {1-3 5 48:5:6.789, 1, 3, 5, 48, 5, 6, 789, 789000},
+  {1-2 3 4:5:6.789, 1, 2, 3, 4, 5, 6, 789, 789000},
+  {1-0 25 -48:5:6.789, 1, 0, 25, -48, -5, -6, -789, -789000}
+]
+==
+[required_features=INTERVAL_TYPE]
+[name=justify_hours]
+SELECT JUSTIFY_HOURS(i) AS justified_hours,
+  EXTRACT(YEAR FROM JUSTIFY_HOURS(i)) AS year,
+  EXTRACT(MONTH FROM JUSTIFY_HOURS(i)) AS month,
+  EXTRACT(DAY FROM JUSTIFY_HOURS(i)) AS day,
+  EXTRACT(HOUR FROM JUSTIFY_HOURS(i)) AS hour,
+  EXTRACT(MINUTE FROM JUSTIFY_HOURS(i)) AS minute,
+  EXTRACT(SECOND FROM JUSTIFY_HOURS(i)) AS second,
+  EXTRACT(MILLISECOND FROM JUSTIFY_HOURS(i)) AS milli,
+  EXTRACT(MICROSECOND FROM JUSTIFY_HOURS(i)) AS micro
+FROM UNNEST([INTERVAL '1-2 3 4:5:6.789' YEAR TO SECOND,
+          INTERVAL '1-2 35 49:5:6.789' YEAR TO SECOND,
+          INTERVAL '1-2 -35 -49:5:6.789' YEAR TO SECOND]) AS i;
+--
+ARRAY<STRUCT<
+        justified_hours INTERVAL,
+        year INT64,
+        month INT64,
+        day INT64,
+        hour INT64,
+        minute INT64,
+        second INT64,
+        milli INT64,
+        micro INT64
+      >>
+[unknown order:
+  {1-2 37 1:5:6.789, 1, 2, 37, 1, 5, 6, 789, 789000},
+  {1-2 3 4:5:6.789, 1, 2, 3, 4, 5, 6, 789, 789000},
+  {1-2 -37 -1:5:6.789, 1, 2, -37, -1, -5, -6, -789, -789000}
+]
+==
+
+[required_features=INTERVAL_TYPE,ANALYSIS_CONSTANT_INTERVAL_CONSTRUCTOR]
+[name=constant1]
+SELECT INTERVAL INTERVAL_STRING_YTS YEAR TO SECOND;
+--
+ARRAY<STRUCT<INTERVAL>>[{1-2 3 4:5:6.789}]
+==
+
+[required_features=INTERVAL_TYPE,ANALYSIS_CONSTANT_INTERVAL_CONSTRUCTOR]
+[name=constant2]
+SELECT INTERVAL INTERVAL_STRING_YTM YEAR TO MONTH;
+--
+ARRAY<STRUCT<INTERVAL>>[{1-2 0 0:0:0}]
+==
+
+[required_features=INTERVAL_TYPE,ANALYSIS_CONSTANT_INTERVAL_CONSTRUCTOR]
+[name=constant3]
+SELECT INTERVAL YEAR_STRING YEAR;
+--
+ARRAY<STRUCT<INTERVAL>>[{100-0 0 0:0:0}]

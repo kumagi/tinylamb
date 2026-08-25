@@ -1106,17 +1106,17 @@ TEST(ExpressionTest, FunctionCallSubstr) {
                                  ConstantValueExp(Value("x"))})
           ->Evaluate(row, schema),
       std::runtime_error);
-  // A non-positive length yields the empty string instead of wrapping the
-  // negative length around to a size_t near SIZE_MAX.
+  // A negative length throws an error per GoogleSQL semantics.
   Expression substr_negative_length = FunctionCallExp(
       "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(1)),
                  ConstantValueExp(Value(-1))});
-  EXPECT_EQ(substr_negative_length->Evaluate(row, schema),
-            Value(std::string()));
+  EXPECT_THROW(substr_negative_length->Evaluate(row, schema),
+               std::runtime_error);
   Expression substr_zero_length = FunctionCallExp(
       "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(2)),
                  ConstantValueExp(Value(0))});
   EXPECT_EQ(substr_zero_length->Evaluate(row, schema), Value(std::string()));
+
   // Start positions before the string are clamped to its beginning.
   Expression substr_start_zero = FunctionCallExp(
       "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(0))});

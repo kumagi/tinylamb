@@ -39,6 +39,7 @@ void UpdateZoneMapFrom(const ColumnVector& column, size_t index,
     case ValueType::kVarChar:
       zone_map->AddString(column.StringData()[index]);
       break;
+    case ValueType::kArray:
     case ValueType::kNull:
       break;
   }
@@ -72,6 +73,9 @@ void ColumnVector::Append(const Value& value) {
       case ValueType::kVarChar:
         strings_.emplace_back(value.value.varchar_value);
         break;
+      case ValueType::kArray:
+        nested_.push_back(value);
+        break;
       case ValueType::kNull:
         break;
     }
@@ -102,6 +106,9 @@ void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
       case ValueType::kVarChar:
         strings_.emplace_back(source.strings_[index]);
         break;
+      case ValueType::kArray:
+        nested_.push_back(source.nested_[index]);
+        break;
       case ValueType::kNull:
         break;
     }
@@ -115,6 +122,7 @@ void ColumnVector::Reset() {
   integers_.clear();
   doubles_.clear();
   strings_.clear();
+  nested_.clear();
 }
 
 void ColumnVector::Reserve(size_t capacity) {
@@ -129,6 +137,9 @@ void ColumnVector::Reserve(size_t capacity) {
       break;
     case ValueType::kVarChar:
       strings_.reserve(capacity);
+      break;
+    case ValueType::kArray:
+      nested_.reserve(capacity);
       break;
     case ValueType::kNull:
       break;
@@ -164,6 +175,9 @@ void ColumnVector::AppendDefault() {
     case ValueType::kVarChar:
       strings_.emplace_back();
       break;
+    case ValueType::kArray:
+      nested_.emplace_back();
+      break;
     case ValueType::kNull:
       break;
   }
@@ -180,6 +194,9 @@ void ColumnVector::MaterializeInferredStorage() {
       break;
     case ValueType::kVarChar:
       strings_.resize(size_);
+      break;
+    case ValueType::kArray:
+      nested_.resize(size_);
       break;
     case ValueType::kNull:
       break;
@@ -199,6 +216,8 @@ Value ColumnVector::ValueAt(size_t index) const {
       return Value(doubles_[index]);
     case ValueType::kVarChar:
       return Value(std::string(strings_[index]));
+    case ValueType::kArray:
+      return nested_[index];
     case ValueType::kNull:
       return {};
   }

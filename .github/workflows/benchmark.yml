@@ -1,0 +1,72 @@
+name: benchmark
+on:
+  workflow_dispatch:
+  schedule:
+    # Every Monday 03:00 UTC (weekly)
+    - cron: '0 3 * * 1'
+
+jobs:
+  tpch-sf1:
+    # P3-1 benchmark regression gate. SF=1 fixed; compares the query-time sum
+    # against the newest section of BenchmarkHistory.md via scripts/bench_gate.py.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang
+
+      - name: Build TPC-H driver (Release)
+        run: |
+          cmake -S . -B build-rel \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DTINYLAMB_ENABLE_GOOGLESQL=OFF
+          cmake --build build-rel --target tinylamb_tpch_benchmark -j"$(nproc)"
+
+      - name: Run TPC-H SF=1 (load + Q1-Q22)
+        working-directory: build-rel
+        run: |
+          ./tinylamb_tpch_benchmark ./tpch-run/sf1 \
+            --scale-factor 1 --force | tee tpch-sf1.log
+
+      - name: Convert TPCH_PROFILE output to TSV
+        working-directory: build-rel
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          total_ms = 0.0
+          rows = []
+          for line in open("tpch-sf1.log", encoding="utf-8"):
+              m = re.match(r"TPCH_PROFILE Q(\d+) ([0-9.]+) ms", line)
+              if m:
+                  q, ms = int(m.group(1)), float(m.group(2))
+                  total_ms += ms
+                  rows.append((q, ms))
+          if not rows:
+              sys.exit("no TPCH_PROFILE lines found; benchmark did not run")
+          with open("results.tsv", "w", encoding="utf-8") as out:
+              for q, ms in sorted(rows):
+                  out.write(f"q{q}_ms\t{ms}\n")
+              out.write(f"query_sum_q1_q22\t{total_ms / 1000.0}\n")
+          print(open("results.tsv").read())
+          EOF
+
+      - name: Regression gate (fail on >10% slowdown vs BenchmarkHistory.md)
+        run: |
+          python3 scripts/bench_gate.py \
+            --history BenchmarkHistory.md \
+            --results build-rel/results.tsv \
+            --threshold-pct 10
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tpch-sf1-results
+          path: |
+            build-rel/tpch-sf1.log
+            build-rel/results.tsv

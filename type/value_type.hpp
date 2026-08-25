@@ -27,6 +27,7 @@ enum class ValueType : uint8_t {
   kVarChar,
   kDouble,
   kDate,
+  kArray,
 };
 
 inline std::string_view ValueTypeToString(ValueType type) {
@@ -41,6 +42,8 @@ inline std::string_view ValueTypeToString(ValueType type) {
       return "Double";
     case ValueType::kDate:
       return "Date";
+    case ValueType::kArray:
+      return "Array";
   }
   return "unknown value type";
 }

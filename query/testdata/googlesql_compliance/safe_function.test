@@ -1,0 +1,495 @@
+# This file has tests for SAFE function calls, with one of each call type.
+# This tests the mechanism of SAFE function calls.  Error-handling for
+# individual functions are tested separately, mostly in code-based tests.
+
+[default required_features=SAFE_FUNCTION_CALL]
+
+[prepare_database]
+CREATE TABLE input AS
+\-- Summing `value` will overflow if we add three of them together.
+select offset, key, cast(pow(2,63)/2.5 as int64) as value
+from unnest([1,1,2,2,2,3,3,3,3,4]) key with offset
+--
+ARRAY<STRUCT<offset INT64, key INT64, value INT64>>[
+  {1, 1, 3689348814741910528},
+  {3, 2, 3689348814741910528},
+  {5, 3, 3689348814741910528},
+  {7, 3, 3689348814741910528},
+  {9, 4, 3689348814741910528},
+  {0, 1, 3689348814741910528},
+  {2, 2, 3689348814741910528},
+  {4, 2, 3689348814741910528},
+  {6, 3, 3689348814741910528},
+  {8, 3, 3689348814741910528}
+]
+==
+
+[name=safe_scalar_func]
+select value, safe.parse_date("%Y-%m-%d", value),
+              safe.parse_date("%Y-%m-%d", value) IS NULL
+from unnest(["2003-02-04", "", "xxx", "2004-05-06"]) value
+--
+ARRAY<STRUCT<value STRING, DATE, BOOL>>[unknown order:
+  {"", NULL, true},
+  {"2004-05-06", 2004-05-06, false},
+  {"2003-02-04", 2003-02-04, false},
+  {"xxx", NULL, true}
+]
+==
+
+[name=safe_agg_func_group_by]
+select key, count(*), safe.sum(value)
+from input
+group by key
+--
+ARRAY<STRUCT<key INT64, INT64, INT64>>[unknown order:
+  {1, 2, 7378697629483821056},
+  {2, 3, NULL},
+  {3, 4, NULL},
+  {4, 1, 3689348814741910528}
+]
+==
+
+[name=safe_sum_double_overflow]
+select safe.sum(value)
+from (SELECT 1.7e+308 AS value UNION ALL SELECT 1.7e+308)
+--
+ARRAY<STRUCT<DOUBLE>>[{NULL}]
+==
+
+[name=safe_agg_func_no_group_by]
+select safe.sum(value)
+from input
+--
+ARRAY<STRUCT<INT64>>[{NULL}]
+==
+
+[name=safe_analytic_agg_func]
+[required_features=ANALYTIC_FUNCTIONS,SAFE_FUNCTION_CALL]
+select key, offset,
+       safe.sum(value) over (partition by key order by offset),
+       safe.sum(value) over (partition by key order by offset) IS NULL
+from input
+order by key, offset
+--
+ARRAY<STRUCT<key INT64, offset INT64, INT64, BOOL>>[known order:
+  {1, 0, 3689348814741910528, false},
+  {1, 1, 7378697629483821056, false},
+  {2, 2, 3689348814741910528, false},
+  {2, 3, 7378697629483821056, false},
+  {2, 4, NULL, true},
+  {3, 5, 3689348814741910528, false},
+  {3, 6, 7378697629483821056, false},
+  {3, 7, NULL, true},
+  {3, 8, NULL, true},
+  {4, 9, 3689348814741910528, false}
+]
+==
+
+# We don't actually have any non-aggregate analytic functions that can return
+# runtime errors (other than case like the one below for NTILE where we
+# validate a constant argument).
+# We'll still test that SAFE makes it through without failing.
+[name=safe_analytic_non_agg_func]
+[required_features=ANALYTIC_FUNCTIONS,SAFE_FUNCTION_CALL]
+select key, offset, safe.rank() over (partition by key order by offset)
+from input
+order by key, offset
+--
+ARRAY<STRUCT<key INT64, offset INT64, INT64>>[known order:
+  {1, 0, 1},
+  {1, 1, 2},
+  {2, 2, 1},
+  {2, 3, 2},
+  {2, 4, 3},
+  {3, 5, 1},
+  {3, 6, 2},
+  {3, 7, 3},
+  {3, 8, 4},
+  {4, 9, 1}
+]
+==
+
+[name=safe_analytic_non_agg_func_ntile_no_error]
+[required_features=ANALYTIC_FUNCTIONS,SAFE_FUNCTION_CALL]
+[parameters=2 as buckets]
+select key, offset,
+       safe.ntile(@buckets) over (partition by key order by offset)
+from input
+order by key, offset
+--
+ARRAY<STRUCT<key INT64, offset INT64, INT64>>[known order:
+  {1, 0, 1},
+  {1, 1, 2},
+  {2, 2, 1},
+  {2, 3, 1},
+  {2, 4, 2},
+  {3, 5, 1},
+  {3, 6, 1},
+  {3, 7, 2},
+  {3, 8, 2},
+  {4, 9, 1}
+]
+==
+
+# This shows the case of an error in the constant argument for NTILE, which
+# can happen at execution time for parameters only.  We aren't converting the
+# error for these cases.
+[name=safe_analytic_non_agg_func_ntile]
+[required_features=ANALYTIC_FUNCTIONS,SAFE_FUNCTION_CALL]
+[parameters=-1 as minus1]
+select key, offset,
+       safe.ntile(@minus1) over (partition by key order by offset)
+from input
+order by key, offset
+--
+ERROR: generic::out_of_range: The N value (number of buckets) for the NTILE function must be positive
+==
+
+[name=safe_analytic_non_agg_func_ntile2]
+[required_features=ANALYTIC_FUNCTIONS,SAFE_FUNCTION_CALL]
+[parameters=null as null_param]
+select key, offset,
+       safe.ntile(@null_param) over (partition by key order by offset)
+from input
+order by key, offset
+--
+ERROR: generic::out_of_range: The N value (number of buckets) for the NTILE function must not be NULL
+==
+
+[name=safe_concat]
+SELECT SAFE.CONCAT('a', 'b');
+--
+ARRAY<STRUCT<STRING>>[{"ab"}]
+==
+
+[name=safe_scalar_arg_error]
+select safe.concat(cast(1 / (offset - offset) as string))
+from input
+--
+ERROR: generic::out_of_range: division by zero: 1 / 0
+==
+
+[name=safe_agg_arg_error]
+select safe.sum(1 / (offset - offset))
+from input
+--
+ERROR: generic::out_of_range: division by zero: 1 / 0
+==
+
+[name=safe_ascii]
+select safe.ascii("\xFF");
+--
+ARRAY<STRUCT<INT64>>[{NULL}]
+==
+
+[name=safe_regexp_contains]
+select safe.regexp_contains("abc", "(");
+--
+ARRAY<STRUCT<BOOL>>[{NULL}]
+==
+
+[name=safe_regexp_instr]
+select safe.regexp_instr("abc", "(a)(b)");
+--
+ARRAY<STRUCT<INT64>>[{NULL}]
+==
+
+[name=safe_left]
+select safe.left("apple", -1);
+--
+ARRAY<STRUCT<STRING>>[{NULL}]
+==
+
+[name=safe_right]
+select safe.right("apple", -1);
+--
+ARRAY<STRUCT<STRING>>[{NULL}]
+==
+
+[required_features=ADDITIONAL_STRING_FUNCTIONS,SAFE_FUNCTION_CALL]
+[name=safe_translate]
+select safe.translate("apple", "aa", "bc");
+--
+ARRAY<STRUCT<STRING>>[{NULL}]
+==
+
+[required_features=ADDITIONAL_STRING_FUNCTIONS,SAFE_FUNCTION_CALL]
+[name=safe_instr]
+select safe.instr("apple", "pl", 0, 1);
+--
+ARRAY<STRUCT<INT64>>[{NULL}]
+==
+
+[name=safe_analytic_arg_error]
+[required_features=ANALYTIC_FUNCTIONS,SAFE_FUNCTION_CALL]
+select
+     safe.sum(value / (offset-offset)) over (partition by key order by offset)
+from input
+--
+ERROR: generic::out_of_range: division by zero: 3.68935e+18 / 0
+==
+
+[name=safe_parse_numeric]
+[required_features=NUMERIC_TYPE,SAFE_FUNCTION_CALL]
+SELECT safe.parse_numeric(' - 1 2.34 '), safe.parse_numeric('1e100'), safe.parse_numeric('abc');
+--
+ARRAY<STRUCT<NUMERIC, NUMERIC, NUMERIC>>[{NULL, NULL, NULL}]
+==
+
+[name=safe_parse_bignumeric]
+[required_features=BIGNUMERIC_TYPE,SAFE_FUNCTION_CALL]
+SELECT safe.parse_bignumeric(' - 1 2.34 '), safe.parse_bignumeric('1e100'), safe.parse_bignumeric('abc');
+--
+ARRAY<STRUCT<BIGNUMERIC, BIGNUMERIC, BIGNUMERIC>>[{NULL, NULL, NULL}]
+==
+
+[name=json_safe_string_resolve_to_null]
+[required_features=JSON_TYPE,JSON_VALUE_EXTRACTION_FUNCTIONS,SAFE_FUNCTION_CALL]
+SELECT safe.string(JSON '4325');
+--
+ARRAY<STRUCT<STRING>>[{NULL}]
+==
+
+[name=json_safe_string]
+[required_features=JSON_TYPE,JSON_VALUE_EXTRACTION_FUNCTIONS,SAFE_FUNCTION_CALL]
+SELECT safe.string(JSON '"json_string"');
+--
+ARRAY<STRUCT<STRING>>[{"json_string"}]
+==
+
+[name=json_safe_bool_resolve_to_null]
+[required_features=JSON_TYPE,JSON_VALUE_EXTRACTION_FUNCTIONS,SAFE_FUNCTION_CALL]
+SELECT safe.bool(JSON '4326');
+--
+ARRAY<STRUCT<BOOL>>[{NULL}]
+==
+
+[name=json_safe_bool]
+[required_features=JSON_TYPE,JSON_VALUE_EXTRACTION_FUNCTIONS,SAFE_FUNCTION_CALL]
+SELECT safe.bool(JSON 'true');
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[name=json_int64_resolve_to_null]
+[required_features=JSON_TYPE,JSON_VALUE_EXTRACTION_FUNCTIONS,SAFE_FUNCTION_CALL]
+SELECT safe.int64(JSON '"not_a_number"');
+--
+ARRAY<STRUCT<INT64>>[{NULL}]
+==
+
+[name=json_safe_int64]
+[required_features=JSON_TYPE,JSON_VALUE_EXTRACTION_FUNCTIONS,SAFE_FUNCTION_CALL]
+SELECT safe.int64(JSON '133');
+--
+ARRAY<STRUCT<INT64>>[{133}]
+==
+
+[name=json_safe_double_fail_resolve_to_null]
+[required_features=JSON_TYPE,NAMED_ARGUMENTS,JSON_VALUE_EXTRACTION_FUNCTIONS,SAFE_FUNCTION_CALL]
+SELECT safe.double(JSON '18446744073709551615', wide_number_mode=>'exact');
+--
+ARRAY<STRUCT<DOUBLE>>[{NULL}]
+==
+[name=json_safe_double]
+[required_features=JSON_TYPE,JSON_VALUE_EXTRACTION_FUNCTIONS,SAFE_FUNCTION_CALL]
+SELECT safe.double(JSON '-1.1');
+--
+ARRAY<STRUCT<DOUBLE>>[{-1.1}]
+
+==
+[name=csc_safe_zero_resolve_to_null]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT safe.csc(0);
+--
+ARRAY<STRUCT<DOUBLE>>[{NULL}]
+==
+[name=csc_safe_double]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT safe.csc(1);
+--
+ARRAY<STRUCT<DOUBLE>>[{1.1883951057781212}]
+
+==
+[name=sec_safe_double]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT safe.sec(0);
+--
+ARRAY<STRUCT<DOUBLE>>[{1}]
+
+==
+[name=cot_safe_zero_resolve_to_null]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT safe.cot(0);
+--
+ARRAY<STRUCT<DOUBLE>>[{NULL}]
+
+==
+[name=cot_safe_double]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT safe.cot(1);
+--
+ARRAY<STRUCT<DOUBLE>>[{0.64209261593433065}]
+
+==
+[name=csch_safe_zero_resolve_to_null]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT safe.csch(0);
+--
+ARRAY<STRUCT<DOUBLE>>[{NULL}]
+
+==
+[name=csch_safe_double]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT safe.csch(1);
+--
+ARRAY<STRUCT<DOUBLE>>[{0.85091812823932156}]
+
+==
+[name=sech_safe_double]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT safe.sech(0);
+--
+ARRAY<STRUCT<DOUBLE>>[{1}]
+
+==
+[name=coth_safe_zero_resolve_to_null]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT safe.coth(0);
+--
+ARRAY<STRUCT<DOUBLE>>[{NULL}]
+
+==
+[name=coth_safe_double]
+[required_features=SAFE_FUNCTION_CALL]
+SELECT safe.coth(1);
+--
+ARRAY<STRUCT<DOUBLE>>[{1.3130352854993315}]
+==
+
+[name=safe_array_transform_with_no_errors]
+[required_features=INLINE_LAMBDA_ARGUMENT,SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_TRANSFORM([-1, 0, 10], e -> e*2)
+--
+ARRAY<STRUCT<ARRAY<>>>[{ARRAY<INT64>[known order:-2, 0, 20]}]
+==
+
+[name=safe_array_filter_with_no_errors]
+[required_features=INLINE_LAMBDA_ARGUMENT,SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_FILTER([-1, 0, 10], e -> e > 0)
+--
+ARRAY<STRUCT<ARRAY<>>>[{ARRAY<INT64>[10]}]
+==
+
+[name=safe_array_includes_with_no_errors]
+[required_features=SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_INCLUDES([-1, 0, 10], 0)
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[name=safe_array_includes_lambda_with_no_errors]
+[required_features=INLINE_LAMBDA_ARGUMENT,SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_INCLUDES([-1, 0, 10], e -> e > 0)
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[name=safe_array_includes_all_with_no_errors]
+[required_features=SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_INCLUDES_ALL([-1, 0, 10], [1, 0])
+--
+ARRAY<STRUCT<BOOL>>[{false}]
+==
+
+[name=safe_array_includes_any_with_no_errors]
+[required_features=SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_INCLUDES_ANY([-1, 0, 10], [1, 0])
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[name=safe_array_filter_transform_with_errors]
+[required_features=INLINE_LAMBDA_ARGUMENT,SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_TRANSFORM([-1, 0, 10], e -> 1/e)
+--
+ARRAY<STRUCT<ARRAY<>>>[{ARRAY<DOUBLE>(NULL)}]
+==
+
+[name=safe_array_filter_with_errors]
+[required_features=INLINE_LAMBDA_ARGUMENT,SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_FILTER([-1, 0, 10], e -> 1/e > 0)
+--
+ARRAY<STRUCT<ARRAY<>>>[{ARRAY<INT64>(NULL)}]
+==
+
+[name=safe_array_includes_lambda_with_errors]
+[required_features=INLINE_LAMBDA_ARGUMENT,SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_INCLUDES([-1, 0, 10], e -> 1/e > 0)
+--
+ARRAY<STRUCT<BOOL>>[{NULL}]
+==
+
+[name=safe_array_transform_does_not_catch_arg_errors]
+[required_features=INLINE_LAMBDA_ARGUMENT,SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_TRANSFORM([-1, 1/0, 10], e -> e*2)
+--
+ERROR: generic::out_of_range: division by zero: 1 / 0
+==
+
+[name=safe_array_filter_does_not_catch_arg_errors]
+[required_features=INLINE_LAMBDA_ARGUMENT,SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_FILTER([-1, 1/0, 10], e -> e > 0)
+--
+ERROR: generic::out_of_range: division by zero: 1 / 0
+==
+
+[name=safe_array_includes_does_not_catch_arg_errors]
+[required_features=SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_INCLUDES([-1, 1/0, 10], 0)
+--
+ERROR: generic::out_of_range: division by zero: 1 / 0
+==
+
+[name=safe_array_includes_lambda_does_not_catch_arg_errors]
+[required_features=INLINE_LAMBDA_ARGUMENT,SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_INCLUDES([-1, 1/0, 10], e -> e > 0)
+--
+ERROR: generic::out_of_range: division by zero: 1 / 0
+==
+
+[name=safe_array_includes_all_does_not_catch_arg_errors]
+[required_features=SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_INCLUDES_ALL([-1, 1/0, 10], [1.0, 0])
+--
+ERROR: generic::out_of_range: division by zero: 1 / 0
+==
+
+[name=safe_array_includes_any_does_not_catch_arg_errors]
+[required_features=SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_INCLUDES_ANY([-1, 1/0, 10], [1.0, 0])
+--
+ERROR: generic::out_of_range: division by zero: 1 / 0
+==
+
+[name=safe_array_filter_transform_with_error_absorbed_in_lambda]
+[required_features=INLINE_LAMBDA_ARGUMENT,SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_TRANSFORM([-1, 0, 10], e -> SAFE_DIVIDE(1, e))
+--
+ARRAY<STRUCT<ARRAY<>>>[{ARRAY<DOUBLE>[known order:-1, NULL, 0.1]}]
+==
+
+[name=safe_array_filter_with_error_absorbed_in_lambda]
+[required_features=INLINE_LAMBDA_ARGUMENT,SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_FILTER([-1, 0, 10], e -> SAFE_DIVIDE(1, e) > 0)
+--
+ARRAY<STRUCT<ARRAY<>>>[{ARRAY<INT64>[10]}]
+==
+
+[name=safe_array_includes_lambda_with_error_absorbed_in_lambda]
+[required_features=INLINE_LAMBDA_ARGUMENT,SAFE_FUNCTION_CALL,SAFE_FUNCTION_CALL_WITH_LAMBDA_ARGS]
+SELECT SAFE.ARRAY_INCLUDES([-1, 0, 10], e -> SAFE_DIVIDE(1, e) > 0)
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+

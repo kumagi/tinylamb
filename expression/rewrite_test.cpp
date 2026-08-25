@@ -3,9 +3,11 @@
 
 #include "common/constants.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/rewrite.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
@@ -861,6 +863,36 @@ TEST(ExpressionRewriteTest, ComplementaryAbsorptionDisabled) {
       BinaryExpressionExp(UnaryExpressionExp(y, UnaryOperation::kNot),
                           BinaryOperation::kOr, ColumnValueExp("z")));
   EXPECT_EQ(rewrite(unrelated)->Type(), TypeTag::kBinaryExp);
+}
+
+TEST(ExpressionRewriteTest, CollapseNestedIdenticalCast) {
+  Expression nested = CastExpressionExp(
+      CastExpressionExp(ColumnValueExp("x"), "INT64"), "INT64");
+  Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(nested);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kCastExp);
+  EXPECT_EQ(rewritten->AsCastExpression().Child()->Type(),
+            TypeTag::kColumnValue);
+}
+
+TEST(ExpressionRewriteTest, FactorCommonAndFromOr) {
+  Expression x = ColumnValueExp("x");
+  Expression y = ColumnValueExp("y");
+  Expression z = ColumnValueExp("z");
+  Expression expression = BinaryExpressionExp(
+      BinaryExpressionExp(x, BinaryOperation::kAnd, y), BinaryOperation::kOr,
+      BinaryExpressionExp(x, BinaryOperation::kAnd, z));
+  Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kAnd);
+}
+
+TEST(ExpressionRewriteTest, ExpressionChildrenRewritesCast) {
+  Expression cast = CastExpressionExp(ColumnValueExp("x"), "INT64");
+  std::vector<Expression> children = ExpressionChildren(cast);
+  ASSERT_EQ(children.size(), 1);
+  EXPECT_EQ(WithExpressionChildren(cast, children)->Type(), TypeTag::kCastExp);
 }
 
 }  // namespace tinylamb

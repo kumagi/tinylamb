@@ -60,6 +60,7 @@ class ColumnVector {
   std::vector<int64_t> integers_;
   std::vector<double> doubles_;
   std::vector<std::string> strings_;
+  std::vector<Value> nested_;
 };
 
 // A fixed-schema, column-oriented batch. Row positions travel with the batch

@@ -25,9 +25,11 @@
 #include <utility>
 
 #include "common/constants.hpp"
+#include "expression/array_expression.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/function_call_expression.hpp"
@@ -84,10 +86,19 @@ const IntervalExpression& ExpressionBase::AsIntervalExpression() const {
   return dynamic_cast<const IntervalExpression&>(*this);
 }
 
+const ArrayExpression& ExpressionBase::AsArrayExpression() const {
+  return dynamic_cast<const ArrayExpression&>(*this);
+}
+
+const CastExpression& ExpressionBase::AsCastExpression() const {
+  return dynamic_cast<const CastExpression&>(*this);
+}
+
 std::unordered_set<ColumnName> ExpressionBase::TouchedColumns() const {
   std::unordered_set<ColumnName> result;
   return result;
 }
+
 
 Expression ColumnValueExp(const ColumnName& col_name) {
   return std::make_shared<ColumnValue>(col_name);
@@ -139,8 +150,24 @@ Expression QueryExpressionExp(std::shared_ptr<SelectStatement> query,
                                            exists, negated);
 }
 
-Expression IntervalExpressionExp(int64_t amount, std::string unit) {
-  return std::make_shared<IntervalExpression>(amount, std::move(unit));
+Expression IntervalExpressionExp(int64_t amount, std::string unit,
+                                std::string raw_amount) {
+  return std::make_shared<IntervalExpression>(amount, std::move(unit),
+                                              std::move(raw_amount));
+}
+
+Expression ArrayExpressionExp(std::vector<Expression> elements,
+                              std::string element_sql_type) {
+  return std::make_shared<ArrayExpression>(std::move(elements),
+                                           std::move(element_sql_type));
+}
+
+Expression CastExpressionExp(Expression child, std::string target_type_name,
+                             bool return_null_on_error) {
+  return std::make_shared<CastExpression>(std::move(child),
+                                          std::move(target_type_name),
+                                          return_null_on_error);
 }
 
 }  // namespace tinylamb
+

@@ -1,0 +1,460 @@
+[default required_features=JSON_TYPE,CAST_TO_JSON_TYPE]
+
+[load_proto_files=googlesql/testdata/test_schema.proto,googlesql/testdata/test_proto3.proto,google/protobuf/duration.proto,google/protobuf/timestamp.proto]
+[load_proto_names=googlesql_test.NullableDate,googlesql_test.NullableInt,googlesql_test.NullableEnum,googlesql_test.PackedRepeatablePB,googlesql_test.TestAbPB,googlesql_test.KitchenSinkPB,googlesql_test.Proto3KitchenSink,googlesql_test.MessageWithMapField,google.protobuf.Duration,google.protobuf.Timestamp,google.protobuf.DoubleValue,google.protobuf.FloatValue,google.protobuf.Int64Value,google.protobuf.UInt64Value,google.protobuf.Int32Value,google.protobuf.UInt32Value,google.protobuf.BoolValue,google.protobuf.StringValue,google.protobuf.BytesValue]
+[prepare_database]
+CREATE TABLE TableAllTypes AS
+SELECT CAST(1 AS int64) as row_id,
+       CAST(true AS bool) as bool_val,
+       CAST(-1 AS int32) as int32_val,
+       CAST(-2 AS int64) as int64_val,
+       CAST(1 AS uint32) as uint32_val,
+       CAST(2 AS uint64) as uint64_val,
+       CAST(0.1 AS float) as float_val,
+       CAST(0.5 AS double) as double_val,
+       CAST("1" AS string) as str_val,
+       CAST("1" AS BYTES) as bytes_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       TIMESTAMP '2014-01-01 00:00:01 UTC' as timestamp_val,
+       cast(null as `googlesql_test.TestEnum`) as enum_val,
+       cast(struct(2, 4) as struct<a int64, b int64>) as struct_val,
+       NEW googlesql_test.KitchenSinkPB(5 AS int64_key_1,
+                                        7 AS int64_key_2) as proto_val UNION ALL
+SELECT 2, false, CAST(1 AS int32), CAST(2 AS int64), CAST(0 AS uint32),
+       CAST(200 AS uint64), CAST(-0.1 AS float), CAST(-0.2 AS double),
+       "A", CAST("124" AS BYTES), CAST('2015-07-01' AS DATE),
+       TIMESTAMP '2015-04-01 00:00:01 UTC',
+       1, struct(4, 5),
+       NEW googlesql_test.KitchenSinkPB(8 AS int64_key_1,
+                                        9 AS int64_key_2)
+--
+ARRAY<STRUCT<
+        row_id INT64,
+        bool_val BOOL,
+        int32_val INT32,
+        int64_val INT64,
+        uint32_val UINT32,
+        uint64_val UINT64,
+        float_val FLOAT,
+        double_val DOUBLE,
+        str_val STRING,
+        bytes_val BYTES,
+        date_val DATE,
+        timestamp_val TIMESTAMP,
+        enum_val ENUM<googlesql_test.TestEnum>,
+        struct_val STRUCT<a INT64, b INT64>,
+        proto_val PROTO<googlesql_test.KitchenSinkPB>
+      >>
+[{1,
+  true,
+  -1,
+  -2,
+  1,
+  2,
+  0.1,
+  0.5,
+  "1",
+  b"1",
+  2014-01-01,
+  2014-01-01 00:00:01+00,
+  NULL,
+  {2, 4},
+  {
+    int64_key_1: 5
+    int64_key_2: 7
+  }},
+ {2,
+  false,
+  1,
+  2,
+  0,
+  200,
+  -0.1,
+  -0.2,
+  "A",
+  b"124",
+  2015-07-01,
+  2015-04-01 00:00:01+00,
+  TESTENUM1,
+  {4, 5},
+  {
+    int64_key_1: 8
+    int64_key_2: 9
+  }}]
+==
+
+[name=cast_json_to_json_no_ops]
+[required_features=JSON_TYPE]
+SELECT CAST((JSON '{"a": 1, "b": 2}') AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{{"a":1,"b":2}}]
+==
+
+# SQL null to JSON
+[name=cast_sql_null_to_json]
+[required_features=JSON_TYPE]
+SELECT CAST(NULL AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{NULL}]
+==
+
+[name=cast_sql_null_array_or_struct_to_json]
+SELECT CAST([1,null] AS JSON), CAST(STRUCT(1 AS a, NULL AS b) AS JSON)
+--
+ARRAY<STRUCT<JSON, JSON>>[{[1,null], {"a":1,"b":null}}]
+==
+
+[name=cast_table_all_types_to_json]
+SELECT CAST(bool_val AS JSON),
+       CAST(int32_val AS JSON),
+       CAST(int64_val AS JSON),
+       CAST(uint32_val AS JSON),
+       CAST(uint64_val AS JSON),
+       CAST(str_val AS JSON),
+       CAST(bytes_val AS JSON),
+       CAST(date_val AS JSON),
+       CAST(timestamp_val AS JSON),
+       CAST(enum_val AS JSON),
+       CAST(struct_val AS JSON)
+FROM TableAllTypes
+ORDER BY row_id
+--
+ARRAY<STRUCT<JSON, JSON, JSON, JSON, JSON, JSON, JSON, JSON, JSON, JSON, JSON>>[known order:
+  {
+    true,
+    -1,
+    -2,
+    1,
+    2,
+    "1",
+    "MQ==",
+    "2014-01-01",
+    "2014-01-01T00:00:01Z",
+    NULL,
+    {"a":2,"b":4}
+  },
+  {
+    false,
+    1,
+    2,
+    0,
+    200,
+    "A",
+    "MTI0",
+    "2015-07-01",
+    "2015-04-01T00:00:01Z",
+    "TESTENUM1",
+    {"a":4,"b":5}
+  }
+]
+==
+
+[name=cast_table_float_double_to_json]
+SELECT CAST(float_val AS JSON),
+       CAST(double_val AS JSON)
+FROM TableAllTypes
+ORDER BY row_id
+--
+ARRAY<STRUCT<JSON, JSON>>[known order:
+  {0.10000000149011612, 0.5},
+  {-0.10000000149011612, -0.2}
+]
+
+NOTE: Reference implementation reports non-determinism.
+==
+
+# Cast SQL types to JSON.
+# BOOL, INT64, UINT64, INT32, UINT32, FLOAT, DOUBLE, NUMERIC, BIGNUMERIC, STRING, BYTES, DATE, DATETIME, TIME, TIMESTAMP.
+[name=cast_simple_sql_literals_to_json]
+SELECT CAST(true AS JSON),
+       CAST(1 AS JSON),
+       CAST(CAST(1 AS UINT64) AS JSON),
+       CAST(CAST(1 AS INT32) AS JSON),
+       CAST(CAST(1 AS UINT32) AS JSON),
+       CAST(CAST(1.5 AS FLOAT) AS JSON),
+       CAST(CAST(1.5 AS DOUBLE) AS JSON),
+       CAST(CAST("abc" AS JSON) AS JSON),
+       CAST(CAST(b"abc" AS JSON) AS JSON),
+       CAST(CAST(DATE '1970-01-02' AS JSON) AS JSON),
+       CAST(CAST(TIMESTAMP_MICROS(1) AS JSON) AS JSON);
+--
+ARRAY<STRUCT<JSON, JSON, JSON, JSON, JSON, JSON, JSON, JSON, JSON, JSON, JSON>>[
+  {
+    true,
+    1,
+    1,
+    1,
+    1,
+    1.5,
+    1.5,
+    "abc",
+    "YWJj",
+    "1970-01-02",
+    "1970-01-01T00:00:00.000001Z"
+  }
+]
+==
+
+# DOUBLE nan value to JSON
+[name=cast_double_nan_to_json]
+SELECT CAST(CAST('nan' AS DOUBLE) AS JSON)
+--
+ERROR: generic::out_of_range: NaN is not a valid JSON number
+==
+
+# DOUBLE positive inf value to JSON
+[name=cast_double_positive_inf_to_json]
+SELECT CAST(CAST('inf' AS DOUBLE) AS JSON)
+--
+ERROR: generic::out_of_range: Infinity is not a valid JSON number
+==
+
+# DOUBLE negative inf value to JSON
+[name=cast_double_negative_inf_to_json]
+SELECT CAST(CAST('-inf' AS DOUBLE) AS JSON)
+--
+ERROR: generic::out_of_range: -Infinity is not a valid JSON number
+==
+
+# SAFE_CAST DOUBLE nan value to JSON
+[name=safe_cast_double_nan_to_json]
+SELECT SAFE_CAST(CAST('nan' AS DOUBLE) AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{NULL}]
+==
+
+# SAFE_CAST DOUBLE positive inf value to JSON
+[name=safe_cast_double_positive_inf_to_json]
+SELECT SAFE_CAST(CAST('inf' AS DOUBLE) AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{NULL}]
+==
+
+# SAFE_CAST DOUBLE negative inf value to JSON
+[name=safe_cast_double_negative_inf_to_json]
+SELECT SAFE_CAST(CAST('-inf' AS DOUBLE) AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{NULL}]
+==
+
+# DOUBLE -0.0 value to JSON
+[name=cast_double_negative_zero_to_json]
+[parameters=-0.0 AS double_param]
+SELECT CAST(@double_param AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{0.0}]
+
+NOTE: Reference implementation reports non-determinism.
+==
+
+# FLOAT -0.0 value to JSON
+[name=cast_float_negative_zero_to_json]
+[parameters=CAST(-0.0 AS FLOAT) AS float_param]
+SELECT CAST(@float_param AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{0.0}]
+
+NOTE: Reference implementation reports non-determinism.
+==
+
+[name=to_json_double_values_differences_from_cast_to_json]
+[required_features=JSON_TYPE]
+SELECT TO_JSON(CAST('inf' AS DOUBLE)),
+       TO_JSON(CAST('-inf' AS DOUBLE)),
+       TO_JSON(CAST('nan' AS DOUBLE))
+--
+ARRAY<STRUCT<JSON, JSON, JSON>>[{"Infinity", "-Infinity", "NaN"}]
+
+NOTE: Reference implementation reports non-determinism.
+==
+
+# NUMERIC to JSON
+[name=cast_numeric_to_json]
+[required_features=JSON_TYPE,NUMERIC_TYPE,CAST_TO_JSON_TYPE]
+SELECT CAST(NUMERIC '1.0' AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{1}]
+==
+
+# BIGNUMERIC to JSON
+[name=cast_bignumeric_to_json]
+[required_features=JSON_TYPE,BIGNUMERIC_TYPE,CAST_TO_JSON_TYPE]
+SELECT CAST(BIGNUMERIC '1.0' AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{1}]
+==
+
+# DATETIME to JSON
+[name=cast_datetime_to_json]
+[required_features=JSON_TYPE,CIVIL_TIME,CAST_TO_JSON_TYPE]
+SELECT CAST(DATETIME '2024-01-02 03:04:05' AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{"2024-01-02T03:04:05"}]
+==
+
+# TIME to JSON
+[name=cast_time_to_json]
+[required_features=JSON_TYPE,CIVIL_TIME,CAST_TO_JSON_TYPE]
+SELECT CAST(TIME '03:04:05' AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{"03:04:05"}]
+==
+
+# ENUM to JSON
+[name=cast_enum_to_json]
+SELECT CAST(CAST(1 AS `googlesql_test.TestEnum`) AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{"TESTENUM1"}]
+==
+
+# UUID to JSON
+[name=cast_uuid_to_json]
+[required_features=JSON_TYPE,CAST_TO_JSON_TYPE,UUID_TYPE]
+SELECT CAST(CAST("00000000-0000-0000-0000-000000000000" AS UUID) AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{"00000000-0000-0000-0000-000000000000"}]
+==
+
+# INTERVAL to JSON
+[name=cast_interval_to_json]
+[required_features=JSON_TYPE,CAST_TO_JSON_TYPE,INTERVAL_TYPE]
+SELECT CAST(INTERVAL 1 MONTH AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{"P1M"}]
+==
+
+# RANGE to JSON
+[name=cast_range_to_json]
+[required_features=JSON_TYPE,CAST_TO_JSON_TYPE,RANGE_TYPE]
+SELECT CAST(RANGE<DATE> '[2020-01-01, 2020-01-11)' AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{{"end":"2020-01-11","start":"2020-01-01"}}]
+==
+
+# ARRAY to JSON
+[name=cast_array_to_json]
+SELECT CAST([1, 2, 3] AS JSON),
+       CAST(ARRAY<INT64>[] AS JSON),
+       CAST([1, NULL, 3] AS JSON)
+--
+ARRAY<STRUCT<JSON, JSON, JSON>>[{[1,2,3], [], [1,null,3]}]
+==
+
+# ARRAY with inf to JSON
+[name=cast_array_with_inf_to_json]
+SELECT CAST([1.0, CAST('inf' AS DOUBLE)] AS JSON)
+--
+ERROR: generic::out_of_range: Infinity is not a valid JSON number
+==
+
+# SAFE_CAST ARRAY with inf to JSON
+[name=safe_cast_array_with_inf_to_json]
+SELECT SAFE_CAST([1.0, CAST('inf' AS DOUBLE)] AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{NULL}]
+==
+
+[name=cast_select_unordered_unique_elements_array_to_json]
+SELECT CAST((SELECT ARRAY(SELECT x FROM UNNEST([1,1,1]) AS x)) AS JSON);
+--
+ARRAY<STRUCT<JSON>>[{[1,1,1]}]
+==
+
+[name=cast_array_agg_with_no_input_to_json]
+SELECT CAST(ARRAY_AGG(x) AS JSON) FROM UNNEST([]) AS x;
+--
+ARRAY<STRUCT<JSON>>[{NULL}]
+==
+
+[name=cast_array_agg_with_single_element_to_json]
+SELECT CAST(ARRAY_AGG(x) AS JSON) FROM UNNEST([2]) AS x;
+--
+ARRAY<STRUCT<JSON>>[{[2]}]
+==
+
+[name=cast_array_agg_with_single_element_null_to_json]
+SELECT CAST(ARRAY_AGG(x) AS JSON) FROM UNNEST([NULL]) AS x;
+--
+ARRAY<STRUCT<JSON>>[{[null]}]
+==
+
+[name=cast_array_agg_with_multiple_nulls_to_json]
+SELECT CAST(ARRAY_AGG(x) AS JSON) FROM UNNEST([NULL, NULL, NULL]) AS x;
+--
+ARRAY<STRUCT<JSON>>[{[null,null,null]}]
+==
+
+[name=cast_array_agg_with_multiple_nan_to_json]
+SELECT CAST(ARRAY_AGG(x) AS JSON) FROM UNNEST([CAST('nan' AS DOUBLE), CAST('nan' AS DOUBLE), CAST('nan' AS DOUBLE)]) AS x;
+--
+ERROR: generic::out_of_range: NaN is not a valid JSON number
+==
+
+[name=safe_cast_array_agg_with_multiple_nan_to_json]
+SELECT SAFE_CAST(ARRAY_AGG(x) AS JSON) FROM UNNEST([CAST('nan' AS DOUBLE), CAST('nan' AS DOUBLE), CAST('nan' AS DOUBLE)]) AS x;
+--
+ARRAY<STRUCT<JSON>>[{NULL}]
+==
+
+[name=cast_array_agg_with_multiple_inf_to_json]
+SELECT CAST(ARRAY_AGG(x) AS JSON) FROM UNNEST([CAST('inf' AS DOUBLE), CAST('inf' AS DOUBLE), CAST('inf' AS DOUBLE)]) AS x;
+--
+ERROR: generic::out_of_range: Infinity is not a valid JSON number
+==
+
+[name=safe_cast_array_agg_with_multiple_inf_to_json]
+SELECT SAFE_CAST(ARRAY_AGG(x) AS JSON) FROM UNNEST([CAST('inf' AS DOUBLE), CAST('inf' AS DOUBLE), CAST('inf' AS DOUBLE)]) AS x;
+--
+ARRAY<STRUCT<JSON>>[{NULL}]
+==
+
+[name=cast_array_agg_with_nan_and_null_to_json]
+SELECT CAST(ARRAY_AGG(x) AS JSON) FROM UNNEST([CAST('nan' AS DOUBLE), null]) AS x;
+--
+ERROR: generic::out_of_range: NaN is not a valid JSON number
+==
+
+[name=safe_cast_array_agg_with_nan_and_null_to_json]
+SELECT SAFE_CAST(ARRAY_AGG(x) AS JSON) FROM UNNEST([CAST('nan' AS DOUBLE), null]) AS x;
+--
+ARRAY<STRUCT<JSON>>[{NULL}]
+==
+
+[name=cast_ordered_array_agg_to_json]
+[required_features=JSON_TYPE,CAST_TO_JSON_TYPE,ORDER_BY_IN_AGGREGATE]
+SELECT CAST(ARRAY_AGG(x ORDER BY x) AS JSON) FROM UNNEST([3,1,2]) AS x;
+--
+ARRAY<STRUCT<JSON>>[{[1,2,3]}]
+==
+
+[name=cast_array_agg_with_only_one_distinct_element_to_json]
+SELECT CAST(ARRAY_AGG(x) AS JSON) FROM UNNEST([1, 1, 1]) AS x;
+--
+ARRAY<STRUCT<JSON>>[{[1,1,1]}]
+==
+
+# STRUCT to JSON
+[name=cast_struct_to_json]
+SELECT CAST(STRUCT(1 AS a, 2 AS b) AS JSON),
+       CAST(STRUCT(2 AS b, 1 AS a) AS JSON),
+       CAST(STRUCT(1, 2 AS b) AS JSON),
+       CAST(STRUCT(1 AS a, NULL AS b) AS JSON)
+--
+ARRAY<STRUCT<JSON, JSON, JSON, JSON>>[
+  {{"a":1,"b":2}, {"a":1,"b":2}, {"":1,"b":2}, {"a":1,"b":null}}
+]
+==
+
+# STRUCT with inf to JSON
+[name=cast_struct_with_inf_to_json]
+SELECT CAST(STRUCT(1.0 AS a, CAST('inf' AS DOUBLE) AS b) AS JSON)
+--
+ERROR: generic::out_of_range: Infinity is not a valid JSON number
+==
+
+# SAFE_CAST STRUCT with inf to JSON
+[name=safe_cast_struct_with_inf_to_json]
+SELECT SAFE_CAST(STRUCT(1.0 AS a, CAST('inf' AS DOUBLE) AS b) AS JSON)
+--
+ARRAY<STRUCT<JSON>>[{NULL}]
+==

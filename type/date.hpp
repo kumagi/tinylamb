@@ -13,6 +13,9 @@ namespace tinylamb {
 [[nodiscard]] int64_t AddDateIntervalDays(int64_t days, int64_t amount,
                                           std::string_view unit);
 
+void SetDefaultTimeZone(std::string_view tz);
+[[nodiscard]] std::string GetDefaultTimeZone();
+
 }  // namespace tinylamb
 
 #endif

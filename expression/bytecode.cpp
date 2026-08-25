@@ -52,6 +52,7 @@ BytecodeOp BinaryOpcode(ValueType type) {
       return BytecodeOp::kBinaryVarchar;
     case ValueType::kDate:
       return BytecodeOp::kBinaryDate;
+    case ValueType::kArray:
     case ValueType::kNull:
       throw std::runtime_error("untyped bytecode operand");
   }

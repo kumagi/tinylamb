@@ -35,12 +35,31 @@ class SelectStatement;
 enum class JoinType { kCross, kInner, kLeft };
 
 struct SelectSource {
+  SelectSource() = default;
+  SelectSource(std::string in_table, std::string in_alias,
+               std::shared_ptr<SelectStatement> in_query = nullptr,
+               JoinType in_join_type = JoinType::kCross,
+               Expression in_join_condition = nullptr,
+               Expression in_unnest = nullptr)
+      : table(std::move(in_table)),
+        alias(std::move(in_alias)),
+        query(std::move(in_query)),
+        join_type(in_join_type),
+        join_condition(std::move(in_join_condition)),
+        unnest(std::move(in_unnest)) {}
+
   std::string table;
+
   std::string alias;
   std::shared_ptr<SelectStatement> query;
   JoinType join_type{JoinType::kCross};
   Expression join_condition;
+  Expression unnest;
+  std::string offset_alias;
 };
+
+
+
 
 enum class StatementType {
   kCreateTable,
@@ -95,22 +114,37 @@ class CreateTableStatement : public Statement {
         table_name_(std::move(table_name)),
         columns_(std::move(columns)) {}
 
+  CreateTableStatement(std::string table_name,
+                       std::shared_ptr<SelectStatement> as_query)
+      : Statement(StatementType::kCreateTable),
+        table_name_(std::move(table_name)),
+        as_query_(std::move(as_query)) {}
+
   const std::string& TableName() const { return table_name_; }
   const std::vector<Column>& Columns() const { return columns_; }
+  const std::shared_ptr<SelectStatement>& AsQuery() const { return as_query_; }
+  bool IsAsSelect() const { return as_query_ != nullptr; }
+
   void Dump(std::ostream& o) const override {
-    o << "table=" << table_name_ << " columns=[";
-    for (size_t i = 0; i < columns_.size(); i++) {
-      if (i) {
-        o << ", ";
+    o << "table=" << table_name_;
+    if (as_query_) {
+      o << " AS SELECT";
+    } else {
+      o << " columns=[";
+      for (size_t i = 0; i < columns_.size(); i++) {
+        if (i) {
+          o << ", ";
+        }
+        o << columns_[i];
       }
-      o << columns_[i];
+      o << "]";
     }
-    o << "]";
   }
 
  private:
   std::string table_name_;
   std::vector<Column> columns_;
+  std::shared_ptr<SelectStatement> as_query_;
 };
 
 class DropTableStatement : public Statement {
@@ -131,6 +165,9 @@ class SelectStatement : public Statement {
   struct OrderByTerm {
     Expression expression;
     bool ascending{true};
+    // Present when the SQL spelled out NULLS FIRST / NULLS LAST; absent keeps
+    // the engine default (NULLS FIRST on ASC, NULLS LAST on DESC).
+    std::optional<bool> nulls_first;
   };
 
   SelectStatement(std::vector<NamedExpression> select_list,
@@ -196,6 +233,26 @@ class SelectStatement : public Statement {
     with_queries_.emplace(std::move(name), std::move(query));
     complex_ = true;
   }
+  const Expression& Qualify() const { return qualify_; }
+  void SetQualify(Expression qualify) {
+    qualify_ = std::move(qualify);
+    complex_ = true;
+  }
+  // Rewriting hooks: the relational executor replaces window-function nodes
+  // with references to pre-computed hidden columns on a shallow copy.
+  void SetSelectList(std::vector<NamedExpression> select_list) {
+    select_list_ = std::move(select_list);
+  }
+  void SetOrderBy(std::vector<OrderByTerm> order_by) {
+    order_by_ = std::move(order_by);
+  }
+  const std::vector<std::shared_ptr<SelectStatement>>& UnionAll() const {
+    return union_all_;
+  }
+  void AddUnionAll(std::shared_ptr<SelectStatement> query) {
+    union_all_.push_back(std::move(query));
+    complex_ = true;
+  }
   void MarkComplex() { complex_ = true; }
   void Dump(std::ostream& o) const override {
     o << "select=[";
@@ -233,8 +290,10 @@ class SelectStatement : public Statement {
   std::vector<SelectSource> sources_;
   std::vector<Expression> group_by_;
   Expression having_;
+  Expression qualify_;
   std::unordered_map<std::string, std::shared_ptr<SelectStatement>>
       with_queries_;
+  std::vector<std::shared_ptr<SelectStatement>> union_all_;
   bool complex_{false};
 };
 

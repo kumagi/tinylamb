@@ -212,6 +212,7 @@ tinylamb_add_layer(tinylamb_type
         type/row.cpp
         type/schema.cpp
         type/date.cpp
+        type/interval.cpp
         type/column.cpp
         type/value.cpp
         type/constraint.cpp
@@ -289,7 +290,11 @@ tinylamb_add_layer(tinylamb_expression
         expression/function_call_expression.cpp
         expression/query_expression.cpp
         expression/interval_expression.cpp
+        expression/array_expression.cpp
+        expression/cast_expression.cpp
+        expression/window_function_expression.cpp
         expression/rewrite.cpp
+
         expression/bytecode.cpp
         expression/jit.cpp
         expression/column_value.cpp
@@ -334,6 +339,7 @@ tinylamb_add_layer(tinylamb_executor
         executor/relational_factory.cpp
         executor/detail/relation.cpp
         executor/detail/subquery_runtime.cpp
+        executor/detail/window_eval.cpp
         executor/detail/expression_eval.cpp
         executor/detail/scan_filter.cpp
         executor/detail/planning_heuristics.cpp
@@ -627,6 +633,15 @@ add_simple_test(query/googlesql_ast_test.cpp)
 add_simple_test(query/sql_template_test.cpp)
 add_simple_test(query/sql_engine_tpcc_test.cpp)
 add_simple_test(query/sql_engine_tpch_test.cpp)
+add_simple_test(query/googlesql_compliance_test.cpp)
+target_sources(googlesql_compliance_test PRIVATE
+        query/googlesql_compliance_file.cpp)
+target_compile_definitions(googlesql_compliance_test PRIVATE
+        TINYLAMB_GOOGLESQL_COMPLIANCE_DIR="${CMAKE_SOURCE_DIR}/query/testdata/googlesql_compliance")
+if(TINYLAMB_ENABLE_GOOGLESQL)
+    target_compile_definitions(googlesql_compliance_test PRIVATE
+            TINYLAMB_GOOGLESQL_COMPLIANCE_RUN=1)
+endif()
 add_simple_test(server/postgres_protocol_test.cpp)
 target_link_libraries(postgres_protocol_test PRIVATE tinylamb::postgres_server)
 add_simple_test(server/postgres_server_test.cpp)

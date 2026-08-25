@@ -309,6 +309,7 @@ long double Position(const Value& value) {
       }
       return position;
     }
+    case ValueType::kArray:
     case ValueType::kNull:
       return 0;
   }
@@ -1043,6 +1044,7 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
         break;
       }
       case ValueType::kVarChar:
+      case ValueType::kArray:
         decoder >> count >> distinct;
         break;
       case ValueType::kNull:

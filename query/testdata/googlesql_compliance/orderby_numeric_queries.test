@@ -1,0 +1,762 @@
+# Tests for ORDER BY with NUMERIC and BIGNUMERIC type.
+
+[prepare_database]
+[required_features=NUMERIC_TYPE]
+CREATE TABLE AllTypesNumericTable AS
+SELECT CAST(1 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       CAST(1 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(2 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       CAST(1 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(3 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       CAST(1 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(4 AS int64) as row_id,
+       CAST(-2 AS int64) as int64_val,
+       CAST('2014-01-02' AS DATE) as date_val,
+       CAST(2 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(5 AS int64) as row_id,
+       CAST(-2 AS int64) as int64_val,
+       CAST('2014-01-02' AS DATE) as date_val,
+       CAST(93 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(6 AS int64) as row_id,
+       CAST(-3 AS int64) as int64_val,
+       CAST('2014-01-03' AS DATE) as date_val,
+       CAST(3 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(7 AS int64) as row_id,
+       CAST(-4 AS int64) as int64_val,
+       CAST('2014-01-04' AS DATE) as date_val,
+       CAST(4 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(8 AS int64) as row_id,
+       CAST(NULL AS int64) as int64_val,
+       CAST(NULL AS DATE) as date_val,
+       CAST(NULL AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(9 AS int64) as row_id,
+       CAST(NULL AS int64) as int64_val,
+       CAST(NULL AS DATE) as date_val,
+       CAST(NULL AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(10 AS int64) as row_id,
+       CAST(1 AS int64) as int64_val,
+       CAST('2014-01-08' AS DATE) as date_val,
+       CAST(1 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(11 AS int64) as row_id,
+       CAST(3 AS int64) as int64_val,
+       CAST('2014-02-01' AS DATE) as date_val,
+       CAST(-5.34 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(12 AS int64) as row_id,
+       CAST(16 AS int64) as int64_val,
+       CAST('2014-02-02' AS DATE) as date_val,
+       CAST(999.999 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(13 AS int64) as row_id,
+       CAST(9 AS int64) as int64_val,
+       CAST('2014-05-02' AS DATE) as date_val,
+       CAST(-1000.10101 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(14 AS int64) as row_id,
+       CAST(23 AS int64) as int64_val,
+       CAST('2014-01-06' AS DATE) as date_val,
+       CAST(222 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(15 AS int64) as row_id,
+       CAST(-14 AS int64) as int64_val,
+       CAST('2014-02-04' AS DATE) as date_val,
+       CAST(-123456789.123456789 AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(16 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST(NULL AS DATE) as date_val,
+       CAST(NULL AS numeric) AS numeric_val
+UNION ALL
+SELECT CAST(17 AS int64) as row_id,
+       CAST(NULL AS int64) as int64_val,
+       CAST('2014-02-04' AS DATE) as date_val,
+       CAST(-123456789.123456789 AS numeric) AS numeric_val
+--
+ARRAY<STRUCT<row_id INT64, int64_val INT64, date_val DATE, numeric_val NUMERIC>>[
+  {1, -1, 2014-01-01, 1},
+  {2, -1, 2014-01-01, 1},
+  {3, -1, 2014-01-01, 1},
+  {4, -2, 2014-01-02, 2},
+  {5, -2, 2014-01-02, 93},
+  {6, -3, 2014-01-03, 3},
+  {7, -4, 2014-01-04, 4},
+  {8, NULL, NULL, NULL},
+  {9, NULL, NULL, NULL},
+  {10, 1, 2014-01-08, 1},
+  {11, 3, 2014-02-01, -5.34},
+  {12, 16, 2014-02-02, 999.999},
+  {13, 9, 2014-05-02, -1000.10101},
+  {14, 23, 2014-01-06, 222},
+  {15, -14, 2014-02-04, -123456789.123456789},
+  {16, -1, NULL, NULL},
+  {17, NULL, 2014-02-04, -123456789.123456789}
+]
+==
+
+[prepare_database]
+[required_features=BIGNUMERIC_TYPE]
+CREATE TABLE AllTypesBigNumericTable AS
+SELECT CAST(1 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       CAST(1 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(2 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       CAST(1 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(3 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       CAST(1 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(4 AS int64) as row_id,
+       CAST(-2 AS int64) as int64_val,
+       CAST('2014-01-02' AS DATE) as date_val,
+       CAST(2 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(5 AS int64) as row_id,
+       CAST(-2 AS int64) as int64_val,
+       CAST('2014-01-02' AS DATE) as date_val,
+       CAST(93 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(6 AS int64) as row_id,
+       CAST(-3 AS int64) as int64_val,
+       CAST('2014-01-03' AS DATE) as date_val,
+       CAST(3 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(7 AS int64) as row_id,
+       CAST(-4 AS int64) as int64_val,
+       CAST('2014-01-04' AS DATE) as date_val,
+       CAST(4 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(8 AS int64) as row_id,
+       CAST(NULL AS int64) as int64_val,
+       CAST(NULL AS DATE) as date_val,
+       CAST(NULL AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(9 AS int64) as row_id,
+       CAST(NULL AS int64) as int64_val,
+       CAST(NULL AS DATE) as date_val,
+       CAST(NULL AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(10 AS int64) as row_id,
+       CAST(1 AS int64) as int64_val,
+       CAST('2014-01-08' AS DATE) as date_val,
+       CAST(1 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(11 AS int64) as row_id,
+       CAST(3 AS int64) as int64_val,
+       CAST('2014-02-01' AS DATE) as date_val,
+       CAST(-5.34 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(12 AS int64) as row_id,
+       CAST(16 AS int64) as int64_val,
+       CAST('2014-02-02' AS DATE) as date_val,
+       CAST(999.9999999999999999999 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(13 AS int64) as row_id,
+       CAST(9 AS int64) as int64_val,
+       CAST('2014-05-02' AS DATE) as date_val,
+       CAST(-1000.0000000000000000001 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(14 AS int64) as row_id,
+       CAST(23 AS int64) as int64_val,
+       CAST('2014-01-06' AS DATE) as date_val,
+       CAST(222 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(15 AS int64) as row_id,
+       CAST(-14 AS int64) as int64_val,
+       CAST('2014-02-04' AS DATE) as date_val,
+       CAST(-123456789.1234567890123456789 AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(16 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST(NULL AS DATE) as date_val,
+       CAST(NULL AS bignumeric) AS bignumeric_val
+UNION ALL
+SELECT CAST(17 AS int64) as row_id,
+       CAST(NULL AS int64) as int64_val,
+       CAST('2014-02-04' AS DATE) as date_val,
+       CAST(-123456789.1234567890123456789 AS bignumeric) AS bignumeric_val
+--
+ARRAY<STRUCT<
+        row_id INT64,
+        int64_val INT64,
+        date_val DATE,
+        bignumeric_val BIGNUMERIC
+      >>
+[{1, -1, 2014-01-01, 1},
+ {2, -1, 2014-01-01, 1},
+ {3, -1, 2014-01-01, 1},
+ {4, -2, 2014-01-02, 2},
+ {5, -2, 2014-01-02, 93},
+ {6, -3, 2014-01-03, 3},
+ {7, -4, 2014-01-04, 4},
+ {8, NULL, NULL, NULL},
+ {9, NULL, NULL, NULL},
+ {10, 1, 2014-01-08, 1},
+ {11, 3, 2014-02-01, -5.34},
+ {
+   12,
+   16,
+   2014-02-02,
+   999.9999999999999999999
+ },
+ {
+   13,
+   9,
+   2014-05-02,
+   -1000.0000000000000000001
+ },
+ {14, 23, 2014-01-06, 222},
+ {
+   15,
+   -14,
+   2014-02-04,
+   -123456789.1234567890123456789
+ },
+ {16, -1, NULL, NULL},
+ {
+   17,
+   NULL,
+   2014-02-04,
+   -123456789.1234567890123456789
+ }]
+==
+
+[required_features=NUMERIC_TYPE]
+[name=orderby_single_base_column_numeric_asc]
+SELECT numeric_val, int64_val, row_id FROM AllTypesNumericTable t
+WHERE row_id NOT IN (2, 3, 5, 9, 16, 17)
+ORDER BY numeric_val ASC
+--
+ARRAY<STRUCT<numeric_val NUMERIC, int64_val INT64, row_id INT64>>[unknown order:
+  {NULL, NULL, 8},
+  {-123456789.123456789, -14, 15},
+  {-1000.10101, 9, 13},
+  {-5.34, 3, 11},
+  {1, 1, 10},
+  {1, -1, 1},
+  {2, -2, 4},
+  {3, -3, 6},
+  {4, -4, 7},
+  {222, 23, 14},
+  {999.999, 16, 12}
+]
+==
+
+[required_features=BIGNUMERIC_TYPE]
+[name=orderby_single_base_column_bignumeric_asc]
+SELECT bignumeric_val, int64_val, row_id FROM AllTypesBigNumericTable t
+WHERE row_id NOT IN (2, 3, 5, 9, 16, 17)
+ORDER BY bignumeric_val ASC
+--
+ARRAY<STRUCT<
+        bignumeric_val BIGNUMERIC,
+        int64_val INT64,
+        row_id INT64
+      >>
+[unknown order:{NULL, NULL, 8},
+               {
+                 -123456789.1234567890123456789,
+                 -14,
+                 15
+               },
+               {
+                 -1000.0000000000000000001,
+                 9,
+                 13
+               },
+               {-5.34, 3, 11},
+               {1, 1, 10},
+               {1, -1, 1},
+               {2, -2, 4},
+               {3, -3, 6},
+               {4, -4, 7},
+               {222, 23, 14},
+               {
+                 999.9999999999999999999,
+                 16,
+                 12
+               }]
+==
+
+[required_features=NUMERIC_TYPE]
+[name=orderby_single_base_column_numeric_desc]
+SELECT numeric_val, int64_val, row_id FROM AllTypesNumericTable t
+WHERE row_id NOT IN (2, 3, 5, 9, 16, 17)
+ORDER BY numeric_val ASC
+--
+ARRAY<STRUCT<numeric_val NUMERIC, int64_val INT64, row_id INT64>>[unknown order:
+  {NULL, NULL, 8},
+  {-123456789.123456789, -14, 15},
+  {-1000.10101, 9, 13},
+  {-5.34, 3, 11},
+  {1, 1, 10},
+  {1, -1, 1},
+  {2, -2, 4},
+  {3, -3, 6},
+  {4, -4, 7},
+  {222, 23, 14},
+  {999.999, 16, 12}
+]
+==
+
+[required_features=BIGNUMERIC_TYPE]
+[name=orderby_single_base_column_bignumeric_desc]
+SELECT bignumeric_val, int64_val, row_id FROM AllTypesBigNumericTable t
+WHERE row_id NOT IN (2, 3, 5, 9, 16, 17)
+ORDER BY bignumeric_val ASC
+--
+ARRAY<STRUCT<
+        bignumeric_val BIGNUMERIC,
+        int64_val INT64,
+        row_id INT64
+      >>
+[unknown order:{NULL, NULL, 8},
+               {
+                 -123456789.1234567890123456789,
+                 -14,
+                 15
+               },
+               {
+                 -1000.0000000000000000001,
+                 9,
+                 13
+               },
+               {-5.34, 3, 11},
+               {1, 1, 10},
+               {1, -1, 1},
+               {2, -2, 4},
+               {3, -3, 6},
+               {4, -4, 7},
+               {222, 23, 14},
+               {
+                 999.9999999999999999999,
+                 16,
+                 12
+               }]
+==
+
+[required_features=NUMERIC_TYPE]
+[name=orderby_single_computed_column_numeric_desc]
+SELECT numeric_val, date_val, row_id FROM AllTypesNumericTable t
+WHERE row_id NOT IN (2, 3, 5, 9, 16, 17)
+ORDER BY numeric_val * 2 DESC
+--
+ARRAY<STRUCT<numeric_val NUMERIC, date_val DATE, row_id INT64>>[unknown order:
+  {999.999, 2014-02-02, 12},
+  {222, 2014-01-06, 14},
+  {4, 2014-01-04, 7},
+  {3, 2014-01-03, 6},
+  {2, 2014-01-02, 4},
+  {1, 2014-01-08, 10},
+  {1, 2014-01-01, 1},
+  {-5.34, 2014-02-01, 11},
+  {-1000.10101, 2014-05-02, 13},
+  {-123456789.123456789, 2014-02-04, 15},
+  {NULL, NULL, 8}
+]
+==
+
+[required_features=BIGNUMERIC_TYPE]
+[name=orderby_single_computed_column_bignumeric_desc]
+SELECT bignumeric_val, date_val, row_id FROM AllTypesBigNumericTable t
+WHERE row_id NOT IN (2, 3, 5, 9, 16, 17)
+ORDER BY bignumeric_val * 2 DESC
+--
+ARRAY<STRUCT<
+        bignumeric_val BIGNUMERIC,
+        date_val DATE,
+        row_id INT64
+      >>
+[unknown order:{
+                 999.9999999999999999999,
+                 2014-02-02,
+                 12
+               },
+               {222, 2014-01-06, 14},
+               {4, 2014-01-04, 7},
+               {3, 2014-01-03, 6},
+               {2, 2014-01-02, 4},
+               {1, 2014-01-08, 10},
+               {1, 2014-01-01, 1},
+               {-5.34, 2014-02-01, 11},
+               {
+                 -1000.0000000000000000001,
+                 2014-05-02,
+                 13
+               },
+               {
+                 -123456789.1234567890123456789,
+                 2014-02-04,
+                 15
+               },
+               {NULL, NULL, 8}]
+==
+
+[required_features=NUMERIC_TYPE]
+[name=orderby_multi_base_column_numeric_asc]
+SELECT numeric_val, date_val, row_id FROM AllTypesNumericTable t
+ORDER BY numeric_val ASC, date_val ASC, row_id ASC
+--
+ARRAY<STRUCT<numeric_val NUMERIC, date_val DATE, row_id INT64>>[known order:
+  {NULL, NULL, 8},
+  {NULL, NULL, 9},
+  {NULL, NULL, 16},
+  {-123456789.123456789, 2014-02-04, 15},
+  {-123456789.123456789, 2014-02-04, 17},
+  {-1000.10101, 2014-05-02, 13},
+  {-5.34, 2014-02-01, 11},
+  {1, 2014-01-01, 1},
+  {1, 2014-01-01, 2},
+  {1, 2014-01-01, 3},
+  {1, 2014-01-08, 10},
+  {2, 2014-01-02, 4},
+  {3, 2014-01-03, 6},
+  {4, 2014-01-04, 7},
+  {93, 2014-01-02, 5},
+  {222, 2014-01-06, 14},
+  {999.999, 2014-02-02, 12}
+]
+==
+
+[required_features=BIGNUMERIC_TYPE]
+[name=orderby_multi_base_column_bignumeric_asc]
+SELECT bignumeric_val, date_val, row_id FROM AllTypesBigNumericTable t
+ORDER BY bignumeric_val ASC, date_val ASC, row_id ASC
+--
+ARRAY<STRUCT<
+        bignumeric_val BIGNUMERIC,
+        date_val DATE,
+        row_id INT64
+      >>
+[known order:{NULL, NULL, 8},
+             {NULL, NULL, 9},
+             {NULL, NULL, 16},
+             {
+               -123456789.1234567890123456789,
+               2014-02-04,
+               15
+             },
+             {
+               -123456789.1234567890123456789,
+               2014-02-04,
+               17
+             },
+             {
+               -1000.0000000000000000001,
+               2014-05-02,
+               13
+             },
+             {-5.34, 2014-02-01, 11},
+             {1, 2014-01-01, 1},
+             {1, 2014-01-01, 2},
+             {1, 2014-01-01, 3},
+             {1, 2014-01-08, 10},
+             {2, 2014-01-02, 4},
+             {3, 2014-01-03, 6},
+             {4, 2014-01-04, 7},
+             {93, 2014-01-02, 5},
+             {222, 2014-01-06, 14},
+             {
+               999.9999999999999999999,
+               2014-02-02,
+               12
+             }]
+==
+
+[required_features=NUMERIC_TYPE]
+[name=orderby_multi_base_column_numeric_desc]
+SELECT numeric_val, date_val, row_id FROM AllTypesNumericTable t
+ORDER BY numeric_val DESC, date_val ASC, row_id ASC
+--
+ARRAY<STRUCT<numeric_val NUMERIC, date_val DATE, row_id INT64>>[known order:
+  {999.999, 2014-02-02, 12},
+  {222, 2014-01-06, 14},
+  {93, 2014-01-02, 5},
+  {4, 2014-01-04, 7},
+  {3, 2014-01-03, 6},
+  {2, 2014-01-02, 4},
+  {1, 2014-01-01, 1},
+  {1, 2014-01-01, 2},
+  {1, 2014-01-01, 3},
+  {1, 2014-01-08, 10},
+  {-5.34, 2014-02-01, 11},
+  {-1000.10101, 2014-05-02, 13},
+  {-123456789.123456789, 2014-02-04, 15},
+  {-123456789.123456789, 2014-02-04, 17},
+  {NULL, NULL, 8},
+  {NULL, NULL, 9},
+  {NULL, NULL, 16}
+]
+==
+
+[required_features=BIGNUMERIC_TYPE]
+[name=orderby_multi_base_column_bignumeric_desc]
+SELECT bignumeric_val, date_val, row_id FROM AllTypesBigNumericTable t
+ORDER BY bignumeric_val DESC, date_val ASC, row_id ASC
+--
+ARRAY<STRUCT<
+        bignumeric_val BIGNUMERIC,
+        date_val DATE,
+        row_id INT64
+      >>
+[known order:{
+               999.9999999999999999999,
+               2014-02-02,
+               12
+             },
+             {222, 2014-01-06, 14},
+             {93, 2014-01-02, 5},
+             {4, 2014-01-04, 7},
+             {3, 2014-01-03, 6},
+             {2, 2014-01-02, 4},
+             {1, 2014-01-01, 1},
+             {1, 2014-01-01, 2},
+             {1, 2014-01-01, 3},
+             {1, 2014-01-08, 10},
+             {-5.34, 2014-02-01, 11},
+             {
+               -1000.0000000000000000001,
+               2014-05-02,
+               13
+             },
+             {
+               -123456789.1234567890123456789,
+               2014-02-04,
+               15
+             },
+             {
+               -123456789.1234567890123456789,
+               2014-02-04,
+               17
+             },
+             {NULL, NULL, 8},
+             {NULL, NULL, 9},
+             {NULL, NULL, 16}]
+==
+
+[required_features=NUMERIC_TYPE]
+[name=orderby_multi_computed_column_numeric_desc]
+SELECT numeric_val, date_val, row_id FROM AllTypesNumericTable t
+ORDER BY numeric_val * 2 DESC, date_val ASC, row_id ASC
+--
+ARRAY<STRUCT<numeric_val NUMERIC, date_val DATE, row_id INT64>>[known order:
+  {999.999, 2014-02-02, 12},
+  {222, 2014-01-06, 14},
+  {93, 2014-01-02, 5},
+  {4, 2014-01-04, 7},
+  {3, 2014-01-03, 6},
+  {2, 2014-01-02, 4},
+  {1, 2014-01-01, 1},
+  {1, 2014-01-01, 2},
+  {1, 2014-01-01, 3},
+  {1, 2014-01-08, 10},
+  {-5.34, 2014-02-01, 11},
+  {-1000.10101, 2014-05-02, 13},
+  {-123456789.123456789, 2014-02-04, 15},
+  {-123456789.123456789, 2014-02-04, 17},
+  {NULL, NULL, 8},
+  {NULL, NULL, 9},
+  {NULL, NULL, 16}
+]
+==
+
+[required_features=BIGNUMERIC_TYPE]
+[name=orderby_multi_computed_column_bignumeric_desc]
+SELECT bignumeric_val, date_val, row_id FROM AllTypesBigNumericTable t
+ORDER BY bignumeric_val * 2 DESC, date_val ASC, row_id ASC
+--
+ARRAY<STRUCT<
+        bignumeric_val BIGNUMERIC,
+        date_val DATE,
+        row_id INT64
+      >>
+[known order:{
+               999.9999999999999999999,
+               2014-02-02,
+               12
+             },
+             {222, 2014-01-06, 14},
+             {93, 2014-01-02, 5},
+             {4, 2014-01-04, 7},
+             {3, 2014-01-03, 6},
+             {2, 2014-01-02, 4},
+             {1, 2014-01-01, 1},
+             {1, 2014-01-01, 2},
+             {1, 2014-01-01, 3},
+             {1, 2014-01-08, 10},
+             {-5.34, 2014-02-01, 11},
+             {
+               -1000.0000000000000000001,
+               2014-05-02,
+               13
+             },
+             {
+               -123456789.1234567890123456789,
+               2014-02-04,
+               15
+             },
+             {
+               -123456789.1234567890123456789,
+               2014-02-04,
+               17
+             },
+             {NULL, NULL, 8},
+             {NULL, NULL, 9},
+             {NULL, NULL, 16}]
+==
+
+[required_features=NUMERIC_TYPE]
+[name=orderby_duplicates_single_base_column_numeric_asc]
+SELECT * FROM UNNEST(ARRAY(
+  SELECT numeric_val FROM AllTypesNumericTable t
+  ORDER BY numeric_val ASC
+)) x WITH OFFSET POS
+--
+ARRAY<STRUCT<x NUMERIC, POS INT64>>[unknown order:
+  {NULL, 0},
+  {NULL, 1},
+  {NULL, 2},
+  {-123456789.123456789, 3},
+  {-123456789.123456789, 4},
+  {-1000.10101, 5},
+  {-5.34, 6},
+  {1, 7},
+  {1, 8},
+  {1, 9},
+  {1, 10},
+  {2, 11},
+  {3, 12},
+  {4, 13},
+  {93, 14},
+  {222, 15},
+  {999.999, 16}
+]
+==
+
+[required_features=BIGNUMERIC_TYPE]
+[name=orderby_duplicates_single_base_column_bignumeric_asc]
+SELECT * FROM UNNEST(ARRAY(
+  SELECT bignumeric_val FROM AllTypesBigNumericTable t
+  ORDER BY bignumeric_val ASC
+)) x WITH OFFSET POS
+--
+ARRAY<STRUCT<x BIGNUMERIC, POS INT64>>[unknown order:
+  {NULL, 0},
+  {NULL, 1},
+  {NULL, 2},
+  {
+    -123456789.1234567890123456789,
+    3
+  },
+  {
+    -123456789.1234567890123456789,
+    4
+  },
+  {
+    -1000.0000000000000000001,
+    5
+  },
+  {-5.34, 6},
+  {1, 7},
+  {1, 8},
+  {1, 9},
+  {1, 10},
+  {2, 11},
+  {3, 12},
+  {4, 13},
+  {93, 14},
+  {222, 15},
+  {
+    999.9999999999999999999,
+    16
+  }
+]
+==
+
+[required_features=NUMERIC_TYPE]
+[name=orderby_duplicates_single_base_column_numeric_desc]
+SELECT * FROM UNNEST(ARRAY(
+  SELECT numeric_val FROM AllTypesNumericTable t
+  ORDER BY numeric_val DESC
+)) x WITH OFFSET POS
+--
+ARRAY<STRUCT<x NUMERIC, POS INT64>>[unknown order:
+  {999.999, 0},
+  {222, 1},
+  {93, 2},
+  {4, 3},
+  {3, 4},
+  {2, 5},
+  {1, 6},
+  {1, 7},
+  {1, 8},
+  {1, 9},
+  {-5.34, 10},
+  {-1000.10101, 11},
+  {-123456789.123456789, 12},
+  {-123456789.123456789, 13},
+  {NULL, 14},
+  {NULL, 15},
+  {NULL, 16}
+]
+==
+
+[required_features=BIGNUMERIC_TYPE]
+[name=orderby_duplicates_single_base_column_bignumeric_desc]
+SELECT * FROM UNNEST(ARRAY(
+  SELECT bignumeric_val FROM AllTypesBigNumericTable t
+  ORDER BY bignumeric_val DESC
+)) x WITH OFFSET POS
+--
+ARRAY<STRUCT<x BIGNUMERIC, POS INT64>>[unknown order:
+  {
+    999.9999999999999999999,
+    0
+  },
+  {222, 1},
+  {93, 2},
+  {4, 3},
+  {3, 4},
+  {2, 5},
+  {1, 6},
+  {1, 7},
+  {1, 8},
+  {1, 9},
+  {-5.34, 10},
+  {
+    -1000.0000000000000000001,
+    11
+  },
+  {
+    -123456789.1234567890123456789,
+    12
+  },
+  {
+    -123456789.1234567890123456789,
+    13
+  },
+  {NULL, 14},
+  {NULL, 15},
+  {NULL, 16}
+]

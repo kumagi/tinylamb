@@ -720,11 +720,13 @@ Relation BuildInput(TransactionContext& context,
   std::vector<std::vector<slot_t>> projections(statement.Sources().size());
   for (size_t i = 0; i < statement.Sources().size(); ++i) {
     const SelectSource& source = statement.Sources()[i];
-    base_sources[i] = !source.query && !ctes.contains(source.table);
+    base_sources[i] =
+        !source.query && !source.unnest && !ctes.contains(source.table);
     if (!base_sources[i]) {
       relations[i] = LoadSource(context, source, outer, ctes);
       continue;
     }
+
     StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
     if (!table.HasValue()) {
       throw std::runtime_error("table " + source.table + " not found");

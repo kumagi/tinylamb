@@ -36,6 +36,13 @@ The built-in logical rules are:
 - `push_selection_into_scan`
 - `push_selection_through_join`
 - `split_selection_over_join`
+- `merge_projections`
+- `push_selection_through_projection`
+- `push_limit_through_projection`
+- `push_selection_through_aggregation`
+- `infer_join_predicates`
+- `merge_limits`
+- `eliminate_true_selection`
 
 The built-in physical rules are:
 
@@ -64,8 +71,9 @@ constant reassociation (`(x + 1) + 2` to `x + 3`); duplicate elimination in
 `IN` lists; and uniform-result `CASE` flattening. Wildcard-free `LIKE`
 constants become equality comparisons, stacked null checks collapse to
 constants, `(x - c1) + c2` style mixed reassociation merges the constants,
-and `x AND (NOT x OR y)` shrinks to `x AND y`. Rewriting is bottom-up and
-continues to a fixed point.
+and `x AND (NOT x OR y)` shrinks to `x AND y`. Nested identical `CAST`s
+collapse, and a common conjunct factored from both sides of `OR` becomes
+`x AND (y OR z)`. Rewriting is bottom-up and continues to a fixed point.
 
 ## Selecting rules per optimization
 
@@ -105,7 +113,8 @@ options.expression_rules.Add(ExpressionRule(
 Patterns may capture any expression or constrain its `TypeTag`, binary
 operation, unary operation, and children. `ExpressionChildren` and
 `WithExpressionChildren` provide generic traversal/reconstruction for binary,
-unary, aggregate, `CASE`, `IN`, function-call, and subquery expressions.
+unary, aggregate, `CASE`, `IN`, function-call, `CAST`, array, and subquery
+expressions.
 
 ## Adding a logical transformation
 

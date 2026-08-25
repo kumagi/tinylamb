@@ -1,15 +1,21 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "plan/cascades.hpp"
 
+#include <algorithm>
 #include <optional>
 #include <cstddef>
+#include <ranges>
 #include <sstream>
 #include <utility>
 #include <vector>
 #include <stdexcept>
 
 #include "common/constants.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "gtest/gtest.h"
 #include "type/column_name.hpp"
 #include "type/value.hpp"
@@ -552,6 +558,161 @@ TEST(CascadesTest, MemoDumpsGroupsAndExpressions) {
   EXPECT_NE(text.find("filter="), std::string::npos);
   EXPECT_NE(text.find("expressions=1"), std::string::npos);
   (void)root;
+}
+
+TEST(CascadesTest, MergeProjectionsComposesTargetLists) {
+  using namespace dsl;
+  Memo memo;
+  const GroupId scan = memo.Build({"a"});
+  const GroupId inner = memo.EnsureDerivedGroup({"a"}, "inner-proj");
+  LogicalExpression inner_proj;
+  inner_proj.operation = LogicalOperator::kProjection;
+  inner_proj.children = {scan};
+  inner_proj.target_list = {NamedExpression("x", ColumnValueExp("a.x"))};
+  ASSERT_TRUE(memo.AddExpression(inner, inner_proj));
+  const GroupId outer = memo.EnsureDerivedGroup({"a"}, "outer-proj");
+  LogicalExpression outer_proj;
+  outer_proj.operation = LogicalOperator::kProjection;
+  outer_proj.children = {inner};
+  outer_proj.target_list = {NamedExpression("y", ColumnValueExp("x"))};
+  ASSERT_TRUE(memo.AddExpression(outer, outer_proj));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+
+  search.Explore(outer);
+
+  bool composed = false;
+  for (const LogicalExpression& expression :
+       search.GetMemo().Get(outer).expressions) {
+    if (expression.operation == LogicalOperator::kProjection &&
+        expression.children == std::vector<GroupId>{scan} &&
+        !expression.target_list.empty() &&
+        expression.target_list[0].expression->ToString() ==
+            ColumnValueExp("a.x")->ToString()) {
+      composed = true;
+    }
+  }
+  EXPECT_TRUE(composed);
+}
+
+TEST(CascadesTest, MergeLimitsComposesNestedLimits) {
+  Memo memo;
+  const GroupId scan = memo.Build({"a"});
+  const GroupId inner = memo.EnsureDerivedGroup({"a"}, "inner-limit");
+  LogicalExpression inner_limit;
+  inner_limit.operation = LogicalOperator::kLimit;
+  inner_limit.children = {scan};
+  inner_limit.limit_count = 10;
+  inner_limit.limit_offset = 0;
+  ASSERT_TRUE(memo.AddExpression(inner, inner_limit));
+  const GroupId outer = memo.EnsureDerivedGroup({"a"}, "outer-limit");
+  LogicalExpression outer_limit;
+  outer_limit.operation = LogicalOperator::kLimit;
+  outer_limit.children = {inner};
+  outer_limit.limit_count = 3;
+  outer_limit.limit_offset = 1;
+  ASSERT_TRUE(memo.AddExpression(outer, outer_limit));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+
+  search.Explore(outer);
+
+  bool merged = false;
+  for (const LogicalExpression& expression :
+       search.GetMemo().Get(outer).expressions) {
+    if (expression.operation == LogicalOperator::kLimit &&
+        expression.children == std::vector<GroupId>{scan} &&
+        expression.limit_count == 3 && expression.limit_offset == 1) {
+      merged = true;
+    }
+  }
+  EXPECT_TRUE(merged);
+}
+
+TEST(CascadesTest, EliminateTrueSelectionCopiesChildScan) {
+  Memo memo;
+  const GroupId scan = memo.Build({"a"});
+  const GroupId selection = memo.EnsureDerivedGroup({"a"}, "true-sel");
+  LogicalExpression tautology;
+  tautology.operation = LogicalOperator::kSelection;
+  tautology.children = {scan};
+  tautology.predicate = ConstantValueExp(Value(true));
+  ASSERT_TRUE(memo.AddExpression(selection, tautology));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+
+  search.Explore(selection);
+
+  bool has_scan = false;
+  for (const LogicalExpression& expression :
+       search.GetMemo().Get(selection).expressions) {
+    if (expression.operation == LogicalOperator::kScan &&
+        expression.table == "a") {
+      has_scan = true;
+    }
+  }
+  EXPECT_TRUE(has_scan);
+}
+
+TEST(CascadesTest, DefaultRulesIncludePredicateAndProjectionTransforms) {
+  const RuleSet& rules = RuleSet::Default();
+  EXPECT_TRUE(rules.Contains("merge_projections"));
+  EXPECT_TRUE(rules.Contains("push_selection_through_projection"));
+  EXPECT_TRUE(rules.Contains("push_limit_through_projection"));
+  EXPECT_TRUE(rules.Contains("push_selection_through_aggregation"));
+  EXPECT_TRUE(rules.Contains("infer_join_predicates"));
+  EXPECT_TRUE(rules.Contains("merge_limits"));
+  EXPECT_TRUE(rules.Contains("eliminate_true_selection"));
+}
+
+TEST(CascadesTest, PushLimitThroughProjectionAddsLimitBelow) {
+  Memo memo;
+  const GroupId scan = memo.Build({"a"});
+  const GroupId projection = memo.EnsureDerivedGroup({"a"}, "projection");
+  LogicalExpression proj;
+  proj.operation = LogicalOperator::kProjection;
+  proj.children = {scan};
+  proj.target_list = {NamedExpression("x", ColumnValueExp("a.x"))};
+  ASSERT_TRUE(memo.AddExpression(projection, proj));
+  const GroupId limit = memo.EnsureDerivedGroup({"a"}, "limit");
+  LogicalExpression lim;
+  lim.operation = LogicalOperator::kLimit;
+  lim.children = {projection};
+  lim.limit_count = 5;
+  lim.limit_offset = 0;
+  ASSERT_TRUE(memo.AddExpression(limit, lim));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+
+  search.Explore(limit);
+
+  bool projected_limit = false;
+  for (const LogicalExpression& expression :
+       search.GetMemo().Get(limit).expressions) {
+    if (expression.operation != LogicalOperator::kProjection) { continue;
+}
+    const Group& child = search.GetMemo().Get(expression.children[0]);
+    projected_limit = std::ranges::any_of(
+        child.expressions, [](const LogicalExpression& candidate) {
+          return candidate.operation == LogicalOperator::kLimit &&
+                 candidate.limit_count == 5;
+        });
+  }
+  EXPECT_TRUE(projected_limit);
+}
+
+TEST(CascadesTest, InferJoinPredicatesCopiesConstantsAcrossEquals) {
+  Memo memo;
+  const GroupId root = memo.Build(
+      {"a", "b"},
+      {{EqExp("a.x", Value(1)), {"a"}},
+       {BinaryExpressionExp(ColumnValueExp("a.x"), BinaryOperation::kEquals,
+                            ColumnValueExp("b.y")),
+        {"a", "b"}}});
+  SearchEngine search(std::move(memo), RuleSet::Default());
+
+  search.Explore(root);
+
+  const Group& b = search.GetMemo().Get(search.GetMemo().EnsureGroup({"b"}));
+  ASSERT_TRUE(b.filter);
+  EXPECT_NE(b.filter->ToString().find("b.y"), std::string::npos);
+  EXPECT_NE(b.filter->ToString().find("1"), std::string::npos);
 }
 
 }  // namespace tinylamb::cascades

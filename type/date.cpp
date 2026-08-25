@@ -160,4 +160,20 @@ int64_t AddDateIntervalDays(int64_t days, int64_t amount,
   throw std::runtime_error("unsupported interval unit " + std::string(unit));
 }
 
+namespace {
+thread_local std::string tls_default_time_zone = "America/Los_Angeles";
+}  // namespace
+
+void SetDefaultTimeZone(std::string_view tz) {
+  if (tz.empty()) {
+    tls_default_time_zone = "America/Los_Angeles";
+  } else {
+    tls_default_time_zone = std::string(tz);
+  }
+}
+
+std::string GetDefaultTimeZone() {
+  return tls_default_time_zone.empty() ? "America/Los_Angeles" : tls_default_time_zone;
+}
+
 }  // namespace tinylamb

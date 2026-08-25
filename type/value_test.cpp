@@ -87,6 +87,21 @@ TEST(ValueTest, SerializeRoundTripCoversDateNullAndBinaryVarchar) {
   SerializeDeserializeTest(Value(std::string(long_text)));
 }
 
+TEST(ValueTest, ArrayRoundTrip) {
+  const Value array =
+      Value::Array({Value(int64_t{1}), Value(int64_t{2})}, "INT64");
+  ASSERT_TRUE(array.IsArray());
+  EXPECT_EQ(array.ArrayElementSqlType(), "INT64");
+  ASSERT_EQ(array.ArrayElements().size(), 2);
+  EXPECT_EQ(array.ArrayElements()[0], Value(int64_t{1}));
+  EXPECT_EQ(array.ArrayElements()[1], Value(int64_t{2}));
+  SerializeDeserializeTest(array);
+  const std::string encoded = array.EncodeMemcomparableFormat();
+  Value decoded;
+  ASSERT_GT(decoded.DecodeMemcomparableFormat(encoded.data()), 0U);
+  EXPECT_EQ(decoded, array);
+}
+
 TEST(ValueTest, Compare) {
   // Arrange -- three Values of different types for inequality comparison
   // Act + Assert -- < semantics across int, double, varchar
@@ -668,7 +683,7 @@ TEST(ValueTest, DecodeMemcomparableRejectsNullAndBrokenPrefixes) {
   Value v;
   // Act + Assert -- a kNull prefix byte and an out-of-range prefix both throw.
   ASSERT_THROW(v.DecodeMemcomparableFormat("\x00"), std::runtime_error);
-  ASSERT_THROW(v.DecodeMemcomparableFormat("\x05"), std::runtime_error);
+  ASSERT_THROW(v.DecodeMemcomparableFormat("\x06"), std::runtime_error);
 }
 
 TEST(ValueTest, HashNullValueIsStable) {

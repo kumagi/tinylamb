@@ -58,6 +58,8 @@ std::string ValueText(const Value& value) {
              << value.value.double_value;
       return output.str();
     }
+    case ValueType::kArray:
+      return value.AsString();
   }
   return {};
 }
@@ -77,6 +79,7 @@ PgType ToPgType(ValueType type) {
       return {.oid=1082, .length=4};  // date
     case ValueType::kNull:
     case ValueType::kVarChar:
+    case ValueType::kArray:
       return {.oid=25, .length=-1};  // text
   }
   return {.oid=25, .length=-1};

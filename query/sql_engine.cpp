@@ -31,6 +31,7 @@
 #include "database/transaction_context.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/delete.hpp"
+#include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/distinct.hpp"
 #include "executor/executor_base.hpp"
@@ -118,16 +119,21 @@ StatusOr<QueryResult> SqlEngine::Execute(TransactionContext& ctx,
   const auto started = tls_sql_runtime_profiling
                            ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
-  StatusOr<Executor> prepared = Prepare(ctx, sql);
-  if (tls_sql_runtime_profiling) {
-    tls_sql_runtime_stats.prepare_ns += static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - started)
-            .count());
+  try {
+    StatusOr<Executor> prepared = Prepare(ctx, sql);
+    if (tls_sql_runtime_profiling) {
+      tls_sql_runtime_stats.prepare_ns += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - started)
+              .count());
+    }
+    if (!prepared.HasValue()) { return prepared.GetStatus(); }
+    return QueryResult(std::move(prepared.Value()), last_statement_type_,
+                       result_column_names_);
+  } catch (const std::exception& e) {
+    last_error_ = e.what();
+    return Status::kUnknown;
   }
-  if (!prepared.HasValue()) { return prepared.GetStatus(); }
-  return QueryResult(std::move(prepared.Value()), last_statement_type_,
-                     result_column_names_);
 }
 
 uint64_t SqlEngine::ThreadExecutionCount() {
@@ -654,6 +660,44 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
     case StatementType::kCreateTable: {
       const auto& create =
           dynamic_cast<const CreateTableStatement&>(*statement);
+      if (create.IsAsSelect()) {
+        // Materialize through the relational engine so the star-expanded
+        // output schema is available: a raw select list still holds the
+        // literal "*" directive, whose width/name cannot define the catalog.
+        relational_detail::Relation materialized =
+            relational_detail::ExecuteQuery(ctx, *create.AsQuery(), nullptr, {});
+        std::vector<Row> rows;
+        materialized.ForEachRow([&rows](const Row& row) { rows.push_back(row); });
+        std::vector<Column> columns;
+        columns.reserve(materialized.schema.ColumnCount());
+        for (size_t i = 0; i < materialized.schema.ColumnCount(); ++i) {
+          const Column& schema_column = materialized.schema.GetColumn(i);
+          std::string col_name = schema_column.Name().name;
+          if (col_name.empty() || col_name == "*") {
+            col_name = "col_" + std::to_string(i);
+          }
+          ValueType vtype = schema_column.Type();
+          if (vtype == ValueType::kNull) {
+            vtype = ValueType::kVarChar;
+            for (const auto& row : rows) {
+              if (i < row.Size() && !row[i].IsNull() &&
+                  row[i].type != ValueType::kNull) {
+                vtype = row[i].type;
+                break;
+              }
+            }
+          }
+          columns.emplace_back(col_name, vtype);
+        }
+        ASSIGN_OR_RETURN(Table, table,
+                         database_->CreateTable(
+                             ctx, Schema(create.TableName(), columns)));
+        for (const auto& row : rows) {
+          ASSIGN_OR_RETURN(RowPosition, pos, table.Insert(ctx.txn_, row));
+        }
+        return Executor(std::make_shared<ConstantExecutor>(
+            Row({Value("CREATE TABLE"), Value(static_cast<int64_t>(rows.size()))})));
+      }
       ASSIGN_OR_RETURN(Table, table,
                        database_->CreateTable(
                            ctx, Schema(create.TableName(), create.Columns())));
@@ -824,9 +868,14 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         return Executor(std::make_shared<ConstantExecutor>(
             std::vector<Row>{}));
       }
-      if (select->RequiresRelationalEvaluation()) {
+      const bool has_unnest = std::any_of(
+          select->Sources().begin(), select->Sources().end(),
+          [](const SelectSource& s) { return static_cast<bool>(s.unnest); });
+      if (select->RequiresRelationalEvaluation() ||
+          select->Sources().empty() || has_unnest) {
         return emit_relational();
       }
+
       // Phase 8 routing: queries whose FROM uses table aliases (including
       // self-joins of one physical table) go through the cost-based
       // optimizer, which renames scan schemas to the alias identity. Plain

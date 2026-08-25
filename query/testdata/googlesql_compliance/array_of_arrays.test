@@ -1,0 +1,192 @@
+[default required_features=ARRAY_OF_ARRAY]
+[name=literal_array_of_int_arrays]
+SELECT ARRAY<ARRAY<INT64>>[[1, 2], [3, 4]]
+--
+ARRAY<STRUCT<ARRAY<>>>[
+  {ARRAY<ARRAY<>>[known order:
+     ARRAY<INT64>[known order:1, 2],
+     ARRAY<INT64>[known order:3, 4]
+   ]}
+]
+==
+
+[required_features=ARRAY_OF_ARRAY,TYPEOF_FUNCTION]
+[name=typeof_array_of_int_arrays]
+SELECT TYPEOF(ARRAY<ARRAY<INT64>>[[1]])
+--
+ARRAY<STRUCT<STRING>>[{"ARRAY<ARRAY<INT64>>"}]
+==
+
+[name=cast_null_to_array_of_string_arrays]
+SELECT CAST(NULL AS ARRAY<ARRAY<STRING>>)
+--
+ARRAY<STRUCT<ARRAY<>>>[{ARRAY<ARRAY<STRING>>(NULL)}]
+==
+
+[required_features=ARRAY_OF_ARRAY,CAST_DIFFERENT_ARRAY_TYPES]
+[name=cast_literal_to_array_of_string_arrays]
+SELECT CAST([[1], [2]] AS ARRAY<ARRAY<STRING>>)
+--
+ARRAY<STRUCT<ARRAY<>>>[
+  {ARRAY<ARRAY<>>[known order:ARRAY<STRING>["1"], ARRAY<STRING>["2"]]}
+]
+==
+
+[name=array_concat_empty_array_of_arrays]
+SELECT ARRAY_CONCAT([], [[]])
+--
+ARRAY<STRUCT<ARRAY<>>>[{ARRAY<ARRAY<>>[ARRAY<INT64>[]]}]
+==
+
+[name=array_agg_array_of_int_arrays]
+SELECT ARRAY_AGG(arr)
+FROM (
+  SELECT [1, 2] AS arr UNION ALL
+  SELECT []            UNION ALL
+  SELECT [3, 4]
+)
+--
+ARRAY<STRUCT<ARRAY<>>>[
+  {ARRAY<ARRAY<>>[unknown order:
+     ARRAY<INT64>[],
+     ARRAY<INT64>[known order:1, 2],
+     ARRAY<INT64>[known order:3, 4]
+   ]}
+]
+==
+
+[required_features=ARRAY_OF_ARRAY,ARRAY_ZIP,INLINE_LAMBDA_ARGUMENT]
+[name=array_zip]
+SELECT ARRAY_ZIP([arr, arr], [['ax', 'ay'], NULL], (e1, e2) -> ARRAY_CONCAT(e1, e2))
+FROM (
+  SELECT ['a'] AS arr UNION ALL
+  SELECT []            UNION ALL
+  SELECT NULL          UNION ALL
+  SELECT ARRAY<STRING>[NULL] UNION ALL
+  SELECT ['b']
+)
+--
+ARRAY<STRUCT<ARRAY<>>>[unknown order:
+  {ARRAY<ARRAY<>>[known order:
+     ARRAY<STRING>[known order:"ax", "ay"],
+     ARRAY<STRING>(NULL)
+   ]},
+  {ARRAY<ARRAY<>>[known order:
+     ARRAY<STRING>[known order:NULL, "ax", "ay"],
+     ARRAY<STRING>(NULL)
+   ]},
+  {ARRAY<ARRAY<>>[known order:
+     ARRAY<STRING>[known order:"a", "ax", "ay"],
+     ARRAY<STRING>(NULL)
+   ]},
+  {ARRAY<ARRAY<>>[known order:ARRAY<STRING>(NULL), ARRAY<STRING>(NULL)]},
+  {ARRAY<ARRAY<>>[known order:
+     ARRAY<STRING>[known order:"b", "ax", "ay"],
+     ARRAY<STRING>(NULL)
+   ]}
+]
+==
+
+# Ensures that collation is propagated.
+# Note that we reverse the order in the lambda to get the 'ax' item first.
+[required_features=ARRAY_OF_ARRAY,ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,ARRAY_ZIP,INLINE_LAMBDA_ARGUMENT]
+[name=array_zip_with_collation]
+SELECT result, ARRAY_FIRST(ARRAY_FIRST(result)) = 'AX' AS eq_AX
+FROM (
+  SELECT ARRAY_ZIP([arr, arr], [['ax', COLLATE('ay', 'und:ci')], NULL], (e1, e2) -> ARRAY_CONCAT(e2, e1)) AS result
+  FROM (
+    SELECT ['a'] AS arr UNION ALL
+    SELECT []            UNION ALL
+    SELECT NULL          UNION ALL
+    SELECT ARRAY<STRING>[NULL] UNION ALL
+    SELECT ['b']
+  )
+)
+--
+ARRAY<STRUCT<result ARRAY<>, eq_AX BOOL>>[unknown order:
+  {ARRAY<ARRAY<>>[known order:
+     ARRAY<STRING>[known order:"ax", "ay", NULL],
+     ARRAY<STRING>(NULL)
+   ],
+   true},
+  {
+    ARRAY<ARRAY<>>[known order:ARRAY<STRING>(NULL), ARRAY<STRING>(NULL)],
+    NULL
+  },
+  {ARRAY<ARRAY<>>[known order:
+     ARRAY<STRING>[known order:"ax", "ay"],
+     ARRAY<STRING>(NULL)
+   ],
+   true},
+  {ARRAY<ARRAY<>>[known order:
+     ARRAY<STRING>[known order:"ax", "ay", "a"],
+     ARRAY<STRING>(NULL)
+   ],
+   true},
+  {ARRAY<ARRAY<>>[known order:
+     ARRAY<STRING>[known order:"ax", "ay", "b"],
+     ARRAY<STRING>(NULL)
+   ],
+   true}
+]
+==
+
+[name=array_of_arrays_of_struct]
+SELECT ARRAY<ARRAY<STRUCT<a INT64, b STRING>>>[[STRUCT(1 AS a, "foo" AS b), STRUCT(2 AS a, "bar" AS b)], [STRUCT(3 AS a, "baz" AS b)]]
+--
+ARRAY<STRUCT<ARRAY<>>>[
+  {
+    ARRAY<ARRAY<>>[known order:
+      ARRAY<STRUCT<a INT64, b STRING>>[known order:{1, "foo"}, {2, "bar"}],
+      ARRAY<STRUCT<a INT64, b STRING>>[{3, "baz"}]
+    ]
+  }
+]
+==
+
+[name=array_ctor_array_of_arrays_empty_outer]
+SELECT ARRAY<ARRAY<INT64>>[]
+--
+ARRAY<STRUCT<ARRAY<>>>[{ARRAY<ARRAY<INT64>>[]}]
+==
+
+[name=array_ctor_three_level_array]
+SELECT ARRAY<ARRAY<ARRAY<INT64>>>[[[1, 2], [3]], [[4]]]
+--
+ARRAY<STRUCT<ARRAY<>>>[
+  {ARRAY<ARRAY<>>[known order:
+     ARRAY<ARRAY<>>[known order:
+       ARRAY<INT64>[known order:1, 2],
+       ARRAY<INT64>[3]
+     ],
+     ARRAY<ARRAY<>>[ARRAY<INT64>[4]]
+   ]}
+]
+==
+
+[required_features=ARRAY_OF_ARRAY,ARRAY_EQUALITY]
+[name=array_of_arrays_equality_true]
+SELECT [[1, 2], [3, 4]] = [[1, 2], [3, 4]]
+--
+ARRAY<STRUCT<BOOL>>[{true}]
+==
+
+[required_features=ARRAY_OF_ARRAY,ARRAY_EQUALITY]
+[name=array_of_arrays_equality_false]
+SELECT [[1, 2], [3, 4]] = [[1, 2], [3, 5]]
+--
+ARRAY<STRUCT<BOOL>>[{false}]
+==
+
+[required_features=ARRAY_OF_ARRAY,ARRAY_EQUALITY]
+[name=array_of_arrays_equality_null]
+SELECT [[1, 2], [3, 4]] = CAST(NULL AS ARRAY<ARRAY<INT64>>)
+--
+ARRAY<STRUCT<BOOL>>[{NULL}]
+==
+
+[required_features=ARRAY_OF_ARRAY,ARRAY_ORDERING]
+[name=array_of_arrays_ordering]
+SELECT [[1, 2], [3, 4]] < [[2,3], [-1, -1]]
+--
+ARRAY<STRUCT<BOOL>>[{true}]

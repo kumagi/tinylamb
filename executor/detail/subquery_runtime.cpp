@@ -87,9 +87,12 @@ void CountStatementTablesImpl(  // NOLINT(misc-no-recursion)
   for (const SelectSource& source : statement.Sources()) {
     if (source.query) {
       CountStatementTablesImpl(*source.query, counts, visible_ctes);
-    } else if (!visible_ctes.contains(source.table)) {
+    } else if (source.unnest) {
+      // unnest has no base table
+    } else if (!source.table.empty() && !visible_ctes.contains(source.table)) {
       ++(*counts)[source.table];
     }
+
     CountExpressionTables(source.join_condition, counts, visible_ctes);
   }
   CountExpressionTables(statement.WhereClause(), counts, visible_ctes);
@@ -377,11 +380,34 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         Scope scope{.row=&row, .schema=&source.schema, .outer=nullptr};
         for (size_t i = 0; i < aggregate_expressions.size(); ++i) {
           const AggregateExpression& aggregate = *aggregate_expressions[i];
-          group->accumulators[i].Add(
-              IsCountStar(aggregate)
-                  ? Value(1)
-                  : Evaluate(aggregate.Child(), scope, nullptr, context,
-                             ctes));
+          if (aggregate.WhereFilter() &&
+              !Truthy(Evaluate(aggregate.WhereFilter(), scope, nullptr,
+                               context, ctes))) {
+            continue;
+          }
+          if (IsCountStar(aggregate)) {
+            group->accumulators[i].Add(Value(1));
+            continue;
+          }
+          AggregateInput input;
+          input.value =
+              Evaluate(aggregate.Child(), scope, nullptr, context, ctes);
+          if (aggregate.Having() != AggregateHavingModifier::kNone &&
+              aggregate.HavingCondition()) {
+            input.condition = Evaluate(aggregate.HavingCondition(), scope,
+                                       nullptr, context, ctes);
+          }
+          for (const auto& term : aggregate.InnerOrderBy()) {
+            input.order_keys.push_back(
+                Evaluate(term.expression, scope, nullptr, context, ctes));
+          }
+          if (aggregate.GetType() == AggregationType::kStringAgg &&
+              aggregate.SecondaryArg()) {
+            input.auxiliary =
+                Evaluate(aggregate.SecondaryArg(), scope, nullptr, context,
+                         ctes);
+          }
+          group->accumulators[i].Add(std::move(input));
         }
       });
       auto emit_group = [&](const std::string& key, GroupAggs& group) {
@@ -533,9 +559,9 @@ bool StatementUsesOnlyScopes(  // NOLINT(misc-no-recursion)
     scopes.push_back(std::move(metadata));
   }
   for (const SelectSource& source : statement.Sources()) {
-    if (source.query) { return false;
-}
+    if (source.query || source.unnest) { return false; }
     Relation metadata;
+
     if (const auto cte = ctes.find(source.table); cte != ctes.end()) {
       metadata.schema = cte->second->schema;
     } else {
@@ -637,7 +663,19 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
           context.execution_runtime()->noncacheable_queries.insert(&statement);
           return nullptr;
         }
-        columns.emplace_back(ProjectionName(projection, i), ValueType::kNull);
+        std::string col_name = ProjectionName(projection, i);
+        if (source.query->SelectList().size() == 1 && !source.alias.empty() && projection.name.empty()) {
+          col_name = source.alias;
+        }
+        columns.emplace_back(std::move(col_name), ValueType::kNull);
+      }
+      metadata.schema = Schema("", std::move(columns));
+    } else if (source.unnest) {
+      std::string col_name = source.alias.empty() ? "unnest" : source.alias;
+      std::vector<Column> columns;
+      columns.emplace_back(col_name, ValueType::kNull);
+      if (!source.offset_alias.empty()) {
+        columns.emplace_back(source.offset_alias, ValueType::kInt64);
       }
       metadata.schema = Schema("", std::move(columns));
     } else if (const auto cte = ctes.find(source.table); cte != ctes.end()) {
@@ -652,7 +690,7 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
     }
     const std::string qualifier =
         source.alias.empty() ? source.table : source.alias;
-    if (!qualifier.empty()) {
+    if (!qualifier.empty() && !source.unnest) {
       metadata.schema = QualifySchema(metadata.schema, qualifier);
     }
     schemas.push_back(std::move(metadata));

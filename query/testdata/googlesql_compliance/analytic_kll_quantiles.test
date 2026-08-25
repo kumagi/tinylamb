@@ -1,0 +1,102 @@
+[default required_features=ANALYTIC_FUNCTIONS]
+[name=analytic_kll_quantiles_init_int64_basic]
+SELECT kll_quantiles_init_int64 IS NOT NULL,
+       LENGTH(kll_quantiles_init_int64) > 0
+FROM (
+  SELECT KLL_QUANTILES.INIT_INT64(x, 2) OVER () AS kll_quantiles_init_int64
+  FROM UNNEST([1, 1, 1, 1, 1]) x
+)
+--
+ARRAY<STRUCT<BOOL, BOOL>>[unknown order:
+  {true, true},
+  {true, true},
+  {true, true},
+  {true, true},
+  {true, true}
+]
+==
+
+[name=analytic_kll_quantiles_init_uint64_basic]
+SELECT kll_quantiles_init_uint64 IS NOT NULL,
+  LENGTH(kll_quantiles_init_uint64) > 0
+FROM (
+  SELECT KLL_QUANTILES.INIT_UINT64(x, 2) OVER () AS kll_quantiles_init_uint64
+  FROM UNNEST([CAST(1 AS UINT64), 1, 1, 1, 1]) x
+)
+--
+ARRAY<STRUCT<BOOL, BOOL>>[unknown order:
+  {true, true},
+  {true, true},
+  {true, true},
+  {true, true},
+  {true, true}
+]
+==
+
+[name=analytic_kll_quantiles_init_double_basic]
+SELECT kll_quantiles_init_double IS NOT NULL,
+       LENGTH(kll_quantiles_init_double) > 0
+FROM (
+  SELECT KLL_QUANTILES.INIT_DOUBLE(x, 2) OVER () AS kll_quantiles_init_double
+  FROM UNNEST([1.0, 1.0, 1.0, 1.0, 1.0]) x
+)
+--
+ARRAY<STRUCT<BOOL, BOOL>>[unknown order:
+  {true, true},
+  {true, true},
+  {true, true},
+  {true, true},
+  {true, true}
+]
+==
+
+[name=analytic_kll_quantiles_merge_partial_basic]
+SELECT KLL_QUANTILES.MERGE_PARTIAL(x) OVER () AS kll_quantiles_merge_partial
+FROM UNNEST([CAST(NULL AS BYTES)]) x;
+--
+ARRAY<STRUCT<kll_quantiles_merge_partial BYTES>>[{NULL}]
+==
+
+[name=analytic_kll_quantiles_merge_int64_basic]
+SELECT KLL_QUANTILES.MERGE_INT64(x, 2) OVER () AS kll_quantiles_merge_int64
+FROM UNNEST([CAST(NULL AS BYTES)]) x;
+--
+ARRAY<STRUCT<kll_quantiles_merge_int64 ARRAY<>>>[{ARRAY<INT64>(NULL)}]
+==
+
+[name=analytic_kll_quantiles_merge_uint64_basic]
+SELECT KLL_QUANTILES.MERGE_UINT64(x, 2) OVER () AS kll_quantiles_merge_uint64
+FROM UNNEST([CAST(NULL AS BYTES)]) x;
+--
+ARRAY<STRUCT<kll_quantiles_merge_uint64 ARRAY<>>>[{ARRAY<UINT64>(NULL)}]
+==
+
+[name=analytic_kll_quantiles_merge_double_basic]
+SELECT KLL_QUANTILES.MERGE_DOUBLE(x, 2) OVER () AS kll_quantiles_merge_double
+FROM UNNEST([CAST(NULL AS BYTES)]) x;
+--
+ARRAY<STRUCT<kll_quantiles_merge_double ARRAY<>>>[{ARRAY<DOUBLE>(NULL)}]
+==
+
+[name=analytic_kll_quantiles_merge_point_int64_basic]
+SELECT KLL_QUANTILES.MERGE_POINT_INT64(x, 0.5) OVER ()
+    AS kll_quantiles_merge_point_int64
+FROM UNNEST([CAST(NULL AS BYTES)]) x;
+--
+ARRAY<STRUCT<kll_quantiles_merge_point_int64 INT64>>[{NULL}]
+==
+
+[name=analytic_kll_quantiles_merge_point_uint64_basic]
+SELECT KLL_QUANTILES.MERGE_POINT_UINT64(x, 0.5) OVER ()
+    AS kll_quantiles_merge_point_uint64
+FROM UNNEST([CAST(NULL AS BYTES)]) x;
+--
+ARRAY<STRUCT<kll_quantiles_merge_point_uint64 UINT64>>[{NULL}]
+==
+
+[name=analytic_kll_quantiles_merge_point_double_basic]
+SELECT KLL_QUANTILES.MERGE_POINT_DOUBLE(x, 0.5) OVER ()
+    AS kll_quantiles_merge_point_double
+FROM UNNEST([CAST(NULL AS BYTES)]) x;
+--
+ARRAY<STRUCT<kll_quantiles_merge_point_double DOUBLE>>[{NULL}]

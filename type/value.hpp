@@ -18,6 +18,8 @@
 #define TINYLAMB_VALUE_HPP
 
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 #include "common/serdes.hpp"
 #include "type/value_type.hpp"
@@ -25,13 +27,19 @@
 namespace tinylamb {
 class Encoder;
 class Decoder;
+struct ArrayPayload;
 
 enum class UnaryOperation : int {
   kIsNull,
   kIsNotNull,
+  kIsTrue,
+  kIsNotTrue,
+  kIsFalse,
+  kIsNotFalse,
   kNot,
   kMinus,
 };
+
 
 enum class AggregationType : int {
   kCount,
@@ -39,6 +47,11 @@ enum class AggregationType : int {
   kAvg,
   kMin,
   kMax,
+  kLogicalAnd,
+  kLogicalOr,
+  kArrayAgg,
+  kStringAgg,
+  kCountIf,
 };
 
 std::string ToString(AggregationType type);
@@ -62,7 +75,12 @@ class Value {
   explicit Value(double double_value);
   [[nodiscard]] static Value Date(std::string_view date);
   [[nodiscard]] static Value DateFromDays(int64_t days);
+  [[nodiscard]] static Value Array(std::vector<Value> elements,
+                                   std::string element_sql_type);
   [[nodiscard]] int64_t DateDays() const;
+  [[nodiscard]] bool IsArray() const { return type == ValueType::kArray; }
+  [[nodiscard]] const std::vector<Value>& ArrayElements() const;
+  [[nodiscard]] const std::string& ArrayElementSqlType() const;
   Value(const Value& o);
   Value(Value&& o) noexcept;
 
@@ -121,6 +139,7 @@ class Value {
   } value{0};
   ValueType type{ValueType::kNull};
   std::string owned_data;
+  std::shared_ptr<ArrayPayload> array_;
 };
 
 }  // namespace tinylamb

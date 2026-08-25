@@ -1,0 +1,814 @@
+[default extract_labels]
+[prepare_database]
+CREATE TABLE StringTable(
+  primary_Key INT64,
+  col_ci STRING COLLATE 'und:ci',
+  col_binary STRING COLLATE 'binary',
+  col_no_collation STRING) AS
+SELECT 1 AS primary_Key, "a" AS col_ci, "a" col_binary, "a" UNION ALL
+SELECT 2, "A", "A", "A" UNION ALL
+SELECT 3, "a", "A", "a" UNION ALL
+SELECT 4, "A", "a", "A" UNION ALL
+SELECT 5, "b", "b", "b" UNION ALL
+SELECT 6, "B", "B", "B"
+--
+ARRAY<STRUCT<
+        primary_Key INT64,
+        col_ci STRING,
+        col_binary STRING,
+        col_no_collation STRING
+      >>
+[{1, "a", "a", "a"},
+ {2, "A", "A", "A"},
+ {3, "a", "A", "a"},
+ {4, "A", "a", "A"},
+ {5, "b", "b", "b"},
+ {6, "B", "B", "B"}]
+==
+
+[required_features=ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS]
+[prepare_database]
+CREATE TEMP FUNCTION udf_with_collated_return(s1 STRING) AS (
+  COLLATE(s1, 'und:ci')
+);
+
+==
+
+[required_features=TEMPLATE_FUNCTIONS]
+[prepare_database]
+CREATE TEMP FUNCTION templated_udf_with_collated_return(x ANY TYPE) AS (
+  COLLATE(CAST(x AS STRING), 'und:ci')
+);
+
+==
+
+[prepare_database]
+CREATE TEMP FUNCTION udf_with_fixed_args(s1 STRING, s2 STRING)
+AS (
+  s1 = s2
+);
+==
+
+[required_features=]
+[prepare_database]
+CREATE TEMP FUNCTION udf_fixed_calls_another_udf(a STRUCT<x STRING, y ARRAY<STRING>>)
+AS (
+  udf_with_fixed_args(a.x || 'suffix', ARRAY_FIRST(a.y) || 'suffix')
+);
+==
+
+[required_features=TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS,ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,CREATE_TABLE_FUNCTION]
+[prepare_database]
+CREATE TEMP AGGREGATE FUNCTION uda_with_fixed_args(s1 STRING) AS (
+ (COUNT(distinct s1))
+);
+
+==
+
+[required_features=TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS,ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,CREATE_TABLE_FUNCTION]
+[prepare_database]
+CREATE TEMP AGGREGATE FUNCTION uda_fixed_calls_another_uda(s1 STRING) AS (
+  uda_with_fixed_args(s1 || 'suffix')
+);
+==
+
+
+[required_features=ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,CREATE_TABLE_FUNCTION,TEMPLATE_FUNCTIONS]
+[prepare_database]
+CREATE TEMP FUNCTION udf_templated(s1 ANY TYPE, s2 ANY TYPE)
+AS (
+  s1 = s2
+);
+
+==
+
+[required_features=ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,CREATE_TABLE_FUNCTION,TEMPLATE_FUNCTIONS]
+[prepare_database]
+CREATE TEMP AGGREGATE FUNCTION uda_templated(s1 ANY TYPE)
+AS (
+  (COUNT(DISTINCT s1))
+);
+==
+
+[required_features=TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS,ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,CREATE_TABLE_FUNCTION]
+[prepare_database]
+CREATE TABLE FUNCTION tvf_fixed_table_passthrough_implicit_return(t TABLE<primary_key INT64, col_ci STRING>)
+AS (
+  SELECT col_ci, count(*) AS cnt FROM t GROUP BY col_ci
+);
+
+==
+
+[required_features=TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS,ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,CREATE_TABLE_FUNCTION]
+[prepare_database]
+CREATE TABLE FUNCTION tvf_fixed_table_passthrough_explicit_return(t TABLE<primary_key INT64, col_ci STRING>)
+RETURNS TABLE<col_ci STRING, cnt INT64>
+AS (
+  SELECT col_ci, count(*) AS cnt FROM t GROUP BY col_ci
+);
+
+==
+
+[required_features=TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS,ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,CREATE_TABLE_FUNCTION]
+[prepare_database]
+CREATE TABLE FUNCTION tvf_fixed_args(t TABLE<primary_key INT64, col_ci STRING>, a ARRAY<STRING>)
+AS (
+  SELECT * FROM t WHERE t.col_ci IN (SELECT * FROM UNNEST(a))
+);
+
+==
+
+[required_features=CREATE_TABLE_FUNCTION,TEMPLATE_FUNCTIONS]
+[prepare_database]
+CREATE TABLE FUNCTION tvf_templated_implicit_return(t ANY TABLE, a ANY TYPE)
+AS (
+  SELECT * FROM t WHERE t.col_ci IN (SELECT * FROM UNNEST(a))
+);
+==
+
+[required_features=CREATE_TABLE_FUNCTION,TEMPLATE_FUNCTIONS]
+[prepare_database]
+CREATE TABLE FUNCTION tvf_templated_explicit_return(t ANY TABLE, a ANY TYPE)
+RETURNS TABLE<col_ci STRING, cnt INT64>
+AS (
+  SELECT col_ci, 1 AS cnt
+  FROM t
+  WHERE t.col_ci IN (SELECT * FROM UNNEST(a))
+);
+==
+
+[required_features=TEMPLATE_FUNCTIONS,ANY_STRING_TEMPLATED_ARGUMENT]
+[prepare_database]
+# For all function kinds, we also ensure that concrete arguments do not leak
+# collation from their inputs.
+CREATE TEMP FUNCTION udf_with_any_string(s1 ANY STRING, s2 ANY STRING DEFAULT "A", s3 STRING DEFAULT "B") AS (
+  s1
+  || IF(s2 = s3, '_and_eq_', '_and_ne_')
+  || s2
+  || s3
+);
+==
+
+[required_features=TEMPLATE_FUNCTIONS,ANY_STRING_TEMPLATED_ARGUMENT,FUNCTION_ARGUMENTS_WITH_DEFAULTS]
+[prepare_database]
+CREATE TEMP AGGREGATE FUNCTION uda_with_any_string(s1 ANY STRING DEFAULT "default_val", s2 ANY STRING DEFAULT "A" NOT AGGREGATE, s3 STRING DEFAULT "B" NOT AGGREGATE) AS (
+  CAST(IF (s2 = s3, COUNT(DISTINCT s1), COUNT(DISTINCT s1) - 100) AS STRING)
+    || s2 || s3
+);
+==
+
+[required_features=CREATE_TABLE_FUNCTION,TEMPLATE_FUNCTIONS,ANY_STRING_TEMPLATED_ARGUMENT,FUNCTION_ARGUMENTS_WITH_DEFAULTS]
+[prepare_database]
+CREATE TABLE FUNCTION tvf_with_any_string(t TABLE<col STRING>, x ANY STRING DEFAULT "A", y STRING DEFAULT "B") AS (
+  SELECT *, x, y FROM t WHERE col = x
+)
+==
+
+[default required_features=TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS,ANNOTATION_FRAMEWORK,COLLATION_SUPPORT]
+[name=collation_in_fixed_udfs]
+SELECT
+  primary_key,
+  col_ci,
+  col_binary,
+  udf_with_fixed_args(col_ci, COLLATE(col_binary, 'und:ci')),
+  udf_fixed_calls_another_udf((COLLATE(col_ci, 'binary'), [col_binary, 'arg']))
+FROM StringTable
+ORDER BY primary_key
+--
+ARRAY<STRUCT<primary_key INT64, col_ci STRING, col_binary STRING, BOOL, BOOL>>[known order:
+  {1, "a", "a", true, true},
+  {2, "A", "A", true, true},
+  {3, "a", "A", false, false},
+  {4, "A", "a", false, false},
+  {5, "b", "b", true, true},
+  {6, "B", "B", true, true}
+]
+--
+FunctionErrorMode::COLLATE:FN_COLLATE:DEFAULT_ERROR_MODE
+FunctionName::COLLATE
+FunctionSignature::COLLATE:FN_COLLATE
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+OperatorName:ARRAY[...]
+OperatorSignature:ARRAY[...]:FN_MAKE_ARRAY
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_CAST
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Expression:RESOLVED_MAKE_STRUCT
+ResolvedNodeKind:Scan:RESOLVED_ORDER_BY_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeCast:TYPE_ARRAY:TYPE_ARRAY
+TypeCast:TYPE_STRING:TYPE_STRING
+TypeKind:TYPE_ARRAY
+TypeKind:TYPE_BOOL
+TypeKind:TYPE_INT64
+TypeKind:TYPE_STRING
+TypeKind:TYPE_STRUCT
+collation_propagated_to_sql_function
+==
+
+[required_features=COLLATION_SUPPORT,ANNOTATION_FRAMEWORK,TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS]
+[name=collation_in_fixed_udas]
+SELECT
+  uda_with_fixed_args(col_ci) AS c1,
+  uda_fixed_calls_another_uda(col_ci) AS c2
+FROM StringTable
+WHERE COLLATE('a', 'und:ci') = 'A'  -- Dummy tautology for the feature_integrity_test.
+--
+ARRAY<STRUCT<c1 INT64, c2 INT64>>[{4, 4}]
+--
+FunctionErrorMode::COLLATE:FN_COLLATE:DEFAULT_ERROR_MODE
+FunctionName::COLLATE
+FunctionSignature::COLLATE:FN_COLLATE
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+OperatorName:=
+OperatorSignature:=:FN_EQUAL
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_AGGREGATE_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_CAST
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_AGGREGATE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_FILTER_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeCast:TYPE_STRING:TYPE_STRING
+TypeKind:TYPE_BOOL
+TypeKind:TYPE_INT64
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+[required_features=COLLATION_SUPPORT,ANNOTATION_FRAMEWORK,TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS]
+[name=collation_in_templated_udfs]
+SELECT
+  primary_key,
+  col_ci,
+  col_binary,
+  udf_templated(col_ci, COLLATE(col_binary, 'und:ci')),
+  udf_templated(COLLATE(col_ci, 'binary'), col_binary)
+FROM StringTable
+ORDER BY primary_key
+--
+ARRAY<STRUCT<primary_key INT64, col_ci STRING, col_binary STRING, BOOL, BOOL>>[known order:
+  {1, "a", "a", true, true},
+  {2, "A", "A", true, true},
+  {3, "a", "A", true, false},
+  {4, "A", "a", true, false},
+  {5, "b", "b", true, true},
+  {6, "B", "B", true, true}
+]
+--
+FunctionErrorMode::COLLATE:FN_COLLATE:DEFAULT_ERROR_MODE
+FunctionName::COLLATE
+FunctionSignature::COLLATE:FN_COLLATE
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_ORDER_BY_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeKind:TYPE_BOOL
+TypeKind:TYPE_INT64
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+[name=collation_in_templated_udas]
+SELECT uda_templated(col_ci)
+FROM StringTable
+--
+ARRAY<STRUCT<INT64>>[{2}]
+--
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_AGGREGATE_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Scan:RESOLVED_AGGREGATE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeKind:TYPE_INT64
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+[default required_features=TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS,ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,TABLE_VALUED_FUNCTIONS]
+[name=collation_in_non_templated_tvf]
+SELECT
+  primary_key,
+  col_ci
+FROM tvf_fixed_args(TABLE StringTable, ['a', 'b'])
+WHERE COLLATE('a', 'und:ci') = 'A'  -- Dummy tautology for the feature_integrity_test.
+ORDER BY primary_key
+--
+ARRAY<STRUCT<primary_key INT64, col_ci STRING>>[known order:
+  {1, "a"},
+  {3, "a"},
+  {5, "b"}
+]
+--
+FunctionErrorMode::COLLATE:FN_COLLATE:DEFAULT_ERROR_MODE
+FunctionName::COLLATE
+FunctionSignature::COLLATE:FN_COLLATE
+LanguageFeature::FEATURE_TABLE_VALUED_FUNCTIONS
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+OperatorName:=
+OperatorSignature:=:FN_EQUAL
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_CAST
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_FILTER_SCAN
+ResolvedNodeKind:Scan:RESOLVED_ORDER_BY_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TVFSCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeCast:TYPE_STRING:TYPE_STRING
+TypeKind:TYPE_ARRAY
+TypeKind:TYPE_BOOL
+TypeKind:TYPE_INT64
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+# Like the above, but also uses the output columns in contexts, e.g. GROUP BY
+[name=collation_in_non_templated_tvf2]
+SELECT
+  col_ci, ARRAY_AGG(col_ci),
+  COUNT(*) AS count
+FROM tvf_fixed_args(TABLE StringTable, ['a', 'b'])
+WHERE COLLATE('a', 'und:ci') = 'A'  -- Dummy tautology for the feature_integrity_test.
+GROUP BY col_ci
+ORDER BY col_ci
+--
+ARRAY<STRUCT<col_ci STRING, ARRAY<>, count INT64>>[known order:
+  {
+    "a",
+    ARRAY<STRING>[unknown order:"a", "a"],
+    2
+  },
+  {"b", ARRAY<STRING>["b"], 1}
+]
+--
+AggregateFunctionSignature::COUNT(*):FN_COUNT_STAR
+AggregateFunctionSignature:ARRAY:ARRAY_AGG:FN_ARRAY_AGG
+FunctionErrorMode::COLLATE:FN_COLLATE:DEFAULT_ERROR_MODE
+FunctionErrorMode::COUNT(*):FN_COUNT_STAR:DEFAULT_ERROR_MODE
+FunctionErrorMode:ARRAY:ARRAY_AGG:FN_ARRAY_AGG:DEFAULT_ERROR_MODE
+FunctionFamily:ARRAY
+FunctionName::COLLATE
+FunctionName::COUNT(*)
+FunctionName:ARRAY:ARRAY_AGG
+FunctionSignature::COLLATE:FN_COLLATE
+FunctionSignature::COUNT(*):FN_COUNT_STAR
+FunctionSignature:ARRAY:ARRAY_AGG:FN_ARRAY_AGG
+LanguageFeature::FEATURE_TABLE_VALUED_FUNCTIONS
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+OperatorName:=
+OperatorSignature:=:FN_EQUAL
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_AGGREGATE_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_CAST
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_AGGREGATE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_FILTER_SCAN
+ResolvedNodeKind:Scan:RESOLVED_ORDER_BY_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TVFSCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeCast:TYPE_STRING:TYPE_STRING
+TypeKind:TYPE_ARRAY
+TypeKind:TYPE_BOOL
+TypeKind:TYPE_INT64
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+[name=collation_in_templated_tvf_implicit_return]
+SELECT
+  primary_key,
+  col_ci
+FROM tvf_templated_implicit_return(TABLE StringTable, ['a', 'b'])
+ORDER BY primary_key
+--
+ARRAY<STRUCT<primary_key INT64, col_ci STRING>>[known order:
+  {1, "a"},
+  {2, "A"},
+  {3, "a"},
+  {4, "A"},
+  {5, "b"},
+  {6, "B"}
+]
+--
+LanguageFeature::FEATURE_TABLE_VALUED_FUNCTIONS
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_ORDER_BY_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TVFSCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeKind:TYPE_ARRAY
+TypeKind:TYPE_INT64
+collation_propagated_to_sql_function
+==
+
+# Like the above, but also uses the output columns in contexts, e.g. GROUP BY
+[name=collation_in_templated_tvf_implicit_return_use_output_columns]
+SELECT
+  UPPER(col_ci),
+  COUNT(*) AS count
+FROM tvf_templated_implicit_return(TABLE StringTable, ['a', 'b'])
+GROUP BY col_ci
+ORDER BY col_ci
+--
+ARRAY<STRUCT<STRING, count INT64>>[known order:{"A", 4}, {"B", 2}]
+--
+AggregateFunctionSignature::COUNT(*):FN_COUNT_STAR
+FunctionErrorMode::COUNT(*):FN_COUNT_STAR:DEFAULT_ERROR_MODE
+FunctionErrorMode::UPPER:FN_UPPER_STRING:DEFAULT_ERROR_MODE
+FunctionName::COUNT(*)
+FunctionName::UPPER
+FunctionSignature::COUNT(*):FN_COUNT_STAR
+FunctionSignature::UPPER:FN_UPPER_STRING
+LanguageFeature::FEATURE_TABLE_VALUED_FUNCTIONS
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_AGGREGATE_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_AGGREGATE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_ORDER_BY_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TVFSCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeKind:TYPE_ARRAY
+TypeKind:TYPE_INT64
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+[name=collation_in_templated_tvf_explicit_return]
+SELECT
+  col_ci,
+  (col_ci = 'A' AND col_ci = 'a') OR (col_ci = 'B' AND col_ci = 'b') AS is_collated
+FROM tvf_templated_explicit_return(TABLE StringTable, ['a', 'b'])
+ORDER BY col_ci
+--
+ARRAY<STRUCT<col_ci STRING, is_collated BOOL>>[known order:
+  {"A", false},
+  {"A", false},
+  {"B", false},
+  {"a", false},
+  {"a", false},
+  {"b", false}
+]
+--
+LanguageFeature::FEATURE_TABLE_VALUED_FUNCTIONS
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+OperatorName:=
+OperatorName:AND
+OperatorName:OR
+OperatorSignature:=:FN_EQUAL
+OperatorSignature:AND:FN_AND
+OperatorSignature:OR:FN_OR
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_ORDER_BY_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TVFSCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeKind:TYPE_ARRAY
+TypeKind:TYPE_BOOL
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+# Ensure that collation gets dropped on concrete (STRING) args, and propagate
+# for ANY STRING args.
+[required_features=TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS,ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS]
+[name=collation_in_any_string_udfs]
+SELECT
+  udf_with_any_string(col_ci) udf_with_defaults,
+  udf_with_any_string(col_ci, "X", COLLATE("x", "binary")) udf_explicit_args,
+  COUNT(*) AS count
+FROM StringTable
+GROUP BY udf_with_defaults, udf_explicit_args
+--
+ARRAY<STRUCT<
+        udf_with_defaults STRING,
+        udf_explicit_args STRING,
+        count INT64
+      >>
+[unknown order:
+  {"A_and_ne_AB", "A_and_ne_Xx", 4},
+  {"B_and_ne_AB", "B_and_ne_Xx", 2}
+]
+--
+AggregateFunctionSignature::COUNT(*):FN_COUNT_STAR
+FunctionErrorMode::COLLATE:FN_COLLATE:DEFAULT_ERROR_MODE
+FunctionErrorMode::COUNT(*):FN_COUNT_STAR:DEFAULT_ERROR_MODE
+FunctionName::COLLATE
+FunctionName::COUNT(*)
+FunctionSignature::COLLATE:FN_COLLATE
+FunctionSignature::COUNT(*):FN_COUNT_STAR
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_AGGREGATE_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_CAST
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_AGGREGATE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeCast:TYPE_STRING:TYPE_STRING
+TypeKind:TYPE_INT64
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+# Ensure that collation gets dropped on concrete (STRING) args, and propagate
+# for ANY STRING args.
+[required_features=TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS,ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS]
+[name=collation_in_any_string_udas]
+SELECT
+  uda_with_any_string() uda_with_defaults,
+  uda_with_any_string(col_ci, "X", "x") uda_explicit_args,
+FROM StringTable
+--
+ARRAY<STRUCT<
+        uda_with_defaults STRING,
+        uda_explicit_args STRING
+      >>[{"-99AB", "-98Xx"}]
+--
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_AGGREGATE_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_AGGREGATE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+[required_features=TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS,TABLE_VALUED_FUNCTIONS]
+[name=collation_in_tvf_with_any_string_applies_correct_defaults]
+SELECT
+  col, x, y, COUNT(*) AS count
+FROM tvf_with_any_string((SELECT col_ci AS col FROM StringTable))
+GROUP BY col, x, y
+ORDER BY col
+--
+ARRAY<STRUCT<col STRING, x STRING, y STRING, count INT64>>[{"A", "A", "B", 2}]
+--
+AggregateFunctionSignature::COUNT(*):FN_COUNT_STAR
+FunctionErrorMode::COUNT(*):FN_COUNT_STAR:DEFAULT_ERROR_MODE
+FunctionName::COUNT(*)
+FunctionSignature::COUNT(*):FN_COUNT_STAR
+LanguageFeature::FEATURE_TABLE_VALUED_FUNCTIONS
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_AGGREGATE_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_AGGREGATE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_ORDER_BY_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TVFSCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+TimeResolution:Any
+TypeKind:TYPE_INT64
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+# Like the above, but also uses the output columns in contexts, e.g. GROUP BY
+# Ensure that collation gets dropped on concrete (STRING) args, and propagate
+# for ANY STRING args.
+[name=collation_in_tvf_with_any_string_explicit_args]
+SELECT
+  col, x, y, COUNT(*) AS count
+FROM tvf_with_any_string((SELECT col_ci AS col FROM StringTable), "A", COLLATE("a", "binary"))
+GROUP BY col, x, y
+ORDER BY col
+--
+ARRAY<STRUCT<col STRING, x STRING, y STRING, count INT64>>[{"A", "A", "a", 2}]
+--
+AggregateFunctionSignature::COUNT(*):FN_COUNT_STAR
+FunctionErrorMode::COLLATE:FN_COLLATE:DEFAULT_ERROR_MODE
+FunctionErrorMode::COUNT(*):FN_COUNT_STAR:DEFAULT_ERROR_MODE
+FunctionName::COLLATE
+FunctionName::COUNT(*)
+FunctionSignature::COLLATE:FN_COLLATE
+FunctionSignature::COUNT(*):FN_COUNT_STAR
+LanguageFeature::FEATURE_TABLE_VALUED_FUNCTIONS
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_AGGREGATE_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_CAST
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_AGGREGATE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_ORDER_BY_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TVFSCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeCast:TYPE_STRING:TYPE_STRING
+TypeKind:TYPE_INT64
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+[required_features=ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,TYPE_MODIFIERS_IN_EXPLICIT_CONSTRUCTORS_AND_UDF]
+[name=collation_in_udf_return_type]
+SELECT
+  udf_with_collated_return('A') = udf_with_collated_return('a') AS is_collated
+--
+ARRAY<STRUCT<is_collated BOOL>>[{true}]
+--
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+LanguageFeature:VERSION_1_5:FEATURE_TYPE_MODIFIERS_IN_EXPLICIT_CONSTRUCTORS_AND_UDF
+OperatorName:=
+OperatorSignature:=:FN_EQUAL
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_SINGLE_ROW_SCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeKind:TYPE_BOOL
+TypeKind:TYPE_STRING
+==
+
+[required_features=TABLE_VALUED_FUNCTIONS,TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS]
+[name=collation_in_tvf_fixed_table_passthrough_implicit_return]
+SELECT
+  col_ci,
+  cnt
+FROM tvf_fixed_table_passthrough_implicit_return(TABLE StringTable)
+WHERE col_ci = 'a' AND col_ci != 'A'
+ORDER BY col_ci
+--
+ARRAY<STRUCT<col_ci STRING, cnt INT64>>[{"a", 2}]
+--
+LanguageFeature::FEATURE_TABLE_VALUED_FUNCTIONS
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+OperatorName:!=
+OperatorName:=
+OperatorName:AND
+OperatorSignature:!=:FN_NOT_EQUAL
+OperatorSignature:=:FN_EQUAL
+OperatorSignature:AND:FN_AND
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_FILTER_SCAN
+ResolvedNodeKind:Scan:RESOLVED_ORDER_BY_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TVFSCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+TimeResolution:Any
+TypeKind:TYPE_BOOL
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+[required_features=TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS,ANNOTATION_FRAMEWORK,COLLATION_SUPPORT]
+[name=collation_in_templated_udf_return_type]
+SELECT
+  templated_udf_with_collated_return('A') = templated_udf_with_collated_return('a') AS is_collated
+--
+ARRAY<STRUCT<is_collated BOOL>>[{true}]
+--
+LanguageFeature:VERSION_1_3:FEATURE_ANNOTATION_FRAMEWORK
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+LanguageFeature:VERSION_1_5:FEATURE_COLLATION_SUPPORT
+OperatorName:=
+OperatorSignature:=:FN_EQUAL
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_SINGLE_ROW_SCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+Special:InDevelopment
+TimeResolution:Any
+TypeKind:TYPE_BOOL
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function
+==
+
+[required_features=TABLE_VALUED_FUNCTIONS,TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS]
+[name=collation_in_tvf_fixed_table_passthrough_explicit_return]
+SELECT
+  col_ci,
+  cnt
+FROM tvf_fixed_table_passthrough_explicit_return(TABLE StringTable)
+WHERE col_ci = 'a' AND col_ci != 'A'
+ORDER BY col_ci
+--
+ARRAY<STRUCT<col_ci STRING, cnt INT64>>[{"a", 2}]
+--
+LanguageFeature::FEATURE_TABLE_VALUED_FUNCTIONS
+LanguageFeature:VERSION_1_4:FEATURE_TYPE_ANNOTATIONS_ON_SQL_FUNCTION_ARGUMENTS
+OperatorName:!=
+OperatorName:=
+OperatorName:AND
+OperatorSignature:!=:FN_NOT_EQUAL
+OperatorSignature:=:FN_EQUAL
+OperatorSignature:AND:FN_AND
+ProductMode:InternalAndExternal
+ResolvedNodeKind:Expression:RESOLVED_COLUMN_REF
+ResolvedNodeKind:Expression:RESOLVED_FUNCTION_CALL
+ResolvedNodeKind:Expression:RESOLVED_LITERAL
+ResolvedNodeKind:Scan:RESOLVED_FILTER_SCAN
+ResolvedNodeKind:Scan:RESOLVED_ORDER_BY_SCAN
+ResolvedNodeKind:Scan:RESOLVED_PROJECT_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TABLE_SCAN
+ResolvedNodeKind:Scan:RESOLVED_TVFSCAN
+ResolvedNodeKind:Statement:RESOLVED_QUERY_STMT
+TimeResolution:Any
+TypeKind:TYPE_BOOL
+TypeKind:TYPE_STRING
+collation_propagated_to_sql_function

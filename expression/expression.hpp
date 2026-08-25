@@ -22,6 +22,9 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
+#include <vector>
+#include <vector>
 
 #include "common/status_or.hpp"
 #include "type/column_name.hpp"
@@ -41,6 +44,8 @@ class InExpression;
 class FunctionCallExpression;
 class QueryExpression;
 class IntervalExpression;
+class ArrayExpression;
+class CastExpression;
 class SelectStatement;
 class EvaluationContext;
 
@@ -64,6 +69,9 @@ class ExpressionBase {
   [[nodiscard]] const FunctionCallExpression& AsFunctionCallExpression() const;
   [[nodiscard]] const QueryExpression& AsQueryExpression() const;
   [[nodiscard]] const IntervalExpression& AsIntervalExpression() const;
+  [[nodiscard]] const ArrayExpression& AsArrayExpression() const;
+  [[nodiscard]] const CastExpression& AsCastExpression() const;
+
   [[nodiscard]] virtual std::unordered_set<ColumnName> TouchedColumns() const;
   [[nodiscard]] virtual Value Evaluate(const Row& row,
                                        const Schema& schema) const = 0;
@@ -121,8 +129,14 @@ Expression FunctionCallExp(std::string func_name,
 Expression QueryExpressionExp(std::shared_ptr<SelectStatement> query,
                               Expression test = nullptr, bool exists = false,
                               bool negated = false);
-Expression IntervalExpressionExp(int64_t amount, std::string unit);
+Expression IntervalExpressionExp(int64_t amount, std::string unit,
+                                std::string raw_amount = "");
+Expression ArrayExpressionExp(std::vector<Expression> elements,
+                              std::string element_sql_type);
+Expression CastExpressionExp(Expression child, std::string target_type_name,
+                             bool return_null_on_error = false);
 
 }  // namespace tinylamb
+
 
 #endif  // TINYLAMB_EXPRESSION_HPP

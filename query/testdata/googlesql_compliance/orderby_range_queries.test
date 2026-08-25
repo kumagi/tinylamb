@@ -1,0 +1,2306 @@
+# Tests for ORDER BY with RANGE type.
+
+[prepare_database]
+[required_features=RANGE_TYPE]
+CREATE TABLE AllTypesRangeTable AS
+SELECT CAST(1 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       TIMESTAMP '2014-01-01 00:00:01.011011 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2011-01-01 00:00:00+00, 2011-10-15 00:00:00+00)' as range_timestamp_val,
+       RANGE<DATE> '[2011-01-01, 2011-10-15)' as range_date_val
+UNION ALL
+SELECT CAST(2 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       TIMESTAMP '2014-01-01 00:00:01.011011 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2011-01-01 00:00:00+00, 2011-10-15 00:00:00+00)' as range_timestamp_val,
+       RANGE<DATE> '[2011-01-01, 2011-10-15)' as range_date_val
+UNION ALL
+SELECT CAST(3 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       TIMESTAMP '2014-01-01 00:00:01.011011 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2011-01-01 00:00:00+00, 2011-10-15 00:00:00+00)' as range_timestamp_val,
+       RANGE<DATE> '[2011-01-01, 2011-10-15)' as range_date_val
+UNION ALL
+SELECT CAST(4 AS int64) as row_id,
+       CAST(-2 AS int64) as int64_val,
+       CAST('2014-01-02' AS DATE) as date_val,
+       TIMESTAMP '2014-01-02 00:00:02.022022 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2012-01-01 00:00:00+00, 2012-10-15 00:00:00+00)' as range_timestamp_val,
+       RANGE<DATE> '[2012-01-01, 2012-10-15)' as range_date_val
+UNION ALL
+SELECT CAST(5 AS int64) as row_id,
+       CAST(-2 AS int64) as int64_val,
+       CAST('2014-01-02' AS DATE) as date_val,
+       TIMESTAMP '2014-01-02 00:00:02.022022 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2012-01-01 00:00:00+00, 2012-10-15 00:00:00+00)' as range_timestamp_val,
+       RANGE<DATE> '[2012-01-01, 2012-10-15)' as range_date_val
+UNION ALL
+SELECT CAST(6 AS int64) as row_id,
+       CAST(-3 AS int64) as int64_val,
+       CAST('2014-01-03' AS DATE) as date_val,
+       TIMESTAMP '2014-01-03 00:00:03.033033 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2013-01-01 00:00:00+00, 2013-10-15 00:00:00+00)' as range_timestamp_val,
+       RANGE<DATE> '[2013-01-01, 2013-10-15)' as range_date_val
+UNION ALL
+SELECT CAST(7 AS int64) as row_id,
+       CAST(-4 AS int64) as int64_val,
+       CAST('2014-01-04' AS DATE) as date_val,
+       TIMESTAMP '2014-01-04 00:00:04.044044 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2014-01-01 00:00:00+00, 2014-10-15 00:00:00+00)' as range_timestamp_val,
+       RANGE<DATE> '[2014-01-01, 2014-10-15)' as range_date_val
+UNION ALL
+SELECT CAST(8 AS int64) as row_id,
+       CAST(NULL AS int64) as int64_val,
+       CAST(NULL AS DATE) as date_val,
+       CAST(NULL AS TIMESTAMP) as timestamp_val,
+       CAST(NULL AS RANGE<TIMESTAMP>) as range_timestamp_val,
+       CAST(NULL AS RANGE<DATE>) as range_date_val
+UNION ALL
+SELECT CAST(9 AS int64) as row_id,
+       CAST(NULL AS int64) as int64_val,
+       CAST(NULL AS DATE) as date_val,
+       CAST(NULL AS TIMESTAMP) as timestamp_val,
+       CAST(NULL AS RANGE<TIMESTAMP>) as range_timestamp_val,
+       CAST(NULL AS RANGE<DATE>) as range_date_val
+UNION ALL
+SELECT CAST(10 AS int64) as row_id,
+       CAST(1 AS int64) as int64_val,
+       CAST('2014-01-08' AS DATE) as date_val,
+       TIMESTAMP '2014-01-02 00:00:01.011011 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2011-01-01 00:00:00+00, 2011-10-15 00:00:00+00)' as range_timestamp_val,
+       RANGE<DATE> '[2011-01-01, 2011-10-15)' as range_date_val
+UNION ALL
+SELECT CAST(11 AS int64) as row_id,
+       CAST(3 AS int64) as int64_val,
+       CAST('2014-02-01' AS DATE) as date_val,
+       TIMESTAMP '2014-04-01 00:00:01.011011 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2015-01-01 00:00:00+00, 2015-10-15 00:00:00+00)' as range_timestamp_val,
+       RANGE<DATE> '[2013-01-01, 2013-10-15)' as range_date_val
+UNION ALL
+SELECT CAST(12 AS int64) as row_id,
+       CAST(16 AS int64) as int64_val,
+       CAST('2014-02-02' AS DATE) as date_val,
+       TIMESTAMP '2014-01-05 00:00:02.022022 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2012-01-01 00:00:00+00, 2012-10-15 00:00:00+00)' as range_timestamp_val,
+       RANGE<DATE> '[2026-01-01, 2026-10-15)' as range_date_val
+UNION ALL
+SELECT CAST(13 AS int64) as row_id,
+       CAST(9 AS int64) as int64_val,
+       CAST('2014-05-02' AS DATE) as date_val,
+       TIMESTAMP '2014-05-02 00:00:02.022022 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2019-01-01 00:00:00+00, 2019-10-15 00:00:00+00)' as range_timestamp_val,
+       RANGE<DATE> '[2019-01-01, 2019-10-15)' as range_date_val
+UNION ALL
+SELECT CAST(14 AS int64) as row_id,
+       CAST(23 AS int64) as int64_val,
+       CAST('2014-01-06' AS DATE) as date_val,
+       TIMESTAMP '2014-01-04 00:00:03.033033 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[UNBOUNDED, 2013-10-15 00:00:00+00)' as range_timestamp_val,
+       RANGE<DATE> '[2017-01-01, UNBOUNDED)' as range_date_val
+UNION ALL
+SELECT CAST(15 AS int64) as row_id,
+       CAST(-14 AS int64) as int64_val,
+       CAST('2014-02-04' AS DATE) as date_val,
+       TIMESTAMP '2014-02-04 00:00:04.044044 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2017-01-01 00:00:00+00, UNBOUNDED)' as range_timestamp_val,
+       RANGE<DATE> '[UNBOUNDED, 2007-10-15)' as range_date_val
+UNION ALL
+SELECT CAST(16 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST(NULL AS DATE) as date_val,
+       TIMESTAMP '2014-02-04 00:00:04.044044 UTC' as
+           timestamp_val,
+       RANGE<TIMESTAMP> '[2004-01-01 00:00:00+00, 2004-10-15 00:00:00+00)' as range_timestamp_val,
+       CAST (NULL AS RANGE<DATE>) as range_date_val
+UNION ALL
+SELECT CAST(17 AS int64) as row_id,
+       CAST(NULL AS int64) as int64_val,
+       CAST('2014-02-04' AS DATE) as date_val,
+       CAST(NULL AS TIMESTAMP) as timestamp_val,
+       CAST (NULL AS RANGE<TIMESTAMP>) as range_timestamp_val,
+       RANGE<DATE> '[2007-01-01, 2007-10-15)' as range_date_val
+--
+ARRAY<STRUCT<
+        row_id INT64,
+        int64_val INT64,
+        date_val DATE,
+        timestamp_val TIMESTAMP,
+        range_timestamp_val RANGE<TIMESTAMP>,
+        range_date_val RANGE<DATE>
+      >>
+[{1,
+  -1,
+  2014-01-01,
+  2014-01-01 00:00:01.011011+00,
+  [
+    2011-01-01 00:00:00+00,
+    2011-10-15 00:00:00+00
+  ),
+  [2011-01-01, 2011-10-15)},
+ {2,
+  -1,
+  2014-01-01,
+  2014-01-01 00:00:01.011011+00,
+  [
+    2011-01-01 00:00:00+00,
+    2011-10-15 00:00:00+00
+  ),
+  [2011-01-01, 2011-10-15)},
+ {3,
+  -1,
+  2014-01-01,
+  2014-01-01 00:00:01.011011+00,
+  [
+    2011-01-01 00:00:00+00,
+    2011-10-15 00:00:00+00
+  ),
+  [2011-01-01, 2011-10-15)},
+ {4,
+  -2,
+  2014-01-02,
+  2014-01-02 00:00:02.022022+00,
+  [
+    2012-01-01 00:00:00+00,
+    2012-10-15 00:00:00+00
+  ),
+  [2012-01-01, 2012-10-15)},
+ {5,
+  -2,
+  2014-01-02,
+  2014-01-02 00:00:02.022022+00,
+  [
+    2012-01-01 00:00:00+00,
+    2012-10-15 00:00:00+00
+  ),
+  [2012-01-01, 2012-10-15)},
+ {6,
+  -3,
+  2014-01-03,
+  2014-01-03 00:00:03.033033+00,
+  [
+    2013-01-01 00:00:00+00,
+    2013-10-15 00:00:00+00
+  ),
+  [2013-01-01, 2013-10-15)},
+ {7,
+  -4,
+  2014-01-04,
+  2014-01-04 00:00:04.044044+00,
+  [
+    2014-01-01 00:00:00+00,
+    2014-10-15 00:00:00+00
+  ),
+  [2014-01-01, 2014-10-15)},
+ {8, NULL, NULL, NULL, NULL, NULL},
+ {9, NULL, NULL, NULL, NULL, NULL},
+ {10,
+  1,
+  2014-01-08,
+  2014-01-02 00:00:01.011011+00,
+  [
+    2011-01-01 00:00:00+00,
+    2011-10-15 00:00:00+00
+  ),
+  [2011-01-01, 2011-10-15)},
+ {11,
+  3,
+  2014-02-01,
+  2014-04-01 00:00:01.011011+00,
+  [
+    2015-01-01 00:00:00+00,
+    2015-10-15 00:00:00+00
+  ),
+  [2013-01-01, 2013-10-15)},
+ {12,
+  16,
+  2014-02-02,
+  2014-01-05 00:00:02.022022+00,
+  [
+    2012-01-01 00:00:00+00,
+    2012-10-15 00:00:00+00
+  ),
+  [2026-01-01, 2026-10-15)},
+ {13,
+  9,
+  2014-05-02,
+  2014-05-02 00:00:02.022022+00,
+  [
+    2019-01-01 00:00:00+00,
+    2019-10-15 00:00:00+00
+  ),
+  [2019-01-01, 2019-10-15)},
+ {14,
+  23,
+  2014-01-06,
+  2014-01-04 00:00:03.033033+00,
+  [
+    NULL,
+    2013-10-15 00:00:00+00
+  ),
+  [2017-01-01, NULL)},
+ {15,
+  -14,
+  2014-02-04,
+  2014-02-04 00:00:04.044044+00,
+  [
+    2017-01-01 00:00:00+00,
+    NULL
+  ),
+  [NULL, 2007-10-15)},
+ {16,
+  -1,
+  NULL,
+  2014-02-04 00:00:04.044044+00,
+  [
+    2004-01-01 00:00:00+00,
+    2004-10-15 00:00:00+00
+  ),
+  NULL},
+ {
+   17,
+   NULL,
+   2014-02-04,
+   NULL,
+   NULL,
+   [2007-01-01, 2007-10-15)
+ }]
+==
+
+[prepare_database]
+[required_features=RANGE_TYPE,CIVIL_TIME]
+CREATE TABLE AllTypesRangeDatetimeTable AS
+SELECT CAST(1 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       TIMESTAMP '2014-01-01 00:00:01.011011 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2011-01-01 00:00:00, 2011-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(2 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       TIMESTAMP '2014-01-01 00:00:01.011011 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2011-01-01 00:00:00, 2011-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(3 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST('2014-01-01' AS DATE) as date_val,
+       TIMESTAMP '2014-01-01 00:00:01.011011 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2011-01-01 00:00:00, 2011-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(4 AS int64) as row_id,
+       CAST(-2 AS int64) as int64_val,
+       CAST('2014-01-02' AS DATE) as date_val,
+       TIMESTAMP '2014-01-02 00:00:02.022022 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2012-01-01 00:00:00, 2012-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(5 AS int64) as row_id,
+       CAST(-2 AS int64) as int64_val,
+       CAST('2014-01-02' AS DATE) as date_val,
+       TIMESTAMP '2014-01-02 00:00:02.022022 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2012-01-01 00:00:00, 2012-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(6 AS int64) as row_id,
+       CAST(-3 AS int64) as int64_val,
+       CAST('2014-01-03' AS DATE) as date_val,
+       TIMESTAMP '2014-01-03 00:00:03.033033 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2013-01-01 00:00:00, 2013-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(7 AS int64) as row_id,
+       CAST(-4 AS int64) as int64_val,
+       CAST('2014-01-04' AS DATE) as date_val,
+       TIMESTAMP '2014-01-04 00:00:04.044044 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2014-01-01 00:00:00, 2014-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(8 AS int64) as row_id,
+       CAST(NULL AS int64) as int64_val,
+       CAST(NULL AS DATE) as date_val,
+       CAST(NULL AS TIMESTAMP) as timestamp_val,
+       CAST(NULL AS RANGE<DATETIME>) as range_datetime_val
+UNION ALL
+SELECT CAST(9 AS int64) as row_id,
+       CAST(NULL AS int64) as int64_val,
+       CAST(NULL AS DATE) as date_val,
+       CAST(NULL AS TIMESTAMP) as timestamp_val,
+       CAST(NULL AS RANGE<DATETIME>) as range_datetime_val
+UNION ALL
+SELECT CAST(10 AS int64) as row_id,
+       CAST(1 AS int64) as int64_val,
+       CAST('2014-01-08' AS DATE) as date_val,
+       TIMESTAMP '2014-01-02 00:00:01.011011 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2011-01-01 00:00:00, 2011-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(11 AS int64) as row_id,
+       CAST(3 AS int64) as int64_val,
+       CAST('2014-02-01' AS DATE) as date_val,
+       TIMESTAMP '2014-04-01 00:00:01.011011 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2015-01-01 00:00:00, 2015-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(12 AS int64) as row_id,
+       CAST(16 AS int64) as int64_val,
+       CAST('2014-02-02' AS DATE) as date_val,
+       TIMESTAMP '2014-01-05 00:00:02.022022 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2012-01-01 00:00:00, 2012-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(13 AS int64) as row_id,
+       CAST(9 AS int64) as int64_val,
+       CAST('2014-05-02' AS DATE) as date_val,
+       TIMESTAMP '2014-05-02 00:00:02.022022 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2019-01-01 00:00:00, 2019-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(14 AS int64) as row_id,
+       CAST(23 AS int64) as int64_val,
+       CAST('2014-01-06' AS DATE) as date_val,
+       TIMESTAMP '2014-01-04 00:00:03.033033 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[UNBOUNDED, 2013-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(15 AS int64) as row_id,
+       CAST(-14 AS int64) as int64_val,
+       CAST('2014-02-04' AS DATE) as date_val,
+       TIMESTAMP '2014-02-04 00:00:04.044044 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2017-01-01 00:00:00, UNBOUNDED)' as range_datetime_val
+UNION ALL
+SELECT CAST(16 AS int64) as row_id,
+       CAST(-1 AS int64) as int64_val,
+       CAST(NULL AS DATE) as date_val,
+       TIMESTAMP '2014-02-04 00:00:04.044044 UTC' as
+           timestamp_val,
+       RANGE<DATETIME> '[2004-01-01 00:00:00, 2004-10-15 00:00:00)' as range_datetime_val
+UNION ALL
+SELECT CAST(17 AS int64) as row_id,
+       CAST(NULL AS int64) as int64_val,
+       CAST('2014-02-04' AS DATE) as date_val,
+       CAST(NULL AS TIMESTAMP) as timestamp_val,
+       CAST (NULL AS RANGE<DATETIME>) as range_datetime_val
+--
+ARRAY<STRUCT<
+        row_id INT64,
+        int64_val INT64,
+        date_val DATE,
+        timestamp_val TIMESTAMP,
+        range_datetime_val RANGE<DATETIME>
+      >>
+[{
+   1,
+   -1,
+   2014-01-01,
+   2014-01-01 00:00:01.011011+00,
+   [2011-01-01 00:00:00, 2011-10-15 00:00:00)
+ },
+ {
+   2,
+   -1,
+   2014-01-01,
+   2014-01-01 00:00:01.011011+00,
+   [2011-01-01 00:00:00, 2011-10-15 00:00:00)
+ },
+ {
+   3,
+   -1,
+   2014-01-01,
+   2014-01-01 00:00:01.011011+00,
+   [2011-01-01 00:00:00, 2011-10-15 00:00:00)
+ },
+ {
+   4,
+   -2,
+   2014-01-02,
+   2014-01-02 00:00:02.022022+00,
+   [2012-01-01 00:00:00, 2012-10-15 00:00:00)
+ },
+ {
+   5,
+   -2,
+   2014-01-02,
+   2014-01-02 00:00:02.022022+00,
+   [2012-01-01 00:00:00, 2012-10-15 00:00:00)
+ },
+ {
+   6,
+   -3,
+   2014-01-03,
+   2014-01-03 00:00:03.033033+00,
+   [2013-01-01 00:00:00, 2013-10-15 00:00:00)
+ },
+ {
+   7,
+   -4,
+   2014-01-04,
+   2014-01-04 00:00:04.044044+00,
+   [2014-01-01 00:00:00, 2014-10-15 00:00:00)
+ },
+ {8, NULL, NULL, NULL, NULL},
+ {9, NULL, NULL, NULL, NULL},
+ {
+   10,
+   1,
+   2014-01-08,
+   2014-01-02 00:00:01.011011+00,
+   [2011-01-01 00:00:00, 2011-10-15 00:00:00)
+ },
+ {
+   11,
+   3,
+   2014-02-01,
+   2014-04-01 00:00:01.011011+00,
+   [2015-01-01 00:00:00, 2015-10-15 00:00:00)
+ },
+ {
+   12,
+   16,
+   2014-02-02,
+   2014-01-05 00:00:02.022022+00,
+   [2012-01-01 00:00:00, 2012-10-15 00:00:00)
+ },
+ {
+   13,
+   9,
+   2014-05-02,
+   2014-05-02 00:00:02.022022+00,
+   [2019-01-01 00:00:00, 2019-10-15 00:00:00)
+ },
+ {
+   14,
+   23,
+   2014-01-06,
+   2014-01-04 00:00:03.033033+00,
+   [NULL, 2013-10-15 00:00:00)
+ },
+ {
+   15,
+   -14,
+   2014-02-04,
+   2014-02-04 00:00:04.044044+00,
+   [2017-01-01 00:00:00, NULL)
+ },
+ {
+   16,
+   -1,
+   NULL,
+   2014-02-04 00:00:04.044044+00,
+   [2004-01-01 00:00:00, 2004-10-15 00:00:00)
+ },
+ {17, NULL, 2014-02-04, NULL, NULL}]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_single_base_column_range_timestamp_asc]
+SELECT range_timestamp_val, int64_val, row_id FROM AllTypesRangeTable t
+WHERE row_id NOT IN (2, 3, 5, 9, 10, 12, 16, 17)
+ORDER BY range_timestamp_val ASC
+--
+ARRAY<STRUCT<
+        range_timestamp_val RANGE<TIMESTAMP>,
+        int64_val INT64,
+        row_id INT64
+      >>
+[known order:{NULL, NULL, 8},
+             {[
+                NULL,
+                2013-10-15 00:00:00+00
+              ),
+              23,
+              14},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              -1,
+              1},
+             {[
+                2012-01-01 00:00:00+00,
+                2012-10-15 00:00:00+00
+              ),
+              -2,
+              4},
+             {[
+                2013-01-01 00:00:00+00,
+                2013-10-15 00:00:00+00
+              ),
+              -3,
+              6},
+             {[
+                2014-01-01 00:00:00+00,
+                2014-10-15 00:00:00+00
+              ),
+              -4,
+              7},
+             {[
+                2015-01-01 00:00:00+00,
+                2015-10-15 00:00:00+00
+              ),
+              3,
+              11},
+             {[
+                2017-01-01 00:00:00+00,
+                NULL
+              ),
+              -14,
+              15},
+             {[
+                2019-01-01 00:00:00+00,
+                2019-10-15 00:00:00+00
+              ),
+              9,
+              13}]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_single_base_column_range_date_asc]
+SELECT range_date_val, int64_val, row_id FROM AllTypesRangeTable t
+WHERE row_id NOT IN (2, 3, 5, 8, 9, 10, 11)
+ORDER BY range_date_val ASC
+--
+ARRAY<STRUCT<
+        range_date_val RANGE<DATE>,
+        int64_val INT64,
+        row_id INT64
+      >>
+[known order:{NULL, -1, 16},
+             {[NULL, 2007-10-15), -14, 15},
+             {
+               [2007-01-01, 2007-10-15),
+               NULL,
+               17
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               -1,
+               1
+             },
+             {
+               [2012-01-01, 2012-10-15),
+               -2,
+               4
+             },
+             {
+               [2013-01-01, 2013-10-15),
+               -3,
+               6
+             },
+             {
+               [2014-01-01, 2014-10-15),
+               -4,
+               7
+             },
+             {[2017-01-01, NULL), 23, 14},
+             {
+               [2019-01-01, 2019-10-15),
+               9,
+               13
+             },
+             {
+               [2026-01-01, 2026-10-15),
+               16,
+               12
+             }]
+==
+
+[required_features=RANGE_TYPE,CIVIL_TIME]
+[name=orderby_single_base_column_range_datetime_asc]
+SELECT range_datetime_val, int64_val, row_id FROM AllTypesRangeDatetimeTable t
+WHERE row_id NOT IN (2, 3, 5, 9, 10, 12, 17)
+ORDER BY range_datetime_val ASC
+--
+ARRAY<STRUCT<
+        range_datetime_val RANGE<DATETIME>,
+        int64_val INT64,
+        row_id INT64
+      >>
+[known order:{NULL, NULL, 8},
+             {
+               [NULL, 2013-10-15 00:00:00),
+               23,
+               14
+             },
+             {
+               [2004-01-01 00:00:00, 2004-10-15 00:00:00),
+               -1,
+               16
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               -1,
+               1
+             },
+             {
+               [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+               -2,
+               4
+             },
+             {
+               [2013-01-01 00:00:00, 2013-10-15 00:00:00),
+               -3,
+               6
+             },
+             {
+               [2014-01-01 00:00:00, 2014-10-15 00:00:00),
+               -4,
+               7
+             },
+             {
+               [2015-01-01 00:00:00, 2015-10-15 00:00:00),
+               3,
+               11
+             },
+             {
+               [2017-01-01 00:00:00, NULL),
+               -14,
+               15
+             },
+             {
+               [2019-01-01 00:00:00, 2019-10-15 00:00:00),
+               9,
+               13
+             }]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_single_base_column_range_timestamp_desc]
+SELECT range_timestamp_val, int64_val, row_id FROM AllTypesRangeTable t
+WHERE row_id NOT IN (2, 3, 5, 9, 10, 12, 16, 17)
+ORDER BY range_timestamp_val DESC
+--
+ARRAY<STRUCT<
+        range_timestamp_val RANGE<TIMESTAMP>,
+        int64_val INT64,
+        row_id INT64
+      >>
+[known order:{[
+                2019-01-01 00:00:00+00,
+                2019-10-15 00:00:00+00
+              ),
+              9,
+              13},
+             {[
+                2017-01-01 00:00:00+00,
+                NULL
+              ),
+              -14,
+              15},
+             {[
+                2015-01-01 00:00:00+00,
+                2015-10-15 00:00:00+00
+              ),
+              3,
+              11},
+             {[
+                2014-01-01 00:00:00+00,
+                2014-10-15 00:00:00+00
+              ),
+              -4,
+              7},
+             {[
+                2013-01-01 00:00:00+00,
+                2013-10-15 00:00:00+00
+              ),
+              -3,
+              6},
+             {[
+                2012-01-01 00:00:00+00,
+                2012-10-15 00:00:00+00
+              ),
+              -2,
+              4},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              -1,
+              1},
+             {[
+                NULL,
+                2013-10-15 00:00:00+00
+              ),
+              23,
+              14},
+             {NULL, NULL, 8}]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_single_base_column_range_date_desc]
+SELECT range_date_val, int64_val, row_id FROM AllTypesRangeTable t
+WHERE row_id NOT IN (2, 3, 5, 8, 9, 10, 11)
+ORDER BY range_date_val DESC
+--
+ARRAY<STRUCT<
+        range_date_val RANGE<DATE>,
+        int64_val INT64,
+        row_id INT64
+      >>
+[known order:{
+               [2026-01-01, 2026-10-15),
+               16,
+               12
+             },
+             {
+               [2019-01-01, 2019-10-15),
+               9,
+               13
+             },
+             {[2017-01-01, NULL), 23, 14},
+             {
+               [2014-01-01, 2014-10-15),
+               -4,
+               7
+             },
+             {
+               [2013-01-01, 2013-10-15),
+               -3,
+               6
+             },
+             {
+               [2012-01-01, 2012-10-15),
+               -2,
+               4
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               -1,
+               1
+             },
+             {
+               [2007-01-01, 2007-10-15),
+               NULL,
+               17
+             },
+             {[NULL, 2007-10-15), -14, 15},
+             {NULL, -1, 16}]
+==
+
+[required_features=RANGE_TYPE,CIVIL_TIME]
+[name=orderby_single_base_column_range_datetime_desc]
+SELECT range_datetime_val, int64_val, row_id FROM AllTypesRangeDatetimeTable t
+WHERE row_id NOT IN (2, 3, 5, 9, 10, 12, 17)
+ORDER BY range_datetime_val DESC
+--
+ARRAY<STRUCT<
+        range_datetime_val RANGE<DATETIME>,
+        int64_val INT64,
+        row_id INT64
+      >>
+[known order:{
+               [2019-01-01 00:00:00, 2019-10-15 00:00:00),
+               9,
+               13
+             },
+             {
+               [2017-01-01 00:00:00, NULL),
+               -14,
+               15
+             },
+             {
+               [2015-01-01 00:00:00, 2015-10-15 00:00:00),
+               3,
+               11
+             },
+             {
+               [2014-01-01 00:00:00, 2014-10-15 00:00:00),
+               -4,
+               7
+             },
+             {
+               [2013-01-01 00:00:00, 2013-10-15 00:00:00),
+               -3,
+               6
+             },
+             {
+               [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+               -2,
+               4
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               -1,
+               1
+             },
+             {
+               [2004-01-01 00:00:00, 2004-10-15 00:00:00),
+               -1,
+               16
+             },
+             {
+               [NULL, 2013-10-15 00:00:00),
+               23,
+               14
+             },
+             {NULL, NULL, 8}]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_single_computed_column_range_timestamp_desc]
+SELECT range_timestamp_val, int64_val, row_id FROM AllTypesRangeTable t
+WHERE row_id NOT IN (2, 3, 5, 9, 10, 12, 16, 17)
+ORDER BY IF(
+  range_timestamp_val IS NULL,
+  NULL,
+  RANGE(RANGE_START(range_timestamp_val), RANGE_END(range_timestamp_val))) DESC
+--
+ARRAY<STRUCT<
+        range_timestamp_val RANGE<TIMESTAMP>,
+        int64_val INT64,
+        row_id INT64
+      >>
+[known order:{[
+                2019-01-01 00:00:00+00,
+                2019-10-15 00:00:00+00
+              ),
+              9,
+              13},
+             {[
+                2017-01-01 00:00:00+00,
+                NULL
+              ),
+              -14,
+              15},
+             {[
+                2015-01-01 00:00:00+00,
+                2015-10-15 00:00:00+00
+              ),
+              3,
+              11},
+             {[
+                2014-01-01 00:00:00+00,
+                2014-10-15 00:00:00+00
+              ),
+              -4,
+              7},
+             {[
+                2013-01-01 00:00:00+00,
+                2013-10-15 00:00:00+00
+              ),
+              -3,
+              6},
+             {[
+                2012-01-01 00:00:00+00,
+                2012-10-15 00:00:00+00
+              ),
+              -2,
+              4},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              -1,
+              1},
+             {[
+                NULL,
+                2013-10-15 00:00:00+00
+              ),
+              23,
+              14},
+             {NULL, NULL, 8}]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_single_computed_column_range_date_desc]
+SELECT range_date_val, int64_val, row_id FROM AllTypesRangeTable t
+WHERE row_id NOT IN (2, 3, 5, 8, 9, 10, 11)
+ORDER BY IF(
+  range_date_val IS NULL,
+  NULL,
+  RANGE(RANGE_START(range_date_val), RANGE_END(range_date_val))) DESC
+--
+ARRAY<STRUCT<
+        range_date_val RANGE<DATE>,
+        int64_val INT64,
+        row_id INT64
+      >>
+[known order:{
+               [2026-01-01, 2026-10-15),
+               16,
+               12
+             },
+             {
+               [2019-01-01, 2019-10-15),
+               9,
+               13
+             },
+             {[2017-01-01, NULL), 23, 14},
+             {
+               [2014-01-01, 2014-10-15),
+               -4,
+               7
+             },
+             {
+               [2013-01-01, 2013-10-15),
+               -3,
+               6
+             },
+             {
+               [2012-01-01, 2012-10-15),
+               -2,
+               4
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               -1,
+               1
+             },
+             {
+               [2007-01-01, 2007-10-15),
+               NULL,
+               17
+             },
+             {[NULL, 2007-10-15), -14, 15},
+             {NULL, -1, 16}]
+==
+
+[required_features=RANGE_TYPE,CIVIL_TIME]
+[name=orderby_single_computed_column_range_datetime_desc]
+SELECT range_datetime_val, int64_val, row_id FROM AllTypesRangeDatetimeTable t
+WHERE row_id NOT IN (2, 3, 5, 9, 10, 12, 17)
+ORDER BY IF(
+  range_datetime_val IS NULL,
+  NULL,
+  RANGE(RANGE_START(range_datetime_val), RANGE_END(range_datetime_val))) DESC
+--
+ARRAY<STRUCT<
+        range_datetime_val RANGE<DATETIME>,
+        int64_val INT64,
+        row_id INT64
+      >>
+[known order:{
+               [2019-01-01 00:00:00, 2019-10-15 00:00:00),
+               9,
+               13
+             },
+             {
+               [2017-01-01 00:00:00, NULL),
+               -14,
+               15
+             },
+             {
+               [2015-01-01 00:00:00, 2015-10-15 00:00:00),
+               3,
+               11
+             },
+             {
+               [2014-01-01 00:00:00, 2014-10-15 00:00:00),
+               -4,
+               7
+             },
+             {
+               [2013-01-01 00:00:00, 2013-10-15 00:00:00),
+               -3,
+               6
+             },
+             {
+               [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+               -2,
+               4
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               -1,
+               1
+             },
+             {
+               [2004-01-01 00:00:00, 2004-10-15 00:00:00),
+               -1,
+               16
+             },
+             {
+               [NULL, 2013-10-15 00:00:00),
+               23,
+               14
+             },
+             {NULL, NULL, 8}]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_multi_base_column_range_timestamp_asc]
+SELECT range_timestamp_val, date_val, row_id FROM AllTypesRangeTable t
+ORDER BY range_timestamp_val ASC, date_val ASC, row_id ASC
+--
+ARRAY<STRUCT<
+        range_timestamp_val RANGE<TIMESTAMP>,
+        date_val DATE,
+        row_id INT64
+      >>
+[known order:{NULL, NULL, 8},
+             {NULL, NULL, 9},
+             {NULL, 2014-02-04, 17},
+             {[
+                NULL,
+                2013-10-15 00:00:00+00
+              ),
+              2014-01-06,
+              14},
+             {[
+                2004-01-01 00:00:00+00,
+                2004-10-15 00:00:00+00
+              ),
+              NULL,
+              16},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              2014-01-01,
+              1},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              2014-01-01,
+              2},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              2014-01-01,
+              3},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              2014-01-08,
+              10},
+             {[
+                2012-01-01 00:00:00+00,
+                2012-10-15 00:00:00+00
+              ),
+              2014-01-02,
+              4},
+             {[
+                2012-01-01 00:00:00+00,
+                2012-10-15 00:00:00+00
+              ),
+              2014-01-02,
+              5},
+             {[
+                2012-01-01 00:00:00+00,
+                2012-10-15 00:00:00+00
+              ),
+              2014-02-02,
+              12},
+             {[
+                2013-01-01 00:00:00+00,
+                2013-10-15 00:00:00+00
+              ),
+              2014-01-03,
+              6},
+             {[
+                2014-01-01 00:00:00+00,
+                2014-10-15 00:00:00+00
+              ),
+              2014-01-04,
+              7},
+             {[
+                2015-01-01 00:00:00+00,
+                2015-10-15 00:00:00+00
+              ),
+              2014-02-01,
+              11},
+             {[
+                2017-01-01 00:00:00+00,
+                NULL
+              ),
+              2014-02-04,
+              15},
+             {[
+                2019-01-01 00:00:00+00,
+                2019-10-15 00:00:00+00
+              ),
+              2014-05-02,
+              13}]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_multi_base_column_range_date_asc]
+SELECT range_date_val, timestamp_val, row_id FROM AllTypesRangeTable t
+ORDER BY range_date_val ASC, timestamp_val ASC, row_id ASC
+--
+ARRAY<STRUCT<
+        range_date_val RANGE<DATE>,
+        timestamp_val TIMESTAMP,
+        row_id INT64
+      >>
+[known order:{NULL, NULL, 8},
+             {NULL, NULL, 9},
+             {
+               NULL,
+               2014-02-04 00:00:04.044044+00,
+               16
+             },
+             {
+               [NULL, 2007-10-15),
+               2014-02-04 00:00:04.044044+00,
+               15
+             },
+             {
+               [2007-01-01, 2007-10-15),
+               NULL,
+               17
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               2014-01-01 00:00:01.011011+00,
+               1
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               2014-01-01 00:00:01.011011+00,
+               2
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               2014-01-01 00:00:01.011011+00,
+               3
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               2014-01-02 00:00:01.011011+00,
+               10
+             },
+             {
+               [2012-01-01, 2012-10-15),
+               2014-01-02 00:00:02.022022+00,
+               4
+             },
+             {
+               [2012-01-01, 2012-10-15),
+               2014-01-02 00:00:02.022022+00,
+               5
+             },
+             {
+               [2013-01-01, 2013-10-15),
+               2014-01-03 00:00:03.033033+00,
+               6
+             },
+             {
+               [2013-01-01, 2013-10-15),
+               2014-04-01 00:00:01.011011+00,
+               11
+             },
+             {
+               [2014-01-01, 2014-10-15),
+               2014-01-04 00:00:04.044044+00,
+               7
+             },
+             {
+               [2017-01-01, NULL),
+               2014-01-04 00:00:03.033033+00,
+               14
+             },
+             {
+               [2019-01-01, 2019-10-15),
+               2014-05-02 00:00:02.022022+00,
+               13
+             },
+             {
+               [2026-01-01, 2026-10-15),
+               2014-01-05 00:00:02.022022+00,
+               12
+             }]
+==
+
+[required_features=RANGE_TYPE,CIVIL_TIME]
+[name=orderby_multi_base_column_range_datetime_asc]
+SELECT range_datetime_val, timestamp_val, row_id FROM AllTypesRangeDatetimeTable t
+ORDER BY range_datetime_val ASC, timestamp_val ASC, row_id ASC
+--
+ARRAY<STRUCT<
+        range_datetime_val RANGE<DATETIME>,
+        timestamp_val TIMESTAMP,
+        row_id INT64
+      >>
+[known order:{NULL, NULL, 8},
+             {NULL, NULL, 9},
+             {NULL, NULL, 17},
+             {
+               [NULL, 2013-10-15 00:00:00),
+               2014-01-04 00:00:03.033033+00,
+               14
+             },
+             {
+               [2004-01-01 00:00:00, 2004-10-15 00:00:00),
+               2014-02-04 00:00:04.044044+00,
+               16
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               2014-01-01 00:00:01.011011+00,
+               1
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               2014-01-01 00:00:01.011011+00,
+               2
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               2014-01-01 00:00:01.011011+00,
+               3
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               2014-01-02 00:00:01.011011+00,
+               10
+             },
+             {
+               [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+               2014-01-02 00:00:02.022022+00,
+               4
+             },
+             {
+               [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+               2014-01-02 00:00:02.022022+00,
+               5
+             },
+             {
+               [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+               2014-01-05 00:00:02.022022+00,
+               12
+             },
+             {
+               [2013-01-01 00:00:00, 2013-10-15 00:00:00),
+               2014-01-03 00:00:03.033033+00,
+               6
+             },
+             {
+               [2014-01-01 00:00:00, 2014-10-15 00:00:00),
+               2014-01-04 00:00:04.044044+00,
+               7
+             },
+             {
+               [2015-01-01 00:00:00, 2015-10-15 00:00:00),
+               2014-04-01 00:00:01.011011+00,
+               11
+             },
+             {
+               [2017-01-01 00:00:00, NULL),
+               2014-02-04 00:00:04.044044+00,
+               15
+             },
+             {
+               [2019-01-01 00:00:00, 2019-10-15 00:00:00),
+               2014-05-02 00:00:02.022022+00,
+               13
+             }]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_multi_base_column_range_timestamp_desc]
+SELECT range_timestamp_val, date_val, row_id FROM AllTypesRangeTable t
+ORDER BY range_timestamp_val DESC, date_val ASC, row_id ASC
+--
+ARRAY<STRUCT<
+        range_timestamp_val RANGE<TIMESTAMP>,
+        date_val DATE,
+        row_id INT64
+      >>
+[known order:{[
+                2019-01-01 00:00:00+00,
+                2019-10-15 00:00:00+00
+              ),
+              2014-05-02,
+              13},
+             {[
+                2017-01-01 00:00:00+00,
+                NULL
+              ),
+              2014-02-04,
+              15},
+             {[
+                2015-01-01 00:00:00+00,
+                2015-10-15 00:00:00+00
+              ),
+              2014-02-01,
+              11},
+             {[
+                2014-01-01 00:00:00+00,
+                2014-10-15 00:00:00+00
+              ),
+              2014-01-04,
+              7},
+             {[
+                2013-01-01 00:00:00+00,
+                2013-10-15 00:00:00+00
+              ),
+              2014-01-03,
+              6},
+             {[
+                2012-01-01 00:00:00+00,
+                2012-10-15 00:00:00+00
+              ),
+              2014-01-02,
+              4},
+             {[
+                2012-01-01 00:00:00+00,
+                2012-10-15 00:00:00+00
+              ),
+              2014-01-02,
+              5},
+             {[
+                2012-01-01 00:00:00+00,
+                2012-10-15 00:00:00+00
+              ),
+              2014-02-02,
+              12},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              2014-01-01,
+              1},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              2014-01-01,
+              2},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              2014-01-01,
+              3},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              2014-01-08,
+              10},
+             {[
+                2004-01-01 00:00:00+00,
+                2004-10-15 00:00:00+00
+              ),
+              NULL,
+              16},
+             {[
+                NULL,
+                2013-10-15 00:00:00+00
+              ),
+              2014-01-06,
+              14},
+             {NULL, NULL, 8},
+             {NULL, NULL, 9},
+             {NULL, 2014-02-04, 17}]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_multi_base_column_range_date_desc]
+SELECT range_date_val, timestamp_val, row_id FROM AllTypesRangeTable t
+ORDER BY range_date_val DESC, timestamp_val ASC, row_id ASC
+--
+ARRAY<STRUCT<
+        range_date_val RANGE<DATE>,
+        timestamp_val TIMESTAMP,
+        row_id INT64
+      >>
+[known order:{
+               [2026-01-01, 2026-10-15),
+               2014-01-05 00:00:02.022022+00,
+               12
+             },
+             {
+               [2019-01-01, 2019-10-15),
+               2014-05-02 00:00:02.022022+00,
+               13
+             },
+             {
+               [2017-01-01, NULL),
+               2014-01-04 00:00:03.033033+00,
+               14
+             },
+             {
+               [2014-01-01, 2014-10-15),
+               2014-01-04 00:00:04.044044+00,
+               7
+             },
+             {
+               [2013-01-01, 2013-10-15),
+               2014-01-03 00:00:03.033033+00,
+               6
+             },
+             {
+               [2013-01-01, 2013-10-15),
+               2014-04-01 00:00:01.011011+00,
+               11
+             },
+             {
+               [2012-01-01, 2012-10-15),
+               2014-01-02 00:00:02.022022+00,
+               4
+             },
+             {
+               [2012-01-01, 2012-10-15),
+               2014-01-02 00:00:02.022022+00,
+               5
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               2014-01-01 00:00:01.011011+00,
+               1
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               2014-01-01 00:00:01.011011+00,
+               2
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               2014-01-01 00:00:01.011011+00,
+               3
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               2014-01-02 00:00:01.011011+00,
+               10
+             },
+             {
+               [2007-01-01, 2007-10-15),
+               NULL,
+               17
+             },
+             {
+               [NULL, 2007-10-15),
+               2014-02-04 00:00:04.044044+00,
+               15
+             },
+             {NULL, NULL, 8},
+             {NULL, NULL, 9},
+             {
+               NULL,
+               2014-02-04 00:00:04.044044+00,
+               16
+             }]
+==
+
+[required_features=RANGE_TYPE,CIVIL_TIME]
+[name=orderby_multi_base_column_range_datetime_desc]
+SELECT range_datetime_val, timestamp_val, row_id FROM AllTypesRangeDatetimeTable t
+ORDER BY range_datetime_val DESC, timestamp_val ASC, row_id ASC
+--
+ARRAY<STRUCT<
+        range_datetime_val RANGE<DATETIME>,
+        timestamp_val TIMESTAMP,
+        row_id INT64
+      >>
+[known order:{
+               [2019-01-01 00:00:00, 2019-10-15 00:00:00),
+               2014-05-02 00:00:02.022022+00,
+               13
+             },
+             {
+               [2017-01-01 00:00:00, NULL),
+               2014-02-04 00:00:04.044044+00,
+               15
+             },
+             {
+               [2015-01-01 00:00:00, 2015-10-15 00:00:00),
+               2014-04-01 00:00:01.011011+00,
+               11
+             },
+             {
+               [2014-01-01 00:00:00, 2014-10-15 00:00:00),
+               2014-01-04 00:00:04.044044+00,
+               7
+             },
+             {
+               [2013-01-01 00:00:00, 2013-10-15 00:00:00),
+               2014-01-03 00:00:03.033033+00,
+               6
+             },
+             {
+               [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+               2014-01-02 00:00:02.022022+00,
+               4
+             },
+             {
+               [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+               2014-01-02 00:00:02.022022+00,
+               5
+             },
+             {
+               [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+               2014-01-05 00:00:02.022022+00,
+               12
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               2014-01-01 00:00:01.011011+00,
+               1
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               2014-01-01 00:00:01.011011+00,
+               2
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               2014-01-01 00:00:01.011011+00,
+               3
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               2014-01-02 00:00:01.011011+00,
+               10
+             },
+             {
+               [2004-01-01 00:00:00, 2004-10-15 00:00:00),
+               2014-02-04 00:00:04.044044+00,
+               16
+             },
+             {
+               [NULL, 2013-10-15 00:00:00),
+               2014-01-04 00:00:03.033033+00,
+               14
+             },
+             {NULL, NULL, 8},
+             {NULL, NULL, 9},
+             {NULL, NULL, 17}]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_multi_computed_column_range_timestamp_desc]
+SELECT range_timestamp_val, date_val, row_id FROM AllTypesRangeTable t
+ORDER BY
+  IF(range_timestamp_val IS NULL,
+     NULL,
+     RANGE(RANGE_START(range_timestamp_val), RANGE_END(range_timestamp_val))) DESC,
+  date_val ASC,
+  row_id ASC
+--
+ARRAY<STRUCT<
+        range_timestamp_val RANGE<TIMESTAMP>,
+        date_val DATE,
+        row_id INT64
+      >>
+[known order:{[
+                2019-01-01 00:00:00+00,
+                2019-10-15 00:00:00+00
+              ),
+              2014-05-02,
+              13},
+             {[
+                2017-01-01 00:00:00+00,
+                NULL
+              ),
+              2014-02-04,
+              15},
+             {[
+                2015-01-01 00:00:00+00,
+                2015-10-15 00:00:00+00
+              ),
+              2014-02-01,
+              11},
+             {[
+                2014-01-01 00:00:00+00,
+                2014-10-15 00:00:00+00
+              ),
+              2014-01-04,
+              7},
+             {[
+                2013-01-01 00:00:00+00,
+                2013-10-15 00:00:00+00
+              ),
+              2014-01-03,
+              6},
+             {[
+                2012-01-01 00:00:00+00,
+                2012-10-15 00:00:00+00
+              ),
+              2014-01-02,
+              4},
+             {[
+                2012-01-01 00:00:00+00,
+                2012-10-15 00:00:00+00
+              ),
+              2014-01-02,
+              5},
+             {[
+                2012-01-01 00:00:00+00,
+                2012-10-15 00:00:00+00
+              ),
+              2014-02-02,
+              12},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              2014-01-01,
+              1},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              2014-01-01,
+              2},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              2014-01-01,
+              3},
+             {[
+                2011-01-01 00:00:00+00,
+                2011-10-15 00:00:00+00
+              ),
+              2014-01-08,
+              10},
+             {[
+                2004-01-01 00:00:00+00,
+                2004-10-15 00:00:00+00
+              ),
+              NULL,
+              16},
+             {[
+                NULL,
+                2013-10-15 00:00:00+00
+              ),
+              2014-01-06,
+              14},
+             {NULL, NULL, 8},
+             {NULL, NULL, 9},
+             {NULL, 2014-02-04, 17}]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_multi_computed_column_range_date_desc]
+SELECT range_date_val, timestamp_val, row_id FROM AllTypesRangeTable t
+ORDER BY
+  IF(range_date_val IS NULL,
+     NULL,
+     RANGE(RANGE_START(range_date_val), RANGE_END(range_date_val))) DESC,
+  timestamp_val ASC,
+  row_id ASC
+--
+ARRAY<STRUCT<
+        range_date_val RANGE<DATE>,
+        timestamp_val TIMESTAMP,
+        row_id INT64
+      >>
+[known order:{
+               [2026-01-01, 2026-10-15),
+               2014-01-05 00:00:02.022022+00,
+               12
+             },
+             {
+               [2019-01-01, 2019-10-15),
+               2014-05-02 00:00:02.022022+00,
+               13
+             },
+             {
+               [2017-01-01, NULL),
+               2014-01-04 00:00:03.033033+00,
+               14
+             },
+             {
+               [2014-01-01, 2014-10-15),
+               2014-01-04 00:00:04.044044+00,
+               7
+             },
+             {
+               [2013-01-01, 2013-10-15),
+               2014-01-03 00:00:03.033033+00,
+               6
+             },
+             {
+               [2013-01-01, 2013-10-15),
+               2014-04-01 00:00:01.011011+00,
+               11
+             },
+             {
+               [2012-01-01, 2012-10-15),
+               2014-01-02 00:00:02.022022+00,
+               4
+             },
+             {
+               [2012-01-01, 2012-10-15),
+               2014-01-02 00:00:02.022022+00,
+               5
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               2014-01-01 00:00:01.011011+00,
+               1
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               2014-01-01 00:00:01.011011+00,
+               2
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               2014-01-01 00:00:01.011011+00,
+               3
+             },
+             {
+               [2011-01-01, 2011-10-15),
+               2014-01-02 00:00:01.011011+00,
+               10
+             },
+             {
+               [2007-01-01, 2007-10-15),
+               NULL,
+               17
+             },
+             {
+               [NULL, 2007-10-15),
+               2014-02-04 00:00:04.044044+00,
+               15
+             },
+             {NULL, NULL, 8},
+             {NULL, NULL, 9},
+             {
+               NULL,
+               2014-02-04 00:00:04.044044+00,
+               16
+             }]
+==
+
+[required_features=RANGE_TYPE,CIVIL_TIME]
+[name=orderby_multi_computed_column_range_datetime_desc]
+SELECT range_datetime_val, timestamp_val, row_id FROM AllTypesRangeDatetimeTable t
+ORDER BY
+  IF(range_datetime_val IS NULL,
+     NULL,
+     RANGE(RANGE_START(range_datetime_val), RANGE_END(range_datetime_val))) DESC,
+  timestamp_val ASC,
+  row_id ASC
+--
+ARRAY<STRUCT<
+        range_datetime_val RANGE<DATETIME>,
+        timestamp_val TIMESTAMP,
+        row_id INT64
+      >>
+[known order:{
+               [2019-01-01 00:00:00, 2019-10-15 00:00:00),
+               2014-05-02 00:00:02.022022+00,
+               13
+             },
+             {
+               [2017-01-01 00:00:00, NULL),
+               2014-02-04 00:00:04.044044+00,
+               15
+             },
+             {
+               [2015-01-01 00:00:00, 2015-10-15 00:00:00),
+               2014-04-01 00:00:01.011011+00,
+               11
+             },
+             {
+               [2014-01-01 00:00:00, 2014-10-15 00:00:00),
+               2014-01-04 00:00:04.044044+00,
+               7
+             },
+             {
+               [2013-01-01 00:00:00, 2013-10-15 00:00:00),
+               2014-01-03 00:00:03.033033+00,
+               6
+             },
+             {
+               [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+               2014-01-02 00:00:02.022022+00,
+               4
+             },
+             {
+               [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+               2014-01-02 00:00:02.022022+00,
+               5
+             },
+             {
+               [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+               2014-01-05 00:00:02.022022+00,
+               12
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               2014-01-01 00:00:01.011011+00,
+               1
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               2014-01-01 00:00:01.011011+00,
+               2
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               2014-01-01 00:00:01.011011+00,
+               3
+             },
+             {
+               [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+               2014-01-02 00:00:01.011011+00,
+               10
+             },
+             {
+               [2004-01-01 00:00:00, 2004-10-15 00:00:00),
+               2014-02-04 00:00:04.044044+00,
+               16
+             },
+             {
+               [NULL, 2013-10-15 00:00:00),
+               2014-01-04 00:00:03.033033+00,
+               14
+             },
+             {NULL, NULL, 8},
+             {NULL, NULL, 9},
+             {NULL, NULL, 17}]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_duplicates_single_base_column_range_timestamp_asc]
+SELECT * FROM UNNEST(ARRAY(
+  SELECT range_timestamp_val FROM AllTypesRangeTable t
+  ORDER BY range_timestamp_val ASC
+)) x WITH OFFSET POS
+--
+ARRAY<STRUCT<x RANGE<TIMESTAMP>, POS INT64>>[unknown order:
+  {NULL, 0},
+  {NULL, 1},
+  {NULL, 2},
+  {[
+     NULL,
+     2013-10-15 00:00:00+00
+   ),
+   3},
+  {[
+     2004-01-01 00:00:00+00,
+     2004-10-15 00:00:00+00
+   ),
+   4},
+  {[
+     2011-01-01 00:00:00+00,
+     2011-10-15 00:00:00+00
+   ),
+   5},
+  {[
+     2011-01-01 00:00:00+00,
+     2011-10-15 00:00:00+00
+   ),
+   6},
+  {[
+     2011-01-01 00:00:00+00,
+     2011-10-15 00:00:00+00
+   ),
+   7},
+  {[
+     2011-01-01 00:00:00+00,
+     2011-10-15 00:00:00+00
+   ),
+   8},
+  {[
+     2012-01-01 00:00:00+00,
+     2012-10-15 00:00:00+00
+   ),
+   9},
+  {[
+     2012-01-01 00:00:00+00,
+     2012-10-15 00:00:00+00
+   ),
+   10},
+  {[
+     2012-01-01 00:00:00+00,
+     2012-10-15 00:00:00+00
+   ),
+   11},
+  {[
+     2013-01-01 00:00:00+00,
+     2013-10-15 00:00:00+00
+   ),
+   12},
+  {[
+     2014-01-01 00:00:00+00,
+     2014-10-15 00:00:00+00
+   ),
+   13},
+  {[
+     2015-01-01 00:00:00+00,
+     2015-10-15 00:00:00+00
+   ),
+   14},
+  {[
+     2017-01-01 00:00:00+00,
+     NULL
+   ),
+   15},
+  {[
+     2019-01-01 00:00:00+00,
+     2019-10-15 00:00:00+00
+   ),
+   16}
+]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_duplicates_single_base_column_range_date_asc]
+SELECT * FROM UNNEST(ARRAY(
+  SELECT range_date_val FROM AllTypesRangeTable t
+  ORDER BY range_date_val ASC
+)) x WITH OFFSET POS
+--
+ARRAY<STRUCT<x RANGE<DATE>, POS INT64>>[unknown order:
+  {NULL, 0},
+  {NULL, 1},
+  {NULL, 2},
+  {[NULL, 2007-10-15), 3},
+  {
+    [2007-01-01, 2007-10-15),
+    4
+  },
+  {
+    [2011-01-01, 2011-10-15),
+    5
+  },
+  {
+    [2011-01-01, 2011-10-15),
+    6
+  },
+  {
+    [2011-01-01, 2011-10-15),
+    7
+  },
+  {
+    [2011-01-01, 2011-10-15),
+    8
+  },
+  {
+    [2012-01-01, 2012-10-15),
+    9
+  },
+  {
+    [2012-01-01, 2012-10-15),
+    10
+  },
+  {
+    [2013-01-01, 2013-10-15),
+    11
+  },
+  {
+    [2013-01-01, 2013-10-15),
+    12
+  },
+  {
+    [2014-01-01, 2014-10-15),
+    13
+  },
+  {[2017-01-01, NULL), 14},
+  {
+    [2019-01-01, 2019-10-15),
+    15
+  },
+  {
+    [2026-01-01, 2026-10-15),
+    16
+  }
+]
+==
+
+[required_features=RANGE_TYPE,CIVIL_TIME]
+[name=orderby_duplicates_single_base_column_range_datetime_asc]
+SELECT * FROM UNNEST(ARRAY(
+  SELECT range_datetime_val FROM AllTypesRangeDatetimeTable t
+  ORDER BY range_datetime_val ASC
+)) x WITH OFFSET POS
+--
+ARRAY<STRUCT<x RANGE<DATETIME>, POS INT64>>[unknown order:
+  {NULL, 0},
+  {NULL, 1},
+  {NULL, 2},
+  {
+    [NULL, 2013-10-15 00:00:00),
+    3
+  },
+  {
+    [2004-01-01 00:00:00, 2004-10-15 00:00:00),
+    4
+  },
+  {
+    [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+    5
+  },
+  {
+    [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+    6
+  },
+  {
+    [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+    7
+  },
+  {
+    [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+    8
+  },
+  {
+    [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+    9
+  },
+  {
+    [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+    10
+  },
+  {
+    [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+    11
+  },
+  {
+    [2013-01-01 00:00:00, 2013-10-15 00:00:00),
+    12
+  },
+  {
+    [2014-01-01 00:00:00, 2014-10-15 00:00:00),
+    13
+  },
+  {
+    [2015-01-01 00:00:00, 2015-10-15 00:00:00),
+    14
+  },
+  {
+    [2017-01-01 00:00:00, NULL),
+    15
+  },
+  {
+    [2019-01-01 00:00:00, 2019-10-15 00:00:00),
+    16
+  }
+]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_duplicates_single_base_column_range_timestamp_desc]
+SELECT * FROM UNNEST(ARRAY(
+  SELECT range_timestamp_val FROM AllTypesRangeTable t
+  ORDER BY range_timestamp_val DESC
+)) x WITH OFFSET POS
+--
+ARRAY<STRUCT<x RANGE<TIMESTAMP>, POS INT64>>[unknown order:
+  {[
+     2019-01-01 00:00:00+00,
+     2019-10-15 00:00:00+00
+   ),
+   0},
+  {[
+     2017-01-01 00:00:00+00,
+     NULL
+   ),
+   1},
+  {[
+     2015-01-01 00:00:00+00,
+     2015-10-15 00:00:00+00
+   ),
+   2},
+  {[
+     2014-01-01 00:00:00+00,
+     2014-10-15 00:00:00+00
+   ),
+   3},
+  {[
+     2013-01-01 00:00:00+00,
+     2013-10-15 00:00:00+00
+   ),
+   4},
+  {[
+     2012-01-01 00:00:00+00,
+     2012-10-15 00:00:00+00
+   ),
+   5},
+  {[
+     2012-01-01 00:00:00+00,
+     2012-10-15 00:00:00+00
+   ),
+   6},
+  {[
+     2012-01-01 00:00:00+00,
+     2012-10-15 00:00:00+00
+   ),
+   7},
+  {[
+     2011-01-01 00:00:00+00,
+     2011-10-15 00:00:00+00
+   ),
+   8},
+  {[
+     2011-01-01 00:00:00+00,
+     2011-10-15 00:00:00+00
+   ),
+   9},
+  {[
+     2011-01-01 00:00:00+00,
+     2011-10-15 00:00:00+00
+   ),
+   10},
+  {[
+     2011-01-01 00:00:00+00,
+     2011-10-15 00:00:00+00
+   ),
+   11},
+  {[
+     2004-01-01 00:00:00+00,
+     2004-10-15 00:00:00+00
+   ),
+   12},
+  {[
+     NULL,
+     2013-10-15 00:00:00+00
+   ),
+   13},
+  {NULL, 14},
+  {NULL, 15},
+  {NULL, 16}
+]
+==
+
+[required_features=RANGE_TYPE]
+[name=orderby_duplicates_single_base_column_range_date_desc]
+SELECT * FROM UNNEST(ARRAY(
+  SELECT range_date_val FROM AllTypesRangeTable t
+  ORDER BY range_date_val DESC
+)) x WITH OFFSET POS
+--
+ARRAY<STRUCT<x RANGE<DATE>, POS INT64>>[unknown order:
+  {
+    [2026-01-01, 2026-10-15),
+    0
+  },
+  {
+    [2019-01-01, 2019-10-15),
+    1
+  },
+  {[2017-01-01, NULL), 2},
+  {
+    [2014-01-01, 2014-10-15),
+    3
+  },
+  {
+    [2013-01-01, 2013-10-15),
+    4
+  },
+  {
+    [2013-01-01, 2013-10-15),
+    5
+  },
+  {
+    [2012-01-01, 2012-10-15),
+    6
+  },
+  {
+    [2012-01-01, 2012-10-15),
+    7
+  },
+  {
+    [2011-01-01, 2011-10-15),
+    8
+  },
+  {
+    [2011-01-01, 2011-10-15),
+    9
+  },
+  {
+    [2011-01-01, 2011-10-15),
+    10
+  },
+  {
+    [2011-01-01, 2011-10-15),
+    11
+  },
+  {
+    [2007-01-01, 2007-10-15),
+    12
+  },
+  {[NULL, 2007-10-15), 13},
+  {NULL, 14},
+  {NULL, 15},
+  {NULL, 16}
+]
+==
+
+[required_features=RANGE_TYPE,CIVIL_TIME]
+[name=orderby_duplicates_single_base_column_range_datetime_desc]
+SELECT * FROM UNNEST(ARRAY(
+  SELECT range_datetime_val FROM AllTypesRangeDatetimeTable t
+  ORDER BY range_datetime_val DESC
+)) x WITH OFFSET POS
+--
+ARRAY<STRUCT<x RANGE<DATETIME>, POS INT64>>[unknown order:
+  {
+    [2019-01-01 00:00:00, 2019-10-15 00:00:00),
+    0
+  },
+  {
+    [2017-01-01 00:00:00, NULL),
+    1
+  },
+  {
+    [2015-01-01 00:00:00, 2015-10-15 00:00:00),
+    2
+  },
+  {
+    [2014-01-01 00:00:00, 2014-10-15 00:00:00),
+    3
+  },
+  {
+    [2013-01-01 00:00:00, 2013-10-15 00:00:00),
+    4
+  },
+  {
+    [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+    5
+  },
+  {
+    [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+    6
+  },
+  {
+    [2012-01-01 00:00:00, 2012-10-15 00:00:00),
+    7
+  },
+  {
+    [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+    8
+  },
+  {
+    [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+    9
+  },
+  {
+    [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+    10
+  },
+  {
+    [2011-01-01 00:00:00, 2011-10-15 00:00:00),
+    11
+  },
+  {
+    [2004-01-01 00:00:00, 2004-10-15 00:00:00),
+    12
+  },
+  {
+    [NULL, 2013-10-15 00:00:00),
+    13
+  },
+  {NULL, 14},
+  {NULL, 15},
+  {NULL, 16}
+]
