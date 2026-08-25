@@ -704,7 +704,22 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         ASSIGN_OR_RETURN(Table, table,
                          database_->CreateTable(
                              ctx, Schema(create.TableName(), columns)));
-        for (const auto& row : rows) {
+        for (auto& row : rows) {
+          // Coerce materialized values to the declared column types: the
+          // SELECT output may carry narrower types (e.g. INT64 literals in
+          // UNION ALL branches under a DOUBLE first row).
+          for (size_t i = 0; i < row.Size() && i < columns.size(); ++i) {
+            Value& cell = row.values_[i];
+            const ValueType target = columns[i].Type();
+            if (cell.IsNull() || cell.type == target ||
+                target == ValueType::kNull) {
+              continue;
+            }
+            if (target == ValueType::kDouble &&
+                cell.type == ValueType::kInt64) {
+              cell = Value(static_cast<double>(cell.value.int_value));
+            }
+          }
           ASSIGN_OR_RETURN(RowPosition, pos, table.Insert(ctx.txn_, row));
         }
         return Executor(std::make_shared<ConstantExecutor>(

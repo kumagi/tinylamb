@@ -22,6 +22,7 @@
 #include <ctime>
 #include <iomanip>
 #include <ostream>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -274,6 +275,18 @@ Value ExecuteFunction(const std::string& name,
     return val.AsString();
   };
 
+  if (name == "rand") {
+    if (!values.empty()) {
+      throw std::runtime_error("RAND requires no arguments");
+    }
+    static thread_local std::mt19937_64 rng(
+        std::random_device{}() ^
+        static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    static thread_local std::uniform_real_distribution<double> uniform(0.0,
+                                                                       1.0);
+    return Value(uniform(rng));
+  }
   if (name == "coalesce") {
     for (const auto& val : values) {
       if (!val.IsNull()) { return val; }

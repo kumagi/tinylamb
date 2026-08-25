@@ -131,6 +131,12 @@ struct AggregateAccumulator {
   mutable std::vector<std::string> sketch_values_;  // HLL/KLL distinct entries
   mutable int sketch_type_ = 0;                     // 0 = unset
   mutable int64_t sketch_precision_ = 0;
+  // PERCENTILE_CONT inputs and the group-wide percentile parameter.
+  mutable std::vector<double> percentile_values_;
+  double percentile_p_ = 0;
+  bool percentile_p_valid_ = false;
+  // APPROX_COUNT_DISTINCT distinct-value tracking (exact within engine).
+  std::unique_ptr<std::unordered_set<Value>> approx_distinct_;
 
   void ApplyCore(const Value& value,
                  const std::vector<Value>& trailing_values = {});

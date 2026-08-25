@@ -18,16 +18,16 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "database/transaction_context.hpp"
+#include "executor/detail/expression_eval.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
-#include "database/transaction_context.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
-#include "executor/detail/expression_eval.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
@@ -47,10 +47,14 @@
 namespace tinylamb {
 namespace {
 
-int ParseTimeZoneOffset(std::string_view tz_str, int Y, int M, int D, int h, int m, int s, int default_offset = 0) {
-  if (tz_str.empty()) { return default_offset; }
-  if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" || tz_str == "gmt" ||
-      tz_str == "Z" || tz_str == "z" || tz_str == "Etc/Greenwich" || tz_str == "Etc/UTC" || tz_str == "Etc/GMT") {
+int ParseTimeZoneOffset(std::string_view tz_str, int Y, int M, int D, int h,
+                        int m, int s, int default_offset = 0) {
+  if (tz_str.empty()) {
+    return default_offset;
+  }
+  if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" ||
+      tz_str == "gmt" || tz_str == "Z" || tz_str == "z" ||
+      tz_str == "Etc/Greenwich" || tz_str == "Etc/UTC" || tz_str == "Etc/GMT") {
     return 0;
   }
   if (tz_str.starts_with("UTC+") || tz_str.starts_with("UTC-") ||
@@ -81,31 +85,33 @@ int ParseTimeZoneOffset(std::string_view tz_str, int Y, int M, int D, int h, int
     return (th * 3600 + tm * 60) * (sign == '-' ? -1 : 1);
   }
   std::string zone_name(tz_str);
-  if (zone_name == "NZ-CHAT") { zone_name = "Pacific/Chatham"; }
+  if (zone_name == "NZ-CHAT") {
+    zone_name = "Pacific/Chatham";
+  }
   try {
     const auto* zone = std::chrono::locate_zone(zone_name);
     if (zone) {
       int y = Y < 1970 ? 1970 : Y;
-      std::chrono::year_month_day ymd{std::chrono::year{y},
-                                      std::chrono::month{static_cast<unsigned>(M)},
-                                      std::chrono::day{static_cast<unsigned>(D)}};
+      std::chrono::year_month_day ymd{
+          std::chrono::year{y}, std::chrono::month{static_cast<unsigned>(M)},
+          std::chrono::day{static_cast<unsigned>(D)}};
       std::chrono::local_days loc_d{ymd};
-      auto loc_tp = loc_d + std::chrono::hours{h} +
-                    std::chrono::minutes{m} + std::chrono::seconds{s};
+      auto loc_tp = loc_d + std::chrono::hours{h} + std::chrono::minutes{m} +
+                    std::chrono::seconds{s};
       auto loc_info = zone->get_info(loc_tp);
       return static_cast<int>(loc_info.first.offset.count());
     }
-  } catch (...) {}
+  } catch (...) {
+  }
   return default_offset;
 }
 
 std::string SqlTypeFromAst(const GoogleSqlAstNode& node);
 
 std::string Lower(std::string value) {
-
-  std::ranges::transform(
-      value, value.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::ranges::transform(value, value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
   return value;
 }
 
@@ -141,9 +147,8 @@ class ExpressionDepthGuard {
 int64_t ParseIntLiteral(const GoogleSqlAstNode& node) {
   const std::string& text = node.detail;
   const bool digits_only =
-      !text.empty() && std::ranges::all_of(text, [](char c) {
-        return '0' <= c && c <= '9';
-      });
+      !text.empty() &&
+      std::ranges::all_of(text, [](char c) { return '0' <= c && c <= '9'; });
   if (!digits_only) {
     throw std::runtime_error("GoogleSQL AST: malformed integer literal " +
                              text);
@@ -164,9 +169,8 @@ int64_t ParseIntLiteral(const GoogleSqlAstNode& node) {
 uint64_t ParseUnsignedLiteral(const GoogleSqlAstNode& node) {
   const std::string& text = node.detail;
   const bool digits_only =
-      !text.empty() && std::ranges::all_of(text, [](char c) {
-        return '0' <= c && c <= '9';
-      });
+      !text.empty() &&
+      std::ranges::all_of(text, [](char c) { return '0' <= c && c <= '9'; });
   if (!digits_only) {
     throw std::runtime_error("GoogleSQL AST: malformed unsigned literal " +
                              text);
@@ -182,12 +186,23 @@ uint64_t ParseUnsignedLiteral(const GoogleSqlAstNode& node) {
 }
 
 double ParseFloatLiteral(const GoogleSqlAstNode& node) {
-  try {
-    return std::stod(node.detail);
-  } catch (const std::exception&) {
-    throw std::runtime_error("GoogleSQL AST: float literal out of range " +
-                             node.detail);
+  const std::string text = node.detail;
+  char* end = nullptr;
+  const double value = std::strtod(text.c_str(), &end);
+  if (end == text.c_str() || *end != '\0') {
+    try {
+      return std::stod(text);
+    } catch (const std::exception&) {
+      throw std::runtime_error("GoogleSQL AST: invalid float literal " + text);
+    }
   }
+  // strtod reports ERANGE for subnormal (denormal) results; the returned
+  // value is still the closest representable double and is accepted here.
+  if (std::isinf(value)) {
+    throw std::runtime_error("GoogleSQL AST: float literal out of range " +
+                             text);
+  }
+  return value;
 }
 
 std::string DecodeSingleComponent(std::string_view value_view);
@@ -198,7 +213,8 @@ std::string Identifier(const GoogleSqlAstNode& node) {
   }
   std::string value = node.detail;
   if (value.size() >= 2 && value.front() == '`' && value.back() == '`') {
-    value = DecodeSingleComponent("\"" + value.substr(1, value.size() - 2) + "\"");
+    value =
+        DecodeSingleComponent("\"" + value.substr(1, value.size() - 2) + "\"");
   }
   return value;
 }
@@ -206,8 +222,9 @@ std::string Identifier(const GoogleSqlAstNode& node) {
 std::vector<std::string> PathParts(const GoogleSqlAstNode& path) {
   std::vector<std::string> result;
   for (const auto& child : path.children) {
-    if (child->kind == "Identifier") { result.push_back(Identifier(*child));
-}
+    if (child->kind == "Identifier") {
+      result.push_back(Identifier(*child));
+    }
   }
   if (result.empty()) {
     throw std::runtime_error("GoogleSQL AST: empty path expression");
@@ -219,8 +236,9 @@ std::string Path(const GoogleSqlAstNode& path) {
   const std::vector<std::string> parts = PathParts(path);
   std::string result;
   for (const std::string& part : parts) {
-    if (!result.empty()) { result += '.';
-}
+    if (!result.empty()) {
+      result += '.';
+    }
     result += part;
   }
   return result;
@@ -246,7 +264,8 @@ std::string DecodeSingleComponent(std::string_view value_view) {
     is_bytes = true;
     value = value.substr(1);
   }
-  if (!is_raw && value.size() >= 1 && (value.front() == 'r' || value.front() == 'R')) {
+  if (!is_raw && value.size() >= 1 &&
+      (value.front() == 'r' || value.front() == 'R')) {
     is_raw = true;
     value = value.substr(1);
   }
@@ -277,24 +296,38 @@ std::string DecodeSingleComponent(std::string_view value_view) {
   for (size_t i = 0; i < value.size(); ++i) {
     if (value[i] == '\\' && i + 1 < value.size()) {
       char next = value[++i];
-      if (next == 'a') { decoded.push_back('\a'); }
-      else if (next == 'b') { decoded.push_back('\b'); }
-      else if (next == 'f') { decoded.push_back('\f'); }
-      else if (next == 'n') { decoded.push_back('\n'); }
-      else if (next == 'r') { decoded.push_back('\r'); }
-      else if (next == 't') { decoded.push_back('\t'); }
-      else if (next == 'v') { decoded.push_back('\v'); }
-      else if (next == '\\') { decoded.push_back('\\'); }
-      else if (next == '\'') { decoded.push_back('\''); }
-      else if (next == '"') { decoded.push_back('"'); }
-      else if (next == '`') { decoded.push_back('`'); }
-      else if (next == '?' || next == '/') { decoded.push_back(next); }
-      else if (next >= '0' && next <= '7') {
+      if (next == 'a') {
+        decoded.push_back('\a');
+      } else if (next == 'b') {
+        decoded.push_back('\b');
+      } else if (next == 'f') {
+        decoded.push_back('\f');
+      } else if (next == 'n') {
+        decoded.push_back('\n');
+      } else if (next == 'r') {
+        decoded.push_back('\r');
+      } else if (next == 't') {
+        decoded.push_back('\t');
+      } else if (next == 'v') {
+        decoded.push_back('\v');
+      } else if (next == '\\') {
+        decoded.push_back('\\');
+      } else if (next == '\'') {
+        decoded.push_back('\'');
+      } else if (next == '"') {
+        decoded.push_back('"');
+      } else if (next == '`') {
+        decoded.push_back('`');
+      } else if (next == '?' || next == '/') {
+        decoded.push_back(next);
+      } else if (next >= '0' && next <= '7') {
         std::string oct_str;
         oct_str.push_back(next);
-        if (i + 1 < value.size() && value[i + 1] >= '0' && value[i + 1] <= '7') {
+        if (i + 1 < value.size() && value[i + 1] >= '0' &&
+            value[i + 1] <= '7') {
           oct_str.push_back(value[++i]);
-          if (i + 1 < value.size() && value[i + 1] >= '0' && value[i + 1] <= '7') {
+          if (i + 1 < value.size() && value[i + 1] >= '0' &&
+              value[i + 1] <= '7') {
             oct_str.push_back(value[++i]);
           }
         }
@@ -303,14 +336,14 @@ std::string DecodeSingleComponent(std::string_view value_view) {
           if (is_bytes || raw_byte <= 0x7F) {
             decoded.push_back(static_cast<char>(raw_byte));
           } else {
-            decoded.push_back(static_cast<char>(0xC0 | ((raw_byte >> 6) & 0x1F)));
+            decoded.push_back(
+                static_cast<char>(0xC0 | ((raw_byte >> 6) & 0x1F)));
             decoded.push_back(static_cast<char>(0x80 | (raw_byte & 0x3F)));
           }
         } catch (...) {
           decoded.push_back(next);
         }
-      }
-      else if (next == 'x' || next == 'X') {
+      } else if (next == 'x' || next == 'X') {
         if (i + 2 < value.size()) {
           std::string hex_str = value.substr(i + 1, 2);
           try {
@@ -318,7 +351,8 @@ std::string DecodeSingleComponent(std::string_view value_view) {
             if (is_bytes || raw_byte <= 0x7F) {
               decoded.push_back(static_cast<char>(raw_byte));
             } else {
-              decoded.push_back(static_cast<char>(0xC0 | ((raw_byte >> 6) & 0x1F)));
+              decoded.push_back(
+                  static_cast<char>(0xC0 | ((raw_byte >> 6) & 0x1F)));
               decoded.push_back(static_cast<char>(0x80 | (raw_byte & 0x3F)));
             }
             i += 2;
@@ -328,8 +362,7 @@ std::string DecodeSingleComponent(std::string_view value_view) {
         } else {
           decoded.push_back(next);
         }
-      }
-      else if (next == 'u') {
+      } else if (next == 'u') {
         if (i + 4 < value.size()) {
           std::string hex_str = value.substr(i + 1, 4);
           try {
@@ -386,7 +419,8 @@ std::string DecodeSingleComponent(std::string_view value_view) {
       } else {
         decoded.push_back(next);
       }
-    } else if (!is_triple && value[i] == quote && i + 1 < value.size() && value[i + 1] == quote) {
+    } else if (!is_triple && value[i] == quote && i + 1 < value.size() &&
+               value[i + 1] == quote) {
       decoded.push_back(quote);
       ++i;
     } else {
@@ -395,9 +429,6 @@ std::string DecodeSingleComponent(std::string_view value_view) {
   }
   return decoded;
 }
-
-
-
 
 std::string DecodeString(const GoogleSqlAstNode& node) {
   std::string result;
@@ -414,19 +445,21 @@ std::string DecodeString(const GoogleSqlAstNode& node) {
   return DecodeSingleComponent(node.detail);
 }
 
-
-
 // Recognizes the correlated shape `SELECT x FROM UNNEST(<expr>) [AS x]`
 // (no other clauses) used by quantified comparisons over table arrays and
 // returns the array expression node.  Returns nullptr for anything else.
-const GoogleSqlAstNode* UnnestArrayOfQuantifiedSubquery(  // NOLINT(misc-no-recursion)
+const GoogleSqlAstNode*
+UnnestArrayOfQuantifiedSubquery(  // NOLINT(misc-no-recursion)
     const GoogleSqlAstNode& query) {
-  const GoogleSqlAstNode* select = (query.kind == "Select")
-                                       ? &query
-                                       : query.Child("Select");
-  if (select == nullptr) { return nullptr; }
+  const GoogleSqlAstNode* select =
+      (query.kind == "Select") ? &query : query.Child("Select");
+  if (select == nullptr) {
+    return nullptr;
+  }
   for (const auto& child : select->children) {
-    if (child->kind == "Location") { continue; }
+    if (child->kind == "Location") {
+      continue;
+    }
     if (child->kind != "SelectList" && child->kind != "FromClause") {
       return nullptr;
     }
@@ -436,20 +469,26 @@ const GoogleSqlAstNode* UnnestArrayOfQuantifiedSubquery(  // NOLINT(misc-no-recu
     return nullptr;
   }
   const GoogleSqlAstNode* from = select->Child("FromClause");
-  if (from == nullptr || from->children.size() != 1) { return nullptr; }
+  if (from == nullptr || from->children.size() != 1) {
+    return nullptr;
+  }
   const GoogleSqlAstNode* source = from->children.front().get();
   if (source == nullptr || source->kind != "TablePathExpression") {
     return nullptr;
   }
   const GoogleSqlAstNode* unnest = source->Child("UnnestExpression");
-  if (unnest == nullptr) { return nullptr; }
+  if (unnest == nullptr) {
+    return nullptr;
+  }
   if (source->Child("WithOffset") != nullptr ||
       source->Child("WithOffsetClause") != nullptr) {
     return nullptr;
   }
   const GoogleSqlAstNode* expr_with_alias =
       unnest->Child("ExpressionWithOptAlias");
-  if (expr_with_alias == nullptr) { return nullptr; }
+  if (expr_with_alias == nullptr) {
+    return nullptr;
+  }
   for (const auto& child : expr_with_alias->children) {
     if (child->kind != "Location" && child->kind != "Identifier" &&
         child->kind != "Alias") {
@@ -460,43 +499,62 @@ const GoogleSqlAstNode* UnnestArrayOfQuantifiedSubquery(  // NOLINT(misc-no-recu
 }
 
 BinaryOperation BinaryOp(std::string_view detail) {
-  if (detail == "+") { return BinaryOperation::kAdd;
-}
-  if (detail == "-") { return BinaryOperation::kSubtract;
-}
-  if (detail == "*") { return BinaryOperation::kMultiply;
-}
-  if (detail == "/") { return BinaryOperation::kDivide;
-}
-  if (detail == "%") { return BinaryOperation::kModulo;
-}
-  if (detail == "=") { return BinaryOperation::kEquals;
-}
-  if (detail == "!=" || detail == "<>") { return BinaryOperation::kNotEquals;
-}
-  if (detail == "<") { return BinaryOperation::kLessThan;
-}
-  if (detail == "<=") { return BinaryOperation::kLessThanEquals;
-}
-  if (detail == ">") { return BinaryOperation::kGreaterThan;
-}
-  if (detail == ">=") { return BinaryOperation::kGreaterThanEquals;
-}
-  if (detail == "LIKE") { return BinaryOperation::kLike;
-}
-  if (detail == "NOT LIKE") { return BinaryOperation::kNotLike;
-}
+  if (detail == "+") {
+    return BinaryOperation::kAdd;
+  }
+  if (detail == "-") {
+    return BinaryOperation::kSubtract;
+  }
+  if (detail == "*") {
+    return BinaryOperation::kMultiply;
+  }
+  if (detail == "/") {
+    return BinaryOperation::kDivide;
+  }
+  if (detail == "%") {
+    return BinaryOperation::kModulo;
+  }
+  if (detail == "=") {
+    return BinaryOperation::kEquals;
+  }
+  if (detail == "!=" || detail == "<>") {
+    return BinaryOperation::kNotEquals;
+  }
+  if (detail == "<") {
+    return BinaryOperation::kLessThan;
+  }
+  if (detail == "<=") {
+    return BinaryOperation::kLessThanEquals;
+  }
+  if (detail == ">") {
+    return BinaryOperation::kGreaterThan;
+  }
+  if (detail == ">=") {
+    return BinaryOperation::kGreaterThanEquals;
+  }
+  if (detail == "LIKE") {
+    return BinaryOperation::kLike;
+  }
+  if (detail == "NOT LIKE") {
+    return BinaryOperation::kNotLike;
+  }
   throw std::runtime_error("GoogleSQL AST: unsupported binary operator " +
                            std::string(detail));
 }
 
 std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query);
+Expression ExpandUdfCall(std::string name, std::vector<Expression> arguments);
 Expression VisitExpression(const GoogleSqlAstNode& node);
 
-bool NeedsRelationalEvaluation(const Expression& expression,  // NOLINT(misc-no-recursion) // AST traversal recursion is intentional; expression depth bounded by ExpressionDepthGuard (kMaxExpressionDepth).
-                               bool top_level = true) {
-  if (!expression) { return false;
-}
+bool NeedsRelationalEvaluation(
+    const Expression&
+        expression,  // NOLINT(misc-no-recursion) // AST traversal recursion is
+                     // intentional; expression depth bounded by
+                     // ExpressionDepthGuard (kMaxExpressionDepth).
+    bool top_level = true) {
+  if (!expression) {
+    return false;
+  }
   switch (expression->Type()) {
     case TypeTag::kQueryExp:
     case TypeTag::kIntervalExp:
@@ -536,11 +594,16 @@ bool NeedsRelationalEvaluation(const Expression& expression,  // NOLINT(misc-no-
     }
     case TypeTag::kInExp: {
       const auto& value = expression->AsInExpression();
-      if (NeedsRelationalEvaluation(value.child_, false)) { return true;
-}
-      return std::ranges::any_of(value.list_, [](const Expression& item) {  // NOLINT(misc-no-recursion) // Part of NeedsRelationalEvaluation recursion; depth-guarded by ExpressionDepthGuard.
-        return NeedsRelationalEvaluation(item, false);
-      });
+      if (NeedsRelationalEvaluation(value.child_, false)) {
+        return true;
+      }
+      return std::ranges::any_of(
+          value.list_, [](const Expression&
+                              item) {  // NOLINT(misc-no-recursion) // Part of
+                                       // NeedsRelationalEvaluation recursion;
+                                       // depth-guarded by ExpressionDepthGuard.
+            return NeedsRelationalEvaluation(item, false);
+          });
     }
     case TypeTag::kFunctionCallExp: {
       return true;
@@ -550,17 +613,21 @@ bool NeedsRelationalEvaluation(const Expression& expression,  // NOLINT(misc-no-
       // hidden-column pre-computation.
       return true;
     case TypeTag::kArrayExp:
-      return std::ranges::any_of(
-          expression->AsArrayExpression().Elements(),
-          [](const Expression& element) {
-            return NeedsRelationalEvaluation(element, false);
-          });
+      return std::ranges::any_of(expression->AsArrayExpression().Elements(),
+                                 [](const Expression& element) {
+                                   return NeedsRelationalEvaluation(element,
+                                                                    false);
+                                 });
     default:
       return false;
   }
 }
 
-Expression FoldBoolean(const GoogleSqlAstNode& node, BinaryOperation op) {  // NOLINT(misc-no-recursion) // AST traversal recursion is intentional; depth bounded by ExpressionDepthGuard in VisitExpression.
+Expression FoldBoolean(
+    const GoogleSqlAstNode& node,
+    BinaryOperation op) {  // NOLINT(misc-no-recursion) // AST traversal
+                           // recursion is intentional; depth bounded by
+                           // ExpressionDepthGuard in VisitExpression.
   Expression result;
   for (const auto& child : node.children) {
     Expression next = VisitExpression(*child);
@@ -568,13 +635,16 @@ Expression FoldBoolean(const GoogleSqlAstNode& node, BinaryOperation op) {  // N
                  ? BinaryExpressionExp(std::move(result), op, std::move(next))
                  : std::move(next);
   }
-  if (!result) { throw std::runtime_error("GoogleSQL AST: empty boolean node");
-}
+  if (!result) {
+    throw std::runtime_error("GoogleSQL AST: empty boolean node");
+  }
   return result;
 }
 
 bool IsBooleanAstNode(const GoogleSqlAstNode& node) {
-  if (node.kind == "BooleanLiteral") { return true; }
+  if (node.kind == "BooleanLiteral") {
+    return true;
+  }
   if (node.kind == "BinaryExpression") {
     if (node.detail == "=" || node.detail == "!=" || node.detail == "<>" ||
         node.detail == "<" || node.detail == "<=" || node.detail == ">" ||
@@ -597,6 +667,142 @@ bool IsBooleanAstNode(const GoogleSqlAstNode& node) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// SQL UDF / UDA support (CREATE TEMP FUNCTION / CREATE TEMP AGGREGATE
+// FUNCTION).  Definitions are kept in a session registry; call sites expand
+// by re-visiting the body AST with parameter identifiers substituted by the
+// argument expressions.  Substitution is shadow-aware: a parameter whose name
+// is explicitly bound by an intervening query block (derived-table output,
+// UNNEST alias, ...) resolves to that binding instead of the parameter.
+struct SqlUdf {
+  std::string name;
+  std::vector<std::pair<std::string, bool>>
+      parameters;  // (lower name, NOT AGGREGATE)
+  bool is_aggregate{false};
+  std::shared_ptr<GoogleSqlAstNode> root;  // owns the AST copy
+  const GoogleSqlAstNode* body{nullptr};
+  // Body analysis: how often each parameter occurs, and whether the body is
+  // too complex (subqueries, aggregates) for argument-once binding.
+  std::vector<size_t> parameter_counts;
+  bool simple_body{true};
+};
+
+std::unordered_map<std::string, SqlUdf>& UdfRegistry() {
+  static thread_local std::unordered_map<std::string, SqlUdf> registry;
+  return registry;
+}
+
+std::unique_ptr<GoogleSqlAstNode> CloneAstNode(
+    const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recursion)
+  auto clone = std::make_unique<GoogleSqlAstNode>();
+  clone->kind = node.kind;
+  clone->detail = node.detail;
+  clone->start = node.start;
+  clone->end = node.end;
+  clone->children.reserve(node.children.size());
+  for (const auto& child : node.children) {
+    clone->children.push_back(CloneAstNode(*child));
+  }
+  return clone;
+}
+
+struct UdfExpansionFrame {
+  const SqlUdf* udf;
+  const std::vector<Expression>* arguments;
+  size_t mask_depth;
+};
+
+thread_local std::vector<UdfExpansionFrame> t_udf_frames;
+thread_local std::vector<std::unordered_set<std::string>> t_udf_bound_masks;
+
+// CREATE TEMP CONSTANT values that could not be folded to text (subqueries,
+// function calls): resolved per reference through the relational evaluator.
+std::unordered_map<std::string, Expression>& SessionConstantExpressions() {
+  static thread_local std::unordered_map<std::string, Expression> constants;
+  return constants;
+}
+
+// Returns the argument expression bound to `path_name` by the innermost
+// active expansion, or nullptr when the identifier must resolve normally
+// (no parameter of that name, or an explicit binding shadows it).
+Expression SubstituteUdfParameter(const std::string& path_name) {
+  if (path_name.find('.') != std::string::npos || t_udf_frames.empty()) {
+    return nullptr;
+  }
+  const std::string lower = Lower(path_name);
+  // Walk masks top-down alongside frames: masks pushed above a frame's
+  // mask_depth belong to query blocks between the expansion and this
+  // identifier occurrence.
+  size_t mask_pos = t_udf_bound_masks.size();
+  for (size_t f = t_udf_frames.size(); f-- > 0;) {
+    const UdfExpansionFrame& frame = t_udf_frames[f];
+    while (mask_pos > frame.mask_depth) {
+      --mask_pos;
+      if (t_udf_bound_masks[mask_pos].count(lower) != 0) {
+        // Explicitly bound between this expansion and the occurrence: the
+        // column/alias wins over every enclosing parameter.
+        return nullptr;
+      }
+    }
+    if (frame.arguments == nullptr) {
+      continue;
+    }
+    for (size_t index = 0; index < frame.udf->parameters.size(); ++index) {
+      if (frame.udf->parameters[index].first == lower) {
+        return (*frame.arguments)[index];
+      }
+    }
+  }
+  return nullptr;
+}
+
+// Analyzes a registered body: per-parameter identifier occurrence counts and
+// whether subqueries/aggregates rule out argument-once binding.
+void AnalyzeUdfBody(const GoogleSqlAstNode& node,  // NOLINT(misc-no-recursion)
+                    const std::vector<std::pair<std::string, bool>>& parameters,
+                    std::vector<size_t>* counts, bool* simple) {
+  static const std::unordered_set<std::string> kAggregateNames = {
+      "count",   "sum",       "avg",        "min",         "max",
+      "countif", "array_agg", "string_agg", "logical_and", "logical_or"};
+  if (node.kind == "Query" || node.kind == "ExpressionSubquery" ||
+      node.kind == "TableSubquery" || node.kind == "AnalyticFunctionCall") {
+    *simple = false;
+    return;
+  }
+  if (node.kind == "PathExpression" && node.children.size() == 1 &&
+      node.children[0]->kind == "Identifier") {
+    const std::string lower = Lower(Identifier(*node.children[0]));
+    for (size_t i = 0; i < parameters.size(); ++i) {
+      if (parameters[i].first == lower) {
+        ++(*counts)[i];
+      }
+    }
+    return;
+  }
+  if (node.kind == "FunctionCall" && !node.children.empty() &&
+      node.children.front()->kind == "PathExpression") {
+    try {
+      const std::string fn = Lower(Path(*node.children.front()));
+      if (kAggregateNames.count(fn) != 0) {
+        *simple = false;
+      }
+    } catch (...) {
+    }
+  }
+  for (const auto& child : node.children) {
+    AnalyzeUdfBody(*child, parameters, counts, simple);
+  }
+}
+
+// Expands a call to a registered SQL function by visiting its body with the
+// call arguments substituted for the parameters. Aggregate definitions whose
+// expanded body contains no aggregate still force grouped semantics so that
+// they yield exactly one row per group even over empty input.
+
+// Collects the names explicitly bound by a FROM clause subtree (derived
+// table outputs, UNNEST / table aliases, WITH OFFSET aliases). Plain base
+// tables bind nothing here because their column sets are unknown at visit
+// time.
 Expression WrapIfBoolean(Expression expr, const GoogleSqlAstNode& node) {
   if (IsBooleanAstNode(node)) {
     return CaseExpressionExp(
@@ -614,7 +820,9 @@ std::string UpperCopy(std::string text) {
 }
 
 bool IsBytesAstNode(const GoogleSqlAstNode& node) {
-  if (node.kind == "BytesLiteral") { return true; }
+  if (node.kind == "BytesLiteral") {
+    return true;
+  }
   if (node.kind == "CastExpression" && node.children.size() >= 2) {
     const GoogleSqlAstNode& type_node = *node.children[1];
     std::string type_name = SqlTypeFromAst(type_node);
@@ -624,7 +832,9 @@ bool IsBytesAstNode(const GoogleSqlAstNode& node) {
       } else if (type_node.kind == "SimpleType") {
         for (const auto& c : type_node.children) {
           type_name = SqlTypeFromAst(*c);
-          if (!type_name.empty()) { break; }
+          if (!type_name.empty()) {
+            break;
+          }
         }
       }
     }
@@ -634,26 +844,34 @@ bool IsBytesAstNode(const GoogleSqlAstNode& node) {
     }
   }
   if (node.kind == "FunctionCall") {
-    if (!node.children.empty() && node.children.front()->kind == "PathExpression") {
+    if (!node.children.empty() &&
+        node.children.front()->kind == "PathExpression") {
       const std::string fn = Lower(Path(*node.children.front()));
-      if (fn == "byte_substr" || fn == "b") { return true; }
+      if (fn == "byte_substr" || fn == "b") {
+        return true;
+      }
     }
   }
   return false;
 }
 
-
 WindowOrderTerm ParseOrderingTerm(const GoogleSqlAstNode* term) {
   WindowOrderTerm parsed;
-  if (term == nullptr || term->children.empty()) { return parsed; }
+  if (term == nullptr || term->children.empty()) {
+    return parsed;
+  }
   for (const auto& child : term->children) {
-    if (child->kind == "Location") { continue; }
+    if (child->kind == "Location") {
+      continue;
+    }
     if (child->kind == "NullOrder") {
       parsed.nulls_first =
           UpperCopy(child->detail).find("NULLS FIRST") != std::string::npos;
       continue;
     }
-    if (!parsed.expression) { parsed.expression = VisitExpression(*child); }
+    if (!parsed.expression) {
+      parsed.expression = VisitExpression(*child);
+    }
   }
   parsed.ascending = UpperCopy(term->detail) != "DESC";
   return parsed;
@@ -663,19 +881,29 @@ std::vector<WindowOrderTerm> ParseOrderingList(const GoogleSqlAstNode& order) {
   std::vector<WindowOrderTerm> terms;
   for (const GoogleSqlAstNode* term : order.Children("OrderingExpression")) {
     WindowOrderTerm parsed = ParseOrderingTerm(term);
-    if (parsed.expression) { terms.push_back(std::move(parsed)); }
+    if (parsed.expression) {
+      terms.push_back(std::move(parsed));
+    }
   }
   return terms;
 }
 
-Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recursion) // AST traversal recursion is intentional; depth bounded by ExpressionDepthGuard in VisitExpression.
+Expression VisitFunction(
+    const GoogleSqlAstNode&
+        node) {  // NOLINT(misc-no-recursion) // AST traversal recursion is
+                 // intentional; depth bounded by ExpressionDepthGuard in
+                 // VisitExpression.
   if (node.children.empty() ||
       node.children.front()->kind != "PathExpression") {
     throw std::runtime_error("GoogleSQL AST: function without name");
   }
   std::string name = Lower(Path(*node.children.front()));
-  if (name == "ucase") { name = "upper"; }
-  if (name == "lcase") { name = "lower"; }
+  if (name == "ucase") {
+    name = "upper";
+  }
+  if (name == "lcase") {
+    name = "lower";
+  }
   if (name == "collate") {
     // GoogleSQL requires COLLATE(value, 'literal'): the collator must be a
     // plain string literal, not a NULL/parameter/expression.
@@ -711,7 +939,9 @@ Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recu
 
   for (size_t i = 1; i < node.children.size(); ++i) {
     const GoogleSqlAstNode& child = *node.children[i];
-    if (child.kind == "Location") { continue; }
+    if (child.kind == "Location") {
+      continue;
+    }
     if (child.kind == "WhereClause") {
       // AGG(x WHERE cond): row-level pre-filter before aggregation.
       if (!child.children.empty()) {
@@ -759,9 +989,15 @@ Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recu
     if (having != AggregateHavingModifier::kNone) {
       aggregate->SetHaving(having, having_condition);
     }
-    if (where_filter) { aggregate->SetWhereFilter(where_filter); }
-    if (!inner_order_by.empty()) { aggregate->SetInnerOrderBy(inner_order_by); }
-    if (inner_limit.has_value()) { aggregate->SetInnerLimit(inner_limit); }
+    if (where_filter) {
+      aggregate->SetWhereFilter(where_filter);
+    }
+    if (!inner_order_by.empty()) {
+      aggregate->SetInnerOrderBy(inner_order_by);
+    }
+    if (inner_limit.has_value()) {
+      aggregate->SetInnerLimit(inner_limit);
+    }
     if (type == AggregationType::kStringAgg && arguments.size() > 1) {
       aggregate->SetSecondaryArg(arguments[1]);
     } else if (IsExtendedAggregate(type) && arguments.size() > 1) {
@@ -787,8 +1023,8 @@ Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recu
       name == "array_concat_agg" || name == "elementwise_sum" ||
       name == "elementwise_avg" || name == "any_value" ||
       name == "approx_top_count" || name == "approx_top_sum") {
-    const bool is_bit = name == "bit_and" || name == "bit_or" ||
-                        name == "bit_xor";
+    const bool is_bit =
+        name == "bit_and" || name == "bit_or" || name == "bit_xor";
     const bool is_approx_top =
         name == "approx_top_count" || name == "approx_top_sum";
     const size_t approx_arity = name == "approx_top_count" ? 2 : 3;
@@ -797,35 +1033,69 @@ Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recu
     const bool arity_checked =
         !is_bit && !is_approx_top && name != "string_agg";
     const bool arity_ok =
-        !arity_checked ||
-        (name == "count" && !arguments.empty()) ||
-        arguments.size() == 1 ||
-        (is_bit && arguments.size() == 2) ||
+        !arity_checked || (name == "count" && !arguments.empty()) ||
+        arguments.size() == 1 || (is_bit && arguments.size() == 2) ||
         (is_approx_top && arguments.size() == approx_arity);
     if (!arity_ok) {
       throw std::runtime_error("GoogleSQL AST: aggregate arity");
     }
     AggregationType type = AggregationType::kCount;
-    if (name == "sum") { type = AggregationType::kSum; }
-    if (name == "avg") { type = AggregationType::kAvg; }
-    if (name == "min") { type = AggregationType::kMin; }
-    if (name == "max") { type = AggregationType::kMax; }
-    if (name == "logical_and") { type = AggregationType::kLogicalAnd; }
-    if (name == "logical_or") { type = AggregationType::kLogicalOr; }
-    if (name == "array_agg") { type = AggregationType::kArrayAgg; }
-    if (name == "string_agg") { type = AggregationType::kStringAgg; }
-    if (name == "countif") { type = AggregationType::kCountIf; }
+    if (name == "sum") {
+      type = AggregationType::kSum;
+    }
+    if (name == "avg") {
+      type = AggregationType::kAvg;
+    }
+    if (name == "min") {
+      type = AggregationType::kMin;
+    }
+    if (name == "max") {
+      type = AggregationType::kMax;
+    }
+    if (name == "logical_and") {
+      type = AggregationType::kLogicalAnd;
+    }
+    if (name == "logical_or") {
+      type = AggregationType::kLogicalOr;
+    }
+    if (name == "array_agg") {
+      type = AggregationType::kArrayAgg;
+    }
+    if (name == "string_agg") {
+      type = AggregationType::kStringAgg;
+    }
+    if (name == "countif") {
+      type = AggregationType::kCountIf;
+    }
     // ANY_VALUE may legally return any non-NULL group value; MIN provides
     // that with deterministic streaming semantics.
-    if (name == "any_value") { type = AggregationType::kMin; }
-    if (name == "bit_and") { type = AggregationType::kBitAnd; }
-    if (name == "bit_or") { type = AggregationType::kBitOr; }
-    if (name == "bit_xor") { type = AggregationType::kBitXor; }
-    if (name == "array_concat_agg") { type = AggregationType::kArrayConcatAgg; }
-    if (name == "elementwise_sum") { type = AggregationType::kElementwiseSum; }
-    if (name == "elementwise_avg") { type = AggregationType::kElementwiseAvg; }
-    if (name == "approx_top_count") { type = AggregationType::kApproxTopCount; }
-    if (name == "approx_top_sum") { type = AggregationType::kApproxTopSum; }
+    if (name == "any_value") {
+      type = AggregationType::kMin;
+    }
+    if (name == "bit_and") {
+      type = AggregationType::kBitAnd;
+    }
+    if (name == "bit_or") {
+      type = AggregationType::kBitOr;
+    }
+    if (name == "bit_xor") {
+      type = AggregationType::kBitXor;
+    }
+    if (name == "array_concat_agg") {
+      type = AggregationType::kArrayConcatAgg;
+    }
+    if (name == "elementwise_sum") {
+      type = AggregationType::kElementwiseSum;
+    }
+    if (name == "elementwise_avg") {
+      type = AggregationType::kElementwiseAvg;
+    }
+    if (name == "approx_top_count") {
+      type = AggregationType::kApproxTopCount;
+    }
+    if (name == "approx_top_sum") {
+      type = AggregationType::kApproxTopSum;
+    }
     return finish_aggregate(type);
   }
 
@@ -883,6 +1153,12 @@ Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recu
       max_arity = 2;
     } else if (name == "kll_quantiles.merge_partial") {
       extended = AggregationType::kKllMergePartial;
+    } else if (name == "percentile_cont") {
+      extended = AggregationType::kPercentileCont;
+      min_arity = max_arity = 2;
+    } else if (name == "approx_count_distinct") {
+      extended = AggregationType::kApproxCountDistinct;
+      min_arity = max_arity = 1;
     } else {
       matched = false;
     }
@@ -893,25 +1169,113 @@ Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recu
       return finish_aggregate(extended);
     }
   }
+  if (!UdfRegistry().empty() &&
+      UdfRegistry().find(name) != UdfRegistry().end()) {
+    if (Expression expanded = ExpandUdfCall(name, std::move(arguments))) {
+      return expanded;
+    }
+  }
   return FunctionCallExp(name, std::move(arguments));
 }
 
-
-
-
-
-bool IsAstTrivia(std::string_view kind) {
-  return kind == "Location";
+// Expands a call to a registered SQL function (CREATE TEMP FUNCTION /
+// CREATE TEMP AGGREGATE FUNCTION) by visiting the stored body AST with the
+// call arguments substituted for the parameters. Aggregate definitions whose
+// expanded body has no aggregate are wrapped in a COUNT(*)-gated CASE so
+// they still evaluate once per group (one row over empty input).
+Expression ExpandUdfCall(std::string name, std::vector<Expression> arguments) {
+  auto& registry = UdfRegistry();
+  const auto found = registry.find(name);
+  if (found == registry.end()) {
+    return nullptr;
+  }
+  SqlUdf& udf = found->second;
+  if (arguments.size() != udf.parameters.size()) {
+    throw std::runtime_error("Function call arity mismatch: " + udf.name);
+  }
+  if (t_udf_frames.size() >= 32) {
+    throw std::runtime_error("SQL function recursion limit exceeded: " +
+                             udf.name);
+  }
+  std::vector<Expression> args = std::move(arguments);
+  const bool bind_arguments =
+      !udf.is_aggregate && udf.simple_body &&
+      std::any_of(udf.parameter_counts.begin(), udf.parameter_counts.end(),
+                  [](size_t count) { return count > 1; });
+  if (bind_arguments) {
+    // GoogleSQL evaluates each SQL function argument exactly once per call
+    // even when the body references the parameter repeatedly. Bind the
+    // arguments as columns of a one-row derived table and select the body
+    // from it, leaving parameter identifiers untouched.
+    t_udf_bound_masks.push_back({});
+    Expression result;
+    try {
+      std::vector<NamedExpression> inner_projections;
+      inner_projections.reserve(args.size());
+      for (size_t i = 0; i < args.size(); ++i) {
+        inner_projections.emplace_back(udf.parameters[i].first, args[i]);
+      }
+      auto inner = std::make_shared<SelectStatement>(
+          std::move(inner_projections), std::vector<std::string>{},
+          Expression{});
+      SelectSource source;
+      source.join_type = JoinType::kCross;
+      source.query = std::move(inner);
+      source.alias = "__udf_args";
+      auto outer = std::make_shared<SelectStatement>(
+          std::vector<NamedExpression>{
+              NamedExpression(std::string(""), VisitExpression(*udf.body))},
+          std::vector<std::string>{}, Expression{});
+      outer->SetSources({std::move(source)});
+      outer->MarkComplex();
+      result = QueryExpressionExp(std::move(outer));
+    } catch (...) {
+      t_udf_bound_masks.pop_back();
+      throw;
+    }
+    t_udf_bound_masks.pop_back();
+    return result;
+  }
+  const UdfExpansionFrame frame{&udf, &args, t_udf_bound_masks.size()};
+  t_udf_frames.push_back(frame);
+  Expression result;
+  try {
+    result = VisitExpression(*udf.body);
+  } catch (...) {
+    t_udf_frames.pop_back();
+    throw;
+  }
+  t_udf_frames.pop_back();
+  if (udf.is_aggregate && !relational_detail::ContainsAggregate(result)) {
+    // NOT AGGREGATE arguments and aggregate-free bodies are group-level
+    // expressions: force the grouped path so an empty input still yields
+    // one group whose value is the body expression.
+    Expression count_star =
+        AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("*"));
+    Expression condition = BinaryExpressionExp(
+        std::move(count_star), BinaryOperation::kGreaterThanEquals,
+        ConstantValueExp(Value(int64_t{0})));
+    result =
+        CaseExpressionExp({{std::move(condition), std::move(result)}}, nullptr);
+  }
+  return result;
 }
 
-bool IsArrayTypeNode(std::string_view kind) {
-  return kind == "ArrayType";
-}
+bool IsAstTrivia(std::string_view kind) { return kind == "Location"; }
 
-std::string SqlTypeFromAst(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recursion)
-  if (IsAstTrivia(node.kind)) { return {}; }
-  if (node.kind == "PathExpression") { return UpperCopy(Path(node)); }
-  if (node.kind == "Identifier") { return UpperCopy(node.detail); }
+bool IsArrayTypeNode(std::string_view kind) { return kind == "ArrayType"; }
+
+std::string SqlTypeFromAst(
+    const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recursion)
+  if (IsAstTrivia(node.kind)) {
+    return {};
+  }
+  if (node.kind == "PathExpression") {
+    return UpperCopy(Path(node));
+  }
+  if (node.kind == "Identifier") {
+    return UpperCopy(node.detail);
+  }
   if (node.kind == "SimpleType") {
     // Preserve length/type parameters (STRING(2), NUMERIC(10), ...): they
     // carry validation semantics for casts.
@@ -925,59 +1289,95 @@ std::string SqlTypeFromAst(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     }
     if (!base.empty()) {
       for (const auto& child : node.children) {
-        if (child->kind != "TypeParameterList") { continue; }
+        if (child->kind != "TypeParameterList") {
+          continue;
+        }
         std::string params;
         for (const auto& param : child->children) {
           if (param->kind == "IntLiteral" || param->kind == "Identifier") {
-            if (!params.empty()) { params += ", "; }
+            if (!params.empty()) {
+              params += ", ";
+            }
             params += param->kind == "IntLiteral" ? param->detail
                                                   : UpperCopy(param->detail);
           }
         }
-        if (!params.empty()) { base += "(" + params + ")"; }
+        if (!params.empty()) {
+          base += "(" + params + ")";
+        }
         break;
       }
     }
-    if (!base.empty()) { return base; }
+    if (!base.empty()) {
+      return base;
+    }
   }
   if (node.kind == "ArrayType") {
     for (const auto& child : node.children) {
       const std::string nested = SqlTypeFromAst(*child);
-      if (!nested.empty()) { return "ARRAY<" + nested + ">"; }
+      if (!nested.empty()) {
+        return "ARRAY<" + nested + ">";
+      }
     }
     return "ARRAY<INT64>";
   }
   for (const auto& child : node.children) {
     const std::string nested = SqlTypeFromAst(*child);
-    if (!nested.empty()) { return nested; }
+    if (!nested.empty()) {
+      return nested;
+    }
   }
   return {};
 }
 
-std::string InferArrayElementSqlType(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recursion)
-  if (node.kind == "BooleanLiteral") { return "BOOL"; }
-  if (node.kind == "FloatLiteral") { return "FLOAT64"; }
-  if (node.kind == "StringLiteral") { return "STRING"; }
-  if (node.kind == "BytesLiteral") { return "BYTES"; }
-  if (node.kind == "DateOrTimeLiteral") {
-    if (node.detail == "TYPE_DATE") { return "DATE"; }
-    if (node.detail == "TYPE_TIMESTAMP") { return "TIMESTAMP"; }
-    if (node.detail == "TYPE_TIME") { return "TIME"; }
-    if (node.detail == "TYPE_DATETIME") { return "DATETIME"; }
+std::string InferArrayElementSqlType(
+    const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recursion)
+  if (node.kind == "BooleanLiteral") {
+    return "BOOL";
+  }
+  if (node.kind == "FloatLiteral") {
+    return "FLOAT64";
+  }
+  if (node.kind == "StringLiteral") {
     return "STRING";
   }
-  if (node.kind == "IntervalExpr") { return "INTERVAL"; }
+  if (node.kind == "BytesLiteral") {
+    return "BYTES";
+  }
+  if (node.kind == "DateOrTimeLiteral") {
+    if (node.detail == "TYPE_DATE") {
+      return "DATE";
+    }
+    if (node.detail == "TYPE_TIMESTAMP") {
+      return "TIMESTAMP";
+    }
+    if (node.detail == "TYPE_TIME") {
+      return "TIME";
+    }
+    if (node.detail == "TYPE_DATETIME") {
+      return "DATETIME";
+    }
+    return "STRING";
+  }
+  if (node.kind == "IntervalExpr") {
+    return "INTERVAL";
+  }
   if (node.kind == "CastExpression" && node.children.size() >= 2) {
     return SqlTypeFromAst(*node.children[1]);
   }
-  if (node.kind == "NewConstructor") { return "PROTO"; }
-  if (node.kind == "NullLiteral") { return {}; }
-
+  if (node.kind == "NewConstructor") {
+    return "PROTO";
+  }
+  if (node.kind == "NullLiteral") {
+    return {};
+  }
 
   if (node.kind == "ArrayConstructor") {
     std::string inner;
     for (const auto& child : node.children) {
-      if (IsAstTrivia(child->kind)) { continue; }
+      if (IsAstTrivia(child->kind)) {
+        continue;
+      }
       if (child->kind == "ArrayType") {
         inner = SqlTypeFromAst(*child);
         if (inner.starts_with("ARRAY<") && inner.back() == '>') {
@@ -986,9 +1386,13 @@ std::string InferArrayElementSqlType(const GoogleSqlAstNode& node) {  // NOLINT(
         break;
       }
       inner = InferArrayElementSqlType(*child);
-      if (!inner.empty()) { break; }
+      if (!inner.empty()) {
+        break;
+      }
     }
-    if (inner.empty()) { inner = "INT64"; }
+    if (inner.empty()) {
+      inner = "INT64";
+    }
     return "ARRAY<" + inner + ">";
   }
   return "INT64";
@@ -1025,8 +1429,93 @@ struct NamedWindowParts {
   bool has_frame{false};
 };
 
-thread_local std::unordered_map<std::string, NamedWindowParts>
-    t_named_windows;
+thread_local std::unordered_map<std::string, NamedWindowParts> t_named_windows;
+
+void CollectFromBoundNames(
+    const GoogleSqlAstNode& node,  // NOLINT(misc-no-recursion)
+    std::unordered_set<std::string>* names) {
+  if (node.kind == "TablePathExpression") {
+    std::string alias = Alias(node);
+    if (!alias.empty()) {
+      names->insert(Lower(alias));
+    }
+    if (const GoogleSqlAstNode* unnest = node.Child("UnnestExpression")) {
+      for (const auto& child : unnest->children) {
+        if (child->kind == "ExpressionWithOptAlias") {
+          std::string unnest_alias = Alias(*child);
+          if (!unnest_alias.empty()) {
+            names->insert(Lower(unnest_alias));
+          }
+          break;
+        }
+      }
+      for (const auto& child : unnest->children) {
+        if (child->kind.find("Offset") != std::string::npos) {
+          if (const GoogleSqlAstNode* alias = child->Child("Alias")) {
+            if (alias->Child("Identifier") != nullptr) {
+              names->insert(Lower(Identifier(*alias->Child("Identifier"))));
+            }
+          }
+        }
+      }
+      if (node.Child("WithOffset") != nullptr) {
+        if (const GoogleSqlAstNode* alias =
+                node.Child("WithOffset")->Child("Alias")) {
+          if (alias->Child("Identifier") != nullptr) {
+            names->insert(Lower(Identifier(*alias->Child("Identifier"))));
+          } else {
+            names->insert("offset");
+          }
+        }
+      }
+    }
+    return;
+  }
+  if (node.kind == "TableSubquery") {
+    if (const GoogleSqlAstNode* query = node.Child("Query")) {
+      const GoogleSqlAstNode* select =
+          (query->kind == "Select") ? query : query->Child("Select");
+      if (select != nullptr) {
+        if (const GoogleSqlAstNode* list = select->Child("SelectList")) {
+          for (const GoogleSqlAstNode* column :
+               list->Children("SelectColumn")) {
+            std::string name = Alias(*column);
+            if (!name.empty()) {
+              names->insert(Lower(name));
+              continue;
+            }
+            for (const auto& child : column->children) {
+              if (child->kind == "PathExpression" &&
+                  child->children.size() == 1) {
+                names->insert(Lower(Identifier(*child->children.back())));
+                break;
+              }
+              if (child->kind != "Location" && child->kind != "Alias") {
+                break;
+              }
+            }
+          }
+        }
+      }
+      for (const auto& child : query->children) {
+        CollectFromBoundNames(*child, names);
+      }
+      if (select != nullptr && select != query) {
+        for (const auto& child : select->children) {
+          if (child->kind == "FromClause") {
+            for (const auto& from_child : child->children) {
+              CollectFromBoundNames(*from_child, names);
+            }
+          }
+        }
+      }
+    }
+    return;
+  }
+  for (const auto& child : node.children) {
+    CollectFromBoundNames(*child, names);
+  }
+}
 
 // Parses one OrderingExpression: children[0] is the key expression and an
 // optional NullOrder child carries an explicit NULLS FIRST / NULLS LAST.
@@ -1098,8 +1587,7 @@ NamedWindowParts ParseWindowSpecification(const GoogleSqlAstNode& spec) {
 Expression VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
   const GoogleSqlAstNode* call = node.Child("FunctionCall");
   if (call == nullptr || call->children.empty()) {
-    throw std::runtime_error(
-        "GoogleSQL AST: malformed analytic function call");
+    throw std::runtime_error("GoogleSQL AST: malformed analytic function call");
   }
   auto window = std::make_shared<WindowFunctionCallExpression>();
 
@@ -1117,7 +1605,9 @@ Expression VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
   std::vector<WindowOrderTerm> inner_order_by;
   for (size_t i = arg_start; i < call->children.size(); ++i) {
     const GoogleSqlAstNode& child = *call->children[i];
-    if (child.kind == "Location") { continue; }
+    if (child.kind == "Location") {
+      continue;
+    }
     if (child.kind == "WhereClause") {
       // AGG(x WHERE cond) OVER (...): row-level pre-filter.
       if (!child.children.empty()) {
@@ -1134,7 +1624,8 @@ Expression VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
     if (child.kind == "LimitOffset") {
       if (const GoogleSqlAstNode* limit_node = child.Child("Limit")) {
         if (const GoogleSqlAstNode* value = limit_node->Child("IntLiteral")) {
-          window->inner_limit = static_cast<size_t>(ParseUnsignedLiteral(*value));
+          window->inner_limit =
+              static_cast<size_t>(ParseUnsignedLiteral(*value));
         }
       }
       continue;
@@ -1147,7 +1638,8 @@ Expression VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
   if (spec != nullptr) {
     if (spec->Child("Identifier") != nullptr &&
         spec->Child("PartitionBy") == nullptr &&
-        spec->Child("OrderBy") == nullptr && spec->Child("WindowFrame") == nullptr) {
+        spec->Child("OrderBy") == nullptr &&
+        spec->Child("WindowFrame") == nullptr) {
       // Bare reference to a WINDOW-clause definition.
       const std::string name = Identifier(*spec->Child("Identifier"));
       const auto found = t_named_windows.find(name);
@@ -1173,13 +1665,14 @@ Expression VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
   return window;
 }
 
-
 // Normalizes a TIMESTAMP string to UTC ("...+00"), interpreting an explicit
 // offset / UTC marker when present and the session default time zone
 // otherwise.  Shared by TIMESTAMP literals and typed array elements.
 std::string NormalizeTimestampText(const std::string& text) {
   std::string norm_ts = text;
-  if (text.size() < 10) { return norm_ts; }
+  if (text.size() < 10) {
+    return norm_ts;
+  }
   size_t tz_pos = std::string::npos;
   for (size_t i = 10; i < text.size(); ++i) {
     if (text[i] == '+' || text[i] == '-') {
@@ -1189,8 +1682,10 @@ std::string NormalizeTimestampText(const std::string& text) {
   }
   int total_offset_mins = 0;
   bool has_explicit_tz = false;
-  if (text.find("UTC") != std::string::npos || text.find("utc") != std::string::npos ||
-      text.find('Z') != std::string::npos || text.find('z') != std::string::npos) {
+  if (text.find("UTC") != std::string::npos ||
+      text.find("utc") != std::string::npos ||
+      text.find('Z') != std::string::npos ||
+      text.find('z') != std::string::npos) {
     total_offset_mins = 0;
     has_explicit_tz = true;
   }
@@ -1206,9 +1701,13 @@ std::string NormalizeTimestampText(const std::string& text) {
       try {
         tz_hours = std::stoi(tz_part.substr(0, colon));
         tz_mins = std::stoi(tz_part.substr(colon + 1));
-      } catch (...) {}
+      } catch (...) {
+      }
     } else {
-      try { tz_hours = std::stoi(tz_part); } catch (...) {}
+      try {
+        tz_hours = std::stoi(tz_part);
+      } catch (...) {
+      }
     }
     total_offset_mins = (tz_hours * 60 + tz_mins) * (sign == '-' ? -1 : 1);
   }
@@ -1220,16 +1719,23 @@ std::string NormalizeTimestampText(const std::string& text) {
   }
   int Y = 0, M = 0, D = 0, h = 0, m = 0;
   double s_val = 0;
-  int matched = sscanf(base_time.c_str(), "%d-%d-%d %d:%d:%lf", &Y, &M, &D, &h, &m, &s_val);
+  int matched = sscanf(base_time.c_str(), "%d-%d-%d %d:%d:%lf", &Y, &M, &D, &h,
+                       &m, &s_val);
   if (matched < 3) {
     matched = sscanf(base_time.c_str(), "%d-%d-%d", &Y, &M, &D);
   }
-  if (matched < 3) { return norm_ts; }
-  if (is_leap_sec) { m += 1; s_val = 0.0; }
+  if (matched < 3) {
+    return norm_ts;
+  }
+  if (is_leap_sec) {
+    m += 1;
+    s_val = 0.0;
+  }
   if (!has_explicit_tz) {
     total_offset_mins =
         ParseTimeZoneOffset(GetDefaultTimeZone(), Y, M, D, h, m,
-                            static_cast<int>(s_val), -8 * 3600) / 60;
+                            static_cast<int>(s_val), -8 * 3600) /
+        60;
   }
   struct tm t = {};
   t.tm_year = Y - 1900;
@@ -1252,27 +1758,43 @@ std::string NormalizeTimestampText(const std::string& text) {
     }
     std::string frac_str = text.substr(dot_pos, end_digit - dot_pos);
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d%s+00",
-             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-             utc.tm_hour, utc.tm_min, utc.tm_sec, frac_str.c_str());
+             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour,
+             utc.tm_min, utc.tm_sec, frac_str.c_str());
   } else {
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d+00",
-             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-             utc.tm_hour, utc.tm_min, utc.tm_sec);
+             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour,
+             utc.tm_min, utc.tm_sec);
   }
   return std::string(buf);
 }
 
-Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recursion) // Recursive AST descent by design; stack overflow guarded via ExpressionDepthGuard.
+Expression VisitExpression(
+    const GoogleSqlAstNode&
+        node) {  // NOLINT(misc-no-recursion) // Recursive AST descent by
+                 // design; stack overflow guarded via ExpressionDepthGuard.
   const ExpressionDepthGuard depth_guard;
   if (node.kind == "PathExpression") {
     std::string path_name = Path(node);
+    if (!t_udf_frames.empty()) {
+      if (Expression substituted = SubstituteUdfParameter(path_name)) {
+        return substituted;
+      }
+    }
+    if (path_name.find('.') == std::string::npos) {
+      const auto& constants = SessionConstantExpressions();
+      const auto found = constants.find(Lower(path_name));
+      if (found != constants.end()) {
+        return found->second;
+      }
+    }
     if (HasSessionConstant(path_name)) {
       return ConstantValueExp(Value(GetSessionConstant(path_name)));
     }
     return ColumnValueExp(path_name);
   }
-  if (node.kind == "Star") { return ColumnValueExp("*");
-}
+  if (node.kind == "Star") {
+    return ColumnValueExp("*");
+  }
   if (node.kind == "IntLiteral") {
     return ConstantValueExp(Value(ParseIntLiteral(node)));
   }
@@ -1300,16 +1822,19 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         int Y = 0, M = 0, D = 0, h = 0;
         if (sscanf(dt_str.c_str(), "%d-%d-%d %d", &Y, &M, &D, &h) >= 4) {
           h += 1;
-          std::chrono::year_month_day ymd{std::chrono::year{Y},
-                                          std::chrono::month{static_cast<unsigned>(M)},
-                                          std::chrono::day{static_cast<unsigned>(D)}};
-          int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count() + h / 24;
+          std::chrono::year_month_day ymd{
+              std::chrono::year{Y},
+              std::chrono::month{static_cast<unsigned>(M)},
+              std::chrono::day{static_cast<unsigned>(D)}};
+          int64_t days =
+              std::chrono::sys_days{ymd}.time_since_epoch().count() + h / 24;
           h %= 24;
           std::chrono::sys_days new_sd{std::chrono::days{days}};
           std::chrono::year_month_day new_ymd{new_sd};
           char buf[64];
           snprintf(buf, sizeof(buf), "%04d-%02u-%02u %02d:00:00",
-                   int(new_ymd.year()), unsigned(new_ymd.month()), unsigned(new_ymd.day()), h);
+                   int(new_ymd.year()), unsigned(new_ymd.month()),
+                   unsigned(new_ymd.day()), h);
           dt_str = buf;
         }
       }
@@ -1322,13 +1847,14 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     return ConstantValueExp(Value(NormalizeTimestampText(text)));
   }
 
-
-  if (node.kind == "NullLiteral") { return ConstantValueExp(Value());
-}
+  if (node.kind == "NullLiteral") {
+    return ConstantValueExp(Value());
+  }
   // INSERT ... VALUES (30, DEFAULT): tables built by this engine carry no
   // column defaults, so DEFAULT resolves to NULL.
-  if (node.kind == "DefaultLiteral") { return ConstantValueExp(Value());
-}
+  if (node.kind == "DefaultLiteral") {
+    return ConstantValueExp(Value());
+  }
   if (node.kind == "BooleanLiteral") {
     const std::string upper_literal = UpperCopy(node.detail);
     return ConstantValueExp(Value(upper_literal == "TRUE"));
@@ -1337,7 +1863,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     std::string element_type;
     std::vector<Expression> elements;
     for (const auto& child : node.children) {
-      if (IsAstTrivia(child->kind)) { continue; }
+      if (IsAstTrivia(child->kind)) {
+        continue;
+      }
       if (IsArrayTypeNode(child->kind)) {
         for (const auto& nested : child->children) {
           const std::string parsed = SqlTypeFromAst(*nested);
@@ -1364,10 +1892,14 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
           continue;
         }
         element_type = InferArrayElementSqlType(*child);
-        if (!element_type.empty()) { break; }
+        if (!element_type.empty()) {
+          break;
+        }
       }
     }
-    if (element_type.empty()) { element_type = "INT64"; }
+    if (element_type.empty()) {
+      element_type = "INT64";
+    }
     // ARRAY(SELECT ...) projects the whole subquery result as one array
     // value; a plain QueryExpression would only expose its first row.
     if (elements.size() == 1 && elements[0]->Type() == TypeTag::kQueryExp) {
@@ -1438,8 +1970,12 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
                                std::move(right));
   }
 
-  if (node.kind == "AndExpr") { return FoldBoolean(node, BinaryOperation::kAnd); }
-  if (node.kind == "OrExpr") { return FoldBoolean(node, BinaryOperation::kOr); }
+  if (node.kind == "AndExpr") {
+    return FoldBoolean(node, BinaryOperation::kAnd);
+  }
+  if (node.kind == "OrExpr") {
+    return FoldBoolean(node, BinaryOperation::kOr);
+  }
   if (node.kind == "UnaryExpression") {
     if (node.children.size() != 1) {
       throw std::runtime_error("GoogleSQL AST: unary expression arity");
@@ -1475,7 +2011,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     std::vector<Expression> args;
     args.reserve(node.children.size());
     for (const auto& child : node.children) {
-      if (child->kind == "Location") { continue; }
+      if (child->kind == "Location") {
+        continue;
+      }
       Expression arg = VisitExpression(*child);
       arg = WrapIfBoolean(std::move(arg), *child);
       args.push_back(std::move(arg));
@@ -1483,7 +2021,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     return FunctionCallExp("concat", std::move(args));
   }
 
-  if (node.kind == "FunctionCall") { return VisitFunction(node); }
+  if (node.kind == "FunctionCall") {
+    return VisitFunction(node);
+  }
 
   if (node.kind == "AnalyticFunctionCall") {
     return VisitAnalyticFunctionCall(node);
@@ -1517,7 +2057,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
       return {};
     };
     for (const auto& child : node.children) {
-      if (child->kind == "Location") { continue; }
+      if (child->kind == "Location") {
+        continue;
+      }
       if (child->kind == "FunctionCall") {
         const std::string name = accessor_name(*child);
         if (!name.empty()) {
@@ -1531,7 +2073,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
           continue;
         }
       }
-      if (!base && child->kind != "Location") { base = VisitExpression(*child); }
+      if (!base && child->kind != "Location") {
+        base = VisitExpression(*child);
+      }
     }
     if (!base || index_node == nullptr) {
       throw std::runtime_error("GoogleSQL AST: malformed array element");
@@ -1539,6 +2083,10 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     std::string fn = "array_element_offset";
     if (accessor.find("ORDINAL") != std::string::npos) {
       fn = "array_element_ordinal";
+    }
+    if (accessor.find("SAFE_") == 0 ||
+        accessor.find("_SAFE") != std::string::npos) {
+      fn += "_safe";
     }
     return FunctionCallExp(fn, {std::move(base), VisitExpression(*index_node)});
   }
@@ -1567,8 +2115,10 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     }
     for (size_t i = 1; i < pair_end; i += 2) {
       Expression when_val = VisitExpression(*node.children[i]);
-      Expression cond = BinaryExpressionExp(value_expr, BinaryOperation::kEquals, std::move(when_val));
-      clauses.emplace_back(std::move(cond), VisitExpression(*node.children[i + 1]));
+      Expression cond = BinaryExpressionExp(
+          value_expr, BinaryOperation::kEquals, std::move(when_val));
+      clauses.emplace_back(std::move(cond),
+                           VisitExpression(*node.children[i + 1]));
     }
     return CaseExpressionExp(std::move(clauses), std::move(otherwise));
   }
@@ -1592,8 +2142,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
   if (node.kind == "BetweenExpression") {
     std::vector<const GoogleSqlAstNode*> operands;
     for (const auto& child : node.children) {
-      if (child->kind != "Location") { operands.push_back(child.get());
-}
+      if (child->kind != "Location") {
+        operands.push_back(child.get());
+      }
     }
     if (operands.size() != 3) {
       throw std::runtime_error("GoogleSQL AST: BETWEEN arity");
@@ -1634,8 +2185,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
                                 negated);
     }
     for (const auto& child : node.children) {
-      if (child->kind != "UnnestExpression") { continue;
-}
+      if (child->kind != "UnnestExpression") {
+        continue;
+      }
       // `x [NOT] IN UNNEST(arr)`: three-valued membership over a runtime
       // array, reusing the quantified-comparison runtime helper.
       const GoogleSqlAstNode* inner = child->Child("ExpressionWithOptAlias");
@@ -1650,11 +2202,10 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
           break;
         }
       }
-      Expression result =
-          FunctionCallExp("__quantified__",
-                          {std::move(test), std::move(array),
-                           ConstantValueExp(Value(std::string("="))),
-                           ConstantValueExp(Value(std::string("ANY")))});
+      Expression result = FunctionCallExp(
+          "__quantified__", {std::move(test), std::move(array),
+                             ConstantValueExp(Value(std::string("="))),
+                             ConstantValueExp(Value(std::string("ANY")))});
       return negated
                  ? UnaryExpressionExp(std::move(result), UnaryOperation::kNot)
                  : result;
@@ -1716,8 +2267,12 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
       if (value_node->kind == "StringLiteral") {
         std::string str_val = DecodeString(*value_node);
         int64_t amount = 0;
-        try { amount = std::stoll(str_val); } catch (...) {}
-        return IntervalExpressionExp(amount, std::move(unit), std::move(str_val));
+        try {
+          amount = std::stoll(str_val);
+        } catch (...) {
+        }
+        return IntervalExpressionExp(amount, std::move(unit),
+                                     std::move(str_val));
       }
       Expression expr = VisitExpression(*value_node);
       if (expr->Type() == TypeTag::kConstantValue) {
@@ -1728,8 +2283,12 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         if (v.type == ValueType::kVarChar) {
           std::string str_val = std::string(v.value.varchar_value);
           int64_t amount = 0;
-          try { amount = std::stoll(str_val); } catch (...) {}
-          return IntervalExpressionExp(amount, std::move(unit), std::move(str_val));
+          try {
+            amount = std::stoll(str_val);
+          } catch (...) {
+          }
+          return IntervalExpressionExp(amount, std::move(unit),
+                                       std::move(str_val));
         }
       }
       if (expr->Type() == TypeTag::kColumnValue) {
@@ -1738,7 +2297,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
           std::string str_val = GetSessionConstant(col_name);
           return IntervalExpressionExp(0, std::move(unit), std::move(str_val));
         }
-        return FunctionCallExp("make_interval", {expr, ConstantValueExp(Value(std::string(unit)))});
+        return FunctionCallExp(
+            "make_interval",
+            {expr, ConstantValueExp(Value(std::string(unit)))});
       }
       Row dummy_row;
       Schema dummy_schema;
@@ -1750,11 +2311,17 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         if (v.type == ValueType::kVarChar) {
           std::string str_val = std::string(v.value.varchar_value);
           int64_t amount = 0;
-          try { amount = std::stoll(str_val); } catch (...) {}
-          return IntervalExpressionExp(amount, std::move(unit), std::move(str_val));
+          try {
+            amount = std::stoll(str_val);
+          } catch (...) {
+          }
+          return IntervalExpressionExp(amount, std::move(unit),
+                                       std::move(str_val));
         }
-      } catch (...) {}
-      return FunctionCallExp("make_interval", {expr, ConstantValueExp(Value(std::string(unit)))});
+      } catch (...) {
+      }
+      return FunctionCallExp(
+          "make_interval", {expr, ConstantValueExp(Value(std::string(unit)))});
     }
     if (!node.children.empty() && node.children[0]->kind == "StringLiteral") {
       std::string res = DecodeString(*node.children[0]);
@@ -1785,7 +2352,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
       return ConstantValueExp(Value(Identifier(*id)));
     }
     std::string unit = node.detail;
-    if (unit.starts_with("unit=")) { unit = unit.substr(5); }
+    if (unit.starts_with("unit=")) {
+      unit = unit.substr(5);
+    }
     return ConstantValueExp(Value(std::move(unit)));
   }
   if (node.kind == "CastExpression") {
@@ -1800,11 +2369,15 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
       } else if (node.children[1]->kind == "SimpleType") {
         for (const auto& c : node.children[1]->children) {
           type_name = SqlTypeFromAst(*c);
-          if (!type_name.empty()) { break; }
+          if (!type_name.empty()) {
+            break;
+          }
         }
       }
     }
-    if (type_name.empty()) { type_name = "STRING"; }
+    if (type_name.empty()) {
+      type_name = "STRING";
+    }
     const std::string upper_type = UpperCopy(type_name);
     if (upper_type.ends_with("TESTENUM") || upper_type.ends_with("ENUM")) {
       if (child->Type() == TypeTag::kConstantValue) {
@@ -1831,7 +2404,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         if (val_expr->Type() == TypeTag::kConstantValue) {
           val_str = val_expr->AsConstantValue().GetValue().AsString();
         }
-        if (!text_format.empty()) { text_format += " "; }
+        if (!text_format.empty()) {
+          text_format += " ";
+        }
         text_format += field_name + ": " + val_str;
       }
     }
@@ -1856,6 +2431,7 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
       std::string name;
       std::string text;
       bool is_string{false};
+      Expression deferred;  // set when eager evaluation failed
     };
     std::vector<StructFieldJson> fields;
     bool any_ci = false;
@@ -1865,7 +2441,8 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         continue;
       }
       const GoogleSqlAstNode* arg_node = child.get();
-      std::string fname = arg_idx < field_names.size() ? field_names[arg_idx] : "";
+      std::string fname =
+          arg_idx < field_names.size() ? field_names[arg_idx] : "";
       if (child->kind == "StructConstructorArg") {
         if (fname.empty()) {
           // Field alias: STRUCT(1 AS emp_id) nests the Identifier under an
@@ -1876,11 +2453,13 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
               id = alias->Child("Identifier");
             }
           }
-          if (id != nullptr) { fname = Identifier(*id); }
+          if (id != nullptr) {
+            fname = Identifier(*id);
+          }
         }
         for (const auto& arg_child : child->children) {
-          if (arg_child->kind != "Location" && arg_child->kind != "Identifier" &&
-              arg_child->kind != "Alias") {
+          if (arg_child->kind != "Location" &&
+              arg_child->kind != "Identifier" && arg_child->kind != "Alias") {
             arg_node = arg_child.get();
             break;
           }
@@ -1920,11 +2499,35 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
                 field.text = v.AsString();
               }
             }
-          } catch (...) {}
+          } catch (...) {
+            // Aggregates and subqueries cannot be evaluated at visit time;
+            // defer the field to runtime via the __struct_json__ path.
+            field.deferred = val_expr;
+          }
         }
       }
       fields.push_back(std::move(field));
       ++arg_idx;
+    }
+    const bool any_deferred = std::any_of(
+        fields.begin(), fields.end(),
+        [](const StructFieldJson& f) { return static_cast<bool>(f.deferred); });
+    if (any_deferred) {
+      // Runtime struct construction: alternating name / value / is-string
+      // flag arguments, resolved by EvaluateFunction per row or per group.
+      std::vector<Expression> args;
+      args.reserve(fields.size() * 3);
+      for (auto& f : fields) {
+        args.push_back(ConstantValueExp(Value(std::move(f.name))));
+        if (f.deferred) {
+          args.push_back(std::move(f.deferred));
+        } else {
+          args.push_back(ConstantValueExp(Value(std::move(f.text))));
+        }
+        args.push_back(ConstantValueExp(
+            Value(f.is_string && !f.deferred ? int64_t{1} : int64_t{0})));
+      }
+      return FunctionCallExp("__struct_json__", std::move(args));
     }
     // Collation propagation: when any field value carries a case-insensitive
     // collator, the whole struct comparison folds (GoogleSQL resolves one
@@ -1944,13 +2547,17 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     std::string json_out = "{";
     bool first = true;
     for (auto& field : fields) {
-      if (!first) { json_out += ","; }
+      if (!first) {
+        json_out += ",";
+      }
       first = false;
       std::string escaped_fname;
       for (char c : field.name) {
-        if (c == '"') { escaped_fname += "\\\""; }
-        else if (c == '\\') { escaped_fname += "\\\\"; }
-        else if (static_cast<unsigned char>(c) < 0x20) {
+        if (c == '"') {
+          escaped_fname += "\\\"";
+        } else if (c == '\\') {
+          escaped_fname += "\\\\";
+        } else if (static_cast<unsigned char>(c) < 0x20) {
           char buf[8];
           snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
           escaped_fname += buf;
@@ -1969,7 +2576,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     if (node.children.size() >= 2 && node.children[1]->kind == "Identifier") {
       Expression base_expr = VisitExpression(*node.children[0]);
       std::string field_name = Identifier(*node.children[1]);
-      return FunctionCallExp("get_field", {std::move(base_expr), ConstantValueExp(Value(std::move(field_name)))});
+      return FunctionCallExp("get_field",
+                             {std::move(base_expr),
+                              ConstantValueExp(Value(std::move(field_name)))});
     }
     throw std::runtime_error("GoogleSQL AST: invalid DotIdentifier");
   }
@@ -2000,7 +2609,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     const GoogleSqlAstNode* collection = nullptr;
     const GoogleSqlAstNode* query_node = nullptr;
     for (const auto& child : node.children) {
-      if (child->kind == "Location") { continue; }
+      if (child->kind == "Location") {
+        continue;
+      }
       if (child->kind == "AnySomeAllOp") {
         quantifier = UpperCopy(child->detail);
         continue;
@@ -2037,13 +2648,14 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         Expression arr = VisitExpression(*array_expr);
         std::string op_text(node.detail);
         std::string quantifier_text = quantifier;
-        return FunctionCallExp("__quantified__",
-                               {std::move(lhs), std::move(arr),
-                                ConstantValueExp(Value(std::move(op_text))),
-                                ConstantValueExp(Value(std::move(quantifier_text)))});
+        return FunctionCallExp(
+            "__quantified__",
+            {std::move(lhs), std::move(arr),
+             ConstantValueExp(Value(std::move(op_text))),
+             ConstantValueExp(Value(std::move(quantifier_text)))});
       }
-      return QueryExpressionExp(VisitQuery(*query_node), lhs, false, false,
-                                op, mode);
+      return QueryExpressionExp(VisitQuery(*query_node), lhs, false, false, op,
+                                mode);
     }
     const GoogleSqlAstNode* query =
         list_node != nullptr ? list_node->Child("Query") : nullptr;
@@ -2057,10 +2669,11 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
       Expression arr = VisitExpression(*collection);
       std::string node_detail = node.detail;
       std::string quantifier_copy = quantifier;
-      return FunctionCallExp("__quantified__",
-                             {std::move(lhs), std::move(arr),
-                              ConstantValueExp(Value(std::move(node_detail))),
-                              ConstantValueExp(Value(std::move(quantifier_copy)))});
+      return FunctionCallExp(
+          "__quantified__",
+          {std::move(lhs), std::move(arr),
+           ConstantValueExp(Value(std::move(node_detail))),
+           ConstantValueExp(Value(std::move(quantifier_copy)))});
     }
     std::vector<Expression> items;
     for (const auto& child : list_node->children) {
@@ -2089,7 +2702,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     const GoogleSqlAstNode* query_node = nullptr;
     std::vector<Expression> operands;
     for (const auto& child : node.children) {
-      if (child->kind == "Location") { continue; }
+      if (child->kind == "Location") {
+        continue;
+      }
       if (child->kind == "AnySomeAllOp") {
         any_op = child.get();
         continue;
@@ -2108,13 +2723,13 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         operands.push_back(VisitExpression(*child));
       }
     }
-    const bool negated = UpperCopy(node.detail).find("NOT") != std::string::npos;
+    const bool negated =
+        UpperCopy(node.detail).find("NOT") != std::string::npos;
     if (any_op != nullptr && query_node != nullptr) {
       // `lhs [NOT] LIKE ANY/ALL (subquery)`: per-row LIKE / NOT LIKE under
       // three-valued ANY/ALL combination.
-      const bool is_any =
-          UpperCopy(any_op->detail) == "ANY" ||
-          UpperCopy(any_op->detail) == "SOME";
+      const bool is_any = UpperCopy(any_op->detail) == "ANY" ||
+                          UpperCopy(any_op->detail) == "SOME";
       return QueryExpressionExp(
           VisitQuery(*query_node), lhs, false, false,
           negated ? BinaryOperation::kNotLike : BinaryOperation::kLike,
@@ -2124,15 +2739,14 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
       if (operands.empty()) {
         throw std::runtime_error("GoogleSQL AST: malformed LIKE");
       }
-      Expression call = BinaryExpressionExp(lhs, BinaryOperation::kLike,
-                                            operands[0]);
+      Expression call =
+          BinaryExpressionExp(lhs, BinaryOperation::kLike, operands[0]);
       return negated ? UnaryExpressionExp(std::move(call), UnaryOperation::kNot)
                      : Expression(call);
     }
     // LIKE ANY/ALL over a pattern list.
-    const bool is_any =
-        UpperCopy(any_op->detail) == "ANY" ||
-        UpperCopy(any_op->detail) == "SOME";
+    const bool is_any = UpperCopy(any_op->detail) == "ANY" ||
+                        UpperCopy(any_op->detail) == "SOME";
     std::vector<Expression> patterns;
     for (const auto& child : list_node->children) {
       if (child->kind != "Location") {
@@ -2161,12 +2775,33 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
 
   throw std::runtime_error("GoogleSQL AST: unsupported expression " +
                            node.kind);
-
 }
 
-
-SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type,  // NOLINT(misc-no-recursion) // Recursive AST descent for nested joins/subqueries by design (see VisitQuery depth note).
-                              Expression join_condition) {
+SelectSource VisitTableSource(
+    const GoogleSqlAstNode& node,
+    JoinType join_type,  // NOLINT(misc-no-recursion) // Recursive AST descent
+                         // for nested joins/subqueries by design (see
+                         // VisitQuery depth note).
+    Expression join_condition) {
+  // FROM sources are resolved outside the alias scope of their own query
+  // block, so the innermost bound-name mask is suspended while descending
+  // into them.
+  struct SuspendInnermostMask {
+    bool active = false;
+    std::unordered_set<std::string> restored;
+    SuspendInnermostMask() {
+      active = !t_udf_frames.empty() && !t_udf_bound_masks.empty();
+      if (active) {
+        restored = std::move(t_udf_bound_masks.back());
+        t_udf_bound_masks.pop_back();
+      }
+    }
+    ~SuspendInnermostMask() {
+      if (active) {
+        t_udf_bound_masks.push_back(std::move(restored));
+      }
+    }
+  } suspend_mask;
   SelectSource source;
   source.join_type = join_type;
   source.join_condition = std::move(join_condition);
@@ -2181,7 +2816,9 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
               break;
             }
           }
-          if (source.alias.empty()) { source.alias = Alias(*child); }
+          if (source.alias.empty()) {
+            source.alias = Alias(*child);
+          }
           break;
         }
       }
@@ -2195,7 +2832,8 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
         } else {
           source.offset_alias = "offset";
         }
-      } else if (const GoogleSqlAstNode* with_offset2 = node.Child("WithOffsetClause")) {
+      } else if (const GoogleSqlAstNode* with_offset2 =
+                     node.Child("WithOffsetClause")) {
         if (const GoogleSqlAstNode* alias = with_offset2->Child("Alias")) {
           if (alias->Child("Identifier") != nullptr) {
             source.offset_alias = Identifier(*alias->Child("Identifier"));
@@ -2221,7 +2859,9 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
           }
         }
       }
-      if (source.alias.empty()) { source.alias = "unnest"; }
+      if (source.alias.empty()) {
+        source.alias = "unnest";
+      }
       return source;
     }
     const GoogleSqlAstNode* path = node.Child("PathExpression");
@@ -2234,8 +2874,7 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
     // base relation, so map them to an unnest source whose expression is
     // resolved against the enclosing scope chain at execution time.
     const std::string dotted = Path(*path);
-    if (dotted.find('.') != std::string::npos &&
-        dotted.back() != '.') {
+    if (dotted.find('.') != std::string::npos && dotted.back() != '.') {
       source.unnest = VisitExpression(*path);
       if (source.alias.empty()) {
         source.alias = dotted.substr(dotted.rfind('.') + 1);
@@ -2243,7 +2882,9 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
       return source;
     }
     source.table = dotted;
-    if (source.alias.empty()) { source.alias = source.table; }
+    if (source.alias.empty()) {
+      source.alias = source.table;
+    }
   } else if (node.kind == "TableSubquery") {
     const GoogleSqlAstNode* query = node.Child("Query");
     if (query == nullptr) {
@@ -2257,8 +2898,10 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
   return source;
 }
 
-
-void AppendSources(const GoogleSqlAstNode& node, JoinType incoming,  // NOLINT(misc-no-recursion) // Recursive AST descent for nested joins by design (see VisitQuery depth note).
+void AppendSources(const GoogleSqlAstNode& node,
+                   JoinType incoming,  // NOLINT(misc-no-recursion) // Recursive
+                                       // AST descent for nested joins by design
+                                       // (see VisitQuery depth note).
                    Expression condition, std::vector<SelectSource>* sources) {
   if (node.kind != "Join") {
     sources->push_back(VisitTableSource(node, incoming, std::move(condition)));
@@ -2273,8 +2916,7 @@ void AppendSources(const GoogleSqlAstNode& node, JoinType incoming,  // NOLINT(m
       operands.push_back(child.get());
     } else if (child->kind == "OnClause") {
       on = child.get();
-    } else if (using_clause == nullptr &&
-                child->kind.starts_with("Using")) {
+    } else if (using_clause == nullptr && child->kind.starts_with("Using")) {
       using_clause = child.get();
     }
   }
@@ -2283,10 +2925,12 @@ void AppendSources(const GoogleSqlAstNode& node, JoinType incoming,  // NOLINT(m
   }
   AppendSources(*operands[0], incoming, std::move(condition), sources);
   JoinType type = JoinType::kInner;
-  if (node.detail == "COMMA") { type = JoinType::kCross;
-}
-  if (node.detail == "LEFT") { type = JoinType::kLeft;
-}
+  if (node.detail == "COMMA") {
+    type = JoinType::kCross;
+  }
+  if (node.detail == "LEFT") {
+    type = JoinType::kLeft;
+  }
   Expression join_expression;
   if (on != nullptr && !on->children.empty()) {
     join_expression = VisitExpression(*on->children[0]);
@@ -2296,15 +2940,13 @@ void AppendSources(const GoogleSqlAstNode& node, JoinType incoming,  // NOLINT(m
     // a condition-less join.
     for (const GoogleSqlAstNode* column :
          using_clause->Children("Identifier")) {
-      Expression equality =
-          BinaryExpressionExp(ColumnValueExp(Identifier(*column)),
-                              BinaryOperation::kEquals,
-                              ColumnValueExp(Identifier(*column)));
+      Expression equality = BinaryExpressionExp(
+          ColumnValueExp(Identifier(*column)), BinaryOperation::kEquals,
+          ColumnValueExp(Identifier(*column)));
       join_expression =
           join_expression
               ? BinaryExpressionExp(std::move(join_expression),
-                                    BinaryOperation::kAnd,
-                                    std::move(equality))
+                                    BinaryOperation::kAnd, std::move(equality))
               : std::move(equality);
     }
     if (!join_expression) {
@@ -2314,10 +2956,15 @@ void AppendSources(const GoogleSqlAstNode& node, JoinType incoming,  // NOLINT(m
   AppendSources(*operands[1], type, std::move(join_expression), sources);
 }
 
-std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  // NOLINT(misc-no-recursion) // Recursive subquery/CTE traversal by design; SQL nesting is finite and parser-bounded.
-  const GoogleSqlAstNode* select = (query.kind == "Select") ? &query : query.Child("Select");
+std::shared_ptr<SelectStatement> VisitQuery(
+    const GoogleSqlAstNode& query) {  // NOLINT(misc-no-recursion) // Recursive
+                                      // subquery/CTE traversal by design; SQL
+                                      // nesting is finite and parser-bounded.
+  const GoogleSqlAstNode* select =
+      (query.kind == "Select") ? &query : query.Child("Select");
   if (select == nullptr) {
-    const GoogleSqlAstNode* set_op = (query.kind == "SetOperation") ? &query : query.Child("SetOperation");
+    const GoogleSqlAstNode* set_op =
+        (query.kind == "SetOperation") ? &query : query.Child("SetOperation");
     if (set_op == nullptr) {
       for (const auto& child : query.children) {
         if (child->kind == "SetOperation") {
@@ -2329,7 +2976,8 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
     if (set_op != nullptr) {
       std::vector<const GoogleSqlAstNode*> operands;
       for (const auto& child : set_op->children) {
-        if (child->kind == "Query" || child->kind == "Select" || child->kind == "SetOperation") {
+        if (child->kind == "Query" || child->kind == "Select" ||
+            child->kind == "SetOperation") {
           operands.push_back(child.get());
         }
       }
@@ -2355,21 +3003,24 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
     ~NamedWindowsScope() { t_named_windows.swap(previous); }
   } named_windows_scope;
   const GoogleSqlAstNode* window_clause =
-      select->Child("WindowClause") != nullptr
-          ? select->Child("WindowClause")
-          : query.Child("WindowClause");
+      select->Child("WindowClause") != nullptr ? select->Child("WindowClause")
+                                               : query.Child("WindowClause");
   if (window_clause != nullptr) {
     for (const GoogleSqlAstNode* definition :
          window_clause->Children("WindowDefinition")) {
       const GoogleSqlAstNode* name_node = definition->Child("Identifier");
       const GoogleSqlAstNode* spec = definition->Child("WindowSpecification");
-      if (name_node == nullptr || spec == nullptr) { continue; }
+      if (name_node == nullptr || spec == nullptr) {
+        continue;
+      }
       NamedWindowParts parts;
       // `v AS (w ORDER BY z)`: inherit from the referenced definition first,
       // then overlay whatever this specification declares itself.
       if (const GoogleSqlAstNode* base = spec->Child("Identifier")) {
         const auto found = t_named_windows.find(Identifier(*base));
-        if (found != t_named_windows.end()) { parts = found->second; }
+        if (found != t_named_windows.end()) {
+          parts = found->second;
+        }
       }
       NamedWindowParts own = ParseWindowSpecification(*spec);
       if (!own.partition_by.empty()) {
@@ -2388,6 +3039,25 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
     }
   }
 
+  // UDF parameter substitution scoping: names explicitly bound by this
+  // query block's FROM clause shadow parameters of enclosing expansions.
+  std::unordered_set<std::string> bound_names;
+  if (!t_udf_frames.empty()) {
+    if (const GoogleSqlAstNode* from_clause = select->Child("FromClause")) {
+      for (const auto& child : from_clause->children) {
+        CollectFromBoundNames(*child, &bound_names);
+      }
+    }
+  }
+  t_udf_bound_masks.push_back(std::move(bound_names));
+  struct BoundMaskScope {
+    ~BoundMaskScope() {
+      if (!t_udf_bound_masks.empty()) {
+        t_udf_bound_masks.pop_back();
+      }
+    }
+  } bound_mask_scope;
+
   std::vector<NamedExpression> projections;
   for (const GoogleSqlAstNode* column : select_list->Children("SelectColumn")) {
     const GoogleSqlAstNode* expression_node = nullptr;
@@ -2399,7 +3069,7 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
     }
     if (expression_node == nullptr) {
       throw std::runtime_error("GoogleSQL AST: empty column");
-}
+    }
     Expression expression = VisitExpression(*expression_node);
     std::string name = Alias(*column);
     if (name.empty() && expression->Type() == TypeTag::kColumnValue) {
@@ -2411,30 +3081,43 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
   const std::string upper_select_detail = UpperCopy(select->detail);
   const GoogleSqlAstNode* select_as = select->Child("SelectAs");
   const GoogleSqlAstNode* as_struct = select->Child("AsStruct");
-  const bool is_as_struct = upper_select_detail.find("STRUCT") != std::string::npos ||
-                            (select_as != nullptr && UpperCopy(select_as->detail).find("STRUCT") != std::string::npos) ||
-                            as_struct != nullptr;
+  const bool is_as_struct =
+      upper_select_detail.find("STRUCT") != std::string::npos ||
+      (select_as != nullptr &&
+       UpperCopy(select_as->detail).find("STRUCT") != std::string::npos) ||
+      as_struct != nullptr;
   // SELECT AS VALUE yields the bare value as the sole column; only named
   // proto/struct targets are folded into a field-list literal.
-  const bool as_value = select_as != nullptr &&
-                        UpperCopy(select_as->detail).find("VALUE") !=
-                            std::string::npos;
-  if (!is_as_struct && !as_value && (select_as != nullptr || (upper_select_detail.find("AS_MODE=") != std::string::npos && upper_select_detail.find("AS_MODE=VALUE") == std::string::npos))) {
+  const bool as_value =
+      select_as != nullptr &&
+      UpperCopy(select_as->detail).find("VALUE") != std::string::npos;
+  if (!is_as_struct && !as_value &&
+      (select_as != nullptr ||
+       (upper_select_detail.find("AS_MODE=") != std::string::npos &&
+        upper_select_detail.find("AS_MODE=VALUE") == std::string::npos))) {
     std::string proto_str;
     bool all_const = true;
     for (size_t i = 0; i < projections.size(); ++i) {
-      std::string fname = projections[i].name.empty() ? ("f" + std::to_string(i + 1)) : projections[i].name;
+      std::string fname = projections[i].name.empty()
+                              ? ("f" + std::to_string(i + 1))
+                              : projections[i].name;
       if (projections[i].expression->Type() == TypeTag::kConstantValue) {
-        if (!proto_str.empty()) { proto_str += " "; }
+        if (!proto_str.empty()) {
+          proto_str += " ";
+        }
         proto_str += fname + ": ";
-        const Value& v = projections[i].expression->AsConstantValue().GetValue();
+        const Value& v =
+            projections[i].expression->AsConstantValue().GetValue();
         proto_str += v.AsString();
       } else if (projections[i].expression->Type() == TypeTag::kArrayExp) {
         const auto& arr = projections[i].expression->AsArrayExpression();
         for (const auto& elem : arr.Elements()) {
           if (elem->Type() == TypeTag::kConstantValue) {
-            if (!proto_str.empty()) { proto_str += " "; }
-            proto_str += fname + ": " + elem->AsConstantValue().GetValue().AsString();
+            if (!proto_str.empty()) {
+              proto_str += " ";
+            }
+            proto_str +=
+                fname + ": " + elem->AsConstantValue().GetValue().AsString();
           } else {
             all_const = false;
           }
@@ -2444,7 +3127,8 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
       }
     }
     if (all_const) {
-      projections = {NamedExpression("", ConstantValueExp(Value(std::move(proto_str))))};
+      projections = {
+          NamedExpression("", ConstantValueExp(Value(std::move(proto_str))))};
     }
   }
 
@@ -2456,8 +3140,9 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
       AppendSources(*child, JoinType::kCross, nullptr, &sources);
     }
     for (const SelectSource& source : sources) {
-      if (!source.table.empty()) { tables.push_back(source.table);
-}
+      if (!source.table.empty()) {
+        tables.push_back(source.table);
+      }
     }
   }
 
@@ -2465,16 +3150,18 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
   if (const GoogleSqlAstNode* clause = select->Child("WhereClause")) {
     if (!clause->children.empty()) {
       where = VisitExpression(*clause->children[0]);
-}
+    }
   }
 
   std::vector<SelectStatement::OrderByTerm> order_by;
   if (const GoogleSqlAstNode* order = query.Child("OrderBy")) {
     for (const GoogleSqlAstNode* term : order->Children("OrderingExpression")) {
       WindowOrderTerm parsed = ParseOrderingTerm(term);
-      if (!parsed.expression) { continue; }
-      order_by.push_back({std::move(parsed.expression), parsed.ascending,
-                          parsed.nulls_first});
+      if (!parsed.expression) {
+        continue;
+      }
+      order_by.push_back(
+          {std::move(parsed.expression), parsed.ascending, parsed.nulls_first});
     }
   }
 
@@ -2487,8 +3174,9 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
       }
     }
     for (const auto& child : limit_offset->children) {
-      if (child->kind == "IntLiteral") { offset = ParseUnsignedLiteral(*child);
-}
+      if (child->kind == "IntLiteral") {
+        offset = ParseUnsignedLiteral(*child);
+      }
     }
   }
 
@@ -2502,9 +3190,23 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
   if (const GoogleSqlAstNode* group = select->Child("GroupBy")) {
     std::vector<Expression> expressions;
     for (const GoogleSqlAstNode* item : group->Children("GroupingItem")) {
-      if (!item->children.empty()) {
-        expressions.push_back(VisitExpression(*item->children[0]));
+      if (item->children.empty()) {
+        continue;
       }
+      const GoogleSqlAstNode& term = *item->children[0];
+      if (term.kind == "IntLiteral") {
+        // GoogleSQL: integer GROUP BY items are SELECT-list ordinals.
+        const size_t ordinal = static_cast<size_t>(ParseUnsignedLiteral(term));
+        if (ordinal >= 1 && ordinal <= statement->SelectList().size() &&
+            statement->SelectList()[ordinal - 1].expression) {
+          expressions.push_back(
+              statement->SelectList()[ordinal - 1].expression);
+          continue;
+        }
+        throw std::runtime_error(
+            "GoogleSQL AST: GROUP BY ordinal out of range");
+      }
+      expressions.push_back(VisitExpression(term));
     }
     statement->SetGroupBy(std::move(expressions));
   }
@@ -2513,9 +3215,9 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
       statement->SetHaving(VisitExpression(*having->children[0]));
     }
   }
-  const GoogleSqlAstNode* qualify =
-      select->Child("Qualify") != nullptr ? select->Child("Qualify")
-                                          : query.Child("Qualify");
+  const GoogleSqlAstNode* qualify = select->Child("Qualify") != nullptr
+                                        ? select->Child("Qualify")
+                                        : query.Child("Qualify");
   if (qualify != nullptr) {
     if (!qualify->children.empty()) {
       statement->SetQualify(VisitExpression(*qualify->children[0]));
@@ -2524,8 +3226,9 @@ std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query) {  //
   if (const GoogleSqlAstNode* with = query.Child("WithClause")) {
     for (const GoogleSqlAstNode* entry : with->Children("WithClauseEntry")) {
       const GoogleSqlAstNode* aliased = entry->Child("AliasedQuery");
-      if (aliased == nullptr) { continue;
-}
+      if (aliased == nullptr) {
+        continue;
+      }
       const GoogleSqlAstNode* name = aliased->Child("Identifier");
       const GoogleSqlAstNode* nested = aliased->Child("Query");
       if (name != nullptr && nested != nullptr) {
@@ -2586,13 +3289,14 @@ ValueType ColumnType(const GoogleSqlAstNode& definition) {
       type == "float" || type == "float64") {
     return ValueType::kDouble;
   }
-  if (type == "date") { return ValueType::kDate;
-}
+  if (type == "date") {
+    return ValueType::kDate;
+  }
   if (type == "string" || type == "varchar" || type == "char" ||
       type == "timestamp" || type == "datetime") {
     return ValueType::kVarChar;
   }
-    throw std::runtime_error("GoogleSQL AST: unsupported column type " + type);
+  throw std::runtime_error("GoogleSQL AST: unsupported column type " + type);
 }
 
 std::unique_ptr<Statement> VisitCreate(const GoogleSqlAstNode& root) {
@@ -2621,6 +3325,70 @@ std::unique_ptr<Statement> VisitCreate(const GoogleSqlAstNode& root) {
                                                   std::move(statement));
   }
   throw std::runtime_error("GoogleSQL AST: bad CREATE");
+}
+
+// CREATE [TEMP] FUNCTION / CREATE TEMP AGGREGATE FUNCTION / CREATE TABLE
+// FUNCTION: register scalar and aggregate SQL functions for later call-site
+// expansion. Table functions are registered as inert entries (their bodies
+// produce relations, which expression call sites cannot consume yet); the
+// DDL itself succeeds so downstream statements observe the objects.
+const GoogleSqlAstNode* FindSqlFunctionBody(const GoogleSqlAstNode& root) {
+  for (const auto& child : root.children) {
+    if (child->kind == "SqlFunctionBody") {
+      for (const auto& body_child : child->children) {
+        if (body_child->kind != "Location") {
+          return body_child.get();
+        }
+      }
+    }
+  }
+  return nullptr;
+}
+
+std::unique_ptr<Statement> VisitCreateFunction(const GoogleSqlAstNode& root) {
+  const GoogleSqlAstNode* declaration = root.Child("FunctionDeclaration");
+  if (declaration == nullptr) {
+    throw std::runtime_error("GoogleSQL AST: function declaration missing");
+  }
+  const GoogleSqlAstNode* path = declaration->Child("PathExpression");
+  if (path == nullptr) {
+    throw std::runtime_error("GoogleSQL AST: function without name");
+  }
+  SqlUdf udf;
+  udf.name = Lower(Path(*path));
+  udf.is_aggregate = root.detail.find("is_aggregate=true") != std::string::npos;
+  if (const GoogleSqlAstNode* parameters =
+          declaration->Child("FunctionParameters")) {
+    for (const GoogleSqlAstNode* parameter :
+         parameters->Children("FunctionParameter")) {
+      const GoogleSqlAstNode* name_node = parameter->Child("Identifier");
+      if (name_node == nullptr) {
+        throw std::runtime_error(
+            "GoogleSQL AST: function parameter without name");
+      }
+      udf.parameters.emplace_back(
+          Lower(Identifier(*name_node)),
+          parameter->detail.find("is_not_aggregate=true") != std::string::npos);
+    }
+  }
+  if (root.kind != "CreateTableFunctionStatement") {
+    const GoogleSqlAstNode* body = FindSqlFunctionBody(root);
+    if (body != nullptr) {
+      auto cloned = CloneAstNode(root);
+      udf.root = std::move(cloned);
+      udf.body = FindSqlFunctionBody(*udf.root);
+      udf.parameter_counts.assign(udf.parameters.size(), 0);
+      AnalyzeUdfBody(*udf.body, udf.parameters, &udf.parameter_counts,
+                     &udf.simple_body);
+      UdfRegistry()[udf.name] = std::move(udf);
+    }
+  } else {
+    UdfRegistry()[udf.name] = std::move(udf);
+  }
+  std::vector<NamedExpression> projection;
+  projection.emplace_back("", ConstantValueExp(Value(int64_t{0})));
+  return std::make_unique<SelectStatement>(
+      std::move(projection), std::vector<std::string>{}, Expression{});
 }
 
 InsertMode InsertModeFromDetail(const std::string& detail) {
@@ -2662,8 +3430,9 @@ std::unique_ptr<Statement> VisitInsert(const GoogleSqlAstNode& root) {
     for (const GoogleSqlAstNode* row : row_list->Children("InsertValuesRow")) {
       std::vector<Expression> values;
       for (const auto& value : row->children) {
-        if (value->kind == "Location" || value->kind == "Hint") { continue;
-}
+        if (value->kind == "Location" || value->kind == "Hint") {
+          continue;
+        }
         values.push_back(VisitExpression(*value));
       }
       rows.push_back(std::move(values));
@@ -2706,8 +3475,7 @@ std::unique_ptr<Statement> VisitUpdate(const GoogleSqlAstNode& root) {
     if (child->kind == "PathExpression" || child->kind == "UpdateItemList" ||
         child->kind == "Location" || child->kind == "Hint" ||
         child->kind == "Alias" || child->kind == "AssertRowsModified" ||
-        child->kind == "ReturningClause" ||
-        child->kind == "FromClause") {
+        child->kind == "ReturningClause" || child->kind == "FromClause") {
       continue;
     }
     where_candidates.push_back(child.get());
@@ -2732,14 +3500,13 @@ std::unique_ptr<Statement> VisitDelete(const GoogleSqlAstNode& root) {
   const GoogleSqlAstNode* path = root.Child("PathExpression");
   if (path == nullptr) {
     throw std::runtime_error("GoogleSQL AST: bad DELETE");
-}
+  }
   std::vector<const GoogleSqlAstNode*> where_candidates;
   for (const auto& child : root.children) {
     if (child->kind == "PathExpression" || child->kind == "Location" ||
         child->kind == "Hint" || child->kind == "Alias" ||
         child->kind == "AssertRowsModified" ||
-        child->kind == "ReturningClause" ||
-        child->kind == "FromClause") {
+        child->kind == "ReturningClause" || child->kind == "FromClause") {
       continue;
     }
     where_candidates.push_back(child.get());
@@ -2768,7 +3535,7 @@ std::unique_ptr<Statement> GoogleSqlAstVisitor::Visit(
     const GoogleSqlAstNode* query = root.Child("Query");
     if (query == nullptr) {
       throw std::runtime_error("GoogleSQL AST: missing query");
-}
+    }
     auto statement = VisitQuery(*query);
     return std::make_unique<SelectStatement>(*statement);
   }
@@ -2791,9 +3558,19 @@ std::unique_ptr<Statement> GoogleSqlAstVisitor::Visit(
           } else {
             const_val = v.AsString();
           }
+          // Fully evaluable constant: pin the value itself so every
+          // reference observes one deterministic result (e.g. Rand()).
+          SessionConstantExpressions()[Lower(const_name)] =
+              ConstantValueExp(Value(std::move(v)));
         } catch (...) {
           if (child->kind == "StringLiteral") {
             const_val = DecodeString(*child);
+            SessionConstantExpressions()[Lower(const_name)] =
+                ConstantValueExp(Value(std::move(const_val)));
+          } else {
+            // Subqueries and function calls evaluate per reference through
+            // the relational interpreter instead.
+            SessionConstantExpressions()[Lower(const_name)] = std::move(expr);
           }
         }
         break;
@@ -2801,25 +3578,32 @@ std::unique_ptr<Statement> GoogleSqlAstVisitor::Visit(
     }
     SetSessionConstant(const_name, const_val);
     std::vector<NamedExpression> proj;
-    proj.emplace_back("constant", ConstantValueExp(Value(std::string(const_name))));
+    proj.emplace_back("constant",
+                      ConstantValueExp(Value(std::string(const_name))));
     return std::make_unique<SelectStatement>(
-        std::move(proj),
-        std::vector<std::string>{},
-        Expression{});
+        std::move(proj), std::vector<std::string>{}, Expression{});
   }
-  if (root.kind == "CreateTableStatement") { return VisitCreate(root);
-}
-  if (root.kind == "InsertStatement") { return VisitInsert(root);
-}
-  if (root.kind == "UpdateStatement") { return VisitUpdate(root);
-}
-  if (root.kind == "DeleteStatement") { return VisitDelete(root);
-}
+  if (root.kind == "CreateTableStatement") {
+    return VisitCreate(root);
+  }
+  if (root.kind == "CreateFunctionStatement" ||
+      root.kind == "CreateTableFunctionStatement") {
+    return VisitCreateFunction(root);
+  }
+  if (root.kind == "InsertStatement") {
+    return VisitInsert(root);
+  }
+  if (root.kind == "UpdateStatement") {
+    return VisitUpdate(root);
+  }
+  if (root.kind == "DeleteStatement") {
+    return VisitDelete(root);
+  }
   if (root.kind == "DropStatement" || root.kind == "DropStatement TABLE") {
     const GoogleSqlAstNode* path = root.Child("PathExpression");
     if (path == nullptr) {
       throw std::runtime_error("GoogleSQL AST: bad DROP");
-}
+    }
     return std::make_unique<DropTableStatement>(Path(*path));
   }
   if (root.kind.starts_with("DropStatement")) {
