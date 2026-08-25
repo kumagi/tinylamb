@@ -401,6 +401,16 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       context.execution_runtime()->unindexable_queries.contains(&statement)) {
     return std::nullopt;
   }
+  {
+    // CTE sources (inherited or declared by this statement's own WITH clause)
+    // have no base table; the correlated-index fast path cannot load them.
+    const SelectSource& from = statement.Sources()[0];
+    if ((!from.table.empty() &&
+         (ctes.contains(from.table) ||
+          statement.WithQueries().contains(from.table)))) {
+      return std::nullopt;
+    }
+  }
 
   CorrelatedIndex* index = nullptr;
   const auto cached =

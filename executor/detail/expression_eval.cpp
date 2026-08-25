@@ -39,6 +39,7 @@
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
+#include "expression/sql_udf.hpp"
 #include "expression/unary_expression.hpp"
 #include "query/statement.hpp"
 #include "type/column_name.hpp"
@@ -2024,6 +2025,15 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(FormatCivilTime(res_ct));
   }
+  // Lazy IF: the unselected branch must not evaluate, so expressions like
+  // IF(cond, x, ERROR(msg)) stay quiet when the branch is not taken.
+  if (name == "if" && call.Args().size() == 3) {
+    const Value branch =
+        Evaluate(call.Args()[0], scope, aggregates, context, ctes);
+    return branch.Truthy()
+               ? Evaluate(call.Args()[1], scope, aggregates, context, ctes)
+               : Evaluate(call.Args()[2], scope, aggregates, context, ctes);
+  }
   std::vector<Value> arguments;
   for (const Expression& argument : call.Args()) {
     arguments.push_back(Evaluate(argument, scope, aggregates, context, ctes));
@@ -2238,6 +2248,14 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       throw std::runtime_error("IF requires 3 arguments");
     }
     return arguments[0].Truthy() ? arguments[1] : arguments[2];
+  }
+  if (name == "error") {
+    // Unreachable in valid plans unless evaluated: raise the requested
+    // runtime error (the message text is informational only).
+    throw std::runtime_error(
+        arguments.empty() || arguments[0].IsNull()
+            ? std::string("ERROR: user-raised")
+            : "generic::out_of_range: " + raw_str(arguments[0]));
   }
   if (name == "coalesce") {
     for (Value& value : arguments) {
@@ -2836,7 +2854,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(int64_t{1});
   }
-  if (name == "array_element_offset" || name == "array_element_ordinal") {
+  if (name == "array_element_offset" || name == "array_element_ordinal" ||
+      name == "array_element_offset_safe" ||
+      name == "array_element_ordinal_safe") {
+    const bool safe = name.ends_with("_safe");
     if (arguments.size() != 2) {
       throw std::runtime_error("array element access requires 2 arguments");
     }
@@ -2848,13 +2869,22 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       throw std::runtime_error("array element access requires an array");
     }
     const auto& elements = arr.ArrayElements();
-    int64_t index = arguments[1].IsNull() ? -1 : arguments[1].value.int_value;
-    if (name == "array_element_ordinal") {
+    const bool null_index = arguments[1].IsNull();
+    int64_t index = null_index ? -1 : arguments[1].value.int_value;
+    if (name.find("ordinal") != std::string::npos) {
       --index;
     }
+    if (null_index) {
+      // A NULL position yields NULL for plain and SAFE accesses alike.
+      return {};
+    }
     if (index < 0 || index >= static_cast<int64_t>(elements.size())) {
-      // Out-of-range plain accesses are errors in GoogleSQL; SAFE variants
-      // and this fallback yield NULL.
+      // A non-NULL out-of-bounds OFFSET/ORDINAL access is a runtime error in
+      // GoogleSQL; the SAFE variants yield NULL instead.
+      if (!safe) {
+        throw std::runtime_error("Array index " + std::to_string(index) +
+                                 " is out of bounds");
+      }
       return {};
     }
     return elements[static_cast<size_t>(index)];
@@ -6360,6 +6390,36 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(uniform(rng));
   }
 
+  // Deferred STRUCT(...) construction: arguments alternate field name and
+  // value; encoding is shared with the AST evaluator.
+  if (name == "__struct_json__") {
+    std::vector<std::pair<std::string, Value>> fields;
+    fields.reserve(arguments.size() / 2);
+    for (size_t i = 0; i + 1 < arguments.size(); i += 2) {
+      fields.emplace_back(arguments[i].IsNull() ? std::string()
+                                                : std::string(
+                                                      arguments[i]
+                                                          .value
+                                                          .varchar_value),
+                          arguments[i + 1]);
+    }
+    return Value(EncodeStructJson(fields));
+  }
+
+  // SQL scalar UDFs registered by CREATE FUNCTION: evaluate the body against
+  // a synthetic single-row scope chained onto the caller's scope so subqueries
+  // inside the body stay correlated with the bound parameters.
+  if (std::optional<SqlScalarFunction> udf = FindSqlScalarFunction(name)) {
+    SqlUdfBinding binding = BindSqlUdfArguments(*udf, std::move(arguments));
+    const Scope inner_scope{.row = &binding.row,
+                            .schema = &binding.schema,
+                            .outer = &scope};
+    SqlUdfDepthGuard depth_guard;
+    // Scalar bodies never contain aggregates; passing nullptr surfaces a clear
+    // error instead of silently reusing the caller's group state.
+    return Evaluate(udf->body, inner_scope, nullptr, context, ctes);
+  }
+
   throw std::runtime_error("unsupported function " + name);
 }
 
@@ -6524,6 +6584,16 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       }
       auto& row_source = const_cast<Relation&>(*relation);
       const bool as_struct = value.Query()->AsStruct();
+      if (value.ArrayResult()) {
+        // ARRAY(SELECT ...): collect every projected row into one array
+        // value; an empty subquery yields an empty array, not NULL.
+        std::vector<Value> collected;
+        collected.reserve(relation->TotalRows());
+        row_source.ForEachRow([&](const Row& row) {
+          collected.push_back(ProjectSubqueryRow(row, as_struct));
+        });
+        return Value::Array(std::move(collected), "INT64");
+      }
       if (value.Exists()) {
         const bool exists = relation->TotalRows() > 0;
         return Value(value.Negated() ? !exists : exists);
@@ -6607,7 +6677,9 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
         return membership.IsNull() ? Value() : Value(!membership.Truthy());
       }
       std::optional<Row> first;
+      size_t total_rows = 0;
       row_source.ForEachRow([&](const Row& row) {
+        ++total_rows;
         // Scalar subquery: only the first row matters.
         if (!first) {
           first = row;
@@ -6615,6 +6687,11 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       });
       if (!first || first->values_.empty()) {
         return {};
+      }
+      if (total_rows > 1) {
+        // A scalar subquery must produce at most one row.
+        throw std::runtime_error(
+            "More than one element returned by the scalar subquery");
       }
       return ProjectSubqueryRow(*first, as_struct);
     }
