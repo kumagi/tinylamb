@@ -415,6 +415,49 @@ std::string DecodeString(const GoogleSqlAstNode& node) {
 
 
 
+// Recognizes the correlated shape `SELECT x FROM UNNEST(<expr>) [AS x]`
+// (no other clauses) used by quantified comparisons over table arrays and
+// returns the array expression node.  Returns nullptr for anything else.
+const GoogleSqlAstNode* UnnestArrayOfQuantifiedSubquery(  // NOLINT(misc-no-recursion)
+    const GoogleSqlAstNode& query) {
+  const GoogleSqlAstNode* select = (query.kind == "Select")
+                                       ? &query
+                                       : query.Child("Select");
+  if (select == nullptr) { return nullptr; }
+  for (const auto& child : select->children) {
+    if (child->kind == "Location") { continue; }
+    if (child->kind != "SelectList" && child->kind != "FromClause") {
+      return nullptr;
+    }
+  }
+  const GoogleSqlAstNode* select_list = select->Child("SelectList");
+  if (select_list == nullptr || select_list->children.size() != 1) {
+    return nullptr;
+  }
+  const GoogleSqlAstNode* from = select->Child("FromClause");
+  if (from == nullptr || from->children.size() != 1) { return nullptr; }
+  const GoogleSqlAstNode* source = from->children.front().get();
+  if (source == nullptr || source->kind != "TablePathExpression") {
+    return nullptr;
+  }
+  const GoogleSqlAstNode* unnest = source->Child("UnnestExpression");
+  if (unnest == nullptr) { return nullptr; }
+  if (source->Child("WithOffset") != nullptr ||
+      source->Child("WithOffsetClause") != nullptr) {
+    return nullptr;
+  }
+  const GoogleSqlAstNode* expr_with_alias =
+      unnest->Child("ExpressionWithOptAlias");
+  if (expr_with_alias == nullptr) { return nullptr; }
+  for (const auto& child : expr_with_alias->children) {
+    if (child->kind != "Location" && child->kind != "Identifier" &&
+        child->kind != "Alias") {
+      return child.get();
+    }
+  }
+  return nullptr;
+}
+
 BinaryOperation BinaryOp(std::string_view detail) {
   if (detail == "+") { return BinaryOperation::kAdd;
 }
@@ -624,6 +667,20 @@ Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recu
   std::string name = Lower(Path(*node.children.front()));
   if (name == "ucase") { name = "upper"; }
   if (name == "lcase") { name = "lower"; }
+  if (name == "collate") {
+    // GoogleSQL requires COLLATE(value, 'literal'): the collator must be a
+    // plain string literal, not a NULL/parameter/expression.
+    std::vector<const GoogleSqlAstNode*> args;
+    for (size_t i = 1; i < node.children.size(); ++i) {
+      if (node.children[i]->kind != "Location") {
+        args.push_back(node.children[i].get());
+      }
+    }
+    if (args.size() != 2 || args[1]->kind != "StringLiteral") {
+      throw std::runtime_error(
+          "The second argument of COLLATE() must be a string literal");
+    }
+  }
   const bool first_arg_bytes =
       node.children.size() > 1 && IsBytesAstNode(*node.children[1]);
   if (first_arg_bytes) {
@@ -743,6 +800,34 @@ std::string SqlTypeFromAst(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
   if (IsAstTrivia(node.kind)) { return {}; }
   if (node.kind == "PathExpression") { return UpperCopy(Path(node)); }
   if (node.kind == "Identifier") { return UpperCopy(node.detail); }
+  if (node.kind == "SimpleType") {
+    // Preserve length/type parameters (STRING(2), NUMERIC(10), ...): they
+    // carry validation semantics for casts.
+    std::string base;
+    for (const auto& child : node.children) {
+      if (child->kind == "PathExpression" || child->kind == "Identifier") {
+        base = child->kind == "Identifier" ? UpperCopy(child->detail)
+                                           : UpperCopy(Path(*child));
+        break;
+      }
+    }
+    if (!base.empty()) {
+      for (const auto& child : node.children) {
+        if (child->kind != "TypeParameterList") { continue; }
+        std::string params;
+        for (const auto& param : child->children) {
+          if (param->kind == "IntLiteral" || param->kind == "Identifier") {
+            if (!params.empty()) { params += ", "; }
+            params += param->kind == "IntLiteral" ? param->detail
+                                                  : UpperCopy(param->detail);
+          }
+        }
+        if (!params.empty()) { base += "(" + params + ")"; }
+        break;
+      }
+    }
+    if (!base.empty()) { return base; }
+  }
   if (node.kind == "ArrayType") {
     for (const auto& child : node.children) {
       const std::string nested = SqlTypeFromAst(*child);
@@ -1581,8 +1666,13 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         }
       }
     }
-    std::string json_out = "{";
-    bool first = true;
+    struct StructFieldJson {
+      std::string name;
+      std::string text;
+      bool is_string{false};
+    };
+    std::vector<StructFieldJson> fields;
+    bool any_ci = false;
     size_t arg_idx = 0;
     for (const auto& child : node.children) {
       if (child->kind == "Location" || child->kind == "StructType") {
@@ -1614,34 +1704,60 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         fname = "f" + std::to_string(arg_idx + 1);
       }
 
-      std::string val_str = "null";
+      StructFieldJson field;
+      field.name = std::move(fname);
       if (arg_node->kind == "BooleanLiteral") {
-        val_str = (arg_node->detail == "TRUE" || arg_node->detail == "true") ? "true" : "false";
+        field.text = (arg_node->detail == "TRUE" || arg_node->detail == "true")
+                         ? "true"
+                         : "false";
       } else if (arg_node->kind == "NullLiteral") {
-        val_str = "null";
+        field.text = "null";
       } else {
         Expression val_expr = VisitExpression(*arg_node);
         if (val_expr) {
           try {
             Value v = val_expr->Evaluate(Row(), Schema());
             if (!v.IsNull()) {
+              any_ci = any_ci || v.IsCaseInsensitive();
               if (v.type == ValueType::kVarChar) {
-                val_str = "\"" + std::string(v.value.varchar_value) + "\"";
+                field.text = std::string(v.value.varchar_value);
+                field.is_string = true;
               } else if (v.type == ValueType::kInt64) {
-                val_str = std::to_string(v.value.int_value);
+                field.text = std::to_string(v.value.int_value);
               } else if (v.type == ValueType::kDouble) {
-                val_str = std::to_string(v.value.double_value);
+                field.text = std::to_string(v.value.double_value);
               } else {
-                val_str = v.AsString();
+                field.text = v.AsString();
               }
             }
           } catch (...) {}
         }
       }
+      fields.push_back(std::move(field));
+      ++arg_idx;
+    }
+    // Collation propagation: when any field value carries a case-insensitive
+    // collator, the whole struct comparison folds (GoogleSQL resolves one
+    // collation per comparison; struct JSON carries no per-field metadata).
+    if (any_ci) {
+      for (auto& field : fields) {
+        if (field.is_string) {
+          std::transform(field.text.begin(), field.text.end(),
+                         field.text.begin(), [](unsigned char c) {
+                           return c >= 'A' && c <= 'Z'
+                                      ? static_cast<char>(c - 'A' + 'a')
+                                      : static_cast<char>(c);
+                         });
+        }
+      }
+    }
+    std::string json_out = "{";
+    bool first = true;
+    for (auto& field : fields) {
       if (!first) { json_out += ","; }
       first = false;
       std::string escaped_fname;
-      for (char c : fname) {
+      for (char c : field.name) {
         if (c == '"') { escaped_fname += "\\\""; }
         else if (c == '\\') { escaped_fname += "\\\\"; }
         else if (static_cast<unsigned char>(c) < 0x20) {
@@ -1652,8 +1768,8 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
           escaped_fname.push_back(c);
         }
       }
-      json_out += "\"" + escaped_fname + "\":" + val_str;
-      ++arg_idx;
+      json_out += "\"" + escaped_fname + "\":";
+      json_out += field.is_string ? "\"" + field.text + "\"" : field.text;
     }
     json_out += "}";
     return ConstantValueExp(Value(std::move(json_out)));
@@ -1686,16 +1802,21 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
 
   if (node.kind == "QuantifiedComparisonExpression") {
     // `lhs <op> ANY/ALL/SOME (list | query)`.  List forms desugar into OR/AND
-    // comparison chains; the two subquery shapes with an equality mapping
-    // (op = ANY -> IN, op <> ALL -> NOT IN) reuse the IN-subquery machinery.
+    // comparison chains; subquery forms reuse the QueryExpression machinery
+    // with the comparison operator and quantifier attached.
     Expression lhs;
     std::string quantifier;
     const GoogleSqlAstNode* list_node = nullptr;
     const GoogleSqlAstNode* collection = nullptr;
+    const GoogleSqlAstNode* query_node = nullptr;
     for (const auto& child : node.children) {
       if (child->kind == "Location") { continue; }
       if (child->kind == "AnySomeAllOp") {
         quantifier = UpperCopy(child->detail);
+        continue;
+      }
+      if (child->kind == "Query") {
+        query_node = child.get();
         continue;
       }
       if (child->kind == "InList") {
@@ -1715,18 +1836,30 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     }
     const BinaryOperation op = BinaryOp(node.detail);
     const bool is_any = quantifier == "ANY" || quantifier == "SOME";
+    const QuantifierMode mode =
+        is_any ? QuantifierMode::kAny : QuantifierMode::kAll;
+    if (query_node != nullptr) {
+      // `lhs <op> ANY/ALL (SELECT x FROM UNNEST(arr) x)` iterates the array
+      // directly; evaluating it as a correlated subquery would require
+      // outer-scope resolution inside UNNEST table sources.
+      if (const GoogleSqlAstNode* array_expr =
+              UnnestArrayOfQuantifiedSubquery(*query_node)) {
+        Expression arr = VisitExpression(*array_expr);
+        std::string op_text(node.detail);
+        std::string quantifier_text = quantifier;
+        return FunctionCallExp("__quantified__",
+                               {std::move(lhs), std::move(arr),
+                                ConstantValueExp(Value(std::move(op_text))),
+                                ConstantValueExp(Value(std::move(quantifier_text)))});
+      }
+      return QueryExpressionExp(VisitQuery(*query_node), lhs, false, false,
+                                op, mode);
+    }
     const GoogleSqlAstNode* query =
         list_node != nullptr ? list_node->Child("Query") : nullptr;
     if (query != nullptr) {
-      auto inner = VisitQuery(*query);
-      if (is_any && op == BinaryOperation::kEquals) {
-        return QueryExpressionExp(std::move(inner), lhs, false, false);
-      }
-      if (!is_any && op == BinaryOperation::kNotEquals) {
-        return QueryExpressionExp(std::move(inner), lhs, false, true);
-      }
-      throw std::runtime_error(
-          "GoogleSQL AST: unsupported quantified comparison over subquery");
+      return QueryExpressionExp(VisitQuery(*query), lhs, false, false, op,
+                                mode);
     }
     if (collection != nullptr) {
       // Generic array-collection form: evaluated by the runtime helper
@@ -1745,33 +1878,34 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         items.push_back(VisitExpression(*child));
       }
     }
-    Expression chain;
-    for (Expression& item : items) {
-      Expression term =
-          BinaryExpressionExp(lhs, op, item);
-      if (chain == nullptr) {
-        chain = std::move(term);
-      } else if (is_any) {
-        chain = BinaryExpressionExp(std::move(chain), BinaryOperation::kOr,
-                                    std::move(term));
-      } else {
-        chain = BinaryExpressionExp(std::move(chain), BinaryOperation::kAnd,
-                                    std::move(term));
-      }
-    }
-    return chain;
+    // List form shares the __quantified__ runtime with the array form so
+    // three-valued combination and collation resolution stay identical
+    // across all quantified-comparison shapes.
+    std::string op_text(node.detail);
+    std::string quantifier_text = quantifier;
+    return FunctionCallExp(
+        "__quantified__",
+        {std::move(lhs), ArrayExpressionExp(std::move(items), ""),
+         ConstantValueExp(Value(std::move(op_text))),
+         ConstantValueExp(Value(std::move(quantifier_text)))});
   }
 
   if (node.kind == "LikeExpression") {
-    // `lhs [NOT] LIKE rhs`, plus the LIKE ANY/SOME/ALL (list) extension.
+    // `lhs [NOT] LIKE rhs`, plus the LIKE ANY/SOME/ALL (list | query)
+    // extension.
     Expression lhs;
     const GoogleSqlAstNode* any_op = nullptr;
     const GoogleSqlAstNode* list_node = nullptr;
+    const GoogleSqlAstNode* query_node = nullptr;
     std::vector<Expression> operands;
     for (const auto& child : node.children) {
       if (child->kind == "Location") { continue; }
       if (child->kind == "AnySomeAllOp") {
         any_op = child.get();
+        continue;
+      }
+      if (child->kind == "Query") {
+        query_node = child.get();
         continue;
       }
       if (child->kind == "InList") {
@@ -1785,6 +1919,17 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
       }
     }
     const bool negated = UpperCopy(node.detail).find("NOT") != std::string::npos;
+    if (any_op != nullptr && query_node != nullptr) {
+      // `lhs [NOT] LIKE ANY/ALL (subquery)`: per-row LIKE / NOT LIKE under
+      // three-valued ANY/ALL combination.
+      const bool is_any =
+          UpperCopy(any_op->detail) == "ANY" ||
+          UpperCopy(any_op->detail) == "SOME";
+      return QueryExpressionExp(
+          VisitQuery(*query_node), lhs, false, false,
+          negated ? BinaryOperation::kNotLike : BinaryOperation::kLike,
+          is_any ? QuantifierMode::kAny : QuantifierMode::kAll);
+    }
     if (any_op == nullptr || list_node == nullptr) {
       if (operands.empty()) {
         throw std::runtime_error("GoogleSQL AST: malformed LIKE");

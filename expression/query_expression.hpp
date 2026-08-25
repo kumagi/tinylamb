@@ -4,7 +4,9 @@
 
 #include <memory>
 #include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
 #include "expression/expression.hpp"
 
 namespace tinylamb {
@@ -12,14 +14,29 @@ namespace tinylamb {
 class EvaluationContext;
 class SelectStatement;
 
+// Three-valued ANY/ALL kernel shared by the AST and relational interpreters:
+// ANY is a three-valued OR over per-row comparisons, ALL its dual.  An empty
+// row set is vacuous (ALL -> TRUE, ANY -> FALSE).
+Value EvaluateQuantifiedComparison(BinaryOperation op, QuantifierMode mode,
+                                   const Value& test,
+                                   const std::vector<Value>& rows);
+
 class QueryExpression : public ExpressionBase {
  public:
   QueryExpression(std::shared_ptr<SelectStatement> query, Expression test,
                   bool exists, bool negated)
+      : QueryExpression(std::move(query), std::move(test), exists, negated,
+                        BinaryOperation::kEquals, QuantifierMode::kIn) {}
+
+  QueryExpression(std::shared_ptr<SelectStatement> query, Expression test,
+                  bool exists, bool negated, BinaryOperation op,
+                  QuantifierMode mode)
       : query_(std::move(query)),
         test_(std::move(test)),
         exists_(exists),
-        negated_(negated) {}
+        negated_(negated),
+        op_(op),
+        mode_(mode) {}
 
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kQueryExp; }
   [[nodiscard]] Value Evaluate(const Row&, const Schema&) const override;
@@ -37,12 +54,16 @@ class QueryExpression : public ExpressionBase {
   [[nodiscard]] const Expression& Test() const { return test_; }
   [[nodiscard]] bool Exists() const { return exists_; }
   [[nodiscard]] bool Negated() const { return negated_; }
+  [[nodiscard]] BinaryOperation Op() const { return op_; }
+  [[nodiscard]] QuantifierMode Mode() const { return mode_; }
 
  private:
   std::shared_ptr<SelectStatement> query_;
   Expression test_;
   bool exists_{false};
   bool negated_{false};
+  BinaryOperation op_{BinaryOperation::kEquals};
+  QuantifierMode mode_{QuantifierMode::kIn};
 };
 
 }  // namespace tinylamb

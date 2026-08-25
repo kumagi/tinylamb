@@ -132,6 +132,17 @@ class Value {
 
   [[nodiscard]] bool IsNull() const { return type == ValueType::kNull; }
 
+  // Collation attachment (COLLATE(value, spec)).  0 = none, 1 = 'binary',
+  // 2 = case-insensitive ('und:ci' style).  Comparisons consult the tag when
+  // either operand carries it; serialization and hashing ignore it.
+  [[nodiscard]] uint8_t Collation() const { return collation_; }
+  [[nodiscard]] bool IsCaseInsensitive() const { return collation_ == 2; }
+  [[nodiscard]] Value WithCollation(uint8_t collation) const {
+    Value copy = *this;
+    copy.collation_ = collation;
+    return copy;
+  }
+
   union {
     int64_t int_value;
     std::string_view varchar_value;
@@ -140,6 +151,9 @@ class Value {
   ValueType type{ValueType::kNull};
   std::string owned_data;
   std::shared_ptr<ArrayPayload> array_;
+
+ private:
+  uint8_t collation_{0};
 };
 
 }  // namespace tinylamb

@@ -86,16 +86,55 @@ std::vector<std::string> ExtractStructValues(std::string_view json) {
   return values;
 }
 
-bool StructJsonEqual(std::string_view lhs, std::string_view rhs) {
-  if (lhs == rhs) { return true; }
+// Row-comparison semantics for STRUCT equality (ANSI row value comparison):
+// a pair of non-NULL, differing fields decides FALSE outright; any field
+// pair involving NULL yields UNKNOWN unless another pair decided FALSE.
+Value StructJsonCompare(std::string_view lhs, std::string_view rhs) {
   auto v1 = ExtractStructValues(lhs);
   auto v2 = ExtractStructValues(rhs);
-  if (v1.empty() || v1.size() != v2.size()) { return false; }
+  if (v1.empty() || v1.size() != v2.size()) { return Value(false); }
+  bool saw_null = false;
   for (size_t i = 0; i < v1.size(); ++i) {
-    if (v1[i] != v2[i]) { return false; }
+    if (v1[i] == "null" || v2[i] == "null") {
+      saw_null = true;
+      continue;
+    }
+    if (v1[i] != v2[i]) { return Value(false); }
   }
-  return true;
+  return saw_null ? Value() : Value(true);
 }
+
+bool IsComparisonOp(BinaryOperation op) {
+  switch (op) {
+    case BinaryOperation::kEquals:
+    case BinaryOperation::kNotEquals:
+    case BinaryOperation::kLessThan:
+    case BinaryOperation::kLessThanEquals:
+    case BinaryOperation::kGreaterThan:
+    case BinaryOperation::kGreaterThanEquals:
+    case BinaryOperation::kLike:
+    case BinaryOperation::kNotLike:
+      return true;
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
+std::string FoldCase(std::string_view s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    const auto uc = static_cast<unsigned char>(c);
+    out.push_back(uc >= 'A' && uc <= 'Z'
+                      ? static_cast<char>(uc - 'A' + 'a')
+                      : c);
+  }
+  return out;
+}
+
+namespace {
 
 bool Like(std::string_view value, std::string_view pattern) {
   size_t value_pos = 0;
@@ -153,12 +192,35 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
   }
   if (left.IsNull() || right.IsNull()) { return {};
 }
+  // Collation-aware normalization: when either operand carries a
+  // case-insensitive collator, both sides fold to lowercase.  GoogleSQL
+  // resolves an explicit COLLATE on one side for the whole comparison.
+  Value folded_left = left;
+  Value folded_right = right;
+  if (IsComparisonOp(op) && left.type == ValueType::kVarChar &&
+      right.type == ValueType::kVarChar &&
+      (left.IsCaseInsensitive() || right.IsCaseInsensitive())) {
+    // Tags ride along so downstream LIKE validation still sees the collator.
+    folded_left = Value(FoldCase(left.value.varchar_value))
+                      .WithCollation(left.Collation());
+    folded_right = Value(FoldCase(right.value.varchar_value))
+                       .WithCollation(right.Collation());
+  }
   if (op == BinaryOperation::kLike || op == BinaryOperation::kNotLike) {
-    if (left.type != ValueType::kVarChar || right.type != ValueType::kVarChar) {
+    if (folded_left.type != ValueType::kVarChar ||
+        folded_right.type != ValueType::kVarChar) {
       throw std::runtime_error("LIKE requires string operands");
     }
+    const std::string_view pattern = folded_right.value.varchar_value;
+    if ((folded_left.IsCaseInsensitive() || folded_right.IsCaseInsensitive()) &&
+        pattern.find('_') != std::string_view::npos) {
+      throw std::runtime_error(
+          "LIKE pattern has '_' which is not allowed when its operands have "
+          "collation: " +
+          std::string(pattern));
+    }
     const bool matched =
-        Like(left.value.varchar_value, right.value.varchar_value);
+        Like(folded_left.value.varchar_value, pattern);
     return Value(op == BinaryOperation::kLike ? matched : !matched);
   }
   const bool numeric =
@@ -290,25 +352,34 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     case BinaryOperation::kModulo:
       return left % right;
     case BinaryOperation::kEquals:
-      if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar &&
-          IsStructJson(left.value.varchar_value) && IsStructJson(right.value.varchar_value)) {
-        return Value(StructJsonEqual(left.value.varchar_value, right.value.varchar_value));
+      if (folded_left.type == ValueType::kVarChar &&
+          folded_right.type == ValueType::kVarChar &&
+          IsStructJson(folded_left.value.varchar_value) &&
+          IsStructJson(folded_right.value.varchar_value)) {
+        return StructJsonCompare(folded_left.value.varchar_value,
+                                 folded_right.value.varchar_value);
       }
-      return Value(left == right);
+      return Value(folded_left == folded_right);
     case BinaryOperation::kNotEquals:
-      if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar &&
-          IsStructJson(left.value.varchar_value) && IsStructJson(right.value.varchar_value)) {
-        return Value(!StructJsonEqual(left.value.varchar_value, right.value.varchar_value));
+      if (folded_left.type == ValueType::kVarChar &&
+          folded_right.type == ValueType::kVarChar &&
+          IsStructJson(folded_left.value.varchar_value) &&
+          IsStructJson(folded_right.value.varchar_value)) {
+        const Value equal = StructJsonCompare(folded_left.value.varchar_value,
+                                              folded_right.value.varchar_value);
+        if (equal.IsNull()) { return {};
+}
+        return Value(!equal.Truthy());
       }
-      return Value(left != right);
+      return Value(folded_left != folded_right);
     case BinaryOperation::kLessThan:
-      return Value(left < right);
+      return Value(folded_left < folded_right);
     case BinaryOperation::kLessThanEquals:
-      return Value(left <= right);
+      return Value(folded_left <= folded_right);
     case BinaryOperation::kGreaterThan:
-      return Value(left > right);
+      return Value(folded_left > folded_right);
     case BinaryOperation::kGreaterThanEquals:
-      return Value(left >= right);
+      return Value(folded_left >= folded_right);
     case BinaryOperation::kAnd:
     case BinaryOperation::kOr:
     case BinaryOperation::kXor:

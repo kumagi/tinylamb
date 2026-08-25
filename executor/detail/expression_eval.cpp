@@ -13,6 +13,7 @@
 #include <vector>
 #include <unordered_set>
 #include <string>
+#include <cctype>
 #include <utility>
 #include <regex>
 
@@ -1412,10 +1413,15 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       throw std::runtime_error("quantified comparison requires 4 arguments");
     }
     const Value& lhs = arguments[0];
-    const Value& arr = arguments[1];
+    Value arr = arguments[1];
     const std::string op = raw_str(arguments[2]);
     const std::string mode = raw_str(arguments[3]);
-    if (arr.IsNull()) { return {}; }
+    // UNNEST over a NULL array produces zero rows: the comparison is vacuous
+    // (ALL -> TRUE, ANY -> FALSE), not UNKNOWN.
+    if (arr.IsNull()) {
+      if (mode == "ANY" || mode == "SOME") { return Value(int64_t{0}); }
+      return Value(int64_t{1});
+    }
     if (!arr.IsArray()) {
       throw std::runtime_error("quantified comparison requires an array");
     }
@@ -1446,12 +1452,51 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
                                op);
     }
     const bool is_any = mode == "ANY" || mode == "SOME";
+    // Collation resolution: an explicit case-insensitive collator on any
+    // element applies to the whole comparison set.
+    bool any_ci = lhs.IsCaseInsensitive();
+    for (const Value& element : arr.ArrayElements()) {
+      any_ci = any_ci || element.IsCaseInsensitive();
+    }
+    Value test_value = lhs;
+    if (any_ci && lhs.type == ValueType::kVarChar) {
+      std::vector<Value> folded;
+      folded.reserve(arr.ArrayElements().size());
+      for (const Value& element : arr.ArrayElements()) {
+        if (element.type == ValueType::kVarChar) {
+          folded.push_back(Value(FoldCase(element.value.varchar_value))
+                               .WithCollation(element.Collation()));
+        } else {
+          folded.push_back(element);
+        }
+      }
+      arr = Value::Array(std::move(folded), arr.ArrayElementSqlType());
+      test_value = Value(FoldCase(lhs.value.varchar_value))
+                       .WithCollation(lhs.Collation());
+    }
     bool saw_true = false;
     bool saw_null = false;
+    // Collated LIKE rejects the '_' wildcard outright (validation error, not
+    // a per-row UNKNOWN).
+    if (operation == BinaryOperation::kLike ||
+        operation == BinaryOperation::kNotLike) {
+      if (any_ci) {
+        for (const Value& element : arr.ArrayElements()) {
+          if (!element.IsNull() && element.type == ValueType::kVarChar &&
+              std::string_view(element.value.varchar_value)
+                      .find('_') != std::string_view::npos) {
+            throw std::runtime_error(
+                "LIKE pattern has '_' which is not allowed when its operands "
+                "have collation: " +
+                std::string(element.value.varchar_value));
+          }
+        }
+      }
+    }
     for (const Value& element : arr.ArrayElements()) {
       Value result;
       try {
-        result = Binary(operation, lhs, element);
+        result = Binary(operation, test_value, element);
       } catch (...) {
         result = Value();
       }
@@ -4101,6 +4146,24 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(iv.JustifyInterval().ToString());
   }
 
+  if (name == "collate") {
+    // COLLATE(value, spec): attaches the collator to the value; the value
+    // itself is unchanged.  1 = explicit binary collator, 2 =
+    // case-insensitive (or unknown non-binary) collator.
+    if (arguments.size() != 2) {
+      throw std::runtime_error("COLLATE requires 2 arguments");
+    }
+    const Value& v = arguments[0];
+    if (v.IsNull()) { return {};
+}
+    std::string spec = raw_str(arguments[1]);
+    for (char& c : spec) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    const uint8_t code = spec == "binary" ? 1 : 2;
+    return v.WithCollation(code);
+  }
+
   throw std::runtime_error("unsupported function " + name);
 }
 
@@ -4254,6 +4317,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
         relation = &*executed;
       }
       auto& row_source = const_cast<Relation&>(*relation);
+      const bool as_struct = value.Query()->AsStruct();
       if (value.Exists()) {
         const bool exists = relation->TotalRows() > 0;
         return Value(value.Negated() ? !exists : exists);
@@ -4261,8 +4325,22 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       if (value.Test()) {
         const Value test =
             Evaluate(value.Test(), scope, aggregates, context, ctes);
+        if (value.Mode() != QuantifierMode::kIn) {
+          std::vector<Value> candidates;
+          candidates.reserve(relation->TotalRows());
+          row_source.ForEachRow([&](const Row& row) {
+            candidates.push_back(ProjectSubqueryRow(row, as_struct));
+          });
+          return EvaluateQuantifiedComparison(value.Op(), value.Mode(), test,
+                                              candidates);
+        }
         // Canonical three-valued IN membership: a match decides TRUE, any
         // NULL (test value or row value) turns a miss into UNKNOWN.
+        auto collation_conflict = [&](const Value& projected) {
+          return !test.IsNull() && !projected.IsNull() &&
+                 test.Collation() != 0 && projected.Collation() != 0 &&
+                 test.Collation() != projected.Collation();
+        };
         bool found = false;
         bool saw_null = test.IsNull();
         if (uncorrelated && context.execution_runtime() != nullptr) {
@@ -4272,9 +4350,12 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
           if (inserted) {
             cached->second.reserve(relation->TotalRows());
             row_source.ForEachRow([&](const Row& row) {
-              if (!row.values_.empty() && !row[0].IsNull()) {
-                cached->second.insert(row[0]);
+              const Value projected = ProjectSubqueryRow(row, as_struct);
+              if (collation_conflict(projected)) {
+                throw std::runtime_error("Collation conflict between the IN "
+                                         "operands");
               }
+              if (!projected.IsNull()) { cached->second.insert(projected); }
             });
             ++context.execution_runtime()->uncorrelated_hash_builds;
           }
@@ -4286,7 +4367,8 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
             // The hash set excludes NULL keys; a size shortfall means the
             // relation may contain NULLs that turn the miss into UNKNOWN.
             row_source.ForEachRow([&](const Row& row) {
-              if (!row.values_.empty() && row[0].IsNull()) { saw_null = true;
+              if (!row.values_.empty() &&
+                  ProjectSubqueryRow(row, as_struct).IsNull()) { saw_null = true;
 }
             });
           }
@@ -4294,8 +4376,13 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
           row_source.ForEachRow([&](const Row& row) {
             if (found || row.values_.empty()) { return;
 }
-            saw_null = saw_null || row[0].IsNull();
-            if (Truthy(Binary(BinaryOperation::kEquals, test, row[0]))) {
+            const Value projected = ProjectSubqueryRow(row, as_struct);
+            if (collation_conflict(projected)) {
+              throw std::runtime_error("Collation conflict between the IN "
+                                       "operands");
+            }
+            saw_null = saw_null || projected.IsNull();
+            if (Truthy(Binary(BinaryOperation::kEquals, test, projected))) {
               found = true;
             }
           });
@@ -4314,7 +4401,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       });
       if (!first || first->values_.empty()) { return {};
 }
-      return (*first)[0];
+      return ProjectSubqueryRow(*first, as_struct);
     }
     case TypeTag::kIntervalExp:
       return expression->Evaluate(Row(), Schema());

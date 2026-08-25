@@ -212,6 +212,9 @@ class SelectStatement : public Statement {
     return with_queries_;
   }
   bool RequiresRelationalEvaluation() const { return complex_; }
+  // SELECT AS STRUCT: subquery consumers compare whole rows as structs.
+  bool AsStruct() const { return as_struct_; }
+  void SetAsStruct(bool as_struct) { as_struct_ = as_struct; }
   const std::unordered_map<std::string, std::string>& Aliases() const {
     return aliases_;
   }
@@ -294,6 +297,7 @@ class SelectStatement : public Statement {
   std::unordered_map<std::string, std::shared_ptr<SelectStatement>>
       with_queries_;
   std::vector<std::shared_ptr<SelectStatement>> union_all_;
+  bool as_struct_{false};
   bool complex_{false};
 };
 

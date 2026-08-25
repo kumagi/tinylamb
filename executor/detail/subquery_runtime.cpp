@@ -41,6 +41,41 @@
 
 namespace tinylamb::relational_detail {
 
+Value ProjectSubqueryRow(const Row& row, bool as_struct) {
+  if (row.values_.empty()) { return {};
+}
+  if (!as_struct) { return row[0];
+}
+  if (row.values_.size() == 1) {
+    const Value& only = row.values_[0];
+    // A fully-NULL single-field struct is a scalar NULL.
+    if (only.IsNull()) { return {};
+}
+  }
+  auto scalar_to_json = [](const Value& v) -> std::string {
+    switch (v.type) {
+      case ValueType::kNull:
+        return "null";
+      case ValueType::kInt64:
+        return std::to_string(v.value.int_value);
+      case ValueType::kDouble:
+        return std::to_string(v.value.double_value);
+      case ValueType::kVarChar:
+        return "\"" + std::string(v.value.varchar_value) + "\"";
+      default:
+        return v.AsString();
+    }
+  };
+  std::string json = "{";
+  for (size_t i = 0; i < row.values_.size(); ++i) {
+    if (i > 0) { json += ","; }
+    json += "\"f" + std::to_string(i + 1) + "\":" +
+            scalar_to_json(row.values_[i]);
+  }
+  json += "}";
+  return Value(std::move(json));
+}
+
 double ElapsedMs(std::chrono::steady_clock::time_point begin) {
   return std::chrono::duration<double, std::milli>(
              std::chrono::steady_clock::now() - begin)

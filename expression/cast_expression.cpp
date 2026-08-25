@@ -264,7 +264,12 @@ std::string ToLower(std::string str) {
 }
 
 std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
-  const std::string upper = ToUpper(type_name);
+  std::string upper = ToUpper(type_name);
+  // Strip type parameters (STRING(2) -> STRING) for base-type resolution.
+  const size_t paren = upper.find('(');
+  if (paren != std::string::npos && !upper.starts_with("ARRAY<")) {
+    upper = upper.substr(0, paren);
+  }
   if (upper == "INT64" || upper == "INT32" || upper == "INT" ||
       upper == "INTEGER" || upper == "INT16" || upper == "INT8" ||
       upper == "UINT64" || upper == "UINT32" || upper == "UINT16" ||
@@ -548,6 +553,66 @@ Value CastValue(const Value& val, const std::string& type_name,
           return Value::DateFromDays(val.value.int_value);
         }
         break;
+      }
+      case ValueType::kArray: {
+        // CAST(x AS ARRAY<T>): retypes array literals (coercing elements to
+        // the declared element type when they are scalar); NULL stays NULL.
+        if (val.IsNull()) { return Value(); }
+        if (!val.IsArray()) { break; }
+        std::string element_type = "INT64";
+        if (upper.starts_with("ARRAY<") && upper.ends_with(">")) {
+          element_type = type_name.substr(6, type_name.size() - 7);
+        }
+        // Length-parameterized element types (STRING(N)/BYTES(N)) bound each
+        // string element.
+        size_t length_limit = 0;
+        std::string length_base;
+        {
+          const std::string upper_element = ToUpper(element_type);
+          const size_t elem_paren = upper_element.find('(');
+          if (elem_paren != std::string::npos) {
+            length_base = upper_element.substr(0, elem_paren);
+            if (length_base == "STRING" || length_base == "BYTES") {
+              try {
+                length_limit = static_cast<size_t>(std::stoll(
+                    element_type.substr(elem_paren + 1)));
+              } catch (const std::exception&) {
+                length_limit = 0;
+              }
+            } else {
+              length_base.clear();
+            }
+          }
+        }
+        std::vector<Value> elements;
+        bool ok = true;
+        for (const Value& element : val.ArrayElements()) {
+          if (element.IsNull()) {
+            elements.push_back(Value());
+            continue;
+          }
+          if (length_limit > 0 && element.type == ValueType::kVarChar &&
+              element.value.varchar_value.size() > length_limit) {
+            if (!safe) {
+              throw std::runtime_error(
+                  length_base + "(" + std::to_string(length_limit) +
+                  ") has maximum length " + std::to_string(length_limit) +
+                  " but got a value with length " +
+                  std::to_string(element.value.varchar_value.size()));
+            }
+            ok = false;
+            break;
+          }
+          try {
+            elements.push_back(CastValue(element, element_type,
+                                         ParseType(element_type).first, safe));
+          } catch (const std::exception&) {
+            ok = false;
+            break;
+          }
+        }
+        if (!ok) { break; }
+        return Value::Array(std::move(elements), ToUpper(element_type));
       }
       default:
         break;

@@ -164,7 +164,10 @@ const std::string& Value::ArrayElementSqlType() const {
 }
 
 Value::Value(const Value& o)
-    : value(o.value), type(o.type), array_(o.array_) {
+    : value(o.value),
+      type(o.type),
+      array_(o.array_),
+      collation_(o.collation_) {
   if (type == ValueType::kVarChar) {
     owned_data.assign(o.value.varchar_value);
     value.varchar_value = owned_data;
@@ -175,7 +178,8 @@ Value::Value(Value&& o) noexcept
     : value(o.value),
       type(o.type),
       owned_data(std::move(o.owned_data)),
-      array_(std::move(o.array_)) {
+      array_(std::move(o.array_)),
+      collation_(o.collation_) {
   if (type == ValueType::kVarChar) { value.varchar_value = owned_data; }
   o.type = ValueType::kNull;
 }
@@ -186,6 +190,7 @@ Value& Value::operator=(const Value& rhs) {
   value = rhs.value;
   owned_data.clear();
   array_ = rhs.array_;
+  collation_ = rhs.collation_;
   if (type == ValueType::kVarChar) {
     owned_data.assign(rhs.value.varchar_value);
     value.varchar_value = owned_data;
@@ -199,6 +204,7 @@ Value& Value::operator=(Value&& o) noexcept {
   array_ = std::move(o.array_);
   type = o.type;
   value = o.value;
+  collation_ = o.collation_;
   if (type == ValueType::kVarChar) { value.varchar_value = owned_data; }
   o.type = ValueType::kNull;
   return *this;
