@@ -13,3 +13,6 @@ compile_commands.json
 .cache/
 repro-drs-*/
 ironlamb-compliance-*
+
+googlesql_compliance-*
+ironlamb-compliance-*
