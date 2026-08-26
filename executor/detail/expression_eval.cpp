@@ -917,11 +917,19 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
         const ColumnName base(qualifier, segments[split]);
         const int offset = FindColumn(*current->schema, base);
         if (offset >= 0) {
-          return ResolveFieldPath(
-              (*current->row)[static_cast<size_t>(offset)],
-              std::vector<std::string>(segments.begin() +
-                                           static_cast<ptrdiff_t>(split + 1),
-                                       segments.end()));
+          const Value& base_value =
+              (*current->row)[static_cast<size_t>(offset)];
+          // Only textual STRUCT/PROTO values carry traversable fields; a
+          // scalar match here came from a qualifier/alias fallback, so keep
+          // searching other scopes instead of failing the whole lookup.
+          if (base_value.type == ValueType::kVarChar ||
+              split + 1 == segments.size()) {
+            return ResolveFieldPath(
+                base_value,
+                std::vector<std::string>(segments.begin() +
+                                             static_cast<ptrdiff_t>(split + 1),
+                                         segments.end()));
+          }
         }
       }
     }
@@ -4197,6 +4205,27 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return elements[static_cast<size_t>(index)];
   }
+  if (name == "__bit_and" || name == "__bit_or" || name == "__bit_xor" ||
+      name == "__shift_left" || name == "__shift_right") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error(name + " requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) {
+      return {};
+    }
+    const int64_t lhs = arguments[0].value.int_value;
+    const int64_t rhs = arguments[1].value.int_value;
+    if (name == "__bit_and") { return Value(lhs & rhs); }
+    if (name == "__bit_or") { return Value(lhs | rhs); }
+    if (name == "__bit_xor") { return Value(lhs ^ rhs); }
+    if (rhs < 0 || rhs >= 64) {
+      throw std::out_of_range("shift amount out of range");
+    }
+    const uint64_t ulhs = static_cast<uint64_t>(lhs);
+    const uint64_t shifted =
+        name == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
+    return Value(static_cast<int64_t>(shifted));
+  }
   if (name == "__proto_new") {
     // NEW ProtoType(v1 AS f1, ...) / SELECT AS ProtoType: argument layout is
     // (type_name, value1, field1, value2, field2, ...).  Builds the proto
@@ -4306,29 +4335,39 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     std::string object = raw_str(arguments[0]);
     const std::string field_name = raw_str(arguments[1]);
-    Value proto_value;
-    if (TryProtoTextGetField(object, field_name, &proto_value)) {
-      return proto_value;
-    }
-    if (object.size() < 2 || object.front() != '{' ||
-        object.back() != '}') {
-      return {};
-    }
-    const auto members =
-        SplitJsonObjectMembers(object.substr(1, object.size() - 2));
-    for (const auto& [key, text] : members) {
-      if (key.size() == field_name.size() &&
-          std::equal(key.begin(), key.end(), field_name.begin(),
-                     [](char lhs, char rhs) {
-                       return std::tolower(static_cast<unsigned char>(lhs)) ==
-                              std::tolower(static_cast<unsigned char>(rhs));
-                     })) {
+    if (object.size() >= 2 && object.front() == '{' &&
+        object.back() == '}') {
+      const auto members =
+          SplitJsonObjectMembers(object.substr(1, object.size() - 2));
+      for (const auto& [key, text] : members) {
+        if (key.size() == field_name.size() &&
+            std::equal(key.begin(), key.end(), field_name.begin(),
+                       [](char lhs, char rhs) {
+                         return std::tolower(static_cast<unsigned char>(lhs)) ==
+                                std::tolower(static_cast<unsigned char>(rhs));
+                       })) {
+          Value parsed;
+          if (!JsonTextToValue(text, &parsed)) {
+            return {};
+          }
+          return parsed;
+        }
+      }
+      // Anonymous struct members (`STRUCT(2)` stores {"f1":2}) are still
+      // addressable by any field reference when unambiguous: a single-member
+      // object exposes its only value positionally.
+      if (members.size() == 1) {
         Value parsed;
-        if (!JsonTextToValue(text, &parsed)) {
+        if (!JsonTextToValue(members.front().second, &parsed)) {
           return {};
         }
         return parsed;
       }
+    }
+    // Proto text-format cells (`value: 1`) carry the same field semantics.
+    Value proto_field;
+    if (ProtoTextExtractField(object, field_name, &proto_field)) {
+      return proto_field;
     }
     return {};
   }
@@ -8106,6 +8145,84 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(digest::ToHex(raw_str(arguments[0])));
   }
 
+  if (name == "to_base64") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("TO_BASE64 requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    static const char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const std::string input = raw_str(arguments[0]);
+    std::string out;
+    out.reserve((input.size() + 2) / 3 * 4);
+    size_t i = 0;
+    while (i + 3 <= input.size()) {
+      const uint32_t triple = (static_cast<unsigned char>(input[i]) << 16) |
+                              (static_cast<unsigned char>(input[i + 1]) << 8) |
+                              static_cast<unsigned char>(input[i + 2]);
+      out.push_back(kAlphabet[(triple >> 18) & 0x3F]);
+      out.push_back(kAlphabet[(triple >> 12) & 0x3F]);
+      out.push_back(kAlphabet[(triple >> 6) & 0x3F]);
+      out.push_back(kAlphabet[triple & 0x3F]);
+      i += 3;
+    }
+    const size_t remainder = input.size() - i;
+    if (remainder == 1) {
+      const uint32_t byte = static_cast<unsigned char>(input[i]);
+      out.push_back(kAlphabet[(byte >> 2) & 0x3F]);
+      out.push_back(kAlphabet[(byte & 0x03) << 4]);
+      out += "==";
+    } else if (remainder == 2) {
+      const uint32_t pair =
+          (static_cast<unsigned char>(input[i]) << 8) |
+          static_cast<unsigned char>(input[i + 1]);
+      out.push_back(kAlphabet[(pair >> 10) & 0x3F]);
+      out.push_back(kAlphabet[(pair >> 4) & 0x3F]);
+      out.push_back(kAlphabet[(pair & 0x0F) << 2]);
+      out.push_back('=');
+    }
+    return Value(std::move(out));
+  }
+
+  if (name == "from_base64") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("FROM_BASE64 requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    const std::string input = raw_str(arguments[0]);
+    auto value_of = [](char c) -> int {
+      if (c >= 'A' && c <= 'Z') { return c - 'A'; }
+      if (c >= 'a' && c <= 'z') { return c - 'a' + 26; }
+      if (c >= '0' && c <= '9') { return c - '0' + 52; }
+      if (c == '+') { return 62; }
+      if (c == '/') { return 63; }
+      return -1;
+    };
+    std::string out;
+    out.reserve(input.size() / 4 * 3);
+    uint32_t buffer = 0;
+    int bits = 0;
+    for (const char c : input) {
+      if (std::isspace(static_cast<unsigned char>(c)) != 0) { continue; }
+      if (c == '=') { break; }
+      const int decoded = value_of(c);
+      if (decoded < 0) {
+        throw std::runtime_error("FROM_BASE64: invalid character in input");
+      }
+      buffer = (buffer << 6) | static_cast<uint32_t>(decoded);
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out.push_back(static_cast<char>((buffer >> bits) & 0xFF));
+      }
+    }
+    return Value(std::move(out));
+  }
+
   if (name == "from_hex") {
     if (arguments.size() != 1) {
       throw std::runtime_error("FROM_HEX requires 1 argument");
@@ -8542,6 +8659,21 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           c = static_cast<char>(std::tolower(c));
         }
         step_days = unit == "day" || unit == "days" ? interval.Amount() : 0;
+      } else if (arguments[2].type == ValueType::kVarChar) {
+        // Dynamic steps arrive as make_interval(...) results encoded
+        // "Y-M D H:M:S"; only whole-day counts are supported here.
+        long long years = 0, months = 0, days = 0, hours = 0, mins = 0,
+                  secs = 0;
+        const std::string encoded = raw_str(arguments[2]);
+        if (sscanf(encoded.c_str(), "%lld-%lld %lld %lld:%lld:%lld", &years,
+                   &months, &days, &hours, &mins, &secs) >= 3 &&
+            years == 0 && months == 0 && hours == 0 && mins == 0 &&
+            secs == 0 && days != 0) {
+          step_days = static_cast<int64_t>(days);
+        } else {
+          throw std::runtime_error(
+              "GENERATE_DATE_ARRAY requires an INTERVAL step");
+        }
       } else {
         throw std::runtime_error(
             "GENERATE_DATE_ARRAY requires an INTERVAL step");

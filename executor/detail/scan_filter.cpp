@@ -27,6 +27,7 @@
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "query/statement.hpp"
 #include "table/full_scan_iterator.hpp"
@@ -441,6 +442,12 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
 }
 Relation UnnestValueToRelation(const SelectSource& source,
                                const Value& array_val) {
+  auto trim_part = [](std::string_view text) {
+    size_t begin = text.find_first_not_of(" \t");
+    if (begin == std::string_view::npos) { return std::string(); }
+    size_t end = text.find_last_not_of(" \t");
+    return std::string(text.substr(begin, end - begin + 1));
+  };
   Relation result;
   std::string col_name = source.alias.empty() ? "unnest" : source.alias;
   ValueType elem_type = ValueType::kNull;
@@ -495,13 +502,177 @@ Relation UnnestValueToRelation(const SelectSource& source,
     }
     return result;
   }
-  // Struct elements stay in their single encoded (JSON) column instead of
-  // being flattened into per-field columns: UNNEST must yield one row per
-  // element where a NULL element surfaces as a NULL value, and field access
-  // (`elem.field`) resolves through Lookup's dotted-path traversal of the
-  // encoding.  A flattened layout would also derive its width from element
-  // values, which can differ per prefix row of a lateral expansion and
-  // break the rows-must-match-schema invariant downstream.
+  // GoogleSQL UNNEST over an ARRAY<STRUCT> flattens one structural level:
+  // the struct's fields become top-level columns (`FROM UNNEST([STRUCT(1 AS
+  // y, 2 AS x)])` exposes y and x).  Field names come from the first
+  // non-NULL element's encoded JSON keys; NULL elements and later rows with
+  // fewer members NULL-fill to the initialized width.
+  const bool declared_struct = elem_sql_type.starts_with("STRUCT");
+  bool object_shaped = false;
+  if (!declared_struct && (elem_sql_type.empty() || elem_sql_type == "INT64")) {
+    for (const Value& element : elements) {
+      if (element.IsNull()) { continue; }
+      if (element.type == ValueType::kVarChar) {
+        const std::string_view text(element.value.varchar_value);
+        object_shaped = text.size() >= 2 && text.front() == '{' &&
+                        text.back() == '}';
+      }
+      break;
+    }
+  }
+  if (declared_struct || object_shaped) {
+    // An explicitly aliased UNNEST (`t.struct_arrcol elem`) keeps the whole
+    // element reachable under its alias (a NULL element stays NULL); the
+    // flattened member columns sit beside it.  An unaliased UNNEST exposes
+    // only the member columns.
+    const bool keep_element_column =
+        !source.alias.empty() && source.alias != "unnest";
+    std::vector<std::pair<std::string, ValueType>> fields;
+    // Declared element types (`ARRAY<STRUCT<start_day DATE, ...>>`) name
+    // fields even when the encoded members use anonymous fN keys, and let
+    // textual members coerce back to their declared runtime type.
+    std::vector<std::pair<std::string, std::string>> declared_fields;
+    if (declared_struct && elem_sql_type.back() == '>' &&
+        elem_sql_type.find('<') != std::string::npos) {
+      const size_t open = elem_sql_type.find('<');
+      std::vector<std::string> parts;
+      int bracket = 0;
+      std::string current;
+      for (size_t i = open + 1; i < elem_sql_type.size(); ++i) {
+        const char c = elem_sql_type[i];
+        if (c == '<' || c == '(') { ++bracket; }
+        if (c == '>' || c == ')') { --bracket; }
+        if (c == ',' && bracket == 0) {
+          parts.push_back(current);
+          current.clear();
+          continue;
+        }
+        current.push_back(c);
+      }
+      if (!current.empty()) { parts.push_back(current); }
+      for (std::string& part : parts) {
+        const std::string trimmed = trim_part(part);
+        if (trimmed.empty()) { continue; }
+        const size_t space = trimmed.find_first_of(" \t");
+        if (space == std::string::npos) {
+          declared_fields.emplace_back(std::string(), trimmed);
+        } else {
+          declared_fields.emplace_back(trimmed.substr(0, space),
+                                       trim_part(trimmed.substr(space + 1)));
+        }
+      }
+    }
+    struct ParsedElement {
+      std::vector<Value> values;
+      bool null_row{false};
+    };
+    std::vector<ParsedElement> parsed_rows(elements.size());
+    for (size_t row_idx = 0; row_idx < elements.size(); ++row_idx) {
+      const Value& element = elements[row_idx];
+      if (element.IsNull() || element.type != ValueType::kVarChar) {
+        parsed_rows[row_idx].null_row = true;
+        continue;
+      }
+      const std::string text(element.value.varchar_value);
+      if (text.size() < 2 || text.front() != '{' || text.back() != '}') {
+        parsed_rows[row_idx].null_row = true;
+        continue;
+      }
+      const auto members =
+          SplitJsonObjectMembers(text.substr(1, text.size() - 2));
+      for (const auto& [key, member_text] : members) {
+        Value parsed;
+        if (!JsonTextToValue(member_text, &parsed)) {
+          // Non-JSON scalars (e.g. `inf`, `nan` doubles) fall back to
+          // numeric then textual interpretation.
+          char* parse_end = nullptr;
+          const double number = std::strtod(member_text.c_str(), &parse_end);
+          if (parse_end != member_text.c_str() && *parse_end == '\0') {
+            parsed = Value(number);
+          } else {
+            parsed = Value(std::string(member_text));
+          }
+        }
+        // Coerce textual members back to declared runtime types: struct
+        // serialization stores DATE/TIMESTAMP cells as plain text.
+        if (parsed.type == ValueType::kVarChar &&
+            declared_fields.size() == members.size()) {
+          const size_t member_index = parsed_rows[row_idx].values.size();
+          const std::string& declared_type =
+              declared_fields[member_index].second;
+          std::string text(parsed.value.varchar_value);
+          if ((declared_type == "DATE" || declared_type == "date")) {
+            int y = 0, m = 0, d = 0;
+            if (sscanf(text.c_str(), "%d-%d-%d", &y, &m, &d) == 3) {
+              parsed = Value::Date(text);
+            }
+          } else if (declared_type == "TIMESTAMP" ||
+                     declared_type == "timestamp" ||
+                     declared_type == "DATETIME") {
+            int y = 0, mo = 0, d = 0;
+            if (sscanf(text.c_str(), "%d-%d-%d", &y, &mo, &d) == 3) {
+              parsed = Value(std::move(text));  // keep canonical text form
+            }
+          }
+        }
+        parsed_rows[row_idx].values.push_back(std::move(parsed));
+      }
+      if (fields.empty()) {
+        for (const auto& [key, member_text] : members) {
+          fields.emplace_back(key, ValueType::kNull);
+        }
+        // Prefer declared field names when the arity matches: anonymous
+        // tuple literals encode members as f1..fN under a declared type.
+        if (declared_fields.size() == fields.size()) {
+          for (size_t i = 0; i < declared_fields.size(); ++i) {
+            if (!declared_fields[i].first.empty()) {
+              fields[i].first = declared_fields[i].first;
+            }
+          }
+        }
+        // Fix up column types from the representative row's values.
+        for (size_t i = 0; i < parsed_rows[row_idx].values.size() &&
+                           i < fields.size();
+             ++i) {
+          fields[i].second = parsed_rows[row_idx].values[i].IsNull()
+                                 ? ValueType::kNull
+                                 : parsed_rows[row_idx].values[i].type;
+        }
+      }
+    }
+    std::vector<Column> unnest_cols;
+    for (const auto& [field_name, field_type] : fields) {
+      unnest_cols.emplace_back(field_name, field_type);
+    }
+    if (keep_element_column) {
+      unnest_cols.emplace_back(col_name, ValueType::kVarChar);
+    }
+    if (!source.offset_alias.empty()) {
+      unnest_cols.emplace_back(source.offset_alias, ValueType::kInt64);
+    }
+    result.schema = Schema("", std::move(unnest_cols));
+    for (size_t row_idx = 0; row_idx < parsed_rows.size(); ++row_idx) {
+      std::vector<Value> row_vals(fields.size(), Value());
+      if (!parsed_rows[row_idx].null_row) {
+        for (size_t i = 0; i < fields.size() &&
+                           i < parsed_rows[row_idx].values.size();
+             ++i) {
+          row_vals[i] = parsed_rows[row_idx].values[i];
+        }
+      }
+      if (keep_element_column) {
+        row_vals.push_back(elements[row_idx]);
+      }
+      if (!source.offset_alias.empty()) {
+        row_vals.push_back(Value(static_cast<int64_t>(row_idx)));
+      }
+      result.AddRow(Row(std::move(row_vals)));
+    }
+    return result;
+  }
+  // Scalar / untyped elements stay in their single encoded column instead:
+  // a NULL element surfaces as a NULL value, and field access resolves via
+  // Lookup's dotted-path traversal of the encoding.
   std::vector<Column> unnest_cols;
   unnest_cols.emplace_back(col_name, elem_type);
   if (!source.offset_alias.empty()) {

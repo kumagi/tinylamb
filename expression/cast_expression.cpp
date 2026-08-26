@@ -294,6 +294,168 @@ std::string ToLower(std::string str) {
   return str;
 }
 
+// Splits the top-level comma-separated members of a STRUCT's textual form
+// ({"k":v,...} / {"f1":v,...}) respecting nesting and quotes; returns raw
+// "key" / raw-value text pairs.
+std::string StructTrim(std::string_view text) {
+  size_t begin = 0;
+  while (begin < text.size() &&
+         std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
+    ++begin;
+  }
+  size_t end = text.size();
+  while (end > begin &&
+         std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
+    --end;
+  }
+  return std::string(text.substr(begin, end - begin));
+}
+
+std::vector<std::pair<std::string, std::string>> SplitStructMembers(
+    const std::string& body) {
+  std::vector<std::pair<std::string, std::string>> members;
+  int depth = 0;
+  bool in_string = false;
+  size_t segment_begin = 0;
+  for (size_t i = 0; i <= body.size(); ++i) {
+    const bool end = i == body.size();
+    const char c = end ? ',' : body[i];
+    if (!end) {
+      if (in_string) {
+        if (c == '\\' && i + 1 < body.size()) { ++i; } else if (c == '"') {
+          in_string = false;
+        }
+        continue;
+      }
+      if (c == '"') {
+        in_string = true;
+      } else if (c == '{' || c == '[' || c == '(') {
+        ++depth;
+      } else if (c == '}' || c == ']' || c == ')') {
+        --depth;
+      } else if (c == ',' && depth == 0) {
+      } else {
+        continue;
+      }
+    }
+    if (!end && c != ',') { continue; }
+    const std::string member =
+        body.substr(segment_begin, i - segment_begin);
+    segment_begin = i + 1;
+    const size_t colon = member.find(':');
+    if (colon == std::string::npos) { continue; }
+    std::string key = StructTrim(member.substr(0, colon));
+    if (key.size() >= 2 && key.front() == '"' && key.back() == '"') {
+      key = key.substr(1, key.size() - 2);
+    }
+    members.emplace_back(std::move(key),
+                         StructTrim(member.substr(colon + 1)));
+    if (end) { break; }
+    continue;
+  }
+  return members;
+}
+
+// Decodes a struct-member scalar: quoted strings are unescaped, everything
+// else keeps its raw text (nested objects/arrays stay textual).
+std::string DecodeStructMemberText(const std::string& raw) {
+  if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
+    std::string out;
+    for (size_t i = 1; i + 1 < raw.size(); ++i) {
+      if (raw[i] == '\\' && i + 2 < raw.size()) {
+        const char next = raw[++i];
+        switch (next) {
+          case 'n': out.push_back('\n'); break;
+          case 't': out.push_back('\t'); break;
+          case 'r': out.push_back('\r'); break;
+          default: out.push_back(next); break;
+        }
+      } else {
+        out.push_back(raw[i]);
+      }
+    }
+    return out;
+  }
+  return raw;
+}
+
+std::string EncodeStructMemberText(const Value& value) {
+  if (value.IsNull()) { return "null"; }
+  if (value.type == ValueType::kVarChar) {
+    std::string out = "\"";
+    for (const char c : value.value.varchar_value) {
+      if (c == '"' || c == '\\') { out.push_back('\\'); }
+      out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+  }
+  if (value.type == ValueType::kDouble) {
+    if (std::isnan(value.value.double_value)) { return "\"NaN\""; }
+    if (std::isinf(value.value.double_value)) {
+      return value.value.double_value > 0 ? "\"Infinity\"" : "\"-Infinity\"";
+    }
+    char buffer[64];
+    const auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer),
+                                         value.value.double_value);
+    (void)ec;
+    return std::string(buffer, ptr - buffer);
+  }
+  if (value.type == ValueType::kInt64) {
+    return std::to_string(value.value.int_value);
+  }
+  if (value.type == ValueType::kDate) {
+    return "\"" + FormatDateDays(value.DateDays()) + "\"";
+  }
+  return "\"" + value.AsString() + "\"";
+}
+
+// Parses the field list of a STRUCT<...> target type into
+// (field-name-or-empty, type-text) pairs, honoring nested brackets.
+std::vector<std::pair<std::string, std::string>> ParseStructTypeFields(
+    const std::string& upper_type) {
+  const size_t open = upper_type.find('<');
+  if (open == std::string::npos) { return {}; }
+  int depth = 0;
+  size_t close = std::string::npos;
+  for (size_t i = open; i < upper_type.size(); ++i) {
+    if (upper_type[i] == '<') { ++depth; } else if (upper_type[i] == '>') {
+      if (--depth == 0) {
+        close = i;
+        break;
+      }
+    }
+  }
+  if (close == std::string::npos) { return {}; }
+  const std::string inner =
+      StructTrim(upper_type.substr(open + 1, close - open - 1));
+  std::vector<std::string> parts;
+  int bracket = 0;
+  std::string current;
+  for (const char c : inner) {
+    if (c == '<' || c == '(') { ++bracket; }
+    if (c == '>' || c == ')') { --bracket; }
+    if (c == ',' && bracket == 0) {
+      parts.push_back(StructTrim(current));
+      current.clear();
+    } else {
+      current.push_back(c);
+    }
+  }
+  if (!StructTrim(current).empty()) { parts.push_back(StructTrim(current)); }
+  std::vector<std::pair<std::string, std::string>> fields;
+  for (const std::string& part : parts) {
+    // "name TYPE" names the field; a lone token is an anonymous field type.
+    const size_t space = part.find_first_of(" \t");
+    if (space == std::string::npos) {
+      fields.emplace_back(std::string(), part);
+      continue;
+    }
+    fields.emplace_back(part.substr(0, space), part.substr(space + 1));
+  }
+  return fields;
+}
+
 std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
   std::string upper = ToUpper(type_name);
   // Strip type parameters (STRING(2) -> STRING) for base-type resolution.
@@ -314,8 +476,15 @@ std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
   if (upper == "STRING" || upper == "VARCHAR" || upper == "TEXT" ||
       upper == "BYTES" || upper == "JSON" || upper == "NUMERIC" ||
       upper == "BIGNUMERIC" || upper == "DECIMAL" || upper == "DATETIME" ||
-      upper == "TIMESTAMP" || upper == "TIME" || upper == "INTERVAL" || upper.find("PB") != std::string::npos ||
+      upper == "TIMESTAMP" || upper == "TIME" || upper == "INTERVAL" ||
+      upper.find("PB") != std::string::npos ||
       upper.find("PROTO") != std::string::npos) {
+    return {ValueType::kVarChar, TypeTag::kVarChar};
+  }
+  // Dotted user-defined type paths (`googlesql_test.KitchenSinkPB`) are
+  // protobuf messages: the engine carries them as text-format strings.  Enum
+  // paths keep their member-name text form through the same channel.
+  if (upper.find('.') != std::string::npos) {
     return {ValueType::kVarChar, TypeTag::kVarChar};
   }
 
@@ -324,6 +493,10 @@ std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
   }
   if (upper == "DATE") {
     return {ValueType::kDate, TypeTag::kDate};
+  }
+  if (upper == "UUID") {
+    // UUID values are stored as their canonical lowercase text form.
+    return {ValueType::kVarChar, TypeTag::kVarChar};
   }
   if (upper.starts_with("ARRAY<")) {
     return {ValueType::kArray, TypeTag::kArray};
@@ -381,6 +554,113 @@ Value CastValue(const Value& val, const std::string& type_name,
   // must match a member name exactly. Unknown enum types keep the legacy
   // heuristic below.
   const std::string enum_short_name(ShortTypeName(type_name));
+  // UUID targets canonicalize any 32-hex-digit input (with or without
+  // dashes) into the lowercase 8-4-4-4-12 text form.
+  if (upper == "UUID") {
+    std::string hex;
+    if (val.type == ValueType::kVarChar) {
+      hex.assign(val.value.varchar_value);
+    } else {
+      hex = val.AsString();
+    }
+    std::string compact;
+    for (const char c : hex) {
+      if (c == '-') { continue; }
+      if (std::isxdigit(static_cast<unsigned char>(c)) != 0) {
+        compact.push_back(
+            static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+      } else {
+        compact.clear();
+        break;
+      }
+    }
+    if (compact.size() != 32) {
+      if (safe) { return Value(); }
+      throw std::runtime_error("invalid UUID string: " + hex);
+    }
+    std::string canonical;
+    for (size_t i = 0; i < compact.size(); ++i) {
+      if (i == 8 || i == 12 || i == 16 || i == 20) { canonical.push_back('-'); }
+      canonical.push_back(compact[i]);
+    }
+    return Value(std::move(canonical));
+  }
+  // STRUCT<...> targets cast struct values field-wise: source members are
+  // matched positionally, cast to each declared field type, and rebuilt
+  // under the target field names.
+  if (upper.starts_with("STRUCT") && val.type == ValueType::kVarChar) {
+    const std::string text(val.value.varchar_value);
+    if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
+      const auto fields = ParseStructTypeFields(upper);
+      const auto members =
+          SplitStructMembers(text.substr(1, text.size() - 2));
+      auto fail = [&]() -> Value {
+        if (safe) { return Value(); }
+        throw std::runtime_error("cannot cast struct to " + type_name);
+      };
+      std::string rebuilt = "{";
+      bool first = true;
+      for (size_t i = 0; i < fields.size(); ++i) {
+        const auto& [field_name, field_type] = fields[i];
+        if (!first) { rebuilt += ","; }
+        first = false;
+        const std::string key = field_name.empty()
+                                    ? "f" + std::to_string(i + 1)
+                                    : ToLower(field_name);
+        rebuilt += "\"" + key + "\":";
+        if (i >= members.size() || members[i].second == "null") {
+          rebuilt += "null";
+          continue;
+        }
+        const std::string raw_member = members[i].second;
+        std::string raw = DecodeStructMemberText(raw_member);
+        // Nested objects/arrays stay textual; only STRUCT targets recurse.
+        if ((raw.starts_with("{") && raw.ends_with("}")) ||
+            (raw_member.starts_with("[") && raw_member.ends_with("]"))) {
+          if (ToUpper(field_type).starts_with("STRUCT") &&
+              raw.starts_with("{")) {
+            Value nested = CastValue(Value(std::move(raw)), field_type,
+                                     ParseType(field_type).first, safe);
+            if (nested.IsNull()) { return fail(); }
+            rebuilt += EncodeStructMemberText(nested);
+          } else {
+            rebuilt += raw_member;
+          }
+          continue;
+        }
+        const bool quoted_input =
+            raw_member.size() >= 2 && raw_member.front() == '"';
+        Value member_value;
+        if (quoted_input) {
+          member_value = Value(std::move(raw));
+        } else if (raw.find('.') != std::string::npos ||
+                   raw.find('e') != std::string::npos ||
+                   raw.find('E') != std::string::npos ||
+                   raw == "true" || raw == "false") {
+          member_value = Value(std::strtod(raw.c_str(), nullptr));
+        } else {
+          int64_t parsed_int = 0;
+          const auto [ptr, ec] = std::from_chars(
+              raw.data(), raw.data() + raw.size(), parsed_int);
+          member_value = ec == std::errc() && ptr == raw.data() + raw.size()
+                             ? Value(parsed_int)
+                             : Value(std::string(raw));
+        }
+        try {
+          member_value = CastValue(member_value, field_type,
+                                   ParseType(field_type).first, safe);
+        } catch (const std::exception&) {
+          return fail();
+        }
+        if (member_value.IsNull()) { return fail(); }
+        rebuilt += EncodeStructMemberText(member_value);
+      }
+      rebuilt += "}";
+      return Value(std::move(rebuilt));
+    }
+  }
+  // ENUM-typed targets accept their textual member names verbatim: this
+  // engine stores enums as their member-name strings.
   if (!is_bool && upper.find("ENUM") != std::string::npos &&
       IsKnownEnum(enum_short_name)) {
     auto out_of_range = [&](const std::string& message) -> Value {
@@ -529,12 +809,35 @@ Value CastValue(const Value& val, const std::string& type_name,
 
     switch (target_type) {
       case ValueType::kInt64: {
-        if (val.type == ValueType::kInt64) {
-          // Narrowed integer targets reject values outside their width:
-          // GoogleSQL raises out_of_range instead of truncating.
-          ValidateIntWidth(upper, val.value.int_value);
-          return val;
+        // Narrow integer targets validate their declared range: the engine
+        // stores every integer as INT64 but CAST semantics still reject
+        // out-of-range values.
+        auto narrow_bounds = [](const std::string& t, int64_t* lo,
+                                uint64_t* hi) -> bool {
+          if (t == "INT8") { *lo = -128; *hi = 127; return true; }
+          if (t == "INT16") { *lo = -32768; *hi = 32767; return true; }
+          if (t == "INT32") { *lo = -2147483648LL; *hi = 2147483647LL; return true; }
+          if (t == "UINT8") { *lo = 0; *hi = 255; return true; }
+          if (t == "UINT16") { *lo = 0; *hi = 65535; return true; }
+          if (t == "UINT32") { *lo = 0; *hi = 4294967295ULL; return true; }
+          return false;
+        };
+        int64_t lo = 0;
+        uint64_t hi = 0;
+        if (narrow_bounds(upper, &lo, &hi)) {
+          const int64_t candidate =
+              val.type == ValueType::kDouble
+                  ? static_cast<int64_t>(std::round(val.value.double_value))
+                  : val.value.int_value;
+          if (candidate < lo ||
+              (candidate >= 0 && static_cast<uint64_t>(candidate) > hi)) {
+            const std::string message = ToLower(upper) + " out of range: " +
+                                        std::to_string(candidate);
+            if (safe) { return Value(); }
+            throw std::out_of_range(message);
+          }
         }
+        if (val.type == ValueType::kInt64) { return val; }
         if (val.type == ValueType::kDouble) {
           if (std::isnan(val.value.double_value) ||
               std::isinf(val.value.double_value)) {
@@ -695,7 +998,10 @@ Value CastValue(const Value& val, const std::string& type_name,
         break;
       }
       case ValueType::kVarChar: {
+        // Booleans stringify as their SQL literals, not as integers.
         std::string s = (val.type == ValueType::kDate) ? FormatDateDays(val.DateDays())
+                        : (is_bool && val.type == ValueType::kInt64)
+                            ? (val.value.int_value != 0 ? "true" : "false")
                         : (val.type == ValueType::kInt64) ? std::to_string(val.value.int_value)
                         : (val.type == ValueType::kDouble) ? ([&]() {
                             if (std::isnan(val.value.double_value)) { return std::string("nan"); }

@@ -128,6 +128,50 @@ Expression BindColumnQualifiedFieldReads(
     child = std::move(mapped);
   }
   return changed ? WithExpressionChildren(expr, std::move(children)) : expr;
+// Rewrites STRUCT/PROTO field paths (`value.empty_message`, where `value`
+// names a column rather than a FROM relation) into safe field-extraction
+// calls over the base column, so the flat-column plan executor can evaluate
+// them.  Returns nullptr when the expression is untouched.
+Expression BindFieldPaths(
+    const Expression& exp,
+    const std::unordered_map<std::string, std::string>& col_table_map,
+    const std::unordered_set<std::string>& relations) {
+  if (!exp) {
+    return nullptr;
+  }
+  if (exp->Type() == TypeTag::kColumnValue) {
+    const ColumnName& col_name = exp->AsColumnValue().GetColumnName();
+    if (col_name.schema.empty() || col_name.name.empty() ||
+        col_name.name == "*" || relations.contains(col_name.schema)) {
+      return nullptr;
+    }
+    const auto base_it = col_table_map.find(ToLowerCopy(col_name.schema));
+    if (base_it == col_table_map.end()) {
+      return nullptr;
+    }
+    Expression current =
+        ColumnValueExp(ColumnName(base_it->second, col_name.schema));
+    std::string remaining = col_name.name;
+    while (!remaining.empty()) {
+      const size_t dot = remaining.find('.');
+      std::string field = dot == std::string::npos ? remaining
+                                                   : remaining.substr(0, dot);
+      current = FunctionCallExp(
+          "__get_field_safe",
+          {std::move(current), ConstantValueExp(Value(std::move(field)))});
+      if (dot == std::string::npos) { break; }
+      remaining = remaining.substr(dot + 1);
+    }
+    return current;
+  }
+  std::vector<Expression> children = ExpressionChildren(exp);
+  bool changed = false;
+  for (Expression& child : children) {
+    Expression mapped = BindFieldPaths(child, col_table_map, relations);
+    changed |= static_cast<bool>(mapped);
+    if (mapped) { child = std::move(mapped); }
+  }
+  return changed ? WithExpressionChildren(exp, std::move(children)) : nullptr;
 }
 
 Status
@@ -319,6 +363,18 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
         ambiguous_colum_name.emplace(lower_name);
       }
     }
+  }
+
+  // STRUCT/PROTO field paths become explicit extraction calls before
+  // resolution so only plain column references remain to bind.
+  for (auto& item : select_) {
+    Expression mapped =
+        BindFieldPaths(item.expression, col_table_map, relations);
+    if (mapped) { item.expression = std::move(mapped); }
+  }
+  {
+    Expression mapped = BindFieldPaths(where_, col_table_map, relations);
+    if (mapped) { where_ = std::move(mapped); }
   }
 
   // Rewrite SELECT clause.

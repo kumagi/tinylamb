@@ -256,8 +256,8 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     if (rhs == 0.0) {
       throw std::runtime_error("division by zero");
     }
-    // IEEE semantics: overflow and NaN results (e.g. inf/x, nan/x) flow
-    // through; only an exact zero divisor raises.
+    // FLOAT64 division follows IEEE-754: overflow yields ±infinity, never
+    // an error (the reference engine only rejects division by zero).
     return Value(lhs / rhs);
   }
   if (numeric && left.type != right.type) {
@@ -391,6 +391,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         if (right.value.double_value == 0.0) {
           throw std::runtime_error("division by zero");
         }
+        // IEEE-754: overflow yields ±infinity, never an error.
         return Value(left.value.double_value / right.value.double_value);
       }
       return left / right;

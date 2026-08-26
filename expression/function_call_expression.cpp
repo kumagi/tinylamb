@@ -280,6 +280,158 @@ Value AddOrSubInterval(const std::string& func_name, const Value& date,
                                        : Value(FormatDateDays(result));
 }
 
+// Decodes one proto-text scalar token (`5`, `1.5`, `true`, `"str"`).
+Value ProtoTextScalar(std::string_view raw) {
+  while (!raw.empty() &&
+         std::isspace(static_cast<unsigned char>(raw.front()))) {
+    raw.remove_prefix(1);
+  }
+  while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.back()))) {
+    raw.remove_suffix(1);
+  }
+  if (raw.empty() || raw == "null") { return {}; }
+  if (raw == "true") { return Value(int64_t{1}); }
+  if (raw == "false") { return Value(int64_t{0}); }
+  if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
+    return Value(std::string(raw.substr(1, raw.size() - 2)));
+  }
+  std::string token(raw);
+  try {
+    return Value(static_cast<int64_t>(std::stoll(token)));
+  } catch (...) {
+  }
+  try {
+    return Value(std::stod(token));
+  } catch (...) {
+  }
+  return Value(std::move(token));
+}
+
+// Minimal proto text-format field extraction: repeated `field: value`
+// entries and `field { ... }` message blocks; multiple matches become an
+// array.  Mirrors the interpreter-side extractor for plan-executor use.
+bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
+                               Value* out) {
+  // Proto presence fields (`has_xxx`) report whether `xxx` occurs.
+  if (key.size() > 4 && key.substr(0, 4) == "has_") {
+    Value probe;
+    if (!ProtoTextExtractFieldShim(text, key.substr(4), &probe)) {
+      *out = Value(int64_t{0});
+      return true;
+    }
+    *out = Value(int64_t{1});
+    return true;
+  }
+  std::vector<Value> matches;
+  size_t i = 0;
+  while (i < text.size()) {
+    while (i < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
+    }
+    if (i >= text.size()) { break; }
+    if (text[i] == '#') {
+      // Comment token: skip through end of line.
+      while (i < text.size() && text[i] != '\n') { ++i; }
+      continue;
+    }
+    if (text[i] == '{' || text[i] == '}') {
+      ++i;
+      continue;
+    }
+    const size_t name_start = i;
+    while (i < text.size() && text[i] != ':' && text[i] != '{' &&
+           !std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
+    }
+    const std::string_view field_name = text.substr(name_start, i - name_start);
+    while (i < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
+    }
+    if (i < text.size() && text[i] == '{') {
+      int nest = 1;
+      bool str = false;
+      size_t j = i + 1;
+      for (; j < text.size(); ++j) {
+        const char c = text[j];
+        if (str) {
+          if (c == '\\' && j + 1 < text.size()) { ++j; } else if (c == '"') {
+            str = false;
+          }
+          continue;
+        }
+        if (c == '"') {
+          str = true;
+        } else if (c == '{') {
+          ++nest;
+        } else if (c == '}') {
+          if (--nest == 0) { break; }
+        }
+      }
+      std::string_view body =
+          text.substr(i + 1, j > i + 1 ? j - i - 1 : 0);
+      while (!body.empty() &&
+             std::isspace(static_cast<unsigned char>(body.front()))) {
+        body.remove_prefix(1);
+      }
+      while (!body.empty() &&
+             std::isspace(static_cast<unsigned char>(body.back()))) {
+        body.remove_suffix(1);
+      }
+      i = j < text.size() ? j + 1 : text.size();
+      if (field_name.size() == key.size() &&
+          std::equal(key.begin(), key.end(), field_name.begin(),
+                     [](char a, char b) {
+                       return std::tolower(static_cast<unsigned char>(a)) ==
+                              std::tolower(static_cast<unsigned char>(b));
+                     })) {
+        matches.emplace_back(std::string(body));
+      }
+      continue;
+    }
+    if (i >= text.size() || text[i] != ':') { break; }
+    ++i;
+    while (i < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
+    }
+    const size_t value_begin = i;
+    size_t value_end;
+    if (i < text.size() && text[i] == '"') {
+      ++i;
+      while (i < text.size() && text[i] != '"') {
+        if (text[i] == '\\' && i + 1 < text.size()) { ++i; }
+        ++i;
+      }
+      value_end = std::min(text.size(), i + 1);
+      i = value_end;
+    } else {
+      while (i < text.size() &&
+             !std::isspace(static_cast<unsigned char>(text[i]))) {
+        ++i;
+      }
+      value_end = i;
+    }
+    if (field_name.size() == key.size() &&
+        std::equal(key.begin(), key.end(), field_name.begin(),
+                   [](char a, char b) {
+                     return std::tolower(static_cast<unsigned char>(a)) ==
+                            std::tolower(static_cast<unsigned char>(b));
+                   })) {
+      matches.push_back(ProtoTextScalar(
+          text.substr(value_begin, value_end - value_begin)));
+    }
+  }
+  if (matches.empty()) { return false; }
+  if (matches.size() == 1) {
+    *out = std::move(matches[0]);
+  } else {
+    *out = Value::Array(std::move(matches), "INT64");
+  }
+  return true;
+}
+
 Value ExecuteFunction(const std::string& name,
                       const std::vector<Value>& values) {
   auto raw_str = [](const Value& val) -> std::string {
@@ -369,20 +521,31 @@ Value ExecuteFunction(const std::string& name,
     if (values[0].IsNull()) { return {}; }
     const std::string object = raw_str(values[0]);
     const std::string field = raw_str(values[1]);
-    Value proto_value;
-    if (TryProtoTextGetField(object, field, &proto_value)) {
-      return proto_value;
-    }
-    if (object.size() < 2 || object.front() != '{' || object.back() != '}') {
-      return {};
-    }
-    for (const auto& [key, text] :
-         SplitJsonObjectMembers(object.substr(1, object.size() - 2))) {
-      if (IdentifierEquals(key, field)) {
+    if (object.size() >= 2 && object.front() == '{' &&
+        object.back() == '}') {
+      const auto members =
+          SplitJsonObjectMembers(object.substr(1, object.size() - 2));
+      for (const auto& [key, text] : members) {
+        if (IdentifierEquals(key, field)) {
+          Value parsed;
+          if (!JsonTextToValue(text, &parsed)) { return {}; }
+          return parsed;
+        }
+      }
+      // Anonymous struct members (`STRUCT(2)` stores {"f1":2}) are still
+      // addressable by any field reference when unambiguous: a single-member
+      // object exposes its only value positionally.
+      if (members.size() == 1) {
         Value parsed;
-        if (!JsonTextToValue(text, &parsed)) { return {}; }
+        if (!JsonTextToValue(members.front().second, &parsed)) { return {}; }
         return parsed;
       }
+    }
+    // Proto text-format cells (`i1: 5 i2: 5`) carry the same field
+    // semantics: extract the first (or repeated) occurrence of `field`.
+    Value proto_field;
+    if (ProtoTextExtractFieldShim(object, field, &proto_field)) {
+      return proto_field;
     }
     return {};
   }

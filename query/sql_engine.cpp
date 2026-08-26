@@ -42,6 +42,7 @@
 #include "executor/relational.hpp"
 #include "executor/sort.hpp"
 #include "executor/update.hpp"
+#include "type/date.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/proto_text.hpp"
@@ -831,7 +832,15 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   // disarms them on every exit (including EXPLAIN, which never sets one).
   set_plan_cache_candidate(templated.fingerprint, templated.parameters);
   PlanCacheCandidateGuard candidate_guard{this};
-  return PrepareStatement(ctx, std::move(statement));
+  // Statement execution (e.g. eager DML application) must uphold the
+  // StatusOr contract: runtime errors surface as Status values, never as
+  // escaping C++ exceptions.
+  try {
+    return PrepareStatement(ctx, std::move(statement));
+  } catch (const std::exception& error) {
+    last_error_ = error.what();
+    return Status::kUnknown;
+  }
 }
 
 namespace {
@@ -1074,129 +1083,341 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
       Row({Value("Update Rows"), Value(modified_rows)})));
 }
 
-namespace {
+// ---------------------------------------------------------------------------
+// Dotted SET-target support for STRUCT (JSON) and PROTO (text format) cells.
+// A cell parses into an ordered member list; updates replace the first
+// occurrence of a leaf in place, drop further occurrences, create missing
+// intermediate messages, and clear on NULL assignment.  NULL cells are
+// synthesized from scratch so `SET proto.f = v` materializes a message.
+// ---------------------------------------------------------------------------
 
-namespace {
+struct CellFieldEntry {
+  std::string name;
+  std::string body;  // raw serialized member text in the cell's format
+  bool is_message{false};
+};
 
-std::string EscapeStructKey(std::string_view text) {
-  std::string escaped;
-  for (const char c : text) {
-    switch (c) {
-      case '"': escaped += "\\\""; break;
-      case '\\': escaped += "\\\\"; break;
-      default: escaped.push_back(c);
+bool ParseCellMembers(const std::string& text, bool* json_format,
+                      std::vector<CellFieldEntry>* entries);
+
+// Scans proto text-format entries (`name: scalar` / `name { body }`).
+void SplitProtoTextEntries(const std::string& text,
+                           std::vector<CellFieldEntry>* entries) {
+  size_t i = 0;
+  while (i < text.size()) {
+    while (i < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
     }
-  }
-  return escaped;
-}
-
-}  // namespace
-
-// Decodes one struct-member token. Legacy constructor storage embeds nested
-// objects/arrays as *quoted* raw JSON (the writer did not escape inner
-// quotes); unwrap those so navigation sees real objects.
-Value DecodeStructMember(const std::string& text) {
-  std::string trimmed = text;
-  size_t b = trimmed.find_first_not_of(" \t\r\n");
-  if (b == std::string::npos) { return Value(); }
-  size_t e = trimmed.find_last_not_of(" \t\r\n");
-  trimmed = trimmed.substr(b, e - b + 1);
-  if (trimmed.size() >= 4 && trimmed.front() == '"' &&
-      trimmed.back() == '"') {
-    const std::string inner = trimmed.substr(1, trimmed.size() - 2);
-    if (!inner.empty() && ((inner.front() == '{' && inner.back() == '}') ||
-                           (inner.front() == '[' && inner.back() == ']'))) {
-      return Value(std::string(inner));
+    if (i >= text.size()) { break; }
+    if (text[i] == '#') {
+      // Comment token: skip through end of line.
+      while (i < text.size() && text[i] != '\n') { ++i; }
+      continue;
     }
-  }
-  Value parsed;
-  if (!JsonTextToValue(trimmed, &parsed)) {
-    parsed = Value(std::move(trimmed));
-  }
-  return parsed;
-}
-
-// Resolves `segs` member positions inside `json` by name; returns the index
-// at every level or an empty optional when the path does not exist here.
-std::optional<std::vector<int>> FindStructPathOrdinals(
-    const std::string& json, const std::vector<std::string>& segs) {
-  std::vector<int> ordinals;
-  std::string current = json;
-  for (const std::string& seg : segs) {
-    if (current.size() < 2 || current.front() != '{' ||
-        current.back() != '}') {
-      return std::nullopt;
+    if (text[i] == '{' || text[i] == '}') {
+      ++i;
+      continue;
     }
-    const auto members =
-        SplitJsonObjectMembers(current.substr(1, current.size() - 2));
-    int index = -1;
-    size_t ordinal = 0;
-    for (const auto& [key, text] : members) {
-      if (IdentifierEquals(key, seg)) {
-        index = static_cast<int>(ordinal);
-        break;
+    const size_t name_start = i;
+    while (i < text.size() && text[i] != ':' && text[i] != '{' &&
+           !std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
+    }
+    CellFieldEntry entry;
+    entry.name = text.substr(name_start, i - name_start);
+    if (entry.name.empty()) {
+      ++i;
+      continue;
+    }
+    while (i < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
+    }
+    if (i < text.size() && text[i] == '{') {
+      const size_t body_start = i + 1;
+      int nest = 1;
+      bool str = false;
+      size_t j = i + 1;
+      for (; j < text.size(); ++j) {
+        const char c = text[j];
+        if (str) {
+          if (c == '\\' && j + 1 < text.size()) { ++j; } else if (c == '"') {
+            str = false;
+          }
+          continue;
+        }
+        if (c == '"') {
+          str = true;
+        } else if (c == '{') {
+          ++nest;
+        } else if (c == '}') {
+          if (--nest == 0) { break; }
+        }
       }
-      ++ordinal;
+      entry.is_message = true;
+      entry.body =
+          std::string(text.substr(body_start, j > body_start ? j - body_start
+                                                             : 0));
+      i = j < text.size() ? j + 1 : text.size();
+      entries->push_back(std::move(entry));
+      continue;
     }
-    if (index < 0) {
-      return std::nullopt;
+    if (i >= text.size() || text[i] != ':') { break; }
+    ++i;
+    while (i < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
     }
-    ordinals.push_back(index);
-    Value decoded =
-        DecodeStructMember(members[static_cast<size_t>(index)].second);
-    if (decoded.IsNull()) { return std::nullopt; }
-    current = decoded.type == ValueType::kVarChar
-                  ? std::string(decoded.value.varchar_value)
-                  : std::string("null");
-  }
-  return ordinals;
-}
-
-// Rewrites `json` by replacing the member addressed by `ordinals` (one index
-// per path segment). Missing positions leave the document untouched.
-std::optional<std::string> SetStructPathByOrdinals(
-    const std::string& json, const std::vector<std::string>& segs,
-    const std::vector<int>& ordinals, size_t depth, const Value& new_value) {
-  if (json.size() < 2 || json.front() != '{' || json.back() != '}') {
-    // Assigning through a NULL / non-object intermediate.
-    throw std::runtime_error("Cannot set field of NULL STRUCT");
-  }
-  const auto members =
-      SplitJsonObjectMembers(json.substr(1, json.size() - 2));
-  const int index = ordinals[depth];
-  if (index < 0 || static_cast<size_t>(index) >= members.size()) {
-    return std::nullopt;
-  }
-  std::string rebuilt = "{";
-  bool first = true;
-  for (size_t i = 0; i < members.size(); ++i) {
-    if (!first) { rebuilt += ","; }
-    first = false;
-    rebuilt += "\"";
-    rebuilt += EscapeStructKey(members[i].first);
-    rebuilt += "\":";
-    if (static_cast<int>(i) == index) {
-      if (depth + 1 == segs.size()) {
-        rebuilt += EncodeStructMemberJson(new_value);
-      } else {
-        Value nested_value = DecodeStructMember(members[i].second);
-        auto nested = SetStructPathByOrdinals(
-            nested_value.IsNull()
-                ? std::string("null")
-                : nested_value.type == ValueType::kVarChar
-                      ? std::string(nested_value.value.varchar_value)
-                      : std::string("null"),
-            segs, ordinals, depth + 1, new_value);
-        rebuilt += nested.has_value() ? *nested : members[i].second;
+    const size_t value_begin = i;
+    size_t value_end;
+    if (i < text.size() && text[i] == '"') {
+      ++i;
+      while (i < text.size() && text[i] != '"') {
+        if (text[i] == '\\' && i + 1 < text.size()) { ++i; }
+        ++i;
       }
+      value_end = std::min(text.size(), i + 1);
+      i = value_end;
     } else {
-      rebuilt += members[i].second;
+      while (i < text.size() &&
+             !std::isspace(static_cast<unsigned char>(text[i]))) {
+        ++i;
+      }
+      value_end = i;
+    }
+    entry.body =
+        std::string(text.substr(value_begin, value_end - value_begin));
+    entries->push_back(std::move(entry));
+  }
+}
+
+bool ParseCellMembers(const std::string& text, bool* json_format,
+                      std::vector<CellFieldEntry>* entries) {
+  if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
+    *json_format = true;
+    const auto members =
+        SplitJsonObjectMembers(text.substr(1, text.size() - 2));
+    for (const auto& [key, member_text] : members) {
+      const bool is_message =
+          member_text.size() >= 2 && member_text.front() == '{';
+      entries->push_back(
+          CellFieldEntry{key, member_text, is_message});
+    }
+    return true;
+  }
+  *json_format = false;
+  SplitProtoTextEntries(text, entries);
+  return true;
+}
+
+std::string SerializeCellMembers(bool json_format,
+                                 const std::vector<CellFieldEntry>& entries) {
+  if (json_format) {
+    std::string out = "{";
+    bool first = true;
+    for (const CellFieldEntry& entry : entries) {
+      if (!first) { out += ","; }
+      first = false;
+      out += "\"" + entry.name + "\":" + entry.body;
+    }
+    return out + "}";
+  }
+  std::string out;
+  bool first = true;
+  for (const CellFieldEntry& entry : entries) {
+    if (!first) { out.push_back(' '); }
+    first = false;
+    out += entry.name;
+    if (entry.is_message) {
+      out += " { " + entry.body + " }";
+    } else {
+      out += ": " + entry.body;
     }
   }
-  rebuilt += "}";
-  return rebuilt;
+  return out;
 }
-}  // namespace
+
+bool TextBodyLooksLikeMessage(const std::string& raw_value_text) {
+  if (raw_value_text.empty()) { return true; }
+  size_t i = 0;
+  while (i < raw_value_text.size() &&
+         (std::isalnum(static_cast<unsigned char>(raw_value_text[i])) ||
+          raw_value_text[i] == '_')) {
+    ++i;
+  }
+  if (i == 0) { return false; }
+  while (i < raw_value_text.size() &&
+         std::isspace(static_cast<unsigned char>(raw_value_text[i]))) {
+    ++i;
+  }
+  return i < raw_value_text.size() &&
+         (raw_value_text[i] == ':' || raw_value_text[i] == '{');
+}
+
+std::string EncodeCellScalarText(const Value& value) {
+  switch (value.type) {
+    case ValueType::kInt64:
+      return std::to_string(value.value.int_value);
+    case ValueType::kDouble: {
+      char buffer[64];
+      auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer),
+                                     value.value.double_value);
+      (void)ec;
+      return std::string(buffer, ptr - buffer);
+    }
+    case ValueType::kDate:
+      // Proto date fields with format annotations carry days since epoch.
+      return std::to_string(value.value.int_value);
+    default: {
+      const std::string text = value.type == ValueType::kVarChar
+                                   ? std::string(value.value.varchar_value)
+                                   : value.AsString();
+      std::string escaped;
+      for (const char c : text) {
+        if (c == '"' || c == '\\') { escaped.push_back('\\'); }
+        escaped.push_back(c);
+      }
+      return "\"" + escaped + "\"";
+    }
+  }
+}
+
+void ApplyCellLeafUpdate(std::vector<CellFieldEntry>* entries,
+                         bool json_format, const std::string& leaf,
+                         const Value& new_value);
+
+// Descends into (or creates) the message named by segs[depth] inside the
+// member list, applying the remaining path segments below it.
+void ApplyCellPathAt(std::vector<CellFieldEntry>* entries, bool json_format,
+                     const std::vector<std::string>& segs, size_t depth,
+                     const Value& new_value) {
+  const std::string& segment = segs[depth];
+  if (depth + 1 == segs.size()) {
+    ApplyCellLeafUpdate(entries, json_format, segment, new_value);
+    return;
+  }
+  for (CellFieldEntry& entry : *entries) {
+    if (!IdentifierEquals(entry.name, segment)) { continue; }
+    if (json_format && !entry.is_message) {
+      return;  // JSON scalar member blocks descent; leave untouched
+    }
+    bool nested_json = json_format;
+    std::vector<CellFieldEntry> nested;
+    if (json_format) {
+      // JSON object member: body is already a "{...}" document.
+      ParseCellMembers(entry.body, &nested_json, &nested);
+    } else {
+      if (!entry.is_message) {
+        // A text-format scalar occupies the path slot: overwrite as message.
+        entry.is_message = true;
+        entry.body.clear();
+      }
+      SplitProtoTextEntries(entry.body, &nested);
+    }
+    ApplyCellPathAt(&nested, nested_json, segs, depth + 1, new_value);
+    entry.body = SerializeCellMembers(nested_json, nested);
+    return;
+  }
+  CellFieldEntry placeholder;
+  placeholder.name = segment;
+  placeholder.is_message = true;
+  std::vector<CellFieldEntry> nested;
+  ApplyCellPathAt(&nested, json_format, segs, depth + 1, new_value);
+  placeholder.body = SerializeCellMembers(json_format, nested);
+  entries->push_back(std::move(placeholder));
+}
+
+void ApplyCellLeafUpdate(std::vector<CellFieldEntry>* entries,
+                         bool json_format, const std::string& leaf,
+                         const Value& new_value) {
+  if (new_value.IsNull()) {
+    entries->erase(std::remove_if(entries->begin(), entries->end(),
+                                  [&leaf](const CellFieldEntry& entry) {
+                                    return IdentifierEquals(entry.name, leaf);
+                                  }),
+                   entries->end());
+    return;
+  }
+  std::vector<CellFieldEntry> updates;
+  auto push_update = [&](const Value& element) {
+    CellFieldEntry entry;
+    entry.name = leaf;
+    if (json_format) {
+      Value encoded = element.IsNull() ? Value() : element;
+      if (element.type == ValueType::kVarChar) {
+        const std::string text(element.value.varchar_value);
+        if (!text.empty() && (text.front() == '{' || text.front() == '[')) {
+          entry.body = text;  // pre-encoded nested document
+          entry.is_message = text.front() == '{';
+          updates.push_back(std::move(entry));
+          return;
+        }
+      }
+      entry.body = EncodeStructMemberJson(encoded);
+      updates.push_back(std::move(entry));
+      return;
+    }
+    if (element.IsArray()) {
+      std::string inner = "[";
+      bool first_element = true;
+      for (const Value& item : element.ArrayElements()) {
+        if (!first_element) { inner += ", "; }
+        first_element = false;
+        inner += item.IsNull() ? "null" : EncodeCellScalarText(item);
+      }
+      entry.body = inner + "]";
+    } else if (element.IsNull()) {
+      entry.body = "null";
+    } else if (element.type == ValueType::kVarChar &&
+               TextBodyLooksLikeMessage(
+                   std::string(element.value.varchar_value))) {
+      // A message-typed leaf keeps its text-format body verbatim.
+      entry.is_message = true;
+      entry.body = std::string(element.value.varchar_value);
+    } else {
+      entry.body = EncodeCellScalarText(element);
+    }
+    updates.push_back(std::move(entry));
+  };
+  if (new_value.IsNull()) {
+    entries->erase(std::remove_if(entries->begin(), entries->end(),
+                                  [&leaf](const CellFieldEntry& entry) {
+                                    return IdentifierEquals(entry.name, leaf);
+                                  }),
+                   entries->end());
+    return;
+  }
+  if (new_value.IsArray()) {
+    for (const Value& element : new_value.ArrayElements()) {
+      push_update(element);
+    }
+  } else {
+    push_update(new_value);
+  }
+  size_t update_index = 0;
+  for (CellFieldEntry& entry : *entries) {
+    if (!IdentifierEquals(entry.name, leaf)) { continue; }
+    if (update_index < updates.size()) {
+      // Pair each existing occurrence with the next value so multi-value
+      // assignments keep their field position within the message.
+      entry.body = updates[update_index].body;
+      entry.is_message = updates[update_index].is_message;
+      ++update_index;
+    } else {
+      entry.name.clear();  // more stored occurrences than new values
+    }
+  }
+  entries->erase(std::remove_if(entries->begin(), entries->end(),
+                                [](const CellFieldEntry& entry) {
+                                  return entry.name.empty();
+                                }),
+                 entries->end());
+  while (update_index < updates.size()) {
+    entries->push_back(std::move(updates[update_index]));
+    ++update_index;
+  }
+}
 
 // UPDATE with dotted SET targets over STRUCT-typed columns ("SET s.f = ...").
 // Struct JSON carries no schema-level field names/positions, so the ordinal
@@ -1218,7 +1439,6 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
     size_t offset;
     std::vector<std::string> segments;
     const Expression* value;
-    std::vector<int> ordinals;
   };
   std::vector<FieldTarget> field_targets;
   std::vector<std::pair<ColumnName, const Expression*>> plain_targets;
@@ -1235,14 +1455,29 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
           }
         }
         field_targets.push_back(FieldTarget{static_cast<size_t>(base),
-                                            std::move(segments), &expression,
-                                            {}});
+                                            std::move(segments), &expression});
         continue;
       }
     }
     int offset = -1;
     if (!target.name.empty()) { offset = column_index(target.name); }
     if (offset < 0) {
+      // Value-table proto field pseudo-target: the lone physical column
+      // holds the message, so `SET int64_key_1` means <column>.int64_key_1.
+      if (schema.ColumnCount() == 1 && target.schema.empty() &&
+          !target.name.empty()) {
+        std::vector<std::string> segments;
+        size_t start = 0;
+        for (size_t pos = 0; pos <= target.name.size(); ++pos) {
+          if (pos == target.name.size() || target.name[pos] == '.') {
+            segments.push_back(target.name.substr(start, pos - start));
+            start = pos + 1;
+          }
+        }
+        field_targets.push_back(FieldTarget{0, std::move(segments),
+                                            &expression});
+        continue;
+      }
       throw std::runtime_error("UPDATE SET target not found: " +
                                target.ToString());
     }
@@ -1309,22 +1544,6 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
     row = Row();
   }
 
-  // Resolve each path segment's positional index from any matched row that
-  // carries the segment names explicitly (anonymous tuples store fN keys).
-  for (auto& target : field_targets) {
-    target.ordinals.assign(target.segments.size(), -1);
-    for (const auto& [candidate, candidate_position] : pending) {
-      const Value& cell = candidate.values_[target.offset];
-      if (cell.IsNull() || cell.type != ValueType::kVarChar) { continue; }
-      auto found = FindStructPathOrdinals(
-          std::string(cell.value.varchar_value), target.segments);
-      if (found.has_value()) {
-        target.ordinals = *found;
-        break;
-      }
-    }
-  }
-
   int64_t modified_rows = 0;
   for (auto& [new_row, row_position] : pending) {
     for (const auto& target : field_targets) {
@@ -1378,11 +1597,15 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
       const Value assigned =
           relational_detail::Evaluate(*target.value, row_scope, nullptr, ctx,
                                       relational_detail::CteMap{});
-      auto rewritten = SetStructPathByOrdinals(text, target.segments,
-                                               target.ordinals, 0, assigned);
-      if (rewritten.has_value()) {
-        cell = Value(std::move(*rewritten));
-      }
+      // A NULL base cell is synthesized as an empty proto message: GoogleSQL
+      // materializes default instances when assigning through NULL protos.
+      const std::string text =
+          cell.IsNull() ? std::string() : std::string(cell.value.varchar_value);
+      bool json_format = false;
+      std::vector<CellFieldEntry> entries;
+      ParseCellMembers(text, &json_format, &entries);
+      ApplyCellPathAt(&entries, json_format, target.segments, 0, assigned);
+      cell = Value(SerializeCellMembers(json_format, entries));
     }
     StatusOr<RowPosition> updated =
         table->Update(ctx.txn_, row_position, new_row);
@@ -1922,6 +2145,19 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           if (!target.schema.empty() && !target.name.empty() &&
               target.schema != update.TableName()) {
             dotted_target = true;
+          }
+        }
+        // Single-column (value) tables whose lone column holds STRUCT/PROTO
+        // data expose fields as pseudo-targets (`SET int64_key_1 = ...`
+        // addresses <column>.int64_key_1).
+        if (!dotted_target && schema.ColumnCount() == 1 &&
+            schema.GetColumn(0).Type() == ValueType::kVarChar) {
+          for (const auto& [target, expression] : update.SetClause()) {
+            if (target.schema.empty() && !target.name.empty() &&
+                target.name.find('.') == std::string::npos &&
+                schema.Offset(ColumnName(target.name)) < 0) {
+              dotted_target = true;
+            }
           }
         }
         if (dotted_target) {

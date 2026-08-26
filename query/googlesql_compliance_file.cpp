@@ -396,6 +396,17 @@ void ParseResult(std::string_view result, GoogleSqlComplianceCase* out) {
   ParseExpectedRows(result, out);
 }
 
+// The compliance corpus escapes comment markers on continuation lines
+// ("\-- text"); the reference parser treats them as plain "--" comments.
+std::string NormalizeCommentEscapes(std::string sql) {
+  size_t pos = 0;
+  while ((pos = sql.find("\\--", pos)) != std::string::npos) {
+    sql.erase(pos, 1);
+    pos += 2;
+  }
+  return sql;
+}
+
 std::string ApplyParameters(
     std::string sql,
     const std::vector<std::pair<std::string, std::string>>& parameters) {
@@ -415,6 +426,44 @@ std::string ApplyParameters(
     }
   }
   return sql;
+}
+
+// Option blocks such as multi-line `[parameters=...]` span several physical
+// lines until their brackets balance (quotes ignored). Joins continuation
+// lines into one logical line so ConsumeOptionLine can parse the block.
+std::string ReadLogicalOptionLine(std::istringstream* stream,
+                                  std::string first_line) {
+  auto unbalanced = [](const std::string& text) {
+    int depth = 0;
+    bool in_string = false;
+    char quote = '\0';
+    for (size_t i = 0; i < text.size(); ++i) {
+      const char c = text[i];
+      if (in_string) {
+        if (c == '\\' && i + 1 < text.size()) { ++i; } else if (c == quote) {
+          in_string = false;
+        }
+        continue;
+      }
+      if (c == '"' || c == '\'') {
+        in_string = true;
+        quote = c;
+      } else if (c == '[' || c == '(' || c == '<') {
+        ++depth;
+      } else if (c == ']' || c == ')' || c == '>') {
+        --depth;
+      }
+    }
+    return depth > 0;
+  };
+  std::string line = std::move(first_line);
+  while (unbalanced(line)) {
+    std::string next;
+    if (!std::getline(*stream, next)) { break; }
+    line.push_back(' ');
+    line += next;
+  }
+  return line;
 }
 
 GoogleSqlComplianceCase ParseSegment(std::string_view file,
@@ -448,7 +497,10 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
     const std::string trimmed = Trim(line);
     if (in_options) {
       if (trimmed.empty() || trimmed.starts_with('#')) { continue; }
-      if (consume_option(line)) {
+      if (trimmed.front() == '[') {
+        line = ReadLogicalOptionLine(&stream, line);
+      }
+      if (ConsumeOptionLine(line, &test_case, default_features)) {
         if (!test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
@@ -460,7 +512,7 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
       std::ostringstream rest;
       rest << stream.rdbuf();
       ParseResult(rest.str(), &test_case);
-      test_case.sql = ApplyParameters(Trim(sql), test_case.parameters);
+      test_case.sql = NormalizeCommentEscapes(ApplyParameters(Trim(sql), test_case.parameters));
       if (test_case.name.empty()) {
         test_case.name = test_case.prepare_database ? "prepare_database"
                                                     : "unnamed";
@@ -469,7 +521,10 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
     }
     if (sql.empty()) {
       if (trimmed.empty() || trimmed.starts_with('#')) { continue; }
-      if (consume_option(line)) {
+      if (trimmed.front() == '[') {
+        line = ReadLogicalOptionLine(&stream, line);
+      }
+      if (ConsumeOptionLine(line, &test_case, default_features)) {
         if (!test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
@@ -479,7 +534,7 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
     sql += line;
     sql.push_back('\n');
   }
-  test_case.sql = ApplyParameters(Trim(sql), test_case.parameters);
+  test_case.sql = NormalizeCommentEscapes(ApplyParameters(Trim(sql), test_case.parameters));
   if (test_case.name.empty()) {
     test_case.name =
         test_case.prepare_database ? "prepare_database" : "unnamed";

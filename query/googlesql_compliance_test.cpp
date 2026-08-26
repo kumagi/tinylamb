@@ -162,7 +162,14 @@ std::vector<std::string> SplitStatements(std::string_view sql) {
   enum class Mode { kCode, kString, kComment };
   Mode mode = Mode::kCode;
   char quote = '\0';
+  // Triple-quoted strings ('''...''' / """...""") delimit with three quote
+  // runs; interior quotes of any count must not toggle the string state.
   bool triple = false;
+  auto run_length = [&](size_t i) {
+    size_t n = 0;
+    while (i + n < sql.size() && sql[i + n] == quote && n < 3) { ++n; }
+    return n;
+  };
   for (size_t i = 0; i < sql.size(); ++i) {
     const char c = sql[i];
     if (mode == Mode::kComment) {
@@ -172,46 +179,26 @@ std::vector<std::string> SplitStatements(std::string_view sql) {
     }
     if (mode == Mode::kString) {
       current.push_back(c);
-      if (c == '\\' && i + 1 < sql.size()) {
+      if (!triple && c == '\\' && i + 1 < sql.size()) {
         current.push_back(sql[++i]);
         continue;
       }
-      if (!triple && c == quote) {
-        mode = Mode::kCode;
-      } else if (triple && c == quote && i + 2 < sql.size() &&
-                 sql[i + 1] == quote && sql[i + 2] == quote) {
-        current.push_back(sql[i + 1]);
-        current.push_back(sql[i + 2]);
-        i += 2;
-        mode = Mode::kCode;
+      if (c == quote) {
+        const size_t run = run_length(i);
+        if (triple ? run == 3 : true) {
+          for (size_t k = 1; k < (triple ? run : 1); ++k) {
+            current.push_back(sql[++i]);
+          }
+          in_string = false;
+          triple = false;
+        }
       }
-      continue;
-    }
-    if ((c == '"' || c == '\'') && i + 2 < sql.size() && sql[i + 1] == c &&
-        sql[i + 2] == c) {
-      mode = Mode::kString;
-      quote = c;
-      triple = true;
-      current.push_back(c);
-      current.push_back(sql[i + 1]);
-      current.push_back(sql[i + 2]);
-      i += 2;
       continue;
     }
     if (c == '"' || c == '\'') {
       mode = Mode::kString;
       quote = c;
-      triple = false;
-      current.push_back(c);
-      continue;
-    }
-    if (c == '#') {
-      mode = Mode::kComment;
-      current.push_back(c);
-      continue;
-    }
-    if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-      mode = Mode::kComment;
+      triple = run_length(i) == 3;
       current.push_back(c);
       continue;
     }
@@ -348,7 +335,16 @@ TEST(GoogleSqlComplianceFile, SkipsDifferentialPrivacy) {
 // with required_features outside this set is skipped, mirroring the reference
 // TestDriver contract (unsupported-feature cases are neither pass nor fail).
 bool CaseFeatureSupported(const GoogleSqlComplianceCase& test_case) {
-  static const std::unordered_set<std::string> kSupported = {};
+  // Features this engine implements well enough to run their cases; every
+  // other required_features tag skips the case (and file-level setup for
+  // whole-file features), mirroring the reference TestDriver contract where
+  // unsupported-feature cases are neither pass nor fail.
+  static const std::unordered_set<std::string> kSupported = {
+      "INLINE_LAMBDA_ARGUMENT",        // ARRAY_TRANSFORM/ARRAY_FILTER lambdas
+      "TEMPLATE_FUNCTIONS",            // ANY TYPE templated SQL functions
+      "ANY_STRING_TEMPLATED_ARGUMENT", // ANY STRING templated parameters
+      "WITH_ON_SUBQUERY",              // WITH clauses inside function bodies
+  };
   for (const std::string& feature : test_case.required_features) {
     if (kSupported.find(feature) == kSupported.end()) { return false; }
   }
@@ -420,6 +416,10 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
 
   for (const GoogleSqlComplianceCase& test_case : cases) {
     if (IsDifferentialPrivacyCase(test_case)) { continue; }
+    // Feature gating applies to prepare_database setup too: whole-file
+    // features (SQL_GRAPH, RANGE_TYPE, ...) gate their file's setup blocks,
+    // exactly like the reference driver skips unsupported feature files.
+    if (!CaseFeatureSupported(test_case)) { continue; }
     SetDefaultTimeZone(test_case.default_time_zone.empty() ? "America/Los_Angeles" : test_case.default_time_zone);
     if (test_case.prepare_database) {
       const std::vector<std::string> stmts = SplitStatements(test_case.sql);
@@ -445,7 +445,6 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
       continue;
     }
 
-    if (!CaseFeatureSupported(test_case)) { continue; }
     if (file_mutates_state) {
       engine.reset();
       context.reset();
