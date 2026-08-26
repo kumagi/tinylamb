@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -34,6 +35,7 @@
 #include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
+#include "expression/sql_udf.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "query/googlesql_ast.hpp"
@@ -256,6 +258,271 @@ std::string Alias(const GoogleSqlAstNode& node) {
   }
   return Identifier(*alias->Child("Identifier"));
 }
+
+// --- SQL UDF support (CREATE [TEMP] [AGGREGATE] FUNCTION) -------------------
+//
+// The visitor keeps a process-wide registry of user-defined SQL functions,
+// mirroring the session-scoped TEMP semantics of the single-connection
+// compliance harness (the same pattern as SetSessionConstant).  Definitions
+// store the raw body AST; scalar bodies are compiled lazily on first call and
+// served from the expression-layer runtime registry, while aggregate bodies
+// are spliced into every call site so the enclosing statement's aggregation
+// machinery computes their inner aggregates.
+
+Expression VisitExpression(const GoogleSqlAstNode& node);
+
+struct UdfParameter {
+  std::string name;
+  // DEFAULT expression subtree; null when the parameter is required.
+  std::unique_ptr<GoogleSqlAstNode> default_value;
+};
+
+
+constexpr int kMaxUdfExpansionDepth = 64;
+
+thread_local int tls_udf_expansion_depth = 0;
+
+class UdfExpansionDepthGuard {
+ public:
+  UdfExpansionDepthGuard() {
+    if (tls_udf_expansion_depth >= kMaxUdfExpansionDepth) {
+      throw std::runtime_error("SQL UDF invocation depth exceeds " +
+                               std::to_string(kMaxUdfExpansionDepth));
+    }
+    ++tls_udf_expansion_depth;
+  }
+  ~UdfExpansionDepthGuard() { --tls_udf_expansion_depth; }
+  UdfExpansionDepthGuard(const UdfExpansionDepthGuard&) = delete;
+  UdfExpansionDepthGuard& operator=(const UdfExpansionDepthGuard&) = delete;
+};
+
+bool IsTypeAstNode(std::string_view kind) {
+  return kind == "SimpleType" || kind == "ArrayType" || kind == "StructType" ||
+         kind == "MapType" || kind == "TemplatedParameterType" ||
+         kind == "TVFSchema" || kind == "TypeParameterList" ||
+         kind == "Collate";
+}
+
+Expression SubstituteParameters(
+    const Expression& expression,
+    const std::unordered_map<std::string, Expression>& bindings);
+
+std::shared_ptr<SelectStatement> SubstituteInSelect(
+    const SelectStatement& select,
+    const std::unordered_map<std::string, Expression>& bindings);
+
+WindowOrderTerm SubstituteInOrderTerm(
+    const WindowOrderTerm& term,
+    const std::unordered_map<std::string, Expression>& bindings) {
+  WindowOrderTerm result;
+  result.ascending = term.ascending;
+  result.nulls_first = term.nulls_first;
+  if (term.expression) {
+    result.expression = SubstituteParameters(term.expression, bindings);
+  }
+  return result;
+}
+
+Expression SubstituteParameters(
+    const Expression& expression,
+    const std::unordered_map<std::string, Expression>&
+        bindings) {  // NOLINT(misc-no-recursion) // AST-shaped tree walk; depth
+                     // bounded by the parser's expression nesting.
+  if (!expression) {
+    return expression;
+  }
+  switch (expression->Type()) {
+    case TypeTag::kColumnValue: {
+      const ColumnName& column = expression->AsColumnValue().GetColumnName();
+      if (!column.schema.empty() || column.name == "*") {
+        return expression;
+      }
+      std::string lower_name = column.name;
+      for (char& c : lower_name) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      const auto found = bindings.find(lower_name);
+      if (found == bindings.end()) {
+        return expression;
+      }
+      return found->second;
+    }
+    case TypeTag::kBinaryExp: {
+      const auto& binary = expression->AsBinaryExpression();
+      return BinaryExpressionExp(
+          SubstituteParameters(binary.Left(), bindings), binary.Op(),
+          SubstituteParameters(binary.Right(), bindings));
+    }
+    case TypeTag::kUnaryExp: {
+      const auto& unary = expression->AsUnaryExpression();
+      return UnaryExpressionExp(SubstituteParameters(unary.Child(), bindings),
+                                unary.Op());
+    }
+    case TypeTag::kAggregateExp: {
+      const auto& aggregate = expression->AsAggregateExpression();
+      auto rebuilt = std::make_shared<AggregateExpression>(
+          aggregate.GetType(),
+          SubstituteParameters(aggregate.Child(), bindings),
+          aggregate.Distinct());
+      if (aggregate.Having() != AggregateHavingModifier::kNone) {
+        rebuilt->SetHaving(
+            aggregate.Having(),
+            SubstituteParameters(aggregate.HavingCondition(), bindings));
+      }
+      if (aggregate.WhereFilter()) {
+        rebuilt->SetWhereFilter(
+            SubstituteParameters(aggregate.WhereFilter(), bindings));
+      }
+      if (aggregate.SecondaryArg()) {
+        rebuilt->SetSecondaryArg(
+            SubstituteParameters(aggregate.SecondaryArg(), bindings));
+      }
+      if (!aggregate.TrailingArgs().empty()) {
+        std::vector<Expression> trailing;
+        trailing.reserve(aggregate.TrailingArgs().size());
+        for (const Expression& arg : aggregate.TrailingArgs()) {
+          trailing.push_back(SubstituteParameters(arg, bindings));
+        }
+        rebuilt->SetTrailingArgs(std::move(trailing));
+      }
+      if (!aggregate.InnerOrderBy().empty()) {
+        std::vector<WindowOrderTerm> order;
+        order.reserve(aggregate.InnerOrderBy().size());
+        for (const WindowOrderTerm& term : aggregate.InnerOrderBy()) {
+          order.push_back(SubstituteInOrderTerm(term, bindings));
+        }
+        rebuilt->SetInnerOrderBy(std::move(order));
+      }
+      rebuilt->SetInnerLimit(aggregate.InnerLimit());
+      return rebuilt;
+    }
+    case TypeTag::kCaseExp: {
+      const auto& searched = expression->AsCaseExpression();
+      std::vector<std::pair<Expression, Expression>> clauses;
+      clauses.reserve(searched.when_clauses_.size());
+      for (const auto& clause : searched.when_clauses_) {
+        clauses.emplace_back(SubstituteParameters(clause.first, bindings),
+                             SubstituteParameters(clause.second, bindings));
+      }
+      return CaseExpressionExp(
+          std::move(clauses),
+          SubstituteParameters(searched.else_clause_, bindings));
+    }
+    case TypeTag::kInExp: {
+      const auto& in = expression->AsInExpression();
+      std::vector<Expression> list;
+      list.reserve(in.list_.size());
+      for (const Expression& item : in.list_) {
+        list.push_back(SubstituteParameters(item, bindings));
+      }
+      return InExpressionExp(SubstituteParameters(in.child_, bindings),
+                             std::move(list));
+    }
+    case TypeTag::kFunctionCallExp: {
+      const auto& call = expression->AsFunctionCallExpression();
+      std::vector<Expression> args;
+      args.reserve(call.Args().size());
+      for (const Expression& arg : call.Args()) {
+        args.push_back(SubstituteParameters(arg, bindings));
+      }
+      return FunctionCallExp(call.FuncName(), std::move(args));
+    }
+    case TypeTag::kArrayExp: {
+      const auto& array = expression->AsArrayExpression();
+      std::vector<Expression> elements;
+      elements.reserve(array.Elements().size());
+      for (const Expression& element : array.Elements()) {
+        elements.push_back(SubstituteParameters(element, bindings));
+      }
+      return ArrayExpressionExp(std::move(elements), array.ElementSqlType());
+    }
+    case TypeTag::kCastExp: {
+      const auto& cast = expression->AsCastExpression();
+      return CastExpressionExp(SubstituteParameters(cast.Child(), bindings),
+                               cast.TargetTypeName(), cast.ReturnNullOnError());
+    }
+    case TypeTag::kQueryExp: {
+      const auto& query = expression->AsQueryExpression();
+      auto rebuilt = std::make_shared<QueryExpression>(
+          SubstituteInSelect(*query.Query(), bindings),
+          SubstituteParameters(query.Test(), bindings), query.Exists(),
+          query.Negated(), query.Op(), query.Mode());
+      rebuilt->SetArrayResult(query.ArrayResult());
+      return Expression(rebuilt);
+    }
+    default:
+      // Constants and intervals carry no parameter references.
+      return expression;
+  }
+}
+
+std::shared_ptr<SelectStatement> SubstituteInSelect(
+    const SelectStatement& select,
+    const std::unordered_map<std::string, Expression>&
+        bindings) {  // NOLINT(misc-no-recursion) // Mirrors statement-tree
+                     // binding in sql_template.cpp.
+  std::vector<NamedExpression> items;
+  items.reserve(select.SelectList().size());
+  for (const NamedExpression& item : select.SelectList()) {
+    items.emplace_back(item.name,
+                       SubstituteParameters(item.expression, bindings));
+  }
+  auto result = std::make_shared<SelectStatement>(
+      std::move(items), select.FromClause(),
+      SubstituteParameters(select.WhereClause(), bindings),
+      std::vector<SelectStatement::OrderByTerm>{}, select.Limit(),
+      select.Offset(), select.Distinct());
+  result->SetLimit(select.HasLimit() ? std::optional<size_t>(select.Limit())
+                                     : std::nullopt);
+  std::vector<SelectSource> sources;
+  sources.reserve(select.Sources().size());
+  for (const SelectSource& source : select.Sources()) {
+    SelectSource copied = source;
+    copied.join_condition =
+        SubstituteParameters(source.join_condition, bindings);
+    if (source.query) {
+      copied.query = SubstituteInSelect(*source.query, bindings);
+    }
+    sources.push_back(std::move(copied));
+  }
+  result->SetSources(std::move(sources));
+  for (const auto& [alias, table] : select.Aliases()) {
+    result->AddAlias(alias, table);
+  }
+  if (!select.GroupBy().empty()) {
+    std::vector<Expression> group;
+    group.reserve(select.GroupBy().size());
+    for (const Expression& item : select.GroupBy()) {
+      group.push_back(SubstituteParameters(item, bindings));
+    }
+    result->SetGroupBy(std::move(group));
+  }
+  if (select.Having()) {
+    result->SetHaving(SubstituteParameters(select.Having(), bindings));
+  }
+  if (select.Qualify()) {
+    result->SetQualify(SubstituteParameters(select.Qualify(), bindings));
+  }
+  if (!select.OrderBy().empty()) {
+    std::vector<SelectStatement::OrderByTerm> order;
+    order.reserve(select.OrderBy().size());
+    for (const SelectStatement::OrderByTerm& term : select.OrderBy()) {
+      order.push_back({SubstituteParameters(term.expression, bindings),
+                       term.ascending, term.nulls_first});
+    }
+    result->SetOrderBy(std::move(order));
+  }
+  for (const auto& [name, query] : select.WithQueries()) {
+    result->AddWithQuery(name, SubstituteInSelect(*query, bindings));
+  }
+  if (select.RequiresRelationalEvaluation()) {
+    result->MarkComplex();
+  }
+  result->SetAsStruct(select.AsStruct());
+  return result;
+}
+
+
 
 std::string DecodeSingleComponent(std::string_view value_view) {
   std::string value = std::string(value_view);

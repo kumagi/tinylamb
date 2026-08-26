@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <ctime>
 #include <iomanip>
+#include <optional>
 #include <ostream>
 #include <random>
 #include <sstream>
@@ -34,6 +35,7 @@
 #include "common/status_or.hpp"
 #include "expression/evaluation_context.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/sql_udf.hpp"
 #include "type/column_name.hpp"
 #include "type/function.hpp"
 #include "type/row.hpp"
@@ -622,6 +624,28 @@ Value ExecuteFunction(const std::string& name,
       }
     }
     return Value(FormatCivilTime(ct) + "+00");
+  }
+
+  // Deferred STRUCT(...) construction: arguments alternate field name and
+  // value; encoding is shared with the relational interpreter.
+  if (name == "__struct_json__") {
+    std::vector<std::pair<std::string, Value>> fields;
+    fields.reserve(values.size() / 2);
+    for (size_t i = 0; i + 1 < values.size(); i += 2) {
+      fields.emplace_back(values[i].IsNull()
+                              ? std::string()
+                              : std::string(values[i].value.varchar_value),
+                          values[i + 1]);
+    }
+    return Value(EncodeStructJson(fields));
+  }
+
+  // SQL scalar UDFs registered by CREATE FUNCTION: evaluate the body against
+  // a synthetic single-row scope holding the argument values.
+  if (std::optional<SqlScalarFunction> udf = FindSqlScalarFunction(name)) {
+    SqlUdfBinding binding = BindSqlUdfArguments(*udf, std::move(values));
+    SqlUdfDepthGuard depth_guard;
+    return udf->body->Evaluate(binding.row, binding.schema);
   }
   throw std::runtime_error("Function calls are not yet executable: " + name);
 }

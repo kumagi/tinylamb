@@ -41,6 +41,7 @@
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
+#include "expression/sql_udf.hpp"
 #include "expression/unary_expression.hpp"
 #include "query/statement.hpp"
 #include "type/column_name.hpp"
@@ -3074,6 +3075,14 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return StructSetField(arguments[0], raw_str(arguments[1]), arguments[2]);
   }
+  if (name == "error") {
+    // Unreachable in valid plans unless evaluated: raise the requested
+    // runtime error (the message text is informational only).
+    throw std::runtime_error(
+        arguments.empty() || arguments[0].IsNull()
+            ? std::string("ERROR: user-raised")
+            : "generic::out_of_range: " + raw_str(arguments[0]));
+  }
   if (name == "coalesce") {
     for (Value& value : arguments) {
       if (!value.IsNull()) {
@@ -3682,14 +3691,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
   }
   if (name == "array_element_offset" || name == "array_element_ordinal" ||
       name == "array_element_safe_offset" ||
-      name == "array_element_safe_ordinal" ||
-      name == "array_element_offset_safe" ||
-      name == "array_element_ordinal_safe") {
+      name == "array_element_safe_ordinal") {
     if (arguments.size() != 2) {
       throw std::runtime_error("array element access requires 2 arguments");
     }
-    const bool safe = name == "array_element_safe_offset" ||
-                      name == "array_element_safe_ordinal";
+    const bool safe = name.find("safe") != std::string::npos;
     const Value& arr = arguments[0];
     if (arr.IsNull()) {
       return {};
@@ -3697,32 +3703,23 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (!arr.IsArray()) {
       throw std::runtime_error("array element access requires an array");
     }
-    const auto& elements = arr.ArrayElements();
     // A NULL index yields NULL rather than an error (even for non-SAFE).
     if (arguments[1].IsNull()) {
       return {};
     }
+    const auto& elements = arr.ArrayElements();
     int64_t index = arguments[1].value.int_value;
-    if (name == "array_element_ordinal" ||
-        name == "array_element_safe_ordinal") {
+    if (name.find("ordinal") != std::string::npos) {
       --index;
     }
     if (index < 0 || index >= static_cast<int64_t>(elements.size())) {
+      // Out-of-range plain accesses are errors in GoogleSQL; only the SAFE
+      // variants yield NULL.
       if (!safe) {
         throw std::out_of_range("Array index " + std::to_string(index) +
                                 " is out of bounds");
       }
       return {};
-    }
-    if (index < 0 || index >= static_cast<int64_t>(elements.size())) {
-      // Out-of-range plain accesses are errors in GoogleSQL; only the SAFE
-      // variants yield NULL.
-      if (safe) {
-        return {};
-      }
-      throw std::runtime_error("Array index " +
-                               std::to_string(arguments[1].value.int_value) +
-                               " is out of bounds");
     }
     return elements[static_cast<size_t>(index)];
   }
