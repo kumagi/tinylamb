@@ -922,7 +922,10 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
           // Only textual STRUCT/PROTO values carry traversable fields; a
           // scalar match here came from a qualifier/alias fallback, so keep
           // searching other scopes instead of failing the whole lookup.
-          if (base_value.type == ValueType::kVarChar ||
+          // NULL bases (empty/unset protos) resolve to NULL field values
+          // rather than aborting the lookup.
+          if (base_value.IsNull() ||
+              base_value.type == ValueType::kVarChar ||
               split + 1 == segments.size()) {
             return ResolveFieldPath(
                 base_value,

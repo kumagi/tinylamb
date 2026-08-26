@@ -5014,72 +5014,85 @@ void RequireProtoFieldsPresent(const std::string& message_name,
 }
 
 Expression BuildNewConstructor(const GoogleSqlAstNode& node) {
+  // Registry validation runs at compile time; the actual payload is built
+  // at runtime through __proto_new so per-row values (subqueries, column
+  // references, TIMESTAMP/DATE conversions, NULLs) format correctly.
   const std::string message_name = ConstructorTypeFullName(node);
   const std::vector<ProtoFieldSchema>* fields =
       message_name.empty() ? nullptr : FindProtoMessageFields(message_name);
-  std::string text_format;
-  std::vector<const GoogleSqlAstNode*> runtime_guards;
   std::set<std::string> assigned;
   for (const auto& child : node.children) {
     if (child->kind != "NewConstructorArg" || child->children.size() < 2) {
       continue;
     }
-    const GoogleSqlAstNode& value_node = *child->children[0];
     const std::string field_name = Identifier(*child->children[1]);
+    if (field_name.empty()) {
+      continue;
+    }
     assigned.insert(field_name);
-    bool needs_guard = false;
     if (fields != nullptr) {
       const ProtoFieldSchema* field = FindProtoField(*fields, field_name);
       if (field != nullptr) {
-        needs_guard =
-            ValidateProtoFieldAssignment(message_name, *field, value_node);
+        ValidateProtoFieldAssignment(message_name, *field,
+                                     *child->children[0]);
       }
-    }
-    Expression val_expr = VisitExpression(value_node);
-    std::string val_str;
-    if (val_expr->Type() == TypeTag::kConstantValue) {
-      val_str = val_expr->AsConstantValue().GetValue().AsString();
-    }
-    if (!text_format.empty()) {
-      text_format += " ";
-    }
-    text_format += field_name + ": " + val_str;
-    if (needs_guard) {
-      runtime_guards.push_back(&value_node);
     }
   }
   if (fields != nullptr) {
     RequireProtoFieldsPresent(message_name, *fields, assigned);
   }
-  // Runtime guards wrap the folded text so a NULL-bearing array or an
-  // invalid enum value fails execution instead of being silently dropped.
-  Expression result = ConstantValueExp(Value(std::move(text_format)));
-  for (const GoogleSqlAstNode* guard_source : runtime_guards) {
-    const GoogleSqlAstNode* guard_field = nullptr;
-    for (const auto& child : node.children) {
-      if (child->kind == "NewConstructorArg" &&
-          child->children.size() >= 2 &&
-          child->children[0].get() == guard_source) {
-        guard_field = child->children[1].get();
-        break;
-      }
-    }
-    const ProtoFieldSchema* field =
-        fields != nullptr && guard_field != nullptr
-            ? FindProtoField(*fields, Identifier(*guard_field))
-            : nullptr;
-    if (field != nullptr && field->is_enum) {
-      result = FunctionCallExp("$proto_field_guard",
-                               {VisitExpression(*guard_source),
-                                ConstantValueExp(Value(std::string(field->type_name))),
-                                std::move(result)});
-    } else {
-      result = FunctionCallExp("$proto_repeated_guard",
-                               {VisitExpression(*guard_source),
-                                std::move(result)});
+  std::string type_name;
+  if (const GoogleSqlAstNode* path_node = node.Child("PathExpression")) {
+    type_name = Path(*path_node);
+  } else if (const GoogleSqlAstNode* simple = node.Child("SimpleType")) {
+    if (const GoogleSqlAstNode* inner = simple->Child("PathExpression")) {
+      type_name = Path(*inner);
     }
   }
-  return result;
+  {
+    for (char& c : type_name) {
+      if (c == '`') {
+        c = ' ';
+      }
+    }
+    // Collapse whitespace left by backtick removal.
+    std::string collapsed;
+    for (const char c : type_name) {
+      if (c != ' ' || (!collapsed.empty() && collapsed.back() != ' ')) {
+        collapsed.push_back(c);
+      }
+    }
+    type_name = std::move(collapsed);
+  }
+  std::vector<Expression> args;
+  args.emplace_back(ConstantValueExp(Value(std::move(type_name))));
+  for (const auto& child : node.children) {
+    if (child->kind != "NewConstructorArg" || child->children.size() < 2) {
+      continue;
+    }
+    const GoogleSqlAstNode& value_node = *child->children[0];
+    const GoogleSqlAstNode& name_node = *child->children[1];
+    std::string field_name = Identifier(name_node);
+    if (field_name.empty()) {
+      field_name = Path(name_node);
+    }
+    // Extension targets arrive as parenthesized paths: emit the bracketed
+    // extension key used by TEXT format.
+    if (!field_name.empty() && field_name.front() != '[' &&
+        field_name.find('.') != std::string::npos) {
+      field_name = "[" + field_name + "]";
+    }
+    if (value_node.kind == "BooleanLiteral") {
+      const std::string upper_literal = UpperCopy(value_node.detail);
+      args.emplace_back(ConstantValueExp(
+          Value(upper_literal == "TRUE" ? std::string("true")
+                                        : std::string("false"))));
+    } else {
+      args.push_back(VisitExpression(value_node));
+    }
+    args.emplace_back(ConstantValueExp(Value(std::move(field_name))));
+  }
+  return FunctionCallExp("__proto_new", std::move(args));
 }
 
 void ValidateSelectAsProjections(

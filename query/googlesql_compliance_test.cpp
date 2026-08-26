@@ -189,7 +189,7 @@ std::vector<std::string> SplitStatements(std::string_view sql) {
           for (size_t k = 1; k < (triple ? run : 1); ++k) {
             current.push_back(sql[++i]);
           }
-          in_string = false;
+          mode = Mode::kCode;
           triple = false;
         }
       }

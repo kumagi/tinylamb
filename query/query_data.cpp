@@ -128,6 +128,8 @@ Expression BindColumnQualifiedFieldReads(
     child = std::move(mapped);
   }
   return changed ? WithExpressionChildren(expr, std::move(children)) : expr;
+}
+
 // Rewrites STRUCT/PROTO field paths (`value.empty_message`, where `value`
 // names a column rather than a FROM relation) into safe field-extraction
 // calls over the base column, so the flat-column plan executor can evaluate
