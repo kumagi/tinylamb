@@ -555,6 +555,14 @@ bool NeedsRelationalEvaluation(const Expression& expression,  // NOLINT(misc-no-
           [](const Expression& element) {
             return NeedsRelationalEvaluation(element, false);
           });
+    case TypeTag::kColumnValue: {
+      const ColumnName& name = expression->AsColumnValue().GetColumnName();
+      // Deep field paths (`t.Info.str_value`, `sub.ca.a`) resolve through
+      // the relational interpreter's nested-field Lookup; the plan
+      // executor's plain AST walk only knows flat columns.
+      return name.schema.find('.') != std::string::npos ||
+             name.name.find('.') != std::string::npos;
+    }
     default:
       return false;
   }
@@ -2171,6 +2179,40 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
   source.join_type = join_type;
   source.join_condition = std::move(join_condition);
   source.alias = Alias(node);
+  // WITH OFFSET applies to both explicit UNNEST operators and implicit
+  // unnests written as qualified field paths (`t.arr elem WITH OFFSET off`).
+  auto capture_offset_alias = [&]() {
+    const GoogleSqlAstNode* with_offset = node.Child("WithOffset");
+    if (with_offset == nullptr) {
+      with_offset = node.Child("WithOffsetClause");
+    }
+    if (with_offset != nullptr) {
+      if (const GoogleSqlAstNode* alias = with_offset->Child("Alias")) {
+        if (alias->Child("Identifier") != nullptr) {
+          source.offset_alias = Identifier(*alias->Child("Identifier"));
+        } else {
+          source.offset_alias = "offset";
+        }
+      } else {
+        source.offset_alias = "offset";
+      }
+      return;
+    }
+    for (const auto& child : node.children) {
+      if (child->kind.find("Offset") != std::string::npos) {
+        if (const GoogleSqlAstNode* alias = child->Child("Alias")) {
+          if (alias->Child("Identifier") != nullptr) {
+            source.offset_alias = Identifier(*alias->Child("Identifier"));
+          } else {
+            source.offset_alias = "offset";
+          }
+        } else {
+          source.offset_alias = "offset";
+        }
+        break;
+      }
+    }
+  };
   if (node.kind == "TablePathExpression") {
     if (const GoogleSqlAstNode* unnest = node.Child("UnnestExpression")) {
       for (const auto& child : unnest->children) {
@@ -2185,42 +2227,7 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
           break;
         }
       }
-      if (const GoogleSqlAstNode* with_offset = node.Child("WithOffset")) {
-        if (const GoogleSqlAstNode* alias = with_offset->Child("Alias")) {
-          if (alias->Child("Identifier") != nullptr) {
-            source.offset_alias = Identifier(*alias->Child("Identifier"));
-          } else {
-            source.offset_alias = "offset";
-          }
-        } else {
-          source.offset_alias = "offset";
-        }
-      } else if (const GoogleSqlAstNode* with_offset2 = node.Child("WithOffsetClause")) {
-        if (const GoogleSqlAstNode* alias = with_offset2->Child("Alias")) {
-          if (alias->Child("Identifier") != nullptr) {
-            source.offset_alias = Identifier(*alias->Child("Identifier"));
-          } else {
-            source.offset_alias = "offset";
-          }
-        } else {
-          source.offset_alias = "offset";
-        }
-      } else {
-        for (const auto& child : node.children) {
-          if (child->kind.find("Offset") != std::string::npos) {
-            if (const GoogleSqlAstNode* alias = child->Child("Alias")) {
-              if (alias->Child("Identifier") != nullptr) {
-                source.offset_alias = Identifier(*alias->Child("Identifier"));
-              } else {
-                source.offset_alias = "offset";
-              }
-            } else {
-              source.offset_alias = "offset";
-            }
-            break;
-          }
-        }
-      }
+      capture_offset_alias();
       if (source.alias.empty()) { source.alias = "unnest"; }
       return source;
     }
@@ -2240,6 +2247,7 @@ SelectSource VisitTableSource(const GoogleSqlAstNode& node, JoinType join_type, 
       if (source.alias.empty()) {
         source.alias = dotted.substr(dotted.rfind('.') + 1);
       }
+      capture_offset_alias();
       return source;
     }
     source.table = dotted;

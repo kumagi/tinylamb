@@ -439,6 +439,341 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
   }
   return true;
 }
+Relation UnnestValueToRelation(const SelectSource& source,
+                               const Value& array_val) {
+  Relation result;
+  std::string col_name = source.alias.empty() ? "unnest" : source.alias;
+  ValueType elem_type = ValueType::kNull;
+  std::vector<Value> elements;
+  if (array_val.IsArray()) {
+    elements = array_val.ArrayElements();
+    if (!elements.empty()) {
+      elem_type = elements[0].type;
+    }
+  } else if (!array_val.IsNull()) {
+    elements.push_back(array_val);
+    elem_type = array_val.type;
+  }
+  const std::string elem_sql_type =
+      array_val.IsArray() ? array_val.ArrayElementSqlType() : "";
+  if (elem_sql_type == "BOOL" || elem_sql_type == "BOOLEAN") {
+    elem_type = ValueType::kVarChar;
+    for (auto& elem : elements) {
+      if (!elem.IsNull()) {
+        elem =
+            Value(std::string(elem.value.int_value != 0 ? "true" : "false"));
+      }
+    }
+  } else if (elem_sql_type == "PROTO") {
+    std::vector<Column> cols;
+    cols.emplace_back(col_name, ValueType::kVarChar);
+    std::vector<std::vector<Value>> field_values(elements.size());
+    for (size_t row_idx = 0; row_idx < elements.size(); ++row_idx) {
+      if (!elements[row_idx].IsNull() &&
+          elements[row_idx].type == ValueType::kVarChar) {
+        const std::string text =
+            std::string(elements[row_idx].value.varchar_value);
+        std::istringstream iss(text);
+        std::string field_name_colon, val_str;
+        while (iss >> field_name_colon >> val_str) {
+          if (field_name_colon.ends_with(':')) {
+            std::string f_name =
+                field_name_colon.substr(0, field_name_colon.size() - 1);
+            if (row_idx == 0) {
+              cols.emplace_back(col_name + "." + f_name, ValueType::kInt64);
+            }
+            int64_t v = 0;
+            try {
+              v = std::stoll(val_str);
+            } catch (...) {
+            }
+            field_values[row_idx].push_back(Value(v));
+          }
+        }
+      }
+    }
+    result.schema = Schema("", std::move(cols));
+    for (size_t row_idx = 0; row_idx < elements.size(); ++row_idx) {
+      std::vector<Value> row_vals;
+      row_vals.push_back(std::move(elements[row_idx]));
+      for (auto& fv : field_values[row_idx]) {
+        row_vals.push_back(std::move(fv));
+      }
+      result.AddRow(Row(std::move(row_vals)));
+    }
+    return result;
+  }
+  bool is_struct_json = !elements.empty() &&
+                        elements[0].type == ValueType::kVarChar &&
+                        !elements[0].value.varchar_value.empty() &&
+                        elements[0].value.varchar_value.front() == '{' &&
+                        elements[0].value.varchar_value.back() == '}';
+  if (is_struct_json) {
+    auto parse_json_obj = [](std::string_view json) {
+      std::vector<std::pair<std::string, Value>> fields;
+      if (json.size() < 2 || json.front() != '{' || json.back() != '}') {
+        return fields;
+      }
+      std::string_view inner = json.substr(1, json.size() - 2);
+      int depth = 0;
+      bool in_string = false;
+      size_t start = 0;
+      std::vector<std::string_view> pairs;
+      for (size_t i = 0; i < inner.size(); ++i) {
+        char c = inner[i];
+        if (in_string) {
+          if (c == '\\' && i + 1 < inner.size()) {
+            ++i;
+            continue;
+          }
+          if (c == '"') {
+            in_string = false;
+          }
+          continue;
+        }
+        if (c == '"') {
+          in_string = true;
+          continue;
+        }
+        if (c == '{' || c == '[' || c == '(') {
+          ++depth;
+          continue;
+        }
+        if (c == '}' || c == ']' || c == ')') {
+          if (depth > 0) --depth;
+          continue;
+        }
+        if (c == ',' && depth == 0) {
+          pairs.push_back(inner.substr(start, i - start));
+          start = i + 1;
+        }
+      }
+      if (start < inner.size()) {
+        pairs.push_back(inner.substr(start));
+      }
+      for (auto p : pairs) {
+        while (!p.empty() &&
+               std::isspace(static_cast<unsigned char>(p.front()))) {
+          p.remove_prefix(1);
+        }
+        while (!p.empty() &&
+               std::isspace(static_cast<unsigned char>(p.back()))) {
+          p.remove_suffix(1);
+        }
+        size_t colon = p.find(':');
+        if (colon == std::string_view::npos) {
+          continue;
+        }
+        std::string_view k = p.substr(0, colon);
+        std::string_view v = p.substr(colon + 1);
+        while (!k.empty() &&
+               (k.front() == '"' ||
+                std::isspace(static_cast<unsigned char>(k.front())))) {
+          k.remove_prefix(1);
+        }
+        while (!k.empty() &&
+               (k.back() == '"' ||
+                std::isspace(static_cast<unsigned char>(k.back())))) {
+          k.remove_suffix(1);
+        }
+        while (!v.empty() &&
+               std::isspace(static_cast<unsigned char>(v.front()))) {
+          v.remove_prefix(1);
+        }
+        while (!v.empty() &&
+               std::isspace(static_cast<unsigned char>(v.back()))) {
+          v.remove_suffix(1);
+        }
+        auto decode_array_text = [](std::string_view body) -> Value {
+        // body excludes the outer brackets.  Elements are scalars or nested
+        // struct objects; strings are double-quoted.
+        auto scalar_token = [](std::string_view t) -> Value {
+          while (!t.empty() &&
+                 std::isspace(static_cast<unsigned char>(t.front()))) {
+            t.remove_prefix(1);
+          }
+          while (!t.empty() &&
+                 std::isspace(static_cast<unsigned char>(t.back()))) {
+            t.remove_suffix(1);
+          }
+          if (t.empty() || t == "null") {
+            return {};
+          }
+          if (t == "true") {
+            return Value(int64_t{1});
+          }
+          if (t == "false") {
+            return Value(int64_t{0});
+          }
+          if (t.front() == '"' && t.back() == '"' && t.size() >= 2) {
+            return Value(std::string(t.substr(1, t.size() - 2)));
+          }
+          if (t.front() == '{' && t.back() == '}') {
+            return Value(std::string(t));  // nested struct stays encoded
+          }
+          int64_t ival = 0;
+          auto [ptr, ec] = std::from_chars(t.data(), t.data() + t.size(), ival);
+          if (ec == std::errc() && ptr == t.data() + t.size()) {
+            return Value(ival);
+          }
+          double dval = 0.0;
+          try {
+            dval = std::stod(std::string(t));
+            return Value(dval);
+          } catch (...) {
+            return Value(std::string(t));
+          }
+        };
+        std::vector<Value> elements;
+        int nest = 0;
+        bool str = false;
+        size_t start = 0;
+        for (size_t i = 0; i < body.size(); ++i) {
+          char c = body[i];
+          if (str) {
+            if (c == '\\' && i + 1 < body.size()) {
+              ++i;
+              continue;
+            }
+            if (c == '"') {
+              str = false;
+            }
+            continue;
+          }
+          if (c == '"') {
+            str = true;
+            continue;
+          }
+          if (c == '{' || c == '[' || c == '(') {
+            ++nest;
+            continue;
+          }
+          if (c == '}' || c == ']' || c == ')') {
+            if (nest > 0) {
+              --nest;
+            }
+            continue;
+          }
+          if (c == ',' && nest == 0) {
+            elements.push_back(scalar_token(body.substr(start, i - start)));
+            start = i + 1;
+          }
+        }
+        if (!body.empty()) {
+          elements.push_back(scalar_token(body.substr(start)));
+        }
+        std::string elem_sql;
+        for (const Value& element : elements) {
+          if (!element.IsNull()) {
+            switch (element.type) {
+              case ValueType::kInt64:
+                elem_sql = "INT64";
+                break;
+              case ValueType::kDouble:
+                elem_sql = "DOUBLE";
+                break;
+              case ValueType::kVarChar:
+                elem_sql = "STRING";
+                break;
+              default:
+                elem_sql = {};
+                break;
+            }
+            break;
+          }
+        }
+        return Value::Array(std::move(elements),
+                            elem_sql.empty() ? "INT64" : elem_sql);
+      };
+      std::string_view trimmed = v;
+      if (trimmed.size() > 6 && trimmed.substr(0, 6) == "ARRAY<") {
+        const size_t bracket = trimmed.find('[');
+        if (bracket != std::string_view::npos) {
+          fields.emplace_back(std::string(k),
+                              decode_array_text(trimmed.substr(bracket + 1)));
+          continue;
+        }
+      }
+      if (v == "null") {
+          fields.emplace_back(std::string(k), Value());
+        } else if (v == "true") {
+          fields.emplace_back(std::string(k), Value(int64_t{1}));
+        } else if (v == "false") {
+          fields.emplace_back(std::string(k), Value(int64_t{0}));
+        } else if (!v.empty() && v.front() == '"' && v.back() == '"') {
+          std::string unquoted(v.substr(1, v.size() - 2));
+          fields.emplace_back(std::string(k), Value(std::move(unquoted)));
+        } else {
+          int64_t ival = 0;
+          auto [ptr, ec] =
+              std::from_chars(v.data(), v.data() + v.size(), ival);
+          if (ec == std::errc() && ptr == v.data() + v.size()) {
+            fields.emplace_back(std::string(k), Value(ival));
+          } else {
+            double dval = 0.0;
+            try {
+              dval = std::stod(std::string(v));
+              fields.emplace_back(std::string(k), Value(dval));
+            } catch (...) {
+              fields.emplace_back(std::string(k), Value(std::string(v)));
+            }
+          }
+        }
+      }
+      return fields;
+    };
+
+    std::vector<std::vector<std::pair<std::string, Value>>> all_row_fields;
+    for (const auto& elem : elements) {
+      if (!elem.IsNull() && elem.type == ValueType::kVarChar) {
+        all_row_fields.push_back(parse_json_obj(elem.value.varchar_value));
+      } else {
+        all_row_fields.push_back({});
+      }
+    }
+
+    std::vector<Column> cols;
+    if (!all_row_fields.empty()) {
+      for (const auto& [fname, fval] : all_row_fields[0]) {
+        ValueType vt = fval.IsNull() ? ValueType::kVarChar : fval.type;
+        cols.emplace_back(fname, vt);
+      }
+    }
+    const bool with_offset = !source.offset_alias.empty();
+    if (with_offset) {
+      cols.emplace_back(source.offset_alias, ValueType::kInt64);
+    }
+    result.schema = Schema("", std::move(cols));
+    for (size_t row_idx = 0; row_idx < all_row_fields.size(); ++row_idx) {
+      const auto& row_fields = all_row_fields[row_idx];
+      std::vector<Value> row_vals;
+      for (const auto& [fname, fval] : row_fields) {
+        row_vals.push_back(fval);
+      }
+      if (with_offset) {
+        row_vals.push_back(Value(static_cast<int64_t>(row_idx)));
+      }
+      result.AddRow(Row(std::move(row_vals)));
+    }
+    return result;
+  }
+  std::vector<Column> unnest_cols;
+  unnest_cols.emplace_back(col_name, elem_type);
+  if (!source.offset_alias.empty()) {
+    unnest_cols.emplace_back(source.offset_alias, ValueType::kInt64);
+  }
+  result.schema = Schema("", std::move(unnest_cols));
+  for (size_t row_idx = 0; row_idx < elements.size(); ++row_idx) {
+    if (!source.offset_alias.empty()) {
+      result.AddRow(Row({std::move(elements[row_idx]),
+                         Value(static_cast<int64_t>(row_idx))}));
+    } else {
+      result.AddRow(Row({std::move(elements[row_idx])}));
+    }
+  }
+  return result;
+}
+
 Relation LoadSource(TransactionContext& context, const SelectSource& source,
                     const Scope* outer, const CteMap& ctes,
                     const std::vector<slot_t>* projection,
@@ -449,226 +784,7 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
   if (source.unnest) {
     const Value array_val =
         Evaluate(source.unnest, Scope{.outer = outer}, nullptr, context, ctes);
-    std::string col_name = source.alias.empty() ? "unnest" : source.alias;
-    ValueType elem_type = ValueType::kNull;
-    std::vector<Value> elements;
-    if (array_val.IsArray()) {
-      elements = array_val.ArrayElements();
-      if (!elements.empty()) {
-        elem_type = elements[0].type;
-      }
-    } else if (!array_val.IsNull()) {
-      elements.push_back(array_val);
-      elem_type = array_val.type;
-    }
-    const std::string elem_sql_type =
-        array_val.IsArray() ? array_val.ArrayElementSqlType() : "";
-    if (elem_sql_type == "BOOL" || elem_sql_type == "BOOLEAN") {
-      elem_type = ValueType::kVarChar;
-      for (auto& elem : elements) {
-        if (!elem.IsNull()) {
-          elem =
-              Value(std::string(elem.value.int_value != 0 ? "true" : "false"));
-        }
-      }
-    } else if (elem_sql_type == "PROTO") {
-      std::vector<Column> cols;
-      cols.emplace_back(col_name, ValueType::kVarChar);
-      std::vector<std::vector<Value>> field_values(elements.size());
-      for (size_t row_idx = 0; row_idx < elements.size(); ++row_idx) {
-        if (!elements[row_idx].IsNull() &&
-            elements[row_idx].type == ValueType::kVarChar) {
-          const std::string text =
-              std::string(elements[row_idx].value.varchar_value);
-          std::istringstream iss(text);
-          std::string field_name_colon, val_str;
-          while (iss >> field_name_colon >> val_str) {
-            if (field_name_colon.ends_with(':')) {
-              std::string f_name =
-                  field_name_colon.substr(0, field_name_colon.size() - 1);
-              if (row_idx == 0) {
-                cols.emplace_back(col_name + "." + f_name, ValueType::kInt64);
-              }
-              int64_t v = 0;
-              try {
-                v = std::stoll(val_str);
-              } catch (...) {
-              }
-              field_values[row_idx].push_back(Value(v));
-            }
-          }
-        }
-      }
-      result.schema = Schema("", std::move(cols));
-      for (size_t row_idx = 0; row_idx < elements.size(); ++row_idx) {
-        std::vector<Value> row_vals;
-        row_vals.push_back(std::move(elements[row_idx]));
-        for (auto& fv : field_values[row_idx]) {
-          row_vals.push_back(std::move(fv));
-        }
-        result.AddRow(Row(std::move(row_vals)));
-      }
-      return result;
-    }
-    bool is_struct_json = !elements.empty() &&
-                          elements[0].type == ValueType::kVarChar &&
-                          !elements[0].value.varchar_value.empty() &&
-                          elements[0].value.varchar_value.front() == '{' &&
-                          elements[0].value.varchar_value.back() == '}';
-    if (is_struct_json) {
-      auto parse_json_obj = [](std::string_view json) {
-        std::vector<std::pair<std::string, Value>> fields;
-        if (json.size() < 2 || json.front() != '{' || json.back() != '}') {
-          return fields;
-        }
-        std::string_view inner = json.substr(1, json.size() - 2);
-        int depth = 0;
-        bool in_string = false;
-        size_t start = 0;
-        std::vector<std::string_view> pairs;
-        for (size_t i = 0; i < inner.size(); ++i) {
-          char c = inner[i];
-          if (in_string) {
-            if (c == '\\' && i + 1 < inner.size()) {
-              ++i;
-              continue;
-            }
-            if (c == '"') {
-              in_string = false;
-            }
-            continue;
-          }
-          if (c == '"') {
-            in_string = true;
-            continue;
-          }
-          if (c == '{' || c == '[' || c == '(') {
-            ++depth;
-            continue;
-          }
-          if (c == '}' || c == ']' || c == ')') {
-            if (depth > 0) --depth;
-            continue;
-          }
-          if (c == ',' && depth == 0) {
-            pairs.push_back(inner.substr(start, i - start));
-            start = i + 1;
-          }
-        }
-        if (start < inner.size()) {
-          pairs.push_back(inner.substr(start));
-        }
-        for (auto p : pairs) {
-          while (!p.empty() &&
-                 std::isspace(static_cast<unsigned char>(p.front()))) {
-            p.remove_prefix(1);
-          }
-          while (!p.empty() &&
-                 std::isspace(static_cast<unsigned char>(p.back()))) {
-            p.remove_suffix(1);
-          }
-          size_t colon = p.find(':');
-          if (colon == std::string_view::npos) {
-            continue;
-          }
-          std::string_view k = p.substr(0, colon);
-          std::string_view v = p.substr(colon + 1);
-          while (!k.empty() &&
-                 (k.front() == '"' ||
-                  std::isspace(static_cast<unsigned char>(k.front())))) {
-            k.remove_prefix(1);
-          }
-          while (!k.empty() &&
-                 (k.back() == '"' ||
-                  std::isspace(static_cast<unsigned char>(k.back())))) {
-            k.remove_suffix(1);
-          }
-          while (!v.empty() &&
-                 std::isspace(static_cast<unsigned char>(v.front()))) {
-            v.remove_prefix(1);
-          }
-          while (!v.empty() &&
-                 std::isspace(static_cast<unsigned char>(v.back()))) {
-            v.remove_suffix(1);
-          }
-          if (v == "null") {
-            fields.emplace_back(std::string(k), Value());
-          } else if (v == "true") {
-            fields.emplace_back(std::string(k), Value(int64_t{1}));
-          } else if (v == "false") {
-            fields.emplace_back(std::string(k), Value(int64_t{0}));
-          } else if (!v.empty() && v.front() == '"' && v.back() == '"') {
-            std::string unquoted(v.substr(1, v.size() - 2));
-            fields.emplace_back(std::string(k), Value(std::move(unquoted)));
-          } else {
-            int64_t ival = 0;
-            auto [ptr, ec] =
-                std::from_chars(v.data(), v.data() + v.size(), ival);
-            if (ec == std::errc() && ptr == v.data() + v.size()) {
-              fields.emplace_back(std::string(k), Value(ival));
-            } else {
-              double dval = 0.0;
-              try {
-                dval = std::stod(std::string(v));
-                fields.emplace_back(std::string(k), Value(dval));
-              } catch (...) {
-                fields.emplace_back(std::string(k), Value(std::string(v)));
-              }
-            }
-          }
-        }
-        return fields;
-      };
-
-      std::vector<std::vector<std::pair<std::string, Value>>> all_row_fields;
-      for (const auto& elem : elements) {
-        if (!elem.IsNull() && elem.type == ValueType::kVarChar) {
-          all_row_fields.push_back(parse_json_obj(elem.value.varchar_value));
-        } else {
-          all_row_fields.push_back({});
-        }
-      }
-
-      std::vector<Column> cols;
-      if (!all_row_fields.empty()) {
-        for (const auto& [fname, fval] : all_row_fields[0]) {
-          ValueType vt = fval.IsNull() ? ValueType::kVarChar : fval.type;
-          cols.emplace_back(fname, vt);
-        }
-      }
-      const bool with_offset = !source.offset_alias.empty();
-      if (with_offset) {
-        cols.emplace_back(source.offset_alias, ValueType::kInt64);
-      }
-      result.schema = Schema("", std::move(cols));
-      for (size_t row_idx = 0; row_idx < all_row_fields.size(); ++row_idx) {
-        const auto& row_fields = all_row_fields[row_idx];
-        std::vector<Value> row_vals;
-        for (const auto& [fname, fval] : row_fields) {
-          row_vals.push_back(fval);
-        }
-        if (with_offset) {
-          row_vals.push_back(Value(static_cast<int64_t>(row_idx)));
-        }
-        result.AddRow(Row(std::move(row_vals)));
-      }
-      return result;
-    }
-    std::vector<Column> unnest_cols;
-    unnest_cols.emplace_back(col_name, elem_type);
-    if (!source.offset_alias.empty()) {
-      unnest_cols.emplace_back(source.offset_alias, ValueType::kInt64);
-    }
-    result.schema = Schema("", std::move(unnest_cols));
-    for (size_t row_idx = 0; row_idx < elements.size(); ++row_idx) {
-      if (!source.offset_alias.empty()) {
-        result.AddRow(Row({std::move(elements[row_idx]),
-                           Value(static_cast<int64_t>(row_idx))}));
-      } else {
-        result.AddRow(Row({std::move(elements[row_idx])}));
-      }
-    }
-
+    result = UnnestValueToRelation(source, array_val);
   } else if (source.query) {
     result = ExecuteQuery(context, *source.query, outer, ctes);
   } else if (const auto cte = ctes.find(source.table); cte != ctes.end()) {

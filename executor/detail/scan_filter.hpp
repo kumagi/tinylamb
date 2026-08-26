@@ -70,6 +70,12 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
                     const std::unordered_set<int64_t>* int_key_filter = nullptr,
                     std::optional<slot_t> int_key_column = std::nullopt);
 
+// Materializes one UNNEST'd array value into a single-column relation named
+// after the source alias (struct elements expand into per-field columns,
+// WITH OFFSET appends the offset column).  Pure: no context, no scope.
+Relation UnnestValueToRelation(const SelectSource& source,
+                               const Value& array_val);
+
 bool ContainsQuery(const Expression& expression);
 
 std::optional<size_t> LocalColumnOffset(const Schema& schema,

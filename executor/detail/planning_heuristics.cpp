@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <vector>
 #include <utility>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -704,6 +705,104 @@ bool IsSubset(const std::unordered_set<size_t>& values,
   return std::ranges::all_of(values,
                              [&](size_t value) { return superset.contains(value); });
 }
+
+// Recursively gathers every column referenced by an expression, descending
+// into subqueries so UNNEST arguments like ARRAY(SELECT ... a ...) report
+// their correlated references.
+void CollectColumnsRecursive(  // NOLINT(misc-no-recursion)
+    const Expression& expression, std::unordered_set<ColumnName>* columns) {
+  if (!expression) {
+    return;
+  }
+  if (expression->Type() == TypeTag::kQueryExp) {
+    const QueryExpression& query = expression->AsQueryExpression();
+    CollectStatementColumns(*query.Query(), columns);
+    CollectColumnsRecursive(query.Test(), columns);
+    return;
+  }
+  std::unordered_set<ColumnName> touched = expression->TouchedColumns();
+  columns->merge(touched);
+  for (const Expression& child : ExpressionChildren(expression)) {
+    CollectColumnsRecursive(child, columns);
+  }
+}
+
+// Expands a lateral (correlated) UNNEST source against the relation
+// accumulated from the preceding FROM items: for every prefix row the array
+// expression is evaluated with that row in scope and each element becomes an
+// output row joined with the prefix row.
+Relation LateralExpandRelation(TransactionContext& context,
+                               const SelectSource& source,
+                               Relation& prefix, const Scope* outer,
+                               const CteMap& ctes) {
+  Relation output(context.execution_runtime());
+  const std::string qualifier =
+      source.alias.empty() ? "unnest" : source.alias;
+  auto element_schema_of = [&](const Value& array_val) {
+    Relation elements = UnnestValueToRelation(source, array_val);
+    if (!qualifier.empty()) {
+      elements.schema = QualifySchema(elements.schema, qualifier);
+    }
+    return elements;
+  };
+  const Expression condition =
+      source.join_condition ? source.join_condition : nullptr;
+  const bool left_outer = source.join_type == JoinType::kLeft;
+  bool any_prefix_row = false;
+  bool schema_initialized = false;
+  prefix.FinishSpill();
+  prefix.ForEachRow([&](const Row& row) {
+    any_prefix_row = true;
+    Scope scope{.row = &row, .schema = &prefix.schema, .outer = outer};
+    const Value array_val =
+        Evaluate(source.unnest, scope, nullptr, context, ctes);
+    Relation elements = element_schema_of(array_val);
+    if (!schema_initialized) {
+      output.schema = prefix.schema + elements.schema;
+      schema_initialized = true;
+    }
+    elements.FinishSpill();
+    bool matched = false;
+    elements.ForEachRow([&](const Row& element_row) {
+      Row combined = row + element_row;
+      if (condition) {
+        Scope combined_scope{
+            .row = &combined, .schema = &output.schema, .outer = outer};
+        if (!Truthy(
+                Evaluate(condition, combined_scope, nullptr, context, ctes))) {
+          return;
+        }
+      }
+      matched = true;
+      output.AddRow(std::move(combined));
+    });
+    if (!matched && left_outer) {
+      std::vector<Value> nulls(
+          output.schema.ColumnCount() - row.values_.size(), Value());
+      output.AddRow(row + Row(std::move(nulls)));
+    }
+  });
+  if (!any_prefix_row || !schema_initialized) {
+    // Empty prefix (or every prefix row skipped before initialization):
+    // still derive the output schema so downstream projection sees the
+    // unnest columns; evaluating on an all-NULL representative row keeps
+    // this exception-free for constant arrays.
+    if (!schema_initialized) {
+      Row representative(
+          std::vector<Value>(prefix.schema.ColumnCount(), Value()));
+      Scope scope{
+          .row = &representative, .schema = &prefix.schema, .outer = outer};
+      const Value array_val =
+          Evaluate(source.unnest, scope, nullptr, context, ctes);
+      Relation elements = element_schema_of(array_val);
+      output.schema = prefix.schema + elements.schema;
+      schema_initialized = true;
+    }
+  }
+  output.FinishSpill();
+  return output;
+}
+
 Relation BuildInput(TransactionContext& context,
                     const SelectStatement& statement, const Scope* outer,
                     const CteMap& ctes, bool* where_fully_applied) {
@@ -713,6 +812,61 @@ Relation BuildInput(TransactionContext& context,
     singleton.rows.emplace_back();
     singleton.peak_intermediate_rows = 1;
     return singleton;
+  }
+
+  // Lateral UNNEST: a FROM item whose UNNEST argument references columns
+  // (of sibling FROM items or enclosing scopes) cannot be materialized in
+  // isolation; it expands per-row against the relations accumulated so far.
+  // Such statements assemble left-to-right instead of using the reordered
+  // join pipeline below.
+  {
+    bool lateral = false;
+    for (const SelectSource& source : statement.Sources()) {
+      if (!source.unnest) {
+        continue;
+      }
+      std::unordered_set<ColumnName> touched;
+      CollectColumnsRecursive(source.unnest, &touched);
+      if (!touched.empty()) {
+        lateral = true;
+        break;
+      }
+    }
+    if (lateral) {
+      Relation result(context.execution_runtime());
+      bool first = true;
+      for (const SelectSource& source : statement.Sources()) {
+        Relation relation(context.execution_runtime());
+        if (source.unnest) {
+          // Lateral expansion already merges the prefix with each element
+          // row (applying the source's join condition); no separate join.
+          if (first) {
+            Relation singleton(context.execution_runtime());
+            singleton.schema = Schema("", std::vector<Column>{});
+            singleton.rows.emplace_back();
+            singleton.peak_intermediate_rows = 1;
+            relation = LateralExpandRelation(context, source, singleton,
+                                             outer, ctes);
+          } else {
+            relation =
+                LateralExpandRelation(context, source, result, outer, ctes);
+          }
+        } else {
+          relation = LoadSource(context, source, outer, ctes);
+        }
+        if (first) {
+          result = std::move(relation);
+          first = false;
+        } else if (!source.unnest) {
+          result =
+              Join(context, std::move(result), std::move(relation), source,
+                   outer, ctes);
+        } else {
+          result = std::move(relation);
+        }
+      }
+      return result;
+    }
   }
 
   std::vector<Relation> relations(statement.Sources().size());
