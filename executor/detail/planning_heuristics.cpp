@@ -761,10 +761,16 @@ Relation LateralExpandRelation(TransactionContext& context,
       output.schema = prefix.schema + elements.schema;
       schema_initialized = true;
     }
+    // The element relation's shape is derived from the array value at hand,
+    // so a later prefix row can in principle expand to fewer columns than
+    // the row that initialized output.schema.  NULL-fill (or trim) back to
+    // the initialized arity so every emitted row matches output.schema
+    // exactly; Lookup and projection index rows by schema offsets.
     elements.FinishSpill();
     bool matched = false;
     elements.ForEachRow([&](const Row& element_row) {
       Row combined = row + element_row;
+      combined.values_.resize(output.schema.ColumnCount());
       if (condition) {
         Scope combined_scope{
             .row = &combined, .schema = &output.schema, .outer = outer};
