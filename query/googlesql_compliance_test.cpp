@@ -500,7 +500,14 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
                     << test_case.sql;
     } else {
       std::string detail;
-      EXPECT_TRUE(RowsMatch(rows, test_case, &detail))
+      bool matched = false;
+      try {
+        matched = RowsMatch(rows, test_case, &detail);
+      } catch (const std::exception& ex) {
+        matched = false;
+        detail = std::string("RowsMatch threw: ") + ex.what();
+      }
+      EXPECT_TRUE(matched)
           << GetParam() << " / " << test_case.name << " " << detail << "\n"
           << test_case.sql << "\n"
           << test_case.raw_result;

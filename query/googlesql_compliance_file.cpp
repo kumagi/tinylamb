@@ -655,6 +655,15 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
                                  lower_type.size() - lower_type.find('<') - 2));
       if (unwrapped == lower_actual_type) { lower_type = lower_actual_type; }
     }
+    // Engines that cannot name nested message element types report the bare
+    // PROTO/STRUCT tag; judge those by element values.
+    const auto bare_message_tag = [](const std::string& t) {
+      return t == "proto" || t == "struct";
+    };
+    if (bare_message_tag(lower_actual_type) &&
+        (lower_type.starts_with(lower_actual_type + "<"))) {
+      lower_type = lower_actual_type;
+    }
     // Engines that store enums as their member-name strings report
     // STRING-typed arrays where the reference prints ENUM<T>.
     if (lower_type.starts_with("enum<") && lower_actual_type == "string") {

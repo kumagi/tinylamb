@@ -68,6 +68,13 @@ std::string ConstructProtoText(
     const std::string& type_name,
     const std::vector<std::pair<std::string, Value>>& fields);
 
+// Rejects values that cannot be stored into an enum-typed field: INT64 into
+// proto2 enums (proto3 keeps unknown numeric members), and strings outside
+// the declared member list.  No-op for unmodelled (type, field) pairs.
+void ValidateEnumFieldValue(const std::string& type_name,
+                            const std::string& field_name,
+                            const Value& value);
+
 // Decodes a minimal protobuf wire-format byte payload for protos whose field
 // layout this engine models.  Returns nullopt for unknown types / payloads.
 std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
@@ -77,6 +84,22 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
 // when the text plausibly holds proto TEXT entries; false otherwise.
 bool TryProtoTextGetField(std::string_view text, std::string_view key,
                           Value* out);
+
+// Appends the engine's proto-type marker comment ("# tinylamb-proto-type=...")
+// so per-type unset-field defaults resolve at extraction time.
+std::string AppendProtoTypeMarker(const std::string& payload,
+                                  const std::string& type_name);
+
+// Extracts the lowered proto type recorded by AppendProtoTypeMarker; empty
+// when the payload carries no marker.
+std::string ExtractProtoTypeMarker(std::string_view text);
+
+// Best-effort proto type resolution for payloads stored without a marker:
+// scores the modelled compliance protos by their signature fields, counting
+// both payload entries and the caller's SET-target path segments.  Returns
+// the display-form type name, or empty when nothing matches confidently.
+std::string InferProtoTypeName(
+    std::string_view payload, const std::vector<std::string>& hint_fields);
 
 // True when the field belongs to a proto compiled with required fields that
 // this engine models (used to reject null/missing constructions).

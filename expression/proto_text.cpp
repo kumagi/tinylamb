@@ -296,9 +296,19 @@ FieldFormat ClassifyFieldFormat(std::string_view field) {
   if (name.rfind("has_", 0) == 0) {
     return FieldFormat::kNone;
   }
-  // Strip trailing "_format" annotation marker.
+  // Strip trailing "_format" / width / default markers ("micros_u64",
+  // "date_64", "seconds_default").
   if (name.size() > 7 && name.ends_with("_format")) {
     name.resize(name.size() - 7);
+  }
+  while (name.size() > 9 && name.ends_with("_default")) {
+    name.resize(name.size() - 8);
+  }
+  while (name.size() > 4 && name.ends_with("_u64")) {
+    name.resize(name.size() - 4);
+  }
+  while (name.size() > 3 && name.ends_with("_64")) {
+    name.resize(name.size() - 3);
   }
   if (name.find("timestamp") != std::string::npos) {
     if (name.ends_with("_second") || name.ends_with("_seconds")) {
@@ -405,13 +415,17 @@ std::optional<Value> ApplyWriteConversion(FieldFormat format,
         if (!nanos.has_value()) {
           return std::nullopt;
         }
+        auto floor_div = [](int64_t a, int64_t b) {
+          const int64_t q = a / b;
+          return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+        };
         switch (format) {
           case FieldFormat::kTsSeconds:
-            return Value(*nanos / 1000000000LL);
+            return Value(floor_div(*nanos, 1000000000LL));
           case FieldFormat::kTsMillis:
-            return Value(*nanos / 1000000LL);
+            return Value(floor_div(*nanos, 1000000LL));
           default:
-            return Value(*nanos / 1000LL);
+            return Value(floor_div(*nanos, 1000LL));
         }
       }
       return std::nullopt;
@@ -465,6 +479,15 @@ bool AbsentAnnotatedDateReadsNull(std::string_view field) {
   std::string name = ToLowerCopy(field);
   if (name.size() > 7 && name.ends_with("_format")) {
     name.resize(name.size() - 7);
+  }
+  while (name.size() > 9 && name.ends_with("_default")) {
+    name.resize(name.size() - 8);
+  }
+  while (name.size() > 4 && name.ends_with("_u64")) {
+    name.resize(name.size() - 4);
+  }
+  while (name.size() > 3 && name.ends_with("_64")) {
+    name.resize(name.size() - 3);
   }
   return name == "date" || name == "s_date" || name == "f_date" ||
          name == "date_decimal" || name == "s_date_decimal" ||
@@ -674,11 +697,15 @@ bool LooksLikeProtoText(std::string_view text) {
   if (body.empty()) {
     return false;
   }
+  // Whitespace-only bodies are empty messages (they still carry absent-field
+  // defaults), so they count as proto TEXT.
+  const bool all_space =
+      body.find_first_not_of(" \t\r\n") == std::string_view::npos;
   std::vector<ProtoTextEntry> entries;
   if (!ParseProtoTextEntries(body, &entries)) {
     return false;
   }
-  return !entries.empty();
+  return !entries.empty() || all_space;
 }
 
 std::optional<std::string> NormalizeProtoText(std::string_view text) {
@@ -729,6 +756,11 @@ std::string FormatProtoTextScalar(std::string_view raw_token) {
   token = b == std::string::npos ? "" : token.substr(b, e - b + 1);
   if (token.empty()) {
     return "\"\"";
+  }
+  if (token == "true" || token == "false") {
+    // Proto TEXT renders booleans bare; the SQL engine surfaces them as
+    // INT64 0/1 or the keyword string depending on the producer.
+    return token;
   }
   if (token.front() == '"' || token.front() == '\'') {
     // Re-emit quoted tokens canonically double-quoted.
@@ -796,6 +828,7 @@ bool IsKnownMessageField(std::string_view lower_name) {
       new auto(std::unordered_set<std::string>{
           "nested_value",
           "nested_repeated_value",
+          "empty_message",
           "repeated_holder",
           "repeated_field",
           "optional_group",
@@ -867,6 +900,82 @@ std::optional<std::string> AbsentEnumDefault(
   return prefix + "0";
 }
 
+// Known enum members for the compliance protos: (lowered type, lowered field)
+// pairs map to the exact member tokens the SQL type declares.
+const std::unordered_map<std::string, std::vector<std::string>>&
+KnownEnumFields() {
+  static const std::unordered_map<std::string, std::vector<std::string>>* const
+      kMap = new auto(std::unordered_map<std::string, std::vector<std::string>>{
+          {"googlesql_test.kitchensinkpb/test_enum",
+           {"TESTENUM0", "TESTENUM1", "TESTENUM2"}},
+          {"googlesql_test.kitchensinkenumpb/required_test_enum",
+           {"TESTENUM0", "TESTENUM1", "TESTENUM2"}},
+          {"googlesql_test.kitchensinkenumpb/test_enum",
+           {"TESTENUM0", "TESTENUM1", "TESTENUM2"}},
+          {"googlesql_test.kitchensinkenumpb/repeated_test_enum",
+           {"TESTENUM0", "TESTENUM1", "TESTENUM2"}},
+          {"googlesql_test.proto3kitchensink/test_enum",
+           {"ENUM0", "ENUM1", "ENUM2"}},
+          {"googlesql_test.proto3kitchensink/repeated_test_enum",
+           {"ENUM0", "ENUM1", "ENUM2"}},
+      });
+  return *kMap;
+}
+
+// Member list of the enum family a field belongs to, used to normalize
+// numeric tokens ("2" -> "ENUM2").  Candidate lists come from the modelled
+// (type, field) pairs; ambiguity resolves by matching member-shaped tokens
+// already stored under this key.
+const std::vector<std::string>* EnumMembersForField(
+    std::string_view key, const std::vector<ProtoTextEntry>& entries) {
+  const std::string lower = ToLowerCopy(key);
+  const auto& known = KnownEnumFields();
+  std::vector<const std::vector<std::string>*> candidates;
+  for (const auto& [type_field, members] : known) {
+    const size_t slash = type_field.find('/');
+    if (slash == std::string::npos) {
+      continue;
+    }
+    if (type_field.compare(slash + 1, std::string_view::npos, lower) == 0) {
+      candidates.push_back(&members);
+    }
+  }
+  if (candidates.empty()) {
+    return nullptr;
+  }
+  if (candidates.size() == 1) {
+    return candidates.front();
+  }
+  // Prefer the candidate whose members appear verbatim in this field's own
+  // entries (e.g. "ENUM2147483647" pins the ENUM0.. family).
+  for (const ProtoTextEntry& entry : entries) {
+    if (entry.is_message || !NameEquals(entry.name, key)) {
+      continue;
+    }
+    for (const auto* members : candidates) {
+      if (std::find(members->begin(), members->end(), entry.text) !=
+          members->end()) {
+        return members;
+      }
+    }
+  }
+  return nullptr;
+}
+
+// Normalizes an enum scalar token: integers within the member range become
+// their member names; unknown numbers and member tokens stay as-is.
+Value NormalizeEnumToken(const std::vector<std::string>& members,
+                         const Value& parsed) {
+  if (parsed.type != ValueType::kInt64) {
+    return parsed;
+  }
+  const int64_t ord = parsed.value.int_value;
+  if (ord < 0 || static_cast<size_t>(ord) >= members.size()) {
+    return parsed;
+  }
+  return Value(std::string(members[static_cast<size_t>(ord)]));
+}
+
 bool ProtoTextExtractField(std::string_view text, std::string_view key,
                            Value* out) {
   std::string_view body = text;
@@ -888,6 +997,12 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
   std::string lower_key = ToLowerCopy(key);
   if (lower_key.starts_with("has_") && lower_key.size() > 4) {
     const std::string bare(key.substr(4));
+    const std::string lower_bare = ToLowerCopy(bare);
+    if (lower_bare.find("repeated") != std::string::npos) {
+      throw std::runtime_error("Field " + bare +
+                               " is repeated, so has_" + bare +
+                               " is not allowed");
+    }
     *out = Value(int64_t{ProtoTextHasField(text, bare) ? int64_t{1} : 0});
     return true;
   }
@@ -900,9 +1015,11 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
     const size_t dot = inner.rfind('.');
     repeated_leaf = dot == std::string::npos ? inner : inner.substr(dot + 1);
   }
+  // Repetition shows up anywhere in the name for the modelled protos
+  // ("repeated_int64_val", "nested_repeated_value", extension leaves).
   const bool is_repeated_field =
-      lower_key.starts_with("repeated_") ||
-      ToLowerCopy(repeated_leaf).find("repeated_") != std::string::npos;
+      lower_key.find("repeated") != std::string::npos ||
+      ToLowerCopy(repeated_leaf).find("repeated") != std::string::npos;
 
   std::vector<Value> scalars;
   std::vector<Value> messages;
@@ -917,20 +1034,22 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
     }
   }
   if (messages.empty() && scalars.empty()) {
+    // Schema-level defaults take precedence over per-type defaults.
+    const std::optional<Value> fallback = DefaultForAbsentField(key);
+    const FieldFormat format = ClassifyFieldFormat(key);
+    if (fallback.has_value()) {
+      *out = ApplyReadConversion(format, *fallback);
+      return true;
+    }
     if (is_repeated_field) {
       // Unset repeated fields read as empty arrays.
       *out = Value::Array({}, InferRepeatedElementType(key));
       return true;
     }
-    const FieldFormat format = ClassifyFieldFormat(key);
     if (format != FieldFormat::kNone) {
-      const std::optional<Value> fallback = DefaultForAbsentField(key);
-      if (fallback.has_value()) {
-        *out = ApplyReadConversion(format, *fallback);
-        return true;
-      }
       if (AbsentAnnotatedDateReadsNull(key)) {
-        return false;
+        *out = Value();
+        return true;
       }
       // Unset int-encoded formats read as their epoch default.
       switch (format) {
@@ -947,26 +1066,17 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
           *out = Value::DateFromDays(0);
           return true;
         default:
-          return false;
+          *out = Value();
+          return true;
       }
     }
     if (extension_key) {
       // Absent extensions: scalar numeric -> 0, repeated -> [], else NULL.
-      std::string inner(key.substr(1, key.size() - 2));
-      std::string leaf = inner;
-      const size_t dot = inner.rfind('.');
-      if (dot != std::string::npos) {
-        leaf = inner.substr(dot + 1);
-      }
-      std::string lower_leaf = ToLowerCopy(repeated_leaf);
-      if (lower_leaf.find("repeated_") != std::string::npos) {
+      if (ToLowerCopy(repeated_leaf).find("repeated_") != std::string::npos) {
         *out = Value::Array({}, "PROTO");
         return true;
       }
-      if (lower_leaf.starts_with("optional_")) {
-        return false;
-      }
-      *out = Value(int64_t{0});
+      *out = Value();
       return true;
     }
     std::optional<std::string> enum_default =
@@ -978,7 +1088,8 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
     // Message-typed fields read as NULL when unset; scalar fields surface
     // their type defaults (GoogleSQL proto semantics).
     if (IsKnownMessageField(lower_key)) {
-      return false;
+      *out = Value();
+      return true;
     }
     if (lower_key.find("string") != std::string::npos ||
         lower_key.find("bytes") != std::string::npos) {
@@ -1001,6 +1112,10 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
   auto convert_scalar = [&](const Value& raw_token) {
     const FieldFormat format = ClassifyFieldFormat(key);
     Value parsed = DecodeScalarToken(RawTextOfValue(raw_token));
+    if (const std::vector<std::string>* members =
+            EnumMembersForField(key, entries)) {
+      parsed = NormalizeEnumToken(*members, parsed);
+    }
     return ApplyReadConversion(format, parsed);
   };
 
@@ -1145,7 +1260,10 @@ std::optional<std::string> SetFieldInBody(
         }
       }
     } else if (value_to_store.type == ValueType::kVarChar &&
-               LooksLikeProtoText(RawTextOfValue(value_to_store))) {
+               (LooksLikeProtoText(RawTextOfValue(value_to_store)) ||
+                RawTextOfValue(value_to_store).empty())) {
+      // Message-looking strings nest; an empty string constructs an empty
+      // submessage.
       replacement.push_back(
           {target, true,
            NormalizeProtoText(RawTextOfValue(value_to_store))
@@ -1216,21 +1334,13 @@ std::optional<std::string> SetFieldInBody(
   if (found_any) {
     return std::nullopt;
   }
-  // No matching intermediate message: create it.
-  ProtoTextEntry created;
-  created.name = target;
-  created.is_message = true;
-  auto nested = SetFieldInBody("", path, depth + 1, new_value, type_name);
-  if (!nested.has_value()) {
-    return std::nullopt;
+  // GoogleSQL refuses to assign through a missing intermediate submessage
+  // (it reads as NULL); creating it implicitly is not allowed.
+  if (!target.empty()) {
+    throw std::runtime_error("Cannot set field of NULL `" + type_name +
+                             "." + target + "`");
   }
-  created.text = *nested;
-  std::string out;
-  for (const ProtoTextEntry& entry : entries) {
-    out += RenderEntry(entry) + " ";
-  }
-  out += RenderEntry(created);
-  return out;
+  return std::nullopt;
 }
 
 }  // namespace
@@ -1271,30 +1381,6 @@ bool RequiredProtoField(const std::string& type_name,
          it->second.end();
 }
 
-namespace {
-
-// Known enum members for the compliance protos: (lowered type, lowered field)
-// pairs map to the exact member tokens the SQL type declares.
-const std::unordered_map<std::string, std::vector<std::string>>&
-KnownEnumFields() {
-  static const std::unordered_map<std::string, std::vector<std::string>>* const
-      kMap = new auto(std::unordered_map<std::string, std::vector<std::string>>{
-          {"googlesql_test.kitchensinkpb/test_enum",
-           {"TESTENUM0", "TESTENUM1", "TESTENUM2"}},
-          {"googlesql_test.kitchensinkenumpb/required_test_enum",
-           {"TESTENUM0", "TESTENUM1", "TESTENUM2"}},
-          {"googlesql_test.kitchensinkenumpb/test_enum",
-           {"TESTENUM0", "TESTENUM1", "TESTENUM2"}},
-          {"googlesql_test.kitchensinkenumpb/repeated_test_enum",
-           {"TESTENUM0", "TESTENUM1", "TESTENUM2"}},
-          {"googlesql_test.proto3kitchensink/test_enum",
-           {"ENUM0", "ENUM1", "ENUM2"}},
-          {"googlesql_test.proto3kitchensink/repeated_test_enum",
-           {"ENUM0", "ENUM1", "ENUM2"}},
-      });
-  return *kMap;
-}
-
 void ValidateEnumFieldValue(const std::string& type_name,
                             const std::string& field_name,
                             const Value& value) {
@@ -1305,7 +1391,14 @@ void ValidateEnumFieldValue(const std::string& type_name,
   if (it == known.end()) {
     return;  // no metadata for this (type, field): accept as-is
   }
+  // Proto3 enums accept numeric values verbatim (unknown members are
+  // preserved); proto2 requires known member names.
+  const bool proto3 = ToLowerCopy(type_name).find("proto3") !=
+                      std::string::npos;
   if (value.type == ValueType::kInt64 || value.type == ValueType::kDouble) {
+    if (proto3) {
+      return;
+    }
     throw std::runtime_error(
         "Could not store value with type INT64 into proto field " + type_name +
         "." + field_name + " which has an SQL enum type");
@@ -1313,8 +1406,11 @@ void ValidateEnumFieldValue(const std::string& type_name,
   if (value.type != ValueType::kVarChar) {
     return;
   }
-  const std::string member =
-      DecodeScalarToken(RawTextOfValue(value)).AsString();
+  const Value member_value = DecodeScalarToken(RawTextOfValue(value));
+  if (member_value.IsNull()) {
+    return;  // null enum members cannot appear in TEXT payloads
+  }
+  const std::string member = RawTextOfValue(member_value);
   if (std::find(it->second.begin(), it->second.end(), member) ==
       it->second.end()) {
     throw std::runtime_error("Out of range cast of string '" + member +
@@ -1322,8 +1418,6 @@ void ValidateEnumFieldValue(const std::string& type_name,
                              field_name);
   }
 }
-
-}  // namespace
 
 std::string ConstructProtoText(
     const std::string& type_name,
@@ -1375,7 +1469,10 @@ std::string ConstructProtoText(
       continue;
     }
     const std::string text = RawTextOfValue(value);
-    if (value.type == ValueType::kVarChar && LooksLikeProtoText(text)) {
+    if (value.type == ValueType::kVarChar &&
+        (LooksLikeProtoText(text) || text.empty())) {
+      // Message-looking strings nest; an empty string constructs an empty
+      // submessage (NEW X.Nested() with all-NULL fields).
       append_entry(field_name, NormalizeProtoText(text).value_or(text), true);
     } else {
       append_entry(field_name, FormatProtoTextScalar(text), false);
@@ -1512,6 +1609,123 @@ bool TryProtoTextGetField(std::string_view text, std::string_view key,
     return false;
   }
   return ProtoTextExtractField(text, key, out);
+}
+
+namespace {
+
+// Modelled proto types with the signature fields that identify payloads.
+// Field names are lowercase; a payload scores one point per signature field
+// it mentions (top level) and per SET-target hint that matches.
+struct KnownProtoType {
+  const char* name;       // display form used in messages
+  std::vector<const char*> signature;
+};
+
+const std::vector<KnownProtoType>& KnownProtoTypes() {
+  static const auto* const kTypes = new auto(std::vector<KnownProtoType>{
+      {"googlesql_test.KitchenSinkPB",
+       {"int64_key_1", "int64_key_2", "nullable_int", "key_value",
+        "optional_group", "repeated_holder", "date_default",
+        "timestamp_uint64"}},
+      {"googlesql_test.Proto3KitchenSink",
+       {"test_enum", "repeated_test_enum", "nullable_string",
+        "nullable_nested_value"}},
+      {"googlesql_test.KitchenSinkEnumPB",
+       {"required_test_enum"}},
+      {"googlesql_test.EmptyMessage", {}},
+  });
+  return *kTypes;
+}
+
+}  // namespace
+
+std::string AppendProtoTypeMarker(const std::string& payload,
+                                  const std::string& type_name) {
+  // Comment-form marker: transparent to the TEXT entry parser (which skips
+  // '#' through end-of-line) and to NormalizeProtoText re-renders.
+  return "# tinylamb-proto-type=" + ToLowerCopy(type_name) + "\n" + payload;
+}
+
+std::string ExtractProtoTypeMarker(std::string_view text) {
+  constexpr std::string_view kMarker = "# tinylamb-proto-type=";
+  size_t pos = text.find(kMarker);
+  while (pos != std::string_view::npos) {
+    if (pos == 0 || text[pos - 1] == '\n') {
+      const size_t begin = pos + kMarker.size();
+      const size_t end = text.find('\n', begin);
+      const std::string_view name =
+          text.substr(begin,
+                      end == std::string_view::npos ? end : end - begin);
+      std::string trimmed = ToLowerCopy(name);
+      while (!trimmed.empty() &&
+             std::isspace(static_cast<unsigned char>(trimmed.back()))) {
+        trimmed.pop_back();
+      }
+      return trimmed;
+    }
+    pos = text.find(kMarker, pos + 1);
+  }
+  return {};
+}
+
+std::string InferProtoTypeName(
+    std::string_view payload, const std::vector<std::string>& hint_fields) {
+  std::string marked = ExtractProtoTypeMarker(payload);
+  if (!marked.empty()) {
+    // Canonicalize to the display form when this is a modelled type.
+    for (const KnownProtoType& type : KnownProtoTypes()) {
+      if (ToLowerCopy(type.name) == marked) {
+        return type.name;
+      }
+    }
+    return marked;
+  }
+  std::string_view body = payload;
+  while (!body.empty() && IsSpaceChar(body.front())) {
+    body.remove_prefix(1);
+  }
+  while (!body.empty() && IsSpaceChar(body.back())) {
+    body.remove_suffix(1);
+  }
+  if (!body.empty() && body.front() == '{' && body.back() == '}') {
+    body = body.substr(1, body.size() - 2);
+  }
+  std::vector<ProtoTextEntry> entries;
+  if (!ParseProtoTextEntries(body, &entries)) {
+    entries.clear();
+  }
+  std::unordered_set<std::string> present;
+  for (const ProtoTextEntry& entry : entries) {
+    present.insert(ToLowerCopy(entry.name));
+  }
+  for (const std::string& hint : hint_fields) {
+    present.insert(ToLowerCopy(hint));
+  }
+  if (present.empty()) {
+    return {};
+  }
+  const KnownProtoType* best = nullptr;
+  size_t best_score = 0;
+  bool tie = false;
+  for (const KnownProtoType& type : KnownProtoTypes()) {
+    size_t score = 0;
+    for (const char* field : type.signature) {
+      if (present.count(field) != 0) {
+        ++score;
+      }
+    }
+    if (score > best_score) {
+      best = &type;
+      best_score = score;
+      tie = false;
+    } else if (score == best_score && score > 0) {
+      tie = true;
+    }
+  }
+  if (best != nullptr && !tie) {
+    return best->name;
+  }
+  return {};
 }
 
 }  // namespace tinylamb

@@ -60,6 +60,21 @@ namespace tinylamb {
 
 namespace {
 
+// Case-insensitive identifier equality (mirrors the SQL name resolution
+// used throughout the engine).
+bool CaseInsensitiveEquals(std::string_view left, std::string_view right) {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < left.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(left[i])) !=
+        std::tolower(static_cast<unsigned char>(right[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Dotted references whose qualifier names a COLUMN (not a FROM relation)
 // address encoded fields of proto / struct payloads: "value.int32_val",
 // "t.value.nested_value.nested_int64".  Rewrite them into chained
@@ -121,7 +136,8 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
     Expression& exp,
     const std::unordered_map<std::string, std::string>& col_table_map,
     const std::unordered_set<std::string>& ambiguous_colum_name,
-    const std::unordered_set<std::string>& relations) {
+    const std::unordered_set<std::string>& relations,
+    const std::vector<ColumnName>& all_cols) {
   if (!exp) {
     return Status::kSuccess;
   }
@@ -143,6 +159,20 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
     }
     const auto it = col_table_map.find(ToLowerCopy(col_name.name));
     if (it == col_table_map.end()) {
+      // A bare name that matches a FROM relation (its alias or table name)
+      // denotes that relation's whole row as a struct ("SELECT s FROM t s").
+      if (relations.contains(ToLowerCopy(col_name.name))) {
+        std::vector<Expression> args;
+        for (const ColumnName& column : all_cols) {
+          if (!CaseInsensitiveEquals(column.schema, col_name.name)) {
+            continue;
+          }
+          args.push_back(ConstantValueExp(Value(std::string(column.name))));
+          args.push_back(ColumnValueExp(column));
+        }
+        exp = FunctionCallExp("__struct_json__", std::move(args));
+        return Status::kSuccess;
+      }
       return Status::kNotExists;
     }
     cv.SetSchemaName(it->second);
@@ -152,13 +182,13 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
     Expression left = exp->AsBinaryExpression().Left();
     Expression right = exp->AsBinaryExpression().Right();
     RETURN_IF_FAIL(ResolveExpression(left, col_table_map, ambiguous_colum_name,
-                                     relations));
+                                     relations, all_cols));
     RETURN_IF_FAIL(ResolveExpression(right, col_table_map, ambiguous_colum_name,
-                                     relations));
+                                     relations, all_cols));
   } else if (exp->Type() == TypeTag::kUnaryExp) {
     Expression child = exp->AsUnaryExpression().Child();
     RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
-                                     relations));
+                                     relations, all_cols));
   } else if (exp->Type() == TypeTag::kAggregateExp) {
     Expression child = exp->AsAggregateExpression().Child();
     if (child->Type() == TypeTag::kColumnValue &&
@@ -166,33 +196,33 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
       return Status::kSuccess;
     }
     RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
-                                     relations));
+                                     relations, all_cols));
   } else if (exp->Type() == TypeTag::kCaseExp) {
     const auto& case_expression = exp->AsCaseExpression();
     for (const auto& clause : case_expression.when_clauses_) {
       Expression condition = clause.first;
       Expression value = clause.second;
       RETURN_IF_FAIL(ResolveExpression(condition, col_table_map,
-                                       ambiguous_colum_name, relations));
+                                       ambiguous_colum_name, relations, all_cols));
       RETURN_IF_FAIL(ResolveExpression(value, col_table_map,
-                                       ambiguous_colum_name, relations));
+                                       ambiguous_colum_name, relations, all_cols));
     }
     Expression otherwise = case_expression.else_clause_;
     RETURN_IF_FAIL(ResolveExpression(otherwise, col_table_map,
-                                     ambiguous_colum_name, relations));
+                                     ambiguous_colum_name, relations, all_cols));
   } else if (exp->Type() == TypeTag::kInExp) {
     const auto& in = exp->AsInExpression();
     Expression child = in.child_;
     RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
-                                     relations));
+                                     relations, all_cols));
     for (Expression item : in.list_) {
       RETURN_IF_FAIL(ResolveExpression(item, col_table_map,
-                                       ambiguous_colum_name, relations));
+                                       ambiguous_colum_name, relations, all_cols));
     }
   } else if (exp->Type() == TypeTag::kFunctionCallExp) {
     for (Expression argument : exp->AsFunctionCallExpression().Args()) {
       RETURN_IF_FAIL(ResolveExpression(argument, col_table_map,
-                                       ambiguous_colum_name, relations));
+                                       ambiguous_colum_name, relations, all_cols));
     }
   }
   return Status::kSuccess;
@@ -223,12 +253,28 @@ Status ResolveSelect(
       if (!col_name.schema.empty()) {
         Expression expression = it->expression;
         RETURN_IF_FAIL(ResolveExpression(expression, col_table_map,
-                                         ambiguous_colum_name, relations));
+                                         ambiguous_colum_name, relations, all_cols));
         ++it;
         continue;
       }
       const auto col_it = col_table_map.find(ToLowerCopy(col_name.name));
       if (col_it == col_table_map.end()) {
+        // A bare name matching a FROM relation denotes its whole row as a
+        // struct ("SELECT s FROM t s"): encode every column of that relation
+        // explicitly so projection keeps them alive.
+        if (relations.contains(ToLowerCopy(col_name.name))) {
+          std::vector<Expression> args;
+          for (const ColumnName& column : all_cols) {
+            if (!CaseInsensitiveEquals(column.schema, col_name.name)) {
+              continue;
+            }
+            args.push_back(ConstantValueExp(Value(std::string(column.name))));
+            args.push_back(ColumnValueExp(column));
+          }
+          it->expression = FunctionCallExp("__struct_json__", std::move(args));
+          ++it;
+          continue;
+        }
         return Status::kNotExists;
       }
       cv.SetSchemaName(col_it->second);
@@ -236,7 +282,7 @@ Status ResolveSelect(
     } else {
       Expression expression = it->expression;
       RETURN_IF_FAIL(ResolveExpression(expression, col_table_map,
-                                       ambiguous_colum_name, relations));
+                                       ambiguous_colum_name, relations, all_cols));
       ++it;
     }
   }
@@ -290,7 +336,7 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
 
   // Rewrite WHERE clause.
   return ResolveExpression(where_, col_table_map, ambiguous_colum_name,
-                           relations);
+                           relations, all_cols);
 }
 
 }  // namespace tinylamb

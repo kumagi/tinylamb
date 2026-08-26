@@ -34,6 +34,7 @@
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
 #include "expression/evaluation_context.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/interval_expression.hpp"
 #include "expression/proto_text.hpp"
 #include "expression/sql_udf.hpp"
@@ -655,6 +656,73 @@ Value ExecuteFunction(const std::string& name,
     return Value(EncodeStructJson(fields));
   }
 
+  if (name == "__proto_new") {
+    // NEW ProtoType(v1 AS f1, ...) / SELECT AS ProtoType: argument layout is
+    // (type_name, value1, field1, value2, field2, ...).  Builds the proto
+    // TEXT payload; required-field and enum-member violations throw.
+    if (values.size() % 2 != 1) {
+      throw std::runtime_error("__proto_new requires (type, v, f, ...)");
+    }
+    const std::string type_name = raw_str(values[0]);
+    std::vector<std::pair<std::string, Value>> fields;
+    fields.reserve(values.size() / 2);
+    for (size_t i = 1; i < values.size(); i += 2) {
+      fields.emplace_back(raw_str(values[i + 1]), values[i]);
+    }
+    return Value(ConstructProtoText(type_name, fields));
+  }
+  if (name == "__proto_set") {
+    // Dotted SET targets over proto TEXT columns: (payload, path, new_value).
+    if (values.size() != 3) {
+      throw std::runtime_error("__proto_set requires 3 arguments");
+    }
+    std::vector<std::string> path;
+    {
+      std::string_view joined = raw_str(values[1]);
+      size_t start = 0;
+      while (true) {
+        const size_t dot = joined.find('.', start);
+        if (dot == std::string_view::npos) {
+          path.emplace_back(joined.substr(start));
+          break;
+        }
+        path.emplace_back(joined.substr(start, dot - start));
+        start = dot + 1;
+      }
+    }
+    const std::string type_name =
+        InferProtoTypeName(values[0].IsNull() ? std::string_view()
+                                              : raw_str(values[0]),
+                           path);
+    if (values[0].IsNull()) {
+      throw std::runtime_error("Cannot set field of NULL `" +
+                               (type_name.empty() ? std::string("PROTO")
+                                                  : type_name) +
+                               "`");
+    }
+    const std::string payload = raw_str(values[0]);
+    auto rewritten = ProtoTextSetField(payload, path, values[2], type_name);
+    return Value(rewritten.value_or(payload));
+  }
+  if (name == "__get_extension") {
+    // value.(pkg.Ext.field): reads the bracketed extension entry from a
+    // proto TEXT payload; NULL bases yield NULL.
+    if (values.size() != 2) {
+      throw std::runtime_error("__get_extension requires 2 arguments");
+    }
+    if (values[0].IsNull()) {
+      return {};
+    }
+    const std::string base = raw_str(values[0]);
+    const std::string key = "[" + raw_str(values[1]) + "]";
+    Value out;
+    if (!TryProtoTextGetField(base, key, &out)) {
+      throw std::runtime_error("extension " + raw_str(values[1]) +
+                               " not found");
+    }
+    return out;
+  }
+
   // SQL scalar UDFs registered by CREATE FUNCTION: evaluate the body against
   // a synthetic single-row scope holding the argument values.
   if (std::optional<SqlScalarFunction> udf = FindSqlScalarFunction(name)) {
@@ -942,6 +1010,30 @@ std::unordered_set<ColumnName> FunctionCallExpression::TouchedColumns() const {
 
 Value FunctionCallExpression::Evaluate(const Row& row,
                                        const Schema& schema) const {
+  if (func_name_ == "__row_struct") {
+    // Bare alias row reference ("SELECT s FROM t s"): encodes the columns
+    // qualified by the given alias as a struct JSON object.  Evaluated with
+    // the scope's full row so multi-source queries pick their own columns.
+    if (args_.size() != 1 || args_[0]->Type() != TypeTag::kConstantValue) {
+      throw std::runtime_error("__row_struct requires an alias literal");
+    }
+    std::string alias;
+    const Value& alias_value = args_[0]->AsConstantValue().GetValue();
+    if (!alias_value.IsNull()) {
+      alias = alias_value.type == ValueType::kVarChar
+                  ? std::string(alias_value.value.varchar_value)
+                  : alias_value.AsString();
+    }
+    std::vector<std::pair<std::string, Value>> fields;
+    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+      const ColumnName& column = schema.GetColumn(i).Name();
+      if (!alias.empty() && !IdentifierEquals(column.schema, alias)) {
+        continue;
+      }
+      fields.emplace_back(column.name, row.values_[i]);
+    }
+    return Value(EncodeStructJson(fields));
+  }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
       throw std::runtime_error("DATE_ADD/DATE_SUB requires DATE and INTERVAL");

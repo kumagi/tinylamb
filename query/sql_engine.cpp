@@ -44,6 +44,7 @@
 #include "executor/update.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/expression.hpp"
+#include "expression/proto_text.hpp"
 #include "expression/rewrite.hpp"
 #include "plan/optimizer.hpp"
 #include "plan/plan.hpp"
@@ -1328,12 +1329,47 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
   for (auto& [new_row, row_position] : pending) {
     for (const auto& target : field_targets) {
       Value& cell = new_row.values_[target.offset];
+      // Struct JSON objects start with '{'; proto TEXT payloads never do.
+      // Proto cells (and NULLs whose target addresses a modelled proto
+      // field) rewrite through the shared dotted-field setter; required-
+      // field and enum-member violations surface as errors.
+      const bool json_cell = !cell.IsNull() &&
+                             cell.type == ValueType::kVarChar &&
+                             !cell.value.varchar_value.empty() &&
+                             cell.value.varchar_value.front() == '{';
+      std::string_view payload =
+          !json_cell && !cell.IsNull() && cell.type == ValueType::kVarChar
+              ? std::string_view(cell.value.varchar_value)
+              : std::string_view();
+      const std::string proto_type =
+          json_cell ? std::string()
+                    : InferProtoTypeName(payload, target.segments);
+      const bool proto_cell = !json_cell && !proto_type.empty();
+      if (proto_cell) {
+        if (cell.IsNull()) {
+          throw std::runtime_error("Cannot set field of NULL `" + proto_type +
+                                   "`");
+        }
+        relational_detail::Scope row_scope{.row = &new_row,
+                                           .schema = &schema,
+                                           .outer = nullptr};
+        const Value assigned =
+            relational_detail::Evaluate(*target.value, row_scope, nullptr, ctx,
+                                        relational_detail::CteMap{});
+        ValidateEnumFieldValue(
+            proto_type, target.segments.empty() ? std::string()
+                                                : target.segments.back(),
+            assigned);
+        auto rewritten =
+            ProtoTextSetField(std::string(payload), target.segments, assigned,
+                              proto_type);
+        if (rewritten.has_value()) {
+          cell = Value(std::move(*rewritten));
+        }
+        continue;
+      }
       if (cell.IsNull()) {
         throw std::runtime_error("Cannot set field of NULL STRUCT");
-      }
-      if (cell.type != ValueType::kVarChar) {
-        throw std::runtime_error(
-            "struct field assignment requires a STRUCT column");
       }
       const std::string text(cell.value.varchar_value);
       relational_detail::Scope row_scope{.row = &new_row,

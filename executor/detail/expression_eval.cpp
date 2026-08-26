@@ -648,6 +648,20 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
         }
       }
       if (owned.empty()) {
+        // Relational-path scans (INSERT ... SELECT and other routes outside
+        // the QueryData rewriter) carry no per-column relation identity.
+        // When the alias names none of this scope's columns either, it still
+        // denotes the whole row as a struct.
+        bool names_a_column = false;
+        for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+          if (IdentifierEquals(schema.GetColumn(i).Name().name, name.name)) {
+            names_a_column = true;
+            break;
+          }
+        }
+        if (!names_a_column && schema.ColumnCount() > 0) {
+          return RowAsStructValue(*current->row, schema);
+        }
         continue;
       }
       Row aliased;
@@ -3689,10 +3703,6 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments.size() != 3) {
       throw std::runtime_error("__proto_set requires 3 arguments");
     }
-    if (arguments[0].IsNull()) {
-      throw std::runtime_error("Cannot set field of NULL STRUCT");
-    }
-    const std::string payload = raw_str(arguments[0]);
     std::vector<std::string> path;
     {
       const std::string joined = raw_str(arguments[1]);
@@ -3707,8 +3717,21 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         start = dot + 1;
       }
     }
-    auto rewritten =
-        ProtoTextSetField(payload, path, arguments[2], std::string());
+    // Resolve the type before the NULL check so error messages can name it.
+    const std::string type_name =
+        InferProtoTypeName(arguments[0].IsNull() ? std::string_view()
+                                                 : raw_str(arguments[0]),
+                           path);
+    if (arguments[0].IsNull()) {
+      throw std::runtime_error("Cannot set field of NULL `" +
+                               (type_name.empty() ? std::string("PROTO")
+                                                  : type_name) +
+                               "`");
+    }
+    const std::string payload = raw_str(arguments[0]);
+    ValidateEnumFieldValue(
+        type_name, path.empty() ? std::string() : path.back(), arguments[2]);
+    auto rewritten = ProtoTextSetField(payload, path, arguments[2], type_name);
     return Value(rewritten.value_or(payload));
   }
   if (name == "__get_extension") {
@@ -8389,6 +8412,12 @@ std::vector<slot_t> RequiredColumns(const SelectStatement& statement,
         selects_star || std::ranges::any_of(referenced, [&](const auto& name) {
           if (name.name == "*") {
             return false;
+          }
+          // A bare reference naming this relation's qualifier (`s` for an
+          // aliased scan) is a whole-row struct read: keep every column.
+          if (name.schema.empty() &&
+              IdentifierEquals(name.name, candidate.schema)) {
+            return true;
           }
           // GoogleSQL identifiers are case-insensitive; references may also
           // qualify this relation by table name or any alias.  Over-
