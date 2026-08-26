@@ -79,6 +79,19 @@ std::string ElementSqlTypeName(ValueType type) {
   }
 }
 
+Value CanonicalDistinctValue(const Value& value) {
+  if (value.type == ValueType::kDouble) {
+    const double d = value.value.double_value;
+    if (std::isnan(d)) {
+      return Value(std::numeric_limits<double>::quiet_NaN());
+    }
+    if (d == 0.0) {
+      return Value(0.0);  // -0.0 folds to +0.0
+    }
+  }
+  return value;
+}
+
 namespace {
 
 bool IdentifierEquals(std::string_view left, std::string_view right) {
@@ -406,7 +419,7 @@ void AggregateAccumulator::ApplyCore(
       if (!distinct_ints->insert(value.value.int_value).second) {
         return;
       }
-    } else if (!distinct->insert(value).second) {
+    } else if (!distinct->insert(CanonicalDistinctValue(value)).second) {
       return;
     }
   }
@@ -1252,7 +1265,11 @@ Value AggregateAccumulator::Finish() const {
       // STRING_AGG delimiter comes from the first buffered row.
       if (expression->GetType() == AggregationType::kStringAgg &&
           !delimiter_.has_value() && !row.auxiliary.IsNull()) {
-        delimiter_ = row.auxiliary.AsString();
+        // Raw text: AsString wraps VARCHAR values in display quotes.
+        const Value& delim = row.auxiliary;
+        delimiter_ = delim.type == ValueType::kVarChar
+                         ? std::string(delim.value.varchar_value)
+                         : delim.AsString();
       }
     }
     buffer_.reset();  // replayed
@@ -1281,7 +1298,8 @@ Value AggregateAccumulator::Finish() const {
       return extreme;
     case AggregationType::kLogicalAnd:
     case AggregationType::kLogicalOr:
-      return extreme.IsNull() ? Value(int64_t{1}) : extreme;
+      // No non-NULL input: LOGICAL_AND/OR are NULL, not vacuously true.
+      return extreme.IsNull() ? Value() : extreme;
     case AggregationType::kArrayAgg: {
       // An empty input produces a NULL array, not an empty one.
       if (array_values_.empty()) {
@@ -1301,12 +1319,22 @@ Value AggregateAccumulator::Finish() const {
       return Value::Array(array_values_, std::move(element_type));
     }
     case AggregationType::kStringAgg: {
+      // No rows: STRING_AGG is NULL, not the empty string.
+      if (array_values_.empty()) {
+        return {};
+      }
       std::string out;
       for (size_t i = 0; i < array_values_.size(); ++i) {
         if (i) {
           out += delimiter_.value_or(",");
         }
-        out += array_values_[i].AsString();
+        // Raw text, not AsString(): AsString wraps VARCHAR values in quotes.
+        const Value& element = array_values_[i];
+        if (element.IsNull()) { continue;
+}
+        out += element.type == ValueType::kVarChar
+                   ? std::string(element.value.varchar_value)
+                   : element.AsString();
       }
       return Value(std::move(out));
     }

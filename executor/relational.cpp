@@ -51,6 +51,35 @@
 
 namespace tinylamb::relational_detail {
 
+// SQL equality for group keys: NaN equals NaN and -0 equals +0, unlike raw
+// IEEE Value::operator== which never folds NaNs together.
+struct GroupKeyEqual {
+  bool operator()(const Row& a, const Row& b) const {
+    if (a.values_.size() != b.values_.size()) { return false;
+}
+    for (size_t i = 0; i < a.values_.size(); ++i) {
+      const Value& x = a.values_[i];
+      const Value& y = b.values_[i];
+      if (x.type != y.type) { return false;
+}
+      if (x.type == ValueType::kDouble) {
+        const double p = x.value.double_value;
+        const double q = y.value.double_value;
+        if (std::isnan(p) && std::isnan(q)) { continue;
+}
+        if (!(p == q)) { return false;
+}
+        continue;
+      }
+      if (!(x == y)) { return false;
+      }
+    }
+    return true;
+  }
+};
+using GroupKeyMap =
+    std::unordered_map<Row, size_t, std::hash<Row>, GroupKeyEqual>;
+
 namespace {
 
 // HAVING may reference select-list aliases (`HAVING double_avg > 0.7`).
@@ -173,13 +202,15 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
   };
   std::deque<AggregateAccumulator> aggregate_states;
   auto accumulate_row = [&](const Row& row,
-                            std::unordered_map<Row, size_t>* offsets,
+                            GroupKeyMap* offsets,
                             std::vector<GroupState>* local_groups,
                             std::deque<AggregateAccumulator>* local_states) {
     Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
     std::vector<Value> key_values;
     for (const Expression& key : statement.GroupBy()) {
-      key_values.push_back(Evaluate(key, scope, nullptr, context, ctes));
+      // Canonicalize so NaN/-0 keys fold like SQL equality demands.
+      key_values.push_back(
+          CanonicalDistinctValue(Evaluate(key, scope, nullptr, context, ctes)));
     }
     Row key(std::move(key_values));
     auto [iter, inserted] = offsets->emplace(key, local_groups->size());
@@ -268,7 +299,9 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
         Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
         std::vector<Value> key_values;
         for (const Expression& key : statement.GroupBy()) {
-          key_values.push_back(Evaluate(key, scope, nullptr, context, ctes));
+          key_values.push_back(
+              CanonicalDistinctValue(Evaluate(key, scope, nullptr, context,
+                                              ctes)));
         }
         Row key(std::move(key_values));
         parts[SpillPartitionOf(key.EncodeMemcomparableFormat(),
@@ -281,7 +314,7 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       // Every row was copied into a partition above.
       input.ResetContents();
       for (size_t part = 0; part < kSpillPartitions; ++part) {
-        std::unordered_map<Row, size_t> offsets;
+        GroupKeyMap offsets;
         std::vector<GroupState> local_groups;
         std::deque<AggregateAccumulator> local_states;
         parts[part].ForEachRow([&](const Row& row) {
@@ -297,7 +330,7 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
         }
       }
     } else {
-      std::unordered_map<Row, size_t> offsets;
+      GroupKeyMap offsets;
       input.ForEachRow([&](const Row& row) {
         accumulate_row(row, &offsets, &groups, &aggregate_states);
       });
@@ -740,7 +773,7 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     };
     std::deque<AggregateAccumulator> aggregate_states;
     std::vector<GroupState> groups;
-    std::unordered_map<Row, size_t> offsets;
+    GroupKeyMap offsets;
 
     std::vector<std::optional<slot_t>> group_offsets;
     group_offsets.reserve(stmt.GroupBy().size());
@@ -788,11 +821,13 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       key_values.reserve(stmt.GroupBy().size());
       if (group_keys_are_columns) {
         for (const auto& offset : group_offsets) {
-          key_values.push_back(row[*offset]);
+          key_values.push_back(CanonicalDistinctValue(row[*offset]));
         }
       } else {
         for (const Expression& key : stmt.GroupBy()) {
-          key_values.push_back(Evaluate(key, scope, nullptr, context, ctes));
+          key_values.push_back(
+              CanonicalDistinctValue(Evaluate(key, scope, nullptr, context,
+                                              ctes)));
         }
       }
       Row key(std::move(key_values));
@@ -1102,6 +1137,7 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
 }  // namespace tinylamb::relational_detail
 
 namespace tinylamb {
+
 
 using relational_detail::CountStatementTables;
 using relational_detail::ExecuteQuery;

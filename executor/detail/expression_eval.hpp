@@ -52,6 +52,11 @@ struct AggregateInput {
 
 std::string ElementSqlTypeName(ValueType type);
 
+// DISTINCT/GROUP-BY key normalization: every NaN collapses to one canonical
+// bit pattern and negative zero folds to +0, matching SQL equality semantics
+// where raw IEEE bit patterns would otherwise count NaNs as distinct.
+[[nodiscard]] Value CanonicalDistinctValue(const Value& value);
+
 struct AggregateAccumulator {
   explicit AggregateAccumulator(const AggregateExpression* aggregate);
 

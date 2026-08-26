@@ -31,6 +31,7 @@
 #include "common/constants.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "executor/query_memory.hpp"
+#include "executor/detail/expression_eval.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/named_expression.hpp"
 #include "page/row_position.hpp"
@@ -151,6 +152,21 @@ int64_t CheckedAdd(int64_t lhs, int64_t rhs) {
     throw std::runtime_error("integer overflow on '+'");
   }
   return result;
+}
+
+// The typed fast path only understands COUNT/SUM/AVG; every other kind
+// (MIN/MAX with NaN poisoning, STRING_AGG, COUNTIF, ARRAY_AGG,
+// LOGICAL_AND/OR, statistical and sketch aggregates) routes through the
+// general accumulator, which owns NULL/DISTINCT/HAVING/ORDER-BY semantics.
+bool IsTypedAggregate(AggregationType type) {
+  switch (type) {
+    case AggregationType::kCount:
+    case AggregationType::kSum:
+    case AggregationType::kAvg:
+      return true;
+    default:
+      return false;
+  }
 }
 
 }  // namespace
@@ -333,6 +349,19 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
   results.resize(aggregates_.size());
   std::vector<int64_t> counts(aggregates_.size(), 0);
   std::vector<std::unordered_set<Value>> distinct_values(aggregates_.size());
+  // General accumulators for aggregate kinds the typed switches do not
+  // model (kept in aggregate order).
+  std::vector<std::unique_ptr<relational_detail::AggregateAccumulator>>
+      accumulators(aggregates_.size());
+  for (size_t i = 0; i < aggregates_.size(); ++i) {
+    const auto& agg = aggregates_[i].expression->AsAggregateExpression();
+    if (IsTypedAggregate(agg.GetType())) {
+      continue;
+    }
+    accumulators[i] =
+        std::make_unique<relational_detail::AggregateAccumulator>(
+            &aggregates_[i].expression->AsAggregateExpression());
+  }
   for (size_t i = 0; i < aggregates_.size(); ++i) {
     const auto& agg = aggregates_[i].expression->AsAggregateExpression();
     switch (agg.GetType()) {
@@ -354,8 +383,49 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
 }
     for (size_t row_index = 0; row_index < input_batch_.Size(); ++row_index) {
       std::optional<Row> materialized;
+      auto materialize = [&]() -> const Row& {
+        if (!materialized) { materialized = input_batch_.RowAt(row_index);
+}
+        return *materialized;
+      };
       for (size_t i = 0; i < aggregates_.size(); ++i) {
         const auto& agg = aggregates_[i].expression->AsAggregateExpression();
+        // Non-typed aggregates own their full semantics via the accumulator.
+        if (accumulators[i]) {
+          if (agg.WhereFilter()) {
+            relational_detail::Scope scope{.row = &materialize(),
+                                           .schema = &input_schema_,
+                                           .outer = nullptr};
+            if (!relational_detail::Truthy(
+                    agg.WhereFilter()->Evaluate(*scope.row, *scope.schema))) {
+              continue;
+            }
+          }
+          relational_detail::AggregateInput input;
+          if (!IsCountStar(agg)) {
+            input.value =
+                agg.Child()->Evaluate(materialize(), input_schema_);
+          } else {
+            input.value = Value(1);
+          }
+          for (const auto& term : agg.InnerOrderBy()) {
+            input.order_keys.push_back(
+                term.expression->Evaluate(materialize(), input_schema_));
+          }
+          if (agg.GetType() == AggregationType::kStringAgg &&
+              agg.SecondaryArg()) {
+            input.auxiliary =
+                agg.SecondaryArg()->Evaluate(materialize(), input_schema_);
+          }
+          for (const Expression& extra : agg.TrailingArgs()) {
+            if (extra) {
+              input.trailing_values.push_back(
+                  extra->Evaluate(materialize(), input_schema_));
+            }
+          }
+          accumulators[i]->Add(std::move(input));
+          continue;
+        }
         Value val;
         if (IsCountStar(agg)) {
           val = Value(1);
@@ -366,21 +436,19 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
             val = input_batch_.ColumnAt(static_cast<size_t>(offset))
                       .ValueAt(row_index);
           } else {
-            if (!materialized) { materialized = input_batch_.RowAt(row_index);
-}
-            val = agg.Child()->Evaluate(*materialized, input_schema_);
+            val = agg.Child()->Evaluate(materialize(), input_schema_);
           }
         } else {
-          if (!materialized) { materialized = input_batch_.RowAt(row_index);
-}
-          val = agg.Child()->Evaluate(*materialized, input_schema_);
+          val = agg.Child()->Evaluate(materialize(), input_schema_);
         }
         if (val.IsNull()) { continue;
 }
         if (agg.Distinct()) {
           const size_t bytes = EstimateValueBytes(val);
           QueryMemoryBudget::Global().ReserveForced(bytes);
-          if (!distinct_values[i].insert(val).second) {
+          if (!distinct_values[i]
+                   .insert(relational_detail::CanonicalDistinctValue(val))
+                   .second) {
             QueryMemoryBudget::Global().Release(bytes);
             continue;
           }
@@ -438,6 +506,11 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
       default:
         // NOP
         break;
+    }
+  }
+  for (size_t i = 0; i < aggregates_.size(); ++i) {
+    if (accumulators[i]) {
+      results[i] = accumulators[i]->Finish();
     }
   }
 
