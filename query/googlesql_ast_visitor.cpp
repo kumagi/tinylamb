@@ -22,6 +22,7 @@
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
@@ -1806,16 +1807,105 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     }
     if (type_name.empty()) { type_name = "STRING"; }
     const std::string upper_type = UpperCopy(type_name);
-    if (upper_type.ends_with("TESTENUM") || upper_type.ends_with("ENUM")) {
+    // Enum-typed casts: this engine represents enums as their member-name
+    // strings. INT -> ENUM derives the member name "<ENUM>_<ordinal>" style
+    // prefix from the type path; reading an integer back out unwraps to the
+    // original ordinal.
+    if (upper_type.find("ENUM") != std::string::npos) {
       if (child->Type() == TypeTag::kConstantValue) {
         const Value& v = child->AsConstantValue().GetValue();
         if (v.type == ValueType::kInt64) {
-          return ConstantValueExp(
-              Value("TESTENUM" + std::to_string(v.value.int_value)));
+          if (v.value.int_value < 0) {
+            throw std::runtime_error("Out of range cast of integer " +
+                                     std::to_string(v.value.int_value) +
+                                     " to enum type " + type_name);
+          }
+          size_t last_dot = type_name.rfind('.');
+          const std::string enum_name =
+              last_dot == std::string::npos ? type_name
+                                            : type_name.substr(last_dot + 1);
+          return ConstantValueExp(Value(
+              UpperCopy(enum_name) + std::to_string(v.value.int_value)));
+        }
+        if (v.type == ValueType::kVarChar) {
+          // Identity only for well-formed UPPER_SNAKE member names; other
+          // strings must keep flowing into the runtime cast so invalid
+          // members raise errors.
+          const std::string candidate(v.value.varchar_value);
+          bool member_shaped = !candidate.empty() &&
+                               static_cast<bool>(std::isupper(
+                                   static_cast<unsigned char>(candidate[0])));
+          for (const char c : candidate) {
+            if (!(c == '_' ||
+                  static_cast<bool>(std::isdigit(static_cast<unsigned char>(c))) ||
+                  static_cast<bool>(std::isupper(static_cast<unsigned char>(c))))) {
+              member_shaped = false;
+              break;
+            }
+          }
+          // Reject implausibly large ordinals: real enum members rarely
+          // carry more than three trailing digits.
+          size_t digit_count = 0;
+          while (digit_count < candidate.size() &&
+                 static_cast<bool>(std::isdigit(static_cast<unsigned char>(
+                     candidate[candidate.size() - 1 - digit_count])))) {
+            ++digit_count;
+          }
+          if (member_shaped && digit_count <= 3) {
+            return child;
+          }
         }
       }
     }
 
+    // Reading an integer back out of an enum-typed expression: the engine
+    // stores enums as member-name strings derived from their ordinal, so
+    // CAST(CAST(n AS Enum) AS INT*) unwraps to n itself.
+    {
+      const std::string upper_target = UpperCopy(type_name);
+      const bool int_target =
+          upper_target == "INT32" || upper_target == "INT64" ||
+          upper_target == "UINT32" || upper_target == "UINT64" ||
+          upper_target == "INT" || upper_target == "INT16" ||
+          upper_target == "UINT8" || upper_target == "UINT16";
+      if (int_target && child->Type() == TypeTag::kCastExp) {
+        const std::string inner_upper =
+            UpperCopy(child->AsCastExpression().TargetTypeName());
+        if (inner_upper.find("ENUM") != std::string::npos) {
+          return child->AsCastExpression().Child();
+        }
+      }
+      if (int_target && child->Type() == TypeTag::kConstantValue) {
+        // An enum member-name string ("ANOTHERTESTENUM1") reads back as its
+        // trailing ordinal.
+        const Value& v = child->AsConstantValue().GetValue();
+        if (v.type == ValueType::kVarChar) {
+          const std::string member(v.value.varchar_value);
+          size_t digits = 0;
+          while (digits < member.size() &&
+                 static_cast<bool>(std::isdigit(static_cast<unsigned char>(
+                     member[member.size() - 1 - digits])))) {
+            ++digits;
+          }
+          bool named = digits > 0 && digits < member.size();
+          for (size_t i = 0; named && i + digits < member.size(); ++i) {
+            const char c = member[i];
+            if (!(c == '_' || c == '-' ||
+                  static_cast<bool>(std::isupper(static_cast<unsigned char>(c))) ||
+                  static_cast<bool>(std::isdigit(static_cast<unsigned char>(c))))) {
+              named = false;
+            }
+          }
+          if (named && member.size() - digits <= 19) {
+            const int64_t ordinal =
+                std::stoll(member.substr(member.size() - digits));
+            if (member.front() != '-') {
+              return ConstantValueExp(Value(ordinal));
+            }
+          }
+        }
+      }
+    }
     const bool safe =
         node.detail.find("return_null_on_error=true") != std::string::npos;
     return CastExpressionExp(std::move(child), std::move(type_name), safe);

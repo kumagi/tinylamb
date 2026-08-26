@@ -655,6 +655,11 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
                                  lower_type.size() - lower_type.find('<') - 2));
       if (unwrapped == lower_actual_type) { lower_type = lower_actual_type; }
     }
+    // Engines that store enums as their member-name strings report
+    // STRING-typed arrays where the reference prints ENUM<T>.
+    if (lower_type.starts_with("enum<") && lower_actual_type == "string") {
+      lower_type = lower_actual_type;
+    }
     if (!lower_type.empty() && lower_type != lower_actual_type) {
       const bool struct_or_proto =
           lower_type.starts_with("struct<") || lower_type.starts_with("proto<");
