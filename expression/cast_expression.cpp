@@ -306,6 +306,39 @@ Value CastValue(const Value& val, const std::string& type_name,
   if (val.IsNull()) { return Value(); }
   const std::string upper = ToUpper(type_name);
   const bool is_bool = (upper == "BOOL" || upper == "BOOLEAN");
+  // ENUM-typed targets accept their textual member names verbatim: this
+  // engine stores enums as their member-name strings.
+  if (!is_bool && upper.find("ENUM") != std::string::npos &&
+      val.type == ValueType::kVarChar) {
+    // Member names are case-sensitive UPPER_SNAKE identifiers.
+    const std::string member(val.value.varchar_value);
+    bool member_shaped =
+        !member.empty() &&
+        static_cast<bool>(std::isupper(static_cast<unsigned char>(
+            member.front())));
+    for (const char c : member) {
+      if (!(c == '_' || static_cast<bool>(std::isdigit(
+                              static_cast<unsigned char>(c))) ||
+            static_cast<bool>(std::isupper(static_cast<unsigned char>(c))))) {
+        member_shaped = false;
+        break;
+      }
+    }
+    // Members with implausibly large ordinals are invalid for real enums;
+    // keep them erroring through the numeric path (no enum metadata here).
+    size_t digits = 0;
+    while (digits < member.size() &&
+           static_cast<bool>(std::isdigit(static_cast<unsigned char>(
+               member[member.size() - 1 - digits])))) {
+      ++digits;
+    }
+    if (member_shaped && digits <= 3) { return val; }
+    if (member_shaped) {
+      if (safe) { return Value(); }
+      throw std::runtime_error("Out of range cast of string '" + member +
+                               "' to enum type " + type_name);
+    }
+  }
 
   try {
     if (is_bool) {
@@ -348,6 +381,68 @@ Value CastValue(const Value& val, const std::string& type_name,
           size_t end = s.find_last_not_of(" \t\r\n");
           s = s.substr(start, end - start + 1);
 
+          // GoogleSQL accepts hex literals in integer casts: an optional
+          // sign followed by 0x / 0X and hexadecimal digits.
+          size_t hex_body = 0;
+          bool hex_negative = false;
+          if (!s.empty() && (s[0] == '-' || s[0] == '+')) {
+            hex_negative = s[0] == '-';
+            hex_body = 1;
+          }
+          if (s.size() >= hex_body + 3 && s[hex_body] == '0' &&
+              (s[hex_body + 1] == 'x' || s[hex_body + 1] == 'X')) {
+            const std::string digits = s.substr(hex_body + 2);
+            uint64_t magnitude = 0;
+            const char* d_begin = digits.data();
+            const char* d_end = digits.data() + digits.size();
+            auto [d_ptr, d_ec] =
+                std::from_chars(d_begin, d_end, magnitude, 16);
+            if (d_ec != std::errc() || d_ptr != d_end) {
+              throw std::runtime_error("invalid integer string: " + s);
+            }
+            const bool unsigned_target =
+                upper == "UINT8" || upper == "UINT16" || upper == "UINT32" ||
+                upper == "UINT64";
+            const bool int32_target =
+                upper == "INT32" || upper == "INT" || upper == "INTEGER" ||
+                upper == "INT16" || upper == "INT8";
+            const bool uint32_target = upper == "UINT32" ||
+                                       upper == "UINT16" ||
+                                       upper == "UINT8";
+            if (hex_negative &&
+                (unsigned_target || magnitude > 0x8000000000000000ULL)) {
+              throw std::runtime_error(
+                  "Bad " + upper + " value: " + s);
+            }
+            if (!hex_negative && magnitude > 0x7fffffffffffffffULL &&
+                !unsigned_target) {
+              throw std::runtime_error("int overflow casting from string: " +
+                                       s);
+            }
+            auto out_of_range = [&](uint64_t magnitude_value) {
+              if (int32_target &&
+                  magnitude_value > (hex_negative ? 0x80000000ULL
+                                                  : 0x7FFFFFFFULL)) {
+                return true;
+              }
+              if (unsigned_target && !hex_negative) {
+                const uint64_t limit = uint32_target ? 0xFFFFFFFFULL
+                                      : upper == "UINT64"
+                                          ? 0xFFFFFFFFFFFFFFFFULL
+                                          : 0xFFFFULL;
+                return magnitude_value > limit;
+              }
+              return false;
+            };
+            if (out_of_range(magnitude)) {
+              throw std::runtime_error(
+                  upper + " out of range: " + s);
+            }
+            if (hex_negative) {
+              return Value(static_cast<int64_t>(~magnitude + 1));
+            }
+            return Value(static_cast<int64_t>(magnitude));
+          }
           int64_t result = 0;
           const char* begin_ptr = s.data();
           const char* end_ptr = s.data() + s.size();

@@ -2569,6 +2569,81 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(FormatCivilTime(res_ct));
   }
+  // Control flow functions must observe conditional-evaluation semantics:
+  // untaken branches (and error-handled operands) are never evaluated, so a
+  // division by zero or an invalid cast inside them cannot surface.
+  // Branch results are normalized to the common supertype of every branch
+  // (GoogleSQL coerces INT64 branch arms to FLOAT64 when any arm is a
+  // float), keeping downstream comparisons type-consistent.
+  auto promotes_to_double = [&](const std::vector<Expression>& exprs) {
+    for (const Expression& branch : exprs) {
+      if (scope.schema == nullptr) { continue; }
+      try {
+        if (branch->ResultType(*scope.schema).GetType() == TypeTag::kDouble) {
+          return true;
+        }
+      } catch (const std::exception&) {
+        // Static types are unavailable for subqueries/aggregates; the
+        // runtime value types then stand on their own.
+      }
+    }
+    return false;
+  };
+  auto normalize = [](Value value, bool to_double) {
+    if (to_double && !value.IsNull() && value.type == ValueType::kInt64) {
+      return Value(static_cast<double>(value.value.int_value));
+    }
+    return value;
+  };
+  if (name == "if") {
+    if (call.Args().size() != 3) {
+      throw std::runtime_error("IF requires 3 arguments");
+    }
+    const bool as_double =
+        promotes_to_double({call.Args()[1], call.Args()[2]});
+    const Value condition =
+        Evaluate(call.Args()[0], scope, aggregates, context, ctes);
+    const bool take_then = !condition.IsNull() && Truthy(condition);
+    return normalize(
+        Evaluate(call.Args()[take_then ? 1 : 2], scope, aggregates, context,
+                 ctes), as_double);
+  }
+  if (name == "iferror") {
+    if (call.Args().size() != 2) {
+      throw std::runtime_error("IFERROR requires 2 arguments");
+    }
+    const bool as_double = promotes_to_double(call.Args());
+    try {
+      return normalize(
+          Evaluate(call.Args()[0], scope, aggregates, context, ctes),
+          as_double);
+    } catch (const std::exception&) {
+      return normalize(
+          Evaluate(call.Args()[1], scope, aggregates, context, ctes),
+          as_double);
+    }
+  }
+  if (name == "iserror") {
+    if (call.Args().size() != 1) {
+      throw std::runtime_error("ISERROR requires 1 argument");
+    }
+    try {
+      Evaluate(call.Args()[0], scope, aggregates, context, ctes);
+      return Value(false);
+    } catch (const std::exception&) {
+      return Value(true);
+    }
+  }
+  if (name == "nulliferror") {
+    if (call.Args().size() != 1) {
+      throw std::runtime_error("NULLIFERROR requires 1 argument");
+    }
+    try {
+      return Evaluate(call.Args()[0], scope, aggregates, context, ctes);
+    } catch (const std::exception&) {
+      return Value();
+    }
+  }
   std::vector<Value> arguments;
   for (const Expression& argument : call.Args()) {
     arguments.push_back(Evaluate(argument, scope, aggregates, context, ctes));
@@ -2777,12 +2852,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     throw std::runtime_error("unsupported extract field: " + name);
   }
-  // Control flow
-  if (name == "if") {
+  if (name == "__struct_set") {
     if (arguments.size() != 3) {
-      throw std::runtime_error("IF requires 3 arguments");
+      throw std::runtime_error("__struct_set requires 3 arguments");
     }
-    return arguments[0].Truthy() ? arguments[1] : arguments[2];
+    return StructSetField(arguments[0], raw_str(arguments[1]), arguments[2]);
   }
   if (name == "coalesce") {
     for (Value& value : arguments) {
@@ -3412,6 +3486,39 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     return elements[static_cast<size_t>(index)];
+  }
+  if (name == "__get_field_safe") {
+    // Field access tolerating NULL bases / missing members (returns NULL);
+    // used for dotted struct references inside DML predicates.
+    if (arguments.size() != 2) {
+      throw std::runtime_error("__get_field_safe requires 2 arguments");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    std::string object = raw_str(arguments[0]);
+    const std::string field_name = raw_str(arguments[1]);
+    if (object.size() < 2 || object.front() != '{' ||
+        object.back() != '}') {
+      return {};
+    }
+    const auto members =
+        SplitJsonObjectMembers(object.substr(1, object.size() - 2));
+    for (const auto& [key, text] : members) {
+      if (key.size() == field_name.size() &&
+          std::equal(key.begin(), key.end(), field_name.begin(),
+                     [](char lhs, char rhs) {
+                       return std::tolower(static_cast<unsigned char>(lhs)) ==
+                              std::tolower(static_cast<unsigned char>(rhs));
+                     })) {
+        Value parsed;
+        if (!JsonTextToValue(text, &parsed)) {
+          return {};
+        }
+        return parsed;
+      }
+    }
+    return {};
   }
   if (name == "get_field") {
     if (arguments.size() != 2) {
@@ -7165,7 +7272,9 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
         return membership.IsNull() ? Value() : Value(!membership.Truthy());
       }
       std::optional<Row> first;
+      size_t row_count = 0;
       row_source.ForEachRow([&](const Row& row) {
+        ++row_count;
         // Scalar subquery: only the first row matters.
         if (!first) {
           first = row;
@@ -7173,6 +7282,11 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       });
       if (!first || first->values_.empty()) {
         return {};
+      }
+      if (row_count > 1) {
+        // GoogleSQL: a scalar subquery must produce at most one row.
+        throw std::runtime_error(
+            "Scalar subquery produced more than one row");
       }
       return ProjectSubqueryRow(*first, as_struct, &subquery_schema);
     }

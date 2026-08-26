@@ -72,6 +72,25 @@ bool RowsMatch(const std::vector<Row>& actual,
                const GoogleSqlComplianceCase& test_case, std::string* detail) {
   auto matches_expected = [&](const Row& row,
                               const std::vector<std::string>& expected) {
+    // Value-table goldens print a whole-row NULL as a single "NULL" token;
+    // engines that store the struct flattened (one column per field) present
+    // the same row as all-NULL columns.
+    auto lower_trim = [](const std::string& s) {
+      const char* ws = " \t\r\n";
+      size_t b = s.find_first_not_of(ws);
+      if (b == std::string::npos) { return std::string(); }
+      size_t e = s.find_last_not_of(ws);
+      std::string out = s.substr(b, e - b + 1);
+      for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      return out;
+    };
+    if (expected.size() == 1 && lower_trim(expected[0]) == "null" &&
+        row.values_.size() > 1) {
+      return std::all_of(row.values_.begin(), row.values_.end(),
+                         [](const Value& v) { return v.IsNull(); });
+    }
     if (row.values_.size() != expected.size()) { return false; }
     for (size_t i = 0; i < expected.size(); ++i) {
       if (!ComplianceValueMatches(row.values_[i], expected[i])) { return false; }

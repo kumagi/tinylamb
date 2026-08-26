@@ -429,24 +429,42 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
   }
 
   if (has_order_by) {
+    // Ordering compares keys of dynamically-typed expressions: GoogleSQL
+    // computes each key in the common supertype of its row-wise results, so
+    // INT64 and DOUBLE keys compare numerically instead of by type tag.
+    auto key_less = [&order_by](const Value& a, const Value& b,
+                                size_t i) -> std::optional<bool> {
+      if (a.IsNull() || b.IsNull()) {
+        const bool nulls_first =
+            order_by[i].nulls_first.value_or(order_by[i].ascending);
+        if (a.IsNull() && b.IsNull()) { return std::nullopt; }
+        return a.IsNull() ? std::optional(nulls_first)
+                          : std::optional(!nulls_first);
+      }
+      if (a == b) { return std::nullopt; }
+      bool less = false;
+      if (a.type == b.type) {
+        less = a < b;
+      } else if (a.type == ValueType::kInt64 && b.type == ValueType::kDouble) {
+        less = static_cast<double>(a.value.int_value) < b.value.double_value;
+      } else if (a.type == ValueType::kDouble &&
+                 b.type == ValueType::kInt64) {
+        less = a.value.double_value < static_cast<double>(b.value.int_value);
+      } else {
+        less = a < b;
+      }
+      return order_by[i].ascending ? std::optional(less)
+                                   : std::optional(!less);
+    };
     const auto sort_begin = std::chrono::steady_clock::now();
     std::ranges::stable_sort(
         sortable, [&](const KeyedRow& left, const KeyedRow& right) {
           for (size_t i = 0; i < order_by.size(); ++i) {
-            const Value& a = left.keys[i];
-            const Value& b = right.keys[i];
-            if (a == b) {
-              continue;
+            const std::optional<bool> outcome =
+                key_less(left.keys[i], right.keys[i], i);
+            if (outcome.has_value()) {
+              return *outcome;
             }
-            const bool nulls_first =
-                order_by[i].nulls_first.value_or(order_by[i].ascending);
-            if (a.IsNull()) {
-              return nulls_first;
-            }
-            if (b.IsNull()) {
-              return !nulls_first;
-            }
-            return order_by[i].ascending ? a < b : b < a;
           }
           return false;
         });

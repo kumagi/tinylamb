@@ -43,6 +43,13 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+// JSON struct-text helpers; definitions live below with external linkage.
+std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
+    const std::string& body);
+bool JsonTextToValue(const std::string& text, Value* parsed);
+bool IdentifierEquals(std::string_view left, std::string_view right);
+
 namespace {
 
 struct CivilTime {
@@ -273,7 +280,87 @@ Value ExecuteFunction(const std::string& name,
     }
     return val.AsString();
   };
+  if (name == "__struct_set") {
+    if (values.size() != 3) {
+      throw std::runtime_error("__struct_set requires 3 arguments");
+    }
+    return StructSetField(values[0], raw_str(values[1]), values[2]);
+  }
+  if (name == "get_field") {
+    if (values.size() != 2) {
+      throw std::runtime_error("get_field requires 2 arguments");
+    }
+    if (values[0].IsNull()) { return {}; }
+    const std::string object = raw_str(values[0]);
+    const std::string field = raw_str(values[1]);
+    if (object.size() < 2 || object.front() != '{' || object.back() != '}') {
+      throw std::runtime_error("get_field requires a STRUCT");
+    }
+    for (const auto& [key, text] :
+         SplitJsonObjectMembers(object.substr(1, object.size() - 2))) {
+      if (IdentifierEquals(key, field)) {
+        Value parsed;
+        if (!JsonTextToValue(text, &parsed)) {
+          throw std::runtime_error("get_field: malformed member value");
+        }
+        return parsed;
+      }
+    }
+    throw std::runtime_error("field not found: " + field);
+  }
+  if (name == "__get_field_safe") {
+    // Field access that tolerates NULL bases and missing members by
+    // returning NULL; used for dotted references in DML predicates.
+    if (values.size() != 2) {
+      throw std::runtime_error("__get_field_safe requires 2 arguments");
+    }
+    if (values[0].IsNull()) { return {}; }
+    const std::string object = raw_str(values[0]);
+    const std::string field = raw_str(values[1]);
+    if (object.size() < 2 || object.front() != '{' || object.back() != '}') {
+      return {};
+    }
+    for (const auto& [key, text] :
+         SplitJsonObjectMembers(object.substr(1, object.size() - 2))) {
+      if (IdentifierEquals(key, field)) {
+        Value parsed;
+        if (!JsonTextToValue(text, &parsed)) { return {}; }
+        return parsed;
+      }
+    }
+    return {};
+  }
 
+  if (name == "__struct_set") {
+    if (values.size() != 3) {
+      throw std::runtime_error("__struct_set requires 3 arguments");
+    }
+    return StructSetField(values[0], raw_str(values[1]), values[2]);
+  }
+  if (name == "get_field") {
+    if (values.size() != 2) {
+      throw std::runtime_error("get_field requires 2 arguments");
+    }
+    if (values[0].IsNull()) { return {};
+}
+    const std::string object = raw_str(values[0]);
+    const std::string field = raw_str(values[1]);
+    if (object.size() < 2 || object.front() != '{' || object.back() != '}') {
+      throw std::runtime_error("get_field requires a STRUCT");
+    }
+    const auto members = SplitJsonObjectMembers(object.substr(
+        1, object.size() - 2));
+    for (const auto& [key, text] : members) {
+      if (IdentifierEquals(key, field)) {
+        Value parsed;
+        if (!JsonTextToValue(text, &parsed)) {
+          throw std::runtime_error("get_field: malformed member value");
+        }
+        return parsed;
+      }
+    }
+    throw std::runtime_error("field not found: " + field);
+  }
   if (name == "coalesce") {
     for (const auto& val : values) {
       if (!val.IsNull()) { return val; }
@@ -524,7 +611,273 @@ Value ExecuteFunction(const std::string& name,
   }
   throw std::runtime_error("Function calls are not yet executable: " + name);
 }
+
 }  // namespace
+
+
+// ---- Struct (JSON text) helpers shared by the evaluators and the DML
+// mapping. Struct values are stored as flat JSON objects:
+//   {"field":value,"nested":{"x":1}}
+// ---------------------------------------------------------------------------
+
+bool IsJsonSpace(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+bool IdentifierEquals(std::string_view left, std::string_view right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(),
+                    [](char lhs, char rhs) {
+                      return std::tolower(static_cast<unsigned char>(lhs)) ==
+                             std::tolower(static_cast<unsigned char>(rhs));
+                    });
+}
+
+std::string TrimJson(std::string s) {
+  size_t b = 0;
+  while (b < s.size() && IsJsonSpace(s[b])) { ++b; }
+  size_t e = s.size();
+  while (e > b && IsJsonSpace(s[e - 1])) { --e; }
+  return s.substr(b, e - b);
+}
+
+std::string EscapeJsonText(std::string_view text) {
+  std::string escaped;
+  escaped.reserve(text.size());
+  for (const char c : text) {
+    switch (c) {
+      case '"': escaped += "\\\""; break;
+      case '\\': escaped += "\\\\"; break;
+      case '\n': escaped += "\\n"; break;
+      case '\t': escaped += "\\t"; break;
+      case '\r': escaped += "\\r"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          snprintf(buf, sizeof(buf), "\\u%04x",
+                   static_cast<unsigned char>(c));
+          escaped += buf;
+        } else {
+          escaped.push_back(c);
+        }
+    }
+  }
+  return escaped;
+}
+
+// Splits a JSON object body into top-level key / raw-value-text pairs.
+std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
+    const std::string& body) {
+  std::vector<std::pair<std::string, std::string>> members;
+  int depth = 0;
+  bool in_str = false;
+  char quote = '\0';
+  std::string current;
+  auto flush = [&]() {
+    const std::string member = TrimJson(current);
+    if (member.empty()) { return; }
+    size_t colon = std::string::npos;
+    int d2 = 0;
+    bool s2 = false;
+    char q2 = '\0';
+    for (size_t i = 0; i < member.size(); ++i) {
+      const char c = member[i];
+      if (s2) {
+        if (c == '\\' && i + 1 < member.size()) { ++i; }
+        else if (c == q2) { s2 = false; }
+        continue;
+      }
+      if (c == '"' || c == '\'') { s2 = true; q2 = c; }
+      else if (c == '{' || c == '[') { ++d2; }
+      else if (c == '}' || c == ']') { --d2; }
+      else if (c == ':' && d2 == 0) { colon = i; break; }
+    }
+    std::string key =
+        colon == std::string::npos ? member : member.substr(0, colon);
+    std::string value_text =
+        colon == std::string::npos ? "" : member.substr(colon + 1);
+    key = TrimJson(key);
+    if (key.size() >= 2 && key.front() == '"' && key.back() == '"') {
+      key = key.substr(1, key.size() - 2);
+    }
+    members.emplace_back(std::move(key), TrimJson(value_text));
+    current.clear();
+  };
+  for (size_t i = 0; i < body.size(); ++i) {
+    const char c = body[i];
+    if (in_str) {
+      current.push_back(c);
+      if (c == '\\' && i + 1 < body.size()) {
+        current.push_back(body[++i]);
+      } else if (c == quote) {
+        in_str = false;
+      }
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      in_str = true;
+      quote = c;
+      current.push_back(c);
+    } else if (c == '{' || c == '[') {
+      ++depth;
+      current.push_back(c);
+    } else if (c == '}' || c == ']') {
+      --depth;
+      current.push_back(c);
+    } else if (c == ',' && depth == 0) {
+      flush();
+    } else {
+      current.push_back(c);
+    }
+  }
+  flush();
+  return members;
+}
+
+bool JsonTextToValue(const std::string& text, Value* parsed) {
+  const std::string trimmed = TrimJson(text);
+  if (trimmed == "null") { *parsed = Value(); return true; }
+  if (trimmed == "true") { *parsed = Value(int64_t{1}); return true; }
+  if (trimmed == "false") { *parsed = Value(int64_t{0}); return true; }
+  if (trimmed.size() >= 2 && trimmed.front() == '"' &&
+      trimmed.back() == '"') {
+    std::string unescaped;
+    unescaped.reserve(trimmed.size());
+    for (size_t i = 1; i + 1 < trimmed.size(); ++i) {
+      if (trimmed[i] == '\\' && i + 2 < trimmed.size()) {
+        ++i;
+        switch (trimmed[i]) {
+          case 'n': unescaped.push_back('\n'); break;
+          case 't': unescaped.push_back('\t'); break;
+          case 'r': unescaped.push_back('\r'); break;
+          default: unescaped.push_back(trimmed[i]); break;
+        }
+      } else {
+        unescaped.push_back(trimmed[i]);
+      }
+    }
+    *parsed = Value(std::move(unescaped));
+    return true;
+  }
+  if (!trimmed.empty()) {
+    try {
+      size_t consumed = 0;
+      const int64_t as_int = std::stoll(trimmed, &consumed);
+      if (consumed == trimmed.size()) {
+        *parsed = Value(as_int);
+        return true;
+      }
+      const double as_double = std::stod(trimmed, &consumed);
+      if (consumed == trimmed.size()) {
+        *parsed = Value(as_double);
+        return true;
+      }
+    } catch (const std::exception&) {
+    }
+  }
+  std::string lowered_head;
+  if (!trimmed.empty()) {
+    lowered_head = trimmed.substr(0, 5);
+    for (char& c : lowered_head) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+  }
+  if (!trimmed.empty() && trimmed.back() == ']' &&
+      ((trimmed.front() == '{' && trimmed.back() == '}') ||
+       trimmed.front() == '[' || lowered_head == "array")) {
+    // Objects / bare arrays / canonical ARRAY<T>[...] tokens stay as raw
+    // struct-member text.
+    *parsed = Value(std::string(trimmed));
+    return true;
+  }
+  return false;
+}
+
+std::string EncodeStructMemberJson(const Value& value) {
+  if (value.IsNull()) { return "null"; }
+  switch (value.type) {
+    case ValueType::kInt64:
+      return std::to_string(value.value.int_value);
+    case ValueType::kDouble: {
+      char buffer[64];
+      auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer),
+                                     value.value.double_value);
+      (void)ec;
+      return std::string(buffer, ptr - buffer);
+    }
+    case ValueType::kDate:
+      return "\"" + EscapeJsonText(FormatDateDays(value.DateDays())) + "\"";
+    case ValueType::kVarChar: {
+      const std::string text(value.value.varchar_value);
+      // Nested structs and arrays are already JSON-shaped; embed verbatim.
+      if (text.size() >= 2 &&
+          ((text.front() == '{' && text.back() == '}') ||
+           (text.front() == '[' && text.back() == ']'))) {
+        return text;
+      }
+      return "\"" + EscapeJsonText(text) + "\"";
+    }
+    case ValueType::kArray: {
+      // Match the canonical struct-constructor storage text, which embeds
+      // arrays via Value::AsString(): "ARRAY<INT64>[50, NULL, 52]".
+      return value.AsString();
+    }
+    default:
+      break;
+  }
+  throw std::runtime_error("cannot encode struct member");
+}
+
+Value StructSetField(const Value& json, const std::string& path,
+                     const Value& new_value) {
+  if (json.IsNull()) { return json; }
+  if (json.type != ValueType::kVarChar) {
+    throw std::runtime_error("struct field assignment requires a STRUCT");
+  }
+  const std::string text(json.value.varchar_value);
+  if (text.size() < 2 || text.front() != '{' || text.back() != '}') {
+    throw std::runtime_error("struct field assignment requires a STRUCT");
+  }
+  size_t dot = path.find('.');
+  const std::string head = dot == std::string::npos ? path : path.substr(0, dot);
+  const std::string rest =
+      dot == std::string::npos ? std::string() : path.substr(dot + 1);
+  const auto members =
+      SplitJsonObjectMembers(text.substr(1, text.size() - 2));
+  std::string rebuilt = "{";
+  bool first = true;
+  bool replaced = false;
+  for (auto& [key, value_text] : members) {
+    if (!first) { rebuilt += ","; }
+    first = false;
+    if (IdentifierEquals(key, head)) {
+      replaced = true;
+      rebuilt += "\"" + EscapeJsonText(key) + "\":";
+      if (rest.empty()) {
+        rebuilt += EncodeStructMemberJson(new_value);
+      } else {
+        Value nested;
+        JsonTextToValue(value_text, &nested);
+        rebuilt += EncodeStructMemberJson(
+            StructSetField(nested, rest, new_value));
+      }
+    } else {
+      rebuilt += "\"" + EscapeJsonText(key) + "\":" + value_text;
+    }
+  }
+  if (!replaced) {
+    if (!first) { rebuilt += ","; }
+    rebuilt += "\"" + EscapeJsonText(head) + "\":";
+    if (rest.empty()) {
+      rebuilt += EncodeStructMemberJson(new_value);
+    } else {
+      rebuilt += EncodeStructMemberJson(
+          StructSetField(Value(std::string("{}")), rest, new_value));
+    }
+  }
+  rebuilt += "}";
+  return Value(std::move(rebuilt));
+}
 
 std::unordered_set<ColumnName> FunctionCallExpression::TouchedColumns() const {
   std::unordered_set<ColumnName> result;
@@ -545,6 +898,66 @@ Value FunctionCallExpression::Evaluate(const Row& row,
 }
     return AddOrSubInterval(func_name_, date,
                             args_[1]->AsIntervalExpression());
+  }
+  // Conditional-evaluation semantics: only the taken (or error-handled)
+  // branch is evaluated, so errors inside untaken branches never surface.
+  // Branch results are normalized to the common supertype of every branch so
+  // downstream comparisons and sort keys stay type-consistent.
+  auto promotes_to_double = [&](const Schema& schema_for_types,
+                                size_t from) {
+    for (size_t i = from; i < args_.size(); ++i) {
+      try {
+        if (args_[i]->ResultType(schema_for_types).GetType() ==
+            TypeTag::kDouble) {
+          return true;
+        }
+      } catch (const std::exception&) {
+      }
+    }
+    return false;
+  };
+  auto normalize = [](Value value, bool to_double) {
+    if (to_double && !value.IsNull() && value.type == ValueType::kInt64) {
+      return Value(static_cast<double>(value.value.int_value));
+    }
+    return value;
+  };
+  if (func_name_ == "if") {
+    if (args_.size() != 3) { throw std::runtime_error("IF requires 3 arguments");
+}
+    const bool as_double = promotes_to_double(schema, 1);
+    return normalize(
+        args_[args_[0]->Evaluate(row, schema).Truthy() ? 1 : 2]->Evaluate(
+            row, schema), as_double);
+  }
+  if (func_name_ == "iferror") {
+    if (args_.size() != 2) { throw std::runtime_error("IFERROR requires 2 arguments");
+}
+    const bool as_double = promotes_to_double(schema, 0);
+    try {
+      return normalize(args_[0]->Evaluate(row, schema), as_double);
+    } catch (const std::exception&) {
+      return normalize(args_[1]->Evaluate(row, schema), as_double);
+    }
+  }
+  if (func_name_ == "iserror") {
+    if (args_.size() != 1) { throw std::runtime_error("ISERROR requires 1 argument");
+}
+    try {
+      args_[0]->Evaluate(row, schema);
+      return Value(int64_t{0});
+    } catch (const std::exception&) {
+      return Value(int64_t{1});
+    }
+  }
+  if (func_name_ == "nulliferror") {
+    if (args_.size() != 1) { throw std::runtime_error("NULLIFERROR requires 1 argument");
+}
+    try {
+      return args_[0]->Evaluate(row, schema);
+    } catch (const std::exception&) {
+      return Value();
+    }
   }
   std::vector<Value> values;
   values.reserve(args_.size());
@@ -584,6 +997,43 @@ Value FunctionCallExpression::Evaluate(const Row* left,
     return AddOrSubInterval(func_name_, date,
                             args_[1]->AsIntervalExpression());
   }
+  // Lazy conditional-evaluation semantics (mirrors the plain overload).
+  if (func_name_ == "if") {
+    if (args_.size() != 3) { throw std::runtime_error("IF requires 3 arguments");
+}
+    const Value condition =
+        args_[0]->Evaluate(left, left_schema, right, right_schema);
+    return args_[condition.Truthy() ? 1 : 2]->Evaluate(
+        left, left_schema, right, right_schema);
+  }
+  if (func_name_ == "iferror") {
+    if (args_.size() != 2) { throw std::runtime_error("IFERROR requires 2 arguments");
+}
+    try {
+      return args_[0]->Evaluate(left, left_schema, right, right_schema);
+    } catch (const std::exception&) {
+      return args_[1]->Evaluate(left, left_schema, right, right_schema);
+    }
+  }
+  if (func_name_ == "iserror") {
+    if (args_.size() != 1) { throw std::runtime_error("ISERROR requires 1 argument");
+}
+    try {
+      args_[0]->Evaluate(left, left_schema, right, right_schema);
+      return Value(int64_t{0});
+    } catch (const std::exception&) {
+      return Value(int64_t{1});
+    }
+  }
+  if (func_name_ == "nulliferror") {
+    if (args_.size() != 1) { throw std::runtime_error("NULLIFERROR requires 1 argument");
+}
+    try {
+      return args_[0]->Evaluate(left, left_schema, right, right_schema);
+    } catch (const std::exception&) {
+      return Value();
+    }
+  }
   std::vector<Value> values;
   values.reserve(args_.size());
   for (const auto& arg : args_) {
@@ -606,6 +1056,41 @@ Value FunctionCallExpression::Evaluate(const Row& row, const Schema& schema,
     return AddOrSubInterval(func_name_, date,
                             args_[1]->AsIntervalExpression());
   }
+  // Lazy conditional-evaluation semantics (mirrors the plain overload).
+  if (func_name_ == "if") {
+    if (args_.size() != 3) { throw std::runtime_error("IF requires 3 arguments");
+}
+    const Value condition = args_[0]->Evaluate(row, schema, context);
+    return args_[condition.Truthy() ? 1 : 2]->Evaluate(row, schema, context);
+  }
+  if (func_name_ == "iferror") {
+    if (args_.size() != 2) { throw std::runtime_error("IFERROR requires 2 arguments");
+}
+    try {
+      return args_[0]->Evaluate(row, schema, context);
+    } catch (const std::exception&) {
+      return args_[1]->Evaluate(row, schema, context);
+    }
+  }
+  if (func_name_ == "iserror") {
+    if (args_.size() != 1) { throw std::runtime_error("ISERROR requires 1 argument");
+}
+    try {
+      args_[0]->Evaluate(row, schema, context);
+      return Value(int64_t{0});
+    } catch (const std::exception&) {
+      return Value(int64_t{1});
+    }
+  }
+  if (func_name_ == "nulliferror") {
+    if (args_.size() != 1) { throw std::runtime_error("NULLIFERROR requires 1 argument");
+}
+    try {
+      return args_[0]->Evaluate(row, schema, context);
+    } catch (const std::exception&) {
+      return Value();
+    }
+  }
   std::vector<Value> values;
   values.reserve(args_.size());
   for (const auto& arg : args_) {
@@ -624,6 +1109,13 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
   if (func_name_ == "if") {
     if (args_.size() < 2) { return {TypeTag::kInvalid}; }
     return args_[1]->ResultType(schema);
+  }
+  if (func_name_ == "iferror" || func_name_ == "nulliferror") {
+    if (args_.empty()) { return {TypeTag::kInvalid}; }
+    return args_[0]->ResultType(schema);
+  }
+  if (func_name_ == "iserror") {
+    return {TypeTag::kBigInt};
   }
   if (func_name_ == "split" || func_name_ == "regexp_extract_all" || func_name_.ends_with("_array")) {
     return {TypeTag::kArray};
@@ -696,6 +1188,13 @@ Type FunctionCallExpression::ResultType(const Schema& left,
   if (func_name_ == "if") {
     if (args_.size() < 2) { return {TypeTag::kInvalid}; }
     return args_[1]->ResultType(left, right);
+  }
+  if (func_name_ == "iferror" || func_name_ == "nulliferror") {
+    if (args_.empty()) { return {TypeTag::kInvalid}; }
+    return args_[0]->ResultType(left, right);
+  }
+  if (func_name_ == "iserror") {
+    return {TypeTag::kBigInt};
   }
   if (func_name_ == "split" || func_name_ == "regexp_extract_all" || func_name_.ends_with("_array")) {
     return {TypeTag::kArray};

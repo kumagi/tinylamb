@@ -23,6 +23,7 @@
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
@@ -1824,16 +1825,105 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
     }
     if (type_name.empty()) { type_name = "STRING"; }
     const std::string upper_type = UpperCopy(type_name);
-    if (upper_type.ends_with("TESTENUM") || upper_type.ends_with("ENUM")) {
+    // Enum-typed casts: this engine represents enums as their member-name
+    // strings. INT -> ENUM derives the member name "<ENUM>_<ordinal>" style
+    // prefix from the type path; reading an integer back out unwraps to the
+    // original ordinal.
+    if (upper_type.find("ENUM") != std::string::npos) {
       if (child->Type() == TypeTag::kConstantValue) {
         const Value& v = child->AsConstantValue().GetValue();
         if (v.type == ValueType::kInt64) {
-          return ConstantValueExp(
-              Value("TESTENUM" + std::to_string(v.value.int_value)));
+          if (v.value.int_value < 0) {
+            throw std::runtime_error("Out of range cast of integer " +
+                                     std::to_string(v.value.int_value) +
+                                     " to enum type " + type_name);
+          }
+          size_t last_dot = type_name.rfind('.');
+          const std::string enum_name =
+              last_dot == std::string::npos ? type_name
+                                            : type_name.substr(last_dot + 1);
+          return ConstantValueExp(Value(
+              UpperCopy(enum_name) + std::to_string(v.value.int_value)));
+        }
+        if (v.type == ValueType::kVarChar) {
+          // Identity only for well-formed UPPER_SNAKE member names; other
+          // strings must keep flowing into the runtime cast so invalid
+          // members raise errors.
+          const std::string candidate(v.value.varchar_value);
+          bool member_shaped = !candidate.empty() &&
+                               static_cast<bool>(std::isupper(
+                                   static_cast<unsigned char>(candidate[0])));
+          for (const char c : candidate) {
+            if (!(c == '_' ||
+                  static_cast<bool>(std::isdigit(static_cast<unsigned char>(c))) ||
+                  static_cast<bool>(std::isupper(static_cast<unsigned char>(c))))) {
+              member_shaped = false;
+              break;
+            }
+          }
+          // Reject implausibly large ordinals: real enum members rarely
+          // carry more than three trailing digits.
+          size_t digit_count = 0;
+          while (digit_count < candidate.size() &&
+                 static_cast<bool>(std::isdigit(static_cast<unsigned char>(
+                     candidate[candidate.size() - 1 - digit_count])))) {
+            ++digit_count;
+          }
+          if (member_shaped && digit_count <= 3) {
+            return child;
+          }
         }
       }
     }
 
+    // Reading an integer back out of an enum-typed expression: the engine
+    // stores enums as member-name strings derived from their ordinal, so
+    // CAST(CAST(n AS Enum) AS INT*) unwraps to n itself.
+    {
+      const std::string upper_target = UpperCopy(type_name);
+      const bool int_target =
+          upper_target == "INT32" || upper_target == "INT64" ||
+          upper_target == "UINT32" || upper_target == "UINT64" ||
+          upper_target == "INT" || upper_target == "INT16" ||
+          upper_target == "UINT8" || upper_target == "UINT16";
+      if (int_target && child->Type() == TypeTag::kCastExp) {
+        const std::string inner_upper =
+            UpperCopy(child->AsCastExpression().TargetTypeName());
+        if (inner_upper.find("ENUM") != std::string::npos) {
+          return child->AsCastExpression().Child();
+        }
+      }
+      if (int_target && child->Type() == TypeTag::kConstantValue) {
+        // An enum member-name string ("ANOTHERTESTENUM1") reads back as its
+        // trailing ordinal.
+        const Value& v = child->AsConstantValue().GetValue();
+        if (v.type == ValueType::kVarChar) {
+          const std::string member(v.value.varchar_value);
+          size_t digits = 0;
+          while (digits < member.size() &&
+                 static_cast<bool>(std::isdigit(static_cast<unsigned char>(
+                     member[member.size() - 1 - digits])))) {
+            ++digits;
+          }
+          bool named = digits > 0 && digits < member.size();
+          for (size_t i = 0; named && i + digits < member.size(); ++i) {
+            const char c = member[i];
+            if (!(c == '_' || c == '-' ||
+                  static_cast<bool>(std::isupper(static_cast<unsigned char>(c))) ||
+                  static_cast<bool>(std::isdigit(static_cast<unsigned char>(c))))) {
+              named = false;
+            }
+          }
+          if (named && member.size() - digits <= 19) {
+            const int64_t ordinal =
+                std::stoll(member.substr(member.size() - digits));
+            if (member.front() != '-') {
+              return ConstantValueExp(Value(ordinal));
+            }
+          }
+        }
+      }
+    }
     const bool safe =
         node.detail.find("return_null_on_error=true") != std::string::npos;
     return CastExpressionExp(std::move(child), std::move(type_name), safe);
@@ -2706,13 +2796,122 @@ std::unique_ptr<Statement> VisitUpdate(const GoogleSqlAstNode& root) {
     throw std::runtime_error("GoogleSQL AST: bad UPDATE");
   }
   std::vector<std::pair<ColumnName, Expression>> assignments;
+  std::vector<NestedDmlItem> nested_items;
+  // Extracts "WHERE <expr>" plus an optional ASSERT_ROWS_MODIFIED from a
+  // nested DELETE/UPDATE statement node; remaining children are ignored
+  // because nested targets are columns, not relations (no alias/RETURNING).
+  auto parse_nested_tail =
+      [](const GoogleSqlAstNode& node, Expression* predicate,
+         int64_t* assert_rows) {
+        std::vector<const GoogleSqlAstNode*> candidates;
+        for (const auto& child : node.children) {
+          if (child->kind == "PathExpression" ||
+              child->kind == "UpdateItemList" ||
+              child->kind == "Location" || child->kind == "Hint" ||
+              child->kind == "AssertRowsModified") {
+            continue;
+          }
+          if (child->kind == "Alias" || child->kind == "ReturningClause" ||
+              child->kind == "FromClause") {
+            continue;
+          }
+          candidates.push_back(child.get());
+        }
+        if (candidates.size() > 1) {
+          throw std::runtime_error(
+              "GoogleSQL AST: multiple nested WHERE clause candidates");
+        }
+        if (!candidates.empty()) {
+          *predicate = VisitExpression(*candidates.front());
+        }
+        if (const GoogleSqlAstNode* assert =
+                node.Child("AssertRowsModified")) {
+          *assert_rows = AssertRowsModifiedValue(*assert);
+        }
+      };
   for (const GoogleSqlAstNode* item : items->Children("UpdateItem")) {
     const GoogleSqlAstNode* set = item->Child("UpdateSetValue");
-    if (set == nullptr || set->children.size() != 2) {
-      throw std::runtime_error("GoogleSQL AST: bad UPDATE assignment");
+    if (set != nullptr && set->children.size() == 2) {
+      assignments.emplace_back(ColumnName(Path(*set->children[0])),
+                               VisitExpression(*set->children[1]));
+      continue;
     }
-    assignments.emplace_back(ColumnName(Path(*set->children[0])),
-                             VisitExpression(*set->children[1]));
+    // Nested DML: SET (DELETE arr WHERE ...), SET (UPDATE arr SET ... WHERE
+    // ...) and SET (INSERT arr VALUES ... / (SELECT ...)).
+    if (const GoogleSqlAstNode* nested = item->Child("DeleteStatement")) {
+      const GoogleSqlAstNode* target = nested->Child("PathExpression");
+      if (target == nullptr) {
+        throw std::runtime_error("GoogleSQL AST: nested DELETE without target");
+      }
+      NestedDmlItem parsed;
+      parsed.kind = NestedDmlItem::Kind::kDelete;
+      parsed.target_path = Path(*target);
+      parse_nested_tail(*nested, &parsed.predicate,
+                        &parsed.assert_rows_modified);
+      nested_items.push_back(std::move(parsed));
+      continue;
+    }
+    if (const GoogleSqlAstNode* nested = item->Child("UpdateStatement")) {
+      const GoogleSqlAstNode* target = nested->Child("PathExpression");
+      const GoogleSqlAstNode* inner_items =
+          nested->Child("UpdateItemList");
+      if (target == nullptr || inner_items == nullptr ||
+          inner_items->Children("UpdateItem").size() != 1) {
+        throw std::runtime_error(
+            "GoogleSQL AST: bad nested UPDATE assignment");
+      }
+      const GoogleSqlAstNode* inner_set =
+          inner_items->Children("UpdateItem").front()->Child("UpdateSetValue");
+      if (inner_set == nullptr || inner_set->children.size() != 2) {
+        throw std::runtime_error(
+            "GoogleSQL AST: bad nested UPDATE assignment");
+      }
+      NestedDmlItem parsed;
+      parsed.kind = NestedDmlItem::Kind::kUpdate;
+      parsed.target_path = Path(*target);
+      parsed.set_value = VisitExpression(*inner_set->children[1]);
+      parse_nested_tail(*nested, &parsed.predicate,
+                        &parsed.assert_rows_modified);
+      nested_items.push_back(std::move(parsed));
+      continue;
+    }
+    if (const GoogleSqlAstNode* nested = item->Child("InsertStatement")) {
+      const GoogleSqlAstNode* target = nested->Child("PathExpression");
+      if (target == nullptr) {
+        throw std::runtime_error("GoogleSQL AST: nested INSERT without target");
+      }
+      NestedDmlItem parsed;
+      parsed.kind = NestedDmlItem::Kind::kInsert;
+      parsed.target_path = Path(*target);
+      if (const GoogleSqlAstNode* row_list =
+              nested->Child("InsertValuesRowList")) {
+        for (const GoogleSqlAstNode* row :
+             row_list->Children("InsertValuesRow")) {
+          std::vector<Expression> values;
+          for (const auto& value : row->children) {
+            if (value->kind == "Location" || value->kind == "Hint") {
+              continue;
+            }
+            values.push_back(VisitExpression(*value));
+          }
+          parsed.insert_values.push_back(std::move(values));
+        }
+      }
+      if (const GoogleSqlAstNode* query = nested->Child("Query")) {
+        parsed.insert_query = VisitQuery(*query);
+      }
+      if (parsed.insert_values.empty() && parsed.insert_query == nullptr) {
+        throw std::runtime_error(
+            "GoogleSQL AST: nested INSERT without values or query");
+      }
+      if (const GoogleSqlAstNode* assert =
+              nested->Child("AssertRowsModified")) {
+        parsed.assert_rows_modified = AssertRowsModifiedValue(*assert);
+      }
+      nested_items.push_back(std::move(parsed));
+      continue;
+    }
+    throw std::runtime_error("GoogleSQL AST: bad UPDATE assignment");
   }
   // The WHERE clause is the single remaining child once the target path and
   // the assignment list are removed. Table aliases, ASSERT_ROWS_MODIFIED,
@@ -2740,6 +2939,12 @@ std::unique_ptr<Statement> VisitUpdate(const GoogleSqlAstNode& root) {
   }
   auto statement = std::make_unique<UpdateStatement>(
       Path(*path), std::move(assignments), std::move(where));
+  statement->SetNestedItems(std::move(nested_items));
+  if (const GoogleSqlAstNode* alias = root.Child("Alias")) {
+    if (const GoogleSqlAstNode* id = alias->Child("Identifier")) {
+      statement->SetAlias(Identifier(*id));
+    }
+  }
   if (const GoogleSqlAstNode* assert = root.Child("AssertRowsModified")) {
     statement->SetAssertRowsModified(AssertRowsModifiedValue(*assert));
   }
@@ -2772,6 +2977,11 @@ std::unique_ptr<Statement> VisitDelete(const GoogleSqlAstNode& root) {
   }
   auto statement =
       std::make_unique<DeleteStatement>(Path(*path), std::move(where));
+  if (const GoogleSqlAstNode* alias = root.Child("Alias")) {
+    if (const GoogleSqlAstNode* id = alias->Child("Identifier")) {
+      statement->SetAlias(Identifier(*id));
+    }
+  }
   if (const GoogleSqlAstNode* assert = root.Child("AssertRowsModified")) {
     statement->SetAssertRowsModified(AssertRowsModifiedValue(*assert));
   }
