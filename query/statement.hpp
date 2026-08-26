@@ -389,6 +389,10 @@ class UpdateStatement : public Statement {
         where_clause_(std::move(where_clause)) {}
 
   const std::string& TableName() const { return table_name_; }
+  // UPDATE tbl AS alias: bare references to the alias denote the whole row
+  // (value tables), so SET/WHERE may bind to the single physical column.
+  const std::string& Alias() const { return alias_; }
+  void SetAlias(std::string alias) { alias_ = std::move(alias); }
   const std::vector<std::pair<ColumnName, Expression>>& SetClause() const {
     return set_clause_;
   }
@@ -425,6 +429,7 @@ class UpdateStatement : public Statement {
 
  private:
   std::string table_name_;
+  std::string alias_;
   std::vector<std::pair<ColumnName, Expression>> set_clause_;
   Expression where_clause_;
   std::vector<NestedDmlItem> nested_items_;
@@ -439,6 +444,8 @@ class DeleteStatement : public Statement {
         where_clause_(std::move(where_clause)) {}
 
   const std::string& TableName() const { return table_name_; }
+  const std::string& Alias() const { return alias_; }
+  void SetAlias(std::string alias) { alias_ = std::move(alias); }
   const Expression& WhereClause() const { return where_clause_; }
   // -1 = no ASSERT_ROWS_MODIFIED clause.
   int64_t AssertRowsModified() const { return assert_rows_modified_; }
@@ -457,6 +464,7 @@ class DeleteStatement : public Statement {
 
  private:
   std::string table_name_;
+  std::string alias_;
   Expression where_clause_;
   int64_t assert_rows_modified_{-1};
 };

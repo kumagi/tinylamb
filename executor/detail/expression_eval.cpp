@@ -2307,6 +2307,12 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     throw std::runtime_error("unsupported extract field: " + name);
   }
+  if (name == "__struct_set") {
+    if (arguments.size() != 3) {
+      throw std::runtime_error("__struct_set requires 3 arguments");
+    }
+    return StructSetField(arguments[0], raw_str(arguments[1]), arguments[2]);
+  }
   if (name == "coalesce") {
     for (Value& value : arguments) {
       if (!value.IsNull()) {
@@ -2926,6 +2932,39 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     return elements[static_cast<size_t>(index)];
+  }
+  if (name == "__get_field_safe") {
+    // Field access tolerating NULL bases / missing members (returns NULL);
+    // used for dotted struct references inside DML predicates.
+    if (arguments.size() != 2) {
+      throw std::runtime_error("__get_field_safe requires 2 arguments");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    std::string object = raw_str(arguments[0]);
+    const std::string field_name = raw_str(arguments[1]);
+    if (object.size() < 2 || object.front() != '{' ||
+        object.back() != '}') {
+      return {};
+    }
+    const auto members =
+        SplitJsonObjectMembers(object.substr(1, object.size() - 2));
+    for (const auto& [key, text] : members) {
+      if (key.size() == field_name.size() &&
+          std::equal(key.begin(), key.end(), field_name.begin(),
+                     [](char lhs, char rhs) {
+                       return std::tolower(static_cast<unsigned char>(lhs)) ==
+                              std::tolower(static_cast<unsigned char>(rhs));
+                     })) {
+        Value parsed;
+        if (!JsonTextToValue(text, &parsed)) {
+          return {};
+        }
+        return parsed;
+      }
+    }
+    return {};
   }
   if (name == "get_field") {
     if (arguments.size() != 2) {

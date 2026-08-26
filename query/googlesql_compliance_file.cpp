@@ -765,6 +765,23 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       if (!out.empty() && out.back() == ' ') { out.pop_back(); }
       return out;
     };
+    auto strip_order_annotations = [](const std::string& s) {
+      std::string out = s;
+      for (const char* note : {"known order:", "unknown order:"}) {
+        size_t pos;
+        const size_t note_len = std::char_traits<char>::length(note);
+        while ((pos = ToLower(out).find(note)) != std::string::npos) {
+          out.erase(pos, note_len);
+        }
+      }
+      return out;
+    };
+    if (normalize_ws(strip_order_annotations(actual_str)) ==
+            normalize_ws(strip_order_annotations(unquoted)) ||
+        normalize_ws(strip_order_annotations(actual_str)) ==
+            normalize_ws(strip_order_annotations(want))) {
+      return true;
+    }
     if (normalize_ws(actual_str) == normalize_ws(unquoted) ||
         normalize_ws(actual_str) == normalize_ws(want) ||
         normalize_ws("{" + actual_str + "}") == normalize_ws(want) ||
@@ -779,17 +796,41 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       std::vector<std::string> want_parts = SplitTopLevel(want.substr(1, want.size() - 2));
       std::vector<std::string> got_parts = SplitTopLevel(norm_actual.substr(1, norm_actual.size() - 2));
       if (want_parts.size() == got_parts.size()) {
+        // Strips a leading `"key":` / bare `key:` marker, ignoring colons
+        // that live inside brackets or quotes (e.g. ARRAY tokens carrying
+        // ordering annotations).
+        auto drop_key = [](std::string elem) -> std::string {
+          int depth = 0;
+          bool in_str = false;
+          char quote = '\0';
+          for (size_t i = 0; i < elem.size(); ++i) {
+            const char c = elem[i];
+            if (in_str) {
+              if (c == '\\' && i + 1 < elem.size()) { ++i; }
+              else if (c == quote) { in_str = false; }
+              continue;
+            }
+            if (c == '"' || c == '\'') { in_str = true; quote = c; }
+            else if (c == '<' || c == '[' || c == '(' || c == '{') { ++depth; }
+            else if (c == '>' || c == ']' || c == ')' || c == '}') {
+              if (depth > 0) { --depth; }
+            } else if (c == ':' && depth == 0 && i + 1 < elem.size()) {
+              return Trim(elem.substr(i + 1));
+            }
+          }
+          return elem;
+        };
         bool matched = true;
         for (size_t idx = 0; idx < want_parts.size(); ++idx) {
-          std::string want_elem = Trim(want_parts[idx]);
-          size_t colon_w = want_elem.find(':');
-          if (colon_w != std::string::npos && colon_w + 1 < want_elem.size()) {
-            want_elem = Trim(want_elem.substr(colon_w + 1));
-          }
-          std::string got_elem = Trim(got_parts[idx]);
-          size_t colon_g = got_elem.find(':');
-          if (colon_g != std::string::npos && colon_g + 1 < got_elem.size()) {
-            got_elem = Trim(got_elem.substr(colon_g + 1));
+          std::string want_elem = drop_key(Trim(want_parts[idx]));
+          std::string got_elem = drop_key(Trim(got_parts[idx]));
+          // A NULL-typed array prints as ARRAY<T>(NULL); treat it as NULL.
+          {
+            const std::string lower_want = ToLower(want_elem);
+            if (lower_want.starts_with("array<") &&
+                lower_want.ends_with("(null)")) {
+              want_elem = "NULL";
+            }
           }
           if (ToLower(got_elem) == "null") {
             if (ToLower(want_elem) != "null") { matched = false; break; }

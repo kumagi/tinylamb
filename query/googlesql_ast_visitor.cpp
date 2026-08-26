@@ -2832,6 +2832,11 @@ std::unique_ptr<Statement> VisitUpdate(const GoogleSqlAstNode& root) {
   auto statement = std::make_unique<UpdateStatement>(
       Path(*path), std::move(assignments), std::move(where));
   statement->SetNestedItems(std::move(nested_items));
+  if (const GoogleSqlAstNode* alias = root.Child("Alias")) {
+    if (const GoogleSqlAstNode* id = alias->Child("Identifier")) {
+      statement->SetAlias(Identifier(*id));
+    }
+  }
   if (const GoogleSqlAstNode* assert = root.Child("AssertRowsModified")) {
     statement->SetAssertRowsModified(AssertRowsModifiedValue(*assert));
   }
@@ -2864,6 +2869,11 @@ std::unique_ptr<Statement> VisitDelete(const GoogleSqlAstNode& root) {
   }
   auto statement =
       std::make_unique<DeleteStatement>(Path(*path), std::move(where));
+  if (const GoogleSqlAstNode* alias = root.Child("Alias")) {
+    if (const GoogleSqlAstNode* id = alias->Child("Identifier")) {
+      statement->SetAlias(Identifier(*id));
+    }
+  }
   if (const GoogleSqlAstNode* assert = root.Child("AssertRowsModified")) {
     statement->SetAssertRowsModified(AssertRowsModifiedValue(*assert));
   }

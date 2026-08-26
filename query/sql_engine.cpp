@@ -44,6 +44,7 @@
 #include "executor/update.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/expression.hpp"
+#include "expression/rewrite.hpp"
 #include "plan/optimizer.hpp"
 #include "plan/plan.hpp"
 #include "query/googlesql_ast.hpp"
@@ -161,6 +162,174 @@ SqlRuntimeStats SqlEngine::ThreadRuntimeStats() {
 }
 
 namespace {
+
+// SQL identifiers compare case-insensitively unless quoted; ColumnName does
+// not retain quotedness, so matching here is always case-insensitive.
+bool IdentifierEquals(std::string_view left, std::string_view right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(),
+                    [](char lhs, char rhs) {
+                      return std::tolower(static_cast<unsigned char>(lhs)) ==
+                             std::tolower(static_cast<unsigned char>(rhs));
+                    });
+}
+
+// INSERT accepts a single STRUCT (or NULL) expression for a multi-column
+// table: struct fields expand positionally across the columns and a whole-row
+// NULL becomes a fully-NULL row. Struct values are stored as JSON text, so
+// expansion parses the top-level object members. Returns false when `single`
+// is not an expandable shape.
+bool ExpandStructInsertValue(const Value& single, size_t width,
+                             std::vector<Value>* out) {
+  if (width <= 1) { return false; }
+  if (single.IsNull()) {
+    *out = std::vector<Value>(width);
+    return true;
+  }
+  const auto json_value_to_value = [](const std::string& token,
+                                      Value* parsed) -> bool {
+    const std::string trimmed = [&] {
+      size_t b = token.find_first_not_of(" \t\r\n");
+      if (b == std::string::npos) { return std::string(); }
+      size_t e = token.find_last_not_of(" \t\r\n");
+      return token.substr(b, e - b + 1);
+    }();
+    if (trimmed == "null") { *parsed = Value(); return true; }
+    if (trimmed == "true") { *parsed = Value(int64_t{1}); return true; }
+    if (trimmed == "false") { *parsed = Value(int64_t{0}); return true; }
+    if (trimmed.size() >= 2 && trimmed.front() == '"' &&
+        trimmed.back() == '"') {
+      std::string unescaped;
+      unescaped.reserve(trimmed.size());
+      for (size_t i = 1; i + 1 < trimmed.size(); ++i) {
+        if (trimmed[i] == '\\' && i + 2 < trimmed.size()) {
+          ++i;
+          switch (trimmed[i]) {
+            case 'n': unescaped.push_back('\n'); break;
+            case 't': unescaped.push_back('\t'); break;
+            case 'r': unescaped.push_back('\r'); break;
+            default: unescaped.push_back(trimmed[i]); break;
+          }
+        } else {
+          unescaped.push_back(trimmed[i]);
+        }
+      }
+      *parsed = Value(std::move(unescaped));
+      return true;
+    }
+    if (!trimmed.empty()) {
+      try {
+        size_t consumed = 0;
+        const int64_t as_int = std::stoll(trimmed, &consumed);
+        if (consumed == trimmed.size()) {
+          *parsed = Value(as_int);
+          return true;
+        }
+        const double as_double = std::stod(trimmed, &consumed);
+        if (consumed == trimmed.size()) {
+          *parsed = Value(as_double);
+          return true;
+        }
+      } catch (const std::exception&) {
+      }
+    }
+    // Nested structs / arrays stay as their raw JSON text.
+    if (!trimmed.empty() &&
+        ((trimmed.front() == '{' && trimmed.back() == '}') ||
+         (trimmed.front() == '[' && trimmed.back() == ']'))) {
+      *parsed = Value(std::string(trimmed));
+      return true;
+    }
+    return false;
+  };
+
+  const auto split_top_level = [](const std::string& body) {
+    std::vector<std::string> parts;
+    int depth = 0;
+    bool in_str = false;
+    char quote = '\0';
+    std::string current;
+    for (size_t i = 0; i < body.size(); ++i) {
+      const char c = body[i];
+      if (in_str) {
+        current.push_back(c);
+        if (c == '\\' && i + 1 < body.size()) {
+          current.push_back(body[++i]);
+        } else if (c == quote) {
+          in_str = false;
+        }
+        continue;
+      }
+      if (c == '"' || c == '\'') {
+        in_str = true;
+        quote = c;
+        current.push_back(c);
+      } else if (c == '{' || c == '[' || c == '(') {
+        ++depth;
+        current.push_back(c);
+      } else if (c == '}' || c == ']' || c == ')') {
+        --depth;
+        current.push_back(c);
+      } else if (c == ',' && depth == 0) {
+        parts.push_back(std::move(current));
+        current.clear();
+      } else {
+        current.push_back(c);
+      }
+    }
+    if (!current.empty()) { parts.push_back(std::move(current)); }
+    return parts;
+  };
+
+  if (single.type != ValueType::kVarChar) { return false; }
+  const std::string text(single.value.varchar_value);
+  if (text.size() < 2 || text.front() != '{' || text.back() != '}') {
+    return false;
+  }
+  const std::vector<std::string> members =
+      split_top_level(text.substr(1, text.size() - 2));
+  if (members.size() != width) { return false; }
+  std::vector<Value> expanded;
+  expanded.reserve(width);
+  for (const std::string& member : members) {
+    // Each member is `"name":value`; the value starts after the first colon
+    // outside quotes / nesting.
+    size_t colon = std::string::npos;
+    int depth = 0;
+    bool in_str = false;
+    char quote = '\0';
+    for (size_t i = 0; i < member.size(); ++i) {
+      const char c = member[i];
+      if (in_str) {
+        if (c == '\\') { ++i; }
+        else if (c == quote) { in_str = false; }
+        continue;
+      }
+      if (c == '"' || c == '\'') {
+        in_str = true;
+        quote = c;
+      } else if (c == '{' || c == '[' || c == '(') {
+        ++depth;
+      } else if (c == '}' || c == ']' || c == ')') {
+        --depth;
+      } else if (c == ':' && depth == 0) {
+        colon = i;
+        break;
+      }
+    }
+    std::string value_text = colon == std::string::npos ? member
+                                                        : member.substr(colon + 1);
+    if (colon == std::string::npos) {
+      // Anonymous positional shape: the member itself is the value.
+      value_text = member;
+    }
+    Value parsed;
+    if (!json_value_to_value(value_text, &parsed)) { return false; }
+    expanded.push_back(std::move(parsed));
+  }
+  *out = std::move(expanded);
+  return true;
+}
 
 // Physical plans and mutation executors borrow Table/Index objects from their
 // compiled-plan artifact.  A concurrent execution of the same fingerprint
@@ -904,6 +1073,296 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
       Row({Value("Update Rows"), Value(modified_rows)})));
 }
 
+namespace {
+
+namespace {
+
+std::string EscapeStructKey(std::string_view text) {
+  std::string escaped;
+  for (const char c : text) {
+    switch (c) {
+      case '"': escaped += "\\\""; break;
+      case '\\': escaped += "\\\\"; break;
+      default: escaped.push_back(c);
+    }
+  }
+  return escaped;
+}
+
+}  // namespace
+
+// Decodes one struct-member token. Legacy constructor storage embeds nested
+// objects/arrays as *quoted* raw JSON (the writer did not escape inner
+// quotes); unwrap those so navigation sees real objects.
+Value DecodeStructMember(const std::string& text) {
+  std::string trimmed = text;
+  size_t b = trimmed.find_first_not_of(" \t\r\n");
+  if (b == std::string::npos) { return Value(); }
+  size_t e = trimmed.find_last_not_of(" \t\r\n");
+  trimmed = trimmed.substr(b, e - b + 1);
+  if (trimmed.size() >= 4 && trimmed.front() == '"' &&
+      trimmed.back() == '"') {
+    const std::string inner = trimmed.substr(1, trimmed.size() - 2);
+    if (!inner.empty() && ((inner.front() == '{' && inner.back() == '}') ||
+                           (inner.front() == '[' && inner.back() == ']'))) {
+      return Value(std::string(inner));
+    }
+  }
+  Value parsed;
+  if (!JsonTextToValue(trimmed, &parsed)) {
+    parsed = Value(std::move(trimmed));
+  }
+  return parsed;
+}
+
+// Resolves `segs` member positions inside `json` by name; returns the index
+// at every level or an empty optional when the path does not exist here.
+std::optional<std::vector<int>> FindStructPathOrdinals(
+    const std::string& json, const std::vector<std::string>& segs) {
+  std::vector<int> ordinals;
+  std::string current = json;
+  for (const std::string& seg : segs) {
+    if (current.size() < 2 || current.front() != '{' ||
+        current.back() != '}') {
+      return std::nullopt;
+    }
+    const auto members =
+        SplitJsonObjectMembers(current.substr(1, current.size() - 2));
+    int index = -1;
+    size_t ordinal = 0;
+    for (const auto& [key, text] : members) {
+      if (IdentifierEquals(key, seg)) {
+        index = static_cast<int>(ordinal);
+        break;
+      }
+      ++ordinal;
+    }
+    if (index < 0) {
+      return std::nullopt;
+    }
+    ordinals.push_back(index);
+    Value decoded =
+        DecodeStructMember(members[static_cast<size_t>(index)].second);
+    if (decoded.IsNull()) { return std::nullopt; }
+    current = decoded.type == ValueType::kVarChar
+                  ? std::string(decoded.value.varchar_value)
+                  : std::string("null");
+  }
+  return ordinals;
+}
+
+// Rewrites `json` by replacing the member addressed by `ordinals` (one index
+// per path segment). Missing positions leave the document untouched.
+std::optional<std::string> SetStructPathByOrdinals(
+    const std::string& json, const std::vector<std::string>& segs,
+    const std::vector<int>& ordinals, size_t depth, const Value& new_value) {
+  if (json.size() < 2 || json.front() != '{' || json.back() != '}') {
+    // Assigning through a NULL / non-object intermediate.
+    throw std::runtime_error("Cannot set field of NULL STRUCT");
+  }
+  const auto members =
+      SplitJsonObjectMembers(json.substr(1, json.size() - 2));
+  const int index = ordinals[depth];
+  if (index < 0 || static_cast<size_t>(index) >= members.size()) {
+    return std::nullopt;
+  }
+  std::string rebuilt = "{";
+  bool first = true;
+  for (size_t i = 0; i < members.size(); ++i) {
+    if (!first) { rebuilt += ","; }
+    first = false;
+    rebuilt += "\"";
+    rebuilt += EscapeStructKey(members[i].first);
+    rebuilt += "\":";
+    if (static_cast<int>(i) == index) {
+      if (depth + 1 == segs.size()) {
+        rebuilt += EncodeStructMemberJson(new_value);
+      } else {
+        Value nested_value = DecodeStructMember(members[i].second);
+        auto nested = SetStructPathByOrdinals(
+            nested_value.IsNull()
+                ? std::string("null")
+                : nested_value.type == ValueType::kVarChar
+                      ? std::string(nested_value.value.varchar_value)
+                      : std::string("null"),
+            segs, ordinals, depth + 1, new_value);
+        rebuilt += nested.has_value() ? *nested : members[i].second;
+      }
+    } else {
+      rebuilt += members[i].second;
+    }
+  }
+  rebuilt += "}";
+  return rebuilt;
+}
+}  // namespace
+
+// UPDATE with dotted SET targets over STRUCT-typed columns ("SET s.f = ...").
+// Struct JSON carries no schema-level field names/positions, so the ordinal
+// of each top-level field is resolved against the matched rows themselves;
+// rows whose stored keys differ positionally still update correctly.
+StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
+                                            const UpdateStatement& update,
+                                            Table* table) {
+  const Schema& schema = table->GetSchema();
+  auto column_index = [&](std::string_view name) -> int {
+    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+      if (IdentifierEquals(schema.GetColumn(i).Name().name, name)) {
+        return static_cast<int>(i);
+      }
+    }
+    return -1;
+  };
+  struct FieldTarget {
+    size_t offset;
+    std::vector<std::string> segments;
+    const Expression* value;
+    std::vector<int> ordinals;
+  };
+  std::vector<FieldTarget> field_targets;
+  std::vector<std::pair<ColumnName, const Expression*>> plain_targets;
+  for (const auto& [target, expression] : update.SetClause()) {
+    if (!target.schema.empty() && !target.name.empty()) {
+      const int base = column_index(target.schema);
+      if (base >= 0) {
+        std::vector<std::string> segments;
+        size_t start = 0;
+        for (size_t pos = 0; pos <= target.name.size(); ++pos) {
+          if (pos == target.name.size() || target.name[pos] == '.') {
+            segments.push_back(target.name.substr(start, pos - start));
+            start = pos + 1;
+          }
+        }
+        field_targets.push_back(FieldTarget{static_cast<size_t>(base),
+                                            std::move(segments), &expression,
+                                            {}});
+        continue;
+      }
+    }
+    int offset = -1;
+    if (!target.name.empty()) { offset = column_index(target.name); }
+    if (offset < 0) {
+      throw std::runtime_error("UPDATE SET target not found: " +
+                               target.ToString());
+    }
+    plain_targets.emplace_back(
+        ColumnName(update.TableName(),
+                   schema.GetColumn(static_cast<size_t>(offset)).Name().name),
+        &expression);
+  }
+
+  QueryData query;
+  query.from_ = {update.TableName()};
+  // Dotted references inside the predicate resolve as STRUCT field access
+  // against the column named by the first path component.
+  Expression where_clause = update.WhereClause();
+  if (where_clause) {
+    std::function<Expression(const Expression&)> bind_struct_fields =
+        [&](const Expression& expr) -> Expression {
+      if (!expr) { return expr; }
+      if (expr->Type() == TypeTag::kColumnValue) {
+        const ColumnName& name = expr->AsColumnValue().GetColumnName();
+        if (!name.schema.empty() && name.schema != update.TableName() &&
+            !name.name.empty() && name.name != "*") {
+          const int base = column_index(name.schema);
+          if (base >= 0) {
+            return FunctionCallExp(
+                "__get_field_safe",
+                {ColumnValueExp(ColumnName(
+                     update.TableName(),
+                     schema.GetColumn(static_cast<size_t>(base))
+                         .Name().name)),
+                 ConstantValueExp(Value(std::string(name.name)))});
+          }
+        }
+        return expr;
+      }
+      std::vector<Expression> children = ExpressionChildren(expr);
+      bool changed = false;
+      for (Expression& child : children) {
+        Expression mapped = bind_struct_fields(child);
+        changed |= child->ToString() != mapped->ToString();
+        child = std::move(mapped);
+      }
+      return changed ? WithExpressionChildren(expr, std::move(children))
+                     : expr;
+    };
+    where_clause = bind_struct_fields(where_clause);
+  }
+  query.where_ = where_clause ? where_clause : ConstantValueExp(Value(true));
+  query.select_.reserve(schema.ColumnCount());
+  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+    query.select_.emplace_back(schema.GetColumn(i).Name().name,
+                               ColumnValueExp(schema.GetColumn(i).Name()));
+  }
+  query.require_row_position_ = true;
+  RETURN_IF_FAIL(query.Rewrite(ctx));
+  ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
+  Executor source = plan->EmitExecutor(ctx);
+
+  std::vector<std::pair<Row, RowPosition>> pending;
+  Row row;
+  RowPosition position;
+  while (source->Next(&row, &position)) {
+    pending.emplace_back(std::move(row), position);
+    row = Row();
+  }
+
+  // Resolve each path segment's positional index from any matched row that
+  // carries the segment names explicitly (anonymous tuples store fN keys).
+  for (auto& target : field_targets) {
+    target.ordinals.assign(target.segments.size(), -1);
+    for (const auto& [candidate, candidate_position] : pending) {
+      const Value& cell = candidate.values_[target.offset];
+      if (cell.IsNull() || cell.type != ValueType::kVarChar) { continue; }
+      auto found = FindStructPathOrdinals(
+          std::string(cell.value.varchar_value), target.segments);
+      if (found.has_value()) {
+        target.ordinals = *found;
+        break;
+      }
+    }
+  }
+
+  int64_t modified_rows = 0;
+  for (auto& [new_row, row_position] : pending) {
+    for (const auto& target : field_targets) {
+      Value& cell = new_row.values_[target.offset];
+      if (cell.IsNull()) {
+        throw std::runtime_error("Cannot set field of NULL STRUCT");
+      }
+      if (cell.type != ValueType::kVarChar) {
+        throw std::runtime_error(
+            "struct field assignment requires a STRUCT column");
+      }
+      const std::string text(cell.value.varchar_value);
+      relational_detail::Scope row_scope{.row = &new_row,
+                                         .schema = &schema,
+                                         .outer = nullptr};
+      const Value assigned =
+          relational_detail::Evaluate(*target.value, row_scope, nullptr, ctx,
+                                      relational_detail::CteMap{});
+      auto rewritten = SetStructPathByOrdinals(text, target.segments,
+                                               target.ordinals, 0, assigned);
+    }
+    StatusOr<RowPosition> updated =
+        table->Update(ctx.txn_, row_position, new_row);
+    if (updated.GetStatus() != Status::kSuccess) {
+      throw std::runtime_error("update failed on table " +
+                               std::string(schema.Name()));
+    }
+    ++modified_rows;
+  }
+  if (update.HasAssert() && modified_rows != update.AssertRowsModified()) {
+    throw std::runtime_error("ASSERT_ROWS_MODIFIED was specified with " +
+                             std::to_string(update.AssertRowsModified()) +
+                             " rows, but " + std::to_string(modified_rows) +
+                             " rows were modified");
+  }
+  return Executor(std::make_shared<ConstantExecutor>(
+      Row({Value("Update Rows"), Value(modified_rows)})));
+}
+
 }  // namespace
 
 StatusOr<Executor> SqlEngine::PrepareStatement(
@@ -1020,6 +1479,16 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             reordered[upsert_offsets[i]] = row[i];
           }
           row = Row(std::move(reordered));
+        } else if (row.values_.size() == 1 &&
+                   table->GetSchema().ColumnCount() > 1) {
+          // INSERT t VALUES ((1, 'x')) / VALUES (NULL) / (DEFAULT): a single
+          // STRUCT (or whole-row NULL) expands across every column.
+          std::vector<Value> expanded;
+          if (ExpandStructInsertValue(row[0],
+                                      table->GetSchema().ColumnCount(),
+                                      &expanded)) {
+            row = Row(std::move(expanded));
+          }
         }
         if (row.values_.size() != table->GetSchema().ColumnCount()) {
           last_error_ = "INSERT value count does not match table schema (got " +
@@ -1392,22 +1861,143 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         // because array mutations are not expressible as plain projections.
         return ExecuteNestedArrayUpdate(ctx, update, table.get());
       }
-      std::vector<NamedExpression> output;
       const Schema& schema = table->GetSchema();
+      {
+        bool dotted_target = false;
+        for (const auto& [target, expression] : update.SetClause()) {
+          if (!target.schema.empty() && !target.name.empty() &&
+              target.schema != update.TableName()) {
+            dotted_target = true;
+          }
+        }
+        if (dotted_target) {
+          return ExecuteStructFieldUpdate(ctx, update, table.get());
+        }
+      }
+      std::vector<NamedExpression> output;
+      // Value tables (single physical column) allow the FROM alias to stand
+      // for the whole row: "UPDATE t AS v SET v = ... WHERE v = ..." binds
+      // the alias to that column. Rewritten targets/expressions below.
+      std::string value_table_alias = update.Alias();
+      if (!value_table_alias.empty() && schema.ColumnCount() == 1) {
+        bool alias_is_column = false;
+        for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+          if (IdentifierEquals(schema.GetColumn(i).Name().name,
+                               value_table_alias)) {
+            alias_is_column = true;
+          }
+        }
+        if (alias_is_column) {
+          value_table_alias.clear();
+        }
+      } else {
+        value_table_alias.clear();
+      }
+      std::vector<std::pair<ColumnName, Expression>> set_clause =
+          update.SetClause();
+      Expression where_clause = update.WhereClause();
+      if (!value_table_alias.empty()) {
+        const ColumnName only_column(
+            update.TableName(), schema.GetColumn(0).Name().name);
+        auto matches_alias = [&](const ColumnName& name) {
+          return (name.schema.empty() ||
+                  IdentifierEquals(name.schema, value_table_alias)) &&
+                 IdentifierEquals(name.name, value_table_alias);
+        };
+        for (auto& [target, expression] : set_clause) {
+          if (matches_alias(target)) {
+            target = ColumnName(target.schema, only_column.name);
+          }
+        }
+        if (where_clause) {
+          std::function<Expression(const Expression&)> bind_alias =
+              [&](const Expression& expr) -> Expression {
+            if (!expr) { return expr; }
+            if (expr->Type() == TypeTag::kColumnValue) {
+              const ColumnName& name =
+                  expr->AsColumnValue().GetColumnName();
+              if (matches_alias(name)) {
+                return ColumnValueExp(only_column);
+              }
+              if (!name.schema.empty() &&
+                  IdentifierEquals(name.schema, value_table_alias)) {
+                return ColumnValueExp(ColumnName(update.TableName(),
+                                                 name.name));
+              }
+              return expr;
+            }
+            std::vector<Expression> children = ExpressionChildren(expr);
+            bool changed = false;
+            for (Expression& child : children) {
+              Expression mapped = bind_alias(child);
+              changed |= child->ToString() != mapped->ToString();
+              child = std::move(mapped);
+            }
+            return changed ? WithExpressionChildren(expr, std::move(children))
+                           : expr;
+          };
+          where_clause = bind_alias(where_clause);
+        }
+      }
       output.reserve(schema.ColumnCount());
+      auto column_index = [&](std::string_view name) -> int {
+        for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+          if (IdentifierEquals(schema.GetColumn(i).Name().name, name)) {
+            return static_cast<int>(i);
+          }
+        }
+        return -1;
+      };
+      // WHERE predicates may reference struct fields through dotted paths;
+      // rewrite those references into get_field(column, "field.path") when
+      // the path prefix names a column rather than a relation.
+      if (where_clause) {
+        std::function<Expression(const Expression&)> bind_struct_fields =
+            [&](const Expression& expr) -> Expression {
+          if (!expr) { return expr; }
+          if (expr->Type() == TypeTag::kColumnValue) {
+            const ColumnName& name = expr->AsColumnValue().GetColumnName();
+            if (!name.schema.empty() && name.schema != update.TableName()) {
+              const int base_column = column_index(name.schema);
+              if (base_column >= 0 && !name.name.empty() &&
+                  name.name != "*") {
+                return FunctionCallExp(
+                    "__get_field_safe",
+                    {ColumnValueExp(ColumnName(
+                         update.TableName(),
+                         schema.GetColumn(static_cast<size_t>(base_column))
+                             .Name().name)),
+                     ConstantValueExp(Value(std::string(name.name)))});
+              }
+            }
+            return expr;
+          }
+          std::vector<Expression> children = ExpressionChildren(expr);
+          bool changed = false;
+          for (Expression& child : children) {
+            Expression mapped = bind_struct_fields(child);
+            changed |= child->ToString() != mapped->ToString();
+            child = std::move(mapped);
+          }
+          return changed ? WithExpressionChildren(expr, std::move(children))
+                         : expr;
+        };
+        where_clause = bind_struct_fields(where_clause);
+      }
       // SET targets may be qualified ("UPDATE t SET t.a = ..."); match the
       // full ColumnName instead of the bare name so qualified assignments are
       // not silently ignored.
-      std::vector<bool> applied(update.SetClause().size(), false);
+      std::vector<bool> applied(set_clause.size(), false);
       for (size_t i = 0; i < schema.ColumnCount(); ++i) {
         const Column& column = schema.GetColumn(i);
         Expression expression = ColumnValueExp(column.Name());
-        for (size_t j = 0; j < update.SetClause().size(); ++j) {
-          const ColumnName& target = update.SetClause()[j].first;
-          if (target.name == column.Name().name &&
+        for (size_t j = 0; j < set_clause.size(); ++j) {
+          const ColumnName& target = set_clause[j].first;
+          if ((target.name == column.Name().name ||
+               IdentifierEquals(target.name, column.Name().name)) &&
               (target.schema.empty() ||
                target.schema == update.TableName())) {
-            expression = update.SetClause()[j].second;
+            expression = set_clause[j].second;
             applied[j] = true;
             break;
           }
@@ -1418,16 +2008,16 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         if (!applied[j]) {
           last_error_ =
               "UPDATE SET target not found: " +
-              (update.SetClause()[j].first.schema.empty()
-                   ? update.SetClause()[j].first.name
-                   : update.SetClause()[j].first.ToString());
+              (set_clause[j].first.schema.empty()
+                   ? set_clause[j].first.name
+                   : set_clause[j].first.ToString());
           return Status::kNotExists;
         }
       }
       QueryData query;
       query.from_ = {update.TableName()};
-      query.where_ = update.WhereClause() ? update.WhereClause()
-                                          : ConstantValueExp(Value(true));
+      query.where_ = where_clause ? where_clause
+                                  : ConstantValueExp(Value(true));
       query.select_ = std::move(output);
       query.require_row_position_ = true;
       RETURN_IF_FAIL(query.Rewrite(ctx));
@@ -1449,13 +2039,50 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       std::vector<NamedExpression> output;
       const Schema& schema = table->GetSchema();
       output.reserve(schema.ColumnCount());
+      // Value tables: bind a FROM alias standing for the whole row to the
+      // single physical column ("DELETE t AS v WHERE v = ...").
+      Expression where_clause = remove.WhereClause();
+      const std::string& delete_alias = remove.Alias();
+      if (!delete_alias.empty() && schema.ColumnCount() == 1 &&
+          !IdentifierEquals(schema.GetColumn(0).Name().name, delete_alias)) {
+        const ColumnName only_column(remove.TableName(),
+                                     schema.GetColumn(0).Name().name);
+        std::function<Expression(const Expression&)> bind_alias =
+            [&](const Expression& expr) -> Expression {
+          if (!expr) { return expr; }
+          if (expr->Type() == TypeTag::kColumnValue) {
+            const ColumnName& name = expr->AsColumnValue().GetColumnName();
+            if ((name.schema.empty() ||
+                 IdentifierEquals(name.schema, delete_alias)) &&
+                IdentifierEquals(name.name, delete_alias)) {
+              return ColumnValueExp(only_column);
+            }
+            if (!name.schema.empty() &&
+                IdentifierEquals(name.schema, delete_alias)) {
+              return ColumnValueExp(
+                  ColumnName(remove.TableName(), name.name));
+            }
+            return expr;
+          }
+          std::vector<Expression> children = ExpressionChildren(expr);
+          bool changed = false;
+          for (Expression& child : children) {
+            Expression mapped = bind_alias(child);
+            changed |= child->ToString() != mapped->ToString();
+            child = std::move(mapped);
+          }
+          return changed ? WithExpressionChildren(expr, std::move(children))
+                         : expr;
+        };
+        where_clause = bind_alias(where_clause);
+      }
       for (size_t i = 0; i < schema.ColumnCount(); ++i) {
         output.emplace_back(schema.GetColumn(i).Name());
       }
       QueryData query;
       query.from_ = {remove.TableName()};
-      query.where_ = remove.WhereClause() ? remove.WhereClause()
-                                          : ConstantValueExp(Value(true));
+      query.where_ = where_clause ? where_clause
+                                  : ConstantValueExp(Value(true));
       query.select_ = std::move(output);
       query.require_row_position_ = true;
       query.wait_for_write_intent_ = false;

@@ -30,6 +30,23 @@ namespace tinylamb {
 
 class EvaluationContext;
 
+// Splits a JSON object body into top-level key / raw-value-text pairs.
+std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
+    const std::string& body);
+
+// Parses one JSON scalar/object/array token into a Value.
+bool JsonTextToValue(const std::string& text, Value* parsed);
+
+// Encodes an evaluated value as struct-member JSON text (strings quoted and
+// escaped, numbers bare, nested objects/arrays embedded verbatim).
+std::string EncodeStructMemberJson(const Value& value);
+
+// Sets a (possibly dotted) field on a struct-typed JSON text value and
+// returns the rewritten JSON. Missing intermediates are created; a NULL base
+// stays NULL.
+Value StructSetField(const Value& json, const std::string& path,
+                     const Value& new_value);
+
 class FunctionCallExpression : public ExpressionBase {
  public:
   FunctionCallExpression(std::string func_name, std::vector<Expression> args)
