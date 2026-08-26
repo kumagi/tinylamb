@@ -962,7 +962,10 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
   }
   const std::string qualifier =
       source.alias.empty() ? source.table : source.alias;
-  if (!qualifier.empty() && !source.unnest) {
+  // Unnest outputs carry the alias as qualifier too: bare element refs still
+  // match by column name, while alias-qualified and alias-as-row references
+  // (`s.field`, `SELECT s`) resolve uniformly with table sources.
+  if (!qualifier.empty()) {
     result.schema = QualifySchema(result.schema, qualifier);
   }
   result.FinishSpill();

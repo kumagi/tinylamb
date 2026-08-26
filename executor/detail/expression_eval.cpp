@@ -590,50 +590,63 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
   // the full path into segments and, per scope level (innermost outward),
   // try every split point: the leading segments form a (possibly qualified)
   // column reference and the trailing segments traverse encoded field values.
-  {
-    std::vector<std::string> segments = name.schema.empty()
-                                            ? SplitDottedName(name.name)
-                                            : [&] {
-                                              std::vector<std::string> parts =
-                                                  SplitDottedName(name.schema);
-                                              for (std::string& part :
-                                                   SplitDottedName(name.name)) {
-                                                parts.push_back(
-                                                    std::move(part));
-                                              }
-                                              return parts;
-                                            }();
-    if (segments.size() >= 2) {
-      for (const Scope* current = &scope; current != nullptr;
-           current = current->outer) {
-        if (current->row == nullptr || current->schema == nullptr) {
-          continue;
+  std::vector<std::string> segments = name.schema.empty()
+                                          ? SplitDottedName(name.name)
+                                          : [&] {
+                                            std::vector<std::string> parts =
+                                                SplitDottedName(name.schema);
+                                            for (std::string& part :
+                                                 SplitDottedName(name.name)) {
+                                              parts.push_back(std::move(part));
+                                            }
+                                            return parts;
+                                          }();
+  if (segments.size() >= 2) {
+    const std::vector<std::string> fields(
+        segments.begin() + 1, segments.end());
+    for (const Scope* current = &scope; current != nullptr;
+         current = current->outer) {
+      if (current->row == nullptr || current->schema == nullptr) {
+        continue;
+      }
+      // First segment may be an alias whose whole row is the base value.
+      if (name.schema.empty()) {
+        bool any_match = false;
+        for (size_t i = 0; i < current->schema->ColumnCount(); ++i) {
+          if (IdentifierEquals(current->schema->GetColumn(i).Name().schema,
+                               segments.front())) {
+            any_match = true;
+            break;
+          }
         }
-        for (size_t split = segments.size() - 1; split >= 1; --split) {
-          std::string qualifier;
-          for (size_t i = 0; i + 1 < split; ++i) {
-            if (!qualifier.empty()) {
-              qualifier += '.';
-            }
-            qualifier += segments[i];
+        if (any_match) {
+          return ResolveFieldPath(
+              RowAsStructValue(*current->row, *current->schema), fields);
+        }
+      }
+      for (size_t split = 1; split < segments.size(); ++split) {
+        std::string qualifier;
+        for (size_t i = 0; i + 1 < split; ++i) {
+          if (!qualifier.empty()) {
+            qualifier += '.';
           }
-          const ColumnName base(qualifier, segments[split - 1]);
-          const int offset = FindColumn(*current->schema, base);
-          if (offset >= 0) {
-            return ResolveFieldPath(
-                (*current->row)[static_cast<size_t>(offset)],
-                std::vector<std::string>(segments.begin() +
-                                             static_cast<ptrdiff_t>(split),
-                                         segments.end()));
-          }
+          qualifier += segments[i];
+        }
+        const ColumnName base(qualifier, segments[split]);
+        const int offset = FindColumn(*current->schema, base);
+        if (offset >= 0) {
+          return ResolveFieldPath(
+              (*current->row)[static_cast<size_t>(offset)],
+              std::vector<std::string>(segments.begin() +
+                                           static_cast<ptrdiff_t>(split + 1),
+                                       segments.end()));
         }
       }
     }
   }
-  // A bare alias (`SELECT t FROM (...) t`, `COUNT(t)`) denotes the whole row
-  // of the source aliased `t`; GoogleSQL treats such rows as structs.  When
-  // every column of some scope level shares that qualifier, hand back the
-  // row encoded as a struct value.
+  // A bare alias (`SELECT t FROM (...) t`, `COUNT(t)`) denotes the row of the
+  // source aliased `t`; GoogleSQL treats such rows as structs.  Collect the
+  // columns that carry the alias as qualifier and encode them as a struct.
   if (name.schema.empty() && name.name != "*" &&
       name.name.find('.') == std::string::npos) {
     for (const Scope* current = &scope; current != nullptr;
@@ -645,18 +658,29 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
       if (schema.ColumnCount() == 0) {
         continue;
       }
-      bool all_match = true;
-      bool any_match = false;
+      std::vector<size_t> owned;
       for (size_t i = 0; i < schema.ColumnCount(); ++i) {
         if (IdentifierEquals(schema.GetColumn(i).Name().schema, name.name)) {
-          any_match = true;
-        } else if (!schema.GetColumn(i).Name().schema.empty()) {
-          all_match = false;
+          owned.push_back(i);
         }
       }
-      if (any_match && all_match) {
-        return RowAsStructValue(*current->row, schema);
+      if (owned.empty()) {
+        continue;
       }
+      Row aliased;
+      aliased.values_.reserve(owned.size());
+      for (size_t i : owned) {
+        aliased.values_.push_back((*current->row)[i]);
+      }
+      Schema owned_schema("", [&] {
+        std::vector<Column> columns;
+        columns.reserve(owned.size());
+        for (size_t i : owned) {
+          columns.push_back(schema.GetColumn(i));
+        }
+        return columns;
+      }());
+      return RowAsStructValue(aliased, owned_schema);
     }
   }
   throw std::runtime_error("column " + name.ToString() + " not found");
@@ -3251,7 +3275,16 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(int64_t{1});
     }
     if (!arr.IsArray()) {
-      throw std::runtime_error("quantified comparison requires an array");
+      if (arr.IsNull()) {
+        // Handled above; unreachable, kept for clarity.
+        throw std::runtime_error("quantified comparison requires an array");
+      }
+      // Field traversals collapse a single-occurrence repeated field to its
+      // scalar; UNNEST iterates it as a one-element array.
+      arr = Value::Array({std::move(arr)},
+                         ElementSqlTypeName(arr.type).empty()
+                             ? "INT64"
+                             : ElementSqlTypeName(arr.type));
     }
     struct OpEntry {
       const char* text;
@@ -7266,14 +7299,17 @@ std::vector<slot_t> RequiredColumns(const SelectStatement& statement,
           if (name.name == "*") {
             return false;
           }
-          return name.name == candidate.name &&
-                 (name.schema.empty() || name.schema == candidate.schema);
+          // Match on bare column name only: references may qualify this
+          // relation by table name or any alias, while stored schemas qualify
+          // columns by the physical table name.  Over-projecting a scan is
+          // harmless; dropping a column some scope reference needs breaks
+          // evaluation.
+          return name.name == candidate.name;
         });
     if (needed) {
       result.push_back(i);
     }
-  }
-  return result;
+  }  return result;
 }
 Schema ProjectSchema(const Schema& schema,
                      const std::vector<slot_t>& projection) {
