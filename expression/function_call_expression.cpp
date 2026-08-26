@@ -546,6 +546,66 @@ Value FunctionCallExpression::Evaluate(const Row& row,
     return AddOrSubInterval(func_name_, date,
                             args_[1]->AsIntervalExpression());
   }
+  // Conditional-evaluation semantics: only the taken (or error-handled)
+  // branch is evaluated, so errors inside untaken branches never surface.
+  // Branch results are normalized to the common supertype of every branch so
+  // downstream comparisons and sort keys stay type-consistent.
+  auto promotes_to_double = [&](const Schema& schema_for_types,
+                                size_t from) {
+    for (size_t i = from; i < args_.size(); ++i) {
+      try {
+        if (args_[i]->ResultType(schema_for_types).GetType() ==
+            TypeTag::kDouble) {
+          return true;
+        }
+      } catch (const std::exception&) {
+      }
+    }
+    return false;
+  };
+  auto normalize = [](Value value, bool to_double) {
+    if (to_double && !value.IsNull() && value.type == ValueType::kInt64) {
+      return Value(static_cast<double>(value.value.int_value));
+    }
+    return value;
+  };
+  if (func_name_ == "if") {
+    if (args_.size() != 3) { throw std::runtime_error("IF requires 3 arguments");
+}
+    const bool as_double = promotes_to_double(schema, 1);
+    return normalize(
+        args_[args_[0]->Evaluate(row, schema).Truthy() ? 1 : 2]->Evaluate(
+            row, schema), as_double);
+  }
+  if (func_name_ == "iferror") {
+    if (args_.size() != 2) { throw std::runtime_error("IFERROR requires 2 arguments");
+}
+    const bool as_double = promotes_to_double(schema, 0);
+    try {
+      return normalize(args_[0]->Evaluate(row, schema), as_double);
+    } catch (const std::exception&) {
+      return normalize(args_[1]->Evaluate(row, schema), as_double);
+    }
+  }
+  if (func_name_ == "iserror") {
+    if (args_.size() != 1) { throw std::runtime_error("ISERROR requires 1 argument");
+}
+    try {
+      args_[0]->Evaluate(row, schema);
+      return Value(int64_t{0});
+    } catch (const std::exception&) {
+      return Value(int64_t{1});
+    }
+  }
+  if (func_name_ == "nulliferror") {
+    if (args_.size() != 1) { throw std::runtime_error("NULLIFERROR requires 1 argument");
+}
+    try {
+      return args_[0]->Evaluate(row, schema);
+    } catch (const std::exception&) {
+      return Value();
+    }
+  }
   std::vector<Value> values;
   values.reserve(args_.size());
   for (const auto& arg : args_) {
@@ -584,6 +644,43 @@ Value FunctionCallExpression::Evaluate(const Row* left,
     return AddOrSubInterval(func_name_, date,
                             args_[1]->AsIntervalExpression());
   }
+  // Lazy conditional-evaluation semantics (mirrors the plain overload).
+  if (func_name_ == "if") {
+    if (args_.size() != 3) { throw std::runtime_error("IF requires 3 arguments");
+}
+    const Value condition =
+        args_[0]->Evaluate(left, left_schema, right, right_schema);
+    return args_[condition.Truthy() ? 1 : 2]->Evaluate(
+        left, left_schema, right, right_schema);
+  }
+  if (func_name_ == "iferror") {
+    if (args_.size() != 2) { throw std::runtime_error("IFERROR requires 2 arguments");
+}
+    try {
+      return args_[0]->Evaluate(left, left_schema, right, right_schema);
+    } catch (const std::exception&) {
+      return args_[1]->Evaluate(left, left_schema, right, right_schema);
+    }
+  }
+  if (func_name_ == "iserror") {
+    if (args_.size() != 1) { throw std::runtime_error("ISERROR requires 1 argument");
+}
+    try {
+      args_[0]->Evaluate(left, left_schema, right, right_schema);
+      return Value(int64_t{0});
+    } catch (const std::exception&) {
+      return Value(int64_t{1});
+    }
+  }
+  if (func_name_ == "nulliferror") {
+    if (args_.size() != 1) { throw std::runtime_error("NULLIFERROR requires 1 argument");
+}
+    try {
+      return args_[0]->Evaluate(left, left_schema, right, right_schema);
+    } catch (const std::exception&) {
+      return Value();
+    }
+  }
   std::vector<Value> values;
   values.reserve(args_.size());
   for (const auto& arg : args_) {
@@ -606,6 +703,41 @@ Value FunctionCallExpression::Evaluate(const Row& row, const Schema& schema,
     return AddOrSubInterval(func_name_, date,
                             args_[1]->AsIntervalExpression());
   }
+  // Lazy conditional-evaluation semantics (mirrors the plain overload).
+  if (func_name_ == "if") {
+    if (args_.size() != 3) { throw std::runtime_error("IF requires 3 arguments");
+}
+    const Value condition = args_[0]->Evaluate(row, schema, context);
+    return args_[condition.Truthy() ? 1 : 2]->Evaluate(row, schema, context);
+  }
+  if (func_name_ == "iferror") {
+    if (args_.size() != 2) { throw std::runtime_error("IFERROR requires 2 arguments");
+}
+    try {
+      return args_[0]->Evaluate(row, schema, context);
+    } catch (const std::exception&) {
+      return args_[1]->Evaluate(row, schema, context);
+    }
+  }
+  if (func_name_ == "iserror") {
+    if (args_.size() != 1) { throw std::runtime_error("ISERROR requires 1 argument");
+}
+    try {
+      args_[0]->Evaluate(row, schema, context);
+      return Value(int64_t{0});
+    } catch (const std::exception&) {
+      return Value(int64_t{1});
+    }
+  }
+  if (func_name_ == "nulliferror") {
+    if (args_.size() != 1) { throw std::runtime_error("NULLIFERROR requires 1 argument");
+}
+    try {
+      return args_[0]->Evaluate(row, schema, context);
+    } catch (const std::exception&) {
+      return Value();
+    }
+  }
   std::vector<Value> values;
   values.reserve(args_.size());
   for (const auto& arg : args_) {
@@ -624,6 +756,13 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
   if (func_name_ == "if") {
     if (args_.size() < 2) { return {TypeTag::kInvalid}; }
     return args_[1]->ResultType(schema);
+  }
+  if (func_name_ == "iferror" || func_name_ == "nulliferror") {
+    if (args_.empty()) { return {TypeTag::kInvalid}; }
+    return args_[0]->ResultType(schema);
+  }
+  if (func_name_ == "iserror") {
+    return {TypeTag::kBigInt};
   }
   if (func_name_ == "split" || func_name_ == "regexp_extract_all" || func_name_.ends_with("_array")) {
     return {TypeTag::kArray};
@@ -696,6 +835,13 @@ Type FunctionCallExpression::ResultType(const Schema& left,
   if (func_name_ == "if") {
     if (args_.size() < 2) { return {TypeTag::kInvalid}; }
     return args_[1]->ResultType(left, right);
+  }
+  if (func_name_ == "iferror" || func_name_ == "nulliferror") {
+    if (args_.empty()) { return {TypeTag::kInvalid}; }
+    return args_[0]->ResultType(left, right);
+  }
+  if (func_name_ == "iserror") {
+    return {TypeTag::kBigInt};
   }
   if (func_name_ == "split" || func_name_ == "regexp_extract_all" || func_name_.ends_with("_array")) {
     return {TypeTag::kArray};
