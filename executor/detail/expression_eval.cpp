@@ -8244,6 +8244,10 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
         // GoogleSQL: a scalar subquery must produce at most one row.
         throw std::runtime_error("Scalar subquery produced more than one row");
       }
+      if (!first || first->values_.empty()) {
+        // Empty subquery: scalar NULL.
+        return {};
+      }
       return ProjectSubqueryRow(*first, as_struct, &subquery_schema);
     }
     case TypeTag::kIntervalExp:
