@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <sstream>
@@ -153,6 +154,31 @@ class ExpressionDepthGuard {
 // accept signs and std::stoull would wrap "-1" into a huge positive value.
 int64_t ParseIntLiteral(const GoogleSqlAstNode& node) {
   const std::string& text = node.detail;
+  // Hex literals (0x1F, 0XFFFFFFFFFFFFD8F0) are bit patterns: they wrap
+  // modulo 2^64 exactly like the reference engine, where 0xFF... == -1.
+  if (text.size() > 2 && text[0] == '0' &&
+      (text[1] == 'x' || text[1] == 'X')) {
+    const std::string_view digits(text.data() + 2, text.size() - 2);
+    const bool hex_only =
+        !digits.empty() &&
+        std::ranges::all_of(digits, [](char c) {
+          return ('0' <= c && c <= '9') || ('a' <= c && c <= 'f') ||
+                 ('A' <= c && c <= 'F');
+        });
+    if (!hex_only) {
+      throw std::runtime_error("GoogleSQL AST: malformed integer literal " +
+                               text);
+    }
+    uint64_t magnitude = 0;
+    const auto* end = digits.data() + digits.size();
+    const auto [ptr, ec] =
+        std::from_chars(digits.data(), end, magnitude, 16);
+    if (ec != std::errc() || ptr != end) {
+      throw std::runtime_error("GoogleSQL AST: integer literal out of range " +
+                               text);
+    }
+    return static_cast<int64_t>(magnitude);
+  }
   const bool digits_only =
       !text.empty() &&
       std::ranges::all_of(text, [](char c) { return '0' <= c && c <= '9'; });
@@ -165,7 +191,17 @@ int64_t ParseIntLiteral(const GoogleSqlAstNode& node) {
   }
   int64_t value = 0;
   const auto* end = text.data() + text.size();
-  const auto [ptr, ec] = std::from_chars(text.data(), end, value);
+  auto [ptr, ec] = std::from_chars(text.data(), end, value);
+  if (ec == std::errc::result_out_of_range) {
+    // Literals above INT64_MAX name UINT64 values; the engine stores them
+    // as their two's-complement signed bit pattern.
+    uint64_t magnitude = 0;
+    const auto [u_ptr, u_ec] =
+        std::from_chars(text.data(), end, magnitude, 10);
+    if (u_ec == std::errc() && u_ptr == end) {
+      return static_cast<int64_t>(magnitude);
+    }
+  }
   if (ec != std::errc() || ptr != end) {
     throw std::runtime_error("GoogleSQL AST: integer literal out of range " +
                              text);
@@ -972,6 +1008,21 @@ std::unordered_map<std::string, SqlUdf>& UdfRegistry() {
   return registry;
 }
 
+// TEMP views created by CREATE VIEW statements: name -> cloned statement
+// AST. Views expand as macro subqueries at FROM-reference time.
+std::unordered_map<std::string, std::shared_ptr<GoogleSqlAstNode>>&
+ViewRegistry() {
+  static thread_local std::unordered_map<std::string,
+                                         std::shared_ptr<GoogleSqlAstNode>>
+      registry;
+  return registry;
+}
+
+size_t& ViewExpansionDepth() {
+  static thread_local size_t depth = 0;
+  return depth;
+}
+
 std::unique_ptr<GoogleSqlAstNode> CloneAstNode(
     const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recursion)
   auto clone = std::make_unique<GoogleSqlAstNode>();
@@ -994,6 +1045,13 @@ struct UdfExpansionFrame {
 
 thread_local std::vector<UdfExpansionFrame> t_udf_frames;
 thread_local std::vector<std::unordered_set<std::string>> t_udf_bound_masks;
+
+// Stable storage for synthetic lambda-expansion frames (see
+// RewriteArrayTransformLambda): deque so push/pop never moves elements.
+std::deque<SqlUdf>& t_lambda_frame_storage() {
+  static thread_local std::deque<SqlUdf> storage;
+  return storage;
+}
 
 // CREATE TEMP CONSTANT values that could not be folded to text (subqueries,
 // function calls): resolved per reference through the relational evaluator.
@@ -1168,6 +1226,90 @@ std::vector<WindowOrderTerm> ParseOrderingList(const GoogleSqlAstNode& order) {
   return terms;
 }
 
+// ARRAY_TRANSFORM(array, x -> body) desugars into the relational shape
+// ARRAY(SELECT body FROM UNNEST(array) AS <binding>): the lambda parameter
+// becomes the UNNEST column and the body is visited against it, so nested
+// calls, captures of outer columns, and two-parameter (element, offset)
+// lambdas keep working through ordinary scope resolution.  ARRAY_FILTER is
+// the same shape with the lambda result as a retention predicate.
+std::string InferArrayElementSqlType(const GoogleSqlAstNode& node);
+
+Expression RewriteLambdaArrayFunction(const GoogleSqlAstNode& array_node,
+                                      const GoogleSqlAstNode& lambda,
+                                      bool as_filter) {
+  std::vector<std::string> params;
+  for (size_t i = 0; i + 1 < lambda.children.size(); ++i) {
+    const GoogleSqlAstNode& head = *lambda.children[i];
+    if (head.kind == "PathExpression") {
+      params.push_back(Lower(Path(head)));
+    } else if (head.kind == "StructConstructorWithParens") {
+      for (const auto& sub : head.children) {
+        if (sub->kind == "PathExpression") {
+          params.push_back(Lower(Path(*sub)));
+        }
+      }
+    }
+  }
+  const GoogleSqlAstNode* body =
+      lambda.children.empty() ? nullptr : lambda.children.back().get();
+  if (params.empty() || params.size() > 2 || body == nullptr ||
+      body->kind == "PathExpression") {
+    throw std::runtime_error("GoogleSQL AST: unsupported Lambda");
+  }
+  static thread_local size_t t_lambda_counter = 0;
+  const size_t lambda_id = ++t_lambda_counter;
+  const std::string element_binding =
+      "__lambda_element_" + std::to_string(lambda_id);
+  const std::string offset_binding =
+      "__lambda_offset_" + std::to_string(lambda_id);
+  Expression array_expr = VisitExpression(array_node);
+  // The frame storage keeps stable SqlUdf addresses while nested lambdas
+  // expand; entries are popped with their frames.
+  auto& frame_udf = t_lambda_frame_storage().emplace_back();
+  frame_udf.name = "__lambda";
+  for (const std::string& param : params) {
+    frame_udf.parameters.emplace_back(param, false);
+  }
+  std::vector<Expression> bound;
+  bound.push_back(ColumnValueExp(ColumnName("", element_binding)));
+  if (params.size() == 2) {
+    bound.push_back(ColumnValueExp(ColumnName("", offset_binding)));
+  }
+  const UdfExpansionFrame frame{&frame_udf, &bound, t_udf_bound_masks.size()};
+  t_udf_frames.push_back(frame);
+  Expression body_expression;
+  try {
+    body_expression = VisitExpression(*body);
+  } catch (...) {
+    t_udf_frames.pop_back();
+    t_lambda_frame_storage().pop_back();
+    throw;
+  }
+  t_udf_frames.pop_back();
+  t_lambda_frame_storage().pop_back();
+
+  auto inner = std::make_shared<SelectStatement>(
+      as_filter
+          ? std::vector<NamedExpression>{NamedExpression(
+                std::string(""),
+                ColumnValueExp(ColumnName("", element_binding)))}
+          : std::vector<NamedExpression>{NamedExpression(
+                std::string(""), std::move(body_expression))},
+      std::vector<std::string>{},
+      as_filter ? std::move(body_expression) : Expression{});
+  SelectSource source;
+  source.unnest = std::move(array_expr);
+  source.alias = element_binding;
+  if (params.size() == 2) { source.offset_alias = offset_binding; }
+  inner->SetSources({std::move(source)});
+  inner->MarkComplex();
+  auto query_expression = std::make_shared<QueryExpression>(
+      std::move(inner), nullptr, false, false);
+  query_expression->SetArrayResult(true);
+  query_expression->SetArrayElementSqlType(InferArrayElementSqlType(*body));
+  return Expression(query_expression);
+}
+
 Expression VisitFunction(
     const GoogleSqlAstNode&
         node) {  // NOLINT(misc-no-recursion) // AST traversal recursion is
@@ -1183,6 +1325,25 @@ Expression VisitFunction(
   }
   if (name == "lcase") {
     name = "lower";
+  }
+  if (name == "array_transform" || name == "array_filter") {
+    // Higher-order array functions take a trailing lambda argument; desugar
+    // the lambda into an ARRAY(SELECT ... FROM UNNEST ...) rewrite.
+    const GoogleSqlAstNode* array_arg = nullptr;
+    const GoogleSqlAstNode* lambda = nullptr;
+    for (size_t i = 1; i < node.children.size(); ++i) {
+      const GoogleSqlAstNode& child = *node.children[i];
+      if (child.kind == "Location") { continue; }
+      if (child.kind == "Lambda" && lambda == nullptr) {
+        lambda = &child;
+        continue;
+      }
+      if (array_arg == nullptr) { array_arg = &child; }
+    }
+    if (lambda != nullptr && array_arg != nullptr) {
+      return RewriteLambdaArrayFunction(*array_arg, *lambda,
+                                        name == "array_filter");
+    }
   }
   if (name == "collate") {
     // GoogleSQL requires COLLATE(value, 'literal'): the collator must be a
@@ -1619,6 +1780,31 @@ std::string SqlTypeFromAst(
     }
     return "ARRAY<INT64>";
   }
+  if (node.kind == "StructType") {
+    // Render STRUCT<T1, T2> / STRUCT<name T, ...> so runtime casts can walk
+    // the declared field list.
+    std::string fields;
+    for (const auto& child : node.children) {
+      if (child->kind != "StructField") { continue; }
+      std::string name_part;
+      if (const auto* id = child->Child("Identifier")) {
+        name_part = UpperCopy(Identifier(*id));
+      }
+      std::string type_part;
+      for (const auto& field_child : child->children) {
+        if (field_child->kind == "Identifier") { continue; }
+        const std::string nested = SqlTypeFromAst(*field_child);
+        if (!nested.empty()) {
+          type_part = nested;
+          break;
+        }
+      }
+      if (type_part.empty()) { continue; }
+      if (!fields.empty()) { fields += ", "; }
+      fields += name_part.empty() ? type_part : name_part + " " + type_part;
+    }
+    return "STRUCT<" + fields + ">";
+  }
   for (const auto& child : node.children) {
     const std::string nested = SqlTypeFromAst(*child);
     if (!nested.empty()) {
@@ -1638,6 +1824,15 @@ std::string InferArrayElementSqlType(
   }
   if (node.kind == "StringLiteral") {
     return "STRING";
+  }
+  if (node.kind == "JSONLiteral") {
+    return "JSON";
+  }
+  if (node.kind == "NumericLiteral") {
+    return "NUMERIC";
+  }
+  if (node.kind == "BigNumericLiteral") {
+    return "BIGNUMERIC";
   }
   if (node.kind == "BytesLiteral") {
     return "BYTES";
@@ -2157,6 +2352,29 @@ Expression VisitExpression(
   }
   if (node.kind == "StringLiteral") {
     return ConstantValueExp(Value(DecodeString(node)));
+  }
+  if (node.kind == "JSONLiteral" || node.kind == "NumericLiteral" ||
+      node.kind == "BigNumericLiteral") {
+    // JSON literals keep their verbatim text (the JSON type maps to the
+    // engine's string cell representation); NUMERIC / BIGNUMERIC literals
+    // evaluate as IEEE doubles, matching the double-typed statistical
+    // goldens exercised by the compliance corpus.
+    const GoogleSqlAstNode* literal = node.Child("StringLiteral");
+    if (literal == nullptr) {
+      throw std::runtime_error("GoogleSQL AST: malformed " + node.kind);
+    }
+    std::string text = DecodeString(*literal);
+    if (node.kind == "JSONLiteral") {
+      return ConstantValueExp(Value(std::move(text)));
+    }
+    errno = 0;
+    char* parse_end = nullptr;
+    const double parsed = std::strtod(text.c_str(), &parse_end);
+    if (parse_end == text.c_str() || *parse_end != '\0') {
+      throw std::runtime_error("GoogleSQL AST: malformed numeric literal " +
+                               text);
+    }
+    return ConstantValueExp(Value(parsed));
   }
   if (node.kind == "BytesLiteral") {
     return ConstantValueExp(Value(DecodeBytes(node)));
@@ -3349,6 +3567,27 @@ SelectSource VisitTableSource(
     if (source.alias.empty()) {
       source.alias = source.table;
     }
+    // TEMP views expand as their stored defining query; the reference alias
+    // stays the name used at the reference site.
+    const auto& views = ViewRegistry();
+    const auto found_view = views.find(Lower(dotted));
+    if (found_view != views.end()) {
+      if (ViewExpansionDepth() >= 16) {
+        throw std::runtime_error("view expansion too deep: " + dotted);
+      }
+      ++ViewExpansionDepth();
+      SelectSource view_source;
+      try {
+        view_source.query = VisitQuery(*found_view->second);
+        view_source.alias =
+            source.alias.empty() ? Lower(dotted) : source.alias;
+      } catch (...) {
+        --ViewExpansionDepth();
+        throw;
+      }
+      --ViewExpansionDepth();
+      return view_source;
+    }
   } else if (node.kind == "TableSubquery") {
     const GoogleSqlAstNode* query = node.Child("Query");
     if (query == nullptr) {
@@ -4115,6 +4354,15 @@ std::unique_ptr<Statement> VisitDelete(const GoogleSqlAstNode& root) {
 
 std::unique_ptr<Statement> GoogleSqlAstVisitor::Visit(
     const GoogleSqlAstNode& root) {
+  if (root.kind == "HintedStatement") {
+    // Engine-specific hints (`@{ engine.hint=value }`) never alter results
+    // for this engine: unwrap and execute the hinted statement itself.
+    for (const auto& child : root.children) {
+      if (child->kind == "Location" || child->kind == "Hint") { continue; }
+      return Visit(*child);
+    }
+    throw std::runtime_error("GoogleSQL AST: empty HintedStatement");
+  }
   if (root.kind == "QueryStatement") {
     const GoogleSqlAstNode* query = root.Child("Query");
     if (query == nullptr) {
@@ -4173,6 +4421,20 @@ std::unique_ptr<Statement> GoogleSqlAstVisitor::Visit(
   if (root.kind == "CreateFunctionStatement" ||
       root.kind == "CreateTableFunctionStatement") {
     return VisitCreateFunction(root);
+  }
+  if (root.kind == "CreateViewStatement") {
+    // TEMP views: register the defining query for FROM-reference expansion.
+    const GoogleSqlAstNode* path = root.Child("PathExpression");
+    const GoogleSqlAstNode* query = root.Child("Query");
+    if (path == nullptr || query == nullptr) {
+      throw std::runtime_error("GoogleSQL AST: bad CREATE VIEW");
+    }
+    std::shared_ptr<GoogleSqlAstNode> clone = CloneAstNode(*query);
+    ViewRegistry()[Lower(Path(*path))] = std::move(clone);
+    std::vector<NamedExpression> projection;
+    projection.emplace_back("", ConstantValueExp(Value(int64_t{0})));
+    return std::make_unique<SelectStatement>(
+        std::move(projection), std::vector<std::string>{}, Expression{});
   }
   if (root.kind == "InsertStatement") {
     return VisitInsert(root);

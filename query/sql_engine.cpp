@@ -830,7 +830,15 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   // disarms them on every exit (including EXPLAIN, which never sets one).
   set_plan_cache_candidate(templated.fingerprint, templated.parameters);
   PlanCacheCandidateGuard candidate_guard{this};
-  return PrepareStatement(ctx, std::move(statement));
+  // Statement execution (e.g. eager DML application) must uphold the
+  // StatusOr contract: runtime errors surface as Status values, never as
+  // escaping C++ exceptions.
+  try {
+    return PrepareStatement(ctx, std::move(statement));
+  } catch (const std::exception& error) {
+    last_error_ = error.what();
+    return Status::kUnknown;
+  }
 }
 
 namespace {

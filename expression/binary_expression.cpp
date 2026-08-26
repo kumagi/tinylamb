@@ -236,14 +236,9 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     if (rhs == 0.0) {
       throw std::runtime_error("division by zero");
     }
-    const double res = lhs / rhs;
-    if (std::isinf(res)) {
-      throw std::runtime_error("double overflow on '/'");
-    }
-    if (std::isnan(res)) {
-      throw std::runtime_error("division by zero");
-    }
-    return Value(res);
+    // FLOAT64 division follows IEEE-754: overflow yields ±infinity, never
+    // an error (the reference engine only rejects division by zero).
+    return Value(lhs / rhs);
   }
   if (numeric && left.type != right.type) {
     const double lhs = left.type == ValueType::kDouble
@@ -342,10 +337,8 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         if (right.value.double_value == 0.0) {
           throw std::runtime_error("division by zero");
         }
-        const double res = left.value.double_value / right.value.double_value;
-        if (std::isinf(res)) { throw std::runtime_error("double overflow"); }
-        if (std::isnan(res)) { throw std::runtime_error("division by zero"); }
-        return Value(res);
+        // IEEE-754: overflow yields ±infinity, never an error.
+        return Value(left.value.double_value / right.value.double_value);
       }
       return left / right;
     }

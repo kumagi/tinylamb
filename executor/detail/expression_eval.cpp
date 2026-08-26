@@ -673,11 +673,19 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
         const ColumnName base(qualifier, segments[split]);
         const int offset = FindColumn(*current->schema, base);
         if (offset >= 0) {
-          return ResolveFieldPath(
-              (*current->row)[static_cast<size_t>(offset)],
-              std::vector<std::string>(segments.begin() +
-                                           static_cast<ptrdiff_t>(split + 1),
-                                       segments.end()));
+          const Value& base_value =
+              (*current->row)[static_cast<size_t>(offset)];
+          // Only textual STRUCT/PROTO values carry traversable fields; a
+          // scalar match here came from a qualifier/alias fallback, so keep
+          // searching other scopes instead of failing the whole lookup.
+          if (base_value.type == ValueType::kVarChar ||
+              split + 1 == segments.size()) {
+            return ResolveFieldPath(
+                base_value,
+                std::vector<std::string>(segments.begin() +
+                                             static_cast<ptrdiff_t>(split + 1),
+                                         segments.end()));
+          }
         }
       }
     }
@@ -7509,6 +7517,84 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(digest::ToHex(raw_str(arguments[0])));
   }
 
+  if (name == "to_base64") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("TO_BASE64 requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    static const char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const std::string input = raw_str(arguments[0]);
+    std::string out;
+    out.reserve((input.size() + 2) / 3 * 4);
+    size_t i = 0;
+    while (i + 3 <= input.size()) {
+      const uint32_t triple = (static_cast<unsigned char>(input[i]) << 16) |
+                              (static_cast<unsigned char>(input[i + 1]) << 8) |
+                              static_cast<unsigned char>(input[i + 2]);
+      out.push_back(kAlphabet[(triple >> 18) & 0x3F]);
+      out.push_back(kAlphabet[(triple >> 12) & 0x3F]);
+      out.push_back(kAlphabet[(triple >> 6) & 0x3F]);
+      out.push_back(kAlphabet[triple & 0x3F]);
+      i += 3;
+    }
+    const size_t remainder = input.size() - i;
+    if (remainder == 1) {
+      const uint32_t byte = static_cast<unsigned char>(input[i]);
+      out.push_back(kAlphabet[(byte >> 2) & 0x3F]);
+      out.push_back(kAlphabet[(byte & 0x03) << 4]);
+      out += "==";
+    } else if (remainder == 2) {
+      const uint32_t pair =
+          (static_cast<unsigned char>(input[i]) << 8) |
+          static_cast<unsigned char>(input[i + 1]);
+      out.push_back(kAlphabet[(pair >> 10) & 0x3F]);
+      out.push_back(kAlphabet[(pair >> 4) & 0x3F]);
+      out.push_back(kAlphabet[(pair & 0x0F) << 2]);
+      out.push_back('=');
+    }
+    return Value(std::move(out));
+  }
+
+  if (name == "from_base64") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("FROM_BASE64 requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    const std::string input = raw_str(arguments[0]);
+    auto value_of = [](char c) -> int {
+      if (c >= 'A' && c <= 'Z') { return c - 'A'; }
+      if (c >= 'a' && c <= 'z') { return c - 'a' + 26; }
+      if (c >= '0' && c <= '9') { return c - '0' + 52; }
+      if (c == '+') { return 62; }
+      if (c == '/') { return 63; }
+      return -1;
+    };
+    std::string out;
+    out.reserve(input.size() / 4 * 3);
+    uint32_t buffer = 0;
+    int bits = 0;
+    for (const char c : input) {
+      if (std::isspace(static_cast<unsigned char>(c)) != 0) { continue; }
+      if (c == '=') { break; }
+      const int decoded = value_of(c);
+      if (decoded < 0) {
+        throw std::runtime_error("FROM_BASE64: invalid character in input");
+      }
+      buffer = (buffer << 6) | static_cast<uint32_t>(decoded);
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out.push_back(static_cast<char>((buffer >> bits) & 0xFF));
+      }
+    }
+    return Value(std::move(out));
+  }
+
   if (name == "from_hex") {
     if (arguments.size() != 1) {
       throw std::runtime_error("FROM_HEX requires 1 argument");
@@ -7800,6 +7886,27 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       if (v.type == ValueType::kInt64) {
         return static_cast<double>(v.value.int_value);
+      }
+      if (v.type == ValueType::kVarChar) {
+        // (key, value) struct elements carry their coordinate in the last
+        // member of the textual struct form {"k":...,"value":10}.
+        const std::string_view text(v.value.varchar_value);
+        const size_t last_colon = text.rfind(':');
+        if (text.size() >= 2 && text.front() == '{' && text.back() == '}' &&
+            last_colon != std::string_view::npos &&
+            last_colon + 1 < text.size()) {
+          std::string tail(text.substr(last_colon + 1));
+          while (!tail.empty() &&
+                 (std::isspace(static_cast<unsigned char>(tail.back())) != 0 ||
+                  tail.back() == '}')) {
+            tail.pop_back();
+          }
+          char* parse_end = nullptr;
+          const double parsed = std::strtod(tail.c_str(), &parse_end);
+          if (parse_end != tail.c_str() && *parse_end == '\0') {
+            return parsed;
+          }
+        }
       }
       throw std::runtime_error(
           "EUCLIDEAN_DISTANCE requires numeric array elements");
