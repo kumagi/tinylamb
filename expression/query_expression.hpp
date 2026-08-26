@@ -3,6 +3,7 @@
 #define TINYLAMB_QUERY_EXPRESSION_HPP
 
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -58,6 +59,15 @@ class QueryExpression : public ExpressionBase {
   // single array value instead of scalar/EXISTS/IN semantics.
   [[nodiscard]] bool ArrayResult() const { return array_result_; }
   void SetArrayResult(bool array_result) { array_result_ = array_result; }
+  // Static SQL type of the projected column (BOOL, INT32, ...), inferred from
+  // the subquery AST when possible.  Empty when only runtime inference is
+  // possible.
+  [[nodiscard]] const std::string& ArrayElementSqlType() const {
+    return array_element_sql_type_;
+  }
+  void SetArrayElementSqlType(std::string type) {
+    array_element_sql_type_ = std::move(type);
+  }
   [[nodiscard]] BinaryOperation Op() const { return op_; }
   [[nodiscard]] QuantifierMode Mode() const { return mode_; }
 
@@ -67,6 +77,7 @@ class QueryExpression : public ExpressionBase {
   bool exists_{false};
   bool negated_{false};
   bool array_result_{false};
+  std::string array_element_sql_type_;
   BinaryOperation op_{BinaryOperation::kEquals};
   QuantifierMode mode_{QuantifierMode::kIn};
 };

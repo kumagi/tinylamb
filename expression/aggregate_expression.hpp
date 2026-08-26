@@ -19,6 +19,7 @@
 
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -91,6 +92,14 @@ class AggregateExpression : public ExpressionBase {
   // true; streaming-safe, unlike the HAVING MAX/MIN modifier.
   [[nodiscard]] const Expression& WhereFilter() const { return where_filter_; }
   void SetWhereFilter(Expression filter) { where_filter_ = std::move(filter); }
+  // Static SQL type of ARRAY_AGG's element (BOOL, INT32, ...), inferred from
+  // the argument AST.  Empty means infer from the aggregated values.
+  [[nodiscard]] const std::string& ArrayElementSqlType() const {
+    return array_element_sql_type_;
+  }
+  void SetArrayElementSqlType(std::string type) {
+    array_element_sql_type_ = std::move(type);
+  }
   // Aggregates that cannot stream row-at-a-time: they need whole-group
   // context for their HAVING modifier, inner ORDER BY, LIMIT, or per-row
   // trailing arguments (two-input statistics, sketch parameters).
@@ -116,6 +125,7 @@ class AggregateExpression : public ExpressionBase {
   Expression secondary_arg_;
   std::vector<Expression> trailing_args_;
   Expression where_filter_;
+  std::string array_element_sql_type_;
 };
 
 }  // namespace tinylamb

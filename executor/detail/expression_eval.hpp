@@ -52,6 +52,21 @@ struct AggregateInput {
 
 std::string ElementSqlTypeName(ValueType type);
 
+// DISTINCT semantics: all NaNs collapse to one entry and -0 folds to +0.
+struct DistinctValueHash {
+  size_t operator()(const Value& value) const;
+};
+struct DistinctValueEqual {
+  bool operator()(const Value& left, const Value& right) const;
+};
+using DistinctValueSet =
+    std::unordered_set<Value, DistinctValueHash, DistinctValueEqual>;
+
+// DISTINCT/GROUP-BY key normalization: every NaN collapses to one canonical
+// bit pattern and negative zero folds to +0, matching SQL equality semantics
+// where raw IEEE bit patterns would otherwise count NaNs as distinct.
+[[nodiscard]] Value CanonicalDistinctValue(const Value& value);
+
 struct AggregateAccumulator {
   explicit AggregateAccumulator(const AggregateExpression* aggregate);
 
@@ -72,7 +87,7 @@ struct AggregateAccumulator {
   Value extreme;
   // GoogleSQL MIN/MAX: a NaN input poisons the result.
   mutable bool saw_nan_{false};
-  std::unique_ptr<std::unordered_set<Value>> distinct;
+  std::unique_ptr<DistinctValueSet> distinct;
   std::unique_ptr<std::unordered_set<int64_t>> distinct_ints;
 
  private:
@@ -89,6 +104,8 @@ struct AggregateAccumulator {
   // BIT_AND/OR/XOR fold state.
   mutable int64_t bit_acc_{0};
   mutable bool bit_saw_value_{false};
+  // ARRAY_AGG DISTINCT: a repeated NULL collapses to one element.
+  mutable bool array_saw_null_{false};
   // ARRAY_CONCAT_AGG declared element type (captured even for empty arrays).
   mutable std::string concat_elem_type_;
   // ELEMENTWISE_SUM/AVG positional state.

@@ -16,6 +16,11 @@ void ZoneMap::Add(const Value& value) {
     return;
   }
   ++value_count_;
+  // Arrays carry no useful scalar ordering for pruning (element-wise
+  // lexicographic comparison throws across NULL/non-NULL elements), so keep
+  // them out of the min/max envelope.
+  if (value.IsArray()) { return;
+}
   if (!minimum_ || value < *minimum_) { minimum_ = value;
 }
   if (!maximum_ || *maximum_ < value) { maximum_ = value;
@@ -89,6 +94,10 @@ bool ZoneMap::MayMatch(BinaryOperation operation, const Value& constant) const {
   // constants never compare either.  minimum_/maximum_ are always populated
   // together, so checking both here keeps the invariant explicit.
   if (!minimum_ || !maximum_ || constant.IsNull()) {
+    // Non-NULL values were observed but excluded from the envelope (arrays):
+    // nothing can be proven, so keep every row.
+    if (value_count_ > 0) { return true;
+}
     return false;
   }
   // Cross-type comparisons (e.g. int constant vs double zone) may match after

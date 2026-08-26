@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "executor/executor_base.hpp"
+#include "executor/detail/expression_eval.hpp"
 #include "expression/named_expression.hpp"
 #include "type/schema.hpp"
 
@@ -46,7 +47,7 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   struct PartialState {
     std::vector<Value> values;
     std::vector<int64_t> counts;
-    std::vector<std::unordered_set<Value>> distinct_values;
+    std::vector<relational_detail::DistinctValueSet> distinct_values;
   };
 
   [[nodiscard]] PartialState MakeState() const;

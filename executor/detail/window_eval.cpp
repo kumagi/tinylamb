@@ -174,11 +174,11 @@ bool ValueLess(const Value& a, const Value& b, bool ascending,
   if (a.IsNull() && b.IsNull()) { return false; }
   if (a.IsNull()) { return nulls_first_value; }
   if (b.IsNull()) { return !nulls_first_value; }
-  try {
-    return ascending ? a < b : b < a;
-  } catch (...) {
-    return false;
-  }
+  const int c = CompareForOrderBy(a, b);
+  if (c == 0) { return false;
+}
+  const bool a_less = c < 0;
+  return ascending ? a_less : !a_less;
 }
 
 bool ValuesEqual(const Value& a, const Value& b) {
@@ -487,11 +487,22 @@ struct WindowRuntime {
         final_values.resize(*window.inner_limit);
       }
       if (fn == "STRING_AGG") {
-        std::string sep = delimiter.IsNull() ? "," : delimiter.AsString();
+        std::string sep =
+            delimiter.IsNull() ? "," : std::string(delimiter.AsString());
+        // Strip the display quotes AsString() wraps around VARCHAR values.
+        if (sep.size() >= 2 && sep.front() == '"' && sep.back() == '"') {
+          sep = sep.substr(1, sep.size() - 2);
+        }
+        auto raw_text = [](const Value& v) {
+          return v.type == ValueType::kVarChar
+                     ? std::string(v.value.varchar_value)
+                     : v.AsString();
+        };
         std::string out;
         for (size_t i = 0; i < final_values.size(); ++i) {
-          if (i) { out += sep; }
-          out += final_values[i].AsString();
+          if (i) { out += sep;
+}
+          out += raw_text(final_values[i]);
         }
         return Value(std::move(out));
       }

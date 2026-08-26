@@ -102,6 +102,8 @@ int ParseTimeZoneOffset(std::string_view tz_str, int Y, int M, int D, int h, int
 }
 
 std::string SqlTypeFromAst(const GoogleSqlAstNode& node);
+std::string InferSubqueryArrayElementType(const GoogleSqlAstNode& query_node);
+std::string InferAggregateArrayElementType(const GoogleSqlAstNode& node);
 
 std::string Lower(std::string value) {
 
@@ -796,6 +798,24 @@ Expression VisitFunction(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-recu
       }
       aggregate->SetExtraArgs(std::move(extras));
     }
+    // ARRAY_AGG keeps a statically inferred element type: runtime values
+    // cannot distinguish BOOL from INT64 or INT32 from INT64.
+    if (type == AggregationType::kArrayAgg) {
+      for (size_t i = 1; i < node.children.size(); ++i) {
+        const GoogleSqlAstNode& child = *node.children[i];
+        if (child.kind == "Location" || child.kind == "WhereClause" ||
+            child.kind == "HavingModifier" || child.kind == "OrderBy" ||
+            child.kind == "LimitOffset") {
+          continue;
+        }
+        const std::string element_type =
+            InferAggregateArrayElementType(child);
+        if (!element_type.empty()) {
+          aggregate->SetArrayElementSqlType(element_type);
+        }
+        break;
+      }
+    }
     return aggregate;
   };
 
@@ -1011,6 +1031,62 @@ std::string InferArrayElementSqlType(const GoogleSqlAstNode& node) {  // NOLINT(
     return "ARRAY<" + inner + ">";
   }
   return "INT64";
+}
+
+// Statically infers the SQL type of an ARRAY(SELECT ...) subquery's single
+// projected column from its AST.  Returns "" when the projection is not a
+// statically-known literal/cast shape; callers then fall back to runtime
+// inference from the produced values.
+std::string InferSubqueryArrayElementType(
+    const GoogleSqlAstNode& query_node) {
+  const GoogleSqlAstNode* select = query_node.Child("Select");
+  const GoogleSqlAstNode* select_list =
+      select == nullptr ? nullptr : select->Child("SelectList");
+  if (select_list == nullptr) { return {};
+}
+  for (const GoogleSqlAstNode* column : select_list->Children("SelectColumn")) {
+    const GoogleSqlAstNode* expression_node = nullptr;
+    for (const auto& child : column->children) {
+      if (child->kind != "Alias") {
+        expression_node = child.get();
+        break;
+      }
+    }
+    if (expression_node == nullptr) { return {};
+}
+    const GoogleSqlAstNode& expr = *expression_node;
+    if (expr.kind == "BooleanLiteral") { return "BOOL"; }
+    if (expr.kind == "FloatLiteral") { return "DOUBLE"; }
+    if (expr.kind == "IntLiteral") { return "INT64"; }
+    if (expr.kind == "StringLiteral") { return "STRING"; }
+    if (expr.kind == "BytesLiteral") { return "BYTES"; }
+    if (expr.kind == "CastExpression" && expr.children.size() >= 2) {
+      return SqlTypeFromAst(*expr.children[1]);
+    }
+    return "";
+  }
+  return "";
+}
+
+// Reliable-only variant used by ARRAY_AGG: unlike the subquery path there is
+// no fallback cost asymmetry — a wrong guess (e.g. INT64 for a DOUBLE column)
+// is worse than deferring to runtime value inference, so only literal/cast
+// argument shapes produce a type here.
+std::string InferAggregateArrayElementType(const GoogleSqlAstNode& node) {
+  if (node.kind == "BooleanLiteral") { return "BOOL"; }
+  if (node.kind == "StringLiteral") { return "STRING"; }
+  if (node.kind == "BytesLiteral") { return "BYTES"; }
+  if (node.kind == "DateOrTimeLiteral") {
+    if (node.detail == "TYPE_DATE") { return "DATE"; }
+    if (node.detail == "TYPE_TIMESTAMP") { return "TIMESTAMP"; }
+    if (node.detail == "TYPE_TIME") { return "TIME"; }
+    if (node.detail == "TYPE_DATETIME") { return "DATETIME"; }
+    return {};
+  }
+  if (node.kind == "CastExpression" && node.children.size() >= 2) {
+    return SqlTypeFromAst(*node.children[1]);
+  }
+  return "";
 }
 
 std::string DecodeBytes(const GoogleSqlAstNode& node) {
@@ -1382,6 +1458,14 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         if (IsAstTrivia(child->kind) || IsArrayTypeNode(child->kind)) {
           continue;
         }
+        // ARRAY(SELECT ...): infer from the subquery's projected column.
+        if (child->kind == "ExpressionSubquery" &&
+            child->detail == "modifier=ARRAY") {
+          if (const GoogleSqlAstNode* inner_query = child->Child("Query")) {
+            element_type = InferSubqueryArrayElementType(*inner_query);
+            if (!element_type.empty()) { break; }
+          }
+        }
         element_type = InferArrayElementSqlType(*child);
         if (!element_type.empty()) { break; }
       }
@@ -1395,9 +1479,9 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
         auto array_query = std::make_shared<QueryExpression>(
             query.Query(), nullptr, false, false);
         array_query->SetArrayResult(true);
+        array_query->SetArrayElementSqlType(element_type);
         return Expression(array_query);
-      }
-    }
+      }    }
     return ArrayExpressionExp(std::move(elements), std::move(element_type));
   }
   if (node.kind == "BinaryExpression") {
@@ -1493,11 +1577,19 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
   if (node.kind == "ConcatExpr") {
     std::vector<Expression> args;
     args.reserve(node.children.size());
+    bool all_arrays = true;
     for (const auto& child : node.children) {
       if (child->kind == "Location") { continue; }
       Expression arg = VisitExpression(*child);
+      if (arg->Type() != TypeTag::kArrayExp) {
+        all_arrays = false;
+      }
       arg = WrapIfBoolean(std::move(arg), *child);
       args.push_back(std::move(arg));
+    }
+    // array || array is array concatenation, not string concat.
+    if (all_arrays && args.size() >= 2) {
+      return FunctionCallExp("array_concat", std::move(args));
     }
     return FunctionCallExp("concat", std::move(args));
   }
@@ -1556,7 +1648,11 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
       throw std::runtime_error("GoogleSQL AST: malformed array element");
     }
     std::string fn = "array_element_offset";
-    if (accessor.find("ORDINAL") != std::string::npos) {
+    if (accessor == "SAFE_OFFSET") {
+      fn = "array_element_safe_offset";
+    } else if (accessor == "SAFE_ORDINAL") {
+      fn = "array_element_safe_ordinal";
+    } else if (accessor == "ORDINAL") {
       fn = "array_element_ordinal";
     }
     return FunctionCallExp(fn, {std::move(base), VisitExpression(*index_node)});
@@ -1690,6 +1786,8 @@ Expression VisitExpression(const GoogleSqlAstNode& node) {  // NOLINT(misc-no-re
       auto array_query = std::make_shared<QueryExpression>(
           VisitQuery(*query), nullptr, false, false);
       array_query->SetArrayResult(true);
+      array_query->SetArrayElementSqlType(
+          InferSubqueryArrayElementType(*query));
       return Expression(array_query);
     }
     return QueryExpressionExp(VisitQuery(*query), nullptr,

@@ -17,6 +17,7 @@
 #include "type/value.hpp"
 #include <endian.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -890,6 +891,64 @@ Value Value::operator^(const Value& rhs) const {
     return Value(value.int_value ^ rhs.value.int_value);
   }
   throw std::runtime_error("Cannot do '^' against this type");
+}
+
+int CompareForOrderBy(const Value& a, const Value& b) {
+  // Type rank keeps cross-type keys in a deterministic total order; matching
+  // types compare by value.
+  static constexpr int kRank[] = {0, 1, 4, 3, 5, 6};  // null,int,string,double,date,array
+  auto rank_of = [](const Value& v) {
+    return v.type == ValueType::kNull
+               ? 0
+               : (static_cast<int>(v.type) < 6 ? kRank[static_cast<int>(v.type)]
+                                               : 9);
+  };
+  if (a.IsNull() || b.IsNull()) {
+    // NULLs compare equal here; NULLS FIRST/LAST is the caller's decision.
+    if (a.IsNull() && b.IsNull()) { return 0;
+}
+    return a.IsNull() ? -1 : 1;
+  }
+  const int ra = rank_of(a);
+  const int rb = rank_of(b);
+  if (ra != rb) { return ra < rb ? -1 : 1;
+}
+  switch (a.type) {
+    case ValueType::kInt64:
+    case ValueType::kDate:
+      return a.value.int_value < b.value.int_value
+                 ? -1
+                 : (b.value.int_value < a.value.int_value ? 1 : 0);
+    case ValueType::kDouble: {
+      const double x = a.value.double_value;
+      const double y = b.value.double_value;
+      // GoogleSQL: NaN is larger than every non-NaN (including +inf); all
+      // NaNs are equal under the ordering.
+      const bool nx = std::isnan(x);
+      const bool ny = std::isnan(y);
+      if (nx || ny) { return nx && ny ? 0 : (nx ? 1 : -1);
+}
+      return x < y ? -1 : (y < x ? 1 : 0);
+    }
+    case ValueType::kVarChar:
+      return a.value.varchar_value < b.value.varchar_value
+                 ? -1
+                 : (b.value.varchar_value < a.value.varchar_value ? 1 : 0);
+    case ValueType::kArray: {
+      const auto& xs = a.ArrayElements();
+      const auto& ys = b.ArrayElements();
+      const size_t n = std::min(xs.size(), ys.size());
+      for (size_t i = 0; i < n; ++i) {
+        const int c = CompareForOrderBy(xs[i], ys[i]);
+        if (c != 0) { return c;
+}
+      }
+      return xs.size() < ys.size() ? -1
+                                   : (ys.size() < xs.size() ? 1 : 0);
+    }
+    default:
+      return 0;
+  }
 }
 
 std::ostream& operator<<(std::ostream& o, const Value& v) {
