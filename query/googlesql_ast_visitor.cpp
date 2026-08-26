@@ -1062,12 +1062,17 @@ std::unordered_map<std::string, Expression>& SessionConstantExpressions() {
 
 // Returns the argument expression bound to `path_name` by the innermost
 // active expansion, or nullptr when the identifier must resolve normally
-// (no parameter of that name, or an explicit binding shadows it).
+// (no parameter of that name, or an explicit binding shadows it).  A dotted
+// path whose leading segment names a parameter (`e.x` for a STRUCT-bound
+// lambda element) substitutes the base and traverses the remaining fields.
 Expression SubstituteUdfParameter(const std::string& path_name) {
-  if (path_name.find('.') != std::string::npos || t_udf_frames.empty()) {
+  if (t_udf_frames.empty()) {
     return nullptr;
   }
-  const std::string lower = Lower(path_name);
+  const size_t dot = path_name.find('.');
+  const std::string head =
+      dot == std::string::npos ? path_name : path_name.substr(0, dot);
+  const std::string lower = Lower(head);
   // Walk masks top-down alongside frames: masks pushed above a frame's
   // mask_depth belong to query blocks between the expansion and this
   // identifier occurrence.
@@ -1087,7 +1092,26 @@ Expression SubstituteUdfParameter(const std::string& path_name) {
     }
     for (size_t index = 0; index < frame.udf->parameters.size(); ++index) {
       if (frame.udf->parameters[index].first == lower) {
-        return (*frame.arguments)[index];
+        Expression base = (*frame.arguments)[index];
+        if (dot == std::string::npos) {
+          return base;
+        }
+        // Field traversal on a substituted STRUCT/PROTO base (`e.x`): safe
+        // access so anonymous struct members surface as NULL, matching the
+        // reference lambda semantics.
+        std::string remaining = path_name.substr(dot + 1);
+        while (!remaining.empty()) {
+          const size_t segment_end = remaining.find('.');
+          std::string field = segment_end == std::string::npos
+                                  ? remaining
+                                  : remaining.substr(0, segment_end);
+          base = FunctionCallExp(
+              "__get_field_safe",
+              {std::move(base), ConstantValueExp(Value(std::move(field)))});
+          if (segment_end == std::string::npos) { break; }
+          remaining = remaining.substr(segment_end + 1);
+        }
+        return base;
       }
     }
   }
@@ -1226,17 +1250,19 @@ std::vector<WindowOrderTerm> ParseOrderingList(const GoogleSqlAstNode& order) {
   return terms;
 }
 
-// ARRAY_TRANSFORM(array, x -> body) desugars into the relational shape
-// ARRAY(SELECT body FROM UNNEST(array) AS <binding>): the lambda parameter
-// becomes the UNNEST column and the body is visited against it, so nested
-// calls, captures of outer columns, and two-parameter (element, offset)
-// lambdas keep working through ordinary scope resolution.  ARRAY_FILTER is
-// the same shape with the lambda result as a retention predicate.
+// Shared lambda plumbing for the higher-order array functions: extracts the
+// parameter names, binds them to the synthetic UNNEST bindings, and visits
+// the body under that expansion frame.
 std::string InferArrayElementSqlType(const GoogleSqlAstNode& node);
 
-Expression RewriteLambdaArrayFunction(const GoogleSqlAstNode& array_node,
-                                      const GoogleSqlAstNode& lambda,
-                                      bool as_filter) {
+struct LambdaBindingResult {
+  Expression body;
+  std::string element_binding;
+  std::string offset_binding;
+  size_t param_count{0};
+};
+
+LambdaBindingResult BindLambdaBody(const GoogleSqlAstNode& lambda) {
   std::vector<std::string> params;
   for (size_t i = 0; i + 1 < lambda.children.size(); ++i) {
     const GoogleSqlAstNode& head = *lambda.children[i];
@@ -1252,17 +1278,17 @@ Expression RewriteLambdaArrayFunction(const GoogleSqlAstNode& array_node,
   }
   const GoogleSqlAstNode* body =
       lambda.children.empty() ? nullptr : lambda.children.back().get();
-  if (params.empty() || params.size() > 2 || body == nullptr ||
-      body->kind == "PathExpression") {
+  // A bare-parameter body (`e -> e`, `e -> e.x`) is a valid projection and
+  // resolves through ordinary parameter substitution.
+  if (params.empty() || params.size() > 2 || body == nullptr) {
     throw std::runtime_error("GoogleSQL AST: unsupported Lambda");
   }
   static thread_local size_t t_lambda_counter = 0;
   const size_t lambda_id = ++t_lambda_counter;
-  const std::string element_binding =
-      "__lambda_element_" + std::to_string(lambda_id);
-  const std::string offset_binding =
-      "__lambda_offset_" + std::to_string(lambda_id);
-  Expression array_expr = VisitExpression(array_node);
+  LambdaBindingResult result;
+  result.element_binding = "__lambda_element_" + std::to_string(lambda_id);
+  result.offset_binding = "__lambda_offset_" + std::to_string(lambda_id);
+  result.param_count = params.size();
   // The frame storage keeps stable SqlUdf addresses while nested lambdas
   // expand; entries are popped with their frames.
   auto& frame_udf = t_lambda_frame_storage().emplace_back();
@@ -1271,15 +1297,14 @@ Expression RewriteLambdaArrayFunction(const GoogleSqlAstNode& array_node,
     frame_udf.parameters.emplace_back(param, false);
   }
   std::vector<Expression> bound;
-  bound.push_back(ColumnValueExp(ColumnName("", element_binding)));
+  bound.push_back(ColumnValueExp(ColumnName("", result.element_binding)));
   if (params.size() == 2) {
-    bound.push_back(ColumnValueExp(ColumnName("", offset_binding)));
+    bound.push_back(ColumnValueExp(ColumnName("", result.offset_binding)));
   }
   const UdfExpansionFrame frame{&frame_udf, &bound, t_udf_bound_masks.size()};
   t_udf_frames.push_back(frame);
-  Expression body_expression;
   try {
-    body_expression = VisitExpression(*body);
+    result.body = VisitExpression(*body);
   } catch (...) {
     t_udf_frames.pop_back();
     t_lambda_frame_storage().pop_back();
@@ -1287,27 +1312,80 @@ Expression RewriteLambdaArrayFunction(const GoogleSqlAstNode& array_node,
   }
   t_udf_frames.pop_back();
   t_lambda_frame_storage().pop_back();
+  return result;
+}
 
+SelectSource MakeLambdaSource(Expression array_expr,
+                              const LambdaBindingResult& binding) {
+  SelectSource source;
+  source.unnest = std::move(array_expr);
+  source.alias = binding.element_binding;
+  if (binding.param_count == 2) {
+    source.offset_alias = binding.offset_binding;
+  }
+  return source;
+}
+
+Expression RewriteLambdaArrayFunction(const GoogleSqlAstNode& array_node,
+                                      const GoogleSqlAstNode& lambda,
+                                      bool as_filter) {
+  Expression array_expr = VisitExpression(array_node);
+  // A NULL array argument propagates: UNNEST over it yields no rows, which
+  // would otherwise collapse to an empty (non-NULL) result array.
+  Expression array_for_null_check = array_expr;
+  LambdaBindingResult binding = BindLambdaBody(lambda);
   auto inner = std::make_shared<SelectStatement>(
       as_filter
           ? std::vector<NamedExpression>{NamedExpression(
                 std::string(""),
-                ColumnValueExp(ColumnName("", element_binding)))}
+                ColumnValueExp(ColumnName("", binding.element_binding)))}
           : std::vector<NamedExpression>{NamedExpression(
-                std::string(""), std::move(body_expression))},
+                std::string(""), std::move(binding.body))},
       std::vector<std::string>{},
-      as_filter ? std::move(body_expression) : Expression{});
-  SelectSource source;
-  source.unnest = std::move(array_expr);
-  source.alias = element_binding;
-  if (params.size() == 2) { source.offset_alias = offset_binding; }
-  inner->SetSources({std::move(source)});
+      as_filter ? binding.body : Expression{});
+  inner->SetSources({MakeLambdaSource(std::move(array_expr), binding)});
   inner->MarkComplex();
-  auto query_expression = std::make_shared<QueryExpression>(
-      std::move(inner), nullptr, false, false);
+  auto query_expression =
+      std::make_shared<QueryExpression>(std::move(inner), nullptr, false, false);
   query_expression->SetArrayResult(true);
-  query_expression->SetArrayElementSqlType(InferArrayElementSqlType(*body));
-  return Expression(query_expression);
+  query_expression->SetArrayElementSqlType(
+      InferArrayElementSqlType(lambda.children.back().get() == nullptr
+                                   ? lambda
+                                   : *lambda.children.back()));
+  Expression array_result(query_expression);
+  return CaseExpressionExp(
+      {{UnaryExpressionExp(std::move(array_for_null_check),
+                           UnaryOperation::kIsNull),
+        ConstantValueExp(Value())}},
+      std::move(array_result));
+}
+
+// ARRAY_INCLUDES(array, e -> pred) asks whether any element satisfies the
+// predicate: three-valued over a NULL array (NULL), otherwise TRUE when the
+// existential subquery finds a row and FALSE when it does not.  An empty
+// array yields FALSE because UNNEST produces no rows to satisfy it.
+Expression RewriteLambdaIncludes(const GoogleSqlAstNode& array_node,
+                                 const GoogleSqlAstNode& lambda) {
+  Expression array_expr = VisitExpression(array_node);
+  // The NULL-array guard and the UNNEST source share one evaluation of the
+  // array argument; keep a handle for both.
+  Expression array_for_null_check = array_expr;
+  LambdaBindingResult binding = BindLambdaBody(lambda);
+  auto inner = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression(
+          std::string(""),
+          ColumnValueExp(ColumnName("", binding.element_binding)))},
+      std::vector<std::string>{}, std::move(binding.body));
+  inner->SetSources({MakeLambdaSource(std::move(array_expr), binding)});
+  inner->MarkComplex();
+  auto exists = std::make_shared<QueryExpression>(
+      std::move(inner), nullptr, true, false);
+  return CaseExpressionExp(
+      {{UnaryExpressionExp(std::move(array_for_null_check),
+                           UnaryOperation::kIsNull),
+        ConstantValueExp(Value())},
+       {Expression(std::move(exists)), ConstantValueExp(Value(int64_t{1}))}},
+      ConstantValueExp(Value(int64_t{0})));
 }
 
 Expression VisitFunction(
@@ -1326,9 +1404,11 @@ Expression VisitFunction(
   if (name == "lcase") {
     name = "lower";
   }
-  if (name == "array_transform" || name == "array_filter") {
+  if (name == "array_transform" || name == "array_filter" ||
+      name == "array_includes") {
     // Higher-order array functions take a trailing lambda argument; desugar
-    // the lambda into an ARRAY(SELECT ... FROM UNNEST ...) rewrite.
+    // the lambda into an ARRAY(SELECT ... FROM UNNEST ...) rewrite (or the
+    // existential CASE shape for ARRAY_INCLUDES).
     const GoogleSqlAstNode* array_arg = nullptr;
     const GoogleSqlAstNode* lambda = nullptr;
     for (size_t i = 1; i < node.children.size(); ++i) {
@@ -1341,6 +1421,9 @@ Expression VisitFunction(
       if (array_arg == nullptr) { array_arg = &child; }
     }
     if (lambda != nullptr && array_arg != nullptr) {
+      if (name == "array_includes") {
+        return RewriteLambdaIncludes(*array_arg, *lambda);
+      }
       return RewriteLambdaArrayFunction(*array_arg, *lambda,
                                         name == "array_filter");
     }
@@ -1860,6 +1943,12 @@ std::string InferArrayElementSqlType(
   }
   if (node.kind == "NewConstructor") {
     return "PROTO";
+  }
+  if (node.kind == "StructConstructorWithParens" ||
+      node.kind == "StructConstructorWithKeyword") {
+    // Struct elements flatten one level inside UNNEST; the declared tag
+    // tells the runtime to expand member columns.
+    return "STRUCT";
   }
   if (node.kind == "NullLiteral") {
     return {};

@@ -445,8 +445,15 @@ std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
   if (upper == "STRING" || upper == "VARCHAR" || upper == "TEXT" ||
       upper == "BYTES" || upper == "JSON" || upper == "NUMERIC" ||
       upper == "BIGNUMERIC" || upper == "DECIMAL" || upper == "DATETIME" ||
-      upper == "TIMESTAMP" || upper == "TIME" || upper == "INTERVAL" || upper.find("PB") != std::string::npos ||
+      upper == "TIMESTAMP" || upper == "TIME" || upper == "INTERVAL" ||
+      upper.find("PB") != std::string::npos ||
       upper.find("PROTO") != std::string::npos) {
+    return {ValueType::kVarChar, TypeTag::kVarChar};
+  }
+  // Dotted user-defined type paths (`googlesql_test.KitchenSinkPB`) are
+  // protobuf messages: the engine carries them as text-format strings.  Enum
+  // paths keep their member-name text form through the same channel.
+  if (upper.find('.') != std::string::npos) {
     return {ValueType::kVarChar, TypeTag::kVarChar};
   }
 
