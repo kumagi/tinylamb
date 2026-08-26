@@ -229,7 +229,7 @@ Value ProjectSubqueryRow(const Row& row, bool as_struct,
       case ValueType::kInt64:
         return std::to_string(v.value.int_value);
       case ValueType::kDouble:
-        return std::to_string(v.value.double_value);
+        return FormatDoubleShortest(v.value.double_value);
       case ValueType::kVarChar:
         return "\"" + std::string(v.value.varchar_value) + "\"";
       case ValueType::kArray: {
@@ -246,7 +246,7 @@ Value ProjectSubqueryRow(const Row& row, bool as_struct,
               inner += std::to_string(element.value.int_value);
               break;
             case ValueType::kDouble:
-              inner += std::to_string(element.value.double_value);
+              inner += FormatDoubleShortest(element.value.double_value);
               break;
             case ValueType::kVarChar:
               inner += "\"" + std::string(element.value.varchar_value) + "\"";
@@ -391,6 +391,24 @@ const std::vector<slot_t>* ReusableProjection(TransactionContext& context,
   }
   return &found->second;
 }
+// True when the cache entry keyed by `statement`'s address was created for
+// this very statement (address recycling guard). Records `fresh` when absent.
+bool CacheEntryIsCurrent(const SelectStatement& statement,
+                         ExecutionRuntime& runtime) {
+  const std::string& fresh = statement.Fingerprint();
+  const auto [it, inserted] =
+      runtime.cache_fingerprints.try_emplace(&statement, fresh);
+  if (!inserted && it->second != fresh) {
+    it->second = fresh;
+    return false;
+  }
+  return true;
+}
+
+void DropCacheEntry(ExecutionRuntime& runtime, const SelectStatement* key) {
+  runtime.cache_fingerprints.erase(key);
+}
+
 std::optional<Relation> ExecuteCorrelatedSingleSource(
     TransactionContext& context, const SelectStatement& statement,
     const Scope& outer, const CteMap& ctes) {
@@ -416,8 +434,18 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
   const auto cached =
       context.execution_runtime()->correlated_indexes.find(&statement);
   if (cached != context.execution_runtime()->correlated_indexes.end()) {
-    index = cached->second.get();
-  } else {
+    if (CacheEntryIsCurrent(statement, *context.execution_runtime())) {
+      index = cached->second.get();
+    } else {
+      // Address recycled: the entry belongs to a dead statement.
+      DropCacheEntry(*context.execution_runtime(), &statement);
+      context.execution_runtime()->correlated_indexes.erase(cached);
+      context.execution_runtime()->unindexable_queries.erase(&statement);
+    }
+  }
+  if (index == nullptr &&
+      !context.execution_runtime()->unindexable_queries.contains(
+          &statement)) {
     const SelectSource& from = statement.Sources()[0];
     Schema peek_schema;
     if (statement.Sources().size() == 1 && !from.query && !from.table.empty()) {
@@ -743,6 +771,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     source.spill.reset();
     source.spill_tail_.reset();
     index = created.get();
+    CacheEntryIsCurrent(statement, *context.execution_runtime());
     context.execution_runtime()->correlated_indexes.emplace(&statement,
                                                             std::move(created));
     ++context.execution_runtime()->correlated_index_builds;
@@ -925,9 +954,14 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
   const auto cached =
       context.execution_runtime()->uncorrelated_results.find(&statement);
   if (cached != context.execution_runtime()->uncorrelated_results.end()) {
-    ++context.execution_runtime()->uncorrelated_cache_hits;
-    return cached->second.get();
+    if (CacheEntryIsCurrent(statement, *context.execution_runtime())) {
+      ++context.execution_runtime()->uncorrelated_cache_hits;
+      return cached->second.get();
+    }
+    DropCacheEntry(*context.execution_runtime(), &statement);
+    context.execution_runtime()->uncorrelated_results.erase(cached);
   }
+  CacheEntryIsCurrent(statement, *context.execution_runtime());
 
   std::vector<Relation> schemas;
   schemas.reserve(statement.Sources().size());

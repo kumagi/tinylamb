@@ -91,6 +91,19 @@ bool SkipBindConstant(const Value& value) {
           value.type != ValueType::kVarChar && value.type != ValueType::kDate);
 }
 
+// Visitor-synthesized function calls carry structural constant arguments
+// (operators, quantifier modes, field names, unit names) that have no
+// counterpart in the SQL text.  The text-driven extractor never emits them,
+// so binding must pass them through verbatim; treating them as bindable
+// literals shifts every later parameter and silently rewrites operator or
+// field-name slots into user data.
+bool IsStructuralCallArg(std::string_view func, size_t index) {
+  if (func == "__quantified__") { return index >= 2; }
+  if (func == "__struct_json__") { return index % 3 != 1; }
+  if (func == "make_interval" || func == "get_field") { return index == 1; }
+  return false;
+}
+
 Expression BindExpression(const Expression& expression,
                           const std::vector<Value>& parameters, size_t* index);
 
@@ -181,10 +194,15 @@ Expression BindExpression(const Expression& expression,  // NOLINT(misc-no-recur
     }
     case TypeTag::kFunctionCallExp: {
       const auto& call = expression->AsFunctionCallExpression();
+      const std::string& func = call.FuncName();
       std::vector<Expression> args;
       args.reserve(call.Args().size());
-      for (const Expression& arg : call.Args()) {
-        args.push_back(BindExpression(arg, parameters, index));
+      for (size_t i = 0; i < call.Args().size(); ++i) {
+        if (IsStructuralCallArg(func, i)) {
+          args.push_back(call.Args()[i]);
+        } else {
+          args.push_back(BindExpression(call.Args()[i], parameters, index));
+        }
       }
       return FunctionCallExp(call.FuncName(), std::move(args));
     }
@@ -299,13 +317,16 @@ bool ContainsBindableConstant(const Expression& expression) {  // NOLINT(misc-no
 }
       return std::ranges::any_of(in.list_, ContainsBindableConstant);
     }
-    case TypeTag::kFunctionCallExp:
-      for (const Expression& arg :
-           expression->AsFunctionCallExpression().Args()) {
-        if (ContainsBindableConstant(arg)) { return true;
+    case TypeTag::kFunctionCallExp: {
+      const auto& call = expression->AsFunctionCallExpression();
+      for (size_t i = 0; i < call.Args().size(); ++i) {
+        if (IsStructuralCallArg(call.FuncName(), i)) { continue;
+}
+        if (ContainsBindableConstant(call.Args()[i])) { return true;
 }
       }
       return false;
+    }
     case TypeTag::kArrayExp:
       for (const Expression& element :
            expression->AsArrayExpression().Elements()) {

@@ -159,8 +159,9 @@ class Value {
   friend std::ostream& operator<<(std::ostream& o, const Value& v);
 
 // Three-way comparison with SQL ORDER BY semantics among non-NULL values:
-// NaN orders above every non-NaN number, and cross-type or unordered
-// operands fall back to a deterministic total order instead of throwing.
+// NULL orders below everything, NaN orders directly above NULL and below
+// every other number, and cross-type or unordered operands fall back to a
+// deterministic total order instead of throwing.
 // Returns a negative value when a sorts before b, zero when equal under the
 // ordering, positive when a sorts after b.
 [[nodiscard]] friend int CompareForOrderBy(const Value& a, const Value& b);
@@ -194,6 +195,15 @@ class Value {
  private:
   uint8_t collation_{0};
 };
+
+}  // namespace tinylamb
+
+namespace tinylamb {
+
+// Shortest round-trip text for a DOUBLE ("17.5", "0.1", "inf", "nan").
+// Shared by struct/JSON encoders so nested values render like the
+// compliance goldens instead of fixed-precision "%f" output.
+[[nodiscard]] std::string FormatDoubleShortest(double value);
 
 }  // namespace tinylamb
 

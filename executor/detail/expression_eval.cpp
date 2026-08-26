@@ -141,12 +141,27 @@ int FindColumn(const Schema& schema, const ColumnName& name) {
     }
   }
   if (match < 0 && !name.schema.empty()) {
+    // Bare-name fallback for a qualified reference is only safe when this
+    // schema carries no aliases at all (degraded metadata such as raw catalog
+    // rows).  Once columns are aliased, a reference qualified by another
+    // alias (`t1.x` seen from inside `... AS t2`) belongs to an outer scope;
+    // capturing a same-named local column silently turns correlated
+    // predicates into wrong local filters.
+    bool any_qualified = false;
     for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-      if (IdentifierEquals(schema.GetColumn(i).Name().name, name.name)) {
-        if (match >= 0) {
-          return -1;
+      if (!schema.GetColumn(i).Name().schema.empty()) {
+        any_qualified = true;
+        break;
+      }
+    }
+    if (!any_qualified) {
+      for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+        if (IdentifierEquals(schema.GetColumn(i).Name().name, name.name)) {
+          if (match >= 0) {
+            return -1;
+          }
+          match = static_cast<int>(i);
         }
-        match = static_cast<int>(i);
       }
     }
   }
@@ -554,7 +569,7 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
       case ValueType::kInt64:
         return std::to_string(v.value.int_value);
       case ValueType::kDouble:
-        return std::to_string(v.value.double_value);
+        return FormatDoubleShortest(v.value.double_value);
       case ValueType::kVarChar:
         return "\"" + std::string(v.value.varchar_value) + "\"";
       case ValueType::kArray: {
@@ -573,7 +588,7 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
               inner += std::to_string(element.value.int_value);
               break;
             case ValueType::kDouble:
-              inner += std::to_string(element.value.double_value);
+              inner += FormatDoubleShortest(element.value.double_value);
               break;
             case ValueType::kVarChar:
               inner += "\"" + std::string(element.value.varchar_value) + "\"";
@@ -604,6 +619,247 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
   }
   json += "}";
   return Value(std::move(json));
+}
+
+// ---- Three-valued SQL equality over struct-encoded values ------------------
+// Structs live as flat JSON objects (`{"f1":1,"f2":...}`); GoogleSQL compares
+// them positionally with full three-valued logic (a NULL anywhere yields
+// UNKNOWN, never FALSE), and field names are not part of identity.  Plain
+// scalars keep ordinary equality.
+
+bool LooksLikeStructJson(const Value& value) {
+  return value.type == ValueType::kVarChar &&
+         value.value.varchar_value.size() >= 2 &&
+         value.value.varchar_value.front() == '{' &&
+         value.value.varchar_value.back() == '}';
+}
+
+// Splits a top-level JSON object into ordered raw field-value texts (names
+// discarded: structural equality is positional).
+bool JsonObjectFieldTexts(std::string_view json,
+                          std::vector<std::string_view>* values) {
+  if (json.size() < 2 || json.front() != '{' || json.back() != '}') {
+    return false;
+  }
+  size_t i = 1;
+  const size_t end = json.size() - 1;
+  while (i < end) {
+    // Field name.
+    while (i < end && std::isspace(static_cast<unsigned char>(json[i]))) {
+      ++i;
+    }
+    if (i < end && json[i] == '"') {
+      ++i;
+      while (i < end) {
+        if (json[i] == '\\') {
+          i += 2;
+          continue;
+        }
+        if (json[i] == '"') {
+          break;
+        }
+        ++i;
+      }
+      ++i;
+    } else {
+      return false;
+    }
+    while (i < end && std::isspace(static_cast<unsigned char>(json[i]))) {
+      ++i;
+    }
+    if (i >= end || json[i] != ':') {
+      return false;
+    }
+    ++i;
+    while (i < end && std::isspace(static_cast<unsigned char>(json[i]))) {
+      ++i;
+    }
+    // Raw value through the matching close.
+    const size_t value_begin = i;
+    // A string-encoded nested struct/array may appear either as strict JSON
+    // ("{\"a\":1}", escapes keep quotes balanced) or in the legacy raw form
+    // ("{"a":1}", inner quotes unescaped).  Detect the raw form by a quote
+    // immediately followed by an opening bracket and scan to the matching
+    // close bracket, ignoring quote state inside.
+    const bool raw_embedded =
+        i + 1 < end && json[i] == '"' &&
+        (json[i + 1] == '{' || json[i + 1] == '[');
+    int depth = 0;
+    bool in_string = false;
+    if (raw_embedded) {
+      ++i;  // opening quote
+      while (i < end) {
+        const char c = json[i];
+        if (c == '{' || c == '[') {
+          ++depth;
+        } else if (c == '}' || c == ']') {
+          --depth;
+          if (depth == 0) {
+            ++i;
+            break;
+          }
+        }
+        ++i;
+      }
+      if (i < end && json[i] == '"') {
+        ++i;  // closing quote
+      }
+      values->emplace_back(json.substr(value_begin, i - value_begin));
+      if (i < end && json[i] == ',') {
+        ++i;
+      }
+      continue;
+    }
+    while (i < end) {
+      const char c = json[i];
+      if (in_string) {
+        if (c == '\\') {
+          ++i;
+        } else if (c == '"') {
+          in_string = false;
+        }
+      } else if (c == '"') {
+        in_string = true;
+      } else if (c == '{' || c == '[') {
+        ++depth;
+      } else if (c == '}' || c == ']') {
+        --depth;
+      } else if (c == ',' && depth == 0) {
+        break;
+      }
+      ++i;
+    }
+    values->emplace_back(json.substr(value_begin, i - value_begin));
+    if (i < end && json[i] == ',') {
+      ++i;
+    }
+  }
+  return true;
+}
+
+// 1 = TRUE, 0 = FALSE, -1 = UNKNOWN.
+int ThreeValuedEqualsImpl(const Value& left, const Value& right);
+
+int CompareEncodedField(std::string_view raw_left, std::string_view raw_right) {
+  auto trim = [](std::string_view s) {
+    size_t b = 0;
+    size_t e = s.size();
+    while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) { ++b; }
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) { --e; }
+    return s.substr(b, e - b);
+  };
+  const std::string_view l = trim(raw_left);
+  const std::string_view r = trim(raw_right);
+  if (l == "null" || r == "null") {
+    return -1;
+  }
+  if (l.front() == '{' && l.back() == '}' && r.front() == '{' &&
+      r.back() == '}') {
+    std::vector<std::string_view> lv;
+    std::vector<std::string_view> rv;
+    if (!JsonObjectFieldTexts(l, &lv) || !JsonObjectFieldTexts(r, &rv)) {
+      return l == r ? 1 : 0;
+    }
+    if (lv.size() != rv.size()) {
+      return 0;
+    }
+    bool saw_unknown = false;
+    for (size_t i = 0; i < lv.size(); ++i) {
+      const int field = CompareEncodedField(lv[i], rv[i]);
+      if (field == 0) {
+        return 0;
+      }
+      if (field < 0) {
+        saw_unknown = true;
+      }
+    }
+    return saw_unknown ? -1 : 1;
+  }
+  if (l.front() == '"' && l.back() == '"' && r.front() == '"' &&
+      r.back() == '"') {
+    // String values: compare contents.  Contents may themselves be encoded
+    // structs (nested fields), so recurse after stripping the quotes.
+    const std::string_view inner_l = l.substr(1, l.size() - 2);
+    const std::string_view inner_r = r.substr(1, r.size() - 2);
+    if (!inner_l.empty() && !inner_r.empty() &&
+        inner_l.front() == '{' && inner_l.back() == '}' &&
+        inner_r.front() == '{' && inner_r.back() == '}') {
+      return CompareEncodedField(inner_l, inner_r);
+    }
+    return inner_l == inner_r ? 1 : 0;
+  }
+  if (l == r) {
+    return 1;
+  }
+  // Numeric comparison so "1" vs "1.0" agrees with scalar semantics.
+  try {
+    const double ld = std::stod(std::string(l));
+    const double rd = std::stod(std::string(r));
+    return ld == rd ? 1 : 0;
+  } catch (const std::exception&) {
+    return 0;
+  }
+}
+
+int ThreeValuedEqualsImpl(const Value& left, const Value& right) {
+  if (left.IsNull() || right.IsNull()) {
+    return -1;
+  }
+  if (left.type == ValueType::kArray && right.type == ValueType::kArray) {
+    const auto& le = left.ArrayElements();
+    const auto& re = right.ArrayElements();
+    if (le.size() != re.size()) {
+      return 0;
+    }
+    bool saw_unknown = false;
+    for (size_t i = 0; i < le.size(); ++i) {
+      const int element = ThreeValuedEqualsImpl(le[i], re[i]);
+      if (element == 0) {
+        return 0;
+      }
+      if (element < 0) {
+        saw_unknown = true;
+      }
+    }
+    return saw_unknown ? -1 : 1;
+  }
+  if (LooksLikeStructJson(left) && LooksLikeStructJson(right)) {
+    std::vector<std::string_view> lv;
+    std::vector<std::string_view> rv;
+    if (!JsonObjectFieldTexts(left.value.varchar_value, &lv) ||
+        !JsonObjectFieldTexts(right.value.varchar_value, &rv)) {
+      return left.value.varchar_value == right.value.varchar_value ? 1 : 0;
+    }
+    if (lv.size() != rv.size()) {
+      return 0;
+    }
+    bool saw_unknown = false;
+    for (size_t i = 0; i < lv.size(); ++i) {
+      const int field = CompareEncodedField(lv[i], rv[i]);
+      if (field == 0) {
+        return 0;
+      }
+      if (field < 0) {
+        saw_unknown = true;
+      }
+    }
+    return saw_unknown ? -1 : 1;
+  }
+  if (left.type != right.type) {
+    return 0;
+  }
+  try {
+    return Truthy(Binary(BinaryOperation::kEquals, left, right)) ? 1 : 0;
+  } catch (const std::exception&) {
+    return -1;
+  }
+}
+
+// Three-valued equality entry point shared by IN membership and quantified
+// comparisons.  Struct-shaped operands take the positional JSON path; plain
+// strings keep ordinary (never JSON-parsed) equality.
+int ThreeValuedEquals(const Value& left, const Value& right) {
+  return ThreeValuedEqualsImpl(left, right);
 }
 
 }  // namespace
@@ -1646,6 +1902,27 @@ std::string TopEntryString(const Value& value, const std::string& metric_text) {
   return out;
 }
 
+// Timestamps have no dedicated runtime tag: they are strings rendered as
+// "...+00".  Recognize that canonical shape so ARRAY_AGG over TIMESTAMP
+// expressions reports the reference's element type instead of STRING.
+bool LooksLikeZonedTimestampText(std::string_view text) {
+  if (text.size() < 20 || text[4] != '-' || text[7] != '-' ||
+      text[10] != ' ' || text[13] != ':' || text[16] != ':') {
+    return false;
+  }
+  for (const int idx : {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15}) {
+    if (std::isdigit(static_cast<unsigned char>(text[idx])) == 0) {
+      return false;
+    }
+  }
+  const size_t zone = text.find('+', 17);
+  if (zone == std::string_view::npos || zone + 3 > text.size()) {
+    return false;
+  }
+  return std::all_of(text.begin() + zone + 1, text.end(),
+                     [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; });
+}
+
 // Element SQL type for APPROX_QUANTILES output arrays. Boolean inputs arrive
 // as the strings "true"/"false" (UNNEST of ARRAY<BOOL> materializes them that
 // way) and are reported with GoogleSQL BOOL naming.
@@ -1911,6 +2188,11 @@ Value AggregateAccumulator::Finish() const {
         for (const Value& value : array_values_) {
           if (!value.IsNull()) {
             element_type = ElementSqlTypeName(value.type);
+            if (element_type == "STRING" &&
+                value.type == ValueType::kVarChar &&
+                LooksLikeZonedTimestampText(value.value.varchar_value)) {
+              element_type = "TIMESTAMP";
+            }
             break;
           }
         }
@@ -3455,6 +3737,39 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     std::string tz_str =
         (arguments.size() == 2) ? raw_str(arguments[1]) : GetDefaultTimeZone();
     int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct, -8 * 3600);
+    // An explicit zone inside the timestamp text (" UTC", "Z", "+HH:MM")
+    // fixes the instant; the session default must not shift it again.
+    if (arguments[0].type == ValueType::kVarChar) {
+      const std::string_view text = arguments[0].value.varchar_value;
+      if (text.size() > 10) {
+        bool has_explicit_zone = false;
+        int explicit_sec = 0;
+        for (size_t i = 10; i < text.size(); ++i) {
+          if ((text[i] == '+' || text[i] == '-') &&
+              std::isdigit(static_cast<unsigned char>(
+                  i + 1 < text.size() ? text[i + 1] : '0')) != 0) {
+            has_explicit_zone = true;
+            explicit_sec = ParseTimeZoneOffset(std::string(text.substr(i)),
+                                               &ct, 0);
+            break;
+          }
+        }
+        if (!has_explicit_zone) {
+          for (const std::string_view marker :
+               {" UTC", " utc", " GMT", " gmt", "Z", "z"}) {
+            if (text.size() > marker.size() &&
+                text.substr(text.size() - marker.size()) == marker) {
+              has_explicit_zone = true;
+              explicit_sec = 0;
+              break;
+            }
+          }
+        }
+        if (has_explicit_zone) {
+          tz_offset_sec = explicit_sec;
+        }
+      }
+    }
     int64_t ns = CivilTimeToNanos(ct) - tz_offset_sec * 1000000000LL;
     CivilTime utc_ct = NanosToCivilTime(ns);
     return Value(FormatCivilTime(utc_ct) + "+00");
@@ -3612,6 +3927,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
     }
     if (!found) {
+      {
+        std::ostringstream dbg;
+        call.Dump(dbg);
+        fprintf(stderr, "DBG quantified op=%s nargs=%zu expr=%s\n", op.c_str(), arguments.size(), dbg.str().c_str());
+      }
       throw std::runtime_error("quantified comparison: unsupported operator " +
                                op);
     }
@@ -3658,6 +3978,28 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
     }
     for (const Value& element : arr.ArrayElements()) {
+      if (operation == BinaryOperation::kEquals ||
+          operation == BinaryOperation::kNotEquals) {
+        // Struct-encoded operands need positional three-valued equality;
+        // raw string comparison would turn NULL fields into FALSE.
+        const int tri = ThreeValuedEquals(test_value, element);
+        const bool is_null = tri < 0;
+        const bool equal =
+            operation == BinaryOperation::kEquals ? tri == 1 : tri == 0;
+        if (is_null) {
+          saw_null = true;
+          continue;
+        }
+        if (equal) {
+          saw_true = true;
+          if (is_any) {
+            return Value(int64_t{1});
+          }
+        } else if (!is_any) {
+          return Value(int64_t{0});
+        }
+        continue;
+      }
       Value result;
       try {
         result = Binary(operation, test_value, element);
@@ -6544,6 +6886,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     const double base = arguments[1].type == ValueType::kInt64
                             ? arguments[1].value.int_value
                             : arguments[1].value.double_value;
+    // Reference quirk: the logarithm of 1 to an infinite base is undefined
+    // (NaN), not zero; plain IEEE division would report +/-0 there.
+    if (v == 1.0 && std::isinf(base)) {
+      return Value(std::numeric_limits<double>::quiet_NaN());
+    }
     return Value(std::log(v) / std::log(base));
   }
   if (name == "exp") {
@@ -8098,6 +8445,14 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
 
     case TypeTag::kQueryExp: {
       const auto& value = expression->AsQueryExpression();
+      // The runtime caches below key on the subquery statement's address;
+      // retaining the owning shared_ptr keeps that address unique for as
+      // long as the entry can be probed (statements otherwise die with
+      // their prepared executor and the allocator would recycle them).
+      if (context.execution_runtime() != nullptr) {
+        context.execution_runtime()->retained_statements.push_back(
+            value.Query());
+      }
       // Subqueries carrying their own WITH clauses must run through
       // ExecuteQuery, which materializes the local CTEs first.
       const bool has_own_ctes = !value.Query()->WithQueries().empty();
@@ -8147,11 +8502,34 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
         };
         bool found = false;
         bool saw_null = test.IsNull();
-        if (uncorrelated && context.execution_runtime() != nullptr) {
+        const bool structural_members =
+            LooksLikeStructJson(test) || test.type == ValueType::kArray;
+        if (relation->TotalRows() == 0) {
+          // An empty candidate set is decisive: `x IN ()` is FALSE and
+          // `x NOT IN ()` is TRUE even when x itself is NULL (no comparison
+          // exists that could turn UNKNOWN).
+          saw_null = false;
+          found = false;
+        } else if (uncorrelated && context.execution_runtime() != nullptr &&
+                   !structural_members) {
           auto [cached, inserted] =
               context.execution_runtime()->uncorrelated_membership.try_emplace(
                   value.Query().get());
-          if (inserted) {
+          bool rebuilt = false;
+          if (!inserted &&
+              !CacheEntryIsCurrent(*value.Query(),
+                                   *context.execution_runtime())) {
+            // The address was recycled from a dead statement: drop the
+            // stale membership set and rebuild for this subquery.
+            context.execution_runtime()->uncorrelated_membership.erase(cached);
+            cached = context.execution_runtime()
+                         ->uncorrelated_membership.try_emplace(
+                             value.Query().get())
+                         .first;
+            rebuilt = true;
+          }
+          CacheEntryIsCurrent(*value.Query(), *context.execution_runtime());
+          if (inserted || rebuilt) {
             cached->second.reserve(relation->TotalRows());
             row_source.ForEachRow([&](const Row& row) {
               const Value projected = ProjectSubqueryRow(row, as_struct, &subquery_schema);
@@ -8191,8 +8569,10 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
                   "Collation conflict between the IN "
                   "operands");
             }
-            saw_null = saw_null || projected.IsNull();
-            if (Truthy(Binary(BinaryOperation::kEquals, test, projected))) {
+            const int tri = ThreeValuedEquals(test, projected);
+            if (tri < 0) {
+              saw_null = true;
+            } else if (tri == 1) {
               found = true;
             }
           });

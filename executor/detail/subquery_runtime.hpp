@@ -60,6 +60,15 @@ struct ExecutionRuntime {
   std::unordered_map<const SelectStatement*, std::unordered_set<Value>>
       uncorrelated_membership;
   std::unordered_set<const SelectStatement*> noncacheable_queries;
+  // Keep-alives for every subquery statement whose address keys the caches
+  // above.  Prepared executors are freed between statements, and a later
+  // allocation could otherwise reuse a dead statement's address, silently
+  // binding stale cache entries to an unrelated subquery.
+  std::vector<std::shared_ptr<const SelectStatement>> retained_statements;
+  // Fingerprint recorded when a cache entry was created; a mismatch on probe
+  // means the address was recycled by an unrelated statement and the entry
+  // must be discarded.
+  std::unordered_map<const SelectStatement*, std::string> cache_fingerprints;
   size_t correlated_index_builds{0};
   size_t correlated_index_probes{0};
   size_t correlated_result_cache_hits{0};
@@ -146,6 +155,12 @@ bool ExpressionsAreLocal(TransactionContext& context,
                          const SelectStatement& statement,
                          const std::vector<Relation>& sources,
                          const CteMap& ctes);
+
+// Guards runtime caches against recycled statement addresses (see
+// ExecutionRuntime::cache_fingerprints).
+bool CacheEntryIsCurrent(const SelectStatement& statement,
+                         ExecutionRuntime& runtime);
+void DropCacheEntry(ExecutionRuntime& runtime, const SelectStatement* key);
 
 }  // namespace tinylamb::relational_detail
 

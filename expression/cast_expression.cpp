@@ -191,6 +191,35 @@ CivilTime ShiftCivilTimeHours(CivilTime ct, int add_hours) {
   return ct;
 }
 
+// Zone shifts must stay in whole seconds: routing through nanosecond
+// arithmetic overflows int64 for dates older than ~1678 / newer than ~2262.
+CivilTime ShiftCivilTimeSeconds(CivilTime ct, int64_t add_seconds) {
+  const auto floor_div = [](int64_t a, int64_t b) -> int64_t {
+    const int64_t q = a / b;
+    return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+  };
+  int64_t day_secs =
+      ct.hour * 3600LL + ct.minute * 60LL + ct.second + add_seconds;
+  int64_t extra_days = floor_div(day_secs, 86400);
+  int64_t rem = day_secs - extra_days * 86400;
+  ct.second = static_cast<int>(rem % 60);
+  ct.minute = static_cast<int>((rem / 60) % 60);
+  ct.hour = static_cast<int>(rem / 3600);
+  if (extra_days != 0) {
+    std::chrono::year_month_day ymd{std::chrono::year{ct.year},
+                                    std::chrono::month{static_cast<unsigned>(ct.month)},
+                                    std::chrono::day{static_cast<unsigned>(ct.day)}};
+    int64_t days =
+        std::chrono::sys_days{ymd}.time_since_epoch().count() + extra_days;
+    std::chrono::sys_days new_sd{std::chrono::days{days}};
+    std::chrono::year_month_day new_ymd{new_sd};
+    ct.year = int(new_ymd.year());
+    ct.month = unsigned(new_ymd.month());
+    ct.day = unsigned(new_ymd.day());
+  }
+  return ct;
+}
+
 int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr, int default_offset = 0) {
   if (tz_str.empty()) { return default_offset; }
   if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" || tz_str == "gmt" ||
@@ -510,7 +539,7 @@ Value CastValue(const Value& val, const std::string& type_name,
                         : (val.type == ValueType::kDouble) ? ([&]() {
                             if (std::isnan(val.value.double_value)) { return std::string("nan"); }
                             if (std::isinf(val.value.double_value)) { return std::string(val.value.double_value > 0 ? "inf" : "-inf"); }
-                            std::ostringstream ss; ss << std::setprecision(17) << val.value.double_value; return ss.str();
+                            return FormatDoubleShortest(val.value.double_value);
                           })()
                         : std::string(val.value.varchar_value);
         if (upper == "DATETIME") {
@@ -541,31 +570,61 @@ Value CastValue(const Value& val, const std::string& type_name,
         }
         if (upper == "TIMESTAMP") {
           std::string raw = s;
+          // Explicit zone detection: a ±HH[:MM] offset after the date part,
+          // a Z/z suffix, or a trailing UTC/GMT zone word.  An explicit zone
+          // fixes the instant regardless of the session default.
+          std::string base = raw;
+          bool has_explicit_zone = false;
+          int64_t explicit_offset_sec = 0;
+          size_t tz_pos = std::string::npos;
+          if (raw.size() > 10) {
+            for (size_t i = 10; i < raw.size(); ++i) {
+              if (raw[i] == '+' || raw[i] == '-') {
+                tz_pos = i;
+                break;
+              }
+            }
+          }
+          if (tz_pos != std::string::npos) {
+            has_explicit_zone = true;
+            base = raw.substr(0, tz_pos);
+            explicit_offset_sec = ParseTimeZoneOffset(raw.substr(tz_pos));
+          } else {
+            for (const std::string_view word : {"UTC", "utc", "GMT", "gmt"}) {
+              const size_t word_len = word.size();
+              if (base.size() > word_len + 1 &&
+                  base.compare(base.size() - word_len, word_len, word) == 0 &&
+                  base[base.size() - word_len - 1] == ' ') {
+                base.resize(base.size() - word_len - 1);
+                has_explicit_zone = true;
+                explicit_offset_sec = 0;
+                break;
+              }
+            }
+            if (!has_explicit_zone && !base.empty() &&
+                (base.back() == 'Z' || base.back() == 'z')) {
+              base.pop_back();
+              while (!base.empty() && base.back() == ' ') { base.pop_back(); }
+              has_explicit_zone = true;
+              explicit_offset_sec = 0;
+            }
+          }
           CivilTime ct;
-          if (ParseCivilTime(raw, &ct)) {
-            size_t tz_pos = raw.find_first_of("+-", 11);
-            if (tz_pos != std::string::npos || raw.find('Z') != std::string::npos || raw.find('z') != std::string::npos) {
-              return Value(std::move(raw));
+          if (ParseCivilTime(base, &ct)) {
+            if (has_explicit_zone) {
+              // wall clock in the stated zone -> UTC instant.
+              return Value(FormatCivilTime(ShiftCivilTimeSeconds(
+                          ct, -explicit_offset_sec)) +
+                      "+00");
             }
             if (ct.year == 1 && ct.month == 1 && ct.day == 1 && ct.hour == 0 && ct.minute == 0 && ct.second == 0) {
               return Value(std::string("0001-01-01 07:52:58+00"));
             }
-            int offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
-            ct = ShiftCivilTimeHours(ct, -offset_sec / 3600);
-            int rem_mins = (offset_sec % 3600) / 60;
-            if (rem_mins != 0) {
-              int total_m = ct.minute - rem_mins;
-              if (total_m >= 60) {
-                ct.minute = total_m - 60;
-                ct = ShiftCivilTimeHours(ct, 1);
-              } else if (total_m < 0) {
-                ct.minute = total_m + 60;
-                ct = ShiftCivilTimeHours(ct, -1);
-              } else {
-                ct.minute = total_m;
-              }
-            }
-            return Value(FormatCivilTime(ct) + "+00");
+            const int offset_sec =
+                ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
+            return Value(FormatCivilTime(ShiftCivilTimeSeconds(
+                        ct, -static_cast<int64_t>(offset_sec))) +
+                    "+00");
           }
           return Value(std::move(s));
         }
@@ -631,6 +690,26 @@ Value CastValue(const Value& val, const std::string& type_name,
         if (upper == "DATE") {
           CivilTime ct;
           if (ParseCivilTime(s, &ct)) {
+            // A zoned timestamp source (…+00 / Z / UTC marker) is an
+            // instant: take its calendar date in the session default zone.
+            bool zoned = false;
+            if (s.size() > 11) {
+              for (size_t i = 11; i < s.size(); ++i) {
+                if (s[i] == '+' || s[i] == '-') { zoned = true; break; }
+                if (s[i] == ' ') { break; }
+              }
+            }
+            const std::string_view tail(s);
+            if (!zoned && s.size() >= 3 &&
+                ((tail.substr(tail.size() - 3) == " UTC") ||
+                 tail.substr(tail.size() - 3) == " utc")) {
+              zoned = true;
+            }
+            if (zoned) {
+              const int offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone(),
+                                                         &ct, -8 * 3600);
+              ct = ShiftCivilTimeSeconds(ct, offset_sec);
+            }
             char buf[32];
             snprintf(buf, sizeof(buf), "%04d-%02u-%02u", ct.year, ct.month, ct.day);
             return Value::Date(std::string(buf));
@@ -647,6 +726,26 @@ Value CastValue(const Value& val, const std::string& type_name,
           std::string s(val.value.varchar_value);
           CivilTime ct;
           if (ParseCivilTime(s, &ct)) {
+            // A zoned timestamp source (…+00 / Z / UTC marker) is an
+            // instant: take its calendar date in the session default zone.
+            bool zoned = false;
+            if (s.size() > 11) {
+              for (size_t i = 11; i < s.size(); ++i) {
+                if (s[i] == '+' || s[i] == '-') { zoned = true; break; }
+                if (s[i] == ' ') { break; }
+              }
+            }
+            const std::string_view tail(s);
+            if (!zoned && s.size() >= 5 &&
+                (tail.substr(tail.size() - 4) == " UTC" ||
+                 tail.substr(tail.size() - 4) == " utc")) {
+              zoned = true;
+            }
+            if (zoned) {
+              const int offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone(),
+                                                         &ct, -8 * 3600);
+              ct = ShiftCivilTimeSeconds(ct, offset_sec);
+            }
             char buf[32];
             snprintf(buf, sizeof(buf), "%04d-%02u-%02u", ct.year, ct.month, ct.day);
             return Value::Date(std::string(buf));

@@ -596,9 +596,11 @@ Relation LimitedRows(const SelectStatement& statement, Relation&& input) {
   const size_t total = input.TotalRows();
   const size_t begin = std::min(statement.Offset(), total);
   const size_t available = total - begin;
-  const size_t count = statement.Limit() == 0
-                           ? available
-                           : std::min(statement.Limit(), available);
+  // An explicit LIMIT 0 is a real bound (zero rows); only an absent LIMIT
+  // leaves the window unbounded.
+  const bool unlimited = statement.Limit() == 0 && !statement.HasLimit();
+  const size_t count =
+      unlimited ? available : std::min(statement.Limit(), available);
   size_t index = 0;
   input.ForEachRow([&](const Row& row) {
     const size_t current = index++;
