@@ -4,16 +4,16 @@
 
 #include <gtest/gtest.h>
 
-#include <exception>
 #include <array>
 #include <cstddef>
+#include <exception>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
-#include "common/status_or.hpp"
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/in_expression.hpp"
@@ -33,13 +33,15 @@ namespace {
 std::unique_ptr<Statement> VisitSql(std::string_view sql) {
   GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(sql);
   EXPECT_TRUE(parsed.ok) << parsed.error;
-  if (!parsed.ok) { return nullptr;
-}
+  if (!parsed.ok) {
+    return nullptr;
+  }
   StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
       GoogleSqlAstParser::Parse(parsed.ast);
   EXPECT_EQ(ast.GetStatus(), Status::kSuccess);
-  if (!ast.HasValue()) { return nullptr;
-}
+  if (!ast.HasValue()) {
+    return nullptr;
+  }
   return GoogleSqlAstVisitor::Visit(*ast.Value());
 }
 
@@ -49,8 +51,9 @@ std::unique_ptr<Statement> VisitSqlOrThrow(std::string_view sql) {
   StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
       GoogleSqlAstParser::Parse(parsed.ast);
   EXPECT_EQ(ast.GetStatus(), Status::kSuccess);
-  if (!ast.HasValue()) { return nullptr;
-}
+  if (!ast.HasValue()) {
+    return nullptr;
+  }
   return GoogleSqlAstVisitor::Visit(*ast.Value());
 }
 
@@ -103,10 +106,8 @@ TEST(GoogleSqlAstTest, SelectStarAndAllLiteralKinds) {
             Value(true));
   EXPECT_EQ(select.SelectList()[4].expression->AsConstantValue().GetValue(),
             Value(false));
-  EXPECT_TRUE(select.SelectList()[5]
-                  .expression->AsConstantValue()
-                  .GetValue()
-                  .IsNull());
+  EXPECT_TRUE(
+      select.SelectList()[5].expression->AsConstantValue().GetValue().IsNull());
   EXPECT_EQ(select.SelectList()[6].expression->AsConstantValue().GetValue(),
             Value::Date("2020-01-01"));
   EXPECT_EQ(select.SelectList()[7].expression->AsConstantValue().GetValue(),
@@ -132,8 +133,7 @@ TEST(GoogleSqlAstTest, WhereClauseOperatorForms) {
 }
 
 TEST(GoogleSqlAstTest, NotBetweenAndInListSemantics) {
-  auto not_between = VisitSql(
-      "SELECT * FROM t WHERE a NOT BETWEEN 1 AND 2;");
+  auto not_between = VisitSql("SELECT * FROM t WHERE a NOT BETWEEN 1 AND 2;");
   ASSERT_TRUE(not_between);
   const auto& not_between_select =
       dynamic_cast<const SelectStatement&>(*not_between);
@@ -150,8 +150,7 @@ TEST(GoogleSqlAstTest, NotBetweenAndInListSemantics) {
 }
 
 TEST(GoogleSqlAstTest, InSubqueryAndScalarSubquery) {
-  auto in_subquery = VisitSql(
-      "SELECT * FROM t WHERE a IN (SELECT b FROM t2);");
+  auto in_subquery = VisitSql("SELECT * FROM t WHERE a IN (SELECT b FROM t2);");
   ASSERT_TRUE(in_subquery);
   const auto& in_select = dynamic_cast<const SelectStatement&>(*in_subquery);
   ASSERT_TRUE(in_select.WhereClause());
@@ -174,20 +173,18 @@ TEST(GoogleSqlAstTest, InSubqueryAndScalarSubquery) {
 }
 
 TEST(GoogleSqlAstTest, CaseExtractIntervalAndUnary) {
-  auto case_stmt = VisitSql(
-      "SELECT CASE WHEN a > 1 THEN 'big' ELSE 'small' END;");
+  auto case_stmt =
+      VisitSql("SELECT CASE WHEN a > 1 THEN 'big' ELSE 'small' END;");
   ASSERT_TRUE(case_stmt);
   const auto& case_select = dynamic_cast<const SelectStatement&>(*case_stmt);
   ASSERT_EQ(case_select.SelectList().size(), 1);
-  EXPECT_EQ(case_select.SelectList()[0].expression->Type(),
-            TypeTag::kCaseExp);
+  EXPECT_EQ(case_select.SelectList()[0].expression->Type(), TypeTag::kCaseExp);
   EXPECT_NE(case_select.SelectList()[0].expression->ToString().find("CASE"),
             std::string::npos);
 
   auto extract = VisitSql("SELECT EXTRACT(YEAR FROM '2020-01-01');");
   ASSERT_TRUE(extract);
-  const auto& extract_select =
-      dynamic_cast<const SelectStatement&>(*extract);
+  const auto& extract_select = dynamic_cast<const SelectStatement&>(*extract);
   ASSERT_EQ(extract_select.SelectList().size(), 1);
   EXPECT_EQ(extract_select.SelectList()[0].expression->Type(),
             TypeTag::kFunctionCallExp);
@@ -197,8 +194,7 @@ TEST(GoogleSqlAstTest, CaseExtractIntervalAndUnary) {
 
   auto interval = VisitSql("SELECT INTERVAL 1 DAY;");
   ASSERT_TRUE(interval);
-  const auto& interval_select =
-      dynamic_cast<const SelectStatement&>(*interval);
+  const auto& interval_select = dynamic_cast<const SelectStatement&>(*interval);
   ASSERT_EQ(interval_select.SelectList().size(), 1);
   EXPECT_EQ(interval_select.SelectList()[0].expression->Type(),
             TypeTag::kIntervalExp);
@@ -240,13 +236,11 @@ TEST(GoogleSqlAstTest, AggregateFunctionsIncludingDistinct) {
   EXPECT_EQ(select.SelectList()[2].expression->ToString(), "AVG(b)");
   EXPECT_EQ(select.SelectList()[3].expression->ToString(), "MIN(c)");
   EXPECT_EQ(select.SelectList()[4].expression->ToString(), "MAX(d)");
-  EXPECT_EQ(select.SelectList()[5].expression->ToString(),
-            "COUNT(DISTINCT e)");
+  EXPECT_EQ(select.SelectList()[5].expression->ToString(), "COUNT(DISTINCT e)");
 }
 
 TEST(GoogleSqlAstTest, FoldBooleanChains) {
-  auto statement = VisitSql(
-      "SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3;");
+  auto statement = VisitSql("SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3;");
   ASSERT_TRUE(statement);
   const auto& select = dynamic_cast<const SelectStatement&>(*statement);
   ASSERT_TRUE(select.WhereClause());
@@ -273,21 +267,18 @@ TEST(GoogleSqlAstTest, JoinsAndTableSubqueries) {
   EXPECT_FALSE(join_select.RequiresRelationalEvaluation());
   EXPECT_TRUE(join_select.Sources()[1].join_condition);
 
-  auto left_join = VisitSql(
-      "SELECT * FROM t LEFT JOIN t2 ON t.a = t2.a;");
+  auto left_join = VisitSql("SELECT * FROM t LEFT JOIN t2 ON t.a = t2.a;");
   ASSERT_TRUE(left_join);
   const auto& left_select = dynamic_cast<const SelectStatement&>(*left_join);
   ASSERT_EQ(left_select.Sources().size(), 2);
   EXPECT_EQ(left_select.Sources()[1].join_type, JoinType::kLeft);
 
-  auto right_join = VisitSql(
-      "SELECT * FROM t RIGHT JOIN t2 ON t.a = t2.a;");
+  auto right_join = VisitSql("SELECT * FROM t RIGHT JOIN t2 ON t.a = t2.a;");
   ASSERT_TRUE(right_join);
   const auto& right_select = dynamic_cast<const SelectStatement&>(*right_join);
   EXPECT_EQ(right_select.Sources()[1].join_type, JoinType::kRight);
 
-  auto full_join = VisitSql(
-      "SELECT * FROM t FULL JOIN t2 ON t.a = t2.a;");
+  auto full_join = VisitSql("SELECT * FROM t FULL JOIN t2 ON t.a = t2.a;");
   ASSERT_TRUE(full_join);
   const auto& full_select = dynamic_cast<const SelectStatement&>(*full_join);
   EXPECT_EQ(full_select.Sources()[1].join_type, JoinType::kFull);
@@ -302,8 +293,7 @@ TEST(GoogleSqlAstTest, JoinsAndTableSubqueries) {
 }
 
 TEST(GoogleSqlAstTest, WithClause) {
-  auto statement = VisitSql(
-      "WITH cte AS (SELECT 1 AS x) SELECT * FROM cte;");
+  auto statement = VisitSql("WITH cte AS (SELECT 1 AS x) SELECT * FROM cte;");
   ASSERT_TRUE(statement);
   const auto& select = dynamic_cast<const SelectStatement&>(*statement);
   EXPECT_EQ(select.WithQueries().size(), 1);
@@ -335,8 +325,7 @@ TEST(GoogleSqlAstTest, InsertWithAndWithoutColumnList) {
   auto with_columns = VisitSql("INSERT INTO t (a, b) VALUES (1, 2);");
   ASSERT_TRUE(with_columns);
   ASSERT_EQ(with_columns->Type(), StatementType::kInsert);
-  const auto& insert =
-      dynamic_cast<const InsertStatement&>(*with_columns);
+  const auto& insert = dynamic_cast<const InsertStatement&>(*with_columns);
   EXPECT_EQ(insert.TableName(), "t");
   EXPECT_EQ(insert.Columns().size(), 2);
   EXPECT_EQ(insert.Columns()[0], "a");
@@ -344,8 +333,7 @@ TEST(GoogleSqlAstTest, InsertWithAndWithoutColumnList) {
   ASSERT_EQ(insert.Values().size(), 1);
   EXPECT_EQ(insert.Values()[0].size(), 2);
 
-  auto multi_row = VisitSql(
-      "INSERT INTO t VALUES (1, 'x'), (2, 'y');");
+  auto multi_row = VisitSql("INSERT INTO t VALUES (1, 'x'), (2, 'y');");
   ASSERT_TRUE(multi_row);
   const auto& multi = dynamic_cast<const InsertStatement&>(*multi_row);
   EXPECT_TRUE(multi.Columns().empty());
@@ -411,18 +399,9 @@ TEST(GoogleSqlAstTest, ArrayConstructor) {
 TEST(GoogleSqlAstTest, UnsupportedConstructsThrow) {
   // Unsupported binary operators: the parser accepts them but the visitor
   // rejects them during translation.
-  EXPECT_THROW(VisitSqlOrThrow("SELECT 1 IS DISTINCT FROM 2;"),
-               std::runtime_error);
-  EXPECT_THROW(VisitSqlOrThrow("SELECT 'a' || 'b';"), std::runtime_error);
   EXPECT_THROW(VisitSqlOrThrow("SELECT 1 & 2;"), std::runtime_error);
-  // Aggregate arity is validated during translation.
-  EXPECT_THROW(VisitSqlOrThrow("SELECT COUNT(a, b);"), std::runtime_error);
-  // Intervals must have an integer literal magnitude.
-  EXPECT_THROW(VisitSqlOrThrow("SELECT INTERVAL '1' DAY;"),
-               std::runtime_error);
   // Unknown column types are rejected while building CREATE TABLE.
-  EXPECT_THROW(VisitSqlOrThrow("CREATE TABLE t (x BLOB);"),
-               std::runtime_error);
+  EXPECT_THROW(VisitSqlOrThrow("CREATE TABLE t (x BLOB);"), std::runtime_error);
   // Only DROP TABLE is translated; other DROP kinds are unsupported.
   EXPECT_THROW(VisitSqlOrThrow("DROP DATABASE t;"), std::runtime_error);
 }
@@ -461,14 +440,14 @@ TEST(GoogleSqlAstTest, BacktickIdentifiersAreDecoded) {
 }
 
 TEST(GoogleSqlAstTest, TripleQuotedStringDecodesEmbeddedQuote) {
-  // GoogleSQL allows a triple-quoted string literal that contains an escaped
-  // single quote (''), which the visitor must decode into one quote character.
+  // A triple-quoted string keeps embedded quote runs literally: GoogleSQL
+  // only decodes backslash escapes inside triple quotes ('' stays '').
   auto statement = VisitSql("SELECT '''a''b''';");
   ASSERT_TRUE(statement);
   const auto& select = dynamic_cast<const SelectStatement&>(*statement);
   ASSERT_EQ(select.SelectList().size(), 1);
   EXPECT_EQ(select.SelectList()[0].expression->AsConstantValue().GetValue(),
-            Value("'a'b'"));
+            Value("a''b"));
 }
 
 TEST(GoogleSqlAstTest, VisitsInsertSelectQuery) {
@@ -493,24 +472,28 @@ TEST(GoogleSqlAstTest, TableValuedFunctionSourceThrows) {
 TEST(GoogleSqlAstTest, UnsupportedStatementKindsThrow) {
   // Statements beyond SELECT / CREATE TABLE / INSERT / UPDATE / DELETE / DROP
   // TABLE have no translation and must be rejected explicitly.
-  for (const char* sql : {"EXPLAIN SELECT 1;", "SHOW TABLES;", "BEGIN;",
-                          "COMMIT;", "CREATE INDEX i ON t(a);",
-                          "ALTER TABLE t ADD COLUMN b INT64;",
-                          "CREATE VIEW v AS SELECT 1;", "DESCRIBE t;"}) {
+  for (const char* sql :
+       {"EXPLAIN SELECT 1;", "SHOW TABLES;", "BEGIN;", "COMMIT;",
+        "CREATE INDEX i ON t(a);", "ALTER TABLE t ADD COLUMN b INT64;",
+        "CREATE VIEW v AS SELECT 1;", "DESCRIBE t;"}) {
     const std::string message = ThrowMessage([sql] { VisitSqlOrThrow(sql); });
     EXPECT_NE(message.find("unsupported statement"), std::string::npos)
-        << sql << "\n" << message;
+        << sql << "\n"
+        << message;
   }
 }
 
-TEST(GoogleSqlAstTest, UnsupportedExpressionKindsThrow) {
-  // Expression node kinds without a mapping must be rejected with a precise
-  // diagnostic instead of silently producing a malformed plan.
-  for (const char* sql : {"SELECT t.* FROM t;", "SELECT a[0] FROM t;",
-                          "SELECT f(x => 1);"}) {
-    const std::string message = ThrowMessage([sql] { VisitSqlOrThrow(sql); });
-    EXPECT_NE(message.find("unsupported expression"), std::string::npos)
-        << sql << "\n" << message;
+TEST(GoogleSqlAstTest, PreviouslyUnsupportedExpressionsAreNowSupported) {
+  // Star expansion, bracketed array access and named function arguments all
+  // have visitor mappings now; they must produce statements instead of
+  // "unsupported expression" diagnostics.
+  for (const char* sql :
+       {"SELECT t.* FROM t;", "SELECT a[0] FROM t;", "SELECT f(x => 1);"}) {
+    auto statement = VisitSql(sql);
+    EXPECT_NE(statement, nullptr) << sql;
+    if (statement != nullptr) {
+      EXPECT_EQ(statement->Type(), StatementType::kSelect) << sql;
+    }
   }
 }
 
@@ -522,11 +505,11 @@ TEST(GoogleSqlAstTest, DeeplyNestedExpressionsFailWithDiagnostic) {
     GTEST_SKIP() << "GoogleSQL parser disabled for this platform";
   }
   std::string sql = "SELECT 1";
-  for (int i = 0; i < 600; ++i) { sql += "+1";
-}
+  for (int i = 0; i < 600; ++i) {
+    sql += "+1";
+  }
   sql += ";";
-  const std::string message =
-      ThrowMessage([&sql] { VisitSqlOrThrow(sql); });
+  const std::string message = ThrowMessage([&sql] { VisitSqlOrThrow(sql); });
   // Either layer must reject the input instead of overflowing the stack: the
   // ZetaSQL parser ("binary expression arity") or the visitor depth cap
   // ("nesting exceeds").

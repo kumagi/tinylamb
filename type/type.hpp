@@ -45,8 +45,8 @@ enum class TypeTag {
   kArrayExp,
   kCastExp,
   kWindowFunctionExp,
+  kLambdaExp,
 };
-
 
 class Type {
  public:

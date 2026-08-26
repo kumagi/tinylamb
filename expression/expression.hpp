@@ -24,7 +24,6 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-#include <vector>
 
 #include "common/status_or.hpp"
 #include "type/column_name.hpp"
@@ -46,6 +45,7 @@ class QueryExpression;
 class IntervalExpression;
 class ArrayExpression;
 class CastExpression;
+class LambdaExpression;
 class SelectStatement;
 class EvaluationContext;
 
@@ -71,6 +71,7 @@ class ExpressionBase {
   [[nodiscard]] const IntervalExpression& AsIntervalExpression() const;
   [[nodiscard]] const ArrayExpression& AsArrayExpression() const;
   [[nodiscard]] const CastExpression& AsCastExpression() const;
+  [[nodiscard]] const LambdaExpression& AsLambdaExpression() const;
 
   [[nodiscard]] virtual std::unordered_set<ColumnName> TouchedColumns() const;
   [[nodiscard]] virtual Value Evaluate(const Row& row,
@@ -124,20 +125,24 @@ Expression CaseExpressionExp(
     std::vector<std::pair<Expression, Expression>> when_clauses,
     Expression else_clause, bool from_if = false);
 Expression InExpressionExp(Expression child, std::vector<Expression> list);
-Expression FunctionCallExp(std::string func_name,
-                           std::vector<Expression> args,
+Expression FunctionCallExp(std::string func_name, std::vector<Expression> args,
                            bool canonical_if = false);
 Expression QueryExpressionExp(std::shared_ptr<SelectStatement> query,
                               Expression test = nullptr, bool exists = false,
                               bool negated = false);
+Expression QuantifiedQueryExpressionExp(std::shared_ptr<SelectStatement> query,
+                                        Expression test, std::string compare_op,
+                                        bool any_mode);
+Expression ArraySubqueryExpressionExp(std::shared_ptr<SelectStatement> query);
 Expression IntervalExpressionExp(int64_t amount, std::string unit,
-                                std::string raw_amount = "");
+                                 std::string raw_amount = "");
 Expression ArrayExpressionExp(std::vector<Expression> elements,
                               std::string element_sql_type);
 Expression CastExpressionExp(Expression child, std::string target_type_name,
                              bool return_null_on_error = false);
+Expression LambdaExpressionExp(std::vector<std::string> parameters,
+                               Expression body);
 
 }  // namespace tinylamb
-
 
 #endif  // TINYLAMB_EXPRESSION_HPP

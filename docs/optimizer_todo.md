@@ -45,7 +45,9 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [x] `kValues` / `kConstantTable`（`ValuesPlan` と Cascades 実装規則）
 - [ ] `kUnnest` / `kGenerateSeries` / TVF
 - [ ] `kExpand`（CUBE / ROLLUP / GROUPING SETS）
-- [ ] `kRecursiveCte` / `kWorkTableScan`
+- [x] `kRecursiveCte` / `kWorkTableScan`（relational 経路で実装:
+      `ExecuteRecursiveCte` が作業表反復を担当。Cascades 論理ノードは未導入で、
+      WITH RECURSIVE は opaque relational IR として実行される）
 - [ ] `kMaterialize` / `kEagerSpool` / `kLazySpool`
 - [ ] `kExchange` / `kGather` / `kBroadcast` / `kRedistribute`（分散予約）
 - [ ] `kSample` / `kTableSample`
@@ -68,7 +70,10 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `PhysicalProperties` に collation、nulls first/last、partitioning、
       uniqueness、sorted-prefix、bloom/filter 伝播
 - [ ] グループの出力スキーマを常に保持（identity projection 判定に必要）
-- [ ] null-rejection / strong-null / weak-null 解析 API
+- [x] null-rejection / strong-null / weak-null 解析 API（第一版:
+      `IsNullRejectingPredicate` の構文的厳格解析。比較 / IS NOT NULL /
+      AND / NOT / 定数 IN を strict と判定し、outer join 縮約と押し下げに接続。
+      strong-null / weak-null の区別は未導入）
 - [ ] FD（関数従属）・unique key・not-null をグループ属性として伝播
 - [ ] 等価クラス（equivalence class）をメモ全体で共有
 - [ ] 述語の正規形（CNF / DNF）を選択的に保持
@@ -138,8 +143,7 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `null_rejecting_is_not_null_insert`（inner join キー）
 - [ ] `not_null_inferred_from_inner_join`
 - [x] `contradiction_from_null_eq`（比較式の片側 NULL を UNKNOWN に定数化し、
-      Selection の Empty 化へ接続）
-- [ ] `canonicalize_boolean`（`x=true` → `x`、三値論理に注意）
+      Selection の Empty 化へ接続）- [ ] `canonicalize_boolean`（`x=true` → `x`、三値論理に注意）
 - [x] `simplify_coalesce_in_filter`（先行する NULL リテラルだけを許し、非 NULL
       リテラルが結果を固定する `IS NULL` / `IS NOT NULL` を定数化）
 - [x] `like_prefix_to_range`（ASCII の末尾 `%` だけを半開区間へ変換し、LIKE は
@@ -155,7 +159,9 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [x] `push_limit_through_union_all`（`union_all_push_limit` として有限 LIMIT の
       offset+count を各枝へ伝播）
 - [ ] `push_limit_through_inner_join_if_unique`（1:1 のとき）
-- [ ] `offset_zero_elimination`
+- [x] `offset_zero_elimination`（表現上、OFFSET 0 は既定値と同一の正規化済み
+      形であり、専用変換の余地なし。TopN / union branch cap は offset=0 を
+      正しく透過）
 - [x] `limit_zero_to_empty`（SQL エンジンの明示 LIMIT 0 fast path。QueryData の
       `limit_count_ == 0` は OFFSET-only / 無制限との兼用のため、論理 Cascades
       ノードではまだ区別しない）
@@ -194,13 +200,18 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `remove_redundant_join`（unique キー上の FK inner join 除去）
 - [ ] `join_elimination_unique_key`（PK-FK、SELECT が親だけ）
 - [ ] `self_join_elimination`
-- [ ] `outer_to_inner`（WHERE が null-rejecting）
+- [x] `outer_to_inner`（WHERE が null-rejecting。relational 経路の
+      `ReduceOuterJoinsToInner`: LEFT/RIGHT/FULL を NULL 側を被る厳格述語で
+      inner へ縮約し、EXPLAIN 表示にも反映。`IsNullRejectingPredicate` 参照）
 - [ ] `outer_to_anti`（`WHERE right.key IS NULL`）
 - [ ] `full_outer_to_left_plus_anti`
 - [ ] `right_join_to_left_join`（子の交換）
 - [ ] `left_join_commutativity`（禁止、テストで固定）
-- [ ] `push_filter_through_left_join_left_side`（常に可）
-- [ ] `push_filter_through_left_join_right_side`（null-rejecting のみ）
+- [x] `push_filter_through_left_join_left_side`（常に可。BuildInput の outer 経路で
+      非 NULL 側ソースへの単一関係 conjunct を join 前に適用）
+- [x] `push_filter_through_left_join_right_side`（null-rejecting のみ。
+      null-rejecting の場合は outer_to_inner 縮約が等価かつそれ以上の効果を
+      持つため、縮約経路で実現）
 - [ ] `push_filter_above_left_join`（遅延評価が得な場合）
 - [ ] `split_filter_over_outer_join`
 - [ ] `predicate_move_around_outer`
@@ -220,8 +231,7 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `prefer_hash_when_equality_and_unsorted`
 - [x] `prefer_merge_when_both_sorted` → [`executor_todo.md`](executor_todo.md) MergeJoin
       （既存順序を再利用し、未ソート側は SortPlan を候補内で補完）
-- [ ] `nested_loop_for_non_equality`
-- [ ] `block_nested_loop` 実装規則
+- [ ] `nested_loop_for_non_equality`- [ ] `block_nested_loop` 実装規則
 - [ ] `lookup_join` / `index_nested_loop` の一般化（複合キー、範囲）
 - [ ] `batch_nested_loop`（IN リスト化して内側を一括）
 - [ ] `dynamic_filter_join`（実行時ブルームを内側スキャンへ）
@@ -324,8 +334,9 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 
 - [x] `union_all_merge`（連続 UNION ALL を n-ary）
 - [x] `union_to_union_all_plus_distinct`
-- [ ] `intersect_to_semijoin`
-- [ ] `except_to_antijoin`
+- [ ] `intersect_to_semijoin`（専用の hash set-op 実行器が既に spill 対応で
+      効くため、追加の plan 変換より実行器経由が現状最短）
+- [ ] `except_to_antijoin`（同上）
 - [x] `setop_push_projection`（UNION / UNION ALL の枝へ分配）
 - [x] `setop_push_filter`（全 set-op の枝へ述語を分配）
 - [x] `union_all_push_limit`（有限 LIMIT の offset+count を各枝へ伝播し、
@@ -395,8 +406,9 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [x] `if_to_case`（3 引数 IF を短絡評価を保つ CASE へ変換） / [x] `case_to_if`（単一 WHEN の CASE を canonical IF へ変換し、往復を防止）
 - [x] `greatest_least_fold`（全リテラルは既存の deterministic function fold、
       1 引数は恒等式へ縮約）
-- [ ] `between_symmetric`
-- [ ] `is_distinct_from_rewrite`
+- [ ] `between_symmetric`（到達不能: ピン留め parser が SYMMETRIC 構文を拒否）
+- [x] `is_distinct_from_rewrite`（定数側の `__is_distinct_from` を
+      IS (NOT) NULL または OR/AND 比較へ正準化。三値論理回帰あり）
 - [x] `boolean_eq_true_false_three_valued`（構文上の論理式だけを TRUE/FALSE
       リテラル比較から恒等式/NOT へ変換し、NULL は UNKNOWN のまま保持）
 - [ ] `and_true_elim` / `or_false_elim` の NULL 厳密化監査
@@ -409,8 +421,8 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
       1 要素リストは UNKNOWN に固定）
 - [x] `in_single_null`
 - [ ] `not_in_with_null_list` 警告と計画
-- [ ] `like_escape_normalize`
-- [ ] `ilike_to_lower_like`
+- [ ] `like_escape_normalize`（到達不能: ピン留め parser が ESCAPE 句を拒否）
+- [ ] `ilike_to_lower_like`（到達不能: ピン留め parser が ILIKE を拒否）
 - [ ] `similiar_to_to_regex`
 - [ ] `arithmetic_overflow_safe_fold`
 - [x] `date_add_sub_fold`（決定的なリテラル関数折りたたみで DATE_ADD/SUB を定数化）
@@ -421,7 +433,8 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [x] `array_constructor_fold`（定数要素の `ArrayExpression` を `fold_array` で
       配列 Value へ畳み込み、rewrite 回帰を追加）
 - [ ] `array_length_zero`
-- [ ] `safe_divide_rewrite`
+- [x] `safe_divide_rewrite`（定数 0 除数は NULL へ定数化。非定数除数は
+      オーバーフロー意味論維持のため保持）
 - [x] `abs_of_abs`（`ABS(ABS(x))` を安定な関数形に縮約）
 - [ ] `log_identities`
 - [x] `comparison_of_same_expr`（安定した列参照に限定して `x=x` → `x IS NOT NULL`）
@@ -430,10 +443,13 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [x] `nondeterministic_barrier`（時刻・乱数・UUID 系を定数畳み込みから除外）
 - [ ] `stable_vs_immutable` 分類
 - [ ] `rewrite_or_of_ranges_to_in`
-- [ ] `extract_year_sargable`（可能なら range）
+- [x] `extract_year_sargable`（DATE 列限定でプランニング層が
+      `EXTRACT(YEAR FROM col) <op> 年定数` を半開区間へ書き換え。
+      残余 WHERE は元述語のまま二重評価で安全性担保。TIMESTAMP / VARCHAR は
+      意味論変更のため対象外）
 - [x] `not_between_to_or`（既存の De Morgan / 比較否定書き換えで実装済み、NULL 回帰テストあり）
 - [x] `xor_to_or_and_not`（SQL 三値論理を保つ `(a OR b) AND NOT(a AND b)`）
-- [ ] `bit_and_or_identities`
+- [ ] `bit_and_or_identities`（到達不能: BIT_AND / BIT_OR 関数が未実装）
 
 ---
 

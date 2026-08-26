@@ -40,7 +40,6 @@ enum class UnaryOperation : int {
   kMinus,
 };
 
-
 enum class AggregationType : int {
   kCount,
   kSum,
@@ -52,6 +51,19 @@ enum class AggregationType : int {
   kArrayAgg,
   kStringAgg,
   kCountIf,
+  kAnyValue,
+  kVarPop,
+  kVarSamp,
+  kStddevPop,
+  kStddevSamp,
+  kCovarPop,
+  kCovarSamp,
+  kCorr,
+  kBitAnd,
+  kBitOr,
+  kBitXor,
+  kElementwiseSum,
+  kElementwiseAvg,
 };
 
 std::string ToString(AggregationType type);
@@ -101,7 +113,8 @@ class Value {
   size_t Serialize(char* dst) const;
   size_t Deserialize(const char* src, ValueType as_type);
   // Advance past a serialized value without constructing it (projection skip).
-  [[nodiscard]] static size_t SkipSerialized(const char* src, ValueType as_type);
+  [[nodiscard]] static size_t SkipSerialized(const char* src,
+                                             ValueType as_type);
 
   [[nodiscard]] std::string EncodeMemcomparableFormat() const;
   size_t DecodeMemcomparableFormat(const char* src);

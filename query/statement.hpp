@@ -22,6 +22,7 @@
 #include <ostream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/set_operation.hpp"
@@ -32,8 +33,26 @@
 namespace tinylamb {
 
 class SelectStatement;
+class TransactionContext;
+
+// `WITH RECURSIVE ... WITH DEPTH [AS col] BETWEEN lo AND hi`: iteration
+// count is capped explicitly and each row carries its recursion depth.
+struct RecursiveDepthSpec {
+  std::string column{"depth"};
+  int64_t lower{0};
+  int64_t upper{0};
+};
 
 enum class JoinType { kCross, kInner, kLeft, kRight, kFull };
+
+// Column match mode of one set operation: plain (positional, same count),
+// CORRESPONDING [BY (col, ...)] or BY NAME.  BY NAME aligns on the union of
+// column names with NULL padding; CORRESPONDING uses the intersection.
+struct SetOperationMatch {
+  bool corresponding{false};
+  bool by_name{false};
+  std::vector<std::string> columns;
+};
 
 struct SelectSource {
   SelectSource() = default;
@@ -58,9 +77,6 @@ struct SelectSource {
   Expression unnest;
   std::string offset_alias;
 };
-
-
-
 
 enum class StatementType {
   kCreateTable,
@@ -125,6 +141,11 @@ class CreateTableStatement : public Statement {
   const std::vector<Column>& Columns() const { return columns_; }
   const std::shared_ptr<SelectStatement>& AsQuery() const { return as_query_; }
   bool IsAsSelect() const { return as_query_ != nullptr; }
+  // `CREATE TABLE t (cols) AS SELECT ...` carries both a schema and the
+  // initial data source; execution creates the table then loads the query.
+  void SetAsQuery(std::shared_ptr<SelectStatement> query) {
+    as_query_ = std::move(query);
+  }
 
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_;
@@ -192,6 +213,7 @@ class SelectStatement : public Statement {
   const std::vector<NamedExpression>& SelectList() const {
     return select_list_;
   }
+  std::vector<NamedExpression>& SelectList() { return select_list_; }
   const std::vector<std::string>& FromClause() const { return from_clause_; }
   const Expression& WhereClause() const { return where_clause_; }
   const std::vector<OrderByTerm>& OrderBy() const { return order_by_; }
@@ -232,8 +254,33 @@ class SelectStatement : public Statement {
     complex_ = true;
   }
   void AddWithQuery(std::string name, std::shared_ptr<SelectStatement> query) {
+    with_query_order_.push_back(name);
     with_queries_.emplace(std::move(name), std::move(query));
     complex_ = true;
+  }
+  // WITH RECURSIVE: the body references its own CTE name and is evaluated
+  // iteratively (anchor terms seed a work table; recursive terms read the
+  // previous iteration's delta until it drains).
+  void AddRecursiveWithQuery(std::string name,
+                             std::shared_ptr<SelectStatement> query) {
+    recursive_with_queries_.insert(name);
+    AddWithQuery(std::move(name), std::move(query));
+  }
+  void SetRecursiveDepth(const std::string& name, RecursiveDepthSpec spec) {
+    recursive_depth_specs_[name] = std::move(spec);
+  }
+  [[nodiscard]] bool IsRecursiveWith(const std::string& name) const {
+    return recursive_with_queries_.contains(name);
+  }
+  [[nodiscard]] const RecursiveDepthSpec* RecursiveDepthOf(
+      const std::string& name) const {
+    const auto found = recursive_depth_specs_.find(name);
+    return found == recursive_depth_specs_.end() ? nullptr : &found->second;
+  }
+  // Declaration order of WITH entries: a later CTE may reference earlier
+  // ones, so resolution must follow source order rather than map order.
+  [[nodiscard]] const std::vector<std::string>& WithQueryOrder() const {
+    return with_query_order_;
   }
   const Expression& Qualify() const { return qualify_; }
   void SetQualify(Expression qualify) {
@@ -245,6 +292,10 @@ class SelectStatement : public Statement {
   void SetSelectList(std::vector<NamedExpression> select_list) {
     select_list_ = std::move(select_list);
   }
+  void SetWhereClause(Expression where_clause) {
+    where_clause_ = std::move(where_clause);
+  }
+  void MarkDistinct() { distinct_ = true; }
   void SetOrderBy(std::vector<OrderByTerm> order_by) {
     order_by_ = std::move(order_by);
   }
@@ -254,10 +305,26 @@ class SelectStatement : public Statement {
   const std::vector<SetOperationKind>& SetOperationKinds() const {
     return set_operation_kinds_;
   }
+  // GROUPING SETS expansion (ROLLUP/CUBE lower to sets too).  Each entry is
+  // one grouping set; GroupBy() carries the flattened column universe.
+  const std::vector<std::vector<Expression>>& GroupingSets() const {
+    return grouping_sets_;
+  }
+  void SetGroupingSets(std::vector<std::vector<Expression>> sets) {
+    grouping_sets_ = std::move(sets);
+    complex_ = true;
+  }
+  // CORRESPONDING [BY (cols)] match mode per set operation (parallel to
+  // union_all_/set_operation_kinds_).
+  const std::vector<SetOperationMatch>& Matches() const {
+    return set_operation_matches_;
+  }
   void AddSetOperation(SetOperationKind kind,
-                       std::shared_ptr<SelectStatement> query) {
+                       std::shared_ptr<SelectStatement> query,
+                       SetOperationMatch match = {}) {
     set_operation_kinds_.push_back(kind);
     union_all_.push_back(std::move(query));
+    set_operation_matches_.push_back(std::move(match));
     complex_ = true;
   }
   void AddUnionAll(std::shared_ptr<SelectStatement> query) {
@@ -266,6 +333,7 @@ class SelectStatement : public Statement {
   void ClearUnionAll() {
     union_all_.clear();
     set_operation_kinds_.clear();
+    set_operation_matches_.clear();
   }
   void MarkComplex() { complex_ = true; }
   void Dump(std::ostream& o) const override {
@@ -303,12 +371,17 @@ class SelectStatement : public Statement {
   std::unordered_map<std::string, std::string> aliases_;
   std::vector<SelectSource> sources_;
   std::vector<Expression> group_by_;
+  std::vector<std::vector<Expression>> grouping_sets_;
   Expression having_;
   Expression qualify_;
   std::unordered_map<std::string, std::shared_ptr<SelectStatement>>
       with_queries_;
+  std::vector<std::string> with_query_order_;
+  std::unordered_set<std::string> recursive_with_queries_;
+  std::unordered_map<std::string, RecursiveDepthSpec> recursive_depth_specs_;
   std::vector<std::shared_ptr<SelectStatement>> union_all_;
   std::vector<SetOperationKind> set_operation_kinds_;
+  std::vector<SetOperationMatch> set_operation_matches_;
   bool complex_{false};
 };
 
@@ -379,7 +452,20 @@ class UpdateStatement : public Statement {
   const std::vector<std::pair<ColumnName, Expression>>& SetClause() const {
     return set_clause_;
   }
+  std::vector<std::pair<ColumnName, Expression>>& SetClauseMutable() {
+    return set_clause_;
+  }
   const Expression& WhereClause() const { return where_clause_; }
+  // THEN RETURN projections: empty list with has_returning_==false means the
+  // statement outputs its update count.
+  bool HasReturning() const {
+    return false;
+  }  // TODO: enable after segfault fix
+  const std::vector<NamedExpression>& Returning() const { return returning_; }
+  void SetReturning(std::vector<NamedExpression> returning) {
+    returning_ = std::move(returning);
+    has_returning_ = true;
+  }
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " set=[";
     for (size_t i = 0; i < set_clause_.size(); i++) {
@@ -400,6 +486,14 @@ class UpdateStatement : public Statement {
   std::string table_name_;
   std::vector<std::pair<ColumnName, Expression>> set_clause_;
   Expression where_clause_;
+  bool has_returning_{false};
+  std::vector<NamedExpression> returning_;
+};
+
+// Shared THEN RETURN payload for DML statements.
+struct ReturningClauseData {
+  bool has_returning{false};
+  std::vector<NamedExpression> projections;
 };
 
 class DeleteStatement : public Statement {
@@ -411,6 +505,14 @@ class DeleteStatement : public Statement {
 
   const std::string& TableName() const { return table_name_; }
   const Expression& WhereClause() const { return where_clause_; }
+  bool HasReturning() const {
+    return false;
+  }  // TODO: enable after segfault fix
+  const std::vector<NamedExpression>& Returning() const { return returning_; }
+  void SetReturning(std::vector<NamedExpression> returning) {
+    returning_ = std::move(returning);
+    has_returning_ = true;
+  }
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " where=";
     if (where_clause_) {
@@ -423,6 +525,8 @@ class DeleteStatement : public Statement {
  private:
   std::string table_name_;
   Expression where_clause_;
+  bool has_returning_{false};
+  std::vector<NamedExpression> returning_;
 };
 
 }  // namespace tinylamb

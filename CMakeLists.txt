@@ -292,6 +292,7 @@ tinylamb_add_layer(tinylamb_expression
         expression/interval_expression.cpp
         expression/array_expression.cpp
         expression/cast_expression.cpp
+        expression/lambda_expression.cpp
         expression/window_function_expression.cpp
         expression/rewrite.cpp
 

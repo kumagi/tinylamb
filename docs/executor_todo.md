@@ -55,7 +55,8 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
       MergeJoinAlternative が子 SortPlan 要求を構築）
 - [x] `MergeJoinExecutor`（等価、両側昇順、NULL 非マッチ、重複キー run）
 - [x] 複合キー（キー配列と回帰テスト）
-- [ ] 不等号残余フィルタ
+- [x] 不等号残余フィルタ（等価キー run の各ペアに残余述語を評価。outer の NULL
+      padding と semi/anti の一致判定も残余込みで行う）
 - [x] LEFT / RIGHT / FULL outer merge join（NULL キーを非マッチとして左右の
       unmatched 行を NULL padding。空入力の幅は `MergeJoinPlan` から伝播し、
       `MergeJoinSupportsOuterKindsAndNullKeys` で回帰）
@@ -136,7 +137,8 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `HashAggregatePlan` と `SortAggregatePlan` の分離選択（スカラー集約の
       物理 plan 型と `AggregationStrategy` を分離。GROUP BY payload の
       Cascades 接続までは別項目）
-- [ ] `StreamAggregate`（入力が group キー順）
+- [ ] `StreamAggregate`（入力が group キー順。前提: Cascades 論理ペイロードへの
+      GROUP BY キー導入が未着手のため、単体実行器だけでは接続先がない）
 - [ ] `PartialAggregate` + `FinalizeAggregate`（並列・分散）
 - [x] `DistinctAggregate`（逐次・並列 `Aggregation` が aggregate metadata の
       DISTINCT 集合を保持して `COUNT(DISTINCT x)` を処理）
@@ -178,7 +180,8 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `ValuesScan`（多行 VALUES の `ValuesPlan` / `ValuesExecutor`）
 - [x] `FunctionScan` / TVF（関数由来の配列を `LoadSource` が行源化）
 - [x] `UnnestScan`（配列、STRUCT/PROTO、WITH OFFSET、相関 lateral 経路）
-- [ ] `WorkTableScan`（再帰 CTE）
+- [x] `WorkTableScan`（再帰 CTE。反復ごとに CteMap の CTE 名を差分 Relation に
+      束縛する形で実装。専用インデックスアクセスは `WorkTableIndex` が未実装）
 - [ ] `ForeignScan`（将来の外部データ）
 - [x] `FilteredScanPushdown` と残余フィルタの EXPLAIN 区別（IndexScan の predicate
       と、非カバー条件を Selection に残す経路を分離）
@@ -254,10 +257,23 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `LazySpool` / `ConsumerSpool`（再スキャン可能バッファ。`Relation` の
       `ForEachRow` を複数 consumer から利用）
 - [x] `CteScan`（実体化された CTE の読み。`LoadSource` の `CteMap` 経路）
-- [ ] `RecursiveUnion`（作業表の反復）
-- [ ] 再帰の UNION vs UNION ALL
-- [ ] サイクル検出オプション
-- [ ] 再帰深さリミット
+- [x] `RecursiveUnion`（作業表の反復。`ExecuteRecursiveCte`: anchor 項で作業表を
+      初期化し、再帰項には前回差分だけを CTE 名に束縛して反復。anchor が空でも
+      再帰項内の非再帰分岐から反復を開始する）
+- [x] 再帰の UNION vs UNION ALL（UNION ALL は差分そのまま、UNION DISTINCT は
+      payload の seen セットで重複排除。循環データは DISTINCT で停止する。
+      NaN / ±inf は正規化キーで収束させる）
+- [x] `WITH DEPTH BETWEEN lo AND hi` 修飾子（反復上限と depth 列を提供。anchor は
+      depth 0、round r の出力は depth r、範囲外の行は非表示。既定列名 depth、
+      `AS col` で改名、UNBOUNDED 上限対応）→ サイクル検出オプションの実質代替
+- [x] 再帰深さリミット（明示 DEPTH 未指定時は反復上限 1024 + 累積行予算
+      1000 万で超過時にエラー）
+- [x] CTE 解決の依存順（WITH RECURSIVE 内の前方参照を許可。兄弟定義への参照を
+      トポロジカルに解決し、相互再帰はエラー化）
+- [x] テンプレート再構築でも再帰メタデータを保持（BindSelect が宣言順
+      `WithQueryOrder()` でバインドし、`AddRecursiveWithQuery` /
+      `SetRecursiveDepth` を再適用。従来はプランキャッシュ経由で recursive
+      フラグが落ちて自己参照が unknown table になっていた）
 - [ ] `WorkTableIndex`（再帰結合用）
 - [x] `CacheSubquery`（`ExecuteCachedUncorrelated` が非相関サブクエリを 1 回だけ
       materialize。再利用と cache hit を回帰テスト）

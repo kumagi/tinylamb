@@ -9,21 +9,25 @@
 #include <system_error>
 #include <utility>
 #include <vector>
-#include "common/status_or.hpp"
+
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 
 namespace tinylamb {
 namespace {
 
 bool ParseLocation(std::string& label, size_t* start, size_t* end) {
-  if (label.empty() || label.back() != ']') { return false;
-}
+  if (label.empty() || label.back() != ']') {
+    return false;
+  }
   const size_t open = label.rfind(" [");
-  if (open == std::string::npos) { return false;
-}
+  if (open == std::string::npos) {
+    return false;
+  }
   const size_t dash = label.find('-', open + 2);
-  if (dash == std::string::npos) { return false;
-}
+  if (dash == std::string::npos) {
+    return false;
+  }
   const char* first = label.data() + open + 2;
   const char* middle = label.data() + dash;
   const char* last = label.data() + label.size() - 1;
@@ -45,6 +49,12 @@ std::unique_ptr<GoogleSqlAstNode> ParseNode(std::string label) {
   const size_t open = label.find('(');
   if (open != std::string::npos && label.back() == ')') {
     node->kind = label.substr(0, open);
+    // Attribute-style labels separate the name from the detail with a
+    // space ("WithClause (recursive)"); trim so kind equality keeps working.
+    while (!node->kind.empty() &&
+           (node->kind.back() == ' ' || node->kind.back() == '\t')) {
+      node->kind.pop_back();
+    }
     node->detail = label.substr(open + 1, label.size() - open - 2);
   } else {
     node->kind = std::move(label);
@@ -52,13 +62,31 @@ std::unique_ptr<GoogleSqlAstNode> ParseNode(std::string label) {
   return node;
 }
 
+// A node whose parenthesis never closes continues onto the next line: the
+// ZetaSQL parser emits multi-line labels only for literals that embed raw
+// newlines (e.g. a triple-quoted string). Everything else stays one node per
+// line so indentation keeps encoding the tree structure.
+bool HasUnclosedParen(const std::string& label) {
+  size_t open = 0;
+  size_t close = 0;
+  for (const char c : label) {
+    if (c == '(') {
+      ++open;
+    } else if (c == ')') {
+      ++close;
+    }
+  }
+  return open > close;
+}
+
 }  // namespace
 
 const GoogleSqlAstNode* GoogleSqlAstNode::Child(std::string_view child_kind,
                                                 size_t occurrence) const {
   for (const auto& child : children) {
-    if (child->kind == child_kind && occurrence-- == 0) { return child.get();
-}
+    if (child->kind == child_kind && occurrence-- == 0) {
+      return child.get();
+    }
   }
   return nullptr;
 }
@@ -67,8 +95,9 @@ std::vector<const GoogleSqlAstNode*> GoogleSqlAstNode::Children(
     std::string_view child_kind) const {
   std::vector<const GoogleSqlAstNode*> result;
   for (const auto& child : children) {
-    if (child->kind == child_kind) { result.push_back(child.get());
-}
+    if (child->kind == child_kind) {
+      result.push_back(child.get());
+    }
   }
   return result;
 }
@@ -80,20 +109,31 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
   size_t cursor = 0;
   while (cursor < dump.size()) {
     size_t line_end = dump.find('\n', cursor);
-    if (line_end == std::string_view::npos) { line_end = dump.size(); }
+    if (line_end == std::string_view::npos) {
+      line_end = dump.size();
+    }
     std::string full_line = std::string(dump.substr(cursor, line_end - cursor));
-    if (!full_line.empty() && full_line.back() == '\r') { full_line.pop_back(); }
+    if (!full_line.empty() && full_line.back() == '\r') {
+      full_line.pop_back();
+    }
     cursor = line_end + 1;
-    if (full_line.empty()) { continue; }
+    if (full_line.empty()) {
+      continue;
+    }
 
     size_t tmp_start = 0;
     size_t tmp_end = 0;
     std::string test_label = full_line;
-    while (!ParseLocation(test_label, &tmp_start, &tmp_end) && cursor < dump.size()) {
+    while (!ParseLocation(test_label, &tmp_start, &tmp_end) &&
+           HasUnclosedParen(test_label) && cursor < dump.size()) {
       size_t next_line_end = dump.find('\n', cursor);
-      if (next_line_end == std::string_view::npos) { next_line_end = dump.size(); }
+      if (next_line_end == std::string_view::npos) {
+        next_line_end = dump.size();
+      }
       std::string_view next_line = dump.substr(cursor, next_line_end - cursor);
-      if (!next_line.empty() && next_line.back() == '\r') { next_line.remove_suffix(1); }
+      if (!next_line.empty() && next_line.back() == '\r') {
+        next_line.remove_suffix(1);
+      }
       cursor = next_line_end + 1;
       full_line.push_back('\n');
       full_line.append(next_line);
@@ -101,25 +141,36 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
     }
 
     size_t spaces = 0;
-    while (spaces < full_line.size() && full_line[spaces] == ' ') { ++spaces; }
-    if (spaces % 2 != 0 || spaces == full_line.size()) { return Status::kUnknown; }
+    while (spaces < full_line.size() && full_line[spaces] == ' ') {
+      ++spaces;
+    }
+    if (spaces % 2 != 0 || spaces == full_line.size()) {
+      return Status::kUnknown;
+    }
     const size_t depth = spaces / 2;
     auto node = ParseNode(full_line.substr(spaces));
     GoogleSqlAstNode* raw = node.get();
     if (depth == 0) {
-      if (root) { return Status::kUnknown; }
+      if (root) {
+        return Status::kUnknown;
+      }
       root = std::move(node);
     } else {
-      if (depth > parents.size()) { return Status::kUnknown; }
+      if (depth > parents.size()) {
+        return Status::kUnknown;
+      }
       parents[depth - 1]->children.push_back(std::move(node));
     }
-    if (parents.size() <= depth) { parents.resize(depth + 1); }
+    if (parents.size() <= depth) {
+      parents.resize(depth + 1);
+    }
     parents[depth] = raw;
     parents.resize(depth + 1);
   }
-  if (!root) { return Status::kUnknown; }
+  if (!root) {
+    return Status::kUnknown;
+  }
   return root;
 }
-
 
 }  // namespace tinylamb

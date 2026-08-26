@@ -28,7 +28,6 @@ struct GoogleSqlComplianceCase {
   std::string raw_result;
 };
 
-
 [[nodiscard]] std::vector<GoogleSqlComplianceCase> ParseGoogleSqlComplianceFile(
     std::string_view path, std::string_view contents);
 
@@ -37,6 +36,14 @@ struct GoogleSqlComplianceCase {
 
 [[nodiscard]] bool IsDifferentialPrivacyCase(
     const GoogleSqlComplianceCase& test_case);
+
+// tinylamb excludes the property-graph surface (CREATE PROPERTY GRAPH /
+// GRAPH_TABLE / GQL) and protobuf-backed values from its GoogleSQL subset;
+// STRUCT values remain supported. Cases needing either are skipped.
+[[nodiscard]] bool IsPropertyGraphCase(
+    const GoogleSqlComplianceCase& test_case);
+[[nodiscard]] bool IsProtoCase(const GoogleSqlComplianceCase& test_case);
+[[nodiscard]] bool IsOutOfScopeCase(const GoogleSqlComplianceCase& test_case);
 
 // Compare a tinylamb Value with a golden token from the compliance file.
 [[nodiscard]] bool ComplianceValueMatches(const Value& actual,

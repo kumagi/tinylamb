@@ -34,6 +34,19 @@ date intervals and extraction, `ORDER BY`, `LIMIT`/`OFFSET`, `INSERT`, `UPDATE`,
 and `DELETE`. End-to-end coverage lives in `query/sql_engine_tpcc_test.cpp` and
 `query/sql_engine_tpch_test.cpp`.
 
+**Deliberately out of scope.** tinylamb implements a subset of GoogleSQL and
+skips the compliance cases for features it will not implement:
+
+- **Property graphs**: no `CREATE PROPERTY GRAPH`, `GRAPH_TABLE`, or GQL
+  `MATCH` patterns.
+- **Protobuf values**: no `PROTO` columns, braced proto constructors
+  (``SELECT AS `pkg.TypePB` ``), or proto extraction functions.
+
+Plain `STRUCT` values remain supported (construction, field access,
+`UNNEST` of structs). The compliance runner filters these cases through
+`IsPropertyGraphCase` / `IsProtoCase` in `query/googlesql_compliance_file.cpp`
+so skipped features do not count as failures.
+
 `EXPLAIN` returns the selected physical execution strategy without running the
 query. `EXPLAIN ANALYZE` executes it and adds actual row count, planning and
 execution time, scan/filter/join/project/sort timings, join comparison counts,

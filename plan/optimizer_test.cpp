@@ -16,16 +16,16 @@
 
 #include "plan/optimizer.hpp"
 
-#include <array>
-#include <cstdint>
-#include <cstddef>
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <random>
 #include <sstream>
 #include <string>
-#include <vector>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
@@ -50,8 +50,8 @@
 #include "plan/merge_join_plan.hpp"
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
-#include "plan/sort_plan.hpp"
 #include "plan/sort_distinct_plan.hpp"
+#include "plan/sort_plan.hpp"
 #include "plan/values_plan.hpp"
 #include "query/query_data.hpp"
 #include "query/statement.hpp"
@@ -78,9 +78,9 @@ Expression ExistsSubquery(const std::vector<NamedExpression>& select,
       select, std::vector<std::string>{table}, std::move(where));
   Expression expression =
       QueryExpressionExp(std::move(statement), nullptr, true, false);
-  return negated ? UnaryExpressionExp(std::move(expression),
-                                      UnaryOperation::kNot)
-                 : expression;
+  return negated
+             ? UnaryExpressionExp(std::move(expression), UnaryOperation::kNot)
+             : expression;
 }
 }  // namespace
 
@@ -218,8 +218,8 @@ TEST_F(OptimizerTest, Simple) {
 }
 
 TEST_F(OptimizerTest, ConstantFalseSelectionBecomesEmptyPlan) {
-  QueryData query{{"Sc1"}, ConstantValueExp(Value(false)),
-                  {NamedExpression("c1")}};
+  QueryData query{
+      {"Sc1"}, ConstantValueExp(Value(false)), {NamedExpression("c1")}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
 
@@ -264,8 +264,7 @@ TEST_F(OptimizerTest, UnorderedLimitPushesRowCapIntoFullScan) {
   ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
   std::ostringstream dump;
   dump << plan_or.Value();
-  EXPECT_NE(dump.str().find("max rows: 1"), std::string::npos)
-      << dump.str();
+  EXPECT_NE(dump.str().find("max rows: 1"), std::string::npos) << dump.str();
 
   Executor executor = plan_or.Value()->EmitExecutor(context);
   Row row;
@@ -278,10 +277,11 @@ TEST_F(OptimizerTest, UnorderedLimitPushesRowCapIntoFullScan) {
 }
 
 TEST_F(OptimizerTest, AggregateLimitDoesNotCapInputScan) {
-  QueryData query{{"Sc1"}, nullptr,
-                  {NamedExpression("count", AggregateExpressionExp(
-                                                 AggregationType::kCount,
-                                                 ColumnValueExp("c1")))}};
+  QueryData query{
+      {"Sc1"},
+      nullptr,
+      {NamedExpression("count", AggregateExpressionExp(AggregationType::kCount,
+                                                       ColumnValueExp("c1")))}};
   query.limit_count_ = 1;
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
@@ -339,7 +339,9 @@ TEST_F(OptimizerTest, LikeSuffixDoesNotInventAnIndexRange) {
   Executor executor = plan_or.Value()->EmitExecutor(context);
   Row row;
   size_t rows = 0;
-  while (executor->Next(&row, nullptr)) { ++rows; }
+  while (executor->Next(&row, nullptr)) {
+    ++rows;
+  }
   EXPECT_EQ(rows, 20U);
   ASSERT_SUCCESS(context.PreCommit());
 }
@@ -395,9 +397,9 @@ TEST_F(OptimizerTest, CascadesSemiAndAntiJoinImplementationsUseHashJoinKind) {
 
     const cascades::RuleSet no_rules;
     cascades::SearchEngine search(std::move(memo), no_rules);
-    const auto best = search.Optimize(
-        derived, cascades::PhysicalProperties{},
-        DefaultImplementationRules(), rule_context);
+    const auto best =
+        search.Optimize(derived, cascades::PhysicalProperties{},
+                        DefaultImplementationRules(), rule_context);
     ASSERT_TRUE(best.has_value());
     const auto product = std::dynamic_pointer_cast<ProductPlan>(best->plan);
     ASSERT_NE(product, nullptr);
@@ -501,7 +503,8 @@ TEST_F(OptimizerTest, PhysicalRulesCanBeRemovedIndependently) {
 
   OptimizerOptions full_scan_only = OptimizerOptions::Default();
   full_scan_only.disabled_implementation_rules.insert("index_scan");
-  const auto full_plan_or = (Optimizer::Optimize(query, context, full_scan_only));
+  const auto full_plan_or =
+      (Optimizer::Optimize(query, context, full_scan_only));
   ASSERT_EQ(full_plan_or.GetStatus(), Status::kSuccess);
   const Plan& full_plan = full_plan_or.Value();
   std::ostringstream full_dump;
@@ -510,7 +513,8 @@ TEST_F(OptimizerTest, PhysicalRulesCanBeRemovedIndependently) {
 
   OptimizerOptions index_scan_only = OptimizerOptions::Default();
   index_scan_only.disabled_implementation_rules.insert("full_scan");
-  const auto index_plan_or = (Optimizer::Optimize(query, context, index_scan_only));
+  const auto index_plan_or =
+      (Optimizer::Optimize(query, context, index_scan_only));
   ASSERT_EQ(index_plan_or.GetStatus(), Status::kSuccess);
   const Plan& index_plan = index_plan_or.Value();
   std::ostringstream index_dump;
@@ -527,17 +531,15 @@ TEST_F(OptimizerTest, PhysicalRuleSubsetsPreserveOrderedLimitResults) {
   QueryData query{
       {"Sc1", "Sc2"},
       BinaryExpressionExp(
-          BinaryExpressionExp(
-              ColumnValueExp(ColumnName("Sc1", "c1")),
-              BinaryOperation::kEquals,
-              ColumnValueExp(ColumnName("Sc2", "d1"))),
+          BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
+                              BinaryOperation::kEquals,
+                              ColumnValueExp(ColumnName("Sc2", "d1"))),
           BinaryOperation::kAnd,
-          BinaryExpressionExp(
-              ColumnValueExp(ColumnName("Sc1", "c1")),
-              BinaryOperation::kLessThan, ConstantValueExp(Value(6)))),
+          BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
+                              BinaryOperation::kLessThan,
+                              ConstantValueExp(Value(6)))),
       {NamedExpression("key", ColumnName("Sc1", "c1"))}};
-  query.order_expressions_ = {
-      ColumnValueExp(ColumnName("Sc1", "c1"))};
+  query.order_expressions_ = {ColumnValueExp(ColumnName("Sc1", "c1"))};
   query.order_ascending_ = {true};
   query.limit_count_ = 2;
   query.limit_offset_ = 1;
@@ -546,8 +548,7 @@ TEST_F(OptimizerTest, PhysicalRuleSubsetsPreserveOrderedLimitResults) {
   ASSERT_SUCCESS(query.Rewrite(context));
 
   const std::array<std::string, 5> optional_rules = {
-      "index_scan", "full_scan", "hash_join", "index_join",
-      "nested_loop_join"};
+      "index_scan", "full_scan", "hash_join", "index_join", "nested_loop_join"};
   std::vector<uint32_t> masks;
   masks.reserve(1U << optional_rules.size());
   for (uint32_t mask = 0; mask < (1U << optional_rules.size()); ++mask) {
@@ -599,8 +600,7 @@ TEST_F(OptimizerTest, PhysicalRuleSubsetsPreserveOrderedLimitResults) {
       keys = std::vector<int64_t>(keys.begin() + begin, keys.begin() + end);
     }
 
-    EXPECT_EQ(keys, (std::vector<int64_t>{1, 2}))
-        << "rule mask=" << mask;
+    EXPECT_EQ(keys, (std::vector<int64_t>{1, 2})) << "rule mask=" << mask;
     ++planned_subsets;
   }
 
@@ -750,7 +750,8 @@ TEST_F(OptimizerTest, StrictRangePredicatesDriveIndexBounds) {
   // Strict inequalities, reversed operands and NOT-EQUALS exercise every branch
   // of Range::Update and the index prefix construction in ScanCandidates.
   TransactionContext context = rs_->BeginContext();
-  auto run = [&](const Expression& predicate, const std::vector<int64_t>& expected) {
+  auto run = [&](const Expression& predicate,
+                 const std::vector<int64_t>& expected) {
     QueryData query{{"Sc1"}, predicate, {NamedExpression("c1")}};
     ASSERT_SUCCESS(query.Rewrite(context));
     const auto plan_or = (Optimizer::Optimize(query, context));
@@ -766,8 +767,9 @@ TEST_F(OptimizerTest, StrictRangePredicatesDriveIndexBounds) {
   };
   auto range = [](int64_t begin, int64_t end) {
     std::vector<int64_t> values;
-    for (int64_t i = begin; i < end; ++i) { values.push_back(i);
-}
+    for (int64_t i = begin; i < end; ++i) {
+      values.push_back(i);
+    }
     return values;
   };
 
@@ -775,8 +777,9 @@ TEST_F(OptimizerTest, StrictRangePredicatesDriveIndexBounds) {
   // constant-on-left comparisons all produce the matching key sets.
   std::vector<int64_t> all_but_five;
   for (int64_t i = 0; i < 100; ++i) {
-    if (i != 5) { all_but_five.push_back(i);
-}
+    if (i != 5) {
+      all_but_five.push_back(i);
+    }
   }
   run(BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kNotEquals,
                           ConstantValueExp(Value(5))),
@@ -815,7 +818,8 @@ TEST_F(OptimizerTest, DISABLED_CompositeIndexEqualityPrefixWithOneSidedRange) {
   // ceiling). The scan predicate must keep boundary rows exact.
   // Sc1 carries KeyIdx(c2, c3); c2 = "c2-<i>", c3 = i + 9.9.
   TransactionContext context = rs_->BeginContext();
-  auto run = [&](const Expression& predicate, const std::vector<int64_t>& expected) {
+  auto run = [&](const Expression& predicate,
+                 const std::vector<int64_t>& expected) {
     QueryData query{{"Sc1"}, predicate, {NamedExpression("c1")}};
     ASSERT_SUCCESS(query.Rewrite(context));
     const auto plan_or = (Optimizer::Optimize(query, context));
@@ -970,10 +974,9 @@ TEST_F(OptimizerTest, AggregateSelectBuildsAggregationPlan) {
       {"Sc1"},
       BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(2))),
-      {NamedExpression(
-          "sum_score",
-          AggregateExpressionExp(AggregationType::kSum,
-                                 ColumnValueExp("c3")))}};
+      {NamedExpression("sum_score",
+                       AggregateExpressionExp(AggregationType::kSum,
+                                              ColumnValueExp("c3")))}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
 
@@ -998,8 +1001,7 @@ TEST_F(OptimizerTest, MixedAggregateAndScalarSelectIsNotImplemented) {
                           ConstantValueExp(Value(2))),
       {NamedExpression(
            "sum_score",
-           AggregateExpressionExp(AggregationType::kSum,
-                                  ColumnValueExp("c3"))),
+           AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("c3"))),
        NamedExpression("c1")}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
@@ -1020,7 +1022,8 @@ TEST_F(OptimizerTest, ConstantLeftPredicatesWithoutCanonicalization) {
   TransactionContext context = rs_->BeginContext();
   OptimizerOptions options;
   options.relational_rules = cascades::RuleSet::Default();
-  auto run = [&](const Expression& predicate, const std::vector<int64_t>& expected) {
+  auto run = [&](const Expression& predicate,
+                 const std::vector<int64_t>& expected) {
     QueryData query{{"Sc1"}, predicate, {NamedExpression("c1")}};
     ASSERT_SUCCESS(query.Rewrite(context));
     const auto plan_or = (Optimizer::Optimize(query, context, options));
@@ -1036,8 +1039,9 @@ TEST_F(OptimizerTest, ConstantLeftPredicatesWithoutCanonicalization) {
   };
   auto range = [](int64_t begin, int64_t end) {
     std::vector<int64_t> values;
-    for (int64_t i = begin; i < end; ++i) { values.push_back(i);
-}
+    for (int64_t i = begin; i < end; ++i) {
+      values.push_back(i);
+    }
     return values;
   };
 
@@ -1074,8 +1078,8 @@ TEST_F(OptimizerTest, ExtraImplementationRuleIsRegistered) {
   OptimizerOptions options = OptimizerOptions::Default();
   options.extra_implementation_rules.emplace_back(
       "extra_scan_probe", cascades::dsl::Scan(),
-      [](cascades::GroupId, const cascades::Memo&,
-         const cascades::Bindings&, const cascades::LogicalExpression&,
+      [](cascades::GroupId, const cascades::Memo&, const cascades::Bindings&,
+         const cascades::LogicalExpression&,
          const std::vector<cascades::BestPlan>&,
          const cascades::PhysicalProperties&, const cascades::RuleContext&) {
         return std::vector<cascades::PlanAlternative>{};
@@ -1124,7 +1128,6 @@ TEST_F(OptimizerTest, NotComparisonPredicateExecutesAfterPushdown) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-
 TEST_F(OptimizerTest, HashJoinPreferredOverCrossProductForEquiJoin) {
   // Arrange: a 100x200 equality join. The Phase 6 cost model (|L|*|R| local
   // cost for cross products versus |L|+|R| for hash joins) must prefer a
@@ -1154,10 +1157,10 @@ TEST_F(OptimizerTest, HashJoinPreferredOverCrossProductForEquiJoin) {
 }
 
 TEST_F(OptimizerTest, UnqualifiedJoinBecomesExplicitCrossJoin) {
-  QueryData query{
-      {"Sc1", "Sc2"}, ConstantValueExp(Value(true)),
-      {NamedExpression(ColumnName("Sc1", "c1")),
-       NamedExpression(ColumnName("Sc2", "d1"))}};
+  QueryData query{{"Sc1", "Sc2"},
+                  ConstantValueExp(Value(true)),
+                  {NamedExpression(ColumnName("Sc1", "c1")),
+                   NamedExpression(ColumnName("Sc2", "d1"))}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
 
@@ -1183,11 +1186,11 @@ TEST_F(OptimizerTest, MergeJoinRuleUsesChildrenThatAlreadyProvideKeyOrder) {
   Plan left_scan = std::make_shared<FullScanPlan>(*left_table, *left_stats);
   Plan right_scan = std::make_shared<FullScanPlan>(*right_table, *right_stats);
   Plan left_sorted = std::make_shared<SortPlan>(
-      left_scan, std::vector<SortKey>{
-                     {ColumnValueExp(ColumnName("Sc1", "c1")), true}});
+      left_scan,
+      std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc1", "c1")), true}});
   Plan right_sorted = std::make_shared<SortPlan>(
-      right_scan, std::vector<SortKey>{
-                      {ColumnValueExp(ColumnName("Sc2", "d1")), true}});
+      right_scan,
+      std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc2", "d1")), true}});
 
   cascades::Memo memo;
   const cascades::GroupId root = memo.Build({"Sc1", "Sc2"});
@@ -1198,12 +1201,12 @@ TEST_F(OptimizerTest, MergeJoinRuleUsesChildrenThatAlreadyProvideKeyOrder) {
   cascades::LogicalExpression logical = initial;
   logical.predicate = equality;
   std::vector<cascades::BestPlan> children{
-      cascades::BestPlan{.plan = left_sorted,
-                         .estimated_rows =
-                             static_cast<double>(left_sorted->EmitRowCount())},
-      cascades::BestPlan{.plan = right_sorted,
-                         .estimated_rows = static_cast<double>(
-                             right_sorted->EmitRowCount())}};
+      cascades::BestPlan{
+          .plan = left_sorted,
+          .estimated_rows = static_cast<double>(left_sorted->EmitRowCount())},
+      cascades::BestPlan{
+          .plan = right_sorted,
+          .estimated_rows = static_cast<double>(right_sorted->EmitRowCount())}};
 
   const cascades::ImplementationRule* merge_rule = nullptr;
   for (const auto& rule : DefaultImplementationRules().Rules()) {
@@ -1242,12 +1245,12 @@ TEST_F(OptimizerTest, MergeJoinRuleSortsUnorderedChildren) {
       ColumnValueExp(ColumnName("Sc1", "c1")), BinaryOperation::kEquals,
       ColumnValueExp(ColumnName("Sc2", "d1")));
   std::vector<cascades::BestPlan> children{
-      cascades::BestPlan{.plan = left,
-                         .estimated_rows =
-                             static_cast<double>(left->EmitRowCount())},
-      cascades::BestPlan{.plan = right,
-                         .estimated_rows =
-                             static_cast<double>(right->EmitRowCount())}};
+      cascades::BestPlan{
+          .plan = left,
+          .estimated_rows = static_cast<double>(left->EmitRowCount())},
+      cascades::BestPlan{
+          .plan = right,
+          .estimated_rows = static_cast<double>(right->EmitRowCount())}};
 
   const cascades::ImplementationRule* merge_rule = nullptr;
   for (const auto& rule : DefaultImplementationRules().Rules()) {
@@ -1290,12 +1293,12 @@ TEST_F(OptimizerTest, OuterJoinRuleAddsMergeJoinAlternative) {
       ColumnValueExp(ColumnName("Sc1", "c1")), BinaryOperation::kEquals,
       ColumnValueExp(ColumnName("Sc2", "d1")));
   std::vector<cascades::BestPlan> children{
-      cascades::BestPlan{.plan = left,
-                         .estimated_rows =
-                             static_cast<double>(left->EmitRowCount())},
-      cascades::BestPlan{.plan = right,
-                         .estimated_rows =
-                             static_cast<double>(right->EmitRowCount())}};
+      cascades::BestPlan{
+          .plan = left,
+          .estimated_rows = static_cast<double>(left->EmitRowCount())},
+      cascades::BestPlan{
+          .plan = right,
+          .estimated_rows = static_cast<double>(right->EmitRowCount())}};
 
   const cascades::ImplementationRule* rule = nullptr;
   for (const auto& candidate : DefaultImplementationRules().Rules()) {
@@ -1305,18 +1308,18 @@ TEST_F(OptimizerTest, OuterJoinRuleAddsMergeJoinAlternative) {
     }
   }
   ASSERT_NE(rule, nullptr);
-  const auto alternatives = rule->Apply(
-      memo, root, logical, children, cascades::PhysicalProperties{},
-      cascades::RuleContext::Empty());
+  const auto alternatives =
+      rule->Apply(memo, root, logical, children, cascades::PhysicalProperties{},
+                  cascades::RuleContext::Empty());
   bool found_merge = false;
   for (const auto& alternative : alternatives) {
     const auto merge =
         std::dynamic_pointer_cast<MergeJoinPlan>(alternative.plan);
     if (merge != nullptr && merge->Kind() == LeftOuterJoinKind()) {
       found_merge = true;
-      EXPECT_EQ(merge->GetSchema().ColumnCount(),
-                left->GetSchema().ColumnCount() +
-                    right->GetSchema().ColumnCount());
+      EXPECT_EQ(
+          merge->GetSchema().ColumnCount(),
+          left->GetSchema().ColumnCount() + right->GetSchema().ColumnCount());
     }
   }
   EXPECT_TRUE(found_merge);
@@ -1344,12 +1347,12 @@ TEST_F(OptimizerTest, MergeSemiJoinRuleBuildsSortedProbeOnlyPlan) {
       ColumnValueExp(ColumnName("Sc1", "c1")), BinaryOperation::kEquals,
       ColumnValueExp(ColumnName("Sc2", "d1")));
   std::vector<cascades::BestPlan> children{
-      cascades::BestPlan{.plan = left,
-                         .estimated_rows =
-                             static_cast<double>(left->EmitRowCount())},
-      cascades::BestPlan{.plan = right,
-                         .estimated_rows =
-                             static_cast<double>(right->EmitRowCount())}};
+      cascades::BestPlan{
+          .plan = left,
+          .estimated_rows = static_cast<double>(left->EmitRowCount())},
+      cascades::BestPlan{
+          .plan = right,
+          .estimated_rows = static_cast<double>(right->EmitRowCount())}};
   const cascades::ImplementationRule* rule = nullptr;
   for (const auto& candidate : DefaultImplementationRules().Rules()) {
     if (candidate.Name() == "semi_merge_join") {
@@ -1358,9 +1361,9 @@ TEST_F(OptimizerTest, MergeSemiJoinRuleBuildsSortedProbeOnlyPlan) {
     }
   }
   ASSERT_NE(rule, nullptr);
-  const auto alternatives = rule->Apply(
-      memo, root, logical, children, cascades::PhysicalProperties{},
-      cascades::RuleContext::Empty());
+  const auto alternatives =
+      rule->Apply(memo, root, logical, children, cascades::PhysicalProperties{},
+                  cascades::RuleContext::Empty());
   ASSERT_EQ(alternatives.size(), 1U);
   const auto merge =
       std::dynamic_pointer_cast<MergeJoinPlan>(alternatives.front().plan);
@@ -1370,10 +1373,69 @@ TEST_F(OptimizerTest, MergeSemiJoinRuleBuildsSortedProbeOnlyPlan) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+// A semi join whose predicate mixes the equality with an inequality keeps a
+// merge alternative: the inequality rides along as the plan's residual
+// instead of disqualifying merge join entirely.
+TEST_F(OptimizerTest, MergeSemiJoinRuleCarriesInequalityResidual) {
+  TransactionContext context = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, left_table,
+                        context.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, right_table,
+                        context.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, left_stats,
+                        context.GetStats("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, right_stats,
+                        context.GetStats("Sc2"));
+  Plan left = std::make_shared<FullScanPlan>(*left_table, *left_stats);
+  Plan right = std::make_shared<FullScanPlan>(*right_table, *right_stats);
+  cascades::Memo memo;
+  const cascades::GroupId root = memo.Build({"Sc1", "Sc2"});
+  cascades::LogicalExpression logical;
+  logical.operation = cascades::LogicalOperator::kSemiJoin;
+  logical.children = memo.Get(root).expressions.front().children;
+  Expression predicate = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("Sc1", "c1")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("Sc2", "d1")));
+  predicate = BinaryExpressionExp(
+      predicate, BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc2", "d4")),
+                          BinaryOperation::kGreaterThanEquals,
+                          ConstantValueExp(Value(16))));
+  logical.predicate = predicate;
+  std::vector<cascades::BestPlan> children{
+      cascades::BestPlan{
+          .plan = left,
+          .estimated_rows = static_cast<double>(left->EmitRowCount())},
+      cascades::BestPlan{
+          .plan = right,
+          .estimated_rows = static_cast<double>(right->EmitRowCount())}};
+  const cascades::ImplementationRule* rule = nullptr;
+  for (const auto& candidate : DefaultImplementationRules().Rules()) {
+    if (candidate.Name() == "semi_merge_join") {
+      rule = &candidate;
+      break;
+    }
+  }
+  ASSERT_NE(rule, nullptr);
+  const auto alternatives =
+      rule->Apply(memo, root, logical, children, cascades::PhysicalProperties{},
+                  cascades::RuleContext::Empty());
+  ASSERT_EQ(alternatives.size(), 1U);
+  const auto merge =
+      std::dynamic_pointer_cast<MergeJoinPlan>(alternatives.front().plan);
+  ASSERT_NE(merge, nullptr);
+  EXPECT_EQ(merge->Kind(), SemiJoinKind());
+  ASSERT_TRUE(merge->Residual());
+  EXPECT_NE(merge->Residual()->ToString().find(">="), std::string::npos)
+      << merge->Residual()->ToString();
+  EXPECT_NE(merge->ToString().find("residual"), std::string::npos)
+      << merge->ToString();
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, SortDistinctRuleAddsSortForUnorderedInput) {
   TransactionContext context = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
-                        context.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, context.GetTable("Sc1"));
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
                         context.GetStats("Sc1"));
   Plan scan = std::make_shared<FullScanPlan>(*table, *stats);
@@ -1383,10 +1445,9 @@ TEST_F(OptimizerTest, SortDistinctRuleAddsSortForUnorderedInput) {
   cascades::LogicalExpression logical;
   logical.operation = cascades::LogicalOperator::kDistinct;
   logical.children = {child_group};
-  std::vector<cascades::BestPlan> children{
-      cascades::BestPlan{.plan = scan,
-                         .estimated_rows =
-                             static_cast<double>(scan->EmitRowCount())}};
+  std::vector<cascades::BestPlan> children{cascades::BestPlan{
+      .plan = scan,
+      .estimated_rows = static_cast<double>(scan->EmitRowCount())}};
 
   const cascades::ImplementationRule* sort_distinct_rule = nullptr;
   for (const auto& rule : DefaultImplementationRules().Rules()) {
@@ -1480,11 +1541,11 @@ TEST_F(OptimizerTest, LimitWithOrderedIndexStreamsOnlyTopKRows) {
   // Arrange: a range on the indexed column c1 with ORDER BY c1 and LIMIT 5.
   // The Sc1PK index delivers the ordering, so the optimizer folds LIMIT into
   // the plan and the lazy pipeline stops after five rows (Top-K, Phase 5).
-  QueryData query{
-      {"Sc1"},
-      BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kGreaterThanEquals,
-                          ConstantValueExp(Value(80))),
-      {NamedExpression("c1")}};
+  QueryData query{{"Sc1"},
+                  BinaryExpressionExp(ColumnValueExp("c1"),
+                                      BinaryOperation::kGreaterThanEquals,
+                                      ConstantValueExp(Value(80))),
+                  {NamedExpression("c1")}};
   query.order_expressions_ = {ColumnValueExp("c1")};
   query.order_ascending_ = {true};
   query.limit_count_ = 5;
@@ -1629,8 +1690,9 @@ TEST_F(OptimizerTest, AliasedSelfJoinCanUseIndexNestedLoop) {
 
 TEST_F(OptimizerTest, AliasedOrderByLimitFoldsTopK) {
   // Phase 8 follow-up: the relation rename translates ordering requests back
-  // to physical names, so an ordered index scan keeps delivering ORDER BY
-  // above the rename and LIMIT folds into a Top-K plan.
+  // to physical names. An ordered IndexOnlyScan already delivers rows in the
+  // requested order, so no Sort (and no Top-N heap) is needed above the scan;
+  // LIMIT applies straight to the ordered stream.
   QueryData query{
       {"a"},
       BinaryExpressionExp(ColumnValueExp(ColumnName("a", "c1")),
@@ -1647,8 +1709,12 @@ TEST_F(OptimizerTest, AliasedOrderByLimitFoldsTopK) {
   ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
   std::ostringstream dump;
   plan->Dump(dump, 0);
-  EXPECT_NE(dump.str().find("TopN"), std::string::npos) << dump.str();
   EXPECT_NE(dump.str().find("Rename"), std::string::npos) << dump.str();
+  EXPECT_EQ(plan->IsOrderedBy(query.order_expressions_, query.order_ascending_),
+            true)
+      << dump.str();
+  EXPECT_EQ(plan->EnforcesLimit(query.limit_count_, query.limit_offset_), true)
+      << dump.str();
 
   Executor executor = plan->EmitExecutor(context);
   Row row;
@@ -1734,10 +1800,10 @@ TEST_F(OptimizerTest, EqualityPrefixAndInListDriveCompositePointUnion) {
                               BinaryOperation::kEquals,
                               ConstantValueExp(Value("d3-2"))),
           BinaryOperation::kAnd,
-          InExpressionExp(ColumnValueExp(ColumnName("a", "d4")),
-                          {ConstantValueExp(Value(16)),
-                           ConstantValueExp(Value(17))})),
-      {NamedExpression("ad1", ColumnValueExp(ColumnName("a", "d1")))} };
+          InExpressionExp(
+              ColumnValueExp(ColumnName("a", "d4")),
+              {ConstantValueExp(Value(16)), ConstantValueExp(Value(17))})),
+      {NamedExpression("ad1", ColumnValueExp(ColumnName("a", "d1")))}};
   query.aliases_ = {{"a", "Sc2"}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
@@ -1759,7 +1825,11 @@ TEST_F(OptimizerTest, EqualityPrefixAndInListDriveCompositePointUnion) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(OptimizerTest, AccessMethodHintAndMemoDumpDiagnosticsSmoke) {  // Arrange: a plain equality query planned with the Phase 5 access-method
+TEST_F(
+    OptimizerTest,
+    AccessMethodHintAndMemoDumpDiagnosticsSmoke) {  // Arrange: a plain equality
+                                                    // query planned with the
+                                                    // Phase 5 access-method
   // hint and Phase 9 memo dumping enabled.
   QueryData query{
       {"Sc1"},
@@ -1811,12 +1881,11 @@ TEST_F(OptimizerTest, ParallelScanEmittedForLargeAnalyzedTable) {
   // Arrange: an analyzed table whose row count exceeds the parallel threshold.
   const std::string kTable = "BigParallelScan";
   InsertAnalyzedBigTable(rs_.get(), kTable);
-  QueryData query{
-      {kTable},
-      BinaryExpressionExp(ColumnValueExp("key"),
-                          BinaryOperation::kGreaterThanEquals,
-                          ConstantValueExp(Value(0))),
-      {NamedExpression("key"), NamedExpression("payload")}};
+  QueryData query{{kTable},
+                  BinaryExpressionExp(ColumnValueExp("key"),
+                                      BinaryOperation::kGreaterThanEquals,
+                                      ConstantValueExp(Value(0))),
+                  {NamedExpression("key"), NamedExpression("payload")}};
 
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
@@ -1866,9 +1935,9 @@ TEST_F(OptimizerTest, ParallelAggregationEmittedForLargeChild) {
                           ConstantValueExp(Value(0))),
       {NamedExpression("cnt", AggregateExpressionExp(AggregationType::kCount,
                                                      ColumnValueExp("*"))),
-       NamedExpression("total", AggregateExpressionExp(
-                                    AggregationType::kSum,
-                                    ColumnValueExp("key")))}};
+       NamedExpression("total",
+                       AggregateExpressionExp(AggregationType::kSum,
+                                              ColumnValueExp("key")))}};
 
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
@@ -1902,12 +1971,11 @@ TEST_F(OptimizerTest, UpdateOverParallelScanStaysCorrect) {
   query.where_ =
       BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kLessThan,
                           ConstantValueExp(Value(100)));
-  query.select_ = {
-      NamedExpression("key", ColumnValueExp("key")),
-      NamedExpression("payload",
-                      BinaryExpressionExp(ColumnValueExp("payload"),
-                                          BinaryOperation::kAdd,
-                                          ConstantValueExp(Value(1))))};
+  query.select_ = {NamedExpression("key", ColumnValueExp("key")),
+                   NamedExpression("payload", BinaryExpressionExp(
+                                                  ColumnValueExp("payload"),
+                                                  BinaryOperation::kAdd,
+                                                  ConstantValueExp(Value(1))))};
   query.require_row_position_ = true;
 
   TransactionContext context = rs_->BeginContext();
@@ -1944,8 +2012,9 @@ TEST_F(OptimizerTest, UpdateOverParallelScanStaysCorrect) {
     ++total;
     const int64_t key = (*it)[0].value.int_value;
     const int64_t expected = (key * 3) + (key < 100 ? 1 : 0);
-    if ((*it)[1].value.int_value != expected) { ++mismatched;
-}
+    if ((*it)[1].value.int_value != expected) {
+      ++mismatched;
+    }
   }
   EXPECT_EQ(total, kParallelTestRows);
   EXPECT_EQ(mismatched, 0);
@@ -1960,8 +2029,9 @@ namespace {
 int CountRows(Executor executor) {
   Row row;
   int count = 0;
-  while (executor->Next(&row, nullptr)) { ++count;
-}
+  while (executor->Next(&row, nullptr)) {
+    ++count;
+  }
   return count;
 }
 
@@ -1975,9 +2045,9 @@ TEST_F(OptimizerTest, InSubqueryBecomesSemiJoin) {
       std::vector<std::string>{"Sc3"}, Expression());
   QueryData query;
   query.from_ = {"Sc1"};
-  query.where_ = QueryExpressionExp(std::move(statement),
-                                    ColumnValueExp(ColumnName("Sc1", "c1")),
-                                    false, false);
+  query.where_ =
+      QueryExpressionExp(std::move(statement),
+                         ColumnValueExp(ColumnName("Sc1", "c1")), false, false);
   query.select_ = {NamedExpression("c1")};
 
   TransactionContext context = rs_->BeginContext();
@@ -2061,9 +2131,9 @@ TEST_F(OptimizerTest, NotInWithoutNotNullConstraintUsesNullAwareAntiJoin) {
       std::vector<std::string>{"Sc3"}, Expression());
   QueryData query;
   query.from_ = {"Sc1"};
-  query.where_ = QueryExpressionExp(std::move(statement),
-                                    ColumnValueExp(ColumnName("Sc1", "c1")),
-                                    false, true);
+  query.where_ =
+      QueryExpressionExp(std::move(statement),
+                         ColumnValueExp(ColumnName("Sc1", "c1")), false, true);
   query.select_ = {NamedExpression("c1")};
 
   TransactionContext context = rs_->BeginContext();
@@ -2115,9 +2185,8 @@ TEST_F(OptimizerTest, NotInWithNotNullKeysBecomesAntiJoin) {
       std::vector<std::string>{"Nn"}, Expression());
   QueryData query;
   query.from_ = {"Po"};
-  query.where_ = QueryExpressionExp(std::move(statement),
-                                    ColumnValueExp(ColumnName("Po", "c")),
-                                    false, true);
+  query.where_ = QueryExpressionExp(
+      std::move(statement), ColumnValueExp(ColumnName("Po", "c")), false, true);
   query.select_ = {NamedExpression("c")};
 
   TransactionContext context = rs_->BeginContext();
@@ -2138,19 +2207,14 @@ TEST(HashJoinKindTest, SemiJoinEmitsProbeRowOnceAndNullNeverMatches) {
   using tinylamb::Value;
   // Build side holds duplicates of 5 plus a NULL: semi emits each matching
   // probe row once regardless of duplicate build matches.
-  std::vector<Row> right_rows{
-      Row({Value(int64_t{5})}),
-      Row({Value(int64_t{5})}),
-      Row({Value()})};
-  std::vector<Row> left_rows{
-      Row({Value(int64_t{5})}),
-      Row({Value(int64_t{7})}),
-      Row({Value()})};
-  HashJoin join(std::make_shared<ConstantExecutor>(left_rows),
-                std::vector<slot_t>{0},
-                std::make_shared<ConstantExecutor>(right_rows),
-                std::vector<slot_t>{0}, HashJoinMode::kInMemory,
-                JoinKind::kSemi);
+  std::vector<Row> right_rows{Row({Value(int64_t{5})}),
+                              Row({Value(int64_t{5})}), Row({Value()})};
+  std::vector<Row> left_rows{Row({Value(int64_t{5})}), Row({Value(int64_t{7})}),
+                             Row({Value()})};
+  HashJoin join(
+      std::make_shared<ConstantExecutor>(left_rows), std::vector<slot_t>{0},
+      std::make_shared<ConstantExecutor>(right_rows), std::vector<slot_t>{0},
+      HashJoinMode::kInMemory, JoinKind::kSemi);
   Row row;
   ASSERT_TRUE(join.Next(&row, nullptr));
   EXPECT_EQ(row[0], Value(5));
@@ -2159,14 +2223,12 @@ TEST(HashJoinKindTest, SemiJoinEmitsProbeRowOnceAndNullNeverMatches) {
 
 TEST(HashJoinKindTest, AntiJoinKeepsUnmatchedRowsOnly) {
   std::vector<Row> right_rows{Row({Value(int64_t{5})})};
-  std::vector<Row> left_rows{
-      Row({Value(int64_t{5})}), Row({Value(int64_t{7})}),
-      Row({Value(int64_t{9})})};
-  HashJoin join(std::make_shared<ConstantExecutor>(left_rows),
-                std::vector<slot_t>{0},
-                std::make_shared<ConstantExecutor>(right_rows),
-                std::vector<slot_t>{0}, HashJoinMode::kInMemory,
-                JoinKind::kAnti);
+  std::vector<Row> left_rows{Row({Value(int64_t{5})}), Row({Value(int64_t{7})}),
+                             Row({Value(int64_t{9})})};
+  HashJoin join(
+      std::make_shared<ConstantExecutor>(left_rows), std::vector<slot_t>{0},
+      std::make_shared<ConstantExecutor>(right_rows), std::vector<slot_t>{0},
+      HashJoinMode::kInMemory, JoinKind::kAnti);
   Row row;
   ASSERT_TRUE(join.Next(&row, nullptr));
   EXPECT_EQ(row[0], Value(7));
@@ -2179,11 +2241,10 @@ TEST(HashJoinKindTest, AntiJoinEmptyBuildSideEmitsEverythingIncludingNull) {
   // `x NOT IN ()` is TRUE even for x IS NULL: every probe row survives,
   // NULL keys included.
   std::vector<Row> left_rows{Row({Value()}), Row({Value(int64_t{1})})};
-  HashJoin join(std::make_shared<ConstantExecutor>(left_rows),
-                std::vector<slot_t>{0},
-                std::make_shared<ConstantExecutor>(std::vector<Row>{}),
-                std::vector<slot_t>{0}, HashJoinMode::kInMemory,
-                JoinKind::kAnti);
+  HashJoin join(
+      std::make_shared<ConstantExecutor>(left_rows), std::vector<slot_t>{0},
+      std::make_shared<ConstantExecutor>(std::vector<Row>{}),
+      std::vector<slot_t>{0}, HashJoinMode::kInMemory, JoinKind::kAnti);
   Row row;
   ASSERT_TRUE(join.Next(&row, nullptr));
   EXPECT_TRUE(row[0].IsNull());
@@ -2193,14 +2254,12 @@ TEST(HashJoinKindTest, AntiJoinEmptyBuildSideEmitsEverythingIncludingNull) {
 }
 
 TEST(HashJoinKindTest, NullAwareAntiJoinRejectsAllRowsWhenBuildContainsNull) {
-  std::vector<Row> left_rows{Row({Value(int64_t{1})}),
-                             Row({Value()})};
+  std::vector<Row> left_rows{Row({Value(int64_t{1})}), Row({Value()})};
   std::vector<Row> right_rows{Row({Value(int64_t{9})}), Row({Value()})};
-  HashJoin join(std::make_shared<ConstantExecutor>(left_rows),
-                std::vector<slot_t>{0},
-                std::make_shared<ConstantExecutor>(right_rows),
-                std::vector<slot_t>{0}, HashJoinMode::kInMemory,
-                JoinKind::kNullAwareAnti);
+  HashJoin join(
+      std::make_shared<ConstantExecutor>(left_rows), std::vector<slot_t>{0},
+      std::make_shared<ConstantExecutor>(right_rows), std::vector<slot_t>{0},
+      HashJoinMode::kInMemory, JoinKind::kNullAwareAnti);
   Row row;
   EXPECT_FALSE(join.Next(&row, nullptr));
 }
@@ -2209,11 +2268,10 @@ TEST(HashJoinKindTest, NullAwareAntiJoinDropsNullProbeButKeepsUnmatchedValue) {
   std::vector<Row> left_rows{Row({Value()}), Row({Value(int64_t{1})}),
                              Row({Value(int64_t{9})})};
   std::vector<Row> right_rows{Row({Value(int64_t{9})})};
-  HashJoin join(std::make_shared<ConstantExecutor>(left_rows),
-                std::vector<slot_t>{0},
-                std::make_shared<ConstantExecutor>(right_rows),
-                std::vector<slot_t>{0}, HashJoinMode::kInMemory,
-                JoinKind::kNullAwareAnti);
+  HashJoin join(
+      std::make_shared<ConstantExecutor>(left_rows), std::vector<slot_t>{0},
+      std::make_shared<ConstantExecutor>(right_rows), std::vector<slot_t>{0},
+      HashJoinMode::kInMemory, JoinKind::kNullAwareAnti);
   Row row;
   ASSERT_TRUE(join.Next(&row, nullptr));
   EXPECT_EQ(row[0], Value(1));

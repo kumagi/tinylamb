@@ -20,19 +20,19 @@
 #include <cstddef>
 #include <ostream>
 #include <stdexcept>
-#include <string_view>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 
-#include "type/column_name.hpp"
 #include "common/constants.hpp"
 #include "expression/expression.hpp"
+#include "type/column_name.hpp"
 #include "type/date.hpp"
 #include "type/interval.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
-#include "type/type.hpp"
 
 namespace tinylamb {
 
@@ -49,7 +49,9 @@ bool IsStructJson(std::string_view s) {
 
 std::vector<std::string> ExtractStructValues(std::string_view json) {
   std::vector<std::string> values;
-  if (!IsStructJson(json)) { return values; }
+  if (!IsStructJson(json)) {
+    return values;
+  }
   std::string_view inner = json.substr(1, json.size() - 2);
   int depth = 0;
   bool in_string = false;
@@ -58,13 +60,27 @@ std::vector<std::string> ExtractStructValues(std::string_view json) {
   for (size_t i = 0; i < inner.size(); ++i) {
     char c = inner[i];
     if (in_string) {
-      if (c == '\\' && i + 1 < inner.size()) { ++i; continue; }
-      if (c == '"') { in_string = false; }
+      if (c == '\\' && i + 1 < inner.size()) {
+        ++i;
+        continue;
+      }
+      if (c == '"') {
+        in_string = false;
+      }
       continue;
     }
-    if (c == '"') { in_string = true; continue; }
-    if (c == '{' || c == '[' || c == '(') { ++depth; continue; }
-    if (c == '}' || c == ']' || c == ')') { if (depth > 0) --depth; continue; }
+    if (c == '"') {
+      in_string = true;
+      continue;
+    }
+    if (c == '{' || c == '[' || c == '(') {
+      ++depth;
+      continue;
+    }
+    if (c == '}' || c == ']' || c == ')') {
+      if (depth > 0) --depth;
+      continue;
+    }
     if (c == ',' && depth == 0) {
       parts.push_back(inner.substr(start, i - start));
       start = i + 1;
@@ -74,12 +90,19 @@ std::vector<std::string> ExtractStructValues(std::string_view json) {
     parts.push_back(inner.substr(start));
   }
   for (auto p : parts) {
-    while (!p.empty() && std::isspace(static_cast<unsigned char>(p.front()))) { p.remove_prefix(1); }
-    while (!p.empty() && std::isspace(static_cast<unsigned char>(p.back()))) { p.remove_suffix(1); }
+    while (!p.empty() && std::isspace(static_cast<unsigned char>(p.front()))) {
+      p.remove_prefix(1);
+    }
+    while (!p.empty() && std::isspace(static_cast<unsigned char>(p.back()))) {
+      p.remove_suffix(1);
+    }
     size_t colon = p.find(':');
     if (colon != std::string_view::npos) {
       p = p.substr(colon + 1);
-      while (!p.empty() && std::isspace(static_cast<unsigned char>(p.front()))) { p.remove_prefix(1); }
+      while (!p.empty() &&
+             std::isspace(static_cast<unsigned char>(p.front()))) {
+        p.remove_prefix(1);
+      }
     }
     values.emplace_back(p);
   }
@@ -87,12 +110,18 @@ std::vector<std::string> ExtractStructValues(std::string_view json) {
 }
 
 bool StructJsonEqual(std::string_view lhs, std::string_view rhs) {
-  if (lhs == rhs) { return true; }
+  if (lhs == rhs) {
+    return true;
+  }
   auto v1 = ExtractStructValues(lhs);
   auto v2 = ExtractStructValues(rhs);
-  if (v1.empty() || v1.size() != v2.size()) { return false; }
+  if (v1.empty() || v1.size() != v2.size()) {
+    return false;
+  }
   for (size_t i = 0; i < v1.size(); ++i) {
-    if (v1[i] != v2[i]) { return false; }
+    if (v1[i] != v2[i]) {
+      return false;
+    }
   }
   return true;
 }
@@ -133,8 +162,9 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         (!right.IsNull() && !right.Truthy())) {
       return Value(false);
     }
-    if (left.IsNull() || right.IsNull()) { return {};
-}
+    if (left.IsNull() || right.IsNull()) {
+      return {};
+    }
     return Value(true);
   }
   if (op == BinaryOperation::kOr) {
@@ -142,20 +172,23 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         (!right.IsNull() && right.Truthy())) {
       return Value(true);
     }
-    if (left.IsNull() || right.IsNull()) { return {};
-}
+    if (left.IsNull() || right.IsNull()) {
+      return {};
+    }
     return Value(false);
   }
   if (op == BinaryOperation::kXor) {
-    if (left.IsNull() || right.IsNull()) { return {};
-}
+    if (left.IsNull() || right.IsNull()) {
+      return {};
+    }
     return Value(left.Truthy() != right.Truthy());
   }
-  if (left.IsNull() || right.IsNull()) { return {};
-}
+  if (left.IsNull() || right.IsNull()) {
+    return {};
+  }
   if (op == BinaryOperation::kLike || op == BinaryOperation::kNotLike) {
     if (left.type != ValueType::kVarChar || right.type != ValueType::kVarChar) {
-      throw std::runtime_error("LIKE requires string operands");
+      throw std::runtime_error("type mismatch");
     }
     const bool matched =
         Like(left.value.varchar_value, right.value.varchar_value);
@@ -198,10 +231,14 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       case BinaryOperation::kMultiply:
         return Value(lhs * rhs);
       case BinaryOperation::kDivide:
-        if (rhs == 0.0) { throw std::runtime_error("division by zero"); }
+        if (rhs == 0.0) {
+          throw std::runtime_error("division by zero");
+        }
         return Value(lhs / rhs);
       case BinaryOperation::kModulo:
-        if (rhs == 0.0) { throw std::runtime_error("division by zero"); }
+        if (rhs == 0.0) {
+          throw std::runtime_error("division by zero");
+        }
         return Value(std::fmod(lhs, rhs));
       case BinaryOperation::kEquals:
         return Value(lhs == rhs);
@@ -222,8 +259,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
   if (left.type != right.type) {
     auto is_iv = [](std::string_view s) {
       return s.find('-') != std::string_view::npos &&
-             s.find(' ') != std::string_view::npos &&
-             s.find('-') < s.find(' ');
+             s.find(' ') != std::string_view::npos && s.find('-') < s.find(' ');
     };
     if (left.type == ValueType::kVarChar && right.type == ValueType::kInt64 &&
         is_iv(left.value.varchar_value) && op == BinaryOperation::kMultiply) {
@@ -237,34 +273,70 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     }
     if (left.type == ValueType::kDate && right.type == ValueType::kVarChar) {
       try {
-        return EvaluateBinary(op, left, Value::DateFromDays(ParseDateDays(right.value.varchar_value)));
-      } catch (...) {}
-    } else if (left.type == ValueType::kVarChar && right.type == ValueType::kDate) {
+        return EvaluateBinary(
+            op, left,
+            Value::DateFromDays(ParseDateDays(right.value.varchar_value)));
+      } catch (...) {
+      }
+      // Tolerate datetime/timestamp literals: compare on the date portion.
+      std::string_view sv = right.value.varchar_value;
+      const size_t space = sv.find(' ');
+      if (space != std::string_view::npos) {
+        try {
+          return EvaluateBinary(
+              op, left,
+              Value::DateFromDays(ParseDateDays(sv.substr(0, space))));
+        } catch (...) {
+        }
+      }
+    } else if (left.type == ValueType::kVarChar &&
+               right.type == ValueType::kDate) {
       try {
-        return EvaluateBinary(op, Value::DateFromDays(ParseDateDays(left.value.varchar_value)), right);
-      } catch (...) {}
+        return EvaluateBinary(
+            op, Value::DateFromDays(ParseDateDays(left.value.varchar_value)),
+            right);
+      } catch (...) {
+      }
+      std::string_view sv = left.value.varchar_value;
+      const size_t space = sv.find(' ');
+      if (space != std::string_view::npos) {
+        try {
+          return EvaluateBinary(
+              op, Value::DateFromDays(ParseDateDays(sv.substr(0, space))),
+              right);
+        } catch (...) {
+        }
+      }
     }
     throw std::runtime_error("type mismatch");
   }
   if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar) {
     auto is_iv = [](std::string_view s) {
       return s.find('-') != std::string_view::npos &&
-             s.find(' ') != std::string_view::npos &&
-             s.find('-') < s.find(' ');
+             s.find(' ') != std::string_view::npos && s.find('-') < s.find(' ');
     };
     if (is_iv(left.value.varchar_value) && is_iv(right.value.varchar_value)) {
       IntervalValue iv1 = IntervalValue::Parse(left.value.varchar_value);
       IntervalValue iv2 = IntervalValue::Parse(right.value.varchar_value);
       switch (op) {
-        case BinaryOperation::kAdd: return Value((iv1 + iv2).ToString());
-        case BinaryOperation::kSubtract: return Value((iv1 - iv2).ToString());
-        case BinaryOperation::kEquals: return Value(iv1 == iv2);
-        case BinaryOperation::kNotEquals: return Value(iv1 != iv2);
-        case BinaryOperation::kLessThan: return Value(iv1 < iv2);
-        case BinaryOperation::kLessThanEquals: return Value(iv1 <= iv2);
-        case BinaryOperation::kGreaterThan: return Value(iv1 > iv2);
-        case BinaryOperation::kGreaterThanEquals: return Value(iv1 >= iv2);
-        default: break;
+        case BinaryOperation::kAdd:
+          return Value((iv1 + iv2).ToString());
+        case BinaryOperation::kSubtract:
+          return Value((iv1 - iv2).ToString());
+        case BinaryOperation::kEquals:
+          return Value(iv1 == iv2);
+        case BinaryOperation::kNotEquals:
+          return Value(iv1 != iv2);
+        case BinaryOperation::kLessThan:
+          return Value(iv1 < iv2);
+        case BinaryOperation::kLessThanEquals:
+          return Value(iv1 <= iv2);
+        case BinaryOperation::kGreaterThan:
+          return Value(iv1 > iv2);
+        case BinaryOperation::kGreaterThanEquals:
+          return Value(iv1 >= iv2);
+        default:
+          break;
       }
     }
   }
@@ -281,8 +353,12 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
           throw std::runtime_error("division by zero");
         }
         const double res = left.value.double_value / right.value.double_value;
-        if (std::isinf(res)) { throw std::runtime_error("double overflow"); }
-        if (std::isnan(res)) { throw std::runtime_error("division by zero"); }
+        if (std::isinf(res)) {
+          throw std::runtime_error("double overflow");
+        }
+        if (std::isnan(res)) {
+          throw std::runtime_error("division by zero");
+        }
         return Value(res);
       }
       return left / right;
@@ -290,15 +366,21 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     case BinaryOperation::kModulo:
       return left % right;
     case BinaryOperation::kEquals:
-      if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar &&
-          IsStructJson(left.value.varchar_value) && IsStructJson(right.value.varchar_value)) {
-        return Value(StructJsonEqual(left.value.varchar_value, right.value.varchar_value));
+      if (left.type == ValueType::kVarChar &&
+          right.type == ValueType::kVarChar &&
+          IsStructJson(left.value.varchar_value) &&
+          IsStructJson(right.value.varchar_value)) {
+        return Value(StructJsonEqual(left.value.varchar_value,
+                                     right.value.varchar_value));
       }
       return Value(left == right);
     case BinaryOperation::kNotEquals:
-      if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar &&
-          IsStructJson(left.value.varchar_value) && IsStructJson(right.value.varchar_value)) {
-        return Value(!StructJsonEqual(left.value.varchar_value, right.value.varchar_value));
+      if (left.type == ValueType::kVarChar &&
+          right.type == ValueType::kVarChar &&
+          IsStructJson(left.value.varchar_value) &&
+          IsStructJson(right.value.varchar_value)) {
+        return Value(!StructJsonEqual(left.value.varchar_value,
+                                      right.value.varchar_value));
       }
       return Value(left != right);
     case BinaryOperation::kLessThan:
@@ -364,8 +446,8 @@ Value BinaryExpression::Evaluate(const Row& row, const Schema& schema,
         left_value.Truthy() != (op_ == BinaryOperation::kAnd)) {
       return Value(op_ == BinaryOperation::kOr);
     }
-    return EvaluateBinary(
-        op_, left_value, right_->Evaluate(row, schema, context));
+    return EvaluateBinary(op_, left_value,
+                          right_->Evaluate(row, schema, context));
   }
   return EvaluateBinary(op_, left_->Evaluate(row, schema, context),
                         right_->Evaluate(row, schema, context));
@@ -409,8 +491,8 @@ Type BinaryExpression::ResultType(const Schema& left,
 }
 
 std::string BinaryExpression::ToString() const {
-  return "(" + left_->ToString() + " " +
-         std::string(tinylamb::ToString(op_)) + " " + right_->ToString() + ")";
+  return "(" + left_->ToString() + " " + std::string(tinylamb::ToString(op_)) +
+         " " + right_->ToString() + ")";
 }
 
 void BinaryExpression::Dump(std::ostream& o) const { o << ToString(); }

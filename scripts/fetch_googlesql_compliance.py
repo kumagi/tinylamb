@@ -28,6 +28,8 @@ SKIP = (
     "anonymization",
     "aggregation_threshold",
     "pipe_aggregate_with_dp",
+    # Graph (GQL) queries are out of scope for tinylamb.
+    "graph_",
 )
 
 

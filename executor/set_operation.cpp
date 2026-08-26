@@ -21,11 +21,26 @@ namespace {
 constexpr size_t kSetOperationPartitions = 32;
 
 ValueType CommonSetValueType(ValueType left, ValueType right) {
-  if (left == ValueType::kNull) { return right; }
-  if (right == ValueType::kNull || left == right) { return left; }
+  if (left == ValueType::kNull) {
+    return right;
+  }
+  if (right == ValueType::kNull || left == right) {
+    return left;
+  }
   if ((left == ValueType::kInt64 && right == ValueType::kDouble) ||
       (left == ValueType::kDouble && right == ValueType::kInt64)) {
     return ValueType::kDouble;
+  }
+  // Textual types (STRING / NUMERIC / BIGNUMERIC literals) unify with
+  // numerics by coercing the numeric side to text.
+  const bool left_text = left == ValueType::kVarChar;
+  const bool right_text = right == ValueType::kVarChar;
+  if ((left_text &&
+       (right == ValueType::kInt64 || right == ValueType::kDouble ||
+        right == ValueType::kDate)) ||
+      (right_text && (left == ValueType::kInt64 || left == ValueType::kDouble ||
+                      left == ValueType::kDate))) {
+    return ValueType::kVarChar;
   }
   throw std::invalid_argument("set operation inputs have incompatible types");
 }
@@ -72,6 +87,10 @@ void SetOperationExecutor::MaterializeRows(
             value = Value(static_cast<double>(value.value.int_value));
             continue;
           }
+          if (common_types[column] == ValueType::kVarChar) {
+            value = Value(value.AsString());
+            continue;
+          }
           throw std::invalid_argument(
               "set operation value cannot be coerced to common type");
         }
@@ -82,11 +101,15 @@ void SetOperationExecutor::MaterializeRows(
   output_offset_ = 0;
   switch (operation_) {
     case SetOperationKind::kUnionAll:
-      for (const auto& source : rows) { AppendAll(source); }
+      for (const auto& source : rows) {
+        AppendAll(source);
+      }
       break;
     case SetOperationKind::kUnion: {
       std::unordered_set<Row> seen;
-      for (const auto& source : rows) { AppendDistinct(source, &seen); }
+      for (const auto& source : rows) {
+        AppendDistinct(source, &seen);
+      }
       break;
     }
     case SetOperationKind::kIntersect:
@@ -106,29 +129,38 @@ void SetOperationExecutor::MaterializeRows(
 
 void SetOperationExecutor::MaterializePartitioned() {
   for (auto& source : spill_sources_) {
-    for (SpillFile& partition : source) { partition.FinishWriting(); }
+    for (SpillFile& partition : source) {
+      partition.FinishWriting();
+    }
   }
   // A value's physical type participates in Row's hash. Repartition after
   // determining the global common type so INT64 1 and DOUBLE 1.0 still meet
   // in UNION DISTINCT / INTERSECT partitions.
   std::vector<std::vector<SpillFile>> normalized(spill_sources_.size());
-  for (auto& source : normalized) { source.resize(kSetOperationPartitions); }
+  for (auto& source : normalized) {
+    source.resize(kSetOperationPartitions);
+  }
   for (size_t source = 0; source < spill_sources_.size(); ++source) {
     for (SpillFile& raw_partition : spill_sources_[source]) {
       raw_partition.ForEachRow([&](const Row& raw) {
         Row row = raw;
-        if (spill_width_.has_value() &&
-            row.values_.size() != *spill_width_) {
+        if (spill_width_.has_value() && row.values_.size() != *spill_width_) {
           throw std::invalid_argument(
               "set operation inputs must have the same column count");
         }
         for (size_t column = 0; column < row.values_.size(); ++column) {
           Value& value = row.values_[column];
           const ValueType expected = spill_common_types_[column];
-          if (value.IsNull() || value.type == expected) { continue; }
+          if (value.IsNull() || value.type == expected) {
+            continue;
+          }
           if (expected == ValueType::kDouble &&
               value.type == ValueType::kInt64) {
             value = Value(static_cast<double>(value.value.int_value));
+            continue;
+          }
+          if (expected == ValueType::kVarChar) {
+            value = Value(value.AsString());
             continue;
           }
           throw std::invalid_argument(
@@ -141,13 +173,14 @@ void SetOperationExecutor::MaterializePartitioned() {
   }
   spill_sources_ = std::move(normalized);
   for (auto& source : spill_sources_) {
-    for (SpillFile& partition : source) { partition.FinishWriting(); }
+    for (SpillFile& partition : source) {
+      partition.FinishWriting();
+    }
   }
   output_.clear();
   output_offset_ = 0;
   std::vector<Positioned> accumulated;
-  for (size_t partition = 0; partition < kSetOperationPartitions;
-       ++partition) {
+  for (size_t partition = 0; partition < kSetOperationPartitions; ++partition) {
     std::vector<std::vector<Positioned>> rows(spill_sources_.size());
     for (size_t source = 0; source < spill_sources_.size(); ++source) {
       const std::vector<Row> spilled =
@@ -170,8 +203,8 @@ void SetOperationExecutor::AppendAll(const std::vector<Positioned>& source) {
   output_.insert(output_.end(), source.begin(), source.end());
 }
 
-void SetOperationExecutor::AppendDistinct(
-    const std::vector<Positioned>& source, std::unordered_set<Row>* seen) {
+void SetOperationExecutor::AppendDistinct(const std::vector<Positioned>& source,
+                                          std::unordered_set<Row>* seen) {
   for (const Positioned& item : source) {
     if (seen->insert(item.row).second) {
       output_.push_back(item);
@@ -272,9 +305,9 @@ void SetOperationExecutor::Materialize() {
     }
     for (size_t source = 0; source < rows.size(); ++source) {
       for (const Positioned& item : rows[source]) {
-        spill_sources_[source][std::hash<Row>{}(item.row) %
-                              kSetOperationPartitions]
-            .Append(item.row);
+        spill_sources_[source]
+                      [std::hash<Row>{}(item.row) % kSetOperationPartitions]
+                          .Append(item.row);
       }
       rows[source].clear();
       rows[source].shrink_to_fit();
@@ -291,8 +324,7 @@ void SetOperationExecutor::Materialize() {
         begin_spill();
       }
       if (spilling) {
-        spill_sources_[source][std::hash<Row>{}(row) %
-                              kSetOperationPartitions]
+        spill_sources_[source][std::hash<Row>{}(row) % kSetOperationPartitions]
             .Append(row);
       } else {
         charge.Add(EstimateRowBytes(row));
@@ -312,7 +344,8 @@ bool SetOperationExecutor::Next(Row* destination, RowPosition* position) {
   if (!materialized_) {
     Materialize();
   }
-  if (output_offset_ == output_.size()) { return false;
+  if (output_offset_ == output_.size()) {
+    return false;
   }
   const Positioned& item = output_[output_offset_++];
   *destination = item.row;

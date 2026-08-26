@@ -46,6 +46,12 @@ class SortPlan final : public PlanBase {
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override;
+  // Sorting reorders but never adds or removes rows, so a limit below a
+  // Sort still shapes the final output exactly.
+  [[nodiscard]] bool EnforcesLimit(size_t limit_count,
+                                   size_t limit_offset) const override {
+    return child_->EnforcesLimit(limit_count, limit_offset);
+  }
 
   [[nodiscard]] const std::vector<SortKey>& Keys() const { return keys_; }
   [[nodiscard]] const Plan& Child() const { return child_; }

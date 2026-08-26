@@ -3,18 +3,18 @@
 #include "server/postgres_server.hpp"
 
 #include <arpa/inet.h>
-#include <chrono>
-#include <netinet/in.h>
 #include <asm-generic/socket.h>
 #include <bits/pthreadtypes.h>
+#include <netinet/in.h>
 #include <poll.h>
-#include <sys/poll.h>
 #include <signal.h>  // NOLINT(modernize-deprecated-headers) // POSIX sigaction/sigemptyset below are only provided by this header.
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -35,8 +35,9 @@ bool SendAll(int fd, const std::string& bytes) {
   while (offset < bytes.size()) {
     const ssize_t sent =
         send(fd, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
-    if (sent <= 0) { return false;
-}
+    if (sent <= 0) {
+      return false;
+    }
     offset += static_cast<size_t>(sent);
   }
   return true;
@@ -45,22 +46,26 @@ bool SendAll(int fd, const std::string& bytes) {
 std::string ReadUntilReady(int fd) {
   std::string result;
   while (true) {
-    pollfd descriptor{.fd=fd, .events=POLLIN, .revents=0};
-    if (poll(&descriptor, 1, 5000) <= 0) { return {};
-}
+    pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
+    if (poll(&descriptor, 1, 5000) <= 0) {
+      return {};
+    }
     std::array<char, 4096> buffer{};
     const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
-    if (received <= 0) { return {};
-}
+    if (received <= 0) {
+      return {};
+    }
     result.append(buffer.data(), static_cast<size_t>(received));
 
     size_t cursor = 0;
     while (cursor + 5 <= result.size()) {
       const uint32_t length = pgwire::ReadUint32(result, cursor + 1);
-      if (length < 4 || cursor + 1 + length > result.size()) { break;
-}
-      if (result[cursor] == 'Z') { return result;
-}
+      if (length < 4 || cursor + 1 + length > result.size()) {
+        break;
+      }
+      if (result[cursor] == 'Z') {
+        return result;
+      }
       cursor += 1 + length;
     }
   }
@@ -89,8 +94,9 @@ std::string QueryMessage(const std::string& sql) {
 
 int ConnectClient(uint16_t port) {
   const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (client < 0) { return -1;
-}
+  if (client < 0) {
+    return -1;
+  }
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_port = htons(port);
@@ -210,8 +216,9 @@ TEST(PostgresServerTest, ExecutesIndependentReadsConcurrently) {
     ASSERT_FALSE(ReadUntilReady(setup).empty());
     std::string insert = "INSERT INTO parallel_rows VALUES ";
     for (int64_t value = 1; value <= 200; ++value) {
-      if (value != 1) { insert += ',';
-}
+      if (value != 1) {
+        insert += ',';
+      }
       insert += '(' + std::to_string(value) + ')';
     }
     insert += ';';
@@ -275,13 +282,15 @@ TEST(PostgresServerTest, TransactionsOverTcpProtocol) {
 
     // Act -- create a table
     ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE txns (id INT64, body STRING(32));")));
+        client,
+        QueryMessage("CREATE TABLE txns (id INT64, body STRING(32));")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
 
     // Act -- open a transaction, insert, and roll back
     ASSERT_TRUE(SendAll(client, QueryMessage("BEGIN;")));
     EXPECT_NE(ReadUntilReady(client).find("BEGIN"), std::string::npos);
-    ASSERT_TRUE(SendAll(client, QueryMessage("INSERT INTO txns VALUES (1, 'a');")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("INSERT INTO txns VALUES (1, 'a');")));
     EXPECT_NE(ReadUntilReady(client).find("INSERT 0 1"), std::string::npos);
     ASSERT_TRUE(SendAll(client, QueryMessage("ROLLBACK;")));
     EXPECT_NE(ReadUntilReady(client).find("ROLLBACK"), std::string::npos);
@@ -314,8 +323,8 @@ TEST(PostgresServerTest, TransactionsOverTcpProtocol) {
     EXPECT_NE(ReadUntilReady(client).find("SET"), std::string::npos);
 
     // Act -- UPDATE and DELETE produce their command tags
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("UPDATE txns SET id = 3 WHERE id = 2;")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("UPDATE txns SET id = 3 WHERE id = 2;")));
     EXPECT_NE(ReadUntilReady(client).find("UPDATE 1"), std::string::npos);
     ASSERT_TRUE(SendAll(client, QueryMessage("DELETE FROM txns;")));
     EXPECT_NE(ReadUntilReady(client).find("DELETE 1"), std::string::npos);
@@ -366,13 +375,15 @@ TEST(PostgresServerTest, ServerProtocolErrorResponses) {
     // without a ReadyForQuery
     std::string response;
     while (true) {
-      pollfd descriptor{.fd=client, .events=POLLIN, .revents=0};
-      if (poll(&descriptor, 1, 5000) <= 0) { break;
-}
+      pollfd descriptor{.fd = client, .events = POLLIN, .revents = 0};
+      if (poll(&descriptor, 1, 5000) <= 0) {
+        break;
+      }
       std::array<char, 4096> buffer{};
       const ssize_t received = recv(client, buffer.data(), buffer.size(), 0);
-      if (received <= 0) { break;
-}
+      if (received <= 0) {
+        break;
+      }
       response.append(buffer.data(), static_cast<size_t>(received));
     }
     EXPECT_NE(response.find('E'), std::string::npos);
@@ -406,8 +417,7 @@ TEST(PostgresServerTest, ReadWorkerReportsPrepareErrors) {
 
     // Act -- a read-only statement that fails to prepare (unknown table) is
     // routed to a read worker
-    ASSERT_TRUE(
-        SendAll(client, QueryMessage("SELECT * FROM does_not_exist;")));
+    ASSERT_TRUE(SendAll(client, QueryMessage("SELECT * FROM does_not_exist;")));
     const std::string response = ReadUntilReady(client);
     // Assert -- the worker returns an ErrorResponse plus ReadyForQuery
     EXPECT_NE(response.find('E'), std::string::npos);
@@ -468,8 +478,9 @@ TEST(PostgresServerTest, StartupPacketVariants) {
 
     auto ConnectRaw = [&]() {
       const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-      if (client < 0) { return -1;
-}
+      if (client < 0) {
+        return -1;
+      }
       sockaddr_in address{};
       address.sin_family = AF_INET;
       address.sin_port = htons(server.BoundPort());
@@ -496,13 +507,15 @@ TEST(PostgresServerTest, StartupPacketVariants) {
     auto ReadAll = [](int fd) {
       std::string result;
       while (true) {
-        pollfd descriptor{.fd=fd, .events=POLLIN, .revents=0};
-        if (poll(&descriptor, 1, 5000) <= 0) { break;
-}
+        pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
+        if (poll(&descriptor, 1, 5000) <= 0) {
+          break;
+        }
         std::array<char, 4096> buffer{};
         const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
-        if (received <= 0) { break;
-}
+        if (received <= 0) {
+          break;
+        }
         result.append(buffer.data(), static_cast<size_t>(received));
       }
       return result;
@@ -549,9 +562,9 @@ TEST(PostgresServerTest, StartupPacketVariants) {
       const int client = ConnectRaw();
       ASSERT_GE(client, 0);
       ASSERT_TRUE(SendAll(
-          client, MakeStartup(0x00040000U,
-                              std::string("user\0test\0database\0test\0\0",
-                                          25))));
+          client,
+          MakeStartup(0x00040000U,
+                      std::string("user\0test\0database\0test\0\0", 25))));
       const std::string reply = ReadAll(client);
       EXPECT_NE(reply.find('E'), std::string::npos);
       EXPECT_NE(reply.find("only PostgreSQL protocol v3 is supported"),
@@ -563,10 +576,9 @@ TEST(PostgresServerTest, StartupPacketVariants) {
     {
       const int client = ConnectRaw();
       ASSERT_GE(client, 0);
-      ASSERT_TRUE(SendAll(
-          client,
-          MakeStartup(pgwire::kProtocolVersion30,
-                      std::string("database\0test\0\0", 15))));
+      ASSERT_TRUE(
+          SendAll(client, MakeStartup(pgwire::kProtocolVersion30,
+                                      std::string("database\0test\0\0", 15))));
       const std::string reply = ReadAll(client);
       EXPECT_NE(reply.find('E'), std::string::npos);
       EXPECT_NE(reply.find("startup packet must include a user"),
@@ -579,9 +591,9 @@ TEST(PostgresServerTest, StartupPacketVariants) {
       const int client = ConnectRaw();
       ASSERT_GE(client, 0);
       ASSERT_TRUE(SendAll(
-          client, MakeStartup(0x00030001U,
-                              std::string("user\0test\0_pq_.foo\0bar\0\0",
-                                          24))));
+          client,
+          MakeStartup(0x00030001U,
+                      std::string("user\0test\0_pq_.foo\0bar\0\0", 24))));
       const std::string reply = ReadUntilReady(client);
       EXPECT_NE(reply.find('v'), std::string::npos);
       EXPECT_NE(reply.find("_pq_.foo"), std::string::npos);
@@ -613,8 +625,8 @@ TEST(PostgresServerTest, TransactionAbortErrorState) {
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
 
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE abort_state (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE abort_state (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
 
     ASSERT_TRUE(SendAll(client, QueryMessage("BEGIN;")));
@@ -681,13 +693,15 @@ TEST(PostgresServerTest, OversizedMessageLimit) {
     ASSERT_TRUE(SendAll(client, QueryMessage(long_sql)));
     std::string reply;
     while (true) {
-      pollfd descriptor{.fd=client, .events=POLLIN, .revents=0};
-      if (poll(&descriptor, 1, 5000) <= 0) { break;
-}
+      pollfd descriptor{.fd = client, .events = POLLIN, .revents = 0};
+      if (poll(&descriptor, 1, 5000) <= 0) {
+        break;
+      }
       std::array<char, 4096> buffer{};
       const ssize_t received = recv(client, buffer.data(), buffer.size(), 0);
-      if (received <= 0) { break;
-}
+      if (received <= 0) {
+        break;
+      }
       reply.append(buffer.data(), static_cast<size_t>(received));
     }
     EXPECT_NE(reply.find('E'), std::string::npos);
@@ -718,10 +732,11 @@ TEST(PostgresServerTest, SyncAndFlushMessages) {
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
 
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE sync_rows (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE sync_rows (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
-    ASSERT_TRUE(SendAll(client, QueryMessage("INSERT INTO sync_rows VALUES (1);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("INSERT INTO sync_rows VALUES (1);")));
     EXPECT_NE(ReadUntilReady(client).find("INSERT 0 1"), std::string::npos);
 
     // Act -- a Sync message elicits an immediate ReadyForQuery
@@ -762,10 +777,11 @@ TEST(PostgresServerTest, DropTableCommandTagOverTcp) {
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
 
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE drop_me (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE drop_me (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
-    ASSERT_TRUE(SendAll(client, QueryMessage("INSERT INTO drop_me VALUES (1);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("INSERT INTO drop_me VALUES (1);")));
     EXPECT_NE(ReadUntilReady(client).find("INSERT 0 1"), std::string::npos);
 
     // Act -- drop the table; the command tag must be reported to the client
@@ -806,10 +822,11 @@ TEST(PostgresServerTest, SelectInsideExplicitTransaction) {
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
 
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE txn_rows (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE txn_rows (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
-    ASSERT_TRUE(SendAll(client, QueryMessage("INSERT INTO txn_rows VALUES (7);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("INSERT INTO txn_rows VALUES (7);")));
     EXPECT_NE(ReadUntilReady(client).find("INSERT 0 1"), std::string::npos);
 
     // Act -- a SELECT inside a transaction goes through the main statement
@@ -862,13 +879,15 @@ TEST(PostgresServerTest, InvalidStartupPacketLength) {
     ASSERT_TRUE(SendAll(client, std::string("\0\0\0\4", 4)));
     std::string reply;
     while (true) {
-      pollfd descriptor{.fd=client, .events=POLLIN, .revents=0};
-      if (poll(&descriptor, 1, 5000) <= 0) { break;
-}
+      pollfd descriptor{.fd = client, .events = POLLIN, .revents = 0};
+      if (poll(&descriptor, 1, 5000) <= 0) {
+        break;
+      }
       std::array<char, 4096> buffer{};
       const ssize_t received = recv(client, buffer.data(), buffer.size(), 0);
-      if (received <= 0) { break;
-}
+      if (received <= 0) {
+        break;
+      }
       reply.append(buffer.data(), static_cast<size_t>(received));
     }
     // Assert -- the server reports the invalid packet and drops the client
@@ -921,13 +940,15 @@ TEST(PostgresServerTest, MalformedStartupPacketWithoutTerminator) {
     ASSERT_TRUE(SendAll(client, packet));
     std::string reply;
     while (true) {
-      pollfd descriptor{.fd=client, .events=POLLIN, .revents=0};
-      if (poll(&descriptor, 1, 5000) <= 0) { break;
-}
+      pollfd descriptor{.fd = client, .events = POLLIN, .revents = 0};
+      if (poll(&descriptor, 1, 5000) <= 0) {
+        break;
+      }
       std::array<char, 4096> buffer{};
       const ssize_t received = recv(client, buffer.data(), buffer.size(), 0);
-      if (received <= 0) { break;
-}
+      if (received <= 0) {
+        break;
+      }
       reply.append(buffer.data(), static_cast<size_t>(received));
     }
     // Assert -- the parse failure surfaces as an 08P01 protocol error
@@ -987,9 +1008,9 @@ TEST(PostgresServerTest, ListenFailsWhenPortAlreadyInUse) {
   ASSERT_EQ(listen(conflict, 1), 0);
   sockaddr_in bound{};
   socklen_t bound_size = sizeof(bound);
-  ASSERT_EQ(getsockname(conflict, reinterpret_cast<sockaddr*>(&bound),
-                        &bound_size),
-            0);
+  ASSERT_EQ(
+      getsockname(conflict, reinterpret_cast<sockaddr*>(&bound), &bound_size),
+      0);
 
   PostgresServerOptions options;
   options.listen_address = "127.0.0.1";
@@ -1041,14 +1062,15 @@ TEST(PostgresServerTest, FailedAutomaticTransactionRecoversSession) {
 
     // Act -- a non-read-only statement that fails to prepare aborts its
     // automatic transaction and reports an error plus ReadyForQuery
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("INSERT INTO missing_table VALUES (1);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("INSERT INTO missing_table VALUES (1);")));
     const std::string failed = ReadUntilReady(client);
     EXPECT_NE(failed.find('E'), std::string::npos);
     EXPECT_NE(failed.find('Z'), std::string::npos);
 
     // Assert -- the session is usable again afterwards
-    ASSERT_TRUE(SendAll(client, QueryMessage("CREATE TABLE ok_now (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE ok_now (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
 
     ASSERT_TRUE(SendAll(client, std::string("X\0\0\0\4", 5)));
@@ -1099,8 +1121,8 @@ TEST(PostgresServerTest, StartTransactionAndEndAliases) {
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
 
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE alias_rows (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE alias_rows (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
 
     // Act -- START TRANSACTION is treated as BEGIN
@@ -1137,7 +1159,8 @@ TEST(PostgresServerTest, StartTransactionAndEndAliases) {
   database.DeleteAll();
 }
 
-// Multi-statement simple query: exercises sequential DDL/DML/SELECT in one message.
+// Multi-statement simple query: exercises sequential DDL/DML/SELECT in one
+// message.
 TEST(PostgresServerTest, MultiStatementSimpleQueryMessage) {
   const std::string path = "postgres_server_multistmt_test-" + RandomString();
   {
@@ -1154,32 +1177,31 @@ TEST(PostgresServerTest, MultiStatementSimpleQueryMessage) {
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
 
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE multi_rows (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE multi_rows (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
 
     // Act -- a mixed write + read message runs every statement in order
-    ASSERT_TRUE(SendAll(client, QueryMessage(
-                                    "INSERT INTO multi_rows VALUES (1); "
-                                    "SELECT id FROM multi_rows;")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("INSERT INTO multi_rows VALUES (1); "
+                                     "SELECT id FROM multi_rows;")));
     const std::string mixed = ReadUntilReady(client);
     EXPECT_NE(mixed.find("INSERT 0 1"), std::string::npos);
     EXPECT_NE(mixed.find("SELECT 1"), std::string::npos);
     EXPECT_NE(mixed.find('Z'), std::string::npos);
 
     // Act -- an all-read-only multi-statement message uses a read worker
-    ASSERT_TRUE(SendAll(client, QueryMessage(
-                                    "SELECT id FROM multi_rows; "
-                                    "SELECT id FROM multi_rows;")));
+    ASSERT_TRUE(SendAll(client, QueryMessage("SELECT id FROM multi_rows; "
+                                             "SELECT id FROM multi_rows;")));
     const std::string read_only = ReadUntilReady(client);
     EXPECT_NE(read_only.find("SELECT 1"), std::string::npos);
     EXPECT_NE(read_only.find('Z'), std::string::npos);
 
     // Act -- a multi-statement message with a failing statement stops the
     // remaining statements from executing
-    ASSERT_TRUE(SendAll(client, QueryMessage(
-                                    "INSERT INTO missing_table VALUES (1); "
-                                    "INSERT INTO multi_rows VALUES (2);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("INSERT INTO missing_table VALUES (1); "
+                                     "INSERT INTO multi_rows VALUES (2);")));
     const std::string failed = ReadUntilReady(client);
     EXPECT_NE(failed.find('E'), std::string::npos);
     EXPECT_EQ(failed.find("INSERT 0 1"), std::string::npos);
@@ -1211,15 +1233,15 @@ TEST(PostgresServerTest, MultiStatementImplicitTransactionIsAtomic) {
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE atomic_rows (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE atomic_rows (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
 
     // Act -- the first INSERT succeeds and reports its tag, then the second
     // statement fails; the whole implicit transaction must roll back.
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("INSERT INTO atomic_rows VALUES (1); "
-                             "INSERT INTO missing_table VALUES (2);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("INSERT INTO atomic_rows VALUES (1); "
+                                     "INSERT INTO missing_table VALUES (2);")));
     const std::string failed = ReadUntilReady(client);
     EXPECT_NE(failed.find("ERROR"), std::string::npos);
 
@@ -1230,13 +1252,13 @@ TEST(PostgresServerTest, MultiStatementImplicitTransactionIsAtomic) {
     EXPECT_EQ(selected.find('D'), std::string::npos);
 
     // Act -- a fully successful multi-statement message commits everything.
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("INSERT INTO atomic_rows VALUES (10); "
-                             "INSERT INTO atomic_rows VALUES (20);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("INSERT INTO atomic_rows VALUES (10); "
+                                     "INSERT INTO atomic_rows VALUES (20);")));
     const std::string committed = ReadUntilReady(client);
     EXPECT_EQ(committed.find("ERROR"), std::string::npos);
-    ASSERT_TRUE(SendAll(client,
-                        QueryMessage("SELECT COUNT(*) FROM atomic_rows;")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("SELECT COUNT(*) FROM atomic_rows;")));
     const std::string counted = ReadUntilReady(client);
     EXPECT_NE(counted.find("SELECT 1"), std::string::npos);
     EXPECT_NE(counted.find('2'), std::string::npos);
@@ -1273,8 +1295,9 @@ TEST(PostgresServerTest, ReadCompletionAfterClientCloseIsIgnored) {
     for (int64_t batch = 0; batch < 3; ++batch) {
       std::string insert = "INSERT INTO stale_rows VALUES ";
       for (int64_t offset = 0; offset < 10000; ++offset) {
-        if (offset != 0) { insert += ',';
-}
+        if (offset != 0) {
+          insert += ',';
+        }
         const int64_t value = (batch * 10000) + offset + 1;
         insert += "(" + std::to_string(value) + ")";
       }
@@ -1299,8 +1322,7 @@ TEST(PostgresServerTest, ReadCompletionAfterClientCloseIsIgnored) {
     ASSERT_TRUE(SendAll(client_b, QueryMessage("SELECT * FROM stale_rows;")));
     close(client_b);
 
-    EXPECT_NE(ReadUntilReady(client_a).find("SELECT 30000"),
-              std::string::npos);
+    EXPECT_NE(ReadUntilReady(client_a).find("SELECT 30000"), std::string::npos);
     close(client_a);
 
     server.RequestStop();
@@ -1328,8 +1350,9 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
     // reply in one pass and must keep output pending.
     auto ConnectSmallWindow = [&]() {
       const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-      if (client < 0) { return -1;
-}
+      if (client < 0) {
+        return -1;
+      }
       const int receive_buffer = 4096;
       setsockopt(client, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
                  sizeof(receive_buffer));
@@ -1355,8 +1378,9 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
     for (int64_t batch = 0; batch < 5; ++batch) {
       std::string insert = "INSERT INTO queue_rows VALUES ";
       for (int64_t offset = 0; offset < 10000; ++offset) {
-        if (offset != 0) { insert += ',';
-}
+        if (offset != 0) {
+          insert += ',';
+        }
         const int64_t value = (batch * 10000) + offset + 1;
         insert += "(" + std::to_string(value) + ")";
       }
@@ -1380,10 +1404,11 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
     // Wait until the server has begun writing the large reply: the client's
     // tiny receive window then stalls the write part-way through the response.
     {
-      struct pollfd ready{.fd=client, .events=POLLIN, .revents=0};
+      struct pollfd ready{.fd = client, .events = POLLIN, .revents = 0};
       for (int attempt = 0; attempt < 100; ++attempt) {
-        if (poll(&ready, 1, 100) > 0 && (ready.revents & POLLIN) != 0) { break;
-}
+        if (poll(&ready, 1, 100) > 0 && (ready.revents & POLLIN) != 0) {
+          break;
+        }
       }
     }
     ASSERT_TRUE(
@@ -1392,13 +1417,15 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
     auto ReadUntil = [](int fd, const std::string& needle) {
       std::string result;
       while (result.find(needle) == std::string::npos) {
-        pollfd descriptor{.fd=fd, .events=POLLIN, .revents=0};
-        if (poll(&descriptor, 1, 5000) <= 0) { break;
-}
+        pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
+        if (poll(&descriptor, 1, 5000) <= 0) {
+          break;
+        }
         std::array<char, 4096> buffer{};
         const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
-        if (received <= 0) { break;
-}
+        if (received <= 0) {
+          break;
+        }
         result.append(buffer.data(), static_cast<size_t>(received));
       }
       return result;
@@ -1433,8 +1460,8 @@ TEST(PostgresServerTest, DropAndRecreateTableOverTcp) {
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE cycle_rows (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE cycle_rows (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
     ASSERT_TRUE(
         SendAll(client, QueryMessage("INSERT INTO cycle_rows VALUES (1);")));
@@ -1448,14 +1475,15 @@ TEST(PostgresServerTest, DropAndRecreateTableOverTcp) {
     ASSERT_TRUE(SendAll(client, QueryMessage("SELECT * FROM cycle_rows;")));
     EXPECT_NE(ReadUntilReady(client).find('E'), std::string::npos);
 
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE cycle_rows (id INT64, body "
-                             "STRING(16));")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE cycle_rows (id INT64, body "
+                                     "STRING(16));")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
     ASSERT_TRUE(SendAll(
         client, QueryMessage("INSERT INTO cycle_rows VALUES (2, 'two');")));
     EXPECT_NE(ReadUntilReady(client).find("INSERT 0 1"), std::string::npos);
-    ASSERT_TRUE(SendAll(client, QueryMessage("SELECT id, body FROM cycle_rows;")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("SELECT id, body FROM cycle_rows;")));
     const std::string selected = ReadUntilReady(client);
     EXPECT_NE(selected.find("SELECT 1"), std::string::npos);
     EXPECT_NE(selected.find("two"), std::string::npos);
@@ -1486,8 +1514,8 @@ TEST(PostgresServerTest, ConcurrentWriteTransactionsOverTcp) {
 
     const int setup = ConnectClient(server.BoundPort());
     ASSERT_GE(setup, 0);
-    ASSERT_TRUE(SendAll(
-        setup, QueryMessage("CREATE TABLE conc_writes (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(setup, QueryMessage("CREATE TABLE conc_writes (id INT64);")));
     ASSERT_FALSE(ReadUntilReady(setup).empty());
     close(setup);
 
@@ -1548,16 +1576,16 @@ TEST(PostgresServerTest, ReadWorkerRejectsDataModifyingWith) {
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE with_rows (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE with_rows (id INT64);")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
     ASSERT_TRUE(
         SendAll(client, QueryMessage("INSERT INTO with_rows VALUES (1);")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
 
     // Act -- a read-only WITH query runs through a read worker.
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("WITH x AS (SELECT 1) SELECT * FROM x;")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("WITH x AS (SELECT 1) SELECT * FROM x;")));
     const std::string with_select = ReadUntilReady(client);
     EXPECT_NE(with_select.find('T'), std::string::npos);
     EXPECT_NE(with_select.find('D'), std::string::npos);
@@ -1579,7 +1607,8 @@ TEST(PostgresServerTest, ReadWorkerRejectsDataModifyingWith) {
     EXPECT_NE(response.find('Z'), std::string::npos);
 
     // Assert -- the rejected statement did not delete the row.
-    ASSERT_TRUE(SendAll(client, QueryMessage("SELECT COUNT(*) FROM with_rows;")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("SELECT COUNT(*) FROM with_rows;")));
     const std::string counted = ReadUntilReady(client);
     EXPECT_NE(counted.find("SELECT 1"), std::string::npos);
 
@@ -1609,22 +1638,24 @@ TEST(PostgresServerTest, SelectConstantExpressionNoTable) {
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
 
-    // Act -- a constant expression with no FROM clause is routed to a read
-    // worker, which reports that no table was specified (42601).
+    // Act -- a constant expression with no FROM clause executes through the
+    // one-row DummyScan path and returns its value without touching a table.
     ASSERT_TRUE(SendAll(client, QueryMessage("SELECT 1 + 1;")));
     const std::string summed = ReadUntilReady(client);
-    EXPECT_NE(summed.find('E'), std::string::npos);
-    EXPECT_NE(summed.find("No table specified"), std::string::npos);
-    EXPECT_NE(summed.find('Z'), std::string::npos);
+    ASSERT_FALSE(summed.empty());
+    EXPECT_EQ(summed.find("SERROR"), std::string::npos) << summed;
+    EXPECT_NE(summed.find('D'), std::string::npos) << summed;
+    EXPECT_NE(summed.find("SELECT 1"), std::string::npos) << summed;
 
     ASSERT_TRUE(SendAll(client, QueryMessage("SELECT NULL;")));
     const std::string nulled = ReadUntilReady(client);
-    EXPECT_NE(nulled.find('E'), std::string::npos);
-    EXPECT_NE(nulled.find("No table specified"), std::string::npos);
+    ASSERT_FALSE(nulled.empty());
+    EXPECT_EQ(nulled.find("SERROR"), std::string::npos) << nulled;
+    EXPECT_NE(nulled.find('D'), std::string::npos) << nulled;
 
-    // Assert -- the session is still usable after the rejected expression.
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE const_rows (id INT64);")));
+    // Assert -- the session stays usable after the constant queries.
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE const_rows (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
 
     ASSERT_TRUE(SendAll(client, std::string("X\0\0\0\4", 5)));
@@ -1653,16 +1684,15 @@ TEST(PostgresServerTest, ExtendedQueryMessagesRejectedKeepSessionAlive) {
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
 
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE ext_rows (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE ext_rows (id INT64);")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
 
     // Act -- the extended query protocol is not implemented: Parse, Bind, and
     // Execute messages are each rejected with an error plus ReadyForQuery.
-    const std::string parse = std::string("P\0\0\0\21", 5) +
-                              std::string("\0", 1) +
-                              std::string("SELECT 1;\0", 10) +
-                              std::string("\0\0", 2);
+    const std::string parse =
+        std::string("P\0\0\0\21", 5) + std::string("\0", 1) +
+        std::string("SELECT 1;\0", 10) + std::string("\0\0", 2);
     ASSERT_TRUE(SendAll(client, parse));
     const std::string parsed = ReadUntilReady(client);
     EXPECT_NE(parsed.find('E'), std::string::npos);
@@ -1715,8 +1745,9 @@ TEST(PostgresServerTest, DisconnectDuringLargeResponse) {
     for (int64_t batch = 0; batch < 2; ++batch) {
       std::string insert = "INSERT INTO disconnect_rows VALUES ";
       for (int64_t offset = 0; offset < 10000; ++offset) {
-        if (offset != 0) { insert += ',';
-}
+        if (offset != 0) {
+          insert += ',';
+        }
         insert += "(" + std::to_string((batch * 10000) + offset + 1) + ")";
       }
       insert += ';';
@@ -1752,10 +1783,11 @@ TEST(PostgresServerTest, DisconnectDuringLargeResponse) {
     // Wait until the server has begun streaming the large reply, then
     // disconnect mid-write so the server's next send() must fail.
     {
-      struct pollfd ready{.fd=client, .events=POLLIN, .revents=0};
+      struct pollfd ready{.fd = client, .events = POLLIN, .revents = 0};
       for (int attempt = 0; attempt < 100; ++attempt) {
-        if (poll(&ready, 1, 100) > 0 && (ready.revents & POLLIN) != 0) { break;
-}
+        if (poll(&ready, 1, 100) > 0 && (ready.revents & POLLIN) != 0) {
+          break;
+        }
       }
     }
     close(client);
@@ -1787,7 +1819,7 @@ TEST(PostgresServerTest, ClientResetForcesRecvError) {
     // with ECONNRESET and must drop the client without taking the server down.
     const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     ASSERT_GE(client, 0);
-    linger reset{.l_onoff=1, .l_linger=0};
+    linger reset{.l_onoff = 1, .l_linger = 0};
     setsockopt(client, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -1802,8 +1834,8 @@ TEST(PostgresServerTest, ClientResetForcesRecvError) {
     // A healthy second client still completes a normal startup.
     const int healthy = ConnectClient(server.BoundPort());
     ASSERT_GE(healthy, 0);
-    ASSERT_TRUE(SendAll(
-        healthy, QueryMessage("CREATE TABLE reset_ok (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(healthy, QueryMessage("CREATE TABLE reset_ok (id INT64);")));
     EXPECT_NE(ReadUntilReady(healthy).find("CREATE TABLE"), std::string::npos);
     ASSERT_TRUE(SendAll(healthy, std::string("X\0\0\0\4", 5)));
     close(healthy);
@@ -1902,7 +1934,8 @@ TEST(PostgresServerTest, GssEncRequestDeclinedThenNormalStartup) {
     pgwire::AppendUint32(&gss_request, pgwire::kGssEncRequestCode);
     ASSERT_TRUE(SendAll(client, gss_request));
     std::array<char, 4> gss_reply{};
-    const ssize_t received = recv(client, gss_reply.data(), gss_reply.size(), 0);
+    const ssize_t received =
+        recv(client, gss_reply.data(), gss_reply.size(), 0);
     ASSERT_EQ(received, 1);
     EXPECT_EQ(gss_reply[0], 'N');
     ASSERT_TRUE(SendAll(client, StartupMessage()));
@@ -1937,11 +1970,11 @@ TEST(PostgresServerTest, MultiStatementDdlInsertSelectOverTcp) {
 
     // Act -- a single message carrying CREATE + INSERT + SELECT runs every
     // statement in order through the synchronous executor.
-    ASSERT_TRUE(SendAll(client, QueryMessage(
-                                    "CREATE TABLE multi_flow (id INT64); "
-                                    "INSERT INTO multi_flow VALUES (1); "
-                                    "INSERT INTO multi_flow VALUES (2); "
-                                    "SELECT id FROM multi_flow ORDER BY id;")));
+    ASSERT_TRUE(SendAll(
+        client, QueryMessage("CREATE TABLE multi_flow (id INT64); "
+                             "INSERT INTO multi_flow VALUES (1); "
+                             "INSERT INTO multi_flow VALUES (2); "
+                             "SELECT id FROM multi_flow ORDER BY id;")));
     const std::string response = ReadUntilReady(client);
     EXPECT_NE(response.find("CREATE TABLE"), std::string::npos);
     EXPECT_NE(response.find("INSERT 0 1"), std::string::npos);
@@ -1950,8 +1983,8 @@ TEST(PostgresServerTest, MultiStatementDdlInsertSelectOverTcp) {
     EXPECT_NE(response.find('Z'), std::string::npos);
 
     // Assert -- the table created by the batch is visible to later messages.
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("INSERT INTO multi_flow VALUES (3);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("INSERT INTO multi_flow VALUES (3);")));
     EXPECT_NE(ReadUntilReady(client).find("INSERT 0 1"), std::string::npos);
 
     ASSERT_TRUE(SendAll(client, std::string("X\0\0\0\4", 5)));
@@ -1980,8 +2013,8 @@ TEST(PostgresServerTest, RollbackAfterStatementErrorClearsAbortedState) {
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
 
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE rb_abort (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE rb_abort (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
 
     ASSERT_TRUE(SendAll(client, QueryMessage("BEGIN;")));
@@ -2042,8 +2075,9 @@ TEST(PostgresServerTest, ReadWorkerCompletionForDisconnectedClientIsDropped) {
     for (int64_t batch = 0; batch < 4; ++batch) {
       std::string insert = "INSERT INTO stale_rows2 VALUES ";
       for (int64_t offset = 0; offset < 10000; ++offset) {
-        if (offset != 0) { insert += ',';
-}
+        if (offset != 0) {
+          insert += ',';
+        }
         const int64_t value = (batch * 10000) + offset + 1;
         insert += "(" + std::to_string(value) + ")";
       }
@@ -2069,8 +2103,7 @@ TEST(PostgresServerTest, ReadWorkerCompletionForDisconnectedClientIsDropped) {
     ASSERT_TRUE(SendAll(client_b, std::string("X\0\0\0\4", 5)));
     close(client_b);
 
-    EXPECT_NE(ReadUntilReady(client_a).find("SELECT 40000"),
-              std::string::npos);
+    EXPECT_NE(ReadUntilReady(client_a).find("SELECT 40000"), std::string::npos);
     close(client_a);
 
     server.RequestStop();
@@ -2097,8 +2130,8 @@ TEST(PostgresServerTest, DropTableInsideExplicitTransactionCommits) {
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
 
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE drop_txn (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE drop_txn (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
     ASSERT_TRUE(
         SendAll(client, QueryMessage("INSERT INTO drop_txn VALUES (1);")));
@@ -2141,13 +2174,12 @@ TEST(PostgresServerTest, RuntimeErrorInSynchronousTransaction) {
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
-    ASSERT_TRUE(SendAll(client,
-                        QueryMessage("CREATE TABLE runtime_sync (id INT64, "
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE runtime_sync (id INT64, "
                                      "body STRING(16));")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
-    ASSERT_TRUE(SendAll(client,
-                        QueryMessage("INSERT INTO runtime_sync VALUES "
-                                     "(1, 'abc');")));
+    ASSERT_TRUE(SendAll(client, QueryMessage("INSERT INTO runtime_sync VALUES "
+                                             "(1, 'abc');")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
 
     // Act -- a type error that is only detectable at execution time (adding
@@ -2155,8 +2187,8 @@ TEST(PostgresServerTest, RuntimeErrorInSynchronousTransaction) {
     // travel through the synchronous executor and abort the transaction.
     ASSERT_TRUE(SendAll(client, QueryMessage("BEGIN;")));
     ASSERT_NE(ReadUntilReady(client).find("BEGIN"), std::string::npos);
-    ASSERT_TRUE(SendAll(client,
-                        QueryMessage("SELECT id + body FROM runtime_sync;")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("SELECT id + body FROM runtime_sync;")));
     const std::string failed = ReadUntilReady(client);
     EXPECT_NE(failed.find('E'), std::string::npos);
     EXPECT_NE(failed.find("type mismatch"), std::string::npos);
@@ -2197,13 +2229,12 @@ TEST(PostgresServerTest, RuntimeErrorInReadWorker) {
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
-    ASSERT_TRUE(SendAll(client,
-                        QueryMessage("CREATE TABLE runtime_rw (id INT64, body "
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE runtime_rw (id INT64, body "
                                      "STRING(16));")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
-    ASSERT_TRUE(SendAll(client,
-                        QueryMessage("INSERT INTO runtime_rw VALUES "
-                                     "(1, 'abc');")));
+    ASSERT_TRUE(SendAll(client, QueryMessage("INSERT INTO runtime_rw VALUES "
+                                             "(1, 'abc');")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
 
     // Act -- the same type error in a read-only statement is routed to a read
@@ -2216,8 +2247,7 @@ TEST(PostgresServerTest, RuntimeErrorInReadWorker) {
     EXPECT_NE(failed.find('Z'), std::string::npos);
 
     // Assert -- the session remains usable afterwards.
-    ASSERT_TRUE(
-        SendAll(client, QueryMessage("SELECT id FROM runtime_rw;")));
+    ASSERT_TRUE(SendAll(client, QueryMessage("SELECT id FROM runtime_rw;")));
     const std::string recovered = ReadUntilReady(client);
     EXPECT_NE(recovered.find("SELECT 1"), std::string::npos);
 
@@ -2247,23 +2277,22 @@ TEST(PostgresServerTest, MultiStatementReadWorkerRuntimeErrorStopsBatch) {
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
-    ASSERT_TRUE(SendAll(client,
-                        QueryMessage("CREATE TABLE runtime_multi (id INT64, "
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE runtime_multi (id INT64, "
                                      "body STRING(16));")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
-    ASSERT_TRUE(SendAll(client,
-                        QueryMessage("INSERT INTO runtime_multi VALUES "
-                                     "(1, 'abc');")));
+    ASSERT_TRUE(SendAll(client, QueryMessage("INSERT INTO runtime_multi VALUES "
+                                             "(1, 'abc');")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
 
     // Act -- a single message with two read-only statements sharing one
     // read-only snapshot (§7.3): the first streams its rows, then the second
     // throws at execution time. The worker aborts the shared snapshot,
     // stops at the failing statement, and still answers ReadyForQuery.
-    ASSERT_TRUE(SendAll(client, QueryMessage(
-                                    "SELECT id FROM runtime_multi; "
-                                    "SELECT id + body FROM runtime_multi; "
-                                    "SELECT id FROM runtime_multi;")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("SELECT id FROM runtime_multi; "
+                                     "SELECT id + body FROM runtime_multi; "
+                                     "SELECT id FROM runtime_multi;")));
     const std::string response = ReadUntilReady(client);
     EXPECT_NE(response.find('D'), std::string::npos);
     EXPECT_NE(response.find("SELECT 1"), std::string::npos);
@@ -2271,12 +2300,10 @@ TEST(PostgresServerTest, MultiStatementReadWorkerRuntimeErrorStopsBatch) {
     EXPECT_NE(response.find("type mismatch"), std::string::npos);
     EXPECT_NE(response.find('Z'), std::string::npos);
     // The failing third statement must never execute: exactly two DataRows.
-    EXPECT_EQ(response.find("SELECT 1", response.find('E')),
-              std::string::npos);
+    EXPECT_EQ(response.find("SELECT 1", response.find('E')), std::string::npos);
 
     // Assert -- the session is still usable.
-    ASSERT_TRUE(
-        SendAll(client, QueryMessage("SELECT id FROM runtime_multi;")));
+    ASSERT_TRUE(SendAll(client, QueryMessage("SELECT id FROM runtime_multi;")));
     EXPECT_NE(ReadUntilReady(client).find("SELECT 1"), std::string::npos);
 
     ASSERT_TRUE(SendAll(client, std::string("X\0\0\0\4", 5)));
@@ -2311,8 +2338,9 @@ TEST(PostgresServerTest, StaleReadCompletionDroppedAfterFdReuse) {
     for (int64_t batch = 0; batch < 4; ++batch) {
       std::string insert = "INSERT INTO stale_fd VALUES ";
       for (int64_t offset = 0; offset < 10000; ++offset) {
-        if (offset != 0) { insert += ',';
-}
+        if (offset != 0) {
+          insert += ',';
+        }
         insert += "(" + std::to_string((batch * 10000) + offset + 1) + ")";
       }
       insert += ';';
@@ -2329,9 +2357,9 @@ TEST(PostgresServerTest, StaleReadCompletionDroppedAfterFdReuse) {
     // mismatch instead of being written to C.
     const int client_a = ConnectClient(server.BoundPort());
     ASSERT_GE(client_a, 0);
-    ASSERT_TRUE(SendAll(client_a,
-                        QueryMessage("SELECT * FROM stale_fd ORDER BY id "
-                                     "DESC;")));
+    ASSERT_TRUE(
+        SendAll(client_a, QueryMessage("SELECT * FROM stale_fd ORDER BY id "
+                                       "DESC;")));
     const int client_b = ConnectClient(server.BoundPort());
     ASSERT_GE(client_b, 0);
     ASSERT_TRUE(SendAll(client_b, QueryMessage("SELECT * FROM stale_fd;")));
@@ -2346,8 +2374,7 @@ TEST(PostgresServerTest, StaleReadCompletionDroppedAfterFdReuse) {
     const int client_c = ConnectClient(server.BoundPort());
     ASSERT_GE(client_c, 0);
 
-    EXPECT_NE(ReadUntilReady(client_a).find("SELECT 40000"),
-              std::string::npos);
+    EXPECT_NE(ReadUntilReady(client_a).find("SELECT 40000"), std::string::npos);
     ASSERT_TRUE(
         SendAll(client_c, QueryMessage("SELECT COUNT(*) FROM stale_fd;")));
     const std::string counted = ReadUntilReady(client_c);
@@ -2379,8 +2406,8 @@ TEST(PostgresServerTest, DropTableInsideAbortedTransaction) {
 
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
-    ASSERT_TRUE(SendAll(
-        client, QueryMessage("CREATE TABLE drop_abort (id INT64);")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("CREATE TABLE drop_abort (id INT64);")));
     EXPECT_NE(ReadUntilReady(client).find("CREATE TABLE"), std::string::npos);
     ASSERT_TRUE(
         SendAll(client, QueryMessage("INSERT INTO drop_abort VALUES (1);")));

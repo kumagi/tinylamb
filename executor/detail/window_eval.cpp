@@ -2,19 +2,22 @@
 #include "executor/detail/window_eval.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include "executor/detail/expression_eval.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/detail/expression_eval.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
@@ -33,8 +36,8 @@ namespace tinylamb {
 namespace relational_detail {
 namespace {
 
-using WindowNodeMap =
-    std::map<const WindowFunctionCallExpression*, size_t>;  // sorted: stable $win naming
+using WindowNodeMap = std::map<const WindowFunctionCallExpression*,
+                               size_t>;  // sorted: stable $win naming
 
 const WindowFunctionCallExpression* AsWindow(const Expression& expression) {
   if (expression && expression->Type() == TypeTag::kWindowFunctionExp) {
@@ -44,9 +47,13 @@ const WindowFunctionCallExpression* AsWindow(const Expression& expression) {
 }
 
 void CollectWindows(const Expression& expression, WindowNodeMap* found) {
-  if (!expression) { return; }
+  if (!expression) {
+    return;
+  }
   if (const auto* window = AsWindow(expression)) {
-    if (!found->contains(window)) { (*found)[window] = found->size(); }
+    if (!found->contains(window)) {
+      (*found)[window] = found->size();
+    }
     return;  // nested OVER calls are invalid SQL; do not descend
   }
   switch (expression->Type()) {
@@ -69,7 +76,9 @@ void CollectWindows(const Expression& expression, WindowNodeMap* found) {
     case TypeTag::kInExp: {
       const auto& value = expression->AsInExpression();
       CollectWindows(value.child_, found);
-      for (const Expression& item : value.list_) { CollectWindows(item, found); }
+      for (const Expression& item : value.list_) {
+        CollectWindows(item, found);
+      }
       break;
     }
     case TypeTag::kFunctionCallExp:
@@ -107,12 +116,16 @@ std::vector<Expression> RebuildAll(const std::vector<Expression>& items,
                                    const ReplacementMap& map) {
   std::vector<Expression> out;
   out.reserve(items.size());
-  for (const Expression& item : items) { out.push_back(Rebuild(item, map)); }
+  for (const Expression& item : items) {
+    out.push_back(Rebuild(item, map));
+  }
   return out;
 }
 
 Expression Rebuild(const Expression& expression, const ReplacementMap& map) {
-  if (!expression) { return expression; }
+  if (!expression) {
+    return expression;
+  }
   if (const auto* window = AsWindow(expression)) {
     const auto found = map.find(window);
     return found != map.end() ? found->second : expression;
@@ -171,9 +184,28 @@ std::vector<Expression> RebuildAll(const std::vector<Expression>& items,
 bool ValueLess(const Value& a, const Value& b, bool ascending,
                const std::optional<bool>& nulls_first = std::nullopt) {
   const bool nulls_first_value = nulls_first.value_or(ascending);
-  if (a.IsNull() && b.IsNull()) { return false; }
-  if (a.IsNull()) { return nulls_first_value; }
-  if (b.IsNull()) { return !nulls_first_value; }
+  if (a.IsNull() && b.IsNull()) {
+    return false;
+  }
+  if (a.IsNull()) {
+    return nulls_first_value;
+  }
+  if (b.IsNull()) {
+    return !nulls_first_value;
+  }
+  // GoogleSQL orders NaN above every other number (including +inf) and all
+  // NaNs as one peer group; raw double comparison cannot express that.
+  const bool a_nan =
+      a.type == ValueType::kDouble && std::isnan(a.value.double_value);
+  const bool b_nan =
+      b.type == ValueType::kDouble && std::isnan(b.value.double_value);
+  if (a_nan && b_nan) {
+    return false;
+  }
+  if (a_nan || b_nan) {
+    // NaN is the largest value regardless of direction.
+    return a_nan ? !ascending : ascending;
+  }
   try {
     return ascending ? a < b : b < a;
   } catch (...) {
@@ -182,7 +214,13 @@ bool ValueLess(const Value& a, const Value& b, bool ascending,
 }
 
 bool ValuesEqual(const Value& a, const Value& b) {
-  if (a.IsNull() || b.IsNull()) { return a.IsNull() && b.IsNull(); }
+  if (a.IsNull() || b.IsNull()) {
+    return a.IsNull() && b.IsNull();
+  }
+  if (a.type == ValueType::kDouble && b.type == ValueType::kDouble &&
+      std::isnan(a.value.double_value) && std::isnan(b.value.double_value)) {
+    return true;  // all NaNs are one peer group
+  }
   try {
     return a == b;
   } catch (...) {
@@ -191,8 +229,9 @@ bool ValuesEqual(const Value& a, const Value& b) {
 }
 
 double NumericOf(const Value& value) {
-  return value.type == ValueType::kDouble ? value.value.double_value
-                                         : static_cast<double>(value.value.int_value);
+  return value.type == ValueType::kDouble
+             ? value.value.double_value
+             : static_cast<double>(value.value.int_value);
 }
 
 std::string ElementSqlTypeOf(const Value& value) {
@@ -210,6 +249,20 @@ std::string ElementSqlTypeOf(const Value& value) {
   }
 }
 
+// Exact |a-b| comparison for INT64 keys where double conversion would lose
+// precision near 2^63.
+bool DistanceWithin(const Value& key, const Value& candidate, double off,
+                    bool inclusive_le) {
+  if (key.type == ValueType::kInt64 && candidate.type == ValueType::kInt64) {
+    const __int128 diff = static_cast<__int128>(key.value.int_value) -
+                          static_cast<__int128>(candidate.value.int_value);
+    const __int128 bound = static_cast<__int128>(off);
+    return inclusive_le ? diff <= bound : diff >= bound;
+  }
+  const double dk = NumericOf(key);
+  const double dc = NumericOf(candidate);
+  return inclusive_le ? dk - dc <= off + 1e-9 : dk - dc >= off - 1e-9;
+}
 struct WindowRuntime {
   TransactionContext& context;
   const Scope* outer{nullptr};
@@ -218,21 +271,98 @@ struct WindowRuntime {
 
   Value EvalAt(const Expression& expression, const std::vector<Row>& rows,
                size_t position) const {
-    Scope scope{.row=&rows[position], .schema=schema, .outer=outer};
+    Scope scope{.row = &rows[position], .schema = schema, .outer = outer};
     return Evaluate(expression, scope, nullptr, context, *ctes);
   }
 
   // Resolves [lo, hi] (inclusive) frame bounds within the ordered partition.
   std::pair<size_t, size_t> ResolveFrame(
-      const WindowFunctionCallExpression& window,
-      const std::vector<Row>& rows, const std::vector<size_t>& ordered,
+      const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
+      const std::vector<size_t>& ordered,
       const std::vector<std::vector<Value>>& order_values, size_t position,
       const std::vector<size_t>& peer_end) const {
     const size_t m = ordered.size();
     if (!window.has_frame) {
-      if (window.order_by.empty()) { return {0, m - 1}; }
+      if (window.order_by.empty()) {
+        return {0, m - 1};
+      }
       // Default frame: RANGE UNBOUNDED PRECEDING .. CURRENT ROW.
       return {0, peer_end[position]};
+    }
+    if (window.frame_unit == WindowFrameUnit::kRows) {
+      // Physical row offsets: CURRENT ROW excludes peers.
+      auto rows_offset = [&](const WindowFrameBound& bound) -> int64_t {
+        if (!bound.offset || bound.offset->Type() != TypeTag::kConstantValue ||
+            bound.offset->AsConstantValue().GetValue().type !=
+                ValueType::kInt64) {
+          throw std::runtime_error("ROWS offset must be a constant integer");
+        }
+        return bound.offset->AsConstantValue().GetValue().value.int_value;
+      };
+      auto rows_start =
+          [&](const WindowFrameBound& bound) -> std::optional<size_t> {
+        switch (bound.type) {
+          case WindowFrameBoundType::kUnboundedPreceding:
+            return 0;
+          case WindowFrameBoundType::kCurrentRow:
+            return position;
+          case WindowFrameBoundType::kOffsetPreceding: {
+            const int64_t off = rows_offset(bound);
+            // A start bound reaching past the partition start clamps to it;
+            // emptiness is decided by lo > hi afterwards.
+            if (off >= 0) {
+              return static_cast<int64_t>(position) - off >= 0
+                         ? std::optional<size_t>(position -
+                                                 static_cast<size_t>(off))
+                         : std::optional<size_t>(size_t{0});
+            }
+            return std::min(position + static_cast<size_t>(-off), m - 1);
+          }
+          case WindowFrameBoundType::kOffsetFollowing: {
+            const int64_t off = rows_offset(bound);
+            // A start bound past the partition end leaves an empty frame.
+            if (position + static_cast<size_t>(off) > m - 1) {
+              return std::nullopt;
+            }
+            return position + static_cast<size_t>(off);
+          }
+          case WindowFrameBoundType::kUnboundedFollowing:
+            return m - 1;
+        }
+        return std::nullopt;
+      };
+      auto rows_end =
+          [&](const WindowFrameBound& bound) -> std::optional<size_t> {
+        switch (bound.type) {
+          case WindowFrameBoundType::kUnboundedFollowing:
+            return m - 1;
+          case WindowFrameBoundType::kCurrentRow:
+            return position;
+          case WindowFrameBoundType::kOffsetFollowing: {
+            const int64_t off = rows_offset(bound);
+            return position + static_cast<size_t>(off) <= m - 1
+                       ? std::optional<size_t>(position +
+                                               static_cast<size_t>(off))
+                       : std::optional<size_t>(m - 1);
+          }
+          case WindowFrameBoundType::kOffsetPreceding: {
+            const int64_t off = rows_offset(bound);
+            return static_cast<int64_t>(position) - off >= 0
+                       ? std::optional<size_t>(position -
+                                               static_cast<size_t>(off))
+                       : std::nullopt;
+          }
+          case WindowFrameBoundType::kUnboundedPreceding:
+            return std::nullopt;
+        }
+        return std::nullopt;
+      };
+      const auto lo = rows_start(window.frame_start);
+      const auto hi = rows_end(window.frame_end);
+      if (!lo.has_value() || !hi.has_value() || *lo > *hi) {
+        return {1, 0};  // empty frame
+      }
+      return {*lo, *hi};
     }
     if (window.frame_unit == WindowFrameUnit::kGroups) {
       if (window.order_by.empty()) {
@@ -247,14 +377,19 @@ struct WindowRuntime {
         i = end + 1;
       }
       size_t current_group = 0;
-      while (group_end[current_group] < position) { ++current_group; }
+      while (group_end[current_group] < position) {
+        ++current_group;
+      }
       const size_t group_count = group_start.size();
       auto offset_of = [](const WindowFrameBound& bound) -> size_t {
         if (!bound.offset || bound.offset->Type() != TypeTag::kConstantValue) {
           throw std::runtime_error("GROUPS offset requires a constant value");
         }
-        const double value = NumericOf(bound.offset->AsConstantValue().GetValue());
-        if (value < 0) { throw std::runtime_error("GROUPS offset is negative"); }
+        const double value =
+            NumericOf(bound.offset->AsConstantValue().GetValue());
+        if (value < 0) {
+          throw std::runtime_error("GROUPS offset is negative");
+        }
         return static_cast<size_t>(value);
       };
       auto group_for_preceding = [&](size_t offset) {
@@ -265,25 +400,31 @@ struct WindowRuntime {
       };
       auto groups_start = [&](const WindowFrameBound& bound) {
         switch (bound.type) {
-          case WindowFrameBoundType::kUnboundedPreceding: return size_t{0};
+          case WindowFrameBoundType::kUnboundedPreceding:
+            return size_t{0};
           case WindowFrameBoundType::kOffsetPreceding:
             return group_start[group_for_preceding(offset_of(bound))];
-          case WindowFrameBoundType::kCurrentRow: return group_start[current_group];
+          case WindowFrameBoundType::kCurrentRow:
+            return group_start[current_group];
           case WindowFrameBoundType::kOffsetFollowing:
             return group_start[group_for_following(offset_of(bound))];
-          case WindowFrameBoundType::kUnboundedFollowing: return m - 1;
+          case WindowFrameBoundType::kUnboundedFollowing:
+            return m - 1;
         }
         return size_t{0};
       };
       auto groups_end = [&](const WindowFrameBound& bound) {
         switch (bound.type) {
-          case WindowFrameBoundType::kUnboundedPreceding: return size_t{0};
+          case WindowFrameBoundType::kUnboundedPreceding:
+            return size_t{0};
           case WindowFrameBoundType::kOffsetPreceding:
             return group_end[group_for_preceding(offset_of(bound))];
-          case WindowFrameBoundType::kCurrentRow: return group_end[current_group];
+          case WindowFrameBoundType::kCurrentRow:
+            return group_end[current_group];
           case WindowFrameBoundType::kOffsetFollowing:
             return group_end[group_for_following(offset_of(bound))];
-          case WindowFrameBoundType::kUnboundedFollowing: return m - 1;
+          case WindowFrameBoundType::kUnboundedFollowing:
+            return m - 1;
         }
         return size_t{0};
       };
@@ -292,7 +433,8 @@ struct WindowRuntime {
       return lo > hi ? std::pair<size_t, size_t>{1, 0}
                      : std::pair<size_t, size_t>{lo, hi};
     }
-    auto start_of = [&](const WindowFrameBound& bound) -> std::optional<size_t> {
+    auto start_of =
+        [&](const WindowFrameBound& bound) -> std::optional<size_t> {
       switch (bound.type) {
         case WindowFrameBoundType::kUnboundedPreceding:
           return 0;
@@ -306,13 +448,17 @@ struct WindowRuntime {
           const double off =
               NumericOf(bound.offset->AsConstantValue().GetValue());
           const Value& key = order_values[position][0];
-          if (key.IsNull()) { return position; }
+          if (key.IsNull()) {
+            return position;
+          }
           for (size_t j = 0; j <= position; ++j) {
             const Value& candidate = order_values[j][0];
-            if (candidate.IsNull()) { continue; }
-            const double distance =
-                NumericOf(key) - NumericOf(candidate);
-            if (distance <= off + 1e-9) { return j; }
+            if (candidate.IsNull()) {
+              continue;
+            }
+            if (DistanceWithin(key, candidate, off, true)) {
+              return j;
+            }
           }
           return position;
         }
@@ -336,14 +482,18 @@ struct WindowRuntime {
           const double off =
               NumericOf(bound.offset->AsConstantValue().GetValue());
           const Value& key = order_values[position][0];
-          if (key.IsNull()) { return peer_end[position]; }
+          if (key.IsNull()) {
+            return peer_end[position];
+          }
           std::optional<size_t> reached;
           for (size_t j = 0; j < m; ++j) {
             const Value& candidate = order_values[j][0];
-            if (candidate.IsNull()) { continue; }
-            const double distance =
-                NumericOf(candidate) - NumericOf(key);
-            if (distance <= off + 1e-9) { reached = j; }
+            if (candidate.IsNull()) {
+              continue;
+            }
+            if (DistanceWithin(candidate, key, off, true)) {
+              reached = j;
+            }
           }
           return reached.value_or(peer_end[position]);
         }
@@ -357,16 +507,33 @@ struct WindowRuntime {
           const double off =
               NumericOf(bound.offset->AsConstantValue().GetValue());
           const Value& key = order_values[position][0];
-          if (key.IsNull()) { return peer_end[position]; }
+          if (key.IsNull()) {
+            return peer_end[position];
+          }
+          // End bound "off PRECEDING": candidates <= key - off, computed
+          // exactly (key - off may underflow int64).  NULL keys sort lowest
+          // and stay inside an unbounded-start frame.
           std::optional<size_t> reached;
+          const bool key_int = key.type == ValueType::kInt64;
+          const __int128 bound =
+              key_int ? static_cast<__int128>(key.value.int_value) -
+                            static_cast<__int128>(off)
+                      : static_cast<__int128>(NumericOf(key) - off);
           for (size_t j = 0; j <= position; ++j) {
             const Value& candidate = order_values[j][0];
-            if (candidate.IsNull()) { continue; }
-            if (NumericOf(key) - NumericOf(candidate) >= off - 1e-9) {
+            if (candidate.IsNull()) {
+              reached = j;
+              continue;
+            }
+            const __int128 cand =
+                candidate.type == ValueType::kInt64
+                    ? static_cast<__int128>(candidate.value.int_value)
+                    : static_cast<__int128>(NumericOf(candidate));
+            if (cand <= bound) {
               reached = j;
             }
           }
-          return reached.value_or(peer_end[position]);
+          return reached;
         }
       }
       return peer_end[position];
@@ -387,16 +554,19 @@ struct WindowRuntime {
                            size_t current, size_t lo, size_t hi) const {
     const std::string& fn = window.function;
     if (hi < lo || ordered.empty() || hi >= ordered.size()) {
-      if (fn == "COUNT") { return Value(static_cast<int64_t>(0)); }
+      if (fn == "COUNT") {
+        return Value(static_cast<int64_t>(0));
+      }
       return Value();
     }
     // The window expression carries an optional row-level WHERE filter.
     const Expression& where_filter = window.where_filter;
 
     int64_t row_count = 0;
-    bool count_star = fn == "COUNT" && window.args.size() == 1 &&
-                      window.args[0]->Type() == TypeTag::kColumnValue &&
-                      window.args[0]->AsColumnValue().GetColumnName().name == "*";
+    bool count_star =
+        fn == "COUNT" && window.args.size() == 1 &&
+        window.args[0]->Type() == TypeTag::kColumnValue &&
+        window.args[0]->AsColumnValue().GetColumnName().name == "*";
     std::vector<Value> values;
     Value delimiter;
     for (size_t p = lo; p <= hi; ++p) {
@@ -414,8 +584,8 @@ struct WindowRuntime {
             excluded = order_values[p].size() == order_values[current].size();
             for (size_t t = 0; excluded && t < order_values[current].size();
                  ++t) {
-              excluded = ValuesEqual(order_values[p][t],
-                                    order_values[current][t]);
+              excluded =
+                  ValuesEqual(order_values[p][t], order_values[current][t]);
             }
           }
           break;
@@ -430,8 +600,8 @@ struct WindowRuntime {
                        order_values[p].size() == order_values[current].size();
             for (size_t t = 0; excluded && t < order_values[current].size();
                  ++t) {
-              excluded = ValuesEqual(order_values[p][t],
-                                    order_values[current][t]);
+              excluded =
+                  ValuesEqual(order_values[p][t], order_values[current][t]);
             }
           }
           break;
@@ -439,9 +609,11 @@ struct WindowRuntime {
         case WindowFrameExclusion::kNone:
           break;
       }
-      if (excluded) { continue; }
+      if (excluded) {
+        continue;
+      }
       const Row& row = rows[ordered[p]];
-      Scope scope{.row=&row, .schema=schema, .outer=outer};
+      Scope scope{.row = &row, .schema = schema, .outer = outer};
       // AGG(x WHERE cond) OVER (...): skip rows failing the filter.
       if (window.where_filter) {
         Value keep;
@@ -450,12 +622,17 @@ struct WindowRuntime {
         } catch (...) {
           keep = Value();
         }
-        if (!Truthy(keep)) { continue; }
+        if (!Truthy(keep)) {
+          continue;
+        }
       }
       ++row_count;
-      if (count_star) { continue; }
+      if (count_star) {
+        continue;
+      }
       if (!window.args.empty()) {
-        values.push_back(Evaluate(window.args[0], scope, nullptr, context, *ctes));
+        values.push_back(
+            Evaluate(window.args[0], scope, nullptr, context, *ctes));
       }
       if (fn == "STRING_AGG" && window.args.size() > 1) {
         delimiter = Evaluate(window.args[1], scope, nullptr, context, *ctes);
@@ -467,9 +644,14 @@ struct WindowRuntime {
       for (Value& candidate : values) {
         bool duplicate = false;
         for (const Value& kept : unique) {
-          if (ValuesEqual(candidate, kept)) { duplicate = true; break; }
+          if (ValuesEqual(candidate, kept)) {
+            duplicate = true;
+            break;
+          }
         }
-        if (!duplicate) { unique.push_back(std::move(candidate)); }
+        if (!duplicate) {
+          unique.push_back(std::move(candidate));
+        }
       }
       values = std::move(unique);
     }
@@ -477,20 +659,28 @@ struct WindowRuntime {
     std::vector<Value> non_null;
     non_null.reserve(values.size());
     for (Value& value : values) {
-      if (!value.IsNull()) { non_null.push_back(std::move(value)); }
+      if (!value.IsNull()) {
+        non_null.push_back(std::move(value));
+      }
     }
 
     if (fn == "COUNT") {
-      return Value(count_star ? row_count : static_cast<int64_t>(non_null.size()));
+      return Value(count_star ? row_count
+                              : static_cast<int64_t>(non_null.size()));
     }
     if (fn == "APPROX_COUNT_DISTINCT") {
       std::vector<Value> unique;
       for (const Value& candidate : non_null) {
         bool duplicate = false;
         for (const Value& kept : unique) {
-          if (ValuesEqual(candidate, kept)) { duplicate = true; break; }
+          if (ValuesEqual(candidate, kept)) {
+            duplicate = true;
+            break;
+          }
         }
-        if (!duplicate) { unique.push_back(candidate); }
+        if (!duplicate) {
+          unique.push_back(candidate);
+        }
       }
       return Value(static_cast<int64_t>(unique.size()));
     }
@@ -499,7 +689,9 @@ struct WindowRuntime {
       std::vector<Value> merged;
       std::string element_type;
       for (const Value& array : non_null) {
-        if (array.IsNull() || !array.IsArray()) { continue; }
+        if (array.IsNull() || !array.IsArray()) {
+          continue;
+        }
         for (const Value& element : array.ArrayElements()) {
           if (element_type.empty() && !element.IsNull()) {
             element_type = ElementSqlTypeOf(element);
@@ -512,19 +704,29 @@ struct WindowRuntime {
     if (fn == "APPROX_QUANTILES") {
       // Exact percentile interpolation over the frame; returns NUM quantiles
       // including both endpoints.
-      if (non_null.empty() || window.args.size() < 2) { return Value(); }
-      Value n_value = Evaluate(window.args[1], Scope{.row=&rows[ordered[lo]],
-                                                    .schema=schema, .outer=outer},
-                               nullptr, context, *ctes);
+      if (non_null.empty() || window.args.size() < 2) {
+        return Value();
+      }
+      Value n_value = Evaluate(
+          window.args[1],
+          Scope{.row = &rows[ordered[lo]], .schema = schema, .outer = outer},
+          nullptr, context, *ctes);
       const int64_t num = n_value.value.int_value;
-      if (num <= 0) { return Value(); }
+      if (num <= 0) {
+        return Value();
+      }
       std::vector<Value> sorted = non_null;
-      std::sort(sorted.begin(), sorted.end(), [](const Value& a, const Value& b) {
-        try {
-          if (a.IsNull() || b.IsNull()) { return false; }
-          return a < b;
-        } catch (...) { return false; }
-      });
+      std::sort(sorted.begin(), sorted.end(),
+                [](const Value& a, const Value& b) {
+                  try {
+                    if (a.IsNull() || b.IsNull()) {
+                      return false;
+                    }
+                    return a < b;
+                  } catch (...) {
+                    return false;
+                  }
+                });
       // APPROX_QUANTILES returns NUM+1 percentiles including both endpoints.
       std::vector<Value> quantiles;
       for (int64_t i = 0; i <= num; ++i) {
@@ -533,23 +735,148 @@ struct WindowRuntime {
       }
       return Value::Array(std::move(quantiles), ElementSqlTypeOf(sorted[0]));
     }
+    if (fn == "APPROX_TOP_COUNT" || fn == "APPROX_TOP_SUM") {
+      // Exact deterministic evaluation: count/sum occurrences per value over
+      // the frame and return the top-k as ARRAY<STRUCT<value, number>>.
+      if (non_null.empty() || window.args.empty()) {
+        return Value();
+      }
+      int64_t k = 1;
+      if (!window.args.empty()) {
+        const size_t n_arg = fn == "APPROX_TOP_COUNT" ? 1 : 2;
+        if (window.args.size() > n_arg) {
+          Value n_value = Evaluate(
+              window.args[n_arg],
+              Scope{
+                  .row = &rows[ordered[lo]], .schema = schema, .outer = outer},
+              nullptr, context, *ctes);
+          if (!n_value.IsNull()) {
+            k = n_value.value.int_value;
+          }
+        }
+      }
+      std::vector<std::pair<Value, double>> stats;
+      for (size_t r = lo; r <= hi; ++r) {
+        const size_t row = ordered[r];
+        const Scope scope{.row = &rows[row], .schema = schema, .outer = outer};
+        Value v = Evaluate(window.args[0], scope, nullptr, context, *ctes);
+        if (v.IsNull()) {
+          continue;
+        }
+        double weight = 1.0;
+        if (fn == "APPROX_TOP_SUM" && window.args.size() > 1) {
+          Value w = Evaluate(window.args[1], scope, nullptr, context, *ctes);
+          if (!w.IsNull()) {
+            weight = w.type == ValueType::kDouble
+                         ? w.value.double_value
+                         : static_cast<double>(w.value.int_value);
+          }
+        }
+        bool found = false;
+        for (auto& [value, total] : stats) {
+          try {
+            if (!EvaluateBinary(BinaryOperation::kEquals, value, v).IsNull() &&
+                EvaluateBinary(BinaryOperation::kEquals, value, v).Truthy()) {
+              total += weight;
+              found = true;
+              break;
+            }
+          } catch (...) {
+          }
+        }
+        if (!found) {
+          stats.emplace_back(v, weight);
+          v = Value();
+        }
+      }
+      std::sort(stats.begin(), stats.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+      });
+      auto json_of = [](const Value& v) -> std::string {
+        if (v.IsNull()) {
+          return "null";
+        }
+        switch (v.type) {
+          case ValueType::kInt64:
+          case ValueType::kDate:
+            return std::to_string(v.value.int_value);
+          case ValueType::kDouble: {
+            const double d = v.value.double_value;
+            if (std::isnan(d)) {
+              return "NaN";
+            }
+            if (std::isinf(d)) {
+              return d > 0 ? "Infinity" : "-Infinity";
+            }
+            std::ostringstream out;
+            out << std::setprecision(17) << d;
+            return out.str();
+          }
+          case ValueType::kVarChar:
+            return "\"" + std::string(v.value.varchar_value) + "\"";
+          default:
+            return "null";
+        }
+      };
+      std::vector<Value> out;
+      std::string element_type;
+      for (size_t i = 0; i < stats.size() && static_cast<int64_t>(i) < k; ++i) {
+        std::string json =
+            "{\"value\":" + json_of(stats[i].first) + ",\"count\":" +
+            (stats[i].second == std::floor(stats[i].second)
+                 ? std::to_string(static_cast<int64_t>(stats[i].second))
+                 : std::to_string(stats[i].second)) +
+            "}";
+        out.push_back(Value(std::move(json)));
+      }
+      if (!out.empty()) {
+        std::string value_type = "STRING";
+        switch (stats[0].first.type) {
+          case ValueType::kInt64:
+            value_type = "INT64";
+            break;
+          case ValueType::kDouble:
+            value_type = "FLOAT64";
+            break;
+          case ValueType::kDate:
+            value_type = "DATE";
+            break;
+          default:
+            value_type = "STRING";
+            break;
+        }
+        element_type = fn == "APPROX_TOP_COUNT"
+                           ? "STRUCT<value " + value_type + ", count INT64>"
+                           : "STRUCT<value " + value_type + ", sum INT64>";
+      }
+      return Value::Array(std::move(out), element_type);
+    }
     if (fn == "COUNTIF") {
       int64_t trues = 0;
       for (const Value& value : non_null) {
-        if (Truthy(value)) { ++trues; }
+        if (Truthy(value)) {
+          ++trues;
+        }
       }
       return Value(trues);
     }
-    if (non_null.empty()) { return Value(); }
+    if (non_null.empty()) {
+      return Value();
+    }
 
     if (fn == "SUM" || fn == "AVG") {
       bool any_double = false;
       for (const Value& value : non_null) {
-        if (value.type == ValueType::kDouble) { any_double = true; break; }
+        if (value.type == ValueType::kDouble) {
+          any_double = true;
+          break;
+        }
       }
       if (any_double) {
         double total = 0.0;
-        for (const Value& value : non_null) { total += NumericOf(value); }
+        for (const Value& value : non_null) {
+          total += NumericOf(value);
+        }
         return Value(total);
       }
       uint64_t total = 0;
@@ -582,7 +909,9 @@ struct WindowRuntime {
         std::string sep = delimiter.IsNull() ? "," : delimiter.AsString();
         std::string out;
         for (size_t i = 0; i < final_values.size(); ++i) {
-          if (i) { out += sep; }
+          if (i) {
+            out += sep;
+          }
           out += final_values[i].AsString();
         }
         return Value(std::move(out));
@@ -600,13 +929,21 @@ struct WindowRuntime {
       bool saw_true = false;
       bool saw_false = false;
       for (const Value& value : non_null) {
-        if (Truthy(value)) { saw_true = true; } else { saw_false = true; }
+        if (Truthy(value)) {
+          saw_true = true;
+        } else {
+          saw_false = true;
+        }
       }
       if (fn == "LOGICAL_AND") {
-        if (saw_false) { return Value(static_cast<int64_t>(0)); }
+        if (saw_false) {
+          return Value(static_cast<int64_t>(0));
+        }
         return Value(static_cast<int64_t>(1));
       }
-      if (saw_true) { return Value(static_cast<int64_t>(1)); }
+      if (saw_true) {
+        return Value(static_cast<int64_t>(1));
+      }
       return Value(static_cast<int64_t>(0));
     }
     if (fn == "BIT_AND" || fn == "BIT_OR" || fn == "BIT_XOR") {
@@ -622,6 +959,166 @@ struct WindowRuntime {
         }
       }
       return Value(acc);
+    }
+    auto numeric_of = [](const Value& v) -> double {
+      return v.type == ValueType::kDouble
+                 ? v.value.double_value
+                 : static_cast<double>(v.value.int_value);
+    };
+    auto frame_pairs =
+        [&]() -> std::optional<std::tuple<double, double, double, size_t>> {
+      // Evaluates both arguments per aligned row (NULL on either side skips
+      // the pair).  Returns {covar_pop, var_x, var_y, n}.
+      std::vector<std::pair<double, double>> pairs;
+      for (size_t r = lo; r <= hi; ++r) {
+        const size_t row = ordered[r];
+        const Scope pair_scope{
+            .row = &rows[row], .schema = schema, .outer = outer};
+        Value x = Evaluate(window.args[0], pair_scope, nullptr, context, *ctes);
+        if (x.IsNull()) {
+          continue;
+        }
+        double xv = numeric_of(x);
+        double yv = xv;
+        if (window.args.size() > 1) {
+          Value y =
+              Evaluate(window.args[1], pair_scope, nullptr, context, *ctes);
+          if (y.IsNull()) {
+            continue;
+          }
+          yv = numeric_of(y);
+        }
+        pairs.emplace_back(xv, yv);
+      }
+      const size_t n = pairs.size();
+      if (n < 2) {
+        return std::nullopt;
+      }
+      double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+      for (const auto& [xv, yv] : pairs) {
+        sx += xv;
+        sy += yv;
+        sxx += xv * xv;
+        syy += yv * yv;
+        sxy += xv * yv;
+      }
+      const double mx = sx / static_cast<double>(n);
+      const double my = sy / static_cast<double>(n);
+      const double covar_pop = sxy / static_cast<double>(n) - mx * my;
+      const double var_x = sxx / static_cast<double>(n) - mx * mx;
+      const double var_y = syy / static_cast<double>(n) - my * my;
+      return std::make_tuple(covar_pop, var_x, var_y, n);
+    };
+    auto frame_variance = [&](bool samp) -> Value {
+      if (non_null.empty()) {
+        return Value();
+      }
+      const size_t n = non_null.size();
+      double mean = 0.0;
+      for (const Value& value : non_null) {
+        mean += numeric_of(value);
+      }
+      mean /= static_cast<double>(n);
+      double ss = 0.0;
+      for (const Value& value : non_null) {
+        const double d = numeric_of(value) - mean;
+        ss += d * d;
+      }
+      double variance = ss / static_cast<double>(n);
+      if (samp) {
+        if (n < 2) {
+          return Value();
+        }
+        variance *= static_cast<double>(n) / static_cast<double>(n - 1);
+      }
+      return Value(variance);
+    };
+    if (fn == "VAR_POP" || fn == "VAR_SAMP") {
+      return frame_variance(fn == "VAR_SAMP");
+    }
+    if (fn == "STDDEV_POP" || fn == "STDDEV_SAMP" || fn == "STDDEV") {
+      Value variance = frame_variance(fn != "STDDEV_POP");
+      if (variance.IsNull()) {
+        return variance;
+      }
+      return Value(std::sqrt(variance.value.double_value));
+    }
+    if (fn == "ANY_VALUE") {
+      return non_null[0];
+    }
+    if (fn == "COVAR_POP" || fn == "COVAR_SAMP" || fn == "CORR") {
+      auto stats = frame_pairs();
+      if (!stats.has_value()) {
+        return Value();
+      }
+      const auto& [covar_pop, var_x, var_y, n] = *stats;
+      if (fn == "COVAR_POP") {
+        return Value(covar_pop);
+      }
+      if (fn == "COVAR_SAMP") {
+        return Value(covar_pop * static_cast<double>(n) /
+                     static_cast<double>(n - 1));
+      }
+      // CORR
+      if (var_x <= 0.0 || var_y <= 0.0) {
+        return Value();
+      }
+      return Value(covar_pop / std::sqrt(var_x * var_y));
+    }
+    if (fn == "ELEMENTWISE_SUM" || fn == "ELEMENTWISE_AVG") {
+      bool saw_array = false;
+      size_t width = 0;
+      for (const Value& value : non_null) {
+        if (!value.IsNull() && value.IsArray()) {
+          saw_array = true;
+          width = std::max(width, value.ArrayElements().size());
+        }
+      }
+      if (!saw_array) {
+        return Value();
+      }
+      std::vector<Value> out;
+      out.reserve(width);
+      std::string element_type;
+      for (size_t pos = 0; pos < width; ++pos) {
+        bool any_double = false;
+        int64_t int_sum = 0;
+        double double_sum = 0.0;
+        int64_t seen = 0;
+        for (const Value& value : non_null) {
+          if (value.IsNull() || !value.IsArray()) {
+            continue;
+          }
+          const auto& elements = value.ArrayElements();
+          if (pos >= elements.size() || elements[pos].IsNull()) {
+            continue;
+          }
+          const Value& element = elements[pos];
+          ++seen;
+          if (element.type == ValueType::kDouble) {
+            any_double = true;
+            double_sum += element.value.double_value;
+          } else {
+            int_sum += element.value.int_value;
+            double_sum += static_cast<double>(element.value.int_value);
+          }
+        }
+        if (seen == 0) {
+          out.emplace_back();
+          continue;
+        }
+        if (element_type.empty()) {
+          element_type = any_double ? "FLOAT64" : "INT64";
+        }
+        if (fn == "ELEMENTWISE_AVG") {
+          out.push_back(Value(double_sum / static_cast<double>(seen)));
+        } else if (any_double) {
+          out.push_back(Value(double_sum));
+        } else {
+          out.push_back(Value(int_sum));
+        }
+      }
+      return Value::Array(std::move(out), element_type);
     }
     throw std::runtime_error("unsupported window aggregate " + fn);
   }
@@ -674,7 +1171,9 @@ WindowOrderLayout BuildWindowOrderLayout(
     for (size_t g = 0; g < partition_keys.size(); ++g) {
       bool equal = partition_keys[g].size() == keys.size();
       for (size_t t = 0; equal && t < keys.size(); ++t) {
-        if (!ValuesEqual(partition_keys[g][t], keys[t])) { equal = false; }
+        if (!ValuesEqual(partition_keys[g][t], keys[t])) {
+          equal = false;
+        }
       }
       if (equal) {
         group = g;
@@ -695,8 +1194,28 @@ WindowOrderLayout BuildWindowOrderLayout(
         auto& values = partition.order_values[k];
         values.reserve(window.order_by.size());
         for (const WindowOrderTerm& term : window.order_by) {
-          values.push_back(
-              runtime.EvalAt(term.expression, rows, partition.ordered[k]));
+          Value key =
+              runtime.EvalAt(term.expression, rows, partition.ordered[k]);
+          // COLLATE-wrapped keys sort case-insensitively (und:ci style);
+          // folding the hidden sort key is sufficient.
+          if (term.expression->Type() == TypeTag::kFunctionCallExp) {
+            const auto& call = term.expression->AsFunctionCallExpression();
+            std::string fname = call.FuncName();
+            for (char& c : fname) {
+              c = static_cast<char>(
+                  std::tolower(static_cast<unsigned char>(c)));
+            }
+            if (fname == "collate" && !key.IsNull() &&
+                key.type == ValueType::kVarChar) {
+              std::string folded(key.value.varchar_value);
+              for (char& c : folded) {
+                c = static_cast<char>(
+                    std::tolower(static_cast<unsigned char>(c)));
+              }
+              key = Value(std::move(folded));
+            }
+          }
+          values.push_back(std::move(key));
         }
       }
       std::vector<size_t> positions(partition.ordered.size());
@@ -738,7 +1257,9 @@ WindowOrderLayout BuildWindowOrderLayout(
             break;
           }
         }
-        if (!equal) { break; }
+        if (!equal) {
+          break;
+        }
         ++end;
       }
       partition.peer_end[a] = end;
@@ -755,7 +1276,9 @@ void ComputeOneWindow(TransactionContext& context,
                       const WindowOrderLayout* cached_layout = nullptr) {
   const size_t n = rows.size();
   out->assign(n, Value());
-  if (n == 0) { return; }
+  if (n == 0) {
+    return;
+  }
 
   WindowRuntime runtime{context, outer, &ctes, &schema};
 
@@ -836,12 +1359,12 @@ void ComputeOneWindow(TransactionContext& context,
         offset = offset_value.IsNull() ? 1 : offset_value.value.int_value;
       }
       for (size_t k = 0; k < m; ++k) {
-        const int64_t target = fn == "LAG"
-                                   ? static_cast<int64_t>(k) - offset
-                                   : static_cast<int64_t>(k) + offset;
+        const int64_t target = fn == "LAG" ? static_cast<int64_t>(k) - offset
+                                           : static_cast<int64_t>(k) + offset;
         if (target < 0 || target >= static_cast<int64_t>(m)) {
           if (window.args.size() > 2) {
-            (*out)[ordered[k]] = runtime.EvalAt(window.args[2], rows, ordered[k]);
+            (*out)[ordered[k]] =
+                runtime.EvalAt(window.args[2], rows, ordered[k]);
           }
           continue;
         }
@@ -852,10 +1375,11 @@ void ComputeOneWindow(TransactionContext& context,
     }
     if (fn == "FIRST_VALUE" || fn == "LAST_VALUE" || fn == "NTH_VALUE") {
       for (size_t k = 0; k < m; ++k) {
-        const auto [lo, hi] =
-            runtime.ResolveFrame(window, rows, ordered, order_values, k,
-                                 peer_end);
-        if (hi < lo) { continue; }
+        const auto [lo, hi] = runtime.ResolveFrame(window, rows, ordered,
+                                                   order_values, k, peer_end);
+        if (hi < lo) {
+          continue;
+        }
         auto excluded = [&](size_t candidate) {
           if (window.exclusion == WindowFrameExclusion::kCurrentRow) {
             return candidate == k;
@@ -882,11 +1406,15 @@ void ComputeOneWindow(TransactionContext& context,
         };
         size_t target = lo;
         if (fn == "FIRST_VALUE") {
-          while (target <= hi && excluded(target)) { ++target; }
+          while (target <= hi && excluded(target)) {
+            ++target;
+          }
         } else if (fn == "LAST_VALUE") {
           target = hi;
           while (target >= lo && excluded(target)) {
-            if (target == 0) { break; }
+            if (target == 0) {
+              break;
+            }
             --target;
           }
         } else {
@@ -898,7 +1426,9 @@ void ComputeOneWindow(TransactionContext& context,
           int64_t nth = nth_value.value.int_value;
           size_t frame_size = 0;
           for (size_t candidate = lo; candidate <= hi; ++candidate) {
-            if (!excluded(candidate)) { ++frame_size; }
+            if (!excluded(candidate)) {
+              ++frame_size;
+            }
           }
           if (nth <= 0 || static_cast<size_t>(nth) > frame_size) {
             continue;
@@ -910,20 +1440,21 @@ void ComputeOneWindow(TransactionContext& context,
             }
           }
         }
-        if (target < lo || target > hi || excluded(target)) { continue; }
-        (*out)[ordered[k]] = runtime.EvalAt(window.args[0], rows, ordered[target]);
+        if (target < lo || target > hi || excluded(target)) {
+          continue;
+        }
+        (*out)[ordered[k]] =
+            runtime.EvalAt(window.args[0], rows, ordered[target]);
       }
       continue;
     }
 
     // Everything else is treated as an aggregate over the frame.
     for (size_t k = 0; k < m; ++k) {
-      const auto [lo, hi] =
-          runtime.ResolveFrame(window, rows, ordered, order_values, k,
-                               peer_end);
-      (*out)[ordered[k]] =
-          runtime.AggregateOverFrame(window, rows, ordered, order_values,
-                                     k, lo, hi);
+      const auto [lo, hi] = runtime.ResolveFrame(window, rows, ordered,
+                                                 order_values, k, peer_end);
+      (*out)[ordered[k]] = runtime.AggregateOverFrame(window, rows, ordered,
+                                                      order_values, k, lo, hi);
     }
   }
 }
@@ -932,10 +1463,14 @@ void ComputeOneWindow(TransactionContext& context,
 
 bool HasWindowFunctions(const SelectStatement& statement) {
   for (const NamedExpression& projection : statement.SelectList()) {
-    if (ContainsWindow(projection.expression)) { return true; }
+    if (ContainsWindow(projection.expression)) {
+      return true;
+    }
   }
   for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
-    if (ContainsWindow(term.expression)) { return true; }
+    if (ContainsWindow(term.expression)) {
+      return true;
+    }
   }
   return ContainsWindow(statement.Qualify());
 }
@@ -944,14 +1479,16 @@ namespace {
 
 // QUALIFY may reference select-list aliases; inline them so filtering works
 // against pre-projection rows.  Real FROM columns win over aliases.
-Expression InlineAliases(const Expression& expression,
-                         const std::unordered_map<std::string, Expression>& aliases,
-                         const Schema& schema) {
-  if (!expression) { return expression; }
+Expression InlineAliases(
+    const Expression& expression,
+    const std::unordered_map<std::string, Expression>& aliases,
+    const Schema& schema) {
+  if (!expression) {
+    return expression;
+  }
   switch (expression->Type()) {
     case TypeTag::kColumnValue: {
-      const ColumnName& name =
-          expression->AsColumnValue().GetColumnName();
+      const ColumnName& name = expression->AsColumnValue().GetColumnName();
       if (!name.schema.empty() || schema.Offset(name) >= 0) {
         return expression;
       }
@@ -960,12 +1497,15 @@ Expression InlineAliases(const Expression& expression,
     }
     case TypeTag::kBinaryExp:
       return BinaryExpressionExp(
-          InlineAliases(expression->AsBinaryExpression().Left(), aliases, schema),
+          InlineAliases(expression->AsBinaryExpression().Left(), aliases,
+                        schema),
           expression->AsBinaryExpression().Op(),
-          InlineAliases(expression->AsBinaryExpression().Right(), aliases, schema));
+          InlineAliases(expression->AsBinaryExpression().Right(), aliases,
+                        schema));
     case TypeTag::kUnaryExp:
       return UnaryExpressionExp(
-          InlineAliases(expression->AsUnaryExpression().Child(), aliases, schema),
+          InlineAliases(expression->AsUnaryExpression().Child(), aliases,
+                        schema),
           expression->AsUnaryExpression().Op());
     case TypeTag::kCaseExp: {
       const auto& value = expression->AsCaseExpression();
@@ -974,13 +1514,13 @@ Expression InlineAliases(const Expression& expression,
         clauses.emplace_back(InlineAliases(condition, aliases, schema),
                              InlineAliases(result, aliases, schema));
       }
-      return CaseExpressionExp(std::move(clauses),
-                               InlineAliases(value.else_clause_, aliases, schema));
+      return CaseExpressionExp(
+          std::move(clauses),
+          InlineAliases(value.else_clause_, aliases, schema));
     }
     case TypeTag::kFunctionCallExp:
       return FunctionCallExp(
-          expression->AsFunctionCallExpression().FuncName(),
-          [&] {
+          expression->AsFunctionCallExpression().FuncName(), [&] {
             std::vector<Expression> out;
             for (const Expression& argument :
                  expression->AsFunctionCallExpression().Args()) {
@@ -996,8 +1536,8 @@ Expression InlineAliases(const Expression& expression,
 }  // namespace
 
 WindowedInput ApplyWindows(TransactionContext& context,
-                          const SelectStatement& statement, Relation&& input,
-                          const Scope* outer, const CteMap& ctes) {
+                           const SelectStatement& statement, Relation&& input,
+                           const Scope* outer, const CteMap& ctes) {
   WindowedInput result;
   result.statement = std::make_shared<SelectStatement>(statement);
 
@@ -1057,8 +1597,7 @@ WindowedInput ApplyWindows(TransactionContext& context,
     Column& column = extended_columns[base_width + w];
     for (const Row& row : rows) {
       const Value& candidate = row.values_[base_width + w];
-      if (!candidate.IsNull() &&
-          candidate.type != ValueType::kNull) {
+      if (!candidate.IsNull() && candidate.type != ValueType::kNull) {
         column = Column(column.Name(), ValueTypeOf(candidate));
         break;
       }
@@ -1084,20 +1623,19 @@ WindowedInput ApplyWindows(TransactionContext& context,
   }
   std::vector<SelectStatement::OrderByTerm> rewritten_order;
   for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
-    rewritten_order.push_back({Rebuild(term.expression, replacements),
-                               term.ascending});
+    rewritten_order.push_back(
+        {Rebuild(term.expression, replacements), term.ascending});
   }
   result.statement->SetSelectList(std::move(rewritten_select));
   result.statement->SetOrderBy(std::move(rewritten_order));
 
   if (statement.Qualify()) {
-    Expression qualify =
-        InlineAliases(Rebuild(statement.Qualify(), replacements), aliases,
-                      extended.schema);
+    Expression qualify = InlineAliases(
+        Rebuild(statement.Qualify(), replacements), aliases, extended.schema);
     Relation filtered(context.execution_runtime());
     filtered.schema = extended.schema;
     extended.ForEachRow([&](const Row& row) {
-      Scope scope{.row=&row, .schema=&extended.schema, .outer=outer};
+      Scope scope{.row = &row, .schema = &extended.schema, .outer = outer};
       if (Truthy(Evaluate(qualify, scope, nullptr, context, ctes))) {
         filtered.AddRow(row);
       }
@@ -1112,7 +1650,9 @@ WindowedInput ApplyWindows(TransactionContext& context,
 }
 
 Relation TrimHiddenColumns(Relation&& input, size_t hidden_columns) {
-  if (hidden_columns == 0) { return std::move(input); }
+  if (hidden_columns == 0) {
+    return std::move(input);
+  }
   Relation trimmed(input.runtime());
   std::vector<Column> columns;
   const size_t keep = input.schema.ColumnCount() - hidden_columns;

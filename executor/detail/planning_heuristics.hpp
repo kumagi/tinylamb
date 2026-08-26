@@ -37,6 +37,17 @@ struct EqualityKey {
 std::vector<PredicateInfo> AnalyzePredicates(
     const Expression& where, const std::vector<Relation>& relations);
 
+// True when a NULL in any touched column forces the predicate away from TRUE
+// (strict comparisons, IS NOT NULL, AND of strict terms, IN over constants).
+// Used to license outer-join-to-inner reduction and pre-join filter pushdown.
+bool IsNullRejectingPredicate(const Expression& expression);
+
+// Downgrades outer joins proven redundant by a null-rejecting WHERE conjunct
+// to inner joins. `reduced_all` reports whether every outer join collapsed.
+std::vector<SelectSource> ReduceOuterJoinsToInner(
+    const SelectStatement& statement, const std::vector<Relation>& schemas,
+    bool* reduced_all);
+
 Expression NecessaryLocalDisjunction(const Expression& expression,
                                      size_t source,
                                      const std::vector<Relation>& relations);
@@ -66,11 +77,11 @@ std::string EncodeJoinKey(const Row& row, const std::vector<slot_t>& columns);
 size_t EstimateJoinRows(const Relation& left, const Relation& right,
                         const std::vector<Expression>& predicates);
 
-Relation HybridHashJoin(
-    Relation left, Relation right, const std::vector<slot_t>& left_columns,
-    const std::vector<slot_t>& right_columns,
-    const std::function<bool(const Row&)>& matches, bool left_join,
-    size_t* join_comparisons);
+Relation HybridHashJoin(Relation left, Relation right,
+                        const std::vector<slot_t>& left_columns,
+                        const std::vector<slot_t>& right_columns,
+                        const std::function<bool(const Row&)>& matches,
+                        bool left_join, size_t* join_comparisons);
 
 bool ShouldHybridJoin(const Relation& left, const Relation& right);
 

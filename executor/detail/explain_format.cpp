@@ -11,9 +11,9 @@
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <vector>
-#include <utility>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
@@ -29,15 +29,16 @@
 #include "query/statement.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
-#include "type/schema.hpp"
 #include "type/column.hpp"
+#include "type/schema.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb::relational_detail {
 
 std::string IndentLines(std::string_view text, int spaces) {
-  if (text.empty()) { return {};
-}
+  if (text.empty()) {
+    return {};
+  }
   const std::string pad(static_cast<size_t>(spaces), ' ');
   std::ostringstream out;
   size_t start = 0;
@@ -94,8 +95,9 @@ struct EstimatedPlanNode {
 };
 
 std::string FormatRows(const EstimatedPlanNode& node) {
-  if (!node.rows_known) { return "unknown";
-}
+  if (!node.rows_known) {
+    return "unknown";
+  }
   return std::to_string(node.rows);
 }
 
@@ -174,14 +176,14 @@ EstimatedPlanNode MakeJoinNode(const EstimatedPlanNode& left,
     if (PreferHybridForBuild(right)) {
       head << "HybridHashJoin build~" << FormatRows(right);
       if (right.rows_known) {
-        head << " (~"
-             << FormatBytes(right.rows * kHashJoinRowBytesEstimate) << ")";
+        head << " (~" << FormatBytes(right.rows * kHashJoinRowBytesEstimate)
+             << ")";
       }
     } else {
       head << "HashJoin build~" << FormatRows(right);
       if (right.rows_known) {
-        head << " (~"
-             << FormatBytes(right.rows * kHashJoinRowBytesEstimate) << ")";
+        head << " (~" << FormatBytes(right.rows * kHashJoinRowBytesEstimate)
+             << ")";
       }
     }
   }
@@ -210,31 +212,57 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       nodes.push_back(MakeScanNode(context, source, empty_ctes));
     }
 
-    const bool has_outer_join = std::any_of(
-        statement.Sources().begin() + 1, statement.Sources().end(),
-        [](const SelectSource& source) {
-          return source.join_type == JoinType::kLeft ||
-                 source.join_type == JoinType::kRight ||
-                 source.join_type == JoinType::kFull;
-        });
+    const bool has_outer_join =
+        std::any_of(statement.Sources().begin() + 1, statement.Sources().end(),
+                    [](const SelectSource& source) {
+                      return source.join_type == JoinType::kLeft ||
+                             source.join_type == JoinType::kRight ||
+                             source.join_type == JoinType::kFull;
+                    });
 
     EstimatedPlanNode plan;
     if (has_outer_join) {
-      output << pad << "JoinOrder=syntactic (outer joins present)\n";
+      // Mirror the executor's outer-to-inner reduction so the displayed
+      // join kinds match what actually runs.
+      std::vector<Relation> schema_only(nodes.size());
+      for (size_t i = 0; i < nodes.size(); ++i) {
+        schema_only[i].schema = nodes[i].schema;
+      }
+      bool reduced_all = false;
+      const std::vector<SelectSource> reduced_sources =
+          ReduceOuterJoinsToInner(statement, schema_only, &reduced_all);
+      const bool any_outer_remaining =
+          std::any_of(reduced_sources.begin() + 1, reduced_sources.end(),
+                      [](const SelectSource& source) {
+                        return source.join_type == JoinType::kLeft ||
+                               source.join_type == JoinType::kRight ||
+                               source.join_type == JoinType::kFull;
+                      });
+      if (any_outer_remaining) {
+        output << pad << "JoinOrder=syntactic (outer joins present)\n";
+      } else {
+        output << pad
+               << "JoinOrder=greedy_filtered_cardinality "
+                  "(outer joins reduced by null-rejecting WHERE)\n";
+      }
       plan = std::move(nodes.front());
       for (size_t i = 1; i < nodes.size(); ++i) {
-        const SelectSource& source = statement.Sources()[i];
+        const SelectSource& source = reduced_sources[i];
         std::vector<Expression> predicates =
             SplitConjuncts(source.join_condition);
         const char* kind = "cross";
-        if (source.join_type == JoinType::kInner) { kind = "inner";
-}
-        if (source.join_type == JoinType::kLeft) { kind = "left";
-}
-        if (source.join_type == JoinType::kRight) { kind = "right";
-}
-        if (source.join_type == JoinType::kFull) { kind = "full";
-}
+        if (source.join_type == JoinType::kInner) {
+          kind = "inner";
+        }
+        if (source.join_type == JoinType::kLeft) {
+          kind = "left";
+        }
+        if (source.join_type == JoinType::kRight) {
+          kind = "right";
+        }
+        if (source.join_type == JoinType::kFull) {
+          kind = "full";
+        }
         plan = MakeJoinNode(plan, nodes[i], predicates, kind);
       }
     } else {
@@ -259,15 +287,17 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
 
       size_t first = 0;
       for (size_t i = 1; i < nodes.size(); ++i) {
-        if (nodes[i].rows < nodes[first].rows) { first = i;
-}
+        if (nodes[i].rows < nodes[first].rows) {
+          first = i;
+        }
       }
       plan = std::move(nodes[first]);
       std::unordered_set<size_t> joined{first};
       std::unordered_set<size_t> remaining;
       for (size_t i = 0; i < nodes.size(); ++i) {
-        if (i != first) { remaining.insert(i);
-}
+        if (i != first) {
+          remaining.insert(i);
+        }
       }
       while (!remaining.empty()) {
         size_t next = *remaining.begin();
@@ -300,10 +330,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
             estimate = plan.rows * nodes[candidate].rows;
           }
           const bool connected = !applicable.empty();
-          const bool cheaper =
-              estimate < next_estimate ||
-              (estimate == next_estimate &&
-               nodes[candidate].rows < nodes[next].rows);
+          const bool cheaper = estimate < next_estimate ||
+                               (estimate == next_estimate &&
+                                nodes[candidate].rows < nodes[next].rows);
           if ((connected && !next_connected) ||
               (connected == next_connected && cheaper)) {
             next = candidate;
@@ -352,8 +381,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   if (budget.Unlimited()) {
     output << "unlimited";
   } else {
-    output << FormatBytes(budget.Limit()) << " soft="
-           << FormatBytes(budget.Limit() / 5 * 4);
+    output << FormatBytes(budget.Limit())
+           << " soft=" << FormatBytes(budget.Limit() / 5 * 4);
   }
   output << '\n';
 }

@@ -6,7 +6,6 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
-
 #include <cstdint>
 #include <filesystem>
 #include <ranges>
@@ -27,7 +26,6 @@ namespace {
 std::vector<std::string> SplitTopLevel(std::string_view text);
 
 std::string Trim(std::string_view text) {
-
   size_t begin = 0;
   while (begin < text.size() &&
          std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
@@ -42,14 +40,46 @@ std::string Trim(std::string_view text) {
 }
 
 std::string ToLower(std::string text) {
-  std::ranges::transform(
-      text, text.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::ranges::transform(text, text.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
   return text;
 }
 
 bool LineIsSeparator(std::string_view line, std::string_view expected) {
   return Trim(line) == expected;
+}
+
+// Option headers such as [parameters=a,\n b] may span several lines; an
+// incomplete bracket count means more lines belong to this header.
+bool OptionHeaderComplete(std::string_view text) {
+  int depth = 0;
+  bool in_string = false;
+  char quote = '\0';
+  for (size_t i = 0; i < text.size(); ++i) {
+    const char c = text[i];
+    if (in_string) {
+      if (c == '\\' && i + 1 < text.size()) {
+        ++i;
+        continue;
+      }
+      if (c == quote) {
+        in_string = false;
+      }
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      in_string = true;
+      quote = c;
+      continue;
+    }
+    if (c == '[') {
+      ++depth;
+    } else if (c == ']') {
+      --depth;
+    }
+  }
+  return depth <= 0;
 }
 
 std::vector<std::string> SplitCases(std::string_view contents) {
@@ -66,7 +96,9 @@ std::vector<std::string> SplitCases(std::string_view contents) {
     current += line;
     current.push_back('\n');
   }
-  if (!Trim(current).empty()) { cases.push_back(std::move(current)); }
+  if (!Trim(current).empty()) {
+    cases.push_back(std::move(current));
+  }
   return cases;
 }
 
@@ -94,7 +126,9 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out) {
     std::istringstream features(value);
     while (std::getline(features, feature, ',')) {
       feature = Trim(feature);
-      if (!feature.empty()) { out->required_features.push_back(feature); }
+      if (!feature.empty()) {
+        out->required_features.push_back(feature);
+      }
     }
     return true;
   }
@@ -120,14 +154,15 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out) {
   return true;
 }
 
-
 bool ParseStructRow(std::string_view text, size_t* offset,
                     std::vector<std::string>* fields) {
   while (*offset < text.size() &&
          std::isspace(static_cast<unsigned char>(text[*offset])) != 0) {
     ++*offset;
   }
-  if (*offset >= text.size() || text[*offset] != '{') { return false; }
+  if (*offset >= text.size() || text[*offset] != '{') {
+    return false;
+  }
   ++*offset;
   std::string token;
   int depth = 1;
@@ -136,7 +171,9 @@ bool ParseStructRow(std::string_view text, size_t* offset,
   char quote = '\0';
   auto flush = [&]() {
     const std::string field = Trim(token);
-    if (!field.empty()) { fields->push_back(field); }
+    if (!field.empty()) {
+      fields->push_back(field);
+    }
     token.clear();
   };
   while (*offset < text.size() && depth > 0) {
@@ -149,7 +186,9 @@ bool ParseStructRow(std::string_view text, size_t* offset,
         ++*offset;
         continue;
       }
-      if (c == quote) { in_string = false; }
+      if (c == quote) {
+        in_string = false;
+      }
       continue;
     }
     if (c == '"' || c == '\'') {
@@ -178,7 +217,9 @@ bool ParseStructRow(std::string_view text, size_t* offset,
       continue;
     }
     if (c == ']' || c == ')' || c == '>') {
-      if (bracket_depth > 0) { --bracket_depth; }
+      if (bracket_depth > 0) {
+        --bracket_depth;
+      }
       token.push_back(c);
       continue;
     }
@@ -195,25 +236,33 @@ void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
   const std::string lower = ToLower(std::string(result));
   out->unknown_order = lower.find("unknown order") != std::string::npos;
   const size_t array_open = result.find('[');
-  if (array_open == std::string_view::npos) { return; }
+  if (array_open == std::string_view::npos) {
+    return;
+  }
   size_t offset = array_open + 1;
   while (offset < result.size()) {
     while (offset < result.size() &&
            std::isspace(static_cast<unsigned char>(result[offset])) != 0) {
       ++offset;
     }
-    if (offset >= result.size() || result[offset] == ']') { break; }
+    if (offset >= result.size() || result[offset] == ']') {
+      break;
+    }
     if (result[offset] == ',') {
       ++offset;
       continue;
     }
     if (result[offset] != '{') {
       const size_t next = result.find('{', offset);
-      if (next == std::string_view::npos) { break; }
+      if (next == std::string_view::npos) {
+        break;
+      }
       offset = next;
     }
     std::vector<std::string> fields;
-    if (!ParseStructRow(result, &offset, &fields)) { break; }
+    if (!ParseStructRow(result, &offset, &fields)) {
+      break;
+    }
     out->expected_rows.push_back(std::move(fields));
   }
 }
@@ -260,11 +309,27 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
   std::string line;
   bool in_options = true;
   std::string sql;
+  auto consume_option = [&](const std::string& first_line) {
+    std::string header = first_line;
+    const std::string trimmed_header = Trim(first_line);
+    if (!trimmed_header.empty() && trimmed_header.front() == '[') {
+      while (!OptionHeaderComplete(header)) {
+        std::string next;
+        if (!std::getline(stream, next)) {
+          break;
+        }
+        header += "\n" + next;
+      }
+    }
+    return ConsumeOptionLine(header, &test_case);
+  };
   while (std::getline(stream, line)) {
     const std::string trimmed = Trim(line);
     if (in_options) {
-      if (trimmed.empty() || trimmed.starts_with('#')) { continue; }
-      if (ConsumeOptionLine(line, &test_case)) {
+      if (trimmed.empty() || trimmed.starts_with('#')) {
+        continue;
+      }
+      if (consume_option(line)) {
         if (!test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
@@ -278,14 +343,16 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
       ParseResult(rest.str(), &test_case);
       test_case.sql = ApplyParameters(Trim(sql), test_case.parameters);
       if (test_case.name.empty()) {
-        test_case.name = test_case.prepare_database ? "prepare_database"
-                                                    : "unnamed";
+        test_case.name =
+            test_case.prepare_database ? "prepare_database" : "unnamed";
       }
       return test_case;
     }
     if (sql.empty()) {
-      if (trimmed.empty() || trimmed.starts_with('#')) { continue; }
-      if (ConsumeOptionLine(line, &test_case)) {
+      if (trimmed.empty() || trimmed.starts_with('#')) {
+        continue;
+      }
+      if (consume_option(line)) {
         if (!test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
@@ -303,16 +370,12 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
   return test_case;
 }
 
-
-
 std::string Unquote(std::string_view token) {
   if (token.size() >= 1 && (token.front() == 'b' || token.front() == 'B')) {
     token.remove_prefix(1);
   }
-  if (token.size() >= 2 &&
-      ((token.front() == '"' && token.back() == '"') ||
-       (token.front() == '\'' && token.back() == '\''))) {
-
+  if (token.size() >= 2 && ((token.front() == '"' && token.back() == '"') ||
+                            (token.front() == '\'' && token.back() == '\''))) {
     std::string out;
     for (size_t i = 1; i + 1 < token.size(); ++i) {
       if (token[i] == '\\' && i + 2 < token.size()) {
@@ -348,7 +411,6 @@ std::string Unquote(std::string_view token) {
   return std::string(token);
 }
 
-
 std::vector<std::string> SplitTopLevel(std::string_view text) {
   std::vector<std::string> parts;
   std::string current;
@@ -363,7 +425,9 @@ std::vector<std::string> SplitTopLevel(std::string_view text) {
         current.push_back(text[++i]);
         continue;
       }
-      if (c == quote) { in_string = false; }
+      if (c == quote) {
+        in_string = false;
+      }
       continue;
     }
     if (c == '"' || c == '\'') {
@@ -378,20 +442,26 @@ std::vector<std::string> SplitTopLevel(std::string_view text) {
       continue;
     }
     if (c == ']' || c == '}' || c == ')' || c == '>') {
-      if (depth > 0) { --depth; }
+      if (depth > 0) {
+        --depth;
+      }
       current.push_back(c);
       continue;
     }
     if (c == ',' && depth == 0) {
       const std::string part = Trim(current);
-      if (!part.empty()) { parts.push_back(part); }
+      if (!part.empty()) {
+        parts.push_back(part);
+      }
       current.clear();
       continue;
     }
     current.push_back(c);
   }
   const std::string part = Trim(current);
-  if (!part.empty()) { parts.push_back(part); }
+  if (!part.empty()) {
+    parts.push_back(part);
+  }
   return parts;
 }
 
@@ -406,8 +476,9 @@ bool ParseArrayToken(std::string_view token, std::string* sql_type,
   int depth = 1;
   size_t close = std::string::npos;
   for (size_t i = kPrefix.size(); i < text.size(); ++i) {
-    if (text[i] == '<') { ++depth; }
-    else if (text[i] == '>') {
+    if (text[i] == '<') {
+      ++depth;
+    } else if (text[i] == '>') {
       --depth;
       if (depth == 0) {
         close = i;
@@ -415,7 +486,9 @@ bool ParseArrayToken(std::string_view token, std::string* sql_type,
       }
     }
   }
-  if (close == std::string::npos) { return false; }
+  if (close == std::string::npos) {
+    return false;
+  }
   *sql_type = Trim(text.substr(kPrefix.size(), close - kPrefix.size()));
   std::string rest = Trim(text.substr(close + 1));
   if (rest.size() < 2 || rest.front() != '[' || rest.back() != ']') {
@@ -437,7 +510,9 @@ bool ParseArrayToken(std::string_view token, std::string* sql_type,
 std::string QuoteComplianceString(std::string_view text, bool bytes) {
   std::string out = bytes ? "b\"" : "\"";
   for (const char c : text) {
-    if (c == '"' || c == '\\') { out.push_back('\\'); }
+    if (c == '"' || c == '\\') {
+      out.push_back('\\');
+    }
     out.push_back(c);
   }
   out.push_back('"');
@@ -454,8 +529,11 @@ std::vector<GoogleSqlComplianceCase> ParseGoogleSqlComplianceFile(
   size_t unnamed = 0;
   std::string current_default_tz = "America/Los_Angeles";
   for (const std::string& segment : SplitCases(contents)) {
-    if (Trim(segment).empty()) { continue; }
-    GoogleSqlComplianceCase test_case = ParseSegment(file, segment, &current_default_tz);
+    if (Trim(segment).empty()) {
+      continue;
+    }
+    GoogleSqlComplianceCase test_case =
+        ParseSegment(file, segment, &current_default_tz);
     if (test_case.name == "unnamed" ||
         test_case.name.starts_with("prepare_database")) {
       if (test_case.name.find('_') == std::string::npos ||
@@ -463,7 +541,9 @@ std::vector<GoogleSqlComplianceCase> ParseGoogleSqlComplianceFile(
         test_case.name += "_" + std::to_string(unnamed++);
       }
     }
-    if (test_case.sql.empty() && !test_case.prepare_database) { continue; }
+    if (test_case.sql.empty() && !test_case.prepare_database) {
+      continue;
+    }
     cases.push_back(std::move(test_case));
   }
   return cases;
@@ -475,8 +555,12 @@ std::vector<std::string> ListGoogleSqlComplianceFiles(
   std::error_code error;
   for (const auto& entry :
        std::filesystem::directory_iterator(std::string(directory), error)) {
-    if (!entry.is_regular_file()) { continue; }
-    if (entry.path().extension() != ".test") { continue; }
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    if (entry.path().extension() != ".test") {
+      continue;
+    }
     files.push_back(entry.path().filename().string());
   }
   std::ranges::sort(files);
@@ -486,10 +570,18 @@ std::vector<std::string> ListGoogleSqlComplianceFiles(
 bool IsDifferentialPrivacyCase(const GoogleSqlComplianceCase& test_case) {
   const std::string hay =
       ToLower(test_case.file + " " + test_case.name + " " + test_case.sql);
-  if (hay.find("differential_privacy") != std::string::npos) { return true; }
-  if (hay.find("differential privacy") != std::string::npos) { return true; }
-  if (hay.find("anonymization") != std::string::npos) { return true; }
-  if (hay.find("anon_") != std::string::npos) { return true; }
+  if (hay.find("differential_privacy") != std::string::npos) {
+    return true;
+  }
+  if (hay.find("differential privacy") != std::string::npos) {
+    return true;
+  }
+  if (hay.find("anonymization") != std::string::npos) {
+    return true;
+  }
+  if (hay.find("anon_") != std::string::npos) {
+    return true;
+  }
   for (const std::string& feature : test_case.required_features) {
     const std::string lower = ToLower(feature);
     if (lower.find("anonym") != std::string::npos ||
@@ -501,13 +593,96 @@ bool IsDifferentialPrivacyCase(const GoogleSqlComplianceCase& test_case) {
   return false;
 }
 
+// True when `hay` contains `word` delimited by non-alphanumerics, so
+// "proto" matches PROTO/to_proto but not "protocol".
+bool ContainsWordCI(std::string_view hay, std::string_view word) {
+  const size_t n = hay.size();
+  const size_t w = word.size();
+  for (size_t pos = hay.find(word); pos != std::string_view::npos;
+       pos = hay.find(word, pos + 1)) {
+    const bool left_ok =
+        pos == 0 || !std::isalnum(static_cast<unsigned char>(hay[pos - 1]));
+    const bool right_ok =
+        pos + w >= n || !std::isalnum(static_cast<unsigned char>(hay[pos + w]));
+    if (left_ok && right_ok) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// tinylamb intentionally does not implement the GoogleSQL property-graph
+// surface: CREATE PROPERTY GRAPH / GRAPH_TABLE / GQL MATCH patterns.
+bool IsPropertyGraphCase(const GoogleSqlComplianceCase& test_case) {
+  const std::string file_lower = ToLower(test_case.file);
+  const std::string hay =
+      file_lower + " " + ToLower(test_case.name + " " + test_case.sql);
+  if (hay.find("property graph") != std::string::npos ||
+      hay.find("graph_table") != std::string::npos ||
+      ContainsWordCI(hay, "gql") ||
+      file_lower.find("graph") != std::string::npos) {
+    return true;
+  }
+  for (const std::string& feature : test_case.required_features) {
+    const std::string lower = ToLower(feature);
+    if (lower.find("graph") != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Protobuf-backed values are out of scope as well: no PROTO columns,
+// constructors or extraction functions. Plain STRUCT values stay supported.
+// Some proto constructors spell the payload type in backticks
+// (`SELECT AS \`pkg.TypePB\``), so the corpus file name doubles as a
+// fallback marker.
+bool IsProtoCase(const GoogleSqlComplianceCase& test_case) {
+  const std::string sql_lower = ToLower(test_case.sql);
+  if (ContainsWordCI(sql_lower, "proto")) {
+    return true;
+  }
+  // Corpus file names are curated scope markers ("proto3_fields.test"),
+  // so a plain substring check is appropriate here.
+  if (ToLower(test_case.file).find("proto") != std::string::npos) {
+    return true;
+  }
+  for (const std::string& feature : test_case.required_features) {
+    if (ToLower(feature).find("proto") != std::string::npos) {
+      return true;
+    }
+  }
+  // Proto type names in SQL text or prepare payloads.
+  static const char* kProtoTypes[] = {
+      "kitchensinkpb", "testenum", "from_proto", "to_proto",
+      "replace_fields", "filter_fields"};
+  for (const char* keyword : kProtoTypes) {
+    if (sql_lower.find(keyword) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// One gate for every feature tinylamb deliberately excludes from its
+// GoogleSQL subset. Compliance cases outside the subset are skipped rather
+// than counted as failures.
+bool IsOutOfScopeCase(const GoogleSqlComplianceCase& test_case) {
+  return IsDifferentialPrivacyCase(test_case) ||
+         IsPropertyGraphCase(test_case) || IsProtoCase(test_case);
+}
+
 std::string FormatComplianceValue(const Value& value) {
-  if (value.IsNull()) { return "NULL"; }
+  if (value.IsNull()) {
+    return "NULL";
+  }
   switch (value.type) {
     case ValueType::kInt64:
       return std::to_string(value.value.int_value);
     case ValueType::kDouble: {
-      if (std::isnan(value.value.double_value)) { return "nan"; }
+      if (std::isnan(value.value.double_value)) {
+        return "nan";
+      }
       if (std::isinf(value.value.double_value)) {
         return value.value.double_value > 0 ? "inf" : "-inf";
       }
@@ -524,17 +699,21 @@ std::string FormatComplianceValue(const Value& value) {
       const std::string sql_type = value.ArrayElementSqlType();
       const auto& elements = value.ArrayElements();
       std::string inner;
-      if (elements.size() >= 2) { inner = "known order:"; }
+      if (elements.size() >= 2) {
+        inner = "known order:";
+      }
       for (size_t i = 0; i < elements.size(); ++i) {
-        if (i != 0) { inner += ", "; }
+        if (i != 0) {
+          inner += ", ";
+        }
         const Value& element = elements[i];
         if (element.IsNull()) {
           inner += "NULL";
         } else if (sql_type == "BOOL" || sql_type == "BOOLEAN") {
-          inner += element.type == ValueType::kInt64 &&
-                           element.value.int_value != 0
-                       ? "true"
-                       : "false";
+          inner +=
+              element.type == ValueType::kInt64 && element.value.int_value != 0
+                  ? "true"
+                  : "false";
         } else if (sql_type == "STRING") {
           inner += QuoteComplianceString(
               std::string(element.value.varchar_value), false);
@@ -555,20 +734,28 @@ std::string FormatComplianceValue(const Value& value) {
 
 bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   const std::string want = Trim(expected);
-  if (ToLower(want) == "null") { return actual.IsNull(); }
+  if (ToLower(want) == "null") {
+    return actual.IsNull();
+  }
   if (want.starts_with("ARRAY<") && want.ends_with("(NULL)")) {
     return actual.IsNull();
   }
-  if (actual.IsNull()) { return false; }
+  if (actual.IsNull()) {
+    return false;
+  }
   if (actual.IsArray()) {
     std::string sql_type;
     std::vector<std::string> elements;
-    if (!ParseArrayToken(want, &sql_type, &elements)) { return false; }
+    if (!ParseArrayToken(want, &sql_type, &elements)) {
+      return false;
+    }
     if (!sql_type.empty() &&
         ToLower(sql_type) != ToLower(actual.ArrayElementSqlType())) {
       const std::string lower_type = ToLower(sql_type);
-      const bool struct_or_proto = lower_type.starts_with("struct<") || lower_type.starts_with("proto<");
-      if (!struct_or_proto || ToLower(actual.ArrayElementSqlType()) != "string") {
+      const bool struct_or_proto =
+          lower_type.starts_with("struct<") || lower_type.starts_with("proto<");
+      if (!struct_or_proto ||
+          ToLower(actual.ArrayElementSqlType()) != "string") {
         bool all_null = true;
         for (const auto& elem : actual.ArrayElements()) {
           if (!elem.IsNull()) {
@@ -581,7 +768,9 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         }
       }
     }
-    if (elements.size() != actual.ArrayElements().size()) { return false; }
+    if (elements.size() != actual.ArrayElements().size()) {
+      return false;
+    }
     for (size_t i = 0; i < elements.size(); ++i) {
       if (!ComplianceValueMatches(actual.ArrayElements()[i], elements[i])) {
         return false;
@@ -599,7 +788,9 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   if (actual.type == ValueType::kInt64) {
     try {
       return actual.value.int_value == static_cast<int64_t>(std::stoll(want));
-    } catch (...) { return false; }
+    } catch (...) {
+      return false;
+    }
   }
   if (actual.type == ValueType::kDouble) {
     const std::string lower_want = ToLower(want);
@@ -618,44 +809,56 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     char* end = nullptr;
     errno = 0;
     const double parsed = std::strtod(want.c_str(), &end);
-    if (end == want.c_str()) { return false; }
+    if (end == want.c_str()) {
+      return false;
+    }
     const double got = actual.value.double_value;
-    if (std::isnan(got) || std::isnan(parsed)) { return false; }
-    if (std::isinf(got) || std::isinf(parsed)) { return got == parsed; }
+    if (std::isnan(got) || std::isnan(parsed)) {
+      return false;
+    }
+    if (std::isinf(got) || std::isinf(parsed)) {
+      return got == parsed;
+    }
     if (std::fabs(parsed) < 1e-300) {
       return std::fabs(got - parsed) <= 1e-5 * std::fabs(parsed);
     }
-    return std::fabs(got - parsed) <=
-           1e-6 * std::max(1.0, std::fabs(parsed));
+    return std::fabs(got - parsed) <= 1e-6 * std::max(1.0, std::fabs(parsed));
   }
 
   if (actual.type == ValueType::kVarChar) {
     if (want.size() >= 3 && (want[0] == 'b' || want[0] == 'B') &&
         want[1] == '"' && want.back() == '"') {
-      return std::string(actual.value.varchar_value) ==
-             Unquote(want.substr(1));
+      return std::string(actual.value.varchar_value) == Unquote(want.substr(1));
     }
     const std::string unquoted = Unquote(want);
     const std::string actual_str = std::string(actual.value.varchar_value);
-    if (actual_str == unquoted) { return true; }
+    if (actual_str == unquoted) {
+      return true;
+    }
     auto normalize_ws = [](std::string_view str) -> std::string {
       std::string out;
       bool in_space = false;
       for (char c : str) {
         if (std::isspace(static_cast<unsigned char>(c))) {
-          if (!in_space && !out.empty() && out.back() != '[' && out.back() != '(' && out.back() != '{' && out.back() != ',') {
+          if (!in_space && !out.empty() && out.back() != '[' &&
+              out.back() != '(' && out.back() != '{' && out.back() != ',') {
             out.push_back(' ');
           }
           in_space = true;
         } else {
-          if (in_space && !out.empty() && (c == ']' || c == ')' || c == '}' || c == ',')) {
-            if (out.back() == ' ') { out.pop_back(); }
+          if (in_space && !out.empty() &&
+              (c == ']' || c == ')' || c == '}' || c == ',')) {
+            if (out.back() == ' ') {
+              out.pop_back();
+            }
           }
           in_space = false;
           out.push_back(c);
         }
       }
-      if (!out.empty() && out.back() == ' ') { out.pop_back(); }
+      if (!out.empty() && out.back() == ' ') {
+        out.pop_back();
+      }
       return out;
     };
     if (normalize_ws(actual_str) == normalize_ws(unquoted) ||
@@ -666,11 +869,17 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     }
     const std::string norm_actual = Unquote(actual_str);
     if ("{" + actual_str + "}" == unquoted || "{" + actual_str + "}" == want ||
-        "{" + norm_actual + "}" == unquoted || "{" + norm_actual + "}" == want) { return true; }
+        "{" + norm_actual + "}" == unquoted ||
+        "{" + norm_actual + "}" == want) {
+      return true;
+    }
     if (!want.empty() && want.front() == '{' && want.back() == '}' &&
-        !norm_actual.empty() && norm_actual.front() == '{' && norm_actual.back() == '}') {
-      std::vector<std::string> want_parts = SplitTopLevel(want.substr(1, want.size() - 2));
-      std::vector<std::string> got_parts = SplitTopLevel(norm_actual.substr(1, norm_actual.size() - 2));
+        !norm_actual.empty() && norm_actual.front() == '{' &&
+        norm_actual.back() == '}') {
+      std::vector<std::string> want_parts =
+          SplitTopLevel(want.substr(1, want.size() - 2));
+      std::vector<std::string> got_parts =
+          SplitTopLevel(norm_actual.substr(1, norm_actual.size() - 2));
       if (want_parts.size() == got_parts.size()) {
         bool matched = true;
         for (size_t idx = 0; idx < want_parts.size(); ++idx) {
@@ -685,17 +894,29 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
             got_elem = Trim(got_elem.substr(colon_g + 1));
           }
           if (ToLower(got_elem) == "null") {
-            if (ToLower(want_elem) != "null") { matched = false; break; }
-          } else if (ToLower(got_elem) == "true" || ToLower(got_elem) == "false") {
-            if (ToLower(want_elem) != ToLower(got_elem)) { matched = false; break; }
-          } else if (!ComplianceValueMatches(Value(std::string(got_elem)), want_elem)) {
-            matched = false; break;
+            if (ToLower(want_elem) != "null") {
+              matched = false;
+              break;
+            }
+          } else if (ToLower(got_elem) == "true" ||
+                     ToLower(got_elem) == "false") {
+            if (ToLower(want_elem) != ToLower(got_elem)) {
+              matched = false;
+              break;
+            }
+          } else if (!ComplianceValueMatches(Value(std::string(got_elem)),
+                                             want_elem)) {
+            matched = false;
+            break;
           }
         }
-        if (matched) { return true; }
+        if (matched) {
+          return true;
+        }
       }
     }
-    // Match timestamps where reference output includes timezone suffix like -08, +00, etc.
+    // Match timestamps where reference output includes timezone suffix like
+    // -08, +00, etc.
     if (unquoted.size() > 3 &&
         (unquoted[unquoted.size() - 3] == '-' ||
          unquoted[unquoted.size() - 3] == '+') &&
@@ -708,21 +929,29 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       }
     }
     if (actual_str.size() >= 19 && unquoted.size() >= 19 &&
-        actual_str[4] == '-' && actual_str[7] == '-' &&
-        unquoted[4] == '-' && unquoted[7] == '-') {
-      auto parse_ts_utc = [](std::string_view s) -> std::pair<bool, std::pair<int64_t, int64_t>> {
+        actual_str[4] == '-' && actual_str[7] == '-' && unquoted[4] == '-' &&
+        unquoted[7] == '-') {
+      auto parse_ts_utc = [](std::string_view s)
+          -> std::pair<bool, std::pair<int64_t, int64_t>> {
         int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
-        if (sscanf(s.data(), "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) < 6) {
+        if (sscanf(s.data(), "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) <
+            6) {
           return {false, {0, 0}};
         }
         int64_t sub_ns = 0;
         size_t dot = s.find('.');
         if (dot != std::string_view::npos) {
           size_t end_d = dot + 1;
-          while (end_d < s.size() && s[end_d] >= '0' && s[end_d] <= '9') { ++end_d; }
+          while (end_d < s.size() && s[end_d] >= '0' && s[end_d] <= '9') {
+            ++end_d;
+          }
           std::string frac_str(s.substr(dot + 1, end_d - (dot + 1)));
-          while (frac_str.size() < 9) { frac_str.push_back('0'); }
-          if (frac_str.size() > 9) { frac_str = frac_str.substr(0, 9); }
+          while (frac_str.size() < 9) {
+            frac_str.push_back('0');
+          }
+          if (frac_str.size() > 9) {
+            frac_str = frac_str.substr(0, 9);
+          }
           sub_ns = std::stoll(frac_str);
         }
         int tz_sec = 0;
@@ -736,11 +965,12 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
           }
           tz_sec = (tzh * 3600 + tzm * 60) * (s[tz_pos] == '-' ? -1 : 1);
         }
-        std::chrono::year_month_day ymd{std::chrono::year{Y},
-                                        std::chrono::month{static_cast<unsigned>(M)},
-                                        std::chrono::day{static_cast<unsigned>(D)}};
+        std::chrono::year_month_day ymd{
+            std::chrono::year{Y}, std::chrono::month{static_cast<unsigned>(M)},
+            std::chrono::day{static_cast<unsigned>(D)}};
         int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
-        int64_t total_secs = days * 86400LL + h * 3600LL + m * 60LL + sec - tz_sec;
+        int64_t total_secs =
+            days * 86400LL + h * 3600LL + m * 60LL + sec - tz_sec;
         return {true, {total_secs, sub_ns}};
       };
       auto [ok1, utc1] = parse_ts_utc(actual_str);
@@ -757,6 +987,5 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   }
   return FormatComplianceValue(actual) == Unquote(want);
 }
-
 
 }  // namespace tinylamb

@@ -15,28 +15,29 @@
  */
 
 #include "type/value.hpp"
+
 #include <endian.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
-
 #include <cstring>
 #include <functional>
 #include <limits>
-#include <string>
-#include <vector>
-#include <utility>
-#include <stdexcept>
 #include <ostream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "common/serdes.hpp"
-#include "type/value_type.hpp"
 #include "type/date.hpp"
 #include "type/interval.hpp"
+#include "type/value_type.hpp"
 
 namespace tinylamb {
 
@@ -71,7 +72,6 @@ std::string ToString(UnaryOperation type) {
   return "UNKNOWN";
 }
 
-
 std::string ToString(AggregationType type) {
   switch (type) {
     case AggregationType::kCount:
@@ -94,6 +94,32 @@ std::string ToString(AggregationType type) {
       return "STRING_AGG";
     case AggregationType::kCountIf:
       return "COUNTIF";
+    case AggregationType::kAnyValue:
+      return "ANY_VALUE";
+    case AggregationType::kVarPop:
+      return "VAR_POP";
+    case AggregationType::kVarSamp:
+      return "VAR_SAMP";
+    case AggregationType::kStddevPop:
+      return "STDDEV_POP";
+    case AggregationType::kStddevSamp:
+      return "STDDEV_SAMP";
+    case AggregationType::kCovarPop:
+      return "COVAR_POP";
+    case AggregationType::kCovarSamp:
+      return "COVAR_SAMP";
+    case AggregationType::kCorr:
+      return "CORR";
+    case AggregationType::kBitAnd:
+      return "BIT_AND";
+    case AggregationType::kBitOr:
+      return "BIT_OR";
+    case AggregationType::kBitXor:
+      return "BIT_XOR";
+    case AggregationType::kElementwiseSum:
+      return "ELEMENTWISE_SUM";
+    case AggregationType::kElementwiseAvg:
+      return "ELEMENTWISE_AVG";
     default:
       return "UNKNOWN";
   }
@@ -138,8 +164,9 @@ Value Value::DateFromDays(int64_t days) {
 }
 
 int64_t Value::DateDays() const {
-  if (type != ValueType::kDate) { throw std::runtime_error("DATE value required");
-}
+  if (type != ValueType::kDate) {
+    throw std::runtime_error("DATE value required");
+  }
   return value.int_value;
 }
 
@@ -153,18 +180,21 @@ Value Value::Array(std::vector<Value> elements, std::string element_sql_type) {
 }
 
 const std::vector<Value>& Value::ArrayElements() const {
-  if (array_ == nullptr) { return kEmptyArrayElements; }
+  if (array_ == nullptr) {
+    return kEmptyArrayElements;
+  }
   return array_->elements;
 }
 
 const std::string& Value::ArrayElementSqlType() const {
   static const std::string kEmpty;
-  if (array_ == nullptr) { return kEmpty; }
+  if (array_ == nullptr) {
+    return kEmpty;
+  }
   return array_->element_sql_type;
 }
 
-Value::Value(const Value& o)
-    : value(o.value), type(o.type), array_(o.array_) {
+Value::Value(const Value& o) : value(o.value), type(o.type), array_(o.array_) {
   if (type == ValueType::kVarChar) {
     owned_data.assign(o.value.varchar_value);
     value.varchar_value = owned_data;
@@ -176,12 +206,16 @@ Value::Value(Value&& o) noexcept
       type(o.type),
       owned_data(std::move(o.owned_data)),
       array_(std::move(o.array_)) {
-  if (type == ValueType::kVarChar) { value.varchar_value = owned_data; }
+  if (type == ValueType::kVarChar) {
+    value.varchar_value = owned_data;
+  }
   o.type = ValueType::kNull;
 }
 
 Value& Value::operator=(const Value& rhs) {
-  if (this == &rhs) { return *this; }
+  if (this == &rhs) {
+    return *this;
+  }
   type = rhs.type;
   value = rhs.value;
   owned_data.clear();
@@ -194,12 +228,16 @@ Value& Value::operator=(const Value& rhs) {
 }
 
 Value& Value::operator=(Value&& o) noexcept {
-  if (this == &o) { return *this; }
+  if (this == &o) {
+    return *this;
+  }
   owned_data = std::move(o.owned_data);
   array_ = std::move(o.array_);
   type = o.type;
   value = o.value;
-  if (type == ValueType::kVarChar) { value.varchar_value = owned_data; }
+  if (type == ValueType::kVarChar) {
+    value.varchar_value = owned_data;
+  }
   o.type = ValueType::kNull;
   return *this;
 }
@@ -229,7 +267,9 @@ bool Value::Truthy() const {
       size_t bytes = sizeof(uint32_t) + SerializeSize(ArrayElementSqlType());
       for (const Value& element : ArrayElements()) {
         bytes += 1;
-        if (!element.IsNull()) { bytes += 1 + element.Size(); }
+        if (!element.IsNull()) {
+          bytes += 1 + element.Size();
+        }
       }
       return bytes;
     }
@@ -336,7 +376,9 @@ size_t Value::SkipSerialized(const char* src, ValueType as_type) {
       cursor += DeserializeStringView(cursor, &sql_type);
       for (uint32_t i = 0; i < count; ++i) {
         const bool present = *cursor++ != 0;
-        if (!present) { continue; }
+        if (!present) {
+          continue;
+        }
         const auto elem_type = static_cast<ValueType>(*cursor++);
         cursor += SkipSerialized(cursor, elem_type);
       }
@@ -357,7 +399,9 @@ size_t Value::SkipSerialized(const char* src, ValueType as_type) {
     case ValueType::kVarChar:
       return "\"" + std::string(value.varchar_value) + "\"";
     case ValueType::kDouble: {
-      if (std::isnan(value.double_value)) { return "nan"; }
+      if (std::isnan(value.double_value)) {
+        return "nan";
+      }
       if (std::isinf(value.double_value)) {
         return value.double_value > 0 ? "inf" : "-inf";
       }
@@ -367,12 +411,13 @@ size_t Value::SkipSerialized(const char* src, ValueType as_type) {
       return std::string(buffer, ptr - buffer);
     }
 
-
     case ValueType::kArray: {
       std::string out = "ARRAY<" + ArrayElementSqlType() + ">[";
       const auto& elements = ArrayElements();
       for (size_t i = 0; i < elements.size(); ++i) {
-        if (i != 0) { out += ", "; }
+        if (i != 0) {
+          out += ", ";
+        }
         out += elements[i].IsNull() ? "NULL" : elements[i].AsString();
       }
       out += "]";
@@ -395,7 +440,9 @@ bool Value::operator==(const Value& rhs) const {
     case ValueType::kVarChar: {
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
-      if (sv1 == sv2) { return true; }
+      if (sv1 == sv2) {
+        return true;
+      }
       auto is_iv = [](std::string_view s) {
         return s.find('-') != std::string_view::npos &&
                s.find(' ') != std::string_view::npos &&
@@ -578,7 +625,9 @@ size_t Value::DecodeMemcomparableFormat(const char* src) {
       cursor += sizeof(be);
       const uint32_t count = be32toh(be);
       const char* type_begin = cursor;
-      while (*cursor != '\0') { ++cursor; }
+      while (*cursor != '\0') {
+        ++cursor;
+      }
       std::string sql_type(type_begin, cursor);
       ++cursor;
       std::vector<Value> elements;
@@ -626,8 +675,33 @@ bool Value::operator<(const Value& rhs) const {
     }
     case ValueType::kDouble:
       return value.double_value < rhs.value.double_value;
-    case ValueType::kArray:
-      return ArrayElements() < rhs.ArrayElements();
+    case ValueType::kArray: {
+      // Total order over array payloads: element-wise with SQL NULL ordering
+      // lowest; vector's operator< would throw on embedded NULL elements.
+      const std::vector<Value>& lhs_elements = ArrayElements();
+      const std::vector<Value>& rhs_elements = rhs.ArrayElements();
+      const size_t common = std::min(lhs_elements.size(), rhs_elements.size());
+      for (size_t i = 0; i < common; ++i) {
+        const bool l_null = lhs_elements[i].IsNull();
+        const bool r_null = rhs_elements[i].IsNull();
+        if (l_null && r_null) {
+          continue;
+        }
+        if (l_null) {
+          return true;
+        }
+        if (r_null) {
+          return false;
+        }
+        if (lhs_elements[i] < rhs_elements[i]) {
+          return true;
+        }
+        if (rhs_elements[i] < lhs_elements[i]) {
+          return false;
+        }
+      }
+      return lhs_elements.size() < rhs_elements.size();
+    }
   }
   throw std::runtime_error("undefined type");
 }
@@ -669,8 +743,7 @@ Value Value::operator+(const Value& rhs) const {
   }
   if (type == ValueType::kInt64) {
     int64_t result = 0;
-    if (__builtin_add_overflow(value.int_value, rhs.value.int_value,
-                               &result)) {
+    if (__builtin_add_overflow(value.int_value, rhs.value.int_value, &result)) {
       throw std::runtime_error("integer overflow on '+'");
     }
     return Value(result);
@@ -692,8 +765,7 @@ Value Value::operator-(const Value& rhs) const {
   }
   if (type == ValueType::kInt64) {
     int64_t result = 0;
-    if (__builtin_sub_overflow(value.int_value, rhs.value.int_value,
-                               &result)) {
+    if (__builtin_sub_overflow(value.int_value, rhs.value.int_value, &result)) {
       throw std::runtime_error("integer overflow on '-'");
     }
     return Value(result);
@@ -710,8 +782,7 @@ Value Value::operator*(const Value& rhs) const {
   }
   if (type == ValueType::kInt64) {
     int64_t result = 0;
-    if (__builtin_mul_overflow(value.int_value, rhs.value.int_value,
-                               &result)) {
+    if (__builtin_mul_overflow(value.int_value, rhs.value.int_value, &result)) {
       throw std::runtime_error("integer overflow on '*'");
     }
     return Value(result);
@@ -869,7 +940,8 @@ uint64_t std::hash<tinylamb::Value>::operator()(
         tinylamb::IntervalValue iv = tinylamb::IntervalValue::Parse(sv);
         constexpr int64_t kDayNanos = 24LL * 3600LL * 1000000000LL;
         constexpr int64_t kMonthNanos = 30LL * kDayNanos;
-        int64_t total = iv.months * kMonthNanos + iv.days * kDayNanos + iv.nanos;
+        int64_t total =
+            iv.months * kMonthNanos + iv.days * kDayNanos + iv.nanos;
         return std::hash<int64_t>()(total);
       }
       return std::hash<std::string_view>()(sv);

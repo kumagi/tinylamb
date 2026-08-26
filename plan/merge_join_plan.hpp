@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_MERGE_JOIN_PLAN_HPP
 #define TINYLAMB_MERGE_JOIN_PLAN_HPP
 
+#include "expression/expression.hpp"
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
 #include "table/table_statistics.hpp"
@@ -12,8 +13,8 @@ namespace tinylamb {
 class MergeJoinPlan final : public PlanBase {
  public:
   MergeJoinPlan(Plan left, std::vector<ColumnName> left_keys, Plan right,
-                std::vector<ColumnName> right_keys,
-                JoinKind kind = JoinKind{});
+                std::vector<ColumnName> right_keys, JoinKind kind = JoinKind{},
+                Expression residual = Expression());
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] const Table* ScanSource() const override { return nullptr; }
@@ -38,6 +39,9 @@ class MergeJoinPlan final : public PlanBase {
     return right_keys_;
   }
   [[nodiscard]] JoinKind Kind() const { return kind_; }
+  // Optional inequality (or general non-equality) predicate evaluated on the
+  // concatenated left+right rows; pairs failing it are not matches.
+  [[nodiscard]] const Expression& Residual() const { return residual_; }
 
  private:
   Plan left_;
@@ -45,6 +49,7 @@ class MergeJoinPlan final : public PlanBase {
   std::vector<ColumnName> left_keys_;
   std::vector<ColumnName> right_keys_;
   JoinKind kind_{};
+  Expression residual_{};
   Schema schema_;
   TableStatistics stats_;
 };

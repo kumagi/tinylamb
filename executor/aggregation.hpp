@@ -21,10 +21,11 @@
 #include <optional>
 #include <vector>
 
+#include "executor/detail/expression_eval.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/aggregate_expression.hpp"
-#include "expression/named_expression.hpp"
 #include "expression/jit.hpp"
+#include "expression/named_expression.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
@@ -56,9 +57,9 @@ class AggregationExecutor : public ExecutorBase {
   // How each aggregate reads its input for the vectorized accumulator path.
   // kGeneric falls back to the per-row Evaluate loop below.
   enum class AggregateInputKind {
-    kCountStar,     // COUNT(*): fed straight from the batch row count.
-    kTypedColumn,   // non-distinct column reference over int64/double data.
-    kTypedConstant, // non-distinct constant argument folded once per batch.
+    kCountStar,      // COUNT(*): fed straight from the batch row count.
+    kTypedColumn,    // non-distinct column reference over int64/double data.
+    kTypedConstant,  // non-distinct constant argument folded once per batch.
     kGeneric,
   };
   struct AggregateInput {
@@ -78,6 +79,12 @@ class AggregationExecutor : public ExecutorBase {
   Schema input_schema_;
   std::vector<NamedExpression> aggregates_;
   std::vector<AggregateInput> inputs_;
+  // Aggregates whose semantics live in AggregateAccumulator (buffered or
+  // specialized types such as ARRAY_AGG / ELEMENTWISE_* / statistics) are
+  // delegated instead of using the inline switch in NextGeneric.
+  std::vector<bool> delegates_to_accumulator_;
+  std::vector<std::unique_ptr<relational_detail::AggregateAccumulator>>
+      accumulators_;
   bool all_typed_{false};
   bool executed_ = false;
   DataChunk input_batch_;

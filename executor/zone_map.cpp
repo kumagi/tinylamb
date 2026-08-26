@@ -2,13 +2,13 @@
 #include "executor/zone_map.hpp"
 
 #include <cstdint>
-#include <string_view>
 #include <string>
-#include "type/value.hpp"
+#include <string_view>
+
 #include "common/constants.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
-
 void ZoneMap::Add(const Value& value) {
   initialized_ = true;
   if (value.IsNull()) {
@@ -16,12 +16,18 @@ void ZoneMap::Add(const Value& value) {
     return;
   }
   ++value_count_;
-  if (!minimum_ || value < *minimum_) { minimum_ = value;
+  // Array payloads can contain NULL elements; their ordering is undefined and
+  // irrelevant for scalar predicate pruning, so keep them out of min/max.
+  if (value.IsArray()) {
+    return;
+  }
+  if (!minimum_ || value < *minimum_) {
+    minimum_ = value;
+  }
+  if (!maximum_ || *maximum_ < value) {
+    maximum_ = value;
+  }
 }
-  if (!maximum_ || *maximum_ < value) { maximum_ = value;
-}
-}
-
 void ZoneMap::AddInt(int64_t value) {
   initialized_ = true;
   ++value_count_;

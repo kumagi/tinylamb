@@ -490,11 +490,10 @@ std::shared_ptr<SelectStatement> LiteralCteBody(const char* column,
                           ConstantValueExp(Value(literal))));
 }
 
-TEST(SqlTemplateTest, MultiWithWithLiteralsRefusesTemplateBinding) {
-  // WithQueries() is an unordered_map: the declaration order of two or more
-  // CTE bodies is unrecoverable, so binding them positionally could swap
-  // literals between bodies. Such statements must refuse template binding
-  // (the engine falls back to parsing verbatim) instead of risking a swap.
+TEST(SqlTemplateTest, MultiWithWithLiteralsBindInDeclarationOrder) {
+  // WithQueryOrder() preserves the declaration position of every CTE body,
+  // so multiple WITH entries bind their literals positionally without any
+  // risk of swapping parameters between bodies.
   auto cached = std::make_shared<SelectStatement>(
       std::vector<NamedExpression>{NamedExpression("k", ColumnValueExp("k"))},
       std::vector<std::string>{"t"},
@@ -502,9 +501,17 @@ TEST(SqlTemplateTest, MultiWithWithLiteralsRefusesTemplateBinding) {
                           ConstantValueExp(Value(3))));
   cached->AddWithQuery("zeta", LiteralCteBody("x", 1));
   cached->AddWithQuery("alpha", LiteralCteBody("y", 2));
-  // Exact parameter count so only the ordering guard can throw.
-  EXPECT_THROW(BindStatementLiterals(*cached, {Value(7), Value(8), Value(9)}),
-               std::runtime_error);
+  auto bound = BindStatementLiterals(*cached, {Value(7), Value(8), Value(9)});
+  const auto& select = dynamic_cast<const SelectStatement&>(*bound);
+  ASSERT_EQ(select.WithQueries().size(), 2U);
+  // Declaration order (zeta first) decides which literal lands in which
+  // body: zeta's x takes 7, alpha's y takes 8.
+  EXPECT_EQ(select.WithQueryOrder(),
+            (std::vector<std::string>{"zeta", "alpha"}));
+  EXPECT_EQ(select.WithQueries().at("zeta")->WhereClause()->ToString(),
+            "(x = 7)");
+  EXPECT_EQ(select.WithQueries().at("alpha")->WhereClause()->ToString(),
+            "(y = 8)");
 }
 
 TEST(SqlTemplateTest, BindsMultipleLiteralFreeWithQueries) {

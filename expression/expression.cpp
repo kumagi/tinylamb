@@ -21,12 +21,12 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
-#include <vector>
 #include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
-#include "expression/array_expression.hpp"
 #include "expression/aggregate_expression.hpp"
+#include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
@@ -35,6 +35,7 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/lambda_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "type/column_name.hpp"
@@ -94,11 +95,14 @@ const CastExpression& ExpressionBase::AsCastExpression() const {
   return dynamic_cast<const CastExpression&>(*this);
 }
 
+const LambdaExpression& ExpressionBase::AsLambdaExpression() const {
+  return dynamic_cast<const LambdaExpression&>(*this);
+}
+
 std::unordered_set<ColumnName> ExpressionBase::TouchedColumns() const {
   std::unordered_set<ColumnName> result;
   return result;
 }
-
 
 Expression ColumnValueExp(const ColumnName& col_name) {
   return std::make_shared<ColumnValue>(col_name);
@@ -151,8 +155,19 @@ Expression QueryExpressionExp(std::shared_ptr<SelectStatement> query,
                                            exists, negated);
 }
 
+Expression QuantifiedQueryExpressionExp(std::shared_ptr<SelectStatement> query,
+                                        Expression test, std::string compare_op,
+                                        bool any_mode) {
+  return std::make_shared<QueryExpression>(std::move(query), std::move(test),
+                                           std::move(compare_op), any_mode);
+}
+
+Expression ArraySubqueryExpressionExp(std::shared_ptr<SelectStatement> query) {
+  return QueryExpression::ArraySubquery(std::move(query));
+}
+
 Expression IntervalExpressionExp(int64_t amount, std::string unit,
-                                std::string raw_amount) {
+                                 std::string raw_amount) {
   return std::make_shared<IntervalExpression>(amount, std::move(unit),
                                               std::move(raw_amount));
 }
@@ -165,9 +180,14 @@ Expression ArrayExpressionExp(std::vector<Expression> elements,
 
 Expression CastExpressionExp(Expression child, std::string target_type_name,
                              bool return_null_on_error) {
-  return std::make_shared<CastExpression>(std::move(child),
-                                          std::move(target_type_name),
-                                          return_null_on_error);
+  return std::make_shared<CastExpression>(
+      std::move(child), std::move(target_type_name), return_null_on_error);
+}
+
+Expression LambdaExpressionExp(std::vector<std::string> parameters,
+                               Expression body) {
+  return std::make_shared<LambdaExpression>(std::move(parameters),
+                                            std::move(body));
 }
 
 }  // namespace tinylamb
