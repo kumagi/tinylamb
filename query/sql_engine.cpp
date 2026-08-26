@@ -1109,6 +1109,11 @@ void SplitProtoTextEntries(const std::string& text,
       ++i;
     }
     if (i >= text.size()) { break; }
+    if (text[i] == '#') {
+      // Comment token: skip through end of line.
+      while (i < text.size() && text[i] != '\n') { ++i; }
+      continue;
+    }
     if (text[i] == '{' || text[i] == '}') {
       ++i;
       continue;

@@ -748,16 +748,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         const bool compatible =
             (is_int_family(norm_want) && is_int_family(norm_actual)) ||
             (is_float_family(norm_want) && is_float_family(norm_actual)) ||
-            ((norm_want == "bytes") && norm_actual == "string") ||
-            // Struct/proto/enum element goldens compare by member values;
-            // engines that lose the declared element tag still match when
-            // every element is value-compared below.
-            (norm_want.starts_with("struct<") &&
-             (norm_actual == "int64" || norm_actual == "string" ||
-              norm_actual == "struct")) ||
-            ((norm_want.starts_with("proto<") ||
-              norm_want.starts_with("enum<")) &&
-             norm_actual == "int64");
+            ((norm_want == "bytes") && norm_actual == "string");
         if (!all_null && !compatible) {
           return false;
         }

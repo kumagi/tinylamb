@@ -307,6 +307,16 @@ Value ProtoTextScalar(std::string_view raw) {
 // array.  Mirrors the interpreter-side extractor for plan-executor use.
 bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
                                Value* out) {
+  // Proto presence fields (`has_xxx`) report whether `xxx` occurs.
+  if (key.size() > 4 && key.substr(0, 4) == "has_") {
+    Value probe;
+    if (!ProtoTextExtractFieldShim(text, key.substr(4), &probe)) {
+      *out = Value(int64_t{0});
+      return true;
+    }
+    *out = Value(int64_t{1});
+    return true;
+  }
   std::vector<Value> matches;
   size_t i = 0;
   while (i < text.size()) {
@@ -315,6 +325,11 @@ bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
       ++i;
     }
     if (i >= text.size()) { break; }
+    if (text[i] == '#') {
+      // Comment token: skip through end of line.
+      while (i < text.size() && text[i] != '\n') { ++i; }
+      continue;
+    }
     if (text[i] == '{' || text[i] == '}') {
       ++i;
       continue;
