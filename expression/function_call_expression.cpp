@@ -22,6 +22,7 @@
 #include <ctime>
 #include <iomanip>
 #include <ostream>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -341,15 +342,16 @@ Value ExecuteFunction(const std::string& name,
     if (values.size() != 2) {
       throw std::runtime_error("get_field requires 2 arguments");
     }
-    if (values[0].IsNull()) { return {};
-}
+    if (values[0].IsNull()) {
+      return {};
+    }
     const std::string object = raw_str(values[0]);
     const std::string field = raw_str(values[1]);
     if (object.size() < 2 || object.front() != '{' || object.back() != '}') {
       throw std::runtime_error("get_field requires a STRUCT");
     }
-    const auto members = SplitJsonObjectMembers(object.substr(
-        1, object.size() - 2));
+    const auto members =
+        SplitJsonObjectMembers(object.substr(1, object.size() - 2));
     for (const auto& [key, text] : members) {
       if (IdentifierEquals(key, field)) {
         Value parsed;
@@ -360,6 +362,18 @@ Value ExecuteFunction(const std::string& name,
       }
     }
     throw std::runtime_error("field not found: " + field);
+  }
+  if (name == "rand") {
+    if (!values.empty()) {
+      throw std::runtime_error("RAND requires no arguments");
+    }
+    static thread_local std::mt19937_64 rng(
+        std::random_device{}() ^
+        static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    static thread_local std::uniform_real_distribution<double> uniform(0.0,
+                                                                       1.0);
+    return Value(uniform(rng));
   }
   if (name == "coalesce") {
     for (const auto& val : values) {

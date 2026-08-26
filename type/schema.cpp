@@ -53,17 +53,37 @@ std::unordered_set<ColumnName> Schema::ColumnSet() const {
 }
 
 int Schema::Offset(const ColumnName& col_name) const {
+  // SQL identifiers are case-insensitive unless quoted; ColumnName does not
+  // carry quotedness, so resolution folds case everywhere.
+  auto equals = [](std::string_view left, std::string_view right) {
+    if (left.size() != right.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < left.size(); ++i) {
+      const char lc = left[i] >= 'A' && left[i] <= 'Z'
+                          ? static_cast<char>(left[i] + ('a' - 'A'))
+                          : left[i];
+      const char rc = right[i] >= 'A' && right[i] <= 'Z'
+                          ? static_cast<char>(right[i] + ('a' - 'A'))
+                          : right[i];
+      if (lc != rc) {
+        return false;
+      }
+    }
+    return true;
+  };
   if (!col_name.schema.empty() && !Name().empty() &&
-      Name() != col_name.schema) {
+      !equals(Name(), col_name.schema)) {
     return -1;
   }
   for (size_t i = 0; i < columns_.size(); ++i) {
     const ColumnName& cn = columns_[i].Name();
     if (col_name.schema.empty()) {
-      if (cn.name == col_name.name) {
+      if (equals(cn.name, col_name.name)) {
         return static_cast<int>(i);
       }
-    } else if (cn == col_name) {
+    } else if (equals(cn.name, col_name.name) &&
+               equals(cn.schema, col_name.schema)) {
       return static_cast<int>(i);
     }
   }

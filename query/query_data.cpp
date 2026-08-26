@@ -20,6 +20,7 @@
 
 #include "query_data.hpp"
 
+#include <cctype>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -28,6 +29,15 @@
 #include <vector>
 
 #include "common/constants.hpp"
+
+namespace {
+std::string ToLowerCopy(std::string value) {
+  for (char& c : value) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return value;
+}
+}  // namespace
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/aggregate_expression.hpp"
@@ -47,13 +57,16 @@ namespace tinylamb {
 
 namespace {
 
-Status ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree resolution by design; trees are parser-bounded in depth.
+Status
+ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
+                    // resolution by design; trees are parser-bounded in depth.
     Expression& exp,
     const std::unordered_map<std::string, std::string>& col_table_map,
     const std::unordered_set<std::string>& ambiguous_colum_name,
     const std::unordered_set<std::string>& relations) {
-  if (!exp) { return Status::kSuccess;
-}
+  if (!exp) {
+    return Status::kSuccess;
+  }
   if (exp->Type() == TypeTag::kColumnValue) {
     auto& cv = exp->AsColumnValue();
     const ColumnName& col_name = cv.GetColumnName();
@@ -62,14 +75,15 @@ Status ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-
     // implementations can rename their output schemas to match it
     // (Phase 8 aliases/self-joins).
     if (!col_name.schema.empty()) {
-      if (!relations.contains(col_name.schema)) { return Status::kNotExists;
-}
+      if (!relations.contains(col_name.schema)) {
+        return Status::kNotExists;
+      }
       return Status::kSuccess;
     }
-    if (ambiguous_colum_name.contains(col_name.name)) {
+    if (ambiguous_colum_name.contains(ToLowerCopy(col_name.name))) {
       return Status::kAmbiguousQuery;
     }
-    const auto it = col_table_map.find(col_name.name);
+    const auto it = col_table_map.find(ToLowerCopy(col_name.name));
     if (it == col_table_map.end()) {
       return Status::kNotExists;
     }
@@ -79,22 +93,22 @@ Status ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-
   if (exp->Type() == TypeTag::kBinaryExp) {
     Expression left = exp->AsBinaryExpression().Left();
     Expression right = exp->AsBinaryExpression().Right();
-    RETURN_IF_FAIL(
-        ResolveExpression(left, col_table_map, ambiguous_colum_name, relations));
-    RETURN_IF_FAIL(
-        ResolveExpression(right, col_table_map, ambiguous_colum_name, relations));
+    RETURN_IF_FAIL(ResolveExpression(left, col_table_map, ambiguous_colum_name,
+                                     relations));
+    RETURN_IF_FAIL(ResolveExpression(right, col_table_map, ambiguous_colum_name,
+                                     relations));
   } else if (exp->Type() == TypeTag::kUnaryExp) {
     Expression child = exp->AsUnaryExpression().Child();
-    RETURN_IF_FAIL(
-        ResolveExpression(child, col_table_map, ambiguous_colum_name, relations));
+    RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
+                                     relations));
   } else if (exp->Type() == TypeTag::kAggregateExp) {
     Expression child = exp->AsAggregateExpression().Child();
     if (child->Type() == TypeTag::kColumnValue &&
         child->AsColumnValue().GetColumnName().name == "*") {
       return Status::kSuccess;
     }
-    RETURN_IF_FAIL(
-        ResolveExpression(child, col_table_map, ambiguous_colum_name, relations));
+    RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
+                                     relations));
   } else if (exp->Type() == TypeTag::kCaseExp) {
     const auto& case_expression = exp->AsCaseExpression();
     for (const auto& clause : case_expression.when_clauses_) {
@@ -111,8 +125,8 @@ Status ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-
   } else if (exp->Type() == TypeTag::kInExp) {
     const auto& in = exp->AsInExpression();
     Expression child = in.child_;
-    RETURN_IF_FAIL(
-        ResolveExpression(child, col_table_map, ambiguous_colum_name, relations));
+    RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
+                                     relations));
     for (Expression item : in.list_) {
       RETURN_IF_FAIL(ResolveExpression(item, col_table_map,
                                        ambiguous_colum_name, relations));
@@ -139,7 +153,7 @@ Status ResolveSelect(
       if (col_name.name == "*") {
         it = select.erase(it);
         for (const auto& cols : all_cols) {
-          if (ambiguous_colum_name.contains(cols.name)) {
+          if (ambiguous_colum_name.contains(ToLowerCopy(cols.name))) {
             it = select.insert(it, NamedExpression(cols));
           } else {
             it = select.insert(it, NamedExpression(cols.name, cols));
@@ -155,7 +169,7 @@ Status ResolveSelect(
         ++it;
         continue;
       }
-      const auto col_it = col_table_map.find(col_name.name);
+      const auto col_it = col_table_map.find(ToLowerCopy(col_name.name));
       if (col_it == col_table_map.end()) {
         return Status::kNotExists;
       }
@@ -188,15 +202,17 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
     const auto aliased = aliases_.find(relation);
     const std::string& physical =
         aliased == aliases_.end() ? relation : aliased->second;
-    ASSIGN_OR_RETURN(std::shared_ptr<Table>, from_table, ctx.GetTable(physical));
+    ASSIGN_OR_RETURN(std::shared_ptr<Table>, from_table,
+                     ctx.GetTable(physical));
     const Schema& sc = from_table->GetSchema();
     for (size_t i = 0; i < sc.ColumnCount(); ++i) {
       const ColumnName& col_name = sc.GetColumn(i).Name();
       all_cols.emplace_back(relation, col_name.name);
-      if (!col_table_map.contains(col_name.name)) {
-        col_table_map.emplace(col_name.name, relation);
+      const std::string lower_name = ToLowerCopy(col_name.name);
+      if (!col_table_map.contains(lower_name)) {
+        col_table_map.emplace(lower_name, relation);
       } else {
-        ambiguous_colum_name.emplace(col_name.name);
+        ambiguous_colum_name.emplace(lower_name);
       }
     }
   }

@@ -143,6 +143,10 @@ std::string ToString(AggregationType type) {
       return "KLL_QUANTILES.INIT_DOUBLE";
     case AggregationType::kKllMergePartial:
       return "KLL_QUANTILES.MERGE_PARTIAL";
+    case AggregationType::kPercentileCont:
+      return "PERCENTILE_CONT";
+    case AggregationType::kApproxCountDistinct:
+      return "APPROX_COUNT_DISTINCT";
     default:
       return "UNKNOWN";
   }

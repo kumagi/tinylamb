@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/digest.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
@@ -1086,8 +1088,7 @@ void AggregateAccumulator::ApplyCore(
     }
     case AggregationType::kArrayConcatAgg:
       if (!value.IsArray()) {
-        throw std::runtime_error(
-            "ARRAY_CONCAT_AGG requires an ARRAY argument");
+        throw std::runtime_error("ARRAY_CONCAT_AGG requires an ARRAY argument");
       }
       if (concat_elem_type_.empty()) {
         concat_elem_type_ = value.ArrayElementSqlType();
@@ -1155,6 +1156,41 @@ void AggregateAccumulator::ApplyCore(
     case AggregationType::kKllMergePartial:
       SketchMerge(value);
       break;
+    case AggregationType::kApproxCountDistinct:
+      if (!approx_distinct_) {
+        approx_distinct_ = std::make_unique<std::unordered_set<Value>>();
+      }
+      approx_distinct_->insert(value);
+      break;
+    case AggregationType::kPercentileCont: {
+      if (trailing_values.empty()) {
+        throw std::runtime_error("PERCENTILE_CONT requires two arguments");
+      }
+      const Value& percentile = trailing_values[0];
+      if (percentile.IsNull() || (percentile.type != ValueType::kInt64 &&
+                                  percentile.type != ValueType::kDouble)) {
+        throw std::runtime_error(
+            "The second argument to PERCENTILE_CONT must be numeric");
+      }
+      const double p = percentile.type == ValueType::kInt64
+                           ? static_cast<double>(percentile.value.int_value)
+                           : percentile.value.double_value;
+      if (!(p >= 0.0 && p <= 1.0)) {
+        throw std::runtime_error(
+            "The second argument to PERCENTILE_CONT must be between 0 and 1");
+      }
+      percentile_p_ = p;
+      percentile_p_valid_ = true;
+      if (value.type == ValueType::kDouble) {
+        percentile_values_.push_back(value.value.double_value);
+      } else if (value.type == ValueType::kInt64) {
+        percentile_values_.push_back(
+            static_cast<double>(value.value.int_value));
+      } else {
+        throw std::runtime_error("numeric value required");
+      }
+      break;
+    }
   }
 }
 
@@ -2109,9 +2145,9 @@ Value AggregateAccumulator::Finish() const {
         if (is_avg || ew_saw_double_[i]) {
           const double sum =
               ew_double_sum_[i] + static_cast<double>(ew_int_sum_[i]);
-          elements.push_back(is_avg
-                                 ? Value(sum / static_cast<double>(ew_count_[i]))
-                                 : Value(sum));
+          elements.push_back(
+              is_avg ? Value(sum / static_cast<double>(ew_count_[i]))
+                     : Value(sum));
         } else {
           elements.push_back(Value(ew_int_sum_[i]));
         }
@@ -2133,6 +2169,44 @@ Value AggregateAccumulator::Finish() const {
     case AggregationType::kKllInitUint64:
     case AggregationType::kKllInitDouble:
       return FinishSketch(/*extract_count=*/false);
+    case AggregationType::kApproxCountDistinct:
+      return Value(static_cast<int64_t>(
+          approx_distinct_ ? approx_distinct_->size() : 0));
+    case AggregationType::kPercentileCont: {
+      // GoogleSQL semantics: NULL inputs are ignored, NaN sorts before every
+      // other value (including -inf), and the result is linear interpolation
+      // over the sorted group values.
+      if (!percentile_p_valid_ || percentile_values_.empty()) {
+        return {};
+      }
+      const auto nan_first = [](double x, double y) {
+        const bool xn = std::isnan(x);
+        const bool yn = std::isnan(y);
+        if (xn || yn) {
+          return xn && !yn;
+        }
+        return x < y;
+      };
+      std::sort(percentile_values_.begin(), percentile_values_.end(),
+                nan_first);
+      const double position =
+          percentile_p_ * static_cast<double>(percentile_values_.size() - 1);
+      const size_t low = static_cast<size_t>(position);
+      const size_t high = low + 1 < percentile_values_.size() ? low + 1 : low;
+      const double a = percentile_values_[low];
+      const double b = percentile_values_[high];
+      // Guard the degenerate fractions: 0 * inf is NaN, so exact positions
+      // must return the boundary value untouched. The weighted form
+      // a*(1-f) + b*f matches the reference engine on infinite bounds.
+      const double fraction = position - static_cast<double>(low);
+      if (fraction <= 0.0) {
+        return Value(a);
+      }
+      if (fraction >= 1.0 || a == b) {
+        return Value(b);
+      }
+      return Value(a * (1.0 - fraction) + b * fraction);
+    }
   }
   return {};
 }
@@ -2732,6 +2806,63 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
   std::vector<Value> arguments;
   for (const Expression& argument : call.Args()) {
     arguments.push_back(Evaluate(argument, scope, aggregates, context, ctes));
+  }
+
+  if (name == "__struct_json__") {
+    // Runtime struct constructor installed by the visitor when struct
+    // fields could not be folded at plan time (aggregates, subqueries).
+    // Arguments alternate name / value / quoted-flag.
+    if (arguments.size() % 3 != 0) {
+      throw std::runtime_error("struct constructor arity");
+    }
+    std::string json = "{";
+    for (size_t i = 0; i < arguments.size(); i += 3) {
+      if (i != 0) {
+        json += ",";
+      }
+      std::string escaped;
+      const std::string field_name = raw_str(arguments[i]);
+      for (char c : field_name) {
+        if (c == '"' || c == '\\') {
+          escaped.push_back('\\');
+        }
+        escaped.push_back(c);
+      }
+      json += "\"" + escaped + "\":";
+      const Value& field_value = arguments[i + 1];
+      if (field_value.IsNull()) {
+        json += "null";
+        continue;
+      }
+      const bool quoted = Truthy(arguments[i + 2]);
+      if (quoted) {
+        std::string text = raw_str(field_value);
+        std::string escaped_text;
+        for (char c : text) {
+          if (c == '"' || c == '\\') {
+            escaped_text.push_back('\\');
+          }
+          escaped_text.push_back(c);
+        }
+        json += "\"" + escaped_text + "\"";
+        continue;
+      }
+      if (field_value.type == ValueType::kInt64) {
+        json += std::to_string(field_value.value.int_value);
+      } else if (field_value.type == ValueType::kDouble) {
+        const double d = field_value.value.double_value;
+        char buffer[64];
+        auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), d);
+        json.append(buffer, static_cast<size_t>(ptr - buffer));
+      } else if (field_value.type == ValueType::kVarChar) {
+        // Flag said unquoted: emit the text without JSON quoting.
+        json += raw_str(field_value);
+      } else {
+        json += field_value.AsString();
+      }
+    }
+    json += "}";
+    return Value(std::move(json));
   }
 
   auto to_lower = [](std::string_view s) -> std::string {
@@ -3551,7 +3682,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
   }
   if (name == "array_element_offset" || name == "array_element_ordinal" ||
       name == "array_element_safe_offset" ||
-      name == "array_element_safe_ordinal") {
+      name == "array_element_safe_ordinal" ||
+      name == "array_element_offset_safe" ||
+      name == "array_element_ordinal_safe") {
     if (arguments.size() != 2) {
       throw std::runtime_error("array element access requires 2 arguments");
     }
@@ -3580,6 +3713,16 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
                                 " is out of bounds");
       }
       return {};
+    }
+    if (index < 0 || index >= static_cast<int64_t>(elements.size())) {
+      // Out-of-range plain accesses are errors in GoogleSQL; only the SAFE
+      // variants yield NULL.
+      if (safe) {
+        return {};
+      }
+      throw std::runtime_error("Array index " +
+                               std::to_string(arguments[1].value.int_value) +
+                               " is out of bounds");
     }
     return elements[static_cast<size_t>(index)];
   }
@@ -7234,8 +7377,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (input.IsNull() || target.IsNull()) {
       return {};
     }
-    if (!input.IsArray() ||
-        (name != "array_includes" && !target.IsArray())) {
+    if (!input.IsArray() || (name != "array_includes" && !target.IsArray())) {
       throw std::runtime_error(name + " requires ARRAY arguments");
     }
     auto equals = [](const Value& left, const Value& right) {
@@ -7299,6 +7441,515 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     static thread_local std::uniform_real_distribution<double> uniform(0.0,
                                                                        1.0);
     return Value(uniform(rng));
+  }
+
+  if (name == "session_user" || name == "current_user") {
+    if (!arguments.empty()) {
+      throw std::runtime_error(name + " requires no arguments");
+    }
+    return Value(std::string("tinylamb"));
+  }
+
+  if (name == "generate_uuid") {
+    if (!arguments.empty()) {
+      throw std::runtime_error("GENERATE_UUID requires no arguments");
+    }
+    static thread_local std::mt19937_64 rng(
+        std::random_device{}() ^
+        static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    const uint64_t r1 = rng();
+    const uint64_t r2 = rng();
+    std::string uuid;
+    uuid.reserve(36);
+    auto append_hex = [&uuid](uint64_t value, int nibbles) {
+      static const char kDigits[] = "0123456789abcdef";
+      for (int i = nibbles - 1; i >= 0; --i) {
+        uuid.push_back(kDigits[(value >> (4 * i)) & 0xF]);
+      }
+    };
+    append_hex(r1 >> 32, 8);
+    uuid.push_back('-');
+    append_hex((r1 >> 16) & 0xFFFF, 4);
+    uuid.push_back('-');
+    uuid.push_back('4');  // RFC 4122 version 4 (random)
+    append_hex(r1 & 0x0FFF, 3);
+    uuid.push_back('-');
+    append_hex(0x8 + (r2 >> 62), 1);  // variant 10xx
+    append_hex((r2 >> 46) & 0x3FFF, 3);
+    uuid.push_back('-');
+    append_hex(r2 & 0xFFFFFFFFFFFFULL, 12);
+    return Value(std::move(uuid));
+  }
+
+  if (name == "md5" || name == "sha1" || name == "sha256" || name == "sha512") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error(name + " requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    const std::string input = raw_str(arguments[0]);
+    if (name == "md5") {
+      return Value(digest::Md5Digest(input));
+    }
+    if (name == "sha1") {
+      return Value(digest::Sha1Digest(input));
+    }
+    if (name == "sha256") {
+      return Value(digest::Sha256Digest(input));
+    }
+    return Value(digest::Sha512Digest(input));
+  }
+
+  if (name == "to_hex") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("TO_HEX requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    return Value(digest::ToHex(raw_str(arguments[0])));
+  }
+
+  if (name == "from_hex") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("FROM_HEX requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    std::string text = raw_str(arguments[0]);
+    std::string out;
+    out.reserve(text.size() / 2);
+    auto nibble = [](char c) -> int {
+      if (c >= '0' && c <= '9') {
+        return c - '0';
+      }
+      if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+      }
+      if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+      }
+      return -1;
+    };
+    size_t i = 0;
+    if (text.size() % 2 != 0) {
+      const int high = nibble(text[0]);
+      if (high < 0) {
+        throw std::runtime_error("FROM_HEX: invalid hex string");
+      }
+      out.push_back(static_cast<char>(high));
+      i = 1;
+    }
+    for (; i + 1 < text.size(); i += 2) {
+      const int hi = nibble(text[i]);
+      const int lo = nibble(text[i + 1]);
+      if (hi < 0 || lo < 0) {
+        throw std::runtime_error("FROM_HEX: invalid hex string");
+      }
+      out.push_back(static_cast<char>(hi * 16 + lo));
+    }
+    return Value(std::move(out));
+  }
+
+  if (name == "safe_convert_bytes_to_string") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error(
+          "SAFE_CONVERT_BYTES_TO_STRING requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    const std::string input = raw_str(arguments[0]);
+    std::string out;
+    out.reserve(input.size());
+    const std::string replacement = "\xEF\xBF\xBD";
+    for (size_t i = 0; i < input.size();) {
+      const unsigned char lead = static_cast<unsigned char>(input[i]);
+      size_t length = 0;
+      unsigned char min_cont = 0x80;
+      if (lead < 0x80) {
+        length = 1;
+      } else if (lead >= 0xC2 && lead <= 0xDF) {
+        length = 2;
+      } else if (lead >= 0xE0 && lead <= 0xEF) {
+        length = 3;
+        if (lead == 0xE0) {
+          min_cont = 0xA0;
+        }
+        if (lead == 0xED) { /* ED 9F BF is the last code point */
+        }
+      } else if (lead >= 0xF0 && lead <= 0xF4) {
+        length = 4;
+        if (lead == 0xF0) {
+          min_cont = 0x90;
+        }
+      }
+      bool valid = length > 0 && i + length <= input.size();
+      for (size_t j = 1; valid && j < length; ++j) {
+        const unsigned char cont = static_cast<unsigned char>(input[i + j]);
+        if (cont < (j == 1 ? min_cont : 0x80) || cont > 0xBF) {
+          valid = false;
+        }
+      }
+      if (valid && length == 1) {
+        out.push_back(input[i]);
+        ++i;
+      } else if (valid) {
+        out.append(input, i, length);
+        i += length;
+      } else {
+        out += replacement;
+        ++i;
+      }
+    }
+    return Value(std::move(out));
+  }
+
+  if (name == "bit_cast_to_int64" || name == "bit_cast_to_uint64") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error(name + " requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    const Value& input = arguments[0];
+    uint64_t bits = 0;
+    if (input.type == ValueType::kInt64) {
+      bits = static_cast<uint64_t>(input.value.int_value);
+    } else if (input.type == ValueType::kDouble) {
+      std::memcpy(&bits, &input.value.double_value, sizeof(bits));
+    } else if (input.type == ValueType::kVarChar) {
+      // BYTES payloads carry little-endian 64-bit patterns.
+      const std::string bytes = raw_str(input);
+      if (bytes.size() > 8) {
+        throw std::runtime_error("BIT_CAST requires at most 8 bytes");
+      }
+      for (size_t i = 0; i < bytes.size(); ++i) {
+        bits |= static_cast<uint64_t>(static_cast<unsigned char>(bytes[i]))
+                << (8 * i);
+      }
+    } else {
+      throw std::runtime_error("unsupported BIT_CAST input type");
+    }
+    if (name == "bit_cast_to_int64") {
+      return Value(static_cast<int64_t>(bits));
+    }
+    // UINT64 results above INT64_MAX have no exact in-engine representation:
+    // widen to double so they compare distinct from any signed value.
+    if (bits >= 0x8000000000000000ULL) {
+      return Value(static_cast<double>(bits));
+    }
+    return Value(static_cast<int64_t>(bits));
+  }
+
+  if (name == "error") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("ERROR requires 1 argument");
+    }
+    throw std::runtime_error(arguments[0].IsNull() ? "ERROR()"
+                                                   : raw_str(arguments[0]));
+  }
+
+  if (name == "array_reverse") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("ARRAY_REVERSE requires 1 argument");
+    }
+    const Value& array = arguments[0];
+    if (array.IsNull()) {
+      return {};
+    }
+    if (!array.IsArray()) {
+      throw std::runtime_error("ARRAY_REVERSE requires an ARRAY argument");
+    }
+    std::vector<Value> reversed(array.ArrayElements().rbegin(),
+                                array.ArrayElements().rend());
+    return Value::Array(std::move(reversed), array.ArrayElementSqlType());
+  }
+
+  if (name == "array_is_distinct") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("ARRAY_IS_DISTINCT requires 1 argument");
+    }
+    const Value& array = arguments[0];
+    if (array.IsNull()) {
+      return {};
+    }
+    if (!array.IsArray()) {
+      throw std::runtime_error("ARRAY_IS_DISTINCT requires an ARRAY argument");
+    }
+    const auto& elements = array.ArrayElements();
+    bool saw_null = false;
+    for (size_t i = 0; i < elements.size(); ++i) {
+      if (elements[i].IsNull()) {
+        if (saw_null) {
+          return Value(int64_t{0});
+        }
+        saw_null = true;
+        continue;
+      }
+      for (size_t j = 0; j < i; ++j) {
+        if (elements[j].IsNull()) {
+          continue;
+        }
+        try {
+          if (Binary(BinaryOperation::kEquals, elements[j], elements[i])
+                  .Truthy()) {
+            return Value(int64_t{0});
+          }
+        } catch (...) {
+          // incomparable element types are simply not duplicates
+        }
+      }
+    }
+    return Value(int64_t{1});
+  }
+
+  if (name == "array_first" || name == "array_last") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error(name + " requires 1 argument");
+    }
+    const Value& array = arguments[0];
+    if (array.IsNull()) {
+      return {};
+    }
+    if (!array.IsArray()) {
+      throw std::runtime_error(name + " requires an ARRAY argument");
+    }
+    if (array.ArrayElements().empty()) {
+      throw std::runtime_error(
+          name == "array_first"
+              ? "ARRAY_FIRST cannot get the first element of an empty array"
+              : "ARRAY_LAST cannot get the last element of an empty array");
+    }
+    if (name == "array_first") {
+      return array.ArrayElements().front();
+    }
+    return array.ArrayElements().back();
+  }
+
+  if (name == "array_slice") {
+    if (arguments.size() < 2 || arguments.size() > 3) {
+      throw std::runtime_error("ARRAY_SLICE requires two or three arguments");
+    }
+    const Value& array = arguments[0];
+    if (array.IsNull()) {
+      return {};
+    }
+    if (!array.IsArray()) {
+      throw std::runtime_error("ARRAY_SLICE requires an ARRAY argument");
+    }
+    auto as_index = [&](const Value& v) -> int64_t {
+      if (v.IsNull() ||
+          (v.type != ValueType::kInt64 && v.type != ValueType::kDouble)) {
+        throw std::runtime_error("ARRAY_SLICE offsets must be integers");
+      }
+      return v.type == ValueType::kInt64
+                 ? v.value.int_value
+                 : static_cast<int64_t>(v.value.double_value);
+    };
+    const auto& elements = array.ArrayElements();
+    const int64_t n = static_cast<int64_t>(elements.size());
+    const int64_t start_raw = as_index(arguments[1]);
+    const int64_t end_raw = arguments.size() == 3 ? as_index(arguments[2]) : n;
+    const auto normalize = [n](int64_t offset) -> int64_t {
+      if (offset < 0) {
+        offset += n;
+      }
+      if (offset < 0) {
+        return 0;
+      }
+      if (offset > n) {
+        return n;
+      }
+      return offset;
+    };
+    int64_t start = normalize(start_raw);
+    int64_t end = normalize(end_raw);
+    if (start > end) {
+      start = end;
+    }
+    std::vector<Value> sliced(elements.begin() + static_cast<size_t>(start),
+                              elements.begin() + static_cast<size_t>(end));
+    return Value::Array(std::move(sliced), array.ArrayElementSqlType());
+  }
+
+  if (name == "euclidean_distance") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("EUCLIDEAN_DISTANCE requires 2 arguments");
+    }
+    const Value& left = arguments[0];
+    const Value& right = arguments[1];
+    if (left.IsNull() || right.IsNull()) {
+      return {};
+    }
+    if (!left.IsArray() || !right.IsArray()) {
+      throw std::runtime_error("EUCLIDEAN_DISTANCE requires ARRAY arguments");
+    }
+    const auto& a = left.ArrayElements();
+    const auto& b = right.ArrayElements();
+    if (a.size() != b.size()) {
+      throw std::runtime_error(
+          "EUCLIDEAN_DISTANCE arrays must have equal sizes");
+    }
+    auto coordinate = [](const Value& v) -> double {
+      if (v.IsNull()) {
+        return 0.0;
+      }
+      if (v.type == ValueType::kDouble) {
+        return v.value.double_value;
+      }
+      if (v.type == ValueType::kInt64) {
+        return static_cast<double>(v.value.int_value);
+      }
+      throw std::runtime_error(
+          "EUCLIDEAN_DISTANCE requires numeric array elements");
+    };
+    double total = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      const double diff = coordinate(a[i]) - coordinate(b[i]);
+      total += diff * diff;
+    }
+    return Value(std::sqrt(total));
+  }
+
+  if (name == "element") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("ELEMENT requires 1 argument");
+    }
+    const Value& array = arguments[0];
+    if (array.IsNull()) {
+      return {};
+    }
+    if (!array.IsArray()) {
+      throw std::runtime_error("ELEMENT requires an ARRAY argument");
+    }
+    if (array.ArrayElements().size() != 1) {
+      throw std::runtime_error("More than one element");
+    }
+    return array.ArrayElements().front();
+  }
+
+  if (name == "generate_array") {
+    if (arguments.size() < 2 || arguments.size() > 3) {
+      throw std::runtime_error(name + " requires two or three arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull() ||
+        (arguments.size() == 3 && arguments[2].IsNull())) {
+      return {};
+    }
+    auto numeric = [](const Value& v) -> double {
+      if (v.type == ValueType::kInt64) {
+        return static_cast<double>(v.value.int_value);
+      }
+      if (v.type == ValueType::kDouble) {
+        return v.value.double_value;
+      }
+      throw std::runtime_error("GENERATE_ARRAY requires numeric arguments");
+    };
+    const double start = numeric(arguments[0]);
+    const double end = numeric(arguments[1]);
+    double step = arguments.size() == 3 ? numeric(arguments[2]) : 0.0;
+    if (step == 0.0) {
+      if (arguments.size() == 3) {
+        throw std::runtime_error("Sequence step cannot be 0.");
+      }
+      step = start <= end ? 1.0 : -1.0;
+    }
+    if ((start < end && step < 0) || (start > end && step > 0)) {
+      return Value::Array({}, "INT64");
+    }
+    bool saw_double =
+        arguments[0].type == ValueType::kDouble ||
+        arguments[1].type == ValueType::kDouble ||
+        (arguments.size() == 3 && arguments[2].type == ValueType::kDouble);
+    bool saw_uint = false;
+    for (const Expression& argument : call.Args()) {
+      if (argument->Type() != TypeTag::kCastExp) {
+        continue;
+      }
+      std::string target = argument->AsCastExpression().TargetTypeName();
+      for (char& c : target) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      }
+      if (target.find("UINT") != std::string::npos) {
+        saw_uint = true;
+      }
+    }
+    const bool integral =
+        !saw_double &&
+        start == static_cast<double>(static_cast<int64_t>(start)) &&
+        step == static_cast<double>(static_cast<int64_t>(step));
+    const std::string element_type =
+        integral ? (saw_uint ? "UINT64" : "INT64") : "DOUBLE";
+    std::vector<Value> elements;
+    constexpr size_t kMaxGeneratedElements = 1000000;
+    for (double value = start; elements.size() < kMaxGeneratedElements &&
+                               (step > 0 ? value <= end : value >= end);
+         value += step) {
+      if (integral) {
+        elements.push_back(Value(static_cast<int64_t>(value)));
+      } else {
+        elements.push_back(Value(value));
+      }
+    }
+    return Value::Array(std::move(elements), element_type);
+  }
+
+  if (name == "generate_date_array") {
+    if (arguments.size() < 2 || arguments.size() > 4) {
+      throw std::runtime_error(
+          "GENERATE_DATE_ARRAY requires two or more arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) {
+      return {};
+    }
+    auto to_days = [&raw_str](const Value& v) -> int64_t {
+      if (v.type == ValueType::kDate) {
+        return v.DateDays();
+      }
+      try {
+        return Value::Date(raw_str(v)).DateDays();
+      } catch (...) {
+        throw std::runtime_error("GENERATE_DATE_ARRAY requires DATE arguments");
+      }
+    };
+    int64_t step_days = 1;
+    if (arguments.size() >= 3 && !arguments[2].IsNull()) {
+      // INTERVAL steps ride as unevaluated IntervalExpression arguments.
+      if (call.Args().size() >= 3 &&
+          call.Args()[2]->Type() == TypeTag::kIntervalExp) {
+        const auto& interval = call.Args()[2]->AsIntervalExpression();
+        std::string unit = std::string(interval.Unit());
+        for (char& c : unit) {
+          c = static_cast<char>(std::tolower(c));
+        }
+        step_days = unit == "day" || unit == "days" ? interval.Amount() : 0;
+      } else {
+        throw std::runtime_error(
+            "GENERATE_DATE_ARRAY requires an INTERVAL step");
+      }
+      if (step_days == 0) {
+        throw std::runtime_error(
+            "GENERATE_DATE_ARRAY supports only whole-DAY intervals");
+      }
+    }
+    const int64_t start_day = to_days(arguments[0]);
+    const int64_t end_day = to_days(arguments[1]);
+    std::vector<Value> elements;
+    constexpr size_t kMaxGeneratedDates = 1000000;
+    if ((step_days > 0 && start_day <= end_day) ||
+        (step_days < 0 && start_day >= end_day)) {
+      for (int64_t day = start_day;
+           elements.size() < kMaxGeneratedDates &&
+           (step_days > 0 ? day <= end_day : day >= end_day);
+           day += step_days) {
+        elements.push_back(Value::DateFromDays(day));
+      }
+    }
+    return Value::Array(std::move(elements), "DATE");
   }
 
   throw std::runtime_error("unsupported function " + name);
@@ -7450,12 +8101,17 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
 
     case TypeTag::kQueryExp: {
       const auto& value = expression->AsQueryExpression();
+      // Subqueries carrying their own WITH clauses must run through
+      // ExecuteQuery, which materializes the local CTEs first.
+      const bool has_own_ctes = !value.Query()->WithQueries().empty();
       std::optional<Relation> indexed =
-          ExecuteCorrelatedSingleSource(context, *value.Query(), scope, ctes);
+          has_own_ctes ? std::nullopt
+                       : ExecuteCorrelatedSingleSource(context, *value.Query(),
+                                                       scope, ctes);
       std::optional<Relation> executed;
       const Relation* relation = indexed ? &*indexed : nullptr;
       bool uncorrelated = false;
-      if (relation == nullptr) {
+      if (relation == nullptr && !has_own_ctes) {
         relation = ExecuteCachedUncorrelated(context, *value.Query(), ctes);
         uncorrelated = relation != nullptr;
       }
@@ -7587,13 +8243,9 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
           first = row;
         }
       });
-      if (!first || first->values_.empty()) {
-        return {};
-      }
       if (row_count > 1) {
         // GoogleSQL: a scalar subquery must produce at most one row.
-        throw std::runtime_error(
-            "Scalar subquery produced more than one row");
+        throw std::runtime_error("Scalar subquery produced more than one row");
       }
       return ProjectSubqueryRow(*first, as_struct, &subquery_schema);
     }
@@ -7724,17 +8376,19 @@ std::vector<slot_t> RequiredColumns(const SelectStatement& statement,
           if (name.name == "*") {
             return false;
           }
-          // Match on bare column name only: references may qualify this
-          // relation by table name or any alias, while stored schemas qualify
-          // columns by the physical table name.  Over-projecting a scan is
-          // harmless; dropping a column some scope reference needs breaks
-          // evaluation.
-          return name.name == candidate.name;
+          // GoogleSQL identifiers are case-insensitive; references may also
+          // qualify this relation by table name or any alias.  Over-
+          // projecting a scan is harmless; dropping a column some scope
+          // reference needs breaks evaluation.
+          return IdentifierEquals(name.name, candidate.name) &&
+                 (name.schema.empty() ||
+                  IdentifierEquals(name.schema, candidate.schema));
         });
     if (needed) {
       result.push_back(i);
     }
-  }  return result;
+  }
+  return result;
 }
 Schema ProjectSchema(const Schema& schema,
                      const std::vector<slot_t>& projection) {

@@ -989,13 +989,22 @@ bool ContainsQuery(const Expression& expression) {  // NOLINT(misc-no-recursion)
 
 std::optional<size_t> LocalColumnOffset(const Schema& schema,
                                         const ColumnName& name) {
+  // GoogleSQL identifiers are case-insensitive.
+  auto equals = [](std::string_view left, std::string_view right) {
+    return left.size() == right.size() &&
+           std::equal(left.begin(), left.end(), right.begin(),
+                      [](char lhs, char rhs) {
+                        return std::tolower(static_cast<unsigned char>(lhs)) ==
+                               std::tolower(static_cast<unsigned char>(rhs));
+                      });
+  };
   std::optional<size_t> match;
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     const ColumnName& candidate = schema.GetColumn(i).Name();
-    if (candidate.name != name.name) {
+    if (!equals(candidate.name, name.name)) {
       continue;
     }
-    if (!name.schema.empty() && candidate.schema != name.schema) {
+    if (!name.schema.empty() && !equals(candidate.schema, name.schema)) {
       continue;
     }
     if (match) {
@@ -1006,7 +1015,7 @@ std::optional<size_t> LocalColumnOffset(const Schema& schema,
   if (!match && name.schema.empty()) {
     for (size_t i = 0; i < schema.ColumnCount(); ++i) {
       const ColumnName& candidate = schema.GetColumn(i).Name();
-      if (candidate.schema == name.name) {
+      if (equals(candidate.schema, name.name)) {
         if (match) {
           return std::nullopt;
         }
