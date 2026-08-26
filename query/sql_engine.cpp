@@ -31,6 +31,7 @@
 #include "database/transaction_context.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/delete.hpp"
+#include "executor/detail/expression_eval.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/distinct.hpp"
@@ -663,6 +664,248 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   return PrepareStatement(ctx, std::move(statement));
 }
 
+namespace {
+
+// Nested per-row array DML (UPDATE ... SET (DELETE/UPDATE/INSERT ...)).
+// Each matching row is rewritten in place: the target column holds an ARRAY,
+// and every nested item filters / transforms / appends its elements. The
+// element variable visible to item predicates is the last component of the
+// target path; outer row columns stay reachable through the scope chain so
+// correlated references and subqueries keep working.
+StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
+                                            const UpdateStatement& update,
+                                            Table* table) {
+  const Schema& schema = table->GetSchema();
+  struct ResolvedItem {
+    size_t offset;
+    std::string element_name;
+    const NestedDmlItem* item;
+  };
+  std::vector<ResolvedItem> resolved;
+  resolved.reserve(update.NestedItems().size());
+  for (const NestedDmlItem& item : update.NestedItems()) {
+    const ColumnName name(item.target_path);
+    if (!name.schema.empty() || item.target_path.find('.') != std::string::npos) {
+      throw std::runtime_error(
+          "nested DML on a non-array field is not supported: " +
+          item.target_path);
+    }
+    const int offset = schema.Offset(name);
+    if (offset < 0) {
+      throw std::runtime_error("nested DML target not found: " +
+                               item.target_path);
+    }
+    resolved.push_back(ResolvedItem{static_cast<size_t>(offset), name.name,
+                                    &item});
+  }
+
+  QueryData query;
+  query.from_ = {update.TableName()};
+  query.where_ = update.WhereClause() ? update.WhereClause()
+                                      : ConstantValueExp(Value(true));
+  query.select_.reserve(schema.ColumnCount());
+  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+    query.select_.emplace_back(schema.GetColumn(i).Name().name,
+                               ColumnValueExp(schema.GetColumn(i).Name()));
+  }
+  query.require_row_position_ = true;
+  RETURN_IF_FAIL(query.Rewrite(ctx));
+  ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
+  Executor source = plan->EmitExecutor(ctx);
+
+  int64_t modified_rows = 0;
+  Row new_row;
+  RowPosition position;
+  while (source->Next(&new_row, &position)) {
+    // Per-cell array edit state: UPDATE predicates match against the array
+    // as of the last DELETE / INSERT (or the original contents), so writes
+    // from sibling nested UPDATEs never see one another, while DELETEs take
+    // effect immediately in order.
+    struct ArrayEditState {
+      std::vector<Value> working;
+      std::vector<Value> update_baseline;
+      // Flags marking elements already rewritten by a nested UPDATE: a
+      // second UPDATE touching the same element is a conflict.
+      std::vector<bool> update_touched;
+      bool loaded{false};
+    };
+    std::map<size_t, ArrayEditState> edit_state;
+    for (const ResolvedItem& entry : resolved) {
+      const NestedDmlItem& item = *entry.item;
+      Value& cell = new_row.values_[entry.offset];
+      const Column element_column(
+          ColumnName("", entry.element_name),
+          cell.IsNull() ? ValueType::kNull
+                        : cell.IsArray() ? ValueType::kInt64 : cell.type);
+      Schema element_schema("", {element_column});
+      relational_detail::Scope outer_scope{.row = &new_row,
+                                           .schema = &schema,
+                                           .outer = nullptr};
+      auto eval_on_element =
+          [&](const Expression& expr, const Value& element) -> Value {
+        if (!expr) { return Value(true); }
+        Row element_row({element});
+        relational_detail::Scope element_scope{.row = &element_row,
+                                               .schema = &element_schema,
+                                               .outer = &outer_scope};
+        return relational_detail::Evaluate(expr, element_scope, nullptr, ctx,
+                                           relational_detail::CteMap{});
+      };
+      ArrayEditState& state = edit_state[entry.offset];
+      auto load_working = [&]() {
+        if (!state.loaded) {
+          state.working = cell.ArrayElements();
+          state.update_baseline = state.working;
+          state.update_touched.assign(state.working.size(), false);
+          state.loaded = true;
+        }
+      };
+      switch (item.kind) {
+        case NestedDmlItem::Kind::kDelete: {
+          if (cell.IsNull()) {
+            throw std::runtime_error(
+                "Cannot execute a nested DELETE statement on a NULL array "
+                "value");
+          }
+          if (!cell.IsArray()) {
+            throw std::runtime_error("nested DELETE requires an ARRAY value "
+                                     "in column " +
+                                     item.target_path);
+          }
+          load_working();
+          std::vector<Value> kept;
+          kept.reserve(state.working.size());
+          int64_t touched = 0;
+          for (Value& element : state.working) {
+            const Value matches = eval_on_element(item.predicate, element);
+            if (!matches.IsNull() && relational_detail::Truthy(matches)) {
+              ++touched;
+            } else {
+              kept.push_back(std::move(element));
+            }
+          }
+          if (item.assert_rows_modified >= 0 &&
+              touched != item.assert_rows_modified) {
+            std::ostringstream message;
+            message << "ASSERT_ROWS_MODIFIED expected "
+                    << item.assert_rows_modified
+                    << " array elements modified, but found " << touched;
+            throw std::runtime_error(message.str());
+          }
+          state.working = std::move(kept);
+          state.update_baseline = state.working;
+          state.update_touched.assign(state.working.size(), false);
+          cell = Value::Array(state.working, cell.ArrayElementSqlType());
+          break;
+        }
+        case NestedDmlItem::Kind::kUpdate: {
+          if (cell.IsNull()) {
+            throw std::runtime_error(
+                "Cannot execute a nested UPDATE statement on a NULL array "
+                "value");
+          }
+          if (!cell.IsArray()) {
+            throw std::runtime_error("nested UPDATE requires an ARRAY value "
+                                     "in column " +
+                                     item.target_path);
+          }
+          load_working();
+          int64_t touched = 0;
+          for (size_t i = 0; i < state.working.size(); ++i) {
+            const Value matches =
+                eval_on_element(item.predicate, state.update_baseline[i]);
+            if (!matches.IsNull() && relational_detail::Truthy(matches)) {
+              if (i < state.update_touched.size() &&
+                  state.update_touched[i]) {
+                throw std::runtime_error(
+                    "Attempted to modify an array element with multiple "
+                    "nested UPDATE statements");
+              }
+              ++touched;
+              if (i < state.update_touched.size()) {
+                state.update_touched[i] = true;
+              }
+              state.working[i] =
+                  eval_on_element(item.set_value, state.update_baseline[i]);
+            }
+          }
+          if (item.assert_rows_modified >= 0 &&
+              touched != item.assert_rows_modified) {
+            std::ostringstream message;
+            message << "ASSERT_ROWS_MODIFIED expected "
+                    << item.assert_rows_modified
+                    << " array elements modified, but found " << touched;
+            throw std::runtime_error(message.str());
+          }
+          cell = Value::Array(state.working, cell.ArrayElementSqlType());
+          break;
+        }
+        case NestedDmlItem::Kind::kInsert: {
+          if (cell.IsNull()) {
+            throw std::runtime_error(
+                "Cannot execute a nested INSERT statement on a NULL array "
+                "value");
+          }
+          if (!cell.IsArray()) {
+            throw std::runtime_error("nested INSERT requires an ARRAY value "
+                                     "in column " +
+                                     item.target_path);
+          }
+          load_working();
+          int64_t inserted = 0;
+          if (item.insert_query != nullptr) {
+            relational_detail::Relation produced =
+                relational_detail::ExecuteQuery(ctx, *item.insert_query,
+                                                nullptr, {});
+            produced.ForEachRow([&](const Row& row) {
+              if (!row.values_.empty()) {
+                state.working.push_back(row.values_.front());
+                ++inserted;
+              }
+            });
+          } else {
+            for (const auto& values : item.insert_values) {
+              if (values.empty()) { continue;
+}
+              state.working.push_back(relational_detail::Evaluate(
+                  values.front(), outer_scope, nullptr, ctx,
+                  relational_detail::CteMap{}));
+              ++inserted;
+            }
+          }
+          if (item.assert_rows_modified >= 0 &&
+              inserted != item.assert_rows_modified) {
+            std::ostringstream message;
+            message << "ASSERT_ROWS_MODIFIED expected "
+                    << item.assert_rows_modified
+                    << " array elements modified, but found " << inserted;
+            throw std::runtime_error(message.str());
+          }
+          state.update_baseline = state.working;
+          cell = Value::Array(state.working, cell.ArrayElementSqlType());
+          break;
+        }
+      }
+    }
+    StatusOr<RowPosition> updated = table->Update(ctx.txn_, position, new_row);
+    if (updated.GetStatus() != Status::kSuccess) {
+      throw std::runtime_error("update failed on table " +
+                               std::string(schema.Name()));
+    }
+    ++modified_rows;
+  }
+  if (update.HasAssert() && modified_rows != update.AssertRowsModified()) {
+    throw std::runtime_error("ASSERT_ROWS_MODIFIED was specified with " +
+                             std::to_string(update.AssertRowsModified()) +
+                             " rows, but " + std::to_string(modified_rows) +
+                             " rows were modified");
+  }
+  return Executor(std::make_shared<ConstantExecutor>(
+      Row({Value("Update Rows"), Value(modified_rows)})));
+}
+
+}  // namespace
+
 StatusOr<Executor> SqlEngine::PrepareStatement(
     TransactionContext& ctx, std::unique_ptr<Statement> statement) {
   last_statement_type_ = statement->Type();
@@ -1144,6 +1387,11 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
                        ctx.GetTable(update.TableName()));
       last_dml_table_ = update.TableName();
+      if (update.HasNestedDml()) {
+        // Nested per-row array DML: rows are rewritten element-wise here
+        // because array mutations are not expressible as plain projections.
+        return ExecuteNestedArrayUpdate(ctx, update, table.get());
+      }
       std::vector<NamedExpression> output;
       const Schema& schema = table->GetSchema();
       output.reserve(schema.ColumnCount());
