@@ -2703,6 +2703,17 @@ Expression VisitExpression(
         }
       }
     }
+    // `x IS [NOT] UNKNOWN` arrives as a UnaryExpression (unlike IS NULL /
+    // IS TRUE, which the parser shapes as BinaryExpression); UNKNOWN is a
+    // NULL predicate, so map it to the corresponding null test.
+    if (node.detail == "IS UNKNOWN") {
+      return UnaryExpressionExp(VisitExpression(*node.children[0]),
+                                UnaryOperation::kIsNull);
+    }
+    if (node.detail == "IS NOT UNKNOWN") {
+      return UnaryExpressionExp(VisitExpression(*node.children[0]),
+                                UnaryOperation::kIsNotNull);
+    }
     return UnaryExpressionExp(
         VisitExpression(*node.children[0]),
         node.detail == "NOT" ? UnaryOperation::kNot : UnaryOperation::kMinus);
@@ -3226,7 +3237,7 @@ Expression VisitExpression(
               } else if (v.type == ValueType::kInt64) {
                 field.text = std::to_string(v.value.int_value);
               } else if (v.type == ValueType::kDouble) {
-                field.text = std::to_string(v.value.double_value);
+                field.text = FormatDoubleShortest(v.value.double_value);
               } else {
                 field.text = v.AsString();
               }
@@ -3970,6 +3981,25 @@ std::shared_ptr<SelectStatement> VisitQuery(
       WindowOrderTerm parsed = ParseOrderingTerm(term);
       if (!parsed.expression) {
         continue;
+      }
+      // GoogleSQL: an unsigned integer ORDER BY item sorts by the
+      // SELECT-list ordinal, not by the constant itself.
+      if (parsed.expression->Type() == TypeTag::kConstantValue) {
+        const Value& ordinal_value =
+            parsed.expression->AsConstantValue().GetValue();
+        if (ordinal_value.type == ValueType::kInt64 &&
+            ordinal_value.value.int_value >= 0) {
+          const size_t ordinal =
+              static_cast<size_t>(ordinal_value.value.int_value);
+          if (ordinal >= 1 && ordinal <= projections.size() &&
+              projections[ordinal - 1].expression) {
+            order_by.push_back({projections[ordinal - 1].expression,
+                                parsed.ascending, parsed.nulls_first});
+            continue;
+          }
+          throw std::runtime_error(
+              "GoogleSQL AST: ORDER BY ordinal out of range");
+        }
       }
       order_by.push_back(
           {std::move(parsed.expression), parsed.ascending, parsed.nulls_first});

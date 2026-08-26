@@ -543,6 +543,16 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
             source.table);
     const std::string cache_key =
         BaseRelationCacheKey(source.table, projection);
+    // Predicates attached to this source are written against the source's
+    // alias, but cached/raw table schemas carry the table name (or no
+    // qualifier at all).  Evaluate every scan filter against an alias-qualified
+    // view of the schema; row layouts are positional so only names change.
+    const std::string load_qualifier =
+        source.alias.empty() ? source.table : source.alias;
+    auto filter_view_of = [&load_qualifier](const Schema& schema) {
+      return load_qualifier.empty() ? schema
+                                    : QualifySchema(schema, load_qualifier);
+    };
     const bool filter_during_scan =
         !reusable && scan_predicates != nullptr && !scan_predicates->empty();
     RelationPtr cached_entry;
@@ -572,8 +582,9 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
         });
       } else {
         const auto filter_begin = std::chrono::steady_clock::now();
+        const Schema filter_view = filter_view_of(cached_relation.schema);
         const CompiledScanFilter scan_filter =
-            CompileScanFilter(*scan_predicates, cached_relation.schema);
+            CompileScanFilter(*scan_predicates, filter_view);
         auto emit_filtered = [&](const Relation& source_rel) {
           source_rel.ForEachRow([&](const Row& row) {
             if (int_key_filter && int_key_column) {
@@ -583,7 +594,7 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
                 return;
               }
             }
-            if (MatchScanFilter(row, source_rel.schema, scan_filter, outer,
+            if (MatchScanFilter(row, filter_view, scan_filter, outer,
                                 context, ctes)) {
               result.AddRow(row);
             }
@@ -615,9 +626,10 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
       result.schema = projection != nullptr
                           ? ProjectSchema(table_schema, *projection)
                           : table_schema;
+      const Schema filter_view = filter_view_of(result.schema);
       CompiledScanFilter scan_filter;
       if (filter_during_scan) {
-        scan_filter = CompileScanFilter(*scan_predicates, result.schema);
+        scan_filter = CompileScanFilter(*scan_predicates, filter_view);
       }
       const auto scan_begin = std::chrono::steady_clock::now();
       const auto filter_begin = scan_begin;
@@ -635,7 +647,7 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
       const bool parallel_ok = TryParallelTableScan(
           context, *table.Value(), projection, int_key_filter, full_key_column,
           filter_during_scan, filter_during_scan ? &scan_filter : nullptr,
-          result.schema, outer, ctes, &result);
+          filter_view, outer, ctes, &result);
       if (!parallel_ok) {
         Iterator iterator = [&] {
           if (full_key_column != std::nullopt) {
@@ -672,7 +684,7 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
             }
           }
           if (matches && filter_during_scan) {
-            matches = MatchScanFilter(*iterator, result.schema, scan_filter,
+            matches = MatchScanFilter(*iterator, filter_view, scan_filter,
                                       outer, context, ctes);
           }
           if (matches) {
@@ -701,7 +713,12 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
         }
       }
       if (reusable && scan_predicates != nullptr && !scan_predicates->empty()) {
+        // Evaluate this alias's predicates against the alias-qualified view;
+        // the stored schema stays neutral for cache sharing across aliases.
+        const Schema saved_schema = result.schema;
+        result.schema = filter_view_of(saved_schema);
         FilterRelation(context, &result, *scan_predicates, outer, ctes);
+        result.schema = saved_schema;
       }
     }
   }

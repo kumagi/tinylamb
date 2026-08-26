@@ -1165,9 +1165,62 @@ Relation BuildInput(TransactionContext& context,
     if (condition) { all_predicates.push_back(condition);
 }
   }
+  // Join-condition conjuncts that the pipeline below cannot push down
+  // (subquery predicates, constant-only conjuncts such as NOT EXISTS(SELECT 1))
+  // must still gate the joined output; dropping them silently changes the
+  // join semantics.  Unresolvable *plain-column* conjuncts keep their
+  // historic silent-drop behavior: executor tests pin queries whose ON
+  // clauses reference outer qualifiers and rely on the cross-join fallback.
+  std::vector<Expression> join_residual;
+  auto is_using_self_equality = [](const Expression& predicate) {
+    if (!predicate || predicate->Type() != TypeTag::kBinaryExp) { return false;
+}
+    const auto& binary = predicate->AsBinaryExpression();
+    if (binary.Op() != BinaryOperation::kEquals ||
+        binary.Left()->Type() != TypeTag::kColumnValue ||
+        binary.Right()->Type() != TypeTag::kColumnValue) {
+      return false;
+    }
+    const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
+    const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
+    return lhs.schema.empty() && rhs.schema.empty() && lhs.name == rhs.name;
+  };
+  auto mark_applied = [&join_residual](const Expression& expression) {
+    if (!expression) { return;
+}
+    std::erase_if(join_residual, [&](const Expression& kept) {
+      return kept.get() == expression.get();
+    });
+  };
   std::vector<PredicateInfo> predicates = AnalyzePredicates(
       all_predicates.empty() ? Expression() : CombineConjuncts(all_predicates),
       relations);
+  {
+    // Populate the residual list from the analyzed predicates so only
+    // join-condition conjuncts whose evaluation is well-defined survive.
+    std::unordered_set<const ExpressionBase*> from_joins;
+    for (size_t i = 1; i < statement.Sources().size(); ++i) {
+      for (const Expression& conjunct :
+           SplitConjuncts(statement.Sources()[i].join_condition)) {
+        if (conjunct) { from_joins.insert(conjunct.get());
+}
+      }
+    }
+    for (const PredicateInfo& predicate : predicates) {
+      const Expression& expr = predicate.expression;
+      if (!expr || !from_joins.contains(expr.get())) { continue;
+}
+      if (is_using_self_equality(expr)) { continue;
+}
+      // Historic behavior: an unresolvable plain-column conjunct is dropped
+      // rather than evaluated against a schema where it cannot bind.
+      if (!predicate.resolved && !predicate.contains_query &&
+          !predicate.sources.empty()) {
+        continue;
+      }
+      join_residual.push_back(expr);
+    }
+  }
   const std::vector<PredicateInfo> where_predicates =
       AnalyzePredicates(statement.WhereClause(), relations);
   auto locally_evaluable = [&](const PredicateInfo& predicate) {
@@ -1190,6 +1243,7 @@ Relation BuildInput(TransactionContext& context,
     for (const PredicateInfo& predicate : predicates) {
       if (predicate.sources.contains(i) && locally_evaluable(predicate)) {
         local.push_back(predicate.expression);
+        mark_applied(predicate.expression);
       } else if (predicate.resolved && !predicate.contains_query &&
                  predicate.sources.size() > 1) {
         Expression implied =
@@ -1211,6 +1265,10 @@ Relation BuildInput(TransactionContext& context,
       if (query.Exists() || query.Negated() || !query.Test() ||
           query.Test()->Type() != TypeTag::kColumnValue) {
         continue;
+      }
+      if (context.execution_runtime() != nullptr) {
+        context.execution_runtime()->retained_statements.push_back(
+            query.Query());
       }
       const Relation* membership =
           ExecuteCachedUncorrelated(context, *query.Query(), ctes);
@@ -1453,6 +1511,7 @@ Relation BuildInput(TransactionContext& context,
           continue;
         }
         applicable.push_back(predicate.expression);
+        mark_applied(predicate.expression);
       }
       const size_t estimate =
           EstimateJoinRows(result, relations[candidate], applicable);
@@ -1479,11 +1538,18 @@ Relation BuildInput(TransactionContext& context,
         continue;
       }
       applicable.push_back(predicate.expression);
+      mark_applied(predicate.expression);
     }
     result = InnerJoin(context, std::move(result), std::move(relations[next]),
                        applicable, outer, ctes);
     joined.insert(next);
     remaining.erase(next);
+  }
+  if (!join_residual.empty()) {
+    // Subquery-bearing or constant-only ON conjuncts never made it into a
+    // scan filter or join key; evaluate them over the joined rows now so the
+    // inner-join semantics stay intact.
+    FilterRelation(context, &result, join_residual, outer, ctes);
   }
   return result;
 }

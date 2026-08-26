@@ -256,14 +256,9 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     if (rhs == 0.0) {
       throw std::runtime_error("division by zero");
     }
-    const double res = lhs / rhs;
-    if (std::isinf(res)) {
-      throw std::runtime_error("double overflow on '/'");
-    }
-    if (std::isnan(res)) {
-      throw std::runtime_error("division by zero");
-    }
-    return Value(res);
+    // IEEE semantics: overflow and NaN results (e.g. inf/x, nan/x) flow
+    // through; only an exact zero divisor raises.
+    return Value(lhs / rhs);
   }
   if (numeric && left.type != right.type) {
     const double lhs = left.type == ValueType::kDouble
@@ -272,6 +267,22 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     const double rhs = right.type == ValueType::kDouble
                            ? right.value.double_value
                            : static_cast<double>(right.value.int_value);
+    // IEEE unordered comparisons: any ordered comparison against NaN is
+    // FALSE (never NULL), even NaN vs NaN (GoogleSQL BETWEEN semantics).
+    const auto is_nan = [](const Value& v) {
+      return v.type == ValueType::kDouble && std::isnan(v.value.double_value);
+    };
+    if (is_nan(folded_left) || is_nan(folded_right)) {
+      switch (op) {
+        case BinaryOperation::kLessThan:
+        case BinaryOperation::kLessThanEquals:
+        case BinaryOperation::kGreaterThan:
+        case BinaryOperation::kGreaterThanEquals:
+          return Value(false);
+        default:
+          break;
+      }
+    }
     switch (op) {
       case BinaryOperation::kAdd:
         return Value(lhs + rhs);
@@ -350,6 +361,24 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       }
     }
   }
+  // IEEE unordered comparisons: any ordered comparison against a NaN is
+  // FALSE (never NULL), even NaN vs NaN (GoogleSQL BETWEEN semantics).
+  {
+    const auto operand_is_nan = [](const Value& v) {
+      return v.type == ValueType::kDouble && std::isnan(v.value.double_value);
+    };
+    if (operand_is_nan(folded_left) || operand_is_nan(folded_right)) {
+      switch (op) {
+        case BinaryOperation::kLessThan:
+        case BinaryOperation::kLessThanEquals:
+        case BinaryOperation::kGreaterThan:
+        case BinaryOperation::kGreaterThanEquals:
+          return Value(false);
+        default:
+          break;
+      }
+    }
+  }
   switch (op) {
     case BinaryOperation::kAdd:
       return left + right;
@@ -362,10 +391,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         if (right.value.double_value == 0.0) {
           throw std::runtime_error("division by zero");
         }
-        const double res = left.value.double_value / right.value.double_value;
-        if (std::isinf(res)) { throw std::runtime_error("double overflow"); }
-        if (std::isnan(res)) { throw std::runtime_error("division by zero"); }
-        return Value(res);
+        return Value(left.value.double_value / right.value.double_value);
       }
       return left / right;
     }

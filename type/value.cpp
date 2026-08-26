@@ -444,6 +444,15 @@ size_t Value::SkipSerialized(const char* src, ValueType as_type) {
   throw std::runtime_error("undefined type");
 }
 
+std::string FormatDoubleShortest(double value) {
+  if (std::isnan(value)) { return "nan"; }
+  if (std::isinf(value)) { return value > 0 ? "inf" : "-inf"; }
+  char buffer[64];
+  auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), value);
+  if (ec != std::errc()) { return std::to_string(value); }
+  return std::string(buffer, ptr - buffer);
+}
+
 [[nodiscard]] std::string Value::AsString() const {
   switch (type) {
     case ValueType::kNull:
@@ -495,9 +504,15 @@ bool Value::operator==(const Value& rhs) const {
       std::string_view sv2 = rhs.value.varchar_value;
       if (sv1 == sv2) { return true; }
       auto is_iv = [](std::string_view s) {
-        return s.find('-') != std::string_view::npos &&
-               s.find(' ') != std::string_view::npos &&
-               s.find('-') < s.find(' ');
+        // Interval text carries a single-hyphen month token ("2014-1 0 ...");
+        // a leading token shaped like an ISO date ("2014-01-01 ...") is a
+        // timestamp string and must compare byte-exact instead.
+        const size_t sp = s.find(' ');
+        if (sp == std::string_view::npos) { return false; }
+        const size_t hy = s.find('-');
+        if (hy == std::string_view::npos || hy > sp) { return false; }
+        return s.substr(0, sp).find('-') ==
+               s.substr(0, sp).rfind('-');
       };
       if (is_iv(sv1) && is_iv(sv2)) {
         return IntervalValue::Parse(sv1) == IntervalValue::Parse(sv2);
@@ -720,9 +735,15 @@ bool Value::operator<(const Value& rhs) const {
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
       auto is_iv = [](std::string_view s) {
-        return s.find('-') != std::string_view::npos &&
-               s.find(' ') != std::string_view::npos &&
-               s.find('-') < s.find(' ');
+        // Interval text carries a single-hyphen month token ("2014-1 0 ...");
+        // a leading token shaped like an ISO date ("2014-01-01 ...") is a
+        // timestamp string and must compare byte-exact instead.
+        const size_t sp = s.find(' ');
+        if (sp == std::string_view::npos) { return false; }
+        const size_t hy = s.find('-');
+        if (hy == std::string_view::npos || hy > sp) { return false; }
+        return s.substr(0, sp).find('-') ==
+               s.substr(0, sp).rfind('-');
       };
       if (is_iv(sv1) && is_iv(sv2)) {
         return IntervalValue::Parse(sv1) < IntervalValue::Parse(sv2);
@@ -751,9 +772,15 @@ bool Value::operator>(const Value& rhs) const {
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
       auto is_iv = [](std::string_view s) {
-        return s.find('-') != std::string_view::npos &&
-               s.find(' ') != std::string_view::npos &&
-               s.find('-') < s.find(' ');
+        // Interval text carries a single-hyphen month token ("2014-1 0 ...");
+        // a leading token shaped like an ISO date ("2014-01-01 ...") is a
+        // timestamp string and must compare byte-exact instead.
+        const size_t sp = s.find(' ');
+        if (sp == std::string_view::npos) { return false; }
+        const size_t hy = s.find('-');
+        if (hy == std::string_view::npos || hy > sp) { return false; }
+        return s.substr(0, sp).find('-') ==
+               s.substr(0, sp).rfind('-');
       };
       if (is_iv(sv1) && is_iv(sv2)) {
         return IntervalValue::Parse(sv1) > IntervalValue::Parse(sv2);
@@ -926,11 +953,11 @@ int CompareForOrderBy(const Value& a, const Value& b) {
     case ValueType::kDouble: {
       const double x = a.value.double_value;
       const double y = b.value.double_value;
-      // GoogleSQL: NaN is larger than every non-NaN (including +inf); all
-      // NaNs are equal under the ordering.
+      // GoogleSQL ordering: NULL < NaN < every other value; all NaNs are
+      // equal under the ordering (DESC is the exact reverse).
       const bool nx = std::isnan(x);
       const bool ny = std::isnan(y);
-      if (nx || ny) { return nx && ny ? 0 : (nx ? 1 : -1);
+      if (nx || ny) { return nx && ny ? 0 : (nx ? -1 : 1);
 }
       return x < y ? -1 : (y < x ? 1 : 0);
     }
@@ -1024,9 +1051,15 @@ uint64_t std::hash<tinylamb::Value>::operator()(
     case tinylamb::ValueType::kVarChar: {
       std::string_view sv = v.value.varchar_value;
       auto is_iv = [](std::string_view s) {
-        return s.find('-') != std::string_view::npos &&
-               s.find(' ') != std::string_view::npos &&
-               s.find('-') < s.find(' ');
+        // Interval text carries a single-hyphen month token ("2014-1 0 ...");
+        // a leading token shaped like an ISO date ("2014-01-01 ...") is a
+        // timestamp string and must compare byte-exact instead.
+        const size_t sp = s.find(' ');
+        if (sp == std::string_view::npos) { return false; }
+        const size_t hy = s.find('-');
+        if (hy == std::string_view::npos || hy > sp) { return false; }
+        return s.substr(0, sp).find('-') ==
+               s.substr(0, sp).rfind('-');
       };
       if (is_iv(sv)) {
         tinylamb::IntervalValue iv = tinylamb::IntervalValue::Parse(sv);
@@ -1037,8 +1070,15 @@ uint64_t std::hash<tinylamb::Value>::operator()(
       }
       return std::hash<std::string_view>()(sv);
     }
-    case tinylamb::ValueType::kDouble:
-      return std::hash<double>()(v.value.double_value);
+    case tinylamb::ValueType::kDouble: {
+      // Canonicalize before hashing so group-key buckets agree with SQL
+      // equality: every NaN folds to one pattern and -0/+0 share a bucket.
+      const double d = v.value.double_value;
+      if (std::isnan(d)) {
+        return std::hash<int64_t>()(0x7ff8000000000000LL);
+      }
+      return std::hash<double>()(d == 0.0 ? 0.0 : d);
+    }
     case tinylamb::ValueType::kArray: {
       uint64_t h = std::hash<std::string>()(v.ArrayElementSqlType());
       for (const tinylamb::Value& element : v.ArrayElements()) {

@@ -18,6 +18,7 @@
 #define TINYLAMB_QUERY_STATEMENT_HPP
 
 #include <memory>
+#include <sstream>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -262,6 +263,18 @@ class SelectStatement : public Statement {
     complex_ = true;
   }
   void MarkComplex() { complex_ = true; }
+  // Structural fingerprint (Dump text), memoized per statement object.  The
+  // execution runtime keys caches by statement address; because freed
+  // statements are recycled by the allocator, a probe must confirm the
+  // cached fingerprint still describes THIS statement before reusing data.
+  const std::string& Fingerprint() const {
+    if (cached_fingerprint_.empty()) {
+      std::ostringstream stream;
+      Dump(stream);
+      cached_fingerprint_ = stream.str();
+    }
+    return cached_fingerprint_;
+  }
   void Dump(std::ostream& o) const override {
     o << "select=[";
     for (size_t i = 0; i < select_list_.size(); i++) {
@@ -304,6 +317,7 @@ class SelectStatement : public Statement {
   std::vector<std::shared_ptr<SelectStatement>> union_all_;
   bool as_struct_{false};
   bool complex_{false};
+  mutable std::string cached_fingerprint_;
 };
 
 enum class InsertMode { kDefault, kIgnore, kUpdate, kReplace };
