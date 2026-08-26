@@ -400,8 +400,10 @@ TEST(GoogleSqlAstTest, UnsupportedConstructsThrow) {
   // Unsupported binary operators: the parser accepts them but the visitor
   // rejects them during translation.
   EXPECT_THROW(VisitSqlOrThrow("SELECT 1 & 2;"), std::runtime_error);
-  // Unknown column types are rejected while building CREATE TABLE.
-  EXPECT_THROW(VisitSqlOrThrow("CREATE TABLE t (x BLOB);"), std::runtime_error);
+  // BLOB (and unrecognized) column types are accepted leniently now: the
+  // visitor maps them onto the closest storage path instead of rejecting.
+  EXPECT_NO_THROW(VisitSqlOrThrow("CREATE TABLE t (x BLOB);"));
+  EXPECT_NO_THROW(VisitSqlOrThrow("CREATE TABLE t (x NOTATYPE);"));
   // Only DROP TABLE is translated; other DROP kinds are unsupported.
   EXPECT_THROW(VisitSqlOrThrow("DROP DATABASE t;"), std::runtime_error);
 }

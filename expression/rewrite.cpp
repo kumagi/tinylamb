@@ -1490,6 +1490,9 @@ Expression WithExpressionChildren(const Expression& expression,
       if (aggregate.SecondaryArg()) {
         rebuilt->SetSecondaryArg(aggregate.SecondaryArg());
       }
+      if (!aggregate.InnerGroupBy().empty()) {
+        rebuilt->SetInnerGroupBy(aggregate.InnerGroupBy());
+      }
       return rebuilt;
     }
     case TypeTag::kCaseExp: {

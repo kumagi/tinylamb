@@ -1042,6 +1042,20 @@ TEST_F(QueryTest, SqlEngineRecursiveCteMixedWithPlainCte) {
   ctx.txn_.Abort();
 }
 
+// UNION DISTINCT BY NAME inside a recursive body aligns each round's output
+// on column names, so a term selecting columns in a different order still
+// dedupes against the accumulated rows.
+TEST_F(QueryTest, SqlEngineRecursiveCteByNameUnionDedupesAlignedRows) {
+  TransactionContext ctx = db_->BeginContext();
+  std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "WITH RECURSIVE t AS (SELECT 1 AS a, 2 AS b "
+      "UNION DISTINCT BY NAME SELECT b, a FROM t) SELECT * FROM t;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(2)}));
+  ctx.txn_.Abort();
+}
+
 // WITH DEPTH modifier: iteration count is bounded explicitly, every row
 // carries its depth, and the depth-0 anchor stays hidden below a non-zero
 // lower bound.

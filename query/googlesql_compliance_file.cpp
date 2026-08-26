@@ -466,7 +466,8 @@ std::vector<std::string> SplitTopLevel(std::string_view text) {
 }
 
 bool ParseArrayToken(std::string_view token, std::string* sql_type,
-                     std::vector<std::string>* elements) {
+                     std::vector<std::string>* elements,
+                     bool* unordered = nullptr) {
   const std::string text = Trim(token);
   constexpr std::string_view kPrefix = "ARRAY<";
   if (text.size() < kPrefix.size() ||
@@ -501,6 +502,9 @@ bool ParseArrayToken(std::string_view token, std::string* sql_type,
   if (lower.starts_with(kKnown)) {
     inner = Trim(inner.substr(kKnown.size()));
   } else if (lower.starts_with(kUnknown)) {
+    if (unordered != nullptr) {
+      *unordered = true;
+    }
     inner = Trim(inner.substr(kUnknown.size()));
   }
   *elements = SplitTopLevel(inner);
@@ -653,9 +657,9 @@ bool IsProtoCase(const GoogleSqlComplianceCase& test_case) {
     }
   }
   // Proto type names in SQL text or prepare payloads.
-  static const char* kProtoTypes[] = {
-      "kitchensinkpb", "testenum", "from_proto", "to_proto",
-      "replace_fields", "filter_fields"};
+  static const char* kProtoTypes[] = {"kitchensinkpb",  "testenum",
+                                      "from_proto",     "to_proto",
+                                      "replace_fields", "filter_fields"};
   for (const char* keyword : kProtoTypes) {
     if (sql_lower.find(keyword) != std::string::npos) {
       return true;
@@ -749,6 +753,13 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     if (!ParseArrayToken(want, &sql_type, &elements)) {
       return false;
     }
+    // An "[unknown order: ...]" marker inside an array means the reference
+    // engine produced the elements in an arbitrary order; compare as a
+    // multiset instead of positionally.
+    bool unordered = false;
+    if (!ParseArrayToken(want, &sql_type, &elements, &unordered)) {
+      return false;
+    }
     if (!sql_type.empty() &&
         ToLower(sql_type) != ToLower(actual.ArrayElementSqlType())) {
       const std::string lower_type = ToLower(sql_type);
@@ -770,6 +781,22 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     }
     if (elements.size() != actual.ArrayElements().size()) {
       return false;
+    }
+    if (unordered) {
+      // Multiset match: every expected element must consume an equal actual
+      // element, in any order.
+      std::vector<Value> remaining = actual.ArrayElements();
+      for (const std::string& expected_element : elements) {
+        auto found =
+            std::ranges::find_if(remaining, [&](const Value& candidate) {
+              return ComplianceValueMatches(candidate, expected_element);
+            });
+        if (found == remaining.end()) {
+          return false;
+        }
+        remaining.erase(found);
+      }
+      return true;
     }
     for (size_t i = 0; i < elements.size(); ++i) {
       if (!ComplianceValueMatches(actual.ArrayElements()[i], elements[i])) {

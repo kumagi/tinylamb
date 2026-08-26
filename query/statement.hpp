@@ -76,6 +76,9 @@ struct SelectSource {
   Expression join_condition;
   Expression unnest;
   std::string offset_alias;
+  // USING(col, ...) column names: the joined output must expose ONE merged
+  // column per entry (the left side wins) instead of two same-named ones.
+  std::vector<std::string> using_columns;
 };
 
 enum class StatementType {

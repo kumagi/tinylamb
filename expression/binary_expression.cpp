@@ -18,6 +18,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -204,6 +205,8 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     const double rhs = right.type == ValueType::kDouble
                            ? right.value.double_value
                            : static_cast<double>(right.value.int_value);
+    // GoogleSQL raises a runtime error for any division by zero, integer or
+    // floating point.
     if (rhs == 0.0) {
       throw std::runtime_error("division by zero");
     }

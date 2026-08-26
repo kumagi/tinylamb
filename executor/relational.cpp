@@ -105,6 +105,12 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
   struct GroupState {
     Row representative;
     size_t accumulator_offset{0};
+    // Multi-level aggregation state: for each aggregate index, per-inner-key
+    // maps of {inner aggregate -> accumulator} and the inner representative
+    // row used to evaluate the child expression tree at finish time.
+    std::unordered_map<size_t, std::unordered_map<Row, std::unordered_map<
+        const AggregateExpression*, AggregateAccumulator>>> ml_states;
+    std::unordered_map<size_t, std::unordered_map<Row, Row>> ml_reps;
   };
   std::deque<AggregateAccumulator> aggregate_states;
   auto accumulate_row = [&](const Row& row,
@@ -134,6 +140,167 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       if (aggregate.WhereFilter() &&
           !Truthy(Evaluate(aggregate.WhereFilter(), scope, nullptr, context,
                            ctes))) {
+        continue;
+      }
+      if (aggregate.HasInnerGroupBy()) {
+        // Multi-level: partition rows into inner groups, accumulate every
+        // inner aggregate found in the child tree per inner group.
+        std::vector<const AggregateExpression*> inner_aggs;
+        std::unordered_set<const AggregateExpression*> inner_seen;
+        CollectAggregates(aggregate.Child(), &inner_aggs, &inner_seen);
+        for (const auto& term : aggregate.InnerOrderBy()) {
+          CollectAggregates(term.expression, &inner_aggs, &inner_seen);
+        }
+        std::vector<Value> inner_keys;
+        inner_keys.reserve(aggregate.InnerGroupBy().size());
+        for (const Expression& key : aggregate.InnerGroupBy()) {
+          inner_keys.push_back(
+              Evaluate(key, scope, nullptr, context, ctes));
+        }
+        Row inner_key(std::move(inner_keys));
+        auto& key_states = group.ml_states[i];
+        auto& state = key_states[inner_key];
+        auto& reps = group.ml_reps[i];
+        if (reps.find(inner_key) == reps.end()) {
+          reps.emplace(inner_key, row);
+        }
+        auto CollectForInner = [&](const AggregateExpression* aggregate2,
+                                   AggregateAccumulator* acc) {
+          // Recursive multi-level: an inner aggregate with its own GROUP BY
+          // partitions rows one level deeper inside its accumulator.
+          std::vector<const AggregateExpression*> inner2_aggs;
+          std::unordered_set<const AggregateExpression*> inner2_seen;
+          CollectAggregates(aggregate2->Child(), &inner2_aggs, &inner2_seen);
+          for (const auto& term : aggregate2->InnerOrderBy()) {
+            CollectAggregates(term.expression, &inner2_aggs, &inner2_seen);
+          }
+          std::vector<Value> inner_keys2;
+          inner_keys2.reserve(aggregate2->InnerGroupBy().size());
+          for (const Expression& key : aggregate2->InnerGroupBy()) {
+            inner_keys2.push_back(Evaluate(key, scope, nullptr, context, ctes));
+          }
+          Row inner_key2(std::move(inner_keys2));
+          acc->RememberInnerRepresentative(inner_key2, row);
+          if (inner2_aggs.empty() && IsCountStar(*aggregate2)) {
+            acc->InnerAccumulator(inner_key2, aggregate2)->Add(Value(1));
+          } else if (inner2_aggs.empty()) {
+            acc->RememberInnerKey(inner_key2);
+          }
+          for (const AggregateExpression* inner2 : inner2_aggs) {
+            if (inner2->WhereFilter() &&
+                !Truthy(Evaluate(inner2->WhereFilter(), scope, nullptr,
+                                 context, ctes))) {
+              continue;
+            }
+            Value x2;
+            if (IsCountStar(*inner2)) {
+              x2 = Value(1);
+            } else {
+              try {
+                x2 = Evaluate(inner2->Child(), scope, nullptr, context, ctes);
+              } catch (...) {
+                x2 = Value();
+              }
+            }
+            acc->InnerAccumulator(inner_key2, inner2)->Add(x2);
+          }
+        };
+        auto FeedInnerAgg = [&](const AggregateExpression* inner) {
+          auto found = state.find(inner);
+          if (found == state.end()) {
+            found = state.emplace(inner, AggregateAccumulator(inner)).first;
+          }
+          // Partition keys of the deepest multi-level aggregate below
+          // `inner`: either `inner` itself (SUM(x GROUP BY y)) or a
+          // multi-level aggregate reached through plain aggregates
+          // (SUM(ANY_VALUE(x) GROUP BY y)).
+          const AggregateExpression* ml = inner;
+          if (!inner->HasInnerGroupBy() && inner->Child() != nullptr &&
+              inner->Child()->Type() == TypeTag::kAggregateExp &&
+              inner->Child()->AsAggregateExpression().HasInnerGroupBy()) {
+            ml = &inner->Child()->AsAggregateExpression();
+          }
+          if (inner->HasInnerGroupBy() || ml != inner) {
+            found->second.SetEvalSchema(&input.schema);
+            if (ml == inner) {
+              CollectForInner(inner, &found->second);
+            } else {
+              std::vector<Value> inner_keys2;
+              inner_keys2.reserve(ml->InnerGroupBy().size());
+              for (const Expression& key : ml->InnerGroupBy()) {
+                inner_keys2.push_back(
+                    Evaluate(key, scope, nullptr, context, ctes));
+              }
+              Row inner_key2(std::move(inner_keys2));
+              found->second.RememberInnerRepresentative(inner_key2, row);
+              std::vector<const AggregateExpression*> inner2_aggs;
+              std::unordered_set<const AggregateExpression*> inner2_seen;
+              CollectAggregates(inner->Child(), &inner2_aggs, &inner2_seen);
+              for (const auto& term : inner->InnerOrderBy()) {
+                CollectAggregates(term.expression, &inner2_aggs,
+                                  &inner2_seen);
+              }
+              if (inner2_aggs.empty() && IsCountStar(*ml)) {
+                found->second.InnerAccumulator(inner_key2, ml)
+                    ->Add(Value(1));
+              } else if (inner2_aggs.empty()) {
+                found->second.RememberInnerKey(inner_key2);
+              }
+              for (const AggregateExpression* inner2 : inner2_aggs) {
+                if (inner2->WhereFilter() &&
+                    !Truthy(Evaluate(inner2->WhereFilter(), scope, nullptr,
+                                     context, ctes))) {
+                  continue;
+                }
+                Value x2;
+                if (IsCountStar(*inner2)) {
+                  x2 = Value(1);
+                } else {
+                  try {
+                    x2 = Evaluate(inner2->Child(), scope, nullptr, context,
+                                  ctes);
+                  } catch (...) {
+                    x2 = Value();
+                  }
+                }
+                found->second.InnerAccumulator(inner_key2, inner2)->Add(x2);
+              }
+            }
+            return;
+          }
+          if (inner->WhereFilter() &&
+              !Truthy(Evaluate(inner->WhereFilter(), scope, nullptr,
+                               context, ctes))) {
+            return;
+          }
+          Value x;
+          if (IsCountStar(*inner)) {
+            x = Value(1);
+          } else {
+            try {
+              x = Evaluate(inner->Child(), scope, nullptr, context, ctes);
+            } catch (...) {
+              x = Value();
+            }
+          }
+          found->second.Add(x);
+        };
+        if (inner_aggs.empty() && IsCountStar(aggregate)) {
+          // COUNT(* GROUP BY k): the implicit inner aggregation is the
+          // per-group row count, accumulated under the outer pointer.
+          auto found = state.find(&aggregate);
+          if (found == state.end()) {
+            found = state.emplace(&aggregate, AggregateAccumulator(&aggregate))
+                        .first;
+          }
+          found->second.Add(Value(1));
+        }
+        for (const AggregateExpression* inner : inner_aggs) {
+          FeedInnerAgg(inner);
+        }
+        if (context.execution_runtime() != nullptr) {
+          ++context.execution_runtime()->aggregate_updates;
+        }
         continue;
       }
       if (IsCountStar(aggregate)) {
@@ -361,12 +528,106 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
   };
 
   if (grouped) {
+    auto FeedMultiLevel = [&](AggregateAccumulator* accumulator,
+                              const AggregateExpression* aggregate,
+                              const GroupState& group, size_t index) {
+      if (!aggregate->HasInnerGroupBy()) { return; }
+      auto key_it = group.ml_states.find(index);
+      if (key_it == group.ml_states.end()) { return; }
+      const auto& reps = group.ml_reps.find(index);
+      struct InnerEntry {
+        Row key;
+        Row rep;
+        std::vector<Value> order_keys;
+      };
+      std::vector<InnerEntry> entries;
+      entries.reserve(key_it->second.size());
+      for (const auto& [inner_key, state] : key_it->second) {
+        InnerEntry entry;
+        entry.key = inner_key;
+        if (reps != group.ml_reps.end()) {
+          auto found = reps->second.find(inner_key);
+          if (found != reps->second.end()) { entry.rep = found->second; }
+        }
+        AggregateResultMap agg_map;
+        for (const auto& [inner_agg, acc] : state) {
+          agg_map.emplace(inner_agg, acc.Finish());
+        }
+        Scope inner_scope{.row = &entry.rep,
+                          .schema = &input.schema,
+                          .outer = outer};
+        for (const auto& term : aggregate->InnerOrderBy()) {
+          try {
+            entry.order_keys.push_back(
+                Evaluate(term.expression, inner_scope, &agg_map, context,
+                         ctes));
+          } catch (...) {
+            entry.order_keys.push_back(Value());
+          }
+        }
+        entries.push_back(std::move(entry));
+      }
+      const auto& terms = aggregate->InnerOrderBy();
+      if (!terms.empty()) {
+        std::stable_sort(entries.begin(), entries.end(),
+                         [&](const InnerEntry& left, const InnerEntry& right) {
+                           for (size_t t = 0; t < terms.size(); ++t) {
+                             const WindowOrderTerm& term = terms[t];
+                             const Value& a = left.order_keys[t];
+                             const Value& b = right.order_keys[t];
+                             const bool a_null = a.IsNull();
+                             const bool b_null = b.IsNull();
+                             if (a_null && b_null) { continue; }
+                             const bool nulls_first =
+                                 term.nulls_first.value_or(term.ascending);
+                             if (a_null) { return nulls_first; }
+                             if (b_null) { return !nulls_first; }
+                             try {
+                               return term.ascending ? a < b : b < a;
+                             } catch (...) {
+                               return false;
+                             }
+                           }
+                           return false;
+                         });
+      }
+      size_t count = entries.size();
+      if (aggregate->InnerLimit().has_value()) {
+        count = std::min(count, *aggregate->InnerLimit());
+      }
+      for (size_t e = 0; e < count; ++e) {
+        const InnerEntry& entry = entries[e];
+        const auto& state = key_it->second.at(entry.key);
+        AggregateResultMap agg_map;
+        for (const auto& [inner_agg, acc] : state) {
+          agg_map.emplace(inner_agg, acc.Finish());
+        }
+        Value value;
+        if (IsCountStar(*aggregate)) {
+          if (agg_map.size() == 1) {
+            value = agg_map.begin()->second;
+          }
+        } else {
+          Scope inner_scope{.row = &entry.rep,
+                            .schema = &input.schema,
+                            .outer = outer};
+          try {
+            value = Evaluate(aggregate->Child(), inner_scope, &agg_map, context,
+                             ctes);
+          } catch (...) {
+            value = Value();
+          }
+        }
+        if (!value.IsNull()) { accumulator->Add(value); }
+      }
+    };
     for (const GroupState& group : groups) {
       AggregateResultMap aggregate_results;
       aggregate_results.reserve(aggregate_expressions.size());
       for (size_t i = 0; i < aggregate_expressions.size(); ++i) {
-        const AggregateAccumulator& accumulator =
+        AggregateAccumulator& accumulator =
             aggregate_states[group.accumulator_offset + i];
+        FeedMultiLevel(&accumulator, aggregate_expressions[i], group, i);
         aggregate_results.emplace(accumulator.expression, accumulator.Finish());
       }
       emit(group.representative, &aggregate_results);
@@ -654,11 +915,14 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
   head.SetOffset(0);
   terms.push_back(std::move(head));
   kinds.push_back(SetOperationKind::kUnionAll);
+  std::vector<SetOperationMatch> matches;
   for (size_t i = 0; i < body.UnionAll().size(); ++i) {
     terms.push_back(*body.UnionAll()[i]);
     kinds.push_back(i < body.SetOperationKinds().size()
                         ? body.SetOperationKinds()[i]
                         : SetOperationKind::kUnionAll);
+    matches.push_back(i < body.Matches().size() ? body.Matches()[i]
+                                                : SetOperationMatch{});
   }
 
   std::vector<size_t> anchors;
@@ -734,20 +998,150 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
     destination.AddRow(std::move(stored));
   };
 
-  // Anchor pass seeds both the visible result and the first work-table delta.
+  auto fold_case = [](char a, char b) {
+    return std::tolower(static_cast<unsigned char>(a)) ==
+           std::tolower(static_cast<unsigned char>(b));
+  };
+  auto has_column = [&](const Relation& relation, const std::string& want) {
+    for (size_t c = 0; c < relation.schema.ColumnCount(); ++c) {
+      const ColumnName& candidate = relation.schema.GetColumn(c).Name();
+      if (candidate.name.size() == want.size() &&
+          std::equal(want.begin(), want.end(), candidate.name.begin(),
+                     fold_case)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  auto align_term = [&](Relation& accumulated,
+                        std::shared_ptr<Relation>& delta_state,
+                        Relation& next_delta, Relation& part,
+                        const SetOperationMatch& match) {
+    if (!match.corresponding && !match.by_name) {
+      return;
+    }
+    const bool by_name_intersect = match.by_name && match.corresponding;
+    std::vector<std::string> target_names;
+    if (!match.columns.empty()) {
+      target_names = match.columns;
+    } else if (match.by_name && !by_name_intersect) {
+      for (size_t c = 0; c < accumulated.schema.ColumnCount(); ++c) {
+        const ColumnName& cname = accumulated.schema.GetColumn(c).Name();
+        if (!has_column(part, cname.name)) {
+          target_names.push_back(cname.name);
+        } else {
+          bool already = false;
+          for (const std::string& seen : target_names) {
+            if (seen.size() == cname.name.size() &&
+                std::equal(seen.begin(), seen.end(), cname.name.begin(),
+                           fold_case)) {
+              already = true;
+              break;
+            }
+          }
+          if (!already) {
+            target_names.push_back(cname.name);
+          }
+        }
+      }
+      for (size_t c = 0; c < part.schema.ColumnCount(); ++c) {
+        const ColumnName& cname = part.schema.GetColumn(c).Name();
+        if (!has_column(accumulated, cname.name)) {
+          target_names.push_back(cname.name);
+        }
+      }
+    } else {
+      for (size_t c = 0; c < accumulated.schema.ColumnCount(); ++c) {
+        const ColumnName& cname = accumulated.schema.GetColumn(c).Name();
+        if (has_column(part, cname.name)) {
+          target_names.push_back(cname.name);
+        }
+      }
+    }
+    auto project = [&](Relation& relation,
+                       const std::vector<std::string>& names) {
+      std::vector<slot_t> indexes;
+      std::vector<bool> is_null;
+      std::vector<Column> columns;
+      for (const std::string& want : names) {
+        slot_t found = static_cast<slot_t>(-1);
+        for (size_t c = 0; c < relation.schema.ColumnCount(); ++c) {
+          const ColumnName& candidate = relation.schema.GetColumn(c).Name();
+          if (candidate.name.size() == want.size() &&
+              std::equal(want.begin(), want.end(), candidate.name.begin(),
+                         fold_case)) {
+            found = static_cast<slot_t>(c);
+            break;
+          }
+        }
+        if (found == static_cast<slot_t>(-1)) {
+          is_null.push_back(true);
+          indexes.push_back(static_cast<slot_t>(0));
+          columns.emplace_back(want);
+          continue;
+        }
+        is_null.push_back(false);
+        indexes.push_back(found);
+        columns.push_back(
+            relation.schema.GetColumn(static_cast<size_t>(found)));
+      }
+      Relation projected(context.execution_runtime());
+      projected.schema = Schema(relation.schema.Name(), columns);
+      relation.ForEachRow([&](const Row& row) {
+        Row out;
+        out.values_.reserve(indexes.size());
+        for (size_t k = 0; k < indexes.size(); ++k) {
+          out.values_.push_back(
+              is_null[k] ? Value()
+                         : row.values_[static_cast<size_t>(indexes[k])]);
+        }
+        projected.AddRow(std::move(out));
+      });
+      projected.FinishSpill();
+      return projected;
+    };
+    part = project(part, target_names);
+    if (output.schema.ColumnCount() != target_names.size()) {
+      // The aligned layout widened or narrowed the result: re-project every
+      // row accumulated so far (and the pending delta) onto it.
+      accumulated = project(accumulated, target_names);
+      delta_state =
+          std::make_shared<Relation>(project(*delta_state, target_names));
+      next_delta.schema = accumulated.schema;
+    }
+  };
+
+
+  // Anchor pass seeds both the visible result and the first work-table
+  // delta. Operands are processed in DECLARATION order so BY NAME /
+  // CORRESPONDING alignments between consecutive anchors apply too.
   bool schema_initialized = false;
-  Relation delta(context.execution_runtime());
-  for (const size_t anchor : anchors) {
-    Relation part = ExecuteQuery(context, terms[anchor], outer, inherited_ctes);
+  auto delta = std::make_shared<Relation>(context.execution_runtime());
+  for (size_t term_index = 0; term_index < terms.size(); ++term_index) {
+    if (std::ranges::find(anchors, term_index) == anchors.end()) {
+      continue;  // recursive terms run per round
+    }
+    Relation part =
+        ExecuteQuery(context, terms[term_index], outer, inherited_ctes);
     part.FinishSpill();
+    if (terms[term_index].Distinct()) {
+      part = DistinctOf(std::move(part));
+      part.FinishSpill();
+    }
     if (!schema_initialized) {
       output.schema = part.schema;
       if (track_depth && !depth->column.empty()) {
         output.schema = output.schema +
                         Schema("", {Column(depth->column, ValueType::kInt64)});
       }
-      delta.schema = output.schema;
+      delta->schema = output.schema;
       schema_initialized = true;
+    } else {
+      // Align this later operand against everything accumulated so far.
+      align_term(output, delta, *delta, part,
+                 term_index >= 1 && term_index - 1 < matches.size()
+                     ? matches[term_index - 1]
+                     : SetOperationMatch{});
     }
     if (part.schema.ColumnCount() + payload_width !=
         output.schema.ColumnCount()) {
@@ -757,14 +1151,15 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
     part.ForEachRow([&](const Row& row) {
       // Anchor rows have depth 0 by definition. They always seed the work
       // table, but only become visible when 0 lies inside the DEPTH range.
-      if (distinct) {
-        seen.insert(distinct_key(row));
+      // UNION DISTINCT also dedupes duplicates inside the anchor itself.
+      if (distinct && !seen.insert(distinct_key(row)).second) {
+        return;
       }
       Row stored = row;
       if (track_depth) {
         stored.values_.push_back(Value(0));
       }
-      delta.AddRow(stored);
+      delta->AddRow(stored);
       const bool anchor_visible =
           !track_depth || (0 >= depth->lower && 0 <= depth->upper);
       if (anchor_visible) {
@@ -772,15 +1167,19 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
       }
     });
   }
-  delta.FinishSpill();
+  delta->FinishSpill();
   if (!schema_initialized) {
     return output;
   }
   output.FinishSpill();
 
+  // BY NAME / CORRESPONDING alignment between the accumulated side and a
+  // recursive term: returns target column names plus the term's rows
+  // projected onto them.
   // Iterative pass: each round binds the CTE name to the previous round's
-  // rows only (standard worktable semantics).
-  auto delta_state = std::make_shared<Relation>(std::move(delta));
+  // rows only (standard worktable semantics). delta_state aliases the anchor
+  // work table.
+  auto& delta_state = delta;
   const int64_t depth_cap =
       track_depth ? depth->upper : std::numeric_limits<int64_t>::max();
   bool depth_exhausted = false;
@@ -822,6 +1221,12 @@ Relation ExecuteRecursiveCte(TransactionContext& context,
         part = DistinctOf(std::move(part));
         part.FinishSpill();
       }
+      // matches[k] describes the operation between terms[k] and terms[k+1]:
+      // it is stored per-branch, so subtract the head offset.
+      align_term(output, delta_state, next_delta, part,
+                 term_index >= 1 && term_index - 1 < matches.size()
+                     ? matches[term_index - 1]
+                     : SetOperationMatch{});
       if (part.schema.ColumnCount() + payload_width !=
           output.schema.ColumnCount()) {
         throw std::invalid_argument("recursive CTE " + name +
@@ -1367,6 +1772,9 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     struct GroupState {
       Row representative;
       size_t accumulator_offset{0};
+      std::unordered_map<size_t, std::unordered_map<Row, std::unordered_map<
+          const AggregateExpression*, AggregateAccumulator>>> ml_states;
+      std::unordered_map<size_t, std::unordered_map<Row, Row>> ml_reps;
     };
     std::deque<AggregateAccumulator> aggregate_states;
     std::vector<GroupState> groups;
@@ -1450,10 +1858,114 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
         }
         if (is_count_star[i]) {
           accumulator.Add(Value(1));
-        } else if (aggregate_child_offsets[i] &&
+        } else if (!aggregate.HasInnerGroupBy() &&
+                   aggregate_child_offsets[i] &&
                    !aggregate.NeedsGroupContext() &&
                    aggregate.Having() == AggregateHavingModifier::kNone) {
           accumulator.Add(row[*aggregate_child_offsets[i]]);
+        } else if (aggregate.HasInnerGroupBy()) {
+          // Multi-level: partition rows into inner groups and accumulate
+          // every inner aggregate found in the child tree (and in the inner
+          // ORDER BY terms) per inner group.
+          std::vector<const AggregateExpression*> inner_aggs;
+          std::unordered_set<const AggregateExpression*> inner_seen;
+          CollectAggregates(aggregate.Child(), &inner_aggs, &inner_seen);
+          for (const auto& term : aggregate.InnerOrderBy()) {
+            CollectAggregates(term.expression, &inner_aggs, &inner_seen);
+          }
+          std::vector<Value> inner_keys;
+          inner_keys.reserve(aggregate.InnerGroupBy().size());
+          for (const Expression& key : aggregate.InnerGroupBy()) {
+            inner_keys.push_back(Evaluate(key, scope, nullptr, context, ctes));
+          }
+          Row inner_key(std::move(inner_keys));
+          auto& key_states = group.ml_states[i];
+          auto& state = key_states[inner_key];
+          auto& reps = group.ml_reps[i];
+          if (reps.find(inner_key) == reps.end()) {
+            reps.emplace(inner_key, row);
+          }
+          if (inner_aggs.empty() && IsCountStar(aggregate)) {
+            auto found = state.find(&aggregate);
+            if (found == state.end()) {
+              found = state.emplace(&aggregate, AggregateAccumulator(&aggregate))
+                          .first;
+            }
+            found->second.Add(Value(1));
+          }
+          for (const AggregateExpression* inner : inner_aggs) {
+            auto found = state.find(inner);
+            if (found == state.end()) {
+              found = state.emplace(inner, AggregateAccumulator(inner)).first;
+            }
+            const AggregateExpression* ml = inner;
+            if (!inner->HasInnerGroupBy() && inner->Child() != nullptr &&
+                inner->Child()->Type() == TypeTag::kAggregateExp &&
+                inner->Child()->AsAggregateExpression().HasInnerGroupBy()) {
+              ml = &inner->Child()->AsAggregateExpression();
+            }
+            if (inner->HasInnerGroupBy() || ml != inner) {
+              found->second.SetEvalSchema(&input.schema);
+              std::vector<const AggregateExpression*> inner2_aggs;
+              std::unordered_set<const AggregateExpression*> inner2_seen;
+              CollectAggregates(inner->Child(), &inner2_aggs, &inner2_seen);
+              for (const auto& term : inner->InnerOrderBy()) {
+                CollectAggregates(term.expression, &inner2_aggs,
+                                  &inner2_seen);
+              }
+              const std::vector<Expression>& ml_keys = ml->InnerGroupBy();
+              std::vector<Value> inner_keys2;
+              inner_keys2.reserve(ml_keys.size());
+              for (const Expression& key : ml_keys) {
+                inner_keys2.push_back(
+                    Evaluate(key, scope, nullptr, context, ctes));
+              }
+              Row inner_key2(std::move(inner_keys2));
+              found->second.RememberInnerRepresentative(inner_key2, row);
+              if (inner2_aggs.empty() && IsCountStar(*inner)) {
+                found->second.InnerAccumulator(inner_key2, inner)
+                    ->Add(Value(1));
+              } else if (inner2_aggs.empty()) {
+                found->second.RememberInnerKey(inner_key2);
+              }
+              for (const AggregateExpression* inner2 : inner2_aggs) {
+                if (inner2->WhereFilter() &&
+                    !Truthy(Evaluate(inner2->WhereFilter(), scope, nullptr,
+                                     context, ctes))) {
+                  continue;
+                }
+                Value x2;
+                if (IsCountStar(*inner2)) {
+                  x2 = Value(1);
+                } else {
+                  try {
+                    x2 = Evaluate(inner2->Child(), scope, nullptr, context,
+                                  ctes);
+                  } catch (...) {
+                    x2 = Value();
+                  }
+                }
+                found->second.InnerAccumulator(inner_key2, inner2)->Add(x2);
+              }
+              continue;
+            }
+            if (inner->WhereFilter() &&
+                !Truthy(Evaluate(inner->WhereFilter(), scope, nullptr,
+                                 context, ctes))) {
+              continue;
+            }
+            Value x;
+            if (IsCountStar(*inner)) {
+              x = Value(1);
+            } else {
+              try {
+                x = Evaluate(inner->Child(), scope, nullptr, context, ctes);
+              } catch (...) {
+                x = Value();
+              }
+            }
+            found->second.Add(x);
+          }
         } else {
           AggregateInput input;
           try {
@@ -1598,13 +2110,107 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       output_columns.emplace_back(ProjectionName(projection_item, i),
                                   ValueType::kNull);
     }
+    auto FeedMultiLevel = [&](AggregateAccumulator* accumulator,
+                              const AggregateExpression* aggregate,
+                              const GroupState& group, size_t index) {
+      if (!aggregate->HasInnerGroupBy()) { return; }
+      auto key_it = group.ml_states.find(index);
+      if (key_it == group.ml_states.end()) { return; }
+      const auto& reps = group.ml_reps.find(index);
+      struct InnerEntry {
+        Row key;
+        Row rep;
+        std::vector<Value> order_keys;
+      };
+      std::vector<InnerEntry> entries;
+      entries.reserve(key_it->second.size());
+      for (const auto& [inner_key, state] : key_it->second) {
+        InnerEntry entry;
+        entry.key = inner_key;
+        if (reps != group.ml_reps.end()) {
+          auto found = reps->second.find(inner_key);
+          if (found != reps->second.end()) { entry.rep = found->second; }
+        }
+        AggregateResultMap agg_map;
+        for (const auto& [inner_agg, acc] : state) {
+          agg_map.emplace(inner_agg, acc.Finish());
+        }
+        Scope inner_scope{.row = &entry.rep,
+                          .schema = &input.schema,
+                          .outer = outer};
+        for (const auto& term : aggregate->InnerOrderBy()) {
+          try {
+            entry.order_keys.push_back(
+                Evaluate(term.expression, inner_scope, &agg_map, context,
+                         ctes));
+          } catch (...) {
+            entry.order_keys.push_back(Value());
+          }
+        }
+        entries.push_back(std::move(entry));
+      }
+      const auto& terms = aggregate->InnerOrderBy();
+      if (!terms.empty()) {
+        std::stable_sort(entries.begin(), entries.end(),
+                         [&](const InnerEntry& left, const InnerEntry& right) {
+                           for (size_t t = 0; t < terms.size(); ++t) {
+                             const WindowOrderTerm& term = terms[t];
+                             const Value& a = left.order_keys[t];
+                             const Value& b = right.order_keys[t];
+                             const bool a_null = a.IsNull();
+                             const bool b_null = b.IsNull();
+                             if (a_null && b_null) { continue; }
+                             const bool nulls_first =
+                                 term.nulls_first.value_or(term.ascending);
+                             if (a_null) { return nulls_first; }
+                             if (b_null) { return !nulls_first; }
+                             try {
+                               return term.ascending ? a < b : b < a;
+                             } catch (...) {
+                               return false;
+                             }
+                           }
+                           return false;
+                         });
+      }
+      size_t count = entries.size();
+      if (aggregate->InnerLimit().has_value()) {
+        count = std::min(count, *aggregate->InnerLimit());
+      }
+      for (size_t e = 0; e < count; ++e) {
+        const InnerEntry& entry = entries[e];
+        const auto& state = key_it->second.at(entry.key);
+        AggregateResultMap agg_map;
+        for (const auto& [inner_agg, acc] : state) {
+          agg_map.emplace(inner_agg, acc.Finish());
+        }
+        Value value;
+        if (IsCountStar(*aggregate)) {
+          if (agg_map.size() == 1) {
+            value = agg_map.begin()->second;
+          }
+        } else {
+          Scope inner_scope{.row = &entry.rep,
+                            .schema = &input.schema,
+                            .outer = outer};
+          try {
+            value = Evaluate(aggregate->Child(), inner_scope, &agg_map, context,
+                             ctes);
+          } catch (...) {
+            value = Value();
+          }
+        }
+        if (!value.IsNull()) { accumulator->Add(value); }
+      }
+    };
     for (const GroupState& group : groups) {
       AggregateResultMap aggregate_results;
       aggregate_results.reserve(aggregate_expressions.size());
       for (size_t i = 0; i < aggregate_expressions.size(); ++i) {
-        aggregate_results.emplace(
-            aggregate_expressions[i],
-            aggregate_states[group.accumulator_offset + i].Finish());
+        AggregateAccumulator& accumulator =
+            aggregate_states[group.accumulator_offset + i];
+        FeedMultiLevel(&accumulator, aggregate_expressions[i], group, i);
+        aggregate_results.emplace(aggregate_expressions[i], accumulator.Finish());
       }
       Scope scope{.row = &group.representative,
                   .schema = &input.schema,

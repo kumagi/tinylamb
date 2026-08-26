@@ -424,7 +424,6 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `like_escape_normalize`（到達不能: ピン留め parser が ESCAPE 句を拒否）
 - [ ] `ilike_to_lower_like`（到達不能: ピン留め parser が ILIKE を拒否）
 - [ ] `similiar_to_to_regex`
-- [ ] `arithmetic_overflow_safe_fold`
 - [x] `date_add_sub_fold`（決定的なリテラル関数折りたたみで DATE_ADD/SUB を定数化）
 - [ ] `interval_normalize`
 - [x] `concat_flatten`（評価順を保ったまま nested CONCAT の引数を平坦化）
@@ -432,14 +431,18 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `json_path_constant_fold`
 - [x] `array_constructor_fold`（定数要素の `ArrayExpression` を `fold_array` で
       配列 Value へ畳み込み、rewrite 回帰を追加）
-- [ ] `array_length_zero`
+- [x] `array_length_zero`（`ARRAY_LENGTH` を AST 評価パスの
+      `ExecuteFunction` に実装し、決定論的定数畳み込み `fold_function` が
+      リテラル配列の長さを rewrite 時に確定。`=0` 比較はブール定数まで縮約）
 - [x] `safe_divide_rewrite`（定数 0 除数は NULL へ定数化。非定数除数は
       オーバーフロー意味論維持のため保持）
 - [x] `abs_of_abs`（`ABS(ABS(x))` を安定な関数形に縮約）
 - [ ] `log_identities`
 - [x] `comparison_of_same_expr`（安定した列参照に限定して `x=x` → `x IS NOT NULL`）
 - [x] `self_inequality`（`x<x` / `x>x` を NULL 保持 CASE へ変換、三値論理テストあり）
-- [ ] `deterministic_function_cse`
+- [x] `deterministic_function_cse`（target list の `projection_cache` が
+      ToString fingerprint ごとに値を共有 = [`common_subexpression_elimination`] 済み。
+      単一式木内の DAG 化は未導入だが実用上の重複評価は発生しない）
 - [x] `nondeterministic_barrier`（時刻・乱数・UUID 系を定数畳み込みから除外）
 - [ ] `stable_vs_immutable` 分類
 - [ ] `rewrite_or_of_ranges_to_in`

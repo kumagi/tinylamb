@@ -60,6 +60,10 @@ class WindowFunctionCallExpression : public ExpressionBase {
   WindowFrameBound frame_end;
   bool has_frame{false};
   WindowFrameExclusion exclusion{WindowFrameExclusion::kNone};
+  // RESPECT NULLS / IGNORE NULLS modifier (detected from AST span widths
+  // because the pinned parser omits the node).
+  bool respect_nulls{false};
+  bool ignore_nulls{false};
 
   WindowFunctionCallExpression() = default;
   [[nodiscard]] TypeTag Type() const override {

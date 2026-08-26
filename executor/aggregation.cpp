@@ -74,9 +74,11 @@ AggregationExecutor::AggregationExecutor(
   for (const NamedExpression& named : aggregates_) {
     AggregateInput input;
     const auto& agg = named.expression->AsAggregateExpression();
-    if (!agg.Distinct() && !agg.WhereFilter() && IsCountStar(agg)) {
+    if (!agg.HasInnerGroupBy() && !agg.Distinct() && !agg.WhereFilter() &&
+        IsCountStar(agg)) {
       input.kind = AggregateInputKind::kCountStar;
-    } else if (!agg.Distinct() && !agg.WhereFilter() &&
+    } else if (!agg.HasInnerGroupBy() && !agg.Distinct() &&
+               !agg.WhereFilter() &&
                agg.Child()->Type() == TypeTag::kColumnValue) {
       const int offset =
           input_schema_.Offset(agg.Child()->AsColumnValue().GetColumnName());
@@ -88,7 +90,8 @@ AggregationExecutor::AggregationExecutor(
           input.type = declared;
         }
       }
-    } else if (!agg.Distinct() && !agg.WhereFilter() &&
+    } else if (!agg.HasInnerGroupBy() && !agg.Distinct() &&
+               !agg.WhereFilter() &&
                agg.Child()->Type() == TypeTag::kConstantValue) {
       const Value constant = agg.Child()->AsConstantValue().GetValue();
       if (!constant.IsNull() && (constant.type == ValueType::kInt64 ||
@@ -107,7 +110,7 @@ AggregationExecutor::AggregationExecutor(
         static_cast<int>(AggregationType::kMin),
         static_cast<int>(AggregationType::kMax)};
     const bool native =
-        !agg.Distinct() && !agg.WhereFilter() &&
+        !agg.HasInnerGroupBy() && !agg.Distinct() && !agg.WhereFilter() &&
         kNativeTypes.count(static_cast<int>(agg.GetType())) != 0;
     delegates_to_accumulator_.push_back(!native);
     if (!native) {
@@ -393,6 +396,115 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
       for (size_t i = 0; i < aggregates_.size(); ++i) {
         const auto& agg = aggregates_[i].expression->AsAggregateExpression();
         if (delegates_to_accumulator_[i]) {
+          if (agg.HasInnerGroupBy()) {
+            // Multi-level: accumulate every inner aggregate per inner group.
+            if (!materialized) {
+              materialized = input_batch_.RowAt(row_index);
+            }
+            accumulators_[i]->SetEvalSchema(&input_schema_);
+            std::vector<const AggregateExpression*> inner_aggs;
+            std::unordered_set<const AggregateExpression*> inner_seen;
+            relational_detail::CollectAggregates(agg.Child(), &inner_aggs,
+                                                 &inner_seen);
+            for (const auto& term : agg.InnerOrderBy()) {
+              relational_detail::CollectAggregates(term.expression,
+                                                   &inner_aggs, &inner_seen);
+            }
+            std::vector<Value> inner_keys;
+            inner_keys.reserve(agg.InnerGroupBy().size());
+            for (const Expression& key : agg.InnerGroupBy()) {
+              inner_keys.push_back(
+                  key->Evaluate(*materialized, input_schema_));
+            }
+            Row inner_key(std::move(inner_keys));
+            accumulators_[i]->RememberInnerRepresentative(inner_key,
+                                                          *materialized);
+            if (inner_aggs.empty() && IsCountStar(agg)) {
+              // COUNT(* GROUP BY k): the implicit inner aggregation is the
+              // per-group row count, accumulated row by row.
+              relational_detail::AggregateAccumulator* inner_acc =
+                  accumulators_[i]->InnerAccumulator(inner_key, &agg);
+              inner_acc->Add(Value(1));
+              continue;
+            }
+            if (inner_aggs.empty()) {
+              accumulators_[i]->RememberInnerKey(inner_key);
+              continue;
+            }
+            for (const AggregateExpression* inner : inner_aggs) {
+              relational_detail::AggregateAccumulator* inner_acc =
+                  accumulators_[i]->InnerAccumulator(inner_key, inner);
+              const AggregateExpression* ml = inner;
+              if (!inner->HasInnerGroupBy() && inner->Child() != nullptr &&
+                  inner->Child()->Type() == TypeTag::kAggregateExp &&
+                  inner->Child()->AsAggregateExpression()
+                      .HasInnerGroupBy()) {
+                ml = &inner->Child()->AsAggregateExpression();
+              }
+              if (inner->HasInnerGroupBy() || ml != inner) {
+                // Recursive multi-level: partition one level deeper inside
+                // the inner accumulator.
+                inner_acc->SetEvalSchema(&input_schema_);
+                std::vector<const AggregateExpression*> inner2_aggs;
+                std::unordered_set<const AggregateExpression*> inner2_seen;
+                relational_detail::CollectAggregates(inner->Child(),
+                                                     &inner2_aggs,
+                                                     &inner2_seen);
+                for (const auto& term : inner->InnerOrderBy()) {
+                  relational_detail::CollectAggregates(term.expression,
+                                                       &inner2_aggs,
+                                                       &inner2_seen);
+                }
+                const std::vector<Expression>& ml_keys = ml->InnerGroupBy();
+                std::vector<Value> inner_keys2;
+                inner_keys2.reserve(ml_keys.size());
+                for (const Expression& key : ml_keys) {
+                  inner_keys2.push_back(
+                      key->Evaluate(*materialized, input_schema_));
+                }
+                Row inner_key2(std::move(inner_keys2));
+                inner_acc->RememberInnerRepresentative(inner_key2,
+                                                       *materialized);
+                if (inner2_aggs.empty() && IsCountStar(*inner)) {
+                  inner_acc->InnerAccumulator(inner_key2, inner)
+                      ->Add(Value(1));
+                } else if (inner2_aggs.empty()) {
+                  inner_acc->RememberInnerKey(inner_key2);
+                }
+                for (const AggregateExpression* inner2 : inner2_aggs) {
+                  if (inner2->WhereFilter() &&
+                      !inner2->WhereFilter()
+                           ->Evaluate(*materialized, input_schema_)
+                           .Truthy()) {
+                    continue;
+                  }
+                  Value x2;
+                  if (IsCountStar(*inner2)) {
+                    x2 = Value(1);
+                  } else {
+                    x2 =
+                        inner2->Child()->Evaluate(*materialized, input_schema_);
+                  }
+                  inner_acc->InnerAccumulator(inner_key2, inner2)->Add(x2);
+                }
+                continue;
+              }
+              if (inner->WhereFilter() &&
+                  !inner->WhereFilter()
+                       ->Evaluate(*materialized, input_schema_)
+                       .Truthy()) {
+                continue;
+              }
+              Value x;
+              if (IsCountStar(*inner)) {
+                x = Value(1);
+              } else {
+                x = inner->Child()->Evaluate(*materialized, input_schema_);
+              }
+              inner_acc->Add(x);
+            }
+            continue;
+          }
           relational_detail::AggregateInput input;
           if (agg.WhereFilter()) {
             if (!materialized) {

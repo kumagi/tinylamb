@@ -64,6 +64,9 @@ enum class AggregationType : int {
   kBitXor,
   kElementwiseSum,
   kElementwiseAvg,
+  kKllInitInt64,
+  kKllInitUint64,
+  kKllInitDouble,
 };
 
 std::string ToString(AggregationType type);

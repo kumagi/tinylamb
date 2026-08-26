@@ -423,6 +423,9 @@ AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate)
       aggregate->GetType() == AggregationType::kStringAgg ||
       aggregate->GetType() == AggregationType::kElementwiseSum ||
       aggregate->GetType() == AggregationType::kElementwiseAvg ||
+      aggregate->GetType() == AggregationType::kKllInitInt64 ||
+      aggregate->GetType() == AggregationType::kKllInitUint64 ||
+      aggregate->GetType() == AggregationType::kKllInitDouble ||
       aggregate->NeedsGroupContext()) {
     buffer_ = std::make_unique<std::vector<BufferedRow>>();
   }
@@ -593,6 +596,9 @@ void AggregateAccumulator::ApplyCore(const Value& value,
     case AggregationType::kStringAgg:
     case AggregationType::kElementwiseSum:
     case AggregationType::kElementwiseAvg:
+    case AggregationType::kKllInitInt64:
+    case AggregationType::kKllInitUint64:
+    case AggregationType::kKllInitDouble:
       array_values_.push_back(value);
       break;
   }
@@ -605,6 +611,156 @@ void AggregateAccumulator::Add(const AggregateInput& input) {
   }
   buffer_->push_back(BufferedRow{input.value, input.order_keys, input.condition,
                                  input.auxiliary});
+}
+
+AggregateAccumulator* AggregateAccumulator::InnerAccumulator(
+    const Row& key, const AggregateExpression* inner) {
+  auto& per_agg = inner_states_[key];
+  auto found = per_agg.find(inner);
+  if (found != per_agg.end()) {
+    return &found->second;
+  }
+  auto [iter, inserted] = per_agg.emplace(inner, AggregateAccumulator(inner));
+  return &iter->second;
+}
+
+namespace {
+
+inline bool IsCountStarLocal(const AggregateExpression& aggregate) {
+  return aggregate.GetType() == AggregationType::kCount &&
+         aggregate.Child() != nullptr &&
+         aggregate.Child()->Type() == TypeTag::kColumnValue &&
+         aggregate.Child()->AsColumnValue().GetColumnName().name == "*";
+}
+
+// Substitutes every inner aggregate node (by pointer) with its computed
+// result constant, leaving the rest of the tree intact for plain evaluation.
+Expression SubstituteInnerAggregates(  // NOLINT(misc-no-recursion)
+    const Expression& expression,
+    const std::unordered_map<const AggregateExpression*, Value>& results) {
+  if (!expression) {
+    return expression;
+  }
+  if (expression->Type() == TypeTag::kAggregateExp) {
+    const AggregateExpression* agg = &expression->AsAggregateExpression();
+    auto found = results.find(agg);
+    if (found != results.end()) {
+      return ConstantValueExp(found->second);
+    }
+    return expression;
+  }
+  std::vector<Expression> children = ExpressionChildren(expression);
+  if (children.empty()) {
+    return expression;
+  }
+  bool changed = false;
+  for (Expression& child : children) {
+    Expression replaced = SubstituteInnerAggregates(child, results);
+    if (replaced.get() != child.get()) {
+      changed = true;
+    }
+    child = std::move(replaced);
+  }
+  if (!changed) {
+    return expression;
+  }
+  return WithExpressionChildren(expression, std::move(children));
+}
+
+}  // namespace
+
+void AggregateAccumulator::FeedInnerResults() {
+  if (inner_states_.empty()) {
+    return;
+  }
+  struct InnerEntry {
+    Row key;
+    Row rep;
+    std::vector<Value> order_keys;
+  };
+  std::vector<InnerEntry> entries;
+  entries.reserve(inner_states_.size());
+  for (auto& [key, per_agg] : inner_states_) {
+    InnerEntry entry;
+    entry.key = key;
+    auto rep_it = inner_reps_.find(key);
+    if (rep_it != inner_reps_.end()) {
+      entry.rep = rep_it->second;
+    }
+    std::unordered_map<const AggregateExpression*, Value> results;
+    for (const auto& [inner_agg, acc] : per_agg) {
+      results[inner_agg] = acc.Finish();
+    }
+    if (eval_schema_ != nullptr) {
+      for (const auto& term : expression->InnerOrderBy()) {
+        Expression rewritten =
+            SubstituteInnerAggregates(term.expression, results);
+        try {
+          entry.order_keys.push_back(rewritten->Evaluate(entry.rep,
+                                                         *eval_schema_));
+        } catch (...) {
+          entry.order_keys.push_back(Value());
+        }
+      }
+    }
+    entries.push_back(std::move(entry));
+  }
+  const auto& terms = expression->InnerOrderBy();
+  if (!terms.empty()) {
+    std::stable_sort(entries.begin(), entries.end(),
+                     [&](const InnerEntry& left, const InnerEntry& right) {
+                       for (size_t t = 0; t < terms.size(); ++t) {
+                         const WindowOrderTerm& term = terms[t];
+                         const Value& a = left.order_keys[t];
+                         const Value& b = right.order_keys[t];
+                         const bool a_null = a.IsNull();
+                         const bool b_null = b.IsNull();
+                         if (a_null && b_null) { continue; }
+                         const bool nulls_first =
+                             term.nulls_first.value_or(term.ascending);
+                         if (a_null) { return nulls_first; }
+                         if (b_null) { return !nulls_first; }
+                         try {
+                           return term.ascending ? a < b : b < a;
+                         } catch (...) {
+                           return false;
+                         }
+                       }
+                       return false;
+                     });
+  }
+  size_t count = entries.size();
+  if (expression->InnerLimit().has_value()) {
+    count = std::min(count, *expression->InnerLimit());
+  }
+  for (size_t e = 0; e < count; ++e) {
+    const InnerEntry& entry = entries[e];
+    const auto& per_agg = inner_states_.at(entry.key);
+    std::unordered_map<const AggregateExpression*, Value> results;
+    for (const auto& [inner_agg, acc] : per_agg) {
+      results[inner_agg] = acc.Finish();
+    }
+    if (eval_schema_ == nullptr) {
+      continue;
+    }
+    Value value;
+    if (IsCountStarLocal(*expression)) {
+      if (results.size() == 1) {
+        value = results.begin()->second;
+      }
+    } else {
+      Expression rewritten =
+          SubstituteInnerAggregates(expression->Child(), results);
+      try {
+        value = rewritten->Evaluate(entry.rep, *eval_schema_);
+      } catch (...) {
+        value = Value();
+      }
+    }
+    if (!value.IsNull()) {
+      ApplyCore(value);
+    }
+  }
 }
 
 void AggregateAccumulator::Add(const Value& value) {
@@ -699,6 +855,9 @@ Value AggregateAccumulator::Finish() const {
       }
     }
     buffer_.reset();  // replayed
+  }
+  if (expression->HasInnerGroupBy() && !inner_states_.empty()) {
+    const_cast<AggregateAccumulator*>(this)->FeedInnerResults();
   }
   switch (expression->GetType()) {
     case AggregationType::kCount:
@@ -806,6 +965,55 @@ Value AggregateAccumulator::Finish() const {
       }
       const double covar_samp = covar_pop * n / (n - 1.0);
       return Value(covar_samp / std::sqrt(var_x * var_y));
+    }
+    case AggregationType::kKllInitInt64:
+    case AggregationType::kKllInitUint64:
+    case AggregationType::kKllInitDouble: {
+      // Serialize the sketch as "KLL:TYPE:v1,v2,..." with sorted values so
+      // EXTRACT_* can compute exact quantiles.
+      if (getenv("TINYLAMB_DEBUG_GS")) {
+        fprintf(stderr, "[kll] collected=%zu\n", array_values_.size());
+      }
+      std::vector<Value> vals;
+      for (const Value& v : array_values_) {
+        if (!v.IsNull()) { vals.push_back(v); }
+      }
+      if (vals.empty()) { return {}; }
+      std::stable_sort(vals.begin(), vals.end(),
+                       [](const Value& a, const Value& b) {
+                         // NUMERIC-typed strings (uint64 beyond int64 range)
+                         // must sort numerically, not lexicographically.
+                         if (a.type == ValueType::kVarChar &&
+                             b.type == ValueType::kVarChar) {
+                           try {
+                             const double da =
+                                 std::stod(std::string(a.value.varchar_value));
+                             const double db =
+                                 std::stod(std::string(b.value.varchar_value));
+                             return da < db;
+                           } catch (...) {}
+                         }
+                         try { return a < b; } catch (...) { return false; }
+                       });
+      std::string out = "KLL:";
+      out += expression->GetType() == AggregationType::kKllInitInt64
+                 ? 'I'
+                 : (expression->GetType() == AggregationType::kKllInitUint64
+                        ? 'U'
+                        : 'D');
+      for (size_t i = 0; i < vals.size(); ++i) {
+        if (i) { out += ","; }
+        if (vals[i].type == ValueType::kVarChar) {
+          out += std::string(vals[i].value.varchar_value);
+        } else if (vals[i].type == ValueType::kDouble) {
+          std::ostringstream o;
+          o << std::setprecision(17) << vals[i].value.double_value;
+          out += o.str();
+        } else {
+          out += std::to_string(vals[i].value.int_value);
+        }
+      }
+      return Value(std::move(out));
     }
     case AggregationType::kElementwiseSum:
     case AggregationType::kElementwiseAvg: {
@@ -1364,6 +1572,30 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
   }
+  if (name == "iferror") {
+    // IFERROR(try_expr[, fallback]): evaluate try_expr; on error or NULL
+    // return fallback (or NULL).  Lazy evaluation with exception guard.
+    if (call.Args().empty() || call.Args().size() > 2) {
+      throw std::runtime_error("IFERROR requires 1 or 2 arguments");
+    }
+    Value result;
+    try {
+      result = Evaluate(call.Args()[0], scope, aggregates, context, ctes);
+    } catch (...) {
+      result = Value();
+    }
+    if (!result.IsNull()) {
+      return result;
+    }
+    if (call.Args().size() > 1) {
+      try {
+        return Evaluate(call.Args()[1], scope, aggregates, context, ctes);
+      } catch (...) {
+        return {};
+      }
+    }
+    return {};
+  }
   if (name == "if" && call.Args().size() == 3) {
     // IF is control flow: only the taken branch is evaluated (a division by
     // zero inside the untaken branch must not raise).
@@ -1679,6 +1911,118 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         }
         return Value::Array(std::move(out), out_element_type);
       }
+    }
+  }
+
+  // ARRAY_ZIP with a transformation lambda: intercept before eager argument
+  // evaluation (the lambda cannot be evaluated as a value).
+  if (name == "array_zip" && call.Args().size() >= 3) {
+    // Detect a "\x02transform" marker followed by a lambda, or a bare
+    // positional lambda argument.
+    size_t lambda_index = static_cast<size_t>(-1);
+    for (size_t i = 0; i < call.Args().size(); ++i) {
+      if (call.Args()[i]->Type() == TypeTag::kLambdaExp) {
+        lambda_index = i;
+        break;
+      }
+      if (i + 1 < call.Args().size() &&
+          call.Args()[i]->Type() == TypeTag::kConstantValue &&
+          call.Args()[i]->AsConstantValue().GetValue().type ==
+              ValueType::kVarChar &&
+          std::string(call.Args()[i]
+                          ->AsConstantValue()
+                          .GetValue()
+                          .value.varchar_value) == "\x02transform") {
+        lambda_index = i + 1;
+        break;
+      }
+    }
+    if (lambda_index != static_cast<size_t>(-1) &&
+        lambda_index < call.Args().size() &&
+        call.Args()[lambda_index]->Type() == TypeTag::kLambdaExp) {
+      const auto& lam =
+          call.Args()[lambda_index]->AsLambdaExpression();
+      // Evaluate the zipped arrays (all args before the marker).
+      std::vector<Value> arrays;
+      std::vector<std::string> names;
+      std::string mode = "STRICT";
+      for (size_t i = 0; i < lambda_index; ++i) {
+        if (i + 1 < lambda_index &&
+            call.Args()[i + 1]->Type() == TypeTag::kConstantValue &&
+            call.Args()[i + 1]->AsConstantValue().GetValue().type ==
+                ValueType::kVarChar) {
+          const std::string marker(call.Args()[i + 1]
+                                       ->AsConstantValue()
+                                       .GetValue()
+                                       .value.varchar_value);
+          if (marker == "\x02mode") {
+            Value mode_val =
+                Evaluate(call.Args()[i], scope, aggregates, context, ctes);
+            if (mode_val.IsNull()) { return {}; }
+            mode = raw_str(mode_val);
+            for (char& c : mode) {
+              c = static_cast<char>(
+                  std::toupper(static_cast<unsigned char>(c)));
+            }
+            ++i;
+            continue;
+          }
+          if (marker == "\x02transform") { break; }
+        }
+        Value arr = Evaluate(call.Args()[i], scope, aggregates, context, ctes);
+        arrays.push_back(arr);
+        if (i + 1 < lambda_index) {
+          Value name_val =
+              Evaluate(call.Args()[i + 1], scope, aggregates, context, ctes);
+          names.push_back(name_val.IsNull() ? std::string()
+                                            : raw_str(name_val));
+        }
+        ++i;
+      }
+      bool any_null = false;
+      size_t width = 0;
+      for (const Value& arr : arrays) {
+        if (arr.IsNull()) { any_null = true; continue; }
+        width = std::max(width, arr.ArrayElements().size());
+      }
+      if (any_null) { return {}; }
+      for (const Value& arr : arrays) {
+        if (arr.ArrayElements().size() != width && mode != "PAD") {
+          throw std::runtime_error(
+              "Unequal array length in ARRAY_ZIP using STRICT mode");
+        }
+      }
+      std::vector<Value> out;
+      std::string element_type;
+      for (size_t pos = 0; pos < width; ++pos) {
+        std::vector<Value> slots;
+        for (size_t f = 0; f < arrays.size(); ++f) {
+          const auto& elements = arrays[f].ArrayElements();
+          slots.push_back(pos < elements.size() ? elements[pos] : Value());
+        }
+        while (slots.size() < lam.Parameters().size()) { slots.emplace_back(); }
+        Row param_row(std::move(slots));
+        std::vector<Column> columns;
+        for (const std::string& param : lam.Parameters()) {
+          columns.emplace_back(ColumnName(param));
+        }
+        Schema param_schema("", std::move(columns));
+        Scope inner_scope{.row = &param_row, .schema = &param_schema,
+                          .outer = &scope};
+        Value transformed = Evaluate(lam.Body(), inner_scope, aggregates,
+                                     context, ctes);
+        if (element_type.empty() && !transformed.IsNull()) {
+          switch (transformed.type) {
+            case ValueType::kInt64: element_type = "INT64"; break;
+            case ValueType::kDouble: element_type = "FLOAT64"; break;
+            case ValueType::kVarChar: element_type = "STRING"; break;
+            case ValueType::kDate: element_type = "DATE"; break;
+            default: break;
+          }
+        }
+        out.push_back(std::move(transformed));
+      }
+      return Value::Array(std::move(out), element_type.empty() ? "INT64" : element_type);
     }
   }
 
@@ -2041,6 +2385,137 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(out));
   }
 
+  // ---- TYPEOF: returns the SQL type name of an expression. ----
+  if (name == "typeof") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("TYPEOF requires 1 argument");
+    }
+    const Value& v = arguments[0];
+    std::function<std::string(const Value&)> type_name =
+        [&](const Value& value) -> std::string {
+      if (value.IsNull()) { return "NULL"; }
+      switch (value.type) {
+        case ValueType::kInt64: return "INT64";
+        case ValueType::kDouble: return "FLOAT64";
+        case ValueType::kVarChar: return "STRING";
+        case ValueType::kDate: return "DATE";
+        case ValueType::kArray: {
+          const std::string& declared = value.ArrayElementSqlType();
+          if (!declared.empty() &&
+              declared != "INT64" && declared != "STRING" &&
+              declared != "FLOAT64" && declared != "DOUBLE" &&
+              declared != "DATE" && declared != "BOOL") {
+            // Nested array/struct payloads keep their declared type.
+            return "ARRAY<" + declared + ">";
+          }
+          for (const Value& el : value.ArrayElements()) {
+            if (!el.IsNull()) {
+              if (el.IsArray()) {
+                return "ARRAY<" + type_name(el) + ">";
+              }
+              return "ARRAY<" + type_name(el) + ">";
+            }
+          }
+          return "ARRAY<INT64>";
+        }
+        default: return "UNKNOWN";
+      }
+    };
+    return Value(type_name(v));
+  }
+
+  // ---- ARRAY_DISTINCT / ARRAY_REVERSE / ARRAY_IS_DISTINCT ----
+  if (name == "array_distinct" || name == "array_reverse" ||
+      name == "array_is_distinct") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error(name + " requires 1 argument");
+    }
+    const Value& arr = arguments[0];
+    if (arr.IsNull()) { return {}; }
+    if (!arr.IsArray()) {
+      throw std::runtime_error(name + " requires an array");
+    }
+    const auto& elements = arr.ArrayElements();
+    if (name == "array_reverse") {
+      std::vector<Value> out(elements.rbegin(), elements.rend());
+      return Value::Array(std::move(out), arr.ArrayElementSqlType());
+    }
+    if (name == "array_is_distinct") {
+      for (size_t i = 0; i < elements.size(); ++i) {
+        for (size_t j = i + 1; j < elements.size(); ++j) {
+          try {
+            if (!elements[i].IsNull() && !elements[j].IsNull() &&
+                EvaluateBinary(BinaryOperation::kEquals, elements[i],
+                               elements[j]).Truthy()) {
+              return Value(int64_t{0});
+            }
+          } catch (...) {}
+        }
+      }
+      return Value(int64_t{1});
+    }
+    // ARRAY_DISTINCT
+    std::vector<Value> out;
+    bool saw_null = false;
+    for (const Value& element : elements) {
+      if (element.IsNull()) { saw_null = true; continue; }
+      bool dup = false;
+      for (const Value& kept : out) {
+        try {
+          if (!kept.IsNull() &&
+              EvaluateBinary(BinaryOperation::kEquals, kept, element).Truthy()) {
+            dup = true; break;
+          }
+        } catch (...) {}
+      }
+      if (!dup) { out.push_back(element); }
+    }
+    if (saw_null) { out.emplace_back(); }
+    return Value::Array(std::move(out), arr.ArrayElementSqlType());
+  }
+
+  // ---- GENERATE_ARRAY(start, stop[, step]) ----
+  if (name == "generate_array") {
+    if (arguments.size() < 2 || arguments.size() > 3) {
+      throw std::runtime_error("GENERATE_ARRAY requires 2 or 3 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) { return {}; }
+    double start = arguments[0].type == ValueType::kDouble
+                       ? arguments[0].value.double_value
+                       : static_cast<double>(arguments[0].value.int_value);
+    double stop = arguments[1].type == ValueType::kDouble
+                      ? arguments[1].value.double_value
+                      : static_cast<double>(arguments[1].value.int_value);
+    double step = 1.0;
+    if (arguments.size() >= 3 && !arguments[2].IsNull()) {
+      step = arguments[2].type == ValueType::kDouble
+                 ? arguments[2].value.double_value
+                 : static_cast<double>(arguments[2].value.int_value);
+    }
+    if (step == 0.0) { return Value::Array({}, "INT64"); }
+    bool is_double = arguments[0].type == ValueType::kDouble ||
+                     arguments[1].type == ValueType::kDouble ||
+                     (arguments.size() >= 3 && arguments[2].type == ValueType::kDouble);
+    std::vector<Value> out;
+    if (step > 0) {
+      for (double v = start; v <= stop; v += step) { out.push_back(is_double ? Value(v) : Value(static_cast<int64_t>(v))); }
+    } else {
+      for (double v = start; v >= stop; v += step) { out.push_back(is_double ? Value(v) : Value(static_cast<int64_t>(v))); }
+    }
+    return Value::Array(std::move(out), is_double ? "FLOAT64" : "INT64");
+  }
+
+  // ---- IFERROR(try_expr[, fallback]) ----
+  if (name == "iferror") {
+    // Arguments are eagerly evaluated by the caller; if the first argument
+    // evaluation threw we would never reach here.  Instead, handle at the
+    // visitor level with __safe-like semantics. This branch handles NULL.
+    if (arguments.empty()) { return {}; }
+    return arguments[0].IsNull()
+               ? (arguments.size() > 1 ? arguments[1] : Value())
+               : arguments[0];
+  }
+
   if (name == "__array_set") {
     if (arguments.size() != 3) {
       throw std::runtime_error("__array_set requires 3 arguments");
@@ -2065,6 +2540,57 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     out[static_cast<size_t>(raw_index)] = arguments[2];
     return Value::Array(std::move(out), arr.ArrayElementSqlType());
+  }
+
+  // ---- KLL_QUANTILES sketch functions: the sketch is our opaque sorted
+  // "KLL:TYPE:v1,v2,..." text; EXTRACT computes exact quantiles. ----
+  if (name == "kll_quantiles.extract_int64" ||
+      name == "kll_quantiles.extract_uint64" ||
+      name == "kll_quantiles.extract_double" ||
+      name == "kll_quantiles.extract_float64") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("KLL_QUANTILES.EXTRACT requires 2 arguments");
+    }
+    const Value& sketch = arguments[0];
+    if (sketch.IsNull()) { return {}; }
+    const std::string text = raw_str(sketch);
+    if (!text.starts_with("KLL:")) { return {}; }
+    if (getenv("TINYLAMB_DEBUG_GS")) {
+      fprintf(stderr, "[extract] sketch=%s\n", text.c_str());
+    }
+    const size_t first_comma = text.find(',');
+    std::string values_text =
+        first_comma == std::string::npos ? std::string()
+                                         : text.substr(first_comma + 1);
+    std::vector<Value> values;
+    size_t start = 0;
+    while (start <= values_text.size()) {
+      size_t comma = values_text.find(',', start);
+      std::string tok = comma == std::string::npos
+                            ? values_text.substr(start)
+                            : values_text.substr(start, comma - start);
+      if (!tok.empty()) { values.push_back(json_text_to_value(tok)); }
+      if (comma == std::string::npos) { break; }
+      start = comma + 1;
+    }
+    const Value& n_value = arguments[1];
+    if (n_value.IsNull()) { return {}; }
+    const int64_t num = n_value.value.int_value;
+    if (num <= 0 || values.empty()) { return {}; }
+    std::vector<Value> out;
+    for (int64_t i = 0; i <= num; ++i) {
+      const size_t idx = static_cast<size_t>(
+          i * static_cast<int64_t>(values.size() - 1) / num);
+      out.push_back(values[idx]);
+    }
+    if (getenv("TINYLAMB_DEBUG_GS")) {
+      std::string dbg;
+      for (const Value& v : values) { dbg += std::to_string(v.value.int_value) + ";"; }
+      fprintf(stderr, "[extract2] num=%lld n=%zu vals=%s out0=%lld\n",
+              (long long)num, values.size(), dbg.c_str(),
+              (long long)(out.empty() ? -1 : out[0].value.int_value));
+    }
+    return Value::Array(std::move(out), "INT64");
   }
 
   if (name == "session_user" || name == "current_user") {

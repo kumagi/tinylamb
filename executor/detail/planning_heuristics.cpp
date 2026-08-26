@@ -640,6 +640,71 @@ bool ShouldHybridJoin(const Relation& left, const Relation& right) {
   return PreferHybridHashJoin(estimate);
 }
 
+// USING(col, ...) output shape: the shared columns appear once (left side
+// wins) instead of once per operand. Drops the right-side duplicates from
+// the joined schema and rows.
+Relation CoalesceUsingColumns(TransactionContext& context, Relation joined,
+                              const SelectSource& source, size_t left_width) {
+  if (source.using_columns.empty()) {
+    return joined;
+  }
+  std::vector<size_t> drop;  // right-side offsets to remove
+  auto ci_equal = [](std::string_view a, std::string_view b) {
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+             return std::tolower(static_cast<unsigned char>(x)) ==
+                    std::tolower(static_cast<unsigned char>(y));
+           });
+  };
+  for (size_t c = 0; c < left_width; ++c) {
+    const std::string& name = joined.schema.GetColumn(c).Name().name;
+    for (const std::string& want : source.using_columns) {
+      if (ci_equal(name, want)) {
+        drop.push_back(left_width + c);
+        break;
+      }
+    }
+  }
+  if (drop.empty()) {
+    return joined;
+  }
+  std::vector<Column> columns;
+  columns.reserve(joined.schema.ColumnCount() - drop.size());
+  for (size_t c = 0; c < joined.schema.ColumnCount(); ++c) {
+    if (std::ranges::find(drop, c) == drop.end()) {
+      columns.push_back(joined.schema.GetColumn(c));
+    }
+  }
+  Schema schema(joined.schema.Name(), std::move(columns));
+  Relation out(context.execution_runtime());
+  out.schema = std::move(schema);
+  joined.FinishSpill();
+  joined.ForEachRow([&](const Row& row) {
+    Row kept;
+    kept.values_.reserve(row.values_.size() - drop.size());
+    for (size_t c = 0; c < row.values_.size(); ++c) {
+      if (std::ranges::find(drop, c) == drop.end()) {
+        kept.values_.push_back(row.values_[c]);
+      } else {
+        // USING merge for FULL/RIGHT joins: the surviving (left) column
+        // takes COALESCE(left, right) so right-only rows still expose the
+        // shared key value.
+        const size_t right_index = c;
+        const size_t left_index = right_index - left_width;
+        const Value& right_value = row.values_[right_index];
+        if (!right_value.IsNull()) {
+          kept.values_.push_back(right_value);
+        } else {
+          kept.values_.push_back(row.values_[left_index]);
+        }
+      }
+    }
+    out.AddRow(std::move(kept));
+  });
+  out.FinishSpill();
+  return out;
+}
+
 Relation Join(TransactionContext& context, Relation left, Relation right,
               const SelectSource& source, const Scope* outer,
               const CteMap& ctes) {
@@ -1222,8 +1287,11 @@ Relation BuildInput(TransactionContext& context,
     }
     Relation result = std::move(relations.front());
     for (size_t i = 1; i < relations.size(); ++i) {
+      const size_t left_width = result.schema.ColumnCount();
       result = Join(context, std::move(result), std::move(relations[i]),
                     effective[i], outer, ctes);
+      result = CoalesceUsingColumns(context, std::move(result), effective[i],
+                                    left_width);
     }
     return result;
   }
@@ -1604,8 +1672,11 @@ Relation BuildInput(TransactionContext& context,
       }
       applicable.push_back(predicate.expression);
     }
+    const size_t left_width = result.schema.ColumnCount();
     result = InnerJoin(context, std::move(result), std::move(relations[next]),
                        applicable, outer, ctes);
+    result = CoalesceUsingColumns(context, std::move(result),
+                                  statement.Sources()[next], left_width);
     joined.insert(next);
     remaining.erase(next);
   }

@@ -41,6 +41,9 @@ std::unordered_set<ColumnName> AggregateExpression::TouchedColumns() const {
   for (const auto& term : inner_order_by_) {
     columns.merge(term.expression->TouchedColumns());
   }
+  for (const Expression& key : inner_group_by_) {
+    columns.merge(key->TouchedColumns());
+  }
   return columns;
 }
 

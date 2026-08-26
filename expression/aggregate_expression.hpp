@@ -80,6 +80,18 @@ class AggregateExpression : public ExpressionBase {
     return having_ != AggregateHavingModifier::kNone ||
            !inner_order_by_.empty() || inner_limit_.has_value();
   }
+  // Multi-level aggregation: SUM(AVG(x) GROUP BY y).  The inner GROUP BY
+  // expressions partition input rows before the child aggregate runs; the
+  // outer aggregate then combines the per-group results.
+  [[nodiscard]] const std::vector<Expression>& InnerGroupBy() const {
+    return inner_group_by_;
+  }
+  [[nodiscard]] bool HasInnerGroupBy() const {
+    return !inner_group_by_.empty();
+  }
+  void SetInnerGroupBy(std::vector<Expression> group_by) {
+    inner_group_by_ = std::move(group_by);
+  }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
@@ -94,6 +106,7 @@ class AggregateExpression : public ExpressionBase {
   std::optional<size_t> inner_limit_;
   Expression secondary_arg_;
   Expression where_filter_;
+  std::vector<Expression> inner_group_by_;
 };
 
 }  // namespace tinylamb

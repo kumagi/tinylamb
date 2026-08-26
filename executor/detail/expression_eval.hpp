@@ -62,6 +62,23 @@ struct AggregateAccumulator {
   Value Finish() const;
 
   const AggregateExpression* expression;
+  // Multi-level aggregation: per-inner-group accumulators over the inner
+  // aggregate expression; FeedInnerResults() drains them into this
+  // accumulator before Finish().
+  // Multi-level: get-or-create the accumulator for (inner key, inner agg).
+  AggregateAccumulator* InnerAccumulator(const Row& key,
+                                         const AggregateExpression* inner);
+  void SetEvalSchema(const Schema* schema) { eval_schema_ = schema; }
+  void RememberInnerRepresentative(const Row& key, const Row& rep) {
+    inner_reps_.emplace(key, rep);
+  }
+  // Registers an inner group key even when the child tree holds no aggregate
+  // (implicit inner aggregation): the group still contributes one value.
+  void RememberInnerKey(const Row& key) { inner_states_[key]; }
+  // Drains per-inner-group results into this accumulator by substituting the
+  // inner aggregate results into the child expression tree and evaluating it
+  // against each inner group's representative row.
+  void FeedInnerResults();
   int64_t count = 0;
   double total = 0.0;
   // Integer sums accumulate exactly here (uint64 to keep overflow defined);
@@ -93,6 +110,11 @@ struct AggregateAccumulator {
   mutable std::unique_ptr<std::vector<BufferedRow>> buffer_;
   mutable std::vector<Value> array_values_;
   mutable std::optional<std::string> delimiter_;
+  std::unordered_map<Row, std::unordered_map<const AggregateExpression*,
+                                             AggregateAccumulator>>
+      inner_states_;
+  std::unordered_map<Row, Row> inner_reps_;
+  const Schema* eval_schema_{nullptr};
 
   void ApplyCore(const Value& value, const Value& auxiliary = Value());
 };

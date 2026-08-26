@@ -1033,8 +1033,8 @@ struct WindowRuntime {
       }
       return Value(variance);
     };
-    if (fn == "VAR_POP" || fn == "VAR_SAMP") {
-      return frame_variance(fn == "VAR_SAMP");
+    if (fn == "VAR_POP" || fn == "VAR_SAMP" || fn == "VARIANCE") {
+      return frame_variance(fn == "VAR_POP" ? false : true);
     }
     if (fn == "STDDEV_POP" || fn == "STDDEV_SAMP" || fn == "STDDEV") {
       Value variance = frame_variance(fn != "STDDEV_POP");
@@ -1064,6 +1064,92 @@ struct WindowRuntime {
         return Value();
       }
       return Value(covar_pop / std::sqrt(var_x * var_y));
+    }
+    if (fn == "PERCENTILE_CONT" || fn == "PERCENTILE_DISC") {
+      // PERCENTILE_CONT(value, p) OVER (ORDER BY ...): p in [0,1] constant.
+      std::vector<Value> frame_values = non_null;
+      if (window.respect_nulls) {
+        // NULLs join the frame and sort before every value.
+        frame_values.clear();
+        for (const Value& value : values) {
+          frame_values.push_back(value);
+        }
+      }
+      if (frame_values.empty() || window.args.size() < 2) {
+        return Value();
+      }
+      Value p_value = Evaluate(
+          window.args[1],
+          Scope{.row = &rows[ordered[lo]], .schema = schema, .outer = outer},
+          nullptr, context, *ctes);
+      if (p_value.IsNull()) {
+        return Value();
+      }
+      double p = 0.0;
+      if (p_value.type == ValueType::kDouble) {
+        p = p_value.value.double_value;
+      } else if (p_value.type == ValueType::kInt64) {
+        p = static_cast<double>(p_value.value.int_value);
+      } else {
+        try {
+          p = std::stod(std::string(p_value.value.varchar_value));
+        } catch (...) {
+          return Value();
+        }
+      }
+      if (p < 0.0 || p > 1.0) {
+        throw std::runtime_error("PERCENTILE argument must be between 0 and 1");
+      }
+      std::vector<Value> sorted = frame_values;
+      // PERCENTILE sorts NULLs first, then NaN (unlike ORDER BY, where NaN
+      // is largest).  NUMERIC-typed strings compare numerically.
+      std::sort(
+          sorted.begin(), sorted.end(), [](const Value& a, const Value& b) {
+            if (a.IsNull() || b.IsNull()) {
+              return a.IsNull() && !b.IsNull();
+            }
+            const bool a_nan = a.type == ValueType::kDouble &&
+                               std::isnan(a.value.double_value);
+            const bool b_nan = b.type == ValueType::kDouble &&
+                               std::isnan(b.value.double_value);
+            if (a_nan || b_nan) {
+              return a_nan && !b_nan;
+            }
+            if (a.type == ValueType::kVarChar &&
+                b.type == ValueType::kVarChar) {
+              try {
+                const double da = std::stod(std::string(a.value.varchar_value));
+                const double db = std::stod(std::string(b.value.varchar_value));
+                return da < db;
+              } catch (...) {
+              }
+            }
+            try {
+              return a < b;
+            } catch (...) {
+              return false;
+            }
+          });
+      const double rank = p * static_cast<double>(sorted.size() - 1);
+      if (fn == "PERCENTILE_DISC") {
+        // PERCENTILE_DISC rounds the rank UP to the next element.
+        return sorted[static_cast<size_t>(std::ceil(rank))];
+      }
+      const size_t lo_idx = static_cast<size_t>(std::floor(rank));
+      const size_t hi_idx = static_cast<size_t>(std::ceil(rank));
+      if (lo_idx == hi_idx) {
+        return sorted[lo_idx];
+      }
+      // Interpolation across a NULL endpoint yields NULL.
+      if (sorted[lo_idx].IsNull() || sorted[hi_idx].IsNull()) {
+        return Value();
+      }
+      const double a = NumericOf(sorted[lo_idx]);
+      const double b = NumericOf(sorted[hi_idx]);
+      const double frac = rank - static_cast<double>(lo_idx);
+      // a*(1-frac) + b*frac (NOT a + (b-a)*frac): the former keeps infinite
+      // endpoints as-is instead of collapsing to NaN.
+      return Value(a * (1.0 - frac) + b * frac);
     }
     if (fn == "ELEMENTWISE_SUM" || fn == "ELEMENTWISE_AVG") {
       bool saw_array = false;

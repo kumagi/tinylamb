@@ -268,6 +268,16 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
       `AS col` で改名、UNBOUNDED 上限対応）→ サイクル検出オプションの実質代替
 - [x] 再帰深さリミット（明示 DEPTH 未指定時は反復上限 1024 + 累積行予算
       1000 万で超過時にエラー）
+- [x] JOIN の USING 列合併（`using_columns` を SelectSource に追加し、
+      Join/InnerJoin 後に右側の同名列を出力から除去。FULL/RIGHT/INNER の
+      USING 結合で無修飾参照の曖昧さを解消）
+- [x] anchor 内重複の UNION DISTINCT 排除（Flights 型の全 NULL 重複行が
+      出力に二重に入る不具合を修正。anchor も seen セットで dedupe）
+- [x] JOIN の USING 句を両辺修飾で生成（無修飾 `a = a` が同名列結合で
+      曖昧になる問題を修正。FULL/RIGHT JOIN の CTE オペランドが解決）
+- [x] 再帰項の BY NAME / CORRESPONDING アライメント（各ラウンドで蓄積側と項出力を
+      列名で整列してから dedupe/追加。出力スキーマが拡張/縮小した場合は既存行も
+      再射影。`matches[term_index-1]` で項対応の match を解決）
 - [x] CTE 解決の依存順（WITH RECURSIVE 内の前方参照を許可。兄弟定義への参照を
       トポロジカルに解決し、相互再帰はエラー化）
 - [x] テンプレート再構築でも再帰メタデータを保持（BindSelect が宣言順

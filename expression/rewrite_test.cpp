@@ -1330,4 +1330,36 @@ TEST(ExpressionRewriteTest,
   EXPECT_EQ(WithExpressionChildren(cast, children)->Type(), TypeTag::kCastExp);
 }
 
+// Overflowing constant folds must never wrap into a wrong constant: the
+// fold attempt throws, the rule declines, and the expression survives for
+// execution to report the overflow loudly.
+TEST(ExpressionRewriteTest, Rewrite_OverflowingConstantFoldStaysUnfolded) {
+  Expression expr = BinaryExpressionExp(
+      ConstantValueExp(Value(std::numeric_limits<int64_t>::max())),
+      BinaryOperation::kAdd, ConstantValueExp(Value(1)));
+  Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expr);
+  EXPECT_EQ(rewritten->Type(), TypeTag::kBinaryExp)
+      << "folded value would silently wrap";
+}
+
+// ARRAY_LENGTH over a literal array is deterministic and folds at rewrite
+// time; an =0 comparison against the folded length collapses to a boolean.
+TEST(ExpressionRewriteTest, Rewrite_ArrayLengthOfLiteralArrayFolds) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  Expression length = rewriter.Rewrite(FunctionCallExp(
+      "array_length",
+      {ConstantValueExp(Value::Array({Value(1), Value(2), Value(3)},
+                                     std::string("INT64")))}));
+  ASSERT_EQ(length->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(length->AsConstantValue().GetValue(), Value(3));
+
+  Expression empty_is_zero = rewriter.Rewrite(BinaryExpressionExp(
+      FunctionCallExp("array_length", {ConstantValueExp(Value::Array(
+                                          {}, std::string("INT64")))}),
+      BinaryOperation::kEquals, ConstantValueExp(Value(0))));
+  ASSERT_EQ(empty_is_zero->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(empty_is_zero->AsConstantValue().GetValue().Truthy(), true);
+}
+
 }  // namespace tinylamb
