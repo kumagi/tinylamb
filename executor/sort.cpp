@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -79,7 +80,12 @@ void AppendMemComparableValue(const Value& v, std::string* out) {
       uint64_t bits = 0;
       std::memcpy(&bits, &v.value.double_value, sizeof(bits));
       uint64_t be = BSwap64(bits);
-      if (0 <= v.value.double_value) {
+      // IEEE total-order transform. NaN fails every comparison, so classify
+      // by the sign bit directly; NaN keys then land above +inf, matching
+      // GoogleSQL ORDER BY.
+      const bool negative =
+          !std::isnan(v.value.double_value) && (bits >> 63) != 0;
+      if (!negative) {
         be |= 0x80;
       } else {
         be = ~be;

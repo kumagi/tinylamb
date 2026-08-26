@@ -1228,10 +1228,12 @@ Value AggregateAccumulator::Finish() const {
                            if (b_null) {
                              return !nulls_first;
                            }
-                           try {
-                             return term.ascending ? a < b : b < a;
-                           } catch (...) {
-                             return false;
+                           {
+                             const int c = CompareForOrderBy(a, b);
+                             if (c == 0) { return false;
+}
+                             const bool a_less = c < 0;
+                             return term.ascending ? a_less : !a_less;
                            }
                          }
                          return false;
@@ -1865,6 +1867,27 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
   std::string name = call.FuncName();
   for (char& c : name) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  // IF evaluates only the chosen branch: the untaken branch must not raise
+  // (e.g. guarded out-of-range array accesses under IF guards).
+  if (name == "if") {
+    if (call.Args().size() != 3) {
+      throw std::runtime_error("IF requires 3 arguments");
+    }
+    const Value condition =
+        Evaluate(call.Args()[0], scope, aggregates, context, ctes);
+    const size_t taken = condition.Truthy() ? 1 : 2;
+    return Evaluate(call.Args()[taken], scope, aggregates, context, ctes);
+  }
+  // COALESCE stops at the first non-NULL argument.
+  if (name == "coalesce") {
+    for (const Expression& argument : call.Args()) {
+      Value value = Evaluate(argument, scope, aggregates, context, ctes);
+      if (!value.IsNull()) {
+        return value;
+      }
+    }
+    return {};
   }
   if (name == "date_add" || name == "date_sub" || name == "datetime_add" ||
       name == "datetime_sub" || name == "timestamp_add" ||

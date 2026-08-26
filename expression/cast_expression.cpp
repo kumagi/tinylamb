@@ -366,20 +366,31 @@ Value CastValue(const Value& val, const std::string& type_name,
         break;
       }
       case ValueType::kDouble: {
-        if (val.type == ValueType::kDouble) { return val; }
+        // FLOAT/FLOAT32 targets narrow to IEEE-754 single precision:
+        // subnormal doubles (e.g. -1e-46) round to signed zero like the
+        // reference engine instead of surviving at double precision.
+        const bool is_float32 = upper == "FLOAT" || upper == "FLOAT32";
+        auto finish_double = [&](double d) -> Value {
+          return is_float32 ? Value(static_cast<double>(static_cast<float>(d)))
+                            : Value(d);
+        };
+        if (val.type == ValueType::kDouble) {
+          return finish_double(val.value.double_value);
+        }
         if (val.type == ValueType::kInt64) {
-          return Value(static_cast<double>(val.value.int_value));
+          return finish_double(static_cast<double>(val.value.int_value));
         }
         if (val.type == ValueType::kVarChar) {
           std::string s = ToLower(std::string(val.value.varchar_value));
           if (s == "nan" || s == "+nan" || s == "-nan") {
-            return Value(std::numeric_limits<double>::quiet_NaN());
+            return finish_double(
+                std::numeric_limits<double>::quiet_NaN());
           }
           if (s == "inf" || s == "+inf" || s == "infinity" || s == "+infinity") {
-            return Value(std::numeric_limits<double>::infinity());
+            return finish_double(std::numeric_limits<double>::infinity());
           }
           if (s == "-inf" || s == "-infinity") {
-            return Value(-std::numeric_limits<double>::infinity());
+            return finish_double(-std::numeric_limits<double>::infinity());
           }
           char* end = nullptr;
           errno = 0;
@@ -390,11 +401,11 @@ Value CastValue(const Value& val, const std::string& type_name,
           if (errno == ERANGE && (parsed == HUGE_VAL || parsed == -HUGE_VAL)) {
             throw std::runtime_error("float overflow: " + s);
           }
-          return Value(parsed);
+          return finish_double(parsed);
         }
 
         if (val.type == ValueType::kDate) {
-          return Value(static_cast<double>(val.DateDays()));
+          return finish_double(static_cast<double>(val.DateDays()));
         }
         break;
       }

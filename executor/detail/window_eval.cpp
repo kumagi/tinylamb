@@ -174,11 +174,11 @@ bool ValueLess(const Value& a, const Value& b, bool ascending,
   if (a.IsNull() && b.IsNull()) { return false; }
   if (a.IsNull()) { return nulls_first_value; }
   if (b.IsNull()) { return !nulls_first_value; }
-  try {
-    return ascending ? a < b : b < a;
-  } catch (...) {
-    return false;
-  }
+  const int c = CompareForOrderBy(a, b);
+  if (c == 0) { return false;
+}
+  const bool a_less = c < 0;
+  return ascending ? a_less : !a_less;
 }
 
 bool ValuesEqual(const Value& a, const Value& b) {

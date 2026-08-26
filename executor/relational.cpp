@@ -435,18 +435,20 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
           for (size_t i = 0; i < order_by.size(); ++i) {
             const Value& a = left.keys[i];
             const Value& b = right.keys[i];
-            if (a == b) {
+            const int c = CompareForOrderBy(a, b);
+            if (c == 0) {
               continue;
             }
             const bool nulls_first =
                 order_by[i].nulls_first.value_or(order_by[i].ascending);
+            const bool a_less = c < 0;
             if (a.IsNull()) {
               return nulls_first;
             }
             if (b.IsNull()) {
               return !nulls_first;
             }
-            return order_by[i].ascending ? a < b : b < a;
+            return order_by[i].ascending ? a_less : !a_less;
           }
           return false;
         });
@@ -527,18 +529,20 @@ void ApplyOrderBy(TransactionContext& context, const SelectStatement& statement,
         for (size_t i = 0; i < order_by.size(); ++i) {
           const Value& a = left.keys[i];
           const Value& b = right.keys[i];
-          if (a == b) {
+          const int c = CompareForOrderBy(a, b);
+          if (c == 0) {
             continue;
           }
           const bool nulls_first =
               order_by[i].nulls_first.value_or(order_by[i].ascending);
+          const bool a_less = c < 0;
           if (a.IsNull()) {
             return nulls_first;
           }
           if (b.IsNull()) {
             return !nulls_first;
           }
-          return order_by[i].ascending ? a < b : b < a;
+          return order_by[i].ascending ? a_less : !a_less;
         }
         return false;
       });
@@ -1023,16 +1027,18 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
             for (size_t i = 0; i < stmt.OrderBy().size(); ++i) {
               const Value& a = left.keys[i];
               const Value& b = right.keys[i];
-              if (a == b) { continue;
+              const int c = CompareForOrderBy(a, b);
+              if (c == 0) { continue;
 }
               const bool nulls_first =
                   stmt.OrderBy()[i].nulls_first.value_or(
                       stmt.OrderBy()[i].ascending);
+              const bool a_less = c < 0;
               if (a.IsNull()) { return nulls_first;
 }
               if (b.IsNull()) { return !nulls_first;
 }
-              return stmt.OrderBy()[i].ascending ? a < b : b < a;
+              return stmt.OrderBy()[i].ascending ? a_less : !a_less;
             }
             return false;
           });
