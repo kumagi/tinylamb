@@ -636,6 +636,34 @@ Value CastValue(const Value& val, const std::string& type_name,
 
     switch (target_type) {
       case ValueType::kInt64: {
+        // Narrow integer targets validate their declared range: the engine
+        // stores every integer as INT64 but CAST semantics still reject
+        // out-of-range values.
+        auto narrow_bounds = [](const std::string& t, int64_t* lo,
+                                uint64_t* hi) -> bool {
+          if (t == "INT8") { *lo = -128; *hi = 127; return true; }
+          if (t == "INT16") { *lo = -32768; *hi = 32767; return true; }
+          if (t == "INT32") { *lo = -2147483648LL; *hi = 2147483647LL; return true; }
+          if (t == "UINT8") { *lo = 0; *hi = 255; return true; }
+          if (t == "UINT16") { *lo = 0; *hi = 65535; return true; }
+          if (t == "UINT32") { *lo = 0; *hi = 4294967295ULL; return true; }
+          return false;
+        };
+        int64_t lo = 0;
+        uint64_t hi = 0;
+        if (narrow_bounds(upper, &lo, &hi)) {
+          const int64_t candidate =
+              val.type == ValueType::kDouble
+                  ? static_cast<int64_t>(std::round(val.value.double_value))
+                  : val.value.int_value;
+          if (candidate < lo ||
+              (candidate >= 0 && static_cast<uint64_t>(candidate) > hi)) {
+            const std::string message = ToLower(upper) + " out of range: " +
+                                        std::to_string(candidate);
+            if (safe) { return Value(); }
+            throw std::out_of_range(message);
+          }
+        }
         if (val.type == ValueType::kInt64) { return val; }
         if (val.type == ValueType::kDouble) {
           if (std::isnan(val.value.double_value) ||
@@ -783,7 +811,10 @@ Value CastValue(const Value& val, const std::string& type_name,
         break;
       }
       case ValueType::kVarChar: {
+        // Booleans stringify as their SQL literals, not as integers.
         std::string s = (val.type == ValueType::kDate) ? FormatDateDays(val.DateDays())
+                        : (is_bool && val.type == ValueType::kInt64)
+                            ? (val.value.int_value != 0 ? "true" : "false")
                         : (val.type == ValueType::kInt64) ? std::to_string(val.value.int_value)
                         : (val.type == ValueType::kDouble) ? ([&]() {
                             if (std::isnan(val.value.double_value)) { return std::string("nan"); }

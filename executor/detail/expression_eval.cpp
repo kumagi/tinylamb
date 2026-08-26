@@ -3798,6 +3798,60 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return elements[static_cast<size_t>(index)];
   }
+  if (name == "__bit_and" || name == "__bit_or" || name == "__bit_xor" ||
+      name == "__shift_left" || name == "__shift_right") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error(name + " requires 2 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull()) {
+      return {};
+    }
+    const int64_t lhs = arguments[0].value.int_value;
+    const int64_t rhs = arguments[1].value.int_value;
+    if (name == "__bit_and") { return Value(lhs & rhs); }
+    if (name == "__bit_or") { return Value(lhs | rhs); }
+    if (name == "__bit_xor") { return Value(lhs ^ rhs); }
+    if (rhs < 0 || rhs >= 64) {
+      throw std::out_of_range("shift amount out of range");
+    }
+    const uint64_t ulhs = static_cast<uint64_t>(lhs);
+    const uint64_t shifted =
+        name == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
+    return Value(static_cast<int64_t>(shifted));
+  }
+  if (name == "unix_millis") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("unix_millis requires 1 argument");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    // TIMESTAMP values carry micros; a millisecond grid truncates them.
+    const std::string text = raw_str(arguments[0]);
+    std::tm tm{};
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+    long fractional = 0;
+    const char* tz = nullptr;
+    if (sscanf(text.c_str(), "%d-%d-%d %d:%d:%d.%ld", &year, &month, &day,
+               &hour, &minute, &second, &fractional) >= 6) {
+      tm.tm_year = year - 1900;
+      tm.tm_mon = month - 1;
+      tm.tm_mday = day;
+      tm.tm_hour = hour;
+      tm.tm_min = minute;
+      tm.tm_sec = second;
+      tm.tm_isdst = 0;
+      const int64_t epoch_seconds = static_cast<int64_t>(timegm(&tm));
+      const int64_t millis =
+          epoch_seconds * 1000 + (fractional > 999 ? fractional / 1000 : fractional);
+      return Value(millis);
+    }
+    tz = strpbrk(text.c_str(), "T ");
+    if (tz == nullptr) {
+      throw std::runtime_error("unix_millis requires a TIMESTAMP");
+    }
+    throw std::runtime_error("unix_millis requires a TIMESTAMP");
+  }
   if (name == "__get_field_safe") {
     // Field access tolerating NULL bases / missing members (returns NULL);
     // used for dotted struct references inside DML predicates.

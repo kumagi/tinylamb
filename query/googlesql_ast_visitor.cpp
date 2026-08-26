@@ -2634,6 +2634,17 @@ Expression VisitExpression(
                                  " cannot be literal NULL");
       }
     }
+    // Bitwise operators have no BinaryOperation tag: desugar into function
+    // calls so both the interpreter and plan executor can evaluate them.
+    if (node.detail == "&" || node.detail == "|" || node.detail == "^" ||
+        node.detail == "<<" || node.detail == ">>") {
+      static const std::unordered_map<std::string, std::string> kBitFns = {
+          {"&", "__bit_and"}, {"|", "__bit_or"}, {"^", "__bit_xor"},
+          {"<<", "__shift_left"}, {">>", "__shift_right"}};
+      const std::string fn = kBitFns.at(std::string(node.detail));
+      return FunctionCallExp(
+          fn, {std::move(left), VisitExpression(*node.children[1])});
+    }
     Expression right = VisitExpression(*node.children[1]);
     return BinaryExpressionExp(std::move(left), BinaryOp(node.detail),
                                std::move(right));
@@ -2771,6 +2782,18 @@ Expression VisitExpression(
       fn += "_safe";
     }
     return FunctionCallExp(fn, {std::move(base), VisitExpression(*index_node)});
+  }
+
+  if (node.kind == "BitwiseShiftExpression") {
+    // `expr << n` / `expr >> n`: children are [expr, Location, n].
+    if (node.children.size() < 3) {
+      throw std::runtime_error("GoogleSQL AST: malformed shift expression");
+    }
+    const bool left_shift = node.detail == "<<";
+    return FunctionCallExp(
+        left_shift ? "__shift_left" : "__shift_right",
+        {VisitExpression(*node.children[0]),
+         VisitExpression(*node.children[2])});
   }
 
   if (node.kind == "DotStar") {
@@ -3063,6 +3086,14 @@ Expression VisitExpression(
       type_name = "STRING";
     }
     const std::string upper_type = UpperCopy(type_name);
+    // CAST(<boolean literal> AS STRING) stringifies as the SQL literal; the
+    // engine's INT64 boolean encoding would lose that distinction.
+    if ((upper_type == "STRING" || upper_type == "VARCHAR") &&
+        node.children[0]->kind == "BooleanLiteral") {
+      return ConstantValueExp(
+          Value(UpperCopy(node.children[0]->detail) == "TRUE" ? "true"
+                                                              : "false"));
+    }
     // Enum-typed casts: this engine represents enums as their member-name
     // strings. INT -> ENUM derives the member name "<ENUM>_<ordinal>" style
     // prefix from the type path; reading an integer back out unwraps to the
