@@ -848,7 +848,17 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   if (actual.type == ValueType::kInt64) {
     try {
       return actual.value.int_value == static_cast<int64_t>(std::stoll(want));
-    } catch (...) { return false; }
+    } catch (...) {
+      // Goldens may carry UINT64 magnitudes (2^63 .. 2^64-1) that engines
+      // storing every integer as INT64 keep as their two's-complement bit
+      // pattern; compare those on the unsigned bit representation.
+      try {
+        return static_cast<uint64_t>(actual.value.int_value) ==
+               std::stoull(want);
+      } catch (...) {
+        return false;
+      }
+    }
   }
   if (actual.type == ValueType::kDouble) {
     const std::string lower_want = ToLower(want);

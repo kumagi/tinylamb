@@ -192,6 +192,26 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
   }
   if (left.IsNull() || right.IsNull()) { return {};
 }
+  // Bit shifts operate on the two's-complement representation with logical
+  // (unsigned) semantics, matching GoogleSQL: shift amounts >= 64 yield 0 and
+  // negative amounts raise OUT_OF_RANGE.
+  if (op == BinaryOperation::kShiftLeft || op == BinaryOperation::kShiftRight) {
+    if (left.type != ValueType::kInt64 || right.type != ValueType::kInt64) {
+      throw std::runtime_error("bitwise shift requires integer operands");
+    }
+    const int64_t amount = right.value.int_value;
+    if (amount < 0) {
+      throw std::runtime_error("Bitwise shift by negative offset.");
+    }
+    if (amount >= 64) {
+      return Value(static_cast<int64_t>(0));
+    }
+    const uint64_t bits = static_cast<uint64_t>(left.value.int_value);
+    const uint64_t shifted = op == BinaryOperation::kShiftLeft
+                                 ? bits << amount
+                                 : bits >> amount;
+    return Value(static_cast<int64_t>(shifted));
+  }
   // Collation-aware normalization: when either operand carries a
   // case-insensitive collator, both sides fold to lowercase.  GoogleSQL
   // resolves an explicit COLLATE on one side for the whole comparison.

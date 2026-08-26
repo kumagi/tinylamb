@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -140,8 +141,19 @@ bool EncodeJoinKeyInto(const Row& row, const std::vector<slot_t>& cols,
   out->clear();
   for (const slot_t col : cols) {
     const Value& value = row[col];
-    if (value.IsNull()) {
+    // NULL never equals anything, and SQL equality also excludes NaN: rows
+    // with such join keys are excluded from the hash index entirely.
+    if (value.IsNull() ||
+        (value.type == ValueType::kDouble &&
+         std::isnan(value.value.double_value))) {
       return false;
+    }
+    // -0 and +0 are equal in SQL: fold both zeros onto one key.
+    if (value.type == ValueType::kDouble &&
+        value.value.double_value == 0.0) {
+      Value zero(0.0);
+      AppendMemComparableValue(zero, out);
+      continue;
     }
     AppendMemComparableValue(value, out);
   }

@@ -151,8 +151,34 @@ class ExpressionDepthGuard {
 
 // Dump-produced literals must be digits-only and in range: std::stoll would
 // accept signs and std::stoull would wrap "-1" into a huge positive value.
+// Hex literals (0x / 0X) are accepted up to 16 digits; values above INT64_MAX
+// are GoogleSQL UINT64 literals kept as their two's-complement bit pattern.
 int64_t ParseIntLiteral(const GoogleSqlAstNode& node) {
   const std::string& text = node.detail;
+  if (text.size() > 2 && text[0] == '0' &&
+      (text[1] == 'x' || text[1] == 'X')) {
+    const std::string digits = text.substr(2);
+    const bool hex_only =
+        !digits.empty() &&
+        digits.size() <= 16 &&
+        std::ranges::all_of(digits, [](char c) {
+          return ('0' <= c && c <= '9') || ('a' <= c && c <= 'f') ||
+                 ('A' <= c && c <= 'F');
+        });
+    if (!hex_only) {
+      throw std::runtime_error("GoogleSQL AST: malformed integer literal " +
+                               text);
+    }
+    uint64_t bits = 0;
+    const auto [ptr, ec] = std::from_chars(digits.data(),
+                                           digits.data() + digits.size(), bits,
+                                           16);
+    if (ec != std::errc() || ptr != digits.data() + digits.size()) {
+      throw std::runtime_error("GoogleSQL AST: integer literal out of range " +
+                               text);
+    }
+    return static_cast<int64_t>(bits);
+  }
   const bool digits_only =
       !text.empty() &&
       std::ranges::all_of(text, [](char c) { return '0' <= c && c <= '9'; });
@@ -785,6 +811,12 @@ BinaryOperation BinaryOp(std::string_view detail) {
   }
   if (detail == "%") {
     return BinaryOperation::kModulo;
+  }
+  if (detail == "<<") {
+    return BinaryOperation::kShiftLeft;
+  }
+  if (detail == ">>") {
+    return BinaryOperation::kShiftRight;
   }
   if (detail == "=") {
     return BinaryOperation::kEquals;
@@ -2178,10 +2210,13 @@ bool SplitJsonObjectFields(
 
 // An array of struct literals declares field names once (first element or
 // STRUCT<...> type); positional siblings like `(2.0, 2.0)` encode generic
-// "f1..fN" keys.  Rename those to the leading element's field names so bare
-// field references resolve uniformly across every row.
-void AlignAnonymousStructFieldNames(std::vector<Expression>* elements) {
-  if (elements->size() < 2) {
+// "f1..fN" keys.  Rename those to the leading element's field names (or to
+// explicitly declared names when provided) so bare field references resolve
+// uniformly across every row.
+void AlignAnonymousStructFieldNames(
+    std::vector<Expression>* elements,
+    const std::vector<std::string>* declared = nullptr) {
+  if (elements->size() < 2 && declared == nullptr) {
     return;
   }
   auto encoded_struct = [](const Expression& e) -> std::string {
@@ -2194,22 +2229,32 @@ void AlignAnonymousStructFieldNames(std::vector<Expression>* elements) {
     }
     return std::string(value.value.varchar_value);
   };
-  const std::string head = encoded_struct((*elements)[0]);
-  if (head.empty()) {
-    return;
-  }
   std::vector<std::pair<std::string, std::string>> head_fields;
-  if (!SplitJsonObjectFields(head, &head_fields)) {
-    return;
-  }
-  // The head must carry explicit names: anonymous fN keys have nothing to
-  // propagate.
-  for (size_t i = 0; i < head_fields.size(); ++i) {
-    if (head_fields[i].first == "f" + std::to_string(i + 1)) {
+  if (declared != nullptr) {
+    for (const std::string& name : *declared) {
+      head_fields.emplace_back(name, "");
+    }
+  } else if (!elements->empty()) {
+    const std::string head = encoded_struct((*elements)[0]);
+    if (head.empty()) {
       return;
     }
+    if (!SplitJsonObjectFields(head, &head_fields)) {
+      return;
+    }
+    // The head must carry explicit names: anonymous fN keys have nothing to
+    // propagate.
+    for (size_t i = 0; i < head_fields.size(); ++i) {
+      if (head_fields[i].first == "f" + std::to_string(i + 1)) {
+        return;
+      }
+    }
+  } else {
+    return;
   }
-  for (size_t idx = 1; idx < elements->size(); ++idx) {
+  const size_t first_candidate =
+      declared != nullptr ? 0 : 1;
+  for (size_t idx = first_candidate; idx < elements->size(); ++idx) {
     const std::string text = encoded_struct((*elements)[idx]);
     if (text.empty()) {
       continue;
@@ -2334,6 +2379,10 @@ Expression VisitExpression(
   }
   if (node.kind == "ArrayConstructor") {
     std::string element_type;
+    // Field names declared on ARRAY<STRUCT<name T, ...>>: parenthesized
+    // struct elements carry no StructType of their own, so their eager JSON
+    // encoding uses generic fN keys until renamed here.
+    std::vector<std::string> struct_field_names;
     std::vector<Expression> elements;
     for (const auto& child : node.children) {
       if (IsAstTrivia(child->kind)) {
@@ -2341,6 +2390,11 @@ Expression VisitExpression(
       }
       if (IsArrayTypeNode(child->kind)) {
         for (const auto& nested : child->children) {
+          for (const GoogleSqlAstNode* field : nested->Children("StructField")) {
+            if (const GoogleSqlAstNode* id = field->Child("Identifier")) {
+              struct_field_names.push_back(Identifier(*id));
+            }
+          }
           const std::string parsed = SqlTypeFromAst(*nested);
           if (!parsed.empty()) {
             element_type = parsed;
@@ -2392,9 +2446,28 @@ Expression VisitExpression(
         array_query->SetArrayElementSqlType(element_type);
         return Expression(array_query);
       }    }
-    AlignAnonymousStructFieldNames(&elements);
+    AlignAnonymousStructFieldNames(
+        &elements,
+        struct_field_names.size() >= 2 ? &struct_field_names : nullptr);
     return ArrayExpressionExp(std::move(elements), std::move(element_type));
   }
+  // `a << b` / `a >> b`: the dump interleaves a Location node between the
+  // operands.
+  if (node.kind == "BitwiseShiftExpression") {
+    std::vector<const GoogleSqlAstNode*> operands;
+    for (const auto& child : node.children) {
+      if (child->kind != "Location") {
+        operands.push_back(child.get());
+      }
+    }
+    if (operands.size() != 2) {
+      throw std::runtime_error("GoogleSQL AST: bit shift arity");
+    }
+    return BinaryExpressionExp(VisitExpression(*operands[0]),
+                               BinaryOp(node.detail),
+                               VisitExpression(*operands[1]));
+  }
+
   if (node.kind == "BinaryExpression") {
     if (node.children.size() != 2) {
       throw std::runtime_error("GoogleSQL AST: binary expression arity");
@@ -3507,19 +3580,25 @@ void AppendSources(const GoogleSqlAstNode& node,
   JoinType type = JoinType::kInner;
   if (node.detail == "COMMA") {
     type = JoinType::kCross;
-  }
-  if (node.detail == "LEFT") {
+  } else if (node.detail == "LEFT") {
     type = JoinType::kLeft;
+  } else if (node.detail == "RIGHT") {
+    type = JoinType::kRight;
+  } else if (node.detail == "FULL") {
+    type = JoinType::kFull;
   }
   Expression join_expression;
+  std::vector<std::string> using_columns;
   if (on != nullptr && !on->children.empty()) {
     join_expression = VisitExpression(*on->children[0]);
   } else if (using_clause != nullptr) {
     // USING(col, ...) carries no OnClause child; it is an equality join over
     // the shared columns. Dropping it silently would turn the statement into
-    // a condition-less join.
+    // a condition-less join.  The names also ride on the right-hand source so
+    // execution can coalesce bare references and star expansion.
     for (const GoogleSqlAstNode* column :
          using_clause->Children("Identifier")) {
+      using_columns.push_back(Identifier(*column));
       Expression equality = BinaryExpressionExp(
           ColumnValueExp(Identifier(*column)), BinaryOperation::kEquals,
           ColumnValueExp(Identifier(*column)));
@@ -3533,7 +3612,11 @@ void AppendSources(const GoogleSqlAstNode& node,
       throw std::runtime_error("GoogleSQL AST: unsupported join USING clause");
     }
   }
+  const size_t right_source_index = sources->size();
   AppendSources(*operands[1], type, std::move(join_expression), sources);
+  if (!using_columns.empty() && right_source_index < sources->size()) {
+    (*sources)[right_source_index].using_columns = std::move(using_columns);
+  }
 }
 
 std::shared_ptr<SelectStatement> VisitQuery(
@@ -3823,6 +3906,9 @@ std::shared_ptr<SelectStatement> VisitQuery(
   // executor: FROM-subqueries and outer joins.
   for (const SelectSource& source : statement->Sources()) {
     if (source.query || source.join_type == JoinType::kLeft ||
+        source.join_type == JoinType::kRight ||
+        source.join_type == JoinType::kFull ||
+        !source.using_columns.empty() ||
         NeedsRelationalEvaluation(source.join_condition)) {
       statement->MarkComplex();
     }

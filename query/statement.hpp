@@ -32,7 +32,7 @@ namespace tinylamb {
 
 class SelectStatement;
 
-enum class JoinType { kCross, kInner, kLeft };
+enum class JoinType { kCross, kInner, kLeft, kRight, kFull };
 
 struct SelectSource {
   SelectSource() = default;
@@ -56,6 +56,11 @@ struct SelectSource {
   Expression join_condition;
   Expression unnest;
   std::string offset_alias;
+  // USING (col, ...) names declared on the join whose right operand is this
+  // source; empty for every other source.  The merged columns stay
+  // physically duplicated in the joined schema, but bare references and
+  // star expansion coalesce them (see Lookup / relational projection).
+  std::vector<std::string> using_columns;
 };
 
 

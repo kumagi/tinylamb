@@ -155,6 +155,33 @@ Expression InlineHavingAliases(const SelectStatement& statement,
               }
               return out;
             }());
+      case TypeTag::kQueryExp: {
+        // Alias references may sit inside HAVING subqueries
+        // (EXISTS (SELECT * FROM UNNEST(agg_alias) ...)).  Rewrite them on a
+        // shallow copy so the subquery's lateral unnest arguments bind to the
+        // outer aggregate expressions.
+        const auto& value = expression->AsQueryExpression();
+        if (!value.Query() || value.Test()) { return expression; }
+        auto copied = std::make_shared<SelectStatement>(*value.Query());
+        bool changed = false;
+        std::vector<SelectSource> sources = copied->Sources();
+        for (SelectSource& source : sources) {
+          if (source.unnest) {
+            source.unnest = walk(source.unnest);
+            changed = true;
+          }
+        }
+        if (!changed) { return expression; }
+        copied->SetSources(std::move(sources));
+        auto rewritten = std::make_shared<QueryExpression>(
+            std::move(copied), nullptr, value.Exists(), value.Negated(),
+            value.Op(), value.Mode());
+        rewritten->SetArrayResult(value.ArrayResult());
+        if (!value.ArrayElementSqlType().empty()) {
+          rewritten->SetArrayElementSqlType(value.ArrayElementSqlType());
+        }
+        return Expression(rewritten);
+      }
       default:
         // Aggregates, subqueries and casts keep their own scope.
         return expression;
@@ -365,7 +392,16 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     }
     return requested.schema.empty();
   };
-  std::vector<std::vector<size_t>> star_columns(statement.SelectList().size());
+  // USING merge: unqualified `*` emits one coalesced entry per declared
+  // using column (first), then the remaining columns in schema order;
+  // `relation.*` keeps every physical column of the named side.  Each star
+  // entry stores its coalesce group (single index for plain columns).
+  std::vector<std::vector<std::vector<size_t>>> star_groups(
+      statement.SelectList().size());
+  std::vector<std::string> lowered_using;
+  if (input.using_columns != nullptr) {
+    lowered_using = *input.using_columns;
+  }
   for (size_t i = 0; i < statement.SelectList().size(); ++i) {
     const NamedExpression& projection = statement.SelectList()[i];
     if (projection.expression->Type() == TypeTag::kColumnValue &&
@@ -373,10 +409,52 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       const ColumnName& requested =
           projection.expression->AsColumnValue().GetColumnName();
       const bool qualified = !requested.schema.empty();
+      if (!qualified && !lowered_using.empty()) {
+        // Merged using columns first, in declaration order.
+        std::vector<size_t> consumed;
+        for (const std::string& using_name : lowered_using) {
+          std::vector<size_t> group;
+          for (size_t column = 0; column < base_width; ++column) {
+            const ColumnName& candidate =
+                input.schema.GetColumn(column).Name();
+            if (candidate.name.size() == using_name.size() &&
+                std::equal(using_name.begin(), using_name.end(),
+                           candidate.name.begin(),
+                           [](char a, char b) {
+                             return std::tolower(static_cast<unsigned char>(a)) ==
+                                    std::tolower(static_cast<unsigned char>(b));
+                           })) {
+              group.push_back(column);
+            }
+          }
+          if (!group.empty()) {
+            consumed.insert(consumed.end(), group.begin(), group.end());
+            const size_t merged_index = group.front();
+            star_groups[i].push_back(std::move(group));
+            output_columns.emplace_back(
+                input.schema.GetColumn(merged_index).Name().name,
+                input.schema.GetColumn(merged_index).Type());
+          }
+        }
+        // Remaining non-using columns keep schema order.
+        for (size_t column = 0; column < base_width; ++column) {
+          if (std::find(consumed.begin(), consumed.end(), column) !=
+              consumed.end()) {
+            continue;
+          }
+          const Column& candidate = input.schema.GetColumn(column);
+          if (matches_star(requested, candidate.Name(), qualified)) {
+            star_groups[i].push_back({column});
+            output_columns.emplace_back(candidate.Name().name,
+                                        candidate.Type());
+          }
+        }
+        continue;
+      }
       for (size_t column = 0; column < base_width; ++column) {
         const Column& candidate = input.schema.GetColumn(column);
         if (matches_star(requested, candidate.Name(), qualified)) {
-          star_columns[i].push_back(column);
+          star_groups[i].push_back({column});
           output_columns.emplace_back(candidate.Name().name, candidate.Type());
         }
       }
@@ -405,6 +483,14 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
                   const AggregateResultMap* aggregates) {
     Scope scope{
         .row = &representative, .schema = &input.schema, .outer = outer};
+    if (aggregates != nullptr) {
+      // Correlated subqueries in HAVING / SELECT resolve aggregate aliases
+      // against this group's values through the scope chain.
+      scope.aggregates = aggregates;
+    }
+    if (!lowered_using.empty()) {
+      scope.using_columns = &lowered_using;
+    }
     if (having_expr &&
         !Truthy(Evaluate(having_expr, scope, aggregates, context, ctes))) {
       return;
@@ -414,8 +500,16 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       const NamedExpression& projection = statement.SelectList()[item];
       if (projection.expression->Type() == TypeTag::kColumnValue &&
           projection.expression->AsColumnValue().GetColumnName().name == "*") {
-        for (const size_t column : star_columns[item]) {
-          values.push_back(representative.values_[column]);
+        for (const std::vector<size_t>& group : star_groups[item]) {
+          // USING-merged entries coalesce their physical duplicates.
+          Value merged;
+          for (const size_t column : group) {
+            if (!representative.values_[column].IsNull()) {
+              merged = representative.values_[column];
+              break;
+            }
+          }
+          values.push_back(std::move(merged));
         }
       } else {
         values.push_back(
@@ -741,7 +835,16 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     std::vector<slot_t> projection = RequiredColumns(stmt, qualified_table_schema);
     if (const std::vector<slot_t>* shared =
             ReusableProjection(context, source.table)) {
-      projection = *shared;
+      // The shared layout was derived from the raw table schema; never let
+      // it drop columns this statement's own (possibly alias-qualified)
+      // references need.
+      for (const slot_t slot : *shared) {
+        if (std::find(projection.begin(), projection.end(), slot) ==
+            projection.end()) {
+          projection.push_back(slot);
+        }
+      }
+      std::sort(projection.begin(), projection.end());
     }
     Schema scan_schema = projection.empty()
                              ? Schema("", std::vector<Column>{})
@@ -1021,6 +1124,9 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       Scope scope{.row = &group.representative,
                   .schema = &input.schema,
                   .outer = outer};
+      // Correlated subqueries in HAVING / SELECT resolve aggregate aliases
+      // against this group's values through the scope chain.
+      scope.aggregates = &aggregate_results;
       if (having_expr &&
           !Truthy(Evaluate(having_expr, scope, &aggregate_results, context,
                            ctes))) {

@@ -24,6 +24,16 @@ struct Scope {
   const Row* row{nullptr};
   const Schema* schema{nullptr};
   const Scope* outer{nullptr};
+  // USING join merged column names (lowercased): a bare reference matching
+  // several schema columns coalesces them when its name is listed here.
+  const std::vector<std::string>* using_columns{nullptr};
+  // Aggregate values of the enclosing grouped query.  Subqueries nested in
+  // HAVING / SELECT-over-groups resolve correlated aggregate references
+  // through this chain (e.g. FROM UNNEST(agg_alias) after alias inlining).
+  // Same type as relational_detail::AggregateResultMap, spelled inline to
+  // keep this header free of the expression_eval.hpp cycle.
+  const std::unordered_map<const class AggregateExpression*, Value>*
+      aggregates{nullptr};
 };
 
 using CteMap = std::unordered_map<std::string, RelationPtr>;

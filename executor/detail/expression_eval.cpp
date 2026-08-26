@@ -627,6 +627,36 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
     if (current->row == nullptr || current->schema == nullptr) {
       continue;
     }
+    // USING joins keep one merged column per declared name even though the
+    // physical schema duplicates it: bare references coalesce every match
+    // instead of raising ambiguity.  Qualified references still bind to a
+    // single side.
+    if (current->using_columns != nullptr && name.schema.empty() &&
+        name.name.find('.') == std::string::npos) {
+      std::vector<size_t> matches;
+      for (size_t i = 0; i < current->schema->ColumnCount(); ++i) {
+        if (IdentifierEquals(current->schema->GetColumn(i).Name().name,
+                             name.name)) {
+          matches.push_back(i);
+        }
+      }
+      const bool merged =
+          matches.size() > 1 &&
+          std::any_of(current->using_columns->begin(),
+                      current->using_columns->end(),
+                      [&](const std::string& using_name) {
+                        return IdentifierEquals(using_name, name.name);
+                      });
+      if (merged) {
+        for (const size_t index : matches) {
+          const Value& candidate = (*current->row)[index];
+          if (!candidate.IsNull()) {
+            return candidate;
+          }
+        }
+        return {};
+      }
+    }
     const int offset = FindColumn(*current->schema, name);
     if (offset >= 0) {
       return (*current->row)[static_cast<size_t>(offset)];
@@ -7389,7 +7419,20 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         if (step.IsNull()) {
           return {};
         }
-        step_days = step.value.int_value;
+        if (step.type == ValueType::kInt64) {
+          step_days = step.value.int_value;
+        } else {
+          // Column-valued INTERVAL steps arrive pre-evaluated as the
+          // encoded text of a make_interval call (INTERVAL col DAY).
+          const std::string text = raw_str(step);
+          const IntervalValue parsed =
+              text.empty() ? IntervalValue{} : IntervalValue::Parse(text);
+          if (parsed.months != 0 || parsed.nanos != 0) {
+            throw std::runtime_error(
+                "unsupported GENERATE_DATE_ARRAY step unit");
+          }
+          step_days = parsed.days;
+        }
       }
     }
     if (step_days == 0) {
@@ -7843,6 +7886,27 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kInt64) {
         return static_cast<double>(v.value.int_value);
       }
+      // ARRAY<STRUCT<key, value>> elements stay JSON-encoded: the distance
+      // runs over the numeric payload (last member); the leading member is
+      // only the pair key.
+      if (v.type == ValueType::kVarChar) {
+        const std::string text(v.value.varchar_value);
+        if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
+          const auto members =
+              SplitJsonObjectMembers(text.substr(1, text.size() - 2));
+          if (!members.empty()) {
+            Value parsed;
+            if (JsonTextToValue(members.back().second, &parsed)) {
+              if (parsed.type == ValueType::kDouble) {
+                return parsed.value.double_value;
+              }
+              if (parsed.type == ValueType::kInt64) {
+                return static_cast<double>(parsed.value.int_value);
+              }
+            }
+          }
+        }
+      }
       throw std::runtime_error(
           "EUCLIDEAN_DISTANCE requires numeric array elements");
     };
@@ -8061,11 +8125,23 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       return EvaluateUnary(value.Op(), Evaluate(value.Child(), scope,
                                                 aggregates, context, ctes));
     }
-    case TypeTag::kAggregateExp:
-      if (aggregates == nullptr) {
+    case TypeTag::kAggregateExp: {
+      // Subqueries nested inside grouped queries have no explicit aggregate
+      // map of their own; they inherit the enclosing group's values through
+      // the scope chain so correlated references (UNNEST(agg_alias), ...)
+      // resolve.
+      const AggregateResultMap* resolved = aggregates;
+      if (resolved == nullptr) {
+        for (const Scope* s = &scope; s != nullptr && resolved == nullptr;
+             s = s->outer) {
+          resolved = s->aggregates;
+        }
+      }
+      if (resolved == nullptr) {
         throw std::runtime_error("aggregate outside grouping");
       }
-      return Aggregate(expression->AsAggregateExpression(), *aggregates);
+      return Aggregate(expression->AsAggregateExpression(), *resolved);
+    }
     case TypeTag::kCaseExp: {
       const auto& value = expression->AsCaseExpression();
       for (const auto& [condition, result] : value.when_clauses_) {

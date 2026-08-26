@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <vector>
 #include <utility>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -165,8 +166,14 @@ bool SingleIntegerJoinKey(const Schema& schema,
 }
 
 bool HasNullKey(const Row& row, const std::vector<slot_t>& columns) {
-  return std::ranges::any_of(columns,
-                             [&](slot_t column) { return row[column].IsNull(); });
+  // NULL never equals anything, and SQL equality also excludes NaN: rows
+  // with such join keys take no part in hash matching.
+  return std::ranges::any_of(columns, [&](slot_t column) {
+    const Value& value = row[column];
+    return value.IsNull() ||
+           (value.type == ValueType::kDouble &&
+            std::isnan(value.value.double_value));
+  });
 }
 
 int64_t IntegerJoinKey(const Row& row, slot_t column) {
@@ -174,7 +181,21 @@ int64_t IntegerJoinKey(const Row& row, slot_t column) {
 }
 
 std::string EncodeJoinKey(const Row& row, const std::vector<slot_t>& columns) {
-  return row.Extract(columns).EncodeMemcomparableFormat();
+  // Join keys canonicalize doubles the way SQL equality demands: -0 folds to
+  // +0 so both zeros share a bucket, while NaN bit patterns stay distinct
+  // (NaN never joins with anything).
+  std::string key;
+  key.reserve(columns.size() * 9);
+  for (const slot_t column : columns) {
+    const Value& value = row[column];
+    if (value.type == ValueType::kDouble &&
+        value.value.double_value == 0.0) {
+      key += Value(0.0).EncodeMemcomparableFormat();
+      continue;
+    }
+    key += value.EncodeMemcomparableFormat();
+  }
+  return key;
 }
 
 size_t EstimateJoinRows(const Relation& left, const Relation& right,
@@ -453,6 +474,42 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
   result.join_comparisons = left.join_comparisons + right.join_comparisons;
   result.peak_intermediate_rows =
       std::max(left.peak_intermediate_rows, right.peak_intermediate_rows);
+  // USING joins expose one merged column per declared name: bare references
+  // and star expansion coalesce the physical duplicates (see Lookup and the
+  // relational projection).  Qualified references keep binding per side.
+  if (!source.using_columns.empty()) {
+    std::vector<std::string> lowered;
+    lowered.reserve(source.using_columns.size());
+    for (const std::string& name : source.using_columns) {
+      std::string lower(name);
+      for (char& c : lower) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      lowered.push_back(std::move(lower));
+    }
+    result.using_columns =
+        std::make_shared<const std::vector<std::string>>(std::move(lowered));
+  }
+  const bool want_left_nulls = source.join_type == JoinType::kLeft ||
+                               source.join_type == JoinType::kFull;
+  const bool want_right_nulls = source.join_type == JoinType::kRight ||
+                                source.join_type == JoinType::kFull;
+  // Unmatched right-side emission needs index-addressable rows; spillable
+  // inputs are materialized up front (the relational join is the fallback
+  // path, so this keeps semantics without touching the hybrid operator).
+  if (want_right_nulls && right.HasSpill()) {
+    right = MaterializeRelation(right);
+  }
+  right.FinishSpill();
+  const Row* right_base = right.rows.empty() ? nullptr : right.rows.data();
+  std::vector<char> right_matched(want_right_nulls ? right.rows.size() : 0, 0);
+  auto mark_right_match = [&](const Row& right_row) {
+    if (!want_right_nulls || right_base == nullptr) { return;
+}
+    const size_t index = static_cast<size_t>(&right_row - right_base);
+    if (index < right_matched.size()) { right_matched[index] = 1;
+}
+  };
   const std::vector<Expression> predicates =
       SplitConjuncts(source.join_condition);
   const std::vector<EqualityKey> equality_keys =
@@ -470,7 +527,7 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
         });
   };
   auto emit_unmatched = [&](const Row& left_row) {
-    if (source.join_type != JoinType::kLeft) { return;
+    if (!want_left_nulls) { return;
 }
     std::vector<Value> nulls(right.schema.ColumnCount());
     result.AddRow(left_row + Row(std::move(nulls)));
@@ -486,6 +543,7 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
         ++result.join_comparisons;
         Row combined = left_row + right_row;
         if (matches(combined)) {
+          mark_right_match(right_row);
           result.AddRow(std::move(combined));
           matched = true;
         }
@@ -501,7 +559,8 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
       left_columns.push_back(static_cast<slot_t>(key.left));
       right_columns.push_back(static_cast<slot_t>(key.right));
     }
-    if (ShouldHybridJoin(left, right)) {
+    // The hybrid operator only implements plain inner/left semantics.
+    if (ShouldHybridJoin(left, right) && !want_right_nulls) {
       ++result.hybrid_hash_joins;
       Relation joined =
           HybridHashJoin(std::move(left), std::move(right), left_columns,
@@ -513,6 +572,7 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
       joined.in_memory_hash_joins = result.in_memory_hash_joins;
       joined.nested_loop_joins = result.nested_loop_joins;
       joined.join_comparisons = result.join_comparisons;
+      joined.using_columns = result.using_columns;
       if (context.execution_runtime() != nullptr) { context.execution_runtime()->join_ms += ElapsedMs(join_begin);
 }
       return joined;
@@ -538,6 +598,7 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
             ++result.join_comparisons;
             Row combined = left_row + *iter->second;
             if (matches(combined)) {
+              mark_right_match(*iter->second);
               result.AddRow(std::move(combined));
               matched = true;
             }
@@ -563,6 +624,7 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
             ++result.join_comparisons;
             Row combined = left_row + *iter->second;
             if (matches(combined)) {
+              mark_right_match(*iter->second);
               result.AddRow(std::move(combined));
               matched = true;
             }
@@ -571,6 +633,16 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
         if (!matched) { emit_unmatched(left_row);
 }
       }
+    }
+  }
+  // RIGHT / FULL OUTER: every build-side row that never matched emits once,
+  // null-extended on the left.
+  if (want_right_nulls) {
+    for (size_t index = 0; index < right.rows.size(); ++index) {
+      if (right_matched[index] != 0) { continue;
+}
+      std::vector<Value> nulls(left.schema.ColumnCount());
+      result.AddRow(Row(std::move(nulls)) + right.rows[index]);
     }
   }
   result.FinishSpill();
@@ -747,7 +819,87 @@ Relation LateralExpandRelation(TransactionContext& context,
   };
   const Expression condition =
       source.join_condition ? source.join_condition : nullptr;
-  const bool left_outer = source.join_type == JoinType::kLeft;
+  // USING(name) equalities bind positionally: both operands share one bare
+  // name, so combined-scope evaluation would be ambiguous (and after
+  // coalescing, trivially true).  Each such conjunct resolves to a
+  // prefix-side and an element-side column up front and compares them
+  // directly; remaining conjuncts keep combined-scope evaluation.
+  struct UsingEquality {
+    size_t prefix_column;
+    size_t element_column;
+  };
+  std::vector<UsingEquality> using_equalities;
+  std::vector<Expression> residual_condition =
+      condition ? SplitConjuncts(condition) : std::vector<Expression>{};
+  if (!source.using_columns.empty() && condition) {
+    auto declared = [&](const ColumnName& name) {
+      if (!name.schema.empty()) { return false;
+}
+      return std::any_of(source.using_columns.begin(),
+                         source.using_columns.end(),
+                         [&](const std::string& candidate) {
+                           return candidate.size() == name.name.size() &&
+                                  std::equal(candidate.begin(), candidate.end(),
+                                             name.name.begin(),
+                                             [](char lhs, char rhs) {
+                                               return std::tolower(
+                                                          static_cast<unsigned char>(lhs)) ==
+                                                      std::tolower(static_cast<
+                                                                   unsigned char>(rhs));
+                                             });
+                         });
+    };
+    // The element relation's column names are stable across expansions:
+    // [alias] plus the offset alias when declared.
+    std::vector<Column> probe{Column(
+        source.alias.empty() ? "unnest" : source.alias, ValueType::kNull)};
+    if (!source.offset_alias.empty()) {
+      probe.emplace_back(source.offset_alias, ValueType::kInt64);
+    }
+    const Schema element_names("", std::move(probe));
+    for (size_t conjunct_index = 0; conjunct_index < residual_condition.size();) {
+      const Expression& conjunct = residual_condition[conjunct_index];
+      bool handled = false;
+      if (IsColumnEqualityPredicate(conjunct)) {
+        const BinaryExpression& binary = conjunct->AsBinaryExpression();
+        const ColumnName& ln =
+            binary.Left()->AsColumnValue().GetColumnName();
+        const ColumnName& rn =
+            binary.Right()->AsColumnValue().GetColumnName();
+        if (declared(ln) && declared(rn)) {
+          for (const auto [outer_name, inner_name] :
+               std::vector<std::pair<ColumnName, ColumnName>>{{ln, rn},
+                                                              {rn, ln}}) {
+            const auto prefix_offset =
+                LocalColumnOffset(prefix.schema, outer_name);
+            const auto element_offset =
+                LocalColumnOffset(element_names, inner_name);
+            if (prefix_offset && element_offset) {
+              using_equalities.push_back(
+                  {*prefix_offset, *element_offset});
+              handled = true;
+              break;
+            }
+          }
+        }
+      }
+      if (handled) {
+        residual_condition.erase(residual_condition.begin() +
+                                 static_cast<ptrdiff_t>(conjunct_index));
+      } else {
+        ++conjunct_index;
+      }
+    }
+  }
+  const bool want_left_nulls = source.join_type == JoinType::kLeft ||
+                               source.join_type == JoinType::kFull;
+  const bool want_right_nulls = source.join_type == JoinType::kRight ||
+                                source.join_type == JoinType::kFull;
+  if (!source.using_columns.empty()) {
+    output.using_columns = std::make_shared<const std::vector<std::string>>(
+        source.using_columns);
+  }
+  const bool left_outer = want_left_nulls;
   bool any_prefix_row = false;
   bool schema_initialized = false;
   prefix.FinishSpill();
@@ -767,17 +919,47 @@ Relation LateralExpandRelation(TransactionContext& context,
     // the initialized arity so every emitted row matches output.schema
     // exactly; Lookup and projection index rows by schema offsets.
     elements.FinishSpill();
+    const size_t prefix_width = row.values_.size();
+    std::vector<char> element_matched(
+        want_right_nulls ? elements.TotalRows() : 0, 0);
+    size_t element_index = 0;
     bool matched = false;
     elements.ForEachRow([&](const Row& element_row) {
+      const size_t this_element = element_index++;
       Row combined = row + element_row;
       combined.values_.resize(output.schema.ColumnCount());
       if (condition) {
         Scope combined_scope{
             .row = &combined, .schema = &output.schema, .outer = outer};
-        if (!Truthy(
-                Evaluate(condition, combined_scope, nullptr, context, ctes))) {
-          return;
+        if (!source.using_columns.empty()) {
+          combined_scope.using_columns = &source.using_columns;
         }
+        bool all_match = true;
+        for (const UsingEquality& key : using_equalities) {
+          const Value& left_value =
+              combined.values_[key.prefix_column];
+          const Value& right_value =
+              combined.values_[prefix_width + key.element_column];
+          if (!Truthy(EvaluateBinary(BinaryOperation::kEquals, left_value,
+                                     right_value))) {
+            all_match = false;
+            break;
+          }
+        }
+        if (all_match) {
+          for (const Expression& conjunct : residual_condition) {
+            if (!Truthy(Evaluate(conjunct, combined_scope, nullptr, context,
+                                 ctes))) {
+              all_match = false;
+              break;
+            }
+          }
+        }
+        if (!all_match) { return;
+}
+      }
+      if (want_right_nulls && this_element < element_matched.size()) {
+        element_matched[this_element] = 1;
       }
       matched = true;
       output.AddRow(std::move(combined));
@@ -786,6 +968,18 @@ Relation LateralExpandRelation(TransactionContext& context,
       std::vector<Value> nulls(
           output.schema.ColumnCount() - row.values_.size(), Value());
       output.AddRow(row + Row(std::move(nulls)));
+    }
+    // RIGHT / FULL OUTER: within this prefix row's expansion, element rows
+    // that matched nothing emit once, null-extended on the prefix side.
+    if (want_right_nulls && !element_matched.empty()) {
+      size_t replay_index = 0;
+      elements.ForEachRow([&](const Row& element_row) {
+        const size_t index = replay_index++;
+        if (index < element_matched.size() && element_matched[index] == 0) {
+          std::vector<Value> nulls(prefix.schema.ColumnCount(), Value());
+          output.AddRow(Row(std::move(nulls)) + element_row);
+        }
+      });
     }
   });
   if (!any_prefix_row || !schema_initialized) {
@@ -900,7 +1094,18 @@ Relation BuildInput(TransactionContext& context,
     projections[i] = RequiredColumns(statement, relations[i].schema);
     if (const std::vector<slot_t>* shared =
             ReusableProjection(context, source.table)) {
-      projections[i] = *shared;
+      // The shared layout was derived from the raw table schema, so
+      // alias-qualified references (T1.col) resolved against this source's
+      // qualified schema may be missing from it; projecting fewer columns
+      // than this source needs breaks evaluation downstream.
+      std::vector<slot_t> merged(projections[i]);
+      for (const slot_t slot : *shared) {
+        if (std::find(merged.begin(), merged.end(), slot) == merged.end()) {
+          merged.push_back(slot);
+        }
+      }
+      std::sort(merged.begin(), merged.end());
+      projections[i] = std::move(merged);
     }
   }
 
@@ -927,14 +1132,18 @@ Relation BuildInput(TransactionContext& context,
     }
   }
 
-  // LEFT JOIN predicates have null-extension semantics, so retain their
-  // syntactic order. The optimizer below is valid for inner/cross joins.
-  const bool has_left_join =
+  // OUTER JOIN predicates and USING merges have order-dependent semantics,
+  // so retain their syntactic order. The optimizer below is valid for
+  // inner/cross joins.
+  const bool has_ordered_join =
       std::any_of(statement.Sources().begin() + 1, statement.Sources().end(),
                   [](const SelectSource& source) {
-                    return source.join_type == JoinType::kLeft;
+                    return source.join_type == JoinType::kLeft ||
+                           source.join_type == JoinType::kRight ||
+                           source.join_type == JoinType::kFull ||
+                           !source.using_columns.empty();
                   });
-  if (has_left_join) {
+  if (has_ordered_join) {
     for (size_t i = 0; i < relations.size(); ++i) {
       if (base_sources[i]) {
         relations[i] = LoadSource(context, statement.Sources()[i], outer,
