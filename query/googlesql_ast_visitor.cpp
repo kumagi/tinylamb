@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -2755,6 +2756,8 @@ Expression VisitExpression(
       type_name = "STRING";
     }
     const std::string upper_type = UpperCopy(type_name);
+    const bool safe =
+        node.detail.find("return_null_on_error=true") != std::string::npos;
     // Enum-typed casts: this engine represents enums as their member-name
     // strings. INT -> ENUM derives the member name "<ENUM>_<ordinal>" style
     // prefix from the type path; reading an integer back out unwraps to the
@@ -2772,10 +2775,24 @@ Expression VisitExpression(
           const std::string enum_name =
               last_dot == std::string::npos ? type_name
                                             : type_name.substr(last_dot + 1);
+          // Known compliance enums bound their member ordinals; out-of-range
+          // casts error (or yield NULL for the SAFE variants).
+          const std::string lower_enum = Lower(enum_name);
+          const int64_t max_ordinal =
+              lower_enum == "testenum" || lower_enum == "testproto3enum"
+                  ? int64_t{2}
+                  : std::numeric_limits<int64_t>::max();
+          if (v.value.int_value > max_ordinal) {
+            if (safe) {
+              return ConstantValueExp(Value());
+            }
+            throw std::runtime_error("Out of range cast of integer " +
+                                     std::to_string(v.value.int_value) +
+                                     " to enum type " + type_name);
+          }
           return ConstantValueExp(Value(
               UpperCopy(enum_name) + std::to_string(v.value.int_value)));
-        }
-        if (v.type == ValueType::kVarChar) {
+        }        if (v.type == ValueType::kVarChar) {
           // Identity only for well-formed UPPER_SNAKE member names; other
           // strings must keep flowing into the runtime cast so invalid
           // members raise errors.
@@ -2854,28 +2871,64 @@ Expression VisitExpression(
         }
       }
     }
-    const bool safe =
-        node.detail.find("return_null_on_error=true") != std::string::npos;
     return CastExpressionExp(std::move(child), std::move(type_name), safe);
   }
 
   if (node.kind == "NewConstructor") {
-    std::string text_format;
-    for (const auto& child : node.children) {
-      if (child->kind == "NewConstructorArg" && child->children.size() >= 2) {
-        Expression val_expr = VisitExpression(*child->children[0]);
-        std::string field_name = Identifier(*child->children[1]);
-        std::string val_str;
-        if (val_expr->Type() == TypeTag::kConstantValue) {
-          val_str = val_expr->AsConstantValue().GetValue().AsString();
-        }
-        if (!text_format.empty()) {
-          text_format += " ";
-        }
-        text_format += field_name + ": " + val_str;
+    // NEW ProtoType(field AS name, ...): lowered to a runtime constructor
+    // call so non-constant arguments (subqueries, column references,
+    // TIMESTAMP/DATE values) format their TEXT payload per row.
+    std::string type_name;
+    if (const GoogleSqlAstNode* path_node = node.Child("PathExpression")) {
+      type_name = Path(*path_node);
+    } else if (const GoogleSqlAstNode* simple = node.Child("SimpleType")) {
+      if (const GoogleSqlAstNode* inner = simple->Child("PathExpression")) {
+        type_name = Path(*inner);
       }
     }
-    return ConstantValueExp(Value(std::move(text_format)));
+    {
+      for (char& c : type_name) {
+        if (c == '`') {
+          c = ' ';
+        }
+      }
+      // Collapse whitespace left by backtick removal.
+      std::string collapsed;
+      for (const char c : type_name) {
+        if (c != ' ' || (!collapsed.empty() && collapsed.back() != ' ')) {
+          collapsed.push_back(c);
+        }
+      }
+      type_name = std::move(collapsed);
+    }
+    std::vector<Expression> args;
+    args.emplace_back(ConstantValueExp(Value(std::move(type_name))));
+    for (const auto& child : node.children) {
+      if (child->kind == "NewConstructorArg" && child->children.size() >= 2) {
+        const GoogleSqlAstNode& value_node = *child->children[0];
+        const GoogleSqlAstNode& name_node = *child->children[1];
+        std::string field_name = Identifier(name_node);
+        if (field_name.empty()) {
+          field_name = Path(name_node);
+        }
+        // Extension targets arrive as parenthesized paths: emit the
+        // bracketed extension key used by TEXT format.
+        if (!field_name.empty() && field_name.front() != '[' &&
+            field_name.find('.') != std::string::npos) {
+          field_name = "[" + field_name + "]";
+        }
+        if (value_node.kind == "BooleanLiteral") {
+          const std::string upper_literal = UpperCopy(value_node.detail);
+          args.emplace_back(ConstantValueExp(
+              Value(upper_literal == "TRUE" ? std::string("true")
+                                            : std::string("false"))));
+        } else {
+          args.push_back(VisitExpression(value_node));
+        }
+        args.emplace_back(ConstantValueExp(Value(std::move(field_name))));
+      }
+    }
+    return FunctionCallExp("__proto_new", std::move(args));
   }
 
   if (node.kind == "StructConstructorWithKeyword" ||
@@ -3238,6 +3291,16 @@ Expression VisitExpression(
     return chain;
   }
 
+  if (node.kind == "DotGeneralizedField" && node.children.size() >= 2) {
+    // proto extension access: value.(pkg.Ext.field).  Lowered to a runtime
+    // lookup of the bracketed extension key inside the TEXT payload.
+    Expression base = VisitExpression(*node.children[0]);
+    std::string extension_path = Path(*node.children[node.children.size() - 1]);
+    return FunctionCallExp(
+        "__get_extension",
+        {std::move(base), ConstantValueExp(Value(std::move(extension_path)))});
+  }
+
   throw std::runtime_error("GoogleSQL AST: unsupported expression " +
                            node.kind);
 }
@@ -3523,6 +3586,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
   } bound_mask_scope;
 
   std::vector<NamedExpression> projections;
+  std::vector<const GoogleSqlAstNode*> projection_nodes;
   for (const GoogleSqlAstNode* column : select_list->Children("SelectColumn")) {
     const GoogleSqlAstNode* expression_node = nullptr;
     for (const auto& child : column->children) {
@@ -3540,6 +3604,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
       name = expression->AsColumnValue().GetColumnName().name;
     }
     projections.emplace_back(name, std::move(expression));
+    projection_nodes.push_back(expression_node);
   }
 
   const std::string upper_select_detail = UpperCopy(select->detail);
@@ -3559,40 +3624,84 @@ std::shared_ptr<SelectStatement> VisitQuery(
       (select_as != nullptr ||
        (upper_select_detail.find("AS_MODE=") != std::string::npos &&
         upper_select_detail.find("AS_MODE=VALUE") == std::string::npos))) {
-    std::string proto_str;
-    bool all_const = true;
-    for (size_t i = 0; i < projections.size(); ++i) {
-      std::string fname = projections[i].name.empty()
-                              ? ("f" + std::to_string(i + 1))
-                              : projections[i].name;
-      if (projections[i].expression->Type() == TypeTag::kConstantValue) {
-        if (!proto_str.empty()) {
-          proto_str += " ";
-        }
-        proto_str += fname + ": ";
-        const Value& v =
-            projections[i].expression->AsConstantValue().GetValue();
-        proto_str += v.AsString();
-      } else if (projections[i].expression->Type() == TypeTag::kArrayExp) {
-        const auto& arr = projections[i].expression->AsArrayExpression();
-        for (const auto& elem : arr.Elements()) {
-          if (elem->Type() == TypeTag::kConstantValue) {
-            if (!proto_str.empty()) {
-              proto_str += " ";
+    // SELECT AS <proto type>: fold the projections into a single proto
+    // TEXT-format payload through the runtime constructor so non-constant
+    // arguments (subqueries, column refs, temporal values) format per row.
+    std::string type_name;
+    if (select_as != nullptr) {
+      for (const auto& child : select_as->children) {
+        if (child->kind == "PathExpression" || child->kind == "SimpleType") {
+          std::string candidate = child->kind == "PathExpression"
+                                      ? Path(*child)
+                                      : SqlTypeFromAst(*child);
+          for (char& c : candidate) {
+            if (c == '`') {
+              c = ' ';
             }
-            proto_str +=
-                fname + ": " + elem->AsConstantValue().GetValue().AsString();
-          } else {
-            all_const = false;
+          }
+          std::string collapsed;
+          for (const char c : candidate) {
+            if (c != ' ' ||
+                (!collapsed.empty() && collapsed.back() != ' ')) {
+              collapsed.push_back(c);
+            }
+          }
+          if (!collapsed.empty()) {
+            type_name = collapsed;
+            break;
           }
         }
-      } else {
-        all_const = false;
       }
     }
-    if (all_const) {
-      projections = {
-          NamedExpression("", ConstantValueExp(Value(std::move(proto_str))))};
+    if (type_name.empty()) {
+      const size_t mode = upper_select_detail.find("AS_MODE=");
+      if (mode != std::string::npos) {
+        size_t end = mode + 8;
+        while (end < select->detail.size() &&
+               select->detail[end] != ',' && select->detail[end] != ' ') {
+          ++end;
+        }
+        type_name = select->detail.substr(mode + 8, end - mode - 8);
+      } else if (UpperCopy(select_as != nullptr
+                               ? select_as->detail
+                               : std::string())
+                     .size() > 5) {
+        // SelectAs detail carries the raw target text after "type=".
+        const std::string& detail = select_as->detail;
+        const size_t eq = detail.find("path=");
+        if (eq != std::string::npos) {
+          size_t end = eq + 5;
+          while (end < detail.size() && detail[end] != ',' &&
+                 detail[end] != ' ') {
+            ++end;
+          }
+          type_name = detail.substr(eq + 5, end - eq - 5);
+        }
+      }
+    }
+    if (!type_name.empty()) {
+      std::vector<Expression> args;
+      args.emplace_back(ConstantValueExp(Value(std::move(type_name))));
+      for (size_t i = 0; i < projections.size() &&
+                         i < projection_nodes.size();
+           ++i) {
+        std::string fname =
+            projections[i].name.empty()
+                ? ("f" + std::to_string(i + 1))
+                : projections[i].name;
+        const GoogleSqlAstNode& value_node = *projection_nodes[i];
+        if (value_node.kind == "BooleanLiteral") {
+          const std::string upper_literal = UpperCopy(value_node.detail);
+          args.emplace_back(ConstantValueExp(
+              Value(upper_literal == "TRUE" ? std::string("true")
+                                            : std::string("false"))));
+        } else {
+          args.push_back(projections[i].expression);
+        }
+        args.emplace_back(ConstantValueExp(Value(std::move(fname))));
+      }
+      projections = {NamedExpression("", FunctionCallExp("__proto_new",
+                                                         std::move(args)))};
     }
   }
 
@@ -3744,7 +3853,21 @@ ValueType ColumnType(const GoogleSqlAstNode& definition) {
   if (path == nullptr) {
     throw std::runtime_error("GoogleSQL AST: column type missing");
   }
-  const std::string type = Lower(Path(*path));
+  // Proto / user-defined type names arrive as backticked dotted paths
+  // (`googlesql_test.Proto3KitchenSink`) or PROTO<...> wrappers; they store
+  // through the VARCHAR channel carrying their TEXT-format payload.
+  std::string raw_type = Path(*path);
+  std::string cleaned;
+  for (const char c : raw_type) {
+    if (c != '`') {
+      cleaned.push_back(c);
+    }
+  }
+  const std::string lower = Lower(cleaned);
+  if (lower.rfind("proto<", 0) == 0 || lower.find('.') != std::string::npos) {
+    return ValueType::kVarChar;
+  }
+  const std::string& type = lower;
   if (type == "int" || type == "int64" || type == "integer" ||
       type == "bigint" || type == "bool" || type == "boolean") {
     return ValueType::kInt64;

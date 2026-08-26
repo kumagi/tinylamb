@@ -1968,7 +1968,10 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       };
       // WHERE predicates may reference struct fields through dotted paths;
       // rewrite those references into get_field(column, "field.path") when
-      // the path prefix names a column rather than a relation.
+      // the path prefix names a column rather than a relation.  Single-column
+      // (value / proto) tables additionally bind unresolved bare names to
+      // field reads of that column.
+      const bool single_column_table = schema.ColumnCount() == 1;
       if (where_clause) {
         std::function<Expression(const Expression&)> bind_struct_fields =
             [&](const Expression& expr) -> Expression {
@@ -1988,6 +1991,16 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                      ConstantValueExp(Value(std::string(name.name)))});
               }
             }
+            if (single_column_table && name.schema.empty() &&
+                !name.name.empty() && name.name != "*" &&
+                !IdentifierEquals(name.name,
+                                  schema.GetColumn(0).Name().name)) {
+              return FunctionCallExp(
+                  "__get_field_safe",
+                  {ColumnValueExp(ColumnName(update.TableName(),
+                                             schema.GetColumn(0).Name().name)),
+                   ConstantValueExp(Value(std::string(name.name)))});
+            }
             return expr;
           }
           std::vector<Expression> children = ExpressionChildren(expr);
@@ -2006,6 +2019,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       // full ColumnName instead of the bare name so qualified assignments are
       // not silently ignored.
       std::vector<bool> applied(set_clause.size(), false);
+      // Unmatched targets on single-column (proto) tables address fields of
+      // that column's TEXT payload ("SET int64_key_1 = 100").
+      std::vector<std::pair<std::string, const Expression*>> proto_sets;
       for (size_t i = 0; i < schema.ColumnCount(); ++i) {
         const Column& column = schema.GetColumn(i);
         Expression expression = ColumnValueExp(column.Name());
@@ -2023,13 +2039,43 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         output.emplace_back(column.Name().name, std::move(expression));
       }
       for (size_t j = 0; j < applied.size(); ++j) {
-        if (!applied[j]) {
-          last_error_ =
-              "UPDATE SET target not found: " +
-              (set_clause[j].first.schema.empty()
-                   ? set_clause[j].first.name
-                   : set_clause[j].first.ToString());
-          return Status::kNotExists;
+        if (applied[j]) { continue; }
+        const ColumnName& target = set_clause[j].first;
+        const bool plain_or_local =
+            target.schema.empty() || target.schema == update.TableName();
+        if (single_column_table && plain_or_local && !target.name.empty() &&
+            target.name != "*") {
+          std::string path = target.name;
+          if (!target.schema.empty()) {
+            path = target.schema + "." + target.name;
+          }
+          proto_sets.emplace_back(std::move(path), &set_clause[j].second);
+          applied[j] = true;
+          continue;
+        }
+        last_error_ =
+            "UPDATE SET target not found: " +
+            (set_clause[j].first.schema.empty()
+                 ? set_clause[j].first.name
+                 : set_clause[j].first.ToString());
+        return Status::kNotExists;
+      }
+      if (!proto_sets.empty()) {
+        // Wrap the column read with chained __proto_set calls so each field
+        // assignment applies to the payload produced by the previous one.
+        for (auto& entry : output) {
+          if (!IdentifierEquals(entry.name,
+                                schema.GetColumn(0).Name().name)) {
+            continue;
+          }
+          Expression current = std::move(entry.expression);
+          for (const auto& [path, value_expr] : proto_sets) {
+            current = FunctionCallExp(
+                "__proto_set",
+                {std::move(current), ConstantValueExp(Value(std::string(path))),
+                 *value_expr});
+          }
+          entry.expression = std::move(current);
         }
       }
       QueryData query;
@@ -2093,6 +2139,40 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                          : expr;
         };
         where_clause = bind_alias(where_clause);
+      }
+      // Single-column (proto) value tables: unresolved bare names in the
+      // predicate address fields of the only column's TEXT payload.
+      if (where_clause && schema.ColumnCount() == 1 &&
+          !IdentifierEquals(schema.GetColumn(0).Name().name, delete_alias)) {
+        const ColumnName only_column(remove.TableName(),
+                                     schema.GetColumn(0).Name().name);
+        std::function<Expression(const Expression&)> bind_proto_fields =
+            [&](const Expression& expr) -> Expression {
+          if (!expr) { return expr; }
+          if (expr->Type() == TypeTag::kColumnValue) {
+            const ColumnName& name = expr->AsColumnValue().GetColumnName();
+            if (name.schema.empty() && !name.name.empty() &&
+                name.name != "*" &&
+                !IdentifierEquals(name.name,
+                                  schema.GetColumn(0).Name().name)) {
+              return FunctionCallExp(
+                  "__get_field_safe",
+                  {ColumnValueExp(only_column),
+                   ConstantValueExp(Value(std::string(name.name)))});
+            }
+            return expr;
+          }
+          std::vector<Expression> children = ExpressionChildren(expr);
+          bool changed = false;
+          for (Expression& child : children) {
+            Expression mapped = bind_proto_fields(child);
+            changed |= child->ToString() != mapped->ToString();
+            child = std::move(mapped);
+          }
+          return changed ? WithExpressionChildren(expr, std::move(children))
+                         : expr;
+        };
+        where_clause = bind_proto_fields(where_clause);
       }
       for (size_t i = 0; i < schema.ColumnCount(); ++i) {
         output.emplace_back(schema.GetColumn(i).Name());

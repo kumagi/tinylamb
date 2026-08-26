@@ -35,6 +35,7 @@
 #include "common/status_or.hpp"
 #include "expression/evaluation_context.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/proto_text.hpp"
 #include "expression/sql_udf.hpp"
 #include "type/column_name.hpp"
 #include "type/function.hpp"
@@ -296,6 +297,12 @@ Value ExecuteFunction(const std::string& name,
     if (values[0].IsNull()) { return {}; }
     const std::string object = raw_str(values[0]);
     const std::string field = raw_str(values[1]);
+    // Proto TEXT payloads resolve through the shared extractor (defaults,
+    // has_ bits, repeated arrays) instead of the JSON member scan.
+    Value proto_value;
+    if (TryProtoTextGetField(object, field, &proto_value)) {
+      return proto_value;
+    }
     if (object.size() < 2 || object.front() != '{' || object.back() != '}') {
       throw std::runtime_error("get_field requires a STRUCT");
     }
@@ -320,6 +327,10 @@ Value ExecuteFunction(const std::string& name,
     if (values[0].IsNull()) { return {}; }
     const std::string object = raw_str(values[0]);
     const std::string field = raw_str(values[1]);
+    Value proto_value;
+    if (TryProtoTextGetField(object, field, &proto_value)) {
+      return proto_value;
+    }
     if (object.size() < 2 || object.front() != '{' || object.back() != '}') {
       return {};
     }
@@ -349,6 +360,10 @@ Value ExecuteFunction(const std::string& name,
     }
     const std::string object = raw_str(values[0]);
     const std::string field = raw_str(values[1]);
+    Value proto_value;
+    if (TryProtoTextGetField(object, field, &proto_value)) {
+      return proto_value;
+    }
     if (object.size() < 2 || object.front() != '{' || object.back() != '}') {
       throw std::runtime_error("get_field requires a STRUCT");
     }

@@ -43,10 +43,13 @@ std::string ToLowerCopy(std::string value) {
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "table/table.hpp"
 #include "type/column_name.hpp"
@@ -56,6 +59,61 @@ std::string ToLowerCopy(std::string value) {
 namespace tinylamb {
 
 namespace {
+
+// Dotted references whose qualifier names a COLUMN (not a FROM relation)
+// address encoded fields of proto / struct payloads: "value.int32_val",
+// "t.value.nested_value.nested_int64".  Rewrite them into chained
+// __get_field_safe reads so resolution succeeds against the base column.
+Expression BindColumnQualifiedFieldReads(
+    const Expression& expr,
+    const std::unordered_map<std::string, std::string>& col_table_map,
+    const std::unordered_set<std::string>& relations) {
+  if (!expr) {
+    return expr;
+  }
+  if (expr->Type() == TypeTag::kColumnValue) {
+    const ColumnName& name = expr->AsColumnValue().GetColumnName();
+    if (name.schema.empty() || name.name.empty() || name.name == "*" ||
+        relations.contains(name.schema)) {
+      return expr;
+    }
+    // The qualifier may itself be dotted ("t.value"); the first segment must
+    // name a column of the driving table for this to be a field read.
+    const size_t first_dot = name.schema.find('.');
+    const std::string head = first_dot == std::string::npos
+                                 ? name.schema
+                                 : name.schema.substr(0, first_dot);
+    const auto it = col_table_map.find(ToLowerCopy(head));
+    if (it == col_table_map.end()) {
+      return expr;
+    }
+    std::vector<std::string> segments;
+    {
+      std::string remainder = name.schema.substr(
+          first_dot == std::string::npos ? name.schema.size() : first_dot + 1);
+      if (!remainder.empty()) {
+        segments.push_back(std::move(remainder));
+      }
+      segments.push_back(name.name);
+    }
+    Expression current = ColumnValueExp(ColumnName(it->second, head));
+    for (const std::string& segment : segments) {
+      current = FunctionCallExp(
+          "__get_field_safe",
+          {std::move(current), ConstantValueExp(Value(std::string(segment)))});
+    }
+    return current;
+  }
+  std::vector<Expression> children = ExpressionChildren(expr);
+  bool changed = false;
+  for (Expression& child : children) {
+    Expression mapped = BindColumnQualifiedFieldReads(child, col_table_map,
+                                                      relations);
+    changed |= child->ToString() != mapped->ToString();
+    child = std::move(mapped);
+  }
+  return changed ? WithExpressionChildren(expr, std::move(children)) : expr;
+}
 
 Status
 ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
@@ -218,6 +276,15 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   }
 
   // Rewrite SELECT clause.
+  for (auto& named : select_) {
+    if (named.expression) {
+      named.expression = BindColumnQualifiedFieldReads(
+          named.expression, col_table_map, relations);
+    }
+  }
+  where_ = where_ ? BindColumnQualifiedFieldReads(where_, col_table_map,
+                                                  relations)
+                  : where_;
   RETURN_IF_FAIL(ResolveSelect(select_, col_table_map, ambiguous_colum_name,
                                all_cols, relations));
 

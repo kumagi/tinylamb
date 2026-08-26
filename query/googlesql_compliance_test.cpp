@@ -156,22 +156,62 @@ bool RowsMatch(const std::vector<Row>& actual,
 std::vector<std::string> SplitStatements(std::string_view sql) {
   std::vector<std::string> stmts;
   std::string current;
-  bool in_string = false;
+  // Splits on top-level ';' only: string literals (including triple-quoted
+  // ones) and '#' / '--' comments may contain semicolons, quotes and
+  // apostrophes that must not disturb the scanner state.
+  enum class Mode { kCode, kString, kComment };
+  Mode mode = Mode::kCode;
   char quote = '\0';
+  bool triple = false;
   for (size_t i = 0; i < sql.size(); ++i) {
     const char c = sql[i];
-    if (in_string) {
+    if (mode == Mode::kComment) {
+      current.push_back(c);
+      if (c == '\n') { mode = Mode::kCode; }
+      continue;
+    }
+    if (mode == Mode::kString) {
       current.push_back(c);
       if (c == '\\' && i + 1 < sql.size()) {
         current.push_back(sql[++i]);
         continue;
       }
-      if (c == quote) { in_string = false; }
+      if (!triple && c == quote) {
+        mode = Mode::kCode;
+      } else if (triple && c == quote && i + 2 < sql.size() &&
+                 sql[i + 1] == quote && sql[i + 2] == quote) {
+        current.push_back(sql[i + 1]);
+        current.push_back(sql[i + 2]);
+        i += 2;
+        mode = Mode::kCode;
+      }
+      continue;
+    }
+    if ((c == '"' || c == '\'') && i + 2 < sql.size() && sql[i + 1] == c &&
+        sql[i + 2] == c) {
+      mode = Mode::kString;
+      quote = c;
+      triple = true;
+      current.push_back(c);
+      current.push_back(sql[i + 1]);
+      current.push_back(sql[i + 2]);
+      i += 2;
       continue;
     }
     if (c == '"' || c == '\'') {
-      in_string = true;
+      mode = Mode::kString;
       quote = c;
+      triple = false;
+      current.push_back(c);
+      continue;
+    }
+    if (c == '#') {
+      mode = Mode::kComment;
+      current.push_back(c);
+      continue;
+    }
+    if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+      mode = Mode::kComment;
       current.push_back(c);
       continue;
     }
