@@ -624,9 +624,13 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
               RowAsStructValue(*current->row, *current->schema), fields);
         }
       }
-      for (size_t split = 1; split < segments.size(); ++split) {
+      // Split point k: segments[0..k] form the base column reference
+      // (qualifier = segments[0..k-1], bare name = segments[k]) and
+      // segments[k+1..] traverse encoded field values.  Longest prefix
+      // first so explicit qualifiers win over bare-name matches.
+      for (size_t split = segments.size() - 1; split-- > 0;) {
         std::string qualifier;
-        for (size_t i = 0; i + 1 < split; ++i) {
+        for (size_t i = 0; i < split; ++i) {
           if (!qualifier.empty()) {
             qualifier += '.';
           }

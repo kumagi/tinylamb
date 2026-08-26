@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -185,8 +186,17 @@ double ParseFloatLiteral(const GoogleSqlAstNode& node) {
   try {
     return std::stod(node.detail);
   } catch (const std::exception&) {
-    throw std::runtime_error("GoogleSQL AST: float literal out of range " +
-                             node.detail);
+    // std::stod rejects subnormal magnitudes on some libstdc++ versions
+    // (ERANGE); strtod accepts the full IEEE-754 double domain.
+    errno = 0;
+    const char* text = node.detail.c_str();
+    char* end = nullptr;
+    const double value = std::strtod(text, &end);
+    if (end == text || *end != '\0') {
+      throw std::runtime_error("GoogleSQL AST: float literal out of range " +
+                               node.detail);
+    }
+    return value;
   }
 }
 
