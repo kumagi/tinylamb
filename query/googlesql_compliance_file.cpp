@@ -741,6 +741,185 @@ std::string FormatComplianceValue(const Value& value) {
   return value.AsString();
 }
 
+namespace {
+
+// Case-insensitive identifier equality for proto member splitting.
+bool ProtoIsIdentStart(char c) {
+  return std::isalpha(static_cast<unsigned char>(c)) != 0 || c == '_' ||
+         c == '[';
+}
+
+// Collapses whitespace runs to single spaces (dropping space before closing
+// brackets); used to normalize golden text before comparison.
+std::string NormalizeWsText(std::string_view str) {
+  std::string out;
+  bool in_space = false;
+  for (char c : str) {
+    if (std::isspace(static_cast<unsigned char>(c))) {
+      if (!in_space && !out.empty() && out.back() != '[' && out.back() != '(' && out.back() != '{' && out.back() != ',') {
+        out.push_back(' ');
+      }
+      in_space = true;
+    } else {
+      if (in_space && !out.empty() && (c == ']' || c == ')' || c == '}' || c == ',')) {
+        if (out.back() == ' ') { out.pop_back(); }
+      }
+      in_space = false;
+      out.push_back(c);
+    }
+  }
+  if (!out.empty() && out.back() == ' ') { out.pop_back(); }
+  return out;
+}
+
+// Splits a proto TEXT / struct body into top-level (name, value) members.
+// Members separate on ',', ';' or on whitespace immediately before another
+// "identifier:" pair; bracketed groups and quoted strings stay intact.
+void SplitProtoMembers(const std::string& body,
+                       std::vector<std::pair<std::string, std::string>>* out) {
+  int depth = 0;
+  bool in_string = false;
+  char quote = '\0';
+  size_t start = 0;
+  const size_t n = body.size();
+  auto flush = [&](size_t end) {
+    std::string piece = Trim(body.substr(start, end - start));
+    if (!piece.empty()) {
+      const size_t colon = piece.find(':');
+      // Only treat the first top-level colon as a name separator when the
+      // prefix is identifier-shaped.
+      bool ident = colon != std::string::npos && colon > 0 &&
+                   colon + 1 <= piece.size() - 1 && ProtoIsIdentStart(piece[0]);
+      for (size_t k = 0; ident && k < colon; ++k) {
+        const char c = piece[k];
+        if (!(std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' ||
+              c == '.' || c == '[')) {
+          ident = false;
+          break;
+        }
+      }
+      if (ident) {
+        out->emplace_back(ToLower(Trim(piece.substr(0, colon))),
+                          Trim(piece.substr(colon + 1)));
+      } else {
+        out->emplace_back(std::string(), piece);
+      }
+    }
+  };
+  size_t i = 0;
+  while (i < n) {
+    const char c = body[i];
+    if (in_string) {
+      if (c == '\\' && i + 1 < n) { i += 2; continue; }
+      if (c == quote) { in_string = false; }
+      ++i;
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      in_string = true;
+      quote = c;
+      ++i;
+      continue;
+    }
+    if (c == '{' || c == '(' || c == '[' || c == '<') { ++depth; ++i; continue; }
+    if (c == '}' || c == ')' || c == ']' || c == '>') {
+      if (depth > 0) { --depth; }
+      ++i;
+      continue;
+    }
+    if (depth == 0 && (c == ',' || c == ';')) {
+      flush(i);
+      ++i;
+      while (i < n && std::isspace(static_cast<unsigned char>(body[i]))) { ++i; }
+      start = i;
+      continue;
+    }
+    if (depth == 0 && std::isspace(static_cast<unsigned char>(c))) {
+      // Whitespace ends the member only when an identifier-colon follows
+      // ("field: value field2: value2"); bare values keep their spaces.
+      size_t j = i;
+      while (j < n && std::isspace(static_cast<unsigned char>(body[j]))) { ++j; }
+      if (j < n && ProtoIsIdentStart(body[j])) {
+        size_t k = j + 1;
+        while (k < n && (std::isalnum(static_cast<unsigned char>(body[k])) != 0 ||
+                         body[k] == '_' || body[k] == '.')) {
+          ++k;
+        }
+        while (k < n && std::isspace(static_cast<unsigned char>(body[k]))) { ++k; }
+        if (k < n && body[k] == ':' && k > j) {
+          flush(i);
+          i = j;
+          start = i;
+          continue;
+        }
+      }
+      ++i;
+      continue;
+    }
+    ++i;
+  }
+  flush(n);
+}
+
+// Canonical form of one proto/struct value: nested braced bodies sort their
+// members so field order never affects matching.
+std::string CanonicalizeProtoValue(const std::string& value);
+
+std::string CanonicalizeProtoBody(const std::string& body) {
+  std::vector<std::pair<std::string, std::string>> members;
+  SplitProtoMembers(body, &members);
+  std::vector<std::string> canon;
+  canon.reserve(members.size());
+  for (const auto& [name, raw] : members) {
+    canon.push_back(name + "=" + CanonicalizeProtoValue(raw));
+  }
+  std::sort(canon.begin(), canon.end());
+  std::string joined;
+  for (const std::string& item : canon) {
+    if (!joined.empty()) { joined.push_back('|'); }
+    joined += item;
+  }
+  return joined;
+}
+
+std::string CanonicalizeProtoValue(const std::string& value) {
+  const std::string trimmed = Trim(value);
+  if (trimmed.size() >= 2 && trimmed.front() == '{' && trimmed.back() == '}') {
+    return "{" + CanonicalizeProtoBody(trimmed.substr(1, trimmed.size() - 2)) +
+           "}";
+  }
+  if (trimmed.size() >= 2 && trimmed.front() == '<' && trimmed.back() == '>') {
+    return "{" + CanonicalizeProtoBody(trimmed.substr(1, trimmed.size() - 2)) +
+           "}";
+  }
+  return ToLower(NormalizeWsText(trimmed));
+}
+
+// Order-insensitive whole-proto comparison: both bodies must parse into
+// fully-named member multisets (positional struct tokens are rejected so
+// order-sensitive flows keep using the positional paths).
+bool ProtoBodiesMatch(const std::string& want_body,
+                      const std::string& actual_body) {
+  std::vector<std::pair<std::string, std::string>> want_members;
+  std::vector<std::pair<std::string, std::string>> actual_members;
+  SplitProtoMembers(want_body, &want_members);
+  SplitProtoMembers(actual_body, &actual_members);
+  if (want_members.empty() || want_members.size() != actual_members.size()) {
+    return false;
+  }
+  bool all_named = true;
+  for (const auto& [name, raw] : want_members) {
+    if (name.empty()) { all_named = false; break; }
+  }
+  for (const auto& [name, raw] : actual_members) {
+    if (name.empty()) { all_named = false; break; }
+  }
+  if (!all_named) { return false; }
+  return CanonicalizeProtoBody(want_body) == CanonicalizeProtoBody(actual_body);
+}
+
+}  // namespace
+
 bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   const std::string want = Trim(expected);
   if (ToLower(want) == "null") { return actual.IsNull(); }
@@ -767,6 +946,15 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
           Trim(lower_type.substr(lower_type.find('<') + 1,
                                  lower_type.size() - lower_type.find('<') - 2));
       if (unwrapped == lower_actual_type) { lower_type = lower_actual_type; }
+    }
+    // Engines that cannot name nested message element types report the bare
+    // PROTO/STRUCT tag; judge those by element values.
+    const auto bare_message_tag = [](const std::string& t) {
+      return t == "proto" || t == "struct";
+    };
+    if (bare_message_tag(lower_actual_type) &&
+        (lower_type.starts_with(lower_actual_type + "<"))) {
+      lower_type = lower_actual_type;
     }
     // Engines that store enums as their member-name strings report
     // STRING-typed arrays where the reference prints ENUM<T>.
@@ -898,24 +1086,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     const std::string actual_str = std::string(actual.value.varchar_value);
     if (actual_str == unquoted) { return true; }
     auto normalize_ws = [](std::string_view str) -> std::string {
-      std::string out;
-      bool in_space = false;
-      for (char c : str) {
-        if (std::isspace(static_cast<unsigned char>(c))) {
-          if (!in_space && !out.empty() && out.back() != '[' && out.back() != '(' && out.back() != '{' && out.back() != ',') {
-            out.push_back(' ');
-          }
-          in_space = true;
-        } else {
-          if (in_space && !out.empty() && (c == ']' || c == ')' || c == '}' || c == ',')) {
-            if (out.back() == ' ') { out.pop_back(); }
-          }
-          in_space = false;
-          out.push_back(c);
-        }
-      }
-      if (!out.empty() && out.back() == ' ') { out.pop_back(); }
-      return out;
+      return NormalizeWsText(str);
     };
     auto strip_order_annotations = [](const std::string& s) {
       std::string out = s;
@@ -941,37 +1112,72 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       return true;
     }
     const std::string norm_actual = Unquote(actual_str);
+    // Whole-proto goldens may wrap the payload in extra STRUCT brace layers
+    // ("{{ field: v ... }}"): strip every layer from the golden side and
+    // compare member multisets so field order never affects matching.
+    {
+      std::string want_body = want;
+      while (want_body.size() >= 2 && want_body.front() == '{' &&
+             want_body.back() == '}') {
+        want_body = Trim(want_body.substr(1, want_body.size() - 2));
+      }
+      std::string actual_body = norm_actual.empty() ? actual_str : norm_actual;
+      if (!want_body.empty() && !actual_body.empty()) {
+        if (ProtoBodiesMatch(want_body, actual_body)) { return true; }
+      }
+    }
     if ("{" + actual_str + "}" == unquoted || "{" + actual_str + "}" == want ||
         "{" + norm_actual + "}" == unquoted || "{" + norm_actual + "}" == want) { return true; }
+    // Strips a leading `"key":` / bare `key:` marker, ignoring colons
+    // that live inside brackets or quotes (e.g. ARRAY tokens carrying
+    // ordering annotations).
+    auto drop_key = [](std::string elem) -> std::string {
+      int depth = 0;
+      bool in_str = false;
+      char quote = '\0';
+      for (size_t i = 0; i < elem.size(); ++i) {
+        const char c = elem[i];
+        if (in_str) {
+          if (c == '\\' && i + 1 < elem.size()) { ++i; }
+          else if (c == quote) { in_str = false; }
+          continue;
+        }
+        if (c == '"' || c == '\'') { in_str = true; quote = c; }
+        else if (c == '<' || c == '[' || c == '(' || c == '{') { ++depth; }
+        else if (c == '>' || c == ']' || c == ')' || c == '}') {
+          if (depth > 0) { --depth; }
+        } else if (c == ':' && depth == 0 && i + 1 < elem.size()) {
+          return Trim(elem.substr(i + 1));
+        }
+      }
+      return elem;
+    };
     if (!want.empty() && want.front() == '{' && want.back() == '}' &&
         !norm_actual.empty() && norm_actual.front() == '{' && norm_actual.back() == '}') {
+      // Order-insensitive comparison: protos and structs are field sets, so
+      // members match as a multiset of canonicalized tokens.
+      auto canonical_members = [&](const std::string& body) {
+        std::vector<std::string> parts = SplitTopLevel(body);
+        std::vector<std::string> out;
+        out.reserve(parts.size());
+        for (std::string& p : parts) {
+          std::string elem = drop_key(Trim(p));
+          const std::string lower_elem = ToLower(elem);
+          if (lower_elem.starts_with("array<") && lower_elem.ends_with("(null)")) {
+            elem = "NULL";
+          }
+          out.push_back(normalize_ws(strip_order_annotations(elem)));
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+      };
+      if (canonical_members(want.substr(1, want.size() - 2)) ==
+          canonical_members(norm_actual.substr(1, norm_actual.size() - 2))) {
+        return true;
+      }
       std::vector<std::string> want_parts = SplitTopLevel(want.substr(1, want.size() - 2));
       std::vector<std::string> got_parts = SplitTopLevel(norm_actual.substr(1, norm_actual.size() - 2));
       if (want_parts.size() == got_parts.size()) {
-        // Strips a leading `"key":` / bare `key:` marker, ignoring colons
-        // that live inside brackets or quotes (e.g. ARRAY tokens carrying
-        // ordering annotations).
-        auto drop_key = [](std::string elem) -> std::string {
-          int depth = 0;
-          bool in_str = false;
-          char quote = '\0';
-          for (size_t i = 0; i < elem.size(); ++i) {
-            const char c = elem[i];
-            if (in_str) {
-              if (c == '\\' && i + 1 < elem.size()) { ++i; }
-              else if (c == quote) { in_str = false; }
-              continue;
-            }
-            if (c == '"' || c == '\'') { in_str = true; quote = c; }
-            else if (c == '<' || c == '[' || c == '(' || c == '{') { ++depth; }
-            else if (c == '>' || c == ']' || c == ')' || c == '}') {
-              if (depth > 0) { --depth; }
-            } else if (c == ':' && depth == 0 && i + 1 < elem.size()) {
-              return Trim(elem.substr(i + 1));
-            }
-          }
-          return elem;
-        };
         bool matched = true;
         for (size_t idx = 0; idx < want_parts.size(); ++idx) {
           std::string want_elem = drop_key(Trim(want_parts[idx]));

@@ -19,6 +19,7 @@
 #include <utility>
 
 #include "common/constants.hpp"
+#include "expression/proto_text.hpp"
 #include "type/column_name.hpp"
 #include "type/date.hpp"
 #include "type/interval.hpp"
@@ -297,6 +298,12 @@ std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
   if (upper.starts_with("ARRAY<")) {
     return {ValueType::kArray, TypeTag::kArray};
   }
+  // Dotted user-defined type paths (googlesql_test.KitchenSinkPB,
+  // ...Nested, ...) carry their TEXT-format payloads through the VARCHAR
+  // channel; enum members ride the same channel as their name strings.
+  if (upper.find('.') != std::string::npos) {
+    return {ValueType::kVarChar, TypeTag::kVarChar};
+  }
   // Enums or user types default to int64 or varchar
   return {ValueType::kInt64, TypeTag::kBigInt};
 }
@@ -307,9 +314,13 @@ Value CastValue(const Value& val, const std::string& type_name,
   const std::string upper = ToUpper(type_name);
   const bool is_bool = (upper == "BOOL" || upper == "BOOLEAN");
   // ENUM-typed targets accept their textual member names verbatim: this
-  // engine stores enums as their member-name strings.
-  if (!is_bool && upper.find("ENUM") != std::string::npos &&
-      val.type == ValueType::kVarChar) {
+  // engine stores enums as their member-name strings.  Message protos whose
+  // names merely contain "ENUM" (KitchenSinkEnumPB) are excluded.
+  const bool dotted_type = upper.find('.') != std::string::npos;
+  const bool enum_target =
+      !is_bool && upper.find("ENUM") != std::string::npos &&
+      (!dotted_type || IsKnownEnumTypeName(type_name));
+  if (enum_target && val.type == ValueType::kVarChar) {
     // Member names are case-sensitive UPPER_SNAKE identifiers.
     const std::string member(val.value.varchar_value);
     bool member_shaped =
@@ -337,6 +348,64 @@ Value CastValue(const Value& val, const std::string& type_name,
       if (safe) { return Value(); }
       throw std::runtime_error("Out of range cast of string '" + member +
                                "' to enum type " + type_name);
+    }
+    // Numeric-looking strings into enum types never name a member.
+    const std::string trimmed_member = [&] {
+      const size_t b = member.find_first_not_of(" \t\r\n");
+      if (b == std::string::npos) { return std::string(); }
+      const size_t e = member.find_last_not_of(" \t\r\n");
+      return member.substr(b, e - b + 1);
+    }();
+    bool numeric_token = !trimmed_member.empty();
+    for (const char c : trimmed_member) {
+      if (!(static_cast<bool>(std::isdigit(static_cast<unsigned char>(c))) ||
+            c == '-' || c == '+')) {
+        numeric_token = false;
+        break;
+      }
+    }
+    if (numeric_token) {
+      if (safe) { return Value(); }
+      throw std::runtime_error("Out of range cast of string '" + member +
+                               "' to enum type " + type_name);
+    }
+  }
+
+  // Dotted non-enum message targets: TEXT payloads normalize through the
+  // shared proto-text helpers; modelled protos additionally decode their
+  // wire-format byte casts.
+  {
+    const std::string upper_path = ToUpper(type_name);
+    if (upper_path.find('.') != std::string::npos && !enum_target) {
+      if (val.IsNull()) { return Value(); }
+      if (val.type == ValueType::kVarChar || val.type == ValueType::kInt64 ||
+          val.type == ValueType::kDouble) {
+        const std::string raw =
+            val.type == ValueType::kVarChar ? std::string(val.value.varchar_value)
+                                            : val.AsString();
+        if (std::optional<std::string> decoded =
+                DecodeProtoWireBytes(type_name, raw);
+            decoded.has_value()) {
+          std::string wire_text = std::move(*decoded);
+          return Value(std::move(wire_text));
+        }
+        if (std::optional<std::string> normalized = NormalizeProtoText(raw);
+            normalized.has_value()) {
+          // Parseable TEXT payload (whitespace-only text yields the empty
+          // message ""): store the canonical form.
+          std::string payload = std::move(*normalized);
+          return Value(std::move(payload));
+        }
+        if (!LooksLikeProtoText(raw)) {
+          // Not proto-shaped text (plain strings, binary junk): store as-is.
+          std::string verbatim = raw;
+          return Value(std::move(verbatim));
+        }
+        if (!safe) {
+          throw std::runtime_error("invalid proto TEXT payload: " + raw);
+        }
+        return Value();
+      }
     }
   }
 

@@ -39,6 +39,7 @@
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/proto_text.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/sql_udf.hpp"
@@ -460,65 +461,9 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
   return true;
 }
 
-// Proto text format: repeated `field: value` entries separated by whitespace,
-// strings double-quoted.  A field occurring once yields a scalar; repeated
-// occurrences yield an array.
-bool ProtoTextExtractField(std::string_view text, std::string_view key,
-                           Value* out) {
-  std::vector<Value> matches;
-  size_t i = 0;
-  while (i < text.size()) {
-    while (i < text.size() &&
-           std::isspace(static_cast<unsigned char>(text[i]))) {
-      ++i;
-    }
-    size_t name_start = i;
-    while (i < text.size() && text[i] != ':') {
-      ++i;
-    }
-    if (i >= text.size()) {
-      break;
-    }
-    std::string_view field_name = text.substr(name_start, i - name_start);
-    ++i;  // skip ':'
-    while (i < text.size() &&
-           std::isspace(static_cast<unsigned char>(text[i]))) {
-      ++i;
-    }
-    size_t value_begin = i;
-    size_t value_end;
-    if (i < text.size() && text[i] == '"') {
-      ++i;
-      while (i < text.size() && text[i] != '"') {
-        if (text[i] == '\\' && i + 1 < text.size()) {
-          ++i;
-        }
-        ++i;
-      }
-      value_end = std::min(text.size(), i + 1);
-      i = value_end;
-    } else {
-      while (i < text.size() &&
-             !std::isspace(static_cast<unsigned char>(text[i]))) {
-        ++i;
-      }
-      value_end = i;
-    }
-    if (IdentifierEquals(field_name, key)) {
-      matches.push_back(
-          ScalarFromText(text.substr(value_begin, value_end - value_begin)));
-    }
-  }
-  if (matches.empty()) {
-    return false;
-  }
-  if (matches.size() == 1) {
-    *out = std::move(matches[0]);
-  } else {
-    *out = Value::Array(std::move(matches), InferElementSqlType(matches));
-  }
-  return true;
-}
+// Proto text field reads (scalar / repeated / nested / has_ pseudo fields,
+// DATE/TIMESTAMP format annotations and enum defaults) live in the shared
+// expression-layer helper; see expression/proto_text.hpp.
 
 Value ResolveFieldPath(const Value& base,
                        const std::vector<std::string>& fields) {
@@ -533,7 +478,7 @@ Value ResolveFieldPath(const Value& base,
     }
     const std::string_view text(current.value.varchar_value);
     bool resolved = JsonExtractField(text, field, &current) ||
-                    ProtoTextExtractField(text, field, &current);
+                    TryProtoTextGetField(text, field, &current);
     if (!resolved) {
       throw std::runtime_error("field " + field + " not found");
     }
@@ -746,6 +691,20 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
         }
       }
       if (owned.empty()) {
+        // Relational-path scans (INSERT ... SELECT and other routes outside
+        // the QueryData rewriter) carry no per-column relation identity.
+        // When the alias names none of this scope's columns either, it still
+        // denotes the whole row as a struct.
+        bool names_a_column = false;
+        for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+          if (IdentifierEquals(schema.GetColumn(i).Name().name, name.name)) {
+            names_a_column = true;
+            break;
+          }
+        }
+        if (!names_a_column && schema.ColumnCount() > 0) {
+          return RowAsStructValue(*current->row, schema);
+        }
         continue;
       }
       Row aliased;
@@ -3795,6 +3754,104 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return elements[static_cast<size_t>(index)];
   }
+  if (name == "__proto_new") {
+    // NEW ProtoType(v1 AS f1, ...) / SELECT AS ProtoType: argument layout is
+    // (type_name, value1, field1, value2, field2, ...).  Builds the proto
+    // TEXT payload; required-field and enum-member violations throw.
+    if (arguments.empty() || arguments.size() % 2 != 1) {
+      throw std::runtime_error("__proto_new requires (type, v, f, ...)");
+    }
+    const std::string type_name = raw_str(arguments[0]);
+    std::vector<std::pair<std::string, Value>> fields;
+    fields.reserve(arguments.size() / 2);
+    for (size_t i = 1; i < arguments.size(); i += 2) {
+      fields.emplace_back(raw_str(arguments[i + 1]), arguments[i]);
+    }
+    return Value(ConstructProtoText(type_name, fields));
+  }
+  if (name == "__proto_set") {
+    // Dotted SET targets over proto TEXT columns: (payload, path, new_value).
+    // NULL payloads have no field structure to update.
+    if (arguments.size() != 3) {
+      throw std::runtime_error("__proto_set requires 3 arguments");
+    }
+    std::vector<std::string> path;
+    {
+      const std::string joined = raw_str(arguments[1]);
+      size_t start = 0;
+      while (true) {
+        const size_t dot = joined.find('.', start);
+        if (dot == std::string::npos) {
+          path.push_back(joined.substr(start));
+          break;
+        }
+        path.push_back(joined.substr(start, dot - start));
+        start = dot + 1;
+      }
+    }
+    // Resolve the type before the NULL check so error messages can name it.
+    const std::string type_name =
+        InferProtoTypeName(arguments[0].IsNull() ? std::string_view()
+                                                 : raw_str(arguments[0]),
+                           path);
+    if (arguments[0].IsNull()) {
+      throw std::runtime_error("Cannot set field of NULL `" +
+                               (type_name.empty() ? std::string("PROTO")
+                                                  : type_name) +
+                               "`");
+    }
+    const std::string payload = raw_str(arguments[0]);
+    ValidateEnumFieldValue(
+        type_name, path.empty() ? std::string() : path.back(), arguments[2]);
+    auto rewritten = ProtoTextSetField(payload, path, arguments[2], type_name);
+    return Value(rewritten.value_or(payload));
+  }
+  if (name == "__get_extension") {
+    // value.(pkg.Ext.field): reads the bracketed extension entry from a
+    // proto TEXT payload; NULL bases yield NULL.
+    if (arguments.size() != 2) {
+      throw std::runtime_error("__get_extension requires 2 arguments");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    const std::string base = raw_str(arguments[0]);
+    const std::string key = "[" + raw_str(arguments[1]) + "]";
+    Value out;
+    if (!TryProtoTextGetField(base, key, &out)) {
+      throw std::runtime_error("extension " + raw_str(arguments[1]) +
+                               " not found");
+    }
+    return out;
+  }
+  if (name == "unix_seconds" || name == "unix_millis" ||
+      name == "unix_micros" || name == "unix_date") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error(name + " requires one TIMESTAMP argument");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    const std::optional<int64_t> nanos =
+        ParseTimestampTextNanos(raw_str(arguments[0]));
+    if (!nanos.has_value()) {
+      throw std::runtime_error("invalid TIMESTAMP: " + raw_str(arguments[0]));
+    }
+    auto floor_div_unix = [](int64_t a, int64_t b) {
+      const int64_t q = a / b;
+      return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+    };
+    if (name == "unix_date") {
+      return Value(floor_div_unix(*nanos, 86400000000000LL));
+    }
+    if (name == "unix_seconds") {
+      return Value(floor_div_unix(*nanos, 1000000000LL));
+    }
+    if (name == "unix_millis") {
+      return Value(floor_div_unix(*nanos, 1000000LL));
+    }
+    return Value(floor_div_unix(*nanos, 1000LL));
+  }
   if (name == "__get_field_safe") {
     // Field access tolerating NULL bases / missing members (returns NULL);
     // used for dotted struct references inside DML predicates.
@@ -3806,6 +3863,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     std::string object = raw_str(arguments[0]);
     const std::string field_name = raw_str(arguments[1]);
+    Value proto_value;
+    if (TryProtoTextGetField(object, field_name, &proto_value)) {
+      return proto_value;
+    }
     if (object.size() < 2 || object.front() != '{' ||
         object.back() != '}') {
       return {};
@@ -3836,14 +3897,17 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     std::string s0 = raw_str(arguments[0]);
-    if (s0.empty()) {
-      return {};
-    }
     if (s0.find("\x18\x00") != std::string::npos ||
         (s0.size() >= 2 && s0[0] == '\x18')) {
       throw std::runtime_error("invalid datetime_micros in proto");
     }
     std::string field_name = raw_str(arguments[1]);
+    // Proto TEXT payloads (non-JSON) resolve through the shared extractor,
+    // which also supplies scalar defaults / has_ bits for absent fields.
+    Value proto_value;
+    if (TryProtoTextGetField(s0, field_name, &proto_value)) {
+      return proto_value;
+    }
     if (s0.starts_with("{") && s0.ends_with("}")) {
       std::string search_key = "\"" + field_name + "\":";
       size_t pos = s0.find(search_key);
@@ -8494,6 +8558,12 @@ std::vector<slot_t> RequiredColumns(const SelectStatement& statement,
         selects_star || std::ranges::any_of(referenced, [&](const auto& name) {
           if (name.name == "*") {
             return false;
+          }
+          // A bare reference naming this relation's qualifier (`s` for an
+          // aliased scan) is a whole-row struct read: keep every column.
+          if (name.schema.empty() &&
+              IdentifierEquals(name.name, candidate.schema)) {
+            return true;
           }
           // GoogleSQL identifiers are case-insensitive; references may also
           // qualify this relation by table name or any alias.  Over-
