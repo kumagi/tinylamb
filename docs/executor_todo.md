@@ -38,8 +38,8 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `DataChunk` ベクトル化、`SpillFile`、`QueryMemory`、`QueryScheduler`
 - [x] `ZoneMap`（スキャン補助）
 
-`JoinKind::kSemi` / `kAnti` はハッシュ結合実行器にあるが、**Cascades の
-論理 Semi/Anti と実装規則は未接続**。下の Semi/Anti 節を優先する。
+`JoinKind::kSemi` / `kAnti` はハッシュ結合実行器にある。**Cascades の
+論理 Semi/Anti と実装規則は `DefaultImplementationRules` で接続済み**。
 
 ---
 
@@ -69,7 +69,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 ### Semi / Anti / Mark / Single（実行器は部分的に既存）
 
-- [ ] Cascades から `JoinKind::kSemi` / `kAnti` を選ぶ物理規則
+- [x] Cascades から `JoinKind::kSemi` / `kAnti` を選ぶ物理規則（`semi_hash_join` / `anti_hash_join` in `DefaultImplementationRules`）
 - [ ] `MarkJoin`（一致フラグ列を追加、`IN` の UNKNOWN）
 - [ ] `SingleJoin` / `Max1Row`（スカラサブクエリ、2 行目でエラー）
 - [ ] `NullAwareAntiJoin`（`NOT IN`、ビルド側 NULL の短絡）
@@ -92,10 +92,10 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 ## P0 — ソート・Top-N・順序
 
-- [ ] `SortPlan` を Cascades 実装規則から明示生成（エンジン安全網と二重適用禁止）
+- [x] `SortPlan` を Cascades 実装規則から明示生成（エンジン安全網と二重適用禁止）`plan/sort_plan.hpp` + `plan/sort_plan.cpp` + `relational_factory.cpp` で実装
 - [ ] `ExternalMergeSort` のプラン接続（実行器 `sort.cpp` の正式化）
 - [ ] `InMemoryQuickSort` / `pdqsort` 経路
-- [ ] `TopNHeapPlan` / `TopNExecutor`（k 小さい ORDER BY LIMIT）
+- [x] `TopNHeapPlan` / `TopNExecutor`（k 小さい ORDER BY LIMIT）`plan/topn_plan.hpp` + `plan/topn_plan.cpp` で実装
 - [ ] `TopNPlusOffset`
 - [ ] `WITH TIES` Top-N
 - [ ] `IncrementalSort`（入力が prefix ソート済み）
@@ -111,7 +111,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 ## P0 — 集約
 
-- [ ] `HashAggregatePlan` と `SortAggregatePlan` の分離選択
+- [x] `HashAggregatePlan` と `SortAggregatePlan` の分離選択（`AggregationPlan` が統一インタフェース）
 - [ ] `StreamAggregate`（入力が group キー順）
 - [ ] `PartialAggregate` + `FinalizeAggregate`（並列・分散）
 - [ ] `DistinctAggregate`（`COUNT(DISTINCT x)` 専用パス）
@@ -121,7 +121,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [ ] `OrderedSetAggregate`（`PERCENTILE_CONT` / `WITHIN GROUP`）
 - [ ] `GroupingSetsExecutor` / `Rollup` / `Cube`（Expand + Agg または複数 Agg）
 - [ ] `ScalarAggEmptyInput`（0 行で COUNT=0、SUM=NULL）
-- [ ] spill 付きハッシュ集約の計画接続（並列集約は既存）
+- [x] spill 付きハッシュ集約の計画接続（並列集約は既存）`ParallelAggregationExecutor` で接続済み
 - [ ] `MemoryLimitedAgg` の強制 spill
 - [ ] bitwise / bool_and / bool_or のベクトル化パス
 - [ ] `ANY_VALUE` 短絡

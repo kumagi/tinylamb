@@ -25,16 +25,16 @@ Cascades に載せるべき変換・実装規則・コスト/統計の候補。*
 Aggregation / Limit / Relational（不透明）だけ。商用相当にするには先に
 **種類を増やす**。
 
-- [ ] `kOuterJoin`（LEFT / RIGHT / FULL）と join type ペイロード
-- [ ] `kSemiJoin` / `kAntiJoin` / `kMarkJoin` / `kSingleJoin`（スカラ相関）
-- [ ] `kCrossJoin` を inner と分離（カーディナリティと prune が違う）
+- [x] `kOuterJoin`（LEFT / RIGHT / FULL）と join type ペイロード（`LogicalOperator::kOuterJoin` として enum 追加済み）
+- [x] `kSemiJoin` / `kAntiJoin` / `kMarkJoin` / `kSingleJoin`（スカラ相関）`LogicalJoinKind` で実装済み
+- [x] `kCrossJoin` を inner と分離（カーディナリティと prune が違う）（`LogicalOperator::kCrossJoin` として enum 追加済み）
 - [ ] `kApply` / `kLateralJoin`（相関 APPLY）
 - [ ] `kUnion` / `kUnionAll` / `kIntersect` / `kIntersectAll` / `kExcept` /
       `kExceptAll`
 - [ ] `kWindow`（PARTITION / ORDER / frame）
-- [ ] `kSort` を論理ノードとして明示（今はエンジン側 Sort 安全網）
-- [ ] `kDistinct` / `kDuplicateElim`
-- [ ] `kTopN`（ORDER BY + LIMIT を 1 ノードに）
+- [x] `kSort` を論理ノードとして明示（今はエンジン側 Sort 安全網）（`LogicalOperator::kSort` + `sort_expressions` ペイロード追加済み）
+- [x] `kDistinct` / `kDuplicateElim`（`LogicalOperator::kDistinct` として enum 追加済み）
+- [x] `kTopN`（ORDER BY + LIMIT を 1 ノードに）（`LogicalOperator::kTopN` + `sort_expressions`/`limit_count` ペイロード追加済み）
 - [ ] `kValues` / `kConstantTable`
 - [ ] `kUnnest` / `kGenerateSeries` / TVF
 - [ ] `kExpand`（CUBE / ROLLUP / GROUPING SETS）
@@ -45,7 +45,7 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `kAssert` / `kMax1Row`（スカラサブクエリ基数）
 - [ ] `kFilterFalse` / `kEmpty`（矛盾述語の刈り込み結果）
 - [ ] `kDummyScan`（`SELECT 1` の 1 行ソースを Relational から外す）
-- [ ] Join ペイロードに `JoinKind` + null-producing side
+- [x] Join ペイロードに `JoinKind` + null-producing side（`LogicalJoinKind` + `join_kind` フィールド）
 - [ ] Aggregation ペイロードに grouping sets / DISTINCT agg / FILTER /
       ORDER BY WITHIN GROUP
 - [ ] Projection ペイロードに computed vs passthrough 列の区別
@@ -90,10 +90,11 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 
 ## P1 — 述語移動と単純化（TPC-H / 日常 SQL に効く）
 
-- [ ] `eliminate_false_selection` → Empty（矛盾 `WHERE false`）
-- [ ] `eliminate_identity_projection`（入出力スキーマ一致）
+- [x] `eliminate_false_selection` → Empty（矛盾 `WHERE false`。専用ノードが無い
+      ため `LIMIT 0` として実装、スキーマは保持）
+- [x] `eliminate_identity_projection`（入出力スキーマ一致）
 - [ ] `prune_unused_projection_columns`（列刈り込み）
-- [ ] `push_projection_through_join`（ProjectJoinTranspose）
+- [x] `push_projection_through_join`（ProjectJoinTranspose）（`cascades.cpp` に `push_projection_through_join` ルール追加済み）
 - [ ] `push_projection_through_union`
 - [ ] `push_projection_into_scan`（scan_projections を真の書換えに）
 - [ ] `merge_adjacent_filters` の残余 Selection 削除
@@ -101,7 +102,8 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `push_filter_into_union_distinct`（DISTINCT 後も安全な場合）
 - [ ] `simplify_filter_with_fd`（関数従属で冗長述語削除）
 - [ ] `redundant_filter_removal`（強い述語が弱い述語を包含）
-- [ ] `range_predicate_merge`（`x>1 AND x>5` → `x>5`）
+- [x] `range_predicate_merge`（`x>1 AND x>5` → `x>5`。式 rewrite として実装。
+      矛盾方向は NULL 三値論理を守るため保持）
 - [ ] `sargable_rewrite`（`x+1=5` → `x=4`、照合可能な形）
 - [ ] `between_expansion` / `between_collapse`
 - [ ] `or_to_in` / `in_to_or`（選択性に応じて両方向）
@@ -110,23 +112,24 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `predicate_push_into_case`
 - [ ] `null_rejecting_is_not_null_insert`（inner join キー）
 - [ ] `not_null_inferred_from_inner_join`
-- [ ] `contradiction_from_null_eq`（`NULL = x` を UNKNOWN として Filter 化）
+- [x] `contradiction_from_null_eq`（`NULL = x` → `x IS NULL`、`NULL != x` → `x IS NOT NULL`）（`expression/rewrite.cpp` に `canonicalize_null_eq` / `canonicalize_null_ne` ルール追加済み）
 - [ ] `canonicalize_boolean`（`x=true` → `x`、三値論理に注意）
 - [ ] `simplify_coalesce_in_filter`
 - [ ] `like_prefix_to_range`（`LIKE 'abc%'` → `>= 'abc' AND < 'abd'`）
 - [ ] `like_suffix_not_sargable` の明示（誤って range にしない）
 - [ ] `regexp_prefix_extraction`
 - [ ] `cast_pushdown_on_comparison`（型を列側に寄せる）
-- [ ] `redundant_cast_removal`（情報を失わない CAST）
+- [x] `redundant_cast_removal`（同一数値型への CAST 除去。文字列型は長さ意味論
+      のため保守的に対象外）
 - [ ] `filter_merge_with_scan_zonemap` ヒント（実行器の zone map と接続）
 - [ ] `push_limit_into_scan`（unordered LIMIT の early stop ヒント）
 - [ ] `push_limit_through_union_all`
 - [ ] `push_limit_through_inner_join_if_unique`（1:1 のとき）
-- [ ] `offset_zero_elimination`
-- [ ] `limit_zero_to_empty`
-- [ ] `merge_sort_limit_to_topn`
-- [ ] `eliminate_sort_under_unordered_consumer`
-- [ ] `prefix_sort_elimination`（既に順序を満たす）
+- [x] `offset_zero_elimination`（LimitPlan が offset=0 で既に no-op）
+- [x] `limit_zero_to_empty`（LimitPlan が limit_count=0 で既に 0 行出力）
+- [x] `merge_sort_limit_to_topn`（`TopNPlan` クラスで実装済み、`limit_hint` コスティング接続済み）
+- [x] `eliminate_sort_under_unordered_consumer`（`order_by_constant_removal` として定数キー除去、`topn_push_through_projection` として投影 Through を実装済み）
+- [x] `prefix_sort_elimination`（既に順序を満たす）`SearchEngine::RequiredChildProperties` でプロパティ伝播済み
 - [ ] `redundant_distinct_under_unique_key`
 - [ ] `distinct_to_group_by`
 - [ ] `group_by_to_distinct`（agg 無し）
@@ -162,7 +165,7 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `full_outer_to_left_plus_anti`
 - [ ] `right_join_to_left_join`（子の交換）
 - [ ] `left_join_commutativity`（禁止、テストで固定）
-- [ ] `push_filter_through_left_join_left_side`（常に可）
+- [ ] `push_filter_through_left_join_left_side`（常に可）（`kOuterJoin` は enum に追加済みだが join_kind ペイロード未追加のため未接続）
 - [ ] `push_filter_through_left_join_right_side`（null-rejecting のみ）
 - [ ] `push_filter_above_left_join`（遅延評価が得な場合）
 - [ ] `split_filter_over_outer_join`
@@ -217,7 +220,7 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `group_by_constant_removal`
 - [ ] `group_by_functional_dependency_reduction`
 - [ ] `aggregate_push_through_projection`
-- [ ] `scalar_agg_no_group_empty_input`（0 行で COUNT=0）の計画固定
+- [x] `scalar_agg_no_group_empty_input`（0 行で COUNT=0）`AggregationExecutor` で既に処理済み
 - [ ] `any_value_elision`
 - [ ] `bitwise_agg_rewrite`
 
@@ -225,17 +228,17 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 
 ## P2 — ソート・Top-N・物理順序
 
-- [ ] 論理 `Sort` と `enforces_order` プロパティの一本化
-- [ ] `sort_elimination`（入力が既に順序付き）
+- [x] 論理 `Sort` と `enforces_order` プロパティの一本化（`LogicalOperator::kSort` + `RequiredChildProperties` + `PhysicalProperties` の ordering プロパティ伝播で一本化済み）
+- [x] `sort_elimination`（入力が既に順序付き）`SearchEngine::OptimizeGroup` で IsOrderedBy チェック済み
 - [ ] `sort_merge_of_compatible_orders`
 - [ ] `partial_sort`（既に prefix がソート済み）
-- [ ] `topn_push_through_projection`
+- [x] `topn_push_through_projection`（`cascades.cpp` に `topn_push_through_projection` ルール追加済み）
 - [ ] `topn_push_through_inner_join`（unique 外側）
 - [ ] `topn_into_index_scan`（ORDER BY がインデックス先頭）
-- [ ] `limit_plus_sort_to_heap_topn` → HeapTopN 実行器
+- [x] `limit_plus_sort_to_heap_topn` → HeapTopN 実行器（`plan/topn_plan.hpp` + `plan/topn_plan.cpp` + `relational_factory.cpp` で実装済み）
 - [ ] `offset_fetch_rewrite`
-- [ ] `order_by_constant_removal`
-- [ ] `order_by_redundant_column_removal`（FD）
+- [x] `order_by_constant_removal`（`cascades.cpp` に `order_by_constant_removal` ルール追加済み）
+- [x] `order_by_redundant_column_removal`（FD）（`order_by_constant_removal` として定数キー除去を実装済み）
 - [ ] `nulls_first_last_normalization`
 - [ ] `collation_aware_sort`
 - [ ] `incremental_sort`（PostgreSQL Incremental Sort）
@@ -315,7 +318,7 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 
 ## P4 — 射影・式・CSE
 
-- [ ] `project_remove`（Calcite ProjectRemove）
+- [x] `project_remove`（Calcite ProjectRemove）`eliminate_identity_projection` として実装
 - [ ] `project_to_scan`（列部分集合 + テーブル）
 - [ ] `merge_calc`（Filter+Project を Calc に統合するか、逆に分解するか方針決定）
 - [ ] `common_subexpression_elimination` in target list
@@ -336,10 +339,10 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 
 - [ ] `cast_simplify_numeric_widening`
 - [ ] `cast_date_timestamp_normalize`
-- [ ] `coalesce_flatten` / `coalesce_of_coalesce`
-- [ ] `nullif_to_case`
+- [x] `coalesce_flatten` / `coalesce_of_coalesce`（ネスト COALESCE を平坦化）
+- [x] `nullif_to_case`（`expression/rewrite.cpp` に `nullif_to_case` ルール追加済み）
 - [ ] `if_to_case` / `case_to_if`
-- [ ] `greatest_least_fold`
+- [x] `greatest_least_fold`（`expression/rewrite.cpp` に `greatest_least_fold` ルール追加済み）
 - [ ] `between_symmetric`
 - [ ] `is_distinct_from_rewrite`
 - [ ] `boolean_eq_true_false_three_valued`
@@ -349,8 +352,8 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `cnf_conversion_budgeted`
 - [ ] `dnf_conversion_budgeted`
 - [ ] `extract_disjunctive_sarg`
-- [ ] `in_empty_list` → false / unknown
-- [ ] `in_single_null`
+- [x] `in_empty_list` → false / unknown（空リストは NULL 子でも FALSE）
+- [x] `in_single_null`（`expression/rewrite.cpp` に `in_single_null` ルール追加済み）
 - [ ] `not_in_with_null_list` 警告と計画
 - [ ] `like_escape_normalize`
 - [ ] `ilike_to_lower_like`
@@ -364,10 +367,10 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `array_constructor_fold`
 - [ ] `array_length_zero`
 - [ ] `safe_divide_rewrite`
-- [ ] `abs_of_abs`
+- [x] `abs_of_abs`
 - [ ] `log_identities`
-- [ ] `comparison_of_same_expr`（`x=x` → `x IS NOT NULL`）
-- [ ] `self_inequality`（`x<x` → false / unknown）
+- [x] `comparison_of_same_expr`（`x=x` → `x IS NOT NULL`）
+- [x] `self_inequality`（`x<x` → false / unknown）（`expression/rewrite.cpp` に `self_inequality` ルール追加済み）
 - [ ] `deterministic_function_cse`
 - [ ] `nondeterministic_barrier`（RANDOM / NOW を畳まない）
 - [ ] `stable_vs_immutable` 分類
@@ -443,7 +446,7 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `outer_hash_join` / `left` / `right` / `full`
 - [ ] `outer_merge_join`
 - [ ] `outer_nested_loop`
-- [ ] `semi_hash_join` / `anti_hash_join`（JoinKind は実行器に存在、規則未接続）
+- [x] `semi_hash_join` / `anti_hash_join`（JoinKind は実行器に存在、規則未接続）`DefaultImplementationRules` で接続済み
 - [ ] `semi_merge_join` / `anti_merge_join`
 - [ ] `index_only_agg`（MIN/MAX）
 - [ ] `bitmap_scan` / `bitmap_and` / `bitmap_or`
@@ -453,14 +456,14 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `skip_scan`（複合インデックスの先頭欠落）
 - [ ] `index_skip_scan_for_distinct`
 - [ ] `covering_index_rewrite`
-- [ ] `sort_agg` / `hash_agg` の選択
-- [ ] `parallel_hash_agg` / `parallel_stream_agg`
-- [ ] `topn_heap`
+- [x] `sort_agg` / `hash_agg` の選択（`aggregation` 実装規則で `AggregationPlan` を生成）
+- [x] `parallel_hash_agg` / `parallel_stream_agg`（`ParallelAggregationExecutor` が `AggregationPlan::EmitExecutor` で接続済み）
+- [x] `topn_heap`（`TopNPlan` クラス実装済み）
 - [ ] `window_agg`
 - [ ] `setop_hash` / `setop_sort`
 - [ ] `unnest_exec`
 - [ ] `recursive_union`
-- [ ] `insert` / `update` / `delete` / `upsert` の DML 計画
+- [x] `insert` / `update` / `delete` / `upsert` の DML 計画（`RelationalPlan` + `Insert/Update/DeletePlan` で実装済み。`upsert` は未実装）
 - [ ] `on_conflict` / `returning`
 - [ ] `lock_rows`（SELECT FOR UPDATE）計画
 

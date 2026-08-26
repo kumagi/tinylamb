@@ -356,6 +356,8 @@ tinylamb_add_layer(tinylamb_executor
         plan/optimizer.cpp
         plan/cascades.cpp
         plan/limit_plan.cpp
+        plan/sort_plan.cpp
+        plan/topn_plan.cpp
         plan/relation_rename_plan.cpp
         plan/implementation_rules.cpp
         plan/index_only_scan_plan.cpp

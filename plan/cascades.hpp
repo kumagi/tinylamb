@@ -40,10 +40,20 @@ enum class LogicalOperator {
   kProjection,
   kAggregation,
   kLimit,
+  kSort,       // Logical sort node (ORDER BY).
+  kTopN,       // ORDER BY + LIMIT combined (heap top-N).
+  kOuterJoin,  // LEFT / RIGHT / FULL outer join.
+  kCrossJoin,  // Cross join (no predicate, distinct from inner).
+  kDistinct,   // Duplicate elimination (SELECT DISTINCT).
   // Opaque relational IR (outer/semi/anti joins, subqueries and CTEs). The
   // memo can cost/select it while its internal lowering remains specialized.
   kRelational,
 };
+
+// Join semantics carried by a kJoin logical expression (D-payload). The
+// plan layer mirrors the executor's JoinKind because plan must not depend on
+// the executor header; implementation rules map the two at planning time.
+enum class LogicalJoinKind : uint8_t { kInner, kSemi, kAnti };
 
 // One logical expression inside a memo group. `predicate` carries the
 // Selection predicate or the Join condition; `target_list` carries the
@@ -58,6 +68,12 @@ struct LogicalExpression {
   std::vector<NamedExpression> target_list{};
   size_t limit_count{0};
   size_t limit_offset{0};
+  // Sort key expressions for kSort and kTopN.
+  std::vector<Expression> sort_expressions;
+  std::vector<bool> sort_ascending;
+  // Join semantics for kJoin / kOuterJoin expressions: semi/anti joins emit
+  // only the left child's rows and must never flow through inner-only rewrites.
+  LogicalJoinKind join_kind{LogicalJoinKind::kInner};
   std::shared_ptr<const SelectStatement> relational_statement{};
   Schema output_schema{};
 
@@ -116,6 +132,11 @@ class Memo {
   // joins through this helper; it guarantees each conjunct is applied exactly
   // once on every root-to-leaf path.
   [[nodiscard]] LogicalExpression NewJoin(GroupId left, GroupId right) const;
+  // Semi/anti variant: same conjunct bookkeeping as NewJoin, but the payload
+  // records that only the left side survives. The condition still comes from
+  // the stored conjuncts so each one keeps being applied exactly once.
+  [[nodiscard]] LogicalExpression NewJoin(GroupId left, GroupId right,
+                                          LogicalJoinKind kind) const;
   // Merges `predicate` into a single-relation group's scan filter (used by
   // pushdown rules); idempotent through conjunct canonicalization.
   void MergeScanFilter(GroupId group, const Expression& predicate);
@@ -239,6 +260,18 @@ inline Pattern Aggregation(Pattern child = Any(), std::string capture = {}) {
 }
 inline Pattern Limit(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kLimit, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern Sort(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kSort, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern TopN(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kTopN, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern Distinct(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kDistinct, {std::move(child)},
                      std::move(capture));
 }
 }  // namespace dsl

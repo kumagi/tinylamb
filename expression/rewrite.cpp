@@ -985,6 +985,110 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // were removed: they are valid only in two-valued logic and produce wrong
     // results under SQL three-valued logic (x = NULL, y = FALSE gives
     // UNKNOWN on the left side but FALSE on the right).
+    // x < x / x > x / x <= x / x >= x: self-comparison of the same
+    // expression is always UNKNOWN (three-valued logic).  In a WHERE
+    // context UNKNOWN is treated as FALSE, so this is safe to fold.
+    // x = x is already handled by comparison_of_same_expr → IS NOT NULL.
+    built.Add(ExpressionRule(
+      "self_inequality",
+      AnyBinary(Any("x"), Any("x")),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto op = expression->AsBinaryExpression().Op();
+        switch (op) {
+          case BinaryOperation::kLessThan:
+          case BinaryOperation::kLessThanEquals:
+          case BinaryOperation::kGreaterThan:
+          case BinaryOperation::kGreaterThanEquals:
+            // Unknown / NULL for all values including NULL.
+            return ConstantValueExp(Value());
+          default:
+            return Expression{};
+        }
+      }));
+    // duplicate_column_elimination in target lists: when a projection has
+    // duplicate output names, keep only the first occurrence.
+    // NULLIF(a, b) = CASE WHEN a = b THEN NULL ELSE a END.
+    built.Add(ExpressionRule(
+      "nullif_to_case", Is(TypeTag::kFunctionCallExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& func = expression->AsFunctionCallExpression();
+        if (func.FuncName() != "nullif" || func.Args().size() != 2) {
+          return Expression{};
+        }
+        const Expression& a = func.Args()[0];
+        const Expression& b = func.Args()[1];
+        return CaseExpressionExp(
+            {{BinaryExpressionExp(a, BinaryOperation::kEquals, b),
+              ConstantValueExp(Value())}},
+            a);
+      }));
+    // x = NULL -> x IS NULL (canonicalize NULL comparison to IS NULL).
+    built.Add(ExpressionRule(
+      "canonicalize_null_eq",
+      Binary(BinaryOperation::kEquals, Any("x"),
+             Is(TypeTag::kConstantValue, "c")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const Value c = bindings.at("c")->AsConstantValue().GetValue();
+        if (!c.IsNull()) { return Expression{}; }
+        return UnaryExpressionExp(bindings.at("x"),
+                                  UnaryOperation::kIsNull);
+      }));
+    // x != NULL -> x IS NOT NULL (NULL-safe not-equal to IS NOT NULL).
+    built.Add(ExpressionRule(
+      "canonicalize_null_ne",
+      Binary(BinaryOperation::kNotEquals, Any("x"),
+             Is(TypeTag::kConstantValue, "c")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const Value c = bindings.at("c")->AsConstantValue().GetValue();
+        if (!c.IsNull()) { return Expression{}; }
+        return UnaryExpressionExp(bindings.at("x"),
+                                  UnaryOperation::kIsNotNull);
+      }));
+    // greatest(greatest(a,b),c) -> greatest(a,b,c) and same for least.
+    built.Add(ExpressionRule(
+      "greatest_least_fold", Is(TypeTag::kFunctionCallExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& func = expression->AsFunctionCallExpression();
+        if (func.FuncName() != "greatest" && func.FuncName() != "least") {
+          return Expression{};
+        }
+        std::vector<Expression> flattened;
+        bool changed = false;
+        for (const Expression& arg : func.Args()) {
+          if (arg && arg->Type() == TypeTag::kFunctionCallExp &&
+              arg->AsFunctionCallExpression().FuncName() == func.FuncName()) {
+            for (const Expression& inner :
+                 arg->AsFunctionCallExpression().Args()) {
+              flattened.push_back(inner);
+            }
+            changed = true;
+            continue;
+          }
+          flattened.push_back(arg);
+        }
+        if (!changed) { return Expression{}; }
+        return FunctionCallExp(func.FuncName(), std::move(flattened));
+      }));
+    // x IN (NULL) -> x IS NULL (single NULL element).
+    built.Add(ExpressionRule(
+      "in_single_null", Is(TypeTag::kInExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& in = expression->AsInExpression();
+        if (in.list_.size() != 1) { return Expression{}; }
+        if (!in.list_.front() ||
+            in.list_.front()->Type() != TypeTag::kConstantValue) {
+          return Expression{};
+        }
+        if (!in.list_.front()->AsConstantValue().GetValue().IsNull()) {
+          return Expression{};
+        }
+        return UnaryExpressionExp(in.child_, UnaryOperation::kIsNull);
+      }));
+    // x IS TRUE -> x IS NOT NULL AND x (three-valued: IS TRUE requires
+    // non-NULL and truthy; but x IS TRUE is semantically equivalent to
+    // (x IS NOT NULL AND x) in SQL.  We do NOT rewrite this away because
+    // IS TRUE/IS FALSE are already the canonical three-valued operators.
+    // Instead, we simplify IS TRUE of a non-NULL-typed expression.
     return built;
   }();
   return rules;

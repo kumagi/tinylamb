@@ -7,6 +7,7 @@
 #include <ranges>
 #include <sstream>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 #include <stdexcept>
 
@@ -17,7 +18,13 @@
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "gtest/gtest.h"
+#include "plan/implementation_rules.hpp"
+#include "plan/product_plan.hpp"
+#include "plan/relational_plan.hpp"
+#include "query/statement.hpp"
+#include "type/column.hpp"
 #include "type/column_name.hpp"
+#include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb::cascades {
@@ -739,6 +746,160 @@ TEST(CascadesTest, InferJoinPredicatesCopiesConstantsAcrossEquals) {
   ASSERT_TRUE(b.filter);
   EXPECT_NE(b.filter->ToString().find("b.y"), std::string::npos);
   EXPECT_NE(b.filter->ToString().find("1"), std::string::npos);
+}
+
+namespace {
+
+using dsl::Scan;
+
+// Schema-carrying opaque plan so join implementation rules can run without
+// catalog tables; only GetSchema()/stats are consulted during costing.
+Plan StubLeafPlan(ColumnName key) {
+  return std::make_shared<RelationalPlan>(
+      std::make_shared<SelectStatement>(std::vector<NamedExpression>{},
+                                        std::vector<std::string>{},
+                                        Expression()),
+      Schema("", std::vector<Column>{Column(std::move(key))}));
+}
+
+// Implements scan groups "a"/"b" with the given stubs and also includes
+// the default semi/anti join implementation rules so that join groups can
+// be optimized end-to-end.
+ImplementationRuleSet RulesWithStubLeaves(Plan left_stub, Plan right_stub) {
+  ImplementationRuleSet rules;
+  rules.Add(ImplementationRule(
+      "stub_scan", Scan("scan"),
+      [left_stub, right_stub](GroupId, const Memo&, const Bindings&,
+                              const LogicalExpression& logical,
+                              const std::vector<BestPlan>&,
+                              const PhysicalProperties&, const RuleContext&) {
+        if (logical.table == "a") {
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = left_stub, .local_cost = 1,
+                              .estimated_rows = 10}};
+        }
+        if (logical.table == "b") {
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = right_stub, .local_cost = 1,
+                              .estimated_rows = 10}};
+        }
+        return std::vector<PlanAlternative>{};
+      },
+      LogicalOperator::kScan));
+  // Include default join-family implementation rules so the optimizer can
+  // select hash/semi/anti join strategies.  Scan/projection/aggregation/
+  // limit rules are excluded because they require catalog context that
+  // these tests do not provide.
+  static const std::unordered_set<std::string> kJoinRules = {
+      "hash_join",    "semi_hash_join", "anti_hash_join",
+      "index_join",   "nested_loop_join"};
+  for (const auto& rule : DefaultImplementationRules().Rules()) {
+    if (kJoinRules.contains(rule.Name())) {
+      rules.Add(rule);
+    }
+  }
+  return rules;
+}
+
+// Builds {a} ⋈ {b} on a.x = b.y with the requested membership semantics.
+// Uses a single Build call so the relation index stays consistent.
+GroupId BuildMembershipJoin(Memo& memo, LogicalJoinKind kind,
+                            Expression extra_conjunct = nullptr) {
+  const GroupId root = memo.Build({"a", "b"});
+  // Extract the two scan child groups from the initial join expression.
+  const Group& root_group = memo.Get(root);
+  EXPECT_EQ(root_group.expressions.size(), 1U);
+  const GroupId left = root_group.expressions[0].children[0];
+  const GroupId right = root_group.expressions[0].children[1];
+  const GroupId join_group =
+      memo.EnsureDerivedGroup({"a", "b"}, "membership-join");
+  LogicalExpression join = memo.NewJoin(left, right, kind);
+  join.predicate = BinaryExpressionExp(
+      ColumnValueExp("a.x"), BinaryOperation::kEquals, ColumnValueExp("b.y"));
+  if (extra_conjunct) {
+    join.predicate = BinaryExpressionExp(*join.predicate,
+                                         BinaryOperation::kAnd,
+                                         extra_conjunct);
+  }
+  EXPECT_TRUE(memo.AddExpression(join_group, join));
+  return join_group;
+}
+
+}  // namespace
+
+TEST(CascadesTest, SemiHashJoinImplementationRuleChoosesSemiKind) {
+  Memo memo;
+  const GroupId root = BuildMembershipJoin(memo, LogicalJoinKind::kSemi);
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(root);
+
+  std::optional<BestPlan> best =
+      search.Optimize(root, PhysicalProperties{},
+                      RulesWithStubLeaves(StubLeafPlan(ColumnName("a", "x")),
+                                          StubLeafPlan(ColumnName("b", "y"))));
+
+  ASSERT_TRUE(best.has_value());
+  // Semi joins keep only the probe side's columns.
+  EXPECT_NE(best->plan->ToString().find("Semi Join"), std::string::npos);
+  EXPECT_EQ(best->plan->GetSchema().ColumnCount(), 1U);
+}
+
+TEST(CascadesTest, AntiHashJoinImplementationRuleChoosesAntiKind) {
+  Memo memo;
+  const GroupId root = BuildMembershipJoin(memo, LogicalJoinKind::kAnti);
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(root);
+
+  std::optional<BestPlan> best =
+      search.Optimize(root, PhysicalProperties{},
+                      RulesWithStubLeaves(StubLeafPlan(ColumnName("a", "x")),
+                                          StubLeafPlan(ColumnName("b", "y"))));
+
+  ASSERT_TRUE(best.has_value());
+  EXPECT_NE(best->plan->ToString().find("Anti Join"), std::string::npos);
+  EXPECT_EQ(best->plan->GetSchema().ColumnCount(), 1U);
+}
+
+TEST(CascadesTest, MembershipJoinRulesRejectResidualConjuncts) {
+  // A non-equality conjunct cannot be re-applied above a membership join
+  // without changing semantics, so no physical alternative may be offered.
+  Memo memo;
+  const GroupId root = BuildMembershipJoin(
+      memo, LogicalJoinKind::kSemi,
+      BinaryExpressionExp(ColumnValueExp("a.x"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(1))));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(root);
+
+  std::optional<BestPlan> best =
+      search.Optimize(root, PhysicalProperties{},
+                      RulesWithStubLeaves(StubLeafPlan(ColumnName("a", "x")),
+                                          StubLeafPlan(ColumnName("b", "y"))));
+  EXPECT_FALSE(best.has_value());
+}
+
+TEST(CascadesTest, InnerRulesSkipMembershipJoins) {
+  // Commutativity must not swap semi/anti children: only the left side
+  // survives, so the memo must not derive an inner-style swapped expression.
+  Memo memo;
+  const GroupId root = BuildMembershipJoin(memo, LogicalJoinKind::kSemi);
+  SearchEngine search(std::move(memo), RuleSet::Default());
+
+  search.Explore(root);
+
+  for (const LogicalExpression& expression :
+       search.GetMemo().Get(root).expressions) {
+    if (expression.operation == LogicalOperator::kJoin) {
+      EXPECT_EQ(expression.join_kind, LogicalJoinKind::kSemi);
+      EXPECT_EQ(expression.children.size(), 2U);
+    }
+  }
+}
+
+TEST(CascadesTest, DefaultImplementationRulesIncludeMembershipKinds) {
+  const ImplementationRuleSet& rules = DefaultImplementationRules();
+  EXPECT_TRUE(rules.Contains("semi_hash_join"));
+  EXPECT_TRUE(rules.Contains("anti_hash_join"));
 }
 
 }  // namespace tinylamb::cascades

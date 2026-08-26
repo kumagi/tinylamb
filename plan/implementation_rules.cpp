@@ -15,6 +15,7 @@
 #include "aggregation_plan.hpp"
 #include "common/constants.hpp"
 #include "executor/hash_join_mode.hpp"
+#include "executor/join_kind.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
@@ -27,6 +28,7 @@
 #include "index_only_scan_plan.hpp"
 #include "index_scan_plan.hpp"
 #include "limit_plan.hpp"
+#include "plan/sort_plan.hpp"
 #include "plan/cascades.hpp"
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
@@ -856,6 +858,74 @@ std::vector<PlanAlternative> JoinAlternatives(
   return candidates;
 }
 
+// Semi/anti hash join alternatives (executor P0): map the memo's semi/anti
+// join payload onto the existing HashJoin executor's JoinKind. Every conjunct
+// must be an equality across both sides -- residual predicates cannot be
+// re-applied above a membership join without changing semantics, so other
+// shapes stay on their existing decorrelation / relational paths.
+std::vector<PlanAlternative> SemiAntiJoinAlternatives(
+    const std::optional<Expression>& condition, const BestPlan& left,
+    const BestPlan& right, cascades::LogicalJoinKind kind) {
+  if (!condition) { return {};
+}
+  std::vector<std::pair<ColumnName, ColumnName>> equalities;
+  for (const Expression& conjunct : SplitConjuncts(*condition)) {
+    if (conjunct->Type() != TypeTag::kBinaryExp ||
+        conjunct->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+      return {};
+    }
+    const auto& binary = conjunct->AsBinaryExpression();
+    if (binary.Left()->Type() != TypeTag::kColumnValue ||
+        binary.Right()->Type() != TypeTag::kColumnValue) {
+      return {};
+    }
+    const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
+    const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
+    if (left.plan->GetSchema().Offset(lhs) >= 0 &&
+        right.plan->GetSchema().Offset(rhs) >= 0) {
+      equalities.emplace_back(lhs, rhs);
+    } else if (left.plan->GetSchema().Offset(rhs) >= 0 &&
+               right.plan->GetSchema().Offset(lhs) >= 0) {
+      equalities.emplace_back(rhs, lhs);
+    } else {
+      return {};
+    }
+  }
+  if (equalities.empty()) { return {};
+}
+  std::vector<ColumnName> left_columns;
+  std::vector<ColumnName> right_columns;
+  left_columns.reserve(equalities.size());
+  right_columns.reserve(equalities.size());
+  for (const auto& [left_column, right_column] : equalities) {
+    left_columns.push_back(left_column);
+    right_columns.push_back(right_column);
+  }
+  // Membership joins emit each probe row at most once: semi keeps matching
+  // rows (bounded by the smaller side), anti keeps unmatched rows.
+  const double l_rows = left.estimated_rows;
+  const double r_rows = right.estimated_rows;
+  const double estimate =
+      kind == cascades::LogicalJoinKind::kSemi ? std::min(l_rows, r_rows)
+                                               : l_rows;
+  const JoinKind exec_kind =
+      kind == cascades::LogicalJoinKind::kSemi ? SemiJoinKind() : AntiJoinKind();
+  std::vector<PlanAlternative> candidates;
+  for (const HashJoinMode mode :
+       {HashJoinMode::kInMemory, HashJoinMode::kHybrid}) {
+    Plan join = std::make_shared<ProductPlan>(
+        left.plan, left_columns, right.plan, right_columns, mode, exec_kind);
+    double local_cost = l_rows + r_rows;
+    const double build_bytes = r_rows * kHashJoinRowBytesEstimate;
+    if (mode == HashJoinMode::kInMemory && PreferHybridHashJoin(build_bytes)) {
+      local_cost += r_rows * 3;
+    }
+    candidates.push_back(PlanAlternative{
+        .plan=std::move(join), .local_cost=local_cost, .estimated_rows=estimate});
+  }
+  return candidates;
+}
+
 }  // namespace
 
 StatusOr<Plan> OptimizeSingleRelation(
@@ -1046,11 +1116,42 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
            const c::LogicalExpression& logical,
            const std::vector<BestPlan>& children,
            const PhysicalProperties& required, const c::RuleContext& context) {
-          if (children.size() != 2 || required.require_row_position) {
+          if (children.size() != 2 || required.require_row_position ||
+              logical.join_kind != c::LogicalJoinKind::kInner) {
             return std::vector<PlanAlternative>{};
           }
           return JoinAlternatives(memo, logical.children[1], logical.predicate, children[0], children[1],
                                   context, true, false, false);
+        },
+        c::LogicalOperator::kJoin));
+    built.Add(c::ImplementationRule(
+        "semi_hash_join", Join(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 2 || required.require_row_position ||
+              logical.join_kind != c::LogicalJoinKind::kSemi) {
+            return std::vector<PlanAlternative>{};
+          }
+          return SemiAntiJoinAlternatives(logical.predicate, children[0],
+                                          children[1],
+                                          c::LogicalJoinKind::kSemi);
+        },
+        c::LogicalOperator::kJoin));
+    built.Add(c::ImplementationRule(
+        "anti_hash_join", Join(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 2 || required.require_row_position ||
+              logical.join_kind != c::LogicalJoinKind::kAnti) {
+            return std::vector<PlanAlternative>{};
+          }
+          return SemiAntiJoinAlternatives(logical.predicate, children[0],
+                                          children[1],
+                                          c::LogicalJoinKind::kAnti);
         },
         c::LogicalOperator::kJoin));
     built.Add(c::ImplementationRule(
@@ -1059,7 +1160,8 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
            const c::LogicalExpression& logical,
            const std::vector<BestPlan>& children,
            const PhysicalProperties& required, const c::RuleContext& context) {
-          if (children.size() != 2 || required.require_row_position) {
+          if (children.size() != 2 || required.require_row_position ||
+              logical.join_kind != c::LogicalJoinKind::kInner) {
             return std::vector<PlanAlternative>{};
           }
           return JoinAlternatives(memo, logical.children[1], logical.predicate, children[0], children[1],
@@ -1072,7 +1174,8 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
            const c::LogicalExpression& logical,
            const std::vector<BestPlan>& children,
            const PhysicalProperties& required, const c::RuleContext& context) {
-          if (children.size() != 2 || required.require_row_position) {
+          if (children.size() != 2 || required.require_row_position ||
+              logical.join_kind != c::LogicalJoinKind::kInner) {
             return std::vector<PlanAlternative>{};
           }
           return JoinAlternatives(memo, logical.children[1], logical.predicate, children[0], children[1],

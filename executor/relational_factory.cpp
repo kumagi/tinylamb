@@ -32,6 +32,7 @@
 #include "executor/projection.hpp"
 #include "executor/relational.hpp"
 #include "executor/selection.hpp"
+#include "executor/sort.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "index/index.hpp"
@@ -47,6 +48,8 @@
 #include "plan/relation_rename_plan.hpp"
 #include "plan/relational_plan.hpp"
 #include "plan/selection_plan.hpp"
+#include "plan/sort_plan.hpp"
+#include "plan/topn_plan.hpp"
 #include "table/table.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -104,6 +107,30 @@ Executor ProjectionPlan::EmitExecutor(TransactionContext& ctx) const {
 
 Executor LimitPlan::EmitExecutor(TransactionContext& ctx) const {
   return std::make_shared<LimitExecutor>(src_->EmitExecutor(ctx), limit_count_,
+                                         limit_offset_);
+}
+
+Executor SortPlan::EmitExecutor(TransactionContext& ctx) const {
+  std::vector<SortExecutor::Key> keys;
+  keys.reserve(keys_.size());
+  for (size_t i = 0; i < keys_.size(); ++i) {
+    keys.push_back(SortExecutor::Key{.expression = keys_[i],
+                                     .ascending = ascending_[i]});
+  }
+  return std::make_shared<SortExecutor>(src_->EmitExecutor(ctx),
+                                        src_->GetSchema(), std::move(keys));
+}
+
+Executor TopNPlan::EmitExecutor(TransactionContext& ctx) const {
+  std::vector<SortExecutor::Key> keys;
+  keys.reserve(keys_.size());
+  for (size_t i = 0; i < keys_.size(); ++i) {
+    keys.push_back(SortExecutor::Key{.expression = keys_[i],
+                                     .ascending = ascending_[i]});
+  }
+  Executor sorted = std::make_shared<SortExecutor>(
+      src_->EmitExecutor(ctx), src_->GetSchema(), std::move(keys));
+  return std::make_shared<LimitExecutor>(std::move(sorted), limit_count_,
                                          limit_offset_);
 }
 

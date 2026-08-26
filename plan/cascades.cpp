@@ -233,8 +233,21 @@ std::string LogicalExpression::Fingerprint() const {
   for (const NamedExpression& item : target_list) {
     out << "#t:" << item.name << '=' << item.expression->ToString();
   }
+  if (operation == LogicalOperator::kJoin &&
+      join_kind != LogicalJoinKind::kInner) {
+    out << "#jk:" << static_cast<int>(join_kind);
+  }
   if (operation == LogicalOperator::kLimit) {
     out << "#l:" << limit_offset << ',' << limit_count;
+  }
+  if (operation == LogicalOperator::kSort ||
+      operation == LogicalOperator::kTopN) {
+    for (const Expression& key : sort_expressions) {
+      out << "#sk:" << key->ToString();
+    }
+    if (operation == LogicalOperator::kTopN) {
+      out << "#tl:" << limit_offset << ',' << limit_count;
+    }
   }
   if (operation == LogicalOperator::kRelational) {
     out << "#relational:" << static_cast<const void*>(relational_statement.get());
@@ -364,11 +377,17 @@ std::pair<std::vector<std::string>, std::vector<std::string>> ConnectedSplit(
 }  // namespace
 
 LogicalExpression Memo::NewJoin(GroupId left, GroupId right) const {
+  return NewJoin(left, right, LogicalJoinKind::kInner);
+}
+
+LogicalExpression Memo::NewJoin(GroupId left, GroupId right,
+                                LogicalJoinKind kind) const {
   LogicalExpression join{.operation = LogicalOperator::kJoin,
                          .children = {left, right}};
   const Expression condition = JoinConditionFor(Get(left), Get(right));
   if (condition) { join.predicate = condition;
 }
+  join.join_kind = kind;
   return join;
 }
 
@@ -481,7 +500,10 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
     case LogicalOperator::kSelection:
     case LogicalOperator::kProjection:
     case LogicalOperator::kAggregation:
-    case LogicalOperator::kLimit: {
+    case LogicalOperator::kLimit:
+    case LogicalOperator::kSort:
+    case LogicalOperator::kTopN:
+    case LogicalOperator::kDistinct: {
       if (expression.children.size() != 1) {
         throw std::invalid_argument("single-child logical operator");
       }
@@ -501,6 +523,30 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
           expression.target_list.empty()) {
         throw std::invalid_argument(
             "projection/aggregation needs a target list");
+      }
+      if (expression.operation == LogicalOperator::kSort &&
+          expression.sort_expressions.empty()) {
+        throw std::invalid_argument("sort needs sort key expressions");
+      }
+      if (expression.operation == LogicalOperator::kTopN &&
+          expression.sort_expressions.empty()) {
+        throw std::invalid_argument("topn needs sort key expressions");
+      }
+      break;
+    }
+    case LogicalOperator::kOuterJoin:
+    case LogicalOperator::kCrossJoin: {
+      if (expression.children.size() != 2) {
+        throw std::invalid_argument("join must have two child groups");
+      }
+      const Group& left = Get(expression.children[0]);
+      const Group& right = Get(expression.children[1]);
+      std::vector<std::string> intersection;
+      std::ranges::set_intersection(left.relations, right.relations,
+                                    std::back_inserter(intersection));
+      if (!intersection.empty() ||
+          UnionRelations(left.relations, right.relations) != target.relations) {
+        throw std::invalid_argument("join children are not equivalent to group");
       }
       break;
     }
@@ -705,6 +751,9 @@ const RuleSet& RuleSet::Default() {
         "join_commutativity", Join(Any("left"), Any("right")),
         [](const Bindings&, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
+          // Semi/anti joins are not commutative: only the left side survives.
+          if (expression.join_kind != LogicalJoinKind::kInner) { return;
+}
           memo.AddExpression(
               group, memo.NewJoin(expression.children[1], expression.children[0]));
         },
@@ -712,7 +761,11 @@ const RuleSet& RuleSet::Default() {
     built.Add(Rule(
         "join_enumeration", Join(),
         [](const Bindings&, Memo& memo, GroupId group,
-           const LogicalExpression&) {
+           const LogicalExpression& expression) {
+          // Re-enumerating a semi/anti join would synthesize inner joins and
+          // lose the membership semantics; only inner trees re-order.
+          if (expression.join_kind != LogicalJoinKind::kInner) { return;
+}
           const std::vector<std::string> relations = memo.Get(group).relations;
           if (relations.size() < 3) { return;
 }
@@ -755,7 +808,9 @@ const RuleSet& RuleSet::Default() {
         Join(Pattern::Op(LogicalOperator::kJoin, {Any("ll"), Any("lr")}, "left"),
              Any("right")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
-           const LogicalExpression&) {
+           const LogicalExpression& expression) {
+          if (expression.join_kind != LogicalJoinKind::kInner) { return;
+}
           const GroupId inner = memo.EnsureGroup(UnionRelations(
               memo.Get(bindings.at("lr")).relations,
               memo.Get(bindings.at("right")).relations));
@@ -769,7 +824,9 @@ const RuleSet& RuleSet::Default() {
              Pattern::Op(LogicalOperator::kJoin, {Any("rl"), Any("rr")},
                          "right")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
-           const LogicalExpression&) {
+           const LogicalExpression& expression) {
+          if (expression.join_kind != LogicalJoinKind::kInner) { return;
+}
           const GroupId inner = memo.EnsureGroup(UnionRelations(
               memo.Get(bindings.at("left")).relations,
               memo.Get(bindings.at("rl")).relations));
@@ -1007,6 +1064,9 @@ const RuleSet& RuleSet::Default() {
         "infer_join_predicates", Join(),
         [](const Bindings&, Memo& memo, GroupId,
            const LogicalExpression& expression) {
+          // Constant inference assumes both sides survive the join.
+          if (expression.join_kind != LogicalJoinKind::kInner) { return;
+}
           if (expression.predicate) {
             InferJoinConstants(memo, *expression.predicate);
           }
@@ -1086,6 +1146,247 @@ const RuleSet& RuleSet::Default() {
                                        .limit_offset = 0});
         },
         LogicalOperator::kSelection));
+    // Projection(X, [c1, c2, ...]) where every target_list item is a
+    // simple column passthrough matching the child's schema positionally
+    // is semantically a no-op (ProjectRemove).  We only apply this when
+    // the child is a scan, because only then is the output schema known
+    // at plan-construction time.
+    built.Add(Rule(
+        "eliminate_identity_projection",
+        Projection(Scan("input")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (expression.target_list.empty()) { return; }
+          const Group& scan_group = memo.Get(bindings.at("input"));
+          if (scan_group.relations.size() != 1) { return; }
+          // The scan child produces exactly one column per table column.
+          // An identity projection must have the same count and each
+          // projected column must reference the scan's table.
+          const std::string& table = scan_group.relations[0];
+          for (const NamedExpression& target : expression.target_list) {
+            if (!target.expression ||
+                target.expression->Type() != TypeTag::kColumnValue) {
+              return;
+            }
+            const ColumnName& col =
+                target.expression->AsColumnValue().GetColumnName();
+            if (col.schema != table) { return; }
+          }
+          for (const LogicalExpression& child_expr : scan_group.expressions) {
+            memo.AddExpression(group, child_expr);
+          }
+        },
+        LogicalOperator::kProjection));
+    // Projection(Join(L, R), [L.a, R.b, ...]): push the projection into each
+    // child of the join so scan/join below produces fewer columns.
+    // ProjectJoinTranspose: partition target_list into left-side and right-side
+    // column groups; if all projected columns come from the child schema,
+    // add a narrowed projection below the join.
+    built.Add(Rule(
+        "push_projection_through_join",
+        Projection(Join(Any("left"), Any("right"), "input")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          const Group& left_group = memo.Get(bindings.at("left"));
+          const Group& right_group = memo.Get(bindings.at("right"));
+          std::vector<NamedExpression> left_targets;
+          std::vector<NamedExpression> right_targets;
+          bool all_passthrough = true;
+          for (const NamedExpression& target : expression.target_list) {
+            if (!target.expression ||
+                target.expression->Type() != TypeTag::kColumnValue) {
+              all_passthrough = false;
+              break;
+            }
+            const ColumnName& col =
+                target.expression->AsColumnValue().GetColumnName();
+            bool in_left = !col.schema.empty() &&
+                           std::ranges::find(left_group.relations, col.schema) !=
+                               left_group.relations.end();
+            bool in_right = !col.schema.empty() &&
+                            std::ranges::find(right_group.relations,
+                                              col.schema) !=
+                                right_group.relations.end();
+            if (in_left) {
+              left_targets.push_back(target);
+            } else if (in_right) {
+              right_targets.push_back(target);
+            } else {
+              all_passthrough = false;
+              break;
+            }
+          }
+          if (!all_passthrough ||
+              left_targets.size() == left_group.relations.size() ||
+              right_targets.size() == right_group.relations.size()) {
+            return;
+          }
+          // Only emit narrowed projections when at least one side benefits.
+          const bool left_narrowed =
+              left_targets.size() <
+              memo.Get(bindings.at("left")).relations.size();
+          const bool right_narrowed =
+              right_targets.size() <
+              memo.Get(bindings.at("right")).relations.size();
+          if (!left_narrowed && !right_narrowed) { return; }
+          for (const LogicalExpression& join_expr :
+               memo.Get(bindings.at("input")).expressions) {
+            if (join_expr.operation != LogicalOperator::kJoin) { continue; }
+            GroupId new_left = bindings.at("left");
+            GroupId new_right = bindings.at("right");
+            if (left_narrowed && !left_targets.empty()) {
+              new_left = memo.EnsureDerivedGroup(
+                  left_group.relations,
+                  "proj-left:" +
+                      std::to_string(left_targets.size()));
+              memo.AddExpression(
+                  new_left,
+                  LogicalExpression{.operation = LogicalOperator::kProjection,
+                                    .children = {bindings.at("left")},
+                                    .target_list = left_targets});
+            }
+            if (right_narrowed && !right_targets.empty()) {
+              new_right = memo.EnsureDerivedGroup(
+                  right_group.relations,
+                  "proj-right:" +
+                      std::to_string(right_targets.size()));
+              memo.AddExpression(
+                  new_right,
+                  LogicalExpression{.operation = LogicalOperator::kProjection,
+                                    .children = {bindings.at("right")},
+                                    .target_list = right_targets});
+            }
+            LogicalExpression new_join = join_expr;
+            new_join.children = {new_left, new_right};
+            memo.AddExpression(group, std::move(new_join));
+          }
+        },
+        LogicalOperator::kProjection));
+    // TopN(Projection(X), keys, limit): push the TopN below the projection
+    // so the scan/join below produces fewer rows. Projection preserves row
+    // order, so sort keys survive the pushdown.
+    built.Add(Rule(
+        "topn_push_through_projection",
+        TopN(Projection(Any(), "proj")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          for (const LogicalExpression& projection :
+               memo.Get(bindings.at("proj")).expressions) {
+            if (projection.operation != LogicalOperator::kProjection) {
+              continue;
+            }
+            const GroupId input = projection.children[0];
+            const GroupId topn_below = memo.EnsureDerivedGroup(
+                memo.Get(input).relations,
+                "topn-below-proj:" + std::to_string(expression.limit_count));
+            LogicalExpression topn_below_expr;
+            topn_below_expr.operation = LogicalOperator::kTopN;
+            topn_below_expr.children = {input};
+            topn_below_expr.sort_expressions = expression.sort_expressions;
+            topn_below_expr.sort_ascending = expression.sort_ascending;
+            topn_below_expr.limit_count = expression.limit_count;
+            topn_below_expr.limit_offset = expression.limit_offset;
+            memo.AddExpression(topn_below, std::move(topn_below_expr));
+            memo.AddExpression(
+                group, LogicalExpression{.operation = LogicalOperator::kProjection,
+                                         .children = {topn_below},
+                                         .target_list = projection.target_list});
+          }
+        },
+        LogicalOperator::kTopN));
+    // Sort(Projection(X), keys): push Sort below Projection. Projection
+    // preserves row order, so sort keys survive the pushdown.
+    built.Add(Rule(
+        "sort_push_through_projection",
+        Sort(Projection(Any(), "proj")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          for (const LogicalExpression& projection :
+               memo.Get(bindings.at("proj")).expressions) {
+            if (projection.operation != LogicalOperator::kProjection) {
+              continue;
+            }
+            const GroupId input = projection.children[0];
+            const GroupId sort_below = memo.EnsureDerivedGroup(
+                memo.Get(input).relations,
+                "sort-below-proj");
+            LogicalExpression sort_below_expr;
+            sort_below_expr.operation = LogicalOperator::kSort;
+            sort_below_expr.children = {input};
+            sort_below_expr.sort_expressions = expression.sort_expressions;
+            sort_below_expr.sort_ascending = expression.sort_ascending;
+            memo.AddExpression(sort_below, std::move(sort_below_expr));
+            memo.AddExpression(
+                group, LogicalExpression{.operation = LogicalOperator::kProjection,
+                                         .children = {sort_below},
+                                         .target_list = projection.target_list});
+          }
+        },
+        LogicalOperator::kSort));
+    // Sort(X, [const, real_col, ...]): remove constant sort keys because
+    // they do not affect the output order.  This simplifies the sort and
+    // makes sort elimination more likely to succeed on the remaining keys.
+    built.Add(Rule(
+        "order_by_constant_removal",
+        Sort(),
+        [](const Bindings&, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (expression.sort_expressions.empty()) { return; }
+          std::vector<Expression> filtered_keys;
+          std::vector<bool> filtered_ascending;
+          bool removed_any = false;
+          for (size_t i = 0; i < expression.sort_expressions.size(); ++i) {
+            if (expression.sort_expressions[i] &&
+                expression.sort_expressions[i]->Type() ==
+                    TypeTag::kConstantValue) {
+              removed_any = true;
+              continue;
+            }
+            filtered_keys.push_back(expression.sort_expressions[i]);
+            if (i < expression.sort_ascending.size()) {
+              filtered_ascending.push_back(expression.sort_ascending[i]);
+            } else {
+              filtered_ascending.push_back(true);
+            }
+          }
+          if (!removed_any || filtered_keys.empty()) { return; }
+          LogicalExpression simplified = expression;
+          simplified.sort_expressions = std::move(filtered_keys);
+          simplified.sort_ascending = std::move(filtered_ascending);
+          memo.AddExpression(group, std::move(simplified));
+        },
+        LogicalOperator::kSort));
+    // TopN(X, [const, real_col, ...]): same constant-key removal for TopN.
+    built.Add(Rule(
+        "topn_constant_key_removal",
+        TopN(),
+        [](const Bindings&, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (expression.sort_expressions.empty()) { return; }
+          std::vector<Expression> filtered_keys;
+          std::vector<bool> filtered_ascending;
+          bool removed_any = false;
+          for (size_t i = 0; i < expression.sort_expressions.size(); ++i) {
+            if (expression.sort_expressions[i] &&
+                expression.sort_expressions[i]->Type() ==
+                    TypeTag::kConstantValue) {
+              removed_any = true;
+              continue;
+            }
+            filtered_keys.push_back(expression.sort_expressions[i]);
+            if (i < expression.sort_ascending.size()) {
+              filtered_ascending.push_back(expression.sort_ascending[i]);
+            } else {
+              filtered_ascending.push_back(true);
+            }
+          }
+          if (!removed_any || filtered_keys.empty()) { return; }
+          LogicalExpression simplified = expression;
+          simplified.sort_expressions = std::move(filtered_keys);
+          simplified.sort_ascending = std::move(filtered_ascending);
+          memo.AddExpression(group, std::move(simplified));
+        },
+        LogicalOperator::kTopN));
     return built;
   }();
   return rules;
@@ -1233,6 +1534,8 @@ std::vector<PhysicalProperties> SearchEngine::RequiredChildProperties(
     case LogicalOperator::kRelational:
       return {};
     case LogicalOperator::kJoin:
+    case LogicalOperator::kOuterJoin:
+    case LogicalOperator::kCrossJoin:
       // Joins reorder rows: they neither preserve row position nor deliver
       // the parent's ordering, and a limit hint below them is meaningless.
       return {PhysicalProperties{}, PhysicalProperties{}};
@@ -1242,8 +1545,13 @@ std::vector<PhysicalProperties> SearchEngine::RequiredChildProperties(
     case LogicalOperator::kSelection:
     case LogicalOperator::kProjection:
     case LogicalOperator::kLimit:
+    case LogicalOperator::kDistinct:
       // Row-filtering and row-shaping operators pass rows through in order.
       return {required};
+    case LogicalOperator::kSort:
+    case LogicalOperator::kTopN:
+      // Sort and TopN produce their own ordering; child ordering is free.
+      return {PhysicalProperties{}};
   }
   return {};
 }
