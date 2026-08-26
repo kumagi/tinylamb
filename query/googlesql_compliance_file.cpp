@@ -52,6 +52,100 @@ bool LineIsSeparator(std::string_view line, std::string_view expected) {
   return Trim(line) == expected;
 }
 
+// Byte offset of an " as " separator that sits outside parentheses, brackets,
+// angle brackets and quoted literals, or npos when none exists.
+size_t TopLevelAsPosition(const std::string& lower) {
+  const std::string needle = " as ";
+  int depth = 0;
+  bool in_string = false;
+  char quote = '\0';
+  for (size_t i = 0; i < lower.size(); ++i) {
+    const char c = lower[i];
+    if (in_string) {
+      if (c == '\\' && i + 1 < lower.size()) { ++i; continue; }
+      if (c == quote) { in_string = false; }
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      in_string = true;
+      quote = c;
+      continue;
+    }
+    if (c == '[' || c == '{' || c == '(' || c == '<') {
+      ++depth;
+    } else if (c == ']' || c == '}' || c == ')' || c == '>') {
+      if (depth > 0) { --depth; }
+    } else if (c == ' ' && depth == 0 &&
+               lower.compare(i, needle.size(), needle) == 0) {
+      return i;
+    }
+  }
+  return std::string::npos;
+}
+
+// True when `s` ends with "<whitespace><identifier>" and the boundary sits at
+// bracket depth zero outside string literals.
+bool SplitTrailingIdentifier(const std::string& s, size_t* split) {
+  if (s.empty()) { return false; }
+  size_t end = s.size();
+  while (end > 0 &&
+         (std::isalnum(static_cast<unsigned char>(s[end - 1])) != 0 ||
+          s[end - 1] == '_')) {
+    --end;
+  }
+  if (end == s.size() || end == 0) { return false; }
+  // The identifier must be preceded by whitespace...
+  if (std::isspace(static_cast<unsigned char>(s[end - 1])) == 0) {
+    return false;
+  }
+  // ...at bracket depth zero outside strings.
+  int depth = 0;
+  bool in_string = false;
+  char quote = '\0';
+  for (size_t i = 0; i < end - 1; ++i) {
+    const char c = s[i];
+    if (in_string) {
+      if (c == '\\' && i + 1 < end - 1) { ++i; continue; }
+      if (c == quote) { in_string = false; }
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      in_string = true;
+      quote = c;
+      continue;
+    }
+    if (c == '[' || c == '{' || c == '(' || c == '<') { ++depth; }
+    if (c == ']' || c == '}' || c == ')' || c == '>') { --depth; }
+  }
+  if (depth != 0 || in_string) { return false; }
+  *split = end;
+  return true;
+}
+
+// Option headers such as [parameters=...] may wrap across physical lines;
+// gather continuations until every opened bracket/brace/paren is closed.
+bool OptionHeaderBalanced(const std::string& text) {
+  int depth = 0;
+  bool in_string = false;
+  char quote = '\0';
+  for (size_t i = 0; i < text.size(); ++i) {
+    const char c = text[i];
+    if (in_string) {
+      if (c == '\\' && i + 1 < text.size()) { ++i; continue; }
+      if (c == quote) { in_string = false; }
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      in_string = true;
+      quote = c;
+      continue;
+    }
+    if (c == '[' || c == '{' || c == '(') { ++depth; }
+    if (c == ']' || c == '}' || c == ')') { --depth; }
+  }
+  return depth <= 0 && !in_string;
+}
+
 std::vector<std::string> SplitCases(std::string_view contents) {
   std::vector<std::string> cases;
   std::string current;
@@ -122,7 +216,7 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
     for (const auto& item : SplitTopLevel(value)) {
       const std::string s = Trim(item);
       const std::string lower = ToLower(s);
-      const size_t as_pos = lower.rfind(" as ");
+      const size_t as_pos = TopLevelAsPosition(lower);
       if (as_pos != std::string::npos) {
         const std::string expr = Trim(s.substr(0, as_pos));
         const std::string name = Trim(s.substr(as_pos + 4));
@@ -131,14 +225,18 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
         }
         continue;
       }
-      // Compact "<value> <name>" form (e.g. "1 param", "NULL param").
-      const size_t space = s.rfind(' ');
-      if (space != std::string::npos) {
-        const std::string expr = Trim(s.substr(0, space));
-        const std::string name = Trim(s.substr(space + 1));
+      // Compact "<value> <name>" form (e.g. "1 param", "NULL param").  A
+      // trailing identifier wins over any embedded " AS ": expressions such
+      // as `cast(1 as int32) a` carry their own AS clause, so the separator
+      // search must not see it.
+      size_t split = 0;
+      if (SplitTrailingIdentifier(s, &split)) {
+        const std::string expr = Trim(s.substr(0, split));
+        const std::string name = Trim(s.substr(split));
         if (!name.empty() && !expr.empty()) {
           out->parameters.push_back({name, expr});
         }
+        continue;
       }
     }
     return true;
@@ -328,6 +426,21 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
   test_case.default_time_zone = *current_default_tz;
   test_case.required_features = *default_features;
   std::istringstream stream{std::string(segment)};
+  // Option headers ([name=...], [parameters=...]) may wrap across physical
+  // lines; continuations are folded into one logical line before parsing.
+  auto consume_option = [&](const std::string& raw) {
+    std::string logical = raw;
+    if (!logical.empty() && logical.front() == '[' &&
+        !OptionHeaderBalanced(logical)) {
+      std::string continuation;
+      while (std::getline(stream, continuation)) {
+        logical += '\n';
+        logical += continuation;
+        if (OptionHeaderBalanced(logical)) { break; }
+      }
+    }
+    return ConsumeOptionLine(logical, &test_case, default_features);
+  };
   std::string line;
   bool in_options = true;
   std::string sql;
@@ -335,7 +448,7 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
     const std::string trimmed = Trim(line);
     if (in_options) {
       if (trimmed.empty() || trimmed.starts_with('#')) { continue; }
-      if (ConsumeOptionLine(line, &test_case, default_features)) {
+      if (consume_option(line)) {
         if (!test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
@@ -356,7 +469,7 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
     }
     if (sql.empty()) {
       if (trimmed.empty() || trimmed.starts_with('#')) { continue; }
-      if (ConsumeOptionLine(line, &test_case, default_features)) {
+      if (consume_option(line)) {
         if (!test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }

@@ -2122,6 +2122,125 @@ std::string NormalizeTimestampText(const std::string& text) {
   return std::string(buf);
 }
 
+// Splits a JSON object text (as produced by the eager struct constructors
+// below) into its top-level key/value pairs, preserving order.
+bool SplitJsonObjectFields(
+    const std::string& json,
+    std::vector<std::pair<std::string, std::string>>* fields) {
+  if (json.size() < 2 || json.front() != '{' || json.back() != '}') {
+    return false;
+  }
+  const std::string body = json.substr(1, json.size() - 2);
+  int depth = 0;
+  bool in_string = false;
+  char quote = '\0';
+  std::string current;
+  auto flush = [&]() {
+    const size_t colon = current.find(':');
+    if (colon == std::string::npos) {
+      return;
+    }
+    std::string key = current.substr(0, colon);
+    if (key.size() >= 2 && key.front() == '"' && key.back() == '"') {
+      key = key.substr(1, key.size() - 2);
+    }
+    fields->emplace_back(std::move(key), current.substr(colon + 1));
+  };
+  for (size_t i = 0; i < body.size(); ++i) {
+    const char c = body[i];
+    if (in_string) {
+      current.push_back(c);
+      if (c == '\\' && i + 1 < body.size()) {
+        current.push_back(body[++i]);
+        continue;
+      }
+      if (c == quote) { in_string = false; }
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      in_string = true;
+      quote = c;
+      current.push_back(c);
+      continue;
+    }
+    if (c == '{' || c == '[') { ++depth; }
+    if (c == '}' || c == ']') { --depth; }
+    if (c == ',' && depth == 0) {
+      flush();
+      current.clear();
+      continue;
+    }
+    current.push_back(c);
+  }
+  if (!current.empty()) { flush(); }
+  return true;
+}
+
+// An array of struct literals declares field names once (first element or
+// STRUCT<...> type); positional siblings like `(2.0, 2.0)` encode generic
+// "f1..fN" keys.  Rename those to the leading element's field names so bare
+// field references resolve uniformly across every row.
+void AlignAnonymousStructFieldNames(std::vector<Expression>* elements) {
+  if (elements->size() < 2) {
+    return;
+  }
+  auto encoded_struct = [](const Expression& e) -> std::string {
+    if (!e || e->Type() != TypeTag::kConstantValue) {
+      return {};
+    }
+    const Value& value = e->AsConstantValue().GetValue();
+    if (value.type != ValueType::kVarChar) {
+      return {};
+    }
+    return std::string(value.value.varchar_value);
+  };
+  const std::string head = encoded_struct((*elements)[0]);
+  if (head.empty()) {
+    return;
+  }
+  std::vector<std::pair<std::string, std::string>> head_fields;
+  if (!SplitJsonObjectFields(head, &head_fields)) {
+    return;
+  }
+  // The head must carry explicit names: anonymous fN keys have nothing to
+  // propagate.
+  for (size_t i = 0; i < head_fields.size(); ++i) {
+    if (head_fields[i].first == "f" + std::to_string(i + 1)) {
+      return;
+    }
+  }
+  for (size_t idx = 1; idx < elements->size(); ++idx) {
+    const std::string text = encoded_struct((*elements)[idx]);
+    if (text.empty()) {
+      continue;
+    }
+    std::vector<std::pair<std::string, std::string>> fields;
+    if (!SplitJsonObjectFields(text, &fields) ||
+        fields.size() != head_fields.size()) {
+      continue;
+    }
+    bool anonymous = true;
+    for (size_t i = 0; i < fields.size(); ++i) {
+      if (fields[i].first != "f" + std::to_string(i + 1)) {
+        anonymous = false;
+        break;
+      }
+    }
+    if (!anonymous) {
+      continue;
+    }
+    std::string rebuilt = "{";
+    for (size_t i = 0; i < fields.size(); ++i) {
+      if (i > 0) {
+        rebuilt += ",";
+      }
+      rebuilt += "\"" + head_fields[i].first + "\":" + fields[i].second;
+    }
+    rebuilt += "}";
+    (*elements)[idx] = ConstantValueExp(Value(std::move(rebuilt)));
+  }
+}
+
 Expression VisitExpression(
     const GoogleSqlAstNode&
         node) {  // NOLINT(misc-no-recursion) // Recursive AST descent by
@@ -2273,6 +2392,7 @@ Expression VisitExpression(
         array_query->SetArrayElementSqlType(element_type);
         return Expression(array_query);
       }    }
+    AlignAnonymousStructFieldNames(&elements);
     return ArrayExpressionExp(std::move(elements), std::move(element_type));
   }
   if (node.kind == "BinaryExpression") {
@@ -2457,10 +2577,6 @@ Expression VisitExpression(
       fn = "array_element_safe_ordinal";
     } else if (accessor == "ORDINAL") {
       fn = "array_element_ordinal";
-    }
-    if (accessor.find("SAFE_") == 0 ||
-        accessor.find("_SAFE") != std::string::npos) {
-      fn += "_safe";
     }
     return FunctionCallExp(fn, {std::move(base), VisitExpression(*index_node)});
   }

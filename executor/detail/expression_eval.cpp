@@ -200,6 +200,18 @@ Value ScalarFromText(std::string_view raw) {
   if (token.front() == '{' && token.back() == '}') {
     return Value(std::move(token));  // nested struct stays encoded
   }
+  // Non-finite doubles encode as bare identifier tokens (std::to_string
+  // output); recognize them before the generic string fallback.
+  if (token == "inf" || token == "+inf" || token == "infinity" ||
+      token == "+infinity") {
+    return Value(std::numeric_limits<double>::infinity());
+  }
+  if (token == "-inf" || token == "-infinity") {
+    return Value(-std::numeric_limits<double>::infinity());
+  }
+  if (token == "nan" || token == "+nan" || token == "-nan") {
+    return Value(std::numeric_limits<double>::quiet_NaN());
+  }
   if (token.find('.') != std::string::npos ||
       token.find('e') != std::string::npos ||
       token.find('E') != std::string::npos) {
@@ -346,7 +358,8 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
     }
   } else {
     value_end = value_start;
-    while (value_end < json.size() && json[value_end] != ',') {
+    while (value_end < json.size() && json[value_end] != ',' &&
+           json[value_end] != '}') {
       ++value_end;
     }
   }
@@ -719,6 +732,35 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
         return columns;
       }());
       return RowAsStructValue(aliased, owned_schema);
+    }
+  }
+  // Bare references may also address fields of STRUCT-typed columns:
+  // `FROM UNNEST([STRUCT(1 AS y, 2.0 AS x)])` keeps one encoded struct
+  // column per element, yet GoogleSQL exposes its fields without a
+  // qualifier.  After every plain-column strategy failed, probe JSON-
+  // encoded struct values for a matching top-level field (innermost scope
+  // first; leftmost column wins within a scope).
+  if (name.schema.empty() && name.name != "*" &&
+      name.name.find('.') == std::string::npos) {
+    for (const Scope* current = &scope; current != nullptr;
+         current = current->outer) {
+      if (current->row == nullptr || current->schema == nullptr) {
+        continue;
+      }
+      for (size_t i = 0; i < current->schema->ColumnCount(); ++i) {
+        const Value& candidate = (*current->row)[i];
+        if (candidate.IsNull() || candidate.type != ValueType::kVarChar) {
+          continue;
+        }
+        const std::string_view text(candidate.value.varchar_value);
+        if (text.size() < 2 || text.front() != '{') {
+          continue;
+        }
+        Value field;
+        if (JsonExtractField(text, name.name, &field)) {
+          return field;
+        }
+      }
     }
   }
   throw std::runtime_error("column " + name.ToString() + " not found");

@@ -542,6 +542,21 @@ Value CastValue(const Value& val, const std::string& type_name,
         if (upper == "TIMESTAMP") {
           std::string raw = s;
           CivilTime ct;
+          // An explicit zone name ("... UTC", "... GMT") pins the string to
+          // that zone regardless of the session default; normalize to the
+          // canonical UTC rendering instead of applying the default offset.
+          const std::string probe = ToLower(raw);
+          for (const std::string_view named_utc : {" utc", " gmt"}) {
+            if (probe.size() > named_utc.size() &&
+                probe.compare(probe.size() - named_utc.size(),
+                              named_utc.size(), named_utc) == 0) {
+              CivilTime named{};
+              if (ParseCivilTime(
+                      raw.substr(0, raw.size() - named_utc.size()), &named)) {
+                return Value(FormatCivilTime(named) + "+00");
+              }
+            }
+          }
           if (ParseCivilTime(raw, &ct)) {
             size_t tz_pos = raw.find_first_of("+-", 11);
             if (tz_pos != std::string::npos || raw.find('Z') != std::string::npos || raw.find('z') != std::string::npos) {
