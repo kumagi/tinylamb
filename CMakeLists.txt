@@ -296,6 +296,7 @@ tinylamb_add_layer(tinylamb_expression
         expression/proto_text.cpp
         expression/rewrite.cpp
         expression/sql_udf.cpp
+        expression/proto_schema.cpp
 
         expression/bytecode.cpp
         expression/jit.cpp

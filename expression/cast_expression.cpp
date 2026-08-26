@@ -19,6 +19,7 @@
 #include <utility>
 
 #include "common/constants.hpp"
+#include "expression/proto_schema.hpp"
 #include "expression/proto_text.hpp"
 #include "type/column_name.hpp"
 #include "type/date.hpp"
@@ -308,11 +309,83 @@ std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
   return {ValueType::kInt64, TypeTag::kBigInt};
 }
 
+// Narrowed integer targets reject values outside their width: GoogleSQL
+// raises out_of_range instead of truncating (INT64 keeps every int64 value).
+void ValidateIntWidth(const std::string& upper, int64_t v) {
+  bool out_of_width = false;
+  std::string width_name;
+  if (upper == "INT32") {
+    out_of_width = v < -2147483648LL || v > 2147483647LL;
+    width_name = "int32";
+  } else if (upper == "INT16") {
+    out_of_width = v < -32768 || v > 32767;
+    width_name = "int16";
+  } else if (upper == "INT8") {
+    out_of_width = v < -128 || v > 127;
+    width_name = "int8";
+  } else if (upper == "UINT32") {
+    out_of_width = v < 0 || v > 4294967295LL;
+    width_name = "uint32";
+  } else if (upper == "UINT16") {
+    out_of_width = v < 0 || v > 65535;
+    width_name = "uint16";
+  } else if (upper == "UINT8") {
+    out_of_width = v < 0 || v > 255;
+    width_name = "uint8";
+  } else if (upper == "UINT64") {
+    out_of_width = v < 0;
+    width_name = "uint64";
+  }
+  if (out_of_width) {
+    throw std::runtime_error(width_name + " out of range: " +
+                             std::to_string(v));
+  }
+}
+
 Value CastValue(const Value& val, const std::string& type_name,
                 ValueType target_type, bool safe) {
   if (val.IsNull()) { return Value(); }
   const std::string upper = ToUpper(type_name);
   const bool is_bool = (upper == "BOOL" || upper == "BOOLEAN");
+  // Registered GoogleSQL enums validate strictly: integers must be known
+  // members (proto3 open enums keep unknown in-range numbers) and strings
+  // must match a member name exactly. Unknown enum types keep the legacy
+  // heuristic below.
+  const std::string enum_short_name(ShortTypeName(type_name));
+  if (!is_bool && upper.find("ENUM") != std::string::npos &&
+      IsKnownEnum(enum_short_name)) {
+    auto out_of_range = [&](const std::string& message) -> Value {
+      if (safe) { return Value(); }
+      throw std::runtime_error(message);
+    };
+    if (val.type == ValueType::kInt64) {
+      const int64_t ordinal = val.value.int_value;
+      if (ordinal > 2147483647LL || ordinal < -2147483648LL) {
+        return out_of_range("Out of range cast of integer " +
+                            std::to_string(ordinal) + " to enum type " +
+                            type_name);
+      }
+      const std::optional<std::string> member =
+          EnumMemberForValue(enum_short_name, ordinal);
+      if (member.has_value()) { return Value(std::string(*member)); }
+      // Proto3 enums are open: unknown but in-range values stay numeric;
+      // closed proto2 enums reject them.
+      if (EnumIsOpen(enum_short_name)) { return val; }
+      return out_of_range("Out of range cast of integer " +
+                          std::to_string(ordinal) + " to enum type " +
+                          type_name);
+    }
+    if (val.type == ValueType::kVarChar) {
+      const std::string member(val.value.varchar_value);
+      int64_t ordinal = 0;
+      if (EnumValueForMember(enum_short_name, member, &ordinal)) {
+        return val;
+      }
+      return out_of_range("Out of range cast of string '" + member +
+                          "' to enum type " + type_name);
+    }
+    return val;
+  }
   // ENUM-typed targets accept their textual member names verbatim: this
   // engine stores enums as their member-name strings.  Message protos whose
   // names merely contain "ENUM" (KitchenSinkEnumPB) are excluded.
@@ -427,19 +500,30 @@ Value CastValue(const Value& val, const std::string& type_name,
 
     switch (target_type) {
       case ValueType::kInt64: {
-        if (val.type == ValueType::kInt64) { return val; }
+        if (val.type == ValueType::kInt64) {
+          // Narrowed integer targets reject values outside their width:
+          // GoogleSQL raises out_of_range instead of truncating.
+          ValidateIntWidth(upper, val.value.int_value);
+          return val;
+        }
         if (val.type == ValueType::kDouble) {
           if (std::isnan(val.value.double_value) ||
               std::isinf(val.value.double_value)) {
             throw std::runtime_error("cannot cast NaN/Inf float to int");
           }
           const double rounded = std::round(val.value.double_value);
-          if (rounded < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
-              rounded > static_cast<double>(std::numeric_limits<int64_t>::max())) {
+          // 2^63 as a double is exactly representable; values at or above it
+          // (including INT64_MAX itself after rounding) are out of range.
+          static constexpr double kInt64MaxAsDouble = 9223372036854775808.0;
+          static constexpr double kInt64MinAsDouble =
+              -9223372036854775808.0;
+          if (rounded >= kInt64MaxAsDouble || rounded < kInt64MinAsDouble) {
             throw std::runtime_error("int overflow casting from float: " +
                                      std::to_string(val.value.double_value));
           }
-          return Value(static_cast<int64_t>(rounded));
+          const int64_t narrowed = static_cast<int64_t>(rounded);
+          ValidateIntWidth(upper, narrowed);
+          return Value(narrowed);
         }
         if (val.type == ValueType::kVarChar) {
           std::string s(val.value.varchar_value);
@@ -515,6 +599,14 @@ Value CastValue(const Value& val, const std::string& type_name,
           int64_t result = 0;
           const char* begin_ptr = s.data();
           const char* end_ptr = s.data() + s.size();
+          // An enum member-name string ("TESTENUMNEGATIVE") reads back as
+          // its registry ordinal before plain integer parsing applies.
+          if (std::optional<int64_t> ordinal =
+                  OrdinalForEnumMemberName(s);
+              ordinal.has_value()) {
+            ValidateIntWidth(upper, *ordinal);
+            return Value(*ordinal);
+          }
           auto [ptr, ec] = std::from_chars(begin_ptr, end_ptr, result);
           if (ec == std::errc::result_out_of_range) {
             throw std::runtime_error("int overflow casting from string: " + s);

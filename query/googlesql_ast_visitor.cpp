@@ -11,6 +11,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -26,6 +27,7 @@
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/proto_schema.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
 #include "database/transaction_context.hpp"
@@ -1130,6 +1132,149 @@ std::string UpperCopy(std::string text) {
     c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
   }
   return text;
+}
+
+// A HintEntry is either "name=value" (one leading Identifier) or
+// "engine.name=value" (two). Qualified hints target another engine and are
+// ignored; unqualified hints must be recognized by the engine, and none are.
+void RejectUnsupportedHints(  // NOLINT(misc-no-recursion)
+    const GoogleSqlAstNode& node) {
+  if (node.kind == "HintEntry") {
+    size_t leading_identifiers = 0;
+    for (const auto& child : node.children) {
+      if (child->kind != "Identifier") { break; }
+      ++leading_identifiers;
+    }
+    if (leading_identifiers <= 1) {
+      throw std::runtime_error(
+          std::string("Unsupported hint: ") +
+          (node.children.empty() ? std::string("")
+                                 : Identifier(*node.children.front())));
+    }
+  }
+  for (const auto& child : node.children) {
+    RejectUnsupportedHints(*child);
+  }
+}
+
+// Strict UTF-8 validator: BYTES -> STRING casts must reject the sequences
+// GoogleSQL refuses (surrogates, overlong forms, truncated tails) instead of
+// passing mojibake through.
+bool IsValidUtf8Text(std::string_view text) {
+  size_t i = 0;
+  while (i < text.size()) {
+    const uint8_t lead = static_cast<uint8_t>(text[i]);
+    size_t continuation_count = 0;
+    uint8_t second_lower = 0x80;
+    uint8_t second_upper = 0xBF;
+    if (lead < 0x80) {
+      ++i;
+      continue;
+    } else if (lead >= 0xC2 && lead < 0xDF) {
+      continuation_count = 1;
+    } else if (lead >= 0xE0 && lead < 0xF0) {
+      continuation_count = 2;
+      second_lower = lead == 0xE0 ? 0xA0 : 0x80;
+      second_upper = lead == 0xED ? 0x9F : 0xBF;
+    } else if (lead >= 0xF0 && lead < 0xF5) {
+      continuation_count = 3;
+      second_lower = lead == 0xF0 ? 0x90 : 0x80;
+      second_upper = lead == 0xF4 ? 0x8F : 0xBF;
+    } else {
+      return false;
+    }
+    if (i + continuation_count >= text.size()) { return false; }
+    for (size_t c = 1; c <= continuation_count; ++c) {
+      const uint8_t byte = static_cast<uint8_t>(text[i + c]);
+      const uint8_t lower = c == 1 ? second_lower : 0x80;
+      const uint8_t upper = c == 1 ? second_upper : 0xBF;
+      if (byte < lower || byte > upper) { return false; }
+    }
+    i += continuation_count + 1;
+  }
+  return true;
+}
+
+bool IsAstTrivia(std::string_view kind);
+
+// Builds NEW <proto>(field AS value, ...) into the engine's text-format
+// representation, validating registry-known messages along the way.
+Expression BuildNewConstructor(const GoogleSqlAstNode& node);
+
+// Validates SELECT AS <proto> projections against registry field metadata;
+// wraps non-constant enum-typed values in a runtime validation guard.
+void ValidateSelectAsProjections(
+    const std::string& message_name,
+    const std::vector<std::pair<std::string, const GoogleSqlAstNode*>>& named,
+    std::vector<NamedExpression>* projections);
+
+// GoogleSQL coerces STRUCT<...> casts field-by-field and raises when a field
+// value cannot be coerced to the target field type. The engine's legacy cast
+// path collapses struct types, losing that validation; this re-establishes
+// it for literal struct sources. Anything not statically checkable is left
+// to the existing runtime behavior untouched.
+void ValidateStructCastCoercibility(const GoogleSqlAstNode& node,
+                                    bool safe) {
+  if (node.children.size() < 2 ||
+      node.children[1]->kind != "StructType") {
+    return;
+  }
+  const GoogleSqlAstNode& source = *node.children[0];
+  if (source.kind != "StructConstructorWithParens" &&
+      source.kind != "StructConstructorWithKeyword" &&
+      source.kind != "StructConstructorWithType") {
+    return;
+  }
+  std::vector<std::string> field_types;
+  for (const auto& field : node.children[1]->children) {
+    if (field->kind != "StructField") { continue; }
+    std::string field_type;
+    for (const auto& part : field->children) {
+      field_type = SqlTypeFromAst(*part);
+      if (!field_type.empty()) { break; }
+    }
+    field_types.push_back(field_type);
+  }
+  std::vector<const GoogleSqlAstNode*> elements;
+  for (const auto& child : source.children) {
+    if (IsAstTrivia(child->kind)) { continue; }
+    // Keyword constructors wrap each field in a StructConstructorArg node.
+    if (child->kind == "StructConstructorArg") {
+      for (const auto& inner : child->children) {
+        if (IsAstTrivia(inner->kind)) { continue; }
+        elements.push_back(inner.get());
+        break;
+      }
+      continue;
+    }
+    elements.push_back(child.get());
+  }
+  if (field_types.empty() || elements.size() != field_types.size()) {
+    return;
+  }
+  Row dummy_row;
+  Schema dummy_schema;
+  for (size_t i = 0; i < elements.size(); ++i) {
+    Expression element_expr;
+    try {
+      element_expr = VisitExpression(*elements[i]);
+      Value original = element_expr->Evaluate(dummy_row, dummy_schema);
+      if (original.IsNull()) { continue; }
+      if (field_types[i].empty()) { continue; }
+      Expression coerced = CastExpressionExp(
+          element_expr, field_types[i], /*return_null_on_error=*/true);
+      if (coerced->Evaluate(dummy_row, dummy_schema).IsNull()) {
+        throw std::runtime_error("Cannot coerce struct field " +
+                                 std::to_string(i + 1) + " to " +
+                                 field_types[i]);
+      }
+    } catch (const std::runtime_error&) {
+      throw;
+    } catch (const std::exception&) {
+      // Not statically decidable: defer to the legacy runtime path.
+      return;
+    }
+  }
 }
 
 bool IsBytesAstNode(const GoogleSqlAstNode& node) {
@@ -2927,6 +3072,43 @@ Expression VisitExpression(
     if (node.children.size() < 2) {
       throw std::runtime_error("GoogleSQL AST: CAST without operand or type");
     }
+    const bool safe_cast_target =
+        node.detail.find("return_null_on_error=true") != std::string::npos;
+    // Integer literals beyond INT64_MAX are UINT64-typed in GoogleSQL;
+    // narrowing them to any int width raises out_of_range instead of
+    // truncating.
+    if (node.children[0]->kind == "IntLiteral") {
+      const std::string& digits = node.children[0]->detail;
+      uint64_t magnitude = 0;
+      if (!digits.empty() &&
+          std::from_chars(digits.data(), digits.data() + digits.size(),
+                          magnitude)
+                  .ec == std::errc() &&
+          magnitude >
+              static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        std::string target = SqlTypeFromAst(*node.children[1]);
+        if (target.empty()) { target = "INT64"; }
+        if (safe_cast_target) { return ConstantValueExp(Value()); }
+        throw std::runtime_error(UpperCopy(target) + " out of range: " +
+                                 digits);
+      }
+    }
+    // BYTES -> STRING must carry valid UTF-8; GoogleSQL raises on invalid
+    // sequences rather than re-encoding them.
+    {
+      const std::string upper_cast_type =
+          UpperCopy(SqlTypeFromAst(*node.children[1]));
+      if ((upper_cast_type == "STRING" || upper_cast_type == "VARCHAR") &&
+          IsBytesAstNode(*node.children[0])) {
+        const std::string bytes = DecodeBytes(*node.children[0]);
+        if (!IsValidUtf8Text(bytes)) {
+          if (safe_cast_target) { return ConstantValueExp(Value()); }
+          throw std::runtime_error(
+              "Cannot cast bytes with invalid UTF-8 to STRING");
+        }
+      }
+    }
+    ValidateStructCastCoercibility(node, safe_cast_target);
     Expression child = VisitExpression(*node.children[0]);
     std::string type_name = SqlTypeFromAst(*node.children[1]);
     if (type_name.empty()) {
@@ -2945,179 +3127,22 @@ Expression VisitExpression(
       type_name = "STRING";
     }
     const std::string upper_type = UpperCopy(type_name);
+    // Enum-typed casts stay as runtime CAST expressions: the runtime
+    // resolves registry members to their names, rejects unknown values for
+    // closed (proto2) enums, keeps unknown in-range values for open (proto3)
+    // enums, and raises on out-of-range ordinals. Folding here would leak
+    // one literal's result through the SQL template cache to siblings.
+
+    // Reading an integer back out of an enum-valued string is handled at
+    // runtime: CastValue resolves registry member names to their ordinals
+    // and applies the target width validation.
     const bool safe =
         node.detail.find("return_null_on_error=true") != std::string::npos;
-    // Enum-typed casts: this engine represents enums as their member-name
-    // strings. INT -> ENUM derives the member name "<ENUM>_<ordinal>" style
-    // prefix from the type path; reading an integer back out unwraps to the
-    // original ordinal.
-    if (upper_type.find("ENUM") != std::string::npos) {
-      if (child->Type() == TypeTag::kConstantValue) {
-        const Value& v = child->AsConstantValue().GetValue();
-        if (v.type == ValueType::kInt64) {
-          if (v.value.int_value < 0) {
-            throw std::runtime_error("Out of range cast of integer " +
-                                     std::to_string(v.value.int_value) +
-                                     " to enum type " + type_name);
-          }
-          size_t last_dot = type_name.rfind('.');
-          const std::string enum_name =
-              last_dot == std::string::npos ? type_name
-                                            : type_name.substr(last_dot + 1);
-          // Known compliance enums bound their member ordinals; out-of-range
-          // casts error (or yield NULL for the SAFE variants).
-          const std::string lower_enum = Lower(enum_name);
-          const int64_t max_ordinal =
-              lower_enum == "testenum" || lower_enum == "testproto3enum"
-                  ? int64_t{2}
-                  : std::numeric_limits<int64_t>::max();
-          if (v.value.int_value > max_ordinal) {
-            if (safe) {
-              return ConstantValueExp(Value());
-            }
-            throw std::runtime_error("Out of range cast of integer " +
-                                     std::to_string(v.value.int_value) +
-                                     " to enum type " + type_name);
-          }
-          return ConstantValueExp(Value(
-              UpperCopy(enum_name) + std::to_string(v.value.int_value)));
-        }        if (v.type == ValueType::kVarChar) {
-          // Identity only for well-formed UPPER_SNAKE member names; other
-          // strings must keep flowing into the runtime cast so invalid
-          // members raise errors.
-          const std::string candidate(v.value.varchar_value);
-          bool member_shaped = !candidate.empty() &&
-                               static_cast<bool>(std::isupper(
-                                   static_cast<unsigned char>(candidate[0])));
-          for (const char c : candidate) {
-            if (!(c == '_' ||
-                  static_cast<bool>(std::isdigit(static_cast<unsigned char>(c))) ||
-                  static_cast<bool>(std::isupper(static_cast<unsigned char>(c))))) {
-              member_shaped = false;
-              break;
-            }
-          }
-          // Reject implausibly large ordinals: real enum members rarely
-          // carry more than three trailing digits.
-          size_t digit_count = 0;
-          while (digit_count < candidate.size() &&
-                 static_cast<bool>(std::isdigit(static_cast<unsigned char>(
-                     candidate[candidate.size() - 1 - digit_count])))) {
-            ++digit_count;
-          }
-          if (member_shaped && digit_count <= 3) {
-            return child;
-          }
-        }
-      }
-    }
-
-    // Reading an integer back out of an enum-typed expression: the engine
-    // stores enums as member-name strings derived from their ordinal, so
-    // CAST(CAST(n AS Enum) AS INT*) unwraps to n itself.
-    {
-      const std::string upper_target = UpperCopy(type_name);
-      const bool int_target =
-          upper_target == "INT32" || upper_target == "INT64" ||
-          upper_target == "UINT32" || upper_target == "UINT64" ||
-          upper_target == "INT" || upper_target == "INT16" ||
-          upper_target == "UINT8" || upper_target == "UINT16";
-      if (int_target && child->Type() == TypeTag::kCastExp) {
-        const std::string inner_upper =
-            UpperCopy(child->AsCastExpression().TargetTypeName());
-        if (inner_upper.find("ENUM") != std::string::npos) {
-          return child->AsCastExpression().Child();
-        }
-      }
-      if (int_target && child->Type() == TypeTag::kConstantValue) {
-        // An enum member-name string ("ANOTHERTESTENUM1") reads back as its
-        // trailing ordinal.
-        const Value& v = child->AsConstantValue().GetValue();
-        if (v.type == ValueType::kVarChar) {
-          const std::string member(v.value.varchar_value);
-          size_t digits = 0;
-          while (digits < member.size() &&
-                 static_cast<bool>(std::isdigit(static_cast<unsigned char>(
-                     member[member.size() - 1 - digits])))) {
-            ++digits;
-          }
-          bool named = digits > 0 && digits < member.size();
-          for (size_t i = 0; named && i + digits < member.size(); ++i) {
-            const char c = member[i];
-            if (!(c == '_' || c == '-' ||
-                  static_cast<bool>(std::isupper(static_cast<unsigned char>(c))) ||
-                  static_cast<bool>(std::isdigit(static_cast<unsigned char>(c))))) {
-              named = false;
-            }
-          }
-          if (named && member.size() - digits <= 19) {
-            const int64_t ordinal =
-                std::stoll(member.substr(member.size() - digits));
-            if (member.front() != '-') {
-              return ConstantValueExp(Value(ordinal));
-            }
-          }
-        }
-      }
-    }
     return CastExpressionExp(std::move(child), std::move(type_name), safe);
   }
 
   if (node.kind == "NewConstructor") {
-    // NEW ProtoType(field AS name, ...): lowered to a runtime constructor
-    // call so non-constant arguments (subqueries, column references,
-    // TIMESTAMP/DATE values) format their TEXT payload per row.
-    std::string type_name;
-    if (const GoogleSqlAstNode* path_node = node.Child("PathExpression")) {
-      type_name = Path(*path_node);
-    } else if (const GoogleSqlAstNode* simple = node.Child("SimpleType")) {
-      if (const GoogleSqlAstNode* inner = simple->Child("PathExpression")) {
-        type_name = Path(*inner);
-      }
-    }
-    {
-      for (char& c : type_name) {
-        if (c == '`') {
-          c = ' ';
-        }
-      }
-      // Collapse whitespace left by backtick removal.
-      std::string collapsed;
-      for (const char c : type_name) {
-        if (c != ' ' || (!collapsed.empty() && collapsed.back() != ' ')) {
-          collapsed.push_back(c);
-        }
-      }
-      type_name = std::move(collapsed);
-    }
-    std::vector<Expression> args;
-    args.emplace_back(ConstantValueExp(Value(std::move(type_name))));
-    for (const auto& child : node.children) {
-      if (child->kind == "NewConstructorArg" && child->children.size() >= 2) {
-        const GoogleSqlAstNode& value_node = *child->children[0];
-        const GoogleSqlAstNode& name_node = *child->children[1];
-        std::string field_name = Identifier(name_node);
-        if (field_name.empty()) {
-          field_name = Path(name_node);
-        }
-        // Extension targets arrive as parenthesized paths: emit the
-        // bracketed extension key used by TEXT format.
-        if (!field_name.empty() && field_name.front() != '[' &&
-            field_name.find('.') != std::string::npos) {
-          field_name = "[" + field_name + "]";
-        }
-        if (value_node.kind == "BooleanLiteral") {
-          const std::string upper_literal = UpperCopy(value_node.detail);
-          args.emplace_back(ConstantValueExp(
-              Value(upper_literal == "TRUE" ? std::string("true")
-                                            : std::string("false"))));
-        } else {
-          args.push_back(VisitExpression(value_node));
-        }
-        args.emplace_back(ConstantValueExp(Value(std::move(field_name))));
-      }
-    }
-    return FunctionCallExp("__proto_new", std::move(args));
+    return BuildNewConstructor(node);
   }
 
   if (node.kind == "StructConstructorWithKeyword" ||
@@ -3819,6 +3844,20 @@ std::shared_ptr<SelectStatement> VisitQuery(
   const bool as_value =
       select_as != nullptr &&
       UpperCopy(select_as->detail).find("VALUE") != std::string::npos;
+  // SELECT AS <proto>: validate projected fields against the registry so
+  // required-field violations and invalid enum values fail at prepare time.
+  if (!is_as_struct && !as_value && select_as != nullptr) {
+    if (const GoogleSqlAstNode* as_path =
+            select_as->Child("PathExpression")) {
+      std::vector<std::pair<std::string, const GoogleSqlAstNode*>> named;
+      const size_t count = std::min(projections.size(), projection_nodes.size());
+      named.reserve(count);
+      for (size_t i = 0; i < count; ++i) {
+        named.emplace_back(projections[i].name, projection_nodes[i]);
+      }
+      ValidateSelectAsProjections(Path(*as_path), named, &projections);
+    }
+  }
   if (!is_as_struct && !as_value &&
       (select_as != nullptr ||
        (upper_select_detail.find("AS_MODE=") != std::string::npos &&
@@ -3939,13 +3978,37 @@ std::shared_ptr<SelectStatement> VisitQuery(
 
   std::optional<size_t> limit;
   size_t offset = 0;
+  // GoogleSQL raises when LIMIT/OFFSET is negative or NULL; the dump shapes
+  // those operands as IntLiteral, UnaryExpression(-), or NullLiteral.
+  auto validate_limit_operand = [](const GoogleSqlAstNode& operand,
+                                   std::string_view clause) {
+    if (operand.kind == "NullLiteral") {
+      throw std::runtime_error(std::string(clause) +
+                               " must not be NULL");
+    }
+    if (operand.kind == "UnaryExpression" && operand.detail == "-" &&
+        !operand.children.empty() &&
+        operand.children.front()->kind == "IntLiteral") {
+      throw std::runtime_error(std::string(clause) +
+                               " must be non-negative");
+    }
+  };
   if (const GoogleSqlAstNode* limit_offset = query.Child("LimitOffset")) {
     if (const GoogleSqlAstNode* limit_node = limit_offset->Child("Limit")) {
-      if (const GoogleSqlAstNode* value = limit_node->Child("IntLiteral")) {
-        limit = static_cast<size_t>(ParseUnsignedLiteral(*value));
+      for (const auto& child : limit_node->children) {
+        if (child->kind == "Location" || child->kind == "Hint") { continue; }
+        validate_limit_operand(*child, "LIMIT");
+        if (child->kind == "IntLiteral") {
+          limit = static_cast<size_t>(ParseUnsignedLiteral(*child));
+        }
       }
     }
     for (const auto& child : limit_offset->children) {
+      if (child->kind == "Limit" || child->kind == "Location" ||
+          child->kind == "Hint") {
+        continue;
+      }
+      validate_limit_operand(*child, "OFFSET");
       if (child->kind == "IntLiteral") {
         offset = ParseUnsignedLiteral(*child);
       }
@@ -4436,10 +4499,268 @@ std::unique_ptr<Statement> VisitDelete(const GoogleSqlAstNode& root) {
   return statement;
 }
 
+// ---------------------------------------------------------------------------
+// Proto constructor (NEW) and SELECT AS <proto> validation against the
+// embedded compliance-proto registry.
+
+std::string ConstructorTypeFullName(const GoogleSqlAstNode& node) {
+  const GoogleSqlAstNode* path_node = nullptr;
+  if (const GoogleSqlAstNode* simple = node.Child("SimpleType")) {
+    path_node = simple->Child("PathExpression");
+  }
+  if (path_node == nullptr) {
+    path_node = node.Child("PathExpression");
+  }
+  if (path_node == nullptr) {
+    return {};
+  }
+  return Path(*path_node);
+}
+
+bool FieldNameEquals(const std::string& left, const std::string& right) {
+  if (left.size() != right.size()) { return false; }
+  for (size_t i = 0; i < left.size(); ++i) {
+    const char lc = static_cast<char>(std::tolower(static_cast<unsigned char>(left[i])));
+    const char rc = static_cast<char>(std::tolower(static_cast<unsigned char>(right[i])));
+    if (lc != rc) { return false; }
+  }
+  return true;
+}
+
+const ProtoFieldSchema* FindProtoField(
+    const std::vector<ProtoFieldSchema>& fields, const std::string& name) {
+  for (const ProtoFieldSchema& field : fields) {
+    if (FieldNameEquals(field.name, name)) { return &field; }
+  }
+  return nullptr;
+}
+
+// Rejects literal enum assignments that the registry says are invalid.
+void ValidateEnumLiteralValue(const std::string& message_name,
+                              const std::string& field_name,
+                              const std::string& enum_type_name,
+                              const GoogleSqlAstNode& expr) {
+  const std::string enum_short_name(ShortTypeName(enum_type_name));
+  if (!IsKnownEnum(enum_short_name)) { return; }
+  auto reject = [&](const std::string& message) {
+    throw std::runtime_error("Could not store value into proto field " +
+                             message_name + "." + field_name + ": " +
+                             message);
+  };
+  if (expr.kind == "StringLiteral") {
+    const std::string value = DecodeString(expr);
+    int64_t ordinal = 0;
+    if (!EnumValueForMember(enum_short_name, value, &ordinal)) {
+      reject("Out of range cast of string '" + value + "' to enum type " +
+             enum_short_name);
+    }
+    return;
+  }
+  if (expr.kind == "IntLiteral") {
+    const std::string& digits = expr.detail;
+    uint64_t magnitude = 0;
+    if (std::from_chars(digits.data(), digits.data() + digits.size(),
+                        magnitude)
+            .ec != std::errc() ||
+        magnitude > static_cast<uint64_t>(2147483647LL)) {
+      reject("Out of range cast of integer " + digits + " to enum type " +
+             enum_short_name);
+      return;
+    }
+    const int64_t ordinal = static_cast<int64_t>(magnitude);
+    const std::optional<std::string> member =
+        EnumMemberForValue(enum_short_name, ordinal);
+    if (!member.has_value() && !EnumIsOpen(enum_short_name)) {
+      reject("Out of range cast of integer " + std::to_string(ordinal) +
+             " to enum type " + enum_short_name);
+    }
+  }
+}
+
+// Shared checks for one field assignment. Returns true when the assignment
+// still needs a runtime guard because its value is not statically known.
+bool ValidateProtoFieldAssignment(const std::string& message_name,
+                                  const ProtoFieldSchema& field,
+                                  const GoogleSqlAstNode& expr) {
+  if (expr.kind == "NullLiteral") {
+    if (field.required) {
+      throw std::runtime_error(
+          "Cannot encode a null value in required protocol message field " +
+          message_name + "." + field.name);
+    }
+    return false;
+  }
+  if (field.is_enum && !field.repeated &&
+      (expr.kind == "StringLiteral" || expr.kind == "IntLiteral")) {
+    ValidateEnumLiteralValue(message_name, field.name, field.type_name, expr);
+    return false;
+  }
+  if (field.repeated && expr.kind == "ArrayConstructor") {
+    for (const auto& element : expr.children) {
+      if (element->kind == "ArrayType" || IsAstTrivia(element->kind)) {
+        continue;
+      }
+      if (element->kind == "NullLiteral") {
+        throw std::runtime_error(
+            "Cannot encode a null value in repeated protocol message field " +
+            message_name + "." + field.name);
+      }
+    }
+    return false;
+  }
+  // Non-constant repeated arrays and non-constant enum values need runtime
+  // validation.
+  if (field.repeated &&
+      (expr.kind == "QueryExpression" || expr.kind == "FunctionCall" ||
+       expr.kind == "CallExpression" || expr.kind == "ScalarSubquery" ||
+       expr.kind.starts_with("ExpressionSubquery"))) {
+    return true;
+  }
+  if (field.is_enum && !field.repeated) {
+    return true;
+  }
+  return false;
+}
+
+void RequireProtoFieldsPresent(const std::string& message_name,
+                               const std::vector<ProtoFieldSchema>& fields,
+                               const std::set<std::string>& assigned) {
+  for (const ProtoFieldSchema& field : fields) {
+    if (field.required) {
+      bool found = false;
+      for (const std::string& name : assigned) {
+        if (FieldNameEquals(name, field.name)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        throw std::runtime_error(
+            "Required protocol message field " + message_name + "." +
+            field.name + " is not assigned");
+      }
+    }
+  }
+}
+
+Expression BuildNewConstructor(const GoogleSqlAstNode& node) {
+  const std::string message_name = ConstructorTypeFullName(node);
+  const std::vector<ProtoFieldSchema>* fields =
+      message_name.empty() ? nullptr : FindProtoMessageFields(message_name);
+  std::string text_format;
+  std::vector<const GoogleSqlAstNode*> runtime_guards;
+  std::set<std::string> assigned;
+  for (const auto& child : node.children) {
+    if (child->kind != "NewConstructorArg" || child->children.size() < 2) {
+      continue;
+    }
+    const GoogleSqlAstNode& value_node = *child->children[0];
+    const std::string field_name = Identifier(*child->children[1]);
+    assigned.insert(field_name);
+    bool needs_guard = false;
+    if (fields != nullptr) {
+      const ProtoFieldSchema* field = FindProtoField(*fields, field_name);
+      if (field != nullptr) {
+        needs_guard =
+            ValidateProtoFieldAssignment(message_name, *field, value_node);
+      }
+    }
+    Expression val_expr = VisitExpression(value_node);
+    std::string val_str;
+    if (val_expr->Type() == TypeTag::kConstantValue) {
+      val_str = val_expr->AsConstantValue().GetValue().AsString();
+    }
+    if (!text_format.empty()) {
+      text_format += " ";
+    }
+    text_format += field_name + ": " + val_str;
+    if (needs_guard) {
+      runtime_guards.push_back(&value_node);
+    }
+  }
+  if (fields != nullptr) {
+    RequireProtoFieldsPresent(message_name, *fields, assigned);
+  }
+  // Runtime guards wrap the folded text so a NULL-bearing array or an
+  // invalid enum value fails execution instead of being silently dropped.
+  Expression result = ConstantValueExp(Value(std::move(text_format)));
+  for (const GoogleSqlAstNode* guard_source : runtime_guards) {
+    const GoogleSqlAstNode* guard_field = nullptr;
+    for (const auto& child : node.children) {
+      if (child->kind == "NewConstructorArg" &&
+          child->children.size() >= 2 &&
+          child->children[0].get() == guard_source) {
+        guard_field = child->children[1].get();
+        break;
+      }
+    }
+    const ProtoFieldSchema* field =
+        fields != nullptr && guard_field != nullptr
+            ? FindProtoField(*fields, Identifier(*guard_field))
+            : nullptr;
+    if (field != nullptr && field->is_enum) {
+      result = FunctionCallExp("$proto_field_guard",
+                               {VisitExpression(*guard_source),
+                                ConstantValueExp(Value(std::string(field->type_name))),
+                                std::move(result)});
+    } else {
+      result = FunctionCallExp("$proto_repeated_guard",
+                               {VisitExpression(*guard_source),
+                                std::move(result)});
+    }
+  }
+  return result;
+}
+
+void ValidateSelectAsProjections(
+    const std::string& message_name,
+    const std::vector<std::pair<std::string, const GoogleSqlAstNode*>>& named,
+    std::vector<NamedExpression>* projections) {
+  const std::vector<ProtoFieldSchema>* fields =
+      FindProtoMessageFields(message_name);
+  if (fields == nullptr) { return; }
+  std::set<std::string> assigned;
+  for (const auto& [name, expression_node] : named) {
+    assigned.insert(name);
+    const ProtoFieldSchema* field = FindProtoField(*fields, name);
+    if (field == nullptr) { continue; }
+    ValidateProtoFieldAssignment(message_name, *field, *expression_node);
+  }
+  RequireProtoFieldsPresent(message_name, *fields, assigned);
+  for (size_t i = 0; i < named.size(); ++i) {
+    const ProtoFieldSchema* field = FindProtoField(*fields, named[i].first);
+    if (field == nullptr) { continue; }
+    if (named[i].second->kind == "NullLiteral" ||
+        named[i].second->kind == "StringLiteral" ||
+        named[i].second->kind == "IntLiteral") {
+      continue;
+    }
+    if (field->is_enum && !field->repeated) {
+      (*projections)[i] = NamedExpression(
+          (*projections)[i].name,
+          FunctionCallExp("$proto_enum_guard",
+                          {VisitExpression(*named[i].second),
+                           ConstantValueExp(Value(std::string(field->type_name)))}));
+    }
+  }
+}
+
 }  // namespace
 
 std::unique_ptr<Statement> GoogleSqlAstVisitor::Visit(
     const GoogleSqlAstNode& root) {
+  // Hints for other engines (qualified "engine.name") are ignored; an
+  // unqualified hint is only meaningful when the engine knows it, and this
+  // engine implements none: GoogleSQL rejects unknown default-engine hints
+  // instead of silently executing the statement.
+  RejectUnsupportedHints(root);
+  if (root.kind == "HintedStatement") {
+    for (const auto& child : root.children) {
+      if (child->kind == "Hint" || child->kind == "Location") { continue; }
+      return Visit(*child);
+    }
+    throw std::runtime_error("GoogleSQL AST: hinted statement without body");
+  }
   if (root.kind == "QueryStatement") {
     const GoogleSqlAstNode* query = root.Child("Query");
     if (query == nullptr) {

@@ -106,7 +106,7 @@ class AggregateExpression : public ExpressionBase {
   [[nodiscard]] bool NeedsGroupContext() const {
     return having_ != AggregateHavingModifier::kNone ||
            !inner_order_by_.empty() || inner_limit_.has_value() ||
-           !trailing_args_.empty() ||
+           !trailing_args_.empty() || secondary_arg_ ||
            type_ == AggregationType::kApproxTopCount ||
            type_ == AggregationType::kApproxTopSum;
   }

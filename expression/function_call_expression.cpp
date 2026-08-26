@@ -31,6 +31,9 @@
 #include <vector>
 #include <utility>
 
+#include "expression/cast_expression.hpp"
+#include "expression/constant_value.hpp"
+
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
 #include "expression/evaluation_context.hpp"
@@ -285,6 +288,44 @@ Value ExecuteFunction(const std::string& name,
     }
     return val.AsString();
   };
+  // Proto-field guards emitted by the GoogleSQL frontend: NEW constructors
+  // and SELECT AS <proto> route non-constant repeated-field arrays and enum
+  // values through them so invalid data fails execution instead of being
+  // silently dropped from the text-format representation.
+  if (name == "$proto_repeated_guard") {
+    if (values.size() != 2) {
+      throw std::runtime_error("$proto_repeated_guard requires 2 arguments");
+    }
+    if (values[0].IsArray()) {
+      for (const Value& element : values[0].ArrayElements()) {
+        if (element.IsNull()) {
+          throw std::runtime_error(
+              "Cannot encode a null value in a repeated protocol message "
+              "field");
+        }
+      }
+    } else if (!values[0].IsNull()) {
+      throw std::runtime_error("repeated proto field requires an array");
+    }
+    return values[1];
+  }
+  if (name == "$proto_field_guard" || name == "$proto_enum_guard") {
+    const size_t expected = name == "$proto_field_guard" ? 3 : 2;
+    if (values.size() != expected) {
+      throw std::runtime_error(name + " argument count mismatch");
+    }
+    if (!values[0].IsNull()) {
+      Row dummy_row;
+      Schema dummy_schema;
+      Expression checked =
+          CastExpressionExp(ConstantValueExp(values[0]), raw_str(values[1]),
+                            false);
+      // Full CAST validation against the enum registry; throws on unknown
+      // members or out-of-range ordinals.
+      static_cast<void>(checked->Evaluate(dummy_row, dummy_schema));
+    }
+    return expected == 3 ? values[2] : values[0];
+  }
   if (name == "__struct_set") {
     if (values.size() != 3) {
       throw std::runtime_error("__struct_set requires 3 arguments");
