@@ -1,6 +1,8 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/parallel_aggregation.hpp"
 
+#include "executor/detail/expression_eval.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -104,7 +106,9 @@ void ParallelAggregationExecutor::AccumulateValue(
   if (apply_distinct && aggregate.Distinct()) {
     const size_t bytes = EstimateValueBytes(value);
     QueryMemoryBudget::Global().ReserveForced(bytes);
-    if (!state->distinct_values[index].insert(value).second) {
+    if (!state->distinct_values[index]
+                   .insert(relational_detail::CanonicalDistinctValue(value))
+                   .second) {
       QueryMemoryBudget::Global().Release(bytes);
       return;
     }

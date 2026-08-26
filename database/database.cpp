@@ -16,6 +16,8 @@
 
 #include "database.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -264,14 +266,35 @@ StatusOr<Function> Database::GetOrAddFunction(TransactionContext& ctx,
 
 StatusOr<Table> Database::GetTable(TransactionContext& ctx,
                                    std::string_view schema_name) {
-  ASSIGN_OR_RETURN(std::string_view, val, catalog_.Read(ctx.txn_, schema_name));
-  Table tbl;
-  if (!Deserialize(val, &tbl)) {
-    // A corrupt catalog entry must abort the lookup instead of handing out
-    // a garbage schema.
-    return Status::kCorrupt;
+  auto read_result = catalog_.Read(ctx.txn_, schema_name);
+  if (read_result.HasValue()) {
+    Table tbl;
+    if (!Deserialize(read_result.Value(), &tbl)) {
+      // A corrupt catalog entry must abort the lookup instead of handing
+      // out a garbage schema.
+      return Status::kCorrupt;
+    }
+    return tbl;
   }
-  return tbl;
+  // GoogleSQL identifiers are case-insensitive; fall back to a
+  // case-insensitive scan of the catalog before giving up.
+  for (BPlusTreeIterator iter = catalog_.Begin(ctx.txn_); iter.IsValid();
+       ++iter) {
+    const std::string& name = iter.Key();
+    if (name.size() == schema_name.size() &&
+        std::equal(name.begin(), name.end(), schema_name.begin(),
+                   [](char a, char b) {
+                     return std::tolower(static_cast<unsigned char>(a)) ==
+                            std::tolower(static_cast<unsigned char>(b));
+                   })) {
+      Table tbl;
+      if (!Deserialize(iter.Value(), &tbl)) {
+        return Status::kCorrupt;
+      }
+      return tbl;
+    }
+  }
+  return read_result.GetStatus();
 }
 
 std::vector<std::string> Database::ListTables(TransactionContext& ctx) {

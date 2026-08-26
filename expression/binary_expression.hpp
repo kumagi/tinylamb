@@ -29,6 +29,10 @@ class EvaluationContext;
 [[nodiscard]] Value EvaluateBinary(BinaryOperation operation,
                                    const Value& left, const Value& right);
 
+// Lowercases ASCII letters; the fold applied by case-insensitive collation
+// comparisons ('und:ci').
+[[nodiscard]] std::string FoldCase(std::string_view s);
+
 class BinaryExpression : public ExpressionBase {
  public:
   BinaryExpression(Expression left, BinaryOperation op, Expression right)

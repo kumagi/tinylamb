@@ -12,6 +12,12 @@ class DeleteExecutor : public ExecutorBase {
  public:
   DeleteExecutor(Transaction& txn, Table& target, Executor source)
       : txn_(&txn), target_(&target), source_(std::move(source)) {}
+  DeleteExecutor(Transaction& txn, Table& target, Executor source,
+                 int64_t assert_rows_modified)
+      : txn_(&txn),
+        target_(&target),
+        source_(std::move(source)),
+        assert_rows_modified_(assert_rows_modified) {}
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& output, int indent) const override;
 
@@ -19,6 +25,7 @@ class DeleteExecutor : public ExecutorBase {
   Transaction* txn_;
   Table* target_;
   Executor source_;
+  int64_t assert_rows_modified_{-1};
   bool finished_{false};
 };
 }  // namespace tinylamb

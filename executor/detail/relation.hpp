@@ -20,6 +20,9 @@ struct Relation {
   std::vector<Row> rows;
   std::shared_ptr<SpillFile> spill;
   std::shared_ptr<SpillFile> spill_tail_;
+  // USING join merge metadata: names whose duplicates across the joined
+  // sides coalesce for bare references and star expansion.  Set by Join().
+  std::shared_ptr<const std::vector<std::string>> using_columns;
   size_t charged_bytes_{0};
   size_t hash_joins{0};
   size_t hybrid_hash_joins{0};

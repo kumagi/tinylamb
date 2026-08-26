@@ -86,16 +86,55 @@ std::vector<std::string> ExtractStructValues(std::string_view json) {
   return values;
 }
 
-bool StructJsonEqual(std::string_view lhs, std::string_view rhs) {
-  if (lhs == rhs) { return true; }
+// Row-comparison semantics for STRUCT equality (ANSI row value comparison):
+// a pair of non-NULL, differing fields decides FALSE outright; any field
+// pair involving NULL yields UNKNOWN unless another pair decided FALSE.
+Value StructJsonCompare(std::string_view lhs, std::string_view rhs) {
   auto v1 = ExtractStructValues(lhs);
   auto v2 = ExtractStructValues(rhs);
-  if (v1.empty() || v1.size() != v2.size()) { return false; }
+  if (v1.empty() || v1.size() != v2.size()) { return Value(false); }
+  bool saw_null = false;
   for (size_t i = 0; i < v1.size(); ++i) {
-    if (v1[i] != v2[i]) { return false; }
+    if (v1[i] == "null" || v2[i] == "null") {
+      saw_null = true;
+      continue;
+    }
+    if (v1[i] != v2[i]) { return Value(false); }
   }
-  return true;
+  return saw_null ? Value() : Value(true);
 }
+
+bool IsComparisonOp(BinaryOperation op) {
+  switch (op) {
+    case BinaryOperation::kEquals:
+    case BinaryOperation::kNotEquals:
+    case BinaryOperation::kLessThan:
+    case BinaryOperation::kLessThanEquals:
+    case BinaryOperation::kGreaterThan:
+    case BinaryOperation::kGreaterThanEquals:
+    case BinaryOperation::kLike:
+    case BinaryOperation::kNotLike:
+      return true;
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
+std::string FoldCase(std::string_view s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    const auto uc = static_cast<unsigned char>(c);
+    out.push_back(uc >= 'A' && uc <= 'Z'
+                      ? static_cast<char>(uc - 'A' + 'a')
+                      : c);
+  }
+  return out;
+}
+
+namespace {
 
 bool Like(std::string_view value, std::string_view pattern) {
   size_t value_pos = 0;
@@ -153,12 +192,55 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
   }
   if (left.IsNull() || right.IsNull()) { return {};
 }
+  // Bit shifts operate on the two's-complement representation with logical
+  // (unsigned) semantics, matching GoogleSQL: shift amounts >= 64 yield 0 and
+  // negative amounts raise OUT_OF_RANGE.
+  if (op == BinaryOperation::kShiftLeft || op == BinaryOperation::kShiftRight) {
+    if (left.type != ValueType::kInt64 || right.type != ValueType::kInt64) {
+      throw std::runtime_error("bitwise shift requires integer operands");
+    }
+    const int64_t amount = right.value.int_value;
+    if (amount < 0) {
+      throw std::runtime_error("Bitwise shift by negative offset.");
+    }
+    if (amount >= 64) {
+      return Value(static_cast<int64_t>(0));
+    }
+    const uint64_t bits = static_cast<uint64_t>(left.value.int_value);
+    const uint64_t shifted = op == BinaryOperation::kShiftLeft
+                                 ? bits << amount
+                                 : bits >> amount;
+    return Value(static_cast<int64_t>(shifted));
+  }
+  // Collation-aware normalization: when either operand carries a
+  // case-insensitive collator, both sides fold to lowercase.  GoogleSQL
+  // resolves an explicit COLLATE on one side for the whole comparison.
+  Value folded_left = left;
+  Value folded_right = right;
+  if (IsComparisonOp(op) && left.type == ValueType::kVarChar &&
+      right.type == ValueType::kVarChar &&
+      (left.IsCaseInsensitive() || right.IsCaseInsensitive())) {
+    // Tags ride along so downstream LIKE validation still sees the collator.
+    folded_left = Value(FoldCase(left.value.varchar_value))
+                      .WithCollation(left.Collation());
+    folded_right = Value(FoldCase(right.value.varchar_value))
+                       .WithCollation(right.Collation());
+  }
   if (op == BinaryOperation::kLike || op == BinaryOperation::kNotLike) {
-    if (left.type != ValueType::kVarChar || right.type != ValueType::kVarChar) {
+    if (folded_left.type != ValueType::kVarChar ||
+        folded_right.type != ValueType::kVarChar) {
       throw std::runtime_error("LIKE requires string operands");
     }
+    const std::string_view pattern = folded_right.value.varchar_value;
+    if ((folded_left.IsCaseInsensitive() || folded_right.IsCaseInsensitive()) &&
+        pattern.find('_') != std::string_view::npos) {
+      throw std::runtime_error(
+          "LIKE pattern has '_' which is not allowed when its operands have "
+          "collation: " +
+          std::string(pattern));
+    }
     const bool matched =
-        Like(left.value.varchar_value, right.value.varchar_value);
+        Like(folded_left.value.varchar_value, pattern);
     return Value(op == BinaryOperation::kLike ? matched : !matched);
   }
   const bool numeric =
@@ -174,14 +256,9 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     if (rhs == 0.0) {
       throw std::runtime_error("division by zero");
     }
-    const double res = lhs / rhs;
-    if (std::isinf(res)) {
-      throw std::runtime_error("double overflow on '/'");
-    }
-    if (std::isnan(res)) {
-      throw std::runtime_error("division by zero");
-    }
-    return Value(res);
+    // FLOAT64 division follows IEEE-754: overflow yields ±infinity, never
+    // an error (the reference engine only rejects division by zero).
+    return Value(lhs / rhs);
   }
   if (numeric && left.type != right.type) {
     const double lhs = left.type == ValueType::kDouble
@@ -190,6 +267,22 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     const double rhs = right.type == ValueType::kDouble
                            ? right.value.double_value
                            : static_cast<double>(right.value.int_value);
+    // IEEE unordered comparisons: any ordered comparison against NaN is
+    // FALSE (never NULL), even NaN vs NaN (GoogleSQL BETWEEN semantics).
+    const auto is_nan = [](const Value& v) {
+      return v.type == ValueType::kDouble && std::isnan(v.value.double_value);
+    };
+    if (is_nan(folded_left) || is_nan(folded_right)) {
+      switch (op) {
+        case BinaryOperation::kLessThan:
+        case BinaryOperation::kLessThanEquals:
+        case BinaryOperation::kGreaterThan:
+        case BinaryOperation::kGreaterThanEquals:
+          return Value(false);
+        default:
+          break;
+      }
+    }
     switch (op) {
       case BinaryOperation::kAdd:
         return Value(lhs + rhs);
@@ -268,6 +361,24 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       }
     }
   }
+  // IEEE unordered comparisons: any ordered comparison against a NaN is
+  // FALSE (never NULL), even NaN vs NaN (GoogleSQL BETWEEN semantics).
+  {
+    const auto operand_is_nan = [](const Value& v) {
+      return v.type == ValueType::kDouble && std::isnan(v.value.double_value);
+    };
+    if (operand_is_nan(folded_left) || operand_is_nan(folded_right)) {
+      switch (op) {
+        case BinaryOperation::kLessThan:
+        case BinaryOperation::kLessThanEquals:
+        case BinaryOperation::kGreaterThan:
+        case BinaryOperation::kGreaterThanEquals:
+          return Value(false);
+        default:
+          break;
+      }
+    }
+  }
   switch (op) {
     case BinaryOperation::kAdd:
       return left + right;
@@ -280,35 +391,42 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         if (right.value.double_value == 0.0) {
           throw std::runtime_error("division by zero");
         }
-        const double res = left.value.double_value / right.value.double_value;
-        if (std::isinf(res)) { throw std::runtime_error("double overflow"); }
-        if (std::isnan(res)) { throw std::runtime_error("division by zero"); }
-        return Value(res);
+        // IEEE-754: overflow yields ±infinity, never an error.
+        return Value(left.value.double_value / right.value.double_value);
       }
       return left / right;
     }
     case BinaryOperation::kModulo:
       return left % right;
     case BinaryOperation::kEquals:
-      if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar &&
-          IsStructJson(left.value.varchar_value) && IsStructJson(right.value.varchar_value)) {
-        return Value(StructJsonEqual(left.value.varchar_value, right.value.varchar_value));
+      if (folded_left.type == ValueType::kVarChar &&
+          folded_right.type == ValueType::kVarChar &&
+          IsStructJson(folded_left.value.varchar_value) &&
+          IsStructJson(folded_right.value.varchar_value)) {
+        return StructJsonCompare(folded_left.value.varchar_value,
+                                 folded_right.value.varchar_value);
       }
-      return Value(left == right);
+      return Value(folded_left == folded_right);
     case BinaryOperation::kNotEquals:
-      if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar &&
-          IsStructJson(left.value.varchar_value) && IsStructJson(right.value.varchar_value)) {
-        return Value(!StructJsonEqual(left.value.varchar_value, right.value.varchar_value));
+      if (folded_left.type == ValueType::kVarChar &&
+          folded_right.type == ValueType::kVarChar &&
+          IsStructJson(folded_left.value.varchar_value) &&
+          IsStructJson(folded_right.value.varchar_value)) {
+        const Value equal = StructJsonCompare(folded_left.value.varchar_value,
+                                              folded_right.value.varchar_value);
+        if (equal.IsNull()) { return {};
+}
+        return Value(!equal.Truthy());
       }
-      return Value(left != right);
+      return Value(folded_left != folded_right);
     case BinaryOperation::kLessThan:
-      return Value(left < right);
+      return Value(folded_left < folded_right);
     case BinaryOperation::kLessThanEquals:
-      return Value(left <= right);
+      return Value(folded_left <= folded_right);
     case BinaryOperation::kGreaterThan:
-      return Value(left > right);
+      return Value(folded_left > folded_right);
     case BinaryOperation::kGreaterThanEquals:
-      return Value(left >= right);
+      return Value(folded_left >= folded_right);
     case BinaryOperation::kAnd:
     case BinaryOperation::kOr:
     case BinaryOperation::kXor:

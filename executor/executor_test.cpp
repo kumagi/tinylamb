@@ -2024,9 +2024,10 @@ TEST_F(ExecutorTest, RelationalInSubqueriesAndScalarFallback) {
   EXPECT_EQ(derived_star.size(), 4U);
 
   // Scalar subquery that is neither correlated-indexable nor cacheable must
-  // fall back to a full ExecuteQuery.
+  // fall back to a full ExecuteQuery.  LIMIT 1 keeps the scalar subquery
+  // within its one-row contract.
   const auto scalar = RelationalRun(
-      *rs_, "SELECT (SELECT * FROM (SELECT * FROM SampleTable)) FROM "
+      *rs_, "SELECT (SELECT * FROM (SELECT * FROM SampleTable) LIMIT 1) FROM "
             "SampleTable;");
   ASSERT_EQ(scalar.size(), 4U);
   for (const Row& row : scalar) {
@@ -2549,12 +2550,16 @@ TEST_F(ExecutorTest, RelationalDistinctCrossJoinSpillsUnderBudget) {
 TEST_F(ExecutorTest, RelationalScalarSubquerySurvivesSpilledRows) {
   // Regression guard: scalar-subquery evaluation must read spilled rows too,
   // not just the in-memory portion of the cached subquery result. Every outer
-  // row therefore sees the scalar key value instead of NULL.
+  // row therefore sees the scalar key value instead of NULL. The subquery is
+  // capped with LIMIT 1 because a scalar subquery must return at most one
+  // row; the full 200-row relation is still materialized (and spilled) before
+  // truncation.
   CreateWideTable(*rs_, "WideScalar", 200);
   ScopedQueryMemory memory(65536);
   const auto rows = RelationalRun(
       *rs_,
-      "SELECT (SELECT * FROM (SELECT * FROM WideScalar)) FROM WideScalar;");
+      "SELECT (SELECT key FROM (SELECT * FROM WideScalar) LIMIT 1) FROM "
+      "WideScalar;");
   ASSERT_EQ(rows.size(), 200U);
   for (const Row& row : rows) {
     EXPECT_FALSE(row[0].IsNull());

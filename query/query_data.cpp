@@ -20,6 +20,7 @@
 
 #include "query_data.hpp"
 
+#include <cctype>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -28,15 +29,27 @@
 #include <vector>
 
 #include "common/constants.hpp"
+
+namespace {
+std::string ToLowerCopy(std::string value) {
+  for (char& c : value) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return value;
+}
+}  // namespace
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "table/table.hpp"
 #include "type/column_name.hpp"
@@ -47,13 +60,133 @@ namespace tinylamb {
 
 namespace {
 
-Status ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree resolution by design; trees are parser-bounded in depth.
+// Case-insensitive identifier equality (mirrors the SQL name resolution
+// used throughout the engine).
+bool CaseInsensitiveEquals(std::string_view left, std::string_view right) {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < left.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(left[i])) !=
+        std::tolower(static_cast<unsigned char>(right[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Dotted references whose qualifier names a COLUMN (not a FROM relation)
+// address encoded fields of proto / struct payloads: "value.int32_val",
+// "t.value.nested_value.nested_int64".  Rewrite them into chained
+// __get_field_safe reads so resolution succeeds against the base column.
+Expression BindColumnQualifiedFieldReads(
+    const Expression& expr,
+    const std::unordered_map<std::string, std::string>& col_table_map,
+    const std::unordered_set<std::string>& relations) {
+  if (!expr) {
+    return expr;
+  }
+  if (expr->Type() == TypeTag::kColumnValue) {
+    const ColumnName& name = expr->AsColumnValue().GetColumnName();
+    if (name.schema.empty() || name.name.empty() || name.name == "*" ||
+        relations.contains(name.schema)) {
+      return expr;
+    }
+    // The qualifier may itself be dotted ("t.value"); the first segment must
+    // name a column of the driving table for this to be a field read.
+    const size_t first_dot = name.schema.find('.');
+    const std::string head = first_dot == std::string::npos
+                                 ? name.schema
+                                 : name.schema.substr(0, first_dot);
+    const auto it = col_table_map.find(ToLowerCopy(head));
+    if (it == col_table_map.end()) {
+      return expr;
+    }
+    std::vector<std::string> segments;
+    {
+      std::string remainder = name.schema.substr(
+          first_dot == std::string::npos ? name.schema.size() : first_dot + 1);
+      if (!remainder.empty()) {
+        segments.push_back(std::move(remainder));
+      }
+      segments.push_back(name.name);
+    }
+    Expression current = ColumnValueExp(ColumnName(it->second, head));
+    for (const std::string& segment : segments) {
+      current = FunctionCallExp(
+          "__get_field_safe",
+          {std::move(current), ConstantValueExp(Value(std::string(segment)))});
+    }
+    return current;
+  }
+  std::vector<Expression> children = ExpressionChildren(expr);
+  bool changed = false;
+  for (Expression& child : children) {
+    Expression mapped = BindColumnQualifiedFieldReads(child, col_table_map,
+                                                      relations);
+    changed |= child->ToString() != mapped->ToString();
+    child = std::move(mapped);
+  }
+  return changed ? WithExpressionChildren(expr, std::move(children)) : expr;
+}
+
+// Rewrites STRUCT/PROTO field paths (`value.empty_message`, where `value`
+// names a column rather than a FROM relation) into safe field-extraction
+// calls over the base column, so the flat-column plan executor can evaluate
+// them.  Returns nullptr when the expression is untouched.
+Expression BindFieldPaths(
+    const Expression& exp,
+    const std::unordered_map<std::string, std::string>& col_table_map,
+    const std::unordered_set<std::string>& relations) {
+  if (!exp) {
+    return nullptr;
+  }
+  if (exp->Type() == TypeTag::kColumnValue) {
+    const ColumnName& col_name = exp->AsColumnValue().GetColumnName();
+    if (col_name.schema.empty() || col_name.name.empty() ||
+        col_name.name == "*" || relations.contains(col_name.schema)) {
+      return nullptr;
+    }
+    const auto base_it = col_table_map.find(ToLowerCopy(col_name.schema));
+    if (base_it == col_table_map.end()) {
+      return nullptr;
+    }
+    Expression current =
+        ColumnValueExp(ColumnName(base_it->second, col_name.schema));
+    std::string remaining = col_name.name;
+    while (!remaining.empty()) {
+      const size_t dot = remaining.find('.');
+      std::string field = dot == std::string::npos ? remaining
+                                                   : remaining.substr(0, dot);
+      current = FunctionCallExp(
+          "__get_field_safe",
+          {std::move(current), ConstantValueExp(Value(std::move(field)))});
+      if (dot == std::string::npos) { break; }
+      remaining = remaining.substr(dot + 1);
+    }
+    return current;
+  }
+  std::vector<Expression> children = ExpressionChildren(exp);
+  bool changed = false;
+  for (Expression& child : children) {
+    Expression mapped = BindFieldPaths(child, col_table_map, relations);
+    changed |= static_cast<bool>(mapped);
+    if (mapped) { child = std::move(mapped); }
+  }
+  return changed ? WithExpressionChildren(exp, std::move(children)) : nullptr;
+}
+
+Status
+ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
+                    // resolution by design; trees are parser-bounded in depth.
     Expression& exp,
     const std::unordered_map<std::string, std::string>& col_table_map,
     const std::unordered_set<std::string>& ambiguous_colum_name,
-    const std::unordered_set<std::string>& relations) {
-  if (!exp) { return Status::kSuccess;
-}
+    const std::unordered_set<std::string>& relations,
+    const std::vector<ColumnName>& all_cols) {
+  if (!exp) {
+    return Status::kSuccess;
+  }
   if (exp->Type() == TypeTag::kColumnValue) {
     auto& cv = exp->AsColumnValue();
     const ColumnName& col_name = cv.GetColumnName();
@@ -62,15 +195,30 @@ Status ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-
     // implementations can rename their output schemas to match it
     // (Phase 8 aliases/self-joins).
     if (!col_name.schema.empty()) {
-      if (!relations.contains(col_name.schema)) { return Status::kNotExists;
-}
+      if (!relations.contains(col_name.schema)) {
+        return Status::kNotExists;
+      }
       return Status::kSuccess;
     }
-    if (ambiguous_colum_name.contains(col_name.name)) {
+    if (ambiguous_colum_name.contains(ToLowerCopy(col_name.name))) {
       return Status::kAmbiguousQuery;
     }
-    const auto it = col_table_map.find(col_name.name);
+    const auto it = col_table_map.find(ToLowerCopy(col_name.name));
     if (it == col_table_map.end()) {
+      // A bare name that matches a FROM relation (its alias or table name)
+      // denotes that relation's whole row as a struct ("SELECT s FROM t s").
+      if (relations.contains(ToLowerCopy(col_name.name))) {
+        std::vector<Expression> args;
+        for (const ColumnName& column : all_cols) {
+          if (!CaseInsensitiveEquals(column.schema, col_name.name)) {
+            continue;
+          }
+          args.push_back(ConstantValueExp(Value(std::string(column.name))));
+          args.push_back(ColumnValueExp(column));
+        }
+        exp = FunctionCallExp("__struct_json__", std::move(args));
+        return Status::kSuccess;
+      }
       return Status::kNotExists;
     }
     cv.SetSchemaName(it->second);
@@ -79,48 +227,48 @@ Status ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-
   if (exp->Type() == TypeTag::kBinaryExp) {
     Expression left = exp->AsBinaryExpression().Left();
     Expression right = exp->AsBinaryExpression().Right();
-    RETURN_IF_FAIL(
-        ResolveExpression(left, col_table_map, ambiguous_colum_name, relations));
-    RETURN_IF_FAIL(
-        ResolveExpression(right, col_table_map, ambiguous_colum_name, relations));
+    RETURN_IF_FAIL(ResolveExpression(left, col_table_map, ambiguous_colum_name,
+                                     relations, all_cols));
+    RETURN_IF_FAIL(ResolveExpression(right, col_table_map, ambiguous_colum_name,
+                                     relations, all_cols));
   } else if (exp->Type() == TypeTag::kUnaryExp) {
     Expression child = exp->AsUnaryExpression().Child();
-    RETURN_IF_FAIL(
-        ResolveExpression(child, col_table_map, ambiguous_colum_name, relations));
+    RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
+                                     relations, all_cols));
   } else if (exp->Type() == TypeTag::kAggregateExp) {
     Expression child = exp->AsAggregateExpression().Child();
     if (child->Type() == TypeTag::kColumnValue &&
         child->AsColumnValue().GetColumnName().name == "*") {
       return Status::kSuccess;
     }
-    RETURN_IF_FAIL(
-        ResolveExpression(child, col_table_map, ambiguous_colum_name, relations));
+    RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
+                                     relations, all_cols));
   } else if (exp->Type() == TypeTag::kCaseExp) {
     const auto& case_expression = exp->AsCaseExpression();
     for (const auto& clause : case_expression.when_clauses_) {
       Expression condition = clause.first;
       Expression value = clause.second;
       RETURN_IF_FAIL(ResolveExpression(condition, col_table_map,
-                                       ambiguous_colum_name, relations));
+                                       ambiguous_colum_name, relations, all_cols));
       RETURN_IF_FAIL(ResolveExpression(value, col_table_map,
-                                       ambiguous_colum_name, relations));
+                                       ambiguous_colum_name, relations, all_cols));
     }
     Expression otherwise = case_expression.else_clause_;
     RETURN_IF_FAIL(ResolveExpression(otherwise, col_table_map,
-                                     ambiguous_colum_name, relations));
+                                     ambiguous_colum_name, relations, all_cols));
   } else if (exp->Type() == TypeTag::kInExp) {
     const auto& in = exp->AsInExpression();
     Expression child = in.child_;
-    RETURN_IF_FAIL(
-        ResolveExpression(child, col_table_map, ambiguous_colum_name, relations));
+    RETURN_IF_FAIL(ResolveExpression(child, col_table_map, ambiguous_colum_name,
+                                     relations, all_cols));
     for (Expression item : in.list_) {
       RETURN_IF_FAIL(ResolveExpression(item, col_table_map,
-                                       ambiguous_colum_name, relations));
+                                       ambiguous_colum_name, relations, all_cols));
     }
   } else if (exp->Type() == TypeTag::kFunctionCallExp) {
     for (Expression argument : exp->AsFunctionCallExpression().Args()) {
       RETURN_IF_FAIL(ResolveExpression(argument, col_table_map,
-                                       ambiguous_colum_name, relations));
+                                       ambiguous_colum_name, relations, all_cols));
     }
   }
   return Status::kSuccess;
@@ -139,7 +287,7 @@ Status ResolveSelect(
       if (col_name.name == "*") {
         it = select.erase(it);
         for (const auto& cols : all_cols) {
-          if (ambiguous_colum_name.contains(cols.name)) {
+          if (ambiguous_colum_name.contains(ToLowerCopy(cols.name))) {
             it = select.insert(it, NamedExpression(cols));
           } else {
             it = select.insert(it, NamedExpression(cols.name, cols));
@@ -151,12 +299,28 @@ Status ResolveSelect(
       if (!col_name.schema.empty()) {
         Expression expression = it->expression;
         RETURN_IF_FAIL(ResolveExpression(expression, col_table_map,
-                                         ambiguous_colum_name, relations));
+                                         ambiguous_colum_name, relations, all_cols));
         ++it;
         continue;
       }
-      const auto col_it = col_table_map.find(col_name.name);
+      const auto col_it = col_table_map.find(ToLowerCopy(col_name.name));
       if (col_it == col_table_map.end()) {
+        // A bare name matching a FROM relation denotes its whole row as a
+        // struct ("SELECT s FROM t s"): encode every column of that relation
+        // explicitly so projection keeps them alive.
+        if (relations.contains(ToLowerCopy(col_name.name))) {
+          std::vector<Expression> args;
+          for (const ColumnName& column : all_cols) {
+            if (!CaseInsensitiveEquals(column.schema, col_name.name)) {
+              continue;
+            }
+            args.push_back(ConstantValueExp(Value(std::string(column.name))));
+            args.push_back(ColumnValueExp(column));
+          }
+          it->expression = FunctionCallExp("__struct_json__", std::move(args));
+          ++it;
+          continue;
+        }
         return Status::kNotExists;
       }
       cv.SetSchemaName(col_it->second);
@@ -164,7 +328,7 @@ Status ResolveSelect(
     } else {
       Expression expression = it->expression;
       RETURN_IF_FAIL(ResolveExpression(expression, col_table_map,
-                                       ambiguous_colum_name, relations));
+                                       ambiguous_colum_name, relations, all_cols));
       ++it;
     }
   }
@@ -188,26 +352,49 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
     const auto aliased = aliases_.find(relation);
     const std::string& physical =
         aliased == aliases_.end() ? relation : aliased->second;
-    ASSIGN_OR_RETURN(std::shared_ptr<Table>, from_table, ctx.GetTable(physical));
+    ASSIGN_OR_RETURN(std::shared_ptr<Table>, from_table,
+                     ctx.GetTable(physical));
     const Schema& sc = from_table->GetSchema();
     for (size_t i = 0; i < sc.ColumnCount(); ++i) {
       const ColumnName& col_name = sc.GetColumn(i).Name();
       all_cols.emplace_back(relation, col_name.name);
-      if (!col_table_map.contains(col_name.name)) {
-        col_table_map.emplace(col_name.name, relation);
+      const std::string lower_name = ToLowerCopy(col_name.name);
+      if (!col_table_map.contains(lower_name)) {
+        col_table_map.emplace(lower_name, relation);
       } else {
-        ambiguous_colum_name.emplace(col_name.name);
+        ambiguous_colum_name.emplace(lower_name);
       }
     }
   }
 
+  // STRUCT/PROTO field paths become explicit extraction calls before
+  // resolution so only plain column references remain to bind.
+  for (auto& item : select_) {
+    Expression mapped =
+        BindFieldPaths(item.expression, col_table_map, relations);
+    if (mapped) { item.expression = std::move(mapped); }
+  }
+  {
+    Expression mapped = BindFieldPaths(where_, col_table_map, relations);
+    if (mapped) { where_ = std::move(mapped); }
+  }
+
   // Rewrite SELECT clause.
+  for (auto& named : select_) {
+    if (named.expression) {
+      named.expression = BindColumnQualifiedFieldReads(
+          named.expression, col_table_map, relations);
+    }
+  }
+  where_ = where_ ? BindColumnQualifiedFieldReads(where_, col_table_map,
+                                                  relations)
+                  : where_;
   RETURN_IF_FAIL(ResolveSelect(select_, col_table_map, ambiguous_colum_name,
                                all_cols, relations));
 
   // Rewrite WHERE clause.
   return ResolveExpression(where_, col_table_map, ambiguous_colum_name,
-                           relations);
+                           relations, all_cols);
 }
 
 }  // namespace tinylamb

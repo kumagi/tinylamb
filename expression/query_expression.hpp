@@ -3,8 +3,11 @@
 #define TINYLAMB_QUERY_EXPRESSION_HPP
 
 #include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
+#include "common/constants.hpp"
 #include "expression/expression.hpp"
 
 namespace tinylamb {
@@ -12,14 +15,29 @@ namespace tinylamb {
 class EvaluationContext;
 class SelectStatement;
 
+// Three-valued ANY/ALL kernel shared by the AST and relational interpreters:
+// ANY is a three-valued OR over per-row comparisons, ALL its dual.  An empty
+// row set is vacuous (ALL -> TRUE, ANY -> FALSE).
+Value EvaluateQuantifiedComparison(BinaryOperation op, QuantifierMode mode,
+                                   const Value& test,
+                                   const std::vector<Value>& rows);
+
 class QueryExpression : public ExpressionBase {
  public:
   QueryExpression(std::shared_ptr<SelectStatement> query, Expression test,
                   bool exists, bool negated)
+      : QueryExpression(std::move(query), std::move(test), exists, negated,
+                        BinaryOperation::kEquals, QuantifierMode::kIn) {}
+
+  QueryExpression(std::shared_ptr<SelectStatement> query, Expression test,
+                  bool exists, bool negated, BinaryOperation op,
+                  QuantifierMode mode)
       : query_(std::move(query)),
         test_(std::move(test)),
         exists_(exists),
-        negated_(negated) {}
+        negated_(negated),
+        op_(op),
+        mode_(mode) {}
 
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kQueryExp; }
   [[nodiscard]] Value Evaluate(const Row&, const Schema&) const override;
@@ -37,12 +55,31 @@ class QueryExpression : public ExpressionBase {
   [[nodiscard]] const Expression& Test() const { return test_; }
   [[nodiscard]] bool Exists() const { return exists_; }
   [[nodiscard]] bool Negated() const { return negated_; }
+  // ARRAY(SELECT ...) mode: evaluation collects every projected row into a
+  // single array value instead of scalar/EXISTS/IN semantics.
+  [[nodiscard]] bool ArrayResult() const { return array_result_; }
+  void SetArrayResult(bool array_result) { array_result_ = array_result; }
+  // Static SQL type of the projected column (BOOL, INT32, ...), inferred from
+  // the subquery AST when possible.  Empty when only runtime inference is
+  // possible.
+  [[nodiscard]] const std::string& ArrayElementSqlType() const {
+    return array_element_sql_type_;
+  }
+  void SetArrayElementSqlType(std::string type) {
+    array_element_sql_type_ = std::move(type);
+  }
+  [[nodiscard]] BinaryOperation Op() const { return op_; }
+  [[nodiscard]] QuantifierMode Mode() const { return mode_; }
 
  private:
   std::shared_ptr<SelectStatement> query_;
   Expression test_;
   bool exists_{false};
   bool negated_{false};
+  bool array_result_{false};
+  std::string array_element_sql_type_;
+  BinaryOperation op_{BinaryOperation::kEquals};
+  QuantifierMode mode_{QuantifierMode::kIn};
 };
 
 }  // namespace tinylamb

@@ -12,5 +12,7 @@ Testing/
 compile_commands.json
 .cache/
 repro-drs-*/
-*.db
-*.log
+ironlamb-compliance-*
+
+googlesql_compliance-*
+ironlamb-compliance-*

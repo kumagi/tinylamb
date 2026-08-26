@@ -21,7 +21,9 @@
 #include <cstdio>
 #include <ctime>
 #include <iomanip>
+#include <optional>
 #include <ostream>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -29,10 +31,16 @@
 #include <vector>
 #include <utility>
 
+#include "expression/cast_expression.hpp"
+#include "expression/constant_value.hpp"
+
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
 #include "expression/evaluation_context.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/proto_text.hpp"
+#include "expression/sql_udf.hpp"
 #include "type/column_name.hpp"
 #include "type/function.hpp"
 #include "type/row.hpp"
@@ -43,6 +51,13 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+// JSON struct-text helpers; definitions live below with external linkage.
+std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
+    const std::string& body);
+bool JsonTextToValue(const std::string& text, Value* parsed);
+bool IdentifierEquals(std::string_view left, std::string_view right);
+
 namespace {
 
 struct CivilTime {
@@ -265,6 +280,158 @@ Value AddOrSubInterval(const std::string& func_name, const Value& date,
                                        : Value(FormatDateDays(result));
 }
 
+// Decodes one proto-text scalar token (`5`, `1.5`, `true`, `"str"`).
+Value ProtoTextScalar(std::string_view raw) {
+  while (!raw.empty() &&
+         std::isspace(static_cast<unsigned char>(raw.front()))) {
+    raw.remove_prefix(1);
+  }
+  while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.back()))) {
+    raw.remove_suffix(1);
+  }
+  if (raw.empty() || raw == "null") { return {}; }
+  if (raw == "true") { return Value(int64_t{1}); }
+  if (raw == "false") { return Value(int64_t{0}); }
+  if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
+    return Value(std::string(raw.substr(1, raw.size() - 2)));
+  }
+  std::string token(raw);
+  try {
+    return Value(static_cast<int64_t>(std::stoll(token)));
+  } catch (...) {
+  }
+  try {
+    return Value(std::stod(token));
+  } catch (...) {
+  }
+  return Value(std::move(token));
+}
+
+// Minimal proto text-format field extraction: repeated `field: value`
+// entries and `field { ... }` message blocks; multiple matches become an
+// array.  Mirrors the interpreter-side extractor for plan-executor use.
+bool ProtoTextExtractFieldShim(std::string_view text, std::string_view key,
+                               Value* out) {
+  // Proto presence fields (`has_xxx`) report whether `xxx` occurs.
+  if (key.size() > 4 && key.substr(0, 4) == "has_") {
+    Value probe;
+    if (!ProtoTextExtractFieldShim(text, key.substr(4), &probe)) {
+      *out = Value(int64_t{0});
+      return true;
+    }
+    *out = Value(int64_t{1});
+    return true;
+  }
+  std::vector<Value> matches;
+  size_t i = 0;
+  while (i < text.size()) {
+    while (i < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
+    }
+    if (i >= text.size()) { break; }
+    if (text[i] == '#') {
+      // Comment token: skip through end of line.
+      while (i < text.size() && text[i] != '\n') { ++i; }
+      continue;
+    }
+    if (text[i] == '{' || text[i] == '}') {
+      ++i;
+      continue;
+    }
+    const size_t name_start = i;
+    while (i < text.size() && text[i] != ':' && text[i] != '{' &&
+           !std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
+    }
+    const std::string_view field_name = text.substr(name_start, i - name_start);
+    while (i < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
+    }
+    if (i < text.size() && text[i] == '{') {
+      int nest = 1;
+      bool str = false;
+      size_t j = i + 1;
+      for (; j < text.size(); ++j) {
+        const char c = text[j];
+        if (str) {
+          if (c == '\\' && j + 1 < text.size()) { ++j; } else if (c == '"') {
+            str = false;
+          }
+          continue;
+        }
+        if (c == '"') {
+          str = true;
+        } else if (c == '{') {
+          ++nest;
+        } else if (c == '}') {
+          if (--nest == 0) { break; }
+        }
+      }
+      std::string_view body =
+          text.substr(i + 1, j > i + 1 ? j - i - 1 : 0);
+      while (!body.empty() &&
+             std::isspace(static_cast<unsigned char>(body.front()))) {
+        body.remove_prefix(1);
+      }
+      while (!body.empty() &&
+             std::isspace(static_cast<unsigned char>(body.back()))) {
+        body.remove_suffix(1);
+      }
+      i = j < text.size() ? j + 1 : text.size();
+      if (field_name.size() == key.size() &&
+          std::equal(key.begin(), key.end(), field_name.begin(),
+                     [](char a, char b) {
+                       return std::tolower(static_cast<unsigned char>(a)) ==
+                              std::tolower(static_cast<unsigned char>(b));
+                     })) {
+        matches.emplace_back(std::string(body));
+      }
+      continue;
+    }
+    if (i >= text.size() || text[i] != ':') { break; }
+    ++i;
+    while (i < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
+    }
+    const size_t value_begin = i;
+    size_t value_end;
+    if (i < text.size() && text[i] == '"') {
+      ++i;
+      while (i < text.size() && text[i] != '"') {
+        if (text[i] == '\\' && i + 1 < text.size()) { ++i; }
+        ++i;
+      }
+      value_end = std::min(text.size(), i + 1);
+      i = value_end;
+    } else {
+      while (i < text.size() &&
+             !std::isspace(static_cast<unsigned char>(text[i]))) {
+        ++i;
+      }
+      value_end = i;
+    }
+    if (field_name.size() == key.size() &&
+        std::equal(key.begin(), key.end(), field_name.begin(),
+                   [](char a, char b) {
+                     return std::tolower(static_cast<unsigned char>(a)) ==
+                            std::tolower(static_cast<unsigned char>(b));
+                   })) {
+      matches.push_back(ProtoTextScalar(
+          text.substr(value_begin, value_end - value_begin)));
+    }
+  }
+  if (matches.empty()) { return false; }
+  if (matches.size() == 1) {
+    *out = std::move(matches[0]);
+  } else {
+    *out = Value::Array(std::move(matches), "INT64");
+  }
+  return true;
+}
+
 Value ExecuteFunction(const std::string& name,
                       const std::vector<Value>& values) {
   auto raw_str = [](const Value& val) -> std::string {
@@ -273,7 +440,163 @@ Value ExecuteFunction(const std::string& name,
     }
     return val.AsString();
   };
+  // Proto-field guards emitted by the GoogleSQL frontend: NEW constructors
+  // and SELECT AS <proto> route non-constant repeated-field arrays and enum
+  // values through them so invalid data fails execution instead of being
+  // silently dropped from the text-format representation.
+  if (name == "$proto_repeated_guard") {
+    if (values.size() != 2) {
+      throw std::runtime_error("$proto_repeated_guard requires 2 arguments");
+    }
+    if (values[0].IsArray()) {
+      for (const Value& element : values[0].ArrayElements()) {
+        if (element.IsNull()) {
+          throw std::runtime_error(
+              "Cannot encode a null value in a repeated protocol message "
+              "field");
+        }
+      }
+    } else if (!values[0].IsNull()) {
+      throw std::runtime_error("repeated proto field requires an array");
+    }
+    return values[1];
+  }
+  if (name == "$proto_field_guard" || name == "$proto_enum_guard") {
+    const size_t expected = name == "$proto_field_guard" ? 3 : 2;
+    if (values.size() != expected) {
+      throw std::runtime_error(name + " argument count mismatch");
+    }
+    if (!values[0].IsNull()) {
+      Row dummy_row;
+      Schema dummy_schema;
+      Expression checked =
+          CastExpressionExp(ConstantValueExp(values[0]), raw_str(values[1]),
+                            false);
+      // Full CAST validation against the enum registry; throws on unknown
+      // members or out-of-range ordinals.
+      static_cast<void>(checked->Evaluate(dummy_row, dummy_schema));
+    }
+    return expected == 3 ? values[2] : values[0];
+  }
+  if (name == "__struct_set") {
+    if (values.size() != 3) {
+      throw std::runtime_error("__struct_set requires 3 arguments");
+    }
+    return StructSetField(values[0], raw_str(values[1]), values[2]);
+  }
+  if (name == "get_field") {
+    if (values.size() != 2) {
+      throw std::runtime_error("get_field requires 2 arguments");
+    }
+    if (values[0].IsNull()) { return {}; }
+    const std::string object = raw_str(values[0]);
+    const std::string field = raw_str(values[1]);
+    // Proto TEXT payloads resolve through the shared extractor (defaults,
+    // has_ bits, repeated arrays) instead of the JSON member scan.
+    Value proto_value;
+    if (TryProtoTextGetField(object, field, &proto_value)) {
+      return proto_value;
+    }
+    if (object.size() < 2 || object.front() != '{' || object.back() != '}') {
+      throw std::runtime_error("get_field requires a STRUCT");
+    }
+    for (const auto& [key, text] :
+         SplitJsonObjectMembers(object.substr(1, object.size() - 2))) {
+      if (IdentifierEquals(key, field)) {
+        Value parsed;
+        if (!JsonTextToValue(text, &parsed)) {
+          throw std::runtime_error("get_field: malformed member value");
+        }
+        return parsed;
+      }
+    }
+    throw std::runtime_error("field not found: " + field);
+  }
+  if (name == "__get_field_safe") {
+    // Field access that tolerates NULL bases and missing members by
+    // returning NULL; used for dotted references in DML predicates.
+    if (values.size() != 2) {
+      throw std::runtime_error("__get_field_safe requires 2 arguments");
+    }
+    if (values[0].IsNull()) { return {}; }
+    const std::string object = raw_str(values[0]);
+    const std::string field = raw_str(values[1]);
+    if (object.size() >= 2 && object.front() == '{' &&
+        object.back() == '}') {
+      const auto members =
+          SplitJsonObjectMembers(object.substr(1, object.size() - 2));
+      for (const auto& [key, text] : members) {
+        if (IdentifierEquals(key, field)) {
+          Value parsed;
+          if (!JsonTextToValue(text, &parsed)) { return {}; }
+          return parsed;
+        }
+      }
+      // Anonymous struct members (`STRUCT(2)` stores {"f1":2}) are still
+      // addressable by any field reference when unambiguous: a single-member
+      // object exposes its only value positionally.
+      if (members.size() == 1) {
+        Value parsed;
+        if (!JsonTextToValue(members.front().second, &parsed)) { return {}; }
+        return parsed;
+      }
+    }
+    // Proto text-format cells (`i1: 5 i2: 5`) carry the same field
+    // semantics: extract the first (or repeated) occurrence of `field`.
+    Value proto_field;
+    if (ProtoTextExtractFieldShim(object, field, &proto_field)) {
+      return proto_field;
+    }
+    return {};
+  }
 
+  if (name == "__struct_set") {
+    if (values.size() != 3) {
+      throw std::runtime_error("__struct_set requires 3 arguments");
+    }
+    return StructSetField(values[0], raw_str(values[1]), values[2]);
+  }
+  if (name == "get_field") {
+    if (values.size() != 2) {
+      throw std::runtime_error("get_field requires 2 arguments");
+    }
+    if (values[0].IsNull()) {
+      return {};
+    }
+    const std::string object = raw_str(values[0]);
+    const std::string field = raw_str(values[1]);
+    Value proto_value;
+    if (TryProtoTextGetField(object, field, &proto_value)) {
+      return proto_value;
+    }
+    if (object.size() < 2 || object.front() != '{' || object.back() != '}') {
+      throw std::runtime_error("get_field requires a STRUCT");
+    }
+    const auto members =
+        SplitJsonObjectMembers(object.substr(1, object.size() - 2));
+    for (const auto& [key, text] : members) {
+      if (IdentifierEquals(key, field)) {
+        Value parsed;
+        if (!JsonTextToValue(text, &parsed)) {
+          throw std::runtime_error("get_field: malformed member value");
+        }
+        return parsed;
+      }
+    }
+    throw std::runtime_error("field not found: " + field);
+  }
+  if (name == "rand") {
+    if (!values.empty()) {
+      throw std::runtime_error("RAND requires no arguments");
+    }
+    static thread_local std::mt19937_64 rng(
+        std::random_device{}() ^
+        static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    static thread_local std::uniform_real_distribution<double> uniform(0.0,
+                                                                       1.0);
+    return Value(uniform(rng));
+  }
   if (name == "coalesce") {
     for (const auto& val : values) {
       if (!val.IsNull()) { return val; }
@@ -522,9 +845,392 @@ Value ExecuteFunction(const std::string& name,
     }
     return Value(FormatCivilTime(ct) + "+00");
   }
+
+  // Deferred STRUCT(...) construction: arguments alternate field name and
+  // value; encoding is shared with the relational interpreter.
+  if (name == "__struct_json__") {
+    std::vector<std::pair<std::string, Value>> fields;
+    fields.reserve(values.size() / 2);
+    for (size_t i = 0; i + 1 < values.size(); i += 2) {
+      fields.emplace_back(values[i].IsNull()
+                              ? std::string()
+                              : std::string(values[i].value.varchar_value),
+                          values[i + 1]);
+    }
+    return Value(EncodeStructJson(fields));
+  }
+
+  if (name == "__proto_new") {
+    // NEW ProtoType(v1 AS f1, ...) / SELECT AS ProtoType: argument layout is
+    // (type_name, value1, field1, value2, field2, ...).  Builds the proto
+    // TEXT payload; required-field and enum-member violations throw.
+    if (values.size() % 2 != 1) {
+      throw std::runtime_error("__proto_new requires (type, v, f, ...)");
+    }
+    const std::string type_name = raw_str(values[0]);
+    std::vector<std::pair<std::string, Value>> fields;
+    fields.reserve(values.size() / 2);
+    for (size_t i = 1; i < values.size(); i += 2) {
+      fields.emplace_back(raw_str(values[i + 1]), values[i]);
+    }
+    return Value(ConstructProtoText(type_name, fields));
+  }
+  if (name == "__proto_set") {
+    // Dotted SET targets over proto TEXT columns: (payload, path, new_value).
+    if (values.size() != 3) {
+      throw std::runtime_error("__proto_set requires 3 arguments");
+    }
+    std::vector<std::string> path;
+    {
+      std::string_view joined = raw_str(values[1]);
+      size_t start = 0;
+      while (true) {
+        const size_t dot = joined.find('.', start);
+        if (dot == std::string_view::npos) {
+          path.emplace_back(joined.substr(start));
+          break;
+        }
+        path.emplace_back(joined.substr(start, dot - start));
+        start = dot + 1;
+      }
+    }
+    const std::string type_name =
+        InferProtoTypeName(values[0].IsNull() ? std::string_view()
+                                              : raw_str(values[0]),
+                           path);
+    if (values[0].IsNull()) {
+      throw std::runtime_error("Cannot set field of NULL `" +
+                               (type_name.empty() ? std::string("PROTO")
+                                                  : type_name) +
+                               "`");
+    }
+    const std::string payload = raw_str(values[0]);
+    auto rewritten = ProtoTextSetField(payload, path, values[2], type_name);
+    return Value(rewritten.value_or(payload));
+  }
+  if (name == "__get_extension") {
+    // value.(pkg.Ext.field): reads the bracketed extension entry from a
+    // proto TEXT payload; NULL bases yield NULL.
+    if (values.size() != 2) {
+      throw std::runtime_error("__get_extension requires 2 arguments");
+    }
+    if (values[0].IsNull()) {
+      return {};
+    }
+    const std::string base = raw_str(values[0]);
+    const std::string key = "[" + raw_str(values[1]) + "]";
+    Value out;
+    if (!TryProtoTextGetField(base, key, &out)) {
+      throw std::runtime_error("extension " + raw_str(values[1]) +
+                               " not found");
+    }
+    return out;
+  }
+  if (name == "unix_seconds" || name == "unix_millis" ||
+      name == "unix_micros" || name == "unix_date") {
+    if (values.size() != 1) {
+      throw std::runtime_error(name + " requires one TIMESTAMP argument");
+    }
+    if (values[0].IsNull()) {
+      return {};
+    }
+    const std::optional<int64_t> nanos =
+        ParseTimestampTextNanos(raw_str(values[0]));
+    if (!nanos.has_value()) {
+      throw std::runtime_error("invalid TIMESTAMP: " + raw_str(values[0]));
+    }
+    auto floor_div = [](int64_t a, int64_t b) {
+      const int64_t q = a / b;
+      return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+    };
+    if (name == "unix_date") {
+      return Value(floor_div(*nanos, 86400000000000LL));
+    }
+    if (name == "unix_seconds") {
+      return Value(floor_div(*nanos, 1000000000LL));
+    }
+    if (name == "unix_millis") {
+      return Value(floor_div(*nanos, 1000000LL));
+    }
+    return Value(floor_div(*nanos, 1000LL));
+  }
+
+  // SQL scalar UDFs registered by CREATE FUNCTION: evaluate the body against
+  // a synthetic single-row scope holding the argument values.
+  if (std::optional<SqlScalarFunction> udf = FindSqlScalarFunction(name)) {
+    SqlUdfBinding binding = BindSqlUdfArguments(*udf, std::move(values));
+    SqlUdfDepthGuard depth_guard;
+    return udf->body->Evaluate(binding.row, binding.schema);
+  }
   throw std::runtime_error("Function calls are not yet executable: " + name);
 }
+
 }  // namespace
+
+
+// ---- Struct (JSON text) helpers shared by the evaluators and the DML
+// mapping. Struct values are stored as flat JSON objects:
+//   {"field":value,"nested":{"x":1}}
+// ---------------------------------------------------------------------------
+
+bool IsJsonSpace(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+bool IdentifierEquals(std::string_view left, std::string_view right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(),
+                    [](char lhs, char rhs) {
+                      return std::tolower(static_cast<unsigned char>(lhs)) ==
+                             std::tolower(static_cast<unsigned char>(rhs));
+                    });
+}
+
+std::string TrimJson(std::string s) {
+  size_t b = 0;
+  while (b < s.size() && IsJsonSpace(s[b])) { ++b; }
+  size_t e = s.size();
+  while (e > b && IsJsonSpace(s[e - 1])) { --e; }
+  return s.substr(b, e - b);
+}
+
+std::string EscapeJsonText(std::string_view text) {
+  std::string escaped;
+  escaped.reserve(text.size());
+  for (const char c : text) {
+    switch (c) {
+      case '"': escaped += "\\\""; break;
+      case '\\': escaped += "\\\\"; break;
+      case '\n': escaped += "\\n"; break;
+      case '\t': escaped += "\\t"; break;
+      case '\r': escaped += "\\r"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          snprintf(buf, sizeof(buf), "\\u%04x",
+                   static_cast<unsigned char>(c));
+          escaped += buf;
+        } else {
+          escaped.push_back(c);
+        }
+    }
+  }
+  return escaped;
+}
+
+// Splits a JSON object body into top-level key / raw-value-text pairs.
+std::vector<std::pair<std::string, std::string>> SplitJsonObjectMembers(
+    const std::string& body) {
+  std::vector<std::pair<std::string, std::string>> members;
+  int depth = 0;
+  bool in_str = false;
+  char quote = '\0';
+  std::string current;
+  auto flush = [&]() {
+    const std::string member = TrimJson(current);
+    if (member.empty()) { return; }
+    size_t colon = std::string::npos;
+    int d2 = 0;
+    bool s2 = false;
+    char q2 = '\0';
+    for (size_t i = 0; i < member.size(); ++i) {
+      const char c = member[i];
+      if (s2) {
+        if (c == '\\' && i + 1 < member.size()) { ++i; }
+        else if (c == q2) { s2 = false; }
+        continue;
+      }
+      if (c == '"' || c == '\'') { s2 = true; q2 = c; }
+      else if (c == '{' || c == '[') { ++d2; }
+      else if (c == '}' || c == ']') { --d2; }
+      else if (c == ':' && d2 == 0) { colon = i; break; }
+    }
+    std::string key =
+        colon == std::string::npos ? member : member.substr(0, colon);
+    std::string value_text =
+        colon == std::string::npos ? "" : member.substr(colon + 1);
+    key = TrimJson(key);
+    if (key.size() >= 2 && key.front() == '"' && key.back() == '"') {
+      key = key.substr(1, key.size() - 2);
+    }
+    members.emplace_back(std::move(key), TrimJson(value_text));
+    current.clear();
+  };
+  for (size_t i = 0; i < body.size(); ++i) {
+    const char c = body[i];
+    if (in_str) {
+      current.push_back(c);
+      if (c == '\\' && i + 1 < body.size()) {
+        current.push_back(body[++i]);
+      } else if (c == quote) {
+        in_str = false;
+      }
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      in_str = true;
+      quote = c;
+      current.push_back(c);
+    } else if (c == '{' || c == '[') {
+      ++depth;
+      current.push_back(c);
+    } else if (c == '}' || c == ']') {
+      --depth;
+      current.push_back(c);
+    } else if (c == ',' && depth == 0) {
+      flush();
+    } else {
+      current.push_back(c);
+    }
+  }
+  flush();
+  return members;
+}
+
+bool JsonTextToValue(const std::string& text, Value* parsed) {
+  const std::string trimmed = TrimJson(text);
+  if (trimmed == "null") { *parsed = Value(); return true; }
+  if (trimmed == "true") { *parsed = Value(int64_t{1}); return true; }
+  if (trimmed == "false") { *parsed = Value(int64_t{0}); return true; }
+  if (trimmed.size() >= 2 && trimmed.front() == '"' &&
+      trimmed.back() == '"') {
+    std::string unescaped;
+    unescaped.reserve(trimmed.size());
+    for (size_t i = 1; i + 1 < trimmed.size(); ++i) {
+      if (trimmed[i] == '\\' && i + 2 < trimmed.size()) {
+        ++i;
+        switch (trimmed[i]) {
+          case 'n': unescaped.push_back('\n'); break;
+          case 't': unescaped.push_back('\t'); break;
+          case 'r': unescaped.push_back('\r'); break;
+          default: unescaped.push_back(trimmed[i]); break;
+        }
+      } else {
+        unescaped.push_back(trimmed[i]);
+      }
+    }
+    *parsed = Value(std::move(unescaped));
+    return true;
+  }
+  if (!trimmed.empty()) {
+    try {
+      size_t consumed = 0;
+      const int64_t as_int = std::stoll(trimmed, &consumed);
+      if (consumed == trimmed.size()) {
+        *parsed = Value(as_int);
+        return true;
+      }
+      const double as_double = std::stod(trimmed, &consumed);
+      if (consumed == trimmed.size()) {
+        *parsed = Value(as_double);
+        return true;
+      }
+    } catch (const std::exception&) {
+    }
+  }
+  std::string lowered_head;
+  if (!trimmed.empty()) {
+    lowered_head = trimmed.substr(0, 5);
+    for (char& c : lowered_head) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+  }
+  if (!trimmed.empty() && trimmed.back() == ']' &&
+      ((trimmed.front() == '{' && trimmed.back() == '}') ||
+       trimmed.front() == '[' || lowered_head == "array")) {
+    // Objects / bare arrays / canonical ARRAY<T>[...] tokens stay as raw
+    // struct-member text.
+    *parsed = Value(std::string(trimmed));
+    return true;
+  }
+  return false;
+}
+
+std::string EncodeStructMemberJson(const Value& value) {
+  if (value.IsNull()) { return "null"; }
+  switch (value.type) {
+    case ValueType::kInt64:
+      return std::to_string(value.value.int_value);
+    case ValueType::kDouble: {
+      char buffer[64];
+      auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer),
+                                     value.value.double_value);
+      (void)ec;
+      return std::string(buffer, ptr - buffer);
+    }
+    case ValueType::kDate:
+      return "\"" + EscapeJsonText(FormatDateDays(value.DateDays())) + "\"";
+    case ValueType::kVarChar: {
+      const std::string text(value.value.varchar_value);
+      // Nested structs and arrays are already JSON-shaped; embed verbatim.
+      if (text.size() >= 2 &&
+          ((text.front() == '{' && text.back() == '}') ||
+           (text.front() == '[' && text.back() == ']'))) {
+        return text;
+      }
+      return "\"" + EscapeJsonText(text) + "\"";
+    }
+    case ValueType::kArray: {
+      // Match the canonical struct-constructor storage text, which embeds
+      // arrays via Value::AsString(): "ARRAY<INT64>[50, NULL, 52]".
+      return value.AsString();
+    }
+    default:
+      break;
+  }
+  throw std::runtime_error("cannot encode struct member");
+}
+
+Value StructSetField(const Value& json, const std::string& path,
+                     const Value& new_value) {
+  if (json.IsNull()) { return json; }
+  if (json.type != ValueType::kVarChar) {
+    throw std::runtime_error("struct field assignment requires a STRUCT");
+  }
+  const std::string text(json.value.varchar_value);
+  if (text.size() < 2 || text.front() != '{' || text.back() != '}') {
+    throw std::runtime_error("struct field assignment requires a STRUCT");
+  }
+  size_t dot = path.find('.');
+  const std::string head = dot == std::string::npos ? path : path.substr(0, dot);
+  const std::string rest =
+      dot == std::string::npos ? std::string() : path.substr(dot + 1);
+  const auto members =
+      SplitJsonObjectMembers(text.substr(1, text.size() - 2));
+  std::string rebuilt = "{";
+  bool first = true;
+  bool replaced = false;
+  for (auto& [key, value_text] : members) {
+    if (!first) { rebuilt += ","; }
+    first = false;
+    if (IdentifierEquals(key, head)) {
+      replaced = true;
+      rebuilt += "\"" + EscapeJsonText(key) + "\":";
+      if (rest.empty()) {
+        rebuilt += EncodeStructMemberJson(new_value);
+      } else {
+        Value nested;
+        JsonTextToValue(value_text, &nested);
+        rebuilt += EncodeStructMemberJson(
+            StructSetField(nested, rest, new_value));
+      }
+    } else {
+      rebuilt += "\"" + EscapeJsonText(key) + "\":" + value_text;
+    }
+  }
+  if (!replaced) {
+    if (!first) { rebuilt += ","; }
+    rebuilt += "\"" + EscapeJsonText(head) + "\":";
+    if (rest.empty()) {
+      rebuilt += EncodeStructMemberJson(new_value);
+    } else {
+      rebuilt += EncodeStructMemberJson(
+          StructSetField(Value(std::string("{}")), rest, new_value));
+    }
+  }
+  rebuilt += "}";
+  return Value(std::move(rebuilt));
+}
 
 std::unordered_set<ColumnName> FunctionCallExpression::TouchedColumns() const {
   std::unordered_set<ColumnName> result;
@@ -536,6 +1242,30 @@ std::unordered_set<ColumnName> FunctionCallExpression::TouchedColumns() const {
 
 Value FunctionCallExpression::Evaluate(const Row& row,
                                        const Schema& schema) const {
+  if (func_name_ == "__row_struct") {
+    // Bare alias row reference ("SELECT s FROM t s"): encodes the columns
+    // qualified by the given alias as a struct JSON object.  Evaluated with
+    // the scope's full row so multi-source queries pick their own columns.
+    if (args_.size() != 1 || args_[0]->Type() != TypeTag::kConstantValue) {
+      throw std::runtime_error("__row_struct requires an alias literal");
+    }
+    std::string alias;
+    const Value& alias_value = args_[0]->AsConstantValue().GetValue();
+    if (!alias_value.IsNull()) {
+      alias = alias_value.type == ValueType::kVarChar
+                  ? std::string(alias_value.value.varchar_value)
+                  : alias_value.AsString();
+    }
+    std::vector<std::pair<std::string, Value>> fields;
+    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+      const ColumnName& column = schema.GetColumn(i).Name();
+      if (!alias.empty() && !IdentifierEquals(column.schema, alias)) {
+        continue;
+      }
+      fields.emplace_back(column.name, row.values_[i]);
+    }
+    return Value(EncodeStructJson(fields));
+  }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
       throw std::runtime_error("DATE_ADD/DATE_SUB requires DATE and INTERVAL");
@@ -545,6 +1275,66 @@ Value FunctionCallExpression::Evaluate(const Row& row,
 }
     return AddOrSubInterval(func_name_, date,
                             args_[1]->AsIntervalExpression());
+  }
+  // Conditional-evaluation semantics: only the taken (or error-handled)
+  // branch is evaluated, so errors inside untaken branches never surface.
+  // Branch results are normalized to the common supertype of every branch so
+  // downstream comparisons and sort keys stay type-consistent.
+  auto promotes_to_double = [&](const Schema& schema_for_types,
+                                size_t from) {
+    for (size_t i = from; i < args_.size(); ++i) {
+      try {
+        if (args_[i]->ResultType(schema_for_types).GetType() ==
+            TypeTag::kDouble) {
+          return true;
+        }
+      } catch (const std::exception&) {
+      }
+    }
+    return false;
+  };
+  auto normalize = [](Value value, bool to_double) {
+    if (to_double && !value.IsNull() && value.type == ValueType::kInt64) {
+      return Value(static_cast<double>(value.value.int_value));
+    }
+    return value;
+  };
+  if (func_name_ == "if") {
+    if (args_.size() != 3) { throw std::runtime_error("IF requires 3 arguments");
+}
+    const bool as_double = promotes_to_double(schema, 1);
+    return normalize(
+        args_[args_[0]->Evaluate(row, schema).Truthy() ? 1 : 2]->Evaluate(
+            row, schema), as_double);
+  }
+  if (func_name_ == "iferror") {
+    if (args_.size() != 2) { throw std::runtime_error("IFERROR requires 2 arguments");
+}
+    const bool as_double = promotes_to_double(schema, 0);
+    try {
+      return normalize(args_[0]->Evaluate(row, schema), as_double);
+    } catch (const std::exception&) {
+      return normalize(args_[1]->Evaluate(row, schema), as_double);
+    }
+  }
+  if (func_name_ == "iserror") {
+    if (args_.size() != 1) { throw std::runtime_error("ISERROR requires 1 argument");
+}
+    try {
+      args_[0]->Evaluate(row, schema);
+      return Value(int64_t{0});
+    } catch (const std::exception&) {
+      return Value(int64_t{1});
+    }
+  }
+  if (func_name_ == "nulliferror") {
+    if (args_.size() != 1) { throw std::runtime_error("NULLIFERROR requires 1 argument");
+}
+    try {
+      return args_[0]->Evaluate(row, schema);
+    } catch (const std::exception&) {
+      return Value();
+    }
   }
   std::vector<Value> values;
   values.reserve(args_.size());
@@ -584,6 +1374,43 @@ Value FunctionCallExpression::Evaluate(const Row* left,
     return AddOrSubInterval(func_name_, date,
                             args_[1]->AsIntervalExpression());
   }
+  // Lazy conditional-evaluation semantics (mirrors the plain overload).
+  if (func_name_ == "if") {
+    if (args_.size() != 3) { throw std::runtime_error("IF requires 3 arguments");
+}
+    const Value condition =
+        args_[0]->Evaluate(left, left_schema, right, right_schema);
+    return args_[condition.Truthy() ? 1 : 2]->Evaluate(
+        left, left_schema, right, right_schema);
+  }
+  if (func_name_ == "iferror") {
+    if (args_.size() != 2) { throw std::runtime_error("IFERROR requires 2 arguments");
+}
+    try {
+      return args_[0]->Evaluate(left, left_schema, right, right_schema);
+    } catch (const std::exception&) {
+      return args_[1]->Evaluate(left, left_schema, right, right_schema);
+    }
+  }
+  if (func_name_ == "iserror") {
+    if (args_.size() != 1) { throw std::runtime_error("ISERROR requires 1 argument");
+}
+    try {
+      args_[0]->Evaluate(left, left_schema, right, right_schema);
+      return Value(int64_t{0});
+    } catch (const std::exception&) {
+      return Value(int64_t{1});
+    }
+  }
+  if (func_name_ == "nulliferror") {
+    if (args_.size() != 1) { throw std::runtime_error("NULLIFERROR requires 1 argument");
+}
+    try {
+      return args_[0]->Evaluate(left, left_schema, right, right_schema);
+    } catch (const std::exception&) {
+      return Value();
+    }
+  }
   std::vector<Value> values;
   values.reserve(args_.size());
   for (const auto& arg : args_) {
@@ -606,6 +1433,41 @@ Value FunctionCallExpression::Evaluate(const Row& row, const Schema& schema,
     return AddOrSubInterval(func_name_, date,
                             args_[1]->AsIntervalExpression());
   }
+  // Lazy conditional-evaluation semantics (mirrors the plain overload).
+  if (func_name_ == "if") {
+    if (args_.size() != 3) { throw std::runtime_error("IF requires 3 arguments");
+}
+    const Value condition = args_[0]->Evaluate(row, schema, context);
+    return args_[condition.Truthy() ? 1 : 2]->Evaluate(row, schema, context);
+  }
+  if (func_name_ == "iferror") {
+    if (args_.size() != 2) { throw std::runtime_error("IFERROR requires 2 arguments");
+}
+    try {
+      return args_[0]->Evaluate(row, schema, context);
+    } catch (const std::exception&) {
+      return args_[1]->Evaluate(row, schema, context);
+    }
+  }
+  if (func_name_ == "iserror") {
+    if (args_.size() != 1) { throw std::runtime_error("ISERROR requires 1 argument");
+}
+    try {
+      args_[0]->Evaluate(row, schema, context);
+      return Value(int64_t{0});
+    } catch (const std::exception&) {
+      return Value(int64_t{1});
+    }
+  }
+  if (func_name_ == "nulliferror") {
+    if (args_.size() != 1) { throw std::runtime_error("NULLIFERROR requires 1 argument");
+}
+    try {
+      return args_[0]->Evaluate(row, schema, context);
+    } catch (const std::exception&) {
+      return Value();
+    }
+  }
   std::vector<Value> values;
   values.reserve(args_.size());
   for (const auto& arg : args_) {
@@ -624,6 +1486,13 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
   if (func_name_ == "if") {
     if (args_.size() < 2) { return {TypeTag::kInvalid}; }
     return args_[1]->ResultType(schema);
+  }
+  if (func_name_ == "iferror" || func_name_ == "nulliferror") {
+    if (args_.empty()) { return {TypeTag::kInvalid}; }
+    return args_[0]->ResultType(schema);
+  }
+  if (func_name_ == "iserror") {
+    return {TypeTag::kBigInt};
   }
   if (func_name_ == "split" || func_name_ == "regexp_extract_all" || func_name_.ends_with("_array")) {
     return {TypeTag::kArray};
@@ -696,6 +1565,13 @@ Type FunctionCallExpression::ResultType(const Schema& left,
   if (func_name_ == "if") {
     if (args_.size() < 2) { return {TypeTag::kInvalid}; }
     return args_[1]->ResultType(left, right);
+  }
+  if (func_name_ == "iferror" || func_name_ == "nulliferror") {
+    if (args_.empty()) { return {TypeTag::kInvalid}; }
+    return args_[0]->ResultType(left, right);
+  }
+  if (func_name_ == "iserror") {
+    return {TypeTag::kBigInt};
   }
   if (func_name_ == "split" || func_name_ == "regexp_extract_all" || func_name_.ends_with("_array")) {
     return {TypeTag::kArray};

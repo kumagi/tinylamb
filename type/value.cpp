@@ -17,6 +17,7 @@
 #include "type/value.hpp"
 #include <endian.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -94,9 +95,100 @@ std::string ToString(AggregationType type) {
       return "STRING_AGG";
     case AggregationType::kCountIf:
       return "COUNTIF";
+    case AggregationType::kAnyValue:
+      return "ANY_VALUE";
+    case AggregationType::kVarSamp:
+      return "VAR_SAMP";
+    case AggregationType::kVarPop:
+      return "VAR_POP";
+    case AggregationType::kStddevSamp:
+      return "STDDEV_SAMP";
+    case AggregationType::kStddevPop:
+      return "STDDEV_POP";
+    case AggregationType::kCovarSamp:
+      return "COVAR_SAMP";
+    case AggregationType::kCovarPop:
+      return "COVAR_POP";
+    case AggregationType::kCorr:
+      return "CORR";
+    case AggregationType::kApproxQuantiles:
+      return "APPROX_QUANTILES";
+    case AggregationType::kBitAnd:
+      return "BIT_AND";
+    case AggregationType::kBitOr:
+      return "BIT_OR";
+    case AggregationType::kBitXor:
+      return "BIT_XOR";
+    case AggregationType::kArrayConcatAgg:
+      return "ARRAY_CONCAT_AGG";
+    case AggregationType::kElementwiseSum:
+      return "ELEMENTWISE_SUM";
+    case AggregationType::kElementwiseAvg:
+      return "ELEMENTWISE_AVG";
+    case AggregationType::kApproxTopCount:
+      return "APPROX_TOP_COUNT";
+    case AggregationType::kApproxTopSum:
+      return "APPROX_TOP_SUM";
+    case AggregationType::kHllInit:
+      return "HLL_COUNT.INIT";
+    case AggregationType::kHllMerge:
+      return "HLL_COUNT.MERGE";
+    case AggregationType::kHllMergePartial:
+      return "HLL_COUNT.MERGE_PARTIAL";
+    case AggregationType::kKllInitInt64:
+      return "KLL_QUANTILES.INIT_INT64";
+    case AggregationType::kKllInitUint64:
+      return "KLL_QUANTILES.INIT_UINT64";
+    case AggregationType::kKllInitDouble:
+      return "KLL_QUANTILES.INIT_DOUBLE";
+    case AggregationType::kKllMergePartial:
+      return "KLL_QUANTILES.MERGE_PARTIAL";
+    case AggregationType::kPercentileCont:
+      return "PERCENTILE_CONT";
+    case AggregationType::kApproxCountDistinct:
+      return "APPROX_COUNT_DISTINCT";
     default:
       return "UNKNOWN";
   }
+}
+
+bool IsStatisticalAggregate(AggregationType type) {
+  switch (type) {
+    case AggregationType::kVarSamp:
+    case AggregationType::kVarPop:
+    case AggregationType::kStddevSamp:
+    case AggregationType::kStddevPop:
+    case AggregationType::kCovarSamp:
+    case AggregationType::kCovarPop:
+    case AggregationType::kCorr:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsSketchAggregate(AggregationType type) {
+  switch (type) {
+    case AggregationType::kApproxQuantiles:
+    case AggregationType::kApproxTopCount:
+    case AggregationType::kApproxTopSum:
+    case AggregationType::kHllInit:
+    case AggregationType::kHllMerge:
+    case AggregationType::kHllMergePartial:
+    case AggregationType::kKllInitInt64:
+    case AggregationType::kKllInitUint64:
+    case AggregationType::kKllInitDouble:
+    case AggregationType::kKllMergePartial:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Everything from ANY_VALUE onward is an extended aggregate implemented by
+// the relational accumulator only.
+bool IsExtendedAggregate(AggregationType type) {
+  return type >= AggregationType::kAnyValue;
 }
 
 Value::Value(int int_val) {
@@ -164,7 +256,10 @@ const std::string& Value::ArrayElementSqlType() const {
 }
 
 Value::Value(const Value& o)
-    : value(o.value), type(o.type), array_(o.array_) {
+    : value(o.value),
+      type(o.type),
+      array_(o.array_),
+      collation_(o.collation_) {
   if (type == ValueType::kVarChar) {
     owned_data.assign(o.value.varchar_value);
     value.varchar_value = owned_data;
@@ -175,7 +270,8 @@ Value::Value(Value&& o) noexcept
     : value(o.value),
       type(o.type),
       owned_data(std::move(o.owned_data)),
-      array_(std::move(o.array_)) {
+      array_(std::move(o.array_)),
+      collation_(o.collation_) {
   if (type == ValueType::kVarChar) { value.varchar_value = owned_data; }
   o.type = ValueType::kNull;
 }
@@ -186,6 +282,7 @@ Value& Value::operator=(const Value& rhs) {
   value = rhs.value;
   owned_data.clear();
   array_ = rhs.array_;
+  collation_ = rhs.collation_;
   if (type == ValueType::kVarChar) {
     owned_data.assign(rhs.value.varchar_value);
     value.varchar_value = owned_data;
@@ -199,6 +296,7 @@ Value& Value::operator=(Value&& o) noexcept {
   array_ = std::move(o.array_);
   type = o.type;
   value = o.value;
+  collation_ = o.collation_;
   if (type == ValueType::kVarChar) { value.varchar_value = owned_data; }
   o.type = ValueType::kNull;
   return *this;
@@ -346,6 +444,15 @@ size_t Value::SkipSerialized(const char* src, ValueType as_type) {
   throw std::runtime_error("undefined type");
 }
 
+std::string FormatDoubleShortest(double value) {
+  if (std::isnan(value)) { return "nan"; }
+  if (std::isinf(value)) { return value > 0 ? "inf" : "-inf"; }
+  char buffer[64];
+  auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), value);
+  if (ec != std::errc()) { return std::to_string(value); }
+  return std::string(buffer, ptr - buffer);
+}
+
 [[nodiscard]] std::string Value::AsString() const {
   switch (type) {
     case ValueType::kNull:
@@ -397,19 +504,32 @@ bool Value::operator==(const Value& rhs) const {
       std::string_view sv2 = rhs.value.varchar_value;
       if (sv1 == sv2) { return true; }
       auto is_iv = [](std::string_view s) {
-        return s.find('-') != std::string_view::npos &&
-               s.find(' ') != std::string_view::npos &&
-               s.find('-') < s.find(' ');
+        // Interval text carries a single-hyphen month token ("2014-1 0 ...");
+        // a leading token shaped like an ISO date ("2014-01-01 ...") is a
+        // timestamp string and must compare byte-exact instead.
+        const size_t sp = s.find(' ');
+        if (sp == std::string_view::npos) { return false; }
+        const size_t hy = s.find('-');
+        if (hy == std::string_view::npos || hy > sp) { return false; }
+        return s.substr(0, sp).find('-') ==
+               s.substr(0, sp).rfind('-');
       };
       if (is_iv(sv1) && is_iv(sv2)) {
         return IntervalValue::Parse(sv1) == IntervalValue::Parse(sv2);
       }
       return false;
     }
-    case ValueType::kDouble:
+    case ValueType::kDouble: {
+      const double lhs = value.double_value;
+      const double rhs_double = rhs.value.double_value;
       // Epsilon comparison: accumulated sums must compare equal to literals
       // (e.g. SUM over doubles vs 22.44). Exact bit equality is too strict.
-      return std::fabs(value.double_value - rhs.value.double_value) < 1e-9;
+      // Infinities compare equal only to themselves (inf - inf is NaN, so
+      // the epsilon test alone would report two -inf values unequal).
+      if (lhs == rhs_double) { return true; }
+      if (std::isnan(lhs) || std::isnan(rhs_double)) { return false; }
+      return std::fabs(lhs - rhs_double) < 1e-9;
+    }
     case ValueType::kArray:
       return ArrayElementSqlType() == rhs.ArrayElementSqlType() &&
              ArrayElements() == rhs.ArrayElements();
@@ -615,9 +735,15 @@ bool Value::operator<(const Value& rhs) const {
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
       auto is_iv = [](std::string_view s) {
-        return s.find('-') != std::string_view::npos &&
-               s.find(' ') != std::string_view::npos &&
-               s.find('-') < s.find(' ');
+        // Interval text carries a single-hyphen month token ("2014-1 0 ...");
+        // a leading token shaped like an ISO date ("2014-01-01 ...") is a
+        // timestamp string and must compare byte-exact instead.
+        const size_t sp = s.find(' ');
+        if (sp == std::string_view::npos) { return false; }
+        const size_t hy = s.find('-');
+        if (hy == std::string_view::npos || hy > sp) { return false; }
+        return s.substr(0, sp).find('-') ==
+               s.substr(0, sp).rfind('-');
       };
       if (is_iv(sv1) && is_iv(sv2)) {
         return IntervalValue::Parse(sv1) < IntervalValue::Parse(sv2);
@@ -646,9 +772,15 @@ bool Value::operator>(const Value& rhs) const {
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
       auto is_iv = [](std::string_view s) {
-        return s.find('-') != std::string_view::npos &&
-               s.find(' ') != std::string_view::npos &&
-               s.find('-') < s.find(' ');
+        // Interval text carries a single-hyphen month token ("2014-1 0 ...");
+        // a leading token shaped like an ISO date ("2014-01-01 ...") is a
+        // timestamp string and must compare byte-exact instead.
+        const size_t sp = s.find(' ');
+        if (sp == std::string_view::npos) { return false; }
+        const size_t hy = s.find('-');
+        if (hy == std::string_view::npos || hy > sp) { return false; }
+        return s.substr(0, sp).find('-') ==
+               s.substr(0, sp).rfind('-');
       };
       if (is_iv(sv1) && is_iv(sv2)) {
         return IntervalValue::Parse(sv1) > IntervalValue::Parse(sv2);
@@ -792,6 +924,64 @@ Value Value::operator^(const Value& rhs) const {
   throw std::runtime_error("Cannot do '^' against this type");
 }
 
+int CompareForOrderBy(const Value& a, const Value& b) {
+  // Type rank keeps cross-type keys in a deterministic total order; matching
+  // types compare by value.
+  static constexpr int kRank[] = {0, 1, 4, 3, 5, 6};  // null,int,string,double,date,array
+  auto rank_of = [](const Value& v) {
+    return v.type == ValueType::kNull
+               ? 0
+               : (static_cast<int>(v.type) < 6 ? kRank[static_cast<int>(v.type)]
+                                               : 9);
+  };
+  if (a.IsNull() || b.IsNull()) {
+    // NULLs compare equal here; NULLS FIRST/LAST is the caller's decision.
+    if (a.IsNull() && b.IsNull()) { return 0;
+}
+    return a.IsNull() ? -1 : 1;
+  }
+  const int ra = rank_of(a);
+  const int rb = rank_of(b);
+  if (ra != rb) { return ra < rb ? -1 : 1;
+}
+  switch (a.type) {
+    case ValueType::kInt64:
+    case ValueType::kDate:
+      return a.value.int_value < b.value.int_value
+                 ? -1
+                 : (b.value.int_value < a.value.int_value ? 1 : 0);
+    case ValueType::kDouble: {
+      const double x = a.value.double_value;
+      const double y = b.value.double_value;
+      // GoogleSQL ordering: NULL < NaN < every other value; all NaNs are
+      // equal under the ordering (DESC is the exact reverse).
+      const bool nx = std::isnan(x);
+      const bool ny = std::isnan(y);
+      if (nx || ny) { return nx && ny ? 0 : (nx ? -1 : 1);
+}
+      return x < y ? -1 : (y < x ? 1 : 0);
+    }
+    case ValueType::kVarChar:
+      return a.value.varchar_value < b.value.varchar_value
+                 ? -1
+                 : (b.value.varchar_value < a.value.varchar_value ? 1 : 0);
+    case ValueType::kArray: {
+      const auto& xs = a.ArrayElements();
+      const auto& ys = b.ArrayElements();
+      const size_t n = std::min(xs.size(), ys.size());
+      for (size_t i = 0; i < n; ++i) {
+        const int c = CompareForOrderBy(xs[i], ys[i]);
+        if (c != 0) { return c;
+}
+      }
+      return xs.size() < ys.size() ? -1
+                                   : (ys.size() < xs.size() ? 1 : 0);
+    }
+    default:
+      return 0;
+  }
+}
+
 std::ostream& operator<<(std::ostream& o, const Value& v) {
   o << v.AsString();
   return o;
@@ -861,9 +1051,15 @@ uint64_t std::hash<tinylamb::Value>::operator()(
     case tinylamb::ValueType::kVarChar: {
       std::string_view sv = v.value.varchar_value;
       auto is_iv = [](std::string_view s) {
-        return s.find('-') != std::string_view::npos &&
-               s.find(' ') != std::string_view::npos &&
-               s.find('-') < s.find(' ');
+        // Interval text carries a single-hyphen month token ("2014-1 0 ...");
+        // a leading token shaped like an ISO date ("2014-01-01 ...") is a
+        // timestamp string and must compare byte-exact instead.
+        const size_t sp = s.find(' ');
+        if (sp == std::string_view::npos) { return false; }
+        const size_t hy = s.find('-');
+        if (hy == std::string_view::npos || hy > sp) { return false; }
+        return s.substr(0, sp).find('-') ==
+               s.substr(0, sp).rfind('-');
       };
       if (is_iv(sv)) {
         tinylamb::IntervalValue iv = tinylamb::IntervalValue::Parse(sv);
@@ -874,8 +1070,15 @@ uint64_t std::hash<tinylamb::Value>::operator()(
       }
       return std::hash<std::string_view>()(sv);
     }
-    case tinylamb::ValueType::kDouble:
-      return std::hash<double>()(v.value.double_value);
+    case tinylamb::ValueType::kDouble: {
+      // Canonicalize before hashing so group-key buckets agree with SQL
+      // equality: every NaN folds to one pattern and -0/+0 share a bucket.
+      const double d = v.value.double_value;
+      if (std::isnan(d)) {
+        return std::hash<int64_t>()(0x7ff8000000000000LL);
+      }
+      return std::hash<double>()(d == 0.0 ? 0.0 : d);
+    }
     case tinylamb::ValueType::kArray: {
       uint64_t h = std::hash<std::string>()(v.ArrayElementSqlType());
       for (const tinylamb::Value& element : v.ArrayElements()) {

@@ -91,6 +91,19 @@ bool SkipBindConstant(const Value& value) {
           value.type != ValueType::kVarChar && value.type != ValueType::kDate);
 }
 
+// Visitor-synthesized function calls carry structural constant arguments
+// (operators, quantifier modes, field names, unit names) that have no
+// counterpart in the SQL text.  The text-driven extractor never emits them,
+// so binding must pass them through verbatim; treating them as bindable
+// literals shifts every later parameter and silently rewrites operator or
+// field-name slots into user data.
+bool IsStructuralCallArg(std::string_view func, size_t index) {
+  if (func == "__quantified__") { return index >= 2; }
+  if (func == "__struct_json__") { return index % 3 != 1; }
+  if (func == "make_interval" || func == "get_field") { return index == 1; }
+  return false;
+}
+
 Expression BindExpression(const Expression& expression,
                           const std::vector<Value>& parameters, size_t* index);
 
@@ -181,10 +194,15 @@ Expression BindExpression(const Expression& expression,  // NOLINT(misc-no-recur
     }
     case TypeTag::kFunctionCallExp: {
       const auto& call = expression->AsFunctionCallExpression();
+      const std::string& func = call.FuncName();
       std::vector<Expression> args;
       args.reserve(call.Args().size());
-      for (const Expression& arg : call.Args()) {
-        args.push_back(BindExpression(arg, parameters, index));
+      for (size_t i = 0; i < call.Args().size(); ++i) {
+        if (IsStructuralCallArg(func, i)) {
+          args.push_back(call.Args()[i]);
+        } else {
+          args.push_back(BindExpression(call.Args()[i], parameters, index));
+        }
       }
       return FunctionCallExp(call.FuncName(), std::move(args));
     }
@@ -203,8 +221,12 @@ Expression BindExpression(const Expression& expression,  // NOLINT(misc-no-recur
       // first, the subquery body afterwards.
       Expression test = BindExpression(query.Test(), parameters, index);
       auto subquery = BindSelect(*query.Query(), parameters, index);
-      return QueryExpressionExp(std::move(subquery), std::move(test),
-                                query.Exists(), query.Negated());
+      auto bound = std::make_shared<QueryExpression>(
+          std::move(subquery), std::move(test), query.Exists(),
+          query.Negated());
+      // Preserve ARRAY(SELECT ...) semantics across template rebinding.
+      bound->SetArrayResult(query.ArrayResult());
+      return Expression(bound);
     }
     case TypeTag::kIntervalExp: {
       const auto& interval = expression->AsIntervalExpression();
@@ -295,13 +317,16 @@ bool ContainsBindableConstant(const Expression& expression) {  // NOLINT(misc-no
 }
       return std::ranges::any_of(in.list_, ContainsBindableConstant);
     }
-    case TypeTag::kFunctionCallExp:
-      for (const Expression& arg :
-           expression->AsFunctionCallExpression().Args()) {
-        if (ContainsBindableConstant(arg)) { return true;
+    case TypeTag::kFunctionCallExp: {
+      const auto& call = expression->AsFunctionCallExpression();
+      for (size_t i = 0; i < call.Args().size(); ++i) {
+        if (IsStructuralCallArg(call.FuncName(), i)) { continue;
+}
+        if (ContainsBindableConstant(call.Args()[i])) { return true;
 }
       }
       return false;
+    }
     case TypeTag::kArrayExp:
       for (const Expression& element :
            expression->AsArrayExpression().Elements()) {
@@ -406,6 +431,12 @@ std::shared_ptr<SelectStatement> BindSelect(  // NOLINT(misc-no-recursion) // Re
 }
   if (having) { result->SetHaving(std::move(having));
 }
+  // UNION ALL branches appear after the main SELECT in SQL text, so bind
+  // them last (after every main-select parameter) in branch order. Dropping
+  // them silently shrank re-bound statements to their first branch.
+  for (const auto& branch : select.UnionAll()) {
+    result->AddUnionAll(BindSelect(*branch, parameters, index));
+  }
   for (auto& [name, query] : withs) {
     result->AddWithQuery(name, std::move(query));
   }
@@ -556,6 +587,25 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       }
       continue;
     }
+    if (KeywordAt(sql, i, "ASSERT_ROWS_MODIFIED")) {
+      // The row-count assert is statement metadata carried outside the
+      // expression tree; parameterizing its literal would let two asserts
+      // that differ only in the count collide on one fingerprint (and one
+      // cached shape) while binding substitutes the wrong value.
+      constexpr std::string_view kAssert = "ASSERT_ROWS_MODIFIED";
+      result.fingerprint.append(kAssert);
+      i += kAssert.size();
+      while (i < sql.size() &&
+             std::isspace(static_cast<unsigned char>(sql[i])) != 0) {
+        result.fingerprint.push_back(sql[i]);
+        ++i;
+      }
+      while (i < sql.size() && std::isdigit(static_cast<unsigned char>(sql[i])) != 0) {
+        result.fingerprint.push_back(sql[i]);
+        ++i;
+      }
+      continue;
+    }
     if (KeywordAt(sql, i, "CREATE") || KeywordAt(sql, i, "DROP")) {
       result.templatable = false;
     }
@@ -645,9 +695,15 @@ std::unique_ptr<Statement> BindStatementLiterals(
         }
         rows.push_back(std::move(values));
       }
-      bound = std::make_unique<InsertStatement>(insert.TableName(),
-                                                std::move(rows),
-                                                insert.Columns());
+      auto bound_insert = std::make_unique<InsertStatement>(
+          insert.TableName(), std::move(rows), insert.Columns());
+      // Preserve conflict-handling attributes across template rebinding;
+      // dropping them would silently turn INSERT IGNORE/UPDATE/REPLACE and
+      // ASSERT_ROWS_MODIFIED into plain inserts.
+      bound_insert->SetMode(insert.Mode());
+      bound_insert->SetAssertRowsModified(insert.AssertRowsModified());
+      bound_insert->SetQuery(insert.Query());
+      bound = std::move(bound_insert);
       break;
     }
     case StatementType::kUpdate: {
@@ -659,16 +715,20 @@ std::unique_ptr<Statement> BindStatementLiterals(
             assignment.first,
             BindExpression(assignment.second, parameters, &index));
       }
-      bound = std::make_unique<UpdateStatement>(
+      auto bound_update = std::make_unique<UpdateStatement>(
           update.TableName(), std::move(assignments),
           BindExpression(update.WhereClause(), parameters, &index));
+      bound_update->SetAssertRowsModified(update.AssertRowsModified());
+      bound = std::move(bound_update);
       break;
     }
     case StatementType::kDelete: {
       const auto& remove = dynamic_cast<const DeleteStatement&>(statement);
-      bound = std::make_unique<DeleteStatement>(
+      auto bound_delete = std::make_unique<DeleteStatement>(
           remove.TableName(),
           BindExpression(remove.WhereClause(), parameters, &index));
+      bound_delete->SetAssertRowsModified(remove.AssertRowsModified());
+      bound = std::move(bound_delete);
       break;
     }
     case StatementType::kCreateTable:

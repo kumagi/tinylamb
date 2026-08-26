@@ -77,6 +77,8 @@ enum class BinaryOperation {
   kMultiply,
   kDivide,
   kModulo,
+  kShiftLeft,
+  kShiftRight,
 
   // Comparisons.
   kEquals,
@@ -106,6 +108,10 @@ inline std::string_view ToString(BinaryOperation op) {
       return "/";
     case BinaryOperation::kModulo:
       return "%";
+    case BinaryOperation::kShiftLeft:
+      return "<<";
+    case BinaryOperation::kShiftRight:
+      return ">>";
     case BinaryOperation::kEquals:
       return "=";
     case BinaryOperation::kNotEquals:

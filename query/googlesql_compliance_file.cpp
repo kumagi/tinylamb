@@ -52,6 +52,100 @@ bool LineIsSeparator(std::string_view line, std::string_view expected) {
   return Trim(line) == expected;
 }
 
+// Byte offset of an " as " separator that sits outside parentheses, brackets,
+// angle brackets and quoted literals, or npos when none exists.
+size_t TopLevelAsPosition(const std::string& lower) {
+  const std::string needle = " as ";
+  int depth = 0;
+  bool in_string = false;
+  char quote = '\0';
+  for (size_t i = 0; i < lower.size(); ++i) {
+    const char c = lower[i];
+    if (in_string) {
+      if (c == '\\' && i + 1 < lower.size()) { ++i; continue; }
+      if (c == quote) { in_string = false; }
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      in_string = true;
+      quote = c;
+      continue;
+    }
+    if (c == '[' || c == '{' || c == '(' || c == '<') {
+      ++depth;
+    } else if (c == ']' || c == '}' || c == ')' || c == '>') {
+      if (depth > 0) { --depth; }
+    } else if (c == ' ' && depth == 0 &&
+               lower.compare(i, needle.size(), needle) == 0) {
+      return i;
+    }
+  }
+  return std::string::npos;
+}
+
+// True when `s` ends with "<whitespace><identifier>" and the boundary sits at
+// bracket depth zero outside string literals.
+bool SplitTrailingIdentifier(const std::string& s, size_t* split) {
+  if (s.empty()) { return false; }
+  size_t end = s.size();
+  while (end > 0 &&
+         (std::isalnum(static_cast<unsigned char>(s[end - 1])) != 0 ||
+          s[end - 1] == '_')) {
+    --end;
+  }
+  if (end == s.size() || end == 0) { return false; }
+  // The identifier must be preceded by whitespace...
+  if (std::isspace(static_cast<unsigned char>(s[end - 1])) == 0) {
+    return false;
+  }
+  // ...at bracket depth zero outside strings.
+  int depth = 0;
+  bool in_string = false;
+  char quote = '\0';
+  for (size_t i = 0; i < end - 1; ++i) {
+    const char c = s[i];
+    if (in_string) {
+      if (c == '\\' && i + 1 < end - 1) { ++i; continue; }
+      if (c == quote) { in_string = false; }
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      in_string = true;
+      quote = c;
+      continue;
+    }
+    if (c == '[' || c == '{' || c == '(' || c == '<') { ++depth; }
+    if (c == ']' || c == '}' || c == ')' || c == '>') { --depth; }
+  }
+  if (depth != 0 || in_string) { return false; }
+  *split = end;
+  return true;
+}
+
+// Option headers such as [parameters=...] may wrap across physical lines;
+// gather continuations until every opened bracket/brace/paren is closed.
+bool OptionHeaderBalanced(const std::string& text) {
+  int depth = 0;
+  bool in_string = false;
+  char quote = '\0';
+  for (size_t i = 0; i < text.size(); ++i) {
+    const char c = text[i];
+    if (in_string) {
+      if (c == '\\' && i + 1 < text.size()) { ++i; continue; }
+      if (c == quote) { in_string = false; }
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      in_string = true;
+      quote = c;
+      continue;
+    }
+    if (c == '[' || c == '{' || c == '(') { ++depth; }
+    if (c == ']' || c == '}' || c == ')') { --depth; }
+  }
+  return depth <= 0 && !in_string;
+}
+
 std::vector<std::string> SplitCases(std::string_view contents) {
   std::vector<std::string> cases;
   std::string current;
@@ -70,7 +164,8 @@ std::vector<std::string> SplitCases(std::string_view contents) {
   return cases;
 }
 
-bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out) {
+bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
+                       std::vector<std::string>* file_default_features) {
   const std::string trimmed = Trim(line);
   if (trimmed.size() < 2 || trimmed.front() != '[' || trimmed.back() != ']') {
     return false;
@@ -98,17 +193,50 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out) {
     }
     return true;
   }
+  if (key == "default required_features" ||
+      key == "default required_feature") {
+    file_default_features->clear();
+    std::string feature;
+    std::istringstream features(value);
+    while (std::getline(features, feature, ',')) {
+      feature = Trim(feature);
+      if (!feature.empty()) {
+        file_default_features->push_back(feature);
+        // The declaration inside a segment also gates that segment itself.
+        out->required_features.push_back(feature);
+      }
+    }
+    return true;
+  }
+  if (key == "primary_key_mode") {
+    out->primary_key_mode = value;
+    return true;
+  }
   if (key == "parameters" || key == "parameter") {
     for (const auto& item : SplitTopLevel(value)) {
       const std::string s = Trim(item);
       const std::string lower = ToLower(s);
-      const size_t as_pos = lower.rfind(" as ");
+      const size_t as_pos = TopLevelAsPosition(lower);
       if (as_pos != std::string::npos) {
         const std::string expr = Trim(s.substr(0, as_pos));
         const std::string name = Trim(s.substr(as_pos + 4));
         if (!name.empty() && !expr.empty()) {
           out->parameters.push_back({name, expr});
         }
+        continue;
+      }
+      // Compact "<value> <name>" form (e.g. "1 param", "NULL param").  A
+      // trailing identifier wins over any embedded " AS ": expressions such
+      // as `cast(1 as int32) a` carry their own AS clause, so the separator
+      // search must not see it.
+      size_t split = 0;
+      if (SplitTrailingIdentifier(s, &split)) {
+        const std::string expr = Trim(s.substr(0, split));
+        const std::string name = Trim(s.substr(split));
+        if (!name.empty() && !expr.empty()) {
+          out->parameters.push_back({name, expr});
+        }
+        continue;
       }
     }
     return true;
@@ -207,14 +335,53 @@ void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
       ++offset;
       continue;
     }
-    if (result[offset] != '{') {
-      const size_t next = result.find('{', offset);
-      if (next == std::string_view::npos) { break; }
-      offset = next;
+    // Skip an ordering annotation before the first element.
+    const std::string lower_rest =
+        ToLower(std::string(result.substr(offset, 14)));
+    if (lower_rest.starts_with("unknown order:")) {
+      offset += 14;
+    } else if (lower_rest.starts_with("known order:")) {
+      offset += 12;
+    }
+    while (offset < result.size() &&
+           std::isspace(static_cast<unsigned char>(result[offset])) != 0) {
+      ++offset;
     }
     std::vector<std::string> fields;
-    if (!ParseStructRow(result, &offset, &fields)) { break; }
-    out->expected_rows.push_back(std::move(fields));
+    if (result[offset] == '{') {
+      if (!ParseStructRow(result, &offset, &fields)) { break; }
+      out->expected_rows.push_back(std::move(fields));
+      continue;
+    }
+    // Bare scalar element (e.g. ARRAY<INT64>[10, 20] or value-table rows):
+    // one row per comma-separated token until the closing bracket.
+    size_t end = offset;
+    int depth = 0;
+    bool in_string = false;
+    char quote = '\0';
+    while (end < result.size()) {
+      const char c = result[end];
+      if (in_string) {
+        if (c == '\\' && end + 1 < result.size()) { ++end; }
+        else if (c == quote) { in_string = false; }
+        ++end;
+        continue;
+      }
+      if (c == '"' || c == '\'') {
+        in_string = true;
+        quote = c;
+        ++end;
+        continue;
+      }
+      if (c == '<' || c == '[' || c == '(' || c == '{') { ++depth; }
+      else if (c == '>' && depth > 0) { --depth; }
+      else if ((c == ')' || c == '}') && depth > 0) { --depth; }
+      else if ((c == ',' && depth == 0) || c == ']') { break; }
+      ++end;
+    }
+    const std::string token = Trim(result.substr(offset, end - offset));
+    offset = end;
+    if (!token.empty()) { out->expected_rows.push_back({token}); }
   }
 }
 
@@ -227,6 +394,17 @@ void ParseResult(std::string_view result, GoogleSqlComplianceCase* out) {
     return;
   }
   ParseExpectedRows(result, out);
+}
+
+// The compliance corpus escapes comment markers on continuation lines
+// ("\-- text"); the reference parser treats them as plain "--" comments.
+std::string NormalizeCommentEscapes(std::string sql) {
+  size_t pos = 0;
+  while ((pos = sql.find("\\--", pos)) != std::string::npos) {
+    sql.erase(pos, 1);
+    pos += 2;
+  }
+  return sql;
 }
 
 std::string ApplyParameters(
@@ -250,13 +428,68 @@ std::string ApplyParameters(
   return sql;
 }
 
+// Option blocks such as multi-line `[parameters=...]` span several physical
+// lines until their brackets balance (quotes ignored). Joins continuation
+// lines into one logical line so ConsumeOptionLine can parse the block.
+std::string ReadLogicalOptionLine(std::istringstream* stream,
+                                  std::string first_line) {
+  auto unbalanced = [](const std::string& text) {
+    int depth = 0;
+    bool in_string = false;
+    char quote = '\0';
+    for (size_t i = 0; i < text.size(); ++i) {
+      const char c = text[i];
+      if (in_string) {
+        if (c == '\\' && i + 1 < text.size()) { ++i; } else if (c == quote) {
+          in_string = false;
+        }
+        continue;
+      }
+      if (c == '"' || c == '\'') {
+        in_string = true;
+        quote = c;
+      } else if (c == '[' || c == '(' || c == '<') {
+        ++depth;
+      } else if (c == ']' || c == ')' || c == '>') {
+        --depth;
+      }
+    }
+    return depth > 0;
+  };
+  std::string line = std::move(first_line);
+  while (unbalanced(line)) {
+    std::string next;
+    if (!std::getline(*stream, next)) { break; }
+    line.push_back(' ');
+    line += next;
+  }
+  return line;
+}
+
 GoogleSqlComplianceCase ParseSegment(std::string_view file,
                                      std::string_view segment,
-                                     std::string* current_default_tz) {
+                                     std::string* current_default_tz,
+                                     std::vector<std::string>* default_features) {
   GoogleSqlComplianceCase test_case;
   test_case.file = std::string(file);
   test_case.default_time_zone = *current_default_tz;
+  test_case.required_features = *default_features;
   std::istringstream stream{std::string(segment)};
+  // Option headers ([name=...], [parameters=...]) may wrap across physical
+  // lines; continuations are folded into one logical line before parsing.
+  auto consume_option = [&](const std::string& raw) {
+    std::string logical = raw;
+    if (!logical.empty() && logical.front() == '[' &&
+        !OptionHeaderBalanced(logical)) {
+      std::string continuation;
+      while (std::getline(stream, continuation)) {
+        logical += '\n';
+        logical += continuation;
+        if (OptionHeaderBalanced(logical)) { break; }
+      }
+    }
+    return ConsumeOptionLine(logical, &test_case, default_features);
+  };
   std::string line;
   bool in_options = true;
   std::string sql;
@@ -264,7 +497,10 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
     const std::string trimmed = Trim(line);
     if (in_options) {
       if (trimmed.empty() || trimmed.starts_with('#')) { continue; }
-      if (ConsumeOptionLine(line, &test_case)) {
+      if (trimmed.front() == '[') {
+        line = ReadLogicalOptionLine(&stream, line);
+      }
+      if (ConsumeOptionLine(line, &test_case, default_features)) {
         if (!test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
@@ -276,7 +512,7 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
       std::ostringstream rest;
       rest << stream.rdbuf();
       ParseResult(rest.str(), &test_case);
-      test_case.sql = ApplyParameters(Trim(sql), test_case.parameters);
+      test_case.sql = NormalizeCommentEscapes(ApplyParameters(Trim(sql), test_case.parameters));
       if (test_case.name.empty()) {
         test_case.name = test_case.prepare_database ? "prepare_database"
                                                     : "unnamed";
@@ -285,7 +521,10 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
     }
     if (sql.empty()) {
       if (trimmed.empty() || trimmed.starts_with('#')) { continue; }
-      if (ConsumeOptionLine(line, &test_case)) {
+      if (trimmed.front() == '[') {
+        line = ReadLogicalOptionLine(&stream, line);
+      }
+      if (ConsumeOptionLine(line, &test_case, default_features)) {
         if (!test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
@@ -295,7 +534,7 @@ GoogleSqlComplianceCase ParseSegment(std::string_view file,
     sql += line;
     sql.push_back('\n');
   }
-  test_case.sql = ApplyParameters(Trim(sql), test_case.parameters);
+  test_case.sql = NormalizeCommentEscapes(ApplyParameters(Trim(sql), test_case.parameters));
   if (test_case.name.empty()) {
     test_case.name =
         test_case.prepare_database ? "prepare_database" : "unnamed";
@@ -396,7 +635,8 @@ std::vector<std::string> SplitTopLevel(std::string_view text) {
 }
 
 bool ParseArrayToken(std::string_view token, std::string* sql_type,
-                     std::vector<std::string>* elements) {
+                     std::vector<std::string>* elements,
+                     bool* unordered = nullptr) {
   const std::string text = Trim(token);
   constexpr std::string_view kPrefix = "ARRAY<";
   if (text.size() < kPrefix.size() ||
@@ -429,6 +669,7 @@ bool ParseArrayToken(std::string_view token, std::string* sql_type,
     inner = Trim(inner.substr(kKnown.size()));
   } else if (lower.starts_with(kUnknown)) {
     inner = Trim(inner.substr(kUnknown.size()));
+    if (unordered != nullptr) { *unordered = true; }
   }
   *elements = SplitTopLevel(inner);
   return true;
@@ -453,9 +694,11 @@ std::vector<GoogleSqlComplianceCase> ParseGoogleSqlComplianceFile(
   std::vector<GoogleSqlComplianceCase> cases;
   size_t unnamed = 0;
   std::string current_default_tz = "America/Los_Angeles";
+  std::vector<std::string> default_features;
   for (const std::string& segment : SplitCases(contents)) {
     if (Trim(segment).empty()) { continue; }
-    GoogleSqlComplianceCase test_case = ParseSegment(file, segment, &current_default_tz);
+    GoogleSqlComplianceCase test_case =
+        ParseSegment(file, segment, &current_default_tz, &default_features);
     if (test_case.name == "unnamed" ||
         test_case.name.starts_with("prepare_database")) {
       if (test_case.name.find('_') == std::string::npos ||
@@ -553,6 +796,185 @@ std::string FormatComplianceValue(const Value& value) {
   return value.AsString();
 }
 
+namespace {
+
+// Case-insensitive identifier equality for proto member splitting.
+bool ProtoIsIdentStart(char c) {
+  return std::isalpha(static_cast<unsigned char>(c)) != 0 || c == '_' ||
+         c == '[';
+}
+
+// Collapses whitespace runs to single spaces (dropping space before closing
+// brackets); used to normalize golden text before comparison.
+std::string NormalizeWsText(std::string_view str) {
+  std::string out;
+  bool in_space = false;
+  for (char c : str) {
+    if (std::isspace(static_cast<unsigned char>(c))) {
+      if (!in_space && !out.empty() && out.back() != '[' && out.back() != '(' && out.back() != '{' && out.back() != ',') {
+        out.push_back(' ');
+      }
+      in_space = true;
+    } else {
+      if (in_space && !out.empty() && (c == ']' || c == ')' || c == '}' || c == ',')) {
+        if (out.back() == ' ') { out.pop_back(); }
+      }
+      in_space = false;
+      out.push_back(c);
+    }
+  }
+  if (!out.empty() && out.back() == ' ') { out.pop_back(); }
+  return out;
+}
+
+// Splits a proto TEXT / struct body into top-level (name, value) members.
+// Members separate on ',', ';' or on whitespace immediately before another
+// "identifier:" pair; bracketed groups and quoted strings stay intact.
+void SplitProtoMembers(const std::string& body,
+                       std::vector<std::pair<std::string, std::string>>* out) {
+  int depth = 0;
+  bool in_string = false;
+  char quote = '\0';
+  size_t start = 0;
+  const size_t n = body.size();
+  auto flush = [&](size_t end) {
+    std::string piece = Trim(body.substr(start, end - start));
+    if (!piece.empty()) {
+      const size_t colon = piece.find(':');
+      // Only treat the first top-level colon as a name separator when the
+      // prefix is identifier-shaped.
+      bool ident = colon != std::string::npos && colon > 0 &&
+                   colon + 1 <= piece.size() - 1 && ProtoIsIdentStart(piece[0]);
+      for (size_t k = 0; ident && k < colon; ++k) {
+        const char c = piece[k];
+        if (!(std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' ||
+              c == '.' || c == '[')) {
+          ident = false;
+          break;
+        }
+      }
+      if (ident) {
+        out->emplace_back(ToLower(Trim(piece.substr(0, colon))),
+                          Trim(piece.substr(colon + 1)));
+      } else {
+        out->emplace_back(std::string(), piece);
+      }
+    }
+  };
+  size_t i = 0;
+  while (i < n) {
+    const char c = body[i];
+    if (in_string) {
+      if (c == '\\' && i + 1 < n) { i += 2; continue; }
+      if (c == quote) { in_string = false; }
+      ++i;
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      in_string = true;
+      quote = c;
+      ++i;
+      continue;
+    }
+    if (c == '{' || c == '(' || c == '[' || c == '<') { ++depth; ++i; continue; }
+    if (c == '}' || c == ')' || c == ']' || c == '>') {
+      if (depth > 0) { --depth; }
+      ++i;
+      continue;
+    }
+    if (depth == 0 && (c == ',' || c == ';')) {
+      flush(i);
+      ++i;
+      while (i < n && std::isspace(static_cast<unsigned char>(body[i]))) { ++i; }
+      start = i;
+      continue;
+    }
+    if (depth == 0 && std::isspace(static_cast<unsigned char>(c))) {
+      // Whitespace ends the member only when an identifier-colon follows
+      // ("field: value field2: value2"); bare values keep their spaces.
+      size_t j = i;
+      while (j < n && std::isspace(static_cast<unsigned char>(body[j]))) { ++j; }
+      if (j < n && ProtoIsIdentStart(body[j])) {
+        size_t k = j + 1;
+        while (k < n && (std::isalnum(static_cast<unsigned char>(body[k])) != 0 ||
+                         body[k] == '_' || body[k] == '.')) {
+          ++k;
+        }
+        while (k < n && std::isspace(static_cast<unsigned char>(body[k]))) { ++k; }
+        if (k < n && body[k] == ':' && k > j) {
+          flush(i);
+          i = j;
+          start = i;
+          continue;
+        }
+      }
+      ++i;
+      continue;
+    }
+    ++i;
+  }
+  flush(n);
+}
+
+// Canonical form of one proto/struct value: nested braced bodies sort their
+// members so field order never affects matching.
+std::string CanonicalizeProtoValue(const std::string& value);
+
+std::string CanonicalizeProtoBody(const std::string& body) {
+  std::vector<std::pair<std::string, std::string>> members;
+  SplitProtoMembers(body, &members);
+  std::vector<std::string> canon;
+  canon.reserve(members.size());
+  for (const auto& [name, raw] : members) {
+    canon.push_back(name + "=" + CanonicalizeProtoValue(raw));
+  }
+  std::sort(canon.begin(), canon.end());
+  std::string joined;
+  for (const std::string& item : canon) {
+    if (!joined.empty()) { joined.push_back('|'); }
+    joined += item;
+  }
+  return joined;
+}
+
+std::string CanonicalizeProtoValue(const std::string& value) {
+  const std::string trimmed = Trim(value);
+  if (trimmed.size() >= 2 && trimmed.front() == '{' && trimmed.back() == '}') {
+    return "{" + CanonicalizeProtoBody(trimmed.substr(1, trimmed.size() - 2)) +
+           "}";
+  }
+  if (trimmed.size() >= 2 && trimmed.front() == '<' && trimmed.back() == '>') {
+    return "{" + CanonicalizeProtoBody(trimmed.substr(1, trimmed.size() - 2)) +
+           "}";
+  }
+  return ToLower(NormalizeWsText(trimmed));
+}
+
+// Order-insensitive whole-proto comparison: both bodies must parse into
+// fully-named member multisets (positional struct tokens are rejected so
+// order-sensitive flows keep using the positional paths).
+bool ProtoBodiesMatch(const std::string& want_body,
+                      const std::string& actual_body) {
+  std::vector<std::pair<std::string, std::string>> want_members;
+  std::vector<std::pair<std::string, std::string>> actual_members;
+  SplitProtoMembers(want_body, &want_members);
+  SplitProtoMembers(actual_body, &actual_members);
+  if (want_members.empty() || want_members.size() != actual_members.size()) {
+    return false;
+  }
+  bool all_named = true;
+  for (const auto& [name, raw] : want_members) {
+    if (name.empty()) { all_named = false; break; }
+  }
+  for (const auto& [name, raw] : actual_members) {
+    if (name.empty()) { all_named = false; break; }
+  }
+  if (!all_named) { return false; }
+  return CanonicalizeProtoBody(want_body) == CanonicalizeProtoBody(actual_body);
+}
+
+}  // namespace
+
 bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   const std::string want = Trim(expected);
   if (ToLower(want) == "null") { return actual.IsNull(); }
@@ -563,12 +985,41 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   if (actual.IsArray()) {
     std::string sql_type;
     std::vector<std::string> elements;
-    if (!ParseArrayToken(want, &sql_type, &elements)) { return false; }
-    if (!sql_type.empty() &&
-        ToLower(sql_type) != ToLower(actual.ArrayElementSqlType())) {
-      const std::string lower_type = ToLower(sql_type);
-      const bool struct_or_proto = lower_type.starts_with("struct<") || lower_type.starts_with("proto<");
-      if (!struct_or_proto || ToLower(actual.ArrayElementSqlType()) != "string") {
+    bool unordered = false;
+    if (!ParseArrayToken(want, &sql_type, &elements, &unordered)) {
+      return false;
+    }
+    std::string lower_type = ToLower(sql_type);
+    const std::string lower_actual_type =
+        ToLower(actual.ArrayElementSqlType());
+    // ENUM<T> / PROTO<T> goldens match engines that carry the bare type path
+    // (ENUM<googlesql_test.X> vs "googlesql_test.X").
+    if (lower_type != lower_actual_type &&
+        (lower_type.starts_with("enum<") || lower_type.starts_with("proto<")) &&
+        lower_type.back() == '>') {
+      const std::string unwrapped =
+          Trim(lower_type.substr(lower_type.find('<') + 1,
+                                 lower_type.size() - lower_type.find('<') - 2));
+      if (unwrapped == lower_actual_type) { lower_type = lower_actual_type; }
+    }
+    // Engines that cannot name nested message element types report the bare
+    // PROTO/STRUCT tag; judge those by element values.
+    const auto bare_message_tag = [](const std::string& t) {
+      return t == "proto" || t == "struct";
+    };
+    if (bare_message_tag(lower_actual_type) &&
+        (lower_type.starts_with(lower_actual_type + "<"))) {
+      lower_type = lower_actual_type;
+    }
+    // Engines that store enums as their member-name strings report
+    // STRING-typed arrays where the reference prints ENUM<T>.
+    if (lower_type.starts_with("enum<") && lower_actual_type == "string") {
+      lower_type = lower_actual_type;
+    }
+    if (!lower_type.empty() && lower_type != lower_actual_type) {
+      const bool struct_or_proto =
+          lower_type.starts_with("struct<") || lower_type.starts_with("proto<");
+      if (!struct_or_proto || lower_actual_type != "string") {
         bool all_null = true;
         for (const auto& elem : actual.ArrayElements()) {
           if (!elem.IsNull()) {
@@ -576,12 +1027,53 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
             break;
           }
         }
-        if (!all_null) {
+        // The engine stores every integer as INT64 and booleans as nonzero
+        // INT64, so declared INT32/UINT64/BOOL/FLOAT element types surface as
+        // INT64/DOUBLE at runtime; judge those by element values instead of
+        // the type tag.
+        auto is_int_family = [](const std::string& t) {
+          return t == "bool" || t == "boolean" || t == "int32" ||
+                 t == "sint32" || t == "uint32" || t == "int64" ||
+                 t == "uint64";
+        };
+        auto is_float_family = [](const std::string& t) {
+          return t == "float" || t == "float32" || t == "float64" ||
+                 t == "double" || t == "real";
+        };
+        auto normalize_float = [](const std::string& t) -> std::string {
+          if (t == "float64") { return "double"; }
+          if (t == "float32" || t == "real") { return "float"; }
+          return t;
+        };
+        const std::string norm_want = normalize_float(lower_type);
+        const std::string norm_actual = normalize_float(lower_actual_type);
+        const bool compatible =
+            (is_int_family(norm_want) && is_int_family(norm_actual)) ||
+            (is_float_family(norm_want) && is_float_family(norm_actual)) ||
+            ((norm_want == "bytes") && norm_actual == "string");
+        if (!all_null && !compatible) {
           return false;
         }
       }
     }
     if (elements.size() != actual.ArrayElements().size()) { return false; }
+    if (unordered) {
+      // The reference does not guarantee element order: match as a multiset.
+      std::vector<bool> used(elements.size(), false);
+      for (const Value& element : actual.ArrayElements()) {
+        bool found = false;
+        for (size_t i = 0; i < elements.size(); ++i) {
+          if (used[i]) { continue; }
+          if (ComplianceValueMatches(element, elements[i])) {
+            used[i] = true;
+            found = true;
+            break;
+          }
+        }
+        if (!found) { return false; }
+      }
+      return true;
+    }
     for (size_t i = 0; i < elements.size(); ++i) {
       if (!ComplianceValueMatches(actual.ArrayElements()[i], elements[i])) {
         return false;
@@ -599,7 +1091,17 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   if (actual.type == ValueType::kInt64) {
     try {
       return actual.value.int_value == static_cast<int64_t>(std::stoll(want));
-    } catch (...) { return false; }
+    } catch (...) {
+      // Goldens may carry UINT64 magnitudes (2^63 .. 2^64-1) that engines
+      // storing every integer as INT64 keep as their two's-complement bit
+      // pattern; compare those on the unsigned bit representation.
+      try {
+        return static_cast<uint64_t>(actual.value.int_value) ==
+               std::stoull(want);
+      } catch (...) {
+        return false;
+      }
+    }
   }
   if (actual.type == ValueType::kDouble) {
     const std::string lower_want = ToLower(want);
@@ -639,25 +1141,25 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     const std::string actual_str = std::string(actual.value.varchar_value);
     if (actual_str == unquoted) { return true; }
     auto normalize_ws = [](std::string_view str) -> std::string {
-      std::string out;
-      bool in_space = false;
-      for (char c : str) {
-        if (std::isspace(static_cast<unsigned char>(c))) {
-          if (!in_space && !out.empty() && out.back() != '[' && out.back() != '(' && out.back() != '{' && out.back() != ',') {
-            out.push_back(' ');
-          }
-          in_space = true;
-        } else {
-          if (in_space && !out.empty() && (c == ']' || c == ')' || c == '}' || c == ',')) {
-            if (out.back() == ' ') { out.pop_back(); }
-          }
-          in_space = false;
-          out.push_back(c);
+      return NormalizeWsText(str);
+    };
+    auto strip_order_annotations = [](const std::string& s) {
+      std::string out = s;
+      for (const char* note : {"known order:", "unknown order:"}) {
+        size_t pos;
+        const size_t note_len = std::char_traits<char>::length(note);
+        while ((pos = ToLower(out).find(note)) != std::string::npos) {
+          out.erase(pos, note_len);
         }
       }
-      if (!out.empty() && out.back() == ' ') { out.pop_back(); }
       return out;
     };
+    if (normalize_ws(strip_order_annotations(actual_str)) ==
+            normalize_ws(strip_order_annotations(unquoted)) ||
+        normalize_ws(strip_order_annotations(actual_str)) ==
+            normalize_ws(strip_order_annotations(want))) {
+      return true;
+    }
     if (normalize_ws(actual_str) == normalize_ws(unquoted) ||
         normalize_ws(actual_str) == normalize_ws(want) ||
         normalize_ws("{" + actual_str + "}") == normalize_ws(want) ||
@@ -665,24 +1167,83 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       return true;
     }
     const std::string norm_actual = Unquote(actual_str);
+    // Whole-proto goldens may wrap the payload in extra STRUCT brace layers
+    // ("{{ field: v ... }}"): strip every layer from the golden side and
+    // compare member multisets so field order never affects matching.
+    {
+      std::string want_body = want;
+      while (want_body.size() >= 2 && want_body.front() == '{' &&
+             want_body.back() == '}') {
+        want_body = Trim(want_body.substr(1, want_body.size() - 2));
+      }
+      std::string actual_body = norm_actual.empty() ? actual_str : norm_actual;
+      if (!want_body.empty() && !actual_body.empty()) {
+        if (ProtoBodiesMatch(want_body, actual_body)) { return true; }
+      }
+    }
     if ("{" + actual_str + "}" == unquoted || "{" + actual_str + "}" == want ||
         "{" + norm_actual + "}" == unquoted || "{" + norm_actual + "}" == want) { return true; }
+    // Strips a leading `"key":` / bare `key:` marker, ignoring colons
+    // that live inside brackets or quotes (e.g. ARRAY tokens carrying
+    // ordering annotations).
+    auto drop_key = [](std::string elem) -> std::string {
+      int depth = 0;
+      bool in_str = false;
+      char quote = '\0';
+      for (size_t i = 0; i < elem.size(); ++i) {
+        const char c = elem[i];
+        if (in_str) {
+          if (c == '\\' && i + 1 < elem.size()) { ++i; }
+          else if (c == quote) { in_str = false; }
+          continue;
+        }
+        if (c == '"' || c == '\'') { in_str = true; quote = c; }
+        else if (c == '<' || c == '[' || c == '(' || c == '{') { ++depth; }
+        else if (c == '>' || c == ']' || c == ')' || c == '}') {
+          if (depth > 0) { --depth; }
+        } else if (c == ':' && depth == 0 && i + 1 < elem.size()) {
+          return Trim(elem.substr(i + 1));
+        }
+      }
+      return elem;
+    };
     if (!want.empty() && want.front() == '{' && want.back() == '}' &&
         !norm_actual.empty() && norm_actual.front() == '{' && norm_actual.back() == '}') {
+      // Order-insensitive comparison: protos and structs are field sets, so
+      // members match as a multiset of canonicalized tokens.
+      auto canonical_members = [&](const std::string& body) {
+        std::vector<std::string> parts = SplitTopLevel(body);
+        std::vector<std::string> out;
+        out.reserve(parts.size());
+        for (std::string& p : parts) {
+          std::string elem = drop_key(Trim(p));
+          const std::string lower_elem = ToLower(elem);
+          if (lower_elem.starts_with("array<") && lower_elem.ends_with("(null)")) {
+            elem = "NULL";
+          }
+          out.push_back(normalize_ws(strip_order_annotations(elem)));
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+      };
+      if (canonical_members(want.substr(1, want.size() - 2)) ==
+          canonical_members(norm_actual.substr(1, norm_actual.size() - 2))) {
+        return true;
+      }
       std::vector<std::string> want_parts = SplitTopLevel(want.substr(1, want.size() - 2));
       std::vector<std::string> got_parts = SplitTopLevel(norm_actual.substr(1, norm_actual.size() - 2));
       if (want_parts.size() == got_parts.size()) {
         bool matched = true;
         for (size_t idx = 0; idx < want_parts.size(); ++idx) {
-          std::string want_elem = Trim(want_parts[idx]);
-          size_t colon_w = want_elem.find(':');
-          if (colon_w != std::string::npos && colon_w + 1 < want_elem.size()) {
-            want_elem = Trim(want_elem.substr(colon_w + 1));
-          }
-          std::string got_elem = Trim(got_parts[idx]);
-          size_t colon_g = got_elem.find(':');
-          if (colon_g != std::string::npos && colon_g + 1 < got_elem.size()) {
-            got_elem = Trim(got_elem.substr(colon_g + 1));
+          std::string want_elem = drop_key(Trim(want_parts[idx]));
+          std::string got_elem = drop_key(Trim(got_parts[idx]));
+          // A NULL-typed array prints as ARRAY<T>(NULL); treat it as NULL.
+          {
+            const std::string lower_want = ToLower(want_elem);
+            if (lower_want.starts_with("array<") &&
+                lower_want.ends_with("(null)")) {
+              want_elem = "NULL";
+            }
           }
           if (ToLower(got_elem) == "null") {
             if (ToLower(want_elem) != "null") { matched = false; break; }

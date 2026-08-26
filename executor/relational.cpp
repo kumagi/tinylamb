@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -15,37 +16,179 @@
 #include <utility>
 #include <vector>
 
-#include "common/status_or.hpp"
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/aggregation.hpp"
 #include "executor/detail/explain_format.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/planning_heuristics.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/detail/subquery_runtime.hpp"
-#include "executor/aggregation.hpp"
+#include "executor/detail/window_eval.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/spill_file.hpp"
-#include "executor/detail/window_eval.hpp"
 #include "expression/aggregate_expression.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
-#include "expression/named_expression.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
+#include "expression/in_expression.hpp"
+#include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
+#include "expression/unary_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "query/statement.hpp"
 #include "table/full_scan_iterator.hpp"
 #include "table/iterator.hpp"
 #include "table/table.hpp"
-#include "type/value.hpp"
 #include "type/column.hpp"
 #include "type/type.hpp"
+#include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb::relational_detail {
 
+// SQL equality for group keys: NaN equals NaN and -0 equals +0, unlike raw
+// IEEE Value::operator== which never folds NaNs together.
+struct GroupKeyEqual {
+  bool operator()(const Row& a, const Row& b) const {
+    if (a.values_.size() != b.values_.size()) { return false;
+}
+    for (size_t i = 0; i < a.values_.size(); ++i) {
+      const Value& x = a.values_[i];
+      const Value& y = b.values_[i];
+      if (x.type != y.type) { return false;
+}
+      if (x.type == ValueType::kDouble) {
+        const double p = x.value.double_value;
+        const double q = y.value.double_value;
+        if (std::isnan(p) && std::isnan(q)) { continue;
+}
+        if (!(p == q)) { return false;
+}
+        continue;
+      }
+      if (!(x == y)) { return false;
+      }
+    }
+    return true;
+  }
+};
+using GroupKeyMap =
+    std::unordered_map<Row, size_t, std::hash<Row>, GroupKeyEqual>;
+
 namespace {
+
+// HAVING may reference select-list aliases (`HAVING double_avg > 0.7`).
+// Alias references that are not real input columns are rewritten to the
+// aliased expression so aggregate aliases resolve during grouping.
+Expression InlineHavingAliases(const SelectStatement& statement,
+                               const Schema& schema) {
+  const Expression& having = statement.Having();
+  if (!having) { return having; }
+  std::unordered_map<std::string, Expression> aliases;
+  for (const NamedExpression& projection : statement.SelectList()) {
+    if (!projection.name.empty() && projection.name != "*") {
+      aliases.emplace(projection.name, projection.expression);
+    }
+  }
+  if (aliases.empty()) { return having; }
+  auto schema_has_column = [&schema](std::string_view name) {
+    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+      if (name == schema.GetColumn(i).Name().name) { return true; }
+    }
+    return false;
+  };
+  std::function<Expression(const Expression&)> walk =
+      [&](const Expression& expression) -> Expression {  // NOLINT(misc-no-recursion)
+    if (!expression) { return expression; }
+    switch (expression->Type()) {
+      case TypeTag::kColumnValue: {
+        const ColumnName& name =
+            expression->AsColumnValue().GetColumnName();
+        if (!name.schema.empty() || schema_has_column(name.name)) {
+          return expression;
+        }
+        const auto found = aliases.find(name.name);
+        return found != aliases.end() ? found->second : expression;
+      }
+      case TypeTag::kBinaryExp:
+        return BinaryExpressionExp(
+            walk(expression->AsBinaryExpression().Left()),
+            expression->AsBinaryExpression().Op(),
+            walk(expression->AsBinaryExpression().Right()));
+      case TypeTag::kUnaryExp:
+        return UnaryExpressionExp(
+            walk(expression->AsUnaryExpression().Child()),
+            expression->AsUnaryExpression().Op());
+      case TypeTag::kCaseExp: {
+        const auto& value = expression->AsCaseExpression();
+        std::vector<std::pair<Expression, Expression>> clauses;
+        clauses.reserve(value.when_clauses_.size());
+        for (const auto& [condition, result] : value.when_clauses_) {
+          clauses.emplace_back(walk(condition), walk(result));
+        }
+        return CaseExpressionExp(std::move(clauses),
+                                 walk(value.else_clause_));
+      }
+      case TypeTag::kInExp: {
+        const auto& value = expression->AsInExpression();
+        std::vector<Expression> items;
+        items.reserve(value.list_.size());
+        for (const Expression& item : value.list_) {
+          items.push_back(walk(item));
+        }
+        return InExpressionExp(walk(value.child_), std::move(items));
+      }
+      case TypeTag::kFunctionCallExp:
+        return FunctionCallExp(
+            expression->AsFunctionCallExpression().FuncName(), [&] {
+              std::vector<Expression> out;
+              out.reserve(
+                  expression->AsFunctionCallExpression().Args().size());
+              for (const Expression& argument :
+                   expression->AsFunctionCallExpression().Args()) {
+                out.push_back(walk(argument));
+              }
+              return out;
+            }());
+      case TypeTag::kQueryExp: {
+        // Alias references may sit inside HAVING subqueries
+        // (EXISTS (SELECT * FROM UNNEST(agg_alias) ...)).  Rewrite them on a
+        // shallow copy so the subquery's lateral unnest arguments bind to the
+        // outer aggregate expressions.
+        const auto& value = expression->AsQueryExpression();
+        if (!value.Query() || value.Test()) { return expression; }
+        auto copied = std::make_shared<SelectStatement>(*value.Query());
+        bool changed = false;
+        std::vector<SelectSource> sources = copied->Sources();
+        for (SelectSource& source : sources) {
+          if (source.unnest) {
+            source.unnest = walk(source.unnest);
+            changed = true;
+          }
+        }
+        if (!changed) { return expression; }
+        copied->SetSources(std::move(sources));
+        auto rewritten = std::make_shared<QueryExpression>(
+            std::move(copied), nullptr, value.Exists(), value.Negated(),
+            value.Op(), value.Mode());
+        rewritten->SetArrayResult(value.ArrayResult());
+        if (!value.ArrayElementSqlType().empty()) {
+          rewritten->SetArrayElementSqlType(value.ArrayElementSqlType());
+        }
+        return Expression(rewritten);
+      }
+      default:
+        // Aggregates, subqueries and casts keep their own scope.
+        return expression;
+    }
+  };
+  return walk(having);
+}
 
 Relation Project(TransactionContext& context, const SelectStatement& statement,
                  Relation input, const Scope* outer, const CteMap& ctes,
@@ -69,27 +212,32 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
                     return ContainsAggregate(projection.expression);
                   }) ||
       ContainsAggregate(statement.Having());
+  const Expression having_expr =
+      grouped ? InlineHavingAliases(statement, input.schema)
+              : statement.Having();
   std::vector<const AggregateExpression*> aggregate_expressions;
   std::unordered_set<const AggregateExpression*> seen_aggregates;
   for (const NamedExpression& projection : statement.SelectList()) {
     CollectAggregates(projection.expression, &aggregate_expressions,
                       &seen_aggregates);
   }
-  CollectAggregates(statement.Having(), &aggregate_expressions,
-                    &seen_aggregates);
+  CollectAggregates(having_expr, &aggregate_expressions, &seen_aggregates);
 
   struct GroupState {
     Row representative;
     size_t accumulator_offset{0};
   };
   std::deque<AggregateAccumulator> aggregate_states;
-  auto accumulate_row = [&](const Row& row, std::unordered_map<Row, size_t>* offsets,
+  auto accumulate_row = [&](const Row& row,
+                            GroupKeyMap* offsets,
                             std::vector<GroupState>* local_groups,
                             std::deque<AggregateAccumulator>* local_states) {
-    Scope scope{.row=&row, .schema=&input.schema, .outer=outer};
+    Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
     std::vector<Value> key_values;
     for (const Expression& key : statement.GroupBy()) {
-      key_values.push_back(Evaluate(key, scope, nullptr, context, ctes));
+      // Canonicalize so NaN/-0 keys fold like SQL equality demands.
+      key_values.push_back(
+          CanonicalDistinctValue(Evaluate(key, scope, nullptr, context, ctes)));
     }
     Row key(std::move(key_values));
     auto [iter, inserted] = offsets->emplace(key, local_groups->size());
@@ -116,35 +264,47 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
         continue;
       }
       AggregateInput input;
-      input.value =
-          Evaluate(aggregate.Child(), scope, nullptr, context, ctes);
+      input.value = Evaluate(aggregate.Child(), scope, nullptr, context, ctes);
       if (aggregate.Having() != AggregateHavingModifier::kNone &&
           aggregate.HavingCondition()) {
-        input.condition = Evaluate(aggregate.HavingCondition(), scope,
-                                   nullptr, context, ctes);
+        input.condition = Evaluate(aggregate.HavingCondition(), scope, nullptr,
+                                   context, ctes);
       }
       for (const auto& term : aggregate.InnerOrderBy()) {
         input.order_keys.push_back(
             Evaluate(term.expression, scope, nullptr, context, ctes));
       }
-      if (aggregate.GetType() == AggregationType::kStringAgg &&
-          aggregate.SecondaryArg()) {
+      for (const Expression& extra : aggregate.ExtraArgs()) {
+        input.order_keys.push_back(
+            Evaluate(extra, scope, nullptr, context, ctes));
+      }
+      if (aggregate.SecondaryArg()) {
         input.auxiliary =
             Evaluate(aggregate.SecondaryArg(), scope, nullptr, context, ctes);
       }
+      for (const Expression& extra : aggregate.TrailingArgs()) {
+        if (extra) {
+          input.trailing_values.push_back(
+              Evaluate(extra, scope, nullptr, context, ctes));
+        }
+      }
       accumulator.Add(std::move(input));
-      if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->aggregate_updates;
-}
+      if (context.execution_runtime() != nullptr) {
+        ++context.execution_runtime()->aggregate_updates;
+      }
     }
     // Only new groups need a representative row.
-    if (inserted) { group.representative = row;
-}
-    if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->aggregate_input_rows;
-}
+    if (inserted) {
+      group.representative = row;
+    }
+    if (context.execution_runtime() != nullptr) {
+      ++context.execution_runtime()->aggregate_input_rows;
+    }
   };
   auto make_group = [&]() {
     GroupState group;
-    group.representative = Row(std::vector<Value>(input.schema.ColumnCount(), Value()));
+    group.representative =
+        Row(std::vector<Value>(input.schema.ColumnCount(), Value()));
     group.accumulator_offset = aggregate_states.size();
     for (const AggregateExpression* aggregate : aggregate_expressions) {
       aggregate_states.emplace_back(aggregate);
@@ -158,16 +318,17 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
 
     const bool partition_agg =
         !statement.GroupBy().empty() &&
-        (input.HasSpill() ||
-         !QueryMemoryBudget::Global().CanReserve(
-             std::max<size_t>(1, input.TotalRows()) * 128));
+        (input.HasSpill() || !QueryMemoryBudget::Global().CanReserve(
+                                 std::max<size_t>(1, input.TotalRows()) * 128));
     if (partition_agg) {
       std::vector<SpillFile> parts(kSpillPartitions);
       input.ForEachRow([&](const Row& row) {
-        Scope scope{.row=&row, .schema=&input.schema, .outer=outer};
+        Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
         std::vector<Value> key_values;
         for (const Expression& key : statement.GroupBy()) {
-          key_values.push_back(Evaluate(key, scope, nullptr, context, ctes));
+          key_values.push_back(
+              CanonicalDistinctValue(Evaluate(key, scope, nullptr, context,
+                                              ctes)));
         }
         Row key(std::move(key_values));
         parts[SpillPartitionOf(key.EncodeMemcomparableFormat(),
@@ -180,7 +341,7 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       // Every row was copied into a partition above.
       input.ResetContents();
       for (size_t part = 0; part < kSpillPartitions; ++part) {
-        std::unordered_map<Row, size_t> offsets;
+        GroupKeyMap offsets;
         std::vector<GroupState> local_groups;
         std::deque<AggregateAccumulator> local_states;
         parts[part].ForEachRow([&](const Row& row) {
@@ -196,7 +357,7 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
         }
       }
     } else {
-      std::unordered_map<Row, size_t> offsets;
+      GroupKeyMap offsets;
       input.ForEachRow([&](const Row& row) {
         accumulate_row(row, &offsets, &groups, &aggregate_states);
       });
@@ -204,8 +365,9 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
         groups.push_back(make_group());
       }
     }
-    if (context.execution_runtime() != nullptr) { context.execution_runtime()->aggregate_groups += groups.size();
-}
+    if (context.execution_runtime() != nullptr) {
+      context.execution_runtime()->aggregate_groups += groups.size();
+    }
   }
 
   Relation output(context.execution_runtime());
@@ -217,8 +379,8 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
   std::vector<Column> output_columns;
   // Per-select-item expansion of star items: the input column indices each
   // `*` / `relation.*` refers to.
-  auto matches_star = [](const ColumnName& requested, const ColumnName& candidate,
-                         bool qualified) {
+  auto matches_star = [](const ColumnName& requested,
+                         const ColumnName& candidate, bool qualified) {
     if (qualified) {
       return !requested.schema.empty() &&
              std::equal(requested.schema.begin(), requested.schema.end(),
@@ -230,7 +392,16 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     }
     return requested.schema.empty();
   };
-  std::vector<std::vector<size_t>> star_columns(statement.SelectList().size());
+  // USING merge: unqualified `*` emits one coalesced entry per declared
+  // using column (first), then the remaining columns in schema order;
+  // `relation.*` keeps every physical column of the named side.  Each star
+  // entry stores its coalesce group (single index for plain columns).
+  std::vector<std::vector<std::vector<size_t>>> star_groups(
+      statement.SelectList().size());
+  std::vector<std::string> lowered_using;
+  if (input.using_columns != nullptr) {
+    lowered_using = *input.using_columns;
+  }
   for (size_t i = 0; i < statement.SelectList().size(); ++i) {
     const NamedExpression& projection = statement.SelectList()[i];
     if (projection.expression->Type() == TypeTag::kColumnValue &&
@@ -238,12 +409,53 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       const ColumnName& requested =
           projection.expression->AsColumnValue().GetColumnName();
       const bool qualified = !requested.schema.empty();
+      if (!qualified && !lowered_using.empty()) {
+        // Merged using columns first, in declaration order.
+        std::vector<size_t> consumed;
+        for (const std::string& using_name : lowered_using) {
+          std::vector<size_t> group;
+          for (size_t column = 0; column < base_width; ++column) {
+            const ColumnName& candidate =
+                input.schema.GetColumn(column).Name();
+            if (candidate.name.size() == using_name.size() &&
+                std::equal(using_name.begin(), using_name.end(),
+                           candidate.name.begin(),
+                           [](char a, char b) {
+                             return std::tolower(static_cast<unsigned char>(a)) ==
+                                    std::tolower(static_cast<unsigned char>(b));
+                           })) {
+              group.push_back(column);
+            }
+          }
+          if (!group.empty()) {
+            consumed.insert(consumed.end(), group.begin(), group.end());
+            const size_t merged_index = group.front();
+            star_groups[i].push_back(std::move(group));
+            output_columns.emplace_back(
+                input.schema.GetColumn(merged_index).Name().name,
+                input.schema.GetColumn(merged_index).Type());
+          }
+        }
+        // Remaining non-using columns keep schema order.
+        for (size_t column = 0; column < base_width; ++column) {
+          if (std::find(consumed.begin(), consumed.end(), column) !=
+              consumed.end()) {
+            continue;
+          }
+          const Column& candidate = input.schema.GetColumn(column);
+          if (matches_star(requested, candidate.Name(), qualified)) {
+            star_groups[i].push_back({column});
+            output_columns.emplace_back(candidate.Name().name,
+                                        candidate.Type());
+          }
+        }
+        continue;
+      }
       for (size_t column = 0; column < base_width; ++column) {
         const Column& candidate = input.schema.GetColumn(column);
         if (matches_star(requested, candidate.Name(), qualified)) {
-          star_columns[i].push_back(column);
-          output_columns.emplace_back(candidate.Name().name,
-                                      candidate.Type());
+          star_groups[i].push_back({column});
+          output_columns.emplace_back(candidate.Name().name, candidate.Type());
         }
       }
     } else {
@@ -269,10 +481,18 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
 
   auto emit = [&](const Row& representative,
                   const AggregateResultMap* aggregates) {
-    Scope scope{.row=&representative, .schema=&input.schema, .outer=outer};
-    if (statement.Having() &&
-        !Truthy(Evaluate(statement.Having(), scope, aggregates, context,
-                         ctes))) {
+    Scope scope{
+        .row = &representative, .schema = &input.schema, .outer = outer};
+    if (aggregates != nullptr) {
+      // Correlated subqueries in HAVING / SELECT resolve aggregate aliases
+      // against this group's values through the scope chain.
+      scope.aggregates = aggregates;
+    }
+    if (!lowered_using.empty()) {
+      scope.using_columns = &lowered_using;
+    }
+    if (having_expr &&
+        !Truthy(Evaluate(having_expr, scope, aggregates, context, ctes))) {
       return;
     }
     std::vector<Value> values;
@@ -280,12 +500,20 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       const NamedExpression& projection = statement.SelectList()[item];
       if (projection.expression->Type() == TypeTag::kColumnValue &&
           projection.expression->AsColumnValue().GetColumnName().name == "*") {
-        for (const size_t column : star_columns[item]) {
-          values.push_back(representative.values_[column]);
+        for (const std::vector<size_t>& group : star_groups[item]) {
+          // USING-merged entries coalesce their physical duplicates.
+          Value merged;
+          for (const size_t column : group) {
+            if (!representative.values_[column].IsNull()) {
+              merged = representative.values_[column];
+              break;
+            }
+          }
+          values.push_back(std::move(merged));
         }
       } else {
-        values.push_back(Evaluate(projection.expression, scope, aggregates,
-                                  context, ctes));
+        values.push_back(
+            Evaluate(projection.expression, scope, aggregates, context, ctes));
       }
     }
     // Carry hidden $win columns through projection; ORDER BY may reference
@@ -295,13 +523,17 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     }
     Row output_row(std::move(values));
     if (has_order_by) {
-      Scope proj_scope{.row=&output_row, .schema=&initial_output_schema, .outer=&scope};
+      Scope proj_scope{.row = &output_row,
+                       .schema = &initial_output_schema,
+                       .outer = &scope};
       std::vector<Value> keys;
       keys.reserve(order_by.size());
       for (const auto& key : order_by) {
-        keys.push_back(Evaluate(key.expression, proj_scope, aggregates, context, ctes));
+        keys.push_back(
+            Evaluate(key.expression, proj_scope, aggregates, context, ctes));
       }
-      sortable.push_back(KeyedRow{.keys=std::move(keys), .row=std::move(output_row)});
+      sortable.push_back(
+          KeyedRow{.keys = std::move(keys), .row = std::move(output_row)});
     } else {
       output.AddRow(std::move(output_row));
     }
@@ -314,8 +546,7 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       for (size_t i = 0; i < aggregate_expressions.size(); ++i) {
         const AggregateAccumulator& accumulator =
             aggregate_states[group.accumulator_offset + i];
-        aggregate_results.emplace(accumulator.expression,
-                                  accumulator.Finish());
+        aggregate_results.emplace(accumulator.expression, accumulator.Finish());
       }
       emit(group.representative, &aggregate_results);
     }
@@ -327,17 +558,24 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
   if (has_order_by) {
     const auto sort_begin = std::chrono::steady_clock::now();
     std::ranges::stable_sort(
-        sortable,
-        [&](const KeyedRow& left, const KeyedRow& right) {
+        sortable, [&](const KeyedRow& left, const KeyedRow& right) {
           for (size_t i = 0; i < order_by.size(); ++i) {
             const Value& a = left.keys[i];
             const Value& b = right.keys[i];
-            if (a == b) { continue; }
+            const int c = CompareForOrderBy(a, b);
+            if (c == 0) {
+              continue;
+            }
             const bool nulls_first =
                 order_by[i].nulls_first.value_or(order_by[i].ascending);
-            if (a.IsNull()) { return nulls_first; }
-            if (b.IsNull()) { return !nulls_first; }
-            return order_by[i].ascending ? a < b : b < a;
+            const bool a_less = c < 0;
+            if (a.IsNull()) {
+              return nulls_first;
+            }
+            if (b.IsNull()) {
+              return !nulls_first;
+            }
+            return order_by[i].ascending ? a_less : !a_less;
           }
           return false;
         });
@@ -365,8 +603,9 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     }
   }
   output.schema = Schema("", std::move(output_columns));
-  if (context.execution_runtime() != nullptr) { context.execution_runtime()->project_ms += ElapsedMs(project_begin);
-}
+  if (context.execution_runtime() != nullptr) {
+    context.execution_runtime()->project_ms += ElapsedMs(project_begin);
+  }
   return output;
 }
 
@@ -377,8 +616,9 @@ Relation DistinctOf(Relation input) {
   CopyExecutionStats(&distinct, input);
   input.FinishSpill();
   input.ForEachRow([&](const Row& row) {
-    if (seen.insert(row).second) { distinct.AddRow(row);
-}
+    if (seen.insert(row).second) {
+      distinct.AddRow(row);
+    }
   });
   distinct.FinishSpill();
   return distinct;
@@ -400,32 +640,36 @@ void ApplyOrderBy(TransactionContext& context, const SelectStatement& statement,
   std::vector<KeyedRow> sortable;
   output->FinishSpill();
   output->ForEachRow([&](const Row& row) {
-    Scope scope{.row=&row, .schema=&output->schema, .outer=outer};
+    Scope scope{.row = &row, .schema = &output->schema, .outer = outer};
     std::vector<Value> keys;
     keys.reserve(order_by.size());
     for (const auto& key : order_by) {
       keys.push_back(Evaluate(key.expression, scope, nullptr, context, ctes));
     }
-    sortable.push_back(KeyedRow{.keys=std::move(keys), .row=row});
+    sortable.push_back(KeyedRow{.keys = std::move(keys), .row = row});
   });
   // Every row was copied into `sortable`; detach the finished spill files so
   // re-adding below cannot hit "Append after FinishWriting".
   output->ResetContents();
   std::ranges::stable_sort(
-      sortable,
-      [&](const KeyedRow& left, const KeyedRow& right) {
+      sortable, [&](const KeyedRow& left, const KeyedRow& right) {
         for (size_t i = 0; i < order_by.size(); ++i) {
           const Value& a = left.keys[i];
           const Value& b = right.keys[i];
-          if (a == b) { continue;
-}
+          const int c = CompareForOrderBy(a, b);
+          if (c == 0) {
+            continue;
+          }
           const bool nulls_first =
               order_by[i].nulls_first.value_or(order_by[i].ascending);
-          if (a.IsNull()) { return nulls_first;
-}
-          if (b.IsNull()) { return !nulls_first;
-}
-          return order_by[i].ascending ? a < b : b < a;
+          const bool a_less = c < 0;
+          if (a.IsNull()) {
+            return nulls_first;
+          }
+          if (b.IsNull()) {
+            return !nulls_first;
+          }
+          return order_by[i].ascending ? a_less : !a_less;
         }
         return false;
       });
@@ -433,8 +677,9 @@ void ApplyOrderBy(TransactionContext& context, const SelectStatement& statement,
     output->AddRow(std::move(keyed.row));
   }
   output->FinishSpill();
-  if (context.execution_runtime() != nullptr) { context.execution_runtime()->sort_ms += ElapsedMs(sort_begin);
-}
+  if (context.execution_runtime() != nullptr) {
+    context.execution_runtime()->sort_ms += ElapsedMs(sort_begin);
+  }
 }
 
 Relation LimitedRows(const SelectStatement& statement, Relation&& input) {
@@ -445,14 +690,17 @@ Relation LimitedRows(const SelectStatement& statement, Relation&& input) {
   const size_t total = input.TotalRows();
   const size_t begin = std::min(statement.Offset(), total);
   const size_t available = total - begin;
-  const size_t count = statement.Limit() == 0
-                           ? available
-                           : std::min(statement.Limit(), available);
+  // An explicit LIMIT 0 is a real bound (zero rows); only an absent LIMIT
+  // leaves the window unbounded.
+  const bool unlimited = statement.Limit() == 0 && !statement.HasLimit();
+  const size_t count =
+      unlimited ? available : std::min(statement.Limit(), available);
   size_t index = 0;
   input.ForEachRow([&](const Row& row) {
     const size_t current = index++;
-    if (current < begin || current >= begin + count) { return;
-}
+    if (current < begin || current >= begin + count) {
+      return;
+    }
     limited.AddRow(row);
   });
   limited.FinishSpill();
@@ -463,8 +711,8 @@ Relation LimitedRows(const SelectStatement& statement, Relation&& input) {
 
 Relation FinishQuery(TransactionContext& context,
                      const SelectStatement& statement, Relation input,
-                     const Scope* outer, const CteMap& ctes,
-                     bool apply_where, size_t hidden_columns) {
+                     const Scope* outer, const CteMap& ctes, bool apply_where,
+                     size_t hidden_columns) {
   if (apply_where && statement.WhereClause()) {
     const auto filter_begin = std::chrono::steady_clock::now();
     Relation filtered(context.execution_runtime());
@@ -472,7 +720,7 @@ Relation FinishQuery(TransactionContext& context,
     CopyExecutionStats(&filtered, input);
     input.FinishSpill();
     input.ForEachRow([&](const Row& row) {
-      Scope scope{.row=&row, .schema=&input.schema, .outer=outer};
+      Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
       if (Truthy(Evaluate(statement.WhereClause(), scope, nullptr, context,
                           ctes))) {
         filtered.AddRow(row);
@@ -480,8 +728,9 @@ Relation FinishQuery(TransactionContext& context,
     });
     filtered.FinishSpill();
     input = std::move(filtered);
-    if (context.execution_runtime() != nullptr) { context.execution_runtime()->filter_ms += ElapsedMs(filter_begin);
-}
+    if (context.execution_runtime() != nullptr) {
+      context.execution_runtime()->filter_ms += ElapsedMs(filter_begin);
+    }
   }
 
   Relation output = Project(context, statement, std::move(input), outer, ctes,
@@ -499,9 +748,46 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     const Scope* outer, const CteMap& inherited_ctes) {
   EnsureReusableProjections(context, context.execution_runtime());
   CteMap ctes = inherited_ctes;
-  for (const auto& [name, query] : statement.WithQueries()) {
-    ctes[name] = std::make_shared<Relation>(
-        ExecuteQuery(context, *query, outer, ctes));
+  // WITH entries live in an unordered map, so declaration order is lost;
+  // execute them in dependency order (a CTE may reference earlier ones).
+  if (!statement.WithQueries().empty()) {
+    std::unordered_set<std::string> pending;
+    for (const auto& [name, query] : statement.WithQueries()) {
+      (void)query;
+      pending.insert(name);
+    }
+    while (!pending.empty()) {
+      bool progress = false;
+      for (auto iter = pending.begin(); iter != pending.end();) {
+        const std::string& name = *iter;
+        const SelectStatement& query = *statement.WithQueries().at(name);
+        bool ready = true;
+        for (const SelectSource& source : query.Sources()) {
+          if (!source.table.empty() && pending.contains(source.table)) {
+            ready = false;
+            break;
+          }
+        }
+        if (ready) {
+          ctes[name] = std::make_shared<Relation>(
+              ExecuteQuery(context, query, outer, ctes));
+          iter = pending.erase(iter);
+          progress = true;
+        } else {
+          ++iter;
+        }
+      }
+      if (!progress) {
+        // Cyclic references cannot be satisfied; run whatever remains in
+        // map order so the failure mirrors a missing relation.
+        for (const std::string& name : pending) {
+          ctes[name] = std::make_shared<Relation>(
+              ExecuteQuery(context, *statement.WithQueries().at(name), outer,
+                           ctes));
+        }
+        break;
+      }
+    }
   }
 
   // Single-table aggregation: filter and aggregate while scanning so we never
@@ -511,8 +797,7 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
   const bool stream_agg =
       outer == nullptr && statement.WithQueries().empty() &&
       statement.Sources().size() == 1 && !statement.Sources()[0].query &&
-      !statement.Sources()[0].unnest &&
-      !HasWindowFunctions(statement) &&
+      !statement.Sources()[0].unnest && !HasWindowFunctions(statement) &&
       !ctes.contains(statement.Sources()[0].table) &&
       (!statement.WhereClause() || !ContainsQuery(statement.WhereClause())) &&
 
@@ -526,28 +811,51 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     const SelectSource& source = statement.Sources()[0];
     const bool reusable =
         context.execution_runtime() != nullptr &&
-        context.execution_runtime()->reusable_base_relations.contains(source.table);
+        context.execution_runtime()->reusable_base_relations.contains(
+            source.table);
     StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
     if (!table.HasValue()) {
       throw std::runtime_error("table " + source.table + " not found");
     }
     const Schema& table_schema = table.Value()->GetSchema();
-    std::vector<slot_t> projection = RequiredColumns(statement, table_schema);
+    const std::string qualifier =
+        source.alias.empty() ? source.table : source.alias;
+    // Alias/ordinal resolution needs the qualified column names the grouping
+    // expressions see; offsets are identical in the raw table schema.
+    std::shared_ptr<SelectStatement> resolved_statement =
+        ResolveGroupingAliases(
+            statement, qualifier.empty()
+                           ? table_schema
+                           : QualifySchema(table_schema, qualifier));
+    const SelectStatement& stmt =
+        resolved_statement != nullptr ? *resolved_statement : statement;
+    // RequiredColumns must run against the qualified names the statement
+    // references (`t4.array_val`); QualifySchema preserves column order so
+    // the resulting offsets index the raw table scan unchanged.
+    const Schema qualified_table_schema =
+        qualifier.empty() ? table_schema : QualifySchema(table_schema, qualifier);
+    std::vector<slot_t> projection = RequiredColumns(stmt, qualified_table_schema);
     if (const std::vector<slot_t>* shared =
             ReusableProjection(context, source.table)) {
-      projection = *shared;
+      // The shared layout was derived from the raw table schema; never let
+      // it drop columns this statement's own (possibly alias-qualified)
+      // references need.
+      for (const slot_t slot : *shared) {
+        if (std::find(projection.begin(), projection.end(), slot) ==
+            projection.end()) {
+          projection.push_back(slot);
+        }
+      }
+      std::sort(projection.begin(), projection.end());
     }
     Schema scan_schema = projection.empty()
                              ? Schema("", std::vector<Column>{})
                              : ProjectSchema(table_schema, projection);
-    const std::string qualifier =
-        source.alias.empty() ? source.table : source.alias;
     Schema qualified_schema =
-        qualifier.empty() ? scan_schema
-                          : QualifySchema(scan_schema, qualifier);
+        qualifier.empty() ? scan_schema : QualifySchema(scan_schema, qualifier);
 
     std::vector<Expression> scan_predicates =
-        SplitConjuncts(statement.WhereClause());
+        SplitConjuncts(stmt.WhereClause());
     CompiledScanFilter scan_filter =
         CompileScanFilter(scan_predicates, scan_schema);
 
@@ -555,14 +863,14 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     input.schema = qualified_schema;
     // Project aggregates against the qualified schema; feed rows one at a time
     // without retaining them in input.rows.
+    const Expression having_expr = InlineHavingAliases(statement, input.schema);
     std::vector<const AggregateExpression*> aggregate_expressions;
     std::unordered_set<const AggregateExpression*> seen_aggregates;
-    for (const NamedExpression& projection_item : statement.SelectList()) {
+    for (const NamedExpression& projection_item : stmt.SelectList()) {
       CollectAggregates(projection_item.expression, &aggregate_expressions,
                         &seen_aggregates);
     }
-    CollectAggregates(statement.Having(), &aggregate_expressions,
-                      &seen_aggregates);
+    CollectAggregates(having_expr, &aggregate_expressions, &seen_aggregates);
 
     struct GroupState {
       Row representative;
@@ -570,12 +878,12 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     };
     std::deque<AggregateAccumulator> aggregate_states;
     std::vector<GroupState> groups;
-    std::unordered_map<Row, size_t> offsets;
+    GroupKeyMap offsets;
 
     std::vector<std::optional<slot_t>> group_offsets;
-    group_offsets.reserve(statement.GroupBy().size());
+    group_offsets.reserve(stmt.GroupBy().size());
     bool group_keys_are_columns = true;
-    for (const Expression& key : statement.GroupBy()) {
+    for (const Expression& key : stmt.GroupBy()) {
       if (key->Type() != TypeTag::kColumnValue) {
         group_keys_are_columns = false;
         group_offsets.emplace_back(std::nullopt);
@@ -583,14 +891,16 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       }
       group_offsets.emplace_back(LocalColumnOffset(
           input.schema, key->AsColumnValue().GetColumnName()));
-      if (!group_offsets.back()) { group_keys_are_columns = false;
-}
+      if (!group_offsets.back()) {
+        group_keys_are_columns = false;
+      }
     }
     std::vector<std::optional<slot_t>> aggregate_child_offsets;
     aggregate_child_offsets.reserve(aggregate_expressions.size());
     for (const AggregateExpression* aggregate : aggregate_expressions) {
       if (IsCountStar(*aggregate)) {
-        aggregate_child_offsets.emplace_back(std::nullopt);  // sentinel via count*
+        aggregate_child_offsets.emplace_back(
+            std::nullopt);  // sentinel via count*
         continue;
       }
       if (aggregate->Child()->Type() == TypeTag::kColumnValue) {
@@ -608,18 +918,21 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
 
     const auto scan_begin = std::chrono::steady_clock::now();
     auto accumulate_row = [&](Row row) {
-      if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->scan_output_rows;
-}
-      Scope scope{.row=&row, .schema=&input.schema, .outer=outer};
+      if (context.execution_runtime() != nullptr) {
+        ++context.execution_runtime()->scan_output_rows;
+      }
+      Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
       std::vector<Value> key_values;
-      key_values.reserve(statement.GroupBy().size());
+      key_values.reserve(stmt.GroupBy().size());
       if (group_keys_are_columns) {
         for (const auto& offset : group_offsets) {
-          key_values.push_back(row[*offset]);
+          key_values.push_back(CanonicalDistinctValue(row[*offset]));
         }
       } else {
-        for (const Expression& key : statement.GroupBy()) {
-          key_values.push_back(Evaluate(key, scope, nullptr, context, ctes));
+        for (const Expression& key : stmt.GroupBy()) {
+          key_values.push_back(
+              CanonicalDistinctValue(Evaluate(key, scope, nullptr, context,
+                                              ctes)));
         }
       }
       Row key(std::move(key_values));
@@ -651,8 +964,8 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
           accumulator.Add(row[*aggregate_child_offsets[i]]);
         } else {
           AggregateInput input;
-          input.value = Evaluate(aggregate.Child(), scope, nullptr, context,
-                                 ctes);
+          input.value =
+              Evaluate(aggregate.Child(), scope, nullptr, context, ctes);
           if (aggregate.Having() != AggregateHavingModifier::kNone &&
               aggregate.HavingCondition()) {
             input.condition = Evaluate(aggregate.HavingCondition(), scope,
@@ -664,16 +977,24 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
           }
           if (aggregate.GetType() == AggregationType::kStringAgg &&
               aggregate.SecondaryArg()) {
-            input.auxiliary = Evaluate(aggregate.SecondaryArg(), scope,
-                                       nullptr, context, ctes);
+            input.auxiliary = Evaluate(aggregate.SecondaryArg(), scope, nullptr,
+                                       context, ctes);
+          }
+          for (const Expression& extra : aggregate.TrailingArgs()) {
+            if (extra) {
+              input.trailing_values.push_back(
+                  Evaluate(extra, scope, nullptr, context, ctes));
+            }
           }
           accumulator.Add(std::move(input));
         }
-        if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->aggregate_updates;
-}
+        if (context.execution_runtime() != nullptr) {
+          ++context.execution_runtime()->aggregate_updates;
+        }
       }
-      if (context.execution_runtime() != nullptr) { ++context.execution_runtime()->aggregate_input_rows;
-}
+      if (context.execution_runtime() != nullptr) {
+        ++context.execution_runtime()->aggregate_input_rows;
+      }
     };
 
     const std::vector<slot_t>* proj_ptr =
@@ -700,17 +1021,20 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
         while (iterator.IsValid()) {
           if (context.execution_runtime() != nullptr) {
             ++context.execution_runtime()->scan_rows;
-            context.execution_runtime()->scan_values_available += table_schema.ColumnCount();
-            context.execution_runtime()->scan_values_decoded += scan_schema.ColumnCount();
+            context.execution_runtime()->scan_values_available +=
+                table_schema.ColumnCount();
+            context.execution_runtime()->scan_values_decoded +=
+                scan_schema.ColumnCount();
           }
           cache_rel.AddRow(*iterator);
           ++iterator;
         }
         cache_rel.FinishSpill();
-        cached =
-            context.execution_runtime()->base_relations
-                .emplace(cache_key, std::make_shared<Relation>(std::move(cache_rel)))
-                .first;
+        cached = context.execution_runtime()
+                     ->base_relations
+                     .emplace(cache_key,
+                              std::make_shared<Relation>(std::move(cache_rel)))
+                     .first;
       } else {
         ++context.execution_runtime()->base_scan_cache_hits;
       }
@@ -741,15 +1065,17 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
         return table.Value()->BeginFullScan(context.txn_, projection);
       }();
       while (iterator.IsValid()) {
-        if (!MatchScanFilter(*iterator, scan_schema, scan_filter, outer, context,
-                             ctes)) {
+        if (!MatchScanFilter(*iterator, scan_schema, scan_filter, outer,
+                             context, ctes)) {
           ++iterator;
           continue;
         }
         if (context.execution_runtime() != nullptr) {
           ++context.execution_runtime()->scan_rows;
-          context.execution_runtime()->scan_values_available += table_schema.ColumnCount();
-          context.execution_runtime()->scan_values_decoded += scan_schema.ColumnCount();
+          context.execution_runtime()->scan_values_available +=
+              table_schema.ColumnCount();
+          context.execution_runtime()->scan_values_decoded +=
+              scan_schema.ColumnCount();
         }
         accumulate_row(*iterator);
         ++iterator;
@@ -762,9 +1088,10 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       context.execution_runtime()->filter_ms += ElapsedMs(scan_begin);
       context.execution_runtime()->aggregate_groups += groups.size();
     }
-    if (groups.empty() && statement.GroupBy().empty()) {
+    if (groups.empty() && stmt.GroupBy().empty()) {
       GroupState group;
-      group.representative = Row(std::vector<Value>(input.schema.ColumnCount(), Value()));
+      group.representative =
+          Row(std::vector<Value>(input.schema.ColumnCount(), Value()));
       group.accumulator_offset = aggregate_states.size();
       for (const AggregateExpression* aggregate : aggregate_expressions) {
         aggregate_states.emplace_back(aggregate);
@@ -775,11 +1102,19 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     Relation output(context.execution_runtime());
     output.schema = input.schema;
     std::vector<Column> output_columns;
-    for (size_t i = 0; i < statement.SelectList().size(); ++i) {
-      const NamedExpression& projection_item = statement.SelectList()[i];
+    for (size_t i = 0; i < stmt.SelectList().size(); ++i) {
+      const NamedExpression& projection_item = stmt.SelectList()[i];
       output_columns.emplace_back(ProjectionName(projection_item, i),
                                   ValueType::kNull);
     }
+    // Inline ORDER BY handling: keys may reference select aliases (output
+    // schema), grouping base columns (representative row) or outer scopes.
+    const Schema initial_output_schema("", output_columns);
+    struct KeyedRow {
+      std::vector<Value> keys;
+      Row row;
+    };
+    std::vector<KeyedRow> sortable;
     for (const GroupState& group : groups) {
       AggregateResultMap aggregate_results;
       aggregate_results.reserve(aggregate_expressions.size());
@@ -788,19 +1123,74 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
             aggregate_expressions[i],
             aggregate_states[group.accumulator_offset + i].Finish());
       }
-      Scope scope{.row=&group.representative, .schema=&input.schema, .outer=outer};
-      if (statement.Having() &&
-          !Truthy(Evaluate(statement.Having(), scope, &aggregate_results,
-                           context, ctes))) {
+      Scope scope{.row = &group.representative,
+                  .schema = &input.schema,
+                  .outer = outer};
+      // Correlated subqueries in HAVING / SELECT resolve aggregate aliases
+      // against this group's values through the scope chain.
+      scope.aggregates = &aggregate_results;
+      if (having_expr &&
+          !Truthy(Evaluate(having_expr, scope, &aggregate_results, context,
+                           ctes))) {
         continue;
       }
       std::vector<Value> values;
-      values.reserve(statement.SelectList().size());
-      for (const NamedExpression& projection_item : statement.SelectList()) {
+      values.reserve(stmt.SelectList().size());
+      for (const NamedExpression& projection_item : stmt.SelectList()) {
         values.push_back(Evaluate(projection_item.expression, scope,
                                   &aggregate_results, context, ctes));
       }
-      output.AddRow(Row(std::move(values)));
+      Row output_row(std::move(values));
+      // Sort keys may reference base columns of the grouped relation
+      // (`ORDER BY str_val` where str_val is a grouping key); chain the
+      // projected row to the group's representative row so those resolve.
+      if (!stmt.OrderBy().empty()) {
+        Scope base_scope{.row=&group.representative, .schema=&input.schema,
+                         .outer=outer};
+        Scope proj_scope{.row=&output_row, .schema=&initial_output_schema,
+                         .outer=&base_scope};
+        std::vector<Value> keys;
+        keys.reserve(stmt.OrderBy().size());
+        for (const auto& key : stmt.OrderBy()) {
+          keys.push_back(
+              Evaluate(key.expression, proj_scope, &aggregate_results,
+                       context, ctes));
+        }
+        sortable.push_back(KeyedRow{.keys=std::move(keys),
+                                    .row=std::move(output_row)});
+      } else {
+        output.AddRow(std::move(output_row));
+      }
+    }
+    if (!sortable.empty()) {
+      const auto sort_begin = std::chrono::steady_clock::now();
+      std::ranges::stable_sort(
+          sortable,
+          [&stmt](const KeyedRow& left, const KeyedRow& right) {
+            for (size_t i = 0; i < stmt.OrderBy().size(); ++i) {
+              const Value& a = left.keys[i];
+              const Value& b = right.keys[i];
+              const int c = CompareForOrderBy(a, b);
+              if (c == 0) { continue;
+}
+              const bool nulls_first =
+                  stmt.OrderBy()[i].nulls_first.value_or(
+                      stmt.OrderBy()[i].ascending);
+              const bool a_less = c < 0;
+              if (a.IsNull()) { return nulls_first;
+}
+              if (b.IsNull()) { return !nulls_first;
+}
+              return stmt.OrderBy()[i].ascending ? a_less : !a_less;
+            }
+            return false;
+          });
+      for (KeyedRow& keyed : sortable) {
+        output.AddRow(std::move(keyed.row));
+      }
+      if (context.execution_runtime() != nullptr) {
+        context.execution_runtime()->sort_ms += ElapsedMs(sort_begin);
+      }
     }
     for (size_t i = 0; i < output_columns.size() && !output.rows.empty(); ++i) {
       output_columns[i] =
@@ -808,12 +1198,12 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     }
     output.schema = Schema("", std::move(output_columns));
     output.FinishSpill();
-    // DISTINCT / ORDER BY / LIMIT without running Project again.
-    if (statement.Distinct()) {
+    // DISTINCT / LIMIT without running Project again; ORDER BY was applied
+    // inline above (its keys may reference grouping base columns that are no
+    // longer reachable from the projected output alone), and DistinctOf
+    // preserves row order.
+    if (stmt.Distinct()) {
       output = DistinctOf(std::move(output));
-    }
-    if (!statement.OrderBy().empty()) {
-      ApplyOrderBy(context, statement, &output, outer, ctes);
     }
     return LimitedRows(statement, std::move(output));
   }
@@ -825,9 +1215,17 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
   size_t hidden_columns = 0;
   const SelectStatement* effective = &statement;
   std::shared_ptr<SelectStatement> windowed_statement;
-  if (HasWindowFunctions(statement)) {
-    WindowedInput windowed = ApplyWindows(context, statement,
-                                          std::move(input), outer, ctes);
+  std::shared_ptr<SelectStatement> resolved_statement;
+  if (!HasWindowFunctions(statement)) {
+    // Grouped queries may reference select-list aliases in GROUP BY / HAVING.
+    resolved_statement = ResolveGroupingAliases(statement, input.schema);
+    if (resolved_statement != nullptr) {
+      effective = resolved_statement.get();
+    }
+  }
+  if (HasWindowFunctions(*effective)) {
+    WindowedInput windowed =
+        ApplyWindows(context, *effective, std::move(input), outer, ctes);
     windowed_statement = windowed.statement;
     hidden_columns = windowed.hidden_columns;
     input = std::move(windowed.input);
@@ -838,24 +1236,22 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
                                 ctes, !where_fully_applied, hidden_columns);
   for (const auto& union_stmt : statement.UnionAll()) {
     Relation union_res = ExecuteQuery(context, *union_stmt, outer, ctes);
-    union_res.ForEachRow([&](const Row& row) {
-      result.AddRow(row);
-    });
+    union_res.ForEachRow([&](const Row& row) { result.AddRow(row); });
   }
   result.FinishSpill();
   return result;
 }
 
-
 }  // namespace tinylamb::relational_detail
 
 namespace tinylamb {
 
-using relational_detail::ExecuteQuery;
+
 using relational_detail::CountStatementTables;
+using relational_detail::ExecuteQuery;
 using relational_detail::ExecutionRuntime;
-using relational_detail::WriteEstimatedPhysicalPlan;
 using relational_detail::Relation;
+using relational_detail::WriteEstimatedPhysicalPlan;
 
 RelationalExecutor::RelationalExecutor(
     TransactionContext& context,
@@ -863,15 +1259,17 @@ RelationalExecutor::RelationalExecutor(
     : context_(&context), statement_(std::move(statement)) {}
 
 void RelationalExecutor::Initialize() {
-  if (initialized_) { return;
-}
+  if (initialized_) {
+    return;
+  }
   ExecutionRuntime runtime;
   runtime.root_statement = statement_.get();
   std::unordered_map<std::string, size_t> table_counts;
   CountStatementTables(*statement_, &table_counts);
   for (const auto& [table, count] : table_counts) {
-    if (count > 1) { runtime.reusable_base_relations.insert(table);
-}
+    if (count > 1) {
+      runtime.reusable_base_relations.insert(table);
+    }
   }
   ExecutionRuntime* previous_runtime = context_->execution_runtime();
   context_->set_execution_runtime(&runtime);
@@ -917,11 +1315,13 @@ void RelationalExecutor::Initialize() {
 
 bool RelationalExecutor::Next(Row* destination, RowPosition* position) {
   Initialize();
-  if (offset_ >= rows_.size()) { return false;
-}
+  if (offset_ >= rows_.size()) {
+    return false;
+  }
   *destination = rows_[offset_++];
-  if (position != nullptr) { *position = RowPosition();
-}
+  if (position != nullptr) {
+    *position = RowPosition();
+  }
   return true;
 }
 
@@ -969,6 +1369,5 @@ void RelationalExecutor::Explain(std::ostream& output, int /*indent*/) const {
            << " relation_spills=" << relation_spills_ << '\n';
   }
 }
-
 
 }  // namespace tinylamb

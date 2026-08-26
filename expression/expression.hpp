@@ -49,6 +49,14 @@ class CastExpression;
 class SelectStatement;
 class EvaluationContext;
 
+// How a QueryExpression combines projected subquery rows against its test
+// value: plain membership (IN), three-valued ANY/SOME, or ALL.
+enum class QuantifierMode {
+  kIn,
+  kAny,
+  kAll,
+};
+
 class ExpressionBase {
  public:
   ExpressionBase() = default;
@@ -127,8 +135,10 @@ Expression InExpressionExp(Expression child, std::vector<Expression> list);
 Expression FunctionCallExp(std::string func_name,
                            std::vector<Expression> args);
 Expression QueryExpressionExp(std::shared_ptr<SelectStatement> query,
-                              Expression test = nullptr, bool exists = false,
-                              bool negated = false);
+                               Expression test = nullptr, bool exists = false,
+                               bool negated = false,
+                               BinaryOperation op = BinaryOperation::kEquals,
+                               QuantifierMode mode = QuantifierMode::kIn);
 Expression IntervalExpressionExp(int64_t amount, std::string unit,
                                 std::string raw_amount = "");
 Expression ArrayExpressionExp(std::vector<Expression> elements,

@@ -9,7 +9,9 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
+#include <unordered_set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +25,7 @@
 #include "executor/executor_base.hpp"
 #include "query/googlesql_frontend.hpp"
 #include "query/sql_engine.hpp"
+#include "query/statement.hpp"
 #include "type/date.hpp"
 #include "type/row.hpp"
 #endif
@@ -69,6 +72,25 @@ bool RowsMatch(const std::vector<Row>& actual,
                const GoogleSqlComplianceCase& test_case, std::string* detail) {
   auto matches_expected = [&](const Row& row,
                               const std::vector<std::string>& expected) {
+    // Value-table goldens print a whole-row NULL as a single "NULL" token;
+    // engines that store the struct flattened (one column per field) present
+    // the same row as all-NULL columns.
+    auto lower_trim = [](const std::string& s) {
+      const char* ws = " \t\r\n";
+      size_t b = s.find_first_not_of(ws);
+      if (b == std::string::npos) { return std::string(); }
+      size_t e = s.find_last_not_of(ws);
+      std::string out = s.substr(b, e - b + 1);
+      for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      return out;
+    };
+    if (expected.size() == 1 && lower_trim(expected[0]) == "null" &&
+        row.values_.size() > 1) {
+      return std::all_of(row.values_.begin(), row.values_.end(),
+                         [](const Value& v) { return v.IsNull(); });
+    }
     if (row.values_.size() != expected.size()) { return false; }
     for (size_t i = 0; i < expected.size(); ++i) {
       if (!ComplianceValueMatches(row.values_[i], expected[i])) { return false; }
@@ -134,22 +156,49 @@ bool RowsMatch(const std::vector<Row>& actual,
 std::vector<std::string> SplitStatements(std::string_view sql) {
   std::vector<std::string> stmts;
   std::string current;
-  bool in_string = false;
+  // Splits on top-level ';' only: string literals (including triple-quoted
+  // ones) and '#' / '--' comments may contain semicolons, quotes and
+  // apostrophes that must not disturb the scanner state.
+  enum class Mode { kCode, kString, kComment };
+  Mode mode = Mode::kCode;
   char quote = '\0';
+  // Triple-quoted strings ('''...''' / """...""") delimit with three quote
+  // runs; interior quotes of any count must not toggle the string state.
+  bool triple = false;
+  auto run_length = [&](size_t i) {
+    size_t n = 0;
+    while (i + n < sql.size() && sql[i + n] == quote && n < 3) { ++n; }
+    return n;
+  };
   for (size_t i = 0; i < sql.size(); ++i) {
     const char c = sql[i];
-    if (in_string) {
+    if (mode == Mode::kComment) {
       current.push_back(c);
-      if (c == '\\' && i + 1 < sql.size()) {
+      if (c == '\n') { mode = Mode::kCode; }
+      continue;
+    }
+    if (mode == Mode::kString) {
+      current.push_back(c);
+      if (!triple && c == '\\' && i + 1 < sql.size()) {
         current.push_back(sql[++i]);
         continue;
       }
-      if (c == quote) { in_string = false; }
+      if (c == quote) {
+        const size_t run = run_length(i);
+        if (triple ? run == 3 : true) {
+          for (size_t k = 1; k < (triple ? run : 1); ++k) {
+            current.push_back(sql[++i]);
+          }
+          mode = Mode::kCode;
+          triple = false;
+        }
+      }
       continue;
     }
     if (c == '"' || c == '\'') {
-      in_string = true;
+      mode = Mode::kString;
       quote = c;
+      triple = run_length(i) == 3;
       current.push_back(c);
       continue;
     }
@@ -282,6 +331,42 @@ TEST(GoogleSqlComplianceFile, SkipsDifferentialPrivacy) {
 }
 
 #ifdef TINYLAMB_GOOGLESQL_COMPLIANCE_RUN
+// Features this engine claims for compliance feature-gating. A case tagged
+// with required_features outside this set is skipped, mirroring the reference
+// TestDriver contract (unsupported-feature cases are neither pass nor fail).
+bool CaseFeatureSupported(const GoogleSqlComplianceCase& test_case) {
+  // Features this engine implements well enough to run their cases; every
+  // other required_features tag skips the case (and file-level setup for
+  // whole-file features), mirroring the reference TestDriver contract where
+  // unsupported-feature cases are neither pass nor fail.
+  static const std::unordered_set<std::string> kSupported = {
+      "INLINE_LAMBDA_ARGUMENT",        // ARRAY_TRANSFORM/ARRAY_FILTER lambdas
+      "TEMPLATE_FUNCTIONS",            // ANY TYPE templated SQL functions
+      "ANY_STRING_TEMPLATED_ARGUMENT", // ANY STRING templated parameters
+      "WITH_ON_SUBQUERY",              // WITH clauses inside function bodies
+  };
+  for (const std::string& feature : test_case.required_features) {
+    if (kSupported.find(feature) == kSupported.end()) { return false; }
+  }
+  return true;
+}
+
+bool IsMutatingSql(std::string_view sql) {
+  size_t begin = 0;
+  while (begin < sql.size() && std::isspace(static_cast<unsigned char>(sql[begin])) != 0) {
+    ++begin;
+  }
+  sql = sql.substr(begin);
+  auto prefix = [&sql](std::string_view keyword) {
+    if (sql.size() < keyword.size()) { return false; }
+    if (sql.substr(0, keyword.size()) != keyword) { return false; }
+    if (sql.size() == keyword.size()) { return true; }
+    const char next = sql[keyword.size()];
+    return !std::isalnum(static_cast<unsigned char>(next)) && next != '_';
+  };
+  return prefix("INSERT") || prefix("UPDATE") || prefix("DELETE");
+}
+
 class GoogleSqlComplianceFileTest
     : public ::testing::TestWithParam<std::string> {};
 
@@ -299,20 +384,50 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
   const std::vector<GoogleSqlComplianceCase> cases =
       ParseGoogleSqlComplianceFile(path.string(), ReadFile(path));
 
+  bool file_mutates_state = false;
+  for (const GoogleSqlComplianceCase& test_case : cases) {
+    if (!test_case.prepare_database && IsMutatingSql(test_case.sql)) {
+      file_mutates_state = true;
+      break;
+    }
+  }
+
   const std::string path_prefix = "googlesql_compliance-" + RandomString(8);
-  Database database(path_prefix);
-  TransactionContext context = database.BeginContext();
-  SqlEngine engine(database);
+  auto database = std::make_unique<Database>(path_prefix);
+  auto context = std::make_unique<TransactionContext>(database->BeginContext());
+  auto engine = std::make_unique<SqlEngine>(*database);
+
+  // Files whose cases mutate tables get per-case isolation: each case runs
+  // against a freshly created database with the prepared state replayed,
+  // mirroring the reference driver's per-case test database. A distinct
+  // storage prefix per rebuild keeps a destroyed instance's WAL from being
+  // recovered into its replacement.
+  std::vector<std::vector<std::string>> prepare_segments;
+  int environment_generation = 0;
+  auto replay_prepared_state = [&]() {
+    SqlEngine::SetCompliancePrimaryKeyMode(false);
+    for (const auto& segment : prepare_segments) {
+      for (const std::string& stmt : segment) {
+        Status s_status = Status::kSuccess;
+        Drain(*engine, *context, stmt, &s_status);
+      }
+    }
+  };
 
   for (const GoogleSqlComplianceCase& test_case : cases) {
     if (IsDifferentialPrivacyCase(test_case)) { continue; }
+    // Feature gating applies to prepare_database setup too: whole-file
+    // features (SQL_GRAPH, RANGE_TYPE, ...) gate their file's setup blocks,
+    // exactly like the reference driver skips unsupported feature files.
+    if (!CaseFeatureSupported(test_case)) { continue; }
     SetDefaultTimeZone(test_case.default_time_zone.empty() ? "America/Los_Angeles" : test_case.default_time_zone);
     if (test_case.prepare_database) {
       const std::vector<std::string> stmts = SplitStatements(test_case.sql);
+      prepare_segments.push_back(stmts);
       for (const std::string& stmt : stmts) {
         Status s_status = Status::kSuccess;
         try {
-          Drain(engine, context, stmt, &s_status);
+          Drain(*engine, *context, stmt, &s_status);
         } catch (const std::exception& ex) {
           ADD_FAILURE() << GetParam() << " / " << test_case.name
                         << " prepare threw: " << ex.what() << "\n"
@@ -322,7 +437,7 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
         if (s_status != Status::kSuccess) {
           EXPECT_EQ(s_status, Status::kSuccess)
               << GetParam() << " / " << test_case.name
-              << " prepare failed: " << engine.LastError() << "\n"
+              << " prepare failed: " << engine->LastError() << "\n"
               << stmt;
           break;
         }
@@ -330,12 +445,40 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
       continue;
     }
 
+    if (file_mutates_state) {
+      engine.reset();
+      context.reset();
+      database->DeleteAll();
+      database.reset();
+      const std::string case_prefix =
+          path_prefix + "-" + std::to_string(++environment_generation);
+      database = std::make_unique<Database>(case_prefix);
+      context = std::make_unique<TransactionContext>(database->BeginContext());
+      engine = std::make_unique<SqlEngine>(*database);
+      replay_prepared_state();
+    }
+    SqlEngine::SetCompliancePrimaryKeyMode(
+        test_case.primary_key_mode == "first_column_is_primary_key");
 
     Status status = Status::kSuccess;
     std::string error_msg;
     std::vector<Row> rows;
     try {
-      rows = Drain(engine, context, test_case.sql, &status, &error_msg);
+      rows = Drain(*engine, *context, test_case.sql, &status, &error_msg);
+      if (status == Status::kSuccess &&
+          engine->LastStatementType().has_value()) {
+        const StatementType executed = *engine->LastStatementType();
+        if (executed == StatementType::kInsert ||
+            executed == StatementType::kUpdate ||
+            executed == StatementType::kDelete) {
+          // The reference driver reports num_rows_modified plus the full
+          // post-statement table contents; mirror that by scanning the
+          // target table after a successful mutation.
+          rows = Drain(*engine, *context,
+                       "SELECT * FROM `" + engine->LastDmlTable() + "`",
+                       &status, &error_msg);
+        }
+      }
     } catch (const std::exception& ex) {
       if (!test_case.expect_error) {
         ADD_FAILURE() << GetParam() << " / " << test_case.name
@@ -356,13 +499,20 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
                     << test_case.sql;
     } else {
       std::string detail;
-      EXPECT_TRUE(RowsMatch(rows, test_case, &detail))
+      bool matched = false;
+      try {
+        matched = RowsMatch(rows, test_case, &detail);
+      } catch (const std::exception& ex) {
+        matched = false;
+        detail = std::string("RowsMatch threw: ") + ex.what();
+      }
+      EXPECT_TRUE(matched)
           << GetParam() << " / " << test_case.name << " " << detail << "\n"
           << test_case.sql << "\n"
           << test_case.raw_result;
     }
   }
-  database.DeleteAll();
+  database->DeleteAll();
 }
 
 std::vector<std::string> ComplianceFileNames() {

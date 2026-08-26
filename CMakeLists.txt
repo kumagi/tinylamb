@@ -293,8 +293,10 @@ tinylamb_add_layer(tinylamb_expression
         expression/array_expression.cpp
         expression/cast_expression.cpp
         expression/window_function_expression.cpp
-        expression/lambda_expression.cpp
+        expression/proto_text.cpp
         expression/rewrite.cpp
+        expression/sql_udf.cpp
+        expression/proto_schema.cpp
 
         expression/bytecode.cpp
         expression/jit.cpp

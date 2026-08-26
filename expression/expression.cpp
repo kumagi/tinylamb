@@ -145,9 +145,10 @@ Expression FunctionCallExp(std::string func_name, std::vector<Expression> args) 
 }
 
 Expression QueryExpressionExp(std::shared_ptr<SelectStatement> query,
-                              Expression test, bool exists, bool negated) {
+                              Expression test, bool exists, bool negated,
+                              BinaryOperation op, QuantifierMode mode) {
   return std::make_shared<QueryExpression>(std::move(query), std::move(test),
-                                           exists, negated);
+                                           exists, negated, op, mode);
 }
 
 Expression IntervalExpressionExp(int64_t amount, std::string unit,

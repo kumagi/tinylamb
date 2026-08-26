@@ -18,6 +18,7 @@ Relation::Relation(Relation&& other) noexcept
       rows(std::move(other.rows)),
       spill(std::move(other.spill)),
       spill_tail_(std::move(other.spill_tail_)),
+      using_columns(std::move(other.using_columns)),
       charged_bytes_(other.charged_bytes_),
       hash_joins(other.hash_joins),
       hybrid_hash_joins(other.hybrid_hash_joins),
@@ -44,6 +45,7 @@ Relation& Relation::operator=(Relation&& other) noexcept {
     rows = std::move(other.rows);
     spill = std::move(other.spill);
     spill_tail_ = std::move(other.spill_tail_);
+    using_columns = std::move(other.using_columns);
     charged_bytes_ = other.charged_bytes_;
     other.charged_bytes_ = 0;
     hash_joins = other.hash_joins;
@@ -144,6 +146,7 @@ void CopyExecutionStats(Relation* destination, const Relation& source) {
   destination->nested_loop_joins = source.nested_loop_joins;
   destination->join_comparisons = source.join_comparisons;
   destination->peak_intermediate_rows = source.peak_intermediate_rows;
+  destination->using_columns = source.using_columns;
 }
 
 }  // namespace tinylamb::relational_detail

@@ -40,7 +40,6 @@ enum class UnaryOperation : int {
   kMinus,
 };
 
-
 enum class AggregationType : int {
   kCount,
   kSum,
@@ -52,7 +51,39 @@ enum class AggregationType : int {
   kArrayAgg,
   kStringAgg,
   kCountIf,
+  // Statistical aggregates (long-double accumulation).
+  kAnyValue,
+  kVarSamp,
+  kVarPop,
+  kStddevSamp,
+  kStddevPop,
+  kCovarSamp,
+  kCovarPop,
+  kCorr,
+  // Approximate / sketching aggregates.
+  kApproxQuantiles,
+  kBitAnd,
+  kBitOr,
+  kBitXor,
+  kArrayConcatAgg,
+  kElementwiseSum,
+  kElementwiseAvg,
+  kApproxTopCount,
+  kApproxTopSum,
+  kHllInit,
+  kHllMerge,
+  kHllMergePartial,
+  kKllInitInt64,
+  kKllInitUint64,
+  kKllInitDouble,
+  kKllMergePartial,
+  kPercentileCont,
+  kApproxCountDistinct,
 };
+
+bool IsStatisticalAggregate(AggregationType type);
+bool IsSketchAggregate(AggregationType type);
+bool IsExtendedAggregate(AggregationType type);
 
 std::string ToString(AggregationType type);
 inline std::ostream& operator<<(std::ostream& o, const AggregationType& at) {
@@ -101,7 +132,8 @@ class Value {
   size_t Serialize(char* dst) const;
   size_t Deserialize(const char* src, ValueType as_type);
   // Advance past a serialized value without constructing it (projection skip).
-  [[nodiscard]] static size_t SkipSerialized(const char* src, ValueType as_type);
+  [[nodiscard]] static size_t SkipSerialized(const char* src,
+                                             ValueType as_type);
 
   [[nodiscard]] std::string EncodeMemcomparableFormat() const;
   size_t DecodeMemcomparableFormat(const char* src);
@@ -126,11 +158,30 @@ class Value {
   [[nodiscard]] std::string AsString() const;
   friend std::ostream& operator<<(std::ostream& o, const Value& v);
 
+// Three-way comparison with SQL ORDER BY semantics among non-NULL values:
+// NULL orders below everything, NaN orders directly above NULL and below
+// every other number, and cross-type or unordered operands fall back to a
+// deterministic total order instead of throwing.
+// Returns a negative value when a sorts before b, zero when equal under the
+// ordering, positive when a sorts after b.
+[[nodiscard]] friend int CompareForOrderBy(const Value& a, const Value& b);
+
   // Read/Write with type info.
   friend Encoder& operator<<(Encoder& a, const Value& v);
   friend Decoder& operator>>(Decoder& e, Value& v);
 
   [[nodiscard]] bool IsNull() const { return type == ValueType::kNull; }
+
+  // Collation attachment (COLLATE(value, spec)).  0 = none, 1 = 'binary',
+  // 2 = case-insensitive ('und:ci' style).  Comparisons consult the tag when
+  // either operand carries it; serialization and hashing ignore it.
+  [[nodiscard]] uint8_t Collation() const { return collation_; }
+  [[nodiscard]] bool IsCaseInsensitive() const { return collation_ == 2; }
+  [[nodiscard]] Value WithCollation(uint8_t collation) const {
+    Value copy = *this;
+    copy.collation_ = collation;
+    return copy;
+  }
 
   union {
     int64_t int_value;
@@ -140,7 +191,19 @@ class Value {
   ValueType type{ValueType::kNull};
   std::string owned_data;
   std::shared_ptr<ArrayPayload> array_;
+
+ private:
+  uint8_t collation_{0};
 };
+
+}  // namespace tinylamb
+
+namespace tinylamb {
+
+// Shortest round-trip text for a DOUBLE ("17.5", "0.1", "inf", "nan").
+// Shared by struct/JSON encoders so nested values render like the
+// compliance goldens instead of fixed-precision "%f" output.
+[[nodiscard]] std::string FormatDoubleShortest(double value);
 
 }  // namespace tinylamb
 

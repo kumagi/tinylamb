@@ -24,6 +24,16 @@ struct Scope {
   const Row* row{nullptr};
   const Schema* schema{nullptr};
   const Scope* outer{nullptr};
+  // USING join merged column names (lowercased): a bare reference matching
+  // several schema columns coalesces them when its name is listed here.
+  const std::vector<std::string>* using_columns{nullptr};
+  // Aggregate values of the enclosing grouped query.  Subqueries nested in
+  // HAVING / SELECT-over-groups resolve correlated aggregate references
+  // through this chain (e.g. FROM UNNEST(agg_alias) after alias inlining).
+  // Same type as relational_detail::AggregateResultMap, spelled inline to
+  // keep this header free of the expression_eval.hpp cycle.
+  const std::unordered_map<const class AggregateExpression*, Value>*
+      aggregates{nullptr};
 };
 
 using CteMap = std::unordered_map<std::string, RelationPtr>;
@@ -60,6 +70,15 @@ struct ExecutionRuntime {
   std::unordered_map<const SelectStatement*, std::unordered_set<Value>>
       uncorrelated_membership;
   std::unordered_set<const SelectStatement*> noncacheable_queries;
+  // Keep-alives for every subquery statement whose address keys the caches
+  // above.  Prepared executors are freed between statements, and a later
+  // allocation could otherwise reuse a dead statement's address, silently
+  // binding stale cache entries to an unrelated subquery.
+  std::vector<std::shared_ptr<const SelectStatement>> retained_statements;
+  // Fingerprint recorded when a cache entry was created; a mismatch on probe
+  // means the address was recycled by an unrelated statement and the entry
+  // must be discarded.
+  std::unordered_map<const SelectStatement*, std::string> cache_fingerprints;
   size_t correlated_index_builds{0};
   size_t correlated_index_probes{0};
   size_t correlated_result_cache_hits{0};
@@ -106,6 +125,20 @@ Relation FinishQuery(TransactionContext& context,
                      bool apply_where = true,
                      size_t hidden_columns = 0);
 
+// GoogleSQL name resolution for grouped queries: GROUP BY / HAVING items may
+// reference SELECT-list aliases or ordinals when they do not resolve against
+// the input columns.  Returns nullptr when nothing needed rewriting.
+std::shared_ptr<SelectStatement> ResolveGroupingAliases(
+    const SelectStatement& statement, const Schema& input_schema);
+
+// Projects one subquery result row for expression consumption: the first
+// column value, or -- for SELECT AS STRUCT subqueries -- the whole row
+// encoded as struct-like JSON so quantified comparisons and membership see a
+// single comparable value.  `schema` (optional) supplies the declared field
+// names; without it positional "fN" keys are used.
+Value ProjectSubqueryRow(const Row& row, bool as_struct,
+                         const Schema* schema = nullptr);
+
 std::optional<Relation> ExecuteCorrelatedSingleSource(
     TransactionContext& context, const SelectStatement& statement,
     const Scope& outer, const CteMap& ctes);
@@ -132,6 +165,12 @@ bool ExpressionsAreLocal(TransactionContext& context,
                          const SelectStatement& statement,
                          const std::vector<Relation>& sources,
                          const CteMap& ctes);
+
+// Guards runtime caches against recycled statement addresses (see
+// ExecutionRuntime::cache_fingerprints).
+bool CacheEntryIsCurrent(const SelectStatement& statement,
+                         ExecutionRuntime& runtime);
+void DropCacheEntry(ExecutionRuntime& runtime, const SelectStatement* key);
 
 }  // namespace tinylamb::relational_detail
 

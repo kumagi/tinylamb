@@ -18,6 +18,7 @@
 #define TINYLAMB_QUERY_STATEMENT_HPP
 
 #include <memory>
+#include <sstream>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -32,7 +33,7 @@ namespace tinylamb {
 
 class SelectStatement;
 
-enum class JoinType { kCross, kInner, kLeft };
+enum class JoinType { kCross, kInner, kLeft, kRight, kFull };
 
 struct SelectSource {
   SelectSource() = default;
@@ -56,6 +57,11 @@ struct SelectSource {
   Expression join_condition;
   Expression unnest;
   std::string offset_alias;
+  // USING (col, ...) names declared on the join whose right operand is this
+  // source; empty for every other source.  The merged columns stay
+  // physically duplicated in the joined schema, but bare references and
+  // star expansion coalesce them (see Lookup / relational projection).
+  std::vector<std::string> using_columns;
 };
 
 
@@ -212,6 +218,9 @@ class SelectStatement : public Statement {
     return with_queries_;
   }
   bool RequiresRelationalEvaluation() const { return complex_; }
+  // SELECT AS STRUCT: subquery consumers compare whole rows as structs.
+  bool AsStruct() const { return as_struct_; }
+  void SetAsStruct(bool as_struct) { as_struct_ = as_struct; }
   const std::unordered_map<std::string, std::string>& Aliases() const {
     return aliases_;
   }
@@ -254,6 +263,18 @@ class SelectStatement : public Statement {
     complex_ = true;
   }
   void MarkComplex() { complex_ = true; }
+  // Structural fingerprint (Dump text), memoized per statement object.  The
+  // execution runtime keys caches by statement address; because freed
+  // statements are recycled by the allocator, a probe must confirm the
+  // cached fingerprint still describes THIS statement before reusing data.
+  const std::string& Fingerprint() const {
+    if (cached_fingerprint_.empty()) {
+      std::ostringstream stream;
+      Dump(stream);
+      cached_fingerprint_ = stream.str();
+    }
+    return cached_fingerprint_;
+  }
   void Dump(std::ostream& o) const override {
     o << "select=[";
     for (size_t i = 0; i < select_list_.size(); i++) {
@@ -294,8 +315,12 @@ class SelectStatement : public Statement {
   std::unordered_map<std::string, std::shared_ptr<SelectStatement>>
       with_queries_;
   std::vector<std::shared_ptr<SelectStatement>> union_all_;
+  bool as_struct_{false};
   bool complex_{false};
+  mutable std::string cached_fingerprint_;
 };
+
+enum class InsertMode { kDefault, kIgnore, kUpdate, kReplace };
 
 class InsertStatement : public Statement {
  public:
@@ -310,6 +335,19 @@ class InsertStatement : public Statement {
   const std::string& TableName() const { return table_name_; }
   const std::vector<std::vector<Expression>>& Values() const { return values_; }
   const std::vector<std::string>& Columns() const { return columns_; }
+  // INSERT ... SELECT: rows come from the query instead of VALUES tuples.
+  const std::shared_ptr<SelectStatement>& Query() const { return query_; }
+  void SetQuery(std::shared_ptr<SelectStatement> query) {
+    query_ = std::move(query);
+  }
+  InsertMode Mode() const { return mode_; }
+  void SetMode(InsertMode mode) { mode_ = mode; }
+  // -1 = no ASSERT_ROWS_MODIFIED clause.
+  int64_t AssertRowsModified() const { return assert_rows_modified_; }
+  void SetAssertRowsModified(int64_t expected) {
+    assert_rows_modified_ = expected;
+  }
+  bool HasAssert() const { return assert_rows_modified_ >= 0; }
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " values=[";
     for (size_t i = 0; i < values_.size(); i++) {
@@ -325,6 +363,9 @@ class InsertStatement : public Statement {
       }
       o << ")";
     }
+    if (query_) {
+      o << "query={" << *query_ << "}";
+    }
     o << "]";
   }
 
@@ -332,6 +373,28 @@ class InsertStatement : public Statement {
   std::string table_name_;
   std::vector<std::vector<Expression>> values_;
   std::vector<std::string> columns_;
+  std::shared_ptr<SelectStatement> query_;
+  InsertMode mode_{InsertMode::kDefault};
+  int64_t assert_rows_modified_{-1};
+};
+
+// Nested DML inside UPDATE SET (...): GoogleSQL applies per-row array
+// mutations (DELETE / UPDATE / INSERT of array elements) while rewriting a
+// target row. The element variable visible to `predicate` / `set_value` is
+// the last component of `target_path`.
+struct NestedDmlItem {
+  enum class Kind { kDelete, kUpdate, kInsert };
+
+  Kind kind{Kind::kDelete};
+  std::string target_path;
+  // DELETE elem WHERE predicate / UPDATE ... SET x = set_value WHERE predicate
+  Expression predicate;
+  Expression set_value;
+  // INSERT VALUES ((a), (b)) rows or an INSERT ... (SELECT ...) source query.
+  std::vector<std::vector<Expression>> insert_values;
+  std::shared_ptr<SelectStatement> insert_query;
+  // -1 = no ASSERT_ROWS_MODIFIED clause on this nested item.
+  int64_t assert_rows_modified{-1};
 };
 
 class UpdateStatement : public Statement {
@@ -345,10 +408,28 @@ class UpdateStatement : public Statement {
         where_clause_(std::move(where_clause)) {}
 
   const std::string& TableName() const { return table_name_; }
+  // UPDATE tbl AS alias: bare references to the alias denote the whole row
+  // (value tables), so SET/WHERE may bind to the single physical column.
+  const std::string& Alias() const { return alias_; }
+  void SetAlias(std::string alias) { alias_ = std::move(alias); }
   const std::vector<std::pair<ColumnName, Expression>>& SetClause() const {
     return set_clause_;
   }
   const Expression& WhereClause() const { return where_clause_; }
+  // Nested per-row array DML items (SET (DELETE/UPDATE/INSERT ...)).
+  const std::vector<NestedDmlItem>& NestedItems() const {
+    return nested_items_;
+  }
+  void SetNestedItems(std::vector<NestedDmlItem> items) {
+    nested_items_ = std::move(items);
+  }
+  bool HasNestedDml() const { return !nested_items_.empty(); }
+  // -1 = no ASSERT_ROWS_MODIFIED clause.
+  int64_t AssertRowsModified() const { return assert_rows_modified_; }
+  void SetAssertRowsModified(int64_t expected) {
+    assert_rows_modified_ = expected;
+  }
+  bool HasAssert() const { return assert_rows_modified_ >= 0; }
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " set=[";
     for (size_t i = 0; i < set_clause_.size(); i++) {
@@ -367,8 +448,11 @@ class UpdateStatement : public Statement {
 
  private:
   std::string table_name_;
+  std::string alias_;
   std::vector<std::pair<ColumnName, Expression>> set_clause_;
   Expression where_clause_;
+  std::vector<NestedDmlItem> nested_items_;
+  int64_t assert_rows_modified_{-1};
 };
 
 class DeleteStatement : public Statement {
@@ -379,7 +463,15 @@ class DeleteStatement : public Statement {
         where_clause_(std::move(where_clause)) {}
 
   const std::string& TableName() const { return table_name_; }
+  const std::string& Alias() const { return alias_; }
+  void SetAlias(std::string alias) { alias_ = std::move(alias); }
   const Expression& WhereClause() const { return where_clause_; }
+  // -1 = no ASSERT_ROWS_MODIFIED clause.
+  int64_t AssertRowsModified() const { return assert_rows_modified_; }
+  void SetAssertRowsModified(int64_t expected) {
+    assert_rows_modified_ = expected;
+  }
+  bool HasAssert() const { return assert_rows_modified_ >= 0; }
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " where=";
     if (where_clause_) {
@@ -391,7 +483,9 @@ class DeleteStatement : public Statement {
 
  private:
   std::string table_name_;
+  std::string alias_;
   Expression where_clause_;
+  int64_t assert_rows_modified_{-1};
 };
 
 }  // namespace tinylamb
