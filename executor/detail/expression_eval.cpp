@@ -5,7 +5,9 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <ctime>
+#include <random>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -33,6 +35,7 @@
 #include "expression/array_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/lambda_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
@@ -747,6 +750,240 @@ std::string FormatCivilTime(const CivilTime& ct, bool include_subsecond = true, 
   return std::string(buf);
 }
 
+// ---------------------------------------------------------------------------
+// Lambda-taking array functions: ARRAY_FILTER / ARRAY_TRANSFORM /
+// ARRAY_FIND / ARRAY_OFFSET / ...  The lambda body is evaluated per element
+// against a synthetic frame that chains to the enclosing scope.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Extracts a typed field from a struct value (stored as a JSON object string)
+// or a proto-ish `{k: v}` text.  Used for `struct.field` access.
+Value StructFieldValue(const Value& base, std::string_view field) {
+  if (base.IsNull()) { return {}; }
+  std::string s0 = base.type == ValueType::kVarChar
+                       ? std::string(base.value.varchar_value)
+                       : base.AsString();
+  if (s0.size() < 2 || s0.front() != '{' || s0.back() != '}') { return {}; }
+  const std::string search_key = "\"" + std::string(field) + "\":";
+  const size_t pos = s0.find(search_key);
+  if (pos == std::string::npos) { return {}; }
+  size_t vs = pos + search_key.size();
+  size_t ve = vs;
+  int depth = 0;
+  bool in_string = false;
+  for (; ve < s0.size(); ++ve) {
+    const char c = s0[ve];
+    if (in_string) {
+      if (c == '\\' && ve + 1 < s0.size()) { ++ve; continue; }
+      if (c == '"') { in_string = false; }
+      continue;
+    }
+    if (c == '"') { in_string = true; continue; }
+    if (c == '{' || c == '[') { ++depth; continue; }
+    if (c == '}' || c == ']') {
+      if (depth > 0) { --depth; continue; }
+      break;
+    }
+    if (c == ',' && depth == 0) { break; }
+  }
+  std::string val_str = s0.substr(vs, ve - vs);
+  while (!val_str.empty() && std::isspace(static_cast<unsigned char>(val_str.front()))) {
+    val_str.erase(val_str.begin());
+  }
+  while (!val_str.empty() && std::isspace(static_cast<unsigned char>(val_str.back()))) {
+    val_str.pop_back();
+  }
+  if (val_str.empty() || val_str == "null") { return {}; }
+  if (val_str == "true") { return Value(int64_t{1}); }
+  if (val_str == "false") { return Value(int64_t{0}); }
+  if (val_str.size() >= 2 && val_str.front() == '"' && val_str.back() == '"') {
+    return Value(std::string(val_str.substr(1, val_str.size() - 2)));
+  }
+  char* end = nullptr;
+  errno = 0;
+  const long long ll = std::strtoll(val_str.c_str(), &end, 10);
+  if (errno == 0 && end != val_str.c_str() && *end == '\0') {
+    return Value(static_cast<int64_t>(ll));
+  }
+  const double dv = std::strtod(val_str.c_str(), &end);
+  if (errno == 0 && end != val_str.c_str() && *end == '\0') {
+    return Value(dv);
+  }
+  // Nested struct / array / other: keep the raw text as a value.
+  return Value(std::move(val_str));
+}
+
+// Serializes a Value into its JSON form for struct embedding.
+std::string ValueToJsonValue(const Value& value) {
+  if (value.IsNull()) { return "null"; }
+  switch (value.type) {
+    case ValueType::kInt64:
+      return std::to_string(value.value.int_value);
+    case ValueType::kDouble: {
+      if (std::isnan(value.value.double_value)) { return "\"nan\""; }
+      if (std::isinf(value.value.double_value)) {
+        return value.value.double_value > 0 ? "\"inf\"" : "\"-inf\"";
+      }
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%g", value.value.double_value);
+      return buf;
+    }
+    case ValueType::kDate:
+      return "\"" + value.AsString() + "\"";
+    case ValueType::kVarChar: {
+      std::string s(value.value.varchar_value);
+      std::string out = "\"";
+      for (char c : s) {
+        if (c == '"' || c == '\\') {
+          out += '\\';
+          out += c;
+        } else if (c == '\n') {
+          out += "\\n";
+        } else {
+          out += c;
+        }
+      }
+      return out + "\"";
+    }
+    default:
+      return value.AsString();
+  }
+}
+
+Value EvaluateLambdaBody(const LambdaExpression& lambda,
+                         const std::vector<Value>& bindings,
+                         const Scope& outer, const AggregateResultMap* aggregates,
+                         TransactionContext& context, const CteMap& ctes) {
+  std::vector<Column> columns;
+  columns.reserve(bindings.size());
+  for (size_t i = 0; i < lambda.Params().size() && i < bindings.size(); ++i) {
+    columns.emplace_back(lambda.Params()[i], ValueTypeOf(bindings[i]));
+  }
+  Schema frame_schema("", std::move(columns));
+  Row frame_row(bindings);
+  Scope scope{.row=&frame_row, .schema=&frame_schema, .outer=&outer};
+  return Evaluate(lambda.Body(), scope, aggregates, context, ctes);
+}
+
+}  // namespace
+
+Value EvaluateLambdaCall(  // NOLINT(misc-no-recursion)
+    const std::string& raw_name, const std::vector<Expression>& args,
+    const LambdaExpression& lambda, const Scope& scope,
+    const AggregateResultMap* aggregates, TransactionContext& context,
+    const CteMap& ctes) {
+  auto evaluate_arg = [&](size_t index) -> Value {
+    return Evaluate(args[index], scope, aggregates, context, ctes);
+  };
+  auto eval_predicate = [&](const Value& element, int64_t offset) -> Value {
+    std::vector<Value> bindings{element};
+    if (lambda.Params().size() > 1) {
+      bindings.push_back(Value(offset));
+    }
+    return EvaluateLambdaBody(lambda, bindings, scope, aggregates, context,
+                              ctes);
+  };
+
+  size_t array_index = 0;
+  while (array_index < args.size() &&
+         (!args[array_index] ||
+          args[array_index]->Type() == TypeTag::kLambdaExp)) {
+    ++array_index;
+  }
+  const Value arr =
+      array_index < args.size() ? evaluate_arg(array_index) : Value();
+  const bool null_array = arr.IsNull() || !arr.IsArray();
+
+  // Index of the lambda argument (the first lambda in the call).
+  const size_t lambda_index =
+      [&]() {
+        for (size_t i = 0; i < args.size(); ++i) {
+          if (args[i] && args[i]->Type() == TypeTag::kLambdaExp) { return i; }
+        }
+        return args.size();
+      }();
+
+  if (raw_name == "apply" || raw_name == "safe.apply") {
+    // Scalar lambda application: apply(value, y -> expr).  The lambda runs
+    // even for a NULL input (so `x IS NULL` and `x+1` behave differently).
+    const Value input = arr;
+    try {
+      std::vector<Value> bindings{input};
+      return EvaluateLambdaBody(lambda, bindings, scope, aggregates, context,
+                                ctes);
+    } catch (...) {
+      if (raw_name == "safe.apply") { return {}; }
+      throw;
+    }
+  }
+  if (raw_name == "array_filter" || raw_name == "array_find_all") {
+    if (null_array) { return Value::Array({}, "INT64"); }
+    std::vector<Value> out;
+    const auto& elements = arr.ArrayElements();
+    for (size_t i = 0; i < elements.size(); ++i) {
+      Value keep = eval_predicate(elements[i], static_cast<int64_t>(i));
+      if (!keep.IsNull() && Truthy(keep)) { out.push_back(elements[i]); }
+    }
+    return Value::Array(std::move(out), arr.ArrayElementSqlType());
+  }
+  if (raw_name == "array_transform") {
+    if (null_array) { return Value::Array({}, "INT64"); }
+    std::vector<Value> out;
+    const auto& elements = arr.ArrayElements();
+    for (size_t i = 0; i < elements.size(); ++i) {
+      out.push_back(eval_predicate(elements[i], static_cast<int64_t>(i)));
+    }
+    std::string element_type;
+    for (const Value& value : out) {
+      if (!value.IsNull()) {
+        element_type = ElementSqlTypeName(value.type);
+        break;
+      }
+    }
+    return Value::Array(std::move(out), element_type);
+  }
+  if (raw_name == "array_offsets") {
+    if (null_array) { return Value::Array({}, "INT64"); }
+    std::vector<Value> out;
+    const auto& elements = arr.ArrayElements();
+    for (size_t i = 0; i < elements.size(); ++i) {
+      Value hit = eval_predicate(elements[i], static_cast<int64_t>(i));
+      if (!hit.IsNull() && Truthy(hit)) { out.push_back(Value(static_cast<int64_t>(i))); }
+    }
+    return Value::Array(std::move(out), "INT64");
+  }
+  if (raw_name == "array_find" || raw_name == "array_offset") {
+    bool last = false;
+    // Optional trailing 'FIRST'/'LAST' mode sits after the lambda argument;
+    // never evaluate the lambda itself as a scalar.
+    for (size_t i = lambda_index + 1; i < args.size(); ++i) {
+      Value mode = evaluate_arg(i);
+      if (!mode.IsNull()) {
+        std::string mode_str = mode.AsString();
+        for (char& c : mode_str) {
+          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (mode_str.find("last") != std::string::npos) { last = true; }
+      }
+    }
+    if (null_array) { return {}; }
+    const auto& elements = arr.ArrayElements();
+    std::vector<size_t> matches;
+    for (size_t i = 0; i < elements.size(); ++i) {
+      Value hit = eval_predicate(elements[i], static_cast<int64_t>(i));
+      if (!hit.IsNull() && Truthy(hit)) { matches.push_back(i); }
+    }
+    if (matches.empty()) { return {}; }
+    const size_t pick = last ? matches.back() : matches.front();
+    return raw_name == "array_offset"
+               ? Value(static_cast<int64_t>(pick))
+               : elements[pick];
+  }
+  throw std::runtime_error("unsupported lambda function " + raw_name);
+}
+
 // Mutual recursion with Evaluate above; expression trees are the intended
 // shape here.
 Value EvaluateFunction(  // NOLINT(misc-no-recursion)
@@ -761,6 +998,47 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
   };
   std::string name = call.FuncName();
   for (char& c : name) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+
+  // Array functions taking a lambda argument need scope-preserving
+  // evaluation: the lambda body sees both its bound parameters and the outer
+  // row's columns.
+  {
+    const LambdaExpression* lambda = nullptr;
+    for (const Expression& arg : call.Args()) {
+      if (arg && arg->Type() == TypeTag::kLambdaExp) {
+        lambda = static_cast<const LambdaExpression*>(arg.get());
+        break;
+      }
+    }
+    if (lambda != nullptr) {
+      return EvaluateLambdaCall(name, call.Args(), *lambda, scope, aggregates,
+                                context, ctes);
+    }
+  }
+  // SAFE.<fn>(...): convert only the inner function's error to NULL.  The
+  // arguments (including any chained receiver) are evaluated first so their
+  // errors still propagate.
+  if (name.rfind("safe.", 0) == 0) {
+    std::string inner = name.substr(5);
+    std::vector<Expression> arg_values;
+    arg_values.reserve(call.Args().size());
+    for (const Expression& a : call.Args()) {
+      if (a && a->Type() == TypeTag::kLambdaExp) {
+        arg_values.push_back(a);  // lambdas stay unevaluated
+        continue;
+      }
+      arg_values.push_back(
+          ConstantValueExp(Evaluate(a, scope, aggregates, context, ctes)));
+    }
+    auto inner_call =
+        std::make_shared<FunctionCallExpression>(std::move(inner),
+                                                 std::move(arg_values));
+    try {
+      return Evaluate(inner_call, scope, aggregates, context, ctes);
+    } catch (...) {
+      return {};
+    }
+  }
   if (name == "date_add" || name == "date_sub" ||
       name == "datetime_add" || name == "datetime_sub" ||
       name == "timestamp_add" || name == "timestamp_sub") {
@@ -1474,6 +1752,176 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (saw_null) { return {}; }
     return Value(int64_t{1});
   }
+  if (name == "collate") {
+    // COLLATE(value, collation): case-insensitive semantics are approximated;
+    // the value passes through unchanged.
+    if (arguments.empty()) { throw std::runtime_error("COLLATE arity"); }
+    return arguments[0];
+  }
+  if (name == "array_length") {
+    if (arguments.empty()) { throw std::runtime_error("array_length arity"); }
+    const Value& arr = arguments[0];
+    return arr.IsNull() ? Value() : Value(static_cast<int64_t>(arr.ArrayElements().size()));
+  }
+  if (name == "array_distinct") {
+    if (arguments.empty()) { throw std::runtime_error("array_distinct arity"); }
+    const Value& arr = arguments[0];
+    if (arr.IsNull()) { return Value::Array({}, "INT64"); }
+    std::vector<Value> out;
+    for (const Value& e : arr.ArrayElements()) {
+      bool dup = false;
+      for (const Value& kept : out) {
+        if (e.IsNull() && kept.IsNull()) { dup = true; break; }
+        if (!e.IsNull() && !kept.IsNull()) {
+          try { if (e == kept) { dup = true; break; } } catch (...) {}
+        }
+      }
+      if (!dup) { out.push_back(e); }
+    }
+    return Value::Array(std::move(out), arr.ArrayElementSqlType());
+  }
+  if (name == "array_reverse") {
+    if (arguments.empty()) { throw std::runtime_error("array_reverse arity"); }
+    const Value& arr = arguments[0];
+    if (arr.IsNull()) { return Value::Array({}, "INT64"); }
+    auto out = arr.ArrayElements();
+    std::reverse(out.begin(), out.end());
+    return Value::Array(std::move(out), arr.ArrayElementSqlType());
+  }
+  if (name == "array_concat") {
+    std::vector<Value> out;
+    std::string element_type;
+    for (const Value& arr : arguments) {
+      if (arr.IsNull()) { continue; }
+      if (!arr.IsArray()) { throw std::runtime_error("array_concat requires arrays"); }
+      if (element_type.empty()) { element_type = arr.ArrayElementSqlType(); }
+      const auto& elems = arr.ArrayElements();
+      out.insert(out.end(), elems.begin(), elems.end());
+    }
+    return Value::Array(std::move(out), element_type);
+  }
+  if (name == "__array_zip__") {
+    // __array_zip__(array0, alias0, array1, alias1, ... [, mode])
+    if (arguments.empty()) {
+      throw std::runtime_error("ARRAY_ZIP arity");
+    }
+    const size_t num_arrays = arguments.size() / 2;
+    if (num_arrays == 0) { return Value::Array({}, "INT64"); }
+    std::vector<std::string> aliases;
+    aliases.reserve(num_arrays);
+    std::vector<std::vector<Value>> arrays;
+    arrays.reserve(num_arrays);
+    bool any_null = false;
+    size_t max_len = 0;
+    size_t min_len = ~0ULL;
+    for (size_t i = 0; i < num_arrays; ++i) {
+      aliases.push_back(raw_str(arguments[2 * i + 1]));
+      const Value& arr = arguments[2 * i];
+      if (arr.IsNull() || !arr.IsArray()) {
+        any_null = true;
+        arrays.emplace_back();
+        continue;
+      }
+      arrays.push_back(arr.ArrayElements());
+      max_len = std::max(max_len, arrays.back().size());
+      min_len = std::min(min_len, arrays.back().size());
+    }
+    if (any_null) { return {}; }
+    // Optional trailing mode argument (PAD / STRICT / NULL).  Default: trim.
+    std::string mode;
+    if (!arguments.empty()) {
+      const Value& last = arguments.back();
+      if (!last.IsNull()) {
+        mode = raw_str(last);
+        for (char& c : mode) {
+          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+      }
+    }
+    size_t zip_len = min_len == ~0ULL ? 0 : min_len;
+    if (mode == "PAD") { zip_len = max_len; }
+    if (mode == "STRICT" && min_len != max_len) {
+      throw std::runtime_error("ARRAY_ZIP STRICT requires equal-length arrays");
+    }
+    // Build the STRUCT type signature and per-row struct JSON values.
+    std::string struct_type = "STRUCT<";
+    for (size_t i = 0; i < num_arrays; ++i) {
+      if (i) { struct_type += ", "; }
+      struct_type += aliases[i] + " " +
+                     (arrays[i].empty() ? "INT64"
+                                        : ElementSqlTypeName(arrays[i][0].type));
+    }
+    struct_type += ">";
+    std::vector<Value> zipped;
+    zipped.reserve(zip_len);
+    for (size_t r = 0; r < zip_len; ++r) {
+      std::string json = "{";
+      for (size_t i = 0; i < num_arrays; ++i) {
+        if (i) { json += ","; }
+        json += "\"" + aliases[i] + "\":";
+        json += r < arrays[i].size() ? ValueToJsonValue(arrays[i][r])
+                                     : "null";
+      }
+      json += "}";
+      zipped.push_back(Value(std::move(json)));
+    }
+    return Value::Array(std::move(zipped), struct_type);
+  }
+  if (name == "array_includes" || name == "array_includes_any" ||
+      name == "array_includes_all") {
+    if (arguments.empty()) { throw std::runtime_error(name + " arity"); }
+    const Value& arr = arguments[0];
+    if (arr.IsNull()) { return {}; }
+    const auto& elements = arr.ArrayElements();
+    auto includes_one = [&](const Value& needle) {
+      if (needle.IsNull()) { return false; }
+      for (const Value& e : elements) {
+        if (e.IsNull()) { continue; }
+        try { if (e == needle) { return true; } } catch (...) {}
+      }
+      return false;
+    };
+    if (name == "array_includes") {
+      return arguments.size() > 1 && includes_one(arguments[1])
+                 ? Value(int64_t{1})
+                 : Value(int64_t{0});
+    }
+    // _ANY / _ALL take a second array of needles.
+    if (arguments.size() < 2 || arguments[1].IsNull()) { return {}; }
+    bool any = false;
+    bool all = true;
+    const auto& needles = arguments[1].ArrayElements();
+    for (const Value& n : needles) {
+      if (includes_one(n)) { any = true; } else { all = false; }
+    }
+    if (name == "array_includes_any") {
+      return any ? Value(int64_t{1}) : Value(int64_t{0});
+    }
+    return all ? Value(int64_t{1}) : Value(int64_t{0});
+  }
+  if (name == "flatten") {
+    // FLATTEN(arr): concatenates nested arrays one level deep.
+    if (arguments.empty()) { throw std::runtime_error("flatten arity"); }
+    const Value& arr = arguments[0];
+    if (arr.IsNull()) { return Value::Array({}, "INT64"); }
+    std::vector<Value> out;
+    std::string element_type;
+    for (const Value& outer : arr.ArrayElements()) {
+      if (outer.IsNull() || !outer.IsArray()) { continue; }
+      if (element_type.empty()) { element_type = outer.ArrayElementSqlType(); }
+      const auto& inner = outer.ArrayElements();
+      out.insert(out.end(), inner.begin(), inner.end());
+    }
+    return Value::Array(std::move(out), element_type);
+  }
+  if (name == "array_first" || name == "array_last") {
+    if (arguments.empty()) { throw std::runtime_error(name + " arity"); }
+    const Value& arr = arguments[0];
+    if (arr.IsNull()) { return {}; }
+    const auto& elems = arr.ArrayElements();
+    if (elems.empty()) { return {}; }
+    return name == "array_first" ? elems.front() : elems.back();
+  }
   if (name == "array_element_offset" || name == "array_element_ordinal") {
     if (arguments.size() != 2) {
       throw std::runtime_error("array element access requires 2 arguments");
@@ -1493,30 +1941,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return elements[static_cast<size_t>(index)];
   }
-  if (name == "get_field") {    if (arguments.size() != 2) { throw std::runtime_error("get_field requires 2 arguments"); }
-    if (arguments[0].IsNull()) { return {}; }
-    std::string s0 = raw_str(arguments[0]);
-    if (s0.empty()) { return {}; }
-    if (s0.find("\x18\x00") != std::string::npos || (s0.size() >= 2 && s0[0] == '\x18')) {
-      throw std::runtime_error("invalid datetime_micros in proto");
-    }
-    std::string field_name = raw_str(arguments[1]);
-    if (s0.starts_with("{") && s0.ends_with("}")) {
-      std::string search_key = "\"" + field_name + "\":";
-      size_t pos = s0.find(search_key);
-      if (pos == std::string::npos) {
-        return {};
-      }
-      size_t val_start = pos + search_key.size();
-      size_t val_end = s0.find_first_of(",}", val_start);
-      std::string val_str = s0.substr(val_start, val_end - val_start);
-      if (val_str == "null") { return {}; }
-      if (val_str.size() >= 2 && val_str.front() == '"' && val_str.back() == '"') {
-        val_str = val_str.substr(1, val_str.size() - 2);
-      }
-      return Value(std::move(val_str));
-    }
-    return {};
+  if (name == "get_field") {
+    if (arguments.size() != 2) { throw std::runtime_error("get_field requires 2 arguments"); }
+    return StructFieldValue(arguments[0], raw_str(arguments[1]));
   }
   if (name == "date_diff" || name == "datetime_diff" || name == "timestamp_diff") {
     if (call.Args().size() != 3) { throw std::runtime_error(name + " requires 3 arguments"); }
@@ -4057,6 +4484,32 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
 
 
 
+  if (name == "rand") {
+    if (!arguments.empty()) { throw std::runtime_error("rand takes no arguments"); }
+    return Value(static_cast<double>(std::rand()) / static_cast<double>(RAND_MAX));
+  }
+  if (name == "generate_uuid") {
+    static const char kHex[] = "0123456789abcdef";
+    std::string uuid(36, '-');
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+    for (int group : {8, 4, 4, 4, 12}) {
+      // placeholder groups are laid out below
+    }
+    uuid = "";
+    auto rand_hex = [&]() {
+      return kHex[byte_dist(gen) % 16];
+    };
+    for (int i = 0; i < 36; ++i) {
+      if (i == 8 || i == 13 || i == 18 || i == 23) {
+        uuid += '-';
+      } else {
+        uuid += rand_hex();
+      }
+    }
+    return Value(std::move(uuid));
+  }
   if (name == "current_timestamp") {
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
@@ -4132,6 +4585,32 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
             upper_name == "SUNDAY" || upper_name == "ISOYEAR" || upper_name == "ISOWEEK" ||
             upper_name == "DATE") {
           return Value(std::move(upper_name));
+        }
+        // `struct.field` where the base is a struct-typed column: resolve the
+        // base column and extract the field.  The AST may fold the dotted path
+        // into ColumnName(schema="struct", name="field") or a single dotted
+        // name ColumnName(schema="", name="struct.field").
+        {
+          std::string base_name;
+          std::string field_name;
+          if (!name.schema.empty()) {
+            base_name = name.schema;
+            field_name = name.name;
+          } else {
+            const size_t dot = name.name.find('.');
+            if (dot != std::string::npos && dot + 1 < name.name.size()) {
+              base_name = name.name.substr(0, dot);
+              field_name = name.name.substr(dot + 1);
+            }
+          }
+          if (!base_name.empty() && !field_name.empty()) {
+            try {
+              const Value base = Lookup(ColumnName("", base_name), scope);
+              return StructFieldValue(base, field_name);
+            } catch (...) {
+              // fall through to rethrow the original error
+            }
+          }
         }
         throw;
       }

@@ -97,11 +97,11 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [x] `push_projection_through_join`（ProjectJoinTranspose）（`cascades.cpp` に `push_projection_through_join` ルール追加済み）
 - [ ] `push_projection_through_union`
 - [ ] `push_projection_into_scan`（scan_projections を真の書換えに）
-- [ ] `merge_adjacent_filters` の残余 Selection 削除
+- [x] `merge_adjacent_filters` の残余 Selection 削除（`cascades.cpp` に `merge_adjacent_filters` ルール追加済み — 2 階の Selection を 1 階に畳み）
 - [ ] `push_filter_past_setop`（UNION ALL 両枝へ）
 - [ ] `push_filter_into_union_distinct`（DISTINCT 後も安全な場合）
 - [ ] `simplify_filter_with_fd`（関数従属で冗長述語削除）
-- [ ] `redundant_filter_removal`（強い述語が弱い述語を包含）
+- [ ] `redundant_filter_removal`（強い述語が弱い述語を包含。既存 `range_predicate_merge` が範囲結合の大部分をカバー）
 - [x] `range_predicate_merge`（`x>1 AND x>5` → `x>5`。式 rewrite として実装。
       矛盾方向は NULL 三値論理を守るため保持）
 - [ ] `sargable_rewrite`（`x+1=5` → `x=4`、照合可能な形）
@@ -128,13 +128,13 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [x] `offset_zero_elimination`（LimitPlan が offset=0 で既に no-op）
 - [x] `limit_zero_to_empty`（LimitPlan が limit_count=0 で既に 0 行出力）
 - [x] `merge_sort_limit_to_topn`（`TopNPlan` クラスで実装済み、`limit_hint` コスティング接続済み）
-- [x] `eliminate_sort_under_unordered_consumer`（`order_by_constant_removal` として定数キー除去、`topn_push_through_projection` として投影 Through を実装済み）
+- [x] `eliminate_sort_under_unordered_consumer`（`order_by_constant_removal` として定数キー除去、`topn_push_through_projection` / `sort_push_through_selection` / `topn_push_through_selection` として Selection/Projection Through を実装済み）
 - [x] `prefix_sort_elimination`（既に順序を満たす）`SearchEngine::RequiredChildProperties` でプロパティ伝播済み
 - [ ] `redundant_distinct_under_unique_key`
 - [ ] `distinct_to_group_by`
 - [ ] `group_by_to_distinct`（agg 無し）
 - [ ] `count_star_without_group_rewrite`
-- [ ] `push_filter_through_distinct`（DISTINCT 列のみ）
+- [x] `push_filter_through_distinct`（DISTINCT 列のみ）（`cascades.cpp` に `push_filter_through_distinct` ルール追加済み — Selection を Distinct の下に安全に押下）
 - [ ] `pull_filter_above_join`（選択性が極端に悪い場合の探索用、任意）
 
 ---
@@ -146,7 +146,7 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `join_identity`（空 Values や 1 行定数表）
 - [ ] `join_with_true_to_cross`
 - [ ] `cross_join_elimination`（1 行側）
-- [ ] `join_to_cross_if_no_predicate`
+- [x] `join_to_cross_if_no_predicate`（`cascades.cpp` に `join_to_cross_if_no_predicate` ルール追加済み — 述語なし Join を CrossJoin に変換）
 - [ ] `inner_join_to_filter_cross` の逆（条件付き cross → inner）
 - [ ] `swap_inner_join_children_cost`（既に可換。コスト駆動の再試行）
 - [ ] `dphyp` / `dpccp` 連結部分グラフ列挙（`join_enumeration` の置換）
@@ -165,20 +165,20 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `full_outer_to_left_plus_anti`
 - [ ] `right_join_to_left_join`（子の交換）
 - [ ] `left_join_commutativity`（禁止、テストで固定）
-- [ ] `push_filter_through_left_join_left_side`（常に可）（`kOuterJoin` は enum に追加済みだが join_kind ペイロード未追加のため未接続）
+- [x] `push_filter_through_left_join_left_side`（常に可）（`cascades.cpp` に `push_filter_through_left_join_left_side` ルール追加済み — Selection を OuterJoin の左子に押下）
 - [ ] `push_filter_through_left_join_right_side`（null-rejecting のみ）
 - [ ] `push_filter_above_left_join`（遅延評価が得な場合）
 - [ ] `split_filter_over_outer_join`
 - [ ] `predicate_move_around_outer`
 - [ ] `null_aware_anti_join`（`NOT IN` の三値論理）
-- [ ] `not_in_to_anti_join`（両キー NOT NULL のとき。JoinKind は実行器に既にある）
+- [x] `not_in_to_anti_join`（両キー NOT NULL のとき。JoinKind は実行器に既にある。`semi_hash_join` / `anti_hash_join` 規則で接続済み）
 - [ ] `in_to_semijoin`
 - [ ] `exists_to_semijoin`
 - [ ] `not_exists_to_antijoin`
 - [ ] `unique_semijoin_to_inner`
 - [ ] `semijoin_to_inner_plus_distinct`
 - [ ] `semijoin_reduction`（bloom / ハッシュ半結合の先行適用）
-- [ ] `join_on_false_to_empty` / `left_join_on_false_to_left_nullpad`
+- [x] `join_on_false_to_empty` / `left_join_on_false_to_left_nullpad`（`cascades.cpp` に `join_on_false_to_empty` ルール追加済み — FALSE/NULL 述語の Join を LIMIT 0 に変換）
 - [ ] `decorate_join_with_cardinality`（ヒストグラム結合）
 - [ ] `detect_one_to_one` / `one_to_many` / `many_to_many`
 - [ ] `prefer_index_join_when_inner_unique`
@@ -217,7 +217,7 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `two_phase_hash_agg` vs `sort_agg` 実装規則 → SortAgg 実行器
 - [ ] `stream_aggregate_if_sorted`
 - [ ] `distinct_via_hash` vs `distinct_via_sort`
-- [ ] `group_by_constant_removal`
+- [x] `group_by_constant_removal`（`cascades.cpp` に `group_by_constant_removal` ルール追加済み — 定数 group key を除去）
 - [ ] `group_by_functional_dependency_reduction`
 - [ ] `aggregate_push_through_projection`
 - [x] `scalar_agg_no_group_empty_input`（0 行で COUNT=0）`AggregationExecutor` で既に処理済み
@@ -322,9 +322,9 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `project_to_scan`（列部分集合 + テーブル）
 - [ ] `merge_calc`（Filter+Project を Calc に統合するか、逆に分解するか方針決定）
 - [ ] `common_subexpression_elimination` in target list
-- [ ] `duplicate_column_elimination`
+- [x] `duplicate_column_elimination`（`cascades.cpp` に `duplicate_column_elimination` ルール追加済み — Projection の重複出力名を除去）
 - [ ] `unused_expression_pruning`
-- [ ] `constant_propagation_through_project`
+- [x] `constant_propagation_through_project`（`cascades.cpp` に `constant_propagation_through_project` ルール追加済み — Projection のパススルー列経由で述語を押下）
 - [ ] `predicate_push_into_project_expr`
 - [ ] `simplify_case_in_project`
 - [ ] `boolean_project_used_as_filter` の引き上げ
@@ -346,7 +346,7 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `between_symmetric`
 - [ ] `is_distinct_from_rewrite`
 - [ ] `boolean_eq_true_false_three_valued`
-- [ ] `and_true_elim` / `or_false_elim` の NULL 厳密化監査
+- [x] `and_true_elim` / `or_false_elim` の NULL 厳密化監査（`expression/rewrite.cpp` に `and_true_elim` / `or_false_elim` + `and_false_elim` / `or_true_elim` / `not_elim` ルール追加済み — 三値論理で安全）
 - [ ] `distribute_or_over_and`（選択的、爆発抑制）
 - [ ] `distribute_and_over_or`
 - [ ] `cnf_conversion_budgeted`
@@ -361,7 +361,6 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `arithmetic_overflow_safe_fold`
 - [ ] `date_add_sub_fold`
 - [ ] `interval_normalize`
-- [ ] `concat_flatten`
 - [ ] `substring_constant_fold` 強化
 - [ ] `json_path_constant_fold`
 - [ ] `array_constructor_fold`
@@ -377,7 +376,8 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 - [ ] `rewrite_or_of_ranges_to_in`
 - [ ] `extract_year_sargable`（可能なら range）
 - [ ] `not_between_to_or`
-- [ ] `xor_to_or_and_not`
+- [x] `xor_to_or_and_not`（`expression/rewrite.cpp` に `xor_to_or_and_not` ルール追加済み — `a XOR b` → `(a OR b) AND NOT(a AND b)`）
+- [x] `concat_flatten`（`expression/rewrite.cpp` に `concat_flatten` ルール追加済み — ネスト CONCAT を平坦化）
 - [ ] `bit_and_or_identities`
 
 ---
@@ -443,7 +443,7 @@ Aggregation / Limit / Relational（不透明）だけ。商用相当にするに
 
 - [ ] `merge_join`（等価、両側ソート済み）
 - [ ] `sort_merge_join`（必要なら子に Sort を要求）
-- [ ] `outer_hash_join` / `left` / `right` / `full`
+- [x] `outer_hash_join` / `left` / `right` / `full`（`implementation_rules.cpp` に `outer_hash_join` / `right_hash_join` 規則追加済み、`JoinKind::kLeftOuter` + `kRightOuter` + `MaterializeLeftOuter()` / `MaterializeRightOuter()` で LEFT/RIGHT JOIN NULL padding 実装済み。FULL は別途複雑なため未実装）
 - [ ] `outer_merge_join`
 - [ ] `outer_nested_loop`
 - [x] `semi_hash_join` / `anti_hash_join`（JoinKind は実行器に存在、規則未接続）`DefaultImplementationRules` で接続済み

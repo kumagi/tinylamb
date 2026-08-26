@@ -514,8 +514,20 @@ size_t HashJoin::NextBatch(DataChunk* destination, size_t max_rows) {
 void HashJoin::Materialize() {
   output_.clear();
   output_offset_ = 0;
-  if (kind_ != JoinKind::kInner) {
+  if (kind_ == JoinKind::kSemi || kind_ == JoinKind::kAnti) {
     MaterializeSemiAnti();
+    pipelined_ = false;
+    materialized_ = true;
+    return;
+  }
+  if (kind_ == JoinKind::kLeftOuter) {
+    MaterializeLeftOuter();
+    pipelined_ = false;
+    materialized_ = true;
+    return;
+  }
+  if (kind_ == JoinKind::kRightOuter) {
+    MaterializeRightOuter();
     pipelined_ = false;
     materialized_ = true;
     return;
@@ -644,6 +656,243 @@ void HashJoin::MaterializeSemiAnti() {
         if (probe_lookup(probe, build) == static_cast<int>(semi)) {
           emit_probe(probe);
         }
+      }
+    }
+  }
+  output_charge_.Add(output_bytes);
+}
+
+// Left outer hash join: build an index on the right side, probe with the
+// left side.  Every left row that matches at least one right row emits
+// joined pairs (like inner).  Every left row with no match (or a NULL
+// key) emits left + NULL-padded right columns so the left row survives.
+void HashJoin::MaterializeLeftOuter() {
+  state_ = std::make_unique<JoinState>();
+  JoinState& s = *state_;
+  IntakeBothSides();
+  s.left.charge.ReleaseAll();
+  s.right.charge.ReleaseAll();
+
+  // NULL pad row: one Value() (kNull) per right-side column.
+  const size_t right_col_count = right_cols_.empty()
+                                     ? (s.right.rows.empty()
+                                            ? 0
+                                            : s.right.rows[0].first.Size())
+                                     : right_cols_.size();
+  Row null_pad;
+  null_pad.values_.assign(right_col_count, Value());
+
+  size_t output_bytes = 0;
+  const auto emit_match = [&](const PositionedRow& left,
+                              const PositionedRow& right_row) {
+    const Row joined = left.first + right_row.first;
+    output_bytes += EstimateRowBytes(joined);
+    output_.emplace_back(std::move(joined), left.second);
+  };
+  const auto emit_unmatched = [&](const PositionedRow& left) {
+    const Row joined = left.first + null_pad;
+    output_bytes += EstimateRowBytes(joined);
+    output_.emplace_back(std::move(joined), left.second);
+  };
+  std::string scratch;
+
+  // Build index on right side (always the build side for outer joins).
+  if (!s.right.Spilled()) {
+    const SideIndex build = BuildSideIndex(s.right.rows, right_cols_);
+    if (!s.left.Spilled()) {
+      for (const PositionedRow& probe : s.left.rows) {
+        const KeyRef k = KeyOf(probe.first, left_cols_, build.mode,
+                               build.int_type, &scratch);
+        bool matched = false;
+        if (k.valid) {
+          for (size_t e = build.index.Find(k.hash, k.int_key, k.byte_key);
+               e != JoinHashIndex::kNil; e = build.index.ChainNext(e)) {
+            emit_match(probe, s.right.rows[build.index.RowIndex(e)]);
+            matched = true;
+          }
+        }
+        if (!matched) { emit_unmatched(probe); }
+      }
+    } else {
+      for (SpillFile& part : s.left.spills) {
+        for (const PositionedRow& probe : part.ReadAllPositioned()) {
+          const KeyRef k = KeyOf(probe.first, left_cols_, build.mode,
+                                 build.int_type, &scratch);
+          bool matched = false;
+          if (k.valid) {
+            for (size_t e =
+                     build.index.Find(k.hash, k.int_key, k.byte_key);
+                 e != JoinHashIndex::kNil;
+                 e = build.index.ChainNext(e)) {
+              emit_match(probe, s.right.rows[build.index.RowIndex(e)]);
+              matched = true;
+            }
+          }
+          if (!matched) { emit_unmatched(probe); }
+        }
+      }
+    }
+  } else {
+    // Right side spilled: partition both sides and join per-partition.
+    std::vector<bool> left_matched;
+    if (!s.left.Spilled()) {
+      left_matched.assign(s.left.rows.size(), false);
+    }
+    for (size_t p = 0; p < kReactiveSpillPartitions; ++p) {
+      std::vector<PositionedRow> right_part =
+          s.right.spills[p].ReadAllPositioned();
+      if (right_part.empty()) { continue; }
+      const SideIndex build = BuildSideIndex(right_part, right_cols_);
+      if (!s.left.Spilled()) {
+        for (size_t i = 0; i < s.left.rows.size(); ++i) {
+          const PositionedRow& probe = s.left.rows[i];
+          const KeyRef k = KeyOf(probe.first, left_cols_, build.mode,
+                                 build.int_type, &scratch);
+          if (k.valid) {
+            for (size_t e =
+                     build.index.Find(k.hash, k.int_key, k.byte_key);
+                 e != JoinHashIndex::kNil;
+                 e = build.index.ChainNext(e)) {
+              emit_match(probe, right_part[build.index.RowIndex(e)]);
+              left_matched[i] = true;
+            }
+          }
+        }
+      } else {
+        for (SpillFile& part : s.left.spills) {
+          for (const PositionedRow& probe : part.ReadAllPositioned()) {
+            const KeyRef k = KeyOf(probe.first, left_cols_, build.mode,
+                                   build.int_type, &scratch);
+            if (k.valid) {
+              for (size_t e = build.index.Find(k.hash, k.int_key,
+                                               k.byte_key);
+                   e != JoinHashIndex::kNil;
+                   e = build.index.ChainNext(e)) {
+                emit_match(probe, right_part[build.index.RowIndex(e)]);
+              }
+            }
+          }
+        }
+      }
+    }
+    if (!s.left.Spilled()) {
+      for (size_t i = 0; i < s.left.rows.size(); ++i) {
+        if (!left_matched[i]) { emit_unmatched(s.left.rows[i]); }
+      }
+    }
+  }
+  output_charge_.Add(output_bytes);
+}
+
+void HashJoin::MaterializeRightOuter() {
+  state_ = std::make_unique<JoinState>();
+  JoinState& s = *state_;
+  IntakeBothSides();
+  s.left.charge.ReleaseAll();
+  s.right.charge.ReleaseAll();
+
+  // NULL pad row: one Value() (kNull) per left-side column.
+  const size_t left_col_count = left_cols_.empty()
+                                    ? (s.left.rows.empty()
+                                           ? 0
+                                           : s.left.rows[0].first.Size())
+                                    : left_cols_.size();
+  Row null_pad;
+  null_pad.values_.assign(left_col_count, Value());
+
+  size_t output_bytes = 0;
+  // Right outer: build index on LEFT side, probe with RIGHT side.
+  // Emit right + left on match, right + NULL-pad-left on no match.
+  const auto emit_match = [&](const PositionedRow& right_row,
+                              const PositionedRow& left_row) {
+    const Row joined = right_row.first + left_row.first;
+    output_bytes += EstimateRowBytes(joined);
+    output_.emplace_back(std::move(joined), right_row.second);
+  };
+  const auto emit_unmatched = [&](const PositionedRow& right_row) {
+    const Row joined = null_pad + right_row.first;
+    output_bytes += EstimateRowBytes(joined);
+    output_.emplace_back(std::move(joined), right_row.second);
+  };
+  std::string scratch;
+
+  if (!s.left.Spilled()) {
+    const SideIndex build = BuildSideIndex(s.left.rows, left_cols_);
+    if (!s.right.Spilled()) {
+      for (const PositionedRow& probe : s.right.rows) {
+        const KeyRef k = KeyOf(probe.first, right_cols_, build.mode,
+                               build.int_type, &scratch);
+        bool matched = false;
+        if (k.valid) {
+          for (size_t e = build.index.Find(k.hash, k.int_key, k.byte_key);
+               e != JoinHashIndex::kNil; e = build.index.ChainNext(e)) {
+            emit_match(probe, s.left.rows[build.index.RowIndex(e)]);
+            matched = true;
+          }
+        }
+        if (!matched) { emit_unmatched(probe); }
+      }
+    } else {
+      for (SpillFile& part : s.right.spills) {
+        for (const PositionedRow& probe : part.ReadAllPositioned()) {
+          const KeyRef k = KeyOf(probe.first, right_cols_, build.mode,
+                                 build.int_type, &scratch);
+          bool matched = false;
+          if (k.valid) {
+            for (size_t e = build.index.Find(k.hash, k.int_key, k.byte_key);
+                 e != JoinHashIndex::kNil;
+                 e = build.index.ChainNext(e)) {
+              emit_match(probe, s.left.rows[build.index.RowIndex(e)]);
+              matched = true;
+            }
+          }
+          if (!matched) { emit_unmatched(probe); }
+        }
+      }
+    }
+  } else {
+    std::vector<bool> right_matched;
+    if (!s.right.Spilled()) {
+      right_matched.assign(s.right.rows.size(), false);
+    }
+    for (size_t p = 0; p < kReactiveSpillPartitions; ++p) {
+      std::vector<PositionedRow> left_part =
+          s.left.spills[p].ReadAllPositioned();
+      if (left_part.empty()) { continue; }
+      const SideIndex build = BuildSideIndex(left_part, left_cols_);
+      if (!s.right.Spilled()) {
+        for (size_t i = 0; i < s.right.rows.size(); ++i) {
+          const PositionedRow& probe = s.right.rows[i];
+          const KeyRef k = KeyOf(probe.first, right_cols_, build.mode,
+                                 build.int_type, &scratch);
+          if (k.valid) {
+            for (size_t e = build.index.Find(k.hash, k.int_key, k.byte_key);
+                 e != JoinHashIndex::kNil;
+                 e = build.index.ChainNext(e)) {
+              emit_match(probe, left_part[build.index.RowIndex(e)]);
+              right_matched[i] = true;
+            }
+          }
+        }
+      } else {
+        for (SpillFile& part : s.right.spills) {
+          for (const PositionedRow& probe : part.ReadAllPositioned()) {
+            const KeyRef k = KeyOf(probe.first, right_cols_, build.mode,
+                                   build.int_type, &scratch);
+            if (k.valid) {
+              for (size_t e = build.index.Find(k.hash, k.int_key, k.byte_key);
+                   e != JoinHashIndex::kNil;
+                   e = build.index.ChainNext(e)) {
+                emit_match(probe, left_part[build.index.RowIndex(e)]);
+              }
+            }
+          }
+        }
+      }
+    }
+    if (!s.right.Spilled()) {
+      for (size_t i = 0; i < s.right.rows.size(); ++i) {
+        if (!right_matched[i]) { emit_unmatched(s.right.rows[i]); }
       }
     }
   }
@@ -1146,6 +1395,10 @@ void HashJoin::Dump(std::ostream& o, int indent) const {
     o << "SemiHashJoin: " << ss.str() << "\n" << Indent(indent + 2);
   } else if (kind_ == JoinKind::kAnti) {
     o << "AntiHashJoin: " << ss.str() << "\n" << Indent(indent + 2);
+  } else if (kind_ == JoinKind::kLeftOuter) {
+    o << "LeftHashJoin: " << ss.str() << "\n" << Indent(indent + 2);
+  } else if (kind_ == JoinKind::kRightOuter) {
+    o << "RightHashJoin: " << ss.str() << "\n" << Indent(indent + 2);
   } else if (mode_ == HashJoinMode::kHybrid) {
     o << "HybridHashJoin (" << worker_count_ << " workers): " << ss.str()
       << "\n"

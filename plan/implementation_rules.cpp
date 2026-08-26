@@ -989,6 +989,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
   using cascades::dsl::Scan;
   using cascades::dsl::Selection;
   using cascades::dsl::Join;
+  using cascades::dsl::OuterJoin;
   namespace c = cascades;
   static const c::ImplementationRuleSet rules = [] {
     c::ImplementationRuleSet built;
@@ -1182,6 +1183,156 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                                   context, false, false, true);
         },
         c::LogicalOperator::kJoin));
+    // outer_hash_join: LEFT JOIN with hash-based NULL padding.  Builds an
+    // index on the right side, probes with the left side.  Every left row
+    // that matches at least one right row emits joined pairs (like inner).
+    // Every unmatched left row emits left + NULL-padded right columns.
+    built.Add(c::ImplementationRule(
+        "outer_hash_join", OuterJoin(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 2 || required.require_row_position) {
+            return std::vector<PlanAlternative>{};
+          }
+          if (!logical.predicate) { return std::vector<PlanAlternative>{}; }
+          std::vector<std::pair<ColumnName, ColumnName>> equalities;
+          for (const Expression& conjunct :
+               SplitConjuncts(*logical.predicate)) {
+            if (conjunct->Type() != TypeTag::kBinaryExp ||
+                conjunct->AsBinaryExpression().Op() !=
+                    BinaryOperation::kEquals) {
+              return std::vector<PlanAlternative>{};
+            }
+            const auto& binary = conjunct->AsBinaryExpression();
+            if (binary.Left()->Type() != TypeTag::kColumnValue ||
+                binary.Right()->Type() != TypeTag::kColumnValue) {
+              return std::vector<PlanAlternative>{};
+            }
+            const ColumnName& lhs =
+                binary.Left()->AsColumnValue().GetColumnName();
+            const ColumnName& rhs =
+                binary.Right()->AsColumnValue().GetColumnName();
+            if (children[0].plan->GetSchema().Offset(lhs) >= 0 &&
+                children[1].plan->GetSchema().Offset(rhs) >= 0) {
+              equalities.emplace_back(lhs, rhs);
+            } else if (children[0].plan->GetSchema().Offset(rhs) >= 0 &&
+                       children[1].plan->GetSchema().Offset(lhs) >= 0) {
+              equalities.emplace_back(rhs, lhs);
+            } else {
+              return std::vector<PlanAlternative>{};
+            }
+          }
+          if (equalities.empty()) { return std::vector<PlanAlternative>{}; }
+          std::vector<ColumnName> left_columns;
+          std::vector<ColumnName> right_columns;
+          for (const auto& [l, r] : equalities) {
+            left_columns.push_back(l);
+            right_columns.push_back(r);
+          }
+          const double l_rows = children[0].estimated_rows;
+          const double r_rows = children[1].estimated_rows;
+          // Left outer join: every left row appears at least once.
+          const double estimate = std::max(l_rows, l_rows * r_rows * 0.01);
+          std::vector<PlanAlternative> candidates;
+          for (const HashJoinMode mode :
+               {HashJoinMode::kInMemory, HashJoinMode::kHybrid}) {
+            Plan join = std::make_shared<ProductPlan>(
+                children[0].plan, left_columns, children[1].plan,
+                right_columns, mode, JoinKind::kLeftOuter);
+            double local_cost = l_rows + r_rows;
+            const double build_bytes =
+                r_rows * kHashJoinRowBytesEstimate;
+            if (mode == HashJoinMode::kInMemory &&
+                PreferHybridHashJoin(build_bytes)) {
+              local_cost += r_rows * 3;
+            }
+            candidates.push_back(PlanAlternative{
+                .plan = std::move(join),
+                .local_cost = local_cost,
+                .estimated_rows = estimate});
+          }
+          return candidates;
+        },
+        c::LogicalOperator::kOuterJoin));
+    // right_hash_join: RIGHT JOIN with hash-based NULL padding.  Builds an
+    // index on the left side, probes with the right side.  Every right row
+    // that matches at least one left row emits joined pairs.  Every unmatched
+    // right row emits right + NULL-padded left columns.
+    built.Add(c::ImplementationRule(
+        "right_hash_join", OuterJoin(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
+          if (children.size() != 2 || required.require_row_position) {
+            return std::vector<PlanAlternative>{};
+          }
+          if (!logical.predicate) { return std::vector<PlanAlternative>{}; }
+          std::vector<std::pair<ColumnName, ColumnName>> equalities;
+          for (const Expression& conjunct :
+               SplitConjuncts(*logical.predicate)) {
+            if (conjunct->Type() != TypeTag::kBinaryExp ||
+                conjunct->AsBinaryExpression().Op() !=
+                    BinaryOperation::kEquals) {
+              return std::vector<PlanAlternative>{};
+            }
+            const auto& binary = conjunct->AsBinaryExpression();
+            if (binary.Left()->Type() != TypeTag::kColumnValue ||
+                binary.Right()->Type() != TypeTag::kColumnValue) {
+              return std::vector<PlanAlternative>{};
+            }
+            const ColumnName& lhs =
+                binary.Left()->AsColumnValue().GetColumnName();
+            const ColumnName& rhs =
+                binary.Right()->AsColumnValue().GetColumnName();
+            if (children[0].plan->GetSchema().Offset(lhs) >= 0 &&
+                children[1].plan->GetSchema().Offset(rhs) >= 0) {
+              equalities.emplace_back(lhs, rhs);
+            } else if (children[0].plan->GetSchema().Offset(rhs) >= 0 &&
+                       children[1].plan->GetSchema().Offset(lhs) >= 0) {
+              equalities.emplace_back(rhs, lhs);
+            } else {
+              return std::vector<PlanAlternative>{};
+            }
+          }
+          if (equalities.empty()) { return std::vector<PlanAlternative>{}; }
+          // For RIGHT JOIN, swap: the executor's left = logical's right,
+          // executor's right = logical's left.  The join condition is
+          // symmetric, so the equality columns map correctly.
+          std::vector<ColumnName> left_columns;
+          std::vector<ColumnName> right_columns;
+          for (const auto& [l, r] : equalities) {
+            left_columns.push_back(r);
+            right_columns.push_back(l);
+          }
+          const double l_rows = children[0].estimated_rows;
+          const double r_rows = children[1].estimated_rows;
+          const double estimate = std::max(r_rows, l_rows * r_rows * 0.01);
+          std::vector<PlanAlternative> candidates;
+          for (const HashJoinMode mode :
+               {HashJoinMode::kInMemory, HashJoinMode::kHybrid}) {
+            // Swap children: executor's left = logical's right,
+            // executor's right = logical's left.
+            Plan join = std::make_shared<ProductPlan>(
+                children[1].plan, left_columns, children[0].plan,
+                right_columns, mode, JoinKind::kRightOuter);
+            double local_cost = l_rows + r_rows;
+            const double build_bytes =
+                l_rows * kHashJoinRowBytesEstimate;
+            if (mode == HashJoinMode::kInMemory &&
+                PreferHybridHashJoin(build_bytes)) {
+              local_cost += l_rows * 3;
+            }
+            candidates.push_back(PlanAlternative{
+                .plan = std::move(join),
+                .local_cost = local_cost,
+                .estimated_rows = estimate});
+          }
+          return candidates;
+        },
+        c::LogicalOperator::kOuterJoin));
     return built;
   }();
   return rules;

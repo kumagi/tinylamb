@@ -904,6 +904,31 @@ const RuleSet& RuleSet::Default() {
         LogicalOperator::kSelection));
     // Projection(Projection(X)): compose the outer target list through the
     // inner one so later costing sees a single projection (Calcite
+    // duplicate_column_elimination: when a Projection has duplicate output
+    // names, keep only the first occurrence of each column name.
+    built.Add(Rule(
+        "duplicate_column_elimination",
+        Projection(Any("input")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          std::vector<NamedExpression> deduped;
+          std::unordered_set<std::string> seen;
+          for (const NamedExpression& target : expression.target_list) {
+            const std::string name = target.name.empty()
+                                        ? (target.expression
+                                               ? target.expression->ToString()
+                                               : std::string{})
+                                        : target.name;
+            if (!seen.insert(name).second) { continue; }
+            deduped.push_back(target);
+          }
+          if (deduped.size() == expression.target_list.size()) { return; }
+          memo.AddExpression(
+              group, LogicalExpression{.operation = LogicalOperator::kProjection,
+                                       .children = expression.children,
+                                       .target_list = std::move(deduped)});
+        },
+        LogicalOperator::kProjection));
     // ProjectMerge).
     built.Add(Rule(
         "merge_projections",
@@ -1387,6 +1412,180 @@ const RuleSet& RuleSet::Default() {
           memo.AddExpression(group, std::move(simplified));
         },
         LogicalOperator::kTopN));
+    // Sort(Selection(X), keys) -> Selection(Sort(X), keys): push Sort below
+    // Selection.  Selection preserves row order, so sort keys survive the
+    // pushdown.  The selection filter is pushed to the Sort's child.
+    built.Add(Rule(
+        "sort_push_through_selection",
+        Sort(Selection(Any(), "sel")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          for (const LogicalExpression& selection :
+               memo.Get(bindings.at("sel")).expressions) {
+            if (selection.operation != LogicalOperator::kSelection) {
+              continue;
+            }
+            const GroupId input = selection.children[0];
+            const GroupId sort_below = memo.EnsureDerivedGroup(
+                memo.Get(input).relations,
+                "sort-below-sel");
+            LogicalExpression sort_below_expr;
+            sort_below_expr.operation = LogicalOperator::kSort;
+            sort_below_expr.children = {input};
+            sort_below_expr.sort_expressions = expression.sort_expressions;
+            sort_below_expr.sort_ascending = expression.sort_ascending;
+            memo.AddExpression(sort_below, std::move(sort_below_expr));
+            memo.AddExpression(
+                group, LogicalExpression{.operation = LogicalOperator::kSelection,
+                                         .children = {sort_below},
+                                         .predicate = selection.predicate});
+          }
+        },
+        LogicalOperator::kSort));
+    // TopN(Selection(X), keys, limit) -> Selection(TopN(X), keys, limit).
+    // Selection preserves row order.
+    built.Add(Rule(
+        "topn_push_through_selection",
+        TopN(Selection(Any(), "sel")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          for (const LogicalExpression& selection :
+               memo.Get(bindings.at("sel")).expressions) {
+            if (selection.operation != LogicalOperator::kSelection) {
+              continue;
+            }
+            const GroupId input = selection.children[0];
+            const GroupId topn_below = memo.EnsureDerivedGroup(
+                memo.Get(input).relations,
+                "topn-below-sel:" + std::to_string(expression.limit_count));
+            LogicalExpression topn_below_expr;
+            topn_below_expr.operation = LogicalOperator::kTopN;
+            topn_below_expr.children = {input};
+            topn_below_expr.sort_expressions = expression.sort_expressions;
+            topn_below_expr.sort_ascending = expression.sort_ascending;
+            topn_below_expr.limit_count = expression.limit_count;
+            topn_below_expr.limit_offset = expression.limit_offset;
+            memo.AddExpression(topn_below, std::move(topn_below_expr));
+            memo.AddExpression(
+                group, LogicalExpression{.operation = LogicalOperator::kSelection,
+                                         .children = {topn_below},
+                                         .predicate = selection.predicate});
+          }
+        },
+        LogicalOperator::kTopN));
+    // join_to_cross_if_no_predicate: Join(L, R, NULL) -> CrossJoin(L, R).
+    // When a Join has no predicate it is semantically identical to a cross
+    // join.  CrossJoin has different costing (no predicate to push down) and
+    // allows different physical implementations (block nested loop, etc.).
+    built.Add(Rule(
+        "join_to_cross_if_no_predicate",
+        Join(Any("left"), Any("right")),
+        [](const Bindings&, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (expression.predicate && *expression.predicate) { return; }
+          if (expression.operation != LogicalOperator::kJoin) { return; }
+          memo.AddExpression(
+              group,
+              LogicalExpression{.operation = LogicalOperator::kCrossJoin,
+                               .children = expression.children});
+        },
+        LogicalOperator::kJoin));
+    // push_filter_through_distinct: Selection(Distinct(X), p) →
+    // Distinct(Selection(X), p).  Distinct only removes duplicate rows;
+    // it does not change column values, so predicates that reference
+    // existing columns are safe to push through.
+    built.Add(Rule(
+        "push_filter_through_distinct",
+        Selection(Distinct(Any(), "distinct")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          for (const LogicalExpression& distinct :
+               memo.Get(bindings.at("distinct")).expressions) {
+            if (distinct.operation != LogicalOperator::kDistinct) { continue; }
+            const GroupId input = distinct.children[0];
+            const GroupId filtered = memo.EnsureDerivedGroup(
+                memo.Get(input).relations,
+                "sel-below-distinct:" + (*expression.predicate)->ToString());
+            memo.AddExpression(
+                filtered, LogicalExpression{.operation = LogicalOperator::kSelection,
+                                            .children = {input},
+                                            .predicate = expression.predicate});
+            memo.AddExpression(
+                group, LogicalExpression{.operation = LogicalOperator::kDistinct,
+                                         .children = {filtered}});
+          }
+        },
+        LogicalOperator::kSelection));
+    // group_by_constant_removal: when a grouping key in an Aggregation is a
+    // constant expression, it adds no selectivity (every row produces the
+    // same group value).  Remove it from the target list to reduce hash
+    // overhead.  This is purely an optimization hint; the aggregation
+    // semantics are preserved because all rows map to the same constant.
+    built.Add(Rule(
+        "group_by_constant_removal",
+        Aggregation(Any("input")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          std::vector<NamedExpression> simplified;
+          bool removed_any = false;
+          for (const NamedExpression& target : expression.target_list) {
+            if (!target.expression ||
+                target.expression->Type() == TypeTag::kConstantValue) {
+              removed_any = true;
+              continue;
+            }
+            simplified.push_back(target);
+          }
+          if (!removed_any || simplified.empty()) { return; }
+          memo.AddExpression(
+              group, LogicalExpression{.operation = LogicalOperator::kAggregation,
+                                       .children = expression.children,
+                                       .target_list = std::move(simplified)});
+        },
+        LogicalOperator::kAggregation));
+    // constant_propagation_through_project: when a Selection predicate
+    // references only columns that are simple passthroughs in the child
+    // Projection, rewrite the predicate using the Projection's target list
+    // and push it below.  This enables further pushdown into joins/scans.
+    built.Add(Rule(
+        "constant_propagation_through_project",
+        Selection(Projection(Any(), "proj")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          for (const LogicalExpression& projection :
+               memo.Get(bindings.at("proj")).expressions) {
+            if (projection.operation != LogicalOperator::kProjection) { continue; }
+            // Only push through if the predicate references only
+            // passthrough (column-value) targets of this projection.
+            bool all_passthrough = true;
+            for (const ColumnName& col : (*expression.predicate)->TouchedColumns()) {
+              bool found = false;
+              for (const NamedExpression& target : projection.target_list) {
+                if (target.expression &&
+                    target.expression->Type() == TypeTag::kColumnValue &&
+                    target.expression->AsColumnValue().GetColumnName() == col) {
+                  found = true;
+                  break;
+                }
+              }
+              if (!found) { all_passthrough = false; break; }
+            }
+            if (!all_passthrough) { continue; }
+            const GroupId input = projection.children[0];
+            const GroupId filtered = memo.EnsureDerivedGroup(
+                memo.Get(input).relations,
+                "sel-below-proj-const:" + (*expression.predicate)->ToString());
+            memo.AddExpression(
+                filtered, LogicalExpression{.operation = LogicalOperator::kSelection,
+                                            .children = {input},
+                                            .predicate = expression.predicate});
+            memo.AddExpression(
+                group, LogicalExpression{.operation = LogicalOperator::kProjection,
+                                         .children = {filtered},
+                                         .target_list = projection.target_list});
+          }
+        },
+        LogicalOperator::kSelection));
     return built;
   }();
   return rules;

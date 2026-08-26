@@ -21,6 +21,9 @@ enum class JoinKind : uint8_t {
   kInner = 0,
   kSemi = 1,
   kAnti = 2,
+  kLeftOuter = 3,
+  kRightOuter = 4,
+  kFullOuter = 5,
 };
 
 inline std::string_view JoinKindName(JoinKind kind) {
@@ -31,6 +34,12 @@ inline std::string_view JoinKindName(JoinKind kind) {
       return "SemiHashJoin";
     case JoinKind::kAnti:
       return "AntiHashJoin";
+    case JoinKind::kLeftOuter:
+      return "LeftHashJoin";
+    case JoinKind::kRightOuter:
+      return "RightHashJoin";
+    case JoinKind::kFullOuter:
+      return "FullHashJoin";
   }
   return "HashJoin";
 }

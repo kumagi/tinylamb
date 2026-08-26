@@ -1084,11 +1084,136 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         }
         return UnaryExpressionExp(in.child_, UnaryOperation::kIsNull);
       }));
-    // x IS TRUE -> x IS NOT NULL AND x (three-valued: IS TRUE requires
-    // non-NULL and truthy; but x IS TRUE is semantically equivalent to
-    // (x IS NOT NULL AND x) in SQL.  We do NOT rewrite this away because
-    // IS TRUE/IS FALSE are already the canonical three-valued operators.
-    // Instead, we simplify IS TRUE of a non-NULL-typed expression.
+    // a XOR b -> (a OR b) AND NOT(a AND b).  Valid in three-valued logic:
+    // XOR is TRUE iff exactly one of a,b is TRUE; the expansion preserves
+    // NULL propagation because NOT(NULL)=UNKNOWN and AND/OR distribute
+    // UNKNOWN naturally.
+    built.Add(ExpressionRule(
+        "xor_to_or_and_not",
+        Binary(BinaryOperation::kXor, Any("a"), Any("b")),
+        [](const Expression&, const ExpressionBindings& bindings) {
+          Expression a = bindings.at("a");
+          Expression b = bindings.at("b");
+          Expression a_or_b =
+              BinaryExpressionExp(a, BinaryOperation::kOr, b);
+          Expression not_a_and_b = UnaryExpressionExp(
+              BinaryExpressionExp(a, BinaryOperation::kAnd, b),
+              UnaryOperation::kNot);
+          return BinaryExpressionExp(std::move(a_or_b), BinaryOperation::kAnd,
+                                     std::move(not_a_and_b));
+        }));
+    // a AND TRUE -> a (TRUE is identity for AND).
+    built.Add(ExpressionRule(
+        "and_true_elim",
+        Binary(BinaryOperation::kAnd, Any("x"),
+               Is(TypeTag::kConstantValue, "c")),
+        [](const Expression&, const ExpressionBindings& bindings) {
+          const Value v = bindings.at("c")->AsConstantValue().GetValue();
+          if (v.IsNull() || !v.Truthy()) { return Expression{}; }
+          return bindings.at("x");
+        }));
+    built.Add(ExpressionRule(
+        "and_true_elim_rev",
+        Binary(BinaryOperation::kAnd, Is(TypeTag::kConstantValue, "c"),
+               Any("x")),
+        [](const Expression&, const ExpressionBindings& bindings) {
+          const Value v = bindings.at("c")->AsConstantValue().GetValue();
+          if (v.IsNull() || !v.Truthy()) { return Expression{}; }
+          return bindings.at("x");
+        }));
+    // a OR FALSE -> a (FALSE is identity for OR).
+    built.Add(ExpressionRule(
+        "or_false_elim",
+        Binary(BinaryOperation::kOr, Any("x"),
+               Is(TypeTag::kConstantValue, "c")),
+        [](const Expression&, const ExpressionBindings& bindings) {
+          const Value v = bindings.at("c")->AsConstantValue().GetValue();
+          if (v.IsNull() || v.Truthy()) { return Expression{}; }
+          return bindings.at("x");
+        }));
+    built.Add(ExpressionRule(
+        "or_false_elim_rev",
+        Binary(BinaryOperation::kOr, Is(TypeTag::kConstantValue, "c"),
+               Any("x")),
+        [](const Expression&, const ExpressionBindings& bindings) {
+          const Value v = bindings.at("c")->AsConstantValue().GetValue();
+          if (v.IsNull() || v.Truthy()) { return Expression{}; }
+          return bindings.at("x");
+        }));
+    // x AND FALSE -> FALSE (FALSE is annihilator for AND, safe in 3VL).
+    built.Add(ExpressionRule(
+        "and_false_elim",
+        Binary(BinaryOperation::kAnd, Any("x"),
+               Is(TypeTag::kConstantValue, "c")),
+        [](const Expression&, const ExpressionBindings& bindings) {
+          const Value v = bindings.at("c")->AsConstantValue().GetValue();
+          if (v.IsNull() || v.Truthy()) { return Expression{}; }
+          return ConstantValueExp(Value(false));
+        }));
+    built.Add(ExpressionRule(
+        "and_false_elim_rev",
+        Binary(BinaryOperation::kAnd, Is(TypeTag::kConstantValue, "c"),
+               Any("x")),
+        [](const Expression&, const ExpressionBindings& bindings) {
+          const Value v = bindings.at("c")->AsConstantValue().GetValue();
+          if (v.IsNull() || v.Truthy()) { return Expression{}; }
+          return ConstantValueExp(Value(false));
+        }));
+    // x OR TRUE -> TRUE (TRUE is annihilator for OR, safe in 3VL).
+    built.Add(ExpressionRule(
+        "or_true_elim",
+        Binary(BinaryOperation::kOr, Any("x"),
+               Is(TypeTag::kConstantValue, "c")),
+        [](const Expression&, const ExpressionBindings& bindings) {
+          const Value v = bindings.at("c")->AsConstantValue().GetValue();
+          if (v.IsNull() || !v.Truthy()) { return Expression{}; }
+          return ConstantValueExp(Value(true));
+        }));
+    built.Add(ExpressionRule(
+        "or_true_elim_rev",
+        Binary(BinaryOperation::kOr, Is(TypeTag::kConstantValue, "c"),
+               Any("x")),
+        [](const Expression&, const ExpressionBindings& bindings) {
+          const Value v = bindings.at("c")->AsConstantValue().GetValue();
+          if (v.IsNull() || !v.Truthy()) { return Expression{}; }
+          return ConstantValueExp(Value(true));
+        }));
+    // NOT NOT x -> x (double negation elimination).
+    built.Add(ExpressionRule(
+        "not_elim", Unary(UnaryOperation::kNot, Any("x")),
+        [](const Expression&, const ExpressionBindings& bindings) {
+          const Expression& child = bindings.at("x");
+          if (!child || child->Type() != TypeTag::kUnaryExp) {
+            return Expression{};
+          }
+          if (child->AsUnaryExpression().Op() != UnaryOperation::kNot) {
+            return Expression{};
+          }
+          return child->AsUnaryExpression().Child();
+        }));
+    // CONCAT(CONCAT(a, b), c) -> CONCAT(a, b, c) — flatten nested concat.
+    built.Add(ExpressionRule(
+        "concat_flatten", Is(TypeTag::kFunctionCallExp),
+        [](const Expression& expression, const ExpressionBindings&) {
+          const auto& func = expression->AsFunctionCallExpression();
+          if (func.FuncName() != "concat") { return Expression{}; }
+          std::vector<Expression> flattened;
+          bool changed = false;
+          for (const Expression& arg : func.Args()) {
+            if (arg && arg->Type() == TypeTag::kFunctionCallExp &&
+                arg->AsFunctionCallExpression().FuncName() == "concat") {
+              for (const Expression& inner :
+                   arg->AsFunctionCallExpression().Args()) {
+                flattened.push_back(inner);
+              }
+              changed = true;
+              continue;
+            }
+            flattened.push_back(arg);
+          }
+          if (!changed) { return Expression{}; }
+          return FunctionCallExp(func.FuncName(), std::move(flattened));
+        }));
     return built;
   }();
   return rules;

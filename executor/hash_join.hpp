@@ -118,6 +118,8 @@ class HashJoin : public ExecutorBase {
   // check. Output rows are the untouched probe rows, so row positions are
   // preserved for UPDATE/DELETE consumers.
   void MaterializeSemiAnti();
+  void MaterializeLeftOuter();
+  void MaterializeRightOuter();
 
   void IntakeBothSides();
   void BuildShards();

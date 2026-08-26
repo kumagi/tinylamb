@@ -59,8 +59,8 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 ### Outer hash / nested loop
 
-- [ ] `LeftHashJoin`（ビルド右、マッチしなければ NULL pad）
-- [ ] `RightHashJoin`（または左右入替で Left に帰着）
+- [x] `LeftHashJoin`（ビルド右、マッチしなければ NULL pad）（`JoinKind::kLeftOuter` + `MaterializeLeftOuter()` + `outer_hash_join` 実装規則で実装済み）
+- [x] `RightHashJoin`（`JoinKind::kRightOuter` + `MaterializeRightOuter()` + `right_hash_join` 実装規則で実装済み。Cascades で Left/Right 子を入替えて実現）
 - [ ] `FullHashJoin`（両側未マッチ）
 - [ ] spill 付き hybrid outer hash（既存 hybrid の拡張）
 - [ ] `LeftNestedLoopJoin` / `Right` / `Full`

@@ -274,6 +274,14 @@ inline Pattern Distinct(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kDistinct, {std::move(child)},
                      std::move(capture));
 }
+inline Pattern OuterJoin(Pattern left = Any(), Pattern right = Any(),
+                         std::string capture = {}) {
+  std::vector<Pattern> children;
+  children.push_back(std::move(left));
+  children.push_back(std::move(right));
+  return Pattern::Op(LogicalOperator::kOuterJoin, std::move(children),
+                     std::move(capture));
+}
 }  // namespace dsl
 
 class Rule {
