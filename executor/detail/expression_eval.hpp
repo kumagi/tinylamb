@@ -89,6 +89,8 @@ struct AggregateAccumulator {
   // BIT_AND/OR/XOR fold state.
   mutable int64_t bit_acc_{0};
   mutable bool bit_saw_value_{false};
+  // ARRAY_AGG DISTINCT: a repeated NULL collapses to one element.
+  mutable bool array_saw_null_{false};
   // ARRAY_CONCAT_AGG declared element type (captured even for empty arrays).
   mutable std::string concat_elem_type_;
   // ELEMENTWISE_SUM/AVG positional state.

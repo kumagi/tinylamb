@@ -666,7 +666,31 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
             break;
           }
         }
-        if (!all_null) {
+        // The engine stores every integer as INT64 and booleans as nonzero
+        // INT64, so declared INT32/UINT64/BOOL/FLOAT element types surface as
+        // INT64/DOUBLE at runtime; judge those by element values instead of
+        // the type tag.
+        auto is_int_family = [](const std::string& t) {
+          return t == "bool" || t == "boolean" || t == "int32" ||
+                 t == "sint32" || t == "uint32" || t == "int64" ||
+                 t == "uint64";
+        };
+        auto is_float_family = [](const std::string& t) {
+          return t == "float" || t == "float32" || t == "float64" ||
+                 t == "double" || t == "real";
+        };
+        auto normalize_float = [](const std::string& t) -> std::string {
+          if (t == "float64") { return "double"; }
+          if (t == "float32" || t == "real") { return "float"; }
+          return t;
+        };
+        const std::string norm_want = normalize_float(lower_type);
+        const std::string norm_actual = normalize_float(lower_actual_type);
+        const bool compatible =
+            (is_int_family(norm_want) && is_int_family(norm_actual)) ||
+            (is_float_family(norm_want) && is_float_family(norm_actual)) ||
+            ((norm_want == "bytes") && norm_actual == "string");
+        if (!all_null && !compatible) {
           return false;
         }
       }

@@ -745,3 +745,11 @@ add_replay_test(server/postgres_protocol_fuzzer_replay.cpp
         tinylamb::postgres_server)
 add_replay_test(query/googlesql_ast_fuzzer_replay.cpp tinylamb::sql)
 endif()
+
+add_executable(repro_L EXCLUDE_FROM_ALL repro_L.cpp query/googlesql_compliance_file.cpp)
+tinylamb_apply_options(repro_L)
+target_link_libraries(repro_L PRIVATE tinylamb::sql)
+
+add_executable(repro_L2 EXCLUDE_FROM_ALL repro_L2.cpp query/googlesql_compliance_file.cpp)
+tinylamb_apply_options(repro_L2)
+target_link_libraries(repro_L2 PRIVATE tinylamb::sql)

@@ -103,7 +103,10 @@ Value QueryExpression::Evaluate(const Row& row, const Schema& schema,
   }
   const std::vector<Value> values = std::move(rows).MoveValue();
   if (array_result_) {
-    return Value::Array(values, "INT64");
+    return Value::Array(
+        values,
+        array_element_sql_type_.empty() ? std::string("INT64")
+                                        : array_element_sql_type_);
   }
   if (exists_) {
     const bool any = !values.empty();

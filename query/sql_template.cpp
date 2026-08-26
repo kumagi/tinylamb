@@ -410,6 +410,12 @@ std::shared_ptr<SelectStatement> BindSelect(  // NOLINT(misc-no-recursion) // Re
 }
   if (having) { result->SetHaving(std::move(having));
 }
+  // UNION ALL branches appear after the main SELECT in SQL text, so bind
+  // them last (after every main-select parameter) in branch order. Dropping
+  // them silently shrank re-bound statements to their first branch.
+  for (const auto& branch : select.UnionAll()) {
+    result->AddUnionAll(BindSelect(*branch, parameters, index));
+  }
   for (auto& [name, query] : withs) {
     result->AddWithQuery(name, std::move(query));
   }
