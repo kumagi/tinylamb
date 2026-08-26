@@ -1344,6 +1344,9 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
                                       relational_detail::CteMap{});
       auto rewritten = SetStructPathByOrdinals(text, target.segments,
                                                target.ordinals, 0, assigned);
+      if (rewritten.has_value()) {
+        cell = Value(std::move(*rewritten));
+      }
     }
     StatusOr<RowPosition> updated =
         table->Update(ctx.txn_, row_position, new_row);
