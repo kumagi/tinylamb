@@ -39,8 +39,8 @@ class ProductPlan final : public PlanBase {
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
               std::vector<ColumnName> right_cols,
               HashJoinMode hash_mode);
-  // Semi/anti hash join (decorrelated IN / EXISTS / NOT EXISTS): emits only
-  // the left child's columns and rows.
+  // Explicit hash join kind. Semi/anti kinds emit only the left child's
+  // columns; outer kinds retain both schemas and add NULL padding.
   ProductPlan(Plan left_src, std::vector<ColumnName> left_cols, Plan right_src,
               std::vector<ColumnName> right_cols, HashJoinMode hash_mode,
               JoinKind kind);
@@ -100,8 +100,16 @@ class ProductPlan final : public PlanBase {
 // of naming enumerators.
 [[nodiscard]] bool IsSemiJoinKind(JoinKind kind);
 [[nodiscard]] bool IsAntiJoinKind(JoinKind kind);
+[[nodiscard]] bool IsNullAwareAntiJoinKind(JoinKind kind);
+[[nodiscard]] bool IsLeftOuterJoinKind(JoinKind kind);
+[[nodiscard]] bool IsRightOuterJoinKind(JoinKind kind);
+[[nodiscard]] bool IsFullOuterJoinKind(JoinKind kind);
 [[nodiscard]] JoinKind SemiJoinKind();
 [[nodiscard]] JoinKind AntiJoinKind();
+[[nodiscard]] JoinKind NullAwareAntiJoinKind();
+[[nodiscard]] JoinKind LeftOuterJoinKind();
+[[nodiscard]] JoinKind RightOuterJoinKind();
+[[nodiscard]] JoinKind FullOuterJoinKind();
 
 }  // namespace tinylamb
 

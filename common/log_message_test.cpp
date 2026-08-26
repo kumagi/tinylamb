@@ -18,10 +18,7 @@
 
 #include <gtest/gtest.h>
 
-TEST(LogMessage, Log) {
-  // Arrange -- nothing more than the LOG macro itself
-  // Act -- stream one message at each survivable severity level (no assertion;
-  // output-only).  FATAL is excluded: it aborts the process.
+TEST(LogMessageTest, Log_WithSurvivableSeverities_StreamsWithoutError) {
   LOG(ERROR) << "ERROR";
   LOG(ALERT) << "ALERT";
   LOG(WARN) << "WARN";
@@ -30,10 +27,8 @@ TEST(LogMessage, Log) {
   LOG(USER) << "USER";
   LOG(DEBUG) << "DEBUG";
   LOG(TRACE) << "TRACE";
-  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
-TEST(LogMessage, FatalAborts) {
-  // Act/Assert -- FATAL logs the message and then terminates the process.
+TEST(LogMessageTest, Log_WithFatalSeverity_AbortsProcess) {
   ASSERT_DEATH({ LOG(FATAL) << "FATAL"; }, "FATAL");
 }

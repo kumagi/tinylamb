@@ -115,7 +115,7 @@ class RelationalRegressionTest : public ::testing::Test {
 // list pushdown (BuildInput stores table_key_filters["AggTable"]) and then
 // aggregates the same table in an uncorrelated scalar subquery. The subquery's
 // stream_agg cache fill must stay unfiltered; only its own read may filter.
-TEST_F(RelationalRegressionTest, StreamAggCacheIgnoresStashedInListFilter) {
+TEST_F(RelationalRegressionTest, Execute_StreamAggWithInListFilter_IgnoresStashedFilterInSubquery) {
   const auto rows = RelationalRun(
       *rs_,
       "SELECT COUNT(*), (SELECT SUM(k + v) FROM AggTable) "
@@ -133,7 +133,7 @@ TEST_F(RelationalRegressionTest, StreamAggCacheIgnoresStashedInListFilter) {
 // set for that table. Because every reference of a reusable table shares one
 // projected cache entry, the driver below is a DIFFERENT table so the stash
 // exists before AggTable's first (and only) cache fill.
-TEST_F(RelationalRegressionTest, StreamAggCacheIgnoresJoinDerivedKeyFilter) {
+TEST_F(RelationalRegressionTest, Execute_StreamAggWithJoinDerivedFilter_IgnoresStashedFilterInSubquery) {
   const auto rows = RelationalRun(
       *rs_,
       "SELECT COUNT(*), (SELECT SUM(k + v) FROM AggTable) "
@@ -149,8 +149,7 @@ TEST_F(RelationalRegressionTest, StreamAggCacheIgnoresJoinDerivedKeyFilter) {
 // required columns match. The first fills the cache while reading with
 // `k < 3`; the second must observe rows outside that predicate, proving the
 // cached content is not narrowed by the first consumer.
-TEST_F(RelationalRegressionTest,
-       SharedBaseRelationCacheStaysUnfilteredAcrossConsumers) {
+TEST_F(RelationalRegressionTest, Execute_SharedBaseRelationCache_StaysUnfilteredAcrossConsumers) {
   const auto rows = RelationalRun(
       *rs_,
       "SELECT (SELECT SUM(v) FROM AggTable WHERE k < 3), "

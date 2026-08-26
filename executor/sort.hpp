@@ -3,6 +3,7 @@
 #define TINYLAMB_SORT_EXECUTOR_HPP
 
 #include <algorithm>
+#include <optional>
 #include <utility>
 #include <thread>
 #include <vector>
@@ -20,6 +21,7 @@ class SortExecutor : public ExecutorBase {
   struct Key {
     Expression expression;
     bool ascending{true};
+    std::optional<bool> nulls_first;
   };
   SortExecutor(Executor source, Schema schema, std::vector<Key> keys,
                size_t worker_count = 1)

@@ -166,10 +166,9 @@ Implemented in this phase:
 Deliberately not migrated to cost-based planning (functional via the
 relational executor; each needs its own design note):
 
-- Outer joins *inside* the memo: requires a kOuterJoin logical operator,
-  null-rejection analysis gating every pushdown rule, and commutativity
-  restrictions. Guard-rail comments already mark the rule sites in
-  `plan/cascades.cpp`.
+- Outer-join predicate pushdown inside the memo: `kOuterJoin` and the
+  LEFT/RIGHT/FULL hash implementations now exist, but null-rejection analysis
+  must still gate every pushdown rule and commutativity restriction.
 - Subquery decorrelation into SemiJoin/AntiJoin: IN/EXISTS evaluate via
   `subquery_runtime` today; decorrelation changes cardinality estimation and
   needs new implementation rules.
@@ -177,8 +176,8 @@ relational executor; each needs its own design note):
   etc.): the global touched-set approximation remains sound for the shapes
   that reach the optimizer now that disjunctive/subquery shapes route to the
   relational engine; revisit if those shapes ever move over.
-- RIGHT/FULL OUTER joins: not parsed at all (frontend supports kCross/kInner/
-  kLeft only).
+- RIGHT/FULL OUTER joins: parsed and executed on the syntactic relational path;
+  cost-based migration still requires null-rejection-aware rewrites.
 
 ## Phase 9 — Hardening
 
@@ -198,7 +197,7 @@ relational executor; each needs its own design note):
 The four previously recorded direct-executor failures are resolved. Floating
 point aggregate assertions use numeric tolerance, and NULL has defined hash
 semantics so DISTINCT treats it as a value. The complete `executor_test` suite
-passes (140 tests as of 2026-08-24).
+passes (144 tests as of 2026-08-26).
 
 ---
 

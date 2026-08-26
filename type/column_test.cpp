@@ -27,69 +27,75 @@
 #include "value_type.hpp"
 
 namespace tinylamb {
-TEST(ColumnTest, Construct) {
-  // Arrange -- nothing more than default ColumnName/ValueType/Constraint
-  // Act -- construct two Columns with different names/types/constraints
+TEST(ColumnTest, Constructor_WithValidArguments_InitializesMembers) {
   Column c(ColumnName("test_column"), ValueType::kInt64);
   Column d(ColumnName("next_column"), ValueType::kVarChar,
-            Constraint(Constraint::kUnique));
-  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
+           Constraint(Constraint::kUnique));
+
+  EXPECT_EQ(c.Name().name, "test_column");
+  EXPECT_EQ(c.Type(), ValueType::kInt64);
+  EXPECT_EQ(d.Name().name, "next_column");
+  EXPECT_EQ(d.Type(), ValueType::kVarChar);
 }
 
-TEST(ColumnTest, SerializeDeserialize) {
-  // Arrange -- nothing more than default ColumnName/ValueType/Constraint
-  // Act -- serialize+deserialize round-trip for 2 Column variants
+TEST(ColumnTest, SerializeDeserialize_ForDiverseVariants_PreservesState) {
   SerializeDeserializeTest(
       Column(ColumnName("test_column"), ValueType::kInt64));
   SerializeDeserializeTest(Column(ColumnName("next_column"), ValueType::kDouble,
-                                   Constraint(Constraint::kUnique)));
-  // Assert -- implicit; SerializeDeserializeTest macro asserts equality
+                                  Constraint(Constraint::kUnique)));
 }
 
-TEST(ColumnTest, Dump) {
-  // Arrange -- nothing more than two Columns with different names/types
-  // Act -- stream Columns to LOG (no assertion; output-only)
-  LOG(INFO) << Column(ColumnName("test_column"), ValueType::kInt64);
-  LOG(ERROR) << Column(ColumnName("next_column"), ValueType::kDouble,
-                        Constraint(Constraint::kUnique));
-  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
+TEST(ColumnTest, Dump_ToLogStream_SucceedsWithoutCrash) {
+  Column c1(ColumnName("test_column"), ValueType::kInt64);
+  Column c2(ColumnName("next_column"), ValueType::kDouble,
+            Constraint(Constraint::kUnique));
+
+  LOG(INFO) << c1;
+  LOG(ERROR) << c2;
 }
 
-TEST(ColumnTest, Stream) {
-  // Arrange -- columns with and without constraints, and a null-typed column
-  // Act -- stream each to a stringstream
+TEST(ColumnTest, StreamOperator_WithVariousTypesAndConstraints_FormatsExpectedString) {
+  Column c1(ColumnName("int_col"), ValueType::kInt64);
+  Column c2(ColumnName("uniq_col"), ValueType::kDouble,
+            Constraint(Constraint::kUnique));
+  Column c3(ColumnName("bare_col"), ValueType::kNull);
   std::ostringstream oss;
-  oss << Column(ColumnName("int_col"), ValueType::kInt64) << "|"
-      << Column(ColumnName("uniq_col"), ValueType::kDouble,
-                Constraint(Constraint::kUnique))
-      << "|" << Column(ColumnName("bare_col"), ValueType::kNull);
-  // Assert -- type is rendered unless kNull; constraint is appended
+
+  oss << c1 << "|" << c2 << "|" << c3;
+
   ASSERT_EQ(oss.str(),
             "int_col: Integer|uniq_col: Double(UNIQUE)|bare_col");
 }
 
-TEST(ColumnTest, Accessors) {
-  // Arrange -- a column built through the string_view constructor
+TEST(ColumnTest, Accessors_WhenConstructedFromStringView_ReturnMatchingValues) {
   Column c("named_col", ValueType::kVarChar, Constraint(Constraint::kDefault));
-  // Act + Assert -- accessors expose the stored name, type and constraint
-  ASSERT_EQ(c.Name().name, "named_col");
-  ASSERT_EQ(c.Type(), ValueType::kVarChar);
-  ASSERT_EQ(c.GetConstraint().ctype, Constraint::kDefault);
+
+  const std::string name = c.Name().name;
+  const ValueType type = c.Type();
+  const Constraint::ConstraintType ctype = c.GetConstraint().ctype;
+
+  ASSERT_EQ(name, "named_col");
+  ASSERT_EQ(type, ValueType::kVarChar);
+  ASSERT_EQ(ctype, Constraint::kDefault);
 }
 
-TEST(ColumnTest, Hash) {
-  // Arrange -- several columns
-  // Act -- hash each of them
+TEST(ColumnTest, Hash_WithDistinctAndIdenticalColumns_DifferentiatesAndMatches) {
+  Column c1("a", ValueType::kInt64);
+  Column c2("b", ValueType::kInt64);
+  Column c3("a", ValueType::kDouble);
+  Column c4("a", ValueType::kInt64, Constraint(Constraint::kUnique));
+  Column c5("a", ValueType::kInt64);
   std::hash<Column> hasher;
-  // Assert -- different names/types/constraints hash differently
-  ASSERT_NE(hasher(Column("a", ValueType::kInt64)),
-            hasher(Column("b", ValueType::kInt64)));
-  ASSERT_NE(hasher(Column("a", ValueType::kInt64)),
-            hasher(Column("a", ValueType::kDouble)));
-  ASSERT_NE(hasher(Column("a", ValueType::kInt64,
-                          Constraint(Constraint::kUnique))),
-            hasher(Column("a", ValueType::kInt64)));
-  ASSERT_EQ(hasher(Column("a", ValueType::kInt64)),
-            hasher(Column("a", ValueType::kInt64)));
+
+  const size_t h1 = hasher(c1);
+  const size_t h2 = hasher(c2);
+  const size_t h3 = hasher(c3);
+  const size_t h4 = hasher(c4);
+  const size_t h5 = hasher(c5);
+
+  ASSERT_NE(h1, h2);
+  ASSERT_NE(h1, h3);
+  ASSERT_NE(h1, h4);
+  ASSERT_EQ(h1, h5);
 }
 }  // namespace tinylamb

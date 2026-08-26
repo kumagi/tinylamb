@@ -1,30 +1,35 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "expression/lambda_expression.hpp"
 
+#include <ostream>
+#include <sstream>
 #include <stdexcept>
-#include <utility>
+
+#include "type/row.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
 
 Value LambdaExpression::Evaluate(const Row&, const Schema&) const {
-  throw std::runtime_error(
-      "lambda evaluated outside an array function (internal error)");
+  throw std::runtime_error("lambda must be applied by a higher-order function");
 }
 
 std::string LambdaExpression::ToString() const {
-  std::string params;
-  for (size_t i = 0; i < params_.size(); ++i) {
-    if (i) { params += ", "; }
-    params += params_[i];
+  std::ostringstream out;
+  out << "(";
+  for (size_t i = 0; i < parameters_.size(); ++i) {
+    if (i != 0) {
+      out << ", ";
+    }
+    out << parameters_[i];
   }
-  if (params_.size() > 1) { params = "(" + params + ")"; }
-  return params + " -> " + (body_ ? body_->ToString() : "NULL");
+  out << ") -> ";
+  out << (body_ ? body_->ToString() : std::string("NULL"));
+  return out.str();
 }
 
-Expression LambdaExpressionExp(std::vector<std::string> params,
-                               Expression body) {
-  return std::make_shared<LambdaExpression>(std::move(params),
-                                            std::move(body));
+void LambdaExpression::Dump(std::ostream& output) const {
+  output << ToString();
 }
 
 }  // namespace tinylamb

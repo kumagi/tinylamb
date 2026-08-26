@@ -16,14 +16,16 @@
 
 #include "expression/expression.hpp"
 
-#include <ostream>
+#include <cmath>
 #include <memory>
+#include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -38,7 +40,6 @@
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
-#include "common/log_message.hpp"
 #include "gtest/gtest.h"
 #include "query/statement.hpp"
 #include "type/column.hpp"
@@ -51,36 +52,28 @@
 
 namespace tinylamb {
 
-TEST(ExpressionTest, Constant) {
-  // Arrange -- construct three constant value expressions of different types
+TEST(ExpressionTest, ConstantValue_WhenConstructed_OutputsToString) {
   Expression cv_int = ConstantValueExp(Value(1));
   Expression cv_varchar = ConstantValueExp(Value("hello"));
   Expression cv_double = ConstantValueExp(Value(1.1));
 
-  // Act -- stream all three to LOG (no assertion; output-only)
   LOG(INFO) << "cv_int: " << cv_int << "\ncv_varchar: " << cv_varchar
             << "\ncv_double: " << cv_double;
-
-  // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
 }
 
-TEST(ExpressionTest, ConstantEval) {
-  // Arrange -- construct three constant value expressions of different types
+TEST(ExpressionTest, ConstantValue_Evaluate_ReturnsConstantValue) {
   Expression cv_int = ConstantValueExp(Value(1));
   Expression cv_varchar = ConstantValueExp(Value("hello"));
   Expression cv_double = ConstantValueExp(Value(1.1));
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each expression against empty row/schema and
-  // verify
   ASSERT_EQ(cv_int->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(cv_varchar->Evaluate(dummy, dummy_schema), Value("hello"));
   ASSERT_EQ(cv_double->Evaluate(dummy, dummy_schema), Value(1.1));
 }
 
-TEST(ExpressionTest, BinaryPlus) {
-  // Arrange -- construct three binary plus expressions (int, varchar, double)
+TEST(ExpressionTest, BinaryAdd_WithIntVarcharAndDouble_ComputesSumOrConcatenates) {
   Expression int_plus =
       BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kAdd,
                           ConstantValueExp(Value(2)));
@@ -93,7 +86,6 @@ TEST(ExpressionTest, BinaryPlus) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify arithmetic/concatenation semantics
   ASSERT_EQ(int_plus->Evaluate(dummy, dummy_schema), Value(3));
   ASSERT_EQ(varchar_plus->Evaluate(dummy, dummy_schema), Value("hello world"));
   ASSERT_DOUBLE_EQ(
@@ -101,8 +93,7 @@ TEST(ExpressionTest, BinaryPlus) {
       Value(3.3).value.double_value);
 }
 
-TEST(ExpressionTest, BinaryMinus) {
-  // Arrange -- construct binary minus expressions (int, double)
+TEST(ExpressionTest, BinarySubtract_WithIntAndDouble_ComputesDifference) {
   Expression int_minus = BinaryExpressionExp(ConstantValueExp(Value(1)),
                                              BinaryOperation::kSubtract,
                                              ConstantValueExp(Value(2)));
@@ -112,15 +103,13 @@ TEST(ExpressionTest, BinaryMinus) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify subtraction semantics
   ASSERT_EQ(int_minus->Evaluate(dummy, dummy_schema), Value(-1));
   ASSERT_DOUBLE_EQ(
       double_minus->Evaluate(dummy, dummy_schema).value.double_value,
       Value(-1.1).value.double_value);
 }
 
-TEST(ExpressionTest, BinaryMultiple) {
-  // Arrange -- construct binary multiply expressions (int, double)
+TEST(ExpressionTest, BinaryMultiply_WithIntAndDouble_ComputesProduct) {
   Expression int_multiple = BinaryExpressionExp(ConstantValueExp(Value(1)),
                                                 BinaryOperation::kMultiply,
                                                 ConstantValueExp(Value(2)));
@@ -130,15 +119,13 @@ TEST(ExpressionTest, BinaryMultiple) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify multiplication semantics
   ASSERT_EQ(int_multiple->Evaluate(dummy, dummy_schema), Value(2));
   ASSERT_DOUBLE_EQ(
       double_multiple->Evaluate(dummy, dummy_schema).value.double_value,
       Value(2.42).value.double_value);
 }
 
-TEST(ExpressionTest, BinaryDiv) {
-  // Arrange -- construct binary divide expressions (int, double)
+TEST(ExpressionTest, BinaryDivide_WithIntAndDouble_ComputesQuotient) {
   Expression int_div =
       BinaryExpressionExp(ConstantValueExp(Value(10)), BinaryOperation::kDivide,
                           ConstantValueExp(Value(2)));
@@ -148,25 +135,21 @@ TEST(ExpressionTest, BinaryDiv) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify division semantics
   ASSERT_EQ(int_div->Evaluate(dummy, dummy_schema), Value(5.0));
   EXPECT_NEAR(double_div->Evaluate(dummy, dummy_schema).value.double_value, 4.0, 1e-6);
 }
 
-TEST(ExpressionTest, BinaryMod) {
-  // Arrange -- construct binary modulo expression (int only)
+TEST(ExpressionTest, BinaryModulo_WithInt_ComputesRemainder) {
   Expression int_mod =
       BinaryExpressionExp(ConstantValueExp(Value(13)), BinaryOperation::kModulo,
                           ConstantValueExp(Value(5)));
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate and verify modulo semantics
   ASSERT_EQ(int_mod->Evaluate(dummy, dummy_schema), Value(3));
 }
 
-TEST(ExpressionTest, Equal) {
-  // Arrange -- construct six binary equals expressions across types
+TEST(ExpressionTest, BinaryEquals_WithVariousTypes_ReturnsCorrectBoolean) {
   Expression int_eq = BinaryExpressionExp(ConstantValueExp(Value(120)),
                                           BinaryOperation::kEquals,
                                           ConstantValueExp(Value(120)));
@@ -188,7 +171,6 @@ TEST(ExpressionTest, Equal) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify equals semantics (1=true, 0=false)
   ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(int_ne->Evaluate(dummy, dummy_schema), Value(0));
   ASSERT_EQ(double_eq->Evaluate(dummy, dummy_schema), Value(1));
@@ -197,8 +179,7 @@ TEST(ExpressionTest, Equal) {
   ASSERT_EQ(varchar_ne->Evaluate(dummy, dummy_schema), Value(0));
 }
 
-TEST(ExpressionTest, NotEqual) {
-  // Arrange -- construct six binary not-equals expressions across types
+TEST(ExpressionTest, BinaryNotEquals_WithVariousTypes_ReturnsCorrectBoolean) {
   Expression int_eq = BinaryExpressionExp(ConstantValueExp(Value(120)),
                                           BinaryOperation::kNotEquals,
                                           ConstantValueExp(Value(120)));
@@ -220,8 +201,6 @@ TEST(ExpressionTest, NotEqual) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify not-equals semantics (0=false,
-  // 1=true)
   ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(0));
   ASSERT_EQ(int_ne->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(double_eq->Evaluate(dummy, dummy_schema), Value(0));
@@ -230,8 +209,7 @@ TEST(ExpressionTest, NotEqual) {
   ASSERT_EQ(varchar_ne->Evaluate(dummy, dummy_schema), Value(1));
 }
 
-TEST(ExpressionTest, LessThan) {
-  // Arrange -- construct nine binary less-than expressions across types/signs
+TEST(ExpressionTest, BinaryLessThan_WithVariousTypes_ReturnsCorrectBoolean) {
   Expression int_lt = BinaryExpressionExp(ConstantValueExp(Value(100)),
                                           BinaryOperation::kLessThan,
                                           ConstantValueExp(Value(12312)));
@@ -262,8 +240,6 @@ TEST(ExpressionTest, LessThan) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify less-than semantics (1=true,
-  // 0=false)
   ASSERT_EQ(int_lt->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(0));
   ASSERT_EQ(int_gt->Evaluate(dummy, dummy_schema), Value(0));
@@ -275,9 +251,7 @@ TEST(ExpressionTest, LessThan) {
   ASSERT_EQ(varchar_gt->Evaluate(dummy, dummy_schema), Value(0));
 }
 
-TEST(ExpressionTest, LessThanEquals) {
-  // Arrange -- construct nine binary less-than-or-equals expressions across
-  // types/signs
+TEST(ExpressionTest, BinaryLessThanEquals_WithVariousTypes_ReturnsCorrectBoolean) {
   Expression int_lt = BinaryExpressionExp(ConstantValueExp(Value(100)),
                                           BinaryOperation::kLessThanEquals,
                                           ConstantValueExp(Value(12312)));
@@ -308,8 +282,6 @@ TEST(ExpressionTest, LessThanEquals) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify <= semantics (1=true for
-  // less-or-equal, 0=false for greater)
   ASSERT_EQ(int_lt->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(int_gt->Evaluate(dummy, dummy_schema), Value(0));
@@ -321,9 +293,7 @@ TEST(ExpressionTest, LessThanEquals) {
   ASSERT_EQ(varchar_gt->Evaluate(dummy, dummy_schema), Value(0));
 }
 
-TEST(ExpressionTest, GreaterThan) {
-  // Arrange -- construct nine binary greater-than expressions across
-  // types/signs
+TEST(ExpressionTest, BinaryGreaterThan_WithVariousTypes_ReturnsCorrectBoolean) {
   Expression int_lt = BinaryExpressionExp(ConstantValueExp(Value(100)),
                                           BinaryOperation::kGreaterThan,
                                           ConstantValueExp(Value(12312)));
@@ -354,8 +324,6 @@ TEST(ExpressionTest, GreaterThan) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify > semantics (1=true for greater,
-  // 0=false for less-or-equal)
   ASSERT_EQ(int_lt->Evaluate(dummy, dummy_schema), Value(0));
   ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(0));
   ASSERT_EQ(int_gt->Evaluate(dummy, dummy_schema), Value(1));
@@ -367,9 +335,7 @@ TEST(ExpressionTest, GreaterThan) {
   ASSERT_EQ(varchar_gt->Evaluate(dummy, dummy_schema), Value(1));
 }
 
-TEST(ExpressionTest, GreaterThanEquals) {
-  // Arrange -- construct nine binary greater-than-or-equals expressions across
-  // types/signs
+TEST(ExpressionTest, BinaryGreaterThanEquals_WithVariousTypes_ReturnsCorrectBoolean) {
   Expression int_lt = BinaryExpressionExp(ConstantValueExp(Value(100)),
                                           BinaryOperation::kGreaterThanEquals,
                                           ConstantValueExp(Value(12312)));
@@ -400,8 +366,6 @@ TEST(ExpressionTest, GreaterThanEquals) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act + Assert -- evaluate each and verify >= semantics (1=true for
-  // greater-or-equal, 0=false for less)
   ASSERT_EQ(int_lt->Evaluate(dummy, dummy_schema), Value(0));
   ASSERT_EQ(int_eq->Evaluate(dummy, dummy_schema), Value(1));
   ASSERT_EQ(int_gt->Evaluate(dummy, dummy_schema), Value(1));
@@ -413,28 +377,23 @@ TEST(ExpressionTest, GreaterThanEquals) {
   ASSERT_EQ(varchar_gt->Evaluate(dummy, dummy_schema), Value(1));
 }
 
-TEST(ExpressionTest, ColumnValue) {
-  // Arrange -- construct a schema with four columns and a matching row
+TEST(ExpressionTest, ColumnValue_Evaluate_ResolvesColumnFromRow) {
   std::vector<Column> cols{
       Column("name", ValueType::kVarChar), Column("score", ValueType::kInt64),
       Column("flv", ValueType::kDouble), Column("date", ValueType::kInt64)};
   Schema sc("sc", cols);
   Row row({Value("foo"), Value(12), Value(132.3), Value(9)});
 
-  // Act + Assert -- evaluate ColumnValueExp for each column and verify it reads
-  // the row's field
   ASSERT_EQ(ColumnValueExp("sc.name")->Evaluate(row, sc), Value("foo"));
   ASSERT_EQ(ColumnValueExp("score")->Evaluate(row, sc), Value(12));
   ASSERT_EQ(ColumnValueExp("flv")->Evaluate(row, sc), Value(132.3));
   ASSERT_EQ(ColumnValueExp("date")->Evaluate(row, sc), Value(9));
 }
 
-TEST(ExpressionTest, UnaryExpression) {
-  // Arrange -- empty row/schema for unary evaluation
+TEST(ExpressionTest, UnaryExpression_Evaluate_ComputesExpectedResults) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Act 1 + Assert 1 -- IS NULL on null and non-null
   Expression is_null_true =
       UnaryExpressionExp(ConstantValueExp(Value()), UnaryOperation::kIsNull);
   Expression is_null_false =
@@ -442,7 +401,6 @@ TEST(ExpressionTest, UnaryExpression) {
   ASSERT_EQ(is_null_true->Evaluate(dummy, dummy_schema), Value(true));
   ASSERT_EQ(is_null_false->Evaluate(dummy, dummy_schema), Value(false));
 
-  // Act 2 + Assert 2 -- IS NOT NULL on null and non-null
   Expression is_not_null_true = UnaryExpressionExp(ConstantValueExp(Value(1)),
                                                    UnaryOperation::kIsNotNull);
   Expression is_not_null_false =
@@ -450,7 +408,6 @@ TEST(ExpressionTest, UnaryExpression) {
   ASSERT_EQ(is_not_null_true->Evaluate(dummy, dummy_schema), Value(true));
   ASSERT_EQ(is_not_null_false->Evaluate(dummy, dummy_schema), Value(false));
 
-  // Act 3 + Assert 3 -- NOT on true, false, null
   Expression not_true =
       UnaryExpressionExp(ConstantValueExp(Value(true)), UnaryOperation::kNot);
   Expression not_false =
@@ -461,7 +418,6 @@ TEST(ExpressionTest, UnaryExpression) {
   ASSERT_EQ(not_false->Evaluate(dummy, dummy_schema), Value(true));
   ASSERT_TRUE(not_null->Evaluate(dummy, dummy_schema).IsNull());
 
-  // Act 4 + Assert 4 -- Unary Minus on int and double
   Expression int_minus =
       UnaryExpressionExp(ConstantValueExp(Value(1)), UnaryOperation::kMinus);
   Expression double_minus =
@@ -472,8 +428,7 @@ TEST(ExpressionTest, UnaryExpression) {
       Value(-1.1).value.double_value);
 }
 
-TEST(ExpressionTest, AggregateExpression) {
-  // Arrange -- empty row/schema; construct six aggregate expressions
+TEST(ExpressionTest, AggregateExpression_ToString_RendersSqlSyntax) {
   Row dummy({});
   Schema dummy_schema;
   Expression count_all =
@@ -489,9 +444,6 @@ TEST(ExpressionTest, AggregateExpression) {
   Expression max_col =
       AggregateExpressionExp(AggregationType::kMax, ColumnValueExp("col"));
 
-  // Act + Assert -- aggregate expressions are not evaluated directly; executor
-  // computes them. Here we only verify ToString() renders the expected
-  // aggregate syntax.
   ASSERT_EQ(count_all->ToString(), "COUNT(*)");
   ASSERT_EQ(count_col->ToString(), "COUNT(col)");
   ASSERT_EQ(sum_col->ToString(), "SUM(col)");
@@ -500,8 +452,7 @@ TEST(ExpressionTest, AggregateExpression) {
   ASSERT_EQ(max_col->ToString(), "MAX(col)");
 }
 
-TEST(ExpressionTest, CaseExpression) {
-  // Arrange -- empty row/schema; construct two CASE expressions
+TEST(ExpressionTest, CaseExpression_Evaluate_EvaluatesMatchingBranchOrElse) {
   Row dummy({});
   Schema dummy_schema;
   Expression case_exp_true =
@@ -526,14 +477,11 @@ TEST(ExpressionTest, CaseExpression) {
                           ConstantValueExp(Value("two"))}},
                         ConstantValueExp(Value("other")));
 
-  // Act + Assert -- CASE returns "one" when first WHEN matches, "other"
-  // otherwise
   ASSERT_EQ(case_exp_true->Evaluate(dummy, dummy_schema), Value("one"));
   ASSERT_EQ(case_exp_false->Evaluate(dummy, dummy_schema), Value("other"));
 }
 
-TEST(ExpressionTest, InExpression) {
-  // Arrange -- empty row/schema; construct two IN expressions
+TEST(ExpressionTest, InExpression_Evaluate_ReturnsTrueIfContained) {
   Row dummy({});
   Schema dummy_schema;
   Expression in_exp_true =
@@ -545,58 +493,39 @@ TEST(ExpressionTest, InExpression) {
                       {ConstantValueExp(Value(1)), ConstantValueExp(Value(2)),
                        ConstantValueExp(Value(3))});
 
-  // Act + Assert -- IN returns true when left value is in the list, false
-  // otherwise
   ASSERT_EQ(in_exp_true->Evaluate(dummy, dummy_schema), Value(true));
   ASSERT_EQ(in_exp_false->Evaluate(dummy, dummy_schema), Value(false));
 }
 
-TEST(ExpressionTest, PathologicalCases) {
-  // Arrange -- empty row/schema for all sub-cases; sub-cases build their own
-  // expressions
+TEST(ExpressionTest, BinaryExpression_WithNestedExpressions_ComputesCorrectly) {
   Row dummy({});
   Schema dummy_schema;
 
-  // Subcase 1 -- (1 + 2) * 3 = 9
-  // Arrange 1 -- nested binary expression: (1+2)*3
   Expression nested_product = BinaryExpressionExp(
       BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kAdd,
                           ConstantValueExp(Value(2))),
       BinaryOperation::kMultiply, ConstantValueExp(Value(3)));
-  // Act 1 + Assert 1 -- evaluate and verify result equals 9
   ASSERT_EQ(nested_product->Evaluate(dummy, dummy_schema), Value(9));
 
-  // Subcase 2 -- 1 + (2 * 3) = 7
-  // Arrange 2 -- nested binary expression: 1+(2*3)
   Expression exp2 =
       BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kAdd,
                           BinaryExpressionExp(ConstantValueExp(Value(2)),
                                               BinaryOperation::kMultiply,
                                               ConstantValueExp(Value(3))));
-  // Act 2 + Assert 2 -- evaluate and verify result equals 7
   ASSERT_EQ(exp2->Evaluate(dummy, dummy_schema), Value(7));
 
-  // Subcase 3 -- (true AND false) OR true = true
-  // Arrange 3 -- nested logical: (true AND false) OR true
   Expression exp3 = BinaryExpressionExp(
       BinaryExpressionExp(ConstantValueExp(Value(true)), BinaryOperation::kAnd,
                           ConstantValueExp(Value(false))),
       BinaryOperation::kOr, ConstantValueExp(Value(true)));
-  // Act 3 + Assert 3 -- evaluate and verify result equals true
   ASSERT_EQ(exp3->Evaluate(dummy, dummy_schema), Value(true));
 
-  // Subcase 4 -- true AND (false OR true) = true
-  // Arrange 4 -- nested logical: true AND (false OR true)
   Expression exp4 = BinaryExpressionExp(
       ConstantValueExp(Value(true)), BinaryOperation::kAnd,
       BinaryExpressionExp(ConstantValueExp(Value(false)), BinaryOperation::kOr,
                           ConstantValueExp(Value(true))));
-  // Act 4 + Assert 4 -- evaluate and verify result equals true
   ASSERT_EQ(exp4->Evaluate(dummy, dummy_schema), Value(true));
 
-  // Subcase 5 -- ((1 + 2) * 3 - (4 / 2)) > 5 AND (true OR false) = (9 - 2) > 5
-  // AND true = 7 > 5 AND true = true Arrange 5 -- deeply nested
-  // arithmetic+logical: ((1+2)*3 - 4/2) > 5 AND (true OR false)
   Expression exp5 = BinaryExpressionExp(
       BinaryExpressionExp(
           BinaryExpressionExp(BinaryExpressionExp(ConstantValueExp(Value(1)),
@@ -609,11 +538,10 @@ TEST(ExpressionTest, PathologicalCases) {
                               BinaryOperation::kDivide,
                               ConstantValueExp(Value(2)))),
       BinaryOperation::kGreaterThan, ConstantValueExp(Value(5)));
-  // Act 5 + Assert 5 -- evaluate and verify result equals true
   ASSERT_EQ(exp5->Evaluate(dummy, dummy_schema), Value(true));
 }
 
-TEST(ExpressionTest, SqlNullThreeValuedLogic) {
+TEST(ExpressionTest, BinaryExpression_WithNullOperands_FollowsThreeValuedLogic) {
   const Row row;
   const Schema schema;
   const Expression null_value = ConstantValueExp(Value());
@@ -638,14 +566,12 @@ TEST(ExpressionTest, SqlNullThreeValuedLogic) {
                   .IsNull());
 }
 
-TEST(ExpressionTest, ArithmeticNullPropagation) {
-  // SQL arithmetic and comparisons with a NULL operand yield NULL rather than
-  // a value or a crash.  This mirrors the SQL NULL semantics used by the
-  // executor for every binary operator and unary minus.
+TEST(ExpressionTest, BinaryExpression_ArithmeticWithNull_PropagatesNull) {
   const Row row;
   const Schema schema;
   const Expression null_value = ConstantValueExp(Value());
   const Expression one = ConstantValueExp(Value(1));
+
   for (const BinaryOperation op : {BinaryOperation::kAdd,
                                    BinaryOperation::kSubtract,
                                    BinaryOperation::kMultiply,
@@ -669,7 +595,7 @@ TEST(ExpressionTest, ArithmeticNullPropagation) {
   EXPECT_TRUE(neg.IsNull());
 }
 
-TEST(ExpressionTest, MixedNumericEvaluationAndTypeInference) {
+TEST(ExpressionTest, BinaryExpression_WithMixedNumericTypes_InfersTypeAndComputes) {
   const Schema schema("numbers", {Column("integer", ValueType::kInt64),
                                   Column("floating", ValueType::kDouble)});
   const Row row({Value(2), Value(0.5)});
@@ -684,7 +610,7 @@ TEST(ExpressionTest, MixedNumericEvaluationAndTypeInference) {
   EXPECT_EQ(expression->ResultType(schema).GetType(), TypeTag::kDouble);
 }
 
-TEST(ExpressionTest, TpchScalarFunctionsUseTheCommonExpressionEvaluator) {
+TEST(ExpressionTest, FunctionCall_WithTpchScalarFunctions_EvaluatesCorrectly) {
   const Row row;
   const Schema schema;
   const Expression date_add =
@@ -726,7 +652,7 @@ class BareExpression : public ExpressionBase {
 
 }  // namespace
 
-TEST(ExpressionTest, QueryExpressionToStringAndTouchedColumns) {
+TEST(ExpressionTest, QueryExpression_Inspect_ReturnsTypeStringAndTouchedColumns) {
   std::shared_ptr<SelectStatement> no_query;
   Expression test = ColumnValueExp("x");
   Expression exists = QueryExpressionExp(no_query, test, true, false);
@@ -752,18 +678,20 @@ TEST(ExpressionTest, QueryExpressionToStringAndTouchedColumns) {
   EXPECT_EQ(not_exists->AsQueryExpression().Negated(), true);
 }
 
-TEST(ExpressionTest, QueryExpressionEvaluateThrows) {
+TEST(ExpressionTest, QueryExpression_EvaluateWithoutContext_ThrowsRuntimeError) {
   Row row;
   Schema schema;
   Expression scalar = QueryExpressionExp(
       std::shared_ptr<SelectStatement>(), ColumnValueExp("x"));
+
   EXPECT_THROW(scalar->Evaluate(row, schema), std::runtime_error);
+
   std::ostringstream oss;
   scalar->Dump(oss);
   EXPECT_EQ(oss.str(), "x IN(...)");
 }
 
-TEST(ExpressionTest, AggregateResultTypeAndDistinct) {
+TEST(ExpressionTest, AggregateExpression_EvaluateDirectly_ThrowsLogicError) {
   Schema schema("s", {Column("amount", ValueType::kInt64),
                       Column("rate", ValueType::kDouble)});
   Row row({Value(10), Value(0.5)});
@@ -786,8 +714,6 @@ TEST(ExpressionTest, AggregateResultTypeAndDistinct) {
   EXPECT_EQ(count->ResultType(schema, schema).GetType(), TypeTag::kBigInt);
   EXPECT_EQ(avg->ResultType(schema, schema).GetType(), TypeTag::kDouble);
 
-  // Direct evaluation of an aggregate is a misuse; it must throw instead of
-  // silently returning an empty value.
   EXPECT_THROW(count->Evaluate(row, schema), std::logic_error);
   EXPECT_EQ(count->ToString(), "COUNT(amount)");
   EXPECT_EQ(AggregateExpressionExp(AggregationType::kCount,
@@ -800,12 +726,13 @@ TEST(ExpressionTest, AggregateResultTypeAndDistinct) {
   EXPECT_EQ(aggregate.GetType(), AggregationType::kCount);
   EXPECT_EQ(aggregate.Child()->Type(), TypeTag::kColumnValue);
   EXPECT_FALSE(aggregate.Distinct());
+
   std::ostringstream oss;
   count->Dump(oss);
   EXPECT_EQ(oss.str(), "COUNT(amount)");
 }
 
-TEST(ExpressionTest, CaseExpressionWithoutElseAndNullCondition) {
+TEST(ExpressionTest, CaseExpression_WithNullConditionOrMissingElse_ReturnsNullOrElse) {
   Schema schema("s", {Column("v", ValueType::kInt64)});
   Row row({Value(5)});
   Expression no_else = CaseExpressionExp(
@@ -818,20 +745,19 @@ TEST(ExpressionTest, CaseExpressionWithoutElseAndNullCondition) {
       ConstantValueExp(Value("else")));
 
   EXPECT_TRUE(no_else->Evaluate(row, schema).IsNull());
-  // A NULL WHEN condition must not match in SQL three-valued logic. The
-  // 4-argument overload skips NULL conditions explicitly.
   EXPECT_EQ(null_condition->Evaluate(&row, schema, nullptr, schema),
             Value("else"));
   EXPECT_EQ(null_condition->Evaluate(row, schema), Value("else"));
 }
 
-TEST(ExpressionTest, CaseExpressionResultType) {
+TEST(ExpressionTest, CaseExpression_ResultType_InfersCorrectType) {
   Schema schema;
   Expression with_when =
       CaseExpressionExp({{ConstantValueExp(Value(true)),
                           ConstantValueExp(Value(1))}},
                         ConstantValueExp(Value(2)));
   Expression no_when_no_else = CaseExpressionExp({}, nullptr);
+
   EXPECT_EQ(with_when->ResultType(schema).GetType(), TypeTag::kBigInt);
   EXPECT_EQ(with_when->ResultType(schema, schema).GetType(), TypeTag::kBigInt);
   EXPECT_EQ(no_when_no_else->ResultType(schema).GetType(), TypeTag::kInvalid);
@@ -839,38 +765,43 @@ TEST(ExpressionTest, CaseExpressionResultType) {
             TypeTag::kInvalid);
 }
 
-TEST(ExpressionTest, CaseExpressionTouchedColumnsAndString) {
+TEST(ExpressionTest, CaseExpression_Inspect_ReturnsTouchedColumnsAndString) {
   Row row;
   Schema schema;
   Expression case_exp = CaseExpressionExp(
       {{ColumnValueExp("a"), ColumnValueExp("b")}}, ColumnValueExp("c"));
+
   EXPECT_EQ(case_exp->Type(), TypeTag::kCaseExp);
   EXPECT_EQ(case_exp->TouchedColumns().size(), 3);
   EXPECT_EQ(case_exp->ToString(), "CASE WHEN a THEN b ELSE c END");
+
   std::ostringstream oss;
   case_exp->Dump(oss);
   EXPECT_EQ(oss.str(), "CASE WHEN a THEN b ELSE c END");
 }
 
-TEST(ExpressionTest, IntervalExpressionEvaluateAndToString) {
+TEST(ExpressionTest, IntervalExpression_EvaluateAndToString_ReturnsFormattedInterval) {
   Row row;
   Schema schema;
   Expression interval = IntervalExpressionExp(3, "day");
+
   EXPECT_EQ(interval->Type(), TypeTag::kIntervalExp);
   EXPECT_EQ(interval->Evaluate(row, schema), Value("0-0 3 0:0:0"));
   EXPECT_EQ(interval->Evaluate(&row, schema, &row, schema), Value("0-0 3 0:0:0"));
   EXPECT_EQ(interval->ResultType(schema).GetType(), TypeTag::kVarChar);
   EXPECT_EQ(interval->ResultType(schema, schema).GetType(), TypeTag::kVarChar);
   EXPECT_EQ(interval->ToString(), "INTERVAL 0-0 3 0:0:0");
+
   std::ostringstream oss;
   interval->Dump(oss);
   EXPECT_EQ(oss.str(), "INTERVAL 0-0 3 0:0:0");
+
   const auto& interval_expression = interval->AsIntervalExpression();
   EXPECT_EQ(interval_expression.Amount(), 3);
   EXPECT_EQ(interval_expression.Unit(), "day");
 }
 
-TEST(ExpressionTest, InExpressionNullSemantics) {
+TEST(ExpressionTest, InExpression_WithNullValues_FollowsThreeValuedLogic) {
   Row row;
   Schema schema;
   Expression child_null = InExpressionExp(
@@ -896,26 +827,29 @@ TEST(ExpressionTest, InExpressionNullSemantics) {
             Value(true));
 }
 
-TEST(ExpressionTest, InExpressionToStringAndResultType) {
+TEST(ExpressionTest, InExpression_Inspect_ReturnsStringAndResultType) {
   Row row;
   Schema schema;
   Expression in = InExpressionExp(
       ColumnValueExp("x"), {ConstantValueExp(Value(1)),
                             ConstantValueExp(Value(2))});
+
   EXPECT_EQ(in->Type(), TypeTag::kInExp);
   EXPECT_EQ(in->ToString(), "x IN (1, 2)");
   EXPECT_EQ(in->ResultType(schema).GetType(), TypeTag::kBigInt);
   EXPECT_EQ(in->ResultType(schema, schema).GetType(), TypeTag::kBigInt);
   EXPECT_EQ(in->TouchedColumns().size(), 1);
+
   std::ostringstream oss;
   in->Dump(oss);
   EXPECT_EQ(oss.str(), "x IN (1, 2)");
 }
 
-TEST(ExpressionTest, EvaluateBinaryBooleanLogic) {
+TEST(ExpressionTest, EvaluateBinary_WithBooleanLogic_FollowsThreeValuedLogic) {
   const Value vtrue(true);
   const Value vfalse(false);
   const Value vnull;
+
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kAnd, vtrue, vtrue), Value(true));
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kAnd, vfalse, vnull),
             Value(false));
@@ -929,7 +863,7 @@ TEST(ExpressionTest, EvaluateBinaryBooleanLogic) {
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kXor, vtrue, vtrue), Value(false));
 }
 
-TEST(ExpressionTest, EvaluateBinaryLike) {
+TEST(ExpressionTest, EvaluateBinary_WithLikePattern_MatchesCorrectly) {
   EXPECT_EQ(EvaluateBinary(BinaryOperation::kLike, Value("hello"), Value("h%")),
             Value(true));
   EXPECT_EQ(
@@ -950,7 +884,7 @@ TEST(ExpressionTest, EvaluateBinaryLike) {
                   .Truthy() == false);
 }
 
-TEST(ExpressionTest, EvaluateBinaryErrors) {
+TEST(ExpressionTest, EvaluateBinary_WithInvalidOperands_ThrowsOrReturnsNull) {
   EXPECT_THROW(std::ignore = EvaluateBinary(BinaryOperation::kLike, Value(1),
                                             Value("a%")),
                std::runtime_error);
@@ -964,9 +898,10 @@ TEST(ExpressionTest, EvaluateBinaryErrors) {
                   .IsNull());
 }
 
-TEST(ExpressionTest, EvaluateBinaryMixedNumeric) {
+TEST(ExpressionTest, EvaluateBinary_WithMixedNumeric_ComputesCorrectly) {
   const Value int_val(10);
   const Value double_val(2.5);
+
   EXPECT_DOUBLE_EQ(
       EvaluateBinary(BinaryOperation::kAdd, int_val, double_val)
           .value.double_value,
@@ -1003,7 +938,7 @@ TEST(ExpressionTest, EvaluateBinaryMixedNumeric) {
       Value(true));
 }
 
-TEST(ExpressionTest, BinaryExpressionResultType) {
+TEST(ExpressionTest, BinaryExpression_ResultType_InfersCorrectType) {
   Schema int_schema("s", {Column("a", ValueType::kInt64),
                           Column("b", ValueType::kInt64)});
   Schema double_schema("s", {Column("a", ValueType::kDouble),
@@ -1013,6 +948,7 @@ TEST(ExpressionTest, BinaryExpressionResultType) {
   Expression add = BinaryExpressionExp(ColumnValueExp("a"),
                                        BinaryOperation::kAdd,
                                        ColumnValueExp("b"));
+
   EXPECT_EQ(add->ResultType(int_schema).GetType(), TypeTag::kBigInt);
   EXPECT_EQ(add->ResultType(double_schema).GetType(), TypeTag::kDouble);
   EXPECT_EQ(BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kAdd,
@@ -1039,7 +975,7 @@ TEST(ExpressionTest, BinaryExpressionResultType) {
             TypeTag::kBigInt);
 }
 
-TEST(ExpressionTest, BinaryExpressionTwoSchemaEvaluate) {
+TEST(ExpressionTest, BinaryExpression_EvaluateWithTwoSchemas_ResolvesBothSchemas) {
   Schema left_schema("l", {Column("a", ValueType::kInt64)});
   Schema right_schema("r", {Column("b", ValueType::kInt64)});
   Row left_row({Value(1)});
@@ -1047,32 +983,35 @@ TEST(ExpressionTest, BinaryExpressionTwoSchemaEvaluate) {
   Expression expr = BinaryExpressionExp(ColumnValueExp("a"),
                                         BinaryOperation::kAdd,
                                         ColumnValueExp("b"));
+
   EXPECT_EQ(expr->Evaluate(&left_row, left_schema, &right_row, right_schema),
             Value(3));
   EXPECT_EQ(expr->Type(), TypeTag::kBinaryExp);
   EXPECT_EQ(expr->TouchedColumns().size(), 2);
   EXPECT_EQ(expr->ToString(), "(a + b)");
+
   std::ostringstream oss;
   expr->Dump(oss);
   EXPECT_EQ(oss.str(), "(a + b)");
 }
 
-TEST(ExpressionTest, FunctionCallCoalesceAndConcat) {
+TEST(ExpressionTest, FunctionCall_CoalesceAndConcat_EvaluatesCorrectly) {
   Row row;
   Schema schema;
   Expression coalesce = FunctionCallExp(
       "coalesce", {ConstantValueExp(Value()), ConstantValueExp(Value("b")),
                    ConstantValueExp(Value(3))});
-  EXPECT_EQ(coalesce->Evaluate(row, schema), Value("b"));
   Expression all_null = FunctionCallExp(
       "coalesce", {ConstantValueExp(Value()), ConstantValueExp(Value())});
-  EXPECT_TRUE(all_null->Evaluate(row, schema).IsNull());
   Expression concat = FunctionCallExp(
       "concat", {ConstantValueExp(Value("a")), ConstantValueExp(Value("b")),
                  ConstantValueExp(Value("c"))});
-  EXPECT_EQ(concat->Evaluate(row, schema), Value("abc"));
   Expression concat_null = FunctionCallExp(
       "concat", {ConstantValueExp(Value("a")), ConstantValueExp(Value())});
+
+  EXPECT_EQ(coalesce->Evaluate(row, schema), Value("b"));
+  EXPECT_TRUE(all_null->Evaluate(row, schema).IsNull());
+  EXPECT_EQ(concat->Evaluate(row, schema), Value("abc"));
   EXPECT_TRUE(concat_null->Evaluate(row, schema).IsNull());
   EXPECT_THROW(FunctionCallExp("concat", {ConstantValueExp(Value(1)),
                                           ConstantValueExp(Value("a"))})
@@ -1080,28 +1019,29 @@ TEST(ExpressionTest, FunctionCallCoalesceAndConcat) {
                std::runtime_error);
 }
 
-TEST(ExpressionTest, FunctionCallSubstr) {
+TEST(ExpressionTest, FunctionCall_Substr_EvaluatesCorrectly) {
   Row row;
   Schema schema;
   Expression substr2 = FunctionCallExp(
       "substr", {ConstantValueExp(Value("hello")), ConstantValueExp(Value(2))});
-  EXPECT_EQ(substr2->Evaluate(row, schema), Value("ello"));
   Expression substring3 = FunctionCallExp(
       "substring",
       {ConstantValueExp(Value("hello")), ConstantValueExp(Value(2)),
        ConstantValueExp(Value(3))});
-  EXPECT_EQ(substring3->Evaluate(row, schema), Value("ell"));
   Expression substr_start_one = FunctionCallExp(
       "substr", {ConstantValueExp(Value("hello")), ConstantValueExp(Value(1)),
                  ConstantValueExp(Value(2))});
-  EXPECT_EQ(substr_start_one->Evaluate(row, schema), Value("he"));
   Expression substr_out_of_range = FunctionCallExp(
       "substr",
       {ConstantValueExp(Value("hello")), ConstantValueExp(Value(99))});
-  EXPECT_EQ(substr_out_of_range->Evaluate(row, schema), Value(std::string()));
   Expression substr_null = FunctionCallExp(
       "substr",
       {ConstantValueExp(Value("hello")), ConstantValueExp(Value())});
+
+  EXPECT_EQ(substr2->Evaluate(row, schema), Value("ello"));
+  EXPECT_EQ(substring3->Evaluate(row, schema), Value("ell"));
+  EXPECT_EQ(substr_start_one->Evaluate(row, schema), Value("he"));
+  EXPECT_EQ(substr_out_of_range->Evaluate(row, schema), Value(std::string()));
   EXPECT_TRUE(substr_null->Evaluate(row, schema).IsNull());
   EXPECT_THROW(FunctionCallExp("substr", {ConstantValueExp(Value("hello"))})
                    ->Evaluate(row, schema),
@@ -1111,7 +1051,7 @@ TEST(ExpressionTest, FunctionCallSubstr) {
                                  ConstantValueExp(Value("x"))})
           ->Evaluate(row, schema),
       std::runtime_error);
-  // A negative length throws an error per GoogleSQL semantics.
+
   Expression substr_negative_length = FunctionCallExp(
       "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(1)),
                  ConstantValueExp(Value(-1))});
@@ -1122,7 +1062,6 @@ TEST(ExpressionTest, FunctionCallSubstr) {
                  ConstantValueExp(Value(0))});
   EXPECT_EQ(substr_zero_length->Evaluate(row, schema), Value(std::string()));
 
-  // Start positions before the string are clamped to its beginning.
   Expression substr_start_zero = FunctionCallExp(
       "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(0))});
   EXPECT_EQ(substr_start_zero->Evaluate(row, schema), Value("abc"));
@@ -1131,26 +1070,28 @@ TEST(ExpressionTest, FunctionCallSubstr) {
                                  ConstantValueExp(Value(-5))});
   EXPECT_EQ(substr_start_negative->Evaluate(row, schema), Value("abc"));
   EXPECT_EQ(substr2->ToString(), "substr(\"hello\", 2)");
+
   std::ostringstream oss;
   substr2->Dump(oss);
   EXPECT_EQ(oss.str(), "substr(\"hello\", 2)");
   EXPECT_EQ(substr2->AsFunctionCallExpression().Args().size(), 2);
 }
 
-TEST(ExpressionTest, FunctionCallExtract) {
+TEST(ExpressionTest, FunctionCall_Extract_EvaluatesCorrectly) {
   Row row;
   Schema schema;
   Expression year = FunctionCallExp(
       "extract_year", {ConstantValueExp(Value::Date("1996-07-15"))});
-  EXPECT_EQ(year->Evaluate(row, schema), Value(1996));
   Expression month = FunctionCallExp(
       "extract_month", {ConstantValueExp(Value::Date("1996-07-15"))});
-  EXPECT_EQ(month->Evaluate(row, schema), Value(7));
   Expression day = FunctionCallExp(
       "extract_day", {ConstantValueExp(Value("1996-07-15"))});
-  EXPECT_EQ(day->Evaluate(row, schema), Value(15));
   Expression null_extract = FunctionCallExp(
       "extract_year", {ConstantValueExp(Value())});
+
+  EXPECT_EQ(year->Evaluate(row, schema), Value(1996));
+  EXPECT_EQ(month->Evaluate(row, schema), Value(7));
+  EXPECT_EQ(day->Evaluate(row, schema), Value(15));
   EXPECT_TRUE(null_extract->Evaluate(row, schema).IsNull());
   EXPECT_THROW(FunctionCallExp("extract_year", {})->Evaluate(row, schema),
                std::runtime_error);
@@ -1160,9 +1101,10 @@ TEST(ExpressionTest, FunctionCallExtract) {
                std::runtime_error);
 }
 
-TEST(ExpressionTest, FunctionCallCurrentTimestampAndResultType) {
+TEST(ExpressionTest, FunctionCall_CurrentTimestampAndResultType_EvaluatesAndInfersType) {
   Row row;
   Schema schema;
+
   EXPECT_EQ(FunctionCallExp("current_timestamp", {})
                 ->Evaluate(row, schema)
                 .type,
@@ -1205,24 +1147,25 @@ TEST(ExpressionTest, FunctionCallCurrentTimestampAndResultType) {
             2);
 }
 
-TEST(ExpressionTest, FunctionCallDateAddSub) {
+TEST(ExpressionTest, FunctionCall_DateAddSub_EvaluatesCorrectly) {
   Row row;
   Schema schema;
   Expression date_add = FunctionCallExp(
       "date_add", {ConstantValueExp(Value::Date("1994-01-01")),
                    IntervalExpressionExp(1, "year")});
-  EXPECT_EQ(date_add->Evaluate(row, schema), Value::Date("1995-01-01"));
   Expression date_sub = FunctionCallExp(
       "date_sub", {ConstantValueExp(Value("1998-12-01")),
                    IntervalExpressionExp(74, "day")});
-  EXPECT_EQ(date_sub->Evaluate(row, schema), Value("1998-09-18"));
   Expression date_add_4 = FunctionCallExp(
       "date_add", {ConstantValueExp(Value("1994-01-01")),
                    IntervalExpressionExp(1, "year")});
-  EXPECT_EQ(date_add_4->Evaluate(&row, schema, &row, schema),
-            Value("1995-01-01"));
   Expression date_add_null = FunctionCallExp(
       "date_add", {ConstantValueExp(Value()), IntervalExpressionExp(1, "day")});
+
+  EXPECT_EQ(date_add->Evaluate(row, schema), Value::Date("1995-01-01"));
+  EXPECT_EQ(date_sub->Evaluate(row, schema), Value("1998-09-18"));
+  EXPECT_EQ(date_add_4->Evaluate(&row, schema, &row, schema),
+            Value("1995-01-01"));
   EXPECT_TRUE(date_add_null->Evaluate(row, schema).IsNull());
   EXPECT_THROW(
       FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01"))})
@@ -1235,11 +1178,12 @@ TEST(ExpressionTest, FunctionCallDateAddSub) {
                std::runtime_error);
 }
 
-TEST(ExpressionTest, ColumnValueCaseInsensitiveLookup) {
+TEST(ExpressionTest, ColumnValue_CaseInsensitiveLookup_ResolvesColumn) {
   std::vector<Column> cols{Column("Name", ValueType::kVarChar),
                            Column("Score", ValueType::kInt64)};
   Schema sc("sc", cols);
   Row row({Value("foo"), Value(12)});
+
   EXPECT_EQ(ColumnValueExp("name")->Evaluate(row, sc), Value("foo"));
   EXPECT_EQ(ColumnValueExp("SCORE")->Evaluate(row, sc), Value(12));
   EXPECT_EQ(ColumnValueExp("sc.NAME")->Evaluate(row, sc), Value("foo"));
@@ -1247,12 +1191,13 @@ TEST(ExpressionTest, ColumnValueCaseInsensitiveLookup) {
                std::runtime_error);
 }
 
-TEST(ExpressionTest, ColumnValueResultType) {
+TEST(ExpressionTest, ColumnValue_ResultType_InfersCorrectType) {
   std::vector<Column> cols{
       Column("i", ValueType::kInt64), Column("d", ValueType::kDouble),
       Column("s", ValueType::kVarChar), Column("dt", ValueType::kDate),
       Column("n", ValueType::kNull)};
   Schema sc("sc", cols);
+
   EXPECT_EQ(ColumnValueExp("i")->ResultType(sc).GetType(), TypeTag::kBigInt);
   EXPECT_EQ(ColumnValueExp("d")->ResultType(sc).GetType(), TypeTag::kDouble);
   EXPECT_EQ(ColumnValueExp("s")->ResultType(sc).GetType(), TypeTag::kVarChar);
@@ -1261,11 +1206,12 @@ TEST(ExpressionTest, ColumnValueResultType) {
   EXPECT_THROW(ColumnValueExp("zzz")->ResultType(sc), std::runtime_error);
 }
 
-TEST(ExpressionTest, ColumnValueTwoSchemaEvaluation) {
+TEST(ExpressionTest, ColumnValue_EvaluateWithTwoSchemas_ResolvesCorrectSchema) {
   Schema left_schema("l", {Column("a", ValueType::kInt64)});
   Schema right_schema("r", {Column("b", ValueType::kVarChar)});
   Row left_row({Value(1)});
   Row right_row({Value("two")});
+
   EXPECT_EQ(ColumnValueExp("a")
                 ->Evaluate(&left_row, left_schema, &right_row, right_schema),
             Value(1));
@@ -1283,23 +1229,27 @@ TEST(ExpressionTest, ColumnValueTwoSchemaEvaluation) {
                std::runtime_error);
 }
 
-TEST(ExpressionTest, ColumnValueMisc) {
+TEST(ExpressionTest, ColumnValue_Accessors_ReturnExpectedProperties) {
   Expression column = ColumnValueExp("col");
+
   EXPECT_EQ(column->Type(), TypeTag::kColumnValue);
   EXPECT_EQ(column->TouchedColumns().size(), 1);
+
   auto& cv = column->AsColumnValue();
   cv.SetSchemaName("schema");
   EXPECT_EQ(cv.GetName(), "col");
   EXPECT_EQ(cv.ToString(), "schema.col");
   EXPECT_EQ(cv.GetColumnName().name, "col");
+
   std::ostringstream oss;
   column->Dump(oss);
   EXPECT_EQ(oss.str(), "schema.col");
 }
 
-TEST(ExpressionTest, UnaryMinusErrorsAndNull) {
+TEST(ExpressionTest, UnaryExpression_WithInvalidOrNullOperands_HandlesCorrectly) {
   Row row;
   Schema schema;
+
   EXPECT_TRUE(UnaryExpressionExp(ConstantValueExp(Value()),
                                  UnaryOperation::kMinus)
                   ->Evaluate(row, schema)
@@ -1320,9 +1270,10 @@ TEST(ExpressionTest, UnaryMinusErrorsAndNull) {
   EXPECT_EQ(EvaluateUnary(UnaryOperation::kNot, Value(true)), Value(false));
 }
 
-TEST(ExpressionTest, UnaryResultType) {
+TEST(ExpressionTest, UnaryExpression_ResultType_InfersCorrectType) {
   Schema schema("s", {Column("v", ValueType::kInt64),
                       Column("d", ValueType::kDouble)});
+
   EXPECT_EQ(UnaryExpressionExp(ColumnValueExp("v"), UnaryOperation::kIsNull)
                 ->ResultType(schema)
                 .GetType(),
@@ -1346,21 +1297,25 @@ TEST(ExpressionTest, UnaryResultType) {
             TypeTag::kDouble);
 }
 
-TEST(ExpressionTest, UnaryToStringAndDump) {
+TEST(ExpressionTest, UnaryExpression_Inspect_ReturnsStringAndDump) {
   Row row;
   Schema schema;
   Expression minus = UnaryExpressionExp(ColumnValueExp("x"),
                                         UnaryOperation::kMinus);
   Expression not_exp = UnaryExpressionExp(ColumnValueExp("x"),
                                           UnaryOperation::kNot);
+
   EXPECT_EQ(minus->ToString(), "(-x)");
   EXPECT_EQ(not_exp->ToString(), "(NOT x)");
+
   std::ostringstream oss;
   minus->Dump(oss);
   EXPECT_EQ(oss.str(), "(-x)");
+
   std::ostringstream oss2;
   not_exp->Dump(oss2);
   EXPECT_EQ(oss2.str(), "(NOT x)");
+
   EXPECT_EQ(minus->Type(), TypeTag::kUnaryExp);
   EXPECT_EQ(minus->TouchedColumns().size(), 1);
   EXPECT_EQ(minus->AsUnaryExpression().Op(), UnaryOperation::kMinus);
@@ -1374,38 +1329,48 @@ TEST(ExpressionTest, UnaryToStringAndDump) {
             Value(-7));
 }
 
-TEST(ExpressionTest, ExpressionBaseCasts) {
+TEST(ExpressionTest, ExpressionBase_DynamicCasts_CastSuccessfully) {
   Expression column = ColumnValueExp("c");
   EXPECT_NO_THROW((void)column->AsColumnValue());
+
   Expression binary = BinaryExpressionExp(ConstantValueExp(Value(1)),
                                           BinaryOperation::kAdd,
                                           ConstantValueExp(Value(2)));
   EXPECT_NO_THROW((void)binary->AsBinaryExpression());
+
   Expression constant = ConstantValueExp(Value(1));
   EXPECT_NO_THROW((void)constant->AsConstantValue());
+
   Expression unary = UnaryExpressionExp(constant, UnaryOperation::kNot);
   EXPECT_NO_THROW((void)unary->AsUnaryExpression());
+
   Expression aggregate =
       AggregateExpressionExp(AggregationType::kCount, constant);
   EXPECT_NO_THROW((void)aggregate->AsAggregateExpression());
+
   Expression case_exp = CaseExpressionExp(
       {{ConstantValueExp(Value(true)), constant}}, constant);
   EXPECT_NO_THROW((void)case_exp->AsCaseExpression());
+
   Expression in = InExpressionExp(constant, {constant});
   EXPECT_NO_THROW((void)in->AsInExpression());
+
   Expression func = FunctionCallExp("coalesce", {constant});
   EXPECT_NO_THROW((void)func->AsFunctionCallExpression());
+
   Expression interval = IntervalExpressionExp(1, "day");
   EXPECT_NO_THROW((void)interval->AsIntervalExpression());
+
   Expression query = QueryExpressionExp(
       std::shared_ptr<SelectStatement>(), constant);
   EXPECT_NO_THROW((void)query->AsQueryExpression());
 }
 
-TEST(ExpressionTest, BaseClassDefaultsThrow) {
+TEST(ExpressionTest, ExpressionBase_DefaultImplementations_ThrowRuntimeError) {
   BareExpression bare;
   Row row;
   Schema schema;
+
   EXPECT_THROW((void)bare.Evaluate(&row, schema, &row, schema),
                std::runtime_error);
   EXPECT_THROW((void)bare.ResultType(schema), std::runtime_error);
@@ -1413,27 +1378,27 @@ TEST(ExpressionTest, BaseClassDefaultsThrow) {
   EXPECT_EQ(bare.TouchedColumns().size(), 0);
 }
 
-TEST(ExpressionTest, NamedExpressionStreaming) {
+TEST(ExpressionTest, NamedExpression_OutputOperator_StreamsExpectedFormat) {
   std::ostringstream with_alias;
   with_alias << NamedExpression("alias", ConstantValueExp(Value(1)));
   EXPECT_EQ(with_alias.str(), "1 AS alias");
+
   std::ostringstream no_alias;
   no_alias << NamedExpression(std::string_view(""), ConstantValueExp(Value(1)));
   EXPECT_EQ(no_alias.str(), "1");
+
   std::ostringstream same_as_expr;
   same_as_expr << NamedExpression("1", ConstantValueExp(Value(1)));
   EXPECT_EQ(same_as_expr.str(), "1");
 }
 
-TEST(ExpressionTest, FunctionCallTwoRowEvaluate) {
+TEST(ExpressionTest, FunctionCall_EvaluateWithTwoRows_ResolvesBothRows) {
   Schema left("", {Column("x", ValueType::kVarChar),
                    Column("b", ValueType::kInt64)});
   Row left_row({Value("hello"), Value(2)});
   Schema right("", {Column("d", ValueType::kVarChar)});
   Row right_row({Value("1996-07-15")});
 
-  // Act -- evaluate each registered function through the left/right overload
-  // Assert -- the right row supplies columns missing from the left row
   EXPECT_EQ(FunctionCallExp("coalesce",
                             {ColumnValueExp("d"), ColumnValueExp("x")})
                 ->Evaluate(&left_row, left, &right_row, right),
@@ -1441,7 +1406,6 @@ TEST(ExpressionTest, FunctionCallTwoRowEvaluate) {
   EXPECT_EQ(FunctionCallExp("extract_day", {ColumnValueExp("d")})
                 ->Evaluate(&left_row, left, &right_row, right),
             Value(15));
-  // Assert -- columns present on the left row are read from there
   EXPECT_EQ(FunctionCallExp("substr",
                             {ColumnValueExp("x"), ColumnValueExp("b")})
                 ->Evaluate(&left_row, left, &right_row, right),
@@ -1456,19 +1420,16 @@ TEST(ExpressionTest, FunctionCallTwoRowEvaluate) {
             ValueType::kVarChar);
 }
 
-TEST(ExpressionTest, FunctionCallResultTypeTwoSchemas) {
+TEST(ExpressionTest, FunctionCall_ResultTypeWithTwoSchemas_InfersCorrectType) {
   Schema left("", {Column("i", ValueType::kInt64),
                    Column("v", ValueType::kVarChar)});
   Schema right("", {Column("v", ValueType::kVarChar)});
 
-  // Act -- resolve result types through the left/right schema overload
-  // Assert -- coalesce follows the first argument's type
   EXPECT_EQ(FunctionCallExp("coalesce",
                             {ColumnValueExp("i"), ColumnValueExp("v")})
                 ->ResultType(left, right)
                 .GetType(),
             TypeTag::kBigInt);
-  // Assert -- string-producing functions are always varchar
   EXPECT_EQ(FunctionCallExp("concat", {})->ResultType(left, right).GetType(),
             TypeTag::kVarChar);
   EXPECT_EQ(FunctionCallExp("substr", {})->ResultType(left, right).GetType(),
@@ -1479,7 +1440,6 @@ TEST(ExpressionTest, FunctionCallResultTypeTwoSchemas) {
                 ->ResultType(left, right)
                 .GetType(),
             TypeTag::kVarChar);
-  // Assert -- date_add/date_sub follow their date argument
   EXPECT_EQ(FunctionCallExp("date_add", {ColumnValueExp("v"),
                                          IntervalExpressionExp(1, "day")})
                 ->ResultType(left, right)
@@ -1490,57 +1450,50 @@ TEST(ExpressionTest, FunctionCallResultTypeTwoSchemas) {
                 ->ResultType(left, right)
                 .GetType(),
             TypeTag::kBigInt);
-  // Assert -- extract_* functions resolve to bigint
   EXPECT_EQ(FunctionCallExp("extract_month", {ColumnValueExp("v")})
                 ->ResultType(left, right)
                 .GetType(),
             TypeTag::kBigInt);
-  // Assert -- an unknown function resolves to varchar in the two-schema variant
   EXPECT_EQ(FunctionCallExp("unknown_func", {})->ResultType(left, right).GetType(),
             TypeTag::kVarChar);
 }
 
-TEST(ExpressionTest, FunctionCallNestedTouchedAndToString) {
+TEST(ExpressionTest, FunctionCall_WithNestedFunctions_TouchesAllColumnsAndRendersString) {
   Row row;
   Schema schema;
 
-  // Act -- nest a function call inside another and render it
   Expression nested = FunctionCallExp(
       "concat",
       {FunctionCallExp("substr", {ConstantValueExp(Value("hello")),
                                   ConstantValueExp(Value(2))}),
        ConstantValueExp(Value("!"))});
-  // Assert -- nested evaluation and a multi-argument ToString/Dump
+
   EXPECT_EQ(nested->Evaluate(row, schema), Value("ello!"));
   EXPECT_EQ(nested->ToString(), "concat(substr(\"hello\", 2), \"!\")");
+
   std::ostringstream oss;
   nested->Dump(oss);
   EXPECT_EQ(oss.str(), "concat(substr(\"hello\", 2), \"!\")");
 
-  // Assert -- three-argument separators in ToString
   Expression substring3 = FunctionCallExp(
       "substring", {ConstantValueExp(Value("hello")),
                     ConstantValueExp(Value(2)), ConstantValueExp(Value(3))});
   EXPECT_EQ(substring3->ToString(), "substring(\"hello\", 2, 3)");
 
-  // Act -- a function whose arguments are themselves functions and columns
   Expression columns = FunctionCallExp(
       "coalesce",
       {ColumnValueExp("a"),
        FunctionCallExp("substr", {ColumnValueExp("b"),
                                   ConstantValueExp(Value(1))})});
-  // Assert -- touched columns merge from every nested argument
+
   EXPECT_EQ(columns->TouchedColumns().size(), 2);
   EXPECT_EQ(columns->Type(), TypeTag::kFunctionCallExp);
 }
 
-TEST(ExpressionTest, FunctionCallDateAddSubTwoRowEvaluateThrows) {
+TEST(ExpressionTest, FunctionCall_DateAddSubWithInvalidArgs_ThrowsRuntimeError) {
   Row row;
   Schema schema;
 
-  // Act + Assert -- the 4-argument Evaluate overload must reject DATE_ADD
-  // calls whose second argument is not an INTERVAL, just like the 2-argument
-  // overload.
   EXPECT_THROW(FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01")),
                                             ConstantValueExp(Value(1))})
                    ->Evaluate(&row, schema, &row, schema),
@@ -1548,15 +1501,12 @@ TEST(ExpressionTest, FunctionCallDateAddSubTwoRowEvaluateThrows) {
   EXPECT_THROW(FunctionCallExp("date_add", {ConstantValueExp(Value("1994-01-01"))})
                    ->Evaluate(&row, schema, &row, schema),
                std::runtime_error);
-  // Act + Assert -- the same validation applies to DATE_SUB.
   EXPECT_THROW(FunctionCallExp("date_sub", {ConstantValueExp(Value("1998-12-01")),
                                             ConstantValueExp(Value(1))})
                    ->Evaluate(&row, schema, &row, schema),
                std::runtime_error);
 }
 
-// Fake EvaluationContext: lets expression nodes be unit-tested without a
-// Database (the headline goal of improvement3.md A1/S3).
 class FakeEvaluationContext : public EvaluationContext {
  public:
   FakeEvaluationContext() = default;
@@ -1579,11 +1529,8 @@ class FakeEvaluationContext : public EvaluationContext {
     return registration_status;
   }
 
-  // Recorded interactions.
   std::vector<std::pair<std::string, int>> registered;
   int subquery_calls_{0};
-
-  // Scriptable behaviour.
   Status registration_status = Status::kSuccess;
 
  private:
@@ -1591,30 +1538,24 @@ class FakeEvaluationContext : public EvaluationContext {
   size_t next_result_{0};
 };
 
-TEST(ExpressionTest, FunctionCallValidateRegistersThroughEvaluationContext) {
-  // Arrange -- no database involved any more; the context records the
-  // GetOrAddFunction calls (improvement3.md A1).
+TEST(ExpressionTest, FunctionCall_Validate_RegistersThroughEvaluationContext) {
   Schema schema("s", {Column("a", ValueType::kVarChar)});
   Expression concat =
       FunctionCallExp("concat", {ColumnValueExp("a"), ConstantValueExp(Value("x"))});
 
   FakeEvaluationContext ctx;
-  // Act + Assert -- validating registers the function signature exactly once
-  // per Validate call, through the abstract context only.
   EXPECT_EQ(concat->Validate(ctx, schema), Status::kSuccess);
   EXPECT_EQ(concat->Validate(ctx, schema), Status::kSuccess);
   ASSERT_EQ(ctx.registered.size(), 2U);
   EXPECT_EQ(ctx.registered[0], std::make_pair(std::string("concat"), 2));
   EXPECT_EQ(ctx.registered[1], std::make_pair(std::string("concat"), 2));
 
-  // Act + Assert -- a failing registration propagates out of Validate.
   FakeEvaluationContext failing_ctx;
   failing_ctx.registration_status = Status::kNotExists;
   Expression custom = FunctionCallExp("my_udf", {ConstantValueExp(Value(1))});
   EXPECT_EQ(custom->Validate(failing_ctx, schema), Status::kNotExists);
   EXPECT_EQ(failing_ctx.registered.size(), 1U);
 
-  // Act + Assert -- argument failures short-circuit before registration.
   FakeEvaluationContext arg_ctx;
   arg_ctx.registration_status = Status::kSuccess;
   Expression nested = FunctionCallExp(
@@ -1625,16 +1566,13 @@ TEST(ExpressionTest, FunctionCallValidateRegistersThroughEvaluationContext) {
   EXPECT_EQ(arg_ctx.registered[1], std::make_pair(std::string("concat"), 2));
 }
 
-TEST(ExpressionTest, QueryExpressionEvaluatesThroughEvaluationContext) {
-  // Arrange -- a fake context scripts the subquery projection so the three
-  // subquery shapes are covered without any executor involvement.
+TEST(ExpressionTest, QueryExpression_EvaluateWithContext_ExecutesSubquery) {
   Schema schema("s", {Column("i", ValueType::kInt64)});
   Row row({Value(int64_t{7})});
   auto statement = std::make_shared<SelectStatement>(
       std::vector<NamedExpression>{NamedExpression("v")}, std::vector<std::string>{"t"},
       nullptr);
 
-  // EXISTS / NOT EXISTS over an empty and a non-empty projection.
   FakeEvaluationContext empty_ctx;
   const Expression exists_empty =
       QueryExpressionExp(statement, nullptr, true, false);
@@ -1653,14 +1591,12 @@ TEST(ExpressionTest, QueryExpressionEvaluatesThroughEvaluationContext) {
       QueryExpressionExp(statement, nullptr, true, true);
   EXPECT_EQ(not_exists->Evaluate(row, schema, filled_ctx), Value(false));
 
-  // Scalar subquery: first row wins, empty projection yields NULL.
   FakeEvaluationContext scalar_ctx({{Value(int64_t{42})}});
   const Expression scalar =
       QueryExpressionExp(statement, nullptr, false, false);
   EXPECT_EQ(scalar->Evaluate(row, schema, scalar_ctx), Value(int64_t{42}));
   EXPECT_EQ(scalar->Evaluate(row, schema, empty_ctx), Value());
 
-  // IN subquery with SQL three-valued membership.
   const Expression in_subquery = QueryExpressionExp(
       statement, ConstantValueExp(Value(int64_t{7})), false, false);
   FakeEvaluationContext hit_ctx({{Value(int64_t{7}), Value()}});
@@ -1678,18 +1614,15 @@ TEST(ExpressionTest, QueryExpressionEvaluatesThroughEvaluationContext) {
       statement, ConstantValueExp(Value()), false, false);
   FakeEvaluationContext fresh_ctx({{Value(int64_t{1})}});
   EXPECT_EQ(null_test_subquery->Evaluate(row, schema, fresh_ctx), Value());
-  // NOT IN over a NULL-containing projection stays UNKNOWN (three-valued).
+
   const Expression not_in_subquery = QueryExpressionExp(
       statement, ConstantValueExp(Value(int64_t{8})), false, true);
   EXPECT_EQ(not_in_subquery->Evaluate(row, schema, null_list_ctx), Value());
-  // NOT IN over a NULL-free miss is TRUE.
   EXPECT_EQ(not_in_subquery->Evaluate(row, schema, plain_miss_ctx),
             Value(true));
 }
 
-TEST(ExpressionTest, ContextAwareEvaluationMatchesPlainEvaluator) {
-  // Arrange -- migrated node types must agree between the plain and the
-  // context-aware overloads when no subquery is involved.
+TEST(ExpressionTest, Expression_EvaluateWithContext_MatchesPlainEvaluator) {
   Schema schema("s", {Column("i", ValueType::kInt64)});
   Row row({Value(int64_t{5})});
   FakeEvaluationContext ctx;
@@ -1712,7 +1645,6 @@ TEST(ExpressionTest, ContextAwareEvaluationMatchesPlainEvaluator) {
       FunctionCallExp("substr", {ConstantValueExp(Value("hello")),
                                  ConstantValueExp(Value(int64_t{2}))});
 
-  // Act + Assert.
   EXPECT_EQ(binary->Evaluate(row, schema, ctx), binary->Evaluate(row, schema));
   EXPECT_EQ(negated->Evaluate(row, schema, ctx), negated->Evaluate(row, schema));
   EXPECT_EQ(case_expr->Evaluate(row, schema, ctx),
@@ -1721,7 +1653,7 @@ TEST(ExpressionTest, ContextAwareEvaluationMatchesPlainEvaluator) {
   EXPECT_EQ(call->Evaluate(row, schema, ctx), call->Evaluate(row, schema));
 }
 
-TEST(ExpressionTest, CastExpressionCoverage) {
+TEST(ExpressionTest, CastExpression_EvaluateAndResultType_HandlesTimestamps) {
   Row dummy({});
   Schema dummy_schema;
 
@@ -1750,7 +1682,7 @@ TEST(ExpressionTest, CastExpressionCoverage) {
   EXPECT_FALSE(ts_cast->ToString().empty());
 }
 
-TEST(ExpressionTest, BinaryExpressionCoverage) {
+TEST(ExpressionTest, BinaryExpression_SpecialOperations_EvaluatesCorrectly) {
   Row dummy({});
   Schema dummy_schema;
 
@@ -1805,7 +1737,7 @@ TEST(ExpressionTest, BinaryExpressionCoverage) {
   EXPECT_EQ(or_short->Evaluate(&dummy, dummy_schema, &dummy, dummy_schema), Value(true));
 }
 
-TEST(ExpressionTest, ArrayExpressionCoverage) {
+TEST(ExpressionTest, ArrayExpression_EvaluateAndResultType_HandlesVariousTypes) {
   Row dummy({});
   Schema dummy_schema;
 
@@ -1855,7 +1787,7 @@ TEST(ExpressionTest, ArrayExpressionCoverage) {
   EXPECT_FALSE(arr_str->ToString().empty());
 }
 
-TEST(ExpressionTest, WindowFunctionExpressionCoverage) {
+TEST(ExpressionTest, WindowFunctionExpression_EvaluateAndInspect_ThrowsOnEvaluateAndRenders) {
   auto node = std::make_shared<WindowFunctionCallExpression>();
   node->function = "SUM";
   node->args = {ColumnValueExp("x")};
@@ -1878,7 +1810,7 @@ TEST(ExpressionTest, WindowFunctionExpressionCoverage) {
   EXPECT_NE(s.find("UNBOUNDED FOLLOWING"), std::string::npos);
 }
 
-TEST(ExpressionTest, FunctionCallExpressionCoverage) {
+TEST(ExpressionTest, FunctionCall_VariousBuiltinFunctions_EvaluatesCorrectly) {
   Row dummy({});
   Schema dummy_schema;
 
@@ -1925,7 +1857,7 @@ TEST(ExpressionTest, FunctionCallExpressionCoverage) {
             Value("2023-06-15 10:00:00+00"));
 }
 
-TEST(ExpressionTest, CaseExpressionTwoRowAndUnifiedType) {
+TEST(ExpressionTest, CaseExpression_WithTwoRowsAndUnifiedType_EvaluatesAndInfersType) {
   Schema left_schema("L", {Column("a", ValueType::kInt64)});
   Schema right_schema("R", {Column("b", ValueType::kInt64)});
   Row left_row({Value(int64_t{10})});
@@ -1940,7 +1872,6 @@ TEST(ExpressionTest, CaseExpressionTwoRowAndUnifiedType) {
   EXPECT_EQ(case_exp.Evaluate(&left_row, left_schema, &right_row, right_schema),
             Value(int64_t{20}));
 
-  // Disagreeing branch types
   CaseExpression case_mismatch(
       {std::make_pair(ConstantValueExp(Value(true)),
                       ConstantValueExp(Value(int64_t{1})))},
@@ -1948,12 +1879,11 @@ TEST(ExpressionTest, CaseExpressionTwoRowAndUnifiedType) {
   EXPECT_EQ(case_mismatch.ResultType(left_schema).GetType(), TypeTag::kInvalid);
   EXPECT_EQ(case_mismatch.ResultType(left_schema, right_schema).GetType(), TypeTag::kInvalid);
 
-  // Empty when clauses
   CaseExpression case_empty({}, nullptr);
   EXPECT_EQ(case_empty.ResultType(left_schema).GetType(), TypeTag::kInvalid);
 }
 
-TEST(ExpressionTest, InExpressionTwoRowEvaluation) {
+TEST(ExpressionTest, InExpression_EvaluateWithTwoRows_EvaluatesCorrectly) {
   Schema left_schema("L", {Column("a", ValueType::kInt64)});
   Schema right_schema("R", {Column("b", ValueType::kInt64)});
   Row left_row({Value(int64_t{10})});
@@ -1969,8 +1899,90 @@ TEST(ExpressionTest, InExpressionTwoRowEvaluation) {
             Value(false));
 }
 
+TEST(ExpressionTest, Expression_PathologicalPatterns_EvaluatesCorrectly) {
+  Row dummy({});
+  Schema dummy_schema;
+
+  Expression current = ConstantValueExp(Value(int64_t{1}));
+  for (int i = 0; i < 30; ++i) {
+    current = BinaryExpressionExp(std::move(current), BinaryOperation::kAdd,
+                                  ConstantValueExp(Value(int64_t{1})));
+  }
+  EXPECT_EQ(current->Evaluate(dummy, dummy_schema), Value(int64_t{31}));
+
+  double nan_val = std::numeric_limits<double>::quiet_NaN();
+  double inf_val = std::numeric_limits<double>::infinity();
+  double min_subnormal = std::numeric_limits<double>::denorm_min();
+
+  Expression exp_nan_cmp = BinaryExpressionExp(
+      ConstantValueExp(Value(nan_val)), BinaryOperation::kEquals,
+      ConstantValueExp(Value(nan_val)));
+  EXPECT_EQ(exp_nan_cmp->Evaluate(dummy, dummy_schema), Value(int64_t{0}));
+
+  Expression exp_inf_arith = BinaryExpressionExp(
+      ConstantValueExp(Value(inf_val)), BinaryOperation::kSubtract,
+      ConstantValueExp(Value(1e300)));
+  Value inf_res = exp_inf_arith->Evaluate(dummy, dummy_schema);
+  EXPECT_EQ(inf_res.type, ValueType::kDouble);
+  EXPECT_TRUE(std::isinf(inf_res.value.double_value));
+  EXPECT_GT(inf_res.value.double_value, 0.0);
+
+  Expression exp_inf_minus_inf = BinaryExpressionExp(
+      ConstantValueExp(Value(inf_val)), BinaryOperation::kSubtract,
+      ConstantValueExp(Value(inf_val)));
+  Value nan_res = exp_inf_minus_inf->Evaluate(dummy, dummy_schema);
+  EXPECT_EQ(nan_res.type, ValueType::kDouble);
+  EXPECT_TRUE(std::isnan(nan_res.value.double_value));
+
+  Expression exp_subnorm = BinaryExpressionExp(
+      ConstantValueExp(Value(min_subnormal)), BinaryOperation::kMultiply,
+      ConstantValueExp(Value(2.0)));
+  EXPECT_EQ(exp_subnorm->Evaluate(dummy, dummy_schema), Value(min_subnormal * 2.0));
+
+  int64_t int_min = std::numeric_limits<int64_t>::min();
+  int64_t int_max = std::numeric_limits<int64_t>::max();
+
+  Expression exp_int_min_plus_zero = BinaryExpressionExp(
+      ConstantValueExp(Value(int_min)), BinaryOperation::kAdd,
+      ConstantValueExp(Value(int64_t{0})));
+  EXPECT_EQ(exp_int_min_plus_zero->Evaluate(dummy, dummy_schema), Value(int_min));
+
+  Expression exp_int_max_minus_zero = BinaryExpressionExp(
+      ConstantValueExp(Value(int_max)), BinaryOperation::kSubtract,
+      ConstantValueExp(Value(int64_t{0})));
+  EXPECT_EQ(exp_int_max_minus_zero->Evaluate(dummy, dummy_schema), Value(int_max));
+
+  Expression case_safe = CaseExpressionExp(
+      {{ConstantValueExp(Value(true)), ConstantValueExp(Value(int64_t{42}))}},
+      BinaryExpressionExp(ConstantValueExp(Value(int64_t{1})),
+                          BinaryOperation::kDivide,
+                          ConstantValueExp(Value(int64_t{0}))));
+  EXPECT_EQ(case_safe->Evaluate(dummy, dummy_schema), Value(int64_t{42}));
+
+  Expression and_safe = BinaryExpressionExp(
+      ConstantValueExp(Value(false)), BinaryOperation::kAnd,
+      BinaryExpressionExp(ConstantValueExp(Value(int64_t{10})),
+                          BinaryOperation::kDivide,
+                          ConstantValueExp(Value(int64_t{0}))));
+  EXPECT_EQ(and_safe->Evaluate(dummy, dummy_schema), Value(false));
+
+  Expression or_safe = BinaryExpressionExp(
+      ConstantValueExp(Value(true)), BinaryOperation::kOr,
+      BinaryExpressionExp(ConstantValueExp(Value(int64_t{10})),
+                          BinaryOperation::kDivide,
+                          ConstantValueExp(Value(int64_t{0}))));
+  EXPECT_EQ(or_safe->Evaluate(dummy, dummy_schema), Value(true));
+
+  Expression mixed_eq = BinaryExpressionExp(
+      ConstantValueExp(Value("123")), BinaryOperation::kEquals,
+      ConstantValueExp(Value("123")));
+  EXPECT_EQ(mixed_eq->Evaluate(dummy, dummy_schema), Value(int64_t{1}));
+
+  Expression unary_chain = ConstantValueExp(Value(int64_t{7}));
+  for (int i = 0; i < 10; ++i) {
+    unary_chain = UnaryExpressionExp(std::move(unary_chain), UnaryOperation::kMinus);
+  }
+  EXPECT_EQ(unary_chain->Evaluate(dummy, dummy_schema), Value(int64_t{7}));
+}
+
 }  // namespace tinylamb
-
-
-
-

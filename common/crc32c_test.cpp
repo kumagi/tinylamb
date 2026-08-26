@@ -20,13 +20,18 @@
 
 namespace tinylamb {
 
-TEST(Crc32CTest, EmptyIsZero) {
-  EXPECT_EQ(Crc32C(nullptr, 0), 0U);
+TEST(Crc32CTest, Crc32C_WhenDataEmpty_ReturnsZero) {
+  const uint32_t crc = Crc32C(nullptr, 0);
+
+  EXPECT_EQ(crc, 0U);
 }
 
-TEST(Crc32CTest, KnownVector123456789) {
+TEST(Crc32CTest, Crc32C_WithKnownAsciiVector_ComputesExpectedChecksum) {
   const char* data = "123456789";
-  EXPECT_EQ(Crc32C(data, 9), 0xe3069283U);
+
+  const uint32_t crc = Crc32C(data, 9);
+
+  EXPECT_EQ(crc, 0xe3069283U);
 }
 
 }  // namespace tinylamb

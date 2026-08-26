@@ -49,9 +49,14 @@ class ProjectionPlan : public PlanBase {
 
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
-  [[nodiscard]] bool IsOrderedBy(const std::vector<Expression>& expressions,
-                                 const std::vector<bool>& ascending) const override {
-    return src_->IsOrderedBy(expressions, ascending);
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending) const override;
+  // A projection transforms values but never adds or removes rows, so a
+  // limit below it still shapes the final output exactly.
+  [[nodiscard]] bool EnforcesLimit(size_t limit_count,
+                                   size_t limit_offset) const override {
+    return src_->EnforcesLimit(limit_count, limit_offset);
   }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;

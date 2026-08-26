@@ -16,8 +16,10 @@
 
 #include "full_scan_plan.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
+#include <limits>
 #include <ostream>
 #include <string>
 
@@ -28,25 +30,39 @@
 
 namespace tinylamb {
 
-FullScanPlan::FullScanPlan(const Table& table, const TableStatistics& stats)
-    : table_(table), stats_(stats) {}
+FullScanPlan::FullScanPlan(const Table& table, const TableStatistics& stats,
+                           size_t max_rows)
+    : table_(table), stats_(stats), max_rows_(max_rows) {}
 
 // EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
 
 const Schema& FullScanPlan::GetSchema() const { return table_.GetSchema(); }
 
-size_t FullScanPlan::AccessRowCount() const { return stats_.Rows(); }
+size_t FullScanPlan::AccessRowCount() const {
+  return std::min(stats_.Rows(), max_rows_);
+}
 
-size_t FullScanPlan::EmitRowCount() const { return stats_.Rows(); }
+size_t FullScanPlan::EmitRowCount() const {
+  return std::min(stats_.Rows(), max_rows_);
+}
 
 void FullScanPlan::Dump(std::ostream& o, int /*indent*/) const {
   o << "FullScan: " << table_.GetSchema().Name()
-    << "(estimated cost: " << AccessRowCount() << ")";
+    << "(estimated cost: " << AccessRowCount();
+  if (max_rows_ != std::numeric_limits<size_t>::max()) {
+    o << ", max rows: " << max_rows_;
+  }
+  o << ")";
 }
 
 std::string FullScanPlan::ToString() const {
-  return "FullScan: " + std::string(table_.GetSchema().Name()) +
-         "(estimated cost: " + std::to_string(AccessRowCount()) + ")";
+  std::string result = "FullScan: " + std::string(table_.GetSchema().Name()) +
+                       "(estimated cost: " +
+                       std::to_string(AccessRowCount());
+  if (max_rows_ != std::numeric_limits<size_t>::max()) {
+    result += ", max rows: " + std::to_string(max_rows_);
+  }
+  return result + ")";
 }
 
 }  // namespace tinylamb

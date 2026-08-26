@@ -1,69 +1,67 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
-#ifndef TINYLAMB_TOPN_PLAN_HPP
-#define TINYLAMB_TOPN_PLAN_HPP
+#ifndef TINYLAMB_PLAN_TOPN_PLAN_HPP
+#define TINYLAMB_PLAN_TOPN_PLAN_HPP
 
-#include <cstddef>
+#include <optional>
+#include <utility>
 #include <vector>
 
-#include "expression/expression.hpp"
 #include "plan/plan.hpp"
-#include "table/table_statistics.hpp"
 
 namespace tinylamb {
 
-// Physical Top-N: efficient k-row output for ORDER BY LIMIT queries where k
-// is small.  Internally uses a heap to avoid materializing the full sorted
-// result.  Falls back to a full sort when the child delivers more than a
-// threshold number of rows.
-//
-// Enforces limit semantics: at most limit_count rows are emitted after
-// skipping limit_offset rows.
+struct TopNKey {
+  Expression expression;
+  bool ascending{true};
+  std::optional<bool> nulls_first;
+};
+
 class TopNPlan final : public PlanBase {
  public:
-  TopNPlan(Plan src, std::vector<Expression> keys,
-           std::vector<bool> ascending, size_t limit_count,
-           size_t limit_offset)
-      : src_(std::move(src)),
+  TopNPlan(Plan child, std::vector<TopNKey> keys, size_t limit, size_t offset,
+           bool with_ties = false)
+      : child_(std::move(child)),
         keys_(std::move(keys)),
-        ascending_(std::move(ascending)),
-        limit_count_(limit_count),
-        limit_offset_(limit_offset) {}
-  TopNPlan(const TopNPlan&) = delete;
-  TopNPlan(TopNPlan&&) = delete;
-  TopNPlan& operator=(const TopNPlan&) = delete;
-  TopNPlan& operator=(TopNPlan&&) = delete;
-  ~TopNPlan() override = default;
+        limit_(limit),
+        offset_(offset),
+        with_ties_(with_ties) {}
 
-  Executor EmitExecutor(TransactionContext& ctx) const override;
-
+  Executor EmitExecutor(TransactionContext& context) const override;
   [[nodiscard]] const Table* ScanSource() const override {
-    return src_->ScanSource();
+    return child_->ScanSource();
   }
-  [[nodiscard]] const Schema& GetSchema() const override;
   [[nodiscard]] const TableStatistics& GetStats() const override {
-    return src_->GetStats();
+    return child_->GetStats();
   }
-  [[nodiscard]] size_t AccessRowCount() const override;
+  [[nodiscard]] const Schema& GetSchema() const override {
+    return child_->GetSchema();
+  }
+  [[nodiscard]] size_t AccessRowCount() const override {
+    return child_->AccessRowCount();
+  }
   [[nodiscard]] size_t EmitRowCount() const override;
-  // The Top-N output is always ordered by our sort keys.
-  [[nodiscard]] bool IsOrderedBy(const std::vector<Expression>& expressions,
-                                 const std::vector<bool>& ascending) const override;
-  // TopN enforces its own limit.
-  [[nodiscard]] bool EnforcesLimit(size_t limit_count,
-                                   size_t limit_offset) const override {
-    return limit_count_ == limit_count && limit_offset_ == limit_offset;
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending) const override;
+  [[nodiscard]] bool EnforcesLimit(size_t limit, size_t offset) const override {
+    return !with_ties_ && limit == limit_ && offset == offset_;
   }
-  void Dump(std::ostream& o, int indent) const override;
+  [[nodiscard]] const Plan& Child() const { return child_; }
+  [[nodiscard]] const std::vector<TopNKey>& Keys() const { return keys_; }
+  [[nodiscard]] size_t Limit() const { return limit_; }
+  [[nodiscard]] size_t Offset() const { return offset_; }
+  [[nodiscard]] bool WithTies() const { return with_ties_; }
+  void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
  private:
-  Plan src_;
-  std::vector<Expression> keys_;
-  std::vector<bool> ascending_;
-  size_t limit_count_;
-  size_t limit_offset_;
+  Plan child_;
+  std::vector<TopNKey> keys_;
+  size_t limit_{0};
+  size_t offset_{0};
+  bool with_ties_{false};
 };
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_TOPN_PLAN_HPP
+#endif  // TINYLAMB_PLAN_TOPN_PLAN_HPP

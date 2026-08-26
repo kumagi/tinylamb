@@ -57,6 +57,7 @@ class RelationalExecutor : public ExecutorBase {
   size_t scan_output_rows_{0};
   size_t scan_values_decoded_{0};
   size_t scan_values_available_{0};
+  size_t exists_short_circuit_queries_{0};
 };
 
 }  // namespace tinylamb

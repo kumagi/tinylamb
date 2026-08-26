@@ -18,6 +18,7 @@
 #include "expression/named_expression.hpp"
 #include "plan/plan.hpp"
 #include "type/column_name.hpp"
+#include "type/row.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -36,24 +37,31 @@ constexpr GroupId kInvalidGroup = static_cast<GroupId>(-1);
 enum class LogicalOperator {
   kScan,
   kJoin,
+  kOuterJoin,
+  kCrossJoin,
+  kSemiJoin,
+  kAntiJoin,
   kSelection,
   kProjection,
   kAggregation,
+  kSort,
+  kTopN,
+  kDistinct,
+  kMax1Row,
+  kUnion,
+  kUnionAll,
+  kIntersect,
+  kIntersectAll,
+  kExcept,
+  kExceptAll,
   kLimit,
-  kSort,       // Logical sort node (ORDER BY).
-  kTopN,       // ORDER BY + LIMIT combined (heap top-N).
-  kOuterJoin,  // LEFT / RIGHT / FULL outer join.
-  kCrossJoin,  // Cross join (no predicate, distinct from inner).
-  kDistinct,   // Duplicate elimination (SELECT DISTINCT).
+  kEmpty,
+  kValues,
+  kDummyScan,
   // Opaque relational IR (outer/semi/anti joins, subqueries and CTEs). The
   // memo can cost/select it while its internal lowering remains specialized.
   kRelational,
 };
-
-// Join semantics carried by a kJoin logical expression (D-payload). The
-// plan layer mirrors the executor's JoinKind because plan must not depend on
-// the executor header; implementation rules map the two at planning time.
-enum class LogicalJoinKind : uint8_t { kInner, kSemi, kAnti };
 
 // One logical expression inside a memo group. `predicate` carries the
 // Selection predicate or the Join condition; `target_list` carries the
@@ -66,14 +74,13 @@ struct LogicalExpression {
   std::string table{};
   std::optional<Expression> predicate{std::nullopt};
   std::vector<NamedExpression> target_list{};
+  std::vector<bool> sort_ascending{};
+  std::vector<std::optional<bool>> sort_nulls_first{};
+  std::vector<Row> values{};
   size_t limit_count{0};
   size_t limit_offset{0};
-  // Sort key expressions for kSort and kTopN.
-  std::vector<Expression> sort_expressions;
-  std::vector<bool> sort_ascending;
-  // Join semantics for kJoin / kOuterJoin expressions: semi/anti joins emit
-  // only the left child's rows and must never flow through inner-only rewrites.
-  LogicalJoinKind join_kind{LogicalJoinKind::kInner};
+  // Opaque JoinKind value for kOuterJoin (0 = LEFT, 1 = RIGHT, 2 = FULL).
+  uint8_t join_type{0};
   std::shared_ptr<const SelectStatement> relational_statement{};
   Schema output_schema{};
 
@@ -132,11 +139,6 @@ class Memo {
   // joins through this helper; it guarantees each conjunct is applied exactly
   // once on every root-to-leaf path.
   [[nodiscard]] LogicalExpression NewJoin(GroupId left, GroupId right) const;
-  // Semi/anti variant: same conjunct bookkeeping as NewJoin, but the payload
-  // records that only the left side survives. The condition still comes from
-  // the stored conjuncts so each one keeps being applied exactly once.
-  [[nodiscard]] LogicalExpression NewJoin(GroupId left, GroupId right,
-                                          LogicalJoinKind kind) const;
   // Merges `predicate` into a single-relation group's scan filter (used by
   // pushdown rules); idempotent through conjunct canonicalization.
   void MergeScanFilter(GroupId group, const Expression& predicate);
@@ -234,6 +236,30 @@ inline Pattern Join(Pattern left = Any(), Pattern right = Any(),
   return Pattern::Op(LogicalOperator::kJoin, std::move(children),
                      std::move(capture));
 }
+inline Pattern OuterJoin(Pattern left = Any(), Pattern right = Any(),
+                         std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kOuterJoin,
+                     {std::move(left), std::move(right)},
+                     std::move(capture));
+}
+inline Pattern CrossJoin(Pattern left = Any(), Pattern right = Any(),
+                         std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kCrossJoin,
+                     {std::move(left), std::move(right)},
+                     std::move(capture));
+}
+inline Pattern SemiJoin(Pattern left = Any(), Pattern right = Any(),
+                        std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kSemiJoin,
+                     {std::move(left), std::move(right)},
+                     std::move(capture));
+}
+inline Pattern AntiJoin(Pattern left = Any(), Pattern right = Any(),
+                        std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kAntiJoin,
+                     {std::move(left), std::move(right)},
+                     std::move(capture));
+}
 // Matches any Selection regardless of predicate content.
 inline Pattern Selection(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kSelection, {std::move(child)},
@@ -258,10 +284,6 @@ inline Pattern Aggregation(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kAggregation, {std::move(child)},
                      std::move(capture));
 }
-inline Pattern Limit(Pattern child = Any(), std::string capture = {}) {
-  return Pattern::Op(LogicalOperator::kLimit, {std::move(child)},
-                     std::move(capture));
-}
 inline Pattern Sort(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kSort, {std::move(child)},
                      std::move(capture));
@@ -270,16 +292,46 @@ inline Pattern TopN(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kTopN, {std::move(child)},
                      std::move(capture));
 }
+inline Pattern Values(std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kValues, {}, std::move(capture));
+}
+inline Pattern DummyScan(std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kDummyScan, {}, std::move(capture));
+}
 inline Pattern Distinct(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kDistinct, {std::move(child)},
                      std::move(capture));
 }
-inline Pattern OuterJoin(Pattern left = Any(), Pattern right = Any(),
-                         std::string capture = {}) {
-  std::vector<Pattern> children;
-  children.push_back(std::move(left));
-  children.push_back(std::move(right));
-  return Pattern::Op(LogicalOperator::kOuterJoin, std::move(children),
+inline Pattern Max1Row(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kMax1Row, {std::move(child)},
+                     std::move(capture));
+}
+// Set operations intentionally accept any arity; the SQL surface commonly
+// represents a chain as a single n-ary logical expression.
+inline Pattern Union(std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kUnion, {}, std::move(capture));
+}
+inline Pattern UnionAll(std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kUnionAll, {}, std::move(capture));
+}
+inline Pattern Intersect(std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kIntersect, {}, std::move(capture));
+}
+inline Pattern IntersectAll(std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kIntersectAll, {}, std::move(capture));
+}
+inline Pattern Except(std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kExcept, {}, std::move(capture));
+}
+inline Pattern ExceptAll(std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kExceptAll, {}, std::move(capture));
+}
+inline Pattern Empty(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kEmpty, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern Limit(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kLimit, {std::move(child)},
                      std::move(capture));
 }
 }  // namespace dsl

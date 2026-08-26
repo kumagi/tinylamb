@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <ostream>
 #include <stdexcept>
@@ -17,7 +18,9 @@
 
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
+#include "executor/constant_executor.hpp"
 #include "executor/cross_join.hpp"
+#include "executor/distinct.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/hash_join.hpp"
@@ -27,29 +30,42 @@
 #include "executor/index_scan.hpp"
 #include "executor/join_kind.hpp"
 #include "executor/limit.hpp"
+#include "executor/max1_row.hpp"
+#include "executor/merge_append.hpp"
+#include "executor/merge_join.hpp"
 #include "executor/parallel_aggregation.hpp"
 #include "executor/parallel_scan.hpp"
 #include "executor/projection.hpp"
 #include "executor/relational.hpp"
 #include "executor/selection.hpp"
+#include "executor/set_operation.hpp"
 #include "executor/sort.hpp"
+#include "executor/topn.hpp"
+#include "executor/values.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "index/index.hpp"
 #include "page/row_position.hpp"
 #include "plan/aggregation_plan.hpp"
+#include "plan/distinct_plan.hpp"
+#include "plan/empty_plan.hpp"
 #include "plan/full_scan_plan.hpp"
 #include "plan/index_only_scan_plan.hpp"
 #include "plan/index_scan_plan.hpp"
 #include "plan/limit_plan.hpp"
+#include "plan/max1_row_plan.hpp"
+#include "plan/merge_join_plan.hpp"
 #include "plan/parallel_thresholds.hpp"
 #include "plan/product_plan.hpp"
 #include "plan/projection_plan.hpp"
 #include "plan/relation_rename_plan.hpp"
 #include "plan/relational_plan.hpp"
 #include "plan/selection_plan.hpp"
+#include "plan/set_operation_plan.hpp"
+#include "plan/sort_distinct_plan.hpp"
 #include "plan/sort_plan.hpp"
 #include "plan/topn_plan.hpp"
+#include "plan/values_plan.hpp"
 #include "table/table.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -71,9 +87,7 @@ class RelationRenameExecutor final : public ExecutorBase {
         relation_(std::move(relation)),
         physical_(std::move(physical)) {}
 
-  bool Next(Row* dst, RowPosition* rp) override {
-    return src_->Next(dst, rp);
-  }
+  bool Next(Row* dst, RowPosition* rp) override { return src_->Next(dst, rp); }
   void Dump(std::ostream& o, int indent) const override;
 
  private:
@@ -89,10 +103,11 @@ void RelationRenameExecutor::Dump(std::ostream& o, int indent) const {
 }
 
 Executor FullScanPlan::EmitExecutor(TransactionContext& txn) const {
-  if (stats_.Rows() >= kParallelScanMinRows) {
+  if (MaxRows() == std::numeric_limits<size_t>::max() &&
+      stats_.Rows() >= kParallelScanMinRows) {
     return std::make_shared<ParallelScan>(txn.txn_, table_);
   }
-  return std::make_shared<FullScan>(txn.txn_, table_);
+  return std::make_shared<FullScan>(txn.txn_, table_, MaxRows());
 }
 
 Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -112,26 +127,70 @@ Executor LimitPlan::EmitExecutor(TransactionContext& ctx) const {
 
 Executor SortPlan::EmitExecutor(TransactionContext& ctx) const {
   std::vector<SortExecutor::Key> keys;
-  keys.reserve(keys_.size());
-  for (size_t i = 0; i < keys_.size(); ++i) {
-    keys.push_back(SortExecutor::Key{.expression = keys_[i],
-                                     .ascending = ascending_[i]});
+  keys.reserve(Keys().size());
+  for (const SortKey& key : Keys()) {
+    keys.push_back(
+        SortExecutor::Key{key.expression, key.ascending, key.nulls_first});
   }
-  return std::make_shared<SortExecutor>(src_->EmitExecutor(ctx),
-                                        src_->GetSchema(), std::move(keys));
+  return std::make_shared<SortExecutor>(Child()->EmitExecutor(ctx),
+                                        Child()->GetSchema(), std::move(keys));
 }
 
 Executor TopNPlan::EmitExecutor(TransactionContext& ctx) const {
-  std::vector<SortExecutor::Key> keys;
-  keys.reserve(keys_.size());
-  for (size_t i = 0; i < keys_.size(); ++i) {
-    keys.push_back(SortExecutor::Key{.expression = keys_[i],
-                                     .ascending = ascending_[i]});
+  std::vector<TopNExecutor::Key> keys;
+  keys.reserve(Keys().size());
+  for (const TopNKey& key : Keys()) {
+    keys.push_back(
+        TopNExecutor::Key{key.expression, key.ascending, key.nulls_first});
   }
-  Executor sorted = std::make_shared<SortExecutor>(
-      src_->EmitExecutor(ctx), src_->GetSchema(), std::move(keys));
-  return std::make_shared<LimitExecutor>(std::move(sorted), limit_count_,
-                                         limit_offset_);
+  return std::make_shared<TopNExecutor>(Child()->EmitExecutor(ctx),
+                                        Child()->GetSchema(), std::move(keys),
+                                        Limit(), Offset(), WithTies());
+}
+
+Executor DistinctPlan::EmitExecutor(TransactionContext& ctx) const {
+  return std::make_shared<DistinctExecutor>(child_->EmitExecutor(ctx));
+}
+
+Executor ValuesPlan::EmitExecutor(TransactionContext& /*ctx*/) const {
+  return std::make_shared<ValuesExecutor>(Rows());
+}
+
+Executor DummyScanPlan::EmitExecutor(TransactionContext& /*ctx*/) const {
+  return std::make_shared<ValuesExecutor>(std::vector<Row>{Row({})});
+}
+
+Executor SortDistinctPlan::EmitExecutor(TransactionContext& ctx) const {
+  return std::make_shared<SortDistinctExecutor>(Child()->EmitExecutor(ctx));
+}
+
+Executor Max1RowPlan::EmitExecutor(TransactionContext& ctx) const {
+  return std::make_shared<Max1RowExecutor>(child_->EmitExecutor(ctx));
+}
+
+Executor SetOperationPlan::EmitExecutor(TransactionContext& ctx) const {
+  std::vector<Executor> children;
+  children.reserve(Children().size());
+  for (const Plan& child : Children()) {
+    children.push_back(child->EmitExecutor(ctx));
+  }
+  if (Operation() == SetOperationKind::kUnionAll && !OrderKeys().empty()) {
+    std::vector<Schema> schemas;
+    schemas.reserve(Children().size());
+    for (const Plan& child : Children()) {
+      schemas.push_back(child->GetSchema());
+    }
+    std::vector<SortExecutor::Key> keys;
+    keys.reserve(OrderKeys().size());
+    for (const SortKey& key : OrderKeys()) {
+      keys.push_back(
+          SortExecutor::Key{key.expression, key.ascending, key.nulls_first});
+    }
+    return std::make_shared<MergeAppendExecutor>(
+        std::move(children), std::move(schemas), GetSchema(), std::move(keys));
+  }
+  return std::make_shared<SetOperationExecutor>(std::move(children),
+                                                Operation());
 }
 
 Executor AggregationPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -155,16 +214,16 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
     // Fallback route scans the table directly; Selection requires a real
     // predicate, so pass the plain scan through when there is none.
     Executor scan = std::make_shared<FullScan>(txn.txn_, table_);
-    if (!where_) { return scan;
-}
+    if (!where_) {
+      return scan;
+    }
     return std::make_shared<Selection>(where_, table_.GetSchema(),
                                        std::move(scan));
   }
   if (!point_ranges_.empty()) {
-    return std::make_shared<IndexScan>(txn.txn_, table_, index_,
-                                       point_ranges_, ascending_, where_,
-                                       GetSchema(), lock_rows_,
-                                       wait_for_write_intent_);
+    return std::make_shared<IndexScan>(txn.txn_, table_, index_, point_ranges_,
+                                       ascending_, where_, GetSchema(),
+                                       lock_rows_, wait_for_write_intent_);
   }
   return std::make_shared<IndexScan>(txn.txn_, table_, index_, begin_key_,
                                      end_key_, ascending_, where_, GetSchema(),
@@ -204,6 +263,10 @@ Executor RelationRenamePlan::EmitExecutor(TransactionContext& ctx) const {
                                                   relation_, physical_);
 }
 
+Executor EmptyPlan::EmitExecutor(TransactionContext& /*ctx*/) const {
+  return std::make_shared<ConstantExecutor>(std::vector<Row>{});
+}
+
 namespace {
 
 // Resolves join key column names into child schema offsets. The optimizer
@@ -231,6 +294,23 @@ void BuildKeyOffsets(const Schema& schema,
 
 }  // namespace
 
+Executor MergeJoinPlan::EmitExecutor(TransactionContext& ctx) const {
+  std::vector<slot_t> left;
+  std::vector<slot_t> right;
+  BuildKeyOffsets(Left()->GetSchema(), LeftKeys(), &left);
+  BuildKeyOffsets(Right()->GetSchema(), RightKeys(), &right);
+  // The residual is evaluated on concatenated rows, so it always sees the
+  // combined schema even when the join output keeps only the probe side
+  // (semi/anti).
+  Schema residual_schema =
+      Residual() ? Left()->GetSchema() + Right()->GetSchema() : Schema();
+  return std::make_shared<MergeJoin>(
+      Left()->EmitExecutor(ctx), std::move(left), Right()->EmitExecutor(ctx),
+      std::move(right), Kind(), Left()->GetSchema().ColumnCount(),
+      Right()->GetSchema().ColumnCount(), Residual(),
+      std::move(residual_schema));
+}
+
 Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
   if (left_cols_.empty() && right_cols_.empty()) {
     // Cross Join
@@ -249,10 +329,13 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
                                        left, *right_tbl_, *right_idx_, right);
   }
   if (kind_ != JoinKind::kInner) {
-    // Semi/Anti hash join (decorrelated IN / EXISTS / NOT EXISTS).
-    return std::make_shared<HashJoin>(left_src_->EmitExecutor(ctx), left,
-                                      right_src_->EmitExecutor(ctx), right,
-                                      hash_mode_, kind_);
+    // Semi/anti and outer hash joins retain the logical join kind.  Widths
+    // are explicit because one side may be empty, in which case the executor
+    // cannot infer the number of NULL padding columns from a row.
+    return std::make_shared<HashJoin>(
+        left_src_->EmitExecutor(ctx), left, right_src_->EmitExecutor(ctx),
+        right, hash_mode_, kind_, std::thread::hardware_concurrency(),
+        right_schema.ColumnCount(), left_src_->GetSchema().ColumnCount());
   }
   return std::make_shared<HashJoin>(left_src_->EmitExecutor(ctx), left,
                                     right_src_->EmitExecutor(ctx), right,

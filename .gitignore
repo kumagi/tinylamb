@@ -16,3 +16,5 @@ ironlamb-compliance-*
 
 googlesql_compliance-*
 ironlamb-compliance-*
+*.db
+*.log

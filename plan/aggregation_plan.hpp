@@ -18,6 +18,7 @@
 #define TINYLAMB_AGGREGATION_PLAN_HPP
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "expression/named_expression.hpp"
@@ -26,15 +27,23 @@
 
 namespace tinylamb {
 
+enum class AggregationStrategy {
+  kHash,
+  kSort,
+  kStream,
+};
+
 class AggregationPlan : public PlanBase {
  public:
-  AggregationPlan(Plan child, std::vector<NamedExpression> aggregates);
+  AggregationPlan(Plan child, std::vector<NamedExpression> aggregates,
+                  AggregationStrategy strategy = AggregationStrategy::kHash);
   [[nodiscard]] const Schema& GetSchema() const override;
   [[nodiscard]] Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] const Table* ScanSource() const override;
   [[nodiscard]] const TableStatistics& GetStats() const override;
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
+  [[nodiscard]] AggregationStrategy Strategy() const { return strategy_; }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o, int indent) const override;
 
@@ -42,9 +51,36 @@ class AggregationPlan : public PlanBase {
   [[nodiscard]] Schema GenerateSchema() const;
   Plan child_;
   std::vector<NamedExpression> aggregates_;
+  AggregationStrategy strategy_;
   // Declaration order matters: schema_ is initialized from child_ and
   // aggregates_ in the constructor's initializer list.
   Schema schema_;
+};
+
+// Physical names are kept as distinct plan types so EXPLAIN and rule tests can
+// tell the chosen aggregation algorithm apart.  The current Cascades
+// grouping payload is scalar (no GROUP BY keys); all three algorithms share
+// the same scalar accumulator implementation until grouped keys are carried
+// by the logical payload.
+class HashAggregatePlan final : public AggregationPlan {
+ public:
+  HashAggregatePlan(Plan child, std::vector<NamedExpression> aggregates)
+      : AggregationPlan(std::move(child), std::move(aggregates),
+                        AggregationStrategy::kHash) {}
+};
+
+class SortAggregatePlan final : public AggregationPlan {
+ public:
+  SortAggregatePlan(Plan child, std::vector<NamedExpression> aggregates)
+      : AggregationPlan(std::move(child), std::move(aggregates),
+                        AggregationStrategy::kSort) {}
+};
+
+class StreamAggregatePlan final : public AggregationPlan {
+ public:
+  StreamAggregatePlan(Plan child, std::vector<NamedExpression> aggregates)
+      : AggregationPlan(std::move(child), std::move(aggregates),
+                        AggregationStrategy::kStream) {}
 };
 
 }  // namespace tinylamb

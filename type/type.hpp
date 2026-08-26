@@ -48,7 +48,6 @@ enum class TypeTag {
   kLambdaExp,
 };
 
-
 class Type {
  public:
   Type() : type_(TypeTag::kInvalid) {}

@@ -1,60 +1,68 @@
-/** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
-#ifndef TINYLAMB_SORT_PLAN_HPP
-#define TINYLAMB_SORT_PLAN_HPP
+/** Copyright 2026 KUMAZAKI Hiroki. Licensed under the Apache-2.0 license. */
+#ifndef TINYLAMB_PLAN_SORT_PLAN_HPP
+#define TINYLAMB_PLAN_SORT_PLAN_HPP
 
-#include <cstddef>
+#include <optional>
+#include <utility>
 #include <vector>
 
-#include "expression/expression.hpp"
 #include "plan/plan.hpp"
-#include "table/table_statistics.hpp"
 
 namespace tinylamb {
 
-// Physical Sort: wraps a child plan and guarantees that its output is sorted
-// by the specified keys.  The engine safety net also adds a SortExecutor when
-// the child does not satisfy the required ordering; this plan node makes the
-// sort explicit so the optimizer can cost it and avoid double-applying.
-//
-// IsOrderedBy returns true when the requested ordering is a prefix of the
-// plan's own sort keys, enabling downstream Top-N and limit pushdown.
+struct SortKey {
+  Expression expression;
+  bool ascending{true};
+  std::optional<bool> nulls_first;
+};
+
 class SortPlan final : public PlanBase {
  public:
-  SortPlan(Plan src, std::vector<Expression> keys,
-           std::vector<bool> ascending)
-      : src_(std::move(src)),
-        keys_(std::move(keys)),
-        ascending_(std::move(ascending)) {}
+  SortPlan(Plan child, std::vector<SortKey> keys)
+      : child_(std::move(child)), keys_(std::move(keys)) {}
   SortPlan(const SortPlan&) = delete;
   SortPlan(SortPlan&&) = delete;
   SortPlan& operator=(const SortPlan&) = delete;
   SortPlan& operator=(SortPlan&&) = delete;
   ~SortPlan() override = default;
 
-  Executor EmitExecutor(TransactionContext& ctx) const override;
+  Executor EmitExecutor(TransactionContext& context) const override;
 
   [[nodiscard]] const Table* ScanSource() const override {
-    return src_->ScanSource();
+    return child_->ScanSource();
   }
-  [[nodiscard]] const Schema& GetSchema() const override;
   [[nodiscard]] const TableStatistics& GetStats() const override {
-    return src_->GetStats();
+    return child_->GetStats();
   }
-  [[nodiscard]] size_t AccessRowCount() const override;
-  [[nodiscard]] size_t EmitRowCount() const override;
-  // True when the requested ordering is already satisfied: either the child
-  // delivers it or our own sort keys cover it.
-  [[nodiscard]] bool IsOrderedBy(const std::vector<Expression>& expressions,
-                                 const std::vector<bool>& ascending) const override;
-  void Dump(std::ostream& o, int indent) const override;
+  [[nodiscard]] const Schema& GetSchema() const override {
+    return child_->GetSchema();
+  }
+  [[nodiscard]] size_t AccessRowCount() const override {
+    return child_->AccessRowCount();
+  }
+  [[nodiscard]] size_t EmitRowCount() const override {
+    return child_->EmitRowCount();
+  }
+  [[nodiscard]] bool IsOrderedBy(
+      const std::vector<Expression>& expressions,
+      const std::vector<bool>& ascending) const override;
+  // Sorting reorders but never adds or removes rows, so a limit below a
+  // Sort still shapes the final output exactly.
+  [[nodiscard]] bool EnforcesLimit(size_t limit_count,
+                                   size_t limit_offset) const override {
+    return child_->EnforcesLimit(limit_count, limit_offset);
+  }
+
+  [[nodiscard]] const std::vector<SortKey>& Keys() const { return keys_; }
+  [[nodiscard]] const Plan& Child() const { return child_; }
+  void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
  private:
-  Plan src_;
-  std::vector<Expression> keys_;
-  std::vector<bool> ascending_;
+  Plan child_;
+  std::vector<SortKey> keys_;
 };
 
 }  // namespace tinylamb
 
-#endif  // TINYLAMB_SORT_PLAN_HPP
+#endif  // TINYLAMB_PLAN_SORT_PLAN_HPP

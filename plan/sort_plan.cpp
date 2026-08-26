@@ -1,60 +1,50 @@
-/** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
-#include "plan/sort_plan.hpp"
+/** Copyright 2026 KUMAZAKI Hiroki. Licensed under the Apache-2.0 license. */
+#include "sort_plan.hpp"
 
-#include <algorithm>
-#include <cstddef>
-#include <memory>
 #include <ostream>
 #include <sstream>
 #include <string>
-#include <vector>
 
-#include "expression/expression.hpp"
-#include "type/schema.hpp"
+#include "common/constants.hpp"
 
 namespace tinylamb {
 
-// EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
-
-const Schema& SortPlan::GetSchema() const { return src_->GetSchema(); }
-
-size_t SortPlan::AccessRowCount() const { return src_->AccessRowCount(); }
-
-size_t SortPlan::EmitRowCount() const { return src_->EmitRowCount(); }
-
 bool SortPlan::IsOrderedBy(const std::vector<Expression>& expressions,
-                            const std::vector<bool>& ascending) const {
-  // The sort plan itself delivers exactly our sort keys.
-  if (expressions.size() > keys_.size()) { return false; }
+                           const std::vector<bool>& ascending) const {
+  if (expressions.size() > keys_.size() ||
+      ascending.size() != expressions.size()) {
+    return false;
+  }
   for (size_t i = 0; i < expressions.size(); ++i) {
-    if (keys_[i]->ToString() != expressions[i]->ToString()) { return false; }
-    if (ascending_[i] != ascending[i]) { return false; }
+    if (keys_[i].ascending != ascending[i] ||
+        keys_[i].expression->ToString() != expressions[i]->ToString()) {
+      return false;
+    }
   }
   return true;
 }
 
-void SortPlan::Dump(std::ostream& o, int indent) const {
-  o << "Sort: (";
+void SortPlan::Dump(std::ostream& output, int indent) const {
+  output << Indent(indent) << "Sort: [";
   for (size_t i = 0; i < keys_.size(); ++i) {
-    if (i > 0) { o << ", "; }
-    o << *keys_[i];
-    o << (ascending_[i] ? " ASC" : " DESC");
+    if (i > 0) { output << ", "; }
+    output << keys_[i].expression->ToString()
+           << (keys_[i].ascending ? " ASC" : " DESC");
   }
-  o << ")\n"
-    << std::string(indent + 2, ' ');
-  src_->Dump(o, indent + 2);
+  output << "]\n" << Indent(indent + 2);
+  child_->Dump(output, indent + 2);
 }
 
 std::string SortPlan::ToString() const {
-  std::ostringstream out;
-  out << "Sort: (";
+  std::ostringstream output;
+  output << "Sort: [";
   for (size_t i = 0; i < keys_.size(); ++i) {
-    if (i > 0) { out << ", "; }
-    out << *keys_[i];
-    out << (ascending_[i] ? " ASC" : " DESC");
+    if (i > 0) { output << ", "; }
+    output << keys_[i].expression->ToString()
+           << (keys_[i].ascending ? " ASC" : " DESC");
   }
-  out << ")";
-  return out.str();
+  output << "]";
+  return output.str();
 }
 
 }  // namespace tinylamb

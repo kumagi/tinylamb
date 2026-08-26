@@ -37,7 +37,6 @@
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
-#include "expression/lambda_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/sql_udf.hpp"
@@ -932,10 +931,6 @@ bool NeedsRelationalEvaluation(
       // Window functions always evaluate through the relational engine's
       // hidden-column pre-computation.
       return true;
-    case TypeTag::kLambdaExp:
-      // Lambda bodies may reference outer columns, so they evaluate through
-      // the relational engine.
-      return true;
     case TypeTag::kArrayExp:
       return std::ranges::any_of(
           expression->AsArrayExpression().Elements(),
@@ -1613,90 +1608,12 @@ Expression VisitFunction(
       name = "byte_reverse";
     }
   }
-  const bool chained =
-      node.detail.find("is_chained_call=true") != std::string::npos;
-
-  // Parse lambda parameters: a PathExpression names one parameter, a paren
-  // StructConstructor lists several ((e, i) -> ...).
-  auto lambda_params = [&](const GoogleSqlAstNode& params_node) {
-    std::vector<std::string> params;
-    if (params_node.kind == "PathExpression") {
-      params.push_back(Lower(Path(params_node)));
-    } else {
-      for (const auto& child : params_node.children) {
-        if (child->kind == "PathExpression") {
-          params.push_back(Lower(Path(*child)));
-        }
-      }
-    }
-    return params;
-  };
-  auto parse_lambda = [&](const GoogleSqlAstNode& lambda_node) {
-    if (lambda_node.children.empty()) {
-      throw std::runtime_error("GoogleSQL AST: empty lambda");
-    }
-    std::vector<std::string> params = lambda_params(*lambda_node.children.front());
-    Expression body;
-    for (size_t i = 1; i < lambda_node.children.size(); ++i) {
-      if (lambda_node.children[i]->kind == "Location") { continue; }
-      body = VisitExpression(*lambda_node.children[i]);
-    }
-    if (!body) {
-      throw std::runtime_error("GoogleSQL AST: lambda without body");
-    }
-    return LambdaExpressionExp(std::move(params), std::move(body));
-  };
-
   std::vector<Expression> arguments;
-  bool receiver_consumed = false;
   AggregateHavingModifier having = AggregateHavingModifier::kNone;
   Expression having_condition;
   Expression where_filter;
   std::vector<WindowOrderTerm> inner_order_by;
   std::optional<size_t> inner_limit;
-
-  // ARRAY_ZIP carries per-argument aliases (`ARRAY_ZIP(arr AS a, ...)`) that
-  // the generic argument loop would drop; encode them inline for the runtime.
-  if (name == "array_zip") {
-    std::vector<Expression> zip_args;
-    for (size_t i = 1; i < node.children.size(); ++i) {
-      const GoogleSqlAstNode& child = *node.children[i];
-      if (child.kind == "Location") { continue; }
-      if (child.kind == "ExpressionWithAlias") {
-        Expression array_expr = nullptr;
-        for (const auto& grandchild : child.children) {
-          if (grandchild->kind != "Location" && grandchild->kind != "Alias") {
-            array_expr = VisitExpression(*grandchild);
-            break;
-          }
-        }
-        if (!array_expr) { throw std::runtime_error("ARRAY_ZIP empty argument"); }
-        zip_args.push_back(std::move(array_expr));
-        std::string alias = Alias(child);
-        if (alias.empty()) {
-          alias = "f" + std::to_string(zip_args.size() / 2);
-        }
-        zip_args.push_back(ConstantValueExp(Value(std::move(alias))));
-        continue;
-      }
-      if (child.kind == "NamedArgument") {
-        // mode => 'PAD' / 'STRICT' / NULL: append the value as the trailing
-        // mode argument.
-        for (const auto& grandchild : child.children) {
-          if (grandchild->kind != "Location" && grandchild->kind != "Identifier") {
-            zip_args.push_back(VisitExpression(*grandchild));
-            break;
-          }
-        }
-        continue;
-      }
-      // Bare array argument without an alias: assign a positional field name.
-      zip_args.push_back(VisitExpression(child));
-      std::string default_alias = "f" + std::to_string(zip_args.size() / 2);
-      zip_args.push_back(ConstantValueExp(Value(std::move(default_alias))));
-    }
-    return FunctionCallExp("__array_zip__", std::move(zip_args));
-  }
 
   for (size_t i = 1; i < node.children.size(); ++i) {
     const GoogleSqlAstNode& child = *node.children[i];

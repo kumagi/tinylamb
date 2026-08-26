@@ -16,5 +16,17 @@ class DistinctExecutor : public ExecutorBase {
   Executor source_;
   std::unordered_set<Row> seen_;
 };
+
+class SortDistinctExecutor final : public ExecutorBase {
+ public:
+  explicit SortDistinctExecutor(Executor source) : source_(std::move(source)) {}
+  bool Next(Row* dst, RowPosition* rp) override;
+  void Dump(std::ostream& output, int indent) const override;
+
+ private:
+  Executor source_;
+  Row previous_;
+  bool have_previous_{false};
+};
 }  // namespace tinylamb
 #endif

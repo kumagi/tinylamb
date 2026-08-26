@@ -1,18 +1,11 @@
 # コードベース全体レビュー
 
-- **v1**: 2026-08-25 初版。
-- **v2**: 2026-08-26 全面再監査(HEAD `3a945e7` 時点)。コードベースの大幅刷新
-  (TPC-C 高速化 `97ea1f8`、clang-tidy/transaction 強化 `0cd8662`、新機能
-  `bcc0303`(kArray 型・window 式)、カバレッジ向上)を受けて、v1 の全指摘を
-  現行コードと再照合し、新規コードへのレビューを拡充した。
-
-**監査対象に関する重要な注記**: 再監査の実施中にワーキングツリーが変動し、
-集合演算(`common/set_operation.hpp`, `executor/set_operation.*`,
-`plan/set_operation_plan.*`)・MergeJoin・TopN・MergeAppend・Max1Row・Values
-などの新規モジュール群が現 HEAD には含まれなくなっている(reflog 上の
-`9423511` および `../tinylamb_tmp` には存在)。これらに対する指摘は
-「**§8 復元時必修事項**」に分離して記載する。現 HEAD にのみ存在するコード
-(query/plan_cache.hpp, sql_template.cpp 等)の指摘は通常の節に含む。
+2026-08-25 時点。ストレージ / index / table / expression / plan / executor /
+query+server の各層を並行レビューし、発見した改善点を重要度順にまとめた。
+一部の指摘は実機検証済み(LSM 自己デッドロックの最小再現、
+`differential_test` の実行など)。既に [`next-actions.md`](next-actions.md),
+[`executor_todo.md`](executor_todo.md), [`optimizer_todo.md`](optimizer_todo.md)
+に記載済みの意図的先送り項目は原則除外している。
 
 マーク:
 
@@ -22,487 +15,524 @@
 
 ---
 
-## 総論(v2 更新)
+## 総評
 
-- **強み**: v1 で指摘した問題の一部は着実に解消されている(differential_test
-  の緑化、fd リーク、Table::Update の補償、B+Tree イテレータ、Cascades の
-  capture/predicate 管理、サーバ入力上限、.gitignore 整備など)。新規実行器群
-  (TopN・MergeAppend・EmptyPlan/ValuesPlan)の意味論報告契約は概ね堅実で、
-  Cascades の provided-order 活用とも整合。MVCC intent/stable timestamp/GC
-  並列化の方向性も妥当。
-- **弱み**: ARIES 系の構造問題(abort 冪等性・destroy redo・WAL 順序)は
-  **15 件中 0 件しか解消しておらず**、さらに `97ea1f8` の高速化が新経路
-  (ランタイム undo の page_lsn 回帰、undo 中断時のマーカ書き込み)で同じ根を
-  踏んでいる。新機能では window frame の frame_unit 未実装と interval 文字列
-  sniffing の比較器侵入が即時の正確性リスク。クエリキャッシュ/テンプレート
-  再バインド層には「同一クエリの 2 回目以降で結果が変わる」系の無言バグが
-  実機再現済み。集合演算は一時的に正しく実装されたが現 HEAD で失われ
-  (= UNION ALL 回帰)、ORDER BY/LIMIT も無言で捨てられる状態に戻っている。
+- **強み**: S3-FIFO/PageRef/ページラッチの並行設計、durability gate による
+  WAL 先行書込みの強制、fuzz・クラッシュエミュレートテスト、Cascades memo の
+  設計規約(D1〜D6)とガードレールコメント、DataChunk の型付き列ゼロコピー
+  gather など土台の品質は高い。AST 評価器は意味論の正本として堅牢で、
+  リライト規則の三値論理への配慮も行き届いている。
+- **弱み**: (1) ARIES の古典的な綻び(abort 経路の冪等性・ログ→変更の順序・
+  終端マーカ)、(2) 「高速パスが正本実装から意味的に漂う」構造リスク
+  (直列/並列集約の不一致、Bytecode の短絡評価喪失、JIT のオーバーフロー wrap)、
+  (3) 文字列 sniffing に依存する AST 解釈とグローバルなセッション状態、
+  (4) スピル予算が入力側のみで出力側が無制限、という4系統に集中している。
 
 ---
 
-## 最優先修正候補(横断サマリ v2)
+## 最優先修正候補(横断サマリ)
 
-| # | 領域 | 概要 | 状態 | 重要度 |
-|---|------|------|------|--------|
-| 1 | recovery/tx | ランタイム Abort の undo が page_lsn を過去へ回帰させ、再起動 redo が適用済み変更を再適用(**新規**) | 新規発見 | 高 |
-| 2 | tx/recovery | undo 中断時でも `kCommit` 型マーカを書き、不完全 txn が恒久的 committed 扱い(**新規**) | 新規発見 | 高 |
-| 3 | tx | Abort 終端マーカに `kCommit` 流用・補償後クラッシュで二重 undo(v1 #2) | 未修正 | 高 |
-| 4 | page | Insert/Update の「ページ改変→WAL」順・logger 失敗時にファントム行(v1 #3) | 未修正 | 高 |
-| 5 | recovery | `kSystemDestroyPage` redo 未実装 → DROP 含む WAL で起動不能(v1 #4) | 未修正 | 高 |
-| 6 | expression | window frame_unit 未実装: ROWS/GROUPS が RANGE 扱いになり結果が根本的に誤る(**新規**) | 新規発見 | 高 |
-| 7 | type/value | interval 文字列 sniffing が比較器・hash に侵入、誤同値/GROUP BY 併合(**新規・悪化**) | 新規発見 | 高 |
-| 8 | index | LSM `Write(sync=true)`/`Delete(flush=true)` 自己デッドロック(v1 #1。Flusher 側のみ修正) | 未修正 | 高 |
-| 9 | query | 集合演算が UNION ALL に回帰 + ORDER BY/LIMIT/OFFSET/WITH を無言廃棄(**回帰**) | 回帰 | 高 |
-| 10 | query | sql_template 再バインドで `union_all_`/`has_limit_` が喪失 → 2 回目実行で枝欠落・LIMIT 無視(実機再現)(**新規**) | 新規発見 | 高 |
-| 11 | executor | ParallelAggregation `generic_scratch_` データレース(v1 #9) | 未修正 | 高 |
-| 12 | executor | 直列集約 LOGICAL_AND/OR 不在・並列 SUM overflow wrap で DOP により結果変更(v1 #10) | 未修正 | 高 |
-| 13 | plan | インデックスフィルタ選択率の二重計上(v1 #14) | 未修正 | 高 |
-| 14 | plan | 存在しないテーブル SELECT * で LOG(FATAL)(v1 #12) | 未修正 | 高 |
-| 15 | expression | Bytecode/JIT が AND/OR 短絡評価を失う(v1 #13) | 未修正 | 高 |
-| 16 | §8 | EXCEPT DISTINCT 多重度誤り・UNION ALL 全 materialize(復元時必修) | 復元時 | 高 |
-| 17 | query | `UPDATE t SET a='not-an-int'` が成功しゴミ値を永続化(実機確認)(**新規実害確認**) | 未修正 | 中 |
-
----
-
-## 前回(v1)からの解決済み項目
-
-再監査で修正を確認できたもの。回帰に注意しつつ、同種の実装を行う際の参照に。
-
-| 分野 | 項目 | 根拠 |
-|------|------|------|
-| expression | differential_test が赤 → int 除算を FLOAT64 昇格に統一し 13/13 パス(実機確認) | `binary_expression.cpp:167-185` |
-| index | `SortedRun` fd リーク → `shared_ptr<VMCache>` own_fd 化で close | `sorted_run.hpp:233`, `common/vm_cache_impl.hpp:100-105` |
-| index | B+Tree イテレータの foster 前進停止・`operator--` 非対称 | `b_plus_tree_iterator.cpp:96-150` |
-| index | マージファイルパス衝突 → `"merged-"+generation` 化 | `lsm_tree.cpp:266-269` |
-| index | IndexScanIterator の value 二重 Decode | `index_scan_iterator.cpp:95-140` |
-| table | `Table::Update` kNoSpace 時の行消失 → 全失敗枝で `restore_physical_row()` | `table/table.cpp:315-322,342-408` |
-| table | ANALYZE 常時フルスキャン → リザーバサンプリング導入 | `table_statistics.cpp:58-160` |
-| storage | WAL に magic/version ヘッダ追加(torn tail 検知向上。payload CRC は未導入) | `log_record.cpp:789-800`, `recovery_manager.cpp:729-747` |
-| storage | `UndoLoserChains` に page_lsn ガード・循環ガード(ページ毎 undo は無ガード) | `recovery_manager.cpp:783-801` |
-| page | `~PagePool` が pin>0 ページを保護(retired splice) | `page_pool.cpp:420-434` |
-| index | LSM Flusher がロック解放後に Sync、CV 待機導入 | `lsm_tree.cpp:87-101` |
-| plan | Pattern capture バインディング汚染 → local bindings + 成功時 commit | `cascades.cpp:683-733` |
-| plan | mask=0 コンジュンクトの述語消滅 → root 保持(`~uint64_t{0}`) | `cascades.cpp:309-315` |
-| plan | ProjectionPlan::IsOrderedBy の盲目的転送 → 列名翻訳付き委譲 | `projection_plan.cpp:82-103` |
-| plan | join_enumeration に relation 数 cap(kMaxJoinEnumerationRelations=16)新設 | `cascades.cpp:42-48,792` |
-| executor | IndexJoin が複合キーの残列等価を検証 | `index_join.cpp:70-88` |
-| executor | ParallelScan の pending 分割コピー → pending split 方式 | `parallel_scan.cpp:157-196` |
-| executor | 外部ソート最終マージを RunReader+ヒープでストリーミング化(`rows_` 全蓄積は残存) | `sort.cpp:504-560` |
-| executor | memory budget Release の CAS 化 | `query_memory.cpp:80-91` |
-| server | 認証前 1KiB + 認証後も累積入力上限で切断 | `postgres_server.cpp:61,407-414` |
-| server | 結果行数上限 `kMaxServerResultRows` 新設(単一 string 連結は残存) | `postgres_server.cpp:56,806` |
-| server | SplitSqlStatements が行/ブロックコメント・`''` 対応($$/$tag$・ネストは未対応) | `postgres_protocol.cpp:264-366` |
-| query | 単独 INT64_MIN リテラル問題の部分修正(UnaryExpression "-" 分岐新設) | `googlesql_ast_visitor.cpp:1219-1223` |
-| query | NULLS FIRST/LAST パース導入・既定規約を明記(PG 既定とは不一致のまま) | `statement.hpp:169-171` |
-| query | named timezone を `locate_zone` で解決(sscanf 未確認・未知 TZ 黙認は残存) | `googlesql_ast_visitor.cpp:49-99` |
-| 衛生 | `.gitignore` に `*.log`/`*.db` 追加、ルートはほぼクリーン | `.gitignore` |
-| 衛生 | CI workflows 新設(tsan/fuzzer-nightly 等。differential_test は未組み込み) | `.github/workflows/` |
+| # | 領域 | 概要 | 重要度 |
+|---|------|------|--------|
+| 1 | index | LSM `Write(sync=true)`/`Delete(flush=true)` が自己デッドロック(再現済み) | 高 |
+| 2 | recovery | Abort 終端マーカに `kCommit` を流用、補償後クラッシュで二重 undo → ページ破損 | 高 |
+| 3 | page | Insert/Update が「ページ改変→WAL 追記」の順で、logger 失敗時にファントム行が永続化 | 高 |
+| 4 | recovery | `kSystemDestroyPage` の redo 未実装 → DROP 含む WAL で起動不能 | 高 |
+| 5 | table | フルスキャン MVCC 高速パスにダーティリード窓口 | 高 |
+| 6 | query | `JOIN ... USING` が `col = col`(自明真)を生成し結合が壊れる | 高 |
+| 7 | query | 集合演算が種別に関係なく常に UNION ALL(`UNION DISTINCT`/`INTERSECT`/`EXCEPT` が誤結果) | 高 |
+| 8 | query | セッション定数が thread_local で接続間リーク | 高 |
+| 9 | executor | ParallelAggregation の `generic_scratch_` データレース | 高 |
+| 10 | executor | 直列集約に LOGICAL_AND/OR 未実装・並列 SUM が overflow wrap で DOP により結果が変わる | 高 |
+| 11 | expression | `differential_test` の int 除算セマンティクス不一致（解決済み、FLOAT64昇格に統一） | 済 |
+| 12 | plan | 存在しないテーブルへの SELECT * で `LOG(FATAL)` → サーバ全体が落ちる | 高 |
+| 13 | expression | Bytecode/JIT が AND/OR 短絡評価を失い例外抑制が効かない | 高 |
+| 14 | plan | インデックスフィルタ経路で選択率を二重計上しプラン品質を系統的に歪める | 高 |
+| 15 | 全体 | ルートに 277 個のテストログ散布・`.gitignore` 未対応、legacy parser への全テスト過剰リンク | 中 |
 
 ---
 
 ## 1. ストレージ層(page/ recovery/ transaction/)
 
-### 1.1 v1 指摘の状況
+### [高] Abort 終端マーカに `kCommit` を流用しており、マーカ喪失時に二重 undo でページ破損
+- 場所: `transaction/transaction_manager.cpp:189`(abort なのに `LogType::kCommit`)、
+  `recovery/recovery_manager.cpp:145,219-221`(`kCompensateInsertRow` の redo も
+  `kInsertRow` の undo も両方 `DeleteImpl`)、`page/row_page.cpp:235-238`
+- 問題: Abort は undowalk 後に `kCommit` マーカを書くだけで `WaitForDurable`
+  しないため、「補償レコード flush 済み・マーカ未 flush」の窓(~1ms)でクラッシュすると
+  loser 判定され、redo の補償適用後に per-page undo が再度 `DeleteImpl` を実行する。
+  `row_count_` アンダーフローと `free_size_` 二重加算がチェックサム付きでフラッシュされる。
+- 提案: (a) Abort の最後でマーカを `WaitForDurable`、(b) `RowPage::DeleteRow` を
+  offset==0 で no-op にして冪等化、(c) 専用 `kAbort` 型の導入。最低限 (b)+(c) で
+  二重適用を構造的に排除。
 
-**未修正**(行番号は現行):
+### [高] `kSystemDestroyPage` の redo が未実装で例外 — DROP 系操作を含む WAL はクラッシュ後必ずリカバリ失敗
+- 場所: `recovery/recovery_manager.cpp:186-194`(redo で throw)、`:231-239`(undo も lossy)。
+  コメントが参照する `recovery/CODE_REVIEW.md` は存在しない
+- 提案: destroy レコードに旧ページタイプ + free-list 差分を持たせるか、redo を
+  「free-list push のみ」と定義して最小実装。未実装の間は DDL 経由の `DestroyPage`
+  呼び出しをガード。
 
-- **[高] Abort 終端マーカに `kCommit` 流用**: `transaction/transaction_manager.cpp:189`、
-  `recovery/recovery_manager.cpp:145,221`、`row_page.cpp:235-242`(DeleteRow 非冪等)。
-  `UndoLoserChains` 側のガード追加(:783-801)があるが、ページ毎 undo(`PageReplay`
-  :341-352)は無ガードで核心リスクは残存。→ 提案は v1 同様(冪等化 + 専用 `kAbort`)。
-- **[高] `kSystemDestroyPage` redo 未実装で throw**: `recovery_manager.cpp:186-194,231-239`。
-  参照先 `recovery/CODE_REVIEW.md` は現存しない。
-- **[高] 「ページ改変→WAL 追記」順**: `row_page.cpp:86-92,171-173`、
-  `leaf_page.cpp:81-82`、`branch_page.cpp:77-78`、`meta_page.cpp:49-64`。
-  Leaf/Branch の Update のみ log 先行で不統一。
-- **[中] PreCommit が durability 前にバージョン公開**: `transaction_manager.cpp:110` 対
-  `:114`。catch(:136-144)でも公開済み version は放置。stable_timestamp 新設後も順序不変。
-- **[中] WAL レコード本体に payload チェックサム無し**: magic/version 強化はあったが
-  CRC は未使用(`log_record.cpp:789-800`)。
-- **[中] torn write 時 fail-open**: `page_pool.cpp:510-517`(ERROR ログ追加のみ、
-  validate=true でも `kCorrupt` にならず)。
-- **[中] CheckpointManager が Transaction フィールドを無同期読み**:
-  `checkpoint_manager.cpp:132-140`。字段更新は所有スレッドがロック外(`transaction.cpp:268`)。
-- **[中] LeafPage::Split 失敗時の左右重複キー**: **部分修正**
-  (`RETURN_IF_FAIL` 伝播は追加: `leaf_page.cpp:271-280`)。右転記済みキーの補償削除はなく
-  txn abort undo 依存のまま。
-- **[中] master レコード tmp を fsync せず rename**: `checkpoint_manager.cpp:48-79`
-  (:49 のコメントと不一致のまま)。
-- **[低] checkpoint 実質停止 + SPR が O(ページ×WAL)**: `page_storage.cpp:71-99`
-  (`cm_.Start()` 未呼出)、`recovery_manager.cpp:474-502,751-774`。
-- **[低] GetMetaPage が異型メタページを黙って初期化**: `page_manager.cpp:76-78`。
-- **[低] doc drift**: `docs/wal_format.md:26`(kAbort 言語)、`docs/lock_order.md:10,20`
-  (識別子不整合。下記の LockManager 死蔵でさらに拡大)、
-  `recovery_manager.cpp:191,237`(不存在 CODE_REVIEW.md 参照)。
-- **[低] Logger `Finish()` 後の永久ブロック**: **部分修正**(pool 側は改善、
-  logger 側は残存: `logger.cpp:134-155,157-202`)。
-- **[低] RowPage::Insert 空きスロット走査 ×1ms ブロック**: `row_page.cpp:76-84`。
-  `TryAddWriteSet` は index_scan(`executor/index_scan.cpp:111`)でしか未使用。
-- **[低] BranchPage::InsertImpl が容量検証前に減算**: `branch_page.cpp:88`。
+### [高] Insert/Update 系が「ページ改変→WAL 追記」の順で、logger 失敗時に WAL 無しの改変がフラッシュされる
+- 場所: `page/row_page.cpp:86-92`(Insert)、`:171-173`(Update)、`page/leaf_page.cpp:81-82`、
+  `page/branch_page.cpp:77-78`、`page/meta_page.cpp:49-50`
+- 問題: 変更後に `AddLog` が失敗(ENOSPC 等)すると dirty ページが後日 write-back され、
+  WAL に一切記録のない行がリスタート後も残る(MVCC チェーンは消滅済み)。Delete のみ正しい。
+- 提案: スペース確保のみ先行し `log → mutate` の順へ統一。mutate 先の場合は
+  AddLog 失敗時に旧値復元の補償を書く。
 
-### 1.2 新規発見(97ea1f8/0cd8662 の変更に由来)
+### [中] PreCommit がコミットレコード durability 前にバージョンを公開
+- 場所: `transaction/transaction_manager.cpp:108-124`
+- 問題: `synchronous_commit=true` でも公開から fsync 完了まで他 txn がコミット済みデータを
+  読める。ここでクラッシュすると観測された「コミット」が消失。`AddLog` 例外時も
+  `CommitVersions` がロールバックされない。[docs/commit_durability.md](commit_durability.md)
+  に記載はあるが sync commit の意味論としては脆弱。
+- 提案: `AddLog(kCommit)` → (sync 時) `WaitForDurable` → `CommitVersions` の順へ変更。
 
-- **[高] ランタイム Abort の undo が page_lsn を過去へ回帰させ、再起動 redo が適用済み変更を再適用する**
-  - 場所: `recovery/recovery_manager.cpp:309`(`LogUndo` 末尾の無条件 `SetPageLSN(lsn)`)、
-    経路 `transaction/transaction_manager.cpp:174-185`
-  - 問題: 実行時 Abort は新旧混在ページを undo するたび page_lsn を「undone レコードの
-    LSN」へ上書きする。他 txn のコミット済み変更(より新しい LSN)を含むページで flush
-    されると、再起動 redo 条件 `page_lsn < lsn` が既適用レコードを全部再適用する。
-    (a) コミット済み DELETE 再適用で `row_count_--` がアンダーフロー、(b) leaf INSERT
-    再適用で重複キー挿入(重複チェック無し: leaf_page.cpp:86-114)、(c) abort マーカが
-    flush 済みなら loser 扱いされずアボート済み行が物理復活し恒久化。
-    `full_scan_iterator.cpp:71` の物理直読み前提も崩す。
-  - 提案: 実行時 undo では page_lsn を回帰させない(現 page_lsn 維持または補償 LSN で前進)。
-    `DeleteImpl` の offset==0 no-op 化で redo 冪等性を確保。
-- **[高] undo 中断時でも `kCommit` 型マーカを書き、不完全 txn が恒久的に committed 扱いになる**
-  - 場所: `transaction/transaction_manager.cpp:177-181`(ReadLog 失敗で break)+
-    `:186-196`(マーカ書き込み)。この break 経路は 97ea1f8 で新設
-  - 問題: 「中途半端に undo された txn」が WAL 上は完全コミットに変わり、以後のリカバリで
-    修正不能。v1 の「マーカ喪失」とは逆方向の新しい破綻経路。
-  - 提案: 専用 `kAbort` 型を導入し、undo 完了の場合のみマーカを書く。中断時は何も書かず
-    例外報告。(1.1 の abort マーカ問題と同じ修復筋で解消する)
-- **[中] commit ts 割当と RegisterPendingCommit の間の窓で stable_timestamp が未公開 commit を追い越す**
-  - 場所: `transaction_manager.cpp:384-385`(fetch_add 後に登録)対 `:355-373`
-  - 問題: T1 が ts 取得直後(未登録)、T2 が登録・公開すると unpublished が空になり
-    stable が T1 の未公開 ts 込みまで跳ぶ。同一 snapshot 値で可視状態が不一致になる。
-  - 提案: fetch_add+登録を `pending_commits_mutex_` 臨界圏内で原子化。
-- **[中] AcquireWriteIntent の待機が「1 回限り・1ms」で strict locking のコメントと矛盾**
-  - 場所: `transaction_manager.cpp:217-229`
-  - 問題: ホルダが複数行更新や fsync で 1ms 超えると競合相手は即 conflict。
-    TPC-C 系ワークロードで spurious abort を量産する。
-  - 提案: 待ちループ化(デッドライン引数化)か、待機/即断念の期待を呼出側で明示分離。
-- **[中] Transaction 放棄時の登録リーク(GC 停滅・intent 滞留)**
-  - 場所: `transaction/transaction.hpp:94`(`~Transaction() = default`)、
-    `database/transaction_context.hpp:62`
-  - 問題: PreCommit/Abort を経ずに破棄されると active_transactions_/write intent が
-    永遠残留。oldest_snapshot 固定でバージョンストア単調増加、当該行は全 writer から
-    1ms conflict を繰り返す。
-  - 提案: ~Transaction で未終了なら Abort 相当を実行、または assert+LOG(FATAL) で早期発見。
-- **[低] LockManager が本番コードから完全未使用化(doc ドリフト拡大)**
-  - 場所: `transaction/lock_manager.hpp`(参照は fuzzer/test のみ)
-  - 問題: 97ea1f8 で TM の lock 呼出が削除。`release_epoch_` の最大 60 秒待機延長は
-    自己再入をも 60s ブロックさせる地雷だが死蔵コード化。
-  - 提案: 削除 or 「テスト専用」明記 + lock_order.md 更新。
-- **[低] Transaction::CommitWait が 1ms ポーリングのまま**
-  - 場所: `transaction/transaction.cpp:381-386`。`Logger::WaitForDurable` への委譲へ置換。
-- **[低] unstaged intent 保持 txn の同一行読みが snapshot を無視**
-  - 場所: `transaction_manager.cpp:284-291`。意図的な仕様(コメントあり)なら doc 化 +
-    差分テストで固定。そうでなければ staged 自身の値のみ返す。
+### [中] WAL レコード本体にチェックサムが無く、中間ビット反転で以降の全レコードが失われる
+- 場所: `recovery/log_record.cpp:706-780`、[wal_format.md](wal_format.md) はページ画像のみ
+- 提案: レコード尾部に CRC32C(v2 フォーマット)。`common/crc32c.hpp` を流用可能。
+
+### [中] 部分読み(torn write)時に `validate=true` でも fail-open
+- 場所: `page/page_pool.cpp:506-517`(短読み→黙って `PageInit(kFreePage)`)
+  [recovery_invariants.md](recovery_invariants.md) の「fail closed」と矛盾
+- 提案: `validate=true` かつ `0 < nread < kPageSize` は `kCorrupt` に。EOF 区別は
+  `offset+kPageSize <= filesize` で判定。
+
+### [中] CheckpointManager が Transaction フィールドを同期化なしで読む(data race)
+- 場所: `recovery/checkpoint_manager.cpp:134-140`
+- 問題: `prev_lsn_`/`status_` はワーカスレッドがロックなし更新 → TSAN 違反。
+  ATT の last_lsn が途中までしか進まないと undo 漏れのリスク。
+- 提案: atomic 化したスナップショット API を用意、または登録時に pair を複製して読む。
+
+### [中] LeafPage::Split が途中失敗すると左右両方に同一キーが残る
+- 場所: `page/leaf_page.cpp:271-280`
+- 提案: 失敗時に右ページ転記分を補償で消すか、split 全体やり直しプロトコルを
+  b_plus_tree 側と明示契約。
+
+### [中] マスターレコード tmp を fsync せず rename(コメントと実装不一致)
+- 場所: `recovery/checkpoint_manager.cpp:53-79`
+- 提案: open → `::fsync(fd)` → close → rename → dir fsync の順に修正。
+
+### [低] チェックポイントが実質停止 + リカバリが O(ページ数×WAL長)
+- 場所: `database/page_storage.cpp:77,98`(`cm_.Start()` 未呼出)、
+  `recovery/recovery_manager.cpp:474-502`(壊れたページごとに WAL 全走査)、
+  `:751-774`(`ReadLog` が毎レコード 4KB 文字列 + `istringstream`)
+- 提案: 起動時 `cm_.Start()`、SPR に `[rec_lsn, valid_end)` を渡す、`ReadLog` の
+  バッファ再利用化。
+
+### [低] GetMetaPage が異型メタページを WAL 無しで黙って初期化し直す
+- 場所: `page/page_manager.cpp:76-79`
+- 提案: type 異常時は `kCorrupt` で fail-closed に。修復はリカバリ経由のみ。
+
+### [低] ドキュメントと実装のドリフト
+- 場所: [lock_order.md](lock_order.md)(識別子が実装と不一致)、
+  [wal_format.md](wal_format.md)(kAbort 言語 vs kCommit 流用)、
+  `recovery/recovery_manager.cpp:191,237`(存在しない CODE_REVIEW.md 参照)
+- 提案: 各 doc を実装に合わせ更新し、doc 内識別子を CI grep 検証。
+
+### [低] Logger 終了後のブロック・~PagePool の retired 解放で UAF 可能
+- 場所: `recovery/logger.cpp:134-155`(`Finish()` 後も永久待ち)、
+  `page/page_pool.cpp:303-315,434`
+- 提案: `Finish()` 後は closed 状態で即例外化。~PagePool は pin_count>0 を検出したら
+  解放延期。
+
+### [低] RowPage::Insert の空きスロット走査が競合時にスロット数×1ms ブロック
+- 場所: `page/row_page.cpp:75-85`
+- 提案: 最初は `TryAddWriteSet`(wait=false)で通し、全滅時のみ wait=true。
+
+### [低] BranchPage::InsertImpl が空き容量検証前に `free_size_` を減算
+- 場所: `page/branch_page.cpp:82-103`(LeafPage とは不揃い)
+- 提案: LeafPage と同じ順序(計算→上限チェック→DeFragment→減算)に揃える。
 
 ---
 
 ## 2. index / table
 
-### 2.1 v1 指摘の状況
+### [高] LSM `Write(sync=true)`/`Delete(flush=true)` がセルフデッドロック(実機で確認済み)
+- 場所: `index/lsm_tree.cpp:183-191` → `:212`(`mem_tree_lock_` を保持中に同一スレッドが
+  `Sync()` で二重ロック。非リエントラントな `std::timed_mutex`)
+- 問題: 最小再現コードで 3 秒以上ブロックを確認。fuzzer(lsm_tree_fuzzer.hpp:69,77)は
+  50% の確率で踏む経路だが通常テストはデフォルト引数のため潜在化。
+- 提案: ロック解放後に `Sync()` を呼ぶようスコープ分離、または `SyncLocked()` 内部関数に分離。
 
-- **[高] LSM `Write(sync=true)`/`Delete(flush=true)` 自己デッドロック**: **未修正**
-  (`lsm_tree.cpp:183-191,193-201` → `Sync()` 内 `:212` で `mem_tree_lock_` 再取得。
-  非リエントラント `std::timed_mutex`: lsm_tree.hpp:125)。Flusher 側のみ修正済み(:87-101)。
-  fuzzer が踏む経路のまま。
-- **[高] フルスキャン MVCC 高速パスのダーティリード窓口**: **未修正(意図的受容を文書化)**
-  (`full_scan_iterator.cpp:65-74`)。境界条件の詳細コメント追加。ただし §1.2 の
-  page_lsn 回帰バグがこの前提を崩すため、受容判断の再評価が必要。
-- **[高] LSM クラッシュリカバリ不在(manifest 無し・dir fsync 無し・起動時スキャン無し)**:
-  未修正(`lsm_tree.cpp:47-63`)。
-- **[中] `SortedRun` コンストラクタ例外**: **部分修正**(書き込み側は
-  `SortedRun::Construct` Status 返却化: sorted_run.cpp:284-384。読み込み用 ctor は
-  throw のまま(sorted_run.cpp:228-234)で、catch 無しバックグラウンドスレッドから
-  emplace される経路が残存: `lsm_tree.cpp:239,298`)。
-- **[中] fd リーク**: **修正済み**(解決済み表参照)。
-- **[中] blob GC 不在(WiscKey なのに blob.db 単調増加)**: 未修正(`lsm_tree.cpp:244-301`)。
-- **[中] Read/Contains の mem→disk 遷移競合 + 三重実装**: 未修正・軽減のみ
-  (`lsm_tree.cpp:119-181`, `lsm_view.cpp:54-65`)。
-- **[中] B+Tree 再平衡の内部メタ誤読**: 未修正(`b_plus_tree.cpp:741-752`、
-  `GetValue(next_idx-1)` が `next_idx==0 && RowCount()==1` で rows_[-1+kExtraIdx] 解釈)。
-- **[低] イテレータ前進/--**: **ほぼ修正済み**。**[低] 死んだコード**:
-  部分修正(`FileAndIndex` 未使用 lsm_tree.hpp:89-98、`MemoryCompare` 逆符号
-  sorted_run.cpp:59-70 は残存。「DISABLED」陳腐コメント lsm_tree_test.cpp:463-471 も残存)。
+### [高] フルスキャン MVCC 高速パスにダーティリード窓口
+- 場所: `table/full_scan_iterator.cpp:65-74`
+- 問題: 未コミットのまま停滞したページ変更(PageLSN=X)より新しいコミットが閾値を押し上げると、
+  RO トランザクションが version store を経ずに物理行を読む(分離性違反)。
+- 提案: ページに最終コミッタ timestamp を別スタンプ、または高速パス前に write intent 登録簿を
+  照会して fallback。
+
+### [高] LSM にクラッシュ時リカバリが存在しない(manifest 無し・dir fsync 無し・起動時スキャン無し)
+- 場所: `index/lsm_tree.cpp:47-63,237-241`、`sorted_run.cpp:380-384`
+- 問題: 再起動で fsync 済み run ファイルも孤児化。memtable WAL も無く Sync 前の書き込みは消失。
+- 提案: manifest ファイル(原子置換 + 親ディレクトリ fsync)か起動時 root_dir 走査で run を復元。
+  DB 本体統合前の必須作業。
+
+### [中] `SortedRun` コンストラクタの例外が Merger スレッドを `std::terminate`
+- 場所: `sorted_run.cpp:229-234`(StatusOr 方針に反して throw)、
+  `lsm_tree.cpp:108-117,298`(catch 無し)
+- 提案: `static StatusOr<SortedRun> Open()` ファクトリ化 + Merger スレッドに最外殻 catch。
+
+### [中] `SortedRun` が fd を決して close しない(fd リーク)
+- 場所: `sorted_run.cpp:229`(close はエラー経路のみ :251-277)。merge/pop 後も開放されず、
+  長時間稼働で fd 枯渇
+- 提案: RAII fd ラッパまたは参照カウント末尾での close。
+
+### [中] WiscKey 形式なのに blob GC が存在せず blob.db が単調増加
+- 場所: `index/lsm_tree.cpp:291-300`、`blob_file.cpp:55-61`
+- 提案: マージ時の生存 blob copy-out 型 GC、最低限「最古 2 run の tombstone drop + live-set 再配置」。
+
+### [中] `Read`/`Contains` が mem→disk 遷移と競合しスナップショット不整合 + 三重実装
+- 場所: `index/lsm_tree.cpp:119-181`、`lsm_view.cpp:54-65`
+- 提案: mem ロック保持中に generation を撮影し新世代 run をスキップ。`Contains` は `Read` で
+  実装し `LSMView::Find` に集約。
+
+### [中] `Table::Update` の kNoSpace 経路: 移設失敗時に行が消えたままエラー返却
+- 場所: `table/table.cpp:377,395-400,406-409`(`restore_physical_row()`:315-322 があるのに
+  失敗枝で未使用。table.cpp:465-484 の TPC-C Delivery 障害コメントと同型の地雷)
+- 提案: 移設前に original_image を構築し、全失敗枝で `restore_physical_row()` を呼ぶ。
+
+### [中] BPlusTree::Delete 再平衡で内部メタ領域を誤読する可能性
+- 場所: `index/b_plus_tree.cpp:741-749`(`next_idx==0 && RowCount()==1` で
+  `size_t(-1)+kExtraIdx=rows_[2]` を pid として解釈)
+- 提案: `next_idx == 0` 時は `lowest_page_` 側を foster 親候补に、または branch RowCount()==1 を
+  root 折り畳みで潰す不変条件を assert 明文化。
+
+### [低] BPlusTreeIterator の前進停止条件と operator-- の非対称処理
+- 場所: `b_plus_tree_iterator.cpp:117-121,153-156`
+- 提案: 空ページ時は foster を辿るループ化、`--` 側にも `return *this`。
+
+### [低] 死んだコード・陳腐コメント・統計まわりの細粒度改善
+- 場所: `lsm_tree.hpp:89-98`(`FileAndIndex` 未使用)、`lsm_tree_test.cpp:463-471`
+  (「DISABLED」だが有効)、`sorted_run.cpp:59-70`(memcmp 逆符号の `MemoryCompare`)、
+  `lsm_tree.cpp:218-221`(ファイル名と内部 generation の 1 ずれ)、
+  `index_scan_iterator.cpp:136-158,213-220`(value を 2 回 Decode)、
+  `table_statistics.cpp:661-690,823-830`(ANALYZE 常時フルスキャン・ヒストグラム線形走査)
+- 提案: 削除/改名/Decode 結果の引き回し/ページ単位サンプリング導入/bound 探索化。
 
 ---
 
-## 3. expression / type(新機能 kArray・window 式を含む)
+## 3. expression(三層式エンジン)
 
-### 3.1 v1 指摘の状況
+### [高] differential_test における整数除算セマンティクスの食い違い（解決済み）
+- 場所: `expression/differential_test.cpp:979-1016` 対 `binary_expression.cpp:167-185`
+- 状況 (2026-08-26): GoogleSQL 準拠（FLOAT64 昇格）に統一し、`differential_test` の期待値および AST・Detail 評価器の整合性を修正して全 13 テストが PASS することを確認・固定済み。
 
-- 除算セマンティクス不一致: **解決済み**(解決済み表参照)。
-- **[高] Bytecode/JIT が AND/OR 短絡評価を失い例外抑制が効かない**: 未修正
-  (`binary_expression.cpp:324-333` AST は短絡 vs `bytecode.cpp:156-169` 両辺評価、
-  `selection.cpp:170-171`)。
-- **[中] JIT projection overflow wrap**: 未修正(`jit.cpp:233`)。
-- **[中] `identity_divide_one` 書き換えが型を変える**: 未修正(`rewrite.cpp:531-538`)。
-- **[中] like_equality × Value 層の魔法の等価**: **悪化**(§3.2 参照。ルール自体は
-  `rewrite.cpp:626-656` に残存)。
-- **[中] `fold_function` が非決定的関数を畳む**: 未修正(`rewrite.cpp:283-297`)。
-- **[中] リライトホットパス(ToString 同一性・32 パス全走査)**: 未修正
-  (`rewrite.cpp:37-40,789-798`)。
-- **[中] Bytecode 型別オペコード形骸化**: 未修正(`bytecode.cpp:156-169`)。
-- **[低] リライタ throw がクエリ落とす**: 未修正(`rewrite.cpp:797,805`;
-  `optimizer.cpp:543`・`scan_filter.cpp:219` は catch 無し)。
-- **[低] differential 網羅性ギャップ(例外セル・CAST マトリクス)**: 未修正
-  (13 TEST 構成のまま)。
-- **[低] 日時パーサ重複非互換**: 未修正(`cast_expression.cpp:37-115`(トリム有)vs
-  `function_call_expression.cpp:58-119`(トリム無))。
-- **[低] LIKE `_` バイト単位・double イプシロン比較**: 未修正
-  (`binary_expression.cpp:100-125`, `value.cpp:407-409`)。
+### [高] Bytecode/JIT が AND/OR 短絡評価による例外抑制を失う
+- 場所: `binary_expression.cpp:324-336`(AST は短絡)、`bytecode.cpp:156-169`(両辺評価後に適用)、
+  `executor/selection.cpp:171`
+- 問題: `i = 5 OR 1/(j-5) > 0` のような行で AST は true を返すが Bytecode は右辺必須評価で
+  0 除算例外 → バッチ全体が失敗。differential の論理マトリクスは例外セルを含まず未検出。
+- 提案: jump 系オペコードで制御フロー化、または短絡が必要な述語は AST フォールバック。
+  「左辺確定 + 右辺 throw」セルを差分テストへ追加。
 
-### 3.2 新規発見(bcc0303 由来)
+### [中] JIT projection カーネルがオーバーフローを静かにラップ
+- 場所: `jit.cpp:233`(CreateMul/CreateAdd)対 `type/value.cpp:701-717`(AST は builtin_overflow で throw)
+- 提案: `llvm.SAddWithOverflow` 系でセンチネルフラグ → AST 再評価フォールバック、または
+  eligibility 判定で静的に除外。
 
-- **[高] interval 文字列 sniffing の比較器・hash 侵入で誤同値・順序破壊**
-  - 場所: `type/value.cpp:396-406`(==)、`:615-625`(<)、`:646-656`(>)、
-    `:861-875`(std::hash)、`type/interval.cpp:240-300`(composite パース)
-  - 問題: 「`-` と空白を含み `-` が先」だけの弱ヒューリスティックで、タイムスタンプ
-    `"2024-01-15 10:00:00"` 等の通常文字列が INTERVAL 判定される。composite パーサは
-    不正入力でも**例外ではなく無言成功**(stoll 失敗 catch して 0 加算)のため、
-    `"AA-BB CC"` と `"XX-YY ZZ"` が共にゼロ間隔に正規化され `==` 真・hash 一致 →
-    GROUP BY/DISTINCT が異なる値を併合、ソート順も間隔値順に化ける。ISO 'P...' 形式は
-    今度は Parse が throw(`interval.cpp:179-202`)。v1 の like_equality 問題が
-    bcc0303 で Value 層全体へ拡大した形。
-  - 提案: Value 層の sniffing を撤去し INTERVAL 比較は明示キャスト経由に限定。
-    応急として Parse 成功時も「区間らしい形式」検証を追加し失敗時はバイト比較へ。
-- **[中] ArrayExpression の型強制が宣言型を強制しない**
-  - 場所: `expression/array_expression.cpp:29-46`(CoerceArrayElement)、`:56-64`
-  - 問題: BOOL 宣言配列に INT64 要素が変換無しで混入。対応表に無い組合せは素通しされ
-    混合配列が生成。推論も最初の非 NULL 要素のみ駆動。
-  - 提案: default 経路を「キャスト or 型不一致エラー」に。推論は全要素合意方式へ。
-- **[中] WindowFunctionCallExpression の ResultType 固定 VarChar と常時 throw**
-  - 場所: `expression/window_function_expression.cpp:43-53`
-  - 問題: 全ての結果型が kVarChar 固定のためオプティマイザの見積り・型検査・EXPLAIN が
-    信じると誤動作。`Evaluate` は常に runtime_error(Status 経路無し)。
-  - 提案: 関数種別→結果型マップを用意し、Evaluate は planner が保証した経路でのみ到達。
-- **[中] kArray の等価と hash が不一致**
-  - 場所: `type/value.cpp:410-412`(==)、`:880-884`(hash)
-  - 問題: == は要素の double に 1e-9 イプシロン比較・varchar に sniffing が効く一方、
-    hash はビットベース。「等価だが異なるバケット」が GROUP BY/HASH JOIN で重複グループ化。
-  - 提案: kArray 専用の正規化比較(厳密比較)を定義し hash と一致させる。
-- **[中] kArray 逆シリアルの型バイト無検証と NUL 走査の無制限読み**
-  - 場所: `type/value.cpp:303`(Deserialize)、`:340`(SkipSerialized)、`:586` 付近
-  - 問題: 生バイトを `static_cast<ValueType>` し破損データで未定義型が得ても検出されない。
-    NUL 探し・要素走査にバッファ末端チェックが無く範囲外読み/暴走し得る。
-  - 提案: enum 妥当性検証で `kCorrupt` 系エラーに。残バッファ長を受け取る overload 追加。
-- **[中] IndexScanIterator::ResolveRow がエラーを行「無し」に変換**
-  - 場所: `index/index_scan_iterator.cpp:145-158`(0c1f397 で新設)
-  - 問題: 行読み取り失敗(ロック競合等の一時エラー含む)で `Clear()` して反復終了 →
-    結果行が静かに欠落し通知されない。
-  - 提案: kNotExists 以外は伝播。一時エラーはリトライまたはエラー返却。
-- **[低] 複合キー range の NULL 打ち切り契約が不明瞭**: `index_scan_iterator.cpp:38-51`。
-  契約コメント + 切断時 DEBUG ログ。
-- **[低] ArrayExpression の 3 overload がコピー貼り付け**: `array_expression.cpp:50-114`。
-  共通ヘルパへ集約(AST 正本規約上、改修漏れ温床)。
-- **[低] LAG/LEAD/NTILE 引数の型無検証**: `window_eval.cpp:663-700`。
-  INT64 定数検査+明示エラー。
+### [中] `identity_divide_one` 書き換えが型と精度を変える
+- 場所: `rewrite.cpp:530-537`。`x / 1` が INT64 の `x` になり結果型が変わる。
+  |x| > 2^53 では丸め落ちで AST/Bytecode 分岐の具体経路
+- 提案: 左辺が静的 double の場合のみ適用、differential に `col / 1` セル追加。
+
+### [中] `like_equality` 書き換え × Value 層の「魔法の等価比較」相互作用
+- 場所: `rewrite.cpp:625-656` 対 `binary_expression.cpp:292-303`(struct JSON 順不同一致)、
+  `type/value.cpp:393-401`(interval 風文字列の正規化一致)
+- 問題: LIKE はバイト一致だが `=` に書き換えると特殊等価が発火し真偽が変わる。
+- 提案: varchar の意味的等価を `operator==` から分離。応急として JSON/interval 形パターンは
+  書き換え対象外に。
+
+### [中] `fold_function` が非決定的関数(CURRENT_TIMESTAMP 等)を畳み込む
+- 場所: `rewrite.cpp:282-297`。plan 時と演算子構築時で固定時刻が異なり層間不一致の元。
+- 提案: volatile 関数ブラックリスト(current_* )導入。将来的に purity をカタログ管理。
+
+### [中] リライトのホットパスコスト(Match 毎 bindings コピー、ToString 同一性判定)
+- 場所: `rewrite.cpp:38-41`、`rewrite.hpp:207`、`rewrite.cpp:789-822`
+  (最大32パス×~35ルール×全ノード、`Same` が O(サイズ) 文字列比較)
+- 提案: 式ノードに構造ハッシュ導入で `Same` O(1) 化、bindings のロールバック方式化、
+  コンパイル済みプログラムのキャッシュ。
+
+### [中] Bytecode VM の型別オペコードが実質未使用・行毎インタプリタの割高
+- 場所: `bytecode.cpp:146-179`(全バイナリオペコードが汎用 `EvaluateBinary` 呼ぶだけ)、
+  行毎 Value ボックス化(varchar は行毎 `std::string` 新規確保: data_chunk.cpp:218)
+- 提案: NULL-free int64 列の生配列直接演算など型特化ループ、ゾーンマップ NULL-free 先解決。
+
+### [低] リライタの throw がクエリ全体を落とし得る
+- 場所: `rewrite.cpp:797,804-806`(plan/optimizer.cpp:543 と scan_filter.cpp:219 は catch しない)
+- 提案: 非収束・深さ超過時は元の式を返す縮退動作(bytecode.cpp:135-139 と同様)。
+
+### [低] differential_test の網羅性ギャップ
+- CAST/SAFE_CAST 全般、JIT SUM カーネル、COALESCE/NULLIF/文字列関数、date±interval、
+  AND/OR 短絡×例外セル、IS TRUE 等の単項述語×列参照
+- 提案: まず CAST マトリクス(型×NULL×エラーセル)と CompileSum 差分を追加。
+
+### [低] 日時パーサが cast_expression.cpp と function_call_expression.cpp で重複かつ非互換
+- 場所: `cast_expression.cpp:44-115`(トリム有り)対 `function_call_expression.cpp:58-119`(トリム無し)
+- 提案: 共通ユーティリティへ抽出、CAST vs PARSE_TIMESTAMP 一致セルを差分テストへ。
+
+### [低] LIKE の `_` がバイト単位・double 等価のイプシロン比較(推移律破壊)
+- 場所: `binary_expression.cpp:100-125`、`type/value.cpp:403-406`
+- 提案: LIKE は UTF-8 文字単位照合へ。イプシロン比較は `ApproxEquals` に分離し
+  `operator==` は厳密比較に(GROUP BY/HASH 整合のため)。
 
 ---
 
 ## 4. plan(Cascades オプティマイザ)
 
-### 4.1 v1 指摘の状況
+### [高] フィルタ選択率のコスト二重計上(推定行数の過小評価)
+- 場所: `plan/implementation_rules.cpp:605-620,970-976`、`plan/cascades.cpp:816-847`
+- 問題: index scan 経路で `SelectionPlan`(ctor 内 `TableStatistics::Filter()` で選択率適用済み:
+  table_statistics.cpp:892-898)を被せた上にさらに `EmitRowCount()*selectivity` を乗算。
+  full scan 側は乗算なし。pushdown ルールは Selection 式を取り除かないため
+  selection 実装ルールも再度フル述語選択率を掛ける。index+filter 系代替が体系的に過小評価され
+  プラン選択が歪む。
+- 提案: covered==false 時は `SelectionPlan` の EmitRowCount をそのまま使用。
+  pushdown 後の残余 Selection は「pushed 済 conjunct を除いた述語」にするか、
+  子の estimated_rows を上限に clamp。
 
-- **[高] インデックスフィルタ選択率の二重計上**: 未修正
-  (`implementation_rules.cpp:766-767`(SelectionPlan ctor が Filter() 適用)+
-   `:779-781` で `EmitRowCount()*filter_selectivity` 再乗算。full scan 経路 :797-812 は単回)。
-  index+filter 系が sel² で系統的に過小評価される。
-- **[高] 存在しないテーブル SELECT * で LOG(FATAL)**: 未修正(`optimizer.cpp:84-86`、
-  コメント付きで意図的に継続)。入力起因エラーでプロセスごと落ちるのは DoS 相当。
-- **[中] Fingerprint O(k²)**: 部分(join cap 新設。文字列再構築は継続:
-  `cascades.cpp:225-244,589-592`)。
-- **[中] デコリレーション深さガード**: 部分(RAII `DepthGuard` 化: optimizer.cpp:158,649-653
-  だがインクリメント位置は旧指摘と同型で semi-join 構築(:897-910)を跨がない疑い)。
-- **[中] PhysicalProperties で wait_for_write_intent 落下**: 部分(TopN/pass-through は
-  転送: cascades.cpp:1896-1921。Join/Aggregation はデフォルト props のまま :1873-1883)。
-- **[中] push_selection_through_join 冗長**: 未修正(`cascades.cpp:917-948`)。
-- **[中] AggregationPlan::GetStats が子統計**: 未修正(`aggregation_plan.cpp:56-60`)。
-- **[低] IndexScan provided_order が等値固定列を含まず**: 未修正(`index_scan_plan.cpp:30-52`)。
-- mask=0 述語消滅 / capture 汚染 / Projection IsOrderedBy: **修正済み**(解決済み表)。
+### [高] 存在しないテーブルへの SELECT * でプロセス異常終了
+- 場所: `plan/optimizer.cpp:76-80`(`LOG(FATAL)`)
+- 提案: `ASSIGN_OR_RETURN` で Status を返す。入力起因のエラーを FATAL にしない。
+
+### [中] Fingerprint 再計算の O(k²) 直列化と join_enumeration の出現ごと再走査
+- 場所: `plan/cascades.cpp:518-522,1152-1167,729-744`
+- 問題: 重複検出が既存全式の `Fingerprint()`(AST 全体 ToString)を都度再計算する線形走査。
+  join_enumeration は join 式の出現ごとに 2^n ビットマスク全走査 + `CutConnected`。
+  n≈10〜16 でプランニング時間が爆発(cap 到達まで悪化)。
+- 提案: 式に構築時ハッシュを持たせ二段判定化。join_enumeration をグループ先頭 1 回に限定。
+
+### [中] デコリレーション深さガードが機能していない(デッドコード)
+- 場所: `plan/optimizer.cpp:572-577`(インクリメントが即時ラムダ内、実際の再帰 :783 はガード外)
+- 提案: インクリメントとガードを再帰呼び出し箇所へ移動。
+
+### [中] PhysicalProperties 派生で wait_for_write_intent が黙って落とされる
+- 場所: `plan/cascades.cpp:1207-1227`(kJoin/kAggregation がデフォルト props を返す)
+- 提案: 子へ `wait_for_write_intent`/`access_method` は転送し、row_position/ordering/limit_hint
+  のみ演算子特性に応じて落とす。
+
+### [中] push_selection_through_join は split_selection_over_join に完全包含され冗長
+- 場所: `plan/cascades.cpp:816-835` 対 `:838-847`(適用結果が常に部分集合)
+- 提案: 削除するか左側制限の意味を doc/comment 化。
+
+### [中] Pattern マッチ失敗時に capture バインディングが汚染され得る
+- 場所: `plan/cascades.cpp:593-612`(any_of 全敗時の挿入取消なし → false negative)
+- 提案: capture 検査を読み取り専用にし、挿入は成功確定時に commit。
+
+### [中] AggregationPlan::GetStats が子(集約前)統計を返す
+- 場所: `plan/aggregation_plan.cpp:55-57`(出力は最大 1 行なのに数十万行の統計)
+- 問題: Aggregation 上位の Selection がこの母数で Filter() を掛け残余 HAVING 付きプランの
+  行数推定が桁違いに膨らむ。
+- 提案: 自身の EmitRowCount に合わせ ScaleToRows(1)。GROUP BY 対応時に NDV ベース推定へ。
+
+### [低] 空 relations コンジュンクト(mask=0)がメモ内で適用先を失い述語消滅
+- 場所: `plan/cascades.cpp:277-292,309-339`(現在は optimizer.cpp:653-662 のガードで回避)
+- 提案: Build 内で検知したら throw または root Selection へ自動昇格。
+
+### [低] IndexScan の provided_order が等値固定列を含まず ORDER BY を取りこぼす
+- 場所: `plan/implementation_rules.cpp:581-585`、`index_scan_plan.cpp:30-49`
+- 問題: `WHERE a=5 ORDER BY a,b`(索引 (a,b))で不要なソート課金。
+- 提案: OrderMatches に「等値固定列スキップ可」規則を追加。
+
+### [低] ProjectionPlan::IsOrderedBy の盲目的転送による偽陽性リスク
+- 場所: `plan/projection_plan.hpp:52-55`
+- 提案: 恒等写像の場合のみ転送。
+
+### [低] Memo::Build 再呼び出しで状態破壊・kRelational のポインタ指纹
+- 場所: `plan/cascades.cpp:270-276,239-241`
+- 提案: Build 済みフラグで禁止 or 差分更新。指纹にはステートメント通番を使用。
 
 ---
 
 ## 5. executor
 
-### 5.1 v1 指摘の状況
+### [高] ParallelAggregation の `generic_scratch_` がワーカースレッド間で競合(データレース)
+- 場所: `executor/parallel_aggregation.cpp:159-180,475`(`parallel_aggregation.hpp:80`)
+- 問題: `Accumulate()` は input mutex の外で並行呼び出しされるが、共有メンバー vector に
+  複数スレッドが同時 clear/push_back → UB/集計破壊。式引数・DISTINCT・実行時型不一致の
+  フォールバック集計が 1 つでもあると発火。
+- 提案: ローカルスクラッチ(ワーカー毎 1 回アロケーション)へ。TSAN で並列集約テストを回す。
 
-- **[高] ParallelAggregation `generic_scratch_` データレース**: 未修正
-  (`parallel_aggregation.cpp:159-180`、共有メンバを mutex 外で clear/push_back)。
-- **[高] TableKeyFilter スタッシュが自己結合の別エイリアスにも適用**: **部分修正**
-  (文間漏れは防止: planning_heuristics.cpp:1009-1057,1133-1147。キーは table 名のまま
-  (:986,1134)で同文内 t1/t2 衝突は残存)。
-- **[高] 直列集約に LOGICAL_AND/OR ケース不在(DOP で結果が変わる)**: 未修正
-  (kLogicalAnd/Or は並列のみ: parallel_aggregation.cpp:138,145,414,423)。
-- **[高] 並列 SUM(int64) overflow wrap**: 未修正(`parallel_aggregation.cpp:253-267`)。
-- **[中] CanReserve→Add TOCTOU**: 部分(Release は CAS 化。Reserve 経路は非原子対のまま:
-  query_memory.hpp:36-39, hash_join.cpp:430-441)。
-- **[中] ハッシュジョインのスピル**: 部分(part==0 resident 判定に CanReserve:
-  hash_join.cpp:1188-1196。非 resident 読み出しと出力全量常駐(:1213)は予算外)。
-- **[中] 外部ソート最終段**: 部分(ストリーミング化。最終 `rows_` 全蓄積は継続)。
-- **[中] 即席 jthread で QueryScheduler 迂回**: 未修正
-  (hash_join.cpp:780,871,1017,1056 / sort.cpp:321 / scan_filter.cpp:345 /
-   parallel_aggregation.cpp:468。scheduler 未接続、worker cap 16 のみ: relational_factory.cpp:203-206)。
-- **[中] preaggregate が混在 select 項(SUM(x)+y)を通す**: 未修正
-  (`subquery_runtime.cpp:292-299`)。
-- **[中] UNNEST(PROTO) の stoll 黙殺**: 未修正(`detail/scan_filter.cpp:464,483`)。
-- **[中] IndexJoin 複合キー**: **修正済み**。
-- **[低] EstimateJoinRows 再エンコード**: 未修正(`planning_heuristics.cpp:180-209`)。
-- **[低] Selection::NextBatch の Reset で容量廃棄**: 未修正(`selection.cpp:124`)。
-  ParallelScan 側は修正済み。
-- **[低] Distinct 重複集合の無課金**: 部分(SortDistinctPlan/Executor 新設:
-  implementation_rules.cpp:1540-1572。ただし cost にメモリ勘定がなく hash が選ばれ続ける)。
-- **[低] Window SUM uint64 wrap / O(n²) 分割**: 未修正(`detail/window_eval.cpp:555-557`)。
+### [高] TableKeyFilter スタッシュがテーブル名単位で自己結合の別エイリアスにも適用され誤結果
+- 場所: `executor/detail/planning_heuristics.cpp:884-891,1027-1051`
+- 問題: `FROM t AS t1 JOIN t AS t2 ... WHERE t1.x IN (...)` のキー集合が t2 のスキャンにも
+  t1 の列で適用され過剰フィルタ。
+- 提案: スタッシュキーに alias/qualifier を含める、または同一述語由来のスキャンのみに制限。
+
+### [高] LOGICAL_AND/OR 集約が直列実行で無視され、DOP で結果が変わる
+- 場所: `executor/aggregation.cpp:338-351,402-424`(ケース不在)/ `relational_factory.cpp:110-123`
+- 問題: visitor(:633)は parse し、ParallelAggregation と AST 基準は実装するが直列 switch に
+  ケースがなく常に NULL。行数しきい値前後で同じクエリの答えが変わる(三層一致規則違反)。
+- 提案: 直列パスに追加し、NULL 入力の扱いを差分テストで固定。
+
+### [高] 並列 SUM(int64) が overflow を黙って wrap、直列は例外という非対称
+- 場所: `parallel_aggregation.cpp:243-257` 対 `type/value.cpp:666-668`
+- 提案: バッチ確定时マージを CheckedAdd 相当に統一。
+
+### [中] グローバル予算の CanReserve→Add が TOCTOU、プロセス単位で全クエリ共有
+- 場所: `hash_join.cpp:419-432` / `query_memory.cpp:61-76`
+- 提案: CAS ベース TryReserve へ。中長期はクエリごと budget lease へ移行。
+
+### [中] ハッシュジョインのスピルが片レベルのみで、パーティション読み出し時のメモリ上限がない
+- 場所: `hash_join.cpp:846-884,903-905,1049-1126`
+- 問題: Flush 後もパーティションサイズ無検証。スキューで予算無視の OOM。出力も全量常駐。
+- 提案: 閾値超過で再分割(再帰的スピル)or ストリーミング読み。キーヒストグラム分割。
+
+### [中] 外部ソートがマージ最終段で全行を再常駐させ、スピルの意味を消す
+- 場所: `sort.cpp:517-557`
+- 提案: マージ結果のストリーミング返却 or 最終 run 1 つになった時点でファイル直接読み。
+
+### [中] オペレータごとの即席 jthread 生成が QueryScheduler を迂回しネストで過剰購読
+- 場所: `hash_join.cpp:746-766,894-914,931-969` / `sort.cpp:313-339` /
+  `detail/scan_filter.cpp:343-388`(ParallelAggregation×HashJoin×…で DOP 乗算)
+- 提案: QueryScheduler の CPU slot を消費するワーカープールへ統一、DOP 予算の子伝搬。
+
+### [中] 相関サブクエリ preaggregate 経路が空 Row を代表行として評価し範囲外参照の恐れ
+- 場所: `detail/subquery_runtime.cpp:397-404`(`SUM(x)+y` のような混在 select 項が通過)
+- 提案: aggregate_only 判定にローカル非集約列の存在チェックを追加。
+
+### [中] UNNEST(PROTO) の行幅が行ごとに変わりスキーマと不整合
+- 場所: `detail/scan_filter.cpp:458-492`(幅正規化なし、`std::stoll` 失敗は catch(...) 黙殺で 0 埋め)
+- 提案: 1 行目スキーマ準拠で幅正規化、パース失敗は警告 or 明示エラー。
+
+### [中] IndexJoin が複合キーの先頭列しか使わず過剰マッチ
+- 場所: `index_join.cpp:53-56`(残列の等価検証なし)
+- 提案: 残り列の等価チェック追加、または BuildKeyOffsets で複合を禁止して assert。
+
+### [低] EstimateJoinRows が候補ごとに全行 memcomparable エンコードをやり直す
+- 場所: `planning_heuristics.cpp:179-215,1088-1089`
+- 提案: キー頻度表キャッシュ or NDV ベース閉式估算(table_statistics を利用)。
+
+### [低] ParallelScan の pending 分割コピー・Selection のチャンク再初期化
+- 場所: `parallel_scan.cpp:158-167,190-196` / `selection.cpp:124`(`Reset(schema_,max_rows)`
+  で確保済み容量を毎バッチ廃棄。Projection は Reset()+Reserve で回避済み)
+- 提案: AppendGather 使用、Selection も同様に容量再利用。
+
+### [低] DistinctExecutor の重複集合がメモリ予算に無勘定で無限成長
+- 場所: `distinct.cpp:11-23`
+- 提案: insert 時課金、超過で sort-based unique へフォールバック(executor_todo の SortDistinct と接続)。
+
+### [低] Window の SUM(int) が uint64 ラップ・分割は O(n²)
+- 場所: `detail/window_eval.cpp:393-401,489-499`
+- 提案: int64 チェック付き統一、grouping をハッシュマップ化。
 
 ---
 
 ## 6. query / server
 
-### 6.1 v1 指摘の状況
+### [高] JOIN ... USING が `col = col` という自明な条件になる
+- 場所: `query/googlesql_ast_visitor.cpp:1704-1707`(左右両辺に同一 ColumnValueExp)。
+  コメント(:1699-1701)は「shared columns の等価結合」を意図しているが実装が伴っていない
+- 問題: `t1 JOIN t2 USING(id)` が「id 非 NULL 行のクロス積」になり結合が壊れる。
+- 提案: 左右ソースの修飾子付き `l.id = r.id` を構成。USING 専用中間表現を SelectSource に
+  持たせるのが確実。
 
-- **[高] JOIN ... USING が `col = col` 自明真を生成**: **未修正**
-  (`googlesql_ast_visitor.cpp:1930-1946`。移動のみ)。
-- **[高] CREATE CONSTANT が thread_local で接続間リーク**: 未修正
-  (`type/interval.cpp:19,41-53`、visitor `:2375`)。
-- **[高] 集合演算**: **回帰**(§6.2 参照)。
-- **[中] VARCHAR の NUL バイトがフレーミングを壊す**: 未修正
-  (`postgres_protocol.cpp:45-60,228-`)。
-- **[中] 全行 materialize/backpressure**: 部分(kMaxServerResultRows 新設。
-  単一 string 連結と Queue erase O(n) は維持)。
-- **[中] UPDATE SET の型無検査**: **未修正 + 実害確認**
-  - `UPDATE t SET a='not-an-int'`(INT64 列)が成功し、生バイト再解釈値
-    `2936174736662894` を永続化することを実機確認(executor/update.cpp に coercion 無し。
-    INSERT は有り)。
-  - 提案: INSERT の coercion ヘルパを共用。
-- **[中] NULL ソート順**: 変化(NULLS FIRST/LAST パース導入、既定規約を statement.hpp に
-  明記。PG 既定 ASC=NULLS LAST とは不一致のまま)。
-- **[中] 日時パースの黙認**: 部分(named zone 解決追加。sscanf 未確認・未知 TZ の
-  既定オフセットフォールバックは残存: visitor `:49-99`)。
-- **[低] sql_engine.hpp stray include / VisitExpression ~630 行**: 未修正。
-- **[低] pgwire $$ 非対応 + main.cpp 二重実装**: 部分(コメント対応済み。
-  $$/$tag$・ネストコメントは未対応。main.cpp:44-101 との不統一継続)。
+### [高] CREATE CONSTANT のセッション定数がスレッド生存期間で共有され接続間リーク
+- 場所: `type/interval.cpp:19,41-53`(tls_session_constants)/
+  `query/googlesql_ast_visitor.cpp:886,2061`
+- 問題: サーバはワーカースレッドを使い回すため、ある接続の定数が別接続で参照され
+  PathExpression が静かに置換される。同名 `t_named_windows`(:1675-1678)はスコープ復元していて
+  対照的。
+- 提案: 定数を TransactionContext/セッションオブジェクトへ。最低限ステートメント終了時にクリア。
 
-### 6.2 新規発見(現 HEAD での回帰・新バグ)
+### [高] サーバの SplitSqlStatements がドル引用符($$/$tag$)非対応
+- 場所: `server/postgres_protocol.cpp:264-366` 対 `main.cpp:69-85`(main 側は対応済みで不統一)
+- 問題: psql 標準の `SELECT $$a;b$$` で文字列内部分割され断片が別文として実行。
+  ブロックコメントネストも未対応。
+- 提案: pgwire 版にドルタグ追跡を実装、または main.cpp 側を pgwire ライブラリへ一本化。
 
-- **[高] 集合演算の ORDER BY/LIMIT/OFFSET/WITH が無言で捨てられる(現 HEAD 回帰)**
-  - 場所: `query/googlesql_ast_visitor.cpp:1968-1981`(SetOperation 早抜けが
-    OrderBy/LimitOffset/WithClause 処理より前に return)
-  - 実機再現: `SELECT a FROM t1 UNION ALL SELECT a FROM t2 ORDER BY a DESC LIMIT 2`
-    → ソートも制限も適用されない。
-  - 提案: reflog `9423511` が持っていた head への句保存コード(同 rev :2062-2115)を復元。
-- **[中] 集合演算種別が常に UNION ALL(v1 #7 への逆戻り回帰)**
-  - 場所: visitor `:1977-1978`(全オペランド `AddUnionAll`)+
-    `executor/relational.cpp:839`(種別無視の追記)
-  - 実機再現: `UNION DISTINCT` が重複保持、`INTERSECT DISTINCT` が連結を返す。
-  - 提案: 9423511 の `SetOperationKind` パイプライン(visitor の MetadataList 解析、
-    common/set_operation.hpp、executor/set_operation.*)を丸ごと復元(§8 参照)。
-- **[高] sql_template 再バインドが `union_all_` 枝を無言で喪失(実機再現)**
-  - 場所: `query/sql_template.cpp:325-414`(BindSelect が union_all_/Qualify を
-    コピーしない)、`sql_engine.cpp:641-647`(fill 時 RememberTemplate)、`:569-579`(再生)
-  - 問題: リテラルが head 側だけの集合演算は、枝落ちした文がそのままテンプレート
-    キャッシュに保存され、同一形状の次回実行は **head のみ実行され行が欠落**。
-    枝側にもリテラルがある場合のみパラメタ数不一致 throw が偶然救済する(設計ではない)。
-  - 再現: `SELECT a FROM t1 WHERE a=1 UNION ALL SELECT a FROM t2;` →
-    次に `...WHERE a=2...` で t2 側が消える。
-  - 提案: BindSelect に union_all_ の再帰コピー(+SetQualify)追加。
-    または `RequiresRelationalEvaluation()` の文をテンプレート対象外に。
-- **[高] 同じ再バインドで `has_limit_` が喪失し DISTINCT+LIMIT が無視される(実機再現)**
-  - 場所: `query/sql_template.cpp:398-400`(ctor に limit 値を渡すのみで SetLimit せず)、
-    `sql_engine.cpp:976,994`
-  - 再現: `SELECT DISTINCT a FROM t WHERE a<9 LIMIT 2;` の次に `a<99` 版 → LIMIT 無視。
-  - 提案: `result->SetLimit(select.HasLimit() ? ... : nullopt)` を追加。
-    SelectStatement の全フィールドを運ぶコピーヘルパ化が根本策。
-- **[中] CollectStatementColumns が union_all_ 枝を走査しない**
-  - 場所: `executor/detail/expression_eval.cpp:4359-4381`
-  - 問題: reusable_projections が root 文の必須列だけで初期化され table 名単位で共有。
-    自己 UNION の異列枝や集約+同名表の組合せで過小射影(column X not found)が発火し得る。
-  - 提案: UnionAll 枝(と Qualify)の走査追加 + 共有キーに statement 識別子を含める。
-- **[中] plan_cache: エポック無効化は同一 fingerprint の再照会時しか起きない**
-  - 場所: `query/plan_cache.hpp:624-643`(lazy drop)、`:578-591`、`sql_engine.cpp:1035-1038`
-  - 問題: DROP TABLE 後に二度と照会されない fingerprint は Table/Schema を pin 継続。
-    `Find()` は parameter mismatch 判定前に hits++(:589,641)しヒット率指標が膨張。
-    thread(:583)と global(:632)で epoch 参照経路が非対称。
-  - 提案: BumpSchemaEpoch 時の世代スイープ or TTL。カウンタ計上位置の整理。
-- **[低] ParameterSlot が `Type()==kConstantValue` と偽装する UB 地雷**:
-  `plan_cache.hpp:114-131`。将来 `AsConstantValue()` 呼び出しで downcast UB。
-  debug assert か専用 TypeTag。
-- **[低] evaluation_context_impl.hpp が本番未接続(コメントは接続済みと主張)**:
-  `evaluation_context_impl.hpp:14-16`。include は differential_test のみ。
-  接続するか削除。
-- **[低] ORDER BY 序数が静かに無視(実機再現)**: `SELECT a FROM t ORDER BY 1 DESC` が
-  無ソート。ParseOrderingTerm が式を返さず term ごと破棄。序数解決 or 明示エラー。
+### [高] 集合演算が種別に関係なく常に UNION ALL として連結
+- 場所: `query/googlesql_ast_visitor.cpp:1652-1665` / `executor/relational.cpp:766-771`
+- 問題: `UNION`(DISTINCT)は重複排除されず、`INTERSECT`/`EXCEPT` も和集合。compliance テストに
+  UNION 系が見当たらず未検出。
+- 提案: op 種別を保持し UNION DISTINCT は Distinct 相当、INTERSECT/EXCEPT は明示的非対応エラーに。
+
+### [中] VARCHAR 中の NUL バイトがワイヤフレーミングを壊す
+- 場所: `server/postgres_protocol.cpp:45-65,228-244`(SanitizeField は ErrorResponse のみ)
+- 提案: DataRow 送出時の NUL 検知で 22021 エラー応答 or サニタイズ。
+
+### [中] 単独の `9223372036854775808` リテラルが INT64_MIN に化ける
+- 場所: `query/googlesql_ast_visitor.cpp:150-152`(-9223372036854775808 用の特別扱いが
+  ParseIntLiteral 自体に入っている)
+- 提案: 特別扱いを UnaryExpression の "-" 分岐に限定し、ParseIntLiteral は範囲超過エラー。
+
+### [中] クエリ結果を全行 materialize してから送信、backpressure 不成立
+- 場所: `server/postgres_server.cpp:800-822,471-478`(Queue が毎回 erase(0,offset) で O(n))
+- 提案: RowDescription 先送り + DataRows をチャンク単位で EPOLLOUT backpressure に乗せる。
+  Queue は deque<string>/リングへ。
+
+### [中] 認証後入力上限 16 MiB/接続 × max_connections=1024 が DoS 面
+- 場所: `server/postgres_server.cpp:61,406-414` / `postgres_server.hpp:18`
+- 提案: 接続あたり入力バッファ合計の上限(64 KiB〜1 MiB)を別途設定し超過切断。
+
+### [中] NULL ソート順が PostgreSQL 既定と逆(GoogleSQL 式)
+- 場所: `executor/sort.cpp:163-181` / `relational.cpp:290-291,374-376`
+  (ASC=NULLS FIRST。pgwire 互換掲げなら PG 既定 ASC=NULLS LAST と逆向け)
+- 提案: 規約を明示・文書化。pgwire 互換重視なら NULLS FIRST/LAST パースと共に PG 既定へ。
+
+### [中] 型推論・暗黙キャストの穴
+- 場所: `googlesql_ast_visitor.cpp:672-710`(配列要素型が PathExpression 等で INT64 フォールバック)/
+  `sql_engine.cpp:752-770` vs `1055-1068`(INSERT は coercion 有り、UPDATE SET は列型検査なし)
+- 提案: 要素型は実行時 Value から決めるか非対応エラー。UPDATE も INSERT の coercion を共用。
+
+### [中] 日時・タイムゾーンパースのエラー黙認と三系統重複
+- 場所: `googlesql_ast_visitor.cpp:49-99`(sscanf 戻り値未確認、不正 TZ は既定 -8h へ黙って
+  フォールバック)、`904-1020`。executor/detail/expression_eval.cpp:644 以降や
+  function_call_expression.cpp にも別実装(AST/Bytecode/JIT 差異リスク)
+- 提案: パース層(type/date.cpp 等)に一元化、失敗は可視化。タイムスタンプリテラルの差分ケース追加。
+
+### [低] sql_engine.hpp の #endif 後に stray include
+- 場所: `query/sql_engine.hpp:126-127`(`<functional>` がガード外)
+- 提案: ガード内へ移動。
+
+### [低] VisitExpression 約 630 行の単一関数
+- 場所: `query/googlesql_ast_visitor.cpp:881-1514`(リテラル/日時/STRUCT-JSON/区間が混在)
+- 提案: 「リテラル系」「日時系」「コンストラクタ系」関数群に分離、JSON エスケープ共通ヘルパ化。
 
 ---
 
 ## 7. ビルド・リポジトリ衛生・テスト基盤
 
-- **[中] 全テストが legacy parser + sql 層へ過剰リンク(test_util ODR ハザード)**:
-  未修正(`CMakeLists.txt:559-572`、test_util が `type/row.cpp` を独自コンパイル)。
-- **[中] CI への differential_test 未組み込み**: TSAN/fuzzer-nightly workflows は新設
-  されたが、三層一致性の要である differential_test は未登録。§3 の問題群の早期検出に必須。
-- **[低] compliance testdata の実行残骸**: `query/testdata/googlesql_compliance/` 配下に
-  `ironlamb-compliance-*` の .db/.log が多数。掃除 + ignore。
-- **[低] main.cpp の分割器二重実装**: 未修正(`main.cpp:44-101`。pgwire 版との差異継続)。
+### [中] リポジトリルートに 277 個のテストログが散布
+- 場所: ルート直下の `transaction_test-*.log`(267 件)・`page_pool_test-*.log` 等。
+  untracked だが `.gitignore` に `*.log` がなく `git status` が 369 エントリで汚染されている。
+- 提案: `.gitignore` に `*.log`(少なくとも `*_test-*.log`)を追加し、既存ログを削除。
+  テスト側でログ出力先を build ディレクトリに寄せる。
 
-(v1 の「ルートログ散布」「サーバ入力上限」は解決済み表参照)
+### [中] 全テストが legacy parser + sql 層へ過剰リンク
+- 場所: `CMakeLists.txt:557-570`(add_simple_test)、`:153-162`(`tinylamb_parser` の正体は
+  `legacy/parser/*.cpp`)、`:418-423`(test_util が `type/row.cpp` を独自コンパイル →
+  `tinylamb_type` アーカイブ内同一 TU とシンボル競合の ODR ハザード)
+- 問題: page/recovery 等の下位レイヤーテストまで legacy parser/sql/test_util にリンクされ、
+  ビルド時間増とレイヤ違反の隠蔽要因になる。AGENTS.md の「legacy は canonical 実行に不使用」
+  と、top-level `parser/` ディレクトリ(legacy parser のテスト置き場)の位置づけも不明瞭。
+- 提案: add_simple_test に必要ライブラリ上書き引数を追加。test_util は row.cpp を持たず
+  `tinylamb::type` に依存。parser ディレクトリの役割を AGENTS.md/CMake コメントで明文化。
 
----
+### [低] main.cpp のステートメント分割器が pgwire 版と二重実装
+- 場所: `main.cpp:42-101`(自認コメントあり。ドル引用符対応差が既に発生)、stdin 一括読込は
+  サイズ無制限
+- 提案: pgwire ライブラリへ統合、読み込みはチャンク処理 or 上限付き。
 
-## 8. 新規モジュール(現 HEAD 未収録 — reflog `9423511` / `../tinylamb_tmp`)復元時必修事項
-
-集合演算・MergeJoin・TopN 等は一時的に実装されたが現作業木から外れている。
-品質自体は概ね妥当(種別 6 種・列数/型不一致の明示エラー・共通型昇格・スピル・
-CTE 内集合演算まで整備)だが、以下を修正してから復元すること。
-
-- **[高] EXCEPT DISTINCT が多重度を数えてしまい、B 側に存在する行を出力する**
-  - 場所(tmp 木): `executor/set_operation.cpp:234-241`(AppendExcept の all=false 経路)
-  - 問題: `removed` を multiset カウント減算に使うため `A={5,5,5}, B={5}` で 1 行出力。
-    SQL の EXCEPT DISTINCT は「B に一度でも出現した行は除外」(正解は空集合)。
-    EXCEPT ALL としては正しいので分岐構造の誤り。既存テストは count_A==count_B のみで未検出。
-  - 提案: distinct 時は「存在すれば無条件スキップ」、all 時のみカウント減算。
-    `count_A > count_B` の差分テスト追加。
-- **[高] SetOperationExecutor が UNION ALL まで全入力をメモリ materialize(予算課金・スピル対象外)**
-  - 場所(tmp 木): `executor/set_operation.cpp:284-307`(spill 条件が
-    `operation != kUnionAll` のため)、`:84-85,169-171`
-  - 問題: UNION ALL は本来逐次 drain のストリーミング演算なのに全ソース全行を蓄えてから
-    最初の 1 行を返す。QueryMemoryCharge も無しで大入力 OOM。旧 relational.cpp 実装より劣化。
-  - 提案: kUnionAll はソース順次連結(MergeAppend に寄せる)へ。課金は全種別に適用。
-- **[中] MergeJoin が両入力+出力を 3 重に完全 materialize、入力ソート済み契約を検証しない**
-  - 場所(tmp 木): `executor/merge_join.cpp:45-61,14-27`
-  - 問題: マージジョインの存在意義(ストリーミング合成)を果たしておらず、スピルも無い。
-    ルール側の IsOrderedBy 判定が誤ると黙って欠損マッチ(誤結果)。
-  - 提案: ストリーミング本体へ書き換え + debug ビルドで隣接キー順序 assert。
-- **[中] MergeJoinPlan が semi/anti でも右側統計を Concat し schema と列数不整合**:
-  `merge_join_plan.cpp:21-29`。semi/anti では左 stats のみに。
-- **[中] TopN の LIMIT 0 / WITH TIES 契約が LimitPlan・LimitExecutor と正反対**:
-  `topn.cpp:19-22`(limit 0 = 空)対 `limit_plan.cpp:29` 等(limit 0 = 無制限)。
-  現状はルールが limit_count != 0 でガードし不発だが地雷。with_ties 時 EnforcesLimit=false
-  だと engine が LimitExecutor を上乗せし ties を切り捨てる。
-  「limit 0 = 無制限」へ統一し、with_ties 用の専用フラグを engine と合意すること。
-- **[中] 集合演算実装ルールが ORDER BY の NULLS FIRST/LAST 指定を落とす**:
-  implementation_rules.cpp:1635-1638(`SortKey{..., nullopt}` 固定)。
-  required.ordering に方向情報を持たせるのが根本対応。
-- **[中] 混合連鎖の種別決めが「メタデータ欠落時に最終種別を複製」に依存**:
-  9423511 visitor:2038-2055。空 op を skip → padding で back() 複製。欠落は throw に。
-  SqlEngine 経由の UNION DISTINCT/INTERSECT/EXCEPT(ALL) e2e テスト追加。
-- **[中] スピル時も出力が全量メモリ常駐**: set_operation.cpp:148-166(`accumulated` に
-  課金・再分割なし)。charge 課金 + 閾値超過で再分割。
-- **[低]** SetOperationPlan の EmitRowCount/GetStats が常に先頭子基準(hpp:30-32) /
-  MergeAppendExecutor::Before が比較のたび KeyValue 再計算(merge_append.cpp:61-98) /
-  Max1RowExecutor が std::runtime_error throw(max1_row.cpp:18-20) /
-  ValuesExecutor の「replayable」コメントと move 実装の不一致(values.hpp:13-16) /
-  RelationRenamePlan::GetStats が改名前修飾子のまま(relation_rename_plan.hpp:37-39)。
+### [低] differential_test / TSAN / fuzz の CI 組み込み
+- 本レビューで `differential_test` が赤であることが実機確認できたが、CI がこれを拾っていない。
+  §3 の三層一致性問題は TSAN + differential の定期実行で大半が早期検出可能。
+- 提案: differential_test・ASAN/TSAN・lsm_tree_fuzzer(sync=true 経路)を CI の定期ジョブへ。
 
 ---
 
-## 推奨着手順(v2)
+## 既知の設計バックログとの関係
 
-1. **ワーキングツリーの安定化**: §8 のモジュール群は reflog `9423511` /
-   `../tinylamb_tmp` にのみ存在。意図した状態か確認し、戻す場合は本節の必修修正を
-   施してから取り込む。
-2. **differential/回帰テスト網の整備**: CI に differential_test を追加し、
-   集合演算・LIMIT・テンプレート再バインドの e2e テスト(§6.2 の再現クエリ)を固定化。
-   「2 回目の実行で結果が変わる」系は回帰として最悪。
-3. **ARIES 系の構造修复(§1)**: 専用 `kAbort` 型導入 + マーカ durable 化 +
-   DeleteRow 冪等化で、v1 からの abort マーカ問題と v2 新発見(undo 中断マーカ、
-   page_lsn 回帰)を同一の修復筋で解消。`log → mutate` 順序統一と destroy redo も併せて。
-4. **新機能の正確性(§3.2)**: window frame_unit 実装と interval sniffing 撤去。
-   どちらも「静かに誤った結果を返す」タイプ。
-5. **query 層の高**(USING・UPDATE 型検査・NUL バイト・session constants)。
-6. **並列的正確性(§5)**: generic_scratch_ レース、直列/並列集約の不一致、SUM wrap。
-   TSAN + 直列/並列/AST 差分テストで固定。
-7. **コストモデル(§4)**: 選択率二重計上の解消(pushdown 後残余述語の整理)。
+本レビューで指摘した「スピル予算の統一プロトコル」(§5)、「Window の正式化」(§5 低)、
+「SortDistinct フォールバック」(§5 低)は [`executor_todo.md`](executor_todo.md) の項目と
+接続する。一方で:
+
+- Abort マーカ問題(§1)、destroy redo 未実装(§1)、LSM リカバリ不在(§2)、
+  USING/集合演算(§6)はバックログ未記載の**新規発見**であり、優先度判断が必要。
+- [`optimizer_todo.md`](optimizer_todo.md) のコストモデル改善には §4 の選択率二重計上が
+  前提知識として有用。
+
+推奨着手順: (1) §2-1 デッドロックのような即修正可能なもの → (2) differential_test を緑に戻し
+例外セルを追加(§3) → (3) WAL 順序・abort 冪等性(§1 高) → (4) USING/集合演算/セッション定数
+(§6 高) → (5) 並列集約レースと直列/並列不一致(§5 高) → (6) コストモデル二重計上(§4 高)。

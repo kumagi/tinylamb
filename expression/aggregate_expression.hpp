@@ -110,6 +110,18 @@ class AggregateExpression : public ExpressionBase {
            type_ == AggregationType::kApproxTopCount ||
            type_ == AggregationType::kApproxTopSum;
   }
+  // Multi-level aggregation: SUM(AVG(x) GROUP BY y).  The inner grouping
+  // keys are carried through rewrites and can be consumed by a relational
+  // implementation when supported.
+  [[nodiscard]] const std::vector<Expression>& InnerGroupBy() const {
+    return inner_group_by_;
+  }
+  [[nodiscard]] bool HasInnerGroupBy() const {
+    return !inner_group_by_.empty();
+  }
+  void SetInnerGroupBy(std::vector<Expression> group_by) {
+    inner_group_by_ = std::move(group_by);
+  }
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
@@ -126,6 +138,7 @@ class AggregateExpression : public ExpressionBase {
   std::vector<Expression> trailing_args_;
   Expression where_filter_;
   std::string array_element_sql_type_;
+  std::vector<Expression> inner_group_by_;
 };
 
 }  // namespace tinylamb

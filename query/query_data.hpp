@@ -18,6 +18,7 @@
 #define TINYLAMB_QUERY_DATA_HPP
 
 #include <ostream>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -78,6 +79,10 @@ struct QueryData {
   bool wait_for_write_intent_{true};
   std::vector<Expression> order_expressions_;
   std::vector<bool> order_ascending_;
+  // Explicit NULLS FIRST/LAST per ORDER BY term. An absent entry preserves
+  // the SQL default (NULLS FIRST for ASC, NULLS LAST for DESC).
+  std::vector<std::optional<bool>> order_nulls_first_;
+  bool distinct_{false};
   // LIMIT/OFFSET made visible to the optimizer (Phase 5 Top-K). The plan may
   // fold them into a LimitPlan; the engine skips its own wrapper when the
   // plan reports EnforcesLimit (D6).

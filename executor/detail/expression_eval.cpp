@@ -8741,32 +8741,6 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
             upper_name == "DATE") {
           return Value(std::move(upper_name));
         }
-        // `struct.field` where the base is a struct-typed column: resolve the
-        // base column and extract the field.  The AST may fold the dotted path
-        // into ColumnName(schema="struct", name="field") or a single dotted
-        // name ColumnName(schema="", name="struct.field").
-        {
-          std::string base_name;
-          std::string field_name;
-          if (!name.schema.empty()) {
-            base_name = name.schema;
-            field_name = name.name;
-          } else {
-            const size_t dot = name.name.find('.');
-            if (dot != std::string::npos && dot + 1 < name.name.size()) {
-              base_name = name.name.substr(0, dot);
-              field_name = name.name.substr(dot + 1);
-            }
-          }
-          if (!base_name.empty() && !field_name.empty()) {
-            try {
-              const Value base = Lookup(ColumnName("", base_name), scope);
-              return StructFieldValue(base, field_name);
-            } catch (...) {
-              // fall through to rethrow the original error
-            }
-          }
-        }
         throw;
       }
     }

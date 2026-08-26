@@ -292,6 +292,7 @@ tinylamb_add_layer(tinylamb_expression
         expression/interval_expression.cpp
         expression/array_expression.cpp
         expression/cast_expression.cpp
+        expression/lambda_expression.cpp
         expression/window_function_expression.cpp
         expression/proto_text.cpp
         expression/rewrite.cpp
@@ -331,13 +332,19 @@ tinylamb_add_layer(tinylamb_executor
         executor/executor_base.cpp
         executor/selection.cpp
         executor/hash_join.cpp
+        executor/merge_join.cpp
+        executor/merge_append.cpp
         executor/cross_join.cpp
         executor/insert.cpp
         executor/update.cpp
         executor/delete.cpp
         executor/sort.cpp
+        executor/topn.cpp
         executor/limit.cpp
+        executor/max1_row.cpp
+        executor/set_operation.cpp
         executor/distinct.cpp
+        executor/values.cpp
         executor/relational.cpp
         executor/relational_factory.cpp
         executor/detail/relation.cpp
@@ -365,6 +372,13 @@ tinylamb_add_layer(tinylamb_executor
         plan/implementation_rules.cpp
         plan/index_only_scan_plan.cpp
         plan/aggregation_plan.cpp
+        plan/empty_plan.cpp
+        plan/distinct_plan.cpp
+        plan/sort_distinct_plan.cpp
+        plan/values_plan.cpp
+        plan/max1_row_plan.cpp
+        plan/merge_join_plan.cpp
+        plan/set_operation_plan.cpp
         plan/plan.cpp
         plan/index_scan_plan.cpp
         query/query_data.cpp
@@ -715,6 +729,7 @@ add_fuzzer_test(index/lsm_detail/cache_fuzzer.cpp)
 add_fuzzer_test(index/lsm_tree_fuzzer.cpp)
 add_fuzzer_test(index/b_plus_tree_fuzzer.cpp)
 add_fuzzer_test(table/table_fuzzer.cpp)
+add_fuzzer_test(expression/expression_fuzzer.cpp)
 add_fuzzer_test(legacy/parser/parser_fuzzer.cpp tinylamb::parser)
 add_fuzzer_test(server/postgres_protocol_fuzzer.cpp tinylamb::postgres_server)
 add_fuzzer_test(query/googlesql_ast_fuzzer.cpp tinylamb::sql)
