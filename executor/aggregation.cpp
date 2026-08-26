@@ -348,7 +348,8 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
   std::vector<Value> results;
   results.resize(aggregates_.size());
   std::vector<int64_t> counts(aggregates_.size(), 0);
-  std::vector<std::unordered_set<Value>> distinct_values(aggregates_.size());
+  std::vector<relational_detail::DistinctValueSet> distinct_values(
+      aggregates_.size());
   // General accumulators for aggregate kinds the typed switches do not
   // model (kept in aggregate order).
   std::vector<std::unique_ptr<relational_detail::AggregateAccumulator>>

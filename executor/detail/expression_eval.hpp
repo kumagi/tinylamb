@@ -52,6 +52,16 @@ struct AggregateInput {
 
 std::string ElementSqlTypeName(ValueType type);
 
+// DISTINCT semantics: all NaNs collapse to one entry and -0 folds to +0.
+struct DistinctValueHash {
+  size_t operator()(const Value& value) const;
+};
+struct DistinctValueEqual {
+  bool operator()(const Value& left, const Value& right) const;
+};
+using DistinctValueSet =
+    std::unordered_set<Value, DistinctValueHash, DistinctValueEqual>;
+
 // DISTINCT/GROUP-BY key normalization: every NaN collapses to one canonical
 // bit pattern and negative zero folds to +0, matching SQL equality semantics
 // where raw IEEE bit patterns would otherwise count NaNs as distinct.
@@ -77,7 +87,7 @@ struct AggregateAccumulator {
   Value extreme;
   // GoogleSQL MIN/MAX: a NaN input poisons the result.
   mutable bool saw_nan_{false};
-  std::unique_ptr<std::unordered_set<Value>> distinct;
+  std::unique_ptr<DistinctValueSet> distinct;
   std::unique_ptr<std::unordered_set<int64_t>> distinct_ints;
 
  private:

@@ -79,6 +79,24 @@ std::string ElementSqlTypeName(ValueType type) {
   }
 }
 
+size_t DistinctValueHash::operator()(const Value& value) const {
+  return std::hash<Value>()(CanonicalDistinctValue(value));
+}
+
+bool DistinctValueEqual::operator()(const Value& left,
+                                    const Value& right) const {
+  if (left.type != right.type) { return false;
+}
+  if (left.type == ValueType::kDouble) {
+    const double x = left.value.double_value;
+    const double y = right.value.double_value;
+    if (std::isnan(x) && std::isnan(y)) { return true;
+}
+    return x == y;
+  }
+  return left == right;
+}
+
 Value CanonicalDistinctValue(const Value& value) {
   if (value.type == ValueType::kDouble) {
     const double d = value.value.double_value;
@@ -324,9 +342,8 @@ void CollectAggregates(  // NOLINT(misc-no-recursion)
 
 AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate)
     : expression(aggregate),
-      distinct(aggregate->Distinct()
-                   ? std::make_unique<std::unordered_set<Value>>()
-                   : nullptr) {
+      distinct(aggregate->Distinct() ? std::make_unique<DistinctValueSet>()
+                                     : nullptr) {
   if (aggregate->GetType() == AggregationType::kArrayAgg ||
       aggregate->GetType() == AggregationType::kStringAgg ||
       aggregate->NeedsGroupContext()) {
