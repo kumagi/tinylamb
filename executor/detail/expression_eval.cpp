@@ -7436,7 +7436,25 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         if (step.IsNull()) {
           return {};
         }
-        step_days = step.value.int_value;
+        if (step.type == ValueType::kVarChar) {
+          // Dynamic steps arrive as make_interval(...) results encoded
+          // "Y-M D H:M:S"; only pure day counts are supported here.
+          long long years = 0, months = 0, days = 0, hours = 0, mins = 0,
+                    secs = 0;
+          if (sscanf(
+                  std::string(step.value.varchar_value).c_str(),
+                  "%lld-%lld %lld %lld:%lld:%lld", &years, &months, &days,
+                  &hours, &mins, &secs) >= 3 &&
+              years == 0 && months == 0 && hours == 0 && mins == 0 &&
+              secs == 0 && days != 0) {
+            step_days = static_cast<int64_t>(days);
+          } else {
+            throw std::runtime_error(
+                "unsupported GENERATE_DATE_ARRAY step expression");
+          }
+        } else {
+          step_days = step.value.int_value;
+        }
       }
     }
     if (step_days == 0) {
@@ -8112,6 +8130,21 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           c = static_cast<char>(std::tolower(c));
         }
         step_days = unit == "day" || unit == "days" ? interval.Amount() : 0;
+      } else if (arguments[2].type == ValueType::kVarChar) {
+        // Dynamic steps arrive as make_interval(...) results encoded
+        // "Y-M D H:M:S"; only whole-day counts are supported here.
+        long long years = 0, months = 0, days = 0, hours = 0, mins = 0,
+                  secs = 0;
+        const std::string encoded = raw_str(arguments[2]);
+        if (sscanf(encoded.c_str(), "%lld-%lld %lld %lld:%lld:%lld", &years,
+                   &months, &days, &hours, &mins, &secs) >= 3 &&
+            years == 0 && months == 0 && hours == 0 && mins == 0 &&
+            secs == 0 && days != 0) {
+          step_days = static_cast<int64_t>(days);
+        } else {
+          throw std::runtime_error(
+              "GENERATE_DATE_ARRAY requires an INTERVAL step");
+        }
       } else {
         throw std::runtime_error(
             "GENERATE_DATE_ARRAY requires an INTERVAL step");

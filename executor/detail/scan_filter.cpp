@@ -442,6 +442,12 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
 }
 Relation UnnestValueToRelation(const SelectSource& source,
                                const Value& array_val) {
+  auto trim_part = [](std::string_view text) {
+    size_t begin = text.find_first_not_of(" \t");
+    if (begin == std::string_view::npos) { return std::string(); }
+    size_t end = text.find_last_not_of(" \t");
+    return std::string(text.substr(begin, end - begin + 1));
+  };
   Relation result;
   std::string col_name = source.alias.empty() ? "unnest" : source.alias;
   ValueType elem_type = ValueType::kNull;
@@ -522,6 +528,40 @@ Relation UnnestValueToRelation(const SelectSource& source,
     const bool keep_element_column =
         !source.alias.empty() && source.alias != "unnest";
     std::vector<std::pair<std::string, ValueType>> fields;
+    // Declared element types (`ARRAY<STRUCT<start_day DATE, ...>>`) name
+    // fields even when the encoded members use anonymous fN keys, and let
+    // textual members coerce back to their declared runtime type.
+    std::vector<std::pair<std::string, std::string>> declared_fields;
+    if (declared_struct && elem_sql_type.back() == '>' &&
+        elem_sql_type.find('<') != std::string::npos) {
+      const size_t open = elem_sql_type.find('<');
+      std::vector<std::string> parts;
+      int bracket = 0;
+      std::string current;
+      for (size_t i = open + 1; i < elem_sql_type.size(); ++i) {
+        const char c = elem_sql_type[i];
+        if (c == '<' || c == '(') { ++bracket; }
+        if (c == '>' || c == ')') { --bracket; }
+        if (c == ',' && bracket == 0) {
+          parts.push_back(current);
+          current.clear();
+          continue;
+        }
+        current.push_back(c);
+      }
+      if (!current.empty()) { parts.push_back(current); }
+      for (std::string& part : parts) {
+        const std::string trimmed = trim_part(part);
+        if (trimmed.empty()) { continue; }
+        const size_t space = trimmed.find_first_of(" \t");
+        if (space == std::string::npos) {
+          declared_fields.emplace_back(std::string(), trimmed);
+        } else {
+          declared_fields.emplace_back(trimmed.substr(0, space),
+                                       trim_part(trimmed.substr(space + 1)));
+        }
+      }
+    }
     struct ParsedElement {
       std::vector<Value> values;
       bool null_row{false};
@@ -553,11 +593,42 @@ Relation UnnestValueToRelation(const SelectSource& source,
             parsed = Value(std::string(member_text));
           }
         }
+        // Coerce textual members back to declared runtime types: struct
+        // serialization stores DATE/TIMESTAMP cells as plain text.
+        if (parsed.type == ValueType::kVarChar &&
+            declared_fields.size() == members.size()) {
+          const size_t member_index = parsed_rows[row_idx].values.size();
+          const std::string& declared_type =
+              declared_fields[member_index].second;
+          std::string text(parsed.value.varchar_value);
+          if ((declared_type == "DATE" || declared_type == "date")) {
+            int y = 0, m = 0, d = 0;
+            if (sscanf(text.c_str(), "%d-%d-%d", &y, &m, &d) == 3) {
+              parsed = Value::Date(text);
+            }
+          } else if (declared_type == "TIMESTAMP" ||
+                     declared_type == "timestamp" ||
+                     declared_type == "DATETIME") {
+            int y = 0, mo = 0, d = 0;
+            if (sscanf(text.c_str(), "%d-%d-%d", &y, &mo, &d) == 3) {
+              parsed = Value(std::move(text));  // keep canonical text form
+            }
+          }
+        }
         parsed_rows[row_idx].values.push_back(std::move(parsed));
       }
       if (fields.empty()) {
         for (const auto& [key, member_text] : members) {
           fields.emplace_back(key, ValueType::kNull);
+        }
+        // Prefer declared field names when the arity matches: anonymous
+        // tuple literals encode members as f1..fN under a declared type.
+        if (declared_fields.size() == fields.size()) {
+          for (size_t i = 0; i < declared_fields.size(); ++i) {
+            if (!declared_fields[i].first.empty()) {
+              fields[i].first = declared_fields[i].first;
+            }
+          }
         }
         // Fix up column types from the representative row's values.
         for (size_t i = 0; i < parsed_rows[row_idx].values.size() &&

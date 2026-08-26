@@ -2765,8 +2765,9 @@ Expression VisitExpression(
     } else if (accessor == "ORDINAL") {
       fn = "array_element_ordinal";
     }
-    if (accessor.find("SAFE_") == 0 ||
-        accessor.find("_SAFE") != std::string::npos) {
+    if (fn.find("safe") == std::string::npos &&
+        (accessor.find("SAFE_") == 0 ||
+         accessor.find("_SAFE") != std::string::npos)) {
       fn += "_safe";
     }
     return FunctionCallExp(fn, {std::move(base), VisitExpression(*index_node)});

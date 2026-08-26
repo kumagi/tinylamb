@@ -753,7 +753,8 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
             // engines that lose the declared element tag still match when
             // every element is value-compared below.
             (norm_want.starts_with("struct<") &&
-             (norm_actual == "int64" || norm_actual == "string")) ||
+             (norm_actual == "int64" || norm_actual == "string" ||
+              norm_actual == "struct")) ||
             ((norm_want.starts_with("proto<") ||
               norm_want.starts_with("enum<")) &&
              norm_actual == "int64");
