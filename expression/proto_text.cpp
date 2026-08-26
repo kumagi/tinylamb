@@ -354,6 +354,10 @@ Value ApplyReadConversion(FieldFormat format, Value v) {
         return v;
       }
       const int64_t dec = v.value.int_value;
+      if (dec <= 0) {
+        // Decimal-encoded 0 reads as NULL (unset DATE).
+        return Value();
+      }
       if (dec < 9999999) {
         return v;
       }
@@ -473,8 +477,8 @@ constexpr DefaultValueEntry kFieldDefaults[] = {
     {"micros_u64_default", "2015-03-12 17:49:47.555777+00"},
 };
 
-// Annotated int32 DATE fields read as NULL when unset (unlike int64 ones,
-// which read as their epoch default).
+// Annotated int32 DATE_DECIMAL fields read as NULL when unset (and when
+// stored as 0); plain day-count DATE fields read as their epoch default.
 bool AbsentAnnotatedDateReadsNull(std::string_view field) {
   std::string name = ToLowerCopy(field);
   if (name.size() > 7 && name.ends_with("_format")) {
@@ -489,8 +493,7 @@ bool AbsentAnnotatedDateReadsNull(std::string_view field) {
   while (name.size() > 3 && name.ends_with("_64")) {
     name.resize(name.size() - 3);
   }
-  return name == "date" || name == "s_date" || name == "f_date" ||
-         name == "date_decimal" || name == "s_date_decimal" ||
+  return name == "date_decimal" || name == "s_date_decimal" ||
          name == "f_date_decimal";
 }
 
@@ -1034,6 +1037,15 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
     }
   }
   if (messages.empty() && scalars.empty()) {
+    // Reading a required field of a modelled proto that lacks it is an
+    // error (GoogleSQL rejects the projection outright).
+    if (!extension_key) {
+      const std::string inferred = InferProtoTypeName(text, {std::string(key)});
+      if (!inferred.empty() && RequiredProtoField(inferred, std::string(key))) {
+        throw std::runtime_error("Protocol buffer missing required field " +
+                                 inferred + "." + std::string(key));
+      }
+    }
     // Schema-level defaults take precedence over per-type defaults.
     const std::optional<Value> fallback = DefaultForAbsentField(key);
     const FieldFormat format = ClassifyFieldFormat(key);
@@ -1071,9 +1083,33 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
       }
     }
     if (extension_key) {
-      // Absent extensions: scalar numeric -> 0, repeated -> [], else NULL.
-      if (ToLowerCopy(repeated_leaf).find("repeated_") != std::string::npos) {
+      // Absent extensions: repeated -> [], scalar numeric/string/bool ->
+      // their type default, message-typed -> NULL.
+      const std::string lower_leaf = ToLowerCopy(repeated_leaf);
+      if (lower_leaf.find("repeated") != std::string::npos) {
         *out = Value::Array({}, "PROTO");
+        return true;
+      }
+      if (IsKnownMessageField(lower_leaf)) {
+        *out = Value();
+        return true;
+      }
+      if (lower_leaf.find("string") != std::string::npos ||
+          lower_leaf.find("bytes") != std::string::npos) {
+        *out = Value(std::string());
+        return true;
+      }
+      if (lower_leaf.find("bool") != std::string::npos) {
+        *out = Value(int64_t{0});
+        return true;
+      }
+      if (lower_leaf.find("float") != std::string::npos ||
+          lower_leaf.find("double") != std::string::npos) {
+        *out = Value(0.0);
+        return true;
+      }
+      if (lower_leaf.find("int") != std::string::npos) {
+        *out = Value(int64_t{0});
         return true;
       }
       *out = Value();
@@ -1611,6 +1647,10 @@ bool TryProtoTextGetField(std::string_view text, std::string_view key,
   return ProtoTextExtractField(text, key, out);
 }
 
+std::optional<int64_t> ParseTimestampTextNanos(std::string_view text) {
+  return ParseTimestampText(text);
+}
+
 namespace {
 
 // Modelled proto types with the signature fields that identify payloads.
@@ -1638,6 +1678,18 @@ const std::vector<KnownProtoType>& KnownProtoTypes() {
 }
 
 }  // namespace
+
+// Dotted type paths that name ENUM types (everything else dotted is a proto
+// message).  Matched case-insensitively on the lowered full path.
+bool IsKnownEnumTypeName(const std::string& type_name) {
+  static const std::unordered_set<std::string>* const kEnums =
+      new auto(std::unordered_set<std::string>{
+          "googlesql_test.testenum",
+          "googlesql_test.testproto3enum",
+          "googlesql_test.enumannotations.nestedenum",
+      });
+  return kEnums->find(ToLowerCopy(type_name)) != kEnums->end();
+}
 
 std::string AppendProtoTypeMarker(const std::string& payload,
                                   const std::string& type_name) {
@@ -1669,8 +1721,7 @@ std::string ExtractProtoTypeMarker(std::string_view text) {
 }
 
 std::string InferProtoTypeName(
-    std::string_view payload, const std::vector<std::string>& hint_fields) {
-  std::string marked = ExtractProtoTypeMarker(payload);
+    std::string_view payload, const std::vector<std::string>& hint_fields) {  std::string marked = ExtractProtoTypeMarker(payload);
   if (!marked.empty()) {
     // Canonicalize to the display form when this is a modelled type.
     for (const KnownProtoType& type : KnownProtoTypes()) {

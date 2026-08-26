@@ -314,9 +314,13 @@ Value CastValue(const Value& val, const std::string& type_name,
   const std::string upper = ToUpper(type_name);
   const bool is_bool = (upper == "BOOL" || upper == "BOOLEAN");
   // ENUM-typed targets accept their textual member names verbatim: this
-  // engine stores enums as their member-name strings.
-  if (!is_bool && upper.find("ENUM") != std::string::npos &&
-      val.type == ValueType::kVarChar) {
+  // engine stores enums as their member-name strings.  Message protos whose
+  // names merely contain "ENUM" (KitchenSinkEnumPB) are excluded.
+  const bool dotted_type = upper.find('.') != std::string::npos;
+  const bool enum_target =
+      !is_bool && upper.find("ENUM") != std::string::npos &&
+      (!dotted_type || IsKnownEnumTypeName(type_name));
+  if (enum_target && val.type == ValueType::kVarChar) {
     // Member names are case-sensitive UPPER_SNAKE identifiers.
     const std::string member(val.value.varchar_value);
     bool member_shaped =
@@ -372,8 +376,7 @@ Value CastValue(const Value& val, const std::string& type_name,
   // wire-format byte casts.
   {
     const std::string upper_path = ToUpper(type_name);
-    if (upper_path.find('.') != std::string::npos &&
-        upper_path.find("ENUM") == std::string::npos) {
+    if (upper_path.find('.') != std::string::npos && !enum_target) {
       if (val.IsNull()) { return Value(); }
       if (val.type == ValueType::kVarChar || val.type == ValueType::kInt64 ||
           val.type == ValueType::kDouble) {

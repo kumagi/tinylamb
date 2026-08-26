@@ -3752,6 +3752,34 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return out;
   }
+  if (name == "unix_seconds" || name == "unix_millis" ||
+      name == "unix_micros" || name == "unix_date") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error(name + " requires one TIMESTAMP argument");
+    }
+    if (arguments[0].IsNull()) {
+      return {};
+    }
+    const std::optional<int64_t> nanos =
+        ParseTimestampTextNanos(raw_str(arguments[0]));
+    if (!nanos.has_value()) {
+      throw std::runtime_error("invalid TIMESTAMP: " + raw_str(arguments[0]));
+    }
+    auto floor_div_unix = [](int64_t a, int64_t b) {
+      const int64_t q = a / b;
+      return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+    };
+    if (name == "unix_date") {
+      return Value(floor_div_unix(*nanos, 86400000000000LL));
+    }
+    if (name == "unix_seconds") {
+      return Value(floor_div_unix(*nanos, 1000000000LL));
+    }
+    if (name == "unix_millis") {
+      return Value(floor_div_unix(*nanos, 1000000LL));
+    }
+    return Value(floor_div_unix(*nanos, 1000LL));
+  }
   if (name == "__get_field_safe") {
     // Field access tolerating NULL bases / missing members (returns NULL);
     // used for dotted struct references inside DML predicates.

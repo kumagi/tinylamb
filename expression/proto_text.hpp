@@ -101,6 +101,14 @@ std::string ExtractProtoTypeMarker(std::string_view text);
 std::string InferProtoTypeName(
     std::string_view payload, const std::vector<std::string>& hint_fields);
 
+// True for dotted type paths that name known ENUM types (as opposed to the
+// dotted proto message paths this engine stores as TEXT payloads).
+bool IsKnownEnumTypeName(const std::string& type_name);
+
+// Parses GoogleSQL-style timestamp text ("YYYY-MM-DD[ T]HH:MM:SS[.fff][±tz]")
+// into epoch nanoseconds (UTC); nullopt when unparsable.
+std::optional<int64_t> ParseTimestampTextNanos(std::string_view text);
+
 // True when the field belongs to a proto compiled with required fields that
 // this engine models (used to reject null/missing constructions).
 bool RequiredProtoField(const std::string& type_name,
