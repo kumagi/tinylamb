@@ -87,6 +87,9 @@ struct AggregateAccumulator {
   Value extreme;
   // GoogleSQL MIN/MAX: a NaN input poisons the result.
   mutable bool saw_nan_{false};
+  // SUM over doubles: a finite-input sum that reaches infinity overflows and
+  // must raise; infinite inputs themselves are legal and stay inf.
+  bool sum_saw_infinite_input_ = false;
   std::unique_ptr<DistinctValueSet> distinct;
   std::unique_ptr<std::unordered_set<int64_t>> distinct_ints;
 

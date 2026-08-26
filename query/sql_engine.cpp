@@ -2045,9 +2045,20 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             plan_cache_fingerprint_, database_->SchemaEpoch(),
             plan_cache_parameters_, CompiledPlan::Kind::kUpdate, plan, table);
       }
+      // Compliance primary-key mode: UPDATEs assigning the first column must
+      // keep the emulated key unique and duplicate-free.
+      bool update_touches_primary_key = false;
+      if (CompliancePrimaryKeyMode()) {
+        for (const auto& [target, expression] : update.SetClause()) {
+          if (schema.Offset(ColumnName(target.name)) == 0) {
+            update_touches_primary_key = true;
+            break;
+          }
+        }
+      }
       return Executor(std::make_shared<Update>(
           ctx.txn_, table.get(), plan->EmitExecutor(ctx),
-          update.AssertRowsModified()));
+          update.AssertRowsModified(), update_touches_primary_key));
     }
     case StatementType::kDelete: {
       const auto& remove = dynamic_cast<const DeleteStatement&>(*statement);

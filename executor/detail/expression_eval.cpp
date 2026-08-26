@@ -994,6 +994,9 @@ void AggregateAccumulator::ApplyCore(
       break;
     case AggregationType::kSum:
       if (value.type == ValueType::kDouble) {
+        if (std::isinf(value.value.double_value)) {
+          sum_saw_infinite_input_ = true;
+        }
         total += value.value.double_value;
         total_is_double = true;
       } else if (value.type == ValueType::kInt64 ||
@@ -1863,12 +1866,19 @@ Value AggregateAccumulator::Finish() const {
                                                          row.trailing_values);
       // STRING_AGG delimiter comes from the first buffered row.
       if (expression->GetType() == AggregationType::kStringAgg &&
-          !delimiter_.has_value() && !row.auxiliary.IsNull()) {
-        // Raw text: AsString wraps VARCHAR values in display quotes.
-        const Value& delim = row.auxiliary;
-        delimiter_ = delim.type == ValueType::kVarChar
-                         ? std::string(delim.value.varchar_value)
-                         : delim.AsString();
+          !delimiter_.has_value()) {
+        if (!row.auxiliary.IsNull()) {
+          // Raw text: AsString wraps VARCHAR values in display quotes.
+          const Value& delim = row.auxiliary;
+          delimiter_ = delim.type == ValueType::kVarChar
+                           ? std::string(delim.value.varchar_value)
+                           : delim.AsString();
+        } else if (expression->SecondaryArg()) {
+          // A delimiter argument that evaluates to NULL is rejected by
+          // GoogleSQL instead of falling back to a default separator.
+          throw std::runtime_error(
+              "STRING_AGG delimiter must not be NULL");
+        }
       }
     }
     buffer_.reset();  // replayed
@@ -1887,7 +1897,15 @@ Value AggregateAccumulator::Finish() const {
       if (!total_is_double && total == 0.0) {
         return Value(static_cast<int64_t>(int_total));
       }
-      return Value(total + static_cast<double>(int_total));
+      {
+        const double sum_result = total + static_cast<double>(int_total);
+        if (!sum_saw_infinite_input_ && std::isinf(sum_result)) {
+          // Finite inputs whose sum leaves the double range overflow:
+          // GoogleSQL raises instead of returning inf.
+          throw std::runtime_error("SUM overflow: result is infinite");
+        }
+        return Value(sum_result);
+      }
     case AggregationType::kMin:
     case AggregationType::kMax:
       // GoogleSQL: any NaN in the group makes MIN/MAX NaN.
@@ -2398,6 +2416,36 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
   return default_offset;
 }
 
+// CURRENT_DATE('foo') and friends must reject unknown zone names the way
+// GoogleSQL does instead of silently falling back to the session default.
+void ValidateTimeZoneName(std::string_view tz_str) {
+  if (tz_str.empty()) {
+    throw std::runtime_error("invalid timezone: empty");
+  }
+  if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" ||
+      tz_str == "gmt" || tz_str == "Z" || tz_str == "z" ||
+      tz_str == "Etc/Greenwich" || tz_str == "Etc/UTC" || tz_str == "Etc/GMT") {
+    return;
+  }
+  if (tz_str.starts_with("UTC+") || tz_str.starts_with("UTC-") ||
+      tz_str.starts_with("GMT+") || tz_str.starts_with("GMT-")) {
+    return;
+  }
+  if (tz_str[0] == '+' || tz_str[0] == '-') {
+    return;
+  }
+  std::string zone_name(tz_str);
+  if (zone_name == "NZ-CHAT") {
+    zone_name = "Pacific/Chatham";
+  }
+  try {
+    static_cast<void>(std::chrono::locate_zone(zone_name));
+    return;
+  } catch (...) {
+  }
+  throw std::runtime_error("invalid timezone: " + std::string(tz_str));
+}
+
 std::string FormatTimeZoneOffset(int tz_offset_sec) {
   char buf[16];
   int abs_sec = std::abs(tz_offset_sec);
@@ -2553,6 +2601,58 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
     }
     return {};
+  }
+  // Proto-field guards emitted by the GoogleSQL frontend: NEW constructors
+  // and SELECT AS <proto> route non-constant repeated-field arrays and enum
+  // values through them so invalid data fails execution instead of being
+  // silently dropped from the text-format representation.
+  if (name == "$proto_repeated_guard") {
+    const auto& args = call.Args();
+    if (args.size() != 2) {
+      throw std::runtime_error("$proto_repeated_guard requires 2 arguments");
+    }
+    const Value arr = Evaluate(args[0], scope, aggregates, context, ctes);
+    if (arr.IsArray()) {
+      for (const Value& element : arr.ArrayElements()) {
+        if (element.IsNull()) {
+          throw std::runtime_error(
+              "Cannot encode a null value in a repeated protocol message "
+              "field");
+        }
+      }
+    } else if (!arr.IsNull()) {
+      throw std::runtime_error("repeated proto field requires an array");
+    }
+    return Evaluate(args[1], scope, aggregates, context, ctes);
+  }
+  if (name == "$proto_field_guard" || name == "$proto_enum_guard") {
+
+    const auto& args = call.Args();
+    const size_t expected = name == "$proto_field_guard" ? 3 : 2;
+    if (args.size() != expected) {
+      throw std::runtime_error(name + " argument count mismatch");
+    }
+    const Value value = Evaluate(args[0], scope, aggregates, context, ctes);
+    if (!value.IsNull()) {
+      const Value type_value = Evaluate(args[1], scope, aggregates, context,
+                                        ctes);
+      const std::string enum_type =
+          type_value.type == ValueType::kVarChar
+              ? std::string(type_value.value.varchar_value)
+              : (type_value.IsNull() ? std::string()
+                                     : std::string(type_value.AsString()));
+      // Full CAST validation against the enum registry; throws on unknown
+      // members or out-of-range ordinals.
+      Row dummy_row;
+      Schema dummy_schema;
+      Expression checked =
+          CastExpressionExp(ConstantValueExp(value), enum_type, false);
+      static_cast<void>(checked->Evaluate(dummy_row, dummy_schema));
+    }
+    if (expected == 3) {
+      return Evaluate(args[2], scope, aggregates, context, ctes);
+    }
+    return value;
   }
   if (name == "date_add" || name == "date_sub" || name == "datetime_add" ||
       name == "datetime_sub" || name == "timestamp_add" ||
@@ -3219,6 +3319,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (tz_str.empty() || tz_str == "invalid_time_zone") {
         throw std::runtime_error("invalid timezone: " + tz_str);
       }
+      ValidateTimeZoneName(tz_str);
       tz_offset_sec = ParseTimeZoneOffset(tz_str);
     }
     time_t now = time(nullptr) + tz_offset_sec;
