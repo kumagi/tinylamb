@@ -283,9 +283,10 @@ void TransactionManager::Abort(Transaction& txn) {
     const uint64_t latest_log_end = logger_->BufferedLSN();
     try {
       logger_->WaitForDurable(latest_log_end);
-    } catch (const std::exception&) {
+    } catch (const std::exception& error) {
       // Fall through; the undo replay reads what was flushed and the abort
       // log write reports the broken WAL.
+      LOG(WARN) << "WAL durability wait failed during abort: " << error.what();
     }
   }
   lsn_t prev = txn.prev_lsn_;
@@ -565,7 +566,10 @@ void TransactionManager::RegisterVersionWrite(
   }
   // AddWriteSet reserves the pending slot before the physical image changes.
   // Reaching this function without that reservation is an invariant breach.
-  assert(chain.pending.has_value());
+  if (!chain.pending.has_value()) {
+    assert(false);
+    return;
+  }
   assert(chain.pending->owner == txn.ID());
   chain.pending->value = std::move(after_copy);
   chain.pending->staged = true;

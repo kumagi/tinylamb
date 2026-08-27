@@ -507,12 +507,16 @@ Relation UnnestValueToRelation(const SelectSource& source,
             std::string f_name =
                 field_name_colon.substr(0, field_name_colon.size() - 1);
             if (row_idx == 0) {
-              cols.emplace_back(col_name + "." + f_name, ValueType::kInt64);
+              std::string qualified_name = col_name;
+              qualified_name += ".";
+              qualified_name += f_name;
+              cols.emplace_back(std::move(qualified_name), ValueType::kInt64);
             }
             int64_t v = 0;
             try {
               v = std::stoll(val_str);
             } catch (...) {
+              v = 0;
             }
             field_values[row_idx].push_back(Value(v));
           }
@@ -669,6 +673,8 @@ Relation UnnestValueToRelation(const SelectSource& source,
       }
     }
     std::vector<Column> unnest_cols;
+    unnest_cols.reserve(fields.size() + (keep_element_column ? 1 : 0) +
+                        (!source.offset_alias.empty() ? 1 : 0));
     for (const auto& [field_name, field_type] : fields) {
       unnest_cols.emplace_back(field_name, field_type);
     }

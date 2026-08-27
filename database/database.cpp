@@ -127,7 +127,7 @@ uint64_t PeekUint64(std::string_view payload) {
     return 0;
   }
   uint64_t value = 0;
-  DeserializeU64(payload.data(), &value);
+  DeserializeU64(&payload[0], &value);
   return value;
 }
 

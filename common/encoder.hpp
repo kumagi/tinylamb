@@ -65,7 +65,7 @@ class Encoder {
 };
 
 template <typename T>
-std::string Encode(T src) {
+std::string Encode(const T& src) {
   std::stringstream ss;
   Encoder enc(ss);
   enc << src;

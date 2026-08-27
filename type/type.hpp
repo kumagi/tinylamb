@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_TYPE_HPP
 #define TINYLAMB_TYPE_HPP
 
+#include <cstdint>
 #include <string>
 
 #include "common/decoder.hpp"
@@ -24,7 +25,7 @@
 
 namespace tinylamb {
 
-enum class TypeTag {
+enum class TypeTag : uint8_t {
   kInvalid,
   kInteger,
   kBigInt,

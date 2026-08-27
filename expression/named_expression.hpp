@@ -28,11 +28,11 @@
 namespace tinylamb {
 
 struct NamedExpression {
-  explicit NamedExpression(ColumnName name_)
+  explicit NamedExpression(const ColumnName& name_)
       : name(), expression(ColumnValueExp(name_)) {}
   explicit NamedExpression(std::string_view name_)
       : name(), expression(ColumnValueExp(name_)) {}
-  NamedExpression(std::string_view name_, ColumnName column_name)
+  NamedExpression(std::string_view name_, const ColumnName& column_name)
       : name(name_), expression(ColumnValueExp(column_name)) {}
   NamedExpression(std::string_view name_, Expression exp)
       : name(name_), expression(std::move(exp)) {}

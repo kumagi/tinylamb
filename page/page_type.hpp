@@ -25,7 +25,7 @@ namespace tinylamb {
 class Encoder;
 class Decoder;
 
-enum class PageType : uint64_t {
+enum class PageType : uint8_t {
   kUnknown = 0,
   kFreePage,
   kMetaPage,

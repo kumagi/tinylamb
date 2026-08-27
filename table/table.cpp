@@ -202,8 +202,8 @@ bool KeyColumnChanged(const Value& a, const Value& b) {
     case ValueType::kVarChar:
       return a.value.varchar_value != b.value.varchar_value;
     case ValueType::kDouble:
-      return std::memcmp(&a.value.double_value, &b.value.double_value,
-                         sizeof(double)) != 0;
+      return std::bit_cast<uint64_t>(a.value.double_value) !=
+             std::bit_cast<uint64_t>(b.value.double_value);
     case ValueType::kArray:
       return a.ArrayElementSqlType() != b.ArrayElementSqlType() ||
              a.ArrayElements() != b.ArrayElements();

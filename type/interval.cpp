@@ -190,13 +190,9 @@ IntervalValue IntervalValue::Parse(std::string_view text,
         ++pos;
       }
       size_t num_start = pos;
-      bool has_dot = false;
       while (
           pos < s.size() &&
           (std::isdigit(static_cast<unsigned char>(s[pos])) || s[pos] == '.')) {
-        if (s[pos] == '.') {
-          has_dot = true;
-        }
         ++pos;
       }
       if (num_start == pos) {
@@ -254,18 +250,11 @@ IntervalValue IntervalValue::Parse(std::string_view text,
 
   // Single unit conversions
   if (!u.empty() && u.find(" to ") == std::string::npos) {
-    int64_t sign = 1;
-    size_t start = 0;
-    if (s.front() == '-') {
-      sign = -1;
-      start = 1;
-    } else if (s.front() == '+') {
-      start = 1;
-    }
     double dval = 0.0;
     try {
       dval = std::stod(s);
     } catch (...) {
+      dval = 0.0;
     }
 
     if (u == "year" || u == "years") {
@@ -324,7 +313,7 @@ IntervalValue IntervalValue::Parse(std::string_view text,
   if (u.find(" to ") != std::string::npos) {
     static const char* kUnitNames[] = {"year", "month",  "day",
                                        "hour", "minute", "second"};
-    const std::string range = u;
+    const std::string& range = u;
     const size_t split = range.find(" to ");
     const std::string lo_unit = range.substr(0, split);
     const std::string hi_unit = range.substr(split + 4);
@@ -427,6 +416,8 @@ IntervalValue IntervalValue::Parse(std::string_view text,
           y = std::stoll(ym_part.substr(0, dash));
           m = std::stoll(ym_part.substr(dash + 1));
         } catch (...) {
+          y = 0;
+          m = 0;
         }
       }
       iv.months += (y * 12 + m) * sign;
@@ -436,6 +427,7 @@ IntervalValue IntervalValue::Parse(std::string_view text,
       try {
         val = std::stoll(p);
       } catch (...) {
+        val = 0;
       }
       if (parts.size() == 3) {
         if (idx == 1) {
@@ -444,7 +436,7 @@ IntervalValue IntervalValue::Parse(std::string_view text,
           iv.months += val * 12;
         }
       } else if (parts.size() == 2) {
-        if (u == "month to day") {
+        if (u == "month to day") {  // NOLINT(bugprone-branch-clone)
           if (idx == 0) {
             iv.months += val;
           } else {
@@ -467,12 +459,12 @@ IntervalValue IntervalValue::Parse(std::string_view text,
           }
         }
       } else {
+        // The unit prefixes intentionally share the same accumulation shape.
+        // NOLINTNEXTLINE(bugprone-branch-clone)
         if (u.starts_with("year")) {
           iv.months += val * 12;
         } else if (u.starts_with("month")) {
           iv.months += val;
-        } else if (u.starts_with("day")) {
-          iv.days += val;
         } else if (u.starts_with("hour")) {
           iv.nanos += val * 3600LL * 1000000000LL;
         } else if (u.starts_with("minute")) {

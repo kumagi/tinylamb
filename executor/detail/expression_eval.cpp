@@ -235,14 +235,15 @@ Value ScalarFromText(std::string_view raw) {
       token.find('E') != std::string::npos) {
     try {
       return Value(std::stod(token));
-    } catch (...) {
+    } catch (const std::exception& error) {
+      (void)error;
     }
   }
   try {
     return Value(static_cast<int64_t>(std::stoll(token)));
   } catch (...) {
+    return Value(std::move(token));
   }
-  return Value(std::move(token));
 }
 
 std::string InferElementSqlType(const std::vector<Value>& elements) {
@@ -427,7 +428,8 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
       if (!inner.empty()) {
         elements.push_back(ScalarFromText(inner.substr(start)));
       }
-      *out = Value::Array(std::move(elements), InferElementSqlType(elements));
+      const std::string element_type = InferElementSqlType(elements);
+      *out = Value::Array(std::move(elements), element_type);
       return true;
     }
   }
@@ -471,7 +473,8 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
     if (!inner.empty()) {
       elements.push_back(ScalarFromText(inner.substr(start)));
     }
-    *out = Value::Array(std::move(elements), InferElementSqlType(elements));
+    const std::string element_type = InferElementSqlType(elements);
+    *out = Value::Array(std::move(elements), element_type);
     return true;
   }
   *out = ScalarFromText(raw);
@@ -1778,8 +1781,6 @@ int SketchTypeCode(AggregationType type, const Value& first) {
           return 3;
         case ValueType::kDate:
           return 6;
-        case ValueType::kVarChar:
-          return 4;
         default:
           return 4;
       }
@@ -2203,13 +2204,16 @@ Value AggregateAccumulator::FinishSketch(bool extract_count) const {
   return Value(std::move(encoded));
 }
 
-void AggregateAccumulator::Add(const AggregateInput& input) {
+void AggregateAccumulator::Add(AggregateInput input) {
   if (!buffer_) {
     ApplyCore(input.value, input.trailing_values);
     return;
   }
-  buffer_->push_back(BufferedRow{input.value, input.order_keys, input.condition,
-                                 input.auxiliary, input.trailing_values});
+  buffer_->push_back(BufferedRow{std::move(input.value),
+                                 std::move(input.order_keys),
+                                 std::move(input.condition),
+                                 std::move(input.auxiliary),
+                                 std::move(input.trailing_values)});
 }
 
 void AggregateAccumulator::Add(const Value& value) {
@@ -2555,8 +2559,7 @@ Value AggregateAccumulator::Finish() const {
                          ? FormatWeightDouble(as_double)
                          : std::to_string(static_cast<int64_t>(weight.sum));
         }
-        elements.push_back(
-            Value(TopEntryString(weight.value, std::move(sum_text))));
+        elements.push_back(Value(TopEntryString(weight.value, sum_text)));
       }
       return Value::Array(std::move(elements), "STRING");
     }
@@ -2623,6 +2626,8 @@ Value AggregateAccumulator::Finish() const {
         return Value(int64_t{0});
       }
       return FinishSketch(/*extract_count=*/true);
+    // These two merge entry points intentionally share the same finalization.
+    // NOLINTNEXTLINE(bugprone-branch-clone)
     case AggregationType::kHllMergePartial:
     case AggregationType::kKllMergePartial:
       return FinishSketch(/*extract_count=*/false);
@@ -2855,6 +2860,7 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
       return static_cast<int>(loc_info.first.offset.count());
     }
   } catch (...) {
+    return default_offset;
   }
   return default_offset;
 }
@@ -2885,8 +2891,8 @@ void ValidateTimeZoneName(std::string_view tz_str) {
     static_cast<void>(std::chrono::locate_zone(zone_name));
     return;
   } catch (...) {
+    throw std::runtime_error("invalid timezone: " + std::string(tz_str));
   }
-  throw std::runtime_error("invalid timezone: " + std::string(tz_str));
 }
 
 std::string FormatTimeZoneOffset(int tz_offset_sec) {
@@ -3075,7 +3081,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (args.size() != expected) {
       throw std::runtime_error(name + " argument count mismatch");
     }
-    const Value value = Evaluate(args[0], scope, aggregates, context, ctes);
+    Value value = Evaluate(args[0], scope, aggregates, context, ctes);
     if (!value.IsNull()) {
       const Value type_value = Evaluate(args[1], scope, aggregates, context,
                                         ctes);
@@ -3204,8 +3210,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         delta_days = amount / 24;
         delta_sub_ns = (amount % 24) * 3600LL * 1000000000LL;
       } else if (unit == "minute" || unit == "minutes") {
-        delta_days = amount / (24 * 60);
-        delta_sub_ns = (amount % (24 * 60)) * 60LL * 1000000000LL;
+        delta_days = amount / (24LL * 60LL);
+        delta_sub_ns = (amount % (24LL * 60LL)) * 60LL * 1000000000LL;
       } else if (unit == "second" || unit == "seconds") {
         delta_days = amount / 86400LL;
         delta_sub_ns = (amount % 86400LL) * 1000000000LL;
@@ -3286,6 +3292,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           return true;
         }
       } catch (const std::exception&) {
+        continue;
         // Static types are unavailable for subqueries/aggregates; the
         // runtime value types then stand on their own.
       }
@@ -4159,10 +4166,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       // Field traversals collapse a single-occurrence repeated field to its
       // scalar; UNNEST iterates it as a one-element array.
+      const std::string element_type = ElementSqlTypeName(arr.type);
       arr = Value::Array({std::move(arr)},
-                         ElementSqlTypeName(arr.type).empty()
+                         element_type.empty()
                              ? "INT64"
-                             : ElementSqlTypeName(arr.type));
+                             : element_type);
     }
     struct OpEntry {
       const char* text;
@@ -4552,7 +4560,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
             current.push_back(c);
           }
           fields.push_back(current);
-          auto trim_copy = [](std::string v) {
+          auto trim_copy = [](const std::string& v) {
             size_t b = v.find_first_not_of(" \t\n\r");
             size_t e = v.find_last_not_of(" \t\n\r");
             return b == std::string::npos ? std::string()
@@ -5083,11 +5091,12 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           step_m = amount * 3;
         }
         int64_t m_diff =
-            (d_ct.year - orig_ct.year) * 12 + (d_ct.month - orig_ct.month);
+            static_cast<int64_t>(d_ct.year - orig_ct.year) * 12 +
+            (d_ct.month - orig_ct.month);
         int64_t bucket_m = floor_div(m_diff, step_m) * step_m;
         int64_t total_m = (orig_ct.year * 12 + orig_ct.month - 1) + bucket_m;
         int bucket_y = floor_div(total_m, 12);
-        int bucket_mon = total_m - bucket_y * 12 + 1;
+        int bucket_mon = total_m - static_cast<int64_t>(bucket_y) * 12 + 1;
         CivilTime res_ct = orig_ct;
         res_ct.year = bucket_y;
         res_ct.month = bucket_mon;
@@ -5342,12 +5351,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       const int64_t q = a / b;
       return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
     };
-    int64_t total_m = (int(ymd.year()) * 12 + unsigned(ymd.month()) - 1) + n;
+    int64_t total_m =
+        static_cast<int64_t>(int(ymd.year())) * 12 + unsigned(ymd.month()) - 1 + n;
     int target_y = floor_div(total_m, 12);
     if (target_y < 1 || target_y > 9999) {
       throw std::runtime_error("DATE value out of range");
     }
-    int target_m = total_m - target_y * 12 + 1;
+    int target_m = total_m - static_cast<int64_t>(target_y) * 12 + 1;
 
     year_month_day_last last_of_target{
         year{target_y}, month_day_last{month{static_cast<unsigned>(target_m)}}};
@@ -5464,13 +5474,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(full_months + day_diff / 31.0);
   }
 
-  auto utf8_offsets = [](std::string_view s) -> std::vector<size_t> {
+  auto utf8_offsets = [](std::string_view s) -> std::vector<size_t> {  // NOLINT(bugprone-branch-clone)
     std::vector<size_t> offsets;
     offsets.reserve(s.size() + 1);
     for (size_t i = 0; i < s.size();) {
       offsets.push_back(i);
       const unsigned char c = static_cast<unsigned char>(s[i]);
-      if ((c & 0x80) == 0) {
+      if ((c & 0x80) == 0) {  // NOLINT(bugprone-branch-clone)
         i += 1;
       } else if ((c & 0xE0) == 0xC0) {
         i += (i + 1 < s.size()) ? 2 : 1;
@@ -5674,7 +5684,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -5769,7 +5779,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -5832,7 +5842,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -5890,7 +5900,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -5959,7 +5969,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -5996,7 +6006,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -6041,7 +6051,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -6315,7 +6325,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback is the default.
         }
       }
       return def;
@@ -6485,6 +6495,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       if (v.type == ValueType::kVarChar) {
         try {
           return std::stoll(std::string(v.value.varchar_value));
+        // NOLINTNEXTLINE(bugprone-empty-catch)
+        // NOLINTNEXTLINE(bugprone-empty-catch)
         } catch (...) {
         }
       }
@@ -6665,11 +6677,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     const size_t dst_len = dst_offsets.size() - 1;
 
     std::vector<std::string> src_chars;
+    src_chars.reserve(src_len);
     for (size_t i = 0; i < src_len; ++i) {
       src_chars.push_back(
           src.substr(src_offsets[i], src_offsets[i + 1] - src_offsets[i]));
     }
     std::vector<std::string> dst_chars;
+    dst_chars.reserve(dst_len);
     for (size_t i = 0; i < dst_len; ++i) {
       dst_chars.push_back(
           dst.substr(dst_offsets[i], dst_offsets[i + 1] - dst_offsets[i]));
@@ -6711,11 +6725,18 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     const std::string path =
         arguments.size() == 2 ? raw_str(arguments[1]) : "$";
     struct JVal {
-      enum T { kNull, kBool, kNum, kStr, kArr, kObj } type{kNull};
+      enum T {  // NOLINT(performance-enum-size) - local recursive JSON tag.
+        kNull,
+        kBool,
+        kNum,
+        kStr,
+        kArr,
+        kObj
+      } type{kNull};
       std::string raw;
       std::string str;
-      std::vector<JVal> arr;
-      std::vector<std::pair<std::string, JVal>> obj;
+      std::vector<std::unique_ptr<JVal>> arr;
+      std::vector<std::pair<std::string, std::unique_ptr<JVal>>> obj;
 
       std::string canonical() const {
         if (type == kNull) {
@@ -6762,7 +6783,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
             if (i > 0) {
               res += ",";
             }
-            res += arr[i].canonical();
+            res += arr[i]->canonical();
           }
           res += "]";
           return res;
@@ -6773,7 +6794,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
             if (i > 0) {
               res += ",";
             }
-            res += "\"" + obj[i].first + "\":" + obj[i].second.canonical();
+            res += "\"";
+            res += obj[i].first;
+            res += "\":";
+            res += obj[i].second->canonical();
           }
           res += "}";
           return res;
@@ -6896,7 +6920,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           if (!parse_j(s, pos, v)) {
             return false;
           }
-          out.obj.emplace_back(std::move(k), std::move(v));
+          out.obj.emplace_back(std::move(k), std::make_unique<JVal>(std::move(v)));
           skip_ws(s, pos);
           if (pos < s.size() && s[pos] == ',') {
             ++pos;
@@ -6924,7 +6948,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           if (!parse_j(s, pos, elem)) {
             return false;
           }
-          out.arr.push_back(std::move(elem));
+          out.arr.push_back(std::make_unique<JVal>(std::move(elem)));
           skip_ws(s, pos);
           if (pos < s.size() && s[pos] == ',') {
             ++pos;
@@ -7004,7 +7028,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         const JVal* next = nullptr;
         for (const auto& [k, v] : cur->obj) {
           if (k == key) {
-            next = &v;
+            next = v.get();
             break;
           }
         }
@@ -7025,7 +7049,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         int64_t idx = 0;
         try {
           idx = std::stoll(idx_str);
-        } catch (...) {
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - incomparable values are ignored.
           cur = nullptr;
           break;
         }
@@ -7034,7 +7058,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           cur = nullptr;
           break;
         }
-        cur = &cur->arr[idx];
+        cur = cur->arr[idx].get();
       } else {
         cur = nullptr;
         break;
@@ -7052,15 +7076,15 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       elems.reserve(cur->arr.size());
       for (const auto& item : cur->arr) {
         if (name == "json_value_array" || name == "json_extract_string_array") {
-          if (item.type == JVal::kNull) {
+          if (item->type == JVal::kNull) {
             elems.push_back(Value());
-          } else if (item.type == JVal::kStr) {
-            elems.push_back(Value(std::string(item.str)));
+          } else if (item->type == JVal::kStr) {
+            elems.push_back(Value(std::string(item->str)));
           } else {
-            elems.push_back(Value(item.canonical()));
+            elems.push_back(Value(item->canonical()));
           }
         } else {
-          elems.push_back(Value(item.canonical()));
+          elems.push_back(Value(item->canonical()));
         }
       }
       return Value::Array(std::move(elems), "STRING");
@@ -7797,17 +7821,14 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
              spec == 'X' || spec == 'o') &&
             formatted_item != "NULL" &&
             formatted_item.size() < static_cast<size_t>(precision)) {
-          formatted_item =
-              std::string(static_cast<size_t>(precision) -
-                              formatted_item.size(),
-                          '0') +
-              formatted_item;
+          formatted_item.insert(
+              0, static_cast<size_t>(precision) - formatted_item.size(), '0');
         }
         if (width > 0 && formatted_item.size() < static_cast<size_t>(width)) {
           const size_t pad_len =
               static_cast<size_t>(width) - formatted_item.size();
           char pad_char = zero_pad ? '0' : ' ';
-          formatted_item = std::string(pad_len, pad_char) + formatted_item;
+          formatted_item.insert(0, pad_len, pad_char);
         }
         result += formatted_item;
       } else {
@@ -8250,7 +8271,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
               "unsupported GENERATE_DATE_ARRAY step unit: " + unit);
         }
       } else {
-        const Value step = arguments[2];
+        const Value& step = arguments[2];
         if (step.IsNull()) {
           return {};
         }
@@ -8694,6 +8715,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
                   .Truthy()) {
             return Value(int64_t{0});
           }
+        // NOLINTNEXTLINE(bugprone-empty-catch)
         } catch (...) {
           // incomparable element types are simply not duplicates
         }
@@ -9276,7 +9298,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
             }
           });
         }
-        const Value membership =
+        Value membership =
             found ? Value(true) : (saw_null ? Value() : Value(false));
         if (!value.Negated()) {
           return membership;

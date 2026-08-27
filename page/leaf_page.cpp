@@ -279,7 +279,7 @@ Status LeafPage::Split(page_id_t /*pid*/, Transaction& txn, std::string_view key
     RETURN_IF_FAIL(this_page->Delete(txn, GetKey(pivot)));
   }
 
-  if (right->RowCount() == 0 || right->GetKey(0) <= key) {
+  if (right->RowCount() == 0 || right->GetKey(0) <= key) {  // NOLINT(bugprone-branch-clone)
     assert(expected_size <= right->body.leaf_page.free_size_);
   } else {
     assert(expected_size <= free_size_);

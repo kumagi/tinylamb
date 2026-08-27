@@ -34,7 +34,8 @@ namespace tinylamb {
 class Logger final {
  public:
   explicit Logger(const std::filesystem::path& logfile,
-                  size_t buffer_size = 1024 * 1024 * 8, size_t every_ms = 1);
+                  size_t buffer_size = size_t{1024} * 1024 * 8,
+                  size_t every_ms = 1);
   Logger(const Logger&) = delete;
   Logger(Logger&&) = delete;
   Logger& operator=(const Logger&) = delete;

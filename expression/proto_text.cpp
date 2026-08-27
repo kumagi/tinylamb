@@ -285,7 +285,7 @@ std::string FormatTimestampNanos(int64_t nanos, int precision) {
 // compliance schema: fields whose names mention dates/timestamps carry
 // DATE/TIMESTAMP encodings over integer storage.
 
-enum class FieldFormat {
+enum class FieldFormat : uint8_t {
   kNone,
   kDateDays,     // days since epoch -> DATE
   kDateDecimal,  // YYYYMMDD -> DATE
@@ -411,7 +411,7 @@ std::optional<Value> ApplyWriteConversion(FieldFormat format,
       const int yr = std::atoi(text.substr(0, 4).c_str());
       const int mon = std::atoi(text.substr(5, 2).c_str());
       const int day = std::atoi(text.substr(8, 2).c_str());
-      return Value(int64_t{yr} * 10000 + mon * 100 + day);
+      return Value(int64_t{yr} * 10000 + int64_t{mon} * 100 + day);
     }
     case FieldFormat::kTsSeconds:
     case FieldFormat::kTsMillis:
@@ -811,7 +811,8 @@ Value DecodeScalarToken(std::string_view raw_token) {
     if (idx == token.size()) {
       return Value(as_int);
     }
-  } catch (...) {
+  } catch (const std::exception& error) {
+    (void)error;
   }
   try {
     size_t idx = 0;
@@ -819,7 +820,8 @@ Value DecodeScalarToken(std::string_view raw_token) {
     if (idx == token.size()) {
       return Value(as_double);
     }
-  } catch (...) {
+  } catch (const std::exception& error) {
+    (void)error;
   }
   return Value(std::move(token));
 }
@@ -1170,6 +1172,7 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
     return true;
   }
   std::vector<Value> elements;
+  elements.reserve(scalars.size());
   for (Value& raw : scalars) {
     elements.push_back(convert_scalar(raw));
   }
@@ -1281,9 +1284,12 @@ std::optional<std::string> SetFieldInBody(
     if (value_to_store.IsArray()) {
       for (const Value& element : value_to_store.ArrayElements()) {
         if (element.IsNull()) {
-          throw std::runtime_error(
-              "Cannot encode a null value in repeated protocol message field " +
-              type_name + "." + target);
+          std::string message =
+              "Cannot encode a null value in repeated protocol message field ";
+          message += type_name;
+          message.push_back('.');
+          message += target;
+          throw std::runtime_error(message);
         }
         if (element.type == ValueType::kVarChar &&
             LooksLikeProtoText(RawTextOfValue(element))) {
@@ -1466,18 +1472,26 @@ std::string ConstructProtoText(
       out.push_back(' ');
     }
     if (is_message) {
-      out += name + " { " + text + " }";
+      out += name;
+      out += " { ";
+      out += text;
+      out += " }";
     } else {
-      out += name + ": " + text;
+      out += name;
+      out += ": ";
+      out += text;
     }
   };
 
   for (const auto& [field_name, raw_value] : fields) {
     if (raw_value.IsNull()) {
       if (RequiredProtoField(type_name, field_name)) {
-        throw std::runtime_error(
-            "Cannot encode a null value in required protocol message field " +
-            type_name + "." + field_name);
+        std::string message =
+            "Cannot encode a null value in required protocol message field ";
+        message += type_name;
+        message.push_back('.');
+        message += field_name;
+        throw std::runtime_error(message);
       }
       continue;
     }
@@ -1489,9 +1503,12 @@ std::string ConstructProtoText(
     if (value.IsArray()) {
       for (const Value& element : value.ArrayElements()) {
         if (element.IsNull()) {
-          throw std::runtime_error(
-              "Cannot encode a null value in repeated protocol message field " +
-              type_name + "." + field_name);
+          std::string message =
+              "Cannot encode a null value in repeated protocol message field ";
+          message += type_name;
+          message.push_back('.');
+          message += field_name;
+          throw std::runtime_error(message);
         }
         ValidateEnumFieldValue(type_name, field_name, element);
         const std::string text = RawTextOfValue(element);
@@ -1526,9 +1543,12 @@ std::string ConstructProtoText(
   if (req_it != kRequiredTypes.end()) {
     for (const std::string& required : req_it->second) {
       if (!ProtoTextHasField(out, required)) {
-        throw std::runtime_error(
-            "Cannot construct proto " + type_name +
-            " because required field " + required + " is missing");
+        std::string message = "Cannot construct proto ";
+        message += type_name;
+        message += " because required field ";
+        message += required;
+        message += " is missing";
+        throw std::runtime_error(message);
       }
     }
   }
@@ -1662,7 +1682,9 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
     if (!out.empty()) {
       out.push_back(' ');
     }
-    out += name + ": " + token;
+    out += name;
+    out += ": ";
+    out += token;
   }
   return out;
 }

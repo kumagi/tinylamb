@@ -102,7 +102,7 @@ AggregationExecutor::AggregationExecutor(
       if (!constant.IsNull() && (constant.type == ValueType::kInt64 ||
                                  constant.type == ValueType::kDouble)) {
         input.kind = AggregateInputKind::kTypedConstant;
-        input.constant = std::move(constant);
+        input.constant = constant;
       }
     }
     all_typed_ = all_typed_ && input.kind != AggregateInputKind::kGeneric;

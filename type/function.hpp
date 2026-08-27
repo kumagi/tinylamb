@@ -34,8 +34,8 @@ class Function {
   Function(std::string name, std::vector<Type> args, Type return_type)
       : name_(std::move(name)),
         args_(std::move(args)),
-        return_type_(std::move(return_type)),
-        argument_count_(args.size()) {}
+        return_type_(return_type),
+        argument_count_(static_cast<int>(args_.size())) {}
 
   friend Encoder& operator<<(Encoder& e, const Function& f) {
     e << f.name_ << f.args_ << f.return_type_
@@ -45,7 +45,7 @@ class Function {
   friend Decoder& operator>>(Decoder& d, Function& f) {
     int64_t argument_count;
     d >> f.name_ >> f.args_ >> f.return_type_ >> argument_count;
-    f.argument_count_ = argument_count;
+    f.argument_count_ = static_cast<int>(argument_count);
     return d;
   }
 

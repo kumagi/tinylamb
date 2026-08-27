@@ -30,7 +30,7 @@ namespace tinylamb {
 
 // GoogleSQL aggregate filtering: `AGG(x HAVING MAX cond)` only aggregates the
 // rows whose `cond` value reaches the group-wide MAX (or MIN) of `cond`.
-enum class AggregateHavingModifier { kNone, kMax, kMin };
+enum class AggregateHavingModifier : uint8_t { kNone, kMax, kMin };
 
 class AggregateExpression : public ExpressionBase {
  public:
@@ -64,7 +64,7 @@ class AggregateExpression : public ExpressionBase {
     return inner_limit_;
   }
   void SetInnerLimit(std::optional<size_t> limit) {
-    inner_limit_ = std::move(limit);
+    inner_limit_ = limit;
   }
   // STRING_AGG delimiter (second argument), evaluated per row by call sites.
   [[nodiscard]] const Expression& SecondaryArg() const {

@@ -12,11 +12,11 @@
 
 namespace tinylamb {
 
-enum class WindowFrameUnit { kDefault, kRows, kRange, kGroups };
+enum class WindowFrameUnit : uint8_t { kDefault, kRows, kRange, kGroups };
 
-enum class WindowFrameExclusion { kNone, kCurrentRow, kGroup, kTies };
+enum class WindowFrameExclusion : uint8_t { kNone, kCurrentRow, kGroup, kTies };
 
-enum class WindowFrameBoundType {
+enum class WindowFrameBoundType : uint8_t {
   kUnboundedPreceding,
   kOffsetPreceding,
   kCurrentRow,

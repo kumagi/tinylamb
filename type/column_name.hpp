@@ -45,8 +45,8 @@ struct ColumnName {
     if (pos == std::string::npos) {
       name = na;
     } else {
-      schema.assign(na.data(), pos);
-      name.assign(na.data() + pos + 1, na.size() - schema.size() - 1);
+      schema = na.substr(0, pos);
+      name = na.substr(pos + 1);
     }
   }
   [[nodiscard]] std::string ToString() const;

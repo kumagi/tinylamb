@@ -83,7 +83,7 @@
     LOG(FATAL) << "Crashed: " << value##_const_tmp.GetStatus();         \
     abort();                                                            \
   }                                                                     \
-  const type& value = value##_const_tmp.Value()
+  const type& value = value##_const_tmp.Value()  /* NOLINT(bugprone-macro-parentheses) */
 
 namespace tinylamb {
 
@@ -99,18 +99,18 @@ class StatusOr {
   // Callers must check HasValue() first: accessing the value of a failed
   // StatusOr throws instead of dereferencing an empty optional (UB).
   T& Value() {
-    if (!HasValue()) throw std::runtime_error("StatusOr has no value");
+    if (!value_.has_value()) throw std::runtime_error("StatusOr has no value");
     return *value_;
   }
   // Moves the value out and consumes the StatusOr: a second MoveValue() (or
   // Value()) on the same object throws.
   T&& MoveValue() {
-    if (!HasValue()) throw std::runtime_error("StatusOr has no value");
+    if (!value_.has_value()) throw std::runtime_error("StatusOr has no value");
     status_ = Status::kUnknown;
     return std::move(*value_);
   }
   const T& Value() const {
-    if (!HasValue()) throw std::runtime_error("StatusOr has no value");
+    if (!value_.has_value()) throw std::runtime_error("StatusOr has no value");
     return *value_;
   }
   [[nodiscard]] Status GetStatus() const { return status_; }

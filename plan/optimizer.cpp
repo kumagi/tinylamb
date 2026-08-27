@@ -162,7 +162,7 @@ bool ConjunctRelations(
 constexpr size_t kMaxDecorrelationDepth = 8;
 thread_local size_t tls_decorrelation_depth = 0;
 
-enum class ColumnSide { kOuter, kInner };
+enum class ColumnSide : uint8_t { kOuter, kInner };
 
 struct ScopeMaps {
   // Column resolution mirrors QueryData::Rewrite: qualified names must name a
@@ -311,7 +311,7 @@ bool ColumnIsNonNull(const ScopeMaps& scope, const ColumnName& column,
   return ctype == Constraint::kNotNull || ctype == Constraint::kPrimaryKey;
 }
 
-enum class ConjunctClass { kInnerOnly, kCrossEquality, kReject };
+enum class ConjunctClass : uint8_t { kInnerOnly, kCrossEquality, kReject };
 
 // Sorts one subquery conjunct: an equality whose operands live on opposite
 // sides is the correlation key candidate; anything referencing only the inner
@@ -688,6 +688,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
         ~DepthGuard() { --tls_decorrelation_depth; }
       } guard;
       std::vector<std::pair<std::string, const Schema*>> outer_schemas;
+      outer_schemas.reserve(rule_context.tables.size());
       for (const auto& [relation, table] : rule_context.tables) {
         outer_schemas.emplace_back(relation, &table->GetSchema());
       }
@@ -728,7 +729,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
       return kept.empty() ? Expression(ConstantValueExp(Value(true)))
                           : CombineConjuncts(kept);
     }
-    return predicate;
+    return Expression(predicate);
   }();
 
   std::unordered_set<ColumnName> touched =

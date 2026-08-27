@@ -37,7 +37,7 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   // How each aggregate reads its input.  kInt64Column / kDoubleColumn
   // aggregates can run directly over the chunk's raw numeric storage;
   // everything else falls back to the per-row generic path.
-  enum class AggregateInputKind { kRowCount, kInt64Column, kDoubleColumn,
+  enum class AggregateInputKind : uint8_t { kRowCount, kInt64Column, kDoubleColumn,
                                   kGeneric };
   struct AggregateInput {
     AggregateInputKind kind{AggregateInputKind::kGeneric};

@@ -100,6 +100,7 @@ Expression ResolveAliasInTree(  // NOLINT(misc-no-recursion)
     case TypeTag::kCaseExp: {
       const auto& value = expression->AsCaseExpression();
       std::vector<std::pair<Expression, Expression>> clauses;
+      clauses.reserve(value.when_clauses_.size());
       for (const auto& [condition, result] : value.when_clauses_) {
         clauses.emplace_back(ResolveAliasInTree(condition, schema, select_list),
                              ResolveAliasInTree(result, schema, select_list));
@@ -179,6 +180,7 @@ std::shared_ptr<SelectStatement> ResolveGroupingAliases(
               changed = true;
             }
           } catch (...) {
+            continue;
           }
         }
       }

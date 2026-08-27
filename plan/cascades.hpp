@@ -34,7 +34,7 @@ namespace tinylamb::cascades {
 using GroupId = size_t;
 constexpr GroupId kInvalidGroup = static_cast<GroupId>(-1);
 
-enum class LogicalOperator {
+enum class LogicalOperator : uint8_t {
   kScan,
   kJoin,
   kOuterJoin,

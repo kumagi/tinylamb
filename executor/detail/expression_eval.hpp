@@ -74,7 +74,7 @@ struct AggregateAccumulator {
   void Add(const Value& value);
   // Full-input accumulation: buffers rows for aggregates that need whole-group
   // context (HAVING modifier, inner ORDER BY/LIMIT, ARRAY_AGG, STRING_AGG).
-  void Add(const AggregateInput& input);
+  void Add(AggregateInput input);
   Value Finish() const;
 
   const AggregateExpression* expression;

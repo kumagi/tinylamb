@@ -29,7 +29,7 @@ class Encoder;
 class Decoder;
 struct ArrayPayload;
 
-enum class UnaryOperation : int {
+enum class UnaryOperation : uint8_t {
   kIsNull,
   kIsNotNull,
   kIsTrue,
@@ -40,7 +40,7 @@ enum class UnaryOperation : int {
   kMinus,
 };
 
-enum class AggregationType : int {
+enum class AggregationType : uint8_t {
   kCount,
   kSum,
   kAvg,

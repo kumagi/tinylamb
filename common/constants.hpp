@@ -26,7 +26,7 @@
 
 namespace tinylamb {
 
-static constexpr size_t kPageSize = 1024 * 32;
+static constexpr size_t kPageSize = size_t{1024} * 32;
 static constexpr size_t kPageHeaderSize = sizeof(uint32_t) +  // magic
                                           sizeof(uint32_t) +  // version
                                           sizeof(uint64_t) +  // page_id
@@ -70,7 +70,7 @@ enum class Status : uint8_t {
   kCorrupt,
 };
 
-enum class BinaryOperation {
+enum class BinaryOperation : uint8_t {
   // Calculations.
   kAdd,
   kSubtract,

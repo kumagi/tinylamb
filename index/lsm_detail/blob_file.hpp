@@ -39,7 +39,7 @@ namespace tinylamb {
 class BlobFile final {
  public:
   BlobFile(const std::filesystem::path& path,
-           size_t memory_capacity = 128 * 1024 * 1024,
+           size_t memory_capacity = size_t{128} * 1024 * 1024,
            size_t max_filesize = 1024LLU * 1024 * 1024);
 
   BlobFile(BlobFile&& o) = delete;

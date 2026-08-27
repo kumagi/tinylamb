@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_AGGREGATION_EXECUTOR_HPP
 #define TINYLAMB_AGGREGATION_EXECUTOR_HPP
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -56,7 +57,7 @@ class AggregationExecutor : public ExecutorBase {
 
   // How each aggregate reads its input for the vectorized accumulator path.
   // kGeneric falls back to the per-row Evaluate loop below.
-  enum class AggregateInputKind {
+  enum class AggregateInputKind : uint8_t {
     kCountStar,      // COUNT(*): fed straight from the batch row count.
     kTypedColumn,    // non-distinct column reference over int64/double data.
     kTypedConstant,  // non-distinct constant argument folded once per batch.

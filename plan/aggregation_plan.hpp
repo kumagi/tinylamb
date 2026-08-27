@@ -27,7 +27,7 @@
 
 namespace tinylamb {
 
-enum class AggregationStrategy {
+enum class AggregationStrategy : uint8_t {
   kHash,
   kSort,
   kStream,

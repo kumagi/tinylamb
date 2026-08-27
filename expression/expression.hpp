@@ -51,7 +51,7 @@ class EvaluationContext;
 
 // How a QueryExpression combines projected subquery rows against its test
 // value: plain membership (IN), three-valued ANY/SOME, or ALL.
-enum class QuantifierMode {
+enum class QuantifierMode : uint8_t {
   kIn,
   kAny,
   kAll,

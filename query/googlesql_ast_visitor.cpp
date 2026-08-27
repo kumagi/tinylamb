@@ -111,6 +111,7 @@ int ParseTimeZoneOffset(std::string_view tz_str, int Y, int M, int D, int h,
       return static_cast<int>(loc_info.first.offset.count());
     }
   } catch (...) {
+    return default_offset;
   }
   return default_offset;
 }
@@ -175,10 +176,9 @@ int64_t ParseIntLiteral(const GoogleSqlAstNode& node) {
                                text);
     }
     uint64_t magnitude = 0;
-    const auto* end = digits.data() + digits.size();
     const auto [ptr, ec] =
-        std::from_chars(digits.data(), end, magnitude, 16);
-    if (ec != std::errc() || ptr != end) {
+        std::from_chars(digits.begin(), digits.end(), magnitude, 16);
+    if (ec != std::errc() || ptr != digits.end()) {
       throw std::runtime_error("GoogleSQL AST: integer literal out of range " +
                                text);
     }
@@ -624,8 +624,6 @@ std::string DecodeSingleComponent(std::string_view value_view) {
         decoded.push_back('"');
       } else if (next == '`') {
         decoded.push_back('`');
-      } else if (next == '?' || next == '/') {
-        decoded.push_back(next);
       } else if (next >= '0' && next <= '7') {
         std::string oct_str;
         oct_str.push_back(next);
@@ -855,7 +853,8 @@ BinaryOperation BinaryOp(std::string_view detail) {
 }
 
 std::shared_ptr<SelectStatement> VisitQuery(const GoogleSqlAstNode& query);
-Expression ExpandUdfCall(std::string name, std::vector<Expression> arguments);
+Expression ExpandUdfCall(const std::string& name,
+                         std::vector<Expression> arguments);
 Expression VisitExpression(const GoogleSqlAstNode& node);
 
 bool NeedsRelationalEvaluation(
@@ -1152,7 +1151,8 @@ void AnalyzeUdfBody(const GoogleSqlAstNode& node,  // NOLINT(misc-no-recursion)
       if (kAggregateNames.count(fn) != 0) {
         *simple = false;
       }
-    } catch (...) {
+    } catch (const std::exception& error) {
+      (void)error;
     }
   }
   for (const auto& child : node.children) {
@@ -1869,7 +1869,7 @@ Expression VisitFunction(
   }
   if (!UdfRegistry().empty() &&
       UdfRegistry().find(name) != UdfRegistry().end()) {
-    if (Expression expanded = ExpandUdfCall(name, std::move(arguments))) {
+    if (Expression expanded = ExpandUdfCall(name, arguments)) {
       return expanded;
     }
   }
@@ -1881,7 +1881,8 @@ Expression VisitFunction(
 // call arguments substituted for the parameters. Aggregate definitions whose
 // expanded body has no aggregate are wrapped in a COUNT(*)-gated CASE so
 // they still evaluate once per group (one row over empty input).
-Expression ExpandUdfCall(std::string name, std::vector<Expression> arguments) {
+Expression ExpandUdfCall(const std::string& name,
+                         std::vector<Expression> arguments) {
   auto& registry = UdfRegistry();
   const auto found = registry.find(name);
   if (found == registry.end()) {
@@ -2040,7 +2041,13 @@ std::string SqlTypeFromAst(
       }
       if (type_part.empty()) { continue; }
       if (!fields.empty()) { fields += ", "; }
-      fields += name_part.empty() ? type_part : name_part + " " + type_part;
+      if (name_part.empty()) {
+        fields += type_part;
+      } else {
+        fields += name_part;
+        fields += ' ';
+        fields += type_part;
+      }
     }
     return "STRUCT<" + fields + ">";
   }
@@ -2498,11 +2505,15 @@ std::string NormalizeTimestampText(const std::string& text) {
         tz_hours = std::stoi(tz_part.substr(0, colon));
         tz_mins = std::stoi(tz_part.substr(colon + 1));
       } catch (...) {
+        tz_hours = 0;
+        tz_mins = 0;
       }
     } else {
       try {
         tz_hours = std::stoi(tz_part);
       } catch (...) {
+        tz_hours = 0;
+        tz_mins = 0;
       }
     }
     total_offset_mins = (tz_hours * 60 + tz_mins) * (sign == '-' ? -1 : 1);
@@ -3317,7 +3328,8 @@ Expression VisitExpression(
         int64_t amount = 0;
         try {
           amount = std::stoll(str_val);
-        } catch (...) {
+        } catch (const std::exception& error) {
+          (void)error;
         }
         return IntervalExpressionExp(amount, std::move(unit),
                                      std::move(str_val));
@@ -3333,7 +3345,8 @@ Expression VisitExpression(
           int64_t amount = 0;
           try {
             amount = std::stoll(str_val);
-          } catch (...) {
+          } catch (const std::exception& error) {
+            (void)error;
           }
           return IntervalExpressionExp(amount, std::move(unit),
                                        std::move(str_val));
@@ -3361,12 +3374,14 @@ Expression VisitExpression(
           int64_t amount = 0;
           try {
             amount = std::stoll(str_val);
-          } catch (...) {
+          } catch (const std::exception& error) {
+            (void)error;
           }
           return IntervalExpressionExp(amount, std::move(unit),
                                        std::move(str_val));
         }
-      } catch (...) {
+      } catch (const std::exception& error) {
+        (void)error;
       }
       return FunctionCallExp(
           "make_interval", {expr, ConstantValueExp(Value(std::string(unit)))});
@@ -5285,7 +5300,8 @@ Expression BuildNewConstructor(const GoogleSqlAstNode& node) {
     // extension key used by TEXT format.
     if (!field_name.empty() && field_name.front() != '[' &&
         field_name.find('.') != std::string::npos) {
-      field_name = "[" + field_name + "]";
+      field_name.insert(field_name.begin(), '[');
+      field_name.push_back(']');
     }
     if (value_node.kind == "BooleanLiteral") {
       const std::string upper_literal = UpperCopy(value_node.detail);
@@ -5384,7 +5400,7 @@ std::unique_ptr<Statement> GoogleSqlAstVisitor::Visit(
           if (child->kind == "StringLiteral") {
             const_val = DecodeString(*child);
             SessionConstantExpressions()[Lower(const_name)] =
-                ConstantValueExp(Value(std::move(const_val)));
+                ConstantValueExp(Value(std::string(const_val)));
           } else {
             // Subqueries and function calls evaluate per reference through
             // the relational interpreter instead.

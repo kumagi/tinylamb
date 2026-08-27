@@ -169,7 +169,12 @@ KeyRef KeyOf(const Row& row, const std::vector<slot_t>& cols,
   return {true, 0, std::string_view(*scratch), HashBytesKey(*scratch)};
 }
 
-const Row& RowOf(const Row& row) { return row; }
+// The helper is intentionally a no-op for the row-only representation.
+// NOLINTNEXTLINE(bugprone-return-const-ref-from-parameter)
+const Row& RowOf(const Row& row) {
+  // NOLINTNEXTLINE(bugprone-return-const-ref-from-parameter)
+  return row;
+}
 const Row& RowOf(const PositionedRow& positioned) { return positioned.first; }
 
 template <typename Container>
@@ -560,6 +565,7 @@ void HashJoin::MaterializeOuter() {
   s.right.charge.ReleaseAll();
 
   std::vector<PositionedRow> left_rows;
+  left_rows.reserve(s.left.rows.size());
   for (const PositionedRow& row : s.left.rows) {
     left_rows.push_back(row);
   }
@@ -568,6 +574,7 @@ void HashJoin::MaterializeOuter() {
     left_rows.insert(left_rows.end(), rows.begin(), rows.end());
   }
   std::vector<PositionedRow> right_rows;
+  right_rows.reserve(s.right.rows.size());
   for (const PositionedRow& row : s.right.rows) {
     right_rows.push_back(row);
   }

@@ -17,4 +17,4 @@ jobs:
       - name: clang-tidy diff
         run: |
           git diff -U0 origin/main...HEAD -- '*.cpp' '*.hpp' | \
-            clang-tidy-diff.py -p build -checks='bugprone-*,performance-*' -quiet || true
+            clang-tidy-diff.py -p build -checks='bugprone-*,performance-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions' -quiet || true

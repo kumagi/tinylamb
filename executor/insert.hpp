@@ -35,7 +35,7 @@ class Transaction;
 
 // Mirror of the SQL-level insert modes; kept local so this layer does not
 // depend on the statement layer.
-enum class InsertExecutionMode {
+enum class InsertExecutionMode : uint8_t {
   kDefault = 0,
   kIgnore = 1,
   kUpsert = 2,

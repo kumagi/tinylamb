@@ -137,6 +137,14 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       options->transaction_only = argv[i];
       continue;
     }
+    if (argument == "--deadlock-policy") {
+      if (++i == argc) {
+        return false;
+      }
+      // Parsed later in main; here we just consume the value to keep
+      // ParseOptions happy.
+      continue;
+    }
     if (argument == "--help") {
       return false;
     }

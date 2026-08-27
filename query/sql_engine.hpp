@@ -12,6 +12,7 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <cstdint>
 #include <vector>
 
 #include "common/status_or.hpp"
@@ -24,7 +25,7 @@ namespace tinylamb {
 class Database;
 class Statement;
 class TransactionContext;
-enum class StatementType;
+enum class StatementType : uint8_t;
 
 struct SqlRuntimeStats {
   uint64_t prepare_ns{0};

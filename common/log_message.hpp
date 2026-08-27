@@ -18,6 +18,7 @@
 #define TINYLAMB_LOG_MESSAGE_HPP
 
 #include <array>
+#include <cstdint>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -30,7 +31,7 @@
 #define STATUS(s, message)                   \
   do {                                       \
     if ((s) != Status::kSuccess) {           \
-      LOG(FATAL) << (message) << ": " << s;  \
+      LOG(FATAL) << (message) << ": " << (s); \
       abort();                               \
     }                                        \
   } while (0)
@@ -38,7 +39,7 @@
 #ifndef ERROR_CODES_DEFINE
 #define ERROR_CODES_DEFINE
 
-enum class LogLevel : int {
+enum class LogLevel : uint16_t {
   kTrace = 0,
   kDebug = 1000,
   kUser = 1500,

@@ -54,7 +54,7 @@ struct SetOperationMatch {
   std::vector<std::string> columns;
 };
 
-enum class JoinType { kCross, kInner, kLeft, kRight, kFull };
+enum class JoinType : uint8_t { kCross, kInner, kLeft, kRight, kFull };
 
 struct SelectSource {
   SelectSource() = default;
@@ -88,7 +88,7 @@ struct SelectSource {
 
 
 
-enum class StatementType {
+enum class StatementType : uint8_t {
   kCreateTable,
   kDropTable,
   kSelect,
@@ -393,7 +393,7 @@ class SelectStatement : public Statement {
   mutable std::string cached_fingerprint_;
 };
 
-enum class InsertMode { kDefault, kIgnore, kUpdate, kReplace };
+enum class InsertMode : uint8_t { kDefault, kIgnore, kUpdate, kReplace };
 
 class InsertStatement : public Statement {
  public:
@@ -456,7 +456,7 @@ class InsertStatement : public Statement {
 // target row. The element variable visible to `predicate` / `set_value` is
 // the last component of `target_path`.
 struct NestedDmlItem {
-  enum class Kind { kDelete, kUpdate, kInsert };
+  enum class Kind : uint8_t { kDelete, kUpdate, kInsert };
 
   Kind kind{Kind::kDelete};
   std::string target_path;

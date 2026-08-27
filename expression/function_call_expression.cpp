@@ -72,10 +72,11 @@ struct CivilTime {
 
 bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   if (s.empty()) { return false; }
+  const std::string input(s);
   int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
   bool matched = false;
-  if (sscanf(s.data(), "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) >= 3 ||
-      sscanf(s.data(), "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &sec) >= 3) {
+  if (sscanf(input.c_str(), "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) >= 3 ||
+      sscanf(input.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &sec) >= 3) {
     ct->year = Y; ct->month = M; ct->day = D;
     ct->hour = h; ct->minute = m; ct->second = sec;
     ct->subsecond_nanos = 0;
@@ -91,7 +92,7 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       ct->subsecond_nanos = std::stoll(frac_str);
     }
     matched = true;
-  } else if (sscanf(s.data(), "%d:%d:%d", &h, &m, &sec) >= 3) {
+  } else if (sscanf(input.c_str(), "%d:%d:%d", &h, &m, &sec) >= 3) {
     ct->hour = h; ct->minute = m; ct->second = sec;
     ct->subsecond_nanos = 0;
     size_t dot = s.find('.');
@@ -212,7 +213,9 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr, 
       auto loc_info = zone->get_info(loc_tp);
       return static_cast<int>(loc_info.first.offset.count());
     }
-  } catch (...) {}
+  } catch (...) {
+    return default_offset;
+  }
   return default_offset;
 }
 
@@ -298,13 +301,14 @@ Value ProtoTextScalar(std::string_view raw) {
   std::string token(raw);
   try {
     return Value(static_cast<int64_t>(std::stoll(token)));
-  } catch (...) {
+  } catch (const std::exception& error) {
+    (void)error;
   }
   try {
     return Value(std::stod(token));
   } catch (...) {
+    return Value(std::move(token));
   }
-  return Value(std::move(token));
 }
 
 // Minimal proto text-format field extraction: repeated `field: value`
@@ -885,7 +889,7 @@ Value ExecuteFunction(const std::string& name,
     }
     std::vector<std::string> path;
     {
-      std::string_view joined = raw_str(values[1]);
+      const std::string joined = raw_str(values[1]);
       size_t start = 0;
       while (true) {
         const size_t dot = joined.find('.', start);
@@ -1116,8 +1120,8 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
     return true;
   }
   if (!trimmed.empty()) {
+    size_t consumed = 0;
     try {
-      size_t consumed = 0;
       const int64_t as_int = std::stoll(trimmed, &consumed);
       if (consumed == trimmed.size()) {
         *parsed = Value(as_int);
@@ -1129,6 +1133,7 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
         return true;
       }
     } catch (const std::exception&) {
+      consumed = 0;
     }
   }
   // Struct values encode nested arrays using Value::AsString(), for example
@@ -1218,7 +1223,7 @@ std::string EncodeStructMemberJson(const Value& value) {
     case ValueType::kDate:
       return "\"" + EscapeJsonText(FormatDateDays(value.DateDays())) + "\"";
     case ValueType::kVarChar: {
-      const std::string text(value.value.varchar_value);
+      std::string text(value.value.varchar_value);
       // Nested structs and arrays are already JSON-shaped; embed verbatim.
       if (text.size() >= 2 &&
           ((text.front() == '{' && text.back() == '}') ||
@@ -1345,7 +1350,9 @@ Value FunctionCallExpression::Evaluate(const Row& row,
             TypeTag::kDouble) {
           return true;
         }
-      } catch (const std::exception&) {
+      } catch (const std::exception& error) {
+        (void)error;
+        continue;
       }
     }
     return false;
