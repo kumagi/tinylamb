@@ -1548,6 +1548,9 @@ void ComputeOneWindow(TransactionContext& context,
 }  // namespace
 
 bool HasWindowFunctions(const SelectStatement& statement) {
+  if (statement.Qualify() != nullptr) {
+    return true;
+  }
   for (const NamedExpression& projection : statement.SelectList()) {
     if (ContainsWindow(projection.expression)) {
       return true;
@@ -1558,7 +1561,7 @@ bool HasWindowFunctions(const SelectStatement& statement) {
       return true;
     }
   }
-  return ContainsWindow(statement.Qualify());
+  return false;
 }
 
 namespace {
@@ -1636,7 +1639,30 @@ WindowedInput ApplyWindows(TransactionContext& context,
   }
   CollectWindows(statement.Qualify(), &windows);
   if (windows.empty()) {
-    result.input = std::move(input);
+    if (statement.Qualify()) {
+      std::unordered_map<std::string, Expression> aliases;
+      for (const NamedExpression& projection : statement.SelectList()) {
+        if (!projection.name.empty()) {
+          aliases.emplace(projection.name, projection.expression);
+        }
+      }
+      Expression qualify =
+          InlineAliases(statement.Qualify(), aliases, input.schema);
+      Relation filtered(context.execution_runtime());
+      filtered.schema = input.schema;
+      CopyExecutionStats(&filtered, input);
+      input.FinishSpill();
+      input.ForEachRow([&](const Row& row) {
+        Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
+        if (Truthy(Evaluate(qualify, scope, nullptr, context, ctes))) {
+          filtered.AddRow(row);
+        }
+      });
+      filtered.FinishSpill();
+      result.input = std::move(filtered);
+    } else {
+      result.input = std::move(input);
+    }
     return result;
   }
 

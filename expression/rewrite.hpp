@@ -132,6 +132,14 @@ class ExpressionRewriter {
     const Expression& expression,
     const std::unordered_set<std::string>& relation_names);
 
+enum class Volatility {
+  kImmutable,
+  kStable,
+  kVolatile,
+};
+
+[[nodiscard]] Volatility GetFunctionVolatility(std::string_view func_name);
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_EXPRESSION_REWRITE_HPP

@@ -1555,14 +1555,21 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         if (insert.Values().empty()) {
           return Status::kUnknown;
         }
-        rows.reserve(insert.Values().size());
-        for (const auto& values : insert.Values()) {
-          std::vector<Value> row;
-          row.reserve(values.size());
-          for (const auto& value : values) {
-            row.push_back(value->Evaluate(Row(), Schema()));
+        // Batch INSERT chunking: evaluate values and process in chunks of kInsertChunkSize
+        constexpr size_t kInsertChunkSize = 64;
+        const size_t num_values = insert.Values().size();
+        rows.reserve(num_values);
+        for (size_t chunk_start = 0; chunk_start < num_values; chunk_start += kInsertChunkSize) {
+          const size_t chunk_end = std::min(chunk_start + kInsertChunkSize, num_values);
+          for (size_t v_idx = chunk_start; v_idx < chunk_end; ++v_idx) {
+            const auto& values = insert.Values()[v_idx];
+            std::vector<Value> row;
+            row.reserve(values.size());
+            for (const auto& value : values) {
+              row.push_back(value->Evaluate(Row(), Schema()));
+            }
+            rows.emplace_back(std::move(row));
           }
-          rows.emplace_back(std::move(row));
         }
       }
       // Column mapping and assignment coercion, shared by VALUES rows and
@@ -1760,8 +1767,13 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       const bool has_unnest = std::any_of(
           select->Sources().begin(), select->Sources().end(),
           [](const SelectSource& s) { return static_cast<bool>(s.unnest); });
+      const bool has_subquery_or_lateral = std::any_of(
+          select->Sources().begin(), select->Sources().end(),
+          [](const SelectSource& s) {
+            return s.is_lateral || s.query != nullptr;
+          });
       if (select->RequiresRelationalEvaluation() ||
-          select->Sources().empty() || has_unnest) {
+          select->Sources().empty() || has_unnest || has_subquery_or_lateral) {
         return emit_relational();
       }
 

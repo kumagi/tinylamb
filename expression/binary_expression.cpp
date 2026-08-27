@@ -506,30 +506,41 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       }
     }
   }
-  switch (op) {
-    case BinaryOperation::kAdd:
-      return left + right;
-    case BinaryOperation::kSubtract:
-      return left - right;
-    case BinaryOperation::kMultiply:
-      return left * right;
-    case BinaryOperation::kDivide: {
-      if (left.type == ValueType::kDouble) {
-        if (right.value.double_value == 0.0) {
-          throw std::runtime_error("division by zero");
+  try {
+    switch (op) {
+      case BinaryOperation::kAdd:
+        return left + right;
+      case BinaryOperation::kSubtract:
+        return left - right;
+      case BinaryOperation::kMultiply:
+        return left * right;
+      case BinaryOperation::kDivide: {
+        if (left.type == ValueType::kDouble) {
+          if (right.value.double_value == 0.0) {
+            throw std::runtime_error("division by zero");
+          }
+          const double result =
+              left.value.double_value / right.value.double_value;
+          if (std::isfinite(left.value.double_value) &&
+              std::isfinite(right.value.double_value) && std::isinf(result)) {
+            throw std::runtime_error("double overflow");
+          }
+          return Value(result);
         }
-        const double result =
-            left.value.double_value / right.value.double_value;
-        if (std::isfinite(left.value.double_value) &&
-            std::isfinite(right.value.double_value) && std::isinf(result)) {
-          throw std::runtime_error("double overflow");
-        }
-        return Value(result);
+        return left / right;
       }
-      return left / right;
+      case BinaryOperation::kModulo:
+        return left % right;
+      default:
+        break;
     }
-    case BinaryOperation::kModulo:
-      return left % right;
+  } catch (const std::runtime_error& error) {
+    if (std::string_view(error.what()).starts_with("Cannot do ")) {
+      throw std::runtime_error("unsupported binary operation");
+    }
+    throw;
+  }
+  switch (op) {
     case BinaryOperation::kEquals:
       if (folded_left.type == ValueType::kVarChar &&
           folded_right.type == ValueType::kVarChar &&

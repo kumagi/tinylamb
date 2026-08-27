@@ -79,12 +79,16 @@ Type AggregateExpression::ResultType(const Schema& left,
   if (IsSketchAggregate(type_)) {
     return {TypeTag::kVarChar};
   }
+  if (!child_) {
+    return {TypeTag::kBigInt};
+  }
   return child_->ResultType(left, right);
 }
 
 std::string AggregateExpression::ToString() const {
   std::string out = ::tinylamb::ToString(type_) + "(" +
-                    (distinct_ ? "DISTINCT " : "") + child_->ToString();
+                    (distinct_ ? "DISTINCT " : "") +
+                    (child_ ? child_->ToString() : "*");
   for (const Expression& argument : trailing_args_) {
     if (argument) { out += ", " + argument->ToString(); }
   }

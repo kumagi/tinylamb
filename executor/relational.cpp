@@ -648,21 +648,65 @@ struct CanonicalRowHash {
 
 }  // namespace
 
-Relation DistinctOf(Relation input) {
-  std::unordered_set<Row, CanonicalRowHash, CanonicalRowEqual> seen;
+Relation DistinctOf(Relation input,
+                    const std::vector<Expression>& distinct_on = {},
+                    TransactionContext* ctx = nullptr,
+                    const Scope* outer = nullptr,
+                    const CteMap* ctes = nullptr) {
+  if (distinct_on.empty()) {
+    std::unordered_set<Row, CanonicalRowHash, CanonicalRowEqual> seen;
+    Relation distinct;
+    distinct.schema = input.schema;
+    CopyExecutionStats(&distinct, input);
+    input.FinishSpill();
+    input.ForEachRow([&](const Row& row) {
+      // Canonicalize the emitted row so a representative value is chosen
+      // consistently (NaN -> quiet NaN, -0.0 -> +0.0), matching GoogleSQL.
+      Row canonical = row;
+      for (Value& value : canonical.values_) {
+        value = CanonicalDistinctValue(value);
+      }
+      if (seen.insert(canonical).second) {
+        distinct.AddRow(std::move(canonical));
+      }
+    });
+    distinct.FinishSpill();
+    return distinct;
+  }
+  std::vector<std::vector<Value>> seen_keys;
   Relation distinct;
   distinct.schema = input.schema;
   CopyExecutionStats(&distinct, input);
   input.FinishSpill();
   input.ForEachRow([&](const Row& row) {
-    // Canonicalize the emitted row so a representative value is chosen
-    // consistently (NaN -> quiet NaN, -0.0 -> +0.0), matching GoogleSQL.
-    Row canonical = row;
-    for (Value& value : canonical.values_) {
-      value = CanonicalDistinctValue(value);
+    std::vector<Value> current_keys;
+    current_keys.reserve(distinct_on.size());
+    for (const auto& expr : distinct_on) {
+      Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
+      Value val = ctx != nullptr && ctes != nullptr
+                      ? Evaluate(expr, scope, nullptr, *ctx, *ctes)
+                      : expr->Evaluate(row, input.schema);
+      current_keys.push_back(CanonicalDistinctValue(val));
     }
-    if (seen.insert(canonical).second) {
-      distinct.AddRow(std::move(canonical));
+    bool duplicate = false;
+    for (const auto& seen_k : seen_keys) {
+      if (seen_k.size() == current_keys.size()) {
+        bool match = true;
+        for (size_t i = 0; i < seen_k.size(); ++i) {
+          if (!CanonicalValuesEqual(seen_k[i], current_keys[i])) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          duplicate = true;
+          break;
+        }
+      }
+    }
+    if (!duplicate) {
+      seen_keys.push_back(std::move(current_keys));
+      distinct.AddRow(row);
     }
   });
   distinct.FinishSpill();
@@ -727,7 +771,10 @@ void ApplyOrderBy(TransactionContext& context, const SelectStatement& statement,
   }
 }
 
-Relation LimitedRows(const SelectStatement& statement, Relation&& input) {
+Relation LimitedRows(const SelectStatement& statement, Relation&& input,
+                     TransactionContext* context = nullptr,
+                     const Scope* outer = nullptr,
+                     const CteMap* ctes = nullptr) {
   Relation limited;
   limited.schema = input.schema;
   CopyExecutionStats(&limited, input);
@@ -740,14 +787,44 @@ Relation LimitedRows(const SelectStatement& statement, Relation&& input) {
   const bool unlimited = statement.Limit() == 0 && !statement.HasLimit();
   const size_t count =
       unlimited ? available : std::min(statement.Limit(), available);
-  size_t index = 0;
-  input.ForEachRow([&](const Row& row) {
-    const size_t current = index++;
-    if (current < begin || current >= begin + count) {
-      return;
+
+  std::vector<Row> all_rows;
+  all_rows.reserve(total);
+  input.ForEachRow([&](const Row& row) { all_rows.push_back(row); });
+
+  if (statement.WithTies() && !statement.OrderBy().empty() && count > 0 &&
+      begin + count <= all_rows.size()) {
+    const size_t last_idx = begin + count - 1;
+    const Row& last_row = all_rows[last_idx];
+    size_t end_idx = begin + count;
+    while (end_idx < all_rows.size()) {
+      bool tied = true;
+      for (const auto& term : statement.OrderBy()) {
+        Scope scope_last{.row = &last_row, .schema = &input.schema, .outer = outer};
+        Scope scope_curr{.row = &all_rows[end_idx], .schema = &input.schema, .outer = outer};
+        Value val_last = context != nullptr && ctes != nullptr
+                             ? Evaluate(term.expression, scope_last, nullptr, *context, *ctes)
+                             : term.expression->Evaluate(last_row, input.schema);
+        Value val_curr = context != nullptr && ctes != nullptr
+                             ? Evaluate(term.expression, scope_curr, nullptr, *context, *ctes)
+                             : term.expression->Evaluate(all_rows[end_idx], input.schema);
+        if (!CanonicalValuesEqual(val_last, val_curr)) {
+          tied = false;
+          break;
+        }
+      }
+      if (!tied) break;
+      ++end_idx;
     }
-    limited.AddRow(row);
-  });
+    for (size_t i = begin; i < end_idx; ++i) {
+      limited.AddRow(all_rows[i]);
+    }
+  } else {
+    for (size_t i = begin; i < begin + count && i < all_rows.size(); ++i) {
+      limited.AddRow(all_rows[i]);
+    }
+  }
+
   limited.FinishSpill();
   return limited;
 }
@@ -781,12 +858,20 @@ Relation FinishQuery(TransactionContext& context,
   Relation output = Project(context, statement, std::move(input), outer, ctes,
                             hidden_columns);
   if (statement.Distinct()) {
-    output = DistinctOf(std::move(output));
-    if (!statement.OrderBy().empty()) {
-      ApplyOrderBy(context, statement, &output, outer, ctes);
+    if (statement.HasDistinctOn()) {
+      if (!statement.OrderBy().empty()) {
+        ApplyOrderBy(context, statement, &output, outer, ctes);
+      }
+      output = DistinctOf(std::move(output), statement.DistinctOn(), &context,
+                          outer, &ctes);
+    } else {
+      output = DistinctOf(std::move(output));
+      if (!statement.OrderBy().empty()) {
+        ApplyOrderBy(context, statement, &output, outer, ctes);
+      }
     }
   }
-  return LimitedRows(statement, std::move(output));
+  return LimitedRows(statement, std::move(output), &context, outer, &ctes);
 }
 Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     TransactionContext& context, const SelectStatement& statement,
@@ -1479,9 +1564,14 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     // longer reachable from the projected output alone), and DistinctOf
     // preserves row order.
     if (stmt.Distinct()) {
-      output = DistinctOf(std::move(output));
+      if (stmt.HasDistinctOn()) {
+        output = DistinctOf(std::move(output), stmt.DistinctOn(), &context,
+                            outer, &ctes);
+      } else {
+        output = DistinctOf(std::move(output));
+      }
     }
-    return LimitedRows(statement, std::move(output));
+    return LimitedRows(statement, std::move(output), &context, outer, &ctes);
   }
 
   bool where_fully_applied = false;

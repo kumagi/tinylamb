@@ -4,17 +4,27 @@
 #include <vector>
 
 #include "executor/executor_base.hpp"
+#include "expression/expression.hpp"
 #include "type/row.hpp"
+#include "type/schema.hpp"
+
 namespace tinylamb {
 class DistinctExecutor : public ExecutorBase {
  public:
-  explicit DistinctExecutor(Executor source) : source_(std::move(source)) {}
+  explicit DistinctExecutor(Executor source, Schema schema = {},
+                            std::vector<Expression> distinct_on = {})
+      : source_(std::move(source)),
+        schema_(std::move(schema)),
+        distinct_on_(std::move(distinct_on)) {}
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& output, int indent) const override;
 
  private:
   Executor source_;
+  Schema schema_;
+  std::vector<Expression> distinct_on_;
   std::vector<Row> seen_;
+  std::vector<std::vector<Value>> seen_keys_;
 };
 
 class SortDistinctExecutor final : public ExecutorBase {

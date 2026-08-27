@@ -614,6 +614,53 @@ Value ExecuteFunction(const std::string& name,
     }
     return Value(std::move(result));
   }
+  if (name == "upper") {
+    if (values.size() != 1) {
+      throw std::runtime_error("UPPER requires 1 argument");
+    }
+    if (values[0].IsNull()) { return {}; }
+    std::string s = raw_str(values[0]);
+    for (char& c : s) {
+      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return Value(std::move(s));
+  }
+  if (name == "lower") {
+    if (values.size() != 1) {
+      throw std::runtime_error("LOWER requires 1 argument");
+    }
+    if (values[0].IsNull()) { return {}; }
+    std::string s = raw_str(values[0]);
+    for (char& c : s) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return Value(std::move(s));
+  }
+  if (name == "abs") {
+    if (values.size() != 1) {
+      throw std::runtime_error("ABS requires 1 argument");
+    }
+    if (values[0].IsNull()) { return {}; }
+    if (values[0].type == ValueType::kInt64) {
+      return Value(std::abs(values[0].value.int_value));
+    }
+    if (values[0].type == ValueType::kDouble) {
+      return Value(std::abs(values[0].value.double_value));
+    }
+    throw std::runtime_error("ABS requires numeric argument");
+  }
+  if (name == "sqrt") {
+    if (values.size() != 1) {
+      throw std::runtime_error("SQRT requires 1 argument");
+    }
+    if (values[0].IsNull()) { return {}; }
+    double val = values[0].type == ValueType::kInt64
+                     ? static_cast<double>(values[0].value.int_value)
+                     : (values[0].type == ValueType::kDouble
+                            ? values[0].value.double_value
+                            : 0.0);
+    return Value(std::sqrt(val));
+  }
   if (name == "substr" || name == "substring") {
     if (values.size() < 2 || values.size() > 3) {
       throw std::runtime_error("SUBSTR requires two or three arguments");
@@ -644,6 +691,67 @@ Value ExecuteFunction(const std::string& name,
 
     if (begin >= input.size()) { return Value(std::string()); }
     return Value(input.substr(begin, length));
+  }
+  if (name == "length" || name == "char_length" ||
+      name == "character_length" || name == "octet_length" ||
+      name == "byte_length") {
+    if (values.size() != 1) {
+      throw std::runtime_error(name + " requires 1 argument");
+    }
+    if (values[0].IsNull()) { return {}; }
+    return Value(static_cast<int64_t>(raw_str(values[0]).size()));
+  }
+  if (name == "instr" || name == "strpos") {
+    if (values.size() != 2) {
+      throw std::runtime_error(name + " requires 2 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull()) { return {}; }
+    const std::string hay = raw_str(values[0]);
+    const std::string needle = raw_str(values[1]);
+    const size_t pos = hay.find(needle);
+    if (pos == std::string::npos) {
+      return Value(int64_t{0});
+    }
+    return Value(static_cast<int64_t>(pos + 1));
+  }
+  if (name == "lpad" || name == "rpad") {
+    if (values.size() < 2 || values.size() > 3) {
+      throw std::runtime_error(name + " requires 2 or 3 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() ||
+        (values.size() == 3 && values[2].IsNull())) {
+      return {};
+    }
+    const std::string input = raw_str(values[0]);
+    int64_t target_len = values[1].type == ValueType::kInt64
+                             ? values[1].value.int_value
+                             : std::stoll(raw_str(values[1]));
+    if (target_len < 0) {
+      throw std::runtime_error(name + " target length cannot be negative");
+    }
+    const size_t target_size = static_cast<size_t>(target_len);
+    if (target_size == 0) {
+      return Value(std::string());
+    }
+    if (input.size() >= target_size) {
+      return Value(input.substr(0, target_size));
+    }
+    const std::string pad = values.size() == 3 ? raw_str(values[2]) : " ";
+    if (pad.empty()) {
+      return Value(input.substr(0, target_size));
+    }
+    const size_t pad_needed = target_size - input.size();
+    std::string padding;
+    padding.reserve(pad_needed + pad.size());
+    while (padding.size() < pad_needed) {
+      padding.append(pad);
+    }
+    padding.resize(pad_needed);
+    if (name == "lpad") {
+      return Value(padding + input);
+    } else {
+      return Value(input + padding);
+    }
   }
   if (name == "extract_year" || name == "extract_month" ||
       name == "extract_day") {

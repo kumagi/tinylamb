@@ -17,6 +17,9 @@
 
 namespace tinylamb {
 
+class ColumnVector;
+class SelectionVector;
+
 inline constexpr size_t kDefaultVectorSize = 1024;
 
 class ColumnVector {
@@ -48,6 +51,12 @@ class ColumnVector {
   [[nodiscard]] const std::vector<std::string>& StringData() const {
     return strings_;
   }
+
+  [[nodiscard]] Value AggregateLogicalAnd(const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateLogicalOr(const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateBitAnd(const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateBitOr(const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateBitXor(const SelectionVector* sel = nullptr) const;
 
  private:
   void AppendDefault();
@@ -119,6 +128,17 @@ class DataChunk {
     assert(index < zone_maps_.size() && "DataChunk::ZoneMapAt out of range");
     return zone_maps_[index];
   }
+
+  [[nodiscard]] Value AggregateLogicalAnd(size_t col_idx,
+                                          const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateLogicalOr(size_t col_idx,
+                                         const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateBitAnd(size_t col_idx,
+                                      const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateBitOr(size_t col_idx,
+                                     const SelectionVector* sel = nullptr) const;
+  [[nodiscard]] Value AggregateBitXor(size_t col_idx,
+                                      const SelectionVector* sel = nullptr) const;
 
  private:
   void EnsureLayout(const Row& row);

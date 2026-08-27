@@ -1,0 +1,220 @@
+# Golden test specifications for engine features not yet implemented or upcoming.
+
+[prepare_database]
+CREATE TABLE stock_ticks AS
+SELECT 1 AS tick_id, 'GOOG' AS symbol, 100 AS price, 1 AS t_time
+UNION ALL SELECT 2, 'GOOG', 105, 2
+UNION ALL SELECT 3, 'GOOG', 110, 3
+UNION ALL SELECT 4, 'GOOG', 95, 4
+UNION ALL SELECT 5, 'GOOG', 90, 5
+UNION ALL SELECT 6, 'GOOG', 120, 6;
+--
+ARRAY<STRUCT<tick_id INT64, symbol STRING, price INT64, t_time INT64>>[
+  {1, "GOOG", 100, 1},
+  {2, "GOOG", 105, 2},
+  {3, "GOOG", 110, 3},
+  {4, "GOOG", 95, 4},
+  {5, "GOOG", 90, 5},
+  {6, "GOOG", 120, 6}
+]
+==
+
+[prepare_database]
+CREATE TABLE quarterly_sales AS
+SELECT 2025 AS year, 'Widgets' AS product, 1000 AS q1, 1200 AS q2, 1100 AS q3, 1500 AS q4
+UNION ALL SELECT 2025, 'Gadgets', 500, 600, 750, 900;
+--
+ARRAY<STRUCT<year INT64, product STRING, q1 INT64, q2 INT64, q3 INT64, q4 INT64>>[
+  {2025, "Widgets", 1000, 1200, 1100, 1500},
+  {2025, "Gadgets", 500, 600, 750, 900}
+]
+==
+
+[prepare_database]
+CREATE TABLE monthly_sales AS
+SELECT 2025 AS year, 'Widgets' AS product, 'Q1' AS quarter, 1000 AS amount
+UNION ALL SELECT 2025, 'Widgets', 'Q2', 1200
+UNION ALL SELECT 2025, 'Widgets', 'Q3', 1100
+UNION ALL SELECT 2025, 'Widgets', 'Q4', 1500
+UNION ALL SELECT 2025, 'Gadgets', 'Q1', 500
+UNION ALL SELECT 2025, 'Gadgets', 'Q2', 600
+UNION ALL SELECT 2025, 'Gadgets', 'Q3', 750
+UNION ALL SELECT 2025, 'Gadgets', 'Q4', 900;
+--
+ARRAY<STRUCT<year INT64, product STRING, quarter STRING, amount INT64>>[
+  {2025, "Widgets", "Q1", 1000},
+  {2025, "Widgets", "Q2", 1200},
+  {2025, "Widgets", "Q3", 1100},
+  {2025, "Widgets", "Q4", 1500},
+  {2025, "Gadgets", "Q1", 500},
+  {2025, "Gadgets", "Q2", 600},
+  {2025, "Gadgets", "Q3", 750},
+  {2025, "Gadgets", "Q4", 900}
+]
+==
+
+[required_features=MATCH_RECOGNIZE]
+[name=match_recognize_v_shape_pattern]
+SELECT *
+FROM stock_ticks MATCH_RECOGNIZE (
+  PARTITION BY symbol
+  ORDER BY t_time
+  MEASURES
+    FIRST(A.price) AS start_price,
+    LAST(B.price) AS bottom_price,
+    LAST(C.price) AS peak_price
+  ONE ROW PER MATCH
+  PATTERN ( A B+ C+ )
+  DEFINE
+    B AS B.price < PREV(B.price),
+    C AS C.price > PREV(C.price)
+)
+--
+ARRAY<STRUCT<symbol STRING, start_price INT64, bottom_price INT64, peak_price INT64>>[
+  {"GOOG", 110, 90, 120}
+]
+==
+
+[required_features=MATCH_RECOGNIZE]
+[name=match_recognize_all_rows_per_match]
+SELECT *
+FROM stock_ticks MATCH_RECOGNIZE (
+  PARTITION BY symbol
+  ORDER BY t_time
+  MEASURES
+    CLASSIFIER() AS pattern_var,
+    MATCH_NUMBER() AS match_num
+  ALL ROWS PER MATCH
+  PATTERN ( A B+ )
+  DEFINE
+    B AS B.price > PREV(B.price)
+)
+--
+ARRAY<STRUCT<symbol STRING, t_time INT64, pattern_var STRING, match_num INT64>>[
+  {"GOOG", 1, "A", 1},
+  {"GOOG", 2, "B", 1},
+  {"GOOG", 3, "B", 1},
+  {"GOOG", 5, "A", 2},
+  {"GOOG", 6, "B", 2}
+]
+==
+
+[required_features=PIVOT]
+[name=pivot_quarterly_sales]
+SELECT *
+FROM monthly_sales
+PIVOT (
+  SUM(amount)
+  FOR quarter IN ('Q1' AS q1_sales, 'Q2' AS q2_sales, 'Q3' AS q3_sales, 'Q4' AS q4_sales)
+)
+ORDER BY year, product
+--
+ARRAY<STRUCT<year INT64, product STRING, q1_sales INT64, q2_sales INT64, q3_sales INT64, q4_sales INT64>>[
+  {2025, "Gadgets", 500, 600, 750, 900},
+  {2025, "Widgets", 1000, 1200, 1100, 1500}
+]
+==
+
+[required_features=UNPIVOT]
+[name=unpivot_quarterly_sales]
+SELECT *
+FROM quarterly_sales
+UNPIVOT (
+  amount FOR quarter IN (q1 AS 'Q1', q2 AS 'Q2', q3 AS 'Q3', q4 AS 'Q4')
+)
+ORDER BY year, product, quarter
+--
+ARRAY<STRUCT<year INT64, product STRING, quarter STRING, amount INT64>>[
+  {2025, "Gadgets", "Q1", 500},
+  {2025, "Gadgets", "Q2", 600},
+  {2025, "Gadgets", "Q3", 750},
+  {2025, "Gadgets", "Q4", 900},
+  {2025, "Widgets", "Q1", 1000},
+  {2025, "Widgets", "Q2", 1200},
+  {2025, "Widgets", "Q3", 1100},
+  {2025, "Widgets", "Q4", 1500}
+]
+==
+
+[required_features=SQL_GRAPH]
+[name=graph_table_simple_edge_match]
+SELECT *
+FROM GRAPH_TABLE (
+  social_network
+  MATCH (a:Person)-[e:KNOWS]->(b:Person)
+  COLUMNS (a.name AS src_name, b.name AS dst_name, e.since AS knows_since)
+)
+ORDER BY src_name, dst_name
+--
+ARRAY<STRUCT<src_name STRING, dst_name STRING, knows_since INT64>>[
+  {"Alice", "Bob", 2020},
+  {"Bob", "Charlie", 2021},
+  {"Charlie", "David", 2022}
+]
+==
+
+[required_features=SQL_GRAPH]
+[name=graph_table_variable_length_path]
+SELECT *
+FROM GRAPH_TABLE (
+  social_network
+  MATCH (a:Person)-[e:KNOWS]->{1,3}(b:Person)
+  COLUMNS (a.name AS src_name, b.name AS dst_name)
+)
+ORDER BY src_name, dst_name
+--
+ARRAY<STRUCT<src_name STRING, dst_name STRING>>[
+  {"Alice", "Bob"},
+  {"Alice", "Charlie"},
+  {"Alice", "David"},
+  {"Bob", "Charlie"},
+  {"Bob", "David"},
+  {"Charlie", "David"}
+]
+==
+
+[required_features=QUALIFY]
+[name=qualify_complex_window_filter]
+SELECT year, product, quarter, amount,
+       ROW_NUMBER() OVER (PARTITION BY product ORDER BY amount DESC) AS rank_in_product
+FROM monthly_sales
+QUALIFY rank_in_product <= 2
+    AND AVG(amount) OVER (PARTITION BY product ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) >= 600
+ORDER BY product, rank_in_product
+--
+ARRAY<STRUCT<year INT64, product STRING, quarter STRING, amount INT64, rank_in_product INT64>>[
+  {2025, "Gadgets", "Q4", 900, 1},
+  {2025, "Gadgets", "Q3", 750, 2},
+  {2025, "Widgets", "Q4", 1500, 1},
+  {2025, "Widgets", "Q2", 1200, 2}
+]
+==
+
+[required_features=ORDERED_SET_AGGREGATES]
+[name=ordered_set_percentile_cont]
+SELECT product,
+       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount ASC) AS median_amount,
+       PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY amount ASC) AS p90_amount
+FROM monthly_sales
+GROUP BY product
+ORDER BY product
+--
+ARRAY<STRUCT<product STRING, median_amount DOUBLE, p90_amount INT64>>[
+  {"Gadgets", 675, 900},
+  {"Widgets", 1150, 1500}
+]
+==
+
+[required_features=ORDERED_SET_AGGREGATES]
+[name=ordered_set_mode]
+SELECT product,
+       MODE() WITHIN GROUP (ORDER BY quarter) AS modal_quarter
+FROM monthly_sales
+GROUP BY product
+ORDER BY product
+--
+ARRAY<STRUCT<product STRING, modal_quarter STRING>>[
+  {"Gadgets", "Q1"},
+  {"Widgets", "Q1"}
+]
+==

@@ -76,6 +76,7 @@ struct AggregateAccumulator {
   // context (HAVING modifier, inner ORDER BY/LIMIT, ARRAY_AGG, STRING_AGG).
   void Add(const AggregateInput& input);
   Value Finish() const;
+  [[nodiscard]] bool IsDone() const;
 
   const AggregateExpression* expression;
   int64_t count = 0;
@@ -171,7 +172,8 @@ struct AggregateAccumulator {
   std::unique_ptr<std::unordered_set<Value>> approx_distinct_;
 
   void ApplyCore(const Value& value,
-                 const std::vector<Value>& trailing_values = {});
+                 const std::vector<Value>& trailing_values = {},
+                 const std::vector<Value>& order_keys = {});
   void RecordQuantileParam(const std::vector<Value>& trailing_values);
   void RecordLimitParam(const std::vector<Value>& trailing_values);
   SumWeight& FindOrAddTopSum(const Value& value);

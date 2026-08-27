@@ -6,7 +6,15 @@
 #include <stdexcept>
 #include <utility>
 
+#include "executor/dictionary_batch_aggregation.hpp"
+#include "executor/selection_vector.hpp"
+#include "executor/simd_comparison.hpp"
+#include "executor/vectorized_expression.hpp"
 #include "executor/zone_map.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
 #include "common/constants.hpp"
 #include "gtest/gtest.h"
 #include "type/column.hpp"
@@ -307,6 +315,265 @@ TEST(DataChunkTest, Append_TypeMismatchFromSourceChunk_ThrowsWithoutPartialAppen
   EXPECT_THROW(target.Append(source, 0), std::invalid_argument);
   EXPECT_EQ(target.Size(), 0U);
   EXPECT_NO_THROW(target.Append(Row({Value(int64_t{2})})));
+}
+
+TEST(ValidityBitmapTest, BasicOperationsAndBitwiseOps) {
+  ValidityBitmap bm(130, false);
+  EXPECT_EQ(bm.Size(), 130);
+  EXPECT_EQ(bm.CountValid(), 0);
+  EXPECT_TRUE(bm.NoneValid());
+
+  bm.SetBit(0);
+  bm.SetBit(63);
+  bm.SetBit(64);
+  bm.SetBit(129);
+  EXPECT_EQ(bm.CountValid(), 4);
+  EXPECT_TRUE(bm.Get(0));
+  EXPECT_TRUE(bm.Get(63));
+  EXPECT_TRUE(bm.Get(64));
+  EXPECT_TRUE(bm.Get(129));
+  EXPECT_FALSE(bm.Get(1));
+
+  bm.ClearBit(63);
+  EXPECT_FALSE(bm.Get(63));
+  EXPECT_EQ(bm.CountValid(), 3);
+
+  ValidityBitmap bm2(130, false);
+  bm2.SetBit(0);
+  bm2.SetBit(1);
+
+  ValidityBitmap and_res = bm.BitwiseAnd(bm2);
+  EXPECT_EQ(and_res.CountValid(), 1);
+  EXPECT_TRUE(and_res.Get(0));
+  EXPECT_FALSE(and_res.Get(1));
+
+  ValidityBitmap or_res = bm.BitwiseOr(bm2);
+  EXPECT_EQ(or_res.CountValid(), 4);
+  EXPECT_TRUE(or_res.Get(0));
+  EXPECT_TRUE(or_res.Get(1));
+  EXPECT_TRUE(or_res.Get(64));
+  EXPECT_TRUE(or_res.Get(129));
+}
+
+TEST(SelectionVectorTest, FilterAndToSelectionVector) {
+  ValidityBitmap bm(10, false);
+  bm.SetBit(1);
+  bm.SetBit(3);
+  bm.SetBit(7);
+
+  SelectionVector sel;
+  bm.ToSelectionVector(&sel);
+  ASSERT_EQ(sel.Size(), 3);
+  EXPECT_EQ(sel[0], 1);
+  EXPECT_EQ(sel[1], 3);
+  EXPECT_EQ(sel[2], 7);
+
+  SelectionVector initial;
+  initial.Initialize(10);
+  EXPECT_EQ(initial.Size(), 10);
+
+  SelectionVector filtered;
+  initial.Filter(bm, &filtered);
+  ASSERT_EQ(filtered.Size(), 3);
+  EXPECT_EQ(filtered[0], 1);
+  EXPECT_EQ(filtered[1], 3);
+  EXPECT_EQ(filtered[2], 7);
+
+  SelectionVector sliced = initial.Slice(2, 4);
+  ASSERT_EQ(sliced.Size(), 4);
+  EXPECT_EQ(sliced[0], 2);
+  EXPECT_EQ(sliced[1], 3);
+  EXPECT_EQ(sliced[2], 4);
+  EXPECT_EQ(sliced[3], 5);
+}
+
+TEST(VectorizedExpressionTest, EvaluateArithmeticAndComparison) {
+  const Schema schema("t", {Column("a", ValueType::kInt64),
+                            Column("b", ValueType::kInt64),
+                            Column("score", ValueType::kDouble)});
+  DataChunk chunk(schema, 4);
+  chunk.Append(Row({Value(int64_t{10}), Value(int64_t{2}), Value(1.5)}));
+  chunk.Append(Row({Value(int64_t{20}), Value(int64_t{5}), Value(2.5)}));
+  chunk.Append(Row({Value(int64_t{30}), Value(), Value(3.5)}));
+
+  // a + b
+  Expression add_expr = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kAdd, ColumnValueExp("b"));
+  ColumnVector add_res =
+      VectorizedExpression::Evaluate(add_expr, schema, chunk);
+  ASSERT_EQ(add_res.Size(), 3);
+  EXPECT_EQ(add_res.ValueAt(0), Value(int64_t{12}));
+  EXPECT_EQ(add_res.ValueAt(1), Value(int64_t{25}));
+  EXPECT_TRUE(add_res.IsNull(2));
+
+  // a > 15
+  Expression cmp_expr = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kGreaterThan,
+      ConstantValueExp(Value(int64_t{15})));
+  ValidityBitmap filter_mask =
+      VectorizedExpression::EvaluateFilter(cmp_expr, schema, chunk);
+  ASSERT_EQ(filter_mask.Size(), 3);
+  EXPECT_FALSE(filter_mask.Get(0));
+  EXPECT_TRUE(filter_mask.Get(1));
+  EXPECT_TRUE(filter_mask.Get(2));
+
+  SelectionVector sel;
+  VectorizedExpression::FilterDataChunk(cmp_expr, schema, chunk, &sel);
+  ASSERT_EQ(sel.Size(), 2);
+  EXPECT_EQ(sel[0], 1);
+  EXPECT_EQ(sel[1], 2);
+}
+
+TEST(SimdComparisonKernelTest, IntegerDoubleStringComparison) {
+  std::vector<int64_t> ints = {10, 20, 30, 40, 50};
+  ValidityBitmap int_mask;
+  SimdComparisonKernel::CompareInt64(ints.data(), ints.size(),
+                                     BinaryOperation::kGreaterThan, 25,
+                                     &int_mask);
+  EXPECT_EQ(int_mask.CountValid(), 3);
+  EXPECT_FALSE(int_mask.Get(0));
+  EXPECT_FALSE(int_mask.Get(1));
+  EXPECT_TRUE(int_mask.Get(2));
+  EXPECT_TRUE(int_mask.Get(3));
+  EXPECT_TRUE(int_mask.Get(4));
+
+  std::vector<double> doubles = {1.5, 2.5, 3.5, 4.5};
+  ValidityBitmap dbl_mask;
+  SimdComparisonKernel::CompareDouble(doubles.data(), doubles.size(),
+                                      BinaryOperation::kLessThanEquals, 2.5,
+                                      &dbl_mask);
+  EXPECT_EQ(dbl_mask.CountValid(), 2);
+  EXPECT_TRUE(dbl_mask.Get(0));
+  EXPECT_TRUE(dbl_mask.Get(1));
+  EXPECT_FALSE(dbl_mask.Get(2));
+
+  std::vector<std::string_view> strings = {"apple", "banana", "cherry", "date"};
+  ValidityBitmap str_mask;
+  SimdComparisonKernel::CompareStringPrefix(strings.data(), strings.size(),
+                                           BinaryOperation::kEquals, "banana",
+                                           &str_mask);
+  EXPECT_EQ(str_mask.CountValid(), 1);
+  EXPECT_TRUE(str_mask.Get(1));
+}
+
+TEST(DictionaryBatchAggregationTest, GroupByCountSumAvg) {
+  const Schema schema("sales", {Column("category", ValueType::kVarChar),
+                                Column("amount", ValueType::kInt64)});
+  DataChunk chunk(schema, 6);
+  chunk.Append(Row({Value("Fruit"), Value(int64_t{100})}));
+  chunk.Append(Row({Value("Veg"), Value(int64_t{50})}));
+  chunk.Append(Row({Value("Fruit"), Value(int64_t{200})}));
+  chunk.Append(Row({Value("Veg"), Value(int64_t{150})}));
+  chunk.Append(Row({Value("Fruit"), Value(int64_t{300})}));
+
+  DictionaryBatchAggregation sum_agg(schema, 0, 1,
+                                     DictionaryBatchAggregation::AggOp::kSum);
+  sum_agg.AccumulateChunk(chunk);
+  EXPECT_EQ(sum_agg.GroupCount(), 2);
+
+  const Schema out_schema("res", {Column("category", ValueType::kVarChar),
+                                  Column("total", ValueType::kDouble)});
+  DataChunk out_chunk = sum_agg.EmitResult(out_schema);
+  ASSERT_EQ(out_chunk.Size(), 2);
+
+  // Group 0 ("Fruit"): sum = 600
+  EXPECT_EQ(out_chunk.ColumnAt(0).ValueAt(0), Value("Fruit"));
+  EXPECT_EQ(out_chunk.ColumnAt(1).ValueAt(0), Value(600.0));
+
+  // Group 1 ("Veg"): sum = 200
+  EXPECT_EQ(out_chunk.ColumnAt(0).ValueAt(1), Value("Veg"));
+  EXPECT_EQ(out_chunk.ColumnAt(1).ValueAt(1), Value(200.0));
+}
+
+TEST(VectorizedBooleanAndBitwiseAggregationTest, BitwiseAggregates) {
+  const Schema schema("bits", {Column("v", ValueType::kInt64)});
+  DataChunk chunk(schema, 8);
+  chunk.Append(Row({Value(int64_t{0b1111})}));
+  chunk.Append(Row({Value(int64_t{0b0110})}));
+  chunk.Append(Row({Value(int64_t{0b0011})}));
+  chunk.Append(Row({Value()}));  // Null row should be ignored in aggregates
+
+  // BIT_AND: 0b1111 & 0b0110 & 0b0011 = 0b0010 (2)
+  EXPECT_EQ(chunk.AggregateBitAnd(0), Value(int64_t{0b0010}));
+  EXPECT_EQ(VectorizedExpression::AggregateBitAnd(chunk.ColumnAt(0)),
+            Value(int64_t{0b0010}));
+  EXPECT_EQ(VectorizedExpression::Aggregate(AggregationType::kBitAnd,
+                                            chunk.ColumnAt(0)),
+            Value(int64_t{0b0010}));
+
+  // BIT_OR: 0b1111 | 0b0110 | 0b0011 = 0b1111 (15)
+  EXPECT_EQ(chunk.AggregateBitOr(0), Value(int64_t{0b1111}));
+  EXPECT_EQ(VectorizedExpression::AggregateBitOr(chunk.ColumnAt(0)),
+            Value(int64_t{0b1111}));
+  EXPECT_EQ(VectorizedExpression::Aggregate(AggregationType::kBitOr,
+                                            chunk.ColumnAt(0)),
+            Value(int64_t{0b1111}));
+
+  // BIT_XOR: 0b1111 ^ 0b0110 ^ 0b0011 = 0b1010 (10)
+  EXPECT_EQ(chunk.AggregateBitXor(0), Value(int64_t{0b1010}));
+  EXPECT_EQ(VectorizedExpression::AggregateBitXor(chunk.ColumnAt(0)),
+            Value(int64_t{0b1010}));
+  EXPECT_EQ(VectorizedExpression::Aggregate(AggregationType::kBitXor,
+                                            chunk.ColumnAt(0)),
+            Value(int64_t{0b1010}));
+
+  // With SelectionVector selecting row 0 and row 1:
+  SelectionVector sel({0, 1});
+  EXPECT_EQ(chunk.AggregateBitAnd(0, &sel), Value(int64_t{0b0110}));
+  EXPECT_EQ(chunk.AggregateBitOr(0, &sel), Value(int64_t{0b1111}));
+  EXPECT_EQ(chunk.AggregateBitXor(0, &sel), Value(int64_t{0b1001}));
+}
+
+TEST(VectorizedBooleanAndBitwiseAggregationTest, LogicalAndOrAggregates) {
+  const Schema schema("bools", {Column("a", ValueType::kInt64),
+                                Column("b", ValueType::kInt64),
+                                Column("c", ValueType::kInt64)});
+  DataChunk chunk(schema, 4);
+  chunk.Append(Row({Value(int64_t{1}), Value(int64_t{0}), Value()}));
+  chunk.Append(Row({Value(int64_t{1}), Value(int64_t{0}), Value()}));
+  chunk.Append(Row({Value(int64_t{1}), Value(int64_t{1}), Value()}));
+
+  // Column "a" has all true: LOGICAL_AND = 1, LOGICAL_OR = 1
+  EXPECT_EQ(chunk.AggregateLogicalAnd(0), Value(int64_t{1}));
+  EXPECT_EQ(chunk.AggregateLogicalOr(0), Value(int64_t{1}));
+
+  // Column "b" has mix of 0 and 1: LOGICAL_AND = 0, LOGICAL_OR = 1
+  EXPECT_EQ(chunk.AggregateLogicalAnd(1), Value(int64_t{0}));
+  EXPECT_EQ(chunk.AggregateLogicalOr(1), Value(int64_t{1}));
+
+  // Column "c" has all NULL: LOGICAL_AND = NULL, LOGICAL_OR = NULL
+  EXPECT_TRUE(chunk.AggregateLogicalAnd(2).IsNull());
+  EXPECT_TRUE(chunk.AggregateLogicalOr(2).IsNull());
+
+  // VectorizedExpression binary logical evaluation: a AND b
+  Expression and_expr = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kAnd, ColumnValueExp("b"));
+  ColumnVector and_res =
+      VectorizedExpression::Evaluate(and_expr, schema, chunk);
+  ASSERT_EQ(and_res.Size(), 3);
+  EXPECT_EQ(and_res.ValueAt(0), Value(int64_t{0}));
+  EXPECT_EQ(and_res.ValueAt(1), Value(int64_t{0}));
+  EXPECT_EQ(and_res.ValueAt(2), Value(int64_t{1}));
+
+  // a OR b
+  Expression or_expr = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kOr, ColumnValueExp("b"));
+  ColumnVector or_res =
+      VectorizedExpression::Evaluate(or_expr, schema, chunk);
+  ASSERT_EQ(or_res.Size(), 3);
+  EXPECT_EQ(or_res.ValueAt(0), Value(int64_t{1}));
+  EXPECT_EQ(or_res.ValueAt(1), Value(int64_t{1}));
+  EXPECT_EQ(or_res.ValueAt(2), Value(int64_t{1}));
+
+  // a XOR b
+  Expression xor_expr = BinaryExpressionExp(
+      ColumnValueExp("a"), BinaryOperation::kXor, ColumnValueExp("b"));
+  ColumnVector xor_res =
+      VectorizedExpression::Evaluate(xor_expr, schema, chunk);
+  ASSERT_EQ(xor_res.Size(), 3);
+  EXPECT_EQ(xor_res.ValueAt(0), Value(int64_t{1}));
+  EXPECT_EQ(xor_res.ValueAt(1), Value(int64_t{1}));
+  EXPECT_EQ(xor_res.ValueAt(2), Value(int64_t{0}));
 }
 
 }  // namespace tinylamb

@@ -125,7 +125,7 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
       predicate を分配）
 - [x] `push_filter_into_union_distinct`（DISTINCT 後も安全な場合。set-op の
       重複意味を保ったまま枝へ分配）
-- [ ] `simplify_filter_with_fd`（関数従属で冗長述語削除）
+- [x] `simplify_filter_with_fd`（関数従属で冗長述語削除）
 - [x] `redundant_filter_removal`（同一列の非 NULL 定数等式が包含する比較を
       三値論理を保ったまま除去）
 - [x] `range_predicate_merge`（同一列・同方向の比較に限定し、`x>1 AND x>5`
@@ -136,7 +136,7 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
       lower/upper の AND に正規化。`between_collapse` は未導入）
 - [x] `or_to_in` / `in_to_or`（安全な同一列・定数等式の `OR` → `IN` を実装。
       逆変換は未使用のため、選択性依存の展開は保留）
-- [ ] `in_list_to_semijoin`（大きな IN リスト）
+- [x] `in_list_to_semijoin`（大きな IN リスト）
 - [x] `extract_common_or_predicates`（式レベルの安全な共通 AND 因子抽出を
       `factor_or_common_and` として実装。関係レベルの DNF 展開は抑制）
 - [ ] `predicate_push_into_case`
@@ -153,12 +153,12 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `cast_pushdown_on_comparison`（型を列側に寄せる）
 - [x] `redundant_cast_removal`（同一 target/null-on-error の nested CAST を
       `collapse_nested_identical_cast` で除去。異なる型の CAST は保持）
-- [ ] `filter_merge_with_scan_zonemap` ヒント（実行器の zone map と接続）
+- [x] `filter_merge_with_scan_zonemap` ヒント（実行器の zone map と接続）
 - [x] `push_limit_into_scan`（WHERE / ORDER BY / DISTINCT / 集約がない有限 LIMIT
       に限り、OFFSET + LIMIT の上限を FullScan へ渡す early stop）
 - [x] `push_limit_through_union_all`（`union_all_push_limit` として有限 LIMIT の
       offset+count を各枝へ伝播）
-- [ ] `push_limit_through_inner_join_if_unique`（1:1 のとき）
+- [x] `push_limit_through_inner_join_if_unique`（1:1 のとき）
 - [x] `offset_zero_elimination`（表現上、OFFSET 0 は既定値と同一の正規化済み
       形であり、専用変換の余地なし。TopN / union branch cap は offset=0 を
       正しく透過）
@@ -170,12 +170,12 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [x] `prefix_sort_elimination`（Sort/TopN の出力順序を要求キーの prefix として
       `IsOrderedBy` から伝播）
 - [ ] `redundant_distinct_under_unique_key`
-- [ ] `distinct_to_group_by`
-- [ ] `group_by_to_distinct`（agg 無し）
-- [ ] `count_star_without_group_rewrite`
+- [x] `distinct_to_group_by`
+- [x] `group_by_to_distinct`（agg 無し）
+- [x] `count_star_without_group_rewrite`
 - [x] `push_filter_through_distinct`（行値 predicate は DISTINCT と可換なため
       `DISTINCT(Filter(input))` へ移動）
-- [ ] `pull_filter_above_join`（選択性が極端に悪い場合の探索用、任意）
+- [x] `pull_filter_above_join`（選択性が極端に悪い場合の探索用、任意）
 
 ---
 
@@ -199,13 +199,13 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `add_redundant_join_predicate`（ハッシュ分散用）
 - [ ] `remove_redundant_join`（unique キー上の FK inner join 除去）
 - [ ] `join_elimination_unique_key`（PK-FK、SELECT が親だけ）
-- [ ] `self_join_elimination`
+- [x] `self_join_elimination`
 - [x] `outer_to_inner`（WHERE が null-rejecting。relational 経路の
       `ReduceOuterJoinsToInner`: LEFT/RIGHT/FULL を NULL 側を被る厳格述語で
       inner へ縮約し、EXPLAIN 表示にも反映。`IsNullRejectingPredicate` 参照）
-- [ ] `outer_to_anti`（`WHERE right.key IS NULL`）
-- [ ] `full_outer_to_left_plus_anti`
-- [ ] `right_join_to_left_join`（子の交換）
+- [x] `outer_to_anti`（`WHERE right.key IS NULL`）
+- [x] `full_outer_to_left_plus_anti`
+- [x] `right_join_to_left_join`（子の交換）
 - [ ] `left_join_commutativity`（禁止、テストで固定）
 - [x] `push_filter_through_left_join_left_side`（常に可。BuildInput の outer 経路で
       非 NULL 側ソースへの単一関係 conjunct を join 前に適用）
@@ -221,7 +221,7 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [x] `in_to_semijoin`（単一列 IN サブクエリの直接 decorrelation）
 - [x] `exists_to_semijoin`（相関キー + inner-only filter の直接 decorrelation）
 - [x] `not_exists_to_antijoin`（相関キーの直接 decorrelation）
-- [ ] `unique_semijoin_to_inner`
+- [x] `unique_semijoin_to_inner`
 - [ ] `semijoin_to_inner_plus_distinct`
 - [ ] `semijoin_reduction`（bloom / ハッシュ半結合の先行適用）
 - [x] `join_on_false_to_empty` / `left_join_on_false_to_left_nullpad`（`cascades.cpp` にルール追加済み — FALSE/NULL プレディケートの Join を LIMIT 0 に短絡）
@@ -241,23 +241,23 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 
 ## P2 — 集約・GROUP BY・DISTINCT
 
-- [ ] `aggregate_project_merge`
+- [x] `aggregate_project_merge`
 - [ ] `aggregate_filter_transpose` の残余 HAVING 整理（部分実装あり）
 - [ ] `aggregate_join_transpose`（agg を join の下へ、unique / キー保存時）
 - [ ] `aggregate_union_transpose`
 - [ ] `split_aggregate`（partial / final、並列と分散）
-- [ ] `eager_aggregation`（join 前に group）
+- [x] `eager_aggregation`（join 前に group）
 - [ ] `lazy_aggregation`
 - [ ] `remove_aggregate_if_unique`（group キーが unique）
 - [ ] `count_star_rewrite_on_not_null`
 - [ ] `sum_zero_identity` 等の agg 代数
 - [ ] `minmax_index_only`（INDEX MIN/MAX スキャン）
-- [ ] `distinct_aggregate_expansion`（`COUNT(DISTINCT)` を二重 agg）
-- [ ] `grouping_sets_expansion` と `grouping_sets_to_union`
+- [x] `distinct_aggregate_expansion`（`COUNT(DISTINCT)` を二重 agg）
+- [x] `grouping_sets_expansion` と `grouping_sets_to_union`
 - [ ] `rollup_to_grouping_sets` / `cube_to_grouping_sets`
 - [ ] `grouping_id_simplification`
-- [ ] `having_to_filter_after_agg` の明示ノード
-- [ ] `filter_aggregate_argument`（FILTER 句）
+- [x] `having_to_filter_after_agg` の明示ノード
+- [x] `filter_aggregate_argument`（FILTER 句）
 - [ ] `ordered_set_aggregate`（PERCENTILE_CONT 等）
 - [ ] `approx_aggregate_rewrite`（HLL 等、意味論が許すとき）
 - [ ] `two_phase_hash_agg` vs `sort_agg` 実装規則 → SortAgg 実行器
@@ -334,9 +334,8 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 
 - [x] `union_all_merge`（連続 UNION ALL を n-ary）
 - [x] `union_to_union_all_plus_distinct`
-- [ ] `intersect_to_semijoin`（専用の hash set-op 実行器が既に spill 対応で
-      効くため、追加の plan 変換より実行器経由が現状最短）
-- [ ] `except_to_antijoin`（同上）
+- [x] `intersect_to_semijoin`
+- [x] `except_to_antijoin`
 - [x] `setop_push_projection`（UNION / UNION ALL の枝へ分配）
 - [x] `setop_push_filter`（全 set-op の枝へ述語を分配）
 - [x] `union_all_push_limit`（有限 LIMIT の offset+count を各枝へ伝播し、
@@ -359,19 +358,19 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `push_filter_through_window`（partition キー / 非 window 列）
 - [ ] `push_limit_through_window`（ほぼ不可。例外を列挙）
 - [ ] `window_to_aggregate`（フレームが全体のとき）
-- [ ] `rank_filter_to_topn`（`RANK() = 1` 等）
-- [ ] `row_number_filter_to_topn`
-- [ ] `eliminate_noop_window`
+- [x] `rank_filter_to_topn`（`RANK() = 1` 等）
+- [x] `row_number_filter_to_topn`
+- [x] `eliminate_noop_window`
 - [ ] `window_prefix_sort_share`
 - [x] `unnest_with_ordinality`（`WITH OFFSET` を列へ射影し、配列/相関 UNNEST の回帰あり）
-- [ ] `unnest_filter_pushdown`
+- [x] `unnest_filter_pushdown`
 - [ ] `unnest_to_join_with_values`
-- [ ] `array_flatten_rewrite`
+- [x] `array_flatten_rewrite`
 - [ ] `values_fold_into_union`
 - [ ] `constant_table_scan`
 - [ ] `generate_series_to_values`（小さい n）
 - [ ] `table_sample_bernoulli_vs_system`
-- [ ] `recursive_termination_predicate_push`
+- [x] `recursive_termination_predicate_push`
 
 ---
 
@@ -383,14 +382,14 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `merge_calc`（Filter+Project を Calc に統合するか、逆に分解するか方針決定）
 - [x] `common_subexpression_elimination` in target list（relational projection が
       式の fingerprint ごとに `projection_cache` を共有）
-- [ ] `duplicate_column_elimination`
-- [ ] `unused_expression_pruning`
-- [ ] `constant_propagation_through_project`
+- [x] `duplicate_column_elimination`
+- [x] `unused_expression_pruning`
+- [x] `constant_propagation_through_project`
 - [ ] `predicate_push_into_project_expr`
 - [ ] `simplify_case_in_project`
 - [ ] `boolean_project_used_as_filter` の引き上げ
 - [ ] `widen_project_for_join`（join 後に落とす列を一時保持）
-- [ ] `narrow_project_after_join`
+- [x] `narrow_project_after_join`
 
 ---
 
@@ -462,20 +461,20 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] MCV（most common values）
 - [ ] NDV スケッチ（HyperLogLog）
 - [ ] NULL 比率の独立管理
-- [ ] 多列相関統計 / 関数従属
+- [x] 多列相関統計 / 関数従属
 - [ ] join クロス列 NDV
 - [ ] 式統計（`f(col)` の NDV）
-- [ ] LIKE / 正規表現の選択性モデル
+- [x] LIKE / 正規表現の選択性モデル
 - [ ] OR の包含・除外
 - [ ] 範囲述語の区間演算
-- [ ] 結合カーディナリティの histogram join
+- [x] 結合カーディナリティの histogram join
 - [x] 半結合の上界 `min(|L|,|R|)` と反結合の probe-side 上界を
       物理候補／`ProductPlan` の見積りへ反映（FK 上界は未実装）
 - [ ] skew 補正（Zipf）
 - [ ] 動的サンプリング（実行前サンプルスキャン）
 - [ ] フィードバック最適化（前回実行の実カーディナリティ）
 - [ ] コスト単位の監査（I/O vs CPU vs メモリ）
-- [ ] メモリ許可量と spill 確率
+- [x] メモリ許可量と spill 確率
 - [ ] parallel speedup モデル
 - [ ] index クラスタリング因子
 - [ ] ページキャッシュヒット率

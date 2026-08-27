@@ -41,6 +41,8 @@ enum class LogicalOperator {
   kCrossJoin,
   kSemiJoin,
   kAntiJoin,
+  kSingleJoin,
+  kMarkJoin,
   kSelection,
   kProjection,
   kAggregation,
@@ -57,7 +59,24 @@ enum class LogicalOperator {
   kLimit,
   kEmpty,
   kValues,
+  kConstantTable,
   kDummyScan,
+  kWindow,
+  kUnnest,
+  kGenerateSeries,
+  kRecursiveCte,
+  kWorkTableScan,
+  kMaterialize,
+  kEagerSpool,
+  kLazySpool,
+  kExpand,
+  kApply,
+  kExchange,
+  kGather,
+  kBroadcast,
+  kRedistribute,
+  kSample,
+  kAssert,
   // Opaque relational IR (outer/semi/anti joins, subqueries and CTEs). The
   // memo can cost/select it while its internal lowering remains specialized.
   kRelational,
@@ -83,6 +102,16 @@ struct LogicalExpression {
   uint8_t join_type{0};
   std::shared_ptr<const SelectStatement> relational_statement{};
   Schema output_schema{};
+
+  // Extended payload fields for Window / Grouping / Marker / Assertion:
+  std::string marker_column{};
+  std::vector<Expression> partition_by{};
+  std::vector<Expression> grouping_sets{};
+  std::string unnest_alias{};
+  std::string cte_name{};
+  double sample_rate{1.0};
+  bool is_bernoulli{false};
+  size_t depth_limit{0};
 
   [[nodiscard]] std::string Fingerprint() const;
 };
@@ -164,13 +193,14 @@ class Memo {
 
   void Dump(std::ostream& out) const;
 
- private:
-  [[nodiscard]] static std::string GroupKey(
-      const std::vector<std::string>& relations);
   // Conjuncts whose touched relations are exactly this group's relation.
   [[nodiscard]] Expression ScanFilterFor(const Group& group) const;
   [[nodiscard]] Expression JoinConditionFor(const Group& left,
                                             const Group& right) const;
+
+ private:
+  [[nodiscard]] static std::string GroupKey(
+      const std::vector<std::string>& relations);
 
   std::vector<Group> groups_;
   std::unordered_map<std::string, GroupId> groups_by_key_;
@@ -239,26 +269,22 @@ inline Pattern Join(Pattern left = Any(), Pattern right = Any(),
 inline Pattern OuterJoin(Pattern left = Any(), Pattern right = Any(),
                          std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kOuterJoin,
-                     {std::move(left), std::move(right)},
-                     std::move(capture));
+                     {std::move(left), std::move(right)}, std::move(capture));
 }
 inline Pattern CrossJoin(Pattern left = Any(), Pattern right = Any(),
                          std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kCrossJoin,
-                     {std::move(left), std::move(right)},
-                     std::move(capture));
+                     {std::move(left), std::move(right)}, std::move(capture));
 }
 inline Pattern SemiJoin(Pattern left = Any(), Pattern right = Any(),
                         std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kSemiJoin,
-                     {std::move(left), std::move(right)},
-                     std::move(capture));
+                     {std::move(left), std::move(right)}, std::move(capture));
 }
 inline Pattern AntiJoin(Pattern left = Any(), Pattern right = Any(),
                         std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kAntiJoin,
-                     {std::move(left), std::move(right)},
-                     std::move(capture));
+                     {std::move(left), std::move(right)}, std::move(capture));
 }
 // Matches any Selection regardless of predicate content.
 inline Pattern Selection(Pattern child = Any(), std::string capture = {}) {
@@ -334,6 +360,84 @@ inline Pattern Limit(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kLimit, {std::move(child)},
                      std::move(capture));
 }
+inline Pattern SingleJoin(Pattern left = Any(), Pattern right = Any(),
+                          std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kSingleJoin,
+                     {std::move(left), std::move(right)}, std::move(capture));
+}
+inline Pattern MarkJoin(Pattern left = Any(), Pattern right = Any(),
+                        std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kMarkJoin,
+                     {std::move(left), std::move(right)}, std::move(capture));
+}
+inline Pattern ConstantTable(std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kConstantTable, {}, std::move(capture));
+}
+inline Pattern Window(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kWindow, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern Unnest(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kUnnest, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern GenerateSeries(std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kGenerateSeries, {}, std::move(capture));
+}
+inline Pattern RecursiveCte(Pattern anchor = Any(), Pattern recursive = Any(),
+                            std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kRecursiveCte,
+                     {std::move(anchor), std::move(recursive)},
+                     std::move(capture));
+}
+inline Pattern WorkTableScan(std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kWorkTableScan, {}, std::move(capture));
+}
+inline Pattern Materialize(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kMaterialize, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern EagerSpool(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kEagerSpool, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern LazySpool(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kLazySpool, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern Expand(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kExpand, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern Apply(Pattern left = Any(), Pattern right = Any(),
+                     std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kApply,
+                     {std::move(left), std::move(right)}, std::move(capture));
+}
+inline Pattern Exchange(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kExchange, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern Gather(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kGather, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern Broadcast(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kBroadcast, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern Redistribute(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kRedistribute, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern Sample(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kSample, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern Assert(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kAssert, {std::move(child)},
+                     std::move(capture));
+}
 }  // namespace dsl
 
 class Rule {
@@ -400,19 +504,92 @@ enum class AccessMethod : uint8_t { kAny, kPreferIndex };
 // but participates in property cache keys already.
 enum class Distribution : uint8_t { kAny, kSingleNode };
 
+enum class JoinMultiplicity : uint8_t {
+  kUnknown,
+  kOneToOne,
+  kOneToMany,
+  kManyToMany
+};
+
 struct PhysicalProperties {
   bool require_row_position{false};
   bool wait_for_write_intent{true};
   std::vector<ColumnName> ordering;
+  std::vector<bool> sort_ascending{};
+  std::vector<std::optional<bool>> sort_nulls_first{};
+  std::string collation{};
   // Upper bound on interesting output rows (OFFSET + LIMIT) when the required
   // ordering is delivered; enables Top-K costing on ordered scans.
   size_t limit_hint{std::numeric_limits<size_t>::max()};
   AccessMethod access_method{AccessMethod::kAny};
   Distribution distribution{Distribution::kAny};
+  bool distinct{false};
+  std::vector<ColumnName> partition_by{};
+  std::vector<ColumnName> bloom_filter_keys{};
+  bool is_unique{false};
+  JoinMultiplicity join_multiplicity{JoinMultiplicity::kUnknown};
 
   [[nodiscard]] std::string Key() const;
   bool operator==(const PhysicalProperties&) const = default;
 };
+
+struct JoinCardinalityEstimate {
+  double rows{0.0};
+  JoinMultiplicity multiplicity{JoinMultiplicity::kUnknown};
+};
+
+[[nodiscard]] JoinCardinalityEstimate EstimateJoinCardinality(
+    double left_rows, double right_rows, bool left_is_unique,
+    bool right_is_unique, double selectivity = 1.0);
+
+enum class OperatorCostKind : uint8_t {
+  kHashJoin,
+  kMergeJoin,
+  kNestedLoopJoin,
+  kIndexScan,
+  kBitmapScan,
+  kSort
+};
+
+[[nodiscard]] double EstimateMultiColumnSelectivity(
+    const std::vector<double>& selectivities, double correlation_factor = 0.0);
+
+enum class PatternMatchingKind : uint8_t {
+  kLike,
+  kRegexp
+};
+
+[[nodiscard]] double EstimatePatternSelectivity(
+    PatternMatchingKind kind, std::string_view pattern,
+    double domain_cardinality = 1000.0);
+
+struct HistogramBucket {
+  double lower{0.0};
+  double upper{0.0};
+  double count{0.0};
+  double distinct_count{0.0};
+};
+
+[[nodiscard]] double EstimateHistogramJoinCardinality(
+    const std::vector<HistogramBucket>& left_buckets,
+    const std::vector<HistogramBucket>& right_buckets);
+
+[[nodiscard]] double EstimateStarJoinCost(
+    double fact_rows, const std::vector<double>& dimension_rows,
+    const std::vector<double>& selectivities = {});
+
+struct MemoryBudget {
+  double max_memory_bytes{64.0 * 1024.0 * 1024.0};
+  double row_size_bytes{64.0};
+  double io_spill_cost_multiplier{3.5};
+};
+
+[[nodiscard]] double EstimateMemorySpillCost(
+    OperatorCostKind kind, double input_rows, const MemoryBudget& budget = {});
+
+[[nodiscard]] double CalibrateOperatorCost(
+    OperatorCostKind kind, double input_rows_left, double input_rows_right,
+    const PhysicalProperties& delivered, const PhysicalProperties& required);
 
 struct PlanAlternative {
   Plan plan;
@@ -506,8 +683,7 @@ class SearchEngine {
       const LogicalExpression& expression, const PhysicalProperties& required);
 
  private:
-  void ExploreGroup(GroupId group,
-                    const std::function<void(GroupId)>& enqueue);
+  void ExploreGroup(GroupId group, const std::function<void(GroupId)>& enqueue);
   [[nodiscard]] std::optional<BestPlan> OptimizeGroup(
       GroupId group, const PhysicalProperties& properties,
       const Implement& implement, const RuleContext& context);

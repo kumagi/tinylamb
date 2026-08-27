@@ -10,7 +10,8 @@ namespace tinylamb {
 
 class DistinctPlan final : public PlanBase {
  public:
-  explicit DistinctPlan(Plan child) : child_(std::move(child)) {}
+  explicit DistinctPlan(Plan child, std::vector<Expression> distinct_on = {})
+      : child_(std::move(child)), distinct_on_(std::move(distinct_on)) {}
 
   Executor EmitExecutor(TransactionContext& context) const override;
   [[nodiscard]] const Table* ScanSource() const override {
@@ -34,11 +35,16 @@ class DistinctPlan final : public PlanBase {
     return child_->IsOrderedBy(expressions, ascending);
   }
   [[nodiscard]] const Plan& Child() const { return child_; }
+  [[nodiscard]] const std::vector<Expression>& DistinctOn() const {
+    return distinct_on_;
+  }
+  [[nodiscard]] bool HasDistinctOn() const { return !distinct_on_.empty(); }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
  private:
   Plan child_;
+  std::vector<Expression> distinct_on_;
 };
 
 }  // namespace tinylamb

@@ -48,6 +48,9 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+namespace {
+bool IsTypedAggregate(AggregationType type);
+}  // namespace
 
 AggregationExecutor::AggregationExecutor(
     std::shared_ptr<ExecutorBase> child, Schema input_schema,
@@ -82,27 +85,28 @@ AggregationExecutor::AggregationExecutor(
   for (const NamedExpression& named : aggregates_) {
     AggregateInput input;
     const auto& agg = named.expression->AsAggregateExpression();
-    if (!agg.Distinct() && IsCountStar(agg)) {
-      input.kind = AggregateInputKind::kCountStar;
-    } else if (!agg.Distinct() &&
-               agg.Child()->Type() == TypeTag::kColumnValue) {
-      const int offset =
-          input_schema_.Offset(agg.Child()->AsColumnValue().GetColumnName());
-      if (offset >= 0) {
-        const ValueType declared = input_schema_.GetColumn(offset).Type();
-        if (declared == ValueType::kInt64 || declared == ValueType::kDouble) {
-          input.kind = AggregateInputKind::kTypedColumn;
-          input.column = static_cast<size_t>(offset);
-          input.type = declared;
+    if (IsTypedAggregate(agg.GetType()) && !agg.Distinct() &&
+        !agg.WhereFilter() && agg.InnerOrderBy().empty()) {
+      if (IsCountStar(agg)) {
+        input.kind = AggregateInputKind::kCountStar;
+      } else if (agg.Child()->Type() == TypeTag::kColumnValue) {
+        const int offset =
+            input_schema_.Offset(agg.Child()->AsColumnValue().GetColumnName());
+        if (offset >= 0) {
+          const ValueType declared = input_schema_.GetColumn(offset).Type();
+          if (declared == ValueType::kInt64 || declared == ValueType::kDouble) {
+            input.kind = AggregateInputKind::kTypedColumn;
+            input.column = static_cast<size_t>(offset);
+            input.type = declared;
+          }
         }
-      }
-    } else if (!agg.Distinct() &&
-               agg.Child()->Type() == TypeTag::kConstantValue) {
-      const Value constant = agg.Child()->AsConstantValue().GetValue();
-      if (!constant.IsNull() && (constant.type == ValueType::kInt64 ||
-                                 constant.type == ValueType::kDouble)) {
-        input.kind = AggregateInputKind::kTypedConstant;
-        input.constant = std::move(constant);
+      } else if (agg.Child()->Type() == TypeTag::kConstantValue) {
+        const Value constant = agg.Child()->AsConstantValue().GetValue();
+        if (!constant.IsNull() && (constant.type == ValueType::kInt64 ||
+                                   constant.type == ValueType::kDouble)) {
+          input.kind = AggregateInputKind::kTypedConstant;
+          input.constant = std::move(constant);
+        }
       }
     }
     all_typed_ = all_typed_ && input.kind != AggregateInputKind::kGeneric;
@@ -178,6 +182,13 @@ bool IsTypedAggregate(AggregationType type) {
     case AggregationType::kCount:
     case AggregationType::kSum:
     case AggregationType::kAvg:
+    case AggregationType::kMin:
+    case AggregationType::kMax:
+    case AggregationType::kBitAnd:
+    case AggregationType::kBitOr:
+    case AggregationType::kBitXor:
+    case AggregationType::kLogicalAnd:
+    case AggregationType::kLogicalOr:
       return true;
     default:
       return false;
@@ -396,6 +407,64 @@ bool AggregationExecutor::AccumulateTypedBatch(
         }
         break;
       }
+      case AggregationType::kBitAnd: {
+        const Value batch_val = column.AggregateBitAnd();
+        if (!batch_val.IsNull()) {
+          if ((*results)[i].IsNull()) {
+            (*results)[i] = batch_val;
+          } else {
+            (*results)[i] = Value(static_cast<int64_t>(
+                (*results)[i].value.int_value & batch_val.value.int_value));
+          }
+        }
+        break;
+      }
+      case AggregationType::kBitOr: {
+        const Value batch_val = column.AggregateBitOr();
+        if (!batch_val.IsNull()) {
+          if ((*results)[i].IsNull()) {
+            (*results)[i] = batch_val;
+          } else {
+            (*results)[i] = Value(static_cast<int64_t>(
+                (*results)[i].value.int_value | batch_val.value.int_value));
+          }
+        }
+        break;
+      }
+      case AggregationType::kBitXor: {
+        const Value batch_val = column.AggregateBitXor();
+        if (!batch_val.IsNull()) {
+          if ((*results)[i].IsNull()) {
+            (*results)[i] = batch_val;
+          } else {
+            (*results)[i] = Value(static_cast<int64_t>(
+                (*results)[i].value.int_value ^ batch_val.value.int_value));
+          }
+        }
+        break;
+      }
+      case AggregationType::kLogicalAnd: {
+        const Value batch_val = column.AggregateLogicalAnd();
+        if (!batch_val.IsNull()) {
+          if ((*results)[i].IsNull()) {
+            (*results)[i] = batch_val;
+          } else if (batch_val.value.int_value == 0) {
+            (*results)[i] = Value(int64_t{0});
+          }
+        }
+        break;
+      }
+      case AggregationType::kLogicalOr: {
+        const Value batch_val = column.AggregateLogicalOr();
+        if (!batch_val.IsNull()) {
+          if ((*results)[i].IsNull()) {
+            (*results)[i] = batch_val;
+          } else if (batch_val.value.int_value != 0) {
+            (*results)[i] = Value(int64_t{1});
+          }
+        }
+        break;
+      }
       default:
         // Only the typed aggregate kinds can reach this fast path.
         break;
@@ -441,6 +510,11 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
       case AggregationType::kSum:
       case AggregationType::kMin:
       case AggregationType::kMax:
+      case AggregationType::kBitAnd:
+      case AggregationType::kBitOr:
+      case AggregationType::kBitXor:
+      case AggregationType::kLogicalAnd:
+      case AggregationType::kLogicalOr:
         results[i] = Value();
         break;
       default:
@@ -449,19 +523,34 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
     }
   }
   while (child_->NextBatch(&input_batch_) != 0) {
-    if (AccumulateTypedBatch(&results, &counts, input_batch_)) { continue;
-}
+    if (AccumulateTypedBatch(&results, &counts, input_batch_)) {
+      continue;
+    }
+    bool all_done = true;
+    for (size_t k = 0; k < aggregates_.size(); ++k) {
+      if (accumulators[k] == nullptr || !accumulators[k]->IsDone()) {
+        all_done = false;
+        break;
+      }
+    }
+    if (all_done && !aggregates_.empty()) {
+      break;
+    }
     for (size_t row_index = 0; row_index < input_batch_.Size(); ++row_index) {
       std::optional<Row> materialized;
       auto materialize = [&]() -> const Row& {
-        if (!materialized) { materialized = input_batch_.RowAt(row_index);
-}
+        if (!materialized) {
+          materialized = input_batch_.RowAt(row_index);
+        }
         return *materialized;
       };
       for (size_t i = 0; i < aggregates_.size(); ++i) {
         const auto& agg = aggregates_[i].expression->AsAggregateExpression();
         // Non-typed aggregates own their full semantics via the accumulator.
         if (accumulators[i]) {
+          if (accumulators[i]->IsDone()) {
+            continue;
+          }
           if (agg.WhereFilter()) {
             relational_detail::Scope scope{.row = &materialize(),
                                            .schema = &input_schema_,
@@ -495,6 +584,15 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
           }
           accumulators[i]->Add(std::move(input));
           continue;
+        }
+        if (agg.WhereFilter()) {
+          relational_detail::Scope scope{.row = &materialize(),
+                                         .schema = &input_schema_,
+                                         .outer = nullptr};
+          if (!relational_detail::Truthy(
+                  agg.WhereFilter()->Evaluate(*scope.row, *scope.schema))) {
+            continue;
+          }
         }
         Value val;
         if (IsCountStar(agg)) {

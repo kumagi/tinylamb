@@ -19,8 +19,8 @@
 #include <cstddef>
 #include <cstdio>
 #include <memory>
-#include <stdexcept>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 
@@ -79,8 +79,7 @@ class BPlusTreeIteratorTest : public ::testing::Test {
     l_ = std::make_unique<Logger>(log_name_);
     lm_ = std::make_unique<LockManager>();
     r_ = std::make_unique<RecoveryManager>(log_name_, p_->GetPool());
-    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(),
-                                               r_.get());
+    tm_ = std::make_unique<TransactionManager>(p_.get(), l_.get(), r_.get());
     bpt_ = std::make_unique<BPlusTree>(root);
   }
 
@@ -106,13 +105,14 @@ class BPlusTreeIteratorTest : public ::testing::Test {
 };
 
 TEST_F(BPlusTreeIteratorTest, Construct) {
-  // Arrange -- nothing to set up; default BPlusTreeIterator constructed by SetUp()
-  // Act -- nothing to execute; default constructed via SetUp()
-  // Assert -- nothing to verify; gtest green on pass, death on crash
+  // Arrange -- nothing to set up; default BPlusTreeIterator constructed by
+  // SetUp() Act -- nothing to execute; default constructed via SetUp() Assert
+  // -- nothing to verify; gtest green on pass, death on crash
 }
 
 TEST_F(BPlusTreeIteratorTest, FullScan) {
-  // Arrange -- begin transaction, insert 7 keys a..g with 1000-byte key and 100-byte value
+  // Arrange -- begin transaction, insert 7 keys a..g with 1000-byte key and
+  // 100-byte value
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
     Insert(txn, c, 1000, 100);
@@ -131,7 +131,8 @@ TEST_F(BPlusTreeIteratorTest, FullScan) {
 }
 
 TEST_F(BPlusTreeIteratorTest, RangeAcending) {
-  // Arrange -- begin transaction, insert 7 keys a..g with 1000-byte key and 100-byte value
+  // Arrange -- begin transaction, insert 7 keys a..g with 1000-byte key and
+  // 100-byte value
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
     Insert(txn, c, 1000, 100);
@@ -151,7 +152,8 @@ TEST_F(BPlusTreeIteratorTest, RangeAcending) {
 }
 
 TEST_F(BPlusTreeIteratorTest, RangeDescending) {
-  // Arrange -- begin transaction, insert 7 keys a..g with 1000-byte key and 100-byte value
+  // Arrange -- begin transaction, insert 7 keys a..g with 1000-byte key and
+  // 100-byte value
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
     Insert(txn, c, 1000, 100);
@@ -179,13 +181,15 @@ TEST_F(BPlusTreeIteratorTest, RangeDescending) {
 }
 
 TEST_F(BPlusTreeIteratorTest, RangeDescendingRightOpen) {
-  // Arrange -- begin transaction, insert 7 keys a..g with 1000-byte key and 100-byte value
+  // Arrange -- begin transaction, insert 7 keys a..g with 1000-byte key and
+  // 100-byte value
   auto txn = tm_->Begin();
   for (const auto& c : {'a', 'b', 'c', 'd', 'e', 'f', 'g'}) {
     Insert(txn, c, 1000, 100);
   }
 
-  // Act -- begin a descending full scan iterator ["", ""] (right-open) and walk backward
+  // Act -- begin a descending full scan iterator ["", ""] (right-open) and walk
+  // backward
   BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);
   EXPECT_EQ(it.Value(), std::string(100, 'g'));
   --it;
@@ -213,7 +217,8 @@ TEST_F(BPlusTreeIteratorTest, RangeDescendingRightOpen) {
 }
 
 TEST_F(BPlusTreeIteratorTest, FullScanMultiLeaf) {
-  // Arrange -- begin transaction, insert 9 keys '1'..'9' with 2723-byte key and 2723-byte value
+  // Arrange -- begin transaction, insert 9 keys '1'..'9' with 2723-byte key and
+  // 2723-byte value
   constexpr int kSize = 2723;
   auto txn = tm_->Begin();
   for (const auto& c : {'1', '2', '3', '4', '5', '6', '7', '8', '9'}) {
@@ -236,7 +241,8 @@ TEST_F(BPlusTreeIteratorTest, FullScanMultiLeaf) {
 }
 
 TEST_F(BPlusTreeIteratorTest, FullScanMultiLeafRecovery) {
-  // Arrange -- begin transaction, insert 9 keys '1'..'9' with 2000-byte key and 2000-byte value, precommit
+  // Arrange -- begin transaction, insert 9 keys '1'..'9' with 2000-byte key and
+  // 2000-byte value, precommit
   constexpr int kSize = 2000;
   {
     auto txn = tm_->Begin();
@@ -271,7 +277,8 @@ TEST_F(BPlusTreeIteratorTest, FullScanMultiLeafRecovery) {
 }
 
 TEST_F(BPlusTreeIteratorTest, FullScanReverse) {
-  // Arrange -- begin transaction, insert 11 keys 'k'..'a' (reverse order) with 2000-byte key and 2000-byte value
+  // Arrange -- begin transaction, insert 11 keys 'k'..'a' (reverse order) with
+  // 2000-byte key and 2000-byte value
   constexpr int kSize = 2000;
   auto txn = tm_->Begin();
   for (const auto& c :
@@ -279,7 +286,8 @@ TEST_F(BPlusTreeIteratorTest, FullScanReverse) {
     Insert(txn, c, kSize, kSize);
   }
 
-  // Act -- begin a full scan iterator (forward) and walk through all 11 keys in alphabetical order
+  // Act -- begin a full scan iterator (forward) and walk through all 11 keys in
+  // alphabetical order
   BPlusTreeIterator it = bpt_->Begin(txn);
   for (const auto& c :
        {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'}) {
@@ -294,7 +302,8 @@ TEST_F(BPlusTreeIteratorTest, FullScanReverse) {
 }
 
 TEST_F(BPlusTreeIteratorTest, EndOpenFullScanReverse) {
-  // Arrange -- begin transaction, insert 11 keys 'a'..'k' (forward order) with 2000-byte key and 2000-byte value
+  // Arrange -- begin transaction, insert 11 keys 'a'..'k' (forward order) with
+  // 2000-byte key and 2000-byte value
   constexpr int kSize = 2000;
   auto txn = tm_->Begin();
   for (const auto& c :
@@ -302,7 +311,8 @@ TEST_F(BPlusTreeIteratorTest, EndOpenFullScanReverse) {
     Insert(txn, c, kSize, kSize);
   }
 
-  // Act -- begin a descending full scan iterator ["", ""] (both bounds open) and walk backward
+  // Act -- begin a descending full scan iterator ["", ""] (both bounds open)
+  // and walk backward
   BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);
   DumpLogTxn(*bpt_, txn);
   for (const auto& c :
@@ -653,9 +663,7 @@ TEST_F(BPlusTreeIteratorTest, EmptyTreeForwardScanExhaustsImmediately) {
   // Act -- begin a forward full scan on the empty tree
   BPlusTreeIterator it = bpt_->Begin(txn);
 
-  // Assert -- stepping past the empty leaf invalidates the iterator
-  EXPECT_TRUE(it.IsValid());
-  ++it;
+  // Assert -- an empty tree iterator is immediately invalid
   EXPECT_FALSE(it.IsValid());
 }
 

@@ -1,0 +1,281 @@
+[prepare_database]
+CREATE TABLE expr_test AS
+SELECT 1 AS id, 10 AS a, 20 AS b, true AS flag, 'hello' AS str, DATE '2026-01-01' AS dt
+UNION ALL SELECT 2, 0, -5, false, 'world', DATE '2026-06-15'
+UNION ALL SELECT 3, CAST(NULL AS INT64), CAST(NULL AS INT64), CAST(NULL AS BOOL), CAST(NULL AS STRING), CAST(NULL AS DATE);
+--
+ARRAY<STRUCT<id INT64, a INT64, b INT64, flag BOOL, str STRING, dt DATE>>[
+  {1, 10, 20, true, "hello", 2026-01-01},
+  {2, 0, -5, false, "world", 2026-06-15},
+  {3, NULL, NULL, NULL, NULL, NULL}
+]
+==
+
+[mode=rows]
+[name=constant_folding_arithmetic_int]
+SELECT 1 + 2 * 3 AS r1, 100 - 45 AS r2, 20 / 4 AS r3, MOD(17, 5) AS r4, -42 + 10 AS r5, (10 + 20) * 3 AS r6
+--
+ARRAY<STRUCT<r1 INT64, r2 INT64, r3 INT64, r4 INT64, r5 INT64, r6 INT64>>[
+  {7, 55, 5, 2, -32, 90}
+]
+==
+
+[mode=rows]
+[name=constant_folding_arithmetic_double]
+SELECT 1.5 + 2.5 AS r1, 3.0 * 4.0 AS r2, 10.0 / 2.5 AS r3
+--
+ARRAY<STRUCT<r1 DOUBLE, r2 DOUBLE, r3 DOUBLE>>[
+  {4, 12, 4}
+]
+==
+
+[mode=rows]
+[name=constant_folding_boolean_two_valued]
+SELECT true AND true AS r1, true AND false AS r2, false OR true AS r3, false OR false AS r4, NOT true AS r5, NOT false AS r6
+--
+ARRAY<STRUCT<r1 BOOL, r2 BOOL, r3 BOOL, r4 BOOL, r5 BOOL, r6 BOOL>>[
+  {true, false, true, false, false, true}
+]
+==
+
+[mode=rows]
+[name=constant_folding_boolean_three_valued]
+SELECT true AND CAST(NULL AS BOOL) AS r1, false AND CAST(NULL AS BOOL) AS r2, true OR CAST(NULL AS BOOL) AS r3, false OR CAST(NULL AS BOOL) AS r4, NOT CAST(NULL AS BOOL) AS r5
+--
+ARRAY<STRUCT<r1 BOOL, r2 BOOL, r3 BOOL, r4 BOOL, r5 BOOL>>[
+  {NULL, false, true, NULL, NULL}
+]
+==
+
+[mode=rows]
+[name=constant_folding_string_concat]
+SELECT CONCAT('hello', ' ', 'world') AS r1, CONCAT('foo', 'bar', 'baz') AS r2, CONCAT('a', CAST(NULL AS STRING), 'b') AS r3
+--
+ARRAY<STRUCT<r1 STRING, r2 STRING, r3 STRING>>[
+  {"hello world", "foobarbaz", NULL}
+]
+==
+
+[mode=rows]
+[name=constant_folding_bitwise_ops]
+SELECT 12 & 10 AS r1, 12 | 10 AS r2, 12 ^ 10 AS r3, 1 << 4 AS r4, 32 >> 2 AS r5
+--
+ARRAY<STRUCT<r1 INT64, r2 INT64, r3 INT64, r4 INT64, r5 INT64>>[
+  {8, 14, 6, 16, 8}
+]
+==
+
+[mode=rows]
+[name=constant_folding_date_interval_arithmetic]
+SELECT DATE_ADD(DATE '2026-01-01', INTERVAL 5 DAY) AS r1,
+       DATE_SUB(DATE '2026-06-15', INTERVAL 10 DAY) AS r2,
+       DATE_ADD(DATE '2026-01-01', INTERVAL 1 MONTH) AS r3,
+       DATE_SUB(DATE '2026-03-01', INTERVAL 1 DAY) AS r4,
+       DATE_DIFF(DATE '2026-01-10', DATE '2026-01-01', DAY) AS r5
+--
+ARRAY<STRUCT<r1 DATE, r2 DATE, r3 DATE, r4 DATE, r5 INT64>>[
+  {2026-01-06, 2026-06-05, 2026-02-01, 2026-02-28, 9}
+]
+==
+
+[mode=rows]
+[name=constant_folding_json_functions]
+SELECT JSON_EXTRACT('{"a": {"b": 42}}', '$.a.b') AS r1,
+       JSON_VALUE('{"name": "Alice"}', '$.name') AS r2,
+       JSON_EXTRACT_SCALAR('{"k": "val"}', '$.k') AS r3
+--
+ARRAY<STRUCT<r1 STRING, r2 STRING, r3 STRING>>[
+  {"42", "Alice", "val"}
+]
+==
+
+[mode=ast]
+[name=ast_algebraic_de_morgan_and]
+SELECT NOT (true AND false) AS r1, NOT (true AND true) AS r2
+--
+ARRAY<STRUCT<r1 BOOL, r2 BOOL>>[
+  {true, false}
+]
+==
+
+[mode=ast]
+[name=ast_algebraic_de_morgan_or]
+SELECT NOT (false OR false) AS r1, NOT (false OR true) AS r2
+--
+ARRAY<STRUCT<r1 BOOL, r2 BOOL>>[
+  {true, false}
+]
+==
+
+[mode=ast]
+[name=ast_algebraic_double_negation]
+SELECT NOT NOT true AS r1, NOT NOT false AS r2, -(-42) AS r3
+--
+ARRAY<STRUCT<r1 BOOL, r2 BOOL, r3 INT64>>[
+  {true, false, 42}
+]
+==
+
+[mode=ast]
+[name=ast_algebraic_double_abs]
+SELECT ABS(ABS(-42)) AS r1, ABS(ABS(100)) AS r2
+--
+ARRAY<STRUCT<r1 INT64, r2 INT64>>[
+  {42, 100}
+]
+==
+
+[mode=ast]
+[name=ast_algebraic_boolean_truthiness]
+SELECT (true = true) AS r1, (false = false) AS r2, (true = false) AS r3,
+       (true IS true) AS r4, (false IS false) AS r5, (CAST(NULL AS BOOL) IS true) AS r6
+--
+ARRAY<STRUCT<r1 BOOL, r2 BOOL, r3 BOOL, r4 BOOL, r5 BOOL, r6 BOOL>>[
+  {true, true, false, true, true, false}
+]
+==
+
+[mode=explain]
+[name=explain_algebraic_identities_on_table]
+SELECT id,
+       a + 0 AS a_plus_zero,
+       0 + a AS zero_plus_a,
+       a - 0 AS a_minus_zero,
+       b * 1 AS b_times_one,
+       1 * b AS one_times_b,
+       b * 0 AS b_times_zero
+FROM expr_test
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64, a_plus_zero INT64, zero_plus_a INT64, a_minus_zero INT64, b_times_one INT64, one_times_b INT64, b_times_zero INT64>>[
+  {1, 10, 10, 10, 20, 20, 0},
+  {2, 0, 0, 0, -5, -5, 0},
+  {3, NULL, NULL, NULL, NULL, NULL, NULL}
+]
+==
+
+[mode=explain]
+[name=explain_predicate_in_list_dedupe]
+SELECT id, a FROM expr_test WHERE a IN (10, 20, 10, 0, 0, 20) ORDER BY id
+--
+ARRAY<STRUCT<id INT64, a INT64>>[
+  {1, 10},
+  {2, 0}
+]
+==
+
+[mode=explain]
+[name=explain_predicate_or_of_ranges_to_in]
+SELECT id, a FROM expr_test WHERE (a = 0 OR a = 10 OR a = 99) ORDER BY id
+--
+ARRAY<STRUCT<id INT64, a INT64>>[
+  {1, 10},
+  {2, 0}
+]
+==
+
+[mode=explain]
+[name=explain_predicate_not_in_with_null]
+SELECT id, a, a NOT IN (10, 99) AS not_in_clean, a NOT IN (99, NULL) AS not_in_null
+FROM expr_test
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64, a INT64, not_in_clean BOOL, not_in_null BOOL>>[
+  {1, 10, false, NULL},
+  {2, 0, true, NULL},
+  {3, NULL, NULL, NULL}
+]
+==
+
+[mode=rows]
+[name=predicate_case_simplification_constants]
+SELECT CASE WHEN true THEN 'first' ELSE 'second' END AS r1,
+       CASE WHEN false THEN 'first' ELSE 'second' END AS r2,
+       CASE WHEN false THEN 'a' WHEN true THEN 'b' ELSE 'c' END AS r3,
+       CASE 1 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END AS r4
+--
+ARRAY<STRUCT<r1 STRING, r2 STRING, r3 STRING, r4 STRING>>[
+  {"first", "second", "b", "one"}
+]
+==
+
+[mode=rows]
+[name=predicate_if_to_case]
+SELECT IF(true, 'yes', 'no') AS r1,
+       IF(false, 'yes', 'no') AS r2,
+       IF(10 > 5, 100, 200) AS r3,
+       IF(10 < 5, 100, 200) AS r4
+--
+ARRAY<STRUCT<r1 STRING, r2 STRING, r3 INT64, r4 INT64>>[
+  {"yes", "no", 100, 200}
+]
+==
+
+[mode=rows]
+[name=predicate_nullif_to_case]
+SELECT NULLIF(42, 42) AS r1,
+       NULLIF(42, 99) AS r2,
+       NULLIF('abc', 'abc') AS r3,
+       NULLIF('abc', 'xyz') AS r4,
+       NULLIF(CAST(NULL AS INT64), 10) AS r5,
+       NULLIF(10, CAST(NULL AS INT64)) AS r6
+--
+ARRAY<STRUCT<r1 INT64, r2 INT64, r3 STRING, r4 STRING, r5 INT64, r6 INT64>>[
+  {NULL, 42, NULL, "abc", NULL, 10}
+]
+==
+
+[mode=rows]
+[name=predicate_coalesce_elimination]
+SELECT COALESCE(CAST(NULL AS INT64), CAST(NULL AS INT64), 42, 99) AS r1,
+       COALESCE('first', 'second', 'third') AS r2,
+       COALESCE(CAST(NULL AS STRING), 'fallback') AS r3,
+       COALESCE(CAST(NULL AS INT64), CAST(NULL AS INT64), CAST(NULL AS INT64)) AS r4
+--
+ARRAY<STRUCT<r1 INT64, r2 STRING, r3 STRING, r4 INT64>>[
+  {42, "first", "fallback", NULL}
+]
+==
+
+[mode=explain]
+[name=explain_predicate_contradiction_elimination]
+SELECT id FROM expr_test WHERE a = 10 AND a = 20 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain]
+[name=explain_predicate_tautology_and_null_checks]
+SELECT id, a FROM expr_test WHERE (a IS NOT NULL OR a IS NULL) ORDER BY id
+--
+ARRAY<STRUCT<id INT64, a INT64>>[
+  {1, 10},
+  {2, 0},
+  {3, NULL}
+]
+==
+
+[mode=rows]
+[name=cast_pushdown_and_collapse_nested]
+SELECT CAST(CAST(123 AS INT32) AS INT64) AS r1,
+       CAST(CAST('hello' AS STRING) AS STRING) AS r2,
+       CAST(CAST(45.67 AS FLOAT64) AS DOUBLE) AS r3
+--
+ARRAY<STRUCT<r1 INT64, r2 STRING, r3 DOUBLE>>[
+  {123, "hello", 45.67}
+]
+==
+
+[mode=rows]
+[name=cast_constant_evaluation]
+SELECT CAST('12345' AS INT64) AS r1,
+       CAST(678 AS STRING) AS r2,
+       CAST('2026-08-27' AS DATE) AS r3,
+       CAST(1 AS DOUBLE) AS r4,
+       CAST(1 AS BOOL) AS r5,
+       CAST(0 AS BOOL) AS r6
+--
+ARRAY<STRUCT<r1 INT64, r2 STRING, r3 DATE, r4 DOUBLE, r5 BOOL, r6 BOOL>>[
+  {12345, "678", 2026-08-27, 1, true, false}
+]
+==

@@ -32,6 +32,7 @@ class Transaction;
 class Encoder;
 class Decoder;
 class TableStatistics;
+class AnalyzeScan;
 
 inline constexpr size_t kHistogramBucketCount = 16;
 inline constexpr size_t kBoundaryValueCount = 5;
@@ -97,6 +98,7 @@ class ColumnStats {
 
  private:
   friend class TableStatistics;
+  friend class AnalyzeScan;
 
   [[nodiscard]] double EstimateLessThan(const Value& value) const;
   void Duplicate(size_t multiplier);

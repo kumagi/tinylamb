@@ -78,6 +78,7 @@ struct SelectSource {
   Expression join_condition;
   Expression unnest;
   std::string offset_alias;
+  bool is_lateral{false};
   // USING (col, ...) names declared on the join whose right operand is this
   // source; empty for every other source.  The merged columns stay
   // physically duplicated in the joined schema, but bare references and
@@ -197,6 +198,7 @@ class SelectStatement : public Statement {
     std::optional<bool> nulls_first;
   };
 
+  SelectStatement() : Statement(StatementType::kSelect) {}
   SelectStatement(std::vector<NamedExpression> select_list,
                   std::vector<std::string> from_clause, Expression where_clause,
                   std::vector<OrderByTerm> order_by = {}, size_t limit = 0,
@@ -218,8 +220,14 @@ class SelectStatement : public Statement {
   const std::vector<NamedExpression>& SelectList() const {
     return select_list_;
   }
+  void SetSelectList(std::vector<NamedExpression> select_list) {
+    select_list_ = std::move(select_list);
+  }
   const std::vector<std::string>& FromClause() const { return from_clause_; }
   const Expression& WhereClause() const { return where_clause_; }
+  void SetWhereClause(Expression where_clause) {
+    where_clause_ = std::move(where_clause);
+  }
   const std::vector<OrderByTerm>& OrderBy() const { return order_by_; }
   size_t Limit() const { return limit_; }
   // True only when the SQL carried an explicit LIMIT clause; LIMIT 0 must be
@@ -232,6 +240,20 @@ class SelectStatement : public Statement {
   void SetOffset(size_t offset) { offset_ = offset; }
   size_t Offset() const { return offset_; }
   bool Distinct() const { return distinct_; }
+  bool HasDistinctOn() const { return !distinct_on_.empty(); }
+  const std::vector<Expression>& DistinctOn() const { return distinct_on_; }
+  void SetDistinctOn(std::vector<Expression> distinct_on) {
+    distinct_on_ = std::move(distinct_on);
+    distinct_ = true;
+    complex_ = true;
+  }
+  bool WithTies() const { return with_ties_; }
+  void SetWithTies(bool with_ties) {
+    with_ties_ = with_ties;
+    if (with_ties) {
+      complex_ = true;
+    }
+  }
   const std::vector<SelectSource>& Sources() const { return sources_; }
   const std::vector<Expression>& GroupBy() const { return group_by_; }
   const Expression& Having() const { return having_; }
@@ -288,11 +310,6 @@ class SelectStatement : public Statement {
   void SetQualify(Expression qualify) {
     qualify_ = std::move(qualify);
     complex_ = true;
-  }
-  // Rewriting hooks: the relational executor replaces window-function nodes
-  // with references to pre-computed hidden columns on a shallow copy.
-  void SetSelectList(std::vector<NamedExpression> select_list) {
-    select_list_ = std::move(select_list);
   }
   void SetOrderBy(std::vector<OrderByTerm> order_by) {
     order_by_ = std::move(order_by);
@@ -373,6 +390,8 @@ class SelectStatement : public Statement {
   bool has_limit_{false};
   size_t offset_{0};
   bool distinct_{false};
+  std::vector<Expression> distinct_on_;
+  bool with_ties_{false};
   std::unordered_map<std::string, std::string> aliases_;
   std::vector<SelectSource> sources_;
   std::vector<Expression> group_by_;

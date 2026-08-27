@@ -81,7 +81,7 @@ class BlockedSigPipe {
 };
 
 #if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(__unix__)
-GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
+GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   std::array<int, 2> input_pipe{};
   std::array<int, 2> output_pipe{};
   // O_CLOEXEC keeps concurrent parses' descriptors out of the child; only
@@ -228,6 +228,269 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
     return {.ok=false, .ast={}, .error=std::move(output)};
   }
   return {.ok=true, .ast=std::move(output), .error={}};
+}
+
+std::string ToLowerCopy(std::string_view s) {
+  std::string result;
+  result.reserve(s.size());
+  for (char c : s) {
+    result.push_back(
+        static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  }
+  return result;
+}
+
+bool ExtractDistinctOn(std::string_view sql, size_t* out_start,
+                       size_t* out_end, std::string* out_exprs) {
+  std::string lower = ToLowerCopy(sql);
+  size_t pos = 0;
+  while (pos < lower.size()) {
+    size_t found = lower.find("distinct", pos);
+    if (found == std::string::npos) break;
+    if (found > 0 &&
+        (std::isalnum(static_cast<unsigned char>(lower[found - 1])) ||
+         lower[found - 1] == '_')) {
+      pos = found + 8;
+      continue;
+    }
+    size_t after_dist = found + 8;
+    while (after_dist < lower.size() &&
+           std::isspace(static_cast<unsigned char>(lower[after_dist]))) {
+      ++after_dist;
+    }
+    if (lower.compare(after_dist, 2, "on") == 0) {
+      size_t after_on = after_dist + 2;
+      if (after_on < lower.size() &&
+          (std::isalnum(static_cast<unsigned char>(lower[after_on])) ||
+           lower[after_on] == '_')) {
+        pos = after_on;
+        continue;
+      }
+      while (after_on < lower.size() &&
+             std::isspace(static_cast<unsigned char>(lower[after_on]))) {
+        ++after_on;
+      }
+      if (after_on < lower.size() && lower[after_on] == '(') {
+        size_t open_paren = after_on;
+        int depth = 1;
+        size_t close_paren = open_paren + 1;
+        while (close_paren < sql.size() && depth > 0) {
+          if (sql[close_paren] == '(') {
+            ++depth;
+          } else if (sql[close_paren] == ')') {
+            --depth;
+          }
+          ++close_paren;
+        }
+        if (depth == 0) {
+          *out_start = found;
+          *out_end = close_paren;
+          *out_exprs = std::string(sql.substr(open_paren + 1,
+                                              close_paren - 1 - open_paren - 1));
+          return true;
+        }
+      }
+    }
+    pos = found + 8;
+  }
+  return false;
+}
+
+bool ExtractFetchWithTies(std::string_view sql, std::string* out_rewritten,
+                          bool* out_with_ties) {
+  std::string lower = ToLowerCopy(sql);
+  *out_with_ties = false;
+  size_t ties_pos = lower.find("with ties");
+  bool with_ties = (ties_pos != std::string::npos);
+  *out_with_ties = with_ties;
+
+  size_t fetch_pos = lower.find("fetch first");
+  if (fetch_pos == std::string::npos) {
+    fetch_pos = lower.find("fetch next");
+  }
+
+  if (fetch_pos != std::string::npos) {
+    size_t offset_pos = lower.find("offset");
+    std::string offset_val;
+    if (offset_pos != std::string::npos && offset_pos < fetch_pos) {
+      size_t cur = offset_pos + 6;
+      while (cur < fetch_pos &&
+             std::isspace(static_cast<unsigned char>(lower[cur]))) {
+        ++cur;
+      }
+      while (cur < fetch_pos &&
+             std::isdigit(static_cast<unsigned char>(lower[cur]))) {
+        offset_val.push_back(lower[cur]);
+        ++cur;
+      }
+    }
+
+    size_t count_start = fetch_pos + 11;
+    while (count_start < lower.size() &&
+           std::isspace(static_cast<unsigned char>(lower[count_start]))) {
+      ++count_start;
+    }
+    std::string count_val;
+    size_t count_cur = count_start;
+    while (count_cur < lower.size() &&
+           std::isdigit(static_cast<unsigned char>(lower[count_cur]))) {
+      count_val.push_back(lower[count_cur]);
+      ++count_cur;
+    }
+    if (count_val.empty()) count_val = "1";
+
+    size_t cut_pos = (offset_pos != std::string::npos && offset_pos < fetch_pos)
+                         ? offset_pos
+                         : fetch_pos;
+    std::string base = std::string(sql.substr(0, cut_pos));
+    base += "LIMIT " + count_val;
+    if (!offset_val.empty()) {
+      base += " OFFSET " + offset_val;
+    }
+    if (sql.ends_with(';')) {
+      base += ";";
+    }
+    *out_rewritten = base;
+    return true;
+  }
+
+  if (with_ties) {
+    std::string modified = std::string(sql);
+    size_t pos = lower.find("with ties");
+    if (pos != std::string::npos) {
+      modified.erase(pos, 9);
+      *out_rewritten = modified;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+std::string NormalizeGroupByDistinct(std::string_view sql) {
+  std::string lower = ToLowerCopy(sql);
+  size_t pos = lower.find("group by distinct");
+  if (pos != std::string::npos) {
+    size_t after = pos + 17;
+    while (after < lower.size() &&
+           std::isspace(static_cast<unsigned char>(lower[after]))) {
+      ++after;
+    }
+    if (lower.compare(after, 3, "all") == 0) {
+      std::string result(sql.substr(0, pos));
+      result += "GROUP BY ALL";
+      result += sql.substr(after + 3);
+      return result;
+    }
+    std::string result(sql.substr(0, pos));
+    result += "GROUP BY";
+    result += sql.substr(pos + 17);
+    return result;
+  }
+  return std::string(sql);
+}
+
+GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
+  std::string current_sql = NormalizeGroupByDistinct(sql);
+
+  size_t dist_start = 0;
+  size_t dist_end = 0;
+  std::string distinct_keys;
+  if (ExtractDistinctOn(current_sql, &dist_start, &dist_end, &distinct_keys)) {
+    std::string main_sql = current_sql.substr(0, dist_start) + "DISTINCT " +
+                           current_sql.substr(dist_end);
+    GoogleSqlParseResult main_res = ParseViaSubprocess(main_sql);
+    if (!main_res.ok) {
+      return main_res;
+    }
+    GoogleSqlParseResult keys_res =
+        ParseViaSubprocess("SELECT " + distinct_keys + ";");
+    if (!keys_res.ok) {
+      return main_res;
+    }
+
+    size_t select_pos = std::string::npos;
+    for (const char* pattern : {"Select(", "Select [", "Select\n", "Select "}) {
+      size_t found = main_res.ast.find(pattern);
+      if (found != std::string::npos) {
+        select_pos = found;
+        break;
+      }
+    }
+    if (select_pos != std::string::npos) {
+      size_t sel_line_start = main_res.ast.rfind('\n', select_pos);
+      sel_line_start = (sel_line_start == std::string::npos) ? 0 : sel_line_start + 1;
+      size_t select_indent = 0;
+      while (sel_line_start + select_indent < main_res.ast.size() &&
+             main_res.ast[sel_line_start + select_indent] == ' ') {
+        ++select_indent;
+      }
+
+      std::string distinct_on_block = std::string(select_indent + 2, ' ') + "DistinctOn\n";
+      size_t select_list_pos = keys_res.ast.find("SelectList");
+      if (select_list_pos != std::string::npos) {
+        size_t sl_line_start = keys_res.ast.rfind('\n', select_list_pos);
+        sl_line_start = (sl_line_start == std::string::npos) ? 0 : sl_line_start + 1;
+        size_t sl_indent = 0;
+        while (sl_line_start + sl_indent < keys_res.ast.size() &&
+               keys_res.ast[sl_line_start + sl_indent] == ' ') {
+          ++sl_indent;
+        }
+
+        size_t next_line = keys_res.ast.find('\n', select_list_pos);
+        if (next_line != std::string::npos) {
+          ++next_line;
+          while (next_line < keys_res.ast.size()) {
+            size_t cur_end = keys_res.ast.find('\n', next_line);
+            if (cur_end == std::string::npos) cur_end = keys_res.ast.size();
+            std::string line = keys_res.ast.substr(next_line, cur_end - next_line);
+            size_t sp = 0;
+            while (sp < line.size() && line[sp] == ' ') ++sp;
+            if (sp <= sl_indent && !line.empty()) break;
+            if (!line.empty()) {
+              size_t rel = sp - sl_indent;
+              distinct_on_block += std::string(select_indent + 2 + rel, ' ') + line.substr(sp) + "\n";
+            }
+            next_line = cur_end + 1;
+          }
+        }
+      }
+
+      size_t select_line_end = main_res.ast.find('\n', select_pos);
+      if (select_line_end != std::string::npos) {
+        main_res.ast.insert(select_line_end + 1, distinct_on_block);
+      }
+    }
+    return main_res;
+  }
+
+  std::string rewritten_fetch;
+  bool with_ties = false;
+  if (ExtractFetchWithTies(current_sql, &rewritten_fetch, &with_ties)) {
+    GoogleSqlParseResult res = ParseRawSubprocess(rewritten_fetch);
+    if (!res.ok) {
+      return res;
+    }
+    if (with_ties) {
+      size_t limit_pos = res.ast.find("LimitOffset");
+      if (limit_pos != std::string::npos) {
+        size_t line_start = res.ast.rfind('\n', limit_pos);
+        line_start = (line_start == std::string::npos) ? 0 : line_start + 1;
+        size_t limit_indent = 0;
+        while (line_start + limit_indent < res.ast.size() &&
+               res.ast[line_start + limit_indent] == ' ') {
+          ++limit_indent;
+        }
+        size_t limit_line_end = res.ast.find('\n', limit_pos);
+        if (limit_line_end != std::string::npos) {
+          res.ast.insert(limit_line_end + 1, std::string(limit_indent + 2, ' ') + "WithTies\n");
+        }
+      }
+    }
+    return res;
+  }
+
+  return ParseRawSubprocess(current_sql);
 }
 #endif
 

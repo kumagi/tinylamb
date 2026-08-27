@@ -149,7 +149,8 @@ Executor TopNPlan::EmitExecutor(TransactionContext& ctx) const {
 }
 
 Executor DistinctPlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<DistinctExecutor>(child_->EmitExecutor(ctx));
+  return std::make_shared<DistinctExecutor>(child_->EmitExecutor(ctx),
+                                            child_->GetSchema(), distinct_on_);
 }
 
 Executor ValuesPlan::EmitExecutor(TransactionContext& /*ctx*/) const {

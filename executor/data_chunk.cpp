@@ -12,6 +12,7 @@
 #include "type/value.hpp"
 #include "type/schema.hpp"
 #include <vector>
+#include "executor/selection_vector.hpp"
 #include "type/row.hpp"
 #include "page/row_position.hpp"
 
@@ -416,4 +417,295 @@ Row DataChunk::RowAt(size_t row_index) const {
   return Row(std::move(values));
 }
 
+Value ColumnVector::AggregateLogicalAnd(const SelectionVector* sel) const {
+  if (size_ == 0 || (sel != nullptr && sel->Empty())) {
+    return Value();
+  }
+  bool has_non_null = false;
+  if (sel == nullptr) {
+    if (type_ == ValueType::kInt64) {
+      const int64_t* data = integers_.data();
+      const size_t words = (size_ + 63) / 64;
+      for (size_t w = 0; w < words; ++w) {
+        const size_t base = w * 64;
+        const size_t limit = std::min(size_ - base, size_t{64});
+        const uint64_t null_word =
+            w < null_bitmap_.size() ? null_bitmap_[w] : 0;
+        for (size_t i = 0; i < limit; ++i) {
+          if ((null_word & (1ULL << i)) == 0) {
+            has_non_null = true;
+            if (data[base + i] == 0) {
+              return Value(int64_t{0});
+            }
+          }
+        }
+      }
+    } else {
+      for (size_t i = 0; i < size_; ++i) {
+        if (!IsNull(i)) {
+          has_non_null = true;
+          if (!ValueAt(i).Truthy()) {
+            return Value(int64_t{0});
+          }
+        }
+      }
+    }
+  } else {
+    for (size_t i = 0; i < sel->Size(); ++i) {
+      const size_t idx = (*sel)[i];
+      if (idx < size_ && !IsNull(idx)) {
+        has_non_null = true;
+        if (!ValueAt(idx).Truthy()) {
+          return Value(int64_t{0});
+        }
+      }
+    }
+  }
+  if (!has_non_null) {
+    return Value();
+  }
+  return Value(int64_t{1});
+}
+
+Value ColumnVector::AggregateLogicalOr(const SelectionVector* sel) const {
+  if (size_ == 0 || (sel != nullptr && sel->Empty())) {
+    return Value();
+  }
+  bool has_non_null = false;
+  if (sel == nullptr) {
+    if (type_ == ValueType::kInt64) {
+      const int64_t* data = integers_.data();
+      const size_t words = (size_ + 63) / 64;
+      for (size_t w = 0; w < words; ++w) {
+        const size_t base = w * 64;
+        const size_t limit = std::min(size_ - base, size_t{64});
+        const uint64_t null_word =
+            w < null_bitmap_.size() ? null_bitmap_[w] : 0;
+        for (size_t i = 0; i < limit; ++i) {
+          if ((null_word & (1ULL << i)) == 0) {
+            has_non_null = true;
+            if (data[base + i] != 0) {
+              return Value(int64_t{1});
+            }
+          }
+        }
+      }
+    } else {
+      for (size_t i = 0; i < size_; ++i) {
+        if (!IsNull(i)) {
+          has_non_null = true;
+          if (ValueAt(i).Truthy()) {
+            return Value(int64_t{1});
+          }
+        }
+      }
+    }
+  } else {
+    for (size_t i = 0; i < sel->Size(); ++i) {
+      const size_t idx = (*sel)[i];
+      if (idx < size_ && !IsNull(idx)) {
+        has_non_null = true;
+        if (ValueAt(idx).Truthy()) {
+          return Value(int64_t{1});
+        }
+      }
+    }
+  }
+  if (!has_non_null) {
+    return Value();
+  }
+  return Value(int64_t{0});
+}
+
+Value ColumnVector::AggregateBitAnd(const SelectionVector* sel) const {
+  if (size_ == 0 || (sel != nullptr && sel->Empty())) {
+    return Value();
+  }
+  if (type_ != ValueType::kInt64) {
+    throw std::invalid_argument("BIT_AND requires int64 column");
+  }
+  const int64_t* data = integers_.data();
+  uint64_t acc = ~uint64_t{0};
+  bool has_non_null = false;
+
+  if (sel == nullptr) {
+    const size_t words = (size_ + 63) / 64;
+    for (size_t w = 0; w < words; ++w) {
+      const size_t base = w * 64;
+      const size_t limit = std::min(size_ - base, size_t{64});
+      const uint64_t null_word =
+          w < null_bitmap_.size() ? null_bitmap_[w] : 0;
+      if (null_word == 0) {
+        #pragma clang loop vectorize(enable)
+        for (size_t i = 0; i < limit; ++i) {
+          acc &= static_cast<uint64_t>(data[base + i]);
+        }
+        has_non_null = true;
+      } else if (null_word == ~uint64_t{0}) {
+        continue;
+      } else {
+        for (size_t i = 0; i < limit; ++i) {
+          if ((null_word & (1ULL << i)) == 0) {
+            acc &= static_cast<uint64_t>(data[base + i]);
+            has_non_null = true;
+          }
+        }
+      }
+    }
+  } else {
+    for (size_t i = 0; i < sel->Size(); ++i) {
+      const size_t idx = (*sel)[i];
+      if (idx < size_ && !IsNull(idx)) {
+        acc &= static_cast<uint64_t>(data[idx]);
+        has_non_null = true;
+      }
+    }
+  }
+  if (!has_non_null) {
+    return Value();
+  }
+  return Value(static_cast<int64_t>(acc));
+}
+
+Value ColumnVector::AggregateBitOr(const SelectionVector* sel) const {
+  if (size_ == 0 || (sel != nullptr && sel->Empty())) {
+    return Value();
+  }
+  if (type_ != ValueType::kInt64) {
+    throw std::invalid_argument("BIT_OR requires int64 column");
+  }
+  const int64_t* data = integers_.data();
+  uint64_t acc = 0;
+  bool has_non_null = false;
+
+  if (sel == nullptr) {
+    const size_t words = (size_ + 63) / 64;
+    for (size_t w = 0; w < words; ++w) {
+      const size_t base = w * 64;
+      const size_t limit = std::min(size_ - base, size_t{64});
+      const uint64_t null_word =
+          w < null_bitmap_.size() ? null_bitmap_[w] : 0;
+      if (null_word == 0) {
+        #pragma clang loop vectorize(enable)
+        for (size_t i = 0; i < limit; ++i) {
+          acc |= static_cast<uint64_t>(data[base + i]);
+        }
+        has_non_null = true;
+      } else if (null_word == ~uint64_t{0}) {
+        continue;
+      } else {
+        for (size_t i = 0; i < limit; ++i) {
+          if ((null_word & (1ULL << i)) == 0) {
+            acc |= static_cast<uint64_t>(data[base + i]);
+            has_non_null = true;
+          }
+        }
+      }
+    }
+  } else {
+    for (size_t i = 0; i < sel->Size(); ++i) {
+      const size_t idx = (*sel)[i];
+      if (idx < size_ && !IsNull(idx)) {
+        acc |= static_cast<uint64_t>(data[idx]);
+        has_non_null = true;
+      }
+    }
+  }
+  if (!has_non_null) {
+    return Value();
+  }
+  return Value(static_cast<int64_t>(acc));
+}
+
+Value ColumnVector::AggregateBitXor(const SelectionVector* sel) const {
+  if (size_ == 0 || (sel != nullptr && sel->Empty())) {
+    return Value();
+  }
+  if (type_ != ValueType::kInt64) {
+    throw std::invalid_argument("BIT_XOR requires int64 column");
+  }
+  const int64_t* data = integers_.data();
+  uint64_t acc = 0;
+  bool has_non_null = false;
+
+  if (sel == nullptr) {
+    const size_t words = (size_ + 63) / 64;
+    for (size_t w = 0; w < words; ++w) {
+      const size_t base = w * 64;
+      const size_t limit = std::min(size_ - base, size_t{64});
+      const uint64_t null_word =
+          w < null_bitmap_.size() ? null_bitmap_[w] : 0;
+      if (null_word == 0) {
+        #pragma clang loop vectorize(enable)
+        for (size_t i = 0; i < limit; ++i) {
+          acc ^= static_cast<uint64_t>(data[base + i]);
+        }
+        has_non_null = true;
+      } else if (null_word == ~uint64_t{0}) {
+        continue;
+      } else {
+        for (size_t i = 0; i < limit; ++i) {
+          if ((null_word & (1ULL << i)) == 0) {
+            acc ^= static_cast<uint64_t>(data[base + i]);
+            has_non_null = true;
+          }
+        }
+      }
+    }
+  } else {
+    for (size_t i = 0; i < sel->Size(); ++i) {
+      const size_t idx = (*sel)[i];
+      if (idx < size_ && !IsNull(idx)) {
+        acc ^= static_cast<uint64_t>(data[idx]);
+        has_non_null = true;
+      }
+    }
+  }
+  if (!has_non_null) {
+    return Value();
+  }
+  return Value(static_cast<int64_t>(acc));
+}
+
+Value DataChunk::AggregateLogicalAnd(size_t col_idx,
+                                     const SelectionVector* sel) const {
+  if (col_idx >= columns_.size()) {
+    throw std::out_of_range("DataChunk::AggregateLogicalAnd col_idx out of range");
+  }
+  return columns_[col_idx].AggregateLogicalAnd(sel);
+}
+
+Value DataChunk::AggregateLogicalOr(size_t col_idx,
+                                    const SelectionVector* sel) const {
+  if (col_idx >= columns_.size()) {
+    throw std::out_of_range("DataChunk::AggregateLogicalOr col_idx out of range");
+  }
+  return columns_[col_idx].AggregateLogicalOr(sel);
+}
+
+Value DataChunk::AggregateBitAnd(size_t col_idx,
+                                 const SelectionVector* sel) const {
+  if (col_idx >= columns_.size()) {
+    throw std::out_of_range("DataChunk::AggregateBitAnd col_idx out of range");
+  }
+  return columns_[col_idx].AggregateBitAnd(sel);
+}
+
+Value DataChunk::AggregateBitOr(size_t col_idx,
+                                const SelectionVector* sel) const {
+  if (col_idx >= columns_.size()) {
+    throw std::out_of_range("DataChunk::AggregateBitOr col_idx out of range");
+  }
+  return columns_[col_idx].AggregateBitOr(sel);
+}
+
+Value DataChunk::AggregateBitXor(size_t col_idx,
+                                 const SelectionVector* sel) const {
+  if (col_idx >= columns_.size()) {
+    throw std::out_of_range("DataChunk::AggregateBitXor col_idx out of range");
+  }
+  return columns_[col_idx].AggregateBitXor(sel);
+}
+
 }  // namespace tinylamb
+

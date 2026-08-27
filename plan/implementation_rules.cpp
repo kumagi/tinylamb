@@ -398,24 +398,11 @@ double EqualityPrefixRows(const TableStatistics& statistics, const Index& index,
   return std::max(1.0, rows);
 }
 
-std::vector<Expression> SplitDisjuncts(  // NOLINT(misc-no-recursion)
-    const Expression& expression) {
-  if (expression && expression->Type() == TypeTag::kBinaryExp &&
-      expression->AsBinaryExpression().Op() == BinaryOperation::kOr) {
-    std::vector<Expression> result =
-        SplitDisjuncts(expression->AsBinaryExpression().Left());
-    std::vector<Expression> right =
-        SplitDisjuncts(expression->AsBinaryExpression().Right());
-    result.insert(result.end(), std::make_move_iterator(right.begin()),
-                  std::make_move_iterator(right.end()));
-    return result;
-  }
-  return {expression};
-}
 
 std::optional<std::vector<std::vector<Value>>> DisjunctiveIndexPrefixes(
     const Expression& filter, const Schema& schema, const Index& index) {
-  const std::vector<Expression> disjuncts = SplitDisjuncts(filter);
+  const std::vector<Expression> disjuncts =
+      relational_detail::SplitDisjuncts(filter);
   if (disjuncts.size() < 2) {
     return std::nullopt;
   }
@@ -1960,6 +1947,80 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                                   false, true);
         },
         c::LogicalOperator::kJoin));
+    built.Add(c::ImplementationRule(
+        "single_hash_join", c::dsl::SingleJoin(),
+        [](c::GroupId, const c::Memo& memo, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext& context) {
+          if (children.size() != 2 || required.require_row_position) {
+            return std::vector<PlanAlternative>{};
+          }
+          return JoinAlternatives(memo, logical.children[1], logical.predicate,
+                                  children[0], children[1], context, true,
+                                  false, false,
+                                  JoinAlternativeKind::kLeftOuter);
+        },
+        c::LogicalOperator::kSingleJoin));
+    built.Add(c::ImplementationRule(
+        "mark_hash_join", c::dsl::MarkJoin(),
+        [](c::GroupId, const c::Memo& memo, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext& context) {
+          if (children.size() != 2 || required.require_row_position) {
+            return std::vector<PlanAlternative>{};
+          }
+          return JoinAlternatives(memo, logical.children[1], logical.predicate,
+                                  children[0], children[1], context, true,
+                                  false, false, JoinAlternativeKind::kSemi);
+        },
+        c::LogicalOperator::kMarkJoin));
+    built.Add(c::ImplementationRule(
+        "constant_table", c::dsl::ConstantTable(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical, const std::vector<BestPlan>&,
+           const PhysicalProperties&, const c::RuleContext& context) {
+          if (logical.values.empty() && !logical.table.empty()) {
+            uint64_t count = 0;
+            if (context.statistics.contains(logical.table)) {
+              count = context.statistics.at(logical.table)->Rows();
+            }
+            Schema schema =
+                logical.output_schema.ColumnCount() > 0
+                    ? logical.output_schema
+                    : Schema("", {Column("count", ValueType::kInt64)});
+            Plan values = std::make_shared<ValuesPlan>(
+                schema,
+                std::vector<Row>{Row({Value(static_cast<int64_t>(count))})});
+            return std::vector<PlanAlternative>{
+                PlanAlternative{.plan = std::move(values),
+                                .local_cost = 1.0,
+                                .estimated_rows = 1.0}};
+          }
+          Plan values = std::make_shared<ValuesPlan>(logical.output_schema,
+                                                     logical.values);
+          const double rows = static_cast<double>(logical.values.size());
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = std::move(values),
+                              .local_cost = rows,
+                              .estimated_rows = rows}};
+        },
+        c::LogicalOperator::kConstantTable));
+    built.Add(c::ImplementationRule(
+        "generate_series", c::dsl::GenerateSeries(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical, const std::vector<BestPlan>&,
+           const PhysicalProperties&, const c::RuleContext&) {
+          Plan values = std::make_shared<ValuesPlan>(logical.output_schema,
+                                                     logical.values);
+          const double rows = static_cast<double>(logical.values.size());
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = std::move(values),
+                              .local_cost = rows,
+                              .estimated_rows = rows}};
+        },
+        c::LogicalOperator::kGenerateSeries));
     return built;
   }();
   return rules;

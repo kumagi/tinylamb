@@ -237,6 +237,9 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
                                      relations, all_cols));
   } else if (exp->Type() == TypeTag::kAggregateExp) {
     Expression child = exp->AsAggregateExpression().Child();
+    if (!child) {
+      return Status::kSuccess;
+    }
     if (child->Type() == TypeTag::kColumnValue &&
         child->AsColumnValue().GetColumnName().name == "*") {
       return Status::kSuccess;
