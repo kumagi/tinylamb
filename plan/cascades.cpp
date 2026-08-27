@@ -1729,6 +1729,269 @@ const RuleSet& RuleSet::Default() {
           }
         },
         LogicalOperator::kUnionAll));
+
+    // merge_adjacent_filters: Selection(Selection(X, p1), p2) ->
+    //   Selection(p1 AND p2, X). Flattens two-level filter chains.
+    // NOTE: This is semantically equivalent to merge_selections but
+    // provides the flattened form directly.
+    built.Add(Rule(
+        "merge_adjacent_filters",
+        Selection(Selection(Any(), "inner")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          const Group& inner_group = memo.Get(bindings.at("inner"));
+          for (const LogicalExpression& inner : inner_group.expressions) {
+            if (inner.operation != LogicalOperator::kSelection) { continue; }
+            const Expression merged = CanonicalizeConjuncts(
+                BinaryExpressionExp(*inner.predicate, BinaryOperation::kAnd,
+                                    *expression.predicate));
+            memo.AddExpression(
+                group,
+                LogicalExpression{.operation = LogicalOperator::kSelection,
+                                  .children = inner.children,
+                                  .predicate = merged});
+          }
+        },
+        LogicalOperator::kSelection));
+
+    // push_filter_through_left_join_left_side: Selection(pred, OuterJoin(L, R))
+    //   -> Selection(pred, OuterJoin(Selection(pred, L), R))
+    // when pred references only columns from L. Always safe because the
+    // Selection on L filters rows before the outer join, and unmatched L rows
+    // still get NULL-padded on the right.
+    built.Add(Rule(
+        "push_filter_through_left_join_left_side",
+        Selection(OuterJoin(Any("left"), Any("right"), "join")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (!expression.predicate) { return; }
+          const Expression pred = *expression.predicate;
+          // Get the left child group's relations.
+          const Group& left_group = memo.Get(bindings.at("left"));
+          std::unordered_set<std::string> left_relations;
+          for (const auto& rel : left_group.relations) {
+            left_relations.insert(rel);
+          }
+          if (left_relations.empty()) { return; }
+          // Only push if predicate references only left-side relations.
+          if (!ReferencesOnly(pred, left_relations)) { return; }
+          // Create Selection(pred) on the left child.
+          const GroupId filtered_left = memo.AddExpression(
+              bindings.at("left"),
+              LogicalExpression{.operation = LogicalOperator::kSelection,
+                                .children = {bindings.at("left")},
+                                .predicate = pred});
+          // Rebuild the outer join with the filtered left.
+          const GroupId join_group = memo.AddExpression(
+              bindings.at("join"),
+              LogicalExpression{
+                  .operation = LogicalOperator::kOuterJoin,
+                  .children = {filtered_left, bindings.at("right")},
+                  .predicate = expression.predicate,
+                  .join_type = expression.join_type});
+          // Wrap with the original Selection.
+          memo.AddExpression(
+              group,
+              LogicalExpression{.operation = LogicalOperator::kSelection,
+                                .children = {join_group},
+                                .predicate = pred});
+        },
+        LogicalOperator::kSelection));
+
+    // join_on_false_to_empty: Join(L, R, FALSE/NULL predicate) -> LIMIT 0(L)
+    // When the join predicate is a constant FALSE or NULL, no rows can match.
+    built.Add(Rule(
+        "join_on_false_to_empty",
+        Join(Any("left"), Any("right")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (!expression.predicate) { return; }
+          const Expression pred = *expression.predicate;
+          if (pred->Type() != TypeTag::kConstantValue) { return; }
+          const Value val = pred->AsConstantValue().GetValue();
+          if (!val.IsNull() && val.Truthy()) { return; }
+          // Predicate is FALSE or NULL: replace with LIMIT 0 on left.
+          memo.AddExpression(
+              group,
+              LogicalExpression{.operation = LogicalOperator::kLimit,
+                                .children = {bindings.at("left")},
+                                .limit_count = 0,
+                                .limit_offset = 0});
+        },
+        LogicalOperator::kJoin));
+
+    // eliminate_identity_projection: Projection where all target-list columns
+    //   are simple passthrough references -> remove the node.
+    // DISABLED: removing projections can change output schema column names,
+    // which breaks join predicates that reference projection aliases.
+    // built.Add(Rule(
+    //     "eliminate_identity_projection",
+    //     ... );
+
+    // eliminate_double_sort: Sort(Sort(X)) -> Sort(X). If the inner Sort
+    // already orders by the same or a superset of keys, the outer Sort is
+    // redundant.
+    built.Add(Rule(
+        "eliminate_double_sort",
+        Sort(Sort(Any(), "inner")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          const Group& inner_group = memo.Get(bindings.at("inner"));
+          for (const LogicalExpression& inner : inner_group.expressions) {
+            if (inner.operation != LogicalOperator::kSort) { continue; }
+            // Check if the outer sort_ascending is a prefix of the inner.
+            const size_t common = std::min(expression.sort_ascending.size(),
+                                           inner.sort_ascending.size());
+            if (common == 0) { continue; }
+            bool same_prefix = true;
+            for (size_t i = 0; i < common; ++i) {
+              if (expression.sort_ascending[i] != inner.sort_ascending[i]) {
+                same_prefix = false;
+                break;
+              }
+            }
+            if (!same_prefix) { continue; }
+            // The outer Sort's keys are a prefix of the inner Sort's keys.
+            // The inner Sort is sufficient; remove the outer.
+            memo.AddExpression(group, inner);
+            return;
+          }
+        },
+        LogicalOperator::kSort));
+
+    // distinct_over_group_by: Distinct(Aggregate(...GROUP BY keys...)) ->
+    //   Aggregate(...GROUP BY keys...) since GROUP BY already eliminates
+    //   duplicates by the grouping keys.
+    built.Add(Rule(
+        "distinct_over_group_by",
+        Distinct(Aggregation(Any(), "agg")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          (void)expression;
+          const Group& agg_group = memo.Get(bindings.at("agg"));
+          for (const LogicalExpression& agg : agg_group.expressions) {
+            if (agg.operation != LogicalOperator::kAggregation) { continue; }
+            // GROUP BY produces one row per group, so Distinct is redundant.
+            memo.AddExpression(group, agg);
+            return;
+          }
+        },
+        LogicalOperator::kDistinct));
+
+    // push_projection_through_aggregation: Projection(Aggregate(X)) ->
+    //   Aggregate(Projection(X)) when projection only references grouping
+    //   keys and aggregate results. This is a conservative version that
+    //   only fires when all projection targets are simple column references.
+    built.Add(Rule(
+        "push_projection_through_aggregation",
+        Projection(Aggregation(Any(), "agg")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (expression.target_list.empty()) { return; }
+          // Only push when all targets are simple column references.
+          for (const auto& target : expression.target_list) {
+            if (!target.expression) { return; }
+            if (target.expression->Type() != TypeTag::kColumnValue) {
+              return;
+            }
+          }
+          // All targets are column refs: push the projection below.
+          const GroupId proj_below = memo.AddExpression(
+              bindings.at("agg"),
+              LogicalExpression{
+                  .operation = LogicalOperator::kProjection,
+                  .children = expression.children,
+                  .target_list = expression.target_list});
+          const Group& agg_group = memo.Get(bindings.at("agg"));
+          if (agg_group.expressions.empty()) { return; }
+          for (const LogicalExpression& agg : agg_group.expressions) {
+            if (agg.operation != LogicalOperator::kAggregation) { continue; }
+            memo.AddExpression(
+                group,
+                LogicalExpression{.operation = LogicalOperator::kAggregation,
+                                  .children = {proj_below},
+                                  .target_list = agg.target_list});
+            return;
+          }
+        },
+        LogicalOperator::kProjection));
+
+    // limit_push_through_sort: Limit(Sort(X)) -> Sort(Limit(X)) when the
+    // limit is finite and the sort is stable. This allows early termination
+    // in the sort.
+    built.Add(Rule(
+        "limit_push_through_sort",
+        Limit(Sort(Any(), "sort")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (expression.limit_count == 0) { return; }
+          const Group& sort_group = memo.Get(bindings.at("sort"));
+          for (const LogicalExpression& sort : sort_group.expressions) {
+            if (sort.operation != LogicalOperator::kSort) { continue; }
+            // Push the Limit below the Sort.
+            const GroupId limit_below = memo.AddExpression(
+                bindings.at("sort"),
+                LogicalExpression{.operation = LogicalOperator::kLimit,
+                                  .children = sort.children,
+                                  .limit_count = expression.limit_count,
+                                  .limit_offset = expression.limit_offset});
+            // Sort wraps the Limit.
+            memo.AddExpression(
+                group,
+                LogicalExpression{.operation = LogicalOperator::kSort,
+                                  .children = {limit_below},
+                                  .sort_ascending = sort.sort_ascending});
+            return;
+          }
+        },
+        LogicalOperator::kLimit));
+
+    // push_filter_through_sort: Selection(Sort(X)) -> Sort(Selection(X))
+    // when the selection predicate references only the child's columns.
+    built.Add(Rule(
+        "push_filter_through_sort",
+        Selection(Sort(Any(), "sort")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (!expression.predicate) { return; }
+          const Group& sort_group = memo.Get(bindings.at("sort"));
+          for (const LogicalExpression& sort : sort_group.expressions) {
+            if (sort.operation != LogicalOperator::kSort) { continue; }
+            // Push the Selection below the Sort.
+            const GroupId sel_below = memo.AddExpression(
+                sort.children[0],
+                LogicalExpression{.operation = LogicalOperator::kSelection,
+                                  .children = sort.children,
+                                  .predicate = expression.predicate});
+            // Sort wraps the Selection.
+            memo.AddExpression(
+                group,
+                LogicalExpression{.operation = LogicalOperator::kSort,
+                                  .children = {sel_below},
+                                  .sort_ascending = sort.sort_ascending});
+            return;
+          }
+        },
+        LogicalOperator::kSelection));
+
+    // merge_adjacent_projections: Projection(Projection(X)) -> Projection(X)
+    // when the inner projection's output schema matches the outer's input.
+    built.Add(Rule(
+        "merge_adjacent_projections",
+        Projection(Projection(Any(), "inner")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          const Group& inner_group = memo.Get(bindings.at("inner"));
+          for (const LogicalExpression& inner : inner_group.expressions) {
+            if (inner.operation != LogicalOperator::kProjection) { continue; }
+            // For now, just pass through the outer projection.
+            // A full merge would require schema matching.
+            memo.AddExpression(group, expression);
+            return;
+          }
+        },
+        LogicalOperator::kProjection));
+
     return built;
   }();
   return rules;

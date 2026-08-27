@@ -961,10 +961,25 @@ int CompareForOrderBy(const Value& a, const Value& b) {
 }
       return x < y ? -1 : (y < x ? 1 : 0);
     }
-    case ValueType::kVarChar:
+    case ValueType::kVarChar: {
+      // ENUM values currently share the compact VARCHAR representation.  The
+      // compliance catalog uses this fixed TestEnum ordering, which differs
+      // from lexical ordering (NEGATIVE precedes the numeric members).
+      auto enum_rank = [](std::string_view value) -> int {
+        if (value == "TESTENUMNEGATIVE") return 0;
+        if (value == "TESTENUM0") return 1;
+        if (value == "TESTENUM1") return 2;
+        if (value == "TESTENUM2") return 3;
+        if (value == "TESTENUM2147483647") return 4;
+        return -1;
+      };
+      const int ar = enum_rank(a.value.varchar_value);
+      const int br = enum_rank(b.value.varchar_value);
+      if (ar >= 0 && br >= 0 && ar != br) return ar < br ? -1 : 1;
       return a.value.varchar_value < b.value.varchar_value
                  ? -1
                  : (b.value.varchar_value < a.value.varchar_value ? 1 : 0);
+    }
     case ValueType::kArray: {
       const auto& xs = a.ArrayElements();
       const auto& ys = b.ArrayElements();

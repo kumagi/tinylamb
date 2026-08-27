@@ -537,7 +537,8 @@ TEST_F(PlanTest, SortPlanOrdersRowsAndReportsOrdering) {
                         ctx.GetStats("Sc1"));
   Plan child(new FullScanPlan(*table, *stats));
   Plan sorted(new SortPlan(
-      child, {SortKey{ColumnValueExp(ColumnName("Sc1.c1")), true}}));
+      child, {SortKey{ColumnValueExp(ColumnName("Sc1.c1")), true,
+                      std::nullopt}}));
 
   EXPECT_TRUE(
       sorted->IsOrderedBy({ColumnValueExp(ColumnName("Sc1.c1"))}, {true}));
@@ -562,9 +563,12 @@ TEST_F(PlanTest, SortAndTopNPlansReportSortedPrefixes) {
   const Expression first = ColumnValueExp(ColumnName("Sc1.c1"));
   const Expression second = ColumnValueExp(ColumnName("Sc1.c2"));
   Plan sorted = std::make_shared<SortPlan>(
-      scan, std::vector<SortKey>{{first, true}, {second, true}});
+      scan, std::vector<SortKey>{{first, true, std::nullopt},
+                                 {second, true, std::nullopt}});
   Plan topn = std::make_shared<TopNPlan>(
-      scan, std::vector<TopNKey>{{first, true}, {second, true}}, 3, 0);
+      scan, std::vector<TopNKey>{{first, true, std::nullopt},
+                                 {second, true, std::nullopt}},
+      3, 0);
 
   for (const Plan& plan : {sorted, topn}) {
     EXPECT_TRUE(plan->IsOrderedBy({first}, {true}));
@@ -582,7 +586,8 @@ TEST_F(PlanTest, ProjectionTranslatesAliasedOrderKeysToChildExpressions) {
   const Expression source_key = ColumnValueExp(ColumnName("Sc1.c1"));
   Plan sorted =
       std::make_shared<SortPlan>(std::make_shared<FullScanPlan>(*table, *stats),
-                                 std::vector<SortKey>{{source_key, true}});
+                                 std::vector<SortKey>{{source_key, true,
+                                                       std::nullopt}});
   Plan projected = std::make_shared<ProjectionPlan>(
       sorted, std::vector<NamedExpression>{NamedExpression(
                   "$order0", ColumnValueExp(ColumnName("Sc1.c1")))});
@@ -684,7 +689,8 @@ TEST_F(PlanTest, MergeJoinPlanCarriesSortedKeyContractAndOutputSchema) {
   auto left_scan = std::make_shared<FullScanPlan>(*tbl1, ts);
   auto left = std::make_shared<SortPlan>(
       left_scan,
-      std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc1.c1")), true}});
+      std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc1.c1")), true,
+                            std::nullopt}});
   auto right = std::make_shared<FullScanPlan>(*tbl2, ts);
 
   Plan plan(new MergeJoinPlan(left, {ColumnName("Sc1.c1")}, right,

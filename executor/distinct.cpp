@@ -3,19 +3,52 @@
 
 #include <cstddef>
 #include <ostream>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
+#include "type/value.hpp"
+
 namespace tinylamb {
+namespace {
+
+// DISTINCT collapses rows that are equal under SQL ordering semantics: all
+// NaNs compare equal (GoogleSQL groups every NaN into a single result row),
+// -0.0 equals +0.0, and comparison of floating point values is exact rather
+// than within an epsilon.  Other types keep their ordinary equality so
+// interval-string and NULL handling are unchanged.
+bool DistinctEquals(const Row& a, const Row& b) {
+  if (a.values_.size() != b.values_.size()) { return false; }
+  for (size_t i = 0; i < a.values_.size(); ++i) {
+    const Value& x = a[i];
+    const Value& y = b[i];
+    const bool equal =
+        (x.type == ValueType::kDouble && y.type == ValueType::kDouble)
+            ? (CompareForOrderBy(x, y) == 0)
+            : (x == y);
+    if (!equal) { return false; }
+  }
+  return true;
+}
+
+}  // namespace
+
 bool DistinctExecutor::Next(Row* dst, RowPosition* rp) {
   Row row;
   RowPosition position;
   while (source_->Next(&row, &position)) {
-    if (seen_.insert(row).second) {
-      *dst = row;
-      if (rp != nullptr) { *rp = position;
-}
+    bool duplicate = false;
+    for (const Row& seen : seen_) {
+      if (DistinctEquals(seen, row)) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (!duplicate) {
+      seen_.push_back(row);
+      *dst = seen_.back();
+      if (rp != nullptr) { *rp = position; }
       return true;
     }
   }
@@ -30,7 +63,7 @@ bool SortDistinctExecutor::Next(Row* dst, RowPosition* rp) {
   Row row;
   RowPosition position;
   while (source_->Next(&row, &position)) {
-    if (have_previous_ && row == previous_) { continue; }
+    if (have_previous_ && DistinctEquals(previous_, row)) { continue; }
     previous_ = row;
     have_previous_ = true;
     *dst = std::move(row);

@@ -3,9 +3,8 @@
 2026-08-25 時点。ストレージ / index / table / expression / plan / executor /
 query+server の各層を並行レビューし、発見した改善点を重要度順にまとめた。
 一部の指摘は実機検証済み(LSM 自己デッドロックの最小再現、
-`differential_test` の実行など)。既に [`next-actions.md`](next-actions.md),
-[`executor_todo.md`](executor_todo.md), [`optimizer_todo.md`](optimizer_todo.md)
-に記載済みの意図的先送り項目は原則除外している。
+`differential_test` の実行など)。既に [`next-actions.md`](next-actions.md) と
+[`todo.md`](todo.md) に記載済みの意図的先送り項目は原則除外している。
 
 マーク:
 
@@ -411,7 +410,7 @@ query+server の各層を並行レビューし、発見した改善点を重要�
 
 ### [低] DistinctExecutor の重複集合がメモリ予算に無勘定で無限成長
 - 場所: `distinct.cpp:11-23`
-- 提案: insert 時課金、超過で sort-based unique へフォールバック(executor_todo の SortDistinct と接続)。
+- 提案: insert 時課金、超過で sort-based unique へフォールバック(todo.md の SortDistinct と接続)。
 
 ### [低] Window の SUM(int) が uint64 ラップ・分割は O(n²)
 - 場所: `detail/window_eval.cpp:393-401,489-499`
@@ -525,12 +524,11 @@ query+server の各層を並行レビューし、発見した改善点を重要�
 ## 既知の設計バックログとの関係
 
 本レビューで指摘した「スピル予算の統一プロトコル」(§5)、「Window の正式化」(§5 低)、
-「SortDistinct フォールバック」(§5 低)は [`executor_todo.md`](executor_todo.md) の項目と
-接続する。一方で:
+「SortDistinct フォールバック」(§5 低)は [`todo.md`](todo.md) の項目と接続する。一方で:
 
 - Abort マーカ問題(§1)、destroy redo 未実装(§1)、LSM リカバリ不在(§2)、
   USING/集合演算(§6)はバックログ未記載の**新規発見**であり、優先度判断が必要。
-- [`optimizer_todo.md`](optimizer_todo.md) のコストモデル改善には §4 の選択率二重計上が
+- [`todo.md`](todo.md) のコストモデル改善には §4 の選択率二重計上が
   前提知識として有用。
 
 推奨着手順: (1) §2-1 デッドロックのような即修正可能なもの → (2) differential_test を緑に戻し

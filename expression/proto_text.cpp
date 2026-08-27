@@ -8,7 +8,10 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -564,10 +567,8 @@ bool ParseProtoTextEntries(std::string_view body,
   while (true) {
     SkipWsAndComments(body, &i);
     // Allow ',' / ';' separators between entries.
-    bool saw_sep = false;
     while (i < body.size() && (body[i] == ',' || body[i] == ';')) {
       ++i;
-      saw_sep = true;
       SkipWsAndComments(body, &i);
     }
     if (i >= body.size()) {
@@ -1558,6 +1559,10 @@ WireFieldMaps() {
           // test_enum surfaces as field 50.  proto3 keeps unknown members.
           {"googlesql_test.proto3kitchensink",
            {{50, {"test_enum", false}}}},
+          // KitchenSinkPB's double_val is a protobuf fixed64 field.  Keeping
+          // this small wire map lets CAST(bytes AS KitchenSinkPB).double_val
+          // participate in NaN/INF comparisons instead of becoming NULL.
+          {"googlesql_test.kitchensinkpb", {{9, {"double_val", false}}}},
       });
   return *kMap;
 }
@@ -1602,14 +1607,39 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
     }
     const int field_number = static_cast<int>(tag >> 3);
     const int wire_type = static_cast<int>(tag & 0x7);
+    const auto field_it = fields.find(field_number);
+    if (wire_type == 1) {
+      if (i + 8 > bytes.size()) {
+        return std::nullopt;
+      }
+      uint64_t bits = 0;
+      for (int byte = 0; byte < 8; ++byte) {
+        bits |= static_cast<uint64_t>(static_cast<unsigned char>(bytes[i++]))
+                << (byte * 8);
+      }
+      if (field_it != fields.end() &&
+          std::string_view(field_it->second.name) == "double_val") {
+        double value = 0.0;
+        std::memcpy(&value, &bits, sizeof(value));
+        std::string token;
+        if (std::isnan(value)) {
+          token = "nan";
+        } else if (std::isinf(value)) {
+          token = value < 0 ? "-inf" : "inf";
+        } else {
+          token = std::to_string(value);
+        }
+        entries.emplace_back(field_it->second.name, std::move(token));
+      }
+      continue;
+    }
     if (wire_type != 0) {
-      return std::nullopt;  // only varint fields are modelled
+      return std::nullopt;
     }
     uint64_t value = 0;
     if (!ReadBase128(bytes, &i, &value)) {
       return std::nullopt;
     }
-    const auto field_it = fields.find(field_number);
     if (field_it == fields.end()) {
       entries.emplace_back(std::to_string(field_number),
                            std::to_string(static_cast<int64_t>(value)));

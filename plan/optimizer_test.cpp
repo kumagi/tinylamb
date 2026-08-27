@@ -1187,10 +1187,12 @@ TEST_F(OptimizerTest, MergeJoinRuleUsesChildrenThatAlreadyProvideKeyOrder) {
   Plan right_scan = std::make_shared<FullScanPlan>(*right_table, *right_stats);
   Plan left_sorted = std::make_shared<SortPlan>(
       left_scan,
-      std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc1", "c1")), true}});
+      std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc1", "c1")), true,
+                            std::nullopt}});
   Plan right_sorted = std::make_shared<SortPlan>(
       right_scan,
-      std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc2", "d1")), true}});
+      std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc2", "d1")), true,
+                            std::nullopt}});
 
   cascades::Memo memo;
   const cascades::GroupId root = memo.Build({"Sc1", "Sc2"});

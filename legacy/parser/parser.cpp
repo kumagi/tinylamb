@@ -247,7 +247,7 @@ std::unique_ptr<Statement> Parser::ParseSelect() {  // NOLINT(misc-no-recursion)
           (Peek().value == "ASC" || Peek().value == "DESC")) {
         ascending = Advance().value == "ASC";
       }
-      order_by.push_back({std::move(expression), ascending});
+      order_by.push_back({std::move(expression), ascending, std::nullopt});
       if (Peek().type != TokenType::kComma) {
         break;
       }

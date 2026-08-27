@@ -35,6 +35,13 @@ ValueType CommonSetValueType(ValueType left, ValueType right) {
   // numerics by coercing the numeric side to text.
   const bool left_text = left == ValueType::kVarChar;
   const bool right_text = right == ValueType::kVarChar;
+  // A typed DATE column followed by an untyped string literal keeps the
+  // typed side's domain. Converting DATE back to STRING loses date
+  // comparison semantics after CREATE TABLE AS SELECT.
+  if ((left == ValueType::kDate && right_text) ||
+      (right == ValueType::kDate && left_text)) {
+    return ValueType::kDate;
+  }
   if ((left_text &&
        (right == ValueType::kInt64 || right == ValueType::kDouble ||
         right == ValueType::kDate)) ||
@@ -46,6 +53,28 @@ ValueType CommonSetValueType(ValueType left, ValueType right) {
 }
 
 }  // namespace
+
+bool SetOperationRowEqual::operator()(const Row& left,
+                                      const Row& right) const {
+  if (left.values_.size() != right.values_.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < left.values_.size(); ++i) {
+    const Value& a = left.values_[i];
+    const Value& b = right.values_[i];
+    if (a.type != b.type) {
+      return false;
+    }
+    if (a.type == ValueType::kDouble || a.type == ValueType::kArray) {
+      if (CompareForOrderBy(a, b) != 0) {
+        return false;
+      }
+    } else if (!(a == b)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 void SetOperationExecutor::MaterializeRows(
     std::vector<std::vector<Positioned>> rows) {
@@ -87,6 +116,11 @@ void SetOperationExecutor::MaterializeRows(
             value = Value(static_cast<double>(value.value.int_value));
             continue;
           }
+          if (common_types[column] == ValueType::kDate &&
+              value.type == ValueType::kVarChar) {
+            value = Value::Date(value.value.varchar_value);
+            continue;
+          }
           if (common_types[column] == ValueType::kVarChar) {
             value = Value(value.AsString());
             continue;
@@ -106,7 +140,7 @@ void SetOperationExecutor::MaterializeRows(
       }
       break;
     case SetOperationKind::kUnion: {
-      std::unordered_set<Row> seen;
+      SetOperationRowSet seen;
       for (const auto& source : rows) {
         AppendDistinct(source, &seen);
       }
@@ -159,6 +193,11 @@ void SetOperationExecutor::MaterializePartitioned() {
             value = Value(static_cast<double>(value.value.int_value));
             continue;
           }
+          if (expected == ValueType::kDate &&
+              value.type == ValueType::kVarChar) {
+            value = Value::Date(value.value.varchar_value);
+            continue;
+          }
           if (expected == ValueType::kVarChar) {
             value = Value(value.AsString());
             continue;
@@ -204,7 +243,7 @@ void SetOperationExecutor::AppendAll(const std::vector<Positioned>& source) {
 }
 
 void SetOperationExecutor::AppendDistinct(const std::vector<Positioned>& source,
-                                          std::unordered_set<Row>* seen) {
+                                          SetOperationRowSet* seen) {
   for (const Positioned& item : source) {
     if (seen->insert(item.row).second) {
       output_.push_back(item);
@@ -217,12 +256,12 @@ void SetOperationExecutor::AppendIntersection(
   if (rows.empty()) {
     return;
   }
-  std::unordered_map<Row, size_t> counts;
+    SetOperationRowMap counts;
   for (const Positioned& item : rows[0]) {
     ++counts[item.row];
   }
   for (size_t source = 1; source < rows.size(); ++source) {
-    std::unordered_map<Row, size_t> current;
+    SetOperationRowMap current;
     for (const Positioned& item : rows[source]) {
       ++current[item.row];
     }
@@ -236,7 +275,7 @@ void SetOperationExecutor::AppendIntersection(
       }
     }
   }
-  std::unordered_set<Row> emitted;
+  SetOperationRowSet emitted;
   for (const Positioned& item : rows[0]) {
     const auto found = counts.find(item.row);
     if (found == counts.end() || found->second == 0) {
@@ -257,18 +296,28 @@ void SetOperationExecutor::AppendExcept(
   if (rows.empty()) {
     return;
   }
-  std::unordered_map<Row, size_t> removed;
+  SetOperationRowMap removed;
   for (size_t source = 1; source < rows.size(); ++source) {
     for (const Positioned& item : rows[source]) {
       ++removed[item.row];
     }
   }
-  std::unordered_set<Row> emitted;
+  SetOperationRowSet emitted;
   for (const Positioned& item : rows[0]) {
     const auto found = removed.find(item.row);
     if (found != removed.end() && found->second != 0) {
-      if (--found->second == 0) {
-        removed.erase(found);
+      // EXCEPT DISTINCT removes the value as a set, regardless of how many
+      // copies occur on the left. EXCEPT ALL consumes one right-hand copy per
+      // left-hand occurrence.
+      if (all) {
+        if (--found->second == 0) {
+          removed.erase(found);
+        }
+      } else {
+        // Keep the key present for the remainder of the left input.  EXCEPT
+        // DISTINCT removes every left-hand copy once the key occurs on the
+        // right, whereas erasing it here would let later duplicates leak
+        // back into the result.
       }
       continue;
     }

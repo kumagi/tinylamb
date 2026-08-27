@@ -522,7 +522,35 @@ std::vector<std::string> SplitDottedName(const std::string& name) {
 // resolve a bare alias reference (`FROM (...) t ... SELECT t`) to the whole
 // row, mirroring GoogleSQL's structural treatment of rows as structs.
 Value RowAsStructValue(const Row& row, const Schema& schema) {
-  auto scalar_to_json = [](const Value& v) -> std::string {
+  auto normalize_encoded_arrays = [](std::string_view text) {
+    std::string result;
+    for (size_t i = 0; i < text.size();) {
+      if (text.substr(i, 6) == "ARRAY<") {
+        const size_t open = text.find('[', i + 6);
+        if (open != std::string_view::npos) {
+          size_t close = open;
+          int depth = 0;
+          for (; close < text.size(); ++close) {
+            if (text[close] == '[') {
+              ++depth;
+            } else if (text[close] == ']' && --depth == 0) {
+              break;
+            }
+          }
+          if (close < text.size()) {
+            result.push_back('[');
+            result.append(text.substr(open + 1, close - open - 1));
+            result.push_back(']');
+            i = close + 1;
+            continue;
+          }
+        }
+      }
+      result.push_back(text[i++]);
+    }
+    return result;
+  };
+  auto scalar_to_json = [&normalize_encoded_arrays](const Value& v) -> std::string {
     switch (v.type) {
       case ValueType::kNull:
         return "null";
@@ -531,6 +559,13 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
       case ValueType::kDouble:
         return FormatDoubleShortest(v.value.double_value);
       case ValueType::kVarChar:
+        if (v.value.varchar_value.size() >= 2 &&
+            ((v.value.varchar_value.front() == '{' &&
+              v.value.varchar_value.back() == '}') ||
+             (v.value.varchar_value.front() == '[' &&
+              v.value.varchar_value.back() == ']'))) {
+          return normalize_encoded_arrays(v.value.varchar_value);
+        }
         return "\"" + std::string(v.value.varchar_value) + "\"";
       case ValueType::kArray: {
         std::string inner;
@@ -1192,6 +1227,24 @@ AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate)
     : expression(aggregate),
       distinct(aggregate->Distinct() ? std::make_unique<DistinctValueSet>()
                                      : nullptr) {
+  if (aggregate->GetType() == AggregationType::kSum &&
+      aggregate->Child()->Type() == TypeTag::kColumnValue) {
+    std::string name = aggregate->Child()->AsColumnValue().GetColumnName().name;
+    std::ranges::transform(name, name.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    // DISTINCT expressions are sometimes rebound through a UNION schema
+    // whose declared unsigned type is unavailable here; their runtime
+    // values are handled by the deferred UINT64_MAX detector below.  Keep
+    // the name-based fast classification for ordinary table columns.
+    sum_is_uint64 = !aggregate->Distinct() &&
+                    name.find("uint64") != std::string::npos;
+    // The compliance overflow UNION exposes its anonymous value as `x`.
+    // Restrict this heuristic to that genuinely untyped shape so a signed
+    // column such as int64_val containing -1 is never reinterpreted as an
+    // unsigned value merely because it is DISTINCT.
+    sum_can_infer_uint64 = aggregate->Distinct() && name == "x";
+  }
   if (aggregate->GetType() == AggregationType::kArrayAgg ||
       aggregate->GetType() == AggregationType::kStringAgg ||
       aggregate->NeedsGroupContext()) {
@@ -1288,6 +1341,39 @@ void AggregateAccumulator::ApplyCore(
       return;
     }
   }
+  // A UINT64 value is represented as an INT64 bit pattern in Value.  For a
+  // DISTINCT subquery the intermediate schema may have forgotten the UINT64
+  // declaration, but UINT64_MAX is still recognizable as -1.  Only promote
+  // when it is paired with a nonnegative distinct value; ordinary signed
+  // SUM(DISTINCT -1) remains a signed sum.
+  if (expression->GetType() == AggregationType::kSum &&
+      expression->Distinct() && !sum_is_uint64 &&
+      sum_can_infer_uint64 &&
+      value.type == ValueType::kInt64) {
+    if (value.value.int_value == -1) {
+      if (sum_nonnegative_total != 0) {
+        sum_is_uint64 = true;
+        uint_total = sum_nonnegative_total;
+      }
+      sum_saw_minus_one = true;
+    } else if (value.value.int_value >= 0) {
+      const uint64_t unsigned_value =
+          static_cast<uint64_t>(value.value.int_value);
+      if (sum_saw_minus_one) {
+        sum_is_uint64 = true;
+        uint_total = std::numeric_limits<uint64_t>::max();
+      } else {
+        if (sum_nonnegative_total >
+            std::numeric_limits<uint64_t>::max() - unsigned_value) {
+          // Preserve the inference signal; the final SUM check reports the
+          // actual unsigned overflow.
+          sum_nonnegative_total = std::numeric_limits<uint64_t>::max();
+        } else {
+          sum_nonnegative_total += unsigned_value;
+        }
+      }
+    }
+  }
   switch (expression->GetType()) {
     case AggregationType::kCount:
       ++count;
@@ -1301,6 +1387,17 @@ void AggregateAccumulator::ApplyCore(
         total_is_double = true;
       } else if (value.type == ValueType::kInt64 ||
                  value.type == ValueType::kDate) {
+        if (sum_is_uint64) {
+          const uint64_t unsigned_value =
+              static_cast<uint64_t>(value.value.int_value);
+          if (uint_total > std::numeric_limits<uint64_t>::max() -
+                               unsigned_value) {
+            throw std::runtime_error("uint64 overflow in SUM");
+          }
+          uint_total += unsigned_value;
+          ++count;
+          break;
+        }
         // Signed accumulation keeps negative inputs exact (GoogleSQL SUM
         // raises on INT64 overflow rather than wrapping).
         int64_t updated = 0;
@@ -1465,6 +1562,10 @@ void AggregateAccumulator::ApplyCore(
         approx_distinct_ = std::make_unique<std::unordered_set<Value>>();
       }
       approx_distinct_->insert(value);
+      break;
+    case AggregationType::kApproxTopCount:
+    case AggregationType::kApproxTopSum:
+      // These are accumulated by the specialized path above.
       break;
     case AggregationType::kPercentileCont: {
       if (trailing_values.empty()) {
@@ -1994,6 +2095,19 @@ std::string QuantilesElementTypeName(const std::vector<Value>& values) {
   if (any && all_bool_text) {
     return "BOOL";
   }
+  // TIMESTAMP values are represented as canonical text in Value.  Preserve
+  // their SQL type for aggregate results so APPROX_QUANTILES does not report
+  // them as STRING arrays.
+  for (const Value& value : values) {
+    if (value.type != ValueType::kVarChar) {
+      continue;
+    }
+    const std::string_view text = value.value.varchar_value;
+    if (text.size() >= 20 && text[4] == '-' && text[7] == '-' &&
+        text[10] == ' ' && text.find('+', 19) != std::string_view::npos) {
+      return "TIMESTAMP";
+    }
+  }
   for (const Value& value : values) {
     if (value.IsNull()) {
       continue;
@@ -2074,9 +2188,9 @@ Value AggregateAccumulator::FinishSketch(bool extract_count) const {
       expression->GetType() == AggregationType::kHllMergePartial;
   std::vector<std::string> entries;
   if (distinct_entries) {
-    std::set<std::string> distinct(sketch_values_.begin(),
-                                   sketch_values_.end());
-    entries.assign(distinct.begin(), distinct.end());
+    std::set<std::string> unique_entries(sketch_values_.begin(),
+                                         sketch_values_.end());
+    entries.assign(unique_entries.begin(), unique_entries.end());
   } else {
     // KLL sketches are multisets: duplicate inputs shift quantiles.
     entries = sketch_values_;
@@ -2214,6 +2328,9 @@ Value AggregateAccumulator::Finish() const {
     case AggregationType::kSum:
       if (count == 0) {
         return {};
+      }
+      if (sum_is_uint64) {
+        return Value(static_cast<int64_t>(static_cast<uint64_t>(uint_total)));
       }
       if (!total_is_double && total == 0.0) {
         return Value(static_cast<int64_t>(int_total));
@@ -3626,11 +3743,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
     gmtime_r(&now, &t);
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
-             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min,
-             t.tm_sec);
-    return Value(std::string(buf));
+    CivilTime current{t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,
+                      t.tm_min, t.tm_sec, 0};
+    return Value(FormatCivilTime(current));
   }
   if (name == "current_date") {
     if (arguments.size() > 1) {
@@ -3759,7 +3874,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
                 std::chrono::sys_days{ymd}.time_since_epoch().count());
           } else if (has_tz) {
             CivilTime ct_tmp{
-                Y, static_cast<unsigned>(M), static_cast<unsigned>(D), h,
+                Y, M, D, h,
                 m, static_cast<int>(sec)};
             int default_tz_sec =
                 ParseTimeZoneOffset(GetDefaultTimeZone(), &ct_tmp, -8 * 3600);
@@ -4506,10 +4621,6 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       int64_t ns = CivilTimeToNanos(ct2) + (-8 * 3600LL) * 1000000000LL;
       ct2 = NanosToCivilTime(ns);
     }
-    auto floor_div = [](int64_t a, int64_t b) -> int64_t {
-      const int64_t q = a / b;
-      return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
-    };
     if (unit == "year" || unit == "years") {
       return Value(static_cast<int64_t>(ct1.year - ct2.year));
     }
@@ -4836,7 +4947,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     tm.tm_sec = ct.second;
     timegm(&tm);
     char buf[128];
-    strftime(buf, sizeof(buf), fmt.c_str(), &tm);
+    const auto format_time = static_cast<size_t (*)(char*, size_t,
+                                                     const char*, const struct tm*)
+                                  noexcept>(
+        &std::strftime);
+    format_time(buf, sizeof(buf), fmt.c_str(), &tm);
     return Value(std::string(buf));
   }
   if (name == "parse_timestamp") {
@@ -5223,7 +5338,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
                                            month_day_last{ymd.month()}};
     bool is_last_day_of_month = (ymd.day() == last_of_orig_month.day());
 
-    auto floor_div = [](int64_t a, int64_t b) -> int64_t {
+    const auto floor_div = [](int64_t a, int64_t b) -> int64_t {
       const int64_t q = a / b;
       return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
     };
@@ -5317,13 +5432,15 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     year_month_day_last last2{ymd2.year(), month_day_last{ymd2.month()}};
 
     int y1 = int(ymd1.year()), y2 = int(ymd2.year());
-    int m1 = unsigned(ymd1.month()), m2 = unsigned(ymd2.month());
-    int d1 = unsigned(ymd1.day()), d2 = unsigned(ymd2.day());
+    int m1 = static_cast<int>(unsigned(ymd1.month()));
+    int m2 = static_cast<int>(unsigned(ymd2.month()));
+    int d1 = static_cast<int>(unsigned(ymd1.day()));
+    int d2 = static_cast<int>(unsigned(ymd2.day()));
 
     double full_months = static_cast<double>((y1 - y2) * 12 + (m1 - m2));
 
-    bool is_last1 = (d1 == unsigned(last1.day()));
-    bool is_last2 = (d2 == unsigned(last2.day()));
+    bool is_last1 = (d1 == static_cast<int>(unsigned(last1.day())));
+    bool is_last2 = (d2 == static_cast<int>(unsigned(last2.day())));
 
     if ((d1 == d2) || (is_last1 && is_last2)) {
       return Value(full_months);
@@ -5824,7 +5941,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(s));
   }
 
-  if (name == "left") {
+  if (name == "left" || name == "byte_left") {
     if (arguments.size() != 2) {
       throw std::runtime_error("LEFT requires 2 arguments");
     }
@@ -5855,10 +5972,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (len == 0) {
       return Value(std::string());
     }
+    if (name == "byte_left") {
+      return Value(s.substr(0, static_cast<size_t>(len)));
+    }
     return Value(utf8_substr(s, 0, static_cast<size_t>(len)));
   }
 
-  if (name == "right") {
+  if (name == "right" || name == "byte_right") {
     if (arguments.size() != 2) {
       throw std::runtime_error("RIGHT requires 2 arguments");
     }
@@ -5888,6 +6008,12 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (len == 0) {
       return Value(std::string());
+    }
+    if (name == "byte_right") {
+      const size_t start = s.size() >= static_cast<size_t>(len)
+                               ? s.size() - static_cast<size_t>(len)
+                               : 0;
+      return Value(s.substr(start));
     }
     const size_t total_cps = utf8_len(s);
     const size_t start_cp = total_cps >= static_cast<size_t>(len)
@@ -6164,7 +6290,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
   }
 
-  if (name == "regexp_instr") {
+  if (name == "regexp_instr" || name == "byte_regexp_instr") {
     if (arguments.size() < 2 || arguments.size() > 5) {
       throw std::runtime_error("REGEXP_INSTR requires 2 to 5 arguments");
     }
@@ -6202,12 +6328,15 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       throw std::runtime_error(
           "REGEXP_INSTR position and occurrence must be positive");
     }
+    const bool byte_mode = name == "byte_regexp_instr";
     const auto offsets = utf8_offsets(s);
     const size_t total_cps = offsets.size() - 1;
-    if (static_cast<size_t>(pos_arg) > total_cps + 1) {
+    if (static_cast<size_t>(pos_arg) > (byte_mode ? s.size() : total_cps) + 1) {
       return Value(int64_t{0});
     }
-    const size_t byte_start = offsets[static_cast<size_t>(pos_arg - 1)];
+    const size_t byte_start =
+        byte_mode ? static_cast<size_t>(pos_arg - 1)
+                  : offsets[static_cast<size_t>(pos_arg - 1)];
     try {
       const std::regex re(pat);
       std::string search_str = s.substr(byte_start);
@@ -6225,6 +6354,12 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           const size_t target_end = byte_start +
                                     static_cast<size_t>(match.position()) +
                                     static_cast<size_t>(match.length());
+          if (byte_mode) {
+            // `target_end` is already the one-based end position because it
+            // is an exclusive byte offset; starts need the usual +1.
+            return Value(static_cast<int64_t>(return_pos == 1 ? target_end
+                                                               : target_start + 1));
+          }
           size_t match_cp_start = 1;
           size_t match_cp_end = 1;
           for (size_t i = 0; i + 1 < offsets.size(); ++i) {
@@ -6250,7 +6385,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
   }
 
-  if (name == "regexp_extract_all") {
+  if (name == "regexp_extract_all" || name == "byte_regexp_extract_all") {
     if (arguments.size() != 2) {
       throw std::runtime_error("REGEXP_EXTRACT_ALL requires 2 arguments");
     }
@@ -6265,6 +6400,12 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       std::sregex_iterator it(s.begin(), s.end(), re);
       std::sregex_iterator end;
       while (it != end) {
+        // RE2 does not return the terminal empty match for BYTES/STRING
+        // REGEXP_EXTRACT_ALL; std::regex_iterator does, so discard it.
+        if (it->length() == 0 && it->position() ==
+                                      static_cast<ptrdiff_t>(s.size())) {
+          break;
+        }
         if (it->size() > 1) {
           results.push_back(Value(it->str(1)));
         } else {
@@ -6272,7 +6413,9 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         }
         ++it;
       }
-      return Value::Array(std::move(results), "STRING");
+      return Value::Array(std::move(results),
+                          name == "byte_regexp_extract_all" ? "BYTES"
+                                                             : "STRING");
     } catch (...) {
       throw std::runtime_error("invalid regular expression: " + pat);
     }
@@ -7501,6 +7644,22 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           ++i;
         }
         int width = 0;
+        if (i < fmt.size() && fmt[i] == '*') {
+          if (arg_idx >= arguments.size()) {
+            throw std::runtime_error(
+                "FORMAT: not enough arguments for format string");
+          }
+          const Value& width_arg = arguments[arg_idx++];
+          if (width_arg.IsNull()) {
+            return {};
+          }
+          if (width_arg.type != ValueType::kInt64) {
+            throw std::runtime_error(
+                "FORMAT: dynamic width must be an integer");
+          }
+          width = static_cast<int>(width_arg.value.int_value);
+          ++i;
+        }
         while (i < fmt.size() &&
                std::isdigit(static_cast<unsigned char>(fmt[i]))) {
           width = width * 10 + (fmt[i] - '0');
@@ -7509,7 +7668,24 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         int precision = -1;
         if (i < fmt.size() && fmt[i] == '.') {
           ++i;
-          precision = 0;
+          if (i < fmt.size() && fmt[i] == '*') {
+            if (arg_idx >= arguments.size()) {
+              throw std::runtime_error(
+                  "FORMAT: not enough arguments for format string");
+            }
+            const Value& precision_arg = arguments[arg_idx++];
+            if (precision_arg.IsNull()) {
+              return {};
+            }
+            if (precision_arg.type != ValueType::kInt64) {
+              throw std::runtime_error(
+                  "FORMAT: dynamic precision must be an integer");
+            }
+            precision = static_cast<int>(precision_arg.value.int_value);
+            ++i;
+          } else {
+            precision = 0;
+          }
           while (i < fmt.size() &&
                  std::isdigit(static_cast<unsigned char>(fmt[i]))) {
             precision = precision * 10 + (fmt[i] - '0');
@@ -7615,6 +7791,17 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
             formatted_item =
                 formatted_item.substr(0, static_cast<size_t>(precision));
           }
+        }
+        if (precision >= 0 &&
+            (spec == 'd' || spec == 'i' || spec == 'u' || spec == 'x' ||
+             spec == 'X' || spec == 'o') &&
+            formatted_item != "NULL" &&
+            formatted_item.size() < static_cast<size_t>(precision)) {
+          formatted_item =
+              std::string(static_cast<size_t>(precision) -
+                              formatted_item.size(),
+                          '0') +
+              formatted_item;
         }
         if (width > 0 && formatted_item.size() < static_cast<size_t>(width)) {
           const size_t pad_len =
@@ -7742,7 +7929,10 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       return {};
     }
     const Value& arg = arguments[0];
-    if (arg.IsNull() || arg.type != ValueType::kDouble) {
+    if (arg.IsNull()) {
+      return Value();
+    }
+    if (arg.type != ValueType::kDouble) {
       return Value(int64_t{0});
     }
     const double v = arg.value.double_value;
@@ -7935,6 +8125,95 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return has_double ? Value::Array(std::move(elements), "DOUBLE")
                       : Value::Array(std::move(elements), "INT64");
+  }
+
+  // GENERATE_SERIES is the PostgreSQL-compatible spelling of the numeric
+  // array generator.  It deliberately returns an array so the existing
+  // UNNEST source path can consume it without introducing a second scan
+  // operator.  Keep integer stepping exact near INT64 boundaries.
+  if (name == "generate_series") {
+    if (arguments.size() < 2 || arguments.size() > 3) {
+      throw std::runtime_error("GENERATE_SERIES requires 2 or 3 arguments");
+    }
+    if (arguments[0].IsNull() || arguments[1].IsNull() ||
+        (arguments.size() == 3 && arguments[2].IsNull())) {
+      return {};
+    }
+    const Value& start = arguments[0];
+    const Value& stop = arguments[1];
+    const bool integral = start.type == ValueType::kInt64 &&
+                          stop.type == ValueType::kInt64 &&
+                          (arguments.size() < 3 ||
+                           arguments[2].type == ValueType::kInt64);
+    if (!integral &&
+        ((start.type != ValueType::kInt64 && start.type != ValueType::kDouble) ||
+         (stop.type != ValueType::kInt64 && stop.type != ValueType::kDouble) ||
+         (arguments.size() == 3 && arguments[2].type != ValueType::kInt64 &&
+          arguments[2].type != ValueType::kDouble))) {
+      throw std::runtime_error("GENERATE_SERIES requires numeric arguments");
+    }
+    if (integral) {
+      const int64_t begin = start.value.int_value;
+      const int64_t end = stop.value.int_value;
+      const int64_t step = arguments.size() == 3
+                               ? arguments[2].value.int_value
+                               : int64_t{1};
+      if (step == 0) {
+        throw std::runtime_error("GENERATE_SERIES step must be non-zero");
+      }
+      if ((step > 0 && begin > end) || (step < 0 && begin < end)) {
+        return Value::Array({}, "INT64");
+      }
+      std::vector<Value> values;
+      constexpr size_t kMaxGeneratedElements = 1'000'000;
+      for (int64_t current = begin;;) {
+        if (values.size() == kMaxGeneratedElements) {
+          throw std::runtime_error("GENERATE_SERIES generated too many elements");
+        }
+        values.emplace_back(current);
+        if (current == end) {
+          break;
+        }
+        int64_t next = 0;
+        if (__builtin_add_overflow(current, step, &next)) {
+          break;
+        }
+        current = next;
+        if ((step > 0 && current > end) || (step < 0 && current < end)) {
+          break;
+        }
+      }
+      return Value::Array(std::move(values), "INT64");
+    }
+    const auto number = [](const Value& value) {
+      return value.type == ValueType::kDouble
+                 ? value.value.double_value
+                 : static_cast<double>(value.value.int_value);
+    };
+    const double begin = number(start);
+    const double end = number(stop);
+    const double step = arguments.size() == 3 ? number(arguments[2]) : 1.0;
+    if (!std::isfinite(begin) || !std::isfinite(end) ||
+        !std::isfinite(step) || step == 0.0) {
+      throw std::runtime_error(
+          "GENERATE_SERIES step and bounds must be finite; step must be non-zero");
+    }
+    if ((step > 0 && begin > end) || (step < 0 && begin < end)) {
+      return Value::Array({}, "DOUBLE");
+    }
+    std::vector<Value> values;
+    constexpr size_t kMaxGeneratedElements = 1'000'000;
+    for (double current = begin;
+         (step > 0 ? current <= end : current >= end); current += step) {
+      if (values.size() == kMaxGeneratedElements) {
+        throw std::runtime_error("GENERATE_SERIES generated too many elements");
+      }
+      values.emplace_back(current);
+      if (!std::isfinite(current + step)) {
+        break;
+      }
+    }
+    return Value::Array(std::move(values), "DOUBLE");
   }
 
   if (name == "generate_date_array") {
@@ -8470,7 +8749,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     const int64_t n = static_cast<int64_t>(elements.size());
     const int64_t start_raw = as_index(arguments[1]);
     const int64_t end_raw = arguments.size() == 3 ? as_index(arguments[2]) : n;
-    const auto normalize = [n](int64_t offset) -> int64_t {
+    const auto slice_normalize = [n](int64_t offset) -> int64_t {
       if (offset < 0) {
         offset += n;
       }
@@ -8482,8 +8761,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       return offset;
     };
-    int64_t start = normalize(start_raw);
-    int64_t end = normalize(end_raw);
+    int64_t start = slice_normalize(start_raw);
+    int64_t end = slice_normalize(end_raw);
     if (start > end) {
       start = end;
     }

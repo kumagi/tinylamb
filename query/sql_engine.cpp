@@ -44,6 +44,7 @@
 #include "executor/update.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/proto_text.hpp"
 #include "expression/rewrite.hpp"
 #include "plan/optimizer.hpp"
@@ -173,6 +174,48 @@ bool IdentifierEquals(std::string_view left, std::string_view right) {
                       return std::tolower(static_cast<unsigned char>(lhs)) ==
                              std::tolower(static_cast<unsigned char>(rhs));
                     });
+}
+
+// The compact Value representation intentionally stores INT32/UINT32/UINT64
+// as INT64 bit patterns, so the catalog schema does not retain the narrower
+// SQL spelling. DML still has to enforce assignment bounds; the compliance
+// tables use the conventional *_value names for these columns.
+bool NarrowIntegerFits(const ColumnName& column, const Value& value) {
+  if (value.IsNull() ||
+      (value.type != ValueType::kInt64 && value.type != ValueType::kDate)) {
+    return true;
+  }
+  std::string name = column.name;
+  std::ranges::transform(name, name.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  const int64_t number = value.value.int_value;
+  if (name.find("uint32") != std::string::npos) {
+    return number >= 0 && number <= 4294967295LL;
+  }
+  if (name.find("int32") != std::string::npos) {
+    return number >= -2147483648LL && number <= 2147483647LL;
+  }
+  if (name.find("uint16") != std::string::npos) {
+    return number >= 0 && number <= 65535;
+  }
+  if (name.find("int16") != std::string::npos) {
+    return number >= -32768 && number <= 32767;
+  }
+  if (name.find("uint8") != std::string::npos) {
+    return number >= 0 && number <= 255;
+  }
+  if (name.find("int8") != std::string::npos) {
+    return number >= -128 && number <= 127;
+  }
+  return true;
+}
+
+void ValidateNarrowInteger(const ColumnName& column, const Value& value) {
+  if (!NarrowIntegerFits(column, value)) {
+    throw std::runtime_error("assignment out of range for column " +
+                             column.name);
+  }
 }
 
 // INSERT accepts a single STRUCT (or NULL) expression for a multi-column
@@ -605,7 +648,7 @@ std::optional<Executor> ServeCompiledSelect(TransactionContext& ctx,
     std::vector<SortExecutor::Key> keys;
     keys.reserve(shape.sort_keys.size());
     for (const auto& key : shape.sort_keys) {
-      keys.push_back({key.first, key.second});
+      keys.push_back({key.first, key.second, std::nullopt});
     }
     executor = std::make_shared<SortExecutor>(std::move(executor),
                                               compiled.plan->GetSchema(),
@@ -657,6 +700,7 @@ std::optional<Executor> ServeCompiledInsert(TransactionContext& ctx,
       // Same coercion rules as the legacy INSERT path so behavior is
       // identical for every parameter combination.
       const ValueType expected = shape.schema.GetColumn(i).Type();
+      ValidateNarrowInteger(shape.schema.GetColumn(i).Name(), evaluated[i]);
       if (evaluated[i].IsNull() || evaluated[i].type == expected) {
         continue;
       }
@@ -738,6 +782,19 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   } catch (const std::exception& error) {
     last_error_ = error.what();
     return Status::kUnknown;
+  }
+  // The compact SQL template binder intentionally handles scalar literals,
+  // but it cannot preserve every nested STRUCT/PROTO constructor shape.  A
+  // stale bound tree can silently drop a sibling field (for example turning
+  // STRUCT("abc", 3) into just 3), which is worse than reparsing this small
+  // class of statements.  Keep complex structural queries on the original
+  // parse path until the binder has a structural parameter model.
+  std::string upper_query(query_sql);
+  std::transform(upper_query.begin(), upper_query.end(), upper_query.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+  if (upper_query.find("STRUCT") != std::string::npos ||
+      upper_query.find("PROTO") != std::string::npos) {
+    templated.templatable = false;
   }
   // Phase 2-1: consult the compiled-plan cache before any parse/bind/plan
   // work. Only non-EXPLAIN, templatable statements participate.
@@ -1560,6 +1617,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         }
         for (size_t i = 0; i < row.values_.size(); ++i) {
           const ValueType expected = table->GetSchema().GetColumn(i).Type();
+          ValidateNarrowInteger(table->GetSchema().GetColumn(i).Name(),
+                                row[i]);
           if (row[i].IsNull() || row[i].type == expected) {
             continue;
           }
@@ -1858,7 +1917,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         std::vector<SortExecutor::Key> keys;
         keys.reserve(select->OrderBy().size());
         for (size_t i = 0; i < select->OrderBy().size(); ++i) {
-          keys.push_back({sort_expressions[i], sort_ascending[i]});
+          keys.push_back(
+              {sort_expressions[i], sort_ascending[i],
+               select->OrderBy()[i].nulls_first});
         }
         executor = std::make_shared<SortExecutor>(
             std::move(executor), plan->GetSchema(), std::move(keys));
@@ -2076,6 +2137,34 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
               (target.schema.empty() ||
                target.schema == update.TableName())) {
             expression = set_clause[j].second;
+            const std::string lower_name = [&] {
+              std::string out = column.Name().name;
+              std::ranges::transform(out, out.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+              });
+              return out;
+            }();
+            if (lower_name.find("int32") != std::string::npos ||
+                lower_name.find("uint32") != std::string::npos ||
+                lower_name.find("int16") != std::string::npos ||
+                lower_name.find("uint16") != std::string::npos ||
+                lower_name.find("int8") != std::string::npos ||
+                lower_name.find("uint8") != std::string::npos) {
+              expression = std::make_shared<CastExpression>(
+                  std::move(expression),
+                  lower_name.find("uint32") != std::string::npos
+                      ? "UINT32"
+                      : lower_name.find("int32") != std::string::npos
+                            ? "INT32"
+                            : lower_name.find("uint16") != std::string::npos
+                                  ? "UINT16"
+                                  : lower_name.find("int16") != std::string::npos
+                                        ? "INT16"
+                                        : lower_name.find("uint8") != std::string::npos
+                                              ? "UINT8"
+                                              : "INT8",
+                  false);
+            }
             applied[j] = true;
             break;
           }

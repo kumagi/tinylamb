@@ -12,9 +12,22 @@
 #include "common/set_operation.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/spill_file.hpp"
+#include "type/row.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+// Set operations use SQL equality rather than Value::operator==.  In
+// particular, all NaN values belong to one DISTINCT/GROUP key, while the
+// ordinary Value equality intentionally keeps IEEE NaN semantics.
+struct SetOperationRowEqual {
+  bool operator()(const Row& left, const Row& right) const;
+};
+
+using SetOperationRowSet =
+    std::unordered_set<Row, std::hash<Row>, SetOperationRowEqual>;
+using SetOperationRowMap =
+    std::unordered_map<Row, size_t, std::hash<Row>, SetOperationRowEqual>;
 
 class SetOperationExecutor : public ExecutorBase {
  public:
@@ -34,7 +47,7 @@ class SetOperationExecutor : public ExecutorBase {
   void Materialize();
   void AppendAll(const std::vector<Positioned>& source);
   void AppendDistinct(const std::vector<Positioned>& source,
-                      std::unordered_set<Row>* seen);
+                      SetOperationRowSet* seen);
   void AppendIntersection(const std::vector<std::vector<Positioned>>& rows,
                           bool all);
   void AppendExcept(const std::vector<std::vector<Positioned>>& rows,

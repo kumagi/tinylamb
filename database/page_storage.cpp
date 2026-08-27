@@ -96,6 +96,20 @@ PageStorage::PageStorage(std::string_view dbname, size_t wal_sync_ms)
     }
   }
   rm_.RecoverFrom(checkpoint, &tm_);
+  // Periodic checkpointing keeps the WAL bounded: without it fdatasync cost
+  // scales with the file's dirty page cache footprint, which on a long TPC-C
+  // run makes every commit barrier approach 1 ms regardless of group size.
+  // Honor TINYLAMB_CHECKPOINT_SECONDS for tests (0 disables); the default 10 s
+  // balances checkpoint overhead with WAL growth on OLTP workloads.
+  const char* ckpt_env = std::getenv("TINYLAMB_CHECKPOINT_SECONDS");
+  if (ckpt_env == nullptr || ckpt_env[0] == '\0') {
+    cm_.Start();
+  } else {
+    const unsigned long long seconds = std::strtoull(ckpt_env, nullptr, 10);
+    if (seconds > 0) {
+      cm_.Start();
+    }
+  }
 }
 
 void PageStorage::DiscardAllUpdates() { pm_.GetPool()->DropAllPages(); }

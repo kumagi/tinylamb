@@ -417,7 +417,7 @@ std::shared_ptr<SelectStatement> BindSelect(  // NOLINT(misc-no-recursion) // Re
   order.reserve(select.OrderBy().size());
   for (const auto& term : select.OrderBy()) {
     order.push_back({BindExpression(term.expression, parameters, index),
-                     term.ascending});
+                     term.ascending, term.nulls_first});
   }
 
   auto result = std::make_shared<SelectStatement>(
@@ -434,8 +434,22 @@ std::shared_ptr<SelectStatement> BindSelect(  // NOLINT(misc-no-recursion) // Re
   // UNION ALL branches appear after the main SELECT in SQL text, so bind
   // them last (after every main-select parameter) in branch order. Dropping
   // them silently shrank re-bound statements to their first branch.
-  for (const auto& branch : select.UnionAll()) {
-    result->AddUnionAll(BindSelect(*branch, parameters, index));
+  for (size_t branch_index = 0; branch_index < select.UnionAll().size();
+       ++branch_index) {
+    const SetOperationKind kind =
+        branch_index < select.SetOperationKinds().size()
+            ? select.SetOperationKinds()[branch_index]
+            : SetOperationKind::kUnionAll;
+    const SetOperationMatch match =
+        branch_index < select.Matches().size() ? select.Matches()[branch_index]
+                                               : SetOperationMatch{};
+    result->AddSetOperation(kind,
+                            BindSelect(*select.UnionAll()[branch_index],
+                                       parameters, index),
+                            match);
+  }
+  if (select.UnionDistinct()) {
+    result->MarkUnionDistinct(select.UnionByName());
   }
   for (auto& [name, query] : withs) {
     result->AddWithQuery(name, std::move(query));

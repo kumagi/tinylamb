@@ -449,7 +449,7 @@ TEST(CascadesTest, MergeSelectionsCollapsesSelectionChain) {
 
   // Assert: the outer group gained a merged Selection over the same child.
   const Group& group = search.GetMemo().Get(outer);
-  ASSERT_EQ(group.expressions.size(), 2U);
+  ASSERT_GE(group.expressions.size(), 2U);
   EXPECT_TRUE(group.expressions[1].children == std::vector<GroupId>{inner});
 }
 

@@ -9,6 +9,7 @@
 #include <exception>
 #include <fstream>
 #include <ios>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -77,14 +78,23 @@ void AppendMemComparableValue(const Value& v, std::string* out) {
     }
     case ValueType::kDouble: {
       out->push_back(static_cast<char>(ValueType::kDouble));
+      double d = v.value.double_value;
+      // GoogleSQL treats every NaN as equal (they collapse under DISTINCT and
+      // group together in ORDER BY) and folds -0.0 into +0.0.  Canonicalize
+      // before the IEEE total-order transform so distinct NaN payloads and
+      // signed zeros encode identically and sort to the same position.
+      if (std::isnan(d)) {
+        d = std::numeric_limits<double>::quiet_NaN();
+      } else if (d == 0.0) {
+        d = 0.0;
+      }
       uint64_t bits = 0;
-      std::memcpy(&bits, &v.value.double_value, sizeof(bits));
+      std::memcpy(&bits, &d, sizeof(bits));
       uint64_t be = BSwap64(bits);
       // IEEE total-order transform. NaN fails every comparison, so classify
       // by the sign bit directly; NaN keys then land above +inf, matching
       // GoogleSQL ORDER BY.
-      const bool negative =
-          !std::isnan(v.value.double_value) && (bits >> 63) != 0;
+      const bool negative = (bits >> 63) != 0;
       if (!negative) {
         be |= 0x80;
       } else {

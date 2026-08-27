@@ -81,6 +81,40 @@ class TransactionManager {
   void SetMetricsEnabled(bool enabled) {
     metrics_enabled_.store(enabled, std::memory_order_relaxed);
   }
+  // Deadlock prevention/detection policy for write-intent acquisition.
+  //   kWaitDie       -- an older transaction may wait for a younger holder;
+  //                     a younger transaction aborts itself instead of waiting.
+  //                     This is conservative (no victim is rolled back while
+  //                     making progress), so the wait queue is FIFO by id.
+  //   kWoundWait     -- a younger transaction is preempted: the older
+  //                     arriving transaction aborts its younger holder and
+  //                     takes the lock. Starves younger long transactions
+  //                     when many older transactions pile on, which fits
+  //                     short TPC-C critical sections.
+  //   kDeadlockDetect -- permit unrestricted waiting; a background thread
+  //                     walks a global wait-for graph and aborts the youngest
+  //                     participant in any cycle. Best when cycles are rare
+  //                     and lock-hold time is hard to bound.
+  //   kLegacy        -- the pre-policy behavior: wait up to a short timeout,
+  //                     then abort self. No deadlock prevention, no detection.
+  enum class DeadlockPolicy : uint8_t {
+    kLegacy = 0,
+    kWaitDie = 1,
+    kWoundWait = 2,
+    kDeadlockDetect = 3,
+  };
+  void SetDeadlockPolicy(DeadlockPolicy policy) {
+    deadlock_policy_.store(static_cast<uint8_t>(policy),
+                            std::memory_order_release);
+    if (policy == DeadlockPolicy::kDeadlockDetect &&
+        !deadlock_detector_.joinable()) {
+      deadlock_detector_ = std::thread([this] { DeadlockDetectorLoop(); });
+    }
+  }
+  [[nodiscard]] DeadlockPolicy GetDeadlockPolicy() const {
+    return static_cast<DeadlockPolicy>(
+        deadlock_policy_.load(std::memory_order_acquire));
+  }
   [[nodiscard]] TransactionRuntimeStats RuntimeStats() const;
 
   void Abort(Transaction& txn);
@@ -251,6 +285,47 @@ class TransactionManager {
   std::mutex gc_mutex_;
   std::condition_variable gc_cv_;
   std::thread gc_worker_;
+
+  // ---- deadlock policy & wait-for graph ----
+  std::atomic<uint8_t> deadlock_policy_{
+      static_cast<uint8_t>(DeadlockPolicy::kLegacy)};
+  // Active deadlock detector thread (kDeadlockDetect only).
+  std::atomic<bool> deadlock_detector_stop_{false};
+  std::thread deadlock_detector_;
+  // Wait-for graph for kDeadlockDetect: maps (waiting_txn -> holder_txn) per
+  // row. A cycle in this graph is a deadlock. Maintained under a single
+  // global mutex because deadlock detection is a rare event, not a hot path.
+  mutable std::mutex wait_for_mu_;
+  // Each entry: waiter_id -> (RowPosition, holder_id). When a waiter is
+  // granted, its entry is removed; when a holder commits/aborts, every entry
+  // whose holder_id matches is dropped.
+  struct WaitForEdge {
+    RowPosition row;
+    txn_id_t holder;
+  };
+  std::unordered_map<txn_id_t, WaitForEdge> wait_for_edges_;
+  // Background detector body: scans wait_for_edges_ for cycles and aborts the
+  // youngest participant in each cycle.
+  void DeadlockDetectorLoop();
+  // Signal the detector to wake immediately (used by AddWaitForEdge and
+  // when a transaction becomes unblocked, so an aborted victim releases
+  // waiters quickly).
+  std::mutex deadlock_detector_mu_;
+  std::condition_variable deadlock_detector_cv_;
+  // Records (waiting_txn, holder_txn, row) into the wait-for graph. Called
+  // under the version shard's mutex by AcquireWriteIntent. No-op for
+  // policies that handle ordering without a graph.
+  void AddWaitForEdge(txn_id_t waiter, txn_id_t holder, RowPosition row);
+  // Removes a waiter's edge when the lock is granted, the waiter times out,
+  // or the waiter is aborted.
+  void RemoveWaitForEdge(txn_id_t waiter);
+  // Removes every edge whose holder matches (used on commit/abort so the
+  // graph cannot keep dead references to terminated transactions).
+  void RemoveWaitForEdgesOf(txn_id_t holder);
+  // Out-of-band victim selection: returns true when a waiter's strict wait
+  // should actually be "die" (Wait-Die) or "wound" (Wound-Wait). The
+  // policies are encoded here so the call site stays a one-liner.
+  bool ShouldAbortOnWait(txn_id_t waiter, txn_id_t holder) const;
 };
 
 }  // namespace tinylamb

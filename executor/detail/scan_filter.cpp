@@ -34,6 +34,7 @@
 #include "table/iterator.hpp"
 #include "table/table.hpp"
 #include "type/column_name.hpp"
+#include "type/date.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
@@ -64,6 +65,33 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
   const Value& value = row[pred.column];
   if (value.IsNull() || pred.constant.IsNull()) {
     return false;
+  }
+
+  // The scan fast path must use the same coercions as the full expression
+  // evaluator.  In particular, DATE/TIMESTAMP columns commonly receive bare
+  // string literals from an IN list; rejecting the type mismatch here would
+  // silently filter the matching row before the residual evaluator sees it.
+  if (value.type == ValueType::kDate &&
+      pred.constant.type == ValueType::kVarChar) {
+    try {
+      const int64_t rhs = ParseDateDays(pred.constant.value.varchar_value);
+      const int64_t lhs = value.value.int_value;
+      switch (pred.op) {
+        case BinaryOperation::kEquals: return lhs == rhs;
+        case BinaryOperation::kNotEquals: return lhs != rhs;
+        case BinaryOperation::kLessThan: return lhs < rhs;
+        case BinaryOperation::kLessThanEquals: return lhs <= rhs;
+        case BinaryOperation::kGreaterThan: return lhs > rhs;
+        case BinaryOperation::kGreaterThanEquals: return lhs >= rhs;
+        default: break;
+      }
+    } catch (...) {
+      return false;
+    }
+  }
+  if (value.type == ValueType::kVarChar &&
+      pred.constant.type == ValueType::kVarChar) {
+    return Binary(pred.op, value, pred.constant).Truthy();
   }
 
   if (pred.int_payload &&
@@ -600,18 +628,18 @@ Relation UnnestValueToRelation(const SelectSource& source,
           const size_t member_index = parsed_rows[row_idx].values.size();
           const std::string& declared_type =
               declared_fields[member_index].second;
-          std::string text(parsed.value.varchar_value);
+          std::string declared_text(parsed.value.varchar_value);
           if ((declared_type == "DATE" || declared_type == "date")) {
             int y = 0, m = 0, d = 0;
-            if (sscanf(text.c_str(), "%d-%d-%d", &y, &m, &d) == 3) {
-              parsed = Value::Date(text);
+            if (sscanf(declared_text.c_str(), "%d-%d-%d", &y, &m, &d) == 3) {
+              parsed = Value::Date(declared_text);
             }
           } else if (declared_type == "TIMESTAMP" ||
                      declared_type == "timestamp" ||
                      declared_type == "DATETIME") {
             int y = 0, mo = 0, d = 0;
-            if (sscanf(text.c_str(), "%d-%d-%d", &y, &mo, &d) == 3) {
-              parsed = Value(std::move(text));  // keep canonical text form
+            if (sscanf(declared_text.c_str(), "%d-%d-%d", &y, &mo, &d) == 3) {
+              parsed = Value(std::move(declared_text));  // keep canonical text form
             }
           }
         }

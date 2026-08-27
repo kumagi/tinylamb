@@ -54,10 +54,114 @@ TransactionManager::~TransactionManager() {
   if (gc_worker_.joinable()) {
     gc_worker_.join();
   }
+  // Stop the deadlock detector if it was ever started.
+  deadlock_detector_stop_.store(true, std::memory_order_release);
+  deadlock_detector_cv_.notify_all();
+  if (deadlock_detector_.joinable()) {
+    deadlock_detector_.join();
+  }
 }
 
 void TransactionManager::StartGcWorker() {
   gc_worker_ = std::thread([this] { GcWorkerLoop(); });
+}
+
+void TransactionManager::AddWaitForEdge(txn_id_t waiter, txn_id_t holder,
+                                        RowPosition row) {
+  std::scoped_lock lk(wait_for_mu_);
+  wait_for_edges_[waiter] = WaitForEdge{row, holder};
+}
+
+void TransactionManager::RemoveWaitForEdge(txn_id_t waiter) {
+  std::scoped_lock lk(wait_for_mu_);
+  wait_for_edges_.erase(waiter);
+}
+
+void TransactionManager::RemoveWaitForEdgesOf(txn_id_t holder) {
+  // Two ways a holder can disappear from the wait-for graph: it was the
+  // waiter of someone else (clean up on grant), or it was the holder of
+  // someone else's edge (clean up here when the holder commits/aborts).
+  std::scoped_lock lk(wait_for_mu_);
+  for (auto it = wait_for_edges_.begin(); it != wait_for_edges_.end();) {
+    if (it->second.holder == holder || it->first == holder) {
+      it = wait_for_edges_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void TransactionManager::DeadlockDetectorLoop() {
+  // Polling interval balances detection latency against wasted work when
+  // the graph is empty. The cv-based wake path notifies us on every new
+  // edge, so the worst-case delay is one interval.
+  constexpr auto kPollInterval = std::chrono::milliseconds(2);
+  while (!deadlock_detector_stop_.load(std::memory_order_acquire)) {
+    std::unique_lock<std::mutex> lk(deadlock_detector_mu_);
+    deadlock_detector_cv_.wait_for(lk, kPollInterval, [this] {
+      return deadlock_detector_stop_.load(std::memory_order_acquire) ||
+             !wait_for_edges_.empty();
+    });
+    lk.unlock();
+    if (deadlock_detector_stop_.load(std::memory_order_acquire)) { break; }
+    // Snapshot the current edges under the mutex, then analyze without it.
+    std::vector<std::pair<txn_id_t, txn_id_t>> edges;
+    {
+      std::scoped_lock g(wait_for_mu_);
+      edges.reserve(wait_for_edges_.size());
+      for (const auto& [w, e] : wait_for_edges_) {
+        edges.emplace_back(w, e.holder);
+      }
+    }
+    if (edges.empty()) continue;
+    // Build adjacency: holder -> [waiters]. We want to find a cycle in
+    // wait_for_edges_ and wound the youngest participant in it. Iterate
+    // each waiter as a possible cycle root, follow holder chains, and
+    // record any visit to a previously-seen node.
+    std::unordered_map<txn_id_t, std::vector<txn_id_t>> adj;
+    for (const auto& [w, h] : edges) {
+      adj[h].push_back(w);
+    }
+    // For every waiter, walk the chain forward (waiter -> its holder -> that
+    // holder's waiters' holders -> ...). When a holder equals the original
+    // waiter, we have a cycle. Wound the maximum-id (youngest) participant.
+    std::unordered_set<txn_id_t> already_wounded;
+    for (const auto& [start, _] : edges) {
+      std::unordered_set<txn_id_t> visited;
+      txn_id_t cur = start;
+      bool found_cycle = false;
+      std::vector<txn_id_t> path;
+      for (int safety = 0; safety < 64; ++safety) {
+        if (visited.insert(cur).second == false) {
+          // Found a cycle. Truncate path back to the first visit.
+          auto dup = std::find(path.begin(), path.end(), cur);
+          if (dup != path.end()) {
+            path.erase(path.begin(), dup);
+            found_cycle = true;
+          }
+          break;
+        }
+        path.push_back(cur);
+        // cur is waiting for someone. That someone's holder chain continues
+        // through the inverse adjacency.
+        auto it = std::find_if(edges.begin(), edges.end(),
+                               [cur](const std::pair<txn_id_t, txn_id_t>& e) {
+                                 return e.first == cur;
+                               });
+        if (it == edges.end()) break;  // cur is not waiting; no follow-on.
+        cur = it->second;
+      }
+      if (!found_cycle) continue;
+      txn_id_t victim = *std::max_element(path.begin(), path.end());
+      if (already_wounded.insert(victim).second) {
+        std::scoped_lock registry_lock(transaction_table_lock);
+        auto found = active_transactions_.find(victim);
+        if (found != active_transactions_.end() && found->second != nullptr) {
+          found->second->Wound();
+        }
+      }
+    }
+  }
 }
 
 void TransactionManager::GcWorkerLoop() {
@@ -107,6 +211,13 @@ Transaction TransactionManager::Begin(bool read_only) {
 
 Status TransactionManager::PreCommit(Transaction& txn) {
   assert(!txn.IsFinished());
+  // Drop every wait-for edge in which this transaction is the holder: the
+  // pending intent is about to be released and any later waiter must not see
+  // a stale holder reference. We do this before the WAL barrier so the
+  // detector cannot try to wound us mid-commit.
+  if (!txn.IsReadOnly()) {
+    RemoveWaitForEdgesOf(txn.ID());
+  }
   if (!txn.IsReadOnly()) { CommitVersions(txn);
 }
   txn.SetStatus(TransactionStatus::kCommitted);
@@ -138,6 +249,7 @@ Status TransactionManager::PreCommit(Transaction& txn) {
       // impossible.  Still leave no half-finished state behind: drop the
       // registry slot so the transaction cannot remain active forever, and
       // report it as aborted, never committed.
+      RemoveWaitForEdgesOf(txn.ID());
       ForgetTransaction(txn);
       txn.SetStatus(TransactionStatus::kAborted);
       throw;
@@ -150,9 +262,14 @@ Status TransactionManager::PreCommit(Transaction& txn) {
 void TransactionManager::Abort(Transaction& txn) {
   if (txn.IsReadOnly()) {
     txn.SetStatus(TransactionStatus::kAborted);
+    RemoveWaitForEdgesOf(txn.ID());
     ForgetTransaction(txn);
     return;
   }
+  // Drop our hold on every wait-for edge before undoing: any later wait
+  // waking up to find no holder should not see this transaction as a
+  // possible victim candidate.
+  RemoveWaitForEdgesOf(txn.ID());
   // Wait on the logger's durability condition variable instead of polling:
   // the worker wakes every waiter once records are fsynced, and a dead
   // logger (Failed()) also releases the wait.  A failure falls through to
@@ -204,6 +321,7 @@ bool TransactionManager::AcquireWriteIntent(Transaction& txn,
   const bool measure = metrics_enabled_.load(std::memory_order_relaxed);
   const auto wait_start = measure ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
+  const DeadlockPolicy policy = GetDeadlockPolicy();
   std::unique_lock lock(shard.mutex);
   if (measure) {
     write_intent_attempts_.fetch_add(1, std::memory_order_relaxed);
@@ -214,18 +332,141 @@ bool TransactionManager::AcquireWriteIntent(Transaction& txn,
                 .count()),
         std::memory_order_relaxed);
   }
-  auto available = [&] {
+  // An already-wounded transaction never makes progress: a deadlock detector
+  // (or a Wound-Wait preemption) has marked it for abort. Return false so
+  // AddWriteSet fails and the executor unwinds the transaction. Doing this
+  // before touching the chain is essential: holding the intent while
+  // wounded would block an arbitrary later commit.
+  if (txn.IsWounded()) {
+    return false;
+  }
+  auto available_for_self = [&] {
     const auto found = shard.versions.find(rp);
     return found == shard.versions.end() || !found->second.pending ||
            found->second.pending->owner == txn.ID();
   };
-  if (!available() && (!wait ||
-      !shard.write_intent_released.wait_for(lock, std::chrono::milliseconds(1),
-                                            available))) {
-    if (measure) {
-      write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed);
+  auto holder_id = [&]() -> txn_id_t {
+    const auto found = shard.versions.find(rp);
+    if (found == shard.versions.end() || !found->second.pending) return 0;
+    return found->second.pending->owner;
+  };
+  // Try-lock path: caller (TryAddWriteSet) does not want to wait, regardless
+  // of the policy. The current pending owner is enough information to make
+  // the decision.
+  if (!wait) {
+    if (available_for_self()) {
+      VersionChain& chain = shard.versions[rp];
+      if (chain.pending) { return chain.pending->owner == txn.ID(); }
+      chain.pending = PendingVersion{.owner=txn.ID(), .value=std::nullopt,
+                                     .staged=false};
+      if (txn.write_set_.empty()) {
+        pending_txn_count_.fetch_add(1, std::memory_order_relaxed);
+      }
+      return true;
     }
+    if (measure) { write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed); }
     return false;
+  }
+  // Wait path: apply the configured deadlock policy.
+  switch (policy) {
+    case DeadlockPolicy::kLegacy: {
+      // Pre-policy behavior: wait up to 5ms, then give up. Used for
+      // benchmarks that do not want victim selection to influence results.
+      auto available = [&] {
+        const auto found = shard.versions.find(rp);
+        return found == shard.versions.end() || !found->second.pending ||
+               found->second.pending->owner == txn.ID() || txn.IsWounded();
+      };
+      if (!available() &&
+          !shard.write_intent_released.wait_for(
+              lock, std::chrono::milliseconds(5), available)) {
+        if (measure) { write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed); }
+        return false;
+      }
+      if (txn.IsWounded()) { return false; }
+      break;
+    }
+    case DeadlockPolicy::kWaitDie: {
+      // If the holder is younger than us, the policy says we must die.  We
+      // never wound a younger holder; we just refuse to wait and let the
+      // caller abort us. This bounds wait-queue length to a single older
+      // waiter per row and is deadlock-free by construction.
+      const txn_id_t current_holder = holder_id();
+      if (current_holder != 0 && current_holder != txn.ID() &&
+          txn.ID() > current_holder) {
+        if (measure) { write_intent_conflicts_.fetch_add(1, std::memory_order_relaxed); }
+        return false;
+      }
+      auto available = [&] {
+        if (txn.IsWounded()) return true;
+        const auto found = shard.versions.find(rp);
+        if (found == shard.versions.end() || !found->second.pending) return true;
+        if (found->second.pending->owner == txn.ID()) return true;
+        return false;  // Only let the wait continue while the holder is older
+                       // (already checked) or gone. Re-check on each wake.
+      };
+      shard.write_intent_released.wait(lock, available);
+      if (txn.IsWounded()) { return false; }
+      break;
+    }
+    case DeadlockPolicy::kWoundWait: {
+      // Older arriving transaction preempts a younger holder. We mark the
+      // younger holder as wounded; the holder's next AcquireWriteIntent will
+      // observe the wound and the executor will unwind. This is the classic
+      // preemptive scheme and is well-suited to short TPC-C critical
+      // sections where the wounded transaction has barely started.
+      const txn_id_t current_holder = holder_id();
+      if (current_holder != 0 && current_holder != txn.ID() &&
+          txn.ID() < current_holder) {
+        // Find the holder's Transaction* and wound it. The active registry
+        // is the only place that holds the live pointer.
+        std::scoped_lock registry_lock(transaction_table_lock);
+        auto found = active_transactions_.find(current_holder);
+        if (found != active_transactions_.end() &&
+            found->second != nullptr) {
+          found->second->Wound();
+        }
+        // Nudge every shard waiter that might be holding an exclusive wait
+        // on this transaction's wake-up chain. The shard waiters are not
+        // aware of cross-shard wounds, so we just rely on each shard's CV
+        // firing on IsWounded; the holder will release its intent shortly.
+        shard.write_intent_released.notify_all();
+      }
+      auto available = [&] {
+        if (txn.IsWounded()) return true;
+        const auto found = shard.versions.find(rp);
+        if (found == shard.versions.end() || !found->second.pending) return true;
+        if (found->second.pending->owner == txn.ID()) return true;
+        return false;
+      };
+      shard.write_intent_released.wait(lock, available);
+      if (txn.IsWounded()) { return false; }
+      break;
+    }
+    case DeadlockPolicy::kDeadlockDetect: {
+      // Permit unrestricted waiting.  Register a wait-for edge so the
+      // background detector can break any cycle it finds. The detector
+      // either wounds this transaction (Wound()) or removes the edge when
+      // the holder moves on.
+      const txn_id_t current_holder = holder_id();
+      if (current_holder != 0 && current_holder != txn.ID()) {
+        AddWaitForEdge(txn.ID(), current_holder, rp);
+        // Wake the detector: a new edge may have created a cycle.
+        deadlock_detector_cv_.notify_all();
+      }
+      auto available = [&] {
+        if (txn.IsWounded()) return true;
+        const auto found = shard.versions.find(rp);
+        if (found == shard.versions.end() || !found->second.pending) return true;
+        if (found->second.pending->owner == txn.ID()) return true;
+        return false;
+      };
+      shard.write_intent_released.wait(lock, available);
+      // Whether we got the lock or were wounded, our wait-for edge is moot.
+      RemoveWaitForEdge(txn.ID());
+      if (txn.IsWounded()) { return false; }
+      break;
+    }
   }
   VersionChain& chain = shard.versions[rp];
   if (chain.pending) { return chain.pending->owner == txn.ID(); }
@@ -310,6 +551,7 @@ void TransactionManager::RegisterVersionWrite(
     Transaction& txn, const RowPosition& rp,
     std::optional<std::string_view> before,
     std::optional<std::string_view> after) {
+  (void)txn;
   std::optional<std::string> before_copy =
       before ? std::optional<std::string>(std::string(*before)) : std::nullopt;
   std::optional<std::string> after_copy =

@@ -18,6 +18,9 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <ctime>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string_view>
@@ -192,6 +195,128 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
   }
   if (left.IsNull() || right.IsNull()) { return {};
 }
+  // IN lists are typed by the left-hand expression in GoogleSQL.  The AST
+  // represents a bare DATE literal as STRING, so coerce it when it is
+  // compared with a DATE column value.
+  if (IsComparisonOp(op)) {
+    auto as_date = [](const Value& value) -> std::optional<int64_t> {
+      if (value.type == ValueType::kDate) {
+        return value.value.int_value;
+      }
+      if (value.type != ValueType::kVarChar) {
+        return std::nullopt;
+      }
+      const std::string text(value.value.varchar_value);
+      if (text.size() != 10 || text[4] != '-' || text[7] != '-') {
+        return std::nullopt;
+      }
+      try {
+        return ParseDateDays(text);
+      } catch (...) {
+        return std::nullopt;
+      }
+    };
+    if ((left.type == ValueType::kDate || right.type == ValueType::kDate) &&
+        (left.type == ValueType::kDate || right.type == ValueType::kDate)) {
+      const auto lhs = as_date(left);
+      const auto rhs = as_date(right);
+      if (lhs && rhs) {
+        const int64_t a = *lhs;
+        const int64_t b = *rhs;
+        switch (op) {
+          case BinaryOperation::kEquals: return Value(a == b);
+          case BinaryOperation::kNotEquals: return Value(a != b);
+          case BinaryOperation::kLessThan: return Value(a < b);
+          case BinaryOperation::kLessThanEquals: return Value(a <= b);
+          case BinaryOperation::kGreaterThan: return Value(a > b);
+          case BinaryOperation::kGreaterThanEquals: return Value(a >= b);
+          default: break;
+        }
+      }
+    }
+    auto timestamp_seconds = [](std::string_view text) -> std::optional<time_t> {
+      if (text.size() < 19 || text[4] != '-' || text[7] != '-' ||
+          (text[10] != ' ' && text[10] != 'T')) {
+        return std::nullopt;
+      }
+      int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+      if (sscanf(std::string(text.substr(0, 19)).c_str(),
+                 "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute,
+                 &second) != 6) {
+        return std::nullopt;
+      }
+      std::tm tm{};
+      tm.tm_year = year - 1900;
+      tm.tm_mon = month - 1;
+      tm.tm_mday = day;
+      tm.tm_hour = hour;
+      tm.tm_min = minute;
+      tm.tm_sec = second;
+      time_t epoch = timegm(&tm);
+      const size_t zone = text.find_first_of("+-Zz", 19);
+      if (zone == std::string_view::npos) {
+        // The repository's default session zone is UTC-8 (the same default
+        // used by CAST(TIMESTAMP)), hence local wall time is eight hours
+        // ahead when represented in UTC.
+        epoch += 8 * 60 * 60;
+      }
+      return epoch;
+    };
+    if (left.type == ValueType::kVarChar &&
+        right.type == ValueType::kVarChar) {
+      const std::string_view lhs(left.value.varchar_value);
+      const std::string_view rhs(right.value.varchar_value);
+      const auto looks_like_timestamp = [](std::string_view text) {
+        return text.size() >= 19 && text[4] == '-' && text[7] == '-' &&
+               (text[10] == ' ' || text[10] == 'T') && text[13] == ':' &&
+               text[16] == ':';
+      };
+      const bool lhs_timestamp = looks_like_timestamp(lhs);
+      const bool rhs_timestamp = looks_like_timestamp(rhs);
+      if (lhs_timestamp && rhs_timestamp) {
+        const auto a = timestamp_seconds(lhs);
+        const auto b = timestamp_seconds(rhs);
+        if (a && b) {
+          // A timestamp-typed value is rendered in UTC, while a bare string
+          // in a comparison is parsed in the default UTC-8 session zone.
+          // Keep the civil-time fallback for values crossing a set-operation
+          // boundary where the type tag is carried by the +00 suffix.
+          const auto has_zone = [](std::string_view text) {
+            return text.find_first_of("+-Zz", 19) != std::string_view::npos;
+          };
+          const auto fractional_digits = [](std::string_view text) {
+            const size_t dot = text.find('.', 19);
+            if (dot == std::string_view::npos) {
+              return std::string_view{};
+            }
+            size_t end = dot + 1;
+            while (end < text.size() &&
+                   std::isdigit(static_cast<unsigned char>(text[end])) != 0) {
+              ++end;
+            }
+            return text.substr(dot + 1, end - dot - 1);
+          };
+          const std::string_view lhs_fraction = fractional_digits(lhs);
+          const std::string_view rhs_fraction = fractional_digits(rhs);
+          const bool fractional_equal = lhs_fraction == rhs_fraction;
+          const bool equivalent_default_zone =
+              (has_zone(lhs) != has_zone(rhs)) &&
+              std::llabs(*a - *b) == 8 * 60 * 60;
+          const bool equal = (*a == *b && fractional_equal) ||
+                             equivalent_default_zone;
+          switch (op) {
+            case BinaryOperation::kEquals: return Value(equal);
+            case BinaryOperation::kNotEquals: return Value(!equal);
+            case BinaryOperation::kLessThan: return Value(*a < *b);
+            case BinaryOperation::kLessThanEquals: return Value(*a <= *b);
+            case BinaryOperation::kGreaterThan: return Value(*a > *b);
+            case BinaryOperation::kGreaterThanEquals: return Value(*a >= *b);
+            default: break;
+          }
+        }
+      }
+    }
+  }
   // Bit shifts operate on the two's-complement representation with logical
   // (unsigned) semantics, matching GoogleSQL: shift amounts >= 64 yield 0 and
   // negative amounts raise OUT_OF_RANGE.
@@ -256,9 +381,11 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     if (rhs == 0.0) {
       throw std::runtime_error("division by zero");
     }
-    // FLOAT64 division follows IEEE-754: overflow yields ±infinity, never
-    // an error (the reference engine only rejects division by zero).
-    return Value(lhs / rhs);
+    const double result = lhs / rhs;
+    if (std::isfinite(lhs) && std::isfinite(rhs) && std::isinf(result)) {
+      throw std::runtime_error("double overflow");
+    }
+    return Value(result);
   }
   if (numeric && left.type != right.type) {
     const double lhs = left.type == ValueType::kDouble
@@ -391,8 +518,13 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         if (right.value.double_value == 0.0) {
           throw std::runtime_error("division by zero");
         }
-        // IEEE-754: overflow yields ±infinity, never an error.
-        return Value(left.value.double_value / right.value.double_value);
+        const double result =
+            left.value.double_value / right.value.double_value;
+        if (std::isfinite(left.value.double_value) &&
+            std::isfinite(right.value.double_value) && std::isinf(result)) {
+          throw std::runtime_error("double overflow");
+        }
+        return Value(result);
       }
       return left / right;
     }
@@ -432,6 +564,8 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     case BinaryOperation::kXor:
     case BinaryOperation::kLike:
     case BinaryOperation::kNotLike:
+    case BinaryOperation::kShiftLeft:
+    case BinaryOperation::kShiftRight:
       // Already handled above; kept for -Wswitch completeness.
       break;
   }

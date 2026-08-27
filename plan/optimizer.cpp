@@ -17,12 +17,14 @@
 #include "plan/optimizer.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -738,15 +740,29 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   // Required-column computation (Phase 3): every touched column is needed on
   // each root-to-leaf path of a conjunctive query, so the per-relation
   // projection lists follow directly from the global touched set.
+  const auto same_identifier = [](std::string_view left,
+                                  std::string_view right) {
+    if (left.size() != right.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < left.size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(left[i])) !=
+          std::tolower(static_cast<unsigned char>(right[i]))) {
+        return false;
+      }
+    }
+    return true;
+  };
   for (const auto& [relation, table] : rule_context.tables) {
     const std::string physical_name{table->GetSchema().Name()};
     std::vector<NamedExpression> projection;
     for (size_t i = 0; i < table->GetSchema().ColumnCount(); ++i) {
       const ColumnName& table_column = table->GetSchema().GetColumn(i).Name();
       if (std::ranges::any_of(touched, [&](const ColumnName& column) {
-            return table_column.name == column.name &&
-                   (column.schema.empty() || column.schema == relation ||
-                    column.schema == physical_name);
+            return same_identifier(table_column.name, column.name) &&
+                   (column.schema.empty() ||
+                    same_identifier(column.schema, relation) ||
+                    same_identifier(column.schema, physical_name));
           })) {
         projection.emplace_back(table_column);
       }

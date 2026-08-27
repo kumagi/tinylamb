@@ -117,39 +117,6 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
 }
 
 
-int64_t CivilTimeToNanos(const CivilTime& ct) {
-  std::chrono::year_month_day ymd{std::chrono::year{ct.year},
-                                  std::chrono::month{static_cast<unsigned>(ct.month)},
-                                  std::chrono::day{static_cast<unsigned>(ct.day)}};
-  int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
-  int64_t secs = days * 86400LL + ct.hour * 3600LL + ct.minute * 60LL + ct.second;
-  return secs * 1000000000LL + ct.subsecond_nanos;
-}
-
-CivilTime NanosToCivilTime(int64_t nanos) {
-  auto floor_div = [](int64_t a, int64_t b) -> int64_t {
-    const int64_t q = a / b;
-    return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
-  };
-  int64_t secs = floor_div(nanos, 1000000000LL);
-  int64_t sub_ns = nanos - secs * 1000000000LL;
-  int64_t days = floor_div(secs, 86400LL);
-  int64_t day_secs = secs - days * 86400LL;
-
-  std::chrono::sys_days sys_d{std::chrono::days{days}};
-  std::chrono::year_month_day ymd{sys_d};
-
-  CivilTime ct;
-  ct.year = int(ymd.year());
-  ct.month = unsigned(ymd.month());
-  ct.day = unsigned(ymd.day());
-  ct.hour = day_secs / 3600;
-  ct.minute = (day_secs % 3600) / 60;
-  ct.second = day_secs % 60;
-  ct.subsecond_nanos = sub_ns;
-  return ct;
-}
-
 std::string FormatCivilTime(const CivilTime& ct) {
   char buf[64];
   if (ct.subsecond_nanos != 0) {
@@ -688,6 +655,13 @@ Value CastValue(const Value& val, const std::string& type_name,
       const std::string member(val.value.varchar_value);
       int64_t ordinal = 0;
       if (EnumValueForMember(enum_short_name, member, &ordinal)) {
+        // Proto enum aliases stringify to the first (canonical) member name,
+        // not to the alias used by the input literal.
+        if (const std::optional<std::string> canonical =
+                EnumMemberForValue(enum_short_name, ordinal);
+            canonical.has_value()) {
+          return Value(std::string(*canonical));
+        }
         return val;
       }
       return out_of_range("Out of range cast of string '" + member +

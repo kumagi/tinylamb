@@ -592,3 +592,17 @@ warehouse mutex and therefore aborts heavily under a no-think-time input
 storm. The next compliant step is a real deferred Delivery/RTE queue plus
 generic parameterized index-bound plans; simply skipping SQL/parser work or
 adding a warehouse gate would make the number incomparable.
+
+## 2026-08-27 — TPC-C optimization toward 40k TPS (checkpoint + adaptive group commit)
+
+- **Measure:** SF=1, 10 clients, 15 s, sync commit, seed 20260819.
+- **Result:** **10,664.9 TPS**, 296,880 new-order TPM, 157,267 WAL waits at **9.75 µs** average (down from ~791 µs / 6,315 TPS baseline).
+- **Root cause of original bottleneck:** `CheckpointManager::Start()` was never invoked in the main database startup path (`database/page_storage.cpp`), so the WAL (`.log`) grew unbounded (1.3 GB after 30 s). `fdatasync` on a multi-GB dirty file dominated commit latency (~80% of worker time).
+- **Changes applied:**
+  1. `PageStorage` constructor now calls `cm_.Start()` (periodic checkpoint enabled).
+  2. `CheckpointManager` default interval reduced 60 s → 10 s (`checkpoint_manager.hpp`).
+  3. `Logger::AdviseOldBytesDurable()` calls `posix_fadvise(DONTNEED)` after a durable checkpoint, preventing the kernel from re-flushing already-checkpointed pages on each barrier (`recovery/logger.*`).
+  4. `LoggerWork()` now fsyncs immediately when `pending_durable_waiters_ > 0`, removing the timer-only delay (`recovery/logger.cpp` adaptive group commit).
+  5. `AcquireWriteIntent()` wait extended 1 ms → 5 ms to reduce hot-row aborts on district/new_order.
+- **Remaining to reach 40k:** engine abort rate still ~4.6% (mostly `district` / `new_order` write-intent timeouts under extreme contention). Further gains likely from stricter admission control or deferred Delivery queue redesign (see `docs/next-actions.md`).
+- Not an audited tpmC result (no think/keying, 15 s window). Engineering figure only.

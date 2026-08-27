@@ -543,7 +543,14 @@ function(add_benchmark file_path)
     get_filename_component(target_name ${filename} NAME_WE)
     add_executable(${target_name} ${file_path})
     tinylamb_apply_options(${target_name})
-    set_property(TARGET ${target_name} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    # Keep IPO opt-in, just like the rest of the project.  An unconditional
+    # LTO compile makes this otherwise small benchmark consume several times
+    # the memory of a normal target and can make a complete build fail before
+    # any benchmark code is used.
+    if(TINYLAMB_ENABLE_LTO)
+        set_property(TARGET ${target_name} PROPERTY
+                     INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
     target_link_libraries(${target_name}
             PRIVATE
             tinylamb::core

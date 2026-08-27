@@ -27,7 +27,9 @@
 #include "executor/detail/scan_filter.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/detail/window_eval.hpp"
+#include "executor/constant_executor.hpp"
 #include "executor/query_memory.hpp"
+#include "executor/set_operation.hpp"
 #include "executor/spill_file.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -263,32 +265,33 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
                            ctes))) {
         continue;
       }
-      AggregateInput input;
-      input.value = Evaluate(aggregate.Child(), scope, nullptr, context, ctes);
+      AggregateInput aggregate_input;
+      aggregate_input.value =
+          Evaluate(aggregate.Child(), scope, nullptr, context, ctes);
       if (aggregate.Having() != AggregateHavingModifier::kNone &&
           aggregate.HavingCondition()) {
-        input.condition = Evaluate(aggregate.HavingCondition(), scope, nullptr,
-                                   context, ctes);
+        aggregate_input.condition =
+            Evaluate(aggregate.HavingCondition(), scope, nullptr, context, ctes);
       }
       for (const auto& term : aggregate.InnerOrderBy()) {
-        input.order_keys.push_back(
+        aggregate_input.order_keys.push_back(
             Evaluate(term.expression, scope, nullptr, context, ctes));
       }
       for (const Expression& extra : aggregate.ExtraArgs()) {
-        input.order_keys.push_back(
+        aggregate_input.order_keys.push_back(
             Evaluate(extra, scope, nullptr, context, ctes));
       }
       if (aggregate.SecondaryArg()) {
-        input.auxiliary =
+        aggregate_input.auxiliary =
             Evaluate(aggregate.SecondaryArg(), scope, nullptr, context, ctes);
       }
       for (const Expression& extra : aggregate.TrailingArgs()) {
         if (extra) {
-          input.trailing_values.push_back(
+          aggregate_input.trailing_values.push_back(
               Evaluate(extra, scope, nullptr, context, ctes));
         }
       }
-      accumulator.Add(std::move(input));
+      accumulator.Add(std::move(aggregate_input));
       if (context.execution_runtime() != nullptr) {
         ++context.execution_runtime()->aggregate_updates;
       }
@@ -609,15 +612,57 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
   return output;
 }
 
+namespace {
+
+// GoogleSQL DISTINCT treats every NaN as equal (they collapse to a single
+// group) and folds -0.0 into +0.0.  The default Value/Row equality returns
+// false for NaN != NaN, so DISTINCT needs this canonical-aware comparison
+// (mirroring CompareForOrderBy / CanonicalDistinctValue).
+bool CanonicalValuesEqual(const Value& x, const Value& y) {
+  if (x.type == ValueType::kDouble && y.type == ValueType::kDouble) {
+    return CompareForOrderBy(x, y) == 0;
+  }
+  return x == y;
+}
+
+struct CanonicalRowEqual {
+  bool operator()(const Row& a, const Row& b) const {
+    if (a.values_.size() != b.values_.size()) { return false; }
+    for (size_t i = 0; i < a.values_.size(); ++i) {
+      if (!CanonicalValuesEqual(a.values_[i], b.values_[i])) { return false; }
+    }
+    return true;
+  }
+};
+
+struct CanonicalRowHash {
+  size_t operator()(const Row& r) const {
+    size_t h = 1469598103934665603ULL;  // FNV-1a offset basis
+    for (const Value& value : r.values_) {
+      h ^= std::hash<Value>()(CanonicalDistinctValue(value));
+      h *= 1099511628211ULL;  // FNV-1a prime
+    }
+    return h;
+  }
+};
+
+}  // namespace
+
 Relation DistinctOf(Relation input) {
-  std::unordered_set<Row> seen;
+  std::unordered_set<Row, CanonicalRowHash, CanonicalRowEqual> seen;
   Relation distinct;
   distinct.schema = input.schema;
   CopyExecutionStats(&distinct, input);
   input.FinishSpill();
   input.ForEachRow([&](const Row& row) {
-    if (seen.insert(row).second) {
-      distinct.AddRow(row);
+    // Canonicalize the emitted row so a representative value is chosen
+    // consistently (NaN -> quiet NaN, -0.0 -> +0.0), matching GoogleSQL.
+    Row canonical = row;
+    for (Value& value : canonical.values_) {
+      value = CanonicalDistinctValue(value);
+    }
+    if (seen.insert(canonical).second) {
+      distinct.AddRow(std::move(canonical));
     }
   });
   distinct.FinishSpill();
@@ -745,6 +790,185 @@ Relation FinishQuery(TransactionContext& context,
 }
 Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     TransactionContext& context, const SelectStatement& statement,
+    const Scope* outer, const CteMap& inherited_ctes);
+
+bool ReferencesCte(const SelectStatement& statement, const std::string& name) {
+  for (const SelectSource& source : statement.Sources()) {
+    if (source.table == name) {
+      return true;
+    }
+    if (source.query && ReferencesCte(*source.query, name)) {
+      return true;
+    }
+  }
+  for (const auto& branch : statement.UnionAll()) {
+    if (branch && ReferencesCte(*branch, name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SameRow(const Row& left, const Row& right) {
+  if (left.values_.size() != right.values_.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < left.values_.size(); ++i) {
+    const Value& a = left.values_[i];
+    const Value& b = right.values_[i];
+    if (a.IsNull() || b.IsNull()) {
+      if (!a.IsNull() || !b.IsNull()) {
+        return false;
+      }
+      continue;
+    }
+    try {
+      if (!(a == b)) {
+        return false;
+      }
+    } catch (...) {
+      return false;
+    }
+  }
+  return true;
+}
+
+Relation ExecuteRecursiveCte(TransactionContext& context,
+                             const std::string& name,
+                             const SelectStatement& body, const Scope* outer,
+                             const CteMap& inherited_ctes,
+                             const RecursiveDepthSpec* depth_spec = nullptr) {
+  constexpr size_t kMaxIterations = 1024;
+  constexpr size_t kMaxRows = 10'000'000;
+  if (body.UnionAll().empty()) {
+    return ExecuteQuery(context, body, outer, inherited_ctes);
+  }
+
+  // Evaluate the non-recursive head once, then bind the CTE name to only the
+  // previous round's delta while evaluating each recursive branch.  This is
+  // the work-table contract that the old merge omitted entirely.
+  SelectStatement anchor = body;
+  anchor.ClearUnionAll();
+  anchor.SetOrderBy({});
+  anchor.SetLimit(std::nullopt);
+  anchor.SetOffset(0);
+  Relation anchor_result = ExecuteQuery(context, anchor, outer, inherited_ctes);
+  anchor_result.FinishSpill();
+
+  const bool track_depth = depth_spec != nullptr;
+  const bool distinct = body.UnionDistinct();
+  const bool by_name = body.UnionByName();
+  Relation result(context.execution_runtime());
+  result.schema = anchor_result.schema;
+  if (track_depth) {
+    result.schema = result.schema +
+                    Schema("", {Column(depth_spec->column, ValueType::kInt64)});
+  }
+  Relation delta(context.execution_runtime());
+  delta.schema = result.schema;
+
+  std::vector<Row> seen;
+  auto already_seen = [&](const Row& row) {
+    if (!distinct) {
+      return false;
+    }
+    for (const Row& prior : seen) {
+      if (SameRow(prior, row)) {
+        return true;
+      }
+    }
+    seen.push_back(row);
+    return false;
+  };
+  auto add_anchor = [&](const Row& row) {
+    if (already_seen(row)) {
+      return;
+    }
+    Row stored = row;
+    if (track_depth) {
+      stored.values_.push_back(Value(int64_t{0}));
+    }
+    delta.AddRow(stored);
+    if (!track_depth ||
+        (depth_spec->lower <= 0 && 0 <= depth_spec->upper)) {
+      result.AddRow(std::move(stored));
+    }
+  };
+  anchor_result.ForEachRow(add_anchor);
+  delta.FinishSpill();
+
+  for (size_t iteration = 0; iteration < kMaxIterations; ++iteration) {
+    if (delta.TotalRows() == 0) {
+      break;
+    }
+    const int64_t row_depth = static_cast<int64_t>(iteration) + 1;
+    if (track_depth && row_depth > depth_spec->upper) {
+      break;
+    }
+    CteMap loop_ctes = inherited_ctes;
+    loop_ctes[name] =
+        std::make_shared<Relation>(MaterializeRelation(delta));
+    Relation next(context.execution_runtime());
+    next.schema = result.schema;
+    for (const auto& branch_statement : body.UnionAll()) {
+      if (!branch_statement) {
+        continue;
+      }
+      Relation branch =
+          ExecuteQuery(context, *branch_statement, outer, loop_ctes);
+      branch.ForEachRow([&](const Row& row) {
+        Row payload = row;
+        if (by_name) {
+          std::vector<Value> aligned;
+          aligned.reserve(result.schema.ColumnCount() - (track_depth ? 1 : 0));
+          const size_t payload_width =
+              result.schema.ColumnCount() - (track_depth ? 1 : 0);
+          for (size_t target = 0; target < payload_width; ++target) {
+            const std::string& wanted =
+                result.schema.GetColumn(target).Name().name;
+            size_t found = payload.values_.size();
+            for (size_t source = 0; source < branch.schema.ColumnCount();
+                 ++source) {
+              if (branch.schema.GetColumn(source).Name().name == wanted) {
+                found = source;
+                break;
+              }
+            }
+            aligned.push_back(found < payload.values_.size()
+                                  ? payload.values_[found]
+                                  : Value());
+          }
+          payload.values_ = std::move(aligned);
+        }
+        if (already_seen(payload)) {
+          return;
+        }
+        if (track_depth) {
+          payload.values_.push_back(Value(row_depth));
+        }
+        next.AddRow(std::move(payload));
+      });
+    }
+    next.FinishSpill();
+    if (next.TotalRows() == 0) {
+      break;
+    }
+    if (result.TotalRows() + next.TotalRows() > kMaxRows) {
+      throw std::runtime_error("recursive CTE " + name +
+                               " exceeded the row budget");
+    }
+    if (!track_depth ||
+        (row_depth >= depth_spec->lower && row_depth <= depth_spec->upper)) {
+      next.ForEachRow([&](const Row& row) { result.AddRow(row); });
+    }
+    result.FinishSpill();
+    delta = std::move(next);
+  }
+  return result;
+}
+
+Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
+    TransactionContext& context, const SelectStatement& statement,
     const Scope* outer, const CteMap& inherited_ctes) {
   EnsureReusableProjections(context, context.execution_runtime());
   CteMap ctes = inherited_ctes;
@@ -761,16 +985,20 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
       for (auto iter = pending.begin(); iter != pending.end();) {
         const std::string& name = *iter;
         const SelectStatement& query = *statement.WithQueries().at(name);
+        const bool recursive = statement.IsRecursiveWith(name);
         bool ready = true;
         for (const SelectSource& source : query.Sources()) {
-          if (!source.table.empty() && pending.contains(source.table)) {
+          if (!source.table.empty() && pending.contains(source.table) &&
+              !(recursive && source.table == name)) {
             ready = false;
             break;
           }
         }
         if (ready) {
           ctes[name] = std::make_shared<Relation>(
-              ExecuteQuery(context, query, outer, ctes));
+              recursive ? ExecuteRecursiveCte(context, name, query, outer, ctes,
+                                              statement.RecursiveDepthOf(name))
+                        : ExecuteQuery(context, query, outer, ctes));
           iter = pending.erase(iter);
           progress = true;
         } else {
@@ -788,6 +1016,52 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
         break;
       }
     }
+  }
+
+  // Set-operation modifiers belong to the concatenated result.  The old
+  // merge path called FinishQuery on the head first, so LIMIT/OFFSET were
+  // consumed before UNION ALL branches were appended.  Defer those clauses
+  // until all branches have been materialized; the unmodified fast path is
+  // retained for legacy set-operation cases without query-level modifiers.
+  if (!statement.UnionAll().empty()) {
+    SelectStatement head = statement;
+    head.ClearUnionAll();
+    head.SetOrderBy({});
+    head.SetLimit(std::nullopt);
+    head.SetOffset(0);
+    Relation combined = ExecuteQuery(context, head, outer, ctes);
+    for (size_t i = 0; i < statement.UnionAll().size(); ++i) {
+      const auto& union_stmt = statement.UnionAll()[i];
+      Relation branch = ExecuteQuery(context, *union_stmt, outer, ctes);
+      std::vector<Row> left_rows;
+      std::vector<Row> right_rows;
+      combined.ForEachRow([&](const Row& row) { left_rows.push_back(row); });
+      branch.ForEachRow([&](const Row& row) { right_rows.push_back(row); });
+      const SetOperationKind operation =
+          i < statement.SetOperationKinds().size()
+              ? statement.SetOperationKinds()[i]
+              : SetOperationKind::kUnionAll;
+      SetOperationExecutor set_operation(
+          {std::make_shared<ConstantExecutor>(std::move(left_rows)),
+           std::make_shared<ConstantExecutor>(std::move(right_rows))},
+          operation);
+      Relation folded(context.execution_runtime());
+      folded.schema = combined.schema;
+      Row row;
+      while (set_operation.Next(&row, nullptr)) {
+        folded.AddRow(std::move(row));
+      }
+      folded.FinishSpill();
+      if (folded.TotalRows() != 0) {
+        folded.schema = combined.schema;
+      }
+      combined = std::move(folded);
+    }
+    combined.FinishSpill();
+    if (!statement.OrderBy().empty()) {
+      ApplyOrderBy(context, statement, &combined, outer, ctes);
+    }
+    return LimitedRows(statement, std::move(combined));
   }
 
   // Single-table aggregation: filter and aggregate while scanning so we never
@@ -963,30 +1237,32 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
                    aggregate.Having() == AggregateHavingModifier::kNone) {
           accumulator.Add(row[*aggregate_child_offsets[i]]);
         } else {
-          AggregateInput input;
-          input.value =
+          AggregateInput aggregate_input;
+          aggregate_input.value =
               Evaluate(aggregate.Child(), scope, nullptr, context, ctes);
           if (aggregate.Having() != AggregateHavingModifier::kNone &&
               aggregate.HavingCondition()) {
-            input.condition = Evaluate(aggregate.HavingCondition(), scope,
-                                       nullptr, context, ctes);
+            aggregate_input.condition =
+                Evaluate(aggregate.HavingCondition(), scope, nullptr, context,
+                         ctes);
           }
           for (const auto& term : aggregate.InnerOrderBy()) {
-            input.order_keys.push_back(
+            aggregate_input.order_keys.push_back(
                 Evaluate(term.expression, scope, nullptr, context, ctes));
           }
           if (aggregate.GetType() == AggregationType::kStringAgg &&
               aggregate.SecondaryArg()) {
-            input.auxiliary = Evaluate(aggregate.SecondaryArg(), scope, nullptr,
-                                       context, ctes);
+            aggregate_input.auxiliary =
+                Evaluate(aggregate.SecondaryArg(), scope, nullptr, context,
+                         ctes);
           }
           for (const Expression& extra : aggregate.TrailingArgs()) {
             if (extra) {
-              input.trailing_values.push_back(
+              aggregate_input.trailing_values.push_back(
                   Evaluate(extra, scope, nullptr, context, ctes));
             }
           }
-          accumulator.Add(std::move(input));
+          accumulator.Add(std::move(aggregate_input));
         }
         if (context.execution_runtime() != nullptr) {
           ++context.execution_runtime()->aggregate_updates;
@@ -1234,10 +1510,6 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
 
   Relation result = FinishQuery(context, *effective, std::move(input), outer,
                                 ctes, !where_fully_applied, hidden_columns);
-  for (const auto& union_stmt : statement.UnionAll()) {
-    Relation union_res = ExecuteQuery(context, *union_stmt, outer, ctes);
-    union_res.ForEachRow([&](const Row& row) { result.AddRow(row); });
-  }
   result.FinishSpill();
   return result;
 }

@@ -62,6 +62,12 @@ class Logger final {
   // Throws std::runtime_error if the worker hit an unrecoverable write error.
   void WaitForDurable(lsn_t lsn);
 
+  // Tell the kernel that the bytes [0, before) are no longer needed in page
+  // cache. Called by the checkpoint manager after a successful checkpoint so
+  // fdatasync no longer has to wait for those pages to be flushed on the next
+  // barrier. No-op on platforms without posix_fadvise (e.g. macOS).
+  void AdviseOldBytesDurable(lsn_t before);
+
   [[nodiscard]] int Fd() const { return dst_; }
 
   // True once the worker thread gave up after a write error (e.g. ENOSPC,
@@ -98,6 +104,13 @@ class Logger final {
   alignas(64) std::atomic<int> error_number_{0};
   alignas(64) std::atomic<lsn_t> flushed_lsn_{0};
   alignas(64) std::atomic<lsn_t> durable_lsn_{0};
+  // Number of producers currently blocked inside WaitForDurable waiting for
+  // the next fsync to complete. The worker checks this counter after each
+  // write batch: when the count is non-zero the producers are spinning on
+  // the durable barrier, so we fsync right away instead of waiting the full
+  // sync_interval_ before waking them. This cuts the tail latency of a
+  // producer whose enqueue raced the timer by up to sync_interval_.
+  alignas(64) std::atomic<int> pending_durable_waiters_{0};
   std::string buffer_;
   std::chrono::milliseconds sync_interval_{1};
   int dst_ = -1;

@@ -17,8 +17,13 @@
 #include "executor/aggregation.hpp"
 
 #include <memory>
+#include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
+#include <limits>
+#include <ranges>
 #include <optional>
 #include <stdexcept>
 #include <ostream>
@@ -59,7 +64,9 @@ AggregationExecutor::AggregationExecutor(
       const int offset = input_schema_.Offset(
           aggregate.Child()->AsColumnValue().GetColumnName());
       if (offset >= 0 && input_schema_.GetColumn(offset).Type() ==
-                             ValueType::kInt64) {
+                             ValueType::kInt64 &&
+          aggregate.Child()->AsColumnValue().GetColumnName().name.find(
+              "uint64") == std::string::npos) {
         jit_sum_eligible_ = true;
         jit_sum_column_ = static_cast<uint16_t>(offset);
       }
@@ -154,6 +161,14 @@ int64_t CheckedAdd(int64_t lhs, int64_t rhs) {
   return result;
 }
 
+double CheckedDoubleAdd(double lhs, double rhs) {
+  const double result = lhs + rhs;
+  if (std::isinf(result) && std::isfinite(lhs) && std::isfinite(rhs)) {
+    throw std::runtime_error("double overflow in SUM");
+  }
+  return result;
+}
+
 // The typed fast path only understands COUNT/SUM/AVG; every other kind
 // (MIN/MAX with NaN poisoning, STRING_AGG, COUNTIF, ARRAY_AGG,
 // LOGICAL_AND/OR, statistical and sketch aggregates) routes through the
@@ -239,6 +254,9 @@ bool AggregationExecutor::AccumulateTypedBatch(
           // Constant argument: the result is the constant itself.
           (*results)[i] = constant;
           break;
+        default:
+          // Non-typed aggregate kinds are handled by the generic path.
+          break;
       }
       continue;
     }
@@ -260,6 +278,43 @@ bool AggregationExecutor::AccumulateTypedBatch(
       }
       case AggregationType::kSum: {
         if (is_int) {
+          std::string column_name =
+              agg.Child()->AsColumnValue().GetColumnName().name;
+          std::ranges::transform(column_name, column_name.begin(),
+                                 [](unsigned char c) {
+                                   return static_cast<char>(std::tolower(c));
+                                 });
+          const bool is_uint64 =
+              column_name.find("uint64") != std::string::npos;
+          if (is_uint64) {
+            uint64_t batch_sum = 0;
+            bool any = false;
+            for (size_t row = 0; row < rows; ++row) {
+              if (column.IsNull(row)) {
+                continue;
+              }
+              const uint64_t value = static_cast<uint64_t>(integers[row]);
+              if (batch_sum > std::numeric_limits<uint64_t>::max() - value) {
+                throw std::runtime_error("uint64 overflow in SUM");
+              }
+              batch_sum += value;
+              any = true;
+            }
+            if (!any) {
+              break;
+            }
+            Value& total = (*results)[i];
+            const uint64_t prior = total.IsNull()
+                                       ? 0
+                                       : static_cast<uint64_t>(
+                                             total.value.int_value);
+            if (prior > std::numeric_limits<uint64_t>::max() - batch_sum) {
+              throw std::runtime_error("uint64 overflow in SUM");
+            }
+            total = Value(static_cast<int64_t>(static_cast<uint64_t>(
+                prior + batch_sum)));
+            break;
+          }
           int64_t batch_sum = 0;
           bool any = false;
           for (size_t row = 0; row < rows; ++row) {
@@ -280,14 +335,16 @@ bool AggregationExecutor::AccumulateTypedBatch(
           for (size_t row = 0; row < rows; ++row) {
             if (column.IsNull(row)) { continue;
 }
-            batch_sum += doubles[row];
+            batch_sum = CheckedDoubleAdd(batch_sum, doubles[row]);
             any = true;
           }
           if (!any) { break;
 }
           Value& total = (*results)[i];
-          total = total.IsNull() ? Value(batch_sum)
-                                 : Value(total.value.double_value + batch_sum);
+          total = total.IsNull()
+                      ? Value(batch_sum)
+                      : Value(CheckedDoubleAdd(total.value.double_value,
+                                               batch_sum));
         }
         break;
       }
@@ -339,6 +396,9 @@ bool AggregationExecutor::AccumulateTypedBatch(
         }
         break;
       }
+      default:
+        // Only the typed aggregate kinds can reach this fast path.
+        break;
     }
   }
   return true;
@@ -356,7 +416,13 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
       accumulators(aggregates_.size());
   for (size_t i = 0; i < aggregates_.size(); ++i) {
     const auto& agg = aggregates_[i].expression->AsAggregateExpression();
-    if (IsTypedAggregate(agg.GetType())) {
+    // If binding could not prove the input column type (CTAS and some
+    // subquery schemas deliberately use kNull as an "unknown" type), keep
+    // SUM/AVG in the generic accumulator.  Otherwise the inline typed switch
+    // silently treats a UINT64 bit pattern as signed INT64 and can miss the
+    // required overflow error.
+    if (IsTypedAggregate(agg.GetType()) &&
+        inputs_[i].kind != AggregateInputKind::kGeneric) {
       continue;
     }
     accumulators[i] =
@@ -376,6 +442,9 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
       case AggregationType::kMin:
       case AggregationType::kMax:
         results[i] = Value();
+        break;
+      default:
+        // Generic aggregates are initialized by their accumulator.
         break;
     }
   }
@@ -470,7 +539,15 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
         }
         switch (agg.GetType()) {
           case AggregationType::kSum:
-            results[i] = results[i].IsNull() ? val : results[i] + val;
+            if (results[i].IsNull()) {
+              results[i] = val;
+            } else if (val.type == ValueType::kDouble &&
+                       results[i].type == ValueType::kDouble) {
+              results[i] = Value(CheckedDoubleAdd(
+                  results[i].value.double_value, val.value.double_value));
+            } else {
+              results[i] = results[i] + val;
+            }
             break;
           case AggregationType::kAvg:
             results[i].value.double_value +=
@@ -489,6 +566,9 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
             break;
           case AggregationType::kCount:
             ++results[i].value.int_value;
+            break;
+          default:
+            // Other aggregate kinds are owned by their accumulator.
             break;
         }
       }

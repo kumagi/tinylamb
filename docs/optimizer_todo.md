@@ -112,7 +112,7 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 ## P1 — 述語移動と単純化（TPC-H / 日常 SQL に効く）
 
 - [x] `eliminate_false_selection` → `EmptyPlan`（定数 FALSE / NULL の Selection）
-- [x] `eliminate_identity_projection`（物理実装時に列定義が一致する場合）
+- [ ] `eliminate_identity_projection`（物理実装時に列定義が一致する場合。Cascades ルールは追加済みだが、出力スキーマのカラム名変更で join プレディケートが壊れるため保留）
 - [x] `prune_unused_projection_columns`（述語・出力式の touched columns から
       scan projection を作り、不要な列を物理スキャン直後に除去）
 - [x] `push_projection_through_join`（ProjectJoinTranspose; inner join の qualified 列だけを左右へ残し、outer/cross/未修飾列は保守的に対象外）
@@ -224,7 +224,7 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `unique_semijoin_to_inner`
 - [ ] `semijoin_to_inner_plus_distinct`
 - [ ] `semijoin_reduction`（bloom / ハッシュ半結合の先行適用）
-- [ ] `join_on_false_to_empty` / `left_join_on_false_to_left_nullpad`
+- [x] `join_on_false_to_empty` / `left_join_on_false_to_left_nullpad`（`cascades.cpp` にルール追加済み — FALSE/NULL プレディケートの Join を LIMIT 0 に短絡）
 - [ ] `decorate_join_with_cardinality`（ヒストグラム結合）
 - [ ] `detect_one_to_one` / `one_to_many` / `many_to_many`
 - [ ] `prefer_index_join_when_inner_unique`

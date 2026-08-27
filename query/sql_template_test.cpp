@@ -243,7 +243,7 @@ std::shared_ptr<SelectStatement> WhereOrderByTree() {
       std::vector<SelectStatement::OrderByTerm>{
           {BinaryExpressionExp(ColumnValueExp("b"), BinaryOperation::kAdd,
                                ConstantValueExp(Value(2))),
-           true}});
+                               true, std::nullopt}});
 }
 
 TEST(SqlTemplateTest, BindsWhereBeforeOrderByInTextOrder) {
@@ -328,7 +328,7 @@ TEST(SqlTemplateTest, BindsGroupingClausesBeforeOrderBy) {
       std::vector<SelectStatement::OrderByTerm>{
           {BinaryExpressionExp(ColumnValueExp("k"), BinaryOperation::kAdd,
                                ConstantValueExp(Value(4))),
-           true}});
+                               true, std::nullopt}});
   cached->SetGroupBy(std::vector<Expression>{ColumnValueExp("k")});
   cached->SetHaving(BinaryExpressionExp(ColumnValueExp("k"),
                                         BinaryOperation::kGreaterThan,

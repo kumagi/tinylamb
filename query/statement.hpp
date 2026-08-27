@@ -17,14 +17,17 @@
 #ifndef TINYLAMB_QUERY_STATEMENT_HPP
 #define TINYLAMB_QUERY_STATEMENT_HPP
 
+#include <cstdint>
 #include <memory>
 #include <sstream>
 #include <optional>
 #include <ostream>
 #include <string>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
+#include "common/set_operation.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "type/column.hpp"
@@ -32,6 +35,24 @@
 namespace tinylamb {
 
 class SelectStatement;
+
+// Metadata needed by the relational executor for WITH RECURSIVE.  The
+// recursive body remains a normal SelectStatement; these fields identify the
+// CTEs whose self-reference must be bound to a work table.
+struct RecursiveDepthSpec {
+  std::string column{"depth"};
+  int64_t lower{0};
+  int64_t upper{0};
+};
+
+// Column matching for CORRESPONDING/BY NAME set operations.  Plain set
+// operations remain positional; the optional names describe the output order
+// for name-based matching.
+struct SetOperationMatch {
+  bool corresponding{false};
+  bool by_name{false};
+  std::vector<std::string> columns;
+};
 
 enum class JoinType { kCross, kInner, kLeft, kRight, kFull };
 
@@ -208,6 +229,7 @@ class SelectStatement : public Statement {
     has_limit_ = limit.has_value();
     limit_ = limit.value_or(0);
   }
+  void SetOffset(size_t offset) { offset_ = offset; }
   size_t Offset() const { return offset_; }
   bool Distinct() const { return distinct_; }
   const std::vector<SelectSource>& Sources() const { return sources_; }
@@ -239,8 +261,28 @@ class SelectStatement : public Statement {
     complex_ = true;
   }
   void AddWithQuery(std::string name, std::shared_ptr<SelectStatement> query) {
+    with_query_order_.push_back(name);
     with_queries_.emplace(std::move(name), std::move(query));
     complex_ = true;
+  }
+  void AddRecursiveWithQuery(std::string name,
+                             std::shared_ptr<SelectStatement> query) {
+    recursive_with_queries_.insert(name);
+    AddWithQuery(std::move(name), std::move(query));
+  }
+  [[nodiscard]] bool IsRecursiveWith(const std::string& name) const {
+    return recursive_with_queries_.contains(name);
+  }
+  [[nodiscard]] const RecursiveDepthSpec* RecursiveDepthOf(
+      const std::string& name) const {
+    const auto found = recursive_depth_specs_.find(name);
+    return found == recursive_depth_specs_.end() ? nullptr : &found->second;
+  }
+  void SetRecursiveDepth(const std::string& name, RecursiveDepthSpec spec) {
+    recursive_depth_specs_[name] = std::move(spec);
+  }
+  [[nodiscard]] const std::vector<std::string>& WithQueryOrder() const {
+    return with_query_order_;
   }
   const Expression& Qualify() const { return qualify_; }
   void SetQualify(Expression qualify) {
@@ -258,9 +300,33 @@ class SelectStatement : public Statement {
   const std::vector<std::shared_ptr<SelectStatement>>& UnionAll() const {
     return union_all_;
   }
-  void AddUnionAll(std::shared_ptr<SelectStatement> query) {
+  const std::vector<SetOperationKind>& SetOperationKinds() const {
+    return set_operation_kinds_;
+  }
+  const std::vector<SetOperationMatch>& Matches() const {
+    return set_operation_matches_;
+  }
+  void AddSetOperation(SetOperationKind kind,
+                       std::shared_ptr<SelectStatement> query,
+                       SetOperationMatch match = {}) {
+    set_operation_kinds_.push_back(kind);
     union_all_.push_back(std::move(query));
+    set_operation_matches_.push_back(std::move(match));
     complex_ = true;
+  }
+  void AddUnionAll(std::shared_ptr<SelectStatement> query) {
+    AddSetOperation(SetOperationKind::kUnionAll, std::move(query));
+  }
+  void MarkUnionDistinct(bool by_name = false) {
+    union_distinct_ = true;
+    union_by_name_ = by_name;
+  }
+  [[nodiscard]] bool UnionDistinct() const { return union_distinct_; }
+  [[nodiscard]] bool UnionByName() const { return union_by_name_; }
+  void ClearUnionAll() {
+    union_all_.clear();
+    set_operation_kinds_.clear();
+    set_operation_matches_.clear();
   }
   void MarkComplex() { complex_ = true; }
   // Structural fingerprint (Dump text), memoized per statement object.  The
@@ -314,7 +380,14 @@ class SelectStatement : public Statement {
   Expression qualify_;
   std::unordered_map<std::string, std::shared_ptr<SelectStatement>>
       with_queries_;
+  std::vector<std::string> with_query_order_;
+  std::unordered_set<std::string> recursive_with_queries_;
+  std::unordered_map<std::string, RecursiveDepthSpec> recursive_depth_specs_;
   std::vector<std::shared_ptr<SelectStatement>> union_all_;
+  std::vector<SetOperationKind> set_operation_kinds_;
+  std::vector<SetOperationMatch> set_operation_matches_;
+  bool union_distinct_{false};
+  bool union_by_name_{false};
   bool as_struct_{false};
   bool complex_{false};
   mutable std::string cached_fingerprint_;

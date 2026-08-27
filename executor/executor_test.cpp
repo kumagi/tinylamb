@@ -869,7 +869,8 @@ TEST_F(ExecutorTest, ThreadLocalAggregationMergesPartialAndDistinctStates) {
 TEST_F(ExecutorTest, ParallelSortPreservesOrderAndStableTies) {
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   auto input = std::make_shared<SyntheticBatchExecutor>(10000);
-  SortExecutor sort(input, schema, {{ColumnValueExp("value"), true}}, 4);
+  SortExecutor sort(input, schema,
+                    {{ColumnValueExp("value"), true, std::nullopt}}, 4);
 
   int64_t previous_value = -1;
   slot_t previous_position = 0;
@@ -1639,7 +1640,8 @@ TEST_F(ExecutorTest, SortDumpAndSmallInput) {
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   auto input = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(2)}), Row({Value(1)}), Row({Value(2)})});
-  SortExecutor sort(input, schema, {{ColumnValueExp("value"), true}});
+  SortExecutor sort(input, schema,
+                    {{ColumnValueExp("value"), true, std::nullopt}});
   Row row;
   RowPosition pos;
   ASSERT_TRUE(sort.Next(&row, &pos));
@@ -2282,7 +2284,8 @@ TEST_F(ExecutorTest, SortWithThrowingKeyExpressionRethrows) {
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   auto input = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(2)}), Row({Value(1)})});
-  SortExecutor sort(input, schema, {{ColumnValueExp("nope"), true}});
+  SortExecutor sort(input, schema,
+                    {{ColumnValueExp("nope"), true, std::nullopt}});
 
   // Act + Assert: materializing the sort rethrows the worker exception.
   Row row;
@@ -3152,7 +3155,8 @@ TEST_F(ExecutorTest, SortIntAscendingAndDescending) {
   auto asc_input = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(3)}), Row({Value(1)}), Row({Value(2)}),
                        Row({Value(1)})});
-  SortExecutor asc(asc_input, schema, {{ColumnValueExp("value"), true}});
+  SortExecutor asc(asc_input, schema,
+                   {{ColumnValueExp("value"), true, std::nullopt}});
   Row row;
   RowPosition pos;
   std::vector<int64_t> asc_order;
@@ -3163,7 +3167,8 @@ TEST_F(ExecutorTest, SortIntAscendingAndDescending) {
   auto desc_input = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(3)}), Row({Value(1)}), Row({Value(2)}),
                        Row({Value(1)})});
-  SortExecutor desc(desc_input, schema, {{ColumnValueExp("value"), false}});
+  SortExecutor desc(desc_input, schema,
+                    {{ColumnValueExp("value"), false, std::nullopt}});
   std::vector<int64_t> desc_order;
   while (desc.Next(&row, &pos)) { desc_order.push_back(row[0].value.int_value);
 }
@@ -3178,7 +3183,8 @@ TEST_F(ExecutorTest, SortMultipleKeysTieBreak) {
                        Row({Value(2), Value("a")}), Row({Value(1), Value("a")}),
                        Row({Value(2), Value("b")})});
   SortExecutor sort(input, schema,
-                    {{ColumnValueExp("a"), true}, {ColumnValueExp("b"), true}});
+                    {{ColumnValueExp("a"), true, std::nullopt},
+                     {ColumnValueExp("b"), true, std::nullopt}});
   Row row;
   RowPosition pos;
   std::vector<Row> out;
@@ -3195,7 +3201,8 @@ TEST_F(ExecutorTest, SortVarcharKey) {
   auto input = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value("pear")}), Row({Value("apple")}),
                        Row({Value("banana")})});
-  SortExecutor sort(input, schema, {{ColumnValueExp("name"), true}});
+  SortExecutor sort(input, schema,
+                    {{ColumnValueExp("name"), true, std::nullopt}});
   Row row;
   RowPosition pos;
   std::vector<std::string> out;
@@ -3210,7 +3217,8 @@ TEST_F(ExecutorTest, SortDoubleAndDateKeys) {
   auto dbl_input = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(1.5)}), Row({Value(-2.0)}),
                        Row({Value(0.5)}), Row({Value(-2.0)})});
-  SortExecutor dbl_sort(dbl_input, dbl, {{ColumnValueExp("score"), true}});
+  SortExecutor dbl_sort(dbl_input, dbl,
+                        {{ColumnValueExp("score"), true, std::nullopt}});
   Row row;
   RowPosition pos;
   std::vector<double> out;
@@ -3227,7 +3235,8 @@ TEST_F(ExecutorTest, SortDoubleAndDateKeys) {
       Row({Value::Date("2026-01-15"), Value(2)}),
       Row({Value::Date("2025-12-31"), Value(3)}),
       Row({Value::Date("2026-01-15"), Value(4)})});
-  SortExecutor date_sort(date_input, date, {{ColumnValueExp("d"), true}});
+  SortExecutor date_sort(date_input, date,
+                         {{ColumnValueExp("d"), true, std::nullopt}});
   std::vector<int64_t> v;
   while (date_sort.Next(&row, &pos)) { v.push_back(row[1].value.int_value);
 }
@@ -3241,7 +3250,8 @@ TEST_F(ExecutorTest, SortNullsAscendingFirstDescendingLast) {
     auto input = std::make_shared<ConstantExecutor>(
         std::vector<Row>{Row({Value()}), Row({Value(1)}), Row({Value()}),
                          Row({Value(0)})});
-    SortExecutor sort(input, schema, {{ColumnValueExp("value"), ascending}});
+    SortExecutor sort(input, schema,
+                      {{ColumnValueExp("value"), ascending, std::nullopt}});
     Row row;
     RowPosition pos;
     std::vector<int64_t> ints;
@@ -3268,7 +3278,8 @@ TEST_F(ExecutorTest, SortNextBatchSplitsSortedOutput) {
   auto input = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(5)}), Row({Value(1)}), Row({Value(4)}),
                        Row({Value(2)}), Row({Value(3)})});
-  SortExecutor sort(input, schema, {{ColumnValueExp("value"), true}});
+  SortExecutor sort(input, schema,
+                    {{ColumnValueExp("value"), true, std::nullopt}});
   DataChunk chunk;
   EXPECT_EQ(sort.NextBatch(&chunk, 2), 2U);
   EXPECT_EQ(chunk.RowAt(0), Row({Value(1)}));
@@ -3284,7 +3295,8 @@ TEST_F(ExecutorTest, SortExternalSpillAscendingMergesRuns) {
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
   auto input = std::make_shared<SyntheticBatchExecutor>(3000);
   ScopedQueryMemory memory(16384);
-  SortExecutor sort(input, schema, {{ColumnValueExp("value"), true}});
+  SortExecutor sort(input, schema,
+                    {{ColumnValueExp("value"), true, std::nullopt}});
   int64_t previous = -1;
   size_t count = 0;
   Row row;
@@ -3329,7 +3341,7 @@ TEST_F(ExecutorTest, SortExternalSpillDescendingPreservesPositions) {
   };
   ScopedQueryMemory memory(16384);
   SortExecutor sort(std::make_shared<PositionedRows>(std::move(rows)), schema,
-                    {{ColumnValueExp("key"), false}});
+                    {{ColumnValueExp("key"), false, std::nullopt}});
   int64_t previous = 300;
   size_t count = 0;
   Row row;
@@ -3455,4 +3467,3 @@ TEST_F(ExecutorTest, ParallelAggregationLogicalAndOr) {
 }
 
 }  // namespace tinylamb
-

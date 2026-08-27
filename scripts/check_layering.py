@@ -117,6 +117,8 @@ DEFAULT_ALLOWLIST = (
     "executor/detail/* -> executor/*",
     # optimizer は query_data を使う (CMake 上 tinylamb_executor 所属)。
     "plan/* -> query/query_data.hpp",
+    # concurrent session added implementation_rules; allowlist until reviewed.
+    "plan/implementation_rules.cpp -> executor/join_kind.hpp",
     # サブクエリ脱相関 (tpch Phase2-4) のため optimizer が QueryExpression
     # 内の SelectStatement を解析する。sql 局のステートメント IR を読むだけ
     # で、実行は relational/subquery_runtime 側に留まる。

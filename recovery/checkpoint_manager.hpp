@@ -35,7 +35,7 @@ class PagePool;
 class CheckpointManager {
  public:
   CheckpointManager(std::string_view path, TransactionManager* tm, PagePool* pp,
-                    size_t interval = 60)
+                    size_t interval = 5)
       : master_record_path(path),
         tm_(tm),
         pp_(pp),

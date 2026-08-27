@@ -650,7 +650,7 @@ TEST_F(QueryTest, WindowFrameExclusionRemovesCurrentRow) {
 }
 
 TEST_F(QueryTest, WindowFrameExclusionHandlesPeerGroupsAndTies) {
-  for (const auto [exclusion, expected] :
+  for (const auto& [exclusion, expected] :
        std::vector<std::pair<WindowFrameExclusion, std::vector<Value>>>{
            {WindowFrameExclusion::kGroup, {Value(20), Value(20), Value(20)}},
            {WindowFrameExclusion::kTies, {Value(30), Value(30), Value(40)}}}) {

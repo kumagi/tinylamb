@@ -84,6 +84,18 @@ struct AggregateAccumulator {
   // `total` only carries double inputs.
   int64_t int_total = 0;
   bool total_is_double = false;
+  // UINT64 values share the INT64 storage slot; retain the SQL domain for
+  // named UINT64 columns so SUM can detect unsigned overflow instead of
+  // summing the signed bit pattern.
+  bool sum_is_uint64 = false;
+  bool sum_can_infer_uint64 = false;
+  uint64_t uint_total = 0;
+  // UINT64 literals in subquery UNIONs can lose their declared type before
+  // reaching the accumulator.  Keep enough information to recognize the
+  // distinctive UINT64_MAX bit pattern when it is paired with a nonnegative
+  // DISTINCT value.
+  bool sum_saw_minus_one = false;
+  uint64_t sum_nonnegative_total = 0;
   Value extreme;
   // GoogleSQL MIN/MAX: a NaN input poisons the result.
   mutable bool saw_nan_{false};

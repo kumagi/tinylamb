@@ -149,7 +149,14 @@ lsn_t CheckpointManager::WriteCheckpoint(
   // The master record must not overtake the WAL: wait until every record up
   // to (and including) EndCheckpoint is on stable storage, so a reader that
   // trusts begin_lsn always finds a complete checkpoint pair behind it.
-  tm_->logger_->WaitForDurable(tm_->logger_->BufferedLSN());
+  const lsn_t durable_end = tm_->logger_->BufferedLSN();
+  tm_->logger_->WaitForDurable(durable_end);
+
+  // Once the checkpoint is durable, every byte before begin_lsn is safe to
+  // release from page cache: the next recovery starts from begin_lsn, so the
+  // kernel may drop older pages without losing crash-safety. fdatasync on a
+  // multi-hundred-MB WAL otherwise has to wait for all of them.
+  tm_->logger_->AdviseOldBytesDurable(begin_lsn);
 
   WriteMasterRecord(master_record_path, begin_lsn);
   return begin_lsn;

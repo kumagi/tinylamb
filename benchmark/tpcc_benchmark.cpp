@@ -71,17 +71,18 @@ struct WorkerStats {
 
 void Usage(std::ostream& out, std::string_view program) {
   out << "usage: " << program << " <new-database-path> [options]\n"
-      << "  --scale-factor N  TPC-C warehouses W (default: 1)\n"
-      << "  --clients N       terminals (default: 10 per warehouse)\n"
-      << "  --warmup N        warmup seconds (default: 2)\n"
-      << "  --seconds N       measurement seconds (default: 10)\n"
-      << "  --seed N          random seed\n"
-      << "  --verify-only     run each transaction once and stop\n"
-      << "  --reuse-existing  reuse an already initialized fixture\n"
-      << "  --no-sync-commit  diagnostic only: do not wait for WAL durability\n"
-      << "  --profile-waits   collect WAL/MVCC/scheduler wait counters\n"
-      << "  --transaction N   diagnostic: run only one transaction type\n"
-      << "  --wal-sync-ms N   group-commit interval (default: 1)\n"
+      << "  --scale-factor N    TPC-C warehouses W (default: 1)\n"
+      << "  --clients N         terminals (default: 10 per warehouse)\n"
+      << "  --warmup N          warmup seconds (default: 2)\n"
+      << "  --seconds N         measurement seconds (default: 10)\n"
+      << "  --seed N            random seed\n"
+      << "  --verify-only       run each transaction once and stop\n"
+      << "  --reuse-existing    reuse an already initialized fixture\n"
+      << "  --no-sync-commit    diagnostic only: do not wait for WAL durability\n"
+      << "  --profile-waits     collect WAL/MVCC/scheduler wait counters\n"
+      << "  --transaction N     diagnostic: run only one transaction type\n"
+      << "  --wal-sync-ms N     group-commit interval (default: 1)\n"
+      << "  --deadlock-policy P legacy|wait_die|wound_wait|deadlock_detect\n"
       << "\n"
       << "Population follows TPC-C Clause 4.3 for scale factor W:\n"
       << "  10 districts/warehouse, 3000 customers/district, 100000 items,\n"
@@ -237,26 +238,39 @@ int main(int argc, char** argv) {
             << "tpmc_compliant=false\n"
             << "think_time=omitted\n"
             << "keying_time=omitted\n"
-            << "database=" << options.database_path << '\n'
-            << "scale_factor=" << scale.ScaleFactor() << '\n'
-            << "warehouses=" << scale.warehouses << '\n'
-            << "districts_per_warehouse=" << scale.districts_per_warehouse
-            << '\n'
-            << "customers_per_district=" << scale.customers_per_district << '\n'
-            << "items=" << scale.items << '\n'
-            << "initial_orders_per_district="
-            << scale.initial_orders_per_district << '\n'
-            << "new_orders_per_district=" << scale.new_orders_per_district
-            << '\n'
-            << "order_lines=" << scale.min_order_lines << '-'
-            << scale.max_order_lines << '\n'
-            << "terminals=" << scale.Terminals() << '\n'
-            << "nurand.c_last_load=" << nurand.c_last_load << '\n'
-            << "nurand.c_last_run=" << nurand.c_last_run << '\n'
-            << "nurand.c_id=" << nurand.c_id << '\n'
-            << "nurand.c_ol_i_id=" << nurand.c_ol_i_id << '\n';
+            << "database=" << options.database_path << '\n';
+  // TINYLAMB_DEADLOCK_POLICY selects the write-intent victim-selection
+  // policy. The --deadlock-policy CLI argument overrides the env var.
+  auto parse_policy =
+      [](std::string_view s) -> tinylamb::Database::DeadlockPolicy {
+    if (s == "wait_die") return tinylamb::Database::DeadlockPolicy::kWaitDie;
+    if (s == "wound_wait") {
+      return tinylamb::Database::DeadlockPolicy::kWoundWait;
+    }
+    if (s == "deadlock_detect" || s == "detect") {
+      return tinylamb::Database::DeadlockPolicy::kDeadlockDetect;
+    }
+    return tinylamb::Database::DeadlockPolicy::kLegacy;
+  };
+  const char* deadlock_env = std::getenv("TINYLAMB_DEADLOCK_POLICY");
+  std::string deadlock_arg;
+  for (int i = 2; i < argc; ++i) {
+    if (std::string_view(argv[i]) == "--deadlock-policy") {
+      if (i + 1 < argc) { deadlock_arg = argv[++i]; }
+    }
+  }
+  const std::string policy_source = !deadlock_arg.empty()
+                                        ? deadlock_arg
+                                        : (deadlock_env != nullptr
+                                               ? std::string(deadlock_env)
+                                               : std::string("legacy"));
+  const tinylamb::Database::DeadlockPolicy deadlock_policy =
+      parse_policy(policy_source);
+  std::cout << "deadlock_policy=" << policy_source
+            << " (0=legacy 1=wait_die 2=wound_wait 3=deadlock_detect)\n";
 
   tinylamb::Database database(options.database_path, options.wal_sync_ms);
+  database.SetDeadlockPolicy(deadlock_policy);
   std::string error;
   if (!options.reuse_existing) {
     const tinylamb::Status initialized = tinylamb::TpccWorkload::Initialize(

@@ -1,7 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #ifndef TINYLAMB_DISTINCT_EXECUTOR_HPP
 #define TINYLAMB_DISTINCT_EXECUTOR_HPP
-#include <unordered_set>
+#include <vector>
 
 #include "executor/executor_base.hpp"
 #include "type/row.hpp"
@@ -14,7 +14,7 @@ class DistinctExecutor : public ExecutorBase {
 
  private:
   Executor source_;
-  std::unordered_set<Row> seen_;
+  std::vector<Row> seen_;
 };
 
 class SortDistinctExecutor final : public ExecutorBase {

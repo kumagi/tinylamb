@@ -60,6 +60,15 @@ class Database final : public CatalogReader {
   void SetTransactionMetricsEnabled(bool enabled) {
     storage_.tm_.SetMetricsEnabled(enabled);
   }
+  // Deadlock policy for write-intent acquisition. See
+  // TransactionManager::DeadlockPolicy for the trade-offs.
+  using DeadlockPolicy = TransactionManager::DeadlockPolicy;
+  void SetDeadlockPolicy(DeadlockPolicy policy) {
+    storage_.tm_.SetDeadlockPolicy(policy);
+  }
+  [[nodiscard]] DeadlockPolicy GetDeadlockPolicy() const {
+    return storage_.tm_.GetDeadlockPolicy();
+  }
   [[nodiscard]] TransactionRuntimeStats TransactionStats() const {
     return storage_.tm_.RuntimeStats();
   }

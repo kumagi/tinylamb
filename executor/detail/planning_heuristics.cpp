@@ -867,7 +867,7 @@ Relation LateralExpandRelation(TransactionContext& context,
         const ColumnName& rn =
             binary.Right()->AsColumnValue().GetColumnName();
         if (declared(ln) && declared(rn)) {
-          for (const auto [outer_name, inner_name] :
+          for (const auto& [outer_name, inner_name] :
                std::vector<std::pair<ColumnName, ColumnName>>{{ln, rn},
                                                               {rn, ln}}) {
             const auto prefix_offset =

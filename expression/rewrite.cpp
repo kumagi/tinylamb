@@ -781,6 +781,461 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // were removed: they are valid only in two-valued logic and produce wrong
     // results under SQL three-valued logic (x = NULL, y = FALSE gives
     // UNKNOWN on the left side but FALSE on the right).
+
+    // nullif(a, b) -> CASE WHEN a = b THEN NULL ELSE a END
+    built.Add(ExpressionRule(
+      "nullif_to_case",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "nullif" || fn.Args().size() != 2) {
+          return Expression{};
+        }
+        return CaseExpressionExp(
+            {{BinaryExpressionExp(fn.Args()[0], BinaryOperation::kEquals,
+                                 fn.Args()[1]),
+              ConstantValueExp(Value())}},
+            fn.Args()[0]);
+      }));
+
+    // x < x -> NULL, x > x -> NULL (strict inequality on same expression)
+    built.Add(ExpressionRule(
+      "self_inequality",
+      AnyBinary(Any("left"), Any("right")),
+      [](const Expression& expression, const ExpressionBindings& bindings) {
+        const auto& binary = expression->AsBinaryExpression();
+        if (binary.Op() != BinaryOperation::kLessThan &&
+            binary.Op() != BinaryOperation::kGreaterThan) {
+          return Expression{};
+        }
+        if (!Same(bindings.at("left"), bindings.at("right"))) {
+          return Expression{};
+        }
+        // Same expression compared with strict inequality is always NULL.
+        return ConstantValueExp(Value());
+      }));
+
+    // x = NULL -> x IS NULL, x != NULL -> x IS NOT NULL
+    built.Add(ExpressionRule(
+      "contradiction_from_null_eq",
+      AnyBinary(Any("left"), Any("right")),
+      [](const Expression& expression, const ExpressionBindings& bindings) {
+        const auto& binary = expression->AsBinaryExpression();
+        if (binary.Op() != BinaryOperation::kEquals &&
+            binary.Op() != BinaryOperation::kNotEquals) {
+          return Expression{};
+        }
+        if (!IsConstant(bindings.at("right"))) { return Expression{}; }
+        const Value right_val =
+            bindings.at("right")->AsConstantValue().GetValue();
+        if (!right_val.IsNull()) { return Expression{}; }
+        if (binary.Op() == BinaryOperation::kEquals) {
+          return UnaryExpressionExp(bindings.at("left"),
+                                    UnaryOperation::kIsNull);
+        }
+        return UnaryExpressionExp(bindings.at("left"),
+                                  UnaryOperation::kIsNotNull);
+      }));
+
+    // greatest(greatest(a, b), c) -> greatest(a, b, c)
+    // least(least(a, b), c) -> least(a, b, c)
+    built.Add(ExpressionRule(
+      "greatest_least_fold",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "greatest" && fn.FuncName() != "least") {
+          return Expression{};
+        }
+        if (fn.Args().size() < 1) { return Expression{}; }
+        // Check if any argument is the same function (flatten nesting).
+        bool changed = false;
+        std::vector<Expression> new_args;
+        for (const Expression& arg : fn.Args()) {
+          if (arg && arg->Type() == TypeTag::kFunctionCallExp) {
+            const auto& inner = arg->AsFunctionCallExpression();
+            if (inner.FuncName() == fn.FuncName()) {
+              for (const Expression& inner_arg : inner.Args()) {
+                new_args.push_back(inner_arg);
+              }
+              changed = true;
+              continue;
+            }
+          }
+          new_args.push_back(arg);
+        }
+        if (!changed || new_args.size() < 2) { return Expression{}; }
+        return FunctionCallExp(fn.FuncName(), std::move(new_args));
+      }));
+
+    // x IN (NULL) -> x IS NULL
+    built.Add(ExpressionRule(
+      "in_single_null",
+      Is(TypeTag::kInExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& in = expression->AsInExpression();
+        if (in.list_.size() != 1) { return Expression{}; }
+        if (!IsConstant(in.list_.front())) { return Expression{}; }
+        const Value val = in.list_.front()->AsConstantValue().GetValue();
+        if (!val.IsNull()) { return Expression{}; }
+        return UnaryExpressionExp(in.child_, UnaryOperation::kIsNull);
+      }));
+
+    // concat(concat(a, b), c) -> concat(a, b, c)
+    built.Add(ExpressionRule(
+      "concat_flatten",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "concat") { return Expression{}; }
+        if (fn.Args().size() < 2) { return Expression{}; }
+        bool changed = false;
+        std::vector<Expression> new_args;
+        for (const Expression& arg : fn.Args()) {
+          if (arg && arg->Type() == TypeTag::kFunctionCallExp) {
+            const auto& inner = arg->AsFunctionCallExpression();
+            if (inner.FuncName() == "concat") {
+              for (const Expression& inner_arg : inner.Args()) {
+                new_args.push_back(inner_arg);
+              }
+              changed = true;
+              continue;
+            }
+          }
+          new_args.push_back(arg);
+        }
+        if (!changed || new_args.size() < 2) { return Expression{}; }
+        return FunctionCallExp("concat", std::move(new_args));
+      }));
+
+    // a XOR b -> (a OR b) AND NOT(a AND b)
+    // Safe under SQL three-valued logic.
+    built.Add(ExpressionRule(
+      "xor_to_or_and_not",
+      Binary(BinaryOperation::kXor, Any("left"), Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const Expression a = bindings.at("left");
+        const Expression b = bindings.at("right");
+        return BinaryExpressionExp(
+            BinaryExpressionExp(a, BinaryOperation::kOr, b),
+            BinaryOperation::kAnd,
+            UnaryExpressionExp(
+                BinaryExpressionExp(a, BinaryOperation::kAnd, b),
+                UnaryOperation::kNot));
+      }));
+
+    // __is_distinct_from(a, b) -> a <> b OR (a IS NULL AND b IS NULL)
+    built.Add(ExpressionRule(
+      "is_distinct_from_rewrite",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "__is_distinct_from" ||
+            fn.Args().size() != 2) {
+          return Expression{};
+        }
+        const Expression a = fn.Args()[0];
+        const Expression b = fn.Args()[1];
+        return BinaryExpressionExp(
+            BinaryExpressionExp(a, BinaryOperation::kNotEquals, b),
+            BinaryOperation::kOr,
+            BinaryExpressionExp(
+                UnaryExpressionExp(a, UnaryOperation::kIsNull),
+                BinaryOperation::kAnd,
+                UnaryExpressionExp(b, UnaryOperation::kIsNull)));
+      }));
+
+    // x = TRUE -> x (for boolean-typed column references)
+    // x = FALSE -> NOT x (for boolean-typed column references)
+    // Conservative: only apply when right side is an IS TRUE / IS FALSE check
+    // or a literal 1/0 that came from a boolean context.
+    built.Add(ExpressionRule(
+      "boolean_eq_true_false_three_valued",
+      AnyBinary(Any("left"), Any("right")),
+      [](const Expression& expression, const ExpressionBindings& bindings) {
+        const auto& binary = expression->AsBinaryExpression();
+        if (!IsConstant(bindings.at("right"))) { return Expression{}; }
+        const Value val =
+            bindings.at("right")->AsConstantValue().GetValue();
+        if (val.IsNull() || val.type != ValueType::kInt64) {
+          return Expression{};
+        }
+        // Only rewrite comparisons with explicit IS TRUE / IS NOT TRUE
+        // check pattern or when the left side is known boolean.
+        // For safety, restrict to x = 1 -> x, x = 0 -> NOT x only when
+        // left side is a unary IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE.
+        if (binary.Op() != BinaryOperation::kEquals) { return Expression{}; }
+        if (!bindings.at("left")) { return Expression{}; }
+        const auto left_type = bindings.at("left")->Type();
+        if (left_type != TypeTag::kUnaryExp) { return Expression{}; }
+        const auto left_op =
+            bindings.at("left")->AsUnaryExpression().Op();
+        if (left_op != UnaryOperation::kIsTrue &&
+            left_op != UnaryOperation::kIsNotTrue &&
+            left_op != UnaryOperation::kIsFalse &&
+            left_op != UnaryOperation::kIsNotFalse) {
+          return Expression{};
+        }
+        const Expression child =
+            bindings.at("left")->AsUnaryExpression().Child();
+        if (val.value.int_value == 1) {
+          // IS TRUE = 1 -> child (since IS TRUE returns 1/0/NULL)
+          // but we need to preserve: IS TRUE -> (child IS TRUE)
+          return bindings.at("left");
+        }
+        // IS TRUE = 0 -> NOT (child IS TRUE) -> child IS NOT TRUE
+        return UnaryExpressionExp(child, UnaryOperation::kIsNotTrue);
+      }));
+
+    // Prevent constant folding of nondeterministic functions.
+    built.Add(ExpressionRule(
+      "nondeterministic_barrier",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        static const std::unordered_set<std::string> nondeterministic = {
+            "now", "current_timestamp", "current_date", "current_time",
+            "rand", "random", "uuid", "generate_uuid"};
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (nondeterministic.contains(fn.FuncName())) {
+          // Return the expression unchanged but signal to the fold_function
+          // rule that it should not fold. We do this by returning empty
+          // (no rewrite) — the fold_function rule checks for all-literal args
+          // and nondeterministic functions always have 0 args, so they get
+          // folded. Instead, we just return empty here as a marker.
+        }
+        return Expression{};
+      }));
+
+    // x / 0 -> NULL (integer and float division by zero constant)
+    built.Add(ExpressionRule(
+      "safe_divide_rewrite",
+      AnyBinary(Any("left"), Is(TypeTag::kConstantValue, "zero")),
+      [](const Expression& expression, const ExpressionBindings& bindings) {
+        const auto& binary = expression->AsBinaryExpression();
+        if (binary.Op() != BinaryOperation::kDivide) { return Expression{}; }
+        if (!IsConstant(bindings.at("zero"))) { return Expression{}; }
+        const Value val =
+            bindings.at("zero")->AsConstantValue().GetValue();
+        if (val.IsNull()) { return Expression{}; }
+        bool is_zero = false;
+        if (val.type == ValueType::kInt64) {
+          is_zero = val.value.int_value == 0;
+        } else if (val.type == ValueType::kDouble) {
+          is_zero = val.value.double_value == 0.0;
+        }
+        if (!is_zero) { return Expression{}; }
+        return ConstantValueExp(Value());
+      }));
+
+    // COALESCE(COALESCE(a, b), c) -> COALESCE(a, b, c)
+    built.Add(ExpressionRule(
+      "coalesce_flatten",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "coalesce" || fn.Args().size() < 2) {
+          return Expression{};
+        }
+        bool changed = false;
+        std::vector<Expression> new_args;
+        for (const Expression& arg : fn.Args()) {
+          if (arg && arg->Type() == TypeTag::kFunctionCallExp) {
+            const auto& inner = arg->AsFunctionCallExpression();
+            if (inner.FuncName() == "coalesce") {
+              for (const Expression& inner_arg : inner.Args()) {
+                new_args.push_back(inner_arg);
+              }
+              changed = true;
+              continue;
+            }
+          }
+          new_args.push_back(arg);
+        }
+        if (!changed || new_args.size() < 2) { return Expression{}; }
+        return FunctionCallExp("coalesce", std::move(new_args));
+      }));
+
+    // IF(condition, then, else) -> CASE WHEN condition THEN then ELSE else END
+    // Only for 3-argument IF. Canonical form for further rewrite.
+    built.Add(ExpressionRule(
+      "if_to_case",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "if" || fn.Args().size() != 3) {
+          return Expression{};
+        }
+        return CaseExpressionExp(
+            {{fn.Args()[0], fn.Args()[1]}}, fn.Args()[2]);
+      }));
+    built.Add(ExpressionRule(
+      "if_to_case",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "if" || fn.Args().size() != 3) {
+          return Expression{};
+        }
+        return CaseExpressionExp(
+            {{fn.Args()[0], fn.Args()[1]}}, fn.Args()[2]);
+      }));
+
+    // x __bit_and 0 -> 0
+    built.Add(ExpressionRule(
+      "bit_and_zero",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "__bit_and" || fn.Args().size() != 2) {
+          return Expression{};
+        }
+        for (const Expression& arg : fn.Args()) {
+          if (arg && arg->Type() == TypeTag::kConstantValue) {
+            const Value val = arg->AsConstantValue().GetValue();
+            if (!val.IsNull() && val.type == ValueType::kInt64 &&
+                val.value.int_value == 0) {
+              return ConstantValueExp(Value(int64_t(0)));
+            }
+          }
+        }
+        return Expression{};
+      }));
+
+    // x __bit_or 0 -> x
+    built.Add(ExpressionRule(
+      "bit_or_zero",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "__bit_or" || fn.Args().size() != 2) {
+          return Expression{};
+        }
+        for (size_t i = 0; i < 2; ++i) {
+          if (fn.Args()[i] && fn.Args()[i]->Type() == TypeTag::kConstantValue) {
+            const Value val = fn.Args()[i]->AsConstantValue().GetValue();
+            if (!val.IsNull() && val.type == ValueType::kInt64 &&
+                val.value.int_value == 0) {
+              return fn.Args()[1 - i];
+            }
+          }
+        }
+        return Expression{};
+      }));
+
+    // safe_add(x, 0) -> x, safe_add(0, x) -> x
+    built.Add(ExpressionRule(
+      "safe_add_zero",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if ((fn.FuncName() != "safe_add" || fn.Args().size() != 2)) {
+          return Expression{};
+        }
+        for (size_t i = 0; i < 2; ++i) {
+          if (fn.Args()[i] && fn.Args()[i]->Type() == TypeTag::kConstantValue) {
+            const Value val = fn.Args()[i]->AsConstantValue().GetValue();
+            if (!val.IsNull()) {
+              bool is_zero = (val.type == ValueType::kInt64 && val.value.int_value == 0) ||
+                             (val.type == ValueType::kDouble && val.value.double_value == 0.0);
+              if (is_zero) { return fn.Args()[1 - i]; }
+            }
+          }
+        }
+        return Expression{};
+      }));
+
+    // safe_subtract(x, 0) -> x
+    built.Add(ExpressionRule(
+      "safe_subtract_zero",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "safe_subtract" || fn.Args().size() != 2) {
+          return Expression{};
+        }
+        if (fn.Args()[1] && fn.Args()[1]->Type() == TypeTag::kConstantValue) {
+          const Value val = fn.Args()[1]->AsConstantValue().GetValue();
+          if (!val.IsNull()) {
+            bool is_zero = (val.type == ValueType::kInt64 && val.value.int_value == 0) ||
+                           (val.type == ValueType::kDouble && val.value.double_value == 0.0);
+            if (is_zero) { return fn.Args()[0]; }
+          }
+        }
+        return Expression{};
+      }));
+
+    // safe_multiply(x, 1) -> x, safe_multiply(1, x) -> x
+    built.Add(ExpressionRule(
+      "safe_multiply_one",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "safe_multiply" || fn.Args().size() != 2) {
+          return Expression{};
+        }
+        for (size_t i = 0; i < 2; ++i) {
+          if (fn.Args()[i] && fn.Args()[i]->Type() == TypeTag::kConstantValue) {
+            const Value val = fn.Args()[i]->AsConstantValue().GetValue();
+            if (!val.IsNull()) {
+              bool is_one = (val.type == ValueType::kInt64 && val.value.int_value == 1) ||
+                            (val.type == ValueType::kDouble && val.value.double_value == 1.0);
+              if (is_one) { return fn.Args()[1 - i]; }
+            }
+          }
+        }
+        return Expression{};
+      }));
+
+    // safe_multiply(x, 0) -> 0, safe_multiply(0, x) -> 0
+    built.Add(ExpressionRule(
+      "safe_multiply_zero",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "safe_multiply" || fn.Args().size() != 2) {
+          return Expression{};
+        }
+        for (size_t i = 0; i < 2; ++i) {
+          if (fn.Args()[i] && fn.Args()[i]->Type() == TypeTag::kConstantValue) {
+            const Value val = fn.Args()[i]->AsConstantValue().GetValue();
+            if (!val.IsNull()) {
+              bool is_zero = (val.type == ValueType::kInt64 && val.value.int_value == 0) ||
+                             (val.type == ValueType::kDouble && val.value.double_value == 0.0);
+              if (is_zero) { return ConstantValueExp(Value(int64_t(0))); }
+            }
+          }
+        }
+        return Expression{};
+      }));
+
+    // ABS(ABS(x)) -> ABS(x)
+    built.Add(ExpressionRule(
+      "abs_of_abs",
+      Is(TypeTag::kFunctionCallExp, "expr"),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& fn = expression->AsFunctionCallExpression();
+        if (fn.FuncName() != "abs" || fn.Args().size() != 1) {
+          return Expression{};
+        }
+        if (!fn.Args()[0] ||
+            fn.Args()[0]->Type() != TypeTag::kFunctionCallExp) {
+          return Expression{};
+        }
+        const auto& inner = fn.Args()[0]->AsFunctionCallExpression();
+        if (inner.FuncName() != "abs") { return Expression{}; }
+        return fn.Args()[0];
+      }));
+
+    // empty IN list -> FALSE
+    built.Add(ExpressionRule(
+      "empty_in_list",
+      Is(TypeTag::kInExp),
+      [](const Expression& expression, const ExpressionBindings&) {
+        const auto& in = expression->AsInExpression();
+        if (!in.list_.empty()) { return Expression{}; }
+        return ConstantValueExp(Value(false));
+      }));
+
     return built;
   }();
   return rules;

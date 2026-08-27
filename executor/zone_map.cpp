@@ -92,12 +92,13 @@ bool ZoneMap::MayMatch(BinaryOperation operation, const Value& constant) const {
   }
   // An initialized zone holding only NULLs cannot compare, and NULL
   // constants never compare either.  minimum_/maximum_ are always populated
-  // together, so checking both here keeps the invariant explicit.
-  if (!minimum_ || !maximum_ || constant.IsNull()) {
+  // together, so checking both here keeps the invariant explicit.  // NULL comparisons always evaluate to UNKNOWN (NULL) in SQL,
+  // so no row can ever satisfy = NULL or != NULL.
+  if (constant.IsNull()) { return false; }
+  if (!minimum_ || !maximum_) {
     // Non-NULL values were observed but excluded from the envelope (arrays):
     // nothing can be proven, so keep every row.
-    if (value_count_ > 0) { return true;
-}
+    if (value_count_ > 0) { return true; }
     return false;
   }
   // Cross-type comparisons (e.g. int constant vs double zone) may match after

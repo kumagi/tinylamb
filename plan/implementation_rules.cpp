@@ -1191,7 +1191,7 @@ std::vector<PlanAlternative> MergeJoinAlternative(
     std::vector<SortKey> keys;
     keys.reserve(left_columns.size());
     for (const ColumnName& column : left_columns) {
-      keys.push_back(SortKey{ColumnValueExp(column), true});
+      keys.push_back(SortKey{ColumnValueExp(column), true, std::nullopt});
     }
     left_plan =
         std::make_shared<SortPlan>(std::move(left_plan), std::move(keys));
@@ -1201,7 +1201,7 @@ std::vector<PlanAlternative> MergeJoinAlternative(
     std::vector<SortKey> keys;
     keys.reserve(right_columns.size());
     for (const ColumnName& column : right_columns) {
-      keys.push_back(SortKey{ColumnValueExp(column), true});
+      keys.push_back(SortKey{ColumnValueExp(column), true, std::nullopt});
     }
     right_plan =
         std::make_shared<SortPlan>(std::move(right_plan), std::move(keys));
@@ -1615,7 +1615,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           for (size_t i = 0; i < schema.ColumnCount(); ++i) {
             const ColumnName column = schema.GetColumn(i).Name();
             ordering.push_back(ColumnValueExp(column));
-            keys.push_back(SortKey{ColumnValueExp(column), true});
+            keys.push_back(SortKey{ColumnValueExp(column), true, std::nullopt});
           }
           Plan input = children[0].plan;
           double cost = children[0].estimated_rows;

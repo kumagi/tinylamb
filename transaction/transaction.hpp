@@ -122,6 +122,15 @@ class Transaction final {
   }
   [[nodiscard]] bool IsReadOnly() const { return read_only_; }
 
+  // Marks this transaction as wounded (Wound-Wait victim or a deadlock-
+  // detector victim). AcquireWriteIntent checks this on every entry; the
+  // next call returns false and the caller aborts the transaction, releasing
+  // the held intent cleanly. Idempotent.
+  void Wound() noexcept { wounded_.store(true, std::memory_order_release); }
+  [[nodiscard]] bool IsWounded() const noexcept {
+    return wounded_.load(std::memory_order_acquire);
+  }
+
   Status PreCommit();
   void Abort();
 
@@ -239,6 +248,12 @@ class Transaction final {
 
   // Not owned by this class.
   TransactionManager* transaction_manager_{nullptr};
+  // Set by an older transaction's Wound-Wait preemption or by a deadlock
+  // detector that chose this transaction as a victim. AcquireWriteIntent
+  // checks this on every entry; the next call returns false and the caller
+  // aborts the transaction, releasing the held intent cleanly.
+  std::atomic<bool> wounded_{false};
+  friend class TransactionManager;
 };
 
 }  // namespace tinylamb

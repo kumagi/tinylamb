@@ -699,11 +699,10 @@ Value ExecuteFunction(const std::string& name,
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
     gmtime_r(&now, &t);
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
-             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-             t.tm_hour, t.tm_min, t.tm_sec);
-    return Value(std::string(buf));
+    CivilTime current{t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,
+                      t.tm_min,
+                      t.tm_sec, 0};
+    return Value(FormatCivilTime(current));
   }
   if (name == "current_date") {
     if (values.size() > 1) { throw std::runtime_error("CURRENT_DATE takes at most 1 argument"); }
@@ -796,7 +795,11 @@ Value ExecuteFunction(const std::string& name,
     tm.tm_sec = ct.second;
     timegm(&tm);
     char buf[128];
-    strftime(buf, sizeof(buf), fmt.c_str(), &tm);
+    const auto format_time = static_cast<size_t (*)(char*, size_t,
+                                                     const char*, const struct tm*)
+                                  noexcept>(
+        &std::strftime);
+    format_time(buf, sizeof(buf), fmt.c_str(), &tm);
     return Value(std::string(buf));
   }
   if (name == "parse_timestamp") {
@@ -958,7 +961,7 @@ Value ExecuteFunction(const std::string& name,
   // SQL scalar UDFs registered by CREATE FUNCTION: evaluate the body against
   // a synthetic single-row scope holding the argument values.
   if (std::optional<SqlScalarFunction> udf = FindSqlScalarFunction(name)) {
-    SqlUdfBinding binding = BindSqlUdfArguments(*udf, std::move(values));
+    SqlUdfBinding binding = BindSqlUdfArguments(*udf, values);
     SqlUdfDepthGuard depth_guard;
     return udf->body->Evaluate(binding.row, binding.schema);
   }
@@ -1126,6 +1129,60 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
         return true;
       }
     } catch (const std::exception&) {
+    }
+  }
+  // Struct values encode nested arrays using Value::AsString(), for example
+  // `ARRAY<INT64>[3, 5]`.  Decode that representation here rather than
+  // leaving it as a STRING: field traversal followed by UNNEST must observe
+  // the original array value.
+  if (trimmed.starts_with("ARRAY<") && trimmed.back() == ']') {
+    const size_t type_end = trimmed.find(">[");
+    if (type_end != std::string::npos) {
+      const std::string element_type = trimmed.substr(6, type_end - 6);
+      const std::string body =
+          trimmed.substr(type_end + 2, trimmed.size() - type_end - 3);
+      std::vector<Value> elements;
+      size_t start = 0;
+      int depth = 0;
+      bool quoted = false;
+      for (size_t i = 0; i <= body.size(); ++i) {
+        const bool at_end = i == body.size();
+        const char c = at_end ? ',' : body[i];
+        if (!at_end && c == '"') {
+          quoted = !quoted;
+        } else if (!quoted && !at_end &&
+                   (c == '[' || c == '{' || c == '(')) {
+          ++depth;
+        } else if (!quoted && !at_end &&
+                   (c == ']' || c == '}' || c == ')')) {
+          --depth;
+        }
+        if (at_end || (!quoted && depth == 0 && c == ',')) {
+          const std::string item = TrimJson(body.substr(start, i - start));
+          if (item.empty() || item == "NULL" || item == "null") {
+            elements.emplace_back(Value());
+          } else if (item.front() == '"' && item.back() == '"' &&
+                     item.size() >= 2) {
+            elements.emplace_back(item.substr(1, item.size() - 2));
+          } else {
+            try {
+              size_t consumed = 0;
+              const int64_t integer = std::stoll(item, &consumed);
+              if (consumed == item.size()) {
+                elements.emplace_back(integer);
+              } else {
+                const double real = std::stod(item, &consumed);
+                elements.emplace_back(real);
+              }
+            } catch (const std::exception&) {
+              elements.emplace_back(std::string(item));
+            }
+          }
+          start = i + 1;
+        }
+      }
+      *parsed = Value::Array(std::move(elements), element_type);
+      return true;
     }
   }
   std::string lowered_head;

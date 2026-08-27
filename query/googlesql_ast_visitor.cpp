@@ -337,13 +337,6 @@ class UdfExpansionDepthGuard {
   UdfExpansionDepthGuard& operator=(const UdfExpansionDepthGuard&) = delete;
 };
 
-bool IsTypeAstNode(std::string_view kind) {
-  return kind == "SimpleType" || kind == "ArrayType" || kind == "StructType" ||
-         kind == "MapType" || kind == "TemplatedParameterType" ||
-         kind == "TVFSchema" || kind == "TypeParameterList" ||
-         kind == "Collate";
-}
-
 Expression SubstituteParameters(
     const Expression& expression,
     const std::unordered_map<std::string, Expression>& bindings);
@@ -1273,6 +1266,7 @@ void ValidateSelectAsProjections(
 // to the existing runtime behavior untouched.
 void ValidateStructCastCoercibility(const GoogleSqlAstNode& node,
                                     bool safe) {
+  (void)safe;
   if (node.children.size() < 2 ||
       node.children[1]->kind != "StructType") {
     return;
@@ -1606,6 +1600,14 @@ Expression VisitFunction(
       name = "byte_length";
     } else if (name == "reverse") {
       name = "byte_reverse";
+    } else if (name == "left") {
+      name = "byte_left";
+    } else if (name == "right") {
+      name = "byte_right";
+    } else if (name == "regexp_instr") {
+      name = "byte_regexp_instr";
+    } else if (name == "regexp_extract_all") {
+      name = "byte_regexp_extract_all";
     }
   }
   std::vector<Expression> arguments;
@@ -2243,18 +2245,20 @@ void CollectFromBoundNames(
       }
       for (const auto& child : unnest->children) {
         if (child->kind.find("Offset") != std::string::npos) {
-          if (const GoogleSqlAstNode* alias = child->Child("Alias")) {
-            if (alias->Child("Identifier") != nullptr) {
-              names->insert(Lower(Identifier(*alias->Child("Identifier"))));
+          if (const GoogleSqlAstNode* offset_alias = child->Child("Alias")) {
+            if (offset_alias->Child("Identifier") != nullptr) {
+              names->insert(
+                  Lower(Identifier(*offset_alias->Child("Identifier"))));
             }
           }
         }
       }
       if (node.Child("WithOffset") != nullptr) {
-        if (const GoogleSqlAstNode* alias =
+        if (const GoogleSqlAstNode* offset_alias =
                 node.Child("WithOffset")->Child("Alias")) {
-          if (alias->Child("Identifier") != nullptr) {
-            names->insert(Lower(Identifier(*alias->Child("Identifier"))));
+          if (offset_alias->Child("Identifier") != nullptr) {
+            names->insert(
+                Lower(Identifier(*offset_alias->Child("Identifier"))));
           } else {
             names->insert("offset");
           }
@@ -2813,6 +2817,17 @@ Expression VisitExpression(
     // encoding uses generic fN keys until renamed here.
     std::vector<std::string> struct_field_names;
     std::vector<Expression> elements;
+    // Establish the element kind before visiting values so a mixed typed
+    // array such as [TIMESTAMP '...', '...'] coerces later string literals.
+    for (const auto& child : node.children) {
+      if (IsAstTrivia(child->kind) || IsArrayTypeNode(child->kind)) {
+        continue;
+      }
+      element_type = InferArrayElementSqlType(*child);
+      if (!element_type.empty()) {
+        break;
+      }
+    }
     for (const auto& child : node.children) {
       if (IsAstTrivia(child->kind)) {
         continue;
@@ -3410,6 +3425,14 @@ Expression VisitExpression(
               static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
         std::string target = SqlTypeFromAst(*node.children[1]);
         if (target.empty()) { target = "INT64"; }
+        // Keep UINT64 literals above INT64_MAX in the engine's signed
+        // bit-pattern representation.  The cast expression and result
+        // formatter already interpret this representation as UINT64; only
+        // narrowing casts must reject it.
+        if (UpperCopy(target) == "UINT64" &&
+            (digits.empty() || digits.front() != '-')) {
+          return ConstantValueExp(Value(static_cast<int64_t>(magnitude)));
+        }
         if (safe_cast_target) { return ConstantValueExp(Value()); }
         throw std::runtime_error(UpperCopy(target) + " out of range: " +
                                  digits);
@@ -3449,6 +3472,17 @@ Expression VisitExpression(
       type_name = "STRING";
     }
     const std::string upper_type = UpperCopy(type_name);
+    // A unary-minus integer literal is still a signed value.  UINT64 uses
+    // the signed bit-pattern only after a valid non-negative value has been
+    // cast, so do not let CAST(-1 AS UINT64) enter that representation.
+    if (upper_type == "UINT64" && node.children[0]->kind == "UnaryExpression" &&
+        node.children[0]->detail == "-") {
+      const GoogleSqlAstNode* literal = node.children[0]->Child("IntLiteral");
+      if (literal != nullptr && literal->detail != "0") {
+        if (safe_cast_target) { return ConstantValueExp(Value()); }
+        throw std::runtime_error("UINT64 out of range: -" + literal->detail);
+      }
+    }
     // Enum-typed casts stay as runtime CAST expressions: the runtime
     // resolves registry members to their names, rejects unknown values for
     // closed (proto2) enums, keeps unknown in-range values for open (proto3)
@@ -3552,7 +3586,13 @@ Expression VisitExpression(
               any_ci = any_ci || v.IsCaseInsensitive();
               if (v.type == ValueType::kVarChar) {
                 field.text = std::string(v.value.varchar_value);
-                field.is_string = true;
+                // Nested STRUCT values are represented as JSON text in the
+                // evaluator, but must remain structural members of the
+                // enclosing object rather than becoming a quoted STRING.
+                field.is_string =
+                    !(arg_node->kind == "StructConstructorWithKeyword" ||
+                      arg_node->kind == "StructConstructorWithParens" ||
+                      arg_node->kind == "StructConstructorWithType");
               } else if (v.type == ValueType::kInt64) {
                 field.text = std::to_string(v.value.int_value);
               } else if (v.type == ValueType::kDouble) {
@@ -4085,11 +4125,139 @@ std::shared_ptr<SelectStatement> VisitQuery(
       }
       if (!operands.empty()) {
         auto first_stmt = VisitQuery(*operands[0]);
+        bool union_distinct = false;
+        bool union_by_name = false;
+        SetOperationKind default_operation = SetOperationKind::kUnionAll;
+      const std::string set_detail = UpperCopy(set_op->detail);
+        if (set_detail.find("INTERSECT") != std::string::npos) {
+          default_operation =
+              set_detail.find("ALL") != std::string::npos
+                  ? SetOperationKind::kIntersectAll
+                  : SetOperationKind::kIntersect;
+        } else if (set_detail.find("EXCEPT") != std::string::npos) {
+          default_operation =
+              set_detail.find("ALL") != std::string::npos
+                  ? SetOperationKind::kExceptAll
+                  : SetOperationKind::kExcept;
+        } else if (set_detail.find("DISTINCT") != std::string::npos) {
+          default_operation = SetOperationKind::kUnion;
+        }
+        if (const GoogleSqlAstNode* metadata_list =
+                set_op->Child("SetOperationMetadataList")) {
+          for (const GoogleSqlAstNode* metadata :
+               metadata_list->Children("SetOperationMetadata")) {
+            const GoogleSqlAstNode* mode =
+                metadata->Child("SetOperationAllOrDistinct");
+            if (mode != nullptr &&
+                UpperCopy(mode->detail).find("DISTINCT") != std::string::npos) {
+              union_distinct = true;
+            }
+            if (metadata->Child("SetOperationColumnMatchMode") != nullptr) {
+              union_by_name = true;
+            }
+          }
+        }
+        if (set_detail.find("DISTINCT") != std::string::npos) {
+          union_distinct = true;
+        }
+        if (union_distinct) {
+          first_stmt->MarkUnionDistinct(union_by_name);
+        }
         for (size_t i = 1; i < operands.size(); ++i) {
-          first_stmt->AddUnionAll(VisitQuery(*operands[i]));
+          first_stmt->AddSetOperation(default_operation, VisitQuery(*operands[i]));
+        }
+        // A set operation is represented by the first operand in the
+        // statement tree, but query-level LIMIT/OFFSET and WITH clauses hang
+        // off the wrapper.  Preserve them here so execution sees the same
+        // scope and applies bounds after concatenating the branches.
+        if (const GoogleSqlAstNode* limit_offset =
+                query.Child("LimitOffset")) {
+          if (const GoogleSqlAstNode* limit_node =
+                  limit_offset->Child("Limit")) {
+            for (const auto& child : limit_node->children) {
+              if (child->kind == "IntLiteral") {
+                first_stmt->SetLimit(
+                    static_cast<size_t>(ParseUnsignedLiteral(*child)));
+                break;
+              }
+            }
+          }
+          for (const auto& child : limit_offset->children) {
+            if (child->kind == "IntLiteral") {
+              first_stmt->SetOffset(ParseUnsignedLiteral(*child));
+            }
+          }
+        }
+        if (const GoogleSqlAstNode* order = query.Child("OrderBy")) {
+          std::vector<SelectStatement::OrderByTerm> order_by;
+          for (const GoogleSqlAstNode* term :
+               order->Children("OrderingExpression")) {
+            WindowOrderTerm parsed = ParseOrderingTerm(term);
+            if (parsed.expression) {
+              order_by.push_back({std::move(parsed.expression),
+                                  parsed.ascending, parsed.nulls_first});
+            }
+          }
+          first_stmt->SetOrderBy(std::move(order_by));
+        }
+        if (const GoogleSqlAstNode* with = query.Child("WithClause")) {
+          const bool recursive =
+              Lower(with->detail).find("recursive") != std::string::npos;
+          for (const GoogleSqlAstNode* entry :
+               with->Children("WithClauseEntry")) {
+            const GoogleSqlAstNode* aliased = entry->Child("AliasedQuery");
+            if (aliased == nullptr) {
+              continue;
+            }
+            const GoogleSqlAstNode* name = aliased->Child("Identifier");
+            const GoogleSqlAstNode* nested = aliased->Child("Query");
+            if (name == nullptr || nested == nullptr) {
+              continue;
+            }
+            const std::string cte_name = Identifier(*name);
+            if (recursive) {
+              first_stmt->AddRecursiveWithQuery(cte_name,
+                                                VisitQuery(*nested));
+            } else {
+              first_stmt->AddWithQuery(cte_name, VisitQuery(*nested));
+            }
+          }
         }
         return first_stmt;
       }
+    }
+    // A parenthesized query can carry its own WITH clause while the outer
+    // query wrapper carries another one.  The parser represents that shape
+    // as Query -> WithClause, Query (without a Select child directly on the
+    // outer node).  Visit the nested query and attach the outer CTE scope.
+    for (const auto& child : query.children) {
+      if (child->kind != "Query") {
+        continue;
+      }
+      auto nested = VisitQuery(*child);
+      if (const GoogleSqlAstNode* with = query.Child("WithClause")) {
+        const bool recursive =
+            Lower(with->detail).find("recursive") != std::string::npos;
+        for (const GoogleSqlAstNode* entry :
+             with->Children("WithClauseEntry")) {
+          const GoogleSqlAstNode* aliased = entry->Child("AliasedQuery");
+          if (aliased == nullptr) {
+            continue;
+          }
+          const GoogleSqlAstNode* name = aliased->Child("Identifier");
+          const GoogleSqlAstNode* body = aliased->Child("Query");
+          if (name == nullptr || body == nullptr) {
+            continue;
+          }
+          const std::string cte_name = Identifier(*name);
+          if (recursive) {
+            nested->AddRecursiveWithQuery(cte_name, VisitQuery(*body));
+          } else {
+            nested->AddWithQuery(cte_name, VisitQuery(*body));
+          }
+        }
+      }
+      return nested;
     }
     throw std::runtime_error("GoogleSQL AST: query without SELECT");
   }
@@ -4186,7 +4354,6 @@ std::shared_ptr<SelectStatement> VisitQuery(
   const GoogleSqlAstNode* select_as = select->Child("SelectAs");
   const GoogleSqlAstNode* as_struct = select->Child("AsStruct");
   const bool is_as_struct =
-      upper_select_detail.find("STRUCT") != std::string::npos ||
       (select_as != nullptr &&
        UpperCopy(select_as->detail).find("STRUCT") != std::string::npos) ||
       as_struct != nullptr;
@@ -4429,6 +4596,8 @@ std::shared_ptr<SelectStatement> VisitQuery(
     }
   }
   if (const GoogleSqlAstNode* with = query.Child("WithClause")) {
+    const bool recursive =
+        Lower(with->detail).find("recursive") != std::string::npos;
     for (const GoogleSqlAstNode* entry : with->Children("WithClauseEntry")) {
       const GoogleSqlAstNode* aliased = entry->Child("AliasedQuery");
       if (aliased == nullptr) {
@@ -4437,7 +4606,43 @@ std::shared_ptr<SelectStatement> VisitQuery(
       const GoogleSqlAstNode* name = aliased->Child("Identifier");
       const GoogleSqlAstNode* nested = aliased->Child("Query");
       if (name != nullptr && nested != nullptr) {
-        statement->AddWithQuery(Identifier(*name), VisitQuery(*nested));
+        const std::string cte_name = Identifier(*name);
+        if (recursive) {
+          statement->AddRecursiveWithQuery(cte_name, VisitQuery(*nested));
+          if (const GoogleSqlAstNode* modifiers =
+                  aliased->Child("AliasedQueryModifiers")) {
+            if (const GoogleSqlAstNode* depth_modifier =
+                    modifiers->Child("RecursionDepthModifier")) {
+              RecursiveDepthSpec spec;
+              if (const GoogleSqlAstNode* alias =
+                      depth_modifier->Child("Alias")) {
+                if (const GoogleSqlAstNode* column =
+                        alias->Child("Identifier")) {
+                  spec.column = Identifier(*column);
+                }
+              }
+              const auto bounds =
+                  depth_modifier->Children("IntOrUnbounded");
+              auto bound_value = [&](size_t index, int64_t fallback) {
+                if (index >= bounds.size()) {
+                  return fallback;
+                }
+                for (const auto& child : bounds[index]->children) {
+                  if (child->kind == "IntLiteral") {
+                    return static_cast<int64_t>(ParseUnsignedLiteral(*child));
+                  }
+                }
+                return fallback;
+              };
+              spec.lower = bound_value(0, 0);
+              spec.upper =
+                  bound_value(1, std::numeric_limits<int64_t>::max());
+              statement->SetRecursiveDepth(cte_name, std::move(spec));
+            }
+          }
+        } else {
+          statement->AddWithQuery(cte_name, VisitQuery(*nested));
+        }
       }
     }
   }

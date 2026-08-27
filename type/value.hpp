@@ -164,7 +164,7 @@ class Value {
 // deterministic total order instead of throwing.
 // Returns a negative value when a sorts before b, zero when equal under the
 // ordering, positive when a sorts after b.
-[[nodiscard]] friend int CompareForOrderBy(const Value& a, const Value& b);
+friend int CompareForOrderBy(const Value& a, const Value& b);
 
   // Read/Write with type info.
   friend Encoder& operator<<(Encoder& a, const Value& v);

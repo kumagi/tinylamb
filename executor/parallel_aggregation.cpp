@@ -153,6 +153,9 @@ void ParallelAggregationExecutor::AccumulateValue(
         state->values[index] = Value((state->values[index].Truthy() || value.Truthy()) ? int64_t{1} : int64_t{0});
       }
       break;
+    default:
+      // Unsupported aggregate kinds use the generic executor path.
+      break;
   }
 }
 
@@ -294,6 +297,8 @@ void ParallelAggregationExecutor::AccumulateInt64Column(
       }
       break;
     }
+    default:
+      break;
   }
 }
 
@@ -362,6 +367,8 @@ void ParallelAggregationExecutor::AccumulateDoubleColumn(
       }
       break;
     }
+    default:
+      break;
   }
 }
 
@@ -425,6 +432,9 @@ void ParallelAggregationExecutor::Merge(PartialState* destination,
             destination->values[index] = Value((destination->values[index].Truthy() || source.values[index].Truthy()) ? int64_t{1} : int64_t{0});
           }
         }
+        break;
+      default:
+        // Non-streamable aggregate kinds are not assigned to this executor.
         break;
     }
   }

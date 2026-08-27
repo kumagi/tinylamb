@@ -123,12 +123,36 @@ void Logger::AdvanceDurable(lsn_t to) {
 }
 
 void Logger::WaitForDurable(lsn_t lsn) {
-  std::unique_lock lock(durable_mu_);
-  durable_cv_.wait(lock, [&] {
-    return failed_.load(std::memory_order_acquire) ||
-           durable_lsn_.load(std::memory_order_acquire) >= lsn;
-  });
+  pending_durable_waiters_.fetch_add(1, std::memory_order_acq_rel);
+  const bool already_satisfied =
+      failed_.load(std::memory_order_acquire) ||
+      durable_lsn_.load(std::memory_order_acquire) >= lsn;
+  if (!already_satisfied) {
+    // Nudge the worker: it will fsync promptly when it sees the non-zero
+    // waiter count even if the timer has not elapsed.
+    NotifyWorker();
+    std::unique_lock lock(durable_mu_);
+    durable_cv_.wait(lock, [&] {
+      return failed_.load(std::memory_order_acquire) ||
+             durable_lsn_.load(std::memory_order_acquire) >= lsn;
+    });
+  }
+  pending_durable_waiters_.fetch_sub(1, std::memory_order_acq_rel);
   RaiseIfFailed();
+}
+
+void Logger::AdviseOldBytesDurable(lsn_t before) {
+  if (before == 0 || dst_ < 0) { return; }
+#ifdef POSIX_FADV_DONTNEED
+  // Drop [0, before) from page cache: those bytes are now safe to discard
+  // because the checkpoint that anchored them has been durably committed to
+  // the master record. Without this hint fdatasync keeps having to wait for
+  // every dirty page from the start of the WAL to reach disk, which on long
+  // TPC-C runs turns a sub-millisecond barrier into a multi-millisecond one.
+  ::posix_fadvise(dst_, 0, static_cast<off_t>(before), POSIX_FADV_DONTNEED);
+#else
+  (void)before;
+#endif
 }
 
 void Logger::DrainAndStopWorker() {
@@ -266,8 +290,17 @@ void Logger::LoggerWork() {
       dirty = true;
       NotifyWorker();
     }
-    if (finish_.load(std::memory_order_acquire) ||
-        Clock::now() - last_sync >= sync_interval_) {
+    // Adaptive group commit: if any producer is blocked in WaitForDurable,
+    // fsync immediately so they wake up on this iteration rather than after
+    // the full sync_interval_ of latency. A bare timer would otherwise cap
+    // throughput at floor(1 second / sync_interval_) * num_producers_per_fsync
+    // barriers per second even when fsync itself is sub-millisecond.
+    const bool timer_elapsed =
+        Clock::now() - last_sync >= sync_interval_;
+    const bool waiter_present =
+        pending_durable_waiters_.load(std::memory_order_acquire) > 0;
+    if (finish_.load(std::memory_order_acquire) || timer_elapsed ||
+        waiter_present) {
       if (FdataSync(dst_) != 0) {
         SetFailed(errno);
         return;
