@@ -65,23 +65,31 @@ if(TINYLAMB_ENABLE_GOOGLESQL)
     endif()
 
     if(TINYLAMB_ENABLE_GOOGLESQL AND NOT EXISTS "${_googlesql_executable}")
-        file(MAKE_DIRECTORY "${_googlesql_download_dir}")
-        file(DOWNLOAD
-             "https://github.com/google/googlesql/releases/download/${TINYLAMB_GOOGLESQL_VERSION}/${_googlesql_asset}"
-             "${_googlesql_executable}"
-             EXPECTED_HASH "SHA256=${_googlesql_sha256}"
-             SHOW_PROGRESS
-             STATUS _googlesql_download_status)
-        list(GET _googlesql_download_status 0 _googlesql_download_code)
-        if(NOT _googlesql_download_code EQUAL 0)
-            list(GET _googlesql_download_status 1 _googlesql_download_error)
-            message(FATAL_ERROR
-                    "Failed to download GoogleSQL ${TINYLAMB_GOOGLESQL_VERSION}: "
-                    "${_googlesql_download_error}")
+        if(EXISTS "/google/bin/releases/googlesql-devtools/execute_query/execute_query")
+            file(MAKE_DIRECTORY "${_googlesql_download_dir}")
+            file(COPY "/google/bin/releases/googlesql-devtools/execute_query/execute_query"
+                 DESTINATION "${_googlesql_download_dir}"
+                 FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                                  GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+        else()
+            file(MAKE_DIRECTORY "${_googlesql_download_dir}")
+            file(DOWNLOAD
+                 "https://github.com/google/googlesql/releases/download/${TINYLAMB_GOOGLESQL_VERSION}/${_googlesql_asset}"
+                 "${_googlesql_executable}"
+                 EXPECTED_HASH "SHA256=${_googlesql_sha256}"
+                 SHOW_PROGRESS
+                 STATUS _googlesql_download_status)
+            list(GET _googlesql_download_status 0 _googlesql_download_code)
+            if(NOT _googlesql_download_code EQUAL 0)
+                list(GET _googlesql_download_status 1 _googlesql_download_error)
+                message(FATAL_ERROR
+                        "Failed to download GoogleSQL ${TINYLAMB_GOOGLESQL_VERSION}: "
+                        "${_googlesql_download_error}")
+            endif()
+            file(CHMOD "${_googlesql_executable}"
+                 PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                             GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
         endif()
-        file(CHMOD "${_googlesql_executable}"
-             PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
-                         GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
     endif()
 endif()
 
@@ -266,6 +274,7 @@ tinylamb_add_layer(tinylamb_table
         table/table.cpp
         table/full_scan_iterator.cpp
         table/table_statistics.cpp
+        table/hyper_log_log.cpp
         index/index_scan_iterator.cpp
         DEPENDS tinylamb::index)
 
@@ -335,6 +344,7 @@ tinylamb_add_layer(tinylamb_executor
         executor/merge_join.cpp
         executor/merge_append.cpp
         executor/cross_join.cpp
+        executor/nested_loop_join.cpp
         executor/insert.cpp
         executor/update.cpp
         executor/delete.cpp
@@ -345,6 +355,8 @@ tinylamb_add_layer(tinylamb_executor
         executor/set_operation.cpp
         executor/distinct.cpp
         executor/values.cpp
+        executor/generate_series.cpp
+        executor/returning.cpp
         executor/relational.cpp
         executor/relational_factory.cpp
         executor/detail/relation.cpp
@@ -357,7 +369,36 @@ tinylamb_add_layer(tinylamb_executor
         executor/index_scan.cpp
         executor/index_only_scan.cpp
         executor/index_join.cpp
+        executor/bitmap_scan.cpp
+        executor/tid_scan.cpp
+        executor/truncate.cpp
+        executor/partial_aggregate.cpp
+        executor/two_phase_distinct_agg.cpp
+        executor/merge.cpp
+        executor/as_of_join.cpp
+        executor/interval_join.cpp
+        executor/grouping_sets.cpp
+        executor/selection_vector.cpp
+        executor/vectorized_expression.cpp
+        executor/chunked_scan.cpp
+        executor/materialize.cpp
+        executor/operator_memory.cpp
+        executor/parallel_hash_join.cpp
+        executor/parallel_merge_join.cpp
+        executor/simd_comparison.cpp
+        executor/dictionary_batch_aggregation.cpp
+        executor/numa_arena.cpp
+        executor/exchange.cpp
+        executor/remote_scan.cpp
+        executor/distributed_agg_finalize.cpp
+        executor/batch_nested_loop_join.cpp
+        executor/pdqsort.cpp
+        executor/incremental_sort.cpp
+        executor/partial_sort.cpp
+        executor/skip_scan_distinct.cpp
         executor/constant_executor.cpp
+        executor/analyze_scan.cpp
+        executor/cardinality_probe.cpp
         plan/full_scan_plan.cpp
         plan/projection_plan.cpp
         plan/selection_plan.cpp
@@ -563,23 +604,26 @@ add_benchmark("index/lsm_detail/lsm_tree_bench.cpp")
 ## Testing
 ########################################
 if(BUILD_TESTING)
-    include(FetchContent)
-    FetchContent_Declare(
-            googletest
-            URL https://github.com/google/googletest/archive/refs/tags/v${TINYLAMB_GOOGLETEST_VERSION}.zip
-            URL_HASH SHA256=${TINYLAMB_GOOGLETEST_SHA256}
-    )
+    find_package(GTest QUIET)
+    if(NOT GTest_FOUND)
+        include(FetchContent)
+        FetchContent_Declare(
+                googletest
+                URL https://github.com/google/googletest/archive/refs/tags/v${TINYLAMB_GOOGLETEST_VERSION}.zip
+                URL_HASH SHA256=${TINYLAMB_GOOGLETEST_SHA256}
+        )
 
-    # Keep the dependency focused on the test library used here.
-    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
-    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
-    set(INSTALL_GMOCK OFF CACHE BOOL "" FORCE)
-    set(gtest_build_tests OFF CACHE BOOL "" FORCE)
-    if(WIN32)
-        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+        # Keep the dependency focused on the test library used here.
+        set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+        set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+        set(INSTALL_GMOCK OFF CACHE BOOL "" FORCE)
+        set(gtest_build_tests OFF CACHE BOOL "" FORCE)
+        if(WIN32)
+            set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+        endif()
+
+        FetchContent_MakeAvailable(googletest)
     endif()
-
-    FetchContent_MakeAvailable(googletest)
     include(GoogleTest)
 
     function(add_simple_test file_path)
@@ -646,6 +690,7 @@ add_simple_test(type/column_name_test.cpp)
 add_simple_test(plan/optimizer_test.cpp)
 add_simple_test(plan/cascades_test.cpp)
 add_simple_test(table/table_statistics_test.cpp)
+add_simple_test(table/hyper_log_log_test.cpp)
 add_simple_test(index/lsm_detail/blob_file_test.cpp)
 add_simple_test(index/lsm_detail/lsm_view_test.cpp)
 add_simple_test(index/lsm_detail/cache_test.cpp)

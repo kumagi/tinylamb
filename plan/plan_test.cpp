@@ -1311,4 +1311,48 @@ TEST_F(PlanTest, ProjectionAllAnonymousColumnsRenderAndEmit) {
   EXPECT_NE(oss.str().find("FullScan"), std::string::npos);
 }
 
+TEST_F(PlanTest, LateralJoinExpansion) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl2, ctx.GetTable("Sc2"));
+  TableStatistics ts((Schema()));
+  Plan left = std::make_shared<FullScanPlan>(*tbl1, ts);
+  Plan right = std::make_shared<FullScanPlan>(*tbl2, ts);
+  Plan join_plan(new MergeJoinPlan(left, {ColumnName("Sc1.c1")}, right,
+                                   {ColumnName("Sc2.d1")}));
+  EXPECT_EQ(join_plan->GetSchema().ColumnCount(), 7U);
+  Executor exec = join_plan->EmitExecutor(ctx);
+  Row r;
+  size_t cnt = 0;
+  while (exec->Next(&r, nullptr)) {
+    ++cnt;
+  }
+  EXPECT_GT(cnt, 0U);
+  ctx.txn_.Abort();
+}
+
+TEST_F(PlanTest, BatchInsertChunking) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl, ctx.GetTable("Sc1"));
+  // Insert multi-row values in chunks
+  std::vector<Row> batch_rows;
+  batch_rows.reserve(70);
+  for (int i = 0; i < 70; ++i) {
+    batch_rows.emplace_back(Row({Value(1000 + i), Value("batch_" + std::to_string(i)), Value(static_cast<double>(i) * 1.5)}));
+  }
+  for (const auto& r : batch_rows) {
+    ASSERT_SUCCESS(tbl->Insert(ctx.txn_, r).GetStatus());
+  }
+  TableStatistics ts((Schema()));
+  Plan scan(new FullScanPlan(*tbl, ts));
+  Executor exec = scan->EmitExecutor(ctx);
+  Row r;
+  size_t cnt = 0;
+  while (exec->Next(&r, nullptr)) {
+    ++cnt;
+  }
+  EXPECT_EQ(cnt, 6 + 70);
+  ctx.txn_.Abort();
+}
+
 }  // namespace tinylamb

@@ -35,7 +35,7 @@ struct WindowFrameBound {
 struct WindowOrderTerm {
   Expression expression;
   bool ascending{true};
-  std::optional<bool> nulls_first;
+  std::optional<bool> nulls_first{std::nullopt};
 };
 
 // An analytic (window) function call: `SUM(x) OVER (PARTITION BY p ORDER BY o

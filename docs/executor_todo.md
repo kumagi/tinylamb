@@ -105,7 +105,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [ ] `DynamicFilterJoin` / sideway information passing（ブルームをスキャンへ）
 - [ ] `HashSemiReduction`（巨大ファクトの前に次元を縮約）
 - [x] `CrossJoinUnnest`（定数/相関配列を通常の cross/lateral 行源として結合、SQL 回帰あり）
-- [ ] `AsOfJoin` / `IntervalJoin`（時系列、将来）
+- [x] `AsOfJoin` / `IntervalJoin`（時系列、将来）
 
 ---
 
@@ -119,12 +119,12 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `TopNPlan` / `TopNExecutor`（ヒープで `OFFSET + LIMIT` 件だけ保持）
 - [x] `TopNPlusOffset`（TopNの容量と出力位置で対応）
 - [x] `WITH TIES` Top-N（TopNExecutor の ties 境界拡張）
-- [ ] `IncrementalSort`（入力が prefix ソート済み）
-- [ ] `PartialSort`
+- [x] `IncrementalSort`（入力が prefix ソート済み）
+- [x] `PartialSort`
 - [ ] `ClusteredIndexOrder` を FullScan が報告（PK 順ページ）
 - [x] `LimitPushdownScan`（unordered LIMIT の OFFSET + LIMIT 上限を FullScan が
-     受け取り、スカラー/バッチ双方で early stop）
-- [ ] `SkipScanDistinct`（インデックスで DISTINCT キーを飛ばす）
+      受け取り、スカラー/バッチ双方で early stop）
+- [x] `SkipScanDistinct`（インデックスで DISTINCT キーを飛ばす）
 - [x] collation / nulls first/last を比較器に（Sort / TopN と SQL の明示
       `NULLS FIRST` / `NULLS LAST` を接続。collation の多言語拡張は別項目）
 - [x] 安定ソート vs 非安定の文書化（SortExecutor は安定ソートを保証）
@@ -139,24 +139,24 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
       Cascades 接続までは別項目）
 - [ ] `StreamAggregate`（入力が group キー順。前提: Cascades 論理ペイロードへの
       GROUP BY キー導入が未着手のため、単体実行器だけでは接続先がない）
-- [ ] `PartialAggregate` + `FinalizeAggregate`（並列・分散）
+- [x] `PartialAggregate` + `FinalizeAggregate`（並列・分散）
 - [x] `DistinctAggregate`（逐次・並列 `Aggregation` が aggregate metadata の
       DISTINCT 集合を保持して `COUNT(DISTINCT x)` を処理）
-- [ ] `TwoPhaseDistinctAgg`
+- [x] `TwoPhaseDistinctAgg`
 - [ ] `MinMaxIndexScan`（INDEX ONLY で MIN/MAX）
 - [x] `FilteredAggregate`（GoogleSQL `AGG(x WHERE …)`。直列・並列集約と
       `COUNT(*)` のフィルタ順序を回帰）
 - [ ] SQL 標準 `AGG(...) FILTER (WHERE …)` の AST 接続
-- [ ] `OrderedSetAggregate`（`PERCENTILE_CONT` / `WITHIN GROUP`）
-- [ ] `GroupingSetsExecutor` / `Rollup` / `Cube`（Expand + Agg または複数 Agg）
+- [x] `OrderedSetAggregate`（`PERCENTILE_CONT` / `WITHIN GROUP`）
+- [x] `GroupingSetsExecutor` / `Rollup` / `Cube`（Expand + Agg または複数 Agg）
 - [x] `ScalarAggEmptyInput`（0 行で COUNT=0、SUM=NULL。AVG/MIN/MAX の NULL も
       含め、逐次・並列集約で回帰テスト済み）
 - [x] spill 付きハッシュ集約の計画接続（Relational fallback の partitioned aggregation、予算超過回帰テストあり）
 - [x] `MemoryLimitedAgg` の強制 spill（grouped relational aggregation が
       `QueryMemoryBudget` を監視して hash partition + `SpillFile` に切り替え。
       `Relational_WithPartitionedAggregationUnderBudget_SpillsToDisk` で回帰）
-- [ ] bitwise / bool_and / bool_or のベクトル化パス
-- [ ] `ANY_VALUE` 短絡
+- [x] bitwise / bool_and / bool_or のベクトル化パス
+- [x] `ANY_VALUE` 短絡
 
 ---
 
@@ -299,7 +299,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `BatchInsert`（`Insert` が複数行 source を最後まで消費して一括挿入。
       `Insert_FromSourceTable_InsertsAllRows` と上記 INSERT SELECT 回帰で確認）
 - [ ] `Upsert` / `ON CONFLICT`
-- [ ] `MergeExecutor`（MATCHED / NOT MATCHED）
+- [x] `MergeExecutor`（MATCHED / NOT MATCHED）
 - [ ] `UpdateFrom` / `DeleteUsing`（結合更新）
 - [ ] `ReturningExecutor`
 - [ ] `LockRows` / `SELECT FOR UPDATE`
@@ -364,11 +364,11 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 ## P5 — サンプリング・統計収集実行
 
-- [ ] `AnalyzeScan`（ヒストグラム構築用）
-- [ ] `ReservoirSample`
-- [ ] `BlockSample`
-- [ ] `HyperLogLogScan`
-- [ ] 実行時フィードバック用 `CardinalityProbe`（デバッグ）
+- [x] `AnalyzeScan`（ヒストグラム構築用）
+- [x] `ReservoirSample`
+- [x] `BlockSample`
+- [x] `HyperLogLogScan`
+- [x] 実行時フィードバック用 `CardinalityProbe`（デバッグ）
 
 ---
 

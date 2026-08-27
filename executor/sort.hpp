@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "executor/executor_base.hpp"
+#include "executor/pipeline_breaker.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
@@ -16,7 +17,7 @@
 #include "type/schema.hpp"
 
 namespace tinylamb {
-class SortExecutor : public ExecutorBase {
+class SortExecutor : public ExecutorBase, public PipelineBreaker {
  public:
   struct Key {
     Expression expression;
@@ -31,6 +32,12 @@ class SortExecutor : public ExecutorBase {
         worker_count_(std::max<size_t>(1, worker_count)) {}
   bool Next(Row* dst, RowPosition* rp) override;
   void Dump(std::ostream& output, int indent) const override;
+
+  // PipelineBreaker interface
+  [[nodiscard]] bool IsMaterialized() const override { return materialized_; }
+  void MaterializePipeline() override { Materialize(); }
+  [[nodiscard]] size_t MaterializedRowCount() const override { return rows_.size(); }
+  [[nodiscard]] size_t MaterializedBytes() const override { return rows_charge_.Bytes(); }
 
  private:
   void Materialize();

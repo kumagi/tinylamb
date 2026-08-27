@@ -2,17 +2,23 @@
 #include "expression/rewrite.hpp"
 
 #include "common/constants.hpp"
+#include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
-#include "expression/rewrite.hpp"
+#include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
+#include "expression/interval_expression.hpp"
 #include "expression/query_expression.hpp"
+#include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "gtest/gtest.h"
 #include "type/column_name.hpp"
+#include "type/row.hpp"
+#include "type/schema.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
 
@@ -893,6 +899,708 @@ TEST(ExpressionRewriteTest, ExpressionChildrenRewritesCast) {
   std::vector<Expression> children = ExpressionChildren(cast);
   ASSERT_EQ(children.size(), 1);
   EXPECT_EQ(WithExpressionChildren(cast, children)->Type(), TypeTag::kCastExp);
+}
+
+TEST(ExpressionRewriteTest, JsonPathConstantFold) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  // JSON_EXTRACT with constant json and path
+  Expression extract = FunctionCallExp(
+      "json_extract",
+      {ConstantValueExp(Value("{\"a\": 1, \"b\": \"hello\"}")),
+       ConstantValueExp(Value("$.a"))});
+  Expression rewritten_extract = rewriter.Rewrite(extract);
+  ASSERT_EQ(rewritten_extract->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_extract->AsConstantValue().GetValue(), Value("1"));
+
+  // JSON_VALUE extracting scalar string
+  Expression val_call = FunctionCallExp(
+      "json_value",
+      {ConstantValueExp(Value("{\"name\": \"Alice\"}")),
+       ConstantValueExp(Value("$.name"))});
+  Expression rewritten_val = rewriter.Rewrite(val_call);
+  ASSERT_EQ(rewritten_val->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_val->AsConstantValue().GetValue(), Value("Alice"));
+
+  // JSON_QUERY extracting object/array
+  Expression query_call = FunctionCallExp(
+      "json_query",
+      {ConstantValueExp(Value("{\"items\": [10, 20]}")),
+       ConstantValueExp(Value("$.items"))});
+  Expression rewritten_query = rewriter.Rewrite(query_call);
+  ASSERT_EQ(rewritten_query->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_query->AsConstantValue().GetValue(), Value("[10,20]"));
+
+  // Default path $ when omitted
+  Expression extract_root = FunctionCallExp(
+      "json_extract",
+      {ConstantValueExp(Value("{\"x\": 42}"))});
+  Expression rewritten_root = rewriter.Rewrite(extract_root);
+  ASSERT_EQ(rewritten_root->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_root->AsConstantValue().GetValue(), Value("{\"x\":42}"));
+}
+
+TEST(ExpressionRewriteTest, NumericWideningCast) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression x = ColumnValueExp("x");
+
+  // CAST(CAST(x AS INT32) AS INT64) -> CAST(x AS INT64)
+  Expression nested_int = CastExpressionExp(
+      CastExpressionExp(x, "INT32"), "INT64");
+  Expression rewritten_int = rewriter.Rewrite(nested_int);
+  ASSERT_EQ(rewritten_int->Type(), TypeTag::kCastExp);
+  EXPECT_EQ(rewritten_int->AsCastExpression().TargetTypeName(), "INT64");
+  EXPECT_EQ(rewritten_int->AsCastExpression().Child()->Type(), TypeTag::kColumnValue);
+
+  // CAST(CAST(x AS UINT8) AS INT32) -> CAST(x AS INT32)
+  Expression nested_uint = CastExpressionExp(
+      CastExpressionExp(x, "UINT8"), "INT32");
+  Expression rewritten_uint = rewriter.Rewrite(nested_uint);
+  ASSERT_EQ(rewritten_uint->Type(), TypeTag::kCastExp);
+  EXPECT_EQ(rewritten_uint->AsCastExpression().TargetTypeName(), "INT32");
+
+  // CAST(CAST(x AS FLOAT) AS DOUBLE) -> CAST(x AS DOUBLE)
+  Expression nested_float = CastExpressionExp(
+      CastExpressionExp(x, "FLOAT"), "DOUBLE");
+  Expression rewritten_float = rewriter.Rewrite(nested_float);
+  ASSERT_EQ(rewritten_float->Type(), TypeTag::kCastExp);
+  EXPECT_EQ(rewritten_float->AsCastExpression().TargetTypeName(), "DOUBLE");
+
+  // Narrowing cast CAST(CAST(x AS INT64) AS INT32) should NOT be collapsed
+  Expression narrowing = CastExpressionExp(
+      CastExpressionExp(x, "INT64"), "INT32");
+  Expression rewritten_narrowing = rewriter.Rewrite(narrowing);
+  ASSERT_EQ(rewritten_narrowing->Type(), TypeTag::kCastExp);
+  EXPECT_EQ(rewritten_narrowing->AsCastExpression().Child()->Type(), TypeTag::kCastExp);
+
+  // Constant cast folding CAST(123 AS DOUBLE)
+  Expression constant_cast = CastExpressionExp(ConstantValueExp(Value(int64_t{123})), "DOUBLE");
+  Expression rewritten_const = rewriter.Rewrite(constant_cast);
+  ASSERT_EQ(rewritten_const->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_const->AsConstantValue().GetValue(), Value(123.0));
+}
+
+TEST(ExpressionRewriteTest, OrOfRangesToIn) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression x = ColumnValueExp("x");
+
+  // (x = 1 OR x = 2 OR x = 3) -> x IN (1, 2, 3)
+  Expression or_chain = BinaryExpressionExp(
+      BinaryExpressionExp(
+          BinaryExpressionExp(x, BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{1}))),
+          BinaryOperation::kOr,
+          BinaryExpressionExp(x, BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{2})))),
+      BinaryOperation::kOr,
+      BinaryExpressionExp(x, BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{3}))));
+
+  Expression rewritten = rewriter.Rewrite(or_chain);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kInExp);
+  const auto& in_exp = rewritten->AsInExpression();
+  EXPECT_EQ(in_exp.child_->Type(), TypeTag::kColumnValue);
+  EXPECT_EQ(in_exp.list_.size(), 3);
+
+  // (1 = x OR 2 = x) -> x IN (1, 2)
+  Expression reversed_eq = BinaryExpressionExp(
+      BinaryExpressionExp(ConstantValueExp(Value(int64_t{1})), BinaryOperation::kEquals, x),
+      BinaryOperation::kOr,
+      BinaryExpressionExp(ConstantValueExp(Value(int64_t{2})), BinaryOperation::kEquals, x));
+  Expression rewritten_rev = rewriter.Rewrite(reversed_eq);
+  ASSERT_EQ(rewritten_rev->Type(), TypeTag::kInExp);
+  EXPECT_EQ(rewritten_rev->AsInExpression().list_.size(), 2);
+
+  // (x IN (1, 2) OR x = 3) -> x IN (1, 2, 3)
+  Expression in_or_eq = BinaryExpressionExp(
+      InExpressionExp(x, {ConstantValueExp(Value(int64_t{1})), ConstantValueExp(Value(int64_t{2}))}),
+      BinaryOperation::kOr,
+      BinaryExpressionExp(x, BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{3}))));
+  Expression rewritten_in_or = rewriter.Rewrite(in_or_eq);
+  ASSERT_EQ(rewritten_in_or->Type(), TypeTag::kInExp);
+  EXPECT_EQ(rewritten_in_or->AsInExpression().list_.size(), 3);
+}
+
+TEST(ExpressionRewriteTest, IntervalNormalize) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression iv1 = IntervalExpressionExp(1, "day");
+  Expression iv2 = IntervalExpressionExp(2, "day");
+  Expression iv5 = IntervalExpressionExp(5, "day");
+
+  // INTERVAL '1' DAY + INTERVAL '2' DAY -> INTERVAL '3' DAY
+  Expression add_iv = BinaryExpressionExp(iv1, BinaryOperation::kAdd, iv2);
+  Expression rewritten_add = rewriter.Rewrite(add_iv);
+  ASSERT_EQ(rewritten_add->Type(), TypeTag::kIntervalExp);
+  EXPECT_EQ(rewritten_add->AsIntervalExpression().GetIntervalValue().days, 3);
+
+  // INTERVAL '5' DAY - INTERVAL '2' DAY -> INTERVAL '3' DAY
+  Expression sub_iv = BinaryExpressionExp(iv5, BinaryOperation::kSubtract, iv2);
+  Expression rewritten_sub = rewriter.Rewrite(sub_iv);
+  ASSERT_EQ(rewritten_sub->Type(), TypeTag::kIntervalExp);
+  EXPECT_EQ(rewritten_sub->AsIntervalExpression().GetIntervalValue().days, 3);
+
+  // INTERVAL '2' DAY * 3 -> INTERVAL '6' DAY
+  Expression mul_iv = BinaryExpressionExp(
+      iv2, BinaryOperation::kMultiply, ConstantValueExp(Value(int64_t{3})));
+  Expression rewritten_mul = rewriter.Rewrite(mul_iv);
+  ASSERT_EQ(rewritten_mul->Type(), TypeTag::kIntervalExp);
+  EXPECT_EQ(rewritten_mul->AsIntervalExpression().GetIntervalValue().days, 6);
+
+  // 3 * INTERVAL '2' DAY -> INTERVAL '6' DAY
+  Expression mul_iv2 = BinaryExpressionExp(
+      ConstantValueExp(Value(int64_t{3})), BinaryOperation::kMultiply, iv2);
+  Expression rewritten_mul2 = rewriter.Rewrite(mul_iv2);
+  ASSERT_EQ(rewritten_mul2->Type(), TypeTag::kIntervalExp);
+  EXPECT_EQ(rewritten_mul2->AsIntervalExpression().GetIntervalValue().days, 6);
+
+  // - INTERVAL '5' DAY -> INTERVAL '-5' DAY
+  Expression neg_iv = UnaryExpressionExp(iv5, UnaryOperation::kMinus);
+  Expression rewritten_neg = rewriter.Rewrite(neg_iv);
+  ASSERT_EQ(rewritten_neg->Type(), TypeTag::kIntervalExp);
+  EXPECT_EQ(rewritten_neg->AsIntervalExpression().GetIntervalValue().days, -5);
+
+  // JUSTIFY_HOURS(INTERVAL '30' HOUR)
+  Expression iv30h = IntervalExpressionExp(30, "hour");
+  Expression justify_h = FunctionCallExp("justify_hours", {iv30h});
+  Expression rewritten_jh = rewriter.Rewrite(justify_h);
+  ASSERT_EQ(rewritten_jh->Type(), TypeTag::kIntervalExp);
+  EXPECT_EQ(rewritten_jh->AsIntervalExpression().GetIntervalValue().days, 1);
+  EXPECT_EQ(rewritten_jh->AsIntervalExpression().GetIntervalValue().nanos,
+            6LL * 3600LL * 1000000000LL);
+
+  // JUSTIFY_DAYS(INTERVAL '35' DAY)
+  Expression iv35d = IntervalExpressionExp(35, "day");
+  Expression justify_d = FunctionCallExp("justify_days", {iv35d});
+  Expression rewritten_jd = rewriter.Rewrite(justify_d);
+  ASSERT_EQ(rewritten_jd->Type(), TypeTag::kIntervalExp);
+  EXPECT_EQ(rewritten_jd->AsIntervalExpression().GetIntervalValue().months, 1);
+  EXPECT_EQ(rewritten_jd->AsIntervalExpression().GetIntervalValue().days, 5);
+
+  // JUSTIFY_INTERVAL(INTERVAL '35' DAY + INTERVAL '30' HOUR)
+  Expression iv_combined =
+      BinaryExpressionExp(iv35d, BinaryOperation::kAdd, iv30h);
+  Expression justify_all = FunctionCallExp("justify_interval", {iv_combined});
+  Expression rewritten_ja = rewriter.Rewrite(justify_all);
+  ASSERT_EQ(rewritten_ja->Type(), TypeTag::kIntervalExp);
+  EXPECT_EQ(rewritten_ja->AsIntervalExpression().GetIntervalValue().months, 1);
+  EXPECT_EQ(rewritten_ja->AsIntervalExpression().GetIntervalValue().days, 6);
+  EXPECT_EQ(rewritten_ja->AsIntervalExpression().GetIntervalValue().nanos,
+            6LL * 3600LL * 1000000000LL);
+}
+
+TEST(ExpressionRewriteTest, PredicatePushdownCase) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression c1 = ColumnValueExp("c1");
+  Expression v1 = ColumnValueExp("v1");
+  Expression v2 = ColumnValueExp("v2");
+  Expression case_exp = CaseExpressionExp({{c1, v1}}, v2);
+
+  // Unary IS NULL pushdown
+  Expression is_null = UnaryExpressionExp(case_exp, UnaryOperation::kIsNull);
+  Expression rewritten_unary = rewriter.Rewrite(is_null);
+  ASSERT_EQ(rewritten_unary->Type(), TypeTag::kCaseExp);
+  const auto& case_unary = rewritten_unary->AsCaseExpression();
+  ASSERT_EQ(case_unary.when_clauses_.size(), 1);
+  EXPECT_EQ(case_unary.when_clauses_[0].second->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(case_unary.when_clauses_[0].second->AsUnaryExpression().Op(),
+            UnaryOperation::kIsNull);
+  EXPECT_EQ(case_unary.else_clause_->Type(), TypeTag::kUnaryExp);
+
+  // Binary = pushdown
+  Expression eq = BinaryExpressionExp(case_exp, BinaryOperation::kEquals,
+                                      ConstantValueExp(Value(int64_t{10})));
+  Expression rewritten_binary = rewriter.Rewrite(eq);
+  ASSERT_EQ(rewritten_binary->Type(), TypeTag::kCaseExp);
+  const auto& case_bin = rewritten_binary->AsCaseExpression();
+  ASSERT_EQ(case_bin.when_clauses_.size(), 1);
+  EXPECT_EQ(case_bin.when_clauses_[0].second->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(case_bin.when_clauses_[0].second->AsBinaryExpression().Op(),
+            BinaryOperation::kEquals);
+
+  // IN list pushdown
+  Expression in = InExpressionExp(case_exp,
+                                  {ConstantValueExp(Value(int64_t{1})),
+                                   ConstantValueExp(Value(int64_t{2}))});
+  Expression rewritten_in = rewriter.Rewrite(in);
+  ASSERT_EQ(rewritten_in->Type(), TypeTag::kCaseExp);
+  const auto& case_in = rewritten_in->AsCaseExpression();
+  ASSERT_EQ(case_in.when_clauses_.size(), 1);
+  EXPECT_EQ(case_in.when_clauses_[0].second->Type(), TypeTag::kInExp);
+
+  // CAST pushdown
+  Expression cast = CastExpressionExp(case_exp, "INT64");
+  Expression rewritten_cast = rewriter.Rewrite(cast);
+  ASSERT_EQ(rewritten_cast->Type(), TypeTag::kCaseExp);
+  const auto& case_cast = rewritten_cast->AsCaseExpression();
+  ASSERT_EQ(case_cast.when_clauses_.size(), 1);
+  EXPECT_EQ(case_cast.when_clauses_[0].second->Type(), TypeTag::kCastExp);
+}
+
+TEST(ExpressionRewriteTest, InnerJoinNotNullInference) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression x = ColumnValueExp("x");
+  Expression y = ColumnValueExp("y");
+  Expression a = ColumnValueExp("a");
+
+  // (x = y AND a > 10) -> ((x = y AND a > 10) AND x IS NOT NULL) AND y IS NOT NULL
+  Expression eq = BinaryExpressionExp(
+      BinaryExpressionExp(x, BinaryOperation::kEquals, y),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(a, BinaryOperation::kGreaterThan, ConstantValueExp(Value(int64_t{10}))));
+  Expression rewritten = rewriter.Rewrite(eq);
+  std::vector<Expression> conjuncts = SplitConjuncts(rewritten);
+  EXPECT_GE(conjuncts.size(), 4);
+
+  bool has_eq = false;
+  bool has_x_not_null = false;
+  bool has_y_not_null = false;
+  for (const auto& c : conjuncts) {
+    if (c->Type() == TypeTag::kBinaryExp &&
+        c->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
+      has_eq = true;
+    }
+    if (c->Type() == TypeTag::kUnaryExp &&
+        c->AsUnaryExpression().Op() == UnaryOperation::kIsNotNull) {
+      if (c->AsUnaryExpression().Child()->ToString() == x->ToString()) {
+        has_x_not_null = true;
+      }
+      if (c->AsUnaryExpression().Child()->ToString() == y->ToString()) {
+        has_y_not_null = true;
+      }
+    }
+  }
+  EXPECT_TRUE(has_eq);
+  EXPECT_TRUE(has_x_not_null);
+  EXPECT_TRUE(has_y_not_null);
+}
+
+TEST(ExpressionRewriteTest, RegexpPrefixExtraction) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression str = ColumnValueExp("str");
+
+  // REGEXP_CONTAINS(str, '^abc.*') -> str LIKE 'abc%'
+  Expression fn1 = FunctionCallExp(
+      "regexp_contains", {str, ConstantValueExp(Value("^abc.*"))});
+  Expression rewritten1 = rewriter.Rewrite(fn1);
+  ASSERT_EQ(rewritten1->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten1->AsBinaryExpression().Op(), BinaryOperation::kLike);
+  EXPECT_EQ(rewritten1->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+            Value("abc%"));
+
+  // REGEXP_LIKE(str, '^hello$') -> str = 'hello'
+  Expression fn2 = FunctionCallExp(
+      "regexp_like", {str, ConstantValueExp(Value("^hello$"))});
+  Expression rewritten2 = rewriter.Rewrite(fn2);
+  ASSERT_EQ(rewritten2->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten2->AsBinaryExpression().Op(), BinaryOperation::kEquals);
+  EXPECT_EQ(rewritten2->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+            Value("hello"));
+
+  // REGEXP_MATCH(str, '^test') -> str LIKE 'test%'
+  Expression fn3 = FunctionCallExp(
+      "regexp_match", {str, ConstantValueExp(Value("^test"))});
+  Expression rewritten3 = rewriter.Rewrite(fn3);
+  ASSERT_EQ(rewritten3->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten3->AsBinaryExpression().Op(), BinaryOperation::kLike);
+  EXPECT_EQ(rewritten3->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+            Value("test%"));
+}
+
+TEST(ExpressionRewriteTest, CastPushdownComparison) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression col = ColumnValueExp("col");
+
+  // CAST(col AS DOUBLE) = 10.0 -> col = 10
+  Expression cast_double = CastExpressionExp(col, "DOUBLE");
+  Expression eq_int = BinaryExpressionExp(
+      cast_double, BinaryOperation::kEquals, ConstantValueExp(Value(10.0)));
+  Expression rewritten1 = rewriter.Rewrite(eq_int);
+  ASSERT_EQ(rewritten1->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten1->AsBinaryExpression().Op(), BinaryOperation::kEquals);
+  EXPECT_EQ(rewritten1->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+            Value(int64_t{10}));
+
+  // CAST(col AS DOUBLE) = 3.5 -> false (cannot equal fractional float)
+  Expression eq_fraction = BinaryExpressionExp(
+      cast_double, BinaryOperation::kEquals, ConstantValueExp(Value(3.5)));
+  Expression rewritten2 = rewriter.Rewrite(eq_fraction);
+  ASSERT_EQ(rewritten2->Type(), TypeTag::kConstantValue);
+  EXPECT_FALSE(rewritten2->AsConstantValue().GetValue().Truthy());
+
+  // CAST(col AS DOUBLE) < 3.5 -> col <= 3
+  Expression lt_fraction = BinaryExpressionExp(
+      cast_double, BinaryOperation::kLessThan, ConstantValueExp(Value(3.5)));
+  Expression rewritten3 = rewriter.Rewrite(lt_fraction);
+  ASSERT_EQ(rewritten3->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten3->AsBinaryExpression().Op(),
+            BinaryOperation::kLessThanEquals);
+  EXPECT_EQ(rewritten3->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+            Value(int64_t{3}));
+
+  // CAST(col AS DOUBLE) > 3.5 -> col >= 4
+  Expression gt_fraction = BinaryExpressionExp(
+      cast_double, BinaryOperation::kGreaterThan, ConstantValueExp(Value(3.5)));
+  Expression rewritten4 = rewriter.Rewrite(gt_fraction);
+  ASSERT_EQ(rewritten4->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten4->AsBinaryExpression().Op(),
+            BinaryOperation::kGreaterThanEquals);
+  EXPECT_EQ(rewritten4->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+            Value(int64_t{4}));
+
+  // CAST(col AS INT64) = 42 -> col = 42
+  Expression cast_int = CastExpressionExp(col, "INT64");
+  Expression eq_cast_int = BinaryExpressionExp(
+      cast_int, BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{42})));
+  Expression rewritten5 = rewriter.Rewrite(eq_cast_int);
+  ASSERT_EQ(rewritten5->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten5->AsBinaryExpression().Op(), BinaryOperation::kEquals);
+  EXPECT_EQ(rewritten5->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
+            Value(int64_t{42}));
+}
+
+TEST(ExpressionRewriteTest, DeterministicFunctionCse) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression x = ColumnValueExp("x");
+  Expression abs_x = FunctionCallExp("abs", {x});
+  Expression upper_x = FunctionCallExp("upper", {x});
+  Expression sqrt_x = FunctionCallExp("sqrt", {x});
+
+  // f(x) - f(x) -> 0
+  Expression sub_self = BinaryExpressionExp(abs_x, BinaryOperation::kSubtract, abs_x);
+  Expression rewritten_sub = rewriter.Rewrite(sub_self);
+  ASSERT_EQ(rewritten_sub->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_sub->AsConstantValue().GetValue(), Value(int64_t{0}));
+
+  // f(x) = f(x) -> f(x) IS NOT NULL
+  Expression eq_self = BinaryExpressionExp(upper_x, BinaryOperation::kEquals, upper_x);
+  Expression rewritten_eq = rewriter.Rewrite(eq_self);
+  ASSERT_EQ(rewritten_eq->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(rewritten_eq->AsUnaryExpression().Op(), UnaryOperation::kIsNotNull);
+
+  // f(x) / f(x) -> 1
+  Expression div_self = BinaryExpressionExp(sqrt_x, BinaryOperation::kDivide, sqrt_x);
+  Expression rewritten_div = rewriter.Rewrite(div_self);
+  ASSERT_EQ(rewritten_div->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_div->AsConstantValue().GetValue(), Value(int64_t{1}));
+
+  // COALESCE(upper(x), upper(x)) -> upper(x)
+  Expression coalesce_dup = FunctionCallExp("coalesce", {upper_x, upper_x});
+  Expression rewritten_coalesce = rewriter.Rewrite(coalesce_dup);
+  ASSERT_EQ(rewritten_coalesce->Type(), TypeTag::kFunctionCallExp);
+  EXPECT_EQ(rewritten_coalesce->AsFunctionCallExpression().FuncName(), "upper");
+
+  // NULLIF(upper(x), upper(x)) -> NULL
+  Expression nullif_dup = FunctionCallExp("nullif", {upper_x, upper_x});
+  Expression rewritten_nullif = rewriter.Rewrite(nullif_dup);
+  ASSERT_EQ(rewritten_nullif->Type(), TypeTag::kConstantValue);
+  EXPECT_TRUE(rewritten_nullif->AsConstantValue().GetValue().IsNull());
+
+  // CASE WHEN c THEN upper(x) ELSE upper(x) END -> upper(x)
+  Expression case_dup = CaseExpressionExp({{ColumnValueExp("c"), upper_x}}, upper_x);
+  Expression rewritten_case = rewriter.Rewrite(case_dup);
+  ASSERT_EQ(rewritten_case->Type(), TypeTag::kFunctionCallExp);
+  EXPECT_EQ(rewritten_case->AsFunctionCallExpression().FuncName(), "upper");
+
+  // Volatile rand() - rand() must NOT be eliminated to 0
+  Expression rand_call = FunctionCallExp("rand", {});
+  Expression sub_rand = BinaryExpressionExp(rand_call, BinaryOperation::kSubtract, rand_call);
+  Expression rewritten_rand = rewriter.Rewrite(sub_rand);
+  ASSERT_EQ(rewritten_rand->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten_rand->AsBinaryExpression().Op(), BinaryOperation::kSubtract);
+}
+
+TEST(ExpressionRewriteTest, FunctionVolatilityClassification) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  EXPECT_EQ(GetFunctionVolatility("rand"), Volatility::kVolatile);
+  EXPECT_EQ(GetFunctionVolatility("random"), Volatility::kVolatile);
+  EXPECT_EQ(GetFunctionVolatility("uuid"), Volatility::kVolatile);
+  EXPECT_EQ(GetFunctionVolatility("generate_uuid"), Volatility::kVolatile);
+  EXPECT_EQ(GetFunctionVolatility("now"), Volatility::kStable);
+  EXPECT_EQ(GetFunctionVolatility("current_timestamp"), Volatility::kStable);
+  EXPECT_EQ(GetFunctionVolatility("current_date"), Volatility::kStable);
+  EXPECT_EQ(GetFunctionVolatility("upper"), Volatility::kImmutable);
+  EXPECT_EQ(GetFunctionVolatility("abs"), Volatility::kImmutable);
+  EXPECT_EQ(GetFunctionVolatility("sqrt"), Volatility::kImmutable);
+
+  // Volatile / stable functions with 0 args are NOT constant folded at compile time
+  Expression rand_exp = FunctionCallExp("rand", {});
+  Expression rewritten_rand = rewriter.Rewrite(rand_exp);
+  ASSERT_EQ(rewritten_rand->Type(), TypeTag::kFunctionCallExp);
+  EXPECT_EQ(rewritten_rand->AsFunctionCallExpression().FuncName(), "rand");
+
+  Expression now_exp = FunctionCallExp("now", {});
+  Expression rewritten_now = rewriter.Rewrite(now_exp);
+  ASSERT_EQ(rewritten_now->Type(), TypeTag::kFunctionCallExp);
+  EXPECT_EQ(rewritten_now->AsFunctionCallExpression().FuncName(), "now");
+
+  // Immutable functions with constant args ARE constant folded
+  Expression upper_const = FunctionCallExp("upper", {ConstantValueExp(Value("abc"))});
+  Expression rewritten_upper = rewriter.Rewrite(upper_const);
+  ASSERT_EQ(rewritten_upper->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_upper->AsConstantValue().GetValue(), Value("ABC"));
+}
+
+TEST(ExpressionRewriteTest, BooleanFilterPullup) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression a = ColumnValueExp("a");
+  Expression b = ColumnValueExp("b");
+  Expression c = ColumnValueExp("c");
+
+  // (a = 1 AND b = 2) OR (a = 1 AND c = 3) -> (a = 1) AND ((b = 2) OR (c = 3))
+  Expression a_eq_1 = BinaryExpressionExp(a, BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{1})));
+  Expression b_eq_2 = BinaryExpressionExp(b, BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{2})));
+  Expression c_eq_3 = BinaryExpressionExp(c, BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{3})));
+
+  Expression disj = BinaryExpressionExp(
+      BinaryExpressionExp(a_eq_1, BinaryOperation::kAnd, b_eq_2),
+      BinaryOperation::kOr,
+      BinaryExpressionExp(a_eq_1, BinaryOperation::kAnd, c_eq_3));
+
+  Expression rewritten = rewriter.Rewrite(disj);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kAnd);
+
+  // Absorption: (a = 1 AND b = 2) OR (a = 1) -> a = 1
+  Expression absorb = BinaryExpressionExp(
+      BinaryExpressionExp(a_eq_1, BinaryOperation::kAnd, b_eq_2),
+      BinaryOperation::kOr,
+      a_eq_1);
+  Expression rewritten_absorb = rewriter.Rewrite(absorb);
+  ASSERT_EQ(rewritten_absorb->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten_absorb->AsBinaryExpression().Op(), BinaryOperation::kEquals);
+}
+
+TEST(ExpressionRewriteTest, NotInNullSemantics) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression x = ColumnValueExp("x");
+  Expression null_val = ConstantValueExp(Value());
+  Expression val_1 = ConstantValueExp(Value(int64_t{1}));
+  Expression val_2 = ConstantValueExp(Value(int64_t{2}));
+
+  // x NOT IN (1, NULL) -> CASE WHEN x = 1 THEN false ELSE NULL END
+  Expression not_in_1_null = UnaryExpressionExp(
+      InExpressionExp(x, {val_1, null_val}), UnaryOperation::kNot);
+  Expression rewritten_not_in = rewriter.Rewrite(not_in_1_null);
+  ASSERT_EQ(rewritten_not_in->Type(), TypeTag::kCaseExp);
+
+  // Evaluate x=1 -> false
+  Row row1({Value(int64_t{1})});
+  Schema schema("t", {Column("x", ValueType::kInt64)});
+  EXPECT_EQ(rewritten_not_in->Evaluate(row1, schema), Value(false));
+
+  // Evaluate x=2 -> NULL
+  Row row2({Value(int64_t{2})});
+  EXPECT_TRUE(rewritten_not_in->Evaluate(row2, schema).IsNull());
+
+  // Evaluate x=NULL -> NULL
+  Row row_null({Value()});
+  EXPECT_TRUE(rewritten_not_in->Evaluate(row_null, schema).IsNull());
+
+  // x NOT IN (1, 2, NULL) -> CASE WHEN x IN (1, 2) THEN false ELSE NULL END
+  Expression not_in_multi_null = UnaryExpressionExp(
+      InExpressionExp(x, {val_1, val_2, null_val}), UnaryOperation::kNot);
+  Expression rewritten_multi = rewriter.Rewrite(not_in_multi_null);
+  ASSERT_EQ(rewritten_multi->Type(), TypeTag::kCaseExp);
+  EXPECT_EQ(rewritten_multi->Evaluate(row1, schema), Value(false));
+  EXPECT_EQ(rewritten_multi->Evaluate(row2, schema), Value(false));
+  Row row3({Value(int64_t{3})});
+  EXPECT_TRUE(rewritten_multi->Evaluate(row3, schema).IsNull());
+
+  // x NOT IN (NULL) -> NULL
+  Expression not_in_only_null = UnaryExpressionExp(
+      InExpressionExp(x, {null_val}), UnaryOperation::kNot);
+  Expression rewritten_only_null = rewriter.Rewrite(not_in_only_null);
+  ASSERT_EQ(rewritten_only_null->Type(), TypeTag::kConstantValue);
+  EXPECT_TRUE(rewritten_only_null->AsConstantValue().GetValue().IsNull());
+}
+
+TEST(ExpressionRewriteTest, ArrayFlattenOptimization) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression a = ColumnValueExp("a");
+  Expression b = ColumnValueExp("b");
+  Expression c = ColumnValueExp("c");
+
+  // array_concat(array_concat(a, b), c) -> array_concat(a, b, c)
+  Expression nested_concat = FunctionCallExp(
+      "array_concat", {FunctionCallExp("array_concat", {a, b}), c});
+  Expression rewritten_concat = rewriter.Rewrite(nested_concat);
+  ASSERT_EQ(rewritten_concat->Type(), TypeTag::kFunctionCallExp);
+  EXPECT_EQ(rewritten_concat->AsFunctionCallExpression().FuncName(), "array_concat");
+  EXPECT_EQ(rewritten_concat->AsFunctionCallExpression().Args().size(), 3);
+
+  // array_concat([1, 2], [3, 4]) -> [1, 2, 3, 4]
+  Expression arr1 = ArrayExpressionExp(
+      {ConstantValueExp(Value(int64_t{1})), ConstantValueExp(Value(int64_t{2}))},
+      "INT64");
+  Expression arr2 = ArrayExpressionExp(
+      {ConstantValueExp(Value(int64_t{3})), ConstantValueExp(Value(int64_t{4}))},
+      "INT64");
+  Expression concat_arrays = FunctionCallExp("array_concat", {arr1, arr2});
+  Expression rewritten_arrays = rewriter.Rewrite(concat_arrays);
+  ASSERT_EQ(rewritten_arrays->Type(), TypeTag::kArrayExp);
+  EXPECT_EQ(rewritten_arrays->AsArrayExpression().Elements().size(), 4);
+
+  // array_concat(a, []) -> a
+  Expression empty_arr = ArrayExpressionExp({}, "INT64");
+  Expression concat_empty = FunctionCallExp("array_concat", {a, empty_arr});
+  Expression rewritten_empty = rewriter.Rewrite(concat_empty);
+  EXPECT_EQ(rewritten_empty->Type(), TypeTag::kColumnValue);
+
+  // array_flatten([[1, 2], [3, 4]]) -> [1, 2, 3, 4]
+  Expression nested_array = ArrayExpressionExp({arr1, arr2}, "ARRAY<INT64>");
+  Expression flatten = FunctionCallExp("array_flatten", {nested_array});
+  Expression rewritten_flatten = rewriter.Rewrite(flatten);
+  ASSERT_EQ(rewritten_flatten->Type(), TypeTag::kArrayExp);
+  EXPECT_EQ(rewritten_flatten->AsArrayExpression().Elements().size(), 4);
+
+  // array_flatten([]) -> []
+  Expression flatten_empty = FunctionCallExp("array_flatten", {empty_arr});
+  Expression rewritten_flatten_empty = rewriter.Rewrite(flatten_empty);
+  ASSERT_EQ(rewritten_flatten_empty->Type(), TypeTag::kArrayExp);
+  EXPECT_TRUE(rewritten_flatten_empty->AsArrayExpression().Elements().empty());
+}
+
+TEST(ExpressionRewriteTest, DatetimeAndStringFoldExtent) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  // DATE_ADD(DATE '2026-08-27', INTERVAL 3 DAY) -> DATE '2026-08-30'
+  Expression date_val = ConstantValueExp(Value(std::string("2026-08-27")));
+  Expression interval_3d = IntervalExpressionExp(3, "DAY");
+  Expression date_add = FunctionCallExp("date_add", {date_val, interval_3d});
+  Expression rewritten_date_add = rewriter.Rewrite(date_add);
+  ASSERT_EQ(rewritten_date_add->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_date_add->AsConstantValue().GetValue(), Value(std::string("2026-08-30")));
+
+  // DATE_SUB(DATE '2026-08-27', INTERVAL 2 DAY) -> DATE '2026-08-25'
+  Expression interval_2d = IntervalExpressionExp(2, "DAY");
+  Expression date_sub = FunctionCallExp("date_sub", {date_val, interval_2d});
+  Expression rewritten_date_sub = rewriter.Rewrite(date_sub);
+  ASSERT_EQ(rewritten_date_sub->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_date_sub->AsConstantValue().GetValue(), Value(std::string("2026-08-25")));
+
+  // SUBSTRING('Hello World', 1, 5) -> 'Hello'
+  Expression str_hello_world = ConstantValueExp(Value(std::string("Hello World")));
+  Expression substr = FunctionCallExp(
+      "substring", {str_hello_world, ConstantValueExp(Value(int64_t{1})),
+                    ConstantValueExp(Value(int64_t{5}))});
+  Expression rewritten_substr = rewriter.Rewrite(substr);
+  ASSERT_EQ(rewritten_substr->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_substr->AsConstantValue().GetValue(), Value(std::string("Hello")));
+
+  // INSTR('abcdef', 'cd') -> 3
+  Expression instr = FunctionCallExp(
+      "instr", {ConstantValueExp(Value(std::string("abcdef"))),
+                ConstantValueExp(Value(std::string("cd")))});
+  Expression rewritten_instr = rewriter.Rewrite(instr);
+  ASSERT_EQ(rewritten_instr->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_instr->AsConstantValue().GetValue(), Value(int64_t{3}));
+
+  // LPAD('42', 5, '0') -> '00042'
+  Expression lpad = FunctionCallExp(
+      "lpad", {ConstantValueExp(Value(std::string("42"))),
+               ConstantValueExp(Value(int64_t{5})),
+               ConstantValueExp(Value(std::string("0")))});
+  Expression rewritten_lpad = rewriter.Rewrite(lpad);
+  ASSERT_EQ(rewritten_lpad->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_lpad->AsConstantValue().GetValue(), Value(std::string("00042")));
+
+  // RPAD('hi', 5, '!') -> 'hi!!!'
+  Expression rpad = FunctionCallExp(
+      "rpad", {ConstantValueExp(Value(std::string("hi"))),
+               ConstantValueExp(Value(int64_t{5})),
+               ConstantValueExp(Value(std::string("!")))});
+  Expression rewritten_rpad = rewriter.Rewrite(rpad);
+  ASSERT_EQ(rewritten_rpad->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_rpad->AsConstantValue().GetValue(), Value(std::string("hi!!!")));
+
+  // CONCAT('foo', 'bar', 'baz') -> 'foobarbaz'
+  Expression concat = FunctionCallExp(
+      "concat", {ConstantValueExp(Value(std::string("foo"))),
+                 ConstantValueExp(Value(std::string("bar"))),
+                 ConstantValueExp(Value(std::string("baz")))});
+  Expression rewritten_concat = rewriter.Rewrite(concat);
+  ASSERT_EQ(rewritten_concat->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_concat->AsConstantValue().GetValue(), Value(std::string("foobarbaz")));
+
+  // LENGTH('tinylamb') -> 8
+  Expression len = FunctionCallExp(
+      "length", {ConstantValueExp(Value(std::string("tinylamb")))});
+  Expression rewritten_len = rewriter.Rewrite(len);
+  ASSERT_EQ(rewritten_len->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_len->AsConstantValue().GetValue(), Value(int64_t{8}));
+}
+
+TEST(ExpressionRewriteTest, CoalesceAndNullifSimplification) {
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+
+  Expression x = ColumnValueExp("x");
+  Expression y = ColumnValueExp("y");
+  Expression null_val = ConstantValueExp(Value());
+  Expression const_42 = ConstantValueExp(Value(int64_t{42}));
+  Expression const_99 = ConstantValueExp(Value(int64_t{99}));
+
+  // COALESCE(NULL, 42, x) -> 42
+  Expression c1 = FunctionCallExp("coalesce", {null_val, const_42, x});
+  Expression rewritten_c1 = rewriter.Rewrite(c1);
+  ASSERT_EQ(rewritten_c1->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_c1->AsConstantValue().GetValue(), Value(int64_t{42}));
+
+  // COALESCE(x, 42, y) -> COALESCE(x, 42) (y is eliminated after first non-null constant)
+  Expression c2 = FunctionCallExp("coalesce", {x, const_42, y});
+  Expression rewritten_c2 = rewriter.Rewrite(c2);
+  ASSERT_EQ(rewritten_c2->Type(), TypeTag::kFunctionCallExp);
+  EXPECT_EQ(rewritten_c2->AsFunctionCallExpression().Args().size(), 2);
+  EXPECT_EQ(rewritten_c2->AsFunctionCallExpression().Args()[0]->Type(), TypeTag::kColumnValue);
+  EXPECT_EQ(rewritten_c2->AsFunctionCallExpression().Args()[1]->Type(), TypeTag::kConstantValue);
+
+  // COALESCE(x, y, NULL) -> COALESCE(x, y) (trailing NULL eliminated)
+  Expression c3 = FunctionCallExp("coalesce", {x, y, null_val});
+  Expression rewritten_c3 = rewriter.Rewrite(c3);
+  ASSERT_EQ(rewritten_c3->Type(), TypeTag::kFunctionCallExp);
+  EXPECT_EQ(rewritten_c3->AsFunctionCallExpression().Args().size(), 2);
+
+  // COALESCE(x, NULL) -> x (single non-null arg remaining)
+  Expression c4 = FunctionCallExp("coalesce", {x, null_val});
+  Expression rewritten_c4 = rewriter.Rewrite(c4);
+  EXPECT_EQ(rewritten_c4->Type(), TypeTag::kColumnValue);
+
+  // COALESCE(NULL, NULL) -> NULL
+  Expression c5 = FunctionCallExp("coalesce", {null_val, null_val});
+  Expression rewritten_c5 = rewriter.Rewrite(c5);
+  ASSERT_EQ(rewritten_c5->Type(), TypeTag::kConstantValue);
+  EXPECT_TRUE(rewritten_c5->AsConstantValue().GetValue().IsNull());
+
+  // NULLIF(x, x) -> NULL
+  Expression n1 = FunctionCallExp("nullif", {x, x});
+  Expression rewritten_n1 = rewriter.Rewrite(n1);
+  ASSERT_EQ(rewritten_n1->Type(), TypeTag::kConstantValue);
+  EXPECT_TRUE(rewritten_n1->AsConstantValue().GetValue().IsNull());
+
+  // NULLIF(42, 42) -> NULL
+  Expression n2 = FunctionCallExp("nullif", {const_42, const_42});
+  Expression rewritten_n2 = rewriter.Rewrite(n2);
+  ASSERT_EQ(rewritten_n2->Type(), TypeTag::kConstantValue);
+  EXPECT_TRUE(rewritten_n2->AsConstantValue().GetValue().IsNull());
+
+  // NULLIF(42, 99) -> 42
+  Expression n3 = FunctionCallExp("nullif", {const_42, const_99});
+  Expression rewritten_n3 = rewriter.Rewrite(n3);
+  ASSERT_EQ(rewritten_n3->Type(), TypeTag::kConstantValue);
+  EXPECT_EQ(rewritten_n3->AsConstantValue().GetValue(), Value(int64_t{42}));
+
+  // NULLIF(x, NULL) -> x
+  Expression n4 = FunctionCallExp("nullif", {x, null_val});
+  Expression rewritten_n4 = rewriter.Rewrite(n4);
+  EXPECT_EQ(rewritten_n4->Type(), TypeTag::kColumnValue);
 }
 
 }  // namespace tinylamb

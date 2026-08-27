@@ -92,6 +92,27 @@ void AggregationPlan::Dump(std::ostream& o, int indent) const {
 Schema AggregationPlan::GenerateSchema() const {
   std::vector<Column> columns;
   for (const auto& agg : aggregates_) {
+    if (!agg.expression) {
+      columns.emplace_back(agg.name, ValueType::kInt64);
+      continue;
+    }
+    if (agg.expression->Type() != TypeTag::kAggregateExp) {
+      ValueType type = ValueType::kInt64;
+      try {
+        const Type result = agg.expression->ResultType(child_->GetSchema());
+        if (result.GetType() == TypeTag::kDouble) {
+          type = ValueType::kDouble;
+        } else if (result.GetType() == TypeTag::kVarChar) {
+          type = ValueType::kVarChar;
+        } else {
+          type = ValueType::kInt64;
+        }
+      } catch (...) {
+        type = ValueType::kInt64;
+      }
+      columns.emplace_back(agg.name, type);
+      continue;
+    }
     const auto& expression = agg.expression->AsAggregateExpression();
     ValueType type = ValueType::kInt64;
     if (expression.GetType() == AggregationType::kAvg) {

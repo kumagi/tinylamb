@@ -261,7 +261,11 @@ Value::Value(const Value& o)
       array_(o.array_),
       collation_(o.collation_) {
   if (type == ValueType::kVarChar) {
-    owned_data.assign(o.value.varchar_value);
+    if (!o.owned_data.empty()) {
+      owned_data = o.owned_data;
+    } else {
+      owned_data.assign(o.value.varchar_value);
+    }
     value.varchar_value = owned_data;
   }
 }
@@ -272,7 +276,12 @@ Value::Value(Value&& o) noexcept
       owned_data(std::move(o.owned_data)),
       array_(std::move(o.array_)),
       collation_(o.collation_) {
-  if (type == ValueType::kVarChar) { value.varchar_value = owned_data; }
+  if (type == ValueType::kVarChar) {
+    if (owned_data.empty() && !o.value.varchar_value.empty()) {
+      owned_data.assign(o.value.varchar_value);
+    }
+    value.varchar_value = owned_data;
+  }
   o.type = ValueType::kNull;
 }
 
@@ -284,7 +293,11 @@ Value& Value::operator=(const Value& rhs) {
   array_ = rhs.array_;
   collation_ = rhs.collation_;
   if (type == ValueType::kVarChar) {
-    owned_data.assign(rhs.value.varchar_value);
+    if (!rhs.owned_data.empty()) {
+      owned_data = rhs.owned_data;
+    } else {
+      owned_data.assign(rhs.value.varchar_value);
+    }
     value.varchar_value = owned_data;
   }
   return *this;
@@ -297,7 +310,12 @@ Value& Value::operator=(Value&& o) noexcept {
   type = o.type;
   value = o.value;
   collation_ = o.collation_;
-  if (type == ValueType::kVarChar) { value.varchar_value = owned_data; }
+  if (type == ValueType::kVarChar) {
+    if (owned_data.empty() && !o.value.varchar_value.empty()) {
+      owned_data.assign(o.value.varchar_value);
+    }
+    value.varchar_value = owned_data;
+  }
   o.type = ValueType::kNull;
   return *this;
 }

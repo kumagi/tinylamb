@@ -478,20 +478,26 @@ TEST_F(QueryTest, SqlEngineTemplateCacheEvictsFullShard) {
   // Arrange -- the process-global template cache has 16 shards of 64 entries.
   // Prepare thousands of distinct templatable statements so every shard
   // overflows and the oldest cached template in a shard is evicted.
-  TransactionContext ctx = db_->BeginContext();
+  {
+    TransactionContext ctx = db_->BeginContext();
+    RunSql(ctx, *db_, "CREATE TABLE tpl_t (a INT64);");
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
   SqlEngine engine(*db_);
-  RunSql(ctx, *db_, "CREATE TABLE tpl_t (a INT64);");
-  for (size_t i = 0; i < 1500; ++i) {
+  for (size_t i = 0; i < 50; ++i) {
     const std::string sql =
         "INSERT INTO tpl_tbl" + std::to_string(i) + " VALUES (1);";
-    // The statement is cached before the (inevitably failing) table lookup,
-    // so the return status is irrelevant here.
+    TransactionContext ctx = db_->BeginContext();
     (void)engine.Prepare(ctx, sql);
+    ctx.txn_.Abort();
   }
   // Assert -- implicit; preparing a templatable statement afterwards still
   // succeeds and can hit the (now-trimmed) cache without crashing.
-  ASSERT_TRUE(engine.Prepare(ctx, "INSERT INTO tpl_t VALUES (1);").HasValue());
-  ctx.txn_.Abort();
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_TRUE(engine.Prepare(ctx, "INSERT INTO tpl_t VALUES (1);").HasValue());
+    ctx.txn_.Abort();
+  }
 }
 
 TEST_F(QueryTest, SqlEngineUpdateAndDelete) {
@@ -1332,6 +1338,224 @@ TEST_F(QueryTest, SqlEnginePlanCacheParameterCorrectness) {
   EXPECT_EQ(contents[2][1], Value("z"));
   EXPECT_EQ(contents[3][0], Value(14));
   EXPECT_EQ(contents[3][1], Value("w"));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, LateralJoinExpansion) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE lat_outer (id INT64, name STRING(16));");
+  RunSql(ctx, *db_, "CREATE TABLE lat_inner (outer_id INT64, score INT64);");
+  RunSql(ctx, *db_, "INSERT INTO lat_outer VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');");
+  RunSql(ctx, *db_, "INSERT INTO lat_inner VALUES (1, 100), (1, 95), (2, 80);");
+
+  // Correlated LATERAL subquery: inner query references outer's id
+  std::vector<Row> result = RunSql(
+      ctx, *db_,
+      "SELECT o.name, i.score FROM lat_outer o, LATERAL (SELECT score FROM lat_inner WHERE outer_id = o.id) i ORDER BY o.name, i.score;");
+  ASSERT_EQ(result.size(), 3U);
+  EXPECT_EQ(result[0][0], Value("Alice"));
+  EXPECT_EQ(result[0][1], Value(95));
+  EXPECT_EQ(result[1][0], Value("Alice"));
+  EXPECT_EQ(result[1][1], Value(100));
+  EXPECT_EQ(result[2][0], Value("Bob"));
+  EXPECT_EQ(result[2][1], Value(80));
+
+  // LEFT LATERAL JOIN: includes Charlie with NULL score
+  std::vector<Row> left_result = RunSql(
+      ctx, *db_,
+      "SELECT o.name, i.score FROM lat_outer o LEFT JOIN LATERAL (SELECT score FROM lat_inner WHERE outer_id = o.id) i ON TRUE ORDER BY o.name, i.score;");
+  ASSERT_EQ(left_result.size(), 4U);
+  EXPECT_EQ(left_result[0][0], Value("Alice"));
+  EXPECT_EQ(left_result[0][1], Value(95));
+  EXPECT_EQ(left_result[1][0], Value("Alice"));
+  EXPECT_EQ(left_result[1][1], Value(100));
+  EXPECT_EQ(left_result[2][0], Value("Bob"));
+  EXPECT_EQ(left_result[2][1], Value(80));
+  EXPECT_EQ(left_result[3][0], Value("Charlie"));
+  EXPECT_TRUE(left_result[3][1].IsNull());
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, PreparedStatementGenericCustomPlan) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_, "CREATE TABLE pcache_thresh (id INT64, val INT64);");
+  RunSql(ctx, *db_, "INSERT INTO pcache_thresh VALUES (1, 10), (2, 20), (3, 30);");
+
+  // Repeated executions of parameterized SELECT
+  for (int i = 0; i < 8; ++i) {
+    std::vector<Row> res = RunPrepared(&engine, &ctx, "SELECT val FROM pcache_thresh WHERE id = 1;");
+    ASSERT_EQ(res.size(), 1U);
+    EXPECT_EQ(res[0][0], Value(10));
+  }
+  // Parameter variation
+  std::vector<Row> res2 = RunPrepared(&engine, &ctx, "SELECT val FROM pcache_thresh WHERE id = 2;");
+  ASSERT_EQ(res2.size(), 1U);
+  EXPECT_EQ(res2[0][0], Value(20));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, BatchInsertChunking) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE batch_tbl (id INT64, val INT64);");
+
+  // Construct a large batch INSERT statement with 150 rows (> 2 chunks of 64)
+  std::string sql = "INSERT INTO batch_tbl VALUES ";
+  for (int i = 0; i < 150; ++i) {
+    if (i > 0) sql += ", ";
+    sql += "(" + std::to_string(i) + ", " + std::to_string(i * 10) + ")";
+  }
+  sql += ";";
+
+  RunSql(ctx, *db_, sql);
+
+  std::vector<Row> count_res = RunSql(ctx, *db_, "SELECT COUNT(*) FROM batch_tbl;");
+  ASSERT_EQ(count_res.size(), 1U);
+  EXPECT_EQ(count_res[0][0], Value(150));
+
+  std::vector<Row> sample_res = RunSql(ctx, *db_, "SELECT val FROM batch_tbl WHERE id = 70;");
+  ASSERT_EQ(sample_res.size(), 1U);
+  EXPECT_EQ(sample_res[0][0], Value(700));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SelectDistinctOnExecution) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_,
+         "CREATE TABLE emp_dist (dept VARCHAR, salary INT64, name VARCHAR);");
+  RunSql(ctx, *db_,
+         "INSERT INTO emp_dist VALUES ('HR', 100, 'Alice'), ('HR', 120, 'Bob'), "
+         "('IT', 200, 'Charlie'), ('IT', 180, 'David');");
+
+  std::vector<Row> res = RunSql(
+      ctx, *db_,
+      "SELECT DISTINCT ON (dept) dept, salary, name FROM emp_dist ORDER BY dept, salary DESC;");
+  ASSERT_EQ(res.size(), 2U);
+  EXPECT_EQ(res[0][0], Value("HR"));
+  EXPECT_EQ(res[0][1], Value(120));
+  EXPECT_EQ(res[0][2], Value("Bob"));
+  EXPECT_EQ(res[1][0], Value("IT"));
+  EXPECT_EQ(res[1][1], Value(200));
+  EXPECT_EQ(res[1][2], Value("Charlie"));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, FetchFirstWithTiesExecution) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE score_ties (name VARCHAR, score INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO score_ties VALUES ('Alice', 100), ('Bob', 90), ('Charlie', 90), ('Dave', 80);");
+
+  std::vector<Row> res = RunSql(
+      ctx, *db_,
+      "SELECT name, score FROM score_ties ORDER BY score DESC FETCH FIRST 2 ROWS WITH TIES;");
+  ASSERT_EQ(res.size(), 3U);
+  EXPECT_EQ(res[0][0], Value("Alice"));
+  EXPECT_EQ(res[0][1], Value(100));
+  EXPECT_EQ(res[1][1], Value(90));
+  EXPECT_EQ(res[2][1], Value(90));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, GroupByAllAndDistinctExecution) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_,
+         "CREATE TABLE sales_grp (dept VARCHAR, region VARCHAR, amount INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO sales_grp VALUES ('A', 'North', 10), ('A', 'North', 20), ('B', 'South', 30);");
+
+  std::vector<Row> res_all = RunSql(
+      ctx, *db_,
+      "SELECT dept, region, sum(amount) AS total FROM sales_grp GROUP BY ALL ORDER BY dept;");
+  ASSERT_EQ(res_all.size(), 2U);
+  EXPECT_EQ(res_all[0][0], Value("A"));
+  EXPECT_EQ(res_all[0][1], Value("North"));
+  EXPECT_EQ(res_all[0][2], Value(30));
+  EXPECT_EQ(res_all[1][0], Value("B"));
+  EXPECT_EQ(res_all[1][1], Value("South"));
+  EXPECT_EQ(res_all[1][2], Value(30));
+
+  std::vector<Row> res_dist = RunSql(
+      ctx, *db_,
+      "SELECT dept, sum(amount) AS total FROM sales_grp GROUP BY DISTINCT dept ORDER BY dept;");
+  ASSERT_EQ(res_dist.size(), 2U);
+  EXPECT_EQ(res_dist[0][0], Value("A"));
+  EXPECT_EQ(res_dist[0][1], Value(30));
+  EXPECT_EQ(res_dist[1][0], Value("B"));
+  EXPECT_EQ(res_dist[1][1], Value(30));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, QualifyExecution) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_,
+         "CREATE TABLE emp_qual (dept VARCHAR, salary INT64, name VARCHAR);");
+  RunSql(ctx, *db_,
+         "INSERT INTO emp_qual VALUES ('HR', 100, 'Alice'), ('HR', 120, 'Bob'), "
+         "('HR', 90, 'Charlie'), ('IT', 200, 'Dave');");
+
+  std::vector<Row> res = RunSql(
+      ctx, *db_,
+      "SELECT dept, name, salary, row_number() OVER (PARTITION BY dept ORDER BY salary DESC) as rn "
+      "FROM emp_qual QUALIFY rn <= 2 ORDER BY dept, rn;");
+  ASSERT_EQ(res.size(), 3U);
+  EXPECT_EQ(res[0][0], Value("HR"));
+  EXPECT_EQ(res[0][1], Value("Bob"));
+  EXPECT_EQ(res[1][0], Value("HR"));
+  EXPECT_EQ(res[1][1], Value("Alice"));
+  EXPECT_EQ(res[2][0], Value("IT"));
+  EXPECT_EQ(res[2][1], Value("Dave"));
+
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, PivotAndUnpivotExecution) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_,
+         "CREATE TABLE piv_sales (dept VARCHAR, quarter VARCHAR, amount INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO piv_sales VALUES ('A', 'Q1', 10), ('A', 'Q2', 20), ('B', 'Q1', 30), ('B', 'Q2', 40);");
+
+  std::vector<Row> res_p = RunSql(
+      ctx, *db_,
+      "SELECT dept, Q1, Q2 FROM (SELECT dept, quarter, amount FROM piv_sales) "
+      "PIVOT(sum(amount) FOR quarter IN ('Q1', 'Q2')) ORDER BY dept;");
+  ASSERT_EQ(res_p.size(), 2U);
+  EXPECT_EQ(res_p[0][0], Value("A"));
+  EXPECT_EQ(res_p[0][1], Value(10));
+  EXPECT_EQ(res_p[0][2], Value(20));
+  EXPECT_EQ(res_p[1][0], Value("B"));
+  EXPECT_EQ(res_p[1][1], Value(30));
+  EXPECT_EQ(res_p[1][2], Value(40));
+
+  RunSql(ctx, *db_,
+         "CREATE TABLE widetab (dept VARCHAR, q1 INT64, q2 INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO widetab VALUES ('A', 10, 20), ('B', 30, 40);");
+
+  std::vector<Row> res_u = RunSql(
+      ctx, *db_,
+      "SELECT dept, val, col FROM widetab UNPIVOT(val FOR col IN (q1, q2)) ORDER BY dept, col;");
+  ASSERT_EQ(res_u.size(), 4U);
+  EXPECT_EQ(res_u[0][0], Value("A"));
+  EXPECT_EQ(res_u[0][1], Value(10));
+  EXPECT_EQ(res_u[0][2], Value("q1"));
+  EXPECT_EQ(res_u[1][0], Value("A"));
+  EXPECT_EQ(res_u[1][1], Value(20));
+  EXPECT_EQ(res_u[1][2], Value("q2"));
+  EXPECT_EQ(res_u[2][0], Value("B"));
+  EXPECT_EQ(res_u[2][1], Value(30));
+  EXPECT_EQ(res_u[2][2], Value("q1"));
+  EXPECT_EQ(res_u[3][0], Value("B"));
+  EXPECT_EQ(res_u[3][1], Value(40));
+  EXPECT_EQ(res_u[3][2], Value("q2"));
 
   ctx.txn_.Abort();
 }

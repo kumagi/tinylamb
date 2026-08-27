@@ -143,6 +143,7 @@ Expression Rebuild(const Expression& expression, const ReplacementMap& map) {
     case TypeTag::kCaseExp: {
       const auto& value = expression->AsCaseExpression();
       std::vector<std::pair<Expression, Expression>> clauses;
+      clauses.reserve(value.when_clauses_.size());
       for (const auto& [condition, result] : value.when_clauses_) {
         clauses.emplace_back(Rebuild(condition, map), Rebuild(result, map));
       }
@@ -781,7 +782,8 @@ struct WindowRuntime {
               found = true;
               break;
             }
-          } catch (...) {
+          } catch (const std::exception& error) {
+            (void)error;
           }
         }
         if (!found) {
@@ -1121,7 +1123,8 @@ struct WindowRuntime {
                 const double da = std::stod(std::string(a.value.varchar_value));
                 const double db = std::stod(std::string(b.value.varchar_value));
                 return da < db;
-              } catch (...) {
+              } catch (const std::exception& error) {
+                (void)error;
               }
             }
             try {
@@ -1548,6 +1551,9 @@ void ComputeOneWindow(TransactionContext& context,
 }  // namespace
 
 bool HasWindowFunctions(const SelectStatement& statement) {
+  if (statement.Qualify() != nullptr) {
+    return true;
+  }
   for (const NamedExpression& projection : statement.SelectList()) {
     if (ContainsWindow(projection.expression)) {
       return true;
@@ -1558,7 +1564,7 @@ bool HasWindowFunctions(const SelectStatement& statement) {
       return true;
     }
   }
-  return ContainsWindow(statement.Qualify());
+  return false;
 }
 
 namespace {
@@ -1596,6 +1602,7 @@ Expression InlineAliases(
     case TypeTag::kCaseExp: {
       const auto& value = expression->AsCaseExpression();
       std::vector<std::pair<Expression, Expression>> clauses;
+      clauses.reserve(value.when_clauses_.size());
       for (const auto& [condition, result] : value.when_clauses_) {
         clauses.emplace_back(InlineAliases(condition, aliases, schema),
                              InlineAliases(result, aliases, schema));
@@ -1636,7 +1643,30 @@ WindowedInput ApplyWindows(TransactionContext& context,
   }
   CollectWindows(statement.Qualify(), &windows);
   if (windows.empty()) {
-    result.input = std::move(input);
+    if (statement.Qualify()) {
+      std::unordered_map<std::string, Expression> aliases;
+      for (const NamedExpression& projection : statement.SelectList()) {
+        if (!projection.name.empty()) {
+          aliases.emplace(projection.name, projection.expression);
+        }
+      }
+      Expression qualify =
+          InlineAliases(statement.Qualify(), aliases, input.schema);
+      Relation filtered(context.execution_runtime());
+      filtered.schema = input.schema;
+      CopyExecutionStats(&filtered, input);
+      input.FinishSpill();
+      input.ForEachRow([&](const Row& row) {
+        Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
+        if (Truthy(Evaluate(qualify, scope, nullptr, context, ctes))) {
+          filtered.AddRow(row);
+        }
+      });
+      filtered.FinishSpill();
+      result.input = std::move(filtered);
+    } else {
+      result.input = std::move(input);
+    }
     return result;
   }
 
@@ -1648,6 +1678,7 @@ WindowedInput ApplyWindows(TransactionContext& context,
   ReplacementMap replacements;
   std::vector<Column> extended_columns;
   const size_t base_width = base_schema.ColumnCount();
+  extended_columns.reserve(base_width + windows.size());
   for (size_t i = 0; i < base_width; ++i) {
     extended_columns.push_back(base_schema.GetColumn(i));
   }
@@ -1742,6 +1773,7 @@ Relation TrimHiddenColumns(Relation&& input, size_t hidden_columns) {
   Relation trimmed(input.runtime());
   std::vector<Column> columns;
   const size_t keep = input.schema.ColumnCount() - hidden_columns;
+  columns.reserve(keep);
   for (size_t i = 0; i < keep; ++i) {
     columns.push_back(input.schema.GetColumn(i));
   }

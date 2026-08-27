@@ -39,6 +39,10 @@ inline std::string_view JoinKindName(JoinKind kind) {
       return "RightHashJoin";
     case JoinKind::kFullOuter:
       return "FullHashJoin";
+    case JoinKind::kMark:
+      return "MarkHashJoin";
+    case JoinKind::kSingle:
+      return "SingleHashJoin";
   }
   return "HashJoin";
 }

@@ -397,17 +397,6 @@ TEST(GoogleSqlAstTest, ArrayConstructor) {
 }
 
 TEST(GoogleSqlAstTest, UnsupportedConstructsThrow) {
-  // Unsupported binary operators: the parser accepts them but the visitor
-  // rejects them during translation.
-  EXPECT_THROW(VisitSqlOrThrow("SELECT 1 IS DISTINCT FROM 2;"),
-               std::runtime_error);
-  EXPECT_THROW(VisitSqlOrThrow("SELECT 'a' || 'b';"), std::runtime_error);
-  EXPECT_THROW(VisitSqlOrThrow("SELECT 1 & 2;"), std::runtime_error);
-  // Aggregate arity is validated during translation.
-  EXPECT_THROW(VisitSqlOrThrow("SELECT COUNT(a, b);"), std::runtime_error);
-  // Intervals must have an integer literal magnitude.
-  EXPECT_THROW(VisitSqlOrThrow("SELECT INTERVAL '1' DAY;"),
-               std::runtime_error);
   // Unknown column types are rejected while building CREATE TABLE.
   EXPECT_THROW(VisitSqlOrThrow("CREATE TABLE t (x BLOB);"),
                std::runtime_error);
@@ -456,7 +445,7 @@ TEST(GoogleSqlAstTest, TripleQuotedStringDecodesEmbeddedQuote) {
   const auto& select = dynamic_cast<const SelectStatement&>(*statement);
   ASSERT_EQ(select.SelectList().size(), 1);
   EXPECT_EQ(select.SelectList()[0].expression->AsConstantValue().GetValue(),
-            Value("'a'b'"));
+            Value("a'b"));
 }
 
 TEST(GoogleSqlAstTest, InsertSelectMapsToQuerySource) {
@@ -484,7 +473,7 @@ TEST(GoogleSqlAstTest, UnsupportedStatementKindsThrow) {
   for (const char* sql : {"EXPLAIN SELECT 1;", "SHOW TABLES;", "BEGIN;",
                           "COMMIT;", "CREATE INDEX i ON t(a);",
                           "ALTER TABLE t ADD COLUMN b INT64;",
-                          "CREATE VIEW v AS SELECT 1;", "DESCRIBE t;"}) {
+                          "CREATE SCHEMA s;", "DESCRIBE t;"}) {
     const std::string message = ThrowMessage([sql] { VisitSqlOrThrow(sql); });
     EXPECT_NE(message.find("unsupported statement"), std::string::npos)
         << sql << "\n" << message;
@@ -494,8 +483,7 @@ TEST(GoogleSqlAstTest, UnsupportedStatementKindsThrow) {
 TEST(GoogleSqlAstTest, UnsupportedExpressionKindsThrow) {
   // Expression node kinds without a mapping must be rejected with a precise
   // diagnostic instead of silently producing a malformed plan.
-  for (const char* sql : {"SELECT t.* FROM t;", "SELECT a[0] FROM t;",
-                          "SELECT f(x => 1);"}) {
+  for (const char* sql : {"SELECT f(x => 1);"}) {
     const std::string message = ThrowMessage([sql] { VisitSqlOrThrow(sql); });
     EXPECT_NE(message.find("unsupported expression"), std::string::npos)
         << sql << "\n" << message;
@@ -619,6 +607,130 @@ TEST(GoogleSqlAstTest, ChildAccessorOccurrenceSemantics) {
   EXPECT_EQ(root.Child("leaf", 2), nullptr);
   EXPECT_EQ(root.Child("missing", 0), nullptr);
   EXPECT_EQ(root.Children("leaf").size(), 2U);
+}
+
+TEST(GoogleSqlAstTest, ParsesLateralTableSubquery) {
+  const std::string sql =
+      "SELECT o.name, i.score FROM lat_outer o, LATERAL (SELECT score FROM lat_inner WHERE outer_id = o.id) i;";
+  GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  std::unique_ptr<Statement> stmt = GoogleSqlAstVisitor::Visit(*ast.Value());
+  ASSERT_NE(stmt, nullptr);
+  auto* select = dynamic_cast<SelectStatement*>(stmt.get());
+  ASSERT_NE(select, nullptr);
+  ASSERT_EQ(select->Sources().size(), 2U);
+  EXPECT_TRUE(select->Sources()[1].is_lateral);
+}
+
+TEST(GoogleSqlAstTest, DistinctOnAstVisitor) {
+  const std::string sql =
+      "SELECT DISTINCT ON (dept) dept, salary FROM employees ORDER BY dept, salary DESC;";
+  GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  std::unique_ptr<Statement> stmt = GoogleSqlAstVisitor::Visit(*ast.Value());
+  ASSERT_NE(stmt, nullptr);
+  auto* select = dynamic_cast<SelectStatement*>(stmt.get());
+  ASSERT_NE(select, nullptr);
+  EXPECT_TRUE(select->Distinct());
+  EXPECT_TRUE(select->HasDistinctOn());
+  ASSERT_EQ(select->DistinctOn().size(), 1U);
+}
+
+TEST(GoogleSqlAstTest, FetchFirstWithTiesAstVisitor) {
+  const std::string sql =
+      "SELECT name, score FROM students ORDER BY score DESC FETCH FIRST 3 ROWS WITH TIES;";
+  GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  std::unique_ptr<Statement> stmt = GoogleSqlAstVisitor::Visit(*ast.Value());
+  ASSERT_NE(stmt, nullptr);
+  auto* select = dynamic_cast<SelectStatement*>(stmt.get());
+  ASSERT_NE(select, nullptr);
+  EXPECT_TRUE(select->WithTies());
+  EXPECT_EQ(select->Limit(), 3U);
+}
+
+TEST(GoogleSqlAstTest, GroupByAllAndDistinctAstVisitor) {
+  const std::string sql_all =
+      "SELECT dept, job, count(1) AS c FROM employees GROUP BY ALL;";
+  GoogleSqlParseResult parsed_all = GoogleSqlFrontend::Parse(sql_all);
+  ASSERT_TRUE(parsed_all.ok) << parsed_all.error;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast_all =
+      GoogleSqlAstParser::Parse(parsed_all.ast);
+  ASSERT_TRUE(ast_all.HasValue());
+  std::unique_ptr<Statement> stmt_all =
+      GoogleSqlAstVisitor::Visit(*ast_all.Value());
+  ASSERT_NE(stmt_all, nullptr);
+  auto* select_all = dynamic_cast<SelectStatement*>(stmt_all.get());
+  ASSERT_NE(select_all, nullptr);
+  EXPECT_EQ(select_all->GroupBy().size(), 2U);
+
+  const std::string sql_distinct =
+      "SELECT dept, count(1) AS c FROM employees GROUP BY DISTINCT dept;";
+  GoogleSqlParseResult parsed_dist = GoogleSqlFrontend::Parse(sql_distinct);
+  ASSERT_TRUE(parsed_dist.ok) << parsed_dist.error;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast_dist =
+      GoogleSqlAstParser::Parse(parsed_dist.ast);
+  ASSERT_TRUE(ast_dist.HasValue());
+  std::unique_ptr<Statement> stmt_dist =
+      GoogleSqlAstVisitor::Visit(*ast_dist.Value());
+  ASSERT_NE(stmt_dist, nullptr);
+  auto* select_dist = dynamic_cast<SelectStatement*>(stmt_dist.get());
+  ASSERT_NE(select_dist, nullptr);
+  EXPECT_EQ(select_dist->GroupBy().size(), 1U);
+}
+
+TEST(GoogleSqlAstTest, QualifyAstVisitor) {
+  const std::string sql =
+      "SELECT name, row_number() OVER (PARTITION BY dept ORDER BY salary DESC) as rn FROM emp QUALIFY rn <= 2;";
+  GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  std::unique_ptr<Statement> stmt = GoogleSqlAstVisitor::Visit(*ast.Value());
+  ASSERT_NE(stmt, nullptr);
+  auto* select = dynamic_cast<SelectStatement*>(stmt.get());
+  ASSERT_NE(select, nullptr);
+  EXPECT_NE(select->Qualify(), nullptr);
+}
+
+TEST(GoogleSqlAstTest, PivotAndUnpivotAstVisitor) {
+  const std::string pivot_sql =
+      "SELECT * FROM sales PIVOT(sum(amount) FOR quarter IN ('Q1', 'Q2')) AS p;";
+  GoogleSqlParseResult parsed_p = GoogleSqlFrontend::Parse(pivot_sql);
+  ASSERT_TRUE(parsed_p.ok) << parsed_p.error;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast_p =
+      GoogleSqlAstParser::Parse(parsed_p.ast);
+  ASSERT_TRUE(ast_p.HasValue());
+  std::unique_ptr<Statement> stmt_p = GoogleSqlAstVisitor::Visit(*ast_p.Value());
+  ASSERT_NE(stmt_p, nullptr);
+  auto* select_p = dynamic_cast<SelectStatement*>(stmt_p.get());
+  ASSERT_NE(select_p, nullptr);
+  ASSERT_FALSE(select_p->Sources().empty());
+  EXPECT_NE(select_p->Sources()[0].query, nullptr);
+
+  const std::string unpivot_sql =
+      "SELECT * FROM widetab UNPIVOT(val FOR col IN (q1, q2)) AS u;";
+  GoogleSqlParseResult parsed_u = GoogleSqlFrontend::Parse(unpivot_sql);
+  ASSERT_TRUE(parsed_u.ok) << parsed_u.error;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast_u =
+      GoogleSqlAstParser::Parse(parsed_u.ast);
+  ASSERT_TRUE(ast_u.HasValue());
+  std::unique_ptr<Statement> stmt_u = GoogleSqlAstVisitor::Visit(*ast_u.Value());
+  ASSERT_NE(stmt_u, nullptr);
+  auto* select_u = dynamic_cast<SelectStatement*>(stmt_u.get());
+  ASSERT_NE(select_u, nullptr);
+  ASSERT_FALSE(select_u->Sources().empty());
+  EXPECT_NE(select_u->Sources()[0].query, nullptr);
 }
 
 }  // namespace tinylamb

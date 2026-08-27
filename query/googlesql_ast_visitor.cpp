@@ -54,7 +54,13 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
 namespace {
+
+SelectSource ExpandPivotSource(SelectSource base,
+                               const GoogleSqlAstNode& pivot);
+SelectSource ExpandUnpivotSource(const SelectSource& base,
+                                 const GoogleSqlAstNode& unpivot);
 
 int ParseTimeZoneOffset(std::string_view tz_str, int Y, int M, int D, int h,
                         int m, int s, int default_offset = 0) {
@@ -546,6 +552,15 @@ std::shared_ptr<SelectStatement> SubstituteInSelect(
     }
     result->SetOrderBy(std::move(order));
   }
+  if (select.HasDistinctOn()) {
+    std::vector<Expression> d_on;
+    d_on.reserve(select.DistinctOn().size());
+    for (const Expression& item : select.DistinctOn()) {
+      d_on.push_back(SubstituteParameters(item, bindings));
+    }
+    result->SetDistinctOn(std::move(d_on));
+  }
+  result->SetWithTies(select.WithTies());
   for (const auto& [name, query] : select.WithQueries()) {
     result->AddWithQuery(name, SubstituteInSelect(*query, bindings));
   }
@@ -723,7 +738,7 @@ std::string DecodeSingleComponent(std::string_view value_view) {
       } else {
         decoded.push_back(next);
       }
-    } else if (!is_triple && value[i] == quote && i + 1 < value.size() &&
+    } else if (is_triple && value[i] == quote && i + 1 < value.size() &&
                value[i + 1] == quote) {
       decoded.push_back(quote);
       ++i;
@@ -997,6 +1012,7 @@ struct SqlUdf {
   std::string name;
   std::vector<std::pair<std::string, bool>>
       parameters;  // (lower name, NOT AGGREGATE)
+  std::vector<std::shared_ptr<GoogleSqlAstNode>> default_values;
   bool is_aggregate{false};
   std::shared_ptr<GoogleSqlAstNode> root;  // owns the AST copy
   const GoogleSqlAstNode* body{nullptr};
@@ -1889,6 +1905,15 @@ Expression ExpandUdfCall(const std::string& name,
     return nullptr;
   }
   SqlUdf& udf = found->second;
+  if (arguments.size() < udf.parameters.size()) {
+    for (size_t i = arguments.size(); i < udf.parameters.size(); ++i) {
+      if (i < udf.default_values.size() && udf.default_values[i] != nullptr) {
+        arguments.push_back(VisitExpression(*udf.default_values[i]));
+      } else {
+        break;
+      }
+    }
+  }
   if (arguments.size() != udf.parameters.size()) {
     throw std::runtime_error("Function call arity mismatch: " + udf.name);
   }
@@ -3904,6 +3929,290 @@ Expression VisitExpression(
                            node.kind);
 }
 
+bool ContainsAggregate(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  switch (expression->Type()) {
+    case TypeTag::kAggregateExp:
+      return true;
+    case TypeTag::kBinaryExp:
+      return ContainsAggregate(expression->AsBinaryExpression().Left()) ||
+             ContainsAggregate(expression->AsBinaryExpression().Right());
+    case TypeTag::kUnaryExp:
+      return ContainsAggregate(expression->AsUnaryExpression().Child());
+    case TypeTag::kCaseExp: {
+      const auto& val = expression->AsCaseExpression();
+      for (const auto& [c, r] : val.when_clauses_) {
+        if (ContainsAggregate(c) || ContainsAggregate(r)) return true;
+      }
+      return ContainsAggregate(val.else_clause_);
+    }
+    case TypeTag::kFunctionCallExp: {
+      const auto& call = expression->AsFunctionCallExpression();
+      for (const auto& arg : call.Args()) {
+        if (ContainsAggregate(arg)) return true;
+      }
+      return false;
+    }
+    case TypeTag::kInExp: {
+      const auto& in_exp = expression->AsInExpression();
+      if (ContainsAggregate(in_exp.child_)) return true;
+      for (const auto& item : in_exp.list_) {
+        if (ContainsAggregate(item)) return true;
+      }
+      return false;
+    }
+    case TypeTag::kArrayExp: {
+      const auto& arr = expression->AsArrayExpression();
+      for (const auto& item : arr.Elements()) {
+        if (ContainsAggregate(item)) return true;
+      }
+      return false;
+    }
+    default:
+      return false;
+  }
+}
+
+SelectSource ExpandPivotSource(SelectSource base,
+                               const GoogleSqlAstNode& pivot) {
+  const GoogleSqlAstNode* expr_list = pivot.Child("PivotExpressionList");
+  const GoogleSqlAstNode* for_col = pivot.Child("PathExpression");
+  const GoogleSqlAstNode* value_list = pivot.Child("PivotValueList");
+  if (expr_list == nullptr || for_col == nullptr || value_list == nullptr) {
+    throw std::runtime_error("GoogleSQL AST: malformed PivotClause");
+  }
+  const std::string pivot_col_name = Path(*for_col);
+
+  struct PivotAggInfo {
+    std::string agg_alias;
+    std::string func_name;
+    const GoogleSqlAstNode* arg_node{nullptr};
+  };
+  std::vector<PivotAggInfo> aggs;
+  for (const GoogleSqlAstNode* pe : expr_list->Children("PivotExpression")) {
+    PivotAggInfo info;
+    info.agg_alias = Alias(*pe);
+    const GoogleSqlAstNode* fn_call = pe->Child("FunctionCall");
+    if (fn_call == nullptr) {
+      for (const auto& c : pe->children) {
+        if (c->kind != "Alias" && c->kind != "Location") {
+          fn_call = c.get();
+          break;
+        }
+      }
+    }
+    if (fn_call != nullptr) {
+      if (const GoogleSqlAstNode* fn_path = fn_call->Child("PathExpression")) {
+        info.func_name = Path(*fn_path);
+      }
+      for (const auto& c : fn_call->children) {
+        if (c->kind != "PathExpression" && c->kind != "Alias" &&
+            c->kind != "Location") {
+          info.arg_node = c.get();
+          break;
+        }
+      }
+      if (info.arg_node == nullptr) {
+        const auto paths = fn_call->Children("PathExpression");
+        if (paths.size() >= 2) {
+          info.arg_node = paths[1];
+        }
+      }
+    }
+    aggs.push_back(info);
+  }
+
+  std::vector<NamedExpression> projections;
+  std::unordered_set<std::string> agg_column_names;
+  for (const auto& agg : aggs) {
+    if (agg.arg_node && agg.arg_node->kind != "Star") {
+      agg_column_names.insert(Path(*agg.arg_node));
+    }
+  }
+
+  std::vector<Expression> group_by_exprs;
+  if (base.query) {
+    for (const NamedExpression& named : base.query->SelectList()) {
+      if (named.name != pivot_col_name &&
+          !agg_column_names.contains(named.name)) {
+        projections.push_back(
+            NamedExpression(named.name, ColumnValueExp(ColumnName(named.name))));
+        group_by_exprs.push_back(ColumnValueExp(ColumnName(named.name)));
+      }
+    }
+  }
+
+  for (const GoogleSqlAstNode* pv : value_list->Children("PivotValue")) {
+    const GoogleSqlAstNode* val_node = nullptr;
+    for (const auto& c : pv->children) {
+      if (c->kind != "Alias" && c->kind != "Location") {
+        val_node = c.get();
+        break;
+      }
+    }
+    if (val_node == nullptr) continue;
+    Expression val_expr = VisitExpression(*val_node);
+    std::string val_alias = Alias(*pv);
+    if (val_alias.empty()) {
+      if (val_node->kind == "StringLiteral") {
+        for (const auto& c : val_node->children) {
+          if (c->kind == "StringLiteralComponent") {
+            val_alias = c->detail;
+            if (!val_alias.empty() && val_alias.front() == '\'' &&
+                val_alias.back() == '\'') {
+              val_alias = val_alias.substr(1, val_alias.size() - 2);
+            }
+            break;
+          }
+        }
+      }
+      if (val_alias.empty()) {
+        val_alias = val_node->detail;
+      }
+    }
+
+    for (const auto& agg : aggs) {
+      std::string col_name;
+      if (agg.agg_alias.empty()) {
+        col_name = val_alias;
+      } else if (val_alias.empty()) {
+        col_name = agg.agg_alias;
+      } else {
+        col_name = agg.agg_alias + "_" + val_alias;
+      }
+
+      Expression condition = BinaryExpressionExp(
+          ColumnValueExp(ColumnName(pivot_col_name)),
+          BinaryOperation::kEquals, val_expr);
+      Expression inner_arg;
+      if (agg.arg_node && agg.arg_node->kind != "Star") {
+        inner_arg = VisitExpression(*agg.arg_node);
+      } else {
+        inner_arg = ConstantValueExp(Value(1));
+      }
+      std::vector<std::pair<Expression, Expression>> when_clauses;
+      when_clauses.emplace_back(std::move(condition), std::move(inner_arg));
+      Expression case_expr = CaseExpressionExp(std::move(when_clauses),
+                                               ConstantValueExp(Value()));
+
+      const std::string lower_fn = Lower(agg.func_name);
+      AggregationType agg_type = AggregationType::kSum;
+      if (lower_fn == "count") {
+        agg_type = AggregationType::kCount;
+      } else if (lower_fn == "avg") {
+        agg_type = AggregationType::kAvg;
+      } else if (lower_fn == "min") {
+        agg_type = AggregationType::kMin;
+      } else if (lower_fn == "max") {
+        agg_type = AggregationType::kMax;
+      }
+
+      Expression agg_expression =
+          AggregateExpressionExp(agg_type, std::move(case_expr), false);
+      projections.push_back(
+          NamedExpression(col_name, std::move(agg_expression)));
+    }
+  }
+
+  auto pivot_subquery = std::make_shared<SelectStatement>();
+  pivot_subquery->SetSelectList(std::move(projections));
+  std::string saved_alias = base.alias;
+  pivot_subquery->SetSources({std::move(base)});
+  if (!group_by_exprs.empty()) {
+    pivot_subquery->SetGroupBy(std::move(group_by_exprs));
+  } else {
+    std::vector<Expression> inferred;
+    for (const NamedExpression& named : pivot_subquery->SelectList()) {
+      if (named.expression && !ContainsAggregate(named.expression)) {
+        inferred.push_back(named.expression);
+      }
+    }
+    if (!inferred.empty()) {
+      pivot_subquery->SetGroupBy(std::move(inferred));
+    }
+  }
+  pivot_subquery->MarkComplex();
+
+  SelectSource result;
+  result.query = std::move(pivot_subquery);
+  result.alias = saved_alias.empty() ? "pivot_table" : saved_alias;
+  return result;
+}
+
+SelectSource ExpandUnpivotSource(const SelectSource& base,
+                                 const GoogleSqlAstNode& unpivot) {
+  const GoogleSqlAstNode* val_cols = unpivot.Child("ExpressionList");
+  const GoogleSqlAstNode* name_col_node = unpivot.Child("PathExpression");
+  const GoogleSqlAstNode* in_items = unpivot.Child("UnpivotInItemList");
+  if (val_cols == nullptr || name_col_node == nullptr || in_items == nullptr) {
+    throw std::runtime_error("GoogleSQL AST: malformed UnpivotClause");
+  }
+  std::string val_col_name = "val";
+  if (!val_cols->children.empty()) {
+    val_col_name = Path(*val_cols->children[0]);
+  }
+  std::string name_col_name = Path(*name_col_node);
+  const bool include_nulls =
+      unpivot.detail.find("INCLUDE NULLS") != std::string::npos;
+
+  std::shared_ptr<SelectStatement> root_branch;
+  std::string saved_alias = base.alias;
+
+  for (const GoogleSqlAstNode* item : in_items->Children("UnpivotInItem")) {
+    const GoogleSqlAstNode* in_expr_list = item->Child("ExpressionList");
+    if (in_expr_list == nullptr || in_expr_list->children.empty()) continue;
+    std::string in_col_name = Path(*in_expr_list->children[0]);
+    std::string in_label = in_col_name;
+    if (const GoogleSqlAstNode* label_node = item->Child("UnpivotInItemLabel")) {
+      if (const GoogleSqlAstNode* str_node =
+              label_node->Child("StringLiteral")) {
+        for (const auto& c : str_node->children) {
+          if (c->kind == "StringLiteralComponent") {
+            in_label = c->detail;
+            if (!in_label.empty() && in_label.front() == '\'' &&
+                in_label.back() == '\'') {
+              in_label = in_label.substr(1, in_label.size() - 2);
+            }
+            break;
+          }
+        }
+      } else if (!label_node->children.empty()) {
+        in_label = label_node->children[0]->detail;
+      }
+    }
+
+    std::vector<NamedExpression> branch_select;
+    branch_select.push_back(
+        NamedExpression("", ColumnValueExp(ColumnName("*"))));
+    branch_select.push_back(
+        NamedExpression(val_col_name, ColumnValueExp(ColumnName(in_col_name))));
+    branch_select.push_back(
+        NamedExpression(name_col_name, ConstantValueExp(Value(std::string(in_label)))));
+
+    auto branch = std::make_shared<SelectStatement>();
+    branch->SetSelectList(std::move(branch_select));
+    branch->SetSources({base});
+    if (!include_nulls) {
+      branch->SetWhereClause(UnaryExpressionExp(
+          ColumnValueExp(ColumnName(in_col_name)), UnaryOperation::kIsNotNull));
+    }
+    branch->MarkComplex();
+
+    if (!root_branch) {
+      root_branch = branch;
+    } else {
+      root_branch->AddUnionAll(branch);
+    }
+  }
+
+  SelectSource result;
+  result.query = std::move(root_branch);
+  result.alias = saved_alias.empty() ? "unpivot_table" : saved_alias;
+  return result;
+}
+
 SelectSource VisitTableSource(
     const GoogleSqlAstNode& node,
     JoinType join_type,  // NOLINT(misc-no-recursion) // Recursive AST descent
@@ -4038,9 +4347,33 @@ SelectSource VisitTableSource(
       throw std::runtime_error("GoogleSQL AST: table subquery missing query");
     }
     source.query = VisitQuery(*query);
+    if (node.detail.find("lateral") != std::string::npos ||
+        node.detail.find("LATERAL") != std::string::npos ||
+        (query->start > node.start && (query->start - node.start) >= 7)) {
+      source.is_lateral = true;
+    } else if (source.query) {
+      std::unordered_set<std::string> local_tables;
+      for (const auto& s : source.query->Sources()) {
+        if (!s.alias.empty()) local_tables.insert(s.alias);
+        if (!s.table.empty()) local_tables.insert(s.table);
+      }
+      if (source.query->WhereClause()) {
+        for (const auto& col : source.query->WhereClause()->TouchedColumns()) {
+          if (!col.schema.empty() && !local_tables.contains(col.schema)) {
+            source.is_lateral = true;
+            break;
+          }
+        }
+      }
+    }
   } else {
     throw std::runtime_error("GoogleSQL AST: unsupported table source " +
                              node.kind);
+  }
+  if (const GoogleSqlAstNode* pivot = node.Child("PivotClause")) {
+    source = ExpandPivotSource(std::move(source), *pivot);
+  } else if (const GoogleSqlAstNode* unpivot = node.Child("UnpivotClause")) {
+    source = ExpandUnpivotSource(source, *unpivot);
   }
   return source;
 }
@@ -4574,28 +4907,82 @@ std::shared_ptr<SelectStatement> VisitQuery(
   statement->SetLimit(limit);
   statement->SetSources(std::move(sources));
 
-  if (const GoogleSqlAstNode* group = select->Child("GroupBy")) {
-    std::vector<Expression> expressions;
-    for (const GoogleSqlAstNode* item : group->Children("GroupingItem")) {
-      if (item->children.empty()) {
-        continue;
+  std::vector<Expression> distinct_on_expressions;
+  if (const GoogleSqlAstNode* distinct_on = select->Child("DistinctOn")) {
+    for (const auto& child : distinct_on->children) {
+      if (child->kind == "ExpressionList" || child->kind == "GroupingItem") {
+        for (const auto& grandchild : child->children) {
+          distinct_on_expressions.push_back(VisitExpression(*grandchild));
+        }
+      } else if (child->kind == "SelectColumn" && !child->children.empty()) {
+        distinct_on_expressions.push_back(VisitExpression(*child->children[0]));
+      } else {
+        distinct_on_expressions.push_back(VisitExpression(*child));
       }
-      const GoogleSqlAstNode& term = *item->children[0];
-      if (term.kind == "IntLiteral") {
-        // GoogleSQL: integer GROUP BY items are SELECT-list ordinals.
-        const size_t ordinal = static_cast<size_t>(ParseUnsignedLiteral(term));
-        if (ordinal >= 1 && ordinal <= statement->SelectList().size() &&
-            statement->SelectList()[ordinal - 1].expression) {
-          expressions.push_back(
-              statement->SelectList()[ordinal - 1].expression);
+    }
+  } else if (const GoogleSqlAstNode* distinct_on_clause =
+                 select->Child("DistinctOnClause")) {
+    for (const auto& child : distinct_on_clause->children) {
+      if (child->kind == "SelectColumn" && !child->children.empty()) {
+        distinct_on_expressions.push_back(VisitExpression(*child->children[0]));
+      } else {
+        distinct_on_expressions.push_back(VisitExpression(*child));
+      }
+    }
+  }
+  if (!distinct_on_expressions.empty()) {
+    statement->SetDistinctOn(std::move(distinct_on_expressions));
+  }
+
+  if (const GoogleSqlAstNode* limit_offset = query.Child("LimitOffset")) {
+    if (limit_offset->Child("WithTies") != nullptr ||
+        limit_offset->detail.find("with_ties") != std::string::npos ||
+        limit_offset->detail.find("WITH TIES") != std::string::npos) {
+      statement->SetWithTies(true);
+    }
+  }
+  if (query.Child("WithTies") != nullptr) {
+    statement->SetWithTies(true);
+  }
+
+  if (const GoogleSqlAstNode* group = select->Child("GroupBy")) {
+    const bool is_group_by_all =
+        group->Child("GroupByAll") != nullptr ||
+        group->detail.find("ALL") != std::string::npos;
+    if (is_group_by_all) {
+      std::vector<Expression> expressions;
+      for (const NamedExpression& named : statement->SelectList()) {
+        if (named.expression && !ContainsAggregate(named.expression) &&
+            named.expression->Type() != TypeTag::kWindowFunctionExp &&
+            named.expression->Type() != TypeTag::kConstantValue) {
+          expressions.push_back(named.expression);
+        }
+      }
+      statement->SetGroupBy(std::move(expressions));
+    } else {
+      std::vector<Expression> expressions;
+      for (const GoogleSqlAstNode* item : group->Children("GroupingItem")) {
+        if (item->children.empty()) {
           continue;
         }
-        throw std::runtime_error(
-            "GoogleSQL AST: GROUP BY ordinal out of range");
+        const GoogleSqlAstNode& term = *item->children[0];
+        if (term.kind == "IntLiteral") {
+          // GoogleSQL: integer GROUP BY items are SELECT-list ordinals.
+          const size_t ordinal =
+              static_cast<size_t>(ParseUnsignedLiteral(term));
+          if (ordinal >= 1 && ordinal <= statement->SelectList().size() &&
+              statement->SelectList()[ordinal - 1].expression) {
+            expressions.push_back(
+                statement->SelectList()[ordinal - 1].expression);
+            continue;
+          }
+          throw std::runtime_error(
+              "GoogleSQL AST: GROUP BY ordinal out of range");
+        }
+        expressions.push_back(VisitExpression(term));
       }
-      expressions.push_back(VisitExpression(term));
+      statement->SetGroupBy(std::move(expressions));
     }
-    statement->SetGroupBy(std::move(expressions));
   }
   if (const GoogleSqlAstNode* having = select->Child("Having")) {
     if (!having->children.empty()) {
@@ -4811,6 +5198,16 @@ std::unique_ptr<Statement> VisitCreateFunction(const GoogleSqlAstNode& root) {
       udf.parameters.emplace_back(
           Lower(Identifier(*name_node)),
           parameter->detail.find("is_not_aggregate=true") != std::string::npos);
+      std::shared_ptr<GoogleSqlAstNode> default_expr = nullptr;
+      for (const auto& child : parameter->children) {
+        if (child->kind != "Identifier" && child->kind != "SimpleType" &&
+            child->kind != "TemplatedParameterType" &&
+            child->kind != "Location") {
+          default_expr = CloneAstNode(*child);
+          break;
+        }
+      }
+      udf.default_values.push_back(std::move(default_expr));
     }
   }
   if (root.kind != "CreateTableFunctionStatement") {

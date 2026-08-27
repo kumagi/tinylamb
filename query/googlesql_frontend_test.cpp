@@ -372,7 +372,7 @@ TEST(GoogleSqlFrontendTest, RejectsUnsupportedStatementKinds) {
       "GRANT SELECT ON t TO u;",
       "COPY t FROM 'f.csv';",
       "VACUUM;",
-      "SELECT a FROM t ORDER BY a FETCH FIRST 5 ROWS ONLY;"};
+      "CLUSTER t USING idx;"};
   for (const std::string& sql : unsupported) {
     GoogleSqlParseResult result = GoogleSqlFrontend::Parse(sql);
     EXPECT_FALSE(result.ok) << sql;

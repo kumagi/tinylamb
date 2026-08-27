@@ -1,0 +1,541 @@
+[prepare_database]
+CREATE TABLE dept AS
+SELECT 10 AS dept_id, 'Engineering' AS dept_name
+UNION ALL SELECT 20, 'Sales'
+UNION ALL SELECT 30, 'Marketing'
+UNION ALL SELECT 40, 'Executive';
+--
+ARRAY<STRUCT<dept_id INT64, dept_name STRING>>[
+  {10, "Engineering"},
+  {20, "Sales"},
+  {30, "Marketing"},
+  {40, "Executive"}
+]
+==
+
+[prepare_database]
+CREATE TABLE emp AS
+SELECT 1 AS id, 'Alice' AS name, 10 AS dept_id, 8000 AS salary, 1000 AS bonus, 'Eng' AS role
+UNION ALL SELECT 2, 'Bob', 10, 6000, CAST(NULL AS INT64), 'Eng'
+UNION ALL SELECT 3, 'Charlie', 10, 8000, 500, 'Lead'
+UNION ALL SELECT 4, 'David', 20, 5000, 2000, 'Sales'
+UNION ALL SELECT 5, 'Eva', 20, 7000, CAST(NULL AS INT64), 'Lead'
+UNION ALL SELECT 6, 'Frank', 30, 4000, 300, 'Marketing'
+UNION ALL SELECT 7, 'Grace', 99, 9000, 5000, 'Advisor';
+--
+ARRAY<STRUCT<id INT64, name STRING, dept_id INT64, salary INT64, bonus INT64, role STRING>>[
+  {1, "Alice", 10, 8000, 1000, "Eng"},
+  {2, "Bob", 10, 6000, NULL, "Eng"},
+  {3, "Charlie", 10, 8000, 500, "Lead"},
+  {4, "David", 20, 5000, 2000, "Sales"},
+  {5, "Eva", 20, 7000, NULL, "Lead"},
+  {6, "Frank", 30, 4000, 300, "Marketing"},
+  {7, "Grace", 99, 9000, 5000, "Advisor"}
+]
+==
+
+[prepare_database]
+CREATE TABLE join_left AS
+SELECT 1 AS id, 10 AS k, 'L1' AS val
+UNION ALL SELECT 2, 20, 'L2'
+UNION ALL SELECT 3, 30, 'L3'
+UNION ALL SELECT 4, CAST(NULL AS INT64), 'L4'
+UNION ALL SELECT 5, 20, 'L5';
+--
+ARRAY<STRUCT<id INT64, k INT64, val STRING>>[
+  {1, 10, "L1"},
+  {2, 20, "L2"},
+  {3, 30, "L3"},
+  {4, NULL, "L4"},
+  {5, 20, "L5"}
+]
+==
+
+[prepare_database]
+CREATE TABLE join_right AS
+SELECT 100 AS r_id, 10 AS k, 'R1' AS r_val, 1000 AS weight
+UNION ALL SELECT 200, 20, 'R2_a', 2000
+UNION ALL SELECT 201, 20, 'R2_b', 2500
+UNION ALL SELECT 300, 40, 'R4', 4000
+UNION ALL SELECT 400, CAST(NULL AS INT64), 'R_null', 500;
+--
+ARRAY<STRUCT<r_id INT64, k INT64, r_val STRING, weight INT64>>[
+  {100, 10, "R1", 1000},
+  {200, 20, "R2_a", 2000},
+  {201, 20, "R2_b", 2500},
+  {300, 40, "R4", 4000},
+  {400, NULL, "R_null", 500}
+]
+==
+
+[prepare_database]
+CREATE TABLE time_events_a AS
+SELECT 1 AS id, 100 AS ts, 'evt_1' AS descr
+UNION ALL SELECT 2, 250, 'evt_2'
+UNION ALL SELECT 3, 400, 'evt_3';
+--
+ARRAY<STRUCT<id INT64, ts INT64, descr STRING>>[
+  {1, 100, "evt_1"},
+  {2, 250, "evt_2"},
+  {3, 400, "evt_3"}
+]
+==
+
+[prepare_database]
+CREATE TABLE time_windows_b AS
+SELECT 10 AS win_id, 50 AS start_ts, 150 AS end_ts, 'w1' AS label
+UNION ALL SELECT 20, 200, 300, 'w2'
+UNION ALL SELECT 30, 350, 450, 'w3';
+--
+ARRAY<STRUCT<win_id INT64, start_ts INT64, end_ts INT64, label STRING>>[
+  {10, 50, 150, "w1"},
+  {20, 200, 300, "w2"},
+  {30, 350, 450, "w3"}
+]
+==
+
+[prepare_database]
+CREATE TABLE graph_edges AS
+SELECT 1 AS src, 2 AS dst
+UNION ALL SELECT 2, 3
+UNION ALL SELECT 3, 1
+UNION ALL SELECT 3, 4;
+--
+ARRAY<STRUCT<src INT64, dst INT64>>[
+  {1, 2},
+  {2, 3},
+  {3, 1},
+  {3, 4}
+]
+==
+
+[prepare_database]
+CREATE TABLE set_a AS
+SELECT 1 AS x, 'a' AS tag
+UNION ALL SELECT 2, 'b'
+UNION ALL SELECT 2, 'b'
+UNION ALL SELECT 3, 'c';
+--
+ARRAY<STRUCT<x INT64, tag STRING>>[
+  {1, "a"},
+  {2, "b"},
+  {2, "b"},
+  {3, "c"}
+]
+==
+
+[prepare_database]
+CREATE TABLE set_b AS
+SELECT 2 AS x, 'b' AS tag
+UNION ALL SELECT 3, 'c'
+UNION ALL SELECT 4, 'd';
+--
+ARRAY<STRUCT<x INT64, tag STRING>>[
+  {2, "b"},
+  {3, "c"},
+  {4, "d"}
+]
+==
+
+[name=join_semi_join_exists]
+SELECT id, k, val
+FROM join_left
+WHERE k IS NOT NULL AND EXISTS (SELECT 1 FROM join_right WHERE join_left.k = join_right.k)
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64, k INT64, val STRING>>[
+  {1, 10, "L1"},
+  {2, 20, "L2"},
+  {5, 20, "L5"}
+]
+==
+
+[name=join_anti_join_not_exists]
+SELECT id, k, val
+FROM join_left
+WHERE k IS NOT NULL AND NOT EXISTS (SELECT 1 FROM join_right WHERE join_left.k = join_right.k)
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64, k INT64, val STRING>>[
+  {3, 30, "L3"}
+]
+==
+
+[name=join_null_aware_anti_join_not_in]
+SELECT id, k
+FROM join_left
+WHERE k IS NOT NULL AND k NOT IN (SELECT k FROM join_right WHERE k IS NOT NULL)
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64, k INT64>>[
+  {3, 30}
+]
+==
+
+[name=join_single_join_scalar_subquery]
+SELECT d.dept_id, d.dept_name,
+       (SELECT COUNT(*) FROM emp e WHERE e.dept_id = d.dept_id) AS emp_count
+FROM dept d
+ORDER BY d.dept_id
+--
+ARRAY<STRUCT<dept_id INT64, dept_name STRING, emp_count INT64>>[
+  {10, "Engineering", 3},
+  {20, "Sales", 2},
+  {30, "Marketing", 1},
+  {40, "Executive", 0}
+]
+==
+
+[name=join_mark_join_in_subquery]
+SELECT id, k,
+       (k IN (SELECT k FROM join_right WHERE k IS NOT NULL)) AS in_right
+FROM join_left
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64, k INT64, in_right BOOL>>[
+  {1, 10, true},
+  {2, 20, true},
+  {3, 30, false},
+  {4, NULL, NULL},
+  {5, 20, true}
+]
+==
+
+[name=join_interval_range_join]
+SELECT a.id, a.ts, b.win_id, b.label
+FROM time_events_a a
+JOIN time_windows_b b
+  ON a.ts >= b.start_ts AND a.ts <= b.end_ts
+ORDER BY a.id
+--
+ARRAY<STRUCT<id INT64, ts INT64, win_id INT64, label STRING>>[
+  {1, 100, 10, "w1"},
+  {2, 250, 20, "w2"},
+  {3, 400, 30, "w3"}
+]
+==
+
+[name=join_parallel_hash_inner_join]
+SELECT l.id, l.val, r.r_id, r.r_val
+FROM join_left l
+INNER JOIN join_right r ON l.k = r.k
+ORDER BY l.id, r.r_id
+--
+ARRAY<STRUCT<id INT64, val STRING, r_id INT64, r_val STRING>>[
+  {1, "L1", 100, "R1"},
+  {2, "L2", 200, "R2_a"},
+  {2, "L2", 201, "R2_b"},
+  {5, "L5", 200, "R2_a"},
+  {5, "L5", 201, "R2_b"}
+]
+==
+
+[name=join_batch_nested_loop_non_equi]
+SELECT a.id AS a_id, b.win_id AS b_id
+FROM time_events_a a
+JOIN time_windows_b b ON a.ts < b.start_ts
+ORDER BY a.id, b.win_id
+--
+ARRAY<STRUCT<a_id INT64, b_id INT64>>[
+  {1, 20},
+  {1, 30},
+  {2, 30}
+]
+==
+
+[name=aggregate_multi_phase_grouped]
+SELECT dept_id,
+       COUNT(*) AS cnt,
+       SUM(salary) AS total_sal,
+       MIN(salary) AS min_sal,
+       MAX(salary) AS max_sal
+FROM emp
+GROUP BY dept_id
+ORDER BY dept_id
+--
+ARRAY<STRUCT<dept_id INT64, cnt INT64, total_sal INT64, min_sal INT64, max_sal INT64>>[
+  {10, 3, 22000, 6000, 8000},
+  {20, 2, 12000, 5000, 7000},
+  {30, 1, 4000, 4000, 4000},
+  {99, 1, 9000, 9000, 9000}
+]
+==
+
+[name=aggregate_distinct_aggregation]
+SELECT dept_id,
+       COUNT(DISTINCT role) AS distinct_roles,
+       COUNT(DISTINCT salary) AS distinct_salaries
+FROM emp
+GROUP BY dept_id
+ORDER BY dept_id
+--
+ARRAY<STRUCT<dept_id INT64, distinct_roles INT64, distinct_salaries INT64>>[
+  {10, 2, 2},
+  {20, 2, 2},
+  {30, 1, 1},
+  {99, 1, 1}
+]
+==
+
+[required_features=AGGREGATE_FILTERING]
+[name=aggregate_filtered_aggregates]
+SELECT dept_id,
+       COUNT(*) FILTER (WHERE salary >= 7000) AS high_earners,
+       SUM(salary) FILTER (WHERE bonus IS NOT NULL) AS sal_with_bonus
+FROM emp
+GROUP BY dept_id
+ORDER BY dept_id
+--
+ARRAY<STRUCT<dept_id INT64, high_earners INT64, sal_with_bonus INT64>>[
+  {10, 2, 16000},
+  {20, 1, 5000},
+  {30, 0, 4000},
+  {99, 1, 9000}
+]
+==
+
+[name=aggregate_any_value]
+SELECT dept_id, ANY_VALUE(dept_name) AS dname
+FROM dept
+GROUP BY dept_id
+ORDER BY dept_id
+--
+ARRAY<STRUCT<dept_id INT64, dname STRING>>[
+  {10, "Engineering"},
+  {20, "Sales"},
+  {30, "Marketing"},
+  {40, "Executive"}
+]
+==
+
+[required_features=GROUPING_SETS]
+[name=aggregate_grouping_sets]
+SELECT dept_id, role, SUM(salary) AS total_sal
+FROM emp
+WHERE dept_id IN (10, 20)
+GROUP BY GROUPING SETS ((dept_id, role), (dept_id), ())
+ORDER BY dept_id, role
+--
+ARRAY<STRUCT<dept_id INT64, role STRING, total_sal INT64>>[
+  {10, "Eng", 14000},
+  {10, "Lead", 8000},
+  {10, NULL, 22000},
+  {20, "Lead", 7000},
+  {20, "Sales", 5000},
+  {20, NULL, 12000},
+  {NULL, NULL, 34000}
+]
+==
+
+[required_features=GROUPING_SETS]
+[name=aggregate_rollup]
+SELECT dept_id, role, SUM(salary) AS total_sal
+FROM emp
+WHERE dept_id IN (10, 20)
+GROUP BY ROLLUP (dept_id, role)
+ORDER BY dept_id, role
+--
+ARRAY<STRUCT<dept_id INT64, role STRING, total_sal INT64>>[
+  {10, "Eng", 14000},
+  {10, "Lead", 8000},
+  {10, NULL, 22000},
+  {20, "Lead", 7000},
+  {20, "Sales", 5000},
+  {20, NULL, 12000},
+  {NULL, NULL, 34000}
+]
+==
+
+[required_features=GROUPING_SETS]
+[name=aggregate_cube]
+SELECT dept_id, role, SUM(salary) AS total_sal
+FROM emp
+WHERE dept_id IN (10, 20)
+GROUP BY CUBE (dept_id, role)
+ORDER BY dept_id, role
+--
+ARRAY<STRUCT<dept_id INT64, role STRING, total_sal INT64>>[
+  {10, "Eng", 14000},
+  {10, "Lead", 8000},
+  {10, NULL, 22000},
+  {20, "Lead", 7000},
+  {20, "Sales", 5000},
+  {20, NULL, 12000},
+  {NULL, "Eng", 14000},
+  {NULL, "Lead", 15000},
+  {NULL, "Sales", 5000},
+  {NULL, NULL, 34000}
+]
+==
+
+[name=window_ranking_functions]
+SELECT id, dept_id, salary,
+       ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY salary, id) AS rn,
+       RANK() OVER (PARTITION BY dept_id ORDER BY salary) AS rnk,
+       DENSE_RANK() OVER (PARTITION BY dept_id ORDER BY salary) AS drnk
+FROM emp
+WHERE dept_id = 10
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64, dept_id INT64, salary INT64, rn INT64, rnk INT64, drnk INT64>>[
+  {1, 10, 8000, 2, 2, 2},
+  {2, 10, 6000, 1, 1, 1},
+  {3, 10, 8000, 3, 2, 2}
+]
+==
+
+[name=window_rows_frame_moving_sum]
+SELECT id, salary,
+       SUM(salary) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS moving_sum
+FROM emp
+WHERE dept_id = 10
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64, salary INT64, moving_sum INT64>>[
+  {1, 8000, 14000},
+  {2, 6000, 22000},
+  {3, 8000, 14000}
+]
+==
+
+[name=window_range_frame_cumulative_sum]
+SELECT id, salary,
+       SUM(salary) OVER (ORDER BY salary RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_sum
+FROM emp
+WHERE dept_id = 10
+ORDER BY salary, id
+--
+ARRAY<STRUCT<id INT64, salary INT64, cum_sum INT64>>[
+  {2, 6000, 6000},
+  {1, 8000, 22000},
+  {3, 8000, 22000}
+]
+==
+
+[required_features=WINDOW_EXCLUDE]
+[name=window_exclude_current_row]
+SELECT id, salary,
+       SUM(salary) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS other_sum
+FROM emp
+WHERE dept_id = 10
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64, salary INT64, other_sum INT64>>[
+  {1, 8000, 14000},
+  {2, 6000, 16000},
+  {3, 8000, 14000}
+]
+==
+
+[name=cte_recursive_anchor_union]
+WITH RECURSIVE cnt AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM cnt WHERE n < 5
+)
+SELECT n FROM cnt ORDER BY n
+--
+ARRAY<STRUCT<n INT64>>[
+  {1},
+  {2},
+  {3},
+  {4},
+  {5}
+]
+==
+
+[name=cte_recursive_cyclic_graph_depth_bound]
+WITH RECURSIVE path AS (
+  SELECT 1 AS node, 0 AS depth
+  UNION ALL
+  SELECT e.dst, p.depth + 1
+  FROM path p
+  JOIN graph_edges e ON p.node = e.src
+  WHERE p.depth < 3
+)
+SELECT node, depth FROM path ORDER BY depth, node
+--
+ARRAY<STRUCT<node INT64, depth INT64>>[
+  {1, 0},
+  {2, 1},
+  {3, 2},
+  {1, 3},
+  {4, 3}
+]
+==
+
+[name=cte_multiple_consumers_materialized]
+WITH filtered_emp AS (
+  SELECT id, name, salary FROM emp WHERE salary >= 7000
+)
+SELECT e1.name AS n1, e2.name AS n2, e1.salary
+FROM filtered_emp e1
+JOIN filtered_emp e2 ON e1.salary = e2.salary AND e1.id < e2.id
+ORDER BY e1.name
+--
+ARRAY<STRUCT<n1 STRING, n2 STRING, salary INT64>>[
+  {"Alice", "Charlie", 8000}
+]
+==
+
+[name=setop_union_distinct_vs_all]
+SELECT x FROM set_a
+UNION DISTINCT
+SELECT x FROM set_b
+ORDER BY x
+--
+ARRAY<STRUCT<x INT64>>[
+  {1},
+  {2},
+  {3},
+  {4}
+]
+==
+
+[name=setop_intersect_distinct]
+SELECT x FROM set_a
+INTERSECT DISTINCT
+SELECT x FROM set_b
+ORDER BY x
+--
+ARRAY<STRUCT<x INT64>>[
+  {2},
+  {3}
+]
+==
+
+[name=setop_except_distinct]
+SELECT x FROM set_a
+EXCEPT DISTINCT
+SELECT x FROM set_b
+ORDER BY x
+--
+ARRAY<STRUCT<x INT64>>[
+  {1}
+]
+==
+
+[name=setop_type_coercion_pushdown]
+SELECT 1 AS val
+UNION ALL
+SELECT 2.5 AS val
+--
+ARRAY<STRUCT<val DOUBLE>>[
+  {1},
+  {2.5}
+]
+==
+
+[name=setop_union_all_with_limit]
+SELECT x FROM (
+  (SELECT x FROM set_a ORDER BY x)
+  UNION ALL
+  (SELECT x FROM set_b ORDER BY x)
+) LIMIT 3
+--
+ARRAY<STRUCT<x INT64>>[
+  {1},
+  {2},
+  {2}
+]
+==

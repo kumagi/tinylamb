@@ -87,10 +87,16 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
           !CompileNode(binary.Right(), schema, program)) {
         return false;
       }
-      ValueType operand_type = ValueTypeFor(binary.Left()->ResultType(schema));
-      if (operand_type == ValueType::kDouble ||
-          ValueTypeFor(binary.Right()->ResultType(schema)) ==
-              ValueType::kDouble) {
+      const ValueType left_type = ValueTypeFor(binary.Left()->ResultType(schema));
+      const ValueType right_type = ValueTypeFor(binary.Right()->ResultType(schema));
+      if (binary.Op() == BinaryOperation::kLike ||
+          binary.Op() == BinaryOperation::kNotLike) {
+        if (left_type != ValueType::kVarChar || right_type != ValueType::kVarChar) {
+          return false;
+        }
+      }
+      ValueType operand_type = left_type;
+      if (operand_type == ValueType::kDouble || right_type == ValueType::kDouble) {
         operand_type = ValueType::kDouble;
       }
       program->AddInstruction(

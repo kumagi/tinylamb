@@ -541,6 +541,18 @@ void HashJoin::Materialize() {
     materialized_ = true;
     return;
   }
+  if (kind_ == JoinKind::kSingle) {
+    MaterializeSingle();
+    pipelined_ = false;
+    materialized_ = true;
+    return;
+  }
+  if (kind_ == JoinKind::kMark) {
+    MaterializeMarkJoin();
+    pipelined_ = false;
+    materialized_ = true;
+    return;
+  }
   if (kind_ != JoinKind::kInner) {
     MaterializeSemiAnti();
     pipelined_ = false;
@@ -555,6 +567,180 @@ void HashJoin::Materialize() {
     pipelined_ = true;
   }
   materialized_ = true;
+}
+
+void HashJoin::MaterializeSingle() {
+  state_ = std::make_unique<JoinState>();
+  JoinState& s = *state_;
+  IntakeBothSides();
+  s.left.charge.ReleaseAll();
+  s.right.charge.ReleaseAll();
+
+  const std::vector<PositionedRow>& left_rows = s.left.rows;
+  const std::vector<PositionedRow>& right_rows = s.right.rows;
+  std::string scratch;
+
+  const SideIndex build = BuildSideIndex(right_rows, right_cols_);
+  for (size_t left_index = 0; left_index < left_rows.size(); ++left_index) {
+    const PositionedRow& left = left_rows[left_index];
+    const KeyRef key =
+        KeyOf(left.first, left_cols_, build.mode, build.int_type, &scratch);
+    const size_t first = key.valid
+                             ? build.index.Find(key.hash, key.int_key,
+                                                key.byte_key)
+                             : JoinHashIndex::kNil;
+    if (first == JoinHashIndex::kNil) {
+      output_.emplace_back(
+          left.first + Row(std::vector<Value>(right_width_)), left.second);
+      continue;
+    }
+    size_t match_count = 0;
+    size_t matched_right_index = 0;
+    for (size_t entry = first; entry != JoinHashIndex::kNil;
+         entry = build.index.ChainNext(entry)) {
+      matched_right_index = build.index.RowIndex(entry);
+      ++match_count;
+      if (match_count > 1) {
+        throw std::runtime_error(
+            "SingleJoin subquery returned more than 1 row");
+      }
+    }
+    output_.emplace_back(left.first + right_rows[matched_right_index].first,
+                         left.second);
+  }
+
+  size_t output_bytes = 0;
+  for (const auto& row : output_) {
+    output_bytes += EstimateRowBytes(row.first);
+  }
+  output_charge_.Add(output_bytes);
+}
+
+void HashJoin::MaterializeMarkJoin() {
+  state_ = std::make_unique<JoinState>();
+  JoinState& s = *state_;
+  IntakeBothSides();
+  s.left.charge.ReleaseAll();
+  s.right.charge.ReleaseAll();
+
+  std::string scratch;
+  size_t output_bytes = 0;
+  const auto emit_row = [&](const Row& row, const RowPosition& pos) {
+    output_bytes += EstimateRowBytes(row);
+    output_.emplace_back(row, pos);
+  };
+
+  const auto probe_lookup = [&](const PositionedRow& probe,
+                                const SideIndex& build) -> int {
+    const KeyRef k =
+        KeyOf(probe.first, left_cols_, build.mode, build.int_type, &scratch);
+    if (!k.valid) {
+      return -1;
+    }
+    return build.index.Find(k.hash, k.int_key, k.byte_key) !=
+                   JoinHashIndex::kNil
+               ? 1
+               : 0;
+  };
+
+  size_t build_total = s.right.rows.size();
+  for (const SpillFile& part : s.right.spills) {
+    build_total += part.Count();
+  }
+
+  if (!s.right.Spilled()) {
+    const SideIndex build = BuildSideIndex(s.right.rows, right_cols_);
+    const auto process_probe_rows =
+        [&](const std::vector<PositionedRow>& rows) {
+          for (const PositionedRow& probe : rows) {
+            int match = probe_lookup(probe, build);
+            Value marker;
+            if (match == 1) {
+              marker = Value(true);
+            } else if (match == 0) {
+              if (s.right.has_null_key) {
+                marker = Value();
+              } else {
+                marker = Value(false);
+              }
+            } else {
+              if (build_total == 0) {
+                marker = Value(false);
+              } else {
+                marker = Value();
+              }
+            }
+            emit_row(probe.first + Row({marker}), probe.second);
+          }
+        };
+
+    if (!s.left.Spilled()) {
+      process_probe_rows(s.left.rows);
+    } else {
+      for (SpillFile& part : s.left.spills) {
+        process_probe_rows(part.ReadAllPositioned());
+      }
+    }
+    output_charge_.Add(output_bytes);
+    return;
+  }
+
+  const auto process_probe_spilled =
+      [&](const std::vector<PositionedRow>& rows) {
+        std::vector<int> match_state(rows.size(), 0);
+        for (size_t i = 0; i < rows.size(); ++i) {
+          std::string scratch_key;
+          const KeyRef k =
+              KeyOf(rows[i].first, left_cols_,
+                    JoinHashIndex::KeyMode::kBytes, ValueType::kInt64,
+                    &scratch_key);
+          if (!k.valid) {
+            match_state[i] = -1;
+          }
+        }
+
+        for (size_t p = 0; p < kReactiveSpillPartitions; ++p) {
+          std::vector<PositionedRow> right_part =
+              s.right.spills[p].ReadAllPositioned();
+          if (right_part.empty()) continue;
+          const SideIndex build = BuildSideIndex(right_part, right_cols_);
+          for (size_t i = 0; i < rows.size(); ++i) {
+            if (match_state[i] == 1 || match_state[i] == -1) continue;
+            if (probe_lookup(rows[i], build) == 1) {
+              match_state[i] = 1;
+            }
+          }
+        }
+
+        for (size_t i = 0; i < rows.size(); ++i) {
+          Value marker;
+          if (match_state[i] == 1) {
+            marker = Value(true);
+          } else if (match_state[i] == 0) {
+            if (s.right.has_null_key) {
+              marker = Value();
+            } else {
+              marker = Value(false);
+            }
+          } else {
+            if (build_total == 0) {
+              marker = Value(false);
+            } else {
+              marker = Value();
+            }
+          }
+          emit_row(rows[i].first + Row({marker}), rows[i].second);
+        }
+      };
+
+  if (!s.left.Spilled()) {
+    process_probe_spilled(s.left.rows);
+  } else {
+    for (SpillFile& part : s.left.spills) {
+      process_probe_spilled(part.ReadAllPositioned());
+    }
+  }
+  output_charge_.Add(output_bytes);
 }
 
 void HashJoin::MaterializeOuter() {
@@ -1305,6 +1491,29 @@ void HashJoin::Dump(std::ostream& o, int indent) const {
   left_->Dump(o, indent + 2);
   o << "\n" << Indent(indent + 2);
   right_->Dump(o, indent + 2);
+}
+
+size_t HashJoin::MaterializedRowCount() const {
+  if (!output_.empty()) {
+    return output_.size();
+  }
+  if (state_) {
+    if (state_->build_rows != nullptr) {
+      return state_->build_rows->size();
+    }
+    return state_->right.rows.size() + state_->left.rows.size();
+  }
+  return 0;
+}
+
+size_t HashJoin::MaterializedBytes() const {
+  if (output_charge_.Bytes() > 0) {
+    return output_charge_.Bytes();
+  }
+  if (state_) {
+    return state_->left.charge.Bytes() + state_->right.charge.Bytes();
+  }
+  return 0;
 }
 
 }  // namespace tinylamb

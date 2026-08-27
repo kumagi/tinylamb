@@ -906,9 +906,17 @@ Relation LateralExpandRelation(TransactionContext& context,
   prefix.ForEachRow([&](const Row& row) {
     any_prefix_row = true;
     Scope scope{.row = &row, .schema = &prefix.schema, .outer = outer};
-    const Value array_val =
-        Evaluate(source.unnest, scope, nullptr, context, ctes);
-    Relation elements = element_schema_of(array_val);
+    Relation elements(context.execution_runtime());
+    if (source.unnest) {
+      const Value array_val =
+          Evaluate(source.unnest, scope, nullptr, context, ctes);
+      elements = element_schema_of(array_val);
+    } else if (source.query) {
+      elements = ExecuteQuery(context, *source.query, &scope, ctes);
+      if (!source.alias.empty()) {
+        elements.schema = QualifySchema(elements.schema, source.alias);
+      }
+    }
     if (!schema_initialized) {
       output.schema = prefix.schema + elements.schema;
       schema_initialized = true;
@@ -992,9 +1000,17 @@ Relation LateralExpandRelation(TransactionContext& context,
           std::vector<Value>(prefix.schema.ColumnCount(), Value()));
       Scope scope{
           .row = &representative, .schema = &prefix.schema, .outer = outer};
-      const Value array_val =
-          Evaluate(source.unnest, scope, nullptr, context, ctes);
-      Relation elements = element_schema_of(array_val);
+      Relation elements(context.execution_runtime());
+      if (source.unnest) {
+        const Value array_val =
+            Evaluate(source.unnest, scope, nullptr, context, ctes);
+        elements = element_schema_of(array_val);
+      } else if (source.query) {
+        elements = ExecuteQuery(context, *source.query, &scope, ctes);
+        if (!source.alias.empty()) {
+          elements.schema = QualifySchema(elements.schema, source.alias);
+        }
+      }
       output.schema = prefix.schema + elements.schema;
       schema_initialized = true;
     }
@@ -1014,22 +1030,24 @@ Relation BuildInput(TransactionContext& context,
     return singleton;
   }
 
-  // Lateral UNNEST: a FROM item whose UNNEST argument references columns
-  // (of sibling FROM items or enclosing scopes) cannot be materialized in
-  // isolation; it expands per-row against the relations accumulated so far.
-  // Such statements assemble left-to-right instead of using the reordered
-  // join pipeline below.
+  // Lateral UNNEST / LATERAL subquery: a FROM item whose UNNEST or LATERAL
+  // subquery argument references columns of sibling FROM items or enclosing
+  // scopes cannot be materialized in isolation; it expands per-row against
+  // the relations accumulated so far.
   {
     bool lateral = false;
     for (const SelectSource& source : statement.Sources()) {
-      if (!source.unnest) {
-        continue;
-      }
-      std::unordered_set<ColumnName> touched;
-      CollectColumnsRecursive(source.unnest, &touched);
-      if (!touched.empty()) {
+      if (source.is_lateral) {
         lateral = true;
         break;
+      }
+      if (source.unnest) {
+        std::unordered_set<ColumnName> touched;
+        CollectColumnsRecursive(source.unnest, &touched);
+        if (!touched.empty()) {
+          lateral = true;
+          break;
+        }
       }
     }
     if (lateral) {
@@ -1037,7 +1055,7 @@ Relation BuildInput(TransactionContext& context,
       bool first = true;
       for (const SelectSource& source : statement.Sources()) {
         Relation relation(context.execution_runtime());
-        if (source.unnest) {
+        if (source.unnest || source.is_lateral) {
           // Lateral expansion already merges the prefix with each element
           // row (applying the source's join condition); no separate join.
           if (first) {
@@ -1051,18 +1069,18 @@ Relation BuildInput(TransactionContext& context,
             relation =
                 LateralExpandRelation(context, source, result, outer, ctes);
           }
-        } else {
-          relation = LoadSource(context, source, outer, ctes);
-        }
-        if (first) {
           result = std::move(relation);
           first = false;
-        } else if (!source.unnest) {
-          result =
-              Join(context, std::move(result), std::move(relation), source,
-                   outer, ctes);
         } else {
-          result = std::move(relation);
+          relation = LoadSource(context, source, outer, ctes);
+          if (first) {
+            result = std::move(relation);
+            first = false;
+          } else {
+            result =
+                Join(context, std::move(result), std::move(relation), source,
+                     outer, ctes);
+          }
         }
       }
       return result;

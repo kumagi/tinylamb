@@ -31,8 +31,8 @@
 namespace tinylamb {
 
 BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
-                                      std::string_view begin,
-                                      std::string_view end, bool ascending)
+                                     std::string_view begin,
+                                     std::string_view end, bool ascending)
     : tree_(tree), txn_(txn), begin_(begin), end_(end) {
   if (!end.empty() && !begin.empty() && end < begin) {
     throw std::runtime_error("invalid begin & end");
@@ -40,9 +40,22 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
   if (ascending) {
     if (begin.empty()) {
       PageRef leaf = tree->LeftmostPage(*txn_);
+      while (leaf->body.leaf_page.row_count_ == 0) {
+        if (auto foster = leaf->GetFoster(*txn_)) {
+          PageRef child =
+              txn_->GetPageManager()->GetPage(foster.Value().child_pid, true);
+          leaf.PageUnlock();
+          leaf = std::move(child);
+        } else {
+          break;
+        }
+      }
       pid_ = leaf->PageID();
       idx_ = 0;
-      valid_ = true;
+      valid_ = leaf->body.leaf_page.row_count_ > 0;
+      if (valid_ && !end.empty() && end < leaf->body.leaf_page.GetKey(idx_)) {
+        valid_ = false;
+      }
     } else {
       // Construction never mutates: read-only lookups keep RO transactions
       // on shared latches and avoid GrowTreeHeightIfNeeded/foster absorption.
@@ -50,8 +63,7 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.Find(begin);
       valid_ = idx_ < static_cast<size_t>(leaf->body.leaf_page.row_count_);
-      if (valid_ && !end.empty() &&
-          end < leaf->body.leaf_page.GetKey(idx_)) {
+      if (valid_ && !end.empty() && end < leaf->body.leaf_page.GetKey(idx_)) {
         valid_ = false;
       }
     }
@@ -60,8 +72,8 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
       PageRef leaf = tree->RightmostPage(*txn_);
       pid_ = leaf->PageID();
       idx_ = leaf->body.leaf_page.row_count_ == 0
-                  ? 0
-                  : leaf->body.leaf_page.row_count_ - 1;
+                 ? 0
+                 : leaf->body.leaf_page.row_count_ - 1;
       valid_ = leaf->body.leaf_page.row_count_ > 0;
     } else {
       // Find() is only a lower_bound: when `end` is absent we must not start
@@ -72,8 +84,7 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
       valid_ = tree_->PositionBelow(leaf, idx_, *txn_, end);
       if (valid_) {
         pid_ = leaf->PageID();
-        if (!begin_.empty() &&
-            leaf->body.leaf_page.GetKey(idx_) < begin_) {
+        if (!begin_.empty() && leaf->body.leaf_page.GetKey(idx_) < begin_) {
           valid_ = false;
         }
       }
@@ -82,9 +93,8 @@ BPlusTreeIterator::BPlusTreeIterator(BPlusTree* tree, Transaction* txn,
 }
 
 std::string BPlusTreeIterator::Key() const {
-  return std::string(txn_->GetPageManager()
-                         ->GetPage(pid_, true)
-                         ->body.leaf_page.GetKey(idx_));
+  return std::string(
+      txn_->GetPageManager()->GetPage(pid_, true)->body.leaf_page.GetKey(idx_));
 }
 
 std::string BPlusTreeIterator::Value() const {
@@ -110,8 +120,7 @@ BPlusTreeIterator& BPlusTreeIterator::operator++() {
     if (auto foster = ref->GetFoster(*txn_)) {
       const FosterPair& foster_pair = foster.Value();
       pid_ = foster_pair.child_pid;
-      PageRef next_ref =
-          txn_->GetPageManager()->GetPage(pid_, true);
+      PageRef next_ref = txn_->GetPageManager()->GetPage(pid_, true);
       ref.PageUnlock();
       idx_ = 0;
       if (next_ref->body.leaf_page.row_count_ == 0 ||
@@ -173,8 +182,8 @@ BPlusTreeIterator& BPlusTreeIterator::operator--() {
         if (foster.Value().child_pid == left_from) {
           break;
         }
-        PageRef child = txn_->GetPageManager()->GetPage(
-            foster.Value().child_pid, true);
+        PageRef child =
+            txn_->GetPageManager()->GetPage(foster.Value().child_pid, true);
         prev_ref.PageUnlock();
         prev_ref = std::move(child);
       }

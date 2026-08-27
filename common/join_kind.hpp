@@ -17,6 +17,8 @@ enum class JoinKind : uint8_t {
   kLeftOuter = 4,
   kRightOuter = 5,
   kFullOuter = 6,
+  kMark = 7,
+  kSingle = 8,
 };
 
 }  // namespace tinylamb

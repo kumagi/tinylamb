@@ -3,6 +3,7 @@
 #define TINYLAMB_EXPRESSION_REWRITE_HPP
 
 #include <functional>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -131,6 +132,14 @@ class ExpressionRewriter {
 [[nodiscard]] bool ReferencesOnly(
     const Expression& expression,
     const std::unordered_set<std::string>& relation_names);
+
+enum class Volatility : uint8_t {
+  kImmutable,
+  kStable,
+  kVolatile,
+};
+
+[[nodiscard]] Volatility GetFunctionVolatility(std::string_view func_name);
 
 }  // namespace tinylamb
 

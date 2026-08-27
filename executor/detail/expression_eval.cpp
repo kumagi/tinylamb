@@ -1265,7 +1265,8 @@ std::string FormatWeightDouble(double w);
 }  // namespace
 
 void AggregateAccumulator::ApplyCore(
-    const Value& value, const std::vector<Value>& trailing_values) {
+    const Value& value, const std::vector<Value>& trailing_values,
+    const std::vector<Value>& order_keys) {
   // APPROX_TOP_COUNT counts NULL inputs and APPROX_TOP_SUM tracks values
   // whose weights are all NULL; every other aggregate ignores NULL inputs.
   const AggregationType core_type = expression->GetType();
@@ -1571,10 +1572,20 @@ void AggregateAccumulator::ApplyCore(
       // These are accumulated by the specialized path above.
       break;
     case AggregationType::kPercentileCont: {
-      if (trailing_values.empty()) {
+      Value val;
+      Value percentile;
+      if (!trailing_values.empty()) {
+        val = value;
+        percentile = trailing_values[0];
+      } else if (!order_keys.empty()) {
+        percentile = value;
+        val = order_keys[0];
+      } else {
         throw std::runtime_error("PERCENTILE_CONT requires two arguments");
       }
-      const Value& percentile = trailing_values[0];
+      if (val.IsNull()) {
+        break;
+      }
       if (percentile.IsNull() || (percentile.type != ValueType::kInt64 &&
                                   percentile.type != ValueType::kDouble)) {
         throw std::runtime_error(
@@ -1589,11 +1600,11 @@ void AggregateAccumulator::ApplyCore(
       }
       percentile_p_ = p;
       percentile_p_valid_ = true;
-      if (value.type == ValueType::kDouble) {
-        percentile_values_.push_back(value.value.double_value);
-      } else if (value.type == ValueType::kInt64) {
+      if (val.type == ValueType::kDouble) {
+        percentile_values_.push_back(val.value.double_value);
+      } else if (val.type == ValueType::kInt64) {
         percentile_values_.push_back(
-            static_cast<double>(value.value.int_value));
+            static_cast<double>(val.value.int_value));
       } else {
         throw std::runtime_error("numeric value required");
       }
@@ -2204,9 +2215,21 @@ Value AggregateAccumulator::FinishSketch(bool extract_count) const {
   return Value(std::move(encoded));
 }
 
+bool AggregateAccumulator::IsDone() const {
+  if (expression != nullptr &&
+      expression->GetType() == AggregationType::kAnyValue &&
+      saw_any_ && !extreme.IsNull()) {
+    return true;
+  }
+  return false;
+}
+
 void AggregateAccumulator::Add(AggregateInput input) {
+  if (IsDone()) {
+    return;
+  }
   if (!buffer_) {
-    ApplyCore(input.value, input.trailing_values);
+    ApplyCore(input.value, input.trailing_values, input.order_keys);
     return;
   }
   buffer_->push_back(BufferedRow{std::move(input.value),
@@ -2217,6 +2240,9 @@ void AggregateAccumulator::Add(AggregateInput input) {
 }
 
 void AggregateAccumulator::Add(const Value& value) {
+  if (IsDone()) {
+    return;
+  }
   if (buffer_) {
     buffer_->push_back(BufferedRow{value, {}, Value(), Value(), {}});
     return;
@@ -2301,8 +2327,8 @@ Value AggregateAccumulator::Finish() const {
     }
     for (const BufferedRow& row : rows) {
       // Finish() is const by contract; replay mutates only scratch state.
-      const_cast<AggregateAccumulator*>(this)->ApplyCore(row.value,
-                                                         row.trailing_values);
+      const_cast<AggregateAccumulator*>(this)->ApplyCore(
+          row.value, row.trailing_values, row.order_keys);
       // STRING_AGG delimiter comes from the first buffered row.
       if (expression->GetType() == AggregationType::kStringAgg &&
           !delimiter_.has_value()) {
@@ -3108,7 +3134,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       name == "timestamp_sub") {
     if (call.Args().size() != 2 ||
         call.Args()[1]->Type() != TypeTag::kIntervalExp) {
-      throw std::runtime_error(name + " arity");
+      throw std::runtime_error("DATE_ADD/DATE_SUB arity");
     }
     const Value base =
         Evaluate(call.Args()[0], scope, aggregates, context, ctes);
@@ -3134,8 +3160,8 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       int64_t ns = CivilTimeToNanos(ct) + tz_offset_sec * 1000000000LL;
       ct = NanosToCivilTime(ns);
     }
-    const bool is_date = (base.type == ValueType::kDate &&
-                          (name == "date_add" || name == "date_sub"));
+    const bool is_date = (name == "date_add" || name == "date_sub" ||
+                          base.type == ValueType::kDate);
 
     if (unit == "year" || unit == "years" || unit == "quarter" ||
         unit == "quarters" || unit == "month" || unit == "months") {
@@ -3268,8 +3294,14 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           std::chrono::year{res_ct.year},
           std::chrono::month{static_cast<unsigned>(res_ct.month)},
           std::chrono::day{static_cast<unsigned>(res_ct.day)}};
-      return Value::DateFromDays(
-          std::chrono::sys_days{ymd}.time_since_epoch().count());
+      if (base.type == ValueType::kDate) {
+        return Value::DateFromDays(
+            std::chrono::sys_days{ymd}.time_since_epoch().count());
+      }
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d", res_ct.year, res_ct.month,
+               res_ct.day);
+      return Value(std::string(buf));
     }
     if (is_timestamp) {
       int64_t ns = CivilTimeToNanos(res_ct) + (8 * 3600LL) * 1000000000LL;
@@ -3386,7 +3418,11 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         continue;
       }
       const bool quoted = Truthy(arguments[i + 2]);
-      if (quoted) {
+      const auto is_struct = [](std::string_view sv) {
+        return sv.size() >= 2 && sv.front() == '{' && sv.back() == '}';
+      };
+      if (quoted || (field_value.type == ValueType::kVarChar &&
+                     !is_struct(field_value.value.varchar_value))) {
         std::string text = raw_str(field_value);
         std::string escaped_text;
         for (char c : text) {

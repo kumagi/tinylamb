@@ -38,18 +38,54 @@ bool DistinctExecutor::Next(Row* dst, RowPosition* rp) {
   Row row;
   RowPosition position;
   while (source_->Next(&row, &position)) {
-    bool duplicate = false;
-    for (const Row& seen : seen_) {
-      if (DistinctEquals(seen, row)) {
-        duplicate = true;
-        break;
+    if (distinct_on_.empty()) {
+      bool duplicate = false;
+      for (const Row& seen : seen_) {
+        if (DistinctEquals(seen, row)) {
+          duplicate = true;
+          break;
+        }
       }
-    }
-    if (!duplicate) {
-      seen_.push_back(row);
-      *dst = seen_.back();
-      if (rp != nullptr) { *rp = position; }
-      return true;
+      if (!duplicate) {
+        seen_.push_back(row);
+        *dst = seen_.back();
+        if (rp != nullptr) { *rp = position; }
+        return true;
+      }
+    } else {
+      std::vector<Value> current_keys;
+      current_keys.reserve(distinct_on_.size());
+      for (const auto& expr : distinct_on_) {
+        current_keys.push_back(expr->Evaluate(row, schema_));
+      }
+      bool duplicate = false;
+      for (const auto& seen_k : seen_keys_) {
+        if (seen_k.size() == current_keys.size()) {
+          bool match = true;
+          for (size_t i = 0; i < seen_k.size(); ++i) {
+            const Value& x = seen_k[i];
+            const Value& y = current_keys[i];
+            const bool equal =
+                (x.type == ValueType::kDouble && y.type == ValueType::kDouble)
+                    ? (CompareForOrderBy(x, y) == 0)
+                    : (x == y);
+            if (!equal) {
+              match = false;
+              break;
+            }
+          }
+          if (match) {
+            duplicate = true;
+            break;
+          }
+        }
+      }
+      if (!duplicate) {
+        seen_keys_.push_back(std::move(current_keys));
+        *dst = std::move(row);
+        if (rp != nullptr) { *rp = position; }
+        return true;
+      }
     }
   }
   return false;

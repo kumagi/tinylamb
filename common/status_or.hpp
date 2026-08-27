@@ -40,7 +40,7 @@
 #define ASSIGN_OR_ASSERT_FAIL(type, value, expr)        \
   StatusOr<type> value##_tmp = expr;                    \
   ASSERT_EQ(value##_tmp.GetStatus(), Status::kSuccess); \
-  type value(value##_tmp.Value())
+  type value(value##_tmp.MoveValue())
 
 // Like ASSIGN_OR_ASSERT_FAIL, but binds `value` as a const reference into the
 // temporary StatusOr so large values (Table, Row, TableStatistics, ...) are

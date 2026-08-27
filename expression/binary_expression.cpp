@@ -258,7 +258,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
         // The repository's default session zone is UTC-8 (the same default
         // used by CAST(TIMESTAMP)), hence local wall time is eight hours
         // ahead when represented in UTC.
-        epoch += 8 * 60 * 60;
+        epoch += 8LL * 60LL * 60LL;
       }
       return epoch;
     };
@@ -301,7 +301,7 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
           const bool fractional_equal = lhs_fraction == rhs_fraction;
           const bool equivalent_default_zone =
               (has_zone(lhs) != has_zone(rhs)) &&
-              std::llabs(*a - *b) == 8 * 60 * 60;
+              std::llabs(*a - *b) == 8LL * 60LL * 60LL;
           const bool equal = (*a == *b && fractional_equal) ||
                              equivalent_default_zone;
           switch (op) {
@@ -458,11 +458,15 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     if (left.type == ValueType::kDate && right.type == ValueType::kVarChar) {
       try {
         return EvaluateBinary(op, left, Value::DateFromDays(ParseDateDays(right.value.varchar_value)));
-      } catch (...) {}
+      } catch (const std::exception& error) {
+        (void)error;
+      }
     } else if (left.type == ValueType::kVarChar && right.type == ValueType::kDate) {
       try {
         return EvaluateBinary(op, Value::DateFromDays(ParseDateDays(left.value.varchar_value)), right);
-      } catch (...) {}
+      } catch (const std::exception& error) {
+        (void)error;
+      }
     }
     throw std::runtime_error("type mismatch");
   }
@@ -506,30 +510,46 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
       }
     }
   }
+  try {
+    switch (op) {
+      case BinaryOperation::kAdd:
+        return left + right;
+      case BinaryOperation::kSubtract:
+        return left - right;
+      case BinaryOperation::kMultiply:
+        return left * right;
+      case BinaryOperation::kDivide: {
+        if (left.type == ValueType::kDouble) {
+          if (right.value.double_value == 0.0) {
+            throw std::runtime_error("division by zero");
+          }
+          const double result =
+              left.value.double_value / right.value.double_value;
+          if (std::isfinite(left.value.double_value) &&
+              std::isfinite(right.value.double_value) && std::isinf(result)) {
+            throw std::runtime_error("double overflow");
+          }
+          return Value(result);
+        }
+        return left / right;
+      }
+      case BinaryOperation::kModulo:
+        return left % right;
+      default:
+        break;
+    }
+  } catch (const std::runtime_error& error) {
+    if (std::string_view(error.what()).starts_with("Cannot do ")) {
+      throw std::runtime_error("unsupported binary operation");
+    }
+    throw;
+  }
   switch (op) {
     case BinaryOperation::kAdd:
-      return left + right;
     case BinaryOperation::kSubtract:
-      return left - right;
     case BinaryOperation::kMultiply:
-      return left * right;
-    case BinaryOperation::kDivide: {
-      if (left.type == ValueType::kDouble) {
-        if (right.value.double_value == 0.0) {
-          throw std::runtime_error("division by zero");
-        }
-        const double result =
-            left.value.double_value / right.value.double_value;
-        if (std::isfinite(left.value.double_value) &&
-            std::isfinite(right.value.double_value) && std::isinf(result)) {
-          throw std::runtime_error("double overflow");
-        }
-        return Value(result);
-      }
-      return left / right;
-    }
+    case BinaryOperation::kDivide:
     case BinaryOperation::kModulo:
-      return left % right;
     case BinaryOperation::kEquals:
       if (folded_left.type == ValueType::kVarChar &&
           folded_right.type == ValueType::kVarChar &&

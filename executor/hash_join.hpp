@@ -29,6 +29,7 @@
 #include "executor/executor_base.hpp"
 #include "executor/hash_join_mode.hpp"
 #include "executor/join_kind.hpp"
+#include "executor/pipeline_breaker.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
@@ -77,7 +78,7 @@ class JoinHashIndex {
   std::vector<std::pair<uint32_t, uint32_t>> slot_byte_keys_;
 };
 
-class HashJoin : public ExecutorBase {
+class HashJoin : public ExecutorBase, public PipelineBreaker {
  public:
   HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
            std::vector<slot_t> right_cols,
@@ -103,6 +104,12 @@ class HashJoin : public ExecutorBase {
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
 
+  // PipelineBreaker interface
+  [[nodiscard]] bool IsMaterialized() const override { return materialized_; }
+  void MaterializePipeline() override { Materialize(); }
+  [[nodiscard]] size_t MaterializedRowCount() const override;
+  [[nodiscard]] size_t MaterializedBytes() const override;
+
   [[nodiscard]] size_t WorkerCount() const { return worker_count_; }
   [[nodiscard]] HashJoinMode Mode() const { return mode_; }
   [[nodiscard]] JoinKind Kind() const { return kind_; }
@@ -120,6 +127,8 @@ class HashJoin : public ExecutorBase {
   // preserved for UPDATE/DELETE consumers.
   void MaterializeSemiAnti();
   void MaterializeOuter();
+  void MaterializeMarkJoin();
+  void MaterializeSingle();
 
   void IntakeBothSides();
   void BuildShards();
