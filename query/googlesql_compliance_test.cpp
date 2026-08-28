@@ -424,12 +424,17 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
   // mirroring the reference driver's per-case test database. A distinct
   // storage prefix per rebuild keeps a destroyed instance's WAL from being
   // recovered into its replacement.
-  std::vector<std::vector<std::string>> prepare_segments;
+  struct PreparedSegment {
+    std::vector<std::string> statements;
+    bool first_column_is_primary_key{false};
+  };
+  std::vector<PreparedSegment> prepare_segments;
   int environment_generation = 0;
   auto replay_prepared_state = [&]() {
-    SqlEngine::SetCompliancePrimaryKeyMode(false);
-    for (const auto& segment : prepare_segments) {
-      for (const std::string& stmt : segment) {
+    for (const PreparedSegment& segment : prepare_segments) {
+      SqlEngine::SetCompliancePrimaryKeyMode(
+          segment.first_column_is_primary_key);
+      for (const std::string& stmt : segment.statements) {
         Status s_status = Status::kSuccess;
         Drain(*engine, *context, stmt, &s_status);
       }
@@ -445,7 +450,11 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
     SetDefaultTimeZone(test_case.default_time_zone.empty() ? "America/Los_Angeles" : test_case.default_time_zone);
     if (test_case.prepare_database) {
       const std::vector<std::string> stmts = SplitStatements(test_case.sql);
-      prepare_segments.push_back(stmts);
+      const bool first_column_is_primary_key =
+          test_case.primary_key_mode == "first_column_is_primary_key";
+      prepare_segments.push_back(
+          PreparedSegment{stmts, first_column_is_primary_key});
+      SqlEngine::SetCompliancePrimaryKeyMode(first_column_is_primary_key);
       for (const std::string& stmt : stmts) {
         Status s_status = Status::kSuccess;
         try {

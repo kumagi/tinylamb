@@ -1,6 +1,7 @@
 # Access-path, ordering-property, and early-termination expectations.
 
 [prepare_database]
+[primary_key_mode=first_column_is_primary_key]
 CREATE TABLE access_input AS
 SELECT 1 AS id, 10 AS category, 100 AS score, 'one' AS payload
 UNION ALL SELECT 2, 10, 90, 'two'

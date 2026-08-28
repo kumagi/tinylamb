@@ -159,7 +159,7 @@ ARRAY<STRUCT<id INT64>>[{1}, {3}]
 
 [mode=explain]
 [plan_not_contains=LIKE]
-[plan_contains=>= 'alpha']
+[plan_contains=>= "op"]
 [name=prefix_like_becomes_range_predicate]
 SELECT id FROM predicate_input WHERE state LIKE 'op%' ORDER BY id
 --

@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -39,6 +40,7 @@
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
+#include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
@@ -181,6 +183,182 @@ struct SimpleComparison {
 };
 
 std::optional<SimpleComparison> ExtractSimpleComparison(
+    const Expression& expression);
+std::optional<bool> EvaluateConstantPredicate(BinaryOperation operation,
+                                              const Value& left,
+                                              const Value& right);
+
+Expression RewritePrefixLike(const Expression& expression) {
+  if (!expression || expression->Type() != TypeTag::kBinaryExp) {
+    return expression;
+  }
+  const auto& binary = expression->AsBinaryExpression();
+  if (binary.Op() != BinaryOperation::kLike ||
+      binary.Right()->Type() != TypeTag::kConstantValue) {
+    return expression;
+  }
+  const Value pattern = binary.Right()->AsConstantValue().GetValue();
+  if (pattern.IsNull() || pattern.type != ValueType::kVarChar) {
+    return expression;
+  }
+  const std::string_view text = pattern.value.varchar_value;
+  if (text.size() < 2 || text.back() != '%' ||
+      text.find_first_of("%_\\", 0) != text.size() - 1) {
+    return expression;
+  }
+
+  std::string lower(text.substr(0, text.size() - 1));
+  std::string upper = lower;
+  size_t position = upper.size();
+  while (position > 0 &&
+         static_cast<unsigned char>(upper[position - 1]) == 0xffU) {
+    --position;
+  }
+  if (position == 0) { return expression; }
+  upper.resize(position);
+  ++upper.back();
+  return BinaryExpressionExp(
+      BinaryExpressionExp(binary.Left(), BinaryOperation::kGreaterThanEquals,
+                          ConstantValueExp(Value(std::move(lower)))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(binary.Left(), BinaryOperation::kLessThan,
+                          ConstantValueExp(Value(std::move(upper)))));
+}
+
+struct NullTest {
+  Expression child;
+  bool is_null;
+};
+
+std::optional<NullTest> ExtractNullTest(const Expression& expression) {
+  if (!expression || expression->Type() != TypeTag::kUnaryExp) {
+    return std::nullopt;
+  }
+  const auto& unary = expression->AsUnaryExpression();
+  if (unary.Op() != UnaryOperation::kIsNull &&
+      unary.Op() != UnaryOperation::kIsNotNull) {
+    return std::nullopt;
+  }
+  return NullTest{unary.Child(), unary.Op() == UnaryOperation::kIsNull};
+}
+
+struct InTest {
+  const InExpression* expression;
+  bool negated;
+};
+
+std::optional<InTest> ExtractInTest(const Expression& expression) {
+  if (!expression) { return std::nullopt; }
+  if (expression->Type() == TypeTag::kInExp) {
+    return InTest{&expression->AsInExpression(), false};
+  }
+  if (expression->Type() == TypeTag::kUnaryExp &&
+      expression->AsUnaryExpression().Op() == UnaryOperation::kNot &&
+      expression->AsUnaryExpression().Child()->Type() == TypeTag::kInExp) {
+    return InTest{
+        &expression->AsUnaryExpression().Child()->AsInExpression(), true};
+  }
+  return std::nullopt;
+}
+
+bool SameConstantSet(const InExpression& left, const InExpression& right) {
+  if (left.list_.size() != right.list_.size()) { return false; }
+  return std::ranges::all_of(left.list_, [&](const Expression& candidate) {
+    return std::ranges::any_of(right.list_, [&](const Expression& other) {
+      return candidate->Type() == TypeTag::kConstantValue &&
+             other->Type() == TypeTag::kConstantValue &&
+             candidate->AsConstantValue().GetValue() ==
+                 other->AsConstantValue().GetValue();
+    });
+  });
+}
+
+struct EqualityClass {
+  std::vector<Expression> members;
+  std::optional<Value> constant;
+};
+
+size_t FindEqualityClass(std::vector<EqualityClass>* classes,
+                         const Expression& member) {
+  for (size_t i = 0; i < classes->size(); ++i) {
+    if (std::ranges::any_of((*classes)[i].members,
+                            [&](const Expression& candidate) {
+                              return SameExpression(candidate, member);
+                            })) {
+      return i;
+    }
+  }
+  classes->push_back(EqualityClass{{member}, std::nullopt});
+  return classes->size() - 1;
+}
+
+bool ConstantsDiffer(const Value& left, const Value& right) {
+  const std::optional<bool> equal = EvaluateConstantPredicate(
+      BinaryOperation::kEquals, left, right);
+  return equal.has_value() && !*equal;
+}
+
+bool PropagateEqualityConstants(std::vector<Expression>* conjuncts) {
+  std::vector<EqualityClass> classes;
+  for (const Expression& conjunct : *conjuncts) {
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) { continue; }
+    const auto& binary = conjunct->AsBinaryExpression();
+    if (binary.Op() != BinaryOperation::kEquals ||
+        binary.Left()->Type() == TypeTag::kConstantValue ||
+        binary.Right()->Type() == TypeTag::kConstantValue) {
+      continue;
+    }
+    size_t left = FindEqualityClass(&classes, binary.Left());
+    size_t right = FindEqualityClass(&classes, binary.Right());
+    if (left == right) { continue; }
+    classes[left].members.insert(classes[left].members.end(),
+                                 classes[right].members.begin(),
+                                 classes[right].members.end());
+    classes.erase(classes.begin() + static_cast<std::ptrdiff_t>(right));
+  }
+
+  for (const Expression& conjunct : *conjuncts) {
+    const std::optional<SimpleComparison> comparison =
+        ExtractSimpleComparison(conjunct);
+    if (!comparison || comparison->operation != BinaryOperation::kEquals) {
+      continue;
+    }
+    const size_t group = FindEqualityClass(&classes, comparison->key);
+    if (classes[group].constant &&
+        ConstantsDiffer(*classes[group].constant, comparison->constant)) {
+      return false;
+    }
+    classes[group].constant = comparison->constant;
+  }
+
+  std::vector<Expression> rewritten;
+  rewritten.reserve(conjuncts->size() + classes.size());
+  for (const Expression& conjunct : *conjuncts) {
+    bool replaced = false;
+    if (conjunct && conjunct->Type() == TypeTag::kBinaryExp &&
+        conjunct->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
+      const auto& binary = conjunct->AsBinaryExpression();
+      const Expression& candidate =
+          binary.Left()->Type() == TypeTag::kConstantValue ? binary.Right()
+                                                           : binary.Left();
+      const size_t group = FindEqualityClass(&classes, candidate);
+      replaced = classes[group].constant.has_value();
+    }
+    if (!replaced) { rewritten.push_back(conjunct); }
+  }
+  for (const EqualityClass& equality : classes) {
+    if (!equality.constant) { continue; }
+    for (const Expression& member : equality.members) {
+      rewritten.push_back(BinaryExpressionExp(
+          member, BinaryOperation::kEquals,
+          ConstantValueExp(*equality.constant)));
+    }
+  }
+  *conjuncts = std::move(rewritten);
+  return true;
+}
+
+std::optional<SimpleComparison> ExtractSimpleComparison(
     const Expression& expression) {
   if (!expression || expression->Type() != TypeTag::kBinaryExp) {
     return std::nullopt;
@@ -262,12 +440,94 @@ bool ComparisonPairIsContradictory(const SimpleComparison& left,
           upper->operation == BinaryOperation::kLessThan);
 }
 
+void RemoveSubsumedBounds(std::vector<Expression>* conjuncts) {
+  std::vector<std::optional<SimpleComparison>> comparisons;
+  comparisons.reserve(conjuncts->size());
+  for (const Expression& conjunct : *conjuncts) {
+    comparisons.push_back(ExtractSimpleComparison(conjunct));
+  }
+  std::vector<bool> keep(conjuncts->size(), true);
+  const auto is_lower = [](BinaryOperation operation) {
+    return operation == BinaryOperation::kGreaterThan ||
+           operation == BinaryOperation::kGreaterThanEquals;
+  };
+  const auto is_upper = [](BinaryOperation operation) {
+    return operation == BinaryOperation::kLessThan ||
+           operation == BinaryOperation::kLessThanEquals;
+  };
+  for (size_t i = 0; i < comparisons.size(); ++i) {
+    if (!comparisons[i]) { continue; }
+    for (size_t j = i + 1; j < comparisons.size(); ++j) {
+      if (!comparisons[j] ||
+          !SameExpression(comparisons[i]->key, comparisons[j]->key)) {
+        continue;
+      }
+      const SimpleComparison& left = *comparisons[i];
+      const SimpleComparison& right = *comparisons[j];
+      if (left.operation == BinaryOperation::kEquals ||
+          right.operation == BinaryOperation::kEquals) {
+        const size_t equality = left.operation == BinaryOperation::kEquals
+                                    ? i
+                                    : j;
+        const size_t other = equality == i ? j : i;
+        if (comparisons[other]->operation == BinaryOperation::kEquals) {
+          keep[j] = false;
+        } else {
+          keep[other] = false;
+        }
+        continue;
+      }
+      const bool both_lower =
+          is_lower(left.operation) && is_lower(right.operation);
+      const bool both_upper =
+          is_upper(left.operation) && is_upper(right.operation);
+      if (!both_lower && !both_upper) { continue; }
+
+      const std::optional<bool> left_greater = EvaluateConstantPredicate(
+          BinaryOperation::kGreaterThan, left.constant, right.constant);
+      const std::optional<bool> right_greater = EvaluateConstantPredicate(
+          BinaryOperation::kGreaterThan, right.constant, left.constant);
+      if (!left_greater || !right_greater) { continue; }
+      if (*left_greater) {
+        keep[both_lower ? j : i] = false;
+      } else if (*right_greater) {
+        keep[both_lower ? i : j] = false;
+      } else {
+        // Equal endpoints: strict bounds subsume inclusive bounds.
+        const bool left_strict =
+            left.operation == BinaryOperation::kGreaterThan ||
+            left.operation == BinaryOperation::kLessThan;
+        const bool right_strict =
+            right.operation == BinaryOperation::kGreaterThan ||
+            right.operation == BinaryOperation::kLessThan;
+        if (left_strict != right_strict) {
+          keep[left_strict ? j : i] = false;
+        } else {
+          keep[j] = false;
+        }
+      }
+    }
+  }
+
+  std::vector<Expression> reduced;
+  reduced.reserve(conjuncts->size());
+  for (size_t i = 0; i < conjuncts->size(); ++i) {
+    if (keep[i]) { reduced.push_back((*conjuncts)[i]); }
+  }
+  *conjuncts = std::move(reduced);
+}
+
 // WHERE rejects both FALSE and UNKNOWN. This permits stronger simplification
 // than a general scalar-expression context while preserving SQL three-valued
 // semantics in projections and CASE expressions.
 Expression SimplifyFilterPredicate(const Expression& predicate,
                                    const Schema& input_schema) {
-  std::vector<Expression> conjuncts = SplitConjuncts(predicate);
+  std::vector<Expression> conjuncts;
+  for (const Expression& conjunct : SplitConjuncts(predicate)) {
+    std::vector<Expression> rewritten =
+        SplitConjuncts(RewritePrefixLike(conjunct));
+    conjuncts.insert(conjuncts.end(), rewritten.begin(), rewritten.end());
+  }
   for (Expression& conjunct : conjuncts) {
     if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) { continue; }
     const auto& binary = conjunct->AsBinaryExpression();
@@ -291,6 +551,34 @@ Expression SimplifyFilterPredicate(const Expression& predicate,
     }
   }
 
+  for (size_t i = 0; i < conjuncts.size(); ++i) {
+    const std::optional<NullTest> left_null = ExtractNullTest(conjuncts[i]);
+    const std::optional<InTest> left_in = ExtractInTest(conjuncts[i]);
+    for (size_t j = i + 1; j < conjuncts.size(); ++j) {
+      if (left_null) {
+        const std::optional<NullTest> right_null =
+            ExtractNullTest(conjuncts[j]);
+        if (right_null && left_null->is_null != right_null->is_null &&
+            SameExpression(left_null->child, right_null->child)) {
+          return ConstantValueExp(Value(false));
+        }
+      }
+      if (left_in) {
+        const std::optional<InTest> right_in = ExtractInTest(conjuncts[j]);
+        if (right_in && left_in->negated != right_in->negated &&
+            SameExpression(left_in->expression->child_,
+                           right_in->expression->child_) &&
+            SameConstantSet(*left_in->expression, *right_in->expression)) {
+          return ConstantValueExp(Value(false));
+        }
+      }
+    }
+  }
+
+  if (!PropagateEqualityConstants(&conjuncts)) {
+    return ConstantValueExp(Value(false));
+  }
+
   std::vector<SimpleComparison> comparisons;
   comparisons.reserve(conjuncts.size());
   for (const Expression& conjunct : conjuncts) {
@@ -306,6 +594,7 @@ Expression SimplifyFilterPredicate(const Expression& predicate,
       }
     }
   }
+  RemoveSubsumedBounds(&conjuncts);
   return CombineConjuncts(conjuncts);
 }
 

@@ -377,6 +377,127 @@ TEST_F(OptimizerTest, ContradictoryConjunctsBecomeEmptyResult) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+TEST_F(OptimizerTest, StrongerBoundsSubsumeWeakerBounds) {
+  QueryData query{
+      {"Sc1"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("c1"),
+                              BinaryOperation::kGreaterThan,
+                              ConstantValueExp(Value(0))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp("c1"),
+                              BinaryOperation::kGreaterThan,
+                              ConstantValueExp(Value(20)))),
+      {NamedExpression("c1")}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  std::ostringstream dump;
+  dump << *plan_or.Value();
+  EXPECT_EQ(dump.str().find("c1 > 0"), std::string::npos) << dump.str();
+  EXPECT_NE(dump.str().find("c1 > 20"), std::string::npos) << dump.str();
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, EqualityClassesPropagateAndRejectConstants) {
+  TransactionContext context = rs_->BeginContext();
+  const auto optimize = [&](int64_t d1, int64_t d4) {
+    QueryData query{
+        {"Sc2"},
+        BinaryExpressionExp(
+            BinaryExpressionExp(
+                ColumnValueExp("d1"), BinaryOperation::kEquals,
+                ColumnValueExp("d4")),
+            BinaryOperation::kAnd,
+            BinaryExpressionExp(
+                BinaryExpressionExp(ColumnValueExp("d1"),
+                                    BinaryOperation::kEquals,
+                                    ConstantValueExp(Value(d1))),
+                BinaryOperation::kAnd,
+                BinaryExpressionExp(ColumnValueExp("d4"),
+                                    BinaryOperation::kEquals,
+                                    ConstantValueExp(Value(d4))))),
+        {NamedExpression("d1")}};
+    EXPECT_EQ(query.Rewrite(context), Status::kSuccess);
+    return Optimizer::Optimize(query, context);
+  };
+
+  const auto propagated = optimize(16, 16);
+  ASSERT_EQ(propagated.GetStatus(), Status::kSuccess);
+  std::ostringstream propagated_dump;
+  propagated_dump << *propagated.Value();
+  EXPECT_EQ(propagated_dump.str().find("d1 = d4"), std::string::npos)
+      << propagated_dump.str();
+  EXPECT_NE(propagated_dump.str().find("d1 = 16"), std::string::npos)
+      << propagated_dump.str();
+
+  const auto conflicting = optimize(10, 16);
+  ASSERT_EQ(conflicting.GetStatus(), Status::kSuccess);
+  std::ostringstream conflicting_dump;
+  conflicting_dump << *conflicting.Value();
+  EXPECT_NE(conflicting_dump.str().find("EmptyResult"), std::string::npos)
+      << conflicting_dump.str();
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, NullAndInComplementsBecomeEmptyResult) {
+  TransactionContext context = rs_->BeginContext();
+  const auto assert_empty = [&](Expression predicate) {
+    QueryData query{{"Sc1"}, std::move(predicate), {NamedExpression("c1")}};
+    EXPECT_EQ(query.Rewrite(context), Status::kSuccess);
+    const auto plan_or = Optimizer::Optimize(query, context);
+    ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+    std::ostringstream dump;
+    dump << *plan_or.Value();
+    EXPECT_NE(dump.str().find("EmptyResult"), std::string::npos) << dump.str();
+  };
+
+  assert_empty(BinaryExpressionExp(
+      UnaryExpressionExp(ColumnValueExp("c1"), UnaryOperation::kIsNull),
+      BinaryOperation::kAnd,
+      UnaryExpressionExp(ColumnValueExp("c1"),
+                         UnaryOperation::kIsNotNull)));
+
+  const auto in = [] {
+    return InExpressionExp(ColumnValueExp("c2"),
+                           {ConstantValueExp(Value("c2-1")),
+                            ConstantValueExp(Value("c2-2"))});
+  };
+  assert_empty(BinaryExpressionExp(
+      in(), BinaryOperation::kAnd,
+      UnaryExpressionExp(in(), UnaryOperation::kNot)));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, SimplePrefixLikeBecomesExactBinaryRange) {
+  QueryData query{
+      {"Sc1"},
+      BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kLike,
+                          ConstantValueExp(Value("c2-3%"))),
+      {NamedExpression("c1")}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  std::ostringstream dump;
+  dump << *plan_or.Value();
+  EXPECT_EQ(dump.str().find("LIKE"), std::string::npos) << dump.str();
+  EXPECT_NE(dump.str().find(">= \"c2-3\""), std::string::npos)
+      << dump.str();
+  EXPECT_NE(dump.str().find("< \"c2-4\""), std::string::npos)
+      << dump.str();
+
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  Row row;
+  size_t rows = 0;
+  while (executor->Next(&row, nullptr)) { ++rows; }
+  EXPECT_EQ(rows, 11U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, LimitEstimateAccountsForOffset) {
   QueryData query{{"Sc1"}, nullptr, {NamedExpression("c1")}};
   query.limit_count_ = 2;

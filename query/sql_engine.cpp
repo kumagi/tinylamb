@@ -59,6 +59,7 @@
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "type/column_name.hpp"
+#include "type/constraint.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -1577,7 +1578,11 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
               }
             }
           }
-          columns.emplace_back(col_name, vtype);
+          const Constraint constraint =
+              CompliancePrimaryKeyMode() && i == 0
+                  ? Constraint(Constraint::kPrimaryKey)
+                  : Constraint();
+          columns.emplace_back(col_name, vtype, constraint);
           if (std::ranges::any_of(rows, [i](const Row& row) {
                 return i < row.Size() && row[i].IsUnsigned();
               })) {
