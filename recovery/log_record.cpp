@@ -689,7 +689,9 @@ size_t LogRecord::Size() const {
                   CheckpointManager::ActiveTransactionEntry::Size());
       break;
     case LogType::kSystemAllocPage:
-      size += sizeof(PageType);
+      // The encoder stores PageType as a uint64_t to keep the WAL format
+      // independent of the enum's underlying representation.
+      size += sizeof(uint64_t);
       break;
     case LogType::kBegin:
     case LogType::kBeginCheckpoint:

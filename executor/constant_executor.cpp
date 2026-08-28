@@ -47,4 +47,8 @@ void ConstantExecutor::Dump(std::ostream& o, int /*indent*/) const {
   o << "ConstantExecutor";
 }
 
+void EmptyResultExecutor::Dump(std::ostream& o, int /*indent*/) const {
+  o << "EmptyResult";
+}
+
 }  // namespace tinylamb

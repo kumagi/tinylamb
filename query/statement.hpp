@@ -79,6 +79,7 @@ struct SelectSource {
   Expression unnest;
   std::string offset_alias;
   bool is_lateral{false};
+  bool from_nested_join{false};
   // USING (col, ...) names declared on the join whose right operand is this
   // source; empty for every other source.  The merged columns stay
   // physically duplicated in the joined schema, but bare references and

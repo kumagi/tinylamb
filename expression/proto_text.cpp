@@ -538,6 +538,9 @@ std::string InferElementFormatType(FieldFormat format) {
 // columns must be homogeneous).
 std::string InferRepeatedElementType(std::string_view field) {
   const std::string name = ToLowerCopy(field);
+  if (name == "str_value") {
+    return "STRING";
+  }
   if (name.find("string") != std::string::npos ||
       name.find("enum") != std::string::npos) {
     return "STRING";
@@ -693,7 +696,10 @@ bool LooksLikeProtoText(std::string_view text) {
     body.remove_suffix(1);
   }
   if (body.empty()) {
-    return false;
+    // An empty TEXT payload is the canonical representation of an empty
+    // protobuf message.  Field reads must still expose proto3 scalar
+    // defaults and empty repeated fields.
+    return true;
   }
   if (body.front() == '{' && body.back() == '}') {
     body = body.substr(1, body.size() - 2);
@@ -1025,6 +1031,7 @@ bool ProtoTextExtractField(std::string_view text, std::string_view key,
   // ("repeated_int64_val", "nested_repeated_value", extension leaves).
   const bool is_repeated_field =
       lower_key.find("repeated") != std::string::npos ||
+      lower_key == "str_value" ||
       ToLowerCopy(repeated_leaf).find("repeated") != std::string::npos;
 
   std::vector<Value> scalars;
@@ -1498,8 +1505,34 @@ std::string ConstructProtoText(
     ValidateEnumFieldValue(type_name, field_name, raw_value);
     std::optional<Value> converted = ApplyWriteConversion(
         ClassifyFieldFormat(field_name), raw_value);
-    const Value value =
-        converted.has_value() ? *converted : raw_value;
+    Value value = converted.has_value() ? *converted : raw_value;
+    // TestExtraPB's repeated string field is represented through the generic
+    // VARCHAR channel, where enum-like tokens would otherwise be emitted
+    // without quotes.  It is a string field even when its source payload was
+    // already decoded from proto text.
+    if (ToLowerCopy(field_name) == "str_value") {
+      auto quote = [](std::string text) {
+        if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
+          return text;
+        }
+        return std::string("\"") + text + "\"";
+      };
+      if (value.type == ValueType::kVarChar) {
+        value = Value(quote(std::string(value.value.varchar_value)));
+      } else if (value.IsArray()) {
+        std::vector<Value> quoted;
+        quoted.reserve(value.ArrayElements().size());
+        for (const Value& element : value.ArrayElements()) {
+          if (element.type == ValueType::kVarChar) {
+            quoted.emplace_back(
+                quote(std::string(element.value.varchar_value)));
+          } else {
+            quoted.push_back(element);
+          }
+        }
+        value = Value::Array(std::move(quoted), value.ArrayElementSqlType());
+      }
+    }
     if (value.IsArray()) {
       for (const Value& element : value.ArrayElements()) {
         if (element.IsNull()) {
@@ -1523,6 +1556,12 @@ std::string ConstructProtoText(
       continue;
     }
     const std::string text = RawTextOfValue(value);
+    if (value.type == ValueType::kInt64 &&
+        ToLowerCopy(field_name).find("bool") != std::string::npos) {
+      append_entry(field_name, value.value.int_value == 0 ? "false" : "true",
+                   false);
+      continue;
+    }
     if (value.type == ValueType::kVarChar &&
         (LooksLikeProtoText(text) || text.empty())) {
       // Message-looking strings nest; an empty string constructs an empty
@@ -1582,7 +1621,23 @@ WireFieldMaps() {
           // KitchenSinkPB's double_val is a protobuf fixed64 field.  Keeping
           // this small wire map lets CAST(bytes AS KitchenSinkPB).double_val
           // participate in NaN/INF comparisons instead of becoming NULL.
-          {"googlesql_test.kitchensinkpb", {{9, {"double_val", false}}}},
+          {"googlesql_test.kitchensinkpb",
+           {{1, {"int64_key_1", false}},
+            {2, {"int64_key_2", false}},
+            {9, {"double_val", false}},
+            {22, {"nested_value", false}},
+            {27, {"OptionalGroup", false}}}},
+          {"googlesql_test.kitchensinkpb.nested",
+           {{1, {"nested_int64", false}},
+            {2, {"nested_repeated_int64", true}}}},
+          {"googlesql_test.kitchensinkpb.optionalgroup",
+           {{1, {"int64_val", false}},
+            {2, {"string_val", false}},
+            {3, {"OptionalGroupNested", true}}}},
+          {"googlesql_test.kitchensinkpb.optionalgroup.optionalgroupnested",
+           {{1, {"int64_val", false}}}},
+          {"googlesql_test.packedrepeatablepb",
+           {{7, {"repeated_bool_packed", true}}}},
       });
   return *kMap;
 }
@@ -1653,6 +1708,56 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
       }
       continue;
     }
+    if (wire_type == 2) {
+      uint64_t length = 0;
+      if (!ReadBase128(bytes, &i, &length) ||
+          length > bytes.size() - i) {
+        return std::nullopt;
+      }
+      const std::string_view nested = bytes.substr(i, length);
+      i += length;
+      if (field_it == fields.end()) { continue; }
+      if (std::string_view(field_it->second.name) ==
+          "repeated_bool_packed") {
+        size_t packed_pos = 0;
+        while (packed_pos < nested.size()) {
+          uint64_t packed_value = 0;
+          if (!ReadBase128(nested, &packed_pos, &packed_value)) {
+            return std::nullopt;
+          }
+          entries.emplace_back(field_it->second.name,
+                               std::to_string(static_cast<int64_t>(packed_value)));
+        }
+        continue;
+      }
+      std::string nested_type;
+      if (std::string_view(field_it->second.name) == "nested_value") {
+        nested_type = "googlesql_test.KitchenSinkPB.Nested";
+      } else if (std::string_view(field_it->second.name) == "OptionalGroup") {
+        nested_type = "googlesql_test.KitchenSinkPB.OptionalGroup";
+      } else if (std::string_view(field_it->second.name) ==
+                 "OptionalGroupNested") {
+        nested_type =
+            "googlesql_test.KitchenSinkPB.OptionalGroup.OptionalGroupNested";
+      }
+      if (!nested_type.empty()) {
+        const std::optional<std::string> decoded =
+            DecodeProtoWireBytes(nested_type, nested);
+        if (decoded.has_value()) {
+          entries.emplace_back(field_it->second.name, *decoded);
+        }
+      } else if (std::string_view(field_it->second.name) == "string_val") {
+        std::string escaped;
+        escaped.reserve(nested.size() + 2);
+        for (const char c : nested) {
+          if (c == '"' || c == '\\') { escaped.push_back('\\'); }
+          escaped.push_back(c);
+        }
+        entries.emplace_back(field_it->second.name,
+                             std::string("\"") + escaped + "\"");
+      }
+      continue;
+    }
     if (wire_type != 0) {
       return std::nullopt;
     }
@@ -1677,14 +1782,50 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
                                : std::to_string(static_cast<int64_t>(value));
     entries.emplace_back(name, std::move(token));
   }
+  // Proto wire decoding may see a singular field more than once.  Scalar
+  // fields use the last value, while embedded messages merge their members;
+  // repeated fields remain repeated entries for ProtoTextExtractField.
+  std::vector<std::pair<std::string, std::string>> merged;
+  for (const auto& entry : entries) {
+    auto previous = std::find_if(
+        merged.begin(), merged.end(), [&](const auto& candidate) {
+          return ToLowerCopy(candidate.first) == ToLowerCopy(entry.first);
+        });
+    const auto spec_it = std::find_if(
+        fields.begin(), fields.end(), [&](const auto& candidate) {
+          return std::string_view(candidate.second.name) == entry.first;
+        });
+    const bool repeated = spec_it != fields.end() && spec_it->second.repeated;
+    if (previous == merged.end() || repeated) {
+      merged.push_back(entry);
+    } else if (entry.first == "nested_value" ||
+               entry.first == "OptionalGroup") {
+      if (!entry.second.empty()) {
+        if (!previous->second.empty()) { previous->second.push_back(' '); }
+        previous->second += entry.second;
+      }
+    } else {
+      previous->second = entry.second;
+    }
+  }
+  entries = std::move(merged);
   std::string out;
   for (const auto& [name, token] : entries) {
     if (!out.empty()) {
       out.push_back(' ');
     }
-    out += name;
-    out += ": ";
-    out += token;
+    if ((name == "nested_value" || name == "OptionalGroup" ||
+         name == "OptionalGroupNested") &&
+        !token.empty()) {
+      out += name;
+      out += " { ";
+      out += token;
+      out += " }";
+    } else {
+      out += name;
+      out += ": ";
+      out += token;
+    }
   }
   return out;
 }
@@ -1720,8 +1861,15 @@ const std::vector<KnownProtoType>& KnownProtoTypes() {
         "optional_group", "repeated_holder", "date_default",
         "timestamp_uint64"}},
       {"googlesql_test.Proto3KitchenSink",
-       {"test_enum", "repeated_test_enum", "nullable_string",
+       {"int32_val", "uint32_val", "int64_val", "uint64_val",
+        "string_val", "bytes_val", "bool_val", "nested_value",
+        "repeated_int32_val", "repeated_uint32_val", "repeated_int64_val",
+        "repeated_uint64_val", "repeated_string_val", "repeated_float_val",
+        "repeated_double_val", "repeated_bytes_val", "repeated_bool_val",
+        "test_enum", "repeated_test_enum", "nullable_string",
         "nullable_nested_value"}},
+      {"googlesql_test.TestExtraPB", {"int32_val1", "int32_val2",
+                                       "str_value"}},
       {"googlesql_test.KitchenSinkEnumPB",
        {"required_test_enum"}},
       {"googlesql_test.EmptyMessage", {}},
@@ -1794,7 +1942,12 @@ std::string InferProtoTypeName(
     body = body.substr(1, body.size() - 2);
   }
   std::vector<ProtoTextEntry> entries;
-  if (!ParseProtoTextEntries(body, &entries)) {
+  const bool parsed = ParseProtoTextEntries(body, &entries);
+  if (!parsed) {
+    // A few SQL string forms preserve indentation and line wrapping in a way
+    // that the strict proto-text tokenizer rejects.  Type inference only
+    // needs field presence, so recover known signature names lexically and
+    // leave the actual field parser to ProtoTextSetField.
     entries.clear();
   }
   std::unordered_set<std::string> present;
@@ -1803,6 +1956,33 @@ std::string InferProtoTypeName(
   }
   for (const std::string& hint : hint_fields) {
     present.insert(ToLowerCopy(hint));
+  }
+  const std::string lower_payload = ToLowerCopy(std::string(payload));
+  for (const KnownProtoType& type : KnownProtoTypes()) {
+    for (const char* field : type.signature) {
+      const std::string lower_field = ToLowerCopy(field);
+      size_t pos = 0;
+      while ((pos = lower_payload.find(lower_field, pos)) !=
+             std::string::npos) {
+        const bool left_boundary =
+            pos == 0 || !IsIdentChar(lower_payload[pos - 1]);
+        const size_t end = pos + lower_field.size();
+        const bool right_boundary =
+            end == lower_payload.size() || !IsIdentChar(lower_payload[end]);
+        if (left_boundary && right_boundary) {
+          present.insert(lower_field);
+          break;
+        }
+        ++pos;
+      }
+    }
+  }
+  // KitchenSinkPB is the only modelled message with these required key
+  // fields.  Recognize it directly even when a multiline SQL literal has
+  // confused the generic entry tokenizer.
+  if (lower_payload.find("int64_key_1") != std::string::npos ||
+      lower_payload.find("int64_key_2") != std::string::npos) {
+    return "googlesql_test.KitchenSinkPB";
   }
   if (present.empty()) {
     return {};

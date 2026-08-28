@@ -265,7 +265,7 @@ Executor RelationRenamePlan::EmitExecutor(TransactionContext& ctx) const {
 }
 
 Executor EmptyPlan::EmitExecutor(TransactionContext& /*ctx*/) const {
-  return std::make_shared<ConstantExecutor>(std::vector<Row>{});
+  return std::make_shared<EmptyResultExecutor>();
 }
 
 namespace {

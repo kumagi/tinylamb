@@ -1,0 +1,242 @@
+# Locally authored aspirational E2E tests. These cases intentionally describe
+# the rewrite quality expected from a high-end commercial SQL optimizer.
+
+[prepare_database]
+CREATE TABLE rewrite_input AS
+SELECT 1 AS id, 10 AS a, 20 AS b, true AS flag, 'alpha' AS s
+UNION ALL SELECT 2, 0, -5, false, 'beta'
+UNION ALL SELECT 3, CAST(NULL AS INT64), 20, CAST(NULL AS BOOL), CAST(NULL AS STRING);
+ANALYZE rewrite_input;
+--
+ARRAY<STRUCT<id INT64, a INT64, b INT64, flag BOOL, s STRING>>[]
+==
+
+[mode=explain]
+[plan_not_contains=+ 0]
+[plan_not_contains=- 0]
+[plan_not_contains=* 1]
+[name=projection_eliminates_integer_identities]
+SELECT id, a + 0 AS x, a - 0 AS y, b * 1 AS z FROM rewrite_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64, y INT64, z INT64>>[
+  {1, 10, 10, 20}, {2, 0, 0, -5}, {3, NULL, NULL, 20}
+]
+==
+
+[mode=explain]
+[plan_not_contains=* 0]
+[plan_not_contains=0 *]
+[name=projection_folds_multiply_by_zero_null_safely]
+SELECT id, a * 0 AS lhs, 0 * a AS rhs FROM rewrite_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, lhs INT64, rhs INT64>>[
+  {1, 0, 0}, {2, 0, 0}, {3, NULL, NULL}
+]
+==
+
+[mode=explain]
+[plan_not_contains=NOT NOT]
+[plan_not_contains=-(-]
+[name=projection_eliminates_double_negation]
+SELECT id, NOT NOT flag AS f, -(-a) AS x FROM rewrite_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, f BOOL, x INT64>>[
+  {1, true, 10}, {2, false, 0}, {3, NULL, NULL}
+]
+==
+
+[mode=explain]
+[plan_not_contains=NOT (]
+[plan_contains=OR]
+[name=de_morgan_normalization]
+SELECT id FROM rewrite_input WHERE NOT (a = 10 AND b = 20) ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{2}]
+==
+
+[mode=explain]
+[plan_not_contains=AND true]
+[plan_not_contains=true AND]
+[plan_not_contains=OR false]
+[plan_not_contains=false OR]
+[name=boolean_identity_elimination]
+SELECT id FROM rewrite_input
+WHERE (flag AND true) OR (false AND a = 99)
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_not_contains=Filter]
+[name=tautology_removes_filter_operator]
+SELECT id FROM rewrite_input WHERE a IS NULL OR a IS NOT NULL ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}]
+==
+
+[mode=explain]
+[plan_contains=EmptyResult]
+[plan_not_contains=SeqScan rewrite_input]
+[name=contradiction_becomes_empty_relation]
+SELECT id FROM rewrite_input WHERE a = 10 AND a = 11
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain]
+[plan_contains=EmptyResult]
+[plan_not_contains=SeqScan rewrite_input]
+[name=range_contradiction_becomes_empty_relation]
+SELECT id FROM rewrite_input WHERE a > 10 AND a <= 10
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain]
+[plan_not_contains=CASE]
+[name=constant_case_prunes_unreachable_arms]
+SELECT CASE WHEN true THEN a WHEN b / 0 > 1 THEN b ELSE 99 END AS x
+FROM rewrite_input ORDER BY id
+--
+ARRAY<STRUCT<x INT64>>[{10}, {0}, {NULL}]
+==
+
+[mode=explain]
+[plan_not_contains=IF]
+[name=constant_if_prunes_unreachable_arm]
+SELECT IF(false, b / 0, COALESCE(a, 7)) AS x FROM rewrite_input ORDER BY id
+--
+ARRAY<STRUCT<x INT64>>[{10}, {0}, {7}]
+==
+
+[mode=explain]
+[plan_not_contains=COALESCE(NULL]
+[plan_not_contains=COALESCE(42]
+[name=coalesce_removes_null_prefix_and_dead_suffix]
+SELECT COALESCE(CAST(NULL AS INT64), a, 42, b) AS x
+FROM rewrite_input ORDER BY id
+--
+ARRAY<STRUCT<x INT64>>[{10}, {0}, {42}]
+==
+
+[mode=explain]
+[plan_not_contains=NULLIF]
+[name=nullif_constant_arguments_fold]
+SELECT NULLIF(10, 10) AS x, NULLIF(10, 11) AS y
+--
+ARRAY<STRUCT<x INT64, y INT64>>[{NULL, 10}]
+==
+
+[mode=explain]
+[plan_not_contains=CAST(CAST]
+[name=redundant_cast_chain_collapses]
+SELECT id, CAST(CAST(a AS INT64) AS INT64) AS x FROM rewrite_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64>>[{1, 10}, {2, 0}, {3, NULL}]
+==
+
+[mode=explain]
+[plan_not_contains=1 + 2]
+[plan_not_contains=3 * 4]
+[name=deep_constant_subtree_folds_once]
+SELECT id, a + ((1 + 2) * (3 * 4) - 36) AS x FROM rewrite_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64>>[{1, 10}, {2, 0}, {3, NULL}]
+==
+
+[mode=explain]
+[plan_not_contains=CONCAT]
+[name=constant_string_functions_fold]
+SELECT CONCAT('com', 'mer', 'cial') AS x
+--
+ARRAY<STRUCT<x STRING>>[{"commercial"}]
+==
+
+[mode=explain]
+[plan_not_contains=DATE_ADD]
+[plan_not_contains=DATE_DIFF]
+[name=constant_date_functions_fold]
+SELECT DATE_ADD(DATE '2026-01-30', INTERVAL 2 DAY) AS d,
+       DATE_DIFF(DATE '2026-02-01', DATE '2026-01-30', DAY) AS n
+--
+ARRAY<STRUCT<d DATE, n INT64>>[{2026-02-01, 2}]
+==
+
+[mode=explain]
+[plan_not_contains=a = a]
+[plan_contains=IS NOT NULL]
+[name=self_equality_rewrites_with_null_semantics]
+SELECT id FROM rewrite_input WHERE a = a ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}]
+==
+
+[mode=explain]
+[plan_not_contains=a != a]
+[plan_contains=EmptyResult]
+[name=self_inequality_is_never_true]
+SELECT id FROM rewrite_input WHERE a != a
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain]
+[plan_not_contains=IN (10, 10]
+[plan_not_contains=20, 20]
+[name=in_list_constant_deduplication]
+SELECT id FROM rewrite_input WHERE a IN (10, 10, 20, 20, 10) ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_not_contains=OR]
+[plan_contains=IN]
+[name=or_equalities_coalesce_to_in]
+SELECT id FROM rewrite_input WHERE a = 0 OR a = 10 OR a = 20 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}]
+==
+
+[mode=explain]
+[plan_not_contains=AND]
+[name=absorbs_redundant_boolean_term]
+SELECT id FROM rewrite_input WHERE flag OR (flag AND a = 10) ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_not_contains=OR]
+[name=absorbs_redundant_conjunctive_term]
+SELECT id FROM rewrite_input WHERE flag AND (flag OR a = 10) ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_not_contains=NOT]
+[name=negated_comparison_canonicalizes]
+SELECT id FROM rewrite_input WHERE NOT (a < 10) ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_not_contains=BETWEEN]
+[name=between_normalizes_to_sargable_bounds]
+SELECT id FROM rewrite_input WHERE a BETWEEN 0 AND 10 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}]
+==
+
+[mode=explain]
+[plan_not_contains=1 = 1]
+[plan_not_contains=2 < 3]
+[plan_not_contains=3 <= 3]
+[name=constant_comparison_conjunction_folds]
+SELECT id FROM rewrite_input WHERE 1 = 1 AND 2 < 3 AND 3 <= 3 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}]
+==

@@ -241,7 +241,8 @@ void Logger::LoggerWork() {
 
     if (flushed_lsn == buffered_lsn) {
       if (dirty && (finish_.load(std::memory_order_acquire) ||
-                    Clock::now() - last_sync >= sync_interval_)) {
+                    Clock::now() - last_sync >= sync_interval_ ||
+                    pending_durable_waiters_.load(std::memory_order_acquire) > 0)) {
         if (FdataSync(dst_) != 0) {
           SetFailed(errno);
           return;
@@ -260,7 +261,8 @@ void Logger::LoggerWork() {
       work_cv_.wait_for(work_lk, sync_interval_, [&] {
         return finish_.load(std::memory_order_acquire) ||
                flushed_lsn_.load(std::memory_order_acquire) <
-                   buffered_lsn_.load(std::memory_order_acquire);
+                   buffered_lsn_.load(std::memory_order_acquire) ||
+               pending_durable_waiters_.load(std::memory_order_acquire) > 0;
       });
       continue;
     }

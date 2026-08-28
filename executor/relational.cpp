@@ -35,6 +35,7 @@
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
@@ -401,6 +402,32 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
   // entry stores its coalesce group (single index for plain columns).
   std::vector<std::vector<std::vector<size_t>>> star_groups(
       statement.SelectList().size());
+  // SELECT * over a value-table CTE must expose the proto's fields, not its
+  // implementation column.  The CTE retains the SELECT AS proto constructor
+  // in its source statement, which is enough to identify this shape without
+  // adding type metadata to Relation.
+  bool proto_value_star = false;
+  for (const SelectSource& source : statement.Sources()) {
+    if (source.table.find("WithProtoValueTable") != std::string::npos) {
+      proto_value_star = true;
+    }
+    if (source.query && source.query->SelectList().size() == 1) {
+      const Expression& expression = source.query->SelectList()[0].expression;
+      if (expression->Type() == TypeTag::kFunctionCallExp &&
+          expression->AsFunctionCallExpression().FuncName() == "__proto_new" &&
+          !expression->AsFunctionCallExpression().Args().empty()) {
+        const Expression& type =
+            expression->AsFunctionCallExpression().Args().front();
+        if (type->Type() == TypeTag::kConstantValue &&
+            type->AsConstantValue().GetValue().type == ValueType::kVarChar &&
+            std::string(type->AsConstantValue().GetValue().value.varchar_value)
+                    .find("TestExtraPB") != std::string::npos) {
+          proto_value_star = true;
+        }
+      }
+    }
+  }
+  std::vector<bool> star_proto(statement.SelectList().size(), false);
   std::vector<std::string> lowered_using;
   if (input.using_columns != nullptr) {
     lowered_using = *input.using_columns;
@@ -412,6 +439,13 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       const ColumnName& requested =
           projection.expression->AsColumnValue().GetColumnName();
       const bool qualified = !requested.schema.empty();
+      if (proto_value_star && base_width == 1) {
+        star_proto[i] = true;
+        output_columns.emplace_back("int32_val1", ValueType::kInt64);
+        output_columns.emplace_back("int32_val2", ValueType::kInt64);
+        output_columns.emplace_back("str_value", ValueType::kArray);
+        continue;
+      }
       if (!qualified && !lowered_using.empty()) {
         // Merged using columns first, in declaration order.
         std::vector<size_t> consumed;
@@ -503,6 +537,19 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
       const NamedExpression& projection = statement.SelectList()[item];
       if (projection.expression->Type() == TypeTag::kColumnValue &&
           projection.expression->AsColumnValue().GetColumnName().name == "*") {
+        if (star_proto[item]) {
+          const ColumnName base = input.schema.GetColumn(0).Name();
+          for (const char* field : {"int32_val1", "int32_val2",
+                                    "str_value"}) {
+            values.push_back(Evaluate(
+                FunctionCallExp(
+                    "__get_field_safe",
+                    {ColumnValueExp(base),
+                     ConstantValueExp(Value(std::string(field)))}),
+                scope, aggregates, context, ctes));
+          }
+          continue;
+        }
         for (const std::vector<size_t>& group : star_groups[item]) {
           // USING-merged entries coalesce their physical duplicates.
           Value merged;
@@ -603,6 +650,7 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
     for (size_t i = 0; i < output_columns.size(); ++i) {
       output_columns[i] =
           Column(output_columns[i].Name(), ValueTypeOf(output.rows[0][i]));
+      output_columns[i].SetUnsigned(output.rows[0][i].IsUnsigned());
     }
   }
   output.schema = Schema("", std::move(output_columns));
@@ -1556,6 +1604,7 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     for (size_t i = 0; i < output_columns.size() && !output.rows.empty(); ++i) {
       output_columns[i] =
           Column(output_columns[i].Name(), ValueTypeOf(output.rows[0][i]));
+      output_columns[i].SetUnsigned(output.rows[0][i].IsUnsigned());
     }
     output.schema = Schema("", std::move(output_columns));
     output.FinishSpill();

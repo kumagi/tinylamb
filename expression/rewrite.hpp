@@ -125,6 +125,11 @@ class ExpressionRewriter {
     const Expression& expression);
 [[nodiscard]] Expression WithExpressionChildren(
     const Expression& expression, std::vector<Expression> children);
+// Applies arithmetic rewrites that require resolved input-column types.
+// Keeping these separate from the schema-free rule set prevents type-changing
+// rewrites such as DOUBLE-column multiplication by an integer zero.
+[[nodiscard]] Expression RewriteTypedArithmetic(
+    const Expression& expression, const Schema& input_schema);
 [[nodiscard]] std::vector<Expression> SplitConjuncts(
     const Expression& expression);
 [[nodiscard]] Expression CombineConjuncts(

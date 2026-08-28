@@ -1,0 +1,214 @@
+# Common-subexpression elimination, column/lifetime pruning, and compound
+# rewrite expectations.
+
+[prepare_database]
+CREATE TABLE opt_metrics AS
+SELECT 1 AS id, 10 AS a, 2 AS b, 'alpha' AS payload, true AS keep
+UNION ALL SELECT 2, 20, 4, 'beta', false
+UNION ALL SELECT 3, 30, 5, 'gamma', true
+UNION ALL SELECT 4, CAST(NULL AS INT64), 8, 'delta', true;
+ANALYZE opt_metrics;
+--
+ARRAY<STRUCT<x INT64>>[]
+==
+
+[mode=explain]
+[plan_contains=ComputeScalar slots=1 uses=3]
+[plan_not_contains=ComputeScalar slots=3]
+[name=repeated_arithmetic_expression_computed_once]
+SELECT id, a * b AS x, a * b + 1 AS y, (a * b) * 2 AS z
+FROM opt_metrics ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64, y INT64, z INT64>>[
+  {1, 20, 21, 40}, {2, 80, 81, 160}, {3, 150, 151, 300},
+  {4, NULL, NULL, NULL}
+]
+==
+
+[mode=explain]
+[plan_contains=ComputeScalar CASE uses=2]
+[name=repeated_case_expression_computed_once]
+SELECT id,
+       CASE WHEN keep THEN a ELSE b END AS x,
+       CASE WHEN keep THEN a ELSE b END + 10 AS y
+FROM opt_metrics ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64, y INT64>>[
+  {1, 10, 20}, {2, 4, 14}, {3, 30, 40}, {4, NULL, NULL}
+]
+==
+
+[mode=explain]
+[plan_contains=Aggregate expressions=SUM(a),COUNT(*)]
+[plan_not_contains=Aggregate expressions=SUM(a),SUM(a)]
+[name=duplicate_aggregate_call_is_shared]
+SELECT SUM(a) AS total, SUM(a) + COUNT(*) AS decorated FROM opt_metrics
+--
+ARRAY<STRUCT<total INT64, decorated INT64>>[{60, 64}]
+==
+
+[mode=explain]
+[plan_contains=InitPlan executions=1 uses=2]
+[name=duplicate_uncorrelated_scalar_subquery_is_shared]
+SELECT id,
+       (SELECT MAX(a) FROM opt_metrics) AS m1,
+       (SELECT MAX(a) FROM opt_metrics) + 1 AS m2
+FROM opt_metrics ORDER BY id
+--
+ARRAY<STRUCT<id INT64, m1 INT64, m2 INT64>>[
+  {1, 30, 31}, {2, 30, 31}, {3, 30, 31}, {4, 30, 31}
+]
+==
+
+[mode=explain]
+[plan_contains=ParameterizedCache key=o.keep]
+[plan_contains=executions~2]
+[name=correlated_subquery_cache_uses_distinct_parameter_tuples]
+SELECT o.id,
+       (SELECT COUNT(*) FROM opt_metrics i WHERE i.keep = o.keep) AS peers
+FROM opt_metrics o ORDER BY o.id
+--
+ARRAY<STRUCT<id INT64, peers INT64>>[{1, 3}, {2, 1}, {3, 3}, {4, 3}]
+==
+
+[mode=explain]
+[plan_contains=ScanColumns id,a]
+[plan_not_contains=payload]
+[plan_not_contains=keep]
+[name=derived_table_projection_prunes_unused_columns_to_scan]
+SELECT id, doubled
+FROM (SELECT id, a * 2 AS doubled, payload, keep FROM opt_metrics) d
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64, doubled INT64>>[
+  {1, 20}, {2, 40}, {3, 60}, {4, NULL}
+]
+==
+
+[mode=explain]
+[plan_contains=LateMaterialize payload after Limit]
+[plan_not_contains=ScanColumns id,a,b,payload]
+[name=wide_column_lifetime_starts_after_topn]
+SELECT id, payload FROM opt_metrics ORDER BY a DESC LIMIT 2
+--
+ARRAY<STRUCT<id INT64, payload STRING>>[{3, "gamma"}, {2, "beta"}]
+==
+
+[mode=explain]
+[plan_contains=Filter a >= 20 below Project]
+[plan_not_contains=Filter doubled >= 40]
+[name=predicate_translates_through_derived_projection]
+SELECT id, doubled
+FROM (SELECT id, a * 2 AS doubled FROM opt_metrics) d
+WHERE doubled >= 40 ORDER BY id
+--
+ARRAY<STRUCT<id INT64, doubled INT64>>[{2, 40}, {3, 60}]
+==
+
+[mode=explain]
+[plan_contains=Limit count=2 below Project]
+[name=limit_pushes_through_cardinality_preserving_projection]
+SELECT id, a * b AS product
+FROM (SELECT * FROM opt_metrics ORDER BY id LIMIT 2) d
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64, product INT64>>[{1, 20}, {2, 80}]
+==
+
+[mode=explain]
+[plan_contains=Filter keep below Aggregate]
+[plan_not_contains=Filter keep above Aggregate]
+[name=filter_pushes_below_grouping_when_independent]
+SELECT b, SUM(a) AS total
+FROM (SELECT * FROM opt_metrics WHERE keep) d
+GROUP BY b ORDER BY b
+--
+ARRAY<STRUCT<b INT64, total INT64>>[{2, 10}, {5, 30}, {8, NULL}]
+==
+
+[mode=explain]
+[plan_not_contains=Sort]
+[plan_contains=IndexScan: opt_metrics]
+[name=monotonic_projection_preserves_index_order]
+SELECT id + 10 AS shifted FROM opt_metrics ORDER BY shifted
+--
+ARRAY<STRUCT<shifted INT64>>[{11}, {12}, {13}, {14}]
+==
+
+[mode=explain]
+[plan_contains=TopN key=a * b slot=$cse0]
+[plan_contains=ComputeScalar $cse0 once]
+[name=order_by_expression_reuses_projected_cse]
+SELECT id, a * b AS product FROM opt_metrics
+ORDER BY a * b DESC LIMIT 2
+--
+ARRAY<STRUCT<id INT64, product INT64>>[{3, 150}, {2, 80}]
+==
+
+[mode=explain]
+[plan_not_contains=Distinct]
+[plan_contains=UniqueKey id]
+[name=distinct_over_key_preserving_projection_removed]
+SELECT DISTINCT id, a * 2 AS doubled FROM opt_metrics ORDER BY id
+--
+ARRAY<STRUCT<id INT64, doubled INT64>>[
+  {1, 20}, {2, 40}, {3, 60}, {4, NULL}
+]
+==
+
+[mode=explain]
+[plan_contains=EmptyResult]
+[plan_not_contains=ComputeScalar]
+[name=empty_input_prunes_expensive_projection]
+SELECT id, a / 0 AS impossible FROM opt_metrics WHERE false
+--
+ARRAY<STRUCT<id INT64, impossible INT64>>[]
+==
+
+[mode=explain]
+[plan_not_contains=Sort]
+[plan_not_contains=Limit]
+[name=order_limit_inside_exists_is_removed]
+SELECT id FROM opt_metrics o
+WHERE EXISTS (SELECT 1 FROM opt_metrics i WHERE i.keep = o.keep
+              ORDER BY i.id LIMIT 100)
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}]
+==
+
+[mode=explain]
+[plan_contains=SemiHashJoin]
+[plan_contains=DistinctBuild eliminated=true]
+[name=exists_build_does_not_deduplicate_explicitly]
+SELECT id FROM opt_metrics o
+WHERE EXISTS (SELECT DISTINCT keep FROM opt_metrics i WHERE i.keep = o.keep)
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}]
+==
+
+[mode=explain]
+[plan_contains=ProjectCollapse levels=3]
+[plan_not_contains=SubqueryScan]
+[name=deep_projection_stack_collapses]
+SELECT id, x
+FROM (
+  SELECT id, doubled + 1 AS x
+  FROM (SELECT id, a * 2 AS doubled FROM opt_metrics)
+) q
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64, x INT64>>[{1, 21}, {2, 41}, {3, 61}, {4, NULL}]
+==
+
+[mode=explain]
+[plan_contains=PredicateMoveAround]
+[plan_contains=a >= 20 below Subquery]
+[name=predicate_moves_across_multiple_projection_levels]
+SELECT id FROM (
+  SELECT id, a AS x FROM (SELECT id, a FROM opt_metrics)
+) q WHERE x >= 20 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{2}, {3}]
+==

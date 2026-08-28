@@ -1,0 +1,189 @@
+# Access-path, ordering-property, and early-termination expectations.
+
+[prepare_database]
+CREATE TABLE access_input AS
+SELECT 1 AS id, 10 AS category, 100 AS score, 'one' AS payload
+UNION ALL SELECT 2, 10, 90, 'two'
+UNION ALL SELECT 3, 20, 80, 'three'
+UNION ALL SELECT 4, 20, 70, 'four'
+UNION ALL SELECT 5, 30, 60, 'five'
+UNION ALL SELECT 6, 30, 50, 'six'
+UNION ALL SELECT 7, 40, 40, 'seven'
+UNION ALL SELECT 8, 40, 30, 'eight'
+UNION ALL SELECT 9, 50, 20, 'nine'
+UNION ALL SELECT 10, 50, 10, 'ten';
+ANALYZE access_input;
+--
+ARRAY<STRUCT<id INT64, category INT64, score INT64, payload STRING>>[]
+==
+
+[mode=explain]
+[plan_contains=IndexScan: access_input]
+[plan_not_contains=FullScan: access_input]
+[plan_not_contains=SeqScan access_input]
+[name=primary_key_point_lookup]
+SELECT payload FROM access_input WHERE id = 7
+--
+ARRAY<STRUCT<payload STRING>>[{"seven"}]
+==
+
+[mode=explain]
+[plan_contains=IndexOnlyScan: access_input]
+[plan_not_contains=Project]
+[name=primary_key_covering_point_lookup]
+SELECT id FROM access_input WHERE id = 7
+--
+ARRAY<STRUCT<id INT64>>[{7}]
+==
+
+[mode=explain]
+[plan_contains=IndexScan: access_input]
+[plan_not_contains=Sort]
+[name=primary_key_range_provides_order]
+SELECT id, payload FROM access_input WHERE id BETWEEN 3 AND 6 ORDER BY id
+--
+ARRAY<STRUCT<id INT64, payload STRING>>[
+  {3, "three"}, {4, "four"}, {5, "five"}, {6, "six"}
+]
+==
+
+[mode=explain]
+[plan_contains=IndexScan: access_input]
+[plan_not_contains=Sort]
+[name=reverse_primary_key_scan_provides_desc_order]
+SELECT id FROM access_input WHERE id >= 7 ORDER BY id DESC
+--
+ARRAY<STRUCT<id INT64>>[{10}, {9}, {8}, {7}]
+==
+
+[mode=explain]
+[plan_contains=IndexScan: access_input x3 points]
+[plan_not_contains=SeqScan access_input]
+[name=in_list_uses_multi_point_index_scan]
+SELECT id, payload FROM access_input WHERE id IN (2, 5, 9) ORDER BY id
+--
+ARRAY<STRUCT<id INT64, payload STRING>>[
+  {2, "two"}, {5, "five"}, {9, "nine"}
+]
+==
+
+[mode=explain]
+[plan_contains=IndexScan: access_input x2 points]
+[name=or_points_use_multi_range_index_scan]
+SELECT id FROM access_input WHERE id = 1 OR id = 10 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {10}]
+==
+
+[mode=explain]
+[plan_contains=IndexScan: access_input]
+[plan_contains=residual: category = 20]
+[name=index_range_keeps_residual_predicate]
+SELECT id FROM access_input
+WHERE id >= 2 AND id <= 8 AND category = 20
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{3}, {4}]
+==
+
+[mode=explain]
+[plan_contains=TopN]
+[plan_not_contains=Sort:]
+[name=order_by_limit_uses_bounded_topn]
+SELECT id, score FROM access_input ORDER BY score DESC LIMIT 3
+--
+ARRAY<STRUCT<id INT64, score INT64>>[{1, 100}, {2, 90}, {3, 80}]
+==
+
+[mode=explain]
+[plan_contains=TopN (limit=3, offset=2)]
+[plan_not_contains=Sort:]
+[name=order_by_limit_offset_uses_bounded_topn]
+SELECT id FROM access_input ORDER BY score DESC LIMIT 3 OFFSET 2
+--
+ARRAY<STRUCT<id INT64>>[{3}, {4}, {5}]
+==
+
+[mode=explain]
+[plan_contains=IndexOnlyScan: access_input]
+[plan_contains=Limit count=1]
+[plan_not_contains=Sort]
+[name=min_via_ordered_index_early_stop]
+SELECT id FROM access_input ORDER BY id LIMIT 1
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=IndexOnlyScan: access_input]
+[plan_contains=reverse]
+[plan_not_contains=Sort]
+[name=max_via_reverse_index_early_stop]
+SELECT id FROM access_input ORDER BY id DESC LIMIT 1
+--
+ARRAY<STRUCT<id INT64>>[{10}]
+==
+
+[mode=explain]
+[plan_contains=CountIndexOnly]
+[plan_not_contains=SeqScan access_input]
+[name=count_star_uses_narrowest_index]
+SELECT COUNT(*) AS n FROM access_input
+--
+ARRAY<STRUCT<n INT64>>[{10}]
+==
+
+[mode=explain]
+[plan_contains=IndexOnlyScan: access_input]
+[plan_not_contains=Distinct]
+[name=distinct_primary_key_is_eliminated]
+SELECT DISTINCT id FROM access_input ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}, {10}]
+==
+
+[mode=explain]
+[plan_contains=EmptyResult]
+[plan_not_contains=access_input]
+[name=impossible_key_range_avoids_access]
+SELECT id FROM access_input WHERE id > 8 AND id < 2
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain]
+[plan_contains=IndexScan: access_input]
+[plan_contains=limit=1]
+[name=existence_shape_stops_after_first_match]
+SELECT 1 AS present FROM access_input WHERE id >= 5 LIMIT 1
+--
+ARRAY<STRUCT<present INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=LateMaterialize payload]
+[plan_contains=TopN]
+[name=wide_payload_materialized_after_topn]
+SELECT id, payload FROM access_input ORDER BY score DESC LIMIT 2
+--
+ARRAY<STRUCT<id INT64, payload STRING>>[{1, "one"}, {2, "two"}]
+==
+
+[mode=explain]
+[plan_contains=BitmapOr]
+[plan_not_contains=SeqScan access_input]
+[name=disjoint_ranges_use_bitmap_or]
+SELECT id FROM access_input
+WHERE (id BETWEEN 1 AND 2) OR (id BETWEEN 8 AND 10)
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {8}, {9}, {10}]
+==
+
+[mode=explain]
+[plan_contains=BitmapAnd]
+[name=independent_selective_predicates_use_bitmap_and]
+SELECT id FROM access_input WHERE category = 20 AND score >= 70 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{3}, {4}]
+==

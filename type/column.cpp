@@ -46,12 +46,20 @@ std::ostream& operator<<(std::ostream& o, const Column& c) {
 }
 
 Encoder& operator<<(Encoder& a, const Column& c) {
-  a << c.col_name_ << c.type_ << c.constraint_;
+  // Keep the signed value representation while recording UINT64 in the
+  // catalog's column metadata.  The high bit is not part of ValueType, so
+  // existing signed column encodings remain byte-compatible.
+  uint8_t encoded_type = static_cast<uint8_t>(c.type_);
+  if (c.unsigned_) { encoded_type |= 0x80; }
+  a << c.col_name_ << encoded_type << c.constraint_;
   return a;
 }
 
 Decoder& operator>>(Decoder& e, Column& c) {
-  e >> c.col_name_ >> c.type_ >> c.constraint_;
+  uint8_t encoded_type = 0;
+  e >> c.col_name_ >> encoded_type >> c.constraint_;
+  c.unsigned_ = (encoded_type & 0x80) != 0;
+  c.type_ = static_cast<ValueType>(encoded_type & 0x7f);
   return e;
 }
 
@@ -61,6 +69,7 @@ uint64_t std::hash<tinylamb::Column>::operator()(
     const tinylamb::Column& c) const noexcept {
   uint64_t result = std::hash<tinylamb::ColumnName>()(c.Name());
   result += std::hash<tinylamb::ValueType>()(c.Type());
+  result += std::hash<bool>()(c.IsUnsigned());
   result += std::hash<tinylamb::Constraint>()(c.GetConstraint());
   return result;
 }

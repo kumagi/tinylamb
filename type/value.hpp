@@ -177,6 +177,15 @@ friend int CompareForOrderBy(const Value& a, const Value& b);
   // either operand carries it; serialization and hashing ignore it.
   [[nodiscard]] uint8_t Collation() const { return collation_; }
   [[nodiscard]] bool IsCaseInsensitive() const { return collation_ == 2; }
+  // UINT64 values share the INT64 storage representation, so retain their
+  // SQL signedness in the otherwise-unused collation tag.  This lets joins
+  // and comparisons distinguish UINT64(2^64-1) from INT64(-1).
+  [[nodiscard]] bool IsUnsigned() const { return collation_ == 3; }
+  [[nodiscard]] Value WithUnsigned() const {
+    Value copy = *this;
+    copy.collation_ = 3;
+    return copy;
+  }
   [[nodiscard]] Value WithCollation(uint8_t collation) const {
     Value copy = *this;
     copy.collation_ = collation;

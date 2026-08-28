@@ -1,0 +1,186 @@
+# Predicate inference, normalization, and scan pushdown expectations.
+
+[prepare_database]
+CREATE TABLE predicate_input AS
+SELECT 1 AS id, 10 AS x, 100 AS y, 'open' AS state
+UNION ALL SELECT 2, 20, 200, 'closed'
+UNION ALL SELECT 3, 30, 300, 'open'
+UNION ALL SELECT 4, 40, CAST(NULL AS INT64), 'pending'
+UNION ALL SELECT 5, CAST(NULL AS INT64), 500, CAST(NULL AS STRING);
+ANALYZE predicate_input;
+--
+ARRAY<STRUCT<id INT64, x INT64, y INT64, state STRING>>[]
+==
+
+[mode=explain]
+[plan_not_contains=x > 0]
+[name=stronger_lower_bound_subsumes_weaker]
+SELECT id FROM predicate_input WHERE x > 0 AND x > 20 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{3}, {4}]
+==
+
+[mode=explain]
+[plan_not_contains=x <= 100]
+[name=stronger_upper_bound_subsumes_weaker]
+SELECT id FROM predicate_input WHERE x <= 100 AND x < 30 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}]
+==
+
+[mode=explain]
+[plan_contains=EmptyResult]
+[plan_not_contains=SeqScan predicate_input]
+[name=equality_outside_range_detected]
+SELECT id FROM predicate_input WHERE x = 20 AND x > 25
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain]
+[plan_not_contains=x >= 10]
+[plan_not_contains=x <= 10]
+[plan_contains=x = 10]
+[name=closed_singleton_range_becomes_equality]
+SELECT id FROM predicate_input WHERE x >= 10 AND x <= 10
+--
+ARRAY<STRUCT<id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_not_contains=x IS NOT NULL]
+[name=strict_comparison_implies_not_null]
+SELECT id FROM predicate_input WHERE x > 10 AND x IS NOT NULL ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{2}, {3}, {4}]
+==
+
+[mode=explain]
+[plan_contains=EmptyResult]
+[name=null_and_not_null_contradiction]
+SELECT id FROM predicate_input WHERE x IS NULL AND x IS NOT NULL
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain]
+[plan_not_contains=OR]
+[plan_contains=IN]
+[name=large_equality_disjunction_coalesces]
+SELECT id FROM predicate_input
+WHERE state = 'open' OR state = 'pending' OR state = 'closed'
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}]
+==
+
+[mode=explain]
+[plan_not_contains=id = 2]
+[name=in_list_subsumes_redundant_or_equality]
+SELECT id FROM predicate_input WHERE id IN (1, 2, 3) OR id = 2 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}]
+==
+
+[mode=explain]
+[plan_not_contains=NOT IN]
+[plan_contains=!=]
+[name=single_element_not_in_becomes_inequality]
+SELECT id FROM predicate_input WHERE state NOT IN ('closed') ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {3}, {4}]
+==
+
+[mode=explain]
+[plan_contains=EmptyResult]
+[name=in_and_not_in_disjointness_detected]
+SELECT id FROM predicate_input
+WHERE state IN ('open', 'closed') AND state NOT IN ('open', 'closed')
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain]
+[plan_not_contains=OR]
+[plan_contains=>= 10]
+[plan_contains=<= 30]
+[name=adjacent_overlapping_ranges_merge]
+SELECT id FROM predicate_input
+WHERE (x >= 10 AND x <= 20) OR (x >= 20 AND x <= 30)
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}]
+==
+
+[mode=explain]
+[plan_not_contains=id > 0]
+[plan_not_contains=id < 100]
+[name=key_domain_constraints_remove_redundant_bounds]
+SELECT id FROM predicate_input WHERE id > 0 AND id < 100 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}]
+==
+
+[mode=explain]
+[plan_contains=x = 20]
+[plan_not_contains=x = y]
+[name=transitive_constant_propagation]
+SELECT id FROM predicate_input WHERE x = y AND y = 20
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain]
+[plan_contains=EmptyResult]
+[name=transitive_conflicting_constants]
+SELECT id FROM predicate_input WHERE x = y AND x = 10 AND y = 20
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain]
+[plan_not_contains=Filter]
+[name=limit_zero_avoids_scan_and_filter]
+SELECT id FROM predicate_input WHERE y / 0 = 1 LIMIT 0
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain]
+[plan_contains=Filter state]
+[plan_not_contains=Filter (state]
+[name=common_factor_extracted_from_disjunction]
+SELECT id FROM predicate_input
+WHERE (state = 'open' AND x = 10) OR (state = 'open' AND x = 30)
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {3}]
+==
+
+[mode=explain]
+[plan_not_contains=LIKE]
+[plan_contains=>= 'alpha']
+[name=prefix_like_becomes_range_predicate]
+SELECT id FROM predicate_input WHERE state LIKE 'op%' ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {3}]
+==
+
+[mode=explain]
+[plan_contains=EmptyResult]
+[name=constant_false_or_unknown_filter_is_empty]
+SELECT id FROM predicate_input
+WHERE false OR CAST(NULL AS BOOL)
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain]
+[plan_not_contains=Filter]
+[name=constant_true_or_unknown_filter_removed]
+SELECT id FROM predicate_input
+WHERE true OR CAST(NULL AS BOOL)
+ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}]
+==

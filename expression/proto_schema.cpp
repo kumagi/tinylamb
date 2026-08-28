@@ -146,17 +146,49 @@ std::vector<ProtoFieldSchema> KitchenSinkEnumFields() {
 std::vector<ProtoFieldSchema> Proto3KitchenSinkFields() {
   return {
       {"int32_val", "int32", false, false, false, false},
+      {"uint32_val", "uint32", false, false, false, false},
       {"int64_val", "int64", false, false, false, false},
+      {"uint64_val", "uint64", false, false, false, false},
       {"float_val", "float", false, false, false, false},
       {"double_val", "double", false, false, false, false},
       {"string_val", "string", false, false, false, false},
+      {"bytes_val", "bytes", false, false, false, false},
       {"bool_val", "bool", false, false, false, false},
+      {"fixed32_val", "uint32", false, false, false, false},
+      {"fixed64_val", "uint64", false, false, false, false},
+      {"sfixed32_val", "int32", false, false, false, false},
+      {"sfixed64_val", "int64", false, false, false, false},
+      {"sint32_val", "int32", false, false, false, false},
+      {"sint64_val", "int64", false, false, false, false},
+      {"repeated_int32_val", "int32", false, true, false, false},
+      {"repeated_uint32_val", "uint32", false, true, false, false},
+      {"repeated_int64_val", "int64", false, true, false, false},
+      {"repeated_uint64_val", "uint64", false, true, false, false},
+      {"repeated_string_val", "string", false, true, false, false},
+      {"repeated_float_val", "float", false, true, false, false},
+      {"repeated_double_val", "double", false, true, false, false},
+      {"repeated_bytes_val", "bytes", false, true, false, false},
+      {"repeated_bool_val", "bool", false, true, false, false},
+      {"repeated_fixed32_val", "uint32", false, true, false, false},
+      {"repeated_fixed64_val", "uint64", false, true, false, false},
+      {"repeated_sfixed32_val", "int32", false, true, false, false},
+      {"repeated_sfixed64_val", "int64", false, true, false, false},
+      {"repeated_sint32_val", "int32", false, true, false, false},
+      {"repeated_sint64_val", "int64", false, true, false, false},
       {"test_enum", "TestProto3Enum", false, false, false, true},
       {"repeated_test_enum", "TestProto3Enum", false, true, false, true},
       {"empty_message", "EmptyMessage", false, false, true, false},
       {"test_struct", "Proto3AnnotatedStruct", false, false, true, false},
       {"small_message_no_use_defaults", "Proto3SmallMessageWithNoUseDefaults",
        false, false, true, false},
+  };
+}
+
+std::vector<ProtoFieldSchema> TestExtraPBFields() {
+  return {
+      {"int32_val1", "int32", false, false, false, false},
+      {"int32_val2", "int32", false, false, false, false},
+      {"str_value", "string", false, true, false, false},
   };
 }
 
@@ -188,6 +220,7 @@ MessageMap BuildMessages() {
       {{"id", "int64", true, false, false, false}});
   add("KitchenSinkEnumPB", KitchenSinkEnumFields());
   add("Proto3KitchenSink", Proto3KitchenSinkFields());
+  add("TestExtraPB", TestExtraPBFields());
   add("EmptyMessage", {});
   add("NullableInt", {{"value", "int64", false, false, false, false}});
   add("NullableDate", {{"value", "date", false, false, false, false}});

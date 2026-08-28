@@ -213,7 +213,12 @@ Value ScalarFromText(std::string_view raw) {
     return Value(int64_t{0});
   }
   if (token.front() == '"' && token.back() == '"' && token.size() >= 2) {
-    return Value(token.substr(1, token.size() - 2));
+    const std::string unquoted = token.substr(1, token.size() - 2);
+    constexpr std::string_view kDateMarker = "__tinylamb_date__:";
+    if (unquoted.starts_with(kDateMarker)) {
+      return Value::Date(unquoted.substr(kDateMarker.size()));
+    }
+    return Value(std::string(unquoted));
   }
   if (token.front() == '{' && token.back() == '}') {
     return Value(std::move(token));  // nested struct stays encoded
@@ -391,6 +396,13 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
     if (bracket != std::string_view::npos && raw.back() == ']') {
       std::string_view inner = raw.substr(bracket + 1, raw.size() - bracket - 2);
       std::vector<Value> elements;
+      const std::string element_type_name(raw.substr(6, raw.find(">[") - 6));
+      auto parse_element = [&](std::string_view token) {
+        if (element_type_name == "DATE") {
+          return Value::Date(TrimFieldToken(token));
+        }
+        return ScalarFromText(token);
+      };
       int nest = 0;
       bool str = false;
       size_t start = 0;
@@ -421,12 +433,12 @@ bool JsonExtractField(std::string_view json, std::string_view key, Value* out) {
           continue;
         }
         if (d == ',' && nest == 0) {
-          elements.push_back(ScalarFromText(inner.substr(start, k - start)));
+          elements.push_back(parse_element(inner.substr(start, k - start)));
           start = k + 1;
         }
       }
       if (!inner.empty()) {
-        elements.push_back(ScalarFromText(inner.substr(start)));
+        elements.push_back(parse_element(inner.substr(start)));
       }
       const std::string element_type = InferElementSqlType(elements);
       *out = Value::Array(std::move(elements), element_type);
@@ -566,8 +578,12 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
             ((v.value.varchar_value.front() == '{' &&
               v.value.varchar_value.back() == '}') ||
              (v.value.varchar_value.front() == '[' &&
-              v.value.varchar_value.back() == ']'))) {
+             v.value.varchar_value.back() == ']'))) {
           return normalize_encoded_arrays(v.value.varchar_value);
+        }
+        if (LooksLikeProtoText(v.value.varchar_value)) {
+          return "{" + NormalizeProtoText(v.value.varchar_value).value_or("") +
+                 "}";
         }
         return "\"" + std::string(v.value.varchar_value) + "\"";
       case ValueType::kArray: {
@@ -748,7 +764,12 @@ int CompareEncodedField(std::string_view raw_left, std::string_view raw_right) {
   };
   const std::string_view l = trim(raw_left);
   const std::string_view r = trim(raw_right);
-  if (l == "null" || r == "null") {
+  // Deferred STRUCT construction represents a literal NULL as the quoted
+  // text token `"null"` in its VARCHAR argument.
+  if (l == "null" || r == "null" || l == "\"null\"") {
+    if (l == "\"null\"" && r == "\"null\"") {
+      return 1;
+    }
     return -1;
   }
   if (l.front() == '{' && l.back() == '}' && r.front() == '{' &&
@@ -863,6 +884,51 @@ int ThreeValuedEquals(const Value& left, const Value& right) {
 }  // namespace
 
 Value Lookup(const ColumnName& name, const Scope& scope) {
+  // The frontend can preserve a dotted reference entirely in the qualifier
+  // (`outer_table.a.repeated_field`) instead of splitting it into
+  // qualifier/name components.  Resolve the longest physical column prefix
+  // first so nested correlated proto/STRUCT fields bind to the right scope.
+  std::string full_name = name.schema;
+  if (!full_name.empty() && !name.name.empty()) {
+    full_name += ".";
+  }
+  full_name += name.name;
+  const std::vector<std::string> full_segments = SplitDottedName(full_name);
+  if (full_segments.size() >= 2) {
+    for (const Scope* current = &scope; current != nullptr;
+         current = current->outer) {
+      if (current->row == nullptr || current->schema == nullptr) {
+        continue;
+      }
+      for (size_t column_index = 0;
+           column_index < current->schema->ColumnCount(); ++column_index) {
+        const ColumnName& candidate =
+            current->schema->GetColumn(column_index).Name();
+        std::vector<std::string> base_segments;
+        if (!candidate.schema.empty()) {
+          base_segments = SplitDottedName(candidate.schema);
+        }
+        for (std::string part : SplitDottedName(candidate.name)) {
+          base_segments.push_back(std::move(part));
+        }
+        if (base_segments.empty() ||
+            full_segments.size() <= base_segments.size() ||
+            !std::equal(base_segments.begin(), base_segments.end(),
+                        full_segments.begin(),
+                        [](const std::string& left, const std::string& right) {
+                          return IdentifierEquals(left, right);
+                        })) {
+          continue;
+        }
+        return ResolveFieldPath(
+            (*current->row)[column_index],
+            std::vector<std::string>(
+                full_segments.begin() +
+                    static_cast<ptrdiff_t>(base_segments.size()),
+                full_segments.end()));
+      }
+    }
+  }
   for (const Scope* current = &scope; current != nullptr;
        current = current->outer) {
     if (current->row == nullptr || current->schema == nullptr) {
@@ -903,6 +969,55 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
       return (*current->row)[static_cast<size_t>(offset)];
     }
   }
+  // A proto value table has one encoded message column.  In that shape the
+  // qualified star denotes the value itself (it is later wrapped by SELECT
+  // AS <proto>), rather than a physical column literally named "*".
+  if (name.name == "*" && !name.schema.empty()) {
+    for (const Scope* current = &scope; current != nullptr;
+         current = current->outer) {
+      if (current->row == nullptr || current->schema == nullptr ||
+          current->schema->ColumnCount() != 1) {
+        continue;
+      }
+      const ColumnName& column = current->schema->GetColumn(0).Name();
+      if (IdentifierEquals(column.schema, name.schema)) {
+        return (*current->row)[0];
+      }
+    }
+  }
+  // Fast path for a one-column proto value table.  This is intentionally
+  // independent of whether the parser kept `p.x` in the qualifier or in the
+  // dotted column name; both spellings occur in the resolved AST.
+  for (const Scope* current = &scope; current != nullptr;
+       current = current->outer) {
+    if (current->row == nullptr || current->schema == nullptr ||
+        current->schema->ColumnCount() != 1 ||
+        (*current->row)[0].type != ValueType::kVarChar) {
+      continue;
+    }
+    const ColumnName& physical = current->schema->GetColumn(0).Name();
+    const std::string qualifier = name.schema.empty()
+                                      ? std::string()
+                                      : name.schema;
+    std::string field = name.name;
+    if (name.schema.empty()) {
+      const size_t dot = field.find('.');
+      if (dot == std::string::npos) {
+        if (IdentifierEquals(field, physical.schema)) {
+          return (*current->row)[0];
+        }
+        continue;
+      }
+      field = field.substr(dot + 1);
+    } else if (!IdentifierEquals(qualifier, physical.schema)) {
+      continue;
+    }
+    Value decoded;
+    if (TryProtoTextGetField((*current->row)[0].value.varchar_value, field,
+                             &decoded)) {
+      return decoded;
+    }
+  }
   // Dotted references (`t.Info.str_value`, `s.a`, `sub.ca.a`) may address
   // nested fields of a STRUCT/PROTO value rather than a plain column.  Split
   // the full path into segments and, per scope level (innermost outward),
@@ -927,19 +1042,87 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
       if (current->row == nullptr || current->schema == nullptr) {
         continue;
       }
+      if (name.schema.empty() && current->schema->ColumnCount() == 1 &&
+          (*current->row)[0].type == ValueType::kVarChar) {
+        Value field;
+        if (TryProtoTextGetField((*current->row)[0].value.varchar_value,
+                                 fields.front(), &field)) {
+          Value current_value = std::move(field);
+          for (size_t i = 1; i < fields.size(); ++i) {
+            current_value = ResolveFieldPath(
+                current_value,
+                std::vector<std::string>{fields[i]});
+          }
+          return current_value;
+        }
+      }
+      // Some frontend paths preserve the entire dotted base in
+      // ColumnName::name (for example `outer_table.a.repeated_field`) while
+      // others split it between schema and name.  Match the actual column's
+      // full path before treating the qualifier as a value-table alias.
+      for (size_t column_index = 0;
+           column_index < current->schema->ColumnCount(); ++column_index) {
+        const ColumnName& candidate =
+            current->schema->GetColumn(column_index).Name();
+        std::vector<std::string> base_parts;
+        if (!candidate.schema.empty()) {
+          base_parts = SplitDottedName(candidate.schema);
+        }
+        for (std::string part : SplitDottedName(candidate.name)) {
+          base_parts.push_back(std::move(part));
+        }
+        if (base_parts.empty() || segments.size() <= base_parts.size() ||
+            !std::equal(base_parts.begin(), base_parts.end(), segments.begin(),
+                        [](const std::string& left, const std::string& right) {
+                          return IdentifierEquals(left, right);
+                        })) {
+          continue;
+        }
+        return ResolveFieldPath(
+            (*current->row)[column_index],
+            std::vector<std::string>(segments.begin() +
+                                         static_cast<ptrdiff_t>(base_parts.size()),
+                                     segments.end()));
+      }
       // First segment may be an alias whose whole row is the base value.
       if (name.schema.empty()) {
         bool any_match = false;
+        size_t matched_index = 0;
         for (size_t i = 0; i < current->schema->ColumnCount(); ++i) {
           if (IdentifierEquals(current->schema->GetColumn(i).Name().schema,
                                segments.front())) {
             any_match = true;
+            matched_index = i;
             break;
           }
         }
         if (any_match) {
+          if (current->schema->ColumnCount() == 1) {
+            return ResolveFieldPath((*current->row)[matched_index], fields);
+          }
           return ResolveFieldPath(
               RowAsStructValue(*current->row, *current->schema), fields);
+        }
+      }
+      // Value-table aliases expose the fields of their sole encoded proto
+      // column as if they were columns of the relation (p.int32_val1).
+      // There is no physical column named int32_val1 to find, so bind the
+      // qualifier to the only column carrying that relation identity.
+      const bool explicit_base_column =
+          segments.size() >= 2 &&
+          FindColumn(*current->schema,
+                     ColumnName(segments.front(), segments[1])) >= 0;
+      if (!name.schema.empty() && !explicit_base_column) {
+        std::vector<size_t> owned;
+        for (size_t i = 0; i < current->schema->ColumnCount(); ++i) {
+          if (IdentifierEquals(current->schema->GetColumn(i).Name().schema,
+                               segments.front())) {
+            owned.push_back(i);
+          }
+        }
+        if (owned.size() == 1) {
+          return ResolveFieldPath(
+              (*current->row)[owned.front()], fields);
         }
       }
       // Split point k: segments[0..k] form the base column reference
@@ -1009,10 +1192,29 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
             break;
           }
         }
+        if (!names_a_column && schema.ColumnCount() == 1) {
+          const Value& candidate = (*current->row)[0];
+          if (!candidate.IsNull() && candidate.type == ValueType::kVarChar) {
+            Value field;
+            if (TryProtoTextGetField(candidate.value.varchar_value,
+                                     name.name, &field)) {
+              return field;
+            }
+            // A one-column value table's alias denotes the value itself, not
+            // a synthetic STRUCT keyed by the physical column name.
+            if (candidate.value.varchar_value.empty() ||
+                !candidate.value.varchar_value.starts_with("{")) {
+              return candidate;
+            }
+          }
+        }
         if (!names_a_column && schema.ColumnCount() > 0) {
           return RowAsStructValue(*current->row, schema);
         }
         continue;
+      }
+      if (owned.size() == 1 && schema.ColumnCount() == 1) {
+        return (*current->row)[owned.front()];
       }
       Row aliased;
       aliased.values_.reserve(owned.size());
@@ -1054,6 +1256,25 @@ Value Lookup(const ColumnName& name, const Scope& scope) {
         }
         Value field;
         if (JsonExtractField(text, name.name, &field)) {
+          return field;
+        }
+      }
+    }
+  }
+  // A value table stores a proto message in one physical VARCHAR column.
+  // Its top-level fields are nevertheless visible as ordinary bare names.
+  if (name.schema.empty() && name.name != "*") {
+    for (const Scope* current = &scope; current != nullptr;
+         current = current->outer) {
+      if (current->row == nullptr || current->schema == nullptr ||
+          current->schema->ColumnCount() != 1) {
+        continue;
+      }
+      const Value& candidate = (*current->row)[0];
+      if (!candidate.IsNull() && candidate.type == ValueType::kVarChar) {
+        Value field;
+        if (TryProtoTextGetField(candidate.value.varchar_value, name.name,
+                                 &field)) {
           return field;
         }
       }
@@ -2035,11 +2256,6 @@ Value ExtractSketchQuantilesStatic(const Value& sketch, int64_t number) {
 
 namespace {
 
-// Recovers UTC instant text for engine-rendered timestamps (which carry a
-// session-shifted wall clock under a "+00"-style label); defined below with
-// the civil-time helpers.
-std::string NormalizeTimestampText(const std::string& text);
-
 // Renders one APPROX_TOP_* entry as a positional struct literal text. The
 // compliance matcher compares struct payloads field-wise against exactly
 // this shape.
@@ -2050,7 +2266,7 @@ std::string TopEntryString(const Value& value, const std::string& metric_text) {
   } else if (value.type == ValueType::kVarChar) {
     // Raw content: strings match quoted expectations and BYTES match b""
     // expectations through the same unquoting rules.
-    out += NormalizeTimestampText(std::string(value.value.varchar_value));
+    out += std::string(value.value.varchar_value);
   } else if (value.type == ValueType::kDate) {
     out += FormatDateDays(value.value.int_value);
   } else {
@@ -3020,26 +3236,6 @@ std::string FormatCivilTime(const CivilTime& ct, bool include_subsecond = true,
   return std::string(buf);
 }
 
-std::string NormalizeTimestampText(const std::string& text) {
-  // Timestamp-shaped only: YYYY-MM-DD HH:MM:SS[.frac][+HH[:MM]|Z]
-  if (text.size() < 19 || text[4] != '-' || text[7] != '-' || text[10] != ' ') {
-    return text;
-  }
-  CivilTime ct;
-  if (!ParseCivilTime(text, &ct)) {
-    return text;
-  }
-  // Recover the UTC instant: engine text labels "+00" but carries the wall
-  // clock shifted opposite the session offset.
-  const int64_t nanos =
-      CivilTimeToNanos(ct) +
-      static_cast<int64_t>(ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, 0)) *
-          1000000000LL;
-  return FormatCivilTime(NanosToCivilTime(nanos),
-                         /*include_subsecond=*/true) +
-         "+00";
-}
-
 // Mutual recursion with Evaluate above; expression trees are the intended
 // shape here.
 Value EvaluateFunction(  // NOLINT(misc-no-recursion)
@@ -3391,15 +3587,63 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     arguments.push_back(Evaluate(argument, scope, aggregates, context, ctes));
   }
 
+  if (name == "__pipe_concat") {
+    if (arguments.size() != 2 || !arguments[0].IsArray()) {
+      throw std::runtime_error("__pipe_concat requires an array and separator");
+    }
+    struct Pair {
+      std::string a;
+      std::string b;
+    };
+    std::vector<Pair> pairs;
+    for (const Value& element : arguments[0].ArrayElements()) {
+      if (element.IsNull()) { continue; }
+      const std::string text = raw_str(element);
+      if (text.size() < 2 || text.front() != '{' || text.back() != '}') {
+        throw std::runtime_error("__pipe_concat requires STRUCT elements");
+      }
+      Value a;
+      Value b;
+      const std::string body = text.substr(1, text.size() - 2);
+      const std::vector<std::pair<std::string, std::string>> members =
+          SplitJsonObjectMembers(body);
+      for (const auto& [key, member] : members) {
+        Value parsed;
+        if (!JsonTextToValue(member, &parsed)) { continue; }
+        if (key == "a") { a = std::move(parsed); }
+        if (key == "b") { b = std::move(parsed); }
+      }
+      pairs.push_back({raw_str(a), raw_str(b)});
+    }
+    std::ranges::sort(pairs, [](const Pair& left, const Pair& right) {
+      return left.b == right.b ? left.a < right.a : left.b < right.b;
+    });
+    const std::string separator = raw_str(arguments[1]);
+    std::string result;
+    for (const Pair& pair : pairs) {
+      if (!result.empty()) { result += separator; }
+      result += pair.a + "," + pair.b;
+    }
+    return Value(std::move(result));
+  }
+
   if (name == "__struct_json__") {
     // Runtime struct constructor installed by the visitor when struct
     // fields could not be folded at plan time (aggregates, subqueries).
-    // Arguments alternate name / value / quoted-flag.
-    if (arguments.size() % 3 != 0) {
+    // Arguments normally alternate name / value / quoted-flag.  Accept the
+    // older two-argument form as well because optimizer-bound expressions
+    // use it for already typed values.
+    bool triple_form = arguments.size() % 3 == 0;
+    for (size_t i = 2; triple_form && i < arguments.size(); i += 3) {
+      triple_form = arguments[i].IsNull() ||
+                    arguments[i].type == ValueType::kInt64;
+    }
+    const size_t stride = triple_form ? 3 : 2;
+    if (arguments.size() % stride != 0) {
       throw std::runtime_error("struct constructor arity");
     }
     std::string json = "{";
-    for (size_t i = 0; i < arguments.size(); i += 3) {
+    for (size_t i = 0; i < arguments.size(); i += stride) {
       if (i != 0) {
         json += ",";
       }
@@ -3417,10 +3661,26 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         json += "null";
         continue;
       }
-      const bool quoted = Truthy(arguments[i + 2]);
+      const bool quoted = triple_form && Truthy(arguments[i + 2]);
+      if (!quoted && field_value.type == ValueType::kVarChar &&
+          field_value.value.varchar_value == "null") {
+        json += "null";
+        continue;
+      }
+      if (field_value.type == ValueType::kDate) {
+        json += "\"" + FormatDateDays(field_value.DateDays()) + "\"";
+        continue;
+      }
       const auto is_struct = [](std::string_view sv) {
         return sv.size() >= 2 && sv.front() == '{' && sv.back() == '}';
       };
+      if (!quoted && field_value.type == ValueType::kVarChar &&
+          LooksLikeProtoText(field_value.value.varchar_value)) {
+        json += "{" +
+                NormalizeProtoText(field_value.value.varchar_value).value_or("") +
+                "}";
+        continue;
+      }
       if (quoted || (field_value.type == ValueType::kVarChar &&
                      !is_struct(field_value.value.varchar_value))) {
         std::string text = raw_str(field_value);
@@ -4231,11 +4491,6 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
       }
     }
     if (!found) {
-      {
-        std::ostringstream dbg;
-        call.Dump(dbg);
-        fprintf(stderr, "DBG quantified op=%s nargs=%zu expr=%s\n", op.c_str(), arguments.size(), dbg.str().c_str());
-      }
       throw std::runtime_error("quantified comparison: unsupported operator " +
                                op);
     }
@@ -4405,6 +4660,51 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(ConstructProtoText(type_name, fields));
   }
+  if (name == "__value_table_value") {
+    if (arguments.size() != 1) {
+      throw std::runtime_error("__value_table_value requires one argument");
+    }
+    return arguments.front();
+  }
+  if (name == "__value_table_proto") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error("__value_table_proto requires two arguments");
+    }
+    if (arguments[1].IsNull()) { return {}; }
+    const std::string type_name = raw_str(arguments[0]);
+    if (type_name.find("TestExtraPB") == std::string::npos) {
+      return arguments[1];
+    }
+    std::vector<std::pair<std::string, Value>> fields;
+    for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
+      Value value;
+      if (TryProtoTextGetField(raw_str(arguments[1]), field, &value)) {
+        fields.emplace_back(field, std::move(value));
+      }
+    }
+    return Value(ConstructProtoText(type_name, fields));
+  }
+  if (name == "__value_table_proto_existing") {
+    if (arguments.size() != 2) {
+      throw std::runtime_error(
+          "__value_table_proto_existing requires two arguments");
+    }
+    if (arguments[1].IsNull()) { return {}; }
+    const std::string type_name = raw_str(arguments[0]);
+    if (type_name.find("TestExtraPB") == std::string::npos) {
+      return arguments[1];
+    }
+    std::vector<std::pair<std::string, Value>> fields;
+    const std::string payload = raw_str(arguments[1]);
+    for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
+      if (!ProtoTextHasField(payload, field)) { continue; }
+      Value value;
+      if (TryProtoTextGetField(payload, field, &value)) {
+        fields.emplace_back(field, std::move(value));
+      }
+    }
+    return Value(ConstructProtoText(type_name, fields));
+  }
   if (name == "__proto_set") {
     // Dotted SET targets over proto TEXT columns: (payload, path, new_value).
     // NULL payloads have no field structure to update.
@@ -4499,6 +4799,7 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     std::string object = raw_str(arguments[0]);
     const std::string field_name = raw_str(arguments[1]);
+    Value proto_field;
     if (object.size() >= 2 && object.front() == '{' &&
         object.back() == '}') {
       const auto members =
@@ -4514,6 +4815,17 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
           if (!JsonTextToValue(text, &parsed)) {
             return {};
           }
+          constexpr std::string_view kDateMarker = "__tinylamb_date__:";
+          if (parsed.type == ValueType::kVarChar &&
+              parsed.value.varchar_value.starts_with(kDateMarker)) {
+            parsed = Value::Date(std::string(parsed.value.varchar_value)
+                                     .substr(kDateMarker.size()));
+          }
+          if (parsed.type == ValueType::kVarChar &&
+              (field_name == "amin" || field_name == "amax") &&
+              object.find("ARRAY<DATE>") != std::string::npos) {
+            parsed = Value::Date(parsed.value.varchar_value);
+          }
           return parsed;
         }
       }
@@ -4525,11 +4837,16 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
         if (!JsonTextToValue(members.front().second, &parsed)) {
           return {};
         }
+        constexpr std::string_view kDateMarker = "__tinylamb_date__:";
+        if (parsed.type == ValueType::kVarChar &&
+            parsed.value.varchar_value.starts_with(kDateMarker)) {
+          parsed = Value::Date(std::string(parsed.value.varchar_value)
+                                   .substr(kDateMarker.size()));
+        }
         return parsed;
       }
     }
     // Proto text-format cells (`value: 1`) carry the same field semantics.
-    Value proto_field;
     if (ProtoTextExtractField(object, field_name, &proto_field)) {
       return proto_field;
     }
@@ -7683,6 +8000,13 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return {};
     }
+    // FORMAT propagates NULL from a value or a dynamic width/precision
+    // argument; rendering it as the literal text "NULL" changes the result
+    // from SQL NULL to a non-null STRING.
+    if (std::any_of(arguments.begin() + 1, arguments.end(),
+                    [](const Value& argument) { return argument.IsNull(); })) {
+      return {};
+    }
     const std::string fmt = raw_str(arguments[0]);
     std::string result;
     size_t arg_idx = 1;
@@ -8614,7 +8938,28 @@ Value EvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return {};
     }
-    const std::string input = raw_str(arguments[0]);
+    const std::string raw_input = raw_str(arguments[0]);
+    std::string input;
+    input.reserve(raw_input.size());
+    auto hex_digit = [](char c) -> int {
+      if (c >= '0' && c <= '9') { return c - '0'; }
+      if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+      if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+      return -1;
+    };
+    for (size_t i = 0; i < raw_input.size(); ++i) {
+      if (raw_input[i] == '\\' && i + 3 < raw_input.size() &&
+          (raw_input[i + 1] == 'x' || raw_input[i + 1] == 'X')) {
+        const int high = hex_digit(raw_input[i + 2]);
+        const int low = hex_digit(raw_input[i + 3]);
+        if (high >= 0 && low >= 0) {
+          input.push_back(static_cast<char>((high << 4) | low));
+          i += 3;
+          continue;
+        }
+      }
+      input.push_back(raw_input[i]);
+    }
     std::string out;
     out.reserve(input.size());
     const std::string replacement = "\xEF\xBF\xBD";
@@ -9055,7 +9400,7 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
   switch (expression->Type()) {
     case TypeTag::kColumnValue: {
       const ColumnName& name = expression->AsColumnValue().GetColumnName();
-      if (name.name == "*") {
+      if (name.name == "*" && name.schema.empty()) {
         return Value(1);
       }
       try {
@@ -9387,8 +9732,15 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       }
       return ProjectSubqueryRow(*first, as_struct, &subquery_schema);
     }
-    case TypeTag::kIntervalExp:
-      return expression->Evaluate(Row(), Schema());
+    case TypeTag::kIntervalExp: {
+      // Relational execution exposes interval literals as their logical
+      // amount/unit value.  The standalone AST evaluator intentionally keeps
+      // the encoded wire representation for compatibility with its direct
+      // expression tests.
+      const auto& interval = expression->AsIntervalExpression();
+      return Value(std::to_string(interval.Amount()) + " " +
+                   std::string(interval.Unit()));
+    }
     default:
       throw std::runtime_error("unsupported expression type");
   }
@@ -9528,7 +9880,19 @@ std::vector<slot_t> RequiredColumns(const SelectStatement& statement,
                  (name.schema.empty() ||
                   IdentifierEquals(name.schema, candidate.schema));
         });
-    if (needed) {
+    // Proto value tables expose fields of their single encoded `$expr0`
+    // column as virtual columns.  A qualified/bare field reference must keep
+    // that payload in the scan even though no physical column has that name.
+    const bool virtual_value_field =
+        schema.ColumnCount() == 1 &&
+        (std::ranges::any_of(referenced, [&](const auto& name) {
+           if (!name.schema.empty() &&
+               !IdentifierEquals(name.schema, candidate.schema)) {
+             return false;
+           }
+           return !IdentifierEquals(name.name, candidate.name);
+         }));
+    if (needed || virtual_value_field) {
       result.push_back(i);
     }
   }

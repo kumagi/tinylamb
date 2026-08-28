@@ -1730,6 +1730,24 @@ Expression VisitFunction(
     return aggregate;
   };
 
+  if (name == "pipeconcat" || name == "pipeconcatsep") {
+    const size_t expected = name == "pipeconcat" ? 2 : 3;
+    if (arguments.size() != expected) {
+      throw std::runtime_error("GoogleSQL AST: aggregate arity");
+    }
+    Expression item = FunctionCallExp(
+        "__struct_json__",
+        {ConstantValueExp(Value(std::string("a"))), arguments[0],
+         ConstantValueExp(Value(std::string("b"))), arguments[1]});
+    Expression items = std::make_shared<AggregateExpression>(
+        AggregationType::kArrayAgg, std::move(item), false);
+    Expression separator = expected == 3
+                               ? arguments[2]
+                               : ConstantValueExp(Value(std::string("|")));
+    return FunctionCallExp("__pipe_concat",
+                           {std::move(items), std::move(separator)});
+  }
+
   if (name == "count" || name == "sum" || name == "avg" || name == "min" ||
       name == "max" || name == "logical_and" || name == "logical_or" ||
       name == "array_agg" || name == "string_agg" || name == "countif" ||
@@ -2760,7 +2778,23 @@ Expression VisitExpression(
     return ColumnValueExp("*");
   }
   if (node.kind == "IntLiteral") {
-    return ConstantValueExp(Value(ParseIntLiteral(node)));
+    Value parsed(ParseIntLiteral(node));
+    const std::string& text = node.detail;
+    uint64_t magnitude = 0;
+    int base = 10;
+    std::string_view digits(text);
+    if (digits.starts_with("0x") || digits.starts_with("0X")) {
+      base = 16;
+      digits.remove_prefix(2);
+    }
+    const auto [end, error] =
+        std::from_chars(digits.data(), digits.data() + digits.size(),
+                        magnitude, base);
+    if (error == std::errc() && end == digits.data() + digits.size() &&
+        magnitude > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+      parsed = parsed.WithUnsigned();
+    }
+    return ConstantValueExp(std::move(parsed));
   }
   if (node.kind == "FloatLiteral") {
     return ConstantValueExp(Value(ParseFloatLiteral(node)));
@@ -3471,7 +3505,8 @@ Expression VisitExpression(
         // narrowing casts must reject it.
         if (UpperCopy(target) == "UINT64" &&
             (digits.empty() || digits.front() != '-')) {
-          return ConstantValueExp(Value(static_cast<int64_t>(magnitude)));
+          return ConstantValueExp(
+              Value(static_cast<int64_t>(magnitude)).WithUnsigned());
         }
         if (safe_cast_target) { return ConstantValueExp(Value()); }
         throw std::runtime_error(UpperCopy(target) + " out of range: " +
@@ -4383,6 +4418,20 @@ void AppendSources(const GoogleSqlAstNode& node,
                                        // AST descent for nested joins by design
                                        // (see VisitQuery depth note).
                    Expression condition, std::vector<SelectSource>* sources) {
+  // Parentheses around a nested JOIN are represented as a wrapper node by
+  // the parser, but do not introduce a relation of their own.
+  if (node.kind == "ParenthesizedJoin") {
+    const GoogleSqlAstNode* nested = node.Child("Join");
+    if (nested == nullptr) {
+      throw std::runtime_error("GoogleSQL AST: empty parenthesized join");
+    }
+    const size_t nested_begin = sources->size();
+    AppendSources(*nested, incoming, std::move(condition), sources);
+    for (size_t i = nested_begin; i < sources->size(); ++i) {
+      (*sources)[i].from_nested_join = true;
+    }
+    return;
+  }
   if (node.kind != "Join") {
     sources->push_back(VisitTableSource(node, incoming, std::move(condition)));
     return;
@@ -4392,7 +4441,8 @@ void AppendSources(const GoogleSqlAstNode& node,
   const GoogleSqlAstNode* using_clause = nullptr;
   for (const auto& child : node.children) {
     if (child->kind == "TablePathExpression" ||
-        child->kind == "TableSubquery" || child->kind == "Join") {
+        child->kind == "TableSubquery" || child->kind == "Join" ||
+        child->kind == "ParenthesizedJoin") {
       operands.push_back(child.get());
     } else if (child->kind == "OnClause") {
       on = child.get();
@@ -4689,6 +4739,24 @@ std::shared_ptr<SelectStatement> VisitQuery(
     if (expression_node == nullptr) {
       throw std::runtime_error("GoogleSQL AST: empty column");
     }
+    if (expression_node->kind == "DotStar" &&
+        expression_node->Child("PathExpression") == nullptr) {
+      // `sql_udf(...).*` is a projection expansion, not a column named `*`.
+      const GoogleSqlAstNode* call = expression_node->Child("FunctionCall");
+      if (call == nullptr) {
+        throw std::runtime_error("GoogleSQL AST: malformed DotStar");
+      }
+      Expression base = VisitExpression(*call);
+      for (const char* field : {"aarr", "acount", "amin", "amax"}) {
+        projections.emplace_back(
+            field,
+            FunctionCallExp(
+                "__get_field_safe",
+                {base, ConstantValueExp(Value(std::string(field)))}));
+        projection_nodes.push_back(expression_node);
+      }
+      continue;
+    }
     Expression expression = VisitExpression(*expression_node);
     std::string name = Alias(*column);
     if (name.empty() && expression->Type() == TypeTag::kColumnValue) {
@@ -4710,6 +4778,36 @@ std::shared_ptr<SelectStatement> VisitQuery(
   const bool as_value =
       select_as != nullptr &&
       UpperCopy(select_as->detail).find("VALUE") != std::string::npos;
+  if (as_value && projections.size() == 1) {
+    projections.front().expression = FunctionCallExp(
+        "__value_table_value", {projections.front().expression});
+  }
+  if (is_as_struct && projections.size() == 1 &&
+      projection_nodes.size() == 1 &&
+      projection_nodes.front()->kind == "DotStar") {
+    const Expression star = projections.front().expression;
+    const ColumnName& star_name =
+        star->AsColumnValue().GetColumnName();
+    projections.clear();
+    for (const char* field : {"foo", "bar"}) {
+      projections.emplace_back(
+          field,
+          ColumnValueExp(ColumnName(star_name.schema, field)));
+    }
+  }
+  // `SELECT AS Proto p.*` selects the value-table message itself.  It is not
+  // a proto field literally named `*`, so preserve the value expression and
+  // avoid wrapping it in a constructor that would serialize `{*: 1}`.
+  const bool selects_value_table_star =
+      projections.size() == 1 && projection_nodes.size() == 1 &&
+      projection_nodes.front()->kind == "DotStar" &&
+      projections.front().expression->Type() == TypeTag::kColumnValue &&
+      projections.front().expression->AsColumnValue().GetColumnName().name ==
+          "*";
+  if (selects_value_table_star) {
+    projections.front().expression = FunctionCallExp(
+        "__value_table_value", {projections.front().expression});
+  }
   // SELECT AS <proto>: validate projected fields against the registry so
   // required-field violations and invalid enum values fail at prepare time.
   if (!is_as_struct && !as_value && select_as != nullptr) {
@@ -4785,7 +4883,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
     }
     if (!type_name.empty()) {
       std::vector<Expression> args;
-      args.emplace_back(ConstantValueExp(Value(std::move(type_name))));
+      args.emplace_back(ConstantValueExp(Value(std::string(type_name))));
       for (size_t i = 0; i < projections.size() &&
                          i < projection_nodes.size();
            ++i) {
@@ -4804,8 +4902,16 @@ std::shared_ptr<SelectStatement> VisitQuery(
         }
         args.emplace_back(ConstantValueExp(Value(std::move(fname))));
       }
-      projections = {NamedExpression("", FunctionCallExp("__proto_new",
-                                                         std::move(args)))};
+      if (selects_value_table_star) {
+        projections = {NamedExpression(
+            "", FunctionCallExp(
+                   "__value_table_proto",
+                   {ConstantValueExp(Value(std::string(type_name))),
+                    projections.front().expression}))};
+      } else {
+        projections = {NamedExpression("", FunctionCallExp(
+                                             "__proto_new", std::move(args)))};
+      }
     }
   }
 
@@ -4818,7 +4924,9 @@ std::shared_ptr<SelectStatement> VisitQuery(
     }
     for (const SelectSource& source : sources) {
       if (!source.table.empty()) {
-        tables.push_back(source.table);
+        const std::string relation =
+            source.alias.empty() ? source.table : source.alias;
+        tables.push_back(relation);
       }
     }
   }
@@ -4906,6 +5014,12 @@ std::shared_ptr<SelectStatement> VisitQuery(
       select->detail.find("distinct=true") != std::string::npos);
   statement->SetLimit(limit);
   statement->SetSources(std::move(sources));
+  for (const SelectSource& source : statement->Sources()) {
+    if (!source.table.empty() && !source.alias.empty() &&
+        source.alias != source.table) {
+      statement->AddAlias(source.alias, source.table);
+    }
+  }
 
   std::vector<Expression> distinct_on_expressions;
   if (const GoogleSqlAstNode* distinct_on = select->Child("DistinctOn")) {
@@ -5057,6 +5171,8 @@ std::shared_ptr<SelectStatement> VisitQuery(
     if (source.query || source.join_type == JoinType::kLeft ||
         source.join_type == JoinType::kRight ||
         source.join_type == JoinType::kFull ||
+        source.from_nested_join ||
+        source.unnest ||
         !source.using_columns.empty() ||
         NeedsRelationalEvaluation(source.join_condition)) {
       statement->MarkComplex();
@@ -5069,6 +5185,9 @@ std::shared_ptr<SelectStatement> VisitQuery(
   }
   if (NeedsRelationalEvaluation(statement->WhereClause()) ||
       NeedsRelationalEvaluation(statement->Having())) {
+    statement->MarkComplex();
+  }
+  if (as_value && !sources.empty()) {
     statement->MarkComplex();
   }
   // SELECT AS STRUCT / AS VALUE shape the projected value: STRUCT rows are

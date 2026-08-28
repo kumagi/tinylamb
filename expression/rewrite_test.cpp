@@ -633,6 +633,106 @@ TEST(ExpressionRewriteTest, ArithmeticIdentitiesAndDoubleNegation) {
   EXPECT_EQ(rewrite(kept)->Type(), TypeTag::kBinaryExp);
 }
 
+TEST(ExpressionRewriteTest, CanonicalizesSimpleArithmeticShapes) {
+  const ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  const Expression integer =
+      FunctionCallExp("extract_year", {ColumnValueExp("event_date")});
+
+  Expression add_negative = rewriter.Rewrite(BinaryExpressionExp(
+      ColumnValueExp("x"), BinaryOperation::kAdd,
+      ConstantValueExp(Value(-7))));
+  ASSERT_EQ(add_negative->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(add_negative->AsBinaryExpression().Op(),
+            BinaryOperation::kSubtract);
+  EXPECT_EQ(add_negative->AsBinaryExpression()
+                .Right()
+                ->AsConstantValue()
+                .GetValue(),
+            Value(7));
+
+  Expression subtract_negative = rewriter.Rewrite(BinaryExpressionExp(
+      ColumnValueExp("x"), BinaryOperation::kSubtract,
+      ConstantValueExp(Value(-9))));
+  ASSERT_EQ(subtract_negative->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(subtract_negative->AsBinaryExpression().Op(),
+            BinaryOperation::kAdd);
+  EXPECT_EQ(subtract_negative->AsBinaryExpression()
+                .Right()
+                ->AsConstantValue()
+                .GetValue(),
+            Value(9));
+
+  Expression negative_one = rewriter.Rewrite(BinaryExpressionExp(
+      integer, BinaryOperation::kMultiply, ConstantValueExp(Value(-1))));
+  ASSERT_EQ(negative_one->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(negative_one->AsUnaryExpression().Op(), UnaryOperation::kMinus);
+
+  Expression repeated = rewriter.Rewrite(BinaryExpressionExp(
+      integer, BinaryOperation::kAdd, integer));
+  ASSERT_EQ(repeated->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(repeated->AsBinaryExpression().Op(), BinaryOperation::kMultiply);
+  EXPECT_EQ(repeated->AsBinaryExpression()
+                .Right()
+                ->AsConstantValue()
+                .GetValue(),
+            Value(2));
+}
+
+TEST(ExpressionRewriteTest, DoesNotCombineVolatileOrUntypedRepeatedAddends) {
+  const ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  Expression volatile_add = BinaryExpressionExp(
+      FunctionCallExp("rand", {}), BinaryOperation::kAdd,
+      FunctionCallExp("rand", {}));
+  Expression rewritten = rewriter.Rewrite(volatile_add);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kAdd);
+
+  Expression string_add = BinaryExpressionExp(
+      ColumnValueExp("unknown"), BinaryOperation::kAdd,
+      ColumnValueExp("unknown"));
+  rewritten = rewriter.Rewrite(string_add);
+  ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kAdd);
+}
+
+TEST(ExpressionRewriteTest, TypedIntegerMultiplyZeroPreservesNullsAndType) {
+  const Schema schema(
+      "input", {Column("i", ValueType::kInt64),
+                Column("d", ValueType::kDouble)});
+  const Expression integer_multiply = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kMultiply,
+      ConstantValueExp(Value(0)));
+
+  const Expression rewritten =
+      RewriteTypedArithmetic(integer_multiply, schema);
+  EXPECT_EQ(rewritten->Type(), TypeTag::kCaseExp);
+  EXPECT_EQ(rewritten->ResultType(schema).GetType(), TypeTag::kBigInt);
+  EXPECT_EQ(rewritten->Evaluate(Row({Value(9), Value(1.5)}), schema),
+            Value(0));
+  EXPECT_TRUE(rewritten->Evaluate(Row({Value(), Value(1.5)}), schema).IsNull());
+  EXPECT_EQ(rewritten->ToString().find("* 0"), std::string::npos);
+
+  // IEEE NaN and infinity make the corresponding DOUBLE rewrite unsafe.
+  const Expression double_multiply = BinaryExpressionExp(
+      ColumnValueExp("d"), BinaryOperation::kMultiply,
+      ConstantValueExp(Value(0)));
+  EXPECT_EQ(RewriteTypedArithmetic(double_multiply, schema)->Type(),
+            TypeTag::kBinaryExp);
+}
+
+TEST(ExpressionRewriteTest, SchemaFreeSelfComparisonKeepsThreeValuedResult) {
+  const Expression comparison = BinaryExpressionExp(
+      ColumnValueExp("x"), BinaryOperation::kLessThan, ColumnValueExp("x"));
+  const Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(comparison);
+
+  // x < x is FALSE for a non-NULL x and UNKNOWN for NULL. A scalar rewrite
+  // to either one constant would therefore be incorrect outside WHERE.
+  EXPECT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(),
+            BinaryOperation::kLessThan);
+}
+
 TEST(ExpressionRewriteTest, ReassociateConstantArithmetic) {
   auto rewrite = [](const Expression& expression) {
     return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
@@ -809,16 +909,18 @@ TEST(ExpressionRewriteTest, MixedReassociationOfConstants) {
     return FunctionCallExp("extract_year", {ColumnValueExp("event_date")});
   };
 
-  // (x - 5) + 3 -> x + (-2)
+  // (x - 5) + 3 -> x - 2 (negative constants are canonicalized).
   Expression subtract_then_add = BinaryExpressionExp(
       BinaryExpressionExp(int64_inner(), BinaryOperation::kSubtract,
                           ConstantValueExp(Value(5))),
       BinaryOperation::kAdd, ConstantValueExp(Value(3)));
   Expression rewritten = rewrite(subtract_then_add);
   ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten->AsBinaryExpression().Op(),
+            BinaryOperation::kSubtract);
   EXPECT_EQ(
       rewritten->AsBinaryExpression().Right()->AsConstantValue().GetValue(),
-      Value(-2));
+      Value(2));
 
   // (x + 5) - 3 -> x + 2
   Expression add_then_subtract = BinaryExpressionExp(

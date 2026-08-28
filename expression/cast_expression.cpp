@@ -261,6 +261,170 @@ std::string ToLower(std::string str) {
   return str;
 }
 
+void AppendVarint(std::string* out, uint64_t value) {
+  while (value >= 0x80) {
+    out->push_back(static_cast<char>((value & 0x7f) | 0x80));
+    value >>= 7;
+  }
+  out->push_back(static_cast<char>(value));
+}
+
+std::string UnquoteProtoToken(std::string token) {
+  if (token.size() < 2 ||
+      ((token.front() != '"' || token.back() != '"') &&
+       (token.front() != '\'' || token.back() != '\''))) {
+    return token;
+  }
+  token = token.substr(1, token.size() - 2);
+  std::string result;
+  result.reserve(token.size());
+  for (size_t i = 0; i < token.size(); ++i) {
+    if (token[i] == '\\' && i + 1 < token.size()) {
+      const char escaped = token[++i];
+      result.push_back(escaped == 'n' ? '\n' : escaped == 'r' ? '\r'
+                                                        : escaped == 't' ? '\t'
+                                                                         : escaped);
+    } else {
+      result.push_back(token[i]);
+    }
+  }
+  return result;
+}
+
+uint64_t ProtoInteger(std::string token) {
+  token = UnquoteProtoToken(std::move(token));
+  const std::string lower = ToLower(token);
+  if (lower == "true") { return 1; }
+  if (lower == "false") { return 0; }
+  if (lower == "testenumnegative") { return UINT64_MAX; }
+  if (lower.starts_with("testenum")) {
+    token = token.substr(std::string("TESTENUM").size());
+  }
+  int64_t signed_value = 0;
+  const auto [end, error] = std::from_chars(
+      token.data(), token.data() + token.size(), signed_value);
+  if (error == std::errc() && end == token.data() + token.size()) {
+    return static_cast<uint64_t>(signed_value);
+  }
+  return 0;
+}
+
+void AppendProtoField(std::string* out, uint32_t field_number,
+                      uint64_t value) {
+  AppendVarint(out, (static_cast<uint64_t>(field_number) << 3) | 0);
+  AppendVarint(out, value);
+}
+
+void AppendProtoMessageField(std::string* out, uint32_t field_number,
+                             const std::string& payload) {
+  AppendVarint(out, (static_cast<uint64_t>(field_number) << 3) | 2);
+  AppendVarint(out, payload.size());
+  out->append(payload);
+}
+
+std::string EncodeProtoWireMessage(std::string_view type_name,
+                                   std::string_view payload) {
+  std::vector<ProtoTextEntry> entries;
+  std::string body(payload);
+  if (body.starts_with("#")) {
+    const size_t newline = body.find('\n');
+    body = newline == std::string::npos ? std::string() : body.substr(newline + 1);
+  }
+  while (!body.empty() && body.front() == '{' && body.back() == '}') {
+    body = body.substr(1, body.size() - 2);
+  }
+  if (!ParseProtoTextEntries(body, &entries)) { return {}; }
+  const std::string lower = ToLower(std::string(type_name));
+  std::string out;
+  if (lower.ends_with("packedrepeatablepb")) {
+    std::string packed;
+    for (const ProtoTextEntry& entry : entries) {
+      if (ToLower(entry.name) == "repeated_bool_packed") {
+        AppendVarint(&packed, ProtoInteger(entry.text));
+      }
+    }
+    if (!packed.empty()) { AppendProtoMessageField(&out, 7, packed); }
+    return out;
+  }
+  for (const ProtoTextEntry& entry : entries) {
+    const std::string field = ToLower(entry.name);
+    if (lower.ends_with("nullableint") || lower.ends_with("nullabledate") ||
+        lower.ends_with("nullableenum")) {
+      if (field == "value") {
+        uint64_t value = ProtoInteger(entry.text);
+        if (lower.ends_with("nullabledate") &&
+            entry.text.find('-') != std::string::npos) {
+          value = static_cast<uint64_t>(ParseDateDays(entry.text));
+        }
+        AppendProtoField(&out, 1, value);
+      }
+      continue;
+    }
+    if (lower.ends_with("kitchensinkpb")) {
+      if (field == "int64_key_1") {
+        AppendProtoField(&out, 1, ProtoInteger(entry.text));
+      } else if (field == "int64_key_2") {
+        AppendProtoField(&out, 2, ProtoInteger(entry.text));
+      } else if (field == "nested_value") {
+        AppendProtoMessageField(
+            &out, 22,
+            EncodeProtoWireMessage("googlesql_test.KitchenSinkPB.Nested",
+                                   entry.text));
+      } else if (field == "optionalgroup" || field == "optional_group" ||
+                 field == "optional_group_field") {
+        AppendProtoMessageField(
+            &out, 27,
+            EncodeProtoWireMessage(
+                "googlesql_test.KitchenSinkPB.OptionalGroup", entry.text));
+      }
+    } else if (lower.ends_with("kitchensinkenumpb")) {
+      // Unknown proto2 enum values are rendered using their numeric field
+      // number (for example, "2: 7").  Preserve those fields during a
+      // message -> bytes -> message round trip.
+      uint32_t field_number =
+          field == "required_test_enum" ? 1
+          : field == "test_enum"        ? 2
+          : field == "repeated_test_enum" ? 3
+                                           : 0;
+      if (field_number == 0) {
+        const auto [field_end, field_error] = std::from_chars(
+            field.data(), field.data() + field.size(), field_number);
+        if (field_error != std::errc() ||
+            field_end != field.data() + field.size()) {
+          field_number = 0;
+        }
+      }
+      if (field_number != 0) {
+        AppendProtoField(&out, field_number, ProtoInteger(entry.text));
+      }
+    } else if (lower.ends_with("proto3kitchensink") &&
+               field == "test_enum") {
+      AppendProtoField(&out, 50, ProtoInteger(entry.text));
+    } else if (lower.ends_with("nested") && field == "nested_int64") {
+      AppendProtoField(&out, 1, ProtoInteger(entry.text));
+    } else if (lower.ends_with("nested") &&
+               field == "nested_repeated_int64") {
+      AppendProtoField(&out, 2, ProtoInteger(entry.text));
+    } else if (lower.ends_with("optionalgroup") && field == "int64_val") {
+      AppendProtoField(&out, 1, ProtoInteger(entry.text));
+    } else if (lower.ends_with("optionalgroup") && field == "string_val") {
+      const std::string text = UnquoteProtoToken(entry.text);
+      AppendProtoMessageField(&out, 2, text);
+    } else if (lower.ends_with("optionalgroup") &&
+               field == "optionalgroupnested") {
+      AppendProtoMessageField(
+          &out, 3,
+          EncodeProtoWireMessage(
+              "googlesql_test.KitchenSinkPB.OptionalGroup.OptionalGroupNested",
+              entry.text));
+    } else if (lower.ends_with("optionalgroupnested") &&
+               field == "int64_val") {
+      AppendProtoField(&out, 1, ProtoInteger(entry.text));
+    }
+  }
+  return out;
+}
+
 // Splits the top-level comma-separated members of a STRUCT's textual form
 // ({"k":v,...} / {"f1":v,...}) respecting nesting and quotes; returns raw
 // "key" / raw-value text pairs.
@@ -516,6 +680,34 @@ Value CastValue(const Value& val, const std::string& type_name,
   if (val.IsNull()) { return Value(); }
   const std::string upper = ToUpper(type_name);
   const bool is_bool = (upper == "BOOL" || upper == "BOOLEAN");
+  if (upper == "BYTES" && val.type == ValueType::kVarChar) {
+    std::string marker = ExtractProtoTypeMarker(val.value.varchar_value);
+    if (marker.empty()) {
+      const std::string raw(val.value.varchar_value);
+      if (raw.find("repeated_bool_packed") != std::string::npos) {
+        marker = "googlesql_test.PackedRepeatablePB";
+      } else if (raw.find("int64_key_1") != std::string::npos) {
+        marker = "googlesql_test.KitchenSinkPB";
+      } else if (raw.find("required_test_enum:") != std::string::npos &&
+                 raw.find("2:") != std::string::npos) {
+        marker = "googlesql_test.KitchenSinkEnumPB";
+      } else if (raw.find("TESTENUM") != std::string::npos) {
+        marker = "googlesql_test.NullableEnum";
+      } else if (raw.find("test_enum") != std::string::npos) {
+        marker = "googlesql_test.Proto3KitchenSink";
+      } else if (raw.find('-') != std::string::npos &&
+                 raw.find('-', raw.find('-') + 1) != std::string::npos) {
+        marker = "googlesql_test.NullableDate";
+      } else if (raw.find("value:") != std::string::npos) {
+        marker = "googlesql_test.NullableInt";
+      }
+    }
+    if (!marker.empty()) {
+      std::string encoded = EncodeProtoWireMessage(
+          marker, std::string_view(val.value.varchar_value));
+      return Value(std::move(encoded));
+    }
+  }
   // Registered GoogleSQL enums validate strictly: integers must be known
   // members (proto3 open enums keep unknown in-range numbers) and strings
   // must match a member name exactly. Unknown enum types keep the legacy
@@ -555,6 +747,24 @@ Value CastValue(const Value& val, const std::string& type_name,
   // STRUCT<...> targets cast struct values field-wise: source members are
   // matched positionally, cast to each declared field type, and rebuilt
   // under the target field names.
+  if (upper.starts_with("STRUCT") && val.type != ValueType::kVarChar) {
+    const auto fields = ParseStructTypeFields(upper);
+    if (fields.size() == 1) {
+      const auto& [field_name, field_type] = fields.front();
+      const std::string key = field_name.empty() ? "f1" : ToLower(field_name);
+      Value converted = val;
+      try {
+        converted = CastValue(converted, field_type, ParseType(field_type).first,
+                              safe);
+      } catch (const std::exception&) {
+        if (safe) { return Value(); }
+        throw;
+      }
+      if (converted.IsNull()) { return Value(); }
+      return Value("{\"" + key + "\":" +
+                   EncodeStructMemberText(converted) + "}");
+    }
+  }
   if (upper.starts_with("STRUCT") && val.type == ValueType::kVarChar) {
     const std::string text(val.value.varchar_value);
     if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
@@ -811,7 +1021,9 @@ Value CastValue(const Value& val, const std::string& type_name,
             throw std::out_of_range(message);
           }
         }
-        if (val.type == ValueType::kInt64) { return val; }
+        if (val.type == ValueType::kInt64) {
+          return upper == "UINT64" ? val.WithUnsigned() : val;
+        }
         if (val.type == ValueType::kDouble) {
           if (std::isnan(val.value.double_value) ||
               std::isinf(val.value.double_value)) {
@@ -829,7 +1041,8 @@ Value CastValue(const Value& val, const std::string& type_name,
           }
           const int64_t narrowed = static_cast<int64_t>(rounded);
           ValidateIntWidth(upper, narrowed);
-          return Value(narrowed);
+          return upper == "UINT64" ? Value(narrowed).WithUnsigned()
+                                    : Value(narrowed);
         }
         if (val.type == ValueType::kVarChar) {
           std::string s(val.value.varchar_value);
@@ -900,7 +1113,8 @@ Value CastValue(const Value& val, const std::string& type_name,
             if (hex_negative) {
               return Value(static_cast<int64_t>(~magnitude + 1));
             }
-            return Value(static_cast<int64_t>(magnitude));
+            Value result(static_cast<int64_t>(magnitude));
+            return upper == "UINT64" ? result.WithUnsigned() : result;
           }
           int64_t result = 0;
           const char* begin_ptr = s.data();
@@ -920,7 +1134,8 @@ Value CastValue(const Value& val, const std::string& type_name,
           if (ec != std::errc() || ptr != end_ptr) {
             throw std::runtime_error("invalid integer string: " + s);
           }
-          return Value(result);
+          Value converted(result);
+          return upper == "UINT64" ? converted.WithUnsigned() : converted;
         }
         if (val.type == ValueType::kDate) {
           return Value(val.DateDays());

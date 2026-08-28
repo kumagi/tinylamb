@@ -1,0 +1,312 @@
+# Join ordering, join algorithm, predicate propagation, and outer-join
+# simplification expectations.
+
+[prepare_database]
+CREATE TABLE opt_customers AS
+SELECT 1 AS customer_id, 'Alice' AS customer_name, 10 AS region_id, true AS active
+UNION ALL SELECT 2, 'Bob', 10, false
+UNION ALL SELECT 3, 'Carol', 20, true
+UNION ALL SELECT 4, 'Dan', 30, true;
+CREATE TABLE opt_orders AS
+SELECT 101 AS order_id, 1 AS customer_id, 50 AS amount, 'paid' AS status
+UNION ALL SELECT 102, 1, 70, 'pending'
+UNION ALL SELECT 103, 2, 40, 'paid'
+UNION ALL SELECT 104, 3, 90, 'paid'
+UNION ALL SELECT 105, 3, 20, 'canceled'
+UNION ALL SELECT 106, 99, 10, 'orphan';
+CREATE TABLE opt_regions AS
+SELECT 10 AS region_id, 'east' AS region_name
+UNION ALL SELECT 20, 'west'
+UNION ALL SELECT 30, 'north';
+CREATE TABLE opt_lineitems AS
+SELECT 1001 AS line_id, 101 AS order_id, 2 AS qty
+UNION ALL SELECT 1002, 101, 1
+UNION ALL SELECT 1003, 102, 4
+UNION ALL SELECT 1004, 104, 3
+UNION ALL SELECT 1005, 105, 5;
+ANALYZE opt_customers;
+ANALYZE opt_orders;
+ANALYZE opt_regions;
+ANALYZE opt_lineitems;
+--
+ARRAY<STRUCT<x INT64>>[]
+==
+
+[mode=explain]
+[plan_contains=HashJoin]
+[plan_not_contains=NestedLoopJoin]
+[name=equi_join_uses_hash_join]
+SELECT o.order_id, c.customer_name
+FROM opt_orders o JOIN opt_customers c ON o.customer_id = c.customer_id
+ORDER BY o.order_id
+--
+ARRAY<STRUCT<order_id INT64, customer_name STRING>>[
+  {101, "Alice"}, {102, "Alice"}, {103, "Bob"}, {104, "Carol"}, {105, "Carol"}
+]
+==
+
+[mode=explain]
+[plan_contains=IndexJoin opt_customers]
+[plan_not_contains=HashJoin build~4]
+[name=small_outer_uses_index_join]
+SELECT o.order_id, c.customer_name
+FROM opt_orders o JOIN opt_customers c ON c.customer_id = o.customer_id
+WHERE o.order_id IN (101, 104)
+ORDER BY o.order_id
+--
+ARRAY<STRUCT<order_id INT64, customer_name STRING>>[
+  {101, "Alice"}, {104, "Carol"}
+]
+==
+
+[mode=explain]
+[plan_contains=JoinOrder=greedy_filtered_cardinality]
+[plan_contains=opt_regions]
+[plan_not_contains=CrossJoin]
+[name=three_way_join_starts_with_selective_relation]
+SELECT o.order_id, r.region_name
+FROM opt_orders o
+JOIN opt_customers c ON o.customer_id = c.customer_id
+JOIN opt_regions r ON c.region_id = r.region_id
+WHERE r.region_name = 'west'
+ORDER BY o.order_id
+--
+ARRAY<STRUCT<order_id INT64, region_name STRING>>[
+  {104, "west"}, {105, "west"}
+]
+==
+
+[mode=explain]
+[plan_contains=HashJoin]
+[plan_not_contains=NestedLoopJoin]
+[plan_contains=residual: o.amount > l.qty]
+[name=equi_join_with_residual_still_hashes]
+SELECT o.order_id, l.line_id
+FROM opt_orders o JOIN opt_lineitems l
+ON o.order_id = l.order_id AND o.amount > l.qty
+ORDER BY o.order_id, l.line_id
+--
+ARRAY<STRUCT<order_id INT64, line_id INT64>>[
+  {101, 1001}, {101, 1002}, {102, 1003}, {104, 1004}, {105, 1005}
+]
+==
+
+[mode=explain]
+[plan_contains=NestedLoopJoin]
+[plan_not_contains=HashJoin]
+[name=pure_inequality_join_uses_nested_loop]
+SELECT c.customer_id, r.region_id
+FROM opt_customers c JOIN opt_regions r ON c.region_id < r.region_id
+ORDER BY c.customer_id, r.region_id
+--
+ARRAY<STRUCT<customer_id INT64, region_id INT64>>[
+  {1, 20}, {1, 30}, {2, 20}, {2, 30}, {3, 30}
+]
+==
+
+[mode=explain]
+[plan_contains=HashJoin type=inner]
+[plan_not_contains=type=left]
+[name=null_rejecting_where_reduces_left_join_to_inner]
+SELECT c.customer_id, o.order_id
+FROM opt_customers c LEFT JOIN opt_orders o
+ON c.customer_id = o.customer_id
+WHERE o.amount >= 60
+ORDER BY c.customer_id, o.order_id
+--
+ARRAY<STRUCT<customer_id INT64, order_id INT64>>[
+  {1, 102}, {3, 104}
+]
+==
+
+[mode=explain]
+[plan_contains=type=left]
+[plan_not_contains=type=inner]
+[name=null_accepting_where_preserves_left_join]
+SELECT c.customer_id, o.order_id
+FROM opt_customers c LEFT JOIN opt_orders o
+ON c.customer_id = o.customer_id
+WHERE o.amount IS NULL OR o.amount >= 90
+ORDER BY c.customer_id, o.order_id
+--
+ARRAY<STRUCT<customer_id INT64, order_id INT64>>[
+  {3, 104}, {4, NULL}
+]
+==
+
+[mode=explain]
+[plan_not_contains=opt_regions]
+[name=unused_many_to_one_join_is_eliminated]
+SELECT c.customer_id
+FROM opt_customers c JOIN opt_regions r ON c.region_id = r.region_id
+ORDER BY c.customer_id
+--
+ARRAY<STRUCT<customer_id INT64>>[{1}, {2}, {3}, {4}]
+==
+
+[mode=explain]
+[plan_not_contains=Join]
+[plan_not_contains=opt_orders]
+[name=unused_left_join_is_eliminated_when_unique]
+SELECT c.customer_id
+FROM opt_customers c LEFT JOIN opt_orders o
+ON c.customer_id = o.order_id
+ORDER BY c.customer_id
+--
+ARRAY<STRUCT<customer_id INT64>>[{1}, {2}, {3}, {4}]
+==
+
+[mode=explain]
+[plan_contains=SemiHashJoin]
+[plan_not_contains=Subquery]
+[name=exists_decorrelates_to_semi_join]
+SELECT c.customer_id
+FROM opt_customers c
+WHERE EXISTS (SELECT 1 FROM opt_orders o
+              WHERE o.customer_id = c.customer_id AND o.status = 'paid')
+ORDER BY c.customer_id
+--
+ARRAY<STRUCT<customer_id INT64>>[{1}, {2}, {3}]
+==
+
+[mode=explain]
+[plan_contains=AntiHashJoin]
+[plan_not_contains=Subquery]
+[name=not_exists_decorrelates_to_anti_join]
+SELECT c.customer_id
+FROM opt_customers c
+WHERE NOT EXISTS (SELECT 1 FROM opt_orders o
+                  WHERE o.customer_id = c.customer_id)
+ORDER BY c.customer_id
+--
+ARRAY<STRUCT<customer_id INT64>>[{4}]
+==
+
+[mode=explain]
+[plan_contains=NullAwareAntiHashJoin]
+[plan_not_contains=Subquery]
+[name=not_in_uses_null_aware_anti_join]
+SELECT c.customer_id
+FROM opt_customers c
+WHERE c.customer_id NOT IN (SELECT o.customer_id FROM opt_orders o)
+ORDER BY c.customer_id
+--
+ARRAY<STRUCT<customer_id INT64>>[{4}]
+==
+
+[mode=explain]
+[plan_contains=MarkHashJoin]
+[plan_not_contains=Subquery]
+[name=in_projection_uses_mark_join]
+SELECT c.customer_id,
+       c.customer_id IN (SELECT o.customer_id FROM opt_orders o) AS has_order
+FROM opt_customers c ORDER BY c.customer_id
+--
+ARRAY<STRUCT<customer_id INT64, has_order BOOL>>[
+  {1, true}, {2, true}, {3, true}, {4, false}
+]
+==
+
+[mode=explain]
+[plan_contains=SingleHashJoin]
+[plan_not_contains=CorrelatedSubquery]
+[name=correlated_scalar_aggregate_decorrelates]
+SELECT c.customer_id,
+       (SELECT MAX(o.amount) FROM opt_orders o
+        WHERE o.customer_id = c.customer_id) AS max_amount
+FROM opt_customers c ORDER BY c.customer_id
+--
+ARRAY<STRUCT<customer_id INT64, max_amount INT64>>[
+  {1, 70}, {2, 40}, {3, 90}, {4, NULL}
+]
+==
+
+[mode=explain]
+[plan_contains=Aggregate]
+[plan_contains=HashJoin]
+[plan_not_contains=CorrelatedSubquery]
+[name=correlated_count_preaggregates_before_join]
+SELECT c.customer_id,
+       (SELECT COUNT(*) FROM opt_orders o
+        WHERE o.customer_id = c.customer_id) AS order_count
+FROM opt_customers c ORDER BY c.customer_id
+--
+ARRAY<STRUCT<customer_id INT64, order_count INT64>>[
+  {1, 2}, {2, 1}, {3, 2}, {4, 0}
+]
+==
+
+[mode=explain]
+[plan_contains=DynamicFilter opt_orders.customer_id]
+[name=hash_join_build_creates_dynamic_filter]
+SELECT o.order_id
+FROM opt_orders o JOIN opt_customers c ON o.customer_id = c.customer_id
+WHERE c.active
+ORDER BY o.order_id
+--
+ARRAY<STRUCT<order_id INT64>>[{101}, {102}, {104}, {105}]
+==
+
+[mode=explain]
+[plan_contains=Filter opt_orders.customer_id = 1]
+[plan_contains=Filter opt_customers.customer_id = 1]
+[name=join_equality_propagates_constant_to_both_sides]
+SELECT o.order_id
+FROM opt_orders o JOIN opt_customers c ON o.customer_id = c.customer_id
+WHERE c.customer_id = 1
+ORDER BY o.order_id
+--
+ARRAY<STRUCT<order_id INT64>>[{101}, {102}]
+==
+
+[mode=explain]
+[plan_contains=EmptyResult]
+[plan_not_contains=Join]
+[name=contradictory_join_constants_eliminate_whole_join]
+SELECT o.order_id
+FROM opt_orders o JOIN opt_customers c ON o.customer_id = c.customer_id
+WHERE o.customer_id = 1 AND c.customer_id = 2
+--
+ARRAY<STRUCT<order_id INT64>>[]
+==
+
+[mode=explain]
+[plan_contains=HashJoin]
+[plan_not_contains=NestedLoopJoin]
+[name=commuted_equality_is_hashable]
+SELECT o.order_id
+FROM opt_orders o JOIN opt_customers c ON c.customer_id = o.customer_id
+ORDER BY o.order_id
+--
+ARRAY<STRUCT<order_id INT64>>[{101}, {102}, {103}, {104}, {105}]
+==
+
+[mode=explain]
+[plan_contains=HashJoin keys=2]
+[name=composite_equality_uses_composite_hash_key]
+SELECT o1.order_id, o2.order_id
+FROM opt_orders o1 JOIN opt_orders o2
+ON o1.customer_id = o2.customer_id AND o1.amount = o2.amount
+ORDER BY o1.order_id, o2.order_id
+--
+ARRAY<STRUCT<left_id INT64, right_id INT64>>[
+  {101, 101}, {102, 102}, {103, 103}, {104, 104}, {105, 105}, {106, 106}
+]
+==
+
+[mode=explain]
+[plan_contains=JoinOrder=greedy_filtered_cardinality]
+[plan_not_contains=JoinOrder=syntactic]
+[name=inner_join_reordering_ignores_written_order]
+SELECT l.line_id, r.region_name
+FROM opt_regions r
+JOIN opt_customers c ON r.region_id = c.region_id
+JOIN opt_orders o ON c.customer_id = o.customer_id
+JOIN opt_lineitems l ON o.order_id = l.order_id
+WHERE l.qty >= 4
+ORDER BY l.line_id
+--
+ARRAY<STRUCT<line_id INT64, region_name STRING>>[
+  {1003, "east"}, {1005, "west"}
+]
+==

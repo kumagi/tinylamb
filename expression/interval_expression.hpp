@@ -22,11 +22,7 @@ class IntervalExpression : public ExpressionBase {
     } else {
       value_ = IntervalValue::Parse(std::to_string(amount_), unit_);
     }
-    if (raw_amount_.empty() && !unit_.empty()) {
-      text_ = std::to_string(amount_) + " " + unit_;
-    } else {
-      text_ = value_.ToString();
-    }
+    text_ = value_.ToString();
   }
   [[nodiscard]] TypeTag Type() const override { return TypeTag::kIntervalExp; }
   [[nodiscard]] Value Evaluate(const Row&, const Schema&) const override;

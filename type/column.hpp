@@ -42,6 +42,8 @@ class Column {
   [[nodiscard]] const ColumnName& Name() const { return col_name_; }
   ColumnName& Name() { return col_name_; }
   [[nodiscard]] ValueType Type() const { return type_; }
+  [[nodiscard]] bool IsUnsigned() const { return unsigned_; }
+  void SetUnsigned(bool value) { unsigned_ = value; }
   [[nodiscard]] Constraint GetConstraint() const { return constraint_; }
 
   bool operator==(const Column& rhs) const = default;
@@ -52,6 +54,7 @@ class Column {
  private:
   ColumnName col_name_;
   ValueType type_{};
+  bool unsigned_{false};
   Constraint constraint_{Constraint::kNothing};
 };
 

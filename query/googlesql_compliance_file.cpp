@@ -188,6 +188,18 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
     out->primary_key_mode = value;
     return true;
   }
+  if (key == "mode") {
+    out->mode = ToLower(Trim(value));
+    return true;
+  }
+  if (key == "plan_contains") {
+    out->plan_contains.push_back(value);
+    return true;
+  }
+  if (key == "plan_not_contains") {
+    out->plan_not_contains.push_back(value);
+    return true;
+  }
   if (key == "parameters" || key == "parameter") {
     for (const auto& item : SplitTopLevel(value)) {
       const std::string s = Trim(item);
@@ -809,7 +821,7 @@ void SplitProtoMembers(const std::string& body,
       for (size_t k = 0; ident && k < colon; ++k) {
         const char c = piece[k];
         if (!(std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' ||
-              c == '.' || c == '[')) {
+              c == '.' || c == '[' || c == ']')) {
           ident = false;
           break;
         }
@@ -818,7 +830,31 @@ void SplitProtoMembers(const std::string& body,
         out->emplace_back(ToLower(Trim(piece.substr(0, colon))),
                           Trim(piece.substr(colon + 1)));
       } else {
-        out->emplace_back(std::string(), piece);
+        // Message fields use `field { ... }` / `field < ... >` syntax and
+        // therefore have no colon before their nested body.  Keep the field
+        // name so recursive proto comparison can distinguish them from
+        // positional STRUCT values.
+        size_t name_end = 0;
+        while (name_end < piece.size() &&
+               (std::isalnum(static_cast<unsigned char>(piece[name_end])) !=
+                    0 ||
+                piece[name_end] == '_' || piece[name_end] == '.' ||
+                piece[name_end] == '[' || piece[name_end] == ']')) {
+          ++name_end;
+        }
+        size_t body_start = name_end;
+        while (body_start < piece.size() &&
+               std::isspace(static_cast<unsigned char>(piece[body_start])) !=
+                   0) {
+          ++body_start;
+        }
+        if (name_end > 0 && body_start < piece.size() &&
+            (piece[body_start] == '{' || piece[body_start] == '<')) {
+          out->emplace_back(ToLower(piece.substr(0, name_end)),
+                            Trim(piece.substr(body_start)));
+        } else {
+          out->emplace_back(std::string(), piece);
+        }
       }
     }
   };
@@ -858,11 +894,12 @@ void SplitProtoMembers(const std::string& body,
       if (j < n && ProtoIsIdentStart(body[j])) {
         size_t k = j + 1;
         while (k < n && (std::isalnum(static_cast<unsigned char>(body[k])) != 0 ||
-                         body[k] == '_' || body[k] == '.')) {
+                         body[k] == '_' || body[k] == '.' || body[k] == ']')) {
           ++k;
         }
         while (k < n && std::isspace(static_cast<unsigned char>(body[k]))) { ++k; }
-        if (k < n && body[k] == ':' && k > j) {
+        if (k < n && (body[k] == ':' || body[k] == '{' || body[k] == '<') &&
+            k > j) {
           flush(i);
           i = j;
           start = i;
@@ -908,6 +945,11 @@ std::string CanonicalizeProtoValue(const std::string& value) {
     return "{" + CanonicalizeProtoBody(trimmed.substr(1, trimmed.size() - 2)) +
            "}";
   }
+  if (trimmed.size() >= 2 &&
+      ((trimmed.front() == '\'' && trimmed.back() == '\'') ||
+       (trimmed.front() == '"' && trimmed.back() == '"'))) {
+    return ToLower("\"" + trimmed.substr(1, trimmed.size() - 2) + "\"");
+  }
   return ToLower(NormalizeWsText(trimmed));
 }
 
@@ -935,6 +977,32 @@ bool ProtoBodiesMatch(const std::string& want_body,
 }
 
 }  // namespace
+
+// Decode a scalar extracted from an encoded STRUCT/PROTO JSON object before
+// comparing it with a typed golden.  Keeping everything as VARCHAR here
+// makes JSON-encoded BOOL/number members fail against `false`/numeric tokens.
+Value ParseEmbeddedComplianceValue(std::string token) {
+  token = Trim(token);
+  if (ToLower(token) == "null") { return Value(); }
+  if (ToLower(token) == "true") { return Value(int64_t{1}); }
+  if (ToLower(token) == "false") { return Value(int64_t{0}); }
+  if (token.size() >= 2 && token.front() == '"' && token.back() == '"') {
+    return Value(Unquote(token));
+  }
+  try {
+    size_t consumed = 0;
+    const int64_t value = std::stoll(token, &consumed);
+    if (consumed == token.size()) { return Value(value); }
+  } catch (...) {
+  }
+  try {
+    size_t consumed = 0;
+    const double value = std::stod(token, &consumed);
+    if (consumed == token.size()) { return Value(value); }
+  } catch (...) {
+  }
+  return Value(std::move(token));
+}
 
 bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
   const std::string want = Trim(expected);
@@ -1063,6 +1131,13 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     return actual.type == ValueType::kInt64 && actual.value.int_value == 0;
   }
   if (actual.type == ValueType::kInt64) {
+    if ((want.size() >= 2 && want.front() == '"' && want.back() == '"') ||
+        (want.size() >= 3 && (want.front() == 'b' || want.front() == 'B') &&
+         want[1] == '"' && want.back() == '"')) {
+      const std::string token =
+          want.front() == 'b' || want.front() == 'B' ? want.substr(1) : want;
+      return std::to_string(actual.value.int_value) == Unquote(token);
+    }
     try {
       return actual.value.int_value == static_cast<int64_t>(std::stoll(want));
     } catch (...) {
@@ -1113,6 +1188,54 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     }
     const std::string unquoted = Unquote(want);
     const std::string actual_str = std::string(actual.value.varchar_value);
+    if (actual_str == unquoted) { return true; }
+    // APPROX_TOP_* returns ARRAY<STRUCT<...>>.  The compact runtime stores
+    // each struct element as a positional textual value; compare its fields
+    // recursively against the positional struct token in the golden.
+    if (actual_str.size() >= 2 && actual_str.front() == '{' &&
+        actual_str.back() == '}' && want.size() >= 2 &&
+        want.front() == '{' && want.back() == '}') {
+      const std::vector<std::string> actual_fields = SplitTopLevel(
+          actual_str.substr(1, actual_str.size() - 2));
+      const std::vector<std::string> expected_fields = SplitTopLevel(
+          want.substr(1, want.size() - 2));
+      if (actual_fields.size() == expected_fields.size()) {
+        bool matched = true;
+        for (size_t i = 0; i < actual_fields.size(); ++i) {
+          if (!ComplianceValueMatches(
+                  ParseEmbeddedComplianceValue(actual_fields[i]),
+                  expected_fields[i])) {
+            matched = false;
+            break;
+          }
+        }
+        if (matched) { return true; }
+      }
+    }
+    // Some STRUCT constructors contain arrays whose elements are themselves
+    // encoded structs.  The execution layer keeps that value as its textual
+    // ARRAY<T>[...] representation, so compare the parsed elements using the
+    // same recursive matcher as native arrays.
+    if (want.starts_with("ARRAY<") && actual_str.starts_with("ARRAY<")) {
+      std::string actual_type;
+      std::vector<std::string> actual_elements;
+      std::string expected_type;
+      std::vector<std::string> expected_elements;
+      if (ParseArrayToken(actual_str, &actual_type, &actual_elements) &&
+          ParseArrayToken(want, &expected_type, &expected_elements) &&
+          actual_elements.size() == expected_elements.size()) {
+        bool matched = true;
+        for (size_t i = 0; i < actual_elements.size(); ++i) {
+          if (!ComplianceValueMatches(
+                  ParseEmbeddedComplianceValue(actual_elements[i]),
+                  expected_elements[i])) {
+            matched = false;
+            break;
+          }
+        }
+        if (matched) { return true; }
+      }
+    }
     auto compact_json = [](std::string_view text) {
       std::string compact;
       bool quoted = false;
@@ -1212,10 +1335,6 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
               --depth;
             } else if (c == ':' && depth == 0) {
               std::string value = Trim(member.substr(i + 1));
-              if (value.size() >= 2 && value.front() == '"' &&
-                  value.back() == '"') {
-                value = Unquote(value);
-              }
               values.push_back(std::move(value));
               break;
             }
@@ -1231,8 +1350,9 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
           actual_values.size() == expected_values.size()) {
         bool matched = true;
         for (size_t i = 0; i < actual_values.size(); ++i) {
-          if (!ComplianceValueMatches(Value(std::string(actual_values[i])),
-                                      expected_values[i])) {
+          if (!ComplianceValueMatches(
+                  ParseEmbeddedComplianceValue(actual_values[i]),
+                  expected_values[i])) {
             matched = false;
             break;
           }
@@ -1357,7 +1477,8 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
             if (ToLower(want_elem) != "null") { matched = false; break; }
           } else if (ToLower(got_elem) == "true" || ToLower(got_elem) == "false") {
             if (ToLower(want_elem) != ToLower(got_elem)) { matched = false; break; }
-          } else if (!ComplianceValueMatches(Value(std::string(got_elem)), want_elem)) {
+          } else if (!ComplianceValueMatches(
+                         ParseEmbeddedComplianceValue(got_elem), want_elem)) {
             matched = false; break;
           }
         }

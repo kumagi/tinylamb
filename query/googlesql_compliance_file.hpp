@@ -26,6 +26,10 @@ struct GoogleSqlComplianceCase {
   // primary_key_mode option: "" (driver default), "no_primary_key", or
   // "first_column_is_primary_key".
   std::string primary_key_mode;
+  // Local optimizer E2E extensions for stable EXPLAIN fragment assertions.
+  std::string mode;
+  std::vector<std::string> plan_contains;
+  std::vector<std::string> plan_not_contains;
   std::vector<std::pair<std::string, std::string>> parameters;
   std::string default_time_zone;
   std::string raw_result;

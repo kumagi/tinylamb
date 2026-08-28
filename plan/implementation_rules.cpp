@@ -1983,20 +1983,24 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
            const c::LogicalExpression& logical, const std::vector<BestPlan>&,
            const PhysicalProperties&, const c::RuleContext& context) {
           if (logical.values.empty() && !logical.table.empty()) {
-            uint64_t count = 0;
-            if (context.statistics.contains(logical.table)) {
-              count = context.statistics.at(logical.table)->Rows();
+            // COUNT(*) is rewritten to this leaf for optimizer purposes, but
+            // its result must still be computed from the transaction-visible
+            // table.  Catalog statistics are estimates and become stale after
+            // INSERT/DELETE, so materializing the count from them is wrong.
+            const auto table = context.tables.find(logical.table);
+            const auto statistics = context.statistics.find(logical.table);
+            if (table == context.tables.end() ||
+                statistics == context.statistics.end()) {
+              return std::vector<PlanAlternative>{};
             }
-            Schema schema =
-                logical.output_schema.ColumnCount() > 0
-                    ? logical.output_schema
-                    : Schema("", {Column("count", ValueType::kInt64)});
-            Plan values = std::make_shared<ValuesPlan>(
-                schema,
-                std::vector<Row>{Row({Value(static_cast<int64_t>(count))})});
+            Plan scan = std::make_shared<FullScanPlan>(*table->second,
+                                                       *statistics->second);
+            Plan aggregate = std::make_shared<HashAggregatePlan>(
+                std::move(scan), logical.target_list);
             return std::vector<PlanAlternative>{
-                PlanAlternative{.plan = std::move(values),
-                                .local_cost = 1.0,
+                PlanAlternative{.plan = std::move(aggregate),
+                                .local_cost =
+                                    static_cast<double>(statistics->second->Rows()),
                                 .estimated_rows = 1.0}};
           }
           Plan values = std::make_shared<ValuesPlan>(logical.output_schema,

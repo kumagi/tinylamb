@@ -734,6 +734,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         for (size_t i = 0; i < values.size(); ++i) {
           columns.emplace_back(ProjectionName(statement.SelectList()[i], i),
                                ValueTypeOf(values[i]));
+          columns.back().SetUnsigned(values[i].IsUnsigned());
         }
         Relation finished;
         finished.schema = Schema("", std::move(columns));

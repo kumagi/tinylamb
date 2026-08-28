@@ -1,0 +1,243 @@
+# Subquery decorrelation, CTE strategy, set-operation, and derived-table
+# optimization expectations.
+
+[prepare_database]
+CREATE TABLE opt_numbers AS
+SELECT 1 AS n, 'odd' AS kind
+UNION ALL SELECT 2, 'even'
+UNION ALL SELECT 3, 'odd'
+UNION ALL SELECT 4, 'even'
+UNION ALL SELECT 5, 'odd';
+CREATE TABLE opt_small AS
+SELECT 2 AS n UNION ALL SELECT 4 UNION ALL SELECT 6;
+ANALYZE opt_numbers;
+ANALYZE opt_small;
+--
+ARRAY<STRUCT<x INT64>>[]
+==
+
+[mode=explain]
+[plan_contains=InitPlan executions=1]
+[plan_not_contains=CorrelatedSubquery]
+[name=uncorrelated_scalar_subquery_executes_once]
+SELECT n, (SELECT MAX(n) FROM opt_small) AS ceiling
+FROM opt_numbers ORDER BY n
+--
+ARRAY<STRUCT<n INT64, ceiling INT64>>[
+  {1, 6}, {2, 6}, {3, 6}, {4, 6}, {5, 6}
+]
+==
+
+[mode=explain]
+[plan_not_contains=opt_small]
+[plan_not_contains=Filter]
+[name=uncorrelated_exists_true_is_constant_folded]
+SELECT n FROM opt_numbers WHERE EXISTS (SELECT 1 FROM opt_small) ORDER BY n
+--
+ARRAY<STRUCT<n INT64>>[{1}, {2}, {3}, {4}, {5}]
+==
+
+[mode=explain]
+[plan_contains=EmptyResult]
+[plan_not_contains=opt_numbers]
+[name=uncorrelated_exists_false_eliminates_outer_scan]
+SELECT n FROM opt_numbers
+WHERE EXISTS (SELECT 1 FROM opt_small WHERE n < 0)
+--
+ARRAY<STRUCT<n INT64>>[]
+==
+
+[mode=explain]
+[plan_contains=SemiHashJoin]
+[plan_not_contains=Subquery]
+[name=uncorrelated_in_becomes_semi_join]
+SELECT n FROM opt_numbers WHERE n IN (SELECT n FROM opt_small) ORDER BY n
+--
+ARRAY<STRUCT<n INT64>>[{2}, {4}]
+==
+
+[mode=explain]
+[plan_contains=AntiHashJoin]
+[plan_not_contains=Subquery]
+[name=not_exists_becomes_anti_join]
+SELECT o.n FROM opt_numbers o
+WHERE NOT EXISTS (SELECT 1 FROM opt_small s WHERE s.n = o.n)
+ORDER BY o.n
+--
+ARRAY<STRUCT<n INT64>>[{1}, {3}, {5}]
+==
+
+[mode=explain]
+[plan_contains=Filter n >= 4 below SubqueryScan]
+[plan_not_contains=Filter n >= 4 above SubqueryScan]
+[name=derived_table_predicate_pushdown]
+SELECT n FROM (SELECT n, kind FROM opt_numbers WHERE n >= 2) d
+WHERE n >= 4 ORDER BY n
+--
+ARRAY<STRUCT<n INT64>>[{4}, {5}]
+==
+
+[mode=explain]
+[plan_not_contains=SubqueryScan]
+[name=trivial_derived_table_is_merged]
+SELECT n FROM (SELECT n FROM opt_numbers) d WHERE n = 3
+--
+ARRAY<STRUCT<n INT64>>[{3}]
+==
+
+[mode=explain]
+[plan_contains=CteInline uses=1]
+[plan_not_contains=Materialize]
+[name=single_use_cte_is_inlined]
+WITH filtered AS (SELECT n FROM opt_numbers WHERE n >= 4)
+SELECT n FROM filtered ORDER BY n
+--
+ARRAY<STRUCT<n INT64>>[{4}, {5}]
+==
+
+[mode=explain]
+[plan_contains=CteMaterialize uses=2]
+[plan_contains=CteScan]
+[name=multi_use_cte_is_materialized_once]
+WITH filtered AS (SELECT n FROM opt_numbers WHERE n >= 3)
+SELECT a.n FROM filtered a JOIN filtered b ON a.n = b.n ORDER BY a.n
+--
+ARRAY<STRUCT<n INT64>>[{3}, {4}, {5}]
+==
+
+[mode=explain]
+[plan_contains=RecursiveUnion]
+[plan_contains=WorkTableScan]
+[name=recursive_cte_uses_work_table]
+WITH RECURSIVE seq AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 4
+)
+SELECT n FROM seq ORDER BY n
+--
+ARRAY<STRUCT<n INT64>>[{1}, {2}, {3}, {4}]
+==
+
+[mode=explain]
+[plan_contains=Append]
+[plan_not_contains=Distinct]
+[name=union_all_uses_append]
+SELECT n FROM opt_numbers WHERE n <= 2
+UNION ALL
+SELECT n FROM opt_small WHERE n >= 4
+ORDER BY n
+--
+ARRAY<STRUCT<n INT64>>[{1}, {2}, {4}, {6}]
+==
+
+[mode=explain]
+[plan_contains=HashDistinct]
+[plan_contains=Append]
+[name=union_distinct_deduplicates_once_above_append]
+SELECT n FROM opt_numbers WHERE n >= 4
+UNION DISTINCT
+SELECT n FROM opt_small WHERE n <= 4
+ORDER BY n
+--
+ARRAY<STRUCT<n INT64>>[{2}, {4}, {5}]
+==
+
+[mode=explain]
+[plan_contains=SemiHashJoin]
+[plan_not_contains=SetOperation]
+[name=intersect_distinct_rewrites_to_semi_join]
+SELECT n FROM opt_numbers
+INTERSECT DISTINCT
+SELECT n FROM opt_small
+ORDER BY n
+--
+ARRAY<STRUCT<n INT64>>[{2}, {4}]
+==
+
+[mode=explain]
+[plan_contains=AntiHashJoin]
+[plan_not_contains=SetOperation]
+[name=except_distinct_rewrites_to_anti_join]
+SELECT n FROM opt_numbers
+EXCEPT DISTINCT
+SELECT n FROM opt_small
+ORDER BY n
+--
+ARRAY<STRUCT<n INT64>>[{1}, {3}, {5}]
+==
+
+[mode=explain]
+[plan_contains=Limit count=2 under Append]
+[name=union_all_global_limit_pushes_branch_caps]
+SELECT n FROM (
+  SELECT n FROM opt_numbers
+  UNION ALL
+  SELECT n FROM opt_small
+) u
+LIMIT 2
+--
+ARRAY<STRUCT<n INT64>>[{1}, {2}]
+==
+
+[mode=explain]
+[plan_contains=TopN limit=3]
+[plan_contains=MergeAppend]
+[plan_not_contains=GlobalSort]
+[name=ordered_union_all_uses_merge_append_topn]
+SELECT n FROM (
+  SELECT n FROM opt_numbers
+  UNION ALL
+  SELECT n FROM opt_small
+) u
+ORDER BY n LIMIT 3
+--
+ARRAY<STRUCT<n INT64>>[{1}, {2}, {2}]
+==
+
+[mode=explain]
+[plan_contains=PredicatePushdown n >= 4 branches=2]
+[name=predicate_pushes_through_union_all]
+SELECT n FROM (
+  SELECT n FROM opt_numbers
+  UNION ALL
+  SELECT n FROM opt_small
+) u
+WHERE n >= 4 ORDER BY n
+--
+ARRAY<STRUCT<n INT64>>[{4}, {4}, {5}, {6}]
+==
+
+[mode=explain]
+[plan_contains=Aggregate below Join]
+[plan_not_contains=Join before Aggregate]
+[name=aggregate_is_pushed_below_join]
+SELECT o.kind, SUM(s.n) AS total
+FROM opt_numbers o JOIN opt_small s ON o.n = s.n
+GROUP BY o.kind
+--
+ARRAY<STRUCT<kind STRING, total INT64>>[{"even", 6}]
+==
+
+[mode=explain]
+[plan_contains=Apply cache=parameterized]
+[plan_contains=cache_key=o.kind]
+[name=nondecorrelatable_subquery_uses_parameter_cache]
+SELECT o.n,
+       (SELECT COUNT(*) FROM opt_numbers i WHERE i.kind = o.kind) AS same_kind
+FROM opt_numbers o ORDER BY o.n
+--
+ARRAY<STRUCT<n INT64, same_kind INT64>>[
+  {1, 3}, {2, 2}, {3, 3}, {4, 2}, {5, 3}
+]
+==
+
+[mode=explain]
+[plan_contains=EmptyResult]
+[plan_not_contains=opt_numbers]
+[name=scalar_subquery_proven_empty_folds_to_null_comparison]
+SELECT n FROM opt_numbers
+WHERE n = (SELECT n FROM opt_small WHERE false)
+--
+ARRAY<STRUCT<n INT64>>[]
+==

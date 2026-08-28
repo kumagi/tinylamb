@@ -513,6 +513,16 @@ bool IsInt64Constant(const Expression& expression) {
   return !constant.IsNull() && constant.type == ValueType::kInt64;
 }
 
+std::optional<int64_t> NegativeInt64Constant(const Expression& expression) {
+  if (!IsInt64Constant(expression)) { return std::nullopt; }
+  const Value value = expression->AsConstantValue().GetValue();
+  if (value.IsUnsigned() || value.value.int_value >= 0 ||
+      value.value.int_value == std::numeric_limits<int64_t>::min()) {
+    return std::nullopt;
+  }
+  return value.value.int_value;
+}
+
 bool HasLikeWildcard(std::string_view pattern) {
   return pattern.find('%') != std::string_view::npos ||
          pattern.find('_') != std::string_view::npos;
@@ -534,6 +544,35 @@ bool StaticallyInt64(const Expression& expression) {
   } catch (const std::exception&) {
     return false;
   }
+}
+
+bool StaticallyNumeric(const Expression& expression) {
+  if (!expression) { return false; }
+  try {
+    const TypeTag type = expression->ResultType(Schema()).GetType();
+    return type == TypeTag::kBigInt || type == TypeTag::kDouble;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+// Reducing x + x to x * 2 must not change the number of evaluations of a
+// volatile expression or a subquery. Immutable scalar trees are safe.
+bool SafeToReduceEvaluationCount(  // NOLINT(misc-no-recursion)
+    const Expression& expression) {
+  if (!expression) { return false; }
+  if (expression->Type() == TypeTag::kQueryExp ||
+      expression->Type() == TypeTag::kAggregateExp) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kFunctionCallExp &&
+      GetFunctionVolatility(
+          expression->AsFunctionCallExpression().FuncName()) !=
+          Volatility::kImmutable) {
+    return false;
+  }
+  return std::ranges::all_of(ExpressionChildren(expression),
+                             SafeToReduceEvaluationCount);
 }
 
 }  // namespace
@@ -931,6 +970,60 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         return bindings.at("left");
       }));
     built.Add(ExpressionRule(
+      "canonicalize_add_negative_constant",
+      Binary(BinaryOperation::kAdd, Any("left"),
+             Is(TypeTag::kConstantValue, "right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const std::optional<int64_t> value =
+            NegativeInt64Constant(bindings.at("right"));
+        if (!value) { return Expression{}; }
+        return BinaryExpressionExp(
+            bindings.at("left"), BinaryOperation::kSubtract,
+            ConstantValueExp(Value(-*value)));
+      }));
+    built.Add(ExpressionRule(
+      "canonicalize_subtract_negative_constant",
+      Binary(BinaryOperation::kSubtract, Any("left"),
+             Is(TypeTag::kConstantValue, "right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const std::optional<int64_t> value =
+            NegativeInt64Constant(bindings.at("right"));
+        if (!value) { return Expression{}; }
+        return BinaryExpressionExp(bindings.at("left"), BinaryOperation::kAdd,
+                                   ConstantValueExp(Value(-*value)));
+      }));
+    built.Add(ExpressionRule(
+      "multiply_by_negative_one",
+      Binary(BinaryOperation::kMultiply, Any("left"), Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const Expression& left = bindings.at("left");
+        const Expression& right = bindings.at("right");
+        const auto is_negative_one = [](const Expression& candidate) {
+          if (!IsInt64Constant(candidate)) { return false; }
+          const Value value = candidate->AsConstantValue().GetValue();
+          return !value.IsUnsigned() && value.value.int_value == -1;
+        };
+        if (is_negative_one(left) && StaticallyNumeric(right)) {
+          return UnaryExpressionExp(right, UnaryOperation::kMinus);
+        }
+        if (is_negative_one(right) && StaticallyNumeric(left)) {
+          return UnaryExpressionExp(left, UnaryOperation::kMinus);
+        }
+        return Expression{};
+      }));
+    built.Add(ExpressionRule(
+      "combine_repeated_addend",
+      Binary(BinaryOperation::kAdd, Any("left"), Any("right")),
+      [](const Expression&, const ExpressionBindings& bindings) {
+        const Expression& left = bindings.at("left");
+        if (!Same(left, bindings.at("right")) || !StaticallyNumeric(left) ||
+            !SafeToReduceEvaluationCount(left)) {
+          return Expression{};
+        }
+        return BinaryExpressionExp(left, BinaryOperation::kMultiply,
+                                   ConstantValueExp(Value(2)));
+      }));
+    built.Add(ExpressionRule(
       "double_negation_arithmetic",
       Unary(UnaryOperation::kMinus,
             Unary(UnaryOperation::kMinus, Any("child"))),
@@ -1220,23 +1313,6 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                  fn.Args()[1]),
               ConstantValueExp(Value())}},
             fn.Args()[0]);
-      }));
-
-    // x < x -> NULL, x > x -> NULL (strict inequality on same expression)
-    built.Add(ExpressionRule(
-      "self_inequality",
-      AnyBinary(Any("left"), Any("right")),
-      [](const Expression& expression, const ExpressionBindings& bindings) {
-        const auto& binary = expression->AsBinaryExpression();
-        if (binary.Op() != BinaryOperation::kLessThan &&
-            binary.Op() != BinaryOperation::kGreaterThan) {
-          return Expression{};
-        }
-        if (!Same(bindings.at("left"), bindings.at("right"))) {
-          return Expression{};
-        }
-        // Same expression compared with strict inequality is always NULL.
-        return ConstantValueExp(Value());
       }));
 
     // x = NULL -> x IS NULL, x != NULL -> x IS NOT NULL
@@ -2747,6 +2823,61 @@ Expression WithExpressionChildren(const Expression& expression,
 }
       return expression;
   }
+}
+
+Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
+    const Expression& expression, const Schema& input_schema) {
+  if (!expression) { return nullptr; }
+
+  std::vector<Expression> children = ExpressionChildren(expression);
+  bool children_changed = false;
+  for (Expression& child : children) {
+    Expression rewritten = RewriteTypedArithmetic(child, input_schema);
+    children_changed |= !Same(child, rewritten);
+    child = std::move(rewritten);
+  }
+  Expression current =
+      children_changed ? WithExpressionChildren(expression, std::move(children))
+                       : expression;
+  if (current->Type() != TypeTag::kBinaryExp ||
+      current->AsBinaryExpression().Op() != BinaryOperation::kMultiply) {
+    return current;
+  }
+
+  const auto& multiply = current->AsBinaryExpression();
+  const Expression* zero = nullptr;
+  const Expression* value = nullptr;
+  if (IsZero(multiply.Left())) {
+    zero = &multiply.Left();
+    value = &multiply.Right();
+  } else if (IsZero(multiply.Right())) {
+    zero = &multiply.Right();
+    value = &multiply.Left();
+  } else {
+    return current;
+  }
+
+  try {
+    // Floating-point x * 0 is not generally zero: NaN and infinities must be
+    // preserved. Restrict this rewrite to resolved integer arithmetic.
+    if (current->ResultType(input_schema).GetType() != TypeTag::kBigInt ||
+        (*value)->ResultType(input_schema).GetType() != TypeTag::kBigInt) {
+      return current;
+    }
+  } catch (const std::exception&) {
+    return current;
+  }
+
+  // SQL arithmetic is NULL-propagating. CASE preserves that behavior while
+  // removing the multiplication, and the casts keep both branches INT64.
+  Expression typed_null =
+      CastExpressionExp(ConstantValueExp(Value()), "INT64", false);
+  Expression typed_zero =
+      CastExpressionExp(*zero, "INT64", false);
+  return CaseExpressionExp(
+      {{UnaryExpressionExp(*value, UnaryOperation::kIsNull),
+        std::move(typed_null)}},
+      std::move(typed_zero));
 }
 
 std::vector<Expression> SplitConjuncts(  // NOLINT(misc-no-recursion)

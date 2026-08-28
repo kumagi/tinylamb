@@ -1,0 +1,189 @@
+# EXPLAIN ANALYZE expectations for adaptive decisions, runtime filters,
+# short-circuiting, cache behavior, and feedback collection.
+
+[prepare_database]
+CREATE TABLE opt_probe AS
+SELECT 1 AS id, 10 AS k, 100 AS payload
+UNION ALL SELECT 2, 10, 200
+UNION ALL SELECT 3, 20, 300
+UNION ALL SELECT 4, 20, 400
+UNION ALL SELECT 5, 30, 500
+UNION ALL SELECT 6, 40, 600
+UNION ALL SELECT 7, 50, 700
+UNION ALL SELECT 8, CAST(NULL AS INT64), 800;
+CREATE TABLE opt_build AS
+SELECT 10 AS k, 'ten' AS label
+UNION ALL SELECT 20, 'twenty'
+UNION ALL SELECT 30, 'thirty'
+UNION ALL SELECT 99, 'unused';
+ANALYZE opt_probe;
+ANALYZE opt_build;
+--
+ARRAY<STRUCT<x INT64>>[]
+==
+
+[mode=explain_analyze]
+[plan_contains=Actual Rows: 5]
+[plan_contains=HashJoin actual_build_rows=4 actual_probe_rows=8]
+[plan_contains=join_matches=5]
+[name=hash_join_reports_build_probe_and_match_counts]
+SELECT p.id, b.label FROM opt_probe p JOIN opt_build b ON p.k = b.k
+ORDER BY p.id
+--
+ARRAY<STRUCT<id INT64, label STRING>>[
+  {1, "ten"}, {2, "ten"}, {3, "twenty"}, {4, "twenty"}, {5, "thirty"}
+]
+==
+
+[mode=explain_analyze]
+[plan_contains=RuntimeFilter type=exact_set keys=4]
+[plan_contains=probe_rows_rejected=3]
+[plan_contains=probe_rows_null_rejected=1]
+[name=small_hash_build_installs_exact_runtime_filter]
+SELECT p.id FROM opt_probe p JOIN opt_build b ON p.k = b.k ORDER BY p.id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}]
+==
+
+[mode=explain_analyze]
+[plan_contains=AdaptiveJoin initial=NestedLoop final=HashJoin]
+[plan_contains=switch_reason=outer_rows_exceeded_threshold]
+[name=adaptive_join_switches_after_outer_cardinality_surprise]
+SELECT p1.id, p2.id AS other_id
+FROM opt_probe p1 JOIN opt_probe p2 ON p1.k = p2.k
+ORDER BY p1.id, other_id
+--
+ARRAY<STRUCT<id INT64, other_id INT64>>[
+  {1, 1}, {1, 2}, {2, 1}, {2, 2},
+  {3, 3}, {3, 4}, {4, 3}, {4, 4},
+  {5, 5}, {6, 6}, {7, 7}
+]
+==
+
+[mode=explain_analyze]
+[plan_contains=EmptyBuildShortCircuit probe_opened=false]
+[plan_contains=Actual Rows: 0]
+[name=empty_inner_hash_build_skips_probe_scan]
+SELECT p.id FROM opt_probe p
+JOIN (SELECT k FROM opt_build WHERE false) b ON p.k = b.k
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain_analyze]
+[plan_contains=Limit early_stop=true consumed_rows=2]
+[plan_not_contains=scan_rows=8]
+[name=unordered_limit_stops_scan_early]
+SELECT id FROM opt_probe LIMIT 2
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}]
+==
+
+[mode=explain_analyze]
+[plan_contains=TopN heap_capacity=3 input_rows=8]
+[plan_contains=output_rows=3]
+[name=topn_reports_bounded_heap_profile]
+SELECT id FROM opt_probe ORDER BY payload DESC LIMIT 3
+--
+ARRAY<STRUCT<id INT64>>[{8}, {7}, {6}]
+==
+
+[mode=explain_analyze]
+[plan_contains=Aggregate input_rows=8 groups=6 updates=8]
+[name=hash_aggregate_reports_groups_and_updates]
+SELECT k, COUNT(*) AS n FROM opt_probe GROUP BY k
+--
+ARRAY<STRUCT<k INT64, n INT64>>[unknown order:
+  {10, 2}, {20, 2}, {30, 1}, {40, 1}, {50, 1}, {NULL, 1}
+]
+==
+
+[mode=explain_analyze]
+[plan_contains=ScalarSubquery executions=1 cache_hits=7]
+[name=uncorrelated_scalar_subquery_profile_proves_single_execution]
+SELECT id, (SELECT MAX(k) FROM opt_build) AS max_k
+FROM opt_probe ORDER BY id
+--
+ARRAY<STRUCT<id INT64, max_k INT64>>[
+  {1, 99}, {2, 99}, {3, 99}, {4, 99},
+  {5, 99}, {6, 99}, {7, 99}, {8, 99}
+]
+==
+
+[mode=explain_analyze]
+[plan_contains=CorrelatedCache distinct_keys=6 probes=8 hits=2]
+[name=correlated_subquery_profile_exposes_parameter_cache]
+SELECT p.id,
+       (SELECT COUNT(*) FROM opt_probe i WHERE i.k = p.k) AS peers
+FROM opt_probe p ORDER BY p.id
+--
+ARRAY<STRUCT<id INT64, peers INT64>>[
+  {1, 2}, {2, 2}, {3, 2}, {4, 2},
+  {5, 1}, {6, 1}, {7, 1}, {8, 0}
+]
+==
+
+[mode=explain_analyze]
+[plan_contains=CardinalityFeedback node=Filter estimated=4 actual=2]
+[plan_contains=feedback_recorded=true]
+[name=selectivity_miss_records_cardinality_feedback]
+SELECT id FROM opt_probe WHERE k = 10 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}]
+==
+
+[mode=explain_analyze]
+[plan_contains=LateMaterialize requested_rows=2 decoded_payloads=2]
+[plan_not_contains=decoded_payloads=8]
+[name=late_materialization_profile_counts_only_survivors]
+SELECT id, payload FROM opt_probe WHERE k = 10 ORDER BY id
+--
+ARRAY<STRUCT<id INT64, payload INT64>>[{1, 100}, {2, 200}]
+==
+
+[mode=explain_analyze]
+[plan_contains=ZoneMap blocks_skipped]
+[plan_contains=rows_after_zone_map=2]
+[name=zone_map_profile_exposes_skipped_work]
+SELECT id FROM opt_probe WHERE payload >= 700 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{7}, {8}]
+==
+
+[mode=explain_analyze]
+[plan_contains=MemoryPeak]
+[plan_contains=spill_partitions=0]
+[plan_contains=HashJoin]
+[name=join_reports_memory_peak_and_no_spill]
+SELECT COUNT(*) AS n FROM opt_probe p1 JOIN opt_probe p2 ON p1.k = p2.k
+--
+ARRAY<STRUCT<n INT64>>[{11}]
+==
+
+[mode=explain_analyze]
+[plan_contains=Filter short_circuit_rhs_evaluations=0]
+[name=boolean_short_circuit_profile_skips_dead_errors]
+SELECT id FROM opt_probe WHERE false AND payload / 0 = 1
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+[mode=explain_analyze]
+[plan_contains=Reoptimization considered=true retained_original=true]
+[plan_contains=reason=remaining_work_below_threshold]
+[name=adaptive_reoptimization_records_noop_decision]
+SELECT p.id FROM opt_probe p JOIN opt_build b ON p.k = b.k
+WHERE p.payload >= 500 ORDER BY p.id
+--
+ARRAY<STRUCT<id INT64>>[{5}]
+==
+
+[mode=explain_analyze]
+[plan_contains=Actual Rows: 0]
+[plan_contains=AntiHashJoin early_termination=build_contains_null]
+[name=null_aware_anti_join_short_circuits_on_build_null]
+SELECT id FROM opt_probe
+WHERE k NOT IN (SELECT k FROM opt_probe)
+--
+ARRAY<STRUCT<id INT64>>[]
+==

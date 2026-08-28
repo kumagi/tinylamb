@@ -64,7 +64,7 @@ class QueryResult {
 
 class SqlEngine {
  public:
-  explicit SqlEngine(Database& database) : database_(&database) {}
+  explicit SqlEngine(Database& database);
 
   StatusOr<QueryResult> Execute(TransactionContext& ctx, std::string_view sql);
   StatusOr<Executor> Prepare(TransactionContext& ctx, std::string_view sql);

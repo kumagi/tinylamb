@@ -1,0 +1,219 @@
+# Aggregation strategy, DISTINCT, sort-property, and Top-N expectations.
+
+[prepare_database]
+CREATE TABLE opt_sales AS
+SELECT 1 AS sale_id, 10 AS dept_id, 'a' AS rep, 100 AS amount
+UNION ALL SELECT 2, 10, 'a', 50
+UNION ALL SELECT 3, 10, 'b', 75
+UNION ALL SELECT 4, 20, 'c', 200
+UNION ALL SELECT 5, 20, 'c', 100
+UNION ALL SELECT 6, 20, 'd', 50
+UNION ALL SELECT 7, 30, 'e', 300
+UNION ALL SELECT 8, 30, 'e', CAST(NULL AS INT64);
+ANALYZE opt_sales;
+--
+ARRAY<STRUCT<x INT64>>[]
+==
+
+[mode=explain]
+[plan_contains=Aggregate strategy=scalar]
+[plan_not_contains=Sort]
+[name=global_aggregates_share_single_pass]
+SELECT COUNT(*) AS n, COUNT(amount) AS present,
+       SUM(amount) AS total, MIN(amount) AS lo, MAX(amount) AS hi
+FROM opt_sales
+--
+ARRAY<STRUCT<n INT64, present INT64, total INT64, lo INT64, hi INT64>>[
+  {8, 7, 875, 50, 300}
+]
+==
+
+[mode=explain]
+[plan_contains=HashAggregate]
+[plan_not_contains=SortAggregate]
+[name=unordered_group_by_prefers_hash_aggregate]
+SELECT dept_id, SUM(amount) AS total
+FROM opt_sales GROUP BY dept_id
+--
+ARRAY<STRUCT<dept_id INT64, total INT64>>[unknown order:
+  {10, 225}, {20, 350}, {30, 300}
+]
+==
+
+[mode=explain]
+[plan_contains=StreamAggregate]
+[plan_not_contains=Sort]
+[name=ordered_index_feeds_stream_aggregate]
+SELECT sale_id, SUM(amount) AS total
+FROM opt_sales GROUP BY sale_id ORDER BY sale_id
+--
+ARRAY<STRUCT<sale_id INT64, total INT64>>[
+  {1, 100}, {2, 50}, {3, 75}, {4, 200}, {5, 100}, {6, 50}, {7, 300}, {8, NULL}
+]
+==
+
+[mode=explain]
+[plan_not_contains=Aggregate]
+[name=group_by_unique_key_is_eliminated]
+SELECT sale_id, MAX(amount) AS amount
+FROM opt_sales GROUP BY sale_id ORDER BY sale_id
+--
+ARRAY<STRUCT<sale_id INT64, amount INT64>>[
+  {1, 100}, {2, 50}, {3, 75}, {4, 200}, {5, 100}, {6, 50}, {7, 300}, {8, NULL}
+]
+==
+
+[mode=explain]
+[plan_contains=Filter dept_id = 10]
+[plan_not_contains=having=true]
+[name=having_on_group_key_pushes_below_aggregate]
+SELECT dept_id, SUM(amount) AS total
+FROM opt_sales GROUP BY dept_id HAVING dept_id = 10
+--
+ARRAY<STRUCT<dept_id INT64, total INT64>>[{10, 225}]
+==
+
+[mode=explain]
+[plan_contains=having=true]
+[plan_not_contains=Filter COUNT]
+[name=aggregate_having_remains_above_aggregate]
+SELECT dept_id, COUNT(*) AS n
+FROM opt_sales GROUP BY dept_id HAVING COUNT(*) >= 3
+ORDER BY dept_id
+--
+ARRAY<STRUCT<dept_id INT64, n INT64>>[{10, 3}, {20, 3}]
+==
+
+[mode=explain]
+[plan_contains=TwoPhaseDistinctAggregate]
+[plan_not_contains=SortDistinct]
+[name=count_distinct_uses_dedicated_hash_phase]
+SELECT dept_id, COUNT(DISTINCT rep) AS reps
+FROM opt_sales GROUP BY dept_id ORDER BY dept_id
+--
+ARRAY<STRUCT<dept_id INT64, reps INT64>>[{10, 2}, {20, 2}, {30, 1}]
+==
+
+[mode=explain]
+[plan_contains=SharedDistinctSet rep]
+[name=multiple_distinct_aggregates_share_deduplication]
+SELECT COUNT(DISTINCT rep) AS reps,
+       COUNT(DISTINCT rep) + 1 AS reps_plus_one
+FROM opt_sales
+--
+ARRAY<STRUCT<reps INT64, reps_plus_one INT64>>[{5, 6}]
+==
+
+[mode=explain]
+[plan_not_contains=GROUP BY 1]
+[plan_contains=Aggregate strategy=scalar]
+[name=constant_grouping_key_is_removed]
+SELECT 1 AS bucket, SUM(amount) AS total FROM opt_sales GROUP BY 1
+--
+ARRAY<STRUCT<bucket INT64, total INT64>>[{1, 875}]
+==
+
+[mode=explain]
+[plan_contains=TopN (limit=2]
+[plan_not_contains=Sort:]
+[name=top_groups_use_topn_after_aggregate]
+SELECT dept_id, SUM(amount) AS total
+FROM opt_sales GROUP BY dept_id ORDER BY total DESC LIMIT 2
+--
+ARRAY<STRUCT<dept_id INT64, total INT64>>[{20, 350}, {30, 300}]
+==
+
+[mode=explain]
+[plan_contains=IndexOnlyScan: opt_sales]
+[plan_contains=limit=1]
+[plan_not_contains=Aggregate]
+[name=min_primary_key_rewrites_to_ordered_limit]
+SELECT MIN(sale_id) AS first_id FROM opt_sales
+--
+ARRAY<STRUCT<first_id INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=IndexOnlyScan: opt_sales]
+[plan_contains=reverse]
+[plan_not_contains=Aggregate]
+[name=max_primary_key_rewrites_to_reverse_limit]
+SELECT MAX(sale_id) AS last_id FROM opt_sales
+--
+ARRAY<STRUCT<last_id INT64>>[{8}]
+==
+
+[mode=explain]
+[plan_not_contains=Distinct]
+[name=distinct_on_unique_key_is_removed]
+SELECT DISTINCT sale_id FROM opt_sales ORDER BY sale_id
+--
+ARRAY<STRUCT<sale_id INT64>>[{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}]
+==
+
+[mode=explain]
+[plan_contains=HashDistinct]
+[plan_not_contains=SortDistinct]
+[name=unordered_distinct_prefers_hash]
+SELECT DISTINCT rep FROM opt_sales
+--
+ARRAY<STRUCT<rep STRING>>[unknown order:{"a"}, {"b"}, {"c"}, {"d"}, {"e"}]
+==
+
+[mode=explain]
+[plan_contains=SortDistinct]
+[plan_not_contains=HashDistinct]
+[name=ordered_distinct_combines_sort_and_deduplication]
+SELECT DISTINCT rep FROM opt_sales ORDER BY rep
+--
+ARRAY<STRUCT<rep STRING>>[{"a"}, {"b"}, {"c"}, {"d"}, {"e"}]
+==
+
+[mode=explain]
+[plan_contains=PartialAggregate]
+[plan_contains=FinalAggregate]
+[name=decomposable_aggregates_use_partial_final_pipeline]
+SELECT dept_id, COUNT(*) AS n, SUM(amount) AS total
+FROM opt_sales GROUP BY dept_id ORDER BY dept_id
+--
+ARRAY<STRUCT<dept_id INT64, n INT64, total INT64>>[
+  {10, 3, 225}, {20, 3, 350}, {30, 2, 300}
+]
+==
+
+[mode=explain]
+[plan_contains=TopN per_partition=2]
+[name=row_number_qualify_uses_partitioned_topn]
+SELECT dept_id, sale_id, amount
+FROM opt_sales
+QUALIFY ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY amount DESC) <= 2
+ORDER BY dept_id, amount DESC
+--
+ARRAY<STRUCT<dept_id INT64, sale_id INT64, amount INT64>>[
+  {10, 1, 100}, {10, 3, 75}, {20, 4, 200}, {20, 5, 100},
+  {30, 7, 300}, {30, 8, NULL}
+]
+==
+
+[mode=explain]
+[plan_contains=IncrementalSort presorted=dept_id]
+[plan_not_contains=FullSort]
+[name=partially_ordered_input_uses_incremental_sort]
+SELECT sale_id, dept_id, amount
+FROM opt_sales ORDER BY sale_id, amount DESC
+--
+ARRAY<STRUCT<sale_id INT64, dept_id INT64, amount INT64>>[
+  {1, 10, 100}, {2, 10, 50}, {3, 10, 75}, {4, 20, 200},
+  {5, 20, 100}, {6, 20, 50}, {7, 30, 300}, {8, 30, NULL}
+]
+==
+
+[mode=explain]
+[plan_contains=Limit count=3]
+[plan_not_contains=Project payload]
+[name=limit_pushes_below_unused_projection_work]
+SELECT sale_id, amount + 0 AS normalized
+FROM opt_sales ORDER BY sale_id LIMIT 3
+--
+ARRAY<STRUCT<sale_id INT64, normalized INT64>>[{1, 100}, {2, 50}, {3, 75}]
+==

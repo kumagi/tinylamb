@@ -64,6 +64,7 @@
 namespace tinylamb {
 
 class Table;
+class Database;
 
 // ---------------------------------------------------------------------------
 // Observability: process-global counters. Tests read deltas; benchmarks can
@@ -497,6 +498,10 @@ struct CompiledPlan {
   enum class Kind : uint8_t { kSelect, kInsert, kUpdate, kDelete };
 
   Kind kind;
+  // Plans retain Table/Index objects from the database that produced them.
+  // Schema epochs are local to a Database, so an epoch alone cannot prevent a
+  // plan compiled for another database instance from being replayed here.
+  const Database* database{nullptr};
   uint64_t epoch{0};
   // Fill-time parameter values for the specialized tiers (kSelect/kUpdate/
   // kDelete). A hit requires exact equality: identical parameters produce an
@@ -576,11 +581,12 @@ inline void NoteSpecializedParameterMismatch(const std::string& fingerprint) {
 }
 
 inline CompiledPlanPtr FindThreadCompiledPlan(const std::string& fingerprint,
+                                              const Database* database,
                                               uint64_t epoch) {
   const auto found = thread_compiled_plans.find(fingerprint);
   if (found == thread_compiled_plans.end()) { return nullptr;
 }
-  if (found->second->epoch != epoch) {
+  if (found->second->database != database || found->second->epoch != epoch) {
     thread_compiled_plans.erase(found);
     PlanCacheStats().epoch_invalidations.fetch_add(1,
                                                    std::memory_order_relaxed);
@@ -621,7 +627,8 @@ class PreparedPlanCache {
 
   // Returns the entry for `fingerprint` when present AND stamped with
   // `epoch`; stale entries are dropped here (lazy invalidation).
-  CompiledPlanPtr Find(const std::string& fingerprint, uint64_t epoch) {
+  CompiledPlanPtr Find(const std::string& fingerprint, const Database* database,
+                       uint64_t epoch) {
     Shard& shard = shard_for(fingerprint);
     std::scoped_lock lock(shard.mutex);
     const auto found = shard.index.find(fingerprint);
@@ -629,7 +636,8 @@ class PreparedPlanCache {
       PlanCacheStats().misses.fetch_add(1, std::memory_order_relaxed);
       return nullptr;
     }
-    if (found->second->plan->epoch != epoch) {
+    if (found->second->plan->database != database ||
+        found->second->plan->epoch != epoch) {
       shard.lru.erase(found->second);
       shard.index.erase(found);
       PlanCacheStats().epoch_invalidations.fetch_add(1,

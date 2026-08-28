@@ -287,6 +287,28 @@ TEST(GoogleSqlComplianceFile, MatchesIntBoolAndNull) {
   EXPECT_FALSE(ComplianceValueMatches(Value(int64_t{2}), "1"));
 }
 
+TEST(GoogleSqlComplianceFile, ParsesExplainPlanAssertions) {
+  constexpr std::string_view kFile = R"test(
+[mode=explain_analyze]
+[plan_contains=IndexScan: orders]
+[plan_contains=Actual Rows: 1]
+[plan_not_contains=FullScan: orders]
+[name=point_lookup_with_profile]
+SELECT id FROM orders WHERE id = 7
+--
+ARRAY<STRUCT<id INT64>>[{7}]
+==
+)test";
+  const std::vector<GoogleSqlComplianceCase> cases =
+      ParseGoogleSqlComplianceFile("optimizer.test", kFile);
+  ASSERT_EQ(cases.size(), 1U);
+  EXPECT_EQ(cases[0].mode, "explain_analyze");
+  EXPECT_EQ(cases[0].plan_contains,
+            (std::vector<std::string>{"IndexScan: orders", "Actual Rows: 1"}));
+  EXPECT_EQ(cases[0].plan_not_contains,
+            (std::vector<std::string>{"FullScan: orders"}));
+}
+
 TEST(GoogleSqlComplianceFile, ParsesVendoredCorpus) {
   const std::string directory = TINYLAMB_GOOGLESQL_COMPLIANCE_DIR;
   if (directory.empty() || !std::filesystem::exists(directory)) {
@@ -510,6 +532,39 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
           << GetParam() << " / " << test_case.name << " " << detail << "\n"
           << test_case.sql << "\n"
           << test_case.raw_result;
+
+      if (!test_case.plan_contains.empty() ||
+          !test_case.plan_not_contains.empty()) {
+        Status explain_status = Status::kSuccess;
+        std::string explain_error;
+        const std::string prefix =
+            test_case.mode == "explain_analyze" ? "EXPLAIN ANALYZE "
+                                                : "EXPLAIN ";
+        const std::vector<Row> explain_rows =
+            Drain(*engine, *context, prefix + test_case.sql,
+                  &explain_status, &explain_error);
+        ASSERT_EQ(explain_status, Status::kSuccess)
+            << GetParam() << " / " << test_case.name
+            << " EXPLAIN failed: " << explain_error << "\n"
+            << test_case.sql;
+        std::string plan;
+        for (const Row& explain_row : explain_rows) {
+          if (!explain_row.values_.empty()) {
+            if (!plan.empty()) { plan.push_back('\n'); }
+            plan += explain_row[0].AsString();
+          }
+        }
+        for (const std::string& fragment : test_case.plan_contains) {
+          EXPECT_NE(plan.find(fragment), std::string::npos)
+              << GetParam() << " / " << test_case.name
+              << " missing plan fragment: " << fragment << "\n" << plan;
+        }
+        for (const std::string& fragment : test_case.plan_not_contains) {
+          EXPECT_EQ(plan.find(fragment), std::string::npos)
+              << GetParam() << " / " << test_case.name
+              << " unexpected plan fragment: " << fragment << "\n" << plan;
+        }
+      }
     }
   }
   database->DeleteAll();

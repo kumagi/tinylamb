@@ -38,6 +38,15 @@ class ConstantExecutor : public ExecutorBase {
   size_t offset_{0};
 };
 
+// Explicit zero-row source used by EmptyPlan. Keeping a distinct EXPLAIN name
+// makes contradiction elimination observable without opening the discarded
+// scan child.
+class EmptyResultExecutor final : public ConstantExecutor {
+ public:
+  EmptyResultExecutor() : ConstantExecutor(std::vector<Row>{}) {}
+  void Dump(std::ostream& o, int indent) const override;
+};
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_CONSTANT_EXECUTOR_HPP

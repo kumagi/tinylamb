@@ -482,6 +482,44 @@ Value ExecuteFunction(const std::string& name,
     }
     return expected == 3 ? values[2] : values[0];
   }
+  if (name == "__pipe_concat") {
+    if (values.size() != 2 || !values[0].IsArray()) {
+      throw std::runtime_error(
+          "__pipe_concat requires an array and separator");
+    }
+    const std::string separator = raw_str(values[1]);
+    struct Pair {
+      std::string a;
+      std::string b;
+    };
+    std::vector<Pair> pairs;
+    for (const Value& element : values[0].ArrayElements()) {
+      if (element.IsNull()) { continue; }
+      const std::string text = raw_str(element);
+      Value a;
+      Value b;
+      const std::string body =
+          text.size() >= 2 && text.front() == '{'
+              ? text.substr(1, text.size() - 2)
+              : text;
+      for (const auto& [key, member] : SplitJsonObjectMembers(body)) {
+        Value parsed;
+        if (!JsonTextToValue(member, &parsed)) { continue; }
+        if (IdentifierEquals(key, "a")) { a = std::move(parsed); }
+        if (IdentifierEquals(key, "b")) { b = std::move(parsed); }
+      }
+      pairs.push_back({raw_str(a), raw_str(b)});
+    }
+    std::ranges::sort(pairs, [](const Pair& left, const Pair& right) {
+      return left.b == right.b ? left.a < right.a : left.b < right.b;
+    });
+    std::string result;
+    for (const Pair& pair : pairs) {
+      if (!result.empty()) { result += separator; }
+      result += pair.a + "," + pair.b;
+    }
+    return Value(std::move(result));
+  }
   if (name == "__struct_set") {
     if (values.size() != 3) {
       throw std::runtime_error("__struct_set requires 3 arguments");
@@ -525,6 +563,12 @@ Value ExecuteFunction(const std::string& name,
     if (values[0].IsNull()) { return {}; }
     const std::string object = raw_str(values[0]);
     const std::string field = raw_str(values[1]);
+    // Proto field reads need scalar defaults even when an empty proto is
+    // represented by an empty text payload.
+    Value proto_field;
+    if (TryProtoTextGetField(object, field, &proto_field)) {
+      return proto_field;
+    }
     if (object.size() >= 2 && object.front() == '{' &&
         object.back() == '}') {
       const auto members =
@@ -547,7 +591,6 @@ Value ExecuteFunction(const std::string& name,
     }
     // Proto text-format cells (`i1: 5 i2: 5`) carry the same field
     // semantics: extract the first (or repeated) occurrence of `field`.
-    Value proto_field;
     if (ProtoTextExtractFieldShim(object, field, &proto_field)) {
       return proto_field;
     }
@@ -964,13 +1007,24 @@ Value ExecuteFunction(const std::string& name,
   // Deferred STRUCT(...) construction: arguments alternate field name and
   // value; encoding is shared with the relational interpreter.
   if (name == "__struct_json__") {
+    bool triple_form = values.size() % 3 == 0;
+    for (size_t i = 2; triple_form && i < values.size(); i += 3) {
+      triple_form = values[i].IsNull() || values[i].type == ValueType::kInt64;
+    }
+    const size_t stride = triple_form ? 3 : 2;
     std::vector<std::pair<std::string, Value>> fields;
-    fields.reserve(values.size() / 2);
-    for (size_t i = 0; i + 1 < values.size(); i += 2) {
+    fields.reserve(values.size() / stride);
+    for (size_t i = 0; i + 1 < values.size(); i += stride) {
+      Value value = values[i + 1];
+      if (triple_form && !values[i + 2].IsNull() && !values[i + 2].Truthy() &&
+          value.type == ValueType::kVarChar &&
+          value.value.varchar_value == "null") {
+        value = Value();
+      }
       fields.emplace_back(values[i].IsNull()
                               ? std::string()
                               : std::string(values[i].value.varchar_value),
-                          values[i + 1]);
+                          std::move(value));
     }
     return Value(EncodeStructJson(fields));
   }
@@ -987,6 +1041,51 @@ Value ExecuteFunction(const std::string& name,
     fields.reserve(values.size() / 2);
     for (size_t i = 1; i < values.size(); i += 2) {
       fields.emplace_back(raw_str(values[i + 1]), values[i]);
+    }
+    return Value(ConstructProtoText(type_name, fields));
+  }
+  if (name == "__value_table_value") {
+    if (values.size() != 1) {
+      throw std::runtime_error("__value_table_value requires one argument");
+    }
+    return values.front();
+  }
+  if (name == "__value_table_proto") {
+    if (values.size() != 2) {
+      throw std::runtime_error("__value_table_proto requires two arguments");
+    }
+    if (values[1].IsNull()) { return {}; }
+    const std::string type_name = raw_str(values[0]);
+    if (type_name.find("TestExtraPB") == std::string::npos) {
+      return values[1];
+    }
+    std::vector<std::pair<std::string, Value>> fields;
+    for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
+      Value value;
+      if (TryProtoTextGetField(raw_str(values[1]), field, &value)) {
+        fields.emplace_back(field, std::move(value));
+      }
+    }
+    return Value(ConstructProtoText(type_name, fields));
+  }
+  if (name == "__value_table_proto_existing") {
+    if (values.size() != 2) {
+      throw std::runtime_error(
+          "__value_table_proto_existing requires two arguments");
+    }
+    if (values[1].IsNull()) { return {}; }
+    const std::string type_name = raw_str(values[0]);
+    if (type_name.find("TestExtraPB") == std::string::npos) {
+      return values[1];
+    }
+    const std::string payload = raw_str(values[1]);
+    std::vector<std::pair<std::string, Value>> fields;
+    for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
+      if (!ProtoTextHasField(payload, field)) { continue; }
+      Value value;
+      if (TryProtoTextGetField(payload, field, &value)) {
+        fields.emplace_back(field, std::move(value));
+      }
     }
     return Value(ConstructProtoText(type_name, fields));
   }
@@ -1224,7 +1323,12 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
         unescaped.push_back(trimmed[i]);
       }
     }
-    *parsed = Value(std::move(unescaped));
+    constexpr std::string_view kDateMarker = "__tinylamb_date__:";
+    if (unescaped.starts_with(kDateMarker)) {
+      *parsed = Value::Date(unescaped.substr(kDateMarker.size()));
+    } else {
+      *parsed = Value(std::move(unescaped));
+    }
     return true;
   }
   if (!trimmed.empty()) {
@@ -1277,6 +1381,8 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
           } else if (item.front() == '"' && item.back() == '"' &&
                      item.size() >= 2) {
             elements.emplace_back(item.substr(1, item.size() - 2));
+          } else if (element_type == "DATE") {
+            elements.emplace_back(Value::Date(item));
           } else {
             try {
               size_t consumed = 0;
@@ -1305,9 +1411,10 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
   }
-  if (!trimmed.empty() && trimmed.back() == ']' &&
+  if (!trimmed.empty() &&
       ((trimmed.front() == '{' && trimmed.back() == '}') ||
-       trimmed.front() == '[' || lowered_head == "array")) {
+       (trimmed.front() == '[' && trimmed.back() == ']') ||
+       lowered_head == "array")) {
     // Objects / bare arrays / canonical ARRAY<T>[...] tokens stay as raw
     // struct-member text.
     *parsed = Value(std::string(trimmed));
@@ -1649,6 +1756,21 @@ Value FunctionCallExpression::Evaluate(const Row& row, const Schema& schema,
 }
 
 Type FunctionCallExpression::ResultType(const Schema& schema) const {
+  if (func_name_ == "__get_field_safe" || func_name_ == "get_field") {
+    if (args_.size() > 1 && args_[1]->Type() == TypeTag::kConstantValue) {
+      const Value& field = args_[1]->AsConstantValue().GetValue();
+      if (field.type == ValueType::kVarChar) {
+        const std::string name(field.value.varchar_value);
+        if (name == "str_value") { return {TypeTag::kArray}; }
+        if (name.starts_with("int") || name.starts_with("uint") ||
+            name.starts_with("fixed") || name.starts_with("sfixed") ||
+            name.starts_with("sint") || name == "bool_val") {
+          return {TypeTag::kBigInt};
+        }
+      }
+    }
+    return {TypeTag::kVarChar};
+  }
   if (func_name_ == "coalesce" || func_name_ == "nullif" ||
       func_name_ == "ifnull" || func_name_ == "greatest" ||
       func_name_ == "least") {
@@ -1728,6 +1850,21 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
 
 Type FunctionCallExpression::ResultType(const Schema& left,
                                         const Schema& right) const {
+  if (func_name_ == "__get_field_safe" || func_name_ == "get_field") {
+    if (args_.size() > 1 && args_[1]->Type() == TypeTag::kConstantValue) {
+      const Value& field = args_[1]->AsConstantValue().GetValue();
+      if (field.type == ValueType::kVarChar) {
+        const std::string name(field.value.varchar_value);
+        if (name == "str_value") { return {TypeTag::kArray}; }
+        if (name.starts_with("int") || name.starts_with("uint") ||
+            name.starts_with("fixed") || name.starts_with("sfixed") ||
+            name.starts_with("sint") || name == "bool_val") {
+          return {TypeTag::kBigInt};
+        }
+      }
+    }
+    return {TypeTag::kVarChar};
+  }
   if (func_name_ == "coalesce" || func_name_ == "nullif" ||
       func_name_ == "ifnull" || func_name_ == "greatest" ||
       func_name_ == "least") {

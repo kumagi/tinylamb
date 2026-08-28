@@ -95,6 +95,7 @@ std::vector<std::string> ExtractStructValues(std::string_view json) {
 Value StructJsonCompare(std::string_view lhs, std::string_view rhs) {
   auto v1 = ExtractStructValues(lhs);
   auto v2 = ExtractStructValues(rhs);
+  if (v1.empty() && v2.empty()) { return Value(true); }
   if (v1.empty() || v1.size() != v2.size()) { return Value(false); }
   bool saw_null = false;
   for (size_t i = 0; i < v1.size(); ++i) {
@@ -371,6 +372,99 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
   const bool numeric =
       (left.type == ValueType::kInt64 || left.type == ValueType::kDouble) &&
       (right.type == ValueType::kInt64 || right.type == ValueType::kDouble);
+  if (numeric && left.type == ValueType::kInt64 &&
+      right.type == ValueType::kInt64 &&
+      (left.IsUnsigned() || right.IsUnsigned())) {
+    const bool mixed_signedness = left.IsUnsigned() != right.IsUnsigned();
+    const uint64_t lhs_unsigned = static_cast<uint64_t>(left.value.int_value);
+    const uint64_t rhs_unsigned = static_cast<uint64_t>(right.value.int_value);
+    const bool lhs_negative = !left.IsUnsigned() && left.value.int_value < 0;
+    const bool rhs_negative = !right.IsUnsigned() && right.value.int_value < 0;
+    auto compare = [&]() {
+      if (!mixed_signedness) {
+        return lhs_unsigned < rhs_unsigned ? -1
+               : lhs_unsigned > rhs_unsigned ? 1
+                                             : 0;
+      }
+      if (lhs_negative || rhs_negative) {
+        return lhs_negative == rhs_negative
+                   ? (lhs_negative ? (left.value.int_value < right.value.int_value ? -1 :
+                                      left.value.int_value > right.value.int_value ? 1 : 0)
+                                   : (right.value.int_value < left.value.int_value ? 1 :
+                                      right.value.int_value > left.value.int_value ? -1 : 0))
+                   : (lhs_negative ? -1 : 1);
+      }
+      return lhs_unsigned < rhs_unsigned ? -1
+             : lhs_unsigned > rhs_unsigned ? 1
+                                           : 0;
+    };
+    const int cmp = compare();
+    switch (op) {
+      case BinaryOperation::kEquals: return Value(cmp == 0);
+      case BinaryOperation::kNotEquals: return Value(cmp != 0);
+      case BinaryOperation::kLessThan: return Value(cmp < 0);
+      case BinaryOperation::kLessThanEquals: return Value(cmp <= 0);
+      case BinaryOperation::kGreaterThan: return Value(cmp > 0);
+      case BinaryOperation::kGreaterThanEquals: return Value(cmp >= 0);
+      default: break;
+    }
+    if (op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract ||
+        op == BinaryOperation::kMultiply || op == BinaryOperation::kDivide ||
+        op == BinaryOperation::kModulo) {
+      const uint64_t lhs = static_cast<uint64_t>(left.value.int_value);
+      const uint64_t rhs = static_cast<uint64_t>(right.value.int_value);
+      if ((op == BinaryOperation::kDivide || op == BinaryOperation::kModulo) &&
+          rhs == 0) {
+        throw std::runtime_error("division by zero");
+      }
+      // Keep ordinary signed-looking results signed when a UINT64 value is
+      // still in INT64's range.  This preserves SQL's `0 - 1 == -1` behavior,
+      // while values crossing the signed boundary use UINT64 wraparound.
+      if (left.IsUnsigned() && !right.IsUnsigned() &&
+          lhs <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) &&
+          right.value.int_value >= 0) {
+        bool fits_signed = false;
+        int64_t signed_result = 0;
+        switch (op) {
+          case BinaryOperation::kAdd:
+            fits_signed = rhs <=
+                         static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) -
+                         lhs;
+            if (fits_signed) {
+              signed_result = static_cast<int64_t>(lhs) + right.value.int_value;
+            }
+            break;
+          case BinaryOperation::kSubtract:
+            fits_signed = true;
+            signed_result = static_cast<int64_t>(lhs) - right.value.int_value;
+            break;
+          case BinaryOperation::kMultiply:
+            fits_signed = rhs == 0 ||
+                          lhs <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
+                                     rhs;
+            if (fits_signed) {
+              signed_result = static_cast<int64_t>(lhs) * right.value.int_value;
+            }
+            break;
+          default:
+            break;
+        }
+        if (fits_signed) {
+          return Value(static_cast<int64_t>(signed_result));
+        }
+      }
+      uint64_t unsigned_result = 0;
+      switch (op) {
+        case BinaryOperation::kAdd: unsigned_result = lhs + rhs; break;
+        case BinaryOperation::kSubtract: unsigned_result = lhs - rhs; break;
+        case BinaryOperation::kMultiply: unsigned_result = lhs * rhs; break;
+        case BinaryOperation::kDivide: unsigned_result = lhs / rhs; break;
+        case BinaryOperation::kModulo: unsigned_result = lhs % rhs; break;
+        default: break;
+      }
+      return Value(static_cast<int64_t>(unsigned_result)).WithUnsigned();
+    }
+  }
   if (op == BinaryOperation::kDivide && numeric) {
     const double lhs = left.type == ValueType::kDouble
                            ? left.value.double_value
@@ -511,13 +605,18 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     }
   }
   try {
+    auto preserve_unsigned = [&](Value result) {
+      return (left.IsUnsigned() || right.IsUnsigned())
+                 ? result.WithUnsigned()
+                 : result;
+    };
     switch (op) {
       case BinaryOperation::kAdd:
-        return left + right;
+        return preserve_unsigned(left + right);
       case BinaryOperation::kSubtract:
-        return left - right;
+        return preserve_unsigned(left - right);
       case BinaryOperation::kMultiply:
-        return left * right;
+        return preserve_unsigned(left * right);
       case BinaryOperation::kDivide: {
         if (left.type == ValueType::kDouble) {
           if (right.value.double_value == 0.0) {
@@ -529,12 +628,12 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
               std::isfinite(right.value.double_value) && std::isinf(result)) {
             throw std::runtime_error("double overflow");
           }
-          return Value(result);
+          return preserve_unsigned(Value(result));
         }
-        return left / right;
+        return preserve_unsigned(left / right);
       }
       case BinaryOperation::kModulo:
-        return left % right;
+        return preserve_unsigned(left % right);
       default:
         break;
     }

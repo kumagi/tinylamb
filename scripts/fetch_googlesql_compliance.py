@@ -32,6 +32,8 @@ SKIP = (
     "graph_",
 )
 
+LOCAL_PREFIXES = ("optimizer_",)
+
 
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
@@ -56,7 +58,8 @@ def main() -> None:
 
     wanted = set(names)
     for existing in out.glob("*.test"):
-        if existing.name not in wanted:
+        if (existing.name not in wanted and
+                not existing.name.startswith(LOCAL_PREFIXES)):
             existing.unlink()
 
     def fetch(name: str) -> tuple[str, str | None]:

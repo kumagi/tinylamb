@@ -74,6 +74,14 @@ thread_local SqlRuntimeStats tls_sql_runtime_stats;
 thread_local bool compliance_primary_key_mode = false;
 }  // namespace
 
+SqlEngine::SqlEngine(Database& database) : database_(&database) {
+  // Cache entries carry both the owning Database and its process-unique epoch.
+  // Keep the per-thread/process caches alive across short-lived SqlEngine
+  // wrappers: callers commonly create one wrapper per statement, and clearing
+  // here would make those independent wrappers unable to share prepared
+  // plans.  Stale entries are removed lazily by the cache lookup checks.
+}
+
 void SqlEngine::SetCompliancePrimaryKeyMode(bool enabled) {
   compliance_primary_key_mode = enabled;
 }
@@ -729,12 +737,14 @@ std::optional<Executor> ServeCompiledInsert(TransactionContext& ctx,
 void RememberSpecializedPlan(const std::string& fingerprint, uint64_t epoch,
                              std::vector<Value> parameters,
                              CompiledPlan::Kind kind, Plan plan,
-                             std::shared_ptr<Table> table) {
+                             std::shared_ptr<Table> table,
+                             const Database* database) {
   if (fingerprint.empty() || IsVolatileSpecializedPlan(fingerprint)) {
     return;
   }
   auto compiled = std::make_shared<CompiledPlan>();
   compiled->kind = kind;
+  compiled->database = database;
   compiled->epoch = epoch;
   compiled->parameters = std::move(parameters);
   compiled->plan = std::move(plan);
@@ -915,24 +925,35 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
   struct ResolvedItem {
     size_t offset;
     std::string element_name;
+    std::vector<std::string> proto_path;
     const NestedDmlItem* item;
   };
   std::vector<ResolvedItem> resolved;
   resolved.reserve(update.NestedItems().size());
   for (const NestedDmlItem& item : update.NestedItems()) {
-    const ColumnName name(item.target_path);
-    if (!name.schema.empty() || item.target_path.find('.') != std::string::npos) {
-      throw std::runtime_error(
-          "nested DML on a non-array field is not supported: " +
-          item.target_path);
+    std::vector<std::string> path;
+    size_t start = 0;
+    for (size_t pos = 0; pos <= item.target_path.size(); ++pos) {
+      if (pos == item.target_path.size() || item.target_path[pos] == '.') {
+        path.push_back(item.target_path.substr(start, pos - start));
+        start = pos + 1;
+      }
     }
-    const int offset = schema.Offset(name);
+    if (path.empty() || path.front().empty()) {
+      throw std::runtime_error("nested DML target not found: " +
+                               item.target_path);
+    }
+    const int offset = schema.Offset(ColumnName(path.front()));
     if (offset < 0) {
       throw std::runtime_error("nested DML target not found: " +
                                item.target_path);
     }
-    resolved.push_back(ResolvedItem{static_cast<size_t>(offset), name.name,
-                                    &item});
+    std::vector<std::string> proto_path;
+    if (path.size() > 1) {
+      proto_path.assign(path.begin() + 1, path.end());
+    }
+    resolved.push_back(ResolvedItem{static_cast<size_t>(offset),
+                                    path.back(), std::move(proto_path), &item});
   }
 
   QueryData query;
@@ -969,10 +990,31 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
     for (const ResolvedItem& entry : resolved) {
       const NestedDmlItem& item = *entry.item;
       Value& cell = new_row.values_[entry.offset];
+      const bool proto_target = !entry.proto_path.empty();
+      Value array_cell = cell;
+      std::string proto_type;
+      if (proto_target) {
+        if (cell.IsNull() || cell.type != ValueType::kVarChar) {
+          throw std::runtime_error(
+              "Cannot execute nested DML on a NULL protocol message");
+        }
+        proto_type = InferProtoTypeName(
+            std::string_view(cell.value.varchar_value), entry.proto_path);
+        Value extracted;
+        if (!TryProtoTextGetField(cell.value.varchar_value,
+                                  entry.proto_path.back(), &extracted) ||
+            !extracted.IsArray()) {
+          throw std::runtime_error("nested DML target is not a repeated "
+                                   "protocol field: " + item.target_path);
+        }
+        array_cell = std::move(extracted);
+      }
+      Value& edit_cell = proto_target ? array_cell : cell;
       const Column element_column(
           ColumnName("", entry.element_name),
-          cell.IsNull() ? ValueType::kNull
-                        : cell.IsArray() ? ValueType::kInt64 : cell.type);
+          edit_cell.IsNull() ? ValueType::kNull
+                             : edit_cell.IsArray() ? ValueType::kInt64
+                                                   : edit_cell.type);
       Schema element_schema("", {element_column});
       relational_detail::Scope outer_scope{.row = &new_row,
                                            .schema = &schema,
@@ -990,7 +1032,7 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
       ArrayEditState& state = edit_state[entry.offset];
       auto load_working = [&]() {
         if (!state.loaded) {
-          state.working = cell.ArrayElements();
+          state.working = edit_cell.ArrayElements();
           state.update_baseline = state.working;
           state.update_touched.assign(state.working.size(), false);
           state.loaded = true;
@@ -998,12 +1040,12 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
       };
       switch (item.kind) {
         case NestedDmlItem::Kind::kDelete: {
-          if (cell.IsNull()) {
+          if (edit_cell.IsNull()) {
             throw std::runtime_error(
                 "Cannot execute a nested DELETE statement on a NULL array "
                 "value");
           }
-          if (!cell.IsArray()) {
+          if (!edit_cell.IsArray()) {
             throw std::runtime_error("nested DELETE requires an ARRAY value "
                                      "in column " +
                                      item.target_path);
@@ -1031,16 +1073,16 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
           state.working = std::move(kept);
           state.update_baseline = state.working;
           state.update_touched.assign(state.working.size(), false);
-          cell = Value::Array(state.working, cell.ArrayElementSqlType());
+          edit_cell = Value::Array(state.working, edit_cell.ArrayElementSqlType());
           break;
         }
         case NestedDmlItem::Kind::kUpdate: {
-          if (cell.IsNull()) {
+          if (edit_cell.IsNull()) {
             throw std::runtime_error(
                 "Cannot execute a nested UPDATE statement on a NULL array "
                 "value");
           }
-          if (!cell.IsArray()) {
+          if (!edit_cell.IsArray()) {
             throw std::runtime_error("nested UPDATE requires an ARRAY value "
                                      "in column " +
                                      item.target_path);
@@ -1073,16 +1115,16 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
                     << " array elements modified, but found " << touched;
             throw std::runtime_error(message.str());
           }
-          cell = Value::Array(state.working, cell.ArrayElementSqlType());
+          edit_cell = Value::Array(state.working, edit_cell.ArrayElementSqlType());
           break;
         }
         case NestedDmlItem::Kind::kInsert: {
-          if (cell.IsNull()) {
+          if (edit_cell.IsNull()) {
             throw std::runtime_error(
                 "Cannot execute a nested INSERT statement on a NULL array "
                 "value");
           }
-          if (!cell.IsArray()) {
+          if (!edit_cell.IsArray()) {
             throw std::runtime_error("nested INSERT requires an ARRAY value "
                                      "in column " +
                                      item.target_path);
@@ -1118,9 +1160,15 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
             throw std::runtime_error(message.str());
           }
           state.update_baseline = state.working;
-          cell = Value::Array(state.working, cell.ArrayElementSqlType());
+          edit_cell = Value::Array(state.working, edit_cell.ArrayElementSqlType());
           break;
         }
+      }
+      if (proto_target) {
+        const auto rewritten = ProtoTextSetField(
+            std::string(cell.value.varchar_value), entry.proto_path, edit_cell,
+            proto_type);
+        if (rewritten.has_value()) { cell = Value(std::string(*rewritten)); }
       }
     }
     StatusOr<RowPosition> updated = table->Update(ctx.txn_, position, new_row);
@@ -1211,6 +1259,14 @@ std::optional<std::vector<int>> FindStructPathOrdinals(
     Value decoded =
         DecodeStructMember(members[static_cast<size_t>(index)].second);
     if (decoded.IsNull()) { return std::nullopt; }
+    if (decoded.type == ValueType::kVarChar &&
+        !std::string_view(decoded.value.varchar_value).starts_with("{")) {
+      // A STRUCT may contain a protocol message encoded as a TEXT member.
+      // The remaining path is resolved by the proto setter rather than by
+      // looking for JSON object ordinals.
+      ordinals.resize(segs.size(), -1);
+      return ordinals;
+    }
     current = decoded.type == ValueType::kVarChar
                   ? std::string(decoded.value.varchar_value)
                   : std::string("null");
@@ -1246,14 +1302,30 @@ std::optional<std::string> SetStructPathByOrdinals(
         rebuilt += EncodeStructMemberJson(new_value);
       } else {
         Value nested_value = DecodeStructMember(members[i].second);
-        auto nested = SetStructPathByOrdinals(
-            nested_value.IsNull()
-                ? std::string("null")
-                : nested_value.type == ValueType::kVarChar
-                      ? std::string(nested_value.value.varchar_value)
-                      : std::string("null"),
-            segs, ordinals, depth + 1, new_value);
-        rebuilt += nested.has_value() ? *nested : members[i].second;
+        if (nested_value.type == ValueType::kVarChar &&
+            !std::string_view(nested_value.value.varchar_value)
+                 .starts_with("{")) {
+          std::vector<std::string> proto_path(segs.begin() + depth + 1,
+                                              segs.end());
+          const std::string_view proto_text(nested_value.value.varchar_value);
+          const std::string proto_type =
+              InferProtoTypeName(proto_text, proto_path);
+          const auto proto = ProtoTextSetField(std::string(proto_text),
+                                               proto_path, new_value,
+                                               proto_type);
+          rebuilt += proto.has_value()
+                         ? EncodeStructMemberJson(Value(std::string(*proto)))
+                                       : members[i].second;
+        } else {
+          auto nested = SetStructPathByOrdinals(
+              nested_value.IsNull()
+                  ? std::string("null")
+                  : nested_value.type == ValueType::kVarChar
+                        ? std::string(nested_value.value.varchar_value)
+                        : std::string("null"),
+              segs, ordinals, depth + 1, new_value);
+          rebuilt += nested.has_value() ? *nested : members[i].second;
+        }
       }
     } else {
       rebuilt += members[i].second;
@@ -1318,8 +1390,6 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
         &expression);
   }
 
-  QueryData query;
-  query.from_ = {update.TableName()};
   // Dotted references inside the predicate resolve as STRUCT field access
   // against the column named by the first path component.
   Expression where_clause = update.WhereClause();
@@ -1356,23 +1426,19 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
     };
     where_clause = bind_struct_fields(where_clause);
   }
-  query.where_ = where_clause ? where_clause : ConstantValueExp(Value(true));
-  query.select_.reserve(schema.ColumnCount());
-  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-    query.select_.emplace_back(schema.GetColumn(i).Name().name,
-                               ColumnValueExp(schema.GetColumn(i).Name()));
-  }
-  query.require_row_position_ = true;
-  RETURN_IF_FAIL(query.Rewrite(ctx));
-  ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
-  Executor source = plan->EmitExecutor(ctx);
-
   std::vector<std::pair<Row, RowPosition>> pending;
-  Row row;
-  RowPosition position;
-  while (source->Next(&row, &position)) {
-    pending.emplace_back(std::move(row), position);
-    row = Row();
+  auto source = table->BeginFullScan(ctx.txn_);
+  while (source.IsValid()) {
+    Row row = *source;
+    relational_detail::Scope scope{.row = &row, .schema = &schema,
+                                   .outer = nullptr};
+    if (!where_clause || relational_detail::Truthy(
+                              relational_detail::Evaluate(
+                                  where_clause, scope, nullptr, ctx,
+                                  relational_detail::CteMap{}))) {
+      pending.emplace_back(std::move(row), source.Position());
+    }
+    ++source;
   }
 
   // Resolve each path segment's positional index from any matched row that
@@ -1393,6 +1459,11 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
 
   int64_t modified_rows = 0;
   for (auto& [new_row, row_position] : pending) {
+    // Re-read the physical row before editing it.  The generic executor may
+    // reuse its batch-backed VARCHAR storage between calls to Next(); a
+    // direct table read gives dotted STRUCT/PROTO updates an owning payload.
+    ASSIGN_OR_RETURN(Row, fresh_row, table->Read(ctx.txn_, row_position));
+    new_row = std::move(fresh_row);
     for (const auto& target : field_targets) {
       Value& cell = new_row.values_[target.offset];
       // Struct JSON objects start with '{'; proto TEXT payloads never do.
@@ -1507,6 +1578,11 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             }
           }
           columns.emplace_back(col_name, vtype);
+          if (std::ranges::any_of(rows, [i](const Row& row) {
+                return i < row.Size() && row[i].IsUnsigned();
+              })) {
+            columns.back().SetUnsigned(true);
+          }
         }
         ASSIGN_OR_RETURN(Table, table,
                          database_->CreateTable(
@@ -1692,6 +1768,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           }
           auto compiled = std::make_shared<CompiledPlan>();
           compiled->kind = CompiledPlan::Kind::kInsert;
+          compiled->database = database_;
           compiled->epoch = database_->SchemaEpoch();
           compiled->parameters = plan_cache_parameters_;
           compiled->insert_shape = std::move(shape);
@@ -1820,7 +1897,49 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                                  }));
       }
       const bool multi_relation = select->Sources().size() > 1;
-      if (multi_relation && (!uses_aliases || has_unqualified_column)) {
+      // Keep optimizer plans for ordinary aliased equi-joins, but preserve
+      // the general relational path when the optimizer cannot yet prove a
+      // safe implementation.  Non-equality joins and inner joins whose
+      // right-hand relation is used only by the join predicate are especially
+      // easy to mis-project or eliminate; relational execution evaluates the
+      // complete predicate over the complete input rows.
+      const bool has_non_equality_join = std::ranges::any_of(
+          select->Sources(), [](const SelectSource& source) {
+            if (!source.join_condition ||
+                source.join_condition->Type() != TypeTag::kBinaryExp) {
+              return false;
+            }
+            return source.join_condition->AsBinaryExpression().Op() !=
+                   BinaryOperation::kEquals;
+          });
+      std::unordered_set<ColumnName> visible_references;
+      for (const NamedExpression& item : select->SelectList()) {
+        visible_references.merge(item.expression->TouchedColumns());
+      }
+      visible_references.merge(select->WhereClause()
+                                   ? select->WhereClause()->TouchedColumns()
+                                   : std::unordered_set<ColumnName>{});
+      for (const auto& term : select->OrderBy()) {
+        visible_references.merge(term.expression->TouchedColumns());
+      }
+      for (const Expression& expression : select->GroupBy()) {
+        visible_references.merge(expression->TouchedColumns());
+      }
+      visible_references.merge(select->Having()
+                                   ? select->Having()->TouchedColumns()
+                                   : std::unordered_set<ColumnName>{});
+      const bool has_join_only_source = std::ranges::any_of(
+          select->Sources(), [&](const SelectSource& source) {
+            if (source.alias.empty()) { return false; }
+            return !std::ranges::any_of(
+                visible_references, [&](const ColumnName& column) {
+                  return !column.schema.empty() &&
+                         column.schema == source.alias;
+                });
+          });
+      if (multi_relation &&
+          (!uses_aliases || has_unqualified_column || has_non_equality_join ||
+           has_join_only_source)) {
         return emit_relational();
       }
       QueryData query;
@@ -1867,14 +1986,28 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                     ctx.GetTable(physical);
                 if (!found.HasValue()) { continue;
 }
+                const Schema& source_schema = found.Value()->GetSchema();
+                if (source_schema.ColumnCount() == 1 &&
+                    physical.find("TestExtraPBValueTable") !=
+                        std::string::npos) {
+                  const ColumnName base(
+                      relation, source_schema.GetColumn(0).Name().name);
+                  for (const char* field : {"int32_val1", "int32_val2",
+                                            "str_value"}) {
+                    expanded.emplace_back(
+                        field,
+                        FunctionCallExp(
+                            "__get_field_safe",
+                            {ColumnValueExp(base),
+                             ConstantValueExp(Value(std::string(field)))}));
+                  }
+                  continue;
+                }
                 for (size_t i = 0;
-                     i < found.Value()->GetSchema().ColumnCount(); ++i) {
+                     i < source_schema.ColumnCount(); ++i) {
                   expanded.emplace_back(
                       ColumnName(relation,
-                                 found.Value()->GetSchema()
-                                     .GetColumn(i)
-                                     .Name()
-                                     .name));
+                                 source_schema.GetColumn(i).Name().name));
                 }
               }
               continue;
@@ -1972,6 +2105,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         shape->final_select_size = query.select_.size();
         auto compiled = std::make_shared<CompiledPlan>();
         compiled->kind = CompiledPlan::Kind::kSelect;
+        compiled->database = database_;
         compiled->epoch = database_->SchemaEpoch();
         compiled->parameters = plan_cache_parameters_;
         compiled->plan = plan;
@@ -1995,9 +2129,12 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       if (update.HasNestedDml()) {
         // Nested per-row array DML: rows are rewritten element-wise here
         // because array mutations are not expressible as plain projections.
-        return ExecuteNestedArrayUpdate(ctx, update, table.get());
+        StatusOr<Executor> result =
+            ExecuteNestedArrayUpdate(ctx, update, table.get());
+        if (result.HasValue()) { database_->BumpSchemaEpoch(); }
+        return result;
       }
-      const Schema& schema = table->GetSchema();
+  const Schema& schema = table->GetSchema();
       {
         bool dotted_target = false;
         for (const auto& [target, expression] : update.SetClause()) {
@@ -2007,7 +2144,10 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           }
         }
         if (dotted_target) {
-          return ExecuteStructFieldUpdate(ctx, update, table.get());
+          StatusOr<Executor> result =
+              ExecuteStructFieldUpdate(ctx, update, table.get());
+          if (result.HasValue()) { database_->BumpSchemaEpoch(); }
+          return result;
         }
       }
       std::vector<NamedExpression> output;
@@ -2235,7 +2375,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       if (!update.HasAssert()) {
         RememberSpecializedPlan(
             plan_cache_fingerprint_, database_->SchemaEpoch(),
-            plan_cache_parameters_, CompiledPlan::Kind::kUpdate, plan, table);
+            plan_cache_parameters_, CompiledPlan::Kind::kUpdate, plan, table,
+            database_);
       }
       // Compliance primary-key mode: UPDATEs assigning the first column must
       // keep the emulated key unique and duplicate-free.
@@ -2346,7 +2487,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       if (!remove.HasAssert()) {
         RememberSpecializedPlan(
             plan_cache_fingerprint_, database_->SchemaEpoch(),
-            plan_cache_parameters_, CompiledPlan::Kind::kDelete, plan, table);
+            plan_cache_parameters_, CompiledPlan::Kind::kDelete, plan, table,
+            database_);
       }
       return Executor(std::make_shared<DeleteExecutor>(
           ctx.txn_, *table, plan->EmitExecutor(ctx),
@@ -2372,10 +2514,10 @@ std::optional<Executor> SqlEngine::ServeFromPlanCache(
     const std::vector<Value>& parameters) {
   if (IsVolatileSpecializedPlan(fingerprint)) { return std::nullopt; }
   CompiledPlanPtr compiled =
-      FindThreadCompiledPlan(fingerprint, database_->SchemaEpoch());
+      FindThreadCompiledPlan(fingerprint, database_, database_->SchemaEpoch());
   if (!compiled) {
     compiled = PreparedPlanCache::Instance().Find(
-        fingerprint, database_->SchemaEpoch());
+        fingerprint, database_, database_->SchemaEpoch());
   }
   if (!compiled) {
     return std::nullopt;

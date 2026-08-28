@@ -44,6 +44,31 @@
 
 namespace tinylamb::relational_detail {
 
+bool IsVirtualValueTableField(const Schema& schema, const ColumnName& name) {
+  if (schema.ColumnCount() != 1) {
+    return false;
+  }
+  const ColumnName& only = schema.GetColumn(0).Name();
+  if (only.name.empty()) {
+    return false;
+  }
+  // A value table's implementation column is commonly named after the
+  // table (for CREATE TABLE AS SELECT AS PROTO), not necessarily `$expr0`.
+  // Any non-physical field reference against a one-column relation therefore
+  // needs the sole payload column retained for dotted-field evaluation.
+  if (name.name == only.name &&
+      (name.schema.empty() || name.schema == only.schema)) {
+    return false;
+  }
+  return name.schema.empty() ||
+         (only.schema.size() == name.schema.size() &&
+          std::equal(only.schema.begin(), only.schema.end(), name.schema.begin(),
+                     [](char left, char right) {
+                       return std::tolower(static_cast<unsigned char>(left)) ==
+                              std::tolower(static_cast<unsigned char>(right));
+                     }));
+}
+
 std::vector<PredicateInfo> AnalyzePredicates(
     const Expression& where, const std::vector<Relation>& relations) {
   std::vector<PredicateInfo> result;
@@ -53,8 +78,10 @@ std::vector<PredicateInfo> AnalyzePredicates(
     for (const ColumnName& column : expression->TouchedColumns()) {
       std::optional<size_t> owner;
       for (size_t i = 0; i < relations.size(); ++i) {
-        if (!LocalColumnOffset(relations[i].schema, column)) { continue;
-}
+        if (!LocalColumnOffset(relations[i].schema, column) &&
+            !IsVirtualValueTableField(relations[i].schema, column)) {
+          continue;
+        }
         if (owner) {
           predicate.resolved = false;
           break;
@@ -107,28 +134,27 @@ bool IsColumnEqualityPredicate(const Expression& predicate) {
          binary.Right()->Type() == TypeTag::kColumnValue;
 }
 
-bool MapsToEqualityKey(const Schema& left, const Schema& right,
-                       const Expression& predicate) {
-  if (!IsColumnEqualityPredicate(predicate)) { return false;
-}
-  const BinaryExpression& binary = predicate->AsBinaryExpression();
-  const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
-  const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
-  const auto lhs_left = LocalColumnOffset(left, lhs);
-  const auto lhs_right = LocalColumnOffset(right, lhs);
-  const auto rhs_left = LocalColumnOffset(left, rhs);
-  const auto rhs_right = LocalColumnOffset(right, rhs);
-  return (lhs_left && rhs_right) || (rhs_left && lhs_right);
-}
-
 std::vector<Expression> ResidualJoinPredicates(
-    const Schema& left, const Schema& right,
+    const Schema& /*left*/, const Schema& /*right*/,
     const std::vector<Expression>& predicates) {
   std::vector<Expression> residual;
   residual.reserve(predicates.size());
   for (const Expression& predicate : predicates) {
-    if (MapsToEqualityKey(left, right, predicate)) { continue;
-}
+    if (IsColumnEqualityPredicate(predicate)) {
+      const auto& binary = predicate->AsBinaryExpression();
+      const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
+      const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
+      if (lhs.schema.empty() && rhs.schema.empty() && lhs.name == rhs.name) {
+        // A USING equality is represented as the same bare name on both
+        // sides.  It is enforced positionally by the join and must not be
+        // evaluated against the combined schema, where it is ambiguous.
+        continue;
+      }
+    }
+    // Keep key equalities as a residual predicate as well.  Hash keys are an
+    // indexing aid, not a complete SQL comparison: UINT64 and INT64 share
+    // the same physical int64 representation, so a bucket collision must be
+    // checked with the original typed expression.
     residual.push_back(predicate);
   }
   return residual;
@@ -516,7 +542,6 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
       EqualityKeys(left.schema, right.schema, predicates);
   const std::vector<Expression> residual =
       ResidualJoinPredicates(left.schema, right.schema, predicates);
-
   auto matches = [&](const Row& combined) {
     if (residual.empty()) { return true;
 }
@@ -972,7 +997,8 @@ Relation LateralExpandRelation(TransactionContext& context,
       matched = true;
       output.AddRow(std::move(combined));
     });
-    if (!matched && left_outer) {
+    if (!matched && left_outer &&
+        !(condition == nullptr && elements.TotalRows() > 0)) {
       std::vector<Value> nulls(
           output.schema.ColumnCount() - row.values_.size(), Value());
       output.AddRow(row + Row(std::move(nulls)));
@@ -1153,14 +1179,48 @@ Relation BuildInput(TransactionContext& context,
   // OUTER JOIN predicates and USING merges have order-dependent semantics,
   // so retain their syntactic order. The optimizer below is valid for
   // inner/cross joins.
-  const bool has_ordered_join =
-      std::any_of(statement.Sources().begin() + 1, statement.Sources().end(),
-                  [](const SelectSource& source) {
-                    return source.join_type == JoinType::kLeft ||
-                           source.join_type == JoinType::kRight ||
-                           source.join_type == JoinType::kFull ||
-                           !source.using_columns.empty();
-                  });
+  const bool has_nested_join = std::any_of(
+      statement.Sources().begin(), statement.Sources().end(),
+      [](const SelectSource& source) { return source.from_nested_join; });
+  const bool has_ordered_join = std::any_of(
+      statement.Sources().begin() + 1, statement.Sources().end(),
+      [](const SelectSource& source) {
+        return source.join_type == JoinType::kLeft ||
+               source.join_type == JoinType::kRight ||
+               source.join_type == JoinType::kFull ||
+               source.from_nested_join || source.unnest ||
+               !source.using_columns.empty();
+      });
+  if (has_nested_join) {
+    // A parenthesized right-hand join is flattened by the frontend so that
+    // column binding remains positional.  Its first source carries the
+    // predicate of the outer join, while subsequent sources carry the
+    // predicates inside the parentheses.  Reconstruct that right-deep tree
+    // here before joining it to the prefix.
+    size_t nested_begin = 0;
+    while (nested_begin < statement.Sources().size() &&
+           !statement.Sources()[nested_begin].from_nested_join) {
+      ++nested_begin;
+    }
+    for (size_t i = 0; i < relations.size(); ++i) {
+      if (base_sources[i]) {
+        relations[i] = LoadSource(context, statement.Sources()[i], outer,
+                                  ctes, &projections[i]);
+      }
+    }
+    Relation prefix = std::move(relations.front());
+    for (size_t i = 1; i < nested_begin; ++i) {
+      prefix = Join(context, std::move(prefix), std::move(relations[i]),
+                    statement.Sources()[i], outer, ctes);
+    }
+    Relation nested = std::move(relations[nested_begin]);
+    for (size_t i = nested_begin + 1; i < relations.size(); ++i) {
+      nested = Join(context, std::move(nested), std::move(relations[i]),
+                    statement.Sources()[i], outer, ctes);
+    }
+    return Join(context, std::move(prefix), std::move(nested),
+                statement.Sources()[nested_begin], outer, ctes);
+  }
   if (has_ordered_join) {
     for (size_t i = 0; i < relations.size(); ++i) {
       if (base_sources[i]) {

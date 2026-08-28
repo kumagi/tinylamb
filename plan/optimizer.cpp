@@ -38,6 +38,7 @@
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
@@ -116,6 +117,196 @@ std::vector<Expression> NormalizeOrderingForOutput(
     }
   }
   return normalized;
+}
+
+bool SameExpression(const Expression& left, const Expression& right) {
+  return left == right ||
+         (left && right && left->Type() == right->Type() &&
+          left->ToString() == right->ToString());
+}
+
+bool SafeDeterministicExpression(  // NOLINT(misc-no-recursion)
+    const Expression& expression) {
+  if (!expression || expression->Type() == TypeTag::kQueryExp ||
+      expression->Type() == TypeTag::kAggregateExp) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kFunctionCallExp &&
+      GetFunctionVolatility(
+          expression->AsFunctionCallExpression().FuncName()) !=
+          Volatility::kImmutable) {
+    return false;
+  }
+  return std::ranges::all_of(ExpressionChildren(expression),
+                             SafeDeterministicExpression);
+}
+
+Schema BuildInputSchema(
+    const QueryData& query,
+    const std::unordered_map<std::string, std::shared_ptr<Table>>& tables) {
+  Schema result;
+  for (const std::string& relation : query.from_) {
+    const auto found = tables.find(relation);
+    if (found == tables.end()) { continue; }
+    const Schema& source = found->second->GetSchema();
+    std::vector<Column> columns;
+    columns.reserve(source.ColumnCount());
+    for (size_t i = 0; i < source.ColumnCount(); ++i) {
+      Column column = source.GetColumn(i);
+      column.Name().schema = relation;
+      columns.push_back(std::move(column));
+    }
+    result = result + Schema(relation, std::move(columns));
+  }
+  return result;
+}
+
+bool CanSimplifySelfComparison(const Expression& expression,
+                               const Schema& input_schema) {
+  if (!SafeDeterministicExpression(expression)) { return false; }
+  try {
+    const TypeTag type = expression->ResultType(input_schema).GetType();
+    // IEEE NaN breaks x = x and x != x identities.
+    return type == TypeTag::kBigInt || type == TypeTag::kVarChar ||
+           type == TypeTag::kDate;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+struct SimpleComparison {
+  Expression key;
+  BinaryOperation operation;
+  Value constant;
+};
+
+std::optional<SimpleComparison> ExtractSimpleComparison(
+    const Expression& expression) {
+  if (!expression || expression->Type() != TypeTag::kBinaryExp) {
+    return std::nullopt;
+  }
+  const auto& binary = expression->AsBinaryExpression();
+  switch (binary.Op()) {
+    case BinaryOperation::kEquals:
+    case BinaryOperation::kNotEquals:
+    case BinaryOperation::kLessThan:
+    case BinaryOperation::kLessThanEquals:
+    case BinaryOperation::kGreaterThan:
+    case BinaryOperation::kGreaterThanEquals:
+      break;
+    default:
+      return std::nullopt;
+  }
+  if (binary.Left()->Type() == TypeTag::kConstantValue ||
+      binary.Right()->Type() != TypeTag::kConstantValue) {
+    return std::nullopt;
+  }
+  const Value constant = binary.Right()->AsConstantValue().GetValue();
+  if (constant.IsNull()) { return std::nullopt; }
+  return SimpleComparison{binary.Left(), binary.Op(), constant};
+}
+
+std::optional<bool> EvaluateConstantPredicate(BinaryOperation operation,
+                                              const Value& left,
+                                              const Value& right) {
+  try {
+    const Value result = EvaluateBinary(operation, left, right);
+    if (result.IsNull()) { return std::nullopt; }
+    return result.Truthy();
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+bool ComparisonPairIsContradictory(const SimpleComparison& left,
+                                   const SimpleComparison& right) {
+  if (!SameExpression(left.key, right.key)) { return false; }
+
+  const auto contradicts_equality = [](const SimpleComparison& equality,
+                                       const SimpleComparison& constraint) {
+    const std::optional<bool> accepted = EvaluateConstantPredicate(
+        constraint.operation, equality.constant, constraint.constant);
+    return accepted.has_value() && !*accepted;
+  };
+  if (left.operation == BinaryOperation::kEquals) {
+    return contradicts_equality(left, right);
+  }
+  if (right.operation == BinaryOperation::kEquals) {
+    return contradicts_equality(right, left);
+  }
+
+  const auto is_lower = [](BinaryOperation operation) {
+    return operation == BinaryOperation::kGreaterThan ||
+           operation == BinaryOperation::kGreaterThanEquals;
+  };
+  const auto is_upper = [](BinaryOperation operation) {
+    return operation == BinaryOperation::kLessThan ||
+           operation == BinaryOperation::kLessThanEquals;
+  };
+  const SimpleComparison* lower = &left;
+  const SimpleComparison* upper = &right;
+  if (is_upper(left.operation) && is_lower(right.operation)) {
+    lower = &right;
+    upper = &left;
+  } else if (!is_lower(left.operation) || !is_upper(right.operation)) {
+    return false;
+  }
+
+  const std::optional<bool> reversed = EvaluateConstantPredicate(
+      BinaryOperation::kGreaterThan, lower->constant, upper->constant);
+  if (reversed.value_or(false)) { return true; }
+  const std::optional<bool> equal = EvaluateConstantPredicate(
+      BinaryOperation::kEquals, lower->constant, upper->constant);
+  return equal.value_or(false) &&
+         (lower->operation == BinaryOperation::kGreaterThan ||
+          upper->operation == BinaryOperation::kLessThan);
+}
+
+// WHERE rejects both FALSE and UNKNOWN. This permits stronger simplification
+// than a general scalar-expression context while preserving SQL three-valued
+// semantics in projections and CASE expressions.
+Expression SimplifyFilterPredicate(const Expression& predicate,
+                                   const Schema& input_schema) {
+  std::vector<Expression> conjuncts = SplitConjuncts(predicate);
+  for (Expression& conjunct : conjuncts) {
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) { continue; }
+    const auto& binary = conjunct->AsBinaryExpression();
+    if (!SameExpression(binary.Left(), binary.Right()) ||
+        !CanSimplifySelfComparison(binary.Left(), input_schema)) {
+      continue;
+    }
+    switch (binary.Op()) {
+      case BinaryOperation::kEquals:
+      case BinaryOperation::kLessThanEquals:
+      case BinaryOperation::kGreaterThanEquals:
+        conjunct = UnaryExpressionExp(binary.Left(),
+                                      UnaryOperation::kIsNotNull);
+        break;
+      case BinaryOperation::kNotEquals:
+      case BinaryOperation::kLessThan:
+      case BinaryOperation::kGreaterThan:
+        return ConstantValueExp(Value(false));
+      default:
+        break;
+    }
+  }
+
+  std::vector<SimpleComparison> comparisons;
+  comparisons.reserve(conjuncts.size());
+  for (const Expression& conjunct : conjuncts) {
+    if (std::optional<SimpleComparison> comparison =
+            ExtractSimpleComparison(conjunct)) {
+      comparisons.push_back(std::move(*comparison));
+    }
+  }
+  for (size_t i = 0; i < comparisons.size(); ++i) {
+    for (size_t j = i + 1; j < comparisons.size(); ++j) {
+      if (ComparisonPairIsContradictory(comparisons[i], comparisons[j])) {
+        return ConstantValueExp(Value(false));
+      }
+    }
+  }
+  return CombineConjuncts(conjuncts);
 }
 
 // Relations a conjunct touches. Qualified names are relation identities
@@ -588,6 +779,21 @@ StatusOr<Plan> Optimizer::OptimizeRelational(
 StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
                                    TransactionContext& ctx,
                                    const OptimizerOptions& options) {
+  const ExpressionRewriter scalar_rewriter(options.expression_rules);
+  bool order_rewritten = false;
+  QueryData scalar_normalized = query;
+  for (size_t i = 0; i < query.order_expressions_.size(); ++i) {
+    if (!query.order_expressions_[i]) { continue; }
+    Expression rewritten =
+        scalar_rewriter.Rewrite(query.order_expressions_[i]);
+    if (rewritten->ToString() != query.order_expressions_[i]->ToString()) {
+      order_rewritten = true;
+      scalar_normalized.order_expressions_[i] = std::move(rewritten);
+    }
+  }
+  if (order_rewritten) {
+    return Optimize(scalar_normalized, ctx, options);
+  }
   // ORDER BY literals do not distinguish rows. Remove them before building
   // the logical sort/top-N layers so direct optimizer callers and the SQL
   // facade share the same property and limit behavior.
@@ -613,7 +819,12 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     }
     return Optimize(normalized, ctx, options);
   }
-  const std::vector<NamedExpression> expanded_select = ExpandSelect(query, ctx);
+  std::vector<NamedExpression> expanded_select = ExpandSelect(query, ctx);
+  for (NamedExpression& selected : expanded_select) {
+    if (selected.expression) {
+      selected.expression = scalar_rewriter.Rewrite(selected.expression);
+    }
+  }
 
   const bool has_aggregate = std::ranges::any_of(expanded_select, IsAggregate);
   if (has_aggregate && !std::ranges::all_of(expanded_select, IsAggregate)) {
@@ -651,7 +862,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
 
   const Expression source_predicate =
       query.where_ ? query.where_ : ConstantValueExp(Value(true));
-  const Expression predicate =
+  Expression predicate =
       ExpressionRewriter(options.expression_rules).Rewrite(source_predicate);
 
   cascades::RuleContext rule_context;
@@ -670,6 +881,14 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     rule_context.tables.emplace(relation, std::move(table));
     rule_context.statistics.emplace(relation, std::move(table_statistics));
   }
+
+  const Schema input_schema = BuildInputSchema(query, rule_context.tables);
+  for (NamedExpression& selected : expanded_select) {
+    selected.expression =
+        RewriteTypedArithmetic(selected.expression, input_schema);
+  }
+  predicate = SimplifyFilterPredicate(
+      RewriteTypedArithmetic(predicate, input_schema), input_schema);
 
   // Subquery decorrelation (tpch Phase2-4 / P1-5): canonical IN / EXISTS /
   // NOT EXISTS conjuncts become semi/anti hash joins wrapped around the
@@ -952,6 +1171,27 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
       search_root, properties, *implementation_rules, rule_context);
   if (!best) {
     return Status::kNotImplemented;
+  }
+
+  // A projection group can be subsumed by a commuted join alternative when
+  // the required output properties are otherwise satisfied.  Keep the
+  // selected output contract explicit at the boundary: join reordering must
+  // never leak the optimizer's internal column order to callers.
+  if (!has_aggregate) {
+    Plan projection = std::make_shared<ProjectionPlan>(best->plan,
+                                                       projection_items);
+    const Schema& projected_schema = projection->GetSchema();
+    const Schema& actual_schema = best->plan->GetSchema();
+    bool same_layout = projected_schema.ColumnCount() ==
+                       actual_schema.ColumnCount();
+    for (size_t i = 0; same_layout && i < projected_schema.ColumnCount();
+         ++i) {
+      same_layout = projected_schema.GetColumn(i).Name() ==
+                    actual_schema.GetColumn(i).Name();
+    }
+    if (!same_layout) {
+      best->plan = std::move(projection);
+    }
   }
 
   // Emit the decorrelated semi/anti joins around the optimized core: the

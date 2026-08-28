@@ -25,6 +25,7 @@
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
+#include "expression/proto_text.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
@@ -494,34 +495,43 @@ Relation UnnestValueToRelation(const SelectSource& source,
   if (elem_sql_type == "PROTO") {
     std::vector<Column> cols;
     cols.emplace_back(col_name, ValueType::kVarChar);
-    std::vector<std::vector<Value>> field_values(elements.size());
-    for (size_t row_idx = 0; row_idx < elements.size(); ++row_idx) {
-      if (!elements[row_idx].IsNull() &&
-          elements[row_idx].type == ValueType::kVarChar) {
-        const std::string text =
-            std::string(elements[row_idx].value.varchar_value);
-        std::istringstream iss(text);
-        std::string field_name_colon, val_str;
-        while (iss >> field_name_colon >> val_str) {
-          if (field_name_colon.ends_with(':')) {
-            std::string f_name =
-                field_name_colon.substr(0, field_name_colon.size() - 1);
-            if (row_idx == 0) {
-              std::string qualified_name = col_name;
-              qualified_name += ".";
-              qualified_name += f_name;
-              cols.emplace_back(std::move(qualified_name), ValueType::kInt64);
-            }
-            int64_t v = 0;
-            try {
-              v = std::stoll(val_str);
-            } catch (...) {
-              v = 0;
-            }
-            field_values[row_idx].push_back(Value(v));
-          }
+    std::vector<std::string> field_names;
+    for (const Value& element : elements) {
+      if (element.IsNull() || element.type != ValueType::kVarChar) {
+        continue;
+      }
+      std::vector<ProtoTextEntry> parsed;
+      const std::string text(element.value.varchar_value);
+      if (!ParseProtoTextEntries(text, &parsed)) { continue; }
+      for (const ProtoTextEntry& entry : parsed) {
+        if (std::ranges::none_of(field_names, [&](const std::string& name) {
+              return name == entry.name;
+            })) {
+          field_names.push_back(entry.name);
         }
       }
+    }
+    std::vector<std::vector<Value>> field_values(
+        elements.size(), std::vector<Value>(field_names.size()));
+    for (size_t field_idx = 0; field_idx < field_names.size(); ++field_idx) {
+      std::string qualified_name = col_name + "." + field_names[field_idx];
+      ValueType type = ValueType::kNull;
+      for (size_t row_idx = 0; row_idx < elements.size(); ++row_idx) {
+        if (elements[row_idx].IsNull() ||
+            elements[row_idx].type != ValueType::kVarChar) {
+          continue;
+        }
+        Value field;
+        if (ProtoTextExtractField(elements[row_idx].value.varchar_value,
+                                  field_names[field_idx], &field)) {
+          field_values[row_idx][field_idx] = field;
+          if (!field.IsNull()) { type = field.type; }
+        }
+      }
+      cols.emplace_back(std::move(qualified_name), type);
+    }
+    if (!source.offset_alias.empty()) {
+      cols.emplace_back(source.offset_alias, ValueType::kInt64);
     }
     result.schema = Schema("", std::move(cols));
     for (size_t row_idx = 0; row_idx < elements.size(); ++row_idx) {
@@ -529,6 +539,9 @@ Relation UnnestValueToRelation(const SelectSource& source,
       row_vals.push_back(std::move(elements[row_idx]));
       for (auto& fv : field_values[row_idx]) {
         row_vals.push_back(std::move(fv));
+      }
+      if (!source.offset_alias.empty()) {
+        row_vals.push_back(Value(static_cast<int64_t>(row_idx)));
       }
       result.AddRow(Row(std::move(row_vals)));
     }
@@ -926,6 +939,31 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
         result.schema = saved_schema;
       }
     }
+  }
+  // Values are stored as INT64 bit patterns, while the catalog retains the
+  // SQL UINT64 declaration on the column.  Reattach that declaration to the
+  // row values before expressions (notably `id < 0`) evaluate them.
+  bool has_unsigned_column = false;
+  for (size_t i = 0; i < result.schema.ColumnCount(); ++i) {
+    has_unsigned_column = has_unsigned_column ||
+                          result.schema.GetColumn(i).IsUnsigned();
+  }
+  if (has_unsigned_column) {
+    Relation normalized(context.execution_runtime());
+    normalized.schema = result.schema;
+    result.ForEachRow([&](const Row& input) {
+      Row row = input;
+      for (size_t i = 0; i < row.Size() && i < normalized.schema.ColumnCount();
+           ++i) {
+        if (normalized.schema.GetColumn(i).IsUnsigned() &&
+            row[i].type == ValueType::kInt64 && !row[i].IsUnsigned()) {
+          row[i] = row[i].WithUnsigned();
+        }
+      }
+      normalized.AddRow(std::move(row));
+    });
+    CopyExecutionStats(&normalized, result);
+    result = std::move(normalized);
   }
   const std::string qualifier =
       source.alias.empty() ? source.table : source.alias;

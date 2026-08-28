@@ -372,6 +372,14 @@ std::string NormalizeGroupByDistinct(std::string_view sql) {
   size_t pos = lower.find("group by distinct");
   if (pos != std::string::npos) {
     size_t after = pos + 17;
+    // `distinct_1` is an ordinary identifier, not the GROUP BY DISTINCT
+    // modifier.  Rewriting it would remove the identifier prefix and turn
+    // the query into the invalid token `GROUP BY_1`.
+    if (after < lower.size() &&
+        (std::isalnum(static_cast<unsigned char>(lower[after])) != 0 ||
+         lower[after] == '_')) {
+      return std::string(sql);
+    }
     while (after < lower.size() &&
            std::isspace(static_cast<unsigned char>(lower[after]))) {
       ++after;

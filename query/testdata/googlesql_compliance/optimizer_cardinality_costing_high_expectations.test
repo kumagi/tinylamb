@@ -1,0 +1,194 @@
+# Histogram, correlation, skew, parameter sensitivity, and cost-model
+# expectations. The plan fragments make estimation quality observable.
+
+[prepare_database]
+CREATE TABLE opt_skew AS
+SELECT 1 AS id, 1 AS hot_key, 10 AS correlated, 'common' AS class
+UNION ALL SELECT 2, 1, 20, 'common'
+UNION ALL SELECT 3, 1, 30, 'common'
+UNION ALL SELECT 4, 1, 40, 'common'
+UNION ALL SELECT 5, 1, 50, 'common'
+UNION ALL SELECT 6, 2, 60, 'rare'
+UNION ALL SELECT 7, 3, 70, 'rare'
+UNION ALL SELECT 8, 4, 80, 'rare'
+UNION ALL SELECT 9, CAST(NULL AS INT64), 90, 'nullish'
+UNION ALL SELECT 10, CAST(NULL AS INT64), 100, 'nullish';
+CREATE TABLE opt_skew_dim AS
+SELECT 1 AS hot_key, 'one' AS label
+UNION ALL SELECT 2, 'two'
+UNION ALL SELECT 3, 'three'
+UNION ALL SELECT 4, 'four';
+ANALYZE opt_skew;
+ANALYZE opt_skew_dim;
+--
+ARRAY<STRUCT<x INT64>>[]
+==
+
+[mode=explain]
+[plan_contains=Filter rows~5 selectivity=0.5 source=MCV]
+[name=most_common_value_frequency_drives_equality_estimate]
+SELECT id FROM opt_skew WHERE hot_key = 1 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}]
+==
+
+[mode=explain]
+[plan_contains=Filter rows~1 selectivity=0.1 source=histogram]
+[name=rare_value_uses_histogram_frequency]
+SELECT id FROM opt_skew WHERE hot_key = 4
+--
+ARRAY<STRUCT<id INT64>>[{8}]
+==
+
+[mode=explain]
+[plan_contains=Filter rows~2 null_fraction=0.2]
+[name=null_fraction_drives_is_null_estimate]
+SELECT id FROM opt_skew WHERE hot_key IS NULL ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{9}, {10}]
+==
+
+[mode=explain]
+[plan_contains=Filter rows~8 selectivity=0.8]
+[name=not_null_estimate_uses_complement_of_null_fraction]
+SELECT id FROM opt_skew WHERE hot_key IS NOT NULL ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}]
+==
+
+[mode=explain]
+[plan_contains=Filter rows~5 source=extended_statistics]
+[plan_not_contains=independence_assumption]
+[name=correlated_predicates_use_multicolumn_statistics]
+SELECT id FROM opt_skew
+WHERE hot_key = 1 AND correlated <= 50 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}]
+==
+
+[mode=explain]
+[plan_contains=Filter rows~3 source=range_histogram]
+[name=range_histogram_estimates_inequality]
+SELECT id FROM opt_skew WHERE correlated BETWEEN 30 AND 50 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{3}, {4}, {5}]
+==
+
+[mode=explain]
+[plan_contains=Filter rows~6 source=MCV_union]
+[name=or_selectivity_accounts_for_disjoint_mcv_values]
+SELECT id FROM opt_skew WHERE hot_key = 1 OR hot_key = 2 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}, {6}]
+==
+
+[mode=explain]
+[plan_contains=HashJoin rows~8 source=foreign_key]
+[plan_not_contains=rows~10]
+[name=foreign_key_join_estimate_excludes_null_keys]
+SELECT s.id, d.label FROM opt_skew s JOIN opt_skew_dim d
+ON s.hot_key = d.hot_key ORDER BY s.id
+--
+ARRAY<STRUCT<id INT64, label STRING>>[
+  {1, "one"}, {2, "one"}, {3, "one"}, {4, "one"}, {5, "one"},
+  {6, "two"}, {7, "three"}, {8, "four"}
+]
+==
+
+[mode=explain]
+[plan_contains=Join build=opt_skew_dim reason=smaller_after_filter]
+[name=cost_model_builds_hash_on_smaller_relation]
+SELECT s.id, d.label FROM opt_skew s JOIN opt_skew_dim d
+ON s.hot_key = d.hot_key
+--
+ARRAY<STRUCT<id INT64, label STRING>>[unknown order:
+  {1, "one"}, {2, "one"}, {3, "one"}, {4, "one"}, {5, "one"},
+  {6, "two"}, {7, "three"}, {8, "four"}
+]
+==
+
+[mode=explain]
+[plan_contains=IndexScan: opt_skew point selectivity=0.1]
+[plan_not_contains=FullScan: opt_skew]
+[name=rare_parameter_shape_chooses_index]
+SELECT id FROM opt_skew WHERE id = 10
+--
+ARRAY<STRUCT<id INT64>>[{10}]
+==
+
+[mode=explain]
+[plan_contains=FullScan: opt_skew selectivity=0.5]
+[plan_not_contains=IndexScan: opt_skew]
+[name=hot_parameter_shape_chooses_scan]
+SELECT id FROM opt_skew WHERE hot_key = 1 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}]
+==
+
+[mode=explain]
+[plan_contains=PlanVariant key=hot_key bucket=MCV]
+[plan_contains=parameter_sensitive=true]
+[name=parameter_sensitive_plan_records_histogram_bucket]
+SELECT id FROM opt_skew WHERE hot_key = 1 ORDER BY id
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}]
+==
+
+[mode=explain]
+[plan_contains=Distinct rows~5 ndv=5 includes_null=true]
+[name=ndv_statistics_estimate_distinct_cardinality]
+SELECT DISTINCT hot_key FROM opt_skew
+--
+ARRAY<STRUCT<hot_key INT64>>[unknown order:{1}, {2}, {3}, {4}, {NULL}]
+==
+
+[mode=explain]
+[plan_contains=Aggregate groups~4 source=ndv]
+[name=group_count_uses_non_null_ndv]
+SELECT hot_key, COUNT(*) AS n FROM opt_skew
+WHERE hot_key IS NOT NULL GROUP BY hot_key
+--
+ARRAY<STRUCT<hot_key INT64, n INT64>>[unknown order:
+  {1, 5}, {2, 1}, {3, 1}, {4, 1}
+]
+==
+
+[mode=explain]
+[plan_contains=TopN cost=scan+bounded_heap]
+[plan_not_contains=FullSort cost=]
+[name=cost_model_prices_topn_as_bounded_heap]
+SELECT id FROM opt_skew ORDER BY correlated DESC LIMIT 2
+--
+ARRAY<STRUCT<id INT64>>[{10}, {9}]
+==
+
+[mode=explain]
+[plan_contains=JoinOrder opt_skew_dim -> opt_skew]
+[plan_contains=estimated_intermediate_rows<=8]
+[name=join_enumerator_avoids_larger_intermediate]
+SELECT s.id, d.label FROM opt_skew s JOIN opt_skew_dim d
+ON s.hot_key = d.hot_key WHERE d.hot_key IN (2, 3)
+ORDER BY s.id
+--
+ARRAY<STRUCT<id INT64, label STRING>>[{6, "two"}, {7, "three"}]
+==
+
+[mode=explain]
+[plan_contains=EstimateConfidence low]
+[plan_contains=AdaptiveJoin enabled=true]
+[name=low_confidence_expression_selectivity_enables_adaptive_plan]
+SELECT s.id FROM opt_skew s JOIN opt_skew_dim d
+ON s.hot_key = d.hot_key
+WHERE MOD(s.correlated, 30) = 0 ORDER BY s.id
+--
+ARRAY<STRUCT<id INT64>>[{3}, {6}]
+==
+
+[mode=explain]
+[plan_contains=Selectivity 0 source=contradiction]
+[plan_contains=EmptyResult]
+[name=logical_proof_overrides_statistical_estimate]
+SELECT id FROM opt_skew WHERE hot_key = 1 AND hot_key = 2
+--
+ARRAY<STRUCT<id INT64>>[]
+==
