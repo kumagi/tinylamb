@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <memory>
 #include <ostream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -68,7 +69,7 @@ class BitmapHeapScan : public ExecutorBase {
  public:
   BitmapHeapScan(Transaction& txn, const Table& table,
                  std::vector<RowPosition> positions, Expression where,
-                 Schema schema);
+                 Schema schema, std::string bitmap_operation);
   BitmapHeapScan(const BitmapHeapScan&) = delete;
   BitmapHeapScan(BitmapHeapScan&&) = delete;
   BitmapHeapScan& operator=(const BitmapHeapScan&) = delete;
@@ -85,6 +86,7 @@ class BitmapHeapScan : public ExecutorBase {
   size_t offset_{0};
   Expression where_;
   Schema schema_;
+  std::string bitmap_operation_;
 };
 
 }  // namespace tinylamb

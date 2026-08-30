@@ -188,6 +188,10 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
     out->primary_key_mode = value;
     return true;
   }
+  if (key == "secondary_index") {
+    out->secondary_indexes.push_back(Trim(value));
+    return true;
+  }
   if (key == "mode") {
     out->mode = ToLower(Trim(value));
     return true;

@@ -8,7 +8,7 @@
 namespace tinylamb {
 
 void DistinctPlan::Dump(std::ostream& output, int indent) const {
-  output << Indent(indent) << "Distinct";
+  output << Indent(indent) << "HashDistinct";
   if (!distinct_on_.empty()) {
     output << " (on=[";
     for (size_t i = 0; i < distinct_on_.size(); ++i) {
@@ -21,6 +21,6 @@ void DistinctPlan::Dump(std::ostream& output, int indent) const {
   child_->Dump(output, indent + 2);
 }
 
-std::string DistinctPlan::ToString() const { return "Distinct"; }
+std::string DistinctPlan::ToString() const { return "HashDistinct"; }
 
 }  // namespace tinylamb

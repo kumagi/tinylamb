@@ -18,6 +18,7 @@
 
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
+#include "executor/bitmap_scan.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/cross_join.hpp"
 #include "executor/distinct.hpp"
@@ -47,6 +48,7 @@
 #include "index/index.hpp"
 #include "page/row_position.hpp"
 #include "plan/aggregation_plan.hpp"
+#include "plan/bitmap_scan_plan.hpp"
 #include "plan/distinct_plan.hpp"
 #include "plan/empty_plan.hpp"
 #include "plan/full_scan_plan.hpp"
@@ -229,6 +231,39 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
   return std::make_shared<IndexScan>(txn.txn_, table_, index_, begin_key_,
                                      end_key_, ascending_, where_, GetSchema(),
                                      lock_rows_, wait_for_write_intent_);
+}
+
+Executor BitmapScanPlan::EmitExecutor(TransactionContext& context) const {
+  for (const BitmapIndexRange& range : ranges_) {
+    if (context.txn_.IndexKeysMayBeStale(range.index->Root())) {
+      Executor scan = std::make_shared<FullScan>(context.txn_, table_);
+      return where_ ? std::make_shared<Selection>(where_, table_.GetSchema(),
+                                                  std::move(scan))
+                    : scan;
+    }
+  }
+  std::vector<RowPosition> positions;
+  bool first = true;
+  for (const BitmapIndexRange& range : ranges_) {
+    std::vector<RowPosition> next =
+        BitmapIndexScan(context.txn_, table_, *range.index, range.begin_key,
+                        range.end_key)
+            .ScanPositions();
+    if (first) {
+      positions = std::move(next);
+      first = false;
+    } else if (combine_ == BitmapCombine::kAnd) {
+      positions = BitmapAnd(positions, next);
+    } else {
+      positions = BitmapOr(positions, next);
+    }
+  }
+  return std::make_shared<BitmapHeapScan>(context.txn_, table_,
+                                          std::move(positions), where_,
+                                          table_.GetSchema(),
+                                          combine_ == BitmapCombine::kAnd
+                                              ? "BitmapAnd"
+                                              : "BitmapOr");
 }
 
 Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& txn) const {

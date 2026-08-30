@@ -63,8 +63,10 @@ IndexOnlyScanPlan::IndexOnlyScanPlan(const Table& table, const Index& index,
                                      std::vector<ColumnName> provided_order)
     : table_(table),
       index_(index),
-      stats_(ts.TransformBy(index.sc_.key_[0], FirstOrNull(begin_key),
-                            FirstOrNull(end_key))),
+      stats_(begin_key.empty() && end_key.empty()
+                 ? ts
+                 : ts.TransformBy(index.sc_.key_[0], FirstOrNull(begin_key),
+                                  FirstOrNull(end_key))),
       begin_key_(std::move(begin_key)),
       end_key_(std::move(end_key)),
       ascending_(ascending),

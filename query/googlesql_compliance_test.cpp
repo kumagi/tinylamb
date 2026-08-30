@@ -23,6 +23,7 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
+#include "index/index_schema.hpp"
 #include "query/googlesql_frontend.hpp"
 #include "query/sql_engine.hpp"
 #include "query/statement.hpp"
@@ -65,6 +66,31 @@ std::vector<Row> Drain(SqlEngine& engine, TransactionContext& context,
     return {};
   }
   return rows;
+}
+
+Status CreateComplianceSecondaryIndex(Database& database,
+                                      TransactionContext& context,
+                                      std::string_view specification) {
+  const size_t colon = specification.find(':');
+  const size_t open = specification.find('(', colon + 1);
+  const size_t close = specification.rfind(')');
+  if (colon == std::string_view::npos || open == std::string_view::npos ||
+      close == std::string_view::npos || colon == 0 || open <= colon + 1 ||
+      close <= open + 1) {
+    return Status::kUnknown;
+  }
+  const std::string index_name(specification.substr(0, colon));
+  const std::string table_name(
+      specification.substr(colon + 1, open - colon - 1));
+  const std::string column_name(
+      specification.substr(open + 1, close - open - 1));
+  ASSIGN_OR_RETURN(std::shared_ptr<Table>, table, context.GetTable(table_name));
+  const int offset = table->GetSchema().Offset(ColumnName(column_name));
+  if (offset < 0) { return Status::kNotExists; }
+  return database.CreateIndex(
+      context, table_name,
+      IndexSchema(index_name, {static_cast<slot_t>(offset)}, {},
+                  IndexMode::kNonUnique));
 }
 
 
@@ -309,6 +335,24 @@ ARRAY<STRUCT<id INT64>>[{7}]
             (std::vector<std::string>{"FullScan: orders"}));
 }
 
+TEST(GoogleSqlComplianceFile, ParsesSecondaryIndexSetup) {
+  constexpr std::string_view kFile = R"test(
+[prepare_database]
+[secondary_index=by_category:items(category)]
+[secondary_index=by_score:items(score)]
+CREATE TABLE items AS SELECT 1 AS id, 2 AS category, 3 AS score
+--
+ARRAY<STRUCT<id INT64, category INT64, score INT64>>[]
+==
+)test";
+  const std::vector<GoogleSqlComplianceCase> cases =
+      ParseGoogleSqlComplianceFile("indexes.test", kFile);
+  ASSERT_EQ(cases.size(), 1U);
+  EXPECT_EQ(cases[0].secondary_indexes,
+            (std::vector<std::string>{"by_category:items(category)",
+                                      "by_score:items(score)"}));
+}
+
 TEST(GoogleSqlComplianceFile, ParsesVendoredCorpus) {
   const std::string directory = TINYLAMB_GOOGLESQL_COMPLIANCE_DIR;
   if (directory.empty() || !std::filesystem::exists(directory)) {
@@ -427,6 +471,7 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
   struct PreparedSegment {
     std::vector<std::string> statements;
     bool first_column_is_primary_key{false};
+    std::vector<std::string> secondary_indexes;
   };
   std::vector<PreparedSegment> prepare_segments;
   int environment_generation = 0;
@@ -437,6 +482,9 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
       for (const std::string& stmt : segment.statements) {
         Status s_status = Status::kSuccess;
         Drain(*engine, *context, stmt, &s_status);
+      }
+      for (const std::string& index : segment.secondary_indexes) {
+        (void)CreateComplianceSecondaryIndex(*database, *context, index);
       }
     }
   };
@@ -453,7 +501,8 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
       const bool first_column_is_primary_key =
           test_case.primary_key_mode == "first_column_is_primary_key";
       prepare_segments.push_back(
-          PreparedSegment{stmts, first_column_is_primary_key});
+          PreparedSegment{stmts, first_column_is_primary_key,
+                          test_case.secondary_indexes});
       SqlEngine::SetCompliancePrimaryKeyMode(first_column_is_primary_key);
       for (const std::string& stmt : stmts) {
         Status s_status = Status::kSuccess;
@@ -472,6 +521,13 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
               << stmt;
           break;
         }
+      }
+      for (const std::string& index : test_case.secondary_indexes) {
+        const Status index_status =
+            CreateComplianceSecondaryIndex(*database, *context, index);
+        EXPECT_EQ(index_status, Status::kSuccess)
+            << GetParam() << " / " << test_case.name
+            << " secondary index failed: " << index;
       }
       continue;
     }

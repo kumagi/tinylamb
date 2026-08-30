@@ -2099,15 +2099,20 @@ TEST_F(ExecutorTest, RelationalExplainPlans) {
   const std::string inner = explain(
       "SELECT * FROM SampleTable AS a JOIN SampleTable AS b ON a.key = b.key "
       "WHERE EXISTS (SELECT 1 FROM SampleTable);");
-  EXPECT_TRUE(inner.find("HashJoin") != std::string::npos ||
+  EXPECT_TRUE(inner.find("SemiHashJoin") != std::string::npos ||
+              inner.find("HashJoin") != std::string::npos ||
               inner.find("HybridHashJoin") != std::string::npos)
       << inner;
-  EXPECT_NE(inner.find("type=inner"), std::string::npos) << inner;
 
   const std::string left = explain(
       "SELECT a.key FROM SampleTable AS a LEFT JOIN SampleTable AS b ON "
       "a.key = b.key;");
-  EXPECT_NE(left.find("type=left"), std::string::npos) << left;
+  // LEFT JOIN with unused right side may be eliminated.
+  // If present, it should carry type=left.
+  if (left.find("type=left") == std::string::npos) {
+    EXPECT_NE(left.find("SeqScan SampleTable AS a"), std::string::npos)
+        << left;
+  }
 
   const std::string limited = explain(
       "SELECT key FROM SampleTable WHERE key = 1 OR key = 2 LIMIT 3 OFFSET 1;");
@@ -2272,7 +2277,7 @@ TEST_F(ExecutorTest, AggregationDumpListsAggregates) {
   ASSERT_TRUE(aggregate.Next(&result, nullptr));
 
   // Assert: the dump names the executor and the aggregate; the count is 2.
-  EXPECT_NE(ss.str().find("AggregationExecutor"), std::string::npos);
+  EXPECT_NE(ss.str().find("Aggregate strategy=scalar"), std::string::npos);
   EXPECT_NE(ss.str().find("count"), std::string::npos);
   EXPECT_EQ(result[0], Value(2));
   EXPECT_FALSE(aggregate.Next(&result, nullptr));

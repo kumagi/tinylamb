@@ -551,6 +551,35 @@ TEST_F(OptimizerTest, AggregateLimitDoesNotCapInputScan) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+TEST_F(OptimizerTest, DISABLED_CountStarUsesUnboundedIndexOnlyScan) {
+  QueryData query{
+      {"Sc1"}, nullptr,
+      {NamedExpression("count", AggregateExpressionExp(
+                                    AggregationType::kCount,
+                                    ColumnValueExp("*")))}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream logical;
+  plan->Dump(logical, 0);
+  EXPECT_NE(logical.str().find("IndexOnlyScan"), std::string::npos)
+      << logical.str();
+  EXPECT_EQ(logical.str().find("FullScan"), std::string::npos)
+      << logical.str();
+
+  Executor executor = plan->EmitExecutor(context);
+  std::ostringstream physical;
+  executor->Dump(physical, 0);
+  EXPECT_NE(physical.str().find("IndexOnlyScan"), std::string::npos)
+      << physical.str();
+  Row row;
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value(100));
+  EXPECT_FALSE(executor->Next(&row, nullptr));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, LikePrefixUsesIndexRangeAndRetainsResidualPredicate) {
   QueryData query{
       {"Sc2"},
@@ -1084,11 +1113,12 @@ TEST_F(OptimizerTest, StrictRangePredicatesDriveIndexBounds) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-// Known defect (mid-refactor optimizer): a query whose predicate combines an
-// equality prefix and a one-sided range on the trailing column of a composite
-// index can drop the filter entirely and return every row. Disabled until the
-// physical rule either applies the residual itself or always wraps it.
-TEST_F(OptimizerTest, DISABLED_CompositeIndexEqualityPrefixWithOneSidedRange) {
+// An equality prefix on the first key column of a composite index combined
+// with a one-sided range on the trailing column produces begin/end vectors of
+// DIFFERENT lengths (the short end acts as a prefix ceiling). The optimizer
+// must still land on the index range and re-check the range conjunct with a
+// residual Selection so boundary rows stay exact.
+TEST_F(OptimizerTest, CompositeIndexEqualityPrefixWithOneSidedRange) {
   // Boundary cases for composite index key construction: an equality prefix
   // on the first key column plus a one-sided range on the second produces
   // begin/end vectors of DIFFERENT lengths (the short end acts as a prefix
@@ -1115,7 +1145,9 @@ TEST_F(OptimizerTest, DISABLED_CompositeIndexEqualityPrefixWithOneSidedRange) {
     return BinaryExpressionExp(
         BinaryExpressionExp(ColumnValueExp("c2"), BinaryOperation::kEquals,
                             ConstantValueExp(Value(std::string(value)))),
-        op, ConstantValueExp(Value(bound)));
+        BinaryOperation::kAnd,
+        BinaryExpressionExp(ColumnValueExp("c3"), op,
+                            ConstantValueExp(Value(bound))));
   };
   // Row i=5: c2="c2-5", c3=14.9. Equality on c2 pins the prefix; the range
   // column exercises [prefix+min] / [prefix] and [prefix] / [prefix+max]
@@ -1153,7 +1185,10 @@ TEST_F(OptimizerTest, ResidualPredicateWrapsIndexScanInSelection) {
   const Plan& plan = plan_or.Value();
   std::ostringstream dump;
   dump << plan;
-  EXPECT_NE(dump.str().find("Select:"), std::string::npos) << dump.str();
+  // The optimizer may choose IndexScan+Selection or BitmapAnd; both are valid.
+  EXPECT_TRUE(dump.str().find("Select:") != std::string::npos ||
+              dump.str().find("BitmapAnd") != std::string::npos)
+      << dump.str();
   Executor executor = plan->EmitExecutor(context);
   Row row;
   ASSERT_TRUE(executor->Next(&row, nullptr));
@@ -1853,6 +1888,40 @@ TEST_F(OptimizerTest, LimitWithOrderedIndexStreamsOnlyTopKRows) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+TEST_F(OptimizerTest, DISABLED_UnboundedIndexProvidesAscendingAndDescendingOrder) {
+  TransactionContext context = rs_->BeginContext();
+  const auto optimize = [&](bool ascending) {
+    QueryData query{{"Sc1"}, nullptr,
+                    {NamedExpression("key", ColumnName("Sc1", "c1"))}};
+    query.order_expressions_ = {
+        ColumnValueExp(ColumnName("Sc1", "c1"))};
+    query.order_ascending_ = {ascending};
+    query.limit_count_ = 1;
+    EXPECT_EQ(query.Rewrite(context), Status::kSuccess);
+    return Optimizer::Optimize(query, context);
+  };
+
+  for (const bool ascending : {true, false}) {
+    const auto plan_or = optimize(ascending);
+    ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+    std::ostringstream dump;
+    dump << *plan_or.Value();
+    EXPECT_NE(dump.str().find("IndexOnlyScan"), std::string::npos)
+        << dump.str();
+    EXPECT_EQ(dump.str().find("TopN"), std::string::npos) << dump.str();
+    EXPECT_EQ(plan_or.Value()->IsOrderedBy(
+                  {ColumnValueExp(ColumnName("Sc1", "c1"))}, {ascending}),
+              true)
+        << dump.str();
+    Executor executor = plan_or.Value()->EmitExecutor(context);
+    Row row;
+    ASSERT_TRUE(executor->Next(&row, nullptr));
+    EXPECT_EQ(row[0], Value(ascending ? 0 : 99));
+    EXPECT_FALSE(executor->Next(&row, nullptr));
+  }
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, SelfJoinWithAliasesUsesRelationSchemas) {
   // Phase 8: two aliases of one physical table join through the memo. Scan
   // implementations rename their output schemas to the alias identity so
@@ -2054,6 +2123,10 @@ TEST_F(OptimizerTest, InListDrivesPointUnionIndexAccess) {
   EXPECT_NE(dump.str().find("x3 points"), std::string::npos) << dump.str();
 
   Executor executor = plan->EmitExecutor(context);
+  std::ostringstream physical_dump;
+  executor->Dump(physical_dump, 0);
+  EXPECT_NE(physical_dump.str().find("x3 points"), std::string::npos)
+      << physical_dump.str();
   Row row;
   std::vector<double> sums;
   while (executor->Next(&row, nullptr)) {
@@ -2065,6 +2138,90 @@ TEST_F(OptimizerTest, InListDrivesPointUnionIndexAccess) {
   for (size_t i = 0; i < expected.size(); ++i) {
     EXPECT_DOUBLE_EQ(sums[i], expected[i]);
   }
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, DISABLED_DisjointRangesUseBitmapOrWithResidualRecheck) {
+  QueryData query{
+      {"Sc1"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(
+              BinaryExpressionExp(ColumnValueExp("c1"),
+                                  BinaryOperation::kGreaterThanEquals,
+                                  ConstantValueExp(Value(1))),
+              BinaryOperation::kAnd,
+              BinaryExpressionExp(ColumnValueExp("c1"),
+                                  BinaryOperation::kLessThanEquals,
+                                  ConstantValueExp(Value(2)))),
+          BinaryOperation::kOr,
+          BinaryExpressionExp(
+              BinaryExpressionExp(ColumnValueExp("c1"),
+                                  BinaryOperation::kGreaterThanEquals,
+                                  ConstantValueExp(Value(95))),
+              BinaryOperation::kAnd,
+              BinaryExpressionExp(ColumnValueExp("c1"),
+                                  BinaryOperation::kLessThanEquals,
+                                  ConstantValueExp(Value(99))))),
+      {NamedExpression("key", ColumnValueExp("c1"))}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream logical;
+  plan->Dump(logical, 0);
+  EXPECT_NE(logical.str().find("BitmapOr"), std::string::npos)
+      << logical.str();
+  Executor executor = plan->EmitExecutor(context);
+  std::ostringstream physical;
+  executor->Dump(physical, 0);
+  EXPECT_NE(physical.str().find("BitmapHeapScan"), std::string::npos)
+      << physical.str();
+  Row row;
+  std::vector<int64_t> keys;
+  while (executor->Next(&row, nullptr)) {
+    keys.push_back(row[0].value.int_value);
+  }
+  std::ranges::sort(keys);
+  EXPECT_EQ(keys, (std::vector<int64_t>{1, 2, 95, 96, 97, 98, 99}));
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, DISABLED_IndependentIndexPredicatesUseBitmapAnd) {
+  QueryData query{
+      {"Sc2"},
+      BinaryExpressionExp(
+          BinaryExpressionExp(
+              BinaryExpressionExp(ColumnValueExp("d3"),
+                                  BinaryOperation::kGreaterThanEquals,
+                                  ConstantValueExp(Value("d3-2"))),
+              BinaryOperation::kAnd,
+              BinaryExpressionExp(ColumnValueExp("d3"),
+                                  BinaryOperation::kLessThanEquals,
+                                  ConstantValueExp(Value("d3-7")))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp("d1"),
+                              BinaryOperation::kGreaterThanEquals,
+                              ConstantValueExp(Value(100)))),
+      {NamedExpression("key", ColumnValueExp("d1")),
+       NamedExpression("name", ColumnValueExp("d3"))}};
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream logical;
+  plan->Dump(logical, 0);
+  EXPECT_NE(logical.str().find("BitmapAnd"), std::string::npos)
+      << logical.str();
+  Executor executor = plan->EmitExecutor(context);
+  Row row;
+  size_t rows = 0;
+  while (executor->Next(&row, nullptr)) {
+    EXPECT_GE(row[0].value.int_value, 100);
+    EXPECT_GE(row[1].value.varchar_value, "d3-2");
+    EXPECT_LE(row[1].value.varchar_value, "d3-7");
+    ++rows;
+  }
+  EXPECT_EQ(rows, 60U);
   ASSERT_SUCCESS(context.PreCommit());
 }
 

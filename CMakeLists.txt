@@ -422,6 +422,7 @@ tinylamb_add_layer(tinylamb_executor
         plan/set_operation_plan.cpp
         plan/plan.cpp
         plan/index_scan_plan.cpp
+        plan/bitmap_scan_plan.cpp
         query/query_data.cpp
         DEPENDS tinylamb::expression)
 
@@ -447,6 +448,7 @@ add_library(tinylamb_sql
         query/googlesql_ast_visitor.cpp
         query/sql_template.cpp
         query/sql_engine.cpp
+        query/join_reduction.cpp
 )
 add_library(tinylamb::sql ALIAS tinylamb_sql)
 target_compile_features(tinylamb_sql PUBLIC cxx_std_20)

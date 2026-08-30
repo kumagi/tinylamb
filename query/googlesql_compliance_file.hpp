@@ -26,6 +26,9 @@ struct GoogleSqlComplianceCase {
   // primary_key_mode option: "" (driver default), "no_primary_key", or
   // "first_column_is_primary_key".
   std::string primary_key_mode;
+  // Local setup extension: "index_name:table_name(column_name)". The runner
+  // creates a real non-unique catalog index after the prepare SQL completes.
+  std::vector<std::string> secondary_indexes;
   // Local optimizer E2E extensions for stable EXPLAIN fragment assertions.
   std::string mode;
   std::vector<std::string> plan_contains;

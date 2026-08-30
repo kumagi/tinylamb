@@ -610,7 +610,7 @@ TEST_F(PlanTest, DistinctPlanUsesHashExecutorAndPreservesOrderingMetadata) {
   EXPECT_EQ(distinct->EmitRowCount(), child->EmitRowCount());
   EXPECT_FALSE(
       distinct->IsOrderedBy({ColumnValueExp(ColumnName("Sc1.c1"))}, {true}));
-  EXPECT_EQ(distinct->ToString(), "Distinct");
+  EXPECT_EQ(distinct->ToString(), "HashDistinct");
 
   Executor executor = distinct->EmitExecutor(ctx);
   Row row;

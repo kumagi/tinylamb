@@ -53,7 +53,8 @@ IndexOnlyScan::IndexOnlyScan(Transaction& txn, const Table& table,
       cond_(std::move(where)),
       key_schema_(KeySchema(index, sc)),
       value_schema_(ValueSchema(index, sc)),
-      output_schema_(OutputSchema(index, sc)) {}
+      output_schema_(OutputSchema(index, sc)),
+      ascending_(ascending) {}
 
 Schema IndexOnlyScan::KeySchema(const Index& idx, const Schema& input_schema) {
   const IndexSchema& is = idx.sc_;
@@ -111,6 +112,7 @@ bool IndexOnlyScan::Next(Row* dst, RowPosition* /*rp*/) {
 
 void IndexOnlyScan::Dump(std::ostream& o, int /*indent*/) const {
   o << "IndexOnlyScan: " << iter_;
+  if (!ascending_) { o << " reverse"; }
   if (cond_) {
     o << " WHERE " << *cond_;
   }

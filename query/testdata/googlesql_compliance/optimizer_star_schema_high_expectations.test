@@ -1,6 +1,7 @@
 # Star-schema transformations: dimension pruning, fact-side dynamic filters,
 # join ordering, preaggregation, and late dimension lookup.
 
+[primary_key_mode=first_column_is_primary_key]
 [prepare_database]
 CREATE TABLE opt_dim_customer AS
 SELECT 1 AS customer_id, 'gold' AS tier, 10 AS region_id
@@ -31,8 +32,8 @@ ARRAY<STRUCT<x INT64>>[]
 ==
 
 [mode=explain]
+[plan_contains=JoinElimination]
 [plan_not_contains=opt_dim_customer]
-[plan_not_contains=Join]
 [name=unused_dimension_join_eliminated_by_foreign_key]
 SELECT f.sale_id, f.revenue
 FROM opt_fact_sales f JOIN opt_dim_customer c

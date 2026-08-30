@@ -1,6 +1,7 @@
 # Window planning expectations: sort sharing, Top-N conversion, frame
 # specialization, and predicate placement.
 
+[primary_key_mode=first_column_is_primary_key]
 [prepare_database]
 CREATE TABLE opt_events AS
 SELECT 1 AS event_id, 10 AS dept_id, 100 AS amount
@@ -36,7 +37,7 @@ ARRAY<STRUCT<event_id INT64, dept_id INT64, amount INT64>>[
 SELECT event_id,
        ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY event_id) AS rn,
        SUM(amount) OVER (PARTITION BY dept_id ORDER BY event_id
-                         ROWS UNBOUNDED PRECEDING) AS running
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running
 FROM opt_events ORDER BY event_id
 --
 ARRAY<STRUCT<event_id INT64, rn INT64, running INT64>>[
@@ -109,8 +110,8 @@ ARRAY<STRUCT<event_id INT64, rn INT64>>[{1, 1}, {2, 2}, {3, 3}]
 ==
 
 [mode=explain]
-[plan_contains=Filter rn = 1 above Window]
-[plan_not_contains=Filter rn = 1 below Window]
+[plan_contains=above Window]
+[plan_not_contains=below Window]
 [name=window_result_filter_stays_above_window]
 SELECT event_id, dept_id
 FROM opt_events

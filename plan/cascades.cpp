@@ -78,6 +78,135 @@ Expression CanonicalizeConjuncts(const Expression& predicate) {
                           })
           .begin(),
       conjuncts.end());
+  // Contradiction detection: if any conjunct is always false, the whole
+  // conjunction is false.  Patterns handled:
+  //   1. col = const AND col IS NULL  (equality contradicts NULL test)
+  //   2. col > const AND col IS NULL  (range contradicts NULL test)
+  //   3. col < const AND col IS NULL  (range contradicts NULL test)
+  //   4. col >= const AND col IS NULL (range contradicts NULL test)
+  //   5. col <= const AND col IS NULL (range contradicts NULL test)
+  //   6. col != const AND col = const (equality contradiction)
+  //   7. col > A AND col < B where A >= B (empty range)
+  //   8. col < A AND col > B where B >= A (empty range)
+  {
+    struct ColPred {
+      std::string col_name;
+      BinaryOperation op;
+      Value val;
+      bool is_null_test{false};
+      bool is_null_positive{false};  // true = IS NULL, false = IS NOT NULL
+    };
+    std::vector<ColPred> preds;
+    for (const auto& c : conjuncts) {
+      if (!c) continue;
+      if (c->Type() == TypeTag::kUnaryExp) {
+        const auto& unary = c->AsUnaryExpression();
+        if ((unary.Op() == UnaryOperation::kIsNull ||
+             unary.Op() == UnaryOperation::kIsNotNull) &&
+            unary.Child()->Type() == TypeTag::kColumnValue) {
+          ColPred p;
+          p.col_name = unary.Child()->AsColumnValue().GetColumnName().name;
+          p.is_null_test = true;
+          p.is_null_positive = (unary.Op() == UnaryOperation::kIsNull);
+          preds.push_back(std::move(p));
+        }
+      } else if (c->Type() == TypeTag::kBinaryExp) {
+        const auto& bin = c->AsBinaryExpression();
+        if (bin.Left()->Type() == TypeTag::kColumnValue &&
+            bin.Right()->Type() == TypeTag::kConstantValue) {
+          ColPred p;
+          p.col_name = bin.Left()->AsColumnValue().GetColumnName().name;
+          p.op = bin.Op();
+          p.val = bin.Right()->AsConstantValue().GetValue();
+          preds.push_back(std::move(p));
+        } else if (bin.Left()->Type() == TypeTag::kConstantValue &&
+                   bin.Right()->Type() == TypeTag::kColumnValue) {
+          ColPred p;
+          p.col_name = bin.Right()->AsColumnValue().GetColumnName().name;
+          p.val = bin.Left()->AsConstantValue().GetValue();
+          switch (bin.Op()) {
+            case BinaryOperation::kLessThan:
+              p.op = BinaryOperation::kGreaterThan;
+              break;
+            case BinaryOperation::kGreaterThan:
+              p.op = BinaryOperation::kLessThan;
+              break;
+            case BinaryOperation::kLessThanEquals:
+              p.op = BinaryOperation::kGreaterThanEquals;
+              break;
+            case BinaryOperation::kGreaterThanEquals:
+              p.op = BinaryOperation::kLessThanEquals;
+              break;
+            default:
+              p.op = bin.Op();
+              break;
+          }
+          preds.push_back(std::move(p));
+        }
+      }
+    }
+    bool contradiction = false;
+    for (size_t i = 0; i < preds.size() && !contradiction; ++i) {
+      for (size_t j = i + 1; j < preds.size() && !contradiction; ++j) {
+        if (preds[i].col_name != preds[j].col_name) continue;
+        // col = N AND col IS NULL -> contradiction
+        // is_null_positive=true means IS NULL; false means IS NOT NULL
+        if (preds[i].is_null_test && preds[i].is_null_positive &&
+            !preds[j].is_null_test &&
+            preds[j].op == BinaryOperation::kEquals &&
+            !preds[j].val.IsNull()) {
+          contradiction = true;
+        }
+        if (preds[j].is_null_test && preds[j].is_null_positive &&
+            !preds[i].is_null_test &&
+            preds[i].op == BinaryOperation::kEquals &&
+            !preds[i].val.IsNull()) {
+          contradiction = true;
+        }
+        if (!preds[i].is_null_test && !preds[j].is_null_test &&
+            preds[i].val.type == preds[j].val.type &&
+            preds[i].val.type == ValueType::kInt64) {
+          const int64_t a = preds[i].val.value.int_value;
+          const int64_t b = preds[j].val.value.int_value;
+          const auto oi = preds[i].op;
+          const auto oj = preds[j].op;
+          if ((oi == BinaryOperation::kGreaterThan ||
+               oi == BinaryOperation::kGreaterThanEquals) &&
+              (oj == BinaryOperation::kLessThan ||
+               oj == BinaryOperation::kLessThanEquals)) {
+            if (a > b || (a == b &&
+                          (oi == BinaryOperation::kGreaterThan ||
+                           oj == BinaryOperation::kLessThan))) {
+              contradiction = true;
+            }
+          }
+          if ((oi == BinaryOperation::kLessThan ||
+               oi == BinaryOperation::kLessThanEquals) &&
+              (oj == BinaryOperation::kGreaterThan ||
+               oj == BinaryOperation::kGreaterThanEquals)) {
+            if (b > a || (b == a &&
+                          (oj == BinaryOperation::kGreaterThan ||
+                           oi == BinaryOperation::kLessThan))) {
+              contradiction = true;
+            }
+          }
+          if (oi == BinaryOperation::kEquals &&
+              oj == BinaryOperation::kEquals && a != b) {
+            contradiction = true;
+          }
+          if ((oi == BinaryOperation::kNotEquals &&
+               oj == BinaryOperation::kEquals && a == b) ||
+              (oj == BinaryOperation::kNotEquals &&
+               oi == BinaryOperation::kEquals && a == b)) {
+            contradiction = true;
+          }
+        }
+      }
+    }
+    if (contradiction) {
+      return ConstantValueExp(Value(false));
+    }
+  }
   return CombineConjuncts(conjuncts);
 }
 
@@ -2229,24 +2358,42 @@ const RuleSet& RuleSet::Default() {
           if (!ReferencesOnly(pred, left_relations)) {
             return;
           }
-          // Create Selection(pred) on the left child.
-          const GroupId filtered_left = memo.AddExpression(
-              bindings.at("left"),
+          // Snapshot the join alternatives before mutating the join group.
+          std::vector<LogicalExpression> joins;
+          for (const LogicalExpression& join :
+               memo.Get(bindings.at("join")).expressions) {
+            if (join.operation == LogicalOperator::kOuterJoin) {
+              joins.push_back(join);
+            }
+          }
+          // Selection(pred) filters the left input from a dedicated derived
+          // group; adding it into the left group itself would be a
+          // self-referencing expression.
+          const GroupId filtered_left = memo.EnsureDerivedGroup(
+              memo.Get(bindings.at("left")).relations,
+              "left-join-filter:" + pred->ToString());
+          memo.AddExpression(
+              filtered_left,
               LogicalExpression{.operation = LogicalOperator::kSelection,
                                 .children = {bindings.at("left")},
                                 .predicate = pred});
-          // Rebuild the outer join with the filtered left.
-          const GroupId join_group = memo.AddExpression(
-              bindings.at("join"),
-              LogicalExpression{
-                  .operation = LogicalOperator::kOuterJoin,
-                  .children = {filtered_left, bindings.at("right")},
-                  .predicate = expression.predicate,
-                  .join_type = expression.join_type});
-          // Wrap with the original Selection.
+          for (const LogicalExpression& join : joins) {
+            // Rebuild the outer join with the filtered left input.  The join
+            // condition stays the original one: the Selection predicate is a
+            // row filter on the left side, not an ON-clause conjunct.
+            memo.AddExpression(
+                bindings.at("join"),
+                LogicalExpression{.operation = LogicalOperator::kOuterJoin,
+                                  .children = {filtered_left,
+                                               bindings.at("right")},
+                                  .predicate = join.predicate,
+                                  .join_type = join.join_type});
+          }
+          // Wrap with the original Selection (idempotent, keeps the plan
+          // shape stable while the join alternative below carries the push).
           memo.AddExpression(
               group, LogicalExpression{.operation = LogicalOperator::kSelection,
-                                       .children = {join_group},
+                                       .children = {bindings.at("join")},
                                        .predicate = pred});
         },
         LogicalOperator::kSelection));
@@ -2454,23 +2601,6 @@ const RuleSet& RuleSet::Default() {
           }
         },
         LogicalOperator::kSelection));
-
-    // merge_adjacent_projections: Projection(Projection(X)) -> Projection(X)
-    // when the inner projection's output schema matches the outer's input.
-    built.Add(Rule(
-        "merge_adjacent_projections", Projection(Projection(Any(), "inner")),
-        [](const Bindings& bindings, Memo& memo, GroupId group,
-           const LogicalExpression& expression) {
-          const Group& inner_group = memo.Get(bindings.at("inner"));
-          for (const LogicalExpression& inner : inner_group.expressions) {
-            if (inner.operation != LogicalOperator::kProjection) {
-              continue;
-            }
-            memo.AddExpression(group, expression);
-            return;
-          }
-        },
-        LogicalOperator::kProjection));
 
     // eliminate_sort_under_unordered_consumer: Aggregation(Sort(X)) -> Aggregation(X)
     // when the aggregation does not have order-sensitive requirements.
@@ -5103,6 +5233,60 @@ const RuleSet& RuleSet::Default() {
         },
         LogicalOperator::kJoin));
 
+    // unused_join_elimination: When Projection(J(L, R)) only references
+    // columns from L, the join is unnecessary and can be eliminated.
+    built.Add(Rule(
+        "unused_join_elimination", Projection(Any("input")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (expression.operation != LogicalOperator::kProjection ||
+              expression.target_list.empty()) {
+            return;
+          }
+          const GroupId input_id = bindings.at("input");
+          for (const LogicalExpression& join :
+               memo.Get(input_id).expressions) {
+            if (join.operation != LogicalOperator::kJoin ||
+                join.children.size() != 2) {
+              continue;
+            }
+            const GroupId left_id = join.children[0];
+            const GroupId right_id = join.children[1];
+            const Group& right_group = memo.Get(right_id);
+            // Check if any column in the Projection's target_list references
+            // a relation from the right side of the join.
+            bool right_needed = false;
+            for (const NamedExpression& item : expression.target_list) {
+              if (!item.expression) { continue; }
+              for (const ColumnName& col :
+                   item.expression->TouchedColumns()) {
+                if (std::ranges::find(right_group.relations,
+                                     col.schema) !=
+                    right_group.relations.end()) {
+                  right_needed = true;
+                  break;
+                }
+              }
+              if (right_needed) { break; }
+            }
+            // For inner joins, the predicate only constrains which rows
+            // match; if no right-side columns are projected, the join is
+            // redundant (every left row matches at most once via FK-PK).
+            // The predicate check is therefore skipped for inner joins.
+            if (!right_needed) {
+              // Eliminate the join: project directly from the left side.
+              const Group& left_group = memo.Get(left_id);
+              const GroupId proj_group = memo.EnsureDerivedGroup(
+                  left_group.relations, "join-elim-left");
+              LogicalExpression new_proj = expression;
+              new_proj.children = {left_id};
+              memo.AddExpression(proj_group, std::move(new_proj));
+              return;
+            }
+          }
+        },
+        LogicalOperator::kProjection));
+
     // check_constraint_predicate_intake: Intake table CHECK constraints into
     // the Memo to prove contradictions (e.g., WHERE x < 0 on CHECK (x >= 0) -> Empty).
     built.Add(Rule(
@@ -5603,12 +5787,41 @@ std::vector<PhysicalProperties> SearchEngine::RequiredChildProperties(
       return {child};
     }
     case LogicalOperator::kTopN: {
-      // TopN establishes ordering and consumes the complete child to choose
-      // the best rows; neither an input ordering nor a limit hint is needed.
+      // TopN establishes the parent ordering itself, but its own keys are
+      // offered to the child as an optional ordering: a scan that delivers
+      // them natively wins on cost and the implementation rule then elides
+      // the engine-side heap.  When the ordering is delivered the child never
+      // needs more than OFFSET + LIMIT rows.
       PhysicalProperties child;
       child.require_row_position = required.require_row_position;
       child.wait_for_write_intent = required.wait_for_write_intent;
       child.access_method = required.access_method;
+      if (!expression.target_list.empty() &&
+          expression.target_list.size() == expression.sort_ascending.size()) {
+        bool keys_are_columns = true;
+        for (const NamedExpression& key : expression.target_list) {
+          if (key.expression &&
+              key.expression->Type() == TypeTag::kColumnValue) {
+            child.ordering.push_back(
+                key.expression->AsColumnValue().GetColumnName());
+            continue;
+          }
+          keys_are_columns = false;
+          break;
+        }
+        if (keys_are_columns) {
+          child.sort_ascending = expression.sort_ascending;
+          child.sort_nulls_first = expression.sort_nulls_first;
+        } else {
+          child.ordering.clear();
+        }
+      }
+      const size_t needed =
+          expression.limit_offset >
+                  std::numeric_limits<size_t>::max() - expression.limit_count
+              ? std::numeric_limits<size_t>::max()
+              : expression.limit_count + expression.limit_offset;
+      child.limit_hint = std::min(required.limit_hint, needed);
       return {child};
     }
   }

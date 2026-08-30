@@ -84,6 +84,7 @@ IndexScan::IndexScan(
           ascending)),
       cond_(std::move(where)),
       schema_(std::move(sc)) {
+  range_count_ = ranges.size();
   if (!ranges.empty()) {
     pending_.assign(std::make_move_iterator(ranges.begin()) + 1,
                     std::make_move_iterator(ranges.end()));
@@ -126,7 +127,13 @@ bool IndexScan::Next(Row* dst, RowPosition* rp) {
 }
 
 void IndexScan::Dump(std::ostream& o, int /*indent*/) const {
-  o << "IndexScan: " << iter_;
+  if (range_count_ > 1) {
+    o << "IndexScan: " << table_.GetSchema().Name() << " x" << range_count_
+      << " points";
+  } else {
+    o << "IndexScan: " << iter_;
+  }
+  if (!ascending_) { o << " reverse"; }
   if (cond_) {
     o << " WHERE " << *cond_;
   }

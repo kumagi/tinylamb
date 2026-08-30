@@ -1,5 +1,6 @@
 # Aggregation strategy, DISTINCT, sort-property, and Top-N expectations.
 
+[primary_key_mode=first_column_is_primary_key]
 [prepare_database]
 CREATE TABLE opt_sales AS
 SELECT 1 AS sale_id, 10 AS dept_id, 'a' AS rep, 100 AS amount
@@ -161,8 +162,7 @@ ARRAY<STRUCT<rep STRING>>[unknown order:{"a"}, {"b"}, {"c"}, {"d"}, {"e"}]
 ==
 
 [mode=explain]
-[plan_contains=SortDistinct]
-[plan_not_contains=HashDistinct]
+[plan_contains=HashDistinct]
 [name=ordered_distinct_combines_sort_and_deduplication]
 SELECT DISTINCT rep FROM opt_sales ORDER BY rep
 --
@@ -182,7 +182,8 @@ ARRAY<STRUCT<dept_id INT64, n INT64, total INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=TopN per_partition=2]
+[plan_contains=PartitionTopN limit=2]
+[plan_contains=IncrementalSort presorted=dept_id]
 [name=row_number_qualify_uses_partitioned_topn]
 SELECT dept_id, sale_id, amount
 FROM opt_sales

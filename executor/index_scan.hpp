@@ -72,6 +72,7 @@ class IndexScan : public ExecutorBase {
   bool ascending_;
   bool lock_rows_;
   bool wait_for_write_intent_;
+  size_t range_count_{1};
   // Ranges not opened yet (multi-range access only).
   std::vector<std::pair<std::vector<Value>, std::vector<Value>>> pending_;
   size_t pending_offset_{0};

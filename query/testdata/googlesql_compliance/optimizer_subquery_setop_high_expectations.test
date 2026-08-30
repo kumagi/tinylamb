@@ -1,6 +1,7 @@
 # Subquery decorrelation, CTE strategy, set-operation, and derived-table
 # optimization expectations.
 
+[primary_key_mode=first_column_is_primary_key]
 [prepare_database]
 CREATE TABLE opt_numbers AS
 SELECT 1 AS n, 'odd' AS kind

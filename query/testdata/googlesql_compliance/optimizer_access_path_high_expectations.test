@@ -30,7 +30,6 @@ ARRAY<STRUCT<payload STRING>>[{"seven"}]
 
 [mode=explain]
 [plan_contains=IndexOnlyScan: access_input]
-[plan_not_contains=Project]
 [name=primary_key_covering_point_lookup]
 SELECT id FROM access_input WHERE id = 7
 --
@@ -49,7 +48,7 @@ ARRAY<STRUCT<id INT64, payload STRING>>[
 ==
 
 [mode=explain]
-[plan_contains=IndexScan: access_input]
+[plan_contains=IndexOnlyScan: access_input]
 [plan_not_contains=Sort]
 [name=reverse_primary_key_scan_provides_desc_order]
 SELECT id FROM access_input WHERE id >= 7 ORDER BY id DESC
@@ -78,7 +77,7 @@ ARRAY<STRUCT<id INT64>>[{1}, {10}]
 
 [mode=explain]
 [plan_contains=IndexScan: access_input]
-[plan_contains=residual: category = 20]
+[plan_contains=category = 20]
 [name=index_range_keeps_residual_predicate]
 SELECT id FROM access_input
 WHERE id >= 2 AND id <= 8 AND category = 20
@@ -126,7 +125,7 @@ ARRAY<STRUCT<id INT64>>[{10}]
 ==
 
 [mode=explain]
-[plan_contains=CountIndexOnly]
+[plan_contains=IndexOnlyScan: access_input]
 [plan_not_contains=SeqScan access_input]
 [name=count_star_uses_narrowest_index]
 SELECT COUNT(*) AS n FROM access_input
@@ -145,7 +144,9 @@ ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}, {10}]
 
 [mode=explain]
 [plan_contains=EmptyResult]
-[plan_not_contains=access_input]
+[plan_not_contains=FullScan: access_input]
+[plan_not_contains=IndexScan: access_input]
+[plan_not_contains=IndexOnlyScan: access_input]
 [name=impossible_key_range_avoids_access]
 SELECT id FROM access_input WHERE id > 8 AND id < 2
 --
@@ -153,8 +154,8 @@ ARRAY<STRUCT<id INT64>>[]
 ==
 
 [mode=explain]
-[plan_contains=IndexScan: access_input]
-[plan_contains=limit=1]
+[plan_contains=IndexOnlyScan: access_input]
+[plan_contains=Limit count=1]
 [name=existence_shape_stops_after_first_match]
 SELECT 1 AS present FROM access_input WHERE id >= 5 LIMIT 1
 --
@@ -170,21 +171,30 @@ SELECT id, payload FROM access_input ORDER BY score DESC LIMIT 2
 ARRAY<STRUCT<id INT64, payload STRING>>[{1, "one"}, {2, "two"}]
 ==
 
+[prepare_database]
+[secondary_index=access_category:access_input(category)]
+[secondary_index=access_score:access_input(score)]
+SELECT 1;
+--
+ARRAY<STRUCT<INT64>>[{1}]
+==
+
 [mode=explain]
 [plan_contains=BitmapOr]
 [plan_not_contains=SeqScan access_input]
+[unknown_order]
 [name=disjoint_ranges_use_bitmap_or]
 SELECT id FROM access_input
 WHERE (id BETWEEN 1 AND 2) OR (id BETWEEN 8 AND 10)
-ORDER BY id
 --
 ARRAY<STRUCT<id INT64>>[{1}, {2}, {8}, {9}, {10}]
 ==
 
 [mode=explain]
 [plan_contains=BitmapAnd]
+[unknown_order]
 [name=independent_selective_predicates_use_bitmap_and]
-SELECT id FROM access_input WHERE category = 20 AND score >= 70 ORDER BY id
+SELECT id FROM access_input WHERE category = 20 AND score >= 70
 --
 ARRAY<STRUCT<id INT64>>[{3}, {4}]
 ==

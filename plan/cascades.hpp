@@ -191,6 +191,12 @@ class Memo {
   // expressions discovered so far (documented degradation path).
   [[nodiscard]] bool Degraded() const { return degraded_; }
 
+  // Provide table schemas so Scan expressions carry output_schema for
+  // constraint-based optimization rules.
+  void SetTableSchemas(const std::unordered_map<std::string, Schema>& schemas) {
+    table_schemas_ = schemas;
+  }
+
   void Dump(std::ostream& out) const;
 
   // Conjuncts whose touched relations are exactly this group's relation.
@@ -208,6 +214,7 @@ class Memo {
   std::vector<Expression> conjuncts_;
   std::vector<uint64_t> conjunct_masks_;
   std::vector<GroupId> touched_groups_;
+  std::unordered_map<std::string, Schema> table_schemas_;
   const size_t expression_cap_;
   bool degraded_{false};
 };

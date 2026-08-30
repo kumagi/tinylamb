@@ -46,12 +46,14 @@ std::vector<RowPosition> BitmapIndexScan::ScanPositions() const {
 
 BitmapHeapScan::BitmapHeapScan(Transaction& txn, const Table& table,
                                std::vector<RowPosition> positions,
-                               Expression where, Schema schema)
+                               Expression where, Schema schema,
+                               std::string bitmap_operation)
     : txn_(&txn),
       table_(&table),
       positions_(std::move(positions)),
       where_(std::move(where)),
-      schema_(std::move(schema)) {
+      schema_(std::move(schema)),
+      bitmap_operation_(std::move(bitmap_operation)) {
   std::sort(positions_.begin(), positions_.end(), RowPositionComparator{});
   positions_.erase(std::unique(positions_.begin(), positions_.end()),
                    positions_.end());
@@ -80,7 +82,9 @@ bool BitmapHeapScan::Next(Row* dst, RowPosition* rp) {
 }
 
 void BitmapHeapScan::Dump(std::ostream& o, int /*indent*/) const {
-  o << "BitmapHeapScan: (" << positions_.size() << " positions)\n";
+  o << bitmap_operation_ << "\n  BitmapHeapScan: (" << positions_.size()
+    << " positions)";
+  if (where_) { o << "\n  Recheck: " << *where_; }
 }
 
 }  // namespace tinylamb

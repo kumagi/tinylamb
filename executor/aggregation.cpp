@@ -711,11 +711,13 @@ size_t AggregationExecutor::NextBatch(DataChunk* destination,
 }
 
 void AggregationExecutor::Dump(std::ostream& o, int indent) const {
-  o << "AggregationExecutor {";
+  // The Cascades path only creates scalar aggregates (no GROUP BY keys).
+  o << "Aggregate strategy=scalar {";
   for (const auto& agg : aggregates_) {
     o << "\n" << Indent(indent + 2) << agg.name << ": " << *agg.expression;
   }
-  o << "\n" << Indent(indent) << "}";
+  o << "\n" << Indent(indent) << "}\n";
+  child_->Dump(o, indent + 2);
 }
 
 }  // namespace tinylamb

@@ -1,6 +1,7 @@
 # Common-subexpression elimination, column/lifetime pruning, and compound
 # rewrite expectations.
 
+[primary_key_mode=first_column_is_primary_key]
 [prepare_database]
 CREATE TABLE opt_metrics AS
 SELECT 1 AS id, 10 AS a, 2 AS b, 'alpha' AS payload, true AS keep

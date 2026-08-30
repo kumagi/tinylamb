@@ -91,7 +91,7 @@ bool DistinctExecutor::Next(Row* dst, RowPosition* rp) {
   return false;
 }
 void DistinctExecutor::Dump(std::ostream& output, int indent) const {
-  output << "Distinct\n" << Indent(static_cast<size_t>(indent) + 2);
+  output << "HashDistinct\n" << Indent(static_cast<size_t>(indent) + 2);
   source_->Dump(output, indent + 2);
 }
 

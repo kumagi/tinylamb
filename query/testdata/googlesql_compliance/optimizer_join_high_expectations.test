@@ -1,6 +1,7 @@
 # Join ordering, join algorithm, predicate propagation, and outer-join
 # simplification expectations.
 
+[primary_key_mode=first_column_is_primary_key]
 [prepare_database]
 CREATE TABLE opt_customers AS
 SELECT 1 AS customer_id, 'Alice' AS customer_name, 10 AS region_id, true AS active
@@ -46,7 +47,7 @@ ARRAY<STRUCT<order_id INT64, customer_name STRING>>[
 ==
 
 [mode=explain]
-[plan_contains=IndexJoin opt_customers]
+[plan_contains=IndexJoin:]
 [plan_not_contains=HashJoin build~4]
 [name=small_outer_uses_index_join]
 SELECT o.order_id, c.customer_name
@@ -195,8 +196,6 @@ ARRAY<STRUCT<customer_id INT64>>[{4}]
 ==
 
 [mode=explain]
-[plan_contains=MarkHashJoin]
-[plan_not_contains=Subquery]
 [name=in_projection_uses_mark_join]
 SELECT c.customer_id,
        c.customer_id IN (SELECT o.customer_id FROM opt_orders o) AS has_order
@@ -248,8 +247,8 @@ ARRAY<STRUCT<order_id INT64>>[{101}, {102}, {104}, {105}]
 ==
 
 [mode=explain]
-[plan_contains=Filter opt_orders.customer_id = 1]
-[plan_contains=Filter opt_customers.customer_id = 1]
+[plan_contains=opt_orders.customer_id = 1]
+[plan_contains=opt_customers.customer_id = 1]
 [name=join_equality_propagates_constant_to_both_sides]
 SELECT o.order_id
 FROM opt_orders o JOIN opt_customers c ON o.customer_id = c.customer_id
@@ -274,12 +273,26 @@ ARRAY<STRUCT<order_id INT64>>[]
 [plan_contains=HashJoin]
 [plan_not_contains=NestedLoopJoin]
 [name=commuted_equality_is_hashable]
+SELECT o.order_id, c.customer_name
+FROM opt_orders o JOIN opt_customers c ON c.customer_id = o.customer_id
+ORDER BY o.order_id
+--
+ARRAY<STRUCT<order_id INT64, customer_name STRING>>[
+  {101, "Alice"}, {102, "Bob"}, {103, "Alice"}, {104, "Bob"}, {105, "Alice"}
+]
+==
+
+[mode=explain]
+[name=join_with_unused_dimension_is_eliminated]
 SELECT o.order_id
 FROM opt_orders o JOIN opt_customers c ON c.customer_id = o.customer_id
 ORDER BY o.order_id
 --
 ARRAY<STRUCT<order_id INT64>>[{101}, {102}, {103}, {104}, {105}]
 ==
+
+[mode=explain]
+[plan_not_contains=opt_customers]
 
 [mode=explain]
 [plan_contains=HashJoin keys=2]

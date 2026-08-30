@@ -52,6 +52,7 @@
 #include "query/googlesql_ast.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
+#include "query/join_reduction.hpp"
 #include "query/plan_cache.hpp"
 #include "query/query_data.hpp"
 #include "query/sql_template.hpp"
@@ -183,6 +184,38 @@ bool IdentifierEquals(std::string_view left, std::string_view right) {
                       return std::tolower(static_cast<unsigned char>(lhs)) ==
                              std::tolower(static_cast<unsigned char>(rhs));
                     });
+}
+
+// DISTINCT is redundant when the visible projection contains every column of
+// a unique index. Keep this SQL-layer check in addition to the optimizer's
+// DistinctPlan elimination because this facade normally adds the executable
+// DISTINCT wrapper after physical optimization.
+bool ProjectionContainsUniqueKey(
+    const Plan& plan, const std::vector<NamedExpression>& columns,
+    size_t visible_columns) {
+  const Table* table = plan->ScanSource();
+  if (table == nullptr) { return false; }
+  std::unordered_set<slot_t> projected;
+  const size_t count = std::min(visible_columns, columns.size());
+  for (size_t i = 0; i < count; ++i) {
+    const Expression& expression = columns[i].expression;
+    if (!expression || expression->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const int offset = table->GetSchema().Offset(
+        expression->AsColumnValue().GetColumnName());
+    if (offset >= 0) { projected.insert(static_cast<slot_t>(offset)); }
+  }
+  for (size_t i = 0; i < table->IndexCount(); ++i) {
+    const Index& index = table->GetIndex(i);
+    if (index.IsUnique() &&
+        std::ranges::all_of(index.sc_.key_, [&](slot_t key) {
+          return projected.contains(key);
+        })) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // The compact Value representation intentionally stores INT32/UINT32/UINT64
@@ -1810,6 +1843,10 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       }
       auto select = std::shared_ptr<SelectStatement>(
           dynamic_cast<SelectStatement*>(statement.release()));
+      // A WHERE conjunct that rejects the NULL padding of a LEFT JOIN makes
+      // the outer join's padded rows unreachable; planning it as an inner
+      // join is exact and unlocks hash-join fast paths (§7.5).
+      ReduceOuterJoins(select.get());
       // Bind every base relation up front, including those nested in IN,
       // EXISTS, scalar subqueries, and CTE definitions. Lazy expression
       // evaluation must not let a missing table go unnoticed merely because
@@ -2060,7 +2097,10 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       RETURN_IF_FAIL(query.Rewrite(ctx));
       ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
       Executor executor = plan->EmitExecutor(ctx);
-      if (select->Distinct()) {
+      const bool needs_distinct =
+          select->Distinct() &&
+          !ProjectionContainsUniqueKey(plan, query.select_, visible_columns);
+      if (needs_distinct) {
         executor = std::make_shared<DistinctExecutor>(std::move(executor));
       }
       if (!select->OrderBy().empty() &&
@@ -2102,7 +2142,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           shape->sort_keys.emplace_back(sort_expressions[i],
                                         static_cast<bool>(sort_ascending[i]));
         }
-        shape->distinct = select->Distinct();
+        shape->distinct = needs_distinct;
         shape->has_limit = select->HasLimit();
         shape->limit = select->Limit();
         shape->offset = select->Offset();

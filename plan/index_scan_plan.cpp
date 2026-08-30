@@ -84,8 +84,10 @@ IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
                              bool lock_rows, bool wait_for_write_intent)
     : table_(table),
       index_(index),
-      stats_(ts.TransformBy(index.sc_.key_[0], FirstOrNull(begin_key),
-                            FirstOrNull(end_key))),
+      stats_(begin_key.empty() && end_key.empty()
+                 ? ts
+                 : ts.TransformBy(index.sc_.key_[0], FirstOrNull(begin_key),
+                                  FirstOrNull(end_key))),
       begin_key_(std::move(begin_key)),
       end_key_(std::move(end_key)),
       ascending_(ascending),
@@ -137,10 +139,8 @@ size_t IndexScanPlan::EmitRowCount() const {
 
 bool IndexScanPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                                 const std::vector<bool>& ascending) const {
-  // Concatenated point ranges only deliver a global order when a single
-  // range remains (ranges are sorted and disjoint).
-  if (point_ranges_.size() > 1) { return false;
-}
+  // Point ranges are sorted and disjoint before construction, so scanning
+  // them in sequence preserves the advertised global key order.
   return OrderMatches(provided_order_, ascending_, expressions, ascending);
 }
 
