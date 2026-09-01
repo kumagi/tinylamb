@@ -97,7 +97,13 @@ bool Deserialize(std::string_view from, Deserializable* dst) {
   std::string v(from);
   std::stringstream ss(v);
   Decoder ext(ss);
-  ext >> *dst;
+  try {
+    ext >> *dst;
+  } catch (const std::exception&) {
+    // Corrupt catalog/statistics payloads (bad version, truncated legacy
+    // image) must surface as `false`, not escape the StatusOr API.
+    return false;
+  }
   // eofbit alone is fine (payload fully consumed); failbit/badbit mean a
   // short read or an oversized length field.
   return !ss.fail();
@@ -165,9 +171,32 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
   // lost race would leak pages permanently. Close the race before the
   // allocation instead of compensating afterwards.
   std::scoped_lock lock(catalog_mu_);
-  if (catalog_.Read(ctx.txn_, schema.Name()).GetStatus() !=
-      Status::kNotExists) {
-    return Status::kConflicts;
+  // Existence must be checked case-insensitively: GetTable() resolves names
+  // with a case-insensitive fallback, so an exact-match-only check here let
+  // "CREATE TABLE foo" succeed while "Foo" already existed, creating an
+  // ambiguous catalog.
+  {
+    auto read_result = catalog_.Read(ctx.txn_, schema.Name());
+    bool exists = read_result.HasValue();
+    if (!exists && read_result.GetStatus() == Status::kNotExists) {
+      const std::string wanted(schema.Name());
+      for (BPlusTreeIterator iter = catalog_.Begin(ctx.txn_); iter.IsValid();
+           ++iter) {
+        const std::string& name = iter.Key();
+        if (name.size() == wanted.size() &&
+            std::equal(name.begin(), name.end(), wanted.begin(),
+                       [](char a, char b) {
+                         return std::tolower(static_cast<unsigned char>(a)) ==
+                                std::tolower(static_cast<unsigned char>(b));
+                       })) {
+          exists = true;
+          break;
+        }
+      }
+    }
+    if (exists || read_result.GetStatus() != Status::kNotExists) {
+      return Status::kConflicts;
+    }
   }
   PageRef table_page =
       storage_.pm_.AllocateNewPage(ctx.txn_, PageType::kRowPage);
@@ -183,7 +212,9 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
       std::stringstream idx_name_stream;
       idx_name_stream << schema.Name() << "|" << col.Name();
       IndexSchema new_idx(idx_name_stream.str(), {i}, {});
-      new_table.CreateIndex(ctx.txn_, new_idx);
+      // A failed unique-index build (oversized key, conflicts) must fail the
+      // CREATE TABLE instead of silently registering an unconstrained table.
+      RETURN_IF_FAIL(new_table.CreateIndex(ctx.txn_, new_idx));
     }
   }
 
@@ -198,27 +229,35 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
 
 Status Database::DropTable(TransactionContext& ctx,
                            std::string_view schema_name) {
+  std::scoped_lock lock(catalog_mu_);
   ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
+  // GetTable() resolves case-insensitively, but every catalog/statistics key
+  // below is written under the canonical (declared) name.  Using the
+  // user-provided spelling left orphaned entries and failed DROPs for
+  // differently-cased references.
+  const std::string canonical(tbl.GetSchema().Name());
   const Schema& schema = tbl.GetSchema();
   for (slot_t column = 0; column < schema.ColumnCount(); ++column) {
     const Status deleted = statistics_.Delete(
-        ctx.txn_, StatisticsColumnKey(schema_name, column));
+        ctx.txn_, StatisticsColumnKey(canonical, column));
     if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
       return deleted;
     }
   }
   {
-    const Status deleted = statistics_.Delete(ctx.txn_, schema_name);
+    const Status deleted = statistics_.Delete(ctx.txn_, canonical);
     if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
       return deleted;
     }
   }
-  RETURN_IF_FAIL(catalog_.Delete(ctx.txn_, schema_name));
+  RETURN_IF_FAIL(catalog_.Delete(ctx.txn_, canonical));
   // KNOWN LIMITATION: the table's row/index pages stay allocated (space
   // leak). Reclaiming them needs kSystemDestroyPage redo support in the
   // recovery manager -- do NOT wire PageManager::DestroyPage here until that
   // lands, or a crash after DROP would make the next startup fail.
   // Invalidate cached images so later lookups observe the drop.
+  ctx.tables_.erase(canonical);
+  ctx.stats_.erase(canonical);
   ctx.tables_.erase(std::string(schema_name));
   ctx.stats_.erase(std::string(schema_name));
   BumpSchemaEpoch();
@@ -228,12 +267,16 @@ Status Database::DropTable(TransactionContext& ctx,
 Status Database::CreateIndex(TransactionContext& ctx,
                              std::string_view schema_name,
                              const IndexSchema& idx) {
+  std::scoped_lock lock(catalog_mu_);
   ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
+  // Serialize catalog/cache updates under the canonical name: a differently
+  // cased reference used to write a second, unreachable catalog entry.
+  const std::string canonical(tbl.GetSchema().Name());
   RETURN_IF_FAIL(tbl.CreateIndex(ctx.txn_, idx));
-  RETURN_IF_FAIL(catalog_.Update(ctx.txn_, schema_name, Serialize(tbl)));
+  RETURN_IF_FAIL(catalog_.Update(ctx.txn_, canonical, Serialize(tbl)));
   // Refresh the cached image so later inserts maintain the new index.
-  ctx.tables_[std::string(schema_name)] =
-      std::make_shared<Table>(std::move(tbl));
+  ctx.tables_.erase(std::string(schema_name));
+  ctx.tables_[canonical] = std::make_shared<Table>(std::move(tbl));
   // New access paths may change plan choices; invalidate compiled plans.
   BumpSchemaEpoch();
   return Status::kSuccess;
@@ -348,8 +391,11 @@ StatusOr<TableStatistics> Database::GetStatistics(
     return found->second;
   }
   ASSIGN_OR_RETURN(Table, tbl, GetTable(ctx, schema_name));
+  // Statistics live under the canonical (declared) table name; a differently
+  // cased reference used to miss the record and fail the whole lookup.
+  const std::string canonical(tbl.GetSchema().Name());
   ASSIGN_OR_RETURN(std::string_view, meta,
-                   statistics_.Read(ctx.txn_, schema_name));
+                   statistics_.Read(ctx.txn_, canonical));
   TableStatistics ts(tbl.GetSchema());
   if (PeekUint64(meta) != kStatisticsMetaMagic) {
     if (!Deserialize(meta, &ts)) {

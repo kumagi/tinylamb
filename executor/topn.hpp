@@ -53,6 +53,8 @@ class TopNExecutor final : public ExecutorBase {
   std::vector<Candidate> rows_;
   size_t output_index_{0};
   size_t output_end_{0};
+  size_t input_rows_{0};
+  size_t heap_capacity_{0};
   bool materialized_{false};
 };
 

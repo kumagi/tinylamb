@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "aggregation_plan.hpp"
+#include "bitmap_scan_plan.hpp"
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
 #include "distinct_plan.hpp"
@@ -32,9 +33,11 @@
 #include "index/index.hpp"
 #include "index_only_scan_plan.hpp"
 #include "index_scan_plan.hpp"
+#include "incremental_sort_plan.hpp"
 #include "limit_plan.hpp"
 #include "max1_row_plan.hpp"
 #include "merge_join_plan.hpp"
+#include "minmax_index_plan.hpp"
 #include "plan/cascades.hpp"
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
@@ -466,6 +469,43 @@ std::optional<std::vector<std::vector<Value>>> DisjunctiveIndexPrefixes(
   return prefixes;
 }
 
+std::unordered_map<slot_t, Range> ComparisonRanges(
+    const Expression& predicate, const Schema& schema) {
+  std::unordered_map<slot_t, Range> result;
+  for (const Expression& conjunct : SplitConjuncts(predicate)) {
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+      continue;
+    }
+    const auto& binary = conjunct->AsBinaryExpression();
+    if (!IsComparison(binary.Op())) {
+      continue;
+    }
+    const ColumnValue* column = nullptr;
+    const ConstantValue* constant = nullptr;
+    Range::Direction direction = Range::Direction::kRight;
+    if (binary.Left()->Type() == TypeTag::kColumnValue &&
+        binary.Right()->Type() == TypeTag::kConstantValue) {
+      column = &binary.Left()->AsColumnValue();
+      constant = &binary.Right()->AsConstantValue();
+    } else if (binary.Left()->Type() == TypeTag::kConstantValue &&
+               binary.Right()->Type() == TypeTag::kColumnValue) {
+      column = &binary.Right()->AsColumnValue();
+      constant = &binary.Left()->AsConstantValue();
+      direction = Range::Direction::kLeft;
+    }
+    if (column == nullptr || constant == nullptr) {
+      continue;
+    }
+    const int offset = schema.Offset(column->GetColumnName());
+    if (offset < 0) {
+      continue;
+    }
+    result[static_cast<slot_t>(offset)].Update(
+        binary.Op(), constant->GetValue(), direction);
+  }
+  return result;
+}
+
 std::vector<PlanAlternative> ScanAlternatives(
     const cascades::Memo& memo, cascades::GroupId group,
     const cascades::LogicalExpression& logical,
@@ -480,15 +520,30 @@ std::vector<PlanAlternative> ScanAlternatives(
   // clause (Phase 2 pushdown); it must be applied in full because the root
   // SelectionPlan wrap no longer exists. Conjuncts speak relation identities
   // while scan machinery speaks physical table names, so translate down.
-  const Expression filter =
+  Expression filter =
       QualifyDown(memo.Get(group).filter, relation, physical);
+  // Canonicalize the neutral predicate before access-path costing. Keeping a
+  // literal TRUE as a non-null filter would disable safe unordered LIMIT
+  // pushdown into FullScan even though it cannot reject a row.
+  if (filter && filter->Type() == TypeTag::kConstantValue &&
+      filter->AsConstantValue().GetValue().Truthy()) {
+    filter = nullptr;
+  }
   // The scan predicate handed to the executor: the group filter, or the
   // neutral `true` constant when the group has none.
   const Expression scan_predicate =
       filter ? filter : ConstantValueExp(Value(true));
+  const bool no_filter =
+      !filter ||
+      (filter->Type() == TypeTag::kConstantValue &&
+       filter->AsConstantValue().GetValue().Truthy());
   std::vector<NamedExpression> fallback_select;
   if (const auto found = context.scan_projections.find(relation);
-      found != context.scan_projections.end() && !found->second.empty()) {
+      found != context.scan_projections.end()) {
+    // An empty required-column list is meaningful: queries such as
+    // COUNT(*) do not need heap payload columns at all. Keep it empty so a
+    // covering index can be selected instead of expanding it back to every
+    // table column.
     fallback_select = found->second;
   } else {
     for (size_t i = 0; i < schema.ColumnCount(); ++i) {
@@ -601,6 +656,130 @@ std::vector<PlanAlternative> ScanAlternatives(
     for (size_t index_offset = 0; index_offset < table.IndexCount();
          ++index_offset) {
       const Index& index = table.GetIndex(index_offset);
+
+      // An unconstrained covering index is a valid access path as well.  It
+      // is especially important for COUNT(*) and for ORDER BY/LIMIT shapes:
+      // the index can provide the required order and the lazy executor can
+      // stop after the requested prefix without touching the heap.  Do not
+      // offer this fallback for filtered scans; without a selective bound it
+      // would only create a tie that could displace the normal full scan.
+      if (no_filter && !required.distinct) {
+        std::vector<ColumnName> full_index_order;
+        full_index_order.reserve(index.sc_.key_.size());
+        for (const slot_t slot : index.sc_.key_) {
+          full_index_order.push_back(schema.GetColumn(slot).Name());
+        }
+        Plan unconstrained = BuildIndexScan(
+            table, index, statistics, {}, {}, true, scan_predicate,
+            fallback_select, required.require_row_position,
+            required.wait_for_write_intent, std::move(full_index_order));
+        unconstrained = finalize(unconstrained);
+        const double unconstrained_cost =
+            static_cast<double>(statistics.Rows()) *
+            (std::dynamic_pointer_cast<IndexOnlyScanPlan>(unconstrained)
+                 ? 0.5
+                 : 1.0);
+        candidates.push_back(PlanAlternative{
+            .plan = std::move(unconstrained),
+            .local_cost = unconstrained_cost,
+            .estimated_rows = static_cast<double>(statistics.Rows())});
+      }
+
+      // Combine independent bitmap index scans before fetching heap rows.
+      // The final predicate is still rechecked by BitmapHeapScan, so the
+      // bitmap is only an access-path optimization and never a semantic
+      // shortcut.  A single-key index is required for each participating
+      // range; composite-key bitmap construction needs a separate selectivity
+      // and prefix proof.
+      if (filter && index.sc_.key_.size() == 1) {
+        const slot_t key_slot = index.sc_.key_.front();
+        const auto key_range = ranges.find(key_slot);
+        if (key_range != ranges.end() &&
+            (key_range->second.min || key_range->second.max)) {
+          // AND: every independent indexed predicate contributes one bitmap.
+          std::vector<BitmapIndexRange> and_ranges;
+          std::unordered_set<const Index*> seen_indexes;
+          for (size_t other_offset = 0; other_offset < table.IndexCount();
+               ++other_offset) {
+            const Index& other = table.GetIndex(other_offset);
+            if (other.sc_.key_.size() != 1 ||
+                !seen_indexes.insert(&other).second) {
+              continue;
+            }
+            const auto other_range = ranges.find(other.sc_.key_.front());
+            if (other_range == ranges.end() ||
+                (!other_range->second.min && !other_range->second.max)) {
+              continue;
+            }
+            BitmapIndexRange range;
+            range.index = &other;
+            if (other_range->second.min) {
+              range.begin_key.push_back(*other_range->second.min);
+            }
+            if (other_range->second.max) {
+              range.end_key.push_back(*other_range->second.max);
+            }
+            and_ranges.push_back(std::move(range));
+          }
+          if (and_ranges.size() >= 2 &&
+              relational_detail::SplitDisjuncts(filter).size() == 1) {
+            Plan bitmap = std::make_shared<BitmapScanPlan>(
+                table, statistics, std::move(and_ranges), BitmapCombine::kAnd,
+                scan_predicate, 1, 1);
+            if (fallback_select.size() != bitmap->GetSchema().ColumnCount()) {
+              bitmap = std::make_shared<ProjectionPlan>(bitmap, fallback_select);
+            }
+            bitmap = finalize(bitmap);
+            candidates.push_back(PlanAlternative{.plan = std::move(bitmap),
+                                                 .local_cost = 0.0,
+                                                 .estimated_rows = 1.0});
+          }
+        }
+      }
+
+      // OR: build one bitmap range per disjunct on this index.  Only
+      // comparison ranges are admitted; residual rechecking handles strict
+      // versus inclusive boundaries and any additional conjuncts.
+      if (filter && index.sc_.key_.size() == 1) {
+        const std::vector<Expression> disjuncts =
+            relational_detail::SplitDisjuncts(filter);
+        if (disjuncts.size() >= 2) {
+          std::vector<BitmapIndexRange> or_ranges;
+          for (const Expression& disjunct : disjuncts) {
+            const auto disjunct_ranges = ComparisonRanges(disjunct, schema);
+            const auto found =
+                disjunct_ranges.find(index.sc_.key_.front());
+            if (found == disjunct_ranges.end() ||
+                (!found->second.min && !found->second.max)) {
+              or_ranges.clear();
+              break;
+            }
+            BitmapIndexRange range;
+            range.index = &index;
+            if (found->second.min) {
+              range.begin_key.push_back(*found->second.min);
+            }
+            if (found->second.max) {
+              range.end_key.push_back(*found->second.max);
+            }
+            or_ranges.push_back(std::move(range));
+          }
+          if (or_ranges.size() == disjuncts.size()) {
+            Plan bitmap = std::make_shared<BitmapScanPlan>(
+                table, statistics, std::move(or_ranges), BitmapCombine::kOr,
+                scan_predicate, statistics.Rows(), statistics.Rows());
+            if (fallback_select.size() != bitmap->GetSchema().ColumnCount()) {
+              bitmap = std::make_shared<ProjectionPlan>(bitmap, fallback_select);
+            }
+            bitmap = finalize(bitmap);
+            candidates.push_back(PlanAlternative{.plan = std::move(bitmap),
+                                                 .local_cost = 0.0,
+                                                 .estimated_rows =
+                                                     filter_selectivity *
+                                                     statistics.Rows()});
+          }
+        }
+      }
 
       // OR-of-conjunctions over distinct composite-key prefixes is a union
       // of disjoint index ranges.  This keeps batched OLTP DML on its indexes
@@ -1265,6 +1444,65 @@ StatusOr<Plan> OptimizeSingleRelation(
   if (alternatives.empty()) {
     return Status::kNotImplemented;
   }
+
+  // A scalar MIN/MAX of a non-null single-column key can be answered by the
+  // first entry of that key's ordered index.  This is both cheaper and more
+  // precise than scanning the relation and feeding every row to an
+  // aggregate.  Restrict the rewrite to a NOT NULL/PRIMARY KEY column: a
+  // general nullable index needs a separate null-position contract and must
+  // retain the ordinary aggregate path.
+  if (has_aggregate && !distinct && query.from_.size() == 1 &&
+      projection_items.size() == 1 &&
+      (!predicate || (predicate->Type() == TypeTag::kConstantValue &&
+                      predicate->AsConstantValue().GetValue().Truthy()))) {
+    const NamedExpression& output = projection_items.front();
+    if (output.expression &&
+        output.expression->Type() == TypeTag::kAggregateExp) {
+      const auto& aggregate = output.expression->AsAggregateExpression();
+      const bool is_min = aggregate.GetType() == AggregationType::kMin;
+      const bool is_max = aggregate.GetType() == AggregationType::kMax;
+      const Expression& child = aggregate.Child();
+      if ((is_min || is_max) && !aggregate.Distinct() &&
+          !aggregate.NeedsGroupContext() && child &&
+          child->Type() == TypeTag::kColumnValue) {
+        const ColumnName target = child->AsColumnValue().GetColumnName();
+        const Table& table = *context.tables.at(relation);
+        const Schema& schema = table.GetSchema();
+        const int target_slot = schema.Offset(target);
+        if (target_slot >= 0 &&
+            schema.GetColumn(static_cast<size_t>(target_slot))
+                .GetConstraint()
+                .ctype != Constraint::kNothing) {
+          const auto& column_constraint =
+              schema.GetColumn(static_cast<size_t>(target_slot))
+                  .GetConstraint();
+          const bool non_null =
+              column_constraint.ctype == Constraint::kNotNull ||
+              column_constraint.ctype == Constraint::kPrimaryKey;
+          if (non_null) {
+            const TableStatistics& statistics = *context.statistics.at(relation);
+            for (size_t index_offset = 0; index_offset < table.IndexCount();
+                 ++index_offset) {
+              const Index& index = table.GetIndex(index_offset);
+              if (index.sc_.key_.size() != 1 ||
+                  index.sc_.key_.front() != static_cast<slot_t>(target_slot) ||
+                  index.RetainsDeletedEntries()) {
+                continue;
+              }
+              const ColumnName provided = schema.GetColumn(target_slot).Name();
+              Plan scan = std::make_shared<IndexOnlyScanPlan>(
+                  table, index, statistics, std::vector<Value>{},
+                  std::vector<Value>{}, is_min, ConstantValueExp(Value(true)),
+                  std::vector<ColumnName>{provided});
+              Plan minmax = std::make_shared<MinMaxIndexPlan>(
+                  std::move(scan), output, 0, is_max);
+              return minmax;
+            }
+          }
+        }
+      }
+    }
+  }
   auto ordered = [&](const PlanAlternative& alternative) {
     return query.order_expressions_.empty() ||
            alternative.plan->IsOrderedBy(query.order_expressions_,
@@ -1295,9 +1533,43 @@ StatusOr<Plan> OptimizeSingleRelation(
 
   const std::vector<Expression> sort_expressions =
       NormalizeOrderingForOutput(query.order_expressions_, projection_items);
-  const bool ordered_plan =
+  bool ordered_plan =
       sort_expressions.empty() ||
       plan->IsOrderedBy(sort_expressions, query.order_ascending_);
+  if (!ordered_plan) {
+    // If the child already arrives in the leading ORDER BY prefix, sort only
+    // each contiguous prefix group. This preserves the requested global order
+    // while avoiding a relation-wide sort for clustered/covering indexes.
+    size_t prefix_length = 0;
+    for (size_t length = sort_expressions.size(); length > 1; --length) {
+      std::vector<Expression> prefix_expressions(
+          sort_expressions.begin(), sort_expressions.begin() + length - 1);
+      std::vector<bool> prefix_ascending(
+          query.order_ascending_.begin(),
+          query.order_ascending_.begin() + length - 1);
+      if (plan->IsOrderedBy(prefix_expressions, prefix_ascending)) {
+        prefix_length = length - 1;
+        break;
+      }
+    }
+    if (prefix_length != 0) {
+      std::vector<SortKey> prefix_keys;
+      std::vector<SortKey> suffix_keys;
+      prefix_keys.reserve(prefix_length);
+      suffix_keys.reserve(sort_expressions.size() - prefix_length);
+      for (size_t i = 0; i < sort_expressions.size(); ++i) {
+        SortKey key{sort_expressions[i], query.order_ascending_[i],
+                    i < query.order_nulls_first_.size()
+                        ? query.order_nulls_first_[i]
+                        : std::nullopt};
+        (i < prefix_length ? prefix_keys : suffix_keys).push_back(
+            std::move(key));
+      }
+      plan = std::make_shared<IncrementalSortPlan>(
+          std::move(plan), std::move(prefix_keys), std::move(suffix_keys));
+      ordered_plan = true;
+    }
+  }
   if (!ordered_plan) {
     if (query.limit_count_ != 0 && !sort_expressions.empty()) {
       std::vector<TopNKey> keys;

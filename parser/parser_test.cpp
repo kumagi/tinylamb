@@ -416,6 +416,19 @@ TEST(ParserTest, SelectOrderByMultipleTerms) {
   ASSERT_EQ(select.Limit(), 5);
 }
 
+TEST(ParserTest, SelectOrderByExplicitNullPlacement) {
+  Tokenizer tokenizer(
+      "SELECT id FROM users ORDER BY id ASC NULLS LAST, id DESC NULLS FIRST;");
+  Parser parser(tokenizer.Tokenize());
+  const auto statement = parser.Parse();
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_EQ(select.OrderBy().size(), 2U);
+  ASSERT_TRUE(select.OrderBy()[0].nulls_first.has_value());
+  EXPECT_FALSE(*select.OrderBy()[0].nulls_first);
+  ASSERT_TRUE(select.OrderBy()[1].nulls_first.has_value());
+  EXPECT_TRUE(*select.OrderBy()[1].nulls_first);
+}
+
 TEST(ParserTest, CreateTableTypeAliases) {
   // Arrange -- tokenize CREATE TABLE exercising several type aliases
   Tokenizer tokenizer(

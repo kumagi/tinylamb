@@ -9561,17 +9561,63 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
       std::optional<Relation> indexed =
           has_own_ctes ? std::nullopt
                        : ExecuteCorrelatedSingleSource(context, *value.Query(),
-                                                       scope, ctes);
+                                                       scope, ctes,
+                                                       value.Exists());
       std::optional<Relation> executed;
       const Relation* relation = indexed ? &*indexed : nullptr;
       bool uncorrelated = false;
+      RelationPtr correlated_apply_result;
+      std::string correlated_apply_key;
       if (relation == nullptr && !has_own_ctes) {
-        relation = ExecuteCachedUncorrelated(context, *value.Query(), ctes);
+        relation = ExecuteCachedUncorrelated(context, *value.Query(), ctes,
+                                             value.Exists());
         uncorrelated = relation != nullptr;
       }
       if (relation == nullptr) {
-        executed = ExecuteQuery(context, *value.Query(), &scope, ctes);
+        const bool apply_cacheable =
+            scope.row != nullptr && context.execution_runtime() != nullptr &&
+            !StatementContainsVolatileFunction(*value.Query());
+        if (apply_cacheable) {
+          correlated_apply_key = CorrelatedApplyCacheKey(
+              *value.Query(), &scope, ctes, value.Exists());
+          const auto cached_apply = context.execution_runtime()
+                                        ->correlated_apply_results.find(
+                                            correlated_apply_key);
+          if (cached_apply != context.execution_runtime()
+                                  ->correlated_apply_results.end()) {
+            correlated_apply_result = cached_apply->second;
+            relation = correlated_apply_result.get();
+            ++context.execution_runtime()->correlated_result_cache_hits;
+          }
+        }
+      }
+      if (relation == nullptr) {
+        // The generic path also gets the EXISTS-only normalization used by
+        // the indexed and uncorrelated fast paths. ORDER BY cannot affect an
+        // EXISTS boolean; cap only when LIMIT 0 is not authoritative.
+        std::shared_ptr<SelectStatement> exists_query;
+        const SelectStatement* execution_query = value.Query().get();
+        if (value.Exists()) {
+          const bool needs_cap = !value.Query()->HasLimit() ||
+                                 value.Query()->Limit() > 1;
+          if (needs_cap || !value.Query()->OrderBy().empty()) {
+            exists_query = std::make_shared<SelectStatement>(*value.Query());
+            exists_query->SetOrderBy({});
+            if (needs_cap) {
+              exists_query->SetLimit(1);
+            }
+            execution_query = exists_query.get();
+          }
+        }
+        executed = ExecuteQuery(context, *execution_query, &scope, ctes);
         relation = &*executed;
+        if (!correlated_apply_key.empty()) {
+          correlated_apply_result =
+              std::make_shared<Relation>(std::move(*executed));
+          context.execution_runtime()->correlated_apply_results.emplace(
+              correlated_apply_key, correlated_apply_result);
+          relation = correlated_apply_result.get();
+        }
       }
       auto& row_source = const_cast<Relation&>(*relation);
       const bool as_struct = value.Query()->AsStruct();
@@ -9583,6 +9629,18 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
         return Value(value.Negated() ? !exists : exists);
       }
       if (value.Test()) {
+        if (value.Negated() && value.Mode() == QuantifierMode::kIn &&
+            context.execution_runtime() != nullptr) {
+          bool has_null_build_key = false;
+          row_source.ForEachRow([&](const Row& row) {
+            has_null_build_key =
+                has_null_build_key ||
+                (!row.values_.empty() && row.values_[0].IsNull());
+          });
+          context.execution_runtime()->null_aware_anti_build_contains_null =
+              context.execution_runtime()->null_aware_anti_build_contains_null ||
+              has_null_build_key;
+        }
         const Value test =
             Evaluate(value.Test(), scope, aggregates, context, ctes);
         if (value.Mode() != QuantifierMode::kIn) {
@@ -9614,24 +9672,13 @@ Value Evaluate(  // NOLINT(misc-no-recursion)
           found = false;
         } else if (uncorrelated && context.execution_runtime() != nullptr &&
                    !structural_members) {
+          const std::string structural_key =
+              UncorrelatedCacheKey(*value.Query(), ctes, false);
           auto [cached, inserted] =
-              context.execution_runtime()->uncorrelated_membership.try_emplace(
-                  value.Query().get());
-          bool rebuilt = false;
-          if (!inserted &&
-              !CacheEntryIsCurrent(*value.Query(),
-                                   *context.execution_runtime())) {
-            // The address was recycled from a dead statement: drop the
-            // stale membership set and rebuild for this subquery.
-            context.execution_runtime()->uncorrelated_membership.erase(cached);
-            cached = context.execution_runtime()
-                         ->uncorrelated_membership.try_emplace(
-                             value.Query().get())
-                         .first;
-            rebuilt = true;
-          }
-          CacheEntryIsCurrent(*value.Query(), *context.execution_runtime());
-          if (inserted || rebuilt) {
+              context.execution_runtime()
+                  ->uncorrelated_membership_by_fingerprint.try_emplace(
+                      structural_key);
+          if (inserted) {
             cached->second.reserve(relation->TotalRows());
             row_source.ForEachRow([&](const Row& row) {
               const Value projected = ProjectSubqueryRow(row, as_struct, &subquery_schema);

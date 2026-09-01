@@ -82,7 +82,8 @@ bool CaseInsensitiveEquals(std::string_view left, std::string_view right) {
 Expression BindColumnQualifiedFieldReads(
     const Expression& expr,
     const std::unordered_map<std::string, std::string>& col_table_map,
-    const std::unordered_set<std::string>& relations) {
+    const std::unordered_set<std::string>& relations,
+    const std::unordered_map<std::string, size_t>& relation_column_counts) {
   if (!expr) {
     return expr;
   }
@@ -96,6 +97,10 @@ Expression BindColumnQualifiedFieldReads(
       // its message fields through the relation alias (`p.int32_val1`).
       // Bind such qualified field references to that sole column when the
       // physical schema has no column with the requested field name.
+      const auto count = relation_column_counts.find(name.schema);
+      if (count == relation_column_counts.end() || count->second != 1) {
+        return expr;
+      }
       std::string only_column;
       for (const auto& [column, relation] : col_table_map) {
         if (relation == name.schema) {
@@ -157,8 +162,8 @@ Expression BindColumnQualifiedFieldReads(
   std::vector<Expression> children = ExpressionChildren(expr);
   bool changed = false;
   for (Expression& child : children) {
-    Expression mapped = BindColumnQualifiedFieldReads(child, col_table_map,
-                                                      relations);
+    Expression mapped = BindColumnQualifiedFieldReads(
+        child, col_table_map, relations, relation_column_counts);
     changed |= child->ToString() != mapped->ToString();
     child = std::move(mapped);
   }
@@ -481,6 +486,7 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   std::unordered_map<std::string, std::string> col_table_map;
   std::unordered_set<std::string> ambiguous_colum_name;
   std::vector<ColumnName> all_cols;
+  std::unordered_map<std::string, size_t> relation_column_counts;
 
   for (const auto& relation : from_) {
     const auto aliased = aliases_.find(relation);
@@ -489,6 +495,7 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
     ASSIGN_OR_RETURN(std::shared_ptr<Table>, from_table,
                      ctx.GetTable(physical));
     const Schema& sc = from_table->GetSchema();
+    relation_column_counts[relation] = sc.ColumnCount();
     for (size_t i = 0; i < sc.ColumnCount(); ++i) {
       const ColumnName& col_name = sc.GetColumn(i).Name();
       all_cols.emplace_back(relation, col_name.name);
@@ -517,14 +524,46 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   for (auto& named : select_) {
     if (named.expression) {
       named.expression = BindColumnQualifiedFieldReads(
-          named.expression, col_table_map, relations);
+          named.expression, col_table_map, relations, relation_column_counts);
     }
   }
   where_ = where_ ? BindColumnQualifiedFieldReads(where_, col_table_map,
-                                                  relations)
+                                                  relations,
+                                                  relation_column_counts)
                   : where_;
-  RETURN_IF_FAIL(ResolveSelect(select_, col_table_map, ambiguous_colum_name,
-                               all_cols, relations, [&] {
+
+  // ORDER BY is evaluated after projection, so a bare identifier may refer
+  // to a SELECT-list alias (for example `SELECT id + 10 AS shifted ...
+  // ORDER BY shifted`).  Resolve that alias before ordinary scope binding;
+  // otherwise the optimizer treats it as a missing input column and returns
+  // kNotExists.  Base columns take precedence over aliases, matching SQL
+  // name-resolution rules.
+  for (Expression& order : order_expressions_) {
+    if (order && order->Type() == TypeTag::kColumnValue) {
+      const ColumnName& name = order->AsColumnValue().GetColumnName();
+      // `$orderN` is an internal output alias installed by SqlEngine for a
+      // hidden ORDER BY key. It is intentionally absent from the input
+      // relation map and must survive Rewrite unchanged.
+      if (name.schema.empty() && name.name.starts_with("$order")) {
+        continue;
+      }
+      if (name.schema.empty() && name.name != "*" &&
+          !col_table_map.contains(ToLowerCopy(name.name))) {
+        for (const NamedExpression& selected : select_) {
+          if (!selected.name.empty() &&
+              CaseInsensitiveEquals(selected.name, name.name)) {
+            order = selected.expression;
+            break;
+          }
+        }
+      }
+    }
+    RETURN_IF_FAIL(ResolveExpression(order, col_table_map,
+                                     ambiguous_colum_name, relations,
+                                     all_cols));
+  }
+  RETURN_IF_FAIL(ResolveSelect(
+      select_, col_table_map, ambiguous_colum_name, all_cols, relations, [&] {
                                  for (const std::string& relation : from_) {
                                    const auto found = aliases_.find(relation);
                                    const std::string& physical =

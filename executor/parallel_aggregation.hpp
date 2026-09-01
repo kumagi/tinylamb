@@ -76,9 +76,6 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   std::vector<size_t> int64_column_indices_;
   std::vector<size_t> double_column_indices_;
   std::vector<size_t> generic_indices_;
-  // Scratch for per-chunk generic fallbacks; capacity is retained across
-  // chunks so the hot path stays allocation-free.
-  mutable std::vector<size_t> generic_scratch_;
   size_t worker_count_;
   bool executed_{false};
   // A failed execution must never degrade into a normal-looking empty

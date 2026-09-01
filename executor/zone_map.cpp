@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/zone_map.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <string_view>
 #include <string>
@@ -21,6 +22,14 @@ void ZoneMap::Add(const Value& value) {
   // them out of the min/max envelope.
   if (value.IsArray()) { return;
 }
+  // PRODUCTION FIX: NaN fails every IEEE comparison, so a NaN that arrived
+  // first poisoned min/max into (NaN, NaN) and MayMatch then pruned batches
+  // that actually contained matching rows. Exclude NaN from the envelope and
+  // keep a flag: its presence must conservatively keep the zone eligible.
+  if (value.type == ValueType::kDouble && std::isnan(value.value.double_value)) {
+    has_nan_ = true;
+    return;
+  }
   if (!minimum_ || value < *minimum_) { minimum_ = value;
 }
   if (!maximum_ || *maximum_ < value) { maximum_ = value;
@@ -52,6 +61,11 @@ void ZoneMap::AddDate(int64_t days) {
 void ZoneMap::AddDouble(double value) {
   initialized_ = true;
   ++value_count_;
+  // Same NaN guard as ZoneMap::Add: a leading NaN poisoned the envelope.
+  if (std::isnan(value)) {
+    has_nan_ = true;
+    return;
+  }
   if (!minimum_ || value < minimum_->value.double_value) {
     minimum_ = Value(value);
   }
@@ -90,6 +104,9 @@ bool ZoneMap::MayMatch(BinaryOperation operation, const Value& constant) const {
   if (!initialized_) {
     return true;
   }
+  // PRODUCTION FIX: NaN-bearing zones keep every row (NaN compares false
+  // against everything, so envelope pruning is unsound for them).
+  if (has_nan_) { return true; }
   // An initialized zone holding only NULLs cannot compare, and NULL
   // constants never compare either.  minimum_/maximum_ are always populated
   // together, so checking both here keeps the invariant explicit.  // NULL comparisons always evaluate to UNKNOWN (NULL) in SQL,

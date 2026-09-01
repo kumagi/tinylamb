@@ -586,6 +586,11 @@ void RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
         // Collect the oldest LSN to dirty_page_table.
         for (const auto& dpt : log.dirty_page_table) {
           UpdateOldestLSN(dpt.first, dpt.second);
+          // PRODUCTION FIX: pages allocated BEFORE the checkpoint appear only
+          // in its dirty-page table (analysis starts at checkpoint_lsn).  Not
+          // folding them into max_seen_pid re-issued live page ids after a
+          // crash when the allocator high-water mark was lost.
+          max_seen_pid = std::max(max_seen_pid, dpt.first);
         }
         for (const auto& at : log.active_transaction_table) {
           if (at.status == TransactionStatus::kCommitted) {

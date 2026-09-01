@@ -2075,4 +2075,42 @@ TEST_F(BPlusTreeTest, ExclusiveInsertAfterSplitForwardsFosterChain) {
   }
 }
 
+TEST_F(BPlusTreeTest, FullScanReverseAfterDeletingRightmostKey) {
+  // PRODUCTION BUG (fixed): deleting the rightmost key of an exclusive-size
+  // foster chain left an empty foster-tail leaf; RightmostPage landed there
+  // and the whole descending scan reported zero rows even though forward
+  // scans still worked.
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Insert(txn, "a", "va"));
+    ASSERT_SUCCESS(bpt_->Insert(txn, "c", "vc"));
+    ASSERT_SUCCESS(bpt_->Insert(txn, "d", "vd"));
+    txn.PreCommit();
+  }
+  {
+    auto txn = tm_->Begin();
+    ASSERT_SUCCESS(bpt_->Delete(txn, "d"));
+    txn.PreCommit();
+  }
+  // Forward scan sanity: the surviving keys are reachable.
+  {
+    auto txn = tm_->Begin();
+    std::string forward;
+    for (BPlusTreeIterator it = bpt_->Begin(txn); it.IsValid(); ++it) {
+      forward += it.Key();
+    }
+    EXPECT_EQ(forward, "ac");
+  }
+  // The descending scan must still visit [c, a].
+  {
+    auto txn = tm_->Begin();
+    BPlusTreeIterator it = bpt_->Begin(txn, "", "", false);
+    std::string backward;
+    for (; it.IsValid(); --it) {
+      backward += it.Key();
+    }
+    EXPECT_EQ(backward, "ca");
+  }
+}
+
 }  // namespace tinylamb

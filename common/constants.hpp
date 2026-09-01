@@ -89,6 +89,8 @@ enum class BinaryOperation : uint8_t {
   kGreaterThanEquals,
   kLike,
   kNotLike,
+  kIsDistinctFrom,
+  kIsNotDistinctFrom,
 
   // Boolean logics.
   kAnd,
@@ -128,6 +130,10 @@ inline std::string_view ToString(BinaryOperation op) {
       return "LIKE";
     case BinaryOperation::kNotLike:
       return "NOT LIKE";
+    case BinaryOperation::kIsDistinctFrom:
+      return "IS DISTINCT FROM";
+    case BinaryOperation::kIsNotDistinctFrom:
+      return "IS NOT DISTINCT FROM";
     case BinaryOperation::kAnd:
       return "AND";
     case BinaryOperation::kOr:

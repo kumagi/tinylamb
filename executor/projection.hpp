@@ -19,6 +19,8 @@
 
 #include <memory>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -48,11 +50,21 @@ class Projection : public ExecutorBase {
 
  private:
   std::vector<NamedExpression> expressions_;
+  // Repeated scalar subexpressions are evaluated into hidden batch columns
+  // and the visible expressions refer to those columns.  This keeps CSE
+  // batch-local (and therefore safe across volatile/query expressions) while
+  // avoiding an additional materialized relation.
+  std::vector<Expression> cse_expressions_;
+  std::vector<std::string> cse_names_;
+  std::vector<size_t> cse_use_counts_;
+  Schema augmented_schema_;
   Schema input_schema_;
   Executor src_;
   DataChunk input_batch_;
+  DataChunk cse_input_batch_;
   DataChunk output_batch_;
   size_t output_offset_{0};
+  std::vector<std::optional<BytecodeProgram>> cse_bytecodes_;
   std::vector<std::optional<BytecodeProgram>> bytecodes_;
   struct JitProjectionState {
     bool eligible{false};

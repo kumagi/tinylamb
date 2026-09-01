@@ -251,13 +251,12 @@ TEST_F(OptimizerTest, RewritesArithmeticInsideProjection) {
            "identity",
            BinaryExpressionExp(ColumnValueExp("c1"), BinaryOperation::kAdd,
                                ConstantValueExp(Value(0)))),
-       NamedExpression(
-           "folded",
-           BinaryExpressionExp(
-               ColumnValueExp("c1"), BinaryOperation::kAdd,
-               BinaryExpressionExp(ConstantValueExp(Value(1)),
-                                   BinaryOperation::kAdd,
-                                   ConstantValueExp(Value(2)))))} };
+       NamedExpression("folded",
+                       BinaryExpressionExp(
+                           ColumnValueExp("c1"), BinaryOperation::kAdd,
+                           BinaryExpressionExp(ConstantValueExp(Value(1)),
+                                               BinaryOperation::kAdd,
+                                               ConstantValueExp(Value(2)))))}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
 
@@ -282,14 +281,12 @@ TEST_F(OptimizerTest, RewritesTypedIntegerMultiplyByZeroInsideProjection) {
   QueryData query{
       {"Sc1"},
       nullptr,
-      {NamedExpression(
-           "lhs", BinaryExpressionExp(ColumnValueExp("c1"),
-                                      BinaryOperation::kMultiply,
-                                      ConstantValueExp(Value(0)))),
-       NamedExpression(
-           "rhs", BinaryExpressionExp(ConstantValueExp(Value(0)),
-                                      BinaryOperation::kMultiply,
-                                      ColumnValueExp("c1")))}};
+      {NamedExpression("lhs", BinaryExpressionExp(ColumnValueExp("c1"),
+                                                  BinaryOperation::kMultiply,
+                                                  ConstantValueExp(Value(0)))),
+       NamedExpression("rhs", BinaryExpressionExp(ConstantValueExp(Value(0)),
+                                                  BinaryOperation::kMultiply,
+                                                  ColumnValueExp("c1")))}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
 
@@ -380,14 +377,13 @@ TEST_F(OptimizerTest, ContradictoryConjunctsBecomeEmptyResult) {
 TEST_F(OptimizerTest, StrongerBoundsSubsumeWeakerBounds) {
   QueryData query{
       {"Sc1"},
-      BinaryExpressionExp(
-          BinaryExpressionExp(ColumnValueExp("c1"),
-                              BinaryOperation::kGreaterThan,
-                              ConstantValueExp(Value(0))),
-          BinaryOperation::kAnd,
-          BinaryExpressionExp(ColumnValueExp("c1"),
-                              BinaryOperation::kGreaterThan,
-                              ConstantValueExp(Value(20)))),
+      BinaryExpressionExp(BinaryExpressionExp(ColumnValueExp("c1"),
+                                              BinaryOperation::kGreaterThan,
+                                              ConstantValueExp(Value(0))),
+                          BinaryOperation::kAnd,
+                          BinaryExpressionExp(ColumnValueExp("c1"),
+                                              BinaryOperation::kGreaterThan,
+                                              ConstantValueExp(Value(20)))),
       {NamedExpression("c1")}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
@@ -407,9 +403,8 @@ TEST_F(OptimizerTest, EqualityClassesPropagateAndRejectConstants) {
     QueryData query{
         {"Sc2"},
         BinaryExpressionExp(
-            BinaryExpressionExp(
-                ColumnValueExp("d1"), BinaryOperation::kEquals,
-                ColumnValueExp("d4")),
+            BinaryExpressionExp(ColumnValueExp("d1"), BinaryOperation::kEquals,
+                                ColumnValueExp("d4")),
             BinaryOperation::kAnd,
             BinaryExpressionExp(
                 BinaryExpressionExp(ColumnValueExp("d1"),
@@ -457,17 +452,16 @@ TEST_F(OptimizerTest, NullAndInComplementsBecomeEmptyResult) {
   assert_empty(BinaryExpressionExp(
       UnaryExpressionExp(ColumnValueExp("c1"), UnaryOperation::kIsNull),
       BinaryOperation::kAnd,
-      UnaryExpressionExp(ColumnValueExp("c1"),
-                         UnaryOperation::kIsNotNull)));
+      UnaryExpressionExp(ColumnValueExp("c1"), UnaryOperation::kIsNotNull)));
 
   const auto in = [] {
-    return InExpressionExp(ColumnValueExp("c2"),
-                           {ConstantValueExp(Value("c2-1")),
-                            ConstantValueExp(Value("c2-2"))});
+    return InExpressionExp(
+        ColumnValueExp("c2"),
+        {ConstantValueExp(Value("c2-1")), ConstantValueExp(Value("c2-2"))});
   };
-  assert_empty(BinaryExpressionExp(
-      in(), BinaryOperation::kAnd,
-      UnaryExpressionExp(in(), UnaryOperation::kNot)));
+  assert_empty(
+      BinaryExpressionExp(in(), BinaryOperation::kAnd,
+                          UnaryExpressionExp(in(), UnaryOperation::kNot)));
   ASSERT_SUCCESS(context.PreCommit());
 }
 
@@ -485,15 +479,15 @@ TEST_F(OptimizerTest, SimplePrefixLikeBecomesExactBinaryRange) {
   std::ostringstream dump;
   dump << *plan_or.Value();
   EXPECT_EQ(dump.str().find("LIKE"), std::string::npos) << dump.str();
-  EXPECT_NE(dump.str().find(">= \"c2-3\""), std::string::npos)
-      << dump.str();
-  EXPECT_NE(dump.str().find("< \"c2-4\""), std::string::npos)
-      << dump.str();
+  EXPECT_NE(dump.str().find(">= \"c2-3\""), std::string::npos) << dump.str();
+  EXPECT_NE(dump.str().find("< \"c2-4\""), std::string::npos) << dump.str();
 
   Executor executor = plan_or.Value()->EmitExecutor(context);
   Row row;
   size_t rows = 0;
-  while (executor->Next(&row, nullptr)) { ++rows; }
+  while (executor->Next(&row, nullptr)) {
+    ++rows;
+  }
   EXPECT_EQ(rows, 11U);
   ASSERT_SUCCESS(context.PreCommit());
 }
@@ -551,12 +545,12 @@ TEST_F(OptimizerTest, AggregateLimitDoesNotCapInputScan) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(OptimizerTest, DISABLED_CountStarUsesUnboundedIndexOnlyScan) {
+TEST_F(OptimizerTest, CountStarUsesUnboundedIndexOnlyScan) {
   QueryData query{
-      {"Sc1"}, nullptr,
-      {NamedExpression("count", AggregateExpressionExp(
-                                    AggregationType::kCount,
-                                    ColumnValueExp("*")))}};
+      {"Sc1"},
+      nullptr,
+      {NamedExpression("count", AggregateExpressionExp(AggregationType::kCount,
+                                                       ColumnValueExp("*")))}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
 
@@ -565,8 +559,7 @@ TEST_F(OptimizerTest, DISABLED_CountStarUsesUnboundedIndexOnlyScan) {
   plan->Dump(logical, 0);
   EXPECT_NE(logical.str().find("IndexOnlyScan"), std::string::npos)
       << logical.str();
-  EXPECT_EQ(logical.str().find("FullScan"), std::string::npos)
-      << logical.str();
+  EXPECT_EQ(logical.str().find("FullScan"), std::string::npos) << logical.str();
 
   Executor executor = plan->EmitExecutor(context);
   std::ostringstream physical;
@@ -652,9 +645,9 @@ TEST_F(OptimizerTest, OrderByLiteralIsRemovedBeforeSortAndTopNPlanning) {
 
 TEST_F(OptimizerTest, FoldedOrderByConstantIsRemovedBeforePlanning) {
   QueryData query{{"Sc1"}, nullptr, {NamedExpression("c1")}};
-  query.order_expressions_ = {BinaryExpressionExp(
-      ConstantValueExp(Value(1)), BinaryOperation::kAdd,
-      ConstantValueExp(Value(2)))};
+  query.order_expressions_ = {BinaryExpressionExp(ConstantValueExp(Value(1)),
+                                                  BinaryOperation::kAdd,
+                                                  ConstantValueExp(Value(2)))};
   query.order_ascending_ = {true};
   query.limit_count_ = 2;
   TransactionContext context = rs_->BeginContext();
@@ -1498,13 +1491,11 @@ TEST_F(OptimizerTest, MergeJoinRuleUsesChildrenThatAlreadyProvideKeyOrder) {
   Plan left_scan = std::make_shared<FullScanPlan>(*left_table, *left_stats);
   Plan right_scan = std::make_shared<FullScanPlan>(*right_table, *right_stats);
   Plan left_sorted = std::make_shared<SortPlan>(
-      left_scan,
-      std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc1", "c1")), true,
-                            std::nullopt}});
+      left_scan, std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc1", "c1")),
+                                       true, std::nullopt}});
   Plan right_sorted = std::make_shared<SortPlan>(
-      right_scan,
-      std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc2", "d1")), true,
-                            std::nullopt}});
+      right_scan, std::vector<SortKey>{{ColumnValueExp(ColumnName("Sc2", "d1")),
+                                        true, std::nullopt}});
 
   cascades::Memo memo;
   const cascades::GroupId root = memo.Build({"Sc1", "Sc2"});
@@ -1888,13 +1879,13 @@ TEST_F(OptimizerTest, LimitWithOrderedIndexStreamsOnlyTopKRows) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(OptimizerTest, DISABLED_UnboundedIndexProvidesAscendingAndDescendingOrder) {
+TEST_F(OptimizerTest,
+       DISABLED_UnboundedIndexProvidesAscendingAndDescendingOrder) {
   TransactionContext context = rs_->BeginContext();
   const auto optimize = [&](bool ascending) {
-    QueryData query{{"Sc1"}, nullptr,
-                    {NamedExpression("key", ColumnName("Sc1", "c1"))}};
-    query.order_expressions_ = {
-        ColumnValueExp(ColumnName("Sc1", "c1"))};
+    QueryData query{
+        {"Sc1"}, nullptr, {NamedExpression("key", ColumnName("Sc1", "c1"))}};
+    query.order_expressions_ = {ColumnValueExp(ColumnName("Sc1", "c1"))};
     query.order_ascending_ = {ascending};
     query.limit_count_ = 1;
     EXPECT_EQ(query.Rewrite(context), Status::kSuccess);
@@ -2169,8 +2160,7 @@ TEST_F(OptimizerTest, DISABLED_DisjointRangesUseBitmapOrWithResidualRecheck) {
   ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
   std::ostringstream logical;
   plan->Dump(logical, 0);
-  EXPECT_NE(logical.str().find("BitmapOr"), std::string::npos)
-      << logical.str();
+  EXPECT_NE(logical.str().find("BitmapOr"), std::string::npos) << logical.str();
   Executor executor = plan->EmitExecutor(context);
   std::ostringstream physical;
   executor->Dump(physical, 0);
@@ -2530,6 +2520,75 @@ TEST_F(OptimizerTest, CorrelatedExistsBecomesSemiJoin) {
 
   Executor executor = plan->EmitExecutor(context);
   EXPECT_EQ(CountRows(executor), 9);  // c1 in 1..9
+}
+
+TEST_F(OptimizerTest, CorrelatedExistsKeepsCompositeCorrelationKey) {
+  // A single-column decorrelation would incorrectly retain Sc1.c1 == 0.
+  // The second equality must participate in the semi join as well.
+  TransactionContext writer = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, tbl,
+      rs_->CreateTable(writer,
+                       Schema("Sc5", {Column("x", ValueType::kInt64),
+                                      Column("y", ValueType::kDouble)})));
+  ASSERT_SUCCESS(
+      tbl.Insert(writer.txn_, Row({Value(0), Value(999.0)})).GetStatus());
+  for (int64_t key = 1; key < 50; ++key) {
+    ASSERT_SUCCESS(tbl.Insert(writer.txn_, Row({Value(key), Value(key + 9.9)}))
+                       .GetStatus());
+  }
+  ASSERT_SUCCESS(writer.PreCommit());
+  auto stats_context = rs_->BeginContext();
+  ASSERT_SUCCESS(rs_->RefreshStatistics(stats_context, "Sc5"));
+  ASSERT_SUCCESS(stats_context.PreCommit());
+
+  Expression correlation = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc5", "x")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("Sc1", "c1"))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc5", "y")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("Sc1", "c3"))));
+  QueryData query;
+  query.from_ = {"Sc1"};
+  query.where_ =
+      ExistsSubquery({NamedExpression("x")}, "Sc5", std::move(correlation));
+  query.select_ = {NamedExpression("c1")};
+
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  std::ostringstream dump;
+  dump << *plan_or.Value();
+  EXPECT_NE(dump.str().find("Semi Join"), std::string::npos) << dump.str();
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  EXPECT_EQ(CountRows(executor), 49);
+  ASSERT_SUCCESS(context.PreCommit());
+
+  // The same composite key machinery also applies when the projected inner
+  // column supplies the positive IN probe key in addition to a correlation
+  // predicate.
+  auto in_statement = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression(ColumnName("Sc5", "x"))},
+      std::vector<std::string>{"Sc5"},
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc5", "y")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("Sc1", "c3"))));
+  QueryData in_query;
+  in_query.from_ = {"Sc1"};
+  in_query.where_ =
+      QueryExpressionExp(std::move(in_statement),
+                         ColumnValueExp(ColumnName("Sc1", "c1")), false, false);
+  in_query.select_ = {NamedExpression("c1")};
+  TransactionContext in_context = rs_->BeginContext();
+  ASSERT_SUCCESS(in_query.Rewrite(in_context));
+  const auto in_plan_or = Optimizer::Optimize(in_query, in_context);
+  ASSERT_EQ(in_plan_or.GetStatus(), Status::kSuccess);
+  Executor in_executor = in_plan_or.Value()->EmitExecutor(in_context);
+  EXPECT_EQ(CountRows(in_executor), 49);
+  ASSERT_SUCCESS(in_context.PreCommit());
 }
 
 TEST_F(OptimizerTest, NotExistsBecomesAntiJoin) {

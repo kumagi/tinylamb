@@ -315,19 +315,36 @@ void PagePool::DropAllPages() {
 }
 
 void PagePool::FlushPageForTest(page_id_t page_id) {
-  Page* target = nullptr;
   {
     std::unique_lock latch(pool_latch);
     const auto it = pool_.find(page_id);
     if (it == pool_.end()) {
       return;  // Already evicted.
     }
-    target = it->second->page.get();
+    // Pin the entry so a concurrent eviction cannot detach and destroy the
+    // Page between unlocking pool_latch and WriteBack (the raw pointer would
+    // dangle the moment the evictor's unique_ptr resets).
+    it->second->pin_count.fetch_add(1, std::memory_order_relaxed);
+    Touch(it->second);
   }
-  // The entry cannot be evicted while this thread's PageRef-free flush runs;
-  // test-only callers hold no competing pins, so the raw pointer stays valid.
   std::scoped_lock io(io_latches_[ShardIndex(page_id)].mu);
+  std::unique_lock latch(pool_latch);
+  const auto it = pool_.find(page_id);
+  if (it == pool_.end()) {
+    // Evicted and re-created?  The pin we hold kept the original Page alive
+    // through DetachVictim's window, so reaching here means the entry was
+    // retired (DropAllPages); just drop our pin.
+    latch.unlock();
+    return;
+  }
+  Page* target = it->second->page.get();
+  latch.unlock();
   WriteBack(target);
+  latch.lock();
+  const auto still = pool_.find(page_id);
+  if (still != pool_.end()) {
+    ReleasePin(*still->second, page_id);
+  }
 }
 
 void PagePool::Unpin(page_id_t page_id) {

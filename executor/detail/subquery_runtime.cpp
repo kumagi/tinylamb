@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <sstream>
 #include <optional>
 #include <ratio>
 #include <string>
@@ -47,6 +49,26 @@
 namespace tinylamb::relational_detail {
 
 namespace {
+
+// EXISTS observes only whether rows remain after the query's relational
+// operators. Ordering those rows cannot change that boolean, including when
+// OFFSET is present; the offset depends on cardinality, not row identity.
+// Preserve LIMIT 0, and cap an unbounded/LIMIT>1 query at one row.
+std::shared_ptr<SelectStatement> PrepareExistsExecution(
+    const SelectStatement& statement, bool* capped) {
+  const bool needs_cap = !statement.HasLimit() || statement.Limit() > 1;
+  if (!needs_cap && statement.OrderBy().empty()) {
+    *capped = false;
+    return nullptr;
+  }
+  auto prepared = std::make_shared<SelectStatement>(statement);
+  prepared->SetOrderBy({});
+  if (needs_cap) {
+    prepared->SetLimit(1);
+  }
+  *capped = needs_cap;
+  return prepared;
+}
 
 bool AliasEquals(std::string_view left, std::string_view right) {
   return left.size() == right.size() &&
@@ -413,7 +435,7 @@ void DropCacheEntry(ExecutionRuntime& runtime, const SelectStatement* key) {
 
 std::optional<Relation> ExecuteCorrelatedSingleSource(
     TransactionContext& context, const SelectStatement& statement,
-    const Scope& outer, const CteMap& ctes) {
+    const Scope& outer, const CteMap& ctes, bool exists_only) {
   if (context.execution_runtime() == nullptr || statement.Sources().empty() ||
       std::ranges::any_of(
           statement.Sources(),
@@ -787,19 +809,45 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
   for (const ColumnName& column : index->cache_outer_columns) {
     cache_values.push_back(Lookup(column, outer));
   }
-  const std::string cache_key =
-      Row(std::move(cache_values)).EncodeMemcomparableFormat();
-  if (const auto cached_result = index->cached_results.find(cache_key);
-      cached_result != index->cached_results.end()) {
-    ++context.execution_runtime()->correlated_result_cache_hits;
-    return MaterializeRelation(*cached_result->second);
+  // A NULL correlated value is not a valid equality key.  In particular,
+  // LEFT JOIN null-extension reaches this path before the indexed equality
+  // guard below; encoding it as a memcomparable row would throw instead of
+  // producing the SQL UNKNOWN/empty-result semantics.  Skip the result cache
+  // for such probes and let the normal NULL guard handle them.
+  const bool cacheable = std::ranges::all_of(
+      cache_values, [](const Value& value) { return !value.IsNull(); });
+  std::optional<std::string> cache_key;
+  if (cacheable) {
+    cache_key = Row(std::move(cache_values)).EncodeMemcomparableFormat();
+    index->parameter_keys_seen.insert(*cache_key);
+    if (const auto cached_result = index->cached_results.find(*cache_key);
+        cached_result != index->cached_results.end()) {
+      ++context.execution_runtime()->correlated_result_cache_hits;
+      return MaterializeRelation(*cached_result->second);
+    }
+  } else {
+    // NULL equality parameters do not participate in the result cache, but
+    // they are still one distinct parameter tuple for profiling purposes.
+    index->parameter_keys_seen.insert("\xfftinylamb-null-parameter");
   }
 
   if (index->preaggregated) {
     Relation empty;
     empty.schema = index->schema;
-    return FinishQuery(context, statement, std::move(empty), &outer, ctes,
-                       false);
+    const SelectStatement* result_statement = &statement;
+    std::shared_ptr<SelectStatement> capped;
+    bool capped_by_limit = false;
+    if (exists_only) {
+      capped = PrepareExistsExecution(statement, &capped_by_limit);
+      if (capped) {
+        result_statement = capped.get();
+      }
+    }
+    if (capped_by_limit) {
+      ++context.execution_runtime()->exists_short_circuit_queries;
+    }
+    return FinishQuery(context, *result_statement, std::move(empty), &outer,
+                       ctes, false);
   }
 
   std::vector<Value> outer_values;
@@ -822,10 +870,25 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     candidates.AddRow(iter->second);
   }
   candidates.peak_intermediate_rows = candidates.rows.size();
-  Relation result =
-      FinishQuery(context, statement, std::move(candidates), &outer, ctes);
+  const SelectStatement* result_statement = &statement;
+  std::shared_ptr<SelectStatement> capped;
+  bool capped_by_limit = false;
+  if (exists_only) {
+    capped = PrepareExistsExecution(statement, &capped_by_limit);
+    if (capped) {
+      result_statement = capped.get();
+    }
+  }
+  if (capped_by_limit) {
+    ++context.execution_runtime()->exists_short_circuit_queries;
+  }
+  Relation result = FinishQuery(context, *result_statement,
+                               std::move(candidates), &outer, ctes);
+  if (!cache_key.has_value()) {
+    return MaterializeRelation(result);
+  }
   auto [iter, inserted] = index->cached_results.emplace(
-      cache_key, std::make_shared<Relation>(std::move(result)));
+      *cache_key, std::make_shared<Relation>(std::move(result)));
   return MaterializeRelation(*iter->second);
 }
 
@@ -947,12 +1010,222 @@ bool ExpressionsAreLocal(TransactionContext& context,
   return true;
 }
 
+bool StatementContainsVolatileFunction(const SelectStatement& statement) {
+  const auto expression_contains_volatile =
+      [](const Expression& expression, const auto& self) -> bool {
+    if (!expression) {
+      return false;
+    }
+    if (expression->Type() == TypeTag::kFunctionCallExp &&
+        GetFunctionVolatility(
+            expression->AsFunctionCallExpression().FuncName()) ==
+            Volatility::kVolatile) {
+      return true;
+    }
+    if (expression->Type() == TypeTag::kQueryExp) {
+      const QueryExpression& query = expression->AsQueryExpression();
+      if (query.Query() &&
+          StatementContainsVolatileFunction(*query.Query())) {
+        return true;
+      }
+    }
+    return std::ranges::any_of(ExpressionChildren(expression),
+                               [&](const Expression& child) {
+                                 return self(child, self);
+                               });
+  };
+  const auto statement_contains_volatile =
+      [&](const SelectStatement& current, const auto& self) -> bool {
+    for (const NamedExpression& item : current.SelectList()) {
+      if (expression_contains_volatile(item.expression,
+                                        expression_contains_volatile)) {
+        return true;
+      }
+    }
+    for (const Expression& expression : current.GroupBy()) {
+      if (expression_contains_volatile(expression, expression_contains_volatile)) {
+        return true;
+      }
+    }
+    if (expression_contains_volatile(current.WhereClause(),
+                                     expression_contains_volatile) ||
+        expression_contains_volatile(current.Having(),
+                                     expression_contains_volatile) ||
+        expression_contains_volatile(current.Qualify(),
+                                     expression_contains_volatile)) {
+      return true;
+    }
+    for (const SelectStatement::OrderByTerm& term : current.OrderBy()) {
+      if (expression_contains_volatile(term.expression,
+                                        expression_contains_volatile)) {
+        return true;
+      }
+    }
+    for (const SelectSource& source : current.Sources()) {
+      if (expression_contains_volatile(source.join_condition,
+                                       expression_contains_volatile) ||
+          expression_contains_volatile(source.unnest,
+                                       expression_contains_volatile)) {
+        return true;
+      }
+      if (source.query && self(*source.query, self)) {
+        return true;
+      }
+    }
+    for (const auto& [name, query] : current.WithQueries()) {
+      (void)name;
+      if (query && self(*query, self)) {
+        return true;
+      }
+    }
+    for (const std::shared_ptr<SelectStatement>& query : current.UnionAll()) {
+      if (query && self(*query, self)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  return statement_contains_volatile(statement, statement_contains_volatile);
+}
+
+std::string UncorrelatedCacheKey(const SelectStatement& statement,
+                                 const CteMap& ctes, bool exists_only) {
+  std::string key = statement.Fingerprint();
+  key += exists_only ? "|mode=exists" : "|mode=rows";
+  if (ctes.empty()) {
+    return key;
+  }
+  std::vector<std::string> names;
+  names.reserve(ctes.size());
+  for (const auto& [name, relation] : ctes) {
+    std::ostringstream part;
+    part << name << '@' << static_cast<const void*>(relation.get());
+    names.push_back(part.str());
+  }
+  std::ranges::sort(names);
+  key += "|ctes=";
+  for (const std::string& name : names) {
+    key += name;
+    key.push_back(';');
+  }
+  return key;
+}
+
+std::string CorrelatedApplyCacheKey(const SelectStatement& statement,
+                                    const Scope* outer, const CteMap& ctes,
+                                    bool exists_only) {
+  std::string key = UncorrelatedCacheKey(statement, ctes, exists_only);
+  key += "|outer=";
+  std::unordered_set<ColumnName> referenced_columns;
+  std::function<void(const SelectStatement&)> collect_statement;
+  std::function<void(const Expression&)> collect_expression;
+  collect_expression = [&](const Expression& expression) {
+    if (!expression) {
+      return;
+    }
+    for (const ColumnName& column : expression->TouchedColumns()) {
+      referenced_columns.insert(column);
+    }
+    for (const Expression& child : ExpressionChildren(expression)) {
+      collect_expression(child);
+    }
+  };
+  collect_statement = [&](const SelectStatement& current) {
+    for (const NamedExpression& item : current.SelectList()) {
+      collect_expression(item.expression);
+    }
+    for (const Expression& item : current.GroupBy()) {
+      collect_expression(item);
+    }
+    collect_expression(current.WhereClause());
+    collect_expression(current.Having());
+    collect_expression(current.Qualify());
+    for (const SelectStatement::OrderByTerm& item : current.OrderBy()) {
+      collect_expression(item.expression);
+    }
+    for (const SelectSource& source : current.Sources()) {
+      collect_expression(source.join_condition);
+      collect_expression(source.unnest);
+    }
+  };
+  collect_statement(statement);
+  size_t depth = 0;
+  for (const Scope* current = outer; current != nullptr;
+       current = current->outer, ++depth) {
+    key += std::to_string(depth);
+    key.push_back(':');
+    if (current->row == nullptr) {
+      key += "<null-row>;";
+      continue;
+    }
+    std::vector<Value> parameters;
+    std::string parameter_names;
+    if (current->schema != nullptr) {
+      for (size_t column = 0; column < current->schema->ColumnCount();
+           ++column) {
+        const ColumnName& candidate =
+            current->schema->GetColumn(column).Name();
+        const bool referenced = std::ranges::any_of(
+            referenced_columns, [&](const ColumnName& requested) {
+              return requested == candidate ||
+                     requested.ToString() == candidate.ToString() ||
+                     (requested.schema.empty() &&
+                      requested.name == candidate.name);
+            });
+        if (referenced && column < current->row->values_.size()) {
+          parameters.push_back((*current->row)[column]);
+          parameter_names += candidate.ToString();
+          parameter_names.push_back(',');
+        }
+      }
+    }
+    // A query with an opaque/derived source may have no resolvable local
+    // metadata. Retain the conservative full-row key in that case.
+    if (parameters.empty()) {
+      parameters = current->row->values_;
+      parameter_names = "<full-row>,";
+    }
+    key += parameter_names;
+    key.push_back('|');
+    // The memcomparable index encoding rejects NULL. Apply parameters may be
+    // NULL, so use Row's null-bitmap serializer instead.
+    const Row parameter_row(std::move(parameters));
+    std::string encoded(parameter_row.Size(), '\0');
+    const size_t serialized = parameter_row.Serialize(encoded.data());
+    encoded.resize(serialized);
+    key.append(encoded);
+    key.push_back(';');
+  }
+  return key;
+}
+
 const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
                                           const SelectStatement& statement,
-                                          const CteMap& ctes) {
+                                          const CteMap& ctes, bool exists_only) {
   if (context.execution_runtime() == nullptr ||
       context.execution_runtime()->noncacheable_queries.contains(&statement)) {
     return nullptr;
+  }
+  // Separate AST nodes can describe the same uncorrelated subquery (for
+  // example two identical scalar expressions in one SELECT list).  Use a
+  // structural key for those nodes, but include the identity of inherited
+  // CTE relations so a name resolving to different materialized contents can
+  // never reuse an unrelated result.
+  // EXISTS may safely execute a capped copy, while scalar/IN consumers need
+  // the complete relation (and scalar consumers must still observe a second
+  // row as a cardinality violation). Never let the capped representation be
+  // reused by a full-result consumer.
+  const std::string structural_key =
+      UncorrelatedCacheKey(statement, ctes, exists_only);
+  if (const auto structural = context.execution_runtime()
+                                  ->uncorrelated_results_by_fingerprint.find(
+                                      structural_key);
+      structural != context.execution_runtime()
+                        ->uncorrelated_results_by_fingerprint.end()) {
+    ++context.execution_runtime()->uncorrelated_cache_hits;
+    context.execution_runtime()->uncorrelated_results.emplace(
+        &statement, structural->second);
+    return structural->second.get();
   }
   const auto cached =
       context.execution_runtime()->uncorrelated_results.find(&statement);
@@ -1042,10 +1315,29 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
     context.execution_runtime()->noncacheable_queries.insert(&statement);
     return nullptr;
   }
-  Relation result = ExecuteQuery(context, statement, nullptr, ctes);
+  const SelectStatement* execution_statement = &statement;
+  std::shared_ptr<SelectStatement> capped;
+  bool capped_by_limit = false;
+  // EXISTS is insensitive to the order or payload of rows after the first
+  // qualifying row.  Apply the cap only when it cannot override an explicit
+  // LIMIT 0, and retain the original statement as the cache key.
+  if (exists_only) {
+    capped = PrepareExistsExecution(statement, &capped_by_limit);
+    if (capped) {
+      execution_statement = capped.get();
+    }
+  }
+  if (capped_by_limit) {
+    context.execution_runtime()->retained_statements.push_back(capped);
+    ++context.execution_runtime()->exists_short_circuit_queries;
+  }
+  Relation result =
+      ExecuteQuery(context, *execution_statement, nullptr, ctes);
   auto [iter, inserted] =
       context.execution_runtime()->uncorrelated_results.emplace(
           &statement, std::make_shared<Relation>(std::move(result)));
+  context.execution_runtime()->uncorrelated_results_by_fingerprint.emplace(
+      std::move(structural_key), iter->second);
   return iter->second.get();
 }
 

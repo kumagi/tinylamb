@@ -4,6 +4,8 @@
 #include "executor/detail/expression_eval.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -162,8 +164,12 @@ void ParallelAggregationExecutor::AccumulateValue(
 void ParallelAggregationExecutor::Accumulate(PartialState* state,
                                              const DataChunk& chunk) const {
   // Index groups were precomputed in the constructor; the only per-chunk
-  // state is this reused scratch vector, so the hot path does not allocate.
-  generic_scratch_.clear();
+  // state is this local scratch vector, so the hot path does not allocate.
+  // (It must stay a local: a shared mutable member was written by every
+  // worker thread concurrently, corrupting the fallback index lists.)
+  std::vector<size_t> generic_scratch;
+  generic_scratch.reserve(int64_column_indices_.size() +
+                          double_column_indices_.size());
   for (const size_t index : row_count_indices_) {
     state->values[index].value.int_value += static_cast<int64_t>(chunk.Size());
   }
@@ -172,7 +178,7 @@ void ParallelAggregationExecutor::Accumulate(PartialState* state,
     if (chunk.ColumnAt(input.column).Type() == ValueType::kInt64) {
       AccumulateInt64Column(state, index, chunk.ColumnAt(input.column));
     } else {
-      generic_scratch_.push_back(index);
+      generic_scratch.push_back(index);
     }
   }
   for (const size_t index : double_column_indices_) {
@@ -180,11 +186,11 @@ void ParallelAggregationExecutor::Accumulate(PartialState* state,
     if (chunk.ColumnAt(input.column).Type() == ValueType::kDouble) {
       AccumulateDoubleColumn(state, index, chunk.ColumnAt(input.column));
     } else {
-      generic_scratch_.push_back(index);
+      generic_scratch.push_back(index);
     }
   }
-  if (!generic_indices_.empty() || !generic_scratch_.empty()) {
-    AccumulateGeneric(state, chunk, generic_indices_, generic_scratch_);
+  if (!generic_indices_.empty() || !generic_scratch.empty()) {
+    AccumulateGeneric(state, chunk, generic_indices_, generic_scratch);
   }
 }
 
@@ -248,19 +254,28 @@ void ParallelAggregationExecutor::AccumulateInt64Column(
       break;
     }
     case AggregationType::kSum: {
+      // The serial executor raises "integer overflow on '+'"; the parallel
+      // path must not silently wrap (UB) instead.
       int64_t sum = 0;
       bool any = false;
+      bool overflow = false;
       for (size_t row = 0; row < column.Size(); ++row) {
         if (column.IsNull(row)) { continue;
 }
-        sum += data[row];
+        if (__builtin_add_overflow(sum, data[row], &sum)) {
+          overflow = true;
+        }
         any = true;
       }
       if (!any) { break;
 }
       Value& total = state->values[aggregate_index];
-      total = total.IsNull() ? Value(sum)
-                             : Value(total.value.int_value + sum);
+      if (overflow || (!total.IsNull() &&
+                       __builtin_add_overflow(total.value.int_value, sum,
+                                              &sum))) {
+        throw std::runtime_error("integer overflow on '+'");
+      }
+      total = total.IsNull() ? Value(sum) : Value(sum);
       break;
     }
     case AggregationType::kAvg: {
@@ -350,6 +365,12 @@ void ParallelAggregationExecutor::AccumulateDoubleColumn(
       for (size_t row = 0; row < column.Size(); ++row) {
         if (column.IsNull(row)) { continue;
 }
+        // GoogleSQL: any NaN in the group makes MIN/MAX NaN (matches the
+        // serial typed path and the ground truth accumulator).
+        if (std::isnan(data[row])) {
+          best = Value(std::numeric_limits<double>::quiet_NaN());
+          continue;
+        }
         if (best.IsNull() || data[row] < best.value.double_value) {
           best = Value(data[row]);
         }
@@ -361,6 +382,10 @@ void ParallelAggregationExecutor::AccumulateDoubleColumn(
       for (size_t row = 0; row < column.Size(); ++row) {
         if (column.IsNull(row)) { continue;
 }
+        if (std::isnan(data[row])) {
+          best = Value(std::numeric_limits<double>::quiet_NaN());
+          continue;
+        }
         if (best.IsNull() || best.value.double_value < data[row]) {
           best = Value(data[row]);
         }
@@ -398,14 +423,30 @@ void ParallelAggregationExecutor::Merge(PartialState* destination,
         destination->counts[index] += source.counts[index];
         break;
       case AggregationType::kMin:
+        // NaN-aware merge: a NaN partial must win (and a NaN destination
+        // must not be replaced), matching the GoogleSQL group semantics.
+        if (source.values[index].type == ValueType::kDouble &&
+            std::isnan(source.values[index].value.double_value)) {
+          destination->values[index] = source.values[index];
+          break;
+        }
         if (!source.values[index].IsNull() &&
+            !(destination->values[index].type == ValueType::kDouble &&
+              std::isnan(destination->values[index].value.double_value)) &&
             (destination->values[index].IsNull() ||
              source.values[index] < destination->values[index])) {
           destination->values[index] = source.values[index];
         }
         break;
       case AggregationType::kMax:
+        if (source.values[index].type == ValueType::kDouble &&
+            std::isnan(source.values[index].value.double_value)) {
+          destination->values[index] = source.values[index];
+          break;
+        }
         if (!source.values[index].IsNull() &&
+            !(destination->values[index].type == ValueType::kDouble &&
+              std::isnan(destination->values[index].value.double_value)) &&
             (destination->values[index].IsNull() ||
              destination->values[index] < source.values[index])) {
           destination->values[index] = source.values[index];

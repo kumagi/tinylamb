@@ -67,6 +67,7 @@ class Selection : public ExecutorBase {
   size_t jit_batches_{0};
   size_t jit_threshold_rows_;
   size_t rows_seen_{0};
+  size_t rows_selected_{0};
   // Surviving row indices of the current input batch; reused across batches
   // so the hot path stays allocation-free.
   std::vector<uint32_t> selection_vector_;

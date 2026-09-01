@@ -29,9 +29,11 @@
 #include "executor/index_join.hpp"
 #include "executor/index_only_scan.hpp"
 #include "executor/index_scan.hpp"
+#include "executor/incremental_sort.hpp"
 #include "executor/join_kind.hpp"
 #include "executor/limit.hpp"
 #include "executor/max1_row.hpp"
+#include "executor/minmax_index.hpp"
 #include "executor/merge_append.hpp"
 #include "executor/merge_join.hpp"
 #include "executor/parallel_aggregation.hpp"
@@ -54,8 +56,10 @@
 #include "plan/full_scan_plan.hpp"
 #include "plan/index_only_scan_plan.hpp"
 #include "plan/index_scan_plan.hpp"
+#include "plan/incremental_sort_plan.hpp"
 #include "plan/limit_plan.hpp"
 #include "plan/max1_row_plan.hpp"
+#include "plan/minmax_index_plan.hpp"
 #include "plan/merge_join_plan.hpp"
 #include "plan/parallel_thresholds.hpp"
 #include "plan/product_plan.hpp"
@@ -169,6 +173,29 @@ Executor SortDistinctPlan::EmitExecutor(TransactionContext& ctx) const {
 
 Executor Max1RowPlan::EmitExecutor(TransactionContext& ctx) const {
   return std::make_shared<Max1RowExecutor>(child_->EmitExecutor(ctx));
+}
+
+Executor MinMaxIndexPlan::EmitExecutor(TransactionContext& ctx) const {
+  return std::make_shared<MinMaxIndexExecutor>(child_->EmitExecutor(ctx),
+                                               ValueSlot());
+}
+
+Executor IncrementalSortPlan::EmitExecutor(TransactionContext& ctx) const {
+  std::vector<SortExecutor::Key> prefix;
+  std::vector<SortExecutor::Key> suffix;
+  prefix.reserve(prefix_keys_.size());
+  suffix.reserve(suffix_keys_.size());
+  for (const SortKey& key : prefix_keys_) {
+    prefix.push_back(
+        SortExecutor::Key{key.expression, key.ascending, key.nulls_first});
+  }
+  for (const SortKey& key : suffix_keys_) {
+    suffix.push_back(
+        SortExecutor::Key{key.expression, key.ascending, key.nulls_first});
+  }
+  return std::make_shared<IncrementalSortExecutor>(
+      child_->EmitExecutor(ctx), child_->GetSchema(), std::move(prefix),
+      std::move(suffix));
 }
 
 Executor SetOperationPlan::EmitExecutor(TransactionContext& ctx) const {

@@ -151,5 +151,29 @@ TEST(RowTest, Extract_WithOutOfBoundsIndices_ReturnsEmptyRow) {
   EXPECT_EQ(extracted.values_.size(), 0U);
 }
 
+TEST(RowTest, Serialize_WithTooManyColumns_ThrowsInsteadOfCorrupting) {
+  // Fixed: slot_t (u16) wrapped for >= 32768 columns and the top bit
+  // collided with the null-bitmap flag, silently corrupting the image.
+  const Row big(std::vector<Value>(32768, Value(int64_t{1})));
+  std::vector<char> buf(big.Size() + 16);
+  EXPECT_THROW(std::ignore = big.Serialize(buf.data()), std::runtime_error);
+
+  // 32767 columns must still round-trip.
+  std::vector<Column> cols;
+  cols.reserve(32767);
+  for (int i = 0; i < 32767; ++i) {
+    cols.emplace_back("c" + std::to_string(i), ValueType::kInt64);
+  }
+  const Schema schema("wide", cols);
+  const Row ok(std::vector<Value>(32767, Value(int64_t{1})));
+  std::vector<char> buf2(ok.Size() + 16);
+  const size_t written = ok.Serialize(buf2.data());
+  Row restored;
+  const size_t read = restored.Deserialize(buf2.data(), schema);
+  EXPECT_EQ(written, read);
+  EXPECT_EQ(restored.values_.size(), 32767U);
+  EXPECT_EQ(restored[0], Value(int64_t{1}));
+}
+
 }  // namespace tinylamb
 

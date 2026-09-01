@@ -146,6 +146,15 @@ TEST(PostgresProtocolTest, EncodesDoubleAndDateValues) {
 
   // Assert -- the double prints with full precision
   EXPECT_NE(message.find("3.5"), std::string::npos);
+
+  // PRODUCTION FIX: the shortest round-tripping representation must be
+  // emitted (PostgreSQL behavior); max_digits10 printed 17 digits and turned
+  // 0.1 into "0.10000000000000001".
+  const std::string short_row = DataRow(Row({Value(0.1), Value(1e20)}));
+  EXPECT_NE(short_row.find("0.1\x00", 0), std::string::npos)
+      << "raw=" << short_row;
+  EXPECT_EQ(short_row.find("0.10000000000000001"), std::string::npos);
+
   // float8 OID 701 then date OID 1082 in the row description
   EXPECT_NE(description.find(std::string("\x00\x00\x02\xbd", 4)),
             std::string::npos);
@@ -205,6 +214,23 @@ TEST(PostgresProtocolTest, SplitSqlStatementsDropsEmptyStatements) {
   const std::vector<std::string> statements = SplitSqlStatements(" ; ;  ; ");
   // Assert -- empty statements are omitted entirely
   EXPECT_TRUE(statements.empty());
+}
+
+TEST(PostgresProtocolTest, SplitSqlStatementsRespectsBackslashEscapes) {
+  // PRODUCTION BUG (fixed): a backslash inside a single-quoted string was a
+  // normal character to the splitter, so `\'` toggled the quote state early
+  // and a semicolon inside the string split statements (classic
+  // statement-split injection: `SELECT 'a\', 2; DROP TABLE t; --'`).
+  const std::vector<std::string> one = SplitSqlStatements(
+      "SELECT 'a\\', 2; DROP TABLE t; --'");
+  ASSERT_EQ(one.size(), 1U);
+  EXPECT_EQ(one[0], "SELECT 'a\\', 2; DROP TABLE t; --'");
+
+  const std::vector<std::string> two =
+      SplitSqlStatements("SELECT 'It\\'s'; SELECT 2;");
+  ASSERT_EQ(two.size(), 2U);
+  EXPECT_EQ(two[0], "SELECT 'It\\'s'");
+  EXPECT_EQ(two[1], "SELECT 2");
 }
 
 TEST(PostgresProtocolTest, RowDescriptionDefaultNameAndTypes) {

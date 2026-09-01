@@ -135,14 +135,23 @@ bool AggregationExecutor::Next(Row* dst, RowPosition* /*rp*/) {
             column.Type() != ValueType::kInt64) {
           throw std::runtime_error("aggregation input layout mismatch");
         }
-        total += jit_sum_->Sum(column.IntegerData().data(), column.Size());
+        const int64_t partial =
+            jit_sum_->Sum(column.IntegerData().data(), column.Size());
+        // PRODUCTION FIX: the JIT kernel wraps on overflow; the serial and
+        // parallel paths throw. Detect the wrap per batch and per merge.
+        if (__builtin_add_overflow(total, partial, &total)) {
+          throw std::runtime_error("integer overflow on '+'");
+        }
         any = any || column.Size() != 0;
         ++jit_batches_;
       } else {
         for (size_t row = 0; row < column.Size(); ++row) {
           if (column.IsNull(row)) { continue;
 }
-          total += column.ValueAt(row).value.int_value;
+          if (__builtin_add_overflow(
+                  total, column.ValueAt(row).value.int_value, &total)) {
+            throw std::runtime_error("integer overflow on '+'");
+          }
           any = true;
         }
       }
@@ -381,6 +390,13 @@ bool AggregationExecutor::AccumulateTypedBatch(
             }
           } else {
             const double candidate = doubles[row];
+            // GoogleSQL: any NaN in the group makes MIN/MAX NaN.  NaN fails
+            // every comparison, so seed the result explicitly (the ground
+            // truth accumulator in expression_eval does the same).
+            if (std::isnan(candidate)) {
+              best = Value(std::numeric_limits<double>::quiet_NaN());
+              continue;
+            }
             if (best.IsNull() || candidate < best.value.double_value) {
               best = Value(candidate);
             }
@@ -400,6 +416,10 @@ bool AggregationExecutor::AccumulateTypedBatch(
             }
           } else {
             const double candidate = doubles[row];
+            if (std::isnan(candidate)) {
+              best = Value(std::numeric_limits<double>::quiet_NaN());
+              continue;
+            }
             if (best.IsNull() || best.value.double_value < candidate) {
               best = Value(candidate);
             }
@@ -655,15 +675,70 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
             ++counts[i];
             break;
           case AggregationType::kMin:
+            if (val.type == ValueType::kDouble &&
+                std::isnan(val.value.double_value)) {
+              // Any NaN makes the group MIN/MAX NaN (see ground truth).
+              results[i] = Value(std::numeric_limits<double>::quiet_NaN());
+              break;
+            }
+            if (results[i].type == ValueType::kDouble &&
+                std::isnan(results[i].value.double_value)) {
+              break;  // NaN best wins; comparisons would be unsound.
+            }
             if (results[i].IsNull() || val < results[i]) { results[i] = val;
 }
             break;
           case AggregationType::kMax:
+            if (val.type == ValueType::kDouble &&
+                std::isnan(val.value.double_value)) {
+              results[i] = Value(std::numeric_limits<double>::quiet_NaN());
+              break;
+            }
+            if (results[i].type == ValueType::kDouble &&
+                std::isnan(results[i].value.double_value)) {
+              break;
+            }
             if (results[i].IsNull() || results[i] < val) { results[i] = val;
 }
             break;
           case AggregationType::kCount:
             ++results[i].value.int_value;
+            break;
+          // PRODUCTION FIX: when a typed aggregate shares the row-wise loop
+          // with a generic one (mixed SELECT list), the typed aggregate owns
+          // no row accumulator; without these cases BIT_*/LOGICAL_* silently
+          // produced NULL.
+          case AggregationType::kBitAnd:
+          case AggregationType::kBitOr:
+          case AggregationType::kBitXor: {
+            if (val.IsNull()) { break; }
+            const int64_t v = val.value.int_value;
+            int64_t& cur = results[i].value.int_value;
+            if (results[i].IsNull()) {
+              results[i] = Value(v);
+            } else if (agg.GetType() == AggregationType::kBitAnd) {
+              cur &= v;
+            } else if (agg.GetType() == AggregationType::kBitOr) {
+              cur |= v;
+            } else {
+              cur ^= v;
+            }
+            break;
+          }
+          case AggregationType::kLogicalAnd:
+            if (!val.IsNull()) {
+              if (results[i].IsNull()) {
+                results[i] = Value(val.value.int_value != 0 ? int64_t{1}
+                                                            : int64_t{0});
+              } else if (val.value.int_value == 0) {
+                results[i] = Value(int64_t{0});
+              }
+            }
+            break;
+          case AggregationType::kLogicalOr:
+            if (!val.IsNull() && val.value.int_value != 0) {
+              results[i] = Value(int64_t{1});
+            }
             break;
           default:
             // Other aggregate kinds are owned by their accumulator.

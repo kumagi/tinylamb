@@ -142,8 +142,16 @@ class Value {
   bool operator!=(const Value& rhs) const { return !operator==(rhs); }
   bool operator<(const Value& rhs) const;
   bool operator>(const Value& rhs) const;
-  bool operator<=(const Value& rhs) const { return !operator>(rhs); }
-  bool operator>=(const Value& rhs) const { return !operator<(rhs); }
+  // Derived from < and == (not from negating >) so that NaN, which compares
+  // false against everything in both < and >, stays consistent: the old
+  // `!(a > b)` form made `NaN <= x` true while `NaN < x` and `NaN == x` were
+  // both false.
+  bool operator<=(const Value& rhs) const {
+    return operator<(rhs) || operator==(rhs);
+  }
+  bool operator>=(const Value& rhs) const {
+    return operator>(rhs) || operator==(rhs);
+  }
 
   Value operator+(const Value& rhs) const;
   Value operator-(const Value& rhs) const;

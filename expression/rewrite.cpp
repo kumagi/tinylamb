@@ -1315,7 +1315,10 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             fn.Args()[0]);
       }));
 
-    // x = NULL -> x IS NULL, x != NULL -> x IS NOT NULL
+    // x = NULL -> NULL (removed: rewriting this to `x IS NULL` destroyed
+    // three-valued logic.  `x = NULL` is UNKNOWN for every row, so the
+    // honest constant result is the NULL (unknown) value; the old rewrite
+    // made `WHERE x = NULL` return exactly the rows with x IS NULL.)
     built.Add(ExpressionRule(
       "contradiction_from_null_eq",
       AnyBinary(Any("left"), Any("right")),
@@ -1329,12 +1332,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         const Value right_val =
             bindings.at("right")->AsConstantValue().GetValue();
         if (!right_val.IsNull()) { return Expression{}; }
-        if (binary.Op() == BinaryOperation::kEquals) {
-          return UnaryExpressionExp(bindings.at("left"),
-                                    UnaryOperation::kIsNull);
-        }
-        return UnaryExpressionExp(bindings.at("left"),
-                                  UnaryOperation::kIsNotNull);
+        return ConstantValueExp(Value());
       }));
 
     // greatest(greatest(a, b), c) -> greatest(a, b, c)
@@ -1626,8 +1624,32 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           // but we need to preserve: IS TRUE -> (child IS TRUE)
           return bindings.at("left");
         }
-        // IS TRUE = 0 -> NOT (child IS TRUE) -> child IS NOT TRUE
-        return UnaryExpressionExp(child, UnaryOperation::kIsNotTrue);
+        if (val.value.int_value != 0) {
+          // Only 0/1 can invert a boolean predicate; comparing an IS-predicate
+          // (1/0/NULL) against e.g. 5 must not invert the predicate.
+          return Expression{};
+        }
+        // (pred) = 0 -> NOT pred.  Map each predicate to its exact
+        // complement; the old code always produced `child IS NOT TRUE`,
+        // which inverts `x IS FALSE` into the wrong predicate.
+        UnaryOperation complement = UnaryOperation::kIsNotTrue;
+        switch (left_op) {
+          case UnaryOperation::kIsTrue:
+            complement = UnaryOperation::kIsNotTrue;
+            break;
+          case UnaryOperation::kIsNotTrue:
+            complement = UnaryOperation::kIsTrue;
+            break;
+          case UnaryOperation::kIsFalse:
+            complement = UnaryOperation::kIsNotFalse;
+            break;
+          case UnaryOperation::kIsNotFalse:
+            complement = UnaryOperation::kIsFalse;
+            break;
+          default:
+            return Expression{};
+        }
+        return UnaryExpressionExp(child, complement);
       }));
 
     // Prevent constant folding of nondeterministic functions.
@@ -1649,25 +1671,14 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         return Expression{};
       }));
 
-    // x / 0 -> NULL (integer and float division by zero constant)
+    // x / 0 keeps the runtime "division by zero" error (removed: folding it
+    // to NULL turned an explicit error into a silent wrong result and made
+    // `WHERE i/0 > 1` drop all rows instead of raising).
     built.Add(ExpressionRule(
       "safe_divide_rewrite",
       AnyBinary(Any("left"), Is(TypeTag::kConstantValue, "zero")),
-      [](const Expression& expression, const ExpressionBindings& bindings) {
-        const auto& binary = expression->AsBinaryExpression();
-        if (binary.Op() != BinaryOperation::kDivide) { return Expression{}; }
-        if (!IsConstant(bindings.at("zero"))) { return Expression{}; }
-        const Value val =
-            bindings.at("zero")->AsConstantValue().GetValue();
-        if (val.IsNull()) { return Expression{}; }
-        bool is_zero = false;
-        if (val.type == ValueType::kInt64) {
-          is_zero = val.value.int_value == 0;
-        } else if (val.type == ValueType::kDouble) {
-          is_zero = val.value.double_value == 0.0;
-        }
-        if (!is_zero) { return Expression{}; }
-        return ConstantValueExp(Value());
+      [](const Expression&, const ExpressionBindings&) {
+        return Expression{};
       }));
 
     // coalesce_and_nullif_simplification: Simplify COALESCE when leading arguments are non-null constants,
@@ -2527,34 +2538,12 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             if (left && right && left->Type() == TypeTag::kFunctionCallExp &&
                 right->Type() == TypeTag::kFunctionCallExp &&
                 Same(left, right)) {
-              const auto& fn = left->AsFunctionCallExpression();
-              if (GetFunctionVolatility(fn.FuncName()) == Volatility::kImmutable) {
-                const BinaryOperation operation = binary.Op();
-                if (operation == BinaryOperation::kNotEquals ||
-                    operation == BinaryOperation::kLessThan ||
-                    operation == BinaryOperation::kGreaterThan) {
-                  return ConstantValueExp(Value(false));
-                }
-                if (operation == BinaryOperation::kLessThanEquals ||
-                    operation == BinaryOperation::kGreaterThanEquals ||
-                    operation == BinaryOperation::kEquals) {
-                  return UnaryExpressionExp(left, UnaryOperation::kIsNotNull);
-                }
-                if (operation == BinaryOperation::kAnd ||
-                    operation == BinaryOperation::kOr) {
-                  return left;
-                }
-                switch (operation) {
-                  case BinaryOperation::kSubtract:
-                    return ConstantValueExp(Value(int64_t{0}));
-                  case BinaryOperation::kDivide:
-                    return ConstantValueExp(Value(int64_t{1}));
-                  case BinaryOperation::kXor:
-                    return ConstantValueExp(Value(int64_t{0}));
-                  default:
-                    break;
-                }
-              }
+              // PRODUCTION FIX: self-identities (f-f -> 0, f/f -> 1,
+              // f = f -> IS NOT NULL, f < f -> FALSE) were only valid for
+              // non-NULL operands.  An immutable function may return NULL,
+              // so folding changed UNKNOWN into concrete values (and f/f
+              // hid the division by zero when f(x) == 0).  The unsafe fold
+              // was removed; expressions stay as written.
             }
           }
           // Function calls with duplicate deterministic arguments (e.g. coalesce, greatest, least)

@@ -923,8 +923,12 @@ void HashJoin::MaterializeSemiAnti() {
   // per-partition index is exhaustive.
   if (!s.left.Spilled()) {
     // Resident probe side: one row may match in any partition, so match
-    // flags accumulate across partitions before emission.
-    std::vector<bool> matched(s.left.rows.size(), false);
+    // states accumulate across partitions before emission.  Three states
+    // (PRODUCTION FIX): -1 = NULL probe key, 0 = no match, 1 = match.  The
+    // old bool array turned a NULL probe key into "no match", which emitted
+    // NULL-key rows for ANTI joins although `NULL NOT IN (...)` is UNKNOWN.
+    enum class ProbeState : int8_t { kNull = -1, kNoMatch = 0, kMatch = 1 };
+    std::vector<ProbeState> matched(s.left.rows.size(), ProbeState::kNoMatch);
     for (size_t p = 0; p < kReactiveSpillPartitions; ++p) {
       std::vector<PositionedRow> right_part =
           s.right.spills[p].ReadAllPositioned();
@@ -932,13 +936,19 @@ void HashJoin::MaterializeSemiAnti() {
 }
       const SideIndex build = BuildSideIndex(right_part, right_cols_);
       for (size_t i = 0; i < s.left.rows.size(); ++i) {
-        if (matched[i]) { continue;
-}
-        matched[i] = probe_lookup(s.left.rows[i], build) == 1;
+        if (matched[i] == ProbeState::kMatch) { continue; }
+        const int state = probe_lookup(s.left.rows[i], build);
+        if (state == 1) {
+          matched[i] = ProbeState::kMatch;
+        } else if (state < 0 && matched[i] == ProbeState::kNoMatch) {
+          matched[i] = ProbeState::kNull;
+        }
       }
     }
+    const int want = semi ? static_cast<int>(ProbeState::kMatch)
+                          : static_cast<int>(ProbeState::kNoMatch);
     for (size_t i = 0; i < s.left.rows.size(); ++i) {
-      if (matched[i] == semi) { emit_probe(s.left.rows[i]); }
+      if (static_cast<int>(matched[i]) == want) { emit_probe(s.left.rows[i]); }
     }
   } else {
     for (size_t p = 0; p < kReactiveSpillPartitions; ++p) {
@@ -1130,6 +1140,8 @@ void HashJoin::SetupInMemoryJoin() {
     s.probe_rows = &s.left.rows;
     s.probe_cols = &left_cols_;
   }
+  actual_build_rows_ = s.build_rows == nullptr ? 0 : s.build_rows->size();
+  actual_probe_rows_ = s.probe_rows == nullptr ? 0 : s.probe_rows->size();
   s.left.charge.ReleaseAll();
   s.right.charge.ReleaseAll();
   if (worker_count_ > 1 && s.probe_rows->size() >= kParallelProbeMinRows) {
@@ -1290,6 +1302,8 @@ void HashJoin::RunStripedProbe() {
       output_bytes += EstimateRowBytes(item.first);
     }
   }
+  join_matches_ = 0;
+  for (const auto& stripe : outs) { join_matches_ += stripe.size(); }
   output_charge_.Add(output_bytes);
   s.stripe_outputs = std::move(outs);
 }
@@ -1346,6 +1360,7 @@ bool HashJoin::EmitNextMatch(Row* dst, RowPosition* rp) {
 }
       }
       s.cur_entry = s.shards[s.cur_shard].ChainNext(s.cur_entry);
+      ++join_matches_;
       return true;
     }
     if (!FetchNextProbe()) { return false;
@@ -1491,6 +1506,12 @@ void HashJoin::Dump(std::ostream& o, int indent) const {
   left_->Dump(o, indent + 2);
   o << "\n" << Indent(indent + 2);
   right_->Dump(o, indent + 2);
+  if (materialized_ && kind_ == JoinKind::kInner) {
+    o << "\n" << Indent(indent)
+      << "HashJoin actual_build_rows=" << actual_build_rows_
+      << " actual_probe_rows=" << actual_probe_rows_
+      << " join_matches=" << join_matches_;
+  }
 }
 
 size_t HashJoin::MaterializedRowCount() const {

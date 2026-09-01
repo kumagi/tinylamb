@@ -23,6 +23,7 @@
 #include <iostream>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -46,6 +47,11 @@ size_t Row::Serialize(char* dst) const {
   const bool has_null =
       std::ranges::any_of(values_, [](const Value& value) { return value.IsNull(); });
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
+  // Slot width is 16 bits and the top bit is the null-bitmap flag; a row with
+  // >= 32768 columns would silently wrap the count and corrupt the image.
+  if (values_.size() >= kNullBitmapFlag) {
+    throw std::runtime_error("too many columns to serialize a row");
+  }
   const auto count = static_cast<slot_t>(values_.size());
   dst += SerializeSlot(dst, has_null ? count | kNullBitmapFlag : count);
   if (has_null) {
@@ -177,6 +183,12 @@ size_t Row::Size() const {
 }
   }
   return ret;
+}
+
+std::string Row::ToString() const {
+  std::ostringstream output;
+  output << *this;
+  return output.str();
 }
 
 std::string Row::EncodeMemcomparableFormat() const {

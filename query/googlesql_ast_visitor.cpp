@@ -56,6 +56,34 @@
 namespace tinylamb {
 
 namespace {
+// The AST dump does not carry per-pair set-operator text (only byte ranges
+// into the original SQL). Visit() stashes the source here so set operations
+// can slice `SetOperationType` / `SetOperationAllOrDistinct` text out.
+thread_local const std::string* t_visit_source = nullptr;
+
+class VisitSourceScope {
+ public:
+  explicit VisitSourceScope(const std::string& source)
+      : previous_(t_visit_source) {
+    t_visit_source = &source;
+  }
+  ~VisitSourceScope() { t_visit_source = previous_; }
+
+ private:
+  const std::string* previous_;
+};
+
+std::string SliceSource(const GoogleSqlAstNode* node) {
+  if (node == nullptr || t_visit_source == nullptr) { return {}; }
+  if (node->end < node->start || node->end > t_visit_source->size()) {
+    return {};
+  }
+  return t_visit_source->substr(node->start, node->end - node->start);
+}
+}  // namespace
+
+
+namespace {
 
 SelectSource ExpandPivotSource(SelectSource base,
                                const GoogleSqlAstNode& pivot);
@@ -863,6 +891,12 @@ BinaryOperation BinaryOp(std::string_view detail) {
   if (detail == "NOT LIKE") {
     return BinaryOperation::kNotLike;
   }
+  if (detail == "IS DISTINCT FROM") {
+    return BinaryOperation::kIsDistinctFrom;
+  }
+  if (detail == "IS NOT DISTINCT FROM") {
+    return BinaryOperation::kIsNotDistinctFrom;
+  }
   throw std::runtime_error("GoogleSQL AST: unsupported binary operator " +
                            std::string(detail));
 }
@@ -1391,15 +1425,22 @@ WindowOrderTerm ParseOrderingTerm(const GoogleSqlAstNode* term) {
       continue;
     }
     if (child->kind == "NullOrder") {
-      parsed.nulls_first =
-          UpperCopy(child->detail).find("NULLS FIRST") != std::string::npos;
+      std::string null_order_text = UpperCopy(child->detail);
+      if (null_order_text.empty()) {
+        null_order_text = UpperCopy(SliceSource(child.get()));
+      }
+      parsed.nulls_first = null_order_text.find("FIRST") != std::string::npos;
       continue;
     }
     if (!parsed.expression) {
       parsed.expression = VisitExpression(*child);
     }
   }
-  parsed.ascending = UpperCopy(term->detail) != "DESC";
+  std::string direction = UpperCopy(term->detail);
+  if (direction.empty()) {
+    direction = UpperCopy(SliceSource(term));
+  }
+  parsed.ascending = direction.find("DESC") == std::string::npos;
   return parsed;
 }
 
@@ -2514,7 +2555,7 @@ Expression VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
 // Normalizes a TIMESTAMP string to UTC ("...+00"), interpreting an explicit
 // offset / UTC marker when present and the session default time zone
 // otherwise.  Shared by TIMESTAMP literals and typed array elements.
-std::string NormalizeTimestampText(const std::string& text) {
+std::string NormalizeTimestampTextImpl(const std::string& text) {
   std::string norm_ts = text;
   if (text.size() < 10) {
     return norm_ts;
@@ -2865,7 +2906,7 @@ Expression VisitExpression(
       return ConstantValueExp(Value(std::string(text)));
     }
     // TYPE_TIMESTAMP
-    return ConstantValueExp(Value(NormalizeTimestampText(text)));
+    return ConstantValueExp(Value(NormalizeTimestampTextImpl(text)));
   }
 
   if (node.kind == "NullLiteral") {
@@ -2922,7 +2963,7 @@ Expression VisitExpression(
       if (UpperCopy(element_type) == "TIMESTAMP" &&
           child->kind == "StringLiteral") {
         elements.push_back(ConstantValueExp(
-            Value(NormalizeTimestampText(DecodeString(*child)))));
+            Value(NormalizeTimestampTextImpl(DecodeString(*child)))));
         continue;
       }
       elements.push_back(VisitExpression(*child));
@@ -3852,6 +3893,13 @@ Expression VisitExpression(
            ConstantValueExp(Value(std::move(node_detail))),
            ConstantValueExp(Value(std::move(quantifier_copy)))});
     }
+    // PRODUCTION FIX: a QuantifiedComparisonExpression with no query and no
+    // list dereferenced a null node here and crashed the process (the AST is
+    // fuzzer/untrusted input). Fail loudly instead.
+    if (list_node == nullptr) {
+      throw std::runtime_error(
+          "GoogleSQL AST: malformed quantified comparison (missing list)");
+    }
     std::vector<Expression> items;
     for (const auto& child : list_node->children) {
       if (child->kind != "Location") {
@@ -4523,47 +4571,89 @@ std::shared_ptr<SelectStatement> VisitQuery(
       }
       if (!operands.empty()) {
         auto first_stmt = VisitQuery(*operands[0]);
-        bool union_distinct = false;
         bool union_by_name = false;
-        SetOperationKind default_operation = SetOperationKind::kUnionAll;
-      const std::string set_detail = UpperCopy(set_op->detail);
+        std::vector<SetOperationKind> per_pair;
+        SetOperationKind head_kind = SetOperationKind::kUnionAll;
+        const std::string set_detail = UpperCopy(set_op->detail);
         if (set_detail.find("INTERSECT") != std::string::npos) {
-          default_operation =
-              set_detail.find("ALL") != std::string::npos
-                  ? SetOperationKind::kIntersectAll
-                  : SetOperationKind::kIntersect;
+          head_kind = set_detail.find("ALL") != std::string::npos
+                          ? SetOperationKind::kIntersectAll
+                          : SetOperationKind::kIntersect;
         } else if (set_detail.find("EXCEPT") != std::string::npos) {
-          default_operation =
-              set_detail.find("ALL") != std::string::npos
-                  ? SetOperationKind::kExceptAll
-                  : SetOperationKind::kExcept;
+          head_kind = set_detail.find("ALL") != std::string::npos
+                          ? SetOperationKind::kExceptAll
+                          : SetOperationKind::kExcept;
         } else if (set_detail.find("DISTINCT") != std::string::npos) {
-          default_operation = SetOperationKind::kUnion;
+          head_kind = SetOperationKind::kUnion;
         }
         if (const GoogleSqlAstNode* metadata_list =
                 set_op->Child("SetOperationMetadataList")) {
           for (const GoogleSqlAstNode* metadata :
                metadata_list->Children("SetOperationMetadata")) {
-            const GoogleSqlAstNode* mode =
+            const GoogleSqlAstNode* type_node =
+                metadata->Child("SetOperationType");
+            const GoogleSqlAstNode* mode_node =
                 metadata->Child("SetOperationAllOrDistinct");
-            if (mode != nullptr &&
-                UpperCopy(mode->detail).find("DISTINCT") != std::string::npos) {
-              union_distinct = true;
+            const std::string type_text = UpperCopy(SliceSource(type_node));
+            const std::string mode_text = UpperCopy(SliceSource(mode_node));
+            if (type_text.empty() && mode_text.empty()) {
+              continue;
             }
+            SetOperationKind kind;
+            if (type_text.find("INTERSECT") != std::string::npos) {
+              kind = mode_text.find("ALL") != std::string::npos
+                         ? SetOperationKind::kIntersectAll
+                         : SetOperationKind::kIntersect;
+            } else if (type_text.find("EXCEPT") != std::string::npos) {
+              kind = mode_text.find("ALL") != std::string::npos
+                         ? SetOperationKind::kExceptAll
+                         : SetOperationKind::kExcept;
+            } else {
+              kind = mode_text.find("ALL") != std::string::npos
+                         ? SetOperationKind::kUnionAll
+                         : SetOperationKind::kUnion;
+            }
+            per_pair.push_back(kind);
             if (metadata->Child("SetOperationColumnMatchMode") != nullptr) {
               union_by_name = true;
             }
           }
         }
-        if (set_detail.find("DISTINCT") != std::string::npos) {
-          union_distinct = true;
+        while (per_pair.size() + 1 < operands.size()) {
+          per_pair.push_back(head_kind);
         }
-        if (union_distinct) {
+        if (set_detail.find("DISTINCT") != std::string::npos) {
           first_stmt->MarkUnionDistinct(union_by_name);
         }
+        const auto first_operand =
+            std::make_shared<SelectStatement>(*first_stmt);
+        std::vector<std::shared_ptr<SelectStatement>> branches;
+        branches.reserve(operands.size() - 1);
         for (size_t i = 1; i < operands.size(); ++i) {
-          first_stmt->AddSetOperation(default_operation, VisitQuery(*operands[i]));
+          const SetOperationKind kind =
+              i - 1 < per_pair.size() ? per_pair[i - 1] : head_kind;
+          auto branch = VisitQuery(*operands[i]);
+          branches.push_back(branch);
+          first_stmt->AddSetOperation(kind, std::move(branch));
         }
+        // Keep explicit parenthesized groups available to the relational
+        // executor.  The legacy vectors above intentionally remain populated
+        // because the optimizer and SQL-template binder still consume them,
+        // but flattening a grouped operand changes the meaning of e.g.
+        // `(A UNION ALL B) INTERSECT C`.
+        bool has_grouped_operand =
+            first_operand->GetSetOperationTree() != nullptr;
+        for (const auto& branch : branches) {
+          if (branch != nullptr && branch->GetSetOperationTree() != nullptr) {
+            has_grouped_operand = true;
+          }
+        }
+        auto tree = std::make_shared<SetOperationTree>();
+        tree->first = first_operand;
+        tree->branches = std::move(branches);
+        tree->kinds = per_pair;
+        tree->grouped = has_grouped_operand;
+        first_stmt->SetSetOperationTree(std::move(tree));
         // A set operation is represented by the first operand in the
         // statement tree, but query-level LIMIT/OFFSET and WITH clauses hang
         // off the wrapper.  Preserve them here so execution sees the same
@@ -5867,8 +5957,17 @@ void ValidateSelectAsProjections(
 
 }  // namespace
 
+std::string NormalizeTimestampText(const std::string& text) {
+  return NormalizeTimestampTextImpl(text);
+}
+
 std::unique_ptr<Statement> GoogleSqlAstVisitor::Visit(
-    const GoogleSqlAstNode& root) {
+    const GoogleSqlAstNode& root, std::string_view source) {
+  std::string source_storage(source);
+  // Only the outermost Visit installs the source; recursive Visit calls
+  // pass an empty view and keep the outer scope alive.
+  std::optional<VisitSourceScope> scope;
+  if (!source_storage.empty()) { scope.emplace(source_storage); }
   // Hints for other engines (qualified "engine.name") are ignored; an
   // unqualified hint is only meaningful when the engine knows it, and this
   // engine implements none: GoogleSQL rejects unknown default-engine hints

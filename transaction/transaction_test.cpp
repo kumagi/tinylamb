@@ -456,4 +456,87 @@ TEST(TransactionManagerTest, AbortedWriteIsNotVisibleToLaterReaders) {
   std::ignore = std::remove(log_name.c_str());
 }
 
+TEST(TransactionManagerTest, ReaderSeesRowWhileWriterHoldsUnstagedIntent) {
+  // PRODUCTION BUG (fixed): between AddWriteSet() and RegisterVersionWrite()
+  // the chain had no committed version, so every OTHER reader received
+  // kNotExists for a row that still exists -- a phantom disappearance.
+  // RowPage::Update/Delete now install the before-image as the base
+  // committed version while reserving the intent.
+  const std::string db_name = "intent_window-test-" + RandomString() + ".db";
+  const std::string log_name = "intent_window-test-" + RandomString() + ".log";
+  {
+    PageManager pm(db_name, 10);
+    Logger logger(log_name);
+    LockManager lm;
+    RecoveryManager rm(log_name, pm.GetPool());
+    TransactionManager tm(&pm, &logger, &rm);
+
+    const RowPosition rp(2, 1);
+    // Seed a committed base version the way RegisterVersionWrite does.
+    Transaction seeder = tm.Begin();
+    ASSERT_TRUE(seeder.AddWriteSet(rp));
+    seeder.RegisterVersionWrite(rp, std::nullopt, "old");
+    ASSERT_EQ(seeder.PreCommit(), Status::kSuccess);
+
+    // A writer reserves its intent but has not staged a value yet.
+    Transaction writer = tm.Begin();
+    ASSERT_TRUE(writer.AddWriteSet(rp, std::string_view("old")));
+
+    // A concurrent reader (older snapshot) must still see the old row.
+    Transaction reader = tm.Begin();
+    ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(reader, rp, std::nullopt), "old");
+    reader.Abort();
+    writer.Abort();
+  }
+  std::ignore = std::remove(db_name.c_str());
+  std::ignore = std::remove(log_name.c_str());
+}
+
+TEST(TransactionManagerTest, AbortAfterPreCommitIsNoOp) {
+  // PRODUCTION BUG (fixed): Abort() lacked an IsFinished guard, so calling it
+  // after a successful PreCommit ran the undo walk and physically rolled
+  // back already-committed writes.
+  const std::string db_name = "abort_after_commit-test-" + RandomString() +
+                              ".db";
+  const std::string log_name = "abort_after_commit-test-" + RandomString() +
+                               ".log";
+  {
+    PageManager pm(db_name, 10);
+    Logger logger(log_name);
+    LockManager lm;
+    RecoveryManager rm(log_name, pm.GetPool());
+    TransactionManager tm(&pm, &logger, &rm);
+
+    const RowPosition rp(3, 1);
+    Transaction writer = tm.Begin();
+    ASSERT_TRUE(writer.AddWriteSet(rp));
+    writer.RegisterVersionWrite(rp, std::nullopt, "committed-value");
+    ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
+    ASSERT_TRUE(writer.IsFinished());
+
+    // Must not roll back the committed write.
+    writer.Abort();
+    ASSERT_TRUE(writer.IsFinished());
+
+    Transaction reader = tm.Begin(true);
+    ASSERT_SUCCESS_AND_EQ(
+        tm.ReadVersion(reader, rp, std::nullopt), "committed-value");
+  }
+  std::ignore = std::remove(db_name.c_str());
+  std::ignore = std::remove(log_name.c_str());
+}
+
+TEST_F(TransactionTest, WoundFlagSurvivesMove) {
+  // PRODUCTION BUG (fixed): the move constructor/assignment dropped the
+  // wounded_ flag, so a Wound-Wait victim that was moved escaped its
+  // preemption and kept running with its write intents.
+  Transaction victim = tm_->Begin();
+  victim.Wound();
+  ASSERT_TRUE(victim.IsWounded());
+
+  Transaction moved = std::move(victim);
+  EXPECT_TRUE(moved.IsWounded());
+  moved.Abort();
+}
+
 }  // namespace tinylamb

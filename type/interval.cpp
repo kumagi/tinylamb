@@ -56,7 +56,14 @@ bool HasSessionConstant(std::string_view name) {
 
 IntervalValue IntervalValue::JustifyHours() const {
   constexpr int64_t kDayNanos = 24LL * 3600LL * 1000000000LL;
-  int64_t total_nanos = days * kDayNanos + nanos;
+  // Overflow-checked: days * kDayNanos previously wrapped silently on large
+  // parseable intervals (e.g. P4000000000D) and produced garbage results.
+  int64_t days_part = 0;
+  int64_t total_nanos = nanos;
+  if (__builtin_mul_overflow(days, kDayNanos, &days_part) ||
+      __builtin_add_overflow(total_nanos, days_part, &total_nanos)) {
+    throw std::runtime_error("INTERVAL computation out of range");
+  }
   bool neg = (total_nanos < 0);
   int64_t abs_nanos = std::abs(total_nanos);
 
@@ -70,7 +77,11 @@ IntervalValue IntervalValue::JustifyHours() const {
 }
 
 IntervalValue IntervalValue::JustifyDays() const {
-  int64_t total_days = months * 30 + days;
+  int64_t total_days = 0;
+  if (__builtin_mul_overflow(months, int64_t{30}, &total_days) ||
+      __builtin_add_overflow(total_days, days, &total_days)) {
+    throw std::runtime_error("INTERVAL computation out of range");
+  }
   bool neg = (total_days < 0);
   int64_t abs_days = std::abs(total_days);
 
@@ -87,7 +98,8 @@ IntervalValue IntervalValue::JustifyInterval() const {
   constexpr int64_t kDayNanos = 24LL * 3600LL * 1000000000LL;
   constexpr int64_t kMonthNanos = 30LL * kDayNanos;
 
-  int64_t total_nanos = months * kMonthNanos + days * kDayNanos + nanos;
+  // Overflow-checked via TotalNanos().
+  int64_t total_nanos = TotalNanos();
   bool neg = (total_nanos < 0);
   int64_t abs_nanos = std::abs(total_nanos);
 

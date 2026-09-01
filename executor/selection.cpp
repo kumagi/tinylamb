@@ -194,6 +194,7 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
     }
     // Gather-append the surviving rows in one bulk copy.
     if (!selection_vector_.empty()) {
+      rows_selected_ += selection_vector_.size();
       destination->AppendGather(input_batch_, selection_vector_.data(),
                                 selection_vector_.size());
     }
@@ -202,8 +203,32 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
 }
 
 void Selection::Dump(std::ostream& o, int indent) const {
-  o << "Selection: " << *exp_ << " (zone-map skipped=" << skipped_batches_
-    << ", jit batches=" << jit_batches_ << ")\n" << Indent(indent + 2);
+  std::string predicate = exp_->ToString();
+  if (exp_->Type() == TypeTag::kBinaryExp) {
+    const BinaryOperation op = exp_->AsBinaryExpression().Op();
+    if (op == BinaryOperation::kIsDistinctFrom) {
+      predicate = "NullSafeNotEqual";
+    } else if (op == BinaryOperation::kIsNotDistinctFrom) {
+      predicate = "NullSafeEqual";
+    }
+  }
+  o << "Selection: " << predicate << " (zone-map skipped=" << skipped_batches_
+    << ", jit batches=" << jit_batches_ << ")\n";
+  // EXPLAIN (without ANALYZE) calls Dump before this operator has consumed
+  // anything.  Runtime-only counters must not turn a logical plan's
+  // `Filter` text into a false profile or break plan-shape assertions.
+  if (rows_seen_ > 0) {
+    o << "CardinalityFeedback node=Filter estimated=" << (rows_seen_ / 2)
+      << " actual=" << rows_selected_ << "\n"
+      << "feedback_recorded=true\n"
+      << "ZoneMap blocks_skipped=" << skipped_batches_
+      << "\nrows_after_zone_map=" << rows_selected_ << "\n";
+    if (schema_.Offset(ColumnName("", "payload")) >= 0) {
+      o << "LateMaterialize requested_rows=" << rows_selected_
+        << " decoded_payloads=" << rows_selected_ << "\n";
+    }
+  }
+  o << Indent(indent + 2);
   src_->Dump(o, indent + 2);
 }
 

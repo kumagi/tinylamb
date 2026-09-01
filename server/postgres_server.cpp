@@ -675,6 +675,16 @@ class PostgresServer::Impl {
                         std::unique_ptr<TransactionContext>& implicit) {
     const std::string command = UppercaseCommand(sql);
     if (command == "BEGIN" || command == "START") {
+      // PostgreSQL: an explicit BEGIN inside an aborted transaction must not
+      // clear the aborted state (25P02); only ROLLBACK/COMMIT recover it.
+      if (client.transaction_status == 'E') {
+        Queue(client,
+              pgwire::ErrorResponse(
+                  "current transaction is aborted, commands ignored until "
+                  "end of transaction block",
+                  "25P02"));
+        return false;
+      }
       if (!client.transaction) {
         client.transaction =
             std::make_unique<TransactionContext>(database_.BeginContext());

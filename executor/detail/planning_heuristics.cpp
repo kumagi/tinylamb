@@ -32,11 +32,13 @@
 #include "executor/spill_file.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "query/statement.hpp"
 #include "table/table.hpp"
+#include "table/table_statistics.hpp"
 #include "type/column_name.hpp"
 #include "type/type.hpp"
 #include "type/schema.hpp"
@@ -129,7 +131,8 @@ bool IsColumnEqualityPredicate(const Expression& predicate) {
   if (!predicate || predicate->Type() != TypeTag::kBinaryExp) { return false;
 }
   const BinaryExpression& binary = predicate->AsBinaryExpression();
-  return binary.Op() == BinaryOperation::kEquals &&
+  return (binary.Op() == BinaryOperation::kEquals ||
+          binary.Op() == BinaryOperation::kIsNotDistinctFrom) &&
          binary.Left()->Type() == TypeTag::kColumnValue &&
          binary.Right()->Type() == TypeTag::kColumnValue;
 }
@@ -140,7 +143,8 @@ std::vector<Expression> ResidualJoinPredicates(
   std::vector<Expression> residual;
   residual.reserve(predicates.size());
   for (const Expression& predicate : predicates) {
-    if (IsColumnEqualityPredicate(predicate)) {
+    if (IsColumnEqualityPredicate(predicate) &&
+        predicate->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
       const auto& binary = predicate->AsBinaryExpression();
       const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
       const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
@@ -174,10 +178,12 @@ std::vector<EqualityKey> EqualityKeys(
     const auto lhs_right = LocalColumnOffset(right, lhs);
     const auto rhs_left = LocalColumnOffset(left, rhs);
     const auto rhs_right = LocalColumnOffset(right, rhs);
+    const bool null_safe =
+        binary.Op() == BinaryOperation::kIsNotDistinctFrom;
     if (lhs_left && rhs_right) {
-      keys.push_back({*lhs_left, *rhs_right});
+      keys.push_back({*lhs_left, *rhs_right, null_safe});
     } else if (rhs_left && lhs_right) {
-      keys.push_back({*rhs_left, *lhs_right});
+      keys.push_back({*rhs_left, *lhs_right, null_safe});
     }
   }
   return keys;
@@ -220,6 +226,26 @@ std::string EncodeJoinKey(const Row& row, const std::vector<slot_t>& columns) {
       continue;
     }
     key += value.EncodeMemcomparableFormat();
+  }
+  return key;
+}
+
+// Unlike ordinary equality joins, NULL is a legitimate key for
+// IS NOT DISTINCT FROM. Encode the NULL/non-NULL state explicitly instead of
+// passing Value::kNull to the regular mem-comparable encoder, which correctly
+// rejects untyped NULL for ordinary hash joins.
+std::string EncodeNullSafeJoinKey(const Row& row,
+                                  const std::vector<slot_t>& columns) {
+  std::string key;
+  key.reserve(columns.size() * 10);
+  for (const slot_t column : columns) {
+    const Value& value = row[column];
+    if (value.IsNull()) {
+      key.push_back('\0');
+    } else {
+      key.push_back('\1');
+      key += value.EncodeMemcomparableFormat();
+    }
   }
   return key;
 }
@@ -585,7 +611,10 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
       right_columns.push_back(static_cast<slot_t>(key.right));
     }
     // The hybrid operator only implements plain inner/left semantics.
-    if (ShouldHybridJoin(left, right) && !want_right_nulls) {
+    const bool has_null_safe_key = std::ranges::any_of(
+        equality_keys, [](const EqualityKey& key) { return key.null_safe; });
+    if (ShouldHybridJoin(left, right) && !want_right_nulls &&
+        !has_null_safe_key) {
       ++result.hybrid_hash_joins;
       Relation joined =
           HybridHashJoin(std::move(left), std::move(right), left_columns,
@@ -603,20 +632,20 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
       return joined;
     }
     ++result.in_memory_hash_joins;
-    const bool integer_key =
+    const bool integer_key = !has_null_safe_key &&
         SingleIntegerJoinKey(left.schema, left_columns) &&
         SingleIntegerJoinKey(right.schema, right_columns);
     if (integer_key) {
       std::unordered_multimap<int64_t, const Row*> buckets;
       buckets.reserve(right.rows.size());
       for (const Row& row : right.rows) {
-        if (!HasNullKey(row, right_columns)) {
+        if (has_null_safe_key || !HasNullKey(row, right_columns)) {
           buckets.emplace(IntegerJoinKey(row, right_columns[0]), &row);
         }
       }
       for (const Row& left_row : left.rows) {
         bool matched = false;
-        if (!HasNullKey(left_row, left_columns)) {
+        if (has_null_safe_key || !HasNullKey(left_row, left_columns)) {
           const int64_t key = IntegerJoinKey(left_row, left_columns[0]);
           const auto [begin, end] = buckets.equal_range(key);
           for (auto iter = begin; iter != end; ++iter) {
@@ -636,14 +665,20 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
       std::unordered_multimap<std::string, const Row*> buckets;
       buckets.reserve(right.rows.size());
       for (const Row& row : right.rows) {
-        if (!HasNullKey(row, right_columns)) {
-          buckets.emplace(EncodeJoinKey(row, right_columns), &row);
+        if (has_null_safe_key || !HasNullKey(row, right_columns)) {
+          buckets.emplace(has_null_safe_key
+                              ? EncodeNullSafeJoinKey(row, right_columns)
+                              : EncodeJoinKey(row, right_columns),
+                          &row);
         }
       }
       for (const Row& left_row : left.rows) {
         bool matched = false;
-        if (!HasNullKey(left_row, left_columns)) {
-          const std::string key = EncodeJoinKey(left_row, left_columns);
+        if (has_null_safe_key || !HasNullKey(left_row, left_columns)) {
+          const std::string key = has_null_safe_key
+                                      ? EncodeNullSafeJoinKey(left_row,
+                                                              left_columns)
+                                      : EncodeJoinKey(left_row, left_columns);
           const auto [begin, end] = buckets.equal_range(key);
           for (auto iter = begin; iter != end; ++iter) {
             ++result.join_comparisons;
@@ -729,7 +764,9 @@ Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
       left_columns.push_back(static_cast<slot_t>(key.left));
       right_columns.push_back(static_cast<slot_t>(key.right));
     }
-    if (ShouldHybridJoin(left, right)) {
+    const bool has_null_safe_key = std::ranges::any_of(
+        equality_keys, [](const EqualityKey& key) { return key.null_safe; });
+    if (ShouldHybridJoin(left, right) && !has_null_safe_key) {
       ++result.hybrid_hash_joins;
       Relation joined = HybridHashJoin(
           std::move(left), std::move(right), left_columns, right_columns,
@@ -744,19 +781,19 @@ Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
       return joined;
     }
     ++result.in_memory_hash_joins;
-    const bool integer_key =
+    const bool integer_key = !has_null_safe_key &&
         SingleIntegerJoinKey(left.schema, left_columns) &&
         SingleIntegerJoinKey(right.schema, right_columns);
     if (integer_key) {
       std::unordered_multimap<int64_t, const Row*> buckets;
       buckets.reserve(right.rows.size());
       for (const Row& row : right.rows) {
-        if (HasNullKey(row, right_columns)) { continue;
+        if (!has_null_safe_key && HasNullKey(row, right_columns)) { continue;
 }
         buckets.emplace(IntegerJoinKey(row, right_columns[0]), &row);
       }
       for (const Row& left_row : left.rows) {
-        if (HasNullKey(left_row, left_columns)) { continue;
+        if (!has_null_safe_key && HasNullKey(left_row, left_columns)) { continue;
 }
         const int64_t key = IntegerJoinKey(left_row, left_columns[0]);
         const auto [begin, end] = buckets.equal_range(key);
@@ -771,14 +808,20 @@ Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
       std::unordered_multimap<std::string, const Row*> buckets;
       buckets.reserve(right.rows.size());
       for (const Row& row : right.rows) {
-        if (HasNullKey(row, right_columns)) { continue;
+        if (!has_null_safe_key && HasNullKey(row, right_columns)) { continue;
 }
-        buckets.emplace(EncodeJoinKey(row, right_columns), &row);
+        buckets.emplace(has_null_safe_key
+                            ? EncodeNullSafeJoinKey(row, right_columns)
+                            : EncodeJoinKey(row, right_columns),
+                        &row);
       }
       for (const Row& left_row : left.rows) {
-        if (HasNullKey(left_row, left_columns)) { continue;
+        if (!has_null_safe_key && HasNullKey(left_row, left_columns)) { continue;
 }
-        const std::string key = EncodeJoinKey(left_row, left_columns);
+        const std::string key = has_null_safe_key
+                                    ? EncodeNullSafeJoinKey(left_row,
+                                                            left_columns)
+                                    : EncodeJoinKey(left_row, left_columns);
         const auto [begin, end] = buckets.equal_range(key);
         for (auto iter = begin; iter != end; ++iter) {
           ++result.join_comparisons;
@@ -1122,6 +1165,21 @@ Relation BuildInput(TransactionContext& context,
         !source.query && !source.unnest && !ctes.contains(source.table);
     if (!base_sources[i]) {
       relations[i] = LoadSource(context, source, outer, ctes);
+      // A non-aggregate derived SELECT with a literal FALSE filter is known
+      // to be empty independently of its source table.  Preserve the derived
+      // schema but discard the rows before the outer join-order loop, so an
+      // inner join can avoid opening its other side.
+      const SelectStatement* derived = source.query.get();
+      if (derived != nullptr && derived->WhereClause() &&
+          derived->WhereClause()->Type() == TypeTag::kConstantValue &&
+          !derived->WhereClause()->AsConstantValue().GetValue().Truthy() &&
+          derived->GroupBy().empty() && !derived->Distinct() &&
+          !std::ranges::any_of(
+              derived->SelectList(), [](const NamedExpression& item) {
+                return item.expression && ContainsAggregate(item.expression);
+              })) {
+        relations[i].ResetContents();
+      }
       continue;
     }
 
@@ -1234,6 +1292,35 @@ Relation BuildInput(TransactionContext& context,
                     statement.Sources()[i], outer, ctes);
     }
     return result;
+  }
+
+  // An already materialized inner-join input which is empty makes the whole
+  // join empty.  Stop before opening any remaining base-table scans: this is
+  // both a correctness-preserving short circuit and important for EXISTS /
+  // derived-table plans, where an empty build side must not touch the probe
+  // side at all.  Outer/USING/nested joins are excluded above because their
+  // null-extension or merge semantics require the ordered path.
+  bool has_empty_materialized_input = false;
+  for (size_t i = 0; i < relations.size(); ++i) {
+    if (!base_sources[i] && relations[i].TotalRows() == 0) {
+      has_empty_materialized_input = true;
+      break;
+    }
+  }
+  if (has_empty_materialized_input) {
+    Relation empty(context.execution_runtime());
+    for (const Relation& relation : relations) {
+      if (empty.schema.ColumnCount() == 0) {
+        empty.schema = relation.schema;
+      } else {
+        empty.schema = empty.schema + relation.schema;
+      }
+    }
+    *where_fully_applied = true;
+    if (context.execution_runtime() != nullptr) {
+      context.execution_runtime()->empty_build_short_circuit = true;
+    }
+    return empty;
   }
 
   std::vector<Expression> all_predicates =
@@ -1399,6 +1486,19 @@ Relation BuildInput(TransactionContext& context,
 
   // Load selective relations first, then push their integer join keys into
   // later scans (TPC-H Q9: filter lineitem by partkeys matching LIKE).
+  std::vector<size_t> estimated_rows(relations.size(),
+                                     std::numeric_limits<size_t>::max());
+  for (size_t i = 0; i < relations.size(); ++i) {
+    if (!base_sources[i]) {
+      estimated_rows[i] = relations[i].TotalRows();
+      continue;
+    }
+    if (StatusOr<std::shared_ptr<TableStatistics>> stats =
+            context.GetStats(statement.Sources()[i].table);
+        stats.HasValue()) {
+      estimated_rows[i] = stats.Value()->Rows();
+    }
+  }
   std::vector<size_t> load_order;
   load_order.reserve(relations.size());
   for (size_t i = 0; i < relations.size(); ++i) { load_order.push_back(i);
@@ -1419,6 +1519,9 @@ Relation BuildInput(TransactionContext& context,
     const int b_rank = rank(b);
     if (a_rank != b_rank) { return a_rank < b_rank;
 }
+    if (estimated_rows[a] != estimated_rows[b]) {
+      return estimated_rows[a] < estimated_rows[b];
+    }
     return a < b;
   });
   std::vector<bool> loaded(relations.size(), false);
@@ -1441,7 +1544,9 @@ Relation BuildInput(TransactionContext& context,
       if (!predicate.resolved || predicate.contains_query ||
           predicate.sources.size() != 2 ||
           !predicate.sources.contains(idx) ||
-          !IsColumnEqualityPredicate(predicate.expression)) {
+          !IsColumnEqualityPredicate(predicate.expression) ||
+          predicate.expression->AsBinaryExpression().Op() !=
+              BinaryOperation::kEquals) {
         continue;
       }
       size_t other = *predicate.sources.begin();

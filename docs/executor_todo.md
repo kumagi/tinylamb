@@ -143,7 +143,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `DistinctAggregate`（逐次・並列 `Aggregation` が aggregate metadata の
       DISTINCT 集合を保持して `COUNT(DISTINCT x)` を処理）
 - [x] `TwoPhaseDistinctAgg`
-- [ ] `MinMaxIndexScan`（INDEX ONLY で MIN/MAX）
+- [x] `MinMaxIndexScan`（非NULLな単一キー列をINDEX ONLYの先頭1件から取得）
 - [x] `FilteredAggregate`（GoogleSQL `AGG(x WHERE …)`。直列・並列集約と
       `COUNT(*)` のフィルタ順序を回帰）
 - [ ] SQL 標準 `AGG(...) FILTER (WHERE …)` の AST 接続
@@ -162,8 +162,8 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 ## P1 — スキャンとアクセスパス
 
-- [ ] `BitmapIndexScan` + `BitmapHeapScan`（複数インデックス OR/AND）
-- [ ] `BitmapAnd` / `BitmapOr` オペレータ
+- [x] `BitmapIndexScan` + `BitmapHeapScan`（単一キーの複数インデックス OR/AND を optimizer に接続）
+- [x] `BitmapAnd` / `BitmapOr` オペレータ
 - [ ] `TidScan` / `RowIdLookup` / `CTID` 相当
 - [ ] `IndexSkipScan`（先頭列が等式でない複合インデックス）
 - [ ] `IndexOnlyScan` の visibility map 相当（MVCC で heap fetch 省略を広げる）

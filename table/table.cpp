@@ -238,8 +238,12 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   // intent: an unstaged intent is deliberately invisible even to its owner.
   // The reservation still enforces first-updater-wins against any writer
   // that commits between this snapshot read and the physical update.
+  // PRODUCTION FIX: the previous image is needed not only by index
+  // maintenance but also by restore_physical_row(); an index-less table used
+  // to leave original_row empty and rewrite a 0-column image into the slot,
+  // destroying the row on every failed UPDATE.
   Row original_row;
-  if (!indexes_.empty()) {
+  {
     StatusOr<Row> visible = Read(txn, pos);
     RETURN_IF_FAIL(visible.GetStatus());
     original_row = visible.MoveValue();
@@ -293,6 +297,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   // phases below so the second descent on the same tree reuses the leaf the
   // first one landed on whenever the live routing agrees.
   std::vector<page_id_t> idx_cursors(indexes_.size(), 0);
+  PageRef page = txn.GetPageManager()->GetPage(new_pos.page_id);
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
   // Best-effort compensations: a failed index mutation must not leave applied
@@ -317,11 +322,13 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
       original_image.resize(original_row.Size());
       std::ignore = original_row.Serialize(original_image.data());
     }
+    // NOTE: callers must release the exclusive latch on pos.page_id first
+    // (page.PageUnlock()); re-entering GetPage() on the same page while the
+    // in-place update path still holds it deadlocks on the shared_mutex.
     PageRef written = txn.GetPageManager()->GetPage(pos.page_id);
     std::ignore = written->Update(txn, pos.slot, original_image);
   };
 
-  PageRef page = txn.GetPageManager()->GetPage(new_pos.page_id);
   Status s = page->Update(txn, new_pos.slot, serialized_row);
   if (s == Status::kSuccess && indexes_unchanged) {
     return new_pos;
@@ -339,6 +346,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
       // The physical row was rewritten in place: put back the deleted keys
       // and roll the row image back to the pre-update one.
       reinstate_old_keys(deleted, pos);
+      page.PageUnlock();  // PRODUCTION FIX: self-deadlock guard
       restore_physical_row();
       return failure;
     }
@@ -354,6 +362,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
       // reinstate every original key, and rewrite the original row image.
       undo_index_inserts(inserted);
       reinstate_old_keys(indexes_.size(), pos);
+      page.PageUnlock();  // PRODUCTION FIX: self-deadlock guard
       restore_physical_row();
       return failure;
     }
@@ -361,26 +370,11 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   }
   if (s != Status::kNoSpace) { return s;
 }
-  Status failure = Status::kSuccess;
-  size_t deleted = 0;
-  for (; deleted < indexes_.size(); ++deleted) {
-    failure = IndexDelete(txn, indexes_[deleted], pos, original_row,
-                          &idx_cursors[deleted]);
-    if (failure != Status::kSuccess) { break;
-}
-  }
-  if (deleted < indexes_.size()) {
-    // The physical row is untouched at pos; reinstating the keys suffices.
-    reinstate_old_keys(deleted, pos);
-    return failure;
-  }
-  const Status delete_status = page->Delete(txn, new_pos.slot);
-  if (delete_status != Status::kSuccess) {
-    // The old row image survives at pos; roll the index deletes back instead
-    // of leaving "row present × all index entries gone".
-    reinstate_old_keys(indexes_.size(), pos);
-    return delete_status;
-  }
+  // PRODUCTION RESTRUCTURE: reserve the relocation target BEFORE deleting
+  // the original row.  The old delete-first ordering compensated failures by
+  // rewriting the old image, but RowPage::Update cannot resurrect a deleted
+  // (empty) slot, so every failed relocation silently destroyed the row.
+  // With reserve-first, a failure leaves the row untouched at pos.
   bool finished = false;
   while (page->body.row_page.next_page_id_ != 0) {
     page_id_t next_page = page->body.row_page.next_page_id_;
@@ -394,8 +388,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     }
     if (next_pos.GetStatus() != Status::kNoSpace) {
       // A rejected insertion (lock conflict, corruption) must not be mistaken
-      // for a full page: stop the walk and compensate below.
-      reinstate_old_keys(indexes_.size(), pos);
+      // for a full page: the original row is still intact at pos.
       return next_pos.GetStatus();
     }
   }
@@ -405,12 +398,12 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     StatusOr<slot_t> new_slot = new_page->Insert(txn, serialized_row);
     if (!new_slot.HasValue()) {
       txn.GetPageManager()->DestroyPage(txn, new_page.get());
-      reinstate_old_keys(indexes_.size(), pos);
+      // Row intact at pos.
       return new_slot.GetStatus();
     }
     RowPosition new_row_pos(new_page->PageID(), new_slot.Value());
-    // Release the latch early: relinking below re-pins the tail page. PageUnlock is
-    // idempotent, so the destructor stays safe.
+    // Release the latch early: relinking below re-pins the tail page.
+    // PageUnlock is idempotent, so the destructor stays safe.
     const page_id_t tail_page_id = page->PageID();
     page.PageUnlock();
     {
@@ -422,6 +415,35 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     txn.GetPageManager()->AdvanceTableTail(first_pid_, tail_page_id,
                                            new_page->PageID());
   }
+  // The copy at new_pos exists; now remove index entries and the original
+  // physical row.  Every failure below compensates by dropping the copy and
+  // keeping the original intact.
+  Status failure = Status::kSuccess;
+  size_t deleted = 0;
+  for (; deleted < indexes_.size(); ++deleted) {
+    failure = IndexDelete(txn, indexes_[deleted], pos, original_row,
+                          &idx_cursors[deleted]);
+    if (failure != Status::kSuccess) { break;
+}
+  }
+  if (deleted < indexes_.size()) {
+    // Drop the reserved copy; the original row and its keys stay intact.
+    PageRef copy_page = txn.GetPageManager()->GetPage(new_pos.page_id);
+    std::ignore = copy_page->Delete(txn, new_pos.slot);
+    copy_page.PageUnlock();
+    return failure;
+  }
+  const Status delete_status =
+      txn.GetPageManager()->GetPage(pos.page_id)->Delete(txn, pos.slot);
+  if (delete_status != Status::kSuccess) {
+    // The original row survives at pos; drop the reserved copy and roll the
+    // index deletes back.
+    PageRef copy_page = txn.GetPageManager()->GetPage(new_pos.page_id);
+    std::ignore = copy_page->Delete(txn, new_pos.slot);
+    copy_page.PageUnlock();
+    reinstate_old_keys(indexes_.size(), pos);
+    return delete_status;
+  }
   size_t inserted = 0;
   for (; inserted < indexes_.size(); ++inserted) {
     failure = IndexInsert(txn, indexes_[inserted], row, new_pos,
@@ -430,21 +452,24 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
 }
   }
   if (inserted < indexes_.size()) {
-    // The row has already been relocated to new_pos, so the exact pre-update
-    // state is unrecoverable; undo the partial inserts and repoint the
-    // original keys at the relocated position (best effort).
+    // The row lives at new_pos now; undo the partial inserts and repoint the
+    // original keys at the relocated position.
     undo_index_inserts(inserted);
     reinstate_old_keys(indexes_.size(), new_pos);
     return failure;
   }
   return new_pos;
 }
-
 Status Table::Delete(Transaction& txn, RowPosition pos) {
-  if (!txn.AddWriteSet(pos)) {
+  ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
+  // Read before reserving the intent, then install the old image as the
+  // chain's base version: concurrent readers must keep seeing this row
+  // between the intent reservation and the physical delete.
+  std::string delete_image(original_row.Size(), '\0');
+  original_row.Serialize(delete_image.data());
+  if (!txn.AddWriteSet(pos, delete_image)) {
     return Status::kConflicts;
   }
-  ASSIGN_OR_RETURN(Row, original_row, Read(txn, pos));
   Status failure = Status::kSuccess;
   size_t deleted = 0;
   for (; deleted < indexes_.size(); ++deleted) {

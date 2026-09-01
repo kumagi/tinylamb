@@ -99,6 +99,65 @@ TEST_F(TableTest, Read_AfterInsert_ReturnsInsertedRow) {
   ASSERT_EQ(read, r);
 }
 
+TEST_F(TableTest, Update_DuplicateKeyCompensation_DoesNotDeadlockOrLoseRow) {
+  // PRODUCTION BUG (fixed): restore_physical_row() re-entered GetPage() on
+  // the page whose exclusive latch the in-place update still held.  A failed
+  // index insert (e.g. PK/UNIQUE violation) therefore threw
+  // "Resource deadlock avoided" with the row already physically deleted.
+  TransactionContext ctx = rs_->BeginContext();
+  Schema schema("uniq_upd_tbl", {Column("id", ValueType::kInt64,
+                                       Constraint(Constraint::kUnique)),
+                                 Column("val", ValueType::kVarChar)});
+  ASSIGN_OR_ASSERT_FAIL(Table, created, rs_->CreateTable(ctx, schema));
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+
+  TransactionContext ctx2 = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx2.GetTable("uniq_upd_tbl"));
+  RowPosition first = tbl->Insert(ctx2.txn_, Row({Value(1), Value("a")})).Value();
+  RowPosition second = tbl->Insert(ctx2.txn_, Row({Value(2), Value("b")})).Value();
+
+  // Updating row 2 to id == 1 collides with row 1's unique key.
+  const Status status = tbl->Update(ctx2.txn_, second,
+                                    Row({Value(1), Value("b2")}))
+                            .GetStatus();
+  EXPECT_EQ(status, Status::kDuplicates);
+
+  // Both rows must survive and read back their original values.
+  ASSERT_SUCCESS_AND_EQ(tbl->Read(ctx2.txn_, first),
+                        Row({Value(1), Value("a")}));
+  ASSERT_SUCCESS_AND_EQ(tbl->Read(ctx2.txn_, second),
+                        Row({Value(2), Value("b")}));
+}
+
+TEST_F(TableTest, Update_NoSpaceRecovery_PreservesRowWithoutIndex) {
+  // PRODUCTION BUG (fixed): index-less tables never read the previous image,
+  // so a failed relocation rewrote a 0-column (empty) image into the slot,
+  // silently destroying the row.
+  TransactionContext ctx = rs_->BeginContext();
+  Schema schema("no_idx_tbl", {Column("c1", ValueType::kInt64),
+                               Column("c2", ValueType::kVarChar)});
+  ASSIGN_OR_ASSERT_FAIL(Table, created, rs_->CreateTable(ctx, schema));
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+
+  TransactionContext ctx2 = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx2.GetTable("no_idx_tbl"));
+  const RowPosition rp = tbl->Insert(ctx2.txn_,
+                                     Row({Value(1), Value("original")}))
+                             .Value();
+
+  // A 40000-byte varchar exceeds any page body; relocation must fail with
+  // kNoSpace and the original row must survive.
+  const Status status =
+      tbl->Update(ctx2.txn_, rp,
+                  Row({Value(1), Value(std::string(40000, 'y'))}))
+          .GetStatus();
+  EXPECT_EQ(status, Status::kNoSpace);
+  ASSERT_SUCCESS_AND_EQ(tbl->Read(ctx2.txn_, rp),
+                        Row({Value(1), Value("original")}));
+}
+
 TEST_F(TableTest, Update_SingleRow_UpdatesRowSuccessfully) {
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,

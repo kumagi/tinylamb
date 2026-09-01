@@ -53,7 +53,7 @@ class Function {
   std::string name_;
   std::vector<Type> args_;
   Type return_type_;
-  int argument_count_;
+  int argument_count_{0};
 };
 
 }  // namespace tinylamb

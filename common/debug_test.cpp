@@ -71,6 +71,21 @@ TEST(DebugTest, OmittedString_WhenLongerThanLimit_TruncatesMiddleWithEllipsis) {
   EXPECT_EQ(out.substr(out.size() - 8), long_str.substr(long_str.size() - 8));
 }
 
+TEST(DebugTest, OmittedString_WhenShorterThanEightBytes_DoesNotThrow) {  // Fixed: the old tail slice `substr(len - 8)` underflowed size_t and threw
+  // std::out_of_range whenever limit < size < 8 (e.g. a 6-byte index key in
+  // Dump output).
+  EXPECT_NO_THROW(std::ignore = OmittedString("hello", 4));
+  EXPECT_NO_THROW(std::ignore = OmittedString("abc", 2));
+  EXPECT_NO_THROW(std::ignore = OmittedString("abcdef", 5));
+  EXPECT_NO_THROW(std::ignore = OmittedString("abcdefgh", 3));
+  EXPECT_EQ(OmittedString("hello", 4), "hello");
+  EXPECT_EQ(OmittedString("abc", 2), "abc");
+
+  const std::string long_str(100, 'x');
+  const std::string out = OmittedString(long_str, 10);
+  EXPECT_NE(out, long_str);
+}
+
 TEST(DebugTest, HeadString_WhenShorterThanLimit_ReturnsOriginalString) {
   const std::string s = "hello";
 
@@ -166,6 +181,43 @@ TEST(DebugTest, EncoderDecoder_WithDiverseTypes_RoundTripsAccurately) {
   std::string r_trunc;
   dec_trunc >> r_trunc;
   EXPECT_TRUE(ss_trunc.fail());
+}
+
+TEST(DecoderTest, Bool_NonCanonicalByte_NormalizesToTrue) {
+  // Fixed: the raw byte used to become the object representation of bool
+  // (UB for anything but 0/1 on a corrupted stream).
+  std::stringstream ss;
+  ss.put('\xFF');
+  Decoder dec(ss);
+  bool v = false;
+  dec >> v;
+  EXPECT_TRUE(v);
+  EXPECT_TRUE(!ss.fail());
+
+  std::stringstream ss_zero;
+  ss_zero.put('\x00');
+  Decoder dec_zero(ss_zero);
+  bool v_zero = true;
+  dec_zero >> v_zero;
+  EXPECT_FALSE(v_zero);
+}
+
+TEST(StatusOrTest, MoveValue_SecondCallThrows) {
+  // Fixed: MoveValue() left the optional engaged, so a second call returned a
+  // second (moved-from) copy instead of throwing as documented.
+  StatusOr<std::string> so(std::string("x"));
+  EXPECT_TRUE(so.HasValue());
+  std::string first = std::move(so).MoveValue();
+  EXPECT_EQ(first, "x");
+  EXPECT_FALSE(so.HasValue());
+  EXPECT_THROW(std::ignore = so.MoveValue(), std::runtime_error);
+  EXPECT_THROW(std::ignore = so.Value(), std::runtime_error);
+}
+
+TEST(StatusOrTest, Value_OnFailedStatus_Throws) {
+  StatusOr<int> failed(Status::kNotExists);
+  EXPECT_THROW(std::ignore = failed.Value(), std::runtime_error);
+  EXPECT_THROW(std::ignore = failed.MoveValue(), std::runtime_error);
 }
 
 }  // namespace tinylamb

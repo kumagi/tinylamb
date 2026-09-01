@@ -99,6 +99,13 @@ TEST_F(ScalarFunctionSqlTest, StringFunctions) {
   EXPECT_EQ(Scalar("SELECT SUBSTR('hello', 2)"), Value("ello"));
   EXPECT_EQ(Scalar("SELECT SUBSTR('hello', 2, 3)"), Value("ell"));
   EXPECT_EQ(Scalar("SELECT SUBSTRING('hello', 2, 3)"), Value("ell"));
+  // Negative start counts from the end (GoogleSQL semantics; the old
+  // implementation clamped every start <= 1 to the first byte).
+  EXPECT_EQ(Scalar("SELECT SUBSTR('abcde', -2)"), Value("de"));
+  EXPECT_EQ(Scalar("SELECT SUBSTR('abcde', -2, 2)"), Value("de"));
+  EXPECT_EQ(Scalar("SELECT SUBSTR('abcde', -10)"), Value(""));
+  EXPECT_EQ(Scalar("SELECT SUBSTR('abcde', 0)"), Value("abcde"));
+  EXPECT_EQ(Scalar("SELECT SUBSTR('abcde', 10)"), Value(""));
   EXPECT_EQ(Scalar("SELECT LEFT('hello', 2)"), Value("he"));
   EXPECT_EQ(Scalar("SELECT RIGHT('hello', 2)"), Value("lo"));
   EXPECT_EQ(Scalar("SELECT TRIM('  x  ')"), Value("x"));

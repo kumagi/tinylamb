@@ -731,12 +731,22 @@ Value ExecuteFunction(const std::string& name,
         return Value(std::string());
       }
     }
-    const size_t begin = start <= 1 ? 0 : static_cast<size_t>(start - 1);
+    // GoogleSQL semantics: a negative start counts back from the end of the
+    // string; start == 0 behaves like start == 1.
+    const size_t size = input.size();
+    size_t begin = 0;
+    if (start < 0) {
+      const size_t back = static_cast<size_t>(-start);
+      if (back >= size) { return Value(std::string()); }
+      begin = size - back;
+    } else {
+      begin = start <= 1 ? 0 : static_cast<size_t>(start - 1);
+    }
     const size_t length = values.size() == 3
                               ? static_cast<size_t>(values[2].value.int_value)
                               : std::string::npos;
 
-    if (begin >= input.size()) { return Value(std::string()); }
+    if (begin >= size) { return Value(std::string()); }
     return Value(input.substr(begin, length));
   }
   if (name == "length" || name == "char_length" ||

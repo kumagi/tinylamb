@@ -219,7 +219,8 @@ Token Tokenizer::Keyword() {
       "INSERT",   "INTO",   "VALUES",  "UPDATE", "SET",    "DELETE",
       "AND",      "OR",     "NOT",     "IS",     "NULL",   "AS",
       "DISTINCT", "ORDER",  "BY",      "ASC",    "DESC",   "LIMIT",
-      "OFFSET",   "JOIN",   "INNER",   "LEFT",   "RIGHT",  "ON",
+      "OFFSET",   "NULLS",  "FIRST",   "LAST",    "JOIN",   "INNER",
+      "LEFT",     "RIGHT",  "ON",
       "CASE",     "WHEN",   "THEN",    "ELSE",   "END",    "IN",
       "GROUP",    "HAVING", "PRIMARY", "KEY",    "UNIQUE", "REFERENCES",
       "DEFAULT",  "TRUE",   "FALSE"};

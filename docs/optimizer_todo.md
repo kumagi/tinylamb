@@ -218,9 +218,9 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [x] `null_aware_anti_join`（`NOT IN` の三値論理。NULL 制約がない場合は
       `NullAwareAntiJoin` を選択）
 - [x] `not_in_to_anti_join`（両キー NOT NULL のとき。V1 の相関なし形）
-- [x] `in_to_semijoin`（単一列 IN サブクエリの直接 decorrelation）
-- [x] `exists_to_semijoin`（相関キー + inner-only filter の直接 decorrelation）
-- [x] `not_exists_to_antijoin`（相関キーの直接 decorrelation）
+- [x] `in_to_semijoin`（単一列 IN と追加相関述語を複合キー化する直接 decorrelation）
+- [x] `exists_to_semijoin`（複合相関キー + inner-only filter の直接 decorrelation）
+- [x] `not_exists_to_antijoin`（複合相関キーの直接 decorrelation）
 - [x] `unique_semijoin_to_inner`
 - [ ] `semijoin_to_inner_plus_distinct`
 - [ ] `semijoin_reduction`（bloom / ハッシュ半結合の先行適用）
@@ -251,7 +251,7 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `remove_aggregate_if_unique`（group キーが unique）
 - [ ] `count_star_rewrite_on_not_null`
 - [ ] `sum_zero_identity` 等の agg 代数
-- [ ] `minmax_index_only`（INDEX MIN/MAX スキャン）
+- [x] `minmax_index_only`（非NULLな単一キー列のINDEX MIN/MAXスキャン）
 - [x] `distinct_aggregate_expansion`（`COUNT(DISTINCT)` を二重 agg）
 - [x] `grouping_sets_expansion` と `grouping_sets_to_union`
 - [ ] `rollup_to_grouping_sets` / `cube_to_grouping_sets`
@@ -294,16 +294,19 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [x] `nulls_first_last_normalization`（`QueryData` → logical / physical key の
       optional 指定を保持。Sort / TopN の明示 NULLS FIRST/LAST テスト済み）
 - [ ] `collation_aware_sort`（NULLS FIRST/LAST の指定は Sort/TopN に接続済み）
-- [ ] `incremental_sort`（PostgreSQL Incremental Sort）
+- [x] `incremental_sort`（入力のORDER BY prefixを保持し、suffixをprefixグループ内でソート）
 - [ ] `buffered_sort` vs `external_merge` 実装規則（Sort 実行器は既にある）
 
 ---
 
 ## P3 — サブクエリ・相関・CTE
 
-- [ ] `unnest_scalar_subquery`（非相関）
-- [ ] `unnest_in_subquery`
-- [ ] `unnest_exists`
+- [x] `unnest_scalar_subquery`（非相関 scalar は InitPlan として一度だけ評価し、
+      同一 SELECT 内で再利用回数を EXPLAIN に表示）
+- [x] `unnest_in_subquery`（非相関 IN は NULL を除いた hash membership を構築し、
+      三値論理のための NULL 検査を残す。struct/array は一般経路を維持）
+- [x] `unnest_exists`（非相関 EXISTS は一度だけ materialize、相関単一表は
+      equality index と parameterized result cache を使用）
 - [ ] `decorrelate_apply`（PullUpCorrelatedPredicates）
 - [ ] `decorrelate_lateral`
 - [x] `subquery_to_semijoin` / `antijoin`（V1 の IN / EXISTS / NOT EXISTS。
@@ -311,22 +314,36 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
 - [ ] `mark_join_to_filter`（`x IN (SELECT…)` の三値）
 - [x] `single_join_max1row_assert`（relational evaluator のスカラー経路。
       standalone Cascades ノードは未実装）
-- [ ] `correlated_filter_pullup`
-- [ ] `push_correlated_predicate_into_subquery`
-- [ ] `flatten_nested_subqueries`
-- [ ] `merge_identical_subqueries`（CSE）
+- [x] `correlated_filter_pullup`（相関等式を index probe key として subquery
+      の単一表 scan より前に適用。複合相関も composite key として保持し、
+      非等式は保守的に一般経路へ）
+- [x] `push_correlated_predicate_into_subquery`（相関等式の local 側を index
+      build、local-only predicate を build 時 filter。NULL key は push しない）
+- [x] `flatten_nested_subqueries`（単一表の identity projection と、行数を変えない
+      immutable projection の nested derived table。WHERE / ORDER BY の列参照を
+      内側式へ再束縛し、GROUP/LIMIT/WINDOW/volatile 式は境界を保持）
+- [x] `merge_identical_subqueries`（非相関 QueryExpression を構造 fingerprint と
+      継承 CTE の実体識別子で共有。scalar 結果と IN membership の構築を
+      statement 内で一度にし、`uncorrelated_cache_hits` へ反映）
 - [x] `cache_invariant_subquery`（非相関サブクエリを実行時キャッシュし、同一
       statement 内の再評価を `uncorrelated_cache_hits` へ記録）
+- [x] parameterized Apply cache（decorrelate できない相関 scalar を外側キーごとに
+      再利用し、`correlated_result_cache_hits` を記録。単一表 equality probe の
+      専用 index に加え、derived/opaque source も外側スコープのパラメータ化
+      結果を共有し、volatile 関数はキャッシュしない）
 - [ ] `cte_inlining`（参照 1 回、または安価）
 - [ ] `cte_materialization`（参照複数、または再帰）
 - [ ] `cte_filter_pushdown`
 - [ ] `cte_predicate_propagation`
 - [ ] `recursive_cte_union_rewrite`
 - [ ] `worktable_scan_indexing`
-- [x] `exists_short_circuit_limit_1`（単純な単一表サブクエリでスキャン上限へ pushdown、相関経路は既存 index を維持）
+- [x] `exists_short_circuit_limit_1`（非相関 EXISTS のキャッシュ結果と相関単一表
+      probe 結果へ LIMIT 1 を適用し、EXISTS に不要な内部 ORDER BY も除去。
+      明示 LIMIT 0 と集約の意味を保持。物理 scan の iterator early-stop は別 TODO）
 - [ ] `any_all_quantified_comparison_rewrite`
 - [ ] `subquery_unnest_with_window`（禁止条件の明示）
-- [ ] `common_subexpression_materialize`（同一 Scan/Join 部分木）
+- [ ] `common_subexpression_materialize`（同一 Scan/Join 部分木。scalar query の
+      statement 内共有と相関 parameter cache は上記で実装済み）
 
 ---
 
@@ -526,7 +543,7 @@ SemiJoin / AntiJoin を持つ。商用相当にするには引き続き
       `HashJoin` の `JoinKind` へ接続）
 - [x] `semi_merge_join` / `anti_merge_join`（ソート子の自動挿入と probe 側スキーマを
       保持する MergeJoinPlan）
-- [ ] `index_only_agg`（MIN/MAX）
+- [x] `index_only_agg`（非NULLな単一キー列のMIN/MAX）
 - [ ] `bitmap_scan` / `bitmap_and` / `bitmap_or`
 - [ ] `tid_scan` / `rowid_lookup`
 - [x] `parallel_seq_scan` を Cascades から明示選択（統計閾値と回帰テスト）

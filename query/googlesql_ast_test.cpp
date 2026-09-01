@@ -56,6 +56,44 @@ std::unique_ptr<Statement> VisitSqlOrThrow(std::string_view sql) {
 
 }  // namespace
 
+TEST(GoogleSqlAstTest, PreservesNestedSetOperationKinds) {
+  const std::string sql =
+      "(SELECT 1 UNION ALL SELECT 1) INTERSECT DISTINCT SELECT 1;";
+  GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  std::unique_ptr<Statement> statement =
+      GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+  ASSERT_NE(statement, nullptr);
+  const auto* select = dynamic_cast<const SelectStatement*>(statement.get());
+  ASSERT_NE(select, nullptr);
+  ASSERT_EQ(select->SetOperationKinds().size(), 2U);
+  EXPECT_EQ(select->SetOperationKinds()[0], SetOperationKind::kUnionAll);
+  EXPECT_EQ(select->SetOperationKinds()[1], SetOperationKind::kIntersect);
+  ASSERT_NE(select->GetSetOperationTree(), nullptr);
+  EXPECT_TRUE(select->GetSetOperationTree()->grouped);
+}
+
+TEST(GoogleSqlAstTest, PreservesExplicitNullOrdering) {
+  const std::string sql =
+      "SELECT x FROM nls ORDER BY x ASC NULLS LAST, x DESC NULLS FIRST;";
+  GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  std::unique_ptr<Statement> statement =
+      GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+  const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+  ASSERT_EQ(select.OrderBy().size(), 2U);
+  ASSERT_TRUE(select.OrderBy()[0].nulls_first.has_value());
+  EXPECT_FALSE(*select.OrderBy()[0].nulls_first);
+  ASSERT_TRUE(select.OrderBy()[1].nulls_first.has_value());
+  EXPECT_TRUE(*select.OrderBy()[1].nulls_first);
+}
+
 TEST(GoogleSqlAstTest, VisitsRichQueryWithoutReparsingSql) {
   GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(
       "SELECT n_name, SUM(l_quantity) AS quantity FROM nation, lineitem "

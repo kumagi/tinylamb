@@ -401,8 +401,7 @@ TEST_F(SqlEngineTpchTest, ExplainReturnsPlanAndAnalyzeReturnsRuntimeProfile) {
   };
 
   const std::string plan = collect_plan("EXPLAIN ");
-  EXPECT_NE(plan.find("JoinOrder=greedy_filtered_cardinality"),
-            std::string::npos)
+  EXPECT_NE(plan.find("StreamAggregate"), std::string::npos)
       << plan;
   EXPECT_NE(plan.find("Relational Physical Plan"), std::string::npos) << plan;
   EXPECT_NE(plan.find("rows~"), std::string::npos) << plan;

@@ -188,6 +188,23 @@ BPlusTreeIterator& BPlusTreeIterator::operator--() {
         prev_ref = std::move(child);
       }
     }
+    // Empty foster-tail leaves are reachable after deletions (the deleter
+    // only refeeds its own chain, leaving the predecessor's foster link).
+    // Skip past them instead of ending the scan early.
+    while (prev_ref->PageID() != left_from &&
+           prev_ref->body.leaf_page.row_count_ == 0) {
+      IndexKey prev_low = prev_ref->GetLowFence(*txn_);
+      if (prev_low.IsMinusInfinity()) {
+        break;
+      }
+      const page_id_t stop = prev_ref->PageID();
+      const std::string prev_seek(prev_low.GetKey().Value());
+      prev_ref.PageUnlock();
+      prev_ref = tree_->FindLeafReadOnly(*txn_, prev_seek, true, stop);
+      if (prev_ref->PageID() == stop) {
+        break;
+      }
+    }
     if (prev_ref->PageID() == left_from ||
         prev_ref->body.leaf_page.row_count_ == 0) {
       valid_ = false;

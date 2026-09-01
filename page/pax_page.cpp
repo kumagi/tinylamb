@@ -210,6 +210,12 @@ StatusOr<DataChunk> PaxPage::Load() const {
       return Status::kCorrupt;
     }
     types.push_back(directories[column].type);
+    // The null bitmap must cover every stored row; a truncated bitmap (e.g.
+    // a header rewritten past CRC validation) would otherwise make the load
+    // loop read past the directory's in-bounds region.
+    if (directories[column].null_length < PaxBitmapBytes(rows)) {
+      return Status::kCorrupt;
+    }
   }
 
   DataChunk chunk(types, rows);

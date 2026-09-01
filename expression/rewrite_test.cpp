@@ -1372,23 +1372,25 @@ TEST(ExpressionRewriteTest, DeterministicFunctionCse) {
   Expression upper_x = FunctionCallExp("upper", {x});
   Expression sqrt_x = FunctionCallExp("sqrt", {x});
 
-  // f(x) - f(x) -> 0
+  // PRODUCTION FIX: f(x) may return NULL, so f - f is UNKNOWN (not 0),
+  // f = f is UNKNOWN (not IS NOT NULL) and f / f is UNKNOWN (not 1; it is
+  // even a division-by-zero error when f(x) == 0).  The unsafe identities
+  // must leave the expression untouched.
   Expression sub_self = BinaryExpressionExp(abs_x, BinaryOperation::kSubtract, abs_x);
   Expression rewritten_sub = rewriter.Rewrite(sub_self);
-  ASSERT_EQ(rewritten_sub->Type(), TypeTag::kConstantValue);
-  EXPECT_EQ(rewritten_sub->AsConstantValue().GetValue(), Value(int64_t{0}));
+  ASSERT_EQ(rewritten_sub->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten_sub->AsBinaryExpression().Op(),
+            BinaryOperation::kSubtract);
 
-  // f(x) = f(x) -> f(x) IS NOT NULL
   Expression eq_self = BinaryExpressionExp(upper_x, BinaryOperation::kEquals, upper_x);
   Expression rewritten_eq = rewriter.Rewrite(eq_self);
-  ASSERT_EQ(rewritten_eq->Type(), TypeTag::kUnaryExp);
-  EXPECT_EQ(rewritten_eq->AsUnaryExpression().Op(), UnaryOperation::kIsNotNull);
+  ASSERT_EQ(rewritten_eq->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten_eq->AsBinaryExpression().Op(), BinaryOperation::kEquals);
 
-  // f(x) / f(x) -> 1
   Expression div_self = BinaryExpressionExp(sqrt_x, BinaryOperation::kDivide, sqrt_x);
   Expression rewritten_div = rewriter.Rewrite(div_self);
-  ASSERT_EQ(rewritten_div->Type(), TypeTag::kConstantValue);
-  EXPECT_EQ(rewritten_div->AsConstantValue().GetValue(), Value(int64_t{1}));
+  ASSERT_EQ(rewritten_div->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(rewritten_div->AsBinaryExpression().Op(), BinaryOperation::kDivide);
 
   // COALESCE(upper(x), upper(x)) -> upper(x)
   Expression coalesce_dup = FunctionCallExp("coalesce", {upper_x, upper_x});
@@ -1703,6 +1705,93 @@ TEST(ExpressionRewriteTest, CoalesceAndNullifSimplification) {
   Expression n4 = FunctionCallExp("nullif", {x, null_val});
   Expression rewritten_n4 = rewriter.Rewrite(n4);
   EXPECT_EQ(rewritten_n4->Type(), TypeTag::kColumnValue);
+}
+
+TEST(ExpressionRewriteTest, NullComparisonFoldsToUnknownNotIsNull) {
+  const ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  // PRODUCTION BUG (fixed): `x = NULL` was rewritten to `x IS NULL`, which
+  // turned three-valued logic into two-valued: WHERE x = NULL returned the
+  // rows whose x IS NULL instead of no rows at all.
+  const Row row_i5({Value(int64_t{5})});
+  const Row row_null({Value()});
+  const Schema schema("s", {Column("i", ValueType::kInt64)});
+
+  const Expression eq_null = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kEquals, ConstantValueExp(Value()));
+  const Expression rewritten_eq = rewriter.Rewrite(eq_null);
+  // The rewritten tree must agree with the raw AST for every input.
+  EXPECT_EQ(rewritten_eq->Evaluate(row_i5, schema),
+            eq_null->Evaluate(row_i5, schema));
+  EXPECT_EQ(rewritten_eq->Evaluate(row_null, schema),
+            eq_null->Evaluate(row_null, schema));
+  EXPECT_TRUE(rewritten_eq->Evaluate(row_i5, schema).IsNull());
+  EXPECT_TRUE(rewritten_eq->Evaluate(row_null, schema).IsNull());
+
+  const Expression ne_null = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kNotEquals,
+      ConstantValueExp(Value()));
+  const Expression rewritten_ne = rewriter.Rewrite(ne_null);
+  EXPECT_TRUE(rewritten_ne->Evaluate(row_i5, schema).IsNull());
+  EXPECT_TRUE(rewritten_ne->Evaluate(row_null, schema).IsNull());
+}
+
+TEST(ExpressionRewriteTest, DivisionByZeroConstantStaysRuntimeError) {
+  // PRODUCTION BUG (fixed): `5 / 0` folded to NULL, silently swallowing the
+  // "division by zero" error the AST evaluation raises.
+  const Expression div_zero = BinaryExpressionExp(
+      ConstantValueExp(Value(int64_t{5})), BinaryOperation::kDivide,
+      ConstantValueExp(Value(int64_t{0})));
+  const Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(div_zero);
+  const Row row({});
+  const Schema schema;
+  EXPECT_THROW(std::ignore = rewritten->Evaluate(row, schema),
+               std::runtime_error);
+}
+
+TEST(ExpressionRewriteTest, BooleanPredicateEqualityInvertsExactComplement) {
+  // PRODUCTION BUG (fixed): `(i IS FALSE) = 0` was rewritten to
+  // `i IS NOT TRUE` (the wrong complement) and non-0/1 constants (e.g. 5)
+  // also inverted the predicate.
+  const ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  const Schema schema("s", {Column("i", ValueType::kInt64)});
+  const Row zero({Value(int64_t{0})});
+  const Row one({Value(int64_t{1})});
+
+  struct Case {
+    UnaryOperation pred;
+    int64_t constant;
+    bool truthy_zero_i;
+    bool truthy_one_i;
+  };
+  // For i = 0: IS TRUE=0, IS NOT TRUE=1, IS FALSE=1, IS NOT FALSE=0.
+  // After `pred = 0` the result must be the negation of pred.
+  const std::vector<std::pair<UnaryOperation, UnaryOperation>> complements = {
+      {UnaryOperation::kIsTrue, UnaryOperation::kIsNotTrue},
+      {UnaryOperation::kIsNotTrue, UnaryOperation::kIsTrue},
+      {UnaryOperation::kIsFalse, UnaryOperation::kIsNotFalse},
+      {UnaryOperation::kIsNotFalse, UnaryOperation::kIsFalse}};
+  for (const auto& [pred, complement] : complements) {
+    const Expression eq_zero = BinaryExpressionExp(
+        UnaryExpressionExp(ColumnValueExp("i"), pred),
+        BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{0})));
+    const Expression rewritten = rewriter.Rewrite(eq_zero);
+    ASSERT_EQ(rewritten->Type(), TypeTag::kUnaryExp);
+    EXPECT_EQ(rewritten->AsUnaryExpression().Op(), complement);
+    // The rewritten tree must evaluate identically to the original.
+    EXPECT_EQ(rewritten->Evaluate(zero, schema), eq_zero->Evaluate(zero, schema));
+    EXPECT_EQ(rewritten->Evaluate(one, schema), eq_zero->Evaluate(one, schema));
+  }
+
+  // Non-boolean constants must not rewrite at all.
+  const Expression eq_five = BinaryExpressionExp(
+      UnaryExpressionExp(ColumnValueExp("i"), UnaryOperation::kIsTrue),
+      BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{5})));
+  Expression rewritten_five = rewriter.Rewrite(eq_five);
+  // Rewriting to a NULL constant is fine (x = 5 with IS TRUE -> UNKNOWN);
+  // it must merely agree with the original evaluation.
+  EXPECT_EQ(rewritten_five->Evaluate(zero, schema), eq_five->Evaluate(zero, schema));
+  EXPECT_EQ(rewritten_five->Evaluate(one, schema), eq_five->Evaluate(one, schema));
 }
 
 }  // namespace tinylamb

@@ -260,6 +260,12 @@ Status TransactionManager::PreCommit(Transaction& txn) {
 }
 
 void TransactionManager::Abort(Transaction& txn) {
+  // Guard double-finish: calling Abort() after a successful PreCommit must
+  // not roll back already-published committed writes (the undo walk would
+  // silently revert data other transactions may already have read).
+  if (txn.IsFinished()) {
+    return;
+  }
   if (txn.IsReadOnly()) {
     txn.SetStatus(TransactionStatus::kAborted);
     RemoveWaitForEdgesOf(txn.ID());
@@ -315,9 +321,9 @@ void TransactionManager::Abort(Transaction& txn) {
   ForgetTransaction(txn);
 }
 
-bool TransactionManager::AcquireWriteIntent(Transaction& txn,
-                                            const RowPosition& rp,
-                                            bool wait) {
+bool TransactionManager::AcquireWriteIntent(
+    Transaction& txn, const RowPosition& rp, bool wait,
+    std::optional<std::string_view> before) {
   VersionShard& shard = version_shards_[VersionShardIndex(rp)];
   const bool measure = metrics_enabled_.load(std::memory_order_relaxed);
   const auto wait_start = measure ? std::chrono::steady_clock::now()
@@ -362,6 +368,14 @@ bool TransactionManager::AcquireWriteIntent(Transaction& txn,
                                      .staged=false};
       if (txn.write_set_.empty()) {
         pending_txn_count_.fetch_add(1, std::memory_order_relaxed);
+      }
+      // Install the before-image as the base committed version while the
+      // shard mutex is held: until RegisterVersionWrite stages the new
+      // value, readers must see the old row instead of kNotExists.
+      if (before && chain.committed.empty()) {
+        chain.committed.push_back(
+            {0, std::numeric_limits<uint64_t>::max(),
+             std::optional<std::string>(std::string(*before))});
       }
       return true;
     }
@@ -480,6 +494,11 @@ bool TransactionManager::AcquireWriteIntent(Transaction& txn,
                                  .staged=false};
   if (txn.write_set_.empty()) {
     pending_txn_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (before && chain.committed.empty()) {
+    chain.committed.push_back(
+        {0, std::numeric_limits<uint64_t>::max(),
+         std::optional<std::string>(std::string(*before))});
   }
   return true;
 }

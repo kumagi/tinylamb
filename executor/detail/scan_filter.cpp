@@ -793,6 +793,12 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
             const Value& key = row[*int_key_column];
             if (key.IsNull() ||
                 !int_key_filter->contains(key.value.int_value)) {
+              if (context.execution_runtime() != nullptr) {
+                ++context.execution_runtime()->key_filter_rejected;
+                if (key.IsNull()) {
+                  ++context.execution_runtime()->key_filter_null_rejected;
+                }
+              }
               return;
             }
           }
@@ -809,6 +815,12 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
               const Value& key = row[*int_key_column];
               if (key.IsNull() ||
                   !int_key_filter->contains(key.value.int_value)) {
+                if (context.execution_runtime() != nullptr) {
+                  ++context.execution_runtime()->key_filter_rejected;
+                  if (key.IsNull()) {
+                    ++context.execution_runtime()->key_filter_null_rejected;
+                  }
+                }
                 return;
               }
             }
@@ -862,13 +874,26 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
                  projection == nullptr) {
         full_key_column = int_key_column;
       }
-      const bool parallel_ok = TryParallelTableScan(
-          context, *table.Value(), projection, int_key_filter, full_key_column,
-          filter_during_scan, filter_during_scan ? &scan_filter : nullptr,
-          filter_view, outer, ctes, &result);
+      // Keep key-filter accounting in this path.  The low-level iterator can
+      // reject keys before LoadSource sees a row, which is efficient but
+      // makes runtime-filter profiles lose the rejected/null-rejected split.
+      // Parallel scans use the same low-level fast path, so defer them while
+      // profiling an integer key filter and account each candidate below.
+      const bool iterator_handles_key_filter =
+          full_key_column.has_value() && context.execution_runtime() == nullptr;
+      const bool parallel_ok =
+          context.execution_runtime() == nullptr || int_key_filter == nullptr
+              ? TryParallelTableScan(
+                    context, *table.Value(), projection,
+                    iterator_handles_key_filter ? int_key_filter : nullptr,
+                    iterator_handles_key_filter ? full_key_column : std::nullopt,
+                    filter_during_scan,
+                    filter_during_scan ? &scan_filter : nullptr, filter_view,
+                    outer, ctes, &result)
+              : false;
       if (!parallel_ok) {
         Iterator iterator = [&] {
-          if (full_key_column != std::nullopt) {
+          if (iterator_handles_key_filter) {
             if (projection != nullptr) {
               return table.Value()->BeginFullScan(
                   context.txn_, *projection, int_key_filter, *full_key_column);
@@ -890,7 +915,7 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
                 result.schema.ColumnCount();
           }
           bool matches = true;
-          if (full_key_column == std::nullopt && int_key_filter != nullptr &&
+          if (!iterator_handles_key_filter && int_key_filter != nullptr &&
               int_key_column) {
             const Value& key = (*iterator)[*int_key_column];
             if (key.IsNull() ||
@@ -898,6 +923,9 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
               matches = false;
               if (context.execution_runtime() != nullptr) {
                 ++context.execution_runtime()->key_filter_rejected;
+                if (key.IsNull()) {
+                  ++context.execution_runtime()->key_filter_null_rejected;
+                }
               }
             }
           }

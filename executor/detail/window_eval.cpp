@@ -465,7 +465,34 @@ struct WindowRuntime {
           }
           return position;
         }
-        case WindowFrameBoundType::kOffsetFollowing:
+        case WindowFrameBoundType::kOffsetFollowing: {
+          // Start bound `N FOLLOWING`: the FIRST row whose key is >=
+          // `key + off`.  The old implementation fell through to `m - 1`,
+          // collapsing every frame start onto the partition's last row.
+          if (window.order_by.size() != 1 || !bound.offset ||
+              bound.offset->Type() != TypeTag::kConstantValue) {
+            throw std::runtime_error("RANGE offset requires one constant key");
+          }
+          const double off =
+              NumericOf(bound.offset->AsConstantValue().GetValue());
+          const Value& key = order_values[position][0];
+          if (key.IsNull()) {
+            return position;
+          }
+          for (size_t j = 0; j < m; ++j) {
+            const Value& candidate = order_values[j][0];
+            if (candidate.IsNull()) {
+              continue;
+            }
+            // DistanceWithin(candidate_value, key, off, false) checks
+            // candidate_value - key >= off, i.e. value >= key + off.
+            if (DistanceWithin(candidate, key, off, false)) {
+              return j;
+            }
+          }
+          // No row satisfies key + off: the frame is empty.
+          return std::nullopt;
+        }
         case WindowFrameBoundType::kUnboundedFollowing:
           return m - 1;
       }
@@ -1671,8 +1698,12 @@ WindowedInput ApplyWindows(TransactionContext& context,
   }
 
   input.FinishSpill();
-  std::vector<Row> rows = std::move(input.rows);
-  input.rows.clear();
+  // PRODUCTION FIX: Relation::AddRow spills to disk under a memory budget;
+  // moving input.rows alone dropped every spilled row. Collect all rows
+  // (resident + spilled) instead.
+  std::vector<Row> rows;
+  input.ForEachRow([&rows](const Row& row) { rows.push_back(row); });
+  input.ResetContents();
   const Schema base_schema = input.schema;
 
   ReplacementMap replacements;

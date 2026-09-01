@@ -158,6 +158,9 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   bool materialize_failed_{false};
   bool pipelined_{false};
   bool build_left_side_{false};
+  size_t actual_build_rows_{0};
+  size_t actual_probe_rows_{0};
+  size_t join_matches_{0};
   // The hybrid path keeps its fully materialized output (frozen spill spec).
   std::vector<std::pair<Row, RowPosition>> output_;
   size_t output_offset_{0};

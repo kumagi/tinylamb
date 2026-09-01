@@ -122,9 +122,8 @@ std::vector<Expression> NormalizeOrderingForOutput(
 }
 
 bool SameExpression(const Expression& left, const Expression& right) {
-  return left == right ||
-         (left && right && left->Type() == right->Type() &&
-          left->ToString() == right->ToString());
+  return left == right || (left && right && left->Type() == right->Type() &&
+                           left->ToString() == right->ToString());
 }
 
 bool SafeDeterministicExpression(  // NOLINT(misc-no-recursion)
@@ -149,7 +148,9 @@ Schema BuildInputSchema(
   Schema result;
   for (const std::string& relation : query.from_) {
     const auto found = tables.find(relation);
-    if (found == tables.end()) { continue; }
+    if (found == tables.end()) {
+      continue;
+    }
     const Schema& source = found->second->GetSchema();
     std::vector<Column> columns;
     columns.reserve(source.ColumnCount());
@@ -165,7 +166,9 @@ Schema BuildInputSchema(
 
 bool CanSimplifySelfComparison(const Expression& expression,
                                const Schema& input_schema) {
-  if (!SafeDeterministicExpression(expression)) { return false; }
+  if (!SafeDeterministicExpression(expression)) {
+    return false;
+  }
   try {
     const TypeTag type = expression->ResultType(input_schema).GetType();
     // IEEE NaN breaks x = x and x != x identities.
@@ -214,7 +217,9 @@ Expression RewritePrefixLike(const Expression& expression) {
          static_cast<unsigned char>(upper[position - 1]) == 0xffU) {
     --position;
   }
-  if (position == 0) { return expression; }
+  if (position == 0) {
+    return expression;
+  }
   upper.resize(position);
   ++upper.back();
   return BinaryExpressionExp(
@@ -248,21 +253,25 @@ struct InTest {
 };
 
 std::optional<InTest> ExtractInTest(const Expression& expression) {
-  if (!expression) { return std::nullopt; }
+  if (!expression) {
+    return std::nullopt;
+  }
   if (expression->Type() == TypeTag::kInExp) {
     return InTest{&expression->AsInExpression(), false};
   }
   if (expression->Type() == TypeTag::kUnaryExp &&
       expression->AsUnaryExpression().Op() == UnaryOperation::kNot &&
       expression->AsUnaryExpression().Child()->Type() == TypeTag::kInExp) {
-    return InTest{
-        &expression->AsUnaryExpression().Child()->AsInExpression(), true};
+    return InTest{&expression->AsUnaryExpression().Child()->AsInExpression(),
+                  true};
   }
   return std::nullopt;
 }
 
 bool SameConstantSet(const InExpression& left, const InExpression& right) {
-  if (left.list_.size() != right.list_.size()) { return false; }
+  if (left.list_.size() != right.list_.size()) {
+    return false;
+  }
   return std::ranges::all_of(left.list_, [&](const Expression& candidate) {
     return std::ranges::any_of(right.list_, [&](const Expression& other) {
       return candidate->Type() == TypeTag::kConstantValue &&
@@ -293,15 +302,17 @@ size_t FindEqualityClass(std::vector<EqualityClass>* classes,
 }
 
 bool ConstantsDiffer(const Value& left, const Value& right) {
-  const std::optional<bool> equal = EvaluateConstantPredicate(
-      BinaryOperation::kEquals, left, right);
+  const std::optional<bool> equal =
+      EvaluateConstantPredicate(BinaryOperation::kEquals, left, right);
   return equal.has_value() && !*equal;
 }
 
 bool PropagateEqualityConstants(std::vector<Expression>* conjuncts) {
   std::vector<EqualityClass> classes;
   for (const Expression& conjunct : *conjuncts) {
-    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) { continue; }
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+      continue;
+    }
     const auto& binary = conjunct->AsBinaryExpression();
     if (binary.Op() != BinaryOperation::kEquals ||
         binary.Left()->Type() == TypeTag::kConstantValue ||
@@ -310,7 +321,9 @@ bool PropagateEqualityConstants(std::vector<Expression>* conjuncts) {
     }
     size_t left = FindEqualityClass(&classes, binary.Left());
     size_t right = FindEqualityClass(&classes, binary.Right());
-    if (left == right) { continue; }
+    if (left == right) {
+      continue;
+    }
     classes[left].members.insert(classes[left].members.end(),
                                  classes[right].members.begin(),
                                  classes[right].members.end());
@@ -344,14 +357,18 @@ bool PropagateEqualityConstants(std::vector<Expression>* conjuncts) {
       const size_t group = FindEqualityClass(&classes, candidate);
       replaced = classes[group].constant.has_value();
     }
-    if (!replaced) { rewritten.push_back(conjunct); }
+    if (!replaced) {
+      rewritten.push_back(conjunct);
+    }
   }
   for (const EqualityClass& equality : classes) {
-    if (!equality.constant) { continue; }
+    if (!equality.constant) {
+      continue;
+    }
     for (const Expression& member : equality.members) {
-      rewritten.push_back(BinaryExpressionExp(
-          member, BinaryOperation::kEquals,
-          ConstantValueExp(*equality.constant)));
+      rewritten.push_back(
+          BinaryExpressionExp(member, BinaryOperation::kEquals,
+                              ConstantValueExp(*equality.constant)));
     }
   }
   *conjuncts = std::move(rewritten);
@@ -380,7 +397,9 @@ std::optional<SimpleComparison> ExtractSimpleComparison(
     return std::nullopt;
   }
   const Value constant = binary.Right()->AsConstantValue().GetValue();
-  if (constant.IsNull()) { return std::nullopt; }
+  if (constant.IsNull()) {
+    return std::nullopt;
+  }
   return SimpleComparison{binary.Left(), binary.Op(), constant};
 }
 
@@ -389,7 +408,9 @@ std::optional<bool> EvaluateConstantPredicate(BinaryOperation operation,
                                               const Value& right) {
   try {
     const Value result = EvaluateBinary(operation, left, right);
-    if (result.IsNull()) { return std::nullopt; }
+    if (result.IsNull()) {
+      return std::nullopt;
+    }
     return result.Truthy();
   } catch (const std::exception&) {
     return std::nullopt;
@@ -398,7 +419,9 @@ std::optional<bool> EvaluateConstantPredicate(BinaryOperation operation,
 
 bool ComparisonPairIsContradictory(const SimpleComparison& left,
                                    const SimpleComparison& right) {
-  if (!SameExpression(left.key, right.key)) { return false; }
+  if (!SameExpression(left.key, right.key)) {
+    return false;
+  }
 
   const auto contradicts_equality = [](const SimpleComparison& equality,
                                        const SimpleComparison& constraint) {
@@ -432,7 +455,9 @@ bool ComparisonPairIsContradictory(const SimpleComparison& left,
 
   const std::optional<bool> reversed = EvaluateConstantPredicate(
       BinaryOperation::kGreaterThan, lower->constant, upper->constant);
-  if (reversed.value_or(false)) { return true; }
+  if (reversed.value_or(false)) {
+    return true;
+  }
   const std::optional<bool> equal = EvaluateConstantPredicate(
       BinaryOperation::kEquals, lower->constant, upper->constant);
   return equal.value_or(false) &&
@@ -456,7 +481,9 @@ void RemoveSubsumedBounds(std::vector<Expression>* conjuncts) {
            operation == BinaryOperation::kLessThanEquals;
   };
   for (size_t i = 0; i < comparisons.size(); ++i) {
-    if (!comparisons[i]) { continue; }
+    if (!comparisons[i]) {
+      continue;
+    }
     for (size_t j = i + 1; j < comparisons.size(); ++j) {
       if (!comparisons[j] ||
           !SameExpression(comparisons[i]->key, comparisons[j]->key)) {
@@ -466,9 +493,8 @@ void RemoveSubsumedBounds(std::vector<Expression>* conjuncts) {
       const SimpleComparison& right = *comparisons[j];
       if (left.operation == BinaryOperation::kEquals ||
           right.operation == BinaryOperation::kEquals) {
-        const size_t equality = left.operation == BinaryOperation::kEquals
-                                    ? i
-                                    : j;
+        const size_t equality =
+            left.operation == BinaryOperation::kEquals ? i : j;
         const size_t other = equality == i ? j : i;
         if (comparisons[other]->operation == BinaryOperation::kEquals) {
           keep[j] = false;
@@ -481,13 +507,17 @@ void RemoveSubsumedBounds(std::vector<Expression>* conjuncts) {
           is_lower(left.operation) && is_lower(right.operation);
       const bool both_upper =
           is_upper(left.operation) && is_upper(right.operation);
-      if (!both_lower && !both_upper) { continue; }
+      if (!both_lower && !both_upper) {
+        continue;
+      }
 
       const std::optional<bool> left_greater = EvaluateConstantPredicate(
           BinaryOperation::kGreaterThan, left.constant, right.constant);
       const std::optional<bool> right_greater = EvaluateConstantPredicate(
           BinaryOperation::kGreaterThan, right.constant, left.constant);
-      if (!left_greater || !right_greater) { continue; }
+      if (!left_greater || !right_greater) {
+        continue;
+      }
       if (*left_greater) {
         keep[both_lower ? j : i] = false;
       } else if (*right_greater) {
@@ -512,7 +542,9 @@ void RemoveSubsumedBounds(std::vector<Expression>* conjuncts) {
   std::vector<Expression> reduced;
   reduced.reserve(conjuncts->size());
   for (size_t i = 0; i < conjuncts->size(); ++i) {
-    if (keep[i]) { reduced.push_back((*conjuncts)[i]); }
+    if (keep[i]) {
+      reduced.push_back((*conjuncts)[i]);
+    }
   }
   *conjuncts = std::move(reduced);
 }
@@ -529,7 +561,9 @@ Expression SimplifyFilterPredicate(const Expression& predicate,
     conjuncts.insert(conjuncts.end(), rewritten.begin(), rewritten.end());
   }
   for (Expression& conjunct : conjuncts) {
-    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) { continue; }
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+      continue;
+    }
     const auto& binary = conjunct->AsBinaryExpression();
     if (!SameExpression(binary.Left(), binary.Right()) ||
         !CanSimplifySelfComparison(binary.Left(), input_schema)) {
@@ -539,8 +573,8 @@ Expression SimplifyFilterPredicate(const Expression& predicate,
       case BinaryOperation::kEquals:
       case BinaryOperation::kLessThanEquals:
       case BinaryOperation::kGreaterThanEquals:
-        conjunct = UnaryExpressionExp(binary.Left(),
-                                      UnaryOperation::kIsNotNull);
+        conjunct =
+            UnaryExpressionExp(binary.Left(), UnaryOperation::kIsNotNull);
         break;
       case BinaryOperation::kNotEquals:
       case BinaryOperation::kLessThan:
@@ -758,8 +792,11 @@ bool ContainsAggregateExp(
 
 struct DecorrelationSpec {
   JoinKind kind{};
-  Expression outer_key;  // resolved qualified column of the outer query
-  Expression inner_key;  // resolved qualified column inside the subquery
+  // The vectors form one composite semi/anti-join key.  Keeping all
+  // correlated equalities is important: dropping the second equality turns
+  // a correlated EXISTS into a wider, semantically incorrect match set.
+  std::vector<Expression> outer_keys;
+  std::vector<Expression> inner_keys;
   std::vector<std::string> from;
   std::unordered_map<std::string, std::string> aliases;
   std::vector<Expression> inner_conjuncts;
@@ -951,12 +988,15 @@ std::optional<DecorrelationSpec> TryDecorrelate(const Expression& conjunct,
         break;
       }
       case ConjunctClass::kCrossEquality:
-        // Correlated IN and second key pairs are not supported in V1.
-        if (!exists_form || have_key) {
+        // NOT IN with extra correlated predicates has tuple-valued UNKNOWN
+        // semantics which the null-aware anti join does not model.  Keep that
+        // shape on the canonical evaluator; positive IN and EXISTS can use a
+        // composite semi/anti key safely.
+        if (!exists_form && negated) {
           return std::nullopt;
         }
-        spec.outer_key = std::move(outer_key);
-        spec.inner_key = std::move(inner_key);
+        spec.outer_keys.push_back(std::move(outer_key));
+        spec.inner_keys.push_back(std::move(inner_key));
         have_key = true;
         break;
       case ConjunctClass::kReject:
@@ -977,11 +1017,11 @@ std::optional<DecorrelationSpec> TryDecorrelate(const Expression& conjunct,
         break;
       }
       case ConjunctClass::kCrossEquality:
-        if (!exists_form || have_key) {
+        if (!exists_form && negated) {
           return std::nullopt;
         }
-        spec.outer_key = std::move(outer_key);
-        spec.inner_key = std::move(inner_key);
+        spec.outer_keys.push_back(std::move(outer_key));
+        spec.inner_keys.push_back(std::move(inner_key));
         have_key = true;
         break;
       case ConjunctClass::kReject:
@@ -1008,27 +1048,28 @@ std::optional<DecorrelationSpec> TryDecorrelate(const Expression& conjunct,
     if (!probe || probe->first != ColumnSide::kOuter) {
       return std::nullopt;
     }
-    spec.outer_key = ColumnValueExp(probe->second);
+    spec.outer_keys.insert(spec.outer_keys.begin(),
+                           ColumnValueExp(probe->second));
     const auto member = ResolveScoped(
         sub.SelectList().front().expression->AsColumnValue().GetColumnName(),
         inner_scope, outer_scope);
     if (!member || member->first != ColumnSide::kInner) {
       return std::nullopt;
     }
-    spec.inner_key = ColumnValueExp(member->second);
-    if (have_key) {
-      return std::nullopt;  // correlated IN: not in V1
-    }
+    spec.inner_keys.insert(spec.inner_keys.begin(),
+                           ColumnValueExp(member->second));
     // NOT IN uses the cheaper regular anti join when both keys are known
     // non-null. Otherwise retain SQL's three-valued behavior in the
     // null-aware anti executor; NOT EXISTS has no such hazard.
     if (spec.kind == AntiJoinKind()) {
+      // Composite correlated NOT IN is rejected above.  This branch is the
+      // ordinary one-key NOT IN case.
       const ColumnName& outer_column =
-          spec.outer_key->AsColumnValue().GetColumnName();
+          spec.outer_keys.front()->AsColumnValue().GetColumnName();
       if (!ColumnIsNonNull(outer_scope, outer_column, ctx) ||
-          !ColumnIsNonNull(inner_scope,
-                           spec.inner_key->AsColumnValue().GetColumnName(),
-                           ctx)) {
+          !ColumnIsNonNull(
+              inner_scope,
+              spec.inner_keys.front()->AsColumnValue().GetColumnName(), ctx)) {
         spec.kind = NullAwareAntiJoinKind();
       }
     }
@@ -1072,9 +1113,10 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   bool order_rewritten = false;
   QueryData scalar_normalized = query;
   for (size_t i = 0; i < query.order_expressions_.size(); ++i) {
-    if (!query.order_expressions_[i]) { continue; }
-    Expression rewritten =
-        scalar_rewriter.Rewrite(query.order_expressions_[i]);
+    if (!query.order_expressions_[i]) {
+      continue;
+    }
+    Expression rewritten = scalar_rewriter.Rewrite(query.order_expressions_[i]);
     if (rewritten->ToString() != query.order_expressions_[i]->ToString()) {
       order_rewritten = true;
       scalar_normalized.order_expressions_[i] = std::move(rewritten);
@@ -1214,17 +1256,26 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
       // key must survive into the projection output; hidden `$semiN` items
       // keep unselected keys visible and the engine trims them afterwards.
       for (size_t i = 0; i < candidates.size(); ++i) {
-        const ColumnName& key =
-            candidates[i].first.outer_key->AsColumnValue().GetColumnName();
-        bool covered = std::ranges::any_of(
-            expanded_select, [&](const NamedExpression& item) {
-              return item.expression->Type() == TypeTag::kColumnValue &&
-                     item.expression->AsColumnValue().GetColumnName() == key;
-            });
-        if (!covered && !has_aggregate) {
-          projection_items.emplace_back("$semi" + std::to_string(i),
-                                        candidates[i].first.outer_key);
-          covered = true;
+        bool covered = true;
+        for (size_t key_index = 0;
+             key_index < candidates[i].first.outer_keys.size(); ++key_index) {
+          const ColumnName& key = candidates[i]
+                                      .first.outer_keys[key_index]
+                                      ->AsColumnValue()
+                                      .GetColumnName();
+          const bool key_covered = std::ranges::any_of(
+              expanded_select, [&](const NamedExpression& item) {
+                return item.expression->Type() == TypeTag::kColumnValue &&
+                       item.expression->AsColumnValue().GetColumnName() == key;
+              });
+          if (!key_covered && !has_aggregate) {
+            // ProductPlan resolves its key against the left output schema.
+            // Preserve the qualified source name here; an alias such as
+            // `$semi0` would hide the key from the join contract.
+            projection_items.emplace_back(
+                "", candidates[i].first.outer_keys[key_index]);
+          }
+          covered = covered && (key_covered || !has_aggregate);
         }
         if (covered) {
           decorrelations.push_back(std::move(candidates[i].first));
@@ -1285,11 +1336,28 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   std::vector<cascades::ConjunctInfo> conjuncts;
   bool needs_root_selection = false;
   for (const Expression& conjunct : SplitConjuncts(effective_predicate)) {
+    // The neutral predicate is already represented by the scan group. It has
+    // no relation identity and must not force the general memo route; doing
+    // so would make a simple single-table query lose the direct access-path
+    // costing (notably COUNT(*)'s covering IndexOnlyScan).
+    if (conjunct && conjunct->Type() == TypeTag::kConstantValue &&
+        conjunct->AsConstantValue().GetValue().Truthy()) {
+      continue;
+    }
     std::unordered_set<std::string> relations;
     if (!ConjunctRelations(conjunct, rule_context.tables, &relations) ||
         relations.empty()) {
       needs_root_selection = true;
       continue;
+    }
+    // Keep a final residual guard for single-relation predicates in a
+    // multi-relation query.  Scan-group filters are still used for costing
+    // and pushdown, but some join alternatives (notably the partitioned hash
+    // path) can reorder or project away the filtered side before the group
+    // predicate is attached.  Rechecking the original conjunct at the root
+    // is cheap compared with returning rows that did not satisfy WHERE.
+    if (relations.size() == 1 && query.from_.size() > 1) {
+      needs_root_selection = true;
     }
     conjuncts.push_back({conjunct, {relations.begin(), relations.end()}});
   }
@@ -1467,14 +1535,13 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   // selected output contract explicit at the boundary: join reordering must
   // never leak the optimizer's internal column order to callers.
   if (!has_aggregate) {
-    Plan projection = std::make_shared<ProjectionPlan>(best->plan,
-                                                       projection_items);
+    Plan projection =
+        std::make_shared<ProjectionPlan>(best->plan, projection_items);
     const Schema& projected_schema = projection->GetSchema();
     const Schema& actual_schema = best->plan->GetSchema();
-    bool same_layout = projected_schema.ColumnCount() ==
-                       actual_schema.ColumnCount();
-    for (size_t i = 0; same_layout && i < projected_schema.ColumnCount();
-         ++i) {
+    bool same_layout =
+        projected_schema.ColumnCount() == actual_schema.ColumnCount();
+    for (size_t i = 0; same_layout && i < projected_schema.ColumnCount(); ++i) {
       same_layout = projected_schema.GetColumn(i).Name() ==
                     actual_schema.GetColumn(i).Name();
     }
@@ -1494,17 +1561,31 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     if (!inner_query.where_) {
       inner_query.where_ = ConstantValueExp(Value(true));
     }
-    inner_query.select_.emplace_back(
-        spec.inner_key->AsColumnValue().GetColumnName());
+    for (const Expression& inner_key : spec.inner_keys) {
+      inner_query.select_.emplace_back(
+          inner_key->AsColumnValue().GetColumnName());
+    }
     ASSIGN_OR_RETURN(Plan, inner_plan, Optimize(inner_query, ctx, options));
+    std::vector<ColumnName> outer_keys;
+    std::vector<ColumnName> inner_keys;
+    outer_keys.reserve(spec.outer_keys.size());
+    inner_keys.reserve(spec.inner_keys.size());
+    for (const Expression& outer_key : spec.outer_keys) {
+      outer_keys.push_back(outer_key->AsColumnValue().GetColumnName());
+    }
+    for (const Expression& inner_key : spec.inner_keys) {
+      inner_keys.push_back(inner_key->AsColumnValue().GetColumnName());
+    }
     best->plan = std::make_shared<ProductPlan>(
-        best->plan,
-        std::vector<ColumnName>{
-            spec.outer_key->AsColumnValue().GetColumnName()},
-        inner_plan,
-        std::vector<ColumnName>{
-            spec.inner_key->AsColumnValue().GetColumnName()},
+        best->plan, std::move(outer_keys), inner_plan, std::move(inner_keys),
         spec.kind);
+  }
+
+  // Correlation keys added only for the semi/anti join are implementation
+  // columns.  Restore the caller-visible projection after all joins so a
+  // decorrelated predicate never leaks hidden key columns into the result.
+  if (!has_aggregate && !decorrelations.empty()) {
+    best->plan = std::make_shared<ProjectionPlan>(best->plan, expanded_select);
   }
 
   if (options.dump_memo) {

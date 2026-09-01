@@ -13,7 +13,9 @@
 #include <string>
 
 #include "database/transaction_context.hpp"
+#include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "index/index.hpp"
 #include "table/table.hpp"
@@ -27,6 +29,46 @@
 namespace tinylamb {
 namespace {
 
+bool IntConstant(const Expression& expression, int64_t* value) {
+  if (!expression || expression->Type() != TypeTag::kConstantValue) {
+    return false;
+  }
+  const Value constant = expression->AsConstantValue().GetValue();
+  if (constant.type != ValueType::kInt64) { return false; }
+  *value = constant.value.int_value;
+  return true;
+}
+
+bool AffineColumn(const Expression& expression, const ColumnName& target,
+                 int64_t* multiplier) {  // NOLINT(misc-no-recursion)
+  if (!expression) { return false; }
+  if (expression->Type() == TypeTag::kColumnValue) {
+    const ColumnName& column = expression->AsColumnValue().GetColumnName();
+    if (column.name != target.name || column.schema != target.schema) {
+      return false;
+    }
+    return true;
+  }
+  if (expression->Type() != TypeTag::kBinaryExp) { return false; }
+  const auto& binary = expression->AsBinaryExpression();
+  int64_t constant = 0;
+  if (binary.Op() == BinaryOperation::kAdd &&
+      IntConstant(binary.Right(), &constant)) {
+    return AffineColumn(binary.Left(), target, multiplier);
+  }
+  if (binary.Op() == BinaryOperation::kSubtract &&
+      IntConstant(binary.Right(), &constant)) {
+    return AffineColumn(binary.Left(), target, multiplier);
+  }
+  if (binary.Op() == BinaryOperation::kMultiply &&
+      IntConstant(binary.Right(), &constant)) {
+    if (!AffineColumn(binary.Left(), target, multiplier)) { return false; }
+    *multiplier *= constant;
+    return true;
+  }
+  return false;
+}
+
 bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
                   const std::vector<Expression>& expressions,
                   const std::vector<bool>& ascending) {
@@ -36,14 +78,27 @@ bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
-    if (expressions[i]->Type() != TypeTag::kColumnValue) { return false;
-}
-    const ColumnName& column =
-        expressions[i]->AsColumnValue().GetColumnName();
-    if (column.name != provided[i].name) { return false;
-}
-    if (ascending[i] != scan_ascending) { return false;
-}
+    if (expressions[i]->Type() == TypeTag::kColumnValue) {
+      const ColumnName& column =
+          expressions[i]->AsColumnValue().GetColumnName();
+      if (column.name != provided[i].name ||
+          ascending[i] != scan_ascending) {
+        return false;
+      }
+      continue;
+    }
+    // An affine expression with a non-zero constant multiplier preserves
+    // index order (or reverses it when the multiplier is negative).  The
+    // projection executor evaluates the expression after the scan; no sort
+    // is needed for ORDER BY id + constant.
+    int64_t multiplier = 1;
+    if (!AffineColumn(expressions[i], provided[i], &multiplier) ||
+        multiplier == 0) {
+      return false;
+    }
+    const bool expression_ascending =
+        multiplier > 0 ? scan_ascending : !scan_ascending;
+    if (ascending[i] != expression_ascending) { return false; }
   }
   return true;
 }

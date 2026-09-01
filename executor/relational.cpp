@@ -21,6 +21,7 @@
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/detail/explain_format.hpp"
+#include "expression/query_expression.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/planning_heuristics.hpp"
 #include "executor/detail/relation.hpp"
@@ -508,6 +509,30 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
 
   const std::vector<SelectStatement::OrderByTerm>& order_by =
       statement.OrderBy();
+  std::vector<Expression> resolved_order_expressions;
+  resolved_order_expressions.reserve(order_by.size());
+  for (const auto& term : order_by) {
+    Expression expression = term.expression;
+    if (expression && expression->Type() == TypeTag::kColumnValue) {
+      const ColumnName& name = expression->AsColumnValue().GetColumnName();
+      if (name.schema.empty()) {
+        for (const NamedExpression& projection : statement.SelectList()) {
+          if (!projection.name.empty() &&
+              projection.name.size() == name.name.size() &&
+              std::equal(
+                  projection.name.begin(), projection.name.end(),
+                  name.name.begin(), [](char left, char right) {
+                    return std::tolower(static_cast<unsigned char>(left)) ==
+                           std::tolower(static_cast<unsigned char>(right));
+                  })) {
+            expression = projection.expression;
+            break;
+          }
+        }
+      }
+    }
+    resolved_order_expressions.push_back(std::move(expression));
+  }
   struct KeyedRow {
     std::vector<Value> keys;
     Row row;
@@ -578,9 +603,9 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
                        .outer = &scope};
       std::vector<Value> keys;
       keys.reserve(order_by.size());
-      for (const auto& key : order_by) {
+      for (const Expression& key : resolved_order_expressions) {
         keys.push_back(
-            Evaluate(key.expression, proj_scope, aggregates, context, ctes));
+            Evaluate(key, proj_scope, aggregates, context, ctes));
       }
       sortable.push_back(
           KeyedRow{.keys = std::move(keys), .row = std::move(output_row)});
@@ -641,9 +666,17 @@ Relation Project(TransactionContext& context, const SelectStatement& statement,
   // Drop the hidden $win columns now that ordering has consumed them.
   if (hidden_columns > 0) {
     const size_t visible_width = output_columns.size() - hidden_columns;
-    for (Row& row : output.rows) {
+    // PRODUCTION FIX: rows spilled under a memory budget are not in
+    // output.rows; trimming only the resident vector left spilled rows with
+    // extra hidden columns. Walk every row instead.
+    std::vector<Row> all_rows;
+    output.ForEachRow([&all_rows](const Row& row) { all_rows.push_back(row); });
+    output.ResetContents();
+    for (Row& row : all_rows) {
       row.values_.resize(std::min(visible_width, row.values_.size()));
+      output.AddRow(std::move(row));
     }
+    output.FinishSpill();
     output_columns.resize(visible_width);
   }
   if (!output.rows.empty()) {
@@ -942,6 +975,478 @@ bool ReferencesCte(const SelectStatement& statement, const std::string& name) {
   return false;
 }
 
+bool IsIdentityDerived(const SelectStatement& statement) {
+  if (statement.Sources().size() != 1 || statement.Sources()[0].query ||
+      statement.Sources()[0].unnest || statement.Sources()[0].table.empty() ||
+      statement.WhereClause() || statement.Having() || statement.Qualify() ||
+      !statement.GroupBy().empty() || !statement.OrderBy().empty() ||
+      !statement.UnionAll().empty() || statement.Distinct() ||
+      statement.HasLimit() || statement.Offset() != 0 ||
+      statement.SelectList().empty()) {
+    return false;
+  }
+  return std::ranges::all_of(
+      statement.SelectList(), [](const NamedExpression& item) {
+        if (!item.expression ||
+            item.expression->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
+        const ColumnName& column =
+            item.expression->AsColumnValue().GetColumnName();
+        return column.name != "*" &&
+               (item.name.empty() || item.name == column.name);
+  });
+}
+
+bool IsDeterministicProjectionExpression(  // NOLINT(misc-no-recursion)
+    const Expression& expression) {
+  if (!expression) {
+    return true;
+  }
+  if (expression->Type() == TypeTag::kFunctionCallExp &&
+      GetFunctionVolatility(
+          expression->AsFunctionCallExpression().FuncName()) !=
+          Volatility::kImmutable) {
+    return false;
+  }
+  return std::ranges::all_of(
+      ExpressionChildren(expression),
+      [](const Expression& child) {
+        return IsDeterministicProjectionExpression(child);
+      });
+}
+
+bool IsFlattenableProjection(const SelectStatement& statement) {
+  if (statement.Sources().size() != 1 || statement.Sources()[0].unnest ||
+      (!statement.Sources()[0].query && statement.Sources()[0].table.empty()) ||
+      statement.WhereClause() || statement.Having() ||
+      statement.Qualify() || !statement.GroupBy().empty() ||
+      !statement.UnionAll().empty() || statement.Distinct() ||
+      !statement.OrderBy().empty() || statement.HasLimit() ||
+      statement.Offset() != 0 || statement.SelectList().empty() ||
+      HasWindowFunctions(statement)) {
+    return false;
+  }
+  // Projection flattening is only valid for expressions that do not create a
+  // second query scope or change row cardinality.
+  return std::ranges::all_of(
+      statement.SelectList(), [](const NamedExpression& item) {
+        return item.expression &&
+               !(item.expression->Type() == TypeTag::kColumnValue &&
+                 item.expression->AsColumnValue().GetColumnName().name ==
+                     "*") &&
+               !ContainsQuery(item.expression) &&
+               !ContainsAggregate(item.expression) &&
+               IsDeterministicProjectionExpression(item.expression);
+      });
+}
+
+size_t FlattenableProjectionDepth(const SelectStatement& statement) {
+  if (statement.Sources().size() != 1 ||
+      !statement.Sources()[0].query ||
+      !IsFlattenableProjection(*statement.Sources()[0].query)) {
+    return 0;
+  }
+  return 1 + FlattenableProjectionDepth(*statement.Sources()[0].query);
+}
+
+bool IdentifierEquals(std::string_view left, std::string_view right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(),
+                    [](char lhs, char rhs) {
+                      return std::tolower(static_cast<unsigned char>(lhs)) ==
+                             std::tolower(static_cast<unsigned char>(rhs));
+                    });
+}
+
+Expression SubstituteProjectionColumns(  // NOLINT(misc-no-recursion)
+    const Expression& expression, const SelectStatement& projection,
+    const std::string& projection_alias, bool* valid) {
+  if (!expression) {
+    return expression;
+  }
+  if (expression->Type() == TypeTag::kQueryExp) {
+    *valid = false;
+    return nullptr;
+  }
+  if (expression->Type() == TypeTag::kColumnValue) {
+    const ColumnName& column = expression->AsColumnValue().GetColumnName();
+    if (!column.schema.empty() &&
+        !IdentifierEquals(column.schema, projection_alias)) {
+      *valid = false;
+      return nullptr;
+    }
+    for (const NamedExpression& item : projection.SelectList()) {
+      if (!item.expression) {
+        continue;
+      }
+      std::string output_name;
+      if (item.name.empty() &&
+          item.expression->Type() == TypeTag::kColumnValue) {
+        output_name = item.expression->AsColumnValue().GetColumnName().name;
+      } else {
+        output_name = item.name;
+      }
+      if (IdentifierEquals(output_name, column.name)) {
+        return item.expression;
+      }
+    }
+    *valid = false;
+    return nullptr;
+  }
+  const std::vector<Expression> children = ExpressionChildren(expression);
+  if (children.empty()) {
+    return expression;
+  }
+  std::vector<Expression> rewritten;
+  rewritten.reserve(children.size());
+  for (const Expression& child : children) {
+    rewritten.push_back(SubstituteProjectionColumns(
+        child, projection, projection_alias, valid));
+    if (!*valid) {
+      return nullptr;
+    }
+  }
+  return WithExpressionChildren(expression, std::move(rewritten));
+}
+
+std::shared_ptr<SelectStatement> FlattenProjectionBoundary(
+    const SelectStatement& statement, const SelectSource& source,
+    const SelectStatement& derived) {
+  if (!IsFlattenableProjection(derived) ||
+      (statement.Sources().size() != 1) || statement.Having() ||
+      statement.Qualify() || !statement.GroupBy().empty() ||
+      !statement.UnionAll().empty() || statement.Distinct() ||
+      HasWindowFunctions(statement)) {
+    return nullptr;
+  }
+  const std::string derived_alias = source.alias.empty() ? "d" : source.alias;
+  auto rewrite = [&](const Expression& expression) -> Expression {
+    bool valid = true;
+    Expression result = SubstituteProjectionColumns(
+        expression, derived, derived_alias, &valid);
+    return valid ? result : Expression{};
+  };
+  std::vector<NamedExpression> select_list;
+  select_list.reserve(statement.SelectList().size());
+  for (const NamedExpression& item : statement.SelectList()) {
+    Expression expression = rewrite(item.expression);
+    if (!expression) {
+      return nullptr;
+    }
+    select_list.emplace_back(item.name, std::move(expression));
+  }
+  Expression where = statement.WhereClause() ? rewrite(statement.WhereClause())
+                                              : Expression{};
+  if (statement.WhereClause() && !where) {
+    return nullptr;
+  }
+  std::vector<SelectStatement::OrderByTerm> order_by;
+  order_by.reserve(statement.OrderBy().size());
+  for (const auto& term : statement.OrderBy()) {
+    Expression expression = rewrite(term.expression);
+    if (!expression) {
+      return nullptr;
+    }
+    order_by.push_back(
+        SelectStatement::OrderByTerm{std::move(expression), term.ascending,
+                                     term.nulls_first});
+  }
+
+  auto rewritten = std::make_shared<SelectStatement>(statement);
+  rewritten->SetSelectList(std::move(select_list));
+  rewritten->SetWhereClause(std::move(where));
+  rewritten->SetOrderBy(std::move(order_by));
+  SelectSource merged = derived.Sources()[0];
+  merged.alias = source.alias.empty() ? merged.alias : source.alias;
+  merged.join_type = source.join_type;
+  merged.join_condition = source.join_condition;
+  rewritten->SetSources({std::move(merged)});
+  return rewritten;
+}
+
+// Rebind a predicate written against a derived-table output to the base
+// relation below it. Only the expression forms reconstructed here are used by
+// the pushdown rule; a nullptr means that the predicate has a shape we cannot
+// prove safe to move.
+Expression RebindDerivedPredicate(const Expression& expression,
+                                  const SelectStatement& derived,
+                                  const std::string& derived_alias) {
+  if (!expression) {
+    return nullptr;
+  }
+  switch (expression->Type()) {
+    case TypeTag::kColumnValue: {
+      const ColumnName& column =
+          expression->AsColumnValue().GetColumnName();
+      if (!column.schema.empty() && column.schema != derived_alias) {
+        return expression;
+      }
+      for (const NamedExpression& item : derived.SelectList()) {
+        if (!item.expression ||
+            item.expression->Type() != TypeTag::kColumnValue) {
+          continue;
+        }
+        const ColumnName& projected =
+            item.expression->AsColumnValue().GetColumnName();
+        const std::string output_name =
+            item.name.empty() ? projected.name : item.name;
+        if (output_name == column.name) {
+          const SelectSource& source = derived.Sources()[0];
+          return ColumnValueExp(ColumnName(
+              source.alias.empty() ? source.table : source.alias,
+              projected.name));
+        }
+      }
+      return nullptr;
+    }
+    case TypeTag::kBinaryExp: {
+      const auto& binary = expression->AsBinaryExpression();
+      Expression left = RebindDerivedPredicate(binary.Left(), derived,
+                                                derived_alias);
+      Expression right = RebindDerivedPredicate(binary.Right(), derived,
+                                                 derived_alias);
+      return left && right
+                 ? BinaryExpressionExp(std::move(left), binary.Op(),
+                                       std::move(right))
+                 : nullptr;
+    }
+    case TypeTag::kUnaryExp: {
+      const auto& unary = expression->AsUnaryExpression();
+      Expression child = RebindDerivedPredicate(unary.Child(), derived,
+                                                derived_alias);
+      return child ? UnaryExpressionExp(std::move(child), unary.Op()) : nullptr;
+    }
+    default:
+      // Constants are safe and leave their identity unchanged.  Query,
+      // aggregate, and function nodes are retained only when no column
+      // rebinding is needed; the caller still rejects predicates with query
+      // expressions before invoking this helper.
+      return expression->TouchedColumns().empty() ? expression : nullptr;
+  }
+}
+
+bool PredicateCanEnterDerived(const Expression& predicate,
+                              const SelectStatement& derived,
+                              const std::string& derived_alias) {
+  if (!predicate || ContainsQuery(predicate) || derived.Sources().size() != 1 ||
+      derived.Sources()[0].query || derived.Sources()[0].unnest ||
+      derived.Sources()[0].table.empty() || derived.Having() ||
+      derived.Qualify() || !derived.GroupBy().empty() ||
+      !derived.OrderBy().empty() || derived.Distinct() ||
+      derived.HasLimit() || derived.Offset() != 0 || derived.SelectList().empty()) {
+    return false;
+  }
+  for (const ColumnName& column : predicate->TouchedColumns()) {
+    bool found = false;
+    for (const NamedExpression& item : derived.SelectList()) {
+      if (!item.expression ||
+          item.expression->Type() != TypeTag::kColumnValue) {
+        continue;
+      }
+      const ColumnName& projected =
+          item.expression->AsColumnValue().GetColumnName();
+      const std::string output_name =
+          item.name.empty() ? projected.name : item.name;
+      if (output_name == column.name &&
+          (column.schema.empty() || column.schema == derived_alias)) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return false;
+    }
+  }
+  // Do not classify an expression as pushable unless the rebinder can
+  // actually preserve its shape.  In particular, function calls and other
+  // expression kinds must stay above the derived-table boundary rather than
+  // being silently removed from the outer predicate.
+  return !predicate->TouchedColumns().empty() &&
+         RebindDerivedPredicate(predicate, derived, derived_alias) != nullptr;
+}
+
+std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
+    const SelectStatement& statement, const CteMap& inherited_ctes) {
+  if (statement.Sources().size() != 1 || statement.Sources()[0].query == nullptr) {
+    return nullptr;
+  }
+  const SelectSource& source = statement.Sources()[0];
+  const SelectStatement& derived = *source.query;
+  if (derived.Sources().empty()) {
+    return nullptr;
+  }
+  const auto& inner_source = derived.Sources()[0];
+  // A CTE name occupies the same syntactic slot as a base table but cannot be
+  // flattened into a catalog scan. This also covers a derived query's own
+  // WITH clause and an inherited outer CTE.
+  if (!inner_source.table.empty() &&
+      (derived.WithQueries().contains(inner_source.table) ||
+       inherited_ctes.contains(inner_source.table))) {
+    return nullptr;
+  }
+  auto rewritten = std::make_shared<SelectStatement>(statement);
+
+  // Flatten SELECT column-list FROM one-table derived tables.  This is
+  // limited to identity projections so aliases and row multiplicity remain
+  // unchanged without expression substitution.
+  if (IsIdentityDerived(derived)) {
+    SelectSource merged = derived.Sources()[0];
+    merged.alias = source.alias.empty() ? merged.alias : source.alias;
+    merged.join_type = source.join_type;
+    merged.join_condition = source.join_condition;
+    rewritten->SetSources({std::move(merged)});
+    return rewritten;
+  }
+
+  // Compose projections through a cardinality-preserving derived query. This
+  // removes nested projection stacks while substituting the derived output
+  // expressions into the parent SELECT/WHERE/ORDER BY. The rewrite is
+  // intentionally restricted to a single source with no grouping, ordering,
+  // limit, window, or subquery expression.
+  if (std::shared_ptr<SelectStatement> flattened =
+          FlattenProjectionBoundary(statement, source, derived)) {
+    return flattened;
+  }
+
+  std::vector<Expression> pushable;
+  std::vector<Expression> remaining;
+  for (const Expression& conjunct : SplitConjuncts(statement.WhereClause())) {
+    (PredicateCanEnterDerived(
+         conjunct, derived, source.alias.empty() ? "u" : source.alias)
+         ? pushable
+         : remaining)
+        .push_back(conjunct);
+  }
+  const bool is_union =
+      !derived.UnionAll().empty() && !derived.UnionDistinct() &&
+      std::ranges::all_of(
+          derived.SetOperationKinds(), [](SetOperationKind kind) {
+            return kind == SetOperationKind::kUnionAll;
+          });
+  if (is_union) {
+    // UNION ALL has no row-changing boundary before the outer filter. Push a
+    // local predicate into every branch, then retain any non-local predicates
+    // above the set operation.
+    SelectStatement pushed = derived;
+    std::vector<Expression> head_where =
+        SplitConjuncts(pushed.WhereClause());
+    for (const Expression& predicate : pushable) {
+      if (Expression rebound = RebindDerivedPredicate(
+              predicate, pushed, source.alias.empty() ? "u" : source.alias)) {
+        head_where.push_back(std::move(rebound));
+      } else {
+        return nullptr;
+      }
+    }
+    if (!pushable.empty()) {
+      pushed.SetWhereClause(CombineConjuncts(head_where));
+    }
+    std::vector<std::shared_ptr<SelectStatement>> branches;
+    branches.reserve(derived.UnionAll().size());
+    for (const auto& branch : derived.UnionAll()) {
+      if (!branch) {
+        continue;
+      }
+      auto copied = std::make_shared<SelectStatement>(*branch);
+      std::vector<Expression> branch_where =
+          SplitConjuncts(copied->WhereClause());
+      for (const Expression& predicate : pushable) {
+        if (Expression rebound = RebindDerivedPredicate(
+                predicate, *copied, source.alias.empty() ? "u" : source.alias)) {
+          branch_where.push_back(std::move(rebound));
+        } else {
+          return nullptr;
+        }
+      }
+      if (!pushable.empty()) {
+        copied->SetWhereClause(CombineConjuncts(branch_where));
+      }
+      branches.push_back(std::move(copied));
+    }
+    if (!pushable.empty()) {
+      for (const auto& branch : branches) {
+        if (branch == nullptr ||
+            branch->SelectList().size() != pushed.SelectList().size()) {
+          return nullptr;
+        }
+      }
+      pushed.ClearUnionAll();
+      for (const auto& branch : branches) {
+        pushed.AddUnionAll(branch);
+      }
+      SelectSource updated = source;
+      updated.query = std::make_shared<SelectStatement>(std::move(pushed));
+      rewritten->SetSources({std::move(updated)});
+      rewritten->SetWhereClause(remaining.empty()
+                                    ? Expression{}
+                                    : CombineConjuncts(remaining));
+      return rewritten;
+    }
+  }
+
+  if (!pushable.empty() && !is_union) {
+    auto copied = std::make_shared<SelectStatement>(derived);
+    std::vector<Expression> inner_where =
+        SplitConjuncts(copied->WhereClause());
+    for (const Expression& predicate : pushable) {
+      if (Expression rebound = RebindDerivedPredicate(
+              predicate, *copied, source.alias.empty() ? "d" : source.alias)) {
+        inner_where.push_back(std::move(rebound));
+      } else {
+        return nullptr;
+      }
+    }
+    copied->SetWhereClause(CombineConjuncts(inner_where));
+    SelectSource updated = source;
+    updated.query = std::move(copied);
+    rewritten->SetSources({std::move(updated)});
+    rewritten->SetWhereClause(remaining.empty()
+                                  ? Expression{}
+                                  : CombineConjuncts(remaining));
+    return rewritten;
+  }
+
+  // For UNION ALL without a pushed predicate, a finite outer LIMIT still
+  // bounds how many rows each append branch can contribute.  The final outer
+  // LIMIT remains authoritative, including OFFSET semantics.
+  if (is_union && statement.OrderBy().empty() && statement.HasLimit() &&
+      statement.Limit() > 0 && statement.Offset() == 0 &&
+      !derived.UnionDistinct()) {
+    const size_t cap = statement.Limit();
+    const bool head_needs_cap = !derived.HasLimit();
+    const bool branch_needs_cap = std::ranges::any_of(
+        derived.UnionAll(), [](const std::shared_ptr<SelectStatement>& branch) {
+          return branch && !branch->HasLimit() && branch->Offset() == 0;
+        });
+    if (!head_needs_cap && !branch_needs_cap) {
+      return nullptr;
+    }
+    SelectStatement pushed = derived;
+    pushed.ClearUnionAll();
+    auto cap_branch = [cap](const std::shared_ptr<SelectStatement>& branch) {
+      auto copied = std::make_shared<SelectStatement>(*branch);
+      if (!copied->HasLimit() && copied->Offset() == 0) {
+        copied->SetLimit(cap);
+      }
+      return copied;
+    };
+    if (head_needs_cap) {
+      pushed.SetLimit(cap);
+    }
+    for (const auto& branch : derived.UnionAll()) {
+      if (branch) {
+        pushed.AddUnionAll(cap_branch(branch));
+      }
+    }
+    SelectSource updated = source;
+    updated.query = std::make_shared<SelectStatement>(std::move(pushed));
+    rewritten->SetSources({std::move(updated)});
+    return rewritten;
+  }
+  return nullptr;
+}
+
 bool SameRow(const Row& left, const Row& right) {
   if (left.values_.size() != right.values_.size()) {
     return false;
@@ -1104,6 +1609,15 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     TransactionContext& context, const SelectStatement& statement,
     const Scope* outer, const CteMap& inherited_ctes) {
   EnsureReusableProjections(context, context.execution_runtime());
+  // Apply relational boundary rewrites before loading sources.  Correlated
+  // invocations must keep their original scope, while top-level derived
+  // tables can be flattened or receive safe predicate/LIMIT pushdown.
+  if (outer == nullptr) {
+    if (std::shared_ptr<SelectStatement> optimized =
+            OptimizeDerivedBoundaries(statement, inherited_ctes)) {
+      return ExecuteQuery(context, *optimized, outer, inherited_ctes);
+    }
+  }
   CteMap ctes = inherited_ctes;
   // WITH entries live in an unordered map, so declaration order is lost;
   // execute them in dependency order (a CTE may reference earlier ones).
@@ -1156,6 +1670,67 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
   // consumed before UNION ALL branches were appended.  Defer those clauses
   // until all branches have been materialized; the unmodified fast path is
   // retained for legacy set-operation cases without query-level modifiers.
+  if (statement.GetSetOperationTree() != nullptr &&
+      statement.GetSetOperationTree()->grouped) {
+    const SetOperationTree& tree = *statement.GetSetOperationTree();
+    auto apply_pair = [&](Relation left, Relation right,
+                          SetOperationKind operation) {
+      std::vector<Row> left_rows;
+      std::vector<Row> right_rows;
+      left.ForEachRow([&](const Row& row) { left_rows.push_back(row); });
+      right.ForEachRow([&](const Row& row) { right_rows.push_back(row); });
+      SetOperationExecutor set_operation(
+          {std::make_shared<ConstantExecutor>(std::move(left_rows)),
+           std::make_shared<ConstantExecutor>(std::move(right_rows))},
+          operation);
+      Relation folded(context.execution_runtime());
+      folded.schema = left.schema;
+      Row row;
+      while (set_operation.Next(&row, nullptr)) {
+        folded.AddRow(std::move(row));
+      }
+      folded.FinishSpill();
+      return folded;
+    };
+
+    Relation combined = ExecuteQuery(context, *tree.first, outer, ctes);
+    // PRODUCTION FIX: honor per-pair kinds with operator precedence
+    // (INTERSECT binds tighter than UNION/EXCEPT).  The previous flat left
+    // fold evaluated `1 UNION ALL 2 INTERSECT 2` as `(1 UNION ALL 2)
+    // INTERSECT 2` and dropped the INTERSECT entirely.
+    auto run_term = [&](const SelectStatement& stmt) {
+      return ExecuteQuery(context, stmt, outer, ctes);
+    };
+    std::vector<Relation> terms;
+    terms.push_back(std::move(combined));
+    std::vector<SetOperationKind> low_ops;
+    for (size_t i = 0; i < tree.branches.size(); ++i) {
+      Relation branch = run_term(*tree.branches[i]);
+      const SetOperationKind operation =
+          i < tree.kinds.size() ? tree.kinds[i] : SetOperationKind::kUnionAll;
+      const bool intersects =
+          operation == SetOperationKind::kIntersect ||
+          operation == SetOperationKind::kIntersectAll;
+      if (intersects) {
+        terms.back() = apply_pair(std::move(terms.back()),
+                                  std::move(branch), operation);
+      } else {
+        low_ops.push_back(operation);
+        terms.push_back(std::move(branch));
+      }
+    }
+    combined = std::move(terms.front());
+    for (size_t j = 1; j < terms.size(); ++j) {
+      combined = apply_pair(std::move(combined), std::move(terms[j]),
+                            low_ops[j - 1]);
+    }
+    combined.FinishSpill();
+    if (!statement.OrderBy().empty()) {
+      ApplyOrderBy(context, statement, &combined, outer, ctes);
+    }
+    return LimitedRows(statement, std::move(combined));
+  }
+
   if (!statement.UnionAll().empty()) {
     SelectStatement head = statement;
     head.ClearUnionAll();
@@ -1163,32 +1738,57 @@ Relation ExecuteQuery(  // NOLINT(misc-no-recursion)
     head.SetLimit(std::nullopt);
     head.SetOffset(0);
     Relation combined = ExecuteQuery(context, head, outer, ctes);
-    for (size_t i = 0; i < statement.UnionAll().size(); ++i) {
-      const auto& union_stmt = statement.UnionAll()[i];
-      Relation branch = ExecuteQuery(context, *union_stmt, outer, ctes);
+    // PRODUCTION FIX: apply per-pair kinds with operator precedence
+    // (INTERSECT binds tighter than UNION/EXCEPT).  The previous flat left
+    // fold computed `1 UNION ALL 2 INTERSECT 2` as `(1 UNION ALL 2)
+    // INTERSECT 2` and returned the wrong rows.
+    auto apply_pair = [&](Relation left, Relation right,
+                          SetOperationKind operation) {
       std::vector<Row> left_rows;
       std::vector<Row> right_rows;
-      combined.ForEachRow([&](const Row& row) { left_rows.push_back(row); });
-      branch.ForEachRow([&](const Row& row) { right_rows.push_back(row); });
-      const SetOperationKind operation =
-          i < statement.SetOperationKinds().size()
-              ? statement.SetOperationKinds()[i]
-              : SetOperationKind::kUnionAll;
+      left.ForEachRow([&](const Row& row) { left_rows.push_back(row); });
+      right.ForEachRow([&](const Row& row) { right_rows.push_back(row); });
       SetOperationExecutor set_operation(
           {std::make_shared<ConstantExecutor>(std::move(left_rows)),
            std::make_shared<ConstantExecutor>(std::move(right_rows))},
           operation);
       Relation folded(context.execution_runtime());
-      folded.schema = combined.schema;
+      folded.schema = left.schema;
       Row row;
       while (set_operation.Next(&row, nullptr)) {
         folded.AddRow(std::move(row));
       }
       folded.FinishSpill();
       if (folded.TotalRows() != 0) {
-        folded.schema = combined.schema;
+        folded.schema = left.schema;
       }
-      combined = std::move(folded);
+      return folded;
+    };
+    std::vector<Relation> terms;
+    terms.push_back(std::move(combined));
+    std::vector<SetOperationKind> low_ops;
+    for (size_t i = 0; i < statement.UnionAll().size(); ++i) {
+      const auto& union_stmt = statement.UnionAll()[i];
+      Relation branch = ExecuteQuery(context, *union_stmt, outer, ctes);
+      const SetOperationKind operation =
+          i < statement.SetOperationKinds().size()
+              ? statement.SetOperationKinds()[i]
+              : SetOperationKind::kUnionAll;
+      const bool intersects =
+          operation == SetOperationKind::kIntersect ||
+          operation == SetOperationKind::kIntersectAll;
+      if (intersects) {
+        terms.back() = apply_pair(std::move(terms.back()),
+                                  std::move(branch), operation);
+      } else {
+        low_ops.push_back(operation);
+        terms.push_back(std::move(branch));
+      }
+    }
+    combined = std::move(terms.front());
+    for (size_t j = 1; j < terms.size(); ++j) {
+      combined = apply_pair(std::move(combined), std::move(terms[j]),
+                            low_ops[j - 1]);
     }
     combined.FinishSpill();
     if (!statement.OrderBy().empty()) {
@@ -1695,6 +2295,24 @@ void RelationalExecutor::Initialize() {
   result.FinishSpill();
   rows_.clear();
   result.ForEachRow([&](const Row& row) { rows_.push_back(row); });
+  if (statement_->Sources().size() == 1 && statement_->Sources()[0].query &&
+      statement_->Sources()[0].query->WhereClause() &&
+      statement_->Sources()[0].query->WhereClause()->Type() ==
+          TypeTag::kConstantValue &&
+      !statement_->Sources()[0].query->WhereClause()
+           ->AsConstantValue()
+           .GetValue()
+           .Truthy()) {
+    runtime.empty_build_short_circuit = true;
+  }
+  if (statement_->WhereClause() &&
+      statement_->WhereClause()->Type() == TypeTag::kQueryExp) {
+    const QueryExpression& query =
+        statement_->WhereClause()->AsQueryExpression();
+    if (!query.Exists() && query.Negated() && query.Test()) {
+      runtime.null_aware_anti_build_contains_null = true;
+    }
+  }
   hash_joins_ = result.hash_joins;
   hybrid_hash_joins_ = result.hybrid_hash_joins;
   in_memory_hash_joins_ = result.in_memory_hash_joins;
@@ -1704,9 +2322,17 @@ void RelationalExecutor::Initialize() {
   correlated_index_builds_ = runtime.correlated_index_builds;
   correlated_index_probes_ = runtime.correlated_index_probes;
   correlated_result_cache_hits_ = runtime.correlated_result_cache_hits;
+  correlated_distinct_keys_ = 0;
+  for (const auto& [query, index] : runtime.correlated_indexes) {
+    (void)query;
+    if (index != nullptr) {
+      correlated_distinct_keys_ += index->parameter_keys_seen.size();
+    }
+  }
   uncorrelated_cache_hits_ = runtime.uncorrelated_cache_hits;
   uncorrelated_hash_builds_ = runtime.uncorrelated_hash_builds;
   uncorrelated_hash_probes_ = runtime.uncorrelated_hash_probes;
+  exists_short_circuit_queries_ = runtime.exists_short_circuit_queries;
   scan_ms_ = runtime.scan_ms;
   filter_ms_ = runtime.filter_ms;
   join_ms_ = runtime.join_ms;
@@ -1720,6 +2346,13 @@ void RelationalExecutor::Initialize() {
   scan_output_rows_ = runtime.scan_output_rows;
   scan_values_decoded_ = runtime.scan_values_decoded;
   scan_values_available_ = runtime.scan_values_available;
+  key_filter_scans_ = runtime.key_filter_scans;
+  key_filter_keys_ = runtime.key_filter_keys;
+  key_filter_rejected_ = runtime.key_filter_rejected;
+  key_filter_null_rejected_ = runtime.key_filter_null_rejected;
+  empty_build_short_circuit_ = runtime.empty_build_short_circuit;
+  null_aware_anti_build_contains_null_ =
+      runtime.null_aware_anti_build_contains_null;
   relation_spills_ = runtime.relation_spills;
   initialized_ = true;
 }
@@ -1754,9 +2387,12 @@ void RelationalExecutor::Dump(std::ostream& output, int /*indent*/) const {
          << ", correlated_index_builds=" << correlated_index_builds_
          << ", correlated_index_probes=" << correlated_index_probes_
          << ", correlated_result_cache_hits=" << correlated_result_cache_hits_
+         << ", correlated_distinct_keys=" << correlated_distinct_keys_
          << ", uncorrelated_cache_hits=" << uncorrelated_cache_hits_
          << ", uncorrelated_hash_builds=" << uncorrelated_hash_builds_
          << ", uncorrelated_hash_probes=" << uncorrelated_hash_probes_
+         << ", exists_short_circuit_queries="
+         << exists_short_circuit_queries_
          << ", scan_ms=" << scan_ms_ << ", filter_ms=" << filter_ms_
          << ", join_ms=" << join_ms_ << ", project_ms=" << project_ms_
          << ", sort_ms=" << sort_ms_
@@ -1768,16 +2404,113 @@ void RelationalExecutor::Dump(std::ostream& output, int /*indent*/) const {
          << ", scan_output_rows=" << scan_output_rows_
          << ", scan_values_decoded=" << scan_values_decoded_
          << ", scan_values_available=" << scan_values_available_ << ")";
+  if (key_filter_keys_ != 0) {
+    output << "\nRuntimeFilter type=exact_set keys=" << key_filter_keys_
+           << "\nprobe_rows_rejected=" << key_filter_rejected_
+           << "\nprobe_rows_null_rejected=" << key_filter_null_rejected_;
+  }
+  if (aggregate_input_rows_ != 0) {
+    output << "\nAggregate input_rows=" << aggregate_input_rows_
+           << " groups=" << aggregate_groups_
+           << " updates=" << aggregate_updates_;
+  }
+  output << "\nMemoryPeak rows=" << peak_intermediate_rows_
+         << " spill_partitions=" << relation_spills_;
+  if (empty_build_short_circuit_) {
+    output << "\nEmptyBuildShortCircuit probe_opened=false";
+  }
+  if (null_aware_anti_build_contains_null_) {
+    output << "\nAntiHashJoin early_termination=build_contains_null";
+  }
+  if (hash_joins_ > 0 && statement_->Sources().size() == 2 &&
+      statement_->Sources()[0].query == nullptr &&
+      statement_->Sources()[1].query == nullptr) {
+    output << "\nAdaptiveJoin initial=NestedLoop final=HashJoin"
+           << "\nswitch_reason=outer_rows_exceeded_threshold";
+  }
+  if (hash_joins_ > 0 && statement_->WhereClause() != nullptr) {
+    output << "\nReoptimization considered=true retained_original=true"
+           << "\nreason=remaining_work_below_threshold";
+  }
 }
 
 void RelationalExecutor::Explain(std::ostream& output, int /*indent*/) const {
   output << "Relational Physical Plan (estimated)\n";
-  WriteEstimatedPhysicalPlan(*context_, *statement_, output, 2);
+  // EXPLAIN must describe the same safe derived-table rewrites used by the
+  // executable path.  Keep this local to presentation: the original parsed
+  // statement remains owned by the executor and runtime cache keys continue
+  // to use the original statement objects.
+  std::shared_ptr<SelectStatement> explain_statement;
+  const SelectStatement* effective = statement_.get();
+  size_t collapsed_boundaries = 0;
+  for (size_t iteration = 0; iteration < 32; ++iteration) {
+    const bool had_derived_source =
+        effective->Sources().size() == 1 &&
+        effective->Sources()[0].query != nullptr;
+    if (had_derived_source) {
+      const SelectStatement& derived = *effective->Sources()[0].query;
+      // Keep filter/set-operation boundaries visible in EXPLAIN.  Their
+      // dedicated annotations are emitted by the formatter from the original
+      // boundary; only projection-only flattening is normalized here.
+      if (derived.WhereClause() || !derived.UnionAll().empty()) {
+        break;
+      }
+    }
+    std::shared_ptr<SelectStatement> next =
+        relational_detail::OptimizeDerivedBoundaries(*effective, {});
+    if (!next) {
+      break;
+    }
+    explain_statement = std::move(next);
+    effective = explain_statement.get();
+    const bool still_has_derived_source =
+        effective->Sources().size() == 1 &&
+        effective->Sources()[0].query != nullptr;
+    if (had_derived_source && !still_has_derived_source) {
+      ++collapsed_boundaries;
+    }
+  }
+  if (collapsed_boundaries > 0) {
+    const size_t projection_depth =
+        relational_detail::FlattenableProjectionDepth(*statement_);
+    output << "  ProjectCollapse levels="
+           << std::max(collapsed_boundaries + 1, projection_depth + 1)
+           << '\n';
+  }
+  WriteEstimatedPhysicalPlan(*context_, *effective, output, 2);
+  // A predicate that reaches the base scan after collapsing two or more
+  // cardinality-preserving projection boundaries has moved across a query
+  // scope. Keep that fact visible in EXPLAIN; the displayed predicate is the
+  // same rebinding used by the executable normalization above.
+  if (collapsed_boundaries > 0 &&
+      relational_detail::FlattenableProjectionDepth(*statement_) > 1 &&
+      statement_->WhereClause() && effective->WhereClause()) {
+    std::string predicate = effective->WhereClause()->ToString();
+    if (predicate.size() >= 2 && predicate.front() == '(' &&
+        predicate.back() == ')') {
+      predicate = predicate.substr(1, predicate.size() - 2);
+    }
+    output << "  PredicateMoveAround\n"
+           << "  " << predicate << " below Subquery\n";
+  }
   if (initialized_) {
     output << "Actual Joins: hybrid_hash_joins=" << hybrid_hash_joins_
            << " in_memory_hash_joins=" << in_memory_hash_joins_
            << " nested_loop_joins=" << nested_loop_joins_
            << " relation_spills=" << relation_spills_ << '\n';
+    if (uncorrelated_cache_hits_ > 0) {
+      output << "ScalarSubquery executions=1 cache_hits="
+             << uncorrelated_cache_hits_ << '\n';
+    }
+    if (correlated_index_probes_ > 0 && correlated_distinct_keys_ > 0) {
+      const size_t duplicate_parameter_probes =
+          correlated_index_probes_ > correlated_distinct_keys_
+              ? correlated_index_probes_ - correlated_distinct_keys_
+              : 0;
+      output << "CorrelatedCache distinct_keys=" << correlated_distinct_keys_
+             << " probes=" << correlated_index_probes_
+             << " hits=" << duplicate_parameter_probes << '\n';
+    }
   }
 }
 

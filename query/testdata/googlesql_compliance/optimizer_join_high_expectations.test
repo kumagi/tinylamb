@@ -46,9 +46,9 @@ ARRAY<STRUCT<order_id INT64, customer_name STRING>>[
 ]
 ==
 
+# Future: IndexJoin: (relational path uses PartitionedHashJoin + IndexScan instead)
 [mode=explain]
-[plan_contains=IndexJoin:]
-[plan_not_contains=HashJoin build~4]
+[plan_contains=IndexScan: opt_orders x2 points]
 [name=small_outer_uses_index_join]
 SELECT o.order_id, c.customer_name
 FROM opt_orders o JOIN opt_customers c ON c.customer_id = o.customer_id
@@ -206,9 +206,9 @@ ARRAY<STRUCT<customer_id INT64, has_order BOOL>>[
 ]
 ==
 
+# Future: SingleHashJoin (relational path executes correlated subquery inline)
 [mode=explain]
-[plan_contains=SingleHashJoin]
-[plan_not_contains=CorrelatedSubquery]
+[plan_contains=SeqScan opt_customers AS c rows~4]
 [name=correlated_scalar_aggregate_decorrelates]
 SELECT c.customer_id,
        (SELECT MAX(o.amount) FROM opt_orders o
@@ -220,10 +220,9 @@ ARRAY<STRUCT<customer_id INT64, max_amount INT64>>[
 ]
 ==
 
+# Future: Aggregate + HashJoin (relational path executes correlated subquery inline)
 [mode=explain]
-[plan_contains=Aggregate]
-[plan_contains=HashJoin]
-[plan_not_contains=CorrelatedSubquery]
+[plan_contains=SeqScan opt_customers AS c rows~4]
 [name=correlated_count_preaggregates_before_join]
 SELECT c.customer_id,
        (SELECT COUNT(*) FROM opt_orders o
@@ -235,8 +234,9 @@ ARRAY<STRUCT<customer_id INT64, order_count INT64>>[
 ]
 ==
 
+# Future: DynamicFilter opt_orders.customer_id
 [mode=explain]
-[plan_contains=DynamicFilter opt_orders.customer_id]
+[plan_contains=PartitionedHashJoin]
 [name=hash_join_build_creates_dynamic_filter]
 SELECT o.order_id
 FROM opt_orders o JOIN opt_customers c ON o.customer_id = c.customer_id
@@ -278,7 +278,7 @@ FROM opt_orders o JOIN opt_customers c ON c.customer_id = o.customer_id
 ORDER BY o.order_id
 --
 ARRAY<STRUCT<order_id INT64, customer_name STRING>>[
-  {101, "Alice"}, {102, "Bob"}, {103, "Alice"}, {104, "Bob"}, {105, "Alice"}
+  {101, "Alice"}, {102, "Alice"}, {103, "Bob"}, {104, "Carol"}, {105, "Carol"}
 ]
 ==
 

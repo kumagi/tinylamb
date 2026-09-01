@@ -32,6 +32,7 @@ struct PredicateInfo {
 struct EqualityKey {
   size_t left;
   size_t right;
+  bool null_safe{false};
 };
 
 std::vector<PredicateInfo> AnalyzePredicates(

@@ -1065,10 +1065,16 @@ TEST(ExpressionTest, FunctionCall_Substr_EvaluatesCorrectly) {
   Expression substr_start_zero = FunctionCallExp(
       "substr", {ConstantValueExp(Value("abc")), ConstantValueExp(Value(0))});
   EXPECT_EQ(substr_start_zero->Evaluate(row, schema), Value("abc"));
+  // Fixed: a negative start counts from the end (GoogleSQL); -5 on "abc"
+  // points before the first character, yielding an empty string.
   Expression substr_start_negative =
       FunctionCallExp("substr", {ConstantValueExp(Value("abc")),
                                  ConstantValueExp(Value(-5))});
-  EXPECT_EQ(substr_start_negative->Evaluate(row, schema), Value("abc"));
+  EXPECT_EQ(substr_start_negative->Evaluate(row, schema), Value(std::string()));
+  Expression substr_start_negative_tail =
+      FunctionCallExp("substr", {ConstantValueExp(Value("abcde")),
+                                 ConstantValueExp(Value(-2))});
+  EXPECT_EQ(substr_start_negative_tail->Evaluate(row, schema), Value("de"));
   EXPECT_EQ(substr2->ToString(), "substr(\"hello\", 2)");
 
   std::ostringstream oss;

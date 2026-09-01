@@ -615,11 +615,15 @@ TEST_F(BPlusTreeIteratorTest, ForwardScanDescendsEmptyLeafWithFoster) {
   ++it;
   EXPECT_FALSE(it.IsValid());
 
-  // The reverse walk from the foster child's only row steps back onto the
-  // empty foster parent and must end the scan (no lower rows exist).
+  // The reverse walk from the foster child's only row skips the empty foster
+  // parent and must land on the surviving lower key "a" (PRODUCTION FIX: the
+  // old behavior ended the scan at the empty leaf even though "a" exists).
   it = bpt_->Begin(txn, "", "", false);
   ASSERT_TRUE(it.IsValid());
   ASSERT_EQ(it.Key(), "b");
+  --it;
+  ASSERT_TRUE(it.IsValid());
+  EXPECT_EQ(it.Key(), "a");
   --it;
   EXPECT_FALSE(it.IsValid());
 }

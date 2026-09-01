@@ -352,6 +352,7 @@ tinylamb_add_layer(tinylamb_executor
         executor/topn.cpp
         executor/limit.cpp
         executor/max1_row.cpp
+        executor/minmax_index.cpp
         executor/set_operation.cpp
         executor/distinct.cpp
         executor/values.cpp
@@ -418,6 +419,8 @@ tinylamb_add_layer(tinylamb_executor
         plan/sort_distinct_plan.cpp
         plan/values_plan.cpp
         plan/max1_row_plan.cpp
+        plan/minmax_index_plan.cpp
+        plan/incremental_sort_plan.cpp
         plan/merge_join_plan.cpp
         plan/set_operation_plan.cpp
         plan/plan.cpp
@@ -518,6 +521,10 @@ target_link_libraries(
         tinylamb
         PRIVATE
         tinylamb::sql
+        # Shares pgwire::SplitSqlStatements with the server so the CLI does
+        # not keep a diverged (comment/backslash-unaware) copy of the
+        # statement splitter.
+        tinylamb::postgres_server
 )
 target_include_directories(
         tinylamb

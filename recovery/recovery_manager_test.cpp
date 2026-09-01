@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "recovery/checkpoint_manager.hpp"
 #include "recovery/recovery_manager.hpp"
 
 #include <gtest/gtest.h>
@@ -1130,6 +1131,53 @@ TEST_F(RecoveryManagerTest, ParallelAbortsReadLogIndependently) {
     EXPECT_EQ(page->RowCount(), 1);  // Only the committed seed remains.
     page.PageUnlock();
   }
+}
+
+TEST_F(RecoveryManagerTest, CheckpointDirtyPageTablePreservesMaxPageId) {
+  // PRODUCTION BUG (fixed): analysis starts at checkpoint_lsn, so pages
+  // allocated before the checkpoint were invisible to the allocator high-
+  // water re-derivation.  After a crash (dropped pages, unflushed meta page)
+  // recovery re-issued LIVE page ids and the next allocate destroyed data.
+  const std::string master = file_name_ + ".mst";
+  {
+    // Allocate pages 2..4 and write rows, then checkpoint.
+    Transaction seed = tm_->Begin();
+    for (uint64_t pid = 2; pid <= 4; ++pid) {
+      PageRef page = p_->AllocateNewPage(seed, PageType::kRowPage);
+      EXPECT_EQ(page->PageID(), pid);
+    }
+    PageRef data = p_->GetPage(2);
+    ASSERT_SUCCESS(data->Insert(seed, "survivor").GetStatus());
+    data.PageUnlock();
+    ASSERT_SUCCESS(seed.PreCommit());
+    // WriteCheckpoint requires no page latch on this thread.
+    CheckpointManager cm(master, tm_.get(), p_->GetPool(), 0);
+    const lsn_t checkpoint_lsn = cm.WriteCheckpoint();
+
+    // Simulate the crash: meta page image (with the old max_page_count)
+    // never reaches disk.
+    p_->GetPool()->DropAllPages();
+    // Recovery pass 1 (rebuilds the allocator from the WAL).
+    RecoverBase([]() {});
+    r_->RecoverFrom(checkpoint_lsn, tm_.get());
+    // A newly allocated page must not collide with any live page.
+    Transaction alloc = tm_->Begin();
+    const PageRef allocated = p_->AllocateNewPage(alloc, PageType::kRowPage);
+    EXPECT_GT(allocated->PageID(), 4)
+        << "allocator re-issued a pre-checkpoint page id";
+    ASSERT_SUCCESS(alloc.PreCommit());
+
+    // Persistence check: a second restart cycle must keep the data.
+    p_->GetPool()->DropAllPages();
+    RecoverBase([]() {});
+    r_->RecoverFrom(0, tm_.get());
+    PageRef again = p_->GetPage(2);
+    EXPECT_EQ(again->Type(), PageType::kRowPage);
+    EXPECT_EQ(again->RowCount(), 1);
+    EXPECT_EQ(again->Read(alloc, 0).Value(), "survivor");
+    again.PageUnlock();
+  }
+  std::ignore = std::remove(master.c_str());
 }
 
 }  // namespace tinylamb

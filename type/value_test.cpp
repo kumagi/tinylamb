@@ -207,6 +207,46 @@ TEST(ValueTest, EncodeMemcomparableFormat_WithIntValues_PreservesTotalOrder) {
   MemcomparableFormatEncodeTest(extreme);
 }
 
+TEST(ValueTest, EncodeMemcomparableFormat_WithDoubleValues_PreservesOrderAndSignFlag) {
+  // Fixed: the sign flag used to be written via `be |= 0x80`, which only
+  // landed on the first image byte on little-endian hosts.  The flag byte is
+  // now written positionally and must match the decoder's expectation on any
+  // endianness.
+  const Value pos(1.0);
+  const Value neg(-1.0);
+  const std::string enc_pos = pos.EncodeMemcomparableFormat();
+  const std::string enc_neg = neg.EncodeMemcomparableFormat();
+  // First image byte (after the 1-byte type prefix) carries the flipped sign.
+  EXPECT_NE(enc_pos[1] & 0x80, 0);
+  EXPECT_EQ(enc_neg[1] & 0x80, 0);
+
+  std::vector<Value> edge = {
+      Value(-std::numeric_limits<double>::infinity()),
+      Value(-1.0), Value(0.0), Value(1e-300),
+      Value(1.0), Value(std::numeric_limits<double>::max()),
+      Value(std::numeric_limits<double>::infinity())};
+  MemcomparableFormatEncodeTest(edge);
+
+  // -0.0 and +0.0 encode to the same image (SQL treats them equal).
+  EXPECT_EQ(Value(-0.0).EncodeMemcomparableFormat(),
+            Value(0.0).EncodeMemcomparableFormat());
+
+  for (const Value& v : edge) {
+    const std::string encoded = v.EncodeMemcomparableFormat();
+    Value decoded;
+    const size_t consumed = decoded.DecodeMemcomparableFormat(encoded.data());
+    EXPECT_EQ(consumed, encoded.size());
+    EXPECT_EQ(decoded.type, ValueType::kDouble);
+    EXPECT_EQ(decoded.value.double_value, v.value.double_value);
+  }
+
+  // NaN round-trips to some NaN.
+  const Value nan(std::numeric_limits<double>::quiet_NaN());
+  Value decoded_nan;
+  decoded_nan.DecodeMemcomparableFormat(nan.EncodeMemcomparableFormat().data());
+  EXPECT_TRUE(std::isnan(decoded_nan.value.double_value));
+}
+
 TEST(ValueTest, EncodeMemcomparableFormat_WithVariousVarchars_MatchesExpectedEncoding) {
   Value v_a("a");
   Value v_ab("ab");
@@ -462,7 +502,7 @@ TEST(ValueTest, AsString_VariousValueTypes_ReturnsFormattedString) {
   std::string s_double = v_double.AsString();
   oss << v_stream;
 
-  EXPECT_EQ(s_null, "(unknown type)");
+  EXPECT_EQ(s_null, "NULL");
   EXPECT_EQ(s_int, "42");
   EXPECT_EQ(s_str, "\"x\"");
   EXPECT_EQ(s_double, "1.5");
@@ -507,17 +547,23 @@ TEST(ValueTest, Arithmetic_WithDoublesAndIntegers_CalculatesExpectedValues) {
 }
 
 TEST(ValueTest, EqualityOperator_WithDoubleEpsilon_TreatsCloseValuesAsEqual) {
+  // Fixed: equality is exact (plus NaN canonicalization).  The old 1e-9
+  // epsilon made == non-transitive, contradicted operator<, and disagreed
+  // with std::hash<Value>, breaking unordered containers on double keys.
   const Value one(1.0);
   const Value neighbor(std::nextafter(1.0, 2.0));
-  const Value beyond_eps(std::nextafter(1.0 + 2e-9, 2.0));
-  const Value within_eps(1.0 + 0.9e-9);
   const Value different(1.1);
+  const Value nan(std::numeric_limits<double>::quiet_NaN());
+  const Value neg_zero(-0.0);
+  const Value pos_zero(0.0);
 
-  EXPECT_TRUE(one == neighbor);
-  EXPECT_FALSE(one != neighbor);
-  EXPECT_TRUE(one < beyond_eps);
-  EXPECT_TRUE(one == within_eps);
+  EXPECT_FALSE(one == neighbor);
+  EXPECT_TRUE(one != neighbor);
+  EXPECT_TRUE(one < neighbor);
   EXPECT_FALSE(one == different);
+  EXPECT_TRUE(nan == nan);
+  EXPECT_TRUE(nan != one);
+  EXPECT_TRUE(neg_zero == pos_zero);
 }
 
 TEST(ValueTest, Hash_WithCloseDoubleValues_DifferentiatesDistinctBitPatterns) {
@@ -530,6 +576,47 @@ TEST(ValueTest, Hash_WithCloseDoubleValues_DifferentiatesDistinctBitPatterns) {
 
   EXPECT_NE(hasher(Value(a)), hasher(Value(b)));
   EXPECT_EQ(seen.count(Value(b)), 0U);
+}
+
+TEST(ValueTest, Hash_IsConsistentWithEquality) {
+  // (a == b) must imply hash(a) == hash(b) for unordered containers.
+  std::hash<Value> hasher;
+  const Value one(1.0);
+  const Value one_again(1.0);
+  const Value neg_zero(-0.0);
+  const Value pos_zero(0.0);
+  const Value nan(std::numeric_limits<double>::quiet_NaN());
+  const Value nan_again(-std::numeric_limits<double>::quiet_NaN());
+
+  EXPECT_TRUE(one == one_again);
+  EXPECT_EQ(hasher(one), hasher(one_again));
+  EXPECT_TRUE(neg_zero == pos_zero);
+  EXPECT_EQ(hasher(neg_zero), hasher(pos_zero));
+  EXPECT_TRUE(nan == nan_again);
+  EXPECT_EQ(hasher(nan), hasher(nan_again));
+
+  std::unordered_set<Value> seen;
+  seen.insert(nan);
+  seen.insert(neg_zero);
+  EXPECT_EQ(seen.size(), 2U);
+  EXPECT_EQ(seen.count(nan_again), 1U);
+  EXPECT_EQ(seen.count(pos_zero), 1U);
+}
+
+TEST(ValueTest, OrderingOperators_AreConsistentForNaN) {
+  // NaN must not satisfy <= / >= against numbers: the old `!>`/`!<` forms
+  // made `NaN <= 1.0` true while `NaN < 1.0` and `NaN == 1.0` were false.
+  const Value nan(std::numeric_limits<double>::quiet_NaN());
+  const Value one(1.0);
+
+  EXPECT_FALSE(nan <= one);
+  EXPECT_FALSE(nan >= one);
+  EXPECT_FALSE(nan < one);
+  EXPECT_FALSE(nan > one);
+  EXPECT_FALSE(one <= nan);
+  EXPECT_FALSE(one >= nan);
+  EXPECT_TRUE(one <= one);
+  EXPECT_TRUE(one >= one);
 }
 
 TEST(ValueTest, BitwiseAndModulo_WithIntegersAndDoubles_ComputesOrThrows) {
@@ -1051,6 +1138,40 @@ TEST(IntervalTest, ParseAndJustify_VariousIntervalFormats_ComputesExpectedValues
   EXPECT_EQ(j_zero.nanos, 0);
   EXPECT_EQ(j_days.months, 0);
   EXPECT_EQ(j_hours.days, 0);
+}
+
+TEST(IntervalTest, JustifyHours_WithHugeInterval_ThrowsInsteadOfWrapping) {
+  // Fixed: days * kDayNanos overflowed silently for parseable intervals,
+  // returning garbage (UB). It must now throw like the date layer does.
+  const IntervalValue huge = IntervalValue::Parse("P4000000000D");
+  EXPECT_THROW(std::ignore = huge.JustifyHours(), std::runtime_error);
+  EXPECT_THROW(std::ignore = huge.JustifyInterval(), std::runtime_error);
+}
+
+TEST(IntervalTest, Comparison_WithHugeIntervals_KeepsOrderAndEquality) {
+  // Fixed: operator== / <=> used to fold via mod-2^64 arithmetic, making
+  // distinct huge intervals "equal".
+  const IntervalValue big = IntervalValue::Parse("P296Y");
+  const IntervalValue small = IntervalValue::Parse("P295Y");
+  EXPECT_FALSE(big == small);
+  EXPECT_TRUE(small < big);
+  EXPECT_TRUE(big == big);
+
+  // Beyond ~3558 years the total nanoseconds no longer fit in int64_t.
+  EXPECT_THROW(std::ignore = IntervalValue::Parse("P99999999Y").TotalNanos(),
+               std::runtime_error);
+}
+
+TEST(IntervalTest, Arithmetic_WithHugeOperands_ThrowsOnOverflow) {
+  const IntervalValue huge = IntervalValue::Parse("P4000000000D");
+  EXPECT_THROW(std::ignore = huge + huge, std::runtime_error);
+  EXPECT_THROW(std::ignore = huge * 2, std::runtime_error);
+  EXPECT_THROW(std::ignore = -huge, std::runtime_error);
+
+  const IntervalValue normal = IntervalValue::Parse("P1D");
+  const IntervalValue sum = normal + normal;
+  EXPECT_EQ(sum.days, 2);
+  EXPECT_EQ(sum, IntervalValue(0, 2, 0));
 }
 
 TEST(ValueTypeTest, ValueTypeToString_AllEnumValues_ReturnsExpectedString) {

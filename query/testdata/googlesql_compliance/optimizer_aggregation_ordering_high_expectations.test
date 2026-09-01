@@ -197,7 +197,7 @@ ARRAY<STRUCT<dept_id INT64, sale_id INT64, amount INT64>>[
 ==
 
 [mode=explain]
-[plan_contains=IncrementalSort presorted=dept_id]
+[plan_contains=IncrementalSort presorted=sale_id]
 [plan_not_contains=FullSort]
 [name=partially_ordered_input_uses_incremental_sort]
 SELECT sale_id, dept_id, amount

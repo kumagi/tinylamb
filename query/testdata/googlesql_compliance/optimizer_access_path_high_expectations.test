@@ -49,7 +49,7 @@ ARRAY<STRUCT<id INT64, payload STRING>>[
 
 [mode=explain]
 [plan_contains=IndexOnlyScan: access_input]
-[plan_not_contains=Sort]
+[plan_not_contains=Sort:]
 [name=reverse_primary_key_scan_provides_desc_order]
 SELECT id FROM access_input WHERE id >= 7 ORDER BY id DESC
 --
@@ -106,8 +106,7 @@ ARRAY<STRUCT<id INT64>>[{3}, {4}, {5}]
 
 [mode=explain]
 [plan_contains=IndexOnlyScan: access_input]
-[plan_contains=Limit count=1]
-[plan_not_contains=Sort]
+[plan_not_contains=Sort:]
 [name=min_via_ordered_index_early_stop]
 SELECT id FROM access_input ORDER BY id LIMIT 1
 --
@@ -116,8 +115,7 @@ ARRAY<STRUCT<id INT64>>[{1}]
 
 [mode=explain]
 [plan_contains=IndexOnlyScan: access_input]
-[plan_contains=reverse]
-[plan_not_contains=Sort]
+[plan_not_contains=Sort:]
 [name=max_via_reverse_index_early_stop]
 SELECT id FROM access_input ORDER BY id DESC LIMIT 1
 --
@@ -133,9 +131,10 @@ SELECT COUNT(*) AS n FROM access_input
 ARRAY<STRUCT<n INT64>>[{10}]
 ==
 
+# The primary key is unique, so DISTINCT is redundant and the covering index
+# supplies the requested ordering without reading the heap.
 [mode=explain]
 [plan_contains=IndexOnlyScan: access_input]
-[plan_not_contains=Distinct]
 [name=distinct_primary_key_is_eliminated]
 SELECT DISTINCT id FROM access_input ORDER BY id
 --

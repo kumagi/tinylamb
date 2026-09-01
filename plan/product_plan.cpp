@@ -315,6 +315,17 @@ size_t ProductPlan::EmitRowCount() const {
   return std::min(left_src_->EmitRowCount(), right_src_->EmitRowCount());
 }
 
+bool ProductPlan::IsOrderedBy(const std::vector<Expression>& expressions,
+                              const std::vector<bool>& ascending) const {
+  // Semi/anti joins emit only probe rows while traversing the left child, so
+  // they preserve the left child's ordering property. Inner joins are not
+  // safe here because duplicate matches can interleave output rows.
+  if (!IsSemiOrAnti(kind_)) {
+    return false;
+  }
+  return left_src_->IsOrderedBy(expressions, ascending);
+}
+
 void ProductPlan::Dump(std::ostream& o, int indent) const {
   o << "Product: ";
   if (static_cast<uint8_t>(kind_) == kJoinKindSemi) {

@@ -24,6 +24,7 @@ void TopNExecutor::Materialize() {
   const size_t capacity = offset_ > static_cast<size_t>(-1) - limit_
                               ? static_cast<size_t>(-1)
                               : offset_ + limit_;
+  heap_capacity_ = capacity;
   auto precedes = [this](const Candidate& left, const Candidate& right) {
     for (size_t i = 0; i < left.keys.size(); ++i) {
       const Value& lhs = left.keys[i];
@@ -35,6 +36,15 @@ void TopNExecutor::Materialize() {
           return lhs.IsNull() == nulls_first;
         }
         continue;
+      }
+      // GoogleSQL ordering treats every NaN as a single value above +inf;
+      // the plain operator< returns false in both directions, which used to
+      // leave NaN rows in arbitrary arrival order and made ORDER BY + LIMIT
+      // (TopN) disagree with an unbounded SortExecutor.
+      if (lhs.type == ValueType::kDouble && rhs.type == ValueType::kDouble) {
+        const int cmp = CompareForOrderBy(lhs, rhs);
+        if (cmp == 0) { continue; }
+        return cmp < 0 ? keys_[i].ascending : !keys_[i].ascending;
       }
       if (lhs == rhs) { continue; }
       return keys_[i].ascending ? lhs < rhs : rhs < lhs;
@@ -92,6 +102,7 @@ void TopNExecutor::Materialize() {
       heap(worse_first);
 
   while (source_->Next(&row, &position)) {
+    ++input_rows_;
     Candidate candidate{.row = std::move(row),
                          .position = position,
                          .keys = {},
@@ -132,6 +143,13 @@ void TopNExecutor::Dump(std::ostream& output, int indent) const {
           << offset_ << (with_ties_ ? ", with ties" : "") << ")\n"
           << Indent(indent + 2);
   source_->Dump(output, indent + 2);
+  if (materialized_) {
+    output << "\n"
+           << Indent(indent)
+           << "TopN heap_capacity=" << heap_capacity_
+           << " input_rows=" << input_rows_
+           << " output_rows=" << (output_end_ - std::min(offset_, rows_.size()));
+  }
 }
 
 }  // namespace tinylamb

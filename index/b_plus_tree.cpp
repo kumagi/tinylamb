@@ -111,7 +111,10 @@ void BPlusTree::GrowTreeHeightIfNeeded(Transaction& txn) const {
       COERCE(root->Delete(txn, root_page.GetKey(0)));
     }
     root->SetLowestValue(txn, new_left->PageID());
-    root->InsertBranch(txn, new_right.key, new_right.child_pid);
+    // A separator larger than BranchPage accepts (kTooBigData) would leave an
+    // empty branch root that routes lookups to garbage page ids: surface the
+    // failure instead of silently corrupting the tree.
+    COERCE(root->InsertBranch(txn, new_right.key, new_right.child_pid));
     return;
   }
   assert(root->Type() == PageType::kLeafPage);
@@ -126,7 +129,7 @@ void BPlusTree::GrowTreeHeightIfNeeded(Transaction& txn) const {
   PageRef right_page = txn.GetPageManager()->GetPage(new_right.child_pid);
   root->PageTypeChange(txn, PageType::kBranchPage);
   root->SetLowestValue(txn, new_left->PageID());
-  root->InsertBranch(txn, new_right.key, new_right.child_pid);
+  COERCE(root->InsertBranch(txn, new_right.key, new_right.child_pid));
 
   // TODO(kumagi): fix low/high fences.
   COERCE(root->SetFoster(txn, FosterPair("", 0)));
@@ -739,7 +742,14 @@ Status BPlusTree::Delete(Transaction& txn, std::string_view key) const {
         COERCE(SetFosterRecursively(txn, next_page, new_foster, next_key));
         COERCE(curr->Delete(txn, next_key));
       } else {
-        // Make this foster child of left sibling.
+        // Make this foster child of left sibling.  PRODUCTION GUARD:
+        // next_idx == 0 made GetValue(-1) read the foster slot as a child
+        // pid (garbage page id), so require a real left sibling and skip
+        // the rebalance otherwise.
+        if (next_idx == 0) {
+          curr = std::move(next_page);  // Releases parent lock here.
+          break;
+        }
         PageRef new_foster_parent = txn.GetPageManager()->GetPage(
             curr->body.branch_page.GetValue(next_idx - 1));
         std::string_view next_key = curr->GetKey(curr->RowCount() - 1);

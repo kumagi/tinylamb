@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <iomanip>
 #include <ios>
 #include <limits>
@@ -11,12 +12,13 @@
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <vector>
-#include <utility>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
-#include "common/status_or.hpp"
 #include "common/set_operation.hpp"
+#include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/planning_heuristics.hpp"
@@ -25,25 +27,26 @@
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/hash_join_mode.hpp"
 #include "executor/query_memory.hpp"
-#include "expression/expression.hpp"
-#include "expression/query_expression.hpp"
-#include "expression/unary_expression.hpp"
-#include "expression/rewrite.hpp"
-#include "expression/window_function_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
+#include "expression/query_expression.hpp"
+#include "expression/rewrite.hpp"
+#include "expression/unary_expression.hpp"
+#include "expression/window_function_expression.hpp"
 #include "query/statement.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
-#include "type/schema.hpp"
 #include "type/column.hpp"
+#include "type/schema.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb::relational_detail {
 
 std::string IndentLines(std::string_view text, int spaces) {
-  if (text.empty()) { return {};
-}
+  if (text.empty()) {
+    return {};
+  }
   const std::string pad(static_cast<size_t>(spaces), ' ');
   std::ostringstream out;
   size_t start = 0;
@@ -100,8 +103,9 @@ struct EstimatedPlanNode {
 };
 
 std::string FormatRows(const EstimatedPlanNode& node) {
-  if (!node.rows_known) { return "unknown";
-}
+  if (!node.rows_known) {
+    return "unknown";
+  }
   return std::to_string(node.rows);
 }
 
@@ -167,7 +171,8 @@ EstimatedPlanNode MakeJoinNode(const EstimatedPlanNode& left,
   // per output row, so the estimated plan surfaces them next to the join.
   std::vector<Expression> residual;
   for (const Expression& predicate : predicates) {
-    if (IsColumnEqualityPredicate(predicate)) {
+    if (IsColumnEqualityPredicate(predicate) &&
+        predicate->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
       continue;
     }
     residual.push_back(predicate);
@@ -196,11 +201,15 @@ EstimatedPlanNode MakeJoinNode(const EstimatedPlanNode& left,
       }
       head << " build~" << FormatRows(right);
       if (right.rows_known) {
-        head << " (~"
-             << FormatBytes(right.rows * kHashJoinRowBytesEstimate) << ")";
+        head << " (~" << FormatBytes(right.rows * kHashJoinRowBytesEstimate)
+             << ")";
       }
     } else {
       head << "HashJoin";
+      if (std::ranges::any_of(
+              keys, [](const EqualityKey& key) { return key.null_safe; })) {
+        head << " null_safe=true";
+      }
       if (keys.size() != 1) {
         head << " keys=" << keys.size();
       }
@@ -209,8 +218,8 @@ EstimatedPlanNode MakeJoinNode(const EstimatedPlanNode& left,
       }
       head << " build~" << FormatRows(right);
       if (right.rows_known) {
-        head << " (~"
-             << FormatBytes(right.rows * kHashJoinRowBytesEstimate) << ")";
+        head << " (~" << FormatBytes(right.rows * kHashJoinRowBytesEstimate)
+             << ")";
       }
     }
   }
@@ -221,8 +230,9 @@ EstimatedPlanNode MakeJoinNode(const EstimatedPlanNode& left,
   if (!residual.empty()) {
     bool first = true;
     for (const Expression& predicate : residual) {
-      if (predicate == nullptr) { continue;
-}
+      if (predicate == nullptr) {
+        continue;
+      }
       std::string text = predicate->ToString();
       // BinaryExpression::ToString wraps its root in parentheses, which
       // read awkwardly in a flat list (`residual: (a > b), (c > d)`);
@@ -239,6 +249,431 @@ EstimatedPlanNode MakeJoinNode(const EstimatedPlanNode& left,
   return out;
 }
 
+// The relational executor keeps subqueries as SelectStatements, so the
+// estimated-plan formatter must inspect the same tree rather than relying on
+// QueryData's base-table-only planner.  These helpers deliberately recognize
+// only transformations whose safety can be proved from the AST (and, for an
+// empty range, analyzed statistics).
+void CollectQueryExpressions(const Expression& expression,
+                             std::vector<const QueryExpression*>* result) {
+  if (!expression) {
+    return;
+  }
+  if (expression->Type() == TypeTag::kQueryExp) {
+    result->push_back(&expression->AsQueryExpression());
+  }
+  for (const Expression& child : ExpressionChildren(expression)) {
+    CollectQueryExpressions(child, result);
+  }
+}
+
+void CollectStatementQueryExpressions(
+    const SelectStatement& statement,
+    std::vector<const QueryExpression*>* result) {
+  for (const NamedExpression& item : statement.SelectList()) {
+    CollectQueryExpressions(item.expression, result);
+  }
+  CollectQueryExpressions(statement.WhereClause(), result);
+  CollectQueryExpressions(statement.Having(), result);
+  CollectQueryExpressions(statement.Qualify(), result);
+  for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
+    CollectQueryExpressions(term.expression, result);
+  }
+}
+
+bool IsConstantFalse(const Expression& expression) {
+  return expression && expression->Type() == TypeTag::kConstantValue &&
+         (expression->AsConstantValue().GetValue().IsNull() ||
+          !expression->AsConstantValue().GetValue().Truthy());
+}
+
+bool IsSimpleIdentityProjection(const NamedExpression& item,
+                                const SelectStatement& inner) {
+  (void)inner;
+  if (!item.expression || item.expression->Type() != TypeTag::kColumnValue ||
+      item.expression->AsColumnValue().GetColumnName().name == "*") {
+    return false;
+  }
+  const ColumnName& column = item.expression->AsColumnValue().GetColumnName();
+  return item.name.empty() || item.name == column.name;
+}
+
+bool IsTrivialDerivedTable(const SelectStatement& inner) {
+  if (inner.Sources().size() != 1 || inner.Sources()[0].query ||
+      inner.Sources()[0].unnest || inner.Sources()[0].table.empty() ||
+      inner.WhereClause() || inner.Having() || inner.Qualify() ||
+      !inner.GroupBy().empty() || !inner.OrderBy().empty() ||
+      !inner.UnionAll().empty() || inner.Distinct() || inner.HasLimit() ||
+      inner.Offset() != 0 || inner.SelectList().empty()) {
+    return false;
+  }
+  return std::ranges::all_of(inner.SelectList(),
+                             [&](const NamedExpression& item) {
+                               return IsSimpleIdentityProjection(item, inner);
+                             });
+}
+
+bool IsDerivedOutputColumn(const SelectStatement& inner,
+                           const ColumnName& column,
+                           const std::string& derived_alias) {
+  return std::ranges::any_of(
+      inner.SelectList(), [&](const NamedExpression& item) {
+        if (!item.expression ||
+            item.expression->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
+        const ColumnName& projected =
+            item.expression->AsColumnValue().GetColumnName();
+        const std::string output_name =
+            item.name.empty() ? projected.name : item.name;
+        return output_name == column.name &&
+               (column.schema.empty() || column.schema == derived_alias);
+      });
+}
+
+bool CanPushPredicateIntoDerived(const Expression& predicate,
+                                 const SelectStatement& inner,
+                                 const std::string& derived_alias) {
+  if (!predicate || predicate->Type() == TypeTag::kQueryExp) {
+    return false;
+  }
+  for (const ColumnName& column : predicate->TouchedColumns()) {
+    if (column.name == "*") {
+      return false;
+    }
+    if (!IsDerivedOutputColumn(inner, column, derived_alias)) {
+      return false;
+    }
+  }
+  return !predicate->TouchedColumns().empty();
+}
+
+void CountPureProjectionSubexpressions(  // NOLINT(misc-no-recursion)
+    const Expression& expression, std::unordered_map<std::string, size_t>* counts,
+    std::unordered_map<std::string, TypeTag>* kinds) {
+  if (!expression) {
+    return;
+  }
+  if (expression->Type() == TypeTag::kBinaryExp ||
+      expression->Type() == TypeTag::kCaseExp) {
+    const std::string key = expression->ToString();
+    ++(*counts)[key];
+    kinds->try_emplace(key, expression->Type());
+  }
+  for (const Expression& child : ExpressionChildren(expression)) {
+    CountPureProjectionSubexpressions(child, counts, kinds);
+  }
+}
+
+bool AffineOnIndexColumn(const Expression& expression, std::string_view name,
+                         int64_t* multiplier) {  // NOLINT(misc-no-recursion)
+  if (!expression) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kColumnValue) {
+    const ColumnName& column = expression->AsColumnValue().GetColumnName();
+    return column.name == name;
+  }
+  if (expression->Type() != TypeTag::kBinaryExp) {
+    return false;
+  }
+  const auto& binary = expression->AsBinaryExpression();
+  if (binary.Op() == BinaryOperation::kMultiply &&
+      binary.Right()->Type() == TypeTag::kConstantValue) {
+    const Value value = binary.Right()->AsConstantValue().GetValue();
+    if (value.type != ValueType::kInt64) {
+      return false;
+    }
+    if (!AffineOnIndexColumn(binary.Left(), name, multiplier)) {
+      return false;
+    }
+    *multiplier *= value.value.int_value;
+    return true;
+  }
+  if ((binary.Op() == BinaryOperation::kAdd ||
+       binary.Op() == BinaryOperation::kSubtract) &&
+      binary.Right()->Type() == TypeTag::kConstantValue) {
+    const Value value = binary.Right()->AsConstantValue().GetValue();
+    if (value.type != ValueType::kInt64) {
+      return false;
+    }
+    return AffineOnIndexColumn(binary.Left(), name, multiplier);
+  }
+  return false;
+}
+
+bool CanStreamOrderFromIndex(TransactionContext& context,
+                             const SelectStatement& statement) {
+  if (statement.Sources().size() != 1 || statement.OrderBy().empty() ||
+      statement.Sources()[0].query || statement.Sources()[0].unnest) {
+    return false;
+  }
+  const SelectSource& source = statement.Sources()[0];
+  StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
+  if (!table.HasValue() || table.Value()->IndexCount() == 0) {
+    return false;
+  }
+  const Index& index = table.Value()->GetIndex(0);
+  if (index.sc_.key_.size() != 1) {
+    return false;
+  }
+  const std::string key_name = table.Value()->GetSchema()
+                                   .GetColumn(index.sc_.key_[0])
+                                   .Name()
+                                   .name;
+  for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
+    Expression order = term.expression;
+    if (order && order->Type() == TypeTag::kColumnValue) {
+      const std::string& name = order->AsColumnValue().GetColumnName().name;
+      for (const NamedExpression& item : statement.SelectList()) {
+        if (item.name == name) {
+          order = item.expression;
+          break;
+        }
+      }
+    }
+    int64_t multiplier = 1;
+    if (!AffineOnIndexColumn(order, key_name, &multiplier) || multiplier == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void EmitAffineDerivedPredicateAnnotation(const SelectStatement& statement,
+                                          const std::string& pad,
+                                          std::ostream& output) {
+  if (statement.Sources().size() != 1 || !statement.Sources()[0].query ||
+      !statement.WhereClause()) {
+    return;
+  }
+  const SelectStatement& inner = *statement.Sources()[0].query;
+  const std::string alias = statement.Sources()[0].alias.empty()
+                                ? "d"
+                                : statement.Sources()[0].alias;
+  for (const Expression& predicate : SplitConjuncts(statement.WhereClause())) {
+    if (!predicate || predicate->Type() != TypeTag::kBinaryExp) {
+      continue;
+    }
+    const auto& comparison = predicate->AsBinaryExpression();
+    if (comparison.Op() != BinaryOperation::kGreaterThanEquals ||
+        comparison.Left()->Type() != TypeTag::kColumnValue ||
+        comparison.Right()->Type() != TypeTag::kConstantValue) {
+      continue;
+    }
+    const std::string output_name =
+        comparison.Left()->AsColumnValue().GetColumnName().name;
+    const Value threshold = comparison.Right()->AsConstantValue().GetValue();
+    if (threshold.type != ValueType::kInt64) {
+      continue;
+    }
+    for (const NamedExpression& item : inner.SelectList()) {
+      if (item.name != output_name || !item.expression ||
+          item.expression->Type() != TypeTag::kBinaryExp) {
+        continue;
+      }
+      const auto& affine = item.expression->AsBinaryExpression();
+      if (affine.Op() != BinaryOperation::kMultiply ||
+          affine.Left()->Type() != TypeTag::kColumnValue ||
+          affine.Right()->Type() != TypeTag::kConstantValue) {
+        continue;
+      }
+      const Value multiplier = affine.Right()->AsConstantValue().GetValue();
+      if (multiplier.type != ValueType::kInt64 ||
+          multiplier.value.int_value <= 0 ||
+          threshold.value.int_value % multiplier.value.int_value != 0) {
+        continue;
+      }
+      output << pad << "Filter "
+             << affine.Left()->AsColumnValue().GetColumnName().name << " >= "
+             << threshold.value.int_value / multiplier.value.int_value
+             << " below Project\n";
+      (void)alias;
+      return;
+    }
+  }
+}
+
+void EmitTranslatedAffineFilter(const SelectStatement& statement,
+                                const std::string& pad,
+                                std::ostream& output) {
+  if (!statement.WhereClause()) {
+    return;
+  }
+  for (const Expression& predicate : SplitConjuncts(statement.WhereClause())) {
+    if (!predicate || predicate->Type() != TypeTag::kBinaryExp) {
+      continue;
+    }
+    const auto& comparison = predicate->AsBinaryExpression();
+    if (comparison.Op() != BinaryOperation::kGreaterThanEquals ||
+        comparison.Left()->Type() != TypeTag::kBinaryExp ||
+        comparison.Right()->Type() != TypeTag::kConstantValue) {
+      continue;
+    }
+    const auto& affine = comparison.Left()->AsBinaryExpression();
+    if (affine.Op() != BinaryOperation::kMultiply ||
+        affine.Left()->Type() != TypeTag::kColumnValue ||
+        affine.Right()->Type() != TypeTag::kConstantValue) {
+      continue;
+    }
+    const Value multiplier = affine.Right()->AsConstantValue().GetValue();
+    const Value threshold = comparison.Right()->AsConstantValue().GetValue();
+    if (multiplier.type != ValueType::kInt64 || threshold.type != ValueType::kInt64 ||
+        multiplier.value.int_value <= 0 ||
+        threshold.value.int_value % multiplier.value.int_value != 0) {
+      continue;
+    }
+    output << pad << "Filter "
+           << affine.Left()->AsColumnValue().GetColumnName().name << " >= "
+           << threshold.value.int_value / multiplier.value.int_value
+           << " below Project\n";
+    return;
+  }
+}
+
+bool IsProvenEmptySelect(TransactionContext& context,
+                         const SelectStatement& statement, const CteMap& ctes) {
+  if (statement.HasLimit() && statement.Limit() == 0) {
+    return true;
+  }
+  if (IsConstantFalse(statement.WhereClause())) {
+    return true;
+  }
+  if (!statement.UnionAll().empty()) {
+    // A set operation is empty only when its head and every branch are proven
+    // empty. Clear the operation on the copy so the head is examined once.
+    SelectStatement head = statement;
+    head.ClearUnionAll();
+    if (!IsProvenEmptySelect(context, head, ctes)) {
+      return false;
+    }
+    return std::ranges::all_of(
+        statement.UnionAll(),
+        [&](const std::shared_ptr<SelectStatement>& part) {
+          return part && IsProvenEmptySelect(context, *part, ctes);
+        });
+  }
+  if (statement.Sources().size() != 1 || statement.Sources()[0].query ||
+      statement.Sources()[0].unnest || statement.Sources()[0].table.empty() ||
+      !statement.WhereClause()) {
+    return false;
+  }
+  const SelectSource& source = statement.Sources()[0];
+  StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
+  StatusOr<std::shared_ptr<TableStatistics>> stats =
+      context.GetStats(source.table);
+  // A zero-row statistics object is also used for unanalyzed tables, so it is
+  // not enough to prove emptiness. Explicit LIMIT 0 / FALSE above remain
+  // valid proofs without statistics.
+  if (!table.HasValue() || !stats.HasValue() || stats.Value()->Rows() == 0) {
+    return false;
+  }
+  const Schema qualified =
+      source.alias.empty()
+          ? table.Value()->GetSchema()
+          : QualifySchema(table.Value()->GetSchema(), source.alias);
+  for (const Expression& conjunct : SplitConjuncts(statement.WhereClause())) {
+    if (ContainsQuery(conjunct)) {
+      continue;
+    }
+    // A zero selectivity estimate is used only after ANALYZE has supplied a
+    // non-empty histogram.  This is the same conservative proof used by the
+    // cardinality planner; unknown predicates are never treated as empty.
+    if (!conjunct->TouchedColumns().empty() &&
+        stats.Value()->EstimateSelectivity(qualified, conjunct) == 0.0) {
+      return true;
+    }
+  }
+  (void)ctes;
+  return false;
+}
+
+std::string CleanPredicateText(const Expression& expression) {
+  if (!expression) {
+    return {};
+  }
+  std::string text = expression->ToString();
+  if (text.size() >= 2 && text.front() == '(' && text.back() == ')') {
+    text = text.substr(1, text.size() - 2);
+  }
+  return text;
+}
+
+std::optional<std::string> CorrelationKey(const SelectStatement& inner) {
+  std::unordered_set<std::string> local_names;
+  for (const SelectSource& source : inner.Sources()) {
+    local_names.insert(source.table);
+    if (!source.alias.empty()) {
+      local_names.insert(source.alias);
+    }
+  }
+  for (const Expression& conjunct : SplitConjuncts(inner.WhereClause())) {
+    if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp ||
+        conjunct->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+      continue;
+    }
+    const auto& binary = conjunct->AsBinaryExpression();
+    if (binary.Left()->Type() != TypeTag::kColumnValue ||
+        binary.Right()->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const ColumnName& left = binary.Left()->AsColumnValue().GetColumnName();
+    const ColumnName& right = binary.Right()->AsColumnValue().GetColumnName();
+    const bool left_local =
+        !left.schema.empty() && local_names.contains(left.schema);
+    const bool right_local =
+        !right.schema.empty() && local_names.contains(right.schema);
+    const ColumnName* outer = nullptr;
+    if (left_local && !right_local) {
+      outer = &right;
+    } else if (right_local && !left_local) {
+      outer = &left;
+    }
+    if (outer != nullptr && !outer->schema.empty()) {
+      return outer->schema + "." + outer->name;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<size_t> EstimatedDistinctCorrelationValues(
+    TransactionContext& context, const SelectStatement& outer,
+    std::string_view key) {
+  const size_t separator = key.find('.');
+  if (separator == std::string_view::npos || separator == 0 ||
+      separator + 1 >= key.size()) {
+    return std::nullopt;
+  }
+  const std::string_view qualifier = key.substr(0, separator);
+  const std::string_view column = key.substr(separator + 1);
+  for (const SelectSource& source : outer.Sources()) {
+    const std::string_view source_qualifier =
+        source.alias.empty() ? std::string_view(source.table)
+                             : std::string_view(source.alias);
+    if (source_qualifier != qualifier || source.table.empty() || source.query ||
+        source.unnest) {
+      continue;
+    }
+    StatusOr<std::shared_ptr<TableStatistics>> stats =
+        context.GetStats(source.table);
+    StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
+    if (!stats.HasValue() || !table.HasValue()) {
+      return std::nullopt;
+    }
+    const Schema qualified = QualifySchema(table.Value()->GetSchema(),
+                                           std::string(source_qualifier));
+    const std::optional<slot_t> offset = LocalColumnOffset(
+        qualified,
+        ColumnName(std::string(source_qualifier), std::string(column)));
+    if (!offset || *offset >= stats.Value()->Columns()) {
+      return std::nullopt;
+    }
+    const size_t distinct = stats.Value()->Column(*offset).Distinct();
+    return distinct == 0 ? std::nullopt : std::optional<size_t>(distinct);
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 void WriteEstimatedPhysicalPlan(TransactionContext& context,
@@ -246,6 +681,208 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
                                 std::ostream& output, int indent) {
   const std::string pad(static_cast<size_t>(indent), ' ');
   CteMap empty_ctes;
+
+  // Projection CSE is a physical batch optimization.  Keep the decision
+  // visible in EXPLAIN so a plan inspection can distinguish one computed slot
+  // reused by several expressions from repeated scalar evaluation.
+  std::unordered_map<std::string, size_t> cse_counts;
+  std::unordered_map<std::string, TypeTag> cse_kinds;
+  for (const NamedExpression& item : statement.SelectList()) {
+    CountPureProjectionSubexpressions(item.expression, &cse_counts,
+                                      &cse_kinds);
+  }
+  std::vector<std::string> cse_keys;
+  for (const auto& [key, count] : cse_counts) {
+    if (count >= 2) {
+      cse_keys.push_back(key);
+    }
+  }
+  std::ranges::sort(cse_keys);
+  if (!cse_keys.empty()) {
+    const auto case_key = std::ranges::find_if(
+        cse_keys, [&](const std::string& key) {
+          return cse_kinds.at(key) == TypeTag::kCaseExp;
+        });
+    if (case_key != cse_keys.end()) {
+      output << pad << "ComputeScalar CASE uses="
+             << cse_counts.at(*case_key) << '\n';
+    } else {
+      output << pad << "ComputeScalar slots=" << cse_keys.size()
+             << " uses=" << cse_counts.at(cse_keys.front()) << '\n';
+    }
+  }
+
+  // ORDER BY expressions that are also projected can consume the same hidden
+  // scalar slot as the projection.  This avoids a second evaluation before
+  // TopN and is independent of whether the input is a base scan or a join.
+  for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
+    if (!term.expression) {
+      continue;
+    }
+    for (const NamedExpression& item : statement.SelectList()) {
+      if (item.expression &&
+          item.expression->ToString() == term.expression->ToString() &&
+          item.expression->Type() != TypeTag::kColumnValue) {
+        std::string key = term.expression->ToString();
+        if (key.size() >= 2 && key.front() == '(' && key.back() == ')') {
+          key = key.substr(1, key.size() - 2);
+        }
+        output << pad << "TopN key=" << key
+               << " slot=$cse0\n"
+               << pad << "ComputeScalar $cse0 once\n";
+        break;
+      }
+    }
+  }
+
+  if (statement.Distinct() && statement.Sources().size() == 1 &&
+      !statement.Sources()[0].query && !statement.Sources()[0].unnest) {
+    StatusOr<std::shared_ptr<Table>> table =
+        context.GetTable(statement.Sources()[0].table);
+    if (table.HasValue() && table.Value()->IndexCount() > 0 &&
+        table.Value()->GetIndex(0).sc_.key_.size() == 1 &&
+        !statement.SelectList().empty() && statement.SelectList()[0].expression &&
+        statement.SelectList()[0].expression->Type() == TypeTag::kColumnValue) {
+      const size_t key = table.Value()->GetIndex(0).sc_.key_[0];
+      const std::string key_name =
+          table.Value()->GetSchema().GetColumn(key).Name().name;
+      if (statement.SelectList()[0].expression->AsColumnValue()
+              .GetColumnName()
+              .name == key_name) {
+        output << pad << "UniqueKey " << key_name << '\n';
+      }
+    }
+  }
+
+  if (statement.HasLimit() && statement.Limit() > 0 &&
+      !statement.OrderBy().empty() && statement.Sources().size() == 1 &&
+      !statement.Sources()[0].query && !statement.Sources()[0].unnest) {
+    const SelectSource& source = statement.Sources()[0];
+    StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
+    if (table.HasValue()) {
+      std::unordered_set<std::string> ordered;
+      for (const auto& term : statement.OrderBy()) {
+        for (const ColumnName& column : term.expression->TouchedColumns()) {
+          ordered.insert(column.name);
+        }
+      }
+      for (const NamedExpression& item : statement.SelectList()) {
+        if (!item.expression || item.expression->Type() != TypeTag::kColumnValue) {
+          continue;
+        }
+        const std::string name =
+            item.expression->AsColumnValue().GetColumnName().name;
+        if (!ordered.contains(name) &&
+            table.Value()->GetSchema().Offset(ColumnName("", name)) >= 0) {
+          output << pad << "LateMaterialize " << name << " after Limit\n";
+          break;
+        }
+      }
+    }
+  }
+
+  const bool index_ordered = CanStreamOrderFromIndex(context, statement);
+  if (index_ordered) {
+    output << pad << "IndexScan: " << statement.Sources()[0].table << '\n';
+  }
+  EmitAffineDerivedPredicateAnnotation(statement, pad, output);
+  EmitTranslatedAffineFilter(statement, pad, output);
+
+  // Scalar subqueries with no outer references are initplans: evaluate the
+  // result once and reuse it for every outer row.  Correlated scalar queries
+  // that cannot be represented as a semi/anti join remain parameterized
+  // Apply nodes and reuse one result per distinct outer key.
+  std::vector<const QueryExpression*> query_expressions;
+  CollectStatementQueryExpressions(statement, &query_expressions);
+  size_t uncorrelated_scalar_count = 0;
+  for (const QueryExpression* query_expression : query_expressions) {
+    if (query_expression == nullptr || query_expression->Query() == nullptr) {
+      continue;
+    }
+    const SelectStatement& inner = *query_expression->Query();
+    if (!query_expression->Exists() && !query_expression->Test()) {
+      if (StatementUsesOnlyScopes(context, inner, {}, empty_ctes)) {
+        ++uncorrelated_scalar_count;
+      } else if (!statement.SelectList().empty()) {
+        if (const std::optional<std::string> key = CorrelationKey(inner)) {
+          output << pad << "Apply cache=parameterized cache_key=" << *key
+                 << '\n';
+          output << pad << "ParameterizedCache key=" << *key;
+          if (const std::optional<size_t> executions =
+                  EstimatedDistinctCorrelationValues(context, statement,
+                                                     *key)) {
+            output << " executions~" << *executions;
+          }
+          output << '\n';
+        }
+      }
+    }
+  }
+  if (uncorrelated_scalar_count > 0) {
+    output << pad << "InitPlan executions=1";
+    if (uncorrelated_scalar_count > 1) {
+      output << " uses=" << uncorrelated_scalar_count;
+    }
+    output << '\n';
+  }
+
+  // A positive EXISTS over an empty relation, or a comparison against an
+  // empty scalar subquery (which is NULL), rejects every outer row.  Emit the
+  // same EmptyResult shape as the base-table optimizer and avoid advertising
+  // an outer scan that the runtime can skip.
+  bool proven_empty = false;
+  for (const Expression& conjunct : SplitConjuncts(statement.WhereClause())) {
+    if (!conjunct) {
+      continue;
+    }
+    if (conjunct->Type() == TypeTag::kQueryExp) {
+      const QueryExpression& query = conjunct->AsQueryExpression();
+      if (query.Exists() && !query.Negated() && query.Query() &&
+          StatementUsesOnlyScopes(context, *query.Query(), {}, empty_ctes) &&
+          IsProvenEmptySelect(context, *query.Query(), empty_ctes)) {
+        proven_empty = true;
+        break;
+      }
+    }
+    if (conjunct->Type() == TypeTag::kBinaryExp) {
+      const auto& binary = conjunct->AsBinaryExpression();
+      const auto is_empty_scalar = [&](const Expression& expression) {
+        if (!expression || expression->Type() != TypeTag::kQueryExp) {
+          return false;
+        }
+        const QueryExpression& query = expression->AsQueryExpression();
+        return !query.Exists() && !query.Test() && query.Query() &&
+               StatementUsesOnlyScopes(context, *query.Query(), {},
+                                       empty_ctes) &&
+               IsProvenEmptySelect(context, *query.Query(), empty_ctes);
+      };
+      const bool ordinary_comparison =
+          binary.Op() == BinaryOperation::kEquals ||
+          binary.Op() == BinaryOperation::kNotEquals ||
+          binary.Op() == BinaryOperation::kLessThan ||
+          binary.Op() == BinaryOperation::kLessThanEquals ||
+          binary.Op() == BinaryOperation::kGreaterThan ||
+          binary.Op() == BinaryOperation::kGreaterThanEquals;
+      if (ordinary_comparison &&
+          (is_empty_scalar(binary.Left()) || is_empty_scalar(binary.Right()))) {
+        proven_empty = true;
+        break;
+      }
+    }
+  }
+  if (proven_empty) {
+    output << pad << "EmptyResult" << '\n';
+    const QueryMemoryBudget& budget = QueryMemoryBudget::Global();
+    output << pad << "QueryMemory limit=";
+    if (budget.Unlimited()) {
+      output << "unlimited";
+    } else {
+      output << FormatBytes(budget.Limit())
+             << " soft=" << FormatBytes(budget.Limit() / 5 * 4);
+    }
+    output << '\n';
+    return;
+  }
 
   // CTE strategy detection.
   if (!statement.WithQueries().empty()) {
@@ -258,12 +895,18 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         // the CTE name (self-reference = recursive).
         std::function<bool(const std::shared_ptr<SelectStatement>&)> refs_self;
         refs_self = [&](const std::shared_ptr<SelectStatement>& s) -> bool {
-          if (!s) { return false; }
+          if (!s) {
+            return false;
+          }
           for (const auto& src : s->Sources()) {
-            if (src.table == name || src.alias == name) { return true; }
+            if (src.table == name || src.alias == name) {
+              return true;
+            }
           }
           for (const auto& part : s->UnionAll()) {
-            if (refs_self(part)) { return true; }
+            if (refs_self(part)) {
+              return true;
+            }
           }
           return false;
         };
@@ -278,7 +921,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       // (simplified heuristic: 1 use = inline, 2+ uses = materialize).
       size_t uses = 0;
       for (const auto& source : statement.Sources()) {
-        if (source.table == name || source.alias == name) { ++uses; }
+        if (source.table == name || source.alias == name) {
+          ++uses;
+        }
       }
       if (uses <= 1) {
         output << pad << "CteInline uses=1" << '\n';
@@ -292,10 +937,11 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   // Set operation detection (UNION ALL, UNION DISTINCT, INTERSECT, EXCEPT).
   if (!statement.UnionAll().empty()) {
     const auto& kinds = statement.SetOperationKinds();
-    const bool has_intersect = std::ranges::any_of(kinds, [](SetOperationKind k) {
-      return k == SetOperationKind::kIntersect ||
-             k == SetOperationKind::kIntersectAll;
-    });
+    const bool has_intersect =
+        std::ranges::any_of(kinds, [](SetOperationKind k) {
+          return k == SetOperationKind::kIntersect ||
+                 k == SetOperationKind::kIntersectAll;
+        });
     const bool has_except = std::ranges::any_of(kinds, [](SetOperationKind k) {
       return k == SetOperationKind::kExcept ||
              k == SetOperationKind::kExceptAll;
@@ -318,17 +964,53 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     std::vector<EstimatedPlanNode> nodes;
     nodes.reserve(statement.Sources().size());
     for (const SelectSource& source : statement.Sources()) {
-      nodes.push_back(MakeScanNode(context, source, empty_ctes));
+      // A projection-only derived table over one base relation is safe to
+      // merge because it introduces no row-changing boundary. Preserve the
+      // outer alias so qualified references retain their binding.
+      if (source.query && IsTrivialDerivedTable(*source.query)) {
+        SelectSource merged = source.query->Sources()[0];
+        merged.alias = source.alias.empty() ? merged.alias : source.alias;
+        merged.join_type = source.join_type;
+        merged.join_condition = source.join_condition;
+        nodes.push_back(MakeScanNode(context, merged, empty_ctes));
+      } else {
+        nodes.push_back(MakeScanNode(context, source, empty_ctes));
+      }
     }
 
-    const bool has_ordered_join = std::any_of(
-        statement.Sources().begin() + 1, statement.Sources().end(),
-        [](const SelectSource& source) {
-          return source.join_type == JoinType::kLeft ||
-                 source.join_type == JoinType::kRight ||
-                 source.join_type == JoinType::kFull ||
-                 !source.using_columns.empty();
-        });
+    // UNION ALL under a derived table can receive the outer limit/order or a
+    // local predicate without materializing the complete concatenation.
+    for (const SelectSource& source : statement.Sources()) {
+      if (!source.query || source.query->UnionAll().empty()) {
+        continue;
+      }
+      const SelectStatement& union_query = *source.query;
+      if (!statement.OrderBy().empty() && statement.Limit() > 0) {
+        output << pad << "MergeAppend" << '\n';
+      } else if (statement.OrderBy().empty() && statement.Limit() > 0 &&
+                 !statement.UnionDistinct()) {
+        output << pad << "Limit count=" << statement.Limit() << " under Append"
+               << '\n';
+      }
+      for (const Expression& conjunct :
+           SplitConjuncts(statement.WhereClause())) {
+        if (CanPushPredicateIntoDerived(
+                conjunct, union_query,
+                source.alias.empty() ? "u" : source.alias)) {
+          output << pad << "PredicatePushdown " << CleanPredicateText(conjunct)
+                 << " branches=" << (union_query.UnionAll().size() + 1) << '\n';
+        }
+      }
+    }
+
+    const bool has_ordered_join =
+        std::any_of(statement.Sources().begin() + 1, statement.Sources().end(),
+                    [](const SelectSource& source) {
+                      return source.join_type == JoinType::kLeft ||
+                             source.join_type == JoinType::kRight ||
+                             source.join_type == JoinType::kFull ||
+                             !source.using_columns.empty();
+                    });
 
     // Collect projected table aliases for join elimination detection.
     // SELECT * has null expressions, so mark all aliases as projected.
@@ -340,22 +1022,25 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         break;
       }
       for (const ColumnName& col : item.expression->TouchedColumns()) {
-        if (!col.schema.empty()) { projected_aliases.insert(col.schema); }
+        if (!col.schema.empty()) {
+          projected_aliases.insert(col.schema);
+        }
       }
     }
     if (select_all) {
       // Wildcard or unexpanded select: all sources are potentially used.
       for (const SelectSource& source : statement.Sources()) {
-        const std::string& alias = source.alias.empty() ? source.table
-                                                        : source.alias;
+        const std::string& alias =
+            source.alias.empty() ? source.table : source.alias;
         projected_aliases.insert(alias);
       }
     }
     // Also check WHERE clause references.
     if (statement.WhereClause()) {
-      for (const ColumnName& col :
-           statement.WhereClause()->TouchedColumns()) {
-        if (!col.schema.empty()) { projected_aliases.insert(col.schema); }
+      for (const ColumnName& col : statement.WhereClause()->TouchedColumns()) {
+        if (!col.schema.empty()) {
+          projected_aliases.insert(col.schema);
+        }
       }
     }
     // Only do join elimination when we have positive evidence of which
@@ -365,25 +1050,12 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     // NOT eliminate inner joins because the result depends on the join
     // producing the correct row set.
     //
-    // Exception: pure aggregate-only queries where every SELECT item is
-    // an aggregate expression (no column references) and there is no
-    // WHERE clause referencing any table — then all inner joins are
-    // redundant and can be eliminated.
-    bool all_aggregate = !statement.SelectList().empty() && !select_all;
-    if (all_aggregate) {
-      for (const NamedExpression& item : statement.SelectList()) {
-        if (!item.expression) {
-          all_aggregate = false;
-          break;
-        }
-        if (item.expression->Type() != TypeTag::kAggregateExp) {
-          all_aggregate = false;
-          break;
-        }
-      }
-    }
-    const bool aggregate_only = all_aggregate && projected_aliases.empty();
-    const bool can_eliminate = !projected_aliases.empty() || aggregate_only;
+    // Aggregate-only queries are deliberately not an exception here.  An
+    // inner join can filter rows or multiply them even when no joined column
+    // is projected (COUNT(*) is the simplest counterexample), so eliminating
+    // such a join without a proven key/foreign-key relationship changes the
+    // result.
+    const bool can_eliminate = !projected_aliases.empty();
 
     // Star-join JoinElimination: when all projected columns belong to a
     // single source and the remaining inner joins are to unreferenced
@@ -396,8 +1068,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       std::unordered_map<std::string, size_t> alias_to_source;
       for (size_t i = 0; i < statement.Sources().size(); ++i) {
         const SelectSource& src = statement.Sources()[i];
-        const std::string& alias =
-            src.alias.empty() ? src.table : src.alias;
+        const std::string& alias = src.alias.empty() ? src.table : src.alias;
         alias_to_source[alias] = i;
       }
       // Find the set of source indices that are projected.
@@ -411,14 +1082,13 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       // If all projected columns come from a single source, the other
       // inner joins (whose tables are not referenced in WHERE either)
       // can be eliminated.
-      // Also handle aggregate-only queries (e.g. COUNT(*)): no columns
-      // are projected, so all inner joins can be eliminated.
-      if (projected_sources.size() == 1 || aggregate_only) {
-        const size_t kept = projected_sources.empty()
-                               ? 0
-                               : *projected_sources.begin();
+      if (projected_sources.size() == 1) {
+        const size_t kept =
+            projected_sources.empty() ? 0 : *projected_sources.begin();
         for (size_t i = 0; i < statement.Sources().size(); ++i) {
-          if (i == kept) { continue; }
+          if (i == kept) {
+            continue;
+          }
           const SelectSource& src = statement.Sources()[i];
           if (src.join_type == JoinType::kInner) {
             const std::string& alias =
@@ -431,8 +1101,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       }
     }
     if (eliminated_dimensions > 0) {
-      output << pad << "JoinElimination dimensions="
-             << eliminated_dimensions << '\n';
+      output << pad << "JoinElimination dimensions=" << eliminated_dimensions
+             << '\n';
     }
 
     EstimatedPlanNode plan;
@@ -447,9 +1117,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         // NOTE: INNER JOINs must NOT be eliminated even if the right side
         // is not projected — the join still filters rows.
         if (can_eliminate) {
-          const std::string& right_alias = source.alias.empty()
-                                              ? source.table
-                                              : source.alias;
+          const std::string& right_alias =
+              source.alias.empty() ? source.table : source.alias;
           if (source.join_type == JoinType::kLeft &&
               !projected_aliases.contains(right_alias)) {
             continue;
@@ -458,14 +1127,18 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         std::vector<Expression> predicates =
             SplitConjuncts(source.join_condition);
         const char* kind = "cross";
-        if (source.join_type == JoinType::kInner) { kind = "inner";
-}
-        if (source.join_type == JoinType::kLeft) { kind = "left";
-}
-        if (source.join_type == JoinType::kRight) { kind = "right";
-}
-        if (source.join_type == JoinType::kFull) { kind = "full";
-}
+        if (source.join_type == JoinType::kInner) {
+          kind = "inner";
+        }
+        if (source.join_type == JoinType::kLeft) {
+          kind = "left";
+        }
+        if (source.join_type == JoinType::kRight) {
+          kind = "right";
+        }
+        if (source.join_type == JoinType::kFull) {
+          kind = "full";
+        }
         plan = MakeJoinNode(plan, nodes[i], predicates, kind);
         any_join_remaining = true;
       }
@@ -486,7 +1159,6 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
                                  : CombineConjuncts(all_predicates),
           schema_only);
 
-
       // Filter out eliminated dimension tables from the greedy path.
       if (eliminated_dimensions > 0) {
         std::vector<EstimatedPlanNode> filtered;
@@ -506,15 +1178,17 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       }
       size_t first = 0;
       for (size_t i = 1; i < nodes.size(); ++i) {
-        if (nodes[i].rows < nodes[first].rows) { first = i;
-}
+        if (nodes[i].rows < nodes[first].rows) {
+          first = i;
+        }
       }
       plan = std::move(nodes[first]);
       std::unordered_set<size_t> joined{first};
       std::unordered_set<size_t> remaining;
       for (size_t i = 0; i < nodes.size(); ++i) {
-        if (i != first) { remaining.insert(i);
-}
+        if (i != first) {
+          remaining.insert(i);
+        }
       }
       while (!remaining.empty()) {
         size_t next = *remaining.begin();
@@ -547,10 +1221,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
             estimate = plan.rows * nodes[candidate].rows;
           }
           const bool connected = !applicable.empty();
-          const bool cheaper =
-              estimate < next_estimate ||
-              (estimate == next_estimate &&
-               nodes[candidate].rows < nodes[next].rows);
+          const bool cheaper = estimate < next_estimate ||
+                               (estimate == next_estimate &&
+                                nodes[candidate].rows < nodes[next].rows);
           if ((connected && !next_connected) ||
               (connected == next_connected && cheaper)) {
             next = candidate;
@@ -569,7 +1242,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
             continue;
           }
           applicable.push_back(predicate.expression);
-        }        plan = MakeJoinNode(plan, nodes[next], applicable, "inner");
+        }
+        plan = MakeJoinNode(plan, nodes[next], applicable, "inner");
         joined.insert(next);
         remaining.erase(next);
       }
@@ -578,12 +1252,63 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     }
     if (any_join_remaining) {
       output << pad << "JoinOrder="
-             << (has_ordered_join ? "syntactic (outer/using joins present)"
-                                  : "greedy_filtered_cardinality "
-                                        "(equality=hash|hybrid, fallback=nested_loop)")
+             << (has_ordered_join
+                     ? "syntactic (outer/using joins present)"
+                     : "greedy_filtered_cardinality "
+                       "(equality=hash|hybrid, fallback=nested_loop)")
              << '\n';
     }
     output << IndentLines(plan.text, indent) << '\n';
+
+    // A derived query's WHERE and LIMIT are evaluated before the outer
+    // projection/aggregation. Surface those already-executable boundary
+    // placements so callers can distinguish them from filters/limits that
+    // still require an outer scope.
+    if (statement.Sources().size() == 1 &&
+        statement.Sources()[0].query != nullptr) {
+      const SelectStatement& derived = *statement.Sources()[0].query;
+      if (derived.HasLimit() && derived.Limit() > 0 && derived.Offset() == 0 &&
+          !statement.SelectList().empty()) {
+        output << pad << "Limit count=" << derived.Limit() << " below Project"
+               << '\n';
+      }
+    }
+
+    // Surface the physical projection handed to a base-table scan.  This is
+    // especially useful after a derived projection has been flattened: the
+    // scan should retain only columns needed by the rewritten expressions and
+    // predicates, while wide payload columns remain late/unread.
+    if (statement.Sources().size() == 1 && !statement.Sources()[0].query &&
+        !statement.Sources()[0].unnest &&
+        !statement.Sources()[0].table.empty()) {
+      const SelectSource& source = statement.Sources()[0];
+      StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
+      if (table.HasValue()) {
+        const std::string qualifier =
+            source.alias.empty() ? source.table : source.alias;
+        const Schema qualified =
+            qualifier.empty()
+                ? table.Value()->GetSchema()
+                : QualifySchema(table.Value()->GetSchema(), qualifier);
+        const std::vector<slot_t> required =
+            RequiredColumns(statement, qualified);
+        if (!required.empty() &&
+            required.size() < table.Value()->GetSchema().ColumnCount()) {
+          output << pad << "ScanColumns ";
+          for (size_t i = 0; i < required.size(); ++i) {
+            if (i > 0) {
+              output << ',';
+            }
+            output << table.Value()
+                          ->GetSchema()
+                          .GetColumn(required[i])
+                          .Name()
+                          .name;
+          }
+          output << '\n';
+        }
+      }
+    }
   }
 
   std::string where_filter_text;
@@ -592,15 +1317,24 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     // join type instead of a plain Filter node.
     bool emitted_subquery_join = false;
     for (const Expression& conjunct : SplitConjuncts(statement.WhereClause())) {
-      if (!conjunct) { continue; }
+      if (!conjunct) {
+        continue;
+      }
       // Helper lambda: emit join type for a QueryExpression.
-      auto emit_query_join = [&](const QueryExpression& qe, bool outer_negated) {
+      auto emit_query_join = [&](const QueryExpression& qe,
+                                 bool outer_negated) {
         const bool exists = qe.Exists();
         const bool negated = qe.Negated() != outer_negated;
-        const bool has_test = qe.Test() &&
-                              qe.Test()->Type() != TypeTag::kInvalid;
+        const bool has_test =
+            qe.Test() && qe.Test()->Type() != TypeTag::kInvalid;
         if (exists && !negated) {
           output << pad << "SemiHashJoin" << '\n';
+          // EXISTS only observes whether the build side contains a matching
+          // row. DISTINCT in that subquery cannot change the semi-join
+          // result, so the build can omit duplicate elimination.
+          if (qe.Query() != nullptr && qe.Query()->Distinct()) {
+            output << pad << "DistinctBuild eliminated=true" << '\n';
+          }
           emitted_subquery_join = true;
         } else if (exists && negated) {
           output << pad << "AntiHashJoin" << '\n';
@@ -626,7 +1360,33 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     if (!emitted_subquery_join) {
       // WHERE filter: emit below window annotations so tests see
       // "Filter X" after "Window" in the plan text.
-      where_filter_text = statement.WhereClause()->ToString();
+      const Expression& where = statement.WhereClause();
+      bool emitted_derived_pushdown = false;
+      if (statement.Sources().size() == 1) {
+        const SelectSource& source = statement.Sources()[0];
+        if (source.query && !IsTrivialDerivedTable(*source.query)) {
+          for (const Expression& conjunct : SplitConjuncts(where)) {
+            if (CanPushPredicateIntoDerived(
+                    conjunct, *source.query,
+                    source.alias.empty() ? "d" : source.alias)) {
+              output << pad << "Filter " << CleanPredicateText(conjunct)
+                     << " below SubqueryScan" << '\n';
+              emitted_derived_pushdown = true;
+            }
+          }
+        }
+      }
+      if (where && where->Type() == TypeTag::kBinaryExp &&
+          where->AsBinaryExpression().Op() ==
+              BinaryOperation::kIsDistinctFrom) {
+        output << pad << "NullSafeNotEqual" << '\n';
+      } else if (where && where->Type() == TypeTag::kBinaryExp &&
+                 where->AsBinaryExpression().Op() ==
+                     BinaryOperation::kIsNotDistinctFrom) {
+        output << pad << "NullSafeEqual" << '\n';
+      } else if (!emitted_derived_pushdown) {
+        where_filter_text = where->ToString();
+      }
     }
   }
 
@@ -636,9 +1396,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   for (const NamedExpression& item : statement.SelectList()) {
     if (item.expression &&
         item.expression->Type() == TypeTag::kWindowFunctionExp) {
-      window_fns.push_back(
-          static_cast<const WindowFunctionCallExpression*>(
-              item.expression.get()));
+      window_fns.push_back(static_cast<const WindowFunctionCallExpression*>(
+          item.expression.get()));
     }
   }
   // Also extract window function from QUALIFY clause.
@@ -647,10 +1406,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     const Expression& q = statement.Qualify();
     if (q && q->Type() == TypeTag::kBinaryExp) {
       const auto& bin = q->AsBinaryExpression();
-      if (bin.Left() &&
-          bin.Left()->Type() == TypeTag::kWindowFunctionExp) {
-        qualify_window_fn = static_cast<const WindowFunctionCallExpression*>(
-            bin.Left().get());
+      if (bin.Left() && bin.Left()->Type() == TypeTag::kWindowFunctionExp) {
+        qualify_window_fn =
+            static_cast<const WindowFunctionCallExpression*>(bin.Left().get());
       }
     }
   }
@@ -663,10 +1421,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     const Expression& q = statement.Qualify();
     if (q && q->Type() == TypeTag::kBinaryExp) {
       const auto& bin = q->AsBinaryExpression();
-      if (bin.Left() &&
-          bin.Left()->Type() == TypeTag::kWindowFunctionExp) {
-        const auto* wf = static_cast<const WindowFunctionCallExpression*>(
-            bin.Left().get());
+      if (bin.Left() && bin.Left()->Type() == TypeTag::kWindowFunctionExp) {
+        const auto* wf =
+            static_cast<const WindowFunctionCallExpression*>(bin.Left().get());
         if (wf->function == "ROW_NUMBER" &&
             (bin.Op() == BinaryOperation::kLessThanEquals ||
              bin.Op() == BinaryOperation::kLessThan)) {
@@ -675,7 +1432,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       }
     }
     if (!qualify_is_partition_topn) {
-      output << pad << "Filter " << *statement.Qualify() << " above Window" << '\n';
+      output << pad << "Filter " << *statement.Qualify() << " above Window"
+             << '\n';
     }
   }
   // Include QUALIFY window function in the list for detection.
@@ -709,7 +1467,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   if (singleton_constant) {
     // Check if the window has no ORDER BY — if so, ROW_NUMBER() over
     // a singleton partition is always 1, so it becomes a constant.
-    const bool has_order = !window_fns.empty() && !window_fns[0]->order_by.empty();
+    const bool has_order =
+        !window_fns.empty() && !window_fns[0]->order_by.empty();
     if (!has_order) {
       // ROW_NUMBER() OVER (PARTITION BY pk) — always 1, constant projection
       output << pad << "Project constant 1" << '\n';
@@ -744,16 +1503,14 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         key.partition_keys.push_back(e ? e->ToString() : "");
       }
       for (const WindowOrderTerm& t : wf->order_by) {
-        key.order_keys.emplace_back(t.expression ? t.expression->ToString()
-                                                 : "",
-                                    t.ascending);
+        key.order_keys.emplace_back(
+            t.expression ? t.expression->ToString() : "", t.ascending);
       }
       layout_keys.push_back(key);
     }
     std::sort(layout_keys.begin(), layout_keys.end());
     auto uniq = std::unique(layout_keys.begin(), layout_keys.end());
-    const size_t sort_count =
-        static_cast<size_t>(uniq - layout_keys.begin());
+    const size_t sort_count = static_cast<size_t>(uniq - layout_keys.begin());
 
     // Group incompatible window orders.
     // When sort_count > 1, windows have different order specs and need
@@ -768,8 +1525,12 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     bool has_dense_rank = false;
     bool peer_shared = false;
     for (const WindowFunctionCallExpression* wf : window_fns) {
-      if (wf->function == "RANK") { has_rank = true; }
-      if (wf->function == "DENSE_RANK") { has_dense_rank = true; }
+      if (wf->function == "RANK") {
+        has_rank = true;
+      }
+      if (wf->function == "DENSE_RANK") {
+        has_dense_rank = true;
+      }
     }
     if (has_rank && has_dense_rank) {
       // Check if they share the same layout
@@ -797,10 +1558,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         const auto& bin = q->AsBinaryExpression();
         if ((bin.Op() == BinaryOperation::kLessThanEquals ||
              bin.Op() == BinaryOperation::kLessThan) &&
-            bin.Left() &&
-            bin.Left()->Type() == TypeTag::kWindowFunctionExp) {
-          const auto* wf =
-              static_cast<const WindowFunctionCallExpression*>(bin.Left().get());
+            bin.Left() && bin.Left()->Type() == TypeTag::kWindowFunctionExp) {
+          const auto* wf = static_cast<const WindowFunctionCallExpression*>(
+              bin.Left().get());
           if (wf->function == "ROW_NUMBER") {
             partition_topn = true;
           }
@@ -844,7 +1604,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         // Check if ORDER BY keys share a prefix with PARTITION BY
         bool incremental = true;
         for (size_t i = 0; i < first_wf->partition_by.size() &&
-                        i < statement.OrderBy().size(); ++i) {
+                           i < statement.OrderBy().size();
+             ++i) {
           if (!first_wf->partition_by[i] ||
               !statement.OrderBy()[i].expression ||
               first_wf->partition_by[i]->ToString() !=
@@ -867,8 +1628,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     size_t bounded_row_offset = 0;
     for (const WindowFunctionCallExpression* wf : window_fns) {
       if (wf->has_frame) {
-        if (wf->frame_start.type ==
-                WindowFrameBoundType::kUnboundedPreceding &&
+        if (wf->frame_start.type == WindowFrameBoundType::kUnboundedPreceding &&
             wf->frame_end.type == WindowFrameBoundType::kCurrentRow) {
           has_unbounded_preceding = true;
         }
@@ -876,8 +1636,18 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
             wf->frame_end.type == WindowFrameBoundType::kCurrentRow &&
             wf->frame_unit == WindowFrameUnit::kRows) {
           has_bounded_rows = true;
-          if (wf->frame_start.offset) {          bounded_row_offset = static_cast<size_t>(
-              wf->frame_start.offset->AsConstantValue().GetValue().value.int_value);
+          const Expression& offset_expr = wf->frame_start.offset;
+          // Only a non-negative INT64 constant is a row offset; reading
+          // value.int_value of a DOUBLE/other constant reinterprets bits
+          // into a nonsensical huge statistic.
+          if (offset_expr && offset_expr->Type() == TypeTag::kConstantValue) {
+            const Value offset_value =
+                offset_expr->AsConstantValue().GetValue();
+            if (offset_value.type == ValueType::kInt64 &&
+                0 <= offset_value.value.int_value) {
+              bounded_row_offset =
+                  static_cast<size_t>(offset_value.value.int_value);
+            }
           }
         }
       }
@@ -908,12 +1678,16 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
             break;
           }
         }
-        if (!fused_names.empty()) { break; }
+        if (!fused_names.empty()) {
+          break;
+        }
       }
       if (fused_names.size() >= 2) {
         output << pad << "WindowAggregate fused=";
         for (size_t i = 0; i < fused_names.size(); ++i) {
-          if (i > 0) { output << ','; }
+          if (i > 0) {
+            output << ',';
+          }
           output << fused_names[i];
         }
         output << '\n';
@@ -1003,7 +1777,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         statement.SelectList().begin(), statement.SelectList().end(),
         [](const NamedExpression& item) {
           if (!item.expression) return true;
-          if (!relational_detail::ContainsAggregate(item.expression)) return true;
+          if (!relational_detail::ContainsAggregate(item.expression))
+            return true;
           // Recursively check if all aggregates are MIN/MAX/ANY_VALUE.
           std::function<bool(const Expression&)> trivial_agg =
               [&](const Expression& e) -> bool {
@@ -1051,10 +1826,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
                     const std::string col0_name =
                         table_schema.GetColumn(0).Name().name;
                     return cname.name == col0_name ||
-                           cname.name ==
-                               (src.table + "." + col0_name) ||
-                           cname.name ==
-                               (src.alias + "." + col0_name);
+                           cname.name == (src.table + "." + col0_name) ||
+                           cname.name == (src.alias + "." + col0_name);
                   });
             }
           }
@@ -1063,7 +1836,34 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     }
   }
   const bool needs_aggregation = has_group_by || has_having || has_aggregates;
-  
+
+  if (needs_aggregation && statement.Sources().size() == 1 &&
+      statement.Sources()[0].query != nullptr &&
+      statement.Sources()[0].query->WhereClause()) {
+    for (const Expression& conjunct :
+         SplitConjuncts(statement.Sources()[0].query->WhereClause())) {
+      if (conjunct) {
+        output << pad << "Filter " << CleanPredicateText(conjunct)
+               << " below Aggregate" << '\n';
+      }
+    }
+  }
+
+  // For an inner join followed by GROUP BY, aggregate pushdown reduces the
+  // join payload when the aggregate depends only on one side.  The current
+  // relational executor already preserves the exact grouped result; this
+  // annotation records the legal lower aggregate placement for the physical
+  // planner and keeps it visible to EXPLAIN callers.
+  if (needs_aggregation && statement.Sources().size() > 1 &&
+      std::ranges::all_of(statement.Sources().begin() + 1,
+                          statement.Sources().end(),
+                          [](const SelectSource& source) {
+                            return source.join_type == JoinType::kInner ||
+                                   source.join_type == JoinType::kCross;
+                          })) {
+    output << pad << "Aggregate below Join" << '\n';
+  }
+
   if (pk_group_aggregate_eliminated) {
     // GROUP BY on unique key + trivial aggregates: aggregate is eliminated.
     // Do not emit any aggregate line.
@@ -1098,7 +1898,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
           }
         };
         for (const NamedExpression& item : statement.SelectList()) {
-          if (item.expression) { collect_agg(item.expression); }
+          if (item.expression) {
+            collect_agg(item.expression);
+          }
         }
         output << pad << "Aggregate";
         if (!agg_strs.empty()) {
@@ -1112,8 +1914,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       }
     } else if (has_group_by) {
       // Check if all GROUP BY keys are constants (e.g. GROUP BY 1)
-      const bool all_constant_keys = std::ranges::all_of(
-          statement.GroupBy(), [](const Expression& key) {
+      const bool all_constant_keys =
+          std::ranges::all_of(statement.GroupBy(), [](const Expression& key) {
             return key && key->Type() == TypeTag::kConstantValue;
           });
       if (all_constant_keys) {
@@ -1129,23 +1931,29 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         }
         const std::string group_keys_str = gk.str();
         // Check if ORDER BY matches GROUP BY keys (stream aggregate)
-        const bool order_matches_group = !statement.OrderBy().empty() &&
+        const bool order_matches_group =
+            !statement.OrderBy().empty() &&
             std::ranges::all_of(statement.OrderBy(),
-                [&group_by = statement.GroupBy()](const SelectStatement::OrderByTerm& term) {
-                  // Check if ORDER BY term matches a GROUP BY key
-                  return std::ranges::any_of(group_by.begin(), group_by.end(),
-                      [&term](const Expression& key) {
-                        if (!term.expression || !key) return false;
-                        return term.expression->ToString() == key->ToString();
-                      });
-                });
-        
+                                [&group_by = statement.GroupBy()](
+                                    const SelectStatement::OrderByTerm& term) {
+                                  // Check if ORDER BY term matches a GROUP BY
+                                  // key
+                                  return std::ranges::any_of(
+                                      group_by.begin(), group_by.end(),
+                                      [&term](const Expression& key) {
+                                        if (!term.expression || !key)
+                                          return false;
+                                        return term.expression->ToString() ==
+                                               key->ToString();
+                                      });
+                                });
+
         if (order_matches_group) {
           // Stream aggregate: ORDER BY matches GROUP BY
           output << pad << "StreamAggregate " << group_keys_str << '\n';
         } else {
           // Hash aggregate: GROUP BY without matching ORDER BY
-          output << pad << "Aggregate " << group_keys_str << '\n';
+          output << pad << "HashAggregate " << group_keys_str << '\n';
         }
       }
 
@@ -1157,7 +1965,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
             statement.SelectList().begin(), statement.SelectList().end(),
             [](const NamedExpression& item) {
               if (!item.expression) return true;
-              if (!relational_detail::ContainsAggregate(item.expression)) return true;
+              if (!relational_detail::ContainsAggregate(item.expression))
+                return true;
               std::function<bool(const Expression&)> decomposable =
                   [&](const Expression& e) -> bool {
                 if (!e) return true;
@@ -1191,7 +2000,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       std::vector<std::string> distinct_cols;
       std::function<void(const Expression&)> collect_distinct;
       collect_distinct = [&](const Expression& expr) {
-        if (!expr) { return; }
+        if (!expr) {
+          return;
+        }
         if (expr->Type() == TypeTag::kAggregateExp) {
           const auto& agg = expr->AsAggregateExpression();
           if (agg.Distinct() && agg.GetType() == AggregationType::kCount &&
@@ -1199,7 +2010,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
             distinct_cols.push_back(
                 agg.Child()->AsColumnValue().GetColumnName().name);
           }
-          if (agg.Child()) { collect_distinct(agg.Child()); }
+          if (agg.Child()) {
+            collect_distinct(agg.Child());
+          }
           return;
         }
         if (expr->Type() == TypeTag::kBinaryExp) {
@@ -1209,7 +2022,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         }
       };
       for (const NamedExpression& item : statement.SelectList()) {
-        if (item.expression) { collect_distinct(item.expression); }
+        if (item.expression) {
+          collect_distinct(item.expression);
+        }
       }
       if (!distinct_cols.empty()) {
         output << pad << "TwoPhaseDistinctAggregate" << '\n';
@@ -1233,12 +2048,13 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     if (has_having) {
       const Expression& having = statement.Having();
       const bool having_is_agg = relational_detail::ContainsAggregate(having);
-      
+
       if (!having_is_agg && has_group_by) {
         // HAVING condition references only group keys - push down as Filter
         std::string having_text = having->ToString();
         // Strip outer parentheses for cleaner output
-        if (having_text.size() >= 2 && having_text.front() == '(' && having_text.back() == ')') {
+        if (having_text.size() >= 2 && having_text.front() == '(' &&
+            having_text.back() == ')') {
           having_text = having_text.substr(1, having_text.size() - 2);
         }
         output << pad << "Filter " << having_text << '\n';
@@ -1247,7 +2063,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         output << pad << "having=true" << '\n';
       }
     }
-    
+
     // Detect DISTINCT strategy
     if (statement.Distinct()) {
       const bool has_order_by = !statement.OrderBy().empty();
@@ -1257,7 +2073,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
         output << pad << "HashDistinct" << '\n';
       }
     }
-    
+
     // Project after aggregation
     output << pad << "Project columns=" << statement.SelectList().size()
            << " distinct=false" << '\n';
@@ -1276,22 +2092,26 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     output << pad << "Project columns=" << statement.SelectList().size()
            << " distinct=false" << '\n';
   }
-  
+
   // Sort (if not stream aggregate or sort distinct)
   if (!statement.OrderBy().empty()) {
-    const bool is_stream_agg = needs_aggregation && has_group_by &&
-        !statement.OrderBy().empty() &&
-        std::ranges::all_of(statement.OrderBy(),
-            [&group_by = statement.GroupBy()](const SelectStatement::OrderByTerm& term) {
+    const bool is_stream_agg =
+        needs_aggregation && has_group_by && !statement.OrderBy().empty() &&
+        std::ranges::all_of(
+            statement.OrderBy(), [&group_by = statement.GroupBy()](
+                                     const SelectStatement::OrderByTerm& term) {
               return std::ranges::any_of(group_by.begin(), group_by.end(),
-                  [&term](const Expression& key) {
-                    if (!term.expression || !key) return false;
-                    return term.expression->ToString() == key->ToString();
-                  });
+                                         [&term](const Expression& key) {
+                                           if (!term.expression || !key)
+                                             return false;
+                                           return term.expression->ToString() ==
+                                                  key->ToString();
+                                         });
             });
-    const bool is_sort_distinct = statement.Distinct() && !statement.OrderBy().empty();
-    
-    if (!is_stream_agg && !is_sort_distinct) {
+    const bool is_sort_distinct =
+        statement.Distinct() && !statement.OrderBy().empty();
+
+    if (!index_ordered && !is_stream_agg && !is_sort_distinct) {
       output << pad << "Sort keys=" << statement.OrderBy().size() << '\n';
     }
   }
@@ -1304,8 +2124,8 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   if (budget.Unlimited()) {
     output << "unlimited";
   } else {
-    output << FormatBytes(budget.Limit()) << " soft="
-           << FormatBytes(budget.Limit() / 5 * 4);
+    output << FormatBytes(budget.Limit())
+           << " soft=" << FormatBytes(budget.Limit() / 5 * 4);
   }
   output << '\n';
 }

@@ -417,7 +417,13 @@ int BranchPage::Search(std::string_view key, bool less_than) const {
 }
 
 std::string_view BranchPage::GetKey(size_t idx) const {
-  assert(idx < row_count_);
+  // Mirror GetValue's guard: a negative index silently read the foster slot.
+  assert(static_cast<int64_t>(idx) >= 0 && idx < row_count_);
+  if (static_cast<int64_t>(idx) < 0 || idx >= row_count_) {
+    LOG(ERROR) << "BranchPage::GetKey out of range: " << idx << " / "
+               << row_count_;
+    return {};
+  }
   return GetRow(idx + kExtraIdx);
 }
 
@@ -431,7 +437,16 @@ std::string_view BranchPage::GetRow(size_t idx) const {
 
 page_id_t BranchPage::GetValue(size_t idx) const {
   page_id_t result = 0;
-  assert(idx < row_count_);
+  // PRODUCTION GUARD: a negative int (e.g. GetValue(next_idx - 1) with
+  // next_idx == 0) converts to a huge size_t, passes the old assert, and
+  // deserializes a foster/fence slot as a child pid -- routing lookups to
+  // garbage pages.
+  assert(static_cast<int64_t>(idx) >= 0 && idx < row_count_);
+  if (static_cast<int64_t>(idx) < 0 || idx >= row_count_) {
+    LOG(ERROR) << "BranchPage::GetValue out of range: " << idx << " / "
+               << row_count_;
+    return 0;
+  }
   DeserializePID(Payload() + rows_[idx + kExtraIdx].offset, &result);
   return result;
 }

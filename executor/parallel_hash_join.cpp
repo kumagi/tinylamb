@@ -125,7 +125,17 @@ std::string SharedBuildParallelHashJoin::MakeKey(
   std::string key;
   for (slot_t col : cols) {
     if (col < row.values_.size()) {
-      key += row[col].EncodeMemcomparableFormat();
+      const Value& value = row[col];
+      // PRODUCTION FIX: EncodeMemcomparableFormat() throws on NULL, and
+      // MakeKey ran on raw worker threads, so a NULL join key crossed a
+      // thread boundary and terminated the whole process.  Encode NULL with
+      // a dedicated single-byte tag instead; the value never matches any
+      // real key prefix (real encodings start with a value-type byte 1..5).
+      if (value.IsNull()) {
+        key.push_back('\0');
+        continue;
+      }
+      key += value.EncodeMemcomparableFormat();
     }
   }
   return key;

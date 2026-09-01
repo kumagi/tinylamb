@@ -65,7 +65,17 @@ StatusOr<std::string_view> RowPage::Read(page_id_t page_id, Transaction& txn,
  */
 StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
                                  std::string_view record) {
-  const size_t needed = record.size() + sizeof(RowPointer);
+  // Whether any hole (vacant slot) exists decides the capacity cost: a reused
+  // hole needs no new RowPointer.  The old check always charged +8, falsely
+  // reporting kNoSpace when free_size_ == record.size() with a hole present.
+  bool has_hole = false;
+  for (slot_t i = 0; i < row_max_; ++i) {
+    if (rows_[i].offset == 0) {
+      has_hole = true;
+      break;
+    }
+  }
+  const size_t needed = record.size() + (has_hole ? 0 : sizeof(RowPointer));
   if (free_size_ < needed) {
     return Status::kNoSpace;
   }
@@ -163,7 +173,7 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
     return Status::kNoSpace;
   }
   RowPosition pos(page_id, slot);
-  if (!txn.AddWriteSet(pos)) {
+  if (!txn.AddWriteSet(pos, prev_row)) {
     return Status::kConflicts;
   }
   // Reserve contiguous space before any WAL write: a failed allocation must
@@ -221,11 +231,11 @@ Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
   if (row_max_ <= slot || rows_[slot].offset == 0) {
     return Status::kNotExists;
   }
+  const std::string previous(GetRow(slot));
   RowPosition pos(page_id, slot);
-  if (!txn.AddWriteSet(pos)) {
+  if (!txn.AddWriteSet(pos, previous)) {
     return Status::kConflicts;
   }
-  const std::string_view previous = GetRow(slot);
   txn.RegisterVersionWrite(pos, previous, std::nullopt);
   txn.DeleteLog(page_id, slot, previous);
   DeleteRow(slot);
@@ -296,8 +306,14 @@ uint64_t std::hash<tinylamb::RowPage>::operator()(
   ret += std::hash<tinylamb::slot_t>()(r.row_count_);
   ret += std::hash<tinylamb::bin_size_t>()(r.free_ptr_);
   ret += std::hash<tinylamb::bin_size_t>()(r.free_size_);
-  for (tinylamb::slot_t i = 0; i < r.row_count_; ++i) {
-    ret += std::hash<std::string_view>()(r.GetRow(i));
+  // Slot numbers do not identify live rows once deletions leave holes: walk
+  // the whole slot array and hash only occupied slots (offset != 0).  The
+  // old loop hashed the first row_count_ slots, so two pages with identical
+  // contents but holes at different positions collided.
+  for (tinylamb::slot_t i = 0; i < r.row_max_; ++i) {
+    if (r.rows_[i].offset != 0) {
+      ret += std::hash<std::string_view>()(r.GetRow(i));
+    }
   }
   return ret;
 }

@@ -43,9 +43,11 @@
 #include "executor/sort.hpp"
 #include "executor/update.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/cast_expression.hpp"
 #include "expression/proto_text.hpp"
+#include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "plan/optimizer.hpp"
 #include "plan/plan.hpp"
@@ -184,6 +186,139 @@ bool IdentifierEquals(std::string_view left, std::string_view right) {
                       return std::tolower(static_cast<unsigned char>(lhs)) ==
                              std::tolower(static_cast<unsigned char>(rhs));
                     });
+}
+
+bool ContainsQueryExpression(const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kQueryExp) {
+    return true;
+  }
+  return std::ranges::any_of(
+      ExpressionChildren(expression),
+      [](const Expression& child) { return ContainsQueryExpression(child); });
+}
+
+// The QueryData optimizer already has a sound decorrelator for simple
+// equality-based EXISTS/IN predicates.  Keep the SQL facade on that path only
+// when the statement shape can be represented without losing query scope:
+// plain base-table sources, direct WHERE conjuncts, and no nested relational
+// features. More involved subqueries stay on the scope-aware interpreter.
+bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
+  if (statement.Sources().empty() || !statement.WithQueries().empty() ||
+      statement.GroupBy().size() != 0 || statement.Having() ||
+      statement.Qualify() || statement.HasDistinctOn() || statement.HasLimit() ||
+      statement.Offset() != 0 ||
+      std::ranges::any_of(statement.SelectList(), [](const NamedExpression& item) {
+        return relational_detail::ContainsAggregate(item.expression);
+      })) {
+    return false;
+  }
+  std::unordered_set<std::string> outer_names;
+  for (const SelectSource& source : statement.Sources()) {
+    if (source.query || source.unnest ||
+        (source.join_type != JoinType::kCross &&
+         source.join_type != JoinType::kInner) ||
+        source.join_condition) {
+      return false;
+    }
+    outer_names.insert(source.table);
+    if (!source.alias.empty()) {
+      outer_names.insert(source.alias);
+    }
+  }
+  if (std::ranges::any_of(
+          statement.SelectList(), [](const NamedExpression& item) {
+            return ContainsQueryExpression(item.expression);
+          }) ||
+      std::ranges::any_of(
+          statement.OrderBy(), [](const SelectStatement::OrderByTerm& term) {
+            return ContainsQueryExpression(term.expression);
+          })) {
+    return false;
+  }
+
+  bool found_correlated = false;
+  for (const Expression& conjunct : SplitConjuncts(statement.WhereClause())) {
+    if (!conjunct || conjunct->Type() != TypeTag::kQueryExp) {
+      if (ContainsQueryExpression(conjunct)) {
+        return false;
+      }
+      continue;
+    }
+    const QueryExpression& query = conjunct->AsQueryExpression();
+    if (query.Query() == nullptr ||
+        (!query.Exists() && query.Test() == nullptr) ||
+        query.Query()->Sources().size() != 1 ||
+        query.Query()->Sources()[0].query ||
+        query.Query()->Sources()[0].unnest ||
+        query.Query()->Sources()[0].join_condition ||
+        query.Query()->GroupBy().size() != 0 || query.Query()->Having() ||
+        query.Query()->Qualify() || query.Query()->HasLimit() ||
+        query.Query()->Offset() != 0 || query.Query()->Distinct() ||
+        ContainsQueryExpression(query.Query()->WhereClause())) {
+      return false;
+    }
+    const SelectSource& inner_source = query.Query()->Sources()[0];
+    std::unordered_set<std::string> inner_names{inner_source.table};
+    if (!inner_source.alias.empty()) {
+      inner_names.insert(inner_source.alias);
+    }
+    if (inner_source.table.empty()) {
+      return false;
+    }
+    for (const Expression& inner_conjunct :
+         SplitConjuncts(query.Query()->WhereClause())) {
+      bool references_outer = false;
+      for (const ColumnName& column : inner_conjunct->TouchedColumns()) {
+        if (!column.schema.empty() && outer_names.contains(column.schema) &&
+            !inner_names.contains(column.schema)) {
+          references_outer = true;
+          break;
+        }
+      }
+      if (!references_outer) {
+        continue;
+      }
+      // The QueryData decorrelator intentionally accepts only column-to-column
+      // equality keys. Expressions such as `outer.k + 1 = inner.k` must stay
+      // on the scope-aware evaluator rather than becoming a residual filter
+      // with no evaluation context.
+      if (inner_conjunct->Type() != TypeTag::kBinaryExp ||
+          inner_conjunct->AsBinaryExpression().Op() !=
+              BinaryOperation::kEquals ||
+          inner_conjunct->AsBinaryExpression().Left()->Type() !=
+              TypeTag::kColumnValue ||
+          inner_conjunct->AsBinaryExpression().Right()->Type() !=
+              TypeTag::kColumnValue) {
+        return false;
+      }
+    }
+    bool correlated = false;
+    for (const ColumnName& column :
+         query.Query()->WhereClause()
+             ? query.Query()->WhereClause()->TouchedColumns()
+             : std::unordered_set<ColumnName>{}) {
+      if (!column.schema.empty() && outer_names.contains(column.schema) &&
+          !inner_names.contains(column.schema)) {
+        correlated = true;
+      }
+    }
+    if (!query.Exists() && query.Test()->Type() == TypeTag::kColumnValue) {
+      const ColumnName& test_column =
+          query.Test()->AsColumnValue().GetColumnName();
+      correlated = correlated ||
+                   (!test_column.schema.empty() &&
+                    outer_names.contains(test_column.schema) &&
+                    !inner_names.contains(test_column.schema));
+    }
+    if (!correlated) {
+      return false;
+    }
+    found_correlated = true;
+  }
+  return found_correlated;
 }
 
 // DISTINCT is redundant when the visible projection contains every column of
@@ -870,13 +1005,14 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     try {
       ASSIGN_OR_RETURN(std::unique_ptr<GoogleSqlAstNode>, ast,
                        GoogleSqlAstParser::Parse(parsed.ast));
-      statement = GoogleSqlAstVisitor::Visit(*ast);
+      // Pass the source SQL: per-pair set-operator kinds are recovered by
+      // slicing the recorded byte ranges (the dump carries no text).
+      statement = GoogleSqlAstVisitor::Visit(*ast, query_sql);
     } catch (const std::exception& error) {
       last_error_ = error.what();
       return Status::kUnknown;
     }
   }
-
   if (explain) {
     // Reject non-SELECT statements BEFORE any planning/execution: EXPLAIN
     // DROP TABLE must neither drop nor create anything (§7.4).
@@ -1874,7 +2010,12 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         }
         StatusOr<Plan> optimized = Optimizer::OptimizeRelational(
             select, Schema("", std::move(columns)), ctx);
-        if (!optimized.HasValue()) { return optimized.GetStatus(); }
+        if (!optimized.HasValue()) {
+          std::ostringstream error;
+          error << "relational optimizer failed: " << optimized.GetStatus();
+          last_error_ = error.str();
+          return optimized.GetStatus();
+        }
         return optimized.Value()->EmitExecutor(ctx);
       };
       // An explicit LIMIT 0 yields zero rows on every route (relational or
@@ -1892,8 +2033,49 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           [](const SelectSource& s) {
             return s.is_lateral || s.query != nullptr;
           });
-      if (select->RequiresRelationalEvaluation() ||
-          select->Sources().empty() || has_unnest || has_subquery_or_lateral) {
+      const bool can_decorrelate_subqueries =
+          CanUseDecorrelatedSubqueryOptimizer(*select);
+      const bool simple_count_star =
+          select->Sources().size() == 1 &&
+          !select->Sources()[0].query && !select->Sources()[0].unnest &&
+          select->Sources()[0].join_type == JoinType::kCross &&
+          select->Sources()[0].join_condition == nullptr &&
+          select->WithQueries().empty() && select->GroupBy().empty() &&
+          !select->Having() && !select->Qualify() &&
+          select->OrderBy().empty() && !select->Distinct() &&
+          select->SelectList().size() == 1 &&
+          select->SelectList()[0].expression &&
+          select->SelectList()[0].expression->Type() == TypeTag::kAggregateExp &&
+          select->SelectList()[0].expression->AsAggregateExpression().GetType() ==
+              AggregationType::kCount &&
+          !select->SelectList()[0].expression->AsAggregateExpression().Distinct() &&
+          select->SelectList()[0].expression->AsAggregateExpression().Child() &&
+          select->SelectList()[0].expression->AsAggregateExpression().Child()->Type() ==
+              TypeTag::kColumnValue &&
+          select->SelectList()[0]
+                  .expression->AsAggregateExpression()
+                  .Child()
+                  ->AsColumnValue()
+                  .GetColumnName()
+                  .name == "*" &&
+           (!select->WhereClause() ||
+           select->WhereClause()->Type() == TypeTag::kConstantValue);
+      const bool has_set_operation = !select->UnionAll().empty();
+      if ((select->RequiresRelationalEvaluation() &&
+           !can_decorrelate_subqueries) ||
+          select->Sources().empty() || has_unnest || has_subquery_or_lateral ||
+          has_set_operation) {
+        if (simple_count_star) {
+          // COUNT(*) over one plain table is fully representable by the
+          // Cascades single-relation path, including a covering index-only
+          // scan. Let that path handle the query even if the visitor marked
+          // the aggregate as relational for another reason.
+        } else {
+          return emit_relational();
+        }
+      }
+      if (select->RequiresRelationalEvaluation() && !simple_count_star &&
+          !can_decorrelate_subqueries) {
         return emit_relational();
       }
 
@@ -1939,6 +2121,35 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                                  }));
       }
       const bool multi_relation = select->Sources().size() > 1;
+      const bool has_aggregate =
+          std::ranges::any_of(
+              select->SelectList(), [](const NamedExpression& item) {
+                return relational_detail::ContainsAggregate(item.expression);
+              }) ||
+          relational_detail::ContainsAggregate(select->Having());
+      const bool order_uses_projection_expression = std::ranges::any_of(
+          select->OrderBy(), [](const SelectStatement::OrderByTerm& term) {
+            return term.expression->Type() != TypeTag::kColumnValue;
+          });
+      const bool order_uses_select_alias = std::ranges::any_of(
+          select->OrderBy(), [&](const SelectStatement::OrderByTerm& term) {
+            if (!term.expression ||
+                term.expression->Type() != TypeTag::kColumnValue) {
+              return false;
+            }
+            const ColumnName& order_name =
+                term.expression->AsColumnValue().GetColumnName();
+            if (!order_name.schema.empty()) {
+              return false;
+            }
+            return std::ranges::any_of(
+                select->SelectList(), [&](const NamedExpression& item) {
+                  return !item.name.empty() &&
+                         IdentifierEquals(item.name, order_name.name) &&
+                         item.expression->ToString() !=
+                             term.expression->ToString();
+                });
+          });
       // Keep optimizer plans for ordinary aliased equi-joins, but preserve
       // the general relational path when the optimizer cannot yet prove a
       // safe implementation.  Non-equality joins and inner joins whose
@@ -1980,8 +2191,17 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                 });
           });
       if (multi_relation &&
-          (!uses_aliases || has_unqualified_column || has_non_equality_join ||
+          (has_aggregate || !uses_aliases || has_unqualified_column ||
+           has_non_equality_join ||
            has_join_only_source)) {
+        return emit_relational();
+      }
+      // The relational evaluator owns the post-projection ORDER BY scope.
+      // Keep computed ordering and direct SELECT aliases on that path until
+      // the optimizer can carry the projected schema through every physical
+      // sort boundary; otherwise a pushed-down sort sees qualified source
+      // names that are no longer in its child schema.
+      if (order_uses_projection_expression || order_uses_select_alias) {
         return emit_relational();
       }
       QueryData query;
@@ -2003,7 +2223,25 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         }
       }
       query.where_ = where ? where : ConstantValueExp(Value(true));
-      query.select_ = select->SelectList();
+      query.select_.reserve(select->SelectList().size());
+      for (const NamedExpression& item : select->SelectList()) {
+        NamedExpression copied = item;
+        // The SQL visitor gives an unaliased `o.key` projection the display
+        // name `key`.  QueryData's ProjectionPlan interprets a non-empty name
+        // as a new unqualified schema column, which would hide `o.key` from
+        // the decorrelated semi/anti join key contract. Keep the expression
+        // name for internal binding and let result_column_names_ provide the
+        // client-facing label.
+        if (copied.expression &&
+            copied.expression->Type() == TypeTag::kColumnValue) {
+          const ColumnName& column =
+              copied.expression->AsColumnValue().GetColumnName();
+          if (copied.name == column.name) {
+            copied.name.clear();
+          }
+        }
+        query.select_.push_back(std::move(copied));
+      }
       // Expand "*" projections here so the visible output width is the
       // expanded width; the optimizer's internal expansion would otherwise
       // disagree with visible_columns and truncate the final projection.
@@ -2063,17 +2301,42 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       const size_t visible_columns = query.select_.size();
       std::vector<Expression> sort_expressions;
       std::vector<bool> sort_ascending;
+      bool order_needs_projection_binding = false;
       sort_expressions.reserve(select->OrderBy().size());
       for (size_t i = 0; i < select->OrderBy().size(); ++i) {
         const auto& order = select->OrderBy()[i];
+        order_needs_projection_binding =
+            order_needs_projection_binding ||
+            order.expression->Type() != TypeTag::kColumnValue;
         query.order_expressions_.push_back(order.expression);
         query.order_ascending_.push_back(order.ascending);
         auto selected = std::ranges::find_if(
             query.select_, [&](const auto& item) {
-              return item.expression->ToString() ==
-                     order.expression->ToString();
+              if (item.expression->ToString() ==
+                  order.expression->ToString()) {
+                return true;
+              }
+              if (order.expression->Type() != TypeTag::kColumnValue ||
+                  item.name.empty()) {
+                return false;
+              }
+              const ColumnName& order_name =
+                  order.expression->AsColumnValue().GetColumnName();
+              return order_name.schema.empty() &&
+                     IdentifierEquals(item.name, order_name.name);
             });
         if (selected != query.select_.end()) {
+          // Keep the optimizer's required ordering in terms of the selected
+          // expression itself.  A bare ORDER BY alias is an output-schema
+          // name, not an input column, and retaining it here would make the
+          // lower projection attempt to resolve a column that does not exist
+          // in its child schema.
+          if (order.expression->Type() == TypeTag::kColumnValue &&
+              order.expression->AsColumnValue().GetColumnName().schema.empty() &&
+              selected->expression->ToString() !=
+                  order.expression->ToString()) {
+            query.order_expressions_.back() = selected->expression;
+          }
           // Sorting consumes the plan OUTPUT, whose columns are named by the
           // select list; normalize the key to that name so qualifiers
           // (table aliases) cannot break resolution after projection.
@@ -2085,9 +2348,23 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         } else {
           const std::string hidden_name = "$order" + std::to_string(i);
           query.select_.emplace_back(hidden_name, order.expression);
+          // ORDER BY a non-selected input is evaluated through this hidden
+          // projection column. Keep the logical ordering key on that output
+          // name so a pushed-down TopN never resolves against a child that
+          // intentionally does not expose the source column.
+          query.order_expressions_.back() = ColumnValueExp(hidden_name);
           sort_expressions.push_back(ColumnValueExp(hidden_name));
         }
         sort_ascending.push_back(order.ascending);
+        query.order_nulls_first_.push_back(order.nulls_first);
+      }
+      // Plan the keys that will actually be evaluated after projection.  A
+      // repeated expression such as `a * b` is represented by its output
+      // alias, so the TopN/Sort node does not resolve input columns against a
+      // schema that no longer contains them.
+      if (order_needs_projection_binding) {
+        query.order_expressions_ = sort_expressions;
+        query.order_ascending_ = sort_ascending;
       }
       // DISTINCT must see every row before truncation, so the optimizer is
       // not told about LIMIT here; Distinct -> Sort -> Limit stays in this

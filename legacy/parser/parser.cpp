@@ -247,7 +247,17 @@ std::unique_ptr<Statement> Parser::ParseSelect() {  // NOLINT(misc-no-recursion)
           (Peek().value == "ASC" || Peek().value == "DESC")) {
         ascending = Advance().value == "ASC";
       }
-      order_by.push_back({std::move(expression), ascending, std::nullopt});
+      std::optional<bool> nulls_first;
+      if (Peek().type == TokenType::kKeyword && Peek().value == "NULLS") {
+        Advance();
+        if (Peek().type != TokenType::kKeyword ||
+            (Peek().value != "FIRST" && Peek().value != "LAST")) {
+          throw std::runtime_error("expected FIRST or LAST after NULLS");
+        }
+        nulls_first = Advance().value == "FIRST";
+      }
+      order_by.push_back(
+          {std::move(expression), ascending, std::move(nulls_first)});
       if (Peek().type != TokenType::kComma) {
         break;
       }

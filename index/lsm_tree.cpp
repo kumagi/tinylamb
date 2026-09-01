@@ -181,20 +181,27 @@ bool LSMTree::Contains(std::string_view key) const {
 }
 
 void LSMTree::Write(std::string_view key, std::string_view value, bool sync) {
-  std::scoped_lock lk(mem_tree_lock_);
-  mem_tree_[std::string(key)] = LSMValue(std::string(value));
-  ++mem_tree_version_;
-  mem_tree_cv_.notify_one();
+  {
+    std::scoped_lock lk(mem_tree_lock_);
+    mem_tree_[std::string(key)] = LSMValue(std::string(value));
+    ++mem_tree_version_;
+    mem_tree_cv_.notify_one();
+  }
+  // Flush after releasing mem_tree_lock_: Sync() re-acquires it (a
+  // non-recursive mutex), so calling it while holding the lock deadlocked
+  // the calling thread.
   if (sync) {
     Sync();
   }
 }
 
 void LSMTree::Delete(std::string_view key, bool flush) {
-  std::scoped_lock lk(mem_tree_lock_);
-  mem_tree_[std::string(key)] = LSMValue::Delete();
-  ++mem_tree_version_;
-  mem_tree_cv_.notify_one();
+  {
+    std::scoped_lock lk(mem_tree_lock_);
+    mem_tree_[std::string(key)] = LSMValue::Delete();
+    ++mem_tree_version_;
+    mem_tree_cv_.notify_one();
+  }
   if (flush) {
     Sync();
   }
@@ -223,9 +230,16 @@ void LSMTree::Sync() {
   if (const Status s =
           SortedRun::Construct(new_index_file, to_flush, blob_, generation);
       s != Status::kSuccess) {
-    // The run file was removed by FlushInternal; keep frozen_mem_tree_
-    // populated so readers still see the data and the next tick retries.
+    // Merge the frozen snapshot back into mem_tree_ so writes made while the
+    // flush was failing stay newer than the failed snapshot on re-flush.
+    // Leaving frozen_mem_tree_ populated made the next Sync() re-swap the
+    // OLD snapshot back into mem_tree_, flushing newer data first and then
+    // re-issuing the stale values as a newer generation (stale reads /
+    // deleted-key resurrection).
     LOG(ERROR) << "flushing mem tree failed: " << s;
+    std::scoped_lock lk(mem_tree_lock_);
+    mem_tree_.merge(frozen_mem_tree_);
+    frozen_mem_tree_.clear();
     return;
   }
   {

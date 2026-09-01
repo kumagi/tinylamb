@@ -16,6 +16,8 @@ class LimitExecutor : public ExecutorBase {
   size_t offset_;
   size_t skipped_{0};
   size_t emitted_{0};
+  size_t consumed_rows_{0};
+  bool early_stop_{false};
 };
 }  // namespace tinylamb
 #endif

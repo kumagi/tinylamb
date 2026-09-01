@@ -93,7 +93,12 @@ Decoder& Decoder::operator>>(ValueType& v) {
 }
 
 Decoder& Decoder::operator>>(bool& v) {
-  is_->read(reinterpret_cast<char*>(&v), sizeof(v));
+  // Normalize any non-zero byte to `true`: reading the raw byte as the object
+  // representation of bool would be UB for values other than 0/1 (e.g. a
+  // corrupted stream carrying 0xFF).
+  uint8_t raw = 0;
+  is_->read(reinterpret_cast<char*>(&raw), sizeof(raw));
+  v = raw != 0;
   return *this;
 }
 }  // namespace tinylamb

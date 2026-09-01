@@ -474,7 +474,7 @@ std::string FormatDoubleShortest(double value) {
 [[nodiscard]] std::string Value::AsString() const {
   switch (type) {
     case ValueType::kNull:
-      return "(unknown type)";
+      return "NULL";
     case ValueType::kInt64:
       return std::to_string(value.int_value);
     case ValueType::kDate:
@@ -540,13 +540,14 @@ bool Value::operator==(const Value& rhs) const {
     case ValueType::kDouble: {
       const double lhs = value.double_value;
       const double rhs_double = rhs.value.double_value;
-      // Epsilon comparison: accumulated sums must compare equal to literals
-      // (e.g. SUM over doubles vs 22.44). Exact bit equality is too strict.
-      // Infinities compare equal only to themselves (inf - inf is NaN, so
-      // the epsilon test alone would report two -inf values unequal).
-      if (lhs == rhs_double) { return true; }
-      if (std::isnan(lhs) || std::isnan(rhs_double)) { return false; }
-      return std::fabs(lhs - rhs_double) < 1e-9;
+      // Exact equality, canonicalized like std::hash<Value>: every NaN
+      // compares equal to every other NaN (all NaNs fold into one hash
+      // bucket) and -0.0 equals +0.0.  The previous 1e-9 epsilon made
+      // equality non-transitive, contradicted operator< and std::hash, and
+      // merged distinct group keys; comparison sites that need fuzzy
+      // matching (e.g. accumulated sums) must opt in explicitly.
+      if (std::isnan(lhs) && std::isnan(rhs_double)) { return true; }
+      return lhs == rhs_double;
     }
     case ValueType::kArray:
       return ArrayElementSqlType() == rhs.ArrayElementSqlType() &&
@@ -629,12 +630,18 @@ std::string EncodeMemcomparableFormatDouble(double in) {
   uint64_t bits = 0;
   std::memcpy(&bits, &in, sizeof(bits));
   uint64_t be = htobe64(bits);
-  if (0 <= in) {
-    be |= 0x80;
-  } else {
+  if (in < 0) {
+    // Strictly negative: invert every byte.  (NaN and -0.0 fall through to
+    // the flag branch so the decoder's XOR restores their exact bits.)
     be = ~be;
   }
   std::memcpy(ret.data() + 1, &be, 8);
+  // Flip the sign bit in the first byte of the big-endian image.  The old
+  // `be |= 0x80` wrote the flag into the uint64's low byte, which memcpy
+  // happened to land on this byte only on little-endian hosts.
+  if (!(in < 0)) {
+    ret[1] |= static_cast<char>(0x80);
+  }
   return ret;
 }
 
@@ -1096,10 +1103,8 @@ uint64_t std::hash<tinylamb::Value>::operator()(
       };
       if (is_iv(sv)) {
         tinylamb::IntervalValue iv = tinylamb::IntervalValue::Parse(sv);
-        constexpr int64_t kDayNanos = 24LL * 3600LL * 1000000000LL;
-        constexpr int64_t kMonthNanos = 30LL * kDayNanos;
-        int64_t total = iv.months * kMonthNanos + iv.days * kDayNanos + iv.nanos;
-        return std::hash<int64_t>()(total);
+        // TotalNanos() is overflow-checked and matches IntervalValue::==.
+        return std::hash<int64_t>()(iv.TotalNanos());
       }
       return std::hash<std::string_view>()(sv);
     }

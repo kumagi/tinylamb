@@ -39,7 +39,10 @@ LogMessage::LogMessage(LogLevel log_level, const char* filename, int lineno,
   std::array<char, 70> buff{};
   auto now = std::chrono::system_clock::now();
   std::time_t now_time = std::chrono::system_clock::to_time_t(now);
-  std::tm now_tm = *std::localtime(&now_time);
+  std::tm now_tm{};
+  // localtime() is not thread-safe (shared static buffer); use the reentrant
+  // form so concurrent loggers on worker threads do not race.
+  std::ignore = localtime_r(&now_time, &now_tm);
   std::ignore =
       strftime(buff.data(), buff.size(), "%Y-%m-%d %H:%M:%S ", &now_tm);
 

@@ -84,6 +84,7 @@ Transaction::Transaction(Transaction&& o) noexcept
       prev_lsn_(o.prev_lsn_),
       status_(o.status_),
       read_only_(o.read_only_),
+      wounded_(o.wounded_.load(std::memory_order_acquire)),
       transaction_manager_(o.transaction_manager_) {
   if (o.transaction_manager_ != nullptr) {
     o.transaction_manager_->MoveActiveTransaction(&o, this);
@@ -112,6 +113,10 @@ bool Transaction::AddReadSet(const RowPosition& rp) {
   assert(!IsFinished());
   // MV2PL readers use snapshot-visible row versions and therefore never take
   // a lock that conflicts with a writer's exclusive lock.
+  // Hash joins may consume both children concurrently.  Index scans on those
+  // children register their reads against the same transaction, so protect
+  // the diagnostic set just like the version-cache state.
+  std::scoped_lock state_guard(*read_state_mutex_);
   read_set_.insert(rp);
   return true;
 }
@@ -127,6 +132,19 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
     return false;
   }
   // Do not remember a write until its MVCC intent has been reserved.
+  write_set_.insert(rp);
+  return true;
+}
+
+bool Transaction::AddWriteSet(const RowPosition& rp, std::string_view before) {
+  assert(!IsFinished());
+  if (read_only_) { return false; }
+  if (write_set_.contains(rp)) {
+    return true;
+  }
+  if (!transaction_manager_->AcquireWriteIntent(*this, rp, true, before)) {
+    return false;
+  }
   write_set_.insert(rp);
   return true;
 }

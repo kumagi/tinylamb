@@ -52,12 +52,11 @@ std::string ValueText(const Value& value) {
       return std::string(value.value.varchar_value);
     case ValueType::kDate:
       return value.AsString();
-    case ValueType::kDouble: {
-      std::ostringstream output;
-      output << std::setprecision(std::numeric_limits<double>::max_digits10)
-             << value.value.double_value;
-      return output.str();
-    }
+    case ValueType::kDouble:
+      // PostgreSQL emits the shortest round-tripping representation (0.1,
+      // not 0.10000000000000001); max_digits10 with the default float format
+      // always printed 17 digits.
+      return FormatDoubleShortest(value.value.double_value);
     case ValueType::kArray:
       return value.AsString();
   }
@@ -326,6 +325,16 @@ std::vector<std::string> SplitSqlStatements(std::string_view sql) {
         current.push_back('*');
         continue;
       }
+    }
+    // Backslash escapes the next character inside a single-quoted string
+    // (the parser decodes \', \" and \\): swallowing the pair here keeps
+    // `SELECT 'It\'s'; SELECT 2;` in two statements and prevents a `;`
+    // inside a string from splitting statements.
+    if (single_quote && current_char == '\\' && i + 1 < sql.size()) {
+      Append(current_char);
+      ++i;
+      Append(sql[i]);
+      continue;
     }
     if (!double_quote && !backtick_quote && current_char == '\'') {
       if (single_quote && next == '\'') {

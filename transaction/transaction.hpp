@@ -83,6 +83,11 @@ class Transaction final {
     status_ = o.status_;
     transaction_manager_ = o.transaction_manager_;
     read_only_ = o.read_only_;
+    // Carry the victim flag: a Wound() issued right before the move would
+    // otherwise be forgotten and the victim would keep running (and keep
+    // its write intents) forever.
+    wounded_.store(o.wounded_.load(std::memory_order_acquire),
+                   std::memory_order_release);
     if (o.transaction_manager_ != nullptr) {
       o.transaction_manager_->MoveActiveTransaction(&o, this);
     }
@@ -102,6 +107,10 @@ class Transaction final {
 
   bool AddReadSet(const RowPosition& rp);
   bool AddWriteSet(const RowPosition& rp);
+  // Like AddWriteSet, but installs `before` as the chain's base committed
+  // version so concurrent readers keep seeing the old row until the write is
+  // staged (prevents a phantom kNotExists during the intent window).
+  bool AddWriteSet(const RowPosition& rp, std::string_view before);
   bool TryAddWriteSet(const RowPosition& rp);
   StatusOr<std::string_view> ReadVersion(
       const RowPosition& rp, std::optional<std::string_view> physical);

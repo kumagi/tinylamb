@@ -118,6 +118,8 @@ bool IsComparisonOp(BinaryOperation op) {
     case BinaryOperation::kGreaterThanEquals:
     case BinaryOperation::kLike:
     case BinaryOperation::kNotLike:
+    case BinaryOperation::kIsDistinctFrom:
+    case BinaryOperation::kIsNotDistinctFrom:
       return true;
     default:
       return false;
@@ -171,6 +173,15 @@ bool Like(std::string_view value, std::string_view pattern) {
 
 Value EvaluateBinary(BinaryOperation op, const Value& left,
                      const Value& right) {
+  // These predicates are two-valued even when either operand is NULL.  Keep
+  // them ahead of the ordinary comparison NULL propagation below.
+  if (op == BinaryOperation::kIsDistinctFrom ||
+      op == BinaryOperation::kIsNotDistinctFrom) {
+    const bool equal = left.IsNull() || right.IsNull()
+                           ? left.IsNull() && right.IsNull()
+                           : left == right;
+    return Value(op == BinaryOperation::kIsNotDistinctFrom ? equal : !equal);
+  }
   if (op == BinaryOperation::kAnd) {
     if ((!left.IsNull() && !left.Truthy()) ||
         (!right.IsNull() && !right.Truthy())) {
@@ -594,6 +605,10 @@ Value EvaluateBinary(BinaryOperation op, const Value& left,
     };
     if (operand_is_nan(folded_left) || operand_is_nan(folded_right)) {
       switch (op) {
+        case BinaryOperation::kEquals:
+          return Value(false);
+        case BinaryOperation::kNotEquals:
+          return Value(true);
         case BinaryOperation::kLessThan:
         case BinaryOperation::kLessThanEquals:
         case BinaryOperation::kGreaterThan:

@@ -35,6 +35,7 @@
 namespace tinylamb {
 
 class SelectStatement;
+struct SetOperationTree;
 
 // Metadata needed by the relational executor for WITH RECURSIVE.  The
 // recursive body remains a normal SelectStatement; these fields identify the
@@ -341,6 +342,14 @@ class SelectStatement : public Statement {
   }
   [[nodiscard]] bool UnionDistinct() const { return union_distinct_; }
   [[nodiscard]] bool UnionByName() const { return union_by_name_; }
+  [[nodiscard]] const std::shared_ptr<SetOperationTree>&
+  GetSetOperationTree() const {
+    return set_operation_tree_;
+  }
+  void SetSetOperationTree(std::shared_ptr<SetOperationTree> tree) {
+    set_operation_tree_ = std::move(tree);
+    complex_ = true;
+  }
   void ClearUnionAll() {
     union_all_.clear();
     set_operation_kinds_.clear();
@@ -406,11 +415,23 @@ class SelectStatement : public Statement {
   std::vector<std::shared_ptr<SelectStatement>> union_all_;
   std::vector<SetOperationKind> set_operation_kinds_;
   std::vector<SetOperationMatch> set_operation_matches_;
+  std::shared_ptr<SetOperationTree> set_operation_tree_;
   bool union_distinct_{false};
   bool union_by_name_{false};
   bool as_struct_{false};
   bool complex_{false};
   mutable std::string cached_fingerprint_;
+};
+
+// Parenthesized set-operation groups cannot be represented by the legacy
+// flat UnionAll()/SetOperationKinds() vectors.  Keep the original flat form
+// for optimizer compatibility, and attach this tree for execution whenever a
+// query contains an explicitly grouped operand.
+struct SetOperationTree {
+  std::shared_ptr<SelectStatement> first;
+  std::vector<std::shared_ptr<SelectStatement>> branches;
+  std::vector<SetOperationKind> kinds;
+  bool grouped{false};
 };
 
 enum class InsertMode : uint8_t { kDefault, kIgnore, kUpdate, kReplace };

@@ -36,11 +36,13 @@ std::string Hex(std::string_view in) {
 }
 
 std::string OmittedString(std::string_view original, int length) {
-  if ((size_t)length < original.length()) {
+  const size_t size = original.length();
+  // The abbreviated form needs a disjoint 8-byte head and tail: bail out when
+  // the string is too short to split (or the limit is negative).
+  if (0 < length && static_cast<size_t>(length) + 16 <= size) {
     std::string omitted_key = std::string(original).substr(0, 8);
-    omitted_key +=
-        "..(" + std::to_string(original.length() - length + 4) + "bytes)..";
-    omitted_key += original.substr(original.length() - 8);
+    omitted_key += "..(" + std::to_string(size - length + 4) + "bytes)..";
+    omitted_key += original.substr(size - 8);
     return omitted_key;
   }
   return std::string(original);

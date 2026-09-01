@@ -14,12 +14,16 @@ bool LimitExecutor::Next(Row* dst, RowPosition* rp) {
     if (!source_->Next(&ignored, nullptr)) { return false;
 }
     ++skipped_;
+    ++consumed_rows_;
   }
-  if (limit_ != 0 && emitted_ >= limit_) { return false;
+  if (limit_ != 0 && emitted_ >= limit_) {
+    early_stop_ = true;
+    return false;
 }
   if (!source_->Next(dst, rp)) { return false;
 }
   ++emitted_;
+  ++consumed_rows_;
   return true;
 }
 void LimitExecutor::Dump(std::ostream& output, int indent) const {
@@ -27,5 +31,9 @@ void LimitExecutor::Dump(std::ostream& output, int indent) const {
          << " (Limit count=" << limit_ << " offset=" << offset_ << ")\n"
          << Indent(static_cast<size_t>(indent) + 2);
   source_->Dump(output, indent + 2);
+  if (early_stop_) {
+    output << "\n" << Indent(indent)
+           << "Limit early_stop=true consumed_rows=" << consumed_rows_;
+  }
 }
 }  // namespace tinylamb

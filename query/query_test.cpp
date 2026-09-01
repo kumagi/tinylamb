@@ -31,7 +31,9 @@
 #include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "executor/constant_executor.hpp"
+#include "executor/detail/relation.hpp"
 #include "executor/detail/window_eval.hpp"
+#include "executor/detail/subquery_runtime.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/insert.hpp"
 #include "expression/window_function_expression.hpp"
@@ -90,10 +92,29 @@ class QueryTest : public ::testing::Test {
       }
       case StatementType::kSelect: {
         auto& select = dynamic_cast<SelectStatement&>(*stmt);
+        // The legacy QueryData adapter predates CTE and set-operation
+        // metadata.  Route those statements through the canonical relational
+        // executor instead of silently executing only the first UNION branch.
+        if (!select.UnionAll().empty() || !select.WithQueries().empty()) {
+          relational_detail::Relation relation =
+              relational_detail::ExecuteQuery(ctx, select, nullptr, {});
+          std::vector<Row> rows;
+          relation.ForEachRow(
+              [&rows](const Row& row) { rows.push_back(row); });
+          return {std::make_shared<ConstantExecutor>(std::move(rows))};
+        }
         QueryData query;
         query.from_ = select.FromClause();
         query.where_ = select.WhereClause();
         query.select_ = select.SelectList();
+        for (const SelectStatement::OrderByTerm& term : select.OrderBy()) {
+          query.order_expressions_.push_back(term.expression);
+          query.order_ascending_.push_back(term.ascending);
+          query.order_nulls_first_.push_back(term.nulls_first);
+        }
+        query.limit_count_ = select.HasLimit() ? select.Limit() : 0;
+        query.limit_offset_ = select.Offset();
+        query.distinct_ = select.Distinct();
         ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
         return plan->EmitExecutor(ctx);
       }
@@ -597,6 +618,35 @@ TEST_F(QueryTest, SqlEngineWindowFunctionsPartitionRankAndCumulativeSum) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, WindowRangeOffsetFollowingStartBoundsFrameCorrectly) {
+  // PRODUCTION BUG (fixed): `RANGE BETWEEN 1 FOLLOWING AND UNBOUNDED
+  // FOLLOWING` collapsed every frame start onto the last row, so the SUM
+  // reported only the final partition row's value.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE wf (k INT64, v INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO wf VALUES (1, 10), (2, 20), (3, 30), (5, 50), "
+         "(8, 80);");
+
+  // Frame start = first row with k >= k + 1:
+  //   k=1 -> rows k=2,3,5,8 -> 20+30+50+80 = 180
+  //   k=2 -> rows k=3,5,8 -> 160
+  //   k=3 -> rows k=5,8 -> 130
+  //   k=5 -> row k=8 -> 80
+  //   k=8 -> no row with k >= 9 -> empty frame (NULL per SQL)
+  const std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT k, SUM(v) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING "
+             "AND UNBOUNDED FOLLOWING) FROM wf ORDER BY k;");
+  ASSERT_EQ(rows.size(), 5U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(180)}));
+  EXPECT_EQ(rows[1], Row({Value(2), Value(160)}));
+  EXPECT_EQ(rows[2], Row({Value(3), Value(130)}));
+  EXPECT_EQ(rows[3], Row({Value(5), Value(80)}));
+  EXPECT_TRUE(rows[4][1].IsNull());
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, WindowGroupsFrameUsesPeerGroups) {
   TransactionContext ctx = db_->BeginContext();
   auto window = std::make_shared<WindowFunctionCallExpression>();
@@ -720,6 +770,39 @@ TEST_F(QueryTest, SqlEngineUnionAllConcatenatesMultipleBranches) {
       RunSql(ctx, *db_, "SELECT v FROM u UNION ALL SELECT v FROM u LIMIT 3;");
   EXPECT_EQ(limited_union, (std::vector<Row>{Row({Value(1)}), Row({Value(2)}),
                                              Row({Value(1)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, MixedSetOperationChainsHonorPerPairOperators) {
+  // PRODUCTION BUG (fixed): the visitor derived ONE kind from the
+  // SetOperation detail and applied it to every pair, so
+  // `A EXCEPT B UNION ALL C` executed as `A EXCEPT B EXCEPT C` and
+  // `UNION ALL ... INTERSECT ...` lost the INTERSECT entirely.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE m (x INT64);");
+  RunSql(ctx, *db_, "INSERT INTO m VALUES (1), (2);");
+
+  // {1,2} EXCEPT {3} UNION ALL {4} = {1,2,4}; the old code returned {1,2}.
+  const std::vector<Row> mixed = RunSql(
+      ctx, *db_,
+      "SELECT x FROM m EXCEPT DISTINCT SELECT 3 UNION ALL SELECT 4;");
+  ASSERT_EQ(mixed.size(), 3U);
+  EXPECT_NE(std::ranges::find(mixed, Row({Value(1)})), mixed.end());
+  EXPECT_NE(std::ranges::find(mixed, Row({Value(2)})), mixed.end());
+  EXPECT_NE(std::ranges::find(mixed, Row({Value(4)})), mixed.end());
+
+  // `1 UNION ALL (2 INTERSECT DISTINCT 2)` = {1, 2}; the old code returned
+  // three rows.
+  const std::vector<Row> intersect_chain =
+      RunSql(ctx, *db_,
+             "SELECT 1 UNION ALL SELECT 2 INTERSECT DISTINCT SELECT 2;");
+  ASSERT_EQ(intersect_chain.size(), 2U);
+
+  // A trailing UNION DISTINCT pair must de-duplicate its own result.
+  const std::vector<Row> distinct_tail =
+      RunSql(ctx, *db_,
+             "SELECT x FROM m UNION ALL SELECT 9 UNION DISTINCT SELECT 9;");
+  ASSERT_EQ(distinct_tail.size(), 3U);
   ctx.txn_.Abort();
 }
 
@@ -1557,6 +1640,38 @@ TEST_F(QueryTest, PivotAndUnpivotExecution) {
   EXPECT_EQ(res_u[3][1], Value(40));
   EXPECT_EQ(res_u[3][2], Value("q2"));
 
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, OrderByHonorsExplicitNullsFirstLast) {
+  // PRODUCTION BUG (fixed): SortExecutor dropped the explicit NULLS FIRST /
+  // NULLS LAST request (TopN honored it), so the position of NULLs changed
+  // merely by adding LIMIT to the same ORDER BY.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE nls (x INT64);");
+  RunSql(ctx, *db_, "INSERT INTO nls VALUES (2), (NULL), (1);");
+
+  const std::vector<Row> asc_last = RunSql(
+      ctx, *db_, "SELECT x FROM nls ORDER BY x ASC NULLS LAST;");
+  ASSERT_EQ(asc_last.size(), 3U);
+  EXPECT_EQ(asc_last[0][0], Value(1));
+  EXPECT_EQ(asc_last[1][0], Value(2));
+  EXPECT_TRUE(asc_last[2][0].IsNull());
+
+  const std::vector<Row> desc_first =
+      RunSql(ctx, *db_, "SELECT x FROM nls ORDER BY x DESC NULLS FIRST;");
+  ASSERT_EQ(desc_first.size(), 3U);
+  EXPECT_TRUE(desc_first[0][0].IsNull());
+  EXPECT_EQ(desc_first[1][0], Value(2));
+  EXPECT_EQ(desc_first[2][0], Value(1));
+
+  // TopN (LIMIT) and Sort must agree on the same ORDER BY.
+  const std::vector<Row> topn_last = RunSql(
+      ctx, *db_, "SELECT x FROM nls ORDER BY x ASC NULLS LAST LIMIT 3;");
+  ASSERT_EQ(topn_last.size(), 3U);
+  for (size_t i = 0; i < 3; ++i) {
+    EXPECT_EQ(topn_last[i], asc_last[i]);
+  }
   ctx.txn_.Abort();
 }
 

@@ -13,6 +13,7 @@
 #include "executor/pdqsort.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/sort.hpp"
+#include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
@@ -129,9 +130,20 @@ size_t IncrementalSortExecutor::NextBatch(DataChunk* destination,
   return count;
 }
 
-void IncrementalSortExecutor::Dump(std::ostream& o, int /*indent*/) const {
-  o << "IncrementalSort(prefix_keys=" << prefix_keys_.size()
-    << ", suffix_keys=" << suffix_keys_.size() << ")";
+void IncrementalSortExecutor::Dump(std::ostream& o, int indent) const {
+  o << "IncrementalSort";
+  if (!prefix_keys_.empty() && prefix_keys_.front().expression) {
+    const Expression& prefix = prefix_keys_.front().expression;
+    if (prefix->Type() == TypeTag::kColumnValue) {
+      o << " presorted=" << prefix->AsColumnValue().GetColumnName().name;
+    } else {
+      o << " presorted=" << prefix->ToString();
+    }
+  }
+  o << " (prefix_keys=" << prefix_keys_.size()
+    << ", suffix_keys=" << suffix_keys_.size() << ")\n"
+    << Indent(indent + 2);
+  source_->Dump(o, indent + 2);
 }
 
 void IncrementalSortExecutor::Explain(std::ostream& o, int indent) const {

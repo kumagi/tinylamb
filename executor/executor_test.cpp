@@ -747,6 +747,64 @@ TEST_F(ExecutorTest, Aggregation) {
   ASSERT_FALSE(agg.Next(&result, nullptr));
 }
 
+TEST_F(ExecutorTest, MixedAggregateKeepsBitAndResult) {
+  // PRODUCTION BUG (fixed): when a typed aggregate (BIT_AND) shared the row
+  // loop with a generic one (STRING_AGG), the typed aggregate owned no
+  // accumulator and the row-wise switch had no BIT_* cases, so it silently
+  // produced NULL.
+  const Schema schema("bits", {Column("x", ValueType::kInt64),
+                               Column("y", ValueType::kVarChar)});
+  auto src = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value(int64_t{5}), Value("a")}),
+      Row({Value(int64_t{1}), Value("b")}),
+      Row({Value(int64_t{3}), Value("c")}),
+  });
+  std::vector<NamedExpression> aggregates = {
+      NamedExpression("bit_and", AggregateExpressionExp(
+                                     AggregationType::kBitAnd,
+                                     ColumnValueExp("x"))),
+      NamedExpression("str", AggregateExpressionExp(AggregationType::kStringAgg,
+                                                    ColumnValueExp("y")))};
+  AggregationExecutor agg(src, schema, aggregates);
+  Row result;
+  ASSERT_TRUE(agg.Next(&result, nullptr));
+  EXPECT_EQ(result[0], Value(int64_t{1}));  // 5 & 1 & 3
+  EXPECT_EQ(result[1], Value("a,b,c"));
+}
+
+TEST_F(ExecutorTest, MinMaxWithNaNIsNaNAcrossPaths) {
+  // PRODUCTION BUG (fixed): the typed fast paths skipped NaN (IEEE compares
+  // false) while the ground truth accumulator returns NaN for any group
+  // containing NaN, so the result depended on the execution path.
+  const Schema schema("nans", {Column("v", ValueType::kDouble)});
+  auto make_src = [] {
+    return std::make_shared<ConstantExecutor>(std::vector<Row>{
+        Row({Value(std::numeric_limits<double>::quiet_NaN())}),
+        Row({Value(3.0)}),
+    });
+  };
+  auto make_aggregates = [] {
+    return std::vector<NamedExpression>{
+        NamedExpression("min", AggregateExpressionExp(AggregationType::kMin,
+                                                      ColumnValueExp("v"))),
+        NamedExpression("max", AggregateExpressionExp(AggregationType::kMax,
+                                                      ColumnValueExp("v")))};
+  };
+
+  AggregationExecutor serial(make_src(), schema, make_aggregates());
+  Row serial_result;
+  ASSERT_TRUE(serial.Next(&serial_result, nullptr));
+  EXPECT_TRUE(std::isnan(serial_result[0].value.double_value));
+  EXPECT_TRUE(std::isnan(serial_result[1].value.double_value));
+
+  ParallelAggregationExecutor parallel(make_src(), schema, make_aggregates(),
+                                       2);
+  Row parallel_result;
+  ASSERT_TRUE(parallel.Next(&parallel_result, nullptr));
+  EXPECT_TRUE(std::isnan(parallel_result[0].value.double_value));
+  EXPECT_TRUE(std::isnan(parallel_result[1].value.double_value));
+}
+
 TEST_F(ExecutorTest, VectorizedScanFilterProjectAggregatePipeline) {
   TransactionContext ctx = rs_->BeginContext();
   const StatusOr<std::shared_ptr<Table>> table_status = ctx.GetTable(kTableName);
@@ -1674,6 +1732,42 @@ TEST_F(ExecutorTest, HashJoinNextBatchAndDump) {
   EXPECT_NE(ss.str().find("PartitionedHashJoin"), std::string::npos);
 }
 
+TEST_F(ExecutorTest, HashJoinSpilledBuildKeepsNullProbeKeyOutOfAntiOutput) {
+  // PRODUCTION BUG (fixed): with the build side spilled, the resident-probe
+  // path used a bool match array, so a NULL probe key ("no match") was
+  // emitted for anti joins although NULL NOT IN (...) is UNKNOWN.
+  const size_t original = QueryMemoryBudget::Global().Limit();
+  QueryMemoryBudget::Global().ResetForTest(8192);
+  struct Restore {
+    size_t value;
+    ~Restore() { QueryMemoryBudget::Global().ResetForTest(value); }
+  } restore{original};
+
+  // Build side needs enough rows to exceed the tiny budget.
+  std::vector<Row> build_rows;
+  for (int64_t i = 0; i < 400; ++i) {
+    build_rows.emplace_back(Row({Value(i)}));
+  }
+  auto build = std::make_shared<ConstantExecutor>(build_rows);
+  // Probe: NULL, 399 (matches), 500 (no match). Only 500 may survive anti.
+  auto probe = std::make_shared<ConstantExecutor>(std::vector<Row>{
+      Row({Value()}),
+      Row({Value(int64_t{399})}),
+      Row({Value(int64_t{500})}),
+  });
+  HashJoin join(probe, {0}, build, {0}, HashJoinMode::kInMemory,
+                JoinKind::kNullAwareAnti);
+  join.MaterializePipeline();
+  std::vector<Row> out;
+  Row row;
+  RowPosition rp;
+  while (join.Next(&row, &rp)) {
+    out.push_back(row);
+  }
+  ASSERT_EQ(out.size(), 1U);
+  EXPECT_EQ(out[0][0], Value(int64_t{500}));
+}
+
 TEST_F(ExecutorTest, HashJoinWithMultipleJoinColumnsDumpsAllKeys) {
   auto left = std::make_shared<ConstantExecutor>(
       std::vector<Row>{Row({Value(1), Value(10), Value("l")})});
@@ -2187,18 +2281,15 @@ TEST_F(ExecutorTest, RelationalDatePlusDateThrows) {
 }
 
 TEST_F(ExecutorTest, RelationalCorrelatedSubqueryOverNullOuterDocumentsBug) {
-  // PRODUCTION BUG: a correlated EXISTS whose outer column is NULL crashes.
-  // ExecuteCorrelatedSingleSource encodes the outer values (including NULL)
-  // into the cache key *before* the IsNull() guard at relational.cpp:1752, so
-  // Row::EncodeMemcomparableFormat() throws "Cannot encode unknown type"
-  // instead of returning an empty relation. The null-extension branch of the
-  // code is therefore dead and this test documents the observed behavior.
-  ExpectMessageContains(RelationalThrow(*rs_, "SELECT o.key FROM SampleTable AS "
-                                              "o LEFT JOIN SampleTable AS b ON "
-                                              "o.key = b.key AND b.key = 99 "
-                                              "WHERE EXISTS (SELECT 1 FROM "
-                                              "SampleTable WHERE b.key = key);"),
-                        "Cannot encode unknown type");
+  // A correlated EXISTS whose outer column is NULL must evaluate to UNKNOWN,
+  // not attempt to encode NULL in the correlated-subquery cache key and
+  // crash.  The LEFT JOIN below null-extends b for every outer row, so the
+  // EXISTS predicate rejects every row.
+  const auto rows = RelationalRun(
+      *rs_, "SELECT o.key FROM SampleTable AS o LEFT JOIN SampleTable AS b ON "
+            "o.key = b.key AND b.key = 99 WHERE EXISTS (SELECT 1 FROM "
+            "SampleTable WHERE b.key = key);");
+  EXPECT_TRUE(rows.empty());
 }
 
 TEST_F(ExecutorTest, AggregationExpressionChildIsEvaluatedPerRow) {
@@ -2428,6 +2519,35 @@ std::string RelationalExplain(Database& database, std::string_view sql,
 
 }  // namespace
 
+TEST_F(ExecutorTest, RelationalIdenticalUncorrelatedSubqueriesShareResult) {
+  // The two QueryExpression nodes are allocated independently by the SQL
+  // visitor. Structural caching must nevertheless execute the same scalar
+  // subquery once and serve the second occurrence from the shared result.
+  const std::string plan = RelationalExplain(
+      *rs_,
+      "SELECT key, (SELECT MAX(key) FROM SampleTable) AS first_value, "
+      "(SELECT MAX(key) FROM SampleTable) AS second_value "
+      "FROM SampleTable ORDER BY key;",
+      /*analyze=*/true);
+  EXPECT_NE(plan.find("ScalarSubquery executions=1"), std::string::npos)
+      << plan;
+  EXPECT_GT(StatsValue(plan, "uncorrelated_cache_hits="), 0) << plan;
+}
+
+TEST_F(ExecutorTest, RelationalCorrelatedDerivedSubqueryUsesApplyCache) {
+  // A derived source prevents the specialized single-table equality index,
+  // but repeated outer parameter tuples are still safe to cache. The cross
+  // join evaluates each key four times, so later probes reuse the result.
+  const std::string query =
+      "SELECT o.key FROM SampleTable AS o CROSS JOIN SampleTable AS b "
+      "WHERE (SELECT COUNT(*) FROM (SELECT key FROM SampleTable) AS i "
+      "WHERE i.key = o.key) > 0 ORDER BY o.key;";
+  const auto rows = RelationalRun(*rs_, query);
+  ASSERT_EQ(rows.size(), 16U);
+  const std::string plan = RelationalExplain(*rs_, query, true);
+  EXPECT_GT(StatsValue(plan, "correlated_result_cache_hits="), 0) << plan;
+}
+
 TEST_F(ExecutorTest, RelationalHybridHashJoinSpillsUnderBudget) {
   CreateWideTable(*rs_, "WideJoin", 200);
   ScopedQueryMemory memory(65536);  // 200 x ~236B rows cannot all stay resident
@@ -2594,6 +2714,19 @@ TEST_F(ExecutorTest, RelationalInSubqueryKeepsSpilledRows) {
   const auto rows = RelationalRun(
       *rs_, "SELECT key FROM WideIn WHERE key IN (SELECT key FROM WideIn);");
   EXPECT_EQ(rows.size(), 200U);
+}
+
+TEST_F(ExecutorTest, RelationalWindowFunctionKeepsSpilledRows) {
+  // PRODUCTION BUG (fixed): ApplyWindows collected only input.rows, so a
+  // memory-budget spill silently dropped every spilled input row and the
+  // window query returned a fraction of (or zero) rows.
+  CreateWideTable(*rs_, "WideWin", 200);
+  ScopedQueryMemory memory(65536);
+  const auto rows = RelationalRun(
+      *rs_, "SELECT key, SUM(key) OVER (ORDER BY key ROWS BETWEEN "
+            "UNBOUNDED PRECEDING AND CURRENT ROW) FROM WideWin;");
+  ASSERT_EQ(rows.size(), 200U);
+  EXPECT_FALSE(rows[199][1].IsNull());
 }
 
 // Segfaults: correlated EXISTS + cross join under memory budget (spill path).

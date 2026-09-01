@@ -69,8 +69,15 @@ bool RejectsNulls(const Expression& expression,
         case BinaryOperation::kGreaterThanEquals:
         case BinaryOperation::kLike:
         case BinaryOperation::kNotLike:
+        case BinaryOperation::kIsDistinctFrom:
+        case BinaryOperation::kIsNotDistinctFrom:
           // Any NULL operand makes the comparison NULL: one rejecting side
-          // is enough.
+          // is enough.  Null-safe comparisons are two-valued and therefore
+          // cannot prove that a NULL-padded outer row is rejected.
+          if (binary.Op() == BinaryOperation::kIsDistinctFrom ||
+              binary.Op() == BinaryOperation::kIsNotDistinctFrom) {
+            return false;
+          }
           return RejectsNulls(binary.Left(), qualifier) ||
                  RejectsNulls(binary.Right(), qualifier);
       }

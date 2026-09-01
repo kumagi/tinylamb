@@ -31,76 +31,8 @@
 #include "database/database.hpp"
 #include "executor/executor_base.hpp"
 #include "query/sql_engine.hpp"
+#include "server/postgres_protocol.hpp"
 #include "type/row.hpp"
-
-namespace {
-
-// Minimal statement splitter for stdin scripts: semicolons outside single
-// quotes, double-quoted identifiers, dollar-quoted strings, and comments
-// separate statements; empty statements are dropped. The server library has
-// pgwire::SplitSqlStatements, but it is not linked into this executable.
-std::vector<std::string> SplitSqlStatements(std::string_view sql) {
-  std::vector<std::string> statements;
-  size_t begin = 0;
-  size_t i = 0;
-  auto emit = [&](size_t end) {
-    const std::string_view piece = sql.substr(begin, end - begin);
-    if (piece.find_first_not_of(" \t\r\n") != std::string_view::npos) {
-      statements.emplace_back(piece);
-    }
-  };
-  while (i < sql.size()) {
-    const char c = sql[i];
-    if (c == '\'') {
-      ++i;
-      while (i < sql.size()) {
-        if (sql[i] == '\'' && i + 1 < sql.size() && sql[i + 1] == '\'') {
-          i += 2;
-          continue;
-        }
-        if (sql[i] == '\'') { break;
-}
-        ++i;
-      }
-    } else if (c == '"') {
-      ++i;
-      while (i < sql.size() && sql[i] != '"') { ++i;
-}
-    } else if (c == '$') {
-      size_t tag_end = i + 1;
-      while (tag_end < sql.size() && sql[tag_end] != '$' &&
-             (std::isalnum(static_cast<unsigned char>(sql[tag_end])) != 0 ||
-              sql[tag_end] == '_')) {
-        ++tag_end;
-      }
-      if (tag_end < sql.size() && sql[tag_end] == '$') {
-        const std::string_view tag = sql.substr(i, tag_end + 1 - i);
-        const size_t body = sql.find(tag, tag_end + 1);
-        if (body == std::string_view::npos) {
-          i = sql.size();
-        } else {
-          i = body + tag.size();
-        }
-        continue;
-      }
-    } else if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-      while (i < sql.size() && sql[i] != '\n') { ++i;
-}
-    } else if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-      const size_t close_pos = sql.find("*/", i + 2);
-      i = close_pos == std::string_view::npos ? sql.size() : close_pos + 2;
-      continue;
-    } else if (c == ';') {
-      emit(i);
-      begin = i + 1;
-    }
-    ++i;
-  }
-  emit(sql.size());
-  return statements;
-}
-
-}  // namespace
 
 int main(int argc, char** argv) {
   // --force: a torn/unparsable WAL tail is truncated to its intact prefix
@@ -121,7 +53,7 @@ int main(int argc, char** argv) {
   std::string sql((std::istreambuf_iterator<char>(std::cin)),
                   std::istreambuf_iterator<char>());
   const std::vector<std::string> statements =
-      SplitSqlStatements(sql);
+      tinylamb::pgwire::SplitSqlStatements(sql);
   if (statements.empty()) {
     std::cerr << "no SQL was provided on standard input\n";
     return 2;

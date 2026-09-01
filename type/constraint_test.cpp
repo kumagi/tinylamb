@@ -87,7 +87,11 @@ TEST(ConstraintTest, Equality_WithEqualAndUnequalInstances_EvaluatesExpectedly) 
   ASSERT_NE(nothing1, unique);
   ASSERT_EQ(def2_a, def2_b);
   ASSERT_NE(def2_a, def3);
-  ASSERT_EQ(foreign2, foreign3);
+  // Fixed: kForeign now compares its payload (a referenced table), matching
+  // std::hash; different payloads are different constraints.
+  ASSERT_NE(foreign2, foreign3);
+  ASSERT_EQ(foreign2, Constraint(Constraint::kForeign, Value(2)));
+  ASSERT_NE(foreign2, unique);
 }
 
 TEST(ConstraintTest, Accessors_ForVariousKinds_ReturnsExpectedBooleans) {
@@ -146,6 +150,27 @@ TEST(ConstraintTest, Dump_ToLogStream_SucceedsWithoutCrash) {
 
   LOG(INFO) << c;
   LOG(WARN) << d;
+}
+
+TEST(ConstraintTest, Equality_IsConsistentWithHash_ForValueBearingKinds) {
+  // Fixed: kForeign/kCheck ignored `value` in == while std::hash included
+  // it, violating the unordered-container contract (equal objects with
+  // different hashes).
+  std::hash<Constraint> hasher;
+
+  const Constraint foreign_a(Constraint::kForeign, Value("t1"));
+  const Constraint foreign_b(Constraint::kForeign, Value("t2"));
+  const Constraint foreign_a2(Constraint::kForeign, Value("t1"));
+  const Constraint check_a(Constraint::kCheck, Value("x > 0"));
+  const Constraint check_b(Constraint::kCheck, Value("x < 0"));
+
+  EXPECT_NE(foreign_a, foreign_b);
+  EXPECT_EQ(hasher(foreign_a), hasher(foreign_a2));
+  EXPECT_EQ(foreign_a, foreign_a2);
+  EXPECT_NE(check_a, check_b);
+
+  // Equal-by-== objects must hash equally (unordered container contract).
+  EXPECT_EQ(hasher(foreign_a), hasher(foreign_a2));
 }
 
 }  // namespace tinylamb

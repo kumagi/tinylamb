@@ -118,6 +118,7 @@ Cascades rule / cost / statistics
 - [x] Incremental Sortを実装する。
 - [x] Partial Sortを実装する。
 - [ ] FullScanがclustered index orderを安全に報告する。
+- [x] `IncrementalSort` を入力の既存順序 prefix と suffix ソートへ接続する。
 - [x] Skip Scan DISTINCTを実装する。
 - [ ] collation対応比較を実装する（NULL順序だけの対応から拡張する）。
 - [ ] buffered sortとexternal mergeのimplementation ruleを分離する。
@@ -131,7 +132,8 @@ Cascades rule / cost / statistics
 - [ ] `StreamAggregate` の入力順序契約と実行器を接続する。
 - [x] `PartialAggregate` + `FinalizeAggregate`を実装する。
 - [x] `TwoPhaseDistinctAgg`を実装する。
-- [ ] MIN/MAXのindex-only aggregate scanを実装する。
+- [x] MIN/MAXのindex-only aggregate scanを実装する（非NULLな単一キー列を
+      順序付きインデックスの先頭1件から取得）。
 - [x] SQL標準 `FILTER (WHERE ...)` をASTから実行器まで接続する。
 - [x] Ordered-set aggregate（PERCENTILE_CONT / WITHIN GROUP）を実装する。
 - [x] Grouping Sets / Rollup / Cube executorを実装する。

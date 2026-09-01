@@ -45,6 +45,11 @@ struct CorrelatedIndex {
   std::vector<ColumnName> outer_columns;
   std::vector<ColumnName> cache_outer_columns;
   std::unordered_map<std::string, RelationPtr> cached_results;
+  // Every parameter tuple observed by the Apply operator, including the
+  // NULL tuple which is intentionally not inserted into cached_results.
+  // Keeping this separate from cached_results lets EXPLAIN ANALYZE report the
+  // actual distinct-key cardinality without pretending NULL is cacheable.
+  std::unordered_set<std::string> parameter_keys_seen;
   bool preaggregated{false};
 };
 
@@ -67,8 +72,19 @@ struct ExecutionRuntime {
       correlated_indexes;
   std::unordered_set<const SelectStatement*> unindexable_queries;
   std::unordered_map<const SelectStatement*, RelationPtr> uncorrelated_results;
+  // Structural cache for equivalent uncorrelated subqueries.  The pointer
+  // keyed cache above is retained for address-local bookkeeping, while this
+  // map lets separately allocated but identical QueryExpression nodes share
+  // one execution (CSE across a SELECT list).
+  std::unordered_map<std::string, RelationPtr>
+      uncorrelated_results_by_fingerprint;
   std::unordered_map<const SelectStatement*, std::unordered_set<Value>>
       uncorrelated_membership;
+  std::unordered_map<std::string, std::unordered_set<Value>>
+      uncorrelated_membership_by_fingerprint;
+  // Results for correlated subqueries which cannot use the specialized
+  // single-table equality index.
+  std::unordered_map<std::string, RelationPtr> correlated_apply_results;
   std::unordered_set<const SelectStatement*> noncacheable_queries;
   // Keep-alives for every subquery statement whose address keys the caches
   // above.  Prepared executors are freed between statements, and a later
@@ -85,6 +101,7 @@ struct ExecutionRuntime {
   size_t uncorrelated_cache_hits{0};
   size_t uncorrelated_hash_builds{0};
   size_t uncorrelated_hash_probes{0};
+  size_t exists_short_circuit_queries{0};
   double scan_ms{0};
   double filter_ms{0};
   double join_ms{0};
@@ -102,9 +119,31 @@ struct ExecutionRuntime {
   size_t key_filter_scans{0};
   size_t key_filter_keys{0};
   size_t key_filter_rejected{0};
+  size_t key_filter_null_rejected{0};
+  bool empty_build_short_circuit{false};
+  bool null_aware_anti_build_contains_null{false};
 };
 
 double ElapsedMs(std::chrono::steady_clock::time_point begin);
+
+// Cache key shared by scalar/EXISTS result caching and IN membership caching.
+// The inherited CTE identities are part of the key because the same query
+// text can resolve a CTE name to different materialized relations at nested
+// scopes.  EXISTS uses a capped execution representation, so it has its own
+// mode and must never share a relation with scalar/IN consumers.
+std::string UncorrelatedCacheKey(const SelectStatement& statement,
+                                 const CteMap& ctes, bool exists_only);
+
+// General correlated Apply fallback. The key contains the complete outer
+// scope chain, which is conservative (it may miss reuse for irrelevant outer
+// columns) but is safe for arbitrary correlated expressions.
+std::string CorrelatedApplyCacheKey(const SelectStatement& statement,
+                                    const Scope* outer, const CteMap& ctes,
+                                    bool exists_only);
+
+// Volatile functions make a correlated result unsafe to reuse. Stable and
+// immutable functions are statement-stable and may participate in the cache.
+bool StatementContainsVolatileFunction(const SelectStatement& statement);
 
 void CountStatementTables(const SelectStatement& statement,
                           std::unordered_map<std::string, size_t>* counts);
@@ -118,6 +157,12 @@ const std::vector<slot_t>* ReusableProjection(TransactionContext& context,
 Relation ExecuteQuery(TransactionContext& context,
                       const SelectStatement& statement, const Scope* outer,
                       const CteMap& inherited_ctes);
+
+// Applies one safe top-level derived-table boundary rewrite.  The relational
+// executor repeatedly calls this until it reaches a fixed point; EXPLAIN uses
+// the same helper so its displayed shape matches the executable query shape.
+std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
+    const SelectStatement& statement, const CteMap& inherited_ctes);
 
 Relation FinishQuery(TransactionContext& context,
                      const SelectStatement& statement, Relation input,
@@ -141,11 +186,12 @@ Value ProjectSubqueryRow(const Row& row, bool as_struct,
 
 std::optional<Relation> ExecuteCorrelatedSingleSource(
     TransactionContext& context, const SelectStatement& statement,
-    const Scope& outer, const CteMap& ctes);
+    const Scope& outer, const CteMap& ctes, bool exists_only = false);
 
 const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
                                           const SelectStatement& statement,
-                                          const CteMap& ctes);
+                                          const CteMap& ctes,
+                                          bool exists_only = false);
 
 bool ExpressionUsesOnlyScopes(TransactionContext& context,
                               const Expression& expression,

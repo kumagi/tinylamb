@@ -42,7 +42,12 @@ size_t Constraint::Size() const {
 bool Constraint::operator==(const Constraint& rhs) const {
   switch (ctype) {
     case kDefault:
-      return rhs.ctype == kDefault && value == rhs.value;
+    case kForeign:
+    case kCheck:
+      // kForeign/kCheck carry the referenced table / checked expression in
+      // `value`; comparing only the kind made == agree with std::hash (which
+      // includes value) break for unordered containers.
+      return rhs.ctype == ctype && value == rhs.value;
 
     default:
       return ctype == rhs.ctype;

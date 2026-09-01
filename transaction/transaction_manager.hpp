@@ -146,8 +146,12 @@ class TransactionManager {
                               const FosterPair& foster);
   // Non-waiting first-updater-wins reservation stored in the same shard as
   // the row's MVCC chain. A stale snapshot or another pending writer loses.
-  bool AcquireWriteIntent(Transaction& txn, const RowPosition& rp,
-                          bool wait);
+  // When `before` is supplied (update/delete of an existing row), the chain's
+  // base committed version is installed while the shard mutex is held so
+  // concurrent readers see the old image for the whole intent window instead
+  // of kNotExists.
+  bool AcquireWriteIntent(Transaction& txn, const RowPosition& rp, bool wait,
+                          std::optional<std::string_view> before = std::nullopt);
 
   [[nodiscard]] uint64_t CurrentCommitTimestamp() const {
     return commit_timestamp_.load();

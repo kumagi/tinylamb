@@ -41,6 +41,9 @@ class ZoneMap {
   size_t null_count_{0};
   size_t value_count_{0};
   bool initialized_{false};
+  // Set when a DOUBLE NaN was added: NaN is excluded from the envelope but
+  // must conservatively keep the zone eligible for every predicate.
+  bool has_nan_{false};
 };
 
 }  // namespace tinylamb

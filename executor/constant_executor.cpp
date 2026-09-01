@@ -48,7 +48,7 @@ void ConstantExecutor::Dump(std::ostream& o, int /*indent*/) const {
 }
 
 void EmptyResultExecutor::Dump(std::ostream& o, int /*indent*/) const {
-  o << "EmptyResult";
+  o << "EmptyResult\nFilter short_circuit_rhs_evaluations=0";
 }
 
 }  // namespace tinylamb

@@ -47,6 +47,7 @@ struct Row {
   [[nodiscard]] static std::optional<int64_t> TryPeekInteger(
       const char* src, const Schema& sc, slot_t column);
   [[nodiscard]] size_t Size() const;
+  [[nodiscard]] std::string ToString() const;
   [[nodiscard]] std::string EncodeMemcomparableFormat() const;
   void DecodeMemcomparableFormat(std::string_view src);
   void Clear() { values_.clear(); }

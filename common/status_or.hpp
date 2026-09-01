@@ -99,18 +99,24 @@ class StatusOr {
   // Callers must check HasValue() first: accessing the value of a failed
   // StatusOr throws instead of dereferencing an empty optional (UB).
   T& Value() {
-    if (!value_.has_value()) throw std::runtime_error("StatusOr has no value");
+    if (status_ != Status::kSuccess || !value_.has_value()) {
+      throw std::runtime_error("StatusOr has no value");
+    }
     return *value_;
   }
   // Moves the value out and consumes the StatusOr: a second MoveValue() (or
   // Value()) on the same object throws.
   T&& MoveValue() {
-    if (!value_.has_value()) throw std::runtime_error("StatusOr has no value");
+    if (status_ != Status::kSuccess || !value_.has_value()) {
+      throw std::runtime_error("StatusOr has no value");
+    }
     status_ = Status::kUnknown;
     return std::move(*value_);
   }
   const T& Value() const {
-    if (!value_.has_value()) throw std::runtime_error("StatusOr has no value");
+    if (status_ != Status::kSuccess || !value_.has_value()) {
+      throw std::runtime_error("StatusOr has no value");
+    }
     return *value_;
   }
   [[nodiscard]] Status GetStatus() const { return status_; }

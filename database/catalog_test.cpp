@@ -843,4 +843,62 @@ TEST_F(CatalogTest, ListTablesAfterRecover) {
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
+TEST_F(CatalogTest, CreateTable_IsCaseInsensitiveDuplicateCheck) {
+  // PRODUCTION BUG (fixed): the existence check was exact-match while
+  // GetTable() resolved case-insensitively, so "foo" and "Foo" could coexist.
+  TransactionContext ctx = rs_->BeginContext();
+  Schema first("MixedCase", {Column("id", ValueType::kInt64)});
+  ASSERT_SUCCESS(rs_->CreateTable(ctx, first).GetStatus());
+  Schema second("mixedcase", {Column("id", ValueType::kInt64)});
+  EXPECT_EQ(rs_->CreateTable(ctx, second).GetStatus(), Status::kConflicts);
+  Schema third("MIXEDCASE", {Column("id", ValueType::kInt64)});
+  EXPECT_EQ(rs_->CreateTable(ctx, third).GetStatus(), Status::kConflicts);
+}
+
+TEST_F(CatalogTest, DropTableAndStats_WorkForAnyCase) {
+  // PRODUCTION BUG (fixed): DropTable/GetStatistics used the user-supplied
+  // spelling for catalog+statistics keys, so "mixedcase" failed against a
+  // table declared as "MixedName".
+  TransactionContext ctx = rs_->BeginContext();
+  Schema schema("MixedName", {Column("id", ValueType::kInt64),
+                              Column("val", ValueType::kVarChar)});
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->CreateTable(ctx, schema));
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+
+  {
+    TransactionContext ctx2 = rs_->BeginContext();
+    // Statistics must resolve for any case spelling.
+    auto stats = rs_->GetStatistics(ctx2, "mixedname");
+    EXPECT_EQ(stats.GetStatus(), Status::kSuccess);
+    ASSERT_SUCCESS(ctx2.txn_.PreCommit());
+  }
+  {
+    TransactionContext ctx3 = rs_->BeginContext();
+    // DROP with a different case must remove the canonical entries.
+    EXPECT_EQ(rs_->DropTable(ctx3, "mixedname"), Status::kSuccess);
+    ASSERT_SUCCESS(ctx3.txn_.PreCommit());
+  }
+  {
+    TransactionContext ctx4 = rs_->BeginContext();
+    EXPECT_EQ(rs_->GetTable(ctx4, "MixedName").GetStatus(),
+              Status::kNotExists);
+    auto stats = rs_->GetStatistics(ctx4, "mixedname");
+    EXPECT_EQ(stats.GetStatus(), Status::kNotExists);
+    ASSERT_SUCCESS(ctx4.txn_.PreCommit());
+  }
+}
+
+TEST_F(CatalogTest, CreateIndex_FailurePropagatesFromCreateTable) {
+  // PRODUCTION BUG (fixed): CreateTable ignored CreateIndex's status, so a
+  // failed unique-index build silently registered an unconstrained table.
+  TransactionContext ctx = rs_->BeginContext();
+  Schema schema("uniq_tbl", {Column("id", ValueType::kInt64,
+                                  Constraint(Constraint::kUnique))});
+  // Normal creation must succeed and enforce uniqueness.
+  ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->CreateTable(ctx, schema));
+  RowPosition pos = tbl.Insert(ctx.txn_, Row({Value(1)})).Value();
+  EXPECT_EQ(tbl.Insert(ctx.txn_, Row({Value(1)})).GetStatus(),
+            Status::kDuplicates);
+}
+
 }  // namespace tinylamb

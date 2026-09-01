@@ -89,6 +89,21 @@ TEST(DataChunkTest, ZoneMap_AfterAppendsAndReset_MaintainsStatistics) {
   EXPECT_EQ(chunk.ZoneMapAt(0).ValueCount(), 0U);
 }
 
+TEST(DataChunkTest, ZoneMap_NaNDoesNotPoisonEnvelope) {
+  // PRODUCTION BUG (fixed): a leading NaN made min/max (NaN, NaN), so
+  // MayMatch pruned batches that actually contained matching rows.
+  DataChunk chunk(std::vector<ValueType>{ValueType::kDouble});
+  chunk.Append(Row({Value(std::numeric_limits<double>::quiet_NaN())}));
+  chunk.Append(Row({Value(3.0)}));
+  const ZoneMap& zone = chunk.ZoneMapAt(0);
+  ASSERT_TRUE(zone.Minimum().has_value());
+  // The envelope only covers real numbers; NaN keeps the zone eligible.
+  EXPECT_EQ(*zone.Minimum(), Value(3.0));
+  EXPECT_EQ(*zone.Maximum(), Value(3.0));
+  EXPECT_TRUE(zone.MayMatch(BinaryOperation::kEquals, Value(3.0)));
+  EXPECT_TRUE(zone.MayMatch(BinaryOperation::kLessThan, Value(5.0)));
+}
+
 TEST(DataChunkTest, Reset_WithSchema_OverridesInferredNullTypes) {
   DataChunk chunk;
   chunk.Append(Row({Value(), Value("a")}));

@@ -17,6 +17,7 @@
 #include "executor/interval_join.hpp"
 #include "executor/materialize.hpp"
 #include "executor/merge.hpp"
+#include "executor/minmax_index.hpp"
 #include "executor/nested_loop_join.hpp"
 #include "executor/numa_arena.hpp"
 #include "executor/operator_memory.hpp"
@@ -41,6 +42,25 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+
+TEST(MinMaxIndexExecutorTest, EmptyAndNullPrefixProduceScalarNull) {
+  auto source = std::make_shared<ValuesExecutor>(std::vector<Row>{
+      Row({Value()}), Row({Value(int64_t{42})})});
+  MinMaxIndexExecutor executor(std::move(source), 0);
+
+  Row result;
+  EXPECT_TRUE(executor.Next(&result, nullptr));
+  ASSERT_EQ(result.values_.size(), 1U);
+  EXPECT_EQ(result[0], Value(int64_t{42}));
+  EXPECT_FALSE(executor.Next(&result, nullptr));
+
+  MinMaxIndexExecutor empty(
+      std::make_shared<ValuesExecutor>(std::vector<Row>{}), 0);
+  EXPECT_TRUE(empty.Next(&result, nullptr));
+  ASSERT_EQ(result.values_.size(), 1U);
+  EXPECT_TRUE(result[0].IsNull());
+  EXPECT_FALSE(empty.Next(&result, nullptr));
+}
 
 TEST(PartialSortTest, TopKWithoutSortingEntireRun) {
   const Schema schema("scores", {Column("player", ValueType::kVarChar),
@@ -74,6 +94,53 @@ TEST(PartialSortTest, TopKWithoutSortingEntireRun) {
   EXPECT_EQ(out_rows[0][1], Value(int64_t{10}));
   EXPECT_EQ(out_rows[1][1], Value(int64_t{20}));
   EXPECT_EQ(out_rows[2][1], Value(int64_t{40}));
+}
+
+TEST(PartialSortTest, NullsFirstDefaultMatchesSortExecutor) {
+  // PRODUCTION BUG (fixed): PartialSort/PdqSort defaulted ASC to NULLS LAST
+  // while SortExecutor/TopN used NULLS FIRST for ascending keys, so the same
+  // ORDER BY produced different row order depending on the plan shape.
+  const Schema schema("vals", {Column("v", ValueType::kInt64)});
+  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
+      Row({Value(int64_t{2})}),
+      Row({Value()}),
+      Row({Value(int64_t{1})}),
+  });
+
+  std::vector<SortExecutor::Key> keys = {
+      {ColumnValueExp("v"), true, std::nullopt}};
+
+  // SortExecutor (reference).
+  SortExecutor full_sort(src, schema, keys);
+  full_sort.MaterializePipeline();
+  std::vector<Value> reference;
+  Row row;
+  RowPosition rp;
+  while (full_sort.Next(&row, &rp)) {
+    reference.push_back(row[0]);
+  }
+  ASSERT_EQ(reference.size(), 3U);
+  EXPECT_TRUE(reference[0].IsNull());
+
+  // PartialSortExecutor with top_k large enough to see every row.
+  auto src2 = std::make_shared<ValuesExecutor>(std::vector<Row>{
+      Row({Value(int64_t{2})}),
+      Row({Value()}),
+      Row({Value(int64_t{1})}),
+  });
+  PartialSortExecutor partial_sort(src2, schema, keys, /*top_k=*/3, 0);
+  partial_sort.MaterializePipeline();
+  std::vector<Value> partial;
+  while (partial_sort.Next(&row, &rp)) {
+    partial.push_back(row[0]);
+  }
+  ASSERT_EQ(partial.size(), 3U);
+  EXPECT_TRUE(partial[0].IsNull());
+  EXPECT_EQ(partial[1], Value(int64_t{1}));
+  EXPECT_EQ(partial[2], Value(int64_t{2}));
+  EXPECT_TRUE(reference[0].IsNull() == partial[0].IsNull());
+  EXPECT_EQ(reference[1], partial[1]);
+  EXPECT_EQ(reference[2], partial[2]);
 }
 
 TEST(PartialSortTest, PartitionedBlockSorting) {

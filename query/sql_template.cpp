@@ -2,6 +2,7 @@
 
 #include "query/sql_template.hpp"
 
+
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
@@ -447,6 +448,18 @@ std::shared_ptr<SelectStatement> BindSelect(  // NOLINT(misc-no-recursion) // Re
                             BindSelect(*select.UnionAll()[branch_index],
                                        parameters, index),
                             match);
+  }
+  if (select.GetSetOperationTree() != nullptr) {
+    auto tree = std::make_shared<SetOperationTree>();
+    tree->first = BindSelect(*select.GetSetOperationTree()->first, parameters,
+                             index);
+    tree->kinds = select.GetSetOperationTree()->kinds;
+    tree->grouped = select.GetSetOperationTree()->grouped;
+    tree->branches.reserve(select.GetSetOperationTree()->branches.size());
+    for (const auto& branch : select.GetSetOperationTree()->branches) {
+      tree->branches.push_back(BindSelect(*branch, parameters, index));
+    }
+    result->SetSetOperationTree(std::move(tree));
   }
   if (select.UnionDistinct()) {
     result->MarkUnionDistinct(select.UnionByName());

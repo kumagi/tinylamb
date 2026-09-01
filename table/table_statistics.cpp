@@ -327,8 +327,11 @@ std::optional<Value> CoerceValue(const Value& value, ValueType type) {
   if (type == ValueType::kInt64 && value.type == ValueType::kDouble) {
     const double integer = std::trunc(value.value.double_value);
     if (integer == value.value.double_value &&
-        integer >= static_cast<double>(std::numeric_limits<int64_t>::min()) &&
-        integer <= static_cast<double>(std::numeric_limits<int64_t>::max())) {
+        // (double)INT64_MAX rounds up to 2^63, so the old `<= INT64_MAX`
+        // upper bound accepted exactly 9223372036854775808.0 and the cast
+        // was UB (typically wrapping to INT64_MIN).
+        integer >= -9223372036854775808.0 &&
+        integer < 9223372036854775808.0) {
       return Value(static_cast<int64_t>(integer));
     }
   }
