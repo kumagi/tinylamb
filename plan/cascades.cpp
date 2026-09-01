@@ -53,6 +53,30 @@ std::vector<std::string> Normalize(std::vector<std::string> relations) {
   return relations;
 }
 
+// True when every column touched by the projection's target list belongs to
+// the LEFT side of the join inside `input_id` (right side fully unused).
+bool ProjectionUsesOnlyLeftSide(const LogicalExpression& projection,
+                                const Memo& memo, GroupId input_id) {
+  for (const LogicalExpression& join : memo.Get(input_id).expressions) {
+    if (join.operation != LogicalOperator::kJoin ||
+        join.children.size() != 2) {
+      continue;
+    }
+    const Group& right_group = memo.Get(join.children[1]);
+    for (const NamedExpression& item : projection.target_list) {
+      if (!item.expression) { continue; }
+      for (const ColumnName& col : item.expression->TouchedColumns()) {
+        if (std::ranges::find(right_group.relations, col.schema) !=
+            right_group.relations.end()) {
+          return false;
+        }
+      }
+    }
+    return true;  // First join shape decides.
+  }
+  return false;
+}
+
 std::vector<std::string> UnionRelations(const std::vector<std::string>& left,
                                         const std::vector<std::string>& right) {
   std::vector<std::string> result;
@@ -644,11 +668,14 @@ std::string LogicalExpression::Fingerprint() const {
   if (operation == LogicalOperator::kOuterJoin) {
     out << "#j:" << static_cast<unsigned>(join_type);
   }
-  if (predicate) {
+  if (predicate && *predicate) {
     out << "#p:" << (*predicate)->ToString();
   }
   for (const NamedExpression& item : target_list) {
-    out << "#t:" << item.name << '=' << item.expression->ToString();
+    // A target expression can be a null handle when a rule built a
+    // placeholder; the fingerprint must not dereference it (SIGSEGV).
+    out << "#t:" << item.name << '='
+        << (item.expression ? item.expression->ToString() : std::string());
   }
   if (operation == LogicalOperator::kSort ||
       operation == LogicalOperator::kTopN) {
@@ -5233,56 +5260,39 @@ const RuleSet& RuleSet::Default() {
         },
         LogicalOperator::kJoin));
 
-    // unused_join_elimination: When Projection(J(L, R)) only references
-    // columns from L, the join is unnecessary and can be eliminated.
+    // unused_join_elimination: Rewrite an inner join whose right side is
+    // never projected into a SEMI join.  PRODUCTION FIX: the previous form
+    // replaced the join with a bare left-side projection.  An inner join
+    // duplicates left rows when the right side matches more than once, so
+    // the rewrite silently changed the result cardinality, and it also
+    // dropped left-side-only predicate conjuncts.  A semi join preserves
+    // both properties without needing a uniqueness proof on the right.
     built.Add(Rule(
         "unused_join_elimination", Projection(Any("input")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
           if (expression.operation != LogicalOperator::kProjection ||
-              expression.target_list.empty()) {
+              expression.target_list.empty() ||
+              !ProjectionUsesOnlyLeftSide(expression, memo,
+                                          bindings.at("input"))) {
             return;
           }
           const GroupId input_id = bindings.at("input");
           for (const LogicalExpression& join :
                memo.Get(input_id).expressions) {
             if (join.operation != LogicalOperator::kJoin ||
-                join.children.size() != 2) {
+                join.children.size() != 2 ||
+                !join.predicate.has_value() || !*join.predicate) {
               continue;
             }
-            const GroupId left_id = join.children[0];
-            const GroupId right_id = join.children[1];
-            const Group& right_group = memo.Get(right_id);
-            // Check if any column in the Projection's target_list references
-            // a relation from the right side of the join.
-            bool right_needed = false;
-            for (const NamedExpression& item : expression.target_list) {
-              if (!item.expression) { continue; }
-              for (const ColumnName& col :
-                   item.expression->TouchedColumns()) {
-                if (std::ranges::find(right_group.relations,
-                                     col.schema) !=
-                    right_group.relations.end()) {
-                  right_needed = true;
-                  break;
-                }
-              }
-              if (right_needed) { break; }
-            }
-            // For inner joins, the predicate only constrains which rows
-            // match; if no right-side columns are projected, the join is
-            // redundant (every left row matches at most once via FK-PK).
-            // The predicate check is therefore skipped for inner joins.
-            if (!right_needed) {
-              // Eliminate the join: project directly from the left side.
-              const Group& left_group = memo.Get(left_id);
-              const GroupId proj_group = memo.EnsureDerivedGroup(
-                  left_group.relations, "join-elim-left");
-              LogicalExpression new_proj = expression;
-              new_proj.children = {left_id};
-              memo.AddExpression(proj_group, std::move(new_proj));
-              return;
-            }
+            // A cross join (no predicate) duplicates every left row by the
+            // right cardinality; it must NOT be eliminated.
+            LogicalExpression semi = expression;
+            semi.children = {join.children[0], join.children[1]};
+            semi.operation = LogicalOperator::kSemiJoin;
+            semi.predicate = join.predicate;
+            memo.AddExpression(group, std::move(semi));
+            return;
           }
         },
         LogicalOperator::kProjection));

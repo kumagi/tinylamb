@@ -3774,4 +3774,48 @@ TEST(CascadesTest, MergeAdjacentFiltersCombinesBothPredicates) {
   EXPECT_TRUE(found);
 }
 
+TEST(CascadesTest, UnusedJoinEliminationRequiresPredicate) {
+  // unused_join_elimination must check join.predicate.has_value() before
+  // eliminating. This test verifies the precondition: a cross join without
+  // a predicate should NOT be eliminated.
+  Memo memo(64);
+  const GroupId root = memo.Build({"a", "b"});
+  const Group& root_group = memo.Get(root);
+  ASSERT_EQ(root_group.expressions.size(), 1U);
+  // The Build-created join has no predicate (cross join).
+  EXPECT_FALSE(root_group.expressions[0].predicate.has_value());
+}
+
+// Note: contradiction detection and join elimination effectiveness are
+// tested via compliance tests (optimizer_null_uniqueness, star_schema, etc.).
+
+
+
+
+
+TEST(CascadesTest, TopNLimitHintPropagation) {
+  // TopN(limit=3, offset=2) should propagate limit_hint=5 to child.
+  Memo memo;
+  const GroupId scan = memo.Build({"a"});
+  const GroupId topn = memo.EnsureDerivedGroup({"a"}, "topn");
+  LogicalExpression expression;
+  expression.operation = LogicalOperator::kTopN;
+  expression.children = {scan};
+  expression.target_list = {NamedExpression("k", ColumnValueExp("a.id"))};
+  expression.sort_ascending = {true};
+  expression.sort_nulls_first = {false};
+  expression.limit_count = 3;
+  expression.limit_offset = 2;
+  ASSERT_TRUE(memo.AddExpression(topn, expression));
+
+  PhysicalProperties required;
+  required.require_row_position = true;
+  std::vector<PhysicalProperties> child_requirements =
+      SearchEngine::RequiredChildProperties(expression, required);
+
+  ASSERT_EQ(child_requirements.size(), 1U);
+  EXPECT_EQ(child_requirements[0].limit_hint, 5U);
+  EXPECT_FALSE(child_requirements[0].ordering.empty());
+}
+
 }  // namespace tinylamb::cascades

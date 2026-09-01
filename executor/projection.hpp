@@ -47,6 +47,9 @@ class Projection : public ExecutorBase {
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] size_t JitBatches() const { return jit_batches_; }
+  [[nodiscard]] const std::vector<size_t>& CseUseCounts() const {
+    return cse_use_counts_;
+  }
 
  private:
   std::vector<NamedExpression> expressions_;

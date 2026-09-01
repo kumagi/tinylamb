@@ -3604,4 +3604,75 @@ TEST_F(ExecutorTest, ParallelAggregationLogicalAndOr) {
   EXPECT_EQ(result[2], Value(int64_t{1}));
 }
 
+TEST_F(ExecutorTest, ProjectionCseEliminatesRepeatedBinaryExpression) {
+  // CSE (Common Subexpression Elimination) should detect and factor out
+  // repeated binary expressions (e.g. a.x + a.y used twice).
+  std::vector<Row> rows;
+  rows.reserve(100);
+  for (int64_t i = 0; i < 100; ++i) {
+    rows.emplace_back(std::vector<Value>{Value(i), Value(i * 10)});
+  }
+  const Schema schema("cse",
+                       {Column("x", ValueType::kInt64),
+                        Column("y", ValueType::kInt64)});
+  auto src = std::make_shared<ConstantExecutor>(std::move(rows));
+  // Expression: x + y (appears twice)
+  auto sum_expr = BinaryExpressionExp(ColumnValueExp("x"),
+                                      BinaryOperation::kAdd,
+                                      ColumnValueExp("y"));
+  // Projection: [x + y, x + y]
+  std::vector<NamedExpression> projections = {
+      NamedExpression("s1", sum_expr),
+      NamedExpression("s2", sum_expr)};
+  Projection proj(std::move(projections), schema, std::move(src));
+
+  // Verify CSE was detected
+  EXPECT_GT(proj.CseUseCounts().size(), 0U);
+
+  // Verify results
+  Row got;
+  size_t count = 0;
+  while (proj.Next(&got, nullptr)) {
+    EXPECT_EQ(got[0], got[1]);
+    EXPECT_EQ(got[0], Value(static_cast<int64_t>(count * 11)));
+    ++count;
+  }
+  EXPECT_EQ(count, 100U);
+}
+
+TEST_F(ExecutorTest, ProjectionCseHandlesSingleOccurrenceExpression) {
+  // Expressions that appear only once should NOT be CSE'd.
+  std::vector<Row> rows;
+  rows.reserve(10);
+  for (int64_t i = 0; i < 10; ++i) {
+    rows.emplace_back(std::vector<Value>{Value(i)});
+  }
+  const Schema schema("no_cse", {Column("v", ValueType::kInt64)});
+  auto src = std::make_shared<ConstantExecutor>(std::move(rows));
+  // Projection: [v + 1, v + 2] - no shared subexpression
+  std::vector<NamedExpression> projections = {
+      NamedExpression("a",
+                       BinaryExpressionExp(ColumnValueExp("v"),
+                                           BinaryOperation::kAdd,
+                                           ConstantValueExp(Value(int64_t{1})))),
+      NamedExpression("b",
+                       BinaryExpressionExp(ColumnValueExp("v"),
+                                           BinaryOperation::kAdd,
+                                           ConstantValueExp(Value(int64_t{2}))))};
+  Projection proj(std::move(projections), schema, std::move(src));
+
+  // No CSE should be detected
+  EXPECT_EQ(proj.CseUseCounts().size(), 0U);
+
+  // Results should still be correct
+  Row got;
+  size_t count = 0;
+  while (proj.Next(&got, nullptr)) {
+    EXPECT_EQ(got[0], Value(static_cast<int64_t>(count + 1)));
+    EXPECT_EQ(got[1], Value(static_cast<int64_t>(count + 2)));
+    ++count;
+  }
+  EXPECT_EQ(count, 10U);
+}
+
 }  // namespace tinylamb
