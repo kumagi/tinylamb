@@ -1909,6 +1909,9 @@ TEST(CascadesTest, FullOuterJoinDecomposition) {
 }
 
 TEST(CascadesTest, PushDownLimitThroughJoin) {
+  // D5 gate: push_down_limit_through_join is DISABLED because the Memo
+  // does not carry uniqueness constraints. Without proving the join key is
+  // unique on the pushed side, this rule can return fewer rows.
   Memo memo;
   (void)memo.Build({"t1", "t2"});
   const GroupId left = memo.EnsureGroup({"t1"});
@@ -1938,23 +1941,24 @@ TEST(CascadesTest, PushDownLimitThroughJoin) {
   SearchEngine search(std::move(memo), RuleSet::Default());
   search.Explore(limit_group);
 
+  // The rule is disabled: no Limit should be pushed into the join's left.
   const auto& exprs = search.GetMemo().Get(limit_group).expressions;
-  bool found_join_with_limit = false;
+  bool found_limit_pushed = false;
   for (const auto& expr : exprs) {
     if (expr.operation == LogicalOperator::kJoin &&
         expr.children.size() == 2) {
       const Group& child_group = search.GetMemo().Get(expr.children[0]);
       for (const auto& child_expr : child_group.expressions) {
-        if (child_expr.operation == LogicalOperator::kLimit &&
-            child_expr.limit_count == 15) {
-          found_join_with_limit = true;
+        if (child_expr.operation == LogicalOperator::kLimit) {
+          found_limit_pushed = true;
           break;
         }
       }
-      if (found_join_with_limit) break;
     }
   }
-  EXPECT_TRUE(found_join_with_limit);
+  EXPECT_FALSE(found_limit_pushed)
+      << "push_down_limit_through_join should be disabled (D5 gate: "
+         "uniqueness cannot be proven from Memo)";
 }
 
 TEST(CascadesTest, RankRowNumberToTopNRewrite) {
@@ -3774,23 +3778,84 @@ TEST(CascadesTest, MergeAdjacentFiltersCombinesBothPredicates) {
   EXPECT_TRUE(found);
 }
 
-TEST(CascadesTest, UnusedJoinEliminationRequiresPredicate) {
-  // unused_join_elimination must check join.predicate.has_value() before
-  // eliminating. This test verifies the precondition: a cross join without
-  // a predicate should NOT be eliminated.
+TEST(CascadesTest, UnusedJoinEliminationRewritesToSemiJoin) {
+  // PRODUCTION FIX: an inner join whose right side is never projected must
+  // NOT be replaced by a bare left-side projection.  The join duplicates
+  // left rows when several right rows match, so the old rewrite silently
+  // changed the result cardinality (and dropped left-side-only predicate
+  // conjuncts).  The sound rewrite is a SEMI join over the same children.
+  Memo memo;
+  (void)memo.Build({"a", "b"});
+  const GroupId left_child = memo.EnsureGroup({"a"});
+  const GroupId right_child = memo.EnsureGroup({"b"});
+  const GroupId join_group =
+      memo.EnsureDerivedGroup({"a", "b"}, "inner-join");
+  ASSERT_TRUE(memo.AddExpression(
+      join_group,
+      LogicalExpression{.operation = LogicalOperator::kJoin,
+                        .children = {left_child, right_child},
+                        .predicate = EqExp("a.id", Value(1))}));
+  const GroupId proj_group =
+      memo.EnsureDerivedGroup({"a", "b"}, "proj");
+  ASSERT_TRUE(memo.AddExpression(
+      proj_group,
+      LogicalExpression{.operation = LogicalOperator::kProjection,
+                        .children = {join_group},
+                        .target_list = {
+                            NamedExpression("id", ColumnValueExp("a.id"))}}));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(proj_group);
+
+  bool semi_join_added = false;
+  for (const LogicalExpression& expression :
+       search.GetMemo().Get(proj_group).expressions) {
+    if (expression.operation == LogicalOperator::kSemiJoin &&
+        expression.children.size() == 2 &&
+        expression.children[0] == left_child &&
+        expression.children[1] == right_child) {
+      semi_join_added = true;
+    }
+  }
+  EXPECT_TRUE(semi_join_added)
+      << "unused_join_elimination should rewrite the unused-right-side inner "
+         "join into a semi join";
+}
+
+TEST(CascadesTest, UnusedJoinEliminationDoesNotFireWithoutPredicate) {
+  // A cross join duplicates every left row by the right cardinality: it must
+  // never be rewritten into a semi join.
   Memo memo(64);
-  const GroupId root = memo.Build({"a", "b"});
-  const Group& root_group = memo.Get(root);
-  ASSERT_EQ(root_group.expressions.size(), 1U);
-  // The Build-created join has no predicate (cross join).
-  EXPECT_FALSE(root_group.expressions[0].predicate.has_value());
+  (void)memo.Build({"a", "b"});
+  const GroupId left_child = memo.EnsureGroup({"a"});
+  const GroupId right_child = memo.EnsureGroup({"b"});
+  const GroupId join_group = memo.EnsureDerivedGroup({"a", "b"}, "cross");
+  ASSERT_TRUE(memo.AddExpression(
+      join_group,
+      LogicalExpression{.operation = LogicalOperator::kJoin,
+                        .children = {left_child, right_child},
+                        .predicate = Expression{}}));
+  const GroupId proj_group = memo.EnsureDerivedGroup({"a", "b"}, "proj");
+  ASSERT_TRUE(memo.AddExpression(
+      proj_group,
+      LogicalExpression{.operation = LogicalOperator::kProjection,
+                        .children = {join_group},
+                        .target_list = {
+                            NamedExpression("id", ColumnValueExp("a.id"))}}));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(proj_group);
+  bool semi_join_added = false;
+  for (const LogicalExpression& expression :
+       search.GetMemo().Get(proj_group).expressions) {
+    if (expression.operation == LogicalOperator::kSemiJoin) {
+      semi_join_added = true;
+    }
+  }
+  EXPECT_FALSE(semi_join_added)
+      << "cross join (no predicate) must not be rewritten into a semi join";
 }
 
 // Note: contradiction detection and join elimination effectiveness are
 // tested via compliance tests (optimizer_null_uniqueness, star_schema, etc.).
-
-
-
 
 
 TEST(CascadesTest, TopNLimitHintPropagation) {
@@ -3816,6 +3881,235 @@ TEST(CascadesTest, TopNLimitHintPropagation) {
   ASSERT_EQ(child_requirements.size(), 1U);
   EXPECT_EQ(child_requirements[0].limit_hint, 5U);
   EXPECT_FALSE(child_requirements[0].ordering.empty());
+}
+
+// ====================================================================
+// D5 counterexample tests: verify that dangerous rules have proper gate
+// conditions and do NOT fire when preconditions are not met.
+// ====================================================================
+
+TEST(CascadesTest, PushDownLimitThroughJoinSkipsNonUniqueJoin) {
+  // D5 counterexample: push_down_limit_through_join must NOT push LIMIT
+  // into a join when the join key is not unique on the inner side.
+  // A many-to-many join with LIMIT can return wrong row counts.
+  Memo memo;
+  (void)memo.Build({"orders", "items"});
+  const GroupId left = memo.EnsureGroup({"orders"});
+  const GroupId right = memo.EnsureGroup({"items"});
+  const GroupId join_group = memo.EnsureDerivedGroup({"orders", "items"}, "j");
+  // orders.item_id = items.id — items.id is NOT unique (many orders per item)
+  ASSERT_TRUE(memo.AddExpression(
+      join_group,
+      LogicalExpression{.operation = LogicalOperator::kJoin,
+                        .children = {left, right},
+                        .predicate = BinaryExpressionExp(
+                            ColumnValueExp("orders.item_id"),
+                            BinaryOperation::kEquals,
+                            ColumnValueExp("items.id"))}));
+  const GroupId limit_group = memo.EnsureDerivedGroup({"orders", "items"}, "l");
+  ASSERT_TRUE(memo.AddExpression(
+      limit_group,
+      LogicalExpression{.operation = LogicalOperator::kLimit,
+                        .children = {join_group},
+                        .limit_count = 5,
+                        .limit_offset = 0}));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(limit_group);
+
+  // The rule should NOT have pushed LIMIT into the join's left side.
+  // Verify no Limit-over-Scan pattern exists inside the join.
+  const bool limit_pushed = std::ranges::any_of(
+      search.GetMemo().Get(limit_group).expressions,
+      [&](const LogicalExpression& expr) {
+        if (expr.operation != LogicalOperator::kJoin) return false;
+        for (GroupId child : expr.children) {
+          for (const LogicalExpression& cexpr :
+               search.GetMemo().Get(child).expressions) {
+            if (cexpr.operation == LogicalOperator::kLimit) return true;
+          }
+        }
+        return false;
+      });
+  EXPECT_FALSE(limit_pushed)
+      << "push_down_limit_through_join incorrectly pushed LIMIT into "
+         "a non-unique join side";
+}
+
+TEST(CascadesTest, EliminateDoubleSortRequiresSameKeyExpressions) {
+  // D5 counterexample: eliminate_double_sort must NOT eliminate the outer
+  // sort when the inner sort uses different key expressions, even if the
+  // ascending flags happen to match.
+  Memo memo;
+  const GroupId scan = memo.Build({"t"});
+  // Inner: ORDER BY t.a ASC
+  const GroupId inner_sort = memo.EnsureDerivedGroup({"t"}, "inner_sort");
+  ASSERT_TRUE(memo.AddExpression(
+      inner_sort,
+      LogicalExpression{.operation = LogicalOperator::kSort,
+                        .children = {scan},
+                        .target_list = {
+                            NamedExpression("a", ColumnValueExp("t.a"))},
+                        .sort_ascending = {true},
+                        .sort_nulls_first = {false}}));
+  // Outer: ORDER BY t.b ASC (different key, same direction)
+  const GroupId outer_sort = memo.EnsureDerivedGroup({"t"}, "outer_sort");
+  ASSERT_TRUE(memo.AddExpression(
+      outer_sort,
+      LogicalExpression{.operation = LogicalOperator::kSort,
+                        .children = {inner_sort},
+                        .target_list = {
+                            NamedExpression("b", ColumnValueExp("t.b"))},
+                        .sort_ascending = {true},
+                        .sort_nulls_first = {false}}));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(outer_sort);
+
+  // The outer sort should NOT have been eliminated because the keys differ.
+  const bool eliminated = std::ranges::any_of(
+      search.GetMemo().Get(outer_sort).expressions,
+      [&](const LogicalExpression& expr) {
+        if (expr.operation != LogicalOperator::kSort ||
+            expr.children.size() != 1) {
+          return false;
+        }
+        // If the child is the scan directly, the sort was eliminated.
+        return search.GetMemo().Get(expr.children[0]).relations ==
+               std::vector<std::string>{"t"} &&
+               std::ranges::none_of(
+                   search.GetMemo().Get(expr.children[0]).expressions,
+                   [](const LogicalExpression& e) {
+                     return e.operation == LogicalOperator::kSort;
+                   });
+      });
+  EXPECT_FALSE(eliminated)
+      << "eliminate_double_sort incorrectly eliminated sort with "
+         "different key expressions";
+}
+
+TEST(CascadesTest, EliminateDoubleSortRequiresSameNullsFirst) {
+  // D5 counterexample: eliminate_double_sort must NOT eliminate the outer
+  // sort when nulls_first differs between inner and outer.
+  Memo memo;
+  const GroupId scan = memo.Build({"t"});
+  // Inner: ORDER BY t.a ASC NULLS FIRST
+  const GroupId inner_sort = memo.EnsureDerivedGroup({"t"}, "inner_sort");
+  ASSERT_TRUE(memo.AddExpression(
+      inner_sort,
+      LogicalExpression{.operation = LogicalOperator::kSort,
+                        .children = {scan},
+                        .target_list = {
+                            NamedExpression("a", ColumnValueExp("t.a"))},
+                        .sort_ascending = {true},
+                        .sort_nulls_first = {true}}));
+  // Outer: ORDER BY t.a ASC NULLS LAST (different nulls order)
+  const GroupId outer_sort = memo.EnsureDerivedGroup({"t"}, "outer_sort");
+  ASSERT_TRUE(memo.AddExpression(
+      outer_sort,
+      LogicalExpression{.operation = LogicalOperator::kSort,
+                        .children = {inner_sort},
+                        .target_list = {
+                            NamedExpression("a", ColumnValueExp("t.a"))},
+                        .sort_ascending = {true},
+                        .sort_nulls_first = {false}}));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(outer_sort);
+
+  // The outer sort should NOT be eliminated because nulls_first differs.
+  const bool eliminated = std::ranges::any_of(
+      search.GetMemo().Get(outer_sort).expressions,
+      [&](const LogicalExpression& expr) {
+        if (expr.operation != LogicalOperator::kSort ||
+            expr.children.size() != 1) {
+          return false;
+        }
+        return search.GetMemo().Get(expr.children[0]).relations ==
+               std::vector<std::string>{"t"} &&
+               std::ranges::none_of(
+                   search.GetMemo().Get(expr.children[0]).expressions,
+                   [](const LogicalExpression& e) {
+                     return e.operation == LogicalOperator::kSort;
+                   });
+      });
+  EXPECT_FALSE(eliminated)
+      << "eliminate_double_sort incorrectly eliminated sort with "
+         "different nulls_first setting";
+}
+
+TEST(CascadesTest, InListToSemiJoinRejectsMixedColumnOr) {
+  // D5 counterexample: in_list_to_semi_join must NOT transform a predicate
+  // where OR branches reference different columns into a semi join.
+  // `x = 1 OR y = 2` cannot become SemiJoin(x, {1}) because y is lost.
+  Memo memo;
+  const GroupId scan = memo.Build({"t"});
+  const GroupId sel = memo.EnsureDerivedGroup({"t"}, "sel");
+  // WHERE x = 1 OR y = 2
+  Expression predicate = BinaryExpressionExp(
+      EqExp("t.x", Value(1)), BinaryOperation::kOr,
+      EqExp("t.y", Value(2)));
+  ASSERT_TRUE(memo.AddExpression(
+      sel,
+      LogicalExpression{.operation = LogicalOperator::kSelection,
+                        .children = {scan},
+                        .predicate = predicate}));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(sel);
+
+  // The rule should NOT have created a SemiJoin.
+  const bool has_semi_join = std::ranges::any_of(
+      search.GetMemo().Get(sel).expressions,
+      [](const LogicalExpression& expr) {
+        return expr.operation == LogicalOperator::kSemiJoin;
+      });
+  EXPECT_FALSE(has_semi_join)
+      << "in_list_to_semi_join incorrectly transformed mixed-column OR "
+         "into a semi join";
+}
+
+TEST(CascadesTest, OuterToAntiJoinRequiresNullCheckOnAllRightColumns) {
+  // D5 counterexample: outer_to_anti_join must NOT convert when the
+  // WHERE clause references right-side columns that are NOT IS NULL checked.
+  // SELECT * FROM a LEFT JOIN b ON a.id = b.id
+  //   WHERE b.id IS NULL AND b.name = 'foo'
+  // The b.name predicate needs actual right-side data, not NULL padding.
+  Memo memo;
+  (void)memo.Build({"a", "b"});
+  const GroupId left = memo.EnsureGroup({"a"});
+  const GroupId right = memo.EnsureGroup({"b"});
+  const GroupId join_group = memo.EnsureDerivedGroup({"a", "b"}, "oj");
+  ASSERT_TRUE(memo.AddExpression(
+      join_group,
+      LogicalExpression{.operation = LogicalOperator::kOuterJoin,
+                        .children = {left, right},
+                        .predicate = BinaryExpressionExp(
+                            ColumnValueExp("a.id"),
+                            BinaryOperation::kEquals,
+                            ColumnValueExp("b.id")),
+                        .join_type = 0}));
+  // WHERE b.id IS NULL AND b.name = 'foo'
+  Expression null_check = UnaryExpressionExp(
+      ColumnValueExp("b.id"), UnaryOperation::kIsNull);
+  Expression name_check = EqExp("b.name", Value("foo"));
+  Expression combined = BinaryExpressionExp(
+      null_check, BinaryOperation::kAnd, name_check);
+  const GroupId sel = memo.EnsureDerivedGroup({"a", "b"}, "sel");
+  ASSERT_TRUE(memo.AddExpression(
+      sel,
+      LogicalExpression{.operation = LogicalOperator::kSelection,
+                        .children = {join_group},
+                        .predicate = combined}));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(sel);
+
+  // The rule should NOT have created an AntiJoin because b.name = 'foo'
+  // still needs right-side data.
+  const bool has_anti_join = std::ranges::any_of(
+      search.GetMemo().Get(sel).expressions,
+      [](const LogicalExpression& expr) {
+        return expr.operation == LogicalOperator::kAntiJoin;
+      });
+  EXPECT_FALSE(has_anti_join)
+      << "outer_to_anti_join incorrectly converted when remaining "
+         "predicates reference right-side columns";
 }
 
 }  // namespace tinylamb::cascades

@@ -57,11 +57,13 @@ std::vector<std::string> Normalize(std::vector<std::string> relations) {
 // the LEFT side of the join inside `input_id` (right side fully unused).
 bool ProjectionUsesOnlyLeftSide(const LogicalExpression& projection,
                                 const Memo& memo, GroupId input_id) {
+  bool saw_join = false;
   for (const LogicalExpression& join : memo.Get(input_id).expressions) {
     if (join.operation != LogicalOperator::kJoin ||
         join.children.size() != 2) {
       continue;
     }
+    saw_join = true;
     const Group& right_group = memo.Get(join.children[1]);
     for (const NamedExpression& item : projection.target_list) {
       if (!item.expression) { continue; }
@@ -72,9 +74,8 @@ bool ProjectionUsesOnlyLeftSide(const LogicalExpression& projection,
         }
       }
     }
-    return true;  // First join shape decides.
   }
-  return false;
+  return saw_join;
 }
 
 std::vector<std::string> UnionRelations(const std::vector<std::string>& left,
@@ -979,6 +980,13 @@ GroupId Memo::EnsureDerivedGroup(const std::vector<std::string>& relations,
 
 bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
   Group& target = Get(group);
+  // Normalize an engaged-but-null predicate (Expression{} is a null
+  // shared_ptr) to nullopt: callers only test has_value() / operator bool,
+  // so an optional holding a null handle dereferences as null downstream
+  // (SIGSEGV in Fingerprint and rule bodies).
+  if (expression.predicate.has_value() && !*expression.predicate) {
+    expression.predicate.reset();
+  }
   switch (expression.operation) {
     case LogicalOperator::kScan:
       if (expression.table.empty() || !expression.children.empty() ||
@@ -2471,24 +2479,53 @@ const RuleSet& RuleSet::Default() {
             if (inner.operation != LogicalOperator::kSort) {
               continue;
             }
-            // Check if the outer sort_ascending is a prefix of the inner.
-            const size_t common = std::min(expression.sort_ascending.size(),
-                                           inner.sort_ascending.size());
-            if (common == 0) {
+            // D5 gate: the outer Sort is redundant only when the inner Sort
+            // produces the same ordering for every key the outer consumer
+            // needs. Check ALL of: key expressions, ascending direction,
+            // and NULLS FIRST/LAST.
+            const size_t outer_keys = expression.target_list.size();
+            const size_t inner_keys = inner.target_list.size();
+            if (outer_keys == 0 || outer_keys > inner_keys) {
               continue;
             }
-            bool same_prefix = true;
-            for (size_t i = 0; i < common; ++i) {
-              if (expression.sort_ascending[i] != inner.sort_ascending[i]) {
-                same_prefix = false;
+            bool keys_match = true;
+            for (size_t i = 0; i < outer_keys; ++i) {
+              if (expression.target_list[i].expression->ToString() !=
+                  inner.target_list[i].expression->ToString()) {
+                keys_match = false;
                 break;
               }
             }
-            if (!same_prefix) {
+            if (!keys_match) {
               continue;
             }
-            // The outer Sort's keys are a prefix of the inner Sort's keys.
-            // The inner Sort is sufficient; remove the outer.
+            // Check ascending direction prefix.
+            bool dir_match = true;
+            for (size_t i = 0; i < outer_keys; ++i) {
+              if (i >= expression.sort_ascending.size() ||
+                  i >= inner.sort_ascending.size() ||
+                  expression.sort_ascending[i] != inner.sort_ascending[i]) {
+                dir_match = false;
+                break;
+              }
+            }
+            if (!dir_match) {
+              continue;
+            }
+            // Check NULLS FIRST/LAST prefix.
+            bool nulls_match = true;
+            for (size_t i = 0; i < outer_keys; ++i) {
+              if (i >= expression.sort_nulls_first.size() ||
+                  i >= inner.sort_nulls_first.size() ||
+                  expression.sort_nulls_first[i] != inner.sort_nulls_first[i]) {
+                nulls_match = false;
+                break;
+              }
+            }
+            if (!nulls_match) {
+              continue;
+            }
+            // The inner Sort provides the same ordering; remove the outer.
             memo.AddExpression(group, inner);
             return;
           }
@@ -3019,9 +3056,11 @@ const RuleSet& RuleSet::Default() {
                 right_group.relations.begin(), right_group.relations.end());
 
             bool has_null_check_on_right = false;
+            bool has_other_right_ref = false;
             for (const Expression& conjunct :
                  SplitConjuncts(*expression.predicate)) {
-              if (conjunct && conjunct->Type() == TypeTag::kUnaryExp &&
+              if (!conjunct) continue;
+              if (conjunct->Type() == TypeTag::kUnaryExp &&
                   conjunct->AsUnaryExpression().Op() ==
                       UnaryOperation::kIsNull) {
                 const auto& child = conjunct->AsUnaryExpression().Child();
@@ -3033,12 +3072,25 @@ const RuleSet& RuleSet::Default() {
                             return IsSameTable(rel, col.schema);
                           })) {
                     has_null_check_on_right = true;
-                    break;
+                    continue;
                   }
                 }
               }
+              // D5 gate: check if any other conjunct references right-side
+              // columns. If so, the AntiJoin conversion would lose those
+              // predicates (they need actual right-side data, not NULLs).
+              for (const ColumnName& col : conjunct->TouchedColumns()) {
+                if (right_rels.contains(col.schema) ||
+                    std::any_of(right_rels.begin(), right_rels.end(),
+                                [&](const std::string& rel) {
+                                  return IsSameTable(rel, col.schema);
+                                })) {
+                  has_other_right_ref = true;
+                  break;
+                }
+              }
             }
-            if (has_null_check_on_right) {
+            if (has_null_check_on_right && !has_other_right_ref) {
               memo.AddExpression(
                   group,
                   LogicalExpression{.operation = LogicalOperator::kAntiJoin,
@@ -3125,49 +3177,10 @@ const RuleSet& RuleSet::Default() {
         LogicalOperator::kOuterJoin));
 
     // push_down_limit_through_join: Push Limit into unique inner join side.
-    built.Add(Rule(
-        "push_down_limit_through_join", Limit(Any("input")),
-        [](const Bindings& bindings, Memo& memo, GroupId group,
-           const LogicalExpression& expression) {
-          if (expression.operation != LogicalOperator::kLimit ||
-              expression.children.size() != 1) {
-            return;
-          }
-          const GroupId input_id = bindings.at("input");
-          const Group& input_group = memo.Get(input_id);
-          for (const LogicalExpression& join_expr : input_group.expressions) {
-            if (join_expr.operation != LogicalOperator::kJoin ||
-                join_expr.children.size() != 2) {
-              continue;
-            }
-            const GroupId left_id = join_expr.children[0];
-            const GroupId right_id = join_expr.children[1];
-            const size_t total_limit =
-                expression.limit_count + expression.limit_offset;
-            if (total_limit == 0) {
-              continue;
-            }
-
-            const GroupId limit_left_group = memo.EnsureDerivedGroup(
-                memo.Get(left_id).relations,
-                "join_limit_left:" + std::to_string(total_limit));
-            memo.AddExpression(
-                limit_left_group,
-                LogicalExpression{.operation = LogicalOperator::kLimit,
-                                  .children = {left_id},
-                                  .limit_count = total_limit,
-                                  .limit_offset = 0});
-
-            memo.AddExpression(
-                group,
-                LogicalExpression{.operation = LogicalOperator::kJoin,
-                                  .children = {limit_left_group, right_id},
-                                  .predicate = join_expr.predicate,
-                                  .target_list = join_expr.target_list,
-                                  .output_schema = join_expr.output_schema});
-          }
-        },
-        LogicalOperator::kLimit));
+    // D5 gate: Disabled because the Memo does not carry uniqueness
+    // constraints.  Without proving the join key is unique on the pushed
+    // side, this rule can return fewer rows than the correct answer.
+    // Re-enable when the Memo exposes catalog constraints (PK/FK metadata).
 
     // rank_row_number_to_topn: Transform Selection(Window(X), col <= N) into TopN
     // when ordering matches window order.
@@ -5685,7 +5698,16 @@ void SearchEngine::ExploreGroup(GroupId group,
       }
       // Transformation rules may legitimately decline; the return value is
       // only advisory for callers that track memo growth.
-      std::ignore = rule.Apply(memo_, group, expression);
+      // PRODUCTION FIX: a buggy rule used to throw std::invalid_argument
+      // straight out of Explore, failing the whole query instead of just
+      // skipping one bad alternative. Contain the failure per rule.
+      try {
+        std::ignore = rule.Apply(memo_, group, expression);
+      } catch (const std::invalid_argument&) {
+        // Memo invariant violation from a transformation rule: keep the
+        // alternative absent and continue exploring the remaining rules.
+        continue;
+      }
     }
     for (GroupId child : expression.children) {
       enqueue(child);
