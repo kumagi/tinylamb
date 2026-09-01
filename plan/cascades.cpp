@@ -3199,6 +3199,12 @@ const RuleSet& RuleSet::Default() {
                 win_expr.children.size() != 1) {
               continue;
             }
+            // D5 gate: TopN is only valid for row_number/rank without
+            // PARTITION BY. A partitioned window requires per-partition
+            // numbering which a single TopN cannot provide.
+            if (!win_expr.partition_by.empty()) {
+              continue;
+            }
             const GroupId child_id = win_expr.children[0];
             size_t limit_val = 0;
             for (const Expression& conjunct :

@@ -4112,4 +4112,152 @@ TEST(CascadesTest, OuterToAntiJoinRequiresNullCheckOnAllRightColumns) {
          "predicates reference right-side columns";
 }
 
+TEST(CascadesTest, RankRowNumberToTopNSkipsPartitionedWindow) {
+  // D5 counterexample: rank_row_number_to_topn must NOT convert a
+  // partitioned window function to TopN. ROW_NUMBER() OVER (PARTITION BY x)
+  // requires per-partition numbering, which a single TopN cannot provide.
+  Memo memo;
+  const GroupId scan = memo.Build({"t"});
+  const GroupId win = memo.EnsureDerivedGroup({"t"}, "win");
+  ASSERT_TRUE(memo.AddExpression(
+      win,
+      LogicalExpression{.operation = LogicalOperator::kWindow,
+                        .children = {scan},
+                        .target_list = {
+                            NamedExpression("rn", ColumnValueExp("t.id"))},
+                        .sort_ascending = {true},
+                        .sort_nulls_first = {false},
+                        .partition_by = {ColumnValueExp("t.department")}}));
+  // WHERE rn <= 3
+  Expression pred = BinaryExpressionExp(
+      ColumnValueExp("rn"), BinaryOperation::kLessThanEquals,
+      ConstantValueExp(Value(int64_t{3})));
+  const GroupId sel = memo.EnsureDerivedGroup({"t"}, "sel");
+  ASSERT_TRUE(memo.AddExpression(
+      sel,
+      LogicalExpression{.operation = LogicalOperator::kSelection,
+                        .children = {win},
+                        .predicate = pred}));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(sel);
+
+  // The rule should NOT have created a TopN because the window has
+  // PARTITION BY which requires per-partition numbering.
+  const bool has_topn = std::ranges::any_of(
+      search.GetMemo().Get(sel).expressions,
+      [](const LogicalExpression& expr) {
+        return expr.operation == LogicalOperator::kTopN;
+      });
+  EXPECT_FALSE(has_topn)
+      << "rank_row_number_to_topn incorrectly converted partitioned "
+         "window to TopN";
+}
+
+TEST(CascadesTest, EagerAggregationOverJoinSkipsOuterJoin) {
+  // D5 counterexample: eager_aggregation_over_join must NOT push aggregation
+  // below an outer join. LEFT JOIN preserves unmatched left rows with NULLs;
+  // aggregating before the join would lose those rows.
+  Memo memo;
+  (void)memo.Build({"a", "b"});
+  const GroupId left = memo.EnsureGroup({"a"});
+  const GroupId right = memo.EnsureGroup({"b"});
+  const GroupId join_group = memo.EnsureDerivedGroup({"a", "b"}, "oj");
+  ASSERT_TRUE(memo.AddExpression(
+      join_group,
+      LogicalExpression{.operation = LogicalOperator::kOuterJoin,
+                        .children = {left, right},
+                        .predicate = BinaryExpressionExp(
+                            ColumnValueExp("a.id"),
+                            BinaryOperation::kEquals,
+                            ColumnValueExp("b.id")),
+                        .join_type = 0}));
+  // SELECT a.dept, COUNT(a.id) FROM a LEFT JOIN b ON a.id=b.id GROUP BY a.dept
+  Expression agg_input = ColumnValueExp("a.id");
+  Expression group_key = ColumnValueExp("a.dept");
+  const GroupId agg_group = memo.EnsureDerivedGroup({"a", "b"}, "agg");
+  ASSERT_TRUE(memo.AddExpression(
+      agg_group,
+      LogicalExpression{.operation = LogicalOperator::kAggregation,
+                        .children = {join_group},
+                        .target_list = {
+                            NamedExpression("dept", group_key),
+                            NamedExpression("cnt",
+                                            AggregateExpressionExp(
+                                                AggregationType::kCount,
+                                                agg_input, false))},
+                        .grouping_sets = {group_key}}));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(agg_group);
+
+  // The rule should NOT have pushed aggregation below the outer join.
+  const bool agg_pushed = std::ranges::any_of(
+      search.GetMemo().Get(agg_group).expressions,
+      [&](const LogicalExpression& expr) {
+        if (expr.operation != LogicalOperator::kJoin) return false;
+        for (GroupId child : expr.children) {
+          for (const LogicalExpression& cexpr :
+               search.GetMemo().Get(child).expressions) {
+            if (cexpr.operation == LogicalOperator::kAggregation) return true;
+          }
+        }
+        return false;
+      });
+  EXPECT_FALSE(agg_pushed)
+      << "eager_aggregation_over_join incorrectly pushed aggregation "
+         "below an outer join";
+}
+
+TEST(CascadesTest, AggregateJoinTransposeSkipsOuterJoin) {
+  // D5 counterexample: aggregate_join_transpose must NOT push aggregation
+  // below an outer join. The aggregation would lose NULL-padded rows.
+  Memo memo;
+  (void)memo.Build({"a", "b"});
+  const GroupId left = memo.EnsureGroup({"a"});
+  const GroupId right = memo.EnsureGroup({"b"});
+  const GroupId join_group = memo.EnsureDerivedGroup({"a", "b"}, "oj");
+  ASSERT_TRUE(memo.AddExpression(
+      join_group,
+      LogicalExpression{.operation = LogicalOperator::kOuterJoin,
+                        .children = {left, right},
+                        .predicate = BinaryExpressionExp(
+                            ColumnValueExp("a.id"),
+                            BinaryOperation::kEquals,
+                            ColumnValueExp("b.id")),
+                        .join_type = 0}));
+  // SELECT a.dept, COUNT(a.id) FROM a LEFT JOIN b ON a.id=b.id GROUP BY a.dept
+  Expression agg_input = ColumnValueExp("a.id");
+  Expression group_key = ColumnValueExp("a.dept");
+  const GroupId agg_group = memo.EnsureDerivedGroup({"a", "b"}, "agg");
+  ASSERT_TRUE(memo.AddExpression(
+      agg_group,
+      LogicalExpression{.operation = LogicalOperator::kAggregation,
+                        .children = {join_group},
+                        .target_list = {
+                            NamedExpression("dept", group_key),
+                            NamedExpression("cnt",
+                                            AggregateExpressionExp(
+                                                AggregationType::kCount,
+                                                agg_input, false))},
+                        .grouping_sets = {group_key}}));
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(agg_group);
+
+  // The rule should NOT have pushed aggregation below the outer join.
+  const bool agg_pushed = std::ranges::any_of(
+      search.GetMemo().Get(agg_group).expressions,
+      [&](const LogicalExpression& expr) {
+        if (expr.operation != LogicalOperator::kJoin) return false;
+        for (GroupId child : expr.children) {
+          for (const LogicalExpression& cexpr :
+               search.GetMemo().Get(child).expressions) {
+            if (cexpr.operation == LogicalOperator::kAggregation) return true;
+          }
+        }
+        return false;
+      });
+  EXPECT_FALSE(agg_pushed)
+      << "aggregate_join_transpose incorrectly pushed aggregation "
+         "below an outer join";
+}
+
 }  // namespace tinylamb::cascades
