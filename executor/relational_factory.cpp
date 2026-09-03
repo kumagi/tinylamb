@@ -111,7 +111,9 @@ void RelationRenameExecutor::Dump(std::ostream& o, int indent) const {
 Executor FullScanPlan::EmitExecutor(TransactionContext& txn) const {
   if (MaxRows() == std::numeric_limits<size_t>::max() &&
       stats_.Rows() >= kParallelScanMinRows) {
-    return std::make_shared<ParallelScan>(txn.txn_, table_);
+    return std::make_shared<ParallelScan>(txn.txn_, table_,
+                                          std::thread::hardware_concurrency(),
+                                          8, std::nullopt, peek_compares_);
   }
   return std::make_shared<FullScan>(txn.txn_, table_, MaxRows());
 }

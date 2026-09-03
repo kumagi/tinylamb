@@ -18,8 +18,10 @@
 #define TINYLAMB_FULL_SCAN_PLAN_HPP
 
 #include <limits>
+#include <vector>
 
 #include "plan/plan.hpp"
+#include "table/full_scan_iterator.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 
@@ -29,6 +31,10 @@ class FullScanPlan : public PlanBase {
  public:
   explicit FullScanPlan(
       const Table& table, const TableStatistics& ts,
+      size_t max_rows = std::numeric_limits<size_t>::max());
+  FullScanPlan(
+      const Table& table, const TableStatistics& ts,
+      std::vector<IntegerPeekCompare> peek_compares,
       size_t max_rows = std::numeric_limits<size_t>::max());
   FullScanPlan(const FullScanPlan&) = delete;
   FullScanPlan(FullScanPlan&&) = delete;
@@ -47,6 +53,9 @@ class FullScanPlan : public PlanBase {
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
   [[nodiscard]] size_t MaxRows() const { return max_rows_; }
+  [[nodiscard]] const std::vector<IntegerPeekCompare>& PeekCompares() const {
+    return peek_compares_;
+  }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
@@ -54,6 +63,7 @@ class FullScanPlan : public PlanBase {
   const Table& table_;
   const TableStatistics& stats_;
   size_t max_rows_;
+  std::vector<IntegerPeekCompare> peek_compares_;
 };
 
 }  // namespace tinylamb

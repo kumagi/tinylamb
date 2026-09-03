@@ -34,6 +34,14 @@ FullScanPlan::FullScanPlan(const Table& table, const TableStatistics& stats,
                            size_t max_rows)
     : table_(table), stats_(stats), max_rows_(max_rows) {}
 
+FullScanPlan::FullScanPlan(const Table& table, const TableStatistics& stats,
+                           std::vector<IntegerPeekCompare> peek_compares,
+                           size_t max_rows)
+    : table_(table),
+      stats_(stats),
+      max_rows_(max_rows),
+      peek_compares_(std::move(peek_compares)) {}
+
 // EmitExecutor lives in the relational factory (executor/relational_factory.cpp).
 
 const Schema& FullScanPlan::GetSchema() const { return table_.GetSchema(); }

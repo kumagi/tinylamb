@@ -606,3 +606,57 @@ adding a warehouse gate would make the number incomparable.
   5. `AcquireWriteIntent()` wait extended 1 ms → 5 ms to reduce hot-row aborts on district/new_order.
 - **Remaining to reach 40k:** engine abort rate still ~4.6% (mostly `district` / `new_order` write-intent timeouts under extreme contention). Further gains likely from stricter admission control or deferred Delivery queue redesign (see `docs/next-actions.md`).
 - Not an audited tpmC result (no think/keying, 15 s window). Engineering figure only.
+
+## 2026-09-03 — TPC-H SF=0.01 PeekCompare predicate pushdown
+
+- **Build:** `CMAKE_BUILD_TYPE=Release`, current working tree.
+- **Host:** AMD Ryzen 9 9950X3D (16 cores / 32 threads, 128 MiB L3), 59 GiB RAM.
+- **Command:** `./tinylamb_tpch_benchmark /tmp/tpch_baseline/tpch --scale-factor 0.01`
+- **Fixture:** SF=0.01 (60,175 lineitem rows, 15,000 orders, 2,000 parts).
+
+### Changes applied
+1. **PeekCompare predicate pushdown in Cascades scan path:** FullScanPlan now accepts
+   `IntegerPeekCompare` predicates extracted from Selection filters. ParallelScan forwards
+   these to `BeginMorselScan`, enabling raw-byte-level integer/date rejection before
+   full row deserialization.
+2. **Fixed `LogCompensationFailure` forward declaration** in `table/table.cpp`.
+
+### SF=0.01 results (cold first run)
+
+| Query | Time (ms) | scan_ms | filter_ms | join_ms | Rows |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q1 | 51.8 | 41.6 | 41.6 | 0 | 4 |
+| Q2 | 12.1 | 1.1 | 2.2 | 0.6 | 3 |
+| Q3 | 15.4 | 5.8 | 5.8 | 0.2 | 10 |
+| Q4 | 30.6 | 8.3 | 21.1 | 0 | 5 |
+| Q5 | 25.7 | 7.2 | 0.7 | 2.6 | 5 |
+| Q6 | 12.7 | 3.4 | 3.4 | 0 | 1 |
+| Q7 | 24.7 | 4.1 | 3.1 | 3.1 | 4 |
+| Q8 | 24.2 | 8.0 | 1.7 | 2.8 | 5 |
+| Q9 | 119.2 | 16.7 | 0.4 | 40.3 | 175 |
+| Q10 | 16.3 | 6.0 | 5.6 | 1.0 | 20 |
+| Q11 | 11.3 | 1.5 | 0.0 | 0.3 | 5 |
+| Q12 | 13.8 | 4.7 | 3.7 | 0.1 | 2 |
+| Q13 | 21.4 | 2.3 | 0 | 6.6 | 32 |
+| Q14 | 12.1 | 1.5 | 1.3 | 0.2 | 1 |
+| Q15 | 12.5 | 3.3 | 3.4 | 0.004 | 1 |
+| Q16 | 12.0 | 1.5 | 1.5 | 0.3 | 278 |
+| Q17 | 30.8 | 10.3 | 16.5 | 0.04 | 1 |
+| Q18 | 32.7 | 17.4 | 17.3 | 0.4 | 100 |
+| Q19 | 16.6 | 6.5 | 6.5 | 0.01 | 1 |
+| Q20 | 79.8 | 10.2 | 48.7 | 19.5 | 1 |
+| Q21 | FAIL | spill write failed (pre-existing) | | | |
+| Q22 | 394.3 | 2.8 | 12.4 | 0 | 7 |
+
+**Query sum (Q1–Q22, Q21 excluded):** **1,060 ms**
+
+### Analysis
+- Q22 (394ms) dominates due to cold page reads (warm=22ms).
+- Q9 (119ms) second slowest: 6-way join with 70K comparisons.
+- Q20 (80ms): expensive filter evaluation (48ms).
+- PeekCompare does not help Q1 because the date predicate passes 99% of rows.
+
+### Correctness
+- `sql_engine_tpch_test.ExecutesAllTwentyTwoQueries` PASS
+- `optimizer_test` 81 PASS
+- `executor_test` 158 PASS

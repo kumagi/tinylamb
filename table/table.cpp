@@ -32,6 +32,7 @@
 #include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/log_message.hpp"
 #include "common/status_or.hpp"
 #include "full_scan_iterator.hpp"
 #include "index/b_plus_tree.hpp"
@@ -90,6 +91,16 @@ namespace {
 // next Insert call pre-allocates and links a fresh tail page so the
 // allocation cost (and the page-full chain walk) leaves the hot path.
 constexpr bin_size_t kTailPreallocateThreshold = kPageBodySize / 16;
+
+// Best-effort compensations run after the primary failure is already decided;
+// their own failures must stay observable instead of vanishing into
+// std::ignore, or heap/index divergence goes undiagnosed.
+void LogCompensationFailure(std::string_view operation, Status status) {
+  if (status != Status::kSuccess) {
+    LOG(WARN) << "Table compensation " << operation
+              << " failed: " << status;
+  }
+}
 }  // namespace
 
 StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
@@ -174,15 +185,19 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
       // the index entries added before the failing one and remove the row
       // that was already written to the row page.
       for (size_t j = 0; j < i; ++j) {
-        std::ignore = IndexDelete(txn, indexes_[j], rp);
+        LogCompensationFailure(
+            "insert-rollback IndexDelete",
+            IndexDelete(txn, indexes_[j], rp));
       }
       PageRef written = txn.GetPageManager()->GetPage(rp.page_id);
-      std::ignore = written->Delete(txn, rp.slot);
+      LogCompensationFailure("insert-rollback heap Delete",
+                             written->Delete(txn, rp.slot));
       return status;
     }
   }
   return rp;
 }
+
 
 namespace {
 // Phase2-5: index-maintenance decisions come from comparing column offsets,
@@ -304,14 +319,16 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   // entries behind (old keys deleted / new keys partially inserted).
   const auto reinstate_old_keys = [&](size_t count, const RowPosition& at) {
     for (size_t j = 0; j < count; ++j) {
-      std::ignore = IndexInsert(txn, indexes_[j], original_row, at,
-                                &idx_cursors[j]);
+      LogCompensationFailure(
+          "update-rollback IndexInsert",
+          IndexInsert(txn, indexes_[j], original_row, at, &idx_cursors[j]));
     }
   };
   const auto undo_index_inserts = [&](size_t count) {
     for (size_t j = 0; j < count; ++j) {
-      std::ignore = IndexDelete(txn, indexes_[j], new_pos, row,
-                                &idx_cursors[j]);
+      LogCompensationFailure(
+          "update-rollback IndexDelete",
+          IndexDelete(txn, indexes_[j], new_pos, row, &idx_cursors[j]));
     }
   };
   // Phase2-3: serialize the pre-update image once, on first use, instead of
@@ -326,7 +343,8 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     // (page.PageUnlock()); re-entering GetPage() on the same page while the
     // in-place update path still holds it deadlocks on the shared_mutex.
     PageRef written = txn.GetPageManager()->GetPage(pos.page_id);
-    std::ignore = written->Update(txn, pos.slot, original_image);
+    LogCompensationFailure("update-rollback physical row restore",
+                           written->Update(txn, pos.slot, original_image));
   };
 
   Status s = page->Update(txn, new_pos.slot, serialized_row);
@@ -429,7 +447,8 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   if (deleted < indexes_.size()) {
     // Drop the reserved copy; the original row and its keys stay intact.
     PageRef copy_page = txn.GetPageManager()->GetPage(new_pos.page_id);
-    std::ignore = copy_page->Delete(txn, new_pos.slot);
+    LogCompensationFailure("update-rollback reserved-copy Delete",
+                           copy_page->Delete(txn, new_pos.slot));
     copy_page.PageUnlock();
     return failure;
   }
@@ -439,7 +458,8 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     // The original row survives at pos; drop the reserved copy and roll the
     // index deletes back.
     PageRef copy_page = txn.GetPageManager()->GetPage(new_pos.page_id);
-    std::ignore = copy_page->Delete(txn, new_pos.slot);
+    LogCompensationFailure("update-rollback reserved-copy Delete",
+                           copy_page->Delete(txn, new_pos.slot));
     copy_page.PageUnlock();
     reinstate_old_keys(indexes_.size(), pos);
     return delete_status;
@@ -481,7 +501,9 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
     // The row survives, so every applied index deletion must be undone:
     // "row present x some index entries gone" is not a legal state.
     for (size_t j = 0; j < deleted; ++j) {
-      std::ignore = IndexInsert(txn, indexes_[j], original_row, pos);
+      LogCompensationFailure(
+          "delete-rollback IndexInsert",
+          IndexInsert(txn, indexes_[j], original_row, pos));
     }
     return failure;
   }
@@ -511,7 +533,9 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
     // The physical delete failed after all keys were removed: reinstate them
     // so the surviving row stays reachable from every index.
     for (size_t i = indexes_.size(); 0 < i; --i) {
-      std::ignore = IndexInsert(txn, indexes_[i - 1], original_row, pos);
+      LogCompensationFailure(
+          "delete-rollback IndexInsert",
+          IndexInsert(txn, indexes_[i - 1], original_row, pos));
     }
   }
   return delete_status;

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "executor/executor_base.hpp"
+#include "table/full_scan_iterator.hpp"
 #include "table/table.hpp"
 
 namespace tinylamb {
@@ -26,7 +27,8 @@ class ParallelScan final : public ExecutorBase {
   ParallelScan(Transaction& txn, const Table& table,
                size_t worker_count = std::thread::hardware_concurrency(),
                size_t pages_per_morsel = 8,
-               std::optional<std::vector<slot_t>> projection = std::nullopt);
+               std::optional<std::vector<slot_t>> projection = std::nullopt,
+               std::vector<IntegerPeekCompare> peek_compares = {});
   ~ParallelScan() override;
 
   bool Next(Row* destination, RowPosition* position) override;
@@ -45,6 +47,7 @@ class ParallelScan final : public ExecutorBase {
   Transaction* txn_;
   const Table* table_;
   std::optional<std::vector<slot_t>> projection_;
+  std::vector<IntegerPeekCompare> peek_compares_;
   std::vector<Table::ScanMorsel> morsels_;
   size_t worker_count_;
   size_t max_ready_chunks_;

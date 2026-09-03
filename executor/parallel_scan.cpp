@@ -23,10 +23,12 @@ namespace tinylamb {
 ParallelScan::ParallelScan(
     Transaction& txn, const Table& table, size_t worker_count,
     size_t pages_per_morsel,
-    std::optional<std::vector<slot_t>> projection)
+    std::optional<std::vector<slot_t>> projection,
+    std::vector<IntegerPeekCompare> peek_compares)
     : txn_(&txn),
       table_(&table),
       projection_(std::move(projection)),
+      peek_compares_(std::move(peek_compares)),
       morsels_(table.BuildScanMorsels(txn, pages_per_morsel)),
       worker_count_(std::min(std::max<size_t>(1, worker_count),
                              std::max<size_t>(1, morsels_.size()))),
@@ -86,8 +88,11 @@ void ParallelScan::RunWorker(size_t batch_size) {
       const size_t morsel_index = next_morsel_.fetch_add(1);
       if (morsel_index >= morsels_.size()) { break;
 }
+      const std::vector<IntegerPeekCompare>* peek_ptr =
+          peek_compares_.empty() ? nullptr : &peek_compares_;
       Iterator iterator = table_->BeginMorselScan(
-          *txn_, morsels_[morsel_index], projection_);
+          *txn_, morsels_[morsel_index], projection_, nullptr,
+          std::nullopt, peek_ptr);
       // The layout never changes across refill, so Initialize is the single
       // reset path for both the first and subsequent chunks.
       DataChunk chunk;
