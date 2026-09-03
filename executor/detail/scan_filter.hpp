@@ -10,6 +10,7 @@
 
 #include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
+#include "expression/bytecode.hpp"
 #include "expression/expression.hpp"
 #include "query/statement.hpp"
 #include "table/full_scan_iterator.hpp"
@@ -49,6 +50,9 @@ struct CompiledScanFilter {
   // Pre-computed unsigned column info to avoid per-row schema iteration.
   bool needs_unsigned_tagging{false};
   std::vector<slot_t> unsigned_columns;
+  // Bytecode-compiled residual expression for fast row-by-row evaluation.
+  // When non-null, MatchScanFilter uses this instead of recursive Evaluate().
+  std::optional<BytecodeProgram> residual_bytecode;
 };
 
 bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred);

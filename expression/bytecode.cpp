@@ -83,6 +83,35 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kBinaryExp: {
       const BinaryExpression& binary = expression->AsBinaryExpression();
+      // D7 (docs/design.md): AND/OR compile to short-circuit control flow so
+      // the VM skips the right operand exactly when the AST does, keeping the
+      // three-valued truth table AND the error-occurrence conditions
+      // identical.  Layout (AND):
+      //     <left>
+      //     JumpIfFalse -> end     (left==FALSE: result FALSE, skip right)
+      //     <right>
+      //     Binary AND             (left TRUE/NULL: merge three-valued)
+      //   end:
+      // OR uses JumpIfTrue symmetrically.  The jump peeks the stack (does not
+      // pop), so every path reaches `end` with exactly one value.
+      if (binary.Op() == BinaryOperation::kAnd ||
+          binary.Op() == BinaryOperation::kOr) {
+        if (!CompileNode(binary.Left(), schema, program)) { return false;
+}
+        const size_t jump_index = program->Size();
+        program->AddInstruction({.opcode = binary.Op() == BinaryOperation::kAnd
+                                              ? BytecodeOp::kJumpIfFalse
+                                              : BytecodeOp::kJumpIfTrue});
+        if (!CompileNode(binary.Right(), schema, program)) { return false;
+}
+        program->AddInstruction(
+            {.opcode=BytecodeOp::kBinaryInt64, .operand=0, .binary=binary.Op()});
+        // Patch: jump lands just past the merge instruction.
+        program->SetJumpTarget(jump_index,
+                               static_cast<int32_t>(program->Size()) -
+                                   static_cast<int32_t>(jump_index));
+        return true;
+      }
       if (!CompileNode(binary.Left(), schema, program) ||
           !CompileNode(binary.Right(), schema, program)) {
         return false;
@@ -151,13 +180,34 @@ ColumnVector BytecodeProgram::EvaluateBatch(const DataChunk& input) const {
   stack.reserve(instructions_.size());
   for (size_t row = 0; row < input.Size(); ++row) {
     stack.clear();
-    for (const BytecodeInstruction& instruction : instructions_) {
+    // D7: a program counter (not a range-for) so the short-circuit jumps can
+    // skip the right operand; jump targets are relative to the jump itself.
+    for (size_t pc = 0; pc < instructions_.size(); ++pc) {
+      const BytecodeInstruction& instruction = instructions_[pc];
       switch (instruction.opcode) {
         case BytecodeOp::kLoadColumn:
           stack.push_back(input.ColumnAt(instruction.operand).ValueAt(row));
           break;
         case BytecodeOp::kLoadConstant:
           stack.push_back(constants_[instruction.operand]);
+          break;
+        case BytecodeOp::kJumpIfFalse:
+        case BytecodeOp::kJumpIfTrue: {
+          assert(!stack.empty());
+          const Value& top = stack.back();
+          const bool decides =
+              instruction.opcode == BytecodeOp::kJumpIfFalse
+                  ? (!top.IsNull() && !top.Truthy())
+                  : (!top.IsNull() && top.Truthy());
+          if (decides) {
+            pc += static_cast<size_t>(instruction.jump_target);
+            --pc;  // the for-loop ++pc lands on the target.
+          }
+          break;
+        }
+        case BytecodeOp::kJump:
+          pc += static_cast<size_t>(instruction.jump_target);
+          --pc;
           break;
         case BytecodeOp::kBinaryInt64:
         case BytecodeOp::kBinaryDouble:
@@ -189,6 +239,63 @@ ColumnVector BytecodeProgram::EvaluateBatch(const DataChunk& input) const {
     result.Append(stack.back());
   }
   return result;
+}
+
+Value BytecodeProgram::EvaluateRow(const Row& row) const {
+  std::vector<Value> stack;
+  stack.reserve(instructions_.size());
+  for (size_t pc = 0; pc < instructions_.size(); ++pc) {
+    const BytecodeInstruction& instruction = instructions_[pc];
+    switch (instruction.opcode) {
+      case BytecodeOp::kLoadColumn:
+        stack.push_back(row[instruction.operand]);
+        break;
+      case BytecodeOp::kLoadConstant:
+        stack.push_back(constants_[instruction.operand]);
+        break;
+      case BytecodeOp::kJumpIfFalse:
+      case BytecodeOp::kJumpIfTrue: {
+        assert(!stack.empty());
+        const Value& top = stack.back();
+        const bool decides =
+            instruction.opcode == BytecodeOp::kJumpIfFalse
+                ? (!top.IsNull() && !top.Truthy())
+                : (!top.IsNull() && top.Truthy());
+        if (decides) {
+          pc += static_cast<size_t>(instruction.jump_target);
+          --pc;
+        }
+        break;
+      }
+      case BytecodeOp::kJump:
+        pc += static_cast<size_t>(instruction.jump_target);
+        --pc;
+        break;
+      case BytecodeOp::kBinaryInt64:
+      case BytecodeOp::kBinaryDouble:
+      case BytecodeOp::kBinaryVarchar:
+      case BytecodeOp::kBinaryDate: {
+        assert(!stack.empty());
+        Value right = std::move(stack.back());
+        stack.pop_back();
+        assert(!stack.empty());
+        Value left = std::move(stack.back());
+        stack.pop_back();
+        stack.push_back(EvaluateBinary(instruction.binary, left, right));
+        break;
+      }
+      case BytecodeOp::kUnaryInt64:
+      case BytecodeOp::kUnaryDouble: {
+        assert(!stack.empty());
+        Value child = std::move(stack.back());
+        stack.pop_back();
+        stack.push_back(EvaluateUnary(instruction.unary, child));
+        break;
+      }
+    }
+  }
+  if (stack.size() != 1) { throw std::runtime_error("invalid bytecode stack"); }
+  return std::move(stack.back());
 }
 
 }  // namespace tinylamb

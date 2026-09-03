@@ -945,9 +945,12 @@ Relation FinishQuery(TransactionContext& context,
     }
     const relational_detail::CompiledScanFilter compiled =
         relational_detail::CompileScanFilter(where_predicates, input.schema);
-    if (!compiled.simple.empty() ||
-        !compiled.disjunctive_branches.empty()) {
-      // Has fast-path predicates: use compiled filter.
+    // Use compiled filter path when any fast-path is available: SimpleCompare,
+    // disjunctive branches, or bytecode-compiled residuals.  The bytecode
+    // path avoids recursive expression tree traversal for residual predicates,
+    // which is the dominant cost for complex WHERE clauses like TPC-H Q20.
+    if (!compiled.simple.empty() || !compiled.disjunctive_branches.empty() ||
+        compiled.residual_bytecode.has_value()) {
       Relation filtered(context.execution_runtime());
       filtered.schema = input.schema;
       CopyExecutionStats(&filtered, input);
@@ -961,7 +964,6 @@ Relation FinishQuery(TransactionContext& context,
       filtered.FinishSpill();
       input = std::move(filtered);
     } else {
-      // No fast-path predicates: use generic expression evaluator.
       Relation filtered(context.execution_runtime());
       filtered.schema = input.schema;
       CopyExecutionStats(&filtered, input);

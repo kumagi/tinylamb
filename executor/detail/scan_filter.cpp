@@ -368,6 +368,38 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
       compiled.unsigned_columns.push_back(i);
     }
   }
+  // Compile residual expressions into bytecode for fast row-by-row evaluation.
+  // Bytecode avoids recursive expression tree traversal and virtual dispatch,
+  // which is the dominant cost for non-selective filters like TPC-H Q20.
+  // Combine all residuals into a single AND expression for compilation.
+  if (!compiled.residual.empty() && !compiled.residual_bytecode) {
+    // Skip bytecode compilation when the schema has duplicate column names.
+    // The bytecode evaluator resolves columns by name, and duplicate names
+    // cause ambiguity errors that the generic Evaluate() path catches at
+    // runtime via FindColumn(). Bytecode bypasses that check, so we must
+    // stay on the generic path to preserve the ambiguous-column error.
+    bool has_duplicate_cols = false;
+    {
+      std::unordered_set<std::string> seen_names;
+      for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+        const std::string& col_name = schema.GetColumn(i).Name().name;
+        if (!seen_names.insert(col_name).second) {
+          has_duplicate_cols = true;
+          break;
+        }
+      }
+    }
+    if (!has_duplicate_cols) {
+      Expression combined = compiled.residual[0];
+      for (size_t i = 1; i < compiled.residual.size(); ++i) {
+        combined = BinaryExpressionExp(combined, BinaryOperation::kAnd,
+                                      compiled.residual[i]);
+      }
+      if (auto bytecode = BytecodeCompiler::Compile(combined, schema)) {
+        compiled.residual_bytecode = std::move(*bytecode);
+      }
+    }
+  }
   return compiled;
 }
 
@@ -433,6 +465,13 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
   }
   if (filter.residual.empty()) {
     return true;
+  }
+  // Use bytecode evaluator when available: avoids recursive expression tree
+  // traversal and virtual dispatch, which is the dominant cost for complex
+  // residual predicates like TPC-H Q20's 3-way OR filter.
+  if (filter.residual_bytecode) {
+    const Value result = filter.residual_bytecode->EvaluateRow(*match_row);
+    return !result.IsNull() && result.Truthy();
   }
   Scope scope{.row = match_row, .schema = &schema, .outer = outer};
   for (const Expression& predicate : filter.residual) {
