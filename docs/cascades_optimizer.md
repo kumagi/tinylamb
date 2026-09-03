@@ -26,7 +26,8 @@ single-relation scan filter. A residual `Selection` remains where the chosen
 physical access path cannot prove it consumed a conjunct, so bounds are an
 optimization and never the sole correctness check.
 
-The built-in logical rules are:
+The built-in logical rules include (see `RuleSet::Default` in
+`plan/cascades.cpp` for the authoritative list, which has grown past 30):
 
 - `join_commutativity`
 - `join_enumeration`
@@ -43,16 +44,22 @@ The built-in logical rules are:
 - `infer_join_predicates`
 - `merge_limits`
 - `eliminate_true_selection`
+- `push_filter_past_setop` (only when the predicate resolves in every branch)
+- `push_filter_through_sort` / `limit_push_through_sort` (offset-free only)
+- `push_projection_through_join` / `push_projection_through_union`
+- `self_join_elimination`, `unique_semi_to_inner` (key-equality gated),
+  `outer_to_anti_join`, `union_all_push_limit`, `eliminate_double_sort`, and
+  subquery/aggregate lowering rules
 
-The built-in physical rules are:
+The built-in physical rules include (see `plan/implementation_rules.cpp`):
 
 - `full_scan`
-- `index_scan`
+- `index_scan` (forward and reverse twins for ORDER BY DESC)
 - `selection`
 - `projection`
 - `aggregation`
 - `limit`
-- `hash_join`
+- `hash_join` (inner/outer/semi/anti, bitmap and TopN/Sort/Distinct/SetOp/Window variants)
 - `index_join`
 - `nested_loop_join`
 
@@ -164,7 +171,34 @@ Tests for rule isolation and memo enumeration are in
   fingerprints drive it to completion. Groups have an expression cap and set
   `Memo::Degraded()` when alternatives are dropped. Join enumeration skips
   exponential bipartitions above 16 relations and keeps the initial order.
-  Scalar rewriting still throws if it does not converge within 32 passes.
+  Scalar rewriting treats the pass cap as a safety net: when a rule set oscillates it returns the last stable (still semantics-preserving) form instead of rejecting the query (D6).
 - Logical and implementation rules all get a chance to apply in registration
   order. `Add` replaces an existing rule of the same name. Scalar rewriting is
   first-success per node and also supports literal function-call folding.
+
+
+## Rule precondition gates and D5 audit (docs/design.md D5)
+
+Every logical equivalence rule must carry a precondition gate that proves the
+rewrite preserves the result multiset. A rule whose precondition cannot be
+proved does not fire; a rule found to violate the semantics is removed or
+disabled and its basis recorded here. Counterexample tests live in
+`plan/cascades_test.cpp`; the dual-path row-set audit lives in
+`executor_test.cpp` (`OptimizerAndRelationalPathsAgree`).
+
+| Rule | Required precondition | State | Counterexample test |
+|------|---------------------|-------|---------------------|
+| `push_down_limit_through_join` | join key unique on the pushed side | **Disabled** (Memo has no uniqueness constraints) | `PushDownLimitThroughJoinSkipsNonUniqueJoin` |
+| `dynamic_filter_pushdown_join` | derived probe group keeps the probe group's residual filter; no filter loss | Gated: probe filter carried onto the derived group, tag fingerprints the bloom key set | `DynamicFilterPushdownJoin` |
+| `outer_to_anti_join` | inner join, IS-NULL on a right column, no other right-column conjunct | Gated | `OuterToAntiJoinRequiresNullCheckOnAllRightColumns` |
+| `eager_aggregation_over_join` | join provably 1:N (non-multiplying) on the aggregated side | **Disabled** (no constraint metadata) | `EagerAggregationOverJoin` (asserts no fire) |
+| `aggregate_join_transpose` | join provably 1:N on a foreign key | **Disabled** (precondition unchecked) | `AggregateJoinTranspose` (asserts no fire) |
+| `in_list_to_semi_join` | every OR branch is a col=const equality on one column (no branch dropped); group tag fingerprints all constants | Gated | `InListToSemiJoinRejectsMixedColumnOr`, `InListToSemiJoinRejectsUncollectableBranch` |
+| `eliminate_double_sort` | key expressions, direction and NULLS order all equal (collation is not modelled in the logical expression, so it cannot diverge) | Gated | `EliminateDoubleSortRequiresSameKeyExpressions`, `EliminateDoubleSortRequiresSameNullsFirst` |
+| `rank_row_number_to_topn` | window has no PARTITION BY and the Selection filters the window's own output column | Gated | `RankRowNumberToTopNSkipsPartitionedWindow`, `RankRowNumberToTopNSkipsNonWindowColumn` |
+| derived group creation | tag must fingerprint the expression *meaning*, never a bare count | `TargetListFingerprint` used by all projection/aggregate/values derived groups | `DerivedGroupFingerprintSeparatesDifferentInLists` |
+| `Memo::AddExpression` | schema/arity/child-group/relation-set contract | Throws `std::invalid_argument`; `ExploreGroup` catch-and-skips a bad rule alternative | memo contract tests in `cascades_test.cpp` |
+
+Re-adding a disabled rule requires re-establishing its precondition gate and a
+counterexample test; a rule may not be re-enabled just to recover an
+optimization opportunity.

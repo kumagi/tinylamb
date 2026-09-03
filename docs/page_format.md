@@ -25,8 +25,9 @@ network byte order. Unknown magic/version values are rejected as corrupt.
 - **PaxPage** — persistent column-group page for `DataChunk` values.
 - **Meta / checkpoint** pages — catalog and recovery metadata.
 
-Row and index layouts are validated on read; checksum mismatch returns
-`Status::kCorrupt` from `PagePool::ReadFrom` (see `docs/page_checksum.md`).
+Row and index layouts are validated on read; checksum mismatch throws
+`std::runtime_error` (logged with `Status::kCorrupt`) from `PagePool::ReadFrom`
+(see `docs/page_checksum.md`).
 
 ## PAX variant
 

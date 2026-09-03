@@ -10,10 +10,10 @@ PAXページは、同じページ内で行のMVCC可視性と列ごとの連続�
 ## レイアウト
 
 1. `PaxPageHeader`: 形式version、列数、行数、visibility領域、列directory、payload境界。
-2. visibility領域: 行ごとのversion-chain参照を固定幅offsetで保持する。0は物理行を使用することを表す。
+2. visibility領域: 将来の行ごと version-chain 参照用に予約された固定幅領域。現実装 (`PaxPage::Store`) は `rows*8` バイトを確保してゼロ埋めし、`Load` は内容を解釈しない。
 3. `PaxColumnDirectory[column_count]`: 型、encoding、値領域、NULL bitmap、補助領域のoffsetと長さ。
-4. NULL bitmap: 1 bit/row。1をNULLとし、未使用capacity bitも1にする。
+4. NULL bitmap: 1 bit/row。1をNULLとする。現実装は未使用 capacity bit を 0 のまま残す。
 5. 列値領域: INT64/DOUBLEは8 byte配列。VARCHARは`uint32_t[row_count + 1]`のoffset配列とbyte payload。
 6. 補助領域: dictionary、bit packing metadata、zone mapを後方互換に追加できる。
 
-すべてのoffsetは`Page::body`先頭からの`uint32_t`相対値とする。領域は重複せずページ境界内に収まり、ヘッダのversionが未知なら読み込みを拒否する。可視性を列データから独立させることで、MVCC判定後に必要列だけを連続走査できる。
+すべてのoffsetは`Page::body`先頭からの`uint32_t`相対値とする。各 directory の値/NULL 領域はページ境界内に収まること、NULL bitmap が全行を覆うこと、encoding が `kPlain` であること、型が既知の `ValueType` であることを `Load` が検証し、違反は破損として拒否する。ヘッダの version が未知の場合も読み込みを拒否する。領域同士の重複検査と visibility 内容の解釈は未実装 (予約領域としてゼロ固定)。可視性を列データから独立させることで、MVCC判定後に必要列だけを連続走査できる。

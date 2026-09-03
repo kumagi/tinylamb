@@ -25,9 +25,9 @@ implementation-defined. There is **no automatic migration**:
   once a page is read (`corrupt page checksum`).
 - Regenerate fixtures (TPC-H `--reuse-database` only after a fresh load, TPC-C
   reload, tests that create temp DBs).
-- Treat this as an on-disk format bump for engineering builds; no separate
-  magic/version field was added yet (follow-up: optional page format version
-  in meta page).
+- Treat this as an on-disk format bump for engineering builds; pages now
+  also carry a format magic (`TYB1`) and version validated by `DecodeDisk`
+  (see `docs/page_format.md`).
 
 ## Why CRC-32C
 

@@ -19,6 +19,29 @@ subtrees into a **`BytecodeProgram`** via `BytecodeCompiler`:
 If bytecode compilation fails, the executor falls back to per-row
 `Expression::Evaluate`.
 
+### Short-circuit AND/OR (D7, `docs/design.md`)
+
+`AND` and `OR` compile to control flow, not an eager binary op, so the VM
+skips the right operand exactly when the AST evaluator does and the three
+evaluation paths (AST / Bytecode / JIT) keep identical truth tables **and
+identical error behaviour**:
+
+```
+AND:  <left>  JumpIfFalse -> end  <right>  BinaryInt64(AND)   end:
+OR :  <left>  JumpIfTrue  -> end  <right>  BinaryInt64(OR)    end:
+```
+
+The jump peeks the stack (does not pop), so every path reaches `end` with one
+value. NULL never jumps (three-valued logic evaluates the right operand
+through `EvaluateBinary`). Consequently `FALSE AND rhs` and `TRUE OR rhs`
+never evaluate `rhs`, so a division-by-zero or other error in `rhs` is
+suppressed on exactly the rows the AST suppresses it on. The VM runs under a
+program counter (previously a range-for) to support these jumps. The JIT
+kernels do not compile AND/OR (they are comparison/projection/sum only), so
+the short-circuit path never reaches the JIT. Coverage lives in
+`differential_test.cpp` (`Evaluate_LogicalShortCircuitErrors_MatchAcrossPaths`)
+and `bytecode_test.cpp` (`D7_*`).
+
 **Bytecode is the authoritative description of what a batch kernel may assume**
 about an expression (column slots, constants, operators, result type).
 
