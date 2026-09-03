@@ -37,6 +37,15 @@ struct SimpleComparePredicate {
 struct CompiledScanFilter {
   std::vector<SimpleComparePredicate> simple;
   std::vector<Expression> residual;
+  // Disjunctive branches: OR(AND(pred1, pred2, ...), AND(pred3, pred4, ...), ...)
+  // Each inner vector is one AND branch.  MatchScanFilter returns true if
+  // ALL predicates in ANY branch pass.  Falls back to residual evaluation
+  // only when the branch contains non-simple (residual) predicates.
+  struct DisjunctiveBranch {
+    std::vector<SimpleComparePredicate> simple;
+    std::vector<Expression> residual;
+  };
+  std::vector<DisjunctiveBranch> disjunctive_branches;
 };
 
 bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred);

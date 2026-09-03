@@ -297,11 +297,16 @@ size_t SpillPartitionOf(int64_t key, size_t partitions) {
 }
 
 // DeWitt-style Hybrid Hash Join: keep partition 0 resident; spill the rest.
+// D8 (docs/design.md): supports null-safe equality keys (NULL matches NULL,
+// ordinary NULL keys never match), LEFT/RIGHT/FULL outer, and reprocesses
+// EVERY spilled partition -- spilled rows are never dropped or double-counted
+// against the resident portion alone.  Over-budget partitions spill further;
+// nothing is silently lost.
 Relation HybridHashJoin(
     Relation left, Relation right, const std::vector<slot_t>& left_columns,
     const std::vector<slot_t>& right_columns,
     const std::function<bool(const Row&)>& matches, bool left_join,
-    size_t* join_comparisons) {
+    size_t* join_comparisons, bool null_safe, bool right_join) {
   size_t build_estimate = 0;
   if (right.HasSpill()) {
     build_estimate = right.TotalRows() * 128;
@@ -312,16 +317,37 @@ Relation HybridHashJoin(
   }
   const size_t partitions = HybridPartitionCount(build_estimate);
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
-  const bool integer_key =
+  // D8: with right-outer emission, NULL-key build rows must survive intake
+  // (they never match but must be emitted); the integer fast path has no
+  // reserved key for NULL, so byte-encode the whole partition set instead.
+  // The null-safe byte encoding is injective for non-NULL rows, and probe
+  // sides still exclude NULL keys for ordinary equality, so semantics hold.
+  const bool integer_key = !null_safe && !right_join &&
       SingleIntegerJoinKey(left.schema, left_columns) &&
       SingleIntegerJoinKey(right.schema, right_columns);
   const slot_t left_key_column =
       integer_key ? left_columns[0] : static_cast<slot_t>(0);
   const slot_t right_key_column =
       integer_key ? right_columns[0] : static_cast<slot_t>(0);
+  auto left_key_string = [&](const Row& row) {
+    return EncodeNullSafeJoinKey(row, left_columns);
+  };
+  auto right_key_string = [&](const Row& row) {
+    return EncodeNullSafeJoinKey(row, right_columns);
+  };
+  // Ordinary equality excludes NULL keys from matching; null-safe equality
+  // treats NULL as a value.  A right-outer side must KEEP null-key build
+  // rows so they can be emitted as unmatched (they never match a probe).
+  auto build_key_excluded = [&](const Row& row) {
+    return !null_safe && HasNullKey(row, right_columns) && !right_join;
+  };
+  auto probe_key_excluded = [&](const Row& row) {
+    return !null_safe && HasNullKey(row, left_columns);
+  };
 
   std::vector<Row> resident_right;
   QueryMemoryCharge resident_charge;
+  std::vector<char> resident_matched;
   std::vector<SpillFile> left_parts(partitions);
   std::vector<SpillFile> right_parts(partitions);
 
@@ -333,17 +359,17 @@ Relation HybridHashJoin(
       return SpillPartitionOf(IntegerJoinKey(row, right_key_column),
                               partitions);
     }
-    return SpillPartitionOf(EncodeJoinKey(row, right_columns), partitions);
+    return SpillPartitionOf(right_key_string(row), partitions);
   };
   auto left_partition = [&](const Row& row) -> size_t {
     if (integer_key) {
       return SpillPartitionOf(IntegerJoinKey(row, left_key_column), partitions);
     }
-    return SpillPartitionOf(EncodeJoinKey(row, left_columns), partitions);
+    return SpillPartitionOf(left_key_string(row), partitions);
   };
 
   right.ForEachRow([&](const Row& row) {
-    if (HasNullKey(row, right_columns)) {
+    if (build_key_excluded(row)) {
       return;
     }
     const size_t part = right_partition(row);
@@ -351,6 +377,9 @@ Relation HybridHashJoin(
     if (part == 0 && budget.CanReserve(bytes)) {
       resident_charge.Add(bytes);
       resident_right.push_back(row);
+      if (right_join) {
+        resident_matched.push_back(0);
+      }
     } else {
       right_parts[part].Append(row);
     }
@@ -369,13 +398,20 @@ Relation HybridHashJoin(
   } else {
     str_buckets.reserve(resident_right.size());
     for (const Row& row : resident_right) {
-      str_buckets.emplace(EncodeJoinKey(row, right_columns), &row);
+      str_buckets.emplace(right_key_string(row), &row);
     }
   }
 
   Relation result(left.runtime());
   result.schema = left.schema + right.schema;
   const size_t right_width = right.schema.ColumnCount();
+  const size_t left_width = left.schema.ColumnCount();
+
+  auto mark_resident_match = [&](const Row& right_row) {
+    if (!right_join || resident_right.empty()) { return; }
+    const size_t index = static_cast<size_t>(&right_row - resident_right.data());
+    if (index < resident_matched.size()) { resident_matched[index] = 1; }
+  };
 
   auto probe_resident = [&](const Row& left_row) {
     bool matched = false;
@@ -386,17 +422,19 @@ Relation HybridHashJoin(
         ++(*join_comparisons);
         Row combined = left_row + *iter->second;
         if (matches(combined)) {
+          mark_resident_match(*iter->second);
           result.AddRow(std::move(combined));
           matched = true;
         }
       }
     } else {
-      const std::string key = EncodeJoinKey(left_row, left_columns);
+      const std::string key = left_key_string(left_row);
       const auto [begin, end] = str_buckets.equal_range(key);
       for (auto iter = begin; iter != end; ++iter) {
         ++(*join_comparisons);
         Row combined = left_row + *iter->second;
         if (matches(combined)) {
+          mark_resident_match(*iter->second);
           result.AddRow(std::move(combined));
           matched = true;
         }
@@ -409,7 +447,7 @@ Relation HybridHashJoin(
   };
 
   left.ForEachRow([&](const Row& left_row) {
-    if (HasNullKey(left_row, left_columns)) {
+    if (probe_key_excluded(left_row)) {
       if (left_join) {
         std::vector<Value> nulls(right_width);
         result.AddRow(left_row + Row(std::move(nulls)));
@@ -429,9 +467,20 @@ Relation HybridHashJoin(
 
   int_buckets.clear();
   str_buckets.clear();
-  if (!right_parts[0].Empty()) {
+  const bool resident_folded = !right_parts[0].Empty();
+  if (resident_folded) {
     for (const Row& row : resident_right) {
       right_parts[0].Append(row);
+    }
+  } else if (right_join) {
+    // Partition 0 stayed fully resident and was probed live: emit the build
+    // rows it never matched before releasing the resident image.
+    for (size_t index = 0; index < resident_right.size(); ++index) {
+      if (index < resident_matched.size() && resident_matched[index] != 0) {
+        continue;
+      }
+      std::vector<Value> nulls(left_width);
+      result.AddRow(Row(std::move(nulls)) + resident_right[index]);
     }
   }
   resident_right.clear();
@@ -452,6 +501,7 @@ Relation HybridHashJoin(
     for (const Row& row : right_rows) {
       part_charge.Add(EstimateRowBytes(row));
     }
+    std::vector<char> part_matched(right_join ? right_rows.size() : 0, 0);
     std::unordered_multimap<int64_t, const Row*> part_int_buckets;
     std::unordered_multimap<std::string, const Row*> part_str_buckets;
     if (integer_key) {
@@ -462,7 +512,7 @@ Relation HybridHashJoin(
     } else {
       part_str_buckets.reserve(right_rows.size());
       for (const Row& row : right_rows) {
-        part_str_buckets.emplace(EncodeJoinKey(row, right_columns), &row);
+        part_str_buckets.emplace(right_key_string(row), &row);
       }
     }
     left_parts[part].ForEachRow([&](const Row& left_row) {
@@ -474,17 +524,27 @@ Relation HybridHashJoin(
           ++(*join_comparisons);
           Row combined = left_row + *iter->second;
           if (matches(combined)) {
+            if (right_join) {
+              const size_t index =
+                  static_cast<size_t>(iter->second - right_rows.data());
+              if (index < part_matched.size()) { part_matched[index] = 1; }
+            }
             result.AddRow(std::move(combined));
             matched = true;
           }
         }
       } else {
-        const std::string key = EncodeJoinKey(left_row, left_columns);
+        const std::string key = left_key_string(left_row);
         const auto [begin, end] = part_str_buckets.equal_range(key);
         for (auto iter = begin; iter != end; ++iter) {
           ++(*join_comparisons);
           Row combined = left_row + *iter->second;
           if (matches(combined)) {
+            if (right_join) {
+              const size_t index =
+                  static_cast<size_t>(iter->second - right_rows.data());
+              if (index < part_matched.size()) { part_matched[index] = 1; }
+            }
             result.AddRow(std::move(combined));
             matched = true;
           }
@@ -495,6 +555,15 @@ Relation HybridHashJoin(
         result.AddRow(left_row + Row(std::move(nulls)));
       }
     });
+  // RIGHT / FULL: unmatched build rows of this partition, including rows
+  // that only ever lived in the spill file (D8: never dropped).
+  if (right_join) {
+    for (size_t index = 0; index < right_rows.size(); ++index) {
+      if (part_matched[index] != 0) { continue; }
+      std::vector<Value> nulls(left_width);
+      result.AddRow(Row(std::move(nulls)) + right_rows[index]);
+    }
+  }
   }
   result.FinishSpill();
   return result;
@@ -610,17 +679,17 @@ Relation Join(TransactionContext& context, Relation left, Relation right,
       left_columns.push_back(static_cast<slot_t>(key.left));
       right_columns.push_back(static_cast<slot_t>(key.right));
     }
-    // The hybrid operator only implements plain inner/left semantics.
+    // D8 (docs/design.md): the hybrid operator now implements null-safe
+    // keys and LEFT/RIGHT/FULL outer with full partition reprocessing.
     const bool has_null_safe_key = std::ranges::any_of(
         equality_keys, [](const EqualityKey& key) { return key.null_safe; });
-    if (ShouldHybridJoin(left, right) && !want_right_nulls &&
-        !has_null_safe_key) {
+    if (ShouldHybridJoin(left, right)) {
       ++result.hybrid_hash_joins;
       Relation joined =
           HybridHashJoin(std::move(left), std::move(right), left_columns,
-                         right_columns, matches,
-                         source.join_type == JoinType::kLeft,
-                         &result.join_comparisons);
+                         right_columns, matches, want_left_nulls,
+                         &result.join_comparisons, has_null_safe_key,
+                         want_right_nulls);
       joined.hash_joins = result.hash_joins;
       joined.hybrid_hash_joins = result.hybrid_hash_joins;
       joined.in_memory_hash_joins = result.in_memory_hash_joins;
@@ -766,11 +835,13 @@ Relation InnerJoin(TransactionContext& context, Relation left, Relation right,
     }
     const bool has_null_safe_key = std::ranges::any_of(
         equality_keys, [](const EqualityKey& key) { return key.null_safe; });
-    if (ShouldHybridJoin(left, right) && !has_null_safe_key) {
+    // D8 (docs/design.md): null-safe keys use the hybrid operator too, so a
+    // spilled input is never silently reduced to its resident prefix.
+    if (ShouldHybridJoin(left, right)) {
       ++result.hybrid_hash_joins;
       Relation joined = HybridHashJoin(
           std::move(left), std::move(right), left_columns, right_columns,
-          matches, false, &result.join_comparisons);
+          matches, false, &result.join_comparisons, has_null_safe_key, false);
       joined.hash_joins = result.hash_joins;
       joined.hybrid_hash_joins = result.hybrid_hash_joins;
       joined.in_memory_hash_joins = result.in_memory_hash_joins;
@@ -1337,19 +1408,6 @@ Relation BuildInput(TransactionContext& context,
   // historic silent-drop behavior: executor tests pin queries whose ON
   // clauses reference outer qualifiers and rely on the cross-join fallback.
   std::vector<Expression> join_residual;
-  auto is_using_self_equality = [](const Expression& predicate) {
-    if (!predicate || predicate->Type() != TypeTag::kBinaryExp) { return false;
-}
-    const auto& binary = predicate->AsBinaryExpression();
-    if (binary.Op() != BinaryOperation::kEquals ||
-        binary.Left()->Type() != TypeTag::kColumnValue ||
-        binary.Right()->Type() != TypeTag::kColumnValue) {
-      return false;
-    }
-    const ColumnName& lhs = binary.Left()->AsColumnValue().GetColumnName();
-    const ColumnName& rhs = binary.Right()->AsColumnValue().GetColumnName();
-    return lhs.schema.empty() && rhs.schema.empty() && lhs.name == rhs.name;
-  };
   auto mark_applied = [&join_residual](const Expression& expression) {
     if (!expression) { return;
 }
@@ -1375,8 +1433,10 @@ Relation BuildInput(TransactionContext& context,
       const Expression& expr = predicate.expression;
       if (!expr || !from_joins.contains(expr.get())) { continue;
 }
-      if (is_using_self_equality(expr)) { continue;
-}
+      // Note: USING(name) conjuncts are fully handled by the ordered-join
+      // path above, so a bare `x = x` seen here is a user-written ON
+      // conjunct; it keeps normal residual/local handling instead of being
+      // dropped (dropping it would lose the NULL rejection of `x = x`).
       // Historic behavior: an unresolvable plain-column conjunct is dropped
       // rather than evaluated against a schema where it cannot bind.
       if (!predicate.resolved && !predicate.contains_query &&
@@ -1665,17 +1725,66 @@ Relation BuildInput(TransactionContext& context,
     loaded[idx] = true;
   }
 
+  // Pick the best starting table.  The naive approach (smallest row
+  // count) can be suboptimal for star-like join graphs where the
+  // smallest table is a leaf with only one connection.  Simulate the
+  // greedy join from every candidate start and pick the one that
+  // yields the lowest estimated peak intermediate row count.
   size_t first = 0;
-  for (size_t i = 1; i < relations.size(); ++i) {
-    if (relations[i].TotalRows() < relations[first].TotalRows()) { first = i;
-}
+  size_t best_peak = std::numeric_limits<size_t>::max();
+  for (size_t start = 0; start < relations.size(); ++start) {
+    size_t sim_current = relations[start].TotalRows();
+    size_t sim_peak = sim_current;
+    std::unordered_set<size_t> sim_joined{start};
+    std::unordered_set<size_t> sim_remaining;
+    for (size_t i = 0; i < relations.size(); ++i) {
+      if (i != start) { sim_remaining.insert(i); }
+    }
+    while (!sim_remaining.empty()) {
+      size_t sim_next = *sim_remaining.begin();
+      size_t sim_est = std::numeric_limits<size_t>::max();
+      bool sim_next_connected = false;
+      for (size_t cand : sim_remaining) {
+        std::unordered_set<size_t> after = sim_joined;
+        after.insert(cand);
+        size_t app_count = 0;
+        for (const PredicateInfo& p : predicates) {
+          if (!p.resolved || p.contains_query || p.sources.size() < 2 ||
+              !p.sources.contains(cand) || !IsSubset(p.sources, after)) {
+            continue;
+          }
+          ++app_count;
+        }
+        const bool connected = app_count > 0;
+        const size_t est = connected
+            ? std::min(sim_current, relations[cand].TotalRows())
+            : sim_current * relations[cand].TotalRows();
+        const bool cheaper = est < sim_est ||
+            (est == sim_est &&
+             relations[cand].TotalRows() < relations[sim_next].TotalRows());
+        if ((connected && !sim_next_connected) ||
+            (connected == sim_next_connected && cheaper)) {
+          sim_next = cand;
+          sim_est = est;
+          sim_next_connected = connected;
+        }
+      }
+      sim_peak = std::max(sim_peak, sim_current);
+      sim_peak = std::max(sim_peak, relations[sim_next].TotalRows());
+      sim_current = sim_est;
+      sim_joined.insert(sim_next);
+      sim_remaining.erase(sim_next);
+    }
+    if (sim_peak < best_peak) {
+      best_peak = sim_peak;
+      first = start;
+    }
   }
   Relation result = std::move(relations[first]);
   std::unordered_set<size_t> joined{first};
   std::unordered_set<size_t> remaining;
   for (size_t i = 0; i < relations.size(); ++i) {
-    if (i != first) { remaining.insert(i);
-}
+    if (i != first) { remaining.insert(i); }
   }
 
   while (!remaining.empty()) {
@@ -1694,7 +1803,10 @@ Relation BuildInput(TransactionContext& context,
           continue;
         }
         applicable.push_back(predicate.expression);
-        mark_applied(predicate.expression);
+        // Note: mark_applied is intentionally NOT called here during
+        // candidate evaluation.  Calling it would remove predicates
+        // from join_residual for unselected candidates, corrupting
+        // the residual filter.  We only mark after the winner is known.
       }
       const size_t estimate =
           EstimateJoinRows(result, relations[candidate], applicable);

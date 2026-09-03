@@ -25,10 +25,10 @@
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
-#include "expression/proto_text.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
+#include "expression/proto_text.hpp"
 #include "expression/rewrite.hpp"
 #include "query/statement.hpp"
 #include "table/full_scan_iterator.hpp"
@@ -67,6 +67,14 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
   if (value.IsNull() || pred.constant.IsNull()) {
     return false;
   }
+  // Unsigned integers share the INT64 storage but compare under unsigned
+  // semantics in the ground-truth evaluator. The integer fast paths below
+  // are all signed, so any unsigned involvement must go through
+  // EvaluateBinary (e.g. UINT64_MAX, stored as bit pattern -1, is NOT < 0).
+  if ((value.type == ValueType::kInt64 || value.type == ValueType::kDate) &&
+      (value.IsUnsigned() || pred.constant.IsUnsigned())) {
+    return Binary(pred.op, value, pred.constant).Truthy();
+  }
 
   // The scan fast path must use the same coercions as the full expression
   // evaluator.  In particular, DATE/TIMESTAMP columns commonly receive bare
@@ -78,13 +86,20 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
       const int64_t rhs = ParseDateDays(pred.constant.value.varchar_value);
       const int64_t lhs = value.value.int_value;
       switch (pred.op) {
-        case BinaryOperation::kEquals: return lhs == rhs;
-        case BinaryOperation::kNotEquals: return lhs != rhs;
-        case BinaryOperation::kLessThan: return lhs < rhs;
-        case BinaryOperation::kLessThanEquals: return lhs <= rhs;
-        case BinaryOperation::kGreaterThan: return lhs > rhs;
-        case BinaryOperation::kGreaterThanEquals: return lhs >= rhs;
-        default: break;
+        case BinaryOperation::kEquals:
+          return lhs == rhs;
+        case BinaryOperation::kNotEquals:
+          return lhs != rhs;
+        case BinaryOperation::kLessThan:
+          return lhs < rhs;
+        case BinaryOperation::kLessThanEquals:
+          return lhs <= rhs;
+        case BinaryOperation::kGreaterThan:
+          return lhs > rhs;
+        case BinaryOperation::kGreaterThanEquals:
+          return lhs >= rhs;
+        default:
+          break;
       }
     } catch (...) {
       return false;
@@ -289,10 +304,57 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
   return compiled;
 }
 
+// Compile a single AND expression into a DisjunctiveBranch.
+// Splits conjuncts and tries to compile each as SimpleCompare.
+CompiledScanFilter::DisjunctiveBranch CompileAndBranch(
+    const Expression& and_expr, const Schema& schema) {
+  CompiledScanFilter::DisjunctiveBranch branch;
+  std::vector<Expression> conjuncts = SplitConjuncts(and_expr);
+  for (const Expression& conjunct : conjuncts) {
+    if (auto simple = TryCompileSimpleCompare(conjunct, schema)) {
+      branch.simple.push_back(std::move(*simple));
+    } else {
+      branch.residual.push_back(conjunct);
+    }
+  }
+  return branch;
+}
+
 CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
                                      const Schema& schema) {
   CompiledScanFilter compiled;
   for (const Expression& predicate : predicates) {
+    if (!predicate) {
+      continue;
+    }
+    // Decompose OR expressions into disjunctive branches.
+    // Each OR branch is compiled independently into simple + residual.
+    // Only create disjunctive branches when the branch has at least one
+    // SimpleCompare predicate AND no query subexpressions.  Otherwise
+    // the branch evaluation overhead exceeds the original tree traversal.
+    if (predicate->Type() == TypeTag::kBinaryExp &&
+        predicate->AsBinaryExpression().Op() == BinaryOperation::kOr) {
+      std::vector<Expression> disjuncts =
+          SplitDisjuncts(predicate);
+      if (disjuncts.size() >= 2 && !ContainsQuery(predicate)) {
+        bool all_branches_usable = true;
+        std::vector<CompiledScanFilter::DisjunctiveBranch> branches;
+        for (const Expression& disjunct : disjuncts) {
+          auto branch = CompileAndBranch(disjunct, schema);
+          if (branch.simple.empty()) {
+            all_branches_usable = false;
+            break;
+          }
+          branches.push_back(std::move(branch));
+        }
+        if (all_branches_usable) {
+          for (auto& b : branches) {
+            compiled.disjunctive_branches.push_back(std::move(b));
+          }
+          continue;
+        }
+      }
+    }
     if (auto simple = TryCompileSimpleCompare(predicate, schema)) {
       compiled.simple.push_back(std::move(*simple));
     } else {
@@ -305,15 +367,74 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
 bool MatchScanFilter(const Row& row, const Schema& schema,
                      const CompiledScanFilter& filter, const Scope* outer,
                      TransactionContext& context, const CteMap& ctes) {
+  // Stored rows carry INT64 bit patterns for UINT64 columns; the catalog
+  // schema retains the unsigned declaration. Reattach it before matching so
+  // both the simple fast path and residual evaluation observe the same
+  // unsigned-tagged values as post-scan normalization produces.
+  const Row* match_row = &row;
+  Row tagged;
+  bool schema_has_unsigned = false;
+  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+    if (schema.GetColumn(i).IsUnsigned()) {
+      schema_has_unsigned = true;
+      break;
+    }
+  }
+  if (schema_has_unsigned) {
+    tagged = row;
+    for (size_t i = 0; i < tagged.Size() && i < schema.ColumnCount(); ++i) {
+      if (schema.GetColumn(i).IsUnsigned() &&
+          tagged[i].type == ValueType::kInt64 && !tagged[i].IsUnsigned()) {
+        tagged[i] = tagged[i].WithUnsigned();
+      }
+    }
+    match_row = &tagged;
+  }
+  // Evaluate top-level simple predicates (conjunction).
   for (const SimpleComparePredicate& pred : filter.simple) {
-    if (!MatchSimpleCompare(row, pred)) {
+    if (!MatchSimpleCompare(*match_row, pred)) {
+      return false;
+    }
+  }
+  // Evaluate disjunctive branches: at least one branch must fully pass.
+  // Each branch has its own SimpleCompare predicates and residual expressions.
+  // This avoids recursive expression tree evaluation for OR-of-ANDs patterns
+  // (e.g. TPC-H Q20's 3-way brand filter).
+  if (!filter.disjunctive_branches.empty()) {
+    bool any_branch_passed = false;
+    for (const auto& branch : filter.disjunctive_branches) {
+      bool branch_ok = true;
+      for (const SimpleComparePredicate& pred : branch.simple) {
+        if (!MatchSimpleCompare(*match_row, pred)) {
+          branch_ok = false;
+          break;
+        }
+      }
+      if (branch_ok && !branch.residual.empty()) {
+        Scope scope{.row = match_row,
+                    .schema = &schema,
+                    .outer = outer};
+        for (const Expression& predicate : branch.residual) {
+          if (!Truthy(
+                  Evaluate(predicate, scope, nullptr, context, ctes))) {
+            branch_ok = false;
+            break;
+          }
+        }
+      }
+      if (branch_ok) {
+        any_branch_passed = true;
+        break;
+      }
+    }
+    if (!any_branch_passed) {
       return false;
     }
   }
   if (filter.residual.empty()) {
     return true;
   }
-  Scope scope{.row = &row, .schema = &schema, .outer = outer};
+  Scope scope{.row = match_row, .schema = &schema, .outer = outer};
   for (const Expression& predicate : filter.residual) {
     if (!Truthy(Evaluate(predicate, scope, nullptr, context, ctes))) {
       return false;
@@ -343,8 +464,15 @@ std::vector<IntegerPeekCompare> BuildIntegerPeeks(
     if (peek.column >= full_schema.ColumnCount()) {
       continue;
     }
-    const ValueType type = full_schema.GetColumn(peek.column).Type();
+    const Column& schema_column = full_schema.GetColumn(peek.column);
+    const ValueType type = schema_column.Type();
     if (type != ValueType::kInt64 && type != ValueType::kDate) {
+      continue;
+    }
+    // Peek pre-filters compare signed integers without rechecking; an
+    // unsigned column would mis-filter boundary values (see
+    // MatchSimpleCompare), so leave unsigned columns to the exact filter.
+    if (schema_column.IsUnsigned()) {
       continue;
     }
     peek.op = pred.op;
@@ -473,7 +601,9 @@ Relation UnnestValueToRelation(const SelectSource& source,
                                const Value& array_val) {
   auto trim_part = [](std::string_view text) {
     size_t begin = text.find_first_not_of(" \t");
-    if (begin == std::string_view::npos) { return std::string(); }
+    if (begin == std::string_view::npos) {
+      return std::string();
+    }
     size_t end = text.find_last_not_of(" \t");
     return std::string(text.substr(begin, end - begin + 1));
   };
@@ -502,7 +632,9 @@ Relation UnnestValueToRelation(const SelectSource& source,
       }
       std::vector<ProtoTextEntry> parsed;
       const std::string text(element.value.varchar_value);
-      if (!ParseProtoTextEntries(text, &parsed)) { continue; }
+      if (!ParseProtoTextEntries(text, &parsed)) {
+        continue;
+      }
       for (const ProtoTextEntry& entry : parsed) {
         if (std::ranges::none_of(field_names, [&](const std::string& name) {
               return name == entry.name;
@@ -525,7 +657,9 @@ Relation UnnestValueToRelation(const SelectSource& source,
         if (ProtoTextExtractField(elements[row_idx].value.varchar_value,
                                   field_names[field_idx], &field)) {
           field_values[row_idx][field_idx] = field;
-          if (!field.IsNull()) { type = field.type; }
+          if (!field.IsNull()) {
+            type = field.type;
+          }
         }
       }
       cols.emplace_back(std::move(qualified_name), type);
@@ -556,11 +690,13 @@ Relation UnnestValueToRelation(const SelectSource& source,
   bool object_shaped = false;
   if (!declared_struct && (elem_sql_type.empty() || elem_sql_type == "INT64")) {
     for (const Value& element : elements) {
-      if (element.IsNull()) { continue; }
+      if (element.IsNull()) {
+        continue;
+      }
       if (element.type == ValueType::kVarChar) {
         const std::string_view text(element.value.varchar_value);
-        object_shaped = text.size() >= 2 && text.front() == '{' &&
-                        text.back() == '}';
+        object_shaped =
+            text.size() >= 2 && text.front() == '{' && text.back() == '}';
       }
       break;
     }
@@ -585,8 +721,12 @@ Relation UnnestValueToRelation(const SelectSource& source,
       std::string current;
       for (size_t i = open + 1; i < elem_sql_type.size(); ++i) {
         const char c = elem_sql_type[i];
-        if (c == '<' || c == '(') { ++bracket; }
-        if (c == '>' || c == ')') { --bracket; }
+        if (c == '<' || c == '(') {
+          ++bracket;
+        }
+        if (c == '>' || c == ')') {
+          --bracket;
+        }
         if (c == ',' && bracket == 0) {
           parts.push_back(current);
           current.clear();
@@ -594,10 +734,14 @@ Relation UnnestValueToRelation(const SelectSource& source,
         }
         current.push_back(c);
       }
-      if (!current.empty()) { parts.push_back(current); }
+      if (!current.empty()) {
+        parts.push_back(current);
+      }
       for (std::string& part : parts) {
         const std::string trimmed = trim_part(part);
-        if (trimmed.empty()) { continue; }
+        if (trimmed.empty()) {
+          continue;
+        }
         const size_t space = trimmed.find_first_of(" \t");
         if (space == std::string::npos) {
           declared_fields.emplace_back(std::string(), trimmed);
@@ -656,7 +800,8 @@ Relation UnnestValueToRelation(const SelectSource& source,
                      declared_type == "DATETIME") {
             int y = 0, mo = 0, d = 0;
             if (sscanf(declared_text.c_str(), "%d-%d-%d", &y, &mo, &d) == 3) {
-              parsed = Value(std::move(declared_text));  // keep canonical text form
+              parsed =
+                  Value(std::move(declared_text));  // keep canonical text form
             }
           }
         }
@@ -676,9 +821,8 @@ Relation UnnestValueToRelation(const SelectSource& source,
           }
         }
         // Fix up column types from the representative row's values.
-        for (size_t i = 0; i < parsed_rows[row_idx].values.size() &&
-                           i < fields.size();
-             ++i) {
+        for (size_t i = 0;
+             i < parsed_rows[row_idx].values.size() && i < fields.size(); ++i) {
           fields[i].second = parsed_rows[row_idx].values[i].IsNull()
                                  ? ValueType::kNull
                                  : parsed_rows[row_idx].values[i].type;
@@ -701,9 +845,8 @@ Relation UnnestValueToRelation(const SelectSource& source,
     for (size_t row_idx = 0; row_idx < parsed_rows.size(); ++row_idx) {
       std::vector<Value> row_vals(fields.size(), Value());
       if (!parsed_rows[row_idx].null_row) {
-        for (size_t i = 0; i < fields.size() &&
-                           i < parsed_rows[row_idx].values.size();
-             ++i) {
+        for (size_t i = 0;
+             i < fields.size() && i < parsed_rows[row_idx].values.size(); ++i) {
           row_vals[i] = parsed_rows[row_idx].values[i];
         }
       }
@@ -824,8 +967,8 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
                 return;
               }
             }
-            if (MatchScanFilter(row, filter_view, scan_filter, outer,
-                                context, ctes)) {
+            if (MatchScanFilter(row, filter_view, scan_filter, outer, context,
+                                ctes)) {
               result.AddRow(row);
             }
           });
@@ -886,7 +1029,8 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
               ? TryParallelTableScan(
                     context, *table.Value(), projection,
                     iterator_handles_key_filter ? int_key_filter : nullptr,
-                    iterator_handles_key_filter ? full_key_column : std::nullopt,
+                    iterator_handles_key_filter ? full_key_column
+                                                : std::nullopt,
                     filter_during_scan,
                     filter_during_scan ? &scan_filter : nullptr, filter_view,
                     outer, ctes, &result)
@@ -973,8 +1117,8 @@ Relation LoadSource(TransactionContext& context, const SelectSource& source,
   // row values before expressions (notably `id < 0`) evaluate them.
   bool has_unsigned_column = false;
   for (size_t i = 0; i < result.schema.ColumnCount(); ++i) {
-    has_unsigned_column = has_unsigned_column ||
-                          result.schema.GetColumn(i).IsUnsigned();
+    has_unsigned_column =
+        has_unsigned_column || result.schema.GetColumn(i).IsUnsigned();
   }
   if (has_unsigned_column) {
     Relation normalized(context.execution_runtime());
