@@ -46,6 +46,9 @@ struct CompiledScanFilter {
     std::vector<Expression> residual;
   };
   std::vector<DisjunctiveBranch> disjunctive_branches;
+  // Pre-computed unsigned column info to avoid per-row schema iteration.
+  bool needs_unsigned_tagging{false};
+  std::vector<slot_t> unsigned_columns;
 };
 
 bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred);

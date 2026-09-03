@@ -361,6 +361,13 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
       compiled.residual.push_back(predicate);
     }
   }
+  // Pre-compute unsigned column info to avoid per-row schema iteration.
+  for (slot_t i = 0; i < static_cast<slot_t>(schema.ColumnCount()); ++i) {
+    if (schema.GetColumn(i).IsUnsigned()) {
+      compiled.needs_unsigned_tagging = true;
+      compiled.unsigned_columns.push_back(i);
+    }
+  }
   return compiled;
 }
 
@@ -373,17 +380,10 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
   // unsigned-tagged values as post-scan normalization produces.
   const Row* match_row = &row;
   Row tagged;
-  bool schema_has_unsigned = false;
-  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-    if (schema.GetColumn(i).IsUnsigned()) {
-      schema_has_unsigned = true;
-      break;
-    }
-  }
-  if (schema_has_unsigned) {
+  if (filter.needs_unsigned_tagging) {
     tagged = row;
-    for (size_t i = 0; i < tagged.Size() && i < schema.ColumnCount(); ++i) {
-      if (schema.GetColumn(i).IsUnsigned() &&
+    for (slot_t i : filter.unsigned_columns) {
+      if (i < static_cast<slot_t>(tagged.Size()) &&
           tagged[i].type == ValueType::kInt64 && !tagged[i].IsUnsigned()) {
         tagged[i] = tagged[i].WithUnsigned();
       }
