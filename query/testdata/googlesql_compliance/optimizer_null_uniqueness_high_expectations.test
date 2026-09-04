@@ -204,3 +204,46 @@ WHERE c.parent_id = 10 AND p.parent_id = 20
 --
 ARRAY<STRUCT<child_id INT64>>[]
 ==
+
+# Contradictory domain / check constraints eliminate the scan entirely.
+[mode=explain]
+[plan_contains=EmptyResult]
+[plan_not_contains=SeqScan]
+[plan_not_contains=FullScan]
+[name=domain_constraint_contradiction_eliminates_scan]
+SELECT id FROM opt_nullable
+WHERE (x > 100 AND x < 10) OR (enabled IS TRUE AND enabled IS FALSE)
+--
+ARRAY<STRUCT<id INT64>>[]
+==
+
+# Multi-hop foreign key join elimination: when grandchild joins child and parent,
+# but neither child nor parent columns are projected or filtered, the optimizer
+# proves parent and child presence by foreign key and unique keys and eliminates both.
+[prepare_database]
+CREATE TABLE opt_unique_grandchild AS
+SELECT 1001 AS gc_id, 101 AS child_id, 'g1' AS note
+UNION ALL SELECT 1002, 102, 'g2'
+UNION ALL SELECT 1003, 103, 'g3';
+ANALYZE opt_unique_grandchild;
+SELECT 1;
+--
+ARRAY<STRUCT<INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=JoinElimination]
+[plan_not_contains=opt_unique_parent]
+[plan_not_contains=opt_unique_child]
+[name=multi_hop_foreign_key_join_eliminated]
+SELECT gc.gc_id, gc.note
+FROM opt_unique_grandchild gc
+JOIN opt_unique_child c ON gc.child_id = c.child_id
+JOIN opt_unique_parent p ON c.parent_id = p.parent_id
+ORDER BY gc.gc_id
+--
+ARRAY<STRUCT<gc_id INT64, note STRING>>[
+  {1001, "g1"}, {1002, "g2"}, {1003, "g3"}
+]
+==
+

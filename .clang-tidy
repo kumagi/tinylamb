@@ -36,4 +36,5 @@ Checks: '-*,
   -readability-identifier-length,
   -readability-isolate-declaration,
   -readability-magic-numbers,
+  -readability-redundant-member-init,
 '

@@ -197,3 +197,32 @@ SELECT id FROM access_input WHERE category = 20 AND score >= 70
 --
 ARRAY<STRUCT<id INT64>>[{3}, {4}]
 ==
+
+# Index Skip Scan:
+# Rather than scanning all rows and deduplicating in memory with HashDistinct,
+# the optimizer leverages the B+Tree index to jump between distinct prefix keys.
+[mode=explain]
+[plan_contains=SkipScanDistinct]
+[plan_not_contains=HashDistinct]
+[plan_not_contains=SortDistinct]
+[name=index_skip_scan_distinct_avoids_hash_or_sort]
+SELECT DISTINCT category FROM access_input ORDER BY category
+--
+ARRAY<STRUCT<category INT64>>[{10}, {20}, {30}, {40}, {50}]
+==
+
+# Range predicate on non-leading index key uses IndexSkipScan:
+# When filtering on a selective non-leading column (score >= 80) without a leading column
+# constraint, the optimizer should perform an index skip scan over the leading distinct keys
+# rather than falling back to a full table scan.
+[mode=explain]
+[plan_contains=IndexSkipScan]
+[plan_not_contains=FullScan: access_input]
+[name=index_skip_scan_on_secondary_range]
+SELECT id, score FROM access_input WHERE score >= 80 ORDER BY id
+--
+ARRAY<STRUCT<id INT64, score INT64>>[
+  {1, 100}, {2, 90}, {3, 80}
+]
+==
+

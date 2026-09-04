@@ -234,3 +234,37 @@ WHERE n = (SELECT n FROM opt_small WHERE false)
 --
 ARRAY<STRUCT<n INT64>>[]
 ==
+
+# Single-use CTE with outer predicate pushdown:
+# When an outer query filters on a single-use CTE, the optimizer inlines the CTE and
+# pushes the outer predicate down into the underlying table scan, avoiding scanning unneeded rows.
+[mode=explain]
+[plan_contains=CteInline]
+[plan_contains=Filter n = 3]
+[plan_not_contains=Materialize]
+[name=single_use_cte_pushes_outer_filter_into_scan]
+WITH numbers_view AS (
+  SELECT n, kind FROM opt_numbers
+)
+SELECT n, kind FROM numbers_view WHERE n = 3
+--
+ARRAY<STRUCT<n INT64, kind STRING>>[{3, "odd"}]
+==
+
+# Single-use CTE containing join pushes outer predicate into join inputs:
+# When an outer query filters on a CTE that contains an inner join, the optimizer
+# inlines the CTE and pushes the filter through the join down to both sides.
+[mode=explain]
+[plan_contains=CteInline]
+[plan_contains=Filter opt_numbers.n = 2]
+[plan_not_contains=Materialize]
+[name=single_use_cte_join_pushes_outer_filter_into_scan]
+WITH joined_cte AS (
+  SELECT o.n, o.kind, s.n AS small_n
+  FROM opt_numbers o JOIN opt_small s ON o.n = s.n
+)
+SELECT n, kind FROM joined_cte WHERE n = 2
+--
+ARRAY<STRUCT<n INT64, kind STRING>>[{2, "even"}]
+==
+

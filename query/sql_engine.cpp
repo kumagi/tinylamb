@@ -26,6 +26,8 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/join_kind.hpp"
+#include "common/set_operation.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
@@ -52,7 +54,9 @@
 #include "expression/proto_text.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
+#include "plan/cascades.hpp"
 #include "plan/group_by_plan.hpp"
+#include "plan/implementation_rules.hpp"
 #include "plan/optimizer.hpp"
 #include "plan/plan.hpp"
 #include "query/googlesql_ast.hpp"
@@ -211,7 +215,7 @@ bool ContainsQueryExpression(const Expression& expression) {
 // features. More involved subqueries stay on the scope-aware interpreter.
 bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
   if (statement.Sources().empty() || !statement.WithQueries().empty() ||
-      statement.GroupBy().size() != 0 || statement.Having() ||
+      !statement.GroupBy().empty() || statement.Having() ||
       statement.Qualify() || statement.HasDistinctOn() ||
       statement.HasLimit() || statement.Offset() != 0 ||
       std::ranges::any_of(
@@ -1920,11 +1924,13 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
   Expression where = select.WhereClause();
   std::unordered_set<std::string> seen_relations;
   for (const SelectSource& source : select.Sources()) {
-    if (!source.alias.empty() && !seen_relations.insert(source.alias).second) {
+    const std::string relation =
+        source.alias.empty() ? source.table : source.alias;
+    if (!seen_relations.insert(relation).second) {
       last_error_ = "duplicate FROM relation; use distinct aliases";
       return Status::kUnknown;
     }
-    core.from_.push_back(source.alias);
+    core.from_.push_back(relation);
     if (!source.alias.empty() && source.alias != source.table) {
       core.aliases_.emplace(source.alias, source.table);
     }
@@ -1998,17 +2004,446 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
   }
   core.select_ = std::move(required);
 
-  RETURN_IF_FAIL(core.Rewrite(ctx));
-  ASSIGN_OR_RETURN(Plan, core_plan, Optimizer::Optimize(core, ctx));
+  Status rewrite_status = core.Rewrite(ctx);
+  if (rewrite_status == Status::kAmbiguousQuery) {
+    last_error_ = "ambiguous column reference";
+    return rewrite_status;
+  }
+  RETURN_IF_FAIL(rewrite_status);
   auto statement = std::make_shared<SelectStatement>(select);
   std::vector<Column> output_columns;
   output_columns.reserve(result_column_names_.size());
   for (const std::string& name : result_column_names_) {
     output_columns.emplace_back(name, ValueType::kNull);
   }
+  StatusOr<Plan> core_plan_or = Optimizer::Optimize(core, ctx);
+  if (!core_plan_or.HasValue()) {
+    StatusOr<Plan> optimized = Optimizer::OptimizeRelational(
+        statement, Schema("", std::move(output_columns)), ctx);
+    if (!optimized.HasValue()) {
+      std::ostringstream error;
+      error << "relational optimizer failed: " << optimized.GetStatus();
+      last_error_ = error.str();
+      return optimized.GetStatus();
+    }
+    return optimized.Value()->EmitExecutor(ctx);
+  }
+  Plan core_plan = std::move(core_plan_or.Value());
   Plan finish = std::make_shared<GroupByPlan>(
       core_plan, std::move(statement), Schema("", std::move(output_columns)));
   return finish->EmitExecutor(ctx);
+}
+
+StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
+                                                  TransactionContext& ctx) {
+  std::vector<std::string> table_relations;
+  std::unordered_map<std::string, std::string> table_aliases;
+  for (const SelectSource& source : select.Sources()) {
+    if (!source.unnest && !source.query && !source.table.empty() &&
+        !select.IsRecursiveWith(source.table)) {
+      const std::string relation =
+          source.alias.empty() ? source.table : source.alias;
+      table_relations.push_back(relation);
+      if (!source.alias.empty() && source.alias != source.table) {
+        table_aliases.emplace(source.alias, source.table);
+      }
+    }
+  }
+
+  cascades::Memo memo;
+  cascades::GroupId current_group = cascades::kInvalidGroup;
+  std::vector<std::string> current_relations;
+  if (!table_relations.empty()) {
+    current_relations = table_relations;
+    current_group = memo.Build(table_relations);
+  }
+
+  size_t unnest_idx = 0;
+  size_t apply_idx = 0;
+  size_t rec_cte_idx = 0;
+  for (const SelectSource& source : select.Sources()) {
+    if (source.unnest) {
+      if (current_group == cascades::kInvalidGroup) {
+        current_group = memo.EnsureDerivedGroup({}, "dummy");
+        memo.AddExpression(
+            current_group,
+            cascades::LogicalExpression{
+                .operation = cascades::LogicalOperator::kDummyScan,
+            });
+      }
+      const std::string tag = "unnest_" + std::to_string(unnest_idx++);
+      const cascades::GroupId next_group =
+          memo.EnsureDerivedGroup(current_relations, tag);
+      memo.AddExpression(
+          next_group,
+          cascades::LogicalExpression{
+              .operation = cascades::LogicalOperator::kUnnest,
+              .children = {current_group},
+              .predicate = source.unnest,
+              .unnest_alias = source.alias.empty() ? "unnest" : source.alias,
+              .offset_alias = source.offset_alias,
+          });
+      current_group = next_group;
+    } else if (source.query) {
+      if (current_group == cascades::kInvalidGroup) {
+        current_group = memo.EnsureDerivedGroup({}, "dummy");
+        memo.AddExpression(
+            current_group,
+            cascades::LogicalExpression{
+                .operation = cascades::LogicalOperator::kDummyScan,
+            });
+      }
+      const std::string tag = "apply_" + std::to_string(apply_idx++);
+      const cascades::GroupId next_group =
+          memo.EnsureDerivedGroup(current_relations, tag);
+      JoinKind join_kind = JoinKind::kInner;
+      switch (source.join_type) {
+        case JoinType::kCross:
+        case JoinType::kInner:
+          join_kind = JoinKind::kInner;
+          break;
+        case JoinType::kLeft:
+          join_kind = JoinKind::kLeftOuter;
+          break;
+        case JoinType::kRight:
+          join_kind = JoinKind::kRightOuter;
+          break;
+        case JoinType::kFull:
+          join_kind = JoinKind::kFullOuter;
+          break;
+      }
+      const std::string alias =
+          source.alias.empty() ? "subquery" : source.alias;
+      std::vector<Column> inner_cols;
+      for (const NamedExpression& item : source.query->SelectList()) {
+        inner_cols.emplace_back(ColumnName(alias, item.name), ValueType::kNull);
+      }
+      Schema inner_schema(alias, std::move(inner_cols));
+      memo.AddExpression(next_group,
+                         cascades::LogicalExpression{
+                             .operation = cascades::LogicalOperator::kApply,
+                             .children = {current_group},
+                             .table = alias,
+                             .predicate = source.join_condition,
+                             .join_type = static_cast<uint8_t>(join_kind),
+                             .relational_statement = source.query,
+                             .output_schema = std::move(inner_schema),
+                         });
+      current_group = next_group;
+    } else if (select.IsRecursiveWith(source.table)) {
+      const std::string cte_name = source.table;
+      const std::string alias = source.alias.empty() ? cte_name : source.alias;
+      const auto it = select.WithQueries().find(cte_name);
+      if (it == select.WithQueries().end()) {
+        return Status::kUnknown;
+      }
+      const std::shared_ptr<SelectStatement>& rec_body = it->second;
+      const RecursiveDepthSpec* depth_spec = select.RecursiveDepthOf(cte_name);
+
+      std::vector<Column> cols;
+      for (const NamedExpression& item : rec_body->SelectList()) {
+        cols.emplace_back(ColumnName(alias, item.name), ValueType::kNull);
+      }
+      if (depth_spec != nullptr) {
+        cols.emplace_back(ColumnName(alias, depth_spec->column),
+                          ValueType::kInt64);
+      }
+      Schema cte_schema(alias, std::move(cols));
+
+      std::optional<RecursiveDepthSpec> opt_depth;
+      if (depth_spec != nullptr) {
+        opt_depth = *depth_spec;
+      }
+
+      if (current_group == cascades::kInvalidGroup) {
+        const std::string tag = "rec_cte_" + std::to_string(rec_cte_idx++);
+        current_group = memo.EnsureDerivedGroup(current_relations, tag);
+        memo.AddExpression(
+            current_group,
+            cascades::LogicalExpression{
+                .operation = cascades::LogicalOperator::kRecursiveCte,
+                .children = {},
+                .table = alias,
+                .relational_statement = rec_body,
+                .output_schema = cte_schema,
+                .cte_name = cte_name,
+                .depth_limit = depth_spec != nullptr && depth_spec->upper > 0
+                                   ? static_cast<size_t>(depth_spec->upper)
+                                   : 0,
+                .depth_spec = opt_depth,
+            });
+      } else {
+        const std::string tag = "rec_cte_" + std::to_string(rec_cte_idx++);
+        const cascades::GroupId next_group =
+            memo.EnsureDerivedGroup(current_relations, tag);
+        memo.AddExpression(
+            next_group,
+            cascades::LogicalExpression{
+                .operation = cascades::LogicalOperator::kRecursiveCte,
+                .children = {current_group},
+                .table = alias,
+                .relational_statement = rec_body,
+                .output_schema = std::move(cte_schema),
+                .cte_name = cte_name,
+                .depth_limit = depth_spec != nullptr && depth_spec->upper > 0
+                                   ? static_cast<size_t>(depth_spec->upper)
+                                   : 0,
+                .depth_spec = std::move(opt_depth),
+            });
+        current_group = next_group;
+      }
+    }
+  }
+  if (current_group == cascades::kInvalidGroup) {
+    current_group = memo.EnsureDerivedGroup({}, "dummy");
+    memo.AddExpression(current_group,
+                       cascades::LogicalExpression{
+                           .operation = cascades::LogicalOperator::kDummyScan,
+                       });
+  }
+
+  Expression filter_pred = select.WhereClause();
+  for (const SelectSource& source : select.Sources()) {
+    if (source.join_condition) {
+      filter_pred =
+          filter_pred ? BinaryExpressionExp(filter_pred, BinaryOperation::kAnd,
+                                            source.join_condition)
+                      : source.join_condition;
+    }
+  }
+  if (filter_pred) {
+    const cascades::GroupId sel_group =
+        memo.EnsureDerivedGroup(current_relations, "selection");
+    memo.AddExpression(sel_group,
+                       cascades::LogicalExpression{
+                           .operation = cascades::LogicalOperator::kSelection,
+                           .children = {current_group},
+                           .predicate = filter_pred,
+                       });
+    current_group = sel_group;
+  }
+
+  const bool has_grouping =
+      !select.GroupBy().empty() ||
+      std::ranges::any_of(
+          select.SelectList(),
+          [](const NamedExpression& item) {
+            return relational_detail::ContainsAggregate(item.expression);
+          }) ||
+      relational_detail::ContainsAggregate(select.Having());
+
+  if (has_grouping) {
+    cascades::RuleContext rule_context;
+    rule_context.transaction = &ctx;
+    for (const std::string& relation : table_relations) {
+      const auto aliased = table_aliases.find(relation);
+      const std::string& physical =
+          aliased == table_aliases.end() ? relation : aliased->second;
+      const StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
+      const StatusOr<std::shared_ptr<TableStatistics>> found_stats =
+          ctx.GetStats(physical);
+      if (found.HasValue()) {
+        rule_context.tables.emplace(relation, found.Value());
+      }
+      if (found_stats.HasValue()) {
+        rule_context.statistics.emplace(relation, found_stats.Value());
+      }
+    }
+    cascades::SearchEngine search(std::move(memo),
+                                  cascades::RuleSet::Default());
+    const std::optional<cascades::BestPlan> best =
+        search.Optimize(current_group, cascades::PhysicalProperties{},
+                        DefaultImplementationRules(), rule_context);
+    if (!best) {
+      last_error_ = "cascades unnest core optimization failed";
+      return Status::kNotImplemented;
+    }
+    Plan core_plan = best->plan;
+    auto statement = std::make_shared<SelectStatement>(select);
+    std::vector<Column> output_columns;
+    output_columns.reserve(result_column_names_.size());
+    for (const std::string& name : result_column_names_) {
+      output_columns.emplace_back(name, ValueType::kNull);
+    }
+    Plan finish = std::make_shared<GroupByPlan>(
+        core_plan, std::move(statement), Schema("", std::move(output_columns)));
+    return finish->EmitExecutor(ctx);
+  }
+
+  bool has_star = false;
+  for (const NamedExpression& item : select.SelectList()) {
+    if (item.expression && item.expression->Type() == TypeTag::kColumnValue &&
+        item.expression->AsColumnValue().GetColumnName().name == "*") {
+      has_star = true;
+      break;
+    }
+  }
+
+  std::vector<NamedExpression> projection_items;
+  if (has_star) {
+    for (const SelectSource& source : select.Sources()) {
+      if (source.unnest) {
+        const std::string unnest_name =
+            source.alias.empty() ? "unnest" : source.alias;
+        projection_items.emplace_back(
+            unnest_name, ColumnValueExp(ColumnName(unnest_name, unnest_name)));
+        if (!source.offset_alias.empty()) {
+          projection_items.emplace_back(
+              source.offset_alias,
+              ColumnValueExp(ColumnName(unnest_name, source.offset_alias)));
+        }
+      } else if (select.IsRecursiveWith(source.table)) {
+        const std::string relation =
+            source.alias.empty() ? source.table : source.alias;
+        const auto it = select.WithQueries().find(source.table);
+        if (it != select.WithQueries().end()) {
+          for (const NamedExpression& q_item : it->second->SelectList()) {
+            projection_items.emplace_back(
+                q_item.name, ColumnValueExp(ColumnName(relation, q_item.name)));
+          }
+          const RecursiveDepthSpec* depth_spec =
+              select.RecursiveDepthOf(source.table);
+          if (depth_spec != nullptr) {
+            projection_items.emplace_back(
+                depth_spec->column,
+                ColumnValueExp(ColumnName(relation, depth_spec->column)));
+          }
+        }
+      } else if (!source.table.empty()) {
+        const std::string relation =
+            source.alias.empty() ? source.table : source.alias;
+        const auto aliased = table_aliases.find(relation);
+        const std::string& physical =
+            aliased == table_aliases.end() ? relation : aliased->second;
+        const StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
+        if (found.HasValue()) {
+          const Schema& s = found.Value()->GetSchema();
+          for (size_t i = 0; i < s.ColumnCount(); ++i) {
+            const std::string& col_name = s.GetColumn(i).Name().name;
+            projection_items.emplace_back(
+                col_name, ColumnValueExp(ColumnName(relation, col_name)));
+          }
+        }
+      } else if (source.query) {
+        const std::string relation =
+            source.alias.empty() ? "subquery" : source.alias;
+        for (const NamedExpression& q_item : source.query->SelectList()) {
+          projection_items.emplace_back(
+              q_item.name, ColumnValueExp(ColumnName(relation, q_item.name)));
+        }
+      }
+    }
+    result_column_names_.clear();
+    result_column_names_.reserve(projection_items.size());
+    for (const NamedExpression& item : projection_items) {
+      result_column_names_.push_back(item.name);
+    }
+  } else {
+    projection_items = select.SelectList();
+  }
+
+  const cascades::GroupId proj_group =
+      memo.EnsureDerivedGroup(current_relations, "projection");
+  memo.AddExpression(proj_group,
+                     cascades::LogicalExpression{
+                         .operation = cascades::LogicalOperator::kProjection,
+                         .children = {current_group},
+                         .target_list = projection_items,
+                     });
+  current_group = proj_group;
+
+  if (select.Distinct()) {
+    const cascades::GroupId distinct_group =
+        memo.EnsureDerivedGroup(current_relations, "distinct");
+    memo.AddExpression(distinct_group,
+                       cascades::LogicalExpression{
+                           .operation = cascades::LogicalOperator::kDistinct,
+                           .children = {current_group},
+                       });
+    current_group = distinct_group;
+  }
+
+  if (!select.OrderBy().empty()) {
+    std::vector<NamedExpression> sort_keys;
+    std::vector<bool> sort_ascending;
+    std::vector<std::optional<bool>> sort_nulls_first;
+    sort_keys.reserve(select.OrderBy().size());
+    sort_ascending.reserve(select.OrderBy().size());
+    sort_nulls_first.reserve(select.OrderBy().size());
+    for (const auto& term : select.OrderBy()) {
+      sort_keys.emplace_back("", term.expression);
+      sort_ascending.push_back(term.ascending);
+      sort_nulls_first.push_back(term.nulls_first);
+    }
+    if (select.HasLimit() && select.Limit() != 0) {
+      const cascades::GroupId topn_group =
+          memo.EnsureDerivedGroup(current_relations, "topn");
+      memo.AddExpression(topn_group,
+                         cascades::LogicalExpression{
+                             .operation = cascades::LogicalOperator::kTopN,
+                             .children = {current_group},
+                             .target_list = std::move(sort_keys),
+                             .sort_ascending = std::move(sort_ascending),
+                             .sort_nulls_first = std::move(sort_nulls_first),
+                             .limit_count = select.Limit(),
+                             .limit_offset = select.Offset(),
+                         });
+      current_group = topn_group;
+    } else {
+      const cascades::GroupId sort_group =
+          memo.EnsureDerivedGroup(current_relations, "sort");
+      memo.AddExpression(sort_group,
+                         cascades::LogicalExpression{
+                             .operation = cascades::LogicalOperator::kSort,
+                             .children = {current_group},
+                             .target_list = std::move(sort_keys),
+                             .sort_ascending = std::move(sort_ascending),
+                             .sort_nulls_first = std::move(sort_nulls_first),
+                         });
+      current_group = sort_group;
+    }
+  }
+
+  if ((select.HasLimit() || select.Offset() != 0) &&
+      (!select.HasLimit() || select.OrderBy().empty() || select.Limit() == 0)) {
+    const cascades::GroupId limit_group =
+        memo.EnsureDerivedGroup(current_relations, "limit");
+    memo.AddExpression(limit_group,
+                       cascades::LogicalExpression{
+                           .operation = cascades::LogicalOperator::kLimit,
+                           .children = {current_group},
+                           .limit_count = select.Limit(),
+                           .limit_offset = select.Offset(),
+                       });
+    current_group = limit_group;
+  }
+
+  cascades::RuleContext rule_context;
+  rule_context.transaction = &ctx;
+  for (const std::string& relation : table_relations) {
+    const auto aliased = table_aliases.find(relation);
+    const std::string& physical =
+        aliased == table_aliases.end() ? relation : aliased->second;
+    const StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
+    const StatusOr<std::shared_ptr<TableStatistics>> found_stats =
+        ctx.GetStats(physical);
+    if (found.HasValue()) {
+      rule_context.tables.emplace(relation, found.Value());
+    }
+    if (found_stats.HasValue()) {
+      rule_context.statistics.emplace(relation, found_stats.Value());
+    }
+  }
+
+  cascades::SearchEngine search(std::move(memo), cascades::RuleSet::Default());
+  const std::optional<cascades::BestPlan> best =
+      search.Optimize(current_group, cascades::PhysicalProperties{},
+                      DefaultImplementationRules(), rule_context);
+  if (!best) {
+    last_error_ = "cascades unnest optimization failed";
+    return Status::kNotImplemented;
+  }
+  return best->plan->EmitExecutor(ctx);
 }
 
 StatusOr<Executor> SqlEngine::PrepareStatement(
@@ -2331,11 +2766,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       const bool has_unnest = std::any_of(
           select->Sources().begin(), select->Sources().end(),
           [](const SelectSource& s) { return static_cast<bool>(s.unnest); });
-      const bool has_subquery_or_lateral =
+      const bool has_lateral =
           std::any_of(select->Sources().begin(), select->Sources().end(),
-                      [](const SelectSource& s) {
-                        return s.is_lateral || s.query != nullptr;
-                      });
+                      [](const SelectSource& s) { return s.is_lateral; });
       const bool can_decorrelate_subqueries =
           CanUseDecorrelatedSubqueryOptimizer(*select);
       const bool simple_count_star =
@@ -2393,20 +2826,6 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         return ExecuteSetOperation(*select, ctx);
       }
       // Self-joins expose the same base relation under two aliases; the
-      // relational interpreter resolves each alias against its own renamed
-      // scope, which keeps per-alias projections and ORDER BY output-alias
-      // keys correct regardless of access-path choice.
-      const auto any_self_join = [](const SelectStatement& stmt) {
-        for (size_t i = 0; i < stmt.Sources().size(); ++i) {
-          for (size_t j = i + 1; j < stmt.Sources().size(); ++j) {
-            if (!stmt.Sources()[i].table.empty() &&
-                stmt.Sources()[i].table == stmt.Sources()[j].table) {
-              return true;
-            }
-          }
-        }
-        return false;
-      };
       // GROUP BY / HAVING / aggregate statements: the Cascades-optimized
       // FROM + WHERE core (join ordering, access paths, filter pushdown)
       // feeds the proven relational grouping finish pipeline (GroupByPlan).
@@ -2417,25 +2836,6 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                 select->SelectList(), [](const NamedExpression& item) {
                   return relational_detail::ContainsAggregate(item.expression);
                 });
-        bool touches_multiple_relations_unqualified = false;
-        if (select->Sources().size() > 1) {
-          const auto unqualified = [](const Expression& expression) {
-            for (const ColumnName& column : expression->TouchedColumns()) {
-              if (column.schema.empty() && column.name != "*") {
-                return true;
-              }
-            }
-            return false;
-          };
-          touches_multiple_relations_unqualified =
-              std::ranges::any_of(select->SelectList(),
-                                  [&](const NamedExpression& item) {
-                                    return unqualified(item.expression);
-                                  }) ||
-              (select->WhereClause() && unqualified(select->WhereClause())) ||
-              std::ranges::any_of(select->GroupBy(), unqualified) ||
-              (select->Having() && unqualified(select->Having()));
-        }
         // Grouped statements whose expressions carry correlated subqueries
         // need the relational interpreter's scope chain (outer/CTE threading
         // through Project); the bridge below runs without it.  Aggregates
@@ -2457,22 +2857,53 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
               grouped_expressions_correlate ||
               touches_query_expression(item.expression);
         }
-        // The bridge earns its keep on multi-relation grouped queries, where
-        // the Cascades join ordering / access-path choice applies; grouped
-        // single-table queries keep the tuned relational stream-aggregation
-        // path.
+        // The bridge executes multi-relation and single-relation grouped
+        // queries through the Cascades core (join ordering, access paths,
+        // filter pushdown), feeding the grouping finish pipeline (GroupByPlan).
         if (select->Sources().size() > 1 && has_grouping &&
             !simple_count_star && !select->Qualify() &&
             !relational_detail::HasWindowFunctions(*select) &&
             select->WithQueries().empty() && sources_plain &&
-            !touches_multiple_relations_unqualified &&
-            !grouped_expressions_correlate && !any_self_join(*select)) {
+            (!select->RequiresRelationalEvaluation() ||
+             can_decorrelate_subqueries) &&
+            !touches_query_expression(select->WhereClause()) &&
+            !grouped_expressions_correlate) {
           return ExecuteGroupedSelect(*select, ctx);
+        }
+      }
+      const auto touches_query_expression =
+          [](const Expression& expression) -> bool {
+        return expression && relational_detail::ContainsQuery(expression);
+      };
+      const bool touches_query =
+          touches_query_expression(select->WhereClause()) ||
+          std::ranges::any_of(
+              select->SelectList(), [&](const NamedExpression& item) {
+                return touches_query_expression(item.expression);
+              });
+      const bool has_recursive_cte =
+          std::any_of(select->WithQueries().begin(),
+                      select->WithQueries().end(), [&](const auto& pair) {
+                        return select->IsRecursiveWith(pair.first);
+                      });
+      const bool has_plain_cte =
+          std::any_of(select->WithQueries().begin(),
+                      select->WithQueries().end(), [&](const auto& pair) {
+                        return !select->IsRecursiveWith(pair.first);
+                      });
+      if ((has_unnest || has_lateral ||
+           (has_recursive_cte && !has_plain_cte && !touches_query)) &&
+          !select->Qualify() &&
+          !relational_detail::HasWindowFunctions(*select)) {
+        StatusOr<Executor> unnest_exec = ExecuteUnnestSelect(*select, ctx);
+        if (unnest_exec.HasValue()) {
+          return unnest_exec;
         }
       }
       if ((select->RequiresRelationalEvaluation() &&
            !can_decorrelate_subqueries) ||
-          select->Sources().empty() || has_unnest || has_subquery_or_lateral) {
+          select->Sources().empty() || has_unnest || has_lateral ||
+          (has_recursive_cte && !has_plain_cte && !touches_query)) {
         if (simple_count_star) {
           // COUNT(*) over one plain table is fully representable by the
           // Cascades single-relation path, including a covering index-only
@@ -2487,29 +2918,6 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         return emit_relational();
       }
 
-      // Unqualified column references across several relations are rejected
-      // by the relational resolver with a precise ambiguity diagnostic; keep
-      // them there.
-      bool has_unqualified_column = false;
-      if (select->Sources().size() > 1) {
-        // A bare `*` is an expansion directive, not a column reference.
-        const auto touches_unqualified = [](const NamedExpression& item) {
-          for (const ColumnName& column : item.expression->TouchedColumns()) {
-            if (column.schema.empty() && column.name != "*") {
-              return true;
-            }
-          }
-          return false;
-        };
-        has_unqualified_column =
-            std::ranges::any_of(select->SelectList(), touches_unqualified) ||
-            (select->WhereClause() &&
-             std::ranges::any_of(select->WhereClause()->TouchedColumns(),
-                                 [](const ColumnName& column) {
-                                   return column.schema.empty() &&
-                                          column.name != "*";
-                                 }));
-      }
       const bool multi_relation = select->Sources().size() > 1;
       const bool has_aggregate =
           std::ranges::any_of(
@@ -2518,51 +2926,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                 return relational_detail::ContainsAggregate(item.expression);
               }) ||
           relational_detail::ContainsAggregate(select->Having());
-      // Keep optimizer plans for ordinary aliased equi-joins, but preserve
-      // the general relational path when the optimizer cannot yet prove a
-      // safe implementation.  Non-equality joins and inner joins whose
-      // right-hand relation is used only by the join predicate are especially
-      // easy to mis-project or eliminate; relational execution evaluates the
-      // complete predicate over the complete input rows.
-      const bool has_non_equality_join = std::ranges::any_of(
-          select->Sources(), [](const SelectSource& source) {
-            if (!source.join_condition ||
-                source.join_condition->Type() != TypeTag::kBinaryExp) {
-              return false;
-            }
-            return source.join_condition->AsBinaryExpression().Op() !=
-                   BinaryOperation::kEquals;
-          });
-      std::unordered_set<ColumnName> visible_references;
-      for (const NamedExpression& item : select->SelectList()) {
-        visible_references.merge(item.expression->TouchedColumns());
-      }
-      visible_references.merge(select->WhereClause()
-                                   ? select->WhereClause()->TouchedColumns()
-                                   : std::unordered_set<ColumnName>{});
-      for (const auto& term : select->OrderBy()) {
-        visible_references.merge(term.expression->TouchedColumns());
-      }
-      for (const Expression& expression : select->GroupBy()) {
-        visible_references.merge(expression->TouchedColumns());
-      }
-      visible_references.merge(select->Having()
-                                   ? select->Having()->TouchedColumns()
-                                   : std::unordered_set<ColumnName>{});
-      const bool has_join_only_source = std::ranges::any_of(
-          select->Sources(), [&](const SelectSource& source) {
-            if (source.alias.empty()) {
-              return false;
-            }
-            return !std::ranges::any_of(visible_references,
-                                        [&](const ColumnName& column) {
-                                          return !column.schema.empty() &&
-                                                 column.schema == source.alias;
-                                        });
-          });
-      if (multi_relation &&
-          (has_aggregate || has_unqualified_column || has_non_equality_join ||
-           has_join_only_source || any_self_join(*select))) {
+      if (multi_relation && has_aggregate) {
         return emit_relational();
       }
       // Post-projection ORDER BY scope: the adapter normalizes computed keys
@@ -2749,8 +3113,17 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       // order above an untruncated plan (D6 soundness).
       query.limit_count_ = select->Distinct() ? 0 : select->Limit();
       query.limit_offset_ = select->Distinct() ? 0 : select->Offset();
-      RETURN_IF_FAIL(query.Rewrite(ctx));
-      ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
+      Status rewrite_status = query.Rewrite(ctx);
+      if (rewrite_status == Status::kAmbiguousQuery) {
+        last_error_ = "ambiguous column reference";
+        return rewrite_status;
+      }
+      RETURN_IF_FAIL(rewrite_status);
+      StatusOr<Plan> plan_or = Optimizer::Optimize(query, ctx);
+      if (!plan_or.HasValue()) {
+        return emit_relational();
+      }
+      Plan plan = std::move(plan_or.Value());
       Executor executor = plan->EmitExecutor(ctx);
       const bool needs_distinct =
           select->Distinct() &&

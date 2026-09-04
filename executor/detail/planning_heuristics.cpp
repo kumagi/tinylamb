@@ -1620,11 +1620,13 @@ Relation BuildInput(TransactionContext& context,
       if (!local_predicates[i].empty()) {
         return 0;
       }
-      const auto stored = context.execution_runtime()->table_key_filters.find(
-          statement.Sources()[i].table);
-      if (stored != context.execution_runtime()->table_key_filters.end() &&
-          stored->second.owner == &statement) {
-        return 0;
+      if (context.execution_runtime() != nullptr) {
+        const auto stored = context.execution_runtime()->table_key_filters.find(
+            statement.Sources()[i].table);
+        if (stored != context.execution_runtime()->table_key_filters.end() &&
+            stored->second.owner == &statement) {
+          return 0;
+        }
       }
       return 1;
     };

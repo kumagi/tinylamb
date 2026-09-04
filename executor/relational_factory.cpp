@@ -18,6 +18,7 @@
 
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
+#include "executor/apply.hpp"
 #include "executor/bitmap_scan.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/cross_join.hpp"
@@ -39,17 +40,20 @@
 #include "executor/parallel_aggregation.hpp"
 #include "executor/parallel_scan.hpp"
 #include "executor/projection.hpp"
+#include "executor/recursive_cte.hpp"
 #include "executor/relational.hpp"
 #include "executor/selection.hpp"
 #include "executor/set_operation.hpp"
 #include "executor/sort.hpp"
 #include "executor/topn.hpp"
+#include "executor/unnest.hpp"
 #include "executor/values.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "index/index.hpp"
 #include "page/row_position.hpp"
 #include "plan/aggregation_plan.hpp"
+#include "plan/apply_plan.hpp"
 #include "plan/bitmap_scan_plan.hpp"
 #include "plan/distinct_plan.hpp"
 #include "plan/empty_plan.hpp"
@@ -65,6 +69,7 @@
 #include "plan/parallel_thresholds.hpp"
 #include "plan/product_plan.hpp"
 #include "plan/projection_plan.hpp"
+#include "plan/recursive_cte_plan.hpp"
 #include "plan/relation_rename_plan.hpp"
 #include "plan/relational_plan.hpp"
 #include "plan/selection_plan.hpp"
@@ -72,6 +77,7 @@
 #include "plan/sort_distinct_plan.hpp"
 #include "plan/sort_plan.hpp"
 #include "plan/topn_plan.hpp"
+#include "plan/unnest_plan.hpp"
 #include "plan/values_plan.hpp"
 #include "table/table.hpp"
 #include "type/row.hpp"
@@ -85,6 +91,33 @@ Executor RelationalPlan::EmitExecutor(TransactionContext& context) const {
 
 Executor GroupByPlan::EmitExecutor(TransactionContext& context) const {
   return EmitGroupedFinishExecutor(context, child_, statement_);
+}
+
+Executor UnnestPlan::EmitExecutor(TransactionContext& ctx) const {
+  Schema child_schema = child_ ? child_->GetSchema() : Schema();
+  Executor child_exec =
+      child_ ? child_->EmitExecutor(ctx)
+             : std::make_shared<ValuesExecutor>(std::vector<Row>{Row({})});
+  return std::make_shared<UnnestExecutor>(ctx, std::move(child_schema),
+                                          std::move(child_exec), unnest_expr_,
+                                          alias_, offset_alias_);
+}
+
+Executor ApplyPlan::EmitExecutor(TransactionContext& ctx) const {
+  Schema child_schema = child_ ? child_->GetSchema() : Schema();
+  Executor child_exec =
+      child_ ? child_->EmitExecutor(ctx)
+             : std::make_shared<ValuesExecutor>(std::vector<Row>{Row({})});
+  Executor inner_exec =
+      inner_child_ ? inner_child_->EmitExecutor(ctx) : nullptr;
+  return std::make_shared<ApplyExecutor>(
+      ctx, std::move(child_schema), std::move(child_exec), inner_query_, alias_,
+      std::move(inner_exec), predicate_, kind_, schema_);
+}
+
+Executor RecursiveCtePlan::EmitExecutor(TransactionContext& ctx) const {
+  return std::make_shared<RecursiveCteExecutor>(ctx, cte_name_, body_,
+                                                depth_spec_, schema_);
 }
 
 // Streaming pass-through that surfaces a relation rename in EXPLAIN/Dump

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "aggregation_plan.hpp"
+#include "apply_plan.hpp"
 #include "bitmap_scan_plan.hpp"
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
@@ -45,6 +47,8 @@
 #include "plan/relational_plan.hpp"
 #include "projection_plan.hpp"
 #include "query/query_data.hpp"
+#include "query/statement.hpp"
+#include "recursive_cte_plan.hpp"
 #include "selection_plan.hpp"
 #include "set_operation_plan.hpp"
 #include "sort_distinct_plan.hpp"
@@ -56,6 +60,7 @@
 #include "type/schema.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
+#include "unnest_plan.hpp"
 #include "values_plan.hpp"
 
 namespace tinylamb {
@@ -1737,6 +1742,102 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               .estimated_rows = static_cast<double>(logical.values.size())}};
         },
         c::LogicalOperator::kValues));
+    built.Add(c::ImplementationRule(
+        "unnest", c::dsl::Unnest(),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children, const PhysicalProperties&,
+           const c::RuleContext&) {
+          if (children.size() != 1) {
+            return std::vector<PlanAlternative>{};
+          }
+          Expression unnest_expr =
+              logical.predicate ? *logical.predicate : nullptr;
+          Plan plan = std::make_shared<UnnestPlan>(
+              children[0].plan, std::move(unnest_expr), logical.unnest_alias,
+              logical.offset_alias, logical.output_schema);
+          const double rows = children[0].estimated_rows * 10.0;
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = std::move(plan),
+                              .local_cost = children[0].estimated_rows * 1.0,
+                              .estimated_rows = rows}};
+        },
+        c::LogicalOperator::kUnnest));
+    built.Add(c::ImplementationRule(
+        "apply", c::Pattern::Op(c::LogicalOperator::kApply, {}),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children, const PhysicalProperties&,
+           const c::RuleContext&) {
+          if (children.empty()) {
+            return std::vector<PlanAlternative>{};
+          }
+          auto kind = static_cast<JoinKind>(logical.join_type);
+          Expression predicate =
+              logical.predicate ? *logical.predicate : nullptr;
+          Plan plan;
+          if (children.size() == 1) {
+            plan = std::make_shared<ApplyPlan>(
+                children[0].plan, logical.relational_statement, logical.table,
+                std::move(predicate), kind, logical.output_schema);
+          } else if (children.size() == 2) {
+            plan = std::make_shared<ApplyPlan>(
+                children[0].plan, children[1].plan,
+                logical.relational_statement, logical.table,
+                std::move(predicate), kind, logical.output_schema);
+          } else {
+            return std::vector<PlanAlternative>{};
+          }
+          const double rows = children[0].estimated_rows * 10.0;
+          return std::vector<PlanAlternative>{
+              PlanAlternative{.plan = std::move(plan),
+                              .local_cost = children[0].estimated_rows * 2.0,
+                              .estimated_rows = rows}};
+        },
+        c::LogicalOperator::kApply));
+    built.Add(c::ImplementationRule(
+        "recursive_cte", c::Pattern::Op(c::LogicalOperator::kRecursiveCte, {}),
+        [](c::GroupId, const c::Memo&, const c::Bindings&,
+           const c::LogicalExpression& logical,
+           const std::vector<BestPlan>& children, const PhysicalProperties&,
+           const c::RuleContext&) {
+          Plan plan;
+          std::optional<RecursiveDepthSpec> depth_spec;
+          if (logical.depth_spec.has_value()) {
+            depth_spec = logical.depth_spec;
+          } else if (logical.depth_limit > 0) {
+            depth_spec = RecursiveDepthSpec{
+                .column = "depth",
+                .lower = 0,
+                .upper = static_cast<int64_t>(logical.depth_limit),
+            };
+          }
+          if (children.empty()) {
+            plan = std::make_shared<RecursiveCtePlan>(
+                nullptr, logical.cte_name, logical.relational_statement,
+                std::move(depth_spec), logical.output_schema);
+          } else if (children.size() == 1) {
+            plan = std::make_shared<RecursiveCtePlan>(
+                children[0].plan, logical.cte_name,
+                logical.relational_statement, std::move(depth_spec),
+                logical.output_schema);
+          } else if (children.size() == 2) {
+            plan = std::make_shared<RecursiveCtePlan>(
+                children[0].plan, children[1].plan, logical.cte_name,
+                logical.relational_statement, std::move(depth_spec),
+                logical.output_schema);
+          } else {
+            return std::vector<PlanAlternative>{};
+          }
+          const double rows =
+              children.empty() ? 10.0 : children[0].estimated_rows * 10.0;
+          return std::vector<PlanAlternative>{PlanAlternative{
+              .plan = std::move(plan),
+              .local_cost =
+                  children.empty() ? 10.0 : children[0].estimated_rows * 2.0,
+              .estimated_rows = rows}};
+        },
+        c::LogicalOperator::kRecursiveCte));
     built.Add(c::ImplementationRule(
         "index_scan", Scan(),
         [](c::GroupId group, const c::Memo& memo, const c::Bindings&,

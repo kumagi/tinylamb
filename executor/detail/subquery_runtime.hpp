@@ -158,6 +158,12 @@ Relation ExecuteQuery(TransactionContext& context,
                       const SelectStatement& statement, const Scope* outer,
                       const CteMap& inherited_ctes);
 
+Relation ExecuteRecursiveCte(TransactionContext& context,
+                             const std::string& name,
+                             const SelectStatement& body, const Scope* outer,
+                             const CteMap& inherited_ctes,
+                             const RecursiveDepthSpec* depth_spec = nullptr);
+
 // Applies one safe top-level derived-table boundary rewrite.  The relational
 // executor repeatedly calls this until it reaches a fixed point; EXPLAIN uses
 // the same helper so its displayed shape matches the executable query shape.

@@ -2,6 +2,7 @@
 #include "query/googlesql_ast_visitor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
 #include <charconv>
@@ -3855,10 +3856,10 @@ Expression VisitExpression(
             break;
           default:
             if (static_cast<unsigned char>(c) < 0x20) {
-              char buf[8];
-              snprintf(buf, sizeof(buf), "\\u%04x",
-                       static_cast<unsigned char>(c));
-              escaped += buf;
+              std::array<char, 8> buf{};
+              (void)snprintf(buf.data(), buf.size(), "\\u%04x",
+                             static_cast<unsigned char>(c));
+              escaped += buf.data();
             } else {
               escaped.push_back(c);
             }
@@ -4210,8 +4211,8 @@ SelectSource ExpandPivotSource(SelectSource base,
     for (const NamedExpression& named : base.query->SelectList()) {
       if (named.name != pivot_col_name &&
           !agg_column_names.contains(named.name)) {
-        projections.push_back(NamedExpression(
-            named.name, ColumnValueExp(ColumnName(named.name))));
+        projections.emplace_back(named.name,
+                                 ColumnValueExp(ColumnName(named.name)));
         group_by_exprs.push_back(ColumnValueExp(ColumnName(named.name)));
       }
     }
@@ -4358,12 +4359,11 @@ SelectSource ExpandUnpivotSource(const SelectSource& base,
     }
 
     std::vector<NamedExpression> branch_select;
-    branch_select.push_back(
-        NamedExpression("", ColumnValueExp(ColumnName("*"))));
-    branch_select.push_back(
-        NamedExpression(val_col_name, ColumnValueExp(ColumnName(in_col_name))));
-    branch_select.push_back(NamedExpression(
-        name_col_name, ConstantValueExp(Value(std::string(in_label)))));
+    branch_select.emplace_back("", ColumnValueExp(ColumnName("*")));
+    branch_select.emplace_back(val_col_name,
+                               ColumnValueExp(ColumnName(in_col_name)));
+    branch_select.emplace_back(name_col_name,
+                               ConstantValueExp(Value(std::string(in_label))));
 
     auto branch = std::make_shared<SelectStatement>();
     branch->SetSelectList(std::move(branch_select));
@@ -4779,7 +4779,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
                     break;
                   }
                 }
-              } catch (...) {
+              } catch (...) {  // NOLINT(bugprone-empty-catch)
               }
               throw std::runtime_error(
                   "LIMIT requires an integer literal in this engine");
@@ -4812,7 +4812,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
                     continue;
                   }
                 }
-              } catch (...) {
+              } catch (...) {  // NOLINT(bugprone-empty-catch)
               }
               throw std::runtime_error(
                   "OFFSET requires an integer literal in this engine");
@@ -5239,7 +5239,7 @@ std::shared_ptr<SelectStatement> VisitQuery(
           return constant.value.int_value;
         }
       }
-    } catch (...) {
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
     }
     for (const auto& sub : node.children) {
       if (auto found = fold_int(*sub)) {

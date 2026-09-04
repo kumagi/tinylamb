@@ -345,6 +345,9 @@ tinylamb_add_layer(tinylamb_executor
         executor/distinct.cpp
         executor/values.cpp
         executor/generate_series.cpp
+        executor/unnest.cpp
+        executor/apply.cpp
+        executor/recursive_cte.cpp
         executor/returning.cpp
         executor/relational.cpp
         executor/relational_factory.cpp
@@ -412,6 +415,9 @@ tinylamb_add_layer(tinylamb_executor
         plan/incremental_sort_plan.cpp
         plan/merge_join_plan.cpp
         plan/set_operation_plan.cpp
+        plan/unnest_plan.cpp
+        plan/apply_plan.cpp
+        plan/recursive_cte_plan.cpp
         plan/plan.cpp
         plan/index_scan_plan.cpp
         plan/bitmap_scan_plan.cpp

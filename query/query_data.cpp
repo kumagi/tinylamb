@@ -422,6 +422,9 @@ Status ResolveSelect(
         ++it;
         continue;
       }
+      if (ambiguous_colum_name.contains(ToLowerCopy(col_name.name))) {
+        return Status::kAmbiguousQuery;
+      }
       const auto col_it = col_table_map.find(ToLowerCopy(col_name.name));
       if (col_it == col_table_map.end()) {
         // A bare name matching a FROM relation denotes its whole row as a

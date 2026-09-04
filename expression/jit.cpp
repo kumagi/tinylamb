@@ -20,6 +20,8 @@
 #include "common/constants.hpp"
 
 #ifdef TINYLAMB_HAS_LLVM
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcpp"
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/IR/BasicBlock.h>
@@ -30,6 +32,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/TargetSelect.h>
+#pragma GCC diagnostic pop
 #endif
 
 namespace tinylamb {
@@ -367,9 +370,9 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileProjectionChecked() {
   llvm::Value* addend = argument++;
   llvm::Value* mul_overflow_out = argument++;
   llvm::Value* add_overflow_out = argument++;
-  llvm::Function* smul = llvm::Intrinsic::getOrInsertDeclaration(
+  llvm::Function* smul = llvm::Intrinsic::getDeclaration(
       module.get(), llvm::Intrinsic::smul_with_overflow, {i64});
-  llvm::Function* sadd = llvm::Intrinsic::getOrInsertDeclaration(
+  llvm::Function* sadd = llvm::Intrinsic::getDeclaration(
       module.get(), llvm::Intrinsic::sadd_with_overflow, {i64});
   auto* entry = llvm::BasicBlock::Create(*context, "entry", function);
   auto* loop = llvm::BasicBlock::Create(*context, "loop", function);
@@ -453,7 +456,7 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileSumChecked() {
   llvm::Value* input = argument++;
   llvm::Value* count = argument++;
   llvm::Value* overflow_out = argument++;
-  llvm::Function* sadd = llvm::Intrinsic::getOrInsertDeclaration(
+  llvm::Function* sadd = llvm::Intrinsic::getDeclaration(
       module.get(), llvm::Intrinsic::sadd_with_overflow, {i64});
   auto* entry = llvm::BasicBlock::Create(*context, "entry", function);
   auto* loop = llvm::BasicBlock::Create(*context, "loop", function);

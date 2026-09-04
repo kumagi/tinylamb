@@ -804,6 +804,62 @@ TEST_F(QueryTest, SqlEngineArrayGeneratorsFeedUnnest) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, CascadesOptimizesUnnestPlans) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+
+  StatusOr<Executor> explain =
+      engine.Prepare(ctx, "EXPLAIN SELECT x FROM UNNEST([1, 2, 3]) x;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  std::string plan_text;
+  Row row;
+  while (explain.Value()->Next(&row, nullptr)) {
+    plan_text += row[0].value.varchar_value;
+    plan_text += "\n";
+  }
+  EXPECT_NE(plan_text.find("Unnest"), std::string::npos);
+  EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos);
+
+  const std::vector<Row> filtered =
+      RunSql(ctx, *db_,
+             "SELECT x FROM UNNEST([1, 2, 3, 4, 5]) x WHERE x > 2 ORDER BY x;");
+  EXPECT_EQ(filtered, (std::vector<Row>{Row({Value(3)}), Row({Value(4)}),
+                                        Row({Value(5)})}));
+
+  const std::vector<Row> grouped =
+      RunSql(ctx, *db_,
+             "SELECT count(*), max(x), min(x) FROM UNNEST([10, 20, 30]) x;");
+  ASSERT_EQ(grouped.size(), 1U);
+  EXPECT_EQ(grouped[0], Row({Value(int64_t{3}), Value(30), Value(10)}));
+
+  ASSERT_TRUE(engine.Execute(ctx, "CREATE TABLE tbl_u (id INT);").HasValue());
+  RunSql(ctx, *db_, "INSERT INTO tbl_u VALUES (1), (2);");
+  StatusOr<Executor> explain_joined =
+      engine.Prepare(ctx,
+                     "EXPLAIN SELECT tbl_u.id, x FROM tbl_u, UNNEST([10, 20]) "
+                     "x ORDER BY tbl_u.id, x;");
+  ASSERT_TRUE(explain_joined.HasValue()) << engine.LastError();
+  std::string explain_joined_text;
+  while (explain_joined.Value()->Next(&row, nullptr)) {
+    explain_joined_text += row[0].value.varchar_value;
+    explain_joined_text += "\n";
+  }
+  EXPECT_NE(explain_joined_text.find("Unnest"), std::string::npos);
+  EXPECT_NE(explain_joined_text.find("FullScan"), std::string::npos);
+  EXPECT_EQ(explain_joined_text.find("RelationalPlan"), std::string::npos);
+
+  const std::vector<Row> joined =
+      RunSql(ctx, *db_,
+             "SELECT tbl_u.id, x FROM tbl_u, UNNEST([10, 20]) x ORDER BY "
+             "tbl_u.id, x;");
+  EXPECT_EQ(joined,
+            (std::vector<Row>{
+                Row({Value(1), Value(10)}), Row({Value(1), Value(20)}),
+                Row({Value(2), Value(10)}), Row({Value(2), Value(20)})}));
+
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, SqlEngineInsertSelectCopiesAndMapsRows) {
   TransactionContext ctx = db_->BeginContext();
   SqlEngine engine(*db_);
@@ -1164,6 +1220,92 @@ TEST_F(QueryTest, SqlEngineSelfJoinAmbiguousColumnRejected) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, SqlEngineMultiRelationGroupByUnqualifiedColumns) {
+  // Verifies that multi-relation GROUP BY with unambiguous unqualified columns
+  // executes through the Cascades-optimized core (ExecuteGroupedSelect).
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE dept (d_id INT64, d_name VARCHAR(32));");
+  RunSql(ctx, *db_,
+         "CREATE TABLE emp (e_id INT64, e_dept INT64, e_salary INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO dept VALUES (1, 'Engineering'), (2, 'Sales');");
+  RunSql(ctx, *db_,
+         "INSERT INTO emp VALUES (10, 1, 100), (20, 1, 150), (30, 2, 200);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> prepared = engine.Prepare(
+      ctx,
+      "SELECT d_name, COUNT(*) AS cnt, SUM(e_salary) AS total "
+      "FROM emp, dept WHERE e_dept = d_id GROUP BY d_name ORDER BY d_name;");
+  ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
+
+  Row row;
+  ASSERT_TRUE(prepared.Value()->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value("Engineering"));
+  EXPECT_EQ(row[1], Value(2));
+  EXPECT_EQ(row[2], Value(250));
+
+  ASSERT_TRUE(prepared.Value()->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value("Sales"));
+  EXPECT_EQ(row[1], Value(1));
+  EXPECT_EQ(row[2], Value(200));
+
+  EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineSelfJoinWithAliasesGroupBy) {
+  // Verifies that self-joins with distinct aliases and grouping execute
+  // successfully through Cascades and GroupByPlan.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE dept (d_id INT64, d_name VARCHAR(32));");
+  RunSql(ctx, *db_, "INSERT INTO dept VALUES (1, 'Eng'), (2, 'Sales');");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> prepared =
+      engine.Prepare(ctx,
+                     "SELECT a.d_name, COUNT(*) AS cnt "
+                     "FROM dept AS a JOIN dept AS b ON a.d_id = b.d_id "
+                     "GROUP BY a.d_name ORDER BY a.d_name;");
+  ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
+
+  Row row;
+  ASSERT_TRUE(prepared.Value()->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value("Eng"));
+  EXPECT_EQ(row[1], Value(1));
+
+  ASSERT_TRUE(prepared.Value()->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value("Sales"));
+  EXPECT_EQ(row[1], Value(1));
+
+  EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineMultiRelationUnqualifiedSelectWithoutGrouping) {
+  // Verifies that multi-relation joins with unqualified non-ambiguous columns
+  // execute directly through the Cascades optimizer.
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE dept (d_id INT64, d_name VARCHAR(32));");
+  RunSql(ctx, *db_,
+         "CREATE TABLE emp (e_id INT64, e_dept INT64, e_salary INT64);");
+  RunSql(ctx, *db_, "INSERT INTO dept VALUES (1, 'Engineering');");
+  RunSql(ctx, *db_, "INSERT INTO emp VALUES (10, 1, 100);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> prepared = engine.Prepare(
+      ctx, "SELECT d_name, e_salary FROM emp, dept WHERE e_dept = d_id;");
+  ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
+
+  Row row;
+  ASSERT_TRUE(prepared.Value()->Next(&row, nullptr));
+  EXPECT_EQ(row[0], Value("Engineering"));
+  EXPECT_EQ(row[1], Value(100));
+
+  EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, SqlEngineSelectLimitZeroReturnsNoRows) {
   // Arrange -- a non-empty table; LIMIT 0 must yield an empty result (§6.3).
   TransactionContext ctx = db_->BeginContext();
@@ -1365,6 +1507,21 @@ TEST_F(QueryTest, LateralJoinExpansion) {
   RunSql(ctx, *db_, "INSERT INTO lat_inner VALUES (1, 100), (1, 95), (2, 80);");
 
   // Correlated LATERAL subquery: inner query references outer's id
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain = engine.Prepare(
+      ctx,
+      "EXPLAIN SELECT o.name, i.score FROM lat_outer o, LATERAL (SELECT score "
+      "FROM lat_inner WHERE outer_id = o.id) i ORDER BY o.name, i.score;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  std::string plan_text;
+  Row r;
+  while (explain.Value()->Next(&r, nullptr)) {
+    plan_text += r[0].value.varchar_value;
+    plan_text += "\n";
+  }
+  EXPECT_NE(plan_text.find("Apply"), std::string::npos);
+  EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos);
+
   std::vector<Row> result = RunSql(
       ctx, *db_,
       "SELECT o.name, i.score FROM lat_outer o, LATERAL (SELECT score FROM "
@@ -1796,6 +1953,115 @@ TEST_F(QueryTest, EighthScanSingleColumnTypoRejected) {
   const StatusOr<Executor> prepared =
       engine.Prepare(ctx, "SELECT only FROM solo WHERE typo_col = 5;");
   EXPECT_FALSE(prepared.HasValue());
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineNonEqualityJoinCascades) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE a (k INT64, v VARCHAR(10));");
+  RunSql(ctx, *db_, "CREATE TABLE b (k INT64, w VARCHAR(10));");
+  RunSql(ctx, *db_, "INSERT INTO a VALUES (1, 'a1'), (3, 'a3');");
+  RunSql(ctx, *db_, "INSERT INTO b VALUES (2, 'b2'), (4, 'b4');");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain = engine.Prepare(
+      ctx,
+      "EXPLAIN SELECT a.v, b.w FROM a JOIN b ON a.k < b.k ORDER BY a.v, b.w;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
+
+  const std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "SELECT a.v, b.w FROM a JOIN b ON a.k < b.k ORDER BY a.v, b.w;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0], Row({Value("a1"), Value("b2")}));
+  EXPECT_EQ(rows[1], Row({Value("a1"), Value("b4")}));
+  EXPECT_EQ(rows[2], Row({Value("a3"), Value("b4")}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineJoinOnlySourceCascades) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE x (id INT64, val INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE y (id INT64, active INT64);");
+  RunSql(ctx, *db_, "INSERT INTO x VALUES (1, 100), (2, 200), (3, 300);");
+  RunSql(ctx, *db_, "INSERT INTO y VALUES (1, 1), (3, 1);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain = engine.Prepare(
+      ctx, "EXPLAIN SELECT x.val FROM x JOIN y ON x.id = y.id ORDER BY x.val;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
+
+  const std::vector<Row> rows = RunSql(
+      ctx, *db_, "SELECT x.val FROM x JOIN y ON x.id = y.id ORDER BY x.val;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(100));
+  EXPECT_EQ(rows[1][0], Value(300));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineCompoundJoinPredicateCascades) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE p (k INT64, num INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE q (k INT64, threshold INT64);");
+  RunSql(ctx, *db_, "INSERT INTO p VALUES (1, 10), (1, 50), (2, 30);");
+  RunSql(ctx, *db_, "INSERT INTO q VALUES (1, 20), (2, 40);");
+
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain =
+      engine.Prepare(ctx,
+                     "EXPLAIN SELECT p.num FROM p JOIN q ON p.k = q.k AND "
+                     "p.num > q.threshold;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
+
+  const std::vector<Row> rows = RunSql(
+      ctx, *db_,
+      "SELECT p.num FROM p JOIN q ON p.k = q.k AND p.num > q.threshold;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(50));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineRecursiveCteCascadesPlan) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  StatusOr<Executor> explain =
+      engine.Prepare(ctx,
+                     "EXPLAIN WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL "
+                     "SELECT n + 1 FROM t "
+                     "WHERE n < 5) SELECT SUM(n) FROM t;");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  Row exp_row;
+  std::string plan_text;
+  while (explain.Value()->Next(&exp_row, nullptr)) {
+    plan_text += exp_row[0].AsString() + "\n";
+  }
+  EXPECT_NE(plan_text.find("RecursiveCtePlan"), std::string::npos) << plan_text;
+  EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
+
+  std::vector<Row> total =
+      RunSql(ctx, *db_,
+             "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 "
+             "FROM t WHERE n < 5) SELECT SUM(n) FROM t;");
+  ASSERT_EQ(total.size(), 1U);
+  EXPECT_EQ(total[0][0], Value(15));
   ctx.txn_.Abort();
 }
 

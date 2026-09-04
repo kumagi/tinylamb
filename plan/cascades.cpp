@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +47,15 @@ namespace {
 // skipped and the connected-split join order built during Memo::Build serves
 // as the fallback plan.
 constexpr size_t kMaxJoinEnumerationRelations = 16;
+
+bool IdentifierEquals(std::string_view left, std::string_view right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(),
+                    [](char lhs, char rhs) {
+                      return std::tolower(static_cast<unsigned char>(lhs)) ==
+                             std::tolower(static_cast<unsigned char>(rhs));
+                    });
+}
 
 std::vector<std::string> Normalize(std::vector<std::string> relations) {
   std::ranges::sort(relations);
@@ -816,8 +826,19 @@ std::string LogicalExpression::Fingerprint() const {
   if (!unnest_alias.empty()) {
     out << "#u:" << unnest_alias;
   }
+  if (!offset_alias.empty()) {
+    out << "#uo:" << offset_alias;
+  }
   if (!cte_name.empty()) {
     out << "#cte:" << cte_name << ':' << depth_limit;
+  }
+  if (depth_spec.has_value()) {
+    out << "#ds:" << depth_spec->column << ':' << depth_spec->lower << ':'
+        << depth_spec->upper;
+  }
+  if (operation == LogicalOperator::kApply) {
+    out << "#apply:" << static_cast<const void*>(relational_statement.get())
+        << ':' << static_cast<int>(join_type);
   }
   if (operation == LogicalOperator::kSample) {
     out << "#sample:" << sample_rate << ':' << (is_bernoulli ? 'b' : 's');
@@ -1096,10 +1117,16 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
     case LogicalOperator::kCrossJoin:
     case LogicalOperator::kSingleJoin:
     case LogicalOperator::kMarkJoin:
-    case LogicalOperator::kApply:
-    case LogicalOperator::kRecursiveCte: {
+    case LogicalOperator::kApply: {
+      if (expression.children.size() == 1) {
+        if (expression.children[0] == target.id) {
+          throw std::invalid_argument(
+              "logical operator references its own group");
+        }
+        break;
+      }
       if (expression.children.size() != 2) {
-        throw std::invalid_argument("join must have two child groups");
+        throw std::invalid_argument("apply must have one or two child groups");
       }
       const Group& left = Get(expression.children[0]);
       const Group& right = Get(expression.children[1]);
@@ -1109,7 +1136,29 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
       if (!intersection.empty() ||
           UnionRelations(left.relations, right.relations) != target.relations) {
         throw std::invalid_argument(
-            "join children are not equivalent to group");
+            "apply children are not equivalent to group");
+      }
+      break;
+    }
+    case LogicalOperator::kRecursiveCte: {
+      if (expression.children.empty() || expression.children.size() == 1) {
+        break;
+      }
+      if (expression.children.size() != 2) {
+        throw std::invalid_argument(
+            "recursive cte must have at most two child groups");
+      }
+      const Group& left = Get(expression.children[0]);
+      const Group& right = Get(expression.children[1]);
+      std::vector<std::string> intersection;
+      std::ranges::set_intersection(left.relations, right.relations,
+                                    std::back_inserter(intersection));
+      if (!intersection.empty() ||
+          UnionRelations(left.relations, right.relations) != target.relations) {
+        if (target.tag.empty()) {
+          throw std::invalid_argument(
+              "join children are not equivalent to group");
+        }
       }
       break;
     }
@@ -4186,6 +4235,23 @@ const RuleSet& RuleSet::Default() {
                 unnest.children.size() != 1 || unnest.children[0] == group) {
               continue;
             }
+            if (expression.predicate && *expression.predicate) {
+              const std::unordered_set<ColumnName> touched =
+                  (*expression.predicate)->TouchedColumns();
+              bool touches_unnest = false;
+              for (const auto& col : touched) {
+                if ((!unnest.unnest_alias.empty() &&
+                     IdentifierEquals(col.name, unnest.unnest_alias)) ||
+                    (!unnest.offset_alias.empty() &&
+                     IdentifierEquals(col.name, unnest.offset_alias))) {
+                  touches_unnest = true;
+                  break;
+                }
+              }
+              if (touches_unnest) {
+                continue;
+              }
+            }
             const GroupId unnest_child = unnest.children[0];
             const GroupId sel_below = memo.EnsureDerivedGroup(
                 memo.Get(unnest_child).relations, "sel_unnest_child");
@@ -5913,9 +5979,17 @@ std::vector<PhysicalProperties> SearchEngine::RequiredChildProperties(
     case LogicalOperator::kSingleJoin:
     case LogicalOperator::kMarkJoin:
     case LogicalOperator::kApply:
+      if (expression.children.size() == 1) {
+        return {required};
+      }
+      return {PhysicalProperties{}, PhysicalProperties{}};
     case LogicalOperator::kRecursiveCte:
-      // Joins reorder rows: they neither preserve row position nor deliver
-      // the parent's ordering, and a limit hint below them is meaningless.
+      if (expression.children.empty()) {
+        return {};
+      }
+      if (expression.children.size() == 1) {
+        return {required};
+      }
       return {PhysicalProperties{}, PhysicalProperties{}};
     case LogicalOperator::kAggregation:
       // Aggregation collapses the input; ordering and row positions die here.

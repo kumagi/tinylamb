@@ -17,6 +17,7 @@
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "plan/plan.hpp"
+#include "query/statement.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -26,7 +27,6 @@ class TransactionContext;
 class Table;
 class TableStatistics;
 struct QueryData;
-class SelectStatement;
 }  // namespace tinylamb
 
 namespace tinylamb::cascades {
@@ -108,10 +108,12 @@ struct LogicalExpression {
   std::vector<Expression> partition_by{};
   std::vector<Expression> grouping_sets{};
   std::string unnest_alias{};
+  std::string offset_alias{};
   std::string cte_name{};
   double sample_rate{1.0};
   bool is_bernoulli{false};
   size_t depth_limit{0};
+  std::optional<RecursiveDepthSpec> depth_spec{};
 
   [[nodiscard]] std::string Fingerprint() const;
 };
@@ -414,6 +416,10 @@ inline Pattern LazySpool(Pattern child = Any(), std::string capture = {}) {
 }
 inline Pattern Expand(Pattern child = Any(), std::string capture = {}) {
   return Pattern::Op(LogicalOperator::kExpand, {std::move(child)},
+                     std::move(capture));
+}
+inline Pattern UnaryApply(Pattern child = Any(), std::string capture = {}) {
+  return Pattern::Op(LogicalOperator::kApply, {std::move(child)},
                      std::move(capture));
 }
 inline Pattern Apply(Pattern left = Any(), Pattern right = Any(),

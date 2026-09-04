@@ -79,7 +79,7 @@ class BlobFile final {
  private:
   // Member order matters: `file_writer_` owns the fd, `cache_` only borrows
   // it (Cache never closes), so the Logger is the sole closer of the file.
-  Logger file_writer_;
+  mutable Logger file_writer_;
   Cache cache_;
   std::mutex writer_lock_;
 };

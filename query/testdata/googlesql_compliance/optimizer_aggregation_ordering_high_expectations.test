@@ -218,3 +218,35 @@ FROM opt_sales ORDER BY sale_id LIMIT 3
 --
 ARRAY<STRUCT<sale_id INT64, normalized INT64>>[{1, 100}, {2, 50}, {3, 75}]
 ==
+
+# Eager Aggregation (Aggregate-Join Transpose):
+# When joining a fact table with a dimension table followed by GROUP BY on the dimension key,
+# the optimizer should push the aggregation down below the join (pre-aggregating opt_sales by dept_id).
+# This reduces the join cardinality from all fact rows down to distinct group keys before the HashJoin.
+[prepare_database]
+CREATE TABLE opt_departments AS
+SELECT 10 AS dept_id, 'Engineering' AS dept_name, 'HQ' AS location
+UNION ALL SELECT 20, 'Sales', 'Remote'
+UNION ALL SELECT 30, 'Marketing', 'HQ';
+ANALYZE opt_departments;
+SELECT 1;
+--
+ARRAY<STRUCT<INT64>>[{1}]
+==
+
+[mode=explain]
+[plan_contains=HashJoin]
+[plan_contains=Aggregate input=opt_sales]
+[plan_not_contains=Join before Aggregate]
+[name=eager_aggregation_preaggregates_fact_before_dimension_join]
+SELECT d.dept_name, SUM(s.amount) AS total_amount
+FROM opt_departments d
+JOIN opt_sales s ON d.dept_id = s.dept_id
+GROUP BY d.dept_id, d.dept_name
+ORDER BY d.dept_name
+--
+ARRAY<STRUCT<dept_name STRING, total_amount INT64>>[
+  {"Engineering", 225}, {"Marketing", 300}, {"Sales", 350}
+]
+==
+

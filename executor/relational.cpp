@@ -1526,13 +1526,13 @@ bool SameRow(const Row& left, const Row& right) {
     }
   }
   return true;
-}
+}  // namespace
 
 Relation ExecuteRecursiveCte(TransactionContext& context,
                              const std::string& name,
                              const SelectStatement& body, const Scope* outer,
                              const CteMap& inherited_ctes,
-                             const RecursiveDepthSpec* depth_spec = nullptr) {
+                             const RecursiveDepthSpec* depth_spec) {
   constexpr size_t kMaxIterations = 1024;
   constexpr size_t kMaxRows = 10'000'000;
   if (body.UnionAll().empty()) {
@@ -2373,14 +2373,17 @@ class GroupedFinishExecutor final : public ExecutorBase {
         }
         return count;
       };
-      const size_t hash_joins = count_occurrences("HashJoin") -
-                                count_occurrences("HashJoin actual_");
+      const size_t hash_joins =
+          count_occurrences("HashJoin") - count_occurrences("HashJoin actual_");
       const size_t nested_loop_joins = count_occurrences("NestedLoop");
+      const size_t total_joins = hash_joins + nested_loop_joins;
       output << "\n"
              << std::string(static_cast<size_t>(indent), ' ')
              << "hash_joins=" << hash_joins
              << ", nested_loop_joins=" << nested_loop_joins
-             << ", join_comparisons=" << core_input_rows_;
+             << ", join_comparisons="
+             << (total_joins > 0 ? total_joins * core_input_rows_
+                                 : core_input_rows_);
     } else {
       core_plan_->Dump(output, indent + 2);
     }
@@ -2398,7 +2401,7 @@ class GroupedFinishExecutor final : public ExecutorBase {
     core_plan_->Dump(output, indent + 2);
   }
 
-  private:
+ private:
   void Initialize() {
     core_executor_ = core_plan_->EmitExecutor(*context_);
     Relation input(context_->execution_runtime());

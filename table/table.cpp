@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -666,9 +667,9 @@ Status Table::IndexDelete(Transaction& txn, const Index& idx,
 
 Iterator Table::BeginFullScan(Transaction& txn,
                               const TableScanOptions& options) const {
-  auto owned = std::make_unique<FullScanIterator>(
-      this, &txn, options.projection, options.key_filter, options.key_column,
-      options.peek_compares);
+  auto owned = std::unique_ptr<FullScanIterator>(
+      new FullScanIterator(this, &txn, options.projection, options.key_filter,
+                           options.key_column, options.peek_compares));
   return Iterator(owned.release());
 }
 
@@ -678,9 +679,9 @@ Iterator Table::BeginMorselScan(
     const std::unordered_set<int64_t>* key_filter,
     std::optional<slot_t> key_column,
     const std::vector<IntegerPeekCompare>* peek_compares) const {
-  auto owned = std::make_unique<FullScanIterator>(
-      this, &txn, pages, std::move(projection), key_filter, key_column,
-      peek_compares);
+  auto owned = std::unique_ptr<FullScanIterator>(
+      new FullScanIterator(this, &txn, pages, std::move(projection), key_filter,
+                           key_column, peek_compares));
   return Iterator(owned.release());
 }
 
@@ -718,7 +719,7 @@ Iterator Table::BeginIndexScan(Transaction& txn, const Index& index,
                                const std::vector<Value>& end_key,
                                bool ascending) const {
   auto owned = std::make_unique<IndexScanIterator>(*this, index, txn, begin_key,
-                                                  end_key, ascending);
+                                                   end_key, ascending);
   return Iterator(owned.release());
 }
 

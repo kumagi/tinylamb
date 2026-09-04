@@ -111,6 +111,11 @@ class SqlEngine {
   StatusOr<Executor> ExecuteGroupedSelect(const SelectStatement& select,
                                           TransactionContext& ctx);
 
+  // Cascades routing for UNNEST queries: lowers UNNEST and lateral sources
+  // into LogicalOperator::kUnnest over DummyScan/input plans.
+  StatusOr<Executor> ExecuteUnnestSelect(const SelectStatement& select,
+                                         TransactionContext& ctx);
+
   // Phase 2-1 compiled-plan cache. Returns a served Executor on a hit
   // (nullopt = miss or any doubt; callers fall back to the legacy path).
   std::optional<Executor> ServeFromPlanCache(
